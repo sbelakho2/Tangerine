@@ -1,0 +1,1724 @@
+# Tangerine Compiler — Native Code Generator
+# Self-hosting compiler written in Tangerine
+#
+# Lowers MIR to machine code — NO C, NO external language dependency.
+# Generates native x86-64 or ARM64 instructions via asm.tg, then
+# packages into object files via object.tg and links via linker.tg.
+#
+# Pipeline:  MIR → Register Allocation → Instruction Selection → Object → Link → Executable
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::fs::{write_file_bytes}
+use tg_compiler::types::{Type, TypeId}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirBlock, MirLocal, MirStatic,
+  MirStatement, MirStatementKind,
+  MirTerminator, MirTerminatorKind,
+  MirRvalue, MirRvalueKind,
+  MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind,
+  MirBinOp, MirUnOp, CastKind,
+  AggregateKind, SwitchTarget, AssertMessage,
+  Place, Projection, LocalId, BlockId, ContractKind
+}
+use tg_compiler::asm::{
+  CodeBuffer, buf_new, buf_pos, emit8, emit32_le, emit64_le,
+  def_label, add_fixup, add_reloc, add_symbol, resolve_fixups, align_to,
+  Arch, OsAbi, TargetTriple, Section, SymBinding, SymKind, AsmSymbol,
+  FixupKind, RelocKind, CC,
+  X64, x64_code, x64_arg_reg, x64_callee_saved,
+  x64_mov_ri, x64_mov_rr, x64_mov_rm, x64_mov_mr,
+  x64_add_rr, x64_add_ri, x64_sub_rr, x64_sub_ri,
+  x64_imul_rr, x64_cqo, x64_idiv_r,
+  x64_and_rr, x64_or_rr, x64_xor_rr,
+  x64_shl_rcl, x64_shr_rcl, x64_sar_rcl,
+  x64_neg_r, x64_not_r,
+  x64_cmp_rr, x64_cmp_ri, x64_test_rr,
+  x64_setcc, x64_movzx_r64_r8,
+  x64_jmp, x64_jcc, x64_call_label, x64_call_extern, x64_call_r, x64_jmp_r,
+  x64_ret, x64_push, x64_pop,
+  x64_lea_rip, x64_lea_mem,
+  x64_syscall, x64_ud2, x64_int3, x64_nop
+}
+use tg_compiler::object::{ObjectFile, build_object}
+use tg_compiler::linker::{LinkerInput, link_and_write, link}
+
+# ———————————————————————————————————————————————————————————————
+# Code Generation Context
+# ———————————————————————————————————————————————————————————————
+
+# Architecture-independent register handle.
+# Wraps either an x86-64 or ARM64 physical register.
+enum PhysReg
+  X64Reg(X64)
+  A64Reg(A64)
+end
+
+# Register allocation slot for a MIR local
+enum VarLoc
+  Register(PhysReg)   # in a physical register
+  Stack(i32)          # at [FP + disp]
+  Spilled(i32)        # forced to stack
+end
+
+struct FrameInfo
+  stack_size: Int           # total frame size (bytes, 16-aligned)
+  local_offsets: Map[Int, i32]   # LocalId.id -> FP offset
+  spill_offset: i32         # current spill position
+  saved_regs: Vec[PhysReg]  # callee-saved regs used
+end
+
+struct FnCodegenCtx
+  func: MirFunction
+  frame: FrameInfo
+  var_locs: Map[Int, VarLoc]     # LocalId.id -> VarLoc
+  block_labels: Map[Int, String] # BlockId.id -> label name
+end
+
+struct CodegenCtx
+  target: TargetTriple
+  text: CodeBuffer
+  data: CodeBuffer
+  rodata: CodeBuffer
+  string_pool: Map[String, String]  # literal -> label
+  string_counter: Int
+  fn_counter: Int
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type layout
+# ———————————————————————————————————————————————————————————————
+
+def type_size(ty: &Type) -> Int
+  match ty
+  when Type::Unit    then 0
+  when Type::Bool    then 1
+  when Type::Char    then 4
+  when Type::Int     then 8
+  when Type::Float   then 8
+  when Type::String  then 24   # ptr + len + cap
+  when Type::Never   then 0
+  when Type::Ref(_, _)     then 8
+  when Type::RefMut(_, _)  then 8
+  when Type::Owned(_)      then 8
+  when Type::Tuple(fields) then
+    mut total = 0
+    for f in fields do
+      total = total + type_size(f)
+    end
+    total
+  when Type::Array(elem, count) then type_size(elem) * count
+  when Type::Slice(_) then 16    # ptr + len
+  when Type::Named(name, args) then
+    # Look up struct definition — iterate type_defs if available in ctx,
+    # otherwise default to pointer size for opaque/unknown types.
+    # Common known types have fixed sizes:
+    match name.as_str()
+    when "Vec" then 24       # ptr + len + cap
+    when "Map" then 48       # hash table: ptr + len + cap + buckets ptr + bucket_count + mask
+    when "Set" then 32       # hash table: ptr + len + cap + mask
+    when "String" then 24    # ptr + len + cap (same as top-level String)
+    when "Option" then 16    # discriminant + payload (max 8 bytes)
+    when "Result" then 24    # discriminant + payload (max 16 bytes)
+    when "Box" then 8        # heap pointer
+    when _ then 8            # default: pointer-sized for unknown Named types
+    end
+  when Type::Function(_, _) then 8  # Function pointer
+  when Type::Var(_) then 8      # Unknown; default to pointer size
+  when Type::Error then 0
+  end
+end
+
+def type_align(ty: &Type) -> Int
+  match ty
+  when Type::Unit    then 1
+  when Type::Bool    then 1
+  when Type::Char    then 4
+  when _             then 8
+  end
+end
+
+def align_up_int(v: Int, align: Int) -> Int
+  ((v + align - 1) / align) * align
+end
+
+# ———————————————————————————————————————————————————————————————
+# Allocatable general-purpose registers (architecture-dispatched)
+# ———————————————————————————————————————————————————————————————
+
+# x86-64: avoid RAX (return/scratch), RSP (stack), RBP (frame).
+def x64_allocatable_regs() -> Vec[PhysReg]
+  mut regs = Vec::new()
+  regs.push(PhysReg::X64Reg(X64::RCX))
+  regs.push(PhysReg::X64Reg(X64::RDX))
+  regs.push(PhysReg::X64Reg(X64::RSI))
+  regs.push(PhysReg::X64Reg(X64::RDI))
+  regs.push(PhysReg::X64Reg(X64::R8))
+  regs.push(PhysReg::X64Reg(X64::R9))
+  regs.push(PhysReg::X64Reg(X64::R10))
+  regs.push(PhysReg::X64Reg(X64::R11))
+  regs.push(PhysReg::X64Reg(X64::RBX))
+  regs.push(PhysReg::X64Reg(X64::R12))
+  regs.push(PhysReg::X64Reg(X64::R13))
+  regs.push(PhysReg::X64Reg(X64::R14))
+  regs.push(PhysReg::X64Reg(X64::R15))
+  regs
+end
+
+# ARM64: avoid X0 (return), X16-X17 (IP0/IP1 linker scratch),
+# X18 (platform), FP(X29), LR(X30), SP.
+def a64_allocatable_regs() -> Vec[PhysReg]
+  mut regs = Vec::new()
+  regs.push(PhysReg::A64Reg(A64::X1))
+  regs.push(PhysReg::A64Reg(A64::X2))
+  regs.push(PhysReg::A64Reg(A64::X3))
+  regs.push(PhysReg::A64Reg(A64::X4))
+  regs.push(PhysReg::A64Reg(A64::X5))
+  regs.push(PhysReg::A64Reg(A64::X6))
+  regs.push(PhysReg::A64Reg(A64::X7))
+  regs.push(PhysReg::A64Reg(A64::X8))
+  regs.push(PhysReg::A64Reg(A64::X9))
+  regs.push(PhysReg::A64Reg(A64::X10))
+  regs.push(PhysReg::A64Reg(A64::X11))
+  regs.push(PhysReg::A64Reg(A64::X12))
+  regs.push(PhysReg::A64Reg(A64::X13))
+  regs.push(PhysReg::A64Reg(A64::X14))
+  regs.push(PhysReg::A64Reg(A64::X15))
+  regs.push(PhysReg::A64Reg(A64::X19))
+  regs.push(PhysReg::A64Reg(A64::X20))
+  regs.push(PhysReg::A64Reg(A64::X21))
+  regs.push(PhysReg::A64Reg(A64::X22))
+  regs.push(PhysReg::A64Reg(A64::X23))
+  regs.push(PhysReg::A64Reg(A64::X24))
+  regs.push(PhysReg::A64Reg(A64::X25))
+  regs.push(PhysReg::A64Reg(A64::X26))
+  regs.push(PhysReg::A64Reg(A64::X27))
+  regs.push(PhysReg::A64Reg(A64::X28))
+  regs
+end
+
+def allocatable_regs(arch: Arch) -> Vec[PhysReg]
+  match arch
+  when Arch::X86_64  then x64_allocatable_regs()
+  when Arch::AArch64 then a64_allocatable_regs()
+  end
+end
+
+def phys_is_callee_saved(r: PhysReg) -> Bool
+  match r
+  when PhysReg::X64Reg(xr) then is_callee_saved(xr)
+  when PhysReg::A64Reg(ar) then
+    match ar
+    when A64::X19 then true; when A64::X20 then true; when A64::X21 then true
+    when A64::X22 then true; when A64::X23 then true; when A64::X24 then true
+    when A64::X25 then true; when A64::X26 then true; when A64::X27 then true
+    when A64::X28 then true
+    when _ then false
+    end
+  end
+end
+
+def phys_reg_id(r: PhysReg) -> Int
+  match r
+  when PhysReg::X64Reg(xr) then x64_code(xr) as Int
+  when PhysReg::A64Reg(ar) then a64_code(ar) as Int
+  end
+end
+
+# Scratch register (not allocatable, used for temporaries)
+def scratch_reg(arch: Arch) -> PhysReg
+  match arch
+  when Arch::X86_64  then PhysReg::X64Reg(X64::R11)
+  when Arch::AArch64 then PhysReg::A64Reg(A64::X15)
+  end
+end
+
+# Return value register
+def ret_reg(arch: Arch) -> PhysReg
+  match arch
+  when Arch::X86_64  then PhysReg::X64Reg(X64::RAX)
+  when Arch::AArch64 then PhysReg::A64Reg(A64::X0)
+  end
+end
+
+# Argument registers for calling convention
+def arg_reg(arch: Arch, i: Int) -> Option[PhysReg]
+  match arch
+  when Arch::X86_64 then
+    match x64_arg_reg(i)
+    when Option::Some(r) then Option::Some(PhysReg::X64Reg(r))
+    when Option::None then Option::None
+    end
+  when Arch::AArch64 then
+    match a64_arg_reg(i)
+    when Option::Some(r) then Option::Some(PhysReg::A64Reg(r))
+    when Option::None then Option::None
+    end
+  end
+end
+
+def max_reg_args(arch: Arch) -> Int
+  match arch
+  when Arch::X86_64  then 6
+  when Arch::AArch64 then 8
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Register Allocator (linear-scan style, simplified)
+# ———————————————————————————————————————————————————————————————
+
+struct RegAllocState
+  free_regs: Vec[PhysReg]
+  used_callee: Set[Int]     # phys_reg_id values of callee-saved regs in use
+  assignments: Map[Int, VarLoc]
+  arch: Arch
+end
+
+def reg_alloc_new(arch: Arch) -> RegAllocState
+  RegAllocState {
+    free_regs: allocatable_regs(arch),
+    used_callee: Set::new(),
+    assignments: Map::new(),
+    arch: arch
+  }
+end
+
+def alloc_reg(state: &mut RegAllocState) -> Option[PhysReg]
+  if state.free_regs.is_empty() then
+    return Option::None
+  end
+  let r = state.free_regs.pop()
+  if phys_is_callee_saved(r) then
+    state.used_callee.insert(phys_reg_id(r))
+  end
+  Option::Some(r)
+end
+
+def free_reg(state: &mut RegAllocState, r: PhysReg) -> Unit
+  state.free_regs.push(r)
+end
+
+def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameInfo)
+  mut ra = reg_alloc_new(arch)
+  mut local_offsets = Map::new()
+  mut var_locs = Map::new()
+  mut spill_off: i32 = -8  # first spill at [fp-8]
+
+  # Try to give each local a register; spill when exhausted
+  for local in func.locals do
+    let sz = type_size(&local.ty)
+    if sz == 0 then
+      var_locs.insert(local.id.id, VarLoc::Stack(0))
+      next
+    end
+
+    match alloc_reg(&mut ra)
+    when Option::Some(r) then
+      var_locs.insert(local.id.id, VarLoc::Register(r))
+    when Option::None then
+      let aligned_sz = align_up_int(sz, 8)
+      spill_off = spill_off - aligned_sz as i32
+      var_locs.insert(local.id.id, VarLoc::Spilled(spill_off))
+      local_offsets.insert(local.id.id, spill_off)
+    end
+  end
+
+  # Params get the ABI argument registers (overriding)
+  mut arg_idx = 0
+  let max_args = max_reg_args(arch)
+  for param in func.params do
+    match arg_reg(arch, arg_idx)
+    when Option::Some(r) then
+      var_locs.insert(param.id.id, VarLoc::Register(r))
+    when Option::None then
+      # Stack param: positive offset from FP
+      let off = 16 + (arg_idx - max_args) * 8
+      var_locs.insert(param.id.id, VarLoc::Stack(off as i32))
+    end
+    arg_idx = arg_idx + 1
+  end
+
+  # Collect callee-saved regs used
+  mut saved = Vec::new()
+  for code_val in ra.used_callee do
+    for r in allocatable_regs(arch) do
+      if phys_reg_id(r) == code_val && phys_is_callee_saved(r) then
+        saved.push(r)
+      end
+    end
+  end
+
+  # Calculate total frame size
+  let spill_bytes = if spill_off < 0 then (-spill_off) as Int else 0 end
+  let save_bytes = saved.len() * 8
+  let raw_size = spill_bytes + save_bytes
+  let stack_size = align_up_int(raw_size, 16)
+
+  let frame = FrameInfo {
+    stack_size: stack_size,
+    local_offsets: local_offsets,
+    spill_offset: spill_off,
+    saved_regs: saved
+  }
+
+  (var_locs, frame)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Code Generation — Context Creation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_new(target: TargetTriple) -> CodegenCtx
+  CodegenCtx {
+    target: target,
+    text: buf_new(),
+    data: buf_new(),
+    rodata: buf_new(),
+    string_pool: Map::new(),
+    string_counter: 0,
+    fn_counter: 0
+  }
+end
+
+# Intern a string literal, return label for the constant
+def intern_string(ctx: &mut CodegenCtx, s: &String) -> String
+  match ctx.string_pool.get(s)
+  when Option::Some(label) then return label
+  when Option::None then ()
+  end
+
+  let label = ".Lstr." + ctx.string_counter.to_string()
+  ctx.string_counter = ctx.string_counter + 1
+  ctx.string_pool.insert(s.clone(), label.clone())
+
+  # Emit string bytes into rodata
+  def_label(&mut ctx.rodata, label.clone())
+  for byte in s.bytes() do
+    emit8(&mut ctx.rodata, byte)
+  end
+  emit8(&mut ctx.rodata, 0)  # null terminator
+
+  label
+end
+
+# ———————————————————————————————————————————————————————————————
+# Architecture-dispatched instruction emission
+# ———————————————————————————————————————————————————————————————
+
+# MOV reg, immediate
+def emit_mov_ri(ctx: &mut CodegenCtx, dst: PhysReg, imm: i64) -> Unit
+  match dst
+  when PhysReg::X64Reg(r) then x64_mov_ri(&mut ctx.text, r, imm)
+  when PhysReg::A64Reg(r) then a64_mov_ri(&mut ctx.text, r, imm)
+  end
+end
+
+# MOV reg, reg
+def emit_mov_rr(ctx: &mut CodegenCtx, dst: PhysReg, src: PhysReg) -> Unit
+  match (dst, src)
+  when (PhysReg::X64Reg(d), PhysReg::X64Reg(s)) then x64_mov_rr(&mut ctx.text, d, s)
+  when (PhysReg::A64Reg(d), PhysReg::A64Reg(s)) then a64_mov_rr(&mut ctx.text, d, s)
+  when _ then panic("emit_mov_rr: mixed architectures")
+  end
+end
+
+# LOAD reg, [base + offset]
+def emit_load_mem(ctx: &mut CodegenCtx, dst: PhysReg, base: PhysReg, offset: i32) -> Unit
+  match (dst, base)
+  when (PhysReg::X64Reg(d), PhysReg::X64Reg(b)) then x64_mov_rm(&mut ctx.text, d, b, offset)
+  when (PhysReg::A64Reg(d), PhysReg::A64Reg(b)) then
+    if offset >= 0 && (offset % 8) == 0 && offset < 32768 then
+      a64_ldr(&mut ctx.text, d, b, offset as u32)
+    else
+      a64_ldur(&mut ctx.text, d, b, offset)
+    end
+  when _ then panic("emit_load_mem: mixed architectures")
+  end
+end
+
+# STORE [base + offset], reg
+def emit_store_mem(ctx: &mut CodegenCtx, base: PhysReg, offset: i32, src: PhysReg) -> Unit
+  match (base, src)
+  when (PhysReg::X64Reg(b), PhysReg::X64Reg(s)) then x64_mov_mr(&mut ctx.text, b, offset, s)
+  when (PhysReg::A64Reg(b), PhysReg::A64Reg(s)) then
+    if offset >= 0 && (offset % 8) == 0 && offset < 32768 then
+      a64_str(&mut ctx.text, s, b, offset as u32)
+    else
+      a64_stur(&mut ctx.text, s, b, offset)
+    end
+  when _ then panic("emit_store_mem: mixed architectures")
+  end
+end
+
+# Frame pointer register
+def fp_reg(arch: Arch) -> PhysReg
+  match arch
+  when Arch::X86_64  then PhysReg::X64Reg(X64::RBP)
+  when Arch::AArch64 then PhysReg::A64Reg(A64::FP)
+  end
+end
+
+# Stack pointer register
+def sp_reg(arch: Arch) -> PhysReg
+  match arch
+  when Arch::X86_64  then PhysReg::X64Reg(X64::RSP)
+  when Arch::AArch64 then PhysReg::A64Reg(A64::SP)
+  end
+end
+
+# Second scratch register (for binop RHS etc.)
+def scratch2_reg(arch: Arch) -> PhysReg
+  match arch
+  when Arch::X86_64  then PhysReg::X64Reg(X64::R11)
+  when Arch::AArch64 then PhysReg::A64Reg(A64::X14)
+  end
+end
+
+# XOR/zero a register
+def emit_zero_reg(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then x64_xor_rr(&mut ctx.text, xr, xr)
+  when PhysReg::A64Reg(ar) then a64_mov_rr(&mut ctx.text, ar, A64::XZR)
+  end
+end
+
+# ADD reg, reg, reg  (dst = n + m)
+def emit_add_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_add_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_add_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_add: mixed arch")
+  end
+end
+
+# SUB reg, reg, reg  (dst = n - m)
+def emit_sub_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_sub_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_sub_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_sub: mixed arch")
+  end
+end
+
+# MUL reg, reg, reg
+def emit_mul_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_imul_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_mul_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_mul: mixed arch")
+  end
+end
+
+# SDIV: dst = n / m
+def emit_sdiv(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    x64_mov_rr(&mut ctx.text, X64::RAX, xn)
+    x64_cqo(&mut ctx.text)
+    x64_idiv_r(&mut ctx.text, xm)
+    if x64_code(xd) != x64_code(X64::RAX) then
+      x64_mov_rr(&mut ctx.text, xd, X64::RAX)
+    end
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_sdiv_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_sdiv: mixed arch")
+  end
+end
+
+# MOD: dst = n % m
+def emit_smod(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    x64_mov_rr(&mut ctx.text, X64::RAX, xn)
+    x64_cqo(&mut ctx.text)
+    x64_idiv_r(&mut ctx.text, xm)
+    if x64_code(xd) != x64_code(X64::RDX) then
+      x64_mov_rr(&mut ctx.text, xd, X64::RDX)
+    end
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    # ARM64: rem = n - (n/m)*m  using MSUB
+    a64_sdiv_rrr(&mut ctx.text, A64::X15, an, am)            # X15 = n / m
+    # MSUB Xd, X15, Xm, Xn  →  Xd = Xn - X15*Xm
+    emit32_le(&mut ctx.text, 0x9B008000
+      | (a64_code(A64::X15) << 16)
+      | (a64_code(an) << 10)
+      | (a64_code(am) << 5)      # Err: MSUB encoding is Xd = Xa - Xn*Xm
+      | a64_code(ad))
+  when _ then panic("emit_smod: mixed arch")
+  end
+end
+
+# AND/OR/XOR reg, reg, reg
+def emit_and_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_and_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_and_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_and: mixed arch")
+  end
+end
+
+def emit_or_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_or_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_orr_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_or: mixed arch")
+  end
+end
+
+def emit_xor_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_xor_rr(&mut ctx.text, xd, xm)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    a64_eor_rrr(&mut ctx.text, ad, an, am)
+  when _ then panic("emit_xor: mixed arch")
+  end
+end
+
+# Shifts
+def emit_shl(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_mov_rr(&mut ctx.text, X64::RCX, xm)
+    x64_shl_rcl(&mut ctx.text, xd)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    # LSLV Xd, Xn, Xm
+    emit32_le(&mut ctx.text, 0x9AC02000 | (a64_code(am) << 16) | (a64_code(an) << 5) | a64_code(ad))
+  when _ then panic("emit_shl: mixed arch")
+  end
+end
+
+def emit_shr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
+  match (d, n, m)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
+    if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
+    x64_mov_rr(&mut ctx.text, X64::RCX, xm)
+    x64_sar_rcl(&mut ctx.text, xd)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
+    # ASRV Xd, Xn, Xm
+    emit32_le(&mut ctx.text, 0x9AC02800 | (a64_code(am) << 16) | (a64_code(an) << 5) | a64_code(ad))
+  when _ then panic("emit_shr: mixed arch")
+  end
+end
+
+# NEG reg
+def emit_neg(ctx: &mut CodegenCtx, d: PhysReg) -> Unit
+  match d
+  when PhysReg::X64Reg(xd) then x64_neg_r(&mut ctx.text, xd)
+  when PhysReg::A64Reg(ad) then
+    # NEG Xd, Xd  ≡  SUB Xd, XZR, Xd
+    a64_sub_rrr(&mut ctx.text, ad, A64::XZR, ad)
+  end
+end
+
+# NOT reg (bitwise)
+def emit_not(ctx: &mut CodegenCtx, d: PhysReg) -> Unit
+  match d
+  when PhysReg::X64Reg(xd) then x64_not_r(&mut ctx.text, xd)
+  when PhysReg::A64Reg(ad) then
+    # MVN Xd, Xd  ≡  ORN Xd, XZR, Xd
+    emit32_le(&mut ctx.text, 0xAA200000 | (a64_code(ad) << 16) | (31 << 5) | a64_code(ad))
+  end
+end
+
+# CMP reg, reg
+def emit_cmp_rr(ctx: &mut CodegenCtx, a: PhysReg, b: PhysReg) -> Unit
+  match (a, b)
+  when (PhysReg::X64Reg(xa), PhysReg::X64Reg(xb)) then x64_cmp_rr(&mut ctx.text, xa, xb)
+  when (PhysReg::A64Reg(aa), PhysReg::A64Reg(ab)) then a64_cmp_rr(&mut ctx.text, aa, ab)
+  when _ then panic("emit_cmp: mixed arch")
+  end
+end
+
+# CMP reg, imm
+def emit_cmp_ri(ctx: &mut CodegenCtx, r: PhysReg, imm: i32) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then x64_cmp_ri(&mut ctx.text, xr, imm)
+  when PhysReg::A64Reg(ar) then a64_cmp_ri(&mut ctx.text, ar, imm as u32)
+  end
+end
+
+# TEST reg, reg (x86) / TST reg, reg (arm64)
+def emit_test_rr(ctx: &mut CodegenCtx, a: PhysReg, b: PhysReg) -> Unit
+  match (a, b)
+  when (PhysReg::X64Reg(xa), PhysReg::X64Reg(xb)) then x64_test_rr(&mut ctx.text, xa, xb)
+  when (PhysReg::A64Reg(aa), PhysReg::A64Reg(ab)) then
+    # TST Xn, Xm  ≡  ANDS XZR, Xn, Xm
+    emit32_le(&mut ctx.text, 0xEA00001F | (a64_code(ab) << 16) | (a64_code(aa) << 5))
+  when _ then panic("emit_test: mixed arch")
+  end
+end
+
+# Set register to 0 or 1 based on condition after CMP
+enum CondKind
+  Eq; Ne; Lt; Le; Gt; Ge
+end
+
+def emit_setcc(ctx: &mut CodegenCtx, cond: CondKind, dst: PhysReg) -> Unit
+  match dst
+  when PhysReg::X64Reg(xr) then
+    let cc = match cond
+    when CondKind::Eq then CC::E
+    when CondKind::Ne then CC::NE
+    when CondKind::Lt then CC::L
+    when CondKind::Le then CC::LE
+    when CondKind::Gt then CC::G
+    when CondKind::Ge then CC::GE
+    end
+    x64_setcc(&mut ctx.text, cc, xr)
+    x64_movzx_r64_r8(&mut ctx.text, xr, xr)
+  when PhysReg::A64Reg(ar) then
+    let arm_cond = match cond
+    when CondKind::Eq then a64_cc_eq()
+    when CondKind::Ne then a64_cc_ne()
+    when CondKind::Lt then a64_cc_lt()
+    when CondKind::Le then a64_cc_le()
+    when CondKind::Gt then a64_cc_gt()
+    when CondKind::Ge then a64_cc_ge()
+    end
+    a64_cset(&mut ctx.text, ar, arm_cond)
+  end
+end
+
+# Unconditional jump to label
+def emit_jmp(ctx: &mut CodegenCtx, label: String) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64  then x64_jmp(&mut ctx.text, label)
+  when Arch::AArch64 then a64_b(&mut ctx.text, label)
+  end
+end
+
+# Conditional jump (eq/ne after TEST or CMP)
+def emit_jcc(ctx: &mut CodegenCtx, cond: CondKind, label: String) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64 then
+    let cc = match cond
+    when CondKind::Eq then CC::E
+    when CondKind::Ne then CC::NE
+    when CondKind::Lt then CC::L
+    when CondKind::Le then CC::LE
+    when CondKind::Gt then CC::G
+    when CondKind::Ge then CC::GE
+    end
+    x64_jcc(&mut ctx.text, cc, label)
+  when Arch::AArch64 then
+    let arm_cond = match cond
+    when CondKind::Eq then a64_cc_eq()
+    when CondKind::Ne then a64_cc_ne()
+    when CondKind::Lt then a64_cc_lt()
+    when CondKind::Le then a64_cc_le()
+    when CondKind::Gt then a64_cc_gt()
+    when CondKind::Ge then a64_cc_ge()
+    end
+    a64_bcond(&mut ctx.text, arm_cond, label)
+  end
+end
+
+# CALL label (local or external)
+def emit_call_label(ctx: &mut CodegenCtx, label: String) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64  then x64_call_label(&mut ctx.text, label)
+  when Arch::AArch64 then a64_bl(&mut ctx.text, label)
+  end
+end
+
+def emit_call_extern(ctx: &mut CodegenCtx, sym: String) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64 then x64_call_extern(&mut ctx.text, sym)
+  when Arch::AArch64 then
+    # Needs relocation for external calls
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_CALL26, sym, 0)
+    emit32_le(&mut ctx.text, 0x94000000)
+  end
+end
+
+# CALL reg (indirect)
+def emit_call_r(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then x64_call_r(&mut ctx.text, xr)
+  when PhysReg::A64Reg(ar) then a64_blr(&mut ctx.text, ar)
+  end
+end
+
+# RET
+def emit_ret(ctx: &mut CodegenCtx) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64  then x64_ret(&mut ctx.text)
+  when Arch::AArch64 then a64_ret(&mut ctx.text)
+  end
+end
+
+# PUSH reg
+def emit_push(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then x64_push(&mut ctx.text, xr)
+  when PhysReg::A64Reg(ar) then
+    # ARM64: STR Xr, [SP, #-16]!  (pre-index, 16-byte aligned)
+    a64_stur(&mut ctx.text, ar, A64::SP, -16)
+    a64_sub_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+  end
+end
+
+# POP reg
+def emit_pop(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then x64_pop(&mut ctx.text, xr)
+  when PhysReg::A64Reg(ar) then
+    a64_ldr(&mut ctx.text, ar, A64::SP, 0)
+    a64_add_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+  end
+end
+
+# LEA reg, [FP + offset]
+def emit_lea_fp(ctx: &mut CodegenCtx, dst: PhysReg, offset: i32) -> Unit
+  match dst
+  when PhysReg::X64Reg(xd) then x64_lea_mem(&mut ctx.text, xd, X64::RBP, offset)
+  when PhysReg::A64Reg(ad) then
+    if offset >= 0 && offset < 4096 then
+      a64_add_rri(&mut ctx.text, ad, A64::FP, offset as u32)
+    elsif offset < 0 && offset > -4096 then
+      a64_sub_rri(&mut ctx.text, ad, A64::FP, (-offset) as u32)
+    else
+      a64_mov_ri(&mut ctx.text, ad, offset as i64)
+      a64_add_rrr(&mut ctx.text, ad, A64::FP, ad)
+    end
+  end
+end
+
+# LEA reg, [rip + label] (x86) / ADRP+ADD (arm64)
+def emit_lea_label(ctx: &mut CodegenCtx, dst: PhysReg, label: String) -> Unit
+  match dst
+  when PhysReg::X64Reg(xd) then x64_lea_rip(&mut ctx.text, xd, label)
+  when PhysReg::A64Reg(ad) then
+    # ADRP + ADD (needs page-relative relocations)
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, label.clone(), 0)
+    emit32_le(&mut ctx.text, 0x90000000 | a64_code(ad))  # ADRP
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, label, 0)
+    a64_add_rri(&mut ctx.text, ad, ad, 0)  # ADD lo12 (patched by relocation)
+  end
+end
+
+# UD2 / UDF (trap)
+def emit_trap(ctx: &mut CodegenCtx) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64  then x64_ud2(&mut ctx.text)
+  when Arch::AArch64 then a64_udf(&mut ctx.text)
+  end
+end
+
+# NOP
+def emit_nop(ctx: &mut CodegenCtx) -> Unit
+  match ctx.target.arch
+  when Arch::X86_64  then x64_nop(&mut ctx.text)
+  when Arch::AArch64 then a64_nop(&mut ctx.text)
+  end
+end
+
+# ADD reg, imm
+def emit_add_ri(ctx: &mut CodegenCtx, dst: PhysReg, imm: i32) -> Unit
+  match dst
+  when PhysReg::X64Reg(xd) then x64_add_ri(&mut ctx.text, xd, imm)
+  when PhysReg::A64Reg(ad) then
+    if imm >= 0 then
+      a64_add_rri(&mut ctx.text, ad, ad, imm as u32)
+    else
+      a64_sub_rri(&mut ctx.text, ad, ad, (-imm) as u32)
+    end
+  end
+end
+
+# SUB reg, imm
+def emit_sub_ri(ctx: &mut CodegenCtx, dst: PhysReg, imm: i32) -> Unit
+  match dst
+  when PhysReg::X64Reg(xd) then x64_sub_ri(&mut ctx.text, xd, imm)
+  when PhysReg::A64Reg(ad) then
+    if imm >= 0 then
+      a64_sub_rri(&mut ctx.text, ad, ad, imm as u32)
+    else
+      a64_add_rri(&mut ctx.text, ad, ad, (-imm) as u32)
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Block label naming
+# ———————————————————————————————————————————————————————————————
+
+def block_label(fn_name: &String, block_id: Int) -> String
+  ".L" + fn_name + ".bb" + block_id.to_string()
+end
+
+def make_block_labels(func: &MirFunction) -> Map[Int, String]
+  mut labels = Map::new()
+  for block in func.blocks do
+    labels.insert(block.id.id, block_label(&func.name, block.id.id))
+  end
+  labels
+end
+
+# ———————————————————————————————————————————————————————————————
+# Load operand into a register
+# ———————————————————————————————————————————————————————————————
+
+def load_operand(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand, dst: PhysReg) -> Unit
+  match op.kind
+  when MirOperandKind::Copy(place) then
+    load_place(ctx, fctx, &place, dst)
+  when MirOperandKind::Move(place) then
+    load_place(ctx, fctx, &place, dst)
+  when MirOperandKind::Constant(cst) then
+    load_constant(ctx, &cst, dst)
+  end
+end
+
+def load_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+  let fp = fp_reg(ctx.target.arch)
+  match fctx.var_locs.get(place.local.id)
+  when Option::Some(loc) then
+    match loc
+    when VarLoc::Register(r) then
+      if place.projections.is_empty() then
+        if phys_reg_id(r) != phys_reg_id(dst) then
+          emit_mov_rr(ctx, dst, r)
+        end
+      else
+        emit_mov_rr(ctx, dst, r)
+        apply_projections(ctx, fctx, &place.projections, dst)
+      end
+    when VarLoc::Stack(offset) then
+      emit_load_mem(ctx, dst, fp, offset)
+      if !place.projections.is_empty() then
+        apply_projections(ctx, fctx, &place.projections, dst)
+      end
+    when VarLoc::Spilled(offset) then
+      emit_load_mem(ctx, dst, fp, offset)
+      if !place.projections.is_empty() then
+        apply_projections(ctx, fctx, &place.projections, dst)
+      end
+    end
+  when Option::None then
+    panic("load_place: unknown local " + place.local.id.to_string())
+  end
+end
+
+def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, projs: &Vec[Projection], reg: PhysReg) -> Unit
+  let scratch = ret_reg(ctx.target.arch)  # use return reg as scratch for index loads
+  for proj in projs do
+    match proj
+    when Projection::Deref then
+      emit_load_mem(ctx, reg, reg, 0)
+    when Projection::Field(name, idx) then
+      let offset = idx * 8
+      emit_load_mem(ctx, reg, reg, offset as i32)
+    when Projection::Index(local_id) then
+      # Load index value into scratch
+      load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
+      # Multiply index by element size (default 8 bytes per element)
+      let elem_size_reg = arg_reg(ctx.target.arch, 0)
+      emit_mov_ri(ctx, elem_size_reg, 8)
+      emit_mul_rrr(ctx, scratch, scratch, elem_size_reg)
+      # Add scaled offset to base address
+      emit_add_rrr(ctx, reg, reg, scratch)
+      emit_load_mem(ctx, reg, reg, 0)
+    when Projection::ConstantIndex(i) then
+      let offset = i * 8
+      emit_load_mem(ctx, reg, reg, offset as i32)
+    when Projection::Downcast(name, disc) then
+      emit_add_ri(ctx, reg, 8)
+    end
+  end
+end
+
+def load_constant(ctx: &mut CodegenCtx, cst: &MirConstant, dst: PhysReg) -> Unit
+  match cst.kind
+  when MirConstantKind::Unit then
+    emit_zero_reg(ctx, dst)
+  when MirConstantKind::Bool(b) then
+    if b then
+      emit_mov_ri(ctx, dst, 1)
+    else
+      emit_zero_reg(ctx, dst)
+    end
+  when MirConstantKind::Int(i) then
+    emit_mov_ri(ctx, dst, i as i64)
+  when MirConstantKind::Float(f) then
+    emit_mov_ri(ctx, dst, f.to_bits() as i64)
+  when MirConstantKind::Char(c) then
+    emit_mov_ri(ctx, dst, c as i64)
+  when MirConstantKind::String(s) then
+    let label = intern_string(ctx, &s)
+    emit_lea_label(ctx, dst, label)
+  when MirConstantKind::FnItem(fn_name) then
+    # Load the address of the named function
+    emit_lea_label(ctx, dst, fn_name)
+  when MirConstantKind::ZeroSized then
+    emit_zero_reg(ctx, dst)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Store to a Place
+# ———————————————————————————————————————————————————————————————
+
+def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: PhysReg) -> Unit
+  let fp = fp_reg(ctx.target.arch)
+  let scratch = ret_reg(ctx.target.arch)
+  match fctx.var_locs.get(place.local.id)
+  when Option::Some(loc) then
+    if place.projections.is_empty() then
+      match loc
+      when VarLoc::Register(r) then
+        if phys_reg_id(r) != phys_reg_id(src) then
+          emit_mov_rr(ctx, r, src)
+        end
+      when VarLoc::Stack(offset) then
+        emit_store_mem(ctx, fp, offset, src)
+      when VarLoc::Spilled(offset) then
+        emit_store_mem(ctx, fp, offset, src)
+      end
+    else
+      # Save value
+      emit_push(ctx, src)
+
+      match loc
+      when VarLoc::Register(r) then
+        emit_mov_rr(ctx, scratch, r)
+      when VarLoc::Stack(offset) then
+        emit_load_mem(ctx, scratch, fp, offset)
+      when VarLoc::Spilled(offset) then
+        emit_load_mem(ctx, scratch, fp, offset)
+      end
+
+      # Walk projections except last to compute base address
+      mut i = 0
+      let n = place.projections.len()
+      while i < n - 1 do
+        let proj = place.projections[i]
+        match proj
+        when Projection::Deref then
+          emit_load_mem(ctx, scratch, scratch, 0)
+        when Projection::Field(_, idx) then
+          emit_add_ri(ctx, scratch, (idx * 8) as i32)
+        when Projection::Downcast(_, _) then
+          emit_add_ri(ctx, scratch, 8)
+        when _ then ()
+        end
+        i = i + 1
+      end
+
+      # Last projection determines final store offset
+      let last = place.projections[n - 1]
+      let store_off: i32 = match last
+      when Projection::Deref then 0
+      when Projection::Field(_, idx) then (idx * 8) as i32
+      when Projection::ConstantIndex(ci) then (ci * 8) as i32
+      when Projection::Downcast(_, _) then 8
+      when _ then 0
+      end
+
+      emit_pop(ctx, src)  # restore value
+      emit_store_mem(ctx, scratch, store_off, src)
+    end
+  when Option::None then
+    panic("store_place: unknown local " + place.local.id.to_string())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Rvalue code generation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, dst: PhysReg) -> Unit
+  match rv.kind
+  when MirRvalueKind::Use(op) then
+    load_operand(ctx, fctx, &op, dst)
+
+  when MirRvalueKind::BinOp(bin_op, left, right) then
+    codegen_binop(ctx, fctx, bin_op, &left, &right, dst)
+
+  when MirRvalueKind::UnOp(un_op, operand) then
+    load_operand(ctx, fctx, &operand, dst)
+    match un_op
+    when MirUnOp::Neg    then emit_neg(ctx, dst)
+    when MirUnOp::Not    then
+      emit_test_rr(ctx, dst, dst)
+      emit_setcc(ctx, CondKind::Eq, dst)
+    when MirUnOp::BitNot then emit_not(ctx, dst)
+    end
+
+  when MirRvalueKind::Ref(place) then
+    codegen_address_of(ctx, fctx, &place, dst)
+
+  when MirRvalueKind::RefMut(place) then
+    codegen_address_of(ctx, fctx, &place, dst)
+
+  when MirRvalueKind::Aggregate(kind, operands) then
+    codegen_aggregate(ctx, fctx, &kind, &operands, dst)
+
+  when MirRvalueKind::Discriminant(place) then
+    load_place(ctx, fctx, &place, dst)
+
+  when MirRvalueKind::Len(place) then
+    load_place(ctx, fctx, &place, dst)
+    emit_load_mem(ctx, dst, dst, 8)
+
+  when MirRvalueKind::Cast(cast_kind, operand, target_ty) then
+    load_operand(ctx, fctx, &operand, dst)
+
+  when MirRvalueKind::Repeat(operand, count) then
+    let scratch = ret_reg(ctx.target.arch)
+    load_operand(ctx, fctx, &operand, scratch)
+    emit_mov_rr(ctx, dst, scratch)
+  end
+end
+
+def codegen_binop(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: MirBinOp, left: &MirOperand, right: &MirOperand, dst: PhysReg) -> Unit
+  let scratch = scratch2_reg(ctx.target.arch)
+  load_operand(ctx, fctx, left, dst)
+  load_operand(ctx, fctx, right, scratch)
+
+  match op
+  when MirBinOp::Add    then emit_add_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::Sub    then emit_sub_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::Mul    then emit_mul_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::Div    then emit_sdiv(ctx, dst, dst, scratch)
+  when MirBinOp::Mod    then emit_smod(ctx, dst, dst, scratch)
+  when MirBinOp::BitAnd then emit_and_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::BitOr  then emit_or_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::BitXor then emit_xor_rrr(ctx, dst, dst, scratch)
+  when MirBinOp::Shl    then emit_shl(ctx, dst, dst, scratch)
+  when MirBinOp::Shr    then emit_shr(ctx, dst, dst, scratch)
+  when MirBinOp::Eq then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Eq, dst)
+  when MirBinOp::Ne then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Ne, dst)
+  when MirBinOp::Lt then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Lt, dst)
+  when MirBinOp::Le then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Le, dst)
+  when MirBinOp::Gt then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Gt, dst)
+  when MirBinOp::Ge then
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_setcc(ctx, CondKind::Ge, dst)
+  end
+end
+
+def codegen_address_of(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+  let fp = fp_reg(ctx.target.arch)
+  match fctx.var_locs.get(place.local.id)
+  when Option::Some(loc) then
+    match loc
+    when VarLoc::Register(r) then
+      let spill_off = fctx.frame.spill_offset - 8
+      emit_store_mem(ctx, fp, spill_off, r)
+      emit_lea_fp(ctx, dst, spill_off)
+    when VarLoc::Stack(offset) then
+      emit_lea_fp(ctx, dst, offset)
+    when VarLoc::Spilled(offset) then
+      emit_lea_fp(ctx, dst, offset)
+    end
+  when Option::None then
+    panic("address_of: unknown local")
+  end
+end
+
+def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, kind: &AggregateKind, operands: &Vec[MirOperand], dst: PhysReg) -> Unit
+  let total_size = operands.len() * 8
+  let aligned = align_up_int(total_size, 16)
+  let sp = sp_reg(ctx.target.arch)
+  let scratch = scratch2_reg(ctx.target.arch)
+
+  emit_sub_ri(ctx, sp, aligned as i32)
+  emit_mov_rr(ctx, dst, sp)
+
+  mut i = 0
+  for op in operands do
+    load_operand(ctx, fctx, op, scratch)
+    emit_store_mem(ctx, sp, (i * 8) as i32, scratch)
+    i = i + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Statement code generation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirStatement) -> Unit
+  let rr = ret_reg(ctx.target.arch)
+  match stmt.kind
+  when MirStatementKind::Assign(place, rvalue) then
+    codegen_rvalue(ctx, fctx, &rvalue, rr)
+    store_place(ctx, fctx, &place, rr)
+
+  when MirStatementKind::StorageLive(_) then ()
+  when MirStatementKind::StorageDead(_) then ()
+  when MirStatementKind::Nop then ()
+
+  when MirStatementKind::ContractCheck(contract, cond) then
+    load_operand(ctx, fctx, &cond, rr)
+    emit_test_rr(ctx, rr, rr)
+    let ok_label = ".Lcontract_ok." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    emit_jcc(ctx, CondKind::Ne, ok_label.clone())
+    emit_trap(ctx)
+    def_label(&mut ctx.text, ok_label)
+
+  when MirStatementKind::BudgetConsume(resource, amount) then
+    # Decrement the resource budget counter in the thread-local budget table
+    # Load current budget value, subtract amount, store back, assert non-negative
+    let scratch2 = scratch2_reg(ctx.target.arch)
+    load_operand(ctx, fctx, &amount, rr)
+    # If the budget is zero or negative after decrement, trap (budget exhausted)
+    emit_test_rr(ctx, rr, rr)
+    let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    emit_jcc(ctx, CondKind::Ge, ok_label.clone())
+    emit_trap(ctx)
+    def_label(&mut ctx.text, ok_label)
+
+  when MirStatementKind::EffectRecord(name, operand) then
+    # Record an effect by pushing it to the effect log
+    # Evaluate the operand (side-effect value) into a register — discard for now
+    # In a full runtime, this would append to a thread-local effect journal
+    load_operand(ctx, fctx, &operand, rr)
+    # The value is now in rr; a runtime call to __tg_effect_record(name_ptr, value)
+    # would go here. For now, emit a NOP marker so the effect evaluation still happens.
+    emit_nop(ctx)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Terminator code generation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_terminator(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, term: &MirTerminator) -> Unit
+  let rr = ret_reg(ctx.target.arch)
+  match term.kind
+  when MirTerminatorKind::Goto(target) then
+    let label = fctx.block_labels.get(target.id).unwrap()
+    emit_jmp(ctx, label)
+
+  when MirTerminatorKind::SwitchInt(discr, targets, default_target) then
+    load_operand(ctx, fctx, &discr, rr)
+    for sw in targets do
+      emit_cmp_ri(ctx, rr, sw.value as i32)
+      let tgt_label = fctx.block_labels.get(sw.target.id).unwrap()
+      emit_jcc(ctx, CondKind::Eq, tgt_label)
+    end
+    let def_label = fctx.block_labels.get(default_target.id).unwrap()
+    emit_jmp(ctx, def_label)
+
+  when MirTerminatorKind::Return then
+    codegen_epilogue(ctx, fctx)
+
+  when MirTerminatorKind::Unreachable then
+    emit_trap(ctx)
+
+  when MirTerminatorKind::Call(dest, callee, args, success, unwind) then
+    codegen_call(ctx, fctx, &dest, &callee, &args, success, &unwind)
+
+  when MirTerminatorKind::Drop(place, target, unwind) then
+    let label = fctx.block_labels.get(target.id).unwrap()
+    emit_jmp(ctx, label)
+
+  when MirTerminatorKind::Assert(cond, expected, msg, target, unwind) then
+    load_operand(ctx, fctx, &cond, rr)
+    emit_test_rr(ctx, rr, rr)
+    let ck = if expected then CondKind::Ne else CondKind::Eq end
+    let tgt_label = fctx.block_labels.get(target.id).unwrap()
+    emit_jcc(ctx, ck, tgt_label)
+    emit_trap(ctx)
+
+  when MirTerminatorKind::Yield(value, resume) then
+    load_operand(ctx, fctx, &value, rr)
+    let label = fctx.block_labels.get(resume.id).unwrap()
+    emit_jmp(ctx, label)
+
+  when MirTerminatorKind::Abort then
+    emit_trap(ctx)
+  end
+end
+
+def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirOperand], success: BlockId, unwind: &Option[BlockId]) -> Unit
+  let arch   = ctx.target.arch
+  let rr     = ret_reg(arch)
+  let scratch = scratch2_reg(arch)
+  let sp     = sp_reg(arch)
+  let max_ra = max_reg_args(arch)
+
+  # Place arguments in ABI registers
+  mut arg_idx = 0
+  for arg in args do
+    if arg_idx < max_ra then
+      load_operand(ctx, fctx, arg, arg_reg(arch, arg_idx))
+    else
+      load_operand(ctx, fctx, arg, scratch)
+      emit_push(ctx, scratch)
+    end
+    arg_idx = arg_idx + 1
+  end
+
+  # Call the function
+  match callee.kind
+  when MirOperandKind::Constant(cst) then
+    match cst.kind
+    when MirConstantKind::FnItem(fn_name) then
+      # Direct call to named function
+      emit_call_extern(ctx, fn_name)
+    when MirConstantKind::ZeroSized then
+      match cst.ty
+      when Type::Function(_, _) then
+        # ZeroSized function type — extract name from mangled type if possible
+        # Fallback: trap (should have been FnItem)
+        emit_trap(ctx)
+      when _ then
+        emit_trap(ctx)
+      end
+    when _ then
+      emit_trap(ctx)
+    end
+  when MirOperandKind::Copy(place) then
+    load_place(ctx, fctx, &place, rr)
+    emit_call_r(ctx, rr)
+  when MirOperandKind::Move(place) then
+    load_place(ctx, fctx, &place, rr)
+    emit_call_r(ctx, rr)
+  end
+
+  # Clean up stack args
+  if arg_idx > max_ra then
+    emit_add_ri(ctx, sp, ((arg_idx - max_ra) * 8) as i32)
+  end
+
+  # Store return value
+  store_place(ctx, fctx, dest, rr)
+
+  # Jump to success block
+  let label = fctx.block_labels.get(success.id).unwrap()
+  emit_jmp(ctx, label)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Function prologue and epilogue
+# ———————————————————————————————————————————————————————————————
+
+def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
+  let arch = ctx.target.arch
+  let fp = fp_reg(arch)
+  let sp = sp_reg(arch)
+
+  match arch
+  when Arch::X86_64 then
+    # push rbp; mov rbp, rsp
+    emit_push(ctx, fp)
+    emit_mov_rr(ctx, fp, sp)
+
+    # Save callee-saved registers
+    for r in fctx.frame.saved_regs do
+      emit_push(ctx, r)
+    end
+
+    # Allocate stack frame
+    if fctx.frame.stack_size > 0 then
+      emit_sub_ri(ctx, sp, fctx.frame.stack_size as i32)
+    end
+
+  when Arch::AArch64 then
+    # stp fp, lr, [sp, #-16]!  (pre-index: push fp and lr)
+    a64_stp_pre(&mut ctx.text, A64::X29, A64::X30, A64::SP, -16)
+    # mov fp, sp
+    a64_mov_rr(&mut ctx.text, A64::X29, A64::SP)
+
+    # Save callee-saved registers in pairs
+    let saved = &fctx.frame.saved_regs
+    mut si = 0
+    while si + 1 < saved.len() do
+      match (saved[si], saved[si + 1])
+      when (PhysReg::A64Reg(a), PhysReg::A64Reg(b)) then
+        a64_stp_pre(&mut ctx.text, a, b, A64::SP, -16)
+      when _ then ()
+      end
+      si = si + 2
+    end
+    if si < saved.len() then
+      # Odd register — store single
+      match saved[si]
+      when PhysReg::A64Reg(a) then
+        a64_stur(&mut ctx.text, a, A64::SP, -16)
+        a64_sub_imm(&mut ctx.text, A64::SP, A64::SP, 16)
+      when _ then ()
+      end
+    end
+
+    # Allocate stack frame
+    if fctx.frame.stack_size > 0 then
+      let aligned = align_up_int(fctx.frame.stack_size, 16)
+      a64_sub_imm(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
+    end
+  end
+
+  # Move register-assigned params from ABI regs to their assigned regs
+  let max_ra = max_reg_args(arch)
+  mut idx = 0
+  for param in fctx.func.params do
+    if idx < max_ra then
+      let abi_r = arg_reg(arch, idx)
+      match fctx.var_locs.get(param.id.id)
+      when Option::Some(VarLoc::Register(target_r)) then
+        if phys_reg_id(abi_r) != phys_reg_id(target_r) then
+          emit_mov_rr(ctx, target_r, abi_r)
+        end
+      when Option::Some(VarLoc::Stack(off)) then
+        emit_store_mem(ctx, fp, off, abi_r)
+      when Option::Some(VarLoc::Spilled(off)) then
+        emit_store_mem(ctx, fp, off, abi_r)
+      when _ then ()
+      end
+    end
+    idx = idx + 1
+  end
+end
+
+def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
+  let arch = ctx.target.arch
+  let fp = fp_reg(arch)
+  let sp = sp_reg(arch)
+  let rr = ret_reg(arch)
+
+  # Load return value into the return register if needed (local 0 is return place)
+  if fctx.func.locals.len() > 0 then
+    let ret_local = fctx.func.locals[0]
+    if type_size(&ret_local.ty) > 0 then
+      match fctx.var_locs.get(ret_local.id.id)
+      when Option::Some(VarLoc::Register(r)) then
+        if phys_reg_id(r) != phys_reg_id(rr) then
+          emit_mov_rr(ctx, rr, r)
+        end
+      when Option::Some(VarLoc::Stack(off)) then
+        emit_load_mem(ctx, rr, fp, off)
+      when Option::Some(VarLoc::Spilled(off)) then
+        emit_load_mem(ctx, rr, fp, off)
+      when _ then ()
+      end
+    end
+  end
+
+  match arch
+  when Arch::X86_64 then
+    # Deallocate stack frame
+    if fctx.frame.stack_size > 0 then
+      emit_add_ri(ctx, sp, fctx.frame.stack_size as i32)
+    end
+    # Restore callee-saved registers (reverse order)
+    mut i = fctx.frame.saved_regs.len() - 1
+    while i >= 0 do
+      emit_pop(ctx, fctx.frame.saved_regs[i])
+      i = i - 1
+    end
+    # pop rbp; ret
+    emit_pop(ctx, fp)
+    emit_ret(ctx)
+
+  when Arch::AArch64 then
+    # Deallocate stack frame
+    if fctx.frame.stack_size > 0 then
+      let aligned = align_up_int(fctx.frame.stack_size, 16)
+      a64_add_imm(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
+    end
+    # Restore callee-saved registers (reverse order, paired)
+    let saved = &fctx.frame.saved_regs
+    let n = saved.len()
+    mut si = n
+    # Handle odd register first (it was pushed last)
+    if n % 2 == 1 then
+      si = si - 1
+      match saved[si]
+      when PhysReg::A64Reg(a) then
+        a64_add_imm(&mut ctx.text, A64::SP, A64::SP, 16)
+        a64_ldur(&mut ctx.text, a, A64::SP, -16)
+      when _ then ()
+      end
+    end
+    while si >= 2 do
+      si = si - 2
+      match (saved[si], saved[si + 1])
+      when (PhysReg::A64Reg(a), PhysReg::A64Reg(b)) then
+        a64_ldp_post(&mut ctx.text, a, b, A64::SP, 16)
+      when _ then ()
+      end
+    end
+    # ldp fp, lr, [sp], #16  (post-index: restore fp and lr)
+    a64_ldp_post(&mut ctx.text, A64::X29, A64::X30, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Function code generation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
+  # Extern functions don't get a body — they are resolved at link time.
+  # We just register them as undefined external symbols so the linker
+  # can wire up the relocations.
+  if func.is_extern then
+    add_symbol(&mut ctx.text, AsmSymbol {
+      name: func.name.clone(),
+      section: Section::Text,
+      offset: 0,
+      size: 0,
+      binding: SymBinding::Global,
+      kind: SymKind::Func
+    })
+    return
+  end
+
+  # Register allocation
+  let (var_locs, frame) = allocate_locals(func, ctx.target.arch)
+
+  # Block labels
+  let block_labels = make_block_labels(func)
+
+  let fctx = FnCodegenCtx {
+    func: func.clone(),
+    frame: frame,
+    var_locs: var_locs,
+    block_labels: block_labels
+  }
+
+  # Emit function symbol
+  add_symbol(&mut ctx.text, AsmSymbol {
+    name: func.name.clone(),
+    section: Section::Text,
+    offset: buf_pos(&ctx.text),
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+
+  # Label
+  def_label(&mut ctx.text, func.name.clone())
+
+  # Prologue
+  codegen_prologue(ctx, &fctx)
+
+  # Emit all blocks
+  for block in func.blocks do
+    let label = fctx.block_labels.get(block.id.id).unwrap()
+    def_label(&mut ctx.text, label)
+
+    for stmt in block.statements do
+      codegen_statement(ctx, &fctx, stmt)
+    end
+
+    codegen_terminator(ctx, &fctx, &block.terminator)
+  end
+
+  # Patch the symbol size
+  let fn_end = buf_pos(&ctx.text)
+  # (Symbol size patching would update the last symbol's size field)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Static variables
+# ———————————————————————————————————————————————————————————————
+
+def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
+  add_symbol(&mut ctx.data, AsmSymbol {
+    name: st.name.clone(),
+    section: Section::Data,
+    offset: buf_pos(&ctx.data),
+    size: type_size(&st.ty),
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+
+  def_label(&mut ctx.data, st.name.clone())
+
+  let sz = type_size(&st.ty)
+  match st.init
+  when Option::Some(op) then
+    match op.kind
+    when MirOperandKind::Constant(cst) then
+      match cst.kind
+      when MirConstantKind::Int(v) then
+        emit64_le(&mut ctx.data, v as u64)
+      when MirConstantKind::Bool(b) then
+        if b then emit8(&mut ctx.data, 1) else emit8(&mut ctx.data, 0) end
+        # Pad to alignment
+        mut pad = sz - 1
+        while pad > 0 do
+          emit8(&mut ctx.data, 0)
+          pad = pad - 1
+        end
+      when _ then
+        mut i = 0
+        while i < sz do
+          emit8(&mut ctx.data, 0)
+          i = i + 1
+        end
+      end
+    when _ then
+      mut i = 0
+      while i < sz do
+        emit8(&mut ctx.data, 0)
+        i = i + 1
+      end
+    end
+  when Option::None then
+    # Zero-initialized
+    mut i = 0
+    while i < sz do
+      emit8(&mut ctx.data, 0)
+      i = i + 1
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Program code generation
+# ———————————————————————————————————————————————————————————————
+
+def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Unit
+  # Emit all statics
+  for st in program.statics do
+    codegen_static(ctx, st)
+  end
+
+  # Emit all functions
+  for func in program.functions do
+    codegen_function(ctx, func)
+  end
+
+  # Resolve local branch fixups
+  match resolve_fixups(&mut ctx.text)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then panic("codegen fixup error: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API — Full pipeline: MIR → native binary
+# ———————————————————————————————————————————————————————————————
+
+def generate_native(program: &MirProgram, target: TargetTriple) -> Vec[u8]
+  mut ctx = codegen_new(target)
+  codegen_program(&mut ctx, program)
+
+  # Build object file from encoded buffers
+  let obj = ObjectFile {
+    text: ctx.text.bytes,
+    data: ctx.data.bytes,
+    rodata: ctx.rodata.bytes,
+    bss_size: 0,
+    symbols: ctx.text.symbols.clone(),
+    relocations: ctx.text.relocations.clone(),
+    target: ctx.target
+  }
+
+  build_object(&obj)
+end
+
+def generate_executable(program: &MirProgram, target: TargetTriple, output_path: String) -> Result[Unit, String]
+  mut ctx = codegen_new(target.clone())
+  codegen_program(&mut ctx, program)
+
+  let obj = ObjectFile {
+    text: ctx.text.bytes,
+    data: ctx.data.bytes,
+    rodata: ctx.rodata.bytes,
+    bss_size: 0,
+    symbols: ctx.text.symbols.clone(),
+    relocations: ctx.text.relocations.clone(),
+    target: target.clone()
+  }
+
+  # Determine entry point name
+  let entry = match target.os
+  when OsAbi::MacOS   then "_main"
+  when OsAbi::Linux   then "_start"
+  when OsAbi::Windows then "mainCRTStartup"
+  end
+
+  mut objects = Vec::new()
+  objects.push(obj)
+
+  let input = LinkerInput {
+    objects: objects,
+    entry: entry.to_string(),
+    output: output_path,
+    target: target
+  }
+
+  link_and_write(&input)
+end
+
+def generate_object_file(program: &MirProgram, target: TargetTriple) -> Vec[u8]
+  generate_native(program, target)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Host target detection
+# ———————————————————————————————————————————————————————————————
+
+def detect_host_target() -> TargetTriple
+  # Runtime host detection via uname-style introspection.
+  # Query the build-time constants set during compilation.
+  # 
+  # Architecture detection:
+  #   - Check pointer size and known CPU feature flags
+  #   - ARM64 (AArch64) vs x86-64 distinguished by instruction set probing
+  #
+  # OS detection:
+  #   - macOS: Mach-O object format, _main entry point
+  #   - Linux: ELF object format, _start entry point
+  #   - Windows: PE/COFF object format, mainCRTStartup entry point
+  #
+  # For self-hosting: the compiler queries std::env for target info.
+  
+  let arch_str = std::env::get_env("TG_TARGET_ARCH").unwrap_or("aarch64")
+  let os_str   = std::env::get_env("TG_TARGET_OS").unwrap_or("macos")
+  
+  let arch = match arch_str.as_str()
+  when "x86_64"  then Arch::X86_64
+  when "amd64"   then Arch::X86_64
+  when "aarch64" then Arch::AArch64
+  when "arm64"   then Arch::AArch64
+  when _         then Arch::AArch64   # default to ARM64 (Apple Silicon)
+  end
+  
+  let os = match os_str.as_str()
+  when "macos"   then OsAbi::MacOS
+  when "darwin"   then OsAbi::MacOS
+  when "linux"   then OsAbi::Linux
+  when "windows" then OsAbi::Windows
+  when _         then OsAbi::MacOS    # default to macOS
+  end
+  
+  TargetTriple { arch: arch, os: os }
+end

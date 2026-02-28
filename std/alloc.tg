@@ -1,0 +1,486 @@
+# Tangerine Standard Library — Memory Allocator Interface
+#
+# Provides pluggable memory allocation with support for:
+# - Global allocator (default heap allocator)
+# - Custom allocators (arena, bump, pool, etc.)
+# - Allocator traits for generic code
+#
+# This module uses extern "C" to interface with system allocators.
+
+use std::core::{Option, Result, panic}
+
+# ———————————————————————————————————————————————————————————————
+# Allocator Trait
+# ———————————————————————————————————————————————————————————————
+
+trait Allocator
+  # Allocate memory of the given size and alignment.
+  # Returns null pointer on failure.
+  def allocate(self: &Self, size: UInt, align: UInt) -> Ptr[u8]
+  
+  # Deallocate memory previously allocated by this allocator.
+  def deallocate(self: &Self, ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+  
+  # Reallocate memory to a new size, preserving contents.
+  # May return a different pointer.
+  def reallocate(self: &Self, ptr: Ptr[u8], old_size: UInt, new_size: UInt, align: UInt) -> Ptr[u8]
+  
+  # Grow allocation in place if possible.
+  def grow_in_place(self: &Self, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+  
+  # Shrink allocation in place.
+  def shrink_in_place(self: &Self, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+end
+
+# ———————————————————————————————————————————————————————————————
+# Layout Information
+# ———————————————————————————————————————————————————————————————
+
+struct Layout
+  size: UInt
+  align: UInt
+end
+
+def layout_new(size: UInt, align: UInt) -> Result[Layout, String]
+  # Alignment must be a power of two
+  if align == 0 || (align & (align - 1)) != 0 then
+    return Result::Err("Alignment must be a power of two".to_string())
+  end
+  
+  # Size must be a multiple of alignment (for arrays)
+  if size % align != 0 then
+    return Result::Err("Size must be a multiple of alignment".to_string())
+  end
+  
+  Result::Ok(Layout { size: size, align: align })
+end
+
+def layout_from_size_align_unchecked(size: UInt, align: UInt) -> Layout
+  Layout { size: size, align: align }
+end
+
+def layout_for[T]() -> Layout
+  # Get size and alignment for type T
+  # This is a compiler intrinsic
+  Layout {
+    size: size_of[T](),
+    align: align_of[T]()
+  }
+end
+
+def layout_array[T](count: UInt) -> Result[Layout, String]
+  let elem_layout = layout_for[T]()
+  let array_size = elem_layout.size * count
+  
+  # Check for overflow
+  if count != 0 && array_size / count != elem_layout.size then
+    return Result::Err("Array size overflow".to_string())
+  end
+  
+  layout_new(array_size, elem_layout.align)
+end
+
+# Compiler intrinsics for type info
+extern "Tangerine"
+  def size_of[T]() -> UInt
+  def align_of[T]() -> UInt
+end
+
+# ———————————————————————————————————————————————————————————————
+# System Allocator (libc malloc/free)
+# ———————————————————————————————————————————————————————————————
+
+extern "C"
+  def malloc(size: UInt) -> Ptr[u8]
+  def free(ptr: Ptr[u8]) -> Unit
+  def realloc(ptr: Ptr[u8], size: UInt) -> Ptr[u8]
+  def calloc(count: UInt, size: UInt) -> Ptr[u8]
+  
+  # Aligned allocation (POSIX)
+  def posix_memalign(memptr: Ptr[Ptr[u8]], align: UInt, size: UInt) -> Int
+  
+  # Aligned allocation (C11)
+  def aligned_alloc(align: UInt, size: UInt) -> Ptr[u8]
+end
+
+struct SystemAllocator
+  # Empty — stateless allocator
+end
+
+def system_allocator() -> SystemAllocator
+  SystemAllocator {}
+end
+
+impl Allocator for SystemAllocator
+  def allocate(self: &SystemAllocator, size: UInt, align: UInt) -> Ptr[u8]
+    if size == 0 then
+      return Ptr::null()
+    end
+    
+    if align <= 16 then
+      # Standard malloc provides at least 16-byte alignment
+      malloc(size)
+    else
+      # Need aligned allocation  
+      aligned_alloc(align, size)
+    end
+  end
+  
+  def deallocate(self: &SystemAllocator, ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+    if !ptr.is_null() then
+      free(ptr)
+    end
+  end
+  
+  def reallocate(self: &SystemAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt, align: UInt) -> Ptr[u8]
+    if ptr.is_null() then
+      return self.allocate(new_size, align)
+    end
+    
+    if new_size == 0 then
+      self.deallocate(ptr, old_size, align)
+      return Ptr::null()
+    end
+    
+    if align <= 16 then
+      realloc(ptr, new_size)
+    else
+      # Aligned realloc not available - manual copy
+      let new_ptr = self.allocate(new_size, align)
+      if !new_ptr.is_null() then
+        let copy_size = if old_size < new_size then old_size else new_size end
+        ptr_copy(ptr, new_ptr, copy_size)
+        self.deallocate(ptr, old_size, align)
+      end
+      new_ptr
+    end
+  end
+  
+  def grow_in_place(self: &SystemAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    # System allocator doesn't support in-place growth checking
+    false
+  end
+  
+  def shrink_in_place(self: &SystemAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    # Shrinking in place is always possible (we just use less of the allocation)
+    true
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Arena Allocator (Bump Allocator)
+# ———————————————————————————————————————————————————————————————
+
+struct ArenaAllocator
+  buffer: Ptr[u8]
+  capacity: UInt
+  offset: UInt
+  backing: &SystemAllocator
+end
+
+def arena_new(capacity: UInt) -> ArenaAllocator
+  let backing = system_allocator()
+  let buffer = backing.allocate(capacity, 16)
+  ArenaAllocator {
+    buffer: buffer,
+    capacity: capacity,
+    offset: 0,
+    backing: &backing
+  }
+end
+
+def arena_reset(arena: &mut ArenaAllocator) -> Unit
+  arena.offset = 0
+end
+
+def arena_destroy(arena: &mut ArenaAllocator) -> Unit
+  arena.backing.deallocate(arena.buffer, arena.capacity, 16)
+  arena.buffer = Ptr::null()
+  arena.capacity = 0
+  arena.offset = 0
+end
+
+impl Allocator for ArenaAllocator
+  def allocate(self: &ArenaAllocator, size: UInt, align: UInt) -> Ptr[u8]
+    # Align the current offset
+    let aligned_offset = (self.offset + align - 1) & !(align - 1)
+    
+    if aligned_offset + size > self.capacity then
+      return Ptr::null()  # Out of memory
+    end
+    
+    let ptr = self.buffer.offset(aligned_offset as Int)
+    self.offset = aligned_offset + size
+    ptr
+  end
+  
+  def deallocate(self: &ArenaAllocator, ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+    # Arena allocator doesn't free individual allocations
+    # Memory is freed when arena is reset or destroyed
+  end
+  
+  def reallocate(self: &ArenaAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt, align: UInt) -> Ptr[u8]
+    # Simple: allocate new, copy, don't free old
+    let new_ptr = self.allocate(new_size, align)
+    if !new_ptr.is_null() && !ptr.is_null() then
+      let copy_size = if old_size < new_size then old_size else new_size end
+      ptr_copy(ptr, new_ptr, copy_size)
+    end
+    new_ptr
+  end
+  
+  def grow_in_place(self: &ArenaAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    false
+  end
+  
+  def shrink_in_place(self: &ArenaAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    true
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pool Allocator (Fixed-Size Blocks)
+# ———————————————————————————————————————————————————————————————
+
+struct PoolAllocator
+  buffer: Ptr[u8]
+  block_size: UInt
+  block_count: UInt
+  free_list: Ptr[Ptr[u8]]  # Linked list of free blocks
+  backing: &SystemAllocator
+end
+
+def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
+  # Ensure block size is at least pointer size
+  let actual_block_size = if block_size < 8 then 8 else block_size end
+  let total_size = actual_block_size * block_count
+  
+  let backing = system_allocator()
+  let buffer = backing.allocate(total_size, 16)
+  
+  # Initialize free list
+  mut current = buffer
+  mut i: UInt = 0
+  while i < block_count - 1 do
+    let next = current.offset(actual_block_size as Int)
+    current.cast[Ptr[u8]]().write(next)
+    current = next
+    i = i + 1
+  end
+  # Last block points to null
+  current.cast[Ptr[u8]]().write(Ptr::null())
+  
+  PoolAllocator {
+    buffer: buffer,
+    block_size: actual_block_size,
+    block_count: block_count,
+    free_list: buffer.cast[Ptr[u8]](),
+    backing: &backing
+  }
+end
+
+impl Allocator for PoolAllocator
+  def allocate(self: &PoolAllocator, size: UInt, align: UInt) -> Ptr[u8]
+    if size > self.block_size then
+      return Ptr::null()  # Too large for pool
+    end
+    
+    if self.free_list.is_null() then
+      return Ptr::null()  # Pool exhausted
+    end
+    
+    let block = self.free_list.cast[u8]()
+    self.free_list = self.free_list.read()
+    block
+  end
+  
+  def deallocate(self: &PoolAllocator, ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+    if ptr.is_null() then return end
+    
+    # Add to free list
+    ptr.cast[Ptr[u8]]().write(self.free_list.cast[u8]())
+    self.free_list = ptr.cast[Ptr[u8]]()
+  end
+  
+  def reallocate(self: &PoolAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt, align: UInt) -> Ptr[u8]
+    if new_size > self.block_size then
+      return Ptr::null()  # Can't grow beyond block size
+    end
+    ptr  # Same block works
+  end
+  
+  def grow_in_place(self: &PoolAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    new_size <= self.block_size
+  end
+  
+  def shrink_in_place(self: &PoolAllocator, ptr: Ptr[u8], old_size: UInt, new_size: UInt) -> Bool
+    true
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Global Allocator
+# ———————————————————————————————————————————————————————————————
+
+# The global allocator used by default for heap allocations
+mut GLOBAL_ALLOCATOR: SystemAllocator = system_allocator()
+
+def global_alloc(size: UInt, align: UInt) -> Ptr[u8]
+  GLOBAL_ALLOCATOR.allocate(size, align)
+end
+
+def global_dealloc(ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+  GLOBAL_ALLOCATOR.deallocate(ptr, size, align)
+end
+
+def global_realloc(ptr: Ptr[u8], old_size: UInt, new_size: UInt, align: UInt) -> Ptr[u8]
+  GLOBAL_ALLOCATOR.reallocate(ptr, old_size, new_size, align)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Allocation Helpers
+# ———————————————————————————————————————————————————————————————
+
+def alloc[T]() -> Ptr[T]
+  let layout = layout_for[T]()
+  global_alloc(layout.size, layout.align).cast[T]()
+end
+
+def alloc_array[T](count: UInt) -> Ptr[T]
+  match layout_array[T](count)
+  when Result::Ok(layout) then
+    global_alloc(layout.size, layout.align).cast[T]()
+  when Result::Err(_) then
+    Ptr::null()
+  end
+end
+
+def alloc_zeroed[T]() -> Ptr[T]
+  let layout = layout_for[T]()
+  let ptr = global_alloc(layout.size, layout.align)
+  if !ptr.is_null() then
+    ptr_zero(ptr, layout.size)
+  end
+  ptr.cast[T]()
+end
+
+def dealloc[T](ptr: Ptr[T]) -> Unit
+  let layout = layout_for[T]()
+  global_dealloc(ptr.cast[u8](), layout.size, layout.align)
+end
+
+def dealloc_array[T](ptr: Ptr[T], count: UInt) -> Unit
+  match layout_array[T](count)
+  when Result::Ok(layout) then
+    global_dealloc(ptr.cast[u8](), layout.size, layout.align)
+  when Result::Err(_) then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pointer Operations
+# ———————————————————————————————————————————————————————————————
+
+extern "C"
+  def memcpy(dest: Ptr[u8], src: Ptr[u8], n: UInt) -> Ptr[u8]
+  def memset(dest: Ptr[u8], c: Int, n: UInt) -> Ptr[u8]
+  def memmove(dest: Ptr[u8], src: Ptr[u8], n: UInt) -> Ptr[u8]
+end
+
+def ptr_copy(src: Ptr[u8], dest: Ptr[u8], size: UInt) -> Unit
+  if size > 0 then
+    memcpy(dest, src, size)
+  end
+end
+
+def ptr_move(src: Ptr[u8], dest: Ptr[u8], size: UInt) -> Unit
+  if size > 0 then
+    memmove(dest, src, size)
+  end
+end
+
+def ptr_zero(ptr: Ptr[u8], size: UInt) -> Unit
+  if size > 0 then
+    memset(ptr, 0, size)
+  end
+end
+
+def ptr_fill(ptr: Ptr[u8], value: u8, size: UInt) -> Unit
+  if size > 0 then
+    memset(ptr, value as Int, size)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Box / Heap Allocation Wrapper
+# ———————————————————————————————————————————————————————————————
+
+struct Box[T]
+  ptr: Ptr[T]
+end
+
+def box_new[T](value: T) -> Box[T]
+  let ptr = alloc[T]()
+  if ptr.is_null() then
+    panic("Out of memory")
+  end
+  ptr.write(value)
+  Box { ptr: ptr }
+end
+
+impl[T] Box[T]
+  def get(self: &Box[T]) -> &T
+    &self.ptr.read()
+  end
+  
+  def get_mut(self: &mut Box[T]) -> &mut T
+    &mut self.ptr.read()
+  end
+  
+  def into_inner(self: Box[T]) -> T
+    let value = self.ptr.read()
+    dealloc(self.ptr)
+    value
+  end
+end
+
+impl[T] Drop for Box[T]
+  def drop(self: &mut Box[T]) -> Unit
+    if !self.ptr.is_null() then
+      # Call drop on the contained value
+      drop(&mut self.ptr.read())
+      dealloc(self.ptr)
+      self.ptr = Ptr::null()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Unique Pointer (single ownership)
+# ———————————————————————————————————————————————————————————————
+
+struct UniquePtr[T]
+  ptr: Ptr[T]
+  allocator: &dyn Allocator
+end
+
+def unique_ptr_new[T, A: Allocator](value: T, allocator: &A) -> UniquePtr[T]
+  let layout = layout_for[T]()
+  let ptr = allocator.allocate(layout.size, layout.align).cast[T]()
+  if ptr.is_null() then
+    panic("Out of memory")
+  end
+  ptr.write(value)
+  UniquePtr { ptr: ptr, allocator: allocator as &dyn Allocator }
+end
+
+impl[T] Drop for UniquePtr[T]
+  def drop(self: &mut UniquePtr[T]) -> Unit
+    if !self.ptr.is_null() then
+      drop(&mut self.ptr.read())
+      let layout = layout_for[T]()
+      self.allocator.deallocate(self.ptr.cast[u8](), layout.size, layout.align)
+      self.ptr = Ptr::null()
+    end
+  end
+end

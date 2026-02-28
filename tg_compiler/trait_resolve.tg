@@ -1,0 +1,719 @@
+# Tangerine trait resolution — Part F of the spec
+# Coherence checking, orphan rule, method lookup, candidate ranking.
+#
+# This module resolves method calls by searching inherent impls first
+# then trait impls, ranking candidates by specificity.
+
+import ast::{ Program, Item, ImplBlock, TraitDef, Span }
+import types::{ Type, TypeEnv, TypeDef, TypeDefKind, MethodSig }
+
+# ———————————————————————————————————————————————————————————————
+# Data Structures
+# ———————————————————————————————————————————————————————————————
+
+enum CandidateKind
+  Inherent
+  Trait
+end
+
+struct Candidate
+  kind: CandidateKind
+  trait_name: Option[String]
+  method_name: String
+  method_sig: MethodSig
+  concreteness: Int
+  is_local: Bool
+end
+
+struct ImplEntry
+  trait_name: String
+  for_type: Type
+  methods: Vec[MethodSig]
+  is_inherent: Bool
+  span: Span
+end
+
+struct TraitResolver
+  impls: Vec[ImplEntry]
+  errors: Vec[TraitError]
+end
+
+struct TraitError
+  message: String
+  span: Span
+end
+
+# ———————————————————————————————————————————————————————————————
+# Constructor
+# ———————————————————————————————————————————————————————————————
+
+def trait_resolver_new() -> TraitResolver
+  TraitResolver {
+    impls: Vec::new(),
+    errors: Vec::new()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Impl Registration
+# ———————————————————————————————————————————————————————————————
+
+def register_impl(resolver: &mut TraitResolver, entry: ImplEntry) -> Unit
+  resolver.impls.push(entry)
+end
+
+def collect_impls(resolver: &mut TraitResolver, program: &Program) -> Unit
+  for item in program.items do
+    match item
+    when Item::Impl(impl_block) then
+      mut methods = Vec::new()
+      for method in impl_block.methods do
+        methods.push(MethodSig {
+          name: method.name.clone(),
+          params: method.params.iter().map(|p| p.ty.clone()).collect(),
+          ret: method.return_type.clone()
+        })
+      end
+      let is_inherent = impl_block.trait_name.is_none()
+      register_impl(resolver, ImplEntry {
+        trait_name: match impl_block.trait_name
+          when Some(name) then name
+          when None then impl_block.type_name.clone()
+        end,
+        for_type: Type::Named(impl_block.type_name.clone(), Vec::new()),
+        methods: methods,
+        is_inherent: is_inherent,
+        span: impl_block.span
+      })
+    when _ then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Method Resolution
+# ———————————————————————————————————————————————————————————————
+
+# Resolves method calls using the algorithm from Part F:
+#   1. Search inherent impls (impl X without a trait)
+#   2. Search trait impls
+#   3. Rank by (is_inherent, concreteness, is_local)
+def resolve_method(
+  resolver: &TraitResolver,
+  receiver_ty: &Type,
+  method_name: String,
+  span: Span
+) -> Option[Candidate]
+  mut candidates: Vec[Candidate] = Vec::new()
+
+  # 1. Search inherent impls first (highest priority)
+  for imp in resolver.impls do
+    if !type_matches(&imp.for_type, receiver_ty) then
+      next
+    end
+    if !imp.is_inherent then
+      next
+    end
+    for method in imp.methods do
+      if method.name == method_name then
+        candidates.push(Candidate {
+          kind: CandidateKind::Inherent,
+          trait_name: None,
+          method_name: method.name.clone(),
+          method_sig: method.clone(),
+          concreteness: type_concreteness(&imp.for_type),
+          is_local: true
+        })
+      end
+    end
+  end
+
+  # If we found inherent candidates, return the best one
+  if !candidates.is_empty() then
+    return Some(best_candidate(&candidates))
+  end
+
+  # 2. Search trait impls
+  for imp in resolver.impls do
+    if !type_matches(&imp.for_type, receiver_ty) then
+      next
+    end
+    if imp.is_inherent then
+      next
+    end
+    for method in imp.methods do
+      if method.name == method_name then
+        candidates.push(Candidate {
+          kind: CandidateKind::Trait,
+          trait_name: Some(imp.trait_name.clone()),
+          method_name: method.name.clone(),
+          method_sig: method.clone(),
+          concreteness: type_concreteness(&imp.for_type),
+          is_local: true
+        })
+      end
+    end
+  end
+
+  if candidates.is_empty() then
+    return None
+  end
+
+  Some(best_candidate(&candidates))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Matching
+# ———————————————————————————————————————————————————————————————
+
+# Check if a pattern type matches a concrete type.
+# Generic parameters match anything.
+def type_matches(pattern: &Type, concrete: &Type) -> Bool
+  match (pattern, concrete)
+  when (Type::Param(_), _) then true
+  when (Type::Var(_), _) then true
+  when (_, Type::Param(_)) then true
+  when (_, Type::Var(_)) then true
+  when (Type::Unit, Type::Unit) then true
+  when (Type::Bool, Type::Bool) then true
+  when (Type::Int, Type::Int) then true
+  when (Type::UInt, Type::UInt) then true
+  when (Type::Float, Type::Float) then true
+  when (Type::Char, Type::Char) then true
+  when (Type::String, Type::String) then true
+  when (Type::Named(n1, args1), Type::Named(n2, args2)) then
+    if n1 != n2 then
+      false
+    elsif args1.len() != args2.len() then
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < args1.len() do
+        if !type_matches(&args1[i], &args2[i]) then
+          ok = false
+          break
+        end
+        i = i + 1
+      end
+      ok
+    end
+  when (Type::Ref(t1, _), Type::Ref(t2, _)) then type_matches(t1, t2)
+  when (Type::RefMut(t1, _), Type::RefMut(t2, _)) then type_matches(t1, t2)
+  when (Type::Option(t1), Type::Option(t2)) then type_matches(t1, t2)
+  when (Type::Result(ok1, err1), Type::Result(ok2, err2)) then
+    type_matches(ok1, ok2) && type_matches(err1, err2)
+  when (Type::Map(k1, v1), Type::Map(k2, v2)) then
+    type_matches(k1, k2) && type_matches(v1, v2)
+  when (Type::Set(t1), Type::Set(t2)) then type_matches(t1, t2)
+  when (Type::Tuple(elems1), Type::Tuple(elems2)) then
+    if elems1.len() != elems2.len() then
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < elems1.len() do
+        if !type_matches(&elems1[i], &elems2[i]) then
+          ok = false
+          break
+        end
+        i = i + 1
+      end
+      ok
+    end
+  when (Type::Array(t1, n1), Type::Array(t2, n2)) then
+    n1 == n2 && type_matches(t1, t2)
+  when (Type::Slice(t1), Type::Slice(t2)) then type_matches(t1, t2)
+  when (Type::Function(p1, r1), Type::Function(p2, r2)) then
+    if p1.len() != p2.len() then
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < p1.len() do
+        if !type_matches(&p1[i], &p2[i]) then
+          ok = false
+          break
+        end
+        i = i + 1
+      end
+      if ok then type_matches(r1, r2) else false end
+    end
+  when _ then false
+  end
+end
+
+# Compute type concreteness — more concrete types rank higher in resolution.
+# Generic/unresolved params have concreteness 0; concrete primitives have 1;
+# compound types sum child concreteness.
+def type_concreteness(ty: &Type) -> Int
+  match ty
+  when Type::Param(_) then 0
+  when Type::Var(_) then 0
+  when Type::Array(elem, _) then 1 + type_concreteness(elem)
+  when Type::Slice(elem) then 1 + type_concreteness(elem)
+  when Type::Tuple(elems) then
+    mut sum = 1
+    for e in elems do
+      sum = sum + type_concreteness(e)
+    end
+    sum
+  when Type::Map(k, v) then 1 + type_concreteness(k) + type_concreteness(v)
+  when Type::Set(inner) then 1 + type_concreteness(inner)
+  when Type::Option(inner) then 1 + type_concreteness(inner)
+  when Type::Result(ok, err) then 1 + type_concreteness(ok) + type_concreteness(err)
+  when Type::Ref(inner, _) then 1 + type_concreteness(inner)
+  when Type::RefMut(inner, _) then 1 + type_concreteness(inner)
+  when Type::Named(_, args) then
+    mut sum = 1
+    for a in args do
+      sum = sum + type_concreteness(a)
+    end
+    sum
+  when Type::Function(params, ret) then
+    mut sum = 1
+    for p in params do
+      sum = sum + type_concreteness(p)
+    end
+    sum + type_concreteness(ret)
+  when _ then 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Candidate Ranking
+# ———————————————————————————————————————————————————————————————
+
+# Select the best candidate from a list using the ranking:
+#   1. Inherent > Trait
+#   2. More concrete > less concrete
+#   3. Local > external
+def best_candidate(candidates: &Vec[Candidate]) -> Candidate
+  if candidates.len() == 1 then
+    return candidates[0].clone()
+  end
+
+  mut best = &candidates[0]
+  mut i = 1
+  while i < candidates.len() do
+    let c = &candidates[i]
+    if candidate_rank(c) > candidate_rank(best) then
+      best = c
+    end
+    i = i + 1
+  end
+  best.clone()
+end
+
+# Returns a ranking tuple as a single comparable integer.
+# Higher is better. Encoding: inherent(1000000) + concreteness(1000) + local(1)
+def candidate_rank(c: &Candidate) -> Int
+  mut rank = 0
+  match c.kind
+  when CandidateKind::Inherent then rank = rank + 1000000
+  when CandidateKind::Trait then ()
+  end
+  rank = rank + c.concreteness * 1000
+  if c.is_local then
+    rank = rank + 1
+  end
+  rank
+end
+
+# ———————————————————————————————————————————————————————————————
+# Coherence Checking
+# ———————————————————————————————————————————————————————————————
+
+# Ensure no overlapping impls for the same trait on the same type.
+# This is the orphan rule / coherence check from Part F.
+def check_coherence(resolver: &mut TraitResolver) -> Unit
+  mut i = 0
+  while i < resolver.impls.len() do
+    mut j = i + 1
+    while j < resolver.impls.len() do
+      let a = &resolver.impls[i]
+      let b = &resolver.impls[j]
+      if a.trait_name == b.trait_name && type_matches(&a.for_type, &b.for_type) then
+        resolver.errors.push(TraitError {
+          message: "overlapping impls for trait '" ++ a.trait_name ++ "' — coherence violation",
+          span: b.span
+        })
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Trait Bound Checking
+# ———————————————————————————————————————————————————————————————
+
+# Check whether a type satisfies a trait bound.
+# Searches all registered impls for a matching impl.
+def satisfies_trait(resolver: &TraitResolver, ty: &Type, trait_name: String) -> Bool
+  for imp in resolver.impls do
+    if imp.trait_name == trait_name && type_matches(&imp.for_type, ty) then
+      return true
+    end
+  end
+  false
+end
+
+# Check whether a type satisfies all trait bounds in a where clause.
+def check_where_bounds(
+  resolver: &TraitResolver,
+  ty: &Type,
+  bounds: &Vec[String],
+  span: Span
+) -> Vec[TraitError]
+  mut errors = Vec::new()
+  for bound in bounds do
+    if !satisfies_trait(resolver, ty, bound.clone()) then
+      errors.push(TraitError {
+        message: "type does not satisfy trait bound '" ++ bound ++ "'",
+        span: span
+      })
+    end
+  end
+  errors
+end
+
+# ———————————————————————————————————————————————————————————————
+# Monomorphization Support
+# ———————————————————————————————————————————————————————————————
+
+struct MonoKey
+  func_name: String
+  type_args: Vec[Type]
+end
+
+struct MonoCache
+  entries: Vec[MonoEntry]
+end
+
+struct MonoEntry
+  key: MonoKey
+  mangled_name: String
+end
+
+def mono_cache_new() -> MonoCache
+  MonoCache { entries: Vec::new() }
+end
+
+# Look up or create a monomorphized instance for a generic function call.
+# Returns the mangled name.
+def monomorphize(cache: &mut MonoCache, func_name: String, type_args: Vec[Type]) -> String
+  # Check if already monomorphized
+  for entry in cache.entries do
+    if entry.key.func_name == func_name && types_equal(&entry.key.type_args, &type_args) then
+      return entry.mangled_name.clone()
+    end
+  end
+
+  # Create new monomorphized instance
+  let mangled = mangle_name(func_name.clone(), &type_args)
+  cache.entries.push(MonoEntry {
+    key: MonoKey {
+      func_name: func_name,
+      type_args: type_args
+    },
+    mangled_name: mangled.clone()
+  })
+  mangled
+end
+
+# Generate mangled name for a monomorphized function
+def mangle_name(base: String, type_args: &Vec[Type]) -> String
+  mut name = base ++ "$"
+  mut first = true
+  for ty in type_args do
+    if !first then
+      name = name ++ "_"
+    end
+    name = name ++ type_to_mangled(ty)
+    first = false
+  end
+  name
+end
+
+def type_to_mangled(ty: &Type) -> String
+  match ty
+  when Type::Unit then "unit"
+  when Type::Bool then "bool"
+  when Type::Int then "i64"
+  when Type::UInt then "u64"
+  when Type::Float then "f64"
+  when Type::Char then "char"
+  when Type::String then "str"
+  when Type::Named(name, _) then name.clone()
+  when Type::Option(inner) then "opt_" ++ type_to_mangled(inner)
+  when Type::Result(ok, err) then "res_" ++ type_to_mangled(ok) ++ "_" ++ type_to_mangled(err)
+  when Type::Map(k, v) then "map_" ++ type_to_mangled(k) ++ "_" ++ type_to_mangled(v)
+  when Type::Set(inner) then "set_" ++ type_to_mangled(inner)
+  when _ then "any"
+  end
+end
+
+def types_equal(a: &Vec[Type], b: &Vec[Type]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  mut i = 0
+  while i < a.len() do
+    if !type_eq(&a[i], &b[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def type_eq(a: &Type, b: &Type) -> Bool
+  match (a, b)
+  when (Type::Unit, Type::Unit) then true
+  when (Type::Bool, Type::Bool) then true
+  when (Type::Int, Type::Int) then true
+  when (Type::UInt, Type::UInt) then true
+  when (Type::Float, Type::Float) then true
+  when (Type::Char, Type::Char) then true
+  when (Type::String, Type::String) then true
+  when (Type::Named(n1, _), Type::Named(n2, _)) then n1 == n2
+  when (Type::Option(t1), Type::Option(t2)) then type_eq(t1, t2)
+  when (Type::Result(ok1, err1), Type::Result(ok2, err2)) then
+    type_eq(ok1, ok2) && type_eq(err1, err2)
+  when (Type::Map(k1, v1), Type::Map(k2, v2)) then
+    type_eq(k1, k2) && type_eq(v1, v2)
+  when (Type::Set(t1), Type::Set(t2)) then type_eq(t1, t2)
+  when _ then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Virtual Tables (vtables) for Dynamic Dispatch
+# ———————————————————————————————————————————————————————————————
+#
+# Trait objects (`dyn Trait`) are fat pointers: (data_ptr, vtable_ptr).
+# The vtable holds function pointers for each method of the trait.
+#
+# Layout of a vtable:
+#   [0] drop_in_place function pointer (destructor)
+#   [1] size of the concrete type
+#   [2] alignment of the concrete type
+#   [3..] one function pointer per trait method (in declaration order)
+
+struct VTable
+  trait_name: String
+  concrete_type: Type
+  entries: Vec[VTableEntry]
+  drop_fn: String           # Mangled name of drop glue
+  size: Int                 # Size of concrete type
+  align: Int                # Alignment of concrete type
+end
+
+struct VTableEntry
+  method_name: String
+  fn_symbol: String         # Mangled function symbol to call
+  signature: MethodSig
+end
+
+struct MethodSig
+  param_types: Vec[Type]
+  return_type: Type
+end
+
+struct VTableRegistry
+  vtables: Map[String, VTable]    # trait_name + "$" + mangled_type -> VTable
+end
+
+def vtable_registry_new() -> VTableRegistry
+  VTableRegistry { vtables: Map::new() }
+end
+
+# Generate a vtable for a concrete type implementing a trait
+def generate_vtable(
+  registry: &mut VTableRegistry,
+  resolver: &TraitResolver,
+  trait_name: String,
+  concrete_type: &Type,
+  trait_methods: &Vec[String],   # Method names in declaration order
+  size: Int,
+  align: Int
+) -> String
+  let key = vtable_key(&trait_name, concrete_type)
+  
+  # Check if already generated
+  if registry.vtables.contains_key(key.clone()) then
+    return key
+  end
+  
+  # Build vtable entries for each trait method
+  mut entries = Vec::new()
+  for method_name in trait_methods do
+    let mangled = mangle_name(method_name.clone(), &vec![concrete_type.clone()])
+    
+    # Try to find the concrete implementation
+    let method_sig = match resolve_method(resolver, concrete_type, method_name.clone(), span_dummy())
+    when Option::Some(candidate) then
+      candidate.method_sig.clone()
+    when Option::None then
+      MethodSig { param_types: Vec::new(), return_type: Type::Unit }
+    end
+    
+    entries.push(VTableEntry {
+      method_name: method_name.clone(),
+      fn_symbol: mangled,
+      signature: method_sig
+    })
+  end
+  
+  let drop_fn = mangle_name("drop".to_string(), &vec![concrete_type.clone()])
+  
+  let vtable = VTable {
+    trait_name: trait_name.clone(),
+    concrete_type: concrete_type.clone(),
+    entries: entries,
+    drop_fn: drop_fn,
+    size: size,
+    align: align
+  }
+  
+  registry.vtables.insert(key.clone(), vtable)
+  key
+end
+
+def vtable_key(trait_name: &String, concrete_type: &Type) -> String
+  trait_name.clone() + "$" + type_to_mangled(concrete_type)
+end
+
+# Look up a specific method in a vtable — returns the slot index and function symbol
+def vtable_method_index(registry: &VTableRegistry, vtable_key: &String, method_name: &String) -> Option[(Int, String)]
+  match registry.vtables.get(vtable_key.clone())
+  when Option::Some(vtable) then
+    mut idx = 0
+    for entry in vtable.entries do
+      if entry.method_name == *method_name then
+        return Option::Some((idx + 3, entry.fn_symbol.clone()))  # +3 for drop/size/align header
+      end
+      idx = idx + 1
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+# Generate a vtable as a static data symbol (for codegen)
+def vtable_to_static_data(vtable: &VTable) -> Vec[String]
+  # Returns a list of symbol names in vtable order:
+  #   [0] drop function
+  #   [1] size (as integer literal)
+  #   [2] align (as integer literal)
+  #   [3..] method function pointers
+  mut symbols = Vec::new()
+  symbols.push(vtable.drop_fn.clone())
+  symbols.push("__size_" + vtable.size.to_string())
+  symbols.push("__align_" + vtable.align.to_string())
+  for entry in vtable.entries do
+    symbols.push(entry.fn_symbol.clone())
+  end
+  symbols
+end
+
+# Dynamic dispatch: generate code to call through vtable
+# Returns the vtable slot index for a trait method call
+def dyn_dispatch_slot(
+  registry: &VTableRegistry,
+  trait_name: &String,
+  method_name: &String,
+  concrete_type: &Type
+) -> Option[Int]
+  let key = vtable_key(trait_name, concrete_type)
+  match vtable_method_index(registry, &key, method_name)
+  when Option::Some(idx_and_sym) then Option::Some(idx_and_sym.0)
+  when Option::None then Option::None
+  end
+end
+
+# Check if a type is a trait object (dyn Trait)
+def is_trait_object(ty: &Type) -> Bool
+  match ty
+  when Type::Named(name, _) then name.starts_with("dyn ")
+  when _ then false
+  end
+end
+
+# Extract the trait name from a dyn trait type
+def trait_object_trait_name(ty: &Type) -> Option[String]
+  match ty
+  when Type::Named(name, _) then
+    if name.starts_with("dyn ") then
+      Option::Some(name.slice(4, name.len()))
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# Collect all types that implement a specific trait (for vtable generation)
+def implementors_of(resolver: &TraitResolver, trait_name: &String) -> Vec[Type]
+  mut types = Vec::new()
+  for entry in resolver.impls do
+    if entry.trait_name == *trait_name then
+      types.push(entry.for_type.clone())
+    end
+  end
+  types
+end
+
+# Generate all vtables for a given trait across all known implementors
+def generate_all_vtables(
+  registry: &mut VTableRegistry,
+  resolver: &TraitResolver,
+  trait_name: String,
+  trait_methods: &Vec[String]
+) -> Vec[String]
+  let impls = implementors_of(resolver, &trait_name)
+  mut keys = Vec::new()
+  for impl_type in impls do
+    # Compute size/align based on type.
+    # Primitive types have known sizes; compound types use pointer-width (8).
+    let (size, align) = compute_type_size_align(&impl_type)
+    let key = generate_vtable(registry, resolver, trait_name.clone(), &impl_type, trait_methods, size, align)
+    keys.push(key)
+  end
+  keys
+end
+
+# Compute the size and alignment of a type for vtable metadata.
+def compute_type_size_align(ty: &Type) -> (Int, Int)
+  match ty
+  when Type::Int then (8, 8)
+  when Type::UInt then (8, 8)
+  when Type::Float then (8, 8)
+  when Type::Bool then (1, 1)
+  when Type::Char then (4, 4)
+  when Type::Unit then (0, 1)
+  when Type::Never then (0, 1)
+  when Type::Named(name, args) then
+    match name.as_str()
+    when "String" then (24, 8)
+    when "Vec" then (24, 8)
+    when "Map" then (48, 8)
+    when "Set" then (32, 8)
+    when "Option" then (16, 8)
+    when "Result" then (24, 8)
+    when "Box" then (8, 8)
+    when _ then (8, 8)   # user-defined structs: pointer-width default
+    end
+  when Type::Ref(_) then (8, 8)
+  when Type::RefMut(_) then (8, 8)
+  when Type::Function(_, _) then (16, 8)  # fn pointer + closure env
+  when Type::Tuple(elems) then
+    let size = elems.len() * 8
+    (size, 8)
+  when Type::Array(_, n) then (n * 8, 8)
+  when Type::Slice(_) then (16, 8)   # ptr + len
+  when _ then (8, 8)
+  end
+end

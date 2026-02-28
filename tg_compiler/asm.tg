@@ -1,0 +1,890 @@
+# Tangerine Compiler — Assembler / Instruction Encoder
+# Self-hosting compiler written in Tangerine
+#
+# Encodes machine instructions for:
+# - x86-64 (System V AMD64; Windows x64)
+# - ARM64 / AArch64 (AAPCS64)
+#
+# NO dependency on any other language — raw byte emission only.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map}
+
+# ———————————————————————————————————————————————————————————————
+# Code Buffer — the raw byte stream
+# ———————————————————————————————————————————————————————————————
+
+struct CodeBuffer
+  bytes: Vec[u8]
+  labels: Map[String, Int]
+  fixups: Vec[Fixup]
+  symbols: Vec[AsmSymbol]
+  relocations: Vec[Relocation]
+end
+
+struct Fixup
+  offset: Int          # byte offset in buffer where patch goes
+  kind: FixupKind
+  label: String        # target label name
+end
+
+enum FixupKind
+  Rel32              # 32-bit PC-relative (x86-64 jmp/call/jcc)
+  Branch26           # ARM64 26-bit branch
+  Adrp21             # ARM64 ADRP page
+  AddImm12           # ARM64 ADD lo12
+end
+
+struct Relocation
+  offset: Int
+  kind: RelocKind
+  symbol: String
+  addend: Int
+end
+
+enum RelocKind
+  # ELF x86-64
+  R_X86_64_PC32
+  R_X86_64_PLT32
+  R_X86_64_GOTPCREL
+  R_X86_64_64
+  # ELF ARM64
+  R_AARCH64_CALL26
+  R_AARCH64_ADR_PREL_PG_HI21
+  R_AARCH64_ADD_ABS_LO12_NC
+  # Mach-O
+  X86_64_RELOC_BRANCH
+  X86_64_RELOC_SIGNED
+  ARM64_RELOC_BRANCH26
+  ARM64_RELOC_PAGE21
+  ARM64_RELOC_PAGEOFF12
+end
+
+struct AsmSymbol
+  name: String
+  section: Section
+  offset: Int
+  size: Int
+  binding: SymBinding
+  kind: SymKind
+end
+
+enum SymBinding
+  Local
+  Global
+  Weak
+end
+
+enum SymKind
+  Func
+  Data
+  NoType
+end
+
+enum Section
+  Text
+  Data
+  Rodata
+  Bss
+end
+
+# ———————————————————————————————————————————————————————————————
+# Buffer operations
+# ———————————————————————————————————————————————————————————————
+
+def buf_new() -> CodeBuffer
+  CodeBuffer {
+    bytes: Vec::new(),
+    labels: Map::new(),
+    fixups: Vec::new(),
+    symbols: Vec::new(),
+    relocations: Vec::new()
+  }
+end
+
+def buf_pos(b: &CodeBuffer) -> Int
+  b.bytes.len()
+end
+
+def emit8(b: &mut CodeBuffer, v: u8) -> Unit
+  b.bytes.push(v)
+end
+
+def emit16_le(b: &mut CodeBuffer, v: u16) -> Unit
+  emit8(b, (v & 0xFF) as u8)
+  emit8(b, ((v >> 8) & 0xFF) as u8)
+end
+
+def emit32_le(b: &mut CodeBuffer, v: u32) -> Unit
+  emit8(b, (v & 0xFF) as u8)
+  emit8(b, ((v >> 8) & 0xFF) as u8)
+  emit8(b, ((v >> 16) & 0xFF) as u8)
+  emit8(b, ((v >> 24) & 0xFF) as u8)
+end
+
+def emit64_le(b: &mut CodeBuffer, v: u64) -> Unit
+  emit32_le(b, (v & 0xFFFFFFFF) as u32)
+  emit32_le(b, ((v >> 32) & 0xFFFFFFFF) as u32)
+end
+
+def emit_i32(b: &mut CodeBuffer, v: i32) -> Unit
+  emit32_le(b, v as u32)
+end
+
+def emit_zeros(b: &mut CodeBuffer, n: Int) -> Unit
+  mut i = 0
+  while i < n do
+    emit8(b, 0)
+    i = i + 1
+  end
+end
+
+def patch32_le(b: &mut CodeBuffer, offset: Int, v: u32) -> Unit
+  b.bytes[offset]     = (v & 0xFF) as u8
+  b.bytes[offset + 1] = ((v >> 8) & 0xFF) as u8
+  b.bytes[offset + 2] = ((v >> 16) & 0xFF) as u8
+  b.bytes[offset + 3] = ((v >> 24) & 0xFF) as u8
+end
+
+def def_label(b: &mut CodeBuffer, name: String) -> Unit
+  b.labels.insert(name, buf_pos(b))
+end
+
+def add_fixup(b: &mut CodeBuffer, kind: FixupKind, label: String) -> Unit
+  b.fixups.push(Fixup { offset: buf_pos(b), kind: kind, label: label })
+end
+
+def add_reloc(b: &mut CodeBuffer, kind: RelocKind, sym: String, addend: Int) -> Unit
+  b.relocations.push(Relocation { offset: buf_pos(b), kind: kind, symbol: sym, addend: addend })
+end
+
+def add_symbol(b: &mut CodeBuffer, sym: AsmSymbol) -> Unit
+  b.symbols.push(sym)
+end
+
+def resolve_fixups(b: &mut CodeBuffer) -> Result[Unit, String]
+  for f in b.fixups do
+    match b.labels.get(f.label)
+    when Option::Some(target) then
+      match f.kind
+      when FixupKind::Rel32 then
+        let rel = (target - (f.offset + 4)) as i32
+        patch32_le(b, f.offset, rel as u32)
+      when FixupKind::Branch26 then
+        let rel = (target - f.offset) as i32
+        let imm26 = (rel >> 2) & 0x03FFFFFF
+        let old = read32_le(b, f.offset)
+        patch32_le(b, f.offset, (old & 0xFC000000) | (imm26 as u32))
+      when _ then
+        ()
+      end
+    when Option::None then
+      return Result::Err("unresolved label: " + f.label)
+    end
+  end
+  Result::Ok(())
+end
+
+def read32_le(b: &CodeBuffer, offset: Int) -> u32
+  (b.bytes[offset] as u32)
+    | ((b.bytes[offset + 1] as u32) << 8)
+    | ((b.bytes[offset + 2] as u32) << 16)
+    | ((b.bytes[offset + 3] as u32) << 24)
+end
+
+def align_to(b: &mut CodeBuffer, alignment: Int) -> Unit
+  while (buf_pos(b) % alignment) != 0 do
+    emit8(b, 0x90)  # NOP for text, 0x00 for data
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# x86-64 Registers
+# ———————————————————————————————————————————————————————————————
+
+enum X64
+  RAX; RCX; RDX; RBX; RSP; RBP; RSI; RDI
+  R8; R9; R10; R11; R12; R13; R14; R15
+end
+
+def x64_code(r: X64) -> u8
+  match r
+  when X64::RAX then 0; when X64::RCX then 1; when X64::RDX then 2; when X64::RBX then 3
+  when X64::RSP then 4; when X64::RBP then 5; when X64::RSI then 6; when X64::RDI then 7
+  when X64::R8 then 8;  when X64::R9 then 9;  when X64::R10 then 10; when X64::R11 then 11
+  when X64::R12 then 12; when X64::R13 then 13; when X64::R14 then 14; when X64::R15 then 15
+  end
+end
+
+def x64_lo3(r: X64) -> u8
+  x64_code(r) & 0x07
+end
+
+def x64_hi(r: X64) -> Bool
+  x64_code(r) >= 8
+end
+
+# System V AMD64: RDI, RSI, RDX, RCX, R8, R9
+def x64_arg_reg(i: Int) -> Option[X64]
+  match i
+  when 0 then Option::Some(X64::RDI)
+  when 1 then Option::Some(X64::RSI)
+  when 2 then Option::Some(X64::RDX)
+  when 3 then Option::Some(X64::RCX)
+  when 4 then Option::Some(X64::R8)
+  when 5 then Option::Some(X64::R9)
+  when _ then Option::None
+  end
+end
+
+# Callee-saved: RBX, RBP, R12–R15
+def x64_callee_saved() -> Vec[X64]
+  [X64::RBX, X64::R12, X64::R13, X64::R14, X64::R15]
+end
+
+# ———————————————————————————————————————————————————————————————
+# x86-64 Encoding helpers
+# ———————————————————————————————————————————————————————————————
+
+def rex(w: Bool, r: Bool, x: Bool, b_: Bool) -> u8
+  mut v: u8 = 0x40
+  if w  then v = v | 0x08 end
+  if r  then v = v | 0x04 end
+  if x  then v = v | 0x02 end
+  if b_ then v = v | 0x01 end
+  v
+end
+
+def modrm(mod_: u8, reg: u8, rm: u8) -> u8
+  ((mod_ & 3) << 6) | ((reg & 7) << 3) | (rm & 7)
+end
+
+def sib(scale: u8, idx: u8, base: u8) -> u8
+  ((scale & 3) << 6) | ((idx & 7) << 3) | (base & 7)
+end
+
+# ———————————————————————————————————————————————————————————————
+# x86-64 Instructions
+# ———————————————————————————————————————————————————————————————
+
+# MOV r64, imm64  (REX.W + B8+rd io)
+def x64_mov_ri(b: &mut CodeBuffer, dst: X64, imm: i64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  emit8(b, 0xB8 + x64_lo3(dst))
+  emit64_le(b, imm as u64)
+end
+
+# MOV r64, r64  (REX.W + 89 /r)
+def x64_mov_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x89)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# MOV r64, [base + disp32]
+def x64_mov_rm(b: &mut CodeBuffer, dst: X64, base: X64, disp: i32) -> Unit
+  emit8(b, rex(true, x64_hi(dst), false, x64_hi(base)))
+  emit8(b, 0x8B)
+  x64_emit_memop(b, x64_lo3(dst), base, disp)
+end
+
+# MOV [base + disp32], r64
+def x64_mov_mr(b: &mut CodeBuffer, base: X64, disp: i32, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(base)))
+  emit8(b, 0x89)
+  x64_emit_memop(b, x64_lo3(src), base, disp)
+end
+
+# Helper: emit ModRM + SIB + displacement for [base+disp]
+def x64_emit_memop(b: &mut CodeBuffer, reg: u8, base: X64, disp: i32) -> Unit
+  let blo = x64_lo3(base)
+  if disp == 0 && blo != 5 then
+    emit8(b, modrm(0x00, reg, blo))
+    if blo == 4 then emit8(b, sib(0, 4, 4)) end
+  elsif disp >= -128 && disp <= 127 then
+    emit8(b, modrm(0x01, reg, blo))
+    if blo == 4 then emit8(b, sib(0, 4, 4)) end
+    emit8(b, disp as u8)
+  else
+    emit8(b, modrm(0x02, reg, blo))
+    if blo == 4 then emit8(b, sib(0, 4, 4)) end
+    emit_i32(b, disp)
+  end
+end
+
+# ADD r64, r64
+def x64_add_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x01)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# ADD r64, imm32
+def x64_add_ri(b: &mut CodeBuffer, dst: X64, imm: i32) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  if x64_code(dst) == 0 then
+    emit8(b, 0x05)
+  else
+    emit8(b, 0x81)
+    emit8(b, modrm(0x03, 0, x64_lo3(dst)))
+  end
+  emit_i32(b, imm)
+end
+
+# SUB r64, r64
+def x64_sub_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x29)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# SUB r64, imm32
+def x64_sub_ri(b: &mut CodeBuffer, dst: X64, imm: i32) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  if x64_code(dst) == 0 then
+    emit8(b, 0x2D)
+  else
+    emit8(b, 0x81)
+    emit8(b, modrm(0x03, 5, x64_lo3(dst)))
+  end
+  emit_i32(b, imm)
+end
+
+# IMUL r64, r64
+def x64_imul_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(dst), false, x64_hi(src)))
+  emit8(b, 0x0F); emit8(b, 0xAF)
+  emit8(b, modrm(0x03, x64_lo3(dst), x64_lo3(src)))
+end
+
+# CQO  (sign-extend RAX -> RDX:RAX)
+def x64_cqo(b: &mut CodeBuffer) -> Unit
+  emit8(b, rex(true, false, false, false))
+  emit8(b, 0x99)
+end
+
+# IDIV r64  (RDX:RAX / r -> RAX quot, RDX rem)
+def x64_idiv_r(b: &mut CodeBuffer, src: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(src)))
+  emit8(b, 0xF7)
+  emit8(b, modrm(0x03, 7, x64_lo3(src)))
+end
+
+# AND r64, r64
+def x64_and_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x21)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# AND r64, imm8 (sign-extended)
+def x64_and_ri8(b: &mut CodeBuffer, dst: X64, imm: i8) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  emit8(b, 0x83)
+  emit8(b, modrm(0x03, 4, x64_lo3(dst)))  # /4 = AND
+  emit8(b, imm as u8)
+end
+
+# OR r64, r64
+def x64_or_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x09)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# XOR r64, r64
+def x64_xor_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x31)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
+# SHL r64, CL
+def x64_shl_rcl(b: &mut CodeBuffer, dst: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  emit8(b, 0xD3)
+  emit8(b, modrm(0x03, 4, x64_lo3(dst)))
+end
+
+# SHR r64, CL
+def x64_shr_rcl(b: &mut CodeBuffer, dst: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  emit8(b, 0xD3)
+  emit8(b, modrm(0x03, 5, x64_lo3(dst)))
+end
+
+# SAR r64, CL (arithmetic shift right)
+def x64_sar_rcl(b: &mut CodeBuffer, dst: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  emit8(b, 0xD3)
+  emit8(b, modrm(0x03, 7, x64_lo3(dst)))
+end
+
+# NEG r64
+def x64_neg_r(b: &mut CodeBuffer, r: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(r)))
+  emit8(b, 0xF7)
+  emit8(b, modrm(0x03, 3, x64_lo3(r)))
+end
+
+# NOT r64
+def x64_not_r(b: &mut CodeBuffer, r: X64) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(r)))
+  emit8(b, 0xF7)
+  emit8(b, modrm(0x03, 2, x64_lo3(r)))
+end
+
+# CMP r64, r64
+def x64_cmp_rr(b: &mut CodeBuffer, left: X64, right: X64) -> Unit
+  emit8(b, rex(true, x64_hi(right), false, x64_hi(left)))
+  emit8(b, 0x39)
+  emit8(b, modrm(0x03, x64_lo3(right), x64_lo3(left)))
+end
+
+# CMP r64, imm32
+def x64_cmp_ri(b: &mut CodeBuffer, r: X64, imm: i32) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(r)))
+  emit8(b, 0x81)
+  emit8(b, modrm(0x03, 7, x64_lo3(r)))
+  emit_i32(b, imm)
+end
+
+# TEST r64, r64
+def x64_test_rr(b: &mut CodeBuffer, a: X64, b_: X64) -> Unit
+  emit8(b, rex(true, x64_hi(b_), false, x64_hi(a)))
+  emit8(b, 0x85)
+  emit8(b, modrm(0x03, x64_lo3(b_), x64_lo3(a)))
+end
+
+# Condition codes
+enum CC
+  E; NE; L; LE; G; GE; B; BE; A; AE; S; NS; O; NO
+end
+
+def cc_byte(c: CC) -> u8
+  match c
+  when CC::E  then 0x04; when CC::NE then 0x05
+  when CC::L  then 0x0C; when CC::LE then 0x0E
+  when CC::G  then 0x0F; when CC::GE then 0x0D
+  when CC::B  then 0x02; when CC::BE then 0x06
+  when CC::A  then 0x07; when CC::AE then 0x03
+  when CC::S  then 0x08; when CC::NS then 0x09
+  when CC::O  then 0x00; when CC::NO then 0x01
+  end
+end
+
+# SETcc r8 (only low byte)
+def x64_setcc(b: &mut CodeBuffer, cc: CC, dst: X64) -> Unit
+  let dc = x64_code(dst)
+  if dc >= 4 then
+    emit8(b, rex(false, false, false, x64_hi(dst)))
+  end
+  emit8(b, 0x0F); emit8(b, 0x90 + cc_byte(cc))
+  emit8(b, modrm(0x03, 0, x64_lo3(dst)))
+end
+
+# MOVZX r64, r8
+def x64_movzx_r64_r8(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(dst), false, x64_hi(src)))
+  emit8(b, 0x0F); emit8(b, 0xB6)
+  emit8(b, modrm(0x03, x64_lo3(dst), x64_lo3(src)))
+end
+
+# JMP rel32  (with fixup)
+def x64_jmp(b: &mut CodeBuffer, label: String) -> Unit
+  emit8(b, 0xE9)
+  add_fixup(b, FixupKind::Rel32, label)
+  emit_i32(b, 0)
+end
+
+# Jcc rel32  (with fixup)
+def x64_jcc(b: &mut CodeBuffer, cc: CC, label: String) -> Unit
+  emit8(b, 0x0F)
+  emit8(b, 0x80 + cc_byte(cc))
+  add_fixup(b, FixupKind::Rel32, label)
+  emit_i32(b, 0)
+end
+
+# CALL rel32  (with fixup or relocation)
+def x64_call_label(b: &mut CodeBuffer, label: String) -> Unit
+  emit8(b, 0xE8)
+  add_fixup(b, FixupKind::Rel32, label)
+  emit_i32(b, 0)
+end
+
+# CALL rel32 external (needs relocation)
+def x64_call_extern(b: &mut CodeBuffer, sym: String) -> Unit
+  emit8(b, 0xE8)
+  add_reloc(b, RelocKind::R_X86_64_PLT32, sym, -4)
+  emit_i32(b, 0)
+end
+
+# CALL r64
+def x64_call_r(b: &mut CodeBuffer, r: X64) -> Unit
+  if x64_hi(r) then emit8(b, rex(false, false, false, true)) end
+  emit8(b, 0xFF)
+  emit8(b, modrm(0x03, 2, x64_lo3(r)))
+end
+
+# JMP r64
+def x64_jmp_r(b: &mut CodeBuffer, r: X64) -> Unit
+  if x64_hi(r) then emit8(b, rex(false, false, false, true)) end
+  emit8(b, 0xFF)
+  emit8(b, modrm(0x03, 4, x64_lo3(r)))
+end
+
+# RET
+def x64_ret(b: &mut CodeBuffer) -> Unit
+  emit8(b, 0xC3)
+end
+
+# PUSH r64
+def x64_push(b: &mut CodeBuffer, r: X64) -> Unit
+  if x64_hi(r) then emit8(b, rex(false, false, false, true)) end
+  emit8(b, 0x50 + x64_lo3(r))
+end
+
+# POP r64
+def x64_pop(b: &mut CodeBuffer, r: X64) -> Unit
+  if x64_hi(r) then emit8(b, rex(false, false, false, true)) end
+  emit8(b, 0x58 + x64_lo3(r))
+end
+
+# LEA r64, [rip + rel32]   (RIP-relative)
+def x64_lea_rip(b: &mut CodeBuffer, dst: X64, label: String) -> Unit
+  emit8(b, rex(true, x64_hi(dst), false, false))
+  emit8(b, 0x8D)
+  emit8(b, modrm(0x00, x64_lo3(dst), 5))
+  add_fixup(b, FixupKind::Rel32, label)
+  emit_i32(b, 0)
+end
+
+# LEA r64, [base + disp32]
+def x64_lea_mem(b: &mut CodeBuffer, dst: X64, base: X64, disp: i32) -> Unit
+  emit8(b, rex(true, x64_hi(dst), false, x64_hi(base)))
+  emit8(b, 0x8D)
+  x64_emit_memop(b, x64_lo3(dst), base, disp)
+end
+
+# SYSCALL
+def x64_syscall(b: &mut CodeBuffer) -> Unit
+  emit8(b, 0x0F); emit8(b, 0x05)
+end
+
+# UD2  (unreachable / trap)
+def x64_ud2(b: &mut CodeBuffer) -> Unit
+  emit8(b, 0x0F); emit8(b, 0x0B)
+end
+
+# INT3  (debug breakpoint)
+def x64_int3(b: &mut CodeBuffer) -> Unit
+  emit8(b, 0xCC)
+end
+
+# NOP
+def x64_nop(b: &mut CodeBuffer) -> Unit
+  emit8(b, 0x90)
+end
+
+# Multi-byte NOP (for alignment padding)
+def x64_nop_n(b: &mut CodeBuffer, n: Int) -> Unit
+  # Use recommended multi-byte NOP encodings
+  mut remaining = n
+  while remaining > 0 do
+    if remaining >= 9 then
+      # 66 0F 1F 84 00 00 00 00 00
+      emit8(b, 0x66); emit8(b, 0x0F); emit8(b, 0x1F)
+      emit8(b, 0x84); emit8(b, 0x00)
+      emit32_le(b, 0)
+      remaining = remaining - 9
+    elsif remaining >= 8 then
+      emit8(b, 0x0F); emit8(b, 0x1F)
+      emit8(b, 0x84); emit8(b, 0x00)
+      emit32_le(b, 0)
+      remaining = remaining - 8
+    elsif remaining >= 7 then
+      emit8(b, 0x0F); emit8(b, 0x1F)
+      emit8(b, 0x80); emit32_le(b, 0)
+      remaining = remaining - 7
+    elsif remaining >= 4 then
+      emit8(b, 0x0F); emit8(b, 0x1F)
+      emit8(b, 0x40); emit8(b, 0x00)
+      remaining = remaining - 4
+    elsif remaining >= 3 then
+      emit8(b, 0x0F); emit8(b, 0x1F); emit8(b, 0x00)
+      remaining = remaining - 3
+    elsif remaining >= 2 then
+      emit8(b, 0x66); emit8(b, 0x90)
+      remaining = remaining - 2
+    else
+      emit8(b, 0x90)
+      remaining = remaining - 1
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# ARM64 (AArch64) Registers
+# ———————————————————————————————————————————————————————————————
+
+enum A64
+  X0; X1; X2; X3; X4; X5; X6; X7
+  X8; X9; X10; X11; X12; X13; X14; X15
+  X16; X17; X18; X19; X20; X21; X22; X23
+  X24; X25; X26; X27; X28
+  FP    # X29
+  LR    # X30
+  SP
+  XZR
+end
+
+def a64_code(r: A64) -> u32
+  match r
+  when A64::X0 then 0;   when A64::X1 then 1;   when A64::X2 then 2;   when A64::X3 then 3
+  when A64::X4 then 4;   when A64::X5 then 5;   when A64::X6 then 6;   when A64::X7 then 7
+  when A64::X8 then 8;   when A64::X9 then 9;   when A64::X10 then 10; when A64::X11 then 11
+  when A64::X12 then 12; when A64::X13 then 13; when A64::X14 then 14; when A64::X15 then 15
+  when A64::X16 then 16; when A64::X17 then 17; when A64::X18 then 18; when A64::X19 then 19
+  when A64::X20 then 20; when A64::X21 then 21; when A64::X22 then 22; when A64::X23 then 23
+  when A64::X24 then 24; when A64::X25 then 25; when A64::X26 then 26; when A64::X27 then 27
+  when A64::X28 then 28; when A64::FP then 29;  when A64::LR then 30
+  when A64::SP then 31;  when A64::XZR then 31
+  end
+end
+
+# AAPCS64: X0–X7 for arguments
+def a64_arg_reg(i: Int) -> Option[A64]
+  match i
+  when 0 then Option::Some(A64::X0); when 1 then Option::Some(A64::X1)
+  when 2 then Option::Some(A64::X2); when 3 then Option::Some(A64::X3)
+  when 4 then Option::Some(A64::X4); when 5 then Option::Some(A64::X5)
+  when 6 then Option::Some(A64::X6); when 7 then Option::Some(A64::X7)
+  when _ then Option::None
+  end
+end
+
+# Callee-saved: X19–X28, FP, LR
+def a64_callee_saved() -> Vec[A64]
+  [A64::X19, A64::X20, A64::X21, A64::X22, A64::X23,
+   A64::X24, A64::X25, A64::X26, A64::X27, A64::X28]
+end
+
+# ———————————————————————————————————————————————————————————————
+# ARM64 Instructions
+# ———————————————————————————————————————————————————————————————
+
+# ADD Xd, Xn, Xm
+def a64_add_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0x8B000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# ADD Xd, Xn, #imm12
+def a64_add_rri(b: &mut CodeBuffer, d: A64, n: A64, imm: u32) -> Unit
+  emit32_le(b, 0x91000000 | ((imm & 0xFFF) << 10) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# SUB Xd, Xn, Xm
+def a64_sub_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0xCB000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# SUB Xd, Xn, #imm12
+def a64_sub_rri(b: &mut CodeBuffer, d: A64, n: A64, imm: u32) -> Unit
+  emit32_le(b, 0xD1000000 | ((imm & 0xFFF) << 10) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# MUL Xd, Xn, Xm  (MADD Xd, Xn, Xm, XZR)
+def a64_mul_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0x9B007C00 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# SDIV Xd, Xn, Xm
+def a64_sdiv_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0x9AC00C00 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# AND Xd, Xn, Xm
+def a64_and_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0x8A000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# ORR Xd, Xn, Xm
+def a64_orr_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0xAA000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# EOR Xd, Xn, Xm
+def a64_eor_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0xCA000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# MOV Xd, Xn  (ORR Xd, XZR, Xn)
+def a64_mov_rr(b: &mut CodeBuffer, d: A64, n: A64) -> Unit
+  emit32_le(b, 0xAA0003E0 | (a64_code(n) << 16) | a64_code(d))
+end
+
+# MOVZ Xd, #imm16, LSL #shift
+def a64_movz(b: &mut CodeBuffer, d: A64, imm: u16, shift: u32) -> Unit
+  let hw = shift / 16
+  emit32_le(b, 0xD2800000 | (hw << 21) | ((imm as u32) << 5) | a64_code(d))
+end
+
+# MOVK Xd, #imm16, LSL #shift
+def a64_movk(b: &mut CodeBuffer, d: A64, imm: u16, shift: u32) -> Unit
+  let hw = shift / 16
+  emit32_le(b, 0xF2800000 | (hw << 21) | ((imm as u32) << 5) | a64_code(d))
+end
+
+# Load full 64-bit immediate using MOVZ + MOVK sequence
+def a64_mov_ri(b: &mut CodeBuffer, d: A64, imm: i64) -> Unit
+  let u = imm as u64
+  a64_movz(b, d, (u & 0xFFFF) as u16, 0)
+  if u > 0xFFFF then
+    a64_movk(b, d, ((u >> 16) & 0xFFFF) as u16, 16)
+  end
+  if u > 0xFFFFFFFF then
+    a64_movk(b, d, ((u >> 32) & 0xFFFF) as u16, 32)
+  end
+  if u > 0xFFFFFFFFFFFF then
+    a64_movk(b, d, ((u >> 48) & 0xFFFF) as u16, 48)
+  end
+end
+
+# LDR Xd, [Xn, #imm12*8]
+def a64_ldr(b: &mut CodeBuffer, d: A64, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 8) & 0xFFF
+  emit32_le(b, 0xF9400000 | (imm12 << 10) | (a64_code(base) << 5) | a64_code(d))
+end
+
+# STR Xd, [Xn, #imm12*8]
+def a64_str(b: &mut CodeBuffer, src: A64, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 8) & 0xFFF
+  emit32_le(b, 0xF9000000 | (imm12 << 10) | (a64_code(base) << 5) | a64_code(src))
+end
+
+# LDUR Xd, [Xn, #simm9]  (unscaled offset)
+def a64_ldur(b: &mut CodeBuffer, d: A64, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xF8400000 | (imm9 << 12) | (a64_code(base) << 5) | a64_code(d))
+end
+
+# STUR Xd, [Xn, #simm9]
+def a64_stur(b: &mut CodeBuffer, src: A64, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xF8000000 | (imm9 << 12) | (a64_code(base) << 5) | a64_code(src))
+end
+
+# CMP Xn, Xm  (SUBS XZR, Xn, Xm)
+def a64_cmp_rr(b: &mut CodeBuffer, n: A64, m: A64) -> Unit
+  emit32_le(b, 0xEB00001F | (a64_code(m) << 16) | (a64_code(n) << 5))
+end
+
+# CMP Xn, #imm12
+def a64_cmp_ri(b: &mut CodeBuffer, n: A64, imm: u32) -> Unit
+  emit32_le(b, 0xF100001F | ((imm & 0xFFF) << 10) | (a64_code(n) << 5))
+end
+
+# CSET Xd, cond  (CSINC Xd, XZR, XZR, inv(cond))
+def a64_cset(b: &mut CodeBuffer, d: A64, cond: u32) -> Unit
+  let inv = cond ^ 1
+  emit32_le(b, 0x9A9F07E0 | (inv << 12) | a64_code(d))
+end
+
+# B label (unconditional)
+def a64_b(b: &mut CodeBuffer, label: String) -> Unit
+  add_fixup(b, FixupKind::Branch26, label)
+  emit32_le(b, 0x14000000)
+end
+
+# B.cond label
+def a64_bcond(b: &mut CodeBuffer, cond: u32, label: String) -> Unit
+  add_fixup(b, FixupKind::Branch26, label)
+  emit32_le(b, 0x54000000 | (cond & 0xF))
+end
+
+# BL label
+def a64_bl(b: &mut CodeBuffer, label: String) -> Unit
+  add_fixup(b, FixupKind::Branch26, label)
+  emit32_le(b, 0x94000000)
+end
+
+# BLR Xn
+def a64_blr(b: &mut CodeBuffer, n: A64) -> Unit
+  emit32_le(b, 0xD63F0000 | (a64_code(n) << 5))
+end
+
+# RET  (BR X30)
+def a64_ret(b: &mut CodeBuffer) -> Unit
+  emit32_le(b, 0xD65F03C0)
+end
+
+# STP Xt1, Xt2, [Xn, #imm7*8]!  (pre-index)
+def a64_stp_pre(b: &mut CodeBuffer, r1: A64, r2: A64, base: A64, offset: i32) -> Unit
+  let imm7 = ((offset / 8) & 0x7F) as u32
+  emit32_le(b, 0xA9800000 | (imm7 << 15) | (a64_code(r2) << 10) | (a64_code(base) << 5) | a64_code(r1))
+end
+
+# LDP Xt1, Xt2, [Xn], #imm7*8  (post-index)
+def a64_ldp_post(b: &mut CodeBuffer, r1: A64, r2: A64, base: A64, offset: i32) -> Unit
+  let imm7 = ((offset / 8) & 0x7F) as u32
+  emit32_le(b, 0xA8C00000 | (imm7 << 15) | (a64_code(r2) << 10) | (a64_code(base) << 5) | a64_code(r1))
+end
+
+# SVC #0  (system call on Linux)
+def a64_svc(b: &mut CodeBuffer, imm: u16) -> Unit
+  emit32_le(b, 0xD4000001 | ((imm as u32) << 5))
+end
+
+# BRK #0  (debug break)
+def a64_brk(b: &mut CodeBuffer, imm: u16) -> Unit
+  emit32_le(b, 0xD4200000 | ((imm as u32) << 5))
+end
+
+# UDF  (undefined / trap)
+def a64_udf(b: &mut CodeBuffer) -> Unit
+  emit32_le(b, 0x00000000)
+end
+
+# NOP
+def a64_nop(b: &mut CodeBuffer) -> Unit
+  emit32_le(b, 0xD503201F)
+end
+
+# ARM64 condition codes
+# EQ=0, NE=1, LT(=LO)=0b1011, LE=0b1101, GT=0b1100, GE=0b1010
+def a64_cc_eq() -> u32 = 0
+def a64_cc_ne() -> u32 = 1
+def a64_cc_lt() -> u32 = 11  # 0b1011
+def a64_cc_le() -> u32 = 13  # 0b1101
+def a64_cc_gt() -> u32 = 12  # 0b1100
+def a64_cc_ge() -> u32 = 10  # 0b1010
+
+# ———————————————————————————————————————————————————————————————
+# Target triple detection
+# ———————————————————————————————————————————————————————————————
+
+enum Arch
+  X86_64
+  AArch64
+end
+
+enum OsAbi
+  Linux
+  MacOS
+  Windows
+end
+
+struct TargetTriple
+  arch: Arch
+  os: OsAbi
+  pointer_size: Int   # always 8 for 64-bit
+end
+
+def target_triple(arch: Arch, os: OsAbi) -> TargetTriple
+  TargetTriple { arch: arch, os: os, pointer_size: 8 }
+end
+
+def host_target() -> TargetTriple
+  # Detect at compile-time; for now default to macOS ARM64
+  target_triple(Arch::AArch64, OsAbi::MacOS)
+end

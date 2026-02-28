@@ -1,0 +1,1488 @@
+# Tangerine Compiler — Object File Generation
+# Self-hosting compiler written in Tangerine
+#
+# Emits native object files directly — no external assembler needed.
+# Supports:
+#   ELF64  (Linux x86-64, Linux AArch64)
+#   Mach-O 64 (macOS x86-64, macOS AArch64 / Apple Silicon)
+#   COFF / PE (Windows x86-64)
+#
+# NO dependency on any other language.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map}
+use tg_compiler::asm::{
+  CodeBuffer, AsmSymbol, Relocation, RelocKind,
+  Section, SymBinding, SymKind,
+  buf_pos, emit8, emit16_le, emit32_le, emit64_le, emit_zeros,
+  Arch, OsAbi, TargetTriple
+}
+
+# ———————————————————————————————————————————————————————————————
+# Object file builder
+# ———————————————————————————————————————————————————————————————
+
+struct ObjectFile
+  target: TargetTriple
+  text: Vec[u8]
+  data: Vec[u8]
+  rodata: Vec[u8]
+  bss_size: Int
+  symbols: Vec[AsmSymbol]
+  relocations: Vec[Relocation]
+  string_table: Vec[u8]
+  strings: Map[String, Int]
+end
+
+def object_new(target: TargetTriple) -> ObjectFile
+  mut strtab = Vec::new()
+  strtab.push(0)   # first byte is NUL
+  ObjectFile {
+    target: target,
+    text: Vec::new(),
+    data: Vec::new(),
+    rodata: Vec::new(),
+    bss_size: 0,
+    symbols: Vec::new(),
+    relocations: Vec::new(),
+    string_table: strtab,
+    strings: Map::new()
+  }
+end
+
+def obj_add_string(obj: &mut ObjectFile, s: String) -> Int
+  match obj.strings.get(s)
+  when Option::Some(off) then return off
+  when Option::None then ()
+  end
+  let off = obj.string_table.len()
+  for c in s.bytes() do
+    obj.string_table.push(c)
+  end
+  obj.string_table.push(0)
+  obj.strings.insert(s, off)
+  off
+end
+
+# ———————————————————————————————————————————————————————————————
+# ELF64 Generation
+# ———————————————————————————————————————————————————————————————
+
+# ELF constants
+def ELF_MAGIC() -> [u8; 4] = [0x7F, 0x45, 0x4C, 0x46]  # \x7fELF
+
+def ELFCLASS64()    -> u8 = 2
+def ELFDATA2LSB()   -> u8 = 1
+def EV_CURRENT()    -> u8 = 1
+def ELFOSABI_NONE() -> u8 = 0
+def ELFOSABI_LINUX()-> u8 = 3
+
+def ET_REL()  -> u16 = 1    # relocatable object
+def ET_EXEC() -> u16 = 2    # executable
+
+def EM_X86_64()  -> u16 = 62   # 0x3E
+def EM_AARCH64() -> u16 = 183  # 0xB7
+
+# Section header types
+def SHT_NULL()     -> u32 = 0
+def SHT_PROGBITS() -> u32 = 1
+def SHT_SYMTAB()   -> u32 = 2
+def SHT_STRTAB()   -> u32 = 3
+def SHT_RELA()     -> u32 = 4
+def SHT_NOBITS()   -> u32 = 8
+
+# Section flags
+def SHF_WRITE()     -> u64 = 0x1
+def SHF_ALLOC()     -> u64 = 0x2
+def SHF_EXECINSTR() -> u64 = 0x4
+def SHF_INFO()      -> u64 = 0x40
+
+# Symbol binding/type for st_info field
+def STB_LOCAL()  -> u8 = 0
+def STB_GLOBAL() -> u8 = 1
+def STB_WEAK()   -> u8 = 2
+
+def STT_NOTYPE() -> u8 = 0
+def STT_FUNC()   -> u8 = 2
+def STT_OBJECT() -> u8 = 1
+def STT_SECTION()-> u8 = 3
+
+def elf_st_info(bind: u8, typ: u8) -> u8
+  (bind << 4) | (typ & 0xF)
+end
+
+# ELF64 relocation types (x86-64)
+def R_X86_64_NONE()      -> u32 = 0
+def R_X86_64_64_()       -> u32 = 1
+def R_X86_64_PC32_()     -> u32 = 2
+def R_X86_64_PLT32_()    -> u32 = 4
+def R_X86_64_GOTPCREL_() -> u32 = 9
+
+# ELF64 relocation types (AArch64)
+def R_AARCH64_CALL26_()          -> u32 = 283
+def R_AARCH64_ADR_PREL_PG_HI21_()-> u32 = 275
+def R_AARCH64_ADD_ABS_LO12_NC_() -> u32 = 277
+
+# ELF section indices (fixed layout for our files)
+# 0: NULL
+# 1: .text
+# 2: .data
+# 3: .rodata
+# 4: .bss
+# 5: .symtab
+# 6: .strtab
+# 7: .shstrtab
+# 8: .rela.text
+def NUM_ELF_SECTIONS() -> Int = 9
+
+def build_elf64(obj: &ObjectFile) -> Vec[u8]
+  mut out = Vec::new()
+
+  # --- Precompute section name string table (.shstrtab) ---
+  mut shstrtab = Vec::new()
+  shstrtab.push(0)  # index 0 = empty
+
+  let sh_text_name    = shstrtab.len(); push_str(&mut shstrtab, ".text")
+  let sh_data_name    = shstrtab.len(); push_str(&mut shstrtab, ".data")
+  let sh_rodata_name  = shstrtab.len(); push_str(&mut shstrtab, ".rodata")
+  let sh_bss_name     = shstrtab.len(); push_str(&mut shstrtab, ".bss")
+  let sh_symtab_name  = shstrtab.len(); push_str(&mut shstrtab, ".symtab")
+  let sh_strtab_name  = shstrtab.len(); push_str(&mut shstrtab, ".strtab")
+  let sh_shstrtab_name= shstrtab.len(); push_str(&mut shstrtab, ".shstrtab")
+  let sh_relatext_name= shstrtab.len(); push_str(&mut shstrtab, ".rela.text")
+
+  # --- Build symbol table ---
+  mut symtab_buf = Vec::new()
+  mut strtab = Vec::new()
+  strtab.push(0)  # null byte at start
+
+  # Symbol 0: null entry (24 bytes of zero)
+  emit_zeros_vec(&mut symtab_buf, 24)
+
+  # Section symbols (1-4: .text, .data, .rodata, .bss)
+  mut sym_idx = 1
+  for sec_idx in 1..5 do
+    elf_write_sym(&mut symtab_buf, 0, elf_st_info(STB_LOCAL(), STT_SECTION()), 0, sec_idx as u16, 0, 0)
+    sym_idx = sym_idx + 1
+  end
+
+  let first_global = sym_idx
+
+  # Global/weak symbols from the object
+  for sym in obj.symbols do
+    let name_off = strtab.len()
+    push_str(&mut strtab, sym.name)
+
+    let bind = match sym.binding
+    when SymBinding::Local  then STB_LOCAL()
+    when SymBinding::Global then STB_GLOBAL()
+    when SymBinding::Weak   then STB_WEAK()
+    end
+
+    let typ = match sym.kind
+    when SymKind::Func   then STT_FUNC()
+    when SymKind::Data   then STT_OBJECT()
+    when SymKind::NoType then STT_NOTYPE()
+    end
+
+    let sec = match sym.section
+    when Section::Text   then 1
+    when Section::Data   then 2
+    when Section::Rodata then 3
+    when Section::Bss    then 4
+    end
+
+    elf_write_sym(&mut symtab_buf, name_off as u32, elf_st_info(bind, typ), 0, sec as u16, sym.offset as u64, sym.size as u64)
+    sym_idx = sym_idx + 1
+  end
+
+  # --- Build .rela.text entries ---
+  mut rela_buf = Vec::new()
+  for rel in obj.relocations do
+    # Find symbol index
+    mut rsym: u32 = 0
+    mut ri = 0
+    for s in obj.symbols do
+      if s.name == rel.symbol then
+        rsym = (first_global + ri) as u32
+        break
+      end
+      ri = ri + 1
+    end
+
+    let rtype = match rel.kind
+    when RelocKind::R_X86_64_PC32      then R_X86_64_PC32_()
+    when RelocKind::R_X86_64_PLT32     then R_X86_64_PLT32_()
+    when RelocKind::R_X86_64_GOTPCREL  then R_X86_64_GOTPCREL_()
+    when RelocKind::R_X86_64_64        then R_X86_64_64_()
+    when RelocKind::R_AARCH64_CALL26   then R_AARCH64_CALL26_()
+    when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then R_AARCH64_ADR_PREL_PG_HI21_()
+    when RelocKind::R_AARCH64_ADD_ABS_LO12_NC  then R_AARCH64_ADD_ABS_LO12_NC_()
+    when _ then 0
+    end
+
+    elf_write_rela(&mut rela_buf, rel.offset as u64, rsym, rtype, rel.addend as i64)
+  end
+
+  # --- Compute layout ---
+  let ehdr_size   = 64
+  let text_off    = ehdr_size
+  let text_size   = obj.text.len()
+  let data_off    = text_off + text_size
+  let data_size   = obj.data.len()
+  let rodata_off  = data_off + data_size
+  let rodata_size = obj.rodata.len()
+  let symtab_off  = align_up(rodata_off + rodata_size, 8)
+  let symtab_size = symtab_buf.len()
+  let strtab_off  = symtab_off + symtab_size
+  let strtab_size = strtab.len()
+  let shstrtab_off= strtab_off + strtab_size
+  let shstrtab_sz = shstrtab.len()
+  let rela_off    = shstrtab_off + shstrtab_sz
+  let rela_size   = rela_buf.len()
+  let shdr_off    = align_up(rela_off + rela_size, 8)
+
+  # --- ELF Header (64 bytes) ---
+  # e_ident[16]
+  for b_ in ELF_MAGIC() do out.push(b_) end
+  out.push(ELFCLASS64())
+  out.push(ELFDATA2LSB())
+  out.push(EV_CURRENT())
+  let osabi = match obj.target.os
+  when OsAbi::Linux then ELFOSABI_LINUX()
+  when _            then ELFOSABI_NONE()
+  end
+  out.push(osabi)
+  emit_zeros_vec(&mut out, 8)  # padding
+
+  write16(&mut out, ET_REL())
+  let machine = match obj.target.arch
+  when Arch::X86_64  then EM_X86_64()
+  when Arch::AArch64 then EM_AARCH64()
+  end
+  write16(&mut out, machine)
+  write32(&mut out, 1)              # e_version
+  write64(&mut out, 0)              # e_entry
+  write64(&mut out, 0)              # e_phoff
+  write64(&mut out, shdr_off as u64)# e_shoff
+  write32(&mut out, 0)              # e_flags
+  write16(&mut out, 64)             # e_ehsize
+  write16(&mut out, 0)              # e_phentsize
+  write16(&mut out, 0)              # e_phnum
+  write16(&mut out, 64)             # e_shentsize
+  write16(&mut out, NUM_ELF_SECTIONS() as u16) # e_shnum
+  write16(&mut out, 7)              # e_shstrndx
+
+  # --- Sections data ---
+  append_vec(&mut out, &obj.text)
+  append_vec(&mut out, &obj.data)
+  append_vec(&mut out, &obj.rodata)
+  pad_to(&mut out, symtab_off)
+  append_vec(&mut out, &symtab_buf)
+  append_vec(&mut out, &strtab)
+  append_vec(&mut out, &shstrtab)
+  append_vec(&mut out, &rela_buf)
+  pad_to(&mut out, shdr_off)
+
+  # --- Section headers (9 × 64 bytes) ---
+
+  # [0] NULL
+  write_shdr(&mut out, 0, SHT_NULL(), 0, 0, 0, 0, 0, 0, 0, 0)
+
+  # [1] .text
+  write_shdr(&mut out, sh_text_name as u32, SHT_PROGBITS(),
+    SHF_ALLOC() | SHF_EXECINSTR(),
+    0, text_off as u64, text_size as u64,
+    0, 0, 16, 0)
+
+  # [2] .data
+  write_shdr(&mut out, sh_data_name as u32, SHT_PROGBITS(),
+    SHF_ALLOC() | SHF_WRITE(),
+    0, data_off as u64, data_size as u64,
+    0, 0, 8, 0)
+
+  # [3] .rodata
+  write_shdr(&mut out, sh_rodata_name as u32, SHT_PROGBITS(),
+    SHF_ALLOC(),
+    0, rodata_off as u64, rodata_size as u64,
+    0, 0, 8, 0)
+
+  # [4] .bss
+  write_shdr(&mut out, sh_bss_name as u32, SHT_NOBITS(),
+    SHF_ALLOC() | SHF_WRITE(),
+    0, 0, obj.bss_size as u64,
+    0, 0, 8, 0)
+
+  # [5] .symtab
+  write_shdr(&mut out, sh_symtab_name as u32, SHT_SYMTAB(),
+    0, 0, symtab_off as u64, symtab_size as u64,
+    6,                     # sh_link = .strtab index
+    first_global as u32,   # sh_info = first global sym
+    8, 24)                 # entsize=24
+
+  # [6] .strtab
+  write_shdr(&mut out, sh_strtab_name as u32, SHT_STRTAB(),
+    0, 0, strtab_off as u64, strtab_size as u64,
+    0, 0, 1, 0)
+
+  # [7] .shstrtab
+  write_shdr(&mut out, sh_shstrtab_name as u32, SHT_STRTAB(),
+    0, 0, shstrtab_off as u64, shstrtab_sz as u64,
+    0, 0, 1, 0)
+
+  # [8] .rela.text
+  write_shdr(&mut out, sh_relatext_name as u32, SHT_RELA(),
+    SHF_INFO(),
+    0, rela_off as u64, rela_size as u64,
+    5,   # sh_link = .symtab index
+    1,   # sh_info = .text index
+    8, 24)  # entsize=24
+
+  out
+end
+
+# Write ELF64 Sym entry (24 bytes)
+def elf_write_sym(buf: &mut Vec[u8], name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64) -> Unit
+  write32(buf, name)
+  buf.push(info)
+  buf.push(other)
+  write16(buf, shndx)
+  write64(buf, value)
+  write64(buf, size)
+end
+
+# Write ELF64 Rela entry (24 bytes)
+def elf_write_rela(buf: &mut Vec[u8], offset: u64, sym: u32, typ: u32, addend: i64) -> Unit
+  write64(buf, offset)
+  write64(buf, ((sym as u64) << 32) | (typ as u64))
+  write64(buf, addend as u64)
+end
+
+# Write ELF64 section header (64 bytes)
+def write_shdr(buf: &mut Vec[u8], name: u32, typ: u32, flags: u64, addr: u64,
+               offset: u64, size: u64, link: u32, info: u32, align: u64, entsize: u64) -> Unit
+  write32(buf, name)
+  write32(buf, typ)
+  write64(buf, flags)
+  write64(buf, addr)
+  write64(buf, offset)
+  write64(buf, size)
+  write32(buf, link)
+  write32(buf, info)
+  write64(buf, align)
+  write64(buf, entsize)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Mach-O 64 Generation (macOS x86-64 and ARM64)
+# ———————————————————————————————————————————————————————————————
+
+# Mach-O header magic
+def MH_MAGIC_64()   -> u32 = 0xFEEDFACF
+def MH_OBJECT()     -> u32 = 1
+
+def CPU_TYPE_X86_64()  -> u32 = 0x01000007
+def CPU_TYPE_ARM64()   -> u32 = 0x0100000C
+
+def CPU_SUBTYPE_X86_64_ALL() -> u32 = 3
+def CPU_SUBTYPE_ARM64_ALL()  -> u32 = 0
+
+# Load command types
+def LC_SEGMENT_64()  -> u32 = 0x19
+def LC_SYMTAB()      -> u32 = 0x02
+def LC_DYSYMTAB()    -> u32 = 0x0B
+
+# Section types/attrs
+def S_REGULAR()             -> u32 = 0
+def S_ZEROFILL()            -> u32 = 1
+def S_ATTR_PURE_INSTRUCTIONS() -> u32 = 0x80000000
+def S_ATTR_SOME_INSTRUCTIONS() -> u32 = 0x00000400
+
+# Mach-O relocation types (x86-64)
+def X86_64_RELOC_BRANCH_()  -> u32 = 2
+def X86_64_RELOC_SIGNED_()  -> u32 = 1
+
+# Mach-O relocation types (ARM64)
+def ARM64_RELOC_BRANCH26_() -> u32 = 2
+def ARM64_RELOC_PAGE21_()   -> u32 = 3
+def ARM64_RELOC_PAGEOFF12_()-> u32 = 4
+
+def build_macho64(obj: &ObjectFile) -> Vec[u8]
+  mut out = Vec::new()
+
+  let is_arm = match obj.target.arch
+  when Arch::AArch64 then true
+  when _ then false
+  end
+
+  let cputype = if is_arm then CPU_TYPE_ARM64() else CPU_TYPE_X86_64() end
+  let cpusubtype = if is_arm then CPU_SUBTYPE_ARM64_ALL() else CPU_SUBTYPE_X86_64_ALL() end
+
+  let text_size = obj.text.len()
+  let data_size = obj.data.len()
+  let rodata_size = obj.rodata.len()
+
+  let num_sections = 3   # __text, __data, __const
+  let segment_cmd_size = 72 + (num_sections * 80)
+  let symtab_cmd_size = 24
+  let dysymtab_cmd_size = 80
+
+  let num_load_cmds = 3   # segment + symtab + dysymtab
+  let load_cmds_size = segment_cmd_size + symtab_cmd_size + dysymtab_cmd_size
+
+  let header_size = 32   # Mach-O 64-bit header
+
+  let text_offset = header_size + load_cmds_size
+  let data_offset = text_offset + text_size
+  let rodata_offset = data_offset + data_size
+  let segment_filesize = text_size + data_size + rodata_size
+
+  # --- Build relocation entries for __text section ---
+  # Mach-O relocation_info: r_address(4 bytes), packed(4 bytes)
+  # packed = r_symbolnum:24 | r_pcrel:1 | r_length:2 | r_extern:1 | r_type:4
+  mut reloc_buf = Vec::new()
+  mut text_nreloc = 0
+
+  # Build symbol name to index map for relocation symbol lookup
+  mut sym_name_to_idx: Map[String, Int] = Map::new()
+  mut si = 0
+  for sym in obj.symbols do
+    sym_name_to_idx.insert(sym.name.clone(), si)
+    si = si + 1
+  end
+
+  for rel in obj.relocations do
+    # Only emit relocations for the .text section
+    let r_address = rel.offset as u32
+
+    # Look up symbol index
+    let sym_idx = match sym_name_to_idx.get(rel.symbol.clone())
+    when Option::Some(idx) then idx
+    when Option::None then 0
+    end
+
+    # Determine relocation type, pcrel, and length for Mach-O
+    let (r_type, r_pcrel, r_length) = if is_arm then
+      match rel.kind
+      when RelocKind::R_AARCH64_CALL26 then
+        (ARM64_RELOC_BRANCH26_(), 1 as u32, 2 as u32)   # pcrel, 4-byte (2^2)
+      when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then
+        (ARM64_RELOC_PAGE21_(), 1 as u32, 2 as u32)
+      when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then
+        (ARM64_RELOC_PAGEOFF12_(), 0 as u32, 2 as u32)  # not pcrel
+      when _ then (0 as u32, 0 as u32, 2 as u32)
+      end
+    else
+      match rel.kind
+      when RelocKind::R_X86_64_PC32 then
+        (X86_64_RELOC_SIGNED_(), 1 as u32, 2 as u32)    # pcrel, 4-byte
+      when RelocKind::R_X86_64_PLT32 then
+        (X86_64_RELOC_BRANCH_(), 1 as u32, 2 as u32)
+      when RelocKind::R_X86_64_64 then
+        (0 as u32, 0 as u32, 3 as u32)                  # abs, 8-byte (2^3)
+      when RelocKind::R_X86_64_GOTPCREL then
+        (4 as u32, 1 as u32, 2 as u32)                  # X86_64_RELOC_GOT
+      when _ then (0 as u32, 0 as u32, 2 as u32)
+      end
+    end
+
+    # r_extern = 1 (symbol-based relocation)
+    let r_extern: u32 = 1
+    # Pack: r_symbolnum(24) | r_pcrel(1) | r_length(2) | r_extern(1) | r_type(4)
+    let packed: u32 = (sym_idx as u32 & 0x00FFFFFF)
+      | ((r_pcrel & 1) << 24)
+      | ((r_length & 3) << 25)
+      | ((r_extern & 1) << 27)
+      | ((r_type & 0xF) << 28)
+
+    write32(&mut reloc_buf, r_address)
+    write32(&mut reloc_buf, packed)
+    text_nreloc = text_nreloc + 1
+  end
+
+  let reloc_offset = align_up(rodata_offset + rodata_size, 4)
+  let reloc_size = reloc_buf.len()
+
+  # Build symbol + string tables
+  mut mo_strtab = Vec::new()
+  mo_strtab.push(0x20)  # space (Mach-O convention: first byte is space)
+  mo_strtab.push(0)
+
+  mut nlist_buf = Vec::new()
+  mut n_local_syms = 0
+  mut n_extern_syms = 0
+
+  for sym in obj.symbols do
+    let name_off = mo_strtab.len()
+    # Mach-O symbols need leading underscore
+    mo_strtab.push(0x5F)  # '_'
+    push_str(&mut mo_strtab, sym.name)
+
+    let (n_type, is_ext) = match sym.binding
+    when SymBinding::Local  then (0x0E as u8, false)  # N_SECT
+    when SymBinding::Global then (0x0F as u8, true)   # N_SECT | N_EXT
+    when SymBinding::Weak   then (0x0F as u8, true)   # N_SECT | N_EXT (weak via n_desc)
+    end
+
+    if is_ext then n_extern_syms = n_extern_syms + 1
+    else n_local_syms = n_local_syms + 1
+    end
+
+    let n_sect: u8 = match sym.section
+    when Section::Text   then 1
+    when Section::Data   then 2
+    when Section::Rodata then 3
+    when Section::Bss    then 0
+    end
+
+    let n_desc: u16 = match sym.binding
+    when SymBinding::Weak then 0x0080  # N_WEAK_DEF
+    when _ then 0
+    end
+
+    # nlist_64: strx(4) type(1) sect(1) desc(2) value(8) = 16 bytes
+    write32(&mut nlist_buf, name_off as u32)
+    nlist_buf.push(n_type)
+    nlist_buf.push(n_sect)
+    write16(&mut nlist_buf, n_desc)
+    write64(&mut nlist_buf, sym.offset as u64)
+  end
+
+  let symtab_offset = align_up(reloc_offset + reloc_size, 8)
+  let strtab_offset = symtab_offset + nlist_buf.len()
+
+  # --- Mach-O Header (32 bytes) ---
+  write32(&mut out, MH_MAGIC_64())
+  write32(&mut out, cputype)
+  write32(&mut out, cpusubtype)
+  write32(&mut out, MH_OBJECT())
+  write32(&mut out, num_load_cmds as u32)
+  write32(&mut out, load_cmds_size as u32)
+  let hdr_flags: u32 = if obj.relocations.len() > 0 then 0x2000 else 0 end  # MH_SUBSECTIONS_VIA_SYMBOLS
+  write32(&mut out, hdr_flags)
+  write32(&mut out, 0)   # reserved
+
+  # --- LC_SEGMENT_64 ---
+  write32(&mut out, LC_SEGMENT_64())
+  write32(&mut out, segment_cmd_size as u32)
+  write_padded_str(&mut out, "", 16)         # segname (empty for MH_OBJECT)
+  write64(&mut out, 0)                        # vmaddr
+  write64(&mut out, segment_filesize as u64)  # vmsize
+  write64(&mut out, text_offset as u64)       # fileoff
+  write64(&mut out, segment_filesize as u64)  # filesize
+  write32(&mut out, 7)                        # maxprot (rwx)
+  write32(&mut out, 7)                        # initprot
+  write32(&mut out, num_sections as u32)
+  write32(&mut out, 0)                        # flags
+
+  # Section 1: __text (with relocations)
+  write_padded_str(&mut out, "__text", 16)
+  write_padded_str(&mut out, "__TEXT", 16)
+  write64(&mut out, 0)                        # addr
+  write64(&mut out, text_size as u64)
+  write32(&mut out, text_offset as u32)
+  write32(&mut out, 4)                        # align (2^4 = 16)
+  if text_nreloc > 0 then
+    write32(&mut out, reloc_offset as u32)    # reloff
+    write32(&mut out, text_nreloc as u32)     # nreloc
+  else
+    write32(&mut out, 0)                      # reloff
+    write32(&mut out, 0)                      # nreloc
+  end
+  write32(&mut out, S_REGULAR() | S_ATTR_PURE_INSTRUCTIONS() | S_ATTR_SOME_INSTRUCTIONS())
+  write32(&mut out, 0)                        # reserved1
+  write32(&mut out, 0)                        # reserved2
+  write32(&mut out, 0)                        # reserved3 (padding for 64-bit)
+
+  # Section 2: __data
+  write_padded_str(&mut out, "__data", 16)
+  write_padded_str(&mut out, "__DATA", 16)
+  write64(&mut out, text_size as u64)
+  write64(&mut out, data_size as u64)
+  write32(&mut out, data_offset as u32)
+  write32(&mut out, 3)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, S_REGULAR())
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # Section 3: __const (rodata)
+  write_padded_str(&mut out, "__const", 16)
+  write_padded_str(&mut out, "__TEXT", 16)
+  write64(&mut out, (text_size + data_size) as u64)
+  write64(&mut out, rodata_size as u64)
+  write32(&mut out, rodata_offset as u32)
+  write32(&mut out, 3)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, S_REGULAR())
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # --- LC_SYMTAB ---
+  write32(&mut out, LC_SYMTAB())
+  write32(&mut out, symtab_cmd_size as u32)
+  write32(&mut out, symtab_offset as u32)
+  write32(&mut out, obj.symbols.len() as u32)
+  write32(&mut out, strtab_offset as u32)
+  write32(&mut out, mo_strtab.len() as u32)
+
+  # --- LC_DYSYMTAB ---
+  write32(&mut out, LC_DYSYMTAB())
+  write32(&mut out, dysymtab_cmd_size as u32)
+  write32(&mut out, 0)                              # ilocalsym
+  write32(&mut out, n_local_syms as u32)             # nlocalsym
+  write32(&mut out, n_local_syms as u32)             # iextdefsym
+  write32(&mut out, n_extern_syms as u32)            # nextdefsym
+  write32(&mut out, (n_local_syms + n_extern_syms) as u32)  # iundefsym
+  write32(&mut out, 0)                              # nundefsym
+  write32(&mut out, 0)                              # tocoff
+  write32(&mut out, 0)                              # ntoc
+  write32(&mut out, 0)                              # modtaboff
+  write32(&mut out, 0)                              # nmodtab
+  write32(&mut out, 0)                              # extrefsymoff
+  write32(&mut out, 0)                              # nextrefsyms
+  write32(&mut out, 0)                              # indirectsymoff
+  write32(&mut out, 0)                              # nindirectsyms
+  write32(&mut out, 0)                              # extreloff
+  write32(&mut out, 0)                              # nextrel
+  write32(&mut out, 0)                              # locreloff
+  write32(&mut out, 0)                              # nlocrel
+
+  # --- Section data ---
+  append_vec(&mut out, &obj.text)
+  append_vec(&mut out, &obj.data)
+  append_vec(&mut out, &obj.rodata)
+
+  # --- Relocation entries ---
+  pad_to(&mut out, reloc_offset)
+  append_vec(&mut out, &reloc_buf)
+
+  pad_to(&mut out, symtab_offset)
+  append_vec(&mut out, &nlist_buf)
+  append_vec(&mut out, &mo_strtab)
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# COFF / PE Generation (Windows x86-64)
+# ———————————————————————————————————————————————————————————————
+
+def IMAGE_FILE_MACHINE_AMD64() -> u16 = 0x8664
+
+# Section flags
+def IMAGE_SCN_CNT_CODE()           -> u32 = 0x00000020
+def IMAGE_SCN_CNT_INITIALIZED()    -> u32 = 0x00000040
+def IMAGE_SCN_CNT_UNINITIALIZED()  -> u32 = 0x00000080
+def IMAGE_SCN_MEM_EXECUTE()        -> u32 = 0x20000000
+def IMAGE_SCN_MEM_READ()           -> u32 = 0x40000000
+def IMAGE_SCN_MEM_WRITE()          -> u32 = 0x80000000
+
+def build_coff64(obj: &ObjectFile) -> Vec[u8]
+  mut out = Vec::new()
+
+  let num_sections = 3  # .text, .data, .rdata
+
+  # --- Build relocation entries for .text section ---
+  # COFF relocation: VirtualAddress(4), SymbolTableIndex(4), Type(2) = 10 bytes each
+  mut text_reloc_buf = Vec::new()
+  mut text_nrelocs: u16 = 0
+
+  # Build symbol name to index map
+  mut sym_name_to_idx: Map[String, Int] = Map::new()
+  mut si = 0
+  for sym in obj.symbols do
+    sym_name_to_idx.insert(sym.name.clone(), si)
+    si = si + 1
+  end
+
+  for rel in obj.relocations do
+    let sym_idx = match sym_name_to_idx.get(rel.symbol.clone())
+    when Option::Some(idx) then idx
+    when Option::None then 0
+    end
+
+    # COFF relocation types for AMD64
+    let reloc_type: u16 = match rel.kind
+    when RelocKind::R_X86_64_64    then 1   # IMAGE_REL_AMD64_ADDR64
+    when RelocKind::R_X86_64_PC32  then 4   # IMAGE_REL_AMD64_REL32
+    when RelocKind::R_X86_64_PLT32 then 4   # IMAGE_REL_AMD64_REL32 (PLT → direct on COFF)
+    when _ then 0
+    end
+
+    write32(&mut text_reloc_buf, rel.offset as u32)     # VirtualAddress
+    write32(&mut text_reloc_buf, sym_idx as u32)         # SymbolTableIndex
+    write16(&mut text_reloc_buf, reloc_type)             # Type
+    text_nrelocs = text_nrelocs + 1
+  end
+
+  # COFF Header (20 bytes)
+  write16(&mut out, IMAGE_FILE_MACHINE_AMD64())
+  write16(&mut out, num_sections as u16)
+  write32(&mut out, 0)                # TimeDateStamp
+  let symtab_placeholder = out.len()  # will patch later
+  write32(&mut out, 0)                # PointerToSymbolTable (placeholder)
+  write32(&mut out, obj.symbols.len() as u32)  # NumberOfSymbols
+  write16(&mut out, 0)                # SizeOfOptionalHeader
+  write16(&mut out, 0)                # Characteristics
+
+  # Section headers (40 bytes each)
+  let headers_end = 20 + (num_sections * 40)
+  let text_off = headers_end
+  let data_off = text_off + obj.text.len()
+  let rdata_off = data_off + obj.data.len()
+  let reloc_off = rdata_off + obj.rodata.len()
+  let reloc_size = text_reloc_buf.len()
+
+  # .text (with relocations)
+  write_padded_str(&mut out, ".text", 8)
+  write32(&mut out, 0)                                    # VirtualSize
+  write32(&mut out, 0)                                    # VirtualAddress
+  write32(&mut out, obj.text.len() as u32)                # SizeOfRawData
+  write32(&mut out, text_off as u32)                      # PointerToRawData
+  if text_nrelocs > 0 then
+    write32(&mut out, reloc_off as u32)                   # PointerToRelocations
+  else
+    write32(&mut out, 0)
+  end
+  write32(&mut out, 0)                                    # PointerToLinenumbers
+  write16(&mut out, text_nrelocs)                         # NumberOfRelocations
+  write16(&mut out, 0)                                    # NumberOfLinenumbers
+  write32(&mut out, IMAGE_SCN_CNT_CODE() | IMAGE_SCN_MEM_EXECUTE() | IMAGE_SCN_MEM_READ())
+
+  # .data
+  write_padded_str(&mut out, ".data", 8)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, obj.data.len() as u32)
+  write32(&mut out, data_off as u32)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write16(&mut out, 0); write16(&mut out, 0)
+  write32(&mut out, IMAGE_SCN_CNT_INITIALIZED() | IMAGE_SCN_MEM_READ() | IMAGE_SCN_MEM_WRITE())
+
+  # .rdata
+  write_padded_str(&mut out, ".rdata", 8)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, obj.rodata.len() as u32)
+  write32(&mut out, rdata_off as u32)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write16(&mut out, 0); write16(&mut out, 0)
+  write32(&mut out, IMAGE_SCN_CNT_INITIALIZED() | IMAGE_SCN_MEM_READ())
+
+  # Section data
+  append_vec(&mut out, &obj.text)
+  append_vec(&mut out, &obj.data)
+  append_vec(&mut out, &obj.rodata)
+
+  # Relocation data
+  append_vec(&mut out, &text_reloc_buf)
+
+  # Symbol table
+  let symtab_pos = out.len()
+  patch_u32(&mut out, symtab_placeholder, symtab_pos as u32)
+
+  # COFF symbol entries (18 bytes each)
+  mut coff_strtab = Vec::new()
+  # String table starts with its own size (4 bytes), patched later
+  let strtab_size_placeholder = coff_strtab.len()
+  write32(&mut coff_strtab, 0)  # placeholder for string table size
+
+  for sym in obj.symbols do
+    let name_bytes = sym.name.bytes()
+    if name_bytes.len() <= 8 then
+      # Short name: fits inline
+      write_padded_str(&mut out, sym.name, 8)
+    else
+      # Long name: zeroes(4) + offset_into_string_table(4)
+      let str_off = coff_strtab.len()
+      push_str(&mut coff_strtab, sym.name)
+      write32(&mut out, 0)
+      write32(&mut out, str_off as u32)
+    end
+
+    write32(&mut out, sym.offset as u32)   # Value
+    let sec_num: u16 = match sym.section
+    when Section::Text   then 1
+    when Section::Data   then 2
+    when Section::Rodata then 3
+    when Section::Bss    then 0
+    end
+    write16(&mut out, sec_num)             # SectionNumber
+    let sym_type: u16 = match sym.kind
+    when SymKind::Func then 0x20           # IMAGE_SYM_DTYPE_FUNCTION
+    when _ then 0
+    end
+    write16(&mut out, sym_type)            # Type
+    let storage: u8 = match sym.binding
+    when SymBinding::Global then 2         # IMAGE_SYM_CLASS_EXTERNAL
+    when SymBinding::Local  then 3         # IMAGE_SYM_CLASS_STATIC
+    when SymBinding::Weak   then 2
+    end
+    out.push(storage)                      # StorageClass
+    out.push(0)                            # NumberOfAuxSymbols
+  end
+
+  # String table (patch size)
+  patch_u32(&mut coff_strtab, strtab_size_placeholder, coff_strtab.len() as u32)
+  append_vec(&mut out, &coff_strtab)
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API — write object file based on target
+# ———————————————————————————————————————————————————————————————
+
+def build_object(obj: &ObjectFile) -> Vec[u8]
+  match obj.target.os
+  when OsAbi::Linux   then build_elf64(obj)
+  when OsAbi::MacOS   then build_macho64(obj)
+  when OsAbi::Windows then build_coff64(obj)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Vector / byte helpers
+# ———————————————————————————————————————————————————————————————
+
+def push_str(v: &mut Vec[u8], s: String) -> Unit
+  for c in s.bytes() do
+    v.push(c)
+  end
+  v.push(0)
+end
+
+def write16(v: &mut Vec[u8], val: u16) -> Unit
+  v.push((val & 0xFF) as u8)
+  v.push(((val >> 8) & 0xFF) as u8)
+end
+
+def write32(v: &mut Vec[u8], val: u32) -> Unit
+  v.push((val & 0xFF) as u8)
+  v.push(((val >> 8) & 0xFF) as u8)
+  v.push(((val >> 16) & 0xFF) as u8)
+  v.push(((val >> 24) & 0xFF) as u8)
+end
+
+def write64(v: &mut Vec[u8], val: u64) -> Unit
+  write32(v, (val & 0xFFFFFFFF) as u32)
+  write32(v, ((val >> 32) & 0xFFFFFFFF) as u32)
+end
+
+def emit_zeros_vec(v: &mut Vec[u8], n: Int) -> Unit
+  mut i = 0
+  while i < n do
+    v.push(0)
+    i = i + 1
+  end
+end
+
+def append_vec(dst: &mut Vec[u8], src: &Vec[u8]) -> Unit
+  for b_ in src do
+    dst.push(b_)
+  end
+end
+
+def pad_to(v: &mut Vec[u8], target: Int) -> Unit
+  while v.len() < target do
+    v.push(0)
+  end
+end
+
+def write_padded_str(v: &mut Vec[u8], s: String, len: Int) -> Unit
+  mut i = 0
+  for c in s.bytes() do
+    if i < len then
+      v.push(c)
+      i = i + 1
+    end
+  end
+  while i < len do
+    v.push(0)
+    i = i + 1
+  end
+end
+
+def patch_u32(v: &mut Vec[u8], offset: Int, val: u32) -> Unit
+  v[offset]     = (val & 0xFF) as u8
+  v[offset + 1] = ((val >> 8) & 0xFF) as u8
+  v[offset + 2] = ((val >> 16) & 0xFF) as u8
+  v[offset + 3] = ((val >> 24) & 0xFF) as u8
+end
+
+def align_up(val: Int, align: Int) -> Int
+  ((val + align - 1) / align) * align
+end
+
+# ———————————————————————————————————————————————————————————————
+# DWARF Debug Information Generation
+# ———————————————————————————————————————————————————————————————
+#
+# Generates DWARF version 4 debug information for native debugging.
+# Emits these sections:
+#   .debug_info      - Compilation unit and DIE tree
+#   .debug_abbrev    - Abbreviation table
+#   .debug_line      - Line number program
+#   .debug_str       - String table
+#   .debug_aranges   - Address ranges
+#   .debug_frame     - Call frame info (for stack unwinding)
+
+# DWARF constants
+def DW_TAG_compile_unit()     -> u8 = 0x11
+def DW_TAG_subprogram()       -> u8 = 0x2E
+def DW_TAG_variable()         -> u8 = 0x34
+def DW_TAG_formal_parameter() -> u8 = 0x05
+def DW_TAG_base_type()        -> u8 = 0x24
+def DW_TAG_pointer_type()     -> u8 = 0x0F
+def DW_TAG_structure_type()   -> u8 = 0x13
+def DW_TAG_member()           -> u8 = 0x0D
+def DW_TAG_typedef()          -> u8 = 0x16
+def DW_TAG_lexical_block()    -> u8 = 0x0B
+
+def DW_AT_name()              -> u8 = 0x03
+def DW_AT_producer()          -> u8 = 0x25
+def DW_AT_language()          -> u8 = 0x13
+def DW_AT_comp_dir()          -> u8 = 0x1B
+def DW_AT_low_pc()            -> u8 = 0x11
+def DW_AT_high_pc()           -> u8 = 0x12
+def DW_AT_stmt_list()         -> u8 = 0x10
+def DW_AT_type()              -> u8 = 0x49
+def DW_AT_decl_file()         -> u8 = 0x3A
+def DW_AT_decl_line()         -> u8 = 0x3B
+def DW_AT_byte_size()         -> u8 = 0x0B
+def DW_AT_encoding()          -> u8 = 0x3E
+def DW_AT_location()          -> u8 = 0x02
+def DW_AT_frame_base()        -> u8 = 0x40
+def DW_AT_external()          -> u8 = 0x3F
+
+def DW_FORM_addr()            -> u8 = 0x01
+def DW_FORM_data1()           -> u8 = 0x0B
+def DW_FORM_data2()           -> u8 = 0x05
+def DW_FORM_data4()           -> u8 = 0x06
+def DW_FORM_string()          -> u8 = 0x08
+def DW_FORM_strp()            -> u8 = 0x0E
+def DW_FORM_sec_offset()      -> u8 = 0x17
+def DW_FORM_flag()            -> u8 = 0x0C
+def DW_FORM_flag_present()    -> u8 = 0x19
+def DW_FORM_ref4()            -> u8 = 0x13
+def DW_FORM_exprloc()         -> u8 = 0x18
+
+def DW_ATE_signed()           -> u8 = 0x05
+def DW_ATE_unsigned()         -> u8 = 0x07
+def DW_ATE_boolean()          -> u8 = 0x02
+def DW_ATE_float()            -> u8 = 0x04
+def DW_ATE_signed_char()      -> u8 = 0x06
+def DW_ATE_UTF()              -> u8 = 0x10
+
+def DW_OP_fbreg()             -> u8 = 0x91
+def DW_OP_reg0()              -> u8 = 0x50
+def DW_OP_call_frame_cfa()    -> u8 = 0x9C
+
+def DW_LANG_Rust()            -> u16 = 0x001C  # We'll use Rust's ID since it's similar
+
+# DWARF line number opcodes
+def DW_LNS_copy()             -> u8 = 0x01
+def DW_LNS_advance_pc()       -> u8 = 0x02
+def DW_LNS_advance_line()     -> u8 = 0x03
+def DW_LNS_set_file()         -> u8 = 0x04
+def DW_LNS_set_column()       -> u8 = 0x05
+def DW_LNS_negate_stmt()      -> u8 = 0x06
+def DW_LNS_const_add_pc()     -> u8 = 0x08
+def DW_LNS_fixed_advance_pc() -> u8 = 0x09
+def DW_LNE_end_sequence()     -> u8 = 0x01
+def DW_LNE_set_address()      -> u8 = 0x02
+def DW_LNE_define_file()      -> u8 = 0x03
+
+struct DebugInfo
+  debug_abbrev: Vec[u8]   # Abbreviation table
+  debug_info: Vec[u8]     # DIE tree
+  debug_line: Vec[u8]     # Line number program
+  debug_str: Vec[u8]      # String table
+  debug_aranges: Vec[u8]  # Address ranges
+  debug_frame: Vec[u8]    # Call frame info
+  
+  # String table index
+  str_offsets: Map[String, Int]
+  
+  # DIE reference tracking
+  next_die_offset: Int
+  type_die_offsets: Map[String, Int]  # Type name -> DIE offset
+end
+
+struct FunctionDebugInfo
+  name: String
+  low_pc: u64
+  high_pc: u64
+  file_index: Int
+  line: Int
+  params: Vec[VariableDebugInfo]
+  locals: Vec[VariableDebugInfo]
+end
+
+struct VariableDebugInfo
+  name: String
+  type_name: String
+  file_index: Int
+  line: Int
+  stack_offset: Int  # Offset from frame base
+end
+
+def debug_info_new() -> DebugInfo
+  mut str_table = Vec::new()
+  str_table.push(0)  # Empty string at offset 0
+  
+  DebugInfo {
+    debug_abbrev: Vec::new(),
+    debug_info: Vec::new(),
+    debug_line: Vec::new(),
+    debug_str: str_table,
+    debug_aranges: Vec::new(),
+    debug_frame: Vec::new(),
+    str_offsets: Map::new(),
+    next_die_offset: 0,
+    type_die_offsets: Map::new()
+  }
+end
+
+def dwarf_add_string(di: &mut DebugInfo, s: String) -> Int
+  match di.str_offsets.get(s.clone())
+  when Option::Some(off) then return off
+  when Option::None then ()
+  end
+  
+  let off = di.debug_str.len()
+  for c in s.bytes() do
+    di.debug_str.push(c)
+  end
+  di.debug_str.push(0)
+  di.str_offsets.insert(s, off)
+  off
+end
+
+def emit_uleb128(v: &mut Vec[u8], mut value: u64) -> Unit
+  loop
+    mut byte = (value & 0x7F) as u8
+    value = value >> 7
+    if value != 0 then
+      byte = byte | 0x80
+    end
+    v.push(byte)
+    if value == 0 then break end
+  end
+end
+
+def emit_sleb128(v: &mut Vec[u8], mut value: i64) -> Unit
+  let negative = value < 0
+  loop
+    mut byte = (value & 0x7F) as u8
+    value = value >> 7
+    let more = !((value == 0 && (byte & 0x40) == 0) || 
+                 (value == -1 && (byte & 0x40) != 0))
+    if more then
+      byte = byte | 0x80
+    end
+    v.push(byte)
+    if !more then break end
+  end
+end
+
+def generate_dwarf_debug_info(
+  di: &mut DebugInfo,
+  source_file: String,
+  comp_dir: String,
+  producer: String,
+  functions: &Vec[FunctionDebugInfo],
+  text_size: u64
+) -> Unit
+  # Generate abbreviation table first
+  generate_abbrev_table(di)
+  
+  # Generate .debug_info compilation unit
+  let abbrev_offset = 0u32
+  let addr_size = 8u8  # 64-bit addresses
+  
+  # Compilation unit header
+  let unit_start = di.debug_info.len()
+  write32(&mut di.debug_info, 0)  # Unit length placeholder
+  write16(&mut di.debug_info, 4)  # DWARF version 4
+  write32(&mut di.debug_info, abbrev_offset)  # Abbrev offset
+  di.debug_info.push(addr_size)
+  
+  # DW_TAG_compile_unit (abbrev code 1)
+  emit_uleb128(&mut di.debug_info, 1)
+  
+  # Producer string
+  let producer_off = dwarf_add_string(di, producer.clone())
+  write32(&mut di.debug_info, producer_off as u32)
+  
+  # Language
+  write16(&mut di.debug_info, DW_LANG_Rust())
+  
+  # Name (source file)
+  let name_off = dwarf_add_string(di, source_file.clone())
+  write32(&mut di.debug_info, name_off as u32)
+  
+  # Comp dir
+  let dir_off = dwarf_add_string(di, comp_dir.clone())
+  write32(&mut di.debug_info, dir_off as u32)
+  
+  # Low PC (0 for relocatable)
+  write64(&mut di.debug_info, 0)
+  
+  # High PC (size)
+  write64(&mut di.debug_info, text_size)
+  
+  # Stmt list (offset into .debug_line)
+  write32(&mut di.debug_info, 0)
+  
+  # Emit base types
+  emit_base_types(di)
+  
+  # Emit function DIEs
+  for func in functions do
+    emit_function_die(di, func)
+  end
+  
+  # End of children
+  di.debug_info.push(0)
+  
+  # Patch unit length
+  let unit_length = di.debug_info.len() - unit_start - 4
+  patch_u32(&mut di.debug_info, unit_start, unit_length as u32)
+  
+  # Generate line number info
+  generate_line_info(di, source_file.clone(), functions)
+  
+  # Generate address ranges
+  generate_aranges(di, text_size)
+  
+  # Generate call frame info
+  generate_frame_info(di)
+end
+
+def generate_abbrev_table(di: &mut DebugInfo) -> Unit
+  # Abbrev 1: DW_TAG_compile_unit
+  emit_uleb128(&mut di.debug_abbrev, 1)  # Abbrev code
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_compile_unit() as u64)
+  di.debug_abbrev.push(1)  # DW_CHILDREN_yes
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_producer() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_language() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data2() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_name() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_comp_dir() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_low_pc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_addr() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_high_pc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_addr() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_stmt_list() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_sec_offset() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # Abbrev 2: DW_TAG_subprogram
+  emit_uleb128(&mut di.debug_abbrev, 2)
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_subprogram() as u64)
+  di.debug_abbrev.push(1)  # DW_CHILDREN_yes
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_name() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_low_pc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_addr() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_high_pc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_addr() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_frame_base() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_exprloc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_decl_file() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data1() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_decl_line() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data2() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_external() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_flag_present() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # Abbrev 3: DW_TAG_formal_parameter
+  emit_uleb128(&mut di.debug_abbrev, 3)
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_formal_parameter() as u64)
+  di.debug_abbrev.push(0)  # DW_CHILDREN_no
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_name() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_type() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_ref4() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_location() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_exprloc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # Abbrev 4: DW_TAG_variable
+  emit_uleb128(&mut di.debug_abbrev, 4)
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_variable() as u64)
+  di.debug_abbrev.push(0)  # DW_CHILDREN_no
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_name() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_type() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_ref4() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_location() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_exprloc() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_decl_line() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data2() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # Abbrev 5: DW_TAG_base_type
+  emit_uleb128(&mut di.debug_abbrev, 5)
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_base_type() as u64)
+  di.debug_abbrev.push(0)  # DW_CHILDREN_no
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_name() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_strp() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_encoding() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data1() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_byte_size() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data1() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # Abbrev 6: DW_TAG_pointer_type
+  emit_uleb128(&mut di.debug_abbrev, 6)
+  emit_uleb128(&mut di.debug_abbrev, DW_TAG_pointer_type() as u64)
+  di.debug_abbrev.push(0)  # DW_CHILDREN_no
+  
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_type() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_ref4() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_AT_byte_size() as u64)
+  emit_uleb128(&mut di.debug_abbrev, DW_FORM_data1() as u64)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  emit_uleb128(&mut di.debug_abbrev, 0)
+  
+  # End of abbreviations
+  di.debug_abbrev.push(0)
+end
+
+def emit_base_types(di: &mut DebugInfo) -> Unit
+  let types = [
+    ("Int", DW_ATE_signed(), 8),
+    ("UInt", DW_ATE_unsigned(), 8),
+    ("Bool", DW_ATE_boolean(), 1),
+    ("Float", DW_ATE_float(), 8),
+    ("Char", DW_ATE_UTF(), 4),
+    ("u8", DW_ATE_unsigned(), 1),
+    ("i32", DW_ATE_signed(), 4),
+    ("i64", DW_ATE_signed(), 8),
+    ("u64", DW_ATE_unsigned(), 8)
+  ]
+  
+  for entry in types do
+    let (name, encoding, byte_size) = entry
+    di.type_die_offsets.insert(name.to_string(), di.debug_info.len())
+    
+    # Abbrev code 5: DW_TAG_base_type
+    emit_uleb128(&mut di.debug_info, 5)
+    
+    let name_off = dwarf_add_string(di, name.to_string())
+    write32(&mut di.debug_info, name_off as u32)
+    di.debug_info.push(encoding)
+    di.debug_info.push(byte_size)
+  end
+end
+
+def emit_function_die(di: &mut DebugInfo, func: &FunctionDebugInfo) -> Unit
+  # Abbrev code 2: DW_TAG_subprogram
+  emit_uleb128(&mut di.debug_info, 2)
+  
+  let name_off = dwarf_add_string(di, func.name.clone())
+  write32(&mut di.debug_info, name_off as u32)
+  
+  write64(&mut di.debug_info, func.low_pc)
+  write64(&mut di.debug_info, func.high_pc)
+  
+  # Frame base expression: DW_OP_call_frame_cfa
+  di.debug_info.push(1)  # Expression length
+  di.debug_info.push(DW_OP_call_frame_cfa())
+  
+  di.debug_info.push(func.file_index as u8)
+  write16(&mut di.debug_info, func.line as u16)
+  # DW_AT_external is flag_present, no value needed
+  
+  # Emit parameters
+  for param in func.params do
+    emit_variable_die(di, &param, true)
+  end
+  
+  # Emit local variables
+  for local in func.locals do
+    emit_variable_die(di, &local, false)
+  end
+  
+  # End of children
+  di.debug_info.push(0)
+end
+
+def emit_variable_die(di: &mut DebugInfo, var: &VariableDebugInfo, is_param: Bool) -> Unit
+  # Abbrev code 3 (param) or 4 (variable)
+  if is_param then
+    emit_uleb128(&mut di.debug_info, 3)
+  else
+    emit_uleb128(&mut di.debug_info, 4)
+  end
+  
+  let name_off = dwarf_add_string(di, var.name.clone())
+  write32(&mut di.debug_info, name_off as u32)
+  
+  # Type reference - look up or use Int as default
+  let type_off = di.type_die_offsets.get(var.type_name.clone())
+    .unwrap_or(di.type_die_offsets.get("Int".to_string()).unwrap_or(0))
+  write32(&mut di.debug_info, type_off as u32)
+  
+  # Location expression: DW_OP_fbreg + offset
+  mut loc_expr: Vec[u8] = Vec::new()
+  loc_expr.push(DW_OP_fbreg())
+  emit_sleb128(&mut loc_expr, var.stack_offset as i64)
+  
+  emit_uleb128(&mut di.debug_info, loc_expr.len() as u64)
+  for b in loc_expr do
+    di.debug_info.push(b)
+  end
+  
+  if !is_param then
+    write16(&mut di.debug_info, var.line as u16)
+  end
+end
+
+def generate_line_info(di: &mut DebugInfo, source_file: String, functions: &Vec[FunctionDebugInfo]) -> Unit
+  # DWARF line number program header
+  let header_start = di.debug_line.len()
+  
+  write32(&mut di.debug_line, 0)  # Total length placeholder
+  write16(&mut di.debug_line, 4)  # DWARF version 4
+  
+  let header_length_pos = di.debug_line.len()
+  write32(&mut di.debug_line, 0)  # Header length placeholder
+  
+  let after_header_length = di.debug_line.len()
+  
+  di.debug_line.push(1)   # Minimum instruction length
+  di.debug_line.push(1)   # Maximum ops per instruction
+  di.debug_line.push(1)   # Default is_stmt
+  di.debug_line.push(250) # Line base (-6 cast to u8)
+  di.debug_line.push(14)  # Line range
+  di.debug_line.push(13)  # Opcode base
+  
+  # Standard opcode lengths
+  di.debug_line.push(0)  # DW_LNS_copy
+  di.debug_line.push(1)  # DW_LNS_advance_pc
+  di.debug_line.push(1)  # DW_LNS_advance_line
+  di.debug_line.push(1)  # DW_LNS_set_file
+  di.debug_line.push(1)  # DW_LNS_set_column
+  di.debug_line.push(0)  # DW_LNS_negate_stmt
+  di.debug_line.push(0)  # DW_LNS_set_basic_block
+  di.debug_line.push(0)  # DW_LNS_const_add_pc
+  di.debug_line.push(1)  # DW_LNS_fixed_advance_pc
+  di.debug_line.push(0)  # DW_LNS_set_prologue_end
+  di.debug_line.push(0)  # DW_LNS_set_epilogue_begin
+  di.debug_line.push(1)  # DW_LNS_set_isa
+  
+  # Include directories (empty)
+  di.debug_line.push(0)
+  
+  # File names
+  for c in source_file.bytes() do
+    di.debug_line.push(c)
+  end
+  di.debug_line.push(0)  # Null terminate filename
+  emit_uleb128(&mut di.debug_line, 0)  # Directory index
+  emit_uleb128(&mut di.debug_line, 0)  # Modification time
+  emit_uleb128(&mut di.debug_line, 0)  # File size
+  di.debug_line.push(0)  # End of file list
+  
+  # Patch header length
+  let header_length = di.debug_line.len() - after_header_length
+  patch_u32(&mut di.debug_line, header_length_pos, header_length as u32)
+  
+  # Line number program
+  for func in functions do
+    # Set address
+    di.debug_line.push(0)  # Extended opcode
+    emit_uleb128(&mut di.debug_line, 9)  # Length
+    di.debug_line.push(DW_LNE_set_address())
+    write64(&mut di.debug_line, func.low_pc)
+    
+    # Advance line
+    di.debug_line.push(DW_LNS_advance_line())
+    emit_sleb128(&mut di.debug_line, func.line as i64)
+    
+    # Copy (emit row)
+    di.debug_line.push(DW_LNS_copy())
+    
+    # Advance PC
+    di.debug_line.push(DW_LNS_advance_pc())
+    emit_uleb128(&mut di.debug_line, (func.high_pc - func.low_pc) as u64)
+  end
+  
+  # End sequence
+  di.debug_line.push(0)  # Extended opcode
+  emit_uleb128(&mut di.debug_line, 1)
+  di.debug_line.push(DW_LNE_end_sequence())
+  
+  # Patch total length
+  let total_length = di.debug_line.len() - header_start - 4
+  patch_u32(&mut di.debug_line, header_start, total_length as u32)
+end
+
+def generate_aranges(di: &mut DebugInfo, text_size: u64) -> Unit
+  let header_start = di.debug_aranges.len()
+  
+  write32(&mut di.debug_aranges, 0)  # Length placeholder
+  write16(&mut di.debug_aranges, 2)  # Version
+  write32(&mut di.debug_aranges, 0)  # Debug info offset
+  di.debug_aranges.push(8)           # Address size
+  di.debug_aranges.push(0)           # Segment size
+  
+  # Padding to address size alignment
+  emit_zeros_vec(&mut di.debug_aranges, 4)
+  
+  # Address range: start, length
+  write64(&mut di.debug_aranges, 0)
+  write64(&mut di.debug_aranges, text_size)
+  
+  # Terminator
+  write64(&mut di.debug_aranges, 0)
+  write64(&mut di.debug_aranges, 0)
+  
+  # Patch length
+  let length = di.debug_aranges.len() - header_start - 4
+  patch_u32(&mut di.debug_aranges, header_start, length as u32)
+end
+
+def generate_frame_info(di: &mut DebugInfo) -> Unit
+  # CIE (Common Information Entry)
+  let cie_start = di.debug_frame.len()
+  
+  write32(&mut di.debug_frame, 0)  # Length placeholder
+  write32(&mut di.debug_frame, 0xFFFFFFFF)  # CIE ID
+  di.debug_frame.push(4)           # Version
+  di.debug_frame.push(0)           # Augmentation (empty string)
+  emit_uleb128(&mut di.debug_frame, 8)  # Code alignment factor
+  emit_sleb128(&mut di.debug_frame, -8) # Data alignment factor
+  emit_uleb128(&mut di.debug_frame, 16) # Return address register (x86-64: RIP)
+  
+  # Initial instructions: CFA = RSP + 8
+  di.debug_frame.push(0x0C)  # DW_CFA_def_cfa
+  emit_uleb128(&mut di.debug_frame, 7)   # RSP
+  emit_uleb128(&mut di.debug_frame, 8)   # Offset
+  
+  di.debug_frame.push(0x90 | 16)  # DW_CFA_offset for RA (register 16)
+  emit_uleb128(&mut di.debug_frame, 1)   # Offset factor
+  
+  # Padding
+  while (di.debug_frame.len() - cie_start) % 8 != 4 do
+    di.debug_frame.push(0)
+  end
+  
+  # Patch CIE length
+  let cie_length = di.debug_frame.len() - cie_start - 4
+  patch_u32(&mut di.debug_frame, cie_start, cie_length as u32)
+end

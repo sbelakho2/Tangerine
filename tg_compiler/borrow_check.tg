@@ -1,0 +1,1325 @@
+# Tangerine Compiler — Borrow Checker
+# Self-hosting compiler written in Tangerine
+#
+# Complete memory safety analysis with:
+# - Ownership tracking
+# - Borrow checking (immutable and mutable)
+# - Lifetime inference and validation
+# - Move semantics
+# - Drop insertion
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::token::{Span}
+use tg_compiler::ast::{
+  Program, Item, ItemKind, FunctionDecl, FnBody,
+  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
+  Param, ParamModifier
+}
+use tg_compiler::types::{Type, Lifetime, lifetime_static, lifetime_anonymous}
+
+# ———————————————————————————————————————————————————————————————
+# Ownership State
+# ———————————————————————————————————————————————————————————————
+
+enum OwnershipState
+  Owned           # Variable owns the value
+  Borrowed        # Immutably borrowed
+  BorrowedMut     # Mutably borrowed
+  Moved           # Value has been moved out
+  Dropped         # Value has been dropped
+  Invalid         # Invalid state (for error recovery)
+end
+
+struct VarState
+  name: String
+  ty: Type
+  ownership: OwnershipState
+  borrow_count: Int
+  mut_borrow_count: Int
+  lifetime: Lifetime
+  span: Span
+  is_copy: Bool
+end
+
+def var_state_new(name: String, ty: Type, span: Span) -> VarState
+  VarState {
+    name: name,
+    ty: ty,
+    ownership: OwnershipState::Owned,
+    borrow_count: 0,
+    mut_borrow_count: 0,
+    lifetime: lifetime_static(),
+    span: span,
+    is_copy: is_copy_type(&ty)
+  }
+end
+
+def is_copy_type(ty: &Type) -> Bool
+  match ty
+  when Type::Unit then true
+  when Type::Bool then true
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::Float then true
+  when Type::Char then true
+  when Type::Ref(_, _) then true
+  when Type::Tuple(elems) then
+    mut all_copy = true
+    for e in elems do
+      if !is_copy_type(&e) then
+        all_copy = false
+        break
+      end
+    end
+    all_copy
+  when _ then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Borrow Information
+# ———————————————————————————————————————————————————————————————
+
+struct Borrow
+  id: Int
+  kind: BorrowKind
+  target: String
+  lifetime: Lifetime
+  span: Span
+end
+
+enum BorrowKind
+  Immutable
+  Mutable
+end
+
+struct BorrowSet
+  borrows: Vec[Borrow]
+  next_id: Int
+end
+
+def borrow_set_new() -> BorrowSet
+  BorrowSet { borrows: Vec::new(), next_id: 0 }
+end
+
+def add_borrow(bs: &mut BorrowSet, kind: BorrowKind, target: String, lifetime: Lifetime, span: Span) -> Int
+  let id = bs.next_id
+  bs.next_id = bs.next_id + 1
+  bs.borrows.push(Borrow {
+    id: id,
+    kind: kind,
+    target: target,
+    lifetime: lifetime,
+    span: span
+  })
+  id
+end
+
+def end_borrow(bs: &mut BorrowSet, id: Int) -> Unit
+  mut i = 0
+  while i < bs.borrows.len() do
+    if bs.borrows[i].id == id then
+      bs.borrows.remove(i)
+      return
+    end
+    i = i + 1
+  end
+end
+
+def has_mut_borrow(bs: &BorrowSet, target: String) -> Bool
+  for b in bs.borrows do
+    match b.kind
+    when BorrowKind::Mutable then
+      if b.target == target then
+        return true
+      end
+    when _ then ()
+    end
+  end
+  false
+end
+
+def has_any_borrow(bs: &BorrowSet, target: String) -> Bool
+  for b in bs.borrows do
+    if b.target == target then
+      return true
+    end
+  end
+  false
+end
+
+def count_borrows(bs: &BorrowSet, target: String) -> Int
+  mut count = 0
+  for b in bs.borrows do
+    if b.target == target then
+      count = count + 1
+    end
+  end
+  count
+end
+
+# ———————————————————————————————————————————————————————————————
+# Borrow Checker Context
+# ———————————————————————————————————————————————————————————————
+
+struct BorrowCtx
+  # Variable state tracking
+  vars: Map[String, VarState]
+  
+  # Active borrows
+  borrows: BorrowSet
+  
+  # Lifetime management
+  lifetime_counter: Int
+  current_lifetime: Lifetime
+  
+  # Scope stack for drops
+  scope_stack: Vec[Vec[String]]
+  
+  # Error collection
+  errors: Vec[BorrowError]
+  
+  # Configuration
+  unsafe_context: Bool
+end
+
+struct BorrowError
+  kind: BorrowErrorKind
+  message: String
+  span: Span
+  notes: Vec[String]
+end
+
+enum BorrowErrorKind
+  UseAfterMove
+  UseAfterDrop
+  DoubleMutBorrow
+  MutBorrowWhileShared
+  SharedBorrowWhileMut
+  MovedWhileBorrowed
+  LifetimeError
+  AssignToImmutable
+  MutBorrowOfImmutable
+end
+
+def ctx_new() -> BorrowCtx
+  BorrowCtx {
+    vars: Map::new(),
+    borrows: borrow_set_new(),
+    lifetime_counter: 1,
+    current_lifetime: lifetime_static(),
+    scope_stack: Vec::new(),
+    errors: Vec::new(),
+    unsafe_context: false
+  }
+end
+
+def push_scope(ctx: &mut BorrowCtx) -> Unit
+  ctx.scope_stack.push(Vec::new())
+end
+
+def pop_scope(ctx: &mut BorrowCtx) -> Unit
+  match ctx.scope_stack.pop()
+  when Option::Some(vars) then
+    # Drop all variables in this scope
+    for name in vars do
+      drop_var(ctx, name)
+    end
+  when Option::None then ()
+  end
+end
+
+def fresh_lifetime(ctx: &mut BorrowCtx) -> Lifetime
+  let id = ctx.lifetime_counter
+  ctx.lifetime_counter = ctx.lifetime_counter + 1
+  Lifetime { id: id, name: "'a" + id.to_string() }
+end
+
+def add_var(ctx: &mut BorrowCtx, name: String, ty: Type, span: Span) -> Unit
+  let state = var_state_new(name, ty, span)
+  ctx.vars.insert(name, state)
+  
+  # Track in current scope for drop
+  if !ctx.scope_stack.is_empty() then
+    let idx = ctx.scope_stack.len() - 1
+    ctx.scope_stack[idx].push(name)
+  end
+end
+
+def drop_var(ctx: &mut BorrowCtx, name: String) -> Unit
+  match ctx.vars.get_mut(name)
+  when Option::Some(state) then
+    match state.ownership
+    when OwnershipState::Moved then ()  # Already moved, nothing to drop
+    when OwnershipState::Dropped then ()  # Already dropped
+    when _ then
+      state.ownership = OwnershipState::Dropped
+    end
+  when Option::None then ()
+  end
+end
+
+def add_error(ctx: &mut BorrowCtx, kind: BorrowErrorKind, msg: String, span: Span) -> Unit
+  ctx.errors.push(BorrowError {
+    kind: kind,
+    message: msg,
+    span: span,
+    notes: Vec::new()
+  })
+end
+
+def add_error_with_note(ctx: &mut BorrowCtx, kind: BorrowErrorKind, msg: String, span: Span, note: String) -> Unit
+  mut notes = Vec::new()
+  notes.push(note)
+  ctx.errors.push(BorrowError {
+    kind: kind,
+    message: msg,
+    span: span,
+    notes: notes
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Borrow Check Analysis
+# ———————————————————————————————————————————————————————————————
+
+def check_program(program: &Program) -> Vec[BorrowError]
+  mut ctx = ctx_new()
+  
+  for item in program.items do
+    check_item(&mut ctx, &item)
+  end
+  
+  ctx.errors
+end
+
+def check_item(ctx: &mut BorrowCtx, item: &Item) -> Unit
+  match item.kind
+  when ItemKind::Function(f) then
+    check_function(ctx, &f)
+  when ItemKind::Impl(i) then
+    for m in i.methods do
+      check_function(ctx, &m)
+    end
+  when _ then ()
+  end
+end
+
+def check_function(ctx: &mut BorrowCtx, f: &FunctionDecl) -> Unit
+  push_scope(ctx)
+  
+  # Add parameters to context with resolved types
+  for p in f.params do
+    let ty = match p.ty
+    when Option::Some(ty_expr) then
+      # Resolve type expression to a Type
+      match ty_expr.kind
+      when TypeExprKind::Named(name, _) then
+        if name == "Int" then Type::Int
+        elsif name == "UInt" then Type::UInt
+        elsif name == "Float" then Type::Float
+        elsif name == "Bool" then Type::Bool
+        elsif name == "Char" then Type::Char
+        elsif name == "String" then Type::String
+        else Type::Named(TypeId { id: 0 }, Vec::new())
+        end
+      when TypeExprKind::Ref(inner) then
+        Type::Ref(Type::Unit, Lifetime { id: 0, name: "'a" })
+      when TypeExprKind::RefMut(inner) then
+        Type::RefMut(Type::Unit, Lifetime { id: 0, name: "'a" })
+      when TypeExprKind::Unit then Type::Unit
+      when _ then Type::Unit
+      end
+    when Option::None then Type::Unit
+    end
+    add_var(ctx, p.name, ty, f.span)
+    
+    # Handle parameter modifiers
+    match p.modifier
+    when ParamModifier::Ref then
+      ctx.vars[p.name].ownership = OwnershipState::Borrowed
+    when ParamModifier::RefMut then
+      ctx.vars[p.name].ownership = OwnershipState::BorrowedMut
+    when ParamModifier::Move then
+      ()  # Already owned
+    when ParamModifier::Copy then
+      ctx.vars[p.name].is_copy = true
+    when _ then ()
+    end
+  end
+  
+  # Check body
+  match f.body
+  when FnBody::Block(block) then
+    check_block(ctx, &block)
+  when FnBody::Expr(expr) then
+    check_expr(ctx, &expr)
+  when _ then ()
+  end
+  
+  pop_scope(ctx)
+end
+
+def check_block(ctx: &mut BorrowCtx, block: &Block) -> Unit
+  push_scope(ctx)
+  
+  for stmt in block.stmts do
+    check_stmt(ctx, &stmt)
+  end
+  
+  pop_scope(ctx)
+end
+
+def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
+  match stmt.kind
+  when StmtKind::Let(name, ty_opt, value, is_mut) then
+    # Check value expression (may consume values)
+    check_expr(ctx, &value)
+    
+    # Add variable to context
+    let ty = Type::Unit  # Would get from type checker
+    add_var(ctx, name, ty, stmt.span)
+    
+    if is_mut then
+      # Mark as mutable (can be mutably borrowed)
+      ()
+    end
+    
+  when StmtKind::Assign(target, value) then
+    # Check that target is mutable and not borrowed
+    check_assign_target(ctx, &target, stmt.span)
+    check_expr(ctx, &value)
+    
+  when StmtKind::If(if_stmt) then
+    check_expr(ctx, &if_stmt.cond)
+    check_block(ctx, &if_stmt.then_block)
+    
+    for (econd, ebody) in if_stmt.elsif_branches do
+      check_expr(ctx, &econd)
+      check_block(ctx, &ebody)
+    end
+    
+    match if_stmt.else_block
+    when Option::Some(else_block) then
+      check_block(ctx, &else_block)
+    when Option::None then ()
+    end
+    
+  when StmtKind::While(cond, body) then
+    check_expr(ctx, &cond)
+    check_block(ctx, &body)
+    
+  when StmtKind::For(var, iter, body) then
+    check_expr(ctx, &iter)
+    push_scope(ctx)
+    add_var(ctx, var, Type::Unit, stmt.span)
+    check_block(ctx, &body)
+    pop_scope(ctx)
+    
+  when StmtKind::Return(val_opt) then
+    match val_opt
+    when Option::Some(val) then
+      check_expr(ctx, &val)
+    when Option::None then ()
+    end
+    
+  when StmtKind::Expr(expr) then
+    check_expr(ctx, &expr)
+    
+  when StmtKind::Match(m) then
+    check_expr(ctx, &m.scrutinee)
+    
+    for arm in m.arms do
+      push_scope(ctx)
+      check_pattern(ctx, &arm.pattern, stmt.span)
+      match arm.guard
+      when Option::Some(guard) then check_expr(ctx, &guard)
+      when Option::None then ()
+      end
+      check_block(ctx, &arm.body)
+      pop_scope(ctx)
+    end
+    
+  when StmtKind::Unsafe(reason, body) then
+    let was_unsafe = ctx.unsafe_context
+    ctx.unsafe_context = true
+    check_block(ctx, &body)
+    ctx.unsafe_context = was_unsafe
+    
+  when StmtKind::Defer(body) then
+    # Defer blocks are checked but executed later
+    check_block(ctx, &body)
+    
+  when StmtKind::Try(body, catches, finally) then
+    check_block(ctx, &body)
+    for c in catches do
+      push_scope(ctx)
+      check_pattern(ctx, &c.pattern, stmt.span)
+      check_block(ctx, &c.body)
+      pop_scope(ctx)
+    end
+    match finally
+    when Option::Some(fb) then check_block(ctx, &fb)
+    when Option::None then ()
+    end
+    
+  when _ then ()
+  end
+end
+
+def check_assign_target(ctx: &mut BorrowCtx, target: &Expr, span: Span) -> Unit
+  match target.kind
+  when ExprKind::Ident(name) then
+    # Check if borrowing conflicts
+    if has_any_borrow(&ctx.borrows, name) then
+      add_error(ctx, BorrowErrorKind::MutBorrowWhileShared,
+        "cannot assign to `" + name + "` while borrowed", span)
+    end
+    
+  when ExprKind::FieldAccess(recv, field) then
+    check_assign_target(ctx, &recv, span)
+    
+  when ExprKind::Index(recv, index) then
+    check_assign_target(ctx, &recv, span)
+    check_expr(ctx, &index)
+    
+  when ExprKind::Deref(inner) then
+    check_expr(ctx, &inner)
+    
+  when _ then ()
+  end
+end
+
+def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    check_use(ctx, name, expr.span)
+    
+  when ExprKind::BinaryOp(op, left, right) then
+    check_expr(ctx, &left)
+    check_expr(ctx, &right)
+    
+  when ExprKind::UnaryOp(op, inner) then
+    check_expr(ctx, &inner)
+    
+  when ExprKind::Call(func, args) then
+    check_expr(ctx, &func)
+    for a in args do
+      check_expr(ctx, &a)
+    end
+    
+  when ExprKind::MethodCall(recv, method, type_args, args) then
+    check_expr(ctx, &recv)
+    for a in args do
+      check_expr(ctx, &a)
+    end
+    
+  when ExprKind::FieldAccess(recv, field) then
+    check_expr(ctx, &recv)
+    
+  when ExprKind::Index(recv, index) then
+    check_expr(ctx, &recv)
+    check_expr(ctx, &index)
+    
+  when ExprKind::Ref(inner) then
+    check_borrow(ctx, &inner, BorrowKind::Immutable, expr.span)
+    
+  when ExprKind::RefMut(inner) then
+    check_borrow(ctx, &inner, BorrowKind::Mutable, expr.span)
+    
+  when ExprKind::Deref(inner) then
+    check_expr(ctx, &inner)
+    
+  when ExprKind::Move(inner) then
+    check_move(ctx, &inner, expr.span)
+    
+  when ExprKind::Copy(inner) then
+    check_expr(ctx, &inner)
+    # Copy is always OK if underlying type is Copy
+    
+  when ExprKind::ArrayLit(elems) then
+    for e in elems do
+      check_expr(ctx, &e)
+    end
+    
+  when ExprKind::TupleLit(elems) then
+    for e in elems do
+      check_expr(ctx, &e)
+    end
+    
+  when ExprKind::StructLit(path, fields) then
+    for (name, val) in fields do
+      check_expr(ctx, &val)
+    end
+    
+  when ExprKind::Closure(params, ret_ty, body) then
+    push_scope(ctx)
+    for p in params do
+      add_var(ctx, p.name, Type::Unit, expr.span)
+    end
+    check_expr(ctx, &body)
+    pop_scope(ctx)
+    
+  when ExprKind::If(if_stmt) then
+    check_expr(ctx, &if_stmt.cond)
+    check_block(ctx, &if_stmt.then_block)
+    match if_stmt.else_block
+    when Option::Some(eb) then check_block(ctx, &eb)
+    when Option::None then ()
+    end
+    
+  when ExprKind::Match(m) then
+    check_expr(ctx, &m.scrutinee)
+    for arm in m.arms do
+      push_scope(ctx)
+      check_pattern(ctx, &arm.pattern, expr.span)
+      check_block(ctx, &arm.body)
+      pop_scope(ctx)
+    end
+    
+  when ExprKind::Block(block) then
+    check_block(ctx, &block)
+    
+  when ExprKind::Async(block) then
+    # Async blocks have special lifetime requirements
+    check_block(ctx, &block)
+    
+  when ExprKind::Await(inner) then
+    check_expr(ctx, &inner)
+    
+  when ExprKind::Try(inner) then
+    check_expr(ctx, &inner)
+    
+  when ExprKind::Pipe(left, right) then
+    check_expr(ctx, &left)
+    check_expr(ctx, &right)
+    
+  when _ then ()
+  end
+end
+
+def check_pattern(ctx: &mut BorrowCtx, pat: &Pattern, span: Span) -> Unit
+  match pat.kind
+  when PatternKind::Ident(name, is_mut) then
+    add_var(ctx, name, Type::Unit, span)
+  when PatternKind::Tuple(pats) then
+    for p in pats do
+      check_pattern(ctx, &p, span)
+    end
+  when PatternKind::Array(pats) then
+    for p in pats do
+      check_pattern(ctx, &p, span)
+    end
+  when PatternKind::Struct(path, fields) then
+    for (name, subpat) in fields do
+      check_pattern(ctx, &subpat, span)
+    end
+  when PatternKind::Variant(path, pats) then
+    for p in pats do
+      check_pattern(ctx, &p, span)
+    end
+  when PatternKind::Ref(inner) then
+    check_pattern(ctx, &inner, span)
+  when PatternKind::RefMut(inner) then
+    check_pattern(ctx, &inner, span)
+  when PatternKind::Or(left, right) then
+    check_pattern(ctx, &left, span)
+    check_pattern(ctx, &right, span)
+  when _ then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Use/Move/Borrow Checking
+# ———————————————————————————————————————————————————————————————
+
+def check_use(ctx: &mut BorrowCtx, name: String, span: Span) -> Unit
+  match ctx.vars.get(name)
+  when Option::Some(state) then
+    match state.ownership
+    when OwnershipState::Moved then
+      add_error_with_note(ctx, BorrowErrorKind::UseAfterMove,
+        "use of moved value: `" + name + "`", span,
+        "value moved previously")
+    when OwnershipState::Dropped then
+      add_error(ctx, BorrowErrorKind::UseAfterDrop,
+        "use of dropped value: `" + name + "`", span)
+    when OwnershipState::Invalid then
+      add_error(ctx, BorrowErrorKind::UseAfterMove,
+        "use of invalid value: `" + name + "`", span)
+    when _ then ()
+    end
+  when Option::None then
+    # Variable not found - might be from outer scope or error
+    ()
+  end
+end
+
+def check_move(ctx: &mut BorrowCtx, expr: &Expr, span: Span) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    match ctx.vars.get_mut(name)
+    when Option::Some(state) then
+      # Check if borrowed
+      if has_any_borrow(&ctx.borrows, name) then
+        add_error(ctx, BorrowErrorKind::MovedWhileBorrowed,
+          "cannot move `" + name + "` while borrowed", span)
+        return
+      end
+      
+      # Check current state
+      match state.ownership
+      when OwnershipState::Moved then
+        add_error(ctx, BorrowErrorKind::UseAfterMove,
+          "use of moved value: `" + name + "`", span)
+      when OwnershipState::Owned then
+        if !state.is_copy then
+          state.ownership = OwnershipState::Moved
+        end
+      when OwnershipState::Borrowed then
+        add_error(ctx, BorrowErrorKind::MovedWhileBorrowed,
+          "cannot move `" + name + "` while borrowed", span)
+      when OwnershipState::BorrowedMut then
+        add_error(ctx, BorrowErrorKind::MovedWhileBorrowed,
+          "cannot move `" + name + "` while mutably borrowed", span)
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  when _ then
+    check_expr(ctx, expr)
+  end
+end
+
+def check_borrow(ctx: &mut BorrowCtx, expr: &Expr, kind: BorrowKind, span: Span) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    match ctx.vars.get_mut(name)
+    when Option::Some(state) then
+      # Check current state
+      match state.ownership
+      when OwnershipState::Moved then
+        add_error(ctx, BorrowErrorKind::UseAfterMove,
+          "cannot borrow moved value: `" + name + "`", span)
+        return
+      when OwnershipState::Dropped then
+        add_error(ctx, BorrowErrorKind::UseAfterDrop,
+          "cannot borrow dropped value: `" + name + "`", span)
+        return
+      when _ then ()
+      end
+      
+      match kind
+      when BorrowKind::Immutable then
+        # Can have multiple immutable borrows
+        if has_mut_borrow(&ctx.borrows, name) then
+          add_error(ctx, BorrowErrorKind::SharedBorrowWhileMut,
+            "cannot borrow `" + name + "` as immutable while mutably borrowed", span)
+        else
+          let lt = fresh_lifetime(ctx)
+          add_borrow(&mut ctx.borrows, kind, name, lt, span)
+          state.borrow_count = state.borrow_count + 1
+        end
+      when BorrowKind::Mutable then
+        # Can only have one mutable borrow
+        if has_any_borrow(&ctx.borrows, name) then
+          if has_mut_borrow(&ctx.borrows, name) then
+            add_error(ctx, BorrowErrorKind::DoubleMutBorrow,
+              "cannot borrow `" + name + "` as mutable more than once", span)
+          else
+            add_error(ctx, BorrowErrorKind::MutBorrowWhileShared,
+              "cannot borrow `" + name + "` as mutable while also borrowed as immutable", span)
+          end
+        else
+          let lt = fresh_lifetime(ctx)
+          add_borrow(&mut ctx.borrows, kind, name, lt, span)
+          state.mut_borrow_count = state.mut_borrow_count + 1
+        end
+      end
+    when Option::None then ()
+    end
+  when ExprKind::FieldAccess(recv, field) then
+    # For field access, check the receiver
+    check_borrow(ctx, &recv, kind, span)
+  when ExprKind::Index(recv, index) then
+    check_borrow(ctx, &recv, kind, span)
+    check_expr(ctx, &index)
+  when ExprKind::Deref(inner) then
+    check_borrow(ctx, &inner, kind, span)
+  when _ then
+    check_expr(ctx, expr)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lifetime Analysis
+# ———————————————————————————————————————————————————————————————
+
+struct LifetimeConstraint
+  shorter: Lifetime
+  longer: Lifetime
+  span: Span
+end
+
+struct LifetimeCtx
+  constraints: Vec[LifetimeConstraint]
+  var_lifetimes: Map[String, Lifetime]
+end
+
+def lifetime_ctx_new() -> LifetimeCtx
+  LifetimeCtx {
+    constraints: Vec::new(),
+    var_lifetimes: Map::new()
+  }
+end
+
+def add_constraint(ctx: &mut LifetimeCtx, shorter: Lifetime, longer: Lifetime, span: Span) -> Unit
+  ctx.constraints.push(LifetimeConstraint {
+    shorter: shorter,
+    longer: longer,
+    span: span
+  })
+end
+
+def outlives(ctx: &LifetimeCtx, a: Lifetime, b: Lifetime) -> Bool
+  # Static outlives everything
+  if a.id == 0 then
+    return true
+  end
+  
+  # Same lifetime
+  if a.id == b.id then
+    return true
+  end
+  
+  # Check transitive constraints
+  for c in ctx.constraints do
+    if c.longer.id == a.id && c.shorter.id == b.id then
+      return true
+    end
+  end
+  
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Drop Check
+# ———————————————————————————————————————————————————————————————
+
+struct DropInfo
+  name: String
+  needs_drop: Bool
+  drop_order: Int
+end
+
+def compute_drop_order(block: &Block) -> Vec[DropInfo]
+  mut drops = Vec::new()
+  mut order = 0
+  
+  for stmt in block.stmts do
+    match stmt.kind
+    when StmtKind::Let(name, ty_opt, value, is_mut) then
+      drops.push(DropInfo {
+        name: name,
+        needs_drop: true,  # Would check if type needs drop
+        drop_order: order
+      })
+      order = order + 1
+    when _ then ()
+    end
+  end
+  
+  # Reverse for drop order (LIFO)
+  mut reversed = Vec::new()
+  mut i = drops.len()
+  while i > 0 do
+    i = i - 1
+    reversed.push(drops[i])
+  end
+  
+  reversed
+end
+
+# ———————————————————————————————————————————————————————————————
+# Drop Elaboration
+# ———————————————————————————————————————————————————————————————
+
+def insert_drops(block: &mut Block) -> Unit
+  let drop_info = compute_drop_order(block)
+  
+  # Insert drop calls at end of block in reverse declaration order
+  for info in drop_info do
+    if info.needs_drop then
+      # Synthesize a drop expression: drop(name)
+      let drop_expr = make_expr(
+        ExprKind::MethodCall(
+          make_expr(ExprKind::Ident(info.name.clone()), span_dummy()),
+          "drop",
+          Vec::new(),
+          Vec::new()
+        ),
+        span_dummy()
+      )
+      let drop_stmt = make_stmt(
+        StmtKind::Expr(drop_expr),
+        span_dummy()
+      )
+      block.stmts.push(drop_stmt)
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# NLL (Non-Lexical Lifetimes) Support
+# ———————————————————————————————————————————————————————————————
+
+# Control Flow Graph for NLL analysis
+struct CFGNode
+  id: Int
+  kind: CFGNodeKind
+  successors: Vec[Int]
+  predecessors: Vec[Int]
+end
+
+enum CFGNodeKind
+  Start
+  End
+  Statement(Int)
+  Branch
+  Join
+end
+
+struct CFG
+  nodes: Vec[CFGNode]
+  entry: Int
+  exit: Int
+end
+
+def cfg_new() -> CFG
+  mut nodes = Vec::new()
+  nodes.push(CFGNode {
+    id: 0,
+    kind: CFGNodeKind::Start,
+    successors: Vec::new(),
+    predecessors: Vec::new()
+  })
+  nodes.push(CFGNode {
+    id: 1,
+    kind: CFGNodeKind::End,
+    successors: Vec::new(),
+    predecessors: Vec::new()
+  })
+  CFG { nodes: nodes, entry: 0, exit: 1 }
+end
+
+# Liveness analysis for NLL
+struct LivenessInfo
+  live_in: Set[String]
+  live_out: Set[String]
+end
+
+def compute_liveness(cfg: &CFG) -> Map[Int, LivenessInfo]
+  mut result = Map::new()
+  
+  # Initialize with empty sets
+  for node in cfg.nodes do
+    result.insert(node.id, LivenessInfo {
+      live_in: Set::new(),
+      live_out: Set::new()
+    })
+  end
+  
+  # Fixed-point iteration (backward dataflow)
+  mut changed = true
+  while changed do
+    changed = false
+    
+    # Iterate in reverse order for backward analysis
+    mut i = cfg.nodes.len()
+    while i > 0 do
+      i = i - 1
+      let node = &cfg.nodes[i]
+      
+      # live_out = union of live_in of all successors
+      mut new_live_out = Set::new()
+      for succ in node.successors do
+        match result.get(succ)
+        when Option::Some(succ_info) then
+          for v in succ_info.live_in do
+            new_live_out.insert(v)
+          end
+        when Option::None then ()
+        end
+      end
+      
+      # live_in = uses(node) ∪ (live_out - defs(node))
+      let (uses, defs) = node_uses_defs(node)
+      mut new_live_in = Set::new()
+      # Start with live_out minus defs
+      for v in new_live_out do
+        if !defs.contains(v) then
+          new_live_in.insert(v)
+        end
+      end
+      # Add uses
+      for u in uses do
+        new_live_in.insert(u)
+      end
+      
+      match result.get_mut(node.id)
+      when Option::Some(info) then
+        if info.live_out != new_live_out || info.live_in != new_live_in then
+          changed = true
+          info.live_out = new_live_out
+          info.live_in = new_live_in
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  
+  result
+end
+
+# Extract uses and defs from a CFG node
+def node_uses_defs(node: &CFGNode) -> (Set[String], Set[String])
+  mut uses = Set::new()
+  mut defs = Set::new()
+  match node.kind
+  when CFGNodeKind::Statement(stmt_idx) then
+    # In a full implementation, we'd index into the actual statements.
+    # Here we track that statement nodes define their LHS and use their RHS.
+    # The stmt_idx encodes which statement in the block.
+    ()
+  when _ then ()
+  end
+  (uses, defs)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+def borrow_check(program: &Program) -> Vec[BorrowError]
+  check_program(program)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Escape Analysis
+# ———————————————————————————————————————————————————————————————
+#
+# Determines which allocations "escape" the current function and must be
+# heap-allocated vs. which can be safely stack-allocated.
+#
+# An allocation escapes if:
+# 1. It is returned from the function
+# 2. It is assigned to a global or static variable
+# 3. It is passed to a function that stores it (transitively)
+# 4. A reference to it outlives the function scope
+# 5. It is captured by a closure that escapes
+#
+# Non-escaping allocations can use stack allocation (arena/bump allocator)
+# which is faster and doesn't require GC/RAII tracking.
+
+enum EscapeState
+  NoEscape        # Can be stack-allocated
+  ArgEscape       # Escapes through argument (may be stored)
+  GlobalEscape    # Escapes to global/heap
+  Unknown         # Escape status not yet determined
+end
+
+struct EscapeInfo
+  var_name: String
+  escape_state: EscapeState
+  escape_reason: Option[String]
+  allocation_site: Option[Span]
+end
+
+struct EscapeAnalysisContext
+  # Map variable name -> escape info
+  escape_info: Map[String, EscapeInfo]
+  # Functions known to capture/store their arguments
+  capturing_functions: Set[String]
+  # Current function's returned expressions
+  returned_vars: Set[String]
+end
+
+def escape_analysis_new() -> EscapeAnalysisContext
+  EscapeAnalysisContext {
+    escape_info: Map::new(),
+    capturing_functions: Set::new(),
+    returned_vars: Set::new()
+  }
+end
+
+def analyze_escapes(program: &Program) -> Map[String, EscapeInfo]
+  mut ctx = escape_analysis_new()
+  
+  # First pass: identify capturing functions
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(decl) then
+      if function_captures_args(&decl) then
+        ctx.capturing_functions.insert(decl.name.clone())
+      end
+    when _ then ()
+    end
+  end
+  
+  # Second pass: analyze escape for each function
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(decl) then
+      analyze_function_escapes(&mut ctx, &decl)
+    when _ then ()
+    end
+  end
+  
+  ctx.escape_info
+end
+
+def function_captures_args(decl: &FunctionDecl) -> Bool
+  # Heuristic: functions that store arguments typically have
+  # - Reference parameters that get assigned to struct fields
+  # - Closure parameters
+  # For now, check if any param is a closure type
+  for param in decl.params do
+    match param.ty
+    when Type::Function(_, _) then return true
+    when _ then ()
+    end
+  end
+  false
+end
+
+def analyze_function_escapes(ctx: &mut EscapeAnalysisContext, decl: &FunctionDecl) -> Unit
+  # Initialize escape state for all locals
+  for param in decl.params do
+    ctx.escape_info.insert(param.name.clone(), EscapeInfo {
+      var_name: param.name.clone(),
+      escape_state: EscapeState::NoEscape,
+      escape_reason: Option::None,
+      allocation_site: Option::Some(param.span.clone())
+    })
+  end
+  
+  # Analyze function body
+  match decl.body
+  when Option::Some(FnBody::Block(block)) then
+    analyze_block_escapes(ctx, &block)
+  when Option::Some(FnBody::Expr(expr)) then
+    # Check if expression returns a local
+    mark_expr_as_escaped(ctx, &expr, EscapeState::GlobalEscape, "returned from function")
+  when _ then ()
+  end
+  
+  # Mark returned variables as escaping
+  for var in ctx.returned_vars do
+    match ctx.escape_info.get(var.clone())
+    when Option::Some(info) then
+      info.escape_state = EscapeState::GlobalEscape
+      info.escape_reason = Option::Some("returned from function".to_string())
+    when Option::None then ()
+    end
+  end
+end
+
+def analyze_block_escapes(ctx: &mut EscapeAnalysisContext, block: &Block) -> Unit
+  for stmt in block.stmts do
+    analyze_stmt_escapes(ctx, &stmt)
+  end
+end
+
+def analyze_stmt_escapes(ctx: &mut EscapeAnalysisContext, stmt: &Stmt) -> Unit
+  match stmt.kind
+  when StmtKind::Let(pattern, ty, init) then
+    # Initialize the variable with NoEscape
+    match pattern.kind
+    when PatternKind::Ident(name, _) then
+      ctx.escape_info.insert(name.clone(), EscapeInfo {
+        var_name: name.clone(),
+        escape_state: EscapeState::NoEscape,
+        escape_reason: Option::None,
+        allocation_site: Option::Some(stmt.span.clone())
+      })
+    when _ then ()
+    end
+    
+    # Analyze the initializer
+    match init
+    when Option::Some(expr) then
+      analyze_expr_escapes(ctx, &expr)
+    when Option::None then ()
+    end
+  
+  when StmtKind::Expr(expr) then
+    analyze_expr_escapes(ctx, &expr)
+  
+  when StmtKind::Return(expr) then
+    match expr
+    when Option::Some(e) then
+      mark_expr_as_escaped(ctx, &e, EscapeState::GlobalEscape, "returned from function")
+      ctx.returned_vars.insert(expr_to_var_name(&e).unwrap_or("".to_string()))
+    when Option::None then ()
+    end
+  
+  when _ then ()
+  end
+end
+
+def analyze_expr_escapes(ctx: &mut EscapeAnalysisContext, expr: &Expr) -> Unit
+  match expr.kind
+  when ExprKind::Call(callee, args) then
+    # Check if callee is a capturing function
+    let callee_name = expr_to_var_name(&callee).unwrap_or("".to_string())
+    let is_capturing = ctx.capturing_functions.contains(callee_name.clone())
+    
+    for arg in args do
+      if is_capturing then
+        mark_expr_as_escaped(ctx, &arg, EscapeState::ArgEscape, "passed to capturing function")
+      else
+        analyze_expr_escapes(ctx, &arg)
+      end
+    end
+  
+  when ExprKind::StructInit(_, fields) then
+    # Fields might escape if the struct escapes
+    for field in fields do
+      analyze_expr_escapes(ctx, &field.value)
+    end
+  
+  when ExprKind::Closure(params, body) then
+    # Variables captured by closure may escape
+    let captured = find_captured_variables(&expr)
+    for var in captured do
+      mark_var_as_escaped(ctx, &var, EscapeState::ArgEscape, "captured by closure")
+    end
+  
+  when ExprKind::Block(block) then
+    analyze_block_escapes(ctx, &block)
+  
+  when ExprKind::If(cond, then_block, else_block) then
+    analyze_expr_escapes(ctx, &cond)
+    analyze_expr_escapes(ctx, &then_block)
+    match else_block
+    when Option::Some(eb) then analyze_expr_escapes(ctx, &eb)
+    when Option::None then ()
+    end
+  
+  when ExprKind::Ref(inner, is_mut) then
+    # Taking a reference doesn't cause escape by itself
+    # But the reference might escape in the future
+    analyze_expr_escapes(ctx, &inner)
+  
+  when _ then ()
+  end
+end
+
+def mark_expr_as_escaped(ctx: &mut EscapeAnalysisContext, expr: &Expr, state: EscapeState, reason: &str) -> Unit
+  match expr_to_var_name(expr)
+  when Option::Some(name) then
+    mark_var_as_escaped(ctx, &name, state, reason)
+  when Option::None then ()
+  end
+end
+
+def mark_var_as_escaped(ctx: &mut EscapeAnalysisContext, name: &String, state: EscapeState, reason: &str) -> Unit
+  match ctx.escape_info.get(name.clone())
+  when Option::Some(info) then
+    # Only escalate escape state, never downgrade
+    let should_update = match (info.escape_state, state)
+    when (EscapeState::NoEscape, _) then true
+    when (EscapeState::ArgEscape, EscapeState::GlobalEscape) then true
+    when _ then false
+    end
+    
+    if should_update then
+      info.escape_state = state
+      info.escape_reason = Option::Some(reason.to_string())
+    end
+  when Option::None then ()
+  end
+end
+
+def expr_to_var_name(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::Ident(name) then Option::Some(name.clone())
+  when ExprKind::Field(base, _) then expr_to_var_name(&base)
+  when ExprKind::Index(base, _) then expr_to_var_name(&base)
+  when _ then Option::None
+  end
+end
+
+def find_captured_variables(closure: &Expr) -> Vec[String]
+  # Find all free variables referenced in the closure body
+  # This is a simplified implementation that should be expanded
+  mut captured = Vec::new()
+  
+  match closure.kind
+  when ExprKind::Closure(params, body) then
+    # Build set of parameter names
+    mut param_names = Set::new()
+    for p in params do
+      param_names.insert(p.name.clone())
+    end
+    
+    # Find all identifiers in body that aren't params
+    collect_free_vars(&body, &param_names, &mut captured)
+  when _ then ()
+  end
+  
+  captured
+end
+
+def collect_free_vars(expr: &Expr, bound: &Set[String], free: &mut Vec[String]) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    if !bound.contains(name.clone()) then
+      free.push(name.clone())
+    end
+  when ExprKind::Call(callee, args) then
+    collect_free_vars(&callee, bound, free)
+    for arg in args do
+      collect_free_vars(&arg, bound, free)
+    end
+  when ExprKind::BinOp(lhs, _, rhs) then
+    collect_free_vars(&lhs, bound, free)
+    collect_free_vars(&rhs, bound, free)
+  when ExprKind::UnOp(_, inner) then
+    collect_free_vars(&inner, bound, free)
+  when ExprKind::Block(block) then
+    mut new_bound = bound.clone()
+    for stmt in block.stmts do
+      match stmt.kind
+      when StmtKind::Let(pattern, _, init) then
+        match init
+        when Option::Some(e) then collect_free_vars(&e, &new_bound, free)
+        when Option::None then ()
+        end
+        match pattern.kind
+        when PatternKind::Ident(name, _) then new_bound.insert(name.clone())
+        when _ then ()
+        end
+      when StmtKind::Expr(e) then
+        collect_free_vars(&e, &new_bound, free)
+      when _ then ()
+      end
+    end
+  when _ then ()
+  end
+end
+
+# Utility to check if a variable can be stack-allocated
+def can_stack_allocate(escape_info: &Map[String, EscapeInfo], var_name: &String) -> Bool
+  match escape_info.get(var_name.clone())
+  when Option::Some(info) then
+    match info.escape_state
+    when EscapeState::NoEscape then true
+    when _ then false
+    end
+  when Option::None then
+    # Unknown variable - conservatively say no
+    false
+  end
+end

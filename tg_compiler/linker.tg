@@ -1,0 +1,587 @@
+# Tangerine Compiler — Native Linker
+# Self-hosting compiler written in Tangerine
+#
+# Produces native executables directly — NO external linker dependency.
+# Supports:
+#   ELF64 executable  (Linux)
+#   Mach-O executable (macOS)
+#   PE executable     (Windows)
+#
+# This linker handles:
+#   - Symbol resolution across object files
+#   - Relocation patching
+#   - Section merging and layout
+#   - Entry point setup (_start / _main)
+#   - Program header / load command generation
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map}
+use std::fs::{write_file_bytes}
+use tg_compiler::asm::{Arch, OsAbi, TargetTriple}
+use tg_compiler::object::{
+  ObjectFile, build_object,
+  write16, write32, write64, emit_zeros_vec, append_vec, pad_to, align_up,
+  push_str, write_padded_str
+}
+
+# ———————————————————————————————————————————————————————————————
+# Linker types
+# ———————————————————————————————————————————————————————————————
+
+struct LinkerInput
+  objects: Vec[ObjectFile]
+  entry: String           # entry point symbol (_start or _main)
+  output: String          # output file path
+  target: TargetTriple
+end
+
+struct LinkedSection
+  name: String
+  data: Vec[u8]
+  vaddr: u64
+  file_offset: u64
+  alignment: u64
+  flags: u64     # rwx permissions
+end
+
+struct LinkerSymbol
+  name: String
+  value: u64     # resolved virtual address
+  section: Int   # section index
+  is_defined: Bool
+end
+
+struct LinkerCtx
+  sections: Vec[LinkedSection]
+  symbols: Map[String, LinkerSymbol]
+  entry_addr: u64
+  target: TargetTriple
+end
+
+# ———————————————————————————————————————————————————————————————
+# Symbol resolution
+# ———————————————————————————————————————————————————————————————
+
+def resolve_symbols(objects: &Vec[ObjectFile]) -> Result[Map[String, LinkerSymbol], String]
+  mut syms = Map::new()
+
+  for obj in objects do
+    for sym in obj.symbols do
+      match syms.get(sym.name)
+      when Option::Some(existing) then
+        if existing.is_defined then
+          return Result::Err("duplicate symbol: " + sym.name)
+        end
+      when Option::None then ()
+      end
+      syms.insert(sym.name, LinkerSymbol {
+        name: sym.name,
+        value: sym.offset as u64,
+        section: 0,
+        is_defined: true
+      })
+    end
+  end
+
+  Result::Ok(syms)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Section merging
+# ———————————————————————————————————————————————————————————————
+
+def merge_sections(objects: &Vec[ObjectFile]) -> Vec[LinkedSection]
+  mut text_data = Vec::new()
+  mut data_data = Vec::new()
+  mut rodata_data = Vec::new()
+
+  for obj in objects do
+    append_vec(&mut text_data, &obj.text)
+    append_vec(&mut data_data, &obj.data)
+    append_vec(&mut rodata_data, &obj.rodata)
+  end
+
+  mut sections = Vec::new()
+  sections.push(LinkedSection {
+    name: ".text",
+    data: text_data,
+    vaddr: 0,
+    file_offset: 0,
+    alignment: 16,
+    flags: 5   # r-x
+  })
+  sections.push(LinkedSection {
+    name: ".rodata",
+    data: rodata_data,
+    vaddr: 0,
+    file_offset: 0,
+    alignment: 8,
+    flags: 4   # r--
+  })
+  sections.push(LinkedSection {
+    name: ".data",
+    data: data_data,
+    vaddr: 0,
+    file_offset: 0,
+    alignment: 8,
+    flags: 6   # rw-
+  })
+
+  sections
+end
+
+# ———————————————————————————————————————————————————————————————
+# ELF64 Executable Generation
+# ———————————————————————————————————————————————————————————————
+
+# Program header types
+def PT_NULL()    -> u32 = 0
+def PT_LOAD()    -> u32 = 1
+def PT_INTERP()  -> u32 = 3
+
+# Program header flags
+def PF_X() -> u32 = 1
+def PF_W() -> u32 = 2
+def PF_R() -> u32 = 4
+
+def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
+  mut out = Vec::new()
+
+  # Merge sections
+  mut sections = merge_sections(&input.objects)
+
+  # Resolve symbols
+  let syms = match resolve_symbols(&input.objects)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(e)
+  end
+
+  # Layout
+  let base_addr: u64 = 0x400000   # Standard Linux x86-64 base
+  let ehdr_size = 64
+  let phdr_size = 56
+  let num_phdrs = sections.len()
+  let phdrs_total = num_phdrs * phdr_size
+
+  mut file_offset = align_up(ehdr_size + phdrs_total, 4096) as u64
+  mut vaddr = base_addr + file_offset
+
+  # Assign addresses to sections
+  mut i = 0
+  while i < sections.len() do
+    sections[i].file_offset = file_offset
+    sections[i].vaddr = vaddr
+
+    let sec_size = sections[i].data.len() as u64
+    file_offset = file_offset + sec_size
+    vaddr = vaddr + sec_size
+
+    # Page-align next segment
+    file_offset = align_up(file_offset as Int, 4096) as u64
+    vaddr = align_up(vaddr as Int, 4096) as u64
+
+    i = i + 1
+  end
+
+  # Find entry point
+  let entry_addr = match syms.get(input.entry)
+  when Option::Some(sym) then
+    # entry is relative to .text; add .text vaddr
+    sections[0].vaddr + sym.value
+  when Option::None then
+    # Default: start of .text
+    sections[0].vaddr
+  end
+
+  # --- ELF Header ---
+  # e_ident
+  out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46)  # \x7fELF
+  out.push(2)   # ELFCLASS64
+  out.push(1)   # ELFDATA2LSB
+  out.push(1)   # EV_CURRENT
+  out.push(0)   # OSABI
+  emit_zeros_vec(&mut out, 8)
+
+  let machine = match input.target.arch
+  when Arch::X86_64  then 62 as u16
+  when Arch::AArch64 then 183 as u16
+  end
+
+  write16(&mut out, 2)           # ET_EXEC
+  write16(&mut out, machine)
+  write32(&mut out, 1)           # e_version
+  write64(&mut out, entry_addr)  # e_entry
+  write64(&mut out, ehdr_size as u64)  # e_phoff
+  write64(&mut out, 0)           # e_shoff (no section headers in exec)
+  write32(&mut out, 0)           # e_flags
+  write16(&mut out, ehdr_size as u16)
+  write16(&mut out, phdr_size as u16)
+  write16(&mut out, num_phdrs as u16)
+  write16(&mut out, 0)           # e_shentsize
+  write16(&mut out, 0)           # e_shnum
+  write16(&mut out, 0)           # e_shstrndx
+
+  # --- Program Headers ---
+  for sec in sections do
+    let sec_size = sec.data.len() as u64
+    let pflags = match sec.name
+    when ".text"   then PF_R() | PF_X()
+    when ".rodata" then PF_R()
+    when ".data"   then PF_R() | PF_W()
+    when _         then PF_R()
+    end
+
+    write32(&mut out, PT_LOAD())
+    write32(&mut out, pflags)
+    write64(&mut out, sec.file_offset)     # p_offset
+    write64(&mut out, sec.vaddr)           # p_vaddr
+    write64(&mut out, sec.vaddr)           # p_paddr
+    write64(&mut out, sec_size)            # p_filesz
+    write64(&mut out, sec_size)            # p_memsz
+    write64(&mut out, sec.alignment)       # p_align
+  end
+
+  # --- Section data ---
+  for sec in sections do
+    pad_to(&mut out, sec.file_offset as Int)
+    append_vec(&mut out, &sec.data)
+  end
+
+  Result::Ok(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Mach-O Executable Generation (macOS)
+# ———————————————————————————————————————————————————————————————
+
+def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
+  mut out = Vec::new()
+
+  # Merge sections
+  mut sections = merge_sections(&input.objects)
+  let syms = match resolve_symbols(&input.objects)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(e)
+  end
+
+  let is_arm = match input.target.arch
+  when Arch::AArch64 then true
+  when _ then false
+  end
+
+  let cputype = if is_arm then 0x0100000C as u32 else 0x01000007 as u32 end
+  let cpusubtype = if is_arm then 0 as u32 else 3 as u32 end
+
+  # Mach-O MH_EXECUTE
+  let MH_EXECUTE = 2 as u32
+  let LC_SEGMENT_64 = 0x19 as u32
+  let LC_MAIN = 0x80000028 as u32
+
+  # Calculate layout
+  let num_sections = 3
+  let seg_cmd_size = 72 + (num_sections * 80)
+  let main_cmd_size = 24
+  let load_cmds_size = seg_cmd_size + main_cmd_size
+  let header_size = 32
+  let page_size = 4096
+
+  let text_fileoff = align_up(header_size + load_cmds_size, page_size)
+  let data_fileoff = text_fileoff + sections[0].data.len()
+  let rodata_fileoff = data_fileoff + sections[2].data.len()
+
+  let base: u64 = 0x100000000   # macOS default base = 4GB
+
+  # Entry point offset (relative to __TEXT segment start)
+  let entry_off = match syms.get(input.entry)
+  when Option::Some(sym) then sym.value as u64
+  when Option::None then 0 as u64
+  end
+
+  # --- Mach-O Header (32 bytes) ---
+  write32(&mut out, 0xFEEDFACF)       # MH_MAGIC_64
+  write32(&mut out, cputype)
+  write32(&mut out, cpusubtype)
+  write32(&mut out, MH_EXECUTE)
+  write32(&mut out, 2)                 # ncmds
+  write32(&mut out, load_cmds_size as u32)
+  write32(&mut out, 0x85)              # MH_PIE | MH_DYLDLINK
+  write32(&mut out, 0)                 # reserved
+
+  # --- LC_SEGMENT_64: __TEXT + __DATA + __RODATA ---
+  let total = rodata_fileoff + sections[1].data.len()
+  let filesize = total - text_fileoff
+
+  write32(&mut out, LC_SEGMENT_64)
+  write32(&mut out, seg_cmd_size as u32)
+  write_padded_str(&mut out, "", 16)
+  write64(&mut out, base)
+  write64(&mut out, filesize as u64)
+  write64(&mut out, text_fileoff as u64)
+  write64(&mut out, filesize as u64)
+  write32(&mut out, 7); write32(&mut out, 7)
+  write32(&mut out, num_sections as u32)
+  write32(&mut out, 0)
+
+  # __text section
+  write_padded_str(&mut out, "__text", 16)
+  write_padded_str(&mut out, "__TEXT", 16)
+  write64(&mut out, base)
+  write64(&mut out, sections[0].data.len() as u64)
+  write32(&mut out, text_fileoff as u32)
+  write32(&mut out, 4)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, 0x80000400)
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # __data section
+  let data_vaddr = base + (data_fileoff - text_fileoff) as u64
+  write_padded_str(&mut out, "__data", 16)
+  write_padded_str(&mut out, "__DATA", 16)
+  write64(&mut out, data_vaddr)
+  write64(&mut out, sections[2].data.len() as u64)
+  write32(&mut out, data_fileoff as u32)
+  write32(&mut out, 3)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, 0)
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # __const section (rodata)
+  let ro_vaddr = base + (rodata_fileoff - text_fileoff) as u64
+  write_padded_str(&mut out, "__const", 16)
+  write_padded_str(&mut out, "__TEXT", 16)
+  write64(&mut out, ro_vaddr)
+  write64(&mut out, sections[1].data.len() as u64)
+  write32(&mut out, rodata_fileoff as u32)
+  write32(&mut out, 3)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, 0)
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # --- LC_MAIN ---
+  write32(&mut out, LC_MAIN)
+  write32(&mut out, main_cmd_size as u32)
+  write64(&mut out, entry_off)        # entryoff
+  write64(&mut out, 0)                # stacksize (default)
+
+  # --- Section data ---
+  pad_to(&mut out, text_fileoff)
+  append_vec(&mut out, &sections[0].data)   # text
+  append_vec(&mut out, &sections[2].data)   # data
+  append_vec(&mut out, &sections[1].data)   # rodata
+
+  Result::Ok(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# PE Executable Generation (Windows)
+# ———————————————————————————————————————————————————————————————
+
+def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
+  mut out = Vec::new()
+
+  let sections = merge_sections(&input.objects)
+  let syms = match resolve_symbols(&input.objects)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(e)
+  end
+
+  # DOS stub
+  out.push(0x4D); out.push(0x5A)  # "MZ"
+  emit_zeros_vec(&mut out, 58)
+  write32(&mut out, 64)           # e_lfanew -> PE signature at offset 64
+
+  # PE signature
+  out.push(0x50); out.push(0x45); out.push(0x00); out.push(0x00)  # "PE\0\0"
+
+  # COFF Header
+  write16(&mut out, 0x8664)         # Machine: AMD64
+  write16(&mut out, 3)              # NumberOfSections
+  write32(&mut out, 0)              # TimeDateStamp
+  write32(&mut out, 0)              # PointerToSymbolTable
+  write32(&mut out, 0)              # NumberOfSymbols
+  write16(&mut out, 240)            # SizeOfOptionalHeader
+  write16(&mut out, 0x22)           # Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+  # Optional Header (PE32+ = 240 bytes)
+  write16(&mut out, 0x020B)         # PE32+ magic
+  write16(&mut out, 0)              # LinkerVersion
+  write32(&mut out, sections[0].data.len() as u32)   # SizeOfCode
+  write32(&mut out, (sections[1].data.len() + sections[2].data.len()) as u32) # SizeOfInitializedData
+  write32(&mut out, 0)              # SizeOfUninitializedData
+
+  let image_base: u64 = 0x140000000  # Windows default
+  let section_align = 4096
+  let file_align = 512
+
+  let text_rva = section_align
+  let entry_rva = text_rva + match syms.get(input.entry)
+  when Option::Some(sym) then sym.value as Int
+  when Option::None then 0
+  end
+
+  write32(&mut out, entry_rva as u32)  # AddressOfEntryPoint
+  write32(&mut out, text_rva as u32)   # BaseOfCode
+
+  write64(&mut out, image_base)
+  write32(&mut out, section_align as u32)
+  write32(&mut out, file_align as u32)
+
+  # OS version, image version, subsystem version
+  write16(&mut out, 6); write16(&mut out, 0)   # OS ver
+  write16(&mut out, 0); write16(&mut out, 0)   # Image ver
+  write16(&mut out, 6); write16(&mut out, 0)   # Subsystem ver
+
+  write32(&mut out, 0)                         # Win32VersionValue
+
+  # SizeOfImage: the total virtual size covering all sections
+  # Accounts for headers + .text + .rdata + .data, each aligned to section_align
+  let text_vsize = align_up(sections[0].data.len(), section_align)
+  let rdata_vsize = align_up(sections[1].data.len(), section_align)
+  let data_vsize = align_up(sections[2].data.len(), section_align)
+  let total_rva_size = section_align + text_vsize + rdata_vsize + data_vsize
+  write32(&mut out, total_rva_size as u32)     # SizeOfImage
+
+  let headers_size = align_up(64 + 4 + 20 + 240 + (3 * 40), file_align)
+  write32(&mut out, headers_size as u32)       # SizeOfHeaders
+  write32(&mut out, 0)                         # CheckSum
+  write16(&mut out, 3)                         # Subsystem: CONSOLE
+  write16(&mut out, 0x8160)                    # DllCharacteristics: NX_COMPAT|DYNAMIC_BASE|HIGH_ENTROPY_VA|TERMINAL_SERVER_AWARE
+
+  # Stack and heap sizes
+  write64(&mut out, 0x100000)   # SizeOfStackReserve
+  write64(&mut out, 0x1000)     # SizeOfStackCommit
+  write64(&mut out, 0x100000)   # SizeOfHeapReserve
+  write64(&mut out, 0x1000)     # SizeOfHeapCommit
+  write32(&mut out, 0)          # LoaderFlags
+
+  write32(&mut out, 16)         # NumberOfRvaAndSizes
+
+  # Data directories (16 × 8 bytes = 128 bytes, all zero for minimal exe)
+  emit_zeros_vec(&mut out, 128)
+
+  # Section headers
+  let text_file_off = headers_size
+  let data_file_off = align_up(text_file_off + sections[0].data.len(), file_align)
+  let rdata_file_off = align_up(data_file_off + sections[2].data.len(), file_align)
+
+  let data_rva = text_rva + align_up(sections[0].data.len(), section_align)
+  let rdata_rva = data_rva + align_up(sections[2].data.len(), section_align)
+
+  # .text
+  write_padded_str(&mut out, ".text", 8)
+  write32(&mut out, sections[0].data.len() as u32)   # VirtualSize
+  write32(&mut out, text_rva as u32)
+  write32(&mut out, align_up(sections[0].data.len(), file_align) as u32)
+  write32(&mut out, text_file_off as u32)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write16(&mut out, 0); write16(&mut out, 0)
+  write32(&mut out, 0x60000020)  # CODE|EXECUTE|READ
+
+  # .data
+  write_padded_str(&mut out, ".data", 8)
+  write32(&mut out, sections[2].data.len() as u32)
+  write32(&mut out, data_rva as u32)
+  write32(&mut out, align_up(sections[2].data.len(), file_align) as u32)
+  write32(&mut out, data_file_off as u32)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write16(&mut out, 0); write16(&mut out, 0)
+  write32(&mut out, 0xC0000040)  # INITIALIZED|READ|WRITE
+
+  # .rdata
+  write_padded_str(&mut out, ".rdata", 8)
+  write32(&mut out, sections[1].data.len() as u32)
+  write32(&mut out, rdata_rva as u32)
+  write32(&mut out, align_up(sections[1].data.len(), file_align) as u32)
+  write32(&mut out, rdata_file_off as u32)
+  write32(&mut out, 0); write32(&mut out, 0)
+  write16(&mut out, 0); write16(&mut out, 0)
+  write32(&mut out, 0x40000040)  # INITIALIZED|READ
+
+  # Section data
+  pad_to(&mut out, text_file_off)
+  append_vec(&mut out, &sections[0].data)
+  pad_to(&mut out, data_file_off)
+  append_vec(&mut out, &sections[2].data)
+  pad_to(&mut out, rdata_file_off)
+  append_vec(&mut out, &sections[1].data)
+
+  Result::Ok(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+def link(input: &LinkerInput) -> Result[Vec[u8], String]
+  match input.target.os
+  when OsAbi::Linux   then link_elf64(input)
+  when OsAbi::MacOS   then link_macho64(input)
+  when OsAbi::Windows then link_pe64(input)
+  end
+end
+
+def link_and_write(input: &LinkerInput) -> Result[Unit, String]
+  let bytes = match link(input)
+  when Result::Ok(b) then b
+  when Result::Err(e) then return Result::Err(e)
+  end
+
+  match write_file_bytes(input.output, bytes)
+  when Result::Ok(_) then Result::Ok(())
+  when Result::Err(e) then Result::Err("failed to write executable: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Startup code injection
+# ———————————————————————————————————————————————————————————————
+
+# Generates minimal _start that calls main() and exits
+def inject_start_x64_linux(text: &mut CodeBuffer) -> Unit
+  use tg_compiler::asm::{
+    x64_xor_rr, x64_mov_rr, x64_call_label, x64_mov_ri,
+    x64_syscall, x64_and_ri8, x64_mov_rm, x64_lea_mem,
+    def_label, X64
+  }
+
+  def_label(text, "_start")
+
+  # Zero RBP (ABI: frame pointer sentinel)
+  x64_xor_rr(text, X64::RBP, X64::RBP)
+
+  # argc = [rsp], argv = rsp+8
+  # rdi = argc, rsi = argv (for main(argc, argv))
+  x64_mov_rm(text, X64::RDI, X64::RSP, 0)    # rdi = [rsp] = argc
+  x64_lea_mem(text, X64::RSI, X64::RSP, 8)    # rsi = rsp+8 = argv
+
+  # Align stack to 16 bytes (SysV ABI requirement)
+  x64_and_ri8(text, X64::RSP, -16 as i8)
+
+  # Call main
+  x64_call_label(text, "main")
+
+  # exit(rax)
+  x64_mov_rr(text, X64::RDI, X64::RAX)
+  x64_mov_ri(text, X64::RAX, 60)  # SYS_exit
+  x64_syscall(text)
+end
+
+def inject_start_a64_linux(text: &mut CodeBuffer) -> Unit
+  use tg_compiler::asm::{
+    a64_mov_rr, a64_bl, a64_mov_ri, a64_svc, def_label, A64
+  }
+
+  def_label(text, "_start")
+
+  # x0 = argc (from stack), x1 = argv
+  a64_ldr(text, A64::X0, A64::SP, 0)
+  a64_add_rri(text, A64::X1, A64::SP, 8)
+
+  # Call main
+  a64_bl(text, "main")
+
+  # exit(x0)
+  a64_mov_rr(text, A64::X0, A64::X0)  # return code already in X0
+  a64_mov_ri(text, A64::X8, 93)       # SYS_exit on ARM64 Linux
+  a64_svc(text, 0)
+end

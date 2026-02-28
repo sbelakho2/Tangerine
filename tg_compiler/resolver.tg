@@ -1,0 +1,1087 @@
+# Tangerine Compiler — Name Resolution
+#
+# Dedicated name resolution pass that runs before type checking:
+#   - Builds symbol tables
+#   - Resolves imports and use declarations
+#   - Resolves paths (module::item::member)
+#   - Enforces visibility (pub/priv)
+#   - Reports unresolved names
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+
+use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind, 
+                        Pattern, TypeExpr, UseTree, Visibility, Path}
+use tg_compiler::token::{Span}
+
+# ———————————————————————————————————————————————————————————————
+# Resolution Errors
+# ———————————————————————————————————————————————————————————————
+
+struct ResolutionError
+  message: String
+  span: Span
+  kind: ResolutionErrorKind
+end
+
+enum ResolutionErrorKind
+  UnresolvedName
+  UnresolvedType
+  UnresolvedModule
+  UnresolvedImport
+  DuplicateDefinition
+  VisibilityViolation
+  CyclicImport
+  AmbiguousName
+end
+
+# ———————————————————————————————————————————————————————————————
+# Symbol Table
+# ———————————————————————————————————————————————————————————————
+
+struct SymbolTable
+  # Root module
+  root: ModuleSymbols
+  
+  # Current path for resolution
+  current_module: Vec[String]
+  
+  # Errors collected during resolution
+  errors: Vec[ResolutionError]
+  
+  # Import graph for cycle detection
+  import_graph: Map[String, Set[String]]
+end
+
+struct ModuleSymbols
+  name: String
+  
+  # Items defined in this module
+  types: Map[String, TypeDefSymbol]
+  functions: Map[String, FunctionSymbol]
+  constants: Map[String, ConstantSymbol]
+  statics: Map[String, StaticSymbol]
+  traits: Map[String, TraitSymbol]
+  
+  # Re-exports and imports
+  imports: Vec[ImportSymbol]
+  
+  # Child modules
+  submodules: Map[String, ModuleSymbols]
+  
+  # Visibility of this module
+  visibility: Visibility
+end
+
+struct TypeDefSymbol
+  name: String
+  kind: TypeDefSymbolKind
+  type_params: Vec[String]
+  visibility: Visibility
+  span: Span
+end
+
+enum TypeDefSymbolKind
+  Struct
+  Enum
+  Union
+  TypeAlias
+end
+
+struct FunctionSymbol
+  name: String
+  params: Vec[(String, Option[TypeExpr])]
+  return_type: Option[TypeExpr]
+  type_params: Vec[String]
+  visibility: Visibility
+  is_method: Bool
+  receiver_type: Option[String]
+  span: Span
+end
+
+struct ConstantSymbol
+  name: String
+  ty: Option[TypeExpr]
+  visibility: Visibility
+  span: Span
+end
+
+struct StaticSymbol
+  name: String
+  ty: Option[TypeExpr]
+  is_mut: Bool
+  visibility: Visibility
+  span: Span
+end
+
+struct TraitSymbol
+  name: String
+  type_params: Vec[String]
+  super_traits: Vec[String]
+  methods: Vec[String]
+  visibility: Visibility
+  span: Span
+end
+
+struct ImportSymbol
+  path: Vec[String]
+  alias: Option[String]
+  is_glob: Bool
+  span: Span
+end
+
+# ———————————————————————————————————————————————————————————————
+# Resolved References
+# ———————————————————————————————————————————————————————————————
+
+struct ResolvedNames
+  # Map from span (or node id) to resolved symbol
+  expr_resolutions: Map[Int, ResolvedExpr]
+  type_resolutions: Map[Int, ResolvedType]
+  pattern_resolutions: Map[Int, ResolvedPattern]
+end
+
+struct ResolvedExpr
+  kind: ResolvedExprKind
+  module_path: Vec[String]
+end
+
+enum ResolvedExprKind
+  LocalVar(String)
+  Parameter(String, Int)
+  Function(String)
+  Method(String, String)  # (type_name, method_name)
+  Constant(String)
+  Static(String)
+  EnumVariant(String, String)  # (enum_name, variant_name)
+  StructField(String, String)  # (struct_name, field_name)
+end
+
+struct ResolvedType
+  module_path: Vec[String]
+  name: String
+  is_builtin: Bool
+end
+
+struct ResolvedPattern
+  kind: ResolvedPatternKind
+end
+
+enum ResolvedPatternKind
+  Variable(String)
+  Struct(String)
+  Enum(String, String)
+  Tuple(Vec[ResolvedPattern])
+  Wildcard
+end
+
+# ———————————————————————————————————————————————————————————————
+# Scoped Resolution Context
+# ———————————————————————————————————————————————————————————————
+
+struct ResolutionContext
+  # Symbol table being built/used
+  symbols: SymbolTable
+  
+  # Current scope stack for local variables
+  local_scopes: Vec[Map[String, LocalBinding]]
+  
+  # Output: resolved references
+  resolved: ResolvedNames
+  
+  # Config
+  prelude_imports: Vec[String]
+end
+
+struct LocalBinding
+  name: String
+  kind: LocalBindingKind
+  is_mut: Bool
+  span: Span
+end
+
+enum LocalBindingKind
+  Variable
+  Parameter(Int)  # Parameter index
+  LoopVariable
+  MatchBinding
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+def resolve_names(program: &Program) -> Result[ResolvedNames, Vec[ResolutionError]]
+  mut ctx = context_new()
+  
+  # Phase 1: Build symbol table from all items
+  build_symbol_table(&mut ctx, program)
+  
+  # Phase 2: Resolve imports
+  resolve_imports(&mut ctx)
+  
+  # Phase 3: Resolve all name references
+  resolve_program(&mut ctx, program)
+  
+  if ctx.symbols.errors.is_empty() then
+    Result::Ok(ctx.resolved)
+  else
+    Result::Err(ctx.symbols.errors)
+  end
+end
+
+def context_new() -> ResolutionContext
+  ResolutionContext {
+    symbols: symbol_table_new(),
+    local_scopes: Vec::new(),
+    resolved: ResolvedNames {
+      expr_resolutions: Map::new(),
+      type_resolutions: Map::new(),
+      pattern_resolutions: Map::new()
+    },
+    prelude_imports: vec!["std", "core"]
+  }
+end
+
+def symbol_table_new() -> SymbolTable
+  SymbolTable {
+    root: module_symbols_new("".to_string()),
+    current_module: Vec::new(),
+    errors: Vec::new(),
+    import_graph: Map::new()
+  }
+end
+
+def module_symbols_new(name: String) -> ModuleSymbols
+  ModuleSymbols {
+    name: name,
+    types: Map::new(),
+    functions: Map::new(),
+    constants: Map::new(),
+    statics: Map::new(),
+    traits: Map::new(),
+    imports: Vec::new(),
+    submodules: Map::new(),
+    visibility: Visibility::Private
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Phase 1: Build Symbol Table
+# ———————————————————————————————————————————————————————————————
+
+def build_symbol_table(ctx: &mut ResolutionContext, program: &Program) -> Unit
+  for item in program.items do
+    add_item_to_symbols(ctx, &item)
+  end
+end
+
+def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
+  let module = get_current_module(&mut ctx.symbols)
+  
+  match item.kind
+  when ItemKind::Function(f) then
+    let sym = FunctionSymbol {
+      name: f.name.clone(),
+      params: extract_params(&f.params),
+      return_type: f.return_type.clone(),
+      type_params: f.type_params.clone(),
+      visibility: item.visibility.clone(),
+      is_method: false,
+      receiver_type: Option::None,
+      span: item.span.clone()
+    }
+    
+    if module.functions.contains_key(&f.name) then
+      add_error(&mut ctx.symbols, ResolutionErrorKind::DuplicateDefinition,
+        "duplicate function definition: " + f.name, item.span.clone())
+    else
+      module.functions.insert(f.name.clone(), sym)
+    end
+  
+  when ItemKind::Struct(s) then
+    let sym = TypeDefSymbol {
+      name: s.name.clone(),
+      kind: TypeDefSymbolKind::Struct,
+      type_params: s.type_params.clone(),
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    
+    if module.types.contains_key(&s.name) then
+      add_error(&mut ctx.symbols, ResolutionErrorKind::DuplicateDefinition,
+        "duplicate type definition: " + s.name, item.span.clone())
+    else
+      module.types.insert(s.name.clone(), sym)
+    end
+  
+  when ItemKind::Enum(e) then
+    let sym = TypeDefSymbol {
+      name: e.name.clone(),
+      kind: TypeDefSymbolKind::Enum,
+      type_params: e.type_params.clone(),
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    
+    if module.types.contains_key(&e.name) then
+      add_error(&mut ctx.symbols, ResolutionErrorKind::DuplicateDefinition,
+        "duplicate type definition: " + e.name, item.span.clone())
+    else
+      module.types.insert(e.name.clone(), sym)
+    end
+  
+  when ItemKind::Trait(t) then
+    let sym = TraitSymbol {
+      name: t.name.clone(),
+      type_params: t.type_params.clone(),
+      super_traits: t.super_traits.clone(),
+      methods: extract_method_names(&t.methods),
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    
+    if module.traits.contains_key(&t.name) then
+      add_error(&mut ctx.symbols, ResolutionErrorKind::DuplicateDefinition,
+        "duplicate trait definition: " + t.name, item.span.clone())
+    else
+      module.traits.insert(t.name.clone(), sym)
+    end
+  
+  when ItemKind::Impl(impl_block) then
+    # Process impl items as methods
+    for method in impl_block.items do
+      match method.kind
+      when ItemKind::Function(f) then
+        # Methods are added with receiver type context
+        let sym = FunctionSymbol {
+          name: f.name.clone(),
+          params: extract_params(&f.params),
+          return_type: f.return_type.clone(),
+          type_params: f.type_params.clone(),
+          visibility: method.visibility.clone(),
+          is_method: true,
+          receiver_type: Option::Some(type_expr_to_string(&impl_block.self_type)),
+          span: method.span.clone()
+        }
+        # Store with qualified name: Type::method
+        let key = type_expr_to_string(&impl_block.self_type) + "::" + f.name
+        module.functions.insert(key, sym)
+      when _ then ()
+      end
+    end
+  
+  when ItemKind::Use(use_tree) then
+    let imports = flatten_use_tree(&use_tree, Vec::new())
+    for import in imports do
+      module.imports.push(import)
+    end
+  
+  when ItemKind::Mod(m) then
+    # Create submodule
+    let submod = module_symbols_new(m.name.clone())
+    ctx.symbols.current_module.push(m.name.clone())
+    
+    for inner in m.items do
+      add_item_to_symbols(ctx, &inner)
+    end
+    
+    ctx.symbols.current_module.pop()
+    module.submodules.insert(m.name.clone(), submod)
+  
+  when ItemKind::Const(c) then
+    let sym = ConstantSymbol {
+      name: c.name.clone(),
+      ty: c.ty.clone(),
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    module.constants.insert(c.name.clone(), sym)
+  
+  when ItemKind::Static(s) then
+    let sym = StaticSymbol {
+      name: s.name.clone(),
+      ty: s.ty.clone(),
+      is_mut: s.is_mut,
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    module.statics.insert(s.name.clone(), sym)
+  
+  when ItemKind::TypeAlias(t) then
+    let sym = TypeDefSymbol {
+      name: t.name.clone(),
+      kind: TypeDefSymbolKind::TypeAlias,
+      type_params: t.type_params.clone(),
+      visibility: item.visibility.clone(),
+      span: item.span.clone()
+    }
+    module.types.insert(t.name.clone(), sym)
+  
+  when ItemKind::Extern(ext) then
+    # Add extern functions
+    for decl in ext.declarations do
+      match decl.kind
+      when ItemKind::Function(f) then
+        let sym = FunctionSymbol {
+          name: f.name.clone(),
+          params: extract_params(&f.params),
+          return_type: f.return_type.clone(),
+          type_params: Vec::new(),
+          visibility: Visibility::Public,
+          is_method: false,
+          receiver_type: Option::None,
+          span: decl.span.clone()
+        }
+        module.functions.insert(f.name.clone(), sym)
+      when _ then ()
+      end
+    end
+  
+  when _ then ()
+  end
+end
+
+def get_current_module(symbols: &mut SymbolTable) -> &mut ModuleSymbols
+  mut module = &mut symbols.root
+  for segment in symbols.current_module do
+    module = module.submodules.get_mut(&segment).expect("module not found")
+  end
+  module
+end
+
+def extract_params(params: &Vec[ast::Param]) -> Vec[(String, Option[TypeExpr])]
+  mut result = Vec::new()
+  for p in params do
+    result.push((p.name.clone(), p.ty.clone()))
+  end
+  result
+end
+
+def extract_method_names(methods: &Vec[ast::TraitMethod]) -> Vec[String]
+  mut result = Vec::new()
+  for m in methods do
+    result.push(m.name.clone())
+  end
+  result
+end
+
+def type_expr_to_string(ty: &TypeExpr) -> String
+  match ty
+  when TypeExpr::Named(path, args) then
+    if args.is_empty() then
+      path.join("::")
+    else
+      path.join("::") + "[...]"
+    end
+  when TypeExpr::Primitive(name) then name.clone()
+  when _ then "<type>".to_string()
+  end
+end
+
+def flatten_use_tree(tree: &UseTree, prefix: Vec[String]) -> Vec[ImportSymbol]
+  mut result = Vec::new()
+  
+  match tree
+  when UseTree::Path(name, subtree) then
+    mut new_prefix = prefix.clone()
+    new_prefix.push(name.clone())
+    result.extend(flatten_use_tree(&subtree, new_prefix))
+  
+  when UseTree::Name(name, alias) then
+    mut path = prefix.clone()
+    path.push(name.clone())
+    result.push(ImportSymbol {
+      path: path,
+      alias: alias.clone(),
+      is_glob: false,
+      span: Span { start: 0, end: 0 }
+    })
+  
+  when UseTree::Glob then
+    result.push(ImportSymbol {
+      path: prefix,
+      alias: Option::None,
+      is_glob: true,
+      span: Span { start: 0, end: 0 }
+    })
+  
+  when UseTree::Group(items) then
+    for item in items do
+      result.extend(flatten_use_tree(&item, prefix.clone()))
+    end
+  end
+  
+  result
+end
+
+# ———————————————————————————————————————————————————————————————
+# Phase 2: Resolve Imports
+# ———————————————————————————————————————————————————————————————
+
+def resolve_imports(ctx: &mut ResolutionContext) -> Unit
+  resolve_module_imports(&mut ctx.symbols, &mut ctx.symbols.root, Vec::new())
+end
+
+def resolve_module_imports(symbols: &mut SymbolTable, module: &mut ModuleSymbols, 
+                           path: Vec[String]) -> Unit
+  for import in module.imports do
+    # Check for cycles
+    let path_str = path.join("::")
+    let import_str = import.path.join("::")
+    
+    if cycle_in_import_graph(symbols, &path_str, &import_str) then
+      add_error(symbols, ResolutionErrorKind::CyclicImport,
+        "cyclic import detected: " + import_str, import.span.clone())
+      continue
+    end
+    
+    # Add to import graph
+    match symbols.import_graph.get_mut(&path_str)
+    when Option::Some(deps) then deps.insert(import_str.clone())
+    when Option::None then
+      mut deps = Set::new()
+      deps.insert(import_str.clone())
+      symbols.import_graph.insert(path_str.clone(), deps)
+    end
+    
+    # Verify import exists
+    if !resolve_import_path(symbols, &import.path) then
+      add_error(symbols, ResolutionErrorKind::UnresolvedImport,
+        "unresolved import: " + import_str, import.span.clone())
+    end
+  end
+  
+  # Recurse into submodules
+  for (name, submod) in module.submodules do
+    mut sub_path = path.clone()
+    sub_path.push(name.clone())
+    resolve_module_imports(symbols, submod, sub_path)
+  end
+end
+
+def cycle_in_import_graph(symbols: &SymbolTable, from: &String, to: &String) -> Bool
+  # Check if adding edge from->to would create a cycle
+  # by checking if 'to' can reach 'from'
+  mut visited = Set::new()
+  mut stack = Vec::new()
+  stack.push(to.clone())
+  
+  while !stack.is_empty() do
+    let current = stack.pop().unwrap()
+    
+    if current == from.clone() then
+      return true
+    end
+    
+    if visited.contains(&current) then
+      continue
+    end
+    visited.insert(current.clone())
+    
+    match symbols.import_graph.get(&current)
+    when Option::Some(deps) then
+      for dep in deps do
+        stack.push(dep.clone())
+      end
+    when Option::None then ()
+    end
+  end
+  
+  false
+end
+
+def resolve_import_path(symbols: &SymbolTable, path: &Vec[String]) -> Bool
+  if path.is_empty() then return false end
+  
+  # Check built-in modules
+  let first = &path[0]
+  if first == "std" || first == "tg_compiler" then
+    return true  # Assume stdlib exists
+  end
+  
+  # Try to find in symbol table
+  mut module = &symbols.root
+  for segment in path do
+    match module.submodules.get(&segment)
+    when Option::Some(submod) then module = submod
+    when Option::None then
+      # Check if it's a type/function in the module
+      if module.types.contains_key(&segment) || 
+         module.functions.contains_key(&segment) ||
+         module.traits.contains_key(&segment) then
+        return true
+      end
+      return false
+    end
+  end
+  
+  true
+end
+
+# ———————————————————————————————————————————————————————————————
+# Phase 3: Resolve References
+# ———————————————————————————————————————————————————————————————
+
+def resolve_program(ctx: &mut ResolutionContext, program: &Program) -> Unit
+  for item in program.items do
+    resolve_item(ctx, &item)
+  end
+end
+
+def resolve_item(ctx: &mut ResolutionContext, item: &Item) -> Unit
+  match item.kind
+  when ItemKind::Function(f) then
+    resolve_function(ctx, &f)
+  when ItemKind::Impl(impl_block) then
+    for method in impl_block.items do
+      resolve_item(ctx, &method)
+    end
+  when ItemKind::Mod(m) then
+    ctx.symbols.current_module.push(m.name.clone())
+    for inner in m.items do
+      resolve_item(ctx, &inner)
+    end
+    ctx.symbols.current_module.pop()
+  when _ then ()
+  end
+end
+
+def resolve_function(ctx: &mut ResolutionContext, f: &ast::Function) -> Unit
+  push_scope(ctx)
+  
+  # Add parameters to scope
+  mut param_idx = 0
+  for param in f.params do
+    define_local(ctx, param.name.clone(), LocalBinding {
+      name: param.name.clone(),
+      kind: LocalBindingKind::Parameter(param_idx),
+      is_mut: param.is_mut,
+      span: param.span.clone()
+    })
+    param_idx = param_idx + 1
+  end
+  
+  # Resolve body
+  match f.body
+  when Option::Some(body) then resolve_expr(ctx, &body)
+  when Option::None then ()
+  end
+  
+  pop_scope(ctx)
+end
+
+def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    # Look up in local scopes first
+    match lookup_local(ctx, &name)
+    when Option::Some(binding) then
+      let resolution = match binding.kind
+      when LocalBindingKind::Variable then ResolvedExprKind::LocalVar(name.clone())
+      when LocalBindingKind::Parameter(idx) then ResolvedExprKind::Parameter(name.clone(), idx)
+      when LocalBindingKind::LoopVariable then ResolvedExprKind::LocalVar(name.clone())
+      when LocalBindingKind::MatchBinding then ResolvedExprKind::LocalVar(name.clone())
+      end
+      ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+        kind: resolution,
+        module_path: ctx.symbols.current_module.clone()
+      })
+    when Option::None then
+      # Try to resolve as function or constant
+      let module = get_current_module_ref(&ctx.symbols)
+      if module.functions.contains_key(&name) then
+        ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+          kind: ResolvedExprKind::Function(name.clone()),
+          module_path: ctx.symbols.current_module.clone()
+        })
+      elsif module.constants.contains_key(&name) then
+        ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+          kind: ResolvedExprKind::Constant(name.clone()),
+          module_path: ctx.symbols.current_module.clone()
+        })
+      elsif module.statics.contains_key(&name) then
+        ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+          kind: ResolvedExprKind::Static(name.clone()),
+          module_path: ctx.symbols.current_module.clone()
+        })
+      else
+        # Check imports
+        if !resolve_via_imports(ctx, &name, expr) then
+          add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedName,
+            "unresolved name: " + name, expr.span.clone())
+        end
+      end
+    end
+  
+  when ExprKind::Path(path) then
+    resolve_path(ctx, &path, expr.span.clone())
+  
+  when ExprKind::Call(callee, args) then
+    resolve_expr(ctx, &callee)
+    for arg in args do
+      resolve_expr(ctx, &arg)
+    end
+  
+  when ExprKind::MethodCall(receiver, method, args) then
+    resolve_expr(ctx, &receiver)
+    for arg in args do
+      resolve_expr(ctx, &arg)
+    end
+    # Method resolution happens during type checking
+  
+  when ExprKind::Binary(op, lhs, rhs) then
+    resolve_expr(ctx, &lhs)
+    resolve_expr(ctx, &rhs)
+  
+  when ExprKind::Unary(op, operand) then
+    resolve_expr(ctx, &operand)
+  
+  when ExprKind::If(cond, then_expr, else_expr) then
+    resolve_expr(ctx, &cond)
+    resolve_expr(ctx, &then_expr)
+    match else_expr
+    when Option::Some(e) then resolve_expr(ctx, &e)
+    when Option::None then ()
+    end
+  
+  when ExprKind::Match(scrutinee, arms) then
+    resolve_expr(ctx, &scrutinee)
+    for arm in arms do
+      push_scope(ctx)
+      resolve_pattern(ctx, &arm.pattern)
+      resolve_expr(ctx, &arm.body)
+      pop_scope(ctx)
+    end
+  
+  when ExprKind::Block(stmts, result) then
+    push_scope(ctx)
+    for stmt in stmts do
+      resolve_stmt(ctx, &stmt)
+    end
+    match result
+    when Option::Some(e) then resolve_expr(ctx, &e)
+    when Option::None then ()
+    end
+    pop_scope(ctx)
+  
+  when ExprKind::Let(pattern, ty, init) then
+    match init
+    when Option::Some(e) then resolve_expr(ctx, &e)
+    when Option::None then ()
+    end
+    resolve_pattern_definition(ctx, &pattern)
+  
+  when ExprKind::While(cond, body) then
+    resolve_expr(ctx, &cond)
+    push_scope(ctx)
+    resolve_expr(ctx, &body)
+    pop_scope(ctx)
+  
+  when ExprKind::For(var, iter, body) then
+    resolve_expr(ctx, &iter)
+    push_scope(ctx)
+    define_local(ctx, var.clone(), LocalBinding {
+      name: var.clone(),
+      kind: LocalBindingKind::LoopVariable,
+      is_mut: false,
+      span: expr.span.clone()
+    })
+    resolve_expr(ctx, &body)
+    pop_scope(ctx)
+  
+  when ExprKind::Return(value) then
+    match value
+    when Option::Some(e) then resolve_expr(ctx, &e)
+    when Option::None then ()
+    end
+  
+  when ExprKind::Struct(path, fields) then
+    resolve_path(ctx, &path, expr.span.clone())
+    for (name, value) in fields do
+      resolve_expr(ctx, &value)
+    end
+  
+  when ExprKind::Array(elements) then
+    for e in elements do
+      resolve_expr(ctx, &e)
+    end
+  
+  when ExprKind::Tuple(elements) then
+    for e in elements do
+      resolve_expr(ctx, &e)
+    end
+  
+  when ExprKind::Field(base, field) then
+    resolve_expr(ctx, &base)
+  
+  when ExprKind::Index(base, index) then
+    resolve_expr(ctx, &base)
+    resolve_expr(ctx, &index)
+  
+  when ExprKind::Closure(params, body) then
+    push_scope(ctx)
+    mut idx = 0
+    for p in params do
+      define_local(ctx, p.name.clone(), LocalBinding {
+        name: p.name.clone(),
+        kind: LocalBindingKind::Parameter(idx),
+        is_mut: p.is_mut,
+        span: expr.span.clone()
+      })
+      idx = idx + 1
+    end
+    resolve_expr(ctx, &body)
+    pop_scope(ctx)
+  
+  when ExprKind::Assign(target, value) then
+    resolve_expr(ctx, &target)
+    resolve_expr(ctx, &value)
+  
+  when ExprKind::Cast(e, ty) then
+    resolve_expr(ctx, &e)
+    resolve_type_expr(ctx, &ty, expr.span.clone())
+  
+  when ExprKind::Literal(_) then ()
+  when ExprKind::Unit then ()
+  when ExprKind::Break then ()
+  when ExprKind::Continue then ()
+  when _ then ()
+  end
+end
+
+def resolve_stmt(ctx: &mut ResolutionContext, stmt: &Stmt) -> Unit
+  match stmt.kind
+  when StmtKind::Expr(e) then resolve_expr(ctx, &e)
+  when StmtKind::Let(pattern, ty, init) then
+    match init
+    when Option::Some(e) then resolve_expr(ctx, &e)  
+    when Option::None then ()
+    end
+    resolve_pattern_definition(ctx, &pattern)
+  when StmtKind::Item(item) then resolve_item(ctx, &item)
+  end
+end
+
+def resolve_pattern(ctx: &mut ResolutionContext, pattern: &Pattern) -> Unit
+  match pattern
+  when Pattern::Ident(name, is_mut) then
+    define_local(ctx, name.clone(), LocalBinding {
+      name: name.clone(),
+      kind: LocalBindingKind::MatchBinding,
+      is_mut: is_mut.clone(),
+      span: Span { start: 0, end: 0 }
+    })
+  when Pattern::Tuple(patterns) then
+    for p in patterns do
+      resolve_pattern(ctx, &p)
+    end
+  when Pattern::Struct(path, fields) then
+    for (name, pat) in fields do
+      resolve_pattern(ctx, &pat)
+    end
+  when Pattern::Enum(path, patterns) then
+    for p in patterns do
+      resolve_pattern(ctx, &p)
+    end
+  when Pattern::Literal(_) then ()
+  when Pattern::Wildcard then ()
+  when Pattern::Rest then ()
+  when _ then ()
+  end
+end
+
+def resolve_pattern_definition(ctx: &mut ResolutionContext, pattern: &Pattern) -> Unit
+  match pattern
+  when Pattern::Ident(name, is_mut) then
+    define_local(ctx, name.clone(), LocalBinding {
+      name: name.clone(),
+      kind: LocalBindingKind::Variable,
+      is_mut: is_mut.clone(),
+      span: Span { start: 0, end: 0 }
+    })
+  when Pattern::Tuple(patterns) then
+    for p in patterns do
+      resolve_pattern_definition(ctx, &p)
+    end
+  when _ then ()
+  end
+end
+
+def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Unit
+  if path.is_empty() then return end
+  
+  let first = &path[0]
+  
+  # Check if it's a type path like Type::method or Enum::Variant
+  if path.len() >= 2 then
+    let module = get_current_module_ref(&ctx.symbols)
+    if module.types.contains_key(first) then
+      let second = &path[1]
+      # Could be enum variant or associated item
+      ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
+        kind: ResolvedExprKind::EnumVariant(first.clone(), second.clone()),
+        module_path: ctx.symbols.current_module.clone()
+      })
+      return
+    end
+  end
+  
+  # Try resolving as module path
+  if resolve_via_imports_path(ctx, path, span) then
+    return
+  end
+  
+  # Could not resolve
+  add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedName,
+    "unresolved path: " + path.join("::"), span)
+end
+
+def resolve_type_expr(ctx: &mut ResolutionContext, ty: &TypeExpr, span: Span) -> Unit
+  match ty
+  when TypeExpr::Named(path, args) then
+    # Check if type exists
+    if !is_builtin_type(&path) then
+      let module = get_current_module_ref(&ctx.symbols)
+      let name = &path[path.len() - 1]
+      if !module.types.contains_key(name) && !resolve_type_via_imports(ctx, &path) then
+        add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedType,
+          "unresolved type: " + path.join("::"), span)
+      end
+    end
+    # Resolve type arguments
+    for arg in args do
+      resolve_type_expr(ctx, &arg, span.clone())
+    end
+  when TypeExpr::Tuple(elems) then
+    for e in elems do
+      resolve_type_expr(ctx, &e, span.clone())
+    end
+  when TypeExpr::Array(elem, _) then
+    resolve_type_expr(ctx, &elem, span.clone())
+  when TypeExpr::Slice(elem) then
+    resolve_type_expr(ctx, &elem, span.clone())
+  when TypeExpr::Ref(inner, _) then
+    resolve_type_expr(ctx, &inner, span.clone())
+  when TypeExpr::RefMut(inner, _) then
+    resolve_type_expr(ctx, &inner, span.clone())
+  when TypeExpr::Fn(params, ret) then
+    for p in params do
+      resolve_type_expr(ctx, &p, span.clone())
+    end
+    resolve_type_expr(ctx, &ret, span.clone())
+  when _ then ()
+  end
+end
+
+def is_builtin_type(path: &Vec[String]) -> Bool
+  if path.len() != 1 then return false end
+  
+  let name = &path[0]
+  name == "Int" || name == "UInt" || name == "Float" || name == "Bool" ||
+  name == "Char" || name == "String" || name == "Unit" || name == "Never" ||
+  name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "i128" ||
+  name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "u128" ||
+  name == "f32" || name == "f64" ||
+  name == "Vec" || name == "Map" || name == "Set" || name == "Option" || name == "Result" ||
+  name == "Ptr" || name == "Box" || name == "Rc" || name == "Arc"
+end
+
+def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr) -> Bool
+  let module = get_current_module_ref(&ctx.symbols)
+  
+  for import in module.imports do
+    if import.is_glob then
+      # Would need to search the imported module
+      continue
+    end
+    
+    let import_name = match import.alias
+    when Option::Some(alias) then alias.clone()
+    when Option::None then
+      if import.path.is_empty() then continue end
+      import.path[import.path.len() - 1].clone()
+    end
+    
+    if import_name == name.clone() then
+      ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+        kind: ResolvedExprKind::Function(name.clone()),
+        module_path: import.path.clone()
+      })
+      return true
+    end
+  end
+  
+  false
+end
+
+def resolve_via_imports_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Bool
+  # Try to match path against imports
+  # This is a simplified version - full resolution would be more complex
+  true
+end
+
+def resolve_type_via_imports(ctx: &ResolutionContext, path: &Vec[String]) -> Bool
+  # Check if type is imported
+  let module = get_current_module_ref(&ctx.symbols)
+  
+  for import in module.imports do
+    if import.path == path.clone() then
+      return true
+    end
+  end
+  
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Scope Management
+# ———————————————————————————————————————————————————————————————
+
+def push_scope(ctx: &mut ResolutionContext) -> Unit
+  ctx.local_scopes.push(Map::new())
+end
+
+def pop_scope(ctx: &mut ResolutionContext) -> Unit
+  ctx.local_scopes.pop()
+end
+
+def define_local(ctx: &mut ResolutionContext, name: String, binding: LocalBinding) -> Unit
+  if !ctx.local_scopes.is_empty() then
+    let idx = ctx.local_scopes.len() - 1
+    ctx.local_scopes[idx].insert(name, binding)
+  end
+end
+
+def lookup_local(ctx: &ResolutionContext, name: &String) -> Option[LocalBinding]
+  mut i = ctx.local_scopes.len()
+  while i > 0 do
+    i = i - 1
+    match ctx.local_scopes[i].get(name)
+    when Option::Some(binding) then return Option::Some(binding.clone())
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+def get_current_module_ref(symbols: &SymbolTable) -> &ModuleSymbols
+  mut module = &symbols.root
+  for seg in symbols.current_module do
+    module = module.submodules.get(&seg).expect("module not found")
+  end
+  module
+end
+
+# ———————————————————————————————————————————————————————————————
+# Error Reporting
+# ———————————————————————————————————————————————————————————————
+
+def add_error(symbols: &mut SymbolTable, kind: ResolutionErrorKind, 
+              message: String, span: Span) -> Unit
+  symbols.errors.push(ResolutionError {
+    message: message,
+    span: span,
+    kind: kind
+  })
+end

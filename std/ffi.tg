@@ -1,0 +1,641 @@
+# Tangerine Standard Library — std::ffi
+# Foreign Function Interface for C interop, Ruby interop, and cross-language bridging.
+#
+# Tangerine uses `extern` blocks to declare foreign functions:
+#
+#   extern "C" do
+#     def malloc(size: UInt) -> Ptr[u8]
+#     def free(ptr: Ptr[u8]) -> Unit
+#   end
+#
+#   extern "Ruby" do
+#     def rb_funcall(recv: RubyValue, mid: RubyID, argc: Int, ...) -> RubyValue
+#   end
+#
+# This module provides:
+# 1. Primitive FFI types (Ptr, CStr, CString, Opaque)
+# 2. Ruby C API bindings (VALUE, ID, rb_* functions)
+# 3. Type marshaling between Tangerine and C/Ruby
+# 4. Safe wrappers around unsafe FFI calls
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map}
+
+# ———————————————————————————————————————————————————————————————
+# Primitive FFI types
+# ———————————————————————————————————————————————————————————————
+
+# Raw pointer type — opaque, unsafe to dereference without checks
+struct Ptr[T]
+  address: UInt
+end
+
+# Null pointer constant
+def null_ptr[T]() -> Ptr[T]
+  Ptr { address: 0 }
+end
+
+def is_null[T](p: &Ptr[T]) -> Bool
+  p.address == 0
+end
+
+# Opaque type for foreign handles
+struct Opaque
+  _private: UInt
+end
+
+# C-compatible string (borrowed, NUL-terminated)
+struct CStr
+  ptr: Ptr[u8]
+  len: Int
+end
+
+# Owned C-compatible string with NUL terminator
+struct CString
+  data: Vec[u8]
+end
+
+def cstring_new(s: String) -> CString
+  mut data = Vec::new()
+  for b in s.bytes() do
+    data.push(b)
+  end
+  data.push(0)  # NUL terminator
+  CString { data: data }
+end
+
+def cstring_as_ptr(cs: &CString) -> Ptr[u8]
+  # In codegen, this becomes a pointer to the Vec's heap buffer
+  Ptr { address: cs.data.as_ptr_address() }
+end
+
+def cstring_to_string(cs: &CString) -> String
+  # Strip the NUL terminator and return as String
+  let len = cs.data.len() - 1
+  String::from_bytes(cs.data.slice(0, len))
+end
+
+# ———————————————————————————————————————————————————————————————
+# C ABI type sizes and alignment
+# ———————————————————————————————————————————————————————————————
+
+enum CType
+  Void
+  Bool
+  Char
+  UChar
+  Short
+  UShort
+  Int
+  UInt
+  Long
+  ULong
+  LongLong
+  ULongLong
+  Float
+  Double
+  SizeT
+  PtrDiff
+  Pointer
+end
+
+def c_type_size(ty: CType) -> Int
+  match ty
+  when CType::Void      then 0
+  when CType::Bool      then 1
+  when CType::Char      then 1
+  when CType::UChar     then 1
+  when CType::Short     then 2
+  when CType::UShort    then 2
+  when CType::Int       then 4
+  when CType::UInt      then 4
+  when CType::Long      then 8   # 64-bit platforms
+  when CType::ULong     then 8
+  when CType::LongLong  then 8
+  when CType::ULongLong then 8
+  when CType::Float     then 4
+  when CType::Double    then 8
+  when CType::SizeT     then 8
+  when CType::PtrDiff   then 8
+  when CType::Pointer   then 8
+  end
+end
+
+def c_type_align(ty: CType) -> Int
+  c_type_size(ty)  # On LP64, align == size for primitive types
+end
+
+# ———————————————————————————————————————————————————————————————
+# Ruby C API types and constants
+# ———————————————————————————————————————————————————————————————
+
+# Ruby VALUE — an unsigned integer holding either an immediate value
+# or a pointer to a heap-allocated Ruby object.
+struct RubyValue
+  raw: UInt
+end
+
+# Ruby ID — interned symbol for method/variable names
+struct RubyID
+  raw: UInt
+end
+
+# Ruby type tags (T_* constants from ruby/ruby.h)
+def RUBY_T_NONE()    -> Int = 0x00
+def RUBY_T_OBJECT()  -> Int = 0x01
+def RUBY_T_CLASS()   -> Int = 0x02
+def RUBY_T_MODULE()  -> Int = 0x03
+def RUBY_T_FLOAT()   -> Int = 0x04
+def RUBY_T_STRING()  -> Int = 0x05
+def RUBY_T_REGEXP()  -> Int = 0x06
+def RUBY_T_ARRAY()   -> Int = 0x07
+def RUBY_T_HASH()    -> Int = 0x08
+def RUBY_T_STRUCT()  -> Int = 0x09
+def RUBY_T_BIGNUM()  -> Int = 0x0A
+def RUBY_T_FILE()    -> Int = 0x0B
+def RUBY_T_DATA()    -> Int = 0x0C
+def RUBY_T_MATCH()   -> Int = 0x0D
+def RUBY_T_SYMBOL()  -> Int = 0x0E
+def RUBY_T_FIXNUM()  -> Int = 0x15
+def RUBY_T_TRUE()    -> Int = 0x02  # immediate
+def RUBY_T_FALSE()   -> Int = 0x00  # immediate
+def RUBY_T_NIL()     -> Int = 0x11
+
+# Singleton VALUE constants
+def RUBY_Qnil()   -> RubyValue = RubyValue { raw: 0x08 }
+def RUBY_Qtrue()  -> RubyValue = RubyValue { raw: 0x14 }
+def RUBY_Qfalse() -> RubyValue = RubyValue { raw: 0x00 }
+
+# Check if a VALUE is nil
+def ruby_nil_p(v: RubyValue) -> Bool
+  v.raw == RUBY_Qnil().raw
+end
+
+# Check if a VALUE is a fixnum (tagged integer)
+def ruby_fixnum_p(v: RubyValue) -> Bool
+  (v.raw & 1) == 1
+end
+
+# Convert Int to Ruby fixnum VALUE (tagged pointer)
+def int_to_ruby_fixnum(n: Int) -> RubyValue
+  RubyValue { raw: ((n as UInt) << 1) | 1 }
+end
+
+# Convert Ruby fixnum VALUE to Int
+def ruby_fixnum_to_int(v: RubyValue) -> Int
+  (v.raw >> 1) as Int
+end
+
+# ———————————————————————————————————————————————————————————————
+# Ruby C API function declarations
+# ———————————————————————————————————————————————————————————————
+# These are declared as extern "C" — the linker resolves them against
+# libruby.dylib / libruby.so at link time.
+
+extern "C" do
+  # Initialization
+  def ruby_init() -> Unit
+  def ruby_init_loadpath() -> Unit
+  def ruby_finalize() -> Unit
+
+  # Module / class definition
+  def rb_define_module(name: Ptr[u8]) -> RubyValue
+  def rb_define_class(name: Ptr[u8], super_: RubyValue) -> RubyValue
+  def rb_define_class_under(outer: RubyValue, name: Ptr[u8], super_: RubyValue) -> RubyValue
+  def rb_define_module_under(outer: RubyValue, name: Ptr[u8]) -> RubyValue
+
+  # Method definition
+  def rb_define_method(klass: RubyValue, name: Ptr[u8], func: Ptr[u8], argc: Int) -> Unit
+  def rb_define_singleton_method(obj: RubyValue, name: Ptr[u8], func: Ptr[u8], argc: Int) -> Unit
+  def rb_define_module_function(mod_: RubyValue, name: Ptr[u8], func: Ptr[u8], argc: Int) -> Unit
+
+  # Method invocation
+  def rb_funcall(recv: RubyValue, mid: RubyID, argc: Int) -> RubyValue
+  def rb_funcall2(recv: RubyValue, mid: RubyID, argc: Int, argv: Ptr[RubyValue]) -> RubyValue
+
+  # Symbol / ID operations
+  def rb_intern(name: Ptr[u8]) -> RubyID
+  def rb_id2name(id: RubyID) -> Ptr[u8]
+  def rb_id2sym(id: RubyID) -> RubyValue
+  def rb_sym2id(sym: RubyValue) -> RubyID
+
+  # String operations
+  def rb_str_new(ptr: Ptr[u8], len: Int) -> RubyValue
+  def rb_str_new_cstr(cstr: Ptr[u8]) -> RubyValue
+  def rb_string_value_cstr(valp: Ptr[RubyValue]) -> Ptr[u8]
+  def rb_str_cat(str_: RubyValue, ptr: Ptr[u8], len: Int) -> RubyValue
+  def rb_str_to_str(val: RubyValue) -> RubyValue
+
+  # Array operations
+  def rb_ary_new() -> RubyValue
+  def rb_ary_new_capa(capa: Int) -> RubyValue
+  def rb_ary_push(ary: RubyValue, item: RubyValue) -> RubyValue
+  def rb_ary_pop(ary: RubyValue) -> RubyValue
+  def rb_ary_entry(ary: RubyValue, idx: Int) -> RubyValue
+  def rb_ary_store(ary: RubyValue, idx: Int, val: RubyValue) -> Unit
+  def rb_ary_len(ary: RubyValue) -> Int
+
+  # Hash operations
+  def rb_hash_new() -> RubyValue
+  def rb_hash_aset(hash: RubyValue, key: RubyValue, val: RubyValue) -> RubyValue
+  def rb_hash_aref(hash: RubyValue, key: RubyValue) -> RubyValue
+  def rb_hash_delete(hash: RubyValue, key: RubyValue) -> RubyValue
+
+  # Type conversion
+  def rb_num2int(val: RubyValue) -> Int
+  def rb_int2num(n: Int) -> RubyValue
+  def rb_num2dbl(val: RubyValue) -> Float
+  def rb_float_new(d: Float) -> RubyValue
+
+  # Object type checking
+  def rb_obj_is_kind_of(obj: RubyValue, klass: RubyValue) -> RubyValue
+  def rb_type(obj: RubyValue) -> Int
+  def rb_obj_classname(obj: RubyValue) -> Ptr[u8]
+
+  # Constants
+  def rb_cObject() -> RubyValue
+  def rb_cArray() -> RubyValue
+  def rb_cHash() -> RubyValue
+  def rb_cString() -> RubyValue
+  def rb_cInteger() -> RubyValue
+  def rb_cFloat() -> RubyValue
+  def rb_cNilClass() -> RubyValue
+  def rb_cTrueClass() -> RubyValue
+  def rb_cFalseClass() -> RubyValue
+  def rb_cSymbol() -> RubyValue
+  def rb_mKernel() -> RubyValue
+
+  # Exception handling
+  def rb_raise(exc: RubyValue, msg: Ptr[u8]) -> Unit
+  def rb_exc_new_str(exc_class: RubyValue, msg: RubyValue) -> RubyValue
+  def rb_eRuntimeError() -> RubyValue
+  def rb_eTypeError() -> RubyValue
+  def rb_eArgError() -> RubyValue
+  def rb_eStandardError() -> RubyValue
+
+  # Evaluation
+  def rb_eval_string(str_: Ptr[u8]) -> RubyValue
+  def rb_eval_string_protect(str_: Ptr[u8], state: Ptr[Int]) -> RubyValue
+
+  # Require / load
+  def rb_require(name: Ptr[u8]) -> RubyValue
+
+  # GC
+  def rb_gc_register_address(valp: Ptr[RubyValue]) -> Unit
+  def rb_gc_unregister_address(valp: Ptr[RubyValue]) -> Unit
+
+  # Global variables
+  def rb_gv_set(name: Ptr[u8], val: RubyValue) -> RubyValue
+  def rb_gv_get(name: Ptr[u8]) -> RubyValue
+end
+
+# ———————————————————————————————————————————————————————————————
+# Safe Tangerine ↔ Ruby value marshaling
+# ———————————————————————————————————————————————————————————————
+
+# Convert a Tangerine String to a Ruby String VALUE
+def tg_string_to_ruby(s: String) -> RubyValue
+  let cs = cstring_new(s)
+  rb_str_new_cstr(cstring_as_ptr(&cs))
+end
+
+# Convert a Ruby String VALUE to a Tangerine String
+def ruby_to_tg_string(v: RubyValue) -> Result[String, String]
+  let rtype = rb_type(v)
+  if rtype != RUBY_T_STRING() then
+    # Try to_s conversion
+    let to_s_id = rb_intern(cstring_as_ptr(&cstring_new("to_s")))
+    let sv = rb_funcall(v, to_s_id, 0)
+    return ruby_to_tg_string(sv)
+  end
+  let mut val_holder = v
+  let cptr = rb_string_value_cstr(Ptr { address: (&mut val_holder) as UInt })
+  if is_null(&Ptr[u8] { address: cptr.address }) then
+    Result::Err("Ruby string conversion returned null")
+  else
+    Result::Ok(String::from_c_str(cptr))
+  end
+end
+
+# Convert a Tangerine Int to Ruby Integer
+def tg_int_to_ruby(n: Int) -> RubyValue
+  rb_int2num(n)
+end
+
+# Convert a Ruby Integer to Tangerine Int
+def ruby_to_tg_int(v: RubyValue) -> Int
+  if ruby_fixnum_p(v) then
+    ruby_fixnum_to_int(v)
+  else
+    rb_num2int(v)
+  end
+end
+
+# Convert a Tangerine Float to Ruby Float
+def tg_float_to_ruby(f: Float) -> RubyValue
+  rb_float_new(f)
+end
+
+# Convert a Ruby Float to Tangerine Float
+def ruby_to_tg_float(v: RubyValue) -> Float
+  rb_num2dbl(v)
+end
+
+# Convert a Tangerine Bool to Ruby true/false
+def tg_bool_to_ruby(b: Bool) -> RubyValue
+  if b then RUBY_Qtrue() else RUBY_Qfalse() end
+end
+
+# Convert a Ruby Bool VALUE to Tangerine Bool
+def ruby_to_tg_bool(v: RubyValue) -> Bool
+  v.raw != RUBY_Qfalse().raw && v.raw != RUBY_Qnil().raw
+end
+
+# Convert Tangerine Unit to Ruby nil
+def tg_unit_to_ruby() -> RubyValue
+  RUBY_Qnil()
+end
+
+# Convert a Tangerine Option[T] style result (None ↔ nil)
+def tg_option_to_ruby[T](opt: Option[T], convert: fn(T) -> RubyValue) -> RubyValue
+  match opt
+  when Option::Some(val) then convert(val)
+  when Option::None then RUBY_Qnil()
+  end
+end
+
+# Convert a Tangerine Vec[T] to a Ruby Array
+def tg_vec_to_ruby[T](vec: &Vec[T], convert: fn(&T) -> RubyValue) -> RubyValue
+  let ary = rb_ary_new_capa(vec.len())
+  for item in vec do
+    rb_ary_push(ary, convert(&item))
+  end
+  ary
+end
+
+# Convert a Ruby Array to a Tangerine Vec[T]
+def ruby_to_tg_vec[T](ary: RubyValue, convert: fn(RubyValue) -> T) -> Vec[T]
+  mut result = Vec::new()
+  let len = rb_ary_len(ary)
+  mut i = 0
+  while i < len do
+    let elem = rb_ary_entry(ary, i)
+    result.push(convert(elem))
+    i = i + 1
+  end
+  result
+end
+
+# Convert a Tangerine Map[String, T] to a Ruby Hash
+def tg_map_to_ruby[T](map: &Map[String, T], convert: fn(&T) -> RubyValue) -> RubyValue
+  let hash = rb_hash_new()
+  for (k, v) in map do
+    let ruby_key = tg_string_to_ruby(k.clone())
+    let ruby_val = convert(&v)
+    rb_hash_aset(hash, ruby_key, ruby_val)
+  end
+  hash
+end
+
+# ———————————————————————————————————————————————————————————————
+# Ruby runtime lifecycle
+# ———————————————————————————————————————————————————————————————
+
+struct RubyRuntime
+  initialized: Bool
+end
+
+mut RUBY_RUNTIME: Option[RubyRuntime] = Option::None
+
+def ruby_start() -> Result[RubyRuntime, String]
+  match RUBY_RUNTIME
+  when Option::Some(_) then
+    return Result::Err("Ruby runtime already initialized")
+  when Option::None then ()
+  end
+  
+  ruby_init()
+  ruby_init_loadpath()
+  
+  let rt = RubyRuntime { initialized: true }
+  RUBY_RUNTIME = Option::Some(rt)
+  Result::Ok(rt)
+end
+
+def ruby_stop() -> Unit
+  match RUBY_RUNTIME
+  when Option::Some(_) then
+    ruby_finalize()
+    RUBY_RUNTIME = Option::None
+  when Option::None then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Safe Ruby method calls
+# ———————————————————————————————————————————————————————————————
+
+# Call a Ruby method by name on a receiver, with no arguments
+def ruby_call(recv: RubyValue, method: String) -> RubyValue
+  let mid = rb_intern(cstring_as_ptr(&cstring_new(method)))
+  rb_funcall(recv, mid, 0)
+end
+
+# Call a Ruby method with one argument
+def ruby_call1(recv: RubyValue, method: String, arg1: RubyValue) -> RubyValue
+  let mid = rb_intern(cstring_as_ptr(&cstring_new(method)))
+  let mut args = Vec::new()
+  args.push(arg1)
+  rb_funcall2(recv, mid, 1, Ptr { address: args.as_ptr_address() })
+end
+
+# Call a Ruby method with two arguments
+def ruby_call2(recv: RubyValue, method: String, arg1: RubyValue, arg2: RubyValue) -> RubyValue
+  let mid = rb_intern(cstring_as_ptr(&cstring_new(method)))
+  let mut args = Vec::new()
+  args.push(arg1)
+  args.push(arg2)
+  rb_funcall2(recv, mid, 2, Ptr { address: args.as_ptr_address() })
+end
+
+# Call a Ruby method with a variable number of arguments
+def ruby_call_args(recv: RubyValue, method: String, args: &Vec[RubyValue]) -> RubyValue
+  let mid = rb_intern(cstring_as_ptr(&cstring_new(method)))
+  rb_funcall2(recv, mid, args.len(), Ptr { address: args.as_ptr_address() })
+end
+
+# Evaluate a string of Ruby code
+def ruby_eval(code: String) -> Result[RubyValue, String]
+  let cs = cstring_new(code)
+  mut state: Int = 0
+  let result = rb_eval_string_protect(cstring_as_ptr(&cs), Ptr { address: (&mut state) as UInt })
+  if state != 0 then
+    # Exception occurred
+    let exc = ruby_call(result, "message")
+    match ruby_to_tg_string(exc)
+    when Result::Ok(msg) then Result::Err("Ruby exception: " + msg)
+    when Result::Err(_) then Result::Err("Ruby exception (could not read message)")
+    end
+  else
+    Result::Ok(result)
+  end
+end
+
+# Require a Ruby file/gem
+def ruby_require(name: String) -> Result[Unit, String]
+  let cs = cstring_new(name)
+  let mut state: Int = 0
+  rb_eval_string_protect(
+    cstring_as_ptr(&cstring_new("require '" + name + "'")),
+    Ptr { address: (&mut state) as UInt }
+  )
+  if state != 0 then
+    Result::Err("Failed to require: " + name)
+  else
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Expose Tangerine functions to Ruby
+# ———————————————————————————————————————————————————————————————
+
+# Register a Tangerine module in Ruby
+def ruby_define_module(name: String) -> RubyValue
+  rb_define_module(cstring_as_ptr(&cstring_new(name)))
+end
+
+# Register a Tangerine class in Ruby
+def ruby_define_class(name: String, parent: RubyValue) -> RubyValue
+  rb_define_class(cstring_as_ptr(&cstring_new(name)), parent)
+end
+
+# Register a Tangerine function as a Ruby method on a class/module
+# `func_ptr` is a pointer to a C-ABI compatible function:
+#   RubyValue func(RubyValue self, RubyValue arg1, ...)  for argc >= 0
+#   RubyValue func(int argc, RubyValue *argv, RubyValue self)  for argc == -1
+def ruby_define_method(klass: RubyValue, name: String, func_ptr: Ptr[u8], argc: Int) -> Unit
+  rb_define_method(klass, cstring_as_ptr(&cstring_new(name)), func_ptr, argc)
+end
+
+def ruby_define_module_function(mod_: RubyValue, name: String, func_ptr: Ptr[u8], argc: Int) -> Unit
+  rb_define_module_function(mod_, cstring_as_ptr(&cstring_new(name)), func_ptr, argc)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Dynamic library loading (for runtime FFI)
+# ———————————————————————————————————————————————————————————————
+
+extern "C" do
+  def dlopen(path: Ptr[u8], flags: Int) -> Ptr[u8]
+  def dlsym(handle: Ptr[u8], symbol: Ptr[u8]) -> Ptr[u8]
+  def dlclose(handle: Ptr[u8]) -> Int
+  def dlerror() -> Ptr[u8]
+end
+
+def RTLD_LAZY()    -> Int = 1
+def RTLD_NOW()     -> Int = 2
+def RTLD_GLOBAL()  -> Int = 8
+
+struct DynLib
+  handle: Ptr[u8]
+  path: String
+end
+
+# Load a shared library (.dylib / .so / .dll)
+def dynlib_open(path: String) -> Result[DynLib, String]
+  let cs = cstring_new(path)
+  let handle = dlopen(cstring_as_ptr(&cs), RTLD_LAZY())
+  if is_null(&handle) then
+    let err = dlerror()
+    if is_null(&Ptr[u8] { address: err.address }) then
+      Result::Err("Failed to load library: " + path)
+    else
+      Result::Err("Failed to load library: " + String::from_c_str(err))
+    end
+  else
+    Result::Ok(DynLib { handle: handle, path: path })
+  end
+end
+
+# Look up a symbol in a loaded library
+def dynlib_sym(lib: &DynLib, name: String) -> Result[Ptr[u8], String]
+  let cs = cstring_new(name)
+  let sym = dlsym(lib.handle, cstring_as_ptr(&cs))
+  if is_null(&sym) then
+    Result::Err("Symbol not found: " + name)
+  else
+    Result::Ok(sym)
+  end
+end
+
+# Close a loaded library
+def dynlib_close(lib: DynLib) -> Unit
+  dlclose(lib.handle)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Callback wrapping for passing Tangerine closures to C/Ruby
+# ———————————————————————————————————————————————————————————————
+
+# FfiCallback wraps a Tangerine closure as a C function pointer.
+# The compiler generates a trampoline that restores the closure
+# environment before invoking the body.
+struct FfiCallback
+  fn_ptr: Ptr[u8]       # C-callable function pointer (generated trampoline)
+  closure_env: Ptr[u8]  # Pointer to captured environment
+  _prevent_gc: Bool     # Prevent GC from collecting the environment
+end
+
+# Create a callback wrapping a Tangerine closure.
+# The closure must have C-compatible parameter and return types.
+# `arity` is the number of parameters.
+# The compiler will generate the appropriate trampoline at codegen time.
+def make_ffi_callback(closure_fn: Ptr[u8], closure_env: Ptr[u8], arity: Int) -> FfiCallback
+  # The actual trampoline generation happens in codegen.
+  # This function records the closure info so the linker can wire it up.
+  FfiCallback {
+    fn_ptr: closure_fn,
+    closure_env: closure_env,
+    _prevent_gc: true
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Convenience: Ruby gem interop
+# ———————————————————————————————————————————————————————————————
+
+# Load a Ruby gem and return a handle to its main module
+def ruby_gem_load(gem_name: String) -> Result[RubyValue, String]
+  match ruby_require(gem_name) 
+  when Result::Ok(_) then
+    # Try to find the module with the capitalized gem name
+    let module_name = gem_name_to_module(gem_name)
+    let cs = cstring_new(module_name)
+    let result = rb_eval_string_protect(
+      cstring_as_ptr(&cstring_new(module_name)),
+      Ptr { address: null_ptr[Int]().address }
+    )
+    Result::Ok(result)
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+# Convert gem name to Ruby module name (e.g., "active_support" → "ActiveSupport")
+def gem_name_to_module(name: String) -> String
+  mut result = ""
+  mut capitalize_next = true
+  for ch in name.chars() do
+    if ch == '_' || ch == '-' then
+      capitalize_next = true
+    else
+      if capitalize_next then
+        result = result + ch.to_uppercase().to_string()
+        capitalize_next = false
+      else
+        result = result + ch.to_string()
+      end
+    end
+  end
+  result
+end

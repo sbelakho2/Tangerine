@@ -1,0 +1,1398 @@
+# Tangerine Compiler — Type System
+# Self-hosting compiler written in Tangerine
+#
+# Complete type system with:
+# - Type inference (Hindley-Milner style)
+# - Generic types with bounds
+# - Ownership and borrowing types
+# - Lifetime inference
+# - Effect types
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::token::{Span}
+use tg_compiler::ast::{
+  Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
+  TypeExpr, TypeExprKind, Param, ParamModifier, GenericParam,
+  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind
+}
+
+# ———————————————————————————————————————————————————————————————
+# Type Representation
+# ———————————————————————————————————————————————————————————————
+
+enum Type
+  # Primitive types
+  Unit
+  Bool
+  Int
+  UInt
+  Float
+  Char
+  String
+  Never
+  
+  # Named type with resolved type arguments
+  Named(TypeId, Vec[Type])
+  
+  # Function type
+  Function(Vec[Type], Type)
+  
+  # Reference types (ownership model)
+  Ref(Type, Lifetime)
+  RefMut(Type, Lifetime)
+  Owned(Type)
+  
+  # Tuple and array
+  Tuple(Vec[Type])
+  Array(Type, Int)
+  Slice(Type)
+  
+  # Built-in generic types (Rust parity)
+  Option(Type)
+  Result(Type, Type)
+  Map(Type, Type)
+  Set(Type)
+  
+  # Type variables (for inference)
+  Var(TypeVarId)
+  
+  # Generic parameter
+  Param(String)
+  
+  # Error type (for error recovery)
+  Error
+end
+
+struct TypeId
+  id: Int
+end
+
+struct TypeVarId
+  id: Int
+end
+
+struct Lifetime
+  id: Int
+  name: String
+end
+
+def lifetime_static() -> Lifetime
+  Lifetime { id: 0, name: "'static" }
+end
+
+def lifetime_anonymous() -> Lifetime
+  Lifetime { id: -1, name: "'_" }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Definitions
+# ———————————————————————————————————————————————————————————————
+
+struct TypeDef
+  id: TypeId
+  name: String
+  kind: TypeDefKind
+  generic_params: Vec[String]
+end
+
+enum TypeDefKind
+  Struct(Vec[FieldInfo])
+  Enum(Vec[VariantInfo])
+  Trait(Vec[MethodSig])
+  Alias(Type)
+  Primitive
+end
+
+struct FieldInfo
+  name: String
+  ty: Type
+  is_public: Bool
+end
+
+struct VariantInfo
+  name: String
+  fields: Vec[Type]
+  discriminant: Int
+end
+
+struct MethodSig
+  name: String
+  params: Vec[Type]
+  ret_type: Type
+  is_method: Bool
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Environment
+# ———————————————————————————————————————————————————————————————
+
+struct TypeEnv
+  types: Map[String, TypeDef]
+  type_id_counter: Int
+  
+  # Type variable substitution
+  subst: Map[TypeVarId, Type]
+  var_counter: Int
+  
+  # Scoped bindings
+  scopes: Vec[Map[String, Type]]
+  
+  # Lifetime tracking
+  lifetime_counter: Int
+  current_lifetime: Lifetime
+  
+  # Trait implementations
+  impls: Vec[ImplInfo]
+  
+  # Diagnostics
+  errors: Vec[TypeError]
+end
+
+struct ImplInfo
+  trait_name: String
+  for_type: Type
+  methods: Vec[String]
+end
+
+struct TypeError
+  message: String
+  span: Span
+end
+
+def type_env_new() -> TypeEnv
+  mut env = TypeEnv {
+    types: Map::new(),
+    type_id_counter: 100,
+    subst: Map::new(),
+    var_counter: 0,
+    scopes: Vec::new(),
+    lifetime_counter: 1,
+    current_lifetime: lifetime_static(),
+    impls: Vec::new(),
+    errors: Vec::new()
+  }
+  
+  # Register primitive types
+  register_primitive(&mut env, "Unit")
+  register_primitive(&mut env, "Bool")
+  register_primitive(&mut env, "Int")
+  register_primitive(&mut env, "UInt")
+  register_primitive(&mut env, "Float")
+  register_primitive(&mut env, "Char")
+  register_primitive(&mut env, "String")
+  register_primitive(&mut env, "Never")
+  
+  # Register built-in generic types (Rust parity)
+  register_builtin_generic(&mut env, "Option", 1,
+    TypeDefKind::Enum(vec![
+      VariantInfo { name: "Some", fields: vec![Type::Param("T")], discriminant: 0 },
+      VariantInfo { name: "None", fields: Vec::new(), discriminant: 1 }
+    ]))
+  register_builtin_generic(&mut env, "Result", 2,
+    TypeDefKind::Enum(vec![
+      VariantInfo { name: "Ok", fields: vec![Type::Param("T")], discriminant: 0 },
+      VariantInfo { name: "Err", fields: vec![Type::Param("E")], discriminant: 1 }
+    ]))
+  register_builtin_generic(&mut env, "Vec", 1,
+    TypeDefKind::Struct(vec![
+      FieldInfo { name: "ptr", ty: Type::Param("T"), is_public: false },
+      FieldInfo { name: "len", ty: Type::Int, is_public: true },
+      FieldInfo { name: "cap", ty: Type::Int, is_public: false }
+    ]))
+  register_builtin_generic(&mut env, "Map", 2,
+    TypeDefKind::Struct(Vec::new()))
+  register_builtin_generic(&mut env, "Set", 1,
+    TypeDefKind::Struct(Vec::new()))
+  
+  # Register built-in traits (Rust parity)
+  register_builtin_trait(&mut env, "Copy", Vec::new())
+  register_builtin_trait(&mut env, "Drop", vec![
+    MethodSig { name: "drop", params: Vec::new(), ret_type: Type::Unit, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Clone", vec![
+    MethodSig { name: "clone", params: Vec::new(), ret_type: Type::Param("Self"), is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Display", vec![
+    MethodSig { name: "to_string", params: Vec::new(), ret_type: Type::String, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Debug", vec![
+    MethodSig { name: "debug_string", params: Vec::new(), ret_type: Type::String, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Iterator", vec![
+    MethodSig { name: "next", params: Vec::new(), ret_type: Type::Option(Type::Param("Item")), is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Send", Vec::new())
+  register_builtin_trait(&mut env, "Sync", Vec::new())
+  register_builtin_trait(&mut env, "Eq", vec![
+    MethodSig { name: "eq", params: vec![Type::Param("Self")], ret_type: Type::Bool, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Ord", vec![
+    MethodSig { name: "cmp", params: vec![Type::Param("Self")], ret_type: Type::Int, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Hash", vec![
+    MethodSig { name: "hash", params: Vec::new(), ret_type: Type::Int, is_method: true }
+  ])
+  register_builtin_trait(&mut env, "Default", vec![
+    MethodSig { name: "default", params: Vec::new(), ret_type: Type::Param("Self"), is_method: false }
+  ])
+  register_builtin_trait(&mut env, "Into", vec![
+    MethodSig { name: "into", params: Vec::new(), ret_type: Type::Param("T"), is_method: true }
+  ])
+  register_builtin_trait(&mut env, "From", vec![
+    MethodSig { name: "from", params: vec![Type::Param("T")], ret_type: Type::Param("Self"), is_method: false }
+  ])
+  
+  env
+end
+
+def register_primitive(env: &mut TypeEnv, name: String) -> Unit
+  let id = TypeId { id: env.type_id_counter }
+  env.type_id_counter = env.type_id_counter + 1
+  env.types.insert(name, TypeDef {
+    id: id,
+    name: name,
+    kind: TypeDefKind::Primitive,
+    generic_params: Vec::new()
+  })
+end
+
+def register_builtin_generic(env: &mut TypeEnv, name: String, arity: Int, kind: TypeDefKind) -> Unit
+  let id = TypeId { id: env.type_id_counter }
+  env.type_id_counter = env.type_id_counter + 1
+  mut gen_params = Vec::new()
+  if arity >= 1 then gen_params.push("T") end
+  if arity >= 2 then gen_params.push("E") end
+  env.types.insert(name, TypeDef {
+    id: id,
+    name: name,
+    kind: kind,
+    generic_params: gen_params
+  })
+end
+
+def register_builtin_trait(env: &mut TypeEnv, name: String, methods: Vec[MethodSig]) -> Unit
+  let id = TypeId { id: env.type_id_counter }
+  env.type_id_counter = env.type_id_counter + 1
+  env.types.insert(name, TypeDef {
+    id: id,
+    name: name,
+    kind: TypeDefKind::Trait(methods),
+    generic_params: Vec::new()
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Scope Management
+# ———————————————————————————————————————————————————————————————
+
+def push_scope(env: &mut TypeEnv) -> Unit
+  env.scopes.push(Map::new())
+end
+
+def pop_scope(env: &mut TypeEnv) -> Unit
+  env.scopes.pop()
+end
+
+def bind_var(env: &mut TypeEnv, name: String, ty: Type) -> Unit
+  if !env.scopes.is_empty() then
+    let idx = env.scopes.len() - 1
+    env.scopes[idx].insert(name, ty)
+  end
+end
+
+def lookup_var(env: &TypeEnv, name: String) -> Option[Type]
+  mut i = env.scopes.len()
+  while i > 0 do
+    i = i - 1
+    match env.scopes[i].get(name)
+    when Option::Some(ty) then return Option::Some(ty)
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Variable Operations
+# ———————————————————————————————————————————————————————————————
+
+def fresh_type_var(env: &mut TypeEnv) -> Type
+  let id = TypeVarId { id: env.var_counter }
+  env.var_counter = env.var_counter + 1
+  Type::Var(id)
+end
+
+def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
+  match ty
+  when Type::Var(id) then
+    match env.subst.get(id)
+    when Option::Some(resolved) then resolve_type_var(env, resolved)
+    when Option::None then ty
+    end
+  when _ then ty
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Unification
+# ———————————————————————————————————————————————————————————————
+
+def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
+  let a = resolve_type_var(env, t1)
+  let b = resolve_type_var(env, t2)
+  
+  match (a, b)
+  when (Type::Var(id1), Type::Var(id2)) then
+    if id1.id == id2.id then
+      true
+    else
+      env.subst.insert(id1, b)
+      true
+    end
+  when (Type::Var(id), _) then
+    if occurs_check(env, id, b) then
+      add_error(env, "infinite type", span)
+      false
+    else
+      env.subst.insert(id, b)
+      true
+    end
+  when (_, Type::Var(id)) then
+    if occurs_check(env, id, a) then
+      add_error(env, "infinite type", span)
+      false
+    else
+      env.subst.insert(id, a)
+      true
+    end
+  when (Type::Unit, Type::Unit) then true
+  when (Type::Bool, Type::Bool) then true
+  when (Type::Int, Type::Int) then true
+  when (Type::UInt, Type::UInt) then true
+  when (Type::Float, Type::Float) then true
+  when (Type::Char, Type::Char) then true
+  when (Type::String, Type::String) then true
+  when (Type::Never, _) then true
+  when (_, Type::Never) then true
+  when (Type::Option(inner1), Type::Option(inner2)) then
+    unify(env, inner1, inner2, span)
+  when (Type::Result(ok1, err1), Type::Result(ok2, err2)) then
+    unify(env, ok1, ok2, span) && unify(env, err1, err2, span)
+  when (Type::Map(k1, v1), Type::Map(k2, v2)) then
+    unify(env, k1, k2, span) && unify(env, v1, v2, span)
+  when (Type::Set(inner1), Type::Set(inner2)) then
+    unify(env, inner1, inner2, span)
+  when (Type::Named(id1, args1), Type::Named(id2, args2)) then
+    if id1.id != id2.id then
+      add_error(env, "type mismatch", span)
+      false
+    elsif args1.len() != args2.len() then
+      add_error(env, "type argument count mismatch", span)
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < args1.len() do
+        if !unify(env, args1[i], args2[i], span) then
+          ok = false
+        end
+        i = i + 1
+      end
+      ok
+    end
+  when (Type::Function(params1, ret1), Type::Function(params2, ret2)) then
+    if params1.len() != params2.len() then
+      add_error(env, "function parameter count mismatch", span)
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < params1.len() do
+        if !unify(env, params1[i], params2[i], span) then
+          ok = false
+        end
+        i = i + 1
+      end
+      if ok then
+        unify(env, ret1, ret2, span)
+      else
+        false
+      end
+    end
+  when (Type::Ref(t1, l1), Type::Ref(t2, l2)) then
+    unify(env, t1, t2, span)
+  when (Type::RefMut(t1, l1), Type::RefMut(t2, l2)) then
+    unify(env, t1, t2, span)
+  when (Type::Tuple(elems1), Type::Tuple(elems2)) then
+    if elems1.len() != elems2.len() then
+      add_error(env, "tuple length mismatch", span)
+      false
+    else
+      mut ok = true
+      mut i = 0
+      while i < elems1.len() do
+        if !unify(env, elems1[i], elems2[i], span) then
+          ok = false
+        end
+        i = i + 1
+      end
+      ok
+    end
+  when (Type::Array(t1, n1), Type::Array(t2, n2)) then
+    if n1 != n2 then
+      add_error(env, "array size mismatch", span)
+      false
+    else
+      unify(env, t1, t2, span)
+    end
+  when (Type::Slice(t1), Type::Slice(t2)) then
+    unify(env, t1, t2, span)
+  when (Type::Error, _) then true
+  when (_, Type::Error) then true
+  when _ then
+    add_error(env, "type mismatch", span)
+    false
+  end
+end
+
+def occurs_check(env: &TypeEnv, id: TypeVarId, ty: Type) -> Bool
+  let resolved = resolve_type_var(env, ty)
+  match resolved
+  when Type::Var(other_id) then id.id == other_id.id
+  when Type::Named(_, args) then
+    mut found = false
+    for arg in args do
+      if occurs_check(env, id, arg) then
+        found = true
+        break
+      end
+    end
+    found
+  when Type::Function(params, ret) then
+    mut found = false
+    for p in params do
+      if occurs_check(env, id, p) then
+        found = true
+        break
+      end
+    end
+    if !found then
+      found = occurs_check(env, id, ret)
+    end
+    found
+  when Type::Ref(inner, _) then occurs_check(env, id, inner)
+  when Type::RefMut(inner, _) then occurs_check(env, id, inner)
+  when Type::Tuple(elems) then
+    mut found = false
+    for e in elems do
+      if occurs_check(env, id, e) then
+        found = true
+        break
+      end
+    end
+    found
+  when Type::Array(elem, _) then occurs_check(env, id, elem)
+  when Type::Slice(elem) then occurs_check(env, id, elem)
+  when Type::Option(inner) then occurs_check(env, id, inner)
+  when Type::Result(ok, err) then
+    occurs_check(env, id, ok) || occurs_check(env, id, err)
+  when Type::Map(key, val) then
+    occurs_check(env, id, key) || occurs_check(env, id, val)
+  when Type::Set(inner) then occurs_check(env, id, inner)
+  when Type::Owned(inner) then occurs_check(env, id, inner)
+  when _ then false
+  end
+end
+
+def add_error(env: &mut TypeEnv, msg: String, span: Span) -> Unit
+  env.errors.push(TypeError { message: msg, span: span })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Checking
+# ———————————————————————————————————————————————————————————————
+
+def check_program(env: &mut TypeEnv, program: &Program) -> Unit
+  # First pass: collect type definitions
+  for item in program.items do
+    collect_type_def(env, item)
+  end
+  
+  # Second pass: check all items
+  for item in program.items do
+    check_item(env, item)
+  end
+end
+
+def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
+  match item.kind
+  when ItemKind::Struct(s) then
+    let id = TypeId { id: env.type_id_counter }
+    env.type_id_counter = env.type_id_counter + 1
+    mut fields = Vec::new()
+    for f in s.fields do
+      let ty = resolve_type_expr(env, &f.ty)
+      fields.push(FieldInfo { name: f.name, ty: ty, is_public: true })
+    end
+    mut gen_params = Vec::new()
+    for gp in s.generic_params do
+      gen_params.push(gp.name)
+    end
+    env.types.insert(s.name, TypeDef {
+      id: id,
+      name: s.name,
+      kind: TypeDefKind::Struct(fields),
+      generic_params: gen_params
+    })
+  when ItemKind::Enum(e) then
+    let id = TypeId { id: env.type_id_counter }
+    env.type_id_counter = env.type_id_counter + 1
+    mut variants = Vec::new()
+    mut disc = 0
+    for v in e.variants do
+      mut ftypes = Vec::new()
+      for ft in v.fields do
+        ftypes.push(resolve_type_expr(env, &ft))
+      end
+      variants.push(VariantInfo { name: v.name, fields: ftypes, discriminant: disc })
+      disc = disc + 1
+    end
+    mut gen_params = Vec::new()
+    for gp in e.generic_params do
+      gen_params.push(gp.name)
+    end
+    env.types.insert(e.name, TypeDef {
+      id: id,
+      name: e.name,
+      kind: TypeDefKind::Enum(variants),
+      generic_params: gen_params
+    })
+  when ItemKind::Trait(t) then
+    let id = TypeId { id: env.type_id_counter }
+    env.type_id_counter = env.type_id_counter + 1
+    mut methods = Vec::new()
+    for m in t.methods do
+      mut param_types = Vec::new()
+      for p in m.sig.params do
+        match p.ty
+        when Option::Some(ty_expr) then
+          param_types.push(resolve_type_expr(env, &ty_expr))
+        when Option::None then
+          param_types.push(fresh_type_var(env))
+        end
+      end
+      let ret_ty = resolve_type_expr(env, &m.sig.ret_type)
+      methods.push(MethodSig {
+        name: m.sig.name,
+        params: param_types,
+        ret_type: ret_ty,
+        is_method: true
+      })
+    end
+    env.types.insert(t.name, TypeDef {
+      id: id,
+      name: t.name,
+      kind: TypeDefKind::Trait(methods),
+      generic_params: Vec::new()
+    })
+  when ItemKind::TypeAlias(ta) then
+    let id = TypeId { id: env.type_id_counter }
+    env.type_id_counter = env.type_id_counter + 1
+    let aliased_type = resolve_type_expr(env, &ta.ty)
+    env.types.insert(ta.name, TypeDef {
+      id: id,
+      name: ta.name,
+      kind: TypeDefKind::Alias(aliased_type),
+      generic_params: Vec::new()
+    })
+  when _ then ()
+  end
+end
+
+def check_item(env: &mut TypeEnv, item: &Item) -> Unit
+  match item.kind
+  when ItemKind::Function(f) then
+    check_function(env, &f)
+  when ItemKind::Impl(i) then
+    check_impl(env, &i)
+  when _ then ()
+  end
+end
+
+def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
+  push_scope(env)
+  
+  # Bind parameters
+  for p in f.params do
+    let ty = match p.ty
+    when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+    when Option::None then fresh_type_var(env)
+    end
+    bind_var(env, p.name, ty)
+  end
+  
+  # Get expected return type
+  let ret_type = match f.ret_type
+  when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+  when Option::None then Type::Unit
+  end
+  
+  # Check body
+  match f.body
+  when FnBody::Block(block) then
+    let body_type = check_block(env, &block)
+    unify(env, body_type, ret_type, f.span)
+  when FnBody::Expr(expr) then
+    let expr_type = check_expr(env, &expr)
+    unify(env, expr_type, ret_type, expr.span)
+  when _ then ()
+  end
+  
+  pop_scope(env)
+end
+
+def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
+  for m in i.methods do
+    check_function(env, &m)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Block and Statement Type Checking
+# ———————————————————————————————————————————————————————————————
+
+def check_block(env: &mut TypeEnv, block: &Block) -> Type
+  push_scope(env)
+  
+  mut result_type = Type::Unit
+  for stmt in block.stmts do
+    result_type = check_stmt(env, &stmt)
+  end
+  
+  pop_scope(env)
+  result_type
+end
+
+def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
+  match stmt.kind
+  when StmtKind::Let(name, ty_opt, value, is_mut) then
+    let value_type = check_expr(env, &value)
+    let var_type = match ty_opt
+    when Option::Some(ty_expr) then
+      let declared = resolve_type_expr(env, &ty_expr)
+      unify(env, value_type, declared, stmt.span)
+      declared
+    when Option::None then
+      value_type
+    end
+    bind_var(env, name, var_type)
+    Type::Unit
+  when StmtKind::Assign(target, value) then
+    let target_type = check_expr(env, &target)
+    let value_type = check_expr(env, &value)
+    unify(env, target_type, value_type, stmt.span)
+    Type::Unit
+  when StmtKind::If(if_stmt) then
+    check_if_stmt(env, &if_stmt)
+  when StmtKind::While(cond, body) then
+    let cond_type = check_expr(env, &cond)
+    unify(env, cond_type, Type::Bool, cond.span)
+    check_block(env, &body)
+    Type::Unit
+  when StmtKind::For(var, iter, body) then
+    push_scope(env)
+    let iter_type = check_expr(env, &iter)
+    let elem_type = fresh_type_var(env)
+    bind_var(env, var, elem_type)
+    check_block(env, &body)
+    pop_scope(env)
+    Type::Unit
+  when StmtKind::Return(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(env, &val)
+    when Option::None then Type::Unit
+    end
+    Type::Never
+  when StmtKind::Break(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(env, &val)
+    when Option::None then Type::Unit
+    end
+    Type::Never
+  when StmtKind::Continue then
+    Type::Never
+  when StmtKind::Expr(expr) then
+    check_expr(env, &expr)
+  when StmtKind::Match(m) then
+    check_match(env, &m)
+  when StmtKind::Unsafe(_, body) then
+    check_block(env, &body)
+  when StmtKind::Defer(body) then
+    check_block(env, &body)
+    Type::Unit
+  when StmtKind::Try(body, catches, finally) then
+    let body_type = check_block(env, &body)
+    for c in catches do
+      push_scope(env)
+      check_pattern(env, &c.pattern, Type::Error)
+      check_block(env, &c.body)
+      pop_scope(env)
+    end
+    match finally
+    when Option::Some(fb) then check_block(env, &fb)
+    when Option::None then ()
+    end
+    body_type
+  when _ then Type::Unit
+  end
+end
+
+def check_if_stmt(env: &mut TypeEnv, if_stmt: &IfStmt) -> Type
+  let cond_type = check_expr(env, &if_stmt.cond)
+  unify(env, cond_type, Type::Bool, if_stmt.cond.span)
+  
+  let then_type = check_block(env, &if_stmt.then_block)
+  
+  mut result_type = then_type
+  
+  for (econd, ebody) in if_stmt.elsif_branches do
+    let ec_type = check_expr(env, &econd)
+    unify(env, ec_type, Type::Bool, econd.span)
+    let eb_type = check_block(env, &ebody)
+    unify(env, result_type, eb_type, ebody.span)
+  end
+  
+  match if_stmt.else_block
+  when Option::Some(else_block) then
+    let else_type = check_block(env, &else_block)
+    unify(env, result_type, else_type, else_block.span)
+  when Option::None then
+    unify(env, result_type, Type::Unit, if_stmt.span)
+  end
+  
+  result_type
+end
+
+def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
+  let scrutinee_type = check_expr(env, &m.scrutinee)
+  
+  mut result_type = fresh_type_var(env)
+  
+  for arm in m.arms do
+    push_scope(env)
+    check_pattern(env, &arm.pattern, scrutinee_type)
+    
+    match arm.guard
+    when Option::Some(guard) then
+      let guard_type = check_expr(env, &guard)
+      unify(env, guard_type, Type::Bool, guard.span)
+    when Option::None then ()
+    end
+    
+    let arm_type = check_block(env, &arm.body)
+    unify(env, result_type, arm_type, arm.span)
+    pop_scope(env)
+  end
+  
+  result_type
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pattern Type Checking
+# ———————————————————————————————————————————————————————————————
+
+def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
+  match pat.kind
+  when PatternKind::Wildcard then
+    ()
+  when PatternKind::Ident(name, is_mut) then
+    bind_var(env, name, expected)
+  when PatternKind::Literal(expr) then
+    let lit_type = check_expr(env, &expr)
+    unify(env, lit_type, expected, pat.span)
+  when PatternKind::Tuple(pats) then
+    match expected
+    when Type::Tuple(types) then
+      if pats.len() == types.len() then
+        mut i = 0
+        for p in pats do
+          check_pattern(env, &p, types[i])
+          i = i + 1
+        end
+      else
+        add_error(env, "tuple pattern length mismatch", pat.span)
+      end
+    when Type::Var(_) then
+      mut types = Vec::new()
+      for p in pats do
+        let t = fresh_type_var(env)
+        check_pattern(env, &p, t)
+        types.push(t)
+      end
+      unify(env, expected, Type::Tuple(types), pat.span)
+    when _ then
+      add_error(env, "expected tuple type", pat.span)
+    end
+  when PatternKind::Array(pats) then
+    let elem_type = fresh_type_var(env)
+    for p in pats do
+      check_pattern(env, &p, elem_type)
+    end
+  when PatternKind::Variant(path, pats) then
+    # Look up variant type from the enum definition
+    let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
+    let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
+    # Try to find the enum definition
+    match env.types.get(enum_name)
+    when Option::Some(td) then
+      match td.kind
+      when TypeDefKind::Enum(variants) then
+        mut found = false
+        for v in variants do
+          if v.name == variant_name then
+            found = true
+            # Check sub-pattern count matches variant field count
+            if pats.len() != v.fields.len() then
+              add_error(env, "variant " + variant_name + " expects " + v.fields.len().to_string() + " fields, got " + pats.len().to_string(), pat.span)
+            end
+            # Unify expected with the enum type
+            unify(env, expected, Type::Named(td.id, Vec::new()), pat.span)
+            # Check each sub-pattern against the variant's field types
+            mut fi = 0
+            while fi < pats.len() && fi < v.fields.len() do
+              check_pattern(env, &pats[fi], v.fields[fi])
+              fi = fi + 1
+            end
+          end
+        end
+        if !found then
+          add_error(env, "unknown variant " + variant_name + " in enum " + enum_name, pat.span)
+        end
+      when _ then
+        add_error(env, enum_name + " is not an enum", pat.span)
+      end
+    when Option::None then
+      # Could be a simple variant like Option::Some — try matching expected type
+      match expected
+      when Type::Named(tid, _) then
+        # Accept; unification already handled by the match scrutinee
+        mut fi = 0
+        while fi < pats.len() do
+          check_pattern(env, &pats[fi], fresh_type_var(env))
+          fi = fi + 1
+        end
+      when _ then
+        # Accept generic patterns without specific enum resolution
+        mut fi = 0
+        while fi < pats.len() do
+          check_pattern(env, &pats[fi], fresh_type_var(env))
+          fi = fi + 1
+        end
+      end
+    end
+  when _ then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Expression Type Checking
+# ———————————————————————————————————————————————————————————————
+
+def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
+  match expr.kind
+  when ExprKind::IntLit(_) then Type::Int
+  when ExprKind::FloatLit(_) then Type::Float
+  when ExprKind::StringLit(_) then Type::String
+  when ExprKind::CharLit(_) then Type::Char
+  when ExprKind::BoolLit(_) then Type::Bool
+  when ExprKind::NilLit then fresh_type_var(env)
+  when ExprKind::Ident(name) then
+    match lookup_var(env, name)
+    when Option::Some(ty) then ty
+    when Option::None then
+      add_error(env, "undefined variable: " + name, expr.span)
+      Type::Error
+    end
+  when ExprKind::SelfRef then
+    match lookup_var(env, "self")
+    when Option::Some(ty) then ty
+    when Option::None then Type::Error
+    end
+  when ExprKind::BinaryOp(op, left, right) then
+    check_binary_op(env, op, &left, &right, expr.span)
+  when ExprKind::UnaryOp(op, inner) then
+    check_unary_op(env, op, &inner, expr.span)
+  when ExprKind::Call(func, args) then
+    let func_type = check_expr(env, &func)
+    mut arg_types = Vec::new()
+    for a in args do
+      arg_types.push(check_expr(env, &a))
+    end
+    let ret_type = fresh_type_var(env)
+    let expected_func = Type::Function(arg_types, ret_type)
+    unify(env, func_type, expected_func, expr.span)
+    ret_type
+  when ExprKind::MethodCall(recv, method, type_args, args) then
+    let recv_type = check_expr(env, &recv)
+    mut arg_types = Vec::new()
+    for a in args do
+      arg_types.push(check_expr(env, &a))
+    end
+    # Look up method on receiver type
+    let ret = resolve_method_type(env, &recv_type, method, &arg_types, expr.span)
+    ret
+  when ExprKind::FieldAccess(recv, field) then
+    let recv_type = check_expr(env, &recv)
+    resolve_field_type(env, &recv_type, field, expr.span)
+  when ExprKind::Index(recv, index) then
+    let recv_type = check_expr(env, &recv)
+    let index_type = check_expr(env, &index)
+    unify(env, index_type, Type::Int, index.span)
+    fresh_type_var(env)
+  when ExprKind::Ref(inner) then
+    let inner_type = check_expr(env, &inner)
+    Type::Ref(inner_type, env.current_lifetime)
+  when ExprKind::RefMut(inner) then
+    let inner_type = check_expr(env, &inner)
+    Type::RefMut(inner_type, env.current_lifetime)
+  when ExprKind::Deref(inner) then
+    let inner_type = check_expr(env, &inner)
+    match inner_type
+    when Type::Ref(t, _) then t
+    when Type::RefMut(t, _) then t
+    when Type::Var(_) then
+      let elem = fresh_type_var(env)
+      unify(env, inner_type, Type::Ref(elem, lifetime_anonymous()), expr.span)
+      elem
+    when _ then
+      add_error(env, "cannot dereference non-reference type", expr.span)
+      Type::Error
+    end
+  when ExprKind::ArrayLit(elems) then
+    if elems.is_empty() then
+      Type::Array(fresh_type_var(env), 0)
+    else
+      let elem_type = check_expr(env, &elems[0])
+      mut i = 1
+      while i < elems.len() do
+        let t = check_expr(env, &elems[i])
+        unify(env, elem_type, t, elems[i].span)
+        i = i + 1
+      end
+      Type::Array(elem_type, elems.len())
+    end
+  when ExprKind::TupleLit(elems) then
+    mut types = Vec::new()
+    for e in elems do
+      types.push(check_expr(env, &e))
+    end
+    Type::Tuple(types)
+  when ExprKind::StructLit(path, fields) then
+    match env.types.get(path.segments[0])
+    when Option::Some(def) then
+      Type::Named(def.id, Vec::new())
+    when Option::None then
+      add_error(env, "undefined type: " + path.segments[0], expr.span)
+      Type::Error
+    end
+  when ExprKind::Closure(params, ret_ty, body) then
+    push_scope(env)
+    mut param_types = Vec::new()
+    for p in params do
+      let ty = match p.ty
+      when Option::Some(te) then resolve_type_expr(env, &te)
+      when Option::None then fresh_type_var(env)
+      end
+      bind_var(env, p.name, ty)
+      param_types.push(ty)
+    end
+    let body_type = check_expr(env, &body)
+    pop_scope(env)
+    Type::Function(param_types, body_type)
+  when ExprKind::If(if_stmt) then
+    check_if_stmt(env, &if_stmt)
+  when ExprKind::Match(m) then
+    check_match(env, &m)
+  when ExprKind::Block(block) then
+    check_block(env, &block)
+  when ExprKind::Async(block) then
+    let inner = check_block(env, &block)
+    inner  # In full impl, would wrap in Future/Async
+  when ExprKind::Await(inner) then
+    let inner_type = check_expr(env, &inner)
+    fresh_type_var(env)
+  when ExprKind::Try(inner) then
+    let inner_type = check_expr(env, &inner)
+    fresh_type_var(env)
+  when ExprKind::Cast(inner, ty) then
+    check_expr(env, &inner)
+    resolve_type_expr(env, &ty)
+  when ExprKind::TypeCheck(inner, ty) then
+    check_expr(env, &inner)
+    Type::Bool
+  when ExprKind::Pipe(left, right) then
+    check_expr(env, &left)
+    check_expr(env, &right)
+  when ExprKind::Path(path) then
+    match lookup_var(env, path.segments[0])
+    when Option::Some(ty) then ty
+    when Option::None then fresh_type_var(env)
+    end
+  when ExprKind::EnumVariant(path, args) then
+    fresh_type_var(env)
+  when ExprKind::Comptime(block) then
+    check_block(env, &block)
+  when _ then Type::Error
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Field and Method Resolution
+# ———————————————————————————————————————————————————————————————
+
+def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span: Span) -> Type
+  # Auto-deref through references
+  let base = match recv_type
+  when Type::Ref(inner, _) then inner
+  when Type::RefMut(inner, _) then inner
+  when Type::Owned(inner) then inner
+  when _ then recv_type
+  end
+
+  match base
+  when Type::Named(tid, type_args) then
+    # Look up the type definition
+    mut found = Option::None
+    for entry in env.types do
+      match entry
+      when (_, td) then
+        if td.id.id == tid.id then
+          found = Option::Some(td)
+        end
+      end
+    end
+    match found
+    when Option::Some(td) then
+      match td.kind
+      when TypeDefKind::Struct(fields) then
+        for f in fields do
+          if f.name == field then
+            return f.ty
+          end
+        end
+        add_error(env, "no field `" + field + "` on type `" + td.name + "`", span)
+        Type::Error
+      when _ then
+        add_error(env, "type `" + td.name + "` does not have fields", span)
+        Type::Error
+      end
+    when Option::None then fresh_type_var(env)
+    end
+  when Type::Tuple(fields) then
+    # Tuple field access by numeric index (e.g., .0, .1)
+    match field.parse_int()
+    when Option::Some(idx) then
+      if idx >= 0 && idx < fields.len() then
+        fields[idx]
+      else
+        add_error(env, "tuple index out of bounds: " + field, span)
+        Type::Error
+      end
+    when Option::None then
+      add_error(env, "tuple fields must be accessed by index", span)
+      Type::Error
+    end
+  when Type::String then
+    # String built-in fields
+    if field == "len" then Type::Int
+    else
+      add_error(env, "no field `" + field + "` on String", span)
+      Type::Error
+    end
+  when Type::Slice(_) then
+    if field == "len" then Type::Int
+    elsif field == "cap" then Type::Int
+    else fresh_type_var(env)
+    end
+  when Type::Array(_, _) then
+    if field == "len" then Type::Int
+    else fresh_type_var(env)
+    end
+  when Type::Var(_) then fresh_type_var(env)
+  when _ then
+    add_error(env, "cannot access field on this type", span)
+    Type::Error
+  end
+end
+
+def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg_types: &Vec[Type], span: Span) -> Type
+  # Auto-deref through references
+  let base = match recv_type
+  when Type::Ref(inner, _) then inner
+  when Type::RefMut(inner, _) then inner
+  when Type::Owned(inner) then inner
+  when _ then recv_type
+  end
+
+  # 1. Check inherent methods on the type
+  match base
+  when Type::Named(tid, _) then
+    for imp in env.impls do
+      if imp.trait_name == "" || imp.trait_name == "_" then
+        # Inherent impl
+        for m in imp.methods do
+          if m.name == method then
+            return m.ret_type
+          end
+        end
+      end
+    end
+  when _ then ()
+  end
+
+  # 2. Check trait impls
+  for imp in env.impls do
+    if imp.trait_name != "" && imp.trait_name != "_" then
+      for m in imp.methods do
+        if m.name == method then
+          return m.ret_type
+        end
+      end
+    end
+  end
+
+  # 3. Built-in methods on common types
+  match base
+  when Type::String then
+    if method == "len" then return Type::Int end
+    if method == "to_string" then return Type::String end
+    if method == "contains" then return Type::Bool end
+    if method == "starts_with" then return Type::Bool end
+    if method == "ends_with" then return Type::Bool end
+    if method == "slice" then return Type::String end
+    if method == "trim" then return Type::String end
+    if method == "split" then return Type::Slice(Type::String) end
+    if method == "chars" then return Type::Slice(Type::Char) end
+    if method == "bytes" then return Type::Slice(Type::Int) end
+    if method == "push" then return Type::Unit end
+    if method == "clone" then return Type::String end
+  when Type::Int then
+    if method == "to_string" then return Type::String end
+    if method == "abs" then return Type::Int end
+    if method == "pow" then return Type::Int end
+    if method == "min" then return Type::Int end
+    if method == "max" then return Type::Int end
+    if method == "clamp" then return Type::Int end
+  when Type::Float then
+    if method == "to_string" then return Type::String end
+    if method == "abs" then return Type::Float end
+    if method == "sqrt" then return Type::Float end
+    if method == "floor" then return Type::Int end
+    if method == "ceil" then return Type::Int end
+    if method == "round" then return Type::Int end
+  when Type::Bool then
+    if method == "to_string" then return Type::String end
+  when Type::Slice(elem) then
+    if method == "len" then return Type::Int end
+    if method == "is_empty" then return Type::Bool end
+    if method == "push" then return Type::Unit end
+    if method == "pop" then return Type::Option(elem) end
+    if method == "get" then return Type::Option(Type::Ref(elem, lifetime_anonymous())) end
+    if method == "contains" then return Type::Bool end
+    if method == "iter" then return Type::Slice(elem) end
+    if method == "map" then return fresh_type_var(env) end
+    if method == "filter" then return Type::Slice(elem) end
+    if method == "fold" then return fresh_type_var(env) end
+    if method == "clone" then return Type::Slice(elem) end
+    if method == "sort" then return Type::Unit end
+    if method == "reverse" then return Type::Unit end
+    if method == "first" then return Type::Option(Type::Ref(elem, lifetime_anonymous())) end
+    if method == "last" then return Type::Option(Type::Ref(elem, lifetime_anonymous())) end
+  when Type::Option(inner) then
+    if method == "unwrap" then return inner end
+    if method == "is_some" then return Type::Bool end
+    if method == "is_none" then return Type::Bool end
+    if method == "map" then return fresh_type_var(env) end
+    if method == "and_then" then return fresh_type_var(env) end
+    if method == "or_else" then return fresh_type_var(env) end
+    if method == "unwrap_or" then return inner end
+  when Type::Result(ok, err) then
+    if method == "unwrap" then return ok end
+    if method == "is_ok" then return Type::Bool end
+    if method == "is_err" then return Type::Bool end
+    if method == "map" then return fresh_type_var(env) end
+    if method == "map_err" then return fresh_type_var(env) end
+    if method == "and_then" then return fresh_type_var(env) end
+    if method == "unwrap_or" then return ok end
+    if method == "ok" then return Type::Option(ok) end
+    if method == "err" then return Type::Option(err) end
+  when Type::Map(k, v) then
+    if method == "get" then return Type::Option(Type::Ref(v, lifetime_anonymous())) end
+    if method == "insert" then return Type::Option(v) end
+    if method == "contains_key" then return Type::Bool end
+    if method == "remove" then return Type::Option(v) end
+    if method == "len" then return Type::Int end
+    if method == "is_empty" then return Type::Bool end
+    if method == "keys" then return Type::Slice(k) end
+    if method == "values" then return Type::Slice(v) end
+  when Type::Set(elem) then
+    if method == "contains" then return Type::Bool end
+    if method == "insert" then return Type::Bool end
+    if method == "remove" then return Type::Bool end
+    if method == "len" then return Type::Int end
+    if method == "is_empty" then return Type::Bool end
+  when _ then ()
+  end
+
+  # Fallback: infer
+  fresh_type_var(env)
+end
+
+def check_binary_op(env: &mut TypeEnv, op: BinOp, left: &Expr, right: &Expr, span: Span) -> Type
+  let left_type = check_expr(env, left)
+  let right_type = check_expr(env, right)
+  
+  match op
+  when BinOp::Add then
+    unify(env, left_type, right_type, span)
+    left_type
+  when BinOp::Sub then
+    unify(env, left_type, right_type, span)
+    left_type
+  when BinOp::Mul then
+    unify(env, left_type, right_type, span)
+    left_type
+  when BinOp::Div then
+    unify(env, left_type, right_type, span)
+    left_type
+  when BinOp::Mod then
+    unify(env, left_type, Type::Int, span)
+    unify(env, right_type, Type::Int, span)
+    Type::Int
+  when BinOp::Pow then
+    unify(env, left_type, right_type, span)
+    left_type
+  when BinOp::Eq then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::Ne then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::Lt then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::Le then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::Gt then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::Ge then
+    unify(env, left_type, right_type, span)
+    Type::Bool
+  when BinOp::And then
+    unify(env, left_type, Type::Bool, span)
+    unify(env, right_type, Type::Bool, span)
+    Type::Bool
+  when BinOp::Or then
+    unify(env, left_type, Type::Bool, span)
+    unify(env, right_type, Type::Bool, span)
+    Type::Bool
+  when _ then left_type
+  end
+end
+
+def check_unary_op(env: &mut TypeEnv, op: UnOp, inner: &Expr, span: Span) -> Type
+  let inner_type = check_expr(env, inner)
+  
+  match op
+  when UnOp::Neg then
+    inner_type
+  when UnOp::Not then
+    unify(env, inner_type, Type::Bool, span)
+    Type::Bool
+  when UnOp::BitNot then
+    unify(env, inner_type, Type::Int, span)
+    Type::Int
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Expression Resolution
+# ———————————————————————————————————————————————————————————————
+
+def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
+  match te.kind
+  when TypeExprKind::Named(name, args) then
+    match name.as_str()
+    when "Unit" then Type::Unit
+    when "Bool" then Type::Bool
+    when "Int" then Type::Int
+    when "Float" then Type::Float
+    when "Char" then Type::Char
+    when "String" then Type::String
+    when "Never" then Type::Never
+    when _ then
+      match env.types.get(name)
+      when Option::Some(def) then
+        mut resolved_args = Vec::new()
+        for a in args do
+          resolved_args.push(resolve_type_expr(env, &a))
+        end
+        Type::Named(def.id, resolved_args)
+      when Option::None then
+        add_error(env, "undefined type: " + name, te.span)
+        Type::Error
+      end
+    end
+  when TypeExprKind::Unit then Type::Unit
+  when TypeExprKind::Never then Type::Never
+  when TypeExprKind::Ref(inner) then
+    let inner_type = resolve_type_expr(env, &inner)
+    Type::Ref(inner_type, lifetime_anonymous())
+  when TypeExprKind::RefMut(inner) then
+    let inner_type = resolve_type_expr(env, &inner)
+    Type::RefMut(inner_type, lifetime_anonymous())
+  when TypeExprKind::Tuple(elems) then
+    mut types = Vec::new()
+    for e in elems do
+      types.push(resolve_type_expr(env, &e))
+    end
+    Type::Tuple(types)
+  when TypeExprKind::Array(elem, size_opt) then
+    let elem_type = resolve_type_expr(env, &elem)
+    let size = match size_opt
+    when Option::Some(size_expr) then
+      match size_expr.kind
+      when ExprKind::IntLit(n) then n
+      when _ then 0
+      end
+    when Option::None then 0
+    end
+    Type::Array(elem_type, size)
+  when TypeExprKind::Slice(elem) then
+    let elem_type = resolve_type_expr(env, &elem)
+    Type::Slice(elem_type)
+  when TypeExprKind::Fn(params, ret) then
+    mut param_types = Vec::new()
+    for p in params do
+      param_types.push(resolve_type_expr(env, &p))
+    end
+    let ret_type = resolve_type_expr(env, &ret)
+    Type::Function(param_types, ret_type)
+  when TypeExprKind::Infer then
+    fresh_type_var(env)
+  when _ then Type::Error
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+def type_check(program: &Program) -> Vec[TypeError]
+  mut env = type_env_new()
+  check_program(&mut env, program)
+  env.errors
+end

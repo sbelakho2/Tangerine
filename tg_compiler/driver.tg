@@ -1,0 +1,1160 @@
+# Tangerine Compiler — Driver
+# Self-hosting compiler written in Tangerine
+#
+# Orchestrates the full compilation pipeline:
+# 1. Lexing
+# 2. Parsing  
+# 3. Type checking
+# 4. Borrow checking
+# 5. MIR lowering
+# 6. Optimization
+# 7. Code generation
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::fs::{read_file, write_file, write_file_bytes}
+use std::io::{print, println, eprintln}
+use std::env::{args}
+
+use tg_compiler::token::{Token, Span}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::ast::{Program}
+use tg_compiler::parser::{parse}
+use tg_compiler::types::{type_check, TypeError}
+use tg_compiler::borrow_check::{borrow_check, BorrowError}
+use tg_compiler::mir::{lower_to_mir, MirProgram}
+use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
+use tg_compiler::asm::{TargetTriple}
+
+# ———————————————————————————————————————————————————————————————
+# Compiler Options
+# ———————————————————————————————————————————————————————————————
+
+struct CompilerOptions
+  # Input/output
+  input_files: Vec[String]
+  output_file: Option[String]
+  
+  # Compilation mode
+  emit: EmitMode
+  
+  # Optimization level
+  opt_level: Int
+  
+  # Debug info
+  debug_info: Bool
+  
+  # Features
+  enable_contracts: Bool
+  enable_capabilities: Bool
+  enable_effects: Bool
+  enable_budgets: Bool
+  
+  # Warnings
+  warn_unused: Bool
+  warn_all: Bool
+  deny_warnings: Bool
+  
+  # Verbosity
+  verbose: Bool
+  quiet: Bool
+  
+  # Special modes
+  check_only: Bool
+  emit_mir: Bool
+  print_ast: Bool
+  print_tokens: Bool
+  
+  # Output format
+  json_diagnostics: Bool
+  color: Bool
+end
+
+enum EmitMode
+  Executable
+  Object
+  Assembly
+  MIR
+end
+
+def default_options() -> CompilerOptions
+  CompilerOptions {
+    input_files: Vec::new(),
+    output_file: Option::None,
+    emit: EmitMode::Executable,
+    opt_level: 0,
+    debug_info: false,
+    enable_contracts: true,
+    enable_capabilities: true,
+    enable_effects: true,
+    enable_budgets: true,
+    warn_unused: true,
+    warn_all: false,
+    deny_warnings: false,
+    verbose: false,
+    quiet: false,
+    check_only: false,
+    emit_mir: false,
+    print_ast: false,
+    print_tokens: false,
+    json_diagnostics: false,
+    color: true
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Diagnostics
+# ———————————————————————————————————————————————————————————————
+
+struct Diagnostic
+  level: DiagLevel
+  message: String
+  span: Option[Span]
+  notes: Vec[String]
+  suggestions: Vec[Suggestion]
+end
+
+enum DiagLevel
+  Error
+  Warning
+  Info
+  Note
+  Help
+end
+
+struct Suggestion
+  message: String
+  replacement: String
+  span: Span
+end
+
+struct DiagnosticEmitter
+  source_map: SourceMap
+  diagnostics: Vec[Diagnostic]
+  error_count: Int
+  warning_count: Int
+  json_mode: Bool
+  color_enabled: Bool
+end
+
+struct SourceMap
+  files: Vec[SourceFile]
+end
+
+struct SourceFile
+  name: String
+  content: String
+  lines: Vec[Int]  # Line start offsets
+end
+
+def emitter_new() -> DiagnosticEmitter
+  DiagnosticEmitter {
+    source_map: SourceMap { files: Vec::new() },
+    diagnostics: Vec::new(),
+    error_count: 0,
+    warning_count: 0,
+    json_mode: false,
+    color_enabled: true
+  }
+end
+
+def emitter_new_json() -> DiagnosticEmitter
+  DiagnosticEmitter {
+    source_map: SourceMap { files: Vec::new() },
+    diagnostics: Vec::new(),
+    error_count: 0,
+    warning_count: 0,
+    json_mode: true,
+    color_enabled: false
+  }
+end
+
+def add_source(e: &mut DiagnosticEmitter, name: String, content: String) -> Int
+  let id = e.source_map.files.len()
+  
+  # Compute line starts
+  mut lines = Vec::new()
+  lines.push(0)
+  mut i = 0
+  while i < content.len() do
+    if content[i] == '\n' then
+      lines.push(i + 1)
+    end
+    i = i + 1
+  end
+  
+  e.source_map.files.push(SourceFile {
+    name: name,
+    content: content,
+    lines: lines
+  })
+  
+  id
+end
+
+def emit_diagnostic(e: &mut DiagnosticEmitter, d: Diagnostic) -> Unit
+  # Track counts
+  match d.level
+  when DiagLevel::Error then
+    e.error_count = e.error_count + 1
+  when DiagLevel::Warning then
+    e.warning_count = e.warning_count + 1
+  when _ then ()
+  end
+  
+  if e.json_mode then
+    emit_diagnostic_json(e, &d)
+    e.diagnostics.push(d)
+    return
+  end
+  
+  # Human-readable format
+  let level_str = match d.level
+  when DiagLevel::Error then "error"
+  when DiagLevel::Warning then "warning"
+  when DiagLevel::Info then "info"
+  when DiagLevel::Note then "note"
+  when DiagLevel::Help then "help"
+  end
+  
+  if e.color_enabled then
+    let color = match d.level
+    when DiagLevel::Error then "\x1b[31m"
+    when DiagLevel::Warning then "\x1b[33m"
+    when DiagLevel::Info then "\x1b[36m"
+    when DiagLevel::Note then "\x1b[34m"
+    when DiagLevel::Help then "\x1b[32m"
+    end
+    eprint_styled(level_str, color)
+  else
+    eprint(level_str)
+  end
+  
+  eprintln(": " + d.message)
+  
+  # Print source location
+  match d.span
+  when Option::Some(span) then
+    print_source_location(e, span)
+  when Option::None then ()
+  end
+  
+  # Print notes
+  for note in d.notes do
+    eprintln("  = note: " + note)
+  end
+  
+  # Print suggestions
+  for suggestion in d.suggestions do
+    eprintln("  = help: " + suggestion.message)
+    eprintln("          " + suggestion.replacement)
+  end
+  
+  e.diagnostics.push(d)
+end
+
+def eprint_styled(s: String, style: String) -> Unit
+  eprint(style + s + "\x1b[0m")
+end
+
+def eprint(s: String) -> Unit
+  # Would use stderr
+  print(s)
+end
+
+def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
+  # Find the source file containing this span
+  mut found_file: Option[&SourceFile] = Option::None
+  for f in e.source_map.files do
+    let file_len = f.content.len()
+    if span.start < file_len then
+      found_file = Option::Some(&f)
+      break
+    end
+  end
+  
+  match found_file
+  when Option::Some(file) then
+    # Find the line number and column
+    mut line_num = 1
+    mut line_start = 0
+    for offset in file.lines do
+      if offset > span.start then
+        break
+      end
+      line_start = offset
+      line_num = line_num + 1
+    end
+    line_num = line_num - 1  # Adjust (loop increments one extra)
+    let col = span.start - line_start
+    
+    # Find end of line
+    mut line_end = line_start
+    while line_end < file.content.len() && file.content.char_at(line_end) != '\n' do
+      line_end = line_end + 1
+    end
+    
+    # Extract the source line
+    let source_line = file.content.slice(line_start, line_end)
+    
+    # Print location header
+    let loc_header = "  --> " + file.name.clone() + ":" + line_num.to_string() + ":" + (col + 1).to_string()
+    eprintln(loc_header)
+    
+    # Print line number gutter
+    let line_str = line_num.to_string()
+    let padding = "     ".slice(0, 5 - line_str.len())
+    eprintln(padding + line_str + " | " + source_line)
+    
+    # Print caret indicator
+    mut caret_line = ""
+    mut i = 0
+    while i < 5 do
+      caret_line = caret_line + " "
+      i = i + 1
+    end
+    caret_line = caret_line + " | "
+    i = 0
+    while i < col do
+      caret_line = caret_line + " "
+      i = i + 1
+    end
+    # Draw the caret(s) for the span width
+    let span_len = if span.end > span.start then span.end - span.start else 1 end
+    i = 0
+    while i < span_len do
+      caret_line = caret_line + "^"
+      i = i + 1
+    end
+    eprintln(caret_line)
+
+  when Option::None then
+    eprintln("  --> <unknown location>")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# JSON Diagnostic Output
+# ———————————————————————————————————————————————————————————————
+
+def emit_diagnostic_json(e: &DiagnosticEmitter, d: &Diagnostic) -> Unit
+  # Format: {"level":"error","message":"...","spans":[...],"code":null,"rendered":null}
+  mut json = "{"
+  
+  # Level
+  let level_str = match d.level
+  when DiagLevel::Error then "error"
+  when DiagLevel::Warning then "warning"
+  when DiagLevel::Info then "info"
+  when DiagLevel::Note then "note"
+  when DiagLevel::Help then "help"
+  end
+  json = json + "\"level\":\"" + level_str + "\","
+  
+  # Message (escape special chars)
+  json = json + "\"message\":\"" + json_escape(d.message.clone()) + "\","
+  
+  # Spans
+  json = json + "\"spans\":["
+  match d.span
+  when Option::Some(span) then
+    json = json + emit_span_json(e, span)
+  when Option::None then ()
+  end
+  json = json + "],"
+  
+  # Notes as children
+  json = json + "\"children\":["
+  mut first = true
+  for note in d.notes do
+    if !first then json = json + "," end
+    json = json + "{\"level\":\"note\",\"message\":\"" + json_escape(note.clone()) + "\"}"
+    first = false
+  end
+  json = json + "],"
+  
+  # Suggestions
+  json = json + "\"suggestions\":["
+  first = true
+  for sugg in d.suggestions do
+    if !first then json = json + "," end
+    json = json + emit_suggestion_json(&sugg)
+    first = false
+  end
+  json = json + "]"
+  
+  json = json + "}"
+  eprintln(json)
+end
+
+def emit_span_json(e: &DiagnosticEmitter, span: Span) -> String
+  mut json = "{"
+  json = json + "\"byte_start\":" + span.start.to_string() + ","
+  json = json + "\"byte_end\":" + span.end.to_string() + ","
+  
+  # Try to find file and line info
+  mut found = false
+  for f in e.source_map.files do
+    if span.start < f.content.len() then
+      # Find line and column
+      mut line_num = 1
+      mut line_start = 0
+      for offset in f.lines do
+        if offset > span.start then break end
+        line_start = offset
+        line_num = line_num + 1
+      end
+      line_num = line_num - 1
+      let col = span.start - line_start
+      
+      # End line and column
+      mut end_line = 1
+      mut end_line_start = 0
+      for offset in f.lines do
+        if offset > span.end then break end
+        end_line_start = offset
+        end_line = end_line + 1
+      end
+      end_line = end_line - 1
+      let end_col = span.end - end_line_start
+      
+      json = json + "\"file_name\":\"" + json_escape(f.name.clone()) + "\","
+      json = json + "\"line_start\":" + line_num.to_string() + ","
+      json = json + "\"line_end\":" + end_line.to_string() + ","
+      json = json + "\"column_start\":" + (col + 1).to_string() + ","
+      json = json + "\"column_end\":" + (end_col + 1).to_string() + ","
+      json = json + "\"is_primary\":true"
+      found = true
+      break
+    end
+  end
+  
+  if !found then
+    json = json + "\"file_name\":\"<unknown>\","
+    json = json + "\"line_start\":0,\"line_end\":0,"
+    json = json + "\"column_start\":0,\"column_end\":0,"
+    json = json + "\"is_primary\":true"
+  end
+  
+  json = json + "}"
+  json
+end
+
+def emit_suggestion_json(sugg: &Suggestion) -> String
+  mut json = "{"
+  json = json + "\"message\":\"" + json_escape(sugg.message.clone()) + "\","
+  json = json + "\"replacement\":\"" + json_escape(sugg.replacement.clone()) + "\","
+  json = json + "\"span\":" + "{"
+  json = json + "\"byte_start\":" + sugg.span.start.to_string() + ","
+  json = json + "\"byte_end\":" + sugg.span.end.to_string()
+  json = json + "}}"
+  json
+end
+
+def json_escape(s: String) -> String
+  mut result = ""
+  mut i = 0
+  while i < s.len() do
+    let c = s.char_at(i)
+    if c == '"' then
+      result = result + "\\\""
+    elsif c == '\\' then
+      result = result + "\\\\"
+    elsif c == '\n' then
+      result = result + "\\n"
+    elsif c == '\r' then
+      result = result + "\\r"
+    elsif c == '\t' then
+      result = result + "\\t"
+    else
+      result = result + c.to_string()
+    end
+    i = i + 1
+  end
+  result
+end
+
+def emit_all_diagnostics_json(e: &DiagnosticEmitter) -> String
+  # Emit as a JSON array
+  mut json = "["
+  mut first = true
+  for d in e.diagnostics do
+    if !first then json = json + "," end
+    # Re-serialize to JSON (simplified)
+    let level_str = match d.level
+    when DiagLevel::Error then "error"
+    when DiagLevel::Warning then "warning"
+    when DiagLevel::Info then "info"
+    when DiagLevel::Note then "note"
+    when DiagLevel::Help then "help"
+    end
+    json = json + "{\"level\":\"" + level_str + "\","
+    json = json + "\"message\":\"" + json_escape(d.message.clone()) + "\"}"
+    first = false
+  end
+  json = json + "]"
+  json
+end
+
+def has_errors(e: &DiagnosticEmitter) -> Bool
+  e.error_count > 0
+end
+
+# ———————————————————————————————————————————————————————————————
+# Compilation Pipeline
+# ———————————————————————————————————————————————————————————————
+
+struct CompilationUnit
+  name: String
+  source: String
+  tokens: Vec[Token]
+  ast: Option[Program]
+  mir: Option[MirProgram]
+end
+
+def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
+  mut emitter = if opts.json_diagnostics then
+    emitter_new_json()
+  else
+    mut e = emitter_new()
+    e.color_enabled = opts.color
+    e
+  end
+  
+  # Read source
+  let source = match read_file(path)
+  when Result::Ok(content) then content
+  when Result::Err(e) then
+    return Result::Err("Failed to read file: " + path + ": " + e)
+  end
+  
+  add_source(&mut emitter, path, source)
+  
+  if opts.verbose then
+    println("Compiling: " + path)
+  end
+  
+  # Phase 1: Lexing
+  if opts.verbose then
+    println("  Lexing...")
+  end
+  
+  let tokens = tokenize(source)
+  
+  if opts.print_tokens then
+    println("Tokens:")
+    for tok in tokens do
+      println("  " + token_debug(tok))
+    end
+  end
+  
+  # Phase 2: Parsing
+  if opts.verbose then
+    println("  Parsing...")
+  end
+  
+  let parse_result = parse(tokens)
+  let ast = match parse_result
+  when Result::Ok(program) then program
+  when Result::Err(err) then
+    emit_diagnostic(&mut emitter, Diagnostic {
+      level: DiagLevel::Error,
+      message: err.message,
+      span: Option::Some(err.span),
+      notes: Vec::new(),
+      suggestions: Vec::new()
+    })
+    return Result::Err("Parse error")
+  end
+  
+  if opts.print_ast then
+    println("AST:")
+    print_ast(&ast)
+  end
+  
+  if opts.check_only then
+    return Result::Ok("")
+  end
+  
+  # Phase 3: Type checking
+  if opts.verbose then
+    println("  Type checking...")
+  end
+  
+  let type_errors = type_check(&ast)
+  for err in type_errors do
+    emit_diagnostic(&mut emitter, Diagnostic {
+      level: DiagLevel::Error,
+      message: err.message,
+      span: Option::Some(err.span),
+      notes: Vec::new(),
+      suggestions: Vec::new()
+    })
+  end
+  
+  if has_errors(&emitter) then
+    return Result::Err("Type check failed")
+  end
+  
+  # Phase 4: Borrow checking
+  if opts.verbose then
+    println("  Borrow checking...")
+  end
+  
+  let borrow_errors = borrow_check(&ast)
+  for err in borrow_errors do
+    emit_diagnostic(&mut emitter, Diagnostic {
+      level: DiagLevel::Error,
+      message: err.message,
+      span: Option::Some(err.span),
+      notes: err.notes,
+      suggestions: Vec::new()
+    })
+  end
+  
+  if has_errors(&emitter) then
+    return Result::Err("Borrow check failed")
+  end
+  
+  # Phase 5: MIR lowering
+  if opts.verbose then
+    println("  Lowering to MIR...")
+  end
+  
+  let mir = lower_to_mir(&ast)
+  
+  if opts.emit_mir then
+    println("MIR:")
+    print_mir(&mir)
+    return Result::Ok("")
+  end
+  
+  # Phase 6: Native code generation
+  if opts.verbose then
+    println("  Generating native code...")
+  end
+  
+  let target = detect_host_target()
+  
+  match opts.emit
+  when EmitMode::Object then
+    let obj_bytes = generate_object_file(&mir, target)
+    let obj_path = get_output_path(opts, path, ".o")
+    match write_file_bytes(obj_path, obj_bytes)
+    when Result::Ok(_) then
+      if !opts.quiet then
+        println("Object file: " + obj_path)
+      end
+    when Result::Err(e) then
+      return Result::Err("Failed to write object file: " + e)
+    end
+  when EmitMode::Executable then
+    let exe_path = get_output_path(opts, path, "")
+    match generate_executable(&mir, target, exe_path)
+    when Result::Ok(_) then
+      if !opts.quiet then
+        println("Compiled: " + exe_path)
+      end
+    when Result::Err(e) then
+      return Result::Err("Native compilation failed: " + e)
+    end
+  when _ then ()
+  end
+  
+  Result::Ok("")
+end
+
+def get_output_path(opts: &CompilerOptions, input: String, ext: String) -> String
+  match opts.output_file
+  when Option::Some(out) then out
+  when Option::None then
+    # Replace .tg with ext
+    if input.ends_with(".tg") then
+      input.slice(0, input.len() - 3) + ext
+    else
+      input + ext
+    end
+  end
+end
+
+# No external compiler invocation needed -- native code is generated directly
+
+# ———————————————————————————————————————————————————————————————
+# Debug Printing
+# ———————————————————————————————————————————————————————————————
+
+def token_debug(tok: Token) -> String
+  tok.kind.to_string() + " @ " + tok.span.start.to_string() + ".." + tok.span.end.to_string()
+end
+
+def print_ast(program: &Program) -> Unit
+  println("Program with " + program.items.len().to_string() + " items")
+  for item in program.items do
+    println("  Item: " + item.kind.to_string())
+  end
+end
+
+def print_mir(mir: &MirProgram) -> Unit
+  println("MIR with " + mir.functions.len().to_string() + " functions")
+  for f in mir.functions do
+    println("  fn " + f.name + " {")
+    for block in f.blocks do
+      println("    bb" + block.id.id.to_string() + ":")
+      for stmt in block.statements do
+        println("      " + stmt.kind.to_string())
+      end
+      println("      " + block.terminator.kind.to_string())
+    end
+    println("  }")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Argument Parsing
+# ———————————————————————————————————————————————————————————————
+
+def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
+  mut opts = default_options()
+  mut i = 1  # Skip program name
+  
+  while i < argv.len() do
+    let arg = argv[i]
+    
+    if arg == "-o" || arg == "--output" then
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for -o")
+      end
+      opts.output_file = Option::Some(argv[i])
+    elsif arg == "-c" then
+      opts.emit = EmitMode::Object
+    elsif arg == "--emit-obj" then
+      opts.emit = EmitMode::Object
+    elsif arg == "--emit-mir" then
+      opts.emit_mir = true
+    elsif arg == "--print-ast" then
+      opts.print_ast = true
+    elsif arg == "--print-tokens" then
+      opts.print_tokens = true
+    elsif arg == "-O0" then
+      opts.opt_level = 0
+    elsif arg == "-O1" then
+      opts.opt_level = 1
+    elsif arg == "-O2" then
+      opts.opt_level = 2
+    elsif arg == "-O3" then
+      opts.opt_level = 3
+    elsif arg == "-g" then
+      opts.debug_info = true
+    elsif arg == "--check" then
+      opts.check_only = true
+    elsif arg == "-v" || arg == "--verbose" then
+      opts.verbose = true
+    elsif arg == "-q" || arg == "--quiet" then
+      opts.quiet = true
+    elsif arg == "-W" || arg == "--warn-all" then
+      opts.warn_all = true
+    elsif arg == "-Werror" then
+      opts.deny_warnings = true
+    elsif arg == "--no-contracts" then
+      opts.enable_contracts = false
+    elsif arg == "--no-capabilities" then
+      opts.enable_capabilities = false
+    elsif arg == "--no-effects" then
+      opts.enable_effects = false
+    elsif arg == "--no-budgets" then
+      opts.enable_budgets = false
+    elsif arg == "--json" then
+      opts.json_diagnostics = true
+    elsif arg == "--no-color" then
+      opts.color = false
+    elsif arg == "--color" then
+      opts.color = true
+    elsif arg == "-h" || arg == "--help" then
+      print_help()
+      return Result::Err("help")
+    elsif arg == "-V" || arg == "--version" then
+      print_version()
+      return Result::Err("version")
+    elsif arg.starts_with("-") then
+      return Result::Err("Unknown option: " + arg)
+    else
+      opts.input_files.push(arg)
+    end
+    
+    i = i + 1
+  end
+  
+  if opts.input_files.is_empty() then
+    return Result::Err("No input files")
+  end
+  
+  Result::Ok(opts)
+end
+
+def print_help() -> Unit
+  println("Usage: tg [OPTIONS] <FILES>...")
+  println("")
+  println("Options:")
+  println("  -o, --output <FILE>  Write output to FILE")
+  println("  -c                   Compile to object file")
+  println("  --emit-obj           Emit object file")
+  println("  --emit-mir           Print MIR representation")
+  println("  --print-ast          Print AST")
+  println("  --print-tokens       Print tokens")
+  println("  -O0 / -O1 / -O2 / -O3  Optimization level")
+  println("  -g                   Include debug info")
+  println("  --check              Check only, don't compile")
+  println("  -v, --verbose        Verbose output")
+  println("  -q, --quiet          Quiet output")
+  println("  -W, --warn-all       Enable all warnings")
+  println("  -Werror              Treat warnings as errors")
+  println("  --no-contracts       Disable contract checking")
+  println("  --no-capabilities    Disable capability system")
+  println("  --no-effects         Disable effect system")
+  println("  --no-budgets         Disable budget system")
+  println("  --json               Emit diagnostics in JSON format")
+  println("  --no-color           Disable colored output")
+  println("  --color              Force colored output")
+  println("  -h, --help           Show help")
+  println("  -V, --version        Show version")
+end
+
+def print_version() -> Unit
+  println("Tangerine compiler v0.1.0")
+  println("Self-hosting edition")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Main Entry Point
+# ———————————————————————————————————————————————————————————————
+
+def main() -> Int
+  let argv = args()
+  
+  let opts = match parse_args(argv)
+  when Result::Ok(o) then o
+  when Result::Err(e) then
+    if e == "help" || e == "version" then
+      return 0
+    end
+    eprintln("Error: " + e)
+    eprintln("Try 'tg --help' for usage")
+    return 1
+  end
+  
+  mut exit_code = 0
+  
+  for file in opts.input_files do
+    match compile_file(&opts, file)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      eprintln("Error: " + e)
+      exit_code = 1
+    end
+  end
+  
+  exit_code
+end
+
+# ———————————————————————————————————————————————————————————————
+# Standard Library Prelude
+# ———————————————————————————————————————————————————————————————
+
+def load_prelude() -> String
+  # Load all standard library files that constitute the prelude.
+  # These provide the core types, collections, I/O, and other builtins
+  # that every Tangerine program can use without explicit `use` declarations.
+  
+  let std_files = [
+    "std/core.tg",
+    "std/collections.tg",
+    "std/fmt.tg",
+    "std/io.tg",
+    "std/fs.tg",
+    "std/env.tg",
+    "std/contracts.tg",
+    "std/capabilities.tg",
+    "std/effects.tg",
+    "std/budget.tg",
+    "std/test.tg",
+    "std/ffi.tg"
+  ]
+  
+  mut prelude = ""
+  
+  for path in std_files do
+    match read_file(path)
+    when Result::Ok(content) then
+      prelude = prelude + "\n# --- " + path + " ---\n" + content + "\n"
+    when Result::Err(_) then
+      # Standard library file not found — skip silently.
+      # This can happen when running from a different working directory.
+      ()
+    end
+  end
+  
+  prelude
+end
+
+def inject_prelude(source: String) -> String
+  let prelude = load_prelude()
+  prelude + "\n" + source
+end
+
+# ———————————————————————————————————————————————————————————————
+# Incremental Compilation Support
+# ———————————————————————————————————————————————————————————————
+
+struct IncrementalCache
+  entries: Map[String, CacheEntry]
+  cache_dir: String
+end
+
+struct CacheEntry
+  source_hash: String
+  mir_hash: String
+  timestamp: Int
+end
+
+def cache_new(dir: String) -> IncrementalCache
+  IncrementalCache {
+    entries: Map::new(),
+    cache_dir: dir
+  }
+end
+
+def is_stale(cache: &IncrementalCache, path: String, source: String) -> Bool
+  match cache.entries.get(path)
+  when Option::Some(entry) then
+    let current_hash = hash_string(source)
+    entry.source_hash != current_hash
+  when Option::None then
+    true
+  end
+end
+
+def update_cache(cache: &mut IncrementalCache, path: String, source: String, mir_hash: String) -> Unit
+  let source_hash = hash_string(source)
+  cache.entries.insert(path, CacheEntry {
+    source_hash: source_hash,
+    mir_hash: mir_hash,
+    timestamp: current_time()
+  })
+end
+
+def hash_string(s: String) -> String
+  # Simple hash for now
+  mut h = 0
+  for c in s do
+    h = h * 31 + (c as Int)
+  end
+  h.to_string()
+end
+
+def current_time() -> Int
+  0  # Would get system time
+end
+
+# ———————————————————————————————————————————————————————————————
+# Build System Integration
+# ———————————————————————————————————————————————————————————————
+
+struct Project
+  name: String
+  version: String
+  authors: Vec[String]
+  dependencies: Vec[Dependency]
+  sources: Vec[String]
+  output_dir: String
+end
+
+struct Dependency
+  name: String
+  version: String
+  path: Option[String]
+  git: Option[String]
+end
+
+def load_project(path: String) -> Result[Project, String]
+  # Parse a Tangerine.toml project manifest file.
+  # Expected format:
+  #   [project]
+  #   name = "my_app"
+  #   version = "0.1.0"
+  #   
+  #   [sources]
+  #   files = ["src/main.tg", "src/lib.tg"]
+  #   
+  #   [dependencies]
+  #   http = { version = "1.0", path = "../http" }
+  
+  let manifest_path = if path.ends_with("Tangerine.toml") then
+    path.clone()
+  else
+    path.clone() + "/Tangerine.toml"
+  end
+  
+  match read_file(manifest_path.clone())
+  when Result::Ok(content) then
+    # Simple TOML-like parser for the project manifest
+    mut name = "untitled"
+    mut version = "0.0.0"
+    mut sources = Vec::new()
+    mut deps = Vec::new()
+    mut output_dir = "build"
+    mut section = ""
+    
+    for line in content.lines() do
+      let trimmed = line.trim()
+      
+      # Skip comments and empty lines
+      if trimmed.is_empty() || trimmed.starts_with("#") then
+        continue
+      end
+      
+      # Section headers
+      if trimmed.starts_with("[") && trimmed.ends_with("]") then
+        section = trimmed.slice(1, trimmed.len() - 1)
+        continue
+      end
+      
+      # Key-value pairs
+      match trimmed.split_once("=")
+      when Option::Some(kv) then
+        let key = kv.0.trim()
+        let val = kv.1.trim().trim_matches('"')
+        
+        if section == "project" then
+          if key == "name" then name = val.to_string() end
+          if key == "version" then version = val.to_string() end
+          if key == "output_dir" then output_dir = val.to_string() end
+        end
+        
+        if section == "sources" then
+          if key == "files" then
+            # Parse array: ["file1.tg", "file2.tg"]
+            let arr = val.trim_matches('[').trim_matches(']')
+            for entry in arr.split(",") do
+              let src = entry.trim().trim_matches('"')
+              if !src.is_empty() then
+                sources.push(src.to_string())
+              end
+            end
+          end
+        end
+        
+        if section == "dependencies" then
+          deps.push(Dependency {
+            name: key.to_string(),
+            version: val.to_string(),
+            path: Option::None,
+            git: Option::None
+          })
+        end
+      when Option::None then ()
+      end
+    end
+    
+    # Default: if no sources specified, look for src/main.tg
+    if sources.is_empty() then
+      sources.push("src/main.tg".to_string())
+    end
+    
+    Result::Ok(Project {
+      name: name.to_string(),
+      version: version.to_string(),
+      dependencies: deps,
+      sources: sources,
+      output_dir: output_dir.to_string()
+    })
+  when Result::Err(e) then
+    Result::Err("Cannot read project manifest '" + manifest_path + "': " + e)
+  end
+end
+
+def build_project(project: &Project) -> Result[Unit, String]
+  let opts = default_options()
+  
+  for src in project.sources do
+    match compile_file(&opts, src)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
+  end
+  
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP Support
+# ———————————————————————————————————————————————————————————————
+
+struct LspServer
+  documents: Map[String, String]
+  diagnostics: Map[String, Vec[Diagnostic]]
+end
+
+def lsp_server_new() -> LspServer
+  LspServer {
+    documents: Map::new(),
+    diagnostics: Map::new()
+  }
+end
+
+def lsp_did_open(server: &mut LspServer, uri: String, content: String) -> Unit
+  server.documents.insert(uri, content)
+  lsp_check_document(server, uri)
+end
+
+def lsp_did_change(server: &mut LspServer, uri: String, content: String) -> Unit
+  server.documents.insert(uri, content)
+  lsp_check_document(server, uri)
+end
+
+def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
+  match server.documents.get(uri)
+  when Option::Some(content) then
+    # Lex, parse, type check
+    let tokens = tokenize(content)
+    let parse_result = parse(tokens)
+    
+    mut diags = Vec::new()
+    
+    match parse_result
+    when Result::Ok(ast) then
+      let type_errors = type_check(&ast)
+      for err in type_errors do
+        diags.push(Diagnostic {
+          level: DiagLevel::Error,
+          message: err.message,
+          span: Option::Some(err.span),
+          notes: Vec::new(),
+          suggestions: Vec::new()
+        })
+      end
+      
+      let borrow_errors = borrow_check(&ast)
+      for err in borrow_errors do
+        diags.push(Diagnostic {
+          level: DiagLevel::Error,
+          message: err.message,
+          span: Option::Some(err.span),
+          notes: err.notes,
+          suggestions: Vec::new()
+        })
+      end
+    when Result::Err(err) then
+      diags.push(Diagnostic {
+        level: DiagLevel::Error,
+        message: err.message,
+        span: Option::Some(err.span),
+        notes: Vec::new(),
+        suggestions: Vec::new()
+      })
+    end
+    
+    server.diagnostics.insert(uri, diags)
+  when Option::None then ()
+  end
+end
