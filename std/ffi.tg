@@ -20,6 +20,7 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map}
+use std::alloc::{size_of}
 
 # ———————————————————————————————————————————————————————————————
 # Primitive FFI types
@@ -30,11 +31,108 @@ struct Ptr[T]
   address: UInt
 end
 
-# Null pointer constant
+# Ptr implementation — unified null pointer API
+impl Ptr[T]
+  # Creates a null pointer (Rust-style API: Ptr::null())
+  def null() -> Ptr[T]
+    Ptr { address: 0 }
+  end
+
+  # Check if pointer is null
+  def is_null(self: &Self) -> Bool
+    self.address == 0
+  end
+
+  # Check if pointer is non-null
+  def is_some(self: &Self) -> Bool
+    self.address != 0
+  end
+
+  # Convert to Option — Rust-style null safety
+  # Returns None if null, Some(NonNull) if valid
+  def to_option(self: &Self) -> Option[NonNull[T]]
+    if self.address == 0 then
+      Option::None
+    else
+      Option::Some(NonNull { ptr: *self })
+    end
+  end
+
+  # Unsafe dereference — requires explicit unsafe block
+  def deref(self: &Self) -> &T
+    if self.address == 0 then
+      panic("null pointer dereference")
+    end
+    unsafe "dereferencing raw pointer" do
+      &(*self)
+    end
+  end
+
+  # Cast to different pointer type
+  def cast[U](self: &Self) -> Ptr[U]
+    Ptr { address: self.address }
+  end
+
+  # Offset pointer by count elements
+  def offset(self: &Self, count: Int) -> Ptr[T]
+    let elem_size = size_of[T]()
+    Ptr { address: self.address + (count * elem_size) as UInt }
+  end
+
+  # Add byte offset
+  def byte_add(self: &Self, bytes: UInt) -> Ptr[T]
+    Ptr { address: self.address + bytes }
+  end
+end
+
+# NonNull[T] — Guaranteed non-null pointer (like Rust's NonNull<T>)
+# Use this in APIs where null is never valid
+struct NonNull[T]
+  ptr: Ptr[T]
+end
+
+impl NonNull[T]
+  # Create from raw pointer, panics if null
+  def new(ptr: Ptr[T]) -> NonNull[T]
+    if ptr.address == 0 then
+      panic("NonNull::new called with null pointer")
+    end
+    NonNull { ptr: ptr }
+  end
+
+  # Create from raw pointer, returns None if null
+  def try_new(ptr: Ptr[T]) -> Option[NonNull[T]]
+    if ptr.address == 0 then
+      Option::None
+    else
+      Option::Some(NonNull { ptr: ptr })
+    end
+  end
+
+  # Get underlying pointer (guaranteed non-null)
+  def as_ptr(self: &Self) -> Ptr[T]
+    self.ptr
+  end
+
+  # Safe dereference — pointer is guaranteed valid
+  def deref(self: &Self) -> &T
+    unsafe "NonNull pointer dereference — guaranteed non-null" do
+      &(*self.ptr)
+    end
+  end
+
+  # Cast to different pointer type
+  def cast[U](self: &Self) -> NonNull[U]
+    NonNull { ptr: Ptr { address: self.ptr.address } }
+  end
+end
+
+# Null pointer constant (free function for backward compatibility)
 def null_ptr[T]() -> Ptr[T]
   Ptr { address: 0 }
 end
 
+# Check if pointer is null (free function for backward compatibility)
 def is_null[T](p: &Ptr[T]) -> Bool
   p.address == 0
 end
@@ -155,11 +253,13 @@ def RUBY_T_BIGNUM()  -> Int = 0x0A
 def RUBY_T_FILE()    -> Int = 0x0B
 def RUBY_T_DATA()    -> Int = 0x0C
 def RUBY_T_MATCH()   -> Int = 0x0D
-def RUBY_T_SYMBOL()  -> Int = 0x0E
-def RUBY_T_FIXNUM()  -> Int = 0x15
-def RUBY_T_TRUE()    -> Int = 0x02  # immediate
-def RUBY_T_FALSE()   -> Int = 0x00  # immediate
+def RUBY_T_COMPLEX() -> Int = 0x0E  
+def RUBY_T_RATIONAL()-> Int = 0x0F  
 def RUBY_T_NIL()     -> Int = 0x11
+def RUBY_T_TRUE()    -> Int = 0x12  
+def RUBY_T_FALSE()   -> Int = 0x13  
+def RUBY_T_SYMBOL()  -> Int = 0x14
+def RUBY_T_FIXNUM()  -> Int = 0x15
 
 # Singleton VALUE constants
 def RUBY_Qnil()   -> RubyValue = RubyValue { raw: 0x08 }
@@ -414,11 +514,31 @@ struct RubyRuntime
   initialized: Bool
 end
 
+
+extern "C" do
+  def __sync_bool_compare_and_swap_1(ptr: Ptr[u8], expected: u8, desired: u8) -> Bool
+  def __sync_synchronize() -> Unit
+end
+
+mut RUBY_RUNTIME_LOCK: u8 = 0
 mut RUBY_RUNTIME: Option[RubyRuntime] = Option::None
 
+def ruby_runtime_lock() -> Unit
+  while !__sync_bool_compare_and_swap_1(&RUBY_RUNTIME_LOCK, 0, 1) do
+    # Spin
+  end
+end
+
+def ruby_runtime_unlock() -> Unit
+  __sync_synchronize()
+  RUBY_RUNTIME_LOCK = 0
+end
+
 def ruby_start() -> Result[RubyRuntime, String]
+  ruby_runtime_lock()
   match RUBY_RUNTIME
   when Option::Some(_) then
+    ruby_runtime_unlock()
     return Result::Err("Ruby runtime already initialized")
   when Option::None then ()
   end
@@ -428,16 +548,19 @@ def ruby_start() -> Result[RubyRuntime, String]
   
   let rt = RubyRuntime { initialized: true }
   RUBY_RUNTIME = Option::Some(rt)
+  ruby_runtime_unlock()
   Result::Ok(rt)
 end
 
 def ruby_stop() -> Unit
+  ruby_runtime_lock()
   match RUBY_RUNTIME
   when Option::Some(_) then
     ruby_finalize()
     RUBY_RUNTIME = Option::None
   when Option::None then ()
   end
+  ruby_runtime_unlock()
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -666,7 +789,7 @@ end
 
 # TgResult — FFI-safe result type for C interop (repr(c))
 # Per interop.txt §7.2
-#[repr(c)]
+@repr(C)
 pub struct TgResult[T]
   ok: Bool           # true if success, false if error
   err_code: Int      # 0 if ok, otherwise error code
@@ -698,7 +821,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Borrowed — pointer does not transfer ownership; valid only for call duration
-#[repr(c)]
+@repr(C)
 pub struct Borrowed[T]
   ptr: Ptr[T]
 end
@@ -712,7 +835,7 @@ pub def borrowed_get[T](b: &Borrowed[T]) -> Ptr[T]
 end
 
 # Owned — ownership transfers to callee; callee must free
-#[repr(c)]
+@repr(C)
 pub struct Owned[T]
   ptr: Ptr[T]
   alloc_domain: AllocDomain
@@ -737,7 +860,7 @@ pub def owned_take[T](o: Owned[T]) -> (Ptr[T], AllocDomain)
 end
 
 # Shared — reference-counted or VM-managed handle
-#[repr(c)]
+@repr(C)
 pub struct Shared[T]
   ptr: Ptr[T]
   refcount: Ptr[UInt]
@@ -749,7 +872,7 @@ pub def shared_new[T](ptr: Ptr[T]) -> Shared[T]
   if rc.is_null() then
     panic("shared_new: failed to allocate refcount")
   end
-  unsafe { *rc = 1 }
+  unsafe "dereferencing raw pointer" do *rc = 1 end
   Shared { ptr: ptr, refcount: rc }
 end
 
@@ -757,7 +880,7 @@ pub def shared_clone[T](s: &Shared[T]) -> Shared[T]
   if s.refcount.is_null() then
     panic("shared_clone: null refcount")
   end
-  unsafe { *s.refcount = *s.refcount + 1 }
+  unsafe "Arc pointer — lifetime managed by refcount" do *s.refcount = *s.refcount + 1 end
   Shared { ptr: s.ptr, refcount: s.refcount }
 end
 
@@ -765,13 +888,13 @@ pub def shared_drop[T](s: Shared[T]) -> Unit
   if s.refcount.is_null() then
     return
   end
-  unsafe {
+  unsafe "Arc pointer — lifetime managed by refcount" do
     *s.refcount = *s.refcount - 1
     if *s.refcount == 0 then
       tg_free(s.refcount as Ptr[u8], 8, 8)
       # Note: caller is responsible for freeing the pointed-to data
     end
-  }
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -779,7 +902,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Slice[T] — borrowed view of contiguous memory (repr(c))
-#[repr(c)]
+@repr(C)
 pub struct FfiSlice[T]
   ptr: Ptr[T]
   len: UInt
@@ -794,7 +917,7 @@ pub def ffi_slice_empty[T]() -> FfiSlice[T]
 end
 
 # FfiStr — UTF-8 string view (borrowed, repr(c))
-#[repr(c)]
+@repr(C)
 pub struct FfiStr
   ptr: Ptr[u8]
   len: UInt
@@ -858,9 +981,9 @@ pub def tg_last_error_message(out: Ptr[FfiStr]) -> Unit
   if out.is_null() then
     return
   end
-  unsafe {
+  unsafe "dereferencing raw pointer" do
     *out = ffi_str_from_string(&_last_error_message)
-  }
+  end
 end
 
 pub def tg_set_last_error(code: Int, message: String) -> Unit
@@ -916,4 +1039,51 @@ end
 @export("tg_abi_revision")
 pub def tg_abi_revision() -> UInt
   FFI_ABI_REVISION
+end
+
+# ———————————————————————————————————————————————————————————————
+# §12 — FFI Taint Integration
+# ———————————————————————————————————————————————————————————————
+
+## All data entering Tangerine through FFI boundaries is automatically
+## wrapped in Tainted[T] by the compiler. This section documents the
+## integration points.
+##
+## The compiler inserts taint wrappers at:
+##   1. Return values of `extern` function calls → Tainted[ReturnType]
+##   2. Parameters passed TO Tangerine callbacks FROM FFI → Tainted[ParamType]
+##   3. Data read from FFI pointers (Ptr.read()) → Tainted[T]
+##
+## To use FFI data, callers MUST validate through std::taint::validate().
+##
+## Example:
+##   extern "C" do
+##     def getenv(name: CStr) -> Ptr[u8]  # Returns Tainted[Ptr[u8]]
+##   end
+##
+##   def get_home() -> Result[String, String]
+##     let raw = getenv(c_str("HOME"))           # Tainted[Ptr[u8]]
+##     let validated = validate(raw, NonNullValidator {})  # Result[Ptr[u8], ...]
+##     match validated
+##       when Result::Ok(ptr) then
+##         let s = c_str_from_ptr(ptr)            # Still Tainted[String]
+##         validate(s, MaxLengthValidator { max_len: 4096 })
+##       when Result::Err(e) then Result::Err(e.message)
+##     end
+##   end
+
+## Marker trait: types that cross FFI boundary get auto-tainted.
+trait FfiBoundary end
+
+## Applied by compiler to all extern return types.
+## Not called directly — compiler inserts this at codegen.
+def __ffi_auto_taint[T: FfiBoundary](value: T, source: String) -> Tainted[T]
+  use std::taint::{taint, TaintLabel}
+  taint(value, TaintLabel::FfiInput)
+end
+
+## Applied by compiler to callback parameters from FFI.
+def __ffi_callback_taint[T: FfiBoundary](value: T, callback: String) -> Tainted[T]
+  use std::taint::{taint, TaintLabel}
+  taint(value, TaintLabel::FfiCallback)
 end

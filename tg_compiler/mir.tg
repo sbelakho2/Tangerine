@@ -1091,9 +1091,11 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     let base_place = lower_place(b, &recv)
     # Resolve field index — use a simple lookup for common types
     let field_idx = resolve_field_index(field_name)
+    mut new_projections = base_place.projections.clone()
+    new_projections.push(Projection::Field(field_name, field_idx))
     let projected = Place {
       local: base_place.local,
-      projections: base_place.projections.clone().push(Projection::Field(field_name, field_idx))
+      projections: new_projections
     }
     MirRvalue { kind: MirRvalueKind::Use(MirOperand {
       kind: MirOperandKind::Copy(projected)
@@ -1107,9 +1109,11 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     push_stmt(b, MirStatementKind::Assign(place_local(idx_tmp), MirRvalue {
       kind: MirRvalueKind::Use(idx_op)
     }), span)
+    mut new_projections = base_place.projections.clone()
+    new_projections.push(Projection::Index(idx_tmp))
     let projected = Place {
       local: base_place.local,
-      projections: base_place.projections.clone().push(Projection::Index(idx_tmp))
+      projections: new_projections
     }
     MirRvalue { kind: MirRvalueKind::Use(MirOperand {
       kind: MirOperandKind::Copy(projected)
@@ -1213,24 +1217,30 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
   when ExprKind::StructLit(path, fields) then
     # Lower struct literal as Aggregate
     mut ops = Vec::new()
+    mut field_names = Vec::new()
     for f in fields do
+      field_names.push(f.name.clone())
       ops.push(lower_expr(b, &f.value, span))
     end
-    MirRvalue { kind: MirRvalueKind::Aggregate(AggregateKind::Adt(path_to_string(&path), 0), ops) }
+    MirRvalue { kind: MirRvalueKind::Aggregate(AggregateKind::Struct(TypeId { id: 0 }, field_names), ops) }
 
   when ExprKind::EnumVariant(path, variant, args) then
     # Lower enum variant as Aggregate with downcast
     mut ops = Vec::new()
+    mut field_names = Vec::new()
+    for i in 0..args.len() do
+      field_names.push(i.to_string())
+    end
     for a in args do
       ops.push(lower_expr(b, &a, span))
     end
-    let full_name = path_to_string(&path) + "::" + variant
-    MirRvalue { kind: MirRvalueKind::Aggregate(AggregateKind::Adt(full_name, 0), ops) }
+    MirRvalue { kind: MirRvalueKind::Aggregate(AggregateKind::Struct(TypeId { id: 0 }, field_names), ops) }
 
   when ExprKind::Cast(inner, target_ty) then
     let inner_op = lower_expr(b, &inner, span)
     let target = resolve_lowering_type(&target_ty)
-    MirRvalue { kind: MirRvalueKind::Cast(CastKind::As, inner_op, target) }
+    # Use Transmute as the generic cast kind - specific casts would require type inference
+    MirRvalue { kind: MirRvalueKind::Cast(CastKind::Transmute, inner_op, target) }
 
   when ExprKind::Return(inner) then
     let ret_op = lower_expr(b, &inner, span)
@@ -1469,11 +1479,8 @@ end
 
 def collect_free_vars_stmt(stmt: &Stmt, free: &mut Set[String], bound: &Set[String]) -> Unit
   match stmt.kind
-  when StmtKind::Let(_, name, _, value) then
-    match value
-    when Option::Some(v) then collect_free_vars(&v, free, bound)
-    when Option::None then ()
-    end
+  when StmtKind::Let(name, _, value, _) then
+    collect_free_vars(&value, free, bound)
   when StmtKind::Expr(expr) then
     collect_free_vars(&expr, free, bound)
   when StmtKind::Assign(target, value) then
@@ -1713,14 +1720,15 @@ end
 def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
   let scrutinee = lower_expr(b, &m.scrutinee, span)
 
-  # Get discriminant for switching
-  let discr_tmp = add_temp(b, Type::Int, span)
-  push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(
-    Place { local: LocalId { id: discr_tmp.id }, projections: Vec::new() }
-  ) }, span)
-  # Actually, scrutinee could be any value; store it and load discriminant
+  # First store the scrutinee value in a local
   let scrut_local = add_temp(b, Type::Unit, span)
   push_assign(b, place_local(scrut_local), MirRvalue { kind: MirRvalueKind::Use(scrutinee.clone()) }, span)
+  
+  # Now get discriminant of the stored scrutinee (not the temp local!)
+  let discr_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(
+    place_local(scrut_local)
+  ) }, span)
 
   let join_block = create_block(b)
 
@@ -2537,9 +2545,16 @@ def remap_statement(stmt: &MirStatement, local_map: &Map[Int, Int]) -> MirStatem
       ),
       span: stmt.span.clone()
     }
-  when MirStatementKind::Drop(place) then
+  when MirStatementKind::StorageLive(local_id) then
+    let new_id = local_map.get(local_id.id).unwrap_or(local_id.id)
     MirStatement {
-      kind: MirStatementKind::Drop(remap_place(&place, local_map)),
+      kind: MirStatementKind::StorageLive(LocalId { id: new_id }),
+      span: stmt.span.clone()
+    }
+  when MirStatementKind::StorageDead(local_id) then
+    let new_id = local_map.get(local_id.id).unwrap_or(local_id.id)
+    MirStatement {
+      kind: MirStatementKind::StorageDead(LocalId { id: new_id }),
       span: stmt.span.clone()
     }
   when _ then stmt.clone()
@@ -2566,7 +2581,23 @@ def remap_rvalue(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
     MirRvalue { kind: MirRvalueKind::Ref(remap_place(&place, local_map)) }
   when MirRvalueKind::RefMut(place) then
     MirRvalue { kind: MirRvalueKind::RefMut(remap_place(&place, local_map)) }
-  when _ then rv.clone()
+  when MirRvalueKind::Aggregate(fields) then
+    let remapped = fields.iter().map(|f| remap_operand(&f, local_map)).collect()
+    MirRvalue { kind: MirRvalueKind::Aggregate(remapped) }
+  when MirRvalueKind::Discriminant(place) then
+    MirRvalue { kind: MirRvalueKind::Discriminant(remap_place(&place, local_map)) }
+  when MirRvalueKind::Len(place) then
+    MirRvalue { kind: MirRvalueKind::Len(remap_place(&place, local_map)) }
+  when MirRvalueKind::Cast(op, ty) then
+    MirRvalue { kind: MirRvalueKind::Cast(remap_operand(&op, local_map), ty.clone()) }
+  when MirRvalueKind::Repeat(op, count) then
+    MirRvalue { kind: MirRvalueKind::Repeat(remap_operand(&op, local_map), count) }
+  when MirRvalueKind::Phi(args) then
+    let remapped = args.iter().map(|(block, local)| {
+      let new_id = local_map.get(local.id).unwrap_or(local.id)
+      (block.clone(), LocalId { id: new_id })
+    }).collect()
+    MirRvalue { kind: MirRvalueKind::Phi(remapped) }
   end
 end
 
@@ -2583,45 +2614,22 @@ end
 def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map: &Map[Int, Int],
                      dest: &Option[Place], next_block: &Option[BlockId]) -> MirTerminator
   match term.kind
-  when MirTerminatorKind::Return(op) then
-    # Replace return with assignment to dest and goto next_block
-    match dest
-    when Option::Some(dest_place) then
-      match op
-      when Option::Some(ret_op) then
-        # We need to create an assignment, but we can't modify the calling block
-        # Instead, replace Return with Goto to next_block (assignment happens elsewhere)
-        match next_block
-        when Option::Some(nb) then
-          MirTerminator { kind: MirTerminatorKind::Goto(nb.clone()), span: term.span.clone() }
-        when Option::None then
-          MirTerminator { kind: MirTerminatorKind::Return(Option::None), span: term.span.clone() }
-        end
-      when Option::None then
-        match next_block
-        when Option::Some(nb) then
-          MirTerminator { kind: MirTerminatorKind::Goto(nb.clone()), span: term.span.clone() }
-        when Option::None then
-          MirTerminator { kind: MirTerminatorKind::Return(Option::None), span: term.span.clone() }
-        end
-      end
+  when MirTerminatorKind::Return then
+    # Replace return with goto next_block (return value is in local 0)
+    match next_block
+    when Option::Some(nb) then
+      MirTerminator { kind: MirTerminatorKind::Goto(nb.clone()), span: term.span.clone() }
     when Option::None then
-      match next_block
-      when Option::Some(nb) then
-        MirTerminator { kind: MirTerminatorKind::Goto(nb.clone()), span: term.span.clone() }
-      when Option::None then
-        term.clone()
-      end
+      MirTerminator { kind: MirTerminatorKind::Return, span: term.span.clone() }
     end
   when MirTerminatorKind::Goto(target) then
     let new_target = block_map.get(target.id).unwrap_or(target.id)
     MirTerminator { kind: MirTerminatorKind::Goto(BlockId { id: new_target }), span: term.span.clone() }
   when MirTerminatorKind::SwitchInt(op, targets, fallback) then
-    mut new_targets: Vec[(Int, BlockId)] = Vec::new()
+    mut new_targets: Vec[SwitchTarget] = Vec::new()
     for entry in targets do
-      let (val, bid) = entry
-      let new_bid = block_map.get(bid.id).unwrap_or(bid.id)
-      new_targets.push((val, BlockId { id: new_bid }))
+      let new_bid = block_map.get(entry.target.id).unwrap_or(entry.target.id)
+      new_targets.push(SwitchTarget { value: entry.value, target: BlockId { id: new_bid } })
     end
     let new_fb = block_map.get(fallback.id).unwrap_or(fallback.id)
     MirTerminator {
@@ -2794,6 +2802,39 @@ def substitute_rvalue_copies(rv: &mut MirRvalue, map: &Map[Int, LocalId]) -> Uni
     end
   when MirRvalueKind::Cast(_, op, _) then substitute_operand_copies(&mut op, map)
   when MirRvalueKind::Repeat(op, _) then substitute_operand_copies(&mut op, map)
+  when MirRvalueKind::Ref(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        rv.kind = MirRvalueKind::Ref(place_local(new_local.clone()))
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::RefMut(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        rv.kind = MirRvalueKind::RefMut(place_local(new_local.clone()))
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::Discriminant(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        rv.kind = MirRvalueKind::Discriminant(place_local(new_local.clone()))
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::Len(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        rv.kind = MirRvalueKind::Len(place_local(new_local.clone()))
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::Phi(_) then ()  # Phi nodes reference block args, not copy targets
   when _ then ()
   end
 end
@@ -3486,38 +3527,54 @@ end
 
 def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
   # Find back edges and compute the natural loop for each.
-  # A back edge is an edge n -> h where h dominates n.
-  
-  # Simplified dominator computation: BFS from entry, build a dominator tree
-  # For correctness, we use a simple "reachable before" heuristic:
-  # h dominates n if h appears in every path from entry to n.
+  # A back edge is an edge n -> h where h is an ancestor on the current DFS path.
+  # We need to distinguish between "on stack" (current path) and "fully processed".
   
   mut loops = Vec::new()
   
-  # Find back edges: an edge to a block that we've already visited in DFS
+  # Use two sets: visited (all seen nodes) and on_stack (current DFS path)
   mut visited = Set::new()
+  mut on_stack = Set::new()
   mut stack = Vec::new()
-  stack.push(f.entry_block)
+  
+  # DFS with explicit stack - push (block_id, is_entering)
+  # is_entering=true: first visit, is_entering=false: backtrack (remove from on_stack)
+  stack.push((f.entry_block, true))
   
   mut back_edges: Vec[(BlockId, BlockId)] = Vec::new()
   
   while !stack.is_empty() do
     match stack.pop()
-    when Option::Some(block_id) then
-      if !visited.contains(block_id.id) then
-        visited.insert(block_id.id)
-        match get_block(f, block_id)
-        when Option::Some(block) then
-          for succ in terminator_successors(&block.terminator) do
-            if visited.contains(succ.id) then
-              # Back edge: block_id -> succ (succ is the loop header)
-              back_edges.push((block_id, succ))
-            else
-              stack.push(succ)
+    when Option::Some((block_id, is_entering)) then
+      if is_entering then
+        if visited.contains(block_id.id) then
+          # Already fully processed, skip
+          ()
+        else
+          visited.insert(block_id.id)
+          on_stack.insert(block_id.id)
+          
+          # Push backtrack marker first (will be popped after all successors)
+          stack.push((block_id, false))
+          
+          match get_block(f, block_id)
+          when Option::Some(block) then
+            for succ in terminator_successors(&block.terminator) do
+              if on_stack.contains(succ.id) then
+                # Back edge: edge to an ancestor on current path
+                back_edges.push((block_id, succ))
+              else if !visited.contains(succ.id) then
+                # Tree edge: visit successor
+                stack.push((succ, true))
+              end
+              # else: cross edge to already-processed node, not a back edge
             end
+          when Option::None then ()
           end
-        when Option::None then ()
         end
+      else
+        # Backtracking: remove from on_stack
+        on_stack.remove(block_id.id)
       end
     when Option::None then ()
     end
@@ -3595,15 +3652,39 @@ def hoist_loop_invariants(f: &mut MirFunction, loop_info: &NaturalLoop) -> Unit
     end
   end
   
-  # If we found invariant statements, prepend them to the loop header
+  # If we found invariant statements, insert them into a preheader block
+  # The preheader executes once before the loop, not on every iteration
   if !invariant_stmts.is_empty() then
+    # Find or create preheader: a unique predecessor of the header from outside the loop
     match get_block_mut(f, loop_info.header)
     when Option::Some(header_block) then
-      mut hoisted = invariant_stmts.clone()
-      for s in header_block.statements do
-        hoisted.push(s)
+      # Find the predecessor that's not in the loop (the preheader)
+      mut preheader_id: Option[BlockId] = Option::None
+      for pred_id in header_block.predecessors do
+        if !loop_info.blocks.contains(pred_id.id) then
+          preheader_id = Option::Some(pred_id.clone())
+        end
       end
-      header_block.statements = hoisted
+      
+      match preheader_id
+      when Option::Some(ph_id) then
+        # Insert invariant statements at the END of the preheader (before its terminator)
+        match get_block_mut(f, ph_id)
+        when Option::Some(preheader_block) then
+          for inv_stmt in invariant_stmts do
+            preheader_block.statements.push(inv_stmt)
+          end
+        when Option::None then ()
+        end
+      when Option::None then
+        # No preheader exists (multiple entry points or entry is the header itself)
+        # Fall back to header (imperfect but better than nothing)
+        mut hoisted = invariant_stmts.clone()
+        for s in header_block.statements do
+          hoisted.push(s)
+        end
+        header_block.statements = hoisted
+      end
     when Option::None then ()
     end
   end
@@ -4079,7 +4160,7 @@ def instrument_for_pgo(program: &mut MirProgram) -> Unit
       # Prepend: __pgo_counters[counter_id] += 1
       let counter_stmt = MirStatement {
         kind: MirStatementKind::BudgetConsume("__pgo_counter_" + counter_id.to_string(), 1),
-        span: Span { file: "".to_string(), line: 0, col: 0, end_line: 0, end_col: 0 }
+        span: span_dummy()  # Use the correct Span from token.tg
       }
       # Insert at position 0
       mut new_stmts = Vec::new()
@@ -4844,9 +4925,11 @@ def rename_operands_in_rvalue(rv: &mut MirRvalue, version_stack: &Map[Int, Vec[I
     rename_operand(&mut rhs, version_stack)
   when MirRvalueKind::UnOp(_, op) then
     rename_operand(&mut op, version_stack)
-  when MirRvalueKind::Ref(_, p) then
+  when MirRvalueKind::Ref(p) then
     rename_place(&mut p, version_stack)
-  when MirRvalueKind::Cast(op, _) then
+  when MirRvalueKind::RefMut(p) then
+    rename_place(&mut p, version_stack)
+  when MirRvalueKind::Cast(_, op, _) then
     rename_operand(&mut op, version_stack)
   when _ then ()
   end
@@ -4876,13 +4959,11 @@ end
 
 def rename_operands_in_terminator(term: &mut MirTerminator, version_stack: &Map[Int, Vec[Int]]) -> Unit
   match term.kind
-  when MirTerminatorKind::Return(op) then
-    match op
-    when Option::Some(operand) then
-      rename_operand(&mut operand, version_stack)
-    when Option::None then ()
-    end
-  when MirTerminatorKind::Call(_, args, _, _) then
+  when MirTerminatorKind::Return then
+    # Return has no operand - return value is in local 0
+    ()
+  when MirTerminatorKind::Call(_, func_op, args, _, _) then
+    rename_operand(&mut func_op, version_stack)
     for arg in args do
       rename_operand(&mut arg, version_stack)
     end
@@ -4923,14 +5004,7 @@ def fill_phi_args(f: &mut MirFunction, succ_id: BlockId, pred_id: BlockId,
   end
 end
 
-def get_block_mut(f: &mut MirFunction, id: BlockId) -> Option[&mut MirBlock]
-  for block in f.blocks do
-    if block.id.id == id.id then
-      return Option::Some(block)
-    end
-  end
-  Option::None
-end
+# Note: get_block_mut is defined earlier in this file
 
 # ———————————————————————————————————————————————————————————————
 # Public API
@@ -5097,15 +5171,15 @@ def verify_rvalue(rvalue: &MirRvalue, valid_locals: &Set[Int],
                   ctx: &String, errors: &mut Vec[String]) -> Unit
   match rvalue.kind
   when MirRvalueKind::Use(operand) then verify_operand(&operand, valid_locals, ctx, errors)
-  when MirRvalueKind::BinaryOp(_, lhs, rhs) then
+  when MirRvalueKind::BinOp(_, lhs, rhs) then
     verify_operand(&lhs, valid_locals, ctx, errors)
     verify_operand(&rhs, valid_locals, ctx, errors)
-  when MirRvalueKind::UnaryOp(_, operand) then verify_operand(&operand, valid_locals, ctx, errors)
+  when MirRvalueKind::UnOp(_, operand) then verify_operand(&operand, valid_locals, ctx, errors)
   when MirRvalueKind::Ref(place) then
     if !valid_locals.contains(&place.local.id) then
       errors.push(ctx.clone() + ": ref to undefined local _" + place.local.id.to_string())
     end
-  when MirRvalueKind::Cast(operand, _) then verify_operand(&operand, valid_locals, ctx, errors)
+  when MirRvalueKind::Cast(_, operand, _) then verify_operand(&operand, valid_locals, ctx, errors)
   when MirRvalueKind::Aggregate(_, operands) then
     for op in operands do
       verify_operand(&op, valid_locals, ctx, errors)
@@ -5144,12 +5218,15 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
     if !valid_blocks.contains(&target.id) then
       errors.push(ctx.clone() + ": goto references invalid block bb" + target.id.to_string())
     end
-  when MirTerminatorKind::SwitchInt(operand, targets) then
+  when MirTerminatorKind::SwitchInt(operand, targets, fallback) then
     verify_operand(&operand, valid_locals, ctx, errors)
-    for (_, target) in targets do
-      if !valid_blocks.contains(&target.id) then
-        errors.push(ctx.clone() + ": switch references invalid block bb" + target.id.to_string())
+    for t in targets do
+      if !valid_blocks.contains(&t.target.id) then
+        errors.push(ctx.clone() + ": switch references invalid block bb" + t.target.id.to_string())
       end
+    end
+    if !valid_blocks.contains(&fallback.id) then
+      errors.push(ctx.clone() + ": switch fallback references invalid block bb" + fallback.id.to_string())
     end
   when MirTerminatorKind::Return then ()
   when MirTerminatorKind::Unreachable then ()
@@ -5198,36 +5275,7 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
   end
 end
 
-def terminator_successors(term: &MirTerminator) -> Vec[Int]
-  mut succs = Vec::new()
-  match term.kind
-  when MirTerminatorKind::Goto(t) then succs.push(t.id)
-  when MirTerminatorKind::SwitchInt(_, targets) then
-    for (_, t) in targets do succs.push(t.id) end
-  when MirTerminatorKind::Call(_, _, _, s, u) then
-    succs.push(s.id)
-    match u
-    when Option::Some(ub) then succs.push(ub.id)
-    when Option::None then ()
-    end
-  when MirTerminatorKind::Drop(_, t, u) then
-    succs.push(t.id)
-    match u
-    when Option::Some(ub) then succs.push(ub.id)
-    when Option::None then ()
-    end
-  when MirTerminatorKind::Assert(_, _, _, t, u) then
-    succs.push(t.id)
-    match u
-    when Option::Some(ub) then succs.push(ub.id)
-    when Option::None then ()
-    end
-  when MirTerminatorKind::Return then ()
-  when MirTerminatorKind::Unreachable then ()
-  when _ then ()
-  end
-  succs
-end
+# Note: terminator_successors is defined earlier in this file (returns Vec[BlockId])
 
 def block_exists(func: &MirFunction, id: BlockId) -> Bool
   for block in func.blocks do

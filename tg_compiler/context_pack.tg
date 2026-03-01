@@ -1,0 +1,498 @@
+## Tangerine Compiler — Context Pack (ctxpack) Generation
+##
+## §91-103: ctxpack.json schema implementation
+## Formal specification of the context pack format for agent consumption.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::mode::{Mode, Span}
+use tg_compiler::cqs::{SurfaceClass, Signal, SuggestedAction, sha256}
+use tg_compiler::symbol_graph::{
+  SymbolGraph, GraphKind, SymbolSummary, CodeSpan,
+  SeedSet, SelectionResult, GreedyStep,
+  CandidateItem, Tier, ItemKind, Need,
+  greedy_select, compute_utility
+}
+
+# ═══════════════════════════════════════════════════════════════
+# §91 — Top-Level ctxpack.json Structure
+# ═══════════════════════════════════════════════════════════════
+
+struct Ctxpack
+  schema_version: String       # "ctxpack.v0.2"
+  tangerine: ToolchainInfo     # §92
+  pack: PackIdentity           # §93
+  inputs: PackInputs           # §94
+  budgets: PackBudgets         # §95
+  graphs: GraphMetadata        # §96
+  selection: SelectionModel    # §97
+  artifacts: Artifacts         # §98
+  items: Vec[CtxItem]          # §99
+  spans: Vec[SpanEntry]        # §100
+  proof: Proof                 # §101
+end
+
+# §92 — Toolchain identity
+struct ToolchainInfo
+  edition: String
+  tgc_version: String
+  tg_version: String
+  target: String
+end
+
+# §93 — Pack identity & hashing
+struct PackIdentity
+  pack_id: String                 # SHA256 of canonical inputs
+  created_utc: String
+  profile: String                 # e.g. "backend"
+  mode: String                    # e.g. "Production"
+  determinism: DeterminismInfo
+end
+
+struct DeterminismInfo
+  sort_order: String
+  hash_scheme: String
+  branch_id_scheme: String
+  arm_id_scheme: String
+end
+
+# §94 — Inputs
+struct PackInputs
+  query: PackQuery
+  seed_symbols: Vec[String]       # Stable-sorted lexicographically
+  index: IndexRefs
+end
+
+struct PackQuery
+  kind: String    # "compile_error", "failing_test", "cqs_gate", "manual"
+  value: String
+  primary_spans: Vec[Span]
+end
+
+struct IndexRefs
+  symbol_graph_id: Option[String]
+  sdg_id: Option[String]
+  coverage_id: Option[String]
+  caps_baseline_id: Option[String]
+end
+
+# §95 — Budgets (enforced limits)
+struct PackBudgets
+  unit: String            # "CU" (1 CU = 4 bytes UTF-8)
+  total: Int
+  summaries: Int
+  code: Int
+  used: BudgetUsed
+end
+
+struct BudgetUsed
+  total: Int
+  summaries: Int
+  code: Int
+end
+
+# §96 — Graphs (graph metadata)
+struct GraphMetadata
+  edge_costs: EdgeCosts
+  radius_caps: Map[String, Float]
+  limits: GraphLimits
+end
+
+struct EdgeCosts
+  call: Float
+  type_use: Float
+  trait_: Float
+  effect: Float
+  test: Float
+  file: Float
+end
+
+def default_edge_costs() -> EdgeCosts
+  EdgeCosts {
+    call: 1.0,
+    type_use: 1.2,
+    trait_: 1.1,
+    effect: 0.8,
+    test: 0.9,
+    file: 1.4
+  }
+end
+
+struct GraphLimits
+  max_candidate_symbols: Int
+  max_expanded_edges: Int
+  max_seeds: Int
+end
+
+def default_limits() -> GraphLimits
+  GraphLimits {
+    max_candidate_symbols: 25000,
+    max_expanded_edges: 250000,
+    max_seeds: 300
+  }
+end
+
+# §97 — Selection (optimization model)
+struct SelectionModel
+  algorithm: String           # "submodular_greedy_knapsack"
+  objective: String           # "weighted_need_coverage"
+  alpha: Float                # Distance decay
+  k: Int                      # Max summaries
+  needs_profile: String       # e.g. "backend"
+  weights: Map[String, Float]
+end
+
+# §98 — Artifacts (optional attachments)
+struct Artifacts
+  quality_report_path: Option[String]
+  merged_coverage_path: Option[String]
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §99 — Items (selected context items)
+# ═══════════════════════════════════════════════════════════════
+
+struct CtxItem
+  item_id: String           # Stable across deterministic runs
+  tier: String              # "S", "M", "L"
+  kind: String              # Item kind
+  cost_cu: Int
+  covers: Vec[String]       # Need IDs covered
+  why: ItemWhy              # Audit trail
+  payload: String           # JSON payload
+end
+
+# §99.2 — Audit trail per item
+struct ItemWhy
+  seed_distance: SeedDistanceInfo
+  slice_membership: SliceMembership
+  marginal_gain: MarginalGain
+  priority_tags: Vec[String]
+end
+
+struct SeedDistanceInfo
+  min: Float
+  avg: Float
+  sources: Vec[SeedSource]
+end
+
+struct SeedSource_
+  seed: String
+  dist: Float
+  via: String
+end
+
+struct SliceMembership
+  in_backward_slice: Bool
+  in_forward_slice: Bool
+  sdg_available: Bool
+  sdg_nodes: Vec[Int]
+end
+
+struct MarginalGain
+  delta_f: Float
+  delta_per_cu: Float
+end
+
+# §99.3 — Canonical Item Kinds
+# symbol_summary (Tier S), definition_span (Tier M), slice_span (Tier L),
+# test_summary, test_span, trait_resolution_bundle,
+# capability_boundary_bundle, taint_flow_bundle
+
+def item_cost_cu(payload_json: String) -> Int
+  # cost_cu = ceil(byte_len(payload_json)/4) + 10 (fixed overhead)
+  let bytes = payload_json.len()
+  (bytes + 3) / 4 + 10
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §100 — Spans (actual code excerpts)
+# ═══════════════════════════════════════════════════════════════
+
+struct SpanEntry
+  span_ref: String          # Unique reference
+  file: String
+  start: Int                # Byte offset (UTF-8)
+  end_pos: Int
+  hash: String              # SHA256 of text bytes
+  language: String          # "tangerine"
+  text: String
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §101 — Proof (global audit + optimization log)
+# ═══════════════════════════════════════════════════════════════
+
+struct Proof
+  needs_universe: Vec[NeedEntry]
+  candidates_considered: Int
+  selected_count: Int
+  objective_value: ObjectiveValue
+  greedy_trace: Vec[GreedyTraceEntry]
+  trace_truncated: Bool
+  f_upper_bound: Float
+  truncation: TruncationInfo
+end
+
+struct NeedEntry
+  id: String
+  weight: Float
+  category: String
+end
+
+struct ObjectiveValue
+  f_selected: Float
+  f_upper_bound: Float
+end
+
+struct GreedyTraceEntry
+  step: Int
+  picked_item_id: String
+  cost_cu: Int
+  delta_f: Float
+  delta_per_cu: Float
+  budget_remaining_cu: Int
+end
+
+struct TruncationInfo
+  candidate_cap_hit: Bool
+  edge_cap_hit: Bool
+  seed_cap_hit: Bool
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §102 — Determinism Rules
+# ═══════════════════════════════════════════════════════════════
+
+# Candidate generation: stable-sorted by (node_id, edge_kind, neighbor_id)
+# Greedy ties broken lexicographically by item_id
+# Costs: cost_cu = ceil(byte_len(payload_json)/4) + 10
+# Spans use byte offsets with stable file normalization
+# Truncation MUST be recorded in proof.truncation
+
+# ═══════════════════════════════════════════════════════════════
+# §103 — Minimal Compliance Levels
+# ═══════════════════════════════════════════════════════════════
+
+enum ComplianceLevel
+  Level1  # Required v0.2: symbol graph, summaries, greedy selection, spans
+  Level2  # Recommended: SDG slicing, taint flow, capability drift bundles
+  Level3  # Advanced: tighter bounds, replay trace, cross-package merging
+end
+
+def check_compliance(pack: &Ctxpack) -> ComplianceLevel
+  # Level 1: Must have symbol graph, items with summaries, spans, proof
+  let has_summaries = pack.items.iter().any(|i| i.kind == "symbol_summary")
+  let has_spans = !pack.spans.is_empty()
+  let has_proof = pack.proof.candidates_considered > 0
+
+  if !has_summaries || !has_spans || !has_proof
+    return ComplianceLevel::Level1  # Minimum required
+  end
+
+  # Level 2: SDG slicing available
+  let has_sdg = pack.items.iter().any(|i|
+    match &i.why.slice_membership.sdg_available { true => true, false => false }
+  )
+  let has_taint = pack.items.iter().any(|i| i.kind == "taint_flow_bundle")
+  let has_cap = pack.items.iter().any(|i| i.kind == "capability_boundary_bundle")
+
+  if has_sdg && (has_taint || has_cap)
+    return ComplianceLevel::Level3
+  else if has_sdg
+    return ComplianceLevel::Level2
+  end
+
+  ComplianceLevel::Level1
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Build a complete ctxpack
+# ═══════════════════════════════════════════════════════════════
+
+def build_ctxpack(
+  graph: &SymbolGraph,
+  seeds: &SeedSet,
+  needs: &Vec[Need],
+  candidates: &Vec[CandidateItem],
+  budget_total: Int,
+  summaries_ratio: Float,
+  alpha: Float,
+  k: Int,
+  profile: String,
+  mode: Mode,
+  target: String
+) -> Ctxpack
+  let budget_summaries = to_int(to_float(budget_total) * summaries_ratio)
+  let budget_code = budget_total - budget_summaries
+
+  # Run greedy selection
+  let result = greedy_select(candidates, needs, budget_total)
+
+  # Separate into items
+  let items = Vec::new()
+  for item in &result.selected
+    items.push(CtxItem {
+      item_id: item.item_id,
+      tier: match item.tier
+        when Tier::S then "S"
+        when Tier::M then "M"
+        when Tier::L then "L"
+      end,
+      kind: match item.kind
+        when ItemKind::SymbolSummary then "symbol_summary"
+        when ItemKind::DefinitionSpan then "definition_span"
+        when ItemKind::SliceSpan then "slice_span"
+        when ItemKind::TestSummary then "test_summary"
+        when ItemKind::TestSpan then "test_span"
+        when ItemKind::TraitResolutionBundle then "trait_resolution_bundle"
+        when ItemKind::CapabilityBoundaryBundle then "capability_boundary_bundle"
+        when ItemKind::TaintFlowBundle then "taint_flow_bundle"
+      end,
+      cost_cu: item.cost_cu,
+      covers: item.covers.clone(),
+      why: ItemWhy {
+        seed_distance: SeedDistanceInfo { min: 0.0, avg: 0.0, sources: Vec::new() },
+        slice_membership: SliceMembership {
+          in_backward_slice: false,
+          in_forward_slice: false,
+          sdg_available: false,
+          sdg_nodes: Vec::new()
+        },
+        marginal_gain: MarginalGain { delta_f: 0.0, delta_per_cu: 0.0 },
+        priority_tags: Vec::new()
+      },
+      payload: item.payload
+    })
+  end
+
+  # Build greedy trace entries
+  let trace = Vec::new()
+  let trace_max = 200
+  for i in 0..min_int(result.greedy_trace.len(), trace_max) do
+    let step = &result.greedy_trace[i]
+    trace.push(GreedyTraceEntry {
+      step: step.step,
+      picked_item_id: step.item_id,
+      cost_cu: step.cost_cu,
+      delta_f: step.delta_f,
+      delta_per_cu: step.delta_per_cu,
+      budget_remaining_cu: step.budget_remaining
+    })
+  end
+
+  # Build seed symbol list (stable-sorted)
+  let seed_ids = seeds.seeds.iter().map(|s| s.symbol_id).collect()
+  seed_ids.sort()
+
+  # Compute pack_id deterministically
+  let all_item_ids = items.iter().map(|i| i.item_id).collect()
+  all_item_ids.sort()
+  let pack_id = sha256(seed_ids.join("|") + "||" + all_item_ids.join("|"))
+
+  Ctxpack {
+    schema_version: "ctxpack.v0.2",
+    tangerine: ToolchainInfo {
+      edition: "2026",
+      tgc_version: "0.1.0",
+      tg_version: "0.1.0",
+      target: target
+    },
+    pack: PackIdentity {
+      pack_id: pack_id,
+      created_utc: __intrinsic_utc_now(),
+      profile: profile,
+      mode: match mode
+        when Mode::Dev then "Dev"
+        when Mode::Strict then "Strict"
+        when Mode::Production then "Production"
+        when Mode::Hardened then "Hardened"
+      end,
+      determinism: DeterminismInfo {
+        sort_order: "lexicographic",
+        hash_scheme: "sha256",
+        branch_id_scheme: "tg.branch.v1",
+        arm_id_scheme: "tg.arm.v1"
+      }
+    },
+    inputs: PackInputs {
+      query: PackQuery {
+        kind: "manual",
+        value: "",
+        primary_spans: Vec::new()
+      },
+      seed_symbols: seed_ids,
+      index: IndexRefs {
+        symbol_graph_id: Option::None,
+        sdg_id: Option::None,
+        coverage_id: Option::None,
+        caps_baseline_id: Option::None
+      }
+    },
+    budgets: PackBudgets {
+      unit: "CU",
+      total: budget_total,
+      summaries: budget_summaries,
+      code: budget_code,
+      used: BudgetUsed {
+        total: result.budget_used,
+        summaries: 0,
+        code: 0
+      }
+    },
+    graphs: GraphMetadata {
+      edge_costs: default_edge_costs(),
+      radius_caps: Map::new(),
+      limits: default_limits()
+    },
+    selection: SelectionModel {
+      algorithm: "submodular_greedy_knapsack",
+      objective: "weighted_need_coverage",
+      alpha: alpha,
+      k: k,
+      needs_profile: profile,
+      weights: Map::new()
+    },
+    artifacts: Artifacts {
+      quality_report_path: Option::None,
+      merged_coverage_path: Option::None
+    },
+    items: items,
+    spans: Vec::new(),
+    proof: Proof {
+      needs_universe: needs.iter().map(|n| NeedEntry {
+        id: n.id, weight: n.weight, category: n.category
+      }).collect(),
+      candidates_considered: candidates.len(),
+      selected_count: result.selected.len(),
+      objective_value: ObjectiveValue {
+        f_selected: result.objective_value,
+        f_upper_bound: result.upper_bound
+      },
+      greedy_trace: trace,
+      trace_truncated: result.greedy_trace.len() > trace_max,
+      f_upper_bound: result.upper_bound,
+      truncation: TruncationInfo {
+        candidate_cap_hit: false,
+        edge_cap_hit: false,
+        seed_cap_hit: false
+      }
+    }
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Utility
+# ═══════════════════════════════════════════════════════════════
+
+def to_float(i: Int) -> Float
+  __intrinsic_int_to_float(i)
+end
+
+def to_int(f: Float) -> Int
+  __intrinsic_float_to_int(f)
+end
+
+def min_int(a: Int, b: Int) -> Int
+  if a < b then a else b end
+end

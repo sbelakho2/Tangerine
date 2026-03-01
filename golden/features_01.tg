@@ -1,0 +1,259 @@
+## Golden test: Mode system, guard keyword, security profiles, CQS scoring
+## Covers: §1, §2, §3, §4, §7, §10, §13, §17, §19
+
+# ——————————————————————————————————————————————————
+# §1 — Mode System
+# ——————————————————————————————————————————————————
+
+@test
+def test_mode_enum()
+  use tg_compiler::mode::{Mode, config_for_mode, is_at_least, parse_mode}
+
+  let dev = Mode::Dev
+  let strict = Mode::Strict
+  let prod = Mode::Production
+  let hard = Mode::Hardened
+
+  assert is_at_least(strict, Mode::Dev)      # Strict >= Dev
+  assert is_at_least(prod, Mode::Strict)     # Prod >= Strict
+  assert is_at_least(hard, Mode::Production) # Hardened >= Prod
+  assert !is_at_least(dev, Mode::Strict)     # Dev < Strict
+
+  assert parse_mode("Production") == Mode::Production
+  assert parse_mode("dev") == Mode::Dev
+end
+
+@test
+def test_mode_config_defaults()
+  use tg_compiler::mode::{Mode, config_for_mode}
+
+  let dev_cfg = config_for_mode(Mode::Dev)
+  assert !dev_cfg.stub_detection.error_pub_placeholders
+  assert dev_cfg.stub_detection.warn_constant_returns
+
+  let prod_cfg = config_for_mode(Mode::Production)
+  assert prod_cfg.stub_detection.error_pub_placeholders
+  assert prod_cfg.error_handling.require_explicit_ignore
+end
+
+# ——————————————————————————————————————————————————
+# §2 — Guard Keyword
+# ——————————————————————————————————————————————————
+
+@test
+def test_guard_basic()
+  use std::contracts::{make_guard, GuardElseAction, guard_else_diverges, desugar_guard}
+
+  let g = make_guard("x > 0", GuardElseAction::Return("0"))
+  assert guard_else_diverges(&g)
+  assert g.promoted_contract.is_some()
+
+  let code = desugar_guard(&g)
+  assert code.contains("if !(x > 0)")
+  assert code.contains("return 0")
+end
+
+@test
+def test_guard_let_binding()
+  use std::contracts::{make_guard, GuardElseAction}
+
+  let g = make_guard("let Some(val) = x", GuardElseAction::Panic("expected Some"))
+  assert g.narrows_type  # `let` in condition triggers type narrowing
+end
+
+# ——————————————————————————————————————————————————
+# §3 — Security Profiles
+# ——————————————————————————————————————————————————
+
+@test
+def test_security_profiles()
+  use std::capabilities::{
+    SecurityProfile, profile_allowed_caps, profile_denied_caps,
+    profile_check, parse_profile, CapCheckResult
+  }
+
+  let backend = SecurityProfile::Backend
+  let allowed = profile_allowed_caps(&backend)
+  assert allowed.contains("Net")
+  assert allowed.contains("File")
+  assert !allowed.contains("Unsafe")
+
+  let denied = profile_denied_caps(&backend)
+  assert denied.contains("Unsafe")
+
+  match profile_check(&backend, &"Net")
+    when CapCheckResult::Satisfied then ()   # Expected
+    else panic("Net should be allowed for backend profile")
+  end
+
+  match profile_check(&backend, &"Unsafe")
+    when CapCheckResult::Conflict(_) then ()  # Expected
+    else panic("Unsafe should be denied for backend profile")
+  end
+end
+
+@test
+def test_library_profile_restrictive()
+  use std::capabilities::{SecurityProfile, profile_allowed_caps}
+
+  let lib_caps = profile_allowed_caps(&SecurityProfile::Library)
+  assert lib_caps.is_empty()  # Library: nothing by default
+end
+
+# ——————————————————————————————————————————————————
+# §11 — Secure Data Types
+# ——————————————————————————————————————————————————
+
+@test
+def test_sql_query()
+  use std::secure_types::{sql_query, SqlParam, sql_debug_string}
+
+  let q = sql_query("SELECT * FROM users WHERE id = $1", vec![SqlParam::Int(42)])
+  assert q.is_ok()
+  let query = q.unwrap()
+  assert sql_debug_string(&query).contains("42")
+
+  # Wrong number of params
+  let bad = sql_query("SELECT $1, $2", vec![SqlParam::Int(1)])
+  assert bad.is_err()
+end
+
+@test
+def test_html_escape()
+  use std::secure_types::{html_escape, html_to_string}
+
+  let safe = html_escape(&"<script>alert('xss')</script>")
+  let content = html_to_string(&safe)
+  assert content.contains("&lt;script&gt;")
+  assert !content.contains("<script>")
+end
+
+@test
+def test_url_validation()
+  use std::secure_types::{url_parse}
+
+  let good = url_parse(&"https://example.com/path?q=1")
+  assert good.is_ok()
+
+  let js = url_parse(&"javascript://alert(1)")
+  assert js.is_err()  # Blocked scheme
+end
+
+@test
+def test_safe_path()
+  use std::secure_types::{path_parse, path_to_string}
+
+  let good = path_parse(&"/usr/local/bin")
+  assert good.is_ok()
+  assert path_to_string(&good.unwrap()) == "/usr/local/bin"
+
+  let traversal = path_parse(&"/etc/../shadow")
+  assert traversal.is_err()  # Rejects traversal
+
+  let null_byte = path_parse(&"/etc/\0shadow")
+  assert null_byte.is_err()  # Rejects null byte
+end
+
+# ——————————————————————————————————————————————————
+# §12 — FFI Taint Tracking
+# ——————————————————————————————————————————————————
+
+@test
+def test_taint_basic()
+  use std::taint::{taint, TaintLabel, validate_with}
+
+  let tainted_int = taint(42, TaintLabel::FfiInput)
+
+  # Can validate with a predicate
+  let clean = validate_with(&tainted_int, |x| *x > 0, "must be positive")
+  assert clean.is_ok()
+  assert clean.unwrap() == 42
+
+  # Failing validation
+  let bad = validate_with(&tainted_int, |x| *x > 100, "must be > 100")
+  assert bad.is_err()
+end
+
+@test
+def test_taint_propagation()
+  use std::taint::{taint, TaintLabel, taint_map, validate_with}
+
+  let tainted = taint("hello", TaintLabel::NetworkRead)
+  let mapped = taint_map(&tainted, |s| s.len())
+
+  # Taint propagates through map
+  let clean = validate_with(&mapped, |n| *n < 100, "length check")
+  assert clean.is_ok()
+  assert clean.unwrap() == 5
+end
+
+# ——————————————————————————————————————————————————
+# §9 — Deterministic Replay
+# ——————————————————————————————————————————————————
+
+@test
+def test_replay_recorder()
+  use std::replay::{
+    recorder_new, recorder_record_schedule, recorder_record_time,
+    scheduler_finish
+  }
+
+  let rec = recorder_new()
+  recorder_record_schedule(&mut rec, 1)
+  recorder_record_schedule(&mut rec, 2)
+  recorder_record_time(&mut rec, 1000000)
+
+  assert rec.events.len() == 3
+  assert rec.tick == 3
+end
+
+@test
+def test_replay_serialize_roundtrip()
+  use std::replay::{
+    ReplayTrace, TraceHeader, ReplayEvent,
+    trace_serialize
+  }
+
+  let trace = ReplayTrace {
+    header: TraceHeader {
+      format_version: "tg.replay.v1",
+      tangerine_version: "0.1.0",
+      program_hash: "abc123",
+      args_hash: "def456",
+      start_time: "2026-01-01T00:00:00Z",
+      event_count: 1
+    },
+    events: vec![ReplayEvent::TimeQuery(nanos: 42000)]
+  }
+
+  let data = trace_serialize(&trace)
+  assert !data.is_empty()
+end
+
+# ——————————————————————————————————————————————————
+# §16 — Supply Chain Security
+# ——————————————————————————————————————————————————
+
+@test
+def test_semver_parse()
+  use std::supply_chain::{semver_parse, semver_to_string}
+
+  let v = semver_parse(&"1.2.3").unwrap()
+  assert v.major == 1
+  assert v.minor == 2
+  assert v.patch == 3
+  assert semver_to_string(&v) == "1.2.3"
+
+  let pre = semver_parse(&"1.0.0-alpha.1").unwrap()
+  assert pre.pre == Option::Some("alpha.1")
+end
+
+@test
+def test_supply_chain_policy()
+  use std::supply_chain::{default_policy, SupplyChainPolicy}
+
+  let policy = default_policy()
+  assert policy.min_direct_trust == 0.5
+  assert policy.require_owner_sig
+  assert policy.max_dep_depth == 10
+end

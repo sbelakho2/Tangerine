@@ -14,7 +14,368 @@ use std::collections::{Map, Set}
 use std::fs::{File}
 use std::io::{Write, BufWriter}
 use std::time::{Instant, Duration, SystemTime}
-use std::thread::{ThreadId}
+use std::thread::{ThreadId, spawn, thread_sleep}
+use std::alloc::{tg_alloc, tg_free, size_of}
+
+# ═══════════════════════════════════════════════════════════════
+# PLATFORM-SPECIFIC SAMPLING EXTERN DECLARATIONS
+# ═══════════════════════════════════════════════════════════════
+
+# Linux: SIGPROF-based sampling via setitimer
+#[cfg(target_os = "linux")]
+extern "C"
+  def setitimer(which: Int, new_value: Ptr[ITimerVal], old_value: Ptr[ITimerVal]) -> Int
+  def sigaction(signum: Int, act: Ptr[SigAction], oldact: Ptr[SigAction]) -> Int
+  def backtrace(buffer: Ptr[Ptr[u8]], size: Int) -> Int
+  def backtrace_symbols(buffer: Ptr[Ptr[u8]], size: Int) -> Ptr[Ptr[u8]]
+  def dladdr(addr: Ptr[u8], info: Ptr[DlInfo]) -> Int
+  def pthread_self() -> u64
+  def getpid() -> Int
+end
+
+#[cfg(target_os = "linux")]
+struct ITimerVal
+  it_interval_sec: i64
+  it_interval_usec: i64
+  it_value_sec: i64
+  it_value_usec: i64
+end
+
+#[cfg(target_os = "linux")]
+struct SigAction
+  sa_handler: Ptr[u8]
+  sa_mask: [u64; 16]
+  sa_flags: Int
+  sa_restorer: Ptr[u8]
+end
+
+#[cfg(target_os = "linux")]
+struct DlInfo
+  dli_fname: Ptr[u8]
+  dli_fbase: Ptr[u8]
+  dli_sname: Ptr[u8]
+  dli_saddr: Ptr[u8]
+end
+
+#[cfg(target_os = "linux")]
+def SIGPROF() -> Int = 27
+def ITIMER_PROF() -> Int = 2
+def SA_SIGINFO() -> Int = 4
+
+# macOS: mach thread sampling via thread_get_state
+#[cfg(target_os = "macos")]
+extern "C"
+  def mach_thread_self() -> u32
+  def thread_get_state(thread: u32, flavor: Int, state: Ptr[u8], count: Ptr[u32]) -> Int
+  def task_threads(task: u32, threads: Ptr[Ptr[u32]], count: Ptr[u32]) -> Int
+  def mach_task_self() -> u32
+  def backtrace(buffer: Ptr[Ptr[u8]], size: Int) -> Int
+  def backtrace_symbols(buffer: Ptr[Ptr[u8]], size: Int) -> Ptr[Ptr[u8]]
+  def dladdr(addr: Ptr[u8], info: Ptr[Dl_info]) -> Int
+  def pthread_self() -> u64
+  def getpid() -> Int
+end
+
+#[cfg(target_os = "macos")]
+struct Dl_info
+  dli_fname: Ptr[u8]
+  dli_fbase: Ptr[u8]
+  dli_sname: Ptr[u8]
+  dli_saddr: Ptr[u8]
+end
+
+#[cfg(target_os = "macos")]
+def x86_THREAD_STATE64() -> Int = 4
+def ARM_THREAD_STATE64() -> Int = 6
+
+# Windows: SuspendThread + GetThreadContext
+#[cfg(target_os = "windows")]
+extern "C"
+  def GetCurrentThread() -> Ptr[u8]
+  def GetCurrentThreadId() -> u32
+  def GetCurrentProcessId() -> u32
+  def SuspendThread(hThread: Ptr[u8]) -> u32
+  def ResumeThread(hThread: Ptr[u8]) -> u32
+  def GetThreadContext(hThread: Ptr[u8], lpContext: Ptr[CONTEXT]) -> Int
+  def OpenThread(dwDesiredAccess: u32, bInheritHandle: Int, dwThreadId: u32) -> Ptr[u8]
+  def CloseHandle(hObject: Ptr[u8]) -> Int
+  def RtlCaptureStackBackTrace(FramesToSkip: u32, FramesToCapture: u32, BackTrace: Ptr[Ptr[u8]], BackTraceHash: Ptr[u32]) -> u16
+  def SymFromAddr(hProcess: Ptr[u8], Address: u64, Displacement: Ptr[u64], Symbol: Ptr[SYMBOL_INFO]) -> Int
+  def SymInitialize(hProcess: Ptr[u8], UserSearchPath: Ptr[u8], fInvadeProcess: Int) -> Int
+  def GetCurrentProcess() -> Ptr[u8]
+end
+
+#[cfg(target_os = "windows")]
+struct CONTEXT
+  data: [u8; 1232]  # Full Windows CONTEXT structure
+end
+
+#[cfg(target_os = "windows")]
+struct SYMBOL_INFO
+  SizeOfStruct: u32
+  TypeIndex: u32
+  Reserved: [u64; 2]
+  Index: u32
+  Size: u32
+  ModBase: u64
+  Flags: u32
+  Value: u64
+  Address: u64
+  Register: u32
+  Scope: u32
+  Tag: u32
+  NameLen: u32
+  MaxNameLen: u32
+  Name: [u8; 256]
+end
+
+#[cfg(target_os = "windows")]
+def THREAD_SUSPEND_RESUME() -> u32 = 0x0002
+def THREAD_GET_CONTEXT() -> u32 = 0x0008
+def CONTEXT_FULL() -> u32 = 0x10001F
+
+# ═══════════════════════════════════════════════════════════════
+# SAMPLING BACKEND
+# ═══════════════════════════════════════════════════════════════
+
+struct SamplingBackend
+  running: Bool
+  sample_interval_us: u64
+  target_profiler: Ptr[Profiler]
+end
+
+mut SAMPLING_BACKEND: Option[SamplingBackend] = Option::None
+
+#[cfg(target_os = "linux")]
+def capture_stack_trace(max_depth: UInt) -> Vec[StackFrame]
+  mut frames = Vec::new()
+  mut buffer: [Ptr[u8]; 128] = [Ptr::null(); 128]
+  let depth = max_depth.min(128) as Int
+  
+  let count = backtrace(&buffer[0], depth)
+  
+  mut i = 0
+  while i < count do
+    mut info = DlInfo {
+      dli_fname: Ptr::null(),
+      dli_fbase: Ptr::null(),
+      dli_sname: Ptr::null(),
+      dli_saddr: Ptr::null()
+    }
+    
+    if dladdr(buffer[i], &info) != 0 && !info.dli_sname.is_null() then
+      let fn_name = String::from_cstr(info.dli_sname)
+      let module = if !info.dli_fname.is_null() then 
+        String::from_cstr(info.dli_fname)
+      else 
+        "<unknown>"
+      end
+      
+      frames.push(StackFrame {
+        function_name: fn_name,
+        module: module,
+        file: "",
+        line: 0,
+        address: buffer[i] as u64
+      })
+    else
+      frames.push(StackFrame {
+        function_name: "<unknown>",
+        module: "<unknown>",
+        file: "",
+        line: 0,
+        address: buffer[i] as u64
+      })
+    end
+    i = i + 1
+  end
+  
+  frames
+end
+
+#[cfg(target_os = "macos")]
+def capture_stack_trace(max_depth: UInt) -> Vec[StackFrame]
+  mut frames = Vec::new()
+  mut buffer: [Ptr[u8]; 128] = [Ptr::null(); 128]
+  let depth = max_depth.min(128) as Int
+  
+  let count = backtrace(&buffer[0], depth)
+  
+  mut i = 0
+  while i < count do
+    mut info = Dl_info {
+      dli_fname: Ptr::null(),
+      dli_fbase: Ptr::null(),
+      dli_sname: Ptr::null(),
+      dli_saddr: Ptr::null()
+    }
+    
+    if dladdr(buffer[i], &info) != 0 && !info.dli_sname.is_null() then
+      let fn_name = String::from_cstr(info.dli_sname)
+      let module = if !info.dli_fname.is_null() then 
+        String::from_cstr(info.dli_fname)
+      else 
+        "<unknown>"
+      end
+      
+      frames.push(StackFrame {
+        function_name: fn_name,
+        module: module,
+        file: "",
+        line: 0,
+        address: buffer[i] as u64
+      })
+    else
+      frames.push(StackFrame {
+        function_name: "<unknown>",
+        module: "<unknown>",
+        file: "",
+        line: 0,
+        address: buffer[i] as u64
+      })
+    end
+    i = i + 1
+  end
+  
+  frames
+end
+
+#[cfg(target_os = "windows")]
+def capture_stack_trace(max_depth: UInt) -> Vec[StackFrame]
+  mut frames = Vec::new()
+  mut buffer: [Ptr[u8]; 128] = [Ptr::null(); 128]
+  let depth = max_depth.min(128) as u32
+  
+  let count = RtlCaptureStackBackTrace(0, depth, &buffer[0], Ptr::null())
+  
+  # Initialize symbol handler once
+  static mut sym_initialized: Bool = false
+  if !sym_initialized then
+    SymInitialize(GetCurrentProcess(), Ptr::null(), 1)
+    sym_initialized = true
+  end
+  
+  mut i: u16 = 0
+  while i < count do
+    mut symbol = SYMBOL_INFO {
+      SizeOfStruct: size_of[SYMBOL_INFO]() as u32,
+      TypeIndex: 0,
+      Reserved: [0, 0],
+      Index: 0,
+      Size: 0,
+      ModBase: 0,
+      Flags: 0,
+      Value: 0,
+      Address: 0,
+      Register: 0,
+      Scope: 0,
+      Tag: 0,
+      NameLen: 0,
+      MaxNameLen: 255,
+      Name: [0; 256]
+    }
+    mut displacement: u64 = 0
+    
+    if SymFromAddr(GetCurrentProcess(), buffer[i as UInt] as u64, &displacement, &symbol) != 0 then
+      let fn_name = String::from_utf8_lossy(&symbol.Name[0..symbol.NameLen as UInt])
+      
+      frames.push(StackFrame {
+        function_name: fn_name,
+        module: "<unknown>",
+        file: "",
+        line: 0,
+        address: buffer[i as UInt] as u64
+      })
+    else
+      frames.push(StackFrame {
+        function_name: "<unknown>",
+        module: "<unknown>",
+        file: "",
+        line: 0,
+        address: buffer[i as UInt] as u64
+      })
+    end
+    i = i + 1
+  end
+  
+  frames
+end
+
+def start_sampling_thread(profiler: &mut Profiler, sample_rate_hz: u32) -> Unit
+  let interval_us = 1_000_000 / (sample_rate_hz as u64)
+  
+  SAMPLING_BACKEND = Option::Some(SamplingBackend {
+    running: true,
+    sample_interval_us: interval_us,
+    target_profiler: profiler as Ptr[Profiler]
+  })
+  
+  # Spawn sampling thread
+  spawn(|| sampling_loop())
+end
+
+def sampling_loop() -> Unit
+  match SAMPLING_BACKEND
+  when Option::Some(ref mut backend) then
+    while backend.running do
+      let start = Instant::now()
+      
+      # Capture sample
+      let stack = capture_stack_trace(128)
+      let timestamp = start.elapsed_nanos()
+      let thread_id = get_current_thread_id()
+      
+      let sample = Sample {
+        timestamp: timestamp,
+        thread_id: thread_id,
+        stack: stack,
+        cpu_time_ns: 0  # Will be filled by timing
+      }
+      
+      # Add to profiler
+      if backend.target_profiler.is_null() then
+        return
+      end
+      unsafe "dereferencing raw pointer" do
+        let prof = &mut *backend.target_profiler
+        prof.add_sample(sample)
+      end
+      
+      # Sleep for interval
+      let elapsed = start.elapsed()
+      let target = Duration::from_micros(backend.sample_interval_us)
+      if elapsed < target then
+        let remaining = target - elapsed
+        thread_sleep(0, remaining.as_nanos() as i64)
+      end
+    end
+  when Option::None then ()
+  end
+end
+
+def stop_sampling_thread() -> Unit
+  match SAMPLING_BACKEND
+  when Option::Some(ref mut backend) then
+    backend.running = false
+  when Option::None then ()
+  end
+  SAMPLING_BACKEND = Option::None
+end
+
+#[cfg(target_os = "linux")]
+def get_current_thread_id() -> u64
+  pthread_self()
+end
+
+#[cfg(target_os = "macos")]
+def get_current_thread_id() -> u64
+  pthread_self()
+end
+
+#[cfg(target_os = "windows")]
+def get_current_thread_id() -> u64
+  GetCurrentThreadId() as u64
+end
 
 # ═══════════════════════════════════════════════════════════════
 # PART 1: CPU PROFILING
@@ -125,11 +486,8 @@ impl Profiler
     self.total_times.clear()
     self.self_times.clear()
     
-    # Start sampling thread (platform-specific)
-    # Linux: use SIGPROF or perf_event_open + /proc/self/maps
-    # macOS: use mach_msg + thread_get_state + vm_region
-    # Windows: use SuspendThread + GetThreadContext
-    # TODO: implement platform-conditional sampling backends
+    # Start sampling thread (platform-specific backend)
+    start_sampling_thread(self, self.config.sample_rate_hz)
     
     Result::Ok(())
   end
@@ -140,6 +498,9 @@ impl Profiler
     end
     
     self.is_running = false
+    
+    # Stop sampling thread
+    stop_sampling_thread()
     
     # Process samples
     self.process_samples()
@@ -220,68 +581,78 @@ impl Profiler
   end
   
   def to_collapsed_format(self: &Profiler) -> String
-    let mut stacks: Map[String, u64] = Map::new()
+    mut stacks: Map[String, u64] = Map::new()
     
-    for sample in &self.samples do
-      let stack_str = sample.stack.iter()
-        .rev()
-        .map(|f| f.function_name.as_str())
-        .collect::<Vec<_>>()
-        .join(";")
+    for sample in self.samples do
+      # Build stack string by reversing and joining function names
+      mut stack_parts = Vec::new()
+      mut i = sample.stack.len()
+      while i > 0 do
+        i = i - 1
+        stack_parts.push(sample.stack[i].function_name.clone())
+      end
+      let stack_str = stack_parts.join(";")
       
-      *stacks.entry(stack_str).or_insert(0) += 1
+      match stacks.get(&stack_str)
+      when Option::Some(count) then stacks.insert(stack_str, count + 1)
+      when Option::None then stacks.insert(stack_str, 1)
+      end
     end
     
-    let mut lines = Vec::new()
-    for (stack, count) in &stacks do
-      lines.push(format!("{} {}", stack, count))
+    mut lines = Vec::new()
+    for entry in stacks.entries() do
+      lines.push(entry.0 + " " + entry.1.to_string())
     end
     
     lines.join("\n")
   end
   
   def to_chrome_trace(self: &Profiler) -> String
-    let mut events = Vec::new()
+    mut events = Vec::new()
     
-    events.push(r#"{"traceEvents":["#.to_string())
+    events.push("{\"traceEvents\":[")
     
-    let mut first = true
-    for sample in &self.samples do
-      for frame in &sample.stack do
+    mut first = true
+    for sample in self.samples do
+      for frame in sample.stack do
         if !first then
-          events.push(",".to_string())
+          events.push(",")
         end
         first = false
         
-        events.push(format!(
-          r#"{{"name":"{}","cat":"function","ph":"X","ts":{},"dur":{},"pid":1,"tid":{}}}"#,
-          frame.function_name,
-          sample.timestamp / 1000,  # Convert to microseconds
-          sample.cpu_time_ns / 1000,
-          sample.thread_id
-        ))
+        # Build JSON event manually without format! macro
+        let ts_us = (sample.timestamp / 1000).to_string()
+        let dur_us = (sample.cpu_time_ns / 1000).to_string()
+        let tid = sample.thread_id.to_string()
+        events.push("{\"name\":\"" + frame.function_name + 
+                    "\",\"cat\":\"function\",\"ph\":\"X\",\"ts\":" + ts_us +
+                    ",\"dur\":" + dur_us + ",\"pid\":1,\"tid\":" + tid + "}")
       end
     end
     
-    events.push(r#"]}"#.to_string())
+    events.push("]}")
     events.join("")
   end
   
-  fn build_call_tree(self: &Profiler) -> CallTreeNode
-    let mut root = CallTreeNode {
-      name: "<root>".to_string(),
-      self_time: Duration::ZERO,
-      total_time: Duration::ZERO,
+  def build_call_tree(self: &Profiler) -> CallTreeNode
+    mut root = CallTreeNode {
+      name: "<root>",
+      self_time: Duration::zero(),
+      total_time: Duration::zero(),
       call_count: 0,
       children: Map::new()
     }
     
-    for sample in &self.samples do
-      let mut current = &mut root
+    for sample in self.samples do
+      mut current = &mut root
       let sample_duration = Duration::from_nanos(sample.cpu_time_ns)
       
-      for frame in sample.stack.iter().rev() do
-        current.total_time += sample_duration
+      # Reverse iteration through stack
+      mut i = sample.stack.len()
+      while i > 0 do
+        i = i - 1
+        let frame = sample.stack[i]
+        current.total_time = current.total_time + sample_duration
         current.call_count += 1
         
         current = current.children
@@ -330,30 +701,30 @@ end
 
 impl ProfileReport
   def print(self: &ProfileReport) -> Unit
-    println!("═══════════════════════════════════════════════════════")
-    println!("                    PROFILE REPORT                     ")
-    println!("═══════════════════════════════════════════════════════")
-    println!()
-    println!("Total duration: {:?}", self.total_duration)
-    println!("Sample count: {}", self.sample_count)
-    println!()
-    println!("Top functions by self time:")
-    println!("───────────────────────────────────────────────────────")
-    println!("{:<40} {:>10} {:>10} {:>8}", "Function", "Self", "Total", "Calls")
-    println!("───────────────────────────────────────────────────────")
+    puts("═══════════════════════════════════════════════════════")
+    puts("                    PROFILE REPORT                     ")
+    puts("═══════════════════════════════════════════════════════")
+    puts("")
+    puts("Total duration: " + self.total_duration.to_string())
+    puts("Sample count: " + self.sample_count.to_string())
+    puts("")
+    puts("Top functions by self time:")
+    puts("───────────────────────────────────────────────────────")
+    puts(pad_right("Function", 40) + pad_left("Self", 10) + pad_left("Total", 10) + pad_left("Calls", 8))
+    puts("───────────────────────────────────────────────────────")
     
-    for (i, func) in self.functions.iter().enumerate() do
+    mut i = 0
+    for func in self.functions do
       if i >= 20 then break end
       
-      println!("{:<40} {:>10?} {:>10?} {:>8}",
-        truncate(&func.name, 40),
-        func.self_time,
-        func.total_time,
-        func.call_count
-      )
+      puts(pad_right(truncate(func.name, 40), 40) + 
+           pad_left(func.self_time.to_string(), 10) + 
+           pad_left(func.total_time.to_string(), 10) + 
+           pad_left(func.call_count.to_string(), 8))
+      i = i + 1
     end
     
-    println!("───────────────────────────────────────────────────────")
+    puts("───────────────────────────────────────────────────────")
   end
   
   def hot_path(self: &ProfileReport) -> Vec[String]
@@ -380,12 +751,48 @@ impl ProfileReport
   end
 end
 
-def truncate(s: &str, max_len: UInt) -> String
+def truncate(s: String, max_len: UInt) -> String
   if s.len() <= max_len then
-    s.to_string()
+    s
   else
-    format!("{}...", &s[0..max_len - 3])
+    s.slice(0, max_len - 3) + "..."
   end
+end
+
+def pad_left(s: String, width: UInt) -> String
+  if s.len() >= width then return s end
+  mut result = ""
+  mut pad = width - s.len()
+  while pad > 0 do
+    result = result + " "
+    pad = pad - 1
+  end
+  result + s
+end
+
+def pad_right(s: String, width: UInt) -> String
+  if s.len() >= width then return s end
+  mut result = s
+  mut pad = width - s.len()
+  while pad > 0 do
+    result = result + " "
+    pad = pad - 1
+  end
+  result
+end
+
+def format_float(f: Float, decimals: UInt) -> String
+  # Simple float formatting - integer part + decimal part
+  let int_part = f as Int
+  let frac = f - (int_part as Float)
+  let multiplier = 10.0.pow(decimals as Float) as Int
+  let frac_int = ((frac * (multiplier as Float)) as Int).abs()
+  
+  mut frac_str = frac_int.to_string()
+  while frac_str.len() < decimals do
+    frac_str = "0" + frac_str
+  end
+  int_part.to_string() + "." + frac_str
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -419,35 +826,33 @@ impl Drop for ProfileScope
   end
 end
 
-# Thread-local scope stack
-thread_local! {
-  static SCOPE_STACK: std::cell::RefCell[Vec[String]] = std::cell::RefCell::new(Vec::new())
-  static SCOPE_TIMES: std::cell::RefCell[Map[String, Duration]] = std::cell::RefCell::new(Map::new())
-}
+# Thread-local scope stack using Tangerine's ThreadLocal
+use std::thread::{thread_local_new, ThreadLocal}
+
+mut SCOPE_STACK: ThreadLocal[Vec[String]] = thread_local_new(|| Vec::new())
+mut SCOPE_TIMES: ThreadLocal[Map[String, Duration]] = thread_local_new(|| Map::new())
 
 def current_scope_name() -> Option[String]
-  SCOPE_STACK.with(|stack| {
-    stack.borrow().last().cloned()
-  })
+  SCOPE_STACK.get().last()
 end
 
-def push_scope(name: &str) -> Unit
-  SCOPE_STACK.with(|stack| {
-    stack.borrow_mut().push(name.to_string())
-  })
+def push_scope(name: String) -> Unit
+  SCOPE_STACK.get().push(name)
 end
 
 def pop_scope() -> Unit
-  SCOPE_STACK.with(|stack| {
-    stack.borrow_mut().pop()
-  })
+  SCOPE_STACK.get().pop()
 end
 
-def record_scope_time(name: &str, duration: Duration) -> Unit
-  SCOPE_TIMES.with(|times| {
-    let mut times = times.borrow_mut()
-    *times.entry(name.to_string()).or_insert(Duration::ZERO) += duration
-  })
+def record_scope_time(name: String, duration: Duration) -> Unit
+  let times = SCOPE_TIMES.get()
+  match times.get(&name)
+  when Option::Some(existing) then
+    times.insert(name, existing + duration)
+  when Option::None then
+    times.insert(name, duration)
+  end
+end
 end
 
 def get_scope_times() -> Map[String, Duration]
@@ -649,12 +1054,10 @@ impl FrameStats
   end
   
   def print(self: &FrameStats) -> Unit
-    println!("Frame {}: {:.2} FPS (avg: {:?}, p99: {:?})",
-      self.frame_number,
-      self.fps,
-      self.avg_frame_time,
-      self.p99_frame_time
-    )
+    puts("Frame " + self.frame_number.to_string() + ": " + 
+         format_float(self.fps, 2) + " FPS (avg: " + 
+         self.avg_frame_time.to_string() + ", p99: " + 
+         self.p99_frame_time.to_string() + ")")
   end
 end
 
@@ -788,27 +1191,29 @@ end
 
 impl MemoryReport
   def print(self: &MemoryReport) -> Unit
-    println!("═══════════════════════════════════════════════════════")
-    println!("                   MEMORY REPORT                       ")
-    println!("═══════════════════════════════════════════════════════")
-    println!()
-    println!("Total allocated:   {} bytes", self.total_allocated)
-    println!("Total freed:       {} bytes", self.total_freed)
-    println!("Current usage:     {} bytes", self.current_usage)
-    println!("Peak usage:        {} bytes", self.peak_usage)
-    println!("Live allocations:  {}", self.live_allocations)
-    println!()
-    println!("Top allocation sites:")
-    println!("───────────────────────────────────────────────────────")
+    puts("═══════════════════════════════════════════════════════")
+    puts("                   MEMORY REPORT                       ")
+    puts("═══════════════════════════════════════════════════════")
+    puts("")
+    puts("Total allocated:   " + self.total_allocated.to_string() + " bytes")
+    puts("Total freed:       " + self.total_freed.to_string() + " bytes")
+    puts("Current usage:     " + self.current_usage.to_string() + " bytes")
+    puts("Peak usage:        " + self.peak_usage.to_string() + " bytes")
+    puts("Live allocations:  " + self.live_allocations.to_string())
+    puts("")
+    puts("Top allocation sites:")
+    puts("───────────────────────────────────────────────────────")
     
-    for (i, (site, stats)) in self.top_sites.iter().enumerate() do
+    mut i = 0
+    for entry in self.top_sites.entries() do
       if i >= 10 then break end
+      let site = entry.0
+      let stats = entry.1
       
-      println!("{:<50} {:>10} bytes ({} allocs)",
-        truncate(site, 50),
-        stats.current_bytes,
-        stats.current_allocations
-      )
+      puts(pad_right(truncate(site, 50), 50) + " " + 
+           pad_left(stats.current_bytes.to_string(), 10) + " bytes (" +
+           stats.current_allocations.to_string() + " allocs)")
+      i = i + 1
     end
   end
 end
@@ -957,17 +1362,19 @@ impl BenchmarkResult
   end
   
   def print(self: &BenchmarkResult) -> Unit
-    println!("Benchmark: {}", self.name)
-    println!("  Iterations: {}", self.iterations)
-    println!("  Mean:       {:?}", self.mean)
-    println!("  Median:     {:?}", self.median)
-    println!("  Min:        {:?}", self.min)
-    println!("  Max:        {:?}", self.max)
-    println!("  Std Dev:    {:?}", self.std_dev)
-    println!("  P99:        {:?}", self.p99)
+    puts("Benchmark: " + self.name)
+    puts("  Iterations: " + self.iterations.to_string())
+    puts("  Mean:       " + self.mean.to_string())
+    puts("  Median:     " + self.median.to_string())
+    puts("  Min:        " + self.min.to_string())
+    puts("  Max:        " + self.max.to_string())
+    puts("  Std Dev:    " + self.std_dev.to_string())
+    puts("  P99:        " + self.p99.to_string())
     
-    if let Option::Some(tp) = self.throughput then
-      println!("  Throughput: {:.2} ops/sec", tp)
+    match self.throughput
+    when Option::Some(tp) then
+      puts("  Throughput: " + format_float(tp, 2) + " ops/sec")
+    when Option::None then ()
     end
   end
 end
@@ -994,18 +1401,18 @@ impl BenchmarkGroup
       return
     end
     
-    println!("═══════════════════════════════════════════════════════")
-    println!("Benchmark Comparison: {}", self.name)
-    println!("═══════════════════════════════════════════════════════")
+    puts("═══════════════════════════════════════════════════════")
+    puts("Benchmark Comparison: " + self.name)
+    puts("═══════════════════════════════════════════════════════")
     
     let baseline = &self.benchmarks[0]
     
-    println!("{:<30} {:>12} {:>12} {:>10}", "Name", "Mean", "vs Baseline", "")
-    println!("───────────────────────────────────────────────────────")
+    puts(pad_right("Name", 30) + pad_left("Mean", 12) + pad_left("vs Baseline", 12) + pad_left("", 10))
+    puts("───────────────────────────────────────────────────────")
     
-    for result in &self.benchmarks do
+    for result in self.benchmarks do
       let ratio = if baseline.mean.as_nanos() > 0 then
-        result.mean.as_nanos() as f64 / baseline.mean.as_nanos() as f64
+        (result.mean.as_nanos() as Float) / (baseline.mean.as_nanos() as Float)
       else
         1.0
       end
@@ -1015,12 +1422,10 @@ impl BenchmarkGroup
         else "same"
       end
       
-      println!("{:<30} {:>12?} {:>11.2}x {:>10}",
-        truncate(&result.name, 30),
-        result.mean,
-        ratio,
-        indicator
-      )
+      puts(pad_right(truncate(result.name, 30), 30) + 
+           pad_left(result.mean.to_string(), 12) +
+           pad_left(format_float(ratio, 2) + "x", 12) +
+           pad_left(indicator, 10))
     end
   end
 end

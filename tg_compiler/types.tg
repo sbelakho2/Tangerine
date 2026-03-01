@@ -129,6 +129,7 @@ end
 
 struct TypeEnv
   types: Map[String, TypeDef]
+  types_by_id: Map[Int, String]   # TypeId.id -> name lookup
   type_id_counter: Int
   
   # Type variable substitution
@@ -168,6 +169,7 @@ end
 def type_env_new() -> TypeEnv
   mut env = TypeEnv {
     types: Map::new(),
+    types_by_id: Map::new(),
     type_id_counter: 100,
     subst: Map::new(),
     var_counter: 0,
@@ -263,12 +265,13 @@ end
 def register_primitive(env: &mut TypeEnv, name: String) -> Unit
   let id = TypeId { id: env.type_id_counter }
   env.type_id_counter = env.type_id_counter + 1
-  env.types.insert(name, TypeDef {
+  env.types.insert(name.clone(), TypeDef {
     id: id,
-    name: name,
+    name: name.clone(),
     kind: TypeDefKind::Primitive,
     generic_params: Vec::new()
   })
+  env.types_by_id.insert(id.id, name)
 end
 
 def register_builtin_generic(env: &mut TypeEnv, name: String, arity: Int, kind: TypeDefKind) -> Unit
@@ -277,23 +280,33 @@ def register_builtin_generic(env: &mut TypeEnv, name: String, arity: Int, kind: 
   mut gen_params = Vec::new()
   if arity >= 1 then gen_params.push("T") end
   if arity >= 2 then gen_params.push("E") end
-  env.types.insert(name, TypeDef {
+  env.types.insert(name.clone(), TypeDef {
     id: id,
-    name: name,
+    name: name.clone(),
     kind: kind,
     generic_params: gen_params
   })
+  env.types_by_id.insert(id.id, name)
 end
 
 def register_builtin_trait(env: &mut TypeEnv, name: String, methods: Vec[MethodSig]) -> Unit
   let id = TypeId { id: env.type_id_counter }
   env.type_id_counter = env.type_id_counter + 1
-  env.types.insert(name, TypeDef {
+  env.types.insert(name.clone(), TypeDef {
     id: id,
-    name: name,
+    name: name.clone(),
     kind: TypeDefKind::Trait(methods),
     generic_params: Vec::new()
   })
+  env.types_by_id.insert(id.id, name)
+end
+
+# Helper to get type definition by TypeId
+def get_type_by_id(env: &TypeEnv, tid: &TypeId) -> Option[&TypeDef]
+  match env.types_by_id.get(tid.id)
+  when Option::Some(name) then env.types.get(name)
+  when Option::None then Option::None
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -462,6 +475,15 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
     end
   when (Type::Slice(t1), Type::Slice(t2)) then
     unify(env, t1, t2, span)
+  when (Type::Owned(t1), Type::Owned(t2)) then
+    unify(env, t1, t2, span)
+  when (Type::Param(name1), Type::Param(name2)) then
+    if name1 == name2 then
+      true
+    else
+      add_error(env, "type parameter mismatch: " + name1 + " vs " + name2, span)
+      false
+    end
   when (Type::Error, _) then true
   when (_, Type::Error) then true
   when _ then
@@ -860,7 +882,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
   if !has_wildcard then
     match scrutinee_type
     when Type::Named(tid, _) then
-      match env.types.get_by_id(tid)
+      match get_type_by_id(env, tid)
       when Option::Some(td) then
         match td.kind
         when TypeDefKind::Enum(variants) then
@@ -1531,8 +1553,8 @@ end
 # Determine whether a type is Send (safe to transfer across threads).
 # A type is Send if all of its field types are Send.
 # Primitive types (Int, UInt, Float, Bool, Char, String) are Send.
-# Raw pointers (*T, *mut T) are NOT Send.
-# Ref(&T) is Send if T is Sync. MutRef(&mut T) is Send if T is Send.
+# Raw pointers are NOT Send (but we don't have a Ptr variant currently).
+# Ref(&T) is Send if T is Sync. RefMut(&mut T) is Send if T is Send.
 def is_send(env: &TypeEnv, ty: &Type) -> Bool
   match ty
   when Type::Unit then true
@@ -1542,23 +1564,31 @@ def is_send(env: &TypeEnv, ty: &Type) -> Bool
   when Type::Float then true
   when Type::Char then true
   when Type::String then true
-  when Type::Named(name) then
-    # Check if there's an explicit !Send impl
-    if env.non_send_types.contains(name.clone()) then return false end
-    # Check all fields of the struct
-    match env.types.get(name.clone())
+  when Type::Named(tid, args) then
+    # Look up the type by id
+    match get_type_by_id(env, tid)
     when Option::Some(td) then
+      # Check if there's an explicit !Send impl
+      if env.non_send_types.contains(td.name.clone()) then return false end
+      # Check all fields of the struct
       match td.kind
       when TypeDefKind::Struct(fields) then
         for field in fields do
           if !is_send(env, &field.ty) then return false end
         end
+        # Also check type arguments
+        for arg in args do
+          if !is_send(env, arg) then return false end
+        end
         true
       when TypeDefKind::Enum(variants) then
         for variant in variants do
           for field in variant.fields do
-            if !is_send(env, &field.ty) then return false end
+            if !is_send(env, field) then return false end
           end
+        end
+        for arg in args do
+          if !is_send(env, arg) then return false end
         end
         true
       when TypeDefKind::Primitive then true
@@ -1566,31 +1596,29 @@ def is_send(env: &TypeEnv, ty: &Type) -> Bool
       end
     when Option::None then true
     end
-  when Type::Generic(name, args) then
-    # Generic types: check the base type and all arguments
-    if !is_send(env, &Type::Named(name.clone())) then return false end
-    for arg in args do
-      if !is_send(env, &arg) then return false end
-    end
-    true
-  when Type::Ref(inner, _is_mut) then
+  when Type::Ref(inner, _lifetime) then
     # &T is Send if T is Sync
     is_sync(env, inner)
-  when Type::MutRef(inner) then
+  when Type::RefMut(inner, _lifetime) then
     # &mut T is Send if T is Send
     is_send(env, inner)
-  when Type::Ptr(_, _) then false  # Raw pointers are !Send
+  when Type::Owned(inner) then is_send(env, inner)
   when Type::Tuple(elems) then
     for e in elems do
-      if !is_send(env, &e) then return false end
+      if !is_send(env, e) then return false end
     end
     true
   when Type::Array(elem, _) then is_send(env, elem)
+  when Type::Slice(elem) then is_send(env, elem)
   when Type::Option(inner) then is_send(env, inner)
   when Type::Result(ok, err) then is_send(env, ok) && is_send(env, err)
+  when Type::Map(k, v) then is_send(env, k) && is_send(env, v)
+  when Type::Set(elem) then is_send(env, elem)
   when Type::Function(_, _) then true  # Function pointers are Send
   when Type::Param(_) then true  # Assume generic params are Send (checked at instantiation)
-  when _ then true
+  when Type::Var(_) then true  # Type variables: assume Send
+  when Type::Never then true
+  when Type::Error then true
   end
 end
 
@@ -1606,47 +1634,57 @@ def is_sync(env: &TypeEnv, ty: &Type) -> Bool
   when Type::Float then true
   when Type::Char then true
   when Type::String then true
-  when Type::Named(name) then
-    # Check explicit !Sync
-    if env.non_sync_types.contains(name.clone()) then return false end
-    # Interior mutability types
-    if name == "Cell" || name == "RefCell" || name == "UnsafeCell" then return false end
-    # Check all fields
-    match env.types.get(name.clone())
+  when Type::Named(tid, args) then
+    # Look up the type by id
+    match get_type_by_id(env, tid)
     when Option::Some(td) then
+      # Check explicit !Sync
+      if env.non_sync_types.contains(td.name.clone()) then return false end
+      # Interior mutability types
+      if td.name == "Cell" || td.name == "RefCell" || td.name == "UnsafeCell" then return false end
+      # Check all fields
       match td.kind
       when TypeDefKind::Struct(fields) then
         for field in fields do
           if !is_sync(env, &field.ty) then return false end
         end
+        for arg in args do
+          if !is_sync(env, arg) then return false end
+        end
         true
       when TypeDefKind::Enum(variants) then
         for variant in variants do
           for field in variant.fields do
-            if !is_sync(env, &field.ty) then return false end
+            if !is_sync(env, field) then return false end
           end
+        end
+        for arg in args do
+          if !is_sync(env, arg) then return false end
         end
         true
       when _ then true
       end
     when Option::None then true
     end
-  when Type::Generic(name, args) then
-    if !is_sync(env, &Type::Named(name.clone())) then return false end
-    for arg in args do
-      if !is_sync(env, &arg) then return false end
-    end
-    true
   when Type::Ref(inner, _) then is_sync(env, inner)
-  when Type::MutRef(inner) then is_sync(env, inner)
-  when Type::Ptr(_, _) then false  # Raw pointers are !Sync
+  when Type::RefMut(inner, _) then is_sync(env, inner)
+  when Type::Owned(inner) then is_sync(env, inner)
   when Type::Tuple(elems) then
     for e in elems do
-      if !is_sync(env, &e) then return false end
+      if !is_sync(env, e) then return false end
     end
     true
   when Type::Array(elem, _) then is_sync(env, elem)
-  when _ then true
+  when Type::Slice(elem) then is_sync(env, elem)
+  when Type::Option(inner) then is_sync(env, inner)
+  when Type::Result(ok, err) then is_sync(env, ok) && is_sync(env, err)
+  when Type::Map(k, v) then is_sync(env, k) && is_sync(env, v)
+  when Type::Set(elem) then is_sync(env, elem)
+  when Type::Function(_, _) then true
+  when Type::Param(_) then true
+  when Type::Var(_) then true
+  when Type::Never then true
+  when Type::Error then true
   end
 end
 
@@ -1683,29 +1721,51 @@ def type_display(ty: &Type) -> String
   when Type::Float then "Float"
   when Type::Char then "Char"
   when Type::String then "String"
-  when Type::Named(name) then name.clone()
-  when Type::Generic(name, args) then
-    mut s = name.clone() + "["
+  when Type::Never then "Never"
+  when Type::Named(tid, args) then
+    # We don't have access to TypeEnv here, so just display the id
+    mut s = "Type#" + tid.id.to_string()
+    if !args.is_empty() then
+      s = s + "["
+      mut first = true
+      for a in args do
+        if !first then s = s + ", " end
+        s = s + type_display(a)
+        first = false
+      end
+      s = s + "]"
+    end
+    s
+  when Type::Function(params, ret) then
+    mut s = "("
     mut first = true
-    for a in args do
+    for p in params do
       if !first then s = s + ", " end
-      s = s + type_display(&a)
+      s = s + type_display(p)
       first = false
     end
-    s + "]"
-  when Type::Ref(inner, is_mut) then
-    if is_mut then "&mut " + type_display(inner) else "&" + type_display(inner) end
-  when Type::Ptr(inner, is_mut) then
-    if is_mut then "*mut " + type_display(inner) else "*" + type_display(inner) end
+    s = s + ") -> " + type_display(ret)
+    s
+  when Type::Ref(inner, _lifetime) then "&" + type_display(inner)
+  when Type::RefMut(inner, _lifetime) then "&mut " + type_display(inner)
+  when Type::Owned(inner) then "own " + type_display(inner)
   when Type::Tuple(elems) then
     mut s = "("
     mut first = true
     for e in elems do
       if !first then s = s + ", " end
-      s = s + type_display(&e)
+      s = s + type_display(e)
       first = false
     end
     s + ")"
-  when _ then "<unknown>"
+  when Type::Array(elem, size) then "[" + type_display(elem) + "; " + size.to_string() + "]"
+  when Type::Slice(elem) then "[" + type_display(elem) + "]"
+  when Type::Option(inner) then "Option[" + type_display(inner) + "]"
+  when Type::Result(ok, err) then "Result[" + type_display(ok) + ", " + type_display(err) + "]"
+  when Type::Map(k, v) then "Map[" + type_display(k) + ", " + type_display(v) + "]"
+  when Type::Set(elem) then "Set[" + type_display(elem) + "]"
+  when Type::Var(vid) then "?T" + vid.id.to_string()
+  when Type::Param(name) then name.clone()
+  when Type::Error then "<error>"
   end
 end

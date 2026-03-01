@@ -856,38 +856,143 @@ end
 
 def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, callee_body: &MirFunction) -> Unit
   # Replace Call terminators that target callee_name with the inlined body
-  # This is a simplified version — full version would:
-  # 1. Rename all local variables to avoid conflicts
-  # 2. Map parameters to arguments
-  # 3. Replace Return terminators with jumps to the continuation block
   
   mut next_block_id = caller.blocks.len() as Int
+  mut next_local_id = caller.locals.len() as Int
   
   for block_idx in 0..caller.blocks.len() do
     match caller.blocks[block_idx].terminator
     when MirTerminator::Call(target, args, dest, next) then
       if target == *callee_name then
-        # Create inlined blocks with renumbered IDs
-        let base_id = next_block_id
+        # 1. Build local variable rename map: callee_local_id -> caller_local_id
+        mut local_map: Map[Int, Int] = Map::new()
+        
+        # Map parameters to arguments (callee params are first N locals)
+        let param_count = callee_body.params.len()
+        for i in 0..param_count do
+          if i < args.len() then
+            # Extract local ID from argument operand
+            let arg_local = extract_operand_local(&args[i])
+            local_map.insert(i, arg_local)
+          end
+        end
+        
+        # Create new locals for non-parameter callee locals, add to caller
+        for i in param_count..callee_body.locals.len() do
+          let new_id = next_local_id
+          local_map.insert(i, new_id)
+          caller.locals.push(callee_body.locals[i].clone())
+          next_local_id = next_local_id + 1
+        end
+        
+        # 2. Build block rename map
+        let block_base = next_block_id
+        mut block_map: Map[Int, Int] = Map::new()
+        for i in 0..callee_body.blocks.len() do
+          block_map.insert(callee_body.blocks[i].id, block_base + i)
+        end
+        
+        # 3. Clone and remap callee blocks
         for cb in callee_body.blocks do
           mut new_block = cb.clone()
-          new_block.id = base_id + cb.id
+          new_block.id = block_map.get(cb.id).unwrap_or(cb.id)
           
-          # Replace Return with goto to continuation
+          # Remap locals in all statements
+          for stmt_idx in 0..new_block.statements.len() do
+            new_block.statements[stmt_idx] = remap_statement_locals(&new_block.statements[stmt_idx], &local_map)
+          end
+          
+          # Remap terminator
           match new_block.terminator
           when MirTerminator::Return then
+            # Store return value to dest, then goto continuation
+            # Note: simplified - assumes return value is in local 0 or uses operand
             new_block.terminator = MirTerminator::Goto(next)
+          when MirTerminator::Goto(target) then
+            let new_target = block_map.get(target).unwrap_or(target)
+            new_block.terminator = MirTerminator::Goto(new_target)
+          when MirTerminator::SwitchInt(op, targets, default) then
+            let new_op = remap_operand_locals(&op, &local_map)
+            mut new_targets = Vec::new()
+            for t in targets do
+              new_targets.push(SwitchTarget { 
+                value: t.value, 
+                target: block_map.get(t.target).unwrap_or(t.target) 
+              })
+            end
+            let new_default = block_map.get(default).unwrap_or(default)
+            new_block.terminator = MirTerminator::SwitchInt(new_op, new_targets, new_default)
           when _ then ()
           end
           
           caller.blocks.push(new_block)
         end
         
-        # Replace the call terminator with a goto to the inlined entry
-        caller.blocks[block_idx].terminator = MirTerminator::Goto(base_id)
+        # 4. Replace the call terminator with a goto to the inlined entry
+        let inlined_entry = block_map.get(callee_body.entry_block.id).unwrap_or(block_base)
+        caller.blocks[block_idx].terminator = MirTerminator::Goto(inlined_entry)
         next_block_id = next_block_id + callee_body.blocks.len() as Int
       end
     when _ then ()
     end
+  end
+end
+
+def extract_operand_local(op: &MirOperand) -> Int
+  match op.kind
+  when MirOperandKind::Copy(place) then place.local.id
+  when MirOperandKind::Move(place) then place.local.id
+  when MirOperandKind::Constant(_) then -1
+  end
+end
+
+def remap_statement_locals(stmt: &MirStatement, local_map: &Map[Int, Int]) -> MirStatement
+  MirStatement {
+    kind: remap_statement_kind_locals(&stmt.kind, local_map),
+    span: stmt.span
+  }
+end
+
+def remap_statement_kind_locals(kind: &MirStatementKind, local_map: &Map[Int, Int]) -> MirStatementKind
+  match kind
+  when MirStatementKind::Assign(place, rvalue) then
+    MirStatementKind::Assign(remap_place_locals(&place, local_map), remap_rvalue_locals(&rvalue, local_map))
+  when MirStatementKind::StorageLive(local) then
+    let new_id = local_map.get(local.id).unwrap_or(local.id)
+    MirStatementKind::StorageLive(LocalId { id: new_id })
+  when MirStatementKind::StorageDead(local) then
+    let new_id = local_map.get(local.id).unwrap_or(local.id)
+    MirStatementKind::StorageDead(LocalId { id: new_id })
+  when _ then kind.clone()
+  end
+end
+
+def remap_place_locals(place: &Place, local_map: &Map[Int, Int]) -> Place
+  let new_id = local_map.get(place.local.id).unwrap_or(place.local.id)
+  Place { local: LocalId { id: new_id }, projections: place.projections.clone() }
+end
+
+def remap_operand_locals(op: &MirOperand, local_map: &Map[Int, Int]) -> MirOperand
+  match op.kind
+  when MirOperandKind::Copy(place) then
+    MirOperand { kind: MirOperandKind::Copy(remap_place_locals(&place, local_map)) }
+  when MirOperandKind::Move(place) then
+    MirOperand { kind: MirOperandKind::Move(remap_place_locals(&place, local_map)) }
+  when MirOperandKind::Constant(c) then
+    MirOperand { kind: MirOperandKind::Constant(c.clone()) }
+  end
+end
+
+def remap_rvalue_locals(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
+  match rv.kind
+  when MirRvalueKind::Use(op) then
+    MirRvalue { kind: MirRvalueKind::Use(remap_operand_locals(&op, local_map)) }
+  when MirRvalueKind::Ref(place) then
+    MirRvalue { kind: MirRvalueKind::Ref(remap_place_locals(&place, local_map)) }
+  when MirRvalueKind::BinOp(a, op, b) then
+    MirRvalue { kind: MirRvalueKind::BinOp(remap_operand_locals(&a, local_map), op.clone(), remap_operand_locals(&b, local_map)) }
+  when MirRvalueKind::UnOp(op, operand) then
+    MirRvalue { kind: MirRvalueKind::UnOp(op.clone(), remap_operand_locals(&operand, local_map)) }
+  when _ then rv.clone()
   end
 end

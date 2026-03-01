@@ -1,0 +1,359 @@
+## Tangerine Standard Library — FFI Taint Tracking
+##
+## §12: Data entering through FFI is tainted.
+## Must be explicitly validated before use in sensitive contexts.
+## Propagation is tracked through the type system.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+
+# ═══════════════════════════════════════════════════════════════
+# §12.1 — Taint Labels
+# ═══════════════════════════════════════════════════════════════
+
+## A taint label describes where untrusted data came from.
+enum TaintLabel
+  FfiInput         # Data from extern function return
+  FfiCallback      # Data from extern callback parameter
+  NetworkRead      # Data from network socket
+  FileRead         # Data from file I/O
+  EnvVar           # Data from environment variable
+  UserInput        # Data from stdin/CLI
+  Deserialized     # Data from deserialized format (JSON, TOML, etc.)
+  Custom(String)   # User-defined taint source
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.2 — Tainted[T] Wrapper
+# ═══════════════════════════════════════════════════════════════
+
+## Tainted[T] wraps a value of type T with taint metadata.
+## Cannot be implicitly coerced to T — must go through a validator.
+struct Tainted[T]
+  value: T
+  labels: Set[TaintLabel]
+  source_span: Option[Span]   # Where the taint was introduced
+  _sealed: _Seal
+end
+
+struct _Seal end  # Prevents construction outside this module
+
+## Create a tainted value (called at FFI boundary).
+def taint[T](value: T, label: TaintLabel) -> Tainted[T]
+  Tainted {
+    value: value,
+    labels: Set::of(label),
+    source_span: Option::None,
+    _sealed: _Seal {}
+  }
+end
+
+def taint_with_span[T](value: T, label: TaintLabel, span: Span) -> Tainted[T]
+  Tainted {
+    value: value,
+    labels: Set::of(label),
+    source_span: Option::Some(span),
+    _sealed: _Seal {}
+  }
+end
+
+## Merge taint labels when combining tainted values.
+def taint_merge[T](value: T, sources: &Vec[&Tainted[_]]) -> Tainted[T]
+  let all_labels = Set::new()
+  for src in sources do
+    for label in &src.labels do
+      all_labels.insert(label.clone())
+    end
+  end
+  Tainted {
+    value: value,
+    labels: all_labels,
+    source_span: Option::None,
+    _sealed: _Seal {}
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.3 — Validation (Sinks)
+# ═══════════════════════════════════════════════════════════════
+
+## A Validator takes a tainted value and produces a clean value or error.
+## This is the ONLY way to extract T from Tainted[T].
+trait Validator[T, Clean]
+  def validate(tainted: &Tainted[T]) -> Result[Clean, ValidationError]
+end
+
+struct ValidationError
+  message: String
+  labels: Set[TaintLabel]
+  source_span: Option[Span]
+end
+
+## Validate and extract a clean value.
+def validate[T, Clean](
+  tainted: &Tainted[T],
+  validator: &impl Validator[T, Clean]
+) -> Result[Clean, ValidationError]
+  validator.validate(tainted)
+end
+
+## Convenience: validate with a predicate function.
+def validate_with[T](
+  tainted: &Tainted[T],
+  predicate: def(&T) -> Bool,
+  error_msg: String
+) -> Result[T, ValidationError]
+  if predicate(&tainted.value)
+    Result::Ok(tainted.value.clone())
+  else
+    Result::Err(ValidationError {
+      message: error_msg,
+      labels: tainted.labels.clone(),
+      source_span: tainted.source_span
+    })
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.4 — Built-in Validators
+# ═══════════════════════════════════════════════════════════════
+
+## String length validator
+struct MaxLengthValidator
+  max_len: Int
+end
+
+impl Validator[String, String] for MaxLengthValidator
+  def validate(tainted: &Tainted[String]) -> Result[String, ValidationError]
+    if tainted.value.len() <= self.max_len
+      Result::Ok(tainted.value.clone())
+    else
+      Result::Err(ValidationError {
+        message: "String exceeds max length " + self.max_len.to_string()
+                 + " (got " + tainted.value.len().to_string() + ")",
+        labels: tainted.labels.clone(),
+        source_span: tainted.source_span
+      })
+    end
+  end
+end
+
+## Integer range validator
+struct IntRangeValidator
+  min: Int
+  max: Int
+end
+
+impl Validator[Int, Int] for IntRangeValidator
+  def validate(tainted: &Tainted[Int]) -> Result[Int, ValidationError]
+    if tainted.value >= self.min && tainted.value <= self.max
+      Result::Ok(tainted.value)
+    else
+      Result::Err(ValidationError {
+        message: "Integer " + tainted.value.to_string()
+                 + " out of range [" + self.min.to_string()
+                 + ", " + self.max.to_string() + "]",
+        labels: tainted.labels.clone(),
+        source_span: tainted.source_span
+      })
+    end
+  end
+end
+
+## Regex pattern validator for strings
+struct PatternValidator
+  pattern: String
+  description: String
+end
+
+impl Validator[String, String] for PatternValidator
+  def validate(tainted: &Tainted[String]) -> Result[String, ValidationError]
+    if __intrinsic_regex_match(&tainted.value, &self.pattern)
+      Result::Ok(tainted.value.clone())
+    else
+      Result::Err(ValidationError {
+        message: "String does not match " + self.description
+                 + " pattern: '" + tainted.value + "'",
+        labels: tainted.labels.clone(),
+        source_span: tainted.source_span
+      })
+    end
+  end
+end
+
+## Non-empty validator
+struct NonEmptyValidator end
+
+impl Validator[String, String] for NonEmptyValidator
+  def validate(tainted: &Tainted[String]) -> Result[String, ValidationError]
+    if !tainted.value.is_empty()
+      Result::Ok(tainted.value.clone())
+    else
+      Result::Err(ValidationError {
+        message: "Expected non-empty string",
+        labels: tainted.labels.clone(),
+        source_span: tainted.source_span
+      })
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.5 — Taint Propagation Rules
+# ═══════════════════════════════════════════════════════════════
+
+## Map a function over tainted data (keeps taint).
+def taint_map[T, U](tainted: &Tainted[T], f: def(&T) -> U) -> Tainted[U]
+  Tainted {
+    value: f(&tainted.value),
+    labels: tainted.labels.clone(),
+    source_span: tainted.source_span,
+    _sealed: _Seal {}
+  }
+end
+
+## Flat-map: combine tainted value with another tainted operation.
+def taint_flat_map[T, U](
+  tainted: &Tainted[T],
+  f: def(&T) -> Tainted[U]
+) -> Tainted[U]
+  let result = f(&tainted.value)
+  let merged_labels = tainted.labels.union(&result.labels)
+  Tainted {
+    value: result.value,
+    labels: merged_labels,
+    source_span: tainted.source_span,
+    _sealed: _Seal {}
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.6 — Static Taint Analysis (Compiler Integration)
+# ═══════════════════════════════════════════════════════════════
+
+## The compiler tracks taint at the type level.
+## If a Tainted[T] reaches a sensitive sink without validation,
+## it's a compile-time error.
+
+struct TaintFlow
+  source: TaintSource
+  sink: TaintSink
+  path: Vec[TaintStep]
+  validated: Bool
+end
+
+struct TaintSource
+  label: TaintLabel
+  span: Span
+  symbol: String
+end
+
+struct TaintSink
+  kind: SinkKind
+  span: Span
+  symbol: String
+end
+
+enum SinkKind
+  SqlExec         # Executing SQL
+  HtmlRender      # Rendering HTML
+  FileWrite       # Writing to filesystem
+  NetSend         # Sending over network
+  ExecCommand     # Executing system command
+  CryptoKey       # Using as cryptographic key
+  LogOutput       # Writing to log (may leak PII)
+  Custom(String)
+end
+
+struct TaintStep
+  span: Span
+  description: String
+end
+
+## Analyze a module for unvalidated taint flows.
+def analyze_taint_flows(
+  flows: &Vec[TaintFlow]
+) -> Vec[TaintDiagnostic]
+  let diagnostics = Vec::new()
+  for flow in flows do
+    if !flow.validated
+      diagnostics.push(TaintDiagnostic {
+        severity: TaintSeverity::Error,
+        message: "Unvalidated tainted data from "
+                 + taint_label_name(&flow.source.label)
+                 + " reaches " + sink_kind_name(&flow.sink.kind)
+                 + " sink at " + flow.sink.span.to_string(),
+        source: flow.source.clone(),
+        sink: flow.sink.clone(),
+        path: flow.path.clone()
+      })
+    end
+  end
+  diagnostics
+end
+
+struct TaintDiagnostic
+  severity: TaintSeverity
+  message: String
+  source: TaintSource
+  sink: TaintSink
+  path: Vec[TaintStep]
+end
+
+enum TaintSeverity
+  Error     # Must fix: unvalidated taint reaching sensitive sink
+  Warning   # Suspicious: taint reaches non-critical sink
+  Info      # Informational: taint flow tracked successfully
+end
+
+def taint_label_name(label: &TaintLabel) -> String
+  match label
+    when TaintLabel::FfiInput then "FFI input"
+    when TaintLabel::FfiCallback then "FFI callback"
+    when TaintLabel::NetworkRead then "network read"
+    when TaintLabel::FileRead then "file read"
+    when TaintLabel::EnvVar then "environment variable"
+    when TaintLabel::UserInput then "user input"
+    when TaintLabel::Deserialized then "deserialized data"
+    when TaintLabel::Custom(name) then name
+  end
+end
+
+def sink_kind_name(kind: &SinkKind) -> String
+  match kind
+    when SinkKind::SqlExec then "SQL execution"
+    when SinkKind::HtmlRender then "HTML render"
+    when SinkKind::FileWrite then "file write"
+    when SinkKind::NetSend then "network send"
+    when SinkKind::ExecCommand then "command execution"
+    when SinkKind::CryptoKey then "cryptographic key"
+    when SinkKind::LogOutput then "log output"
+    when SinkKind::Custom(name) then name
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §12.7 — FFI Auto-Taint
+# ═══════════════════════════════════════════════════════════════
+
+## Automatically wrap extern function return values in Tainted[T].
+## Applied by the compiler at FFI boundary.
+
+struct FfiTaintConfig
+  auto_taint_extern_returns: Bool    # Default: true
+  auto_taint_callback_params: Bool   # Default: true
+  exempt_symbols: Set[String]        # Symbols exempt from auto-taint
+end
+
+def default_ffi_taint_config() -> FfiTaintConfig
+  FfiTaintConfig {
+    auto_taint_extern_returns: true,
+    auto_taint_callback_params: true,
+    exempt_symbols: Set::new()
+  }
+end
+
+## Check if an FFI function should have its return auto-tainted.
+def should_auto_taint(config: &FfiTaintConfig, symbol: &String) -> Bool
+  config.auto_taint_extern_returns && !config.exempt_symbols.contains(symbol)
+end

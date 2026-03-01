@@ -10,23 +10,35 @@ This document provides a comprehensive reference for all modules in the Tangerin
 ## Table of Contents
 
 1. [Core Types](#core-types) - `std/core`
-2. [Serialization](#serialization) - `std/serde`, `std/json`, `std/toml`
-3. [HTTP & Networking](#http--networking) - `std/http`, `std/url`, `std/net`
-4. [Web Framework](#web-framework) - `std/web`
-5. [Database](#database) - `std/db`
-6. [Cryptography](#cryptography) - `std/crypto`
-7. [CLI & Terminal](#cli--terminal) - `std/cli`
-8. [Logging & Tracing](#logging--tracing) - `std/log`
-9. [Regular Expressions & Parsing](#regular-expressions--parsing) - `std/regex`
-10. [Compression & Archives](#compression--archives) - `std/compress`
-11. [Date & Time](#date--time) - `std/time`
-12. [Async & Concurrency](#async--concurrency) - `std/async`, `std/thread`
-13. [I/O & Filesystem](#io--filesystem) - `std/io`, `std/fs`
-14. [Testing](#testing) - `std/test`
-15. [UI & Graphics](#ui--graphics) - `std/ui`
-16. [Contracts & Capabilities](#contracts--capabilities) - `std/contracts`, `std/capabilities`
-17. [Profiling & Observability](#profiling--observability) - `std/profile`, `std/snapshot`
-18. [Effects & Budgets](#effects--budgets) - `std/effects`, `std/budget`
+2. [Collections](#collections) - `std/collections`
+3. [Formatting](#formatting) - `std/fmt`
+4. [Memory Allocation](#memory-allocation) - `std/alloc`
+5. [Environment](#environment) - `std/env`
+6. [Backtrace](#backtrace) - `std/backtrace`
+7. [Serialization](#serialization) - `std/serde`, `std/json`, `std/toml`
+8. [HTTP & Networking](#http--networking) - `std/http`, `std/url`, `std/net`
+9. [Web Framework](#web-framework) - `std/web`
+10. [Database](#database) - `std/db`
+11. [Cryptography](#cryptography) - `std/crypto`
+12. [CLI & Terminal](#cli--terminal) - `std/cli`
+13. [Logging & Tracing](#logging--tracing) - `std/log`
+14. [Regular Expressions & Parsing](#regular-expressions--parsing) - `std/regex`
+15. [Compression & Archives](#compression--archives) - `std/compress`
+16. [Date & Time](#date--time) - `std/time`
+17. [Async & Concurrency](#async--concurrency) - `std/async`, `std/thread`
+18. [I/O & Filesystem](#io--filesystem) - `std/io`, `std/fs`
+19. [FFI](#ffi) - `std/ffi`
+20. [Testing & Benchmarking](#testing--benchmarking) - `std/test`, `std/bench`
+21. [Test Generation](#test-generation) - `std/test_gen`
+22. [UI & Graphics](#ui--graphics) - `std/ui`
+23. [Contracts & Capabilities](#contracts--capabilities) - `std/contracts`, `std/capabilities`
+24. [Profiling & Observability](#profiling--observability) - `std/profile`, `std/snapshot`
+25. [Effects & Budgets](#effects--budgets) - `std/effects`, `std/budget`
+26. [Secure Types](#secure-types) - `std/secure_types`
+27. [Taint Tracking](#taint-tracking) - `std/taint`
+28. [Deterministic Replay](#deterministic-replay) - `std/replay`
+29. [Semantic Diff](#semantic-diff) - `std/semantic_diff`
+30. [Supply Chain Security](#supply-chain-security) - `std/supply_chain`
 
 ---
 
@@ -60,6 +72,158 @@ Foundation types and traits built into the language.
 - **`Ord`, `PartialOrd`** - Ordering comparison `<`, `>`, `<=`, `>=`
 - **`Hash`** - Compute hash for use in hash maps/sets
 - **`Iterator`** - Iterate over a sequence with `.next()`
+
+---
+
+## Collections
+
+**Module:** `std/collections`
+
+Core collection types backed by compiler intrinsics.
+
+```tangerine
+use std::collections::{Array, Map, Set, array_new, array_push, array_pop,
+                       map_new, map_get, map_insert, set_new, set_insert}
+
+# Array (growable)
+mut arr = array_new[Int]()
+array_push(&mut arr, 42)
+array_push(&mut arr, 7)
+let len = array_len(&arr)       # 2
+let item = array_get(&arr, 0)   # &42
+let popped = array_pop(&mut arr) # Option::Some(7)
+
+# Map (hash map)
+mut map = map_new[String, Int]()
+map_insert(&mut map, "x", 10)
+let val = map_get(&map, "x")    # Option::Some(&10)
+
+# Set (hash set)
+mut set = set_new[Int]()
+set_insert(&mut set, 1)
+let has = set_contains(&set, 1) # true
+```
+
+**Traits:**
+- `Iterator[T]` - `advance(&mut Self) -> Option[T]`
+- `IntoIterator[T]` - `into_iter(self) -> Iterator[T]`
+- `Iterable[T]` - `iter(&Self) -> Iterator[T]`
+
+---
+
+## Formatting
+
+**Module:** `std/fmt`
+
+Printing, Display/Debug traits, and string formatting.
+
+```tangerine
+use std::fmt::{format, print, puts, Display, Debug}
+
+# {} positional substitution, {N} indexed, {{ / }} literal braces
+let msg = format("Hello, {}! You are #{}", ["Alice", "42"])
+print(msg)       # no newline
+puts("world")    # with newline
+
+# Trait-based formatting
+impl Display for MyStruct
+  def display(&self) -> String
+    format("MyStruct({})", [self.name])
+  end
+end
+```
+
+**API:**
+- `format(fmt: String, args: Array[String]) -> String`
+- `print(x: String) -> Unit`
+- `puts(x: String) -> Unit`
+- `parse_int(s: String) -> Option[Int]`
+- `int_to_string(x: Int) -> String`
+- `bool_to_string(x: Bool) -> String`
+
+---
+
+## Memory Allocation
+
+**Module:** `std/alloc`
+
+Pluggable memory allocator interface with libc integration.
+
+```tangerine
+use std::alloc::{Allocator, Layout, SystemAllocator, ArenaAllocator,
+                 system_allocator, arena_new, arena_reset, arena_destroy}
+
+# System allocator (wraps libc malloc/free)
+let sys = system_allocator()
+
+# Layout for memory requests
+let layout = layout_new(256, 8)?  # 256 bytes, 8-byte alignment
+
+# Arena (bump) allocator — fast bulk allocation/deallocation
+mut arena = arena_new(65536)
+# ... allocate from arena ...
+arena_reset(&mut arena)    # reset without freeing backing memory
+arena_destroy(&mut arena)  # release backing memory
+```
+
+**Trait:** `Allocator`
+- `allocate(&Self, Layout) -> Result[*mut u8, String]`
+- `deallocate(&Self, *mut u8, Layout)`
+- `reallocate(&Self, *mut u8, Layout, new_size: UInt) -> Result[*mut u8, String]`
+
+**Types:**
+- `Layout` - Size + alignment descriptor
+- `SystemAllocator` - Stateless libc allocator
+- `ArenaAllocator` - Bump allocator with buffer, capacity, offset
+
+---
+
+## Environment
+
+**Module:** `std/env`
+
+Environment variables and process arguments.
+
+```tangerine
+use std::env::{args, var, set_var, current_dir}
+
+let arguments = args()                  # Array[String]
+let home = var("HOME")                  # Option[String]
+set_var("MY_VAR", "value")
+let cwd = current_dir()?               # Result[String, IOError]
+```
+
+---
+
+## Backtrace
+
+**Module:** `std/backtrace`
+
+Runtime backtrace capture and display using DWARF/dladdr.
+
+```tangerine
+use std::backtrace::{capture, capture_force, Backtrace, BacktraceStatus}
+
+# Respects TANGERINE_BACKTRACE env var
+let bt = capture()
+if bt.status == BacktraceStatus::Captured then
+  for frame in bt.frames do
+    puts(format("  {} at {}:{}", [frame.symbol_name, frame.file,
+                                   int_to_string(frame.line)]))
+  end
+end
+
+# Force capture regardless of env setting
+let forced = capture_force()
+```
+
+**Types:**
+- `Backtrace` - `frames: Vec[StackFrame]`, `status: BacktraceStatus`
+- `StackFrame` - `ip`, `symbol_name`, `file`, `line`, `column`, `module_name`, `offset`
+- `BacktraceStatus` - `Captured`, `Disabled`, `Unsupported`
+
+**Constants:**
+- `MAX_FRAMES: UInt = 128`
 
 ---
 
@@ -159,11 +323,11 @@ let response = client.post("https://api.example.com/users")
 
 # HTTP Server
 let server = HttpServer::bind("0.0.0.0:8080")?
-loop {
+loop
   let request = server.accept()?
   let response = handle_request(request)
   server.respond(response)?
-}
+end
 ```
 
 **Features:**
@@ -215,21 +379,21 @@ app.middleware(middleware::cors)
 app.middleware(middleware::compression)
 
 # Routes
-app.get("/", |ctx: &mut Context| {
+app.get("/", |ctx: &mut Context| do
   ctx.html("<h1>Home</h1>")
-})
+end)
 
-app.get("/users/:id", |ctx: &mut Context| {
+app.get("/users/:id", |ctx: &mut Context| do
   let id = ctx.param("id").unwrap()
   let user = get_user(id)?
   ctx.json_response(&user)
-})
+end)
 
-app.post("/users", |ctx: &mut Context| {
+app.post("/users", |ctx: &mut Context| do
   let user: User = ctx.json()?
   let created = create_user(user)?
   ctx.status(StatusCode::Created).json_response(&created)
-})
+end)
 
 # Static files
 app.static_files("/static", "./public")
@@ -301,10 +465,10 @@ let db = Sqlite::open("app.db")?
 db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")?
 
 let rows = db.query("SELECT * FROM users WHERE age > ?", (18,))?
-for row in rows {
+for row in rows do
   let id: Int = row.get(0)?
   let name: String = row.get(1)?
-}
+end
 
 # Prepared statements
 db.execute_params("INSERT INTO users (name, email) VALUES (?, ?)", 
@@ -423,13 +587,13 @@ let app = App::new("myapp", "My CLI Application")
 
 let matches = app.parse()?
 
-if matches.get_flag("verbose") {
-  println!("Verbose mode enabled")
-}
+if matches.get_flag("verbose") then
+  println("Verbose mode enabled")
+end
 
-if let Option::Some(output) = matches.get_value("output") {
-  println!("Output: {}", output)
-}
+if let Option::Some(output) = matches.get_value("output") then
+  println("Output: {}", output)
+end
 
 # Terminal colors
 terminal::print_colored("Success!", Color::Green)
@@ -438,10 +602,10 @@ terminal::print_bold("Important message")
 # Progress bars
 let pb = ProgressBar::new(100)
 pb.set_message("Processing...")
-for i in 0..100 {
+for i in 0..100 do
   pb.set(i)
   # ... work ...
-}
+end
 pb.finish_with_message("Done!")
 
 # Spinner
@@ -509,9 +673,9 @@ let re = Regex::new(r"\d{3}-\d{4}")?
 assert!(re.is_match("555-1234"))
 
 let text = "Phone: 555-1234, Fax: 555-5678"
-for m in re.find_all(text) {
-  println!("Found: {}", m.as_str())
-}
+for m in re.find_all(text) do
+  println("Found: {}", m.as_str())
+end
 
 let replaced = re.replace_all(text, "XXX-XXXX")
 
@@ -525,9 +689,9 @@ let minus = char_p('-')
 let op = choice([plus, minus])
 
 let expr = number.and(op).and(number)
-  .map(|((a, op), b)| {
+  .map(|((a, op), b)| do
     if op == '+' then a + b else a - b
-  })
+  end)
 
 let result = expr.parse("42+58")?  # Result::Ok(100)
 ```
@@ -559,15 +723,15 @@ builder.add_dir("src/")?
 builder.finish()?
 
 let reader = tar::TarReader::open("archive.tar")?
-for entry in reader.entries()? {
-  println!("{}: {} bytes", entry.path(), entry.size())
-}
+for entry in reader.entries()? do
+  println("{}: {} bytes", entry.path(), entry.size())
+end
 
 # Zip archives
 let reader = zip::ZipReader::open("archive.zip")?
-for entry in reader.entries()? {
+for entry in reader.entries()? do
   let data = reader.extract(&entry)?
-}
+end
 
 let writer = zip::ZipWriter::create("output.zip")?
 writer.add_file("data.txt", content)?
@@ -629,9 +793,9 @@ async def fetch_data(url: String) -> Result[String, Error]
 end
 
 # Spawning tasks
-let handle = spawn(async {
+let handle = spawn(async do
   compute_heavy().await
-})
+end)
 let result = handle.await?
 
 # Concurrent execution
@@ -651,17 +815,17 @@ OS threads, synchronization primitives, and message passing.
 use std::thread::{Thread, spawn, Mutex, RwLock, Channel, AtomicInt}
 
 # Thread spawning
-let handle = Thread::spawn(|| {
+let handle = Thread::spawn(|| do
   compute_result()
-})
+end)
 let result = handle.join()?
 
 # Mutex
 let counter = Mutex::new(0)
-{
+do
   let mut guard = counter.lock()
   *guard += 1
-}
+end
 
 # Read-write lock
 let data = RwLock::new(HashMap::new())
@@ -693,9 +857,9 @@ use std::io::{Read, Write, BufReader, BufWriter}
 # Buffered I/O
 let file = File::open("large.txt")?
 let reader = BufReader::new(file)
-for line in reader.lines() {
-  println!("{}", line?)
-}
+for line in reader.lines() do
+  println("{}", line?)
+end
 
 let file = File::create("output.txt")?
 let writer = BufWriter::new(file)
@@ -724,21 +888,64 @@ create_dir("output")?
 create_dir_all("path/to/nested/dir")?
 
 # Walking directories
-for entry in walk_dir("src")? {
-  if entry.is_file() {
-    println!("File: {}", entry.path())
-  }
-}
+for entry in walk_dir("src")? do
+  if entry.is_file() then
+    println("File: {}", entry.path())
+  end
+end
 
 # Recursive with filtering
-for entry in walk_dir("src")?.filter(|e| e.extension() == Some("tg")) {
+for entry in walk_dir("src")?.filter(|e| e.extension() == Some("tg")) do
   process_file(entry.path())?
-}
+end
 ```
 
 ---
 
-## Testing
+## FFI
+
+**Module:** `std/ffi`
+
+Foreign Function Interface types, pointer operations, and FFI boundary taint
+integration.
+
+```tangerine
+use std::ffi::{Ptr, CStr, CString, FfiStr, FfiSlice, Opaque, CType}
+
+# Raw pointer
+let ptr: Ptr[Int] = null_ptr[Int]()
+let is_null = is_null(&ptr)
+
+# C string conversion
+let cs = cstring_new("hello")
+let s = cstring_to_string(&cs)
+
+# Export ABI info
+let edition = tg_abi_edition()    # FfiStr = "2026"
+let rev = tg_abi_revision()       # UInt = 1
+```
+
+**Types:**
+- `Ptr[T]` - Raw pointer with `address: UInt`
+- `Opaque` - Opaque foreign handle
+- `CStr` - Borrowed NUL-terminated C string
+- `CString` - Owned NUL-terminated C string
+- `FfiStr` - Borrowed UTF-8 view for C
+- `FfiSlice[T]` - Borrowed slice view for C
+- `CType` - 17-variant enum of C types
+
+**Taint Integration:**
+- `FfiBoundary` trait — marker for types crossing FFI boundaries
+- `__ffi_auto_taint[T]()` — compiler-inserted taint wrapper for FFI return values
+- `__ffi_callback_taint[T]()` — compiler-inserted taint for callback arguments
+
+**Constants:**
+- `FFI_ABI_EDITION: String = "2026"`
+- `FFI_ABI_REVISION: UInt = 1`
+
+---
+
+## Testing & Benchmarking
 
 ### `std/test` - Testing Framework
 
@@ -747,31 +954,83 @@ Unit tests, integration tests, and snapshot testing.
 ```tangerine
 use std::test::{test, assert_eq, assert_ne, assert_throws, snapshot}
 
-#[test]
+@test
 def test_addition()
   assert_eq(2 + 2, 4)
   assert_eq(add(10, 20), 30)
 end
 
-#[test]
+@test
 def test_error_handling()
-  assert_throws(|| {
+  assert_throws(|| do
     divide(10, 0)
-  })
+  end)
 end
 
-#[test]
+@test
 def test_snapshot()
   let output = render_template(test_data)
   snapshot::assert_eq("template_output", &output)
 end
 
 # Property testing
-#[test_prop]
+@test_prop
 def test_reverse_twice(list: Vec[Int])
   assert_eq(list.reverse().reverse(), list)
 end
 ```
+
+### `std/bench` - Benchmarking Framework
+
+Micro-benchmarking with statistical analysis, warmup, auto-calibration, and
+outlier detection.
+
+```tangerine
+use std::bench::{bench_suite_new, bench_case_new, default_bench_config}
+
+mut suite = bench_suite_new("sort benchmarks")
+suite.add(bench_case_new("quicksort", || sort_quick(&mut data) ))
+suite.add(bench_case_new("mergesort", || sort_merge(&mut data) ))
+
+let config = default_bench_config()
+for case in suite.cases do
+  let result = run_benchmark(case, config)
+  # result: BenchResult { min_ns, max_ns, mean_ns, median_ns, std_dev, ... }
+end
+```
+
+**Types:**
+- `BenchResult` - `iterations`, `min_ns`, `max_ns`, `mean_ns`, `median_ns`, `std_dev`, `throughput`
+- `BenchConfig` - `min_iterations`, `max_iterations`, `warmup_iterations`, `target_time_ms`, `outlier_threshold`
+- `BenchOutcome` - `Passed(BenchResult)`, `Failed(String)`, `Skipped`
+- `BenchSuite` - Named collection of benchmark cases
+
+---
+
+## Test Generation
+
+**Module:** `std/test_gen`
+
+Automatic test case generation from function signatures, contracts, and boundary
+analysis.
+
+```tangerine
+use std::test_gen::{extract_function_info, generate_tests_from_info, TestSuite}
+
+let info = extract_function_info(source, "clamp")?
+let tests = generate_tests_from_info(info)
+# Generates: boundary value tests, contract-based tests, fuzz seeds
+
+for test in tests do
+  puts(format("[{}] {} — expects: {}", [test.kind.name(), test.name, test.expected]))
+end
+```
+
+**Types:**
+- `TestKind` - `Unit`, `Property`, `Boundary`, `Contract`, `Fuzz`
+- `TestCase` - `name`, `kind`, `fn_under_test`, `inputs`, `expected`, `generated`
+- `FunctionInfo` - `name`, `params`, `return_type`, `contracts`
+- `TestExpectation` - `Returns(String)`, `Panics(String)`, `Satisfies(String)`, `NoException`
 
 ---
 
@@ -816,10 +1075,10 @@ let value = anim.sample(t)  # Interpolated value with easing
 
 ### `std/contracts` - Design by Contract
 
-Preconditions, postconditions, and invariants.
+Preconditions, postconditions, invariants, and the **guard** keyword.
 
 ```tangerine
-use std::contracts::{pre, post, invariant}
+use std::contracts::{pre, post, invariant, make_guard, GuardClause, GuardElseAction}
 
 def sqrt(x: Float) -> Float
   pre x >= 0.0, "sqrt requires non-negative input"
@@ -828,11 +1087,11 @@ def sqrt(x: Float) -> Float
   x.sqrt()
 end
 
-struct BankAccount {
+struct BankAccount
   balance: Float
   
   invariant self.balance >= 0.0, "balance must be non-negative"
-}
+end
 
 impl BankAccount
   def withdraw(self: &mut BankAccount, amount: Float) -> Result[Unit, String]
@@ -849,12 +1108,38 @@ impl BankAccount
 end
 ```
 
+**Guard Keyword:**
+
+`guard` is syntactic sugar for precondition checks that early-return on failure.
+
+```tangerine
+# Guard with early return
+def process(input: Option[String]) -> Result[Int, Error]
+  guard let value = input else return Result::Err("missing")
+  parse_int(value)
+end
+
+# Guard with panic
+def require_positive(x: Int) -> Int
+  guard x > 0 else panic("x must be positive")
+  x * 2
+end
+```
+
+**Types:**
+- `ContractKind` - `Pre`, `Post`, `Invariant`
+- `Contract` - `kind`, `expr`, `has_message`, `message`
+- `ProofObligation` - `origin`, `kind`, `expr`, `verified`
+- `GuardClause` - `condition`, `else_action`, `narrows_type`, `promoted_contract`
+- `GuardElseAction` - `Return(expr)`, `Panic(msg)`, `Break(label)`, `Continue(label)`
+
 ### `std/capabilities` - Capability System
 
 Fine-grained access control for resources.
 
 ```tangerine
-use std::capabilities::{cap, requires}
+use std::capabilities::{cap, requires, SecurityProfile, profile_check,
+                        validate_against_profile, parse_profile}
 
 cap FileSystem implies FileRead, FileWrite end
 cap Network implies NetworkRead, NetworkWrite end
@@ -874,6 +1159,29 @@ def safe_compute(data: String) -> String
   process_locally(data)
 end
 ```
+
+**Security Profiles:**
+
+Profiles restrict which capabilities are allowed per project.
+
+```tangerine
+# Built-in profiles
+let prof = parse_profile("backend")  # Backend profile
+
+# Check a capability against a profile
+let result = profile_check(&prof, "Net")  # Satisfied (Net allowed in Backend)
+let result = profile_check(&prof, "Unsafe")  # Missing (Unsafe denied in Backend)
+
+# Validate an entire capability context
+let violations = validate_against_profile(&ctx, &prof)
+```
+
+| Profile | Allowed | Denied |
+|---------|---------|--------|
+| `Backend` | Net, Fs, DB, Env, Clock, Random | Unsafe |
+| `Cli` | Fs, Env, Proc | Net |
+| `Ui` | Clock, Random | Fs, Net, DB |
+| `Library` | Pure, Custom | all system caps |
 
 ---
 
@@ -898,26 +1206,26 @@ profiler.write_flamegraph("profile.svg")?
 
 # Frame timing (games/UI)
 let timer = FrameTimer::with_target_fps(60.0)
-loop {
+loop
   timer.begin_frame()
   
   # Render frame...
   
   let stats = timer.end_frame()
-  if stats.fps < 55.0 {
+  if stats.fps < 55.0 then
     warn!("Low FPS: {:.1}", stats.fps)
-  }
-}
+  end
+end
 
 # Benchmarking
 let mut bench = Benchmark::new("sort_1000")
   .iterations(1000)
   .warmup(100)
 
-let result = bench.run(|| {
+let result = bench.run(|| do
   let mut data = generate_data()
   sort(&mut data)
-})
+end)
 
 result.print()
 ```
@@ -939,20 +1247,20 @@ recorder.checkpoint("before_critical_section", data)
 recorder.checkpoint("after_critical_section", result)
 
 let stats = recorder.stop()?
-println!("Recorded {} events", stats.event_count)
+println("Recorded {} events", stats.event_count)
 
 # Replay
 let player = Player::new("session.replay")
 player.open()?
 
 # Step through execution
-loop {
-  match player.step() {
-    Result::Ok(event) => println!("Event: {:?}", event),
+loop
+  match player.step()
+    Result::Ok(event) => println("Event: {:?}", event),
     Result::Err(PlayerError::EndOfRecording) => break,
     Result::Err(e) => return Result::Err(e),
-  }
-}
+  end
+end
 
 # Seek to checkpoint
 player.seek_to_checkpoint("before_critical_section")?
@@ -990,7 +1298,7 @@ end
 # Handle effects
 handle process_data(input)
 with Logger
-  log(level, msg) => println!("[{}] {}", level, msg)
+  log(level, msg) => println("[{}] {}", level, msg)
 end
 ```
 
@@ -1004,18 +1312,286 @@ use std::budget::{budget, budget_remaining, budget_exceeded}
 def expensive_operation(data: Data) -> Result[Output, Error]
   budget time: 5s, memory: 100MB, api_calls: 10
   
-  for item in data {
-    if budget_remaining("api_calls") < 2 {
+  for item in data do
+    if budget_remaining("api_calls") < 2 then
       # Use cached data instead
       use_cache(item)?
-    } else {
+    else
       fetch_remote(item)?
-    }
-  }
+    end
+  end
   
   Result::Ok(result)
 end
 ```
+
+---
+
+## Secure Types
+
+**Module:** `std/secure_types`
+
+Sealed wrapper types that prevent injection attacks at the type level. These
+types cannot be constructed from raw strings — only through validated constructors.
+
+### `SqlQuery` - Parameterized SQL
+
+```tangerine
+use std::secure_types::{sql_query, SqlParam, sql_debug_string}
+
+# Only way to create a SqlQuery — validates placeholders
+let query = sql_query(
+  "SELECT * FROM users WHERE id = $1 AND name = $2",
+  [SqlParam::Int(42), SqlParam::Text("Alice")]
+)?
+
+# Debug output (safe to log, not for execution)
+let debug = sql_debug_string(&query)
+```
+
+### `HtmlSafe` - XSS-Safe HTML
+
+```tangerine
+use std::secure_types::{html_escape, html_safe_trusted, html_concat}
+
+let safe = html_escape("<script>alert('xss')</script>")
+# safe.value == "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
+
+# Trusted HTML (requires @capability(Unsafe))
+let raw = html_safe_trusted("<b>bold</b>")
+
+let combined = html_concat(&safe, &raw)
+```
+
+### `Url` - Validated URLs
+
+```tangerine
+use std::secure_types::{url_parse}
+
+let url = url_parse("https://example.com/api?q=hello")?
+# Blocks javascript: and vbscript: schemes automatically
+```
+
+### `SafePath` - Traversal-Safe File Paths
+
+```tangerine
+use std::secure_types::{path_parse, path_join, path_extension}
+
+let path = path_parse("data/reports/q1.csv")?
+# Rejects: "../etc/passwd", paths with null bytes, absolute paths
+let joined = path_join(&path, "summary.txt")?
+let ext = path_extension(&path)  # Option::Some("csv")
+```
+
+### `HeaderValue` - HTTP Header Injection Prevention
+
+```tangerine
+use std::secure_types::{header_new}
+
+let hdr = header_new("application/json")?
+# Rejects values containing \r or \n (CRLF injection prevention)
+```
+
+---
+
+## Taint Tracking
+
+**Module:** `std/taint`
+
+Data entering through FFI boundaries is automatically wrapped in `Tainted[T]`.
+Tainted values must pass through a `Validator` to produce clean values.
+
+```tangerine
+use std::taint::{Tainted, taint, taint_with_span, taint_merge,
+                 validate, validate_with, TaintLabel}
+
+# Create tainted values
+let raw = taint("user input", TaintLabel::UserInput)
+let merged = taint_merge("combined", [&raw, &other])
+
+# Validate to clean
+let clean = validate(raw, MaxLengthValidator { max_len: 255 })?
+
+# Inline validation with predicate
+let validated = validate_with(
+  raw_int,
+  |v| v > 0 && v < 1000,
+  "must be between 1 and 999"
+)?
+```
+
+**Taint Labels:** `FfiInput`, `FfiCallback`, `NetworkRead`, `FileRead`, `EnvVar`,
+`UserInput`, `Deserialized`, `Custom(String)`
+
+**Built-in Validators:**
+
+| Validator | Validates |
+|-----------|-----------|
+| `MaxLengthValidator` | `String` length ≤ `max_len` |
+| `IntRangeValidator` | `Int` in `[min, max]` |
+| `PatternValidator` | `String` matches regex `pattern` |
+| `NonEmptyValidator` | `String` is non-empty |
+
+**Propagation:**
+- `taint_map[T, U](&Tainted[T], fn(&T) -> U) -> Tainted[U]` — transform value, preserve taint
+- `taint_flat_map[T, U](&Tainted[T], fn(&T) -> Tainted[U]) -> Tainted[U]` — chain tainted operations
+
+**Static Analysis Types:**
+- `TaintFlow` / `TaintSource` / `TaintSink` / `TaintStep` — for `analyze_taint_flows()` static analysis pass
+- `FfiTaintConfig` — controls auto-taint behavior at FFI boundaries
+
+---
+
+## Deterministic Replay
+
+**Module:** `std/replay`
+
+Captures non-deterministic events during execution and allows exact
+reproduction of program behavior. Serialized as JSONL.
+
+```tangerine
+use std::replay::{ReplayRecorder, ReplayPlayer, ReplayEvent, ReplayTrace,
+                  recorder_new, trace_serialize, trace_save, player_load}
+
+# Recording
+mut recorder = recorder_new()
+recorder_record_schedule(&mut recorder, 0)        # thread schedule decision
+recorder_record_random(&mut recorder, [0x42])      # RNG seed
+recorder_record_time(&mut recorder, 1700000000)    # wall clock query
+recorder_record_io_read(&mut recorder, 0, bytes)   # I/O read result
+recorder_record_env(&mut recorder, "HOME", Option::Some("/home/user"))
+
+let trace = recorder.to_trace()
+trace_save(&trace, "session.replay")?
+
+# Replay
+let player = player_load("session.replay")?
+let event = player.next()?   # ReplayEvent
+```
+
+**Event Types (11):** `ScheduleThread`, `RandomSeed`, `TimeQuery`, `IoRead`,
+`IoWrite`, `NetRecv`, `EnvRead`, `FsStat`, `ChanRecv`, `AllocAddr`
+
+**Deterministic Scheduler:**
+- `DeterministicScheduler` with `SchedulerMode::Normal | Recording | Replaying`
+- `scheduler_pick_thread()` — uses recorded schedule during replay
+
+**Trace Format:**
+- Line 1: `TraceHeader` (format_version `"tg.replay.v1"`, tangerine_version, program_hash, etc.)
+- Lines 2..N: One `ReplayEvent` per line as JSON
+
+---
+
+## Semantic Diff
+
+**Module:** `std/semantic_diff`
+
+Extracts code entities from source files and computes meaningful diffs with
+severity annotation.
+
+```tangerine
+use std::semantic_diff::{extract_entities, compute_diff, SemanticDiff,
+                         AnnotatedChange, DiffSeverity}
+
+let old_entities = extract_entities(old_source)
+let new_entities = extract_entities(new_source)
+let diff = compute_diff(&old_entities, &new_entities)
+
+for change in diff.changes do
+  let severity = classify_change_severity(&change)
+  puts(format("[{}] {} {} — {}", [severity, change.kind, change.entity_name,
+                                    change.description]))
+end
+```
+
+**Entity Kinds:** `Function`, `Struct`, `Enum`, `Trait`, `Impl`, `Const`,
+`Module`, `Import`, `Contract`, `Capability`
+
+**Change Kinds:** `Added`, `Removed`, `Modified`, `Renamed`, `Moved`
+
+**Severity Levels:**
+| Severity | Meaning |
+|----------|---------|
+| `Breaking` | Public API removed or signature changed |
+| `Compatible` | New API added, no existing API affected |
+| `Internal` | Private implementation changed |
+| `Cosmetic` | Whitespace, comments, or formatting only |
+
+---
+
+## Supply Chain Security
+
+**Module:** `std/supply_chain`
+
+Package signing, lockfile verification, reproducible builds, and dependency
+trust computation.
+
+### Package Signing
+
+```tangerine
+use std::supply_chain::{PackageSignature, SignerIdentity, TrustLevel,
+                        verify_package_signature}
+
+let sig = PackageSignature {
+  signer: SignerIdentity { name: "maintainer", public_key: key, trust_level: TrustLevel::Owner },
+  signature: sig_bytes,
+  signed_hash: pkg_hash,
+  timestamp: now,
+  algorithm: "ed25519",
+}
+verify_package_signature(pkg_hash, &sig)?
+```
+
+### Lockfile Integrity
+
+```tangerine
+use std::supply_chain::{lockfile_parse, lockfile_verify, Lockfile}
+
+let lockfile = lockfile_parse(contents)?
+lockfile_verify(&lockfile)?  # Verifies integrity_hash and all package checksums
+```
+
+### SemVer
+
+```tangerine
+use std::supply_chain::{semver_parse, semver_to_string, SemVer}
+
+let ver = semver_parse("1.2.3-beta.1+build.42")?
+# ver.major == 1, ver.minor == 2, ver.patch == 3
+# ver.pre == "beta.1", ver.build == "build.42"
+```
+
+### Trust Graph
+
+```tangerine
+use std::supply_chain::{build_trust_graph, compute_trust_score}
+
+let graph = build_trust_graph(packages)?
+let score = compute_trust_score(&graph, target_id)?
+# score: Float in [0.0, 1.0] — iterative convergence over trust edges
+```
+
+### Supply Chain Policy
+
+```tangerine
+use std::supply_chain::{SupplyChainPolicy, check_policy}
+
+let policy = SupplyChainPolicy {
+  require_signatures: true,
+  min_trust_score: 0.7,
+  max_transitive_deps: 100,
+  allow_git_sources: false,
+  require_lockfile: true,
+}
+let violations = check_policy(&policy, &lockfile)
+```
+
+**Types:**
+- `PackageId` - `name`, `version`, `registry`
+- `SemVer` - `major`, `minor`, `patch`, `pre`, `build`
+- `PackageSource` - `Registry(url)`, `Git(url, rev)`, `Path(path)`
+- `TrustLevel` - `Owner`, `Contributor`, `Auditor`, `Registry`
+- `PolicyViolation` / `ViolationKind` - detailed policy violation reporting
 
 ---
 

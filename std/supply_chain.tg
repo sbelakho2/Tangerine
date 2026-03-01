@@ -1,0 +1,598 @@
+## Tangerine Standard Library — Supply Chain Security
+##
+## §16: Signed packages, lockfiles, reproducible builds, dependency trust.
+## The compiler enforces supply chain integrity at every level.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::crypto::{sha256, ed25519_verify, PublicKey, Signature}
+use std::fs::{File, read_to_string}
+
+# ═══════════════════════════════════════════════════════════════
+# §16.1 — Package Identity
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageId
+  name: String
+  version: SemVer
+  registry: String   # e.g. "tg.registry.tangerine.dev"
+end
+
+struct SemVer
+  major: Int
+  minor: Int
+  patch: Int
+  pre: Option[String]    # e.g. "alpha.1"
+  build: Option[String]  # e.g. "20260101"
+end
+
+def semver_parse(s: &String) -> Result[SemVer, String]
+  let parts = s.split(".")
+  if parts.len() < 3
+    return Result::Err("Invalid semver: " + s)
+  end
+  let major = match parts[0].parse_int()
+    when Result::Ok(n) then n
+    when Result::Err(_) then return Result::Err("Invalid major version")
+  end
+  let minor = match parts[1].parse_int()
+    when Result::Ok(n) then n
+    when Result::Err(_) then return Result::Err("Invalid minor version")
+  end
+  # Patch may contain pre-release/build metadata
+  let patch_str = parts[2]
+  let pre_idx = patch_str.find("-")
+  let build_idx = patch_str.find("+")
+  let patch_end = match (pre_idx, build_idx)
+    when (Option::Some(p), _) then p
+    when (_, Option::Some(b)) then b
+    when _ then patch_str.len()
+  end
+  let patch = match patch_str.slice(0, patch_end).parse_int()
+    when Result::Ok(n) then n
+    when Result::Err(_) then return Result::Err("Invalid patch version")
+  end
+  let pre = match pre_idx
+    when Option::Some(idx) then
+      let end_idx = match build_idx
+        when Option::Some(b) then b
+        when Option::None then patch_str.len()
+      end
+      Option::Some(patch_str.slice(idx + 1, end_idx))
+    when Option::None then Option::None
+  end
+  let build = match build_idx
+    when Option::Some(idx) then Option::Some(patch_str.slice(idx + 1, patch_str.len()))
+    when Option::None then Option::None
+  end
+  Result::Ok(SemVer { major, minor, patch, pre, build })
+end
+
+def semver_to_string(v: &SemVer) -> String
+  let s = v.major.to_string() + "." + v.minor.to_string() + "." + v.patch.to_string()
+  match &v.pre
+    when Option::Some(p) then s = s + "-" + p
+    when Option::None then ()
+  end
+  match &v.build
+    when Option::Some(b) then s = s + "+" + b
+    when Option::None then ()
+  end
+  s
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §16.2 — Package Signing
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageSignature
+  signer: SignerIdentity
+  signature: Signature
+  signed_hash: String          # SHA256 of package content
+  timestamp: String            # ISO 8601 UTC
+  algorithm: String            # "ed25519"
+end
+
+struct SignerIdentity
+  name: String
+  public_key: PublicKey
+  trust_level: TrustLevel
+end
+
+enum TrustLevel
+  Owner       # Package owner/maintainer
+  Contributor # Approved contributor
+  Auditor     # Third-party security auditor
+  Registry    # Registry-level signature
+end
+
+def verify_package_signature(
+  pkg_hash: &String,
+  sig: &PackageSignature
+) -> Result[(), String]
+  if pkg_hash != sig.signed_hash
+    return Result::Err("Package hash mismatch: expected "
+      + sig.signed_hash + " got " + pkg_hash)
+  end
+  if !ed25519_verify(&sig.signer.public_key, pkg_hash.as_bytes(), &sig.signature)
+    return Result::Err("Invalid signature from " + sig.signer.name)
+  end
+  Result::Ok(())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §16.3 — Lockfile
+# ═══════════════════════════════════════════════════════════════
+
+## Tangerine.lock — deterministic dependency resolution.
+struct Lockfile
+  format_version: String    # "tg.lock.v1"
+  packages: Vec[LockedPackage]
+  integrity_hash: String    # SHA256 of sorted package list
+end
+
+struct LockedPackage
+  id: PackageId
+  integrity: String         # SHA256 hash of package contents
+  source: PackageSource
+  dependencies: Vec[String] # Package names this depends on
+  signatures: Vec[PackageSignature]
+end
+
+enum PackageSource
+  Registry(url: String)
+  Git(url: String, rev: String)
+  Path(path: String)
+end
+
+def lockfile_verify(lock: &Lockfile) -> Result[(), Vec[String]]
+  let errors = Vec::new()
+
+  # Verify integrity hash
+  let sorted_ids = lock.packages.iter()
+    .map(|p| p.id.name + "@" + semver_to_string(&p.id.version))
+    .collect()
+  sorted_ids.sort()
+  let expected_hash = sha256(sorted_ids.join("\n").as_bytes())
+  if expected_hash != lock.integrity_hash
+    errors.push("Lockfile integrity hash mismatch")
+  end
+
+  # Verify each package signature
+  for pkg in &lock.packages do
+    if pkg.signatures.is_empty()
+      errors.push("Package " + pkg.id.name + " has no signatures")
+    end
+    for sig in &pkg.signatures do
+      match verify_package_signature(&pkg.integrity, sig)
+        when Result::Err(e) then errors.push(e)
+        when Result::Ok(()) then ()
+      end
+    end
+  end
+
+  if errors.is_empty()
+    Result::Ok(())
+  else
+    Result::Err(errors)
+  end
+end
+
+def lockfile_parse(content: &String) -> Result[Lockfile, String]
+  # Parse Tangerine.lock TOML format
+  use std::toml::{toml_parse, TomlValue}
+  
+  let doc = match toml_parse(content)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err("Lockfile parse error: " + e)
+  end
+  
+  # Extract format_version
+  let format_version = match doc.get("format_version")
+  when Option::Some(TomlValue::String(s)) then s.clone()
+  when _ then return Result::Err("Missing format_version")
+  end
+  
+  # Extract integrity_hash
+  let integrity_hash = match doc.get("integrity_hash")
+  when Option::Some(TomlValue::String(s)) then s.clone()
+  when _ then return Result::Err("Missing integrity_hash")
+  end
+  
+  # Extract packages array
+  mut packages = Vec::new()
+  match doc.get("package")
+  when Option::Some(TomlValue::Array(arr)) then
+    for entry in arr do
+      let name = match entry.get("name")
+      when Option::Some(TomlValue::String(s)) then s.clone()
+      when _ then continue
+      end
+      let version_str = match entry.get("version")
+      when Option::Some(TomlValue::String(s)) then s.clone()
+      when _ then "0.0.0"
+      end
+      let integrity = match entry.get("integrity")
+      when Option::Some(TomlValue::String(s)) then s.clone()
+      when _ then ""
+      end
+      let source = match entry.get("source")
+      when Option::Some(TomlValue::String(s)) then
+        if s.starts_with("registry+") then
+          PackageSource::Registry(s.substring(9, s.len()))
+        else if s.starts_with("git+") then
+          PackageSource::Git(s.substring(4, s.len()), "")
+        else
+          PackageSource::Path(s.clone())
+        end
+      when _ then PackageSource::Path("")
+      end
+      
+      mut deps = Vec::new()
+      match entry.get("dependencies")
+      when Option::Some(TomlValue::Array(dep_arr)) then
+        for d in dep_arr do
+          match d
+          when TomlValue::String(s) then deps.push(s.clone())
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+      
+      let version = parse_semver(&version_str).unwrap_or(SemVer { major: 0, minor: 0, patch: 0, pre: "", build: "" })
+      packages.push(LockedPackage {
+        id: PackageId { name: name, version: version },
+        integrity: integrity,
+        source: source,
+        dependencies: deps,
+        signatures: Vec::new(),
+      })
+    end
+  when _ then ()
+  end
+  
+  Result::Ok(Lockfile {
+    format_version: format_version,
+    packages: packages,
+    integrity_hash: integrity_hash,
+  })
+end
+
+def lockfile_serialize(lock: &Lockfile) -> String
+  # Deterministic TOML serialization — sorted by package name
+  mut output = String::new()
+  output = output + "format_version = \"" + lock.format_version.clone() + "\"\n"
+  output = output + "integrity_hash = \"" + lock.integrity_hash.clone() + "\"\n\n"
+  
+  # Sort packages by name for deterministic output
+  mut sorted = lock.packages.clone()
+  sorted.sort_by(|a, b| a.id.name.cmp(&b.id.name))
+  
+  for pkg in &sorted do
+    output = output + "[[package]]\n"
+    output = output + "name = \"" + pkg.id.name.clone() + "\"\n"
+    output = output + "version = \"" + semver_to_string(&pkg.id.version) + "\"\n"
+    output = output + "integrity = \"" + pkg.integrity.clone() + "\"\n"
+    
+    match &pkg.source
+    when PackageSource::Registry(url) then
+      output = output + "source = \"registry+" + url.clone() + "\"\n"
+    when PackageSource::Git(url, rev) then
+      output = output + "source = \"git+" + url.clone() + "\"\n"
+    when PackageSource::Path(path) then
+      output = output + "source = \"" + path.clone() + "\"\n"
+    end
+    
+    if !pkg.dependencies.is_empty() then
+      output = output + "dependencies = ["
+      mut first = true
+      for dep in &pkg.dependencies do
+        if !first then
+          output = output + ", "
+        end
+        output = output + "\"" + dep.clone() + "\""
+        first = false
+      end
+      output = output + "]\n"
+    end
+    output = output + "\n"
+  end
+  
+  output
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §16.4 — Reproducible Builds
+# ═══════════════════════════════════════════════════════════════
+
+struct ReproducibleBuildConfig
+  ## Strip timestamps from output
+  strip_timestamps: Bool
+  ## Use deterministic ordering in output
+  deterministic_order: Bool
+  ## Hash all inputs for build ID
+  content_addressed: Bool
+  ## Lock compiler version in lockfile
+  lock_compiler_version: Bool
+end
+
+def default_reproducible_config() -> ReproducibleBuildConfig
+  ReproducibleBuildConfig {
+    strip_timestamps: true,
+    deterministic_order: true,
+    content_addressed: true,
+    lock_compiler_version: true
+  }
+end
+
+struct BuildManifest
+  build_id: String              # SHA256(sorted inputs)
+  compiler_version: String
+  target: String
+  inputs: Vec[InputEntry]
+  output_hash: String
+  reproducible: Bool
+end
+
+struct InputEntry
+  path: String
+  hash: String
+end
+
+def compute_build_id(inputs: &Vec[InputEntry], compiler_ver: &String) -> String
+  let parts = Vec::new()
+  parts.push("compiler=" + compiler_ver)
+  let sorted = inputs.clone()
+  sorted.sort_by(|a, b| a.path.cmp(&b.path))
+  for entry in &sorted do
+    parts.push(entry.path + "=" + entry.hash)
+  end
+  sha256(parts.join("\n").as_bytes())
+end
+
+def verify_reproducible(manifest: &BuildManifest, actual_output_hash: &String) -> Bool
+  manifest.output_hash == *actual_output_hash
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §16.5 — Dependency Trust Graph
+# ═══════════════════════════════════════════════════════════════
+
+struct TrustGraph
+  nodes: Map[String, TrustNode]      # package name -> node
+  edges: Vec[TrustEdge]
+end
+
+struct TrustNode
+  package: PackageId
+  trust_score: Float                  # 0.0 to 1.0
+  has_owner_signature: Bool
+  has_audit: Bool
+  transitive_deps: Int
+end
+
+struct TrustEdge
+  from: String   # Dependent
+  to: String     # Dependency
+end
+
+def compute_trust_score(
+  pkg: &LockedPackage,
+  dep_scores: &Map[String, Float]
+) -> Float
+  let base = 0.0
+
+  # Points for signatures
+  let has_owner = pkg.signatures.iter().any(|s|
+    match s.signer.trust_level
+      when TrustLevel::Owner then true
+      else false
+    end
+  )
+  if has_owner then base = base + 0.4 end
+
+  let has_auditor = pkg.signatures.iter().any(|s|
+    match s.signer.trust_level
+      when TrustLevel::Auditor then true
+      else false
+    end
+  )
+  if has_auditor then base = base + 0.3 end
+
+  # Points for registry signature
+  let has_registry = pkg.signatures.iter().any(|s|
+    match s.signer.trust_level
+      when TrustLevel::Registry then true
+      else false
+    end
+  )
+  if has_registry then base = base + 0.1 end
+
+  # Deduction for unaudited transitive deps
+  let avg_dep_score = if pkg.dependencies.is_empty()
+    1.0
+  else
+    let sum = 0.0
+    for dep in &pkg.dependencies do
+      sum = sum + dep_scores.get(dep).unwrap_or(0.0)
+    end
+    sum / to_float(pkg.dependencies.len())
+  end
+  base = base + 0.2 * avg_dep_score
+
+  clamp_float(base, 0.0, 1.0)
+end
+
+def build_trust_graph(lock: &Lockfile) -> TrustGraph
+  let nodes = Map::new()
+  let edges = Vec::new()
+
+  # First pass: compute base scores
+  let dep_scores = Map::new()
+  for pkg in &lock.packages do
+    dep_scores.insert(pkg.id.name, 0.0)
+  end
+
+  # Iterative scoring (converge in ~3 passes)
+  for _ in 0..3 do
+    for pkg in &lock.packages do
+      let score = compute_trust_score(pkg, &dep_scores)
+      dep_scores.insert(pkg.id.name, score)
+    end
+  end
+
+  # Build nodes
+  for pkg in &lock.packages do
+    let score = dep_scores.get(&pkg.id.name).unwrap_or(0.0)
+    nodes.insert(pkg.id.name, TrustNode {
+      package: pkg.id.clone(),
+      trust_score: score,
+      has_owner_signature: pkg.signatures.iter().any(|s|
+        match s.signer.trust_level { when TrustLevel::Owner then true, else false }
+      ),
+      has_audit: pkg.signatures.iter().any(|s|
+        match s.signer.trust_level { when TrustLevel::Auditor then true, else false }
+      ),
+      transitive_deps: count_transitive_deps(&pkg.id.name, lock)
+    })
+    for dep in &pkg.dependencies do
+      edges.push(TrustEdge { from: pkg.id.name, to: dep })
+    end
+  end
+
+  TrustGraph { nodes, edges }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §16.6 — Supply Chain Policy
+# ═══════════════════════════════════════════════════════════════
+
+struct SupplyChainPolicy
+  ## Minimum trust score for direct dependencies
+  min_direct_trust: Float
+  ## Minimum trust score for transitive dependencies
+  min_transitive_trust: Float
+  ## Require owner signature on direct deps
+  require_owner_sig: Bool
+  ## Maximum allowed transitive dependency depth
+  max_dep_depth: Int
+  ## Blocked packages
+  blocked_packages: Set[String]
+  ## Required audit for packages with capabilities
+  require_audit_for_caps: Bool
+end
+
+def default_policy() -> SupplyChainPolicy
+  SupplyChainPolicy {
+    min_direct_trust: 0.5,
+    min_transitive_trust: 0.3,
+    require_owner_sig: true,
+    max_dep_depth: 10,
+    blocked_packages: Set::new(),
+    require_audit_for_caps: true
+  }
+end
+
+struct PolicyViolation
+  package: String
+  kind: ViolationKind
+  message: String
+end
+
+enum ViolationKind
+  LowTrust
+  MissingSignature
+  Blocked
+  TooDeep
+  UnauditedCaps
+end
+
+def check_policy(
+  graph: &TrustGraph,
+  policy: &SupplyChainPolicy
+) -> Vec[PolicyViolation]
+  let violations = Vec::new()
+
+  for (name, node) in &graph.nodes do
+    # Check blocked
+    if policy.blocked_packages.contains(name)
+      violations.push(PolicyViolation {
+        package: name.clone(),
+        kind: ViolationKind::Blocked,
+        message: "Package '" + name + "' is blocked by policy"
+      })
+    end
+
+    # Check trust score
+    if node.trust_score < policy.min_transitive_trust
+      violations.push(PolicyViolation {
+        package: name.clone(),
+        kind: ViolationKind::LowTrust,
+        message: "Package '" + name + "' has trust score "
+                 + node.trust_score.to_string() + " (min: "
+                 + policy.min_transitive_trust.to_string() + ")"
+      })
+    end
+
+    # Check owner signature
+    if policy.require_owner_sig && !node.has_owner_signature
+      violations.push(PolicyViolation {
+        package: name.clone(),
+        kind: ViolationKind::MissingSignature,
+        message: "Package '" + name + "' missing owner signature"
+      })
+    end
+
+    # Check depth
+    if node.transitive_deps > policy.max_dep_depth
+      violations.push(PolicyViolation {
+        package: name.clone(),
+        kind: ViolationKind::TooDeep,
+        message: "Package '" + name + "' has depth "
+                 + node.transitive_deps.to_string()
+                 + " (max: " + policy.max_dep_depth.to_string() + ")"
+      })
+    end
+  end
+
+  violations
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def count_transitive_deps(pkg_name: &String, lock: &Lockfile) -> Int
+  let visited = Set::new()
+  count_transitive_deps_inner(pkg_name, lock, &mut visited)
+  visited.len()
+end
+
+def count_transitive_deps_inner(
+  pkg_name: &String,
+  lock: &Lockfile,
+  visited: &mut Set[String]
+)
+  for pkg in &lock.packages do
+    if pkg.id.name == *pkg_name
+      for dep in &pkg.dependencies do
+        if !visited.contains(dep)
+          visited.insert(dep.clone())
+          count_transitive_deps_inner(dep, lock, visited)
+        end
+      end
+    end
+  end
+end
+
+def to_float(i: Int) -> Float
+  __intrinsic_int_to_float(i)
+end
+
+def clamp_float(v: Float, lo: Float, hi: Float) -> Float
+  if v < lo then lo
+  else if v > hi then hi
+  else v
+  end
+end

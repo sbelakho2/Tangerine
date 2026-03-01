@@ -15,8 +15,9 @@ This document provides comprehensive guidance for developers working with Tanger
 9. [Ruby Interoperability](#ruby-interoperability)
 10. [Bindgen Tools](#bindgen-tools)
 11. [ABI Validation](#abi-validation)
-12. [Best Practices](#best-practices)
-13. [Troubleshooting](#troubleshooting)
+12. [Taint Integration](#taint-integration)
+13. [Best Practices](#best-practices)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -89,9 +90,9 @@ end
 MRI Ruby extension ABI:
 
 ```tangerine
-extern "Ruby" def my_method(self_: RubyValue, arg: RubyValue) -> RubyValue {
+extern "Ruby" def my_method(self_: RubyValue, arg: RubyValue) -> RubyValue
     // Ruby C API conventions
-}
+end
 ```
 
 - C ABI with Ruby C API conventions
@@ -103,9 +104,9 @@ extern "Ruby" def my_method(self_: RubyValue, arg: RubyValue) -> RubyValue {
 Rust interop through C ABI + generated shims:
 
 ```tangerine
-extern "Rust" def rust_process(data: *const u8, len: usize) -> i32 {
+extern "Rust" def rust_process(data: *const u8, len: usize) -> i32
     // Callable from Rust as extern "C"
-}
+end
 ```
 
 - **Important**: Not Rust's native ABI—always goes through C ABI
@@ -174,21 +175,21 @@ use std::ffi::{FfiStr, FfiSlice}
 
 # Export a function that accepts a string view
 @export("process_string")
-extern "C" def process_string(s: FfiStr) -> i32 {
+extern "C" def process_string(s: FfiStr) -> i32
     # s.ptr points to UTF-8 data, s.len is byte length
     # Valid only for duration of call
     0
-}
+end
 
 # Export a function that accepts a slice view
 @export("sum_array")
-extern "C" def sum_array(arr: FfiSlice[i32]) -> i32 {
+extern "C" def sum_array(arr: FfiSlice[i32]) -> i32
     let mut total = 0
-    for i in 0..arr.len {
+    for i in 0..arr.len do
         total += unsafe { *arr.ptr.offset(i as isize) }
-    }
+    end
     total
-}
+end
 ```
 
 ---
@@ -379,13 +380,13 @@ struct TgResult[T] {
 use std::ffi::{TgResult, tg_result_ok, tg_result_err}
 
 @export("divide")
-extern "C" def divide(a: i64, b: i64) -> TgResult[i64] {
-    if b == 0 {
+extern "C" def divide(a: i64, b: i64) -> TgResult[i64]
+    if b == 0 then
         tg_result_err[i64](1)  # Error code 1: division by zero
-    } else {
+    else
         tg_result_ok(a / b)
-    }
-}
+    end
+end
 ```
 
 **C consumer:**
@@ -445,9 +446,9 @@ use std::ffi::{FfiStr, FfiSlice, TgResult}
 
 # Simple function export
 @export("tg_add")
-extern "C" def add(a: i32, b: i32) -> i32 {
+extern "C" def add(a: i32, b: i32) -> i32
     a + b
-}
+end
 
 # Struct export
 @repr(C)
@@ -457,21 +458,21 @@ struct Point {
 }
 
 @export("tg_point_distance")
-extern "C" def point_distance(p1: Point, p2: Point) -> f64 {
+extern "C" def point_distance(p1: Point, p2: Point) -> f64
     let dx = p2.x - p1.x
     let dy = p2.y - p1.y
     (dx * dx + dy * dy).sqrt()
-}
+end
 
 # Array processing
 @export("tg_sum_array")
-extern "C" def sum_array(data: FfiSlice[i32]) -> i64 {
+extern "C" def sum_array(data: FfiSlice[i32]) -> i64
     let mut sum: i64 = 0
-    for i in 0..data.len {
+    for i in 0..data.len do
         sum += unsafe { *data.ptr.offset(i as isize) } as i64
-    }
+    end
     sum
-}
+end
 ```
 
 ### Calling C Functions from Tangerine
@@ -485,7 +486,7 @@ extern "C" {
     def memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8
 }
 
-def example() {
+def example()
     # Allocate with C malloc
     let ptr = malloc(1024)
     
@@ -493,7 +494,7 @@ def example() {
     
     # Free with C free
     free(ptr)
-}
+end
 ```
 
 ### Generating C Headers
@@ -711,10 +712,10 @@ Strings are passed as `(ptr, len)` pairs:
 ```tangerine
 # Tangerine side
 @export("tg_process_string")
-extern "C" def process_string(ptr: *const u8, len: usize) -> i32 {
+extern "C" def process_string(ptr: *const u8, len: usize) -> i32
     # ptr points to UTF-8 data
     0
-}
+end
 ```
 
 ```rust
@@ -745,25 +746,25 @@ use std::ffi::{RubyValue, ruby_nil, ruby_int_new, ruby_string_new}
 
 # Required init function - called when Ruby loads the extension
 @export("Init_my_extension")
-extern "C" def init_my_extension() {
+extern "C" def init_my_extension()
     # Register module and methods with Ruby
     let module = ruby_define_module("MyExtension")
     ruby_define_module_function(module, "add", tg_add, 2)
     ruby_define_module_function(module, "greet", tg_greet, 1)
-}
+end
 
 # Method implementations receive RubyValue arguments
-extern "C" def tg_add(self_: RubyValue, a: RubyValue, b: RubyValue) -> RubyValue {
+extern "C" def tg_add(self_: RubyValue, a: RubyValue, b: RubyValue) -> RubyValue
     let a_int = ruby_num2long(a)
     let b_int = ruby_num2long(b)
     ruby_int_new(a_int + b_int)
-}
+end
 
-extern "C" def tg_greet(self_: RubyValue, name: RubyValue) -> RubyValue {
+extern "C" def tg_greet(self_: RubyValue, name: RubyValue) -> RubyValue
     let name_str = ruby_string_to_str(name)
     let greeting = "Hello, " + name_str + "!"
     ruby_string_new(greeting.ptr, greeting.len)
-}
+end
 ```
 
 ### RubyValue Type
@@ -788,16 +789,16 @@ struct CachedValue {
     value: RubyValue,
 }
 
-def cache_value(v: RubyValue) -> CachedValue {
+def cache_value(v: RubyValue) -> CachedValue
     # MUST register if storing beyond call
     tg_ruby_gc_register(v)
     CachedValue { value: v }
-}
+end
 
-def release_cached(cache: CachedValue) {
+def release_cached(cache: CachedValue)
     # MUST unregister when done
     tg_ruby_gc_unregister(cache.value)
-}
+end
 ```
 
 **Runtime GC Functions:**
@@ -817,20 +818,20 @@ Two modes for converting Ruby strings:
 **Copy Mode (default, safe):**
 
 ```tangerine
-def process_ruby_string(rv: RubyValue) -> String {
+def process_ruby_string(rv: RubyValue) -> String
     # Copies Ruby string bytes into Tangerine String
     ruby_string_to_tangerine(rv)
-}
+end
 ```
 
 **Borrow Mode (advanced, requires explicit attribute):**
 
 ```tangerine
 @ffi(ruby_borrow = "true")
-def process_ruby_string_borrowed(rv: RubyValue) -> FfiStr {
+def process_ruby_string_borrowed(rv: RubyValue) -> FfiStr
     # Borrows pointer+len - only valid if Ruby string is frozen and pinned
     ruby_string_borrow(rv)
-}
+end
 ```
 
 ### Generating Ruby Extensions
@@ -886,19 +887,19 @@ Ruby calls may raise exceptions. Tangerine translates them to `TgResult` at boun
 ```tangerine
 use std::ffi::{TgResult, RubyValue, tg_ruby_eval}
 
-def safe_eval(code: String) -> TgResult[RubyValue] {
+def safe_eval(code: String) -> TgResult[RubyValue]
     # Returns TgResult - check ok field before using value
     tg_ruby_eval(code)
-}
+end
 ```
 
 For explicit exception propagation:
 
 ```tangerine
 @ffi(throws = "ruby")
-extern "C" def may_raise(v: RubyValue) -> RubyValue {
+extern "C" def may_raise(v: RubyValue) -> RubyValue
     # Exceptions propagate to Ruby caller
-}
+end
 ```
 
 ---
@@ -939,7 +940,9 @@ Bindgen includes:
 ```tangerine
 # This function will appear in generated bindings
 @export("my_function")
-extern "C" def my_function(x: i32) -> i32 { x * 2 }
+extern "C" def my_function(x: i32) -> i32
+    x * 2
+end
 
 # This struct will appear in generated bindings
 @repr(C)
@@ -948,7 +951,9 @@ struct MyStruct {
 }
 
 # This will NOT appear (no @export)
-def internal_function(x: i32) -> i32 { x + 1 }
+def internal_function(x: i32) -> i32
+    x + 1
+end
 
 # This will NOT appear (no @repr(C))
 struct InternalStruct {
@@ -1057,6 +1062,69 @@ Summary: 2 breaking changes, 2 additions
 
 ---
 
+## Taint Integration
+
+All data crossing an FFI boundary is automatically wrapped in `Tainted[T]` by
+the compiler. This prevents untrusted foreign data from being used in
+security-sensitive operations without explicit validation.
+
+### Automatic Taint Wrapping
+
+When a function has `extern "C"` (or any foreign ABI), the compiler inserts a
+taint wrapper around return values:
+
+```tangerine
+# What you write:
+extern "C" def read_input() -> String
+
+# What the compiler sees:
+extern "C" def read_input() -> Tainted[String]
+#   (compiler inserts: __ffi_auto_taint(raw_value, "read_input"))
+```
+
+### FfiBoundary Trait
+
+Types implementing the `FfiBoundary` marker trait are automatically tainted
+when crossing FFI boundaries:
+
+```tangerine
+use std::ffi::FfiBoundary
+
+# Implemented by: String, Vec[u8], Int, Float, Bool, and all user types
+# crossing extern "C" boundaries
+```
+
+### Callback Taint
+
+Arguments passed to Tangerine callbacks **from** foreign code are also tainted:
+
+```tangerine
+# C calls this callback with foreign data:
+@export("on_data")
+extern "C" def on_data(data: FfiStr) -> i32
+  # `data` is Tainted[FfiStr] — must validate before use
+  let clean = validate(data, MaxLengthValidator { max_len: 4096 })?
+  process(clean)
+end
+```
+
+### Disabling Auto-Taint
+
+In `Dev` mode, auto-taint is disabled by default for convenience.
+In `Production` and `Hardened` modes, auto-taint is always active.
+
+Configure in `Tangerine.toml`:
+
+```toml
+[ffi]
+auto_taint = true    # default in Production/Hardened
+```
+
+See `std/taint.tg` for `Tainted[T]`, `Validator`, and built-in validators.
+See `std/ffi.tg` for `FfiBoundary`, `__ffi_auto_taint()`, and `__ffi_callback_taint()`.
+
+---
+
 ## Best Practices
 
 ### 1. Use Explicit Ownership Annotations
@@ -1159,16 +1227,16 @@ Always root Ruby values stored beyond call scope:
 
 ```tangerine
 # Pattern: register on store, unregister on release
-def store_ruby_value(v: RubyValue, storage: *mut RubyValue) {
+def store_ruby_value(v: RubyValue, storage: *mut RubyValue)
     tg_ruby_gc_register(v)
     unsafe { *storage = v }
-}
+end
 
-def clear_ruby_value(storage: *mut RubyValue) {
+def clear_ruby_value(storage: *mut RubyValue)
     let old = unsafe { *storage }
     tg_ruby_gc_unregister(old)
     unsafe { *storage = ruby_nil() }
-}
+end
 ```
 
 ---

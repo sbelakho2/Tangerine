@@ -29,7 +29,7 @@ Once Tangerine reaches 1.0:
    before removal (which requires a major version bump).
 
 3. **Feature gates**: New experimental features are available behind
-   `#[feature(...)]` gates and are not subject to stability guarantees.
+   `@feature(...)` gates and are not subject to stability guarantees.
 
 4. **Compiler warnings**: Deprecated features emit warnings that reference the
    replacement API and the version when the feature will be removed.
@@ -68,7 +68,7 @@ The migration tool:
 
 | Edition | Status    | Key Changes |
 | ------- | --------- | ----------- |
-| 2025    | Stable    | Initial release |
+| 2025    | Frozen    | Initial edition; spec frozen (all APIs remain unstable pre-1.0) |
 | 2026    | Current   | ABI updates, stdlib and tooling expansion |
 
 ## Standard Library Stability
@@ -78,10 +78,10 @@ The migration tool:
 Public items in the standard library are annotated with stability:
 
 ```tangerine
-#[stable(since = "0.1.0")]
+@stable(since = "0.1.0")
 def println(s: String) -> Unit
 
-#[unstable(feature = "async_io", reason = "API under review")]
+@unstable(feature = "async_io", reason = "API under review")
 def async_read(fd: Int, buf: &mut Vec[u8]) -> Future[Result[UInt, IoError]]
 ```
 
@@ -89,10 +89,12 @@ def async_read(fd: Int, buf: &mut Vec[u8]) -> Future[Result[UInt, IoError]]
 
 | Tier | Meaning | Guarantees |
 | ---- | ------- | ---------- |
-| `#[stable]` | Permanent API | Will not be removed or have signature changes. |
-| `#[unstable]` | Experimental | May change or be removed. Requires feature gate. |
-| `#[deprecated]` | Scheduled for removal | Emits warning. Replacement documented. |
+| `@stable` / `#[stable]` | Permanent API | Will not be removed or have signature changes. |
+| `@unstable` / `#[unstable]` | Experimental | May change or be removed. Requires feature gate. |
+| `@deprecated` / `#[deprecated]` | Scheduled for removal | Emits warning. Replacement documented. |
 | (no annotation) | Internal | No stability guarantee. Not part of public API. |
+
+> Both `@attr` and `#[attr]` syntaxes are accepted; `@attr` is preferred (see Style Guide).
 
 ### Standard Library Versioning
 
@@ -101,40 +103,55 @@ X.Y.Z ships with stdlib version X.Y.Z. Users cannot independently update the std
 
 ### Standard Library Modules (v0.1.0)
 
-The following modules are included in the standard library:
+The following modules are included in the standard library.
+
+> **Note:** While the v0.1.0 standard library ships with all modules below,
+> all APIs are **unstable** (pre-1.0). Signatures and behavior may change
+> between minor versions without deprecation. Post-1.0, modules will graduate
+> to `@stable` individually.
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| `std/core` | Core types (Option, Result, Vec, Map, String) | Stable |
-| `std/collections` | Additional collections | Stable |
-| `std/io` | I/O traits and buffering | Stable |
-| `std/fs` | Filesystem operations | Stable |
-| `std/net` | Network sockets | Stable |
-| `std/async` | Async runtime and futures | Stable |
-| `std/thread` | Threading and synchronization | Stable |
-| `std/time` | Date, time, and duration | Stable |
-| `std/test` | Testing framework | Stable |
-| `std/bench` | Benchmarking | Stable |
-| `std/serde` | Serialization traits | Stable |
-| `std/json` | JSON parsing/generation | Stable |
-| `std/toml` | TOML parsing/generation | Stable |
-| `std/http` | HTTP client and server | Stable |
-| `std/url` | URL parsing | Stable |
-| `std/crypto` | Cryptographic primitives | Stable |
-| `std/log` | Logging, tracing, metrics | Stable |
-| `std/cli` | CLI argument parsing, terminal | Stable |
-| `std/regex` | Regular expressions, parser combinators | Stable |
-| `std/db` | Database drivers (SQLite, PostgreSQL) | Stable |
-| `std/compress` | Compression (gzip, deflate, tar, zip) | Stable |
-| `std/ui` | 2D graphics, images, fonts | Stable |
-| `std/web` | Web framework (routing, templates, auth) | Stable |
-| `std/snapshot` | Execution recording and replay | Stable |
-| `std/profile` | Profiling and observability | Stable |
-| `std/ffi` | FFI helpers and types | Stable |
-| `std/contracts` | Design by contract | Stable |
-| `std/capabilities` | Capability-based security | Stable |
-| `std/effects` | Algebraic effects | Stable |
-| `std/budget` | Resource budgets | Stable |
+| `std/core` | Core types (Option, Result, String) | Unstable (pre-1.0) |
+| `std/collections` | Array, Map, Set, iterators | Unstable (pre-1.0) |
+| `std/fmt` | Display, Debug, formatting, printing | Unstable (pre-1.0) |
+| `std/alloc` | Allocator trait, system/arena allocators | Unstable (pre-1.0) |
+| `std/env` | Environment variables, process arguments | Unstable (pre-1.0) |
+| `std/backtrace` | Stack trace capture and display | Unstable (pre-1.0) |
+| `std/io` | I/O traits and buffering | Unstable (pre-1.0) |
+| `std/fs` | Filesystem operations | Unstable (pre-1.0) |
+| `std/net` | Network sockets | Unstable (pre-1.0) |
+| `std/async` | Async runtime and futures | Unstable (pre-1.0) |
+| `std/thread` | Threading and synchronization | Unstable (pre-1.0) |
+| `std/time` | Date, time, and duration | Unstable (pre-1.0) |
+| `std/test` | Testing framework | Unstable (pre-1.0) |
+| `std/bench` | Benchmarking | Unstable (pre-1.0) |
+| `std/test_gen` | Automatic test generation | Unstable (pre-1.0) |
+| `std/serde` | Serialization traits | Unstable (pre-1.0) |
+| `std/json` | JSON parsing/generation | Unstable (pre-1.0) |
+| `std/toml` | TOML parsing/generation | Unstable (pre-1.0) |
+| `std/http` | HTTP client and server | Unstable (pre-1.0) |
+| `std/url` | URL parsing | Unstable (pre-1.0) |
+| `std/crypto` | Cryptographic primitives | Unstable (pre-1.0) |
+| `std/log` | Logging, tracing, metrics | Unstable (pre-1.0) |
+| `std/cli` | CLI argument parsing, terminal | Unstable (pre-1.0) |
+| `std/regex` | Regular expressions, parser combinators | Unstable (pre-1.0) |
+| `std/db` | Database drivers (SQLite, PostgreSQL) | Unstable (pre-1.0) |
+| `std/compress` | Compression (gzip, deflate, tar, zip) | Unstable (pre-1.0) |
+| `std/ui` | 2D graphics, images, fonts | Unstable (pre-1.0) |
+| `std/web` | Web framework (routing, templates, auth) | Unstable (pre-1.0) |
+| `std/ffi` | FFI types, pointers, taint integration | Unstable (pre-1.0) |
+| `std/contracts` | Design by contract, guard keyword | Unstable (pre-1.0) |
+| `std/capabilities` | Capability-based security, profiles | Unstable (pre-1.0) |
+| `std/effects` | Algebraic effects | Unstable (pre-1.0) |
+| `std/budget` | Resource budgets | Unstable (pre-1.0) |
+| `std/profile` | Profiling and observability | Unstable (pre-1.0) |
+| `std/snapshot` | Execution recording | Unstable (pre-1.0) |
+| `std/secure_types` | Injection-safe types (SQL, HTML, URL, Path) | Unstable (pre-1.0) |
+| `std/taint` | FFI taint tracking and validators | Unstable (pre-1.0) |
+| `std/replay` | Deterministic replay | Unstable (pre-1.0) |
+| `std/semantic_diff` | Semantic code diffing | Unstable (pre-1.0) |
+| `std/supply_chain` | Package signing, lockfile, trust | Unstable (pre-1.0) |
 
 ## Dependency Version Resolution
 

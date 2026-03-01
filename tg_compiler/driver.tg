@@ -19,13 +19,14 @@ use std::env::{args}
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{Program}
-use tg_compiler::parser::{parse}
+use tg_compiler::parser::{parse, diag_has_errors, DiagnosticBag}
 use tg_compiler::types::{type_check, TypeError}
 use tg_compiler::borrow_check::{borrow_check, BorrowError}
 use tg_compiler::mir::{lower_to_mir, MirProgram, optimize_mir, pretty_print_mir, instrument_for_pgo}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{TargetTriple}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
+use tg_compiler::resolver::{fnv1a_hash}
 
 # ———————————————————————————————————————————————————————————————
 # Compiler Options
@@ -693,17 +694,17 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     println("  Parsing...")
   end
   
-  let parse_result = parse(tokens)
-  let ast = match parse_result
-  when Result::Ok(program) then program
-  when Result::Err(err) then
-    emit_diagnostic(&mut emitter, Diagnostic {
-      level: DiagLevel::Error,
-      message: err.message,
-      span: Option::Some(err.span),
-      notes: Vec::new(),
-      suggestions: Vec::new()
-    })
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    for d in parse_diags.diagnostics do
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: d.message,
+        span: Option::Some(d.span),
+        notes: Vec::new(),
+        suggestions: Vec::new()
+      })
+    end
     return Result::Err("Parse error")
   end
   
@@ -951,11 +952,18 @@ def expand_item(env: &MacroEnv, item: Item) -> (Item, Bool)
         ret_type: f.ret_type.clone(),
         where_clause: f.where_clause.clone(),
         body: FnBody::Block(new_block),
-        attributes: f.attributes.clone(),
+        is_async: f.is_async,
+        is_unsafe: f.is_unsafe,
+        is_const: f.is_const,
+        is_inline: f.is_inline,
+        is_pure: f.is_pure,
         contracts: f.contracts.clone(),
+        budget: f.budget.clone(),
+        required_caps: f.required_caps.clone(),
+        effects: f.effects.clone(),
         span: f.span
       }
-      (Item { kind: ItemKind::Function(new_f), span: item.span }, expanded)
+      (Item { kind: ItemKind::Function(new_f), annotations: item.annotations.clone(), doc_comment: item.doc_comment.clone(), span: item.span }, expanded)
     when _ then (item, false)
     end
   when _ then (item, false)
@@ -1475,7 +1483,7 @@ end
 def execute_binary(path: String) -> Int
   # Execute the compiled binary
   let cmd = "./" + path
-  unsafe { system(cmd.as_ptr()) }
+  unsafe "FFI system call" do system(cmd.as_ptr()) end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1505,15 +1513,15 @@ def cmd_test(argv: Vec[String]) -> Int
     match read_file(file.clone())
     when Result::Ok(source) then
       let tokens = tokenize(source)
-      match parse(tokens)
-      when Result::Ok(ast) then
+      let (ast, parse_diags) = parse(tokens)
+      if diag_has_errors(&parse_diags) then
+        eprintln("Parse error in " + file)
+      else
         # Extract test functions from AST
         let tests = extract_test_functions(&ast, file.clone())
         for tc in tests do
           suite.add_test(tc)
         end
-      when Result::Err(e) then
-        eprintln("Parse error in " + file + ": " + e.message)
       end
     when Result::Err(e) then
       eprintln("Cannot read " + file + ": " + e)
@@ -1568,12 +1576,12 @@ def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
   for item in ast.items do
     match item.kind
     when ItemKind::Function(func) then
-      # Check for #[test] attribute
+      # Check for #[test] annotation on the item
       mut is_test = false
       mut should_panic = false
       mut is_ignored = false
       
-      for attr in func.attributes do
+      for attr in item.annotations do
         if attr.name == "test" then
           is_test = true
         elsif attr.name == "should_panic" then
@@ -1599,13 +1607,11 @@ def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
           tags: Vec::new()
         }
         
-        # Check for timeout attribute
-        for attr in func.attributes do
+        # Check for timeout annotation
+        for attr in item.annotations do
           if attr.name == "timeout" then
-            match attr.value
-            when Option::Some(val) then
-              tc.timeout_ms = Option::Some(val.parse_uint().unwrap_or(0))
-            when Option::None then ()
+            if !attr.args.is_empty() then
+              tc.timeout_ms = Option::Some(attr.args[0].value.parse_uint().unwrap_or(0))
             end
           end
         end
@@ -1907,14 +1913,14 @@ def cmd_bench(argv: Vec[String]) -> Int
     match read_file(file.clone())
     when Result::Ok(source) then
       let tokens = tokenize(source)
-      match parse(tokens)
-      when Result::Ok(ast) then
+      let (ast, parse_diags) = parse(tokens)
+      if diag_has_errors(&parse_diags) then
+        eprintln("Parse error in " + file)
+      else
         let benches = extract_bench_functions(&ast, file.clone())
         for b in benches do
           suite.add_bench(b)
         end
-      when Result::Err(e) then
-        eprintln("Parse error in " + file + ": " + e.message)
       end
     when Result::Err(e) then
       eprintln("Cannot read " + file + ": " + e)
@@ -1960,7 +1966,7 @@ def extract_bench_functions(ast: &Program, file: String) -> Vec[BenchCase]
   for item in ast.items do
     match item.kind
     when ItemKind::Function(func) then
-      for attr in func.attributes do
+      for attr in item.annotations do
         if attr.name == "bench" then
           benches.push(bench_case_new(func.name.clone(), module_name.clone()))
         end
@@ -2169,21 +2175,12 @@ def is_stale(cache: &IncrementalCache, path: String, source: String) -> Bool
 end
 
 def update_cache(cache: &mut IncrementalCache, path: String, source: String, mir_hash: String) -> Unit
-  let source_hash = hash_string(source)
+  let source_hash = fnv1a_hash(source).to_string()
   cache.entries.insert(path, CacheEntry {
     source_hash: source_hash,
     mir_hash: mir_hash,
     timestamp: current_time()
   })
-end
-
-def hash_string(s: String) -> String
-  # Simple hash for now
-  mut h = 0
-  for c in s do
-    h = h * 31 + (c as Int)
-  end
-  h.to_string()
 end
 
 def current_time() -> Int
@@ -3338,10 +3335,9 @@ def agent_check(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3381,10 +3377,9 @@ def agent_caps(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3393,10 +3388,10 @@ def agent_caps(argv: Vec[String]) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      for attr in f.attributes do
+      for attr in item.annotations do
         if attr.name == "require" then
           for arg in attr.args do
-            caps.insert(arg.clone())
+            caps.insert(arg.value.clone())
           end
         end
       end
@@ -3429,10 +3424,9 @@ def agent_effects(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3442,10 +3436,10 @@ def agent_effects(argv: Vec[String]) -> Int
     match item.kind
     when ItemKind::Function(f) then
       mut fn_effects = Vec::new()
-      for attr in f.attributes do
+      for attr in item.annotations do
         if attr.name == "performs" || attr.name == "effect" then
           for arg in attr.args do
-            fn_effects.push(arg.clone())
+            fn_effects.push(arg.value.clone())
           end
         end
       end
@@ -3479,10 +3473,9 @@ def agent_budget(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3539,16 +3532,14 @@ def agent_diff(argv: Vec[String]) -> Int
   end
 
   # Parse both
-  let old_ast = match parse(tokenize(old_source))
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error in " + old_path + ": " + e.message)
+  let (old_ast, old_diags) = parse(tokenize(old_source))
+  if diag_has_errors(&old_diags) then
+    eprintln("Parse error in " + old_path)
     return 1
   end
-  let new_ast = match parse(tokenize(new_source))
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error in " + new_path + ": " + e.message)
+  let (new_ast, new_diags) = parse(tokenize(new_source))
+  if diag_has_errors(&new_diags) then
+    eprintln("Parse error in " + new_path)
     return 1
   end
 
@@ -3629,10 +3620,8 @@ def agent_audit(argv: Vec[String]) -> Int
     end
 
     let tokens = tokenize(source)
-    let ast = match parse(tokens)
-    when Result::Ok(a) then a
-    when Result::Err(_) then continue
-    end
+    let (ast, parse_diags) = parse(tokens)
+    if diag_has_errors(&parse_diags) then continue end
 
     for item in ast.items do
       match item.kind
@@ -3640,7 +3629,7 @@ def agent_audit(argv: Vec[String]) -> Int
         total_functions = total_functions + 1
         total_contracts = total_contracts + f.contracts.len()
         if f.is_unsafe then total_unsafe = total_unsafe + 1 end
-        for attr in f.attributes do
+        for attr in item.annotations do
           if attr.name == "require" then
             total_caps = total_caps + attr.args.len()
           end
@@ -3732,10 +3721,9 @@ def bindgen_c(source_file: String, output: String) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3763,15 +3751,15 @@ def bindgen_c(source_file: String, output: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f) then
+      if is_ffi_exported(&f, &item.annotations) then
         header = header + generate_c_prototype(&f) + "\n"
       end
     when ItemKind::Struct(s) then
-      if is_repr_c(&s) then
+      if is_repr_c(&item.annotations) then
         header = header + generate_c_struct(&s) + "\n"
       end
     when ItemKind::Enum(e) then
-      if is_repr_c_enum(&e) then
+      if is_repr_c(&item.annotations) then
         header = header + generate_c_enum(&e) + "\n"
       end
     when _ then ()
@@ -3790,26 +3778,38 @@ def bindgen_c(source_file: String, output: String) -> Int
   end
 end
 
-def is_ffi_exported(f: &Function) -> Bool
-  f.extern_abi == "C" || f.extern_abi == "c" || 
-    f.attributes.iter().any(|a| a.name == "export")
+def is_ffi_exported(f: &FunctionDecl, annotations: &Vec[Annotation]) -> Bool
+  # Check if function has extern "C" abi or has #[export] annotation
+  annotations.iter().any(|a| a.name == "export")
 end
 
-def is_repr_c(s: &Struct) -> Bool
-  s.attributes.iter().any(|a| a.name == "repr" && a.args.contains("c"))
+def is_repr_c(annotations: &Vec[Annotation]) -> Bool
+  for a in annotations do
+    if a.name == "repr" then
+      for arg in a.args do
+        if arg.value == "c" || arg.value == "C" then
+          return true
+        end
+      end
+    end
+  end
+  false
 end
 
-def is_repr_c_enum(e: &Enum) -> Bool
-  e.attributes.iter().any(|a| a.name == "repr" && a.args.contains("c"))
-end
-
-def generate_c_prototype(f: &Function) -> String
-  let ret_type = tangerine_type_to_c(&f.return_type)
+def generate_c_prototype(f: &FunctionDecl) -> String
+  let ret_type = match f.ret_type
+    when Option::Some(rt) then tangerine_type_to_c(rt)
+    when Option::None then "void"
+  end
   mut params = ""
   mut first = true
   for p in f.params do
     if !first then params = params + ", " end
-    params = params + tangerine_type_to_c(&p.ty) + " " + p.name.clone()
+    let ty_str = match p.ty
+      when Option::Some(t) then tangerine_type_to_c(t)
+      when Option::None then "void*"
+    end
+    params = params + ty_str + " " + p.name.clone()
     first = false
   end
   if params == "" then params = "void" end
@@ -3863,10 +3863,9 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -3910,7 +3909,7 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f) then
+      if is_ffi_exported(&f, &item.annotations) then
         lib_rs = lib_rs + "    " + generate_rust_extern(&f) + "\n"
       end
     when _ then ()
@@ -3928,13 +3927,20 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
   end
 end
 
-def generate_rust_extern(f: &Function) -> String
-  let ret_type = tangerine_type_to_rust(&f.return_type)
+def generate_rust_extern(f: &FunctionDecl) -> String
+  let ret_type = match f.ret_type
+    when Option::Some(rt) then tangerine_type_to_rust(rt)
+    when Option::None then "()"
+  end
   mut params = ""
   mut first = true
   for p in f.params do
     if !first then params = params + ", " end
-    params = params + p.name.clone() + ": " + tangerine_type_to_rust(&p.ty)
+    let ty_str = match p.ty
+      when Option::Some(t) then tangerine_type_to_rust(t)
+      when Option::None then "*const ()"
+    end
+    params = params + p.name.clone() + ": " + ty_str
     first = false
   end
   let ret_clause = if ret_type == "()" then "" else " -> " + ret_type end
@@ -3967,10 +3973,9 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -4000,7 +4005,7 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f) then
+      if is_ffi_exported(&f, &item.annotations) then
         ext_c = ext_c + generate_ruby_wrapper(&f, &module_name) + "\n"
       end
     when _ then ()
@@ -4012,7 +4017,7 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f) then
+      if is_ffi_exported(&f, &item.annotations) then
         let argc = f.params.len()
         ext_c = ext_c + "    rb_define_module_function(m" + module_name
         ext_c = ext_c + ", \"" + f.name.clone() + "\", rb_" + f.name.clone()
@@ -4033,7 +4038,7 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   end
 end
 
-def generate_ruby_wrapper(f: &Function, module_name: &String) -> String
+def generate_ruby_wrapper(f: &FunctionDecl, module_name: &String) -> String
   let argc = f.params.len()
   mut params = ""
   mut i = 0
@@ -4054,7 +4059,11 @@ def generate_ruby_wrapper(f: &Function, module_name: &String) -> String
     let conv_name = "c_" + arg_name
     
     # Generate conversion based on parameter type
-    let (conv_code, c_type) = ruby_to_c_conversion(arg_name.clone(), &param.ty)
+    let param_ty = match param.ty
+      when Option::Some(t) then t
+      when Option::None then &TypeExpr::Unit
+    end
+    let (conv_code, c_type) = ruby_to_c_conversion(arg_name.clone(), param_ty)
     conversions = conversions + "    " + c_type + " " + conv_name + " = " + conv_code + ";\n"
     
     if i > 0 then call_args = call_args + ", " end
@@ -4063,7 +4072,10 @@ def generate_ruby_wrapper(f: &Function, module_name: &String) -> String
   end
   
   # Generate return value handling
-  let (ret_decl, ret_call, ret_conv) = c_to_ruby_return(&f.return_type)
+  let (ret_decl, ret_call, ret_conv) = match f.ret_type
+    when Option::Some(rt) then c_to_ruby_return(rt)
+    when Option::None then ("", "", "    return Qnil;\n")
+  end
 
   "static VALUE rb_" + f.name.clone() + "(" + params + ") {\n" +
   conversions +
@@ -4290,10 +4302,9 @@ def abi_dump(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let ast = match parse(tokens)
-  when Result::Ok(a) then a
-  when Result::Err(e) then
-    eprintln("Parse error: " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    eprintln("Parse error")
     return 1
   end
 
@@ -4448,9 +4459,11 @@ def parse_file(path: String) -> Result[Program, String]
   when Result::Err(e) then return Result::Err("Cannot read " + path + ": " + e)
   end
   let tokens = tokenize(source)
-  match parse(tokens)
-  when Result::Ok(ast) then Result::Ok(ast)
-  when Result::Err(e) then Result::Err("Parse error in " + path + ": " + e.message)
+  let (ast, parse_diags) = parse(tokens)
+  if diag_has_errors(&parse_diags) then
+    Result::Err("Parse error in " + path)
+  else
+    Result::Ok(ast)
   end
 end
 
@@ -4459,7 +4472,7 @@ def extract_exports(ast: &Program) -> Map[String, String]
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f) then
+      if is_ffi_exported(&f, &item.annotations) then
         let sig = function_signature(&f)
         exports.insert(f.name.clone(), sig)
       end
@@ -4469,15 +4482,22 @@ def extract_exports(ast: &Program) -> Map[String, String]
   exports
 end
 
-def function_signature(f: &Function) -> String
+def function_signature(f: &FunctionDecl) -> String
   mut sig = "("
   mut first = true
   for p in f.params do
     if !first then sig = sig + ", " end
-    sig = sig + type_name(&p.ty)
+    match p.ty
+    when Option::Some(t) then sig = sig + type_name(t)
+    when Option::None then sig = sig + "?"
+    end
     first = false
   end
-  sig = sig + ") -> " + type_name(&f.return_type)
+  sig = sig + ") -> "
+  match f.ret_type
+  when Option::Some(rt) then sig = sig + type_name(rt)
+  when Option::None then sig = sig + "Unit"
+  end
   sig
 end
 
@@ -4657,12 +4677,22 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
   match server.documents.get(uri.clone())
   when Option::Some(content) then
     let tokens = tokenize(content)
-    let parse_result = parse(tokens)
+    let (ast, parse_diags) = parse(tokens)
     
     mut diags = Vec::new()
     
-    match parse_result
-    when Result::Ok(ast) then
+    # Convert parse diagnostics
+    for pd in parse_diags.diagnostics do
+      diags.push(Diagnostic {
+        level: DiagLevel::Error,
+        message: pd.message,
+        span: Option::Some(pd.span),
+        notes: Vec::new(),
+        suggestions: Vec::new()
+      })
+    end
+    
+    if !diag_has_errors(&parse_diags) then
       # Build symbol table for the document
       let symbols = build_symbol_table(&ast, uri.clone())
       server.symbol_tables.insert(uri.clone(), symbols)
@@ -4689,14 +4719,6 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
           suggestions: Vec::new()
         })
       end
-    when Result::Err(err) then
-      diags.push(Diagnostic {
-        level: DiagLevel::Error,
-        message: err.message,
-        span: Option::Some(err.span),
-        notes: Vec::new(),
-        suggestions: Vec::new()
-      })
     end
     
     server.diagnostics.insert(uri, diags)
@@ -5364,11 +5386,15 @@ def build_symbol_table(ast: &Program, uri: String) -> Vec[LspSymbol]
       
       # Add parameters
       for param in func.params do
+        let param_type_str = match param.ty
+          when Option::Some(t) then format_type_expr(t)
+          when Option::None then "?"
+        end
         symbols.push(LspSymbol {
           name: param.name.clone(),
           kind: LspSymbolKind::Parameter,
           span: param.span,
-          type_str: param.type_str.clone(),
+          type_str: param_type_str,
           doc_comment: Option::None,
           definition_uri: Option::Some(uri.clone()),
           definition_span: Option::Some(param.span)
@@ -5614,23 +5640,95 @@ def parse_function_params(type_str: String) -> Vec[String]
   params
 end
 
-def format_function_type(func: &Function) -> String
+def format_function_type(func: &FunctionDecl) -> String
   mut result = "("
   mut first = true
   for param in func.params do
     if !first then result = result + ", " end
-    result = result + param.name + ": " + param.type_str
+    let ty_str = match param.ty
+      when Option::Some(t) then format_type_expr(t)
+      when Option::None then "?"
+    end
+    result = result + param.name + ": " + ty_str
     first = false
   end
-  result = result + ") -> " + func.return_type_str
+  result = result + ") -> "
+  match func.ret_type
+  when Option::Some(rt) then result = result + format_type_expr(rt)
+  when Option::None then result = result + "Unit"
+  end
   result
 end
 
 def extract_doc_comment_before(ast: &Program, span: Span) -> Option[String]
-  # Look at the source content before the span for `#` doc comments
-  # This is a simplification — in a full implementation we'd track
-  # doc comments during parsing
-  Option::None
+  # Scan source text backwards from span.start looking for contiguous ## doc comment lines.
+  # Tangerine doc comments use `##` prefix (like Rust `///`).
+  if span.start <= 0 then
+    return Option::None
+  end
+  
+  let source = &ast.source
+  if source.is_empty() then
+    return Option::None
+  end
+  
+  # Find the beginning of the current line
+  mut pos = span.start - 1
+  while pos > 0 && source.char_at(pos) != '\n' do
+    pos = pos - 1
+  end
+  
+  # Now scan upward collecting doc comment lines
+  mut doc_lines = Vec::new()
+  mut scan_pos = pos
+  
+  loop
+    # Skip to the start of the line above
+    if scan_pos <= 0 then
+      break
+    end
+    # Move past the newline
+    scan_pos = scan_pos - 1
+    while scan_pos > 0 && source.char_at(scan_pos) != '\n' do
+      scan_pos = scan_pos - 1
+    end
+    let line_start = if scan_pos == 0 then 0 else scan_pos + 1 end
+    
+    # Find end of this line
+    mut line_end = line_start
+    while line_end < source.len() && source.char_at(line_end) != '\n' do
+      line_end = line_end + 1
+    end
+    
+    let line = source.substring(line_start, line_end).trim()
+    
+    # Check if this line is a doc comment (## prefix)
+    if line.starts_with("##") then
+      # Strip the ## prefix and leading space
+      let content = line.substring(2, line.len()).trim()
+      doc_lines.push(content)
+    else if line.is_empty() then
+      # Empty line between doc comment and declaration is ok (skip)
+      if doc_lines.is_empty() then
+        break
+      end
+    else
+      # Non-doc-comment, non-empty line — stop scanning
+      break
+    end
+    
+    if scan_pos <= 0 then
+      break
+    end
+  end
+  
+  if doc_lines.is_empty() then
+    return Option::None
+  end
+  
+  # Reverse since we collected bottom-up
+  doc_lines.reverse()
+  Option::Some(doc_lines.join("\n"))
 end
 
 def make_json_rpc_response(id: Option[String], result: String) -> Option[String]

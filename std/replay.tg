@@ -1,0 +1,560 @@
+## Tangerine Standard Library — Deterministic Replay
+##
+## §9: Emit traces during execution, replay them deterministically.
+## Every non-deterministic decision is captured and replayed exactly.
+##
+## This module provides lightweight deterministic replay focused on
+## controlling non-determinism (thread scheduling, random seeds, time,
+## I/O ordering). For full program state recording and post-mortem
+## analysis, see std::snapshot which provides comprehensive event
+## tracking including memory operations, function entry/exit, and
+## checkpoint/restore.
+##
+## The two modules complement each other:
+##   - replay.tg:   lightweight, production-safe deterministic replay
+##   - snapshot.tg:  heavyweight, debug-mode full-state recording
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map}
+use std::io::{File, BufWriter, BufReader}
+use std::time::{Instant, Duration}
+use std::snapshot::{Event as SnapshotEvent, FileReadEvent, FileWriteEvent,
+                     NetRecvEvent, RandomBytesEvent, ClockReadEvent}
+
+# ═══════════════════════════════════════════════════════════════
+# §9.1 — Replay Event Types
+# ═══════════════════════════════════════════════════════════════
+
+## Every non-deterministic event is captured as a ReplayEvent.
+enum ReplayEvent
+  ## Thread scheduling decision
+  ScheduleThread(ThreadId: Int, tick: Int)
+  ## Random number generation
+  RandomSeed(seed: Vec[Byte])
+  ## System time query
+  TimeQuery(nanos: Int)
+  ## I/O read result
+  IoRead(fd: Int, data: Vec[Byte])
+  ## I/O write (recorded for verification)
+  IoWrite(fd: Int, data: Vec[Byte])
+  ## Network receive
+  NetRecv(socket: Int, data: Vec[Byte])
+  ## Environment variable read
+  EnvRead(key: String, value: Option[String])
+  ## File system stat result
+  FsStat(path: String, exists: Bool, size: Int, modified: Int)
+  ## Channel receive ordering
+  ChanRecv(chan_id: Int, sender_id: Int)
+  ## Allocation address (for deterministic pointer comparison)
+  AllocAddr(alloc_id: Int, addr: Int)
+end
+
+## Convert a snapshot Event to a ReplayEvent, if applicable.
+## Returns None for snapshot events that have no replay equivalent
+## (e.g. FunctionEntry, MemoryWrite, Checkpoint).
+def replay_event_from_snapshot(event: &SnapshotEvent) -> Option[ReplayEvent]
+  match event
+    when SnapshotEvent::FileRead(e) then
+      Option::Some(ReplayEvent::IoRead(e.fd, e.data.clone()))
+    when SnapshotEvent::FileWrite(e) then
+      Option::Some(ReplayEvent::IoWrite(e.fd, e.data.clone()))
+    when SnapshotEvent::NetRecv(e) then
+      Option::Some(ReplayEvent::NetRecv(e.socket, e.data.clone()))
+    when SnapshotEvent::RandomBytes(e) then
+      Option::Some(ReplayEvent::RandomSeed(e.bytes.clone()))
+    when SnapshotEvent::ClockRead(e) then
+      Option::Some(ReplayEvent::TimeQuery(e.nanos))
+    when _ then Option::None
+  end
+end
+
+## Convert a ReplayEvent to a snapshot Event for unified analysis.
+def replay_event_to_snapshot(event: &ReplayEvent) -> SnapshotEvent
+  match event
+    when ReplayEvent::IoRead(fd, data) then
+      SnapshotEvent::FileRead(FileReadEvent { fd: fd, data: data.clone(), timestamp: 0 })
+    when ReplayEvent::IoWrite(fd, data) then
+      SnapshotEvent::FileWrite(FileWriteEvent { fd: fd, data: data.clone(), timestamp: 0 })
+    when ReplayEvent::NetRecv(socket, data) then
+      SnapshotEvent::NetRecv(NetRecvEvent { socket: socket, data: data.clone(), timestamp: 0 })
+    when ReplayEvent::RandomSeed(seed) then
+      SnapshotEvent::RandomBytes(RandomBytesEvent { bytes: seed.clone(), timestamp: 0 })
+    when ReplayEvent::TimeQuery(nanos) then
+      SnapshotEvent::ClockRead(ClockReadEvent { nanos: nanos, timestamp: 0 })
+    when _ then
+      panic("ReplayEvent variant has no snapshot equivalent")
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §9.2 — Replay Trace
+# ═══════════════════════════════════════════════════════════════
+
+struct ReplayTrace
+  header: TraceHeader
+  events: Vec[ReplayEvent]
+end
+
+struct TraceHeader
+  format_version: String       # "tg.replay.v1"
+  tangerine_version: String
+  program_hash: String         # SHA256 of compiled program
+  args_hash: String            # SHA256 of command-line args
+  start_time: String           # UTC ISO 8601
+  event_count: Int
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §9.3 — Recording
+# ═══════════════════════════════════════════════════════════════
+
+struct ReplayRecorder
+  events: Vec[ReplayEvent]
+  enabled: Bool
+  tick: Int
+end
+
+def recorder_new() -> ReplayRecorder
+  ReplayRecorder {
+    events: Vec::new(),
+    enabled: true,
+    tick: 0
+  }
+end
+
+def recorder_record(rec: &mut ReplayRecorder, event: ReplayEvent)
+  if rec.enabled
+    rec.events.push(event)
+    rec.tick = rec.tick + 1
+  end
+end
+
+def recorder_record_schedule(rec: &mut ReplayRecorder, thread_id: Int)
+  recorder_record(rec, ReplayEvent::ScheduleThread(
+    ThreadId: thread_id,
+    tick: rec.tick
+  ))
+end
+
+def recorder_record_random(rec: &mut ReplayRecorder, seed: Vec[Byte])
+  recorder_record(rec, ReplayEvent::RandomSeed(seed: seed))
+end
+
+def recorder_record_time(rec: &mut ReplayRecorder, nanos: Int)
+  recorder_record(rec, ReplayEvent::TimeQuery(nanos: nanos))
+end
+
+def recorder_record_io_read(rec: &mut ReplayRecorder, fd: Int, data: Vec[Byte])
+  recorder_record(rec, ReplayEvent::IoRead(fd: fd, data: data))
+end
+
+def recorder_record_env(rec: &mut ReplayRecorder, key: String, value: Option[String])
+  recorder_record(rec, ReplayEvent::EnvRead(key: key, value: value))
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §9.4 — Serialization
+# ═══════════════════════════════════════════════════════════════
+
+def trace_serialize(trace: &ReplayTrace) -> Vec[Byte]
+  let lines = Vec::new()
+  # Header
+  lines.push("{\"format\":\"" + trace.header.format_version
+    + "\",\"tg_version\":\"" + trace.header.tangerine_version
+    + "\",\"program_hash\":\"" + trace.header.program_hash
+    + "\",\"args_hash\":\"" + trace.header.args_hash
+    + "\",\"start_time\":\"" + trace.header.start_time
+    + "\",\"event_count\":" + trace.header.event_count.to_string()
+    + "}")
+
+  # Events as JSONL
+  for event in &trace.events do
+    let line = match event
+      when ReplayEvent::ScheduleThread(tid, tick) then
+        "{\"t\":\"sched\",\"tid\":" + tid.to_string()
+        + ",\"tick\":" + tick.to_string() + "}"
+      when ReplayEvent::RandomSeed(seed) then
+        "{\"t\":\"rand\",\"seed\":\"" + hex_encode(&seed) + "\"}"
+      when ReplayEvent::TimeQuery(nanos) then
+        "{\"t\":\"time\",\"ns\":" + nanos.to_string() + "}"
+      when ReplayEvent::IoRead(fd, data) then
+        "{\"t\":\"io_r\",\"fd\":" + fd.to_string()
+        + ",\"len\":" + data.len().to_string()
+        + ",\"data\":\"" + hex_encode(&data) + "\"}"
+      when ReplayEvent::IoWrite(fd, data) then
+        "{\"t\":\"io_w\",\"fd\":" + fd.to_string()
+        + ",\"len\":" + data.len().to_string()
+        + ",\"data\":\"" + hex_encode(&data) + "\"}"
+      when ReplayEvent::NetRecv(socket, data) then
+        "{\"t\":\"net_r\",\"sock\":" + socket.to_string()
+        + ",\"data\":\"" + hex_encode(&data) + "\"}"
+      when ReplayEvent::EnvRead(key, value) then
+        let v = match &value
+          when Option::Some(s) then "\"" + s + "\""
+          when Option::None then "null"
+        end
+        "{\"t\":\"env\",\"key\":\"" + key + "\",\"val\":" + v + "}"
+      when ReplayEvent::FsStat(path, exists, size, modified) then
+        "{\"t\":\"stat\",\"path\":\"" + path
+        + "\",\"exists\":" + exists.to_string()
+        + ",\"size\":" + size.to_string()
+        + ",\"mtime\":" + modified.to_string() + "}"
+      when ReplayEvent::ChanRecv(chan_id, sender_id) then
+        "{\"t\":\"chan\",\"ch\":" + chan_id.to_string()
+        + ",\"from\":" + sender_id.to_string() + "}"
+      when ReplayEvent::AllocAddr(alloc_id, addr) then
+        "{\"t\":\"alloc\",\"id\":" + alloc_id.to_string()
+        + ",\"addr\":" + addr.to_string() + "}"
+    end
+    lines.push(line)
+  end
+
+  lines.join("\n").as_bytes()
+end
+
+def trace_save(trace: &ReplayTrace, path: &String) -> Result[(), String]
+  let data = trace_serialize(trace)
+  match File::create(path)
+    when Result::Ok(f) then
+      let writer = BufWriter::new(f)
+      writer.write_all(&data)
+    when Result::Err(e) then Result::Err("Failed to save trace: " + e.to_string())
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §9.5 — Replay (playback)
+# ═══════════════════════════════════════════════════════════════
+
+struct ReplayPlayer
+  events: Vec[ReplayEvent]
+  cursor: Int
+  program_hash: String
+end
+
+def player_load(path: &String) -> Result[ReplayPlayer, String]
+  let data = match File::read_to_string(path)
+    when Result::Ok(s) then s
+    when Result::Err(e) then return Result::Err("Failed to read trace: " + e.to_string())
+  end
+  let lines = data.split("\n")
+  if lines.is_empty()
+    return Result::Err("Empty trace file")
+  end
+
+  # Parse header
+  let header = parse_trace_header(&lines[0])
+  match header
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(h) then
+      # Parse events
+      let events = Vec::new()
+      for i in 1..lines.len() do
+        if lines[i].is_empty() then continue end
+        match parse_trace_event(&lines[i])
+          when Result::Ok(ev) then events.push(ev)
+          when Result::Err(e) then
+            return Result::Err("Failed to parse event at line "
+              + (i + 1).to_string() + ": " + e)
+        end
+      end
+
+      Result::Ok(ReplayPlayer {
+        events: events,
+        cursor: 0,
+        program_hash: h.program_hash
+      })
+  end
+end
+
+def player_next(player: &mut ReplayPlayer) -> Option[ReplayEvent]
+  if player.cursor >= player.events.len()
+    return Option::None
+  end
+  let event = player.events[player.cursor].clone()
+  player.cursor = player.cursor + 1
+  Option::Some(event)
+end
+
+def player_next_schedule(player: &mut ReplayPlayer) -> Option[Int]
+  match player_next(player)
+    when Option::Some(ReplayEvent::ScheduleThread(tid, _)) then Option::Some(tid)
+    when _ then Option::None
+  end
+end
+
+def player_next_random(player: &mut ReplayPlayer) -> Option[Vec[Byte]]
+  match player_next(player)
+    when Option::Some(ReplayEvent::RandomSeed(seed)) then Option::Some(seed)
+    when _ then Option::None
+  end
+end
+
+def player_next_time(player: &mut ReplayPlayer) -> Option[Int]
+  match player_next(player)
+    when Option::Some(ReplayEvent::TimeQuery(nanos)) then Option::Some(nanos)
+    when _ then Option::None
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §9.6 — Deterministic Scheduler
+# ═══════════════════════════════════════════════════════════════
+
+## In replay mode, the runtime scheduler queries the replay player
+## instead of making its own scheduling decisions.
+
+struct DeterministicScheduler
+  mode: SchedulerMode
+  player: Option[ReplayPlayer]
+  recorder: Option[ReplayRecorder]
+end
+
+enum SchedulerMode
+  Normal      # No recording or replay
+  Recording   # Record all decisions
+  Replaying   # Replay from trace
+end
+
+def scheduler_new(mode: SchedulerMode) -> DeterministicScheduler
+  DeterministicScheduler {
+    mode: mode,
+    player: match mode
+      when SchedulerMode::Replaying then panic("Must use scheduler_from_trace()")
+      else Option::None
+    end,
+    recorder: match mode
+      when SchedulerMode::Recording then Option::Some(recorder_new())
+      when _ then Option::None
+    end
+  }
+end
+
+def scheduler_from_trace(player: ReplayPlayer) -> DeterministicScheduler
+  DeterministicScheduler {
+    mode: SchedulerMode::Replaying,
+    player: Option::Some(player),
+    recorder: Option::None
+  }
+end
+
+def scheduler_pick_thread(
+  sched: &mut DeterministicScheduler,
+  runnable: &Vec[Int]
+) -> Int
+  match sched.mode
+    when SchedulerMode::Normal then
+      # Default: pick first runnable
+      runnable[0]
+    when SchedulerMode::Replaying then
+      match &mut sched.player
+        when Option::Some(p) then
+          match player_next_schedule(p)
+            when Option::Some(tid) then tid
+            when Option::None then panic("Replay trace exhausted during scheduling")
+          end
+        when Option::None then panic("No replay player")
+      end
+    when SchedulerMode::Recording then
+      let tid = runnable[0]
+      match &mut sched.recorder
+        when Option::Some(r) then recorder_record_schedule(r, tid)
+        when Option::None then ()
+      end
+      tid
+  end
+end
+
+def scheduler_finish(sched: &DeterministicScheduler) -> Option[ReplayTrace]
+  match &sched.recorder
+    when Option::Some(r) then
+      Option::Some(ReplayTrace {
+        header: TraceHeader {
+          format_version: "tg.replay.v1",
+          tangerine_version: "0.1.0",
+          program_hash: "",
+          args_hash: "",
+          start_time: "",
+          event_count: r.events.len()
+        },
+        events: r.events.clone()
+      })
+    when Option::None then Option::None
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def hex_encode(data: &Vec[Byte]) -> String
+  # Pre-allocate buffer to avoid O(n²) string concatenation
+  mut buf = Vec::with_capacity(data.len() * 2)
+  let hex_chars = "0123456789abcdef"
+  for b in data do
+    let hi = (b >> 4) & 0x0F
+    let lo = b & 0x0F
+    buf.push(hex_chars[hi as UInt] as Byte)
+    buf.push(hex_chars[lo as UInt] as Byte)
+  end
+  String::from_utf8(buf)
+end
+
+def byte_to_hex(b: Byte) -> String
+  let hi = (b >> 4) & 0x0F
+  let lo = b & 0x0F
+  let chars = "0123456789abcdef"
+  chars[hi].to_string() + chars[lo].to_string()
+end
+
+def parse_trace_header(line: &String) -> Result[TraceHeader, String]
+  # Parse JSON header line using std::json
+  use std::json::{json_parse, JsonValue}
+  
+  let doc = match json_parse(line)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err("Header parse error: " + e)
+  end
+  
+  let format_version = match doc.get("format_version")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then return Result::Err("Missing format_version")
+  end
+  let tangerine_version = match doc.get("tangerine_version")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then ""
+  end
+  let program_hash = match doc.get("program_hash")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then ""
+  end
+  let args_hash = match doc.get("args_hash")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then ""
+  end
+  let start_time = match doc.get("start_time")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then ""
+  end
+  let event_count = match doc.get("event_count")
+  when Option::Some(JsonValue::Number(n)) then n as Int
+  when _ then 0
+  end
+  
+  Result::Ok(TraceHeader {
+    format_version: format_version,
+    tangerine_version: tangerine_version,
+    program_hash: program_hash,
+    args_hash: args_hash,
+    start_time: start_time,
+    event_count: event_count,
+  })
+end
+
+def parse_trace_event(line: &String) -> Result[ReplayEvent, String]
+  # Parse JSON event line using std::json
+  use std::json::{json_parse, JsonValue}
+  
+  let doc = match json_parse(line)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err("Event parse error: " + e)
+  end
+  
+  let kind = match doc.get("kind")
+  when Option::Some(JsonValue::String(s)) then s.clone()
+  when _ then return Result::Err("Missing event kind")
+  end
+  
+  match kind.as_str()
+  when "schedule_thread" then
+    let thread_id = extract_int(&doc, "thread_id").unwrap_or(0)
+    let tick = extract_int(&doc, "tick").unwrap_or(0)
+    Result::Ok(ReplayEvent::ScheduleThread(thread_id, tick))
+  when "random_seed" then
+    let data = extract_byte_array(&doc, "seed")
+    Result::Ok(ReplayEvent::RandomSeed(data))
+  when "time_query" then
+    let nanos = extract_int(&doc, "nanos").unwrap_or(0)
+    Result::Ok(ReplayEvent::TimeQuery(nanos))
+  when "io_read" then
+    let fd = extract_int(&doc, "fd").unwrap_or(0)
+    let data = extract_byte_array(&doc, "data")
+    Result::Ok(ReplayEvent::IoRead(fd, data))
+  when "io_write" then
+    let fd = extract_int(&doc, "fd").unwrap_or(0)
+    let data = extract_byte_array(&doc, "data")
+    Result::Ok(ReplayEvent::IoWrite(fd, data))
+  when "net_recv" then
+    let socket = extract_int(&doc, "socket").unwrap_or(0)
+    let data = extract_byte_array(&doc, "data")
+    Result::Ok(ReplayEvent::NetRecv(socket, data))
+  when "env_read" then
+    let key = extract_string(&doc, "key").unwrap_or("")
+    let value = extract_optional_string(&doc, "value")
+    Result::Ok(ReplayEvent::EnvRead(key, value))
+  when "fs_stat" then
+    let path = extract_string(&doc, "path").unwrap_or("")
+    let exists = extract_bool(&doc, "exists").unwrap_or(false)
+    let size = extract_int(&doc, "size").unwrap_or(0)
+    let modified = extract_int(&doc, "modified").unwrap_or(0)
+    Result::Ok(ReplayEvent::FsStat(path, exists, size, modified))
+  when "chan_recv" then
+    let chan_id = extract_int(&doc, "chan_id").unwrap_or(0)
+    let sender_id = extract_int(&doc, "sender_id").unwrap_or(0)
+    Result::Ok(ReplayEvent::ChanRecv(chan_id, sender_id))
+  when "alloc_addr" then
+    let alloc_id = extract_int(&doc, "alloc_id").unwrap_or(0)
+    let addr = extract_int(&doc, "addr").unwrap_or(0)
+    Result::Ok(ReplayEvent::AllocAddr(alloc_id, addr))
+  when _ then
+    Result::Err("Unknown event kind: " + kind)
+  end
+end
+
+# JSON extraction helpers
+def extract_int(doc: &JsonValue, key: &str) -> Option[Int]
+  match doc.get(key)
+  when Option::Some(JsonValue::Number(n)) then Option::Some(n as Int)
+  when _ then Option::None
+  end
+end
+
+def extract_string(doc: &JsonValue, key: &str) -> Option[String]
+  match doc.get(key)
+  when Option::Some(JsonValue::String(s)) then Option::Some(s.clone())
+  when _ then Option::None
+  end
+end
+
+def extract_bool(doc: &JsonValue, key: &str) -> Option[Bool]
+  match doc.get(key)
+  when Option::Some(JsonValue::Bool(b)) then Option::Some(b)
+  when _ then Option::None
+  end
+end
+
+def extract_optional_string(doc: &JsonValue, key: &str) -> Option[String]
+  match doc.get(key)
+  when Option::Some(JsonValue::String(s)) then Option::Some(s.clone())
+  when Option::Some(JsonValue::Null) then Option::None
+  when _ then Option::None
+  end
+end
+
+def extract_byte_array(doc: &JsonValue, key: &str) -> Vec[Byte]
+  mut result = Vec::new()
+  match doc.get(key)
+  when Option::Some(JsonValue::Array(arr)) then
+    for item in arr do
+      match item
+      when JsonValue::Number(n) then result.push(n as Byte)
+      when _ then ()
+      end
+    end
+  when Option::Some(JsonValue::String(s)) then
+    # Hex-encoded byte string
+    result = hex_decode(&s)
+  when _ then ()
+  end
+  result
+end

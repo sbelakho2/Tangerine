@@ -44,6 +44,7 @@ mut w: Float = 3.14
 - `Unit` - empty type (like `void`)
 - `Bool` - `true` or `false`
 - `Int` - 64-bit signed integer
+- `UInt` - 64-bit unsigned integer
 - `Float` - 64-bit floating point
 - `Char` - Unicode scalar value
 - `String` - UTF-8 string
@@ -66,6 +67,43 @@ let maybe: Option[Int] = Option::Some(42)
 let result: Result[Int, String] = Result::Ok(42)
 ```
 
+#### FFI-Specific Sized Integer Types
+
+When interfacing with C or other languages via FFI, Tangerine provides sized
+integer types that map directly to their C equivalents:
+
+| Tangerine FFI Type | C Equivalent | Size |
+|--------------------|-------------|------|
+| `i8` | `int8_t` | 1 byte |
+| `u8` | `uint8_t` | 1 byte |
+| `i16` | `int16_t` | 2 bytes |
+| `u16` | `uint16_t` | 2 bytes |
+| `i32` | `int32_t` | 4 bytes |
+| `u32` | `uint32_t` | 4 bytes |
+| `i64` / `Int` | `int64_t` | 8 bytes |
+| `u64` / `UInt` | `uint64_t` | 8 bytes |
+| `f32` | `float` | 4 bytes |
+| `f64` / `Float` | `double` | 8 bytes |
+
+These sized types are primarily used in `extern` declarations and `@repr(C)`
+structs. In regular Tangerine code, prefer `Int`, `UInt`, and `Float`.
+
+#### Array and Collection Types
+
+Tangerine distinguishes three array-like types:
+
+- **`[T; N]`** — Fixed-size array. Stack-allocated, size known at compile time.
+- **`[T]`** — Slice. A view into contiguous memory (pointer + length).
+- **`Array[T]` / `Vec[T]`** — Growable dynamic array (heap-allocated, ptr + len + cap). `Vec[T]` is a type alias for `Array[T]`.
+
+#### Pointer Types
+
+- **`&T`** — Shared reference (immutable borrow).
+- **`&mut T`** — Mutable reference (exclusive borrow).
+- **`*T`** / **`Ptr[T]`** — Raw pointer. `*T` is syntax sugar for `Ptr[T]`.
+  Use only in `unsafe` blocks or FFI boundaries.
+- **`*mut T`** — Mutable raw pointer.
+
 ### Functions
 
 ```tangerine
@@ -87,6 +125,9 @@ def greet(name: String) -> String
 end
 
 # Pure function (no side effects)
+# A `pure` function may not perform I/O, mutate external state, call
+# non-pure functions, or trigger effects. The compiler verifies purity
+# via effect tracking. Pure functions are safe to memoize and parallelize.
 pure def add(a: Int, b: Int) -> Int
   a + b
 end
@@ -392,6 +433,37 @@ finally
 end
 ```
 
+## Progressive Strictness (Mode System)
+
+Tangerine features a **progressive strictness** model: projects start in easy
+`Dev` mode and automatically escalate to stricter modes as the codebase matures.
+The mode controls which enforcement passes are active.
+
+```tangerine
+# Set in Tangerine.toml:
+#   [project]
+#   mode = "Production"
+
+# Four modes (least to most strict):
+#   Dev        — contracts checked at runtime, no gating
+#   Strict     — effects enforced, stubs rejected
+#   Production — CQS score gating, docs required for pub
+#   Hardened   — capabilities denylist, all budgets enforced
+```
+
+| Feature | Dev | Strict | Production | Hardened |
+|---------|-----|--------|------------|----------|
+| Runtime contracts | ✓ | ✓ | ✓ | ✓ |
+| Effect enforcement | — | ✓ | ✓ | ✓ |
+| Stub rejection | — | ✓ | ✓ | ✓ |
+| CQS score gating | — | — | ✓ | ✓ |
+| Pub API docs/tests | — | — | ✓ | ✓ |
+| Capability denylist | — | — | — | ✓ |
+| Budget enforcement | — | — | — | ✓ |
+| Unsafe requires reason | — | — | ✓ | ✓ |
+
+See `tg_compiler/mode.tg` for the full `Mode` enum and `ModeConfig` struct.
+
 ## Agentic Features
 
 ### Design by Contract
@@ -413,6 +485,45 @@ struct BankAccount
   invariant self.balance >= 0.0, "balance must be non-negative"
 end
 ```
+
+### Guard Keyword
+
+The `guard` keyword is syntactic sugar for precondition checks that early-return
+on failure. It desugars to an `if`/`return` or `if`/`panic`, and can optionally
+narrow the type of a variable for the remainder of the function.
+
+```tangerine
+# Guard with early return
+def process(input: Option[String]) -> Result[Int, Error]
+  guard let value = input else return Result::Err("missing input")
+
+  # `value` is now `String` (narrowed from Option[String])
+  parse_int(value)
+end
+
+# Guard with panic
+def require_positive(x: Int) -> Int
+  guard x > 0 else panic("x must be positive")
+  x * 2
+end
+
+# Guard with break/continue in loops
+def find_first_valid(items: Vec[Option[Int]]) -> Option[Int]
+  for item in items do
+    guard let val = item else continue
+    if val > 0 then
+      return Option::Some(val)
+    end
+  end
+  Option::None
+end
+```
+
+Guard else-actions must **diverge** — they must `return`, `panic`, `break`, or
+`continue`. The compiler rejects guards whose else branch falls through.
+
+See `std/contracts.tg` for the `GuardClause`, `GuardElseAction` types, and
+`desugar_guard()` function.
 
 ### Capabilities
 
@@ -441,6 +552,31 @@ def safe_process(data: String) -> String
   process_locally(data)
 end
 ```
+
+### Security Profiles
+
+A **security profile** restricts which capabilities are allowed in a project.
+Set via `profile = "backend"` in `Tangerine.toml`.
+
+```tangerine
+# Built-in profiles:
+#   Backend  — Net, Fs, DB, Env, Clock, Random allowed; Unsafe denied
+#   Cli      — Fs, Env, Proc allowed; Net denied
+#   Ui       — Clock, Random allowed; Fs, Net, DB denied
+#   Library  — only Pure + Custom allowed; all system caps denied
+
+# Custom profile
+# [project]
+# profile = "custom"
+# [profile.custom]
+# allowed = ["Net", "Fs"]
+# denied  = ["Unsafe", "FFI"]
+# audit_required = ["DB"]
+```
+
+The compiler runs `validate_against_profile()` during CQS analysis and rejects
+capability usage that violates the active profile. See `std/capabilities.tg` for
+the `SecurityProfile` enum and `profile_check()` function.
 
 ### Effects
 
@@ -474,10 +610,13 @@ end
 
 ### Budgets
 
+Budget constraints are applied as `@budget` annotations inside function bodies.
+The compiler and runtime enforce these limits.
+
 ```tangerine
-# Budget annotation
+# Budget annotation (per golden/budget_01.tg)
 def expensive_operation() -> Result[Data, Error]
-  budget time: 5s, memory: 100MB, api_calls: 10
+  @budget time_p95 < "5s", alloc_bytes < "100MB"
   
   # implementation with resource tracking
 end
@@ -505,6 +644,274 @@ rationale
     - "Copy-on-write: rejected, more complex implementation"
 end
 ```
+
+## Secure Types
+
+Tangerine provides **sealed wrapper types** that prevent injection attacks at the
+type level. These types cannot be constructed from raw strings — only through
+validated constructors that enforce security invariants.
+
+```tangerine
+use std::secure_types::{sql_query, SqlParam, html_escape, url_parse, path_parse}
+
+# SQL — parameterized queries only, no string interpolation
+let query = sql_query("SELECT * FROM users WHERE id = $1", [SqlParam::Int(42)])?
+# query is SqlQuery — cannot be constructed from a raw string
+
+# HTML — auto-escapes, XSS-safe
+let safe = html_escape("<script>alert('xss')</script>")
+# safe.value == "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
+
+# URLs — blocks javascript: and vbscript: schemes
+let url = url_parse("https://example.com/api")?
+# url_parse("javascript:alert(1)") → Err(...)
+
+# File paths — rejects traversal attacks
+let path = path_parse("data/reports/q1.csv")?
+# path_parse("../../etc/passwd") → Err(...)
+```
+
+See `std/secure_types.tg` for `SqlQuery`, `HtmlSafe`, `Url`, `SafePath`, and
+`HeaderValue`.
+
+## Taint Tracking
+
+Data entering the program through **FFI boundaries** is automatically wrapped in
+`Tainted[T]`. Tainted values cannot be used directly — they must pass through a
+**validator** to produce a clean value.
+
+```tangerine
+use std::taint::{Tainted, taint, validate, MaxLengthValidator}
+
+# FFI data is auto-tainted by the compiler
+extern "C" def read_input() -> Tainted[String]
+
+# Cannot use tainted data directly:
+# let name = read_input()   # ERROR: expected String, got Tainted[String]
+
+# Must validate first:
+let raw = read_input()
+let validator = MaxLengthValidator { max_len: 255 }
+let clean_name = validate(raw, validator)?   # Ok(String) or Err(ValidationError)
+```
+
+### Taint Labels
+
+Each tainted value carries one or more `TaintLabel` values tracking its origin:
+`FfiInput`, `FfiCallback`, `NetworkRead`, `FileRead`, `EnvVar`, `UserInput`,
+`Deserialized`, `Custom(String)`.
+
+### Built-in Validators
+
+| Validator | Purpose |
+|-----------|---------|
+| `MaxLengthValidator` | String length ≤ max_len |
+| `IntRangeValidator` | Integer in [min, max] |
+| `PatternValidator` | String matches regex |
+| `NonEmptyValidator` | Non-empty string |
+
+### Custom Validators
+
+```tangerine
+use std::taint::{Validator, Tainted, ValidationError}
+
+struct EmailValidator end
+
+impl Validator[String, String] for EmailValidator
+  def validate(tainted: &Tainted[String]) -> Result[String, ValidationError]
+    let val = tainted.value
+    if val.contains("@") && val.contains(".") then
+      Result::Ok(val.clone())
+    else
+      Result::Err(ValidationError {
+        message: "invalid email",
+        labels: tainted.labels.clone(),
+        source_span: tainted.source_span,
+      })
+    end
+  end
+end
+```
+
+See `std/taint.tg` for the full API and `std/ffi.tg` for FFI boundary
+integration (`FfiBoundary` trait, `__ffi_auto_taint()`).
+
+## Deterministic Replay
+
+The replay system captures non-deterministic events during execution and allows
+exact reproduction of program behavior.
+
+```tangerine
+use std::replay::{ReplayRecorder, recorder_new, recorder_record_schedule,
+                  trace_serialize, trace_save, player_load}
+
+# Record
+mut recorder = recorder_new()
+recorder_record_schedule(&mut recorder, 0)
+recorder_record_random(&mut recorder, [0x42, 0x00])
+recorder_record_time(&mut recorder, 1700000000_000_000_000)
+
+let trace = recorder.to_trace()
+trace_save(&trace, "session.replay")?
+
+# Replay
+let player = player_load("session.replay")?
+let event = player.next()?
+```
+
+Events captured: thread scheduling, RNG seeds, wall-clock queries, I/O
+reads/writes, network receives, environment variable reads, filesystem stats,
+channel receives, allocation addresses.
+
+See `std/replay.tg` for `ReplayEvent` (11 variants), `ReplayRecorder`,
+`ReplayPlayer`, and `DeterministicScheduler`.
+
+## Semantic Refactoring
+
+Tangerine provides compiler-guaranteed refactoring primitives. The compiler
+either applies the refactoring correctly or refuses — it never silently breaks
+code.
+
+```bash
+# Rename a symbol across the entire project
+tg refactor rename old_name new_name
+
+# Extract a code block into a new function
+tg refactor extract src/lib.tg:10:1-25:1 new_function_name
+
+# Inline a single-assignment variable
+tg refactor inline src/lib.tg:15:5 variable_name
+```
+
+Supported refactoring kinds:
+- **Rename** — collision detection, extern symbol checks, pub API guards in Production mode
+- **Extract Function** — control flow integrity, live-in/live-out analysis
+- **Extract Variable** — side-effect-free expression extraction
+- **Inline Variable** — single-assignment verification, side-effect checks
+- **Inline Function** — call-site substitution
+- **Move Item** — cross-module relocation
+
+See `tg_compiler/refactor.tg` for `RefactorKind`, `RefactorRequest`,
+`RefactorResult`, and `TextEdit`.
+
+## Supply Chain Security
+
+Tangerine includes built-in supply chain security primitives for package
+signing, lockfile integrity, reproducible builds, and dependency trust.
+
+```tangerine
+use std::supply_chain::{semver_parse, lockfile_verify, check_policy,
+                        verify_reproducible, compute_trust_score}
+
+# SemVer parsing
+let ver = semver_parse("1.2.3-beta.1")?
+
+# Lockfile integrity verification
+let lockfile = lockfile_parse(contents)?
+lockfile_verify(&lockfile)?
+
+# Reproducible build verification
+let manifest = BuildManifest { source_hash: "abc...", ... }
+verify_reproducible(&manifest)?
+
+# Trust score computation
+let graph = build_trust_graph(packages)?
+let score = compute_trust_score(&graph, target_package)?
+```
+
+See `std/supply_chain.tg` for `PackageId`, `SemVer`, `PackageSignature`,
+`Lockfile`, `TrustGraph`, and `SupplyChainPolicy`.
+
+## Completion & Quality System (CQS)
+
+The CQS is a **static analysis** pass that assigns each symbol a completeness
+score in [0, 100] based on evidence signals. Scores are deterministic and
+reproducible.
+
+```bash
+# Run quality analysis
+tg quality src/
+
+# With JSON output (conforms to cqs_quality.schema.json)
+tg quality src/ --json > report.json
+
+# Bless the current state as baseline
+tg quality --bless
+
+# Merge coverage artifacts
+tg cov merge target/cqs/coverage/*.tgcov -o merged.tgcov
+```
+
+### Signal Categories
+
+| Category | Signals | What they detect |
+|----------|---------|----|
+| Control Flow (CF) | CF-1..CF-4 | Unreachable branches, non-exhaustive matches, panic exits, constant-return dominance |
+| Data Flow (DF) | DF-1..DF-4 | Unused variables, uninitialized reads, dead stores, shadowing hiding live variables |
+| Error Handling (EH) | EH-1..EH-3 | Ignored results, bare unwrap, panic in library code |
+| Coverage (CV) | CV-1..CV-2 | Untested public symbols, low branch coverage |
+| Capability (CP) | CP-1..CP-3 | Undeclared capabilities, capability drift, unused capabilities |
+| Future-gating (FT) | FT-1..FT-2 | Stub functions (todo/unimplemented), feature-gated code |
+
+### Surface Classes
+
+Symbols are classified by their exposure surface, which determines penalty
+weights:
+
+| Surface | Description | Weight |
+|---------|-------------|--------|
+| `PublicStable` | Public API in stable modules | Highest |
+| `PublicExperimental` | Public but feature-gated | High |
+| `InternalHotPath` | Private but performance-critical | Medium |
+| `InternalGlue` | Private boilerplate/glue code | Low |
+| `TestOnly` | Test functions/helpers | Low |
+| `PlatformShim` | OS/arch-specific bindings | Low |
+
+### Enforcement
+
+In `Production` and `Hardened` modes, the CQS gates CI:
+
+| Mode | Score < threshold | Missing coverage | Capability drift |
+|------|------------------|------------------|-----------------|
+| Dev | warn | — | — |
+| Strict | warn | warn | — |
+| Production | **fail** | **fail** | **fail** |
+| Hardened | **fail** | **fail** | **fail** |
+
+See `tg_compiler/cqs.tg` for the full signal detection engine, and
+`docs/cqs_quality.schema.json` for the JSON output schema.
+
+## Context Widening System (CWS)
+
+The CWS generates optimally-selected context packs (`ctxpack.json`) for AI
+agents. It builds a **symbol dependency graph**, runs backward/forward SDG
+slicing from seed symbols, and uses a **greedy submodular knapsack** algorithm to
+maximize information within a CU budget.
+
+```bash
+# Generate context pack for a compile error
+tg ctxpack --error src/lib.tg:42:5 -o ctxpack.json
+
+# Generate context pack for a failing test
+tg ctxpack --test test_login -o ctxpack.json
+
+# Generate context pack for CQS gate failure
+tg ctxpack --cqs-gate -o ctxpack.json
+```
+
+Key parameters (defaults in `docs/cws_defaults.toml`):
+
+| Profile | Budget | K (candidates) | α (balance) |
+|---------|--------|----------------|-------------|
+| Backend | 160K CU | 2000 | 0.55 |
+| CLI | 120K CU | 1500 | 0.70 |
+| UI | 200K CU | 3000 | 0.45 |
+
+1 CU = 4 bytes of UTF-8 text.
+
+See `tg_compiler/symbol_graph.tg` for the graph engine,
+`tg_compiler/context_pack.tg` for pack generation, and
+`docs/ctxpack.schema.json` for the output schema.
 
 ## Async/Await
 
@@ -927,7 +1334,7 @@ use std::log::{Logger, Level, info, warn, error, Span, Metrics}
 
 Logger::init(Level::Info)
 
-info!("Server started on port {}", port)
+info("Server started on port {}", port)
 warn!("Connection pool low: {} available", count)
 error!("Request failed: {}", err)
 
@@ -1044,18 +1451,18 @@ for entry in walk_dir("src")? {
 use std::test::{test, assert_eq, assert_throws, snapshot}
 use std::bench::Benchmark
 
-#[test]
+@test
 def test_addition()
   assert_eq(2 + 2, 4)
 end
 
-#[test]
+@test
 def test_snapshot()
   let output = render_template(data)
   snapshot::assert_eq("template_output", &output)
 end
 
-#[bench]
+@bench
 def bench_sort()
   let mut bm = Benchmark::new("sort_1000")
   bm.run(|| sort(&mut data))
@@ -1082,12 +1489,18 @@ let anim = Animation::new(0.0, 1.0, Duration::from_secs(1))
 ### Contracts & Capabilities (`std/contracts`, `std/capabilities`)
 
 ```tangerine
-use std::contracts::{pre, post, invariant}
+use std::contracts::{pre, post, invariant, make_guard, GuardElseAction}
 
 def sqrt(x: Float) -> Float
   pre x >= 0.0, "sqrt requires non-negative input"
   post result >= 0.0, "result must be non-negative"
   # implementation
+end
+
+# Guard keyword (desugars to early return)
+def process(input: Option[String]) -> Result[Int, Error]
+  guard let value = input else return Result::Err("missing")
+  parse_int(value)
 end
 
 cap FileSystem implies FileRead, FileWrite end
@@ -1097,6 +1510,9 @@ def download(url: String) -> Result[Vec[u8], Error]
   requires Network, FileSystem
   # implementation
 end
+
+# Security profiles restrict capabilities per project
+# profile = "backend"  →  Net, Fs, DB allowed; Unsafe denied
 ```
 
 ### Profiling & Observability (`std/profile`, `std/snapshot`)
@@ -1119,7 +1535,7 @@ loop {
   timer.begin_frame()
   # ... render ...
   let stats = timer.end_frame()
-  println!("FPS: {:.1}", stats.fps)
+  println("FPS: {:.1}", stats.fps)
 }
 
 # Execution recording/replay
@@ -1150,13 +1566,141 @@ end
 
 handle process_with_log(input)
 with Logger
-  log(level, msg) => println!("[{}] {}", level, msg)
+  log(level, msg) => println("[{}] {}", level, msg)
 end
 
 def expensive_op() -> Result[Data, Error]
-  budget time: 5s, memory: 100MB
+  @budget time_p95 < "5s", alloc_bytes < "100MB"
   # implementation
 end
+```
+
+### Memory Allocation (`std/alloc`)
+
+```tangerine
+use std::alloc::{Allocator, Layout, SystemAllocator, ArenaAllocator,
+                 system_allocator, arena_new, arena_reset}
+
+# System allocator (libc malloc/free)
+let alloc = system_allocator()
+
+# Arena allocator (bump allocation, bulk deallocation)
+mut arena = arena_new(4096)
+# ... allocate from arena ...
+arena_reset(&mut arena)
+```
+
+### Backtrace (`std/backtrace`)
+
+```tangerine
+use std::backtrace::{capture, capture_force, Backtrace}
+
+# Respects TANGERINE_BACKTRACE env var
+let bt = capture()
+
+# Force capture regardless of env
+let bt = capture_force()
+for frame in bt.frames do
+  println("  {} at {}:{}", frame.symbol_name, frame.file, frame.line)
+end
+```
+
+### Formatting (`std/fmt`)
+
+```tangerine
+use std::fmt::{format, print, puts, Display, Debug}
+
+# {} positional, {0} indexed, {{ / }} literal braces
+let msg = format("Hello, {}! You are #{}", ["Alice", "42"])
+print(msg)
+puts("with newline")
+```
+
+### Environment (`std/env`)
+
+```tangerine
+use std::env::{args, var, set_var, current_dir}
+
+let arguments = args()
+let home = var("HOME")
+let cwd = current_dir()?
+```
+
+### Secure Types (`std/secure_types`)
+
+```tangerine
+use std::secure_types::{sql_query, SqlParam, html_escape, url_parse, path_parse}
+
+let query = sql_query("SELECT * FROM users WHERE id = $1", [SqlParam::Int(1)])?
+let safe_html = html_escape("<b>hello</b>")
+let url = url_parse("https://example.com")?
+let path = path_parse("data/report.csv")?
+```
+
+### Taint Tracking (`std/taint`)
+
+```tangerine
+use std::taint::{Tainted, taint, validate, MaxLengthValidator}
+
+let raw: Tainted[String] = taint("user input", TaintLabel::UserInput)
+let clean = validate(raw, MaxLengthValidator { max_len: 255 })?
+```
+
+### Deterministic Replay (`std/replay`)
+
+```tangerine
+use std::replay::{recorder_new, trace_save, player_load}
+
+mut rec = recorder_new()
+recorder_record_schedule(&mut rec, 0)
+trace_save(&rec.to_trace(), "trace.replay")?
+
+let player = player_load("trace.replay")?
+```
+
+### Semantic Diff (`std/semantic_diff`)
+
+```tangerine
+use std::semantic_diff::{extract_entities, compute_diff}
+
+let old_entities = extract_entities(old_source)
+let new_entities = extract_entities(new_source)
+let diff = compute_diff(&old_entities, &new_entities)
+# diff.changes: Vec[AnnotatedChange] with severity (Breaking/Compatible/Internal/Cosmetic)
+```
+
+### Supply Chain (`std/supply_chain`)
+
+```tangerine
+use std::supply_chain::{semver_parse, lockfile_verify, check_policy}
+
+let ver = semver_parse("1.0.0")?
+lockfile_verify(&lockfile)?
+let violations = check_policy(&policy, &lockfile)
+```
+
+### Test Generation (`std/test_gen`)
+
+```tangerine
+use std::test_gen::{extract_function_info, generate_tests_from_info}
+
+let info = extract_function_info(source, "my_function")?
+let tests = generate_tests_from_info(info)
+# Generates boundary value, contract-based, and fuzz test cases
+```
+
+### Collections (`std/collections`)
+
+```tangerine
+use std::collections::{Array, Map, Set, Iterator}
+
+mut arr = array_new[Int]()
+array_push(&mut arr, 42)
+
+mut map = map_new[String, Int]()
+map_insert(&mut map, "key", 1)
+
+let val = map_get(&map, "key")  # Option[&Int]
 ```
 
 ## Compiler Invocation
@@ -1205,6 +1749,25 @@ tg main.tg --no-contracts
 tg main.tg --no-capabilities
 tg main.tg --no-effects
 tg main.tg --no-budgets
+
+# Set mode explicitly (overrides Tangerine.toml)
+tg main.tg --mode=Production
+
+# Quality analysis (CQS)
+tg quality src/
+tg quality src/ --json
+tg quality --bless
+
+# Coverage merge
+tg cov merge target/cqs/coverage/*.tgcov -o merged.tgcov
+
+# Context pack generation (CWS)
+tg ctxpack --error src/lib.tg:42:5 -o ctxpack.json
+tg ctxpack --test test_login -o ctxpack.json
+
+# Semantic refactoring
+tg refactor rename old_name new_name
+tg refactor extract src/lib.tg:10:1-25:1 func_name
 ```
 
 ### Target Architecture

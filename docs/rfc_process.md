@@ -67,7 +67,7 @@ The RFC may be amended during implementation if minor adjustments are needed
 
 ### 6. Stabilization
 
-Features land behind a feature gate (e.g., `#[feature(my_feature)]`).
+Features land behind a feature gate (e.g., `@feature(my_feature)`).
 After sufficient testing and feedback, a stabilization PR is filed to remove
 the gate and make the feature available by default.
 

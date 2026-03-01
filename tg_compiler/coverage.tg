@@ -1,0 +1,588 @@
+## Tangerine Compiler — Coverage Instrumentation & Branch Stability
+##
+## §60-67: Coverage artifact specification
+## §75-79: Branch enumeration stability
+## Branch-arm level coverage for CQS canonical branch points.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::mode::{Span}
+use tg_compiler::cqs::{BranchPoint, BranchArm, BranchPointKind, sha256}
+
+# ═══════════════════════════════════════════════════════════════
+# §60 — Coverage Artifact Purpose & Properties
+# ═══════════════════════════════════════════════════════════════
+
+# Records branch-arm hits for CQS canonical branch points.
+# Enables CV-1 and CV-2 signals.
+# Stable cross-run comparisons.
+# Branch arms only (not statement coverage).
+
+# ═══════════════════════════════════════════════════════════════
+# §61 — Artifact Identity & Location
+# ═══════════════════════════════════════════════════════════════
+
+# Default output: target/cqs/coverage/
+# Default name: coverage.tgcov
+# Per-test: coverage.<test_id>.tgcov
+
+struct CoverageHeader
+  schema_version: String      # "tgcov.v1"
+  edition: String             # "2026"
+  tgc_version: String         # "0.1.0"
+  target: String              # target triple
+  branch_id_scheme: String    # "tg.branch.v1"
+  arm_id_scheme: String       # "tg.arm.v1"
+  build_id: String            # hash of code + config + compiler
+  timestamp_utc: String
+end
+
+def default_header(target: String, build_id: String) -> CoverageHeader
+  CoverageHeader {
+    schema_version: "tgcov.v1",
+    edition: "2026",
+    tgc_version: "0.1.0",
+    target: target,
+    branch_id_scheme: "tg.branch.v1",
+    arm_id_scheme: "tg.arm.v1",
+    build_id: build_id,
+    timestamp_utc: __intrinsic_utc_now()
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §62 — Coverage Stable IDs
+# ═══════════════════════════════════════════════════════════════
+
+# §62.1 — Symbol IDs
+# Format: sym:<module_path>::<name>#<stable_hash>
+# Hash from (edition, module_path, symbol_name, signature_shape) — NOT from spans
+def compute_symbol_id(edition: String, module_path: String, name: String, sig_shape: String) -> String
+  let hash = sha256(edition + "|" + module_path + "|" + name + "|" + sig_shape)
+  "sym:" + module_path + "::" + name + "#" + hash.slice(0, 8)
+end
+
+# §62.2 — Branch Point IDs
+# Stable if MIR control structure semantically unchanged + same compiler/edition
+# branch_id = SHA256("tg.branch.v1" ‖ sid ‖ bb ‖ ti ‖ kind)
+def compute_stable_branch_id(symbol_id: String, bb: Int, term_index: Int, kind: String) -> String
+  sha256("tg.branch.v1" + symbol_id + bb.to_string() + term_index.to_string() + kind)
+end
+
+# §62.3 — Arm IDs
+# arm_id = SHA256("tg.arm.v1" ‖ branch_id ‖ arm_index ‖ target_bb)
+# Ordering: Branch: 0=true, 1=false; SwitchInt: ascending; SwitchEnum: declaration order
+def compute_stable_arm_id(branch_id: String, arm_index: Int, target_bb: Int) -> String
+  sha256("tg.arm.v1" + branch_id + arm_index.to_string() + target_bb.to_string())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §63 — Source Mapping
+# ═══════════════════════════════════════════════════════════════
+
+struct SourceMapping
+  span: Option[Span]       # Origin match/if expression
+  arm_span: Option[Span]   # Arm body (best-effort)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §64 — Coverage File Format: tgcov (JSON Lines)
+# ═══════════════════════════════════════════════════════════════
+
+# Line 1: Header JSON object
+# Lines 2..N: Record objects
+
+struct CoverageRecord
+  symbol_id: String
+  branch_id: String
+  arm_id: String
+  kind: String           # "IfExpr", "MatchExpr", etc.
+  arm_index: Int
+  hits: Int
+  span: Option[Span]
+  arm_span: Option[Span]
+  target_bb: Option[Int]
+end
+
+struct CoverageArtifact
+  header: CoverageHeader
+  records: Vec[CoverageRecord]
+end
+
+def new_artifact(target: String, build_id: String) -> CoverageArtifact
+  CoverageArtifact {
+    header: default_header(target, build_id),
+    records: Vec::new()
+  }
+end
+
+def add_record(artifact: &mut CoverageArtifact, record: CoverageRecord) -> Unit
+  artifact.records.push(record)
+end
+
+# Serialize to JSONL format
+def serialize_tgcov(artifact: &CoverageArtifact) -> String
+  let lines = Vec::new()
+  # Header line
+  lines.push(serialize_header(&artifact.header))
+  # Record lines
+  for rec in &artifact.records
+    lines.push(serialize_record(rec))
+  end
+  lines.join("\n")
+end
+
+def json_escape(s: &String) -> String
+  mut result = String::new()
+  for c in s.chars() do
+    match c
+    when '"' then result.push_str("\\\"")
+    when '\\' then result.push_str("\\\\")
+    when '\n' then result.push_str("\\n")
+    when '\r' then result.push_str("\\r")
+    when '\t' then result.push_str("\\t")
+    when c then result.push(c)
+    end
+  end
+  result
+end
+
+def serialize_header(h: &CoverageHeader) -> String
+  "{\"schema_version\":\"" + json_escape(&h.schema_version) +
+  "\",\"edition\":\"" + json_escape(&h.edition) +
+  "\",\"tgc_version\":\"" + json_escape(&h.tgc_version) +
+  "\",\"target\":\"" + json_escape(&h.target) +
+  "\",\"branch_id_scheme\":\"" + json_escape(&h.branch_id_scheme) +
+  "\",\"arm_id_scheme\":\"" + json_escape(&h.arm_id_scheme) +
+  "\",\"build_id\":\"" + json_escape(&h.build_id) +
+  "\",\"timestamp_utc\":\"" + json_escape(&h.timestamp_utc) + "\"}"
+end
+
+def serialize_record(r: &CoverageRecord) -> String
+  "{\"symbol_id\":\"" + json_escape(&r.symbol_id) +
+  "\",\"branch_id\":\"" + json_escape(&r.branch_id) +
+  "\",\"arm_id\":\"" + json_escape(&r.arm_id) +
+  "\",\"kind\":\"" + json_escape(&r.kind) +
+  "\",\"arm_index\":" + r.arm_index.to_string() +
+  ",\"hits\":" + r.hits.to_string() + "}"
+end
+
+# Parse a tgcov file from JSONL
+def parse_tgcov(content: String) -> Result[CoverageArtifact, String]
+  let lines = content.lines()
+  if lines.is_empty()
+    return Result::Err("Empty coverage file")
+  end
+  let header = parse_header(lines[0])?
+  let records = Vec::new()
+  for i in 1..lines.len() do
+    if lines[i].trim().len() > 0
+      let rec = parse_record(lines[i])?
+      records.push(rec)
+    end
+  end
+  Result::Ok(CoverageArtifact { header: header, records: records })
+end
+
+def parse_header(line: String) -> Result[CoverageHeader, String]
+  # JSON parsing delegated to std::json
+  let obj = json_parse(line)?
+  Result::Ok(CoverageHeader {
+    schema_version: obj.get_string("schema_version")?,
+    edition: obj.get_string("edition")?,
+    tgc_version: obj.get_string("tgc_version")?,
+    target: obj.get_string("target")?,
+    branch_id_scheme: obj.get_string("branch_id_scheme")?,
+    arm_id_scheme: obj.get_string("arm_id_scheme")?,
+    build_id: obj.get_string("build_id")?,
+    timestamp_utc: obj.get_string("timestamp_utc")?
+  })
+end
+
+def parse_record(line: String) -> Result[CoverageRecord, String]
+  let obj = json_parse(line)?
+  Result::Ok(CoverageRecord {
+    symbol_id: obj.get_string("symbol_id")?,
+    branch_id: obj.get_string("branch_id")?,
+    arm_id: obj.get_string("arm_id")?,
+    kind: obj.get_string("kind")?,
+    arm_index: obj.get_int("arm_index")?,
+    hits: obj.get_int("hits")?,
+    span: Option::None,
+    arm_span: Option::None,
+    target_bb: Option::None
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §65 — Instrumentation Rules
+# ═══════════════════════════════════════════════════════════════
+
+# §65.1 — Available in `tg test --coverage`, optional in `tg run --coverage`
+# MUST NOT change program semantics.
+# §65.2 — Thread safety: atomic increments or thread-local merge on exit
+# §65.3 — Overhead control: may sample/compress
+
+struct InstrumentationConfig
+  enabled: Bool
+  thread_safe: Bool     # Use atomic counters
+  sample_rate: Float    # 1.0 = instrument all, 0.1 = 10% sampling
+end
+
+def default_instrumentation() -> InstrumentationConfig
+  InstrumentationConfig {
+    enabled: true,
+    thread_safe: true,
+    sample_rate: 1.0
+  }
+end
+
+# Per-function hit counters
+struct HitCounters
+  counters: Map[String, Int]   # arm_id → hit count
+end
+
+def new_counters() -> HitCounters
+  HitCounters { counters: Map::new() }
+end
+
+def increment(counters: &mut HitCounters, arm_id: String) -> Unit
+  let current = counters.counters.get(arm_id).unwrap_or(0)
+  counters.counters.insert(arm_id, current + 1)
+end
+
+def get_hits(counters: &HitCounters, arm_id: String) -> Int
+  counters.counters.get(arm_id).unwrap_or(0)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §66 — Merging Coverage Artifacts
+# ═══════════════════════════════════════════════════════════════
+
+# §66.1 — Merge operator: hits(arm_id) = hitsA + hitsB
+# §66.2 — Merge only if edition, tgc_version, target, build_id, ID schemes all identical
+# §66.3 — Output: same schema with summed hits
+
+def merge_artifacts(a: &CoverageArtifact, b: &CoverageArtifact) -> Result[CoverageArtifact, String]
+  # Validate compatibility
+  if a.header.schema_version != b.header.schema_version
+    return Result::Err("Schema version mismatch: " + a.header.schema_version + " vs " + b.header.schema_version)
+  end
+  if a.header.edition != b.header.edition
+    return Result::Err("Edition mismatch")
+  end
+  if a.header.tgc_version != b.header.tgc_version
+    return Result::Err("tgc_version mismatch")
+  end
+  if a.header.target != b.header.target
+    return Result::Err("Target mismatch")
+  end
+  if a.header.build_id != b.header.build_id
+    return Result::Err("build_id mismatch")
+  end
+  if a.header.branch_id_scheme != b.header.branch_id_scheme
+    return Result::Err("branch_id_scheme mismatch")
+  end
+  if a.header.arm_id_scheme != b.header.arm_id_scheme
+    return Result::Err("arm_id_scheme mismatch")
+  end
+
+  # Merge records by (symbol_id, arm_id) key
+  let merged = Map::new()
+  for rec in &a.records
+    let key = rec.symbol_id + "|" + rec.arm_id
+    merged.insert(key, rec.clone())
+  end
+  for rec in &b.records
+    let key = rec.symbol_id + "|" + rec.arm_id
+    match merged.get_mut(key)
+    when Option::Some(existing) then
+      existing.hits = existing.hits + rec.hits
+    when Option::None then
+      merged.insert(key, rec.clone())
+    end
+  end
+
+  # Sort records lexicographically by (symbol_id, arm_id)
+  let records = merged.values().collect()
+  records.sort_by(|a, b|
+    if a.symbol_id != b.symbol_id
+      a.symbol_id < b.symbol_id
+    else
+      a.arm_id < b.arm_id
+    end
+  )
+
+  Result::Ok(CoverageArtifact {
+    header: a.header.clone(),
+    records: records
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §67 — Computing Branch Coverage Ratio (Normative)
+# ═══════════════════════════════════════════════════════════════
+
+# Per function symbol:
+#   arms_total = |A(s)| (all arm_ids expected by compiler)
+#   arms_covered = count(arm where hit ≥ 1)
+#   branch_ratio = arms_covered / arms_total (or 1 if total=0)
+# This is the canonical ratio for CV-2.
+
+struct CoverageRatio
+  symbol_id: String
+  arms_total: Int
+  arms_covered: Int
+  branch_ratio: Float
+end
+
+def compute_coverage_ratio(
+  symbol_id: String,
+  expected_arms: &Vec[String],
+  artifact: &CoverageArtifact
+) -> CoverageRatio
+  let total = expected_arms.len()
+  if total == 0 then
+    return CoverageRatio {
+      symbol_id: symbol_id,
+      arms_total: 0,
+      arms_covered: 0,
+      branch_ratio: 1.0
+    }
+  end
+
+  # Build a set of covered arm_ids for this symbol — O(m) once
+  let covered_set: Map[String, Bool] = Map::new()
+  for rec in &artifact.records do
+    if rec.symbol_id == symbol_id && rec.hits >= 1 then
+      covered_set.insert(rec.arm_id.clone(), true)
+    end
+  end
+
+  # Now check expected arms — O(n) lookups into the set
+  let covered = 0
+  for arm_id in expected_arms do
+    if covered_set.contains_key(arm_id) then
+      covered = covered + 1
+    end
+  end
+
+  CoverageRatio {
+    symbol_id: symbol_id,
+    arms_total: total,
+    arms_covered: covered,
+    branch_ratio: to_float(covered) / to_float(total)
+  }
+end
+
+def to_float(i: Int) -> Float
+  __intrinsic_int_to_float(i)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §75 — Branch Anchors (source-level stability)
+# ═══════════════════════════════════════════════════════════════
+
+# Every branch point assigned a BranchAnchor at HIR lowering time
+# (before optimizations).
+
+struct BranchAnchor
+  origin_kind: BranchPointKind  # IfExpr, WhileExpr, MatchExpr, etc.
+  origin_span: Span             # Source location of syntactic construct
+  path: Vec[Int]                # Stable structural path in HIR AST
+end
+
+# §76 — Stable Branch ID (source-anchored)
+# Computed from BranchAnchor (not incidental block IDs)
+def compute_anchor_branch_id(symbol_id: String, anchor: &BranchAnchor) -> String
+  let kind_str = match anchor.origin_kind
+  when BranchPointKind::IfExpr then "if"
+  when BranchPointKind::WhileExpr then "while"
+  when BranchPointKind::MatchExpr then "match"
+  when BranchPointKind::ShortCircuit then "short_circuit"
+  when BranchPointKind::Guard then "guard"
+  when BranchPointKind::Desugar then "desugar"
+  end
+  let path_str = anchor.path.iter().map(|i| i.to_string()).join(",")
+  sha256("tg.branch.anchor.v1" + symbol_id + kind_str +
+    anchor.origin_span.file + anchor.origin_span.start_line.to_string() + path_str)
+end
+
+# §77 — Stable Arm IDs with discriminants
+# If/while: "then", "else", "body", "exit"
+# Match enum: "Variant::<name>" in declared enum order
+# Match int: "case::<value>" in sorted order; "other" last
+# Short-circuit: "lhs_true", "lhs_false"
+
+def arm_discriminant(kind: BranchPointKind, arm_index: Int, label: String) -> String
+  match kind
+  when BranchPointKind::IfExpr then
+    match arm_index
+    when 0 then "then"
+    when 1 then "else"
+    when _ then "arm_" + arm_index.to_string()
+    end
+  when BranchPointKind::WhileExpr then
+    match arm_index
+    when 0 then "body"
+    when 1 then "exit"
+    when _ then "arm_" + arm_index.to_string()
+    end
+  when BranchPointKind::ShortCircuit then
+    match arm_index
+    when 0 then "lhs_true"
+    when 1 then "lhs_false"
+    when _ then "arm_" + arm_index.to_string()
+    end
+  when _ then label
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §78 — Optimization Preservation Rules
+# ═══════════════════════════════════════════════════════════════
+
+# All transformations MUST maintain an AnchorMap.
+struct AnchorMap
+  anchors: Map[Int, BranchAnchor]   # bb_id → anchor
+end
+
+def new_anchor_map() -> AnchorMap
+  AnchorMap { anchors: Map::new() }
+end
+
+# Duplicated branches (inlining): inherit same anchor if same source span + HIR path
+def inherit_anchor(map: &mut AnchorMap, old_bb: Int, new_bb: Int) -> Unit
+  match map.anchors.get(old_bb)
+  when Option::Some(anchor) then
+    map.anchors.insert(new_bb, anchor.clone())
+  when Option::None then ()
+  end
+end
+
+# Merged branches: LCA anchor or Desugar + fresh anchor
+def merge_anchor(map: &mut AnchorMap, bb_ids: Vec[Int], merged_bb: Int, span: Span) -> Unit
+  # Use origin_kind=Desugar for merged branches
+  map.anchors.insert(merged_bb, BranchAnchor {
+    origin_kind: BranchPointKind::Desugar,
+    origin_span: span,
+    path: Vec::new()
+  })
+end
+
+# Eliminated branches: simply disappear; expected arm set from same anchoring pipeline
+
+# ═══════════════════════════════════════════════════════════════
+# §79 — Coverage Correctness Contract
+# ═══════════════════════════════════════════════════════════════
+
+# `tgc` MUST compute expected arm set using same BranchAnchor rules
+# CV-1/CV-2 operate on anchor-based IDs
+# NO dependence on basic-block numbering
+
+def compute_expected_arms(branches: &Vec[BranchPoint]) -> Vec[String]
+  let arm_ids = Vec::new()
+  for bp in branches
+    for arm in &bp.arms
+      arm_ids.push(arm.arm_id)
+    end
+  end
+  arm_ids.sort()
+  arm_ids
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §55 — Coverage Signal Mapping Rules
+# ═══════════════════════════════════════════════════════════════
+
+# §55.1 — Instrument branch arms: increment counter when control enters arm target block
+# §55.2 — Counters stable, written to coverage artifact
+
+# Per-function symbol ID: total branch arms, hit count per arm ID
+
+struct CoverageSignalInput
+  symbol_id: String
+  surface_class: String
+  branches: Vec[BranchPoint]
+  hits: Map[String, Int]     # arm_id → hits
+  threshold: Float           # τ_b for this surface+mode
+  gamma: Float               # γ_b for this mode
+end
+
+def compute_cv_signals(input: &CoverageSignalInput) -> Vec[CoverageSignalResult]
+  let results = Vec::new()
+  let total_arms = 0
+  let covered_arms = 0
+  let uncovered_arms = 0
+
+  for bp in &input.branches
+    for arm in &bp.arms
+      total_arms = total_arms + 1
+      let h = input.hits.get(arm.arm_id).unwrap_or(0)
+      if h >= 1
+        covered_arms = covered_arms + 1
+      else
+        uncovered_arms = uncovered_arms + 1
+      end
+    end
+  end
+
+  # CV-1: Uncovered fraction
+  if total_arms > 0
+    let uncov_frac = to_float(uncovered_arms) / to_float(total_arms)
+    if uncov_frac > 0.05  # u0 = 0.05
+      results.push(CoverageSignalResult {
+        kind: "CV-1",
+        severity: sev_count_float(uncov_frac, 0.05, 0.30),
+        count: uncovered_arms,
+        total: total_arms
+      })
+    end
+  end
+
+  # CV-2: Coverage below threshold
+  if total_arms > 0 && input.threshold > 0.0
+    let ratio = to_float(covered_arms) / to_float(total_arms)
+    if ratio < input.threshold
+      let shortfall = input.threshold - ratio
+      let sev_cov = shortfall / input.threshold
+      let severity = pow(sev_cov, input.gamma)
+      results.push(CoverageSignalResult {
+        kind: "CV-2",
+        severity: severity,
+        count: covered_arms,
+        total: total_arms
+      })
+    end
+  end
+
+  results
+end
+
+struct CoverageSignalResult
+  kind: String
+  severity: Float
+  count: Int
+  total: Int
+end
+
+def sev_count_float(val: Float, n0: Float, n1: Float) -> Float
+  if n1 == n0
+    if val >= n1 then 1.0 else 0.0 end
+  else
+    let result = (val - n0) / (n1 - n0)
+    if result < 0.0 then 0.0
+    else if result > 1.0 then 1.0
+    else result
+    end
+  end
+end
+
+def pow(base: Float, exp: Float) -> Float
+  __intrinsic_pow(base, exp)
+end
+
+def json_parse(s: String) -> Result[JsonObject, String]
+  # Delegates to std::json parser
+  std::json::parse(s)
+end

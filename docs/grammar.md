@@ -38,10 +38,20 @@ DIGIT          = '0'..'9'
 ```
 def    end    if     then   else   elsif  while  for    in     do
 let    mut    return break  next   match  when   struct enum   trait
-impl   use    pub    mod    fn     self   Self   true   false  unsafe
+impl   use    pub    module fn     self   Self   true   false  unsafe
 where  as     type   const  extern super  crate  yield  async  await
 cap    effect requires implies handle with rationale budget pre post invariant
+guard  try    catch  finally macro  comptime loop   pure   inline
 ```
+
+**Notes:**
+- `def` declares functions. `fn` appears only in type expressions (`fn(T) -> U` for function pointers).
+- `guard` is the precondition-based early-return keyword (see §2.2a).
+- `yield` is reserved for future generator support.
+- Use `elsif` (not `else if`) for chained conditions.
+- `then` and `do` are optional in multi-line `if`/`while`/`for` expressions.
+- `pure` marks functions with no side effects (see language.md §Functions).
+- The keyword is `module` (not `mod`); `mod` is accepted as an alias for compat.
 
 ### 1.4 Literals
 
@@ -132,6 +142,7 @@ fn_clause      = requires_clause
                | effect_clause
                | budget_clause
                | contract_clause
+               | guard_clause
 
 requires_clause = 'requires' requires_item { ',' requires_item }
 requires_item   = [ '!' ] IDENT
@@ -145,6 +156,14 @@ budget_amount   = INT_LITERAL IDENT
 contract_clause = 'pre' expr [ ',' STRING_LITERAL ]
                 | 'post' expr [ ',' STRING_LITERAL ]
                 | 'invariant' expr [ ',' STRING_LITERAL ]
+
+guard_clause   = 'guard' expr 'else' guard_action
+               | 'guard' 'let' pattern '=' expr 'else' guard_action
+
+guard_action   = 'return' [ expr ]
+               | 'break' [ IDENT ]
+               | 'continue' [ IDENT ]
+               | 'panic' '(' expr ')'
 
 param_list     = param { ',' param } [ ',' ]
 param          = [ 'mut' ] IDENT ':' type_expr
@@ -226,7 +245,7 @@ type_alias     = [ 'pub' ] 'type' IDENT [ type_params ] '=' type_expr
 
 ```ebnf
 extern_block   = 'extern' [ STRING_LITERAL ] function_sig
-               | 'extern' [ STRING_LITERAL ]
+               | 'extern' [ STRING_LITERAL ] [ 'do' ]
                  { function_sig }
                  'end'
 ```
@@ -234,10 +253,10 @@ extern_block   = 'extern' [ STRING_LITERAL ] function_sig
 ### 2.10 Modules
 
 ```ebnf
-mod_decl       = [ 'pub' ] 'mod' IDENT
+mod_decl       = [ 'pub' ] 'module' IDENT
                  { item }
                  'end'
-               | [ 'pub' ] 'mod' IDENT    // file-based module
+               | [ 'pub' ] 'module' IDENT    // file-based module
 
 capability_decl = 'cap' IDENT [ 'implies' IDENT { ',' IDENT } ] 'end'
 
@@ -252,6 +271,45 @@ rationale_block = 'rationale'
                   'end'
 
 rationale_field = IDENT ':' ( STRING_LITERAL | expr )
+```
+
+### 2.11 Async Functions
+
+```ebnf
+async_function  = [ 'pub' ] 'async' 'def' IDENT [ type_params ] '(' [ param_list ] ')'
+                  [ '->' type_expr ]
+                  block
+                  'end'
+```
+
+### 2.12 Try/Catch/Finally
+
+```ebnf
+try_expr       = 'try'
+                 block
+                 { 'catch' pattern 'then' block }
+                 [ 'finally' block ]
+                 'end'
+```
+
+### 2.13 Macro Declarations
+
+```ebnf
+macro_decl     = 'macro' IDENT '(' [ macro_params ] ')'
+                 block
+                 'end'
+
+macro_params   = macro_param { ',' macro_param }
+macro_param    = IDENT ':' macro_type
+macro_type     = 'Expr' | 'Ident' | 'Type' | 'Block' | 'Pattern'
+```
+
+### 2.14 Compile-time Evaluation
+
+```ebnf
+comptime_block = 'comptime'
+                 block
+                 'end'
 ```
 
 ## 3. Type Expressions
@@ -333,6 +391,7 @@ primary        = INT_LITERAL
                | match_expr
                | for_expr
                | while_expr
+               | loop_expr
                | handle_expr
                | closure_expr
                | return_expr
@@ -359,9 +418,9 @@ block          = { statement }
 ### 4.4 Control Flow
 
 ```ebnf
-if_expr        = 'if' expr 'then'
+if_expr        = 'if' expr [ 'then' ]
                  block
-                 { 'elsif' expr 'then' block }
+                 { 'elsif' expr [ 'then' ] block }
                  [ 'else' block ]
                  'end'
 
@@ -371,13 +430,15 @@ match_expr     = 'match' expr
 
 match_arm      = 'when' pattern [ 'if' expr ] 'then' ( expr | block )
 
-for_expr       = 'for' IDENT 'in' expr 'do'
+for_expr       = 'for' IDENT 'in' expr [ 'do' ]
                  block
                  'end'
 
-while_expr     = 'while' expr 'do'
+while_expr     = 'while' expr [ 'do' ]
                  block
                  'end'
+
+loop_expr      = 'loop' block 'end'
 
 return_expr    = 'return' [ expr ]
 break_expr     = 'break' [ expr ]
@@ -441,23 +502,35 @@ expr_statement = expr
 
 ## 7. Attributes
 
+Tangerine supports **two equivalent attribute syntaxes**:
+
 ```ebnf
 attribute      = '#[' attr_inner ']'
+               | '@' attr_inner [ '(' attr_args ')' ]
+
 attr_inner     = IDENT [ '(' attr_args ')' ]
 attr_args      = attr_arg { ',' attr_arg }
 attr_arg       = IDENT [ '=' literal ]
                | literal
 ```
 
+Both `#[test]` and `@test` are accepted and identical in meaning.
+The `@` form is preferred in idiomatic Tangerine code. The `#[...]` form is
+supported for familiarity and compatibility.
+
 Common attributes:
-- `#[test]` — Mark function as a test
-- `#[bench]` — Mark function as a benchmark
-- `#[inline]` — Suggest inlining
-- `#[allow(lint_name)]` — Suppress a lint
-- `#[deny(lint_name)]` — Treat lint as error
-- `#[deprecated(since = "0.2.0", note = "use new_api instead")]`
-- `#[stable(since = "0.1.0")]`
-- `#[feature(name)]` — Enable experimental feature
+- `@test` / `#[test]` — Mark function as a test
+- `@bench` / `#[bench]` — Mark function as a benchmark
+- `@inline` / `#[inline]` — Suggest inlining
+- `@allow(lint_name)` — Suppress a lint
+- `@deny(lint_name)` — Treat lint as error
+- `@deprecated(since = "0.2.0", note = "use new_api instead")`
+- `@stable(since = "0.1.0")`
+- `@feature(name)` — Enable experimental feature
+- `@derive(Clone, Debug)` — Derive trait implementations
+- `@export("symbol_name")` — Export symbol for FFI
+- `@repr(C)` — Use C-compatible memory layout
+- `@capability(Unsafe)` — Require capability to call
 
 ## 8. Evaluation Semantics
 

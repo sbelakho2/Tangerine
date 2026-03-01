@@ -330,23 +330,39 @@ end
 # This is the orphan rule / coherence check from Part F.
 def check_coherence(resolver: &mut TraitResolver) -> Unit
   # Phase 1: Check for overlapping impls
-  mut i = 0
-  while i < resolver.impls.len() do
-    mut j = i + 1
-    while j < resolver.impls.len() do
-      let a = &resolver.impls[i]
-      let b = &resolver.impls[j]
-      if a.trait_name == b.trait_name && type_matches(&a.for_type, &b.for_type) then
-        resolver.errors.push(TraitError {
-          message: "overlapping impls for trait '" ++ a.trait_name ++ "' — coherence violation",
-          span: b.span
-        })
-      end
-      j = j + 1
+  # Group impls by trait_name to avoid O(n²) over all impls
+  let by_trait: Map[String, Vec[UInt]] = Map::new()
+  mut idx: UInt = 0
+  while idx < resolver.impls.len() do
+    let imp = &resolver.impls[idx]
+    let name = imp.trait_name.clone()
+    match by_trait.get_mut(&name)
+    when Option::Some(list) then list.push(idx)
+    when Option::None then by_trait.insert(name, vec![idx])
     end
-    i = i + 1
+    idx = idx + 1
   end
-  
+
+  # Only check pairs that share the same trait
+  for (_, indices) in by_trait.entries() do
+    mut i = 0
+    while i < indices.len() do
+      mut j = i + 1
+      while j < indices.len() do
+        let a = &resolver.impls[indices[i]]
+        let b = &resolver.impls[indices[j]]
+        if type_matches(&a.for_type, &b.for_type) then
+          resolver.errors.push(TraitError {
+            message: "overlapping impls for trait '" ++ a.trait_name ++ "' — coherence violation",
+            span: b.span
+          })
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+  end
+
   # Phase 2: Check orphan rule
   check_orphan_rules(resolver)
 end
@@ -708,9 +724,64 @@ def substitute_aggregate_kind(subst: &TypeSubstMap, kind: &MirAggregateKind) -> 
 end
 
 def substitute_terminator(subst: &TypeSubstMap, term: &MirTerminator) -> MirTerminator
-  # Terminators generally don't carry types directly,
-  # but calls need mangled names updated
-  term.clone()
+  let new_kind = match &term.kind
+  when MirTerminatorKind::Call(callee, args, dest, target, unwind) then
+    # Mangle callee name with substituted type arguments
+    let mangled = mangle_with_subst(callee, subst)
+    # Substitute types in arguments
+    mut new_args = Vec::new()
+    for arg in args do
+      new_args.push(substitute_operand(subst, arg))
+    end
+    # Substitute return type in destination
+    let new_dest = substitute_place(subst, dest)
+    MirTerminatorKind::Call(mangled, new_args, new_dest, target.clone(), unwind.clone())
+  when MirTerminatorKind::SwitchInt(discr, targets) then
+    let new_discr = substitute_operand(subst, discr)
+    MirTerminatorKind::SwitchInt(new_discr, targets.clone())
+  when MirTerminatorKind::Drop(place, target, unwind) then
+    let new_place = substitute_place(subst, place)
+    MirTerminatorKind::Drop(new_place, target.clone(), unwind.clone())
+  when MirTerminatorKind::Assert(cond, expected, target, msg) then
+    let new_cond = substitute_operand(subst, cond)
+    MirTerminatorKind::Assert(new_cond, expected.clone(), target.clone(), msg.clone())
+  when _ then
+    term.kind.clone()
+  end
+  MirTerminator { kind: new_kind, span: term.span.clone() }
+end
+
+# Mangle a function name with type substitutions for monomorphization
+def mangle_with_subst(name: &String, subst: &TypeSubstMap) -> String
+  if subst.is_empty() then
+    return name.clone()
+  end
+  mut mangled = name.clone()
+  for (param, ty) in subst do
+    mangled = mangled + "_" + type_to_mangled_name(ty)
+  end
+  mangled
+end
+
+def type_to_mangled_name(ty: &Type) -> String
+  match ty
+  when Type::Int then "Int"
+  when Type::Float then "Float"
+  when Type::Bool then "Bool"
+  when Type::String then "String"
+  when Type::Unit then "Unit"
+  when Type::Named(id, args) then
+    if args.is_empty() then
+      id.name.clone()
+    else
+      mut s = id.name.clone()
+      for arg in args do
+        s = s + "_" + type_to_mangled_name(arg)
+      end
+      s
+    end
+  when _ then "unknown"
+  end
 end
 
 # Monomorphize all generic functions in a MIR program
@@ -757,12 +828,36 @@ def collect_generic_calls(func: &MirFunction, worklist: &mut Vec[(String, Vec[Ty
     match block.terminator.kind
     when MirTerminatorKind::Call(_, callee, _, _, _) then
       # If callee is a function with type args, record it
-      match callee
-      when MirOperand::Constant(MirConstant::Function(name, type_args)) then
-        if !type_args.is_empty() then
-          worklist.push((name.clone(), type_args.clone()))
+      match callee.kind
+      when MirOperandKind::Constant(const) then
+        match const.kind
+        when MirConstantKind::FnItem(name) then
+          # Check if the function type has type arguments
+          match const.ty
+          when Type::Function(params, ret) then
+            # Extract any type parameters from function signature
+            mut type_args = Vec::new()
+            collect_type_args_from_types(&params, &mut type_args)
+            if !type_args.is_empty() then
+              worklist.push((name.clone(), type_args))
+            end
+          when _ then ()
+          end
+        when _ then ()
         end
       when _ then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+def collect_type_args_from_types(types: &Vec[Type], args: &mut Vec[Type]) -> Unit
+  for ty in types do
+    match ty
+    when Type::Named(_, inner_args) then
+      for a in inner_args do
+        args.push(a.clone())
       end
     when _ then ()
     end

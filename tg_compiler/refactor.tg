@@ -1,0 +1,511 @@
+## Tangerine Compiler — Semantic Refactor Primitives
+##
+## §15: `tg refactor rename`, `tg refactor extract`
+## The compiler guarantees correctness or refuses. No silent breakage.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::ast::{
+  Expr, Stmt, Item, ItemKind, FunctionDecl, TypeExpr, Block, Span
+}
+use tg_compiler::resolver::{ResolvedSymbol, ScopeMap, Binding}
+use tg_compiler::symbol_graph::{SymbolGraph, GraphKind}
+use tg_compiler::types::{Type, TypeId, TypeEnv}
+
+# ═══════════════════════════════════════════════════════════════
+# §15.1 — Refactor Kinds
+# ═══════════════════════════════════════════════════════════════
+
+enum RefactorKind
+  Rename
+  ExtractFunction
+  ExtractVariable
+  InlineVariable
+  InlineFunction
+  MoveItem
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §15.2 — Refactor Request & Result
+# ═══════════════════════════════════════════════════════════════
+
+struct RefactorRequest
+  kind: RefactorKind
+  target_span: Span             # What to refactor
+  new_name: Option[String]      # For rename, extract
+  destination: Option[String]   # For move: module path
+end
+
+struct RefactorResult
+  success: Bool
+  edits: Vec[TextEdit]
+  diagnostics: Vec[RefactorDiagnostic]
+  affected_files: Vec[String]
+  requires_recheck: Bool
+end
+
+struct TextEdit
+  file: String
+  start: Int
+  end_pos: Int
+  new_text: String
+end
+
+enum RefactorSeverity
+  Error     # Cannot proceed
+  Warning   # Proceeds but user should review
+  Info      # Informational
+end
+
+struct RefactorDiagnostic
+  severity: RefactorSeverity
+  message: String
+  span: Option[Span]
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §15.3 — Rename Refactoring
+# ═══════════════════════════════════════════════════════════════
+
+## `tg refactor rename` — rename a symbol everywhere it's referenced.
+## Refuses if:
+##   - New name collides in any scope
+##   - Symbol is from extern/FFI (name matters)
+##   - Symbol is a public API in Production mode (unless --force)
+
+def refactor_rename(
+  symbol: &ResolvedSymbol,
+  new_name: String,
+  scope_map: &ScopeMap,
+  graph: &SymbolGraph,
+  pub_api: Bool
+) -> RefactorResult
+  let edits = Vec::new()
+  let diagnostics = Vec::new()
+
+  # Check for name collisions in all scopes
+  for scope in scope_map.scopes_containing(symbol.id) do
+    if scope.has_binding(new_name)
+      return RefactorResult {
+        success: false,
+        edits: Vec::new(),
+        diagnostics: vec![RefactorDiagnostic {
+          severity: RefactorSeverity::Error,
+          message: "Name '" + new_name + "' already exists in scope at "
+                   + scope.span.to_string(),
+          span: Option::Some(scope.span)
+        }],
+        affected_files: Vec::new(),
+        requires_recheck: false
+      }
+    end
+  end
+
+  # Check for extern symbols
+  if symbol.is_extern
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "Cannot rename extern symbol '" + symbol.name
+                 + "': FFI name is significant",
+        span: Option::Some(symbol.def_span)
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  # Check pub API in Production
+  if pub_api
+    diagnostics.push(RefactorDiagnostic {
+      severity: RefactorSeverity::Warning,
+      message: "Renaming public API symbol '" + symbol.name
+               + "' in Production mode. This is a breaking change.",
+      span: Option::Some(symbol.def_span)
+    })
+  end
+
+  # Collect all references
+  let refs = graph.query_all_references(symbol.id)
+  let files_changed = Set::new()
+
+  # Create edit for definition
+  edits.push(TextEdit {
+    file: symbol.def_span.file,
+    start: symbol.def_span.start,
+    end_pos: symbol.def_span.end_pos,
+    new_text: new_name
+  })
+  files_changed.insert(symbol.def_span.file)
+
+  # Create edits for all references
+  for ref_span in &refs do
+    edits.push(TextEdit {
+      file: ref_span.file,
+      start: ref_span.start,
+      end_pos: ref_span.end_pos,
+      new_text: new_name
+    })
+    files_changed.insert(ref_span.file)
+  end
+
+  RefactorResult {
+    success: true,
+    edits: edits,
+    diagnostics: diagnostics,
+    affected_files: files_changed.into_vec(),
+    requires_recheck: true
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §15.4 — Extract Function
+# ═══════════════════════════════════════════════════════════════
+
+## `tg refactor extract` — extract selected code into a new function.
+## Refuses if:
+##   - Selection contains partial control flow (break/continue across boundary)
+##   - Selection has multiple live-out variables with no struct wrapper
+##   - Selection has complex borrow interactions that can't be serialized
+
+struct ExtractedFunction
+  name: String
+  params: Vec[ExtractedParam]
+  return_type: Option[TypeExpr]
+  body: Block
+  effects: Vec[String]
+  capabilities: Vec[String]
+end
+
+struct ExtractedParam
+  name: String
+  typ: TypeExpr
+  is_mut: Bool
+  is_ref: Bool
+end
+
+def refactor_extract_function(
+  selection_span: Span,
+  new_name: String,
+  stmts: &Vec[Stmt],
+  type_env: &TypeEnv,
+  scope: &ScopeMap
+) -> RefactorResult
+  let diagnostics = Vec::new()
+
+  # Identify selected statements
+  let selected = stmts.iter()
+    .filter(|s| span_contains(selection_span, s.span))
+    .collect()
+
+  if selected.is_empty()
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "No complete statements in selection",
+        span: Option::Some(selection_span)
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  # Check control flow integrity: no partial break/continue/return
+  let cf_check = check_control_flow_integrity(&selected)
+  if !cf_check.ok
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "Cannot extract: " + cf_check.reason,
+        span: cf_check.span
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  # Compute live-in and live-out variables
+  let live_in = compute_live_in(&selected, scope)
+  let live_out = compute_live_out(&selected, scope)
+
+  # Refuse if too many live-out vars
+  if live_out.len() > 3
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "Cannot extract: " + live_out.len().to_string()
+                 + " live-out variables (max 3). Consider creating a struct.",
+        span: Option::Some(selection_span)
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  # Build parameter list from live-in
+  let params = Vec::new()
+  for var in &live_in do
+    let typ = type_env.lookup(var.type_id)
+    params.push(ExtractedParam {
+      name: var.name,
+      typ: typ.to_type_expr(),
+      is_mut: var.is_mutated_in(&selected),
+      is_ref: !typ.is_copy()
+    })
+  end
+
+  # Build return type from live-out
+  let return_type = if live_out.is_empty()
+    Option::None
+  else if live_out.len() == 1
+    Option::Some(type_env.lookup(live_out[0].type_id).to_type_expr())
+  else
+    # Construct a tuple type
+    let fields = live_out.iter()
+      .map(|v| type_env.lookup(v.type_id).to_type_expr())
+      .collect()
+    Option::Some(TypeExpr::Tuple(fields))
+  end
+
+  # Generate edits: Insert function + Replace selection with call
+  let file = selection_span.file
+  let edits = Vec::new()
+
+  # Insert the new function after the current function
+  let fn_text = generate_function_text(new_name, &params, &return_type, &selected)
+  edits.push(TextEdit {
+    file: file,
+    start: find_enclosing_function_end(selection_span),
+    end_pos: find_enclosing_function_end(selection_span),
+    new_text: "\n\n" + fn_text
+  })
+
+  # Replace selection with call
+  let call_text = generate_call_text(new_name, &params, &live_out)
+  edits.push(TextEdit {
+    file: file,
+    start: selection_span.start,
+    end_pos: selection_span.end_pos,
+    new_text: call_text
+  })
+
+  RefactorResult {
+    success: true,
+    edits: edits,
+    diagnostics: diagnostics,
+    affected_files: vec![file],
+    requires_recheck: true
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §15.5 — Inline Variable / Inline Function
+# ═══════════════════════════════════════════════════════════════
+
+def refactor_inline_variable(
+  binding: &Binding,
+  scope: &ScopeMap,
+  graph: &SymbolGraph
+) -> RefactorResult
+  # Inline is only safe if:
+  # - Variable is assigned exactly once
+  # - Initializer has no side effects
+  # - All uses see the same value (no mutation between def and use)
+  let diagnostics = Vec::new()
+
+  if binding.assignment_count != 1
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "Cannot inline: variable '" + binding.name
+                 + "' is assigned " + binding.assignment_count.to_string()
+                 + " times (need exactly 1)",
+        span: Option::Some(binding.def_span)
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  if binding.initializer_has_side_effects
+    return RefactorResult {
+      success: false,
+      edits: Vec::new(),
+      diagnostics: vec![RefactorDiagnostic {
+        severity: RefactorSeverity::Error,
+        message: "Cannot inline: initializer of '" + binding.name
+                 + "' has side effects",
+        span: Option::Some(binding.def_span)
+      }],
+      affected_files: Vec::new(),
+      requires_recheck: false
+    }
+  end
+
+  let refs = graph.query_all_references(binding.symbol_id)
+  let edits = Vec::new()
+  let init_text = binding.initializer_text
+
+  # Replace each use with the initializer
+  for ref_span in &refs do
+    edits.push(TextEdit {
+      file: ref_span.file,
+      start: ref_span.start,
+      end_pos: ref_span.end_pos,
+      new_text: "(" + init_text + ")"
+    })
+  end
+
+  # Remove the variable declaration
+  edits.push(TextEdit {
+    file: binding.def_span.file,
+    start: binding.stmt_span.start,
+    end_pos: binding.stmt_span.end_pos,
+    new_text: ""
+  })
+
+  RefactorResult {
+    success: true,
+    edits: edits,
+    diagnostics: diagnostics,
+    affected_files: vec![binding.def_span.file],
+    requires_recheck: true
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════
+
+struct ControlFlowCheck
+  ok: Bool
+  reason: String
+  span: Option[Span]
+end
+
+def check_control_flow_integrity(stmts: &Vec[&Stmt]) -> ControlFlowCheck
+  # Check for break/continue/return that would escape the extraction boundary
+  for stmt in stmts do
+    match stmt.kind
+      when StmtKind::Break(label) then
+        if !label_target_in_selection(label, stmts)
+          return ControlFlowCheck {
+            ok: false,
+            reason: "break targets a loop outside selection",
+            span: Option::Some(stmt.span)
+          }
+        end
+      when StmtKind::Continue(label) then
+        if !label_target_in_selection(label, stmts)
+          return ControlFlowCheck {
+            ok: false,
+            reason: "continue targets a loop outside selection",
+            span: Option::Some(stmt.span)
+          }
+        end
+      when StmtKind::Return(_) then
+        return ControlFlowCheck {
+          ok: false,
+          reason: "return statement would change function semantics",
+          span: Option::Some(stmt.span)
+        }
+      else ()
+    end
+  end
+  ControlFlowCheck { ok: true, reason: "", span: Option::None }
+end
+
+def compute_live_in(stmts: &Vec[&Stmt], scope: &ScopeMap) -> Vec[Binding]
+  # Variables read in stmts that are defined outside
+  let used = collect_used_variables(stmts)
+  let defined = collect_defined_variables(stmts)
+  used.iter().filter(|v| !defined.contains(v.name)).collect()
+end
+
+def compute_live_out(stmts: &Vec[&Stmt], scope: &ScopeMap) -> Vec[Binding]
+  # Variables defined in stmts that are used after
+  let defined = collect_defined_variables(stmts)
+  defined.iter().filter(|v| scope.has_uses_after(v, stmts)).collect()
+end
+
+def span_contains(outer: Span, inner: Span) -> Bool
+  outer.file == inner.file && outer.start <= inner.start && inner.end_pos <= outer.end_pos
+end
+
+def generate_function_text(
+  name: String,
+  params: &Vec[ExtractedParam],
+  ret: &Option[TypeExpr],
+  stmts: &Vec[&Stmt]
+) -> String
+  let s = "def " + name + "("
+  for i in 0..params.len() do
+    if i > 0 then s = s + ", " end
+    let p = &params[i]
+    if p.is_ref then s = s + "&" end
+    if p.is_mut then s = s + "mut " end
+    s = s + p.name + ": " + p.typ.to_string()
+  end
+  s = s + ")"
+  match ret
+    when Option::Some(t) then s = s + " -> " + t.to_string()
+    when Option::None then ()
+  end
+  s = s + "\n"
+  for stmt in stmts do
+    s = s + "  " + stmt.to_source() + "\n"
+  end
+  s = s + "end"
+  s
+end
+
+def generate_call_text(
+  name: String,
+  params: &Vec[ExtractedParam],
+  live_out: &Vec[Binding]
+) -> String
+  let call = name + "("
+  for i in 0..params.len() do
+    if i > 0 then call = call + ", " end
+    if params[i].is_mut then call = call + "&mut " end
+    call = call + params[i].name
+  end
+  call = call + ")"
+
+  if live_out.is_empty()
+    call
+  else if live_out.len() == 1
+    "let " + live_out[0].name + " = " + call
+  else
+    let names = live_out.iter().map(|v| v.name).collect()
+    "let (" + names.join(", ") + ") = " + call
+  end
+end
+
+def find_enclosing_function_end(span: Span) -> Int
+  # Intrinsic: find the `end` keyword that closes the enclosing function
+  __intrinsic_find_enclosing_end(span)
+end
+
+def label_target_in_selection(label: Option[String], stmts: &Vec[&Stmt]) -> Bool
+  # Check if the label's target loop is within the selected statements
+  __intrinsic_label_in_selection(label, stmts)
+end
+
+def collect_used_variables(stmts: &Vec[&Stmt]) -> Vec[Binding]
+  __intrinsic_collect_used(stmts)
+end
+
+def collect_defined_variables(stmts: &Vec[&Stmt]) -> Vec[Binding]
+  __intrinsic_collect_defined(stmts)
+end

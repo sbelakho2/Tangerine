@@ -1,0 +1,1695 @@
+## Tangerine Compiler — CQS (Completion & Quality System)
+## Formal Specification v0.2 Implementation
+##
+## §23-59 of needed.txt: Static detection, scoring, enforcement, signals.
+## All detection performed on typed MIR with source spans preserved.
+## Deterministic, reproducible, no AI/heuristic guesswork.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::mode::{Mode, ModeConfig, config_for_mode, is_at_least, RichSpan}
+use tg_compiler::mir::{MirFunction, MirBlock, MirStatement, MirTerminator, MirRvalue}
+
+# ═══════════════════════════════════════════════════════════════
+# §24 — CQS Definitions
+# ═══════════════════════════════════════════════════════════════
+
+# §24.1 — Symbol: any function, method, struct, enum, trait, impl, or module
+struct Symbol
+  symbol_id: String    # Stable across builds for same edition
+  name: String
+  kind: SymbolKind
+  span: RichSpan
+  surface_class: SurfaceClass
+  module_path: String
+end
+
+enum SymbolKind
+  Function
+  Method
+  Struct
+  Enum
+  Trait
+  Impl
+  Module
+end
+
+# §24.2 — Surface Class (auto-classified at compile time)
+enum SurfaceClass
+  PublicStable         # pub, not @experimental, referenced externally
+  PublicExperimental   # pub + @experimental
+  InternalHotPath      # not pub, referenced ≥N times or @budget/@hot
+  InternalGlue         # not pub, thin wrapper, mostly forwards calls
+  TestOnly             # only referenced by test modules
+  PlatformShim         # @platform(...) or entirely cfg-gated
+end
+
+def classify_surface(
+  is_pub: Bool,
+  is_experimental: Bool,
+  ref_count: Int,
+  has_budget: Bool,
+  has_hot: Bool,
+  stmt_count: Int,
+  is_test_only: Bool,
+  is_platform_gated: Bool,
+  hot_path_threshold: Int
+) -> SurfaceClass
+  if is_test_only
+    SurfaceClass::TestOnly
+  else if is_platform_gated
+    SurfaceClass::PlatformShim
+  else if is_pub && is_experimental
+    SurfaceClass::PublicExperimental
+  else if is_pub
+    SurfaceClass::PublicStable
+  else if ref_count >= hot_path_threshold || has_budget || has_hot
+    SurfaceClass::InternalHotPath
+  else if stmt_count < 5
+    SurfaceClass::InternalGlue
+  else
+    SurfaceClass::InternalGlue
+  end
+end
+
+# §24.3 — Evidence Signal Categories
+enum SignalCategory
+  ControlFlow
+  DataFlow
+  ErrorHandling
+  Coverage
+  Capability
+  FutureGate
+end
+
+# §24.4 — Completeness Score: numeric value in [0, 100]
+struct CompletenessScore
+  raw: Float     # 100 - Σ penalties (may be negative)
+  clamped: Int   # clamp(raw, 0, 100)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §25 — Evidence Signal Definitions 
+# ═══════════════════════════════════════════════════════════════
+
+enum SignalKind
+  # §25.1 Control-Flow Signals
+  CF1_UnreachableBranch
+  CF2_NonExhaustiveMatch
+  CF3_PanicUnreachableExit
+  CF4_ConstantReturnDominance
+
+  # §25.2 Data-Flow Signals
+  DF1_UnusedParameter
+  DF2_OutputIndependentOfInputs
+  DF3_DeadAssignment
+  DF4_AllBranchesReturnSameLiteral
+
+  # §25.3 Error-Handling Signals
+  EH1_IgnoredResultWithoutJustification
+  EH2_CatchAllWithoutAction
+  EH3_BroadExceptionBoundarySwallowing
+
+  # §25.4 Coverage Signals
+  CV1_UnexecutedPublicBranch
+  CV2_CoverageBelowThreshold
+
+  # §25.5 Capability Signals
+  CP1_CapabilityDrift
+  CP2_UnsafeBlockWithoutReason
+  CP3_TaintedFFIValueUsedWithoutValidation
+
+  # §25.6 Future Signals
+  FT1_FutureBlockInEnabledFeature
+  FT2_CfgFeatureEnabledButIncomplete
+end
+
+struct Signal
+  kind: SignalKind
+  severity: Float    # Normalized ∈ [0, 1]
+  count: Int
+  suppressed: Bool
+  penalty: Float     # Computed from penalty model
+  locations: Vec[RichSpan]
+  details: Map[String, String]
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §26 — CQS Completeness Scoring
+# ═══════════════════════════════════════════════════════════════
+
+# §26.2 — Signal Penalty Model parameters per kind
+struct SignalParams
+  w: Float    # Base weight
+  alpha: Float # Count scaling factor
+  beta: Float  # Severity exponent
+  cap: Float   # Per-kind cap
+end
+
+# §38 — Default Signal Parameter Table
+def default_signal_params(kind: SignalKind) -> SignalParams
+  match kind
+  # §38.1 Control-Flow
+  when SignalKind::CF1_UnreachableBranch then
+    SignalParams { w: 8.0, alpha: 0.15, beta: 1.0, cap: 20.0 }
+  when SignalKind::CF2_NonExhaustiveMatch then
+    SignalParams { w: 15.0, alpha: 0.0, beta: 1.0, cap: 30.0 }
+  when SignalKind::CF3_PanicUnreachableExit then
+    SignalParams { w: 18.0, alpha: 0.0, beta: 1.0, cap: 40.0 }
+  when SignalKind::CF4_ConstantReturnDominance then
+    SignalParams { w: 10.0, alpha: 0.0, beta: 1.0, cap: 25.0 }
+
+  # §38.2 Data-Flow
+  when SignalKind::DF1_UnusedParameter then
+    SignalParams { w: 4.0, alpha: 0.20, beta: 1.0, cap: 18.0 }
+  when SignalKind::DF2_OutputIndependentOfInputs then
+    SignalParams { w: 10.0, alpha: 0.0, beta: 1.0, cap: 25.0 }
+  when SignalKind::DF3_DeadAssignment then
+    SignalParams { w: 3.0, alpha: 0.15, beta: 1.0, cap: 15.0 }
+  when SignalKind::DF4_AllBranchesReturnSameLiteral then
+    SignalParams { w: 8.0, alpha: 0.0, beta: 1.0, cap: 20.0 }
+
+  # §38.3 Error-Handling
+  when SignalKind::EH1_IgnoredResultWithoutJustification then
+    SignalParams { w: 12.0, alpha: 0.20, beta: 1.0, cap: 30.0 }
+  when SignalKind::EH2_CatchAllWithoutAction then
+    SignalParams { w: 8.0, alpha: 0.0, beta: 1.0, cap: 20.0 }
+  when SignalKind::EH3_BroadExceptionBoundarySwallowing then
+    SignalParams { w: 14.0, alpha: 0.0, beta: 1.0, cap: 30.0 }
+
+  # §38.4 Coverage
+  when SignalKind::CV1_UnexecutedPublicBranch then
+    SignalParams { w: 10.0, alpha: 0.0, beta: 1.0, cap: 20.0 }
+  when SignalKind::CV2_CoverageBelowThreshold then
+    SignalParams { w: 20.0, alpha: 0.0, beta: 1.0, cap: 35.0 }
+
+  # §38.5 Capability & Unsafe
+  when SignalKind::CP1_CapabilityDrift then
+    SignalParams { w: 10.0, alpha: 0.0, beta: 1.0, cap: 25.0 }
+  when SignalKind::CP2_UnsafeBlockWithoutReason then
+    SignalParams { w: 20.0, alpha: 0.0, beta: 1.0, cap: 40.0 }
+  when SignalKind::CP3_TaintedFFIValueUsedWithoutValidation then
+    SignalParams { w: 18.0, alpha: 0.0, beta: 1.0, cap: 40.0 }
+
+  # §38.6 Future/Feature
+  when SignalKind::FT1_FutureBlockInEnabledFeature then
+    SignalParams { w: 8.0, alpha: 0.0, beta: 1.0, cap: 20.0 }
+  when SignalKind::FT2_CfgFeatureEnabledButIncomplete then
+    SignalParams { w: 10.0, alpha: 0.0, beta: 1.0, cap: 25.0 }
+  end
+end
+
+# §26.2 — Penalty computation
+# P(σ,s) = (1 - suppr) · min(w · (sev^β) · (1 + α · (n-1)), cap)
+def compute_penalty(signal: &Signal, params: &SignalParams) -> Float
+  let suppr = if signal.suppressed then 1.0 else 0.0 end
+  let raw = params.w * pow(signal.severity, params.beta) * (1.0 + params.alpha * (to_float(signal.count) - 1.0))
+  let capped = min_float(raw, params.cap)
+  (1.0 - suppr) * capped
+end
+
+# §26.1 — Core score definition
+# Score(s) = clamp(100 - Σ P(σ,s), 0, 100)
+def compute_score(signals: &Vec[Signal]) -> CompletenessScore
+  mut total_penalty = 0.0
+  for signal in signals
+    let params = default_signal_params(signal.kind)
+    total_penalty = total_penalty + compute_penalty(signal, &params)
+  end
+  let raw = 100.0 - total_penalty
+  let clamped = clamp_int(to_int(raw), 0, 100)
+  CompletenessScore { raw: raw, clamped: clamped }
+end
+
+# §26.3 — Normalized Severity Functions
+
+# Binary static signals: sev = 1 if present
+def sev_binary() -> Float
+  1.0
+end
+
+# Count-based: sevCount(n; n0, n1) = clamp((n - n0) / (n1 - n0), 0, 1)
+def sev_count(n: Int, n0: Int, n1: Int) -> Float
+  if n1 == n0
+    if n >= n1 then 1.0 else 0.0 end
+  else
+    clamp_float(to_float(n - n0) / to_float(n1 - n0), 0.0, 1.0)
+  end
+end
+
+# §26.4 — Coverage Penalty Normalization
+# r_b = branches_covered / branches_total
+# s_b = max(0, τ_b - r_b)
+# sevCov = s_b / τ_b
+# CV-2 severity: sev = sevCov^γ_b
+def sev_coverage(branches_covered: Int, branches_total: Int, threshold: Float, gamma: Float) -> Float
+  if branches_total == 0
+    0.0
+  else
+    let r_b = to_float(branches_covered) / to_float(branches_total)
+    let s_b = max_float(0.0, threshold - r_b)
+    let sev_cov = if threshold > 0.0 then s_b / threshold else 0.0 end
+    pow(sev_cov, gamma)
+  end
+end
+
+# §26.5 — DF-2: Output-Independence Normalization
+# r_d = |{p ∈ Π': AffectsReturn(p)}| / |Π'|
+# Severity = 1 - r_d
+def sev_output_independence(affecting_params: Int, total_params: Int) -> Float
+  if total_params == 0
+    0.0
+  else
+    let r_d = to_float(affecting_params) / to_float(total_params)
+    1.0 - r_d
+  end
+end
+
+# §26.6 — CF-4: Constant-Return Dominance Normalization
+# sev = clamp((c - c0)/(1 - c0), 0, 1) * clamp(k0/k, 0, 1)
+# Defaults: c0 = 0.80, k0 = 1
+def sev_constant_return(c: Float, k: Int, c0: Float, k0: Int) -> Float
+  let sev_c = clamp_float((c - c0) / (1.0 - c0), 0.0, 1.0)
+  let sev_k = clamp_float(to_float(k0) / to_float(max_int(k, 1)), 0.0, 1.0)
+  sev_c * sev_k
+end
+
+# CV-1: Uncovered branch fraction
+# sevUncov(s) with u0=0.05, u1=0.30
+def sev_uncovered_fraction(uncovered_frac: Float, u0: Float, u1: Float) -> Float
+  sev_count_float(uncovered_frac, u0, u1)
+end
+
+def sev_count_float(val: Float, n0: Float, n1: Float) -> Float
+  if n1 == n0
+    if val >= n1 then 1.0 else 0.0 end
+  else
+    clamp_float((val - n0) / (n1 - n0), 0.0, 1.0)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §27 — CQS Mode Enforcement Matrix
+# ═══════════════════════════════════════════════════════════════
+
+# §36 — Minimum CompletenessScore Thresholds
+def min_score_threshold(surface: SurfaceClass, mode: Mode) -> Int
+  match (surface, mode)
+  when (SurfaceClass::PublicStable, Mode::Dev) then 0
+  when (SurfaceClass::PublicStable, Mode::Strict) then 75
+  when (SurfaceClass::PublicStable, Mode::Production) then 85
+  when (SurfaceClass::PublicStable, Mode::Hardened) then 92
+  when (SurfaceClass::InternalHotPath, Mode::Production) then 70
+  when (SurfaceClass::InternalHotPath, Mode::Hardened) then 80
+  when (_, _) then 0
+  end
+end
+
+# §37 — Branch Coverage Thresholds (τ_b)
+def branch_coverage_threshold(surface: SurfaceClass, mode: Mode) -> Float
+  match (surface, mode)
+  when (SurfaceClass::PublicStable, Mode::Strict) then 0.60
+  when (SurfaceClass::PublicStable, Mode::Production) then 0.75
+  when (SurfaceClass::PublicStable, Mode::Hardened) then 0.85
+  when (SurfaceClass::InternalHotPath, Mode::Strict) then 0.40
+  when (SurfaceClass::InternalHotPath, Mode::Production) then 0.60
+  when (SurfaceClass::InternalHotPath, Mode::Hardened) then 0.70
+  when (_, _) then 0.00
+  end
+end
+
+# §37.2 — Coverage Shortfall Exponent γ_b
+def coverage_gamma(mode: Mode) -> Float
+  match mode
+  when Mode::Hardened then 2.0
+  when _ then 1.0
+  end
+end
+
+enum EnforcementAction
+  NoEnforcement
+  Warn
+  Error
+  SpecialRules
+end
+
+def enforcement_action(surface: SurfaceClass, mode: Mode, score: Int) -> EnforcementAction
+  let threshold = min_score_threshold(surface, mode)
+  if threshold == 0
+    match (surface, mode)
+    when (SurfaceClass::PublicStable, Mode::Dev) then
+      if score < 70 then EnforcementAction::Warn else EnforcementAction::NoEnforcement end
+    when (SurfaceClass::PublicExperimental, _) then EnforcementAction::Warn
+    when (SurfaceClass::PlatformShim, _) then EnforcementAction::SpecialRules
+    when (_, _) then EnforcementAction::NoEnforcement
+    end
+  else
+    if score < threshold
+      EnforcementAction::Error
+    else
+      EnforcementAction::NoEnforcement
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §28 — Context-Aware Relaxation (Suppressions)
+# ═══════════════════════════════════════════════════════════════
+
+# §39 — Deterministic Suppression Policy
+def should_suppress(
+  signal_kind: SignalKind,
+  surface: SurfaceClass,
+  is_cfg_inactive: Bool,
+  is_future_disabled: Bool,
+  is_unit_return: Bool,
+  mode: Mode
+) -> Bool
+  # TestOnly → suppress all
+  match surface
+  when SurfaceClass::TestOnly then return true
+  when _ then ()
+  end
+
+  # Inactive cfg region → suppress
+  if is_cfg_inactive
+    return true
+  end
+
+  # @future with disabled feature → suppress (unless Hardened)
+  if is_future_disabled
+    match mode
+    when Mode::Hardened then return false  # Hardened: @future doesn't suppress
+    when _ then return true
+    end
+  end
+
+  # PlatformShim: suppress CF-3, CF-4, DF-2 only if cfg-gated
+  match (surface, signal_kind)
+  when (SurfaceClass::PlatformShim, SignalKind::CF3_PanicUnreachableExit) then
+    return is_cfg_inactive
+  when (SurfaceClass::PlatformShim, SignalKind::CF4_ConstantReturnDominance) then
+    return is_cfg_inactive
+  when (SurfaceClass::PlatformShim, SignalKind::DF2_OutputIndependentOfInputs) then
+    return is_cfg_inactive
+  when (_, _) then ()
+  end
+
+  # §58.3 — Unit-returning functions: suppress CF-4
+  match signal_kind
+  when SignalKind::CF4_ConstantReturnDominance then
+    if is_unit_return then return true end
+  when _ then ()
+  end
+
+  false
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §40 — Default sevCount Parameters by Kind
+# ═══════════════════════════════════════════════════════════════
+
+struct SevCountParams
+  n0: Int
+  n1: Int
+end
+
+def sev_count_params(kind: SignalKind) -> SevCountParams
+  match kind
+  when SignalKind::DF1_UnusedParameter then SevCountParams { n0: 0, n1: 3 }
+  when SignalKind::DF3_DeadAssignment then SevCountParams { n0: 0, n1: 5 }
+  when SignalKind::CF1_UnreachableBranch then SevCountParams { n0: 0, n1: 2 }
+  when SignalKind::EH1_IgnoredResultWithoutJustification then SevCountParams { n0: 0, n1: 2 }
+  when _ then SevCountParams { n0: 0, n1: 1 }  # Binary default
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §41 — Module / Package Score Aggregation
+# ═══════════════════════════════════════════════════════════════
+
+def surface_weight(surface: SurfaceClass) -> Float
+  match surface
+  when SurfaceClass::PublicStable then 4.0
+  when SurfaceClass::PublicExperimental then 2.0
+  when SurfaceClass::InternalHotPath then 3.0
+  when SurfaceClass::InternalGlue then 1.0
+  when SurfaceClass::TestOnly then 0.0
+  when SurfaceClass::PlatformShim then 2.0
+  end
+end
+
+# §41.1 — Module score as weighted mean
+# Score_M = Σ(w_class(s) · Score(s)) / Σ(w_class(s))
+def compute_module_score(symbols: &Vec[SymbolReport]) -> Float
+  mut weighted_sum = 0.0
+  mut weight_sum = 0.0
+  for sym in symbols
+    let w = surface_weight(sym.surface_class)
+    weighted_sum = weighted_sum + w * to_float(sym.score.clamped)
+    weight_sum = weight_sum + w
+  end
+  if weight_sum > 0.0
+    weighted_sum / weight_sum
+  else
+    100.0
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §29 — CQS Quality Report
+# ═══════════════════════════════════════════════════════════════
+
+struct SymbolReport
+  symbol_id: String
+  name: String
+  kind: SymbolKind
+  span: RichSpan
+  surface_class: SurfaceClass
+  score: CompletenessScore
+  score_raw: Float
+  penalty_total: Float
+  coverage: Option[CoverageInfo]
+  capabilities: Option[CapabilityInfo]
+  signals: Vec[Signal]
+  suggested_actions: Vec[SuggestedAction]
+end
+
+struct CoverageInfo
+  branches_total: Int
+  branches_covered: Int
+  branch_ratio: Float
+  threshold: Float
+end
+
+struct CapabilityInfo
+  required: Vec[String]
+  drift: Vec[String]
+end
+
+# §47 — Suggested Action Entry
+struct SuggestedAction
+  action_id: String
+  priority: Int     # 1 = highest
+  title: String
+  patches: Vec[Patch]
+  tests_to_run: Vec[String]
+  confidence: Float
+end
+
+struct Patch
+  patch_type: String    # "ast_patch"
+  format: String        # "tgc-ast-patch-v1"
+  payload: String
+end
+
+struct ModuleReport
+  module_path: String
+  module_score_weighted: Float
+  symbols: Vec[SymbolReport]
+end
+
+# §42/43 — Top-level tg quality output
+struct QualityReport
+  schema_version: String
+  tangerine_edition: String
+  tgc_version: String
+  target: String
+  mode: Mode
+  config_hash: String
+  package_name: String
+  package_version: String
+  summary: QualitySummary
+  modules: Vec[ModuleReport]
+end
+
+struct QualitySummary
+  symbols_total: Int
+  symbols_scored: Int
+  avg_score_weighted: Float
+  min_score: Int
+  gated_failures: Int
+  signals_total: Int
+  top_signal_kinds: Vec[SignalCount]
+end
+
+struct SignalCount
+  kind: SignalKind
+  count: Int
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §49 — IR Level and Determinism
+# ═══════════════════════════════════════════════════════════════
+
+# All CQS detection on typed MIR with source spans preserved.
+# Deterministic ordering:
+#   Functions in stable symbol-id order
+#   Basic blocks in numeric order
+#   Statements in sequence order
+#   Edges in sorted (from_bb, to_bb) order
+#   Signals emitted sorted by (kind, file, start, end)
+
+def sort_signals(signals: &mut Vec[Signal]) -> Unit
+  signals.sort_by(|a, b|
+    let ka = signal_kind_ordinal(a.kind)
+    let kb = signal_kind_ordinal(b.kind)
+    if ka != kb
+      ka < kb
+    else if a.locations.len() > 0 && b.locations.len() > 0
+      let la = a.locations[0]
+      let lb = b.locations[0]
+      if la.file != lb.file then la.file < lb.file
+      else if la.start_line != lb.start_line then la.start_line < lb.start_line
+      else la.start_col < lb.start_col
+      end
+    else
+      false
+    end
+  )
+end
+
+def signal_kind_ordinal(k: SignalKind) -> Int
+  match k
+  when SignalKind::CF1_UnreachableBranch then 0
+  when SignalKind::CF2_NonExhaustiveMatch then 1
+  when SignalKind::CF3_PanicUnreachableExit then 2
+  when SignalKind::CF4_ConstantReturnDominance then 3
+  when SignalKind::DF1_UnusedParameter then 4
+  when SignalKind::DF2_OutputIndependentOfInputs then 5
+  when SignalKind::DF3_DeadAssignment then 6
+  when SignalKind::DF4_AllBranchesReturnSameLiteral then 7
+  when SignalKind::EH1_IgnoredResultWithoutJustification then 8
+  when SignalKind::EH2_CatchAllWithoutAction then 9
+  when SignalKind::EH3_BroadExceptionBoundarySwallowing then 10
+  when SignalKind::CV1_UnexecutedPublicBranch then 11
+  when SignalKind::CV2_CoverageBelowThreshold then 12
+  when SignalKind::CP1_CapabilityDrift then 13
+  when SignalKind::CP2_UnsafeBlockWithoutReason then 14
+  when SignalKind::CP3_TaintedFFIValueUsedWithoutValidation then 15
+  when SignalKind::FT1_FutureBlockInEnabledFeature then 16
+  when SignalKind::FT2_CfgFeatureEnabledButIncomplete then 17
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §50 — CFG Construction for CQS
+# ═══════════════════════════════════════════════════════════════
+
+struct BasicBlock
+  id: Int
+  statements: Vec[MirStatement]
+  terminator: Terminator
+end
+
+enum Terminator
+  Goto(Int)                        # target bb
+  Branch(Int, Int, Int)            # cond_local, true_bb, false_bb
+  SwitchInt(Int, Vec[SwitchArm], Option[Int])  # operand, cases, other_bb
+  SwitchEnum(Int, Vec[SwitchArm], Option[Int]) # operand, variants, other_bb
+  Return
+  Panic
+  Unreachable
+end
+
+struct SwitchArm
+  value: Int    # discriminant or integer value
+  target: Int   # target bb
+end
+
+struct CFG
+  entry: Int                         # bb0
+  blocks: Vec[BasicBlock]
+  edges: Vec[CFGEdge]
+  reachable: Set[Int]                # Set of reachable block IDs
+end
+
+struct CFGEdge
+  from_bb: Int
+  to_bb: Int
+end
+
+# §50.2 — Reachability via DFS from entry
+def compute_reachability(cfg: &CFG) -> Set[Int]
+  mut visited = Set::new()
+  mut stack = Vec::new()
+  stack.push(cfg.entry)
+
+  while !stack.is_empty() do
+    let bb = stack.pop()
+    if !visited.contains(bb)
+      visited.insert(bb)
+      for edge in &cfg.edges
+        if edge.from_bb == bb && !visited.contains(edge.to_bb)
+          stack.push(edge.to_bb)
+        end
+      end
+    end
+  end
+
+  visited
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §51 — Branch Point Definition
+# ═══════════════════════════════════════════════════════════════
+
+struct BranchPoint
+  branch_id: String     # Stable hash
+  bb_id: Int
+  kind: BranchPointKind
+  arms: Vec[BranchArm]
+  span: Option[RichSpan]
+end
+
+enum BranchPointKind
+  IfExpr
+  WhileExpr
+  MatchExpr
+  ShortCircuit
+  Guard
+  Desugar
+end
+
+struct BranchArm
+  arm_id: String    # Stable hash
+  arm_index: Int
+  target_bb: Int
+  label: String     # "then", "else", "Variant::Name", "case::42", "other"
+end
+
+# §51.2 — Arm ID stability
+# arm_id = SHA256("tg.arm.v1" ‖ branch_id ‖ arm_index ‖ target_bb)
+def compute_arm_id(branch_id: String, arm_index: Int, target_bb: Int) -> String
+  sha256("tg.arm.v1" + branch_id + arm_index.to_string() + target_bb.to_string())
+end
+
+# Branch ID from function symbol + bb + terminator
+def compute_branch_id(symbol_id: String, bb_id: Int, term_index: Int, kind: BranchPointKind) -> String
+  let kind_str = match kind
+  when BranchPointKind::IfExpr then "if"
+  when BranchPointKind::WhileExpr then "while"
+  when BranchPointKind::MatchExpr then "match"
+  when BranchPointKind::ShortCircuit then "short_circuit"
+  when BranchPointKind::Guard then "guard"
+  when BranchPointKind::Desugar then "desugar"
+  end
+  sha256("tg.branch.v1" + symbol_id + bb_id.to_string() + term_index.to_string() + kind_str)
+end
+
+# Enumerate all branch points from a CFG
+def enumerate_branch_points(cfg: &CFG, symbol_id: String) -> Vec[BranchPoint]
+  mut points = Vec::new()
+  for block in &cfg.blocks
+    match &block.terminator
+    when Terminator::Branch(cond, t, f) then
+      let bp_id = compute_branch_id(symbol_id, block.id, 0, BranchPointKind::IfExpr)
+      mut arms = Vec::new()
+      arms.push(BranchArm {
+        arm_id: compute_arm_id(bp_id, 0, t),
+        arm_index: 0,
+        target_bb: t,
+        label: "then"
+      })
+      arms.push(BranchArm {
+        arm_id: compute_arm_id(bp_id, 1, f),
+        arm_index: 1,
+        target_bb: f,
+        label: "else"
+      })
+      points.push(BranchPoint {
+        branch_id: bp_id,
+        bb_id: block.id,
+        kind: BranchPointKind::IfExpr,
+        arms: arms,
+        span: Option::None
+      })
+    when Terminator::SwitchEnum(op, variants, other) then
+      let bp_id = compute_branch_id(symbol_id, block.id, 0, BranchPointKind::MatchExpr)
+      mut arms = Vec::new()
+      for i in 0..variants.len() do
+        let v = &variants[i]
+        arms.push(BranchArm {
+          arm_id: compute_arm_id(bp_id, i, v.target),
+          arm_index: i,
+          target_bb: v.target,
+          label: "Variant::" + v.value.to_string()
+        })
+      end
+      match other
+      when Option::Some(bb) then
+        arms.push(BranchArm {
+          arm_id: compute_arm_id(bp_id, variants.len(), bb),
+          arm_index: variants.len(),
+          target_bb: bb,
+          label: "other"
+        })
+      when Option::None then ()
+      end
+      points.push(BranchPoint {
+        branch_id: bp_id,
+        bb_id: block.id,
+        kind: BranchPointKind::MatchExpr,
+        arms: arms,
+        span: Option::None
+      })
+    when Terminator::SwitchInt(op, cases, other) then
+      let bp_id = compute_branch_id(symbol_id, block.id, 0, BranchPointKind::MatchExpr)
+      mut arms = Vec::new()
+      # Cases sorted ascending by value
+      let sorted_cases = cases.sorted_by(|a, b| a.value < b.value)
+      for i in 0..sorted_cases.len() do
+        let c = &sorted_cases[i]
+        arms.push(BranchArm {
+          arm_id: compute_arm_id(bp_id, i, c.target),
+          arm_index: i,
+          target_bb: c.target,
+          label: "case::" + c.value.to_string()
+        })
+      end
+      match other
+      when Option::Some(bb) then
+        arms.push(BranchArm {
+          arm_id: compute_arm_id(bp_id, sorted_cases.len(), bb),
+          arm_index: sorted_cases.len(),
+          target_bb: bb,
+          label: "other"
+        })
+      when Option::None then ()
+      end
+      points.push(BranchPoint {
+        branch_id: bp_id,
+        bb_id: block.id,
+        kind: BranchPointKind::MatchExpr,
+        arms: arms,
+        span: Option::None
+      })
+    when _ then ()
+    end
+  end
+  points
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §52 — CF Signal Detection Algorithms
+# ═══════════════════════════════════════════════════════════════
+
+# §52.1 — CF-1: Unreachable Branch/Block
+def detect_cf1(cfg: &CFG, symbol_spans: &Map[Int, RichSpan]) -> Option[Signal]
+  mut unreachable_count = 0
+  mut locs = Vec::new()
+  for block in &cfg.blocks
+    if !cfg.reachable.contains(block.id)
+      match symbol_spans.get(block.id)
+      when Option::Some(span) then
+        unreachable_count = unreachable_count + 1
+        if locs.len() < 10  # First K=10 spans
+          locs.push(span)
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  if unreachable_count > 0
+    let params = sev_count_params(SignalKind::CF1_UnreachableBranch)
+    Option::Some(Signal {
+      kind: SignalKind::CF1_UnreachableBranch,
+      severity: sev_count(unreachable_count, params.n0, params.n1),
+      count: unreachable_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+# §52.2 — CF-2: Non-Exhaustive Match
+def detect_cf2(cfg: &CFG, match_info: &Vec[MatchInfo]) -> Option[Signal]
+  mut locs = Vec::new()
+  for info in match_info
+    if !info.is_exhaustive && !info.explicit_non_exhaustive
+      locs.push(info.span)
+    end
+  end
+  if !locs.is_empty()
+    Option::Some(Signal {
+      kind: SignalKind::CF2_NonExhaustiveMatch,
+      severity: sev_binary(),
+      count: locs.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct MatchInfo
+  span: RichSpan
+  is_exhaustive: Bool
+  explicit_non_exhaustive: Bool
+  enum_type: Option[String]
+  covered_variants: Vec[String]
+  all_variants: Vec[String]
+end
+
+# §52.3 — CF-3: Panic/Unreachable as Normal Exit
+def detect_cf3(cfg: &CFG, spans: &Map[Int, RichSpan]) -> Option[Signal]
+  mut panic_count = 0
+  mut locs = Vec::new()
+  for block in &cfg.blocks
+    if cfg.reachable.contains(block.id)
+      match &block.terminator
+      when Terminator::Panic then
+        panic_count = panic_count + 1
+        match spans.get(block.id)
+        when Option::Some(s) then locs.push(s)
+        when Option::None then ()
+        end
+      when Terminator::Unreachable then
+        panic_count = panic_count + 1
+        match spans.get(block.id)
+        when Option::Some(s) then locs.push(s)
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  if panic_count > 0
+    Option::Some(Signal {
+      kind: SignalKind::CF3_PanicUnreachableExit,
+      severity: sev_binary(),
+      count: panic_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+# §52.4 — CF-4: Constant-Return Dominance
+def detect_cf4(
+  cfg: &CFG,
+  return_sites: &Vec[ReturnSite],
+  param_count: Int,
+  has_non_context_param: Bool,
+  surface: SurfaceClass
+) -> Option[Signal]
+  if return_sites.is_empty()
+    return Option::None
+  end
+  let total = return_sites.len()
+  mut constant_count = 0
+  mut distinct_constants = Set::new()
+  for site in return_sites
+    match &site.form
+    when ReturnForm::Const(val) then
+      constant_count = constant_count + 1
+      distinct_constants.insert(val)
+    when ReturnForm::NonConst then ()
+    end
+  end
+  let c = to_float(constant_count) / to_float(total)
+  let k = distinct_constants.len()
+  let sev = sev_constant_return(c, k, 0.80, 1)
+
+  # Only fires when has ≥1 non-context param or PublicStable/InternalHotPath
+  let should_emit = (has_non_context_param || matches_surface(surface)) && c >= 0.80
+  if should_emit && sev > 0.0
+    let mut details = Map::new()
+    details.insert("c", c.to_string())
+    details.insert("k", k.to_string())
+    Option::Some(Signal {
+      kind: SignalKind::CF4_ConstantReturnDominance,
+      severity: sev,
+      count: 1,
+      suppressed: false,
+      penalty: 0.0,
+      locations: Vec::new(),
+      details: details
+    })
+  else
+    Option::None
+  end
+end
+
+struct ReturnSite
+  bb_id: Int
+  form: ReturnForm
+end
+
+enum ReturnForm
+  Const(String)   # Normalized value representation
+  NonConst
+end
+
+def matches_surface(s: SurfaceClass) -> Bool
+  match s
+  when SurfaceClass::PublicStable then true
+  when SurfaceClass::InternalHotPath then true
+  when _ then false
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §53 — DF Signal Detection (Def-Use)
+# ═══════════════════════════════════════════════════════════════
+
+struct DefUseGraph
+  definitions: Vec[Definition]
+  uses: Vec[Use]
+  links: Vec[DefUseLink]
+end
+
+struct Definition
+  local_id: Int
+  stmt_index: Int
+  bb_id: Int
+end
+
+struct Use
+  local_id: Int
+  stmt_index: Int
+  bb_id: Int
+end
+
+struct DefUseLink
+  def_index: Int
+  use_index: Int
+end
+
+# §53.2 — DF-1: Unused Parameter
+def detect_df1(params: &Vec[ParamInfo], def_use: &DefUseGraph) -> Option[Signal]
+  mut unused_count = 0
+  mut locs = Vec::new()
+  for p in params
+    if p.name.starts_with("_") || p.has_unused_ok
+      continue
+    end
+    # Check if param is a context/capability type
+    if p.is_context_param
+      continue
+    end
+    let has_use = false
+    for link in &def_use.links
+      let def = &def_use.definitions[link.def_index]
+      if def.local_id == p.local_id
+        has_use = true
+        break
+      end
+    end
+    if !has_use
+      unused_count = unused_count + 1
+      locs.push(p.span)
+    end
+  end
+  if unused_count > 0
+    let params_sev = sev_count_params(SignalKind::DF1_UnusedParameter)
+    Option::Some(Signal {
+      kind: SignalKind::DF1_UnusedParameter,
+      severity: sev_count(unused_count, params_sev.n0, params_sev.n1),
+      count: unused_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct ParamInfo
+  local_id: Int
+  name: String
+  span: RichSpan
+  is_context_param: Bool
+  has_unused_ok: Bool
+end
+
+# §53.3 — DF-3: Dead Assignment (liveness analysis)
+def detect_df3(def_use: &DefUseGraph, spans: &Map[Int, RichSpan]) -> Option[Signal]
+  mut dead_count = 0
+  mut locs = Vec::new()
+  for i in 0..def_use.definitions.len() do
+    let def = &def_use.definitions[i]
+    let has_use = false
+    for link in &def_use.links
+      if link.def_index == i
+        has_use = true
+        break
+      end
+    end
+    if !has_use
+      dead_count = dead_count + 1
+      match spans.get(def.stmt_index)
+      when Option::Some(s) then locs.push(s)
+      when Option::None then ()
+      end
+    end
+  end
+  if dead_count > 0
+    let params = sev_count_params(SignalKind::DF3_DeadAssignment)
+    Option::Some(Signal {
+      kind: SignalKind::DF3_DeadAssignment,
+      severity: sev_count(dead_count, params.n0, params.n1),
+      count: dead_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+# §53.4 — DF-2: AffectsReturn
+def detect_df2(
+  params: &Vec[ParamInfo],
+  dep_graph: &DependencyGraph,
+  return_sinks: &Vec[Int]
+) -> Option[Signal]
+  let non_context_params = params.iter().filter(|p| !p.is_context_param).collect()
+  if non_context_params.is_empty()
+    return Option::None
+  end
+  mut affecting = 0
+  for p in &non_context_params
+    if reachable_to_sink(dep_graph, p.local_id, return_sinks)
+      affecting = affecting + 1
+    end
+  end
+  let sev = sev_output_independence(affecting, non_context_params.len())
+  if sev > 0.0
+    Option::Some(Signal {
+      kind: SignalKind::DF2_OutputIndependentOfInputs,
+      severity: sev,
+      count: 1,
+      suppressed: false,
+      penalty: 0.0,
+      locations: Vec::new(),
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct DependencyGraph
+  edges: Vec[DepEdge]
+end
+
+struct DepEdge
+  from_local: Int
+  to_local: Int
+end
+
+def reachable_to_sink(graph: &DependencyGraph, start: Int, sinks: &Vec[Int]) -> Bool
+  mut visited = Set::new()
+  mut stack = Vec::new()
+  stack.push(start)
+  while !stack.is_empty() do
+    let node = stack.pop()
+    if sinks.contains(node)
+      return true
+    end
+    if !visited.contains(node)
+      visited.insert(node)
+      for edge in &graph.edges
+        if edge.from_local == node
+          stack.push(edge.to_local)
+        end
+      end
+    end
+  end
+  false
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §54 — EH Signal Detection (Result Discipline)
+# ═══════════════════════════════════════════════════════════════
+
+enum ResultHandling
+  Propagate      # via `?`
+  OkBang         # via `.ok!`
+  IgnoreReason(String) # via `.ignore("reason")`
+  Handled        # Matched/consumed
+  Unknown        # No handler — potential EH-1
+end
+
+# §54.2 — EH-1: Ignored Result without justification
+def detect_eh1(result_sites: &Vec[ResultSite]) -> Option[Signal]
+  mut ignored_count = 0
+  mut locs = Vec::new()
+  for site in result_sites
+    match &site.handling
+    when ResultHandling::Unknown then
+      ignored_count = ignored_count + 1
+      locs.push(site.span)
+    when _ then ()
+    end
+  end
+  if ignored_count > 0
+    let params = sev_count_params(SignalKind::EH1_IgnoredResultWithoutJustification)
+    Option::Some(Signal {
+      kind: SignalKind::EH1_IgnoredResultWithoutJustification,
+      severity: sev_count(ignored_count, params.n0, params.n1),
+      count: ignored_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct ResultSite
+  span: RichSpan
+  result_type: String
+  handling: ResultHandling
+end
+
+# §54.3 — EH-2: Catch-all without action
+def detect_eh2(wildcard_arms: &Vec[WildcardArm]) -> Option[Signal]
+  mut bad_count = 0
+  mut locs = Vec::new()
+  for arm in wildcard_arms
+    if !arm.has_rethrow && !arm.has_log && !arm.has_ignore_reason && !arm.has_default_reason
+      bad_count = bad_count + 1
+      locs.push(arm.span)
+    end
+  end
+  if bad_count > 0
+    Option::Some(Signal {
+      kind: SignalKind::EH2_CatchAllWithoutAction,
+      severity: sev_binary(),
+      count: bad_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct WildcardArm
+  span: RichSpan
+  has_rethrow: Bool
+  has_log: Bool
+  has_ignore_reason: Bool
+  has_default_reason: Bool
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §56 — Capability Signal Detection
+# ═══════════════════════════════════════════════════════════════
+
+# §56.1 — Capability Set Extraction
+struct CapabilitySet
+  direct: Set[String]      # From parameter types
+  transitive: Set[String]  # From callees
+  from_effects: Set[String] # From effect-to-cap mapping
+  from_unsafe: Bool        # Has unsafe blocks
+end
+
+def effect_to_capability(effect: String) -> Option[String]
+  match effect
+  when "net.read" then Option::Some("NetCap")
+  when "net.write" then Option::Some("NetCap")
+  when "fs.read" then Option::Some("FsReadCap")
+  when "fs.write" then Option::Some("FsCap")
+  when "process.spawn" then Option::Some("ProcCap")
+  when "ffi.call" then Option::Some("FfiCap")
+  when _ then Option::None
+  end
+end
+
+# §56.2 — CP-1: Capability Drift
+def detect_cp1(current_caps: &Set[String], baseline_caps: &Set[String]) -> Option[Signal]
+  mut drift = Set::new()
+  for cap in current_caps
+    if !baseline_caps.contains(cap)
+      drift.insert(cap)
+    end
+  end
+  if !drift.is_empty()
+    let n_cap_max = 10
+    let sev = to_float(drift.len()) / to_float(max_int(drift.len(), n_cap_max))
+    let mut details = Map::new()
+    details.insert("new_caps", drift.to_vec().join(", "))
+    details.insert("baseline_caps", baseline_caps.to_vec().join(", "))
+    Option::Some(Signal {
+      kind: SignalKind::CP1_CapabilityDrift,
+      severity: sev,
+      count: drift.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: Vec::new(),
+      details: details
+    })
+  else
+    Option::None
+  end
+end
+
+# §56.3 — CP-2: Unsafe block without reason
+def detect_cp2(unsafe_blocks: &Vec[UnsafeBlockInfo]) -> Option[Signal]
+  mut locs = Vec::new()
+  for block in unsafe_blocks
+    if block.reason.is_none() || block.reason.unwrap_or("").is_empty()
+      locs.push(block.span)
+    end
+  end
+  if !locs.is_empty()
+    Option::Some(Signal {
+      kind: SignalKind::CP2_UnsafeBlockWithoutReason,
+      severity: sev_binary(),
+      count: locs.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct UnsafeBlockInfo
+  span: RichSpan
+  reason: Option[String]
+end
+
+# §56.4 — CP-3: Tainted FFI value without validation
+def detect_cp3(taint_flows: &Vec[TaintFlow]) -> Option[Signal]
+  mut locs = Vec::new()
+  for flow in taint_flows
+    if !flow.validated
+      locs.push(flow.source_span)
+    end
+  end
+  if !locs.is_empty()
+    Option::Some(Signal {
+      kind: SignalKind::CP3_TaintedFFIValueUsedWithoutValidation,
+      severity: sev_binary(),
+      count: locs.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct TaintFlow
+  source_span: RichSpan
+  sink_span: RichSpan
+  validated: Bool
+  validator: Option[String]
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §57 — Future/Feature Signal Detection
+# ═══════════════════════════════════════════════════════════════
+
+def detect_ft1(future_blocks: &Vec[FutureBlock]) -> Option[Signal]
+  mut locs = Vec::new()
+  for fb in future_blocks
+    if fb.feature_enabled
+      locs.push(fb.span)
+    end
+  end
+  if !locs.is_empty()
+    Option::Some(Signal {
+      kind: SignalKind::FT1_FutureBlockInEnabledFeature,
+      severity: sev_binary(),
+      count: locs.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct FutureBlock
+  span: RichSpan
+  feature: String
+  feature_enabled: Bool
+end
+
+def detect_ft2(cfg_regions: &Vec[CfgRegion]) -> Option[Signal]
+  mut locs = Vec::new()
+  for region in cfg_regions
+    if region.active && region.has_cf3_or_cf4
+      locs.push(region.span)
+    end
+  end
+  if !locs.is_empty()
+    Option::Some(Signal {
+      kind: SignalKind::FT2_CfgFeatureEnabledButIncomplete,
+      severity: sev_binary(),
+      count: locs.len(),
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+struct CfgRegion
+  span: RichSpan
+  feature: String
+  active: Bool
+  has_cf3_or_cf4: Bool
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §32 — CQS Determinism Requirement
+# ═══════════════════════════════════════════════════════════════
+
+# Output MUST be:
+#   Stable across builds
+#   Stable across machines
+#   Independent of timing
+#   Independent of non-deterministic test order
+# All functions above produce deterministic output given the same MIR input.
+
+# ═══════════════════════════════════════════════════════════════
+# §33 — CQS Human-Friendliness Guarantees
+# ═══════════════════════════════════════════════════════════════
+
+# Never require verbose annotations in Dev mode
+# Never block InternalGlue code
+# Never require tests for experimental APIs
+# Provide actionable suggestions, not vague warnings
+# Allow opt-in strictness via config
+
+def is_gating_blocked(surface: SurfaceClass, mode: Mode) -> Bool
+  match surface
+  when SurfaceClass::InternalGlue then true   # Never block glue
+  when SurfaceClass::TestOnly then true        # Never block tests
+  when SurfaceClass::PublicExperimental then
+    match mode
+    when Mode::Hardened then false  # Even experimental gated in Hardened
+    when _ then true               # Never gate experimental otherwise
+    end
+  when _ then false
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §34 — CQS Agent Optimization Guarantees
+# ═══════════════════════════════════════════════════════════════
+
+# Deterministic next actions
+# Explicit structured diagnostics
+# Reduced retry loops
+# Context widening via structured metadata
+# Prevention of incomplete public APIs in release builds
+
+def generate_suggested_actions(sym: &SymbolReport, mode: Mode) -> Vec[SuggestedAction]
+  mut actions = Vec::new()
+
+  for signal in &sym.signals
+    if signal.suppressed then continue end
+
+    let action = match signal.kind
+    when SignalKind::CF2_NonExhaustiveMatch then
+      Option::Some(SuggestedAction {
+        action_id: "add_missing_match_arms",
+        priority: 1,
+        title: "Add missing match arms for exhaustiveness",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 1.0
+      })
+    when SignalKind::EH1_IgnoredResultWithoutJustification then
+      Option::Some(SuggestedAction {
+        action_id: "handle_result",
+        priority: 2,
+        title: "Handle or propagate Result value",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when SignalKind::CP2_UnsafeBlockWithoutReason then
+      Option::Some(SuggestedAction {
+        action_id: "add_unsafe_reason",
+        priority: 1,
+        title: "Add reason parameter to unsafe block",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 1.0
+      })
+    when SignalKind::DF1_UnusedParameter then
+      Option::Some(SuggestedAction {
+        action_id: "use_or_prefix_param",
+        priority: 3,
+        title: "Use parameter or prefix with _ to mark intentionally unused",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.95
+      })
+    when _ then Option::None
+    end
+
+    match action
+    when Option::Some(a) then actions.push(a)
+    when Option::None then ()
+    end
+  end
+
+  actions
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §35 — CQS Security Integration (Hardened mode)
+# ═══════════════════════════════════════════════════════════════
+
+def hardened_security_check(sym: &SymbolReport) -> Vec[String]
+  mut violations = Vec::new()
+
+  for signal in &sym.signals
+    match signal.kind
+    when SignalKind::CP1_CapabilityDrift then
+      if !signal.suppressed
+        violations.push("Capability drift without explicit review flag")
+      end
+    when SignalKind::CP2_UnsafeBlockWithoutReason then
+      if !signal.suppressed
+        violations.push("Unsafe block without reason")
+      end
+    when SignalKind::CP3_TaintedFFIValueUsedWithoutValidation then
+      if !signal.suppressed
+        violations.push("FFI tainted value crosses boundary without validation")
+      end
+    when _ then ()
+    end
+  end
+
+  # Check coverage for public branches
+  match &sym.coverage
+  when Option::Some(cov) then
+    if sym.surface_class == SurfaceClass::PublicStable && cov.branch_ratio < 0.85
+      violations.push("Public branches not fully covered by tests")
+    end
+  when Option::None then ()
+  end
+
+  violations
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Entry Point — Run CQS Analysis
+# ═══════════════════════════════════════════════════════════════
+
+def run_cqs_analysis(
+  symbols: Vec[Symbol],
+  mode: Mode,
+  config_hash: String
+) -> QualityReport
+  mut module_reports = Map::new()
+
+  for sym in &symbols
+    mut signals = Vec::new()
+    # Signal detection would be called here with actual MIR data
+    # For each symbol, detect CF/DF/EH/CV/CP/FT signals
+
+    let score = compute_score(&signals)
+    let actions = generate_suggested_actions_from_signals(&signals, mode)
+
+    let report = SymbolReport {
+      symbol_id: sym.symbol_id,
+      name: sym.name,
+      kind: sym.kind,
+      span: sym.span,
+      surface_class: sym.surface_class,
+      score: score,
+      score_raw: score.raw,
+      penalty_total: 100.0 - score.raw,
+      coverage: Option::None,
+      capabilities: Option::None,
+      signals: signals,
+      suggested_actions: actions
+    }
+
+    let module = module_reports.entry(sym.module_path).or_insert(Vec::new())
+    module.push(report)
+  end
+
+  # Build final report
+  mut modules = Vec::new()
+  mut total_symbols = 0
+  mut total_scored = 0
+  mut total_gated = 0
+  let min_score = 100
+  mut weighted_sum = 0.0
+  mut weight_sum = 0.0
+
+  for (path, sym_reports) in &module_reports
+    let mod_score = compute_module_score(&sym_reports)
+    for sr in &sym_reports
+      total_symbols = total_symbols + 1
+      total_scored = total_scored + 1
+      if sr.score.clamped < min_score
+        min_score = sr.score.clamped
+      end
+      let w = surface_weight(sr.surface_class)
+      weighted_sum = weighted_sum + w * to_float(sr.score.clamped)
+      weight_sum = weight_sum + w
+
+      # Check gating
+      let action = enforcement_action(sr.surface_class, mode, sr.score.clamped)
+      match action
+      when EnforcementAction::Error then total_gated = total_gated + 1
+      when _ then ()
+      end
+    end
+    modules.push(ModuleReport {
+      module_path: path,
+      module_score_weighted: mod_score,
+      symbols: sym_reports
+    })
+  end
+
+  let avg = if weight_sum > 0.0 then weighted_sum / weight_sum else 100.0 end
+
+  QualityReport {
+    schema_version: "cqs.v0.2",
+    tangerine_edition: "2026",
+    tgc_version: "0.1.0",
+    target: "native",
+    mode: mode,
+    config_hash: config_hash,
+    package_name: "tangerine",
+    package_version: "0.1.0",
+    summary: QualitySummary {
+      symbols_total: total_symbols,
+      symbols_scored: total_scored,
+      avg_score_weighted: avg,
+      min_score: min_score,
+      gated_failures: total_gated,
+      signals_total: 0,
+      top_signal_kinds: Vec::new()
+    },
+    modules: modules
+  }
+end
+
+def generate_suggested_actions_from_signals(signals: &Vec[Signal], mode: Mode) -> Vec[SuggestedAction]
+  mut actions = Vec::new()
+  for signal in signals
+    if signal.suppressed then continue end
+    match signal.kind
+    when SignalKind::CF2_NonExhaustiveMatch then
+      actions.push(SuggestedAction {
+        action_id: "add_missing_arms",
+        priority: 1,
+        title: "Add missing match arms",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 1.0
+      })
+    when SignalKind::EH1_IgnoredResultWithoutJustification then
+      actions.push(SuggestedAction {
+        action_id: "handle_result",
+        priority: 2,
+        title: "Propagate with ? or handle Result",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when _ then ()
+    end
+  end
+  actions
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Utility Functions
+# ═══════════════════════════════════════════════════════════════
+
+def pow(base: Float, exp: Float) -> Float
+  # Intrinsic power function
+  __intrinsic_pow(base, exp)
+end
+
+def min_float(a: Float, b: Float) -> Float
+  if a < b then a else b end
+end
+
+def max_float(a: Float, b: Float) -> Float
+  if a > b then a else b end
+end
+
+def clamp_int(val: Int, lo: Int, hi: Int) -> Int
+  if val < lo then lo
+  else if val > hi then hi
+  else val
+  end
+end
+
+def clamp_float(val: Float, lo: Float, hi: Float) -> Float
+  if val < lo then lo
+  else if val > hi then hi
+  else val
+  end
+end
+
+def to_float(i: Int) -> Float
+  __intrinsic_int_to_float(i)
+end
+
+def to_int(f: Float) -> Int
+  __intrinsic_float_to_int(f)
+end
+
+def max_int(a: Int, b: Int) -> Int
+  if a > b then a else b end
+end
+
+def sha256(input: String) -> String
+  __intrinsic_sha256(input)
+end

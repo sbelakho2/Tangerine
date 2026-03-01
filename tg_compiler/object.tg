@@ -67,10 +67,11 @@ end
 # ———————————————————————————————————————————————————————————————
 # ELF64 Generation
 # ———————————————————————————————————————————————————————————————
-# NOTE: This module currently only emits ELF64 object files (Linux/FreeBSD).
-# macOS targets require Mach-O emission and Windows requires COFF/PE.
-# TODO: Implement emit_macho64() and emit_coff_pe() and dispatch based
-#       on the target triple (see linker.tg for similar per-format routing).
+# This module emits object files in three formats:
+# - ELF64 (Linux/FreeBSD x86-64 and AArch64) via build_elf64()
+# - Mach-O 64-bit (macOS x86-64 and Apple Silicon) via build_macho64()
+# - COFF (Windows x86-64) via build_coff64()
+# The build_object() dispatcher selects format based on target.os.
 
 # ELF constants
 def ELF_MAGIC() -> [u8; 4] = [0x7F, 0x45, 0x4C, 0x46]  # \x7fELF
@@ -426,7 +427,7 @@ def build_macho64(obj: &ObjectFile) -> Vec[u8]
   let data_size = obj.data.len()
   let rodata_size = obj.rodata.len()
 
-  let num_sections = 3   # __text, __data, __const
+  let num_sections = 4   # __text, __data, __const, __bss
   let segment_cmd_size = 72 + (num_sections * 80)
   let symtab_cmd_size = 24
   let dysymtab_cmd_size = 80
@@ -571,7 +572,8 @@ def build_macho64(obj: &ObjectFile) -> Vec[u8]
   write32(&mut out, segment_cmd_size as u32)
   write_padded_str(&mut out, "", 16)         # segname (empty for MH_OBJECT)
   write64(&mut out, 0)                        # vmaddr
-  write64(&mut out, segment_filesize as u64)  # vmsize
+  let bss_size = obj.bss_size
+  write64(&mut out, (segment_filesize + bss_size) as u64)  # vmsize (includes BSS)
   write64(&mut out, text_offset as u64)       # fileoff
   write64(&mut out, segment_filesize as u64)  # filesize
   write32(&mut out, 7)                        # maxprot (rwx)
@@ -618,6 +620,18 @@ def build_macho64(obj: &ObjectFile) -> Vec[u8]
   write32(&mut out, 3)
   write32(&mut out, 0); write32(&mut out, 0)
   write32(&mut out, S_REGULAR())
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # Section 4: __bss (zero-initialized data)
+  let bss_vmaddr = (text_size + data_size + rodata_size) as u64
+  write_padded_str(&mut out, "__bss", 16)
+  write_padded_str(&mut out, "__DATA", 16)
+  write64(&mut out, bss_vmaddr)                # addr (after rodata in VM)
+  write64(&mut out, bss_size as u64)           # size
+  write32(&mut out, 0)                          # offset (no file content for zerofill)
+  write32(&mut out, 3)                          # align (2^3 = 8)
+  write32(&mut out, 0); write32(&mut out, 0)    # reloff, nreloc
+  write32(&mut out, S_ZEROFILL())               # flags: S_ZEROFILL
   write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
 
   # --- LC_SYMTAB ---
@@ -979,7 +993,9 @@ def DW_OP_fbreg()             -> u8 = 0x91
 def DW_OP_reg0()              -> u8 = 0x50
 def DW_OP_call_frame_cfa()    -> u8 = 0x9C
 
-def DW_LANG_Rust()            -> u16 = 0x001C  # We'll use Rust's ID since it's similar
+# Tangerine language code (vendor-specific range 0x8000-0xFFFF)
+# Using 0x8FE1 = "TG" in hex (0x54 0x47) combined
+def DW_LANG_Tangerine()       -> u16 = 0x8FE1
 
 # DWARF line number opcodes
 def DW_LNS_copy()             -> u8 = 0x01
@@ -995,6 +1011,7 @@ def DW_LNE_set_address()      -> u8 = 0x02
 def DW_LNE_define_file()      -> u8 = 0x03
 
 struct DebugInfo
+  arch: Arch              # Target architecture for register mapping
   debug_abbrev: Vec[u8]   # Abbreviation table
   debug_info: Vec[u8]     # DIE tree
   debug_line: Vec[u8]     # Line number program
@@ -1028,11 +1045,12 @@ struct VariableDebugInfo
   stack_offset: Int  # Offset from frame base
 end
 
-def debug_info_new() -> DebugInfo
+def debug_info_new(arch: Arch) -> DebugInfo
   mut str_table = Vec::new()
   str_table.push(0)  # Empty string at offset 0
   
   DebugInfo {
+    arch: arch,
     debug_abbrev: Vec::new(),
     debug_info: Vec::new(),
     debug_line: Vec::new(),
@@ -1116,8 +1134,8 @@ def generate_dwarf_debug_info(
   let producer_off = dwarf_add_string(di, producer.clone())
   write32(&mut di.debug_info, producer_off as u32)
   
-  # Language
-  write16(&mut di.debug_info, DW_LANG_Rust())
+  # Language (Tangerine vendor-specific code)
+  write16(&mut di.debug_info, DW_LANG_Tangerine())
   
   # Name (source file)
   let name_off = dwarf_add_string(di, source_file.clone())
@@ -1465,20 +1483,25 @@ def generate_frame_info(di: &mut DebugInfo) -> Unit
   # CIE (Common Information Entry)
   let cie_start = di.debug_frame.len()
   
+  let (ra_reg, sp_reg) = match di.arch
+  when Arch::X86_64 then (16, 7)    # RIP=16, RSP=7
+  when Arch::AArch64 then (30, 31)  # LR=30, SP=31
+  end
+  
   write32(&mut di.debug_frame, 0)  # Length placeholder
   write32(&mut di.debug_frame, 0xFFFFFFFF)  # CIE ID
   di.debug_frame.push(4)           # Version
   di.debug_frame.push(0)           # Augmentation (empty string)
   emit_uleb128(&mut di.debug_frame, 8)  # Code alignment factor
   emit_sleb128(&mut di.debug_frame, -8) # Data alignment factor
-  emit_uleb128(&mut di.debug_frame, 16) # Return address register (x86-64: RIP)
+  emit_uleb128(&mut di.debug_frame, ra_reg as u64) # Return address register
   
-  # Initial instructions: CFA = RSP + 8
+  # Initial instructions: CFA = SP + 8
   di.debug_frame.push(0x0C)  # DW_CFA_def_cfa
-  emit_uleb128(&mut di.debug_frame, 7)   # RSP
+  emit_uleb128(&mut di.debug_frame, sp_reg as u64)   # SP
   emit_uleb128(&mut di.debug_frame, 8)   # Offset
   
-  di.debug_frame.push(0x90 | 16)  # DW_CFA_offset for RA (register 16)
+  di.debug_frame.push(0x90 | ra_reg as u8)  # DW_CFA_offset for RA
   emit_uleb128(&mut di.debug_frame, 1)   # Offset factor
   
   # Padding
@@ -1638,17 +1661,18 @@ def cv_builtin_type_index(name: &String) -> u32
   end
 end
 
-def cv_emit_struct_type(pdb: &mut PdbInfo, name: String, fields: &Vec[(String, u32)]) -> u32
+def cv_emit_struct_type(pdb: &mut PdbInfo, name: String, fields: &Vec[(String, u32, u32)], struct_size: u32) -> u32
   let type_idx = cv_emit_type_index(pdb)
   
   # First emit the field list
+  # fields: Vec[(name, type_index, offset)]
   mut field_list_data = Vec::new()
   for field in fields do
     # LF_MEMBER (0x150D)
     write16_le(&mut field_list_data, 0x150D)
     write16_le(&mut field_list_data, 0x0003)  # access: public
     write32_le(&mut field_list_data, field.1)  # type index
-    write16_le(&mut field_list_data, 0)       # offset (simplified)
+    write16_le(&mut field_list_data, field.2 as u16)  # actual field offset
     write_cv_string(&mut field_list_data, &field.0)
     # Align to 4 bytes
     while field_list_data.len() % 4 != 0 do
@@ -1669,7 +1693,7 @@ def cv_emit_struct_type(pdb: &mut PdbInfo, name: String, fields: &Vec[(String, u
   write32_le(&mut struct_data, fl_idx)                 # field list
   write32_le(&mut struct_data, 0)                      # derived from
   write32_le(&mut struct_data, 0)                      # vshape
-  write16_le(&mut struct_data, 0)                      # size (simplified)
+  write16_le(&mut struct_data, struct_size as u16)     # actual struct size
   write_cv_string(&mut struct_data, &name)
   
   pdb.type_records.push(CvTypeRecord {

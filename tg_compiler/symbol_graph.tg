@@ -1,0 +1,706 @@
+## Tangerine Compiler — Symbol Graph & Context Widening System (CWS)
+##
+## §8: Context widening — make structure first-class
+## §83-90: CWS formal specification — graphs, slicing, optimization
+## Multi-graph over symbols with call, type, trait, effect, test, file edges.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use tg_compiler::mode::{Mode, Span}
+use tg_compiler::cqs::{SurfaceClass, Symbol, CompletenessScore, Signal}
+
+# ═══════════════════════════════════════════════════════════════
+# §8.1 / §83 — Canonical Project Graphs
+# ═══════════════════════════════════════════════════════════════
+
+enum GraphKind
+  Call       # f→g if f calls g
+  TypeUse    # f→T if f uses type T
+  Trait      # T→Trait, Trait→impl
+  Effect     # f→cap, f→effect
+  Test       # test→f if test covers/targets f
+  File       # f→file
+end
+
+struct GraphNode
+  id: String          # Stable symbol ID
+  kind: NodeKind
+  name: String
+  module_path: String
+  surface_class: SurfaceClass
+  span: Span
+end
+
+enum NodeKind
+  Function
+  Type
+  Trait
+  Module
+  Test
+  File
+end
+
+struct GraphEdge
+  from_id: String
+  to_id: String
+  kind: GraphKind
+  cost: Float          # Weighted distance cost
+end
+
+struct SymbolGraph
+  nodes: Map[String, GraphNode]
+  edges: Vec[GraphEdge]
+  call_edges: Vec[GraphEdge]
+  type_edges: Vec[GraphEdge]
+  trait_edges: Vec[GraphEdge]
+  effect_edges: Vec[GraphEdge]
+  test_edges: Vec[GraphEdge]
+  file_edges: Vec[GraphEdge]
+end
+
+def new_symbol_graph() -> SymbolGraph
+  SymbolGraph {
+    nodes: Map::new(),
+    edges: Vec::new(),
+    call_edges: Vec::new(),
+    type_edges: Vec::new(),
+    trait_edges: Vec::new(),
+    effect_edges: Vec::new(),
+    test_edges: Vec::new(),
+    file_edges: Vec::new()
+  }
+end
+
+def add_node(graph: &mut SymbolGraph, node: GraphNode) -> Unit
+  graph.nodes.insert(node.id, node)
+end
+
+def add_edge(graph: &mut SymbolGraph, edge: GraphEdge) -> Unit
+  match edge.kind
+  when GraphKind::Call then graph.call_edges.push(edge.clone())
+  when GraphKind::TypeUse then graph.type_edges.push(edge.clone())
+  when GraphKind::Trait then graph.trait_edges.push(edge.clone())
+  when GraphKind::Effect then graph.effect_edges.push(edge.clone())
+  when GraphKind::Test then graph.test_edges.push(edge.clone())
+  when GraphKind::File then graph.file_edges.push(edge.clone())
+  end
+  graph.edges.push(edge)
+end
+
+# §108 — Edge Costs (Weighted Distance)
+def edge_cost(kind: GraphKind) -> Float
+  match kind
+  when GraphKind::Call then 1.0
+  when GraphKind::TypeUse then 1.2
+  when GraphKind::Trait then 1.1
+  when GraphKind::Test then 0.9
+  when GraphKind::Effect then 0.8
+  when GraphKind::File then 1.4
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §8.1 — CLI: tg query
+# ═══════════════════════════════════════════════════════════════
+
+# tg query callers <symbol>
+def query_callers(graph: &SymbolGraph, symbol_id: String) -> Vec[String]
+  let callers = Vec::new()
+  for edge in &graph.call_edges
+    if edge.to_id == symbol_id
+      callers.push(edge.from_id)
+    end
+  end
+  callers.sort()
+  callers
+end
+
+# tg query callees <symbol>
+def query_callees(graph: &SymbolGraph, symbol_id: String) -> Vec[String]
+  let callees = Vec::new()
+  for edge in &graph.call_edges
+    if edge.from_id == symbol_id
+      callees.push(edge.to_id)
+    end
+  end
+  callees.sort()
+  callees
+end
+
+# tg query effects <module>
+def query_effects(graph: &SymbolGraph, module_prefix: String) -> Vec[String]
+  let effects = Set::new()
+  for edge in &graph.effect_edges
+    if edge.from_id.starts_with(module_prefix)
+      effects.insert(edge.to_id)
+    end
+  end
+  effects.to_vec().sorted()
+end
+
+# tg query types <symbol>
+def query_types(graph: &SymbolGraph, symbol_id: String) -> Vec[String]
+  let types = Vec::new()
+  for edge in &graph.type_edges
+    if edge.from_id == symbol_id
+      types.push(edge.to_id)
+    end
+  end
+  types.sort()
+  types
+end
+
+# tg query tests <symbol>
+def query_tests(graph: &SymbolGraph, symbol_id: String) -> Vec[String]
+  let tests = Vec::new()
+  for edge in &graph.test_edges
+    if edge.to_id == symbol_id
+      tests.push(edge.from_id)
+    end
+  end
+  tests.sort()
+  tests
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §8.2 — Context Packs (tg ctx <symbol>)
+# ═══════════════════════════════════════════════════════════════
+
+struct ContextPack
+  symbol_id: String
+  signature: String
+  callers: Vec[String]
+  callees: Vec[String]
+  tests: Vec[String]
+  contracts: Vec[String]
+  budgets: Vec[String]
+  security_profile: String
+  recent_errors: Vec[String]
+  ownership: String
+  known_invariants: Vec[String]
+  surface_class: SurfaceClass
+  completeness_score: Option[CompletenessScore]
+  evidence_signals: Vec[Signal]
+  effects: Vec[String]
+  capabilities: Vec[String]
+  coverage_summary: Option[CoverageSummary]
+  suggested_next_steps: Vec[String]
+end
+
+struct CoverageSummary
+  ratio: Float
+  covered_arms: Int
+  total_arms: Int
+end
+
+def build_context_pack(
+  graph: &SymbolGraph,
+  symbol_id: String,
+  score: Option[CompletenessScore],
+  signals: Vec[Signal]
+) -> ContextPack
+  let callers = query_callers(graph, symbol_id)
+  let callees = query_callees(graph, symbol_id)
+  let tests = query_tests(graph, symbol_id)
+  let effects = Vec::new()
+  for edge in &graph.effect_edges
+    if edge.from_id == symbol_id
+      effects.push(edge.to_id)
+    end
+  end
+
+  ContextPack {
+    symbol_id: symbol_id,
+    signature: "",
+    callers: callers,
+    callees: callees,
+    tests: tests,
+    contracts: Vec::new(),
+    budgets: Vec::new(),
+    security_profile: "default",
+    recent_errors: Vec::new(),
+    ownership: "owned",
+    known_invariants: Vec::new(),
+    surface_class: SurfaceClass::InternalGlue,
+    completeness_score: score,
+    evidence_signals: signals,
+    effects: effects,
+    capabilities: Vec::new(),
+    coverage_summary: Option::None,
+    suggested_next_steps: Vec::new()
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §84 — Seed Set Construction
+# ═══════════════════════════════════════════════════════════════
+
+enum SeedSource
+  CompilerDiagnostic(Span)      # Referenced symbol IDs in error spans
+  FailingTest(String)            # Failing test node + symbols on stack
+  CqsGate(String)               # Symbols with gated failures
+  UserPrompt(String)             # Explicitly named functions/modules
+  RecentChange(String)           # Recently changed symbols (VCS)
+end
+
+struct SeedSet
+  seeds: Vec[SeedEntry]
+end
+
+struct SeedEntry
+  symbol_id: String
+  source: SeedSource
+  priority: Int          # Lower = higher priority
+end
+
+def build_seed_set(
+  diagnostics: &Vec[DiagSeed],
+  failing_tests: &Vec[String],
+  gated_symbols: &Vec[String],
+  user_symbols: &Vec[String],
+  max_seeds: Int
+) -> SeedSet
+  let entries = Vec::new()
+
+  # Priority 1: Failing tests
+  for test in failing_tests
+    entries.push(SeedEntry {
+      symbol_id: test,
+      source: SeedSource::FailingTest(test),
+      priority: 1
+    })
+  end
+
+  # Priority 2: Compiler errors
+  for diag in diagnostics
+    entries.push(SeedEntry {
+      symbol_id: diag.symbol_id,
+      source: SeedSource::CompilerDiagnostic(diag.span),
+      priority: 2
+    })
+  end
+
+  # Priority 3: CQS gated failures
+  for sym in gated_symbols
+    entries.push(SeedEntry {
+      symbol_id: sym,
+      source: SeedSource::CqsGate(sym),
+      priority: 3
+    })
+  end
+
+  # Priority 4: User-mentioned symbols
+  for sym in user_symbols
+    entries.push(SeedEntry {
+      symbol_id: sym,
+      source: SeedSource::UserPrompt(sym),
+      priority: 4
+    })
+  end
+
+  # Sort by priority, then stable-sort by symbol_id
+  entries.sort_by(|a, b|
+    if a.priority != b.priority then a.priority < b.priority
+    else a.symbol_id < b.symbol_id
+    end
+  )
+
+  # Downsample to max_seeds
+  if entries.len() > max_seeds
+    entries.truncate(max_seeds)
+  end
+
+  SeedSet { seeds: entries }
+end
+
+struct DiagSeed
+  symbol_id: String
+  span: Span
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §85 — Program Slicing (Guaranteed Relevance)
+# ═══════════════════════════════════════════════════════════════
+
+# System Dependence Graph (SDG): nodes = statements/defs; 
+# edges = data + control dependence
+struct SDG
+  nodes: Vec[SDGNode]
+  data_edges: Vec[SDGEdge]
+  control_edges: Vec[SDGEdge]
+end
+
+struct SDGNode
+  id: Int
+  symbol_id: String
+  kind: String      # "stmt", "def", "use"
+  span: Span
+end
+
+struct SDGEdge
+  from_id: Int
+  to_id: Int
+  kind: String      # "data", "control"
+end
+
+# Backward slice B(s): everything that can affect s's observable behavior
+def backward_slice(sdg: &SDG, seed_nodes: &Vec[Int]) -> Set[Int]
+  let visited = Set::new()
+  let stack = Vec::new()
+  for n in seed_nodes
+    stack.push(n)
+  end
+
+  while !stack.is_empty() do
+    let node = stack.pop()
+    if !visited.contains(node)
+      visited.insert(node)
+      # Follow reverse edges (data + control)
+      for edge in &sdg.data_edges
+        if edge.to_id == node && !visited.contains(edge.from_id)
+          stack.push(edge.from_id)
+        end
+      end
+      for edge in &sdg.control_edges
+        if edge.to_id == node && !visited.contains(edge.from_id)
+          stack.push(edge.from_id)
+        end
+      end
+    end
+  end
+
+  visited
+end
+
+# Forward slice F(s): everything s can affect
+def forward_slice(sdg: &SDG, seed_nodes: &Vec[Int]) -> Set[Int]
+  let visited = Set::new()
+  let stack = Vec::new()
+  for n in seed_nodes
+    stack.push(n)
+  end
+
+  while !stack.is_empty() do
+    let node = stack.pop()
+    if !visited.contains(node)
+      visited.insert(node)
+      # Follow forward edges (data + control)
+      for edge in &sdg.data_edges
+        if edge.from_id == node && !visited.contains(edge.to_id)
+          stack.push(edge.to_id)
+        end
+      end
+      for edge in &sdg.control_edges
+        if edge.from_id == node && !visited.contains(edge.to_id)
+          stack.push(edge.to_id)
+        end
+      end
+    end
+  end
+
+  visited
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §86 — Context Selection as Optimization Problem
+# ═══════════════════════════════════════════════════════════════
+
+# §86.1 — Candidate Items
+struct CandidateItem
+  item_id: String
+  tier: Tier        # S, M, L
+  kind: ItemKind
+  cost_cu: Int      # Cost in CU (1 CU = 4 bytes)
+  covers: Vec[String]  # Need IDs covered by this item
+  payload: String
+end
+
+enum Tier
+  S   # Symbol summary (cheap, wide)
+  M   # Definition span (medium)
+  L   # Slice span (expensive, selective)
+end
+
+enum ItemKind
+  SymbolSummary
+  DefinitionSpan
+  SliceSpan
+  TestSummary
+  TestSpan
+  TraitResolutionBundle
+  CapabilityBoundaryBundle
+  TaintFlowBundle
+end
+
+# §86.2 — Needs Universe
+struct Need
+  id: String
+  weight: Float
+  category: String
+end
+
+# §86.3 — Utility Function (submodular, provable greedy)
+# F(S) = Σ_u w_u · 1[∃ item in S covering u]
+# F is monotone submodular
+def compute_utility(selected: &Vec[CandidateItem], needs: &Vec[Need]) -> Float
+  let covered = Set::new()
+  for item in selected
+    for need_id in &item.covers
+      covered.insert(need_id)
+    end
+  end
+  let utility = 0.0
+  for need in needs
+    if covered.contains(need.id)
+      utility = utility + need.weight
+    end
+  end
+  utility
+end
+
+# §86.4 — Budgeted Selection (greedy submodular maximization)
+# Guarantee: greedy achieves ≥ (1 − 1/e) of optimum
+# Optimized: track covered needs incrementally instead of recomputing utility O(n·m) per step
+def greedy_select(
+  candidates: &Vec[CandidateItem],
+  needs: &Vec[Need],
+  budget_cu: Int
+) -> SelectionResult
+  let selected = Vec::new()
+  let remaining_budget = budget_cu
+  let used_items = Set::new()
+  let trace = Vec::new()
+
+  # Build need weight lookup for fast marginal gain computation
+  let need_weights: Map[String, Float] = Map::new()
+  for need in needs do
+    need_weights.insert(need.id.clone(), need.weight)
+  end
+
+  # Track which needs are already covered (incrementally updated)
+  let covered_needs: Set[String] = Set::new()
+  mut current_utility: Float = 0.0
+
+  while remaining_budget > 0 do
+    let best_idx = -1
+    let best_ratio = 0.0
+    let best_delta = 0.0
+
+    for i in 0..candidates.len() do
+      if used_items.contains(i) then continue end
+      let item = &candidates[i]
+      if item.cost_cu > remaining_budget then continue end
+
+      # Compute marginal gain incrementally: only new uncovered needs matter
+      mut delta: Float = 0.0
+      for need_id in &item.covers do
+        if !covered_needs.contains(need_id) then
+          delta = delta + need_weights.get(need_id).unwrap_or(0.0)
+        end
+      end
+
+      let ratio = delta / to_float(max_int(item.cost_cu, 1))
+
+      if ratio > best_ratio then
+        best_ratio = ratio
+        best_delta = delta
+        best_idx = i
+      end
+    end
+
+    if best_idx < 0 then
+      break
+    end
+
+    let item = &candidates[best_idx]
+    trace.push(GreedyStep {
+      step: selected.len(),
+      item_id: item.item_id.clone(),
+      cost_cu: item.cost_cu,
+      delta_f: best_delta,
+      delta_per_cu: best_ratio,
+      budget_remaining: remaining_budget - item.cost_cu
+    })
+
+    # Update covered needs incrementally
+    for need_id in &item.covers do
+      covered_needs.insert(need_id.clone())
+    end
+    current_utility = current_utility + best_delta
+
+    selected.push(item.clone())
+    used_items.insert(best_idx)
+    remaining_budget = remaining_budget - item.cost_cu
+  end
+
+  let f_selected = current_utility
+  # Upper bound: sum of all weights
+  mut f_upper: Float = 0.0
+  for need in needs do
+    f_upper = f_upper + need.weight
+  end
+
+  SelectionResult {
+    selected: selected,
+    objective_value: f_selected,
+    upper_bound: f_upper,
+    greedy_trace: trace,
+    budget_used: budget_cu - remaining_budget
+  }
+end
+
+struct SelectionResult
+  selected: Vec[CandidateItem]
+  objective_value: Float
+  upper_bound: Float
+  greedy_trace: Vec[GreedyStep]
+  budget_used: Int
+end
+
+struct GreedyStep
+  step: Int
+  item_id: String
+  cost_cu: Int
+  delta_f: Float
+  delta_per_cu: Float
+  budget_remaining: Int
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §87 — Graph-Distance Weighting
+# ═══════════════════════════════════════════════════════════════
+
+# Distance d(v, Seeds) in unified symbol graph
+# Relevance weight: rel(v) = e^{−α · d(v, Seeds)}
+
+def compute_distances(
+  graph: &SymbolGraph,
+  seeds: &Vec[String],
+  radius_caps: &Map[GraphKind, Float]
+) -> Map[String, Float]
+  let distances = Map::new()
+  # Multi-source BFS with weighted edges — use VecDeque for O(1) dequeue
+  use std::collections::VecDeque
+  mut queue = VecDeque::new()  # (node_id, distance)
+  for seed in seeds do
+    queue.push_back((seed, 0.0))
+    distances.insert(seed, 0.0)
+  end
+
+  while !queue.is_empty() do
+    let (node, dist) = queue.pop_front().unwrap()
+    for edge in &graph.edges
+      if edge.from_id == node
+        let new_dist = dist + edge.cost
+        let cap = radius_caps.get(edge.kind).unwrap_or(3.0)
+        if new_dist <= cap
+          let existing = distances.get(edge.to_id).unwrap_or(999999.0)
+          if new_dist < existing
+            distances.insert(edge.to_id, new_dist)
+            queue.push_back((edge.to_id, new_dist))
+          end
+        end
+      end
+    end
+  end
+
+  distances
+end
+
+def relevance_weight(distance: Float, alpha: Float) -> Float
+  exp(-alpha * distance)
+end
+
+def exp(x: Float) -> Float
+  __intrinsic_exp(x)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §88 — Two-Layer Context Pack
+# ═══════════════════════════════════════════════════════════════
+
+# Layer 1: Symbol Summaries (cheap, wide)
+struct SymbolSummary
+  symbol_id: String
+  signature: String
+  effects: Vec[String]
+  capabilities: Vec[String]
+  contracts: Vec[String]
+  error_types: Vec[String]
+  callers: Vec[String]
+  callees: Vec[String]
+  tests: Vec[String]
+end
+
+# Layer 2: Code Spans (expensive, selective)
+struct CodeSpan
+  span_ref: String
+  file: String
+  start: Int
+  end_pos: Int      # `end` is a keyword
+  hash: String
+  language: String
+  text: String
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §89 — Scaling & Incremental Maintenance
+# ═══════════════════════════════════════════════════════════════
+
+# tg index must be incremental.
+# Persistent symbol graph store.
+# Per-file hashes; update only affected nodes/edges.
+# Slices: computed only for seed regions.
+# Distances: approximate via multi-source BFS truncated at radius R.
+
+struct IncrementalIndex
+  file_hashes: Map[String, String]   # file → hash
+  graph_store_path: String           # Persistent path
+  last_build_id: String
+end
+
+def needs_reindex(index: &IncrementalIndex, file: String, current_hash: String) -> Bool
+  match index.file_hashes.get(file)
+  when Option::Some(old_hash) then old_hash != current_hash
+  when Option::None then true
+  end
+end
+
+def update_file_hash(index: &mut IncrementalIndex, file: String, hash: String) -> Unit
+  index.file_hashes.insert(file, hash)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §90 — CWS Output Formats
+# ═══════════════════════════════════════════════════════════════
+
+# tg ctxpack outputs:
+#   ctxpack.json — graph + summaries + selected spans
+#   ctxpack.spans/ — exact file excerpts
+#   ctxpack.proofs/ — why each item included, slice membership, graph distance
+
+struct CtxpackOutput
+  json_path: String      # ctxpack.json
+  spans_dir: String      # ctxpack.spans/
+  proofs_dir: String     # ctxpack.proofs/
+end
+
+def default_output_paths() -> CtxpackOutput
+  CtxpackOutput {
+    json_path: "ctxpack.json",
+    spans_dir: "ctxpack.spans/",
+    proofs_dir: "ctxpack.proofs/"
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Utility
+# ═══════════════════════════════════════════════════════════════
+
+def to_float(i: Int) -> Float
+  __intrinsic_int_to_float(i)
+end
+
+def max_int(a: Int, b: Int) -> Int
+  if a > b then a else b end
+end

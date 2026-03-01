@@ -263,6 +263,67 @@ unsafe
 end
 ```
 
+### Attributes
+
+Prefer the `@attr` form over `#[attr]`. Both are accepted, but `@` is canonical.
+
+```tangerine
+# Good
+@derive(Clone, Debug)
+@export("my_func")
+@repr(C)
+struct Point
+  x: f64
+  y: f64
+end
+
+# Avoid — use @ instead
+#[derive(Clone, Debug)]
+struct Point2
+  x: f64
+  y: f64
+end
+```
+
+Place attributes above the item they annotate, one per line:
+
+```tangerine
+@stable(since = "0.1.0")
+@inline
+pub def fast_path(x: Int) -> Int
+  x + 1
+end
+```
+
+### Guard Statements
+
+Place `guard` checks at the top of a function body:
+
+```tangerine
+def process(input: Option[String], count: Int) -> Result[Output, Error]
+  guard let value = input else return Result::Err("missing input")
+  guard count > 0 else return Result::Err("count must be positive")
+
+  # Main logic after all guards
+  do_work(value, count)
+end
+```
+
+### Taint Validation
+
+Validate tainted values immediately on receipt. Do not hold tainted values
+longer than necessary:
+
+```tangerine
+# Good: validate immediately
+def handle_request(raw: Tainted[String]) -> Result[Response, Error]
+  let clean = validate(raw, MaxLengthValidator { max_len: 4096 })?
+  process(clean)
+end
+
+# Avoid: passing Tainted down the call chain
+```
+
 ## Anti-Patterns
 
 ### Avoid
@@ -344,10 +405,10 @@ app.middleware(middleware::logger)
 app.middleware(middleware::cors)
 
 # Route handlers return HttpResponse
-app.get("/users/:id", |ctx: &mut Context| {
+app.get("/users/:id", |ctx: &mut Context| do
   let id = ctx.param("id").unwrap_or("0")
   ctx.json_response(&get_user(id)?)
-})
+end)
 ```
 
 ### Cryptography

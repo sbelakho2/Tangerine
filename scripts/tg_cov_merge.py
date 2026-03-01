@@ -2,6 +2,7 @@
 import argparse
 import glob
 import json
+import sys
 from pathlib import Path
 
 HEADER_KEYS = [
@@ -15,6 +16,8 @@ HEADER_KEYS = [
     "build_id",
 ]
 
+REQUIRED_RECORD_FIELDS = ["symbol_id", "arm_id", "hits"]
+
 
 def read_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -23,6 +26,8 @@ def read_jsonl(path: Path):
         raise ValueError(f"empty coverage file: {path}")
     header = json.loads(lines[0])
     records = [json.loads(line) for line in lines[1:]]
+    if not records:
+        print(f"WARNING: {path} contains only a header and no coverage records", file=sys.stderr)
     return header, records
 
 
@@ -32,6 +37,34 @@ def validate_header(base, other, path):
             raise ValueError(
                 f"header mismatch in {path}: key={key} expected={base.get(key)!r} got={other.get(key)!r}"
             )
+
+
+def validate_record(record, path, line_num):
+    """Validate that a coverage record has all required fields with correct types."""
+    for field in REQUIRED_RECORD_FIELDS:
+        if field not in record:
+            raise ValueError(
+                f"malformed record in {path} line {line_num}: missing required field '{field}'. "
+                f"Record: {json.dumps(record)}"
+            )
+    # Validate types
+    if not isinstance(record["symbol_id"], str):
+        raise ValueError(
+            f"malformed record in {path} line {line_num}: 'symbol_id' must be a string, "
+            f"got {type(record['symbol_id']).__name__}"
+        )
+    if not isinstance(record["arm_id"], str):
+        raise ValueError(
+            f"malformed record in {path} line {line_num}: 'arm_id' must be a string, "
+            f"got {type(record['arm_id']).__name__}"
+        )
+    try:
+        int(record["hits"])
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"malformed record in {path} line {line_num}: 'hits' must be an integer, "
+            f"got {record['hits']!r}"
+        )
 
 
 def main():
@@ -54,13 +87,15 @@ def main():
         else:
             merged[key]["hits"] = int(merged[key].get("hits", 0)) + int(record.get("hits", 0))
 
-    for rec in base_records:
+    for i, rec in enumerate(base_records):
+        validate_record(rec, files[0], i + 2)
         add_record(rec)
 
     for path in files[1:]:
         header, records = read_jsonl(path)
         validate_header(base_header, header, path)
-        for rec in records:
+        for i, rec in enumerate(records):
+            validate_record(rec, path, i + 2)
             add_record(rec)
 
     out_header = dict(base_header)

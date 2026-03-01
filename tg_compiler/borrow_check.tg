@@ -1164,12 +1164,13 @@ enum CFGNodeKind
   Start
   End
   Statement(Int)
-  Branch
+  Branch(Expr)      # Branch with condition expression
   Join
 end
 
 struct CFG
   nodes: Vec[CFGNode]
+  statements: Vec[Stmt]   # All statements in the function
   entry: Int
   exit: Int
 end
@@ -1188,7 +1189,7 @@ def cfg_new() -> CFG
     successors: Vec::new(),
     predecessors: Vec::new()
   })
-  CFG { nodes: nodes, entry: 0, exit: 1 }
+  CFG { nodes: nodes, statements: Vec::new(), entry: 0, exit: 1 }
 end
 
 # Liveness analysis for NLL
@@ -1232,7 +1233,7 @@ def compute_liveness(cfg: &CFG) -> Map[Int, LivenessInfo]
       end
       
       # live_in = uses(node) ∪ (live_out - defs(node))
-      let (uses, defs) = node_uses_defs(node)
+      let (uses, defs) = node_uses_defs(cfg, node)
       mut new_live_in = Set::new()
       # Start with live_out minus defs
       for v in new_live_out do
@@ -1261,18 +1262,252 @@ def compute_liveness(cfg: &CFG) -> Map[Int, LivenessInfo]
 end
 
 # Extract uses and defs from a CFG node
-def node_uses_defs(node: &CFGNode) -> (Set[String], Set[String])
+def node_uses_defs(cfg: &CFG, node: &CFGNode) -> (Set[String], Set[String])
   mut uses = Set::new()
   mut defs = Set::new()
+  
   match node.kind
   when CFGNodeKind::Statement(stmt_idx) then
-    # In a full implementation, we'd index into the actual statements.
-    # Here we track that statement nodes define their LHS and use their RHS.
-    # The stmt_idx encodes which statement in the block.
+    # Look up the actual statement and extract variables
+    if stmt_idx >= 0 && stmt_idx < cfg.statements.len() as Int then
+      let stmt = &cfg.statements[stmt_idx as UInt]
+      extract_stmt_uses_defs(stmt, &mut uses, &mut defs)
+    end
+  when CFGNodeKind::Branch(cond) then
+    # Branch condition is a use (no defs)
+    extract_expr_uses(&cond, &mut uses)
+  when CFGNodeKind::Start then ()
+  when CFGNodeKind::End then ()
+  when CFGNodeKind::Join then ()
+  end
+  
+  (uses, defs)
+end
+
+# Extract uses and defs from a statement
+def extract_stmt_uses_defs(stmt: &Stmt, uses: &mut Set[String], defs: &mut Set[String]) -> Unit
+  match stmt.kind
+  when StmtKind::Let(name, ty_opt, value, is_mut) then
+    # Let bindings define a new variable
+    defs.insert(name.clone())
+    # The initializer expression contains uses
+    extract_expr_uses(&value, uses)
+    
+  when StmtKind::Assign(target, value) then
+    # Assignment: target is def, value contains uses
+    extract_assign_target_def(&target, defs)
+    extract_expr_uses(&value, uses)
+    
+  when StmtKind::Expr(expr) then
+    # Expression statement: all variables are uses
+    extract_expr_uses(&expr, uses)
+    
+  when StmtKind::Return(val_opt) then
+    match val_opt
+    when Option::Some(val) then
+      extract_expr_uses(&val, uses)
+    when Option::None then ()
+    end
+    
+  when StmtKind::If(if_stmt) then
+    # Condition is used
+    extract_expr_uses(&if_stmt.cond, uses)
+    # Blocks will be handled as separate CFG nodes
+    
+  when StmtKind::While(cond, body) then
+    extract_expr_uses(&cond, uses)
+    
+  when StmtKind::For(var, iter, body) then
+    # Iterator expression is used
+    extract_expr_uses(&iter, uses)
+    # Loop variable is defined (in each iteration)
+    defs.insert(var.clone())
+    
+  when StmtKind::Match(m) then
+    extract_expr_uses(&m.scrutinee, uses)
+    
+  when _ then ()
+  end
+end
+
+# Extract def from assignment target
+def extract_assign_target_def(target: &Expr, defs: &mut Set[String]) -> Unit
+  match target.kind
+  when ExprKind::Ident(name) then
+    defs.insert(name.clone())
+  when ExprKind::FieldAccess(recv, field) then
+    # Field assignment: the base is both used and modified
+    # We track the root variable as modified
+    extract_root_var(&recv, defs)
+  when ExprKind::Index(recv, index) then
+    # Index assignment: base is modified, index is used
+    extract_root_var(&recv, defs)
+  when ExprKind::Deref(inner) then
+    # Deref assignment: we're writing through a pointer
+    # The pointer itself is not modified, just used
     ()
   when _ then ()
   end
-  (uses, defs)
+end
+
+# Extract root variable from an lvalue expression
+def extract_root_var(expr: &Expr, vars: &mut Set[String]) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    vars.insert(name.clone())
+  when ExprKind::FieldAccess(recv, _) then
+    extract_root_var(&recv, vars)
+  when ExprKind::Index(recv, _) then
+    extract_root_var(&recv, vars)
+  when ExprKind::Deref(inner) then
+    extract_root_var(&inner, vars)
+  when _ then ()
+  end
+end
+
+# Extract all variable uses from an expression
+def extract_expr_uses(expr: &Expr, uses: &mut Set[String]) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    uses.insert(name.clone())
+    
+  when ExprKind::BinaryOp(op, left, right) then
+    extract_expr_uses(&left, uses)
+    extract_expr_uses(&right, uses)
+    
+  when ExprKind::UnaryOp(op, inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Call(func, args) then
+    extract_expr_uses(&func, uses)
+    for a in args do
+      extract_expr_uses(&a, uses)
+    end
+    
+  when ExprKind::MethodCall(recv, method, type_args, args) then
+    extract_expr_uses(&recv, uses)
+    for a in args do
+      extract_expr_uses(&a, uses)
+    end
+    
+  when ExprKind::FieldAccess(recv, field) then
+    extract_expr_uses(&recv, uses)
+    
+  when ExprKind::Index(recv, index) then
+    extract_expr_uses(&recv, uses)
+    extract_expr_uses(&index, uses)
+    
+  when ExprKind::Ref(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::RefMut(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Deref(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Move(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Copy(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::ArrayLit(elems) then
+    for e in elems do
+      extract_expr_uses(&e, uses)
+    end
+    
+  when ExprKind::TupleLit(elems) then
+    for e in elems do
+      extract_expr_uses(&e, uses)
+    end
+    
+  when ExprKind::StructLit(path, fields) then
+    for (name, val) in fields do
+      extract_expr_uses(&val, uses)
+    end
+    
+  when ExprKind::If(if_stmt) then
+    extract_expr_uses(&if_stmt.cond, uses)
+    # Block contents handled separately
+    
+  when ExprKind::Match(m) then
+    extract_expr_uses(&m.scrutinee, uses)
+    
+  when ExprKind::Closure(params, ret_ty, body) then
+    # Closures capture variables - extract free variables
+    mut param_names = Set::new()
+    for p in params do
+      param_names.insert(p.name.clone())
+    end
+    extract_closure_captures(&body, &param_names, uses)
+    
+  when ExprKind::Await(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Try(inner) then
+    extract_expr_uses(&inner, uses)
+    
+  when ExprKind::Pipe(left, right) then
+    extract_expr_uses(&left, uses)
+    extract_expr_uses(&right, uses)
+    
+  when ExprKind::IntLit(_) then ()
+  when ExprKind::FloatLit(_) then ()
+  when ExprKind::StringLit(_) then ()
+  when ExprKind::CharLit(_) then ()
+  when ExprKind::BoolLit(_) then ()
+  when ExprKind::Unit then ()
+  when _ then ()
+  end
+end
+
+# Extract captured variables from closure body
+def extract_closure_captures(body: &Expr, bound: &Set[String], captures: &mut Set[String]) -> Unit
+  match body.kind
+  when ExprKind::Ident(name) then
+    if !bound.contains(&name) then
+      captures.insert(name.clone())
+    end
+    
+  when ExprKind::BinaryOp(_, left, right) then
+    extract_closure_captures(&left, bound, captures)
+    extract_closure_captures(&right, bound, captures)
+    
+  when ExprKind::UnaryOp(_, inner) then
+    extract_closure_captures(&inner, bound, captures)
+    
+  when ExprKind::Call(func, args) then
+    extract_closure_captures(&func, bound, captures)
+    for a in args do
+      extract_closure_captures(&a, bound, captures)
+    end
+    
+  when ExprKind::MethodCall(recv, _, _, args) then
+    extract_closure_captures(&recv, bound, captures)
+    for a in args do
+      extract_closure_captures(&a, bound, captures)
+    end
+    
+  when ExprKind::Block(block) then
+    mut new_bound = bound.clone()
+    for stmt in block.stmts do
+      match stmt.kind
+      when StmtKind::Let(name, _, init, _) then
+        match init
+        when Option::Some(e) then
+          extract_closure_captures(&e, &new_bound, captures)
+        when Option::None then ()
+        end
+        new_bound.insert(name.clone())
+      when StmtKind::Expr(e) then
+        extract_closure_captures(&e, &new_bound, captures)
+      when _ then ()
+      end
+    end
+    
+  when _ then ()
+  end
 end
 
 # ———————————————————————————————————————————————————————————————

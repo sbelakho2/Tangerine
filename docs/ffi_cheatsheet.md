@@ -192,10 +192,37 @@ extern "Tangerine" → _TG{edition}_{pkgHash}_{modLen}:{mod}_{nameLen}:{name}_{s
 | 200-299 | Parse errors |
 | 300-399 | Type errors |
 
+## Taint Integration
+
+All data crossing FFI boundaries is auto-wrapped in `Tainted[T]`.
+
+```tangerine
+# Return values from extern "C" are Tainted
+extern "C" def read_user_data() -> Tainted[String]
+
+# Must validate before use
+let raw = read_user_data()
+let clean = validate(raw, MaxLengthValidator { max_len: 255 })?
+
+# Callback arguments from foreign code are also Tainted
+@export("on_event")
+extern "C" def on_event(data: Tainted[FfiStr]) -> i32
+```
+
+| Mode | Auto-Taint |
+|------|-----------|
+| Dev | Off (configurable) |
+| Strict | On |
+| Production | On (mandatory) |
+| Hardened | On (mandatory) |
+
+**Key types:** `FfiBoundary` trait, `__ffi_auto_taint()`, `__ffi_callback_taint()`
+
 ## See Also
 
 - [Full Interop Guide](interop.md)
 - [Language Reference](language.md)
+- [Taint Tracking](stdlib_reference.md#taint-tracking)
 
 ---
 
@@ -229,7 +256,9 @@ extern "C" {
 }
 
 # Usage wrapper
-struct Sqlite { handle: *mut SqliteDb }
+struct Sqlite
+  handle: *mut SqliteDb
+end
 
 impl Sqlite
   def open(path: &str) -> Result[Sqlite, DbError]
@@ -283,22 +312,22 @@ extern "C" {
 }
 
 @repr(C)
-struct ZStream {
-  next_in: *const u8,
-  avail_in: u32,
-  total_in: u64,
-  next_out: *mut u8,
-  avail_out: u32,
-  total_out: u64,
-  msg: *const u8,
-  state: *mut Unit,
-  zalloc: *const Unit,
-  zfree: *const Unit,
-  opaque: *const Unit,
-  data_type: i32,
-  adler: u64,
-  reserved: u64,
-}
+struct ZStream
+  next_in: *const u8
+  avail_in: u32
+  total_in: u64
+  next_out: *mut u8
+  avail_out: u32
+  total_out: u64
+  msg: *const u8
+  state: *mut Unit
+  zalloc: *const Unit
+  zfree: *const Unit
+  opaque: *const Unit
+  data_type: i32
+  adler: u64
+  reserved: u64
+end
 ```
 
 ### OpenSSL Crypto (from `std/crypto`)
@@ -366,13 +395,13 @@ extern "C" {
 }
 
 @repr(C)
-struct Termios {
-  c_iflag: u64,
-  c_oflag: u64,
-  c_cflag: u64,
-  c_lflag: u64,
-  c_cc: [u8; 20],
-  c_ispeed: u64,
-  c_ospeed: u64,
-}
+struct Termios
+  c_iflag: u64
+  c_oflag: u64
+  c_cflag: u64
+  c_lflag: u64
+  c_cc: [u8; 20]
+  c_ispeed: u64
+  c_ospeed: u64
+end
 ```
