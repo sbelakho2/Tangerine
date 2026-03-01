@@ -1,0 +1,1185 @@
+# Tangerine Compiler — AST-Based Code Formatter
+#
+# Provides configurable, canonical formatting for Tangerine source code.
+# Uses the AST for structure-aware formatting rather than simple text manipulation.
+#
+# Supports:
+# - Configurable indentation (spaces/tabs, width)
+# - Maximum line width with intelligent wrapping
+# - Consistent spacing around operators
+# - Blank line normalization between items
+# - Trailing comma policy
+# - Alignment options
+# - stdin/stdout mode for piping
+# - Check mode (no writes, just report)
+
+use std::core::{Option, Result, Vec, String, Bool, UInt}
+use std::collections::{Map}
+use std::fs::{read_file, write_file}
+use std::io::{print, println, eprintln}
+
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse}
+use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
+                        Function, Param, TypeExpr, Pattern, MatchArm}
+use tg_compiler::token::{Token, TokenKind, Span}
+
+# ———————————————————————————————————————————————————————————————
+# Configuration
+# ———————————————————————————————————————————————————————————————
+
+struct FormatConfig
+  indent_width: UInt          # Spaces per indent level (default: 2)
+  use_tabs: Bool              # Use tabs instead of spaces
+  max_line_width: UInt        # Maximum line width (default: 100)
+  trailing_comma: TrailingComma  # Trailing comma policy
+  blank_lines_between_items: UInt  # Blank lines between top-level items
+  blank_lines_between_methods: UInt  # Blank lines between methods in impl/trait
+  spaces_around_binary_ops: Bool  # Spaces around binary operators
+  spaces_after_comma: Bool    # Space after commas
+  space_before_colon: Bool    # Space before colon in type annotations
+  space_after_colon: Bool     # Space after colon in type annotations
+  align_struct_fields: Bool   # Align struct field types
+  align_match_arms: Bool      # Align match arm bodies
+  newline_before_end: Bool    # Newline before `end` keyword
+  remove_trailing_whitespace: Bool  # Strip trailing whitespace
+  ensure_final_newline: Bool  # Ensure file ends with newline
+  sort_imports: Bool          # Sort `use` declarations
+  group_imports: Bool         # Group imports by module
+end
+
+enum TrailingComma
+  Always    # Always add trailing comma
+  Never     # Never add trailing comma
+  Multi     # Add trailing comma only for multi-line constructs
+end
+
+def default_format_config() -> FormatConfig
+  FormatConfig {
+    indent_width: 2,
+    use_tabs: false,
+    max_line_width: 100,
+    trailing_comma: TrailingComma::Multi,
+    blank_lines_between_items: 1,
+    blank_lines_between_methods: 1,
+    spaces_around_binary_ops: true,
+    spaces_after_comma: true,
+    space_before_colon: false,
+    space_after_colon: true,
+    align_struct_fields: false,
+    align_match_arms: false,
+    newline_before_end: true,
+    remove_trailing_whitespace: true,
+    ensure_final_newline: true,
+    sort_imports: true,
+    group_imports: true
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Formatter State
+# ———————————————————————————————————————————————————————————————
+
+struct Formatter
+  config: FormatConfig
+  output: String
+  indent_level: UInt
+  current_line_width: UInt
+  last_was_newline: Bool
+  blank_line_count: UInt
+end
+
+def formatter_new(config: FormatConfig) -> Formatter
+  Formatter {
+    config: config,
+    output: "".to_string(),
+    indent_level: 0,
+    current_line_width: 0,
+    last_was_newline: true,
+    blank_line_count: 0
+  }
+end
+
+impl Formatter
+  def emit(&mut self, s: &str) -> Unit
+    if self.last_was_newline && !s.is_empty() then
+      self.emit_indent()
+      self.last_was_newline = false
+      self.blank_line_count = 0
+    end
+    self.output = self.output + s
+    self.current_line_width = self.current_line_width + s.len()
+  end
+  
+  def emit_newline(&mut self) -> Unit
+    if self.config.remove_trailing_whitespace then
+      self.output = self.output.trim_end()
+    end
+    self.output = self.output + "\n"
+    self.current_line_width = 0
+    self.last_was_newline = true
+    self.blank_line_count = self.blank_line_count + 1
+  end
+  
+  def emit_blank_line(&mut self, max: UInt) -> Unit
+    if self.blank_line_count < max then
+      self.emit_newline()
+    end
+  end
+  
+  def emit_indent(&mut self) -> Unit
+    let indent = make_indent(&self.config, self.indent_level)
+    self.output = self.output + indent
+    self.current_line_width = indent.len()
+  end
+  
+  def indent(&mut self) -> Unit
+    self.indent_level = self.indent_level + 1
+  end
+  
+  def dedent(&mut self) -> Unit
+    if self.indent_level > 0 then
+      self.indent_level = self.indent_level - 1
+    end
+  end
+  
+  def space(&mut self) -> Unit
+    self.emit(" ")
+  end
+  
+  def remaining_width(&self) -> UInt
+    if self.current_line_width >= self.config.max_line_width then
+      0
+    else
+      self.config.max_line_width - self.current_line_width
+    end
+  end
+  
+  def would_overflow(&self, text: &str) -> Bool
+    self.current_line_width + text.len() > self.config.max_line_width
+  end
+end
+
+def make_indent(config: &FormatConfig, level: UInt) -> String
+  mut s = ""
+  let unit = if config.use_tabs then "\t" else
+    mut spaces = ""
+    mut i: UInt = 0
+    while i < config.indent_width do
+      spaces = spaces + " "
+      i = i + 1
+    end
+    spaces
+  end
+  
+  mut i: UInt = 0
+  while i < level do
+    s = s + unit
+    i = i + 1
+  end
+  s
+end
+
+# ———————————————————————————————————————————————————————————————
+# AST Formatting
+# ———————————————————————————————————————————————————————————————
+
+def format_program(f: &mut Formatter, program: &Program) -> Unit
+  # Sort and emit imports first
+  if f.config.sort_imports then
+    let (imports, other_items) = partition_imports(&program.items)
+    let sorted_imports = sort_import_items(imports, f.config.group_imports)
+    
+    for imp in sorted_imports do
+      format_item(f, imp)
+      f.emit_newline()
+    end
+    
+    if !sorted_imports.is_empty() && !other_items.is_empty() then
+      f.emit_blank_line(1)
+    end
+    
+    mut first = true
+    for item in other_items do
+      if !first then
+        f.emit_blank_line(f.config.blank_lines_between_items)
+      end
+      format_item(f, item)
+      f.emit_newline()
+      first = false
+    end
+  else
+    mut first = true
+    for item in program.items do
+      if !first then
+        f.emit_blank_line(f.config.blank_lines_between_items)
+      end
+      format_item(f, item)
+      f.emit_newline()
+      first = false
+    end
+  end
+  
+  if f.config.ensure_final_newline then
+    if !f.output.ends_with("\n") then
+      f.emit_newline()
+    end
+  end
+end
+
+def format_item(f: &mut Formatter, item: &Item) -> Unit
+  # Emit doc comments
+  match item.doc_comment
+  when Option::Some(doc) then
+    for line in doc.lines() do
+      f.emit("# ")
+      f.emit(line.trim())
+      f.emit_newline()
+    end
+  when Option::None then ()
+  end
+  
+  # Emit attributes
+  for attr in item.attributes do
+    f.emit("#[")
+    f.emit(attr.name.as_str())
+    match attr.value
+    when Option::Some(val) then
+      f.emit("(")
+      f.emit(val.as_str())
+      f.emit(")")
+    when Option::None then ()
+    end
+    f.emit("]")
+    f.emit_newline()
+  end
+  
+  match item.kind
+  when ItemKind::Use(u) then format_use(f, u)
+  when ItemKind::Function(func) then format_function(f, func, false)
+  when ItemKind::Struct(s) then format_struct(f, s)
+  when ItemKind::Enum(e) then format_enum(f, e)
+  when ItemKind::Trait(t) then format_trait(f, t)
+  when ItemKind::Impl(imp) then format_impl(f, imp)
+  when ItemKind::Const(c) then format_const(f, c)
+  when ItemKind::Module(m) then format_module(f, m)
+  when ItemKind::Extern(ext) then format_extern(f, ext)
+  when ItemKind::Type(ta) then format_type_alias(f, ta)
+  end
+end
+
+def format_use(f: &mut Formatter, u: &UseDecl) -> Unit
+  f.emit("use ")
+  f.emit(u.path.as_str())
+  
+  if !u.items.is_empty() then
+    f.emit("::{")
+    mut first = true
+    for item in u.items do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(item.as_str())
+      first = false
+    end
+    f.emit("}")
+  end
+end
+
+def format_function(f: &mut Formatter, func: &Function, is_method: Bool) -> Unit
+  if func.is_pub then f.emit("pub ") end
+  f.emit("def ")
+  f.emit(func.name.as_str())
+  
+  # Type parameters
+  if !func.type_params.is_empty() then
+    f.emit("[")
+    mut first = true
+    for tp in func.type_params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(tp.name.as_str())
+      if !tp.bounds.is_empty() then
+        f.emit(": ")
+        mut first_bound = true
+        for bound in tp.bounds do
+          if !first_bound then f.emit(" + ") end
+          f.emit(bound.as_str())
+          first_bound = false
+        end
+      end
+      first = false
+    end
+    f.emit("]")
+  end
+  
+  # Parameters
+  f.emit("(")
+  let params_str = format_params_inline(func, &f.config)
+  
+  if f.would_overflow(params_str.as_str()) then
+    # Multi-line parameters
+    f.emit_newline()
+    f.indent()
+    mut first = true
+    for param in func.params do
+      if !first then
+        f.emit(",")
+        f.emit_newline()
+      end
+      format_param(f, param)
+      first = false
+    end
+    f.emit_newline()
+    f.dedent()
+  else
+    mut first = true
+    for param in func.params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_param(f, param)
+      first = false
+    end
+  end
+  f.emit(")")
+  
+  # Return type
+  f.emit(" -> ")
+  format_type_expr(f, &func.return_type)
+  
+  # Where clauses
+  if !func.where_clauses.is_empty() then
+    f.emit_newline()
+    f.indent()
+    f.emit("where")
+    f.emit_newline()
+    f.indent()
+    for clause in func.where_clauses do
+      f.emit(clause.as_str())
+      f.emit_newline()
+    end
+    f.dedent()
+    f.dedent()
+  end
+  
+  # Body
+  f.emit_newline()
+  f.indent()
+  format_block(f, &func.body)
+  f.dedent()
+  f.emit("end")
+end
+
+def format_param(f: &mut Formatter, param: &Param) -> Unit
+  if param.is_mut then f.emit("mut ") end
+  f.emit(param.name.as_str())
+  if !f.config.space_before_colon then () else f.space() end
+  f.emit(":")
+  if f.config.space_after_colon then f.space() end
+  format_type_expr(f, &param.type_expr)
+end
+
+def format_params_inline(func: &Function, config: &FormatConfig) -> String
+  mut result = ""
+  mut first = true
+  for param in func.params do
+    if !first then
+      result = result + ", "
+    end
+    if param.is_mut then result = result + "mut " end
+    result = result + param.name
+    result = result + ": " + param.type_str
+    first = false
+  end
+  result
+end
+
+def format_struct(f: &mut Formatter, s: &StructDecl) -> Unit
+  if s.is_pub then f.emit("pub ") end
+  f.emit("struct ")
+  f.emit(s.name.as_str())
+  
+  if !s.type_params.is_empty() then
+    f.emit("[")
+    mut first = true
+    for tp in s.type_params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(tp.name.as_str())
+      first = false
+    end
+    f.emit("]")
+  end
+  
+  f.emit_newline()
+  f.indent()
+  
+  # Calculate max field name width for alignment
+  mut max_name_width: UInt = 0
+  if f.config.align_struct_fields then
+    for field in s.fields do
+      if field.name.len() > max_name_width then
+        max_name_width = field.name.len()
+      end
+    end
+  end
+  
+  for field in s.fields do
+    if field.is_pub then f.emit("pub ") end
+    f.emit(field.name.as_str())
+    
+    if f.config.align_struct_fields then
+      # Pad to alignment
+      mut padding = max_name_width - field.name.len()
+      while padding > 0 do
+        f.space()
+        padding = padding - 1
+      end
+    end
+    
+    if !f.config.space_before_colon then () else f.space() end
+    f.emit(":")
+    if f.config.space_after_colon then f.space() end
+    format_type_expr(f, &field.type_expr)
+    f.emit_newline()
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_enum(f: &mut Formatter, e: &EnumDecl) -> Unit
+  if e.is_pub then f.emit("pub ") end
+  f.emit("enum ")
+  f.emit(e.name.as_str())
+  
+  if !e.type_params.is_empty() then
+    f.emit("[")
+    mut first = true
+    for tp in e.type_params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(tp.name.as_str())
+      first = false
+    end
+    f.emit("]")
+  end
+  
+  f.emit_newline()
+  f.indent()
+  
+  for variant in e.variants do
+    f.emit(variant.name.as_str())
+    
+    if !variant.fields.is_empty() then
+      f.emit("(")
+      mut first = true
+      for field in variant.fields do
+        if !first then
+          f.emit(",")
+          if f.config.spaces_after_comma then f.space() end
+        end
+        if !field.name.is_empty() then
+          f.emit(field.name.as_str())
+          f.emit(": ")
+        end
+        format_type_expr(f, &field.type_expr)
+        first = false
+      end
+      f.emit(")")
+    end
+    
+    f.emit_newline()
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_trait(f: &mut Formatter, t: &TraitDecl) -> Unit
+  if t.is_pub then f.emit("pub ") end
+  f.emit("trait ")
+  f.emit(t.name.as_str())
+  
+  if !t.type_params.is_empty() then
+    f.emit("[")
+    mut first = true
+    for tp in t.type_params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(tp.name.as_str())
+      first = false
+    end
+    f.emit("]")
+  end
+  
+  if !t.super_traits.is_empty() then
+    f.emit(": ")
+    mut first = true
+    for st in t.super_traits do
+      if !first then f.emit(" + ") end
+      f.emit(st.as_str())
+      first = false
+    end
+  end
+  
+  f.emit_newline()
+  f.indent()
+  
+  mut first_method = true
+  for method in t.methods do
+    if !first_method then
+      f.emit_blank_line(f.config.blank_lines_between_methods)
+    end
+    format_function(f, method, true)
+    f.emit_newline()
+    first_method = false
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_impl(f: &mut Formatter, imp: &ImplBlock) -> Unit
+  f.emit("impl ")
+  
+  match imp.trait_name
+  when Option::Some(trait_name) then
+    f.emit(trait_name.as_str())
+    f.emit(" for ")
+  when Option::None then ()
+  end
+  
+  f.emit(imp.type_name.as_str())
+  
+  if !imp.type_params.is_empty() then
+    f.emit("[")
+    mut first = true
+    for tp in imp.type_params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(tp.name.as_str())
+      first = false
+    end
+    f.emit("]")
+  end
+  
+  f.emit_newline()
+  f.indent()
+  
+  mut first_method = true
+  for method in imp.methods do
+    if !first_method then
+      f.emit_blank_line(f.config.blank_lines_between_methods)
+    end
+    format_function(f, method, true)
+    f.emit_newline()
+    first_method = false
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_const(f: &mut Formatter, c: &ConstDecl) -> Unit
+  if c.is_pub then f.emit("pub ") end
+  f.emit("let ")
+  f.emit(c.name.as_str())
+  f.emit(": ")
+  format_type_expr(f, &c.type_expr)
+  f.emit(" = ")
+  format_expr(f, &c.value)
+end
+
+def format_module(f: &mut Formatter, m: &ModuleDecl) -> Unit
+  f.emit("module ")
+  f.emit(m.name.as_str())
+  f.emit_newline()
+  f.indent()
+  
+  for item in m.items do
+    format_item(f, item)
+    f.emit_newline()
+    f.emit_blank_line(f.config.blank_lines_between_items)
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_extern(f: &mut Formatter, ext: &ExternBlock) -> Unit
+  f.emit("extern \"")
+  f.emit(ext.abi.as_str())
+  f.emit("\"")
+  f.emit_newline()
+  f.indent()
+  
+  for item in ext.items do
+    format_item(f, item)
+    f.emit_newline()
+  end
+  
+  f.dedent()
+  f.emit("end")
+end
+
+def format_type_alias(f: &mut Formatter, ta: &TypeAlias) -> Unit
+  if ta.is_pub then f.emit("pub ") end
+  f.emit("type ")
+  f.emit(ta.name.as_str())
+  f.emit(" = ")
+  format_type_expr(f, &ta.type_expr)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Expression Formatting
+# ———————————————————————————————————————————————————————————————
+
+def format_expr(f: &mut Formatter, expr: &Expr) -> Unit
+  match expr.kind
+  when ExprKind::Literal(lit) then
+    f.emit(lit.to_string().as_str())
+  when ExprKind::Ident(name) then
+    f.emit(name.as_str())
+  when ExprKind::Binary(op, left, right) then
+    format_expr(f, left)
+    if f.config.spaces_around_binary_ops then f.space() end
+    f.emit(op.to_string().as_str())
+    if f.config.spaces_around_binary_ops then f.space() end
+    format_expr(f, right)
+  when ExprKind::Unary(op, operand) then
+    f.emit(op.to_string().as_str())
+    format_expr(f, operand)
+  when ExprKind::Call(callee, args) then
+    format_expr(f, callee)
+    f.emit("(")
+    mut first = true
+    for arg in args do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_expr(f, arg)
+      first = false
+    end
+    f.emit(")")
+  when ExprKind::MethodCall(receiver, method, args) then
+    format_expr(f, receiver)
+    f.emit(".")
+    f.emit(method.as_str())
+    f.emit("(")
+    mut first = true
+    for arg in args do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_expr(f, arg)
+      first = false
+    end
+    f.emit(")")
+  when ExprKind::FieldAccess(obj, field) then
+    format_expr(f, obj)
+    f.emit(".")
+    f.emit(field.as_str())
+  when ExprKind::Index(arr, idx) then
+    format_expr(f, arr)
+    f.emit("[")
+    format_expr(f, idx)
+    f.emit("]")
+  when ExprKind::If(cond, then_block, else_block) then
+    f.emit("if ")
+    format_expr(f, cond)
+    f.emit(" then")
+    f.emit_newline()
+    f.indent()
+    format_block(f, then_block)
+    f.dedent()
+    match else_block
+    when Option::Some(else_blk) then
+      f.emit("else")
+      f.emit_newline()
+      f.indent()
+      format_block(f, else_blk)
+      f.dedent()
+    when Option::None then ()
+    end
+    f.emit("end")
+  when ExprKind::Match(scrutinee, arms) then
+    f.emit("match ")
+    format_expr(f, scrutinee)
+    f.emit_newline()
+    for arm in arms do
+      f.emit("when ")
+      format_pattern(f, &arm.pattern)
+      f.emit(" then")
+      f.emit_newline()
+      f.indent()
+      format_block(f, &arm.body)
+      f.dedent()
+    end
+    f.emit("end")
+  when ExprKind::Block(stmts) then
+    format_block_stmts(f, stmts)
+  when ExprKind::Lambda(params, body) then
+    f.emit("|")
+    mut first = true
+    for param in params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(param.as_str())
+      first = false
+    end
+    f.emit("| ")
+    format_expr(f, body)
+  when ExprKind::Return(val) then
+    f.emit("return")
+    match val
+    when Option::Some(v) then
+      f.space()
+      format_expr(f, v)
+    when Option::None then ()
+    end
+  when ExprKind::Break(val) then
+    f.emit("break")
+    match val
+    when Option::Some(v) then
+      f.space()
+      format_expr(f, v)
+    when Option::None then ()
+    end
+  when ExprKind::Continue then
+    f.emit("continue")
+  when ExprKind::StructLiteral(name, fields) then
+    f.emit(name.as_str())
+    f.emit(" {")
+    let inline = fields.len() <= 3
+    if inline then
+      f.space()
+      mut first = true
+      for field in fields do
+        if !first then
+          f.emit(",")
+          if f.config.spaces_after_comma then f.space() end
+        end
+        f.emit(field.name.as_str())
+        f.emit(": ")
+        format_expr(f, &field.value)
+        first = false
+      end
+      f.space()
+    else
+      f.emit_newline()
+      f.indent()
+      for field in fields do
+        f.emit(field.name.as_str())
+        f.emit(": ")
+        format_expr(f, &field.value)
+        f.emit(",")
+        f.emit_newline()
+      end
+      f.dedent()
+    end
+    f.emit("}")
+  when ExprKind::ArrayLiteral(elems) then
+    f.emit("[")
+    mut first = true
+    for elem in elems do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_expr(f, elem)
+      first = false
+    end
+    f.emit("]")
+  when ExprKind::Range(start, end_val, inclusive) then
+    format_expr(f, start)
+    if inclusive then f.emit("..=") else f.emit("..") end
+    format_expr(f, end_val)
+  when ExprKind::Cast(val, ty) then
+    format_expr(f, val)
+    f.emit(" as ")
+    format_type_expr(f, ty)
+  when ExprKind::Unsafe(block) then
+    f.emit("unsafe")
+    f.emit_newline()
+    f.indent()
+    format_block(f, block)
+    f.dedent()
+    f.emit("end")
+  when ExprKind::Assign(target, value) then
+    format_expr(f, target)
+    f.emit(" = ")
+    format_expr(f, value)
+  when _ then
+    # Fallback: emit raw source text
+    f.emit("<expr>")
+  end
+end
+
+def format_stmt(f: &mut Formatter, stmt: &Stmt) -> Unit
+  match stmt.kind
+  when StmtKind::Expr(expr) then
+    format_expr(f, expr)
+  when StmtKind::Let(binding) then
+    if binding.is_mut then
+      f.emit("mut ")
+    else
+      f.emit("let ")
+    end
+    format_pattern(f, &binding.pattern)
+    match binding.type_annotation
+    when Option::Some(ty) then
+      if !f.config.space_before_colon then () else f.space() end
+      f.emit(":")
+      if f.config.space_after_colon then f.space() end
+      format_type_expr(f, ty)
+    when Option::None then ()
+    end
+    match binding.initializer
+    when Option::Some(init) then
+      f.emit(" = ")
+      format_expr(f, init)
+    when Option::None then ()
+    end
+  when StmtKind::For(pat, iter, body) then
+    f.emit("for ")
+    format_pattern(f, pat)
+    f.emit(" in ")
+    format_expr(f, iter)
+    f.emit(" do")
+    f.emit_newline()
+    f.indent()
+    format_block(f, body)
+    f.dedent()
+    f.emit("end")
+  when StmtKind::While(cond, body) then
+    f.emit("while ")
+    format_expr(f, cond)
+    f.emit(" do")
+    f.emit_newline()
+    f.indent()
+    format_block(f, body)
+    f.dedent()
+    f.emit("end")
+  when StmtKind::Loop(body) then
+    f.emit("loop")
+    f.emit_newline()
+    f.indent()
+    format_block(f, body)
+    f.dedent()
+    f.emit("end")
+  when StmtKind::Return(val) then
+    f.emit("return")
+    match val
+    when Option::Some(v) then
+      f.space()
+      format_expr(f, v)
+    when Option::None then ()
+    end
+  when StmtKind::Item(item) then
+    format_item(f, item)
+  end
+end
+
+def format_block(f: &mut Formatter, block: &Block) -> Unit
+  format_block_stmts(f, &block.stmts)
+end
+
+def format_block_stmts(f: &mut Formatter, stmts: &Vec[Stmt]) -> Unit
+  for stmt in stmts do
+    format_stmt(f, stmt)
+    f.emit_newline()
+  end
+end
+
+def format_pattern(f: &mut Formatter, pat: &Pattern) -> Unit
+  match pat
+  when Pattern::Ident(name) then f.emit(name.as_str())
+  when Pattern::Wildcard then f.emit("_")
+  when Pattern::Literal(lit) then f.emit(lit.to_string().as_str())
+  when Pattern::Tuple(pats) then
+    f.emit("(")
+    mut first = true
+    for p in pats do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_pattern(f, p)
+      first = false
+    end
+    f.emit(")")
+  when Pattern::Constructor(name, pats) then
+    f.emit(name.as_str())
+    if !pats.is_empty() then
+      f.emit("(")
+      mut first = true
+      for p in pats do
+        if !first then
+          f.emit(",")
+          if f.config.spaces_after_comma then f.space() end
+        end
+        format_pattern(f, p)
+        first = false
+      end
+      f.emit(")")
+    end
+  when Pattern::Struct(name, fields) then
+    f.emit(name.as_str())
+    f.emit(" { ")
+    mut first = true
+    for field in fields do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      f.emit(field.name.as_str())
+      match field.pattern
+      when Option::Some(p) then
+        f.emit(": ")
+        format_pattern(f, p)
+      when Option::None then ()
+      end
+      first = false
+    end
+    f.emit(" }")
+  when Pattern::Or(left, right) then
+    format_pattern(f, left)
+    f.emit(" | ")
+    format_pattern(f, right)
+  when Pattern::Binding(name, inner) then
+    f.emit(name.as_str())
+    f.emit(" @ ")
+    format_pattern(f, inner)
+  end
+end
+
+def format_type_expr(f: &mut Formatter, ty: &TypeExpr) -> Unit
+  match ty
+  when TypeExpr::Named(name) then f.emit(name.as_str())
+  when TypeExpr::Generic(name, args) then
+    f.emit(name.as_str())
+    f.emit("[")
+    mut first = true
+    for arg in args do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_type_expr(f, arg)
+      first = false
+    end
+    f.emit("]")
+  when TypeExpr::Reference(inner, is_mut) then
+    f.emit("&")
+    if is_mut then f.emit("mut ") end
+    format_type_expr(f, inner)
+  when TypeExpr::Tuple(elems) then
+    f.emit("(")
+    mut first = true
+    for elem in elems do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_type_expr(f, elem)
+      first = false
+    end
+    f.emit(")")
+  when TypeExpr::Function(params, ret) then
+    f.emit("(")
+    mut first = true
+    for p in params do
+      if !first then
+        f.emit(",")
+        if f.config.spaces_after_comma then f.space() end
+      end
+      format_type_expr(f, p)
+      first = false
+    end
+    f.emit(") -> ")
+    format_type_expr(f, ret)
+  when TypeExpr::Array(elem, size) then
+    f.emit("Array[")
+    format_type_expr(f, elem)
+    f.emit(",")
+    if f.config.spaces_after_comma then f.space() end
+    f.emit(size.to_string().as_str())
+    f.emit("]")
+  when TypeExpr::Ptr(inner) then
+    f.emit("Ptr[")
+    format_type_expr(f, inner)
+    f.emit("]")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Import Sorting
+# ———————————————————————————————————————————————————————————————
+
+def partition_imports(items: &Vec[Item]) -> (Vec[&Item], Vec[&Item])
+  mut imports = Vec::new()
+  mut others = Vec::new()
+  
+  for item in items do
+    match item.kind
+    when ItemKind::Use(_) then imports.push(item)
+    when _ then others.push(item)
+    end
+  end
+  
+  (imports, others)
+end
+
+def sort_import_items(imports: Vec[&Item], group: Bool) -> Vec[&Item]
+  # Sort by module path
+  mut sorted = imports
+  sorted.sort_by(|a, b| {
+    let a_path = match a.kind
+    when ItemKind::Use(u) then u.path.clone()
+    when _ then "".to_string()
+    end
+    
+    let b_path = match b.kind
+    when ItemKind::Use(u) then u.path.clone()
+    when _ then "".to_string()
+    end
+    
+    a_path.cmp(&b_path)
+  })
+  
+  sorted
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+# Format a source string using the given configuration.
+pub def format_source(source: String, config: &FormatConfig) -> Result[String, String]
+  let tokens = tokenize(source.clone())
+  match parse(tokens)
+  when Result::Ok(ast) then
+    mut f = formatter_new(config.clone())
+    format_program(&mut f, &ast)
+    Result::Ok(f.output)
+  when Result::Err(e) then
+    # If parsing fails, fall back to line-based formatting
+    Result::Ok(format_lines_fallback(source, config))
+  end
+end
+
+# Format a file in place. Returns true if the file was changed.
+pub def format_file(path: String, config: &FormatConfig) -> Result[Bool, String]
+  match read_file(path.clone())
+  when Result::Err(e) then Result::Err("Cannot read: " + e)
+  when Result::Ok(source) then
+    match format_source(source.clone(), config)
+    when Result::Err(e) then Result::Err(e)
+    when Result::Ok(formatted) then
+      if formatted == source then
+        Result::Ok(false)  # No changes
+      else
+        match write_file(path, formatted)
+        when Result::Err(e) then Result::Err("Cannot write: " + e)
+        when Result::Ok(_) then Result::Ok(true)
+        end
+      end
+    end
+  end
+end
+
+# Check if a file needs formatting. Returns true if it would change.
+pub def format_check(path: String, config: &FormatConfig) -> Result[Bool, String]
+  match read_file(path)
+  when Result::Err(e) then Result::Err("Cannot read: " + e)
+  when Result::Ok(source) then
+    match format_source(source.clone(), config)
+    when Result::Err(e) then Result::Err(e)
+    when Result::Ok(formatted) then
+      Result::Ok(formatted != source)
+    end
+  end
+end
+
+# Line-based fallback formatter (when AST parsing fails)
+def format_lines_fallback(source: String, config: &FormatConfig) -> String
+  mut output = ""
+  mut indent_level: UInt = 0
+  mut prev_was_blank = false
+  
+  for line in source.lines() do
+    let trimmed = line.trim()
+    
+    if trimmed.is_empty() then
+      if !prev_was_blank then
+        output = output + "\n"
+        prev_was_blank = true
+      end
+      continue
+    end
+    prev_was_blank = false
+    
+    # Decrease indent for closing keywords
+    if trimmed.starts_with("end") ||
+       trimmed.starts_with("elsif") ||
+       trimmed.starts_with("else") ||
+       trimmed.starts_with("when") then
+      if indent_level > 0 then
+        indent_level = indent_level - 1
+      end
+    end
+    
+    output = output + make_indent(config, indent_level) + trimmed + "\n"
+    
+    # Increase indent after block-opening keywords
+    if trimmed.starts_with("def ") ||
+       trimmed.starts_with("pub def ") ||
+       trimmed.starts_with("struct ") ||
+       trimmed.starts_with("pub struct ") ||
+       trimmed.starts_with("enum ") ||
+       trimmed.starts_with("pub enum ") ||
+       trimmed.starts_with("trait ") ||
+       trimmed.starts_with("impl ") ||
+       trimmed.starts_with("module ") ||
+       trimmed.starts_with("if ") ||
+       trimmed.starts_with("elsif ") ||
+       trimmed == "else" ||
+       trimmed.starts_with("match ") ||
+       trimmed.starts_with("when ") ||
+       trimmed.starts_with("for ") ||
+       trimmed.starts_with("while ") ||
+       trimmed.starts_with("loop") ||
+       trimmed.starts_with("extern ") ||
+       trimmed.starts_with("unsafe") then
+      indent_level = indent_level + 1
+    end
+    
+    if trimmed.starts_with("when ") && trimmed.contains(" then ") && !trimmed.ends_with("then") then
+      indent_level = indent_level - 1
+    end
+  end
+  
+  if config.ensure_final_newline && !output.ends_with("\n") then
+    output = output + "\n"
+  end
+  
+  output
+end

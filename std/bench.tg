@@ -1,0 +1,762 @@
+# Tangerine Standard Library — Benchmark Framework
+#
+# Provides micro-benchmark measurement with statistical analysis.
+# Supports warm-up, iteration control, outlier detection, and
+# comparison against baselines.
+
+use std::core::{Option, Result, Vec, String, Bool, UInt, Int, Float}
+use std::collections::{Map}
+use std::time::{Instant, Duration, instant_now, duration_nanos, duration_millis,
+                duration_secs_f64}
+use std::io::{println, eprintln}
+use std::env::{args}
+
+# ———————————————————————————————————————————————————————————————
+# Core Measurement Types
+# ———————————————————————————————————————————————————————————————
+
+struct BenchResult
+  name: String
+  iterations: UInt
+  total_time: Duration
+  min_ns: UInt
+  max_ns: UInt
+  mean_ns: Float
+  median_ns: UInt
+  std_dev_ns: Float
+  samples: Vec[UInt]         # Per-iteration nanoseconds
+  throughput: Option[Throughput]
+end
+
+struct Throughput
+  bytes_per_sec: Float
+  elements_per_sec: Float
+end
+
+enum BenchOutcome
+  Passed(BenchResult)
+  Failed(String)
+  Skipped
+end
+
+struct BenchCase
+  name: String
+  func: def() -> Unit
+  setup: Option[def() -> Unit]
+  teardown: Option[def() -> Unit]
+  iterations: Option[UInt]
+  warmup_iterations: UInt
+  input_size: Option[UInt]   # For throughput calculation
+end
+
+struct BenchSuite
+  name: String
+  cases: Vec[BenchCase]
+  config: BenchConfig
+  results: Vec[(String, BenchOutcome)]
+end
+
+struct BenchConfig
+  min_iterations: UInt
+  max_iterations: UInt
+  warmup_iterations: UInt
+  target_time_ms: UInt       # Target measurement time per benchmark
+  filter: Option[String]
+  exact: Bool
+  baseline: Option[String]   # Baseline file to compare against
+  json_output: Bool
+  verbose: Bool
+  list_only: Bool
+  outlier_threshold: Float   # IQR multiplier for outlier detection
+end
+
+def default_bench_config() -> BenchConfig
+  BenchConfig {
+    min_iterations: 10,
+    max_iterations: 10000,
+    warmup_iterations: 5,
+    target_time_ms: 3000,
+    filter: Option::None,
+    exact: false,
+    baseline: Option::None,
+    json_output: false,
+    verbose: false,
+    list_only: false,
+    outlier_threshold: 1.5
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# BenchCase Constructors
+# ———————————————————————————————————————————————————————————————
+
+pub def bench_case_new(name: String, func: def() -> Unit) -> BenchCase
+  BenchCase {
+    name: name,
+    func: func,
+    setup: Option::None,
+    teardown: Option::None,
+    iterations: Option::None,
+    warmup_iterations: 5,
+    input_size: Option::None
+  }
+end
+
+impl BenchCase
+  def with_setup(mut self, setup: def() -> Unit) -> BenchCase
+    self.setup = Option::Some(setup)
+    self
+  end
+  
+  def with_teardown(mut self, teardown: def() -> Unit) -> BenchCase
+    self.teardown = Option::Some(teardown)
+    self
+  end
+  
+  def with_iterations(mut self, n: UInt) -> BenchCase
+    self.iterations = Option::Some(n)
+    self
+  end
+  
+  def with_warmup(mut self, n: UInt) -> BenchCase
+    self.warmup_iterations = n
+    self
+  end
+  
+  def with_input_size(mut self, bytes: UInt) -> BenchCase
+    self.input_size = Option::Some(bytes)
+    self
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# BenchSuite
+# ———————————————————————————————————————————————————————————————
+
+pub def bench_suite_new(name: String) -> BenchSuite
+  BenchSuite {
+    name: name,
+    cases: Vec::new(),
+    config: default_bench_config(),
+    results: Vec::new()
+  }
+end
+
+impl BenchSuite
+  def add(&mut self, case: BenchCase) -> Unit
+    self.cases.push(case)
+  end
+  
+  def with_config(mut self, config: BenchConfig) -> BenchSuite
+    self.config = config
+    self
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Measurement Engine
+# ———————————————————————————————————————————————————————————————
+
+def measure_single(func: &def() -> Unit) -> UInt
+  let start = instant_now()
+  func()
+  let elapsed = start.elapsed()
+  duration_nanos(elapsed)
+end
+
+def determine_iterations(func: &def() -> Unit, config: &BenchConfig) -> UInt
+  # Auto-calibrate: run a few iterations to estimate time, then compute
+  # how many iterations fit in target_time_ms
+  let probe_start = instant_now()
+  let probe_iters: UInt = 10
+  
+  for _ in 0..probe_iters do
+    func()
+  end
+  
+  let probe_elapsed = duration_nanos(probe_start.elapsed())
+  let per_iter_ns = probe_elapsed / probe_iters
+  
+  if per_iter_ns == 0 then
+    return config.max_iterations
+  end
+  
+  let target_ns = (config.target_time_ms as UInt) * 1_000_000
+  mut iters = target_ns / per_iter_ns
+  
+  if iters < config.min_iterations then
+    iters = config.min_iterations
+  end
+  if iters > config.max_iterations then
+    iters = config.max_iterations
+  end
+  
+  iters
+end
+
+def run_benchmark(case: &BenchCase, config: &BenchConfig) -> BenchOutcome
+  # Setup
+  match case.setup
+  when Option::Some(setup_fn) then setup_fn()
+  when Option::None then ()
+  end
+  
+  # Warmup
+  let warmup = if case.warmup_iterations > 0 then case.warmup_iterations
+               else config.warmup_iterations end
+  
+  for _ in 0..warmup do
+    case.func()
+  end
+  
+  # Determine iteration count
+  let iterations = match case.iterations
+  when Option::Some(n) then n
+  when Option::None then determine_iterations(&case.func, config)
+  end
+  
+  # Collect samples
+  mut samples = Vec::with_capacity(iterations)
+  let total_start = instant_now()
+  
+  for _ in 0..iterations do
+    let ns = measure_single(&case.func)
+    samples.push(ns)
+  end
+  
+  let total_time = total_start.elapsed()
+  
+  # Teardown
+  match case.teardown
+  when Option::Some(teardown_fn) then teardown_fn()
+  when Option::None then ()
+  end
+  
+  # Remove outliers
+  let cleaned = remove_outliers(&samples, config.outlier_threshold)
+  
+  # Compute statistics
+  let stats = compute_statistics(&cleaned)
+  
+  # Compute throughput
+  let throughput = match case.input_size
+  when Option::Some(bytes) then
+    let secs = stats.mean_ns / 1_000_000_000.0
+    if secs > 0.0 then
+      Option::Some(Throughput {
+        bytes_per_sec: (bytes as Float) / secs,
+        elements_per_sec: 1.0 / secs
+      })
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+  
+  BenchOutcome::Passed(BenchResult {
+    name: case.name.clone(),
+    iterations: iterations,
+    total_time: total_time,
+    min_ns: stats.min,
+    max_ns: stats.max,
+    mean_ns: stats.mean,
+    median_ns: stats.median,
+    std_dev_ns: stats.std_dev,
+    samples: cleaned,
+    throughput: throughput
+  })
+end
+
+struct Stats
+  min: UInt
+  max: UInt
+  mean: Float
+  median: UInt
+  std_dev: Float
+end
+
+def compute_statistics(samples: &Vec[UInt]) -> Stats
+  if samples.is_empty() then
+    return Stats { min: 0, max: 0, mean: 0.0, median: 0, std_dev: 0.0 }
+  end
+  
+  # Sort for median calculation
+  mut sorted = samples.clone()
+  sorted.sort()
+  
+  let n = sorted.len()
+  mut sum: Float = 0.0
+  mut min_val = sorted[0]
+  mut max_val = sorted[0]
+  
+  for s in sorted do
+    let f = s as Float
+    sum = sum + f
+    if s < min_val then min_val = s end
+    if s > max_val then max_val = s end
+  end
+  
+  let mean = sum / (n as Float)
+  
+  # Median
+  let median = if n % 2 == 0 then
+    (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+  else
+    sorted[n / 2]
+  end
+  
+  # Standard deviation
+  mut var_sum: Float = 0.0
+  for s in sorted do
+    let diff = (s as Float) - mean
+    var_sum = var_sum + diff * diff
+  end
+  let variance = var_sum / (n as Float)
+  let std_dev = sqrt(variance)
+  
+  Stats { min: min_val, max: max_val, mean: mean, median: median, std_dev: std_dev }
+end
+
+def sqrt(x: Float) -> Float
+  if x <= 0.0 then return 0.0 end
+  # Newton's method
+  mut guess = x / 2.0
+  for _ in 0..50 do
+    let next = (guess + x / guess) / 2.0
+    if abs_f(next - guess) < 0.0001 then break end
+    guess = next
+  end
+  guess
+end
+
+def abs_f(x: Float) -> Float
+  if x < 0.0 then -x else x end
+end
+
+def remove_outliers(samples: &Vec[UInt], threshold: Float) -> Vec[UInt]
+  if samples.len() < 4 then return samples.clone() end
+  
+  mut sorted = samples.clone()
+  sorted.sort()
+  
+  let n = sorted.len()
+  let q1 = sorted[n / 4]
+  let q3 = sorted[3 * n / 4]
+  let iqr = (q3 - q1) as Float
+  
+  let lower = (q1 as Float) - threshold * iqr
+  let upper = (q3 as Float) + threshold * iqr
+  
+  mut result = Vec::new()
+  for s in samples do
+    let f = s as Float
+    if f >= lower && f <= upper then
+      result.push(s)
+    end
+  end
+  
+  # Don't remove too much
+  if result.len() < samples.len() / 2 then
+    samples.clone()
+  else
+    result
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Benchmark Runner
+# ———————————————————————————————————————————————————————————————
+
+pub def run_benchmarks(suite: &mut BenchSuite) -> Unit
+  let config = &suite.config
+  
+  if config.list_only then
+    println("Benchmarks in suite `" + suite.name + "`:")
+    for case in suite.cases do
+      println("  " + case.name)
+    end
+    return
+  end
+  
+  println("")
+  println("running " + suite.cases.len().to_string() + " benchmarks")
+  println("---")
+  
+  for case in suite.cases do
+    # Apply filter
+    if !should_run_bench(&case.name, config) then
+      suite.results.push((case.name.clone(), BenchOutcome::Skipped))
+      continue
+    end
+    
+    print_bench_start(&case.name)
+    
+    let outcome = run_benchmark(case, config)
+    
+    match outcome
+    when BenchOutcome::Passed(ref result) then
+      print_bench_result(result, config)
+    when BenchOutcome::Failed(ref msg) then
+      println("  FAILED: " + msg)
+    when BenchOutcome::Skipped then
+      println("  ... skipped")
+    end
+    
+    suite.results.push((case.name.clone(), outcome))
+  end
+  
+  println("---")
+  print_summary(&suite.results)
+  
+  if config.json_output then
+    println("")
+    println(render_json(&suite.results))
+  end
+end
+
+def should_run_bench(name: &str, config: &BenchConfig) -> Bool
+  match config.filter
+  when Option::Some(ref f) then
+    if config.exact then
+      name == f
+    else
+      name.contains(f)
+    end
+  when Option::None then true
+  end
+end
+
+def print_bench_start(name: &str) -> Unit
+  print("bench " + name + " ... ")
+end
+
+def print_bench_result(result: &BenchResult, config: &BenchConfig) -> Unit
+  let mean_str = format_duration_ns(result.mean_ns as UInt)
+  let std_str = format_duration_ns(result.std_dev_ns as UInt)
+  
+  mut line = mean_str + "/iter (+/- " + std_str + ")"
+  
+  if config.verbose then
+    line = line + "  [min: " + format_duration_ns(result.min_ns)
+    line = line + ", max: " + format_duration_ns(result.max_ns)
+    line = line + ", median: " + format_duration_ns(result.median_ns)
+    line = line + ", " + result.iterations.to_string() + " iters]"
+  end
+  
+  match result.throughput
+  when Option::Some(ref tp) then
+    line = line + "  " + format_throughput(tp)
+  when Option::None then ()
+  end
+  
+  println(line)
+end
+
+def print_summary(results: &Vec[(String, BenchOutcome)]) -> Unit
+  mut passed: UInt = 0
+  mut failed: UInt = 0
+  mut skipped: UInt = 0
+  
+  for entry in results do
+    match entry.1
+    when BenchOutcome::Passed(_) then passed = passed + 1
+    when BenchOutcome::Failed(_) then failed = failed + 1
+    when BenchOutcome::Skipped then skipped = skipped + 1
+    end
+  end
+  
+  mut summary = "benchmark result: "
+  if failed > 0 then
+    summary = summary + "FAILED. "
+  else
+    summary = summary + "ok. "
+  end
+  
+  summary = summary + passed.to_string() + " passed"
+  if failed > 0 then summary = summary + ", " + failed.to_string() + " failed" end
+  if skipped > 0 then summary = summary + ", " + skipped.to_string() + " skipped" end
+  
+  println(summary)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Duration Formatting
+# ———————————————————————————————————————————————————————————————
+
+def format_duration_ns(ns: UInt) -> String
+  if ns < 1_000 then
+    ns.to_string() + " ns"
+  elsif ns < 1_000_000 then
+    let us = ns / 1_000
+    let frac = (ns % 1_000) / 100
+    us.to_string() + "." + frac.to_string() + " us"
+  elsif ns < 1_000_000_000 then
+    let ms = ns / 1_000_000
+    let frac = (ns % 1_000_000) / 100_000
+    ms.to_string() + "." + frac.to_string() + " ms"
+  else
+    let s = ns / 1_000_000_000
+    let frac = (ns % 1_000_000_000) / 100_000_000
+    s.to_string() + "." + frac.to_string() + " s"
+  end
+end
+
+def format_throughput(tp: &Throughput) -> String
+  if tp.bytes_per_sec > 1_073_741_824.0 then
+    let gbs = tp.bytes_per_sec / 1_073_741_824.0
+    format_float(gbs, 2) + " GiB/s"
+  elsif tp.bytes_per_sec > 1_048_576.0 then
+    let mbs = tp.bytes_per_sec / 1_048_576.0
+    format_float(mbs, 2) + " MiB/s"
+  elsif tp.bytes_per_sec > 1_024.0 then
+    let kbs = tp.bytes_per_sec / 1_024.0
+    format_float(kbs, 2) + " KiB/s"
+  else
+    format_float(tp.bytes_per_sec, 2) + " B/s"
+  end
+end
+
+def format_float(val: Float, decimals: UInt) -> String
+  let int_part = val as UInt
+  let frac_part = ((val - (int_part as Float)) * pow10(decimals)) as UInt
+  
+  mut result = int_part.to_string() + "."
+  
+  # Zero-pad fractional part
+  mut frac_str = frac_part.to_string()
+  while frac_str.len() < decimals do
+    frac_str = "0" + frac_str
+  end
+  
+  result + frac_str
+end
+
+def pow10(n: UInt) -> Float
+  mut result: Float = 1.0
+  for _ in 0..n do
+    result = result * 10.0
+  end
+  result
+end
+
+# ———————————————————————————————————————————————————————————————
+# JSON Output
+# ———————————————————————————————————————————————————————————————
+
+def render_json(results: &Vec[(String, BenchOutcome)]) -> String
+  mut json = "{\n  \"benchmarks\": [\n"
+  
+  mut first = true
+  for entry in results do
+    match entry.1
+    when BenchOutcome::Passed(ref result) then
+      if !first then json = json + ",\n" end
+      first = false
+      
+      json = json + "    {\n"
+      json = json + "      \"name\": \"" + json_escape(&entry.0) + "\",\n"
+      json = json + "      \"iterations\": " + result.iterations.to_string() + ",\n"
+      json = json + "      \"min_ns\": " + result.min_ns.to_string() + ",\n"
+      json = json + "      \"max_ns\": " + result.max_ns.to_string() + ",\n"
+      json = json + "      \"mean_ns\": " + format_float(result.mean_ns, 2) + ",\n"
+      json = json + "      \"median_ns\": " + result.median_ns.to_string() + ",\n"
+      json = json + "      \"std_dev_ns\": " + format_float(result.std_dev_ns, 2) + "\n"
+      json = json + "    }"
+    when _ then ()
+    end
+  end
+  
+  json = json + "\n  ]\n}"
+  json
+end
+
+def json_escape(s: &str) -> String
+  mut result = ""
+  for c in s.chars() do
+    match c
+    when '"' then result = result + "\\\""
+    when '\\' then result = result + "\\\\"
+    when '\n' then result = result + "\\n"
+    when '\t' then result = result + "\\t"
+    when _ then result = result + c.to_string()
+    end
+  end
+  result
+end
+
+# ———————————————————————————————————————————————————————————————
+# Baseline Comparison
+# ———————————————————————————————————————————————————————————————
+
+struct BaselineEntry
+  name: String
+  mean_ns: Float
+  std_dev_ns: Float
+end
+
+def load_baseline(path: String) -> Result[Vec[BaselineEntry], String]
+  use std::fs::{read_file}
+  
+  match read_file(path)
+  when Result::Err(e) then Result::Err("Cannot load baseline: " + e)
+  when Result::Ok(content) then
+    mut entries = Vec::new()
+    
+    for line in content.split("\n") do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      
+      let parts = trimmed.split(",")
+      if parts.len() >= 3 then
+        match (parts[1].trim().parse_float(), parts[2].trim().parse_float())
+        when (Result::Ok(mean), Result::Ok(std_dev)) then
+          entries.push(BaselineEntry {
+            name: parts[0].trim().to_string(),
+            mean_ns: mean,
+            std_dev_ns: std_dev
+          })
+        when _ then ()
+        end
+      end
+    end
+    
+    Result::Ok(entries)
+  end
+end
+
+def compare_with_baseline(results: &Vec[(String, BenchOutcome)],
+                          baseline: &Vec[BaselineEntry]) -> Unit
+  println("\nBaseline comparison:")
+  println("---")
+  
+  let baseline_map = Map::new()
+  for entry in baseline do
+    baseline_map.insert(entry.name.clone(), entry)
+  end
+  
+  for result_entry in results do
+    match result_entry.1
+    when BenchOutcome::Passed(ref result) then
+      match baseline_map.get(&result_entry.0)
+      when Option::Some(baseline_entry) then
+        let change_pct = ((result.mean_ns - baseline_entry.mean_ns) / baseline_entry.mean_ns) * 100.0
+        
+        let direction = if change_pct > 5.0 then
+          "REGRESSED +" + format_float(change_pct, 1) + "%"
+        elsif change_pct < -5.0 then
+          "improved " + format_float(abs_f(change_pct), 1) + "%"
+        else
+          "no change (" + format_float(change_pct, 1) + "%)"
+        end
+        
+        println("  " + result_entry.0 + ": " + direction +
+                " (was " + format_duration_ns(baseline_entry.mean_ns as UInt) +
+                ", now " + format_duration_ns(result.mean_ns as UInt) + ")")
+      when Option::None then
+        println("  " + result_entry.0 + ": NEW (no baseline)")
+      end
+    when _ then ()
+    end
+  end
+end
+
+def save_baseline(path: String, results: &Vec[(String, BenchOutcome)]) -> Result[Unit, String]
+  use std::fs::{write_file}
+  
+  mut content = "# Benchmark baseline\n# name, mean_ns, std_dev_ns\n"
+  
+  for entry in results do
+    match entry.1
+    when BenchOutcome::Passed(ref result) then
+      content = content + entry.0 + "," +
+        format_float(result.mean_ns, 2) + "," +
+        format_float(result.std_dev_ns, 2) + "\n"
+    when _ then ()
+    end
+  end
+  
+  write_file(path, content)
+end
+
+# ———————————————————————————————————————————————————————————————
+# CLI Argument Parsing
+# ———————————————————————————————————————————————————————————————
+
+pub def parse_bench_args(argv: Vec[String]) -> BenchConfig
+  mut config = default_bench_config()
+  mut i: UInt = 0
+  
+  while i < argv.len() do
+    let arg = argv[i].clone()
+    
+    if arg == "--bench-filter" || arg == "--filter" then
+      i = i + 1
+      if i < argv.len() then
+        config.filter = Option::Some(argv[i].clone())
+      end
+    elsif arg == "--exact" then
+      config.exact = true
+    elsif arg == "--json" then
+      config.json_output = true
+    elsif arg == "--verbose" || arg == "-v" then
+      config.verbose = true
+    elsif arg == "--list" then
+      config.list_only = true
+    elsif arg == "--baseline" then
+      i = i + 1
+      if i < argv.len() then
+        config.baseline = Option::Some(argv[i].clone())
+      end
+    elsif arg == "--min-iters" then
+      i = i + 1
+      if i < argv.len() then
+        match argv[i].parse_uint()
+        when Result::Ok(n) then config.min_iterations = n
+        when _ then ()
+        end
+      end
+    elsif arg == "--max-iters" then
+      i = i + 1
+      if i < argv.len() then
+        match argv[i].parse_uint()
+        when Result::Ok(n) then config.max_iterations = n
+        when _ then ()
+        end
+      end
+    elsif arg == "--warmup" then
+      i = i + 1
+      if i < argv.len() then
+        match argv[i].parse_uint()
+        when Result::Ok(n) then config.warmup_iterations = n
+        when _ then ()
+        end
+      end
+    elsif arg == "--target-time" then
+      i = i + 1
+      if i < argv.len() then
+        match argv[i].parse_uint()
+        when Result::Ok(n) then config.target_time_ms = n
+        when _ then ()
+        end
+      end
+    elsif !arg.starts_with("-") then
+      # Positional filter
+      config.filter = Option::Some(arg)
+    end
+    
+    i = i + 1
+  end
+  
+  config
+end
+
+# ———————————————————————————————————————————————————————————————
+# Black Box (prevent optimization)
+# ———————————————————————————————————————————————————————————————
+
+# Prevent the compiler from optimizing away benchmark code
+pub def black_box[T](val: T) -> T
+  # Uses volatile read semantics to prevent dead code elimination
+  # In native codegen, this emits a volatile load/store pair
+  __compiler_intrinsic_black_box(val)
+end

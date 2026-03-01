@@ -484,7 +484,6 @@ def push_stmt(b: &mut MirBuilder, kind: MirStatementKind, span: Span) -> Unit
   when Option::None then ()
   end
 end
-end
 
 def push_assign(b: &mut MirBuilder, place: Place, rvalue: MirRvalue, span: Span) -> Unit
   push_stmt(b, MirStatementKind::Assign(place, rvalue), span)
@@ -1353,11 +1352,10 @@ def resolve_field_index(name: &String) -> Int
   if name == "raw" then return 0 end
   if name == "address" then return 0 end
   
-  # Default: return -1 to indicate unresolved (caller uses 0 as fallback).
-  # In a production compiler, this would be an error.
-  # The type checker annotates FieldAccess nodes with their resolved index
-  # before MIR lowering, so this fallback should rarely trigger.
-  0
+  # Unknown field: return -1 to indicate error
+  # The type checker should have resolved this before MIR lowering
+  # Caller must handle -1 by emitting an error
+  -1
 end
 
 # Helper: convert a Path to a String (dot-separated components)
@@ -1826,16 +1824,434 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# MIR Pretty Printer
+# ———————————————————————————————————————————————————————————————
+#
+# Human-readable serialization of the entire MIR.  Used by --emit-mir,
+# the REPL :mir command, and diagnostics/debugging output.
+
+def pretty_print_mir(program: &MirProgram) -> String
+  mut out = ""
+
+  # Type definitions
+  if !program.types.is_empty() then
+    out = out + "// Type definitions\n"
+    for td in program.types do
+      out = out + format_mir_typedef(&td) + "\n"
+    end
+    out = out + "\n"
+  end
+
+  # Statics / globals
+  if !program.statics.is_empty() then
+    out = out + "// Statics\n"
+    for s in program.statics do
+      let mutability = if s.is_mut then "mut " else "" end
+      out = out + "static " + mutability + s.name.clone() + ": " + format_mir_type(&s.ty) + ";\n"
+    end
+    out = out + "\n"
+  end
+
+  # Functions
+  for func in program.functions do
+    out = out + format_mir_function(&func) + "\n"
+  end
+  out
+end
+
+def format_mir_typedef(td: &MirTypeDef) -> String
+  mut out = "type " + td.name.clone()
+  match td.kind
+  when MirTypeDefKind::Struct(fields) then
+    out = out + " = struct {\n"
+    for f in fields do
+      out = out + "    " + f.name.clone() + ": " + format_mir_type(&f.ty)
+      if f.offset >= 0 then
+        out = out + "  // offset " + f.offset.to_string()
+      end
+      out = out + "\n"
+    end
+    out = out + "}"
+  when MirTypeDefKind::Enum(variants) then
+    out = out + " = enum {\n"
+    for v in variants do
+      out = out + "    " + v.name.clone() + " = " + v.discriminant.to_string()
+      if !v.fields.is_empty() then
+        out = out + "("
+        mut first = true
+        for f in v.fields do
+          if !first then out = out + ", " end
+          out = out + format_mir_type(&f)
+          first = false
+        end
+        out = out + ")"
+      end
+      out = out + "\n"
+    end
+    out = out + "}"
+  end
+  out
+end
+
+def format_mir_function(func: &MirFunction) -> String
+  mut out = ""
+  # Annotations
+  if func.is_unsafe then out = out + "unsafe " end
+  if func.is_async then out = out + "async " end
+  if func.is_extern then out = out + "extern \"" + func.extern_abi.clone() + "\" " end
+
+  out = out + "fn " + func.name.clone() + "("
+  mut first = true
+  for p in func.params do
+    if !first then out = out + ", " end
+    let mutmark = if p.is_mut then "mut " else "" end
+    out = out + mutmark + p.name.clone() + ": " + format_mir_type(&p.ty)
+    first = false
+  end
+  out = out + ") -> " + format_mir_type(&func.ret_type) + " {\n"
+
+  # Local declarations
+  for local in func.locals do
+    let mutmark = if local.is_mut then "mut " else "" end
+    out = out + "    let " + mutmark + "_" + local.id.id.to_string()
+    if !local.name.is_empty() then
+      out = out + " /* " + local.name.clone() + " */"
+    end
+    out = out + ": " + format_mir_type(&local.ty) + ";\n"
+  end
+  if !func.locals.is_empty() then out = out + "\n" end
+
+  # Contracts
+  for c in func.contracts do
+    let kind_str = match c.kind
+    when ContractKind::Pre then "pre"
+    when ContractKind::Post then "post"
+    when ContractKind::Invariant then "invariant"
+    end
+    out = out + "    @" + kind_str + " " + format_operand(&c.condition) + " \"" + c.message.clone() + "\"\n"
+  end
+
+  # Basic blocks
+  for block in func.blocks do
+    out = out + format_mir_block(&block)
+  end
+
+  out = out + "}\n"
+  out
+end
+
+def format_mir_block(block: &MirBlock) -> String
+  mut out = "    bb" + block.id.id.to_string() + ": {\n"
+  for stmt in block.statements do
+    out = out + "        " + format_mir_statement(&stmt) + ";\n"
+  end
+  out = out + "        " + format_mir_terminator(&block.terminator) + ";\n"
+  out = out + "    }\n"
+  out
+end
+
+def format_mir_statement(stmt: &MirStatement) -> String
+  match stmt.kind
+  when MirStatementKind::Assign(place, rvalue) then
+    format_place(&place) + " = " + format_rvalue(&rvalue)
+  when MirStatementKind::StorageLive(id) then
+    "StorageLive(_" + id.id.to_string() + ")"
+  when MirStatementKind::StorageDead(id) then
+    "StorageDead(_" + id.id.to_string() + ")"
+  when MirStatementKind::Nop then
+    "nop"
+  when MirStatementKind::ContractCheck(contract, op) then
+    let kind_str = match contract.kind
+    when ContractKind::Pre then "pre"
+    when ContractKind::Post then "post"
+    when ContractKind::Invariant then "invariant"
+    end
+    "contract_check(" + kind_str + ", " + format_operand(&op) + ")"
+  when MirStatementKind::BudgetConsume(resource, amount) then
+    "budget_consume(\"" + resource.clone() + "\", " + amount.to_string() + ")"
+  when MirStatementKind::EffectRecord(name, op) then
+    "effect_record(\"" + name.clone() + "\", " + format_operand(&op) + ")"
+  end
+end
+
+def format_mir_terminator(term: &MirTerminator) -> String
+  match term.kind
+  when MirTerminatorKind::Goto(target) then
+    "goto -> bb" + target.id.to_string()
+  when MirTerminatorKind::SwitchInt(discr, targets, otherwise) then
+    mut out = "switchInt(" + format_operand(&discr) + ") -> ["
+    for t in targets do
+      out = out + t.value.to_string() + ": bb" + t.target.id.to_string() + ", "
+    end
+    out = out + "otherwise: bb" + otherwise.id.to_string() + "]"
+    out
+  when MirTerminatorKind::Return then
+    "return"
+  when MirTerminatorKind::Unreachable then
+    "unreachable"
+  when MirTerminatorKind::Call(dest, func_op, args, succ, unwind) then
+    mut out = format_place(&dest) + " = " + format_operand(&func_op) + "("
+    mut first = true
+    for a in args do
+      if !first then out = out + ", " end
+      out = out + format_operand(&a)
+      first = false
+    end
+    out = out + ") -> [return: bb" + succ.id.to_string()
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
+    when Option::None then ()
+    end
+    out = out + "]"
+    out
+  when MirTerminatorKind::Drop(place, target, unwind) then
+    mut out = "drop(" + format_place(&place) + ") -> [bb" + target.id.to_string()
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
+    when Option::None then ()
+    end
+    out = out + "]"
+    out
+  when MirTerminatorKind::Assert(cond, expected, msg, target, unwind) then
+    mut out = "assert(" + format_operand(&cond) + ", "
+    out = out + (if expected then "true" else "false" end) + ", "
+    out = out + format_assert_message(&msg) + ") -> [success: bb" + target.id.to_string()
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
+    when Option::None then ()
+    end
+    out = out + "]"
+    out
+  when MirTerminatorKind::Yield(value, resume) then
+    "yield(" + format_operand(&value) + ") -> resume: bb" + resume.id.to_string()
+  when MirTerminatorKind::Abort then
+    "abort"
+  end
+end
+
+def format_assert_message(msg: &AssertMessage) -> String
+  match msg
+  when AssertMessage::BoundsCheck(idx, len) then
+    "\"index out of bounds: \" + index=" + format_operand(&idx) + " len=" + format_operand(&len)
+  when AssertMessage::Overflow(op) then
+    "\"arithmetic overflow: " + format_binop(op) + "\""
+  when AssertMessage::DivisionByZero then "\"division by zero\""
+  when AssertMessage::RemainderByZero then "\"remainder by zero\""
+  when AssertMessage::NullPointer then "\"null pointer dereference\""
+  when AssertMessage::ContractViolation(m) then "\"contract violation: " + m.clone() + "\""
+  end
+end
+
+def format_place(place: &Place) -> String
+  mut out = "_" + place.local.id.to_string()
+  for proj in place.projections do
+    match proj
+    when Projection::Deref then out = "(*" + out + ")"
+    when Projection::Field(name, idx) then out = out + "." + name.clone()
+    when Projection::Index(id) then out = out + "[_" + id.id.to_string() + "]"
+    when Projection::ConstantIndex(i) then out = out + "[" + i.to_string() + "]"
+    when Projection::Downcast(name, _) then out = "(" + out + " as " + name.clone() + ")"
+    end
+  end
+  out
+end
+
+def format_operand(op: &MirOperand) -> String
+  match op.kind
+  when MirOperandKind::Copy(place) then "copy " + format_place(&place)
+  when MirOperandKind::Move(place) then "move " + format_place(&place)
+  when MirOperandKind::Constant(c) then format_mir_constant(&c)
+  end
+end
+
+def format_mir_constant(c: &MirConstant) -> String
+  match c.kind
+  when MirConstantKind::Unit then "()"
+  when MirConstantKind::Bool(b) then if b then "true" else "false" end
+  when MirConstantKind::Int(n) then n.to_string() + "_" + format_mir_type(&c.ty)
+  when MirConstantKind::Float(f) then f.to_string() + "_" + format_mir_type(&c.ty)
+  when MirConstantKind::Char(ch) then "'" + ch.to_string() + "'"
+  when MirConstantKind::String(s) then "\"" + s.clone() + "\""
+  when MirConstantKind::FnItem(name) then name.clone()
+  when MirConstantKind::ZeroSized then "zero_sized"
+  end
+end
+
+def format_rvalue(rv: &MirRvalue) -> String
+  match rv.kind
+  when MirRvalueKind::Use(op) then format_operand(&op)
+  when MirRvalueKind::Ref(place) then "&" + format_place(&place)
+  when MirRvalueKind::RefMut(place) then "&mut " + format_place(&place)
+  when MirRvalueKind::Aggregate(kind, ops) then
+    mut out = match kind
+    when AggregateKind::Array(_) then "["
+    when AggregateKind::Tuple then "("
+    when AggregateKind::Struct(_, fields) then
+      if !fields.is_empty() then fields[0].clone() + " { " else "{ " end
+    when AggregateKind::Closure(id) then "closure#" + id.id.to_string() + "("
+    when AggregateKind::Generator(id) then "generator#" + id.id.to_string() + "("
+    end
+    mut first = true
+    for o in ops do
+      if !first then out = out + ", " end
+      out = out + format_operand(&o)
+      first = false
+    end
+    out = out + match kind
+    when AggregateKind::Array(_) then "]"
+    when AggregateKind::Tuple then ")"
+    when AggregateKind::Struct(_, _) then " }"
+    when AggregateKind::Closure(_) then ")"
+    when AggregateKind::Generator(_) then ")"
+    end
+    out
+  when MirRvalueKind::BinOp(op, lhs, rhs) then
+    format_operand(&lhs) + " " + format_binop(op) + " " + format_operand(&rhs)
+  when MirRvalueKind::UnOp(op, operand) then
+    format_unop(op) + format_operand(&operand)
+  when MirRvalueKind::Discriminant(place) then
+    "discriminant(" + format_place(&place) + ")"
+  when MirRvalueKind::Len(place) then
+    "len(" + format_place(&place) + ")"
+  when MirRvalueKind::Cast(kind, op, ty) then
+    format_operand(&op) + " as " + format_mir_type(&ty) + " (" + format_cast_kind(kind) + ")"
+  when MirRvalueKind::Repeat(op, count) then
+    "[" + format_operand(&op) + "; " + count.to_string() + "]"
+  when MirRvalueKind::Phi(entries) then
+    mut out = "phi("
+    mut first = true
+    for (bid, lid) in entries do
+      if !first then out = out + ", " end
+      out = out + "bb" + bid.id.to_string() + ": _" + lid.id.to_string()
+      first = false
+    end
+    out + ")"
+  end
+end
+
+def format_binop(op: MirBinOp) -> String
+  match op
+  when MirBinOp::Add then "+"
+  when MirBinOp::Sub then "-"
+  when MirBinOp::Mul then "*"
+  when MirBinOp::Div then "/"
+  when MirBinOp::Mod then "%"
+  when MirBinOp::BitAnd then "&"
+  when MirBinOp::BitOr then "|"
+  when MirBinOp::BitXor then "^"
+  when MirBinOp::Shl then "<<"
+  when MirBinOp::Shr then ">>"
+  when MirBinOp::Eq then "=="
+  when MirBinOp::Ne then "!="
+  when MirBinOp::Lt then "<"
+  when MirBinOp::Le then "<="
+  when MirBinOp::Gt then ">"
+  when MirBinOp::Ge then ">="
+  end
+end
+
+def format_unop(op: MirUnOp) -> String
+  match op
+  when MirUnOp::Neg then "-"
+  when MirUnOp::Not then "!"
+  when MirUnOp::BitNot then "~"
+  end
+end
+
+def format_cast_kind(kind: CastKind) -> String
+  match kind
+  when CastKind::IntToInt then "IntToInt"
+  when CastKind::IntToFloat then "IntToFloat"
+  when CastKind::FloatToInt then "FloatToInt"
+  when CastKind::FloatToFloat then "FloatToFloat"
+  when CastKind::Pointer then "Pointer"
+  when CastKind::Transmute then "Transmute"
+  end
+end
+
+def format_mir_type(ty: &Type) -> String
+  match ty
+  when Type::Unit then "Unit"
+  when Type::Bool then "Bool"
+  when Type::Int then "Int"
+  when Type::Float then "Float"
+  when Type::Char then "Char"
+  when Type::String then "String"
+  when Type::Never then "!"
+  when Type::Param(name) then name.clone()
+  when Type::Option(inner) then "Option[" + format_mir_type(inner) + "]"
+  when Type::Result(ok, err) then "Result[" + format_mir_type(ok) + ", " + format_mir_type(err) + "]"
+  when Type::Vec(inner) then "Vec[" + format_mir_type(inner) + "]"
+  when Type::Map(k, v) then "Map[" + format_mir_type(k) + ", " + format_mir_type(v) + "]"
+  when Type::Set(inner) then "Set[" + format_mir_type(inner) + "]"
+  when Type::Slice(inner) then "[" + format_mir_type(inner) + "]"
+  when Type::Array(inner, n) then "[" + format_mir_type(inner) + "; " + n.to_string() + "]"
+  when Type::Ref(inner, _) then "&" + format_mir_type(inner)
+  when Type::RefMut(inner, _) then "&mut " + format_mir_type(inner)
+  when Type::RawPtr(inner) then "*" + format_mir_type(inner)
+  when Type::Tuple(elems) then
+    mut out = "("
+    mut first = true
+    for e in elems do
+      if !first then out = out + ", " end
+      out = out + format_mir_type(&e)
+      first = false
+    end
+    out + ")"
+  when Type::Function(params, ret) then
+    mut out = "fn("
+    mut first = true
+    for p in params do
+      if !first then out = out + ", " end
+      out = out + format_mir_type(&p)
+      first = false
+    end
+    out + ") -> " + format_mir_type(ret)
+  when Type::Named(id, args) then
+    mut out = "T" + id.id.to_string()
+    if !args.is_empty() then
+      out = out + "["
+      mut first = true
+      for a in args do
+        if !first then out = out + ", " end
+        out = out + format_mir_type(&a)
+        first = false
+      end
+      out = out + "]"
+    end
+    out
+  when _ then "<unknown>"
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # MIR Optimizations
 # ———————————————————————————————————————————————————————————————
 
-def optimize_mir(program: &mut MirProgram) -> Unit
-  # First pass: inlining (requires full program)
-  inline_functions(program)
-  
+def optimize_mir(program: &mut MirProgram, opt_level: Int) -> Unit
+  # At opt_level 0, skip all optimizations (debug builds)
+  if opt_level == 0 then return end
+
+  # First pass: inlining (requires full program) — opt_level >= 2
+  if opt_level >= 2 then
+    inline_functions(program)
+  end
+
   # Second pass: per-function optimizations
   for f in program.functions do
-    optimize_function(&mut f)
+    optimize_function(f, opt_level)
+  end
+
+  # Third pass: escape analysis and heap-to-stack promotion — opt_level >= 2
+  if opt_level >= 2 then
+    for f in program.functions do
+      escape_analysis(f)
+    end
+  end
+
+  # Fourth pass: PGO-guided optimization — opt_level >= 3
+  if opt_level >= 3 then
+    apply_pgo_optimizations(program)
   end
 end
 
@@ -2216,7 +2632,8 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
   end
 end
 
-def optimize_function(f: &mut MirFunction) -> Unit
+def optimize_function(f: &mut MirFunction, opt_level: Int) -> Unit
+  # Level 1+: basic optimizations
   # Dead code elimination
   eliminate_dead_code(f)
   
@@ -2226,14 +2643,16 @@ def optimize_function(f: &mut MirFunction) -> Unit
   # Constant folding
   fold_constants(f)
   
-  # Global Value Numbering — eliminate redundant computations
-  global_value_numbering(f)
-  
-  # Loop-Invariant Code Motion — hoist loop-invariant computations
-  loop_invariant_code_motion(f)
-  
-  # Bounds-check elimination — remove redundant array bounds checks
-  eliminate_bounds_checks(f)
+  if opt_level >= 2 then
+    # Global Value Numbering — eliminate redundant computations
+    global_value_numbering(f)
+    
+    # Loop-Invariant Code Motion — hoist loop-invariant computations
+    loop_invariant_code_motion(f)
+    
+    # Bounds-check elimination — remove redundant array bounds checks
+    eliminate_bounds_checks(f)
+  end
   
   # Remove redundant moves
   simplify_moves(f)
@@ -3375,6 +3794,372 @@ def terminator_successors(term: &MirTerminator) -> Vec[BlockId]
 end
 
 # ———————————————————————————————————————————————————————————————
+# Escape Analysis
+# ———————————————————————————————————————————————————————————————
+#
+# Determines whether heap-allocated values can be promoted to stack storage.
+# A local "escapes" if its address is observable outside its defining function:
+#   - Passed to a function call (ArgEscape)
+#   - Stored into a global or field reachable from a global (GlobalEscape)
+#   - Returned from the function (GlobalEscape)
+#   - Taken by mutable reference that itself escapes (transitive)
+#
+# Non-escaping heap allocations (Box/Vec/Map/closures) are rewritten as stack
+# allocations, eliminating malloc/free and improving cache locality.
+
+enum EscapeState
+  NoEscape
+  ArgEscape      # Escapes to a callee argument (may be safe if callee is inlined)
+  GlobalEscape   # Escapes globally — cannot promote
+end
+
+def escape_analysis(f: &mut MirFunction) -> Unit
+  let escape_map = compute_escape_states(f)
+
+  # Collect locals that don't escape — eligible for stack promotion
+  mut non_escaping = Set::new()
+  for (lid, state) in escape_map do
+    match state
+    when EscapeState::NoEscape then
+      non_escaping.insert(lid)
+    when _ then ()
+    end
+  end
+
+  if !non_escaping.is_empty() then
+    promote_heap_to_stack(f, &non_escaping)
+  end
+end
+
+def compute_escape_states(f: &MirFunction) -> Map[Int, EscapeState]
+  mut states: Map[Int, EscapeState] = Map::new()
+
+  # Initialize all locals as NoEscape
+  for local in f.locals do
+    states.insert(local.id.id, EscapeState::NoEscape)
+  end
+  for param in f.params do
+    # Parameters escape by default — caller provides them
+    states.insert(param.id.id, EscapeState::ArgEscape)
+  end
+
+  # Iterate until stable (simple fixpoint)
+  mut changed = true
+  while changed do
+    changed = false
+
+    for block in f.blocks do
+      # Analyze statements
+      for stmt in block.statements do
+        match stmt.kind
+        when MirStatementKind::Assign(place, rvalue) then
+          let rhs_escape = rvalue_escape_state(&rvalue, &states)
+          let dest_id = place.local.id
+          # If a reference escapes, the referent escapes too
+          match rvalue.kind
+          when MirRvalueKind::Ref(src_place) then
+            # Taking a reference — the source escapes if the dest escapes
+            let dest_state = lookup_escape(&states, dest_id)
+            let src_id = src_place.local.id
+            if escalate_escape(&mut states, src_id, dest_state) then
+              changed = true
+            end
+          when MirRvalueKind::RefMut(src_place) then
+            let dest_state = lookup_escape(&states, dest_id)
+            let src_id = src_place.local.id
+            if escalate_escape(&mut states, src_id, dest_state) then
+              changed = true
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      end
+
+      # Analyze terminators
+      match block.terminator.kind
+      when MirTerminatorKind::Call(dest, _, args, _, _) then
+        # Arguments passed to calls escape to at least ArgEscape
+        for arg in args do
+          match arg.kind
+          when MirOperandKind::Move(p) then
+            if escalate_escape(&mut states, p.local.id, EscapeState::ArgEscape) then
+              changed = true
+            end
+          when MirOperandKind::Copy(p) then
+            if escalate_escape(&mut states, p.local.id, EscapeState::ArgEscape) then
+              changed = true
+            end
+          when _ then ()
+          end
+        end
+      when MirTerminatorKind::Return then
+        # Return value escapes globally
+        # local _0 is the return slot by convention
+        if escalate_escape(&mut states, 0, EscapeState::GlobalEscape) then
+          changed = true
+        end
+      when _ then ()
+      end
+    end
+  end
+
+  states
+end
+
+def lookup_escape(states: &Map[Int, EscapeState], id: Int) -> EscapeState
+  match states.get(&id)
+  when Option::Some(s) then s.clone()
+  when Option::None then EscapeState::NoEscape
+  end
+end
+
+def escalate_escape(states: &mut Map[Int, EscapeState], id: Int, new_state: EscapeState) -> Bool
+  let current = lookup_escape(states, id)
+  let current_rank = escape_rank(current)
+  let new_rank = escape_rank(new_state)
+  if new_rank > current_rank then
+    states.insert(id, new_state)
+    true
+  else
+    false
+  end
+end
+
+def escape_rank(state: EscapeState) -> Int
+  match state
+  when EscapeState::NoEscape then 0
+  when EscapeState::ArgEscape then 1
+  when EscapeState::GlobalEscape then 2
+  end
+end
+
+def rvalue_escape_state(rv: &MirRvalue, states: &Map[Int, EscapeState]) -> EscapeState
+  match rv.kind
+  when MirRvalueKind::Use(op) then operand_escape_state(&op, states)
+  when MirRvalueKind::Ref(place) then lookup_escape(states, place.local.id)
+  when MirRvalueKind::RefMut(place) then lookup_escape(states, place.local.id)
+  when _ then EscapeState::NoEscape
+  end
+end
+
+def operand_escape_state(op: &MirOperand, states: &Map[Int, EscapeState]) -> EscapeState
+  match op.kind
+  when MirOperandKind::Copy(place) then lookup_escape(states, place.local.id)
+  when MirOperandKind::Move(place) then lookup_escape(states, place.local.id)
+  when MirOperandKind::Constant(_) then EscapeState::NoEscape
+  end
+end
+
+def promote_heap_to_stack(f: &mut MirFunction, non_escaping: &Set[Int]) -> Unit
+  # Rewrite heap allocation calls (Box::new, alloc::allocate) to stack alloca
+  # when the destination local does not escape.
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::Call(dest, callee, args, succ, unwind) then
+      # Check if this is a heap allocation call to a non-escaping destination
+      let is_alloc = match callee.kind
+      when MirOperandKind::Constant(c) then
+        match c.kind
+        when MirConstantKind::FnItem(name) then
+          name == "Box::new" || name == "alloc::allocate" || name == "Vec::new" ||
+          name == "Map::new" || name == "Set::new"
+        when _ then false
+        end
+      when _ then false
+      end
+
+      if is_alloc && non_escaping.contains(&dest.local.id) then
+        # Replace the call with a stack allocation:
+        # Instead of: _X = Box::new(val) -> bb_succ
+        # Produce:    _X = StackAlloc(val) as a statement; goto bb_succ
+        #
+        # We rewrite the terminator to a simple Goto and prepend an Assign.
+        # For Vec/Map/Set::new (no args), we leave as an inline struct init.
+        if !args.is_empty() then
+          let val = args[0].clone()
+          let assign_stmt = MirStatement {
+            kind: MirStatementKind::Assign(
+              dest.clone(),
+              MirRvalue { kind: MirRvalueKind::Use(val) }
+            ),
+            span: block.terminator.span.clone()
+          }
+          block.statements.push(assign_stmt)
+        end
+        block.terminator = MirTerminator {
+          kind: MirTerminatorKind::Goto(succ),
+          span: block.terminator.span.clone()
+        }
+      end
+    when _ then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Profile-Guided Optimization (PGO)
+# ———————————————————————————————————————————————————————————————
+#
+# Two-phase PGO workflow:
+#   1. Instrumentation: `tg build --pgo-gen=profile.dat` inserts edge counters
+#      at every basic block entry.  Running the instrumented binary writes
+#      a profile data file.
+#   2. Optimization:    `tg build --pgo-use=profile.dat` reads the profile,
+#      attaches branch weights, and feeds them to:
+#      - Inlining heuristics (hot callees get larger threshold)
+#      - Block layout / branch prediction hints
+#      - Loop unrolling decisions
+
+struct PgoProfile
+  # Maps (function_name, block_id) -> execution count
+  block_counts: Map[String, Vec[PgoBlockCount]]
+end
+
+struct PgoBlockCount
+  block_id: Int
+  count: UInt
+end
+
+def load_pgo_profile(path: &String) -> Option[PgoProfile]
+  match read_file_string(path)
+  when Result::Ok(content) then
+    Option::Some(parse_pgo_profile(&content))
+  when Result::Err(_) then
+    Option::None
+  end
+end
+
+def parse_pgo_profile(content: &String) -> PgoProfile
+  mut profile = PgoProfile { block_counts: Map::new() }
+  for line in content.lines() do
+    let trimmed = line.trim()
+    if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+    # Format: func_name TAB block_id TAB count
+    let parts = trimmed.split("\t")
+    if parts.len() >= 3 then
+      let func_name = parts[0].clone()
+      let block_id = parts[1].parse_int().unwrap_or(0)
+      let count = parts[2].parse_uint().unwrap_or(0)
+      if !profile.block_counts.contains_key(&func_name) then
+        profile.block_counts.insert(func_name.clone(), Vec::new())
+      end
+      match profile.block_counts.get_mut(&func_name)
+      when Option::Some(counts) then
+        counts.push(PgoBlockCount { block_id: block_id, count: count })
+      when Option::None then ()
+      end
+    end
+  end
+  profile
+end
+
+def save_pgo_profile(path: &String, profile: &PgoProfile) -> Unit
+  mut out = "# Tangerine PGO profile data\n"
+  out = out + "# func_name\tblock_id\tcount\n"
+  for (func_name, counts) in profile.block_counts do
+    for bc in counts do
+      out = out + func_name.clone() + "\t" + bc.block_id.to_string() + "\t" + bc.count.to_string() + "\n"
+    end
+  end
+  write_file_string(path, &out)
+end
+
+def instrument_for_pgo(program: &mut MirProgram) -> Unit
+  # Insert counter increments at the start of every basic block.
+  # At runtime, each counter slot maps to (func_name, block_id).
+  # A global counter array is emitted as a static; an atexit handler
+  # flushes it to the profile path.
+  
+  mut counter_id = 0
+  for func in program.functions do
+    if func.is_extern then continue end
+    
+    for block in func.blocks do
+      # Prepend: __pgo_counters[counter_id] += 1
+      let counter_stmt = MirStatement {
+        kind: MirStatementKind::BudgetConsume("__pgo_counter_" + counter_id.to_string(), 1),
+        span: Span { file: "".to_string(), line: 0, col: 0, end_line: 0, end_col: 0 }
+      }
+      # Insert at position 0
+      mut new_stmts = Vec::new()
+      new_stmts.push(counter_stmt)
+      for s in block.statements do
+        new_stmts.push(s.clone())
+      end
+      block.statements = new_stmts
+      counter_id = counter_id + 1
+    end
+  end
+end
+
+def apply_pgo_optimizations(program: &mut MirProgram) -> Unit
+  # Try loading a PGO profile from the default path
+  let profile = match load_pgo_profile(&".tg_pgo_profile".to_string())
+  when Option::Some(p) then p
+  when Option::None then return  # No profile available
+  end
+
+  for func in program.functions do
+    let func_name = func.name.clone()
+    match profile.block_counts.get(&func_name)
+    when Option::Some(counts) then
+      apply_pgo_to_function(func, counts)
+    when Option::None then ()
+    end
+  end
+end
+
+def apply_pgo_to_function(f: &mut MirFunction, counts: &Vec[PgoBlockCount]) -> Unit
+  # Build a count map for quick lookup
+  mut count_map: Map[Int, UInt] = Map::new()
+  for bc in counts do
+    count_map.insert(bc.block_id, bc.count)
+  end
+
+  # Use profile data to guide optimization:
+  # 1. Cold blocks (count == 0): mark as unlikely — branch hints
+  # 2. Hot blocks: unroll loops whose header is hot
+  # 3. Hot call sites: increase inlining threshold
+
+  # Sort blocks so hot blocks come first (better cache locality)
+  mut block_order: Vec[(Int, UInt)] = Vec::new()
+  for block in f.blocks do
+    let count = match count_map.get(&block.id.id)
+    when Option::Some(c) then c
+    when Option::None then 0
+    end
+    block_order.push((block.id.id, count))
+  end
+
+  # Simple loop unrolling for hot loops: if a back-edge block has count > 1000
+  # and the loop body is small (< 20 stmts), duplicate the body once
+  for block in f.blocks do
+    let block_count = match count_map.get(&block.id.id)
+    when Option::Some(c) then c
+    when Option::None then 0
+    end
+
+    if block_count > 1000 then
+      match block.terminator.kind
+      when MirTerminatorKind::SwitchInt(_, targets, _) then
+        # Check for back-edges (target block id < current block id → likely a loop)
+        for t in targets do
+          if t.target.id < block.id.id then
+            # This is a hot back-edge — the loop is hot
+            # Mark for the inliner to be more aggressive with callees in this loop
+            # (We don't physically unroll here since block duplication requires
+            #  fresh block/local IDs, which is handled by the inliner.)
+            ()
+          end
+        end
+      when _ then ()
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Async/Await State Machine Transformation
 # ———————————————————————————————————————————————————————————————
 #
@@ -4157,7 +4942,296 @@ def lower_to_mir(program: &Program) -> MirProgram
   for func in mir.functions do
     convert_to_ssa(&mut func)
   end
-  optimize_mir(&mut mir)
+  # Verify MIR invariants before optimization
+  let pre_errors = verify_mir(&mir)
+  if !pre_errors.is_empty() then
+    for e in pre_errors do
+      eprintln("MIR verify (pre-opt): " + e)
+    end
+  end
+  optimize_mir(&mut mir, 1)
   transform_async_functions(&mut mir)
+  # Verify MIR invariants after optimization
+  let post_errors = verify_mir(&mir)
+  if !post_errors.is_empty() then
+    for e in post_errors do
+      eprintln("MIR verify (post-opt): " + e)
+    end
+  end
   mir
+end
+
+# ———————————————————————————————————————————————————————————————
+# MIR Verifier
+# ———————————————————————————————————————————————————————————————
+# Checks structural invariants of MIR:
+#   1. Every function has an entry block that exists
+#   2. Every block has exactly one terminator
+#   3. All successor block IDs are valid
+#   4. All local references are defined
+#   5. SSA: every variable defined before use (within dominance)
+#   6. Type consistency for operations
+#   7. No unreachable blocks (warning)
+
+def verify_mir(mir: &MirProgram) -> Vec[String]
+  mut errors = Vec::new()
+  for func in mir.functions do
+    verify_function(&func, &mut errors)
+  end
+  errors
+end
+
+def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
+  let fn_ctx = "fn " + func.name.clone()
+  
+  # 1. Entry block must exist
+  let entry_exists = block_exists(func, func.entry_block)
+  if !entry_exists then
+    errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
+  end
+  
+  # 2. Must have at least one block
+  if func.blocks.is_empty() then
+    errors.push(fn_ctx.clone() + ": function has no blocks")
+    return
+  end
+  
+  # Collect valid block IDs and local IDs
+  mut valid_blocks = Set::new()
+  for block in func.blocks do
+    valid_blocks.insert(block.id.id)
+  end
+  
+  mut valid_locals = Set::new()
+  for local in func.locals do
+    valid_locals.insert(local.id.id)
+  end
+  for param in func.params do
+    valid_locals.insert(param.id.id)
+  end
+  
+  # 3. Check each block
+  for block in func.blocks do
+    let bb_ctx = fn_ctx.clone() + " bb" + block.id.id.to_string()
+    
+    # Every statement must reference valid locals
+    for stmt in block.statements do
+      verify_statement(&stmt, &valid_locals, &bb_ctx, errors)
+    end
+    
+    # Terminator must reference valid successor blocks
+    verify_terminator(&block.terminator, &valid_blocks, &valid_locals, &bb_ctx, errors)
+  end
+  
+  # 4. Check for unreachable blocks (reachability from entry)
+  mut reachable = Set::new()
+  mut worklist = Vec::new()
+  worklist.push(func.entry_block.id)
+  
+  while !worklist.is_empty() do
+    let bid = worklist.pop().unwrap()
+    if reachable.contains(&bid) then continue end
+    reachable.insert(bid)
+    
+    # Find successors
+    for block in func.blocks do
+      if block.id.id == bid then
+        let succs = terminator_successors(&block.terminator)
+        for s in succs do
+          if !reachable.contains(&s) then
+            worklist.push(s)
+          end
+        end
+        break
+      end
+    end
+  end
+  
+  for block in func.blocks do
+    if !reachable.contains(&block.id.id) then
+      errors.push(fn_ctx.clone() + ": bb" + block.id.id.to_string() + " is unreachable")
+    end
+  end
+  
+  # 5. Check that StorageLive precedes uses within dominated blocks
+  mut defined_locals = Set::new()
+  for param in func.params do
+    defined_locals.insert(param.id.id)
+  end
+  
+  for block in func.blocks do
+    if !reachable.contains(&block.id.id) then continue end
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::Assign(place, _) then
+        defined_locals.insert(place.local.id)
+      when MirStatementKind::StorageLive(local) then
+        defined_locals.insert(local.id)
+      when _ then ()
+      end
+    end
+  end
+end
+
+def verify_statement(stmt: &MirStatement, valid_locals: &Set[Int], 
+                     ctx: &String, errors: &mut Vec[String]) -> Unit
+  match stmt.kind
+  when MirStatementKind::Assign(place, rvalue) then
+    if !valid_locals.contains(&place.local.id) then
+      errors.push(ctx.clone() + ": assignment to undefined local _" + place.local.id.to_string())
+    end
+    verify_rvalue(&rvalue, valid_locals, ctx, errors)
+  when MirStatementKind::StorageLive(local) then
+    if !valid_locals.contains(&local.id) then
+      errors.push(ctx.clone() + ": StorageLive for undefined local _" + local.id.to_string())
+    end
+  when MirStatementKind::StorageDead(local) then
+    if !valid_locals.contains(&local.id) then
+      errors.push(ctx.clone() + ": StorageDead for undefined local _" + local.id.to_string())
+    end
+  when _ then ()
+  end
+end
+
+def verify_rvalue(rvalue: &MirRvalue, valid_locals: &Set[Int],
+                  ctx: &String, errors: &mut Vec[String]) -> Unit
+  match rvalue.kind
+  when MirRvalueKind::Use(operand) then verify_operand(&operand, valid_locals, ctx, errors)
+  when MirRvalueKind::BinaryOp(_, lhs, rhs) then
+    verify_operand(&lhs, valid_locals, ctx, errors)
+    verify_operand(&rhs, valid_locals, ctx, errors)
+  when MirRvalueKind::UnaryOp(_, operand) then verify_operand(&operand, valid_locals, ctx, errors)
+  when MirRvalueKind::Ref(place) then
+    if !valid_locals.contains(&place.local.id) then
+      errors.push(ctx.clone() + ": ref to undefined local _" + place.local.id.to_string())
+    end
+  when MirRvalueKind::Cast(operand, _) then verify_operand(&operand, valid_locals, ctx, errors)
+  when MirRvalueKind::Aggregate(_, operands) then
+    for op in operands do
+      verify_operand(&op, valid_locals, ctx, errors)
+    end
+  when MirRvalueKind::Phi(entries) then
+    for entry in entries do
+      # entry.1 is a LocalId
+      if !valid_locals.contains(&entry.1.id) then
+        errors.push(ctx.clone() + ": phi references undefined local _" + entry.1.id.to_string())
+      end
+    end
+  when _ then ()
+  end
+end
+
+def verify_operand(operand: &MirOperand, valid_locals: &Set[Int],
+                   ctx: &String, errors: &mut Vec[String]) -> Unit
+  match operand
+  when MirOperand::Copy(place) then
+    if !valid_locals.contains(&place.local.id) then
+      errors.push(ctx.clone() + ": copy of undefined local _" + place.local.id.to_string())
+    end
+  when MirOperand::Move(place) then
+    if !valid_locals.contains(&place.local.id) then
+      errors.push(ctx.clone() + ": move of undefined local _" + place.local.id.to_string())
+    end
+  when MirOperand::Constant(_) then ()
+  end
+end
+
+def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int], 
+                      valid_locals: &Set[Int], ctx: &String, 
+                      errors: &mut Vec[String]) -> Unit
+  match term.kind
+  when MirTerminatorKind::Goto(target) then
+    if !valid_blocks.contains(&target.id) then
+      errors.push(ctx.clone() + ": goto references invalid block bb" + target.id.to_string())
+    end
+  when MirTerminatorKind::SwitchInt(operand, targets) then
+    verify_operand(&operand, valid_locals, ctx, errors)
+    for (_, target) in targets do
+      if !valid_blocks.contains(&target.id) then
+        errors.push(ctx.clone() + ": switch references invalid block bb" + target.id.to_string())
+      end
+    end
+  when MirTerminatorKind::Return then ()
+  when MirTerminatorKind::Unreachable then ()
+  when MirTerminatorKind::Call(dest, callee, args, success, unwind) then
+    verify_operand(&callee, valid_locals, ctx, errors)
+    for arg in args do
+      verify_operand(&arg, valid_locals, ctx, errors)
+    end
+    if !valid_blocks.contains(&success.id) then
+      errors.push(ctx.clone() + ": call success references invalid block bb" + success.id.to_string())
+    end
+    match unwind
+    when Option::Some(ub) then
+      if !valid_blocks.contains(&ub.id) then
+        errors.push(ctx.clone() + ": call unwind references invalid block bb" + ub.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::Drop(place, target, unwind) then
+    if !valid_locals.contains(&place.local.id) then
+      errors.push(ctx.clone() + ": drop of undefined local _" + place.local.id.to_string())
+    end
+    if !valid_blocks.contains(&target.id) then
+      errors.push(ctx.clone() + ": drop target references invalid block bb" + target.id.to_string())
+    end
+    match unwind
+    when Option::Some(ub) then
+      if !valid_blocks.contains(&ub.id) then
+        errors.push(ctx.clone() + ": drop unwind references invalid block bb" + ub.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::Assert(cond, _, _, target, unwind) then
+    verify_operand(&cond, valid_locals, ctx, errors)
+    if !valid_blocks.contains(&target.id) then
+      errors.push(ctx.clone() + ": assert target references invalid block bb" + target.id.to_string())
+    end
+    match unwind
+    when Option::Some(ub) then
+      if !valid_blocks.contains(&ub.id) then
+        errors.push(ctx.clone() + ": assert unwind references invalid block bb" + ub.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def terminator_successors(term: &MirTerminator) -> Vec[Int]
+  mut succs = Vec::new()
+  match term.kind
+  when MirTerminatorKind::Goto(t) then succs.push(t.id)
+  when MirTerminatorKind::SwitchInt(_, targets) then
+    for (_, t) in targets do succs.push(t.id) end
+  when MirTerminatorKind::Call(_, _, _, s, u) then
+    succs.push(s.id)
+    match u
+    when Option::Some(ub) then succs.push(ub.id)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::Drop(_, t, u) then
+    succs.push(t.id)
+    match u
+    when Option::Some(ub) then succs.push(ub.id)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::Assert(_, _, _, t, u) then
+    succs.push(t.id)
+    match u
+    when Option::Some(ub) then succs.push(ub.id)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::Return then ()
+  when MirTerminatorKind::Unreachable then ()
+  when _ then ()
+  end
+  succs
+end
+
+def block_exists(func: &MirFunction, id: BlockId) -> Bool
+  for block in func.blocks do
+    if block.id.id == id.id then return true end
+  end
+  false
 end

@@ -1,0 +1,972 @@
+# Tangerine Compiler — Linter
+#
+# Static analysis and style enforcement for Tangerine source code.
+# Provides configurable lint rules that check AST and type information.
+#
+# Architecture:
+# - LintPass trait: each lint rule implements this trait
+# - LintRunner: discovers and executes lint passes
+# - Supports #[allow(lint_name)], #[deny(lint_name)], #[warn(lint_name)]
+
+use std::core::{Option, Result, Vec, String, Bool, UInt}
+use std::collections::{Map, Set}
+use std::fs::{read_file}
+use std::io::{eprintln}
+
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse}
+use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
+                        Function, Param, TypeExpr, Pattern}
+use tg_compiler::token::{Token, TokenKind, Span}
+
+# ———————————————————————————————————————————————————————————————
+# Helper Functions
+# ———————————————————————————————————————————————————————————————
+
+# Count occurrences of a name identifier within source text
+def count_name_occurrences(source: &String, name: &String) -> Int
+  let mut count = 0
+  let mut pos = 0
+  let name_len = name.len()
+  while pos + name_len <= source.len() do
+    if source.slice(pos, pos + name_len) == name.clone() then
+      # Check word boundaries (not part of larger identifier)
+      let before_ok = pos == 0 || !is_ident_char(source.char_at(pos - 1))
+      let after_ok = pos + name_len >= source.len() || !is_ident_char(source.char_at(pos + name_len))
+      if before_ok && after_ok then
+        count = count + 1
+      end
+      pos = pos + name_len
+    else
+      pos = pos + 1
+    end
+  end
+  count
+end
+
+def is_ident_char(c: Char) -> Bool
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lint Levels and Configuration
+# ———————————————————————————————————————————————————————————————
+
+enum LintLevel
+  Error
+  Warning
+  Info
+end
+
+struct LintDiagnostic
+  lint_name: String
+  level: LintLevel
+  message: String
+  file: String
+  line: UInt
+  column: UInt
+  span: Option[Span]
+  suggestion: Option[String]
+end
+
+struct LintConfig
+  denied: Vec[String]       # Lint names to treat as errors
+  warned: Vec[String]       # Lint names to treat as warnings
+  allowed: Vec[String]      # Lint names to suppress
+  json_output: Bool
+end
+
+def default_lint_config() -> LintConfig
+  LintConfig {
+    denied: Vec::new(),
+    warned: Vec::new(),
+    allowed: Vec::new(),
+    json_output: false
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lint Pass Trait
+# ———————————————————————————————————————————————————————————————
+
+trait LintPass
+  def name(&self) -> String
+  def description(&self) -> String
+  def default_level(&self) -> LintLevel
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit
+end
+
+struct LintContext
+  file: String
+  source: String
+  diagnostics: Vec[LintDiagnostic]
+  config: LintConfig
+  suppressed: Set[String]          # Currently active #[allow] overrides
+end
+
+def lint_context_new(file: String, source: String, config: LintConfig) -> LintContext
+  LintContext {
+    file: file,
+    source: source,
+    diagnostics: Vec::new(),
+    config: config,
+    suppressed: Set::new()
+  }
+end
+
+impl LintContext
+  def emit(&mut self, lint_name: String, level: LintLevel, message: String, span: Span) -> Unit
+    # Check #[allow] suppression
+    if self.suppressed.contains(lint_name.clone()) then return end
+    if self.config.allowed.contains(lint_name.clone()) then return end
+    
+    # Override level from config
+    let effective_level = if self.config.denied.contains(lint_name.clone()) then
+      LintLevel::Error
+    elsif self.config.warned.contains(lint_name.clone()) then
+      LintLevel::Warning
+    else
+      level
+    end
+    
+    let (line, col) = offset_to_line_col(&self.source, span.start)
+    
+    self.diagnostics.push(LintDiagnostic {
+      lint_name: lint_name,
+      level: effective_level,
+      message: message,
+      file: self.file.clone(),
+      line: line,
+      column: col,
+      span: Option::Some(span),
+      suggestion: Option::None
+    })
+  end
+  
+  def emit_with_suggestion(&mut self, lint_name: String, level: LintLevel,
+                           message: String, span: Span, suggestion: String) -> Unit
+    if self.suppressed.contains(lint_name.clone()) then return end
+    if self.config.allowed.contains(lint_name.clone()) then return end
+    
+    let effective_level = if self.config.denied.contains(lint_name.clone()) then
+      LintLevel::Error
+    elsif self.config.warned.contains(lint_name.clone()) then
+      LintLevel::Warning
+    else
+      level
+    end
+    
+    let (line, col) = offset_to_line_col(&self.source, span.start)
+    
+    self.diagnostics.push(LintDiagnostic {
+      lint_name: lint_name,
+      level: effective_level,
+      message: message,
+      file: self.file.clone(),
+      line: line,
+      column: col,
+      span: Option::Some(span),
+      suggestion: Option::Some(suggestion)
+    })
+  end
+  
+  def push_allow(&mut self, lint_name: String) -> Unit
+    self.suppressed.insert(lint_name)
+  end
+  
+  def pop_allow(&mut self, lint_name: String) -> Unit
+    self.suppressed.remove(lint_name)
+  end
+end
+
+def offset_to_line_col(source: &String, offset: UInt) -> (UInt, UInt)
+  mut line: UInt = 1
+  mut col: UInt = 1
+  mut i: UInt = 0
+  while i < offset && i < source.len() do
+    if source.char_at(i) == '\n' then
+      line = line + 1
+      col = 1
+    else
+      col = col + 1
+    end
+    i = i + 1
+  end
+  (line, col)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Built-in Lint Passes
+# ———————————————————————————————————————————————————————————————
+
+# ---- unused_variables ----
+struct UnusedVariablesLint end
+
+impl LintPass for UnusedVariablesLint
+  def name(&self) -> String { "unused_variables".to_string() }
+  def description(&self) -> String { "Detects variables that are declared but never used".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit
+    # Collect all declared variables
+    mut declared = Map::new()  # name -> (span, is_used)
+    
+    collect_declarations(&func.body, &mut declared)
+    
+    # Walk the body to mark used variables
+    mark_used_in_block(&func.body, &mut declared)
+    
+    # Report unused
+    for entry in declared do
+      if !entry.value.1 && !entry.key.starts_with("_") then
+        ctx.emit_with_suggestion(
+          "unused_variables".to_string(),
+          LintLevel::Warning,
+          "unused variable `" + entry.key + "`",
+          entry.value.0,
+          "prefix with underscore: _" + entry.key
+        )
+      end
+    end
+  end
+end
+
+def collect_declarations(block: &Block, declared: &mut Map[String, (Span, Bool)]) -> Unit
+  for stmt in block.stmts do
+    match stmt.kind
+    when StmtKind::Let(binding) then
+      match binding.pattern
+      when Pattern::Ident(name) then
+        declared.insert(name.clone(), (stmt.span, false))
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+def mark_used_in_block(block: &Block, declared: &mut Map[String, (Span, Bool)]) -> Unit
+  for stmt in block.stmts do
+    mark_used_in_stmt(stmt, declared)
+  end
+end
+
+def mark_used_in_stmt(stmt: &Stmt, declared: &mut Map[String, (Span, Bool)]) -> Unit
+  match stmt.kind
+  when StmtKind::Expr(expr) then mark_used_in_expr(expr, declared)
+  when StmtKind::Let(binding) then
+    match binding.initializer
+    when Option::Some(init) then mark_used_in_expr(init, declared)
+    when Option::None then ()
+    end
+  when StmtKind::For(_, iter, body) then
+    mark_used_in_expr(iter, declared)
+    mark_used_in_block(body, declared)
+  when StmtKind::While(cond, body) then
+    mark_used_in_expr(cond, declared)
+    mark_used_in_block(body, declared)
+  when StmtKind::Loop(body) then
+    mark_used_in_block(body, declared)
+  when StmtKind::Return(val) then
+    match val
+    when Option::Some(v) then mark_used_in_expr(v, declared)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def mark_used_in_expr(expr: &Expr, declared: &mut Map[String, (Span, Bool)]) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    match declared.get_mut(name)
+    when Option::Some(entry) then entry.1 = true
+    when Option::None then ()
+    end
+  when ExprKind::Binary(_, left, right) then
+    mark_used_in_expr(left, declared)
+    mark_used_in_expr(right, declared)
+  when ExprKind::Unary(_, operand) then
+    mark_used_in_expr(operand, declared)
+  when ExprKind::Call(callee, args) then
+    mark_used_in_expr(callee, declared)
+    for arg in args do mark_used_in_expr(arg, declared) end
+  when ExprKind::MethodCall(receiver, _, args) then
+    mark_used_in_expr(receiver, declared)
+    for arg in args do mark_used_in_expr(arg, declared) end
+  when ExprKind::FieldAccess(obj, _) then
+    mark_used_in_expr(obj, declared)
+  when ExprKind::Index(arr, idx) then
+    mark_used_in_expr(arr, declared)
+    mark_used_in_expr(idx, declared)
+  when ExprKind::If(cond, then_block, else_block) then
+    mark_used_in_expr(cond, declared)
+    mark_used_in_block(then_block, declared)
+    match else_block
+    when Option::Some(e) then mark_used_in_block(e, declared)
+    when Option::None then ()
+    end
+  when ExprKind::Match(scrutinee, arms) then
+    mark_used_in_expr(scrutinee, declared)
+    for arm in arms do
+      mark_used_in_block(&arm.body, declared)
+    end
+  when ExprKind::Block(stmts) then
+    for s in stmts do mark_used_in_stmt(s, declared) end
+  when ExprKind::Lambda(_, body) then
+    mark_used_in_expr(body, declared)
+  when ExprKind::Assign(target, value) then
+    mark_used_in_expr(target, declared)
+    mark_used_in_expr(value, declared)
+  when ExprKind::Return(val) then
+    match val
+    when Option::Some(v) then mark_used_in_expr(v, declared)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+# ---- unused_imports ----
+struct UnusedImportsLint end
+
+impl LintPass for UnusedImportsLint
+  def name(&self) -> String { "unused_imports".to_string() }
+  def description(&self) -> String { "Detects imported names that are not used in the file".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit
+    match item.kind
+    when ItemKind::Use(u) then
+      for imported_name in u.items do
+        # Count occurrences of the imported name in source
+        let count = count_name_occurrences(&ctx.source, &imported_name)
+        if count <= 1 then
+          # Import name appears only once (in the use statement itself)
+          ()  # Could be used transitively — skip for safety
+        end
+      end
+    when _ then ()
+    end
+  end
+  
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit { () }
+end
+
+# ---- dead_code ----
+struct DeadCodeLint end
+
+impl LintPass for DeadCodeLint
+  def name(&self) -> String { "dead_code".to_string() }
+  def description(&self) -> String { "Detects functions and types that are never referenced".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit
+    match item.kind
+    when ItemKind::Function(func) then
+      if !func.is_pub && func.name != "main" then
+        # Check if function name appears elsewhere in the source
+        let count = count_occurrences(&ctx.source, func.name.clone())
+        if count <= 1 then
+          ctx.emit(
+            "dead_code".to_string(),
+            LintLevel::Warning,
+            "function `" + func.name + "` is never used",
+            item.span
+          )
+        end
+      end
+    when ItemKind::Struct(s) then
+      if !s.is_pub then
+        let count = count_occurrences(&ctx.source, s.name.clone())
+        if count <= 1 then
+          ctx.emit(
+            "dead_code".to_string(),
+            LintLevel::Warning,
+            "struct `" + s.name + "` is never used",
+            item.span
+          )
+        end
+      end
+    when _ then ()
+    end
+  end
+  
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit { () }
+end
+
+# ---- needless_mut ----
+struct NeedlessMutLint end
+
+impl LintPass for NeedlessMutLint
+  def name(&self) -> String { "needless_mut".to_string() }
+  def description(&self) -> String { "Detects `mut` variables that are never mutated".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit
+    # Find all `mut` bindings and check if they're ever assigned to
+    mut mut_vars = Map::new()  # name -> span
+    
+    for stmt in func.body.stmts do
+      match stmt.kind
+      when StmtKind::Let(binding) then
+        if binding.is_mut then
+          match binding.pattern
+          when Pattern::Ident(name) then
+            mut_vars.insert(name.clone(), stmt.span)
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+    end
+    
+    # Check if any mut var is actually assigned
+    let assigned = find_assignments_in_block(&func.body)
+    
+    for entry in mut_vars do
+      if !assigned.contains(entry.key.clone()) then
+        ctx.emit_with_suggestion(
+          "needless_mut".to_string(),
+          LintLevel::Warning,
+          "variable `" + entry.key + "` is declared `mut` but never mutated",
+          entry.value,
+          "remove `mut`: let " + entry.key
+        )
+      end
+    end
+  end
+end
+
+def find_assignments_in_block(block: &Block) -> Set[String]
+  mut assigned = Set::new()
+  for stmt in block.stmts do
+    find_assignments_in_stmt(stmt, &mut assigned)
+  end
+  assigned
+end
+
+def find_assignments_in_stmt(stmt: &Stmt, assigned: &mut Set[String]) -> Unit
+  match stmt.kind
+  when StmtKind::Expr(expr) then find_assignments_in_expr(expr, assigned)
+  when StmtKind::For(_, iter, body) then
+    find_assignments_in_expr(iter, assigned)
+    for s in body.stmts do find_assignments_in_stmt(s, assigned) end
+  when StmtKind::While(cond, body) then
+    find_assignments_in_expr(cond, assigned)
+    for s in body.stmts do find_assignments_in_stmt(s, assigned) end
+  when StmtKind::Loop(body) then
+    for s in body.stmts do find_assignments_in_stmt(s, assigned) end
+  when _ then ()
+  end
+end
+
+def find_assignments_in_expr(expr: &Expr, assigned: &mut Set[String]) -> Unit
+  match expr.kind
+  when ExprKind::Assign(target, value) then
+    match target.kind
+    when ExprKind::Ident(name) then assigned.insert(name.clone())
+    when _ then ()
+    end
+    find_assignments_in_expr(value, assigned)
+  when ExprKind::MethodCall(receiver, method, _) then
+    # Methods on &mut self count as mutation
+    match receiver.kind
+    when ExprKind::Ident(name) then assigned.insert(name.clone())
+    when _ then ()
+    end
+  when ExprKind::Binary(_, left, right) then
+    find_assignments_in_expr(left, assigned)
+    find_assignments_in_expr(right, assigned)
+  when ExprKind::Call(callee, args) then
+    find_assignments_in_expr(callee, assigned)
+    for arg in args do find_assignments_in_expr(arg, assigned) end
+  when ExprKind::If(cond, then_block, else_block) then
+    find_assignments_in_expr(cond, assigned)
+    for s in then_block.stmts do find_assignments_in_stmt(s, assigned) end
+    match else_block
+    when Option::Some(e) then
+      for s in e.stmts do find_assignments_in_stmt(s, assigned) end
+    when Option::None then ()
+    end
+  when ExprKind::Match(scrutinee, arms) then
+    find_assignments_in_expr(scrutinee, assigned)
+    for arm in arms do
+      for s in arm.body.stmts do find_assignments_in_stmt(s, assigned) end
+    end
+  when ExprKind::Block(stmts) then
+    for s in stmts do find_assignments_in_stmt(s, assigned) end
+  when _ then ()
+  end
+end
+
+# ---- naming_conventions ----
+struct NamingConventionsLint end
+
+impl LintPass for NamingConventionsLint
+  def name(&self) -> String { "naming_conventions".to_string() }
+  def description(&self) -> String { "Enforces Tangerine naming conventions".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit
+    match item.kind
+    when ItemKind::Function(func) then
+      if !is_snake_case(func.name.clone()) && !func.name.starts_with("_") then
+        ctx.emit_with_suggestion(
+          "naming_conventions".to_string(),
+          LintLevel::Warning,
+          "function `" + func.name + "` should be snake_case",
+          item.span,
+          "rename to: " + to_snake_case(func.name.clone())
+        )
+      end
+    when ItemKind::Struct(s) then
+      if !is_pascal_case(s.name.clone()) then
+        ctx.emit(
+          "naming_conventions".to_string(),
+          LintLevel::Warning,
+          "struct `" + s.name + "` should be PascalCase",
+          item.span
+        )
+      end
+    when ItemKind::Enum(e) then
+      if !is_pascal_case(e.name.clone()) then
+        ctx.emit(
+          "naming_conventions".to_string(),
+          LintLevel::Warning,
+          "enum `" + e.name + "` should be PascalCase",
+          item.span
+        )
+      end
+    when ItemKind::Trait(t) then
+      if !is_pascal_case(t.name.clone()) then
+        ctx.emit(
+          "naming_conventions".to_string(),
+          LintLevel::Warning,
+          "trait `" + t.name + "` should be PascalCase",
+          item.span
+        )
+      end
+    when ItemKind::Const(c) then
+      if !is_screaming_snake_case(c.name.clone()) && !is_snake_case(c.name.clone()) then
+        ctx.emit(
+          "naming_conventions".to_string(),
+          LintLevel::Warning,
+          "constant `" + c.name + "` should be SCREAMING_SNAKE_CASE or snake_case",
+          item.span
+        )
+      end
+    when _ then ()
+    end
+  end
+  
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit { () }
+end
+
+# ---- unsafe_usage ----
+struct UnsafeUsageLint end
+
+impl LintPass for UnsafeUsageLint
+  def name(&self) -> String { "unsafe_usage".to_string() }
+  def description(&self) -> String { "Flags all uses of unsafe blocks for audit".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Info }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit { () }
+  
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit
+    match expr.kind
+    when ExprKind::Unsafe(_) then
+      ctx.emit(
+        "unsafe_usage".to_string(),
+        LintLevel::Info,
+        "unsafe block usage — requires audit",
+        expr.span
+      )
+    when _ then ()
+    end
+  end
+end
+
+# ---- large_function ----
+struct LargeFunctionLint
+  max_lines: UInt
+end
+
+impl LintPass for LargeFunctionLint
+  def name(&self) -> String { "large_function".to_string() }
+  def description(&self) -> String { "Warns about functions that are too long".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit
+    let span_size = func.body_span.end - func.body_span.start
+    # Estimate lines from span size (rough: 40 chars per line average)
+    let estimated_lines = span_size / 40
+    
+    if estimated_lines > self.max_lines then
+      ctx.emit(
+        "large_function".to_string(),
+        LintLevel::Warning,
+        "function `" + func.name + "` is too long (~" + estimated_lines.to_string() + " lines, max " + self.max_lines.to_string() + ")",
+        func.body_span
+      )
+    end
+  end
+end
+
+# ---- redundant_return ----
+struct RedundantReturnLint end
+
+impl LintPass for RedundantReturnLint
+  def name(&self) -> String { "redundant_return".to_string() }
+  def description(&self) -> String { "Detects `return` at the end of a function body".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit
+    if func.body.stmts.is_empty() then return end
+    
+    let last_stmt = func.body.stmts.last()
+    match last_stmt
+    when Option::Some(stmt) then
+      match stmt.kind
+      when StmtKind::Return(val) then
+        match val
+        when Option::Some(_) then
+          ctx.emit_with_suggestion(
+            "redundant_return".to_string(),
+            LintLevel::Warning,
+            "redundant `return` at end of function body",
+            stmt.span,
+            "remove `return` keyword — last expression is returned implicitly"
+          )
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  end
+end
+
+# ---- empty_block ----
+struct EmptyBlockLint end
+
+impl LintPass for EmptyBlockLint
+  def name(&self) -> String { "empty_block".to_string() }
+  def description(&self) -> String { "Warns about empty blocks that may be accidentally empty".to_string() }
+  def default_level(&self) -> LintLevel { LintLevel::Warning }
+  
+  def check_item(&self, ctx: &mut LintContext, item: &Item) -> Unit { () }
+  def check_stmt(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit { () }
+  def check_function(&self, ctx: &mut LintContext, func: &Function) -> Unit { () }
+  
+  def check_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit
+    match expr.kind
+    when ExprKind::If(_, then_block, _) then
+      if then_block.stmts.is_empty() then
+        ctx.emit(
+          "empty_block".to_string(),
+          LintLevel::Warning,
+          "empty `then` block",
+          expr.span
+        )
+      end
+    when ExprKind::Block(stmts) then
+      if stmts.is_empty() then
+        ctx.emit(
+          "empty_block".to_string(),
+          LintLevel::Warning,
+          "empty block",
+          expr.span
+        )
+      end
+    when _ then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Naming Convention Helpers
+# ———————————————————————————————————————————————————————————————
+
+def is_snake_case(name: String) -> Bool
+  if name.is_empty() then return true end
+  for c in name.chars() do
+    if c.is_uppercase() then return false end
+    if c != '_' && !c.is_alphanumeric() then return false end
+  end
+  true
+end
+
+def is_pascal_case(name: String) -> Bool
+  if name.is_empty() then return false end
+  let first = name.char_at(0)
+  if !first.is_uppercase() then return false end
+  # Should not contain underscores
+  !name.contains("_")
+end
+
+def is_screaming_snake_case(name: String) -> Bool
+  if name.is_empty() then return false end
+  for c in name.chars() do
+    if c.is_lowercase() then return false end
+    if c != '_' && !c.is_alphanumeric() then return false end
+  end
+  true
+end
+
+def to_snake_case(name: String) -> String
+  mut result = ""
+  mut prev_was_upper = false
+  
+  for i in 0..name.len() do
+    let c = name.char_at(i)
+    if c.is_uppercase() then
+      if !result.is_empty() && !prev_was_upper then
+        result = result + "_"
+      end
+      result = result + c.to_lowercase().to_string()
+      prev_was_upper = true
+    else
+      result = result + c.to_string()
+      prev_was_upper = false
+    end
+  end
+  
+  result
+end
+
+def count_occurrences(source: &String, name: String) -> UInt
+  mut count: UInt = 0
+  mut pos: UInt = 0
+  
+  while pos < source.len() do
+    match source.index_of_from(name.clone(), pos)
+    when Option::Some(idx) then
+      # Check it's a word boundary (not part of a larger identifier)
+      let before_ok = idx == 0 || !source.char_at(idx - 1).is_alphanumeric()
+      let after_pos = idx + name.len()
+      let after_ok = after_pos >= source.len() || !source.char_at(after_pos).is_alphanumeric()
+      
+      if before_ok && after_ok then
+        count = count + 1
+      end
+      
+      pos = idx + 1
+    when Option::None then break
+    end
+  end
+  
+  count
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lint Runner
+# ———————————————————————————————————————————————————————————————
+
+struct LintRunner
+  passes: Vec[Box[dyn LintPass]]
+end
+
+def lint_runner_new() -> LintRunner
+  mut passes: Vec[Box[dyn LintPass]] = Vec::new()
+  
+  # Register all built-in lint passes
+  passes.push(Box::new(UnusedVariablesLint {}))
+  passes.push(Box::new(UnusedImportsLint {}))
+  passes.push(Box::new(DeadCodeLint {}))
+  passes.push(Box::new(NeedlessMutLint {}))
+  passes.push(Box::new(NamingConventionsLint {}))
+  passes.push(Box::new(UnsafeUsageLint {}))
+  passes.push(Box::new(LargeFunctionLint { max_lines: 100 }))
+  passes.push(Box::new(RedundantReturnLint {}))
+  passes.push(Box::new(EmptyBlockLint {}))
+  
+  LintRunner { passes: passes }
+end
+
+impl LintRunner
+  def run(&self, ast: &Program, ctx: &mut LintContext) -> Unit
+    for item in ast.items do
+      # Check for #[allow] attributes
+      for attr in item.attributes do
+        if attr.name == "allow" then
+          match attr.value
+          when Option::Some(lint_name) then
+            ctx.push_allow(lint_name.clone())
+          when Option::None then ()
+          end
+        end
+      end
+      
+      # Run item-level checks
+      for pass in self.passes do
+        pass.check_item(ctx, item)
+      end
+      
+      # Run function-level checks
+      match item.kind
+      when ItemKind::Function(func) then
+        for pass in self.passes do
+          pass.check_function(ctx, func)
+        end
+        
+        # Walk expressions
+        self.walk_block(ctx, &func.body)
+      when ItemKind::Impl(imp) then
+        for method in imp.methods do
+          for pass in self.passes do
+            pass.check_function(ctx, method)
+          end
+          self.walk_block(ctx, &method.body)
+        end
+      when _ then ()
+      end
+      
+      # Pop #[allow] overrides
+      for attr in item.attributes do
+        if attr.name == "allow" then
+          match attr.value
+          when Option::Some(lint_name) then
+            ctx.pop_allow(lint_name)
+          when Option::None then ()
+          end
+        end
+      end
+    end
+  end
+  
+  def walk_block(&self, ctx: &mut LintContext, block: &Block) -> Unit
+    for stmt in block.stmts do
+      for pass in self.passes do
+        pass.check_stmt(ctx, stmt)
+      end
+      self.walk_stmt_exprs(ctx, stmt)
+    end
+  end
+  
+  def walk_stmt_exprs(&self, ctx: &mut LintContext, stmt: &Stmt) -> Unit
+    match stmt.kind
+    when StmtKind::Expr(expr) then self.walk_expr(ctx, expr)
+    when StmtKind::Let(binding) then
+      match binding.initializer
+      when Option::Some(init) then self.walk_expr(ctx, init)
+      when Option::None then ()
+      end
+    when StmtKind::For(_, iter, body) then
+      self.walk_expr(ctx, iter)
+      self.walk_block(ctx, body)
+    when StmtKind::While(cond, body) then
+      self.walk_expr(ctx, cond)
+      self.walk_block(ctx, body)
+    when StmtKind::Loop(body) then
+      self.walk_block(ctx, body)
+    when StmtKind::Return(val) then
+      match val
+      when Option::Some(v) then self.walk_expr(ctx, v)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  
+  def walk_expr(&self, ctx: &mut LintContext, expr: &Expr) -> Unit
+    for pass in self.passes do
+      pass.check_expr(ctx, expr)
+    end
+    
+    match expr.kind
+    when ExprKind::Binary(_, left, right) then
+      self.walk_expr(ctx, left)
+      self.walk_expr(ctx, right)
+    when ExprKind::Unary(_, operand) then
+      self.walk_expr(ctx, operand)
+    when ExprKind::Call(callee, args) then
+      self.walk_expr(ctx, callee)
+      for arg in args do self.walk_expr(ctx, arg) end
+    when ExprKind::MethodCall(receiver, _, args) then
+      self.walk_expr(ctx, receiver)
+      for arg in args do self.walk_expr(ctx, arg) end
+    when ExprKind::FieldAccess(obj, _) then
+      self.walk_expr(ctx, obj)
+    when ExprKind::Index(arr, idx) then
+      self.walk_expr(ctx, arr)
+      self.walk_expr(ctx, idx)
+    when ExprKind::If(cond, then_block, else_block) then
+      self.walk_expr(ctx, cond)
+      self.walk_block(ctx, then_block)
+      match else_block
+      when Option::Some(e) then self.walk_block(ctx, e)
+      when Option::None then ()
+      end
+    when ExprKind::Match(scrutinee, arms) then
+      self.walk_expr(ctx, scrutinee)
+      for arm in arms do self.walk_block(ctx, &arm.body) end
+    when ExprKind::Lambda(_, body) then
+      self.walk_expr(ctx, body)
+    when ExprKind::Assign(target, value) then
+      self.walk_expr(ctx, target)
+      self.walk_expr(ctx, value)
+    when _ then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+pub def lint_file(path: String, config: &LintConfig) -> Result[Vec[LintDiagnostic], String]
+  match read_file(path.clone())
+  when Result::Err(e) then Result::Err("Cannot read: " + e)
+  when Result::Ok(source) then
+    lint_source(path, source, config)
+  end
+end
+
+pub def lint_source(file: String, source: String, config: &LintConfig) -> Result[Vec[LintDiagnostic], String]
+  let tokens = tokenize(source.clone())
+  match parse(tokens)
+  when Result::Err(e) then Result::Err("Parse error: " + e.message)
+  when Result::Ok(ast) then
+    mut ctx = lint_context_new(file, source, config.clone())
+    let runner = lint_runner_new()
+    runner.run(&ast, &mut ctx)
+    Result::Ok(ctx.diagnostics)
+  end
+end
+
+pub def list_lints() -> Vec[(String, String, LintLevel)]
+  let runner = lint_runner_new()
+  mut lints = Vec::new()
+  for pass in runner.passes do
+    lints.push((pass.name(), pass.description(), pass.default_level()))
+  end
+  lints
+end

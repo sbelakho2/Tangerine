@@ -157,7 +157,10 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Layout
-  let base_addr: u64 = 0x400000   # Standard Linux x86-64 base
+  # Note: 0x400000 is the standard Linux x86-64 ELF base address.
+  # macOS (Mach-O) uses 0x100000000 — see link_macho64().
+  # Windows (PE) uses 0x140000000 — see link_pe64().
+  let base_addr: u64 = 0x400000
   let ehdr_size = 64
   let phdr_size = 56
   let num_phdrs = sections.len()
@@ -584,4 +587,307 @@ def inject_start_a64_linux(text: &mut CodeBuffer) -> Unit
   a64_mov_rr(text, A64::X0, A64::X0)  # return code already in X0
   a64_mov_ri(text, A64::X8, 93)       # SYS_exit on ARM64 Linux
   a64_svc(text, 0)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Link-Time Optimization (LTO)
+# ———————————————————————————————————————————————————————————————
+
+enum LtoMode
+  None        # No LTO
+  Thin        # Thin LTO — per-module optimization + cross-module import
+  Fat         # Full LTO — all modules merged into one then optimized
+end
+
+struct LtoContext
+  mode: LtoMode
+  modules: Vec[LtoModule]
+  symbol_table: Map[String, LtoSymbolInfo]
+  call_graph: Map[String, Vec[String]]   # caller -> callees
+end
+
+struct LtoModule
+  name: String
+  mir_functions: Vec[MirFunction]
+  symbols: Vec[LtoSymbolInfo]
+end
+
+struct LtoSymbolInfo
+  name: String
+  module_idx: Int
+  is_exported: Bool
+  size_bytes: Int
+  call_count: Int     # How many times this symbol is referenced
+end
+
+def lto_context_new(mode: LtoMode) -> LtoContext
+  LtoContext {
+    mode: mode,
+    modules: Vec::new(),
+    symbol_table: Map::new(),
+    call_graph: Map::new()
+  }
+end
+
+def lto_add_module(ctx: &mut LtoContext, module: LtoModule) -> Unit
+  let idx = ctx.modules.len() as Int
+  for sym in module.symbols do
+    mut info = sym.clone()
+    info.module_idx = idx
+    ctx.symbol_table.insert(sym.name.clone(), info)
+  end
+  ctx.modules.push(module)
+end
+
+# Perform LTO: cross-module dead code elimination and inlining
+def perform_lto(ctx: &mut LtoContext) -> Unit
+  match ctx.mode
+  when LtoMode::None then return
+  when LtoMode::Thin then
+    lto_thin(ctx)
+  when LtoMode::Fat then
+    lto_fat(ctx)
+  end
+end
+
+def lto_thin(ctx: &mut LtoContext) -> Unit
+  # Phase 1: Build cross-module call graph
+  build_call_graph(ctx)
+  
+  # Phase 2: Cross-module dead code elimination
+  # Mark reachable symbols starting from exported ones
+  mut reachable = Set::new()
+  mut worklist = Vec::new()
+  
+  for entry in ctx.symbol_table do
+    if entry.value.is_exported then
+      worklist.push(entry.key.clone())
+      reachable.insert(entry.key.clone())
+    end
+  end
+  
+  # Also keep "main" and "_start"
+  if !reachable.contains("main") then
+    worklist.push("main".to_string())
+    reachable.insert("main".to_string())
+  end
+  
+  while !worklist.is_empty() do
+    let sym = worklist.pop().unwrap()
+    match ctx.call_graph.get(sym.clone())
+    when Option::Some(callees) then
+      for callee in callees do
+        if !reachable.contains(callee.clone()) then
+          reachable.insert(callee.clone())
+          worklist.push(callee.clone())
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  
+  # Remove unreachable functions from each module
+  for module in ctx.modules do
+    module.mir_functions.retain(|f| reachable.contains(f.name.clone()))
+  end
+  
+  # Phase 3: Cross-module inlining for small functions
+  let inline_candidates = find_inline_candidates(ctx)
+  for candidate in inline_candidates do
+    inline_cross_module(ctx, &candidate)
+  end
+end
+
+def lto_fat(ctx: &mut LtoContext) -> Unit
+  # Phase 1: Merge all modules into a single module
+  mut merged = LtoModule {
+    name: "<merged>".to_string(),
+    mir_functions: Vec::new(),
+    symbols: Vec::new()
+  }
+  
+  for module in ctx.modules do
+    for func in module.mir_functions do
+      merged.mir_functions.push(func)
+    end
+    for sym in module.symbols do
+      merged.symbols.push(sym)
+    end
+  end
+  
+  ctx.modules.clear()
+  ctx.modules.push(merged)
+  
+  # Phase 2: Run full optimization pipeline on merged module
+  build_call_graph(ctx)
+  
+  # Dead code elimination
+  mut reachable = Set::new()
+  mut worklist = Vec::new()
+  
+  for entry in ctx.symbol_table do
+    if entry.value.is_exported then
+      worklist.push(entry.key.clone())
+      reachable.insert(entry.key.clone())
+    end
+  end
+  worklist.push("main".to_string())
+  reachable.insert("main".to_string())
+  
+  while !worklist.is_empty() do
+    let sym = worklist.pop().unwrap()
+    match ctx.call_graph.get(sym.clone())
+    when Option::Some(callees) then
+      for callee in callees do
+        if !reachable.contains(callee.clone()) then
+          reachable.insert(callee.clone())
+          worklist.push(callee.clone())
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  
+  ctx.modules[0].mir_functions.retain(|f| reachable.contains(f.name.clone()))
+  
+  # Phase 3: Aggressive inlining (no cross-module boundary now)
+  let candidates = find_inline_candidates(ctx)
+  for candidate in candidates do
+    inline_cross_module(ctx, &candidate)
+  end
+end
+
+def build_call_graph(ctx: &mut LtoContext) -> Unit
+  ctx.call_graph.clear()
+  
+  for module in ctx.modules do
+    for func in module.mir_functions do
+      mut callees = Vec::new()
+      
+      for block in func.blocks do
+        match block.terminator
+        when MirTerminator::Call(target, _, _, _) then
+          callees.push(target.clone())
+        when _ then ()
+        end
+        
+        for stmt in block.statements do
+          match stmt
+          when MirStatement::Call(target, _, _) then
+            callees.push(target.clone())
+          when _ then ()
+          end
+        end
+      end
+      
+      ctx.call_graph.insert(func.name.clone(), callees)
+    end
+  end
+end
+
+struct InlineCandidate
+  caller: String
+  callee: String
+  callee_size: Int
+end
+
+def find_inline_candidates(ctx: &LtoContext) -> Vec[InlineCandidate]
+  mut candidates = Vec::new()
+  let max_inline_size = 50  # Maximum MIR statements for inlining
+  
+  for entry in ctx.call_graph do
+    for callee_name in entry.value do
+      # Find the callee function
+      for module in ctx.modules do
+        for func in module.mir_functions do
+          if func.name == *callee_name then
+            let size = count_mir_statements(func)
+            if size <= max_inline_size && size > 0 then
+              candidates.push(InlineCandidate {
+                caller: entry.key.clone(),
+                callee: callee_name.clone(),
+                callee_size: size
+              })
+            end
+          end
+        end
+      end
+    end
+  end
+  
+  # Sort by size (inline smallest first)
+  candidates.sort_by(|a, b| a.callee_size.cmp(&b.callee_size))
+  candidates
+end
+
+def count_mir_statements(func: &MirFunction) -> Int
+  mut count = 0
+  for block in func.blocks do
+    count = count + block.statements.len() as Int + 1  # +1 for terminator
+  end
+  count
+end
+
+def inline_cross_module(ctx: &mut LtoContext, candidate: &InlineCandidate) -> Unit
+  # Find callee body
+  mut callee_body: Option[MirFunction] = Option::None
+  for module in ctx.modules do
+    for func in module.mir_functions do
+      if func.name == candidate.callee then
+        callee_body = Option::Some(func.clone())
+        break
+      end
+    end
+  end
+  
+  match callee_body
+  when Option::Some(body) then
+    # For each module, find the caller and inline the callee at call sites
+    for module in ctx.modules do
+      for func in module.mir_functions do
+        if func.name == candidate.caller then
+          inline_calls_in_function(func, &candidate.callee, &body)
+        end
+      end
+    end
+  when Option::None then ()
+  end
+end
+
+def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, callee_body: &MirFunction) -> Unit
+  # Replace Call terminators that target callee_name with the inlined body
+  # This is a simplified version — full version would:
+  # 1. Rename all local variables to avoid conflicts
+  # 2. Map parameters to arguments
+  # 3. Replace Return terminators with jumps to the continuation block
+  
+  mut next_block_id = caller.blocks.len() as Int
+  
+  for block_idx in 0..caller.blocks.len() do
+    match caller.blocks[block_idx].terminator
+    when MirTerminator::Call(target, args, dest, next) then
+      if target == *callee_name then
+        # Create inlined blocks with renumbered IDs
+        let base_id = next_block_id
+        for cb in callee_body.blocks do
+          mut new_block = cb.clone()
+          new_block.id = base_id + cb.id
+          
+          # Replace Return with goto to continuation
+          match new_block.terminator
+          when MirTerminator::Return then
+            new_block.terminator = MirTerminator::Goto(next)
+          when _ then ()
+          end
+          
+          caller.blocks.push(new_block)
+        end
+        
+        # Replace the call terminator with a goto to the inlined entry
+        caller.blocks[block_idx].terminator = MirTerminator::Goto(base_id)
+        next_block_id = next_block_id + callee_body.blocks.len() as Int
+      end
+    when _ then ()
+    end
+  end
 end

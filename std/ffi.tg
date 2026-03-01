@@ -1,22 +1,22 @@
-# Tangerine Standard Library — std::ffi
-# Foreign Function Interface for C interop, Ruby interop, and cross-language bridging.
-#
-# Tangerine uses `extern` blocks to declare foreign functions:
-#
-#   extern "C" do
-#     def malloc(size: UInt) -> Ptr[u8]
-#     def free(ptr: Ptr[u8]) -> Unit
-#   end
-#
-#   extern "Ruby" do
-#     def rb_funcall(recv: RubyValue, mid: RubyID, argc: Int, ...) -> RubyValue
-#   end
-#
-# This module provides:
-# 1. Primitive FFI types (Ptr, CStr, CString, Opaque)
-# 2. Ruby C API bindings (VALUE, ID, rb_* functions)
-# 3. Type marshaling between Tangerine and C/Ruby
-# 4. Safe wrappers around unsafe FFI calls
+## Tangerine Standard Library — std::ffi
+## Foreign Function Interface for C interop, Ruby interop, and cross-language bridging.
+##
+## Tangerine uses `extern` blocks to declare foreign functions:
+##
+##   extern "C" do
+##     def malloc(size: UInt) -> Ptr[u8]
+##     def free(ptr: Ptr[u8]) -> Unit
+##   end
+##
+##   extern "Ruby" do
+##     def rb_funcall(recv: RubyValue, mid: RubyID, argc: Int, ...) -> RubyValue
+##   end
+##
+## This module provides:
+## 1. Primitive FFI types (Ptr, CStr, CString, Opaque)
+## 2. Ruby C API bindings (VALUE, ID, rb_* functions)
+## 3. Type marshaling between Tangerine and C/Ruby
+## 4. Safe wrappers around unsafe FFI calls
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map}
@@ -303,14 +303,23 @@ end
 def ruby_to_tg_string(v: RubyValue) -> Result[String, String]
   let rtype = rb_type(v)
   if rtype != RUBY_T_STRING() then
-    # Try to_s conversion
+    # Try to_s conversion (one attempt only — guard against infinite recursion)
     let to_s_id = rb_intern(cstring_as_ptr(&cstring_new("to_s")))
     let sv = rb_funcall(v, to_s_id, 0)
-    return ruby_to_tg_string(sv)
+    let sv_type = rb_type(sv)
+    if sv_type != RUBY_T_STRING() then
+      return Result::Err("Ruby value could not be converted to String via to_s")
+    end
+    let mut sv_holder = sv
+    let sv_cptr = rb_string_value_cstr(Ptr { address: (&mut sv_holder) as UInt })
+    if sv_cptr.address == 0 then
+      return Result::Err("Ruby to_s conversion returned null")
+    end
+    return Result::Ok(String::from_c_str(sv_cptr))
   end
   let mut val_holder = v
   let cptr = rb_string_value_cstr(Ptr { address: (&mut val_holder) as UInt })
-  if is_null(&Ptr[u8] { address: cptr.address }) then
+  if cptr.address == 0 then
     Result::Err("Ruby string conversion returned null")
   else
     Result::Ok(String::from_c_str(cptr))
@@ -592,6 +601,10 @@ end
 # `arity` is the number of parameters.
 # The compiler will generate the appropriate trampoline at codegen time.
 def make_ffi_callback(closure_fn: Ptr[u8], closure_env: Ptr[u8], arity: Int) -> FfiCallback
+  # Guard: closure_fn must not be null (would produce a callback that traps on call)
+  if is_null(&closure_fn) then
+    panic("make_ffi_callback: closure_fn must not be null")
+  end
   # The actual trampoline generation happens in codegen.
   # This function records the closure info so the linker can wire it up.
   FfiCallback {
@@ -612,11 +625,18 @@ def ruby_gem_load(gem_name: String) -> Result[RubyValue, String]
     # Try to find the module with the capitalized gem name
     let module_name = gem_name_to_module(gem_name)
     let cs = cstring_new(module_name)
+    # Use a local state variable — passing null as state pointer would
+    # cause rb_eval_string_protect to dereference null on exception.
+    mut state: Int = 0
     let result = rb_eval_string_protect(
       cstring_as_ptr(&cstring_new(module_name)),
-      Ptr { address: null_ptr[Int]().address }
+      Ptr { address: (&mut state) as UInt }
     )
-    Result::Ok(result)
+    if state != 0 then
+      Result::Err("Failed to resolve module: " + module_name)
+    else
+      Result::Ok(result)
+    end
   when Result::Err(e) then Result::Err(e)
   end
 end
@@ -638,4 +658,262 @@ def gem_name_to_module(name: String) -> String
     end
   end
   result
+end
+
+# ———————————————————————————————————————————————————————————————
+# Tangerine Interop ABI Types (per interop.txt)
+# ———————————————————————————————————————————————————————————————
+
+# TgResult — FFI-safe result type for C interop (repr(c))
+# Per interop.txt §7.2
+#[repr(c)]
+pub struct TgResult[T]
+  ok: Bool           # true if success, false if error
+  err_code: Int      # 0 if ok, otherwise error code
+  value: T           # valid only if ok == true
+end
+
+pub def tg_result_ok[T](value: T) -> TgResult[T]
+  TgResult { ok: true, err_code: 0, value: value }
+end
+
+pub def tg_result_err[T](code: Int, default_value: T) -> TgResult[T]
+  TgResult { ok: false, err_code: code, value: default_value }
+end
+
+pub def tg_result_is_ok[T](r: &TgResult[T]) -> Bool
+  r.ok
+end
+
+pub def tg_result_unwrap[T](r: TgResult[T]) -> T
+  if r.ok then
+    r.value
+  else
+    panic("TgResult::unwrap called on Err")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Ownership Qualifiers for FFI (per interop.txt §6.1)
+# ———————————————————————————————————————————————————————————————
+
+# Borrowed — pointer does not transfer ownership; valid only for call duration
+#[repr(c)]
+pub struct Borrowed[T]
+  ptr: Ptr[T]
+end
+
+pub def borrowed[T](ptr: Ptr[T]) -> Borrowed[T]
+  Borrowed { ptr: ptr }
+end
+
+pub def borrowed_get[T](b: &Borrowed[T]) -> Ptr[T]
+  b.ptr
+end
+
+# Owned — ownership transfers to callee; callee must free
+#[repr(c)]
+pub struct Owned[T]
+  ptr: Ptr[T]
+  alloc_domain: AllocDomain
+end
+
+pub enum AllocDomain
+  Tangerine    # freed via tg_free
+  C            # freed via free()
+  Ruby         # managed by Ruby GC
+end
+
+pub def owned_new[T](ptr: Ptr[T], domain: AllocDomain) -> Owned[T]
+  Owned { ptr: ptr, alloc_domain: domain }
+end
+
+pub def owned_get[T](o: &Owned[T]) -> Ptr[T]
+  o.ptr
+end
+
+pub def owned_take[T](o: Owned[T]) -> (Ptr[T], AllocDomain)
+  (o.ptr, o.alloc_domain)
+end
+
+# Shared — reference-counted or VM-managed handle
+#[repr(c)]
+pub struct Shared[T]
+  ptr: Ptr[T]
+  refcount: Ptr[UInt]
+end
+
+pub def shared_new[T](ptr: Ptr[T]) -> Shared[T]
+  # Allocate refcount
+  let rc = tg_alloc(8, 8) as Ptr[UInt]
+  if rc.is_null() then
+    panic("shared_new: failed to allocate refcount")
+  end
+  unsafe { *rc = 1 }
+  Shared { ptr: ptr, refcount: rc }
+end
+
+pub def shared_clone[T](s: &Shared[T]) -> Shared[T]
+  if s.refcount.is_null() then
+    panic("shared_clone: null refcount")
+  end
+  unsafe { *s.refcount = *s.refcount + 1 }
+  Shared { ptr: s.ptr, refcount: s.refcount }
+end
+
+pub def shared_drop[T](s: Shared[T]) -> Unit
+  if s.refcount.is_null() then
+    return
+  end
+  unsafe {
+    *s.refcount = *s.refcount - 1
+    if *s.refcount == 0 then
+      tg_free(s.refcount as Ptr[u8], 8, 8)
+      # Note: caller is responsible for freeing the pointed-to data
+    end
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# FFI Slice/Str Views (per interop.txt §5.5)
+# ———————————————————————————————————————————————————————————————
+
+# Slice[T] — borrowed view of contiguous memory (repr(c))
+#[repr(c)]
+pub struct FfiSlice[T]
+  ptr: Ptr[T]
+  len: UInt
+end
+
+pub def ffi_slice_new[T](ptr: Ptr[T], len: UInt) -> FfiSlice[T]
+  FfiSlice { ptr: ptr, len: len }
+end
+
+pub def ffi_slice_empty[T]() -> FfiSlice[T]
+  FfiSlice { ptr: null_ptr(), len: 0 }
+end
+
+# FfiStr — UTF-8 string view (borrowed, repr(c))
+#[repr(c)]
+pub struct FfiStr
+  ptr: Ptr[u8]
+  len: UInt
+end
+
+pub def ffi_str_new(ptr: Ptr[u8], len: UInt) -> FfiStr
+  FfiStr { ptr: ptr, len: len }
+end
+
+pub def ffi_str_from_string(s: &String) -> FfiStr
+  FfiStr { ptr: s.as_ptr(), len: s.len() }
+end
+
+pub def ffi_str_to_string(s: &FfiStr) -> String
+  if s.len == 0 then
+    return ""
+  end
+
+  if s.ptr.is_null() then
+    return ""
+  end
+
+  String::from_utf8_unchecked(s.ptr, s.len)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Tangerine Runtime Exports (per interop.txt §11)
+# ———————————————————————————————————————————————————————————————
+
+# Last error tracking (thread-local)
+static mut _last_error_code: Int = 0
+static mut _last_error_message: String = ""
+
+# 11.1 Allocation
+@export("tg_alloc")
+pub def tg_alloc(size: UInt, align: UInt) -> Ptr[u8]
+  use std::alloc::system_alloc
+  system_alloc(size, align)
+end
+
+@export("tg_realloc")
+pub def tg_realloc(ptr: Ptr[u8], new_size: UInt, align: UInt) -> Ptr[u8]
+  use std::alloc::system_realloc
+  system_realloc(ptr, new_size, align)
+end
+
+@export("tg_free")
+pub def tg_free(ptr: Ptr[u8], size: UInt, align: UInt) -> Unit
+  use std::alloc::system_free
+  system_free(ptr, size, align)
+end
+
+# 11.2 Error helpers
+@export("tg_last_error_code")
+pub def tg_last_error_code() -> Int
+  _last_error_code
+end
+
+@export("tg_last_error_message")
+pub def tg_last_error_message(out: Ptr[FfiStr]) -> Unit
+  if out.is_null() then
+    return
+  end
+  unsafe {
+    *out = ffi_str_from_string(&_last_error_message)
+  }
+end
+
+pub def tg_set_last_error(code: Int, message: String) -> Unit
+  _last_error_code = code
+  _last_error_message = message
+end
+
+pub def tg_clear_last_error() -> Unit
+  _last_error_code = 0
+  _last_error_message = ""
+end
+
+# 11.3 Ruby bridge
+@export("tg_ruby_init")
+pub def tg_ruby_init() -> Bool
+  ruby_init()
+  true
+end
+
+@export("tg_ruby_eval")
+pub def tg_ruby_eval(code: FfiStr) -> TgResult[RubyValue]
+  let code_str = ffi_str_to_string(&code)
+  match ruby_eval(&code_str)
+  when Result::Ok(v) then tg_result_ok(v)
+  when Result::Err(e) then
+    tg_set_last_error(1, e)
+    tg_result_err(1, RUBY_Qnil())
+  end
+end
+
+@export("tg_ruby_gc_register")
+pub def tg_ruby_gc_register(v: RubyValue) -> Unit
+  rb_gc_register_address(Ptr { address: (&v.raw) as UInt })
+end
+
+@export("tg_ruby_gc_unregister")
+pub def tg_ruby_gc_unregister(v: RubyValue) -> Unit
+  rb_gc_unregister_address(Ptr { address: (&v.raw) as UInt })
+end
+
+# ———————————————————————————————————————————————————————————————
+# ABI Version Info
+# ———————————————————————————————————————————————————————————————
+
+pub const FFI_ABI_EDITION: String = "2026"
+pub const FFI_ABI_REVISION: UInt = 1
+
+@export("tg_abi_edition")
+pub def tg_abi_edition() -> FfiStr
+  ffi_str_from_string(&FFI_ABI_EDITION)
+end
+
+@export("tg_abi_revision")
+pub def tg_abi_revision() -> UInt
+  FFI_ABI_REVISION
 end

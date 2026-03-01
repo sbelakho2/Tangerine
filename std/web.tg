@@ -1,0 +1,1362 @@
+# Tangerine Standard Library — Web Framework
+#
+# High-level web application framework with routing, templates, middleware.
+#
+# Usage:
+#   let app = App::new()
+#   app.get("/", handle_home)
+#   app.get("/users/:id", handle_user)
+#   app.middleware(logger)
+#   app.listen("0.0.0.0:8080")?
+
+use std::core::{Option, Result, Vec, String, Bool, Int}
+use std::collections::{Map, Set}
+use std::http::{HttpRequest, HttpResponse, HttpMethod, HttpServer, StatusCode, HeaderMap}
+use std::json::{Json, JsonValue}
+use std::serde::{Serialize, Deserialize}
+
+# ═══════════════════════════════════════════════════════════════
+# PART 1: WEB APPLICATION
+# ═══════════════════════════════════════════════════════════════
+
+# ———————————————————————————————————————————————————————————————
+# Context
+# ———————————————————————————————————————————————————————————————
+
+struct Context
+  request: HttpRequest
+  response: ResponseBuilder
+  params: Map[String, String]
+  query: Map[String, String]
+  state: Map[String, String]
+  locals: Map[String, String]
+end
+
+impl Context
+  def new(request: HttpRequest) -> Context
+    let query = parse_query_string(request.uri().query().unwrap_or(""))
+    
+    Context {
+      request: request,
+      response: ResponseBuilder::new(),
+      params: Map::new(),
+      query: query,
+      state: Map::new(),
+      locals: Map::new()
+    }
+  end
+  
+  # Request accessors
+  def method(self: &Context) -> &HttpMethod
+    self.request.method()
+  end
+  
+  def path(self: &Context) -> String
+    self.request.uri().path().to_string()
+  end
+  
+  def header(self: &Context, name: &str) -> Option[String]
+    self.request.headers().get(name).map(|v| v.clone())
+  end
+  
+  def param(self: &Context, name: &str) -> Option[&String]
+    self.params.get(name)
+  end
+  
+  def query_param(self: &Context, name: &str) -> Option[&String]
+    self.query.get(name)
+  end
+  
+  def body(self: &Context) -> &[u8]
+    self.request.body()
+  end
+  
+  def body_string(self: &Context) -> Result[String, WebError]
+    String::from_utf8(self.body().to_vec())
+      .map_err(|_| WebError::InvalidBody("invalid UTF-8"))
+  end
+  
+  def json[T](self: &Context) -> Result[T, WebError] where T: Deserialize
+    let body = self.body_string()?
+    Json::parse::<T>(&body)
+      .map_err(|e| WebError::InvalidBody("JSON parse error: ".to_string() + e.to_string()))
+  end
+  
+  def form(self: &Context) -> Result[Map[String, String], WebError]
+    let body = self.body_string()?
+    Result::Ok(parse_query_string(&body))
+  end
+  
+  # Response builders
+  def status(self: &mut Context, code: StatusCode) -> &mut Context
+    self.response.status(code)
+    self
+  end
+  
+  def set_header(self: &mut Context, name: &str, value: &str) -> &mut Context
+    self.response.header(name, value)
+    self
+  end
+  
+  def content_type(self: &mut Context, ct: &str) -> &mut Context
+    self.set_header("Content-Type", ct)
+  end
+  
+  def text(self: &mut Context, body: &str) -> HttpResponse
+    self.content_type("text/plain; charset=utf-8")
+    self.response.body(body.as_bytes().to_vec())
+    self.response.build()
+  end
+  
+  def html(self: &mut Context, body: &str) -> HttpResponse
+    self.content_type("text/html; charset=utf-8")
+    self.response.body(body.as_bytes().to_vec())
+    self.response.build()
+  end
+  
+  def json_response[T](self: &mut Context, value: &T) -> HttpResponse where T: Serialize
+    self.content_type("application/json")
+    let json_str = Json::stringify(value)
+    self.response.body(json_str.as_bytes().to_vec())
+    self.response.build()
+  end
+  
+  def redirect(self: &mut Context, url: &str) -> HttpResponse
+    self.status(StatusCode::Found)
+    self.set_header("Location", url)
+    self.text("")
+  end
+  
+  def redirect_permanent(self: &mut Context, url: &str) -> HttpResponse
+    self.status(StatusCode::MovedPermanently)
+    self.set_header("Location", url)
+    self.text("")
+  end
+  
+  def not_found(self: &mut Context) -> HttpResponse
+    self.status(StatusCode::NotFound)
+    self.text("Not Found")
+  end
+  
+  def bad_request(self: &mut Context, msg: &str) -> HttpResponse
+    self.status(StatusCode::BadRequest)
+    self.text(msg)
+  end
+  
+  def internal_error(self: &mut Context, msg: &str) -> HttpResponse
+    self.status(StatusCode::InternalServerError)
+    self.text(msg)
+  end
+  
+  def file(self: &mut Context, path: &str) -> Result[HttpResponse, WebError]
+    let content = std::fs::read(path)
+      .map_err(|e| WebError::IoError(e.to_string()))?
+    
+    let mime = guess_mime_type(path)
+    self.content_type(mime)
+    self.response.body(content)
+    Result::Ok(self.response.build())
+  end
+  
+  def set_cookie(self: &mut Context, name: &str, value: &str, options: &CookieOptions) -> &mut Context
+    let cookie = format_cookie(name, value, options)
+    self.set_header("Set-Cookie", &cookie)
+  end
+  
+  def cookie(self: &Context, name: &str) -> Option[String]
+    self.header("Cookie").and_then(|cookies| {
+      parse_cookies(&cookies).get(name).cloned()
+    })
+  end
+end
+
+struct ResponseBuilder
+  status: StatusCode
+  headers: HeaderMap
+  body: Vec[u8]
+end
+
+impl ResponseBuilder
+  def new() -> ResponseBuilder
+    ResponseBuilder {
+      status: StatusCode::Ok,
+      headers: HeaderMap::new(),
+      body: Vec::new()
+    }
+  end
+  
+  def status(self: &mut ResponseBuilder, code: StatusCode) -> &mut ResponseBuilder
+    self.status = code
+    self
+  end
+  
+  def header(self: &mut ResponseBuilder, name: &str, value: &str) -> &mut ResponseBuilder
+    self.headers.insert(name, value)
+    self
+  end
+  
+  def body(self: &mut ResponseBuilder, body: Vec[u8]) -> &mut ResponseBuilder
+    self.body = body
+    self
+  end
+  
+  def build(self: &ResponseBuilder) -> HttpResponse
+    HttpResponse::new(self.status.clone(), self.headers.clone(), self.body.clone())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Error Type
+# ———————————————————————————————————————————————————————————————
+
+enum WebError
+  RouteNotFound
+  MethodNotAllowed
+  InvalidBody(String)
+  Unauthorized
+  Forbidden
+  IoError(String)
+  Internal(String)
+end
+
+def web_error_status(e: &WebError) -> StatusCode
+  match e
+  when WebError::RouteNotFound then StatusCode::NotFound
+  when WebError::MethodNotAllowed then StatusCode::MethodNotAllowed
+  when WebError::InvalidBody(_) then StatusCode::BadRequest
+  when WebError::Unauthorized then StatusCode::Unauthorized
+  when WebError::Forbidden then StatusCode::Forbidden
+  when WebError::IoError(_) | WebError::Internal(_) then StatusCode::InternalServerError
+  end
+end
+
+## Returns a human-readable description of the web error.
+def web_error_message(e: &WebError) -> String
+  match e
+  when WebError::RouteNotFound(path) then "route not found: " + path.clone()
+  when WebError::MethodNotAllowed then "method not allowed"
+  when WebError::InvalidBody(msg) then "invalid body: " + msg.clone()
+  when WebError::Unauthorized then "unauthorized"
+  when WebError::Forbidden then "forbidden"
+  when WebError::IoError(msg) then "IO error: " + msg.clone()
+  when WebError::Internal(msg) then "internal error: " + msg.clone()
+  end
+end
+
+impl Error for WebError
+  def message(&self) -> String
+    web_error_message(self)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Router
+# ———————————————————————————————————————————————————————————————
+
+type Handler = fn(&mut Context) -> HttpResponse
+type Middleware = fn(&mut Context, fn(&mut Context) -> HttpResponse) -> HttpResponse
+
+struct Route
+  method: HttpMethod
+  pattern: RoutePattern
+  handler: Handler
+end
+
+struct RoutePattern
+  segments: Vec[RouteSegment]
+  regex_pattern: Option[String]
+end
+
+enum RouteSegment
+  Literal(String)
+  Param(String)
+  Wildcard
+end
+
+impl RoutePattern
+  def parse(pattern: &str) -> RoutePattern
+    let mut segments = Vec::new()
+    
+    for part in pattern.split('/') do
+      if part.is_empty() then
+        continue
+      end
+      
+      if part.starts_with(':') then
+        segments.push(RouteSegment::Param(part[1..].to_string()))
+      else if part == "*" then
+        segments.push(RouteSegment::Wildcard)
+      else
+        segments.push(RouteSegment::Literal(part.to_string()))
+      end
+    end
+    
+    RoutePattern { segments: segments, regex_pattern: Option::None }
+  end
+  
+  def matches(self: &RoutePattern, path: &str) -> Option[Map[String, String]]
+    let parts: Vec[&str] = path.split('/').filter(|s| !s.is_empty()).collect()
+    let mut params = Map::new()
+    let mut i = 0
+    
+    for segment in &self.segments do
+      match segment
+      when RouteSegment::Literal(s) then
+        if i >= parts.len() || parts[i] != s.as_str() then
+          return Option::None
+        end
+        i = i + 1
+      when RouteSegment::Param(name) then
+        if i >= parts.len() then
+          return Option::None
+        end
+        params.insert(name.clone(), parts[i].to_string())
+        i = i + 1
+      when RouteSegment::Wildcard then
+        # Match rest of path
+        let rest: String = parts[i..].join("/")
+        params.insert("*".to_string(), rest)
+        return Option::Some(params)
+      end
+    end
+    
+    if i == parts.len() then
+      Option::Some(params)
+    else
+      Option::None
+    end
+  end
+end
+
+struct Router
+  routes: Vec[Route]
+  middleware: Vec[Middleware]
+  not_found_handler: Option[Handler]
+  error_handler: Option[fn(&WebError) -> HttpResponse]
+end
+
+impl Router
+  def new() -> Router
+    Router {
+      routes: Vec::new(),
+      middleware: Vec::new(),
+      not_found_handler: Option::None,
+      error_handler: Option::None
+    }
+  end
+  
+  def add_route(self: &mut Router, method: HttpMethod, pattern: &str, handler: Handler) -> &mut Router
+    self.routes.push(Route {
+      method: method,
+      pattern: RoutePattern::parse(pattern),
+      handler: handler
+    })
+    self
+  end
+  
+  def get(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Get, pattern, handler)
+  end
+  
+  def post(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Post, pattern, handler)
+  end
+  
+  def put(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Put, pattern, handler)
+  end
+  
+  def delete(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Delete, pattern, handler)
+  end
+  
+  def patch(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Patch, pattern, handler)
+  end
+  
+  def options(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Options, pattern, handler)
+  end
+  
+  def head(self: &mut Router, pattern: &str, handler: Handler) -> &mut Router
+    self.add_route(HttpMethod::Head, pattern, handler)
+  end
+  
+  def middleware(self: &mut Router, mw: Middleware) -> &mut Router
+    self.middleware.push(mw)
+    self
+  end
+  
+  def not_found(self: &mut Router, handler: Handler) -> &mut Router
+    self.not_found_handler = Option::Some(handler)
+    self
+  end
+  
+  def error_handler(self: &mut Router, handler: fn(&WebError) -> HttpResponse) -> &mut Router
+    self.error_handler = Option::Some(handler)
+    self
+  end
+  
+  def route(self: &Router, request: &HttpRequest) -> Result[(Handler, Map[String, String]), WebError]
+    let path = request.uri().path()
+    let method = request.method()
+    
+    let mut method_matched = false
+    
+    for route in &self.routes do
+      if let Option::Some(params) = route.pattern.matches(path) then
+        method_matched = true
+        if &route.method == method then
+          return Result::Ok((route.handler, params))
+        end
+      end
+    end
+    
+    if method_matched then
+      Result::Err(WebError::MethodNotAllowed)
+    else
+      Result::Err(WebError::RouteNotFound)
+    end
+  end
+  
+  def handle(self: &Router, request: HttpRequest) -> HttpResponse
+    let mut ctx = Context::new(request)
+    
+    match self.route(&ctx.request)
+    when Result::Ok((handler, params)) then
+      ctx.params = params
+      
+      # Apply middleware chain
+      let final_handler = self.build_middleware_chain(handler)
+      final_handler(&mut ctx)
+    when Result::Err(e) then
+      match &self.not_found_handler
+      when Option::Some(h) then h(&mut ctx)
+      when Option::None then
+        match &self.error_handler
+        when Option::Some(h) then h(&e)
+        when Option::None then default_error_response(&e)
+        end
+      end
+    end
+  end
+  
+  def build_middleware_chain(self: &Router, handler: Handler) -> Handler
+    let mut chain = handler
+    
+    for mw in self.middleware.iter().rev() do
+      let prev = chain
+      let mw = *mw
+      chain = |ctx: &mut Context| mw(ctx, prev)
+    end
+    
+    chain
+  end
+end
+
+def default_error_response(e: &WebError) -> HttpResponse
+  let status = web_error_status(e)
+  let body = match e
+  when WebError::RouteNotFound then "Not Found"
+  when WebError::MethodNotAllowed then "Method Not Allowed"
+  when WebError::InvalidBody(msg) then &("Bad Request: ".to_string() + msg)
+  when WebError::Unauthorized then "Unauthorized"
+  when WebError::Forbidden then "Forbidden"
+  when WebError::IoError(msg) then &("Internal Error: ".to_string() + msg)
+  when WebError::Internal(msg) then &("Internal Error: ".to_string() + msg)
+  end
+  
+  HttpResponse::new(status, HeaderMap::new(), body.as_bytes().to_vec())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Application
+# ———————————————————————————————————————————————————————————————
+
+struct App
+  router: Router
+  static_dir: Option[String]
+  static_prefix: String
+end
+
+impl App
+  def new() -> App
+    App {
+      router: Router::new(),
+      static_dir: Option::None,
+      static_prefix: "/static".to_string()
+    }
+  end
+  
+  def get(self: &mut App, pattern: &str, handler: Handler) -> &mut App
+    self.router.get(pattern, handler)
+    self
+  end
+  
+  def post(self: &mut App, pattern: &str, handler: Handler) -> &mut App
+    self.router.post(pattern, handler)
+    self
+  end
+  
+  def put(self: &mut App, pattern: &str, handler: Handler) -> &mut App
+    self.router.put(pattern, handler)
+    self
+  end
+  
+  def delete(self: &mut App, pattern: &str, handler: Handler) -> &mut App
+    self.router.delete(pattern, handler)
+    self
+  end
+  
+  def middleware(self: &mut App, mw: Middleware) -> &mut App
+    self.router.middleware(mw)
+    self
+  end
+  
+  def static_files(self: &mut App, prefix: &str, dir: &str) -> &mut App
+    self.static_prefix = prefix.to_string()
+    self.static_dir = Option::Some(dir.to_string())
+    self
+  end
+  
+  def listen(self: &App, addr: &str) -> Result[Unit, WebError]
+    let server = HttpServer::bind(addr)
+      .map_err(|e| WebError::IoError(e.to_string()))?
+    
+    loop
+      let request = server.accept()
+        .map_err(|e| WebError::IoError(e.to_string()))?
+      
+      let response = self.handle_request(request)
+      server.respond(response)
+        .map_err(|e| WebError::IoError(e.to_string()))?
+    end
+  end
+  
+  def handle_request(self: &App, request: HttpRequest) -> HttpResponse
+    # Check static files first
+    if let Option::Some(ref dir) = self.static_dir then
+      let path = request.uri().path()
+      if path.starts_with(&self.static_prefix) then
+        let file_path = path[self.static_prefix.len()..].trim_start_matches('/')
+        let full_path = dir.clone() + "/" + file_path
+        
+        if let Result::Ok(content) = std::fs::read(&full_path) then
+          let mime = guess_mime_type(&full_path)
+          return HttpResponse::new(
+            StatusCode::Ok,
+            HeaderMap::from([("Content-Type", mime)]),
+            content
+          )
+        end
+      end
+    end
+    
+    self.router.handle(request)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 2: MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════
+
+mod middleware
+  use std::log::{Logger, info}
+  use std::time::{Instant}
+  
+  def logger(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse) -> HttpResponse
+    let start = Instant::now()
+    let method = ctx.method().to_string()
+    let path = ctx.path()
+    
+    let response = next(ctx)
+    
+    let elapsed = start.elapsed()
+    info!("{} {} - {} ({:?})", method, path, response.status().as_u16(), elapsed)
+    
+    response
+  end
+  
+  def cors(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse) -> HttpResponse
+    cors_with_config(ctx, next, CorsConfig::permissive())
+  end
+  
+  def cors_with_config(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse, config: CorsConfig) -> HttpResponse
+    # Handle preflight
+    if ctx.method() == &HttpMethod::Options then
+      let mut response = ctx.status(StatusCode::NoContent).response.build()
+      add_cors_headers(&mut response, &config)
+      return response
+    end
+    
+    let mut response = next(ctx)
+    add_cors_headers(&mut response, &config)
+    response
+  end
+  
+  struct CorsConfig
+    allowed_origins: Vec[String]
+    allowed_methods: Vec[String]
+    allowed_headers: Vec[String]
+    allow_credentials: Bool
+    max_age: Option[u32]
+  end
+  
+  impl CorsConfig
+    def permissive() -> CorsConfig
+      CorsConfig {
+        allowed_origins: ["*".to_string()],
+        allowed_methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        allowed_headers: ["*".to_string()],
+        allow_credentials: false,
+        max_age: Option::Some(86400)
+      }
+    end
+    
+    def strict() -> CorsConfig
+      CorsConfig {
+        allowed_origins: Vec::new(),
+        allowed_methods: ["GET", "POST"],
+        allowed_headers: Vec::new(),
+        allow_credentials: false,
+        max_age: Option::None
+      }
+    end
+  end
+  
+  def add_cors_headers(response: &mut HttpResponse, config: &CorsConfig) -> Unit
+    response.headers_mut().insert("Access-Control-Allow-Origin", config.allowed_origins.join(", "))
+    response.headers_mut().insert("Access-Control-Allow-Methods", config.allowed_methods.join(", "))
+    response.headers_mut().insert("Access-Control-Allow-Headers", config.allowed_headers.join(", "))
+    
+    if config.allow_credentials then
+      response.headers_mut().insert("Access-Control-Allow-Credentials", "true")
+    end
+    
+    if let Option::Some(age) = config.max_age then
+      response.headers_mut().insert("Access-Control-Max-Age", &age.to_string())
+    end
+  end
+  
+  def recovery(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse) -> HttpResponse
+    # In a real implementation, this would catch panics
+    # For now, just wrap in try-catch equivalent
+    next(ctx)
+  end
+  
+  def request_id(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse) -> HttpResponse
+    let id = generate_request_id()
+    ctx.set_header("X-Request-ID", &id)
+    ctx.locals.insert("request_id".to_string(), id)
+    next(ctx)
+  end
+  
+  def generate_request_id() -> String
+    # Simple UUID-like ID
+    let bytes = std::crypto::random_bytes(16)
+    std::crypto::hex::encode(&bytes)
+  end
+  
+  def compression(ctx: &mut Context, next: fn(&mut Context) -> HttpResponse) -> HttpResponse
+    let mut response = next(ctx)
+    
+    let accept = ctx.header("Accept-Encoding").unwrap_or(String::new())
+    
+    if accept.contains("gzip") && response.body().len() > 1024 then
+      if let Result::Ok(compressed) = std::compress::gzip::compress(response.body()) then
+        if compressed.len() < response.body().len() then
+          response.set_body(compressed)
+          response.headers_mut().insert("Content-Encoding", "gzip")
+        end
+      end
+    end
+    
+    response
+  end
+  
+  def rate_limit(requests_per_minute: u32) -> Middleware
+    let limiter = RateLimiter::new(requests_per_minute)
+    
+    |ctx: &mut Context, next: fn(&mut Context) -> HttpResponse| {
+      let ip = ctx.header("X-Forwarded-For")
+        .or_else(|| ctx.header("X-Real-IP"))
+        .unwrap_or("unknown".to_string())
+      
+      if limiter.allow(&ip) then
+        next(ctx)
+      else
+        ctx.status(StatusCode::TooManyRequests)
+        ctx.set_header("Retry-After", "60")
+        ctx.text("Rate limit exceeded")
+      end
+    }
+  end
+  
+  struct RateLimiter
+    requests_per_minute: u32
+    requests: std::thread::Mutex[Map[String, Vec[Instant]]]
+  end
+  
+  impl RateLimiter
+    def new(rpm: u32) -> RateLimiter
+      RateLimiter {
+        requests_per_minute: rpm,
+        requests: std::thread::Mutex::new(Map::new())
+      }
+    end
+    
+    def allow(self: &RateLimiter, key: &str) -> Bool
+      let mut guard = self.requests.lock()
+      let now = Instant::now()
+      let window = std::time::Duration::from_secs(60)
+      
+      let requests = guard.entry(key.to_string()).or_insert(Vec::new())
+      
+      # Remove old requests
+      requests.retain(|t| now.duration_since(*t) < window)
+      
+      if requests.len() < self.requests_per_minute as UInt then
+        requests.push(now)
+        true
+      else
+        false
+      end
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 3: TEMPLATES
+# ═══════════════════════════════════════════════════════════════
+
+struct Template
+  source: String
+  compiled: CompiledTemplate
+end
+
+enum TemplateNode
+  Text(String)
+  Variable(String)
+  Block(String, Vec[TemplateNode])
+  If(String, Vec[TemplateNode], Vec[TemplateNode])
+  For(String, String, Vec[TemplateNode])
+  Include(String)
+end
+
+struct CompiledTemplate
+  nodes: Vec[TemplateNode]
+end
+
+enum TemplateError
+  ParseError(String)
+  RenderError(String)
+  NotFound(String)
+end
+
+impl Template
+  def parse(source: &str) -> Result[Template, TemplateError]
+    let mut parser = TemplateParser::new(source)
+    let nodes = parser.parse()?
+    
+    Result::Ok(Template {
+      source: source.to_string(),
+      compiled: CompiledTemplate { nodes: nodes }
+    })
+  end
+  
+  def render(self: &Template, data: &Map[String, JsonValue]) -> Result[String, TemplateError]
+    render_nodes(&self.compiled.nodes, data)
+  end
+end
+
+struct TemplateParser
+  source: Vec[char]
+  pos: UInt
+end
+
+impl TemplateParser
+  def new(source: &str) -> TemplateParser
+    TemplateParser {
+      source: source.chars().collect(),
+      pos: 0
+    }
+  end
+  
+  def parse(self: &mut TemplateParser) -> Result[Vec[TemplateNode], TemplateError]
+    let mut nodes = Vec::new()
+    
+    while self.pos < self.source.len() do
+      if self.matches("{{") then
+        self.advance_by(2)
+        let var = self.parse_until("}}")?.trim()
+        self.advance_by(2)
+        nodes.push(TemplateNode::Variable(var.to_string()))
+      else if self.matches("{%") then
+        self.advance_by(2)
+        let tag = self.parse_until("%}")?.trim()
+        self.advance_by(2)
+        
+        let parts: Vec[&str] = tag.split_whitespace().collect()
+        if parts.is_empty() then
+          return Result::Err(TemplateError::ParseError("empty tag"))
+        end
+        
+        match parts[0]
+        when "if" then
+          let condition = parts[1..].join(" ")
+          let body = self.parse_block("endif")?
+          nodes.push(TemplateNode::If(condition, body, Vec::new()))
+        when "for" then
+          if parts.len() < 4 || parts[2] != "in" then
+            return Result::Err(TemplateError::ParseError("invalid for syntax"))
+          end
+          let item = parts[1].to_string()
+          let collection = parts[3].to_string()
+          let body = self.parse_block("endfor")?
+          nodes.push(TemplateNode::For(item, collection, body))
+        when "block" then
+          let name = parts.get(1).unwrap_or(&"default").to_string()
+          let body = self.parse_block("endblock")?
+          nodes.push(TemplateNode::Block(name, body))
+        when "include" then
+          let path = parts.get(1).unwrap_or(&"").trim_matches('"').to_string()
+          nodes.push(TemplateNode::Include(path))
+        when _ then ()
+        end
+      else
+        let mut text = String::new()
+        while self.pos < self.source.len() && !self.matches("{{") && !self.matches("{%") do
+          text.push(self.source[self.pos])
+          self.pos = self.pos + 1
+        end
+        if !text.is_empty() then
+          nodes.push(TemplateNode::Text(text))
+        end
+      end
+    end
+    
+    Result::Ok(nodes)
+  end
+  
+  def parse_block(self: &mut TemplateParser, end_tag: &str) -> Result[Vec[TemplateNode], TemplateError]
+    let mut nodes = Vec::new()
+    let end_marker = "{% ".to_string() + end_tag + " %}"
+    
+    while self.pos < self.source.len() do
+      if self.matches(&end_marker) then
+        self.advance_by(end_marker.len())
+        return Result::Ok(nodes)
+      else if self.matches("{{") then
+        self.advance_by(2)
+        let var = self.parse_until("}}")?.trim()
+        self.advance_by(2)
+        nodes.push(TemplateNode::Variable(var.to_string()))
+      else if self.matches("{%") then
+        self.advance_by(2)
+        let tag = self.parse_until("%}")?.trim()
+        self.advance_by(2)
+        
+        let parts: Vec[&str] = tag.split_whitespace().collect()
+        if parts.is_empty() then
+          continue
+        end
+        
+        match parts[0]
+        when "if" then
+          let condition = parts[1..].join(" ")
+          let body = self.parse_block("endif")?
+          nodes.push(TemplateNode::If(condition, body, Vec::new()))
+        when "for" then
+          if parts.len() >= 4 then
+            let item = parts[1].to_string()
+            let collection = parts[3].to_string()
+            let body = self.parse_block("endfor")?
+            nodes.push(TemplateNode::For(item, collection, body))
+          end
+        when _ then ()
+        end
+      else
+        let mut text = String::new()
+        while self.pos < self.source.len() && !self.matches("{{") && !self.matches("{%") do
+          text.push(self.source[self.pos])
+          self.pos = self.pos + 1
+        end
+        if !text.is_empty() then
+          nodes.push(TemplateNode::Text(text))
+        end
+      end
+    end
+    
+    Result::Err(TemplateError::ParseError("unclosed block: ".to_string() + end_tag))
+  end
+  
+  def matches(self: &TemplateParser, s: &str) -> Bool
+    let chars: Vec[char] = s.chars().collect()
+    if self.pos + chars.len() > self.source.len() then
+      return false
+    end
+    for i in 0..chars.len() do
+      if self.source[self.pos + i] != chars[i] then
+        return false
+      end
+    end
+    true
+  end
+  
+  def advance_by(self: &mut TemplateParser, n: UInt) -> Unit
+    self.pos = (self.pos + n).min(self.source.len())
+  end
+  
+  def parse_until(self: &mut TemplateParser, end: &str) -> Result[String, TemplateError]
+    let end_chars: Vec[char] = end.chars().collect()
+    let mut result = String::new()
+    
+    while self.pos < self.source.len() do
+      if self.matches(end) then
+        return Result::Ok(result)
+      end
+      result.push(self.source[self.pos])
+      self.pos = self.pos + 1
+    end
+    
+    Result::Err(TemplateError::ParseError("expected ".to_string() + end))
+  end
+end
+
+def render_nodes(nodes: &[TemplateNode], data: &Map[String, JsonValue]) -> Result[String, TemplateError]
+  let mut output = String::new()
+  
+  for node in nodes do
+    match node
+    when TemplateNode::Text(s) then
+      output.push_str(s)
+    when TemplateNode::Variable(name) then
+      if let Option::Some(value) = get_value(data, name) then
+        output.push_str(&value.to_string())
+      end
+    when TemplateNode::If(condition, then_nodes, else_nodes) then
+      let is_true = evaluate_condition(data, condition)
+      let branch = if is_true then then_nodes else else_nodes end
+      output.push_str(&render_nodes(branch, data)?)
+    when TemplateNode::For(item, collection, body) then
+      if let Option::Some(JsonValue::Array(items)) = get_value(data, collection) then
+        for val in items do
+          let mut loop_data = data.clone()
+          loop_data.insert(item.clone(), val.clone())
+          output.push_str(&render_nodes(body, &loop_data)?)
+        end
+      end
+    when TemplateNode::Block(_, body) then
+      output.push_str(&render_nodes(body, data)?)
+    when TemplateNode::Include(_) then
+      # Would load external template
+      ()
+    end
+  end
+  
+  Result::Ok(output)
+end
+
+def get_value(data: &Map[String, JsonValue], path: &str) -> Option[JsonValue]
+  let parts: Vec[&str] = path.split('.').collect()
+  let mut current = data.get(parts[0])?
+  
+  for i in 1..parts.len() do
+    match current
+    when JsonValue::Object(obj) then
+      current = obj.get(parts[i])?
+    when _ then return Option::None
+    end
+  end
+  
+  Option::Some(current.clone())
+end
+
+def evaluate_condition(data: &Map[String, JsonValue], condition: &str) -> Bool
+  # Simple truthy check
+  if let Option::Some(value) = get_value(data, condition) then
+    match value
+    when JsonValue::Bool(b) then b
+    when JsonValue::Null then false
+    when JsonValue::Number(n) then n != 0.0
+    when JsonValue::String(s) then !s.is_empty()
+    when JsonValue::Array(a) then !a.is_empty()
+    when JsonValue::Object(o) then !o.is_empty()
+    end
+  else
+    false
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 4: AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════
+
+mod auth
+  use std::crypto::{sha256, hmac_sha256, random_bytes, base64}
+  use std::time::{SystemTime, Duration}
+  
+  # JWT
+  struct Jwt
+    header: JwtHeader
+    payload: Map[String, JsonValue]
+    signature: Vec[u8]
+  end
+  
+  struct JwtHeader
+    alg: String
+    typ: String
+  end
+  
+  def create_jwt(payload: &Map[String, JsonValue], secret: &[u8]) -> String
+    let header = JwtHeader {
+      alg: "HS256".to_string(),
+      typ: "JWT".to_string()
+    }
+    
+    let header_json = Json::stringify(&header)
+    let payload_json = Json::stringify(payload)
+    
+    let header_b64 = base64::encode_url_safe(header_json.as_bytes())
+    let payload_b64 = base64::encode_url_safe(payload_json.as_bytes())
+    
+    let message = header_b64.clone() + "." + payload_b64.as_str()
+    let signature = hmac_sha256(secret, message.as_bytes())
+    let sig_b64 = base64::encode_url_safe(&signature)
+    
+    header_b64 + "." + payload_b64 + "." + sig_b64
+  end
+  
+  def verify_jwt(token: &str, secret: &[u8]) -> Result[Map[String, JsonValue], WebError]
+    let parts: Vec[&str] = token.split('.').collect()
+    if parts.len() != 3 then
+      return Result::Err(WebError::Unauthorized)
+    end
+    
+    let header_b64 = parts[0]
+    let payload_b64 = parts[1]
+    let sig_b64 = parts[2]
+    
+    # Verify signature
+    let message = header_b64.to_string() + "." + payload_b64
+    let expected_sig = hmac_sha256(secret, message.as_bytes())
+    let expected_b64 = base64::encode_url_safe(&expected_sig)
+    
+    if sig_b64 != expected_b64 then
+      return Result::Err(WebError::Unauthorized)
+    end
+    
+    # Decode payload
+    let payload_bytes = base64::decode_url_safe(payload_b64)
+      .map_err(|_| WebError::Unauthorized)?
+    let payload_str = String::from_utf8(payload_bytes)
+      .map_err(|_| WebError::Unauthorized)?
+    
+    let payload: Map[String, JsonValue] = Json::parse(&payload_str)
+      .map_err(|_| WebError::Unauthorized)?
+    
+    # Check expiration
+    if let Option::Some(JsonValue::Number(exp)) = payload.get("exp") then
+      let now = SystemTime::now().duration_since_epoch().as_secs() as f64
+      if *exp < now then
+        return Result::Err(WebError::Unauthorized)
+      end
+    end
+    
+    Result::Ok(payload)
+  end
+  
+  def jwt_middleware(secret: &[u8]) -> Middleware
+    let secret = secret.to_vec()
+    
+    |ctx: &mut Context, next: fn(&mut Context) -> HttpResponse| {
+      let auth_header = ctx.header("Authorization");
+      
+      match auth_header
+      when Option::Some(h) then
+        if h.starts_with("Bearer ") then
+          let token = h[7..].trim()
+          match verify_jwt(token, &secret)
+          when Result::Ok(claims) then
+            ctx.locals.insert("user".to_string(), Json::stringify(&claims))
+            next(ctx)
+          when Result::Err(_) then
+            ctx.status(StatusCode::Unauthorized).text("Invalid token")
+          end
+        else
+          ctx.status(StatusCode::Unauthorized).text("Bearer token required")
+        end
+      when Option::None then
+        ctx.status(StatusCode::Unauthorized).text("Authorization required")
+      end
+    }
+  end
+  
+  # Password hashing
+  def hash_password(password: &str) -> String
+    let salt = random_bytes(16)
+    let hash = std::crypto::pbkdf2_sha256(password.as_bytes(), &salt, 10000, 32)
+    
+    let mut result = Vec::new()
+    result.extend(&salt)
+    result.extend(&hash)
+    
+    base64::encode(&result)
+  end
+  
+  def verify_password(password: &str, encoded: &str) -> Bool
+    let decoded = match base64::decode(encoded)
+    when Result::Ok(d) then d
+    when Result::Err(_) then return false
+    end
+    
+    if decoded.len() != 48 then
+      return false
+    end
+    
+    let salt = &decoded[0..16]
+    let stored_hash = &decoded[16..48]
+    
+    let computed_hash = std::crypto::pbkdf2_sha256(password.as_bytes(), salt, 10000, 32)
+    
+    # Constant-time comparison
+    let mut diff = 0u8
+    for i in 0..32 do
+      diff = diff | (stored_hash[i] ^ computed_hash[i])
+    end
+    
+    diff == 0
+  end
+  
+  # Session management
+  struct Session
+    id: String
+    data: Map[String, String]
+    expires_at: SystemTime
+  end
+  
+  struct SessionStore
+    sessions: std::thread::Mutex[Map[String, Session]]
+    max_age: Duration
+  end
+  
+  impl SessionStore
+    def new(max_age: Duration) -> SessionStore
+      SessionStore {
+        sessions: std::thread::Mutex::new(Map::new()),
+        max_age: max_age
+      }
+    end
+    
+    # Generate a new session and return its ID.
+    # This is a factory method on an existing store, not a constructor.
+    def generate_id(self: &SessionStore) -> String
+      let id = base64::encode_url_safe(&random_bytes(32))
+      let session = Session {
+        id: id.clone(),
+        data: Map::new(),
+        expires_at: SystemTime::now() + self.max_age
+      }
+      
+      let mut guard = self.sessions.lock()
+      guard.insert(id.clone(), session)
+      id
+    end
+    
+    def get(self: &SessionStore, id: &str) -> Option[Session]
+      let mut guard = self.sessions.lock()
+      
+      if let Option::Some(session) = guard.get(id) then
+        if session.expires_at > SystemTime::now() then
+          return Option::Some(session.clone())
+        else
+          guard.remove(id)
+        end
+      end
+      
+      Option::None
+    end
+    
+    def set(self: &SessionStore, id: &str, key: &str, value: &str) -> Bool
+      let mut guard = self.sessions.lock()
+      
+      if let Option::Some(session) = guard.get_mut(id) then
+        session.data.insert(key.to_string(), value.to_string())
+        true
+      else
+        false
+      end
+    end
+    
+    def destroy(self: &SessionStore, id: &str) -> Unit
+      let mut guard = self.sessions.lock()
+      guard.remove(id)
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 5: UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+def parse_query_string(query: &str) -> Map[String, String]
+  let mut result = Map::new()
+  
+  for pair in query.split('&') do
+    if let Option::Some(idx) = pair.find('=') then
+      let key = url_decode(&pair[0..idx])
+      let value = url_decode(&pair[idx + 1..])
+      result.insert(key, value)
+    end
+  end
+  
+  result
+end
+
+def url_decode(s: &str) -> String
+  let mut result = String::new()
+  let chars: Vec[char] = s.chars().collect()
+  let mut i = 0
+  
+  while i < chars.len() do
+    if chars[i] == '%' && i + 2 < chars.len() then
+      let hex = &s[i + 1..i + 3]
+      if let Result::Ok(byte) = u8::from_str_radix(hex, 16) then
+        result.push(byte as char)
+        i = i + 3
+        continue
+      end
+    else if chars[i] == '+' then
+      result.push(' ')
+      i = i + 1
+      continue
+    end
+    
+    result.push(chars[i])
+    i = i + 1
+  end
+  
+  result
+end
+
+def url_encode(s: &str) -> String
+  let mut result = String::new()
+  
+  for c in s.chars() do
+    if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' then
+      result.push(c)
+    else
+      result.push_str(&percent_encode_byte(c as u8))
+    end
+  end
+  
+  result
+end
+
+def percent_encode_byte(byte: u8) -> String
+  let digits = "0123456789ABCDEF"
+  let hi = ((byte >> 4) & 0x0f) as UInt
+  let lo = (byte & 0x0f) as UInt
+  "%".to_string() + digits.char_at(hi).unwrap().to_string() + digits.char_at(lo).unwrap().to_string()
+end
+
+struct CookieOptions
+  max_age: Option[u32]
+  domain: Option[String]
+  path: String
+  secure: Bool
+  http_only: Bool
+  same_site: SameSite
+end
+
+enum SameSite
+  Strict
+  Lax
+  None
+end
+
+impl CookieOptions
+  def default() -> CookieOptions
+    CookieOptions {
+      max_age: Option::None,
+      domain: Option::None,
+      path: "/".to_string(),
+      secure: false,
+      http_only: true,
+      same_site: SameSite::Lax
+    }
+  end
+end
+
+def format_cookie(name: &str, value: &str, options: &CookieOptions) -> String
+  let mut cookie = url_encode(name) + "=" + url_encode(value)
+  
+  if let Option::Some(age) = options.max_age then
+    cookie.push_str(&("; Max-Age=".to_string() + age.to_string()))
+  end
+  
+  if let Option::Some(ref domain) = options.domain then
+    cookie.push_str(&("; Domain=".to_string() + domain))
+  end
+  
+  cookie.push_str(&("; Path=".to_string() + options.path.as_str()))
+  
+  if options.secure then
+    cookie.push_str("; Secure")
+  end
+  
+  if options.http_only then
+    cookie.push_str("; HttpOnly")
+  end
+  
+  match options.same_site
+  when SameSite::Strict then cookie.push_str("; SameSite=Strict")
+  when SameSite::Lax then cookie.push_str("; SameSite=Lax")
+  when SameSite::None then cookie.push_str("; SameSite=None")
+  end
+  
+  cookie
+end
+
+def parse_cookies(header: &str) -> Map[String, String]
+  let mut result = Map::new()
+  
+  for pair in header.split(';') do
+    let pair = pair.trim()
+    if let Option::Some(idx) = pair.find('=') then
+      let key = pair[0..idx].to_string()
+      let value = pair[idx + 1..].to_string()
+      result.insert(key, value)
+    end
+  end
+  
+  result
+end
+
+def guess_mime_type(path: &str) -> &str
+  let ext = path.rsplit('.').next().unwrap_or("")
+  
+  match ext.to_lowercase().as_str()
+  when "html" | "htm" then "text/html"
+  when "css" then "text/css"
+  when "js" then "application/javascript"
+  when "json" then "application/json"
+  when "xml" then "application/xml"
+  when "txt" then "text/plain"
+  when "png" then "image/png"
+  when "jpg" | "jpeg" then "image/jpeg"
+  when "gif" then "image/gif"
+  when "svg" then "image/svg+xml"
+  when "ico" then "image/x-icon"
+  when "webp" then "image/webp"
+  when "pdf" then "application/pdf"
+  when "zip" then "application/zip"
+  when "woff" then "font/woff"
+  when "woff2" then "font/woff2"
+  when "ttf" then "font/ttf"
+  when "mp3" then "audio/mpeg"
+  when "mp4" then "video/mp4"
+  when "webm" then "video/webm"
+  when _ then "application/octet-stream"
+  end
+end

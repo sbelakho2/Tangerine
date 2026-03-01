@@ -104,32 +104,80 @@ extern "C"
   def sched_yield() -> Int
   def usleep(usec: UInt) -> Int
   def nanosleep(req: Ptr[TimeSpec], rem: Ptr[TimeSpec]) -> Int
+  
+  # Time functions
+  def clock_gettime(clockid: Int, tp: Ptr[TimeSpec]) -> Int
 end
 
+# Clock IDs for clock_gettime
+def CLOCK_REALTIME() -> Int = 0
+def CLOCK_MONOTONIC() -> Int = 1
+
 # Opaque pthread types (platform-specific sizes)
-# These are sized for common 64-bit platforms
+# Linux glibc x86-64 sizes are default; macOS sizes differ significantly.
+# TODO: when #[cfg(target_os)] is implemented, gate these per-platform.
+#   macOS: PthreadMutexT = 64 bytes, PthreadRwlockT = 200 bytes,
+#          PthreadAttrT = 64 bytes, PthreadBarrierT = not supported.
+
+#[cfg(target_os = "linux")]
 struct PthreadT
   opaque: [u8; 8]
 end
 
+#[cfg(target_os = "linux")]
 struct PthreadAttrT
   opaque: [u8; 56]
 end
 
+#[cfg(target_os = "linux")]
 struct PthreadMutexT
   opaque: [u8; 40]
 end
 
+#[cfg(target_os = "linux")]
 struct PthreadCondT
   opaque: [u8; 48]
 end
 
+#[cfg(target_os = "linux")]
 struct PthreadRwlockT
   opaque: [u8; 56]
 end
 
+#[cfg(target_os = "linux")]
 struct PthreadBarrierT
   opaque: [u8; 32]
+end
+
+#[cfg(target_os = "macos")]
+struct PthreadT
+  opaque: [u8; 8]
+end
+
+#[cfg(target_os = "macos")]
+struct PthreadAttrT
+  opaque: [u8; 64]
+end
+
+#[cfg(target_os = "macos")]
+struct PthreadMutexT
+  opaque: [u8; 64]
+end
+
+#[cfg(target_os = "macos")]
+struct PthreadCondT
+  opaque: [u8; 48]
+end
+
+#[cfg(target_os = "macos")]
+struct PthreadRwlockT
+  opaque: [u8; 200]
+end
+
+# Note: macOS does not support pthread_barrier_t; barrier API is unavailable.
+#[cfg(target_os = "macos")]
+struct PthreadBarrierT
+  opaque: [u8; 0]
 end
 
 struct PthreadKeyT
@@ -153,6 +201,7 @@ end
 struct JoinHandle[T]
   thread: Thread
   result_ptr: Ptr[T]
+  joined: Bool
 end
 
 struct ThreadBuilder
@@ -223,7 +272,8 @@ impl ThreadBuilder
     
     Result::Ok(JoinHandle {
       thread: Thread { handle: handle, name: self.name.clone() },
-      result_ptr: result_ptr
+      result_ptr: result_ptr,
+      joined: false
     })
   end
 end
@@ -257,7 +307,11 @@ def spawn[F, T](f: F) -> JoinHandle[T]
 end
 
 impl[T] JoinHandle[T]
-  def join(self: JoinHandle[T]) -> Result[T, String]
+  def join(mut self: JoinHandle[T]) -> Result[T, String]
+    if self.joined then
+      return Result::Err("Thread already joined".to_string())
+    end
+
     mut retval: Ptr[u8] = Ptr::null()
     let ret = pthread_join(self.thread.handle, &retval)
     
@@ -267,11 +321,33 @@ impl[T] JoinHandle[T]
     
     let result = self.result_ptr.read()
     dealloc(self.result_ptr)
+    self.result_ptr = Ptr::null()
+    self.joined = true
     Result::Ok(result)
   end
   
   def thread(self: &JoinHandle[T]) -> &Thread
     &self.thread
+  end
+end
+
+impl[T] Drop for JoinHandle[T]
+  def drop(self: &mut JoinHandle[T]) -> Unit
+    if self.joined || self.result_ptr.is_null() then
+      return
+    end
+
+    mut retval: Ptr[u8] = Ptr::null()
+    let ret = pthread_join(self.thread.handle, &retval)
+
+    if ret == 0 then
+      drop(&mut self.result_ptr.read())
+      dealloc(self.result_ptr)
+      self.result_ptr = Ptr::null()
+      self.joined = true
+    else
+      pthread_detach(self.thread.handle)
+    end
   end
 end
 
@@ -433,9 +509,8 @@ impl[T] RwLockReadGuard[T]
 end
 
 impl[T] RwLockWriteGuard[T]
-  def get(self: &RwLockWriteGuard[T]) -> &T
-    &self.lock.data
-  end
+  # get() removed - write guards should only provide mutable access
+  # Use get_mut() instead to maintain exclusive write semantics
   
   def get_mut(self: &mut RwLockWriteGuard[T]) -> &mut T
     &mut self.lock.data
@@ -484,9 +559,25 @@ impl Condvar
   end
   
   def wait_timeout[T](self: &Condvar, guard: MutexGuard[T], timeout_ms: UInt) -> (MutexGuard[T], Bool)
-    let secs = (timeout_ms / 1000) as i64
-    let nanos = ((timeout_ms % 1000) * 1000000) as i64
-    mut abstime = TimeSpec { tv_sec: secs, tv_nsec: nanos }
+    # pthread_cond_timedwait requires ABSOLUTE time, not relative
+    mut now = TimeSpec { tv_sec: 0, tv_nsec: 0 }
+    clock_gettime(CLOCK_REALTIME, &mut now)
+    
+    let timeout_secs = (timeout_ms / 1000) as i64
+    let timeout_nanos = ((timeout_ms % 1000) * 1000000) as i64
+    
+    # Add timeout to current time
+    mut abstime = TimeSpec {
+      tv_sec: now.tv_sec + timeout_secs,
+      tv_nsec: now.tv_nsec + timeout_nanos
+    }
+    
+    # Handle nanosecond overflow
+    if abstime.tv_nsec >= 1000000000 then
+      abstime.tv_sec = abstime.tv_sec + 1
+      abstime.tv_nsec = abstime.tv_nsec - 1000000000
+    end
+    
     let ret = pthread_cond_timedwait(&self.inner, &guard.mutex.inner, &abstime)
     let timed_out = ret != 0
     (guard, timed_out)
@@ -848,9 +939,19 @@ struct ThreadLocal[T]
   init: fn() -> T
 end
 
+# Thread-local destructor (called when thread exits)
+extern "C" def tls_destructor[T](value: Ptr[u8]) -> Unit
+  if !value.is_null() then
+    let ptr = value as Ptr[T]
+    ptr.drop_in_place()
+    dealloc(value, size_of[T](), align_of[T]())
+  end
+end
+
 def thread_local_new[T](init: fn() -> T) -> ThreadLocal[T]
   mut key = PthreadKeyT { key: 0 }
-  pthread_key_create(&key, Ptr::null())
+  # Register destructor to prevent memory leak
+  pthread_key_create(&key, tls_destructor[T] as Ptr[u8])
   ThreadLocal { key: key, init: init }
 end
 
@@ -859,11 +960,12 @@ impl[T] ThreadLocal[T]
     let ptr = pthread_getspecific(self.key)
     if ptr.is_null() then
       # Initialize for this thread
-      let boxed = Box::new((self.init)())
-      let raw = &boxed.get() as Ptr[u8]
+      let raw = alloc(size_of[T](), align_of[T]())
+      let typed_ptr = raw as Ptr[T]
+      typed_ptr.write((self.init)())
       pthread_setspecific(self.key, raw)
-      # Note: memory leak - needs destructor registration
-      &boxed.get()
+      # Destructor registered at key creation will free this
+      &typed_ptr.read()
     else
       &(ptr as Ptr[T]).read()
     end

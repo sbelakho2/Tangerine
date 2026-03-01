@@ -46,10 +46,161 @@ trait From[T]
   def from(x: T) -> Self
 end
 
+# Common error trait — implemented by all std error types
+trait Error
+  def message(self: &Self) -> String
+  def source(self: &Self) -> Option[&dyn Error]
+    Option::None
+  end
+end
+
+# Display trait for user-facing string conversion
+trait Display
+  def fmt(self: &Self) -> String
+end
+
 def panic(msg: String) -> Unit
   # Compiler intrinsic: abort with message
   panic(msg)
 end
+
+# ———————————————————————————————————————————————————————————————
+# Panic / Unwind Infrastructure
+# ———————————————————————————————————————————————————————————————
+#
+# Supports two panic strategies selected at compile time:
+#   - abort (default): process terminates immediately
+#   - unwind: stack frames are unwound, destructors run, catch_unwind catches
+#
+# The runtime maintains a thread-local chain of "catch frames" pushed by
+# catch_unwind.  On panic, if unwind is enabled the runtime walks the
+# chain, invokes Drop on every local, and resumes at the closest frame.
+# If no frame exists, it aborts.
+
+struct PanicInfo
+  message: String
+  file: String
+  line: Int
+  column: Int
+end
+
+# Type-erased payload carried during an unwind
+enum PanicPayload
+  Message(String)
+  Value(Box[dyn Any])
+end
+
+# Thread-local panic hook
+# Users can install a custom hook via set_panic_hook.
+# The default hook prints the panic info to stderr.
+static mut _panic_hook: Option[fn(PanicInfo) -> Unit] = Option::None
+
+def set_panic_hook(hook: fn(PanicInfo) -> Unit) -> Unit
+  _panic_hook = Option::Some(hook)
+end
+
+def take_panic_hook() -> Option[fn(PanicInfo) -> Unit]
+  let hook = _panic_hook.clone()
+  _panic_hook = Option::None
+  hook
+end
+
+def default_panic_hook(info: PanicInfo) -> Unit
+  eprintln("thread panicked at '" + info.message.clone() + "', "
+           + info.file.clone() + ":" + info.line.to_string()
+           + ":" + info.column.to_string())
+end
+
+# CatchFrame: linked-list node pushed/popped around catch_unwind.
+# In real codegen this becomes a setjmp/longjmp pair.
+struct CatchFrame
+  id: Int
+  active: Bool
+end
+
+static mut _catch_frame_stack: Vec[CatchFrame] = Vec::new()
+static mut _current_panic: Option[PanicPayload] = Option::None
+
+# Invoke a closure, catching any panic.
+# Returns Result::Ok(value) on success, Result::Err(payload_msg) on panic.
+def catch_unwind[T](f: fn() -> T) -> Result[T, String]
+  # Push a catch frame
+  let frame_id = _catch_frame_stack.len()
+  _catch_frame_stack.push(CatchFrame { id: frame_id, active: true })
+
+  # The compiler lowers this to setjmp; on panic-unwind, longjmp returns here.
+  # In the interpreter this is modelled by the runtime trapping the unwind
+  # and returning to this point.
+  let result = try_invoke(f)
+
+  # Pop the catch frame
+  if !_catch_frame_stack.is_empty() then
+    _catch_frame_stack.pop()
+  end
+
+  match result
+  when Option::Some(val) then Result::Ok(val)
+  when Option::None then
+    # A panic was caught — extract the message
+    let msg = match _current_panic
+    when Option::Some(PanicPayload::Message(m)) then m.clone()
+    when Option::Some(PanicPayload::Value(_)) then "<boxed panic>".to_string()
+    when Option::None then "<unknown panic>".to_string()
+    end
+    _current_panic = Option::None
+    Result::Err(msg)
+  end
+end
+
+# Low-level: invoke f, returning None if a panic/unwind occurred.
+# The compiler translates this into setjmp/longjmp or platform landing pads.
+def try_invoke[T](f: fn() -> T) -> Option[T]
+  # Compiler intrinsic — in interpreted mode, this wraps the call
+  # and intercepts unwind signals.
+  Option::Some(f())
+end
+
+# Begin an unwind from a panic.  Walks the catch-frame stack and invokes
+# destructors for each stack frame between here and the nearest catch point.
+def begin_unwind(payload: PanicPayload) -> Unit
+  _current_panic = Option::Some(payload)
+  
+  # If there is a catch frame, invoke longjmp (compiler intrinsic).
+  # Otherwise, abort.
+  if !_catch_frame_stack.is_empty() then
+    let frame = _catch_frame_stack[_catch_frame_stack.len() - 1]
+    if frame.active then
+      # Compiler intrinsic: longjmp to the catch frame
+      # In interpreted mode, this unwinds the interpreter stack.
+      __intrinsic_longjmp(frame.id)
+    end
+  end
+  
+  # No catch frame — abort
+  __intrinsic_abort()
+end
+
+# Panic entry point (called by the `panic` intrinsic when strategy = unwind)
+def panic_unwind(info: PanicInfo) -> Unit
+  # Invoke the panic hook
+  match _panic_hook
+  when Option::Some(hook) then hook(info.clone())
+  when Option::None then default_panic_hook(info.clone())
+  end
+
+  begin_unwind(PanicPayload::Message(info.message))
+end
+
+# Compiler intrinsics — implemented by the codegen backend
+extern def __intrinsic_longjmp(frame_id: Int) -> Unit
+extern def __intrinsic_abort() -> Unit
+
+# Convenience: resume_unwind re-panics with a payload (useful after catch_unwind)
+def resume_unwind(msg: String) -> Unit
+  begin_unwind(PanicPayload::Message(msg))
+end
+
+# ———————————————————————————————————————————————————————————————
 
 def assert(cond: Bool, msg: String) -> Unit
   if !cond

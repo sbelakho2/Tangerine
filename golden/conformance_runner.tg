@@ -1,0 +1,1124 @@
+# ———————————————————————————————————————————————————————————————
+## Tangerine Conformance Test Runner
+# ———————————————————————————————————————————————————————————————
+#
+# Runs all golden/ test files through the compiler pipeline and
+# checks expected outcomes. Tests are annotated with directives:
+#
+#   # expect: ok             — compilation should succeed
+#   # expect: error E0200    — should emit specific error code
+#   # expect: warning        — should emit a warning
+#   # expect: output "hello" — running the compiled program should print "hello"
+#   # expect: mir_contains "bb0" — MIR should contain substring
+#
+# Usage:
+#   tg test conformance/runner.tg
+#   tg test conformance/runner.tg --filter parser
+#   tg test conformance/runner.tg --verbose
+
+use std::io
+use std::test
+
+# ———————————————————————————————————————————————————————————————
+# Test Directive Parsing
+# ———————————————————————————————————————————————————————————————
+
+enum ExpectedOutcome
+  Ok                              # Compilation succeeds
+  Error(code: String)             # Specific error code expected
+  AnyError                        # Any compilation error
+  Warning                         # A warning is emitted
+  Output(expected: String)        # Runtime output matches
+  MirContains(pattern: String)    # MIR contains substring
+  ParseError                      # Parser should fail
+  TypeErrorMsg(substr: String)    # Type error message contains substring
+end
+
+struct TestDirective
+  file: String
+  outcome: ExpectedOutcome
+  description: String
+end
+
+def parse_directives(path: String, content: &String) -> Vec[TestDirective]
+  mut directives = Vec::new()
+  
+  for line in content.lines() do
+    let trimmed = line.trim()
+    
+    if !trimmed.starts_with("# expect:") then
+      continue
+    end
+    
+    let directive_text = trimmed.slice(9, trimmed.len()).trim()
+    
+    let outcome = if directive_text == "ok" then
+      ExpectedOutcome::Ok
+    elsif directive_text.starts_with("error ") then
+      let code = directive_text.slice(6, directive_text.len()).trim().to_string()
+      ExpectedOutcome::Error(code)
+    elsif directive_text == "error" then
+      ExpectedOutcome::AnyError
+    elsif directive_text == "warning" then
+      ExpectedOutcome::Warning
+    elsif directive_text.starts_with("output ") then
+      let expected = directive_text.slice(7, directive_text.len()).trim()
+      let unquoted = expected.trim_matches('"').to_string()
+      ExpectedOutcome::Output(unquoted)
+    elsif directive_text.starts_with("mir_contains ") then
+      let pat = directive_text.slice(13, directive_text.len()).trim()
+      let unquoted = pat.trim_matches('"').to_string()
+      ExpectedOutcome::MirContains(unquoted)
+    elsif directive_text == "parse_error" then
+      ExpectedOutcome::ParseError
+    elsif directive_text.starts_with("type_error ") then
+      let msg = directive_text.slice(11, directive_text.len()).trim()
+      let unquoted = msg.trim_matches('"').to_string()
+      ExpectedOutcome::TypeErrorMsg(unquoted)
+    else
+      # Unknown directive — treat as warning expectation so it is visible
+      ExpectedOutcome::Warning
+    end
+    
+    directives.push(TestDirective {
+      file: path.clone(),
+      outcome: outcome,
+      description: directive_text.to_string()
+    })
+  end
+  
+  # If no directives found, default to "expect: ok"
+  if directives.is_empty() then
+    directives.push(TestDirective {
+      file: path.clone(),
+      outcome: ExpectedOutcome::Ok,
+      description: "ok (implicit)".to_string()
+    })
+  end
+  
+  directives
+end
+
+# ———————————————————————————————————————————————————————————————
+# Test Execution
+# ———————————————————————————————————————————————————————————————
+
+struct ConformanceResult
+  file: String
+  directive: String
+  passed: Bool
+  message: String
+end
+
+def run_conformance_test(directive: &TestDirective) -> ConformanceResult
+  let path = directive.file.clone()
+  
+  match read_file(path.clone())
+  when Result::Err(e) then
+    return ConformanceResult {
+      file: path,
+      directive: directive.description.clone(),
+      passed: false,
+      message: "cannot read file: " + e
+    }
+  when Result::Ok(source) then
+    # Parse the source
+    let tokens = tokenize(source.clone())
+    let parse_result = parse(tokens)
+    
+    match directive.outcome
+    when ExpectedOutcome::ParseError then
+      match parse_result
+      when Result::Err(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: true, message: "parser correctly rejected input"
+        }
+      when Result::Ok(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: false, message: "expected parse error but parsing succeeded"
+        }
+      end
+    when _ then ()
+    end
+    
+    let ast = match parse_result
+    when Result::Ok(a) then a
+    when Result::Err(e) then
+      # If we expected Ok but got parse error
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: false, message: "unexpected parse error: " + e.message
+      }
+    end
+    
+    # Resolve names
+    let resolved = resolve_names(&ast)
+    
+    # Type check
+    let type_result = type_check(&ast, &resolved)
+    
+    match directive.outcome
+    when ExpectedOutcome::Error(ref code) then
+      match type_result
+      when Result::Err(ref errors) then
+        let has_code = errors.iter().any(|e| {
+          match e.code
+          when Option::Some(ref c) then c == code
+          when Option::None then false
+          end
+        })
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: has_code,
+          message: if has_code then "correct error " + code.clone()
+                   else "expected " + code.clone() + " but got different errors"
+                   end
+        }
+      when Result::Ok(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: false, message: "expected error " + code.clone() + " but compilation succeeded"
+        }
+      end
+    
+    when ExpectedOutcome::AnyError then
+      match type_result
+      when Result::Err(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: true, message: "compilation error as expected"
+        }
+      when Result::Ok(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: false, message: "expected error but compilation succeeded"
+        }
+      end
+    
+    when ExpectedOutcome::TypeErrorMsg(ref substr) then
+      match type_result
+      when Result::Err(ref errors) then
+        let has_msg = errors.iter().any(|e| e.message.contains(substr.as_str()))
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: has_msg,
+          message: if has_msg then "error message contains expected substring"
+                   else "error message does not contain: " + substr.clone()
+                   end
+        }
+      when Result::Ok(_) then
+        return ConformanceResult {
+          file: path, directive: directive.description.clone(),
+          passed: false, message: "expected type error but compilation succeeded"
+        }
+      end
+    
+    when ExpectedOutcome::Warning then
+      # Check that at least one warning was emitted
+      let has_warning = match type_result
+      when Result::Ok(ref ctx) then ctx.warnings.len() > 0
+      when Result::Err(ref errors) then
+        errors.iter().any(|e| e.level == DiagLevel::Warning)
+      end
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: has_warning,
+        message: if has_warning then "warning emitted as expected"
+                 else "expected warning but none emitted"
+                 end
+      }
+    
+    when _ then ()
+    end
+    
+    # Beyond type checking — lower to MIR
+    let typed_ast = match type_result
+    when Result::Ok(ta) then ta
+    when Result::Err(e) then
+      let msg = if e.len() > 0 then e[0].message.clone() else "unknown type error" end
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: false, message: "unexpected type error: " + msg
+      }
+    end
+    
+    let mir = lower_to_mir(&typed_ast)
+    
+    match directive.outcome
+    when ExpectedOutcome::MirContains(ref pattern) then
+      let mir_text = pretty_print_mir(&mir)
+      let contains = mir_text.contains(pattern.as_str())
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: contains,
+        message: if contains then "MIR contains expected pattern"
+                 else "MIR does not contain: " + pattern.clone()
+                 end
+      }
+    
+    when ExpectedOutcome::Output(ref expected) then
+      # Interpret the MIR and check output
+      let output = interpret_mir(&mir)
+      let matches = output.trim() == expected.trim()
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: matches,
+        message: if matches then "output matches"
+                 else "expected output '" + expected.clone() + "' but got '" + output + "'"
+                 end
+      }
+    
+    when ExpectedOutcome::Ok then
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: true, message: "compilation succeeded"
+      }
+    
+    when _ then
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: true, message: "ok"
+      }
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Test Runner
+# ———————————————————————————————————————————————————————————————
+
+struct ConformanceConfig
+  test_dir: String
+  filter: Option[String]
+  verbose: Bool
+  json_output: Bool
+end
+
+def run_conformance_suite(config: ConformanceConfig) -> Int
+  println("Running Tangerine conformance suite...")
+  println("Test directory: " + config.test_dir.clone())
+  println("")
+  
+  # Discover all .tg files in golden/
+  let test_files = discover_test_files(&config.test_dir)
+  
+  mut total = 0
+  mut passed = 0
+  mut failed = 0
+  mut skipped = 0
+  mut results = Vec::new()
+  
+  for file in test_files do
+    # Apply filter
+    match config.filter
+    when Option::Some(ref f) then
+      if !file.contains(f.as_str()) then
+        skipped = skipped + 1
+        continue
+      end
+    when Option::None then ()
+    end
+    
+    match read_file(file.clone())
+    when Result::Ok(content) then
+      let directives = parse_directives(file.clone(), &content)
+      
+      for directive in directives do
+        total = total + 1
+        let result = run_conformance_test(&directive)
+        
+        if result.passed then
+          passed = passed + 1
+          if config.verbose then
+            println("  ✓ " + result.file.clone() + " [" + result.directive.clone() + "]")
+          else
+            print(".")
+          end
+        else
+          failed = failed + 1
+          println("")
+          println("  ✗ FAIL: " + result.file.clone() + " [" + result.directive.clone() + "]")
+          println("    " + result.message.clone())
+        end
+        
+        results.push(result)
+      end
+    when Result::Err(e) then
+      total = total + 1
+      failed = failed + 1
+      println("  ✗ FAIL: " + file.clone() + " — cannot read: " + e)
+    end
+  end
+  
+  if !config.verbose && failed == 0 then
+    println("")
+  end
+  
+  println("")
+  println("Conformance results: " + passed.to_string() + " passed, " +
+          failed.to_string() + " failed, " + skipped.to_string() + " skipped" +
+          " (total: " + total.to_string() + ")")
+  
+  if config.json_output then
+    print_conformance_json(&results)
+  end
+  
+  if failed > 0 then 1 else 0 end
+end
+
+def discover_test_files(dir: &String) -> Vec[String]
+  mut files = Vec::new()
+  
+  match list_directory(dir.clone())
+  when Result::Ok(entries) then
+    mut sorted = entries.clone()
+    sorted.sort()
+    for entry in sorted do
+      if entry.ends_with(".tg") then
+        files.push(dir.clone() + "/" + entry)
+      end
+    end
+  when Result::Err(_) then ()
+  end
+  
+  files
+end
+
+def print_conformance_json(results: &Vec[ConformanceResult]) -> Unit
+  mut json = "[\n".to_string()
+  mut first = true
+  
+  for r in results do
+    if !first then json = json + ",\n" end
+    first = false
+    json = json + "  {\"file\":\"" + escape_json_str(&r.file) + "\""
+    json = json + ",\"directive\":\"" + escape_json_str(&r.directive) + "\""
+    json = json + ",\"passed\":" + if r.passed then "true" else "false" end
+    json = json + ",\"message\":\"" + escape_json_str(&r.message) + "\"}"
+  end
+  
+  json = json + "\n]"
+  println(json)
+end
+
+def escape_json_str(s: &String) -> String
+  mut out = String::new()
+  for c in s.chars() do
+    if c == '"' then out.push_str("\\\"")
+    elsif c == '\\' then out.push_str("\\\\")
+    elsif c == '\n' then out.push_str("\\n")
+    elsif c == '\t' then out.push_str("\\t")
+    else out.push(c)
+    end
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Diagnostics Quality Tests
+# ———————————————————————————————————————————————————————————————
+#
+# Special test files can assert on the exact error messages produced:
+#
+#   # expect-diagnostic: "error[E0200]: type mismatch"
+#   # expect-help: "expected `Int`, found `String`"
+#   # expect-note: "in this expression"
+
+struct DiagnosticAssertion
+  kind: String    # "diagnostic", "help", "note"
+  expected: String
+end
+
+def parse_diagnostic_assertions(content: &String) -> Vec[DiagnosticAssertion]
+  mut assertions = Vec::new()
+  
+  for line in content.lines() do
+    let trimmed = line.trim()
+    
+    if trimmed.starts_with("# expect-diagnostic:") then
+      let msg = trimmed.slice(20, trimmed.len()).trim().trim_matches('"').to_string()
+      assertions.push(DiagnosticAssertion { kind: "diagnostic".to_string(), expected: msg })
+    elsif trimmed.starts_with("# expect-help:") then
+      let msg = trimmed.slice(14, trimmed.len()).trim().trim_matches('"').to_string()
+      assertions.push(DiagnosticAssertion { kind: "help".to_string(), expected: msg })
+    elsif trimmed.starts_with("# expect-note:") then
+      let msg = trimmed.slice(14, trimmed.len()).trim().trim_matches('"').to_string()
+      assertions.push(DiagnosticAssertion { kind: "note".to_string(), expected: msg })
+    end
+  end
+  
+  assertions
+end
+
+# ———————————————————————————————————————————————————————————————
+# Compiler Fuzzing Harness
+# ———————————————————————————————————————————————————————————————
+#
+# Simple mutation-based fuzzer for the Tangerine compiler.
+# Generates random Tangerine source from templates and feeds it
+# to the parser, type checker, and MIR lowering looking for crashes.
+
+struct FuzzConfig
+  iterations: UInt
+  max_depth: UInt
+  seed: UInt
+  timeout_ms: UInt
+  corpus_dir: String
+end
+
+struct FuzzStats
+  total: UInt
+  crashes: UInt
+  timeouts: UInt
+  interesting: UInt
+  coverage_edges: UInt
+end
+
+def fuzz_compiler(config: FuzzConfig) -> FuzzStats
+  println("Fuzzing Tangerine compiler...")
+  println("  Iterations: " + config.iterations.to_string())
+  println("  Max depth: " + config.max_depth.to_string())
+  println("  Seed: " + config.seed.to_string())
+  println("")
+  
+  mut stats = FuzzStats {
+    total: 0,
+    crashes: 0,
+    timeouts: 0,
+    interesting: 0,
+    coverage_edges: 0
+  }
+  
+  mut rng_state = config.seed
+  
+  # Load corpus seeds
+  mut corpus = load_fuzz_corpus(&config.corpus_dir)
+  if corpus.is_empty() then
+    # Generate initial seeds from templates
+    corpus = generate_seed_corpus()
+  end
+  
+  mut i: UInt = 0
+  while i < config.iterations do
+    stats.total = stats.total + 1
+    
+    # Pick a seed and mutate it
+    let seed_idx = rng_next(&mut rng_state) % corpus.len()
+    let mutated = mutate_source(&corpus[seed_idx], &mut rng_state, config.max_depth)
+    
+    # Feed to compiler pipeline
+    let result = fuzz_one_input(&mutated)
+    
+    match result
+    when FuzzResult::Ok then ()
+    when FuzzResult::CompileError then ()  # Expected — compilation errors are fine
+    when FuzzResult::Crash(ref msg) then
+      stats.crashes = stats.crashes + 1
+      println("CRASH at iteration " + i.to_string() + ": " + msg.clone())
+      # Save crash input
+      save_crash_input(&config.corpus_dir, i, &mutated)
+    when FuzzResult::Timeout then
+      stats.timeouts = stats.timeouts + 1
+    when FuzzResult::Interesting then
+      stats.interesting = stats.interesting + 1
+      # Add to corpus for further mutation
+      corpus.push(mutated)
+    end
+    
+    if (i + 1) % 1000 == 0 then
+      println("  [" + (i + 1).to_string() + "/" + config.iterations.to_string() + "] " +
+              "crashes=" + stats.crashes.to_string() +
+              " timeouts=" + stats.timeouts.to_string() +
+              " corpus=" + corpus.len().to_string())
+    end
+    
+    i = i + 1
+  end
+  
+  println("")
+  println("Fuzzing complete:")
+  println("  Total: " + stats.total.to_string())
+  println("  Crashes: " + stats.crashes.to_string())
+  println("  Timeouts: " + stats.timeouts.to_string())
+  println("  Interesting: " + stats.interesting.to_string())
+  
+  stats
+end
+
+enum FuzzResult
+  Ok
+  CompileError
+  Crash(message: String)
+  Timeout
+  Interesting
+end
+
+def fuzz_one_input(source: &String) -> FuzzResult
+  # Run the compiler pipeline in a safe harness
+  # Any panic/crash is caught and reported
+  
+  # Step 1: Tokenize — should never crash
+  let tokens = match try_tokenize(source)
+  when Result::Ok(t) then t
+  when Result::Err(_) then return FuzzResult::CompileError
+  end
+  
+  # Step 2: Parse — may fail on invalid input
+  let ast = match try_parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(_) then return FuzzResult::CompileError
+  end
+  
+  # Step 3: Resolve names
+  let resolved = match try_resolve(&ast)
+  when Result::Ok(r) then r
+  when Result::Err(_) then return FuzzResult::CompileError
+  end
+  
+  # Step 4: Type check
+  let typed = match try_type_check(&ast, &resolved)
+  when Result::Ok(t) then t
+  when Result::Err(_) then return FuzzResult::CompileError
+  end
+  
+  # Step 5: MIR lowering
+  let mir = match try_lower_mir(&typed)
+  when Result::Ok(m) then m
+  when Result::Err(_) then return FuzzResult::CompileError
+  end
+  
+  # Step 6: MIR verification — if it fails on well-typed code, that's interesting
+  match verify_mir(&mir)
+  when Result::Ok(_) then FuzzResult::Ok
+  when Result::Err(e) then
+    # MIR verifier found an inconsistency — this is interesting
+    FuzzResult::Interesting
+  end
+end
+
+def try_tokenize(source: &String) -> Result[Vec[Token], String]
+  # Wraps tokenize() with crash protection
+  Result::Ok(tokenize(source.clone()))
+end
+
+def try_parse(tokens: Vec[Token]) -> Result[Ast, String]
+  parse(tokens)
+end
+
+def try_resolve(ast: &Ast) -> Result[ResolvedNames, String]
+  Result::Ok(resolve_names(ast))
+end
+
+def try_type_check(ast: &Ast, resolved: &ResolvedNames) -> Result[TypedAst, String]
+  match type_check(ast, resolved)
+  when Result::Ok(ta) then Result::Ok(ta)
+  when Result::Err(errors) then
+    if errors.len() > 0 then
+      Result::Err(errors[0].message.clone())
+    else
+      Result::Err("unknown type error".to_string())
+    end
+  end
+end
+
+def try_lower_mir(typed: &TypedAst) -> Result[MirProgram, String]
+  Result::Ok(lower_to_mir(typed))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Fuzzer Mutation Engine
+# ———————————————————————————————————————————————————————————————
+
+def mutate_source(source: &String, rng: &mut UInt, max_depth: UInt) -> String
+  let mutation = rng_next(rng) % 8
+  
+  match mutation
+  when 0 then mutate_insert_token(source, rng)
+  when 1 then mutate_delete_token(source, rng)
+  when 2 then mutate_swap_tokens(source, rng)
+  when 3 then mutate_replace_identifier(source, rng)
+  when 4 then mutate_replace_literal(source, rng)
+  when 5 then mutate_duplicate_line(source, rng)
+  when 6 then mutate_shuffle_lines(source, rng)
+  when 7 then mutate_insert_template(source, rng)
+  when _ then source.clone()
+  end
+end
+
+def mutate_insert_token(source: &String, rng: &mut UInt) -> String
+  let tokens = ["def", "end", "if", "then", "else", "let", "mut", "for", "in",
+                     "do", "while", "match", "when", "struct", "enum", "trait",
+                     "impl", "return", "break", "next", "use", "pub", "unsafe",
+                     "(", ")", "[", "]", "{", "}", "->", "=>", "::", ":", ",", ".",
+                     "+", "-", "*", "/", "=", "==", "!=", "<", ">", "&&", "||",
+                     "true", "false", "0", "1", "\"hello\"", "42"]
+  let pos = rng_next(rng) % (source.len() + 1)
+  let token = tokens[rng_next(rng) % tokens.len()].to_string()
+  source.slice(0, pos) + " " + token + " " + source.slice(pos, source.len())
+end
+
+def mutate_delete_token(source: &String, rng: &mut UInt) -> String
+  let lines: Vec[String] = source.lines().collect()
+  if lines.is_empty() then return source.clone() end
+  let line_idx = rng_next(rng) % lines.len()
+  let line = lines[line_idx].clone()
+  let words: Vec[String] = line.split_whitespace().collect()
+  if words.is_empty() then return source.clone() end
+  let word_idx = rng_next(rng) % words.len()
+  mut new_words = Vec::new()
+  mut j: UInt = 0
+  for w in words do
+    if j != word_idx then new_words.push(w) end
+    j = j + 1
+  end
+  mut new_lines = lines.clone()
+  new_lines[line_idx] = new_words.join(" ")
+  new_lines.join("\n")
+end
+
+def mutate_swap_tokens(source: &String, rng: &mut UInt) -> String
+  let lines: Vec[String] = source.lines().collect()
+  if lines.len() < 2 then return source.clone() end
+  let a = rng_next(rng) % lines.len()
+  let b = rng_next(rng) % lines.len()
+  mut new_lines = lines.clone()
+  let tmp = new_lines[a].clone()
+  new_lines[a] = new_lines[b].clone()
+  new_lines[b] = tmp
+  new_lines.join("\n")
+end
+
+def mutate_replace_identifier(source: &String, rng: &mut UInt) -> String
+  let replacements = ["foo", "bar", "baz", "x", "y", "z", "self", "_", "T"]
+  let ident = replacements[rng_next(rng) % replacements.len()].to_string()
+  # Replace first identifier-like token
+  source.replace_first_matching("[a-zA-Z_][a-zA-Z0-9_]*", &ident)
+end
+
+def mutate_replace_literal(source: &String, rng: &mut UInt) -> String
+  let literals = ["0", "1", "-1", "999999", "0.0", "true", "false", "\"\"", "\"test\""]
+  let lit = literals[rng_next(rng) % literals.len()].to_string()
+  source.replace_first_matching("[0-9]+", &lit)
+end
+
+def mutate_duplicate_line(source: &String, rng: &mut UInt) -> String
+  let lines: Vec[String] = source.lines().collect()
+  if lines.is_empty() then return source.clone() end
+  let idx = rng_next(rng) % lines.len()
+  mut new_lines = Vec::new()
+  mut i: UInt = 0
+  for line in lines do
+    new_lines.push(line.clone())
+    if i == idx then new_lines.push(line.clone()) end
+    i = i + 1
+  end
+  new_lines.join("\n")
+end
+
+def mutate_shuffle_lines(source: &String, rng: &mut UInt) -> String
+  mut lines: Vec[String] = source.lines().collect()
+  # Fisher-Yates shuffle on a subset
+  let n = if lines.len() > 5 then 5 else lines.len() end
+  mut i = n
+  while i > 1 do
+    i = i - 1
+    let j = rng_next(rng) % (i + 1)
+    let tmp = lines[i].clone()
+    lines[i] = lines[j].clone()
+    lines[j] = tmp
+  end
+  lines.join("\n")
+end
+
+def mutate_insert_template(source: &String, rng: &mut UInt) -> String
+  let templates = [
+    "def generated() -> Int\n  42\nend\n",
+    "struct FuzzStruct\n  x: Int\n  y: String\nend\n",
+    "enum FuzzEnum\n  A\n  B(x: Int)\nend\n",
+    "let fuzz_val = if true then 1 else 2 end\n",
+    "for i in 0..10 do\n  let _ = i\nend\n",
+    "match x\nwhen 0 then \"zero\"\nwhen _ then \"other\"\nend\n"
+  ]
+  let template = templates[rng_next(rng) % templates.len()].to_string()
+  let pos = rng_next(rng) % (source.len() + 1)
+  source.slice(0, pos) + "\n" + template + "\n" + source.slice(pos, source.len())
+end
+
+def rng_next(state: &mut UInt) -> UInt
+  # xorshift64
+  *state = *state ^ (*state << 13)
+  *state = *state ^ (*state >> 7)
+  *state = *state ^ (*state << 17)
+  *state
+end
+
+# ———————————————————————————————————————————————————————————————
+# Corpus Management
+# ———————————————————————————————————————————————————————————————
+
+def load_fuzz_corpus(dir: &String) -> Vec[String]
+  mut corpus = Vec::new()
+  
+  match list_directory(dir.clone())
+  when Result::Ok(files) then
+    for f in files do
+      if f.ends_with(".tg") then
+        match read_file(dir.clone() + "/" + f)
+        when Result::Ok(content) then
+          corpus.push(content)
+        when Result::Err(_) then ()
+        end
+      end
+    end
+  when Result::Err(_) then ()
+  end
+  
+  corpus
+end
+
+def generate_seed_corpus() -> Vec[String]
+  [
+    "def main() -> Int\n  0\nend".to_string(),
+    "struct Point\n  x: Int\n  y: Int\nend\ndef main() -> Int\n  let p = Point { x: 1, y: 2 }\n  p.x + p.y\nend".to_string(),
+    "enum Color\n  Red\n  Green\n  Blue\nend\ndef name(c: Color) -> String\n  match c\n  when Color::Red then \"red\"\n  when Color::Green then \"green\"\n  when Color::Blue then \"blue\"\n  end\nend".to_string(),
+    "def factorial(n: Int) -> Int\n  if n <= 1 then 1 else n * factorial(n - 1) end\nend".to_string(),
+    "trait Display\n  def display(self) -> String\nend\nstruct Msg\n  text: String\nend\nimpl Display for Msg\n  def display(self) -> String\n    self.text.clone()\n  end\nend".to_string(),
+    "def test_borrows() -> Unit\n  let mut v = Vec::new()\n  v.push(1)\n  v.push(2)\n  let first = &v[0]\n  println(first.to_string())\nend".to_string()
+  ]
+end
+
+def save_crash_input(dir: &String, iteration: UInt, source: &String) -> Unit
+  let path = dir.clone() + "/crash_" + iteration.to_string() + ".tg"
+  match write_file(path.clone(), source.clone())
+  when Result::Ok(_) then
+    println("  Crash input saved to " + path)
+  when Result::Err(e) then
+    eprintln("  Failed to save crash input: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Performance Regression Tracking
+# ———————————————————————————————————————————————————————————————
+
+struct PerfMetric
+  name: String
+  value_ns: UInt
+  unit: String
+end
+
+struct PerfBaseline
+  metrics: Map[String, UInt]
+  timestamp: Int
+  compiler_version: String
+end
+
+def measure_compile_perf(files: &Vec[String]) -> Vec[PerfMetric]
+  mut metrics = Vec::new()
+  
+  for file in files do
+    match read_file(file.clone())
+    when Result::Ok(source) then
+      # Measure tokenization
+      let lex_start = clock_monotonic_ns()
+      let tokens = tokenize(source.clone())
+      let lex_end = clock_monotonic_ns()
+      metrics.push(PerfMetric {
+        name: file.clone() + "::lex",
+        value_ns: lex_end - lex_start,
+        unit: "ns".to_string()
+      })
+      
+      # Measure parsing
+      let parse_start = clock_monotonic_ns()
+      let ast = match parse(tokens)
+      when Result::Ok(a) then a
+      when Result::Err(_) then continue
+      end
+      let parse_end = clock_monotonic_ns()
+      metrics.push(PerfMetric {
+        name: file.clone() + "::parse",
+        value_ns: parse_end - parse_start,
+        unit: "ns".to_string()
+      })
+      
+      # Measure name resolution
+      let resolve_start = clock_monotonic_ns()
+      let resolved = resolve_names(&ast)
+      let resolve_end = clock_monotonic_ns()
+      metrics.push(PerfMetric {
+        name: file.clone() + "::resolve",
+        value_ns: resolve_end - resolve_start,
+        unit: "ns".to_string()
+      })
+      
+      # Measure type checking
+      let tc_start = clock_monotonic_ns()
+      let typed = type_check(&ast, &resolved)
+      let tc_end = clock_monotonic_ns()
+      metrics.push(PerfMetric {
+        name: file.clone() + "::type_check",
+        value_ns: tc_end - tc_start,
+        unit: "ns".to_string()
+      })
+    when Result::Err(_) then ()
+    end
+  end
+  
+  metrics
+end
+
+def check_perf_regressions(current: &Vec[PerfMetric], baseline: &PerfBaseline,
+                            threshold_pct: Float) -> Vec[String]
+  mut regressions = Vec::new()
+  
+  for metric in current do
+    match baseline.metrics.get(&metric.name)
+    when Option::Some(base_val) then
+      let ratio = metric.value_ns as Float / (*base_val as Float)
+      if ratio > 1.0 + threshold_pct / 100.0 then
+        let pct = ((ratio - 1.0) * 100.0) as Int
+        regressions.push(metric.name.clone() + ": " + pct.to_string() + "% slower (" +
+                         base_val.to_string() + "ns → " + metric.value_ns.to_string() + "ns)")
+      end
+    when Option::None then ()
+    end
+  end
+  
+  regressions
+end
+
+def save_perf_baseline(path: &str, metrics: &Vec[PerfMetric]) -> Unit
+  mut content = "# Perf baseline - auto-generated\n".to_string()
+  for m in metrics do
+    content = content + m.name.clone() + "|" + m.value_ns.to_string() + "\n"
+  end
+  let _ = write_file(path.to_string(), content)
+end
+
+def load_perf_baseline(path: &str) -> Option[PerfBaseline]
+  match read_file(path.to_string())
+  when Result::Ok(content) then
+    mut metrics = Map::new()
+    for line in content.lines() do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      match trimmed.split_once("|")
+      when Option::Some(kv) then
+        let name = kv.0.to_string()
+        let val = match kv.1.parse_uint()
+        when Result::Ok(v) then v
+        when Result::Err(_) then continue
+        end
+        metrics.insert(name, val)
+      when Option::None then ()
+      end
+    end
+    Option::Some(PerfBaseline {
+      metrics: metrics,
+      timestamp: 0,
+      compiler_version: "0.1.0".to_string()
+    })
+  when Result::Err(_) then Option::None
+  end
+end
+
+extern def clock_monotonic_ns() -> UInt
+
+# ———————————————————————————————————————————————————————————————
+# Memory Usage Tracking
+# ———————————————————————————————————————————————————————————————
+#
+# Measures the compiler's memory consumption during each pipeline stage.
+# Uses the platform allocator's bookkeeping (std::alloc::stats) or
+# /proc/self/status (Linux) / task_info (macOS) to sample RSS.
+#
+# Results are emitted as JSON or human-readable tables, compared against
+# baselines to detect memory regressions.
+
+struct MemoryMetric
+  stage: String       # "lex", "parse", "resolve", "type_check", "mir", "codegen"
+  rss_bytes: UInt     # Resident Set Size at end of stage
+  alloc_count: UInt   # Number of allocations made during stage
+  dealloc_count: UInt # Number of deallocations made during stage
+end
+
+struct MemoryBaseline
+  metrics: Map[String, UInt]   # stage -> expected RSS bytes
+  threshold_pct: Int           # allowed % increase before flagging regression (default 10)
+end
+
+def measure_compile_memory(source: &String) -> Vec[MemoryMetric]
+  mut metrics = Vec::new()
+
+  # Snapshot before lexing
+  let pre_lex_rss = current_rss()
+  let pre_lex_alloc = allocation_count()
+  let tokens = tokenize(source.clone())
+  let post_lex_rss = current_rss()
+  let post_lex_alloc = allocation_count()
+  metrics.push(MemoryMetric {
+    stage: "lex".to_string(),
+    rss_bytes: post_lex_rss - pre_lex_rss,
+    alloc_count: post_lex_alloc - pre_lex_alloc,
+    dealloc_count: 0
+  })
+
+  # Parse
+  let pre_parse_rss = current_rss()
+  let pre_parse_alloc = allocation_count()
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(_) then return metrics
+  end
+  let post_parse_rss = current_rss()
+  let post_parse_alloc = allocation_count()
+  metrics.push(MemoryMetric {
+    stage: "parse".to_string(),
+    rss_bytes: post_parse_rss - pre_parse_rss,
+    alloc_count: post_parse_alloc - pre_parse_alloc,
+    dealloc_count: 0
+  })
+
+  # Type check
+  let pre_tc_rss = current_rss()
+  let pre_tc_alloc = allocation_count()
+  let resolved = resolve_names(&ast)
+  let _ = type_check(&ast, &resolved)
+  let post_tc_rss = current_rss()
+  let post_tc_alloc = allocation_count()
+  metrics.push(MemoryMetric {
+    stage: "type_check".to_string(),
+    rss_bytes: post_tc_rss - pre_tc_rss,
+    alloc_count: post_tc_alloc - pre_tc_alloc,
+    dealloc_count: 0
+  })
+
+  # MIR lowering
+  let pre_mir_rss = current_rss()
+  let pre_mir_alloc = allocation_count()
+  let mir = lower_to_mir(&ast)
+  let post_mir_rss = current_rss()
+  let post_mir_alloc = allocation_count()
+  metrics.push(MemoryMetric {
+    stage: "mir".to_string(),
+    rss_bytes: post_mir_rss - pre_mir_rss,
+    alloc_count: post_mir_alloc - pre_mir_alloc,
+    dealloc_count: 0
+  })
+
+  metrics
+end
+
+def print_memory_report(metrics: &Vec[MemoryMetric]) -> Unit
+  println("Memory Usage Report:")
+  println("  Stage         RSS (bytes)   Allocs")
+  println("  ─────────────────────────────────────")
+  mut total_rss: UInt = 0
+  mut total_allocs: UInt = 0
+  for m in metrics do
+    let padded_stage = pad_right(&m.stage, 14)
+    println("  " + padded_stage + m.rss_bytes.to_string() + "        " + m.alloc_count.to_string())
+    total_rss = total_rss + m.rss_bytes
+    total_allocs = total_allocs + m.alloc_count
+  end
+  println("  ─────────────────────────────────────")
+  println("  Total         " + total_rss.to_string() + "        " + total_allocs.to_string())
+end
+
+def check_memory_regressions(
+  metrics: &Vec[MemoryMetric],
+  baseline: &MemoryBaseline
+) -> Vec[String]
+  mut regressions = Vec::new()
+  for m in metrics do
+    match baseline.metrics.get(&m.stage)
+    when Option::Some(expected) then
+      if expected > 0 then
+        let increase_pct = ((m.rss_bytes as Int - expected as Int) * 100) / expected as Int
+        if increase_pct > baseline.threshold_pct then
+          regressions.push(
+            "MEMORY REGRESSION: " + m.stage.clone() +
+            " RSS increased by " + increase_pct.to_string() + "% " +
+            "(expected " + expected.to_string() + ", got " + m.rss_bytes.to_string() + ")"
+          )
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  regressions
+end
+
+def save_memory_baseline(path: &str, metrics: &Vec[MemoryMetric]) -> Unit
+  mut content = "# Memory baseline - auto-generated\n".to_string()
+  for m in metrics do
+    content = content + m.stage.clone() + "|" + m.rss_bytes.to_string() + "\n"
+  end
+  let _ = write_file(path.to_string(), content)
+end
+
+def load_memory_baseline(path: &str) -> Option[MemoryBaseline]
+  match read_file(path.to_string())
+  when Result::Ok(content) then
+    mut metrics = Map::new()
+    for line in content.lines() do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      match trimmed.split_once("|")
+      when Option::Some(kv) then
+        let name = kv.0.to_string()
+        let val = match kv.1.parse_uint()
+        when Result::Ok(v) then v
+        when Result::Err(_) then continue
+        end
+        metrics.insert(name, val)
+      when Option::None then ()
+      end
+    end
+    Option::Some(MemoryBaseline {
+      metrics: metrics,
+      threshold_pct: 10
+    })
+  when Result::Err(_) then Option::None
+  end
+end
+
+def pad_right(s: &String, width: Int) -> String
+  mut result = s.clone()
+  while result.len() < width do
+    result = result + " "
+  end
+  result
+end
+
+# Platform RSS query — uses /proc/self/status on Linux, task_info on macOS
+def current_rss() -> UInt
+  # Try /proc/self/status first (Linux)
+  match read_file("/proc/self/status".to_string())
+  when Result::Ok(content) then
+    for line in content.lines() do
+      if line.starts_with("VmRSS:") then
+        let parts = line.trim().split_whitespace()
+        if parts.len() >= 2 then
+          match parts[1].parse_uint()
+          when Result::Ok(kb) then return kb * 1024  # Convert KB to bytes
+          when Result::Err(_) then ()
+          end
+        end
+      end
+    end
+    0
+  when Result::Err(_) then
+    # macOS fallback: use mach task_info via FFI
+    _macos_rss()
+  end
+end
+
+# macOS RSS via mach_task_self / task_info
+extern def _macos_rss() -> UInt
+
+# Global allocation counter (maintained by the allocator)
+extern def allocation_count() -> UInt

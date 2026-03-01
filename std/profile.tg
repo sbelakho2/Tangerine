@@ -1,0 +1,1072 @@
+# Tangerine Standard Library — Profiling and Observability
+#
+# Performance profiling, flamegraph generation, frame timing for games/UI.
+#
+# Usage:
+#   let profiler = Profiler::new()
+#   profiler.start()
+#   # ... code to profile ...
+#   profiler.stop()
+#   profiler.report()
+
+use std::core::{Option, Result, Vec, String, Bool, Int, UInt}
+use std::collections::{Map, Set}
+use std::fs::{File}
+use std::io::{Write, BufWriter}
+use std::time::{Instant, Duration, SystemTime}
+use std::thread::{ThreadId}
+
+# ═══════════════════════════════════════════════════════════════
+# PART 1: CPU PROFILING
+# ═══════════════════════════════════════════════════════════════
+
+# ———————————————————————————————————————————————————————————————
+# Profiler
+# ———————————————————————————————————————————————————————————————
+
+enum ProfilerError
+  AlreadyRunning
+  NotRunning
+  IoError(String)
+  NoData
+end
+
+struct ProfilerConfig
+  sample_rate_hz: u32
+  stack_depth: u32
+  include_line_numbers: Bool
+  include_timestamps: Bool
+  output_format: OutputFormat
+end
+
+enum OutputFormat
+  Text
+  Json
+  Flamegraph
+  Collapsed  # Brendan Gregg's collapsed format
+  Chrome     # Chrome trace format
+end
+
+impl ProfilerConfig
+  def default() -> ProfilerConfig
+    ProfilerConfig {
+      sample_rate_hz: 1000,
+      stack_depth: 128,
+      include_line_numbers: true,
+      include_timestamps: true,
+      output_format: OutputFormat::Text
+    }
+  end
+  
+  def with_sample_rate(self: ProfilerConfig, hz: u32) -> ProfilerConfig
+    ProfilerConfig { sample_rate_hz: hz, ..self }
+  end
+  
+  def flamegraph(self: ProfilerConfig) -> ProfilerConfig
+    ProfilerConfig { output_format: OutputFormat::Flamegraph, ..self }
+  end
+  
+  def chrome_trace(self: ProfilerConfig) -> ProfilerConfig
+    ProfilerConfig { output_format: OutputFormat::Chrome, ..self }
+  end
+end
+
+struct Profiler
+  config: ProfilerConfig
+  samples: Vec[Sample]
+  start_time: Option[Instant]
+  is_running: Bool
+  call_counts: Map[String, u64]
+  total_times: Map[String, Duration]
+  self_times: Map[String, Duration]
+end
+
+struct Sample
+  timestamp: u64
+  thread_id: u64
+  stack: Vec[StackFrame]
+  cpu_time_ns: u64
+end
+
+struct StackFrame
+  function_name: String
+  module: String
+  file: String
+  line: u32
+  address: u64
+end
+
+impl Profiler
+  def new() -> Profiler
+    Profiler::with_config(ProfilerConfig::default())
+  end
+  
+  def with_config(config: ProfilerConfig) -> Profiler
+    Profiler {
+      config: config,
+      samples: Vec::new(),
+      start_time: Option::None,
+      is_running: false,
+      call_counts: Map::new(),
+      total_times: Map::new(),
+      self_times: Map::new()
+    }
+  end
+  
+  def start(self: &mut Profiler) -> Result[Unit, ProfilerError]
+    if self.is_running then
+      return Result::Err(ProfilerError::AlreadyRunning)
+    end
+    
+    self.is_running = true
+    self.start_time = Option::Some(Instant::now())
+    self.samples.clear()
+    self.call_counts.clear()
+    self.total_times.clear()
+    self.self_times.clear()
+    
+    # Start sampling thread (platform-specific)
+    # Linux: use SIGPROF or perf_event_open + /proc/self/maps
+    # macOS: use mach_msg + thread_get_state + vm_region
+    # Windows: use SuspendThread + GetThreadContext
+    # TODO: implement platform-conditional sampling backends
+    
+    Result::Ok(())
+  end
+  
+  def stop(self: &mut Profiler) -> Result[Unit, ProfilerError]
+    if !self.is_running then
+      return Result::Err(ProfilerError::NotRunning)
+    end
+    
+    self.is_running = false
+    
+    # Process samples
+    self.process_samples()
+    
+    Result::Ok(())
+  end
+  
+  def add_sample(self: &mut Profiler, sample: Sample) -> Unit
+    if self.is_running then
+      self.samples.push(sample)
+    end
+  end
+  
+  fn process_samples(self: &mut Profiler) -> Unit
+    for sample in &self.samples do
+      for (i, frame) in sample.stack.iter().enumerate() do
+        let key = frame.function_name.clone()
+        
+        *self.call_counts.entry(key.clone()).or_insert(0) += 1
+        
+        # Self time = time in this function only (when it's at top of stack)
+        if i == 0 then
+          let duration = Duration::from_nanos(sample.cpu_time_ns)
+          *self.self_times.entry(key.clone()).or_insert(Duration::ZERO) += duration
+        end
+        
+        # Total time = time when this function is anywhere on stack
+        let duration = Duration::from_nanos(sample.cpu_time_ns)
+        *self.total_times.entry(key).or_insert(Duration::ZERO) += duration
+      end
+    end
+  end
+  
+  def report(self: &Profiler) -> ProfileReport
+    let total_duration = self.start_time
+      .map(|t| t.elapsed())
+      .unwrap_or(Duration::ZERO)
+    
+    let mut functions = Vec::new()
+    
+    for (name, &count) in &self.call_counts do
+      let total_time = self.total_times.get(name).cloned().unwrap_or(Duration::ZERO)
+      let self_time = self.self_times.get(name).cloned().unwrap_or(Duration::ZERO)
+      
+      functions.push(FunctionStats {
+        name: name.clone(),
+        call_count: count,
+        total_time: total_time,
+        self_time: self_time,
+        percentage: if total_duration.as_nanos() > 0 then
+          (self_time.as_nanos() as f64 / total_duration.as_nanos() as f64) * 100.0
+        else
+          0.0
+        end
+      })
+    end
+    
+    # Sort by self time descending
+    functions.sort_by(|a, b| b.self_time.cmp(&a.self_time))
+    
+    ProfileReport {
+      total_duration: total_duration,
+      sample_count: self.samples.len(),
+      functions: functions,
+      call_tree: self.build_call_tree()
+    }
+  end
+  
+  def write_flamegraph(self: &Profiler, path: &str) -> Result[Unit, ProfilerError]
+    let mut file = File::create(path)
+      .map_err(|e| ProfilerError::IoError(e.to_string()))?
+    
+    let collapsed = self.to_collapsed_format()
+    file.write_all(collapsed.as_bytes())
+      .map_err(|e| ProfilerError::IoError(e.to_string()))?
+    
+    Result::Ok(())
+  end
+  
+  def to_collapsed_format(self: &Profiler) -> String
+    let mut stacks: Map[String, u64] = Map::new()
+    
+    for sample in &self.samples do
+      let stack_str = sample.stack.iter()
+        .rev()
+        .map(|f| f.function_name.as_str())
+        .collect::<Vec<_>>()
+        .join(";")
+      
+      *stacks.entry(stack_str).or_insert(0) += 1
+    end
+    
+    let mut lines = Vec::new()
+    for (stack, count) in &stacks do
+      lines.push(format!("{} {}", stack, count))
+    end
+    
+    lines.join("\n")
+  end
+  
+  def to_chrome_trace(self: &Profiler) -> String
+    let mut events = Vec::new()
+    
+    events.push(r#"{"traceEvents":["#.to_string())
+    
+    let mut first = true
+    for sample in &self.samples do
+      for frame in &sample.stack do
+        if !first then
+          events.push(",".to_string())
+        end
+        first = false
+        
+        events.push(format!(
+          r#"{{"name":"{}","cat":"function","ph":"X","ts":{},"dur":{},"pid":1,"tid":{}}}"#,
+          frame.function_name,
+          sample.timestamp / 1000,  # Convert to microseconds
+          sample.cpu_time_ns / 1000,
+          sample.thread_id
+        ))
+      end
+    end
+    
+    events.push(r#"]}"#.to_string())
+    events.join("")
+  end
+  
+  fn build_call_tree(self: &Profiler) -> CallTreeNode
+    let mut root = CallTreeNode {
+      name: "<root>".to_string(),
+      self_time: Duration::ZERO,
+      total_time: Duration::ZERO,
+      call_count: 0,
+      children: Map::new()
+    }
+    
+    for sample in &self.samples do
+      let mut current = &mut root
+      let sample_duration = Duration::from_nanos(sample.cpu_time_ns)
+      
+      for frame in sample.stack.iter().rev() do
+        current.total_time += sample_duration
+        current.call_count += 1
+        
+        current = current.children
+          .entry(frame.function_name.clone())
+          .or_insert(CallTreeNode {
+            name: frame.function_name.clone(),
+            self_time: Duration::ZERO,
+            total_time: Duration::ZERO,
+            call_count: 0,
+            children: Map::new()
+          })
+      end
+      
+      # Leaf gets self time
+      current.self_time += sample_duration
+      current.total_time += sample_duration
+      current.call_count += 1
+    end
+    
+    root
+  end
+end
+
+struct ProfileReport
+  total_duration: Duration
+  sample_count: UInt
+  functions: Vec[FunctionStats]
+  call_tree: CallTreeNode
+end
+
+struct FunctionStats
+  name: String
+  call_count: u64
+  total_time: Duration
+  self_time: Duration
+  percentage: f64
+end
+
+struct CallTreeNode
+  name: String
+  self_time: Duration
+  total_time: Duration
+  call_count: u64
+  children: Map[String, CallTreeNode]
+end
+
+impl ProfileReport
+  def print(self: &ProfileReport) -> Unit
+    println!("═══════════════════════════════════════════════════════")
+    println!("                    PROFILE REPORT                     ")
+    println!("═══════════════════════════════════════════════════════")
+    println!()
+    println!("Total duration: {:?}", self.total_duration)
+    println!("Sample count: {}", self.sample_count)
+    println!()
+    println!("Top functions by self time:")
+    println!("───────────────────────────────────────────────────────")
+    println!("{:<40} {:>10} {:>10} {:>8}", "Function", "Self", "Total", "Calls")
+    println!("───────────────────────────────────────────────────────")
+    
+    for (i, func) in self.functions.iter().enumerate() do
+      if i >= 20 then break end
+      
+      println!("{:<40} {:>10?} {:>10?} {:>8}",
+        truncate(&func.name, 40),
+        func.self_time,
+        func.total_time,
+        func.call_count
+      )
+    end
+    
+    println!("───────────────────────────────────────────────────────")
+  end
+  
+  def hot_path(self: &ProfileReport) -> Vec[String]
+    let mut path = Vec::new()
+    let mut current = &self.call_tree
+    
+    while !current.children.is_empty() do
+      path.push(current.name.clone())
+      
+      # Find child with highest total time
+      let hottest = current.children.iter()
+        .max_by_key(|(_, node)| node.total_time)
+        .map(|(name, _)| name.clone())
+      
+      match hottest
+      when Option::Some(name) then
+        current = current.children.get(&name).unwrap()
+      when Option::None then break
+      end
+    end
+    
+    path.push(current.name.clone())
+    path
+  end
+end
+
+def truncate(s: &str, max_len: UInt) -> String
+  if s.len() <= max_len then
+    s.to_string()
+  else
+    format!("{}...", &s[0..max_len - 3])
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 2: SCOPE-BASED PROFILING
+# ═══════════════════════════════════════════════════════════════
+
+struct ProfileScope
+  name: String
+  start: Instant
+  parent: Option[String]
+end
+
+impl ProfileScope
+  def new(name: &str) -> ProfileScope
+    let scope = ProfileScope {
+      name: name.to_string(),
+      start: Instant::now(),
+      parent: current_scope_name()
+    }
+    
+    push_scope(&scope.name)
+    scope
+  end
+end
+
+impl Drop for ProfileScope
+  def drop(self: &mut ProfileScope) -> Unit
+    let elapsed = self.start.elapsed()
+    record_scope_time(&self.name, elapsed)
+    pop_scope()
+  end
+end
+
+# Thread-local scope stack
+thread_local! {
+  static SCOPE_STACK: std::cell::RefCell[Vec[String]] = std::cell::RefCell::new(Vec::new())
+  static SCOPE_TIMES: std::cell::RefCell[Map[String, Duration]] = std::cell::RefCell::new(Map::new())
+}
+
+def current_scope_name() -> Option[String]
+  SCOPE_STACK.with(|stack| {
+    stack.borrow().last().cloned()
+  })
+end
+
+def push_scope(name: &str) -> Unit
+  SCOPE_STACK.with(|stack| {
+    stack.borrow_mut().push(name.to_string())
+  })
+end
+
+def pop_scope() -> Unit
+  SCOPE_STACK.with(|stack| {
+    stack.borrow_mut().pop()
+  })
+end
+
+def record_scope_time(name: &str, duration: Duration) -> Unit
+  SCOPE_TIMES.with(|times| {
+    let mut times = times.borrow_mut()
+    *times.entry(name.to_string()).or_insert(Duration::ZERO) += duration
+  })
+end
+
+def get_scope_times() -> Map[String, Duration]
+  SCOPE_TIMES.with(|times| times.borrow().clone())
+end
+
+def clear_scope_times() -> Unit
+  SCOPE_TIMES.with(|times| times.borrow_mut().clear())
+end
+
+# Macro for profiling a scope
+macro profile!(name: expr)
+  let _profile_scope = ProfileScope::new($name)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 3: FRAME TIMING (for games/UI)
+# ═══════════════════════════════════════════════════════════════
+
+struct FrameTimer
+  frame_times: Vec[Duration]
+  max_samples: UInt
+  current_frame_start: Option[Instant]
+  frame_number: u64
+  target_fps: f64
+  zones: Map[String, Vec[Duration]]
+end
+
+impl FrameTimer
+  def new() -> FrameTimer
+    FrameTimer::with_target_fps(60.0)
+  end
+  
+  def with_target_fps(fps: f64) -> FrameTimer
+    FrameTimer {
+      frame_times: Vec::new(),
+      max_samples: 300,  # Keep last 5 seconds at 60fps
+      current_frame_start: Option::None,
+      frame_number: 0,
+      target_fps: fps,
+      zones: Map::new()
+    }
+  end
+  
+  def begin_frame(self: &mut FrameTimer) -> Unit
+    self.current_frame_start = Option::Some(Instant::now())
+    self.frame_number = self.frame_number + 1
+  end
+  
+  def end_frame(self: &mut FrameTimer) -> FrameStats
+    let elapsed = self.current_frame_start
+      .map(|t| t.elapsed())
+      .unwrap_or(Duration::ZERO)
+    
+    self.frame_times.push(elapsed)
+    
+    if self.frame_times.len() > self.max_samples then
+      self.frame_times.remove(0)
+    end
+    
+    self.current_frame_start = Option::None
+    
+    self.stats()
+  end
+  
+  def zone(self: &mut FrameTimer, name: &str) -> ZoneGuard
+    ZoneGuard {
+      timer: self,
+      name: name.to_string(),
+      start: Instant::now()
+    }
+  end
+  
+  def record_zone(self: &mut FrameTimer, name: &str, duration: Duration) -> Unit
+    let samples = self.zones.entry(name.to_string()).or_insert(Vec::new())
+    samples.push(duration)
+    
+    if samples.len() > self.max_samples then
+      samples.remove(0)
+    end
+  end
+  
+  def stats(self: &FrameTimer) -> FrameStats
+    if self.frame_times.is_empty() then
+      return FrameStats::default()
+    end
+    
+    let count = self.frame_times.len()
+    let sum: Duration = self.frame_times.iter().sum()
+    let avg = sum / count as u32
+    
+    let mut sorted = self.frame_times.clone()
+    sorted.sort()
+    
+    let min = sorted[0]
+    let max = sorted[count - 1]
+    let median = sorted[count / 2]
+    let p99 = sorted[(count * 99) / 100]
+    let p95 = sorted[(count * 95) / 100]
+    
+    let target_frame_time = Duration::from_secs_f64(1.0 / self.target_fps)
+    let frames_over_budget = self.frame_times.iter()
+      .filter(|&&t| t > target_frame_time)
+      .count()
+    
+    let fps = if avg.as_nanos() > 0 then
+      1_000_000_000.0 / avg.as_nanos() as f64
+    else
+      0.0
+    end
+    
+    FrameStats {
+      frame_number: self.frame_number,
+      last_frame_time: self.frame_times.last().cloned().unwrap_or(Duration::ZERO),
+      avg_frame_time: avg,
+      min_frame_time: min,
+      max_frame_time: max,
+      median_frame_time: median,
+      p95_frame_time: p95,
+      p99_frame_time: p99,
+      fps: fps,
+      frames_over_budget: frames_over_budget,
+      sample_count: count
+    }
+  end
+  
+  def zone_stats(self: &FrameTimer, name: &str) -> Option[ZoneStats]
+    let samples = self.zones.get(name)?
+    
+    if samples.is_empty() then
+      return Option::None
+    end
+    
+    let count = samples.len()
+    let sum: Duration = samples.iter().sum()
+    let avg = sum / count as u32
+    
+    let mut sorted = samples.clone()
+    sorted.sort()
+    
+    Option::Some(ZoneStats {
+      name: name.to_string(),
+      avg_time: avg,
+      min_time: sorted[0],
+      max_time: sorted[count - 1],
+      sample_count: count
+    })
+  end
+  
+  def all_zone_stats(self: &FrameTimer) -> Vec[ZoneStats]
+    self.zones.keys()
+      .filter_map(|name| self.zone_stats(name))
+      .collect()
+  end
+end
+
+struct ZoneGuard<'a>
+  timer: &'a mut FrameTimer
+  name: String
+  start: Instant
+end
+
+impl Drop for ZoneGuard<'_>
+  def drop(self: &mut ZoneGuard) -> Unit
+    let elapsed = self.start.elapsed()
+    self.timer.record_zone(&self.name, elapsed)
+  end
+end
+
+struct FrameStats
+  frame_number: u64
+  last_frame_time: Duration
+  avg_frame_time: Duration
+  min_frame_time: Duration
+  max_frame_time: Duration
+  median_frame_time: Duration
+  p95_frame_time: Duration
+  p99_frame_time: Duration
+  fps: f64
+  frames_over_budget: UInt
+  sample_count: UInt
+end
+
+impl FrameStats
+  def default() -> FrameStats
+    FrameStats {
+      frame_number: 0,
+      last_frame_time: Duration::ZERO,
+      avg_frame_time: Duration::ZERO,
+      min_frame_time: Duration::ZERO,
+      max_frame_time: Duration::ZERO,
+      median_frame_time: Duration::ZERO,
+      p95_frame_time: Duration::ZERO,
+      p99_frame_time: Duration::ZERO,
+      fps: 0.0,
+      frames_over_budget: 0,
+      sample_count: 0
+    }
+  end
+  
+  def print(self: &FrameStats) -> Unit
+    println!("Frame {}: {:.2} FPS (avg: {:?}, p99: {:?})",
+      self.frame_number,
+      self.fps,
+      self.avg_frame_time,
+      self.p99_frame_time
+    )
+  end
+end
+
+struct ZoneStats
+  name: String
+  avg_time: Duration
+  min_time: Duration
+  max_time: Duration
+  sample_count: UInt
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 4: MEMORY PROFILING
+# ═══════════════════════════════════════════════════════════════
+
+struct MemoryProfiler
+  allocations: Map[u64, AllocationInfo]
+  total_allocated: UInt
+  total_freed: UInt
+  peak_usage: UInt
+  current_usage: UInt
+  allocation_sites: Map[String, AllocationSiteStats]
+end
+
+struct AllocationInfo
+  address: u64
+  size: UInt
+  timestamp: Instant
+  backtrace: Vec[String]
+  tag: Option[String]
+end
+
+struct AllocationSiteStats
+  total_allocations: u64
+  total_bytes: UInt
+  current_allocations: u64
+  current_bytes: UInt
+end
+
+impl MemoryProfiler
+  def new() -> MemoryProfiler
+    MemoryProfiler {
+      allocations: Map::new(),
+      total_allocated: 0,
+      total_freed: 0,
+      peak_usage: 0,
+      current_usage: 0,
+      allocation_sites: Map::new()
+    }
+  end
+  
+  def record_allocation(self: &mut MemoryProfiler, address: u64, size: UInt, backtrace: Vec[String]) -> Unit
+    let site = backtrace.first().cloned().unwrap_or("<unknown>".to_string())
+    
+    self.allocations.insert(address, AllocationInfo {
+      address: address,
+      size: size,
+      timestamp: Instant::now(),
+      backtrace: backtrace,
+      tag: Option::None
+    })
+    
+    self.total_allocated = self.total_allocated + size
+    self.current_usage = self.current_usage + size
+    
+    if self.current_usage > self.peak_usage then
+      self.peak_usage = self.current_usage
+    end
+    
+    let stats = self.allocation_sites.entry(site).or_insert(AllocationSiteStats {
+      total_allocations: 0,
+      total_bytes: 0,
+      current_allocations: 0,
+      current_bytes: 0
+    })
+    stats.total_allocations = stats.total_allocations + 1
+    stats.total_bytes = stats.total_bytes + size
+    stats.current_allocations = stats.current_allocations + 1
+    stats.current_bytes = stats.current_bytes + size
+  end
+  
+  def record_deallocation(self: &mut MemoryProfiler, address: u64) -> Unit
+    if let Option::Some(info) = self.allocations.remove(&address) then
+      self.total_freed = self.total_freed + info.size
+      self.current_usage = self.current_usage.saturating_sub(info.size)
+      
+      let site = info.backtrace.first().cloned().unwrap_or("<unknown>".to_string())
+      if let Option::Some(stats) = self.allocation_sites.get_mut(&site) then
+        stats.current_allocations = stats.current_allocations.saturating_sub(1)
+        stats.current_bytes = stats.current_bytes.saturating_sub(info.size)
+      end
+    end
+  end
+  
+  def tag_allocation(self: &mut MemoryProfiler, address: u64, tag: &str) -> Unit
+    if let Option::Some(info) = self.allocations.get_mut(&address) then
+      info.tag = Option::Some(tag.to_string())
+    end
+  end
+  
+  def find_leaks(self: &MemoryProfiler) -> Vec[&AllocationInfo]
+    self.allocations.values().collect()
+  end
+  
+  def report(self: &MemoryProfiler) -> MemoryReport
+    let mut sites: Vec[_> = self.allocation_sites.iter()
+      .map(|(site, stats)| (site.clone(), stats.clone()))
+      .collect()
+    
+    sites.sort_by(|a, b| b.1.current_bytes.cmp(&a.1.current_bytes))
+    
+    MemoryReport {
+      total_allocated: self.total_allocated,
+      total_freed: self.total_freed,
+      current_usage: self.current_usage,
+      peak_usage: self.peak_usage,
+      live_allocations: self.allocations.len(),
+      top_sites: sites
+    }
+  end
+end
+
+struct MemoryReport
+  total_allocated: UInt
+  total_freed: UInt
+  current_usage: UInt
+  peak_usage: UInt
+  live_allocations: UInt
+  top_sites: Vec[(String, AllocationSiteStats)]
+end
+
+impl MemoryReport
+  def print(self: &MemoryReport) -> Unit
+    println!("═══════════════════════════════════════════════════════")
+    println!("                   MEMORY REPORT                       ")
+    println!("═══════════════════════════════════════════════════════")
+    println!()
+    println!("Total allocated:   {} bytes", self.total_allocated)
+    println!("Total freed:       {} bytes", self.total_freed)
+    println!("Current usage:     {} bytes", self.current_usage)
+    println!("Peak usage:        {} bytes", self.peak_usage)
+    println!("Live allocations:  {}", self.live_allocations)
+    println!()
+    println!("Top allocation sites:")
+    println!("───────────────────────────────────────────────────────")
+    
+    for (i, (site, stats)) in self.top_sites.iter().enumerate() do
+      if i >= 10 then break end
+      
+      println!("{:<50} {:>10} bytes ({} allocs)",
+        truncate(site, 50),
+        stats.current_bytes,
+        stats.current_allocations
+      )
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 5: BENCHMARK UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+struct Benchmark
+  name: String
+  iterations: u64
+  warmup_iterations: u64
+  samples: Vec[Duration]
+end
+
+impl Benchmark
+  def new(name: &str) -> Benchmark
+    Benchmark {
+      name: name.to_string(),
+      iterations: 1000,
+      warmup_iterations: 100,
+      samples: Vec::new()
+    }
+  end
+  
+  def iterations(self: Benchmark, n: u64) -> Benchmark
+    Benchmark { iterations: n, ..self }
+  end
+  
+  def warmup(self: Benchmark, n: u64) -> Benchmark
+    Benchmark { warmup_iterations: n, ..self }
+  end
+  
+  def run[F](self: &mut Benchmark, f: F) -> BenchmarkResult where F: Fn()
+    # Warmup
+    for _ in 0..self.warmup_iterations do
+      f()
+    end
+    
+    # Benchmark
+    for _ in 0..self.iterations do
+      let start = Instant::now()
+      f()
+      let elapsed = start.elapsed()
+      self.samples.push(elapsed)
+    end
+    
+    self.result()
+  end
+  
+  def run_with_input[T, F](self: &mut Benchmark, inputs: &[T], f: F) -> BenchmarkResult 
+    where F: Fn(&T)
+    # Warmup
+    for input in inputs.iter().cycle().take(self.warmup_iterations as UInt) do
+      f(input)
+    end
+    
+    # Benchmark
+    for input in inputs.iter().cycle().take(self.iterations as UInt) do
+      let start = Instant::now()
+      f(input)
+      let elapsed = start.elapsed()
+      self.samples.push(elapsed)
+    end
+    
+    self.result()
+  end
+  
+  fn result(self: &Benchmark) -> BenchmarkResult
+    if self.samples.is_empty() then
+      return BenchmarkResult::empty(&self.name)
+    end
+    
+    let count = self.samples.len()
+    let sum: Duration = self.samples.iter().sum()
+    let mean = sum / count as u32
+    
+    let mut sorted = self.samples.clone()
+    sorted.sort()
+    
+    let min = sorted[0]
+    let max = sorted[count - 1]
+    let median = sorted[count / 2]
+    let p99 = sorted[(count * 99) / 100]
+    
+    # Calculate standard deviation
+    let mean_ns = mean.as_nanos() as f64
+    let variance: f64 = self.samples.iter()
+      .map(|d| {
+        let diff = d.as_nanos() as f64 - mean_ns
+        diff * diff
+      })
+      .sum::<f64>() / count as f64
+    
+    let std_dev = Duration::from_nanos(variance.sqrt() as u64)
+    
+    BenchmarkResult {
+      name: self.name.clone(),
+      iterations: self.iterations,
+      mean: mean,
+      min: min,
+      max: max,
+      median: median,
+      p99: p99,
+      std_dev: std_dev,
+      throughput: Option::None
+    }
+  end
+end
+
+struct BenchmarkResult
+  name: String
+  iterations: u64
+  mean: Duration
+  min: Duration
+  max: Duration
+  median: Duration
+  p99: Duration
+  std_dev: Duration
+  throughput: Option[f64]
+end
+
+impl BenchmarkResult
+  def empty(name: &str) -> BenchmarkResult
+    BenchmarkResult {
+      name: name.to_string(),
+      iterations: 0,
+      mean: Duration::ZERO,
+      min: Duration::ZERO,
+      max: Duration::ZERO,
+      median: Duration::ZERO,
+      p99: Duration::ZERO,
+      std_dev: Duration::ZERO,
+      throughput: Option::None
+    }
+  end
+  
+  def with_throughput(self: BenchmarkResult, ops: f64) -> BenchmarkResult
+    let throughput = if self.mean.as_nanos() > 0 then
+      ops / self.mean.as_secs_f64()
+    else
+      0.0
+    end
+    
+    BenchmarkResult { throughput: Option::Some(throughput), ..self }
+  end
+  
+  def print(self: &BenchmarkResult) -> Unit
+    println!("Benchmark: {}", self.name)
+    println!("  Iterations: {}", self.iterations)
+    println!("  Mean:       {:?}", self.mean)
+    println!("  Median:     {:?}", self.median)
+    println!("  Min:        {:?}", self.min)
+    println!("  Max:        {:?}", self.max)
+    println!("  Std Dev:    {:?}", self.std_dev)
+    println!("  P99:        {:?}", self.p99)
+    
+    if let Option::Some(tp) = self.throughput then
+      println!("  Throughput: {:.2} ops/sec", tp)
+    end
+  end
+end
+
+struct BenchmarkGroup
+  name: String
+  benchmarks: Vec[BenchmarkResult]
+end
+
+impl BenchmarkGroup
+  def new(name: &str) -> BenchmarkGroup
+    BenchmarkGroup {
+      name: name.to_string(),
+      benchmarks: Vec::new()
+    }
+  end
+  
+  def add(self: &mut BenchmarkGroup, result: BenchmarkResult) -> Unit
+    self.benchmarks.push(result)
+  end
+  
+  def compare(self: &BenchmarkGroup) -> Unit
+    if self.benchmarks.is_empty() then
+      return
+    end
+    
+    println!("═══════════════════════════════════════════════════════")
+    println!("Benchmark Comparison: {}", self.name)
+    println!("═══════════════════════════════════════════════════════")
+    
+    let baseline = &self.benchmarks[0]
+    
+    println!("{:<30} {:>12} {:>12} {:>10}", "Name", "Mean", "vs Baseline", "")
+    println!("───────────────────────────────────────────────────────")
+    
+    for result in &self.benchmarks do
+      let ratio = if baseline.mean.as_nanos() > 0 then
+        result.mean.as_nanos() as f64 / baseline.mean.as_nanos() as f64
+      else
+        1.0
+      end
+      
+      let indicator = if ratio < 0.95 then "faster" 
+        else if ratio > 1.05 then "slower"
+        else "same"
+      end
+      
+      println!("{:<30} {:>12?} {:>11.2}x {:>10}",
+        truncate(&result.name, 30),
+        result.mean,
+        ratio,
+        indicator
+      )
+    end
+  end
+end
+
+# Convenience macro
+macro bench!(name: expr, body: block)
+  {
+    let mut benchmark = Benchmark::new($name)
+    benchmark.run(|| $body)
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 6: GLOBAL PROFILER
+# ═══════════════════════════════════════════════════════════════
+
+static GLOBAL_PROFILER: std::thread::Mutex[Option[Profiler]] = 
+  std::thread::Mutex::new(Option::None)
+
+def start_profiling() -> Result[Unit, ProfilerError]
+  let mut guard = GLOBAL_PROFILER.lock()
+  if guard.is_some() then
+    return Result::Err(ProfilerError::AlreadyRunning)
+  end
+  
+  let mut profiler = Profiler::new()
+  profiler.start()?
+  *guard = Option::Some(profiler)
+  Result::Ok(())
+end
+
+def stop_profiling() -> Result[ProfileReport, ProfilerError]
+  let mut guard = GLOBAL_PROFILER.lock()
+  match guard.take()
+  when Option::Some(mut p) then
+    p.stop()?
+    Result::Ok(p.report())
+  when Option::None then
+    Result::Err(ProfilerError::NotRunning)
+  end
+end
+
+def profile_report() -> Result[ProfileReport, ProfilerError]
+  let guard = GLOBAL_PROFILER.lock()
+  match &*guard
+  when Option::Some(p) then Result::Ok(p.report())
+  when Option::None then Result::Err(ProfilerError::NoData)
+  end
+end

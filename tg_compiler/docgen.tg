@@ -1,0 +1,1144 @@
+# Tangerine Compiler — Documentation Generator
+#
+# Generates structured API documentation from Tangerine source files.
+# Extracts doc comments (lines starting with # before items), function
+# signatures, type definitions, and trait declarations.
+#
+# Outputs HTML or Markdown.
+
+use std::core::{Option, Result, Vec, String, Bool, UInt}
+use std::collections::{Map}
+use std::fs::{read_file, write_file, mkdir_p, path_join, list_dir}
+use std::io::{eprintln}
+
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse}
+use tg_compiler::ast::{Program, Item, ItemKind, Function, Param, TypeExpr,
+                        TypeExprKind, Visibility}
+
+# ———————————————————————————————————————————————————————————————
+# Configuration
+# ———————————————————————————————————————————————————————————————
+
+enum DocFormat
+  Html
+  Markdown
+end
+
+struct DocConfig
+  output_dir: String
+  format: DocFormat
+  include_private: Bool
+  project_name: String
+  version: String
+end
+
+pub def default_doc_config() -> DocConfig
+  DocConfig {
+    output_dir: "docs/api".to_string(),
+    format: DocFormat::Html,
+    include_private: false,
+    project_name: "Tangerine Project".to_string(),
+    version: "0.1.0".to_string()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Document Model
+# ———————————————————————————————————————————————————————————————
+
+struct DocModule
+  name: String
+  path: String               # Source file path
+  doc_comment: String
+  functions: Vec[DocFunction]
+  structs: Vec[DocStruct]
+  enums: Vec[DocEnum]
+  traits: Vec[DocTrait]
+  impls: Vec[DocImpl]
+  constants: Vec[DocConst]
+  type_aliases: Vec[DocTypeAlias]
+  submodules: Vec[DocModule]
+end
+
+struct DocFunction
+  name: String
+  signature: String
+  doc_comment: String
+  params: Vec[DocParam]
+  return_type: String
+  is_pub: Bool
+  is_method: Bool
+  type_params: Vec[String]
+end
+
+struct DocParam
+  name: String
+  type_str: String
+  is_self: Bool
+  is_mut: Bool
+end
+
+struct DocStruct
+  name: String
+  doc_comment: String
+  fields: Vec[DocField]
+  type_params: Vec[String]
+  is_pub: Bool
+end
+
+struct DocField
+  name: String
+  type_str: String
+  doc_comment: String
+  is_pub: Bool
+end
+
+struct DocEnum
+  name: String
+  doc_comment: String
+  variants: Vec[DocVariant]
+  type_params: Vec[String]
+  is_pub: Bool
+end
+
+struct DocVariant
+  name: String
+  doc_comment: String
+  fields: Vec[DocField]
+end
+
+struct DocTrait
+  name: String
+  doc_comment: String
+  methods: Vec[DocFunction]
+  type_params: Vec[String]
+  is_pub: Bool
+end
+
+struct DocImpl
+  type_name: String
+  trait_name: Option[String]
+  methods: Vec[DocFunction]
+end
+
+struct DocConst
+  name: String
+  type_str: String
+  doc_comment: String
+  is_pub: Bool
+end
+
+struct DocTypeAlias
+  name: String
+  target: String
+  doc_comment: String
+  is_pub: Bool
+end
+
+# ———————————————————————————————————————————————————————————————
+# Doc Extraction
+# ———————————————————————————————————————————————————————————————
+
+def extract_module(file_path: String, source: String, include_private: Bool) -> Result[DocModule, String]
+  let tokens = tokenize(source.clone())
+  match parse(tokens)
+  when Result::Err(e) then Result::Err("Parse error in " + file_path + ": " + e.message)
+  when Result::Ok(ast) then
+    let mod_name = module_name_from_path(file_path.clone())
+    let mod_doc = extract_module_doc_comment(&source)
+    
+    mut module = DocModule {
+      name: mod_name,
+      path: file_path,
+      doc_comment: mod_doc,
+      functions: Vec::new(),
+      structs: Vec::new(),
+      enums: Vec::new(),
+      traits: Vec::new(),
+      impls: Vec::new(),
+      constants: Vec::new(),
+      type_aliases: Vec::new(),
+      submodules: Vec::new()
+    }
+    
+    for item in ast.items do
+      extract_item(&mut module, item, &source, include_private)
+    end
+    
+    Result::Ok(module)
+  end
+end
+
+def extract_item(module: &mut DocModule, item: &Item, source: &String, include_private: Bool) -> Unit
+  let doc = extract_doc_comment_before(source, item.span.start)
+  
+  match item.kind
+  when ItemKind::Function(func) then
+    if include_private || func.is_pub then
+      module.functions.push(extract_function(func, &doc, false))
+    end
+  when ItemKind::Struct(s) then
+    if include_private || s.is_pub then
+      module.structs.push(extract_struct(s, &doc, source, include_private))
+    end
+  when ItemKind::Enum(e) then
+    if include_private || e.is_pub then
+      module.enums.push(extract_enum(e, &doc, source))
+    end
+  when ItemKind::Trait(t) then
+    if include_private || t.is_pub then
+      module.traits.push(extract_trait(t, &doc, source))
+    end
+  when ItemKind::Impl(imp) then
+    module.impls.push(extract_impl(imp, source, include_private))
+  when ItemKind::Const(c) then
+    if include_private || c.is_pub then
+      module.constants.push(DocConst {
+        name: c.name.clone(),
+        type_str: format_type_expr(&c.ty),
+        doc_comment: doc,
+        is_pub: c.is_pub
+      })
+    end
+  when ItemKind::TypeAlias(ta) then
+    if include_private || ta.is_pub then
+      module.type_aliases.push(DocTypeAlias {
+        name: ta.name.clone(),
+        target: format_type_expr(&ta.target),
+        doc_comment: doc,
+        is_pub: ta.is_pub
+      })
+    end
+  when _ then ()
+  end
+end
+
+def extract_function(func: &Function, doc: &String, is_method: Bool) -> DocFunction
+  mut params = Vec::new()
+  for p in func.params do
+    if p.name == "self" then
+      params.push(DocParam {
+        name: "self".to_string(),
+        type_str: if p.is_mut then "&mut self".to_string() else "&self".to_string() end,
+        is_self: true,
+        is_mut: p.is_mut
+      })
+    else
+      params.push(DocParam {
+        name: p.name.clone(),
+        type_str: format_type_expr(&p.ty),
+        is_self: false,
+        is_mut: p.is_mut
+      })
+    end
+  end
+  
+  let ret_type = match func.return_type
+  when Option::Some(rt) then format_type_expr(rt)
+  when Option::None then "Unit".to_string()
+  end
+  
+  let sig = build_signature(func)
+  
+  let type_params = func.type_params.iter().map(|tp| tp.name.clone()).collect()
+  
+  DocFunction {
+    name: func.name.clone(),
+    signature: sig,
+    doc_comment: doc.clone(),
+    params: params,
+    return_type: ret_type,
+    is_pub: func.is_pub,
+    is_method: is_method,
+    type_params: type_params
+  }
+end
+
+def build_signature(func: &Function) -> String
+  mut sig = ""
+  if func.is_pub then sig = sig + "pub " end
+  sig = sig + "def " + func.name
+  
+  if !func.type_params.is_empty() then
+    sig = sig + "["
+    for i in 0..func.type_params.len() do
+      if i > 0 then sig = sig + ", " end
+      sig = sig + func.type_params[i].name
+      if !func.type_params[i].bounds.is_empty() then
+        sig = sig + ": "
+        for j in 0..func.type_params[i].bounds.len() do
+          if j > 0 then sig = sig + " + " end
+          sig = sig + func.type_params[i].bounds[j]
+        end
+      end
+    end
+    sig = sig + "]"
+  end
+  
+  sig = sig + "("
+  for i in 0..func.params.len() do
+    if i > 0 then sig = sig + ", " end
+    let p = &func.params[i]
+    if p.name == "self" then
+      if p.is_mut then sig = sig + "&mut self" else sig = sig + "&self" end
+    else
+      if p.is_mut then sig = sig + "mut " end
+      sig = sig + p.name + ": " + format_type_expr(&p.ty)
+    end
+  end
+  sig = sig + ")"
+  
+  match func.return_type
+  when Option::Some(rt) then sig = sig + " -> " + format_type_expr(rt)
+  when Option::None then ()
+  end
+  
+  sig
+end
+
+def extract_struct(s: &Struct, doc: &String, source: &String, include_private: Bool) -> DocStruct
+  mut fields = Vec::new()
+  for f in s.fields do
+    if include_private || f.is_pub then
+      let field_doc = extract_doc_comment_before(source, f.span.start)
+      fields.push(DocField {
+        name: f.name.clone(),
+        type_str: format_type_expr(&f.ty),
+        doc_comment: field_doc,
+        is_pub: f.is_pub
+      })
+    end
+  end
+  
+  let type_params = s.type_params.iter().map(|tp| tp.name.clone()).collect()
+  
+  DocStruct {
+    name: s.name.clone(),
+    doc_comment: doc.clone(),
+    fields: fields,
+    type_params: type_params,
+    is_pub: s.is_pub
+  }
+end
+
+def extract_enum(e: &Enum, doc: &String, source: &String) -> DocEnum
+  mut variants = Vec::new()
+  for v in e.variants do
+    let var_doc = extract_doc_comment_before(source, v.span.start)
+    mut fields = Vec::new()
+    for f in v.fields do
+      fields.push(DocField {
+        name: f.name.clone(),
+        type_str: format_type_expr(&f.ty),
+        doc_comment: "".to_string(),
+        is_pub: true
+      })
+    end
+    variants.push(DocVariant {
+      name: v.name.clone(),
+      doc_comment: var_doc,
+      fields: fields
+    })
+  end
+  
+  let type_params = e.type_params.iter().map(|tp| tp.name.clone()).collect()
+  
+  DocEnum {
+    name: e.name.clone(),
+    doc_comment: doc.clone(),
+    variants: variants,
+    type_params: type_params,
+    is_pub: e.is_pub
+  }
+end
+
+def extract_trait(t: &Trait, doc: &String, source: &String) -> DocTrait
+  mut methods = Vec::new()
+  for m in t.methods do
+    let method_doc = extract_doc_comment_before(source, m.span.start)
+    methods.push(extract_function(m, &method_doc, true))
+  end
+  
+  let type_params = t.type_params.iter().map(|tp| tp.name.clone()).collect()
+  
+  DocTrait {
+    name: t.name.clone(),
+    doc_comment: doc.clone(),
+    methods: methods,
+    type_params: type_params,
+    is_pub: t.is_pub
+  }
+end
+
+def extract_impl(imp: &Impl, source: &String, include_private: Bool) -> DocImpl
+  mut methods = Vec::new()
+  for m in imp.methods do
+    if include_private || m.is_pub then
+      let method_doc = extract_doc_comment_before(source, m.span.start)
+      methods.push(extract_function(m, &method_doc, true))
+    end
+  end
+  
+  DocImpl {
+    type_name: imp.type_name.clone(),
+    trait_name: imp.trait_name.clone(),
+    methods: methods
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Doc Comment Extraction
+# ———————————————————————————————————————————————————————————————
+
+def extract_doc_comment_before(source: &String, offset: UInt) -> String
+  # Walk backwards from offset to find consecutive # comment lines
+  mut lines = Vec::new()
+  
+  # Find the start of the current line
+  mut line_start = offset
+  while line_start > 0 && source.char_at(line_start - 1) != '\n' do
+    line_start = line_start - 1
+  end
+  
+  # Move up to the previous line
+  if line_start > 0 then
+    mut end_pos = line_start - 1  # skip the \n
+    
+    # Collect consecutive comment lines going upward
+    while end_pos > 0 do
+      # Find start of this line
+      mut ls = end_pos
+      while ls > 0 && source.char_at(ls - 1) != '\n' do
+        ls = ls - 1
+      end
+      
+      let line = source.slice(ls, end_pos + 1).trim()
+      
+      if line.starts_with("#") then
+        # Strip the leading # and optional space
+        let content = if line.len() > 1 && line.char_at(1) == ' ' then
+          line.slice(2, line.len())
+        else
+          line.slice(1, line.len())
+        end
+        lines.push(content)
+        
+        if ls == 0 then break end
+        end_pos = ls - 1
+      elsif line.is_empty() then
+        # Allow one blank line within doc comments
+        if !lines.is_empty() then break end
+        if ls == 0 then break end
+        end_pos = ls - 1
+      else
+        break
+      end
+    end
+  end
+  
+  # Reverse since we collected bottom-up
+  lines.reverse()
+  lines.join("\n")
+end
+
+def extract_module_doc_comment(source: &String) -> String
+  # Module doc comment: first block of # comments at top of file
+  mut lines = Vec::new()
+  mut pos: UInt = 0
+  
+  while pos < source.len() do
+    # Find end of current line
+    mut eol = pos
+    while eol < source.len() && source.char_at(eol) != '\n' do
+      eol = eol + 1
+    end
+    
+    let line = source.slice(pos, eol).trim()
+    
+    if line.starts_with("#") then
+      let content = if line.len() > 1 && line.char_at(1) == ' ' then
+        line.slice(2, line.len())
+      else
+        line.slice(1, line.len())
+      end
+      lines.push(content)
+    elsif line.is_empty() then
+      if !lines.is_empty() then break end
+    else
+      break
+    end
+    
+    pos = eol + 1
+  end
+  
+  lines.join("\n")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type Expression Formatting
+# ———————————————————————————————————————————————————————————————
+
+def format_type_expr(ty: &TypeExpr) -> String
+  match ty.kind
+  when TypeExprKind::Named(name) then name.clone()
+  when TypeExprKind::Generic(name, args) then
+    mut s = name.clone() + "["
+    for i in 0..args.len() do
+      if i > 0 then s = s + ", " end
+      s = s + format_type_expr(&args[i])
+    end
+    s + "]"
+  when TypeExprKind::Reference(inner, is_mut) then
+    if is_mut then "&mut " + format_type_expr(inner)
+    else "&" + format_type_expr(inner)
+    end
+  when TypeExprKind::Tuple(elems) then
+    mut s = "("
+    for i in 0..elems.len() do
+      if i > 0 then s = s + ", " end
+      s = s + format_type_expr(&elems[i])
+    end
+    s + ")"
+  when TypeExprKind::Function(params, ret) then
+    mut s = "def("
+    for i in 0..params.len() do
+      if i > 0 then s = s + ", " end
+      s = s + format_type_expr(&params[i])
+    end
+    s = s + ")"
+    match ret
+    when Option::Some(r) then s + " -> " + format_type_expr(r)
+    when Option::None then s
+    end
+  when TypeExprKind::Array(elem, size) then
+    "[" + format_type_expr(elem) + "; " + size.to_string() + "]"
+  when TypeExprKind::Ptr(inner, is_mut) then
+    if is_mut then "*mut " + format_type_expr(inner)
+    else "*" + format_type_expr(inner)
+    end
+  end
+end
+
+def module_name_from_path(path: String) -> String
+  # Extract module name from file path: "std/collections.tg" -> "collections"
+  mut name = path.clone()
+  
+  # Remove directory path
+  match name.last_index_of("/")
+  when Option::Some(idx) then name = name.slice(idx + 1, name.len())
+  when Option::None then ()
+  end
+  
+  # Remove .tg extension
+  if name.ends_with(".tg") then
+    name = name.slice(0, name.len() - 3)
+  end
+  
+  name
+end
+
+# ———————————————————————————————————————————————————————————————
+# Markdown Output
+# ———————————————————————————————————————————————————————————————
+
+def render_markdown(module: &DocModule) -> String
+  mut md = ""
+  
+  md = md + "# Module `" + module.name + "`\n\n"
+  
+  if !module.doc_comment.is_empty() then
+    md = md + module.doc_comment + "\n\n"
+  end
+  
+  md = md + "**Source:** `" + module.path + "`\n\n"
+  
+  # Table of contents
+  if !module.structs.is_empty() || !module.enums.is_empty() ||
+     !module.traits.is_empty() || !module.functions.is_empty() then
+    md = md + "## Contents\n\n"
+    
+    if !module.structs.is_empty() then
+      md = md + "### Structs\n\n"
+      for s in module.structs do
+        md = md + "- [`" + s.name + "`](#struct-" + s.name.to_lowercase() + ")\n"
+      end
+      md = md + "\n"
+    end
+    
+    if !module.enums.is_empty() then
+      md = md + "### Enums\n\n"
+      for e in module.enums do
+        md = md + "- [`" + e.name + "`](#enum-" + e.name.to_lowercase() + ")\n"
+      end
+      md = md + "\n"
+    end
+    
+    if !module.traits.is_empty() then
+      md = md + "### Traits\n\n"
+      for t in module.traits do
+        md = md + "- [`" + t.name + "`](#trait-" + t.name.to_lowercase() + ")\n"
+      end
+      md = md + "\n"
+    end
+    
+    if !module.functions.is_empty() then
+      md = md + "### Functions\n\n"
+      for f in module.functions do
+        md = md + "- [`" + f.name + "`](#func-" + f.name.to_lowercase() + ")\n"
+      end
+      md = md + "\n"
+    end
+    
+    if !module.constants.is_empty() then
+      md = md + "### Constants\n\n"
+      for c in module.constants do
+        md = md + "- `" + c.name + "`: `" + c.type_str + "`\n"
+      end
+      md = md + "\n"
+    end
+    
+    if !module.type_aliases.is_empty() then
+      md = md + "### Type Aliases\n\n"
+      for ta in module.type_aliases do
+        md = md + "- `" + ta.name + "` = `" + ta.target + "`\n"
+      end
+      md = md + "\n"
+    end
+  end
+  
+  # Struct documentation
+  for s in module.structs do
+    md = md + render_struct_markdown(s)
+  end
+  
+  # Enum documentation
+  for e in module.enums do
+    md = md + render_enum_markdown(e)
+  end
+  
+  # Trait documentation
+  for t in module.traits do
+    md = md + render_trait_markdown(t)
+  end
+  
+  # Function documentation
+  for f in module.functions do
+    md = md + render_function_markdown(f, "##")
+  end
+  
+  # Impl blocks
+  for imp in module.impls do
+    if !imp.methods.is_empty() then
+      md = md + "## impl " + imp.type_name
+      match imp.trait_name
+      when Option::Some(tn) then md = md + " for " + tn
+      when Option::None then ()
+      end
+      md = md + "\n\n"
+      
+      for m in imp.methods do
+        md = md + render_function_markdown(m, "###")
+      end
+    end
+  end
+  
+  md
+end
+
+def render_struct_markdown(s: &DocStruct) -> String
+  mut md = "## Struct `" + s.name
+  if !s.type_params.is_empty() then
+    md = md + "[" + s.type_params.join(", ") + "]"
+  end
+  md = md + "`\n\n"
+  
+  if !s.doc_comment.is_empty() then
+    md = md + s.doc_comment + "\n\n"
+  end
+  
+  if !s.fields.is_empty() then
+    md = md + "### Fields\n\n"
+    md = md + "| Field | Type | Description |\n"
+    md = md + "|-------|------|-------------|\n"
+    for f in s.fields do
+      let vis = if f.is_pub then "pub " else "" end
+      md = md + "| " + vis + "`" + f.name + "` | `" + f.type_str + "` | " + f.doc_comment + " |\n"
+    end
+    md = md + "\n"
+  end
+  
+  md
+end
+
+def render_enum_markdown(e: &DocEnum) -> String
+  mut md = "## Enum `" + e.name
+  if !e.type_params.is_empty() then
+    md = md + "[" + e.type_params.join(", ") + "]"
+  end
+  md = md + "`\n\n"
+  
+  if !e.doc_comment.is_empty() then
+    md = md + e.doc_comment + "\n\n"
+  end
+  
+  if !e.variants.is_empty() then
+    md = md + "### Variants\n\n"
+    for v in e.variants do
+      md = md + "- **`" + v.name + "`**"
+      if !v.fields.is_empty() then
+        md = md + "("
+        for i in 0..v.fields.len() do
+          if i > 0 then md = md + ", " end
+          md = md + v.fields[i].type_str
+        end
+        md = md + ")"
+      end
+      md = md + "\n"
+      if !v.doc_comment.is_empty() then
+        md = md + "  " + v.doc_comment + "\n"
+      end
+    end
+    md = md + "\n"
+  end
+  
+  md
+end
+
+def render_trait_markdown(t: &DocTrait) -> String
+  mut md = "## Trait `" + t.name
+  if !t.type_params.is_empty() then
+    md = md + "[" + t.type_params.join(", ") + "]"
+  end
+  md = md + "`\n\n"
+  
+  if !t.doc_comment.is_empty() then
+    md = md + t.doc_comment + "\n\n"
+  end
+  
+  if !t.methods.is_empty() then
+    md = md + "### Required Methods\n\n"
+    for m in t.methods do
+      md = md + render_function_markdown(m, "####")
+    end
+  end
+  
+  md
+end
+
+def render_function_markdown(f: &DocFunction, heading: String) -> String
+  mut md = heading + " `" + f.name + "`\n\n"
+  
+  md = md + "```tangerine\n" + f.signature + "\n```\n\n"
+  
+  if !f.doc_comment.is_empty() then
+    md = md + f.doc_comment + "\n\n"
+  end
+  
+  # Parameters table
+  let non_self_params = f.params.iter().filter(|p| !p.is_self).collect::<Vec[_]>()
+  if !non_self_params.is_empty() then
+    md = md + "**Parameters:**\n\n"
+    for p in non_self_params do
+      md = md + "- `" + p.name + "`: `" + p.type_str + "`\n"
+    end
+    md = md + "\n"
+  end
+  
+  if f.return_type != "Unit" then
+    md = md + "**Returns:** `" + f.return_type + "`\n\n"
+  end
+  
+  md
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTML Output
+# ———————————————————————————————————————————————————————————————
+
+def render_html(module: &DocModule, config: &DocConfig) -> String
+  mut html = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+  html = html + "  <meta charset=\"utf-8\">\n"
+  html = html + "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+  html = html + "  <title>" + module.name + " — " + config.project_name + "</title>\n"
+  html = html + "  <style>\n"
+  html = html + css_styles()
+  html = html + "  </style>\n</head>\n<body>\n"
+  
+  html = html + "<nav class=\"sidebar\">\n"
+  html = html + "  <h2>" + config.project_name + "</h2>\n"
+  html = html + "  <p class=\"version\">" + config.version + "</p>\n"
+  html = html + "  <ul>\n"
+  
+  if !module.structs.is_empty() then
+    html = html + "    <li><strong>Structs</strong><ul>\n"
+    for s in module.structs do
+      html = html + "      <li><a href=\"#struct-" + s.name + "\">" + s.name + "</a></li>\n"
+    end
+    html = html + "    </ul></li>\n"
+  end
+  
+  if !module.enums.is_empty() then
+    html = html + "    <li><strong>Enums</strong><ul>\n"
+    for e in module.enums do
+      html = html + "      <li><a href=\"#enum-" + e.name + "\">" + e.name + "</a></li>\n"
+    end
+    html = html + "    </ul></li>\n"
+  end
+  
+  if !module.traits.is_empty() then
+    html = html + "    <li><strong>Traits</strong><ul>\n"
+    for t in module.traits do
+      html = html + "      <li><a href=\"#trait-" + t.name + "\">" + t.name + "</a></li>\n"
+    end
+    html = html + "    </ul></li>\n"
+  end
+  
+  if !module.functions.is_empty() then
+    html = html + "    <li><strong>Functions</strong><ul>\n"
+    for f in module.functions do
+      html = html + "      <li><a href=\"#func-" + f.name + "\">" + f.name + "</a></li>\n"
+    end
+    html = html + "    </ul></li>\n"
+  end
+  
+  html = html + "  </ul>\n</nav>\n\n"
+  
+  html = html + "<main>\n"
+  html = html + "  <h1>Module <code>" + module.name + "</code></h1>\n"
+  
+  if !module.doc_comment.is_empty() then
+    html = html + "  <div class=\"module-doc\">" + html_escape(module.doc_comment.clone()) + "</div>\n"
+  end
+  
+  html = html + "  <p class=\"source\">Source: <code>" + module.path + "</code></p>\n\n"
+  
+  # Structs
+  for s in module.structs do
+    html = html + render_struct_html(s)
+  end
+  
+  # Enums
+  for e in module.enums do
+    html = html + render_enum_html(e)
+  end
+  
+  # Traits
+  for t in module.traits do
+    html = html + render_trait_html(t)
+  end
+  
+  # Functions
+  for f in module.functions do
+    html = html + render_function_html(f)
+  end
+  
+  # Impls
+  for imp in module.impls do
+    if !imp.methods.is_empty() then
+      html = html + "  <section class=\"impl\">\n"
+      html = html + "    <h2>impl " + imp.type_name
+      match imp.trait_name
+      when Option::Some(tn) then html = html + " for " + tn
+      when Option::None then ()
+      end
+      html = html + "</h2>\n"
+      for m in imp.methods do
+        html = html + render_function_html(m)
+      end
+      html = html + "  </section>\n"
+    end
+  end
+  
+  html = html + "</main>\n</body>\n</html>\n"
+  html
+end
+
+def render_struct_html(s: &DocStruct) -> String
+  mut html = "  <section id=\"struct-" + s.name + "\" class=\"item struct\">\n"
+  html = html + "    <h2>Struct <code>" + s.name
+  if !s.type_params.is_empty() then
+    html = html + "[" + s.type_params.join(", ") + "]"
+  end
+  html = html + "</code></h2>\n"
+  
+  if !s.doc_comment.is_empty() then
+    html = html + "    <div class=\"doc\">" + html_escape(s.doc_comment.clone()) + "</div>\n"
+  end
+  
+  if !s.fields.is_empty() then
+    html = html + "    <h3>Fields</h3>\n    <table class=\"fields\">\n"
+    html = html + "      <tr><th>Name</th><th>Type</th><th>Description</th></tr>\n"
+    for f in s.fields do
+      html = html + "      <tr><td><code>" + f.name + "</code></td>"
+      html = html + "<td><code>" + html_escape(f.type_str.clone()) + "</code></td>"
+      html = html + "<td>" + html_escape(f.doc_comment.clone()) + "</td></tr>\n"
+    end
+    html = html + "    </table>\n"
+  end
+  
+  html = html + "  </section>\n\n"
+  html
+end
+
+def render_enum_html(e: &DocEnum) -> String
+  mut html = "  <section id=\"enum-" + e.name + "\" class=\"item enum\">\n"
+  html = html + "    <h2>Enum <code>" + e.name
+  if !e.type_params.is_empty() then
+    html = html + "[" + e.type_params.join(", ") + "]"
+  end
+  html = html + "</code></h2>\n"
+  
+  if !e.doc_comment.is_empty() then
+    html = html + "    <div class=\"doc\">" + html_escape(e.doc_comment.clone()) + "</div>\n"
+  end
+  
+  html = html + "    <h3>Variants</h3>\n    <ul class=\"variants\">\n"
+  for v in e.variants do
+    html = html + "      <li><code>" + v.name + "</code>"
+    if !v.fields.is_empty() then
+      html = html + "("
+      for i in 0..v.fields.len() do
+        if i > 0 then html = html + ", " end
+        html = html + html_escape(v.fields[i].type_str.clone())
+      end
+      html = html + ")"
+    end
+    if !v.doc_comment.is_empty() then
+      html = html + " — " + html_escape(v.doc_comment.clone())
+    end
+    html = html + "</li>\n"
+  end
+  html = html + "    </ul>\n  </section>\n\n"
+  html
+end
+
+def render_trait_html(t: &DocTrait) -> String
+  mut html = "  <section id=\"trait-" + t.name + "\" class=\"item trait\">\n"
+  html = html + "    <h2>Trait <code>" + t.name
+  if !t.type_params.is_empty() then
+    html = html + "[" + t.type_params.join(", ") + "]"
+  end
+  html = html + "</code></h2>\n"
+  
+  if !t.doc_comment.is_empty() then
+    html = html + "    <div class=\"doc\">" + html_escape(t.doc_comment.clone()) + "</div>\n"
+  end
+  
+  html = html + "    <h3>Required Methods</h3>\n"
+  for m in t.methods do
+    html = html + render_function_html(m)
+  end
+  html = html + "  </section>\n\n"
+  html
+end
+
+def render_function_html(f: &DocFunction) -> String
+  mut html = "  <div id=\"func-" + f.name + "\" class=\"item function\">\n"
+  html = html + "    <h3><code>" + html_escape(f.signature.clone()) + "</code></h3>\n"
+  
+  if !f.doc_comment.is_empty() then
+    html = html + "    <div class=\"doc\">" + html_escape(f.doc_comment.clone()) + "</div>\n"
+  end
+  
+  let non_self_params = f.params.iter().filter(|p| !p.is_self).collect::<Vec[_]>()
+  if !non_self_params.is_empty() then
+    html = html + "    <h4>Parameters</h4>\n    <ul>\n"
+    for p in non_self_params do
+      html = html + "      <li><code>" + p.name + "</code>: <code>" + html_escape(p.type_str.clone()) + "</code></li>\n"
+    end
+    html = html + "    </ul>\n"
+  end
+  
+  if f.return_type != "Unit" then
+    html = html + "    <p><strong>Returns:</strong> <code>" + html_escape(f.return_type.clone()) + "</code></p>\n"
+  end
+  
+  html = html + "  </div>\n\n"
+  html
+end
+
+def html_escape(s: String) -> String
+  mut result = ""
+  for c in s.chars() do
+    match c
+    when '&' then result = result + "&amp;"
+    when '<' then result = result + "&lt;"
+    when '>' then result = result + "&gt;"
+    when '"' then result = result + "&quot;"
+    when _ then result = result + c.to_string()
+    end
+  end
+  result
+end
+
+def css_styles() -> String
+  "
+    :root {
+      --bg: #1e1e2e; --fg: #cdd6f4; --accent: #89b4fa;
+      --sidebar-bg: #181825; --code-bg: #313244;
+      --border: #45475a; --heading: #f5c2e7;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--fg);
+           display: flex; line-height: 1.6; }
+    nav.sidebar { width: 280px; background: var(--sidebar-bg); padding: 1.5rem;
+                  height: 100vh; overflow-y: auto; position: fixed; border-right: 1px solid var(--border); }
+    nav.sidebar h2 { color: var(--accent); margin-bottom: 0.25rem; }
+    nav.sidebar .version { color: var(--border); font-size: 0.85rem; margin-bottom: 1rem; }
+    nav.sidebar ul { list-style: none; }
+    nav.sidebar li { margin: 0.2rem 0; }
+    nav.sidebar a { color: var(--fg); text-decoration: none; }
+    nav.sidebar a:hover { color: var(--accent); }
+    main { margin-left: 300px; padding: 2rem 3rem; max-width: 900px; }
+    h1, h2, h3 { color: var(--heading); margin: 1.5rem 0 0.5rem; }
+    code { background: var(--code-bg); padding: 0.1rem 0.4rem; border-radius: 3px;
+           font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
+    .item { border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem;
+            margin: 1rem 0; background: var(--sidebar-bg); }
+    .doc { margin: 0.5rem 0; }
+    table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+    th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--accent); }
+    .source { color: var(--border); font-size: 0.85rem; }
+    ul.variants li { margin: 0.3rem 0; }
+  "
+end
+
+# ———————————————————————————————————————————————————————————————
+# Index Page Generation
+# ———————————————————————————————————————————————————————————————
+
+def render_index_html(modules: &Vec[DocModule], config: &DocConfig) -> String
+  mut html = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+  html = html + "  <meta charset=\"utf-8\">\n"
+  html = html + "  <title>" + config.project_name + " Documentation</title>\n"
+  html = html + "  <style>\n" + css_styles() + "  </style>\n</head>\n<body>\n"
+  
+  html = html + "<main style=\"margin-left: 0; max-width: 1200px; margin: 0 auto;\">\n"
+  html = html + "  <h1>" + config.project_name + " API Documentation</h1>\n"
+  html = html + "  <p>Version " + config.version + "</p>\n\n"
+  
+  html = html + "  <h2>Modules</h2>\n  <ul>\n"
+  for m in modules do
+    html = html + "    <li><a href=\"" + m.name + ".html\">" + m.name + "</a>"
+    if !m.doc_comment.is_empty() then
+      let first_line = m.doc_comment.split("\n").first().unwrap_or("".to_string())
+      html = html + " — " + html_escape(first_line)
+    end
+    html = html + "</li>\n"
+  end
+  html = html + "  </ul>\n"
+  
+  # Summary statistics
+  mut total_functions: UInt = 0
+  mut total_structs: UInt = 0
+  mut total_enums: UInt = 0
+  mut total_traits: UInt = 0
+  
+  for m in modules do
+    total_functions = total_functions + m.functions.len()
+    total_structs = total_structs + m.structs.len()
+    total_enums = total_enums + m.enums.len()
+    total_traits = total_traits + m.traits.len()
+    for imp in m.impls do
+      total_functions = total_functions + imp.methods.len()
+    end
+  end
+  
+  html = html + "\n  <h2>Statistics</h2>\n  <table>\n"
+  html = html + "    <tr><td>Modules</td><td>" + modules.len().to_string() + "</td></tr>\n"
+  html = html + "    <tr><td>Functions/Methods</td><td>" + total_functions.to_string() + "</td></tr>\n"
+  html = html + "    <tr><td>Structs</td><td>" + total_structs.to_string() + "</td></tr>\n"
+  html = html + "    <tr><td>Enums</td><td>" + total_enums.to_string() + "</td></tr>\n"
+  html = html + "    <tr><td>Traits</td><td>" + total_traits.to_string() + "</td></tr>\n"
+  html = html + "  </table>\n"
+  
+  html = html + "</main>\n</body>\n</html>\n"
+  html
+end
+
+def render_index_markdown(modules: &Vec[DocModule], config: &DocConfig) -> String
+  mut md = "# " + config.project_name + " API Documentation\n\n"
+  md = md + "Version " + config.version + "\n\n"
+  
+  md = md + "## Modules\n\n"
+  for m in modules do
+    md = md + "- [" + m.name + "](" + m.name + ".md)"
+    if !m.doc_comment.is_empty() then
+      let first_line = m.doc_comment.split("\n").first().unwrap_or("".to_string())
+      md = md + " — " + first_line
+    end
+    md = md + "\n"
+  end
+  
+  md
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API
+# ———————————————————————————————————————————————————————————————
+
+pub def generate_docs(files: Vec[String], config: &DocConfig) -> Result[UInt, String]
+  # Create output directory
+  mkdir_p(config.output_dir.clone())
+  
+  mut modules = Vec::new()
+  mut errors = Vec::new()
+  
+  for file in files do
+    match read_file(file.clone())
+    when Result::Ok(source) then
+      match extract_module(file.clone(), source, config.include_private)
+      when Result::Ok(m) then modules.push(m)
+      when Result::Err(e) then errors.push(e)
+      end
+    when Result::Err(e) then errors.push("Cannot read " + file + ": " + e)
+    end
+  end
+  
+  if !errors.is_empty() then
+    for e in errors do eprintln("docgen warning: " + e) end
+  end
+  
+  # Sort modules by name
+  modules.sort_by(|a, b| a.name.cmp(&b.name))
+  
+  # Generate per-module docs
+  for module in modules do
+    let content = match config.format
+    when DocFormat::Html then render_html(&module, config)
+    when DocFormat::Markdown then render_markdown(&module)
+    end
+    
+    let ext = match config.format
+    when DocFormat::Html then ".html"
+    when DocFormat::Markdown then ".md"
+    end
+    
+    let out_path = path_join(config.output_dir.clone(), module.name.clone() + ext)
+    match write_file(out_path.clone(), content)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("Write error: " + e)
+    end
+  end
+  
+  # Generate index
+  let index_content = match config.format
+  when DocFormat::Html then render_index_html(&modules, config)
+  when DocFormat::Markdown then render_index_markdown(&modules, config)
+  end
+  
+  let index_name = match config.format
+  when DocFormat::Html then "index.html"
+  when DocFormat::Markdown then "README.md"
+  end
+  
+  let index_path = path_join(config.output_dir.clone(), index_name.to_string())
+  match write_file(index_path, index_content)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("Write index error: " + e)
+  end
+  
+  Result::Ok(modules.len())
+end

@@ -159,6 +159,67 @@ def count_borrows(bs: &BorrowSet, target: String) -> Int
   count
 end
 
+# Collect all variable names that are borrowed in a block (for loop borrow tracking)
+def collect_borrows_in_block(block: &Block) -> Vec[String]
+  mut names = Vec::new()
+  for stmt in block.stmts do
+    collect_borrows_in_stmt(&stmt, &mut names)
+  end
+  names
+end
+
+def collect_borrows_in_stmt(stmt: &Stmt, names: &mut Vec[String]) -> Unit
+  match stmt.kind
+  when StmtKind::Let(name, _, _, _) then
+    names.push(name.clone())
+  when StmtKind::Expr(expr) then
+    collect_borrows_in_expr(&expr, names)
+  when StmtKind::If(if_stmt) then
+    collect_borrows_in_block(&if_stmt.then_block)
+      .iter().for_each(|n| names.push(n))
+    match if_stmt.else_block
+    when Option::Some(eb) then
+      collect_borrows_in_block(&eb).iter().for_each(|n| names.push(n))
+    when Option::None then ()
+    end
+  when StmtKind::While(_, body) then
+    collect_borrows_in_block(&body).iter().for_each(|n| names.push(n))
+  when StmtKind::For(var, _, body) then
+    names.push(var.clone())
+    collect_borrows_in_block(&body).iter().for_each(|n| names.push(n))
+  when _ then ()
+  end
+end
+
+def collect_borrows_in_expr(expr: &Expr, names: &mut Vec[String]) -> Unit
+  match expr.kind
+  when ExprKind::Ref(inner) then
+    match inner.kind
+    when ExprKind::Ident(name) then names.push(name.clone())
+    when _ then ()
+    end
+  when ExprKind::RefMut(inner) then
+    match inner.kind
+    when ExprKind::Ident(name) then names.push(name.clone())
+    when _ then ()
+    end
+  when _ then ()
+  end
+end
+
+# Invalidate all borrows of a given target (used at loop boundaries)
+def invalidate_borrow(ctx: &mut BorrowCtx, target: &String, span: Span) -> Unit
+  mut i = 0
+  while i < ctx.borrows.borrows.len() do
+    if ctx.borrows.borrows[i].target == *target then
+      ctx.borrows.borrows.remove(i)
+      # Don't increment i since we removed an element
+    else
+      i = i + 1
+    end
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Borrow Checker Context
 # ———————————————————————————————————————————————————————————————
@@ -179,9 +240,154 @@ struct BorrowCtx
   
   # Error collection
   errors: Vec[BorrowError]
+  warnings: Vec[BorrowError]
   
   # Configuration
   unsafe_context: Bool
+  
+  # Unsafe audit trail
+  unsafe_audit: Vec[UnsafeUsage]
+  current_file: String
+  current_function: String
+  source: String
+end
+
+# ———————————————————————————————————————————————————————————————
+# Unsafe Audit Infrastructure
+# ———————————————————————————————————————————————————————————————
+
+enum UnsafeOperation
+  RawPointerDeref
+  FfiCall(String)
+  MutableStaticAccess(String)
+  UnionFieldAccess
+  InlineAssembly
+  TransmuteCall
+  UncheckedArithmetic
+  RawPointerArithmetic
+end
+
+struct UnsafeUsage
+  span: Span
+  file: String
+  line: Int
+  column: Int
+  reason: String
+  operations: Vec[UnsafeOperation]
+  function_name: String
+end
+
+def collect_unsafe_operations(block: &Block, ops: &mut Vec[UnsafeOperation]) -> Unit
+  for stmt in block.stmts do
+    collect_unsafe_ops_stmt(stmt, ops)
+  end
+end
+
+def collect_unsafe_ops_stmt(stmt: &Stmt, ops: &mut Vec[UnsafeOperation]) -> Unit
+  match stmt.kind
+  when StmtKind::Expr(expr) then collect_unsafe_ops_expr(expr, ops)
+  when StmtKind::Let(_, _, init) then
+    match init
+    when Option::Some(e) then collect_unsafe_ops_expr(e, ops)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def collect_unsafe_ops_expr(expr: &Expr, ops: &mut Vec[UnsafeOperation]) -> Unit
+  match expr.kind
+  when ExprKind::Deref(inner) then
+    match inner.kind
+    when ExprKind::Ident(_) then ops.push(UnsafeOperation::RawPointerDeref)
+    when _ then ()
+    end
+    collect_unsafe_ops_expr(inner, ops)
+  when ExprKind::Call(callee, args) then
+    match callee.kind
+    when ExprKind::Ident(name) then
+      if name == "transmute" || name == "std::mem::transmute" then
+        ops.push(UnsafeOperation::TransmuteCall)
+      end
+    when ExprKind::FieldAccess(_, field) then
+      if field == "offset" || field == "add" || field == "sub" then
+        ops.push(UnsafeOperation::RawPointerArithmetic)
+      end
+    when _ then ()
+    end
+    collect_unsafe_ops_expr(callee, ops)
+    for a in args do collect_unsafe_ops_expr(a, ops) end
+  when ExprKind::FfiCall(name, _) then
+    ops.push(UnsafeOperation::FfiCall(name.clone()))
+  when ExprKind::Binary(_, l, r) then
+    collect_unsafe_ops_expr(l, ops)
+    collect_unsafe_ops_expr(r, ops)
+  when ExprKind::Assign(l, r) then
+    collect_unsafe_ops_expr(l, ops)
+    collect_unsafe_ops_expr(r, ops)
+  when _ then ()
+  end
+end
+
+def offset_to_line_col(source: &String, offset: Int) -> (Int, Int)
+  mut line = 1
+  mut col = 1
+  mut i = 0
+  while i < offset && i < source.len() do
+    if source.char_at(i) == '\n' then
+      line = line + 1
+      col = 1
+    else
+      col = col + 1
+    end
+    i = i + 1
+  end
+  (line, col)
+end
+
+def generate_unsafe_report(audit: &Vec[UnsafeUsage]) -> String
+  mut report = "# Unsafe Audit Report\n\n"
+  report = report + "Total unsafe blocks: " + audit.len().to_string() + "\n\n"
+  
+  mut by_file = Map::new()
+  for usage in audit do
+    match by_file.get_mut(usage.file.clone())
+    when Option::Some(list) then list.push(usage)
+    when Option::None then
+      mut list = Vec::new()
+      list.push(usage)
+      by_file.insert(usage.file.clone(), list)
+    end
+  end
+  
+  for entry in by_file do
+    report = report + "## " + entry.key + "\n\n"
+    for usage in entry.value do
+      report = report + "- **Line " + usage.line.to_string() + "** in `" + usage.function_name + "`"
+      if !usage.reason.is_empty() then
+        report = report + " — reason: \"" + usage.reason + "\""
+      else
+        report = report + " — **no reason documented**"
+      end
+      report = report + "\n"
+      for op in usage.operations do
+        let op_str = match op
+        when UnsafeOperation::RawPointerDeref then "raw pointer dereference"
+        when UnsafeOperation::FfiCall(name) then "FFI call: " + name
+        when UnsafeOperation::MutableStaticAccess(name) then "mutable static access: " + name
+        when UnsafeOperation::UnionFieldAccess then "union field access"
+        when UnsafeOperation::InlineAssembly then "inline assembly"
+        when UnsafeOperation::TransmuteCall then "transmute call"
+        when UnsafeOperation::UncheckedArithmetic then "unchecked arithmetic"
+        when UnsafeOperation::RawPointerArithmetic then "raw pointer arithmetic"
+        end
+        report = report + "  - " + op_str + "\n"
+      end
+    end
+    report = report + "\n"
+  end
+  
+  report
 end
 
 struct BorrowError
@@ -189,6 +395,33 @@ struct BorrowError
   message: String
   span: Span
   notes: Vec[String]
+  code: String
+end
+
+# Stable error codes for borrow checking:
+#   E0300 — Use after move
+#   E0301 — Use after drop
+#   E0302 — Cannot borrow as mutable more than once
+#   E0303 — Cannot borrow as mutable while borrowed as immutable
+#   E0304 — Cannot borrow as immutable while borrowed as mutable
+#   E0305 — Cannot move while borrowed
+#   E0306 — Lifetime error (borrow outlives owner)
+#   E0307 — Cannot assign to immutable variable
+#   E0308 — Cannot borrow immutable as mutable
+#   E0309 — Warning (lint-style)
+def error_code_for_kind(kind: BorrowErrorKind) -> String
+  match kind
+  when BorrowErrorKind::UseAfterMove then "E0300"
+  when BorrowErrorKind::UseAfterDrop then "E0301"
+  when BorrowErrorKind::DoubleMutBorrow then "E0302"
+  when BorrowErrorKind::MutBorrowWhileShared then "E0303"
+  when BorrowErrorKind::SharedBorrowWhileMut then "E0304"
+  when BorrowErrorKind::MovedWhileBorrowed then "E0305"
+  when BorrowErrorKind::LifetimeError then "E0306"
+  when BorrowErrorKind::AssignToImmutable then "E0307"
+  when BorrowErrorKind::MutBorrowOfImmutable then "E0308"
+  when BorrowErrorKind::Warning then "W0300"
+  end
 end
 
 enum BorrowErrorKind
@@ -201,6 +434,7 @@ enum BorrowErrorKind
   LifetimeError
   AssignToImmutable
   MutBorrowOfImmutable
+  Warning
 end
 
 def ctx_new() -> BorrowCtx
@@ -211,7 +445,12 @@ def ctx_new() -> BorrowCtx
     current_lifetime: lifetime_static(),
     scope_stack: Vec::new(),
     errors: Vec::new(),
-    unsafe_context: false
+    warnings: Vec::new(),
+    unsafe_context: false,
+    unsafe_audit: Vec::new(),
+    current_file: "".to_string(),
+    current_function: "".to_string(),
+    source: "".to_string()
   }
 end
 
@@ -265,7 +504,8 @@ def add_error(ctx: &mut BorrowCtx, kind: BorrowErrorKind, msg: String, span: Spa
     kind: kind,
     message: msg,
     span: span,
-    notes: Vec::new()
+    notes: Vec::new(),
+    code: error_code_for_kind(kind)
   })
 end
 
@@ -276,7 +516,8 @@ def add_error_with_note(ctx: &mut BorrowCtx, kind: BorrowErrorKind, msg: String,
     kind: kind,
     message: msg,
     span: span,
-    notes: notes
+    notes: notes,
+    code: error_code_for_kind(kind)
   })
 end
 
@@ -414,7 +655,18 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
     check_expr(ctx, &iter)
     push_scope(ctx)
     add_var(ctx, var, Type::Unit, stmt.span)
+    
+    # Invalidate borrows at loop entry (they may not be valid across iterations)
+    let loop_borrows = collect_borrows_in_block(&body)
+    
     check_block(ctx, &body)
+    
+    # Invalidate all borrows created in loop body at end of iteration
+    # This prevents use-after-move across loop iterations
+    for borrow_name in loop_borrows do
+      invalidate_borrow(ctx, &borrow_name, stmt.span)
+    end
+    
     pop_scope(ctx)
     
   when StmtKind::Return(val_opt) then
@@ -444,6 +696,32 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
   when StmtKind::Unsafe(reason, body) then
     let was_unsafe = ctx.unsafe_context
     ctx.unsafe_context = true
+    
+    # Unsafe audit: record this block
+    let (line, col) = offset_to_line_col(&ctx.source, stmt.span.start)
+    mut operations = Vec::new()
+    collect_unsafe_operations(&body, &mut operations)
+    
+    ctx.unsafe_audit.push(UnsafeUsage {
+      span: stmt.span,
+      file: ctx.current_file.clone(),
+      line: line,
+      column: col,
+      reason: reason.clone(),
+      operations: operations,
+      function_name: ctx.current_function.clone()
+    })
+    
+    # Lint: empty unsafe block
+    if body.stmts.is_empty() then
+      ctx.warnings.push(BorrowError {
+        kind: BorrowErrorKind::Warning,
+        message: "unnecessary unsafe block — body is empty",
+        span: stmt.span,
+        notes: Vec::new()
+      })
+    end
+    
     check_block(ctx, &body)
     ctx.unsafe_context = was_unsafe
     

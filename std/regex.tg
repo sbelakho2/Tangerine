@@ -1,0 +1,1542 @@
+# Tangerine Standard Library — Regex & Parser Combinators
+#
+# Regular expression engine and parser combinator library.
+#
+# Usage:
+#   let re = Regex::new(r"\d+")
+#   if re.is_match("42") then ...
+#   
+#   let parser = digit().many1().map(|ds| ds.join(""))
+#   let result = parser.parse("123abc")?
+
+use std::core::{Option, Result, Vec, String, Bool, Int}
+use std::collections::{Map, Set}
+
+# ═══════════════════════════════════════════════════════════════
+# PART 1: REGULAR EXPRESSIONS
+# ═══════════════════════════════════════════════════════════════
+
+# ———————————————————————————————————————————————————————————————
+# Regex Types
+# ———————————————————————————————————————————————————————————————
+
+struct Regex
+  pattern: String
+  nfa: Nfa
+  flags: RegexFlags
+end
+
+struct RegexFlags
+  case_insensitive: Bool
+  multiline: Bool
+  dot_all: Bool
+  unicode: Bool
+end
+
+def RegexFlags::default() -> RegexFlags
+  RegexFlags {
+    case_insensitive: false,
+    multiline: false,
+    dot_all: false,
+    unicode: false
+  }
+end
+
+enum RegexError
+  InvalidEscape(UInt, char)
+  UnmatchedParen(UInt)
+  InvalidQuantifier(UInt)
+  InvalidCharClass(UInt)
+  InvalidRepetition(UInt)
+  EmptyPattern
+  InternalError(String)
+end
+
+def regex_error_message(e: &RegexError) -> String
+  match e
+  when RegexError::InvalidEscape(pos, c) then
+    format!("invalid escape '\\{}' at position {}", c, pos)
+  when RegexError::UnmatchedParen(pos) then
+    format!("unmatched parenthesis at position {}", pos)
+  when RegexError::InvalidQuantifier(pos) then
+    format!("invalid quantifier at position {}", pos)
+  when RegexError::InvalidCharClass(pos) then
+    format!("invalid character class at position {}", pos)
+  when RegexError::InvalidRepetition(pos) then
+    format!("invalid repetition at position {}", pos)
+  when RegexError::EmptyPattern then "empty pattern"
+  when RegexError::InternalError(s) then "internal error: " + s.clone()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# NFA (Thompson's Construction)
+# ———————————————————————————————————————————————————————————————
+
+struct Nfa
+  states: Vec[NfaState]
+  start: UInt
+  accept: UInt
+end
+
+struct NfaState
+  transitions: Vec[(NfaTransition, UInt)]
+  is_accept: Bool
+end
+
+enum NfaTransition
+  Epsilon
+  Char(char)
+  CharRange(char, char)
+  CharClass(CharClass)
+  Any
+  AnyNotNewline
+  StartOfLine
+  EndOfLine
+  StartOfString
+  EndOfString
+  WordBoundary
+  NotWordBoundary
+end
+
+struct CharClass
+  ranges: Vec[(char, char)]
+  negated: Bool
+end
+
+impl CharClass
+  def new() -> CharClass
+    CharClass { ranges: Vec::new(), negated: false }
+  end
+  
+  def add_char(self: &mut CharClass, c: char) -> Unit
+    self.ranges.push((c, c))
+  end
+  
+  def add_range(self: &mut CharClass, start: char, end: char) -> Unit
+    self.ranges.push((start, end))
+  end
+  
+  def negate(self: &mut CharClass) -> Unit
+    self.negated = true
+  end
+  
+  def matches(self: &CharClass, c: char) -> Bool
+    let mut found = false
+    for (start, end) in &self.ranges do
+      if c >= *start && c <= *end then
+        found = true
+        break
+      end
+    end
+    if self.negated then !found else found end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Regex Compilation
+# ———————————————————————————————————————————————————————————————
+
+def Regex::new(pattern: &str) -> Result[Regex, RegexError]
+  Regex::with_flags(pattern, RegexFlags::default())
+end
+
+def Regex::with_flags(pattern: &str, flags: RegexFlags) -> Result[Regex, RegexError]
+  if pattern.is_empty() then
+    return Result::Err(RegexError::EmptyPattern)
+  end
+  
+  let mut compiler = RegexCompiler::new(pattern, &flags)
+  let nfa = compiler.compile()?
+  
+  Result::Ok(Regex {
+    pattern: pattern.to_string(),
+    nfa: nfa,
+    flags: flags
+  })
+end
+
+struct RegexCompiler
+  pattern: Vec[char]
+  pos: UInt
+  flags: RegexFlags
+  state_count: UInt
+end
+
+impl RegexCompiler
+  def new(pattern: &str, flags: &RegexFlags) -> RegexCompiler
+    RegexCompiler {
+      pattern: pattern.chars().collect(),
+      pos: 0,
+      flags: flags.clone(),
+      state_count: 0
+    }
+  end
+  
+  def compile(self: &mut RegexCompiler) -> Result[Nfa, RegexError]
+    let (nfa, _) = self.parse_expr()?
+    Result::Ok(nfa)
+  end
+  
+  def new_state(self: &mut RegexCompiler) -> UInt
+    let id = self.state_count
+    self.state_count = self.state_count + 1
+    id
+  end
+  
+  def peek(self: &RegexCompiler) -> Option[char]
+    if self.pos < self.pattern.len() then
+      Option::Some(self.pattern[self.pos])
+    else
+      Option::None
+    end
+  end
+  
+  def advance(self: &mut RegexCompiler) -> Option[char]
+    if self.pos < self.pattern.len() then
+      let c = self.pattern[self.pos]
+      self.pos = self.pos + 1
+      Option::Some(c)
+    else
+      Option::None
+    end
+  end
+  
+  def parse_expr(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    let (mut nfa, mut end) = self.parse_concat()?
+    
+    while self.peek() == Option::Some('|') do
+      self.advance()  # consume '|'
+      let (alt_nfa, alt_end) = self.parse_concat()?
+      # Create alternation
+      let new_start = self.new_state()
+      let new_end = self.new_state()
+      
+      let mut states = Vec::new()
+      
+      # New start state with epsilon to both branches
+      states.push(NfaState {
+        transitions: vec![
+          (NfaTransition::Epsilon, nfa.start + 1),
+          (NfaTransition::Epsilon, alt_nfa.start + 1 + nfa.states.len())
+        ],
+        is_accept: false
+      })
+      
+      # Add states from first branch
+      for state in nfa.states do
+        let mut s = state
+        for (t, target) in &mut s.transitions do
+          *target = *target + 1
+        end
+        if s.is_accept then
+          s.is_accept = false
+          s.transitions.push((NfaTransition::Epsilon, new_end + 1))
+        end
+        states.push(s)
+      end
+      
+      # Add states from second branch
+      let offset = nfa.states.len() + 1
+      for state in alt_nfa.states do
+        let mut s = state
+        for (t, target) in &mut s.transitions do
+          *target = *target + offset
+        end
+        if s.is_accept then
+          s.is_accept = false
+          s.transitions.push((NfaTransition::Epsilon, new_end + offset))
+        end
+        states.push(s)
+      end
+      
+      # New accept state
+      states.push(NfaState {
+        transitions: Vec::new(),
+        is_accept: true
+      })
+      
+      nfa = Nfa {
+        states: states,
+        start: 0,
+        accept: states.len() - 1
+      }
+      end = nfa.accept
+    end
+    
+    Result::Ok((nfa, end))
+  end
+  
+  def parse_concat(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    let mut fragments = Vec::new()
+    
+    while self.pos < self.pattern.len() do
+      match self.peek()
+      when Option::Some('|') | Option::Some(')') then break
+      when _ then ()
+      end
+      
+      let (frag, _) = self.parse_quantified()?
+      fragments.push(frag)
+    end
+    
+    if fragments.is_empty() then
+      # Empty concatenation = epsilon
+      let mut states = Vec::new()
+      states.push(NfaState {
+        transitions: Vec::new(),
+        is_accept: true
+      })
+      return Result::Ok((Nfa { states: states, start: 0, accept: 0 }, 0))
+    end
+    
+    # Concatenate all fragments
+    let mut result = fragments.remove(0)
+    
+    for frag in fragments do
+      result = concatenate_nfa(result, frag)
+    end
+    
+    Result::Ok((result, result.accept))
+  end
+  
+  def parse_quantified(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    let (base, _) = self.parse_atom()?
+    
+    match self.peek()
+    when Option::Some('*') then
+      self.advance()
+      let greedy = self.peek() != Option::Some('?')
+      if !greedy then self.advance() end
+      Result::Ok((apply_star(base, greedy), 0))
+    when Option::Some('+') then
+      self.advance()
+      let greedy = self.peek() != Option::Some('?')
+      if !greedy then self.advance() end
+      Result::Ok((apply_plus(base, greedy), 0))
+    when Option::Some('?') then
+      self.advance()
+      let greedy = self.peek() != Option::Some('?')
+      if !greedy then self.advance() end
+      Result::Ok((apply_optional(base, greedy), 0))
+    when Option::Some('{') then
+      self.advance()
+      let (min, max) = self.parse_repetition()?
+      if self.advance() != Option::Some('}') then
+        return Result::Err(RegexError::InvalidRepetition(self.pos))
+      end
+      Result::Ok((apply_repetition(base, min, max), 0))
+    when _ then Result::Ok((base, 0))
+    end
+  end
+  
+  def parse_repetition(self: &mut RegexCompiler) -> Result[(UInt, Option[UInt]), RegexError]
+    let mut min_str = String::new()
+    while self.peek().map(|c| c.is_digit()).unwrap_or(false) do
+      min_str.push(self.advance().unwrap())
+    end
+    
+    let min = min_str.parse_uint().unwrap_or(0)
+    
+    if self.peek() == Option::Some(',') then
+      self.advance()
+      if self.peek() == Option::Some('}') then
+        return Result::Ok((min, Option::None))  # {n,}
+      end
+      
+      let mut max_str = String::new()
+      while self.peek().map(|c| c.is_digit()).unwrap_or(false) do
+        max_str.push(self.advance().unwrap())
+      end
+      let max = max_str.parse_uint().unwrap_or(min)
+      Result::Ok((min, Option::Some(max)))  # {n,m}
+    else
+      Result::Ok((min, Option::Some(min)))  # {n}
+    end
+  end
+  
+  def parse_atom(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    match self.peek()
+    when Option::Some('(') then
+      self.advance()
+      let (nfa, end) = self.parse_expr()?
+      if self.advance() != Option::Some(')') then
+        return Result::Err(RegexError::UnmatchedParen(self.pos))
+      end
+      Result::Ok((nfa, end))
+    when Option::Some('[') then
+      self.parse_char_class()
+    when Option::Some('.') then
+      self.advance()
+      let transition = if self.flags.dot_all then
+        NfaTransition::Any
+      else
+        NfaTransition::AnyNotNewline
+      end
+      Result::Ok((single_transition(transition), 0))
+    when Option::Some('^') then
+      self.advance()
+      let transition = if self.flags.multiline then
+        NfaTransition::StartOfLine
+      else
+        NfaTransition::StartOfString
+      end
+      Result::Ok((single_transition(transition), 0))
+    when Option::Some('$') then
+      self.advance()
+      let transition = if self.flags.multiline then
+        NfaTransition::EndOfLine
+      else
+        NfaTransition::EndOfString
+      end
+      Result::Ok((single_transition(transition), 0))
+    when Option::Some('\\') then
+      self.parse_escape()
+    when Option::Some(c) then
+      if c == '*' || c == '+' || c == '?' || c == '{' || c == '|' || c == ')' then
+        return Result::Err(RegexError::InvalidQuantifier(self.pos))
+      end
+      self.advance()
+      let ch = if self.flags.case_insensitive then c.to_lowercase() else c end
+      Result::Ok((single_transition(NfaTransition::Char(ch)), 0))
+    when Option::None then
+      Result::Err(RegexError::EmptyPattern)
+    end
+  end
+  
+  def parse_escape(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    self.advance()  # consume '\'
+    
+    match self.advance()
+    when Option::Some('d') then
+      let mut cc = CharClass::new()
+      cc.add_range('0', '9')
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('D') then
+      let mut cc = CharClass::new()
+      cc.add_range('0', '9')
+      cc.negate()
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('w') then
+      let mut cc = CharClass::new()
+      cc.add_range('a', 'z')
+      cc.add_range('A', 'Z')
+      cc.add_range('0', '9')
+      cc.add_char('_')
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('W') then
+      let mut cc = CharClass::new()
+      cc.add_range('a', 'z')
+      cc.add_range('A', 'Z')
+      cc.add_range('0', '9')
+      cc.add_char('_')
+      cc.negate()
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('s') then
+      let mut cc = CharClass::new()
+      cc.add_char(' ')
+      cc.add_char('\t')
+      cc.add_char('\n')
+      cc.add_char('\r')
+      cc.add_char('\x0c')  # form feed
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('S') then
+      let mut cc = CharClass::new()
+      cc.add_char(' ')
+      cc.add_char('\t')
+      cc.add_char('\n')
+      cc.add_char('\r')
+      cc.add_char('\x0c')
+      cc.negate()
+      Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+    when Option::Some('b') then
+      Result::Ok((single_transition(NfaTransition::WordBoundary), 0))
+    when Option::Some('B') then
+      Result::Ok((single_transition(NfaTransition::NotWordBoundary), 0))
+    when Option::Some('n') then
+      Result::Ok((single_transition(NfaTransition::Char('\n')), 0))
+    when Option::Some('r') then
+      Result::Ok((single_transition(NfaTransition::Char('\r')), 0))
+    when Option::Some('t') then
+      Result::Ok((single_transition(NfaTransition::Char('\t')), 0))
+    when Option::Some('0') then
+      Result::Ok((single_transition(NfaTransition::Char('\0')), 0))
+    when Option::Some(c) then
+      # Escaped literal
+      if c == '\\' || c == '.' || c == '*' || c == '+' || c == '?' ||
+         c == '[' || c == ']' || c == '(' || c == ')' || c == '{' ||
+         c == '}' || c == '|' || c == '^' || c == '$' then
+        Result::Ok((single_transition(NfaTransition::Char(c)), 0))
+      else
+        Result::Err(RegexError::InvalidEscape(self.pos - 1, c))
+      end
+    when Option::None then
+      Result::Err(RegexError::InvalidEscape(self.pos, '\\'))
+    end
+  end
+  
+  def parse_char_class(self: &mut RegexCompiler) -> Result[(Nfa, UInt), RegexError]
+    self.advance()  # consume '['
+    
+    let mut cc = CharClass::new()
+    
+    if self.peek() == Option::Some('^') then
+      self.advance()
+      cc.negate()
+    end
+    
+    while self.peek() != Option::Some(']') && self.pos < self.pattern.len() do
+      let c1 = match self.advance()
+      when Option::Some('\\') then self.parse_char_class_escape()?
+      when Option::Some(c) then c
+      when Option::None then return Result::Err(RegexError::InvalidCharClass(self.pos))
+      end
+      
+      if self.peek() == Option::Some('-') && self.pos + 1 < self.pattern.len() &&
+         self.pattern[self.pos + 1] != ']' then
+        self.advance()  # consume '-'
+        let c2 = match self.advance()
+        when Option::Some('\\') then self.parse_char_class_escape()?
+        when Option::Some(c) then c
+        when Option::None then return Result::Err(RegexError::InvalidCharClass(self.pos))
+        end
+        cc.add_range(c1, c2)
+      else
+        cc.add_char(c1)
+      end
+    end
+    
+    if self.advance() != Option::Some(']') then
+      return Result::Err(RegexError::InvalidCharClass(self.pos))
+    end
+    
+    Result::Ok((single_transition(NfaTransition::CharClass(cc)), 0))
+  end
+  
+  def parse_char_class_escape(self: &mut RegexCompiler) -> Result[char, RegexError]
+    match self.advance()
+    when Option::Some('n') then Result::Ok('\n')
+    when Option::Some('r') then Result::Ok('\r')
+    when Option::Some('t') then Result::Ok('\t')
+    when Option::Some('\\') then Result::Ok('\\')
+    when Option::Some(']') then Result::Ok(']')
+    when Option::Some('-') then Result::Ok('-')
+    when Option::Some('^') then Result::Ok('^')
+    when Option::Some(c) then Result::Ok(c)
+    when Option::None then Result::Err(RegexError::InvalidEscape(self.pos, '\\'))
+    end
+  end
+end
+
+# NFA construction helpers
+def single_transition(t: NfaTransition) -> Nfa
+  let mut states = Vec::new()
+  states.push(NfaState {
+    transitions: vec![(t, 1)],
+    is_accept: false
+  })
+  states.push(NfaState {
+    transitions: Vec::new(),
+    is_accept: true
+  })
+  Nfa { states: states, start: 0, accept: 1 }
+end
+
+def concatenate_nfa(a: Nfa, b: Nfa) -> Nfa
+  let mut states = Vec::new()
+  let b_offset = a.states.len()
+  
+  # Add states from a, adjusting transitions
+  for (i, state) in a.states.iter().enumerate() do
+    let mut s = state.clone()
+    if i == a.accept {
+      s.is_accept = false
+      s.transitions.push((NfaTransition::Epsilon, b.start + b_offset))
+    }
+    states.push(s)
+  end
+  
+  # Add states from b, adjusting transitions
+  for state in b.states do
+    let mut s = state
+    for (t, target) in &mut s.transitions do
+      *target = *target + b_offset
+    end
+    states.push(s)
+  end
+  
+  Nfa {
+    states: states,
+    start: a.start,
+    accept: b.accept + b_offset
+  }
+end
+
+def apply_star(nfa: Nfa, greedy: Bool) -> Nfa
+  let mut states = Vec::new()
+  let offset = 1
+  
+  # New start state
+  let new_start_transitions = if greedy then
+    vec![(NfaTransition::Epsilon, nfa.start + offset), (NfaTransition::Epsilon, nfa.states.len() + offset)]
+  else
+    vec![(NfaTransition::Epsilon, nfa.states.len() + offset), (NfaTransition::Epsilon, nfa.start + offset)]
+  end
+  
+  states.push(NfaState {
+    transitions: new_start_transitions,
+    is_accept: false
+  })
+  
+  # Original states
+  for (i, state) in nfa.states.iter().enumerate() do
+    let mut s = state.clone()
+    for (t, target) in &mut s.transitions do
+      *target = *target + offset
+    end
+    if i == nfa.accept {
+      s.is_accept = false
+      let loop_transitions = if greedy then
+        vec![(NfaTransition::Epsilon, nfa.start + offset), (NfaTransition::Epsilon, nfa.states.len() + offset)]
+      else
+        vec![(NfaTransition::Epsilon, nfa.states.len() + offset), (NfaTransition::Epsilon, nfa.start + offset)]
+      end
+      s.transitions.extend(loop_transitions)
+    }
+    states.push(s)
+  end
+  
+  # New accept state
+  states.push(NfaState {
+    transitions: Vec::new(),
+    is_accept: true
+  })
+  
+  Nfa {
+    states: states,
+    start: 0,
+    accept: states.len() - 1
+  }
+end
+
+def apply_plus(nfa: Nfa, greedy: Bool) -> Nfa
+  let mut states = Vec::new()
+  
+  # Original states
+  for (i, state) in nfa.states.iter().enumerate() do
+    let mut s = state.clone()
+    if i == nfa.accept {
+      s.is_accept = false
+      let loop_transitions = if greedy then
+        vec![(NfaTransition::Epsilon, nfa.start), (NfaTransition::Epsilon, nfa.states.len())]
+      else
+        vec![(NfaTransition::Epsilon, nfa.states.len()), (NfaTransition::Epsilon, nfa.start)]
+      end
+      s.transitions.extend(loop_transitions)
+    }
+    states.push(s)
+  end
+  
+  # New accept state
+  states.push(NfaState {
+    transitions: Vec::new(),
+    is_accept: true
+  })
+  
+  Nfa {
+    states: states,
+    start: nfa.start,
+    accept: states.len() - 1
+  }
+end
+
+def apply_optional(nfa: Nfa, greedy: Bool) -> Nfa
+  let mut states = Vec::new()
+  let offset = 1
+  
+  let new_start_transitions = if greedy then
+    vec![(NfaTransition::Epsilon, nfa.start + offset), (NfaTransition::Epsilon, nfa.states.len() + offset)]
+  else
+    vec![(NfaTransition::Epsilon, nfa.states.len() + offset), (NfaTransition::Epsilon, nfa.start + offset)]
+  end
+  
+  states.push(NfaState {
+    transitions: new_start_transitions,
+    is_accept: false
+  })
+  
+  for (i, state) in nfa.states.iter().enumerate() do
+    let mut s = state.clone()
+    for (t, target) in &mut s.transitions do
+      *target = *target + offset
+    end
+    if i == nfa.accept {
+      s.is_accept = false
+      s.transitions.push((NfaTransition::Epsilon, nfa.states.len() + offset))
+    }
+    states.push(s)
+  end
+  
+  states.push(NfaState {
+    transitions: Vec::new(),
+    is_accept: true
+  })
+  
+  Nfa {
+    states: states,
+    start: 0,
+    accept: states.len() - 1
+  }
+end
+
+def apply_repetition(nfa: Nfa, min: UInt, max: Option[UInt]) -> Nfa
+  # {n,m} = n required copies + (m-n) optional copies
+  let mut result = nfa.clone()
+  
+  for _ in 1..min do
+    result = concatenate_nfa(result, nfa.clone())
+  end
+  
+  match max
+  when Option::Some(m) then
+    for _ in min..m do
+      result = concatenate_nfa(result, apply_optional(nfa.clone(), true))
+    end
+  when Option::None then
+    result = concatenate_nfa(result, apply_star(nfa.clone(), true))
+  end
+  
+  result
+end
+
+# ———————————————————————————————————————————————————————————————
+# Regex Matching (NFA Simulation)
+# ———————————————————————————————————————————————————————————————
+
+struct Match
+  start: UInt
+  end: UInt
+  text: String
+  groups: Vec[Option[String]]
+end
+
+impl Regex
+  def is_match(self: &Regex, text: &str) -> Bool
+    self.find(text).is_some()
+  end
+  
+  def find(self: &Regex, text: &str) -> Option[Match]
+    let chars: Vec[char] = text.chars().collect()
+    
+    # Try matching at each position
+    for start in 0..=chars.len() do
+      match self.match_at(&chars, start)
+      when Option::Some((end, groups)) then
+        return Option::Some(Match {
+          start: start,
+          end: end,
+          text: chars[start..end].iter().collect(),
+          groups: groups
+        })
+      when Option::None then ()
+      end
+    end
+    
+    Option::None
+  end
+  
+  def find_all(self: &Regex, text: &str) -> Vec[Match]
+    let chars: Vec[char] = text.chars().collect()
+    let mut matches = Vec::new()
+    let mut pos = 0
+    
+    while pos <= chars.len() do
+      match self.match_at(&chars, pos)
+      when Option::Some((end, groups)) then
+        matches.push(Match {
+          start: pos,
+          end: end,
+          text: chars[pos..end].iter().collect(),
+          groups: groups
+        })
+        pos = if end > pos then end else pos + 1 end
+      when Option::None then
+        pos = pos + 1
+      end
+    end
+    
+    matches
+  end
+  
+  def replace(self: &Regex, text: &str, replacement: &str) -> String
+    self.replace_n(text, replacement, 0)
+  end
+  
+  def replace_n(self: &Regex, text: &str, replacement: &str, n: UInt) -> String
+    let chars: Vec[char] = text.chars().collect()
+    let mut result = String::new()
+    let mut pos = 0
+    let mut count = 0
+    
+    while pos <= chars.len() do
+      if n > 0 && count >= n then
+        break
+      end
+      
+      match self.match_at(&chars, pos)
+      when Option::Some((end, _)) then
+        result.push_str(replacement)
+        pos = if end > pos then end else pos + 1 end
+        count = count + 1
+      when Option::None then
+        if pos < chars.len() then
+          result.push(chars[pos])
+        end
+        pos = pos + 1
+      end
+    end
+    
+    # Append remaining
+    for i in pos..chars.len() do
+      result.push(chars[i])
+    end
+    
+    result
+  end
+  
+  def split(self: &Regex, text: &str) -> Vec[String]
+    let chars: Vec[char] = text.chars().collect()
+    let mut parts = Vec::new()
+    let mut pos = 0
+    let mut last_end = 0
+    
+    while pos <= chars.len() do
+      match self.match_at(&chars, pos)
+      when Option::Some((end, _)) then
+        parts.push(chars[last_end..pos].iter().collect())
+        last_end = end
+        pos = if end > pos then end else pos + 1 end
+      when Option::None then
+        pos = pos + 1
+      end
+    end
+    
+    parts.push(chars[last_end..].iter().collect())
+    parts
+  end
+  
+  def match_at(self: &Regex, chars: &[char], start: UInt) -> Option[(UInt, Vec[Option[String]])]
+    let mut current_states = Set::new()
+    self.epsilon_closure(self.nfa.start, &mut current_states)
+    
+    let mut pos = start
+    let mut last_accept = Option::None
+    
+    # Check if any initial state is accepting
+    if self.has_accept_state(&current_states) then
+      last_accept = Option::Some(pos)
+    end
+    
+    while pos < chars.len() && !current_states.is_empty() do
+      let c = chars[pos]
+      let mut next_states = Set::new()
+      
+      for state_id in &current_states do
+        let state = &self.nfa.states[*state_id]
+        for (transition, target) in &state.transitions do
+          if self.transition_matches(transition, c, chars, pos) then
+            self.epsilon_closure(*target, &mut next_states)
+          end
+        end
+      end
+      
+      current_states = next_states
+      pos = pos + 1
+      
+      if self.has_accept_state(&current_states) then
+        last_accept = Option::Some(pos)
+      end
+    end
+    
+    match last_accept
+    when Option::Some(end) then Option::Some((end, Vec::new()))
+    when Option::None then Option::None
+    end
+  end
+  
+  def epsilon_closure(self: &Regex, state_id: UInt, states: &mut Set[UInt]) -> Unit
+    if states.contains(&state_id) then
+      return
+    end
+    
+    states.insert(state_id)
+    
+    let state = &self.nfa.states[state_id]
+    for (transition, target) in &state.transitions do
+      match transition
+      when NfaTransition::Epsilon then
+        self.epsilon_closure(*target, states)
+      when _ then ()
+      end
+    end
+  end
+  
+  def has_accept_state(self: &Regex, states: &Set[UInt]) -> Bool
+    for state_id in states do
+      if self.nfa.states[*state_id].is_accept then
+        return true
+      end
+    end
+    false
+  end
+  
+  def transition_matches(self: &Regex, t: &NfaTransition, c: char, chars: &[char], pos: UInt) -> Bool
+    let c = if self.flags.case_insensitive then c.to_lowercase() else c end
+    
+    match t
+    when NfaTransition::Epsilon then false  # handled separately
+    when NfaTransition::Char(expected) then
+      let expected = if self.flags.case_insensitive then expected.to_lowercase() else *expected end
+      c == expected
+    when NfaTransition::CharRange(start, end) then c >= *start && c <= *end
+    when NfaTransition::CharClass(cc) then cc.matches(c)
+    when NfaTransition::Any then true
+    when NfaTransition::AnyNotNewline then c != '\n'
+    when NfaTransition::StartOfLine | NfaTransition::StartOfString then false  # zero-width
+    when NfaTransition::EndOfLine | NfaTransition::EndOfString then false  # zero-width
+    when NfaTransition::WordBoundary then false  # zero-width
+    when NfaTransition::NotWordBoundary then false  # zero-width
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 2: PARSER COMBINATORS
+# ═══════════════════════════════════════════════════════════════
+
+# ———————————————————————————————————————————————————————————————
+# Parser Types
+# ———————————————————————————————————————————————————————————————
+
+struct ParseState
+  input: String
+  pos: UInt
+  line: UInt
+  col: UInt
+end
+
+def ParseState::new(input: &str) -> ParseState
+  ParseState {
+    input: input.to_string(),
+    pos: 0,
+    line: 1,
+    col: 1
+  }
+end
+
+impl ParseState
+  def peek(self: &ParseState) -> Option[char]
+    if self.pos < self.input.len() then
+      Option::Some(self.input.char_at(self.pos))
+    else
+      Option::None
+    end
+  end
+  
+  def advance(self: &mut ParseState) -> Option[char]
+    match self.peek()
+    when Option::Some(c) then
+      self.pos = self.pos + 1
+      if c == '\n' then
+        self.line = self.line + 1
+        self.col = 1
+      else
+        self.col = self.col + 1
+      end
+      Option::Some(c)
+    when Option::None then Option::None
+    end
+  end
+  
+  def remaining(self: &ParseState) -> &str
+    self.input.slice(self.pos, self.input.len())
+  end
+  
+  def is_eof(self: &ParseState) -> Bool
+    self.pos >= self.input.len()
+  end
+end
+
+enum ParseError
+  Expected(String, UInt, UInt)
+  UnexpectedEof
+  Custom(String)
+end
+
+def parse_error_message(e: &ParseError) -> String
+  match e
+  when ParseError::Expected(msg, line, col) then
+    format!("expected {} at line {}:{}", msg, line, col)
+  when ParseError::UnexpectedEof then "unexpected end of input"
+  when ParseError::Custom(msg) then msg.clone()
+  end
+end
+
+type ParseResult[T] = Result[(T, ParseState), ParseError]
+
+# Parser is a function from ParseState to ParseResult[T]
+struct Parser[T]
+  run: fn(ParseState) -> ParseResult[T]
+end
+
+impl[T] Parser[T]
+  def parse(self: &Parser[T], input: &str) -> Result[T, ParseError]
+    let state = ParseState::new(input)
+    match (self.run)(state)
+    when Result::Ok((value, _)) then Result::Ok(value)
+    when Result::Err(e) then Result::Err(e)
+    end
+  end
+  
+  def map[U](self: Parser[T], f: fn(T) -> U) -> Parser[U]
+    Parser {
+      run: |state| {
+        match (self.run)(state)
+        when Result::Ok((value, next)) then Result::Ok((f(value), next))
+        when Result::Err(e) then Result::Err(e)
+        end
+      }
+    }
+  end
+  
+  def flat_map[U](self: Parser[T], f: fn(T) -> Parser[U]) -> Parser[U]
+    Parser {
+      run: |state| {
+        match (self.run)(state)
+        when Result::Ok((value, next)) then (f(value).run)(next)
+        when Result::Err(e) then Result::Err(e)
+        end
+      }
+    }
+  end
+  
+  def and[U](self: Parser[T], other: Parser[U]) -> Parser[(T, U)]
+    Parser {
+      run: |state| {
+        match (self.run)(state)
+        when Result::Ok((v1, next)) then
+          match (other.run)(next)
+          when Result::Ok((v2, final_state)) then Result::Ok(((v1, v2), final_state))
+          when Result::Err(e) then Result::Err(e)
+          end
+        when Result::Err(e) then Result::Err(e)
+        end
+      }
+    }
+  end
+  
+  def or(self: Parser[T], other: Parser[T]) -> Parser[T]
+    Parser {
+      run: |state| {
+        match (self.run)(state.clone())
+        when Result::Ok(result) then Result::Ok(result)
+        when Result::Err(_) then (other.run)(state)
+        end
+      }
+    }
+  end
+  
+  def optional(self: Parser[T]) -> Parser[Option[T]]
+    Parser {
+      run: |state| {
+        match (self.run)(state.clone())
+        when Result::Ok((value, next)) then Result::Ok((Option::Some(value), next))
+        when Result::Err(_) then Result::Ok((Option::None, state))
+        end
+      }
+    }
+  end
+  
+  def many(self: Parser[T]) -> Parser[Vec[T]]
+    Parser {
+      run: |state| {
+        let mut results = Vec::new()
+        let mut current = state
+        
+        loop
+          match (self.run)(current.clone())
+          when Result::Ok((value, next)) then
+            results.push(value)
+            current = next
+          when Result::Err(_) then break
+          end
+        end
+        
+        Result::Ok((results, current))
+      }
+    }
+  end
+  
+  def many1(self: Parser[T]) -> Parser[Vec[T]]
+    Parser {
+      run: |state| {
+        match (self.run)(state)
+        when Result::Ok((first, next)) then
+          let mut results = vec![first]
+          let mut current = next
+          
+          loop
+            match (self.run)(current.clone())
+            when Result::Ok((value, next_state)) then
+              results.push(value)
+              current = next_state
+            when Result::Err(_) then break
+            end
+          end
+          
+          Result::Ok((results, current))
+        when Result::Err(e) then Result::Err(e)
+        end
+      }
+    }
+  end
+  
+  def skip[U](self: Parser[T], other: Parser[U]) -> Parser[T]
+    self.and(other).map(|(t, _)| t)
+  end
+  
+  def then[U](self: Parser[T], other: Parser[U]) -> Parser[U]
+    self.and(other).map(|(_, u)| u)
+  end
+  
+  def between[L, R](self: Parser[T], left: Parser[L], right: Parser[R]) -> Parser[T]
+    left.then(self).skip(right)
+  end
+  
+  def sep_by[S](self: Parser[T], sep: Parser[S]) -> Parser[Vec[T]]
+    self.sep_by1(sep).or(pure(Vec::new()))
+  end
+  
+  def sep_by1[S](self: Parser[T], sep: Parser[S]) -> Parser[Vec[T]]
+    self.and(sep.then(self.clone()).many()).map(|(first, rest)| {
+      let mut results = vec![first]
+      results.extend(rest)
+      results
+    })
+  end
+  
+  def label(self: Parser[T], name: &str) -> Parser[T]
+    let name = name.to_string()
+    Parser {
+      run: |state| {
+        match (self.run)(state.clone())
+        when Result::Ok(result) then Result::Ok(result)
+        when Result::Err(_) then
+          Result::Err(ParseError::Expected(name.clone(), state.line, state.col))
+        end
+      }
+    }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Basic Parsers
+# ———————————————————————————————————————————————————————————————
+
+def pure[T](value: T) -> Parser[T]
+  Parser {
+    run: |state| Result::Ok((value, state))
+  }
+end
+
+def fail[T](msg: &str) -> Parser[T]
+  let msg = msg.to_string()
+  Parser {
+    run: |_| Result::Err(ParseError::Custom(msg.clone()))
+  }
+end
+
+def any_char() -> Parser[char]
+  Parser {
+    run: |mut state| {
+      match state.advance()
+      when Option::Some(c) then Result::Ok((c, state))
+      when Option::None then Result::Err(ParseError::UnexpectedEof)
+      end
+    }
+  }
+end
+
+def char_p(expected: char) -> Parser[char]
+  Parser {
+    run: |mut state| {
+      match state.peek()
+      when Option::Some(c) then
+        if c == expected then
+          state.advance()
+          Result::Ok((c, state))
+        else
+          Result::Err(ParseError::Expected(format!("'{}'", expected), state.line, state.col))
+        end
+      when Option::None then Result::Err(ParseError::UnexpectedEof)
+      end
+    }
+  }
+end
+
+def satisfy(pred: fn(char) -> Bool) -> Parser[char]
+  Parser {
+    run: |mut state| {
+      match state.peek()
+      when Option::Some(c) then
+        if pred(c) then
+          state.advance()
+          Result::Ok((c, state))
+        else
+          Result::Err(ParseError::Expected("character matching predicate", state.line, state.col))
+        end
+      when Option::None then Result::Err(ParseError::UnexpectedEof)
+      end
+    }
+  }
+end
+
+def one_of(chars: &str) -> Parser[char]
+  let char_set: Set[char] = chars.chars().collect()
+  satisfy(|c| char_set.contains(&c))
+end
+
+def none_of(chars: &str) -> Parser[char]
+  let char_set: Set[char] = chars.chars().collect()
+  satisfy(|c| !char_set.contains(&c))
+end
+
+def string_p(expected: &str) -> Parser[String]
+  let expected = expected.to_string()
+  Parser {
+    run: |mut state| {
+      let chars: Vec[char] = expected.chars().collect()
+      for c in &chars do
+        match state.peek()
+        when Option::Some(actual) then
+          if actual == *c then
+            state.advance()
+          else
+            return Result::Err(ParseError::Expected(format!("\"{}\"", expected), state.line, state.col))
+          end
+        when Option::None then
+          return Result::Err(ParseError::UnexpectedEof)
+        end
+      end
+      Result::Ok((expected.clone(), state))
+    }
+  }
+end
+
+def digit() -> Parser[char]
+  satisfy(|c| c >= '0' && c <= '9').label("digit")
+end
+
+def letter() -> Parser[char]
+  satisfy(|c| (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')).label("letter")
+end
+
+def alphanumeric() -> Parser[char]
+  digit().or(letter()).label("alphanumeric")
+end
+
+def whitespace() -> Parser[char]
+  satisfy(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r').label("whitespace")
+end
+
+def spaces() -> Parser[Vec[char]]
+  whitespace().many()
+end
+
+def spaces1() -> Parser[Vec[char]]
+  whitespace().many1()
+end
+
+def newline() -> Parser[char]
+  char_p('\n').label("newline")
+end
+
+def eof() -> Parser[Unit]
+  Parser {
+    run: |state| {
+      if state.is_eof() then
+        Result::Ok(((), state))
+      else
+        Result::Err(ParseError::Expected("end of input", state.line, state.col))
+      end
+    }
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Number Parsers
+# ———————————————————————————————————————————————————————————————
+
+def integer() -> Parser[Int]
+  let sign = char_p('-').optional()
+  let digits = digit().many1()
+  
+  sign.and(digits).map(|(s, ds)| {
+    let num_str: String = ds.iter().collect()
+    let value = num_str.parse_int().unwrap_or(0)
+    match s
+    when Option::Some(_) then -value
+    when Option::None then value
+    end
+  }).label("integer")
+end
+
+def unsigned_integer() -> Parser[UInt]
+  digit().many1().map(|ds| {
+    let num_str: String = ds.iter().collect()
+    num_str.parse_uint().unwrap_or(0)
+  }).label("unsigned integer")
+end
+
+def float_p() -> Parser[f64]
+  let sign = char_p('-').optional()
+  let integer_part = digit().many1()
+  let decimal_part = char_p('.').then(digit().many1()).optional()
+  let exponent = one_of("eE").then(one_of("+-").optional()).and(digit().many1()).optional()
+  
+  sign.and(integer_part).and(decimal_part).and(exponent).map(|(((s, int_ds), dec), exp)| {
+    let mut num_str = String::new()
+    match s
+    when Option::Some(_) then num_str.push('-')
+    when Option::None then ()
+    end
+    
+    for c in int_ds do
+      num_str.push(c)
+    end
+    
+    match dec
+    when Option::Some(ds) then
+      num_str.push('.')
+      for c in ds do
+        num_str.push(c)
+      end
+    when Option::None then ()
+    end
+    
+    match exp
+    when Option::Some((sign, ds)) then
+      num_str.push('e')
+      match sign
+      when Option::Some(s) then num_str.push(s)
+      when Option::None then ()
+      end
+      for c in ds do
+        num_str.push(c)
+      end
+    when Option::None then ()
+    end
+    
+    num_str.parse_f64().unwrap_or(0.0)
+  }).label("float")
+end
+
+# ———————————————————————————————————————————————————————————————
+# String Parsers
+# ———————————————————————————————————————————————————————————————
+
+def quoted_string() -> Parser[String]
+  let escape = char_p('\\').then(any_char()).map(|c| {
+    match c
+    when 'n' then '\n'
+    when 't' then '\t'
+    when 'r' then '\r'
+    when '\\' then '\\'
+    when '"' then '"'
+    when _ then c
+    end
+  })
+  
+  let content = escape.or(none_of("\"\\"))
+  
+  char_p('"').then(content.many()).skip(char_p('"')).map(|cs| cs.iter().collect())
+end
+
+def identifier() -> Parser[String]
+  let first = letter().or(char_p('_'))
+  let rest = alphanumeric().or(char_p('_')).many()
+  
+  first.and(rest).map(|(f, rs)| {
+    let mut s = String::new()
+    s.push(f)
+    for c in rs do
+      s.push(c)
+    end
+    s
+  }).label("identifier")
+end
+
+def take_while(pred: fn(char) -> Bool) -> Parser[String]
+  satisfy(pred).many().map(|cs| cs.iter().collect())
+end
+
+def take_while1(pred: fn(char) -> Bool) -> Parser[String]
+  satisfy(pred).many1().map(|cs| cs.iter().collect())
+end
+
+def take_until(terminator: &str) -> Parser[String]
+  let term = terminator.to_string()
+  Parser {
+    run: |mut state| {
+      let mut result = String::new()
+      while !state.is_eof() do
+        if state.remaining().starts_with(term.as_str()) then
+          break
+        end
+        result.push(state.advance().unwrap())
+      end
+      Result::Ok((result, state))
+    }
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Combinator Utilities
+# ———————————————————————————————————————————————————————————————
+
+def choice[T](parsers: Vec[Parser[T]]) -> Parser[T]
+  if parsers.is_empty() then
+    return fail("empty choice")
+  end
+  
+  let mut result = parsers[0].clone()
+  for i in 1..parsers.len() do
+    result = result.or(parsers[i].clone())
+  end
+  result
+end
+
+def sequence[T](parsers: Vec[Parser[T]]) -> Parser[Vec[T]]
+  Parser {
+    run: |state| {
+      let mut results = Vec::new()
+      let mut current = state
+      
+      for parser in &parsers do
+        match (parser.run)(current)
+        when Result::Ok((value, next)) then
+          results.push(value)
+          current = next
+        when Result::Err(e) then return Result::Err(e)
+        end
+      end
+      
+      Result::Ok((results, current))
+    }
+  }
+end
+
+def lazy[T](thunk: fn() -> Parser[T]) -> Parser[T]
+  Parser {
+    run: |state| (thunk().run)(state)
+  }
+end
+
+def not_followed_by[T](parser: Parser[T]) -> Parser[Unit]
+  Parser {
+    run: |state| {
+      match (parser.run)(state.clone())
+      when Result::Ok(_) then
+        Result::Err(ParseError::Expected("not to match", state.line, state.col))
+      when Result::Err(_) then Result::Ok(((), state))
+      end
+    }
+  }
+end
+
+def lookahead[T](parser: Parser[T]) -> Parser[T]
+  Parser {
+    run: |state| {
+      match (parser.run)(state.clone())
+      when Result::Ok((value, _)) then Result::Ok((value, state))
+      when Result::Err(e) then Result::Err(e)
+      end
+    }
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Expression Parsing
+# ———————————————————————————————————————————————————————————————
+
+enum Assoc
+  Left
+  Right
+end
+
+struct Operator[T]
+  symbol: String
+  precedence: UInt
+  assoc: Assoc
+  apply: fn(T, T) -> T
+end
+
+def expr_parser[T](atom: Parser[T], operators: Vec[Operator[T]]) -> Parser[T]
+  let mut ops_by_prec: Map[UInt, Vec[&Operator[T]]] = Map::new()
+  let mut max_prec = 0
+  
+  for op in &operators do
+    if op.precedence > max_prec then
+      max_prec = op.precedence
+    end
+    ops_by_prec.entry(op.precedence).or_insert(Vec::new()).push(op)
+  end
+  
+  let mut current = atom
+  
+  for prec in 1..=max_prec do
+    match ops_by_prec.get(&prec)
+    when Option::Some(ops) then
+      let left_assoc = ops.iter().any(|op| matches!(&op.assoc, Assoc::Left))
+      
+      if left_assoc then
+        current = left_assoc_expr(current, ops.clone())
+      else
+        current = right_assoc_expr(current, ops.clone())
+      end
+    when Option::None then ()
+    end
+  end
+  
+  current
+end
+
+def left_assoc_expr[T](operand: Parser[T], ops: Vec[&Operator[T]>) -> Parser[T]
+  let op_parsers: Vec[Parser[(&Operator[T], T)>] = ops.iter().map(|op| {
+    spaces().then(string_p(op.symbol.as_str())).then(spaces()).then(operand.clone())
+      .map(|t| (op, t))
+  }).collect()
+  
+  operand.and(choice(op_parsers).many()).map(|(first, rest)| {
+    let mut result = first
+    for (op, operand) in rest do
+      result = (op.apply)(result, operand)
+    end
+    result
+  })
+end
+
+def right_assoc_expr[T](operand: Parser[T], ops: Vec[&Operator[T]>) -> Parser[T]
+  lazy(|| {
+    operand.clone().and(
+      spaces().then(
+        choice(ops.iter().map(|op| string_p(op.symbol.as_str()).map(|_| op)).collect())
+      ).then(spaces()).then(right_assoc_expr(operand.clone(), ops.clone())).optional()
+    ).map(|(first, rest)| {
+      match rest
+      when Option::Some((op, right)) then (op.apply)(first, right)
+      when Option::None then first
+      end
+    })
+  })
+end

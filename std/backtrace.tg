@@ -1,0 +1,816 @@
+# Tangerine Standard Library — std::backtrace
+#
+# Runtime backtrace capture and display for debugging.
+# Uses DWARF frame info on Unix/macOS, or platform-specific mechanisms.
+#
+# Backtraces are captured at panic sites and available on demand.
+
+use std::core::{Option, Result, Vec, String, panic}
+use std::fmt::{format, Display}
+use std::io::{eprintln}
+use std::env::{get_env}
+
+# ———————————————————————————————————————————————————————————————
+# Backtrace Status
+# ———————————————————————————————————————————————————————————————
+
+enum BacktraceStatus
+  Captured       # Backtrace was successfully captured
+  Disabled       # Backtrace capture is disabled by environment
+  Unsupported    # Platform does not support backtrace capture
+end
+
+# ———————————————————————————————————————————————————————————————
+# Stack Frame
+# ———————————————————————————————————————————————————————————————
+
+struct StackFrame
+  # Instruction pointer / return address
+  ip: UInt
+  
+  # Symbol name (demangled if possible)
+  symbol_name: Option[String]
+  
+  # Source file path (from debug info)
+  file: Option[String]
+  
+  # Source line number
+  line: Option[UInt]
+  
+  # Source column number
+  column: Option[UInt]
+  
+  # Module / shared library name
+  module_name: Option[String]
+  
+  # Offset within the symbol
+  symbol_offset: Option[UInt]
+end
+
+def stack_frame_new(ip: UInt) -> StackFrame
+  StackFrame {
+    ip: ip,
+    symbol_name: Option::None,
+    file: Option::None,
+    line: Option::None,
+    column: Option::None,
+    module_name: Option::None,
+    symbol_offset: Option::None
+  }
+end
+
+impl Display for StackFrame
+  def fmt(self: &Self) -> String
+    mut out = ""
+    
+    match self.symbol_name
+    when Option::Some(name) then
+      out = out + name
+    when Option::None then
+      out = out + "<unknown>"
+    end
+    
+    match self.symbol_offset
+    when Option::Some(offset) then
+      out = out + "+0x" + uint_to_hex(offset)
+    when Option::None then ()
+    end
+    
+    match self.file
+    when Option::Some(file) then
+      out = out + "\n        at " + file
+      match self.line
+      when Option::Some(line) then
+        out = out + ":" + line.to_string()
+        match self.column
+        when Option::Some(col) then
+          out = out + ":" + col.to_string()
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    when Option::None then
+      out = out + "\n        at 0x" + uint_to_hex(self.ip)
+    end
+    
+    out
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Backtrace
+# ———————————————————————————————————————————————————————————————
+
+struct Backtrace
+  frames: Vec[StackFrame]
+  status: BacktraceStatus
+end
+
+def backtrace_new() -> Backtrace
+  Backtrace {
+    frames: Vec::new(),
+    status: BacktraceStatus::Disabled
+  }
+end
+
+# Capture a backtrace at the current call site.
+# Respects the TANGERINE_BACKTRACE environment variable:
+#   - "0" or unset: backtraces disabled (returns empty)
+#   - "1": capture backtrace
+#   - "full": capture backtrace with all frames (including runtime)
+def capture() -> Backtrace
+  let env_val = get_env("TANGERINE_BACKTRACE")
+  
+  match env_val
+  when Option::None then
+    return Backtrace {
+      frames: Vec::new(),
+      status: BacktraceStatus::Disabled
+    }
+  when Option::Some(val) then
+    if val == "0" then
+      return Backtrace {
+        frames: Vec::new(),
+        status: BacktraceStatus::Disabled
+      }
+    end
+    
+    let include_runtime = val == "full"
+    capture_frames(include_runtime)
+  end
+end
+
+# Force-capture a backtrace regardless of environment settings.
+def capture_force() -> Backtrace
+  capture_frames(true)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Platform-specific frame capture
+# ———————————————————————————————————————————————————————————————
+
+# Maximum number of frames to capture
+let MAX_FRAMES: UInt = 128
+
+# External frame capture functions
+extern "C"
+  # POSIX backtrace API
+  def backtrace(buffer: Ptr[Ptr[Unit]], size: Int) -> Int
+  def backtrace_symbols(buffer: Ptr[Ptr[Unit]], size: Int) -> Ptr[Ptr[u8]]
+  
+  # dladdr for symbol resolution (POSIX)
+  def dladdr(addr: Ptr[Unit], info: Ptr[DlInfo]) -> Int
+  
+  # Free for cleanup
+  def free(ptr: Ptr[Unit]) -> Unit
+end
+
+# dladdr info structure
+struct DlInfo
+  dli_fname: Ptr[u8]     # Pathname of shared object
+  dli_fbase: Ptr[Unit]   # Base address of shared object
+  dli_sname: Ptr[u8]     # Name of nearest symbol
+  dli_saddr: Ptr[Unit]   # Exact address of symbol
+end
+
+def capture_frames(include_runtime: Bool) -> Backtrace
+  mut frames = Vec::new()
+  
+  # Allocate buffer for return addresses
+  mut buffer: Array[Ptr[Unit], 128] = unsafe { uninitialized() }
+  
+  # Capture raw frame addresses
+  let num_frames = unsafe { backtrace(buffer.as_mut_ptr(), MAX_FRAMES as Int) }
+  
+  if num_frames <= 0 then
+    return Backtrace {
+      frames: frames,
+      status: BacktraceStatus::Unsupported
+    }
+  end
+  
+  # Skip first 2 frames (capture_frames + capture/capture_force)
+  let skip = if include_runtime then 0 else 2 end
+  
+  mut i = skip
+  while i < num_frames as UInt do
+    let addr = unsafe { *buffer.offset(i) }
+    mut frame = stack_frame_new(addr as UInt)
+    
+    # Resolve symbol info via dladdr
+    mut info: DlInfo = unsafe { zeroed() }
+    let resolved = unsafe { dladdr(addr, &mut info as Ptr[DlInfo]) }
+    
+    if resolved != 0 then
+      # Symbol name
+      if !info.dli_sname.is_null() then
+        let raw_name = unsafe { cstr_to_string(info.dli_sname) }
+        frame.symbol_name = Option::Some(demangle(raw_name))
+      end
+      
+      # Module name
+      if !info.dli_fname.is_null() then
+        let mod_path = unsafe { cstr_to_string(info.dli_fname) }
+        frame.module_name = Option::Some(mod_path)
+      end
+      
+      # Symbol offset
+      if !info.dli_saddr.is_null() then
+        let offset = (addr as UInt) - (info.dli_saddr as UInt)
+        frame.symbol_offset = Option::Some(offset)
+      end
+    end
+    
+    # Try to resolve source location from DWARF debug info
+    match resolve_dwarf_location(addr as UInt)
+    when Option::Some(loc) then
+      frame.file = Option::Some(loc.file)
+      frame.line = Option::Some(loc.line)
+      frame.column = loc.column
+    when Option::None then ()
+    end
+    
+    # Filter out runtime frames if not requested
+    if !include_runtime then
+      match frame.symbol_name
+      when Option::Some(name) then
+        if name.starts_with("_tg_runtime_") ||
+           name.starts_with("__libc_") ||
+           name == "_start" ||
+           name == "main" then
+          i = i + 1
+          continue
+        end
+      when Option::None then ()
+      end
+    end
+    
+    frames.push(frame)
+    i = i + 1
+  end
+  
+  Backtrace {
+    frames: frames,
+    status: BacktraceStatus::Captured
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# DWARF Debug Info Location Resolution
+# ———————————————————————————————————————————————————————————————
+
+struct SourceLocation
+  file: String
+  line: UInt
+  column: Option[UInt]
+end
+
+# Resolve a program counter address to source location using DWARF info.
+# This reads the .debug_line section of the current executable.
+def resolve_dwarf_location(pc: UInt) -> Option[SourceLocation]
+  # Read the executable path
+  let exe_path = get_executable_path()
+  
+  match exe_path
+  when Option::None then return Option::None
+  when Option::Some(path) then
+    # Parse DWARF .debug_line section
+    match parse_debug_line_section(path, pc)
+    when Option::Some(loc) then Option::Some(loc)
+    when Option::None then Option::None
+    end
+  end
+end
+
+def get_executable_path() -> Option[String]
+  # On macOS: use _NSGetExecutablePath
+  # On Linux: read /proc/self/exe
+  match get_env("_")
+  when Option::Some(path) then Option::Some(path)
+  when Option::None then
+    # Try /proc/self/exe on Linux
+    match std::fs::read_link("/proc/self/exe")
+    when Result::Ok(path) then Option::Some(path)
+    when Result::Err(_) then Option::None
+    end
+  end
+end
+
+# Parse the DWARF .debug_line section to find source location for a given PC.
+# Uses a simplified line number state machine (DWARF v4).
+def parse_debug_line_section(exe_path: String, target_pc: UInt) -> Option[SourceLocation]
+  # Read the executable file
+  match std::fs::read_file_bytes(exe_path)
+  when Result::Err(_) then return Option::None
+  when Result::Ok(bytes) then
+    # Find the .debug_line section offset from the Mach-O/ELF section headers
+    let section = find_debug_line_section(&bytes)
+    
+    match section
+    when Option::None then return Option::None
+    when Option::Some(sec) then
+      # Parse the line number program
+      mut offset = sec.offset
+      let end_offset = sec.offset + sec.size
+      
+      # Parse unit header
+      if offset + 4 > end_offset then return Option::None end
+      let unit_length = read_u32_le(&bytes, offset)
+      offset = offset + 4
+      
+      let version = read_u16_le(&bytes, offset)
+      offset = offset + 2
+      
+      let header_length = read_u32_le(&bytes, offset)
+      offset = offset + 4
+      
+      let min_insn_length = bytes[offset] as UInt
+      offset = offset + 1
+      
+      # DWARF v4: max_ops_per_instruction
+      if version >= 4 then
+        offset = offset + 1  # max_ops_per_instruction
+      end
+      
+      let default_is_stmt = bytes[offset] as UInt
+      offset = offset + 1
+      
+      let line_base = bytes[offset] as Int
+      offset = offset + 1
+      
+      let line_range = bytes[offset] as UInt
+      offset = offset + 1
+      
+      let opcode_base = bytes[offset] as UInt
+      offset = offset + 1
+      
+      # Skip standard opcode lengths
+      offset = offset + (opcode_base - 1) as UInt
+      
+      # Parse include directories
+      mut dirs = Vec::new()
+      dirs.push("".to_string())  # Current directory
+      while offset < end_offset && bytes[offset] != 0 do
+        let dir = read_null_terminated_string(&bytes, &mut offset)
+        dirs.push(dir)
+      end
+      offset = offset + 1  # Skip null terminator
+      
+      # Parse file names
+      mut files = Vec::new()
+      files.push("".to_string())  # Index 0 unused
+      while offset < end_offset && bytes[offset] != 0 do
+        let file_name = read_null_terminated_string(&bytes, &mut offset)
+        let dir_index = read_uleb128(&bytes, &mut offset)
+        let _mod_time = read_uleb128(&bytes, &mut offset)
+        let _file_length = read_uleb128(&bytes, &mut offset)
+        
+        if dir_index > 0 && dir_index < dirs.len() then
+          files.push(dirs[dir_index] + "/" + file_name)
+        else
+          files.push(file_name)
+        end
+      end
+      offset = offset + 1  # Skip null terminator
+      
+      # Execute line number program (state machine)
+      mut address: UInt = 0
+      mut file_idx: UInt = 1
+      mut line: UInt = 1
+      mut column: UInt = 0
+      mut is_stmt = default_is_stmt != 0
+      
+      mut best_match: Option[SourceLocation] = Option::None
+      mut best_distance: UInt = UInt::MAX
+      
+      while offset < end_offset do
+        let opcode = bytes[offset] as UInt
+        offset = offset + 1
+        
+        if opcode == 0 then
+          # Extended opcode
+          let ext_len = read_uleb128(&bytes, &mut offset)
+          let ext_opcode = bytes[offset] as UInt
+          offset = offset + 1
+          
+          if ext_opcode == 1 then
+            # DW_LNE_end_sequence
+            address = 0
+            file_idx = 1
+            line = 1
+            column = 0
+          elsif ext_opcode == 2 then
+            # DW_LNE_set_address
+            address = read_usize_le(&bytes, offset)
+            offset = offset + 8  # 64-bit address
+          else
+            offset = offset + (ext_len - 1) as UInt
+          end
+        elsif opcode < opcode_base then
+          # Standard opcode
+          if opcode == 1 then
+            # DW_LNS_copy — emit row
+            if address <= target_pc then
+              let distance = target_pc - address
+              if distance < best_distance then
+                best_distance = distance
+                let file_str = if file_idx < files.len() then
+                  files[file_idx].clone()
+                else
+                  "<unknown>".to_string()
+                end
+                best_match = Option::Some(SourceLocation {
+                  file: file_str,
+                  line: line,
+                  column: if column > 0 then Option::Some(column) else Option::None end
+                })
+              end
+            end
+          elsif opcode == 2 then
+            # DW_LNS_advance_pc
+            let advance = read_uleb128(&bytes, &mut offset)
+            address = address + advance * min_insn_length
+          elsif opcode == 3 then
+            # DW_LNS_advance_line
+            let advance = read_sleb128(&bytes, &mut offset)
+            line = (line as Int + advance) as UInt
+          elsif opcode == 4 then
+            # DW_LNS_set_file
+            file_idx = read_uleb128(&bytes, &mut offset)
+          elsif opcode == 5 then
+            # DW_LNS_set_column
+            column = read_uleb128(&bytes, &mut offset)
+          elsif opcode == 6 then
+            # DW_LNS_negate_stmt
+            is_stmt = !is_stmt
+          elsif opcode == 7 then
+            # DW_LNS_set_basic_block — no operands
+            ()
+          elsif opcode == 8 then
+            # DW_LNS_const_add_pc
+            let adjusted = (255 - opcode_base) / line_range
+            address = address + adjusted * min_insn_length
+          elsif opcode == 9 then
+            # DW_LNS_fixed_advance_pc
+            let advance = read_u16_le(&bytes, offset) as UInt
+            offset = offset + 2
+            address = address + advance
+          else
+            # Skip unknown standard opcodes
+            ()
+          end
+        else
+          # Special opcode
+          let adjusted = opcode - opcode_base
+          let addr_advance = (adjusted / line_range) * min_insn_length
+          let line_advance = line_base + (adjusted % line_range) as Int
+          
+          address = address + addr_advance
+          line = (line as Int + line_advance) as UInt
+          
+          # Emit row
+          if address <= target_pc then
+            let distance = target_pc - address
+            if distance < best_distance then
+              best_distance = distance
+              let file_str = if file_idx < files.len() then
+                files[file_idx].clone()
+              else
+                "<unknown>".to_string()
+              end
+              best_match = Option::Some(SourceLocation {
+                file: file_str,
+                line: line,
+                column: if column > 0 then Option::Some(column) else Option::None end
+              })
+            end
+          end
+        end
+      end
+      
+      best_match
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Symbol Demangling
+# ———————————————————————————————————————————————————————————————
+
+# Demangle Tangerine symbol names.
+# Tangerine uses a simple mangling scheme:
+#   _TG<len><module>__<len><function>[__<generic_params>]
+def demangle(mangled: String) -> String
+  if !mangled.starts_with("_TG") then
+    return mangled  # Not a Tangerine symbol
+  end
+  
+  mut result = ""
+  mut pos: UInt = 3  # Skip "_TG"
+  mut first_segment = true
+  
+  while pos < mangled.len() do
+    # Read length prefix
+    mut len_str = ""
+    while pos < mangled.len() && mangled.char_at(pos).is_digit() do
+      len_str = len_str + mangled.char_at(pos).to_string()
+      pos = pos + 1
+    end
+    
+    if len_str.is_empty() then
+      # Skip separator "__"
+      if pos + 1 < mangled.len() && mangled.slice(pos, pos + 2) == "__" then
+        result = result + "::"
+        pos = pos + 2
+        first_segment = false
+        continue
+      else
+        break
+      end
+    end
+    
+    let seg_len = len_str.parse_uint().unwrap_or(0)
+    if seg_len == 0 || pos + seg_len > mangled.len() then break end
+    
+    if !first_segment then
+      result = result + "::"
+    end
+    result = result + mangled.slice(pos, pos + seg_len)
+    pos = pos + seg_len
+    first_segment = false
+  end
+  
+  if result.is_empty() then mangled else result end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Display
+# ———————————————————————————————————————————————————————————————
+
+impl Display for Backtrace
+  def fmt(self: &Self) -> String
+    match self.status
+    when BacktraceStatus::Disabled then
+      return "backtrace disabled (set TANGERINE_BACKTRACE=1 to enable)"
+    when BacktraceStatus::Unsupported then
+      return "backtrace not supported on this platform"
+    when BacktraceStatus::Captured then ()
+    end
+    
+    if self.frames.is_empty() then
+      return "  <empty backtrace>"
+    end
+    
+    mut out = ""
+    mut i: UInt = 0
+    for frame in self.frames do
+      out = out + "  " + i.to_string() + ": " + frame.fmt() + "\n"
+      i = i + 1
+    end
+    out
+  end
+end
+
+def print_backtrace(bt: &Backtrace) -> Unit
+  eprintln("stack backtrace:")
+  eprintln(bt.fmt())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Integration with panic
+# ———————————————————————————————————————————————————————————————
+
+# Enhanced panic handler that captures and prints a backtrace.
+def panic_with_backtrace(msg: String) -> Never
+  eprintln("thread 'main' panicked at '" + msg + "'")
+  
+  let bt = capture()
+  match bt.status
+  when BacktraceStatus::Captured then
+    print_backtrace(&bt)
+  when BacktraceStatus::Disabled then
+    eprintln("note: run with `TANGERINE_BACKTRACE=1` for a backtrace")
+  when BacktraceStatus::Unsupported then ()
+  end
+  
+  panic(msg)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Helper functions
+# ———————————————————————————————————————————————————————————————
+
+struct SectionInfo
+  offset: UInt
+  size: UInt
+end
+
+def find_debug_line_section(bytes: &Vec[u8]) -> Option[SectionInfo]
+  # Detect file format (ELF or Mach-O) and find .debug_line section
+  if bytes.len() < 4 then return Option::None end
+  
+  if bytes[0] == 0x7F && bytes[1] == 0x45 && bytes[2] == 0x4C && bytes[3] == 0x46 then
+    # ELF format
+    find_elf_section(bytes, ".debug_line")
+  elsif bytes[0] == 0xFE && bytes[1] == 0xED && bytes[2] == 0xFA && bytes[3] == 0xCF then
+    # Mach-O 64-bit (big endian magic, but usually LE on Apple)
+    find_macho_section(bytes, "__debug_line")
+  elsif bytes[0] == 0xCF && bytes[1] == 0xFA && bytes[2] == 0xED && bytes[3] == 0xFE then
+    # Mach-O 64-bit LE
+    find_macho_section(bytes, "__debug_line")
+  else
+    Option::None
+  end
+end
+
+def find_elf_section(bytes: &Vec[u8], name: String) -> Option[SectionInfo]
+  # Parse ELF64 header
+  if bytes.len() < 64 then return Option::None end
+  
+  let shoff = read_u64_le(bytes, 40) as UInt       # Section header table offset
+  let shentsize = read_u16_le(bytes, 58) as UInt    # Section header entry size
+  let shnum = read_u16_le(bytes, 60) as UInt        # Number of section headers
+  let shstrndx = read_u16_le(bytes, 62) as UInt     # Section name string table index
+  
+  if shoff == 0 || shnum == 0 then return Option::None end
+  
+  # Get string table section
+  let strtab_offset_pos = shoff + shstrndx * shentsize + 24
+  if strtab_offset_pos + 8 > bytes.len() then return Option::None end
+  let strtab_offset = read_u64_le(bytes, strtab_offset_pos) as UInt
+  
+  # Search sections
+  mut i: UInt = 0
+  while i < shnum do
+    let sh_pos = shoff + i * shentsize
+    if sh_pos + shentsize > bytes.len() then break end
+    
+    let name_offset = read_u32_le(bytes, sh_pos) as UInt
+    let str_pos = strtab_offset + name_offset
+    
+    if str_pos < bytes.len() then
+      let section_name = read_null_terminated_string(bytes, &mut str_pos)
+      if section_name == name then
+        let sec_offset = read_u64_le(bytes, sh_pos + 24) as UInt
+        let sec_size = read_u64_le(bytes, sh_pos + 32) as UInt
+        return Option::Some(SectionInfo { offset: sec_offset, size: sec_size })
+      end
+    end
+    
+    i = i + 1
+  end
+  
+  Option::None
+end
+
+def find_macho_section(bytes: &Vec[u8], name: String) -> Option[SectionInfo]
+  # Parse Mach-O 64-bit header
+  if bytes.len() < 32 then return Option::None end
+  
+  let ncmds = read_u32_le(bytes, 16) as UInt
+  mut offset: UInt = 32  # Start of load commands
+  
+  mut cmd_idx: UInt = 0
+  while cmd_idx < ncmds && offset + 8 <= bytes.len() do
+    let cmd = read_u32_le(bytes, offset)
+    let cmdsize = read_u32_le(bytes, offset + 4) as UInt
+    
+    if cmd == 0x19 then  # LC_SEGMENT_64
+      # Check segment name at offset+8 (16 bytes)
+      let seg_name = read_fixed_string(bytes, offset + 8, 16)
+      
+      if seg_name == "__DWARF" then
+        let nsects = read_u32_le(bytes, offset + 64) as UInt
+        mut sec_offset = offset + 72  # Start of section headers
+        
+        mut sec_idx: UInt = 0
+        while sec_idx < nsects && sec_offset + 80 <= bytes.len() do
+          let sec_name = read_fixed_string(bytes, sec_offset, 16)
+          
+          if sec_name == name then
+            let sec_data_offset = read_u32_le(bytes, sec_offset + 48) as UInt
+            let sec_data_size = read_u64_le(bytes, sec_offset + 40) as UInt
+            return Option::Some(SectionInfo { offset: sec_data_offset, size: sec_data_size })
+          end
+          
+          sec_offset = sec_offset + 80  # sizeof(section_64)
+          sec_idx = sec_idx + 1
+        end
+      end
+    end
+    
+    offset = offset + cmdsize
+    cmd_idx = cmd_idx + 1
+  end
+  
+  Option::None
+end
+
+# ———————————————————————————————————————————————————————————————
+# Binary reading helpers
+# ———————————————————————————————————————————————————————————————
+
+def read_u16_le(bytes: &Vec[u8], offset: UInt) -> UInt
+  (bytes[offset] as UInt) | ((bytes[offset + 1] as UInt) << 8)
+end
+
+def read_u32_le(bytes: &Vec[u8], offset: UInt) -> UInt
+  (bytes[offset] as UInt) |
+  ((bytes[offset + 1] as UInt) << 8) |
+  ((bytes[offset + 2] as UInt) << 16) |
+  ((bytes[offset + 3] as UInt) << 24)
+end
+
+def read_u64_le(bytes: &Vec[u8], offset: UInt) -> UInt
+  (bytes[offset] as UInt) |
+  ((bytes[offset + 1] as UInt) << 8) |
+  ((bytes[offset + 2] as UInt) << 16) |
+  ((bytes[offset + 3] as UInt) << 24) |
+  ((bytes[offset + 4] as UInt) << 32) |
+  ((bytes[offset + 5] as UInt) << 40) |
+  ((bytes[offset + 6] as UInt) << 48) |
+  ((bytes[offset + 7] as UInt) << 56)
+end
+
+def read_usize_le(bytes: &Vec[u8], offset: UInt) -> UInt
+  read_u64_le(bytes, offset)
+end
+
+def read_uleb128(bytes: &Vec[u8], offset: &mut UInt) -> UInt
+  mut result: UInt = 0
+  mut shift: UInt = 0
+  loop
+    let byte = bytes[*offset] as UInt
+    *offset = *offset + 1
+    result = result | ((byte & 0x7F) << shift)
+    if (byte & 0x80) == 0 then break end
+    shift = shift + 7
+  end
+  result
+end
+
+def read_sleb128(bytes: &Vec[u8], offset: &mut UInt) -> Int
+  mut result: Int = 0
+  mut shift: UInt = 0
+  mut byte: UInt = 0
+  loop
+    byte = bytes[*offset] as UInt
+    *offset = *offset + 1
+    result = result | (((byte & 0x7F) as Int) << shift)
+    shift = shift + 7
+    if (byte & 0x80) == 0 then break end
+  end
+  # Sign-extend if needed
+  if shift < 64 && (byte & 0x40) != 0 then
+    result = result | ((-1 as Int) << shift)
+  end
+  result
+end
+
+def read_null_terminated_string(bytes: &Vec[u8], offset: &mut UInt) -> String
+  mut s = ""
+  while *offset < bytes.len() && bytes[*offset] != 0 do
+    s = s + (bytes[*offset] as Char).to_string()
+    *offset = *offset + 1
+  end
+  if *offset < bytes.len() then
+    *offset = *offset + 1  # Skip null terminator
+  end
+  s
+end
+
+def read_fixed_string(bytes: &Vec[u8], offset: UInt, max_len: UInt) -> String
+  mut s = ""
+  mut i: UInt = 0
+  while i < max_len && (offset + i) < bytes.len() && bytes[offset + i] != 0 do
+    s = s + (bytes[offset + i] as Char).to_string()
+    i = i + 1
+  end
+  s
+end
+
+def uint_to_hex(n: UInt) -> String
+  if n == 0 then return "0" end
+  
+  let hex_chars = "0123456789abcdef"
+  mut result = ""
+  mut val = n
+  
+  while val > 0 do
+    let digit = val % 16
+    result = hex_chars.char_at(digit).to_string() + result
+    val = val / 16
+  end
+  
+  result
+end
+
+unsafe def cstr_to_string(ptr: Ptr[u8]) -> String
+  mut s = ""
+  mut i: UInt = 0
+  while unsafe { *ptr.offset(i) } != 0 do
+    s = s + (unsafe { *ptr.offset(i) } as Char).to_string()
+    i = i + 1
+  end
+  s
+end

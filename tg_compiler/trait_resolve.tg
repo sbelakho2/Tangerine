@@ -4,8 +4,8 @@
 # This module resolves method calls by searching inherent impls first
 # then trait impls, ranking candidates by specificity.
 
-import ast::{ Program, Item, ImplBlock, TraitDef, Span }
-import types::{ Type, TypeEnv, TypeDef, TypeDefKind, MethodSig }
+use ast::{ Program, Item, ImplBlock, TraitDef, Span }
+use types::{ Type, TypeEnv, TypeDef, TypeDefKind, MethodSig }
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -36,6 +36,7 @@ end
 struct TraitResolver
   impls: Vec[ImplEntry]
   errors: Vec[TraitError]
+  local_types: Set[String]   # Types/traits defined in the current crate
 end
 
 struct TraitError
@@ -50,7 +51,8 @@ end
 def trait_resolver_new() -> TraitResolver
   TraitResolver {
     impls: Vec::new(),
-    errors: Vec::new()
+    errors: Vec::new(),
+    local_types: Set::new()
   }
 end
 
@@ -327,6 +329,7 @@ end
 # Ensure no overlapping impls for the same trait on the same type.
 # This is the orphan rule / coherence check from Part F.
 def check_coherence(resolver: &mut TraitResolver) -> Unit
+  # Phase 1: Check for overlapping impls
   mut i = 0
   while i < resolver.impls.len() do
     mut j = i + 1
@@ -342,6 +345,122 @@ def check_coherence(resolver: &mut TraitResolver) -> Unit
       j = j + 1
     end
     i = i + 1
+  end
+  
+  # Phase 2: Check orphan rule
+  check_orphan_rules(resolver)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Orphan Rule Enforcement
+# ———————————————————————————————————————————————————————————————
+
+# The orphan rule states: at least one of the trait or the self-type
+# must be defined in the current crate. This prevents conflicting
+# blanket impls across crate boundaries.
+#
+# Exceptions:
+# - "Covered type" rule: a foreign trait may be implemented for a
+#   foreign type if a local type appears as a type parameter in
+#   the uncovered position (e.g., impl ForeignTrait for Vec[LocalType])
+def check_orphan_rules(resolver: &mut TraitResolver) -> Unit
+  for imp in resolver.impls do
+    if imp.is_inherent then next end
+    
+    let trait_is_local = is_type_local(resolver, imp.trait_name.clone())
+    let type_is_local = is_self_type_local(resolver, &imp.for_type)
+    
+    if !trait_is_local && !type_is_local then
+      # Check the covered type exception
+      if !has_local_covered_type(resolver, &imp.for_type) then
+        resolver.errors.push(TraitError {
+          message: "orphan rule violation: cannot implement foreign trait '" ++
+                   imp.trait_name ++ "' for foreign type '" ++
+                   type_to_string(&imp.for_type) ++ "' — at least one must be " ++
+                   "defined in the current crate",
+          span: imp.span
+        })
+      end
+    end
+  end
+end
+
+def is_type_local(resolver: &TraitResolver, name: String) -> Bool
+  # A type/trait is local if it was defined in the current compilation unit
+  # Check if it's in our local definitions
+  match resolver.local_types.get(name.clone())
+  when Option::Some(_) then true
+  when Option::None then
+    # Builtin types are not local
+    is_builtin_type(name.clone()) == false &&
+    is_builtin_trait(name.clone()) == false
+  end
+end
+
+def is_self_type_local(resolver: &TraitResolver, ty: &Type) -> Bool
+  match ty
+  when Type::Named(name) then is_type_local(resolver, name.clone())
+  when Type::Generic(name, _) then is_type_local(resolver, name.clone())
+  when Type::Tuple(_) then false  # Tuples are builtin
+  when Type::Array(_, _) then false  # Arrays are builtin
+  when Type::Ref(inner, _) then is_self_type_local(resolver, inner)
+  when _ then false
+  end
+end
+
+def has_local_covered_type(resolver: &TraitResolver, ty: &Type) -> Bool
+  # A type is "covered" if a local type appears inside a generic parameter
+  # Example: impl Display for Vec[MyLocalType] is OK because MyLocalType covers it
+  match ty
+  when Type::Generic(_, args) then
+    for arg in args do
+      if is_self_type_local(resolver, &arg) then return true end
+      if has_local_covered_type(resolver, &arg) then return true end
+    end
+    false
+  when _ then false
+  end
+end
+
+def is_builtin_type(name: String) -> Bool
+  name == "Int" || name == "UInt" || name == "Float" || name == "Bool" ||
+  name == "String" || name == "Char" || name == "Unit" || name == "Vec" ||
+  name == "Map" || name == "Set" || name == "Option" || name == "Result"
+end
+
+def is_builtin_trait(name: String) -> Bool
+  name == "Drop" || name == "Clone" || name == "Display" || name == "Debug" ||
+  name == "Iterator" || name == "Send" || name == "Sync" || name == "Eq" ||
+  name == "Ord" || name == "Hash" || name == "Default" || name == "Into" ||
+  name == "From" || name == "Future"
+end
+
+def type_to_string(ty: &Type) -> String
+  match ty
+  when Type::Named(name) then name.clone()
+  when Type::Generic(name, args) then
+    mut s = name.clone() + "["
+    mut first = true
+    for arg in args do
+      if !first then s = s + ", " end
+      s = s + type_to_string(&arg)
+      first = false
+    end
+    s + "]"
+  when Type::Ref(inner, is_mut) then
+    if is_mut then "&mut " + type_to_string(inner)
+    else "&" + type_to_string(inner)
+    end
+  when Type::Tuple(elems) then
+    mut s = "("
+    mut first = true
+    for e in elems do
+      if !first then s = s + ", " end
+      s = s + type_to_string(&e)
+      first = false
+    end
+    s + ")"
+  when _ then "<unknown>".to_string()
   end
 end
 
@@ -390,6 +509,8 @@ end
 
 struct MonoCache
   entries: Vec[MonoEntry]
+  # Specialized MIR function bodies keyed by mangled name
+  specialized_bodies: Map[String, MirFunction]
 end
 
 struct MonoEntry
@@ -398,7 +519,7 @@ struct MonoEntry
 end
 
 def mono_cache_new() -> MonoCache
-  MonoCache { entries: Vec::new() }
+  MonoCache { entries: Vec::new(), specialized_bodies: Map::new() }
 end
 
 # Look up or create a monomorphized instance for a generic function call.
@@ -423,6 +544,273 @@ def monomorphize(cache: &mut MonoCache, func_name: String, type_args: Vec[Type])
   mangled
 end
 
+# ———————————————————————————————————————————————————————————————
+# Monomorphization Body Specialization
+# ———————————————————————————————————————————————————————————————
+# Given a generic MIR function and concrete type arguments, produce
+# a specialized copy with all type parameters substituted.
+
+struct TypeSubstMap
+  # Maps type parameter names to concrete types
+  params: Map[String, Type]
+end
+
+def type_subst_new(type_param_names: &Vec[String], type_args: &Vec[Type]) -> TypeSubstMap
+  mut params = Map::new()
+  mut i = 0
+  while i < type_param_names.len() && i < type_args.len() do
+    params.insert(type_param_names[i].clone(), type_args[i].clone())
+    i = i + 1
+  end
+  TypeSubstMap { params: params }
+end
+
+def specialize_function(
+  cache: &mut MonoCache,
+  original: &MirFunction,
+  type_param_names: &Vec[String],
+  type_args: &Vec[Type]
+) -> MirFunction
+  let mangled = monomorphize(cache, original.name.clone(), type_args.clone())
+  
+  # If already specialized, return cached version
+  match cache.specialized_bodies.get(&mangled)
+  when Option::Some(existing) then return existing.clone()
+  when Option::None then ()
+  end
+  
+  let subst = type_subst_new(type_param_names, type_args)
+  
+  # Create specialized function with substituted types
+  mut specialized = MirFunction {
+    name: mangled.clone(),
+    params: Vec::new(),
+    ret_type: substitute_type(&subst, &original.ret_type),
+    locals: Vec::new(),
+    blocks: Vec::new(),
+    entry_block: original.entry_block,
+    is_async: original.is_async,
+    is_unsafe: original.is_unsafe,
+    is_extern: original.is_extern,
+    extern_abi: original.extern_abi.clone(),
+    contracts: original.contracts.clone(),
+    span: original.span.clone()
+  }
+  
+  # Substitute parameter types
+  for param in original.params do
+    specialized.params.push(MirLocal {
+      id: param.id,
+      name: param.name.clone(),
+      ty: substitute_type(&subst, &param.ty),
+      is_mut: param.is_mut
+    })
+  end
+  
+  # Substitute local variable types
+  for local in original.locals do
+    specialized.locals.push(MirLocal {
+      id: local.id,
+      name: local.name.clone(),
+      ty: substitute_type(&subst, &local.ty),
+      is_mut: local.is_mut
+    })
+  end
+  
+  # Deep-copy and substitute all blocks
+  for block in original.blocks do
+    mut new_stmts = Vec::new()
+    for stmt in block.statements do
+      new_stmts.push(substitute_statement(&subst, &stmt))
+    end
+    
+    specialized.blocks.push(MirBlock {
+      id: block.id,
+      statements: new_stmts,
+      terminator: substitute_terminator(&subst, &block.terminator)
+    })
+  end
+  
+  # Cache the specialized body
+  cache.specialized_bodies.insert(mangled, specialized.clone())
+  specialized
+end
+
+def substitute_type(subst: &TypeSubstMap, ty: &Type) -> Type
+  match ty
+  when Type::Param(name) then
+    match subst.params.get(&name)
+    when Option::Some(concrete) then concrete.clone()
+    when Option::None then ty.clone()
+    end
+  when Type::Option(inner) then Type::Option(Box::new(substitute_type(subst, inner)))
+  when Type::Result(ok, err) then
+    Type::Result(Box::new(substitute_type(subst, ok)), Box::new(substitute_type(subst, err)))
+  when Type::Map(k, v) then
+    Type::Map(Box::new(substitute_type(subst, k)), Box::new(substitute_type(subst, v)))
+  when Type::Set(inner) then Type::Set(Box::new(substitute_type(subst, inner)))
+  when Type::Slice(inner) then Type::Slice(Box::new(substitute_type(subst, inner)))
+  when Type::Array(inner, n) then Type::Array(Box::new(substitute_type(subst, inner)), n)
+  when Type::Ref(inner, lt) then Type::Ref(Box::new(substitute_type(subst, inner)), lt.clone())
+  when Type::RefMut(inner, lt) then Type::RefMut(Box::new(substitute_type(subst, inner)), lt.clone())
+  when Type::Tuple(elems) then
+    mut subs = Vec::new()
+    for e in elems do
+      subs.push(substitute_type(subst, &e))
+    end
+    Type::Tuple(subs)
+  when Type::Function(params, ret) then
+    mut sub_params = Vec::new()
+    for p in params do
+      sub_params.push(substitute_type(subst, &p))
+    end
+    Type::Function(sub_params, Box::new(substitute_type(subst, ret)))
+  when Type::Named(id, args) then
+    mut sub_args = Vec::new()
+    for a in args do
+      sub_args.push(substitute_type(subst, &a))
+    end
+    Type::Named(id, sub_args)
+  when _ then ty.clone()
+  end
+end
+
+def substitute_statement(subst: &TypeSubstMap, stmt: &MirStatement) -> MirStatement
+  match stmt.kind
+  when MirStatementKind::Assign(place, rvalue) then
+    MirStatement {
+      kind: MirStatementKind::Assign(place.clone(), substitute_rvalue(subst, &rvalue)),
+      span: stmt.span.clone()
+    }
+  when _ then stmt.clone()
+  end
+end
+
+def substitute_rvalue(subst: &TypeSubstMap, rvalue: &MirRvalue) -> MirRvalue
+  match rvalue.kind
+  when MirRvalueKind::Cast(op, target_ty) then
+    MirRvalue { kind: MirRvalueKind::Cast(op.clone(), substitute_type(subst, &target_ty)) }
+  when MirRvalueKind::Aggregate(kind, ops) then
+    # Substitute type in aggregate kind if it references generics
+    MirRvalue { kind: MirRvalueKind::Aggregate(substitute_aggregate_kind(subst, &kind), ops.clone()) }
+  when _ then rvalue.clone()
+  end
+end
+
+def substitute_aggregate_kind(subst: &TypeSubstMap, kind: &MirAggregateKind) -> MirAggregateKind
+  match kind
+  when MirAggregateKind::Tuple then MirAggregateKind::Tuple
+  when MirAggregateKind::Array then MirAggregateKind::Array
+  when MirAggregateKind::Struct(name) then MirAggregateKind::Struct(name.clone())
+  when MirAggregateKind::Enum(name, variant) then MirAggregateKind::Enum(name.clone(), variant)
+  when _ then kind.clone()
+  end
+end
+
+def substitute_terminator(subst: &TypeSubstMap, term: &MirTerminator) -> MirTerminator
+  # Terminators generally don't carry types directly,
+  # but calls need mangled names updated
+  term.clone()
+end
+
+# Monomorphize all generic functions in a MIR program
+def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
+  # Collect all generic call sites
+  mut worklist = Vec::new()  # (func_name, type_args)
+  
+  for func in mir.functions do
+    collect_generic_calls(&func, &mut worklist)
+  end
+  
+  # Specialize each generic call
+  mut new_functions = Vec::new()
+  for (func_name, type_args) in worklist do
+    # Find the original generic function
+    mut found: Option[&MirFunction] = Option::None
+    for f in mir.functions do
+      if f.name == func_name then
+        found = Option::Some(&f)
+        break
+      end
+    end
+    
+    match found
+    when Option::Some(original) then
+      # Extract type param names from function (heuristic: single-letter uppercase)
+      let type_param_names = infer_type_param_names(original)
+      if !type_param_names.is_empty() then
+        let specialized = specialize_function(cache, original, &type_param_names, &type_args)
+        new_functions.push(specialized)
+      end
+    when Option::None then ()
+    end
+  end
+  
+  # Add specialized functions to program
+  for f in new_functions do
+    mir.functions.push(f)
+  end
+end
+
+def collect_generic_calls(func: &MirFunction, worklist: &mut Vec[(String, Vec[Type])]) -> Unit
+  for block in func.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::Call(_, callee, _, _, _) then
+      # If callee is a function with type args, record it
+      match callee
+      when MirOperand::Constant(MirConstant::Function(name, type_args)) then
+        if !type_args.is_empty() then
+          worklist.push((name.clone(), type_args.clone()))
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+def infer_type_param_names(func: &MirFunction) -> Vec[String]
+  # Scan function locals/params for Param types and collect their names
+  mut names = Vec::new()
+  mut seen = Set::new()
+  
+  for param in func.params do
+    collect_type_params(&param.ty, &mut names, &mut seen)
+  end
+  collect_type_params(&func.ret_type, &mut names, &mut seen)
+  for local in func.locals do
+    collect_type_params(&local.ty, &mut names, &mut seen)
+  end
+  names
+end
+
+def collect_type_params(ty: &Type, names: &mut Vec[String], seen: &mut Set[String]) -> Unit
+  match ty
+  when Type::Param(name) then
+    if !seen.contains(&name) then
+      seen.insert(name.clone())
+      names.push(name.clone())
+    end
+  when Type::Option(inner) then collect_type_params(inner, names, seen)
+  when Type::Result(ok, err) then
+    collect_type_params(ok, names, seen)
+    collect_type_params(err, names, seen)
+  when Type::Map(k, v) then
+    collect_type_params(k, names, seen)
+    collect_type_params(v, names, seen)
+  when Type::Set(inner) then collect_type_params(inner, names, seen)
+  when Type::Slice(inner) then collect_type_params(inner, names, seen)
+  when Type::Tuple(elems) then
+    for e in elems do collect_type_params(&e, names, seen) end
+  when Type::Function(params, ret) then
+    for p in params do collect_type_params(&p, names, seen) end
+    collect_type_params(ret, names, seen)
+  when Type::Named(_, args) then
+    for a in args do collect_type_params(&a, names, seen) end
+  when _ then ()
+  end
+end
+
 # Generate mangled name for a monomorphized function
 def mangle_name(base: String, type_args: &Vec[Type]) -> String
   mut name = base ++ "$"
@@ -435,6 +823,140 @@ def mangle_name(base: String, type_args: &Vec[Type]) -> String
     first = false
   end
   name
+end
+
+# ———————————————————————————————————————————————————————————————
+# Tangerine ABI Symbol Mangling (extern "tangerine")
+# ———————————————————————————————————————————————————————————————
+# Format: _TG{edition}_{pkgHash}_{modulePathLen}:{modulePath}_{nameLen}:{name}_{sigHash}
+#
+# Components:
+#   edition    — language edition (e.g., "2026")
+#   pkgHash    — 64-bit hex of package identity (name + version + registry)
+#   modulePath — module path (e.g., "std::collections")
+#   name       — function/type name
+#   sigHash    — 64-bit hex hash of monomorphized signature
+
+pub const TANGERINE_ABI_EDITION: String = "2026"
+pub const TANGERINE_ABI_REVISION: UInt = 1
+
+# Full Tangerine ABI symbol mangling
+pub def mangle_tangerine_symbol(
+  pkg_name: String,
+  pkg_version: String,
+  module_path: String,
+  name: String,
+  signature: &Type
+) -> String
+  let pkg_hash = compute_pkg_hash(&pkg_name, &pkg_version)
+  let sig_hash = compute_signature_hash(signature)
+  
+  let module_len = module_path.len()
+  let name_len = name.len()
+  
+  "_TG" ++ TANGERINE_ABI_EDITION ++ "_" ++
+    hex_u64(pkg_hash) ++ "_" ++
+    module_len.to_string() ++ ":" ++ module_path ++ "_" ++
+    name_len.to_string() ++ ":" ++ name ++ "_" ++
+    hex_u64(sig_hash)
+end
+
+# Compute package identity hash (name + version + registry)
+def compute_pkg_hash(name: &String, version: &String) -> UInt
+  mut h: UInt = 0xcbf29ce484222325  # FNV-1a offset basis
+  for c in name.bytes() do
+    h = h ^ (c as UInt)
+    h = h * 0x100000001b3  # FNV-1a prime
+  end
+  h = h ^ 0xff  # separator
+  for c in version.bytes() do
+    h = h ^ (c as UInt)
+    h = h * 0x100000001b3
+  end
+  h
+end
+
+# Compute signature hash from type
+def compute_signature_hash(ty: &Type) -> UInt
+  mut h: UInt = 0xcbf29ce484222325
+  let repr = type_to_mangled(ty)
+  for c in repr.bytes() do
+    h = h ^ (c as UInt)
+    h = h * 0x100000001b3
+  end
+  h
+end
+
+# Convert u64 to 16-char hex string
+def hex_u64(val: UInt) -> String
+  let chars = "0123456789abcdef"
+  mut result = ""
+  mut v = val
+  mut i = 0
+  while i < 16 do
+    let nibble = (v >> 60) & 0xf
+    result = result ++ chars.char_at(nibble as UInt).unwrap().to_string()
+    v = v << 4
+    i = i + 1
+  end
+  result
+end
+
+# Demangle a Tangerine symbol back to human-readable form
+pub def demangle_tangerine_symbol(mangled: String) -> Option[String]
+  if !mangled.starts_with("_TG") then
+    return Option::None
+  end
+  
+  # Parse format: _TG{edition}_{pkgHash}_{moduleLen}:{module}_{nameLen}:{name}_{sigHash}
+  mut pos: UInt = 3
+  
+  # Skip edition
+  while pos < mangled.len() && mangled.char_at(pos) != Option::Some('_') do
+    pos = pos + 1
+  end
+  pos = pos + 1  # skip '_'
+  
+  # Skip pkgHash
+  while pos < mangled.len() && mangled.char_at(pos) != Option::Some('_') do
+    pos = pos + 1
+  end
+  pos = pos + 1  # skip '_'
+  
+  # Parse moduleLen
+  mut module_len_str = ""
+  while pos < mangled.len() && mangled.char_at(pos) != Option::Some(':') do
+    module_len_str = module_len_str ++ mangled.char_at(pos).unwrap().to_string()
+    pos = pos + 1
+  end
+  pos = pos + 1  # skip ':'
+  
+  let module_len = match module_len_str.parse_int()
+  when Option::Some(n) then n as UInt
+  when Option::None then return Option::None
+  end
+  
+  # Extract module path
+  let module_path = mangled.slice(pos, pos + module_len)
+  pos = pos + module_len + 1  # skip '_'
+  
+  # Parse nameLen
+  mut name_len_str = ""
+  while pos < mangled.len() && mangled.char_at(pos) != Option::Some(':') do
+    name_len_str = name_len_str ++ mangled.char_at(pos).unwrap().to_string()
+    pos = pos + 1
+  end
+  pos = pos + 1  # skip ':'
+  
+  let name_len = match name_len_str.parse_int()
+  when Option::Some(n) then n as UInt
+  when Option::None then return Option::None
+  end
+  
+  # Extract name
+  let name = mangled.slice(pos, pos + name_len)
+  
+  Option::Some(module_path ++ "::" ++ name)
 end
 
 def type_to_mangled(ty: &Type) -> String

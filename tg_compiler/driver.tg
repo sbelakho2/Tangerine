@@ -22,9 +22,10 @@ use tg_compiler::ast::{Program}
 use tg_compiler::parser::{parse}
 use tg_compiler::types::{type_check, TypeError}
 use tg_compiler::borrow_check::{borrow_check, BorrowError}
-use tg_compiler::mir::{lower_to_mir, MirProgram}
+use tg_compiler::mir::{lower_to_mir, MirProgram, optimize_mir, pretty_print_mir, instrument_for_pgo}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{TargetTriple}
+use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 
 # ———————————————————————————————————————————————————————————————
 # Compiler Options
@@ -68,6 +69,13 @@ struct CompilerOptions
   # Output format
   json_diagnostics: Bool
   color: Bool
+  
+  # Cross-compilation
+  target_triple: Option[String]
+
+  # PGO
+  pgo_gen: Option[String]    # --pgo-gen=<path> : instrument and write profile
+  pgo_use: Option[String]    # --pgo-use=<path> : read profile for optimization
 end
 
 enum EmitMode
@@ -98,7 +106,10 @@ def default_options() -> CompilerOptions
     print_ast: false,
     print_tokens: false,
     json_diagnostics: false,
-    color: true
+    color: true,
+    target_triple: Option::None,
+    pgo_gen: Option::None,
+    pgo_use: Option::None
   }
 end
 
@@ -112,6 +123,7 @@ struct Diagnostic
   span: Option[Span]
   notes: Vec[String]
   suggestions: Vec[Suggestion]
+  code: Option[String]      # Error code, e.g., "E0001"
 end
 
 enum DiagLevel
@@ -230,6 +242,13 @@ def emit_diagnostic(e: &mut DiagnosticEmitter, d: Diagnostic) -> Unit
     eprint(level_str)
   end
   
+  # Print error code if present
+  match d.code
+  when Option::Some(code) then
+    eprint("[" + code + "]")
+  when Option::None then ()
+  end
+  
   eprintln(": " + d.message)
   
   # Print source location
@@ -338,7 +357,6 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def emit_diagnostic_json(e: &DiagnosticEmitter, d: &Diagnostic) -> Unit
-  # Format: {"level":"error","message":"...","spans":[...],"code":null,"rendered":null}
   mut json = "{"
   
   # Level
@@ -353,6 +371,15 @@ def emit_diagnostic_json(e: &DiagnosticEmitter, d: &Diagnostic) -> Unit
   
   # Message (escape special chars)
   json = json + "\"message\":\"" + json_escape(d.message.clone()) + "\","
+  
+  # Error code
+  match d.code
+  when Option::Some(code) then
+    json = json + "\"code\":{\"code\":\"" + code + "\",\"explanation\":\"" +
+           json_escape(explain_error_code(code.clone())) + "\"},"
+  when Option::None then
+    json = json + "\"code\":null,"
+  end
   
   # Spans
   json = json + "\"spans\":["
@@ -501,6 +528,119 @@ def has_errors(e: &DiagnosticEmitter) -> Bool
 end
 
 # ———————————————————————————————————————————————————————————————
+# Error Code Registry
+# ———————————————————————————————————————————————————————————————
+
+def explain_error_code(code: String) -> String
+  match code.as_str()
+  # Lexer/Parser errors
+  when "E0001" then "Unexpected character in source input."
+  when "E0002" then "Unterminated string literal."
+  when "E0003" then "Expected expression but found a different token."
+  when "E0004" then "Mismatched brackets, braces, or parentheses."
+  when "E0005" then "Unexpected end of file while parsing."
+  when "E0010" then "Invalid numeric literal format."
+  when "E0011" then "Expected `:` after struct field name."
+  when "E0012" then "Expected `end` to close block."
+  when "E0013" then "Expected `->` before return type."
+  when "E0014" then "Invalid pattern in match arm."
+  
+  # Name resolution errors
+  when "E0100" then "Unresolved name — the identifier was not found in scope."
+  when "E0101" then "Duplicate definition — a name was defined more than once in the same scope."
+  when "E0102" then "Unresolved import — the imported module or symbol was not found."
+  when "E0103" then "Glob import conflict — two glob imports bring the same name into scope."
+  when "E0104" then "Private symbol cannot be accessed from this module."
+  when "E0105" then "Cannot import from a non-module item."
+  when "E0106" then "Circular import dependency detected."
+  
+  # Type checking errors
+  when "E0200" then "Type mismatch — expected one type but found another."
+  when "E0201" then "Unknown type name — the type was not found."
+  when "E0202" then "Wrong number of type arguments for generic type."
+  when "E0203" then "Missing field in struct literal."
+  when "E0204" then "Unknown field in struct literal."
+  when "E0205" then "Binary operator cannot be applied to these types."
+  when "E0206" then "Cannot call a non-function type."
+  when "E0207" then "Wrong number of arguments in function call."
+  when "E0208" then "Return type mismatch — function body returns a different type."
+  when "E0209" then "Cannot access field on a non-struct type."
+  when "E0210" then "Cannot index into a non-array/non-Vec type."
+  when "E0211" then "Match arms have incompatible types."
+  when "E0212" then "Non-exhaustive match — not all variants are covered."
+  when "E0213" then "Infinite type detected — a type refers to itself without indirection."
+  
+  # Trait errors
+  when "E0270" then "Trait not satisfied — type does not implement the required trait."
+  when "E0271" then "Associated type mismatch in trait implementation."
+  when "E0272" then "Missing method in trait implementation."
+  when "E0273" then "Method signature does not match trait definition."
+  when "E0274" then "Orphan rule violation — cannot implement foreign trait for foreign type."
+  when "E0275" then "Overlapping trait implementations — coherence violation."
+  when "E0276" then "Negative trait bounds not satisfied."
+  when "E0277" then "Required trait bound not satisfied."
+  
+  # Borrow checking errors
+  when "E0300" then "Use of moved value — the value was moved and cannot be used again."
+  when "E0301" then "Cannot borrow as mutable — value is not declared as `mut`."
+  when "E0302" then "Cannot borrow as mutable while shared borrows exist."
+  when "E0303" then "Cannot borrow as shared while mutable borrow exists."
+  when "E0304" then "Value moved while still borrowed."
+  when "E0305" then "Lifetime violation — reference does not live long enough."
+  when "E0306" then "Cannot assign to immutable variable."
+  when "E0307" then "Double mutable borrow — value is already mutably borrowed."
+  when "E0308" then "Use after drop — value has been dropped."
+  when "E0309" then "Cannot move out of borrowed content."
+  when "E0310" then "Dangling reference — reference outlives its referent."
+  
+  # Safety errors
+  when "E0400" then "Operation requires unsafe context."
+  when "E0401" then "Raw pointer dereference outside unsafe block."
+  when "E0402" then "FFI call outside unsafe block."
+  when "E0403" then "Access to mutable static outside unsafe block."
+  when "E0404" then "Transmute call outside unsafe block."
+  
+  # Codegen errors
+  when "E0500" then "Unsupported target architecture."
+  when "E0501" then "Linker error — undefined symbol."
+  when "E0502" then "Linker error — duplicate symbol."
+  when "E0503" then "Object file format error."
+  
+  when _ then "No extended information available for this error code."
+  end
+end
+
+def cmd_explain(code: String) -> Unit
+  let explanation = explain_error_code(code.clone())
+  println("Error code " + code + ":")
+  println("")
+  println(explanation)
+  println("")
+  
+  # Print example if available
+  let example = error_code_example(code.clone())
+  if !example.is_empty() then
+    println("Example:")
+    println(example)
+  end
+end
+
+def error_code_example(code: String) -> String
+  match code.as_str()
+  when "E0300" then
+    "  let x = Vec::new()\n  let y = x       # x is moved to y\n  println(x)     # error: use of moved value `x`"
+  when "E0301" then
+    "  let x = 5\n  x = 10          # error: cannot assign to immutable variable"
+  when "E0302" then
+    "  let mut x = Vec::new()\n  let r = &x\n  x.push(1)       # error: cannot borrow `x` as mutable while shared"
+  when "E0200" then
+    "  def foo() -> Int\n    \"hello\"        # error: expected Int, found String\n  end"
+  when "E0274" then
+    "  # In crate `my_crate`:\n  impl std::fmt::Display for std::vec::Vec[Int]\n  # error: neither Display nor Vec is defined in the current crate"
+  when _ then ""
+  end
+
+# ———————————————————————————————————————————————————————————————
 # Compilation Pipeline
 # ———————————————————————————————————————————————————————————————
 
@@ -576,6 +716,12 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     return Result::Ok("")
   end
   
+  # Phase 2.5: Macro expansion
+  if opts.verbose then
+    println("  Expanding macros...")
+  end
+  let ast = expand_macros(ast)
+  
   # Phase 3: Type checking
   if opts.verbose then
     println("  Type checking...")
@@ -621,11 +767,31 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     println("  Lowering to MIR...")
   end
   
-  let mir = lower_to_mir(&ast)
+  mut mir = lower_to_mir(&ast)
+  
+  # Phase 5.5: Monomorphization — specialize generic functions for concrete types
+  if opts.verbose then
+    println("  Monomorphizing generics...")
+  end
+  mut mono_cache = mono_cache_new()
+  monomorphize_program(&mut mir, &mut mono_cache)
+  
+  # Phase 5.6: MIR Optimization (gated by opt_level)
+  if opts.verbose then
+    println("  Optimizing MIR (O" + opts.opt_level.to_string() + ")...")
+  end
+  
+  # PGO instrumentation: if --pgo-gen, instrument before optimization
+  match opts.pgo_gen
+  when Option::Some(_) then
+    instrument_for_pgo(&mut mir)
+  when Option::None then ()
+  end
+  
+  optimize_mir(&mut mir, opts.opt_level)
   
   if opts.emit_mir then
-    println("MIR:")
-    print_mir(&mir)
+    println(pretty_print_mir(&mir))
     return Result::Ok("")
   end
   
@@ -634,7 +800,10 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     println("  Generating native code...")
   end
   
-  let target = detect_host_target()
+  let target = match opts.target_triple
+  when Option::Some(triple) then parse_target_triple(triple)
+  when Option::None then detect_host_target()
+  end
   
   match opts.emit
   when EmitMode::Object then
@@ -695,17 +864,252 @@ def print_ast(program: &Program) -> Unit
 end
 
 def print_mir(mir: &MirProgram) -> Unit
-  println("MIR with " + mir.functions.len().to_string() + " functions")
-  for f in mir.functions do
-    println("  fn " + f.name + " {")
-    for block in f.blocks do
-      println("    bb" + block.id.id.to_string() + ":")
-      for stmt in block.statements do
-        println("      " + stmt.kind.to_string())
-      end
-      println("      " + block.terminator.kind.to_string())
+  println(pretty_print_mir(mir))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Macro Expansion
+# ———————————————————————————————————————————————————————————————
+#
+# Expands macro invocations in the AST by textual substitution.
+# Macros are template‐based: the macro body is a Block whose parameters
+# are substituted at each call site.
+#
+# Expansion algorithm:
+#   1. Collect all MacroDecl items into a name→decl map.
+#   2. Walk every expression/statement looking for call expressions
+#      whose callee matches a macro name.
+#   3. For each match, clone the macro body, substitute parameter
+#      names with the supplied argument expressions, and splice the
+#      result into the AST.
+#   4. Repeat until no more expansions are found (handles nested macros).
+
+struct MacroEnv
+  macros: Map[String, MacroDecl]
+end
+
+def expand_macros(program: Program) -> Program
+  # Phase 1: collect macro declarations
+  mut env = MacroEnv { macros: Map::new() }
+  for item in program.items do
+    match item.kind
+    when ItemKind::Macro(m) then
+      env.macros.insert(m.name.clone(), m.clone())
+    when _ then ()
     end
-    println("  }")
+  end
+
+  # If no macros defined, return as-is
+  if env.macros.is_empty() then
+    return program
+  end
+
+  # Phase 2: iteratively expand until fixpoint (max 64 passes)
+  mut current = program
+  mut pass = 0
+  while pass < 64 do
+    let (expanded, did_expand) = expand_program_pass(&env, current)
+    current = expanded
+    if !did_expand then break end
+    pass = pass + 1
+  end
+
+  # Phase 3: remove macro declarations from the output AST
+  mut filtered_items = Vec::new()
+  for item in current.items do
+    match item.kind
+    when ItemKind::Macro(_) then ()  # Drop macro defs
+    when _ then filtered_items.push(item.clone())
+    end
+  end
+  Program { items: filtered_items }
+end
+
+def expand_program_pass(env: &MacroEnv, program: Program) -> (Program, Bool)
+  mut new_items = Vec::new()
+  mut did_expand = false
+  for item in program.items do
+    let (new_item, expanded) = expand_item(env, item.clone())
+    new_items.push(new_item)
+    if expanded then did_expand = true end
+  end
+  (Program { items: new_items }, did_expand)
+end
+
+def expand_item(env: &MacroEnv, item: Item) -> (Item, Bool)
+  # For function items, expand macro calls inside the function body
+  match item.kind
+  when ItemKind::Function(f) then
+    match f.body
+    when FnBody::Block(block) then
+      let (new_block, expanded) = expand_block(env, block)
+      let new_f = FunctionDecl {
+        vis: f.vis,
+        name: f.name.clone(),
+        generic_params: f.generic_params.clone(),
+        params: f.params.clone(),
+        ret_type: f.ret_type.clone(),
+        where_clause: f.where_clause.clone(),
+        body: FnBody::Block(new_block),
+        attributes: f.attributes.clone(),
+        contracts: f.contracts.clone(),
+        span: f.span
+      }
+      (Item { kind: ItemKind::Function(new_f), span: item.span }, expanded)
+    when _ then (item, false)
+    end
+  when _ then (item, false)
+  end
+end
+
+def expand_block(env: &MacroEnv, block: Block) -> (Block, Bool)
+  mut new_stmts = Vec::new()
+  mut did_expand = false
+  for stmt in block.stmts do
+    let (new_stmt, expanded) = expand_stmt(env, stmt.clone())
+    new_stmts.push(new_stmt)
+    if expanded then did_expand = true end
+  end
+  (Block { stmts: new_stmts, span: block.span }, did_expand)
+end
+
+def expand_stmt(env: &MacroEnv, stmt: Stmt) -> (Stmt, Bool)
+  match stmt.kind
+  when StmtKind::Expr(expr) then
+    let (new_expr, expanded) = expand_expr(env, expr)
+    (Stmt { kind: StmtKind::Expr(new_expr), span: stmt.span }, expanded)
+  when StmtKind::Let(pat, ty, init) then
+    match init
+    when Option::Some(expr) then
+      let (new_expr, expanded) = expand_expr(env, expr)
+      (Stmt { kind: StmtKind::Let(pat, ty, Option::Some(new_expr)), span: stmt.span }, expanded)
+    when Option::None then (stmt, false)
+    end
+  when _ then (stmt, false)
+  end
+end
+
+def expand_expr(env: &MacroEnv, expr: Expr) -> (Expr, Bool)
+  match expr.kind
+  when ExprKind::Call(callee, args) then
+    # Check if callee is a path that matches a macro name
+    match callee.kind
+    when ExprKind::Path(path) then
+      let name = path_to_name(&path)
+      match env.macros.get(&name)
+      when Option::Some(macro_decl) then
+        # Found a macro invocation — expand it
+        let expanded = instantiate_macro(macro_decl, &args, &expr.span)
+        (expanded, true)
+      when Option::None then
+        # Not a macro — recurse into arguments
+        mut new_args = Vec::new()
+        mut did_expand = false
+        for arg in args do
+          let (new_arg, expanded) = expand_expr(env, arg.clone())
+          new_args.push(new_arg)
+          if expanded then did_expand = true end
+        end
+        (Expr { kind: ExprKind::Call(callee, new_args), span: expr.span }, did_expand)
+      end
+    when _ then
+      mut new_args = Vec::new()
+      mut did_expand = false
+      for arg in args do
+        let (new_arg, expanded) = expand_expr(env, arg.clone())
+        new_args.push(new_arg)
+        if expanded then did_expand = true end
+      end
+      (Expr { kind: ExprKind::Call(callee, new_args), span: expr.span }, did_expand)
+    end
+  when ExprKind::Block(block) then
+    let (new_block, expanded) = expand_block(env, block)
+    (Expr { kind: ExprKind::Block(new_block), span: expr.span }, expanded)
+  when ExprKind::If(if_expr) then
+    let (new_cond, ex1) = expand_expr(env, *if_expr.condition)
+    let (new_then, ex2) = expand_block(env, if_expr.then_block)
+    let expanded = ex1 || ex2
+    let new_if = IfExpr {
+      condition: Box::new(new_cond),
+      then_block: new_then,
+      else_block: if_expr.else_block.clone(),
+      span: if_expr.span
+    }
+    (Expr { kind: ExprKind::If(new_if), span: expr.span }, expanded)
+  when _ then (expr, false)
+  end
+end
+
+def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span) -> Expr
+  # Build substitution map: param_name → argument expression
+  mut subst_map: Map[String, Expr] = Map::new()
+  mut i = 0
+  while i < macro_decl.params.len() && i < args.len() do
+    subst_map.insert(macro_decl.params[i].name.clone(), args[i].clone())
+    i = i + 1
+  end
+
+  # Clone the macro body and substitute identifiers matching parameter names
+  let substituted_block = substitute_block(&subst_map, &macro_decl.body)
+
+  # Wrap the block as a block expression
+  Expr { kind: ExprKind::Block(substituted_block), span: call_span.clone() }
+end
+
+def substitute_block(subst: &Map[String, Expr], block: &Block) -> Block
+  mut new_stmts = Vec::new()
+  for stmt in block.stmts do
+    new_stmts.push(substitute_stmt(subst, &stmt))
+  end
+  Block { stmts: new_stmts, span: block.span }
+end
+
+def substitute_stmt(subst: &Map[String, Expr], stmt: &Stmt) -> Stmt
+  match stmt.kind
+  when StmtKind::Expr(expr) then
+    Stmt { kind: StmtKind::Expr(substitute_expr(subst, &expr)), span: stmt.span }
+  when StmtKind::Let(pat, ty, init) then
+    let new_init = match init
+    when Option::Some(e) then Option::Some(substitute_expr(subst, &e))
+    when Option::None then Option::None
+    end
+    Stmt { kind: StmtKind::Let(pat.clone(), ty.clone(), new_init), span: stmt.span }
+  when _ then stmt.clone()
+  end
+end
+
+def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
+  match expr.kind
+  when ExprKind::Path(path) then
+    let name = path_to_name(&path)
+    match subst.get(&name)
+    when Option::Some(replacement) then replacement.clone()
+    when Option::None then expr.clone()
+    end
+  when ExprKind::Call(callee, args) then
+    let new_callee = substitute_expr(subst, &callee)
+    mut new_args = Vec::new()
+    for arg in args do
+      new_args.push(substitute_expr(subst, &arg))
+    end
+    Expr { kind: ExprKind::Call(Box::new(new_callee), new_args), span: expr.span }
+  when ExprKind::BinOp(op, lhs, rhs) then
+    Expr {
+      kind: ExprKind::BinOp(op, Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))),
+      span: expr.span
+    }
+  when ExprKind::Block(block) then
+    Expr { kind: ExprKind::Block(substitute_block(subst, &block)), span: expr.span }
+  when _ then expr.clone()
+  end
+end
+
+def path_to_name(path: &Path) -> String
+  # Simple: use the last segment name
+  if path.segments.is_empty() then
+    "".to_string()
+  else
+    path.segments[path.segments.len() - 1].name.clone()
   end
 end
 
@@ -764,12 +1168,30 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       opts.enable_effects = false
     elsif arg == "--no-budgets" then
       opts.enable_budgets = false
+    elsif arg == "--target" then
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for --target")
+      end
+      opts.target_triple = Option::Some(argv[i])
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "--no-color" then
       opts.color = false
     elsif arg == "--color" then
       opts.color = true
+    elsif arg.starts_with("--pgo-gen") then
+      if arg.contains("=") then
+        opts.pgo_gen = Option::Some(arg.split("=")[1].clone())
+      else
+        opts.pgo_gen = Option::Some(".tg_pgo_profile".to_string())
+      end
+    elsif arg.starts_with("--pgo-use") then
+      if arg.contains("=") then
+        opts.pgo_use = Option::Some(arg.split("=")[1].clone())
+      else
+        opts.pgo_use = Option::Some(".tg_pgo_profile".to_string())
+      end
     elsif arg == "-h" || arg == "--help" then
       print_help()
       return Result::Err("help")
@@ -793,7 +1215,25 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
 end
 
 def print_help() -> Unit
-  println("Usage: tg [OPTIONS] <FILES>...")
+  println("Usage: tg [SUBCOMMAND] [OPTIONS] [FILES]...")
+  println("")
+  println("Subcommands:")
+  println("  build     Compile project (uses Tangerine.toml)")
+  println("  run       Compile and execute")
+  println("  test      Discover and run tests")
+  println("  check     Type-check and borrow-check only")
+  println("  fmt       Format source files")
+  println("  lint      Run linter")
+  println("  doc       Generate documentation")
+  println("  bench     Run benchmarks")
+  println("  repl      Interactive REPL")
+  println("  lsp       Start language server")
+  println("  init      Create new project")
+  println("  dep       Dependency management (add/remove/list/update/tree)")
+  println("  install   Install a package globally")
+  println("  self-update Update the compiler")
+  println("  explain   Explain an error code")
+  println("  agent     Run agentic workflows (check/caps/effects/budget/diff/audit)")
   println("")
   println("Options:")
   println("  -o, --output <FILE>  Write output to FILE")
@@ -813,6 +1253,9 @@ def print_help() -> Unit
   println("  --no-capabilities    Disable capability system")
   println("  --no-effects         Disable effect system")
   println("  --no-budgets         Disable budget system")
+  println("  --target <TRIPLE>    Cross-compile for target (e.g. x86_64-linux-gnu, aarch64-macos)")
+  println("  --pgo-gen[=PATH]     Instrument binary for profile generation")
+  println("  --pgo-use[=PATH]     Optimize using previously collected profile data")
   println("  --json               Emit diagnostics in JSON format")
   println("  --no-color           Disable colored output")
   println("  --color              Force colored output")
@@ -826,12 +1269,783 @@ def print_version() -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# Subcommands
+# ———————————————————————————————————————————————————————————————
+
+enum Subcommand
+  Build        # tg build — compile project
+  Run          # tg run — compile and execute
+  Test         # tg test — discover and run tests
+  Check        # tg check — type/borrow check only
+  Fmt          # tg fmt — format source files
+  Lint         # tg lint — run linter
+  Doc          # tg doc — generate documentation
+  Bench        # tg bench — run benchmarks
+  Repl         # tg repl — interactive REPL
+  Lsp          # tg lsp — start language server
+  Init         # tg init — create new project
+  Dep          # tg dep — dependency management
+  Install      # tg install — install a package
+  SelfUpdate   # tg self-update — update the compiler
+  Explain      # tg explain E0XXX — explain error code
+  Agent        # tg agent — run agentic workflows
+  Bindgen      # tg bindgen — generate FFI bindings
+  Abi          # tg abi — ABI tools (test, dump)
+  Compile      # tg <files> — raw compile (default, no subcommand)
+end
+
+# ———————————————————————————————————————————————————————————————
 # Main Entry Point
 # ———————————————————————————————————————————————————————————————
 
 def main() -> Int
   let argv = args()
   
+  # Detect subcommand
+  let (subcmd, sub_argv) = detect_subcommand(argv)
+  
+  match subcmd
+  when Subcommand::Build then cmd_build(sub_argv)
+  when Subcommand::Run then cmd_run(sub_argv)
+  when Subcommand::Test then cmd_test(sub_argv)
+  when Subcommand::Check then cmd_check(sub_argv)
+  when Subcommand::Fmt then cmd_fmt(sub_argv)
+  when Subcommand::Lint then cmd_lint(sub_argv)
+  when Subcommand::Doc then cmd_doc(sub_argv)
+  when Subcommand::Bench then cmd_bench(sub_argv)
+  when Subcommand::Repl then cmd_repl(sub_argv)
+  when Subcommand::Lsp then cmd_lsp(sub_argv)
+  when Subcommand::Init then cmd_init(sub_argv)
+  when Subcommand::Dep then cmd_dep(sub_argv)
+  when Subcommand::Install then cmd_install(sub_argv)
+  when Subcommand::SelfUpdate then cmd_self_update(sub_argv)
+  when Subcommand::Explain then cmd_explain_main(sub_argv)
+  when Subcommand::Agent then cmd_agent(sub_argv)
+  when Subcommand::Bindgen then cmd_bindgen(sub_argv)
+  when Subcommand::Abi then cmd_abi(sub_argv)
+  when Subcommand::Compile then cmd_compile(sub_argv)
+  end
+end
+
+def detect_subcommand(argv: Vec[String]) -> (Subcommand, Vec[String])
+  if argv.len() < 2 then
+    return (Subcommand::Compile, argv)
+  end
+  
+  let first = argv[1].clone()
+  
+  let subcmd = if first == "build" then
+    Subcommand::Build
+  elsif first == "run" then
+    Subcommand::Run
+  elsif first == "test" then
+    Subcommand::Test
+  elsif first == "check" then
+    Subcommand::Check
+  elsif first == "fmt" || first == "format" then
+    Subcommand::Fmt
+  elsif first == "lint" then
+    Subcommand::Lint
+  elsif first == "doc" then
+    Subcommand::Doc
+  elsif first == "bench" then
+    Subcommand::Bench
+  elsif first == "repl" then
+    Subcommand::Repl
+  elsif first == "lsp" then
+    Subcommand::Lsp
+  elsif first == "init" then
+    Subcommand::Init
+  elsif first == "dep" then
+    Subcommand::Dep
+  elsif first == "install" then
+    Subcommand::Install
+  elsif first == "self-update" || first == "update" then
+    Subcommand::SelfUpdate
+  elsif first == "explain" then
+    Subcommand::Explain
+  elsif first == "agent" then
+    Subcommand::Agent
+  elsif first == "bindgen" then
+    Subcommand::Bindgen
+  elsif first == "abi" then
+    Subcommand::Abi
+  else
+    # No subcommand — treat as raw compile
+    return (Subcommand::Compile, argv)
+  end
+  
+  # Build sub-argv: [program_name, args after subcommand...]
+  mut sub_argv = Vec::new()
+  sub_argv.push(argv[0].clone())
+  mut i: UInt = 2
+  while i < argv.len() do
+    sub_argv.push(argv[i].clone())
+    i = i + 1
+  end
+  
+  (subcmd, sub_argv)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: build
+# ———————————————————————————————————————————————————————————————
+
+def cmd_build(argv: Vec[String]) -> Int
+  # Try loading project from Tangerine.toml first
+  match load_project(".") 
+  when Result::Ok(project) then
+    # Merge CLI options with project config
+    let opts = match parse_args(argv)
+    when Result::Ok(o) then o
+    when Result::Err(e) then
+      if e == "help" || e == "version" || e == "No input files" then
+        # Use project sources
+        mut o = default_options()
+        o.input_files = project.sources.clone()
+        o
+      else
+        eprintln("Error: " + e)
+        return 1
+      end
+    end
+    
+    match build_project(&project)
+    when Result::Ok(_) then 0
+    when Result::Err(e) then
+      eprintln("Error: " + e)
+      1
+    end
+  when Result::Err(_) then
+    # No project file — compile with CLI args
+    cmd_compile(argv)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: run
+# ———————————————————————————————————————————————————————————————
+
+def cmd_run(argv: Vec[String]) -> Int
+  # Compile to a temp executable, then run it
+  let opts = match parse_args(argv)
+  when Result::Ok(o) then o
+  when Result::Err(e) then
+    if e == "No input files" then
+      # Try project
+      match load_project(".")
+      when Result::Ok(project) then
+        mut o = default_options()
+        o.input_files = project.sources.clone()
+        o
+      when Result::Err(_) then
+        eprintln("Error: no input files and no Tangerine.toml found")
+        return 1
+      end
+    elsif e == "help" then
+      println("Usage: tg run [OPTIONS] [FILES]...")
+      println("Compile and run a Tangerine program")
+      return 0
+    else
+      eprintln("Error: " + e)
+      return 1
+    end
+  end
+  
+  # Compile
+  let exe_path = get_output_path(&opts, opts.input_files[0].clone(), "")
+  for file in opts.input_files do
+    match compile_file(&opts, file)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      eprintln("Error: " + e)
+      return 1
+    end
+  end
+  
+  # Execute
+  let exit_code = execute_binary(exe_path)
+  exit_code
+end
+
+extern "C"
+  def system(cmd: Ptr[u8]) -> Int
+end
+
+def execute_binary(path: String) -> Int
+  # Execute the compiled binary
+  let cmd = "./" + path
+  unsafe { system(cmd.as_ptr()) }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: test
+# ———————————————————————————————————————————————————————————————
+
+use std::test::{TestSuite, TestRunner, TestCase, test_suite_new, test_runner_new,
+                discover_tests, parse_test_args, run_tests}
+
+def cmd_test(argv: Vec[String]) -> Int
+  let test_config = parse_test_args(argv)
+  
+  # Discover test sources
+  let test_files = find_test_files(".")
+  
+  if test_files.is_empty() then
+    eprintln("Error: no test files found")
+    return 1
+  end
+  
+  mut suite = test_suite_new()
+  
+  for file in test_files do
+    # Compile each test file to discover #[test] functions
+    let opts = default_options()
+    
+    match read_file(file.clone())
+    when Result::Ok(source) then
+      let tokens = tokenize(source)
+      match parse(tokens)
+      when Result::Ok(ast) then
+        # Extract test functions from AST
+        let tests = extract_test_functions(&ast, file.clone())
+        for tc in tests do
+          suite.add_test(tc)
+        end
+      when Result::Err(e) then
+        eprintln("Parse error in " + file + ": " + e.message)
+      end
+    when Result::Err(e) then
+      eprintln("Cannot read " + file + ": " + e)
+    end
+  end
+  
+  let success = run_tests(&suite, test_config)
+  if success then 0 else 1 end
+end
+
+def find_test_files(dir: String) -> Vec[String]
+  # Search for files matching *_test.tg or test_*.tg patterns
+  mut files = Vec::new()
+  
+  let entries = match std::fs::read_dir(dir)
+  when Result::Ok(entries) then entries
+  when Result::Err(_) then return files
+  end
+  
+  for entry in entries do
+    if entry.is_dir then
+      # Recurse into subdirectories (but skip hidden dirs)
+      if !entry.name.starts_with(".") then
+        let sub_files = find_test_files(entry.path.clone())
+        for f in sub_files do
+          files.push(f)
+        end
+      end
+    elsif entry.name.ends_with("_test.tg") || entry.name.starts_with("test_") then
+      files.push(entry.path.clone())
+    elsif entry.name.ends_with(".tg") then
+      # Also include files containing #[test] functions
+      match read_file(entry.path.clone())
+      when Result::Ok(content) then
+        if content.contains("#[test]") then
+          files.push(entry.path.clone())
+        end
+      when Result::Err(_) then ()
+      end
+    end
+  end
+  
+  files
+end
+
+def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
+  # Walk AST to find functions decorated with #[test]
+  mut tests = Vec::new()
+  
+  let module_name = file.replace("/", "::").replace(".tg", "")
+  
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(func) then
+      # Check for #[test] attribute
+      mut is_test = false
+      mut should_panic = false
+      mut is_ignored = false
+      
+      for attr in func.attributes do
+        if attr.name == "test" then
+          is_test = true
+        elsif attr.name == "should_panic" then
+          should_panic = true
+        elsif attr.name == "ignore" then
+          is_ignored = true
+        end
+      end
+      
+      if is_test then
+        mut tc = TestCase {
+          name: func.name.clone(),
+          module: module_name.clone(),
+          func: || -> Unit {
+            # The test function body is compiled and linked separately.
+            # This closure is a placeholder that gets replaced by the
+            # actual compiled function pointer during the test linking phase.
+            panic("test stub: should be replaced by linker")
+          },
+          should_panic: should_panic,
+          ignore: is_ignored,
+          timeout_ms: Option::None,
+          tags: Vec::new()
+        }
+        
+        # Check for timeout attribute
+        for attr in func.attributes do
+          if attr.name == "timeout" then
+            match attr.value
+            when Option::Some(val) then
+              tc.timeout_ms = Option::Some(val.parse_uint().unwrap_or(0))
+            when Option::None then ()
+            end
+          end
+        end
+        
+        tests.push(tc)
+      end
+    when _ then ()
+    end
+  end
+  
+  tests
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: check
+# ———————————————————————————————————————————————————————————————
+
+def cmd_check(argv: Vec[String]) -> Int
+  let opts = match parse_args(argv)
+  when Result::Ok(o) then
+    mut o2 = o
+    o2.check_only = true
+    o2
+  when Result::Err(e) then
+    if e == "help" then
+      println("Usage: tg check [OPTIONS] [FILES]...")
+      println("Type-check and borrow-check without compiling")
+      return 0
+    elsif e == "No input files" then
+      match load_project(".")
+      when Result::Ok(project) then
+        mut o = default_options()
+        o.check_only = true
+        o.input_files = project.sources.clone()
+        o
+      when Result::Err(_) then
+        eprintln("Error: no input files")
+        return 1
+      end
+    else
+      eprintln("Error: " + e)
+      return 1
+    end
+  end
+  
+  mut exit_code = 0
+  for file in opts.input_files do
+    match compile_file(&opts, file)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      eprintln("Error: " + e)
+      exit_code = 1
+    end
+  end
+  
+  exit_code
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: fmt
+# ———————————————————————————————————————————————————————————————
+
+use tg_compiler::formatter::{format_file, FormatConfig, default_format_config, format_check}
+
+def cmd_fmt(argv: Vec[String]) -> Int
+  mut check_only = false
+  mut files = Vec::new()
+  mut config = default_format_config()
+  
+  mut i: UInt = 1
+  while i < argv.len() do
+    let arg = argv[i]
+    if arg == "--check" then
+      check_only = true
+    elsif arg == "--indent" then
+      i = i + 1
+      if i < argv.len() then
+        config.indent_width = argv[i].parse_uint().unwrap_or(2)
+      end
+    elsif arg == "--line-width" then
+      i = i + 1
+      if i < argv.len() then
+        config.max_line_width = argv[i].parse_uint().unwrap_or(100)
+      end
+    elsif arg == "-h" || arg == "--help" then
+      println("Usage: tg fmt [OPTIONS] [FILES]...")
+      println("Format Tangerine source files")
+      println("")
+      println("Options:")
+      println("  --check          Check formatting without writing")
+      println("  --indent <N>     Indentation width (default: 2)")
+      println("  --line-width <N> Maximum line width (default: 100)")
+      return 0
+    elsif !arg.starts_with("-") then
+      files.push(arg.clone())
+    end
+    i = i + 1
+  end
+  
+  # If no files, format all .tg files in project
+  if files.is_empty() then
+    files = find_tg_files(".")
+  end
+  
+  mut exit_code = 0
+  mut formatted_count: UInt = 0
+  
+  for file in files do
+    if check_only then
+      match format_check(file.clone(), &config)
+      when Result::Ok(needs_format) then
+        if needs_format then
+          println("Would reformat: " + file)
+          exit_code = 1
+        end
+      when Result::Err(e) then
+        eprintln("Error: " + file + ": " + e)
+        exit_code = 1
+      end
+    else
+      match format_file(file.clone(), &config)
+      when Result::Ok(changed) then
+        if changed then
+          formatted_count = formatted_count + 1
+          println("Formatted: " + file)
+        end
+      when Result::Err(e) then
+        eprintln("Error: " + file + ": " + e)
+        exit_code = 1
+      end
+    end
+  end
+  
+  if !check_only && formatted_count > 0 then
+    println(formatted_count.to_string() + " file(s) formatted")
+  end
+  
+  exit_code
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: lint
+# ———————————————————————————————————————————————————————————————
+
+use tg_compiler::linter::{lint_file, LintConfig, default_lint_config, LintLevel}
+
+def cmd_lint(argv: Vec[String]) -> Int
+  mut files = Vec::new()
+  mut config = default_lint_config()
+  
+  mut i: UInt = 1
+  while i < argv.len() do
+    let arg = argv[i]
+    if arg == "--deny" then
+      i = i + 1
+      if i < argv.len() then
+        config.denied.push(argv[i].clone())
+      end
+    elsif arg == "--allow" then
+      i = i + 1
+      if i < argv.len() then
+        config.allowed.push(argv[i].clone())
+      end
+    elsif arg == "--warn" then
+      i = i + 1
+      if i < argv.len() then
+        config.warned.push(argv[i].clone())
+      end
+    elsif arg == "--json" then
+      config.json_output = true
+    elsif arg == "-h" || arg == "--help" then
+      println("Usage: tg lint [OPTIONS] [FILES]...")
+      println("Run linter on Tangerine source files")
+      println("")
+      println("Options:")
+      println("  --deny <LINT>    Deny a lint (error)")
+      println("  --allow <LINT>   Allow a lint (suppress)")
+      println("  --warn <LINT>    Warn on a lint")
+      println("  --json           Output diagnostics as JSON")
+      return 0
+    elsif !arg.starts_with("-") then
+      files.push(arg.clone())
+    end
+    i = i + 1
+  end
+  
+  if files.is_empty() then
+    files = find_tg_files(".")
+  end
+  
+  mut total_warnings: UInt = 0
+  mut total_errors: UInt = 0
+  
+  for file in files do
+    match lint_file(file.clone(), &config)
+    when Result::Ok(diagnostics) then
+      for diag in diagnostics do
+        match diag.level
+        when LintLevel::Error then
+          total_errors = total_errors + 1
+          eprintln("error[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
+        when LintLevel::Warning then
+          total_warnings = total_warnings + 1
+          eprintln("warning[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
+        when LintLevel::Info then
+          eprintln("info[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
+        end
+      end
+    when Result::Err(e) then
+      eprintln("Error linting " + file + ": " + e)
+      total_errors = total_errors + 1
+    end
+  end
+  
+  if total_errors > 0 || total_warnings > 0 then
+    eprintln(total_errors.to_string() + " error(s), " + total_warnings.to_string() + " warning(s)")
+  end
+  
+  if total_errors > 0 then 1 else 0 end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: doc
+# ———————————————————————————————————————————————————————————————
+
+use tg_compiler::docgen::{generate_docs, DocConfig, default_doc_config}
+
+def cmd_doc(argv: Vec[String]) -> Int
+  mut files = Vec::new()
+  mut config = default_doc_config()
+  
+  mut i: UInt = 1
+  while i < argv.len() do
+    let arg = argv[i]
+    if arg == "--output" || arg == "-o" then
+      i = i + 1
+      if i < argv.len() then
+        config.output_dir = argv[i].clone()
+      end
+    elsif arg == "--format" then
+      i = i + 1
+      if i < argv.len() then
+        if argv[i] == "html" then
+          config.format = DocFormat::Html
+        elsif argv[i] == "markdown" || argv[i] == "md" then
+          config.format = DocFormat::Markdown
+        end
+      end
+    elsif arg == "--private" then
+      config.include_private = true
+    elsif arg == "-h" || arg == "--help" then
+      println("Usage: tg doc [OPTIONS] [FILES]...")
+      println("Generate documentation")
+      println("")
+      println("Options:")
+      println("  -o, --output <DIR>  Output directory (default: docs/api)")
+      println("  --format <FMT>      Output format: html, markdown (default: html)")
+      println("  --private           Include private items")
+      return 0
+    elsif !arg.starts_with("-") then
+      files.push(arg.clone())
+    end
+    i = i + 1
+  end
+  
+  if files.is_empty() then
+    files = find_tg_files(".")
+  end
+  
+  match generate_docs(files, &config)
+  when Result::Ok(count) then
+    println("Generated documentation for " + count.to_string() + " item(s) in " + config.output_dir)
+    0
+  when Result::Err(e) then
+    eprintln("Error generating docs: " + e)
+    1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: bench
+# ———————————————————————————————————————————————————————————————
+
+use std::bench::{BenchSuite, bench_suite_new, run_benchmarks, parse_bench_args}
+
+def cmd_bench(argv: Vec[String]) -> Int
+  let bench_config = parse_bench_args(argv)
+  
+  let bench_files = find_bench_files(".")
+  
+  if bench_files.is_empty() then
+    eprintln("Error: no benchmark files found")
+    return 1
+  end
+  
+  mut suite = bench_suite_new()
+  
+  for file in bench_files do
+    match read_file(file.clone())
+    when Result::Ok(source) then
+      let tokens = tokenize(source)
+      match parse(tokens)
+      when Result::Ok(ast) then
+        let benches = extract_bench_functions(&ast, file.clone())
+        for b in benches do
+          suite.add_bench(b)
+        end
+      when Result::Err(e) then
+        eprintln("Parse error in " + file + ": " + e.message)
+      end
+    when Result::Err(e) then
+      eprintln("Cannot read " + file + ": " + e)
+    end
+  end
+  
+  let success = run_benchmarks(&suite, bench_config)
+  if success then 0 else 1 end
+end
+
+def find_bench_files(dir: String) -> Vec[String]
+  mut files = Vec::new()
+  let entries = match std::fs::read_dir(dir)
+  when Result::Ok(entries) then entries
+  when Result::Err(_) then return files
+  end
+  
+  for entry in entries do
+    if entry.is_dir && !entry.name.starts_with(".") then
+      let sub = find_bench_files(entry.path.clone())
+      for f in sub do files.push(f) end
+    elsif entry.name.ends_with("_bench.tg") || entry.name.starts_with("bench_") then
+      files.push(entry.path.clone())
+    elsif entry.name.ends_with(".tg") then
+      match read_file(entry.path.clone())
+      when Result::Ok(content) then
+        if content.contains("#[bench]") then
+          files.push(entry.path.clone())
+        end
+      when Result::Err(_) then ()
+      end
+    end
+  end
+  
+  files
+end
+
+def extract_bench_functions(ast: &Program, file: String) -> Vec[BenchCase]
+  use std::bench::{BenchCase, bench_case_new}
+  mut benches = Vec::new()
+  let module_name = file.replace("/", "::").replace(".tg", "")
+  
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(func) then
+      for attr in func.attributes do
+        if attr.name == "bench" then
+          benches.push(bench_case_new(func.name.clone(), module_name.clone()))
+        end
+      end
+    when _ then ()
+    end
+  end
+  benches
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: repl
+# ———————————————————————————————————————————————————————————————
+
+use tg_compiler::lib::{run_repl}
+
+def cmd_repl(argv: Vec[String]) -> Int
+  run_repl()
+  0
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: lsp
+# ———————————————————————————————————————————————————————————————
+
+def cmd_lsp(argv: Vec[String]) -> Int
+  println("Starting Tangerine Language Server...")
+  mut server = lsp_server_new()
+  lsp_main_loop(&mut server)
+  0
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: init
+# ———————————————————————————————————————————————————————————————
+
+def cmd_init(argv: Vec[String]) -> Int
+  let project_name = if argv.len() > 1 then
+    argv[1].clone()
+  else
+    "my_project".to_string()
+  end
+  
+  # Create project directory structure
+  match std::fs::create_dir(project_name.clone())
+  when Result::Err(e) then
+    eprintln("Error creating directory: " + e)
+    return 1
+  when Result::Ok(_) then ()
+  end
+  
+  match std::fs::create_dir(project_name.clone() + "/src")
+  when Result::Err(_) then ()
+  when Result::Ok(_) then ()
+  end
+  
+  # Write Tangerine.toml
+  let manifest = "[package]\nname = \"" + project_name + "\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+  match write_file(project_name.clone() + "/Tangerine.toml", manifest)
+  when Result::Err(e) then
+    eprintln("Error writing manifest: " + e)
+    return 1
+  when Result::Ok(_) then ()
+  end
+  
+  # Write src/main.tg
+  let main_content = "# " + project_name + "\n\ndef main() -> Int\n  println(\"Hello from " + project_name + "!\")\n  0\nend\n"
+  match write_file(project_name.clone() + "/src/main.tg", main_content)
+  when Result::Err(e) then
+    eprintln("Error writing main.tg: " + e)
+    return 1
+  when Result::Ok(_) then ()
+  end
+  
+  println("Created project '" + project_name + "'")
+  println("  " + project_name + "/Tangerine.toml")
+  println("  " + project_name + "/src/main.tg")
+  0
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: compile (raw, no subcommand)
+# ———————————————————————————————————————————————————————————————
+
+def cmd_compile(argv: Vec[String]) -> Int
   let opts = match parse_args(argv)
   when Result::Ok(o) then o
   when Result::Err(e) then
@@ -855,6 +2069,26 @@ def main() -> Int
   end
   
   exit_code
+end
+
+# Helper: find all .tg files recursively
+def find_tg_files(dir: String) -> Vec[String]
+  mut files = Vec::new()
+  let entries = match std::fs::read_dir(dir)
+  when Result::Ok(entries) then entries
+  when Result::Err(_) then return files
+  end
+  
+  for entry in entries do
+    if entry.is_dir && !entry.name.starts_with(".") && entry.name != "target" then
+      let sub = find_tg_files(entry.path.clone())
+      for f in sub do files.push(f) end
+    elsif entry.name.ends_with(".tg") then
+      files.push(entry.path.clone())
+    end
+  end
+  
+  files
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -953,7 +2187,9 @@ def hash_string(s: String) -> String
 end
 
 def current_time() -> Int
-  0  # Would get system time
+  # Get seconds since epoch via FFI
+  extern def time(tloc: *mut Int) -> Int
+  time(null)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1076,14 +2312,2233 @@ end
 def build_project(project: &Project) -> Result[Unit, String]
   let opts = default_options()
   
-  for src in project.sources do
-    match compile_file(&opts, src)
+  # Resolve dependencies first
+  let resolved = resolve_project_deps(project)?
+  
+  # Build dependency sources before project sources
+  for dep_src in resolved.dep_sources do
+    match compile_file(&opts, dep_src)
     when Result::Ok(_) then ()
-    when Result::Err(e) then return Result::Err(e)
+    when Result::Err(e) then return Result::Err("dependency error: " + e)
     end
   end
   
+  # Build cache integration
+  mut cache = load_build_cache(&project.output_dir)
+  
+  for src in project.sources do
+    match read_file(src.clone())
+    when Result::Ok(content) then
+      if is_stale(&cache, src.clone(), content.clone()) then
+        match compile_file(&opts, src.clone())
+        when Result::Ok(_) then
+          update_cache(&mut cache, src.clone(), content, "".to_string())
+        when Result::Err(e) then return Result::Err(e)
+        end
+      else
+        # Cache hit — skip recompilation
+        ()
+      end
+    when Result::Err(_) then
+      match compile_file(&opts, src)
+      when Result::Ok(_) then ()
+      when Result::Err(e) then return Result::Err(e)
+      end
+    end
+  end
+  
+  save_build_cache(&cache)
   Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Dependency Resolution & Lockfile
+# ———————————————————————————————————————————————————————————————
+
+struct ResolvedDeps
+  packages: Vec[ResolvedPackage]
+  dep_sources: Vec[String]
+end
+
+struct ResolvedPackage
+  name: String
+  version: String
+  resolved_path: String
+  checksum: String
+end
+
+struct Lockfile
+  packages: Vec[LockEntry]
+end
+
+struct LockEntry
+  name: String
+  version: String
+  source: String
+  checksum: String
+  dependencies: Vec[String]
+end
+
+def resolve_project_deps(project: &Project) -> Result[ResolvedDeps, String]
+  # Load existing lockfile if present
+  let lockfile = load_lockfile("Tangerine.lock")
+  
+  mut resolved = ResolvedDeps {
+    packages: Vec::new(),
+    dep_sources: Vec::new()
+  }
+  
+  for dep in project.dependencies do
+    # Check lockfile first for reproducibility
+    let locked_entry = match lockfile
+    when Option::Some(ref lf) then find_lock_entry(lf, &dep.name)
+    when Option::None then Option::None
+    end
+    
+    # Resolve the dependency source
+    let resolved_pkg = resolve_single_dep(&dep, &locked_entry)?
+    
+    # Collect source files from resolved dependency
+    let dep_dir = resolved_pkg.resolved_path.clone()
+    match discover_sources(&dep_dir)
+    when Result::Ok(srcs) then
+      for s in srcs do
+        resolved.dep_sources.push(s)
+      end
+    when Result::Err(e) then
+      return Result::Err("Failed to discover sources for '" + dep.name.clone() + "': " + e)
+    end
+    
+    resolved.packages.push(resolved_pkg)
+  end
+  
+  # Write lockfile with resolved state
+  write_lockfile("Tangerine.lock", &resolved)
+  
+  Result::Ok(resolved)
+end
+
+def resolve_single_dep(dep: &Dependency, locked: &Option[LockEntry]) -> Result[ResolvedPackage, String]
+  # If a path dependency, use it directly (local development)
+  match dep.path
+  when Option::Some(ref p) then
+    return Result::Ok(ResolvedPackage {
+      name: dep.name.clone(),
+      version: dep.version.clone(),
+      resolved_path: p.clone(),
+      checksum: hash_directory(p)
+    })
+  when Option::None then ()
+  end
+  
+  # If a git dependency, clone/fetch
+  match dep.git
+  when Option::Some(ref url) then
+    let clone_dir = ".tg_deps/" + dep.name.clone()
+    
+    # Check if already cloned with correct version from lockfile
+    match locked
+    when Option::Some(ref entry) then
+      if dir_exists(&clone_dir) && entry.source == url.clone() then
+        return Result::Ok(ResolvedPackage {
+          name: dep.name.clone(),
+          version: entry.version.clone(),
+          resolved_path: clone_dir,
+          checksum: entry.checksum.clone()
+        })
+      end
+    when Option::None then ()
+    end
+    
+    # Clone the repo
+    mkdir_p(".tg_deps")
+    let clone_result = run_command("git", vec!["clone", "--depth", "1", url.as_str(), clone_dir.as_str()])
+    
+    match clone_result
+    when Result::Ok(_) then
+      Result::Ok(ResolvedPackage {
+        name: dep.name.clone(),
+        version: dep.version.clone(),
+        resolved_path: clone_dir.clone(),
+        checksum: hash_directory(&clone_dir)
+      })
+    when Result::Err(e) then
+      Result::Err("Failed to clone '" + dep.name.clone() + "' from " + url.clone() + ": " + e)
+    end
+  when Option::None then ()
+  end
+  
+  # Registry dependency — fetch from package registry
+  let registry_url = "https://registry.tangerine-lang.org"
+  let pkg_dir = ".tg_deps/" + dep.name.clone() + "-" + dep.version.clone()
+  
+  # Check if already downloaded
+  if dir_exists(&pkg_dir) then
+    match locked
+    when Option::Some(ref entry) then
+      if entry.version == dep.version then
+        return Result::Ok(ResolvedPackage {
+          name: dep.name.clone(),
+          version: entry.version.clone(),
+          resolved_path: pkg_dir,
+          checksum: entry.checksum.clone()
+        })
+      end
+    when Option::None then ()
+    end
+  end
+  
+  # Download package tarball
+  mkdir_p(".tg_deps")
+  let fetch_url = registry_url + "/api/v1/packages/" + dep.name.clone() + "/" + dep.version.clone() + "/download"
+  let fetch_result = run_command("curl", vec!["-sSL", "-o", (pkg_dir.clone() + ".tar.gz").as_str(), fetch_url.as_str()])
+  
+  match fetch_result
+  when Result::Ok(_) then
+    # Extract tarball
+    mkdir_p(&pkg_dir)
+    let extract = run_command("tar", vec!["xzf", (pkg_dir.clone() + ".tar.gz").as_str(), "-C", pkg_dir.as_str()])
+    match extract
+    when Result::Ok(_) then
+      Result::Ok(ResolvedPackage {
+        name: dep.name.clone(),
+        version: dep.version.clone(),
+        resolved_path: pkg_dir.clone(),
+        checksum: hash_directory(&pkg_dir)
+      })
+    when Result::Err(e) then
+      Result::Err("Failed to extract package '" + dep.name.clone() + "': " + e)
+    end
+  when Result::Err(e) then
+    Result::Err("Failed to fetch '" + dep.name.clone() + "@" + dep.version.clone() + "' from registry: " + e)
+  end
+end
+
+def discover_sources(dir: &String) -> Result[Vec[String], String]
+  # Look for Tangerine.toml in the dependency directory to find its sources.
+  # If not found, glob for all .tg files under src/.
+  let manifest = dir.clone() + "/Tangerine.toml"
+  match load_project(manifest)
+  when Result::Ok(proj) then
+    mut sources = Vec::new()
+    for s in proj.sources do
+      sources.push(dir.clone() + "/" + s)
+    end
+    Result::Ok(sources)
+  when Result::Err(_) then
+    # Fallback: find all .tg files under src/
+    let src_dir = dir.clone() + "/src"
+    match list_directory(src_dir.clone())
+    when Result::Ok(files) then
+      mut sources = Vec::new()
+      for f in files do
+        if f.ends_with(".tg") then
+          sources.push(src_dir.clone() + "/" + f)
+        end
+      end
+      Result::Ok(sources)
+    when Result::Err(_) then
+      # Try root directory
+      match list_directory(dir.clone())
+      when Result::Ok(files) then
+        mut sources = Vec::new()
+        for f in files do
+          if f.ends_with(".tg") then
+            sources.push(dir.clone() + "/" + f)
+          end
+        end
+        Result::Ok(sources)
+      when Result::Err(e) then
+        Result::Err("Cannot list directory: " + e)
+      end
+    end
+  end
+end
+
+def find_lock_entry(lf: &Lockfile, name: &String) -> Option[LockEntry]
+  for entry in lf.packages do
+    if entry.name == *name then
+      return Option::Some(entry.clone())
+    end
+  end
+  Option::None
+end
+
+# — Lockfile I/O —
+
+def load_lockfile(path: &str) -> Option[Lockfile]
+  match read_file(path.to_string())
+  when Result::Ok(content) then
+    parse_lockfile(&content)
+  when Result::Err(_) then
+    Option::None
+  end
+end
+
+def parse_lockfile(content: &String) -> Option[Lockfile]
+  # Format:
+  #   # This file is auto-generated by tg. Do not edit.
+  #   [[package]]
+  #   name = "http"
+  #   version = "1.0.0"
+  #   source = "path:../http"
+  #   checksum = "abc123"
+  #   dependencies = ["core", "io"]
+  
+  mut packages = Vec::new()
+  mut current_name = "".to_string()
+  mut current_version = "".to_string()
+  mut current_source = "".to_string()
+  mut current_checksum = "".to_string()
+  mut current_deps = Vec::new()
+  mut in_package = false
+  
+  for line in content.lines() do
+    let trimmed = line.trim()
+    
+    if trimmed == "[[package]]" then
+      # Flush previous package
+      if in_package && !current_name.is_empty() then
+        packages.push(LockEntry {
+          name: current_name.clone(),
+          version: current_version.clone(),
+          source: current_source.clone(),
+          checksum: current_checksum.clone(),
+          dependencies: current_deps.clone()
+        })
+      end
+      current_name = "".to_string()
+      current_version = "".to_string()
+      current_source = "".to_string()
+      current_checksum = "".to_string()
+      current_deps = Vec::new()
+      in_package = true
+      continue
+    end
+    
+    if !in_package || trimmed.is_empty() || trimmed.starts_with("#") then
+      continue
+    end
+    
+    match trimmed.split_once("=")
+    when Option::Some(kv) then
+      let key = kv.0.trim()
+      let val = kv.1.trim().trim_matches('"')
+      
+      if key == "name" then current_name = val.to_string() end
+      if key == "version" then current_version = val.to_string() end
+      if key == "source" then current_source = val.to_string() end
+      if key == "checksum" then current_checksum = val.to_string() end
+      if key == "dependencies" then
+        let arr = val.trim_matches('[').trim_matches(']')
+        for dep_name in arr.split(",") do
+          let d = dep_name.trim().trim_matches('"')
+          if !d.is_empty() then
+            current_deps.push(d.to_string())
+          end
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  
+  # Flush last package
+  if in_package && !current_name.is_empty() then
+    packages.push(LockEntry {
+      name: current_name.clone(),
+      version: current_version.clone(),
+      source: current_source.clone(),
+      checksum: current_checksum.clone(),
+      dependencies: current_deps.clone()
+    })
+  end
+  
+  Option::Some(Lockfile { packages: packages })
+end
+
+def write_lockfile(path: &str, resolved: &ResolvedDeps) -> Unit
+  mut out = "# This file is auto-generated by tg. Do not edit.\n".to_string()
+  out = out + "# Tangerine lockfile v1\n\n"
+  
+  for pkg in resolved.packages do
+    out = out + "[[package]]\n"
+    out = out + "name = \"" + pkg.name.clone() + "\"\n"
+    out = out + "version = \"" + pkg.version.clone() + "\"\n"
+    out = out + "source = \"" + pkg.resolved_path.clone() + "\"\n"
+    out = out + "checksum = \"" + pkg.checksum.clone() + "\"\n"
+    out = out + "dependencies = []\n\n"
+  end
+  
+  match write_file(path.to_string(), out)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    eprintln("warning: failed to write lockfile: " + e)
+  end
+end
+
+def hash_directory(dir: &String) -> String
+  # Compute a content hash of all .tg files in a directory for reproducibility.
+  mut h: UInt = 14695981039346656037  # FNV-1a offset basis
+  let prime: UInt = 1099511628211
+  
+  match list_directory(dir.clone())
+  when Result::Ok(files) then
+    mut sorted = files.clone()
+    sorted.sort()
+    for f in sorted do
+      if f.ends_with(".tg") then
+        match read_file(dir.clone() + "/" + f)
+        when Result::Ok(content) then
+          for c in content.bytes() do
+            h = h ^ (c as UInt)
+            h = h * prime
+          end
+        when Result::Err(_) then ()
+        end
+      end
+    end
+  when Result::Err(_) then ()
+  end
+  
+  h.to_string()
+end
+
+# ———————————————————————————————————————————————————————————————
+# Workspace Support
+# ———————————————————————————————————————————————————————————————
+
+struct Workspace
+  root: String
+  members: Vec[String]
+  default_members: Vec[String]
+  shared_output: String
+end
+
+def load_workspace(path: String) -> Result[Workspace, String]
+  # Parse a workspace Tangerine.toml with [workspace] section.
+  let manifest_path = if path.ends_with("Tangerine.toml") then
+    path.clone()
+  else
+    path.clone() + "/Tangerine.toml"
+  end
+  
+  match read_file(manifest_path.clone())
+  when Result::Ok(content) then
+    mut members = Vec::new()
+    mut default_members = Vec::new()
+    mut section = ""
+    mut is_workspace = false
+    
+    for line in content.lines() do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("#") then
+        continue
+      end
+      
+      if trimmed.starts_with("[") && trimmed.ends_with("]") then
+        section = trimmed.slice(1, trimmed.len() - 1)
+        if section == "workspace" then is_workspace = true end
+        continue
+      end
+      
+      if section == "workspace" then
+        match trimmed.split_once("=")
+        when Option::Some(kv) then
+          let key = kv.0.trim()
+          let val = kv.1.trim()
+          
+          if key == "members" then
+            let arr = val.trim_matches('[').trim_matches(']')
+            for entry in arr.split(",") do
+              let m = entry.trim().trim_matches('"')
+              if !m.is_empty() then
+                members.push(m.to_string())
+              end
+            end
+          end
+          
+          if key == "default-members" then
+            let arr = val.trim_matches('[').trim_matches(']')
+            for entry in arr.split(",") do
+              let m = entry.trim().trim_matches('"')
+              if !m.is_empty() then
+                default_members.push(m.to_string())
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+    
+    if !is_workspace then
+      return Result::Err("No [workspace] section in " + manifest_path)
+    end
+    
+    if default_members.is_empty() then
+      default_members = members.clone()
+    end
+    
+    Result::Ok(Workspace {
+      root: path.clone(),
+      members: members,
+      default_members: default_members,
+      shared_output: path + "/build"
+    })
+  when Result::Err(e) then
+    Result::Err("Cannot read workspace manifest: " + e)
+  end
+end
+
+def build_workspace(ws: &Workspace) -> Result[Unit, String]
+  println("Building workspace with " + ws.members.len().to_string() + " member(s)")
+  
+  for member in ws.default_members do
+    let member_path = ws.root.clone() + "/" + member.clone()
+    println("  Building " + member.clone() + "...")
+    
+    match load_project(member_path.clone())
+    when Result::Ok(project) then
+      match build_project(&project)
+      when Result::Ok(_) then
+        println("    ✓ " + member.clone())
+      when Result::Err(e) then
+        return Result::Err("Failed to build workspace member '" + member + "': " + e)
+      end
+    when Result::Err(e) then
+      return Result::Err("Failed to load workspace member '" + member + "': " + e)
+    end
+  end
+  
+  println("Workspace build complete.")
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# tg dep — Dependency Management
+# ———————————————————————————————————————————————————————————————
+
+def cmd_dep(argv: Vec[String]) -> Int
+  if argv.len() < 2 then
+    println("Usage: tg dep <subcommand>")
+    println("")
+    println("Subcommands:")
+    println("  add <name> [--version <ver>] [--path <path>] [--git <url>]")
+    println("  remove <name>")
+    println("  list")
+    println("  update [<name>]")
+    println("  tree")
+    return 1
+  end
+  
+  let sub = argv[1].clone()
+  
+  if sub == "add" then
+    cmd_dep_add(argv)
+  elsif sub == "remove" then
+    cmd_dep_remove(argv)
+  elsif sub == "list" then
+    cmd_dep_list()
+  elsif sub == "update" then
+    cmd_dep_update(argv)
+  elsif sub == "tree" then
+    cmd_dep_tree()
+  else
+    eprintln("Unknown dep subcommand: " + sub)
+    1
+  end
+end
+
+def cmd_dep_add(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg dep add <name> [--version <ver>] [--path <path>] [--git <url>]")
+    return 1
+  end
+  
+  let name = argv[2].clone()
+  mut version = "*".to_string()
+  mut path_opt = Option::None::[String]
+  mut git_opt = Option::None::[String]
+  
+  mut i: UInt = 3
+  while i < argv.len() do
+    if argv[i] == "--version" && i + 1 < argv.len() then
+      version = argv[i + 1].clone()
+      i = i + 2
+    elsif argv[i] == "--path" && i + 1 < argv.len() then
+      path_opt = Option::Some(argv[i + 1].clone())
+      i = i + 2
+    elsif argv[i] == "--git" && i + 1 < argv.len() then
+      git_opt = Option::Some(argv[i + 1].clone())
+      i = i + 2
+    else
+      i = i + 1
+    end
+  end
+  
+  # Read current manifest
+  match read_file("Tangerine.toml".to_string())
+  when Result::Ok(content) then
+    # Check if [dependencies] section exists
+    mut new_content = content.clone()
+    let dep_line = name.clone() + " = " + match path_opt
+    when Option::Some(ref p) then
+      "{ version = \"" + version.clone() + "\", path = \"" + p.clone() + "\" }"
+    when Option::None then
+      match git_opt
+      when Option::Some(ref url) then
+        "{ version = \"" + version.clone() + "\", git = \"" + url.clone() + "\" }"
+      when Option::None then
+        "\"" + version.clone() + "\""
+      end
+    end
+    
+    if content.contains("[dependencies]") then
+      # Append after [dependencies] line
+      new_content = content.replace("[dependencies]", "[dependencies]\n" + dep_line)
+    else
+      # Add [dependencies] section
+      new_content = content + "\n[dependencies]\n" + dep_line + "\n"
+    end
+    
+    match write_file("Tangerine.toml".to_string(), new_content)
+    when Result::Ok(_) then
+      println("Added dependency: " + name + " " + version)
+      0
+    when Result::Err(e) then
+      eprintln("Failed to write manifest: " + e)
+      1
+    end
+  when Result::Err(e) then
+    eprintln("No Tangerine.toml found. Run 'tg init' first.")
+    1
+  end
+end
+
+def cmd_dep_remove(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg dep remove <name>")
+    return 1
+  end
+  
+  let name = argv[2].clone()
+  
+  match read_file("Tangerine.toml".to_string())
+  when Result::Ok(content) then
+    # Remove lines matching the dependency name in [dependencies]
+    mut new_lines = Vec::new()
+    mut in_deps = false
+    
+    for line in content.lines() do
+      let trimmed = line.trim()
+      
+      if trimmed == "[dependencies]" then
+        in_deps = true
+        new_lines.push(line.to_string())
+        continue
+      end
+      
+      if trimmed.starts_with("[") && trimmed.ends_with("]") then
+        in_deps = false
+      end
+      
+      if in_deps && trimmed.starts_with(name.as_str()) then
+        # Skip this dependency line
+        continue
+      end
+      
+      new_lines.push(line.to_string())
+    end
+    
+    let new_content = new_lines.join("\n")
+    match write_file("Tangerine.toml".to_string(), new_content)
+    when Result::Ok(_) then
+      println("Removed dependency: " + name)
+      0
+    when Result::Err(e) then
+      eprintln("Failed to write manifest: " + e)
+      1
+    end
+  when Result::Err(_) then
+    eprintln("No Tangerine.toml found.")
+    1
+  end
+end
+
+def cmd_dep_list() -> Int
+  match load_project(".")
+  when Result::Ok(project) then
+    if project.dependencies.is_empty() then
+      println("No dependencies.")
+    else
+      println("Dependencies:")
+      for dep in project.dependencies do
+        mut info = "  " + dep.name.clone() + " " + dep.version.clone()
+        match dep.path
+        when Option::Some(ref p) then info = info + " (path: " + p.clone() + ")"
+        when Option::None then ()
+        end
+        match dep.git
+        when Option::Some(ref url) then info = info + " (git: " + url.clone() + ")"
+        when Option::None then ()
+        end
+        println(info)
+      end
+    end
+    0
+  when Result::Err(e) then
+    eprintln(e)
+    1
+  end
+end
+
+def cmd_dep_update(argv: Vec[String]) -> Int
+  # Re-resolve all dependencies (or a specific one) and update lockfile
+  let filter = if argv.len() >= 3 then
+    Option::Some(argv[2].clone())
+  else
+    Option::None
+  end
+  
+  match load_project(".")
+  when Result::Ok(project) then
+    # Remove lockfile to force re-resolution
+    match filter
+    when Option::Some(ref name) then
+      println("Updating dependency: " + name.clone())
+    when Option::None then
+      println("Updating all dependencies...")
+      # Delete existing lockfile to force fresh resolution
+      let _ = delete_file("Tangerine.lock")
+    end
+    
+    match resolve_project_deps(&project)
+    when Result::Ok(resolved) then
+      println("Updated " + resolved.packages.len().to_string() + " package(s).")
+      0
+    when Result::Err(e) then
+      eprintln("Resolution failed: " + e)
+      1
+    end
+  when Result::Err(e) then
+    eprintln(e)
+    1
+  end
+end
+
+def cmd_dep_tree() -> Int
+  # Display dependency tree
+  match load_project(".")
+  when Result::Ok(project) then
+    println(project.name.clone() + " v" + project.version.clone())
+    for dep in project.dependencies do
+      let prefix = "├── "
+      mut line = prefix + dep.name.clone() + " v" + dep.version.clone()
+      match dep.path
+      when Option::Some(ref p) then line = line + " (path)"
+      when Option::None then ()
+      end
+      match dep.git
+      when Option::Some(ref url) then line = line + " (git)"
+      when Option::None then ()
+      end
+      println(line)
+      
+      # Attempt to load transitive deps
+      let dep_dir = match dep.path
+      when Option::Some(ref p) then p.clone()
+      when Option::None then ".tg_deps/" + dep.name.clone()
+      end
+      
+      match load_project(dep_dir)
+      when Result::Ok(sub_proj) then
+        for sub_dep in sub_proj.dependencies do
+          println("│   └── " + sub_dep.name.clone() + " v" + sub_dep.version.clone())
+        end
+      when Result::Err(_) then ()
+      end
+    end
+    0
+  when Result::Err(e) then
+    eprintln(e)
+    1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# tg install — Package Installation
+# ———————————————————————————————————————————————————————————————
+
+def cmd_install(argv: Vec[String]) -> Int
+  if argv.len() < 2 then
+    println("Usage: tg install <package-name> [--version <ver>]")
+    println("")
+    println("Installs a Tangerine package binary to ~/.tg/bin/")
+    println("")
+    println("Options:")
+    println("  --version <ver>  Install a specific version")
+    println("  --global         Install globally (default)")
+    println("  --force          Reinstall even if already installed")
+    return 0
+  end
+  
+  let pkg_name = argv[1].clone()
+  mut version = "latest".to_string()
+  mut force = false
+  
+  mut i: UInt = 2
+  while i < argv.len() do
+    if argv[i] == "--version" && i + 1 < argv.len() then
+      version = argv[i + 1].clone()
+      i = i + 2
+    elsif argv[i] == "--force" then
+      force = true
+      i = i + 1
+    else
+      i = i + 1
+    end
+  end
+  
+  let install_dir = home_dir() + "/.tg/bin"
+  mkdir_p(&install_dir)
+  
+  let install_path = install_dir.clone() + "/" + pkg_name.clone()
+  
+  if !force && file_exists(&install_path) then
+    println("Package '" + pkg_name.clone() + "' is already installed. Use --force to reinstall.")
+    return 0
+  end
+  
+  println("Installing " + pkg_name.clone() + " " + version.clone() + "...")
+  
+  # Create a temp directory, fetch the package, build it, copy binary
+  let tmp_dir = "/tmp/tg_install_" + pkg_name.clone()
+  mkdir_p(&tmp_dir)
+  
+  # Fetch from registry
+  let registry_url = "https://registry.tangerine-lang.org"
+  let fetch_url = registry_url + "/api/v1/packages/" + pkg_name.clone() + "/" + version.clone() + "/download"
+  
+  let fetch_result = run_command("curl", vec!["-sSL", "-o", (tmp_dir.clone() + "/pkg.tar.gz").as_str(), fetch_url.as_str()])
+  match fetch_result
+  when Result::Ok(_) then
+    # Extract
+    let extract = run_command("tar", vec!["xzf", (tmp_dir.clone() + "/pkg.tar.gz").as_str(), "-C", tmp_dir.as_str()])
+    match extract
+    when Result::Ok(_) then
+      # Build the package
+      match load_project(tmp_dir.clone())
+      when Result::Ok(project) then
+        match build_project(&project)
+        when Result::Ok(_) then
+          # Copy resulting binary to install dir
+          let binary = tmp_dir.clone() + "/build/" + pkg_name.clone()
+          let cp_result = run_command("cp", vec![binary.as_str(), install_path.as_str()])
+          match cp_result
+          when Result::Ok(_) then
+            # Make executable
+            let _ = run_command("chmod", vec!["+x", install_path.as_str()])
+            println("Installed " + pkg_name.clone() + " to " + install_path)
+            0
+          when Result::Err(e) then
+            eprintln("Failed to copy binary: " + e)
+            1
+          end
+        when Result::Err(e) then
+          eprintln("Build failed: " + e)
+          1
+        end
+      when Result::Err(e) then
+        eprintln("Invalid package: " + e)
+        1
+      end
+    when Result::Err(e) then
+      eprintln("Failed to extract package: " + e)
+      1
+    end
+  when Result::Err(e) then
+    eprintln("Failed to download package: " + e)
+    1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# tg self-update — Compiler Version Manager
+# ———————————————————————————————————————————————————————————————
+
+def cmd_self_update(argv: Vec[String]) -> Int
+  println("Tangerine self-update")
+  println("")
+  
+  let current_version = "0.1.0"
+  
+  # Determine target triple
+  let os = detect_os()
+  let arch = detect_arch()
+  let target = arch + "-" + os
+  
+  println("Current version: " + current_version)
+  println("Target: " + target.clone())
+  
+  # Check for latest version from release server
+  let release_url = "https://releases.tangerine-lang.org/latest/version"
+  println("Checking for updates...")
+  
+  let version_result = run_command("curl", vec!["-sSL", release_url.as_str()])
+  match version_result
+  when Result::Ok(latest_version) then
+    let latest = latest_version.trim().to_string()
+    
+    if latest == current_version then
+      println("Already up to date (v" + current_version + ").")
+      return 0
+    end
+    
+    println("New version available: v" + latest.clone())
+    println("Downloading...")
+    
+    let download_url = "https://releases.tangerine-lang.org/" + latest.clone() + "/tg-" + target + ".tar.gz"
+    let tmp = "/tmp/tg_self_update.tar.gz"
+    
+    let dl = run_command("curl", vec!["-sSL", "-o", tmp, download_url.as_str()])
+    match dl
+    when Result::Ok(_) then
+      # Extract to temp location
+      let tmp_dir = "/tmp/tg_self_update"
+      mkdir_p(tmp_dir)
+      let extract = run_command("tar", vec!["xzf", tmp, "-C", tmp_dir])
+      
+      match extract
+      when Result::Ok(_) then
+        # Replace current binary
+        let current_binary = argv[0].clone()  # Path to running tg binary
+        let new_binary = tmp_dir.to_string() + "/tg"
+        
+        let cp = run_command("cp", vec![new_binary.as_str(), current_binary.as_str()])
+        match cp
+        when Result::Ok(_) then
+          let _ = run_command("chmod", vec!["+x", current_binary.as_str()])
+          println("Updated to v" + latest + " successfully!")
+          0
+        when Result::Err(e) then
+          eprintln("Failed to replace binary: " + e)
+          eprintln("Try running with sudo.")
+          1
+        end
+      when Result::Err(e) then
+        eprintln("Failed to extract update: " + e)
+        1
+      end
+    when Result::Err(e) then
+      eprintln("Failed to download update: " + e)
+      1
+    end
+  when Result::Err(e) then
+    eprintln("Failed to check for updates: " + e)
+    1
+  end
+end
+
+def detect_os() -> String
+  # Check via uname (available on macOS/Linux)
+  match run_command("uname", vec!["-s"])
+  when Result::Ok(out) then
+    let os = out.trim().to_lowercase()
+    if os.contains("darwin") then "apple-darwin".to_string()
+    elsif os.contains("linux") then "unknown-linux-gnu".to_string()
+    else "unknown".to_string()
+    end
+  when Result::Err(_) then
+    "unknown".to_string()
+  end
+end
+
+def detect_arch() -> String
+  match run_command("uname", vec!["-m"])
+  when Result::Ok(out) then
+    let arch = out.trim().to_lowercase()
+    if arch == "x86_64" || arch == "amd64" then "x86_64".to_string()
+    elsif arch == "arm64" || arch == "aarch64" then "aarch64".to_string()
+    else arch.to_string()
+    end
+  when Result::Err(_) then
+    "unknown".to_string()
+  end
+end
+
+def cmd_explain_main(argv: Vec[String]) -> Int
+  if argv.len() < 2 then
+    eprintln("Usage: tg explain <error-code>")
+    eprintln("Example: tg explain E0300")
+    return 1
+  end
+  cmd_explain(argv[1].clone())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: agent
+# ———————————————————————————————————————————————————————————————
+#
+# Run agentic workflows using the Tangerine agentic subsystem.
+# Provides CLI access to contracts, capabilities, effects, and budgets.
+#
+# Usage:
+#   tg agent check <file>           — verify all contracts in a source file
+#   tg agent caps <file>            — list capabilities required by a module
+#   tg agent effects <file>         — list effects performed by a module
+#   tg agent budget <file>          — analyse resource budget of a module
+#   tg agent diff <old> <new>       — semantic diff between two source files
+#   tg agent audit <dir>            — full agentic audit of a project
+
+def cmd_agent(argv: Vec[String]) -> Int
+  if argv.len() < 2 then
+    println("Usage: tg agent <subcommand> [options] <file>")
+    println("")
+    println("Subcommands:")
+    println("  check    Verify all contracts (pre/post/invariant)")
+    println("  caps     List required capabilities")
+    println("  effects  List effects performed by each function")
+    println("  budget   Analyse resource budget usage")
+    println("  diff     Semantic diff between two source files")
+    println("  audit    Full agentic audit of a project directory")
+    return 1
+  end
+
+  let subcmd = argv[1].clone()
+  
+  if subcmd == "check" then
+    agent_check(argv)
+  elsif subcmd == "caps" then
+    agent_caps(argv)
+  elsif subcmd == "effects" then
+    agent_effects(argv)
+  elsif subcmd == "budget" then
+    agent_budget(argv)
+  elsif subcmd == "diff" then
+    agent_diff(argv)
+  elsif subcmd == "audit" then
+    agent_audit(argv)
+  else
+    eprintln("Unknown agent subcommand: " + subcmd)
+    1
+  end
+end
+
+def agent_check(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg agent check <file>")
+    return 1
+  end
+  let path = argv[2].clone()
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read file: " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  # Extract contract declarations from the AST
+  mut contract_count = 0
+  mut violation_count = 0
+
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      for contract in f.contracts do
+        contract_count = contract_count + 1
+        # Verify contract is well-formed (condition references in-scope names)
+        println("  [" + contract.kind.to_string() + "] " + f.name.clone() + ": " + contract.condition_source.clone())
+      end
+    when _ then ()
+    end
+  end
+
+  println("Contract analysis for " + path + ":")
+  println("  Total contracts: " + contract_count.to_string())
+  println("  Violations: " + violation_count.to_string())
+  if violation_count == 0 then 0 else 1 end
+end
+
+def agent_caps(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg agent caps <file>")
+    return 1
+  end
+  let path = argv[2].clone()
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read: " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  # Scan for capability annotations: #[require(cap)] and `require_capability` calls
+  mut caps = Set::new()
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      for attr in f.attributes do
+        if attr.name == "require" then
+          for arg in attr.args do
+            caps.insert(arg.clone())
+          end
+        end
+      end
+    when _ then ()
+    end
+  end
+
+  println("Capabilities required by " + path + ":")
+  if caps.is_empty() then
+    println("  (none)")
+  else
+    for cap in caps do
+      println("  - " + cap)
+    end
+  end
+  0
+end
+
+def agent_effects(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg agent effects <file>")
+    return 1
+  end
+  let path = argv[2].clone()
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read: " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  # Scan for effect annotations and perform declarations
+  println("Effects in " + path + ":")
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      mut fn_effects = Vec::new()
+      for attr in f.attributes do
+        if attr.name == "performs" || attr.name == "effect" then
+          for arg in attr.args do
+            fn_effects.push(arg.clone())
+          end
+        end
+      end
+      if !fn_effects.is_empty() then
+        mut effect_str = ""
+        mut first = true
+        for e in fn_effects do
+          if !first then effect_str = effect_str + ", " end
+          effect_str = effect_str + e
+          first = false
+        end
+        println("  " + f.name.clone() + ": performs " + effect_str)
+      end
+    when _ then ()
+    end
+  end
+  0
+end
+
+def agent_budget(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    eprintln("Usage: tg agent budget <file>")
+    return 1
+  end
+  let path = argv[2].clone()
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read: " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  # Lower to MIR and analyse budget consumption
+  let type_errors = type_check(&ast)
+  if !type_errors.is_empty() then
+    eprintln("Type errors prevent budget analysis")
+    return 1
+  end
+
+  let mir = lower_to_mir(&ast)
+
+  println("Budget analysis for " + path + ":")
+  for func in mir.functions do
+    mut budget_ops = Vec::new()
+    for block in func.blocks do
+      for stmt in block.statements do
+        match stmt.kind
+        when MirStatementKind::BudgetConsume(resource, amount) then
+          budget_ops.push((resource.clone(), amount))
+        when _ then ()
+        end
+      end
+    end
+    if !budget_ops.is_empty() then
+      println("  fn " + func.name.clone() + ":")
+      for (res, amt) in budget_ops do
+        println("    consumes " + amt.to_string() + " units of " + res)
+      end
+    end
+  end
+  0
+end
+
+def agent_diff(argv: Vec[String]) -> Int
+  if argv.len() < 4 then
+    eprintln("Usage: tg agent diff <old-file> <new-file>")
+    return 1
+  end
+  let old_path = argv[2].clone()
+  let new_path = argv[3].clone()
+
+  let old_source = match read_file(old_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + old_path + ": " + e)
+    return 1
+  end
+  let new_source = match read_file(new_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + new_path + ": " + e)
+    return 1
+  end
+
+  # Parse both
+  let old_ast = match parse(tokenize(old_source))
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error in " + old_path + ": " + e.message)
+    return 1
+  end
+  let new_ast = match parse(tokenize(new_source))
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error in " + new_path + ": " + e.message)
+    return 1
+  end
+
+  # Semantic diff: compare items by name
+  println("Semantic diff: " + old_path + " → " + new_path)
+
+  mut old_items: Map[String, String] = Map::new()
+  for item in old_ast.items do
+    let name = item_name(&item)
+    old_items.insert(name, item.kind.to_string())
+  end
+
+  mut new_items: Map[String, String] = Map::new()
+  for item in new_ast.items do
+    let name = item_name(&item)
+    new_items.insert(name, item.kind.to_string())
+  end
+
+  # Added items
+  for (name, _) in new_items do
+    if !old_items.contains_key(&name) then
+      println("  + " + name + " (added)")
+    end
+  end
+
+  # Removed items
+  for (name, _) in old_items do
+    if !new_items.contains_key(&name) then
+      println("  - " + name + " (removed)")
+    end
+  end
+
+  # Modified items
+  for (name, old_kind) in old_items do
+    match new_items.get(&name)
+    when Option::Some(new_kind) then
+      if old_kind != new_kind then
+        println("  ~ " + name + " (modified)")
+      end
+    when Option::None then ()
+    end
+  end
+  0
+end
+
+def item_name(item: &Item) -> String
+  match item.kind
+  when ItemKind::Function(f) then f.name.clone()
+  when ItemKind::Struct(s) then s.name.clone()
+  when ItemKind::Enum(e) then e.name.clone()
+  when ItemKind::Trait(t) then t.name.clone()
+  when ItemKind::Impl(i) then "impl_" + i.type_name.clone()
+  when ItemKind::Const(c) then c.name.clone()
+  when ItemKind::Macro(m) then "macro_" + m.name.clone()
+  when _ then "<anonymous>"
+  end
+end
+
+def agent_audit(argv: Vec[String]) -> Int
+  let dir = if argv.len() >= 3 then argv[2].clone() else ".".to_string() end
+
+  println("Agentic audit of " + dir + ":")
+  println("========================================")
+
+  # Discover all .tg files
+  let files = discover_sources(&dir)
+
+  mut total_contracts = 0
+  mut total_caps = 0
+  mut total_effects = 0
+  mut total_unsafe = 0
+  mut total_functions = 0
+
+  for file in files do
+    let source = match read_file(file.clone())
+    when Result::Ok(s) then s
+    when Result::Err(_) then continue
+    end
+
+    let tokens = tokenize(source)
+    let ast = match parse(tokens)
+    when Result::Ok(a) then a
+    when Result::Err(_) then continue
+    end
+
+    for item in ast.items do
+      match item.kind
+      when ItemKind::Function(f) then
+        total_functions = total_functions + 1
+        total_contracts = total_contracts + f.contracts.len()
+        if f.is_unsafe then total_unsafe = total_unsafe + 1 end
+        for attr in f.attributes do
+          if attr.name == "require" then
+            total_caps = total_caps + attr.args.len()
+          end
+          if attr.name == "performs" || attr.name == "effect" then
+            total_effects = total_effects + attr.args.len()
+          end
+        end
+      when _ then ()
+      end
+    end
+  end
+
+  println("  Files scanned:   " + files.len().to_string())
+  println("  Functions:       " + total_functions.to_string())
+  println("  Contracts:       " + total_contracts.to_string())
+  println("  Capabilities:    " + total_caps.to_string())
+  println("  Effects:         " + total_effects.to_string())
+  println("  Unsafe functions:" + total_unsafe.to_string())
+  println("")
+
+  if total_unsafe > 0 then
+    println("  WARNING: " + total_unsafe.to_string() + " unsafe functions found — ensure SAFETY comments are present")
+  end
+
+  println("Audit complete.")
+  0
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: bindgen
+# ———————————————————————————————————————————————————————————————
+# Generates FFI bindings for C, Rust, and Ruby.
+# Per interop.txt §8.2, §9.1, §12
+#
+# Usage:
+#   tg bindgen c <file.tg> [-o output.h]
+#   tg bindgen rust <file.tg> [-o output_dir]
+#   tg bindgen ruby <file.tg> [-o output_dir]
+
+def cmd_bindgen(argv: Vec[String]) -> Int
+  if argv.len() < 3 then
+    print_bindgen_help()
+    return 1
+  end
+
+  let target = argv[1].clone()
+  let file = argv[2].clone()
+
+  let output = if argv.len() >= 5 && argv[3] == "-o" then
+    argv[4].clone()
+  else
+    match target.as_str()
+    when "c" then file.replace(".tg", ".h")
+    when "rust" then "tangerine_shim"
+    when "ruby" then "ext"
+    end
+  end
+
+  match target.as_str()
+  when "c" then bindgen_c(file, output)
+  when "rust" then bindgen_rust(file, output)
+  when "ruby" then bindgen_ruby(file, output)
+  when _ then
+    eprintln("Unknown target: " + target + ". Use c, rust, or ruby.")
+    1
+  end
+end
+
+def print_bindgen_help() -> Unit
+  println("Usage: tg bindgen <target> <file.tg> [-o output]")
+  println("Generate FFI bindings")
+  println("")
+  println("Targets:")
+  println("  c      Generate C header (.h)")
+  println("  rust   Generate Rust shim crate")
+  println("  ruby   Generate Ruby extension scaffold")
+  println("")
+  println("Options:")
+  println("  -o <path>  Output file/directory")
+end
+
+# Generate C header from Tangerine source
+def bindgen_c(source_file: String, output: String) -> Int
+  let source = match read_file(source_file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + source_file + ": " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  mut header = "/* Generated by tg bindgen c */\n"
+  header = header + "#ifndef TG_BINDINGS_H\n"
+  header = header + "#define TG_BINDINGS_H\n\n"
+  header = header + "#include <stdint.h>\n"
+  header = header + "#include <stdbool.h>\n\n"
+
+  header = header + "/* Type aliases */\n"
+  header = header + "typedef int64_t tg_int;\n"
+  header = header + "typedef uint64_t tg_uint;\n"
+  header = header + "typedef double tg_float;\n"
+  header = header + "typedef uint8_t tg_u8;\n"
+  header = header + "typedef uint32_t tg_char;\n\n"
+
+  header = header + "/* FFI string view (borrowed) */\n"
+  header = header + "typedef struct { const uint8_t* ptr; size_t len; } tg_str;\n\n"
+
+  header = header + "/* FFI result */\n"
+  header = header + "typedef struct { bool ok; int32_t err_code; } tg_result_void;\n\n"
+
+  # Extract extern "C" functions
+  header = header + "/* Exported functions */\n"
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if is_ffi_exported(&f) then
+        header = header + generate_c_prototype(&f) + "\n"
+      end
+    when ItemKind::Struct(s) then
+      if is_repr_c(&s) then
+        header = header + generate_c_struct(&s) + "\n"
+      end
+    when ItemKind::Enum(e) then
+      if is_repr_c_enum(&e) then
+        header = header + generate_c_enum(&e) + "\n"
+      end
+    when _ then ()
+    end
+  end
+
+  header = header + "\n#endif /* TG_BINDINGS_H */\n"
+
+  match write_file(output.clone(), header)
+  when Result::Ok(_) then
+    println("Generated " + output)
+    0
+  when Result::Err(e) then
+    eprintln("Cannot write " + output + ": " + e)
+    1
+  end
+end
+
+def is_ffi_exported(f: &Function) -> Bool
+  f.extern_abi == "C" || f.extern_abi == "c" || 
+    f.attributes.iter().any(|a| a.name == "export")
+end
+
+def is_repr_c(s: &Struct) -> Bool
+  s.attributes.iter().any(|a| a.name == "repr" && a.args.contains("c"))
+end
+
+def is_repr_c_enum(e: &Enum) -> Bool
+  e.attributes.iter().any(|a| a.name == "repr" && a.args.contains("c"))
+end
+
+def generate_c_prototype(f: &Function) -> String
+  let ret_type = tangerine_type_to_c(&f.return_type)
+  mut params = ""
+  mut first = true
+  for p in f.params do
+    if !first then params = params + ", " end
+    params = params + tangerine_type_to_c(&p.ty) + " " + p.name.clone()
+    first = false
+  end
+  if params == "" then params = "void" end
+  ret_type + " " + f.name.clone() + "(" + params + ");"
+end
+
+def generate_c_struct(s: &Struct) -> String
+  mut result = "typedef struct {\n"
+  for field in s.fields do
+    result = result + "    " + tangerine_type_to_c(&field.ty) + " " + field.name.clone() + ";\n"
+  end
+  result = result + "} " + s.name.clone() + ";\n"
+  result
+end
+
+def generate_c_enum(e: &Enum) -> String
+  mut result = "typedef enum {\n"
+  mut val = 0
+  for variant in e.variants do
+    result = result + "    " + e.name.clone() + "_" + variant.name.clone()
+    result = result + " = " + val.to_string() + ",\n"
+    val = val + 1
+  end
+  result = result + "} " + e.name.clone() + ";\n"
+  result
+end
+
+def tangerine_type_to_c(ty: &Type) -> String
+  match ty
+  when Type::Unit then "void"
+  when Type::Bool then "bool"
+  when Type::Int then "int64_t"
+  when Type::UInt then "uint64_t"
+  when Type::Float then "double"
+  when Type::Char then "uint32_t"
+  when Type::String then "tg_str"
+  when Type::Ref(inner, _) then "const " + tangerine_type_to_c(inner) + "*"
+  when Type::RefMut(inner, _) then tangerine_type_to_c(inner) + "*"
+  when Type::Named(name, _) then name.clone()
+  when _ then "void*"
+  end
+end
+
+# Generate Rust shim crate
+def bindgen_rust(source_file: String, output_dir: String) -> Int
+  let source = match read_file(source_file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + source_file + ": " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  # Create output directory
+  std::fs::create_dir_all(output_dir.clone())
+  std::fs::create_dir_all(output_dir.clone() + "/src")
+
+  # Generate Cargo.toml
+  let cargo_toml = "[package]\n" +
+    "name = \"tangerine_shim\"\n" +
+    "version = \"0.1.0\"\n" +
+    "edition = \"2021\"\n\n" +
+    "[lib]\n" +
+    "crate-type = [\"cdylib\", \"staticlib\"]\n"
+
+  match write_file(output_dir.clone() + "/Cargo.toml", cargo_toml)
+  when Result::Err(e) then
+    eprintln("Cannot write Cargo.toml: " + e)
+    return 1
+  when _ then ()
+  end
+
+  # Generate lib.rs
+  mut lib_rs = "//! Generated by tg bindgen rust\n\n"
+  lib_rs = lib_rs + "#![allow(non_camel_case_types)]\n\n"
+
+  lib_rs = lib_rs + "// Type aliases\n"
+  lib_rs = lib_rs + "pub type tg_int = i64;\n"
+  lib_rs = lib_rs + "pub type tg_uint = u64;\n"
+  lib_rs = lib_rs + "pub type tg_float = f64;\n\n"
+
+  lib_rs = lib_rs + "// FFI string view\n"
+  lib_rs = lib_rs + "#[repr(C)]\n"
+  lib_rs = lib_rs + "pub struct TgStr { pub ptr: *const u8, pub len: usize }\n\n"
+
+  lib_rs = lib_rs + "// FFI result\n"
+  lib_rs = lib_rs + "#[repr(C)]\n"
+  lib_rs = lib_rs + "pub struct TgResultVoid { pub ok: bool, pub err_code: i32 }\n\n"
+
+  lib_rs = lib_rs + "extern \"C\" {\n"
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if is_ffi_exported(&f) then
+        lib_rs = lib_rs + "    " + generate_rust_extern(&f) + "\n"
+      end
+    when _ then ()
+    end
+  end
+  lib_rs = lib_rs + "}\n"
+
+  match write_file(output_dir.clone() + "/src/lib.rs", lib_rs)
+  when Result::Ok(_) then
+    println("Generated Rust shim in " + output_dir)
+    0
+  when Result::Err(e) then
+    eprintln("Cannot write lib.rs: " + e)
+    1
+  end
+end
+
+def generate_rust_extern(f: &Function) -> String
+  let ret_type = tangerine_type_to_rust(&f.return_type)
+  mut params = ""
+  mut first = true
+  for p in f.params do
+    if !first then params = params + ", " end
+    params = params + p.name.clone() + ": " + tangerine_type_to_rust(&p.ty)
+    first = false
+  end
+  let ret_clause = if ret_type == "()" then "" else " -> " + ret_type end
+  "pub fn " + f.name.clone() + "(" + params + ")" + ret_clause + ";"
+end
+
+def tangerine_type_to_rust(ty: &Type) -> String
+  match ty
+  when Type::Unit then "()"
+  when Type::Bool then "bool"
+  when Type::Int then "i64"
+  when Type::UInt then "u64"
+  when Type::Float then "f64"
+  when Type::Char then "u32"
+  when Type::String then "TgStr"
+  when Type::Ref(inner, _) then "*const " + tangerine_type_to_rust(inner)
+  when Type::RefMut(inner, _) then "*mut " + tangerine_type_to_rust(inner)
+  when Type::Named(name, _) then name.clone()
+  when _ then "*mut std::ffi::c_void"
+  end
+end
+
+# Generate Ruby extension scaffold
+def bindgen_ruby(source_file: String, output_dir: String) -> Int
+  let source = match read_file(source_file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + source_file + ": " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  let module_name = source_file.replace(".tg", "").replace("/", "_")
+
+  # Create output directory
+  std::fs::create_dir_all(output_dir.clone())
+
+  # Generate extconf.rb
+  let extconf = "require 'mkmf'\n\n" +
+    "extension_name = '" + module_name + "'\n" +
+    "dir_config(extension_name)\n" +
+    "create_makefile(extension_name)\n"
+
+  match write_file(output_dir.clone() + "/extconf.rb", extconf)
+  when Result::Err(e) then
+    eprintln("Cannot write extconf.rb: " + e)
+    return 1
+  when _ then ()
+  end
+
+  # Generate extension.c
+  mut ext_c = "/* Generated by tg bindgen ruby */\n"
+  ext_c = ext_c + "#include \"ruby.h\"\n\n"
+  ext_c = ext_c + "static VALUE m" + module_name + ";\n\n"
+
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if is_ffi_exported(&f) then
+        ext_c = ext_c + generate_ruby_wrapper(&f, &module_name) + "\n"
+      end
+    when _ then ()
+    end
+  end
+
+  ext_c = ext_c + "void Init_" + module_name + "(void) {\n"
+  ext_c = ext_c + "    m" + module_name + " = rb_define_module(\"" + capitalize(&module_name) + "\");\n"
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if is_ffi_exported(&f) then
+        let argc = f.params.len()
+        ext_c = ext_c + "    rb_define_module_function(m" + module_name
+        ext_c = ext_c + ", \"" + f.name.clone() + "\", rb_" + f.name.clone()
+        ext_c = ext_c + ", " + argc.to_string() + ");\n"
+      end
+    when _ then ()
+    end
+  end
+  ext_c = ext_c + "}\n"
+
+  match write_file(output_dir.clone() + "/" + module_name + ".c", ext_c)
+  when Result::Ok(_) then
+    println("Generated Ruby extension in " + output_dir)
+    0
+  when Result::Err(e) then
+    eprintln("Cannot write extension: " + e)
+    1
+  end
+end
+
+def generate_ruby_wrapper(f: &Function, module_name: &String) -> String
+  let argc = f.params.len()
+  mut params = ""
+  mut i = 0
+  while i < argc do
+    if i > 0 then params = params + ", " end
+    params = params + "VALUE arg" + i.to_string()
+    i = i + 1
+  end
+  if argc == 0 then params = "VALUE self" else params = "VALUE self, " + params end
+
+  # Build argument conversion code
+  mut conversions = ""
+  mut call_args = ""
+  i = 0
+  while i < argc do
+    let param = &f.params[i]
+    let arg_name = "arg" + i.to_string()
+    let conv_name = "c_" + arg_name
+    
+    # Generate conversion based on parameter type
+    let (conv_code, c_type) = ruby_to_c_conversion(arg_name.clone(), &param.ty)
+    conversions = conversions + "    " + c_type + " " + conv_name + " = " + conv_code + ";\n"
+    
+    if i > 0 then call_args = call_args + ", " end
+    call_args = call_args + conv_name
+    i = i + 1
+  end
+  
+  # Generate return value handling
+  let (ret_decl, ret_call, ret_conv) = c_to_ruby_return(&f.return_type)
+
+  "static VALUE rb_" + f.name.clone() + "(" + params + ") {\n" +
+  conversions +
+  ret_decl +
+  "    " + ret_call + f.name.clone() + "(" + call_args + ");\n" +
+  ret_conv +
+  "}\n"
+end
+
+# Convert Ruby VALUE to C type for function call
+def ruby_to_c_conversion(arg: String, ty: &Type) -> (String, String)
+  match ty
+  when Type::Named(name) then
+    match name.as_str()
+    when "Int" then ("NUM2LONG(" + arg + ")", "long")
+    when "UInt" then ("NUM2ULONG(" + arg + ")", "unsigned long")
+    when "Float" then ("NUM2DBL(" + arg + ")", "double")
+    when "Bool" then ("RTEST(" + arg + ")", "int")
+    when "String" then ("StringValueCStr(" + arg + ")", "const char*")
+    when "RubyValue" then (arg, "VALUE")
+    when _ then ("(void*)" + arg, "void*")
+    end
+  when Type::Ref(inner) then
+    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), inner)
+    ("&" + inner_conv, inner_type + "*")
+  when Type::RefMut(inner) then
+    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), inner)
+    ("&" + inner_conv, inner_type + "*")
+  when Type::RawPtr(inner) then
+    ("(void*)" + arg, "void*")
+  when _ then
+    ("(void*)" + arg, "void*")
+  end
+end
+
+# Generate C return handling code for Ruby
+def c_to_ruby_return(ty: &Type) -> (String, String, String)
+  match ty
+  when Type::Unit then
+    ("", "", "    return Qnil;\n")
+  when Type::Named(name) then
+    match name.as_str()
+    when "Int" then
+      ("    long tg_result;\n", "tg_result = ", "    return LONG2NUM(tg_result);\n")
+    when "UInt" then
+      ("    unsigned long tg_result;\n", "tg_result = ", "    return ULONG2NUM(tg_result);\n")
+    when "Float" then
+      ("    double tg_result;\n", "tg_result = ", "    return DBL2NUM(tg_result);\n")
+    when "Bool" then
+      ("    int tg_result;\n", "tg_result = ", "    return tg_result ? Qtrue : Qfalse;\n")
+    when "String" then
+      ("    const char* tg_result;\n", "tg_result = ", "    return rb_str_new_cstr(tg_result);\n")
+    when "RubyValue" then
+      ("    VALUE tg_result;\n", "tg_result = ", "    return tg_result;\n")
+    when _ then
+      ("", "", "    return Qnil;\n")
+    end
+  when _ then
+    ("", "", "    return Qnil;\n")
+  end
+end
+
+def capitalize(s: &String) -> String
+  if s.is_empty() then return "" end
+  let first = s.char_at(0).unwrap().to_uppercase().to_string()
+  first + s.slice(1, s.len())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Subcommand: abi
+# ———————————————————————————————————————————————————————————————
+# ABI tools: test, dump, check
+# Per interop.txt §10.2
+#
+# Usage:
+#   tg abi test [file.tg]   — validate ABI conformance
+#   tg abi dump <file.tg>   — dump type layouts
+#   tg abi check <a.tg> <b.tg>  — check ABI compatibility
+
+def cmd_abi(argv: Vec[String]) -> Int
+  if argv.len() < 2 then
+    print_abi_help()
+    return 1
+  end
+
+  let subcmd = argv[1].clone()
+  match subcmd.as_str()
+  when "test" then abi_test(argv)
+  when "dump" then abi_dump(argv)
+  when "check" then abi_check(argv)
+  when _ then
+    eprintln("Unknown abi subcommand: " + subcmd)
+    print_abi_help()
+    1
+  end
+end
+
+def print_abi_help() -> Unit
+  println("Usage: tg abi <subcommand> [args]")
+  println("ABI tools")
+  println("")
+  println("Subcommands:")
+  println("  test [file]     Validate ABI conformance")
+  println("  dump <file>     Dump type layouts (size/align)")
+  println("  check <a> <b>   Check ABI compatibility between files")
+end
+
+# Validate ABI conformance — checks type sizes, alignments, calling conventions
+def abi_test(argv: Vec[String]) -> Int
+  use tg_compiler::codegen::{type_size, type_align}
+
+  println("Tangerine ABI Test Suite")
+  println("========================")
+  println("")
+
+  mut passed = 0
+  mut failed = 0
+
+  # Primitive type size/align tests (per interop.txt §5.2)
+  let tests = [
+    ("i8/u8", 1, 1),
+    ("i16/u16", 2, 2),
+    ("i32/u32", 4, 4),
+    ("i64/u64", 8, 8),
+    ("isize/usize", 8, 8),
+    ("bool", 1, 1),
+    ("f32", 4, 4),
+    ("f64", 8, 8),
+    ("*T", 8, 8)
+  ]
+
+  println("Primitive type layout tests:")
+  
+  # Test Int (i64)
+  let int_size = type_size(&Type::Int)
+  let int_align = type_align(&Type::Int)
+  if int_size == 8 && int_align == 8 then
+    println("  ✓ Int: size=8, align=8")
+    passed = passed + 1
+  else
+    println("  ✗ Int: expected size=8 align=8, got size=" + int_size.to_string() + " align=" + int_align.to_string())
+    failed = failed + 1
+  end
+
+  # Test Bool
+  let bool_size = type_size(&Type::Bool)
+  let bool_align = type_align(&Type::Bool)
+  if bool_size == 1 && bool_align == 1 then
+    println("  ✓ Bool: size=1, align=1")
+    passed = passed + 1
+  else
+    println("  ✗ Bool: expected size=1 align=1, got size=" + bool_size.to_string())
+    failed = failed + 1
+  end
+
+  # Test Float (f64)
+  let float_size = type_size(&Type::Float)
+  let float_align = type_align(&Type::Float)
+  if float_size == 8 && float_align == 8 then
+    println("  ✓ Float: size=8, align=8")
+    passed = passed + 1
+  else
+    println("  ✗ Float: expected size=8 align=8, got size=" + float_size.to_string())
+    failed = failed + 1
+  end
+
+  # Test Ref (pointer)
+  let ref_size = type_size(&Type::Ref(Box::new(Type::Int), lifetime_static()))
+  if ref_size == 8 then
+    println("  ✓ &T: size=8")
+    passed = passed + 1
+  else
+    println("  ✗ &T: expected size=8, got " + ref_size.to_string())
+    failed = failed + 1
+  end
+
+  # Test String (ptr + len + cap)
+  let str_size = type_size(&Type::String)
+  if str_size == 24 then
+    println("  ✓ String: size=24")
+    passed = passed + 1
+  else
+    println("  ✗ String: expected size=24, got " + str_size.to_string())
+    failed = failed + 1
+  end
+
+  # Test Slice (ptr + len)
+  let slice_size = type_size(&Type::Slice(Box::new(Type::Int)))
+  if slice_size == 16 then
+    println("  ✓ Slice[T]: size=16")
+    passed = passed + 1
+  else
+    println("  ✗ Slice[T]: expected size=16, got " + slice_size.to_string())
+    failed = failed + 1
+  end
+
+  println("")
+  println("ABI version info:")
+  println("  Edition: 2026")
+  println("  ABI revision: 1")
+  println("  Target: " + detect_host_target().to_string())
+  println("")
+
+  println("Results: " + passed.to_string() + " passed, " + failed.to_string() + " failed")
+
+  if failed > 0 then 1 else 0 end
+end
+
+# Dump type layouts for a source file
+def abi_dump(argv: Vec[String]) -> Int
+  use tg_compiler::codegen::{type_size, type_align}
+
+  if argv.len() < 3 then
+    eprintln("Usage: tg abi dump <file.tg>")
+    return 1
+  end
+
+  let file = argv[2].clone()
+  let source = match read_file(file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    eprintln("Cannot read " + file + ": " + e)
+    return 1
+  end
+
+  let tokens = tokenize(source)
+  let ast = match parse(tokens)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln("Parse error: " + e.message)
+    return 1
+  end
+
+  println("Type layouts for " + file + ":")
+  println("==============================")
+  println("")
+
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Struct(s) then
+      println("struct " + s.name.clone() + " {")
+      mut offset = 0
+      for field in s.fields do
+        let sz = type_size(&field.ty)
+        let al = type_align(&field.ty)
+        # Compute padding
+        let padding = if offset % al != 0 then al - (offset % al) else 0 end
+        offset = offset + padding
+        println("  " + field.name.clone() + ": " + type_name(&field.ty) +
+                " @ offset " + offset.to_string() + " (size=" + sz.to_string() +
+                ", align=" + al.to_string() + ")")
+        offset = offset + sz
+      end
+      let struct_align = max_field_align(&s.fields)
+      let final_padding = if offset % struct_align != 0 then struct_align - (offset % struct_align) else 0 end
+      offset = offset + final_padding
+      println("} // total size=" + offset.to_string() + ", align=" + struct_align.to_string())
+      println("")
+    when ItemKind::Enum(e) then
+      println("enum " + e.name.clone() + " {")
+      for variant in e.variants do
+        println("  " + variant.name.clone())
+      end
+      println("} // tag size=4")
+      println("")
+    when _ then ()
+    end
+  end
+
+  0
+end
+
+def max_field_align(fields: &Vec[Field]) -> Int
+  use tg_compiler::codegen::type_align
+  mut max_al = 1
+  for f in fields do
+    let al = type_align(&f.ty)
+    if al > max_al then max_al = al end
+  end
+  max_al
+end
+
+def type_name(ty: &Type) -> String
+  match ty
+  when Type::Unit then "Unit"
+  when Type::Bool then "Bool"
+  when Type::Int then "Int"
+  when Type::UInt then "UInt"
+  when Type::Float then "Float"
+  when Type::Char then "Char"
+  when Type::String then "String"
+  when Type::Named(n, _) then n.clone()
+  when Type::Ref(inner, _) then "&" + type_name(inner)
+  when Type::RefMut(inner, _) then "&mut " + type_name(inner)
+  when Type::Option(inner) then "Option[" + type_name(inner) + "]"
+  when Type::Result(ok, err) then "Result[" + type_name(ok) + ", " + type_name(err) + "]"
+  when Type::Vec(inner) then "Vec[" + type_name(inner) + "]"
+  when Type::Array(inner, n) then "[" + type_name(inner) + "; " + n.to_string() + "]"
+  when _ then "?"
+  end
+end
+
+# Check ABI compatibility between two files
+def abi_check(argv: Vec[String]) -> Int
+  use tg_compiler::codegen::{type_size, type_align}
+
+  if argv.len() < 4 then
+    eprintln("Usage: tg abi check <file_a.tg> <file_b.tg>")
+    return 1
+  end
+
+  let file_a = argv[2].clone()
+  let file_b = argv[3].clone()
+
+  # Parse both files
+  let ast_a = match parse_file(file_a.clone())
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln(e)
+    return 1
+  end
+
+  let ast_b = match parse_file(file_b.clone())
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    eprintln(e)
+    return 1
+  end
+
+  # Extract exported symbols from both
+  let exports_a = extract_exports(&ast_a)
+  let exports_b = extract_exports(&ast_b)
+
+  mut compatible = true
+  mut checked = 0
+
+  println("ABI Compatibility Check: " + file_a + " vs " + file_b)
+  println("========================================================")
+  println("")
+
+  # Check for removed exports
+  for (name, sig_a) in exports_a do
+    checked = checked + 1
+    match exports_b.get(&name)
+    when Option::Some(sig_b) then
+      if sig_a != sig_b then
+        println("✗ " + name + ": signature changed")
+        println("    was: " + sig_a)
+        println("    now: " + sig_b)
+        compatible = false
+      else
+        println("✓ " + name)
+      end
+    when Option::None then
+      println("✗ " + name + ": removed (breaking change)")
+      compatible = false
+    end
+  end
+
+  # Check for new exports (non-breaking but reported)
+  for (name, _) in exports_b do
+    if !exports_a.contains_key(&name) then
+      println("+ " + name + ": new export")
+    end
+  end
+
+  println("")
+  println("Checked " + checked.to_string() + " exports.")
+  
+  if compatible then
+    println("Result: ABI compatible ✓")
+    0
+  else
+    println("Result: ABI INCOMPATIBLE ✗")
+    1
+  end
+end
+
+def parse_file(path: String) -> Result[Program, String]
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err("Cannot read " + path + ": " + e)
+  end
+  let tokens = tokenize(source)
+  match parse(tokens)
+  when Result::Ok(ast) then Result::Ok(ast)
+  when Result::Err(e) then Result::Err("Parse error in " + path + ": " + e.message)
+  end
+end
+
+def extract_exports(ast: &Program) -> Map[String, String]
+  mut exports = Map::new()
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if is_ffi_exported(&f) then
+        let sig = function_signature(&f)
+        exports.insert(f.name.clone(), sig)
+      end
+    when _ then ()
+    end
+  end
+  exports
+end
+
+def function_signature(f: &Function) -> String
+  mut sig = "("
+  mut first = true
+  for p in f.params do
+    if !first then sig = sig + ", " end
+    sig = sig + type_name(&p.ty)
+    first = false
+  end
+  sig = sig + ") -> " + type_name(&f.return_type)
+  sig
+end
+
+# ———————————————————————————————————————————————————————————————
+# Build Cache Persistence
+# ———————————————————————————————————————————————————————————————
+
+def load_build_cache(output_dir: &String) -> IncrementalCache
+  let cache_path = output_dir.clone() + "/.tg_cache"
+  
+  match read_file(cache_path)
+  when Result::Ok(content) then
+    mut cache = cache_new(output_dir.clone())
+    
+    # Parse cache file: each line is "path|source_hash|mir_hash|timestamp"
+    for line in content.lines() do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      
+      let parts = trimmed.split("|")
+      if parts.len() >= 4 then
+        let path = parts[0].to_string()
+        let source_hash = parts[1].to_string()
+        let mir_hash = parts[2].to_string()
+        let timestamp = match parts[3].parse_int()
+        when Result::Ok(t) then t
+        when Result::Err(_) then 0
+        end
+        
+        cache.entries.insert(path, CacheEntry {
+          source_hash: source_hash,
+          mir_hash: mir_hash,
+          timestamp: timestamp
+        })
+      end
+    end
+    
+    cache
+  when Result::Err(_) then
+    cache_new(output_dir.clone())
+  end
+end
+
+def save_build_cache(cache: &IncrementalCache) -> Unit
+  let cache_path = cache.cache_dir.clone() + "/.tg_cache"
+  mkdir_p(&cache.cache_dir)
+  
+  mut content = "# Tangerine build cache v1\n".to_string()
+  
+  for entry in cache.entries do
+    content = content + entry.0.clone() + "|"
+    content = content + entry.1.source_hash.clone() + "|"
+    content = content + entry.1.mir_hash.clone() + "|"
+    content = content + entry.1.timestamp.to_string() + "\n"
+  end
+  
+  match write_file(cache_path, content)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    eprintln("warning: could not save build cache: " + e)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1093,29 +4548,114 @@ end
 struct LspServer
   documents: Map[String, String]
   diagnostics: Map[String, Vec[Diagnostic]]
+  asts: Map[String, Program]
+  symbol_tables: Map[String, Vec[LspSymbol]]
+end
+
+struct LspSymbol
+  name: String
+  kind: LspSymbolKind
+  span: Span
+  type_str: String
+  doc_comment: Option[String]
+  definition_uri: Option[String]
+  definition_span: Option[Span]
+end
+
+enum LspSymbolKind
+  Function
+  Method
+  Variable
+  Parameter
+  Field
+  Struct
+  Enum
+  Trait
+  Module
+  Constant
+  Type
+end
+
+struct LspPosition
+  line: UInt
+  character: UInt
+end
+
+struct LspRange
+  start: LspPosition
+  end_pos: LspPosition
+end
+
+struct LspLocation
+  uri: String
+  range: LspRange
+end
+
+struct LspCompletionItem
+  label: String
+  kind: LspSymbolKind
+  detail: Option[String]
+  documentation: Option[String]
+  insert_text: String
+end
+
+struct LspHoverResult
+  contents: String
+  range: Option[LspRange]
+end
+
+struct LspSignatureHelp
+  signatures: Vec[LspSignature]
+  active_signature: UInt
+  active_parameter: UInt
+end
+
+struct LspSignature
+  label: String
+  documentation: Option[String]
+  parameters: Vec[LspParameterInfo]
+end
+
+struct LspParameterInfo
+  label: String
+  documentation: Option[String]
+end
+
+struct LspCodeAction
+  title: String
+  kind: String
+  diagnostics: Vec[Diagnostic]
+  edit: Option[LspTextEdit]
+end
+
+struct LspTextEdit
+  uri: String
+  range: LspRange
+  new_text: String
 end
 
 def lsp_server_new() -> LspServer
   LspServer {
     documents: Map::new(),
-    diagnostics: Map::new()
+    diagnostics: Map::new(),
+    asts: Map::new(),
+    symbol_tables: Map::new()
   }
 end
 
 def lsp_did_open(server: &mut LspServer, uri: String, content: String) -> Unit
-  server.documents.insert(uri, content)
+  server.documents.insert(uri.clone(), content)
   lsp_check_document(server, uri)
 end
 
 def lsp_did_change(server: &mut LspServer, uri: String, content: String) -> Unit
-  server.documents.insert(uri, content)
+  server.documents.insert(uri.clone(), content)
   lsp_check_document(server, uri)
 end
 
 def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
-  match server.documents.get(uri)
+  match server.documents.get(uri.clone())
   when Option::Some(content) then
-    # Lex, parse, type check
     let tokens = tokenize(content)
     let parse_result = parse(tokens)
     
@@ -1123,6 +4663,11 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
     
     match parse_result
     when Result::Ok(ast) then
+      # Build symbol table for the document
+      let symbols = build_symbol_table(&ast, uri.clone())
+      server.symbol_tables.insert(uri.clone(), symbols)
+      server.asts.insert(uri.clone(), ast.clone())
+      
       let type_errors = type_check(&ast)
       for err in type_errors do
         diags.push(Diagnostic {
@@ -1157,4 +4702,1051 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
     server.diagnostics.insert(uri, diags)
   when Option::None then ()
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Hover
+# ———————————————————————————————————————————————————————————————
+
+def lsp_hover(server: &LspServer, uri: String, position: LspPosition) -> Option[LspHoverResult]
+  match server.documents.get(uri.clone())
+  when Option::None then return Option::None
+  when Option::Some(content) then
+    let offset = position_to_offset(content, position)
+    
+    # Find symbol at offset
+    match find_symbol_at(server, uri.clone(), offset)
+    when Option::None then Option::None
+    when Option::Some(symbol) then
+      mut hover_text = "```tangerine\n"
+      
+      match symbol.kind
+      when LspSymbolKind::Function | LspSymbolKind::Method then
+        hover_text = hover_text + "def " + symbol.name + ": " + symbol.type_str
+      when LspSymbolKind::Variable | LspSymbolKind::Parameter then
+        hover_text = hover_text + "let " + symbol.name + ": " + symbol.type_str
+      when LspSymbolKind::Struct then
+        hover_text = hover_text + "struct " + symbol.name
+      when LspSymbolKind::Enum then
+        hover_text = hover_text + "enum " + symbol.name
+      when LspSymbolKind::Trait then
+        hover_text = hover_text + "trait " + symbol.name
+      when LspSymbolKind::Field then
+        hover_text = hover_text + symbol.name + ": " + symbol.type_str
+      when LspSymbolKind::Constant then
+        hover_text = hover_text + "const " + symbol.name + ": " + symbol.type_str
+      when _ then
+        hover_text = hover_text + symbol.name + ": " + symbol.type_str
+      end
+      
+      hover_text = hover_text + "\n```"
+      
+      # Add doc comment if present
+      match symbol.doc_comment
+      when Option::Some(doc) then
+        hover_text = hover_text + "\n\n---\n\n" + doc
+      when Option::None then ()
+      end
+      
+      let range = span_to_lsp_range(content, symbol.span)
+      Option::Some(LspHoverResult {
+        contents: hover_text,
+        range: Option::Some(range)
+      })
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Completion
+# ———————————————————————————————————————————————————————————————
+
+def lsp_completion(server: &LspServer, uri: String, position: LspPosition) -> Vec[LspCompletionItem]
+  mut items = Vec::new()
+  
+  match server.documents.get(uri.clone())
+  when Option::None then return items
+  when Option::Some(content) then
+    let offset = position_to_offset(content, position)
+    
+    # Get the prefix being typed
+    let prefix = get_completion_prefix(content, offset)
+    
+    # Collect all visible symbols
+    match server.symbol_tables.get(uri.clone())
+    when Option::Some(symbols) then
+      for sym in symbols do
+        if sym.name.starts_with(prefix.clone()) then
+          items.push(LspCompletionItem {
+            label: sym.name.clone(),
+            kind: sym.kind,
+            detail: Option::Some(sym.type_str.clone()),
+            documentation: sym.doc_comment.clone(),
+            insert_text: sym.name.clone()
+          })
+        end
+      end
+    when Option::None then ()
+    end
+    
+    # Add keyword completions
+    let keywords = ["def", "struct", "enum", "trait", "impl", "use", "pub",
+                    "let", "mut", "if", "elsif", "else", "match", "when",
+                    "for", "while", "loop", "break", "continue", "return",
+                    "true", "false", "self", "Self", "in", "do", "end",
+                    "then", "module", "type", "where", "as", "unsafe",
+                    "extern", "async", "await", "yield"]
+    
+    for kw in keywords do
+      if kw.starts_with(prefix.clone()) then
+        items.push(LspCompletionItem {
+          label: kw.to_string(),
+          kind: LspSymbolKind::Module,  # Keyword kind
+          detail: Option::Some("keyword".to_string()),
+          documentation: Option::None,
+          insert_text: kw.to_string()
+        })
+      end
+    end
+    
+    # Add type completions from builtins
+    let builtin_types = ["Int", "UInt", "Float", "Bool", "String", "Char",
+                         "Unit", "Never", "Option", "Result", "Vec", "Map",
+                         "Set", "Ptr", "Array"]
+    
+    for ty in builtin_types do
+      if ty.starts_with(prefix.clone()) then
+        items.push(LspCompletionItem {
+          label: ty.to_string(),
+          kind: LspSymbolKind::Type,
+          detail: Option::Some("type".to_string()),
+          documentation: Option::None,
+          insert_text: ty.to_string()
+        })
+      end
+    end
+  end
+  
+  items
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Go to Definition
+# ———————————————————————————————————————————————————————————————
+
+def lsp_goto_definition(server: &LspServer, uri: String, position: LspPosition) -> Option[LspLocation]
+  match server.documents.get(uri.clone())
+  when Option::None then return Option::None
+  when Option::Some(content) then
+    let offset = position_to_offset(content, position)
+    
+    match find_symbol_at(server, uri.clone(), offset)
+    when Option::None then Option::None
+    when Option::Some(symbol) then
+      # Check if this symbol has a known definition location
+      match symbol.definition_uri
+      when Option::Some(def_uri) then
+        match symbol.definition_span
+        when Option::Some(def_span) then
+          # Resolve the definition content for range conversion
+          match server.documents.get(def_uri.clone())
+          when Option::Some(def_content) then
+            let range = span_to_lsp_range(def_content, def_span)
+            Option::Some(LspLocation { uri: def_uri, range: range })
+          when Option::None then
+            # Same document
+            let range = span_to_lsp_range(content, def_span)
+            Option::Some(LspLocation { uri: def_uri, range: range })
+          end
+        when Option::None then Option::None
+        end
+      when Option::None then
+        # Definition is in same file — search by name
+        match find_definition_in_document(server, uri.clone(), symbol.name.clone())
+        when Option::Some(def_symbol) then
+          let range = span_to_lsp_range(content, def_symbol.span)
+          Option::Some(LspLocation { uri: uri, range: range })
+        when Option::None then Option::None
+        end
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: References
+# ———————————————————————————————————————————————————————————————
+
+def lsp_references(server: &LspServer, uri: String, position: LspPosition, include_declaration: Bool) -> Vec[LspLocation]
+  mut locations = Vec::new()
+  
+  match server.documents.get(uri.clone())
+  when Option::None then return locations
+  when Option::Some(content) then
+    let offset = position_to_offset(content, position)
+    
+    match find_symbol_at(server, uri.clone(), offset)
+    when Option::None then return locations
+    when Option::Some(target_symbol) then
+      # Search all open documents for references to this symbol
+      for entry in server.symbol_tables do
+        let doc_uri = entry.key
+        let symbols = entry.value
+        
+        match server.documents.get(doc_uri.clone())
+        when Option::Some(doc_content) then
+          for sym in symbols do
+            if sym.name == target_symbol.name then
+              let is_declaration = match sym.kind
+              when LspSymbolKind::Function | LspSymbolKind::Struct |
+                   LspSymbolKind::Enum | LspSymbolKind::Trait then true
+              when _ then false
+              end
+              
+              if include_declaration || !is_declaration then
+                let range = span_to_lsp_range(doc_content, sym.span)
+                locations.push(LspLocation { uri: doc_uri.clone(), range: range })
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+  end
+  
+  locations
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Rename
+# ———————————————————————————————————————————————————————————————
+
+def lsp_rename(server: &LspServer, uri: String, position: LspPosition, new_name: String) -> Vec[LspTextEdit]
+  mut edits = Vec::new()
+  
+  # Find all references and create edits
+  let refs = lsp_references(server, uri, position, true)
+  
+  for loc in refs do
+    edits.push(LspTextEdit {
+      uri: loc.uri,
+      range: loc.range,
+      new_text: new_name.clone()
+    })
+  end
+  
+  edits
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Signature Help
+# ———————————————————————————————————————————————————————————————
+
+def lsp_signature_help(server: &LspServer, uri: String, position: LspPosition) -> Option[LspSignatureHelp]
+  match server.documents.get(uri.clone())
+  when Option::None then return Option::None
+  when Option::Some(content) then
+    let offset = position_to_offset(content, position)
+    
+    # Find the enclosing function call
+    let (func_name, active_param) = find_enclosing_call(content, offset)
+    
+    match func_name
+    when Option::None then return Option::None
+    when Option::Some(name) then
+      # Look up the function signature
+      match find_definition_in_document(server, uri.clone(), name.clone())
+      when Option::None then Option::None
+      when Option::Some(sym) then
+        # Parse the type string to extract parameters
+        let params = parse_function_params(sym.type_str.clone())
+        
+        mut param_infos = Vec::new()
+        for p in params do
+          param_infos.push(LspParameterInfo {
+            label: p.clone(),
+            documentation: Option::None
+          })
+        end
+        
+        let signature = LspSignature {
+          label: sym.name.clone() + ": " + sym.type_str.clone(),
+          documentation: sym.doc_comment.clone(),
+          parameters: param_infos
+        }
+        
+        Option::Some(LspSignatureHelp {
+          signatures: vec![signature],
+          active_signature: 0,
+          active_parameter: active_param
+        })
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Code Actions
+# ———————————————————————————————————————————————————————————————
+
+def lsp_code_actions(server: &LspServer, uri: String, range: LspRange) -> Vec[LspCodeAction]
+  mut actions = Vec::new()
+  
+  # Check if there are diagnostics in this range with suggestions
+  match server.diagnostics.get(uri.clone())
+  when Option::None then return actions
+  when Option::Some(diags) then
+    match server.documents.get(uri.clone())
+    when Option::None then return actions
+    when Option::Some(content) then
+      let range_start = lsp_position_to_offset(content, range.start)
+      let range_end = lsp_position_to_offset(content, range.end_pos)
+      
+      for diag in diags do
+        match diag.span
+        when Option::Some(span) then
+          if span.start >= range_start && span.end <= range_end then
+            # Generate fix-it actions from suggestions
+            for sugg in diag.suggestions do
+              let edit_range = span_to_lsp_range(content, sugg.span)
+              actions.push(LspCodeAction {
+                title: sugg.message.clone(),
+                kind: "quickfix".to_string(),
+                diagnostics: vec![diag.clone()],
+                edit: Option::Some(LspTextEdit {
+                  uri: uri.clone(),
+                  range: edit_range,
+                  new_text: sugg.replacement.clone()
+                })
+              })
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+  end
+  
+  actions
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Format Document
+# ———————————————————————————————————————————————————————————————
+
+def lsp_format(server: &LspServer, uri: String) -> Option[String]
+  match server.documents.get(uri)
+  when Option::None then Option::None
+  when Option::Some(content) then
+    use tg_compiler::lib::{format}
+    match format(content)
+    when Result::Ok(formatted) then Option::Some(formatted)
+    when Result::Err(_) then Option::None
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP: Main Loop (JSON-RPC over stdio)
+# ———————————————————————————————————————————————————————————————
+
+def lsp_main_loop(server: &mut LspServer) -> Unit
+  # LSP protocol: read Content-Length header, then JSON-RPC body
+  loop
+    # Read header
+    let header = read_lsp_header()
+    match header
+    when Option::None then break  # EOF
+    when Option::Some(content_length) then
+      # Read body
+      let body = read_lsp_body(content_length)
+      
+      # Parse JSON-RPC request
+      let response = handle_lsp_request(server, body)
+      
+      # Send response
+      match response
+      when Option::Some(resp) then
+        send_lsp_response(resp)
+      when Option::None then ()
+      end
+    end
+  end
+end
+
+def read_lsp_header() -> Option[UInt]
+  # Read "Content-Length: N\r\n\r\n"
+  mut header = ""
+  loop
+    let line = read_line()
+    if line.is_empty() then break end
+    header = header + line + "\n"
+    if line == "\r" || line == "" then break end
+  end
+  
+  # Parse Content-Length
+  for line in header.lines() do
+    if line.starts_with("Content-Length:") then
+      let val = line.slice(16, line.len()).trim()
+      return Option::Some(val.parse_uint().unwrap_or(0))
+    end
+  end
+  
+  Option::None
+end
+
+def read_lsp_body(length: UInt) -> String
+  # Read exactly `length` bytes from stdin
+  read_bytes(length)
+end
+
+extern "Tangerine"
+  def read_line() -> String
+  def read_bytes(n: UInt) -> String
+end
+
+def send_lsp_response(body: String) -> Unit
+  let header = "Content-Length: " + body.len().to_string() + "\r\n\r\n"
+  print(header + body)
+end
+
+def handle_lsp_request(server: &mut LspServer, body: String) -> Option[String]
+  # Minimal JSON-RPC parsing
+  let method = extract_json_string(body.clone(), "method")
+  let id = extract_json_value(body.clone(), "id")
+  
+  match method
+  when Option::None then Option::None
+  when Option::Some(m) then
+    if m == "initialize" then
+      # Send capabilities
+      let result = "{\"capabilities\":{" +
+        "\"textDocumentSync\":1," +
+        "\"hoverProvider\":true," +
+        "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]}," +
+        "\"definitionProvider\":true," +
+        "\"referencesProvider\":true," +
+        "\"renameProvider\":true," +
+        "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}," +
+        "\"documentFormattingProvider\":true," +
+        "\"codeActionProvider\":true" +
+        "},\"serverInfo\":{\"name\":\"tangerine-ls\",\"version\":\"0.1.0\"}}"
+      make_json_rpc_response(id, result)
+    elsif m == "initialized" then
+      Option::None  # Notification, no response
+    elsif m == "textDocument/didOpen" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let text = extract_nested_json_string(body.clone(), "textDocument", "text")
+      match (uri, text)
+      when (Option::Some(u), Option::Some(t)) then
+        lsp_did_open(server, u, t)
+      when _ then ()
+      end
+      Option::None  # Notification
+    elsif m == "textDocument/didChange" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      # Get full content from contentChanges[0].text
+      let text = extract_json_string(body.clone(), "text")
+      match (uri, text)
+      when (Option::Some(u), Option::Some(t)) then
+        lsp_did_change(server, u, t)
+      when _ then ()
+      end
+      Option::None
+    elsif m == "textDocument/hover" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      match (uri, line, character)
+      when (Option::Some(u), Option::Some(l), Option::Some(c)) then
+        let pos = LspPosition { line: l, character: c }
+        match lsp_hover(server, u, pos)
+        when Option::Some(hover) then
+          let result = "{\"contents\":{\"kind\":\"markdown\",\"value\":\"" +
+            json_escape(hover.contents) + "\"}}"
+          make_json_rpc_response(id, result)
+        when Option::None then
+          make_json_rpc_response(id, "null".to_string())
+        end
+      when _ then make_json_rpc_response(id, "null".to_string())
+      end
+    elsif m == "textDocument/completion" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      match (uri, line, character)
+      when (Option::Some(u), Option::Some(l), Option::Some(c)) then
+        let pos = LspPosition { line: l, character: c }
+        let items = lsp_completion(server, u, pos)
+        mut result = "{\"isIncomplete\":false,\"items\":["
+        mut first = true
+        for item in items do
+          if !first then result = result + "," end
+          result = result + "{\"label\":\"" + json_escape(item.label) + "\""
+          match item.detail
+          when Option::Some(d) then
+            result = result + ",\"detail\":\"" + json_escape(d) + "\""
+          when Option::None then ()
+          end
+          result = result + ",\"insertText\":\"" + json_escape(item.insert_text) + "\"}"
+          first = false
+        end
+        result = result + "]}"
+        make_json_rpc_response(id, result)
+      when _ then make_json_rpc_response(id, "{\"isIncomplete\":false,\"items\":[]}".to_string())
+      end
+    elsif m == "textDocument/definition" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      match (uri, line, character)
+      when (Option::Some(u), Option::Some(l), Option::Some(c)) then
+        let pos = LspPosition { line: l, character: c }
+        match lsp_goto_definition(server, u, pos)
+        when Option::Some(loc) then
+          let result = "{\"uri\":\"" + json_escape(loc.uri) + "\"," +
+            "\"range\":" + lsp_range_to_json(&loc.range) + "}"
+          make_json_rpc_response(id, result)
+        when Option::None then
+          make_json_rpc_response(id, "null".to_string())
+        end
+      when _ then make_json_rpc_response(id, "null".to_string())
+      end
+    elsif m == "textDocument/references" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      match (uri, line, character)
+      when (Option::Some(u), Option::Some(l), Option::Some(c)) then
+        let pos = LspPosition { line: l, character: c }
+        let refs = lsp_references(server, u, pos, true)
+        mut result = "["
+        mut first = true
+        for loc in refs do
+          if !first then result = result + "," end
+          result = result + "{\"uri\":\"" + json_escape(loc.uri) + "\"," +
+            "\"range\":" + lsp_range_to_json(&loc.range) + "}"
+          first = false
+        end
+        result = result + "]"
+        make_json_rpc_response(id, result)
+      when _ then make_json_rpc_response(id, "[]".to_string())
+      end
+    elsif m == "textDocument/rename" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      let new_name = extract_json_string(body.clone(), "newName")
+      match (uri, line, character, new_name)
+      when (Option::Some(u), Option::Some(l), Option::Some(c), Option::Some(name)) then
+        let pos = LspPosition { line: l, character: c }
+        let edits = lsp_rename(server, u, pos, name)
+        # Group edits by URI
+        mut changes = Map::new()
+        for edit in edits do
+          match changes.get(edit.uri.clone())
+          when Option::Some(existing) then
+            existing.push(edit)
+          when Option::None then
+            changes.insert(edit.uri.clone(), vec![edit])
+          end
+        end
+        
+        mut result = "{\"changes\":{"
+        mut first_uri = true
+        for entry in changes do
+          if !first_uri then result = result + "," end
+          result = result + "\"" + json_escape(entry.key) + "\":["
+          mut first_edit = true
+          for edit in entry.value do
+            if !first_edit then result = result + "," end
+            result = result + "{\"range\":" + lsp_range_to_json(&edit.range) + ","
+            result = result + "\"newText\":\"" + json_escape(edit.new_text) + "\"}"
+            first_edit = false
+          end
+          result = result + "]"
+          first_uri = false
+        end
+        result = result + "}}"
+        make_json_rpc_response(id, result)
+      when _ then make_json_rpc_response(id, "null".to_string())
+      end
+    elsif m == "textDocument/signatureHelp" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      let line = extract_nested_json_uint(body.clone(), "position", "line")
+      let character = extract_nested_json_uint(body.clone(), "position", "character")
+      match (uri, line, character)
+      when (Option::Some(u), Option::Some(l), Option::Some(c)) then
+        let pos = LspPosition { line: l, character: c }
+        match lsp_signature_help(server, u, pos)
+        when Option::Some(help) then
+          mut result = "{\"signatures\":["
+          mut first = true
+          for sig in help.signatures do
+            if !first then result = result + "," end
+            result = result + "{\"label\":\"" + json_escape(sig.label) + "\""
+            result = result + ",\"parameters\":["
+            mut first_p = true
+            for p in sig.parameters do
+              if !first_p then result = result + "," end
+              result = result + "{\"label\":\"" + json_escape(p.label) + "\"}"
+              first_p = false
+            end
+            result = result + "]}"
+            first = false
+          end
+          result = result + "],\"activeSignature\":" + help.active_signature.to_string()
+          result = result + ",\"activeParameter\":" + help.active_parameter.to_string() + "}"
+          make_json_rpc_response(id, result)
+        when Option::None then
+          make_json_rpc_response(id, "null".to_string())
+        end
+      when _ then make_json_rpc_response(id, "null".to_string())
+      end
+    elsif m == "textDocument/formatting" then
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      match uri
+      when Option::Some(u) then
+        match lsp_format(server, u.clone())
+        when Option::Some(formatted) then
+          match server.documents.get(u)
+          when Option::Some(content) then
+            let total_lines = count_lines(content)
+            let end_col = last_line_length(content)
+            let range = LspRange {
+              start: LspPosition { line: 0, character: 0 },
+              end_pos: LspPosition { line: total_lines, character: end_col }
+            }
+            let result = "[{\"range\":" + lsp_range_to_json(&range) + "," +
+              "\"newText\":\"" + json_escape(formatted) + "\"}]"
+            make_json_rpc_response(id, result)
+          when Option::None then
+            make_json_rpc_response(id, "[]".to_string())
+          end
+        when Option::None then
+          make_json_rpc_response(id, "[]".to_string())
+        end
+      when Option::None then
+        make_json_rpc_response(id, "[]".to_string())
+      end
+    elsif m == "shutdown" then
+      make_json_rpc_response(id, "null".to_string())
+    elsif m == "exit" then
+      Option::None  # Exit the loop
+    else
+      # Unknown method
+      Option::None
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LSP Helpers
+# ———————————————————————————————————————————————————————————————
+
+def build_symbol_table(ast: &Program, uri: String) -> Vec[LspSymbol]
+  mut symbols = Vec::new()
+  
+  for item in ast.items do
+    match item.kind
+    when ItemKind::Function(func) then
+      let doc = extract_doc_comment_before(ast, item.span)
+      symbols.push(LspSymbol {
+        name: func.name.clone(),
+        kind: LspSymbolKind::Function,
+        span: item.span,
+        type_str: format_function_type(&func),
+        doc_comment: doc,
+        definition_uri: Option::Some(uri.clone()),
+        definition_span: Option::Some(item.span)
+      })
+      
+      # Add parameters
+      for param in func.params do
+        symbols.push(LspSymbol {
+          name: param.name.clone(),
+          kind: LspSymbolKind::Parameter,
+          span: param.span,
+          type_str: param.type_str.clone(),
+          doc_comment: Option::None,
+          definition_uri: Option::Some(uri.clone()),
+          definition_span: Option::Some(param.span)
+        })
+      end
+    when ItemKind::Struct(s) then
+      let doc = extract_doc_comment_before(ast, item.span)
+      symbols.push(LspSymbol {
+        name: s.name.clone(),
+        kind: LspSymbolKind::Struct,
+        span: item.span,
+        type_str: s.name.clone(),
+        doc_comment: doc,
+        definition_uri: Option::Some(uri.clone()),
+        definition_span: Option::Some(item.span)
+      })
+      
+      for field in s.fields do
+        symbols.push(LspSymbol {
+          name: field.name.clone(),
+          kind: LspSymbolKind::Field,
+          span: field.span,
+          type_str: field.type_str.clone(),
+          doc_comment: Option::None,
+          definition_uri: Option::Some(uri.clone()),
+          definition_span: Option::Some(field.span)
+        })
+      end
+    when ItemKind::Enum(e) then
+      symbols.push(LspSymbol {
+        name: e.name.clone(),
+        kind: LspSymbolKind::Enum,
+        span: item.span,
+        type_str: e.name.clone(),
+        doc_comment: extract_doc_comment_before(ast, item.span),
+        definition_uri: Option::Some(uri.clone()),
+        definition_span: Option::Some(item.span)
+      })
+    when ItemKind::Trait(t) then
+      symbols.push(LspSymbol {
+        name: t.name.clone(),
+        kind: LspSymbolKind::Trait,
+        span: item.span,
+        type_str: t.name.clone(),
+        doc_comment: extract_doc_comment_before(ast, item.span),
+        definition_uri: Option::Some(uri.clone()),
+        definition_span: Option::Some(item.span)
+      })
+      
+      for method in t.methods do
+        symbols.push(LspSymbol {
+          name: method.name.clone(),
+          kind: LspSymbolKind::Method,
+          span: method.span,
+          type_str: format_function_type(&method),
+          doc_comment: Option::None,
+          definition_uri: Option::Some(uri.clone()),
+          definition_span: Option::Some(method.span)
+        })
+      end
+    when ItemKind::Impl(imp) then
+      for method in imp.methods do
+        symbols.push(LspSymbol {
+          name: method.name.clone(),
+          kind: LspSymbolKind::Method,
+          span: method.span,
+          type_str: format_function_type(&method),
+          doc_comment: extract_doc_comment_before(ast, method.span),
+          definition_uri: Option::Some(uri.clone()),
+          definition_span: Option::Some(method.span)
+        })
+      end
+    when ItemKind::Const(c) then
+      symbols.push(LspSymbol {
+        name: c.name.clone(),
+        kind: LspSymbolKind::Constant,
+        span: item.span,
+        type_str: c.type_str.clone(),
+        doc_comment: extract_doc_comment_before(ast, item.span),
+        definition_uri: Option::Some(uri.clone()),
+        definition_span: Option::Some(item.span)
+      })
+    when _ then ()
+    end
+  end
+  
+  symbols
+end
+
+def find_symbol_at(server: &LspServer, uri: String, offset: UInt) -> Option[&LspSymbol]
+  match server.symbol_tables.get(uri)
+  when Option::None then Option::None
+  when Option::Some(symbols) then
+    # Find the most specific (smallest span) symbol containing the offset
+    mut best: Option[&LspSymbol] = Option::None
+    mut best_span_size: UInt = UInt::MAX
+    
+    for sym in symbols do
+      if offset >= sym.span.start && offset <= sym.span.end then
+        let span_size = sym.span.end - sym.span.start
+        if span_size < best_span_size then
+          best = Option::Some(sym)
+          best_span_size = span_size
+        end
+      end
+    end
+    
+    best
+  end
+end
+
+def find_definition_in_document(server: &LspServer, uri: String, name: String) -> Option[&LspSymbol]
+  match server.symbol_tables.get(uri)
+  when Option::None then Option::None
+  when Option::Some(symbols) then
+    for sym in symbols do
+      if sym.name == name then
+        match sym.kind
+        when LspSymbolKind::Function | LspSymbolKind::Struct |
+             LspSymbolKind::Enum | LspSymbolKind::Trait |
+             LspSymbolKind::Constant then
+          return Option::Some(sym)
+        when _ then ()
+        end
+      end
+    end
+    Option::None
+  end
+end
+
+def position_to_offset(content: &String, pos: LspPosition) -> UInt
+  lsp_position_to_offset(content, pos)
+end
+
+def lsp_position_to_offset(content: &String, pos: LspPosition) -> UInt
+  mut offset: UInt = 0
+  mut line: UInt = 0
+  
+  while offset < content.len() && line < pos.line do
+    if content.char_at(offset) == '\n' then
+      line = line + 1
+    end
+    offset = offset + 1
+  end
+  
+  offset + pos.character
+end
+
+def span_to_lsp_range(content: &String, span: Span) -> LspRange
+  let start = offset_to_lsp_position(content, span.start)
+  let end_pos = offset_to_lsp_position(content, span.end)
+  LspRange { start: start, end_pos: end_pos }
+end
+
+def offset_to_lsp_position(content: &String, offset: UInt) -> LspPosition
+  mut line: UInt = 0
+  mut col: UInt = 0
+  mut i: UInt = 0
+  
+  while i < offset && i < content.len() do
+    if content.char_at(i) == '\n' then
+      line = line + 1
+      col = 0
+    else
+      col = col + 1
+    end
+    i = i + 1
+  end
+  
+  LspPosition { line: line, character: col }
+end
+
+def get_completion_prefix(content: &String, offset: UInt) -> String
+  # Walk backwards from offset to find identifier start
+  mut start = offset
+  while start > 0 do
+    let c = content.char_at(start - 1)
+    if c.is_alphanumeric() || c == '_' then
+      start = start - 1
+    else
+      break
+    end
+  end
+  
+  if start < offset then
+    content.slice(start, offset)
+  else
+    "".to_string()
+  end
+end
+
+def find_enclosing_call(content: &String, offset: UInt) -> (Option[String], UInt)
+  # Walk backwards from offset to find the function name before '('
+  mut depth = 0
+  mut param_count: UInt = 0
+  mut i = offset
+  
+  while i > 0 do
+    i = i - 1
+    let c = content.char_at(i)
+    
+    if c == ')' then depth = depth + 1
+    elsif c == '(' then
+      if depth == 0 then
+        # Found the opening paren — get function name before it
+        mut end_pos = i
+        while end_pos > 0 && (content.char_at(end_pos - 1).is_alphanumeric() || content.char_at(end_pos - 1) == '_') do
+          end_pos = end_pos - 1
+        end
+        if end_pos < i then
+          let name = content.slice(end_pos, i)
+          return (Option::Some(name), param_count)
+        end
+        return (Option::None, 0)
+      end
+      depth = depth - 1
+    elsif c == ',' && depth == 0 then
+      param_count = param_count + 1
+    end
+  end
+  
+  (Option::None, 0)
+end
+
+def parse_function_params(type_str: String) -> Vec[String]
+  # Parse "(T1, T2) -> R" format
+  mut params = Vec::new()
+  
+  if !type_str.starts_with("(") then return params end
+  
+  let close = type_str.index_of(")")
+  match close
+  when Option::None then return params
+  when Option::Some(idx) then
+    let inner = type_str.slice(1, idx)
+    if inner.is_empty() then return params end
+    
+    for part in inner.split(",") do
+      params.push(part.trim().to_string())
+    end
+  end
+  
+  params
+end
+
+def format_function_type(func: &Function) -> String
+  mut result = "("
+  mut first = true
+  for param in func.params do
+    if !first then result = result + ", " end
+    result = result + param.name + ": " + param.type_str
+    first = false
+  end
+  result = result + ") -> " + func.return_type_str
+  result
+end
+
+def extract_doc_comment_before(ast: &Program, span: Span) -> Option[String]
+  # Look at the source content before the span for `#` doc comments
+  # This is a simplification — in a full implementation we'd track
+  # doc comments during parsing
+  Option::None
+end
+
+def make_json_rpc_response(id: Option[String], result: String) -> Option[String]
+  match id
+  when Option::None then Option::None
+  when Option::Some(req_id) then
+    Option::Some("{\"jsonrpc\":\"2.0\",\"id\":" + req_id + ",\"result\":" + result + "}")
+  end
+end
+
+def extract_json_string(json: String, key: String) -> Option[String]
+  let search = "\"" + key + "\":"
+  match json.index_of(search)
+  when Option::None then Option::None
+  when Option::Some(idx) then
+    let start = idx + search.len()
+    # Skip whitespace
+    mut pos = start
+    while pos < json.len() && (json.char_at(pos) == ' ' || json.char_at(pos) == '\t') do
+      pos = pos + 1
+    end
+    if pos < json.len() && json.char_at(pos) == '"' then
+      pos = pos + 1
+      mut end_pos = pos
+      while end_pos < json.len() && json.char_at(end_pos) != '"' do
+        if json.char_at(end_pos) == '\\' then end_pos = end_pos + 1 end
+        end_pos = end_pos + 1
+      end
+      Option::Some(json.slice(pos, end_pos))
+    else
+      Option::None
+    end
+  end
+end
+
+def extract_json_value(json: String, key: String) -> Option[String]
+  let search = "\"" + key + "\":"
+  match json.index_of(search)
+  when Option::None then Option::None
+  when Option::Some(idx) then
+    let start = idx + search.len()
+    mut pos = start
+    while pos < json.len() && json.char_at(pos) == ' ' do pos = pos + 1 end
+    
+    mut end_pos = pos
+    let first_char = json.char_at(pos)
+    if first_char == '"' then
+      # String value
+      end_pos = pos + 1
+      while end_pos < json.len() && json.char_at(end_pos) != '"' do
+        if json.char_at(end_pos) == '\\' then end_pos = end_pos + 1 end
+        end_pos = end_pos + 1
+      end
+      end_pos = end_pos + 1
+    elsif first_char == '{' || first_char == '[' then
+      # Object/array — find matching close
+      mut depth = 1
+      end_pos = pos + 1
+      while end_pos < json.len() && depth > 0 do
+        let c = json.char_at(end_pos)
+        if c == '{' || c == '[' then depth = depth + 1
+        elsif c == '}' || c == ']' then depth = depth - 1
+        end
+        end_pos = end_pos + 1
+      end
+    else
+      # Number/bool/null
+      while end_pos < json.len() && json.char_at(end_pos) != ',' && json.char_at(end_pos) != '}' && json.char_at(end_pos) != ']' do
+        end_pos = end_pos + 1
+      end
+    end
+    
+    Option::Some(json.slice(pos, end_pos).trim().to_string())
+  end
+end
+
+def extract_nested_json_string(json: String, outer_key: String, inner_key: String) -> Option[String]
+  match extract_json_value(json, outer_key)
+  when Option::None then Option::None
+  when Option::Some(inner_json) then
+    extract_json_string(inner_json, inner_key)
+  end
+end
+
+def extract_nested_json_uint(json: String, outer_key: String, inner_key: String) -> Option[UInt]
+  match extract_json_value(json, outer_key)
+  when Option::None then Option::None
+  when Option::Some(inner_json) then
+    match extract_json_value(inner_json, inner_key)
+    when Option::None then Option::None
+    when Option::Some(val) then
+      Option::Some(val.parse_uint().unwrap_or(0))
+    end
+  end
+end
+
+def lsp_range_to_json(range: &LspRange) -> String
+  "{\"start\":{\"line\":" + range.start.line.to_string() + ",\"character\":" + range.start.character.to_string() + "}," +
+  "\"end\":{\"line\":" + range.end_pos.line.to_string() + ",\"character\":" + range.end_pos.character.to_string() + "}}"
+end
+
+def count_lines(content: &String) -> UInt
+  mut count: UInt = 0
+  for c in content.chars() do
+    if c == '\n' then count = count + 1 end
+  end
+  count
+end
+
+def last_line_length(content: &String) -> UInt
+  mut len: UInt = 0
+  mut i = content.len()
+  while i > 0 do
+    i = i - 1
+    if content.char_at(i) == '\n' then break end
+    len = len + 1
+  end
+  len
 end

@@ -1,0 +1,773 @@
+# Tangerine Standard Library — Async Runtime
+#
+# Provides cooperative async/await execution with a single-threaded
+# executor, task spawning, channels, timers, and join handles.
+#
+# Architecture:
+# - Executor: runs tasks in a cooperative event loop
+# - Task: a future that can be polled to completion
+# - Waker: notifies the executor that a task is ready
+# - Channel: async MPSC message passing
+# - Timer: async sleep and timeout support
+
+use std::core::{Option, Result, Vec, String, Bool, UInt, Int}
+use std::collections::{Map, VecDeque}
+use std::time::{Instant, Duration, instant_now, duration_millis, duration_nanos}
+
+# ———————————————————————————————————————————————————————————————
+# Poll and Future
+# ———————————————————————————————————————————————————————————————
+
+enum Poll[T]
+  Ready(T)
+  Pending
+end
+
+trait Future
+  type Output
+  def poll(&mut self, cx: &mut Context) -> Poll[Self::Output]
+end
+
+struct Context
+  waker: Waker
+end
+
+struct Waker
+  task_id: UInt
+  executor: *mut Executor
+end
+
+impl Waker
+  def wake(&self) -> Unit
+    # Mark the task as ready in the executor
+    unsafe {
+      let exec = &mut *self.executor
+      exec.wake_task(self.task_id)
+    }
+  end
+  
+  def clone(&self) -> Waker
+    Waker {
+      task_id: self.task_id,
+      executor: self.executor
+    }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Task
+# ———————————————————————————————————————————————————————————————
+
+enum TaskState
+  Ready          # Queued for polling
+  Waiting        # Blocked, waiting for wake
+  Completed      # Finished
+  Cancelled      # Cancelled before completion
+end
+
+struct Task
+  id: UInt
+  state: TaskState
+  future: Box[dyn Future[Output = ()]]
+  name: Option[String]
+end
+
+struct JoinHandle[T]
+  task_id: UInt
+  result: Option[T]
+  executor: *mut Executor
+end
+
+impl JoinHandle[T]
+  def is_finished(&self) -> Bool
+    unsafe {
+      let exec = &*self.executor
+      match exec.task_states.get(&self.task_id)
+      when Option::Some(TaskState::Completed) then true
+      when _ then false
+      end
+    }
+  end
+end
+
+# JoinHandle itself is a future
+impl Future for JoinHandle[T]
+  type Output = Result[T, String]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[T, String]]
+    unsafe {
+      let exec = &mut *self.executor
+      match exec.task_results.remove(&self.task_id)
+      when Option::Some(result) then
+        Poll::Ready(Result::Ok(result))
+      when Option::None then
+        # Register interest
+        exec.join_waiters.insert(self.task_id, cx.waker.clone())
+        Poll::Pending
+      end
+    }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Executor
+# ———————————————————————————————————————————————————————————————
+
+struct Executor
+  tasks: Map[UInt, Task]
+  ready_queue: VecDeque[UInt]
+  next_task_id: UInt
+  task_states: Map[UInt, TaskState]
+  task_results: Map[UInt, Box[dyn Any]]
+  join_waiters: Map[UInt, Waker]     # task_id -> waker of JoinHandle
+  timer_heap: Vec[TimerEntry]
+  running: Bool
+end
+
+struct TimerEntry
+  deadline: Instant
+  task_id: UInt
+end
+
+def executor_new() -> Executor
+  Executor {
+    tasks: Map::new(),
+    ready_queue: VecDeque::new(),
+    next_task_id: 1,
+    task_states: Map::new(),
+    task_results: Map::new(),
+    join_waiters: Map::new(),
+    timer_heap: Vec::new(),
+    running: false
+  }
+end
+
+impl Executor
+  def spawn(&mut self, future: impl Future[Output = ()] + 'static) -> JoinHandle[()]
+    let id = self.next_task_id
+    self.next_task_id = self.next_task_id + 1
+    
+    let task = Task {
+      id: id,
+      state: TaskState::Ready,
+      future: Box::new(future),
+      name: Option::None
+    }
+    
+    self.tasks.insert(id, task)
+    self.task_states.insert(id, TaskState::Ready)
+    self.ready_queue.push_back(id)
+    
+    JoinHandle {
+      task_id: id,
+      result: Option::None,
+      executor: self as *mut Executor
+    }
+  end
+  
+  def spawn_named(&mut self, name: String, future: impl Future[Output = ()] + 'static) -> JoinHandle[()]
+    let id = self.next_task_id
+    self.next_task_id = self.next_task_id + 1
+    
+    let task = Task {
+      id: id,
+      state: TaskState::Ready,
+      future: Box::new(future),
+      name: Option::Some(name),
+    }
+    
+    self.tasks.insert(id, task)
+    self.task_states.insert(id, TaskState::Ready)
+    self.ready_queue.push_back(id)
+    
+    JoinHandle {
+      task_id: id,
+      result: Option::None,
+      executor: self as *mut Executor
+    }
+  end
+  
+  def wake_task(&mut self, task_id: UInt) -> Unit
+    match self.task_states.get(&task_id)
+    when Option::Some(TaskState::Waiting) then
+      self.task_states.insert(task_id, TaskState::Ready)
+      self.ready_queue.push_back(task_id)
+    when _ then ()
+    end
+  end
+  
+  def run(&mut self) -> Unit
+    self.running = true
+    
+    while self.running do
+      # Check timers
+      self.check_timers()
+      
+      # Poll ready tasks
+      match self.ready_queue.pop_front()
+      when Option::Some(task_id) then
+        self.poll_task(task_id)
+      when Option::None then
+        # No ready tasks — check if all done
+        if self.tasks.is_empty() then
+          self.running = false
+          break
+        end
+        
+        # Sleep until next timer or yield
+        match self.next_timer_deadline()
+        when Option::Some(deadline) then
+          let now = instant_now()
+          let remaining = deadline.duration_since(now)
+          let ms = duration_millis(remaining)
+          if ms > 0 then
+            sleep_ms(ms)
+          end
+        when Option::None then
+          # No timers, no ready tasks — deadlock or all waiting on I/O
+          # Yield briefly to avoid busy-spin
+          sleep_ms(1)
+        end
+      end
+    end
+  end
+  
+  def poll_task(&mut self, task_id: UInt) -> Unit
+    match self.tasks.get_mut(&task_id)
+    when Option::None then return
+    when Option::Some(task) then
+      let waker = Waker {
+        task_id: task_id,
+        executor: self as *mut Executor
+      }
+      
+      mut cx = Context { waker: waker }
+      
+      match task.future.poll(&mut cx)
+      when Poll::Ready(()) then
+        # Task completed
+        self.tasks.remove(&task_id)
+        self.task_states.insert(task_id, TaskState::Completed)
+        
+        # Wake any JoinHandle waiters
+        match self.join_waiters.remove(&task_id)
+        when Option::Some(waiter) then waiter.wake()
+        when Option::None then ()
+        end
+      when Poll::Pending then
+        self.task_states.insert(task_id, TaskState::Waiting)
+      end
+    end
+  end
+  
+  def check_timers(&mut self) -> Unit
+    let now = instant_now()
+    
+    # Process all expired timers
+    mut i: UInt = 0
+    while i < self.timer_heap.len() do
+      if self.timer_heap[i].deadline <= now then
+        let entry = self.timer_heap.swap_remove(i)
+        self.wake_task(entry.task_id)
+        # Don't increment i since swap_remove moved an element here
+      else
+        i = i + 1
+      end
+    end
+  end
+  
+  def next_timer_deadline(&self) -> Option[Instant]
+    if self.timer_heap.is_empty() then return Option::None end
+    
+    mut earliest = self.timer_heap[0].deadline
+    for entry in self.timer_heap do
+      if entry.deadline < earliest then
+        earliest = entry.deadline
+      end
+    end
+    Option::Some(earliest)
+  end
+  
+  def register_timer(&mut self, deadline: Instant, task_id: UInt) -> Unit
+    self.timer_heap.push(TimerEntry {
+      deadline: deadline,
+      task_id: task_id
+    })
+  end
+  
+  def cancel_task(&mut self, task_id: UInt) -> Bool
+    match self.tasks.remove(&task_id)
+    when Option::Some(_) then
+      self.task_states.insert(task_id, TaskState::Cancelled)
+      true
+    when Option::None then false
+    end
+  end
+  
+  def task_count(&self) -> UInt
+    self.tasks.len()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Async Sleep / Timer Future
+# ———————————————————————————————————————————————————————————————
+
+struct SleepFuture
+  deadline: Instant
+  registered: Bool
+end
+
+impl Future for SleepFuture
+  type Output = ()
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[()]
+    let now = instant_now()
+    if now >= self.deadline then
+      Poll::Ready(())
+    else
+      if !self.registered then
+        # Register timer with executor
+        unsafe {
+          let exec = &mut *cx.waker.executor
+          exec.register_timer(self.deadline, cx.waker.task_id)
+        }
+        self.registered = true
+      end
+      Poll::Pending
+    end
+  end
+end
+
+pub def sleep(duration: Duration) -> SleepFuture
+  SleepFuture {
+    deadline: instant_now().add(duration),
+    registered: false
+  }
+end
+
+pub def sleep_millis(ms: UInt) -> SleepFuture
+  sleep(Duration::from_millis(ms))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Timeout
+# ———————————————————————————————————————————————————————————————
+
+struct TimeoutFuture[F: Future]
+  inner: F
+  deadline: Instant
+  timer_registered: Bool
+end
+
+enum TimeoutError
+  TimedOut
+end
+
+impl Future for TimeoutFuture[F]
+  type Output = Result[F::Output, TimeoutError]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[F::Output, TimeoutError]]
+    # Check the inner future first
+    match self.inner.poll(cx)
+    when Poll::Ready(val) then
+      return Poll::Ready(Result::Ok(val))
+    when Poll::Pending then ()
+    end
+    
+    # Check timeout
+    let now = instant_now()
+    if now >= self.deadline then
+      Poll::Ready(Result::Err(TimeoutError::TimedOut))
+    else
+      if !self.timer_registered then
+        unsafe {
+          let exec = &mut *cx.waker.executor
+          exec.register_timer(self.deadline, cx.waker.task_id)
+        }
+        self.timer_registered = true
+      end
+      Poll::Pending
+    end
+  end
+end
+
+pub def timeout[F: Future](duration: Duration, future: F) -> TimeoutFuture[F]
+  TimeoutFuture {
+    inner: future,
+    deadline: instant_now().add(duration),
+    timer_registered: false
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Yield
+# ———————————————————————————————————————————————————————————————
+
+struct YieldNow
+  yielded: Bool
+end
+
+impl Future for YieldNow
+  type Output = ()
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[()]
+    if self.yielded then
+      Poll::Ready(())
+    else
+      self.yielded = true
+      # Re-queue ourselves
+      cx.waker.wake()
+      Poll::Pending
+    end
+  end
+end
+
+pub def yield_now() -> YieldNow
+  YieldNow { yielded: false }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Async Channel (MPSC)
+# ———————————————————————————————————————————————————————————————
+
+struct ChannelInner[T]
+  buffer: VecDeque[T]
+  capacity: UInt
+  closed: Bool
+  send_waiters: Vec[Waker]
+  recv_waiters: Vec[Waker]
+end
+
+struct Sender[T]
+  inner: *mut ChannelInner[T]
+end
+
+struct Receiver[T]
+  inner: *mut ChannelInner[T]
+end
+
+pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
+  let inner = Box::new(ChannelInner {
+    buffer: VecDeque::new(),
+    capacity: capacity,
+    closed: false,
+    send_waiters: Vec::new(),
+    recv_waiters: Vec::new()
+  })
+  
+  let ptr = Box::into_raw(inner)
+  
+  (Sender { inner: ptr }, Receiver { inner: ptr })
+end
+
+impl Sender[T]
+  def send(&self, value: T) -> SendFuture[T]
+    SendFuture {
+      sender: self.inner,
+      value: Option::Some(value)
+    }
+  end
+  
+  def close(&self) -> Unit
+    unsafe {
+      let ch = &mut *self.inner
+      ch.closed = true
+      # Wake all receivers
+      for waker in ch.recv_waiters.drain() do
+        waker.wake()
+      end
+    }
+  end
+  
+  def clone(&self) -> Sender[T]
+    Sender { inner: self.inner }
+  end
+end
+
+impl Receiver[T]
+  def recv(&self) -> RecvFuture[T]
+    RecvFuture {
+      receiver: self.inner
+    }
+  end
+end
+
+struct SendFuture[T]
+  sender: *mut ChannelInner[T]
+  value: Option[T]
+end
+
+impl Future for SendFuture[T]
+  type Output = Result[(), String]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[(), String]]
+    unsafe {
+      let ch = &mut *self.sender
+      
+      if ch.closed then
+        return Poll::Ready(Result::Err("channel closed".to_string()))
+      end
+      
+      if ch.buffer.len() < ch.capacity then
+        # Space available
+        match self.value.take()
+        when Option::Some(val) then
+          ch.buffer.push_back(val)
+          # Wake a receiver
+          if !ch.recv_waiters.is_empty() then
+            ch.recv_waiters.pop().unwrap().wake()
+          end
+          Poll::Ready(Result::Ok(()))
+        when Option::None then
+          Poll::Ready(Result::Err("value already sent".to_string()))
+        end
+      else
+        # Buffer full, wait
+        ch.send_waiters.push(cx.waker.clone())
+        Poll::Pending
+      end
+    }
+  end
+end
+
+struct RecvFuture[T]
+  receiver: *mut ChannelInner[T]
+end
+
+impl Future for RecvFuture[T]
+  type Output = Option[T]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[Option[T]]
+    unsafe {
+      let ch = &mut *self.receiver
+      
+      match ch.buffer.pop_front()
+      when Option::Some(val) then
+        # Wake a sender
+        if !ch.send_waiters.is_empty() then
+          ch.send_waiters.pop().unwrap().wake()
+        end
+        Poll::Ready(Option::Some(val))
+      when Option::None then
+        if ch.closed then
+          Poll::Ready(Option::None)
+        else
+          ch.recv_waiters.push(cx.waker.clone())
+          Poll::Pending
+        end
+      end
+    }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Select (race multiple futures)
+# ———————————————————————————————————————————————————————————————
+
+enum Either[A, B]
+  Left(A)
+  Right(B)
+end
+
+struct SelectFuture[A: Future, B: Future]
+  a: A
+  b: B
+  a_done: Bool
+  b_done: Bool
+end
+
+impl Future for SelectFuture[A, B]
+  type Output = Either[A::Output, B::Output]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[Either[A::Output, B::Output]]
+    if !self.a_done then
+      match self.a.poll(cx)
+      when Poll::Ready(val) then
+        return Poll::Ready(Either::Left(val))
+      when Poll::Pending then ()
+      end
+    end
+    
+    if !self.b_done then
+      match self.b.poll(cx)
+      when Poll::Ready(val) then
+        return Poll::Ready(Either::Right(val))
+      when Poll::Pending then ()
+      end
+    end
+    
+    Poll::Pending
+  end
+end
+
+pub def select[A: Future, B: Future](a: A, b: B) -> SelectFuture[A, B]
+  SelectFuture { a: a, b: b, a_done: false, b_done: false }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Join (run two futures concurrently, wait for both)
+# ———————————————————————————————————————————————————————————————
+
+struct JoinFuture[A: Future, B: Future]
+  a: A
+  b: B
+  a_result: Option[A::Output]
+  b_result: Option[B::Output]
+end
+
+impl Future for JoinFuture[A, B]
+  type Output = (A::Output, B::Output)
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[(A::Output, B::Output)]
+    if self.a_result.is_none() then
+      match self.a.poll(cx)
+      when Poll::Ready(val) then self.a_result = Option::Some(val)
+      when Poll::Pending then ()
+      end
+    end
+    
+    if self.b_result.is_none() then
+      match self.b.poll(cx)
+      when Poll::Ready(val) then self.b_result = Option::Some(val)
+      when Poll::Pending then ()
+      end
+    end
+    
+    if self.a_result.is_some() && self.b_result.is_some() then
+      Poll::Ready((self.a_result.take().unwrap(), self.b_result.take().unwrap()))
+    else
+      Poll::Pending
+    end
+  end
+end
+
+pub def join[A: Future, B: Future](a: A, b: B) -> JoinFuture[A, B]
+  JoinFuture {
+    a: a, b: b,
+    a_result: Option::None,
+    b_result: Option::None
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public Entrypoints
+# ———————————————————————————————————————————————————————————————
+
+# Global executor (thread-local in multi-threaded contexts)
+static mut GLOBAL_EXECUTOR: Option[Executor] = Option::None
+
+pub def block_on[F: Future](future: F) -> F::Output
+  mut exec = executor_new()
+  
+  # Wrap the main future to capture its output
+  mut result: Option[F::Output] = Option::None
+  let result_ptr = &mut result as *mut Option[F::Output]
+  
+  exec.spawn(async {
+    let val = future.await
+    unsafe {
+      *result_ptr = Option::Some(val)
+    }
+  })
+  
+  exec.run()
+  
+  result.expect("block_on: future did not complete")
+end
+
+pub def spawn(future: impl Future[Output = ()] + 'static) -> JoinHandle[()]
+  unsafe {
+    match GLOBAL_EXECUTOR
+    when Option::Some(ref mut exec) then exec.spawn(future)
+    when Option::None then
+      panic("spawn called outside of async runtime — use block_on() first")
+    end
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Platform Sleep (FFI)
+# ———————————————————————————————————————————————————————————————
+
+extern "C" {
+  def usleep(usec: UInt) -> Int
+}
+
+def sleep_ms(ms: UInt) -> Unit
+  if ms > 0 then
+    usleep(ms * 1000)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Async Mutex (for shared state in async code)
+# ———————————————————————————————————————————————————————————————
+
+struct AsyncMutex[T]
+  value: T
+  locked: Bool
+  waiters: Vec[Waker]
+end
+
+pub def async_mutex_new[T](value: T) -> AsyncMutex[T]
+  AsyncMutex {
+    value: value,
+    locked: false,
+    waiters: Vec::new()
+  }
+end
+
+struct MutexGuard[T]
+  mutex: *mut AsyncMutex[T]
+end
+
+impl MutexGuard[T]
+  def get(&self) -> &T
+    unsafe { &(*self.mutex).value }
+  end
+  
+  def get_mut(&mut self) -> &mut T
+    unsafe { &mut (*self.mutex).value }
+  end
+end
+
+impl Drop for MutexGuard[T]
+  def drop(&mut self) -> Unit
+    unsafe {
+      let mtx = &mut *self.mutex
+      mtx.locked = false
+      # Wake next waiter
+      if !mtx.waiters.is_empty() then
+        mtx.waiters.remove(0).wake()
+      end
+    }
+  end
+end
+
+struct LockFuture[T]
+  mutex: *mut AsyncMutex[T]
+end
+
+impl Future for LockFuture[T]
+  type Output = MutexGuard[T]
+  
+  def poll(&mut self, cx: &mut Context) -> Poll[MutexGuard[T]]
+    unsafe {
+      let mtx = &mut *self.mutex
+      if !mtx.locked then
+        mtx.locked = true
+        Poll::Ready(MutexGuard { mutex: self.mutex })
+      else
+        mtx.waiters.push(cx.waker.clone())
+        Poll::Pending
+      end
+    }
+  end
+end
+
+impl AsyncMutex[T]
+  def lock(&mut self) -> LockFuture[T]
+    LockFuture { mutex: self as *mut AsyncMutex[T] }
+  end
+end

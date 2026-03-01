@@ -1,13 +1,13 @@
-# Tangerine Compiler — Object File Generation
-# Self-hosting compiler written in Tangerine
-#
-# Emits native object files directly — no external assembler needed.
-# Supports:
-#   ELF64  (Linux x86-64, Linux AArch64)
-#   Mach-O 64 (macOS x86-64, macOS AArch64 / Apple Silicon)
-#   COFF / PE (Windows x86-64)
-#
-# NO dependency on any other language.
+## Tangerine Compiler — Object File Generation
+## Self-hosting compiler written in Tangerine
+##
+## Emits native object files directly — no external assembler needed.
+## Supports:
+##   ELF64  (Linux x86-64, Linux AArch64)
+##   Mach-O 64 (macOS x86-64, macOS AArch64 / Apple Silicon)
+##   COFF / PE (Windows x86-64)
+##
+## NO dependency on any other language.
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map}
@@ -67,6 +67,10 @@ end
 # ———————————————————————————————————————————————————————————————
 # ELF64 Generation
 # ———————————————————————————————————————————————————————————————
+# NOTE: This module currently only emits ELF64 object files (Linux/FreeBSD).
+# macOS targets require Mach-O emission and Windows requires COFF/PE.
+# TODO: Implement emit_macho64() and emit_coff_pe() and dispatch based
+#       on the target triple (see linker.tg for similar per-format routing).
 
 # ELF constants
 def ELF_MAGIC() -> [u8; 4] = [0x7F, 0x45, 0x4C, 0x46]  # \x7fELF
@@ -1485,4 +1489,545 @@ def generate_frame_info(di: &mut DebugInfo) -> Unit
   # Patch CIE length
   let cie_length = di.debug_frame.len() - cie_start - 4
   patch_u32(&mut di.debug_frame, cie_start, cie_length as u32)
+end
+
+# ———————————————————————————————————————————————————————————————
+# PDB / CodeView Debug Info (Windows)
+# ———————————————————————————————————————————————————————————————
+
+# PDB (Program DataBase) file format for Visual Studio / WinDbg.
+# Contains type information (TPI stream), symbol information (DBI stream),
+# source file mappings, and module debug information.
+
+struct PdbInfo
+  # CodeView sections embedded in PE/COFF
+  debug_s: Vec[u8]     # .debug$S — symbol records
+  debug_t: Vec[u8]     # .debug$T — type records
+  
+  # PDB file streams
+  pdb_path: String
+  age: u32              # PDB age/revision
+  guid: PdbGuid         # Unique identifier linking EXE to PDB
+  
+  # TPI (Type Program Information) stream
+  type_records: Vec[CvTypeRecord]
+  type_index_base: u32  # Starting type index (0x1000 for user types)
+  
+  # Symbol records
+  symbol_records: Vec[CvSymbolRecord]
+  
+  # Source file checksums
+  file_checksums: Vec[FileChecksum]
+  
+  # Line number mappings
+  line_info: Vec[CvLineInfo]
+end
+
+struct PdbGuid
+  data1: u32
+  data2: u16
+  data3: u16
+  data4: Vec[u8]  # 8 bytes
+end
+
+# CodeView type record kinds
+enum CvTypeKind
+  LfPointer       # 0x1002
+  LfProcedure     # 0x1008
+  LfArgList       # 0x1201
+  LfFieldList     # 0x1203
+  LfStructure     # 0x1505
+  LfEnum          # 0x1507
+  LfArray         # 0x1503
+  LfMember        # 0x150D
+  LfEnumerate     # 0x1502
+  LfModifier      # 0x1001
+end
+
+struct CvTypeRecord
+  kind: CvTypeKind
+  data: Vec[u8]
+end
+
+# CodeView symbol record kinds
+enum CvSymbolKind
+  SProcRef        # 0x1125 — procedure reference
+  SLProcRef       # 0x1127 — local procedure reference
+  SGProc32        # 0x1110 — global procedure start
+  SLProc32        # 0x110F — local procedure start
+  SEnd            # 0x0006 — end of block/procedure
+  SObjName        # 0x1101 — object file name
+  SCompile3       # 0x113C — compiler info
+  SUdt            # 0x1108 — user-defined type
+  SConstant       # 0x1107 — constant
+  SLocal          # 0x113E — local variable in optimized code
+  SDefRange       # 0x113F — definition range for local
+  SGData32        # 0x110D — global data
+end
+
+struct CvSymbolRecord
+  kind: CvSymbolKind
+  data: Vec[u8]
+end
+
+struct FileChecksum
+  filename: String
+  checksum: Vec[u8]    # MD5 hash
+  checksum_kind: u8    # 1 = MD5
+end
+
+struct CvLineInfo
+  function_name: String
+  file_idx: u32
+  lines: Vec[CvLineEntry]
+end
+
+struct CvLineEntry
+  offset: u32
+  line: u32
+  col_start: u16
+  col_end: u16
+end
+
+def pdb_info_new(pdb_path: String) -> PdbInfo
+  PdbInfo {
+    debug_s: Vec::new(),
+    debug_t: Vec::new(),
+    pdb_path: pdb_path,
+    age: 1,
+    guid: generate_pdb_guid(),
+    type_records: Vec::new(),
+    type_index_base: 0x1000,
+    symbol_records: Vec::new(),
+    file_checksums: Vec::new(),
+    line_info: Vec::new()
+  }
+end
+
+def generate_pdb_guid() -> PdbGuid
+  # Generate a deterministic GUID from compilation timestamp
+  # In production this would use a proper UUID v4
+  PdbGuid {
+    data1: 0x54414E47,  # "TANG"
+    data2: 0x4552,       # "ER"
+    data3: 0x494E,       # "IN"
+    data4: vec![0x45, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01]
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# CodeView Type Record Emission
+# ———————————————————————————————————————————————————————————————
+
+def cv_emit_type_index(pdb: &mut PdbInfo) -> u32
+  let idx = pdb.type_index_base + pdb.type_records.len() as u32
+  idx
+end
+
+# Emit a basic type (Int, Bool, etc.) — uses predefined indices
+def cv_builtin_type_index(name: &String) -> u32
+  match name.as_str()
+  when "Unit" then 0x0003   # T_VOID
+  when "Bool" then 0x0030   # T_BOOL08
+  when "Int" then 0x0076    # T_INT8 (64-bit signed)
+  when "UInt" then 0x0077   # T_UINT8 (64-bit unsigned)
+  when "Float" then 0x0041  # T_REAL64
+  when "Char" then 0x0070   # T_CHAR
+  when "String" then 0x0603 # T_PVOID (pointer to bytes)
+  when _ then 0x0003        # T_VOID (fallback)
+  end
+end
+
+def cv_emit_struct_type(pdb: &mut PdbInfo, name: String, fields: &Vec[(String, u32)]) -> u32
+  let type_idx = cv_emit_type_index(pdb)
+  
+  # First emit the field list
+  mut field_list_data = Vec::new()
+  for field in fields do
+    # LF_MEMBER (0x150D)
+    write16_le(&mut field_list_data, 0x150D)
+    write16_le(&mut field_list_data, 0x0003)  # access: public
+    write32_le(&mut field_list_data, field.1)  # type index
+    write16_le(&mut field_list_data, 0)       # offset (simplified)
+    write_cv_string(&mut field_list_data, &field.0)
+    # Align to 4 bytes
+    while field_list_data.len() % 4 != 0 do
+      field_list_data.push(0xF0 + (4 - field_list_data.len() % 4) as u8)
+    end
+  end
+  
+  let fl_idx = cv_emit_type_index(pdb)
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfFieldList,
+    data: field_list_data
+  })
+  
+  # Now emit the structure type
+  mut struct_data = Vec::new()
+  write16_le(&mut struct_data, fields.len() as u16)  # member count
+  write16_le(&mut struct_data, 0x0200)                # property: none
+  write32_le(&mut struct_data, fl_idx)                 # field list
+  write32_le(&mut struct_data, 0)                      # derived from
+  write32_le(&mut struct_data, 0)                      # vshape
+  write16_le(&mut struct_data, 0)                      # size (simplified)
+  write_cv_string(&mut struct_data, &name)
+  
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfStructure,
+    data: struct_data
+  })
+  
+  type_idx
+end
+
+def cv_emit_enum_type(pdb: &mut PdbInfo, name: String, variants: &Vec[(String, i64)]) -> u32
+  let type_idx = cv_emit_type_index(pdb)
+  
+  # Emit field list for enum variants
+  mut field_data = Vec::new()
+  for variant in variants do
+    # LF_ENUMERATE (0x1502)
+    write16_le(&mut field_data, 0x1502)
+    write16_le(&mut field_data, 0x0003)  # access: public
+    # Value as LF_LONG
+    write16_le(&mut field_data, 0x8004)
+    write32_le(&mut field_data, variant.1 as u32)
+    write_cv_string(&mut field_data, &variant.0)
+    while field_data.len() % 4 != 0 do
+      field_data.push(0xF0 + (4 - field_data.len() % 4) as u8)
+    end
+  end
+  
+  let fl_idx = cv_emit_type_index(pdb)
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfFieldList,
+    data: field_data
+  })
+  
+  # LF_ENUM record
+  mut enum_data = Vec::new()
+  write16_le(&mut enum_data, variants.len() as u16)
+  write16_le(&mut enum_data, 0)               # property
+  write32_le(&mut enum_data, 0x0076)           # underlying type: INT8
+  write32_le(&mut enum_data, fl_idx)           # field list
+  write_cv_string(&mut enum_data, &name)
+  
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfEnum,
+    data: enum_data
+  })
+  
+  type_idx
+end
+
+def cv_emit_procedure_type(pdb: &mut PdbInfo, ret_type: u32, param_types: &Vec[u32]) -> u32
+  let type_idx = cv_emit_type_index(pdb)
+  
+  # Emit arg list first
+  mut arglist_data = Vec::new()
+  write32_le(&mut arglist_data, param_types.len() as u32)
+  for pt in param_types do
+    write32_le(&mut arglist_data, *pt)
+  end
+  
+  let al_idx = cv_emit_type_index(pdb)
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfArgList,
+    data: arglist_data
+  })
+  
+  # LF_PROCEDURE
+  mut proc_data = Vec::new()
+  write32_le(&mut proc_data, ret_type)
+  proc_data.push(0)        # calling convention: near C
+  proc_data.push(0)        # func attributes
+  write16_le(&mut proc_data, param_types.len() as u16)
+  write32_le(&mut proc_data, al_idx)
+  
+  pdb.type_records.push(CvTypeRecord {
+    kind: CvTypeKind::LfProcedure,
+    data: proc_data
+  })
+  
+  type_idx
+end
+
+# ———————————————————————————————————————————————————————————————
+# CodeView Symbol Record Emission
+# ———————————————————————————————————————————————————————————————
+
+def cv_emit_obj_name(pdb: &mut PdbInfo, obj_name: String) -> Unit
+  mut data = Vec::new()
+  write32_le(&mut data, 0)  # signature
+  write_cv_string(&mut data, &obj_name)
+  
+  pdb.symbol_records.push(CvSymbolRecord {
+    kind: CvSymbolKind::SObjName,
+    data: data
+  })
+end
+
+def cv_emit_compile3(pdb: &mut PdbInfo, compiler_version: String) -> Unit
+  mut data = Vec::new()
+  write32_le(&mut data, 0)      # flags
+  write16_le(&mut data, 0x00D0) # machine: AMD64
+  write16_le(&mut data, 0)      # frontend version major
+  write16_le(&mut data, 1)      # frontend version minor
+  write16_le(&mut data, 0)      # frontend version build
+  write16_le(&mut data, 0)      # frontend version QFE
+  write16_le(&mut data, 0)      # backend version major
+  write16_le(&mut data, 1)      # backend version minor
+  write16_le(&mut data, 0)      # backend version build
+  write16_le(&mut data, 0)      # backend version QFE
+  write_cv_string(&mut data, &compiler_version)
+  
+  pdb.symbol_records.push(CvSymbolRecord {
+    kind: CvSymbolKind::SCompile3,
+    data: data
+  })
+end
+
+def cv_emit_global_proc(pdb: &mut PdbInfo, name: String, type_idx: u32,
+                        offset: u32, section: u16, code_size: u32) -> Unit
+  mut data = Vec::new()
+  write32_le(&mut data, 0)           # pParent
+  write32_le(&mut data, 0)           # pEnd
+  write32_le(&mut data, 0)           # pNext
+  write32_le(&mut data, code_size)   # code size
+  write32_le(&mut data, 0)           # debug start offset
+  write32_le(&mut data, code_size)   # debug end offset
+  write32_le(&mut data, type_idx)    # type index
+  write32_le(&mut data, offset)      # offset in section
+  write16_le(&mut data, section)     # section number
+  data.push(0)                       # flags
+  write_cv_string(&mut data, &name)
+  
+  pdb.symbol_records.push(CvSymbolRecord {
+    kind: CvSymbolKind::SGProc32,
+    data: data
+  })
+end
+
+def cv_emit_local_var(pdb: &mut PdbInfo, name: String, type_idx: u32, flags: u16) -> Unit
+  mut data = Vec::new()
+  write32_le(&mut data, type_idx)
+  write16_le(&mut data, flags)
+  write_cv_string(&mut data, &name)
+  
+  pdb.symbol_records.push(CvSymbolRecord {
+    kind: CvSymbolKind::SLocal,
+    data: data
+  })
+end
+
+def cv_emit_end(pdb: &mut PdbInfo) -> Unit
+  pdb.symbol_records.push(CvSymbolRecord {
+    kind: CvSymbolKind::SEnd,
+    data: Vec::new()
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# .debug$S and .debug$T Section Building
+# ———————————————————————————————————————————————————————————————
+
+def build_debug_s_section(pdb: &mut PdbInfo) -> Unit
+  # CodeView signature
+  write32_le(&mut pdb.debug_s, 4)  # CV_SIGNATURE_C13
+  
+  # File checksums subsection (0xF4)
+  let checksums_start = pdb.debug_s.len()
+  write32_le(&mut pdb.debug_s, 0xF4)  # subsection type
+  write32_le(&mut pdb.debug_s, 0)     # length placeholder
+  
+  for fc in pdb.file_checksums do
+    let name_offset = 0u32  # Would be offset into string table
+    write32_le(&mut pdb.debug_s, name_offset)
+    pdb.debug_s.push(fc.checksum.len() as u8)
+    pdb.debug_s.push(fc.checksum_kind)
+    for b in fc.checksum do
+      pdb.debug_s.push(b)
+    end
+    # Align to 4
+    while (pdb.debug_s.len() - checksums_start) % 4 != 0 do
+      pdb.debug_s.push(0)
+    end
+  end
+  
+  # Patch checksums length
+  let checksums_len = pdb.debug_s.len() - checksums_start - 8
+  patch_u32(&mut pdb.debug_s, checksums_start + 4, checksums_len as u32)
+  
+  # Lines subsection (0xF2)
+  for li in pdb.line_info do
+    let lines_start = pdb.debug_s.len()
+    write32_le(&mut pdb.debug_s, 0xF2)  # subsection type
+    write32_le(&mut pdb.debug_s, 0)     # length placeholder
+    
+    write32_le(&mut pdb.debug_s, 0)     # offset of contributing code
+    write16_le(&mut pdb.debug_s, 1)     # segment
+    write16_le(&mut pdb.debug_s, 0)     # flags
+    write32_le(&mut pdb.debug_s, 0)     # code size
+    
+    # File block
+    write32_le(&mut pdb.debug_s, li.file_idx)
+    write32_le(&mut pdb.debug_s, li.lines.len() as u32)
+    write32_le(&mut pdb.debug_s, 12 + li.lines.len() as u32 * 8)  # block size
+    
+    for entry in li.lines do
+      write32_le(&mut pdb.debug_s, entry.offset)
+      # line/deltaLineEnd/fStatement packed
+      write32_le(&mut pdb.debug_s, entry.line | 0x80000000)
+    end
+    
+    let lines_len = pdb.debug_s.len() - lines_start - 8
+    patch_u32(&mut pdb.debug_s, lines_start + 4, lines_len as u32)
+  end
+  
+  # Symbol records subsection (0xF1)
+  let syms_start = pdb.debug_s.len()
+  write32_le(&mut pdb.debug_s, 0xF1)
+  write32_le(&mut pdb.debug_s, 0)  # length placeholder
+  
+  for sym in pdb.symbol_records do
+    let sym_start = pdb.debug_s.len()
+    write16_le(&mut pdb.debug_s, 0)  # record length placeholder
+    write16_le(&mut pdb.debug_s, cv_symbol_kind_value(&sym.kind))
+    for b in sym.data do
+      pdb.debug_s.push(b)
+    end
+    # Align to 4
+    while (pdb.debug_s.len() - sym_start) % 4 != 0 do
+      pdb.debug_s.push(0)
+    end
+    let sym_len = pdb.debug_s.len() - sym_start - 2
+    patch_u16(&mut pdb.debug_s, sym_start, sym_len as u16)
+  end
+  
+  let syms_len = pdb.debug_s.len() - syms_start - 8
+  patch_u32(&mut pdb.debug_s, syms_start + 4, syms_len as u32)
+end
+
+def build_debug_t_section(pdb: &mut PdbInfo) -> Unit
+  # CodeView signature
+  write32_le(&mut pdb.debug_t, 4)  # CV_SIGNATURE_C13
+  
+  for rec in pdb.type_records do
+    let rec_start = pdb.debug_t.len()
+    write16_le(&mut pdb.debug_t, 0)  # record length placeholder
+    write16_le(&mut pdb.debug_t, cv_type_kind_value(&rec.kind))
+    for b in rec.data do
+      pdb.debug_t.push(b)
+    end
+    while (pdb.debug_t.len() - rec_start) % 4 != 0 do
+      pdb.debug_t.push(0)
+    end
+    let rec_len = pdb.debug_t.len() - rec_start - 2
+    patch_u16(&mut pdb.debug_t, rec_start, rec_len as u16)
+  end
+end
+
+def cv_symbol_kind_value(kind: &CvSymbolKind) -> u16
+  match kind
+  when CvSymbolKind::SProcRef then 0x1125
+  when CvSymbolKind::SLProcRef then 0x1127
+  when CvSymbolKind::SGProc32 then 0x1110
+  when CvSymbolKind::SLProc32 then 0x110F
+  when CvSymbolKind::SEnd then 0x0006
+  when CvSymbolKind::SObjName then 0x1101
+  when CvSymbolKind::SCompile3 then 0x113C
+  when CvSymbolKind::SUdt then 0x1108
+  when CvSymbolKind::SConstant then 0x1107
+  when CvSymbolKind::SLocal then 0x113E
+  when CvSymbolKind::SDefRange then 0x113F
+  when CvSymbolKind::SGData32 then 0x110D
+  end
+end
+
+def cv_type_kind_value(kind: &CvTypeKind) -> u16
+  match kind
+  when CvTypeKind::LfPointer then 0x1002
+  when CvTypeKind::LfProcedure then 0x1008
+  when CvTypeKind::LfArgList then 0x1201
+  when CvTypeKind::LfFieldList then 0x1203
+  when CvTypeKind::LfStructure then 0x1505
+  when CvTypeKind::LfEnum then 0x1507
+  when CvTypeKind::LfArray then 0x1503
+  when CvTypeKind::LfMember then 0x150D
+  when CvTypeKind::LfEnumerate then 0x1502
+  when CvTypeKind::LfModifier then 0x1001
+  end
+end
+
+def write_cv_string(buf: &mut Vec[u8], s: &String) -> Unit
+  for c in s.bytes() do
+    buf.push(c)
+  end
+  buf.push(0)  # Null terminator
+end
+
+def write16_le(buf: &mut Vec[u8], val: u16) -> Unit
+  buf.push((val & 0xFF) as u8)
+  buf.push(((val >> 8) & 0xFF) as u8)
+end
+
+def write32_le(buf: &mut Vec[u8], val: u32) -> Unit
+  buf.push((val & 0xFF) as u8)
+  buf.push(((val >> 8) & 0xFF) as u8)
+  buf.push(((val >> 16) & 0xFF) as u8)
+  buf.push(((val >> 24) & 0xFF) as u8)
+end
+
+def patch_u16(buf: &mut Vec[u8], offset: UInt, val: u16) -> Unit
+  buf[offset] = (val & 0xFF) as u8
+  buf[offset + 1] = ((val >> 8) & 0xFF) as u8
+end
+
+# ———————————————————————————————————————————————————————————————
+# PE Debug Directory Entry (links to PDB)
+# ———————————————————————————————————————————————————————————————
+
+def build_pe_debug_directory(pdb: &PdbInfo) -> Vec[u8]
+  mut dir = Vec::new()
+  
+  # IMAGE_DEBUG_DIRECTORY entry for CodeView
+  write32_le(&mut dir, 0)        # Characteristics
+  write32_le(&mut dir, 0)        # TimeDateStamp
+  write16_le(&mut dir, 0)        # MajorVersion
+  write16_le(&mut dir, 0)        # MinorVersion
+  write32_le(&mut dir, 2)        # Type: IMAGE_DEBUG_TYPE_CODEVIEW
+  write32_le(&mut dir, 0)        # SizeOfData (filled later)
+  write32_le(&mut dir, 0)        # AddressOfRawData (filled later)
+  write32_le(&mut dir, 0)        # PointerToRawData (filled later)
+  
+  dir
+end
+
+def build_codeview_info(pdb: &PdbInfo) -> Vec[u8]
+  mut cv = Vec::new()
+  
+  # RSDS signature
+  cv.push('R' as u8)
+  cv.push('S' as u8)
+  cv.push('D' as u8)
+  cv.push('S' as u8)
+  
+  # GUID
+  write32_le(&mut cv, pdb.guid.data1)
+  write16_le(&mut cv, pdb.guid.data2)
+  write16_le(&mut cv, pdb.guid.data3)
+  for b in pdb.guid.data4 do
+    cv.push(b)
+  end
+  
+  # Age
+  write32_le(&mut cv, pdb.age)
+  
+  # PDB file path (null-terminated UTF-8)
+  for c in pdb.pdb_path.bytes() do
+    cv.push(c)
+  end
+  cv.push(0)
+  
+  cv
 end
