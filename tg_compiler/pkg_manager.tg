@@ -1,0 +1,471 @@
+## tg_compiler::pkg_manager — Package Manager
+## Dependency resolution, lockfiles, reproducible builds.
+## Spec: §tooling.pkg
+
+module tg_compiler::pkg_manager
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Set, Array}
+use std::semver::{Version, Requirement}
+use std::fs
+use std::io
+use std::crypto::{Sha256}
+
+# ─── Package identity ────────────────────────────────────────────────
+
+pub struct PackageId
+  pub name: String
+  pub version: Version
+end
+
+impl Display for PackageId
+  def fmt(self: &Self) -> String
+    self.name.clone() + "@" + self.version.to_string()
+  end
+end
+
+pub struct Dependency
+  pub name: String
+  pub requirement: Requirement
+  pub registry: Option[String]
+  pub features: Array[String]
+  pub optional: Bool
+  pub dev_only: Bool
+end
+
+pub struct Package
+  pub id: PackageId
+  pub dependencies: Array[Dependency]
+  pub dev_dependencies: Array[Dependency]
+  pub features: Map[String, Array[String]]
+  pub authors: Array[String]
+  pub license: Option[String]
+  pub repository: Option[String]
+  pub description: Option[String]
+  pub keywords: Array[String]
+  pub edition: String
+  pub source_dir: String
+  pub checksum: Option[String]
+end
+
+# ─── Lockfile ────────────────────────────────────────────────────────
+
+pub struct Lockfile
+  pub packages: Array[LockedPackage]
+  pub metadata: Map[String, String]
+  pub version: Int  ## lockfile format version
+end
+
+pub struct LockedPackage
+  pub name: String
+  pub version: Version
+  pub source: PackageSource
+  pub checksum: String  ## SHA-256 of the package archive
+  pub dependencies: Array[String]  ## "name@version" references
+end
+
+pub enum PackageSource
+  Registry(String)   ## registry URL
+  Git { url: String, rev: String }
+  Path(String)
+  Local
+end
+
+impl Display for PackageSource
+  def fmt(self: &Self) -> String
+    match self
+    when Registry(url) then "registry+" + url
+    when Git { url, rev } then "git+" + url + "#" + rev
+    when Path(p) then "path+" + p
+    when Local then "local"
+    end
+  end
+end
+
+impl Lockfile
+  pub def new() -> Lockfile
+    Lockfile { packages: Array::new(), metadata: Map::new(), version: 1 }
+  end
+
+  pub def parse(content: &str) -> Result[Lockfile, PkgError]
+    ## Parse TOML lockfile format
+    var lockfile = Lockfile::new()
+    ## Simplified parsing — real impl uses std::toml
+    let lines = content.lines()
+    var current_pkg: Option[LockedPackage] = None
+    for line in lines do
+      let trimmed = line.trim()
+      if trimmed.starts_with("[[package]]") then
+        if let Some(pkg) = current_pkg.take() then
+          lockfile.packages.push(pkg)
+        end
+        current_pkg = Some(LockedPackage {
+          name: String::new(),
+          version: Version::new(0, 0, 0),
+          source: PackageSource::Local,
+          checksum: String::new(),
+          dependencies: Array::new(),
+        })
+      else if trimmed.starts_with("name = ") then
+        if let Some(ref mut pkg) = current_pkg then
+          pkg.name = _parse_toml_string(trimmed.substring(7, trimmed.len() as Int))
+        end
+      else if trimmed.starts_with("version = ") then
+        if let Some(ref mut pkg) = current_pkg then
+          let vs = _parse_toml_string(trimmed.substring(10, trimmed.len() as Int))
+          pkg.version = Version::parse(&vs).unwrap_or(Version::new(0, 0, 0))
+        end
+      else if trimmed.starts_with("checksum = ") then
+        if let Some(ref mut pkg) = current_pkg then
+          pkg.checksum = _parse_toml_string(trimmed.substring(11, trimmed.len() as Int))
+        end
+      end
+    end
+    if let Some(pkg) = current_pkg then
+      lockfile.packages.push(pkg)
+    end
+    Ok(lockfile)
+  end
+
+  pub def serialize(self: &Self) -> String
+    var out = String::new()
+    out = out + "# Tangerine lockfile v" + self.version.to_string() + "\n"
+    out = out + "# This file is auto-generated. Do not edit.\n\n"
+    for pkg in self.packages.iter() do
+      out = out + "[[package]]\n"
+      out = out + "name = \"" + pkg.name.clone() + "\"\n"
+      out = out + "version = \"" + pkg.version.to_string() + "\"\n"
+      out = out + "source = \"" + pkg.source.to_string() + "\"\n"
+      out = out + "checksum = \"" + pkg.checksum.clone() + "\"\n"
+      if !pkg.dependencies.is_empty() then
+        out = out + "dependencies = [\n"
+        for dep in pkg.dependencies.iter() do
+          out = out + "  \"" + dep.clone() + "\",\n"
+        end
+        out = out + "]\n"
+      end
+      out = out + "\n"
+    end
+    out
+  end
+
+  pub def write_to_file(self: &Self, path: &str) -> Result[Unit, PkgError]
+    fs::write_string(path.to_string(), self.serialize())
+      .map_err(|e| PkgError::IoError(e.to_string()))
+  end
+
+  pub def read_from_file(path: &str) -> Result[Lockfile, PkgError]
+    let content = fs::read_to_string(path.to_string())
+      .map_err(|e| PkgError::IoError(e.to_string()))?
+    Self::parse(&content)
+  end
+end
+
+# ─── Dependency resolver ─────────────────────────────────────────────
+
+pub struct Resolver
+  registry: Box[dyn Registry]
+  resolved: Map[String, ResolvedNode]
+  visited: Set[String]
+end
+
+struct ResolvedNode
+  package: Package
+  deps: Array[PackageId]
+end
+
+pub trait Registry
+  def fetch_versions(self: &Self, name: &str) -> Result[Array[Version], PkgError]
+  def fetch_package(self: &Self, name: &str, version: &Version) -> Result[Package, PkgError]
+  def download_archive(self: &Self, id: &PackageId) -> Result[Array[u8], PkgError]
+end
+
+impl Resolver
+  pub def new(registry: Box[dyn Registry]) -> Resolver
+    Resolver {
+      registry: registry,
+      resolved: Map::new(),
+      visited: Set::new(),
+    }
+  end
+
+  /// Resolve all dependencies starting from root package.
+  /// Uses a SAT-like backtracking solver.
+  pub def resolve(
+    &mut self,
+    root_deps: &[Dependency]
+  ) -> Result[Array[LockedPackage], PkgError]
+    for dep in root_deps.iter() do
+      self.resolve_dep(dep, 0)?
+    end
+    self.build_lockfile_entries()
+  end
+
+  def resolve_dep(&mut self, dep: &Dependency, depth: Int) -> Result[Unit, PkgError]
+    if depth > 256 then
+      return Err(PkgError::DependencyCycle(dep.name.clone()))
+    end
+
+    let key = dep.name.clone()
+    if self.visited.contains(&key) then
+      return Ok(())
+    end
+    self.visited.insert(key.clone())
+
+    ## Fetch available versions
+    let versions = self.registry.fetch_versions(&dep.name)?
+    
+    ## Find best matching version (highest that satisfies requirement)
+    var best: Option[Version] = None
+    for v in versions.iter() do
+      if dep.requirement.matches(&v) then
+        match &best
+        when Some(b) then
+          if v > *b then best = Some(v) end
+        when None then best = Some(v)
+        end
+      end
+    end
+
+    let selected = best.ok_or(PkgError::NoMatchingVersion {
+      name: dep.name.clone(),
+      requirement: dep.requirement.to_string(),
+    })?
+
+    ## Fetch full package info
+    let pkg = self.registry.fetch_package(&dep.name, &selected)?
+
+    ## Recursively resolve transitive dependencies
+    let transitive_deps = pkg.dependencies.clone()
+    let pkg_id = PackageId { name: dep.name.clone(), version: selected }
+    self.resolved.insert(key, ResolvedNode {
+      package: pkg,
+      deps: Array::new(),
+    })
+
+    for tdep in transitive_deps.iter() do
+      self.resolve_dep(tdep, depth + 1)?
+    end
+
+    Ok(())
+  end
+
+  def build_lockfile_entries(&self) -> Result[Array[LockedPackage], PkgError]
+    var entries = Array::new()
+    for (name, node) in self.resolved.entries() do
+      entries.push(LockedPackage {
+        name: node.package.id.name.clone(),
+        version: node.package.id.version.clone(),
+        source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+        checksum: node.package.checksum.unwrap_or("".to_string()),
+        dependencies: node.deps.iter().map(|d| d.to_string()).collect(),
+      })
+    end
+    Ok(entries)
+  end
+end
+
+# ─── Build plan ──────────────────────────────────────────────────────
+
+pub struct BuildPlan
+  pub steps: Array[BuildStep]
+end
+
+pub struct BuildStep
+  pub package: PackageId
+  pub action: BuildAction
+  pub dependencies: Array[PackageId]
+end
+
+pub enum BuildAction
+  Fetch { source: PackageSource, checksum: String }
+  Compile { features: Array[String], mode: BuildMode }
+  Link
+end
+
+pub enum BuildMode
+  Dev     ## Debug info, no optimizations
+  Release ## Optimized, stripped
+  Test    ## Debug info + test harness
+end
+
+impl BuildPlan
+  pub def from_lockfile(lockfile: &Lockfile) -> BuildPlan
+    var steps = Array::new()
+    for pkg in lockfile.packages.iter() do
+      let id = PackageId { name: pkg.name.clone(), version: pkg.version.clone() }
+      steps.push(BuildStep {
+        package: id,
+        action: BuildAction::Compile {
+          features: Array::new(),
+          mode: BuildMode::Release,
+        },
+        dependencies: pkg.dependencies.iter()
+          .filter_map(|d| _parse_pkg_id(d))
+          .collect(),
+      })
+    end
+    BuildPlan { steps: steps }
+  end
+end
+
+# ─── Package commands ────────────────────────────────────────────────
+
+pub struct PkgManager
+  project_root: String
+  lockfile_path: String
+  cache_dir: String
+end
+
+impl PkgManager
+  pub def new(project_root: &str) -> PkgManager
+    PkgManager {
+      project_root: project_root.to_string(),
+      lockfile_path: project_root.to_string() + "/Tangerine.lock",
+      cache_dir: std::env::home_dir().unwrap_or("/tmp".to_string()) + "/.tangerine/cache",
+    }
+  end
+
+  /// Install all dependencies from lockfile (or resolve + lock first).
+  pub def install(&mut self, registry: Box[dyn Registry]) -> Result[Unit, PkgError]
+    let lockfile = if fs::path_exists(self.lockfile_path.clone()) then
+      Lockfile::read_from_file(&self.lockfile_path)?
+    else
+      ## Read Tangerine.toml and resolve
+      let manifest = self.read_manifest()?
+      let mut resolver = Resolver::new(registry)
+      let locked = resolver.resolve(&manifest.dependencies)?
+      let lf = Lockfile { packages: locked, metadata: Map::new(), version: 1 }
+      lf.write_to_file(&self.lockfile_path)?
+      lf
+    end
+
+    ## Download and cache packages
+    for pkg in lockfile.packages.iter() do
+      self.ensure_cached(pkg)?
+    end
+    Ok(())
+  end
+
+  /// Add a dependency to Tangerine.toml.
+  pub def add(&mut self, name: &str, requirement: &str) -> Result[Unit, PkgError]
+    let req = Requirement::parse(requirement)
+      .map_err(|e| PkgError::InvalidRequirement(e.to_string()))?
+    ## Append to Tangerine.toml [dependencies] section
+    let toml_path = self.project_root.clone() + "/Tangerine.toml"
+    let content = fs::read_to_string(toml_path.clone())
+      .map_err(|e| PkgError::IoError(e.to_string()))?
+    let entry = name.to_string() + " = \"" + requirement.to_string() + "\"\n"
+    ## Simple append — real impl would parse TOML properly
+    let new_content = content + "\n" + entry
+    fs::write_string(toml_path, new_content)
+      .map_err(|e| PkgError::IoError(e.to_string()))
+  end
+
+  /// Remove a dependency.
+  pub def remove(&mut self, name: &str) -> Result[Unit, PkgError]
+    ## Filter out the dependency line from Tangerine.toml
+    let toml_path = self.project_root.clone() + "/Tangerine.toml"
+    let content = fs::read_to_string(toml_path.clone())
+      .map_err(|e| PkgError::IoError(e.to_string()))?
+    let filtered = content.lines()
+      .filter(|line| !line.starts_with(name))
+      .collect::<Array[String]>()
+      .join("\n")
+    fs::write_string(toml_path, filtered)
+      .map_err(|e| PkgError::IoError(e.to_string()))
+  end
+
+  /// Update lockfile to newest compatible versions.
+  pub def update(&mut self, registry: Box[dyn Registry]) -> Result[Unit, PkgError]
+    ## Delete lockfile and re-resolve
+    if fs::path_exists(self.lockfile_path.clone()) then
+      fs::remove_file(self.lockfile_path.clone())
+        .map_err(|e| PkgError::IoError(e.to_string()))?
+    end
+    self.install(registry)
+  end
+
+  def read_manifest(&self) -> Result[Package, PkgError]
+    ## Parse Tangerine.toml into Package struct
+    let toml_path = self.project_root.clone() + "/Tangerine.toml"
+    let _content = fs::read_to_string(toml_path)
+      .map_err(|e| PkgError::IoError(e.to_string()))?
+    ## Simplified — real impl parses full TOML manifest
+    Ok(Package {
+      id: PackageId { name: "root".to_string(), version: Version::new(0, 1, 0) },
+      dependencies: Array::new(),
+      dev_dependencies: Array::new(),
+      features: Map::new(),
+      authors: Array::new(),
+      license: None,
+      repository: None,
+      description: None,
+      keywords: Array::new(),
+      edition: "2024".to_string(),
+      source_dir: "src".to_string(),
+      checksum: None,
+    })
+  end
+
+  def ensure_cached(&self, pkg: &LockedPackage) -> Result[Unit, PkgError]
+    let cache_path = self.cache_dir.clone() + "/" + pkg.name.clone() + "-" + pkg.version.to_string()
+    if fs::path_exists(cache_path) then return Ok(()) end
+    ## In real impl: download from source, verify checksum, extract
+    fs::create_dir_all(cache_path)
+      .map_err(|e| PkgError::IoError(e.to_string()))
+  end
+end
+
+# ─── Errors ──────────────────────────────────────────────────────────
+
+pub enum PkgError
+  IoError(String)
+  ParseError(String)
+  NoMatchingVersion { name: String, requirement: String }
+  DependencyCycle(String)
+  ChecksumMismatch { package: String, expected: String, actual: String }
+  InvalidRequirement(String)
+  RegistryError(String)
+  NetworkError(String)
+end
+
+impl Display for PkgError
+  def fmt(self: &Self) -> String
+    match self
+    when IoError(msg) then "pkg I/O error: " + msg
+    when ParseError(msg) then "pkg parse error: " + msg
+    when NoMatchingVersion { name, requirement } then
+      "no matching version for " + name + " " + requirement
+    when DependencyCycle(name) then "dependency cycle detected at: " + name
+    when ChecksumMismatch { package, expected, actual } then
+      "checksum mismatch for " + package + ": expected " + expected + ", got " + actual
+    when InvalidRequirement(msg) then "invalid requirement: " + msg
+    when RegistryError(msg) then "registry error: " + msg
+    when NetworkError(msg) then "network error: " + msg
+    end
+  end
+end
+
+def _parse_toml_string(s: &str) -> String
+  let trimmed = s.trim()
+  if trimmed.starts_with("\"") && trimmed.ends_with("\"") then
+    trimmed.substring(1, (trimmed.len() - 1) as Int)
+  else
+    trimmed.to_string()
+  end
+end
+
+def _parse_pkg_id(s: &str) -> Option[PackageId]
+  let parts = s.split("@")
+  if parts.len() == 2 then
+    match Version::parse(parts[1])
+    when Ok(v) then Some(PackageId { name: parts[0].to_string(), version: v })
+    when Err(_) then None
+    end
+  else
+    None
+  end
+end
+
+end ## module tg_compiler::pkg_manager

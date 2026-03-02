@@ -1,0 +1,423 @@
+## tg_compiler::debugger — Debugger integration (LLDB/GDB)
+## DWARF debug info generation, breakpoint support, variable inspection.
+## Spec: §tooling.debugger
+
+module tg_compiler::debugger
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Array}
+use tg_compiler::ast::{AstNode}
+
+# ─── DWARF debug information ────────────────────────────────────────
+
+pub struct DebugInfo
+  pub compile_units: Array[CompileUnit]
+  pub line_programs: Array[LineProgram]
+  pub abbrev_tables: Array[AbbrevTable]
+end
+
+pub struct CompileUnit
+  pub name: String
+  pub directory: String
+  pub language: DwarfLang
+  pub producer: String
+  pub low_pc: UInt
+  pub high_pc: UInt
+  pub entries: Array[DebugEntry]
+end
+
+pub enum DwarfLang
+  Tangerine   ## DW_LANG_lo_user + 0x0100
+end
+
+pub struct DebugEntry
+  pub tag: DwarfTag
+  pub attributes: Array[(DwarfAttribute, AttributeValue)]
+  pub children: Array[DebugEntry]
+end
+
+pub enum DwarfTag
+  SubProgram     ## Function
+  Variable
+  FormalParameter
+  LexicalBlock
+  BaseType
+  StructureType
+  EnumerationType
+  Member
+  Enumerator
+  PointerType
+  ReferenceType
+  ArrayType
+  SubrangeType
+  Typedef
+  Namespace
+end
+
+pub enum DwarfAttribute
+  Name
+  Type
+  Location
+  LowPc
+  HighPc
+  DeclFile
+  DeclLine
+  DeclColumn
+  ByteSize
+  Encoding
+  DataMemberLocation
+  Artificial
+  External
+  Inline
+  ConstValue
+end
+
+pub enum AttributeValue
+  String(String)
+  UInt(UInt)
+  Address(UInt)
+  LocationExpr(Array[u8])
+  Flag(Bool)
+  Reference(UInt)
+end
+
+# ─── Source map / line program ───────────────────────────────────────
+
+pub struct LineProgram
+  pub file_names: Array[String]
+  pub entries: Array[LineEntry]
+end
+
+pub struct LineEntry
+  pub address: UInt
+  pub file_index: UInt
+  pub line: UInt
+  pub column: UInt
+  pub is_statement: Bool
+  pub basic_block: Bool
+  pub end_sequence: Bool
+  pub prologue_end: Bool
+  pub epilogue_begin: Bool
+end
+
+pub struct AbbrevTable
+  pub entries: Array[AbbrevEntry]
+end
+
+pub struct AbbrevEntry
+  pub code: UInt
+  pub tag: DwarfTag
+  pub has_children: Bool
+  pub attributes: Array[(DwarfAttribute, AttributeForm)]
+end
+
+pub enum AttributeForm
+  Addr
+  String_
+  Data1
+  Data2
+  Data4
+  Data8
+  Udata
+  Sdata
+  Flag
+  FlagPresent
+  RefAddr
+  Exprloc
+end
+
+# ─── Debug info builder ─────────────────────────────────────────────
+
+pub struct DebugInfoBuilder
+  compile_unit: CompileUnit
+  line_program: LineProgram
+  type_map: Map[String, UInt]  ## type name -> DIE offset
+  next_offset: UInt
+end
+
+impl DebugInfoBuilder
+  pub def new(source_file: &str, source_dir: &str) -> DebugInfoBuilder
+    DebugInfoBuilder {
+      compile_unit: CompileUnit {
+        name: source_file.to_string(),
+        directory: source_dir.to_string(),
+        language: DwarfLang::Tangerine,
+        producer: "tg_compiler v0.1.0".to_string(),
+        low_pc: 0,
+        high_pc: 0,
+        entries: Array::new(),
+      },
+      line_program: LineProgram {
+        file_names: vec![source_file.to_string()],
+        entries: Array::new(),
+      },
+      type_map: Map::new(),
+      next_offset: 0,
+    }
+  end
+
+  /// Add a function entry.
+  pub def add_function(
+    &mut self,
+    name: &str,
+    low_pc: UInt,
+    high_pc: UInt,
+    return_type: UInt,
+    params: &[(String, UInt)],
+    file_idx: UInt,
+    line: UInt
+  ) -> UInt
+    let offset = self.alloc_offset()
+    var children = Array::new()
+    for (pname, pty) in params.iter() do
+      children.push(DebugEntry {
+        tag: DwarfTag::FormalParameter,
+        attributes: vec![
+          (DwarfAttribute::Name, AttributeValue::String(pname.clone())),
+          (DwarfAttribute::Type, AttributeValue::Reference(*pty)),
+        ],
+        children: Array::new(),
+      })
+    end
+    self.compile_unit.entries.push(DebugEntry {
+      tag: DwarfTag::SubProgram,
+      attributes: vec![
+        (DwarfAttribute::Name, AttributeValue::String(name.to_string())),
+        (DwarfAttribute::LowPc, AttributeValue::Address(low_pc)),
+        (DwarfAttribute::HighPc, AttributeValue::UInt(high_pc - low_pc)),
+        (DwarfAttribute::Type, AttributeValue::Reference(return_type)),
+        (DwarfAttribute::DeclFile, AttributeValue::UInt(file_idx)),
+        (DwarfAttribute::DeclLine, AttributeValue::UInt(line)),
+        (DwarfAttribute::External, AttributeValue::Flag(true)),
+      ],
+      children: children,
+    })
+    offset
+  end
+
+  /// Add a variable entry.
+  pub def add_variable(
+    &mut self,
+    name: &str,
+    type_ref: UInt,
+    location: Array[u8],
+    file_idx: UInt,
+    line: UInt
+  ) -> UInt
+    let offset = self.alloc_offset()
+    self.compile_unit.entries.push(DebugEntry {
+      tag: DwarfTag::Variable,
+      attributes: vec![
+        (DwarfAttribute::Name, AttributeValue::String(name.to_string())),
+        (DwarfAttribute::Type, AttributeValue::Reference(type_ref)),
+        (DwarfAttribute::Location, AttributeValue::LocationExpr(location)),
+        (DwarfAttribute::DeclFile, AttributeValue::UInt(file_idx)),
+        (DwarfAttribute::DeclLine, AttributeValue::UInt(line)),
+      ],
+      children: Array::new(),
+    })
+    offset
+  end
+
+  /// Register a base type (Int, Float, Bool, etc.)
+  pub def add_base_type(&mut self, name: &str, byte_size: UInt, encoding: UInt) -> UInt
+    if let Some(offset) = self.type_map.get(&name.to_string()) then
+      return *offset
+    end
+    let offset = self.alloc_offset()
+    self.compile_unit.entries.push(DebugEntry {
+      tag: DwarfTag::BaseType,
+      attributes: vec![
+        (DwarfAttribute::Name, AttributeValue::String(name.to_string())),
+        (DwarfAttribute::ByteSize, AttributeValue::UInt(byte_size)),
+        (DwarfAttribute::Encoding, AttributeValue::UInt(encoding)),
+      ],
+      children: Array::new(),
+    })
+    self.type_map.insert(name.to_string(), offset)
+    offset
+  end
+
+  /// Register a struct type.
+  pub def add_struct_type(
+    &mut self,
+    name: &str,
+    byte_size: UInt,
+    members: &[(String, UInt, UInt)]  ## (name, type_ref, offset)
+  ) -> UInt
+    let offset = self.alloc_offset()
+    var children = Array::new()
+    for (mname, mtype, moffset) in members.iter() do
+      children.push(DebugEntry {
+        tag: DwarfTag::Member,
+        attributes: vec![
+          (DwarfAttribute::Name, AttributeValue::String(mname.clone())),
+          (DwarfAttribute::Type, AttributeValue::Reference(*mtype)),
+          (DwarfAttribute::DataMemberLocation, AttributeValue::UInt(*moffset)),
+        ],
+        children: Array::new(),
+      })
+    end
+    self.compile_unit.entries.push(DebugEntry {
+      tag: DwarfTag::StructureType,
+      attributes: vec![
+        (DwarfAttribute::Name, AttributeValue::String(name.to_string())),
+        (DwarfAttribute::ByteSize, AttributeValue::UInt(byte_size)),
+      ],
+      children: children,
+    })
+    self.type_map.insert(name.to_string(), offset)
+    offset
+  end
+
+  /// Add a pointer type.
+  pub def add_pointer_type(&mut self, pointee_type: UInt) -> UInt
+    let offset = self.alloc_offset()
+    self.compile_unit.entries.push(DebugEntry {
+      tag: DwarfTag::PointerType,
+      attributes: vec![
+        (DwarfAttribute::Type, AttributeValue::Reference(pointee_type)),
+        (DwarfAttribute::ByteSize, AttributeValue::UInt(8)),  ## 64-bit pointer
+      ],
+      children: Array::new(),
+    })
+    offset
+  end
+
+  /// Add a line number entry.
+  pub def add_line_entry(
+    &mut self,
+    address: UInt,
+    file_idx: UInt,
+    line: UInt,
+    column: UInt,
+    is_statement: Bool
+  ) -> Unit
+    self.line_program.entries.push(LineEntry {
+      address: address,
+      file_index: file_idx,
+      line: line,
+      column: column,
+      is_statement: is_statement,
+      basic_block: false,
+      end_sequence: false,
+      prologue_end: false,
+      epilogue_begin: false,
+    })
+  end
+
+  /// Build the final DebugInfo.
+  pub def build(self) -> DebugInfo
+    DebugInfo {
+      compile_units: vec![self.compile_unit],
+      line_programs: vec![self.line_program],
+      abbrev_tables: Array::new(),
+    }
+  end
+
+  def alloc_offset(&mut self) -> UInt
+    let offset = self.next_offset
+    self.next_offset = self.next_offset + 1
+    offset
+  end
+end
+
+# ─── LLDB / GDB integration ─────────────────────────────────────────
+
+pub struct DebuggerConfig
+  pub debugger: DebuggerBackend
+  pub pretty_printers: Bool
+  pub source_map: Map[String, String]  ## compiled path -> source path
+end
+
+pub enum DebuggerBackend
+  LLDB
+  GDB
+  Auto  ## Detect available debugger
+end
+
+impl DebuggerConfig
+  pub def default() -> DebuggerConfig
+    DebuggerConfig {
+      debugger: DebuggerBackend::Auto,
+      pretty_printers: true,
+      source_map: Map::new(),
+    }
+  end
+end
+
+/// Generate LLDB/GDB pretty-printer scripts for Tangerine types.
+pub def generate_pretty_printers(debugger: &DebuggerBackend) -> String
+  match debugger
+  when LLDB then _lldb_pretty_printers()
+  when GDB then _gdb_pretty_printers()
+  when Auto then _lldb_pretty_printers()  ## Default to LLDB on macOS
+  end
+end
+
+def _lldb_pretty_printers() -> String
+  var s = "# Tangerine LLDB pretty printers\n"
+  s = s + "# Source this file in ~/.lldbinit or use `command script import`\n\n"
+  s = s + "import lldb\n\n"
+  s = s + "class TgStringProvider:\n"
+  s = s + "    def __init__(self, valobj, dict):\n"
+  s = s + "        self.valobj = valobj\n"
+  s = s + "    def update(self):\n"
+  s = s + "        ptr = self.valobj.GetChildMemberWithName('ptr')\n"
+  s = s + "        length = self.valobj.GetChildMemberWithName('len')\n"
+  s = s + "        if ptr.IsValid() and length.IsValid():\n"
+  s = s + "            self.length = length.GetValueAsUnsigned(0)\n"
+  s = s + "            self.ptr = ptr.GetValueAsUnsigned(0)\n"
+  s = s + "    def get_child_at_index(self, index):\n"
+  s = s + "        return None\n"
+  s = s + "    def get_child_index(self, name):\n"
+  s = s + "        return -1\n"
+  s = s + "    def num_children(self):\n"
+  s = s + "        return 0\n"
+  s = s + "    def has_children(self):\n"
+  s = s + "        return False\n\n"
+  s = s + "class TgArrayProvider:\n"
+  s = s + "    def __init__(self, valobj, dict):\n"
+  s = s + "        self.valobj = valobj\n"
+  s = s + "    def update(self):\n"
+  s = s + "        self.length = self.valobj.GetChildMemberWithName('len').GetValueAsUnsigned(0)\n"
+  s = s + "    def num_children(self):\n"
+  s = s + "        return self.length\n\n"
+  s = s + "def __lldb_init_module(debugger, dict):\n"
+  s = s + "    debugger.HandleCommand('type synthetic add -l TgStringProvider -x \"^tg::String$\"')\n"
+  s = s + "    debugger.HandleCommand('type synthetic add -l TgArrayProvider -x \"^tg::Array<.*>$\"')\n"
+  s = s + "    debugger.HandleCommand('type summary add -F \"tg::String\" -e -x \"^tg::String$\"')\n"
+  s
+end
+
+def _gdb_pretty_printers() -> String
+  var s = "# Tangerine GDB pretty printers\n"
+  s = s + "import gdb\nimport gdb.printing\n\n"
+  s = s + "class TgStringPrinter:\n"
+  s = s + "    def __init__(self, val):\n"
+  s = s + "        self.val = val\n"
+  s = s + "    def to_string(self):\n"
+  s = s + "        ptr = self.val['ptr']\n"
+  s = s + "        length = int(self.val['len'])\n"
+  s = s + "        return ptr.string(length=length)\n\n"
+  s = s + "class TgArrayPrinter:\n"
+  s = s + "    def __init__(self, val):\n"
+  s = s + "        self.val = val\n"
+  s = s + "    def to_string(self):\n"
+  s = s + "        length = int(self.val['len'])\n"
+  s = s + "        return 'Array(len=%d)' % length\n"
+  s = s + "    def children(self):\n"
+  s = s + "        length = int(self.val['len'])\n"
+  s = s + "        ptr = self.val['ptr']\n"
+  s = s + "        for i in range(length):\n"
+  s = s + "            yield '[%d]' % i, (ptr + i).dereference()\n\n"
+  s = s + "def build_pretty_printer():\n"
+  s = s + "    pp = gdb.printing.RegexpCollectionPrettyPrinter('tangerine')\n"
+  s = s + "    pp.add_printer('String', '^tg::String$', TgStringPrinter)\n"
+  s = s + "    pp.add_printer('Array', '^tg::Array<.*>$', TgArrayPrinter)\n"
+  s = s + "    return pp\n\n"
+  s = s + "gdb.printing.register_pretty_printer(gdb.current_objfile(), build_pretty_printer())\n"
+  s
+end
+
+end ## module tg_compiler::debugger

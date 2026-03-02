@@ -39,6 +39,21 @@ This document provides a comprehensive reference for all modules in the Tangerin
 28. [Deterministic Replay](#deterministic-replay) - `std/replay`
 29. [Semantic Diff](#semantic-diff) - `std/semantic_diff`
 30. [Supply Chain Security](#supply-chain-security) - `std/supply_chain`
+31. [Mathematics](#mathematics) - `std/math`
+32. [Random Numbers](#random-numbers) - `std/random`
+33. [Path Manipulation](#path-manipulation) - `std/path`
+34. [CSV](#csv) - `std/csv`
+35. [YAML](#yaml) - `std/yaml`
+36. [CBOR](#cbor) - `std/cbor`
+37. [MessagePack](#messagepack) - `std/msgpack`
+38. [Signal Handling](#signal-handling) - `std/signal`
+39. [Authentication](#authentication) - `std/auth`
+40. [Configuration](#configuration) - `std/config`
+41. [Debug Utilities](#debug-utilities) - `std/debug`
+42. [Semantic Versioning](#semantic-versioning) - `std/semver`
+43. [WebAssembly Runtime](#webassembly-runtime) - `std/wasm`
+44. [Process Management](#process-management) - `std/process`
+45. [Synchronization](#synchronization) - `std/sync`
 
 ---
 
@@ -1622,5 +1637,11 @@ use std::unicode::{normalize_nfc, grapheme_clusters, display_width}
 
 - [Language Reference](language.md) - Complete language specification
 - [Interoperability Guide](interop.md) - FFI and foreign language integration
+- [Memory Model](memory_model.md) - Ownership, borrowing, and lifetimes
+- [Error Handling Guide](error_handling.md) - Error handling patterns and best practices
+- [Concurrency Guide](concurrency.md) - Threading and async programming
+- [Packaging Guide](packaging.md) - Package management and publishing
+- [Deployment Targets](deployment_targets.md) - Cross-compilation and deployment
+- [Completeness Report](stdlib_completeness.md) - Full module inventory and checklist
 - [Style Guide](style_guide.md) - Code formatting and conventions
 - [FFI Cheat Sheet](ffi_cheatsheet.md) - Quick FFI reference

@@ -1053,3 +1053,255 @@ impl[T] Drop for ThreadLocal[T]
     pthread_key_delete(self.key)
   end
 end
+
+# ———————————————————————————————————————————————————————————————
+# Thread Pool
+# ———————————————————————————————————————————————————————————————
+
+## A fixed-size thread pool that distributes work across worker threads.
+struct ThreadPool
+  workers: Vec[Worker]
+  job_queue: Mutex[VecDeque[Box[dyn FnOnce() + Send]]]
+  condvar: Condvar
+  shutdown: AtomicBool
+  active_jobs: AtomicInt
+end
+
+struct Worker
+  thread: Option[JoinHandle[Unit]]
+  id: UInt
+end
+
+def thread_pool_new(num_threads: UInt) -> ThreadPool
+  let pool = ThreadPool {
+    workers: Vec::new(),
+    job_queue: Mutex::new(VecDeque::new()),
+    condvar: condvar_new(),
+    shutdown: atomic_bool_new(false),
+    active_jobs: atomic_int_new(0),
+  }
+
+  for i in 0..num_threads do
+    let worker_pool = &pool  ## shared reference
+    let handle = ThreadBuilder::new()
+      .name("pool-worker-".to_string() + i.to_string())
+      .spawn(|| worker_loop(worker_pool))
+    pool.workers.push(Worker { thread: Option::Some(handle), id: i })
+  end
+  pool
+end
+
+def worker_loop(pool: &ThreadPool) -> Unit
+  loop do
+    if pool.shutdown.load(Ordering::Acquire) then
+      break
+    end
+    let mut guard = pool.job_queue.lock()
+    while guard.is_empty() && !pool.shutdown.load(Ordering::Acquire) do
+      guard = pool.condvar.wait(guard)
+    end
+    if pool.shutdown.load(Ordering::Acquire) && guard.is_empty() then
+      break
+    end
+    let job = guard.pop_front()
+    drop(guard)
+
+    match job
+    when Option::Some(f) then
+      pool.active_jobs.fetch_add(1, Ordering::Relaxed)
+      f()
+      pool.active_jobs.fetch_sub(1, Ordering::Relaxed)
+    when Option::None then ()
+    end
+  end
+end
+
+impl ThreadPool
+  ## Submit a job to the pool.
+  def execute[F: FnOnce() + Send + 'static](self: &ThreadPool, f: F) -> Unit
+    let mut guard = self.job_queue.lock()
+    guard.push_back(Box::new(f))
+    drop(guard)
+    self.condvar.notify_one()
+  end
+
+  ## Submit a job and get a handle to its result.
+  def submit[T: Send + 'static, F: FnOnce() -> T + Send + 'static](
+    self: &ThreadPool,
+    f: F
+  ) -> ThreadPoolHandle[T]
+    let result = Arc::new(Mutex::new(Option::None))
+    let result_clone = result.clone()
+    let done = Arc::new(AtomicBool::new(false))
+    let done_clone = done.clone()
+
+    self.execute(|| {
+      let val = f()
+      let mut guard = result_clone.lock()
+      *guard = Option::Some(val)
+      drop(guard)
+      done_clone.store(true, Ordering::Release)
+    })
+
+    ThreadPoolHandle { result: result, done: done }
+  end
+
+  ## Number of worker threads.
+  def num_workers(self: &ThreadPool) -> UInt
+    self.workers.len()
+  end
+
+  ## Number of queued jobs waiting for execution.
+  def queued_jobs(self: &ThreadPool) -> UInt
+    let guard = self.job_queue.lock()
+    guard.len()
+  end
+
+  ## Number of currently active (executing) jobs.
+  def active_jobs(self: &ThreadPool) -> Int
+    self.active_jobs.load(Ordering::Relaxed)
+  end
+
+  ## Gracefully shutdown the pool, waiting for all jobs to finish.
+  def shutdown(self: &mut ThreadPool) -> Unit
+    self.shutdown.store(true, Ordering::Release)
+    self.condvar.notify_all()
+    for worker in &mut self.workers do
+      if let Option::Some(handle) = worker.thread.take() then
+        handle.join()
+      end
+    end
+  end
+end
+
+impl Drop for ThreadPool
+  def drop(self: &mut ThreadPool) -> Unit
+    if !self.shutdown.load(Ordering::Acquire) then
+      self.shutdown()
+    end
+  end
+end
+
+struct ThreadPoolHandle[T]
+  result: Arc[Mutex[Option[T]]]
+  done: Arc[AtomicBool]
+end
+
+impl[T] ThreadPoolHandle[T]
+  def is_done(self: &ThreadPoolHandle[T]) -> Bool
+    self.done.load(Ordering::Acquire)
+  end
+
+  def join(self: ThreadPoolHandle[T]) -> T
+    while !self.done.load(Ordering::Acquire) do
+      thread_yield()
+    end
+    let mut guard = self.result.lock()
+    guard.take().unwrap()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Scoped Threads
+# ———————————————————————————————————————————————————————————————
+
+## Scoped threads guarantee all spawned threads complete before the scope exits,
+## allowing safe borrowing of stack data.
+struct Scope[_: 'scope]
+  threads: Vec[JoinHandle[Unit]]
+end
+
+## Run a closure that can spawn scoped threads. All threads are joined
+## before this function returns, so spawned threads can borrow from the parent.
+def scope[T, F: FnOnce(&mut Scope) -> T](body: F) -> T
+  let mut s = Scope { threads: Vec::new() }
+  let result = body(&mut s)
+  ## Join all threads — this makes the borrow safe
+  for handle in s.threads.drain(..) do
+    handle.join()
+  end
+  result
+end
+
+impl Scope
+  ## Spawn a scoped thread. The closure may borrow data from the enclosing scope.
+  def spawn[F: FnOnce() + Send](self: &mut Scope, f: F) -> &JoinHandle[Unit]
+    let handle = ThreadBuilder::new().spawn(f)
+    self.threads.push(handle)
+    &self.threads[self.threads.len() - 1]
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Once (lazy one-time initialization)
+# ———————————————————————————————————————————————————————————————
+
+struct Once
+  done: AtomicBool
+  lock: Mutex[Unit]
+end
+
+def once_new() -> Once
+  Once { done: atomic_bool_new(false), lock: Mutex::new(()) }
+end
+
+impl Once
+  def call_once[F: FnOnce()](self: &Once, f: F) -> Unit
+    if self.done.load(Ordering::Acquire) then
+      return
+    end
+    let guard = self.lock.lock()
+    if !self.done.load(Ordering::Relaxed) then
+      f()
+      self.done.store(true, Ordering::Release)
+    end
+    drop(guard)
+  end
+
+  def is_completed(self: &Once) -> Bool
+    self.done.load(Ordering::Acquire)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Parking (thread park/unpark)
+# ———————————————————————————————————————————————————————————————
+
+## Park the current thread until unparked by another thread.
+def park() -> Unit
+  ## Uses the per-thread park state (mutex + condvar)
+  let park_mutex = thread_current_park_mutex()
+  let park_cond = thread_current_park_cond()
+  let mut guard = park_mutex.lock()
+  while !thread_current_unparked() do
+    guard = park_cond.wait(guard)
+  end
+  thread_clear_unpark()
+end
+
+## Unpark the given thread, causing it to wake from park().
+def unpark(t: &Thread) -> Unit
+  let park_mutex = thread_park_mutex(t)
+  let park_cond = thread_park_cond(t)
+  let guard = park_mutex.lock()
+  thread_set_unpark(t)
+  park_cond.notify_one()
+  drop(guard)
+end
+
+## Placeholder thread-park state accessors (implementation depends on TLS)
+def thread_current_park_mutex() -> &Mutex[Unit]
+  panic("park/unpark requires thread-local park state")
+end
+def thread_current_park_cond() -> &Condvar
+  panic("park/unpark requires thread-local park state")
+end
+def thread_current_unparked() -> Bool = false
+def thread_clear_unpark() -> Unit = ()
+def thread_park_mutex(t: &Thread) -> &Mutex[Unit]
+  panic("park/unpark requires thread-local park state")
+end
+def thread_park_cond(t: &Thread) -> &Condvar
+  panic("park/unpark requires thread-local park state")
+end
+def thread_set_unpark(t: &Thread) -> Unit = ()

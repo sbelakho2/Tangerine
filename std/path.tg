@@ -1,0 +1,452 @@
+## std::path — Cross-platform path manipulation
+## Provides OS-agnostic path normalization, joining, components, and resolution.
+## Spec: §stdlib.path
+
+module std::path
+
+use std::core::{Option, Result, Display, Clone, Eq, Hash, From}
+use std::fmt
+use std::collections::{Array}
+
+# ─── Platform detection ──────────────────────────────────────────────
+
+pub enum PathSeparator
+  Unix     ## '/'
+  Windows  ## '\\'
+end
+
+pub def native_separator() -> PathSeparator
+  @cfg(target_os = "windows")
+  PathSeparator.Windows
+  @cfg(not(target_os = "windows"))
+  PathSeparator.Unix
+end
+
+pub def separator_char() -> Char
+  match native_separator()
+  when PathSeparator.Unix then '/'
+  when PathSeparator.Windows then '\\'
+  end
+end
+
+pub def is_separator(ch: Char) -> Bool
+  ch == '/' || ch == '\\'
+end
+
+# ─── Path ────────────────────────────────────────────────────────────
+
+## An owned, normalized, cross-platform file path.
+@derive(Clone, Hash)
+pub struct Path
+  inner: String
+end
+
+impl Path
+  ## Create from a string. Normalizes separators for the current platform.
+  pub def new(s: String) -> Path
+    Path { inner: _normalize(s) }
+  end
+
+  ## Create from raw string without normalization.
+  pub def from_raw(s: String) -> Path
+    Path { inner: s }
+  end
+
+  ## Return the path as a string.
+  pub def as_str(self) -> &String = &self.inner
+
+  ## Return the path as a string (owned).
+  pub def to_string(self) -> String = self.inner.clone()
+
+  ## Return true if the path is absolute.
+  pub def is_absolute(self) -> Bool
+    if self.inner.len() == 0 then return false end
+    ## Unix: starts with /
+    if self.inner.starts_with("/") then return true end
+    ## Windows: starts with drive letter (C:\) or UNC (\\)
+    if self.inner.len() >= 3 then
+      let c0 = self.inner.char_at(0)
+      let c1 = self.inner.char_at(1)
+      let c2 = self.inner.char_at(2)
+      if _is_alpha(c0) && c1 == ':' && is_separator(c2) then return true end
+    end
+    if self.inner.starts_with("\\\\") then return true end
+    false
+  end
+
+  ## Return true if the path is relative.
+  pub def is_relative(self) -> Bool = !self.is_absolute()
+
+  ## Join this path with another component.
+  pub def join(self, other: &str) -> Path
+    if other.len() == 0 then return self.clone() end
+    let other_path = Path.new(other.to_string())
+    if other_path.is_absolute() then return other_path end
+    let sep = separator_char().to_string()
+    if self.inner.len() == 0 then return other_path end
+    if self.inner.ends_with("/") || self.inner.ends_with("\\") then
+      Path.new(self.inner.clone() + other)
+    else
+      Path.new(self.inner.clone() + sep + other)
+    end
+  end
+
+  ## Join with a Path.
+  pub def join_path(self, other: &Path) -> Path
+    self.join(other.as_str())
+  end
+
+  ## Return the parent directory, or None if at root.
+  pub def parent(self) -> Option[Path]
+    if self.inner.len() == 0 then return None end
+    let components = self.components()
+    if components.len() <= 1 then
+      if self.is_absolute() then return None end
+      return Some(Path.new("".to_string()))
+    end
+    var result = String.new()
+    for i in 0..(components.len() - 1) do
+      if i > 0 then result = result + separator_char().to_string() end
+      result = result + components.get(i).unwrap().as_str()
+    end
+    if self.is_absolute() && !result.starts_with("/") && !_has_drive_prefix(&result) then
+      result = "/" + result
+    end
+    Some(Path.new(result))
+  end
+
+  ## Return the final component (file name), or None if empty.
+  pub def file_name(self) -> Option[String]
+    let comps = self.components()
+    if comps.len() == 0 then return None end
+    let last = comps.get(comps.len() - 1).unwrap()
+    match last
+    when Component.Normal(name) then Some(name.clone())
+    else None
+    end
+  end
+
+  ## Return the file stem (without extension).
+  pub def file_stem(self) -> Option[String]
+    match self.file_name()
+    when Some(name) then
+      match name.rfind('.')
+      when Some(pos) then
+        if pos == 0 then Some(name)  ## dotfile
+        else Some(name.substring(0, pos as Int))
+        end
+      when None then Some(name)
+      end
+    when None then None
+    end
+  end
+
+  ## Return the extension, or None.
+  pub def extension(self) -> Option[String]
+    match self.file_name()
+    when Some(name) then
+      match name.rfind('.')
+      when Some(pos) then
+        if pos == 0 || pos == name.len() - 1 then None
+        else Some(name.substring((pos + 1) as Int, name.len() as Int))
+        end
+      when None then None
+      end
+    when None then None
+    end
+  end
+
+  ## Replace the extension (or add one if none exists).
+  pub def with_extension(self, ext: &str) -> Path
+    let stem = match self.file_stem()
+    when Some(s) then s
+    when None then return self.clone()
+    end
+    let parent_path = self.parent()
+    let new_name = if ext.len() == 0 then stem
+    else stem + "." + ext
+    end
+    match parent_path
+    when Some(p) then p.join(&new_name)
+    when None then Path.new(new_name)
+    end
+  end
+
+  ## Replace the file name.
+  pub def with_file_name(self, name: &str) -> Path
+    match self.parent()
+    when Some(p) then p.join(name)
+    when None then Path.new(name.to_string())
+    end
+  end
+
+  ## Parse path into components.
+  pub def components(self) -> Vec[Component]
+    var result = Vec[Component].new()
+    if self.inner.len() == 0 then return result end
+
+    let s = self.inner.clone()
+    var start = 0
+
+    ## Handle root/prefix
+    if s.starts_with("/") then
+      result.push(Component.RootDir)
+      start = 1
+    elsif s.len() >= 3 && _is_alpha(s.char_at(0)) && s.char_at(1) == ':' then
+      let prefix = s.substring(0, 2)
+      result.push(Component.Prefix(prefix))
+      if s.len() > 2 && is_separator(s.char_at(2)) then
+        result.push(Component.RootDir)
+        start = 3
+      else
+        start = 2
+      end
+    end
+
+    ## Split remaining by separator
+    var current = String.new()
+    for i in start..s.len() do
+      let ch = s.char_at(i)
+      if is_separator(ch) then
+        if current.len() > 0 then
+          if current == "." then
+            result.push(Component.CurDir)
+          elsif current == ".." then
+            result.push(Component.ParentDir)
+          else
+            result.push(Component.Normal(current.clone()))
+          end
+          current.clear()
+        end
+      else
+        current.push(ch)
+      end
+    end
+    if current.len() > 0 then
+      if current == "." then
+        result.push(Component.CurDir)
+      elsif current == ".." then
+        result.push(Component.ParentDir)
+      else
+        result.push(Component.Normal(current))
+      end
+    end
+    result
+  end
+
+  ## Normalize the path: resolve `.` and `..` components.
+  pub def normalize(self) -> Path
+    let comps = self.components()
+    var stack = Vec[Component].new()
+    var is_abs = false
+
+    for comp in comps do
+      match comp
+      when Component.RootDir then
+        is_abs = true
+        stack.clear()
+        stack.push(Component.RootDir)
+      when Component.Prefix(p) then
+        stack.clear()
+        stack.push(Component.Prefix(p))
+      when Component.CurDir then
+        ## Skip '.'
+      when Component.ParentDir then
+        if stack.len() > 0 then
+          let last = stack.get(stack.len() - 1).unwrap()
+          match last
+          when Component.Normal(_) then stack.pop()
+          when Component.ParentDir then stack.push(Component.ParentDir)
+          else
+            if !is_abs then stack.push(Component.ParentDir) end
+          end
+        else
+          if !is_abs then stack.push(Component.ParentDir) end
+        end
+      when Component.Normal(name) then
+        stack.push(Component.Normal(name))
+      end
+    end
+
+    if stack.len() == 0 then return Path.new(".".to_string()) end
+    _components_to_path(stack)
+  end
+
+  ## Strip a prefix from this path.
+  pub def strip_prefix(self, prefix: &Path) -> Option[Path]
+    let self_str = self.normalize().to_string()
+    let prefix_str = prefix.normalize().to_string()
+    if self_str.starts_with(&prefix_str) then
+      var remainder = self_str.substring(prefix_str.len() as Int, self_str.len() as Int)
+      ## Strip leading separator
+      if remainder.starts_with("/") || remainder.starts_with("\\") then
+        remainder = remainder.substring(1, remainder.len() as Int)
+      end
+      Some(Path.new(remainder))
+    else
+      None
+    end
+  end
+
+  ## Check if this path starts with the given prefix.
+  pub def starts_with(self, prefix: &Path) -> Bool
+    self.strip_prefix(prefix).is_some()
+  end
+
+  ## Check if this path ends with the given suffix.
+  pub def ends_with(self, suffix: &str) -> Bool
+    self.inner.ends_with(suffix)
+  end
+
+  ## Return iterator over ancestor paths.
+  pub def ancestors(self) -> Vec[Path]
+    var result = Vec[Path].new()
+    var current = self.clone()
+    loop
+      result.push(current.clone())
+      match current.parent()
+      when Some(p) then
+        if p.to_string() == current.to_string() then break end
+        current = p
+      when None then break
+      end
+    end
+    result
+  end
+end
+
+impl Display for Path
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    f.write_str(self.inner)
+  end
+end
+
+impl Eq for Path
+  def eq(self, other: &Path) -> Bool
+    self.normalize().inner == other.normalize().inner
+  end
+end
+
+impl From[String] for Path
+  def from(s: String) -> Path = Path.new(s)
+end
+
+# ─── Component enum ──────────────────────────────────────────────────
+
+pub enum Component
+  Prefix(String)   ## Windows drive letter or UNC prefix
+  RootDir          ## Root directory '/'
+  CurDir           ## Current directory '.'
+  ParentDir        ## Parent directory '..'
+  Normal(String)   ## Normal path component
+end
+
+impl Component
+  pub def as_str(self) -> String
+    match self
+    when Component.Prefix(p) then p
+    when Component.RootDir then "/".to_string()
+    when Component.CurDir then ".".to_string()
+    when Component.ParentDir then "..".to_string()
+    when Component.Normal(s) then s
+    end
+  end
+end
+
+# ─── PathBuf — Mutable path builder ─────────────────────────────────
+
+pub struct PathBuf
+  inner: Path
+end
+
+impl PathBuf
+  pub def new() -> PathBuf
+    PathBuf { inner: Path.new("".to_string()) }
+  end
+
+  pub def from_path(path: Path) -> PathBuf
+    PathBuf { inner: path }
+  end
+
+  pub def push(&mut self, component: &str) -> Unit
+    self.inner = self.inner.join(component)
+  end
+
+  pub def pop(&mut self) -> Bool
+    match self.inner.parent()
+    when Some(p) then
+      self.inner = p
+      true
+    when None then false
+    end
+  end
+
+  pub def set_file_name(&mut self, name: &str) -> Unit
+    self.inner = self.inner.with_file_name(name)
+  end
+
+  pub def set_extension(&mut self, ext: &str) -> Unit
+    self.inner = self.inner.with_extension(ext)
+  end
+
+  pub def as_path(self) -> &Path = &self.inner
+
+  pub def to_path(self) -> Path = self.inner.clone()
+end
+
+# ─── Internal helpers ────────────────────────────────────────────────
+
+def _normalize(s: String) -> String
+  ## Replace all separators with native separator
+  let sep = separator_char()
+  var result = String.with_capacity(s.len())
+  var prev_sep = false
+  for ch in s.chars() do
+    if is_separator(ch) then
+      if !prev_sep then
+        result.push(sep)
+      end
+      prev_sep = true
+    else
+      result.push(ch)
+      prev_sep = false
+    end
+  end
+  ## Remove trailing separator (unless root)
+  if result.len() > 1 && is_separator(result.char_at(result.len() - 1)) then
+    result = result.substring(0, (result.len() - 1) as Int)
+  end
+  result
+end
+
+def _is_alpha(ch: Char) -> Bool
+  (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+end
+
+def _has_drive_prefix(s: &String) -> Bool
+  s.len() >= 2 && _is_alpha(s.char_at(0)) && s.char_at(1) == ':'
+end
+
+def _components_to_path(components: Vec[Component]) -> Path
+  var result = String.new()
+  var first = true
+  for comp in components do
+    match comp
+    when Component.RootDir then
+      result = result + "/"
+      first = false
+    when Component.Prefix(p) then
+      result = result + p
+      first = false
+    else
+      if !first && !result.ends_with("/") && !result.ends_with("\\") then
+        result = result + separator_char().to_string()
+      end
+      result = result + comp.as_str()
+      first = false
+    end
+  end
+  Path.new(result)
+end
+
+end ## module std::path

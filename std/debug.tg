@@ -1,0 +1,343 @@
+## std::debug — Debugging utilities
+## DWARF/platform debug info, debugger integration, and diagnostic helpers.
+## Spec: §stdlib.debug
+
+module std::debug
+
+use std::core::{Option, Result, Display}
+use std::backtrace::{Backtrace, StackFrame}
+use std::fmt
+use std::collections::{Map}
+use std::env
+use std::io
+
+# ─── Debug info levels ───────────────────────────────────────────────
+
+pub enum DebugLevel
+  None       ## No debug info
+  LineOnly   ## Line tables only (-g1)
+  Standard   ## Full DWARF (-g2)
+  Full       ## Full + macro info (-g3)
+end
+
+# ─── Breakpoint and assertion helpers ────────────────────────────────
+
+## Software breakpoint — triggers debugger trap if attached.
+@inline(never)
+pub def breakpoint() -> Unit
+  @cfg(target_arch = "x86_64")
+  unsafe { asm!("int3") }
+  @cfg(target_arch = "aarch64")
+  unsafe { asm!("brk #0xF000") }
+end
+
+## Conditional breakpoint — breaks only if `condition` is true.
+pub def break_if(condition: Bool) -> Unit
+  if condition then breakpoint() end
+end
+
+## Debug assertion that triggers a breakpoint instead of panicking.
+pub def debug_assert(condition: Bool, message: String = "debug assertion failed") -> Unit
+  @cfg(debug)
+  if !condition then
+    eprintln("DEBUG ASSERT: " + message)
+    eprintln(Backtrace.capture().to_string())
+    breakpoint()
+  end
+end
+
+## Mark code as unreachable in debug builds (triggers breakpoint).
+pub def debug_unreachable(message: String = "entered unreachable code") -> Unit
+  @cfg(debug)
+  do
+    eprintln("DEBUG UNREACHABLE: " + message)
+    breakpoint()
+  end
+end
+
+# ─── Watch expressions ───────────────────────────────────────────────
+
+## Log a watched expression value (optimized out in release builds).
+pub def watch[T: Display](label: &str, value: &T) -> &T
+  @cfg(debug)
+  eprintln("[WATCH] " + label + " = " + value.to_string())
+  value
+end
+
+## Log a watched expression with source location.
+pub def watch_at[T: Display](label: &str, value: &T, file: &str, line: Int) -> &T
+  @cfg(debug)
+  eprintln("[WATCH " + file + ":" + line.to_string() + "] " + label + " = " + value.to_string())
+  value
+end
+
+# ─── Timing helpers ──────────────────────────────────────────────────
+
+pub struct Timer
+  label: String
+  start_ns: UInt
+end
+
+impl Timer
+  pub def start(label: &str) -> Timer
+    Timer {
+      label: label.to_string(),
+      start_ns: _monotonic_ns(),
+    }
+  end
+
+  pub def elapsed_ms(self) -> Float
+    let now = _monotonic_ns()
+    ((now - self.start_ns) as Float) / 1_000_000.0
+  end
+
+  pub def elapsed_us(self) -> Float
+    let now = _monotonic_ns()
+    ((now - self.start_ns) as Float) / 1_000.0
+  end
+
+  pub def stop(self) -> Float
+    let ms = self.elapsed_ms()
+    @cfg(debug)
+    eprintln("[TIMER] " + self.label + ": " + ms.to_string() + "ms")
+    ms
+  end
+end
+
+impl Drop for Timer
+  def drop(&mut self) -> Unit
+    @cfg(debug)
+    do
+      let ms = self.elapsed_ms()
+      eprintln("[TIMER] " + self.label + " (auto): " + ms.to_string() + "ms")
+    end
+  end
+end
+
+## Time a block and return (result, elapsed_ms).
+pub def timed[T](label: &str, f: def() -> T) -> (T, Float)
+  let timer = Timer.start(label)
+  let result = f()
+  let ms = timer.elapsed_ms()
+  @cfg(debug)
+  eprintln("[TIMED] " + label + ": " + ms.to_string() + "ms")
+  (result, ms)
+end
+
+# ─── Memory debugging ───────────────────────────────────────────────
+
+pub struct MemoryStats
+  pub total_allocated: UInt
+  pub total_freed: UInt
+  pub current_usage: UInt
+  pub peak_usage: UInt
+  pub allocation_count: UInt
+  pub deallocation_count: UInt
+end
+
+## Get current memory statistics (requires debug allocator).
+pub def memory_stats() -> MemoryStats
+  ## Read from debug allocator if available
+  MemoryStats {
+    total_allocated: _debug_alloc_total(),
+    total_freed: _debug_free_total(),
+    current_usage: _debug_alloc_total() - _debug_free_total(),
+    peak_usage: _debug_alloc_peak(),
+    allocation_count: _debug_alloc_count(),
+    deallocation_count: _debug_free_count(),
+  }
+end
+
+## Print current memory usage summary.
+pub def print_memory_stats() -> Unit
+  let stats = memory_stats()
+  eprintln("=== Memory Stats ===")
+  eprintln("  Current:      " + _format_bytes(stats.current_usage))
+  eprintln("  Peak:         " + _format_bytes(stats.peak_usage))
+  eprintln("  Total alloc:  " + _format_bytes(stats.total_allocated))
+  eprintln("  Total freed:  " + _format_bytes(stats.total_freed))
+  eprintln("  Alloc count:  " + stats.allocation_count.to_string())
+  eprintln("  Free count:   " + stats.deallocation_count.to_string())
+  if stats.allocation_count > stats.deallocation_count then
+    eprintln("  LEAK WARNING: " + (stats.allocation_count - stats.deallocation_count).to_string() + " allocations not freed")
+  end
+end
+
+# ─── Hexdump ─────────────────────────────────────────────────────────
+
+## Print a hex dump of a byte slice (16 bytes per line with ASCII).
+pub def hexdump(data: &[u8]) -> String
+  var result = String.new()
+  var offset = 0
+  while offset < data.len() do
+    ## Address
+    result = result + _hex_u32(offset as UInt) + "  "
+    ## Hex bytes
+    for i in 0..16 do
+      if offset + i < data.len() then
+        result = result + _hex_u8(data[offset + i]) + " "
+      else
+        result = result + "   "
+      end
+      if i == 7 then result = result + " " end
+    end
+    result = result + " |"
+    ## ASCII
+    for i in 0..16 do
+      if offset + i < data.len() then
+        let b = data[offset + i]
+        if b >= 0x20 && b <= 0x7E then
+          result.push(b as Char)
+        else
+          result.push('.')
+        end
+      end
+    end
+    result = result + "|\n"
+    offset = offset + 16
+  end
+  result
+end
+
+## Print hexdump to stderr.
+pub def print_hexdump(label: &str, data: &[u8]) -> Unit
+  eprintln("=== " + label + " (" + data.len().to_string() + " bytes) ===")
+  eprint(hexdump(data))
+end
+
+# ─── Debug print helpers ────────────────────────────────────────────
+
+## Debug print (like Rust's dbg! macro) — prints value with file/line and returns it.
+pub def dbg[T: Display](value: T) -> T
+  @cfg(debug)
+  eprintln("[DBG] " + value.to_string())
+  value
+end
+
+## Print a value with its type name.
+pub def inspect[T: Display](label: &str, value: &T) -> Unit
+  @cfg(debug)
+  eprintln("[INSPECT] " + label + " : " + type_name[T]() + " = " + value.to_string())
+end
+
+## Get the type name of T as a string.
+pub def type_name[T]() -> String
+  ## Compiler intrinsic — returns the mangled-then-demangled type name
+  @intrinsic("type_name")
+end
+
+# ─── Stack inspection ───────────────────────────────────────────────
+
+## Print the current call stack.
+pub def print_stack() -> Unit
+  let bt = Backtrace.capture()
+  eprintln(bt.to_string())
+end
+
+## Get the current stack depth.
+pub def stack_depth() -> Int
+  let bt = Backtrace.capture()
+  bt.frames().len() as Int
+end
+
+## Check remaining stack space (approximate, platform-dependent).
+pub def remaining_stack_bytes() -> UInt
+  ## Use pthread_attr_getstack or similar
+  let stack_size = _get_stack_size()
+  let used = _estimate_stack_usage()
+  if stack_size > used then stack_size - used else 0 end
+end
+
+# ─── Debugger detection ─────────────────────────────────────────────
+
+## Check if a debugger is attached.
+pub def is_debugger_attached() -> Bool
+  @cfg(target_os = "macos")
+  _macos_is_debugger_attached()
+  @cfg(target_os = "linux")
+  _linux_is_debugger_attached()
+  @cfg(not(any(target_os = "macos", target_os = "linux")))
+  false
+end
+
+@cfg(target_os = "linux")
+def _linux_is_debugger_attached() -> Bool
+  ## Check /proc/self/status for TracerPid
+  match std::fs::read_to_string("/proc/self/status")
+  when Ok(content) then
+    for line in content.lines() do
+      if line.starts_with("TracerPid:") then
+        let pid_str = line.substring(10, line.len() as Int).trim()
+        return pid_str != "0"
+      end
+    end
+    false
+  when Err(_) then false
+  end
+end
+
+@cfg(target_os = "macos")
+def _macos_is_debugger_attached() -> Bool
+  @repr(C)
+  struct KinfoProc
+    padding: [u8; 492]  ## offset to p_flag
+    p_flag: i32
+  end
+  @ffi("c") extern def sysctl(name: *i32, namelen: u32, oldp: *mut u8, oldlenp: *mut UInt, newp: *u8, newlen: UInt) -> i32 end
+  var mib: [i32; 4] = [1, 14, 1, 0]  ## CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()
+  @ffi("c") extern def getpid() -> i32 end
+  mib[3] = getpid()
+  var info: KinfoProc = unsafe { std::core::zeroed() }
+  var size: UInt = std::core::size_of[KinfoProc]()
+  let ret = sysctl(&mib[0], 4, &mut info as *mut u8, &mut size, std::core::null(), 0)
+  if ret != 0 then return false end
+  (info.p_flag & 0x00000800) != 0  ## P_TRACED
+end
+
+# ─── Internal helpers ────────────────────────────────────────────────
+
+def _format_bytes(n: UInt) -> String
+  if n < 1024 then return n.to_string() + " B" end
+  if n < 1024 * 1024 then return (n / 1024).to_string() + " KB" end
+  if n < 1024 * 1024 * 1024 then return (n / (1024 * 1024)).to_string() + " MB" end
+  (n / (1024 * 1024 * 1024)).to_string() + " GB"
+end
+
+def _hex_u8(b: u8) -> String
+  let chars = "0123456789abcdef"
+  var s = String.with_capacity(2)
+  s.push(chars.char_at((b >> 4) as UInt))
+  s.push(chars.char_at((b & 0x0f) as UInt))
+  s
+end
+
+def _hex_u32(v: UInt) -> String
+  var s = String.with_capacity(8)
+  for i in (0..4).rev() do
+    let b = ((v >> (i * 8)) & 0xFF) as u8
+    s = s + _hex_u8(b)
+  end
+  s
+end
+
+@ffi("c") extern def clock_gettime(clock_id: i32, tp: *mut [i64; 2]) -> i32 end
+
+def _monotonic_ns() -> UInt
+  var tp: [i64; 2] = [0, 0]
+  @cfg(target_os = "macos")
+  clock_gettime(6, &mut tp)  ## CLOCK_MONOTONIC_RAW on macOS
+  @cfg(target_os = "linux")
+  clock_gettime(1, &mut tp)  ## CLOCK_MONOTONIC on Linux
+  (tp[0] as UInt) * 1_000_000_000 + (tp[1] as UInt)
+end
+
+## Debug allocator hooks (stubbed — real impl linked at build time)
+def _debug_alloc_total() -> UInt = 0
+def _debug_free_total() -> UInt = 0
+def _debug_alloc_peak() -> UInt = 0
+def _debug_alloc_count() -> UInt = 0
+def _debug_free_count() -> UInt = 0
+def _get_stack_size() -> UInt = 8 * 1024 * 1024  ## default 8MB
+def _estimate_stack_usage() -> UInt = 0
+
+end ## module std::debug

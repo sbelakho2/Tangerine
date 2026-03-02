@@ -1,0 +1,587 @@
+## std::config — Unified configuration system
+## Layered config from env vars, files (TOML/JSON/YAML), defaults, and CLI overrides.
+## Spec: §stdlib.config
+
+module std::config
+
+use std::core::{Option, Result, Display, Clone}
+use std::collections::{Map}
+use std::env
+use std::fs
+use std::json
+use std::toml
+use std::yaml
+use std::path::Path
+
+# ─── Config value ────────────────────────────────────────────────────
+
+pub enum Value
+  Null
+  Bool(Bool)
+  Int(Int)
+  Float(Float)
+  String(String)
+  Array(Vec[Value])
+  Table(Map[String, Value])
+end
+
+impl Value
+  pub def as_bool(self) -> Option[Bool]
+    match self
+    when Value.Bool(b) then Some(b)
+    when Value.String(ref s) then
+      match s.to_lowercase().as_str()
+      when "true" | "1" | "yes" | "on" then Some(true)
+      when "false" | "0" | "no" | "off" then Some(false)
+      else None
+      end
+    else None
+    end
+  end
+
+  pub def as_int(self) -> Option[Int]
+    match self
+    when Value.Int(i) then Some(i)
+    when Value.Float(f) then Some(f as Int)
+    when Value.String(ref s) then Int.parse(s).ok()
+    else None
+    end
+  end
+
+  pub def as_float(self) -> Option[Float]
+    match self
+    when Value.Float(f) then Some(f)
+    when Value.Int(i) then Some(i as Float)
+    when Value.String(ref s) then Float.parse(s).ok()
+    else None
+    end
+  end
+
+  pub def as_str(self) -> Option[&String]
+    match self when Value.String(ref s) then Some(s) else None end
+  end
+
+  pub def as_array(self) -> Option[&Vec[Value]]
+    match self when Value.Array(ref a) then Some(a) else None end
+  end
+
+  pub def as_table(self) -> Option[&Map[String, Value]]
+    match self when Value.Table(ref t) then Some(t) else None end
+  end
+
+  pub def is_null(self) -> Bool
+    match self when Value.Null then true else false end
+  end
+end
+
+impl Display for Value
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    match self
+    when Value.Null then f.write_str("null")
+    when Value.Bool(b) then f.write_str(b.to_string())
+    when Value.Int(i) then f.write_str(i.to_string())
+    when Value.Float(fl) then f.write_str(fl.to_string())
+    when Value.String(ref s) then f.write_str(s)
+    when Value.Array(ref a) then f.write_str("[array(" + a.len().to_string() + ")]")
+    when Value.Table(ref t) then f.write_str("{table(" + t.len().to_string() + ")}")
+    end
+  end
+end
+
+# ─── Config error ────────────────────────────────────────────────────
+
+pub enum ConfigError
+  NotFound(String)
+  TypeError(String, String)   ## key, expected type
+  ParseError(String, String)  ## file, message
+  IoError(String)
+  MergeConflict(String)
+end
+
+impl Display for ConfigError
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    match self
+    when ConfigError.NotFound(key) then f.write_str("config key not found: " + key)
+    when ConfigError.TypeError(key, expected) then f.write_str("config type error for '" + key + "': expected " + expected)
+    when ConfigError.ParseError(file, msg) then f.write_str("config parse error in " + file + ": " + msg)
+    when ConfigError.IoError(msg) then f.write_str("config I/O error: " + msg)
+    when ConfigError.MergeConflict(key) then f.write_str("config merge conflict at: " + key)
+    end
+  end
+end
+
+# ─── Config source ───────────────────────────────────────────────────
+
+pub enum Source
+  Defaults(Map[String, Value])
+  File(String)               ## file path (TOML/JSON/YAML auto-detected)
+  EnvPrefix(String)          ## environment variable prefix
+  EnvMap(Map[String, String]) ## explicit env var -> config key mapping
+  Inline(Map[String, Value]) ## programmatic overrides
+end
+
+# ─── Config builder ──────────────────────────────────────────────────
+
+pub struct ConfigBuilder
+  sources: Vec[Source]
+  separator: String     ## key separator for nested access (default: ".")
+  env_separator: String ## env var hierarchy separator (default: "__")
+  list_separator: String ## env list separator (default: ",")
+end
+
+impl ConfigBuilder
+  pub def new() -> ConfigBuilder
+    ConfigBuilder {
+      sources: Vec[Source].new(),
+      separator: ".".to_string(),
+      env_separator: "__".to_string(),
+      list_separator: ",".to_string(),
+    }
+  end
+
+  ## Add default values (lowest priority).
+  pub def defaults(self, defaults: Map[String, Value]) -> ConfigBuilder
+    var b = self
+    b.sources.push(Source.Defaults(defaults))
+    b
+  end
+
+  ## Add a config file (auto-detects TOML/JSON/YAML by extension).
+  pub def file(self, path: &str) -> ConfigBuilder
+    var b = self
+    b.sources.push(Source.File(path.to_string()))
+    b
+  end
+
+  ## Add an optional config file (no error if missing).
+  pub def file_optional(self, path: &str) -> ConfigBuilder
+    if Path.new(path.to_string()).to_string().len() > 0 && fs::path_exists(path) then
+      var b = self
+      b.sources.push(Source.File(path.to_string()))
+      b
+    else
+      self
+    end
+  end
+
+  ## Add environment variables with a prefix (e.g., "MYAPP" reads MYAPP_KEY).
+  pub def env(self, prefix: &str) -> ConfigBuilder
+    var b = self
+    b.sources.push(Source.EnvPrefix(prefix.to_string()))
+    b
+  end
+
+  ## Add explicit environment variable mappings.
+  pub def env_map(self, mapping: Map[String, String]) -> ConfigBuilder
+    var b = self
+    b.sources.push(Source.EnvMap(mapping))
+    b
+  end
+
+  ## Add programmatic overrides (highest priority).
+  pub def set(self, key: &str, value: Value) -> ConfigBuilder
+    ## Find or create Inline source
+    var b = self
+    var found = false
+    for source in &mut b.sources do
+      match source
+      when Source.Inline(ref mut map) then
+        map.insert(key.to_string(), value.clone())
+        found = true
+        break
+      else {}
+      end
+    end
+    if !found then
+      var map = Map[String, Value].new()
+      map.insert(key.to_string(), value)
+      b.sources.push(Source.Inline(map))
+    end
+    b
+  end
+
+  pub def with_separator(self, sep: &str) -> ConfigBuilder
+    var b = self; b.separator = sep.to_string(); b
+  end
+
+  pub def with_env_separator(self, sep: &str) -> ConfigBuilder
+    var b = self; b.env_separator = sep.to_string(); b
+  end
+
+  ## Build the final Config by merging all sources in order (last wins).
+  pub def build(self) -> Result[Config, ConfigError]
+    var merged = Map[String, Value].new()
+
+    for source in self.sources do
+      let layer = match source
+      when Source.Defaults(map) then map
+      when Source.File(path) then _load_file(&path)?
+      when Source.EnvPrefix(prefix) then _load_env_prefix(&prefix, &self.env_separator, &self.list_separator)
+      when Source.EnvMap(mapping) then _load_env_map(&mapping)
+      when Source.Inline(map) then map
+      end
+
+      _merge_maps(&mut merged, &layer)
+    end
+
+    Ok(Config {
+      data: merged,
+      separator: self.separator.clone(),
+    })
+  end
+end
+
+# ─── Config ──────────────────────────────────────────────────────────
+
+pub struct Config
+  data: Map[String, Value]
+  separator: String
+end
+
+impl Config
+  pub def new() -> Config
+    Config { data: Map.new(), separator: ".".to_string() }
+  end
+
+  ## Load from a single TOML file (convenience).
+  pub def from_toml(path: &str) -> Result[Config, ConfigError]
+    ConfigBuilder.new().file(path).build()
+  end
+
+  ## Load from a single JSON file.
+  pub def from_json(path: &str) -> Result[Config, ConfigError]
+    ConfigBuilder.new().file(path).build()
+  end
+
+  ## Get a value by dotted key path.
+  pub def get(self, key: &str) -> Option[&Value]
+    let parts = key.split(&self.separator)
+    var current: &Map[String, Value] = &self.data
+    for i in 0..(parts.len() - 1) do
+      match current.get(parts[i])
+      when Some(Value.Table(ref inner)) then current = inner
+      else return None
+      end
+    end
+    current.get(parts[parts.len() - 1])
+  end
+
+  ## Get a string value.
+  pub def get_string(self, key: &str) -> Result[String, ConfigError]
+    match self.get(key)
+    when Some(v) then
+      match v.as_str()
+      when Some(s) then Ok(s.clone())
+      when None then
+        ## Try to convert to string
+        Ok(v.to_string())
+      end
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  /// Get a string with a default.
+  pub def get_string_or(self, key: &str, default: &str) -> String
+    self.get_string(key).unwrap_or(default.to_string())
+  end
+
+  /// Get an integer value.
+  pub def get_int(self, key: &str) -> Result[Int, ConfigError]
+    match self.get(key)
+    when Some(v) then
+      v.as_int().ok_or(ConfigError.TypeError(key.to_string(), "Int".to_string()))
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  pub def get_int_or(self, key: &str, default: Int) -> Int
+    self.get_int(key).unwrap_or(default)
+  end
+
+  pub def get_float(self, key: &str) -> Result[Float, ConfigError]
+    match self.get(key)
+    when Some(v) then
+      v.as_float().ok_or(ConfigError.TypeError(key.to_string(), "Float".to_string()))
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  pub def get_bool(self, key: &str) -> Result[Bool, ConfigError]
+    match self.get(key)
+    when Some(v) then
+      v.as_bool().ok_or(ConfigError.TypeError(key.to_string(), "Bool".to_string()))
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  pub def get_bool_or(self, key: &str, default: Bool) -> Bool
+    self.get_bool(key).unwrap_or(default)
+  end
+
+  pub def get_array(self, key: &str) -> Result[&Vec[Value], ConfigError]
+    match self.get(key)
+    when Some(v) then
+      v.as_array().ok_or(ConfigError.TypeError(key.to_string(), "Array".to_string()))
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  pub def get_table(self, key: &str) -> Result[&Map[String, Value], ConfigError]
+    match self.get(key)
+    when Some(v) then
+      v.as_table().ok_or(ConfigError.TypeError(key.to_string(), "Table".to_string()))
+    when None then Err(ConfigError.NotFound(key.to_string()))
+    end
+  end
+
+  /// Check if a key exists.
+  pub def has(self, key: &str) -> Bool
+    self.get(key).is_some()
+  end
+
+  /// Get all top-level keys.
+  pub def keys(self) -> Vec[String]
+    var result = Vec[String].new()
+    for (k, _) in self.data.entries() do
+      result.push(k.clone())
+    end
+    result
+  end
+end
+
+# ─── File loading ────────────────────────────────────────────────────
+
+def _load_file(path: &str) -> Result[Map[String, Value], ConfigError]
+  let content = fs::read_to_string(path)
+    .map_err(|e| ConfigError.IoError("cannot read " + path + ": " + e.to_string()))?
+
+  let ext = Path.new(path.to_string()).extension().unwrap_or("toml".to_string()).to_lowercase()
+
+  match ext.as_str()
+  when "toml" then _parse_toml_to_map(&content, path)
+  when "json" then _parse_json_to_map(&content, path)
+  when "yaml" | "yml" then _parse_yaml_to_map(&content, path)
+  else Err(ConfigError.ParseError(path.to_string(), "unknown config format: " + ext))
+  end
+end
+
+def _parse_toml_to_map(content: &str, path: &str) -> Result[Map[String, Value], ConfigError]
+  let toml_val = toml::parse(content)
+    .map_err(|e| ConfigError.ParseError(path.to_string(), e.to_string()))?
+  Ok(_toml_to_config(&toml_val))
+end
+
+def _parse_json_to_map(content: &str, path: &str) -> Result[Map[String, Value], ConfigError]
+  let json_val = json::parse(content)
+    .map_err(|e| ConfigError.ParseError(path.to_string(), e.to_string()))?
+  Ok(_json_to_config(&json_val))
+end
+
+def _parse_yaml_to_map(content: &str, path: &str) -> Result[Map[String, Value], ConfigError]
+  let yaml_val = yaml::parse(content)
+    .map_err(|e| ConfigError.ParseError(path.to_string(), e.to_string()))?
+  Ok(_yaml_to_config(&yaml_val))
+end
+
+def _toml_to_config(v: &toml::Value) -> Map[String, Value]
+  var map = Map[String, Value].new()
+  match v
+  when toml::Value.Table(ref entries) then
+    for (k, val) in entries do
+      map.insert(k.clone(), _toml_value_to_config(val))
+    end
+  else {}
+  end
+  map
+end
+
+def _toml_value_to_config(v: &toml::Value) -> Value
+  match v
+  when toml::Value.String(ref s) then Value.String(s.clone())
+  when toml::Value.Integer(i) then Value.Int(*i)
+  when toml::Value.Float(f) then Value.Float(*f)
+  when toml::Value.Boolean(b) then Value.Bool(*b)
+  when toml::Value.Array(ref arr) then
+    Value.Array(arr.iter().map(|item| _toml_value_to_config(item)).collect())
+  when toml::Value.Table(ref entries) then
+    var map = Map[String, Value].new()
+    for (k, val) in entries do map.insert(k.clone(), _toml_value_to_config(val)) end
+    Value.Table(map)
+  else Value.Null
+  end
+end
+
+def _json_to_config(v: &json::Value) -> Map[String, Value]
+  var map = Map[String, Value].new()
+  match v
+  when json::Value.Object(ref obj) then
+    for (k, val) in obj.entries() do
+      map.insert(k.clone(), _json_value_to_config(val))
+    end
+  else {}
+  end
+  map
+end
+
+def _json_value_to_config(v: &json::Value) -> Value
+  match v
+  when json::Value.Null then Value.Null
+  when json::Value.Bool(b) then Value.Bool(*b)
+  when json::Value.Number(n) then
+    if *n == (*n as Int) as Float then Value.Int(*n as Int)
+    else Value.Float(*n)
+    end
+  when json::Value.String(ref s) then Value.String(s.clone())
+  when json::Value.Array(ref arr) then
+    Value.Array(arr.iter().map(|item| _json_value_to_config(item)).collect())
+  when json::Value.Object(ref obj) then
+    var map = Map[String, Value].new()
+    for (k, val) in obj.entries() do map.insert(k.clone(), _json_value_to_config(val)) end
+    Value.Table(map)
+  end
+end
+
+def _yaml_to_config(v: &yaml::Value) -> Map[String, Value]
+  var map = Map[String, Value].new()
+  match v
+  when yaml::Value.Mapping(ref entries) then
+    for (k, val) in entries do
+      map.insert(k.clone(), _yaml_value_to_config(val))
+    end
+  else {}
+  end
+  map
+end
+
+def _yaml_value_to_config(v: &yaml::Value) -> Value
+  match v
+  when yaml::Value.Null then Value.Null
+  when yaml::Value.Bool(b) then Value.Bool(*b)
+  when yaml::Value.Int(i) then Value.Int(*i)
+  when yaml::Value.Float(f) then Value.Float(*f)
+  when yaml::Value.String(ref s) then Value.String(s.clone())
+  when yaml::Value.Sequence(ref arr) then
+    Value.Array(arr.iter().map(|item| _yaml_value_to_config(item)).collect())
+  when yaml::Value.Mapping(ref entries) then
+    var map = Map[String, Value].new()
+    for (k, val) in entries do map.insert(k.clone(), _yaml_value_to_config(val)) end
+    Value.Table(map)
+  end
+end
+
+# ─── Environment loading ────────────────────────────────────────────
+
+def _load_env_prefix(prefix: &str, env_sep: &str, list_sep: &str) -> Map[String, Value]
+  var map = Map[String, Value].new()
+  let prefix_upper = prefix.to_uppercase() + "_"
+  for (key, val) in env::vars() do
+    let upper_key = key.to_uppercase()
+    if upper_key.starts_with(&prefix_upper) then
+      let config_key = upper_key
+        .substring(prefix_upper.len() as Int, upper_key.len() as Int)
+        .to_lowercase()
+        .replace(env_sep, ".")
+
+      ## Try to parse value as typed
+      let typed = _parse_env_value(&val, list_sep)
+      _set_nested(&mut map, &config_key, typed)
+    end
+  end
+  map
+end
+
+def _load_env_map(mapping: &Map[String, String]) -> Map[String, Value]
+  var map = Map[String, Value].new()
+  for (env_key, config_key) in mapping.entries() do
+    match env::var(env_key)
+    when Some(val) then
+      map.insert(config_key.clone(), _parse_env_value(&val, ","))
+    when None then {}
+    end
+  end
+  map
+end
+
+def _parse_env_value(val: &str, list_sep: &str) -> Value
+  if val == "true" || val == "TRUE" then return Value.Bool(true) end
+  if val == "false" || val == "FALSE" then return Value.Bool(false) end
+  match Int.parse(val) { when Ok(i) then return Value.Int(i) when Err(_) then {} }
+  match Float.parse(val) { when Ok(f) then return Value.Float(f) when Err(_) then {} }
+  ## Check if it's a list
+  if val.contains(list_sep) then
+    let parts = val.split(list_sep)
+    if parts.len() > 1 then
+      return Value.Array(parts.iter().map(|p| Value.String(p.trim().to_string())).collect())
+    end
+  end
+  Value.String(val.to_string())
+end
+
+def _set_nested(map: &mut Map[String, Value], dotted_key: &str, value: Value) -> Unit
+  let parts = dotted_key.split(".")
+  if parts.len() == 1 then
+    map.insert(dotted_key.to_string(), value)
+    return
+  end
+  if !map.contains_key(parts[0]) then
+    map.insert(parts[0].to_string(), Value.Table(Map.new()))
+  end
+  match map.get_mut(parts[0])
+  when Some(Value.Table(ref mut inner)) then
+    let rest = parts[1..].join(".")
+    _set_nested(inner, &rest, value)
+  else
+    map.insert(parts[0].to_string(), value)
+  end
+end
+
+def _merge_maps(target: &mut Map[String, Value], source: &Map[String, Value]) -> Unit
+  for (k, v) in source.entries() do
+    match (target.get(k), v)
+    when (Some(Value.Table(ref existing)), Value.Table(ref incoming)) then
+      var merged = existing.clone()
+      _merge_maps(&mut merged, incoming)
+      target.insert(k.clone(), Value.Table(merged))
+    else
+      target.insert(k.clone(), v.clone())
+    end
+  end
+end
+
+# ─── Convenience ─────────────────────────────────────────────────────
+
+## Load configuration with conventional defaults:
+## 1. Defaults
+## 2. config.toml (if exists)
+## 3. Environment variables (APP_PREFIX_*)
+/// 4. CLI overrides (passed in)
+pub def load_conventional(
+  app_name: &str,
+  defaults: Map[String, Value] = Map.new(),
+  overrides: Map[String, Value] = Map.new(),
+) -> Result[Config, ConfigError]
+  let config_file = app_name.to_lowercase() + ".toml"
+  let env_prefix = app_name.to_uppercase()
+
+  ConfigBuilder.new()
+    .defaults(defaults)
+    .file_optional(&config_file)
+    .file_optional(&("config/" + &config_file))
+    .env(&env_prefix)
+    .set_all(overrides)
+    .build()
+end
+
+impl ConfigBuilder
+  def set_all(self, overrides: Map[String, Value]) -> ConfigBuilder
+    if overrides.len() > 0 then
+      var b = self
+      b.sources.push(Source.Inline(overrides))
+      b
+    else
+      self
+    end
+  end
+end
+
+end ## module std::config

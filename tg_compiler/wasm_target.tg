@@ -1,0 +1,492 @@
+## tg_compiler::wasm_target — WebAssembly compilation backend
+## Compiles Tangerine MIR to WASM bytecode.
+## Spec: §tooling.wasm
+
+module tg_compiler::wasm_target
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Array}
+use tg_compiler::mir::{MirModule, MirFunction, MirType, MirInstruction}
+use tg_compiler::cross_compile::{TargetTriple, OptLevel}
+
+# ─── WASM binary sections ───────────────────────────────────────────
+
+pub struct WasmBinary
+  pub sections: Array[WasmSection]
+end
+
+pub enum WasmSection
+  Type(TypeSection)
+  Import(ImportSection)
+  Function(FunctionSection)
+  Table(TableSection)
+  Memory(MemorySection)
+  Global(GlobalSection)
+  Export(ExportSection)
+  Start(UInt)  ## start function index
+  Element(ElementSection)
+  Code(CodeSection)
+  Data(DataSection)
+  Custom { name: String, data: Array[u8] }
+end
+
+pub struct TypeSection
+  pub types: Array[FuncType]
+end
+
+pub struct FuncType
+  pub params: Array[WasmValType]
+  pub results: Array[WasmValType]
+end
+
+pub enum WasmValType
+  I32
+  I64
+  F32
+  F64
+end
+
+pub struct ImportSection
+  pub imports: Array[WasmImport]
+end
+
+pub struct WasmImport
+  pub module: String
+  pub name: String
+  pub desc: ImportDesc
+end
+
+pub enum ImportDesc
+  Func(UInt)     ## type index
+  Memory(Limits)
+  Table(TableType)
+  Global(GlobalType)
+end
+
+pub struct Limits
+  pub min: UInt
+  pub max: Option[UInt]
+end
+
+pub struct TableType
+  pub element: WasmValType
+  pub limits: Limits
+end
+
+pub struct GlobalType
+  pub val_type: WasmValType
+  pub mutable: Bool
+end
+
+pub struct FunctionSection
+  pub type_indices: Array[UInt]
+end
+
+pub struct TableSection
+  pub tables: Array[TableType]
+end
+
+pub struct MemorySection
+  pub memories: Array[Limits]
+end
+
+pub struct GlobalSection
+  pub globals: Array[(GlobalType, Array[u8])]  ## type + init expr
+end
+
+pub struct ExportSection
+  pub exports: Array[WasmExport]
+end
+
+pub struct WasmExport
+  pub name: String
+  pub desc: ExportDesc
+end
+
+pub enum ExportDesc
+  Func(UInt)
+  Memory(UInt)
+  Table(UInt)
+  Global(UInt)
+end
+
+pub struct ElementSection
+  pub elements: Array[Element]
+end
+
+pub struct Element
+  pub table_index: UInt
+  pub offset: Array[u8]  ## init expr
+  pub func_indices: Array[UInt]
+end
+
+pub struct CodeSection
+  pub bodies: Array[FunctionBody]
+end
+
+pub struct FunctionBody
+  pub locals: Array[(UInt, WasmValType)]  ## count, type
+  pub code: Array[u8]  ## WASM bytecode
+end
+
+pub struct DataSection
+  pub segments: Array[DataSegment]
+end
+
+pub struct DataSegment
+  pub memory_index: UInt
+  pub offset: Array[u8]  ## init expr
+  pub data: Array[u8]
+end
+
+# ─── Compilation config ──────────────────────────────────────────────
+
+pub struct WasmCompileConfig
+  pub target: WasmTarget
+  pub opt_level: OptLevel
+  pub initial_memory_pages: UInt
+  pub max_memory_pages: Option[UInt]
+  pub export_memory: Bool
+  pub import_memory: Bool
+  pub bulk_memory: Bool  ## bulk-memory proposal
+  pub simd: Bool          ## SIMD proposal
+  pub threads: Bool       ## threads proposal
+  pub exception_handling: Bool
+  pub stack_size: UInt
+  pub strip_debug: Bool
+  pub producer_section: Bool
+end
+
+pub enum WasmTarget
+  Wasm32Unknown   ## Freestanding wasm32
+  Wasm32Wasi      ## WASI target
+  Wasm32Emscripten
+end
+
+impl WasmCompileConfig
+  pub def default() -> WasmCompileConfig
+    WasmCompileConfig {
+      target: WasmTarget::Wasm32Wasi,
+      opt_level: OptLevel::O2,
+      initial_memory_pages: 16,  ## 1MB
+      max_memory_pages: Some(256),  ## 16MB
+      export_memory: true,
+      import_memory: false,
+      bulk_memory: true,
+      simd: false,
+      threads: false,
+      exception_handling: false,
+      stack_size: 65536,  ## 64KB stack
+      strip_debug: true,
+      producer_section: true,
+    }
+  end
+end
+
+# ─── WASM Compiler ──────────────────────────────────────────────────
+
+pub struct WasmCompiler
+  config: WasmCompileConfig
+  type_section: TypeSection
+  import_section: ImportSection
+  function_section: FunctionSection
+  export_section: ExportSection
+  code_section: CodeSection
+  memory_section: MemorySection
+  data_section: DataSection
+  global_section: GlobalSection
+  type_cache: Map[String, UInt]  ## func signature -> type index
+  func_index: UInt
+  string_pool: Map[String, UInt]  ## string -> data offset
+  data_offset: UInt
+end
+
+impl WasmCompiler
+  pub def new(config: WasmCompileConfig) -> WasmCompiler
+    WasmCompiler {
+      config: config,
+      type_section: TypeSection { types: Array::new() },
+      import_section: ImportSection { imports: Array::new() },
+      function_section: FunctionSection { type_indices: Array::new() },
+      export_section: ExportSection { exports: Array::new() },
+      code_section: CodeSection { bodies: Array::new() },
+      memory_section: MemorySection { memories: Array::new() },
+      data_section: DataSection { segments: Array::new() },
+      global_section: GlobalSection { globals: Array::new() },
+      type_cache: Map::new(),
+      func_index: 0,
+      string_pool: Map::new(),
+      data_offset: 0,
+    }
+  end
+
+  /// Compile a MIR module to WASM binary.
+  pub def compile(&mut self, mir: &MirModule) -> Result[Array[u8], WasmCompileError]
+    ## Setup memory
+    self.setup_memory()
+
+    ## Add WASI imports if targeting WASI
+    match &self.config.target
+    when Wasm32Wasi then self.add_wasi_imports()
+    else ()
+    end
+
+    ## Compile each function
+    for func in mir.functions.iter() do
+      self.compile_function(func)?
+    end
+
+    ## Emit binary
+    self.encode()
+  end
+
+  def setup_memory(&mut self) -> Unit
+    let limits = if self.config.import_memory then
+      self.import_section.imports.push(WasmImport {
+        module: "env".to_string(),
+        name: "memory".to_string(),
+        desc: ImportDesc::Memory(Limits {
+          min: self.config.initial_memory_pages,
+          max: self.config.max_memory_pages,
+        }),
+      })
+      return
+    else
+      Limits {
+        min: self.config.initial_memory_pages,
+        max: self.config.max_memory_pages,
+      }
+    end
+    self.memory_section.memories.push(limits)
+
+    if self.config.export_memory then
+      self.export_section.exports.push(WasmExport {
+        name: "memory".to_string(),
+        desc: ExportDesc::Memory(0),
+      })
+    end
+  end
+
+  def add_wasi_imports(&mut self) -> Unit
+    ## WASI snapshot_preview1 imports
+    let wasi_funcs = vec![
+      ("fd_write", vec![WasmValType::I32, WasmValType::I32, WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+      ("fd_read", vec![WasmValType::I32, WasmValType::I32, WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+      ("fd_close", vec![WasmValType::I32], vec![WasmValType::I32]),
+      ("proc_exit", vec![WasmValType::I32], vec![]),
+      ("args_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+      ("args_sizes_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+      ("environ_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+      ("environ_sizes_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
+    ]
+    for (name, params, results) in wasi_funcs do
+      let type_idx = self.intern_type(FuncType { params: params, results: results })
+      self.import_section.imports.push(WasmImport {
+        module: "wasi_snapshot_preview1".to_string(),
+        name: name.to_string(),
+        desc: ImportDesc::Func(type_idx),
+      })
+      self.func_index = self.func_index + 1
+    end
+  end
+
+  def compile_function(&mut self, func: &MirFunction) -> Result[Unit, WasmCompileError]
+    let param_types = func.params.iter().map(|p| mir_type_to_wasm(&p.ty)).collect()
+    let result_types = vec![mir_type_to_wasm(&func.return_type)]
+    let func_type = FuncType { params: param_types, results: result_types }
+    let type_idx = self.intern_type(func_type)
+    self.function_section.type_indices.push(type_idx)
+
+    ## Compile function body
+    let body = self.compile_body(func)?
+    self.code_section.bodies.push(body)
+
+    ## Export if public
+    if func.is_exported then
+      self.export_section.exports.push(WasmExport {
+        name: func.name.clone(),
+        desc: ExportDesc::Func(self.func_index),
+      })
+    end
+
+    self.func_index = self.func_index + 1
+    Ok(())
+  end
+
+  def compile_body(&self, func: &MirFunction) -> Result[FunctionBody, WasmCompileError]
+    var locals = Array::new()
+    var code = Array::new()
+
+    ## Declare locals
+    for local in func.locals.iter() do
+      locals.push((1, mir_type_to_wasm(&local.ty)))
+    end
+
+    ## Compile instructions (simplified — real impl handles full MIR->WASM lowering)
+    for instr in func.body.iter() do
+      self.emit_instruction(&mut code, instr)?
+    end
+
+    ## End opcode
+    code.push(0x0B)  ## end
+
+    Ok(FunctionBody { locals: locals, code: code })
+  end
+
+  def emit_instruction(&self, code: &mut Array[u8], instr: &MirInstruction) -> Result[Unit, WasmCompileError]
+    ## Simplified instruction emission
+    ## Real implementation handles full MIR instruction set
+    Ok(())
+  end
+
+  def intern_type(&mut self, ft: FuncType) -> UInt
+    let key = _func_type_key(&ft)
+    match self.type_cache.get(&key)
+    when Some(idx) then *idx
+    when None then
+      let idx = self.type_section.types.len() as UInt
+      self.type_section.types.push(ft)
+      self.type_cache.insert(key, idx)
+      idx
+    end
+  end
+
+  def encode(&self) -> Result[Array[u8], WasmCompileError]
+    var binary = Array::new()
+
+    ## Magic number and version
+    binary.extend_from_slice(&[0x00, 0x61, 0x73, 0x6D])  ## \0asm
+    binary.extend_from_slice(&[0x01, 0x00, 0x00, 0x00])  ## version 1
+
+    ## Section 1: Type
+    if !self.type_section.types.is_empty() then
+      _encode_section(&mut binary, 0x01, &_encode_type_section(&self.type_section))
+    end
+
+    ## Section 2: Import
+    if !self.import_section.imports.is_empty() then
+      _encode_section(&mut binary, 0x02, &_encode_import_section(&self.import_section))
+    end
+
+    ## Section 3: Function
+    if !self.function_section.type_indices.is_empty() then
+      _encode_section(&mut binary, 0x03, &_encode_function_section(&self.function_section))
+    end
+
+    ## Section 5: Memory
+    if !self.memory_section.memories.is_empty() then
+      _encode_section(&mut binary, 0x05, &_encode_memory_section(&self.memory_section))
+    end
+
+    ## Section 6: Global
+    if !self.global_section.globals.is_empty() then
+      _encode_section(&mut binary, 0x06, &_encode_global_section(&self.global_section))
+    end
+
+    ## Section 7: Export
+    if !self.export_section.exports.is_empty() then
+      _encode_section(&mut binary, 0x07, &_encode_export_section(&self.export_section))
+    end
+
+    ## Section 10: Code
+    if !self.code_section.bodies.is_empty() then
+      _encode_section(&mut binary, 0x0A, &_encode_code_section(&self.code_section))
+    end
+
+    ## Section 11: Data
+    if !self.data_section.segments.is_empty() then
+      _encode_section(&mut binary, 0x0B, &_encode_data_section(&self.data_section))
+    end
+
+    Ok(binary)
+  end
+end
+
+# ─── Errors ──────────────────────────────────────────────────────────
+
+pub enum WasmCompileError
+  UnsupportedType(String)
+  UnsupportedInstruction(String)
+  TooManyLocals
+  FunctionTooLarge
+  MemoryOverflow
+end
+
+impl Display for WasmCompileError
+  def fmt(self: &Self) -> String
+    match self
+    when UnsupportedType(t) then "unsupported WASM type: " + t
+    when UnsupportedInstruction(i) then "unsupported WASM instruction: " + i
+    when TooManyLocals then "too many locals in function"
+    when FunctionTooLarge then "function body too large"
+    when MemoryOverflow then "data segment exceeds memory"
+    end
+  end
+end
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def mir_type_to_wasm(ty: &MirType) -> WasmValType
+  match ty
+  when MirType::Bool | MirType::I8 | MirType::I16 | MirType::I32 | MirType::U8 | MirType::U16 | MirType::U32 then WasmValType::I32
+  when MirType::I64 | MirType::U64 | MirType::Pointer then WasmValType::I64
+  when MirType::F32 then WasmValType::F32
+  when MirType::F64 then WasmValType::F64
+  else WasmValType::I32  ## fallback
+  end
+end
+
+def _func_type_key(ft: &FuncType) -> String
+  var s = "(".to_string()
+  for (i, p) in ft.params.iter().enumerate() do
+    if i > 0 then s = s + "," end
+    s = s + _valtype_str(p)
+  end
+  s = s + ")->("
+  for (i, r) in ft.results.iter().enumerate() do
+    if i > 0 then s = s + "," end
+    s = s + _valtype_str(r)
+  end
+  s + ")"
+end
+
+def _valtype_str(vt: &WasmValType) -> String
+  match vt
+  when I32 then "i32"
+  when I64 then "i64"
+  when F32 then "f32"
+  when F64 then "f64"
+  end
+end
+
+## LEB128 encoding
+def _encode_leb128_u32(buf: &mut Array[u8], mut value: UInt) -> Unit
+  loop
+    let byte = (value & 0x7F) as u8
+    value = value >> 7
+    if value == 0 then
+      buf.push(byte)
+      break
+    else
+      buf.push(byte | 0x80)
+    end
+  end
+end
+
+def _encode_section(binary: &mut Array[u8], id: u8, payload: &Array[u8]) -> Unit
+  binary.push(id)
+  _encode_leb128_u32(binary, payload.len() as UInt)
+  binary.extend_from_slice(payload)
+end
+
+## Simplified section encoders (stubs)
+def _encode_type_section(ts: &TypeSection) -> Array[u8] = Array::new()
+def _encode_import_section(is: &ImportSection) -> Array[u8] = Array::new()
+def _encode_function_section(fs: &FunctionSection) -> Array[u8] = Array::new()
+def _encode_memory_section(ms: &MemorySection) -> Array[u8] = Array::new()
+def _encode_global_section(gs: &GlobalSection) -> Array[u8] = Array::new()
+def _encode_export_section(es: &ExportSection) -> Array[u8] = Array::new()
+def _encode_code_section(cs: &CodeSection) -> Array[u8] = Array::new()
+def _encode_data_section(ds: &DataSection) -> Array[u8] = Array::new()
+
+end ## module tg_compiler::wasm_target

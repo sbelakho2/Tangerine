@@ -1722,3 +1722,387 @@ impl[C] Drop for PooledConnection[C] where C: Connection
     end
   end
 end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 5: MYSQL DRIVER
+# ═══════════════════════════════════════════════════════════════
+
+## FFI bindings for libmysqlclient
+extern "C"
+  def mysql_init(mysql: *mut ()) -> *mut ()
+  def mysql_real_connect(mysql: *mut (), host: *const u8, user: *const u8,
+                          passwd: *const u8, db: *const u8, port: u32,
+                          unix_socket: *const u8, client_flag: UInt) -> *mut ()
+  def mysql_close(mysql: *mut ()) -> Unit
+  def mysql_query(mysql: *mut (), query: *const u8) -> i32
+  def mysql_real_query(mysql: *mut (), query: *const u8, length: UInt) -> i32
+  def mysql_store_result(mysql: *mut ()) -> *mut ()
+  def mysql_free_result(result: *mut ()) -> Unit
+  def mysql_num_fields(result: *mut ()) -> u32
+  def mysql_num_rows(result: *mut ()) -> u64
+  def mysql_fetch_row(result: *mut ()) -> *mut *mut u8
+  def mysql_fetch_lengths(result: *mut ()) -> *mut UInt
+  def mysql_fetch_field(result: *mut ()) -> *mut MysqlField
+  def mysql_affected_rows(mysql: *mut ()) -> u64
+  def mysql_error(mysql: *mut ()) -> *const u8
+  def mysql_errno(mysql: *mut ()) -> u32
+  def mysql_real_escape_string(mysql: *mut (), to: *mut u8, from: *const u8, length: UInt) -> UInt
+  def mysql_autocommit(mysql: *mut (), mode: u8) -> u8
+  def mysql_commit(mysql: *mut ()) -> u8
+  def mysql_rollback(mysql: *mut ()) -> u8
+  def mysql_stmt_init(mysql: *mut ()) -> *mut ()
+  def mysql_stmt_prepare(stmt: *mut (), query: *const u8, length: UInt) -> i32
+  def mysql_stmt_execute(stmt: *mut ()) -> i32
+  def mysql_stmt_close(stmt: *mut ()) -> u8
+  def mysql_stmt_affected_rows(stmt: *mut ()) -> u64
+  def mysql_stmt_error(stmt: *mut ()) -> *const u8
+end
+
+@repr(C)
+struct MysqlField
+  name: *const u8
+  org_name: *const u8
+  table: *const u8
+  org_table: *const u8
+  db: *const u8
+  catalog: *const u8
+  def_: *const u8
+  length: UInt
+  max_length: UInt
+  name_length: u32
+  org_name_length: u32
+  table_length: u32
+  org_table_length: u32
+  db_length: u32
+  catalog_length: u32
+  def_length: u32
+  flags: u32
+  decimals: u32
+  charsetnr: u32
+  type_: u32   ## MYSQL_TYPE_*
+end
+
+struct MysqlConfig
+  host: String
+  port: u16
+  user: String
+  password: String
+  database: String
+  charset: String
+end
+
+def mysql_config_new(host: &str, user: &str, password: &str, database: &str) -> MysqlConfig
+  MysqlConfig {
+    host: host.to_string(),
+    port: 3306,
+    user: user.to_string(),
+    password: password.to_string(),
+    database: database.to_string(),
+    charset: "utf8mb4".to_string(),
+  }
+end
+
+struct Mysql
+  handle: *mut ()
+  connected: Bool
+end
+
+def mysql_open(config: &MysqlConfig) -> Result[Mysql, DbError]
+  let handle = unsafe "FFI boundary" do mysql_init(Ptr::null()) end
+  if handle.is_null() then
+    return Result::Err(DbError::ConnectionFailed("mysql_init failed".to_string()))
+  end
+
+  let result = unsafe "FFI boundary" do
+    mysql_real_connect(
+      handle,
+      config.host.to_cstring().as_ptr(),
+      config.user.to_cstring().as_ptr(),
+      config.password.to_cstring().as_ptr(),
+      config.database.to_cstring().as_ptr(),
+      config.port as u32,
+      Ptr::null(),
+      0
+    )
+  end
+
+  if result.is_null() then
+    let err_msg = unsafe "FFI boundary" do
+      cstring_to_string(mysql_error(handle))
+    end
+    unsafe "FFI boundary" do mysql_close(handle) end
+    return Result::Err(DbError::ConnectionFailed(err_msg))
+  end
+
+  Result::Ok(Mysql { handle: handle, connected: true })
+end
+
+impl Connection for Mysql
+  def execute(self: &mut Mysql, sql: &str, params: &[&dyn ToSqlParam]) -> Result[UInt, DbError]
+    let query_str = mysql_interpolate_params(self, sql, params)?
+    let ret = unsafe "FFI boundary" do
+      mysql_real_query(self.handle, query_str.to_cstring().as_ptr(), query_str.len())
+    end
+    if ret != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    let affected = unsafe "FFI boundary" do mysql_affected_rows(self.handle) end
+    Result::Ok(affected as UInt)
+  end
+
+  def query(self: &Mysql, sql: &str, params: &[&dyn ToSqlParam]) -> Result[Rows, DbError]
+    let query_str = mysql_interpolate_params_ref(self, sql, params)?
+    let ret = unsafe "FFI boundary" do
+      mysql_real_query(self.handle, query_str.to_cstring().as_ptr(), query_str.len())
+    end
+    if ret != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    let result = unsafe "FFI boundary" do mysql_store_result(self.handle) end
+    if result.is_null() then
+      return Result::Ok(Rows { columns: Vec::new(), rows: Vec::new(), position: 0 })
+    end
+
+    let num_fields = unsafe "FFI boundary" do mysql_num_fields(result) end as UInt
+    let num_rows = unsafe "FFI boundary" do mysql_num_rows(result) end as UInt
+
+    ## Read column names
+    let mut columns = Vec::new()
+    for i in 0..num_fields do
+      let field = unsafe "FFI boundary" do mysql_fetch_field(result) end
+      if !field.is_null() then
+        let name = unsafe "FFI boundary" do cstring_to_string(field.name) end
+        columns.push(name)
+      end
+    end
+
+    ## Read rows
+    let mut rows = Vec::new()
+    for _ in 0..num_rows do
+      let row_ptr = unsafe "FFI boundary" do mysql_fetch_row(result) end
+      if row_ptr.is_null() then break end
+      let lengths = unsafe "FFI boundary" do mysql_fetch_lengths(result) end
+      let mut row_values = Vec::new()
+      for j in 0..num_fields do
+        let field_ptr = unsafe "FFI boundary" do *row_ptr.offset(j as isize) end
+        if field_ptr.is_null() then
+          row_values.push(SqlValue::Null)
+        else
+          let len = unsafe "FFI boundary" do *lengths.offset(j as isize) end
+          let s = unsafe "FFI boundary" do string_from_ptr(field_ptr, len) end
+          row_values.push(SqlValue::Text(s))
+        end
+      end
+      rows.push(row_values)
+    end
+
+    unsafe "FFI boundary" do mysql_free_result(result) end
+    Result::Ok(Rows { columns: columns, rows: rows, position: 0 })
+  end
+
+  def begin_transaction(self: &mut Mysql) -> Result[Transaction, DbError]
+    let ret = unsafe "FFI boundary" do mysql_autocommit(self.handle, 0) end
+    if ret != 0 then
+      return Result::Err(DbError::TransactionError("failed to disable autocommit".to_string()))
+    end
+    Result::Ok(Transaction { active: true })
+  end
+
+  def prepare(self: &mut Mysql, sql: &str) -> Result[Statement, DbError]
+    let stmt = unsafe "FFI boundary" do mysql_stmt_init(self.handle) end
+    if stmt.is_null() then
+      return Result::Err(DbError::Internal("mysql_stmt_init failed".to_string()))
+    end
+    let ret = unsafe "FFI boundary" do
+      mysql_stmt_prepare(stmt, sql.to_cstring().as_ptr(), sql.len())
+    end
+    if ret != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+      unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    Result::Ok(Statement { handle: stmt as *mut u8, sql: sql.to_string() })
+  end
+
+  def close(self: &mut Mysql) -> Result[Unit, DbError]
+    if self.connected then
+      unsafe "FFI boundary" do mysql_close(self.handle) end
+      self.connected = false
+    end
+    Result::Ok(())
+  end
+end
+
+impl Drop for Mysql
+  def drop(self: &mut Mysql) -> Unit
+    let _ = self.close()
+  end
+end
+
+def mysql_interpolate_params(conn: &mut Mysql, sql: &str, params: &[&dyn ToSqlParam]) -> Result[String, DbError]
+  let mut result = String::new()
+  let mut param_idx = 0
+  for ch in sql.chars() do
+    if ch == '?' then
+      if param_idx >= params.len() then
+        return Result::Err(DbError::BindError(param_idx as UInt, "too few parameters".to_string()))
+      end
+      let val = params[param_idx].to_sql_param()
+      result.push_str(&sql_value_to_mysql_literal(&val))
+      param_idx = param_idx + 1
+    else
+      result.push(ch)
+    end
+  end
+  Result::Ok(result)
+end
+
+def mysql_interpolate_params_ref(conn: &Mysql, sql: &str, params: &[&dyn ToSqlParam]) -> Result[String, DbError]
+  let mut result = String::new()
+  let mut param_idx = 0
+  for ch in sql.chars() do
+    if ch == '?' then
+      if param_idx >= params.len() then
+        return Result::Err(DbError::BindError(param_idx as UInt, "too few parameters".to_string()))
+      end
+      let val = params[param_idx].to_sql_param()
+      result.push_str(&sql_value_to_mysql_literal(&val))
+      param_idx = param_idx + 1
+    else
+      result.push(ch)
+    end
+  end
+  Result::Ok(result)
+end
+
+def sql_value_to_mysql_literal(val: &SqlValue) -> String
+  match val
+  when SqlValue::Null then "NULL".to_string()
+  when SqlValue::Integer(i) then i.to_string()
+  when SqlValue::Float(f) then f.to_string()
+  when SqlValue::Text(s) then "'" + s.replace("'", "\\'") + "'"
+  when SqlValue::Bool(b) then if *b then "1" else "0" end.to_string()
+  when SqlValue::Blob(_) then "X''".to_string()  ## Simplified
+  when SqlValue::Timestamp(t) then t.to_string()
+  end
+end
+
+def cstring_to_string(ptr: *const u8) -> String
+  if ptr.is_null() then return "".to_string() end
+  let mut len = 0
+  while unsafe "FFI" do *ptr.offset(len as isize) end != 0 do
+    len = len + 1
+  end
+  unsafe "FFI" do string_from_ptr(ptr, len) end
+end
+
+def string_from_ptr(ptr: *const u8, len: UInt) -> String
+  let mut bytes = Vec::with_capacity(len)
+  for i in 0..len do
+    bytes.push(unsafe "FFI" do *ptr.offset(i as isize) end)
+  end
+  String::from_utf8(bytes).unwrap_or("".to_string())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 6: ASYNC DATABASE OPERATIONS
+# ═══════════════════════════════════════════════════════════════
+
+## Trait for async database connections. Mirrors Connection but returns futures.
+trait AsyncConnection
+  async def execute(self: &mut Self, sql: &str, params: &[&dyn ToSqlParam]) -> Result[UInt, DbError]
+  async def query(self: &Self, sql: &str, params: &[&dyn ToSqlParam]) -> Result[Rows, DbError]
+  async def begin_transaction(self: &mut Self) -> Result[AsyncTransaction, DbError]
+  async def close(self: &mut Self) -> Result[Unit, DbError]
+end
+
+struct AsyncTransaction
+  active: Bool
+end
+
+## Async wrapper around a synchronous Connection.
+## Executes DB operations on a background thread pool to avoid blocking the async executor.
+struct AsyncWrapper[C: Connection + Send]
+  inner: C
+end
+
+def async_wrap[C: Connection + Send](conn: C) -> AsyncWrapper[C]
+  AsyncWrapper { inner: conn }
+end
+
+impl[C: Connection + Send] AsyncConnection for AsyncWrapper[C]
+  async def execute(self: &mut AsyncWrapper[C], sql: &str, params: &[&dyn ToSqlParam]) -> Result[UInt, DbError]
+    ## Offload to thread pool
+    let sql_owned = sql.to_string()
+    spawn_blocking(|| {
+      self.inner.execute(&sql_owned, params)
+    }).await
+  end
+
+  async def query(self: &AsyncWrapper[C], sql: &str, params: &[&dyn ToSqlParam]) -> Result[Rows, DbError]
+    let sql_owned = sql.to_string()
+    spawn_blocking(|| {
+      self.inner.query(&sql_owned, params)
+    }).await
+  end
+
+  async def begin_transaction(self: &mut AsyncWrapper[C]) -> Result[AsyncTransaction, DbError]
+    spawn_blocking(|| {
+      self.inner.begin_transaction()
+    }).await.map(|t| AsyncTransaction { active: t.active })
+  end
+
+  async def close(self: &mut AsyncWrapper[C]) -> Result[Unit, DbError]
+    spawn_blocking(|| {
+      self.inner.close()
+    }).await
+  end
+end
+
+## Async connection pool
+struct AsyncPool[C: Connection + Send]
+  pool: Pool[C]
+end
+
+def async_pool_new[C: Connection + Send](max_size: UInt) -> AsyncPool[C]
+  AsyncPool { pool: pool_new(max_size) }
+end
+
+impl[C: Connection + Send] AsyncPool[C]
+  async def get(self: &AsyncPool[C]) -> Result[AsyncPooledConnection[C], DbError]
+    spawn_blocking(|| {
+      self.pool.acquire()
+    }).await.map(|pc| AsyncPooledConnection { inner: pc })
+  end
+end
+
+struct AsyncPooledConnection[C: Connection]
+  inner: PooledConnection[C]
+end
+
+impl[C: Connection + Send] AsyncConnection for AsyncPooledConnection[C]
+  async def execute(self: &mut AsyncPooledConnection[C], sql: &str, params: &[&dyn ToSqlParam]) -> Result[UInt, DbError]
+    spawn_blocking(|| self.inner.execute(sql, params)).await
+  end
+
+  async def query(self: &AsyncPooledConnection[C], sql: &str, params: &[&dyn ToSqlParam]) -> Result[Rows, DbError]
+    spawn_blocking(|| self.inner.query(sql, params)).await
+  end
+
+  async def begin_transaction(self: &mut AsyncPooledConnection[C]) -> Result[AsyncTransaction, DbError]
+    Result::Err(DbError::Internal("use the inner connection for transactions".to_string()))
+  end
+
+  async def close(self: &mut AsyncPooledConnection[C]) -> Result[Unit, DbError]
+    Result::Ok(())  ## Returned to pool on drop
+  end
+end
+
+## Helper: run a blocking closure on a thread pool and return a future.
+async def spawn_blocking[T: Send, F: FnOnce() -> T + Send](f: F) -> T
+  ## In a real implementation, this dispatches to a blocking thread pool
+  ## and returns a future that resolves when the work completes.
+  f()
+end

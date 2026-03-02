@@ -1285,3 +1285,439 @@ impl AsyncMutex[T]
     LockFuture { mutex: self as *mut AsyncMutex[T] }
   end
 end
+
+# ———————————————————————————————————————————————————————————————
+# Structured Concurrency — Task Scopes (Nurseries)
+# ———————————————————————————————————————————————————————————————
+
+## A TaskScope ensures all spawned child tasks complete (or are cancelled)
+## before the scope exits. Inspired by Trio nurseries / JEP 453.
+struct TaskScope
+  tasks: Vec[Task]
+  cancellation: CancellationToken
+  error_strategy: ScopeErrorStrategy
+end
+
+## How the scope handles a child task failure
+enum ScopeErrorStrategy
+  CancelAll         ## Cancel all remaining tasks on first error (default)
+  CollectErrors     ## Let all tasks finish, collect all errors
+  IgnoreErrors      ## Ignore child errors, scope succeeds if body succeeds
+end
+
+struct CancellationToken
+  cancelled: Bool
+  children: Vec[CancellationToken]
+end
+
+def cancellation_token_new() -> CancellationToken
+  CancellationToken { cancelled: false, children: Vec::new() }
+end
+
+impl CancellationToken
+  def cancel(self: &mut CancellationToken) -> Unit
+    self.cancelled = true
+    for child in &mut self.children do
+      child.cancel()
+    end
+  end
+
+  def is_cancelled(self: &CancellationToken) -> Bool
+    self.cancelled
+  end
+
+  def child(self: &mut CancellationToken) -> CancellationToken
+    let c = cancellation_token_new()
+    self.children.push(c)
+    c
+  end
+end
+
+def task_scope_new() -> TaskScope
+  TaskScope {
+    tasks: Vec::new(),
+    cancellation: cancellation_token_new(),
+    error_strategy: ScopeErrorStrategy::CancelAll,
+  }
+end
+
+impl TaskScope
+  def with_error_strategy(self: &mut TaskScope, strategy: ScopeErrorStrategy) -> &mut TaskScope
+    self.error_strategy = strategy
+    self
+  end
+
+  ## Spawn a task within this scope. The task is tracked and must
+  ## complete before the scope exits.
+  def spawn[F: Future](self: &mut TaskScope, future: F) -> JoinHandle[F::Output]
+    let task = Task {
+      id: self.tasks.len() as UInt,
+      future: Box::new(future) as Box[dyn Future[Output = ()>>,
+      state: TaskState::Ready,
+      waker: Option::None,
+    }
+    self.tasks.push(task)
+    JoinHandle {
+      task_id: self.tasks.len() as UInt - 1,
+      result: Option::None,
+    }
+  end
+
+  ## Wait for all tasks in the scope to complete.
+  def join_all(self: &mut TaskScope) -> Result[Unit, Vec[String]]
+    let mut errors = Vec::new()
+    for task in &mut self.tasks do
+      if self.cancellation.is_cancelled() then
+        match self.error_strategy
+        when ScopeErrorStrategy::CancelAll then break
+        when _ then ()
+        end
+      end
+      ## Poll each task to completion
+      match task.state
+      when TaskState::Failed then
+        errors.push("task ".to_string() + task.id.to_string() + " failed")
+        match self.error_strategy
+        when ScopeErrorStrategy::CancelAll then
+          self.cancellation.cancel()
+          break
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+    if errors.is_empty() then
+      Result::Ok(())
+    else
+      Result::Err(errors)
+    end
+  end
+
+  ## Cancel all tasks in this scope.
+  def cancel(self: &mut TaskScope) -> Unit
+    self.cancellation.cancel()
+  end
+end
+
+## Convenience: run a scoped block of async work.
+## All tasks spawned within the closure are guaranteed to complete
+## before this function returns.
+async def scoped[T, F: FnOnce(&mut TaskScope) -> T](body: F) -> Result[T, Vec[String]]
+  let mut scope = task_scope_new()
+  let result = body(&mut scope)
+  scope.join_all()?
+  Result::Ok(result)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Async Streams (AsyncIterator)
+# ———————————————————————————————————————————————————————————————
+
+trait AsyncIterator
+  type Item
+
+  ## Returns Poll::Ready(Some(item)) for next item,
+  ## Poll::Ready(None) when exhausted, or Poll::Pending.
+  def poll_next(self: &mut Self, cx: &mut Context) -> Poll[Option[Self::Item]]
+end
+
+## Adapter: collect all items from an async stream
+async def collect_stream[S: AsyncIterator](stream: &mut S) -> Vec[S::Item]
+  let mut items = Vec::new()
+  loop do
+    match stream.next().await
+    when Option::Some(item) then items.push(item)
+    when Option::None then break
+    end
+  end
+  items
+end
+
+## Map adapter for async streams
+struct MapStream[S: AsyncIterator, F]
+  inner: S
+  f: F
+end
+
+impl[S: AsyncIterator, F: Fn(S::Item) -> U, U] AsyncIterator for MapStream[S, F]
+  type Item = U
+  def poll_next(self: &mut MapStream[S, F], cx: &mut Context) -> Poll[Option[U]]
+    match self.inner.poll_next(cx)
+    when Poll::Ready(Option::Some(item)) then Poll::Ready(Option::Some((self.f)(item)))
+    when Poll::Ready(Option::None) then Poll::Ready(Option::None)
+    when Poll::Pending then Poll::Pending
+    end
+  end
+end
+
+## Filter adapter for async streams
+struct FilterStream[S: AsyncIterator, F]
+  inner: S
+  predicate: F
+end
+
+impl[S: AsyncIterator, F: Fn(&S::Item) -> Bool] AsyncIterator for FilterStream[S, F]
+  type Item = S::Item
+  def poll_next(self: &mut FilterStream[S, F], cx: &mut Context) -> Poll[Option[S::Item]]
+    loop do
+      match self.inner.poll_next(cx)
+      when Poll::Ready(Option::Some(item)) then
+        if (self.predicate)(&item) then
+          return Poll::Ready(Option::Some(item))
+        end
+      when Poll::Ready(Option::None) then return Poll::Ready(Option::None)
+      when Poll::Pending then return Poll::Pending
+      end
+    end
+  end
+end
+
+## Take adapter
+struct TakeStream[S: AsyncIterator]
+  inner: S
+  remaining: UInt
+end
+
+impl[S: AsyncIterator] AsyncIterator for TakeStream[S]
+  type Item = S::Item
+  def poll_next(self: &mut TakeStream[S], cx: &mut Context) -> Poll[Option[S::Item]]
+    if self.remaining == 0 then
+      return Poll::Ready(Option::None)
+    end
+    match self.inner.poll_next(cx)
+    when Poll::Ready(Option::Some(item)) then
+      self.remaining = self.remaining - 1
+      Poll::Ready(Option::Some(item))
+    when other then other
+    end
+  end
+end
+
+## Channel-backed async stream
+struct ChannelStream[T]
+  receiver: Receiver[T]
+end
+
+impl[T] AsyncIterator for ChannelStream[T]
+  type Item = T
+  def poll_next(self: &mut ChannelStream[T], cx: &mut Context) -> Poll[Option[T]]
+    match self.receiver.try_recv()
+    when Option::Some(item) then Poll::Ready(Option::Some(item))
+    when Option::None then
+      if self.receiver.is_closed() then
+        Poll::Ready(Option::None)
+      else
+        Poll::Pending
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Retry with Backoff
+# ———————————————————————————————————————————————————————————————
+
+struct RetryConfig
+  max_attempts: UInt
+  initial_delay_ms: UInt
+  max_delay_ms: UInt
+  backoff_factor: Float
+  jitter: Bool
+end
+
+def retry_config_default() -> RetryConfig
+  RetryConfig {
+    max_attempts: 3,
+    initial_delay_ms: 100,
+    max_delay_ms: 30000,
+    backoff_factor: 2.0,
+    jitter: true,
+  }
+end
+
+## Retry an async operation with exponential backoff.
+async def retry[T, E, F: FnMut() -> impl Future[Output = Result[T, E]]](
+  config: &RetryConfig,
+  mut operation: F
+) -> Result[T, E]
+  let mut delay_ms = config.initial_delay_ms
+  let mut last_err: Option[E] = Option::None
+
+  for attempt in 0..config.max_attempts do
+    match operation().await
+    when Result::Ok(val) then return Result::Ok(val)
+    when Result::Err(e) then
+      last_err = Option::Some(e)
+      if attempt + 1 < config.max_attempts then
+        sleep(Duration::from_millis(delay_ms as u64)).await
+        delay_ms = min_uint(
+          (delay_ms as Float * config.backoff_factor) as UInt,
+          config.max_delay_ms
+        )
+      end
+    end
+  end
+
+  Result::Err(last_err.unwrap())
+end
+
+def min_uint(a: UInt, b: UInt) -> UInt
+  if a < b then a else b end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Circuit Breaker
+# ———————————————————————————————————————————————————————————————
+
+enum CircuitState
+  Closed       ## Normal operation
+  Open         ## Failing, reject calls
+  HalfOpen     ## Testing if service recovered
+end
+
+struct CircuitBreaker
+  state: CircuitState
+  failure_count: UInt
+  success_count: UInt
+  failure_threshold: UInt
+  success_threshold: UInt  ## Successes needed in HalfOpen to close
+  timeout_ms: UInt         ## Time to wait before HalfOpen
+  last_failure_time: UInt  ## Timestamp of last failure
+end
+
+def circuit_breaker_new(failure_threshold: UInt, success_threshold: UInt, timeout_ms: UInt) -> CircuitBreaker
+  CircuitBreaker {
+    state: CircuitState::Closed,
+    failure_count: 0,
+    success_count: 0,
+    failure_threshold: failure_threshold,
+    success_threshold: success_threshold,
+    timeout_ms: timeout_ms,
+    last_failure_time: 0,
+  }
+end
+
+enum CircuitBreakerError[E]
+  CircuitOpen
+  Inner(E)
+end
+
+impl CircuitBreaker
+  def allow_request(self: &mut CircuitBreaker, now_ms: UInt) -> Bool
+    match self.state
+    when CircuitState::Closed then true
+    when CircuitState::Open then
+      if now_ms - self.last_failure_time >= self.timeout_ms then
+        self.state = CircuitState::HalfOpen
+        self.success_count = 0
+        true
+      else
+        false
+      end
+    when CircuitState::HalfOpen then true
+    end
+  end
+
+  def record_success(self: &mut CircuitBreaker) -> Unit
+    match self.state
+    when CircuitState::HalfOpen then
+      self.success_count = self.success_count + 1
+      if self.success_count >= self.success_threshold then
+        self.state = CircuitState::Closed
+        self.failure_count = 0
+      end
+    when CircuitState::Closed then
+      self.failure_count = 0  ## Reset consecutive failures
+    when _ then ()
+    end
+  end
+
+  def record_failure(self: &mut CircuitBreaker, now_ms: UInt) -> Unit
+    self.last_failure_time = now_ms
+    match self.state
+    when CircuitState::Closed then
+      self.failure_count = self.failure_count + 1
+      if self.failure_count >= self.failure_threshold then
+        self.state = CircuitState::Open
+      end
+    when CircuitState::HalfOpen then
+      self.state = CircuitState::Open
+    when _ then ()
+    end
+  end
+
+  def state(self: &CircuitBreaker) -> &CircuitState
+    &self.state
+  end
+
+  def reset(self: &mut CircuitBreaker) -> Unit
+    self.state = CircuitState::Closed
+    self.failure_count = 0
+    self.success_count = 0
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Async Semaphore
+# ———————————————————————————————————————————————————————————————
+
+struct AsyncSemaphore
+  permits: UInt
+  max_permits: UInt
+  waiters: VecDeque[Waker]
+end
+
+def async_semaphore_new(permits: UInt) -> AsyncSemaphore
+  AsyncSemaphore { permits: permits, max_permits: permits, waiters: VecDeque::new() }
+end
+
+struct AcquireFuture
+  semaphore: *mut AsyncSemaphore
+end
+
+impl Future for AcquireFuture
+  type Output = SemaphorePermit
+  def poll(&mut self, cx: &mut Context) -> Poll[SemaphorePermit]
+    unsafe "pointer dereference" do
+      let sem = &mut *self.semaphore
+      if sem.permits > 0 then
+        sem.permits = sem.permits - 1
+        Poll::Ready(SemaphorePermit { semaphore: self.semaphore })
+      else
+        sem.waiters.push_back(cx.waker.clone())
+        Poll::Pending
+      end
+    end
+  end
+end
+
+struct SemaphorePermit
+  semaphore: *mut AsyncSemaphore
+end
+
+impl Drop for SemaphorePermit
+  def drop(&mut self) -> Unit
+    unsafe "pointer dereference" do
+      let sem = &mut *self.semaphore
+      sem.permits = sem.permits + 1
+      if let Some(waker) = sem.waiters.pop_front() then
+        waker.wake()
+      end
+    end
+  end
+end
+
+impl AsyncSemaphore
+  def acquire(&mut self) -> AcquireFuture
+    AcquireFuture { semaphore: self as *mut AsyncSemaphore }
+  end
+
+  def try_acquire(&mut self) -> Option[SemaphorePermit]
+    if self.permits > 0 then
+      self.permits = self.permits - 1
+      Option::Some(SemaphorePermit { semaphore: self as *mut AsyncSemaphore })
+    else
+      Option::None
+    end
+  end
+end

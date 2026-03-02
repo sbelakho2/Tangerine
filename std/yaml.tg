@@ -1,0 +1,819 @@
+## std::yaml — YAML 1.2 parser and emitter
+## Supports YAML 1.2 Core Schema: maps, sequences, scalars, anchors/aliases.
+## Spec: §stdlib.yaml
+
+module std::yaml
+
+use std::core::{Option, Result, Display, Clone, Eq}
+use std::fmt
+use std::collections::{Array, Map}
+
+# ─── Value ───────────────────────────────────────────────────────────
+
+pub enum Value
+  Null
+  Bool(Bool)
+  Int(Int)
+  Float(Float)
+  String(String)
+  Sequence(Vec[Value])
+  Mapping(Vec[(String, Value)])  ## Preserves insertion order
+end
+
+impl Value
+  pub def is_null(self) -> Bool
+    match self
+    when Value.Null then true
+    else false
+    end
+  end
+
+  pub def as_bool(self) -> Option[Bool]
+    match self
+    when Value.Bool(b) then Some(b)
+    else None
+    end
+  end
+
+  pub def as_int(self) -> Option[Int]
+    match self
+    when Value.Int(i) then Some(i)
+    else None
+    end
+  end
+
+  pub def as_float(self) -> Option[Float]
+    match self
+    when Value.Float(f) then Some(f)
+    when Value.Int(i) then Some(i as Float)
+    else None
+    end
+  end
+
+  pub def as_str(self) -> Option[&String]
+    match self
+    when Value.String(ref s) then Some(s)
+    else None
+    end
+  end
+
+  pub def as_sequence(self) -> Option[&Vec[Value]]
+    match self
+    when Value.Sequence(ref seq) then Some(seq)
+    else None
+    end
+  end
+
+  pub def as_mapping(self) -> Option[&Vec[(String, Value)]>
+    match self
+    when Value.Mapping(ref map) then Some(map)
+    else None
+    end
+  end
+
+  ## Index into a mapping by key.
+  pub def get(self, key: &str) -> Option[&Value]
+    match self
+    when Value.Mapping(ref entries) then
+      for (k, v) in entries do
+        if k == key then return Some(v) end
+      end
+      None
+    else None
+    end
+  end
+
+  ## Index into a sequence by position.
+  pub def at(self, index: Int) -> Option[&Value]
+    match self
+    when Value.Sequence(ref seq) then
+      if index >= 0 && (index as UInt) < seq.len() then
+        Some(&seq[index as UInt])
+      else
+        None
+      end
+    else None
+    end
+  end
+end
+
+impl Display for Value
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    f.write_str(emit(self))
+  end
+end
+
+# ─── Error ───────────────────────────────────────────────────────────
+
+pub enum YamlError
+  ParseError(String, Int, Int)    ## message, line, column
+  UnexpectedToken(String, Int)    ## description, line
+  DuplicateAnchor(String, Int)    ## anchor name, line
+  UnknownAlias(String, Int)       ## alias name, line
+  InvalidScalar(String, Int)      ## value, line
+  IndentError(Int)                ## line
+  IoError(String)
+end
+
+impl Display for YamlError
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    match self
+    when YamlError.ParseError(msg, line, col) then
+      f.write_str("YAML error at line " + line.to_string() + ":" + col.to_string() + ": " + msg)
+    when YamlError.UnexpectedToken(desc, line) then
+      f.write_str("YAML unexpected token at line " + line.to_string() + ": " + desc)
+    when YamlError.DuplicateAnchor(name, line) then
+      f.write_str("YAML duplicate anchor &" + name + " at line " + line.to_string())
+    when YamlError.UnknownAlias(name, line) then
+      f.write_str("YAML unknown alias *" + name + " at line " + line.to_string())
+    when YamlError.InvalidScalar(val, line) then
+      f.write_str("YAML invalid scalar '" + val + "' at line " + line.to_string())
+    when YamlError.IndentError(line) then
+      f.write_str("YAML indentation error at line " + line.to_string())
+    when YamlError.IoError(msg) then
+      f.write_str("YAML I/O error: " + msg)
+    end
+  end
+end
+
+# ─── Parser ──────────────────────────────────────────────────────────
+
+pub struct Parser
+  input: String
+  pos: Int
+  line: Int
+  col: Int
+  anchors: Map[String, Value]
+end
+
+impl Parser
+  pub def new(input: String) -> Parser
+    Parser {
+      input: input,
+      pos: 0,
+      line: 1,
+      col: 1,
+      anchors: Map[String, Value].new(),
+    }
+  end
+
+  pub def parse(&mut self) -> Result[Value, YamlError]
+    self._skip_whitespace_and_comments()
+    ## Skip document start markers
+    if self._peek_str("---") then
+      self._advance(3)
+      self._skip_to_eol()
+    end
+    let value = self._parse_value(0)?
+    ## Skip document end markers
+    self._skip_whitespace_and_comments()
+    if self._peek_str("...") then
+      self._advance(3)
+    end
+    Ok(value)
+  end
+
+  ## Parse multiple documents from a single stream.
+  pub def parse_all(&mut self) -> Result[Vec[Value], YamlError]
+    var docs = Vec[Value].new()
+    loop
+      self._skip_whitespace_and_comments()
+      if self._eof() then break end
+      if self._peek_str("---") then
+        self._advance(3)
+        self._skip_to_eol()
+      end
+      let doc = self._parse_value(0)?
+      docs.push(doc)
+      self._skip_whitespace_and_comments()
+      if self._peek_str("...") then
+        self._advance(3)
+        self._skip_to_eol()
+      end
+    end
+    Ok(docs)
+  end
+
+  def _parse_value(&mut self, min_indent: Int) -> Result[Value, YamlError]
+    self._skip_whitespace_and_comments()
+    if self._eof() then return Ok(Value.Null) end
+
+    ## Handle anchor
+    var anchor_name: Option[String] = None
+    if self._peek() == '&' then
+      self._advance(1)
+      anchor_name = Some(self._read_word())
+      self._skip_inline_space()
+    end
+
+    ## Handle alias
+    if self._peek() == '*' then
+      self._advance(1)
+      let alias = self._read_word()
+      match self.anchors.get(&alias)
+      when Some(v) then return Ok(v.clone())
+      when None then return Err(YamlError.UnknownAlias(alias, self.line))
+      end
+    end
+
+    let value = if self._peek() == '-' && self._peek_offset(1) == ' ' then
+      self._parse_sequence(self.col - 1)?
+    elsif self._peek() == '[' then
+      self._parse_flow_sequence()?
+    elsif self._peek() == '{' then
+      self._parse_flow_mapping()?
+    elsif self._peek() == '"' then
+      Value.String(self._parse_double_quoted()?)
+    elsif self._peek() == '\'' then
+      Value.String(self._parse_single_quoted()?)
+    elsif self._peek() == '|' || self._peek() == '>' then
+      Value.String(self._parse_block_scalar()?)
+    else
+      ## Try to detect if this is a mapping key
+      let saved_pos = self.pos
+      let saved_line = self.line
+      let saved_col = self.col
+      let word = self._read_until_colon_or_eol()
+      if !self._eof() && self._peek() == ':' && (self._peek_offset(1) == ' ' || self._peek_offset(1) == '\n' || self._eof_offset(1)) then
+        ## It's a mapping
+        self.pos = saved_pos
+        self.line = saved_line
+        self.col = saved_col
+        self._parse_mapping(min_indent)?
+      else
+        ## It's a plain scalar
+        self.pos = saved_pos
+        self.line = saved_line
+        self.col = saved_col
+        self._parse_plain_scalar()?
+      end
+    end
+
+    match anchor_name
+    when Some(name) then
+      self.anchors.insert(name, value.clone())
+    when None then {}
+    end
+
+    Ok(value)
+  end
+
+  def _parse_mapping(&mut self, min_indent: Int) -> Result[Value, YamlError]
+    var entries = Vec[(String, Value)].new()
+    let map_indent = self.col - 1
+
+    loop
+      self._skip_whitespace_and_comments()
+      if self._eof() then break end
+      let current_indent = self.col - 1
+      if current_indent < map_indent then break end
+      if current_indent != map_indent then break end
+
+      ## Read key
+      let key = if self._peek() == '"' then
+        self._parse_double_quoted()?
+      elsif self._peek() == '\'' then
+        self._parse_single_quoted()?
+      else
+        self._read_until(':')
+      end
+
+      ## Expect ':'
+      if self._eof() || self._peek() != ':' then
+        return Err(YamlError.UnexpectedToken("expected ':'".to_string(), self.line))
+      end
+      self._advance(1)
+      self._skip_inline_space()
+
+      ## Read value
+      let value = if self._peek() == '\n' || self._eof() then
+        self._skip_to_eol()
+        self._skip_whitespace_and_comments()
+        if !self._eof() && (self.col - 1) > map_indent then
+          self._parse_value(map_indent + 1)?
+        else
+          Value.Null
+        end
+      else
+        self._parse_value(map_indent + 1)?
+      end
+
+      entries.push((key, value))
+    end
+
+    Ok(Value.Mapping(entries))
+  end
+
+  def _parse_sequence(&mut self, min_indent: Int) -> Result[Value, YamlError]
+    var items = Vec[Value].new()
+    let seq_indent = self.col - 1
+
+    loop
+      self._skip_whitespace_and_comments()
+      if self._eof() then break end
+      let current_indent = self.col - 1
+      if current_indent != seq_indent then break end
+      if self._peek() != '-' || self._peek_offset(1) != ' ' then break end
+
+      self._advance(2)  ## skip "- "
+      let item = self._parse_value(seq_indent + 2)?
+      items.push(item)
+    end
+
+    Ok(Value.Sequence(items))
+  end
+
+  def _parse_flow_sequence(&mut self) -> Result[Value, YamlError]
+    self._advance(1)  ## skip '['
+    var items = Vec[Value].new()
+    self._skip_whitespace_and_comments()
+
+    if !self._eof() && self._peek() != ']' then
+      loop
+        self._skip_whitespace_and_comments()
+        let item = self._parse_flow_value()?
+        items.push(item)
+        self._skip_whitespace_and_comments()
+        if self._eof() || self._peek() == ']' then break end
+        if self._peek() == ',' then self._advance(1) end
+      end
+    end
+
+    if self._eof() || self._peek() != ']' then
+      return Err(YamlError.UnexpectedToken("expected ']'".to_string(), self.line))
+    end
+    self._advance(1)  ## skip ']'
+    Ok(Value.Sequence(items))
+  end
+
+  def _parse_flow_mapping(&mut self) -> Result[Value, YamlError]
+    self._advance(1)  ## skip '{'
+    var entries = Vec[(String, Value)].new()
+    self._skip_whitespace_and_comments()
+
+    if !self._eof() && self._peek() != '}' then
+      loop
+        self._skip_whitespace_and_comments()
+        let key = if self._peek() == '"' then
+          self._parse_double_quoted()?
+        elsif self._peek() == '\'' then
+          self._parse_single_quoted()?
+        else
+          self._read_until_any(&[':', ',', '}'])
+        end
+        self._skip_whitespace_and_comments()
+        if self._eof() || self._peek() != ':' then
+          return Err(YamlError.UnexpectedToken("expected ':'".to_string(), self.line))
+        end
+        self._advance(1)
+        self._skip_inline_space()
+        let value = self._parse_flow_value()?
+        entries.push((key, value))
+        self._skip_whitespace_and_comments()
+        if self._eof() || self._peek() == '}' then break end
+        if self._peek() == ',' then self._advance(1) end
+      end
+    end
+
+    if self._eof() || self._peek() != '}' then
+      return Err(YamlError.UnexpectedToken("expected '}'".to_string(), self.line))
+    end
+    self._advance(1)  ## skip '}'
+    Ok(Value.Mapping(entries))
+  end
+
+  def _parse_flow_value(&mut self) -> Result[Value, YamlError]
+    self._skip_whitespace_and_comments()
+    if self._peek() == '[' then return self._parse_flow_sequence() end
+    if self._peek() == '{' then return self._parse_flow_mapping() end
+    if self._peek() == '"' then return Ok(Value.String(self._parse_double_quoted()?)) end
+    if self._peek() == '\'' then return Ok(Value.String(self._parse_single_quoted()?)) end
+    ## Plain scalar within flow context
+    let s = self._read_until_any(&[',', ']', '}', '\n']).trim()
+    Ok(_resolve_scalar(s))
+  end
+
+  def _parse_double_quoted(&mut self) -> Result[String, YamlError]
+    self._advance(1)  ## skip opening '"'
+    var result = String.new()
+    while !self._eof() do
+      let ch = self._peek()
+      self._advance(1)
+      if ch == '"' then return Ok(result) end
+      if ch == '\\' then
+        if self._eof() then break end
+        let esc = self._peek()
+        self._advance(1)
+        match esc
+        when 'n' then result.push('\n')
+        when 't' then result.push('\t')
+        when 'r' then result.push('\r')
+        when '\\' then result.push('\\')
+        when '"' then result.push('"')
+        when '/' then result.push('/')
+        when '0' then result.push('\0')
+        else result.push(esc)
+        end
+      else
+        result.push(ch)
+      end
+    end
+    Err(YamlError.ParseError("unterminated double-quoted string".to_string(), self.line, self.col))
+  end
+
+  def _parse_single_quoted(&mut self) -> Result[String, YamlError]
+    self._advance(1)  ## skip opening '\''
+    var result = String.new()
+    while !self._eof() do
+      let ch = self._peek()
+      self._advance(1)
+      if ch == '\'' then
+        if !self._eof() && self._peek() == '\'' then
+          result.push('\'')
+          self._advance(1)
+        else
+          return Ok(result)
+        end
+      else
+        result.push(ch)
+      end
+    end
+    Err(YamlError.ParseError("unterminated single-quoted string".to_string(), self.line, self.col))
+  end
+
+  def _parse_block_scalar(&mut self) -> Result[String, YamlError]
+    let style = self._peek()  ## '|' or '>'
+    self._advance(1)
+    let chomp = if !self._eof() && self._peek() == '-' then
+      self._advance(1)
+      '-'
+    elsif !self._eof() && self._peek() == '+' then
+      self._advance(1)
+      '+'
+    else
+      ' '
+    end
+    self._skip_to_eol()
+
+    ## Determine block indent
+    self._skip_empty_lines()
+    let block_indent = self.col - 1
+    if block_indent == 0 then return Ok("".to_string()) end
+
+    var lines = Vec[String].new()
+    loop
+      if self._eof() then break end
+      let current_indent = self._count_leading_spaces()
+      if current_indent < block_indent && !self._is_empty_line() then break end
+      let line_content = self._read_line()
+      if current_indent >= block_indent then
+        lines.push(line_content.substring(block_indent, line_content.len() as Int))
+      else
+        lines.push("".to_string())
+      end
+    end
+
+    let joiner = if style == '|' then "\n" else " " end
+    var result = lines.join(joiner)
+
+    ## Apply chomping
+    match chomp
+    when '-' then result = result.trim_end()
+    when '+' then {} ## keep trailing newlines
+    else
+      result = result.trim_end()
+      result = result + "\n"
+    end
+
+    Ok(result)
+  end
+
+  def _parse_plain_scalar(&mut self) -> Result[Value, YamlError]
+    let s = self._read_until_any(&['\n', '#', ':'])
+    let trimmed = s.trim()
+    Ok(_resolve_scalar(trimmed))
+  end
+
+  # ─── Scanner helpers ────────────────────────────────────────────────
+
+  def _eof(self) -> Bool = self.pos >= self.input.len() as Int
+
+  def _eof_offset(self, offset: Int) -> Bool = self.pos + offset >= self.input.len() as Int
+
+  def _peek(self) -> Char
+    if self._eof() then '\0' else self.input.char_at(self.pos as UInt) end
+  end
+
+  def _peek_offset(self, n: Int) -> Char
+    let idx = self.pos + n
+    if idx >= self.input.len() as Int || idx < 0 then '\0'
+    else self.input.char_at(idx as UInt)
+    end
+  end
+
+  def _peek_str(self, s: &str) -> Bool
+    for i in 0..s.len() do
+      if self._eof_offset(i as Int) then return false end
+      if self.input.char_at((self.pos + i as Int) as UInt) != s.char_at(i) then return false end
+    end
+    true
+  end
+
+  def _advance(&mut self, n: Int) -> Unit
+    for _ in 0..n do
+      if !self._eof() then
+        if self.input.char_at(self.pos as UInt) == '\n' then
+          self.line = self.line + 1
+          self.col = 1
+        else
+          self.col = self.col + 1
+        end
+        self.pos = self.pos + 1
+      end
+    end
+  end
+
+  def _skip_whitespace_and_comments(&mut self) -> Unit
+    while !self._eof() do
+      let ch = self._peek()
+      if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' then
+        self._advance(1)
+      elsif ch == '#' then
+        self._skip_to_eol()
+      else
+        break
+      end
+    end
+  end
+
+  def _skip_inline_space(&mut self) -> Unit
+    while !self._eof() && (self._peek() == ' ' || self._peek() == '\t') do
+      self._advance(1)
+    end
+  end
+
+  def _skip_to_eol(&mut self) -> Unit
+    while !self._eof() && self._peek() != '\n' do
+      self._advance(1)
+    end
+    if !self._eof() then self._advance(1) end  ## skip \n
+  end
+
+  def _skip_empty_lines(&mut self) -> Unit
+    while !self._eof() && self._is_empty_line() do
+      self._skip_to_eol()
+    end
+  end
+
+  def _is_empty_line(self) -> Bool
+    var i = self.pos
+    while i < self.input.len() as Int do
+      let ch = self.input.char_at(i as UInt)
+      if ch == '\n' then return true end
+      if ch != ' ' && ch != '\t' && ch != '\r' then return false end
+      i = i + 1
+    end
+    true
+  end
+
+  def _count_leading_spaces(self) -> Int
+    var count = 0
+    var i = self.pos
+    while i < self.input.len() as Int && self.input.char_at(i as UInt) == ' ' do
+      count = count + 1
+      i = i + 1
+    end
+    count
+  end
+
+  def _read_word(&mut self) -> String
+    var result = String.new()
+    while !self._eof() do
+      let ch = self._peek()
+      if ch == ' ' || ch == '\t' || ch == '\n' || ch == ':' || ch == ',' || ch == ']' || ch == '}' then break end
+      result.push(ch)
+      self._advance(1)
+    end
+    result
+  end
+
+  def _read_line(&mut self) -> String
+    var result = String.new()
+    while !self._eof() && self._peek() != '\n' do
+      result.push(self._peek())
+      self._advance(1)
+    end
+    if !self._eof() then self._advance(1) end
+    result
+  end
+
+  def _read_until(self, stop: Char) -> String
+    var result = String.new()
+    while !self._eof() && self._peek() != stop do
+      result.push(self._peek())
+      self._advance(1)
+    end
+    result.trim()
+  end
+
+  def _read_until_colon_or_eol(&mut self) -> String
+    var result = String.new()
+    while !self._eof() && self._peek() != ':' && self._peek() != '\n' do
+      result.push(self._peek())
+      self._advance(1)
+    end
+    result
+  end
+
+  def _read_until_any(self, stops: &[Char]) -> String
+    var result = String.new()
+    while !self._eof() do
+      let ch = self._peek()
+      var found = false
+      for s in stops do
+        if ch == s then found = true; break end
+      end
+      if found then break end
+      result.push(ch)
+      self._advance(1)
+    end
+    result
+  end
+end
+
+# ─── Scalar resolution (YAML 1.2 Core Schema) ───────────────────────
+
+def _resolve_scalar(s: String) -> Value
+  if s.len() == 0 || s == "null" || s == "Null" || s == "NULL" || s == "~" then
+    return Value.Null
+  end
+  if s == "true" || s == "True" || s == "TRUE" then return Value.Bool(true) end
+  if s == "false" || s == "False" || s == "FALSE" then return Value.Bool(false) end
+
+  ## Try integer
+  if s.starts_with("0x") || s.starts_with("0X") then
+    match Int.parse_hex(s.substring(2, s.len() as Int))
+    when Ok(i) then return Value.Int(i)
+    when Err(_) then {}
+    end
+  end
+  if s.starts_with("0o") || s.starts_with("0O") then
+    match Int.parse_octal(s.substring(2, s.len() as Int))
+    when Ok(i) then return Value.Int(i)
+    when Err(_) then {}
+    end
+  end
+  match Int.parse(s)
+  when Ok(i) then return Value.Int(i)
+  when Err(_) then {}
+  end
+
+  ## Try float
+  if s == ".inf" || s == ".Inf" || s == ".INF" then return Value.Float(1.0 / 0.0) end
+  if s == "-.inf" || s == "-.Inf" || s == "-.INF" then return Value.Float(-1.0 / 0.0) end
+  if s == ".nan" || s == ".NaN" || s == ".NAN" then return Value.Float(0.0 / 0.0) end
+  match Float.parse(s)
+  when Ok(f) then return Value.Float(f)
+  when Err(_) then {}
+  end
+
+  Value.String(s)
+end
+
+# ─── Emitter ─────────────────────────────────────────────────────────
+
+pub struct EmitConfig
+  indent: Int
+  flow_level: Int   ## depth at which to switch to flow style
+  sort_keys: Bool
+end
+
+impl EmitConfig
+  pub def default() -> EmitConfig
+    EmitConfig { indent: 2, flow_level: -1, sort_keys: false }
+  end
+end
+
+pub def emit(value: &Value) -> String
+  emit_with_config(value, EmitConfig.default())
+end
+
+pub def emit_with_config(value: &Value, config: EmitConfig) -> String
+  _emit_value(value, 0, config)
+end
+
+def _emit_value(value: &Value, depth: Int, config: EmitConfig) -> String
+  if config.flow_level >= 0 && depth >= config.flow_level then
+    return _emit_flow(value)
+  end
+
+  match value
+  when Value.Null then "null"
+  when Value.Bool(b) then if b then "true" else "false" end
+  when Value.Int(i) then i.to_string()
+  when Value.Float(f) then
+    if f != f then ".nan"
+    elsif f == 1.0 / 0.0 then ".inf"
+    elsif f == -1.0 / 0.0 then "-.inf"
+    else f.to_string()
+    end
+  when Value.String(ref s) then _emit_string(s)
+  when Value.Sequence(ref items) then
+    if items.len() == 0 then return "[]" end
+    var result = String.new()
+    let indent_str = " ".repeat(config.indent * (depth + 1))
+    for i in 0..items.len() do
+      if i > 0 then result = result + "\n" end
+      result = result + indent_str + "- "
+      let item_str = _emit_value(&items[i], depth + 1, config)
+      result = result + item_str
+    end
+    result
+  when Value.Mapping(ref entries) then
+    if entries.len() == 0 then return "{}" end
+    var result = String.new()
+    let indent_str = " ".repeat(config.indent * (depth + 1))
+    var sorted_entries = entries.clone()
+    if config.sort_keys then
+      sorted_entries.sort_by(|a, b| a.0.compare(&b.0))
+    end
+    for i in 0..sorted_entries.len() do
+      if i > 0 then result = result + "\n" end
+      let (key, val) = &sorted_entries[i]
+      result = result + indent_str + _emit_string(key) + ":"
+      match val
+      when Value.Mapping(_) | Value.Sequence(_) then
+        result = result + "\n" + _emit_value(val, depth + 1, config)
+      else
+        result = result + " " + _emit_value(val, depth + 1, config)
+      end
+    end
+    result
+  end
+end
+
+def _emit_flow(value: &Value) -> String
+  match value
+  when Value.Null then "null"
+  when Value.Bool(b) then if b then "true" else "false" end
+  when Value.Int(i) then i.to_string()
+  when Value.Float(f) then f.to_string()
+  when Value.String(ref s) then _emit_string(s)
+  when Value.Sequence(ref items) then
+    var parts = Vec[String].new()
+    for item in items do
+      parts.push(_emit_flow(item))
+    end
+    "[" + parts.join(", ") + "]"
+  when Value.Mapping(ref entries) then
+    var parts = Vec[String].new()
+    for (k, v) in entries do
+      parts.push(_emit_string(k) + ": " + _emit_flow(v))
+    end
+    "{" + parts.join(", ") + "}"
+  end
+end
+
+def _emit_string(s: &String) -> String
+  let needs_quote = s.len() == 0
+    || s.contains(':') || s.contains('#') || s.contains('[')
+    || s.contains(']') || s.contains('{') || s.contains('}')
+    || s.contains(',') || s.contains('&') || s.contains('*')
+    || s.contains('!') || s.contains('|') || s.contains('>')
+    || s.contains('\'') || s.contains('"') || s.contains('%')
+    || s.contains('@') || s.contains('`')
+    || s.starts_with("- ") || s.starts_with("? ")
+    || s == "true" || s == "false" || s == "null"
+    || s.contains('\n')
+
+  if !needs_quote then return s.clone() end
+
+  var result = "\""
+  for ch in s.chars() do
+    match ch
+    when '"' then result = result + "\\\""
+    when '\\' then result = result + "\\\\"
+    when '\n' then result = result + "\\n"
+    when '\t' then result = result + "\\t"
+    when '\r' then result = result + "\\r"
+    else result.push(ch)
+    end
+  end
+  result + "\""
+end
+
+# ─── Convenience functions ───────────────────────────────────────────
+
+pub def parse(input: &str) -> Result[Value, YamlError]
+  var parser = Parser.new(input.to_string())
+  parser.parse()
+end
+
+pub def parse_all(input: &str) -> Result[Vec[Value], YamlError]
+  var parser = Parser.new(input.to_string())
+  parser.parse_all()
+end
+
+pub def to_string(value: &Value) -> String = emit(value)
+
+end ## module std::yaml

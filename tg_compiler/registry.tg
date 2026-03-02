@@ -1,0 +1,311 @@
+## tg_compiler::registry — Package Registry Client
+## Support for public and private registries, mirrors, and caching.
+## Spec: §tooling.registry
+
+module tg_compiler::registry
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Array}
+use std::semver::{Version, Requirement}
+use std::http
+use std::crypto::{Sha256}
+use std::fs
+use tg_compiler::pkg_manager::{Package, PackageId, Registry, PkgError}
+
+# ─── Registry configuration ─────────────────────────────────────────
+
+pub struct RegistryConfig
+  pub url: String
+  pub auth_token: Option[String]
+  pub mirrors: Array[String]
+  pub timeout_ms: UInt
+  pub max_retries: UInt
+  pub cache_dir: String
+end
+
+impl RegistryConfig
+  pub def default() -> RegistryConfig
+    RegistryConfig {
+      url: "https://registry.tangerine-lang.org".to_string(),
+      auth_token: None,
+      mirrors: Array::new(),
+      timeout_ms: 30_000,
+      max_retries: 3,
+      cache_dir: _default_cache_dir(),
+    }
+  end
+
+  pub def private(url: &str, token: &str) -> RegistryConfig
+    RegistryConfig {
+      url: url.to_string(),
+      auth_token: Some(token.to_string()),
+      mirrors: Array::new(),
+      timeout_ms: 30_000,
+      max_retries: 3,
+      cache_dir: _default_cache_dir(),
+    }
+  end
+end
+
+# ─── HTTP registry client ───────────────────────────────────────────
+
+pub struct HttpRegistry
+  config: RegistryConfig
+  index_cache: Map[String, Array[RegistryEntry]]
+end
+
+struct RegistryEntry
+  name: String
+  version: Version
+  checksum: String
+  dependencies: Array[RegistryDep]
+  yanked: Bool
+end
+
+struct RegistryDep
+  name: String
+  requirement: String
+  features: Array[String]
+  optional: Bool
+end
+
+impl HttpRegistry
+  pub def new(config: RegistryConfig) -> HttpRegistry
+    HttpRegistry {
+      config: config,
+      index_cache: Map::new(),
+    }
+  end
+
+  pub def from_default() -> HttpRegistry
+    Self::new(RegistryConfig::default())
+  end
+
+  def fetch_index(&mut self, name: &str) -> Result[Array[RegistryEntry], PkgError]
+    ## Check cache first
+    if let Some(entries) = self.index_cache.get(&name.to_string()) then
+      return Ok(entries.clone())
+    end
+
+    ## Fetch from registry API
+    let url = self.config.url.clone() + "/api/v1/crates/" + name + "/versions"
+    let mut headers = Map::new()
+    if let Some(ref token) = self.config.auth_token then
+      headers.insert("Authorization".to_string(), "Bearer ".to_string() + token)
+    end
+
+    let response = _http_get_with_retry(&url, &headers, self.config.max_retries)?
+    let entries = _parse_index_response(&response)?
+    self.index_cache.insert(name.to_string(), entries.clone())
+    Ok(entries)
+  end
+
+  pub def publish(&self, archive: &[u8], metadata: &PublishMetadata) -> Result[Unit, PkgError]
+    let url = self.config.url.clone() + "/api/v1/crates/new"
+    let token = self.config.auth_token.as_ref()
+      .ok_or(PkgError::RegistryError("authentication required for publish".to_string()))?
+
+    let mut headers = Map::new()
+    headers.insert("Authorization".to_string(), "Bearer ".to_string() + token)
+    headers.insert("Content-Type".to_string(), "application/octet-stream".to_string())
+
+    _http_put(&url, &headers, archive)?
+    Ok(())
+  end
+
+  pub def yank(&self, name: &str, version: &Version) -> Result[Unit, PkgError]
+    let url = self.config.url.clone() + "/api/v1/crates/" + name + "/" + &version.to_string() + "/yank"
+    let token = self.config.auth_token.as_ref()
+      .ok_or(PkgError::RegistryError("authentication required for yank".to_string()))?
+
+    let mut headers = Map::new()
+    headers.insert("Authorization".to_string(), "Bearer ".to_string() + token)
+    _http_delete(&url, &headers)?
+    Ok(())
+  end
+
+  pub def search(&self, query: &str) -> Result[Array[SearchResult], PkgError]
+    let url = self.config.url.clone() + "/api/v1/crates?q=" + query
+    let response = _http_get_with_retry(&url, &Map::new(), self.config.max_retries)?
+    _parse_search_response(&response)
+  end
+end
+
+impl Registry for HttpRegistry
+  def fetch_versions(self: &Self, name: &str) -> Result[Array[Version], PkgError]
+    let entries = self.fetch_index(name)?
+    Ok(entries.iter()
+      .filter(|e| !e.yanked)
+      .map(|e| e.version.clone())
+      .collect())
+  end
+
+  def fetch_package(self: &Self, name: &str, version: &Version) -> Result[Package, PkgError]
+    let entries = self.fetch_index(name)?
+    let entry = entries.iter()
+      .find(|e| e.version == *version)
+      .ok_or(PkgError::NoMatchingVersion {
+        name: name.to_string(),
+        requirement: version.to_string(),
+      })?
+    _entry_to_package(&entry)
+  end
+
+  def download_archive(self: &Self, id: &PackageId) -> Result[Array[u8], PkgError]
+    let url = self.config.url.clone() + "/api/v1/crates/" + &id.name + "/" + &id.version.to_string() + "/download"
+    let mut headers = Map::new()
+    if let Some(ref token) = self.config.auth_token then
+      headers.insert("Authorization".to_string(), "Bearer ".to_string() + token)
+    end
+    _http_get_bytes(&url, &headers)
+  end
+end
+
+# ─── Local / filesystem registry ────────────────────────────────────
+
+pub struct LocalRegistry
+  root: String
+end
+
+impl LocalRegistry
+  pub def new(root: &str) -> LocalRegistry
+    LocalRegistry { root: root.to_string() }
+  end
+end
+
+impl Registry for LocalRegistry
+  def fetch_versions(self: &Self, name: &str) -> Result[Array[Version], PkgError]
+    let pkg_dir = self.root.clone() + "/" + name
+    if !fs::path_exists(pkg_dir.clone()) then
+      return Err(PkgError::NoMatchingVersion { name: name.to_string(), requirement: "*".to_string() })
+    end
+    match fs::read_dir(pkg_dir)
+    when Ok(entries) then
+      Ok(entries.iter()
+        .filter(|e| e.is_dir)
+        .filter_map(|e| Version::parse(&e.name).ok())
+        .collect())
+    when Err(e) then Err(PkgError::IoError(e.to_string()))
+    end
+  end
+
+  def fetch_package(self: &Self, name: &str, version: &Version) -> Result[Package, PkgError]
+    let manifest_path = self.root.clone() + "/" + name + "/" + &version.to_string() + "/Tangerine.toml"
+    let _content = fs::read_to_string(manifest_path)
+      .map_err(|e| PkgError::IoError(e.to_string()))?
+    ## Parse manifest (simplified)
+    Ok(Package {
+      id: PackageId { name: name.to_string(), version: version.clone() },
+      dependencies: Array::new(),
+      dev_dependencies: Array::new(),
+      features: Map::new(),
+      authors: Array::new(),
+      license: None,
+      repository: None,
+      description: None,
+      keywords: Array::new(),
+      edition: "2024".to_string(),
+      source_dir: "src".to_string(),
+      checksum: None,
+    })
+  end
+
+  def download_archive(self: &Self, id: &PackageId) -> Result[Array[u8], PkgError]
+    let archive = self.root.clone() + "/" + &id.name + "/" + &id.version.to_string() + "/package.tar.gz"
+    fs::read_to_string(archive)
+      .map(|s| s.into_bytes())
+      .map_err(|e| PkgError::IoError(e.to_string()))
+  end
+end
+
+# ─── Publish metadata ───────────────────────────────────────────────
+
+pub struct PublishMetadata
+  pub name: String
+  pub version: Version
+  pub description: String
+  pub license: String
+  pub keywords: Array[String]
+  pub readme: Option[String]
+end
+
+pub struct SearchResult
+  pub name: String
+  pub description: String
+  pub max_version: Version
+  pub downloads: UInt
+end
+
+# ─── Internal helpers ────────────────────────────────────────────────
+
+def _default_cache_dir() -> String
+  match std::env::home_dir()
+  when Some(h) then h + "/.tangerine/registry/cache"
+  when None then "/tmp/.tangerine/registry/cache"
+  end
+end
+
+def _http_get_with_retry(url: &str, headers: &Map[String, String], retries: UInt) -> Result[String, PkgError]
+  var last_err = PkgError::NetworkError("no attempts made".to_string())
+  for i in 0..retries do
+    match _http_get(url, headers)
+    when Ok(body) then return Ok(body)
+    when Err(e) then last_err = e
+    end
+  end
+  Err(last_err)
+end
+
+def _http_get(url: &str, headers: &Map[String, String]) -> Result[String, PkgError]
+  ## Stub — delegates to std::http
+  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+end
+
+def _http_get_bytes(url: &str, headers: &Map[String, String]) -> Result[Array[u8], PkgError]
+  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+end
+
+def _http_put(url: &str, headers: &Map[String, String], body: &[u8]) -> Result[Unit, PkgError]
+  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+end
+
+def _http_delete(url: &str, headers: &Map[String, String]) -> Result[Unit, PkgError]
+  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+end
+
+def _parse_index_response(body: &str) -> Result[Array[RegistryEntry], PkgError]
+  ## JSON parsing stub
+  Ok(Array::new())
+end
+
+def _parse_search_response(body: &str) -> Result[Array[SearchResult], PkgError]
+  Ok(Array::new())
+end
+
+def _entry_to_package(entry: &RegistryEntry) -> Result[Package, PkgError]
+  Ok(Package {
+    id: PackageId { name: entry.name.clone(), version: entry.version.clone() },
+    dependencies: entry.dependencies.iter().map(|d| {
+      Dependency {
+        name: d.name.clone(),
+        requirement: Requirement::parse(&d.requirement).unwrap(),
+        registry: None,
+        features: d.features.clone(),
+        optional: d.optional,
+        dev_only: false,
+      }
+    }).collect(),
+    dev_dependencies: Array::new(),
+    features: Map::new(),
+    authors: Array::new(),
+    license: None,
+    repository: None,
+    description: None,
+    keywords: Array::new(),
+    edition: "2024".to_string(),
+    source_dir: "src".to_string(),
+    checksum: Some(entry.checksum.clone()),
+  })
+end
+
+end ## module tg_compiler::registry

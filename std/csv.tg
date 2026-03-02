@@ -1,0 +1,431 @@
+## std::csv — CSV parsing and writing
+## RFC 4180 compliant CSV parser with streaming, quoting, and configurable delimiters.
+## Spec: §stdlib.csv
+
+module std::csv
+
+use std::core::{Option, Result, Display}
+use std::io::{Reader, Writer, BufferedReader, BufferedWriter}
+use std::collections::{Array, Map}
+
+# ─── Config ──────────────────────────────────────────────────────────
+
+pub struct CsvConfig
+  delimiter: Char
+  quote: Char
+  escape: Char
+  has_header: Bool
+  trim_fields: Bool
+  flexible: Bool       ## allow rows with different field counts
+  comment_char: Option[Char]
+end
+
+impl CsvConfig
+  pub def default() -> CsvConfig
+    CsvConfig {
+      delimiter: ',',
+      quote: '"',
+      escape: '"',
+      has_header: true,
+      trim_fields: false,
+      flexible: false,
+      comment_char: None,
+    }
+  end
+
+  pub def tsv() -> CsvConfig
+    var cfg = CsvConfig.default()
+    cfg.delimiter = '\t'
+    cfg
+  end
+
+  pub def with_delimiter(self, d: Char) -> CsvConfig
+    var cfg = self
+    cfg.delimiter = d
+    cfg
+  end
+
+  pub def with_quote(self, q: Char) -> CsvConfig
+    var cfg = self
+    cfg.quote = q
+    cfg
+  end
+
+  pub def without_header(self) -> CsvConfig
+    var cfg = self
+    cfg.has_header = false
+    cfg
+  end
+
+  pub def with_trim(self) -> CsvConfig
+    var cfg = self
+    cfg.trim_fields = true
+    cfg
+  end
+
+  pub def with_flexible(self) -> CsvConfig
+    var cfg = self
+    cfg.flexible = true
+    cfg
+  end
+
+  pub def with_comment(self, ch: Char) -> CsvConfig
+    var cfg = self
+    cfg.comment_char = Some(ch)
+    cfg
+  end
+end
+
+# ─── Error ───────────────────────────────────────────────────────────
+
+pub enum CsvError
+  ParseError(String, Int, Int)    ## message, line, column
+  FieldCountMismatch(Int, Int, Int) ## expected, got, line
+  IoError(String)
+  UnclosedQuote(Int)             ## line
+  InvalidUtf8(Int)               ## line
+end
+
+impl Display for CsvError
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    match self
+    when CsvError.ParseError(msg, line, col) then
+      f.write_str("CSV parse error at line " + line.to_string() + ", col " + col.to_string() + ": " + msg)
+    when CsvError.FieldCountMismatch(expected, got, line) then
+      f.write_str("CSV field count mismatch at line " + line.to_string() + ": expected " + expected.to_string() + ", got " + got.to_string())
+    when CsvError.IoError(msg) then
+      f.write_str("CSV I/O error: " + msg)
+    when CsvError.UnclosedQuote(line) then
+      f.write_str("CSV unclosed quote at line " + line.to_string())
+    when CsvError.InvalidUtf8(line) then
+      f.write_str("CSV invalid UTF-8 at line " + line.to_string())
+    end
+  end
+end
+
+# ─── Record ──────────────────────────────────────────────────────────
+
+pub struct Record
+  fields: Vec[String]
+end
+
+impl Record
+  pub def new() -> Record
+    Record { fields: Vec[String].new() }
+  end
+
+  pub def from_fields(fields: Vec[String]) -> Record
+    Record { fields: fields }
+  end
+
+  pub def get(self, index: Int) -> Option[&String]
+    if index >= 0 && (index as UInt) < self.fields.len() then
+      Some(&self.fields[index as UInt])
+    else
+      None
+    end
+  end
+
+  pub def len(self) -> Int = self.fields.len() as Int
+
+  pub def is_empty(self) -> Bool = self.fields.len() == 0
+
+  pub def push(&mut self, field: String) -> Unit
+    self.fields.push(field)
+  end
+
+  pub def iter(self) -> impl Iterator[Item = &String]
+    self.fields.iter()
+  end
+
+  pub def into_vec(self) -> Vec[String] = self.fields
+end
+
+# ─── Reader ──────────────────────────────────────────────────────────
+
+pub struct CsvReader
+  input: String
+  config: CsvConfig
+  pos: Int
+  line: Int
+  headers: Option[Record]
+  expected_fields: Option[Int]
+end
+
+impl CsvReader
+  pub def from_string(input: String) -> CsvReader
+    CsvReader.from_string_with_config(input, CsvConfig.default())
+  end
+
+  pub def from_string_with_config(input: String, config: CsvConfig) -> CsvReader
+    var reader = CsvReader {
+      input: input,
+      config: config,
+      pos: 0,
+      line: 1,
+      headers: None,
+      expected_fields: None,
+    }
+    if reader.config.has_header then
+      match reader._parse_record()
+      when Ok(Some(record)) then
+        reader.expected_fields = Some(record.len())
+        reader.headers = Some(record)
+      when _ then {}
+      end
+    end
+    reader
+  end
+
+  pub def headers(self) -> Option[&Record]
+    match self.headers
+    when Some(ref h) then Some(h)
+    when None then None
+    end
+  end
+
+  ## Read the next record, or None at EOF.
+  pub def next_record(&mut self) -> Result[Option[Record], CsvError]
+    loop
+      match self._parse_record()
+      when Ok(None) then return Ok(None)
+      when Ok(Some(record)) then
+        ## Check field count
+        if !self.config.flexible then
+          match self.expected_fields
+          when Some(expected) then
+            if record.len() != expected then
+              return Err(CsvError.FieldCountMismatch(expected, record.len(), self.line - 1))
+            end
+          when None then
+            self.expected_fields = Some(record.len())
+          end
+        end
+        return Ok(Some(record))
+      when Err(e) then return Err(e)
+      end
+    end
+  end
+
+  ## Read all records into a Vec.
+  pub def read_all(&mut self) -> Result[Vec[Record], CsvError]
+    var records = Vec[Record].new()
+    loop
+      match self.next_record()
+      when Ok(Some(record)) then records.push(record)
+      when Ok(None) then return Ok(records)
+      when Err(e) then return Err(e)
+      end
+    end
+  end
+
+  ## Read all records as maps (header-keyed). Requires has_header=true.
+  pub def read_all_as_maps(&mut self) -> Result[Vec[Map[String, String]], CsvError]
+    let hdrs = match self.headers
+    when Some(ref h) then h.clone()
+    when None then return Err(CsvError.ParseError("no headers available", 0, 0))
+    end
+
+    var result = Vec[Map[String, String]].new()
+    loop
+      match self.next_record()
+      when Ok(Some(record)) then
+        var row = Map[String, String].new()
+        for i in 0..hdrs.len() do
+          let key = hdrs.get(i).unwrap_or(&"".to_string()).clone()
+          let val = record.get(i).unwrap_or(&"".to_string()).clone()
+          row.insert(key, val)
+        end
+        result.push(row)
+      when Ok(None) then return Ok(result)
+      when Err(e) then return Err(e)
+      end
+    end
+  end
+
+  def _parse_record(&mut self) -> Result[Option[Record], CsvError]
+    if self.pos >= self.input.len() as Int then return Ok(None) end
+
+    ## Skip comment lines
+    match self.config.comment_char
+    when Some(comment) then
+      if self.input.char_at(self.pos as UInt) == comment then
+        self._skip_line()
+        return self._parse_record()
+      end
+    when None then {}
+    end
+
+    var record = Record.new()
+    var field = String.new()
+    var in_quotes = false
+    var field_start = true
+
+    while self.pos < self.input.len() as Int do
+      let ch = self.input.char_at(self.pos as UInt)
+      self.pos = self.pos + 1
+
+      if in_quotes then
+        if ch == self.config.quote then
+          if self.pos < self.input.len() as Int && self.input.char_at(self.pos as UInt) == self.config.escape then
+            ## Escaped quote
+            field.push(self.config.quote)
+            self.pos = self.pos + 1
+          else
+            in_quotes = false
+          end
+        else
+          field.push(ch)
+        end
+      else
+        if field_start && ch == self.config.quote then
+          in_quotes = true
+          field_start = false
+        elsif ch == self.config.delimiter then
+          let f = if self.config.trim_fields then field.trim() else field.clone() end
+          record.push(f)
+          field.clear()
+          field_start = true
+        elsif ch == '\n' then
+          self.line = self.line + 1
+          break
+        elsif ch == '\r' then
+          if self.pos < self.input.len() as Int && self.input.char_at(self.pos as UInt) == '\n' then
+            self.pos = self.pos + 1
+          end
+          self.line = self.line + 1
+          break
+        else
+          field.push(ch)
+          field_start = false
+        end
+      end
+    end
+
+    if in_quotes then
+      return Err(CsvError.UnclosedQuote(self.line))
+    end
+
+    let f = if self.config.trim_fields then field.trim() else field end
+    record.push(f)
+    Ok(Some(record))
+  end
+
+  def _skip_line(&mut self) -> Unit
+    while self.pos < self.input.len() as Int do
+      let ch = self.input.char_at(self.pos as UInt)
+      self.pos = self.pos + 1
+      if ch == '\n' then
+        self.line = self.line + 1
+        return
+      end
+      if ch == '\r' then
+        if self.pos < self.input.len() as Int && self.input.char_at(self.pos as UInt) == '\n' then
+          self.pos = self.pos + 1
+        end
+        self.line = self.line + 1
+        return
+      end
+    end
+  end
+end
+
+# ─── Writer ──────────────────────────────────────────────────────────
+
+pub struct CsvWriter
+  config: CsvConfig
+  output: String
+  records_written: Int
+end
+
+impl CsvWriter
+  pub def new() -> CsvWriter
+    CsvWriter.with_config(CsvConfig.default())
+  end
+
+  pub def with_config(config: CsvConfig) -> CsvWriter
+    CsvWriter {
+      config: config,
+      output: String.new(),
+      records_written: 0,
+    }
+  end
+
+  pub def write_header(&mut self, fields: &[String]) -> Unit
+    self._write_record(fields)
+  end
+
+  pub def write_record(&mut self, fields: &[String]) -> Unit
+    self._write_record(fields)
+  end
+
+  pub def write_field(&mut self, field: &str) -> Unit
+    if self.records_written > 0 || self.output.ends_with("\n") then {} end
+    let quoted = self._quote_field(field)
+    self.output = self.output + quoted
+  end
+
+  pub def end_record(&mut self) -> Unit
+    self.output = self.output + "\n"
+    self.records_written = self.records_written + 1
+  end
+
+  pub def into_string(self) -> String = self.output
+
+  def _write_record(&mut self, fields: &[String]) -> Unit
+    for i in 0..fields.len() do
+      if i > 0 then
+        self.output.push(self.config.delimiter)
+      end
+      let quoted = self._quote_field(&fields[i])
+      self.output = self.output + quoted
+    end
+    self.output = self.output + "\n"
+    self.records_written = self.records_written + 1
+  end
+
+  def _quote_field(self, field: &str) -> String
+    let needs_quote = field.contains(self.config.delimiter)
+      || field.contains(self.config.quote)
+      || field.contains('\n')
+      || field.contains('\r')
+
+    if !needs_quote then return field.to_string() end
+
+    var result = String.with_capacity(field.len() + 2)
+    result.push(self.config.quote)
+    for ch in field.chars() do
+      if ch == self.config.quote then
+        result.push(self.config.escape)
+        result.push(self.config.quote)
+      else
+        result.push(ch)
+      end
+    end
+    result.push(self.config.quote)
+    result
+  end
+end
+
+# ─── Convenience functions ───────────────────────────────────────────
+
+pub def parse(input: &str) -> Result[Vec[Record], CsvError]
+  var reader = CsvReader.from_string(input.to_string())
+  reader.read_all()
+end
+
+pub def parse_with_config(input: &str, config: CsvConfig) -> Result[Vec[Record], CsvError]
+  var reader = CsvReader.from_string_with_config(input.to_string(), config)
+  reader.read_all()
+end
+
+pub def to_string(headers: &[String], records: &[&[String]]) -> String
+  var writer = CsvWriter.new()
+  writer.write_header(headers)
+  for record in records do
+    writer.write_record(record)
+  end
+  writer.into_string()
+end
+
+end ## module std::csv

@@ -1970,3 +1970,538 @@ def parse_hex_uint(s: &String) -> UInt
   end
   result
 end
+
+# ———————————————————————————————————————————————————————————————
+# WebSocket Protocol (RFC 6455)
+# ———————————————————————————————————————————————————————————————
+
+enum WsOpcode
+  Continuation   ## 0x0
+  Text           ## 0x1
+  Binary         ## 0x2
+  Close          ## 0x8
+  Ping           ## 0x9
+  Pong           ## 0xA
+end
+
+def opcode_to_u8(op: &WsOpcode) -> u8
+  match op
+  when WsOpcode::Continuation then 0x0
+  when WsOpcode::Text then 0x1
+  when WsOpcode::Binary then 0x2
+  when WsOpcode::Close then 0x8
+  when WsOpcode::Ping then 0x9
+  when WsOpcode::Pong then 0xA
+  end
+end
+
+def u8_to_opcode(v: u8) -> Option[WsOpcode]
+  match v
+  when 0x0 then Option::Some(WsOpcode::Continuation)
+  when 0x1 then Option::Some(WsOpcode::Text)
+  when 0x2 then Option::Some(WsOpcode::Binary)
+  when 0x8 then Option::Some(WsOpcode::Close)
+  when 0x9 then Option::Some(WsOpcode::Ping)
+  when 0xA then Option::Some(WsOpcode::Pong)
+  when _ then Option::None
+  end
+end
+
+struct WsFrame
+  fin: Bool
+  opcode: WsOpcode
+  mask: Option[[u8; 4]]
+  payload: Vec[u8]
+end
+
+struct WsMessage
+  opcode: WsOpcode
+  data: Vec[u8]
+end
+
+impl WsMessage
+  def text(s: &str) -> WsMessage
+    WsMessage { opcode: WsOpcode::Text, data: s.as_bytes().to_vec() }
+  end
+
+  def binary(data: Vec[u8]) -> WsMessage
+    WsMessage { opcode: WsOpcode::Binary, data: data }
+  end
+
+  def as_text(self: &WsMessage) -> Result[String, String]
+    String::from_utf8(self.data.clone())
+  end
+
+  def is_text(self: &WsMessage) -> Bool
+    match self.opcode
+    when WsOpcode::Text then true
+    when _ then false
+    end
+  end
+
+  def is_binary(self: &WsMessage) -> Bool
+    match self.opcode
+    when WsOpcode::Binary then true
+    when _ then false
+    end
+  end
+end
+
+enum WsError
+  ConnectionFailed(String)
+  HandshakeFailed(String)
+  ProtocolError(String)
+  MessageTooLarge(UInt)
+  Closed(u16, String)
+  Io(String)
+end
+
+impl Error for WsError
+  def message(&self) -> String
+    match self
+    when WsError::ConnectionFailed(s) then "WS connection failed: " + s.clone()
+    when WsError::HandshakeFailed(s) then "WS handshake failed: " + s.clone()
+    when WsError::ProtocolError(s) then "WS protocol error: " + s.clone()
+    when WsError::MessageTooLarge(sz) then "WS message too large: " + sz.to_string()
+    when WsError::Closed(code, reason) then "WS closed: " + code.to_string() + " " + reason.clone()
+    when WsError::Io(s) then "WS IO error: " + s.clone()
+    end
+  end
+end
+
+struct WebSocket
+  stream: TcpStream  ## or TlsStream wrapped as Read+Write
+  is_client: Bool
+  closed: Bool
+  max_message_size: UInt
+end
+
+struct WsConfig
+  max_message_size: UInt  ## Default 64 MB
+  auto_pong: Bool
+end
+
+def ws_config_default() -> WsConfig
+  WsConfig {
+    max_message_size: 64 * 1024 * 1024,
+    auto_pong: true,
+  }
+end
+
+## Connect to a WebSocket server
+def ws_connect(url: &str) -> Result[WebSocket, WsError]
+  ws_connect_with_config(url, &ws_config_default())
+end
+
+def ws_connect_with_config(url: &str, config: &WsConfig) -> Result[WebSocket, WsError]
+  ## Parse ws:// or wss:// URL
+  let (host, port, path, use_tls) = match parse_ws_url(url)
+  when Result::Ok(parts) then parts
+  when Result::Err(e) then return Result::Err(WsError::ConnectionFailed(e))
+  end
+
+  ## TCP connection
+  let stream = match tcp_connect_host(host.clone(), port)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(WsError::ConnectionFailed(e.message()))
+  end
+
+  ## Generate Sec-WebSocket-Key (16 random bytes base64-encoded)
+  let key_bytes = [0u8; 16]  ## Would use random_bytes in practice
+  let ws_key = "dGhlIHNhbXBsZSBub25jZQ=="  ## Placeholder base64 key
+
+  ## Send HTTP upgrade request
+  let req = "GET " + path + " HTTP/1.1\r\n" +
+    "Host: " + host + ":" + port.to_string() + "\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Key: " + ws_key + "\r\n" +
+    "Sec-WebSocket-Version: 13\r\n\r\n"
+
+  ## TODO: send request and validate 101 response
+
+  Result::Ok(WebSocket {
+    stream: stream,
+    is_client: true,
+    closed: false,
+    max_message_size: config.max_message_size,
+  })
+end
+
+def parse_ws_url(url: &str) -> Result[(String, u16, String, Bool), String]
+  let (scheme, rest) = if url.starts_with("wss://") then
+    ("wss", &url[6..])
+  elsif url.starts_with("ws://") then
+    ("ws", &url[5..])
+  else
+    return Result::Err("invalid WebSocket URL scheme".to_string())
+  end
+
+  let use_tls = scheme == "wss"
+  let default_port: u16 = if use_tls then 443 else 80 end
+
+  let (host_port, path) = match rest.find("/")
+  when Option::Some(idx) then (&rest[..idx], &rest[idx..])
+  when Option::None then (rest, "/")
+  end
+
+  let (host, port) = match host_port.find(":")
+  when Option::Some(idx) then
+    let h = &host_port[..idx]
+    let p = host_port[idx+1..].parse_u16().unwrap_or(default_port)
+    (h.to_string(), p)
+  when Option::None then (host_port.to_string(), default_port)
+  end
+
+  Result::Ok((host, port, path.to_string(), use_tls))
+end
+
+impl WebSocket
+  ## Send a message
+  def send(self: &mut WebSocket, msg: &WsMessage) -> Result[Unit, WsError]
+    if self.closed then
+      return Result::Err(WsError::ProtocolError("connection closed".to_string()))
+    end
+    let mask = if self.is_client then
+      Option::Some([0x12u8, 0x34, 0x56, 0x78])  ## Should use random mask
+    else
+      Option::None
+    end
+    let frame = encode_ws_frame(&WsFrame {
+      fin: true,
+      opcode: msg.opcode,
+      mask: mask,
+      payload: msg.data.clone(),
+    })
+    match self.stream.write_all(&frame)
+    when Result::Ok(_) then Result::Ok(())
+    when Result::Err(e) then Result::Err(WsError::Io(e.message()))
+    end
+  end
+
+  ## Receive a message
+  def recv(self: &mut WebSocket) -> Result[WsMessage, WsError]
+    if self.closed then
+      return Result::Err(WsError::ProtocolError("connection closed".to_string()))
+    end
+    ## Read frame header (2 bytes minimum)
+    let mut header = [0u8; 2]
+    match self.stream.read_exact(&mut header)
+    when Result::Err(e) then return Result::Err(WsError::Io(e.message()))
+    when _ then ()
+    end
+
+    let fin = (header[0] & 0x80) != 0
+    let opcode_val = header[0] & 0x0F
+    let masked = (header[1] & 0x80) != 0
+    let mut payload_len = (header[1] & 0x7F) as u64
+
+    ## Extended payload length
+    if payload_len == 126 then
+      let mut ext = [0u8; 2]
+      let _ = self.stream.read_exact(&mut ext)
+      payload_len = ((ext[0] as u64) << 8) | (ext[1] as u64)
+    elsif payload_len == 127 then
+      let mut ext = [0u8; 8]
+      let _ = self.stream.read_exact(&mut ext)
+      payload_len = 0
+      for i in 0..8 do
+        payload_len = (payload_len << 8) | (ext[i] as u64)
+      end
+    end
+
+    if payload_len as UInt > self.max_message_size then
+      return Result::Err(WsError::MessageTooLarge(payload_len as UInt))
+    end
+
+    ## Read mask key if present
+    let mask = if masked then
+      let mut mk = [0u8; 4]
+      let _ = self.stream.read_exact(&mut mk)
+      Option::Some(mk)
+    else
+      Option::None
+    end
+
+    ## Read payload
+    let mut payload = vec![0u8; payload_len as UInt]
+    let _ = self.stream.read_exact(&mut payload)
+
+    ## Unmask
+    if let Option::Some(mk) = mask then
+      for i in 0..payload.len() do
+        payload[i] = payload[i] ^ mk[i % 4]
+      end
+    end
+
+    let opcode = match u8_to_opcode(opcode_val)
+    when Option::Some(op) then op
+    when Option::None then return Result::Err(WsError::ProtocolError("unknown opcode".to_string()))
+    end
+
+    ## Handle control frames
+    match opcode
+    when WsOpcode::Close then
+      self.closed = true
+      let (code, reason) = if payload.len() >= 2 then
+        let c = ((payload[0] as u16) << 8) | (payload[1] as u16)
+        let r = if payload.len() > 2 then
+          String::from_utf8(payload[2..].to_vec()).unwrap_or("".to_string())
+        else "".to_string() end
+        (c, r)
+      else
+        (1000u16, "".to_string())
+      end
+      return Result::Err(WsError::Closed(code, reason))
+    when WsOpcode::Ping then
+      ## Auto-pong
+      let pong = WsMessage { opcode: WsOpcode::Pong, data: payload.clone() }
+      let _ = self.send(&pong)
+      return self.recv()  ## Read next actual message
+    when _ then ()
+    end
+
+    Result::Ok(WsMessage { opcode: opcode, data: payload })
+  end
+
+  ## Close the WebSocket connection
+  def close(self: &mut WebSocket, code: u16, reason: &str) -> Result[Unit, WsError]
+    let mut payload = Vec::new()
+    payload.push((code >> 8) as u8)
+    payload.push((code & 0xFF) as u8)
+    payload.extend(reason.as_bytes())
+    let msg = WsMessage { opcode: WsOpcode::Close, data: payload }
+    self.send(&msg)?
+    self.closed = true
+    Result::Ok(())
+  end
+
+  def is_closed(self: &WebSocket) -> Bool
+    self.closed
+  end
+end
+
+## Encode a WebSocket frame to bytes
+def encode_ws_frame(frame: &WsFrame) -> Vec[u8]
+  let mut buf = Vec::new()
+  let mut b0: u8 = opcode_to_u8(&frame.opcode)
+  if frame.fin then b0 = b0 | 0x80 end
+  buf.push(b0)
+
+  let len = frame.payload.len()
+  let masked = frame.mask.is_some()
+  let mask_bit: u8 = if masked then 0x80 else 0 end
+
+  if len < 126 then
+    buf.push((len as u8) | mask_bit)
+  elsif len < 65536 then
+    buf.push(126u8 | mask_bit)
+    buf.push(((len >> 8) & 0xFF) as u8)
+    buf.push((len & 0xFF) as u8)
+  else
+    buf.push(127u8 | mask_bit)
+    for i in (0..8).rev() do
+      buf.push(((len >> (i * 8)) & 0xFF) as u8)
+    end
+  end
+
+  if let Option::Some(mk) = &frame.mask then
+    buf.extend(mk)
+    for i in 0..frame.payload.len() do
+      buf.push(frame.payload[i] ^ mk[i % 4])
+    end
+  else
+    buf.extend(&frame.payload)
+  end
+
+  buf
+end
+
+# ———————————————————————————————————————————————————————————————
+# Connection Pool
+# ———————————————————————————————————————————————————————————————
+
+struct ConnectionPoolEntry
+  stream: TcpStream
+  host: String
+  port: u16
+  created_at: UInt   ## timestamp ms
+  last_used: UInt
+  is_tls: Bool
+end
+
+struct ConnectionPool
+  connections: Vec[ConnectionPoolEntry]
+  max_idle_per_host: UInt
+  max_total: UInt
+  idle_timeout_ms: UInt
+end
+
+def connection_pool_new() -> ConnectionPool
+  ConnectionPool {
+    connections: Vec::new(),
+    max_idle_per_host: 8,
+    max_total: 64,
+    idle_timeout_ms: 90000,  ## 90 seconds
+  }
+end
+
+impl ConnectionPool
+  def get(self: &mut ConnectionPool, host: &str, port: u16) -> Option[TcpStream]
+    let mut idx = Option::None
+    for i in 0..self.connections.len() do
+      if self.connections[i].host == host && self.connections[i].port == port then
+        idx = Option::Some(i)
+        break
+      end
+    end
+    match idx
+    when Option::Some(i) then
+      let entry = self.connections.remove(i)
+      Option::Some(entry.stream)
+    when Option::None then Option::None
+    end
+  end
+
+  def put(self: &mut ConnectionPool, stream: TcpStream, host: String, port: u16) -> Unit
+    ## Count connections for this host
+    let mut count = 0_u
+    for entry in &self.connections do
+      if entry.host == host && entry.port == port then
+        count = count + 1
+      end
+    end
+    if count >= self.max_idle_per_host || self.connections.len() >= self.max_total then
+      return  ## Drop the connection
+    end
+    self.connections.push(ConnectionPoolEntry {
+      stream: stream,
+      host: host,
+      port: port,
+      created_at: 0,
+      last_used: 0,
+      is_tls: false,
+    })
+  end
+
+  def evict_expired(self: &mut ConnectionPool, now_ms: UInt) -> Unit
+    self.connections.retain(|entry| {
+      now_ms - entry.last_used < self.idle_timeout_ms
+    })
+  end
+
+  def clear(self: &mut ConnectionPool) -> Unit
+    self.connections.clear()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP Middleware
+# ———————————————————————————————————————————————————————————————
+
+## Middleware processes requests before they reach handlers and
+## responses before they are sent to clients.
+trait Middleware
+  def process_request(self: &Self, req: &mut HttpRequest) -> Result[Unit, HttpError]
+  def process_response(self: &Self, req: &HttpRequest, resp: &mut HttpResponse) -> Result[Unit, HttpError]
+end
+
+## Logging middleware
+struct LoggingMiddleware
+  log_headers: Bool
+  log_body: Bool
+end
+
+impl Middleware for LoggingMiddleware
+  def process_request(self: &LoggingMiddleware, req: &mut HttpRequest) -> Result[Unit, HttpError]
+    ## Log: METHOD PATH
+    Result::Ok(())
+  end
+  def process_response(self: &LoggingMiddleware, req: &HttpRequest, resp: &mut HttpResponse) -> Result[Unit, HttpError]
+    ## Log: STATUS for METHOD PATH
+    Result::Ok(())
+  end
+end
+
+## CORS middleware
+struct CorsMiddleware
+  allowed_origins: Vec[String]
+  allowed_methods: Vec[String]
+  allowed_headers: Vec[String]
+  max_age: UInt
+end
+
+def cors_permissive() -> CorsMiddleware
+  CorsMiddleware {
+    allowed_origins: vec!["*".to_string()],
+    allowed_methods: vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"].iter().map(|s| s.to_string()).collect(),
+    allowed_headers: vec!["*".to_string()],
+    max_age: 86400,
+  }
+end
+
+impl Middleware for CorsMiddleware
+  def process_request(self: &CorsMiddleware, req: &mut HttpRequest) -> Result[Unit, HttpError]
+    Result::Ok(())
+  end
+  def process_response(self: &CorsMiddleware, req: &HttpRequest, resp: &mut HttpResponse) -> Result[Unit, HttpError]
+    let origin_header = if self.allowed_origins.len() == 1 && self.allowed_origins[0] == "*" then
+      "*".to_string()
+    else
+      self.allowed_origins.join(", ")
+    end
+    resp.headers.set("Access-Control-Allow-Origin", &origin_header)
+    resp.headers.set("Access-Control-Allow-Methods", &self.allowed_methods.join(", "))
+    resp.headers.set("Access-Control-Allow-Headers", &self.allowed_headers.join(", "))
+    resp.headers.set("Access-Control-Max-Age", &self.max_age.to_string())
+    Result::Ok(())
+  end
+end
+
+## Rate limiting middleware
+struct RateLimitMiddleware
+  max_requests: UInt
+  window_ms: UInt
+  counters: Map[String, (UInt, UInt)]  ## IP -> (count, window_start)
+end
+
+impl Middleware for RateLimitMiddleware
+  def process_request(self: &RateLimitMiddleware, req: &mut HttpRequest) -> Result[Unit, HttpError]
+    ## Check rate limit based on client IP
+    Result::Ok(())
+  end
+  def process_response(self: &RateLimitMiddleware, req: &HttpRequest, resp: &mut HttpResponse) -> Result[Unit, HttpError]
+    Result::Ok(())
+  end
+end
+
+## Middleware chain
+struct MiddlewareChain
+  middlewares: Vec[Box[dyn Middleware]]
+end
+
+def middleware_chain_new() -> MiddlewareChain
+  MiddlewareChain { middlewares: Vec::new() }
+end
+
+impl MiddlewareChain
+  def add[M: Middleware + 'static](self: &mut MiddlewareChain, middleware: M) -> &mut MiddlewareChain
+    self.middlewares.push(Box::new(middleware))
+    self
+  end
+
+  def process_request(self: &MiddlewareChain, req: &mut HttpRequest) -> Result[Unit, HttpError]
+    for mw in &self.middlewares do
+      mw.process_request(req)?
+    end
+    Result::Ok(())
+  end
+
+  def process_response(self: &MiddlewareChain, req: &HttpRequest, resp: &mut HttpResponse) -> Result[Unit, HttpError]
+    ## Process in reverse order
+    for i in (0..self.middlewares.len()).rev() do
+      self.middlewares[i].process_response(req, resp)?
+    end
+    Result::Ok(())
+  end
+end

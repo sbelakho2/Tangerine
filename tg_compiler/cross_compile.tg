@@ -1,0 +1,426 @@
+## tg_compiler::cross_compile — Cross-compilation toolchain support
+## Target triple management, sysroot configuration, and toolchain resolution.
+## Spec: §tooling.cross
+
+module tg_compiler::cross_compile
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Array}
+use std::fs
+use std::process
+
+# ─── Target triple ───────────────────────────────────────────────────
+
+pub struct TargetTriple
+  pub arch: Arch
+  pub vendor: Vendor
+  pub os: Os
+  pub env: Option[Env]
+end
+
+pub enum Arch
+  X86_64
+  Aarch64
+  Arm
+  Riscv64
+  Wasm32
+  Wasm64
+  S390x
+  PowerPC64
+end
+
+pub enum Vendor
+  Unknown
+  Apple
+  Pc
+  Fortanix
+  Wasi
+end
+
+pub enum Os
+  Linux
+  MacOS
+  Windows
+  FreeBSD
+  Wasi
+  None_  ## Bare-metal
+  Emscripten
+end
+
+pub enum Env
+  Gnu
+  Musl
+  Msvc
+  Sgx
+  Android
+end
+
+impl TargetTriple
+  pub def parse(triple: &str) -> Result[TargetTriple, CrossError]
+    let parts = triple.split("-")
+    if parts.len() < 2 then
+      return Err(CrossError::InvalidTriple(triple.to_string()))
+    end
+
+    let arch = match parts[0]
+    when "x86_64" then Arch::X86_64
+    when "aarch64" | "arm64" then Arch::Aarch64
+    when "arm" | "armv7" then Arch::Arm
+    when "riscv64" then Arch::Riscv64
+    when "wasm32" then Arch::Wasm32
+    when "wasm64" then Arch::Wasm64
+    when "s390x" then Arch::S390x
+    when "powerpc64" | "ppc64" then Arch::PowerPC64
+    else return Err(CrossError::UnsupportedArch(parts[0].to_string()))
+    end
+
+    let vendor = if parts.len() >= 3 then
+      match parts[1]
+      when "apple" then Vendor::Apple
+      when "pc" then Vendor::Pc
+      when "unknown" then Vendor::Unknown
+      when "fortanix" then Vendor::Fortanix
+      when "wasi" then Vendor::Wasi
+      else Vendor::Unknown
+      end
+    else
+      Vendor::Unknown
+    end
+
+    let os_str = if parts.len() >= 3 then parts[2] else parts[1] end
+    let os = match os_str
+    when "linux" then Os::Linux
+    when "darwin" | "macos" then Os::MacOS
+    when "windows" | "win32" then Os::Windows
+    when "freebsd" then Os::FreeBSD
+    when "wasi" then Os::Wasi
+    when "none" then Os::None_
+    when "emscripten" then Os::Emscripten
+    else return Err(CrossError::UnsupportedOs(os_str.to_string()))
+    end
+
+    let env = if parts.len() >= 4 then
+      Some(match parts[3]
+      when "gnu" then Env::Gnu
+      when "musl" then Env::Musl
+      when "msvc" then Env::Msvc
+      when "sgx" then Env::Sgx
+      when "android" | "androideabi" then Env::Android
+      else return Err(CrossError::UnsupportedEnv(parts[3].to_string()))
+      end)
+    else
+      None
+    end
+
+    Ok(TargetTriple { arch: arch, vendor: vendor, os: os, env: env })
+  end
+
+  pub def host() -> TargetTriple
+    ## Detect the host triple at compile time
+    @cfg(all(target_arch = "x86_64", target_os = "macos"))
+    return TargetTriple { arch: Arch::X86_64, vendor: Vendor::Apple, os: Os::MacOS, env: None }
+
+    @cfg(all(target_arch = "aarch64", target_os = "macos"))
+    return TargetTriple { arch: Arch::Aarch64, vendor: Vendor::Apple, os: Os::MacOS, env: None }
+
+    @cfg(all(target_arch = "x86_64", target_os = "linux"))
+    return TargetTriple { arch: Arch::X86_64, vendor: Vendor::Unknown, os: Os::Linux, env: Some(Env::Gnu) }
+
+    @cfg(all(target_arch = "aarch64", target_os = "linux"))
+    return TargetTriple { arch: Arch::Aarch64, vendor: Vendor::Unknown, os: Os::Linux, env: Some(Env::Gnu) }
+  end
+
+  pub def is_wasm(self: &Self) -> Bool
+    match &self.arch
+    when Wasm32 | Wasm64 then true
+    else false
+    end
+  end
+
+  pub def is_bare_metal(self: &Self) -> Bool
+    match &self.os
+    when None_ then true
+    else false
+    end
+  end
+
+  pub def pointer_width(self: &Self) -> UInt
+    match &self.arch
+    when X86_64 | Aarch64 | Riscv64 | Wasm64 | S390x | PowerPC64 then 64
+    when Arm | Wasm32 then 32
+    end
+  end
+end
+
+impl Display for TargetTriple
+  def fmt(self: &Self) -> String
+    var s = _arch_str(&self.arch)
+    s = s + "-" + _vendor_str(&self.vendor)
+    s = s + "-" + _os_str(&self.os)
+    if let Some(ref env) = self.env then
+      s = s + "-" + _env_str(env)
+    end
+    s
+  end
+end
+
+# ─── Toolchain ───────────────────────────────────────────────────────
+
+pub struct Toolchain
+  pub target: TargetTriple
+  pub cc: String           ## C compiler path
+  pub ar: String           ## Archiver path
+  pub linker: String       ## Linker path
+  pub sysroot: Option[String]
+  pub cflags: Array[String]
+  pub ldflags: Array[String]
+end
+
+impl Toolchain
+  pub def for_target(target: &TargetTriple) -> Result[Toolchain, CrossError]
+    ## Try to find appropriate cross-compilation tools
+    let prefix = _toolchain_prefix(target)
+
+    let cc = _find_tool(&prefix, "cc", &["gcc", "clang"])?
+    let ar = _find_tool(&prefix, "ar", &["ar"])?
+    let linker = _find_tool(&prefix, "ld", &["ld", "lld"])?
+
+    let sysroot = _find_sysroot(target)?
+
+    Ok(Toolchain {
+      target: target.clone(),
+      cc: cc,
+      ar: ar,
+      linker: linker,
+      sysroot: sysroot,
+      cflags: _default_cflags(target),
+      ldflags: _default_ldflags(target),
+    })
+  end
+
+  pub def native() -> Toolchain
+    Toolchain {
+      target: TargetTriple::host(),
+      cc: "cc".to_string(),
+      ar: "ar".to_string(),
+      linker: "cc".to_string(),
+      sysroot: None,
+      cflags: Array::new(),
+      ldflags: Array::new(),
+    }
+  end
+
+  pub def with_sysroot(&mut self, sysroot: &str) -> &mut Self
+    self.sysroot = Some(sysroot.to_string())
+    self
+  end
+
+  pub def with_cc(&mut self, cc: &str) -> &mut Self
+    self.cc = cc.to_string()
+    self
+  end
+
+  pub def with_linker(&mut self, linker: &str) -> &mut Self
+    self.linker = linker.to_string()
+    self
+  end
+end
+
+# ─── Cross-compilation driver ───────────────────────────────────────
+
+pub struct CrossCompileConfig
+  pub target: TargetTriple
+  pub toolchain: Toolchain
+  pub optimization: OptLevel
+  pub debug_info: Bool
+  pub strip: Bool
+  pub lto: LtoMode
+end
+
+pub enum OptLevel
+  O0
+  O1
+  O2
+  O3
+  Os   ## Optimize for size
+  Oz   ## Aggressively optimize for size
+end
+
+pub enum LtoMode
+  None_
+  Thin
+  Full
+end
+
+impl CrossCompileConfig
+  pub def new(target: &str) -> Result[CrossCompileConfig, CrossError]
+    let triple = TargetTriple::parse(target)?
+    let toolchain = Toolchain::for_target(&triple)?
+    Ok(CrossCompileConfig {
+      target: triple,
+      toolchain: toolchain,
+      optimization: OptLevel::O2,
+      debug_info: false,
+      strip: true,
+      lto: LtoMode::Thin,
+    })
+  end
+end
+
+# ─── Supported targets listing ───────────────────────────────────────
+
+pub def supported_targets() -> Array[String]
+  vec![
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "wasm32-wasi",
+    "wasm32-unknown-unknown",
+    "wasm64-unknown-unknown",
+    "riscv64-unknown-linux-gnu",
+    "aarch64-unknown-none",  ## bare-metal
+    "x86_64-unknown-none",
+  ]
+end
+
+pub def is_supported(triple: &str) -> Bool
+  supported_targets().iter().any(|t| t == triple)
+end
+
+# ─── Errors ──────────────────────────────────────────────────────────
+
+pub enum CrossError
+  InvalidTriple(String)
+  UnsupportedArch(String)
+  UnsupportedOs(String)
+  UnsupportedEnv(String)
+  ToolchainNotFound(String)
+  SysrootNotFound(String)
+  LinkError(String)
+end
+
+impl Display for CrossError
+  def fmt(self: &Self) -> String
+    match self
+    when InvalidTriple(t) then "invalid target triple: " + t
+    when UnsupportedArch(a) then "unsupported architecture: " + a
+    when UnsupportedOs(o) then "unsupported OS: " + o
+    when UnsupportedEnv(e) then "unsupported environment: " + e
+    when ToolchainNotFound(t) then "toolchain not found: " + t
+    when SysrootNotFound(s) then "sysroot not found: " + s
+    when LinkError(msg) then "link error: " + msg
+    end
+  end
+end
+
+# ─── Internal helpers ────────────────────────────────────────────────
+
+def _arch_str(a: &Arch) -> String
+  match a
+  when X86_64 then "x86_64"
+  when Aarch64 then "aarch64"
+  when Arm then "arm"
+  when Riscv64 then "riscv64"
+  when Wasm32 then "wasm32"
+  when Wasm64 then "wasm64"
+  when S390x then "s390x"
+  when PowerPC64 then "powerpc64"
+  end
+end
+
+def _vendor_str(v: &Vendor) -> String
+  match v
+  when Unknown then "unknown"
+  when Apple then "apple"
+  when Pc then "pc"
+  when Fortanix then "fortanix"
+  when Wasi then "wasi"
+  end
+end
+
+def _os_str(o: &Os) -> String
+  match o
+  when Linux then "linux"
+  when MacOS then "darwin"
+  when Windows then "windows"
+  when FreeBSD then "freebsd"
+  when Wasi then "wasi"
+  when None_ then "none"
+  when Emscripten then "emscripten"
+  end
+end
+
+def _env_str(e: &Env) -> String
+  match e
+  when Gnu then "gnu"
+  when Musl then "musl"
+  when Msvc then "msvc"
+  when Sgx then "sgx"
+  when Android then "android"
+  end
+end
+
+def _toolchain_prefix(target: &TargetTriple) -> String
+  target.to_string() + "-"
+end
+
+def _find_tool(prefix: &str, name: &str, fallbacks: &[&str]) -> Result[String, CrossError]
+  ## Try prefixed tool first, then fallbacks
+  let prefixed = prefix.to_string() + name
+  match process::which(&prefixed)
+  when Some(path) then return Ok(path)
+  when None then ()
+  end
+  for fb in fallbacks.iter() do
+    let prefixed_fb = prefix.to_string() + fb
+    match process::which(&prefixed_fb)
+    when Some(path) then return Ok(path)
+    when None then ()
+    end
+  end
+  Err(CrossError::ToolchainNotFound(name.to_string()))
+end
+
+def _find_sysroot(target: &TargetTriple) -> Result[Option[String], CrossError]
+  ## Check common sysroot locations
+  let search_paths = vec![
+    "/usr/" + &target.to_string(),
+    "/usr/local/" + &target.to_string(),
+    std::env::home_dir().unwrap_or("".to_string()) + "/.tangerine/sysroots/" + &target.to_string(),
+  ]
+  for path in search_paths.iter() do
+    if fs::path_exists(path.clone()) then
+      return Ok(Some(path.clone()))
+    end
+  end
+  Ok(None)
+end
+
+def _default_cflags(target: &TargetTriple) -> Array[String]
+  var flags = Array::new()
+  match &target.arch
+  when Wasm32 | Wasm64 then
+    flags.push("--target=wasm32".to_string())
+    flags.push("-nostdlib".to_string())
+  when Arm then
+    flags.push("-mfloat-abi=hard".to_string())
+  else ()
+  end
+  flags
+end
+
+def _default_ldflags(target: &TargetTriple) -> Array[String]
+  var flags = Array::new()
+  if target.is_bare_metal() then
+    flags.push("-nostdlib".to_string())
+    flags.push("-static".to_string())
+  end
+  flags
+end
+
+end ## module tg_compiler::cross_compile

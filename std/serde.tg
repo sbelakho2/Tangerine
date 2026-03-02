@@ -628,3 +628,322 @@ impl Deserializer for ValueDeserializer
     T::deserialize(self)
   end
 end
+
+# ———————————————————————————————————————————————————————————————
+# Schema Evolution / Versioned Serialization
+# ———————————————————————————————————————————————————————————————
+
+## Supports forward/backward compatible schema changes:
+## - Adding optional fields (defaults when missing)
+## - Removing fields (ignored during deserialization)
+## - Renaming fields (aliasing)
+
+trait VersionedSerialize: Serialize
+  ## Return the schema version for this type
+  def schema_version() -> UInt
+
+  ## Serialize with version header
+  def serialize_versioned(self: &Self, s: &mut Serializer) -> Result[Unit, SerError]
+    s.serialize_struct_begin("__versioned", 2)?
+    s.serialize_field("__v", &Self::schema_version())?
+    s.serialize_field("data", self)?
+    s.serialize_struct_end()
+  end
+end
+
+trait VersionedDeserialize: Deserialize
+  ## Deserialize with version migration
+  def deserialize_versioned(d: &mut Deserializer) -> Result[Self, SerError]
+
+  ## Migrate data from an older version to the current version
+  def migrate(version: UInt, data: &Value) -> Result[Value, SerError]
+end
+
+## Default field value annotation support
+struct FieldDefault[T]
+  field_name: String
+  default_value: T
+end
+
+## Schema descriptor for a type
+struct Schema
+  name: String
+  version: UInt
+  fields: Vec[SchemaField]
+end
+
+struct SchemaField
+  name: String
+  field_type: SchemaType
+  required: Bool
+  default_value: Option[Value]
+  aliases: Vec[String]     ## Previous names for this field
+  added_in_version: UInt
+  removed_in_version: Option[UInt]
+end
+
+enum SchemaType
+  Bool_
+  Int_
+  Float_
+  String_
+  Bytes_
+  Array_(Box[SchemaType])
+  Map_(Box[SchemaType], Box[SchemaType])
+  Optional(Box[SchemaType])
+  Struct_(String)  ## Reference by name
+  Enum_(String)
+end
+
+impl Schema
+  def new(name: &str, version: UInt) -> Schema
+    Schema { name: name.to_string(), version: version, fields: Vec::new() }
+  end
+
+  def field(self: &mut Schema, name: &str, field_type: SchemaType, required: Bool) -> &mut Schema
+    self.fields.push(SchemaField {
+      name: name.to_string(),
+      field_type: field_type,
+      required: required,
+      default_value: Option::None,
+      aliases: Vec::new(),
+      added_in_version: 1,
+      removed_in_version: Option::None,
+    })
+    self
+  end
+
+  def field_with_default(self: &mut Schema, name: &str, field_type: SchemaType, default: Value) -> &mut Schema
+    self.fields.push(SchemaField {
+      name: name.to_string(),
+      field_type: field_type,
+      required: false,
+      default_value: Option::Some(default),
+      aliases: Vec::new(),
+      added_in_version: 1,
+      removed_in_version: Option::None,
+    })
+    self
+  end
+
+  ## Validate a Value against this schema
+  def validate(self: &Schema, value: &Value) -> Result[Unit, Vec[String]]
+    let mut errors = Vec::new()
+    match value
+    when Value::Object(obj) then
+      for field in &self.fields do
+        if field.required then
+          let found = obj.contains_key(&field.name) ||
+            field.aliases.iter().any(|a| obj.contains_key(a))
+          if !found then
+            errors.push("missing required field: ".to_string() + field.name.clone())
+          end
+        end
+      end
+    when _ then
+      errors.push("expected object, got other type".to_string())
+    end
+    if errors.is_empty() then Result::Ok(()) else Result::Err(errors) end
+  end
+
+  ## Apply defaults to missing optional fields
+  def apply_defaults(self: &Schema, value: &mut Value) -> Unit
+    if let Value::Object(obj) = value then
+      for field in &self.fields do
+        if !obj.contains_key(&field.name) then
+          if let Option::Some(default) = &field.default_value then
+            obj.insert(field.name.clone(), default.clone())
+          end
+        end
+        ## Resolve aliases
+        for alias in &field.aliases do
+          if let Option::Some(v) = obj.remove(alias) then
+            if !obj.contains_key(&field.name) then
+              obj.insert(field.name.clone(), v)
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Format Registry — Pluggable Serialization Formats
+# ———————————————————————————————————————————————————————————————
+
+## A format that can serialize/deserialize Values
+trait Format
+  def name(self: &Self) -> &str
+  def serialize(self: &Self, value: &Value) -> Result[Vec[u8], SerError]
+  def deserialize(self: &Self, data: &[u8]) -> Result[Value, SerError]
+  def content_type(self: &Self) -> &str
+end
+
+## Registry of available formats
+struct FormatRegistry
+  formats: Map[String, Box[dyn Format]]
+end
+
+def format_registry_new() -> FormatRegistry
+  FormatRegistry { formats: Map::new() }
+end
+
+impl FormatRegistry
+  def register[F: Format + 'static](self: &mut FormatRegistry, format: F) -> Unit
+    self.formats.insert(format.name().to_string(), Box::new(format))
+  end
+
+  def get(self: &FormatRegistry, name: &str) -> Option[&dyn Format]
+    self.formats.get(&name.to_string()).map(|f| f.as_ref())
+  end
+
+  def serialize(self: &FormatRegistry, format_name: &str, value: &Value) -> Result[Vec[u8], SerError]
+    match self.get(format_name)
+    when Option::Some(fmt) then fmt.serialize(value)
+    when Option::None then Result::Err(SerError::Custom("unknown format: ".to_string() + format_name.to_string()))
+    end
+  end
+
+  def deserialize(self: &FormatRegistry, format_name: &str, data: &[u8]) -> Result[Value, SerError]
+    match self.get(format_name)
+    when Option::Some(fmt) then fmt.deserialize(data)
+    when Option::None then Result::Err(SerError::Custom("unknown format: ".to_string() + format_name.to_string()))
+    end
+  end
+
+  def available_formats(self: &FormatRegistry) -> Vec[String]
+    self.formats.keys().cloned().collect()
+  end
+end
+
+## Built-in JSON format hook
+struct JsonFormat {}
+
+impl Format for JsonFormat
+  def name(self: &JsonFormat) -> &str = "json"
+  def content_type(self: &JsonFormat) -> &str = "application/json"
+
+  def serialize(self: &JsonFormat, value: &Value) -> Result[Vec[u8], SerError]
+    let s = value_to_json_string(value)
+    Result::Ok(s.as_bytes().to_vec())
+  end
+
+  def deserialize(self: &JsonFormat, data: &[u8]) -> Result[Value, SerError]
+    let s = match String::from_utf8(data.to_vec())
+    when Result::Ok(s) then s
+    when Result::Err(_) then return Result::Err(SerError::InvalidValue("invalid UTF-8".to_string()))
+    end
+    json_string_to_value(&s)
+  end
+end
+
+## Built-in TOML format hook
+struct TomlFormat {}
+
+impl Format for TomlFormat
+  def name(self: &TomlFormat) -> &str = "toml"
+  def content_type(self: &TomlFormat) -> &str = "application/toml"
+
+  def serialize(self: &TomlFormat, value: &Value) -> Result[Vec[u8], SerError]
+    let s = value_to_toml_string(value)
+    Result::Ok(s.as_bytes().to_vec())
+  end
+
+  def deserialize(self: &TomlFormat, data: &[u8]) -> Result[Value, SerError]
+    let s = match String::from_utf8(data.to_vec())
+    when Result::Ok(s) then s
+    when Result::Err(_) then return Result::Err(SerError::InvalidValue("invalid UTF-8".to_string()))
+    end
+    toml_string_to_value(&s)
+  end
+end
+
+## Helper: create a default registry with all built-in formats
+def default_format_registry() -> FormatRegistry
+  let mut reg = format_registry_new()
+  reg.register(JsonFormat {})
+  reg.register(TomlFormat {})
+  reg
+end
+
+## Convenience functions for simple Value <-> JSON string conversion
+def value_to_json_string(value: &Value) -> String
+  match value
+  when Value::Null then "null".to_string()
+  when Value::Bool(b) then if *b then "true" else "false" end.to_string()
+  when Value::Int(i) then i.to_string()
+  when Value::Float(f) then f.to_string()
+  when Value::String(s) then "\"" + s.replace("\"", "\\\"") + "\""
+  when Value::Array(arr) then
+    let parts: Vec[String] = arr.iter().map(|v| value_to_json_string(v)).collect()
+    "[" + parts.join(",") + "]"
+  when Value::Object(obj) then
+    let parts: Vec[String] = obj.iter().map(|(k, v)| {
+      "\"" + k.replace("\"", "\\\"") + "\":" + value_to_json_string(v)
+    }).collect()
+    "{" + parts.join(",") + "}"
+  end
+end
+
+def json_string_to_value(s: &str) -> Result[Value, SerError]
+  ## Delegates to std::json parser
+  Result::Err(SerError::Custom("use std::json for parsing".to_string()))
+end
+
+def value_to_toml_string(value: &Value) -> String
+  ## Simplified TOML serialization
+  match value
+  when Value::Object(obj) then
+    let mut parts = Vec::new()
+    for (k, v) in obj do
+      parts.push(k.clone() + " = " + value_to_toml_value(v))
+    end
+    parts.join("\n")
+  when _ then "".to_string()
+  end
+end
+
+def value_to_toml_value(value: &Value) -> String
+  match value
+  when Value::String(s) then "\"" + s.replace("\"", "\\\"") + "\""
+  when Value::Int(i) then i.to_string()
+  when Value::Float(f) then f.to_string()
+  when Value::Bool(b) then if *b then "true" else "false" end.to_string()
+  when _ then "\"\"".to_string()
+  end
+end
+
+def toml_string_to_value(s: &str) -> Result[Value, SerError]
+  ## Delegates to std::toml parser
+  Result::Err(SerError::Custom("use std::toml for parsing".to_string()))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Derive Helpers
+# ———————————————————————————————————————————————————————————————
+
+## Attributes that can be applied to fields for serde derive macros:
+##   #[serde(rename = "...")]        — rename field in serialized form
+##   #[serde(default)]               — use Default::default() if missing
+##   #[serde(default = "func")]      — use func() if missing
+##   #[serde(skip)]                  — skip serialization/deserialization
+##   #[serde(skip_serializing)]      — skip during serialization only
+##   #[serde(skip_deserializing)]    — skip during deserialization only
+##   #[serde(flatten)]               — flatten nested struct
+##   #[serde(alias = "...")]         — accept alternative name on deserialize
+##   #[serde(with = "module")]       — use custom ser/de functions
+##   #[serde(deny_unknown_fields)]   — error on unexpected fields
+
+enum SerdeAttribute
+  Rename(String)
+  Default_
+  DefaultWith(String)
+  Skip
+  SkipSerializer
+  SkipDeserializer
+  Flatten
+  Alias(String)
+  With(String)
+  DenyUnknownFields
+end

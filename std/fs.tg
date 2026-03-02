@@ -442,3 +442,340 @@ def path_to_cstr(s: String) -> Vec[u8]
   v.push(0)
   v
 end
+
+# ——————————————————————————————————————————————————————————————
+# Extended filesystem operations
+# ——————————————————————————————————————————————————————————————
+
+extern "C" do
+  def symlink(target: Ptr[u8], linkpath: Ptr[u8]) -> Int
+  def readlink(path: Ptr[u8], buf: Ptr[u8], bufsiz: Int) -> Int
+  def chmod(path: Ptr[u8], mode: Int) -> Int
+  def chown(path: Ptr[u8], uid: Int, gid: Int) -> Int
+  def mkdtemp(template: Ptr[u8]) -> Ptr[u8]
+  def mkstemp(template: Ptr[u8]) -> Int
+  def fstat(fd: Int, buf: Ptr[u8]) -> Int
+  def opendir(name: Ptr[u8]) -> Ptr[u8]
+  def readdir(dirp: Ptr[u8]) -> Ptr[u8]
+  def closedir(dirp: Ptr[u8]) -> Int
+  def link(existing: Ptr[u8], new_link: Ptr[u8]) -> Int
+  def realpath(path: Ptr[u8], resolved: Ptr[u8]) -> Ptr[u8]
+end
+
+# ——————————————————————————————————————————————————————————————
+# File metadata
+# ——————————————————————————————————————————————————————————————
+
+struct FileMetadata
+  size: Int
+  mode: Int
+  is_file: Bool
+  is_dir: Bool
+  is_symlink: Bool
+  modified_secs: Int
+  accessed_secs: Int
+  created_secs: Int
+end
+
+def metadata(path: String) -> Result[FileMetadata, IOError]
+  let cs = path_to_cstr(path)
+  #[cfg(target_os = "macos")]
+  let stat_size = 144
+  #[cfg(target_os = "linux")]
+  let stat_size = 128
+  mut buf = Vec::with_capacity(stat_size)
+  mut i = 0
+  while i < stat_size do buf.push(0); i = i + 1 end
+  let rc = stat(cs.as_ptr(), buf.as_ptr())
+  if rc != 0 then
+    return Result::Err(IOError::NotFound("Cannot stat: " + path))
+  end
+  let offset = ST_MODE_OFFSET()
+  let mode_lo = buf[offset] as Int | ((buf[offset + 1] as Int) << 8)
+  let is_f = (mode_lo & 0xF000) == 0x8000
+  let is_d = (mode_lo & 0xF000) == 0x4000
+  let is_l = (mode_lo & 0xF000) == 0xA000
+
+  ## Size is at different offsets per platform
+  #[cfg(target_os = "linux")]
+  let size_offset = 48
+  #[cfg(target_os = "macos")]
+  let size_offset = 96
+
+  let mut file_size = 0
+  let mut j = 0
+  while j < 8 do
+    file_size = file_size | ((buf[size_offset + j] as Int) << (j * 8))
+    j = j + 1
+  end
+
+  Result::Ok(FileMetadata {
+    size: file_size,
+    mode: mode_lo,
+    is_file: is_f,
+    is_dir: is_d,
+    is_symlink: is_l,
+    modified_secs: 0,
+    accessed_secs: 0,
+    created_secs: 0,
+  })
+end
+
+# ——————————————————————————————————————————————————————————————
+# Symlink operations
+# ——————————————————————————————————————————————————————————————
+
+def create_symlink(target: String, link_path: String) -> Result[Unit, IOError]
+  let cs_target = path_to_cstr(target)
+  let cs_link = path_to_cstr(link_path)
+  let rc = symlink(cs_target.as_ptr(), cs_link.as_ptr())
+  if rc < 0 then
+    Result::Err(IOError::Other("Cannot create symlink: " + link_path + " -> " + target))
+  else
+    Result::Ok(())
+  end
+end
+
+def read_link(path: String) -> Result[String, IOError]
+  let cs = path_to_cstr(path)
+  let buf_size = 4096
+  mut buf = Vec::with_capacity(buf_size)
+  mut i = 0
+  while i < buf_size do buf.push(0); i = i + 1 end
+  let n = readlink(cs.as_ptr(), buf.as_ptr(), buf_size)
+  if n < 0 then
+    Result::Err(IOError::NotFound("Cannot read symlink: " + path))
+  else
+    Result::Ok(String::from_bytes(buf.slice(0, n as Int)))
+  end
+end
+
+def create_hard_link(existing: String, new_link: String) -> Result[Unit, IOError]
+  let cs_existing = path_to_cstr(existing)
+  let cs_new = path_to_cstr(new_link)
+  let rc = link(cs_existing.as_ptr(), cs_new.as_ptr())
+  if rc < 0 then
+    Result::Err(IOError::Other("Cannot create hard link: " + new_link))
+  else
+    Result::Ok(())
+  end
+end
+
+# ——————————————————————————————————————————————————————————————
+# Permissions (chmod / chown)
+# ——————————————————————————————————————————————————————————————
+
+def set_permissions(path: String, mode: Int) -> Result[Unit, IOError]
+  let cs = path_to_cstr(path)
+  let rc = chmod(cs.as_ptr(), mode)
+  if rc < 0 then
+    Result::Err(IOError::PermissionDenied("Cannot chmod: " + path))
+  else
+    Result::Ok(())
+  end
+end
+
+def set_owner(path: String, uid: Int, gid: Int) -> Result[Unit, IOError]
+  let cs = path_to_cstr(path)
+  let rc = chown(cs.as_ptr(), uid, gid)
+  if rc < 0 then
+    Result::Err(IOError::PermissionDenied("Cannot chown: " + path))
+  else
+    Result::Ok(())
+  end
+end
+
+# ——————————————————————————————————————————————————————————————
+# Temporary files and directories
+# ——————————————————————————————————————————————————————————————
+
+def temp_dir() -> String
+  ## Check TMPDIR, then fallback to /tmp
+  match std::env::get("TMPDIR")
+  when Option::Some(d) then d
+  when Option::None then "/tmp"
+  end
+end
+
+def create_temp_file(prefix: String) -> Result[File, IOError]
+  let template = temp_dir() + "/" + prefix + "XXXXXX"
+  mut cs = path_to_cstr(template)
+  let fd = mkstemp(cs.as_ptr())
+  if fd < 0 then
+    Result::Err(IOError::Other("Cannot create temp file"))
+  else
+    ## Read back the actual filename
+    let actual_path = String::from_bytes(cs.slice(0, cs.len() - 1))
+    Result::Ok(File { fd: fd, path: actual_path, is_open: true })
+  end
+end
+
+def create_temp_dir(prefix: String) -> Result[String, IOError]
+  let template = temp_dir() + "/" + prefix + "XXXXXX"
+  mut cs = path_to_cstr(template)
+  let result = mkdtemp(cs.as_ptr())
+  if result.is_null() then
+    Result::Err(IOError::Other("Cannot create temp directory"))
+  else
+    let actual_path = String::from_bytes(cs.slice(0, cs.len() - 1))
+    Result::Ok(actual_path)
+  end
+end
+
+# ——————————————————————————————————————————————————————————————
+# Copy file
+# ——————————————————————————————————————————————————————————————
+
+def copy_file(src: String, dst: String) -> Result[Int, IOError]
+  ## Copy file contents from src to dst. Returns bytes copied.
+  match file_open(src)
+  when Result::Ok(mut src_file) then
+    match file_create(dst)
+    when Result::Ok(mut dst_file) then
+      let chunk_size = 8192
+      mut total = 0
+      mut done = false
+      while !done do
+        let mut buf = Vec::new()
+        match file_read(&src_file, &mut buf, chunk_size)
+        when Result::Ok(n) then
+          if n == 0 then
+            done = true
+          else
+            match file_write(&mut dst_file, &buf)
+            when Result::Ok(written) then total = total + written
+            when Result::Err(e) then
+              file_close(&mut src_file)
+              file_close(&mut dst_file)
+              return Result::Err(e)
+            end
+          end
+        when Result::Err(e) then
+          file_close(&mut src_file)
+          file_close(&mut dst_file)
+          return Result::Err(e)
+        end
+      end
+      file_close(&mut src_file)
+      file_close(&mut dst_file)
+      Result::Ok(total)
+    when Result::Err(e) then
+      file_close(&mut src_file)
+      Result::Err(e)
+    end
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+# ——————————————————————————————————————————————————————————————
+# Atomic replace (write to temp, then rename)
+# ——————————————————————————————————————————————————————————————
+
+def atomic_write(path: String, data: String) -> Result[Unit, IOError]
+  let parent = match path_parent(path)
+  when Option::Some(p) then p
+  when Option::None then "."
+  end
+  let tmp_path = parent + "/.tg_atomic_XXXXXX"
+  mut cs = path_to_cstr(tmp_path)
+  let fd = mkstemp(cs.as_ptr())
+  if fd < 0 then
+    return Result::Err(IOError::Other("Cannot create atomic temp file"))
+  end
+  let actual_tmp = String::from_bytes(cs.slice(0, cs.len() - 1))
+  let bytes = data.bytes()
+  let n = write(fd, bytes.as_ptr(), bytes.len())
+  close(fd)
+  if n < 0 then
+    unlink(path_to_cstr(actual_tmp).as_ptr())
+    return Result::Err(IOError::Other("Write error during atomic write"))
+  end
+  ## Rename temp -> target (atomic on POSIX)
+  rename_path(actual_tmp, path)
+end
+
+# ——————————————————————————————————————————————————————————————
+# Directory listing / walk
+# ——————————————————————————————————————————————————————————————
+
+struct DirEntry
+  name: String
+  path: String
+  is_file: Bool
+  is_dir: Bool
+end
+
+def read_dir(path: String) -> Result[Vec[DirEntry], IOError]
+  let cs = path_to_cstr(path)
+  let dirp = opendir(cs.as_ptr())
+  if dirp.is_null() then
+    return Result::Err(IOError::NotFound("Cannot open directory: " + path))
+  end
+  mut entries = Vec::new()
+  loop
+    let entry = readdir(dirp)
+    if entry.is_null() then break end
+    ## Extract d_name from struct dirent (offset 0 after d_ino, etc.)
+    ## Platform-specific, simplified here
+    let name = _dirent_name(entry)
+    if name == "." || name == ".." then continue end
+    let full = path_join(path, name)
+    entries.push(DirEntry {
+      name: name,
+      path: full.clone(),
+      is_file: path_is_file(full.clone()),
+      is_dir: path_is_dir(full),
+    })
+  end
+  closedir(dirp)
+  Result::Ok(entries)
+end
+
+## Recursively walk a directory tree.
+def walk_dir(
+  path: String,
+  callback: fn(&DirEntry) -> Unit
+) -> Result[Unit, IOError]
+  match read_dir(path)
+  when Result::Ok(entries) then
+    for entry in entries do
+      callback(&entry)
+      if entry.is_dir then
+        walk_dir(entry.path, callback)?
+      end
+    end
+    Result::Ok(())
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+## Canonical / absolute path
+def canonicalize(path: String) -> Result[String, IOError]
+  let cs = path_to_cstr(path)
+  let buf_size = 4096
+  mut buf = Vec::with_capacity(buf_size)
+  mut i = 0
+  while i < buf_size do buf.push(0); i = i + 1 end
+  let result = realpath(cs.as_ptr(), buf.as_ptr())
+  if result.is_null() then
+    Result::Err(IOError::NotFound("Cannot resolve path: " + path))
+  else
+    ## Find NUL terminator
+    mut len = 0
+    while len < buf_size && buf[len] != 0 do len = len + 1 end
+    Result::Ok(String::from_bytes(buf.slice(0, len)))
+  end
+end
+
+def _dirent_name(entry: Ptr[u8]) -> String
+  ## Platform-specific extraction of d_name from struct dirent
+  #[cfg(target_os = "macos")]
+  let name_offset = 21  ## __darwin_dirent d_name offset
+  #[cfg(target_os = "linux")]
+  let name_offset = 19  ## struct dirent64 d_name offset
+  let ptr = entry.offset(name_offset)
+  ## Read until NUL
+  mut len = 0
+  while unsafe { *ptr.offset(len) } != 0 do len = len + 1 end
+  String::from_raw_parts(ptr, len)
+end

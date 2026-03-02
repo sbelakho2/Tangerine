@@ -1,0 +1,464 @@
+## tg_compiler::bindgen — FFI binding generator
+## Generate Tangerine bindings from C headers, Rust crates, and export C ABI.
+## Spec: §tooling.bindgen
+
+module tg_compiler::bindgen
+
+use std::core::{Option, Result, Display}
+use std::collections::{Map, Array}
+use std::fs
+
+# ─── Configuration ───────────────────────────────────────────────────
+
+pub struct BindgenConfig
+  pub input: BindgenInput
+  pub output_path: String
+  pub module_name: String
+  pub allowlist: Array[String]       ## Only generate bindings for these symbols
+  pub blocklist: Array[String]       ## Skip these symbols
+  pub type_mappings: Map[String, String]  ## Custom type mappings
+  pub generate_docs: Bool
+  pub safety: BindgenSafety
+end
+
+pub enum BindgenInput
+  CHeader(String)           ## Path to .h file
+  CHeaders(Array[String])   ## Multiple headers
+  RustCrate(String)         ## Path to Rust crate (uses rlib metadata)
+  WitFile(String)           ## WASM Interface Types (.wit)
+end
+
+pub enum BindgenSafety
+  AllUnsafe      ## All FFI calls marked unsafe
+  SafeWrappers   ## Generate safe wrappers with validation
+  Trusted        ## No safety annotations (for vetted libs)
+end
+
+impl BindgenConfig
+  pub def from_c_header(header: &str, module: &str) -> BindgenConfig
+    BindgenConfig {
+      input: BindgenInput::CHeader(header.to_string()),
+      output_path: module.to_string() + "_ffi.tg",
+      module_name: module.to_string(),
+      allowlist: Array::new(),
+      blocklist: Array::new(),
+      type_mappings: _default_c_type_mappings(),
+      generate_docs: true,
+      safety: BindgenSafety::SafeWrappers,
+    }
+  end
+
+  pub def from_rust(crate_path: &str, module: &str) -> BindgenConfig
+    BindgenConfig {
+      input: BindgenInput::RustCrate(crate_path.to_string()),
+      output_path: module.to_string() + "_ffi.tg",
+      module_name: module.to_string(),
+      allowlist: Array::new(),
+      blocklist: Array::new(),
+      type_mappings: _default_rust_type_mappings(),
+      generate_docs: true,
+      safety: BindgenSafety::SafeWrappers,
+    }
+  end
+end
+
+# ─── C type representation ───────────────────────────────────────────
+
+pub enum CType
+  Void
+  Bool
+  Char
+  UChar
+  Short
+  UShort
+  Int
+  UInt
+  Long
+  ULong
+  LongLong
+  ULongLong
+  Float
+  Double
+  SizeT
+  Pointer(Box[CType])
+  ConstPointer(Box[CType])
+  Array(Box[CType], UInt)
+  FuncPointer { params: Array[CType], ret: Box[CType] }
+  Struct(CStruct)
+  Union(CUnion)
+  Enum(CEnum)
+  Typedef(String, Box[CType])
+end
+
+pub struct CStruct
+  pub name: String
+  pub fields: Array[CField]
+  pub packed: Bool
+end
+
+pub struct CField
+  pub name: String
+  pub ty: CType
+  pub doc: Option[String]
+end
+
+pub struct CUnion
+  pub name: String
+  pub variants: Array[CField]
+end
+
+pub struct CEnum
+  pub name: String
+  pub variants: Array[(String, i64)]  ## (name, value)
+end
+
+pub struct CFunction
+  pub name: String
+  pub params: Array[(String, CType)]
+  pub return_type: CType
+  pub variadic: Bool
+  pub doc: Option[String]
+end
+
+# ─── Generator ───────────────────────────────────────────────────────
+
+pub struct Bindgen
+  config: BindgenConfig
+  declarations: Array[Declaration]
+end
+
+enum Declaration
+  Function(CFunction)
+  Struct(CStruct)
+  Union(CUnion)
+  Enum(CEnum)
+  Typedef(String, CType)
+  Constant(String, CType, String)  ## name, type, value
+end
+
+impl Bindgen
+  pub def new(config: BindgenConfig) -> Bindgen
+    Bindgen { config: config, declarations: Array::new() }
+  end
+
+  /// Parse the input and generate bindings.
+  pub def generate(&mut self) -> Result[String, BindgenError]
+    match &self.config.input
+    when CHeader(path) then self.parse_c_header(path)?
+    when CHeaders(paths) then
+      for path in paths.iter() do
+        self.parse_c_header(path)?
+      end
+    when RustCrate(path) then self.parse_rust_crate(path)?
+    when WitFile(path) then self.parse_wit_file(path)?
+    end
+    self.emit()
+  end
+
+  /// Generate and write to file.
+  pub def generate_to_file(&mut self) -> Result[Unit, BindgenError]
+    let output = self.generate()?
+    fs::write_string(self.config.output_path.clone(), output)
+      .map_err(|e| BindgenError::IoError(e.to_string()))
+  end
+
+  def parse_c_header(&mut self, path: &str) -> Result[Unit, BindgenError]
+    let content = fs::read_to_string(path.to_string())
+      .map_err(|e| BindgenError::IoError(e.to_string()))?
+    
+    ## Simple C header parser (real impl would use libclang)
+    let lines = content.lines()
+    for line in lines do
+      let trimmed = line.trim()
+      if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") then
+        continue
+      end
+      if trimmed.starts_with("#") then continue end  ## Skip preprocessor directives
+      
+      ## Detect struct declarations
+      if trimmed.starts_with("typedef struct") || trimmed.starts_with("struct ") then
+        ## Simplified parser — real impl handles full grammar
+        continue
+      end
+      
+      ## Detect function declarations
+      if trimmed.contains("(") && trimmed.ends_with(";") then
+        match _parse_c_function(trimmed)
+        when Some(func) then
+          if self.should_include(&func.name) then
+            self.declarations.push(Declaration::Function(func))
+          end
+        when None then ()
+        end
+      end
+    end
+    Ok(())
+  end
+
+  def parse_rust_crate(&mut self, _path: &str) -> Result[Unit, BindgenError]
+    ## Parse Rust rlib metadata for pub extern "C" fn declarations
+    ## This is a stub — real impl would read .rmeta
+    Ok(())
+  end
+
+  def parse_wit_file(&mut self, _path: &str) -> Result[Unit, BindgenError]
+    ## Parse WIT (WASM Interface Types) file
+    ## Stub — real impl parses WIT grammar
+    Ok(())
+  end
+
+  def should_include(&self, name: &str) -> Bool
+    if !self.config.blocklist.is_empty() then
+      for blocked in self.config.blocklist.iter() do
+        if name == blocked then return false end
+      end
+    end
+    if self.config.allowlist.is_empty() then
+      true
+    else
+      self.config.allowlist.iter().any(|a| a == name)
+    end
+  end
+
+  def emit(&self) -> Result[String, BindgenError]
+    var out = String::new()
+    out = out + "## Auto-generated by tg_compiler::bindgen\n"
+    out = out + "## Do not edit — regenerate with `tangerine bindgen`\n\n"
+    out = out + "module " + &self.config.module_name + "_ffi\n\n"
+
+    for decl in self.declarations.iter() do
+      match decl
+      when Function(f) then out = out + &self.emit_function(f)
+      when Struct(s) then out = out + &self.emit_struct(s)
+      when Union(u) then out = out + &self.emit_union(u)
+      when Enum(e) then out = out + &self.emit_enum(e)
+      when Typedef(name, ty) then
+        out = out + "type " + name + " = " + &_ctype_to_tg(ty, &self.config.type_mappings) + "\n\n"
+      when Constant(name, ty, val) then
+        out = out + "pub def " + name + "() -> " + &_ctype_to_tg(ty, &self.config.type_mappings) + " = " + val + "\n\n"
+      end
+    end
+
+    out = out + "end ## module " + &self.config.module_name + "_ffi\n"
+    Ok(out)
+  end
+
+  def emit_function(&self, f: &CFunction) -> String
+    var out = String::new()
+    if self.config.generate_docs then
+      if let Some(ref doc) = f.doc then
+        out = out + "## " + doc + "\n"
+      end
+    end
+
+    ## Emit the extern declaration
+    out = out + "@ffi(\"c\")\n"
+    out = out + "extern def " + &f.name + "("
+    for (i, (pname, pty)) in f.params.iter().enumerate() do
+      if i > 0 then out = out + ", " end
+      out = out + pname + ": " + &_ctype_to_tg(pty, &self.config.type_mappings)
+    end
+    if f.variadic then
+      if !f.params.is_empty() then out = out + ", " end
+      out = out + "..."
+    end
+    out = out + ") -> " + &_ctype_to_tg(&f.return_type, &self.config.type_mappings) + "\n\n"
+
+    ## Optionally emit safe wrapper
+    match &self.config.safety
+    when SafeWrappers then
+      out = out + "pub def " + &f.name + "_safe("
+      for (i, (pname, pty)) in f.params.iter().enumerate() do
+        if i > 0 then out = out + ", " end
+        out = out + pname + ": " + &_ctype_to_tg_safe(pty, &self.config.type_mappings)
+      end
+      out = out + ") -> Result[" + &_ctype_to_tg_safe(&f.return_type, &self.config.type_mappings) + ", FfiError]\n"
+      out = out + "  unsafe { " + &f.name + "("
+      for (i, (pname, _)) in f.params.iter().enumerate() do
+        if i > 0 then out = out + ", " end
+        out = out + pname
+      end
+      out = out + ") }\nend\n\n"
+    else ()
+    end
+
+    out
+  end
+
+  def emit_struct(&self, s: &CStruct) -> String
+    var out = "@repr(C)\n"
+    if s.packed then out = out + "@packed\n" end
+    out = out + "pub struct " + &s.name + "\n"
+    for field in s.fields.iter() do
+      if let Some(ref doc) = field.doc then
+        out = out + "  ## " + doc + "\n"
+      end
+      out = out + "  pub " + &field.name + ": " + &_ctype_to_tg(&field.ty, &self.config.type_mappings) + "\n"
+    end
+    out = out + "end\n\n"
+    out
+  end
+
+  def emit_union(&self, u: &CUnion) -> String
+    var out = "@repr(C)\n"
+    out = out + "pub union " + &u.name + "\n"
+    for v in u.variants.iter() do
+      out = out + "  pub " + &v.name + ": " + &_ctype_to_tg(&v.ty, &self.config.type_mappings) + "\n"
+    end
+    out = out + "end\n\n"
+    out
+  end
+
+  def emit_enum(&self, e: &CEnum) -> String
+    var out = "@repr(i32)\n"
+    out = out + "pub enum " + &e.name + "\n"
+    for (name, value) in e.variants.iter() do
+      out = out + "  " + name + " = " + &value.to_string() + "\n"
+    end
+    out = out + "end\n\n"
+    out
+  end
+end
+
+# ─── C ABI Export ────────────────────────────────────────────────────
+
+/// Generate a C header file from Tangerine @export functions.
+pub def generate_c_header(module_path: &str) -> Result[String, BindgenError]
+  let content = fs::read_to_string(module_path.to_string())
+    .map_err(|e| BindgenError::IoError(e.to_string()))?
+
+  var out = String::new()
+  out = out + "/* Auto-generated C header for Tangerine module */\n"
+  out = out + "#ifndef TANGERINE_" + &_header_guard(module_path) + "_H\n"
+  out = out + "#define TANGERINE_" + &_header_guard(module_path) + "_H\n\n"
+  out = out + "#include <stdint.h>\n#include <stddef.h>\n\n"
+  out = out + "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
+
+  ## Parse @export annotated functions (simplified)
+  for line in content.lines() do
+    let trimmed = line.trim()
+    if trimmed.starts_with("@export") || trimmed.starts_with("@ffi_export") then
+      ## Next line should be the function signature
+      ## Simplified — real impl would use the AST
+    end
+  end
+
+  out = out + "#ifdef __cplusplus\n}\n#endif\n\n"
+  out = out + "#endif /* TANGERINE_" + &_header_guard(module_path) + "_H */\n"
+  Ok(out)
+end
+
+# ─── Errors ──────────────────────────────────────────────────────────
+
+pub enum BindgenError
+  IoError(String)
+  ParseError(String)
+  UnsupportedType(String)
+  InvalidConfig(String)
+end
+
+impl Display for BindgenError
+  def fmt(self: &Self) -> String
+    match self
+    when IoError(msg) then "bindgen I/O error: " + msg
+    when ParseError(msg) then "bindgen parse error: " + msg
+    when UnsupportedType(ty) then "unsupported C type: " + ty
+    when InvalidConfig(msg) then "bindgen config error: " + msg
+    end
+  end
+end
+
+pub struct FfiError
+  pub message: String
+end
+
+# ─── Internal helpers ────────────────────────────────────────────────
+
+def _default_c_type_mappings() -> Map[String, String]
+  var m = Map::new()
+  m.insert("void".to_string(), "Unit".to_string())
+  m.insert("int".to_string(), "i32".to_string())
+  m.insert("unsigned int".to_string(), "u32".to_string())
+  m.insert("long".to_string(), "i64".to_string())
+  m.insert("unsigned long".to_string(), "u64".to_string())
+  m.insert("char".to_string(), "i8".to_string())
+  m.insert("unsigned char".to_string(), "u8".to_string())
+  m.insert("short".to_string(), "i16".to_string())
+  m.insert("unsigned short".to_string(), "u16".to_string())
+  m.insert("float".to_string(), "f32".to_string())
+  m.insert("double".to_string(), "f64".to_string())
+  m.insert("size_t".to_string(), "UInt".to_string())
+  m.insert("ssize_t".to_string(), "Int".to_string())
+  m.insert("bool".to_string(), "Bool".to_string())
+  m.insert("_Bool".to_string(), "Bool".to_string())
+  m.insert("int8_t".to_string(), "i8".to_string())
+  m.insert("uint8_t".to_string(), "u8".to_string())
+  m.insert("int16_t".to_string(), "i16".to_string())
+  m.insert("uint16_t".to_string(), "u16".to_string())
+  m.insert("int32_t".to_string(), "i32".to_string())
+  m.insert("uint32_t".to_string(), "u32".to_string())
+  m.insert("int64_t".to_string(), "i64".to_string())
+  m.insert("uint64_t".to_string(), "u64".to_string())
+  m
+end
+
+def _default_rust_type_mappings() -> Map[String, String]
+  var m = _default_c_type_mappings()
+  m.insert("i8".to_string(), "i8".to_string())
+  m.insert("u8".to_string(), "u8".to_string())
+  m.insert("i16".to_string(), "i16".to_string())
+  m.insert("u16".to_string(), "u16".to_string())
+  m.insert("i32".to_string(), "i32".to_string())
+  m.insert("u32".to_string(), "u32".to_string())
+  m.insert("i64".to_string(), "i64".to_string())
+  m.insert("u64".to_string(), "u64".to_string())
+  m.insert("f32".to_string(), "f32".to_string())
+  m.insert("f64".to_string(), "f64".to_string())
+  m.insert("usize".to_string(), "UInt".to_string())
+  m.insert("isize".to_string(), "Int".to_string())
+  m.insert("bool".to_string(), "Bool".to_string())
+  m.insert("String".to_string(), "String".to_string())
+  m
+end
+
+def _ctype_to_tg(ct: &CType, mappings: &Map[String, String]) -> String
+  match ct
+  when Void then "Unit"
+  when Bool then "Bool"
+  when Char | Short | Int | Long | LongLong then "i64"
+  when UChar | UShort | UInt | ULong | ULongLong then "u64"
+  when Float then "f32"
+  when Double then "f64"
+  when SizeT then "UInt"
+  when Pointer(inner) then "*mut " + &_ctype_to_tg(inner, mappings)
+  when ConstPointer(inner) then "*const " + &_ctype_to_tg(inner, mappings)
+  when Array(inner, size) then "[" + &_ctype_to_tg(inner, mappings) + "; " + &size.to_string() + "]"
+  when FuncPointer { params, ret } then
+    "fn(" + &params.iter().map(|p| _ctype_to_tg(p, mappings)).collect::<Array[String]>().join(", ") + ") -> " + &_ctype_to_tg(ret, mappings)
+  when Struct(s) then s.name.clone()
+  when Union(u) then u.name.clone()
+  when Enum(e) then e.name.clone()
+  when Typedef(name, _) then name.clone()
+  end
+end
+
+def _ctype_to_tg_safe(ct: &CType, mappings: &Map[String, String]) -> String
+  ## Same as _ctype_to_tg but converts raw pointers to references
+  match ct
+  when Pointer(inner) then "&mut " + &_ctype_to_tg_safe(inner, mappings)
+  when ConstPointer(inner) then "&" + &_ctype_to_tg_safe(inner, mappings)
+  else _ctype_to_tg(ct, mappings)
+  end
+end
+
+def _parse_c_function(line: &str) -> Option[CFunction]
+  ## Simplified C function declaration parser
+  ## Real impl would use libclang bindings
+  None
+end
+
+def _header_guard(path: &str) -> String
+  path.replace("/", "_").replace(".", "_").replace("-", "_").to_uppercase()
+end
+
+end ## module tg_compiler::bindgen

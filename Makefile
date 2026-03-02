@@ -1,6 +1,6 @@
 # Tangerine Project Makefile
 
-.PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help
+.PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-new-std test-tooling test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help
 
 SHELL := /bin/bash
 TG    := tg
@@ -59,7 +59,35 @@ test-abi:
 	@echo "==> Running ABI/FFI tests..."
 	$(TG) test golden/abi_ffi_tests.tg
 
-test-all: test test-conformance test-frontend test-abi test-gfx-ui
+test-new-std:
+	@echo "==> Checking new std modules compile..."
+	$(TG) check std/math.tg
+	$(TG) check std/random.tg
+	$(TG) check std/path.tg
+	$(TG) check std/csv.tg
+	$(TG) check std/yaml.tg
+	$(TG) check std/cbor.tg
+	$(TG) check std/msgpack.tg
+	$(TG) check std/signal.tg
+	$(TG) check std/auth.tg
+	$(TG) check std/config.tg
+	$(TG) check std/debug.tg
+	$(TG) check std/semver.tg
+	$(TG) check std/wasm.tg
+	@echo "==> New std modules OK."
+
+test-tooling:
+	@echo "==> Checking tooling modules compile..."
+	$(TG) check tg_compiler/pkg_manager.tg
+	$(TG) check tg_compiler/registry.tg
+	$(TG) check tg_compiler/template.tg
+	$(TG) check tg_compiler/bindgen.tg
+	$(TG) check tg_compiler/cross_compile.tg
+	$(TG) check tg_compiler/wasm_target.tg
+	$(TG) check tg_compiler/debugger.tg
+	@echo "==> Tooling modules OK."
+
+test-all: test test-conformance test-frontend test-abi test-gfx-ui test-new-std test-tooling
 	@echo "==> All tests passed."
 
 # ————————————————————————————————————————————
@@ -197,4 +225,6 @@ help:
 	@echo "  clean           Remove build artifacts"
 	@echo "  install         Install binary to PREFIX/bin (default /usr/local)"
 	@echo "  bench           Run benchmarks"
+	@echo "  test-new-std    Check new std modules compile"
+	@echo "  test-tooling    Check tooling modules compile"
 	@echo "  help            Show this help"

@@ -1,0 +1,515 @@
+## std::auth — Authentication primitives
+## JWT tokens, OAuth 2.0 helpers, API key management, and password hashing.
+## Spec: §stdlib.auth
+
+module std::auth
+
+use std::core::{Option, Result, Display}
+use std::crypto
+use std::json
+use std::time::{SystemTime, Duration}
+use std::collections::{Map}
+
+# ─── JWT (JSON Web Tokens) ───────────────────────────────────────────
+
+pub enum JwtAlgorithm
+  HS256    ## HMAC-SHA256
+  HS384    ## HMAC-SHA384
+  HS512    ## HMAC-SHA512
+  None     ## Unsecured (dangerous — for testing only)
+end
+
+impl JwtAlgorithm
+  pub def name(self) -> String
+    match self
+    when JwtAlgorithm.HS256 then "HS256"
+    when JwtAlgorithm.HS384 then "HS384"
+    when JwtAlgorithm.HS512 then "HS512"
+    when JwtAlgorithm.None then "none"
+    end
+  end
+
+  pub def from_name(s: &str) -> Option[JwtAlgorithm]
+    match s
+    when "HS256" then Some(JwtAlgorithm.HS256)
+    when "HS384" then Some(JwtAlgorithm.HS384)
+    when "HS512" then Some(JwtAlgorithm.HS512)
+    when "none" then Some(JwtAlgorithm.None)
+    else None
+    end
+  end
+end
+
+pub struct JwtHeader
+  alg: JwtAlgorithm
+  typ: String
+  extra: Map[String, json::Value]
+end
+
+impl JwtHeader
+  pub def new(alg: JwtAlgorithm) -> JwtHeader
+    JwtHeader { alg: alg, typ: "JWT".to_string(), extra: Map.new() }
+  end
+
+  pub def to_json(self) -> json::Value
+    var obj = Map[String, json::Value].new()
+    obj.insert("alg".to_string(), json::Value.String(self.alg.name()))
+    obj.insert("typ".to_string(), json::Value.String(self.typ.clone()))
+    for (k, v) in self.extra.entries() do
+      obj.insert(k.clone(), v.clone())
+    end
+    json::Value.Object(obj)
+  end
+end
+
+pub struct JwtClaims
+  ## Standard claims
+  pub issuer: Option[String]          ## iss
+  pub subject: Option[String]         ## sub
+  pub audience: Option[Vec[String]]   ## aud
+  pub expiration: Option[Int]         ## exp (Unix timestamp)
+  pub not_before: Option[Int]         ## nbf
+  pub issued_at: Option[Int]          ## iat
+  pub jwt_id: Option[String]          ## jti
+
+  ## Custom claims
+  pub custom: Map[String, json::Value]
+end
+
+impl JwtClaims
+  pub def new() -> JwtClaims
+    JwtClaims {
+      issuer: None,
+      subject: None,
+      audience: None,
+      expiration: None,
+      not_before: None,
+      issued_at: None,
+      jwt_id: None,
+      custom: Map.new(),
+    }
+  end
+
+  pub def with_issuer(self, iss: String) -> JwtClaims
+    var c = self; c.issuer = Some(iss); c
+  end
+
+  pub def with_subject(self, sub: String) -> JwtClaims
+    var c = self; c.subject = Some(sub); c
+  end
+
+  pub def with_audience(self, aud: Vec[String]) -> JwtClaims
+    var c = self; c.audience = Some(aud); c
+  end
+
+  pub def with_expiration(self, exp: Int) -> JwtClaims
+    var c = self; c.expiration = Some(exp); c
+  end
+
+  pub def with_expiry_duration(self, dur: Duration) -> JwtClaims
+    let now = SystemTime.now().as_unix_secs()
+    var c = self; c.expiration = Some(now + dur.as_secs()); c
+  end
+
+  pub def with_issued_now(self) -> JwtClaims
+    var c = self; c.issued_at = Some(SystemTime.now().as_unix_secs()); c
+  end
+
+  pub def set(self, key: String, value: json::Value) -> JwtClaims
+    var c = self; c.custom.insert(key, value); c
+  end
+
+  pub def get(self, key: &str) -> Option[&json::Value]
+    self.custom.get(key)
+  end
+
+  pub def is_expired(self) -> Bool
+    match self.expiration
+    when Some(exp) then SystemTime.now().as_unix_secs() > exp
+    when None then false
+    end
+  end
+
+  pub def to_json(self) -> json::Value
+    var obj = Map[String, json::Value].new()
+    match self.issuer  { when Some(ref v) then obj.insert("iss", json::Value.String(v.clone())) when None then {} }
+    match self.subject { when Some(ref v) then obj.insert("sub", json::Value.String(v.clone())) when None then {} }
+    match self.audience {
+      when Some(ref auds) then
+        let arr = auds.iter().map(|a| json::Value.String(a.clone())).collect()
+        obj.insert("aud", json::Value.Array(arr))
+      when None then {}
+    }
+    match self.expiration  { when Some(v) then obj.insert("exp", json::Value.Number(v as Float)) when None then {} }
+    match self.not_before  { when Some(v) then obj.insert("nbf", json::Value.Number(v as Float)) when None then {} }
+    match self.issued_at   { when Some(v) then obj.insert("iat", json::Value.Number(v as Float)) when None then {} }
+    match self.jwt_id      { when Some(ref v) then obj.insert("jti", json::Value.String(v.clone())) when None then {} }
+    for (k, v) in self.custom.entries() do
+      obj.insert(k.clone(), v.clone())
+    end
+    json::Value.Object(obj)
+  end
+
+  pub def from_json(value: &json::Value) -> Result[JwtClaims, JwtError]
+    var claims = JwtClaims.new()
+    match value
+    when json::Value.Object(ref obj) then
+      claims.issuer = obj.get("iss").and_then(|v| v.as_str().map(|s| s.clone()))
+      claims.subject = obj.get("sub").and_then(|v| v.as_str().map(|s| s.clone()))
+      claims.expiration = obj.get("exp").and_then(|v| v.as_number().map(|n| n as Int))
+      claims.not_before = obj.get("nbf").and_then(|v| v.as_number().map(|n| n as Int))
+      claims.issued_at = obj.get("iat").and_then(|v| v.as_number().map(|n| n as Int))
+      claims.jwt_id = obj.get("jti").and_then(|v| v.as_str().map(|s| s.clone()))
+      ## Audience can be string or array
+      match obj.get("aud")
+      when Some(json::Value.String(ref s)) then claims.audience = Some(vec![s.clone()])
+      when Some(json::Value.Array(ref arr)) then
+        var auds = Vec[String].new()
+        for item in arr do
+          match item.as_str() { when Some(s) then auds.push(s.clone()) when None then {} }
+        end
+        claims.audience = Some(auds)
+      when _ then {}
+      end
+      ## Everything else goes into custom
+      for (k, v) in obj.entries() do
+        match k.as_str()
+        when "iss" | "sub" | "aud" | "exp" | "nbf" | "iat" | "jti" then {}
+        else claims.custom.insert(k.clone(), v.clone())
+        end
+      end
+      Ok(claims)
+    else
+      Err(JwtError.InvalidPayload("expected JSON object".to_string()))
+    end
+  end
+end
+
+pub enum JwtError
+  InvalidToken(String)
+  InvalidHeader(String)
+  InvalidPayload(String)
+  InvalidSignature
+  Expired
+  NotYetValid
+  UnsupportedAlgorithm(String)
+  MissingKey
+end
+
+impl Display for JwtError
+  def fmt(self, f: &mut fmt::Formatter) -> fmt::Result
+    match self
+    when JwtError.InvalidToken(msg) then f.write_str("JWT invalid token: " + msg)
+    when JwtError.InvalidHeader(msg) then f.write_str("JWT invalid header: " + msg)
+    when JwtError.InvalidPayload(msg) then f.write_str("JWT invalid payload: " + msg)
+    when JwtError.InvalidSignature then f.write_str("JWT invalid signature")
+    when JwtError.Expired then f.write_str("JWT expired")
+    when JwtError.NotYetValid then f.write_str("JWT not yet valid")
+    when JwtError.UnsupportedAlgorithm(alg) then f.write_str("JWT unsupported algorithm: " + alg)
+    when JwtError.MissingKey then f.write_str("JWT missing signing key")
+    end
+  end
+end
+
+## Encode and sign a JWT.
+pub def jwt_encode(claims: &JwtClaims, secret: &[u8], alg: JwtAlgorithm = JwtAlgorithm.HS256) -> Result[String, JwtError]
+  let header = JwtHeader.new(alg)
+  let header_json = json::to_string(&header.to_json())
+  let payload_json = json::to_string(&claims.to_json())
+  let header_b64 = crypto::base64::encode_url(header_json.as_bytes())
+  let payload_b64 = crypto::base64::encode_url(payload_json.as_bytes())
+  let signing_input = header_b64 + "." + payload_b64
+  let signature = _sign(signing_input.as_bytes(), secret, alg)?
+  let sig_b64 = crypto::base64::encode_url(&signature)
+  Ok(signing_input + "." + sig_b64)
+end
+
+## Decode and verify a JWT.
+pub def jwt_decode(token: &str, secret: &[u8]) -> Result[JwtClaims, JwtError]
+  jwt_decode_with_validation(token, secret, true)
+end
+
+## Decode a JWT with optional validation.
+pub def jwt_decode_with_validation(token: &str, secret: &[u8], validate: Bool) -> Result[JwtClaims, JwtError]
+  let parts = token.split('.')
+  if parts.len() != 3 then
+    return Err(JwtError.InvalidToken("expected 3 parts, got " + parts.len().to_string()))
+  end
+
+  let header_b64 = parts[0]
+  let payload_b64 = parts[1]
+  let sig_b64 = parts[2]
+
+  ## Decode header
+  let header_bytes = crypto::base64::decode_url(header_b64)?
+  let header_json = String.from_utf8(header_bytes).map_err(|_| JwtError.InvalidHeader("invalid UTF-8"))?
+  let header_value = json::parse(&header_json).map_err(|e| JwtError.InvalidHeader(e.to_string()))?
+
+  let alg_str = header_value.get("alg").and_then(|v| v.as_str())
+    .ok_or(JwtError.InvalidHeader("missing alg"))?
+  let alg = JwtAlgorithm.from_name(alg_str)
+    .ok_or(JwtError.UnsupportedAlgorithm(alg_str.clone()))?
+
+  ## Verify signature
+  if validate then
+    let signing_input = header_b64.to_string() + "." + payload_b64
+    let expected_sig = _sign(signing_input.as_bytes(), secret, alg)?
+    let actual_sig = crypto::base64::decode_url(sig_b64)?
+    if !crypto::constant_time_eq(&expected_sig, &actual_sig) then
+      return Err(JwtError.InvalidSignature)
+    end
+  end
+
+  ## Decode payload
+  let payload_bytes = crypto::base64::decode_url(payload_b64)?
+  let payload_str = String.from_utf8(payload_bytes).map_err(|_| JwtError.InvalidPayload("invalid UTF-8"))?
+  let payload_value = json::parse(&payload_str).map_err(|e| JwtError.InvalidPayload(e.to_string()))?
+  var claims = JwtClaims.from_json(&payload_value)?
+
+  ## Validate temporal claims
+  if validate then
+    let now = SystemTime.now().as_unix_secs()
+    match claims.expiration
+    when Some(exp) then
+      if now > exp then return Err(JwtError.Expired) end
+    when None then {}
+    end
+    match claims.not_before
+    when Some(nbf) then
+      if now < nbf then return Err(JwtError.NotYetValid) end
+    when None then {}
+    end
+  end
+
+  Ok(claims)
+end
+
+def _sign(data: &[u8], secret: &[u8], alg: JwtAlgorithm) -> Result[Vec[u8], JwtError]
+  match alg
+  when JwtAlgorithm.HS256 then Ok(crypto::hmac_sha256(secret, data))
+  when JwtAlgorithm.HS384 then Ok(crypto::hmac_sha384(secret, data))
+  when JwtAlgorithm.HS512 then Ok(crypto::hmac_sha512(secret, data))
+  when JwtAlgorithm.None then Ok(Vec[u8].new())
+  end
+end
+
+# ─── OAuth 2.0 ───────────────────────────────────────────────────────
+
+pub enum OAuthGrantType
+  AuthorizationCode
+  ClientCredentials
+  RefreshToken
+  DeviceCode
+  PKCE   ## Authorization Code + PKCE
+end
+
+pub struct OAuthConfig
+  pub client_id: String
+  pub client_secret: Option[String]
+  pub authorize_url: String
+  pub token_url: String
+  pub redirect_uri: String
+  pub scopes: Vec[String]
+end
+
+pub struct OAuthToken
+  pub access_token: String
+  pub token_type: String
+  pub expires_in: Option[Int]
+  pub refresh_token: Option[String]
+  pub scope: Option[String]
+  pub issued_at: Int
+end
+
+impl OAuthToken
+  pub def is_expired(self) -> Bool
+    match self.expires_in
+    when Some(exp) then
+      let now = SystemTime.now().as_unix_secs()
+      now >= self.issued_at + exp
+    when None then false
+    end
+  end
+
+  pub def from_json(value: &json::Value) -> Result[OAuthToken, String]
+    let obj = value.as_object().ok_or("expected JSON object")?
+    let access_token = obj.get("access_token").and_then(|v| v.as_str())
+      .ok_or("missing access_token")?.clone()
+    let token_type = obj.get("token_type").and_then(|v| v.as_str())
+      .unwrap_or(&"Bearer".to_string()).clone()
+    let expires_in = obj.get("expires_in").and_then(|v| v.as_number().map(|n| n as Int))
+    let refresh_token = obj.get("refresh_token").and_then(|v| v.as_str().map(|s| s.clone()))
+    let scope = obj.get("scope").and_then(|v| v.as_str().map(|s| s.clone()))
+    Ok(OAuthToken {
+      access_token: access_token,
+      token_type: token_type,
+      expires_in: expires_in,
+      refresh_token: refresh_token,
+      scope: scope,
+      issued_at: SystemTime.now().as_unix_secs(),
+    })
+  end
+end
+
+## Build the authorization URL for OAuth 2.0.
+pub def oauth_authorize_url(config: &OAuthConfig, state: &str) -> String
+  var url = config.authorize_url.clone()
+  url = url + "?response_type=code"
+  url = url + "&client_id=" + _url_encode(&config.client_id)
+  url = url + "&redirect_uri=" + _url_encode(&config.redirect_uri)
+  if config.scopes.len() > 0 then
+    url = url + "&scope=" + _url_encode(&config.scopes.join(" "))
+  end
+  url = url + "&state=" + _url_encode(state)
+  url
+end
+
+## Build authorization URL with PKCE.
+pub def oauth_authorize_url_pkce(config: &OAuthConfig, state: &str) -> (String, String, String)
+  let code_verifier = _generate_code_verifier()
+  let code_challenge = _generate_code_challenge(&code_verifier)
+  var url = oauth_authorize_url(config, state)
+  url = url + "&code_challenge=" + _url_encode(&code_challenge)
+  url = url + "&code_challenge_method=S256"
+  (url, code_verifier, code_challenge)
+end
+
+## Build the token exchange request body for authorization code flow.
+pub def oauth_token_request_body(config: &OAuthConfig, code: &str) -> String
+  var body = "grant_type=authorization_code"
+  body = body + "&code=" + _url_encode(code)
+  body = body + "&redirect_uri=" + _url_encode(&config.redirect_uri)
+  body = body + "&client_id=" + _url_encode(&config.client_id)
+  match config.client_secret
+  when Some(ref secret) then body = body + "&client_secret=" + _url_encode(secret)
+  when None then {}
+  end
+  body
+end
+
+## Build token request for client credentials flow.
+pub def oauth_client_credentials_body(config: &OAuthConfig) -> String
+  var body = "grant_type=client_credentials"
+  body = body + "&client_id=" + _url_encode(&config.client_id)
+  match config.client_secret
+  when Some(ref secret) then body = body + "&client_secret=" + _url_encode(secret)
+  when None then {}
+  end
+  if config.scopes.len() > 0 then
+    body = body + "&scope=" + _url_encode(&config.scopes.join(" "))
+  end
+  body
+end
+
+## Build refresh token request body.
+pub def oauth_refresh_body(config: &OAuthConfig, refresh_token: &str) -> String
+  var body = "grant_type=refresh_token"
+  body = body + "&refresh_token=" + _url_encode(refresh_token)
+  body = body + "&client_id=" + _url_encode(&config.client_id)
+  match config.client_secret
+  when Some(ref secret) then body = body + "&client_secret=" + _url_encode(secret)
+  when None then {}
+  end
+  body
+end
+
+# ─── Password hashing ───────────────────────────────────────────────
+
+## Hash a password using PBKDF2-SHA256 (returns base64-encoded hash with embedded salt).
+pub def hash_password(password: &str, iterations: Int = 100000) -> String
+  let salt = crypto::random_bytes(16)
+  let hash = crypto::pbkdf2_sha256(password.as_bytes(), &salt, iterations, 32)
+  let encoded_salt = crypto::base64::encode(&salt)
+  let encoded_hash = crypto::base64::encode(&hash)
+  ## Format: $pbkdf2-sha256$iterations$salt$hash
+  "$pbkdf2-sha256$" + iterations.to_string() + "$" + encoded_salt + "$" + encoded_hash
+end
+
+## Verify a password against a hash produced by `hash_password`.
+pub def verify_password(password: &str, stored: &str) -> Bool
+  let parts = stored.split('$')
+  ## Expected: ["", "pbkdf2-sha256", iterations, salt, hash]
+  if parts.len() != 5 then return false end
+  if parts[1] != "pbkdf2-sha256" then return false end
+
+  let iterations = match Int.parse(parts[2])
+  when Ok(i) then i
+  when Err(_) then return false
+  end
+
+  let salt = match crypto::base64::decode(parts[3])
+  when Ok(s) then s
+  when Err(_) then return false
+  end
+
+  let expected_hash = match crypto::base64::decode(parts[4])
+  when Ok(h) then h
+  when Err(_) then return false
+  end
+
+  let computed = crypto::pbkdf2_sha256(password.as_bytes(), &salt, iterations, 32)
+  crypto::constant_time_eq(&computed, &expected_hash)
+end
+
+# ─── API Key management ─────────────────────────────────────────────
+
+pub struct ApiKey
+  pub prefix: String     ## Public prefix for identification (e.g., "tg_live_")
+  pub key: String        ## Full key (prefix + random)
+  pub hash: String       ## Stored hash (never store the full key)
+end
+
+## Generate a new API key with a given prefix.
+pub def generate_api_key(prefix: &str) -> ApiKey
+  let random_part = crypto::base64::encode_url(&crypto::random_bytes(32))
+  let full_key = prefix.to_string() + random_part
+  let hash = crypto::hex::encode(&crypto::sha256(full_key.as_bytes()))
+  ApiKey {
+    prefix: prefix.to_string(),
+    key: full_key,
+    hash: hash,
+  }
+end
+
+## Verify an API key against a stored hash.
+pub def verify_api_key(key: &str, stored_hash: &str) -> Bool
+  let computed = crypto::hex::encode(&crypto::sha256(key.as_bytes()))
+  crypto::constant_time_eq(computed.as_bytes(), stored_hash.as_bytes())
+end
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def _url_encode(s: &str) -> String
+  var result = String.new()
+  for ch in s.chars() do
+    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+       || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~' then
+      result.push(ch)
+    else
+      let bytes = ch.to_string().as_bytes()
+      for b in bytes do
+        result = result + "%" + _hex_byte_upper(b)
+      end
+    end
+  end
+  result
+end
+
+def _hex_byte_upper(b: u8) -> String
+  let chars = "0123456789ABCDEF"
+  var s = String.with_capacity(2)
+  s.push(chars.char_at((b >> 4) as UInt))
+  s.push(chars.char_at((b & 0x0f) as UInt))
+  s
+end
+
+def _generate_code_verifier() -> String
+  crypto::base64::encode_url(&crypto::random_bytes(32))
+end
+
+def _generate_code_challenge(verifier: &str) -> String
+  let hash = crypto::sha256(verifier.as_bytes())
+  crypto::base64::encode_url(&hash)
+end
+
+end ## module std::auth

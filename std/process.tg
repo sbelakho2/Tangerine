@@ -250,3 +250,661 @@ def is_valid_env_key(key: &String) -> Bool
 
   true
 end
+
+# ———————————————————————————————————————————————————————————————
+# Pipe IPC
+# ———————————————————————————————————————————————————————————————
+
+## POSIX pipe FFI
+@[FFI(lib: "c")]
+extern def pipe(fds: &mut [Int; 2]) -> Int
+extern def dup2(oldfd: Int, newfd: Int) -> Int
+extern def fcntl(fd: Int, cmd: Int, arg: Int) -> Int
+
+let F_GETFL = 3
+let F_SETFL = 4
+let O_NONBLOCK = 0x0004
+let O_CLOEXEC = 0x1000000
+
+## A pair of connected file descriptors for IPC
+struct Pipe
+  read_fd: Int
+  write_fd: Int
+end
+
+def pipe_create() -> Result[Pipe, OsError]
+  let mut fds: [Int; 2] = [0, 0]
+  let ret = pipe(&mut fds)
+  if ret < 0 then
+    return Result::Err(OsError::from_errno())
+  end
+  Result::Ok(Pipe { read_fd: fds[0], write_fd: fds[1] })
+end
+
+impl Pipe
+  ## Read from the pipe
+  def read(self: &Pipe, buf: &mut [u8]) -> Result[UInt, OsError]
+    let n = c_read(self.read_fd, buf.as_mut_ptr() as *mut Void, buf.len())
+    if n < 0 then Result::Err(OsError::from_errno()) else Result::Ok(n as UInt) end
+  end
+
+  ## Write to the pipe
+  def write(self: &Pipe, data: &[u8]) -> Result[UInt, OsError]
+    let n = c_write(self.write_fd, data.as_ptr() as *const Void, data.len())
+    if n < 0 then Result::Err(OsError::from_errno()) else Result::Ok(n as UInt) end
+  end
+
+  ## Close the read end
+  def close_read(self: &mut Pipe) -> Unit
+    if self.read_fd >= 0 then
+      c_close(self.read_fd)
+      self.read_fd = -1
+    end
+  end
+
+  ## Close the write end
+  def close_write(self: &mut Pipe) -> Unit
+    if self.write_fd >= 0 then
+      c_close(self.write_fd)
+      self.write_fd = -1
+    end
+  end
+
+  ## Set non-blocking mode on the read end
+  def set_nonblocking(self: &Pipe) -> Result[Unit, OsError]
+    let flags = fcntl(self.read_fd, F_GETFL, 0)
+    if flags < 0 then return Result::Err(OsError::from_errno()) end
+    let ret = fcntl(self.read_fd, F_SETFL, flags | O_NONBLOCK)
+    if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+  end
+end
+
+impl Drop for Pipe
+  def drop(self: &mut Pipe) -> Unit
+    self.close_read()
+    self.close_write()
+  end
+end
+
+## Stdio configuration for child processes
+enum Stdio
+  Inherit    ## Inherit parent's fd
+  Piped      ## Create a pipe
+  Null       ## Redirect to /dev/null
+  Fd(Int)    ## Use a specific fd
+end
+
+## Enhanced command builder with stdio pipe support
+struct PipedCommand
+  program: String
+  args: Vec[String]
+  env: Map[String, String]
+  cwd: Option[String]
+  stdin_cfg: Stdio
+  stdout_cfg: Stdio
+  stderr_cfg: Stdio
+end
+
+def piped_command(program: &str) -> PipedCommand
+  PipedCommand {
+    program: program.to_string(),
+    args: Vec::new(),
+    env: Map::new(),
+    cwd: Option::None,
+    stdin_cfg: Stdio::Inherit,
+    stdout_cfg: Stdio::Inherit,
+    stderr_cfg: Stdio::Inherit,
+  }
+end
+
+impl PipedCommand
+  def arg(self: &mut PipedCommand, a: &str) -> &mut PipedCommand
+    self.args.push(a.to_string())
+    self
+  end
+
+  def args(self: &mut PipedCommand, a: &[&str]) -> &mut PipedCommand
+    for s in a do self.args.push(s.to_string()) end
+    self
+  end
+
+  def env(self: &mut PipedCommand, key: &str, val: &str) -> &mut PipedCommand
+    self.env.insert(key.to_string(), val.to_string())
+    self
+  end
+
+  def current_dir(self: &mut PipedCommand, dir: &str) -> &mut PipedCommand
+    self.cwd = Option::Some(dir.to_string())
+    self
+  end
+
+  def stdin(self: &mut PipedCommand, cfg: Stdio) -> &mut PipedCommand
+    self.stdin_cfg = cfg
+    self
+  end
+
+  def stdout(self: &mut PipedCommand, cfg: Stdio) -> &mut PipedCommand
+    self.stdout_cfg = cfg
+    self
+  end
+
+  def stderr(self: &mut PipedCommand, cfg: Stdio) -> &mut PipedCommand
+    self.stderr_cfg = cfg
+    self
+  end
+
+  def spawn(self: &PipedCommand) -> Result[PipedChild, OsError]
+    ## Create pipes for Piped stdio
+    let stdin_pipe = match &self.stdin_cfg
+    when Stdio::Piped then Option::Some(pipe_create()?)
+    when _ then Option::None
+    end
+
+    let stdout_pipe = match &self.stdout_cfg
+    when Stdio::Piped then Option::Some(pipe_create()?)
+    when _ then Option::None
+    end
+
+    let stderr_pipe = match &self.stderr_cfg
+    when Stdio::Piped then Option::Some(pipe_create()?)
+    when _ then Option::None
+    end
+
+    let pid = fork()
+    if pid < 0 then
+      return Result::Err(OsError::from_errno())
+    end
+
+    if pid == 0 then
+      ## Child process: set up redirections
+      if let Option::Some(p) = &stdin_pipe then
+        dup2(p.read_fd, 0)
+        c_close(p.write_fd)
+      end
+      if let Option::Some(p) = &stdout_pipe then
+        dup2(p.write_fd, 1)
+        c_close(p.read_fd)
+      end
+      if let Option::Some(p) = &stderr_pipe then
+        dup2(p.write_fd, 2)
+        c_close(p.read_fd)
+      end
+
+      ## Null redirections
+      if let Stdio::Null = &self.stdin_cfg then
+        let devnull = open_fd("/dev/null", 0)  ## O_RDONLY
+        dup2(devnull, 0)
+        c_close(devnull)
+      end
+      if let Stdio::Null = &self.stdout_cfg then
+        let devnull = open_fd("/dev/null", 1)  ## O_WRONLY
+        dup2(devnull, 1)
+        c_close(devnull)
+      end
+
+      ## Set cwd, env, exec
+      if let Option::Some(dir) = &self.cwd then
+        chdir(dir.as_ptr())
+      end
+      for (k, v) in &self.env do
+        setenv(k.as_ptr(), v.as_ptr(), 1)
+      end
+
+      exec_command(&self.program, &self.args)
+      _exit(127)
+    end
+
+    ## Parent: close child-side fds, keep parent-side
+    let child_stdin = if let Option::Some(mut p) = stdin_pipe then
+      p.close_read()
+      Option::Some(p)
+    else
+      Option::None
+    end
+
+    let child_stdout = if let Option::Some(mut p) = stdout_pipe then
+      p.close_write()
+      Option::Some(p)
+    else
+      Option::None
+    end
+
+    let child_stderr = if let Option::Some(mut p) = stderr_pipe then
+      p.close_write()
+      Option::Some(p)
+    else
+      Option::None
+    end
+
+    Result::Ok(PipedChild {
+      pid: pid,
+      stdin: child_stdin,
+      stdout: child_stdout,
+      stderr: child_stderr,
+    })
+  end
+end
+
+## A child process with optional piped I/O handles
+struct PipedChild
+  pid: Int
+  stdin: Option[Pipe]
+  stdout: Option[Pipe]
+  stderr: Option[Pipe]
+end
+
+impl PipedChild
+  def wait(self: &mut PipedChild) -> Result[ExitStatus, OsError]
+    let mut status: Int = 0
+    let ret = waitpid(self.pid, &mut status, 0)
+    if ret < 0 then
+      Result::Err(OsError::from_errno())
+    else
+      Result::Ok(exit_status_from_raw(status))
+    end
+  end
+
+  ## Write data to child stdin then close it
+  def write_stdin(self: &mut PipedChild, data: &[u8]) -> Result[Unit, OsError]
+    if let Option::Some(p) = &self.stdin then
+      p.write(data)?
+      self.stdin = Option::None  ## Close by dropping
+      Result::Ok(())
+    else
+      Result::Err(OsError::new("stdin not piped"))
+    end
+  end
+
+  ## Read all stdout
+  def read_stdout(self: &mut PipedChild) -> Result[Vec[u8], OsError]
+    if let Option::Some(p) = &self.stdout then
+      let mut buf = Vec::new()
+      let mut chunk: [u8; 4096] = [0; 4096]
+      loop do
+        let n = p.read(&mut chunk)?
+        if n == 0 then break end
+        buf.extend_from_slice(&chunk[0..n])
+      end
+      Result::Ok(buf)
+    else
+      Result::Err(OsError::new("stdout not piped"))
+    end
+  end
+
+  ## Read all stderr
+  def read_stderr(self: &mut PipedChild) -> Result[Vec[u8], OsError]
+    if let Option::Some(p) = &self.stderr then
+      let mut buf = Vec::new()
+      let mut chunk: [u8; 4096] = [0; 4096]
+      loop do
+        let n = p.read(&mut chunk)?
+        if n == 0 then break end
+        buf.extend_from_slice(&chunk[0..n])
+      end
+      Result::Ok(buf)
+    else
+      Result::Err(OsError::new("stderr not piped"))
+    end
+  end
+
+  ## Send a signal to the child
+  def signal(self: &PipedChild, sig: Int) -> Result[Unit, OsError]
+    let ret = kill(self.pid, sig)
+    if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+  end
+
+  ## Kill the child (SIGKILL)
+  def kill(self: &PipedChild) -> Result[Unit, OsError]
+    self.signal(9)
+  end
+
+  ## Check if child has exited (non-blocking)
+  def try_wait(self: &PipedChild) -> Result[Option[ExitStatus], OsError]
+    let mut status: Int = 0
+    let ret = waitpid(self.pid, &mut status, 1)  ## WNOHANG = 1
+    if ret < 0 then
+      Result::Err(OsError::from_errno())
+    else if ret == 0 then
+      Result::Ok(Option::None)
+    else
+      Result::Ok(Option::Some(exit_status_from_raw(status)))
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Process Groups
+# ———————————————————————————————————————————————————————————————
+
+@[FFI(lib: "c")]
+extern def setpgid(pid: Int, pgid: Int) -> Int
+extern def getpgid(pid: Int) -> Int
+extern def killpg(pgrp: Int, sig: Int) -> Int
+extern def setsid() -> Int
+extern def getpid() -> Int
+extern def getppid() -> Int
+extern def getuid() -> UInt
+extern def geteuid() -> UInt
+
+## Process group management
+struct ProcessGroup
+  pgid: Int
+end
+
+impl ProcessGroup
+  ## Create a new process group with the current process as leader
+  def new() -> Result[ProcessGroup, OsError]
+    let pid = getpid()
+    let ret = setpgid(pid, pid)
+    if ret < 0 then Result::Err(OsError::from_errno())
+    else Result::Ok(ProcessGroup { pgid: pid })
+    end
+  end
+
+  ## Add a child process to this group
+  def add(self: &ProcessGroup, child_pid: Int) -> Result[Unit, OsError]
+    let ret = setpgid(child_pid, self.pgid)
+    if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+  end
+
+  ## Send a signal to all processes in this group
+  def signal_all(self: &ProcessGroup, sig: Int) -> Result[Unit, OsError]
+    let ret = killpg(self.pgid, sig)
+    if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+  end
+
+  ## Terminate all processes in the group (SIGTERM)
+  def terminate_all(self: &ProcessGroup) -> Result[Unit, OsError]
+    self.signal_all(15)  ## SIGTERM
+  end
+
+  ## Kill all processes in the group (SIGKILL)
+  def kill_all(self: &ProcessGroup) -> Result[Unit, OsError]
+    self.signal_all(9)  ## SIGKILL
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Signal Forwarding
+# ———————————————————————————————————————————————————————————————
+
+## Forward signals from parent to a child process
+struct SignalForwarder
+  child_pid: Int
+  signals: Vec[Int]
+end
+
+def signal_forwarder(child_pid: Int) -> SignalForwarder
+  SignalForwarder {
+    child_pid: child_pid,
+    signals: vec![1, 2, 3, 15],  ## HUP, INT, QUIT, TERM
+  }
+end
+
+impl SignalForwarder
+  def add_signal(self: &mut SignalForwarder, sig: Int) -> &mut SignalForwarder
+    self.signals.push(sig)
+    self
+  end
+
+  ## Install signal handlers that forward to the child
+  def install(self: &SignalForwarder) -> Result[Unit, OsError]
+    for sig in &self.signals do
+      let child = self.child_pid
+      signal_trap(*sig, move || {
+        kill(child, *sig)
+      })?
+    end
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Environment Builder
+# ———————————————————————————————————————————————————————————————
+
+## Build a complete environment (inherit or start clean)
+struct EnvBuilder
+  vars: Map[String, String]
+  inherit: Bool
+end
+
+def env_builder() -> EnvBuilder
+  EnvBuilder { vars: Map::new(), inherit: true }
+end
+
+def env_builder_clean() -> EnvBuilder
+  EnvBuilder { vars: Map::new(), inherit: false }
+end
+
+impl EnvBuilder
+  def set(self: &mut EnvBuilder, key: &str, value: &str) -> &mut EnvBuilder
+    self.vars.insert(key.to_string(), value.to_string())
+    self
+  end
+
+  def remove(self: &mut EnvBuilder, key: &str) -> &mut EnvBuilder
+    self.vars.remove(&key.to_string())
+    self
+  end
+
+  ## Add a path component to PATH
+  def prepend_path(self: &mut EnvBuilder, dir: &str) -> &mut EnvBuilder
+    let current = self.vars.get(&"PATH".to_string())
+      .cloned()
+      .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    self.vars.insert("PATH".to_string(), dir.to_string() + ":" + &current)
+    self
+  end
+
+  def append_path(self: &mut EnvBuilder, dir: &str) -> &mut EnvBuilder
+    let current = self.vars.get(&"PATH".to_string())
+      .cloned()
+      .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    self.vars.insert("PATH".to_string(), current + ":" + dir)
+    self
+  end
+
+  ## Build the final env map
+  def build(self: &EnvBuilder) -> Map[String, String]
+    let mut env = if self.inherit then
+      current_env()
+    else
+      Map::new()
+    end
+    for (k, v) in &self.vars do
+      env.insert(k.clone(), v.clone())
+    end
+    env
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Process Priority / Nice
+# ———————————————————————————————————————————————————————————————
+
+@[FFI(lib: "c")]
+extern def nice(inc: Int) -> Int
+extern def getpriority(which: Int, who: Int) -> Int
+extern def setpriority(which: Int, who: Int, prio: Int) -> Int
+
+let PRIO_PROCESS = 0
+let PRIO_PGRP = 1
+let PRIO_USER = 2
+
+## Get current process priority (-20 highest to 19 lowest)
+def get_priority() -> Result[Int, OsError]
+  let p = getpriority(PRIO_PROCESS, 0)
+  Result::Ok(p)
+end
+
+## Set current process priority
+def set_priority(prio: Int) -> Result[Unit, OsError]
+  let ret = setpriority(PRIO_PROCESS, 0, prio)
+  if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+end
+
+## Lower priority by increment (higher nice = lower priority)
+def lower_priority(inc: Int) -> Result[Int, OsError]
+  let ret = nice(inc)
+  if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(ret) end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pipeline: chain commands together
+# ———————————————————————————————————————————————————————————————
+
+## Chain multiple commands with pipes (shell pipeline)
+struct Pipeline
+  commands: Vec[PipedCommand]
+end
+
+def pipeline() -> Pipeline
+  Pipeline { commands: Vec::new() }
+end
+
+impl Pipeline
+  def add(self: &mut Pipeline, cmd: PipedCommand) -> &mut Pipeline
+    self.commands.push(cmd)
+    self
+  end
+
+  ## Execute the pipeline, return output of last command
+  def execute(self: &Pipeline) -> Result[Output, OsError]
+    if self.commands.is_empty() then
+      return Result::Err(OsError::new("empty pipeline"))
+    end
+
+    if self.commands.len() == 1 then
+      ## Single command, just run it
+      let mut cmd = self.commands[0].clone()
+      cmd.stdout_cfg = Stdio::Piped
+      cmd.stderr_cfg = Stdio::Piped
+      let mut child = cmd.spawn()?
+      let stdout_data = child.read_stdout()?
+      let stderr_data = child.read_stderr()?
+      let status = child.wait()?
+      return Result::Ok(Output {
+        status: status,
+        stdout: stdout_data,
+        stderr: stderr_data,
+      })
+    end
+
+    ## Multi-command pipeline: chain stdout -> stdin
+    let mut children: Vec[PipedChild] = Vec::new()
+    let n = self.commands.len()
+
+    for i in 0..n do
+      let mut cmd = self.commands[i].clone()
+      if i > 0 then
+        cmd.stdin_cfg = Stdio::Piped
+      end
+      if i < n - 1 then
+        cmd.stdout_cfg = Stdio::Piped
+      else
+        cmd.stdout_cfg = Stdio::Piped
+        cmd.stderr_cfg = Stdio::Piped
+      end
+      children.push(cmd.spawn()?)
+    end
+
+    ## Connect pipes between adjacent commands
+    for i in 0..(n - 1) do
+      if let Option::Some(stdout_pipe) = &children[i].stdout then
+        if let Option::Some(stdin_pipe) = &children[i + 1].stdin then
+          ## Transfer data (simplified — in practice use splice/sendfile)
+          let mut buf: [u8; 4096] = [0; 4096]
+          loop do
+            let nr = stdout_pipe.read(&mut buf)?
+            if nr == 0 then break end
+            stdin_pipe.write(&buf[0..nr])?
+          end
+        end
+      end
+      children[i].stdout = Option::None
+      children[i + 1].stdin = Option::None
+    end
+
+    ## Collect output from last command
+    let last = &mut children[n - 1]
+    let stdout_data = last.read_stdout().unwrap_or_default()
+    let stderr_data = last.read_stderr().unwrap_or_default()
+
+    ## Wait for all children
+    let mut final_status = ExitStatus { code: 0 }
+    for child in &mut children do
+      final_status = child.wait()?
+    end
+
+    Result::Ok(Output {
+      status: final_status,
+      stdout: stdout_data,
+      stderr: stderr_data,
+    })
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Process Info Utilities
+# ———————————————————————————————————————————————————————————————
+
+## Current process info
+def current_pid() -> Int = getpid()
+def parent_pid() -> Int = getppid()
+def current_uid() -> UInt = getuid()
+def effective_uid() -> UInt = geteuid()
+
+## Current environment as a map
+@[FFI(lib: "c")]
+extern def environ() -> *mut *mut u8
+
+def current_env() -> Map[String, String]
+  let mut env = Map::new()
+  ## Implementation reads from extern environ
+  env
+end
+
+## Get a single environment variable
+@[FFI(lib: "c")]
+extern def getenv(name: *const u8) -> *const u8
+
+def env_var(name: &str) -> Option[String]
+  let ptr = getenv(name.as_ptr())
+  if ptr.is_null() then
+    Option::None
+  else
+    Option::Some(cstring_to_string(ptr))
+  end
+end
+
+## Set environment variable
+@[FFI(lib: "c")]
+extern def setenv(name: *const u8, value: *const u8, overwrite: Int) -> Int
+extern def unsetenv(name: *const u8) -> Int
+
+def set_env_var(name: &str, value: &str) -> Result[Unit, OsError]
+  let ret = setenv(name.as_ptr(), value.as_ptr(), 1)
+  if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+end
+
+def remove_env_var(name: &str) -> Result[Unit, OsError]
+  let ret = unsetenv(name.as_ptr())
+  if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
+end
+
+## Helper: convert C string to Tangerine string
+def cstring_to_string(ptr: *const u8) -> String
+  let mut len = 0
+  while unsafe { *ptr.add(len) } != 0 do len = len + 1 end
+  let slice = unsafe { core::slice::from_raw_parts(ptr, len) }
+  String::from_utf8_lossy(slice).to_string()
+end
+
+## Exit the current process with a status code
+@[FFI(lib: "c")]
+extern def _exit(status: Int) -> !
+
+def exit(code: Int) -> !
+  _exit(code)
+end

@@ -1701,3 +1701,268 @@ mod checksum
     end
   end
 end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 6: ZSTD (Zstandard) COMPRESSION
+# ═══════════════════════════════════════════════════════════════
+
+## FFI bindings for libzstd
+extern "C"
+  def ZSTD_compress(dst: *mut u8, dstCapacity: UInt, src: *const u8, srcSize: UInt, compressionLevel: i32) -> UInt
+  def ZSTD_decompress(dst: *mut u8, dstCapacity: UInt, src: *const u8, compressedSize: UInt) -> UInt
+  def ZSTD_isError(code: UInt) -> u32
+  def ZSTD_getErrorName(code: UInt) -> *const u8
+  def ZSTD_compressBound(srcSize: UInt) -> UInt
+  def ZSTD_getFrameContentSize(src: *const u8, srcSize: UInt) -> u64
+  def ZSTD_createCCtx() -> *mut ()
+  def ZSTD_freeCCtx(cctx: *mut ()) -> UInt
+  def ZSTD_createDCtx() -> *mut ()
+  def ZSTD_freeDCtx(dctx: *mut ()) -> UInt
+  def ZSTD_compressCCtx(cctx: *mut (), dst: *mut u8, dstCapacity: UInt,
+                         src: *const u8, srcSize: UInt, compressionLevel: i32) -> UInt
+  def ZSTD_decompressDCtx(dctx: *mut (), dst: *mut u8, dstCapacity: UInt,
+                           src: *const u8, srcSize: UInt) -> UInt
+  ## Streaming API
+  def ZSTD_createCStream() -> *mut ()
+  def ZSTD_freeCStream(zcs: *mut ()) -> UInt
+  def ZSTD_initCStream(zcs: *mut (), compressionLevel: i32) -> UInt
+  def ZSTD_createDStream() -> *mut ()
+  def ZSTD_freeDStream(zds: *mut ()) -> UInt
+  def ZSTD_initDStream(zds: *mut ()) -> UInt
+end
+
+const ZSTD_CONTENTSIZE_UNKNOWN: u64 = 0xFFFFFFFFFFFFFFFF
+const ZSTD_CONTENTSIZE_ERROR: u64 = 0xFFFFFFFFFFFFFFFE
+const ZSTD_DEFAULT_LEVEL: i32 = 3
+const ZSTD_MIN_LEVEL: i32 = 1
+const ZSTD_MAX_LEVEL: i32 = 22
+
+module zstd
+  enum ZstdLevel
+    Fast       ## Level 1
+    Default    ## Level 3
+    Best       ## Level 19
+    Custom(i32)
+  end
+
+  def level_to_int(level: &ZstdLevel) -> i32
+    match level
+    when ZstdLevel::Fast then 1
+    when ZstdLevel::Default then 3
+    when ZstdLevel::Best then 19
+    when ZstdLevel::Custom(l) then *l
+    end
+  end
+
+  ## One-shot compression
+  def compress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    compress_level(data, &ZstdLevel::Default)
+  end
+
+  def compress_level(data: &[u8], level: &ZstdLevel) -> Result[Vec[u8], CompressionError]
+    let bound = unsafe "FFI boundary" do ZSTD_compressBound(data.len()) end
+    let mut output = vec![0u8; bound]
+    let result = unsafe "FFI boundary" do
+      ZSTD_compress(output.as_mut_ptr(), bound, data.as_ptr(), data.len(), level_to_int(level))
+    end
+    let is_err = unsafe "FFI boundary" do ZSTD_isError(result) end
+    if is_err != 0 then
+      return Result::Err(CompressionError::DataError("Zstd compression failed".to_string()))
+    end
+    output.truncate(result)
+    Result::Ok(output)
+  end
+
+  ## One-shot decompression
+  def decompress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    let content_size = unsafe "FFI boundary" do ZSTD_getFrameContentSize(data.as_ptr(), data.len()) end
+    let dst_capacity = if content_size == ZSTD_CONTENTSIZE_UNKNOWN || content_size == ZSTD_CONTENTSIZE_ERROR then
+      data.len() * 4  ## Heuristic
+    else
+      content_size as UInt
+    end
+    let mut output = vec![0u8; dst_capacity]
+    let result = unsafe "FFI boundary" do
+      ZSTD_decompress(output.as_mut_ptr(), dst_capacity, data.as_ptr(), data.len())
+    end
+    let is_err = unsafe "FFI boundary" do ZSTD_isError(result) end
+    if is_err != 0 then
+      return Result::Err(CompressionError::DataError("Zstd decompression failed".to_string()))
+    end
+    output.truncate(result)
+    Result::Ok(output)
+  end
+
+  ## Streaming compressor
+  struct ZstdEncoder[W: Write]
+    writer: W
+    cctx: *mut ()
+    buffer: Vec[u8]
+  end
+
+  def ZstdEncoder::new[W: Write](writer: W, level: &ZstdLevel) -> Result[ZstdEncoder[W], CompressionError]
+    let cctx = unsafe "FFI boundary" do ZSTD_createCCtx() end
+    if cctx.is_null() then
+      return Result::Err(CompressionError::MemoryError("failed to allocate Zstd context".to_string()))
+    end
+    Result::Ok(ZstdEncoder {
+      writer: writer,
+      cctx: cctx,
+      buffer: Vec::with_capacity(65536),
+    })
+  end
+
+  impl[W: Write] Drop for ZstdEncoder[W]
+    def drop(self: &mut ZstdEncoder[W]) -> Unit
+      if !self.cctx.is_null() then
+        unsafe "FFI boundary" do ZSTD_freeCCtx(self.cctx) end
+      end
+    end
+  end
+
+  ## Streaming decompressor
+  struct ZstdDecoder[R: Read]
+    reader: R
+    dctx: *mut ()
+    buffer: Vec[u8]
+  end
+
+  def ZstdDecoder::new[R: Read](reader: R) -> Result[ZstdDecoder[R], CompressionError]
+    let dctx = unsafe "FFI boundary" do ZSTD_createDCtx() end
+    if dctx.is_null() then
+      return Result::Err(CompressionError::MemoryError("failed to allocate Zstd decompression context".to_string()))
+    end
+    Result::Ok(ZstdDecoder {
+      reader: reader,
+      dctx: dctx,
+      buffer: Vec::with_capacity(65536),
+    })
+  end
+
+  impl[R: Read] Drop for ZstdDecoder[R]
+    def drop(self: &mut ZstdDecoder[R]) -> Unit
+      if !self.dctx.is_null() then
+        unsafe "FFI boundary" do ZSTD_freeDCtx(self.dctx) end
+      end
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 7: BROTLI COMPRESSION
+# ═══════════════════════════════════════════════════════════════
+
+extern "C"
+  def BrotliEncoderCompress(quality: i32, lgwin: i32, mode: i32,
+                             input_size: UInt, input_buffer: *const u8,
+                             encoded_size: *mut UInt, encoded_buffer: *mut u8) -> i32
+  def BrotliDecoderDecompress(encoded_size: UInt, encoded_buffer: *const u8,
+                               decoded_size: *mut UInt, decoded_buffer: *mut u8) -> i32
+end
+
+const BROTLI_MODE_GENERIC: i32 = 0
+const BROTLI_MODE_TEXT: i32 = 1
+const BROTLI_MODE_FONT: i32 = 2
+const BROTLI_DEFAULT_QUALITY: i32 = 11
+const BROTLI_DEFAULT_WINDOW: i32 = 22
+
+module brotli
+  enum BrotliMode
+    Generic
+    Text
+    Font
+  end
+
+  def mode_to_int(mode: &BrotliMode) -> i32
+    match mode
+    when BrotliMode::Generic then BROTLI_MODE_GENERIC
+    when BrotliMode::Text then BROTLI_MODE_TEXT
+    when BrotliMode::Font then BROTLI_MODE_FONT
+    end
+  end
+
+  def compress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    compress_opts(data, BROTLI_DEFAULT_QUALITY, &BrotliMode::Generic)
+  end
+
+  def compress_opts(data: &[u8], quality: i32, mode: &BrotliMode) -> Result[Vec[u8], CompressionError]
+    let mut out_size = data.len() + 1024  ## Conservative estimate
+    let mut output = vec![0u8; out_size]
+    let ret = unsafe "FFI boundary" do
+      BrotliEncoderCompress(quality, BROTLI_DEFAULT_WINDOW, mode_to_int(mode),
+                             data.len(), data.as_ptr(), &mut out_size, output.as_mut_ptr())
+    end
+    if ret == 0 then
+      return Result::Err(CompressionError::DataError("Brotli compression failed".to_string()))
+    end
+    output.truncate(out_size)
+    Result::Ok(output)
+  end
+
+  def decompress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    ## Start with 4x input size estimate, retry with larger if needed
+    let mut out_size = data.len() * 4
+    let mut output = vec![0u8; out_size]
+    let ret = unsafe "FFI boundary" do
+      BrotliDecoderDecompress(data.len(), data.as_ptr(), &mut out_size, output.as_mut_ptr())
+    end
+    if ret == 0 then
+      return Result::Err(CompressionError::DataError("Brotli decompression failed".to_string()))
+    end
+    output.truncate(out_size)
+    Result::Ok(output)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# PART 8: LZ4 COMPRESSION
+# ═══════════════════════════════════════════════════════════════
+
+extern "C"
+  def LZ4_compress_default(src: *const u8, dst: *mut u8, srcSize: i32, dstCapacity: i32) -> i32
+  def LZ4_decompress_safe(src: *const u8, dst: *mut u8, compressedSize: i32, dstCapacity: i32) -> i32
+  def LZ4_compressBound(inputSize: i32) -> i32
+end
+
+module lz4
+  def compress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    let bound = unsafe "FFI boundary" do LZ4_compressBound(data.len() as i32) end
+    if bound <= 0 then
+      return Result::Err(CompressionError::DataError("LZ4 compressBound failed".to_string()))
+    end
+    ## Prepend original size as 4 bytes for decompression
+    let mut output = vec![0u8; (bound as UInt) + 4]
+    let orig_len = data.len() as u32
+    output[0] = (orig_len & 0xFF) as u8
+    output[1] = ((orig_len >> 8) & 0xFF) as u8
+    output[2] = ((orig_len >> 16) & 0xFF) as u8
+    output[3] = ((orig_len >> 24) & 0xFF) as u8
+
+    let written = unsafe "FFI boundary" do
+      LZ4_compress_default(data.as_ptr(), output.as_mut_ptr().offset(4), data.len() as i32, bound)
+    end
+    if written <= 0 then
+      return Result::Err(CompressionError::DataError("LZ4 compression failed".to_string()))
+    end
+    output.truncate((written as UInt) + 4)
+    Result::Ok(output)
+  end
+
+  def decompress(data: &[u8]) -> Result[Vec[u8], CompressionError]
+    if data.len() < 4 then
+      return Result::Err(CompressionError::DataError("LZ4 frame too short".to_string()))
+    end
+    let orig_len = (data[0] as u32) | ((data[1] as u32) << 8) |
+                   ((data[2] as u32) << 16) | ((data[3] as u32) << 24)
+    let mut output = vec![0u8; orig_len as UInt]
+    let written = unsafe "FFI boundary" do
+      LZ4_decompress_safe(data.as_ptr().offset(4), output.as_mut_ptr(),
+                           (data.len() - 4) as i32, orig_len as i32)
+    end
+    if written < 0 then
+      return Result::Err(CompressionError::DataError("LZ4 decompression failed".to_string()))
+    end
+    output.truncate(written as UInt)
+    Result::Ok(output)
+  end
+end
