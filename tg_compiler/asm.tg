@@ -30,7 +30,8 @@ end
 
 enum FixupKind
   Rel32              # 32-bit PC-relative (x86-64 jmp/call/jcc)
-  Branch26           # ARM64 26-bit branch
+  Branch26           # ARM64 26-bit branch (B, BL)
+  BCond19            # ARM64 19-bit conditional branch (B.cond, CBZ, CBNZ)
   Adrp21             # ARM64 ADRP page
   AddImm12           # ARM64 ADD lo12
 end
@@ -52,12 +53,52 @@ enum RelocKind
   R_AARCH64_CALL26
   R_AARCH64_ADR_PREL_PG_HI21
   R_AARCH64_ADD_ABS_LO12_NC
+  R_AARCH64_LDST16_ABS_LO12_NC
   # Mach-O
   X86_64_RELOC_BRANCH
   X86_64_RELOC_SIGNED
   ARM64_RELOC_BRANCH26
   ARM64_RELOC_PAGE21
   ARM64_RELOC_PAGEOFF12
+end
+
+def from_elf_reloc_type(arch: Arch, reloc_type: Int) -> Option[RelocKind]
+  match arch
+  when Arch::X86_64 then
+    match reloc_type
+    when 1 then Option::Some(RelocKind::R_X86_64_64)
+    when 2 then Option::Some(RelocKind::R_X86_64_PC32)
+    when 4 then Option::Some(RelocKind::R_X86_64_PLT32)
+    when 9 then Option::Some(RelocKind::R_X86_64_GOTPCREL)
+    when _ then Option::None
+    end
+  when Arch::AArch64 then
+    match reloc_type
+    when 275 then Option::Some(RelocKind::R_AARCH64_ADR_PREL_PG_HI21)
+    when 277 then Option::Some(RelocKind::R_AARCH64_ADD_ABS_LO12_NC)
+    when 284 then Option::Some(RelocKind::R_AARCH64_LDST16_ABS_LO12_NC)
+    when 283 then Option::Some(RelocKind::R_AARCH64_CALL26)
+    when _ then Option::None
+    end
+  end
+end
+
+def from_macho_reloc_type(arch: Arch, reloc_type: Int) -> Option[RelocKind]
+  match arch
+  when Arch::X86_64 then
+    match reloc_type
+    when 1 then Option::Some(RelocKind::X86_64_RELOC_SIGNED)
+    when 2 then Option::Some(RelocKind::X86_64_RELOC_BRANCH)
+    when _ then Option::None
+    end
+  when Arch::AArch64 then
+    match reloc_type
+    when 2 then Option::Some(RelocKind::ARM64_RELOC_BRANCH26)
+    when 3 then Option::Some(RelocKind::ARM64_RELOC_PAGE21)
+    when 4 then Option::Some(RelocKind::ARM64_RELOC_PAGEOFF12)
+    when _ then Option::None
+    end
+  end
 end
 
 struct AsmSymbol
@@ -175,6 +216,11 @@ def resolve_fixups(b: &mut CodeBuffer) -> Result[Unit, String]
         let imm26 = (rel >> 2) & 0x03FFFFFF
         let old = read32_le(b, f.offset)
         patch32_le(b, f.offset, (old & 0xFC000000) | (imm26 as u32))
+      when FixupKind::BCond19 then
+        let rel = (target - f.offset) as i32
+        let imm19 = ((rel >> 2) & 0x7FFFF) as u32
+        let old = read32_le(b, f.offset)
+        patch32_le(b, f.offset, (old & 0xFF00001F) | (imm19 << 5))
       when FixupKind::Adrp21 then
         # ARM64 ADRP: page-relative address (4KB aligned)
         # imm = ((target_page - pc_page) >> 12) split into immhi:immlo
@@ -207,7 +253,7 @@ end
 
 def align_to(b: &mut CodeBuffer, alignment: Int) -> Unit
   while (buf_pos(b) % alignment) != 0 do
-    emit8(b, 0x90)  # NOP for text, 0x00 for data
+    emit8(b, 0x00)
   end
 end
 
@@ -774,16 +820,15 @@ end
 # Load full 64-bit immediate using MOVZ + MOVK sequence
 def a64_mov_ri(b: &mut CodeBuffer, d: A64, imm: i64) -> Unit
   let u = imm as u64
-  a64_movz(b, d, (u & 0xFFFF) as u16, 0)
-  if u > 0xFFFF then
-    a64_movk(b, d, ((u >> 16) & 0xFFFF) as u16, 16)
-  end
-  if u > 0xFFFFFFFF then
-    a64_movk(b, d, ((u >> 32) & 0xFFFF) as u16, 32)
-  end
-  if u > 0xFFFFFFFFFFFF then
-    a64_movk(b, d, ((u >> 48) & 0xFFFF) as u16, 48)
-  end
+  let lane0 = (u & 0xFFFF) as u16
+  let lane1 = ((u >> 16) & 0xFFFF) as u16
+  let lane2 = ((u >> 32) & 0xFFFF) as u16
+  let lane3 = ((u >> 48) & 0xFFFF) as u16
+
+  a64_movz(b, d, lane0, 0)
+  if lane1 != 0 then a64_movk(b, d, lane1, 16) end
+  if lane2 != 0 then a64_movk(b, d, lane2, 32) end
+  if lane3 != 0 then a64_movk(b, d, lane3, 48) end
 end
 
 # LDR Xd, [Xn, #imm12*8]
@@ -834,7 +879,7 @@ end
 
 # B.cond label
 def a64_bcond(b: &mut CodeBuffer, cond: u32, label: String) -> Unit
-  add_fixup(b, FixupKind::Branch26, label)
+  add_fixup(b, FixupKind::BCond19, label)
   emit32_le(b, 0x54000000 | (cond & 0xF))
 end
 
@@ -971,6 +1016,195 @@ def a64_cc_lt() -> u32 = 11  # 0b1011
 def a64_cc_le() -> u32 = 13  # 0b1101
 def a64_cc_gt() -> u32 = 12  # 0b1100
 def a64_cc_ge() -> u32 = 10  # 0b1010
+
+# ———————————————————————————————————————————————————————————————
+# ARM64 SIMD/FP Instructions (using V registers as Dn for double)
+# ———————————————————————————————————————————————————————————————
+
+# FMOV Dd, Dn  (copy FP register to FP register, double precision)
+def a64_fmov_dd(b: &mut CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E604000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FMOV Dd, Xn  (general register to FP register, 64-bit)
+def a64_fmov_dx(b: &mut CodeBuffer, d: A64V, n: A64) -> Unit
+  emit32_le(b, 0x9E670000 | (a64_code(n) << 5) | a64v_code(d))
+end
+
+# FMOV Xd, Dn  (FP register to general register, 64-bit)
+def a64_fmov_xd(b: &mut CodeBuffer, d: A64, n: A64V) -> Unit
+  emit32_le(b, 0x9E660000 | (a64v_code(n) << 5) | a64_code(d))
+end
+
+# FADD Dd, Dn, Dm  (double-precision add)
+def a64_fadd_ddd(b: &mut CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E602800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FSUB Dd, Dn, Dm  (double-precision subtract)
+def a64_fsub_ddd(b: &mut CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E603800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FMUL Dd, Dn, Dm  (double-precision multiply)
+def a64_fmul_ddd(b: &mut CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E600800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FDIV Dd, Dn, Dm  (double-precision divide)
+def a64_fdiv_ddd(b: &mut CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E601800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FNEG Dd, Dn  (double-precision negate)
+def a64_fneg_dd(b: &mut CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E614000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FCMP Dn, Dm  (compare two doubles, sets NZCV)
+def a64_fcmp_dd(b: &mut CodeBuffer, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E602000 | (a64v_code(m) << 16) | (a64v_code(n) << 5))
+end
+
+# LDR Dt, [Xn, #imm12*8]  (load 64-bit FP from memory)
+def a64_ldr_d(b: &mut CodeBuffer, d: A64V, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 8) & 0xFFF
+  emit32_le(b, 0xFD400000 | (imm12 << 10) | (a64_code(base) << 5) | a64v_code(d))
+end
+
+# STR Dt, [Xn, #imm12*8]  (store 64-bit FP to memory)
+def a64_str_d(b: &mut CodeBuffer, src: A64V, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 8) & 0xFFF
+  emit32_le(b, 0xFD000000 | (imm12 << 10) | (a64_code(base) << 5) | a64v_code(src))
+end
+
+# LDUR Dt, [Xn, #simm9]  (unscaled offset load FP)
+def a64_ldur_d(b: &mut CodeBuffer, d: A64V, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xFC400000 | (imm9 << 12) | (a64_code(base) << 5) | a64v_code(d))
+end
+
+# STUR Dt, [Xn, #simm9]  (unscaled offset store FP)
+def a64_stur_d(b: &mut CodeBuffer, src: A64V, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xFC000000 | (imm9 << 12) | (a64_code(base) << 5) | a64v_code(src))
+end
+
+# SCVTF Dd, Xn  (signed int to double)
+def a64_scvtf_dx(b: &mut CodeBuffer, d: A64V, n: A64) -> Unit
+  emit32_le(b, 0x9E620000 | (a64_code(n) << 5) | a64v_code(d))
+end
+
+# FCVTZS Xd, Dn  (double to signed int, round toward zero)
+def a64_fcvtzs_xd(b: &mut CodeBuffer, d: A64, n: A64V) -> Unit
+  emit32_le(b, 0x9E780000 | (a64v_code(n) << 5) | a64_code(d))
+end
+
+# FSQRT Dd, Dn  (double square root)
+def a64_fsqrt_dd(b: &mut CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E61C000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# ———————————————————————————————————————————————————————————————
+# x86-64 SSE2 Instructions (for float support)
+# ———————————————————————————————————————————————————————————————
+
+# SSE register encoding: XMM0=0, XMM1=1, ..., XMM15=15
+# Mapped into PhysReg::X64Reg as indices 16..31
+
+# MOVSD xmm_d, xmm_s  (F2 0F 10 /r)
+def x64_movsd_rr(b: &mut CodeBuffer, d: u8, s: u8) -> Unit
+  b.data.push(0xF2)
+  if d >= 8 || s >= 8 then
+    b.data.push(0x40 | ((d >> 3) << 2) | (s >> 3))
+  end
+  b.data.push(0x0F)
+  b.data.push(0x10)
+  b.data.push(0xC0 | ((d & 7) << 3) | (s & 7))
+end
+
+# MOVSD xmm, [base + disp32]  (F2 0F 10 /r)
+def x64_movsd_load(b: &mut CodeBuffer, d: u8, base: X64, disp: i32) -> Unit
+  b.data.push(0xF2)
+  if d >= 8 || x64_hi(base) then
+    b.data.push(rex(false, d >= 8, false, x64_hi(base)))
+  end
+  b.data.push(0x0F)
+  b.data.push(0x10)
+  let modrm = 0x80 | ((d & 7) << 3) | (x64_code(base) & 7)
+  b.data.push(modrm)
+  if x64_code(base) == 4 then b.data.push(0x24) end
+  emit32_le(b, disp as u32)
+end
+
+# MOVSD [base + disp32], xmm  (F2 0F 11 /r)
+def x64_movsd_store(b: &mut CodeBuffer, base: X64, disp: i32, s: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x0F)
+  b.data.push(0x11)
+  let modrm = 0x80 | ((s & 7) << 3) | (x64_code(base) & 7)
+  b.data.push(modrm)
+  if x64_code(base) == 4 then b.data.push(0x24) end
+  emit32_le(b, disp as u32)
+end
+
+# ADDSD xmm_d, xmm_s  (F2 0F 58 /r)
+def x64_addsd(b: &mut CodeBuffer, d: u8, s: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x0F)
+  b.data.push(0x58)
+  b.data.push(0xC0 | ((d & 7) << 3) | (s & 7))
+end
+
+# SUBSD xmm_d, xmm_s  (F2 0F 5C /r)
+def x64_subsd(b: &mut CodeBuffer, d: u8, s: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x0F)
+  b.data.push(0x5C)
+  b.data.push(0xC0 | ((d & 7) << 3) | (s & 7))
+end
+
+# MULSD xmm_d, xmm_s  (F2 0F 59 /r)
+def x64_mulsd(b: &mut CodeBuffer, d: u8, s: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x0F)
+  b.data.push(0x59)
+  b.data.push(0xC0 | ((d & 7) << 3) | (s & 7))
+end
+
+# DIVSD xmm_d, xmm_s  (F2 0F 5E /r)
+def x64_divsd(b: &mut CodeBuffer, d: u8, s: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x0F)
+  b.data.push(0x5E)
+  b.data.push(0xC0 | ((d & 7) << 3) | (s & 7))
+end
+
+# UCOMISD xmm, xmm  (66 0F 2E /r — sets EFLAGS from FP compare)
+def x64_ucomisd(b: &mut CodeBuffer, a: u8, c: u8) -> Unit
+  b.data.push(0x66)
+  b.data.push(0x0F)
+  b.data.push(0x2E)
+  b.data.push(0xC0 | ((a & 7) << 3) | (c & 7))
+end
+
+# CVTSI2SD xmm, reg64  (F2 REX.W 0F 2A /r — int-to-double)
+def x64_cvtsi2sd(b: &mut CodeBuffer, d: u8, src: X64) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x48 | ((d >> 3) << 2))
+  b.data.push(0x0F)
+  b.data.push(0x2A)
+  b.data.push(0xC0 | ((d & 7) << 3) | (x64_code(src) & 7))
+end
+
+# CVTTSD2SI reg64, xmm  (F2 REX.W 0F 2C /r — double-to-int truncate)
+def x64_cvttsd2si(b: &mut CodeBuffer, d: X64, src: u8) -> Unit
+  b.data.push(0xF2)
+  b.data.push(0x48 | ((x64_code(d) >> 3) << 2))
+  b.data.push(0x0F)
+  b.data.push(0x2C)
+  b.data.push(0xC0 | ((x64_code(d) & 7) << 3) | (src & 7))
+end
 
 # ———————————————————————————————————————————————————————————————
 # Target triple detection

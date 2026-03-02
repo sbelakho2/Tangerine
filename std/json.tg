@@ -11,6 +11,8 @@
 
 use std::core::{Option, Result, Vec, String, Bool, Int, Float, panic}
 use std::collections::{Map}
+use std::crypto::base64
+use std::fmt
 use std::serde::{Value, Serialize, Deserialize, Serializer, Deserializer, SerError}
 
 # ———————————————————————————————————————————————————————————————
@@ -75,6 +77,8 @@ enum JsonError
   ExpectedColon(UInt, UInt)
   ExpectedValue(UInt, UInt)
   Deserialize(String)
+ 
+  MaxDepthExceeded(UInt, UInt)
 end
 
 def json_error_message(e: &JsonError) -> String
@@ -92,6 +96,8 @@ def json_error_message(e: &JsonError) -> String
   when JsonError::ExpectedValue(line, col) then
     "expected value at " + line.to_string() + ":" + col.to_string()
   when JsonError::Deserialize(s) then "deserialize error: " + s.clone()
+  when JsonError::MaxDepthExceeded(line, col) then
+    "maximum nesting depth exceeded at " + line.to_string() + ":" + col.to_string()
   end
 end
 
@@ -105,11 +111,16 @@ end
 # JSON Parser
 # ———————————————————————————————————————————————————————————————
 
+# Maximum nesting depth to prevent stack overflow
+const MAX_JSON_DEPTH: UInt = 128
+
 struct JsonParser
   input: String
   pos: UInt
   line: UInt
   column: UInt
+  # Track nesting depth
+  depth: UInt
 end
 
 def JsonParser::new(input: &str) -> JsonParser
@@ -117,7 +128,8 @@ def JsonParser::new(input: &str) -> JsonParser
     input: input.to_string(),
     pos: 0,
     line: 1,
-    column: 1
+    column: 1,
+    depth: 0
   }
 end
 
@@ -188,6 +200,12 @@ impl JsonParser
   end
   
   def parse_object(self: &mut JsonParser) -> Result[Value, JsonError]
+    # Check depth limit to prevent stack overflow
+    if self.depth >= MAX_JSON_DEPTH then
+      return Result::Err(JsonError::MaxDepthExceeded(self.line, self.column))
+    end
+    self.depth = self.depth + 1
+    
     self.advance()  # consume '{'
     self.skip_whitespace()
     
@@ -196,6 +214,7 @@ impl JsonParser
     match self.peek()
     when Option::Some('}') then
       self.advance()
+      self.depth = self.depth - 1
       return Result::Ok(Value::Object(obj))
     when _ then ()
     end
@@ -244,6 +263,7 @@ impl JsonParser
         end
       when Option::Some('}') then
         self.advance()
+        self.depth = self.depth - 1
         return Result::Ok(Value::Object(obj))
       when Option::Some(c) then return Result::Err(JsonError::UnexpectedChar(c, self.line, self.column))
       when Option::None then return Result::Err(JsonError::UnexpectedEof)
@@ -252,6 +272,12 @@ impl JsonParser
   end
   
   def parse_array(self: &mut JsonParser) -> Result[Value, JsonError]
+    # Check depth limit to prevent stack overflow
+    if self.depth >= MAX_JSON_DEPTH then
+      return Result::Err(JsonError::MaxDepthExceeded(self.line, self.column))
+    end
+    self.depth = self.depth + 1
+    
     self.advance()  # consume '['
     self.skip_whitespace()
     
@@ -260,6 +286,7 @@ impl JsonParser
     match self.peek()
     when Option::Some(']') then
       self.advance()
+      self.depth = self.depth - 1
       return Result::Ok(Value::Array(arr))
     when _ then ()
     end
@@ -283,6 +310,7 @@ impl JsonParser
         end
       when Option::Some(']') then
         self.advance()
+        self.depth = self.depth - 1
         return Result::Ok(Value::Array(arr))
       when Option::Some(c) then return Result::Err(JsonError::UnexpectedChar(c, self.line, self.column))
       when Option::None then return Result::Err(JsonError::UnexpectedEof)
@@ -316,9 +344,9 @@ impl JsonParser
             when Option::Some(h) then
               if h >= '0' && h <= '9' then
                 code = code * 16 + (h as UInt - '0' as UInt)
-              else if h >= 'a' && h <= 'f' then
+              elsif h >= 'a' && h <= 'f' then
                 code = code * 16 + (h as UInt - 'a' as UInt + 10)
-              else if h >= 'A' && h <= 'F' then
+              elsif h >= 'A' && h <= 'F' then
                 code = code * 16 + (h as UInt - 'A' as UInt + 10)
               else
                 return Result::Err(JsonError::InvalidUnicode(h.to_string()))
@@ -326,7 +354,46 @@ impl JsonParser
             when Option::None then return Result::Err(JsonError::UnexpectedEof)
             end
           end
-          result.push(char_from_code(code))
+          if code >= 0xD800 && code <= 0xDBFF then
+            # High surrogate — expect \uDC00-\uDFFF low surrogate pair
+            match self.peek()
+            when Option::Some('\\') then
+              self.advance()
+              match self.advance()
+              when Option::Some('u') then
+                let mut low: UInt = 0
+                for j in 0..4 do
+                  match self.advance()
+                  when Option::Some(h2) then
+                    if h2 >= '0' && h2 <= '9' then
+                      low = low * 16 + (h2 as UInt - '0' as UInt)
+                    elsif h2 >= 'a' && h2 <= 'f' then
+                      low = low * 16 + (h2 as UInt - 'a' as UInt + 10)
+                    elsif h2 >= 'A' && h2 <= 'F' then
+                      low = low * 16 + (h2 as UInt - 'A' as UInt + 10)
+                    else
+                      return Result::Err(JsonError::InvalidUnicode(h2.to_string()))
+                    end end end
+                  when Option::None then return Result::Err(JsonError::UnexpectedEof)
+                  end
+                end
+                if low >= 0xDC00 && low <= 0xDFFF then
+                  let codepoint = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00)
+                  result.push(char_from_code(codepoint))
+                else
+                  return Result::Err(JsonError::InvalidUnicode("expected low surrogate, got \\u" + format_hex4(low)))
+                end
+              when _ then
+                return Result::Err(JsonError::InvalidUnicode("expected \\u after high surrogate"))
+              end
+            when _ then
+              return Result::Err(JsonError::InvalidUnicode("lone high surrogate"))
+            end
+          elsif code >= 0xDC00 && code <= 0xDFFF then
+            return Result::Err(JsonError::InvalidUnicode("unexpected low surrogate"))
+          else
+            result.push(char_from_code(code))
+          end end
         when Option::Some(c) then
           return Result::Err(JsonError::InvalidEscape("\\" + c.to_string()))
         when Option::None then return Result::Err(JsonError::UnexpectedEof)
@@ -428,7 +495,7 @@ impl JsonParser
   def parse_bool(self: &mut JsonParser) -> Result[Value, JsonError]
     if self.matches("true") then
       Result::Ok(Value::Bool(true))
-    else if self.matches("false") then
+    elsif self.matches("false") then
       Result::Ok(Value::Bool(false))
     else
       match self.peek()
@@ -799,14 +866,9 @@ impl Serializer for JsonSerializer
   end
   
   def serialize_map_value(self: &mut JsonSerializer, v: &dyn Serialize) -> Result[Unit, SerError]
-    # Don't call pre/post_value since key already handled separator
-    let old_state = self.state.pop()
-    v.serialize(self)?
-    match old_state
-    when Option::Some(s) then self.state.push(s)
-    when Option::None then ()
-    end
-    Result::Ok(())
+    # Don't call pre/post_value since key already handled separator.
+    # Keep serializer state intact even if value serialization fails.
+    v.serialize(self)
   end
   
   def serialize_map_end(self: &mut JsonSerializer) -> Result[Unit, SerError]
@@ -885,7 +947,22 @@ impl Deserializer for JsonDeserializer
       when Option::Some(bytes) then Result::Ok(bytes)
       when Option::None then Result::Err(SerError::InvalidValue("invalid base64"))
       end
-    when _ then Result::Err(SerError::InvalidType("expected string"))
+    when Value::Array(arr) then
+      let mut bytes = Vec::new()
+      for item in arr do
+        match item
+        when Value::Int(n) then
+          if n >= 0 && n <= 255 then
+            bytes.push(n as u8)
+          else
+            return Result::Err(SerError::InvalidValue("byte value out of range: " + n.to_string()))
+          end
+        when _ then
+          return Result::Err(SerError::InvalidType("expected integer in byte array"))
+        end
+      end
+      Result::Ok(bytes)
+    when _ then Result::Err(SerError::InvalidType("expected string or array"))
     end
   end
   
@@ -990,87 +1067,5 @@ def parse_int(s: &String) -> Option[Int]
 end
 
 def parse_float(s: &String) -> Option[Float]
-  # Simple float parsing - delegate to compiler intrinsic
-  string_to_float(s)
-end
-
-extern "Tangerine"
-  def string_to_float(s: &String) -> Option[Float]
-end
-
-def base64_encode(data: &[u8]) -> String
-  let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-  let mut result = String::new()
-  let len = data.len()
-  let mut i = 0
-  
-  while i + 2 < len do
-    let n = (data[i] as UInt << 16) | (data[i + 1] as UInt << 8) | (data[i + 2] as UInt)
-    result.push(chars.char_at((n >> 18) & 0x3F))
-    result.push(chars.char_at((n >> 12) & 0x3F))
-    result.push(chars.char_at((n >> 6) & 0x3F))
-    result.push(chars.char_at(n & 0x3F))
-    i = i + 3
-  end
-  
-  if len - i == 2 then
-    let n = (data[i] as UInt << 16) | (data[i + 1] as UInt << 8)
-    result.push(chars.char_at((n >> 18) & 0x3F))
-    result.push(chars.char_at((n >> 12) & 0x3F))
-    result.push(chars.char_at((n >> 6) & 0x3F))
-    result.push('=')
-  else if len - i == 1 then
-    let n = data[i] as UInt << 16
-    result.push(chars.char_at((n >> 18) & 0x3F))
-    result.push(chars.char_at((n >> 12) & 0x3F))
-    result.push('=')
-    result.push('=')
-  end end
-  
-  result
-end
-
-def base64_decode(s: &String) -> Option[Vec[u8]]
-  let mut result = Vec::new()
-  let mut buf: UInt = 0
-  let mut bits = 0
-  
-  for c in s.chars() do
-    if c == '=' then break end
-    
-    let val = base64_char_value(c)
-    if val == 255 then
-      # Skip whitespace
-      if c == ' ' || c == '\n' || c == '\r' || c == '\t' then
-        continue
-      end
-      return Option::None
-    end
-    
-    buf = (buf << 6) | val
-    bits = bits + 6
-    
-    if bits >= 8 then
-      bits = bits - 8
-      result.push(((buf >> bits) & 0xFF) as u8)
-    end
-  end
-  
-  Option::Some(result)
-end
-
-def base64_char_value(c: Char) -> UInt
-  if c >= 'A' && c <= 'Z' then
-    c as UInt - 'A' as UInt
-  else if c >= 'a' && c <= 'z' then
-    c as UInt - 'a' as UInt + 26
-  else if c >= '0' && c <= '9' then
-    c as UInt - '0' as UInt + 52
-  else if c == '+' then
-    62
-  else if c == '/' then
-    63
-  else
-    255
-  end end end end end
+  fmt::parse_int(s.clone())
 end

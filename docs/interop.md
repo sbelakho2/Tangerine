@@ -91,7 +91,7 @@ MRI Ruby extension ABI:
 
 ```tangerine
 extern "Ruby" def my_method(self_: RubyValue, arg: RubyValue) -> RubyValue
-    // Ruby C API conventions
+  # Ruby C API conventions
 end
 ```
 
@@ -105,7 +105,7 @@ Rust interop through C ABI + generated shims:
 
 ```tangerine
 extern "Rust" def rust_process(data: *const u8, len: usize) -> i32
-    // Callable from Rust as extern "C"
+  # Callable from Rust as extern "C"
 end
 ```
 
@@ -155,17 +155,17 @@ Tangerine provides standard FFI view types in `std/ffi`:
 ```tangerine
 # Borrowed slice view
 @repr(C)
-struct FfiSlice[T] {
-    ptr: *const T,
-    len: usize,
-}
+struct FfiSlice[T]
+  ptr: *const T
+  len: usize
+end
 
 # Borrowed UTF-8 string view
 @repr(C)
-struct FfiStr {
-    ptr: *const u8,
-    len: usize,
-}
+struct FfiStr
+  ptr: *const u8
+  len: usize
+end
 ```
 
 **Example usage:**
@@ -222,14 +222,14 @@ Structs marked with `@repr(C)` follow C ABI layout rules:
 
 ```tangerine
 @repr(C)
-struct Example {
-    a: u8,   # offset 0, size 1
-    # padding: 3 bytes
-    b: u32,  # offset 4, size 4
-    c: u8,   # offset 8, size 1
-    # padding: 7 bytes
-    d: u64,  # offset 16, size 8
-}
+struct Example
+  a: u8,   # offset 0, size 1
+  # padding: 3 bytes
+  b: u32,  # offset 4, size 4
+  c: u8,   # offset 8, size 1
+  # padding: 7 bytes
+  d: u64,  # offset 16, size 8
+end
 # Total: size 24, align 8
 ```
 
@@ -245,11 +245,11 @@ C-like enums (no payloads) with explicit tag type:
 
 ```tangerine
 @repr(C, tag = u32)
-enum Color {
-    Red,    # = 0
-    Green,  # = 1
-    Blue,   # = 2
-}
+enum Color
+  Red,    # = 0
+  Green,  # = 1
+  Blue,   # = 2
+end
 # Size: 4, Align: 4
 ```
 
@@ -257,11 +257,11 @@ For enums with payloads, use explicit tagged unions:
 
 ```tangerine
 @repr(C)
-struct OptionI64 {
-    tag: u8,      # 0 = None, 1 = Some
-    # padding for alignment
-    payload: i64, # valid only if tag == 1
-}
+struct OptionI64
+  tag: u8,      # 0 = None, 1 = Some
+  # padding for alignment
+  payload: i64, # valid only if tag == 1
+end
 ```
 
 The compiler can auto-generate these via `@ffi_union`.
@@ -287,17 +287,17 @@ use std::ffi::{Borrowed, Owned, FfiSlice}
 
 # Borrowed: callee does not take ownership
 @export("process_borrowed")
-extern "C" def process_borrowed(data: Borrowed[FfiSlice[u8]]) -> i32 {
-    # data valid only during this call
-    0
-}
+extern "C" def process_borrowed(data: Borrowed[FfiSlice[u8]]) -> i32
+  # data valid only during this call
+  0
+end
 
 # Owned: callee takes ownership and must free
 @ffi(alloc = "tangerine")
 @export("take_owned")
-extern "C" def take_owned(data: Owned[*mut u8], len: usize) -> Unit {
-    # Must call tg_free(data.ptr, len, 1) when done
-}
+extern "C" def take_owned(data: Owned[*mut u8], len: usize) -> Unit
+  # Must call tg_free(data.ptr, len, 1) when done
+end
 ```
 
 ### Allocation Domains
@@ -323,7 +323,7 @@ extern "C" def tg_alloc(size: usize, align: usize) -> *mut u8
 
 # Reallocate memory
 @export("tg_realloc")
-extern "C" def tg_realloc(ptr: *mut u8, new_size: usize, align: usize) -> *mut u8
+extern "C" def tg_realloc(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8
 
 # Free memory
 @export("tg_free")
@@ -361,17 +361,19 @@ Tangerine v0.1 uses `panic = abort` by default:
 - Panics terminate the process immediately
 - No exception handling overhead
 
+Some non-FFI profiles may enable panic unwind internally, but crossing an FFI boundary while unwinding is unsupported.
+
 ### TgResult Pattern
 
 For returning errors across C ABI, use `TgResult[T]`:
 
 ```tangerine
 @repr(C)
-struct TgResult[T] {
-    ok: Bool,       # true if success
-    err_code: i32,  # 0 if ok, error code otherwise
-    value: T,       # valid only if ok == true
-}
+struct TgResult[T]
+  ok: Bool,       # true if success
+  err_code: i32,  # 0 if ok, error code otherwise
+  value: T,       # valid only if ok == true
+end
 ```
 
 **Helper functions:**
@@ -422,6 +424,14 @@ extern "C" def tg_last_error_code() -> i32
 extern "C" def tg_last_error_message() -> FfiStr
 ```
 
+`tg_last_error_code` / `tg_last_error_message` are host-thread-local diagnostics.
+In async runtimes with green tasks, avoid treating this state as task-local; prefer
+returning explicit `TgResult` values across FFI boundaries.
+
+`tg_last_error_message()` returns a borrowed `FfiStr` view owned by the runtime,
+valid until the next error-state mutation on the same host thread. Copy it if you
+need to retain the message.
+
 **C usage:**
 
 ```c
@@ -452,10 +462,10 @@ end
 
 # Struct export
 @repr(C)
-struct Point {
-    x: f64,
-    y: f64,
-}
+struct Point
+  x: f64
+  y: f64
+end
 
 @export("tg_point_distance")
 extern "C" def point_distance(p1: Point, p2: Point) -> f64
@@ -479,12 +489,12 @@ end
 
 ```tangerine
 # Declare external C functions
-extern "C" {
+extern "C"
     def malloc(size: usize) -> *mut u8
     def free(ptr: *mut u8)
     def strlen(s: *const u8) -> usize
     def memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8
-}
+end
 
 def example()
     # Allocate with C malloc
@@ -682,27 +692,27 @@ pub extern "C" fn rust_create_data(value: i64) -> RustData {
 Then declare in Tangerine:
 
 ```tangerine
-extern "C" {
-    def rust_multiply(a: i64, b: i64) -> i64
-}
+extern "C"
+  def rust_multiply(a: i64, b: i64) -> i64
+end
 
 @repr(C)
-struct RustData {
-    value: i64,
-    valid: Bool,
-}
+struct RustData
+  value: i64
+  valid: Bool
+end
 
-extern "C" {
-    def rust_create_data(value: i64) -> RustData
-}
+extern "C"
+  def rust_create_data(value: i64) -> RustData
+end
 
-def main() {
+def main()
     let product = rust_multiply(6, 7)
-    println("6 * 7 = {product}")
+  println(format("6 * 7 = {}", [product.to_string()]))
     
     let data = rust_create_data(42)
-    println("Data: {data.value}, valid: {data.valid}")
-}
+  println(format("Data: {}, valid: {}", [data.value.to_string(), data.valid.to_string()]))
+end
 ```
 
 ### String Passing Convention
@@ -720,9 +730,9 @@ end
 
 ```rust
 // Rust side
-extern "C" {
+extern "C"
     fn tg_process_string(ptr: *const u8, len: usize) -> i32;
-}
+end
 
 fn process(s: &str) -> i32 {
     unsafe {
@@ -771,9 +781,9 @@ end
 
 ```tangerine
 @repr(C)
-struct RubyValue {
-    raw: usize,  # Mirrors Ruby's VALUE type
-}
+struct RubyValue
+  raw: usize,  # Mirrors Ruby's VALUE type
+end
 ```
 
 `RubyValue` is an opaque handle—only Ruby C API functions may inspect or modify it.
@@ -785,9 +795,9 @@ struct RubyValue {
 ```tangerine
 use std::ffi::{RubyValue, tg_ruby_gc_register, tg_ruby_gc_unregister}
 
-struct CachedValue {
-    value: RubyValue,
-}
+struct CachedValue
+  value: RubyValue
+end
 
 def cache_value(v: RubyValue) -> CachedValue
     # MUST register if storing beyond call
@@ -946,9 +956,9 @@ end
 
 # This struct will appear in generated bindings
 @repr(C)
-struct MyStruct {
-    value: i64,
-}
+struct MyStruct
+  value: i64
+end
 
 # This will NOT appear (no @export)
 def internal_function(x: i32) -> i32
@@ -956,9 +966,9 @@ def internal_function(x: i32) -> i32
 end
 
 # This will NOT appear (no @repr(C))
-struct InternalStruct {
-    data: Array[Int],
-}
+struct InternalStruct
+  data: Array[Int]
+end
 ```
 
 ---
@@ -1173,8 +1183,8 @@ extern "C" def parse_bad(input: FfiStr, out: *mut i64) -> i32
 When returning allocated memory, document the domain:
 
 ```tangerine
-/// Returns a newly allocated buffer.
-/// Caller must free with tg_free(ptr, size, 8).
+## Returns a newly allocated buffer.
+## Caller must free with tg_free(ptr, size, 8).
 @export("create_buffer")
 @ffi(alloc = "tangerine")
 extern "C" def create_buffer(size: usize) -> *mut u8
@@ -1187,16 +1197,16 @@ All types crossing FFI boundaries must use `@repr(C)`:
 ```tangerine
 # Good: deterministic C layout
 @repr(C)
-struct FfiPoint {
-    x: f64,
-    y: f64,
-}
+struct FfiPoint
+  x: f64
+  y: f64
+end
 
 # Bad: Tangerine native layout (not portable)
-struct NativePoint {
-    x: Float,
-    y: Float,
-}
+struct NativePoint
+  x: Float
+  y: Float
+end
 ```
 
 ### 6. Validate ABI Before Release
@@ -1343,7 +1353,7 @@ std::collections::insert (edition 2026, pkg a1b2c3d4e5f67890)
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `tg_alloc` | `(size: usize, align: usize) -> *mut u8` | Allocate memory |
-| `tg_realloc` | `(ptr: *mut u8, new_size: usize, align: usize) -> *mut u8` | Reallocate |
+| `tg_realloc` | `(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8` | Reallocate |
 | `tg_free` | `(ptr: *mut u8, size: usize, align: usize) -> Unit` | Free memory |
 
 ### Error Functions
@@ -1381,7 +1391,7 @@ The Tangerine standard library uses FFI extensively. Here are production example
 
 ```tangerine
 # SQLite FFI bindings
-extern "C" {
+extern "C"
   def sqlite3_open(filename: *const u8, ppDb: *mut *mut SqliteDb) -> i32
   def sqlite3_close(db: *mut SqliteDb) -> i32
   def sqlite3_prepare_v2(db: *mut SqliteDb, sql: *const u8, nByte: i32,
@@ -1390,16 +1400,16 @@ extern "C" {
   def sqlite3_finalize(stmt: *mut SqliteStmt) -> i32
   def sqlite3_column_text(stmt: *mut SqliteStmt, col: i32) -> *const u8
   def sqlite3_column_int64(stmt: *mut SqliteStmt, col: i32) -> i64
-}
+end
 
 # PostgreSQL FFI bindings  
-extern "C" {
+extern "C"
   def PQconnectdb(conninfo: *const u8) -> *mut PGconn
   def PQstatus(conn: *const PGconn) -> i32
   def PQexec(conn: *mut PGconn, query: *const u8) -> *mut PGresult
   def PQntuples(res: *const PGresult) -> i32
   def PQgetvalue(res: *const PGresult, row: i32, col: i32) -> *const u8
-}
+end
 ```
 
 ### Compression (`std/compress`)
@@ -1407,24 +1417,24 @@ extern "C" {
 ```tangerine
 # Zlib FFI for deflate/gzip compression
 @repr(C)
-struct ZStream {
-  next_in: *const u8,
-  avail_in: u32,
-  total_in: u64,
-  next_out: *mut u8,
-  avail_out: u32,
-  total_out: u64,
-  msg: *const u8,
-  state: *mut Unit,
-  zalloc: *const Unit,
-  zfree: *const Unit,
-  opaque: *const Unit,
-  data_type: i32,
-  adler: u64,
-  reserved: u64,
-}
+struct ZStream
+  next_in: *const u8
+  avail_in: u32
+  total_in: u64
+  next_out: *mut u8
+  avail_out: u32
+  total_out: u64
+  msg: *const u8
+  state: *mut Unit
+  zalloc: *const Unit
+  zfree: *const Unit
+  opaque: *const Unit
+  data_type: i32
+  adler: u64
+  reserved: u64
+end
 
-extern "C" {
+extern "C"
   def deflateInit_(strm: *mut ZStream, level: i32, 
     version: *const u8, stream_size: i32) -> i32
   def deflate(strm: *mut ZStream, flush: i32) -> i32
@@ -1432,14 +1442,14 @@ extern "C" {
   def inflateInit_(strm: *mut ZStream, version: *const u8, stream_size: i32) -> i32
   def inflate(strm: *mut ZStream, flush: i32) -> i32
   def inflateEnd(strm: *mut ZStream) -> i32
-}
+end
 ```
 
 ### Cryptography (`std/crypto`)
 
 ```tangerine
 # OpenSSL FFI for hashing and encryption
-extern "C" {
+extern "C"
   def SHA256(data: *const u8, len: usize, md: *mut u8) -> *mut u8
   def SHA512(data: *const u8, len: usize, md: *mut u8) -> *mut u8
   def HMAC(evp_md: *const EVP_MD, key: *const u8, key_len: i32,
@@ -1449,14 +1459,14 @@ extern "C" {
   def AES_cbc_encrypt(in_: *const u8, out: *mut u8, length: usize,
     key: *const AES_KEY, iv: *mut u8, enc: i32)
   def RAND_bytes(buf: *mut u8, num: i32) -> i32
-}
+end
 ```
 
 ### TLS/HTTP (`std/http`)
 
 ```tangerine
 # OpenSSL TLS FFI for HTTPS
-extern "C" {
+extern "C"
   def SSL_library_init() -> i32
   def SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX
   def TLS_client_method() -> *const SSL_METHOD
@@ -1468,7 +1478,7 @@ extern "C" {
   def SSL_shutdown(ssl: *mut SSL) -> i32
   def SSL_free(ssl: *mut SSL)
   def SSL_CTX_free(ctx: *mut SSL_CTX)
-}
+end
 ```
 
 ### Terminal I/O (`std/cli`)
@@ -1476,21 +1486,34 @@ extern "C" {
 ```tangerine
 # POSIX terminal control FFI
 @repr(C)
-struct Termios {
-  c_iflag: u64,
-  c_oflag: u64,
-  c_cflag: u64,
-  c_lflag: u64,
-  c_cc: [u8; 20],
-  c_ispeed: u64,
-  c_ospeed: u64,
-}
+#[cfg(target_os = "macos")]
+struct Termios
+  c_iflag: u64
+  c_oflag: u64
+  c_cflag: u64
+  c_lflag: u64
+  c_cc: [u8; 20]
+  c_ispeed: u64
+  c_ospeed: u64
+end
 
-extern "C" {
+@repr(C)
+#[cfg(target_os = "linux")]
+struct Termios
+  c_iflag: u64
+  c_oflag: u64
+  c_cflag: u64
+  c_lflag: u64
+  c_cc: [u8; 32]
+  c_ispeed: u64
+  c_ospeed: u64
+end
+
+extern "C"
   def tcgetattr(fd: i32, termios: *mut Termios) -> i32
   def tcsetattr(fd: i32, action: i32, termios: *const Termios) -> i32
   def isatty(fd: i32) -> i32
-}
+end
 ```
 
 ---

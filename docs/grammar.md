@@ -39,9 +39,10 @@ DIGIT          = '0'..'9'
 def    end    if     then   else   elsif  while  for    in     do
 let    mut    return break  next   match  when   struct enum   trait
 impl   use    pub    module fn     self   Self   true   false  unsafe
-where  as     type   const  extern super  crate  yield  async  await
+where  as     type   const  extern super  crate  yield  async  await edition
 cap    effect requires implies handle with rationale budget pre post invariant
 guard  try    catch  finally macro  comptime loop   pure   inline
+mod
 ```
 
 **Notes:**
@@ -51,7 +52,7 @@ guard  try    catch  finally macro  comptime loop   pure   inline
 - Use `elsif` (not `else if`) for chained conditions.
 - `then` and `do` are optional in multi-line `if`/`while`/`for` expressions.
 - `pure` marks functions with no side effects (see language.md §Functions).
-- The keyword is `module` (not `mod`); `mod` is accepted as an alias for compat.
+- `module` is the canonical spelling; `mod` is accepted as a compatibility alias.
 
 ### 1.4 Literals
 
@@ -66,7 +67,8 @@ EXPONENT       = ( 'e' | 'E' ) [ '+' | '-' ] DIGIT { DIGIT }
 
 STRING_LITERAL = '"' { STRING_CHAR | ESCAPE_SEQ } '"'
 STRING_CHAR    = any_char_except_quote_backslash_newline
-ESCAPE_SEQ     = '\' ( 'n' | 'r' | 't' | '\\' | '"' | '0' | 'x' HEX_DIGIT HEX_DIGIT )
+ESCAPE_SEQ     = '\' ( 'n' | 'r' | 't' | '\\' | '"' | '0' | 'x' HEX_DIGIT HEX_DIGIT
+                       | 'u' '{' HEX_DIGIT { HEX_DIGIT } '}' )
 
 CHAR_LITERAL   = "'" ( CHAR_CHAR | ESCAPE_SEQ ) "'"
 CHAR_CHAR      = any_char_except_quote_backslash_newline
@@ -103,7 +105,7 @@ LBRACE   = '{'    RBRACE   = '}'
 
 // Other
 ARROW    = '->'   FAT_ARROW = '=>'  COLON_COLON = '::'
-COLON    = ':'    COMMA    = ','    DOT      = '.'    DOT_DOT  = '..'
+COLON    = ':'    COMMA    = ','    DOT      = '.'    DOT_DOT  = '..'   DOT_DOT_EQ = '..='
 SEMICOL  = ';'    QUESTION = '?'    HASH     = '#'    AT       = '@'
 ```
 
@@ -112,9 +114,14 @@ SEMICOL  = ';'    QUESTION = '?'    HASH     = '#'    AT       = '@'
 ### 2.1 Program Structure
 
 ```ebnf
-program        = { item }
+program        = ( [ edition_decl ] { item } )
+               | edition_block
+
+edition_decl   = 'edition' INT_LITERAL
+edition_block  = 'edition' INT_LITERAL { item } 'end'
 
 item           = function_def
+               | async_function
                | struct_def
                | enum_def
                | trait_def
@@ -134,9 +141,8 @@ item           = function_def
 ```ebnf
 function_def   = [ 'pub' ] 'def' IDENT [ type_params ] '(' [ param_list ] ')'
                  [ '->' type_expr ] [ where_clause ]
-                 { fn_clause }
-                 block
-                 'end'
+                 ( { fn_clause } block 'end'
+                 | '=' expr )
 
 fn_clause      = requires_clause
                | effect_clause
@@ -151,7 +157,8 @@ effect_clause   = 'effect' IDENT [ type_args ]
 
 budget_clause   = 'budget' budget_entry { ',' budget_entry }
 budget_entry    = IDENT ':' budget_amount
-budget_amount   = INT_LITERAL IDENT
+budget_amount   = INT_LITERAL [ IDENT ]
+                | STRING_LITERAL
 
 contract_clause = 'pre' expr [ ',' STRING_LITERAL ]
                 | 'post' expr [ ',' STRING_LITERAL ]
@@ -162,7 +169,7 @@ guard_clause   = 'guard' expr 'else' guard_action
 
 guard_action   = 'return' [ expr ]
                | 'break' [ IDENT ]
-               | 'continue' [ IDENT ]
+               | 'next' [ IDENT ]
                | 'panic' '(' expr ')'
 
 param_list     = param { ',' param } [ ',' ]
@@ -184,7 +191,7 @@ struct_def     = [ 'pub' ] 'struct' IDENT [ type_params ]
                  { field_def }
                  'end'
 
-field_def      = [ 'pub' ] IDENT ':' type_expr
+field_def      = [ 'pub' ] IDENT ':' type_expr [ ',' ]
 ```
 
 ### 2.4 Enums
@@ -225,9 +232,11 @@ impl_block     = 'impl' [ type_params ] [ IDENT 'for' ] type_expr [ where_clause
 ```ebnf
 use_decl       = 'use' use_path
 
-use_path       = IDENT { '::' IDENT }
-               | IDENT { '::' IDENT } '::' '*'
-               | IDENT { '::' IDENT } '::' '{' use_list '}'
+use_path       = use_segment { '::' use_segment }
+               | use_segment { '::' use_segment } '::' '*'
+               | use_segment { '::' use_segment } '::' '{' use_list '}'
+
+use_segment    = IDENT | 'crate' | 'super' | 'self'
 
 use_list       = use_item { ',' use_item }
 use_item       = IDENT [ 'as' IDENT ]
@@ -248,6 +257,9 @@ extern_block   = 'extern' [ STRING_LITERAL ] function_sig
                | 'extern' [ STRING_LITERAL ] [ 'do' ]
                  { function_sig }
                  'end'
+               | 'extern' [ STRING_LITERAL ] '{'
+                 { function_sig }
+                 '}'
 ```
 
 ### 2.10 Modules
@@ -299,9 +311,10 @@ macro_decl     = 'macro' IDENT '(' [ macro_params ] ')'
                  block
                  'end'
 
-macro_params   = macro_param { ',' macro_param }
-macro_param    = IDENT ':' macro_type
-macro_type     = 'Expr' | 'Ident' | 'Type' | 'Block' | 'Pattern'
+macro_params     = macro_param { ',' macro_param }
+macro_param      = IDENT ':' macro_type
+macro_type       = 'Expr' | 'Ident' | 'Type' | 'Block' | 'Pattern'
+macro_invocation = IDENT '!' '(' [ arg_list ] ')'
 ```
 
 ### 2.14 Compile-time Evaluation
@@ -322,6 +335,7 @@ type_primary   = IDENT [ type_args ]                    // Named type
                | '&' [ 'mut' ] type_expr                // Reference
                | '*' [ 'mut' ] type_expr                // Raw pointer
                | 'fn' '(' [ type_list ] ')' '->' type_expr  // Function pointer
+               | '[' type_expr ';' expr ']'             // Fixed-size array type
                | '[' type_expr ']'                       // Slice type
                | 'Self'                                  // Self type in traits/impls
 
@@ -354,7 +368,8 @@ type_list      = type_expr { ',' type_expr }
 ```ebnf
 expr           = assignment
 
-assignment     = logical_or [ ( '=' | '+=' | '-=' | '*=' | '/=' | '%=' ) assignment ]
+assignment     = range [ ( '=' | '+=' | '-=' | '*=' | '/=' | '%=' ) assignment ]
+range          = logical_or [ ( '..' | '..=' ) logical_or ]
 
 logical_or     = logical_and { '||' logical_and }
 logical_and    = equality { '&&' equality }
@@ -382,6 +397,7 @@ primary        = INT_LITERAL
                | STRING_LITERAL
                | CHAR_LITERAL
                | 'true' | 'false'
+               | macro_invocation
                | IDENT [ '::' IDENT ] [ type_args ]     // Path expression
                | IDENT '{' field_init_list '}'           // Struct literal
                | '(' [ expr { ',' expr } ] ')'          // Tuple / grouping
@@ -458,12 +474,13 @@ unsafe_block   = 'unsafe' [ STRING_LITERAL ]
 ### 4.5 Closures
 
 ```ebnf
-closure_expr   = '|' [ closure_params ] '|' ( expr | block 'end' )
-               | '||' ( expr | block 'end' )    // no-param shorthand
-
+closure_expr   = '|' [ closure_params ] '|' [ '->' type_expr ] ( expr | block 'end' )
 closure_params = closure_param { ',' closure_param }
 closure_param  = [ 'mut' ] IDENT [ ':' type_expr ]
 ```
+
+Zero-parameter closures use an empty parameter list with two pipe tokens:
+`| | expr` (or `||expr` when the parser is in closure position), which disambiguates from logical OR `||`.
 
 ## 5. Patterns
 
@@ -495,7 +512,8 @@ statement      = let_statement
                | expr_statement
                | item                // Items can appear inside functions
 
-let_statement  = 'let' [ 'mut' ] pattern [ ':' type_expr ] '=' expr
+let_statement  = ( 'let' [ 'mut' ] pattern [ ':' type_expr ] '=' expr
+                 | 'mut' pattern [ ':' type_expr ] '=' expr )
 
 expr_statement = expr
 ```
@@ -567,8 +585,8 @@ Common attributes:
 
 - **`Result[T, E]`**: Explicit success/failure. Propagated with `?` operator.
 - **`Option[T]`**: Explicit presence/absence. Propagated with `?` (returns `None`).
-- **`panic`**: Unrecoverable error. Default strategy is abort. No exceptions.
-- Stack unwinding is not guaranteed; `panic` may abort immediately.
+- **`panic`**: Unrecoverable error. Default strategy is abort.
+- Panic strategy is compile-time selected (`abort` or `unwind`); unwinding is profile-dependent.
 
 ### 8.6 Concurrency Model
 

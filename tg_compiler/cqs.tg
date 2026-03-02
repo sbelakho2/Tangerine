@@ -8,7 +8,13 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode, is_at_least, RichSpan}
-use tg_compiler::mir::{MirFunction, MirBlock, MirStatement, MirTerminator, MirRvalue}
+use tg_compiler::mir::{
+  MirFunction, MirBlock, MirStatement, MirTerminator, MirRvalue,
+  MirTerminatorKind, MirStatementKind, MirRvalueKind,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  BlockId, LocalId, Place, SwitchTarget
+}
+use tg_compiler::util::{pow, min_float, max_float, clamp_int, clamp_float, to_float, to_int, max_int, sha256}
 
 # ═══════════════════════════════════════════════════════════════
 # §24 — CQS Definitions
@@ -57,15 +63,15 @@ def classify_surface(
 ) -> SurfaceClass
   if is_test_only
     SurfaceClass::TestOnly
-  else if is_platform_gated
+  elsif is_platform_gated
     SurfaceClass::PlatformShim
-  else if is_pub && is_experimental
+  elsif is_pub && is_experimental
     SurfaceClass::PublicExperimental
-  else if is_pub
+  elsif is_pub
     SurfaceClass::PublicStable
-  else if ref_count >= hot_path_threshold || has_budget || has_hot
+  elsif ref_count >= hot_path_threshold || has_budget || has_hot
     SurfaceClass::InternalHotPath
-  else if stmt_count < 5
+  elsif stmt_count < 5
     SurfaceClass::InternalGlue
   else
     SurfaceClass::InternalGlue
@@ -556,11 +562,11 @@ def sort_signals(signals: &mut Vec[Signal]) -> Unit
     let kb = signal_kind_ordinal(b.kind)
     if ka != kb
       ka < kb
-    else if a.locations.len() > 0 && b.locations.len() > 0
+    elsif a.locations.len() > 0 && b.locations.len() > 0
       let la = a.locations[0]
       let lb = b.locations[0]
       if la.file != lb.file then la.file < lb.file
-      else if la.start_line != lb.start_line then la.start_line < lb.start_line
+      elsif la.start_line != lb.start_line then la.start_line < lb.start_line
       else la.start_col < lb.start_col
       end
     else
@@ -993,13 +999,13 @@ def detect_df1(params: &Vec[ParamInfo], def_use: &DefUseGraph) -> Option[Signal]
   mut locs = Vec::new()
   for p in params
     if p.name.starts_with("_") || p.has_unused_ok
-      continue
+      next
     end
     # Check if param is a context/capability type
     if p.is_context_param
-      continue
+      next
     end
-    let has_use = false
+    mut has_use = false
     for link in &def_use.links
       let def = &def_use.definitions[link.def_index]
       if def.local_id == p.local_id
@@ -1042,7 +1048,7 @@ def detect_df3(def_use: &DefUseGraph, spans: &Map[Int, RichSpan]) -> Option[Sign
   mut locs = Vec::new()
   for i in 0..def_use.definitions.len() do
     let def = &def_use.definitions[i]
-    let has_use = false
+    mut has_use = false
     for link in &def_use.links
       if link.def_index == i
         has_use = true
@@ -1080,25 +1086,32 @@ def detect_df2(
   return_sinks: &Vec[Int]
 ) -> Option[Signal]
   let non_context_params = params.iter().filter(|p| !p.is_context_param).collect()
-  if non_context_params.is_empty()
+  if non_context_params.is_empty() || return_sinks.is_empty()
     return Option::None
   end
   mut affecting = 0
+  let mut locs = Vec::new()
   for p in &non_context_params
     if reachable_to_sink(dep_graph, p.local_id, return_sinks)
       affecting = affecting + 1
+    else
+      locs.push(p.span)
     end
   end
   let sev = sev_output_independence(affecting, non_context_params.len())
   if sev > 0.0
+    let details = Map::new()
+    details.insert("affecting_params", affecting.to_string())
+    details.insert("total_non_context_params", non_context_params.len().to_string())
+    details.insert("return_sinks", return_sinks.len().to_string())
     Option::Some(Signal {
       kind: SignalKind::DF2_OutputIndependentOfInputs,
       severity: sev,
       count: 1,
       suppressed: false,
       penalty: 0.0,
-      locations: Vec::new(),
-      details: Map::new()
+      locations: locs,
+      details: details
     })
   else
     Option::None
@@ -1214,6 +1227,80 @@ struct WildcardArm
   has_default_reason: Bool
 end
 
+# §54.4 — EH-3: Broad Exception Boundary Swallowing
+struct TryCatchInfo
+  span: RichSpan
+  catches_all: Bool       # catch block uses wildcard pattern
+  has_rethrow: Bool       # whether the catch block re-raises
+  has_logging: Bool       # whether the catch block logs the error
+  body_stmt_count: Int    # number of statements in the catch body
+end
+
+def detect_eh3(try_catches: &Vec[TryCatchInfo]) -> Option[Signal]
+  mut bad_count = 0
+  mut locs = Vec::new()
+  for tc in try_catches do
+    if tc.catches_all && !tc.has_rethrow && !tc.has_logging && tc.body_stmt_count <= 1 then
+      bad_count = bad_count + 1
+      locs.push(tc.span)
+    end
+  end
+  if bad_count > 0 then
+    Option::Some(Signal {
+      kind: SignalKind::EH3_BroadExceptionBoundarySwallowing,
+      severity: sev_binary(),
+      count: bad_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
+# §53.5 — DF-4: All Branches Return Same Literal
+struct BranchReturnInfo
+  span: RichSpan
+  branch_count: Int
+  return_values: Vec[String]  # string representations of returned literals
+end
+
+def detect_df4(branches: &Vec[BranchReturnInfo]) -> Option[Signal]
+  mut bad_count = 0
+  mut locs = Vec::new()
+  for br in branches do
+    if br.branch_count >= 2 && br.return_values.len() >= 2 then
+      let first = br.return_values[0].clone()
+      mut all_same = true
+      for val in br.return_values do
+        if val != first then
+          all_same = false
+          break
+        end
+      end
+      if all_same then
+        bad_count = bad_count + 1
+        locs.push(br.span)
+      end
+    end
+  end
+  if bad_count > 0 then
+    Option::Some(Signal {
+      kind: SignalKind::DF4_AllBranchesReturnSameLiteral,
+      severity: sev_binary(),
+      count: bad_count,
+      suppressed: false,
+      penalty: 0.0,
+      locations: locs,
+      details: Map::new()
+    })
+  else
+    Option::None
+  end
+end
+
 # ═══════════════════════════════════════════════════════════════
 # §56 — Capability Signal Detection
 # ═══════════════════════════════════════════════════════════════
@@ -1234,7 +1321,33 @@ def effect_to_capability(effect: String) -> Option[String]
   when "fs.write" then Option::Some("FsCap")
   when "process.spawn" then Option::Some("ProcCap")
   when "ffi.call" then Option::Some("FfiCap")
-  when _ then Option::None
+  when "env.read" then Option::Some("EnvCap")
+  when "env.write" then Option::Some("EnvCap")
+  when "db.read" then Option::Some("DbCap")
+  when "db.write" then Option::Some("DbCap")
+  when "clock.now" then Option::Some("ClockCap")
+  when "random.gen" then Option::Some("RandomCap")
+  when _ then
+    let lowered = effect.to_lowercase()
+    if lowered.starts_with("net.") then
+      Option::Some("NetCap")
+    elsif lowered.starts_with("fs.") then
+      if lowered.contains("read") then Option::Some("FsReadCap") else Option::Some("FsCap") end
+    elsif lowered.starts_with("process.") then
+      Option::Some("ProcCap")
+    elsif lowered.starts_with("ffi.") then
+      Option::Some("FfiCap")
+    elsif lowered.starts_with("env.") then
+      Option::Some("EnvCap")
+    elsif lowered.starts_with("db.") then
+      Option::Some("DbCap")
+    elsif lowered.starts_with("clock.") || lowered.starts_with("time.") then
+      Option::Some("ClockCap")
+    elsif lowered.starts_with("random.") || lowered.starts_with("rand.") then
+      Option::Some("RandomCap")
+    else
+      Option::None
+    end
   end
 end
 
@@ -1433,14 +1546,77 @@ def generate_suggested_actions(sym: &SymbolReport, mode: Mode) -> Vec[SuggestedA
   mut actions = Vec::new()
 
   for signal in &sym.signals
-    if signal.suppressed then continue end
+    if signal.suppressed then next end
 
     let action = match signal.kind
+    when SignalKind::CF1_UnreachableBranch then
+      Option::Some(SuggestedAction {
+        action_id: "remove_unreachable_branch",
+        priority: 3,
+        title: "Remove unreachable branch or fix condition to make it reachable",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
     when SignalKind::CF2_NonExhaustiveMatch then
       Option::Some(SuggestedAction {
         action_id: "add_missing_match_arms",
         priority: 1,
         title: "Add missing match arms for exhaustiveness",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 1.0
+      })
+    when SignalKind::CF3_PanicUnreachableExit then
+      Option::Some(SuggestedAction {
+        action_id: "replace_panic_with_result",
+        priority: 2,
+        title: "Replace panic/unreachable with Result return or proper error handling",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.85
+      })
+    when SignalKind::CF4_ConstantReturnDominance then
+      Option::Some(SuggestedAction {
+        action_id: "simplify_constant_return",
+        priority: 3,
+        title: "Simplify function that always returns a constant",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when SignalKind::DF1_UnusedParameter then
+      Option::Some(SuggestedAction {
+        action_id: "use_or_prefix_param",
+        priority: 3,
+        title: "Use parameter or prefix with _ to mark intentionally unused",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.95
+      })
+    when SignalKind::DF2_OutputIndependentOfInputs then
+      Option::Some(SuggestedAction {
+        action_id: "connect_output_to_inputs",
+        priority: 2,
+        title: "Connect function output to its inputs or mark as constant",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.85
+      })
+    when SignalKind::DF3_DeadAssignment then
+      Option::Some(SuggestedAction {
+        action_id: "remove_dead_assignment",
+        priority: 3,
+        title: "Remove dead assignment or use the assigned value",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.95
+      })
+    when SignalKind::DF4_AllBranchesReturnSameLiteral then
+      Option::Some(SuggestedAction {
+        action_id: "collapse_identical_branches",
+        priority: 3,
+        title: "Collapse branches that all return the same literal value",
         patches: Vec::new(),
         tests_to_run: Vec::new(),
         confidence: 1.0
@@ -1454,6 +1630,51 @@ def generate_suggested_actions(sym: &SymbolReport, mode: Mode) -> Vec[SuggestedA
         tests_to_run: Vec::new(),
         confidence: 0.9
       })
+    when SignalKind::EH2_CatchAllWithoutAction then
+      Option::Some(SuggestedAction {
+        action_id: "add_catch_action",
+        priority: 2,
+        title: "Add logging or re-raise in catch-all handler",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when SignalKind::EH3_BroadExceptionBoundarySwallowing then
+      Option::Some(SuggestedAction {
+        action_id: "narrow_exception_boundary",
+        priority: 1,
+        title: "Narrow catch scope or add error logging to prevent silent swallowing",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when SignalKind::CV1_UnexecutedPublicBranch then
+      Option::Some(SuggestedAction {
+        action_id: "add_branch_test",
+        priority: 2,
+        title: "Add test case to cover unexecuted public branch",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.85
+      })
+    when SignalKind::CV2_CoverageBelowThreshold then
+      Option::Some(SuggestedAction {
+        action_id: "increase_coverage",
+        priority: 2,
+        title: "Add tests to meet coverage threshold",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.8
+      })
+    when SignalKind::CP1_CapabilityDrift then
+      Option::Some(SuggestedAction {
+        action_id: "review_capability_drift",
+        priority: 1,
+        title: "Review and update capability baseline or remove drifted capabilities",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
     when SignalKind::CP2_UnsafeBlockWithoutReason then
       Option::Some(SuggestedAction {
         action_id: "add_unsafe_reason",
@@ -1463,16 +1684,33 @@ def generate_suggested_actions(sym: &SymbolReport, mode: Mode) -> Vec[SuggestedA
         tests_to_run: Vec::new(),
         confidence: 1.0
       })
-    when SignalKind::DF1_UnusedParameter then
+    when SignalKind::CP3_TaintedFFIValueUsedWithoutValidation then
       Option::Some(SuggestedAction {
-        action_id: "use_or_prefix_param",
-        priority: 3,
-        title: "Use parameter or prefix with _ to mark intentionally unused",
+        action_id: "validate_ffi_value",
+        priority: 1,
+        title: "Validate FFI return value before use across trust boundary",
         patches: Vec::new(),
         tests_to_run: Vec::new(),
         confidence: 0.95
       })
-    when _ then Option::None
+    when SignalKind::FT1_FutureBlockInEnabledFeature then
+      Option::Some(SuggestedAction {
+        action_id: "implement_future_block",
+        priority: 2,
+        title: "Implement future block content now that feature is enabled",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.9
+      })
+    when SignalKind::FT2_CfgFeatureEnabledButIncomplete then
+      Option::Some(SuggestedAction {
+        action_id: "complete_feature_impl",
+        priority: 2,
+        title: "Complete feature implementation or disable feature flag",
+        patches: Vec::new(),
+        tests_to_run: Vec::new(),
+        confidence: 0.85
+      })
     end
 
     match action
@@ -1525,8 +1763,179 @@ end
 # Entry Point — Run CQS Analysis
 # ═══════════════════════════════════════════════════════════════
 
+def find_mir_function(mir_functions: &Vec[MirFunction], name: &String) -> Option[&MirFunction]
+  for func in mir_functions do
+    if func.name == name then
+      return Option::Some(func)
+    end
+  end
+  Option::None
+end
+
+def extract_branch_return_info(func: &MirFunction) -> Vec[BranchReturnInfo]
+  mut results = Vec::new()
+  for block in func.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::SwitchInt(_, targets, fallback) then
+      mut return_values = Vec::new()
+      mut branch_count = 0
+      for target in targets do
+        branch_count = branch_count + 1
+        match find_block_terminal_constant(func, target.target)
+        when Option::Some(val) then return_values.push(val)
+        when Option::None then ()
+        end
+      end
+      branch_count = branch_count + 1
+      match find_block_terminal_constant(func, fallback)
+      when Option::Some(val) then return_values.push(val)
+      when Option::None then ()
+      end
+      if branch_count >= 2 && return_values.len() == branch_count then
+        results.push(BranchReturnInfo {
+          span: RichSpan {
+            file: func.name.clone(),
+            start_line: block.id.id,
+            start_col: 0,
+            end_line: block.id.id,
+            end_col: 0
+          },
+          branch_count: branch_count,
+          return_values: return_values
+        })
+      end
+    when _ then ()
+    end
+  end
+  results
+end
+
+def find_block_terminal_constant(func: &MirFunction, target: BlockId) -> Option[String]
+  for block in func.blocks do
+    if block.id.id == target.id then
+      match block.terminator.kind
+      when MirTerminatorKind::Return then
+        if !block.statements.is_empty() then
+          let last = block.statements[block.statements.len() - 1]
+          match last.kind
+          when MirStatementKind::Assign(_, rvalue) then
+            match rvalue.kind
+            when MirRvalueKind::Use(operand) then
+              match operand.kind
+              when MirOperandKind::Constant(c) then
+                match c.kind
+                when MirConstantKind::Int(i) then return Option::Some(i.to_string())
+                when MirConstantKind::Bool(b) then return Option::Some(b.to_string())
+                when MirConstantKind::Float(f) then return Option::Some(f.to_string())
+                when MirConstantKind::String(s) then return Option::Some(s.clone())
+                when MirConstantKind::Unit then return Option::Some("unit")
+                when _ then ()
+                end
+              when _ then ()
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+      return Option::None
+    end
+  end
+  Option::None
+end
+
+def extract_try_catch_info(func: &MirFunction) -> Vec[TryCatchInfo]
+  mut results = Vec::new()
+  for block in func.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::Call(_, _, _, _, unwind) then
+      match unwind
+      when Option::Some(unwind_block) then
+        match find_block_by_id(func, unwind_block)
+        when Option::Some(catch_block) then
+          let catches_all = true
+          let body_count = catch_block.statements.len()
+          let has_rethrow = block_has_rethrow(func, catch_block)
+          let has_logging = block_has_logging(catch_block)
+          results.push(TryCatchInfo {
+            span: RichSpan {
+              file: func.name.clone(),
+              start_line: block.id.id,
+              start_col: 0,
+              end_line: unwind_block.id,
+              end_col: 0
+            },
+            catches_all: catches_all,
+            has_rethrow: has_rethrow,
+            has_logging: has_logging,
+            body_stmt_count: body_count
+          })
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  results
+end
+
+def find_block_by_id(func: &MirFunction, target: BlockId) -> Option[&MirBlock]
+  for block in func.blocks do
+    if block.id.id == target.id then
+      return Option::Some(block)
+    end
+  end
+  Option::None
+end
+
+def block_has_rethrow(func: &MirFunction, block: &MirBlock) -> Bool
+  match block.terminator.kind
+  when MirTerminatorKind::Unreachable then true
+  when MirTerminatorKind::Call(_, callee, _, _, _) then
+    match callee.kind
+    when MirOperandKind::Constant(c) then
+      match c.kind
+      when MirConstantKind::FnItem(name) then
+        name.contains("panic") || name.contains("raise") || name.contains("rethrow")
+      when _ then false
+      end
+    when _ then false
+    end
+  when _ then false
+  end
+end
+
+def block_has_logging(block: &MirBlock) -> Bool
+  for stmt in block.statements do
+    match stmt.kind
+    when MirStatementKind::Assign(_, rvalue) then
+      match rvalue.kind
+      when MirRvalueKind::Use(operand) then
+        match operand.kind
+        when MirOperandKind::Constant(c) then
+          match c.kind
+          when MirConstantKind::FnItem(name) then
+            if name.contains("log") || name.contains("eprintln") || name.contains("warn") then
+              return true
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  false
+end
+
 def run_cqs_analysis(
   symbols: Vec[Symbol],
+  mir_functions: &Vec[MirFunction],
   mode: Mode,
   config_hash: String
 ) -> QualityReport
@@ -1534,13 +1943,28 @@ def run_cqs_analysis(
 
   for sym in &symbols
     mut signals = Vec::new()
-    # Signal detection would be called here with actual MIR data
-    # For each symbol, detect CF/DF/EH/CV/CP/FT signals
+
+    # Detect DF4 and EH3 signals from MIR data
+    match find_mir_function(mir_functions, &sym.name)
+    when Option::Some(func) then
+      let branch_info = extract_branch_return_info(func)
+      match detect_df4(&branch_info)
+      when Option::Some(signal) then signals.push(signal)
+      when Option::None then ()
+      end
+
+      let try_catch_info = extract_try_catch_info(func)
+      match detect_eh3(&try_catch_info)
+      when Option::Some(signal) then signals.push(signal)
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
 
     let score = compute_score(&signals)
-    let actions = generate_suggested_actions_from_signals(&signals, mode)
+    let signal_actions = generate_suggested_actions_from_signals(&signals, mode)
 
-    let report = SymbolReport {
+    mut report = SymbolReport {
       symbol_id: sym.symbol_id,
       name: sym.name,
       kind: sym.kind,
@@ -1552,8 +1976,14 @@ def run_cqs_analysis(
       coverage: Option::None,
       capabilities: Option::None,
       signals: signals,
-      suggested_actions: actions
+      suggested_actions: signal_actions
     }
+
+    # Run the SymbolReport-level action generator for richer suggestions
+    let report_actions = generate_suggested_actions(&report, mode)
+    for ra in report_actions do
+      report.suggested_actions.push(ra)
+    end
 
     let module = module_reports.entry(sym.module_path).or_insert(Vec::new())
     module.push(report)
@@ -1564,7 +1994,7 @@ def run_cqs_analysis(
   mut total_symbols = 0
   mut total_scored = 0
   mut total_gated = 0
-  let min_score = 100
+  mut min_score = 100
   mut weighted_sum = 0.0
   mut weight_sum = 0.0
 
@@ -1621,7 +2051,7 @@ end
 def generate_suggested_actions_from_signals(signals: &Vec[Signal], mode: Mode) -> Vec[SuggestedAction]
   mut actions = Vec::new()
   for signal in signals
-    if signal.suppressed then continue end
+    if signal.suppressed then next end
     match signal.kind
     when SignalKind::CF2_NonExhaustiveMatch then
       actions.push(SuggestedAction {
@@ -1645,51 +2075,4 @@ def generate_suggested_actions_from_signals(signals: &Vec[Signal], mode: Mode) -
     end
   end
   actions
-end
-
-# ═══════════════════════════════════════════════════════════════
-# Utility Functions
-# ═══════════════════════════════════════════════════════════════
-
-def pow(base: Float, exp: Float) -> Float
-  # Intrinsic power function
-  __intrinsic_pow(base, exp)
-end
-
-def min_float(a: Float, b: Float) -> Float
-  if a < b then a else b end
-end
-
-def max_float(a: Float, b: Float) -> Float
-  if a > b then a else b end
-end
-
-def clamp_int(val: Int, lo: Int, hi: Int) -> Int
-  if val < lo then lo
-  else if val > hi then hi
-  else val
-  end
-end
-
-def clamp_float(val: Float, lo: Float, hi: Float) -> Float
-  if val < lo then lo
-  else if val > hi then hi
-  else val
-  end
-end
-
-def to_float(i: Int) -> Float
-  __intrinsic_int_to_float(i)
-end
-
-def to_int(f: Float) -> Int
-  __intrinsic_float_to_int(f)
-end
-
-def max_int(a: Int, b: Int) -> Int
-  if a > b then a else b end
-end
-
-def sha256(input: String) -> String
-  __intrinsic_sha256(input)
 end

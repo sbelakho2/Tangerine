@@ -25,6 +25,16 @@
 
 use std::io
 use std::test
+use std::env
+use std::fs::{read_file}
+
+use tg_compiler::token::{Token}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::ast::{Program}
+use tg_compiler::parser::{parse}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_check}
+use tg_compiler::mir::{lower_to_mir, pretty_print_mir}
 
 # ———————————————————————————————————————————————————————————————
 # Test Directive Parsing
@@ -37,6 +47,7 @@ enum ExpectedOutcome
   Warning                         # A warning is emitted
   Output(expected: String)        # Runtime output matches
   MirContains(pattern: String)    # MIR contains substring
+  MirNotContains(pattern: String) # MIR does not contain substring
   ParseError                      # Parser should fail
   TypeErrorMsg(substr: String)    # Type error message contains substring
 end
@@ -54,7 +65,7 @@ def parse_directives(path: String, content: &String) -> Vec[TestDirective]
     let trimmed = line.trim()
     
     if !trimmed.starts_with("# expect:") then
-      continue
+      next
     end
     
     let directive_text = trimmed.slice(9, trimmed.len()).trim()
@@ -76,6 +87,14 @@ def parse_directives(path: String, content: &String) -> Vec[TestDirective]
       let pat = directive_text.slice(13, directive_text.len()).trim()
       let unquoted = pat.trim_matches('"').to_string()
       ExpectedOutcome::MirContains(unquoted)
+    elsif directive_text.starts_with("ssa_contains ") then
+      let pat = directive_text.slice(13, directive_text.len()).trim()
+      let unquoted = pat.trim_matches('"').to_string()
+      ExpectedOutcome::MirContains(unquoted)
+    elsif directive_text.starts_with("ssa_not_contains ") then
+      let pat = directive_text.slice(17, directive_text.len()).trim()
+      let unquoted = pat.trim_matches('"').to_string()
+      ExpectedOutcome::MirNotContains(unquoted)
     elsif directive_text == "parse_error" then
       ExpectedOutcome::ParseError
     elsif directive_text.starts_with("type_error ") then
@@ -129,6 +148,8 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
       message: "cannot read file: " + e
     }
   when Result::Ok(source) then
+    let diagnostic_assertions = parse_diagnostic_assertions(&source)
+
     # Parse the source
     let tokens = tokenize(source.clone())
     let parse_result = parse(tokens)
@@ -137,6 +158,19 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
     when ExpectedOutcome::ParseError then
       match parse_result
       when Result::Err(_) then
+        match parse_result
+        when Result::Err(ref parse_err) then
+          let parse_messages = vec![parse_err.message.clone()]
+          match verify_diagnostic_assertions(&diagnostic_assertions, &parse_messages)
+          when Option::Some(msg) then
+            return ConformanceResult {
+              file: path, directive: directive.description.clone(),
+              passed: false, message: msg
+            }
+          when Option::None then ()
+          end
+        when _ then ()
+        end
         return ConformanceResult {
           file: path, directive: directive.description.clone(),
           passed: true, message: "parser correctly rejected input"
@@ -170,6 +204,15 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
     when ExpectedOutcome::Error(ref code) then
       match type_result
       when Result::Err(ref errors) then
+        let error_messages = collect_error_messages(errors)
+        match verify_diagnostic_assertions(&diagnostic_assertions, &error_messages)
+        when Option::Some(msg) then
+          return ConformanceResult {
+            file: path, directive: directive.description.clone(),
+            passed: false, message: msg
+          }
+        when Option::None then ()
+        end
         let has_code = errors.iter().any(|e| {
           match e.code
           when Option::Some(ref c) then c == code
@@ -193,6 +236,19 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
     when ExpectedOutcome::AnyError then
       match type_result
       when Result::Err(_) then
+        match type_result
+        when Result::Err(ref errors) then
+          let error_messages = collect_error_messages(errors)
+          match verify_diagnostic_assertions(&diagnostic_assertions, &error_messages)
+          when Option::Some(msg) then
+            return ConformanceResult {
+              file: path, directive: directive.description.clone(),
+              passed: false, message: msg
+            }
+          when Option::None then ()
+          end
+        when _ then ()
+        end
         return ConformanceResult {
           file: path, directive: directive.description.clone(),
           passed: true, message: "compilation error as expected"
@@ -207,6 +263,15 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
     when ExpectedOutcome::TypeErrorMsg(ref substr) then
       match type_result
       when Result::Err(ref errors) then
+        let error_messages = collect_error_messages(errors)
+        match verify_diagnostic_assertions(&diagnostic_assertions, &error_messages)
+        when Option::Some(msg) then
+          return ConformanceResult {
+            file: path, directive: directive.description.clone(),
+            passed: false, message: msg
+          }
+        when Option::None then ()
+        end
         let has_msg = errors.iter().any(|e| e.message.contains(substr.as_str()))
         return ConformanceResult {
           file: path, directive: directive.description.clone(),
@@ -229,6 +294,25 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
       when Result::Err(ref errors) then
         errors.iter().any(|e| e.level == DiagLevel::Warning)
       end
+
+      if has_warning then
+        let warning_messages = match type_result
+        when Result::Ok(ref ctx) then
+          collect_warning_messages(&ctx.warnings)
+        when Result::Err(ref errors) then
+          collect_error_messages(errors)
+        end
+
+        match verify_diagnostic_assertions(&diagnostic_assertions, &warning_messages)
+        when Option::Some(msg) then
+          return ConformanceResult {
+            file: path, directive: directive.description.clone(),
+            passed: false, message: msg
+          }
+        when Option::None then ()
+        end
+      end
+
       return ConformanceResult {
         file: path, directive: directive.description.clone(),
         passed: has_warning,
@@ -262,6 +346,17 @@ def run_conformance_test(directive: &TestDirective) -> ConformanceResult
         passed: contains,
         message: if contains then "MIR contains expected pattern"
                  else "MIR does not contain: " + pattern.clone()
+                 end
+      }
+
+    when ExpectedOutcome::MirNotContains(ref pattern) then
+      let mir_text = pretty_print_mir(&mir)
+      let contains = mir_text.contains(pattern.as_str())
+      return ConformanceResult {
+        file: path, directive: directive.description.clone(),
+        passed: !contains,
+        message: if !contains then "MIR excludes forbidden pattern"
+                 else "MIR unexpectedly contains: " + pattern.clone()
                  end
       }
     
@@ -323,7 +418,7 @@ def run_conformance_suite(config: ConformanceConfig) -> Int
     when Option::Some(ref f) then
       if !file.contains(f.as_str()) then
         skipped = skipped + 1
-        continue
+        next
       end
     when Option::None then ()
     end
@@ -457,6 +552,34 @@ def parse_diagnostic_assertions(content: &String) -> Vec[DiagnosticAssertion]
   end
   
   assertions
+end
+
+def collect_error_messages(errors: &Vec[Diagnostic]) -> Vec[String]
+  mut messages = Vec::new()
+  for err in errors do
+    messages.push(err.message.clone())
+  end
+  messages
+end
+
+def collect_warning_messages(warnings: &Vec[Diagnostic]) -> Vec[String]
+  mut messages = Vec::new()
+  for warn in warnings do
+    messages.push(warn.message.clone())
+  end
+  messages
+end
+
+def verify_diagnostic_assertions(assertions: &Vec[DiagnosticAssertion], messages: &Vec[String]) -> Option[String]
+  for assertion in assertions do
+    let matched = messages.iter().any(|m| m.contains(assertion.expected.as_str()))
+    if !matched then
+      return Option::Some(
+        "missing expected " + assertion.kind.clone() + " text: " + assertion.expected.clone()
+      )
+    end
+  end
+  Option::None
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -842,7 +965,7 @@ def measure_compile_perf(files: &Vec[String]) -> Vec[PerfMetric]
       let parse_start = clock_monotonic_ns()
       let ast = match parse(tokens)
       when Result::Ok(a) then a
-      when Result::Err(_) then continue
+      when Result::Err(_) then next
       end
       let parse_end = clock_monotonic_ns()
       metrics.push(PerfMetric {
@@ -911,13 +1034,13 @@ def load_perf_baseline(path: &str) -> Option[PerfBaseline]
     mut metrics = Map::new()
     for line in content.lines() do
       let trimmed = line.trim()
-      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      if trimmed.is_empty() || trimmed.starts_with("#") then next end
       match trimmed.split_once("|")
       when Option::Some(kv) then
         let name = kv.0.to_string()
         let val = match kv.1.parse_uint()
         when Result::Ok(v) then v
-        when Result::Err(_) then continue
+        when Result::Err(_) then next
         end
         metrics.insert(name, val)
       when Option::None then ()
@@ -1073,13 +1196,13 @@ def load_memory_baseline(path: &str) -> Option[MemoryBaseline]
     mut metrics = Map::new()
     for line in content.lines() do
       let trimmed = line.trim()
-      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      if trimmed.is_empty() || trimmed.starts_with("#") then next end
       match trimmed.split_once("|")
       when Option::Some(kv) then
         let name = kv.0.to_string()
         let val = match kv.1.parse_uint()
         when Result::Ok(v) then v
-        when Result::Err(_) then continue
+        when Result::Err(_) then next
         end
         metrics.insert(name, val)
       when Option::None then ()
@@ -1099,6 +1222,49 @@ def pad_right(s: &String, width: Int) -> String
     result = result + " "
   end
   result
+end
+
+def main() -> Int
+  let argv = env::args()
+
+  # Optional subsystem modes to keep harness paths executable.
+  if argv.contains(&"--fuzz".to_string()) then
+    let stats = fuzz_compiler(FuzzConfig {
+      iterations: 100,
+      max_depth: 6,
+      seed: 1337,
+      timeout_ms: 250,
+      corpus_dir: "golden".to_string()
+    })
+    println("Fuzz finished: total=" + stats.total.to_string() +
+            " crashes=" + stats.crashes.to_string() +
+            " timeouts=" + stats.timeouts.to_string())
+    return if stats.crashes > 0 then 1 else 0 end
+  end
+
+  if argv.contains(&"--mem".to_string()) then
+    let sample = "def main() -> Int\n  0\nend".to_string()
+    let metrics = measure_compile_memory(&sample)
+    print_memory_report(&metrics)
+    return 0
+  end
+
+  mut filter: Option[String] = Option::None
+  mut i: UInt = 0
+  while i < argv.len() do
+    if argv[i] == "--filter" && i + 1 < argv.len() then
+      filter = Option::Some(argv[i + 1].clone())
+      i = i + 1
+    end
+    i = i + 1
+  end
+
+  run_conformance_suite(ConformanceConfig {
+    test_dir: "golden".to_string(),
+    filter: filter,
+    verbose: !argv.contains(&"--quiet".to_string()),
+    json_output: argv.contains(&"--json".to_string())
+  })
 end
 
 # Platform RSS query — uses /proc/self/status on Linux, task_info on macOS

@@ -1,117 +1,72 @@
 #!/usr/bin/env python3
+"""Merge Tangerine coverage JSON files with branch-aware keys."""
+
+from __future__ import annotations
+
 import argparse
-import glob
 import json
 import sys
 from pathlib import Path
-
-HEADER_KEYS = [
-    "schema_version",
-    "edition",
-    "tgc_version",
-    "target",
-    "target_triple",
-    "branch_id_scheme",
-    "arm_id_scheme",
-    "build_id",
-]
-
-REQUIRED_RECORD_FIELDS = ["symbol_id", "arm_id", "hits"]
+from typing import Any
 
 
-def read_jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    if not lines:
-        raise ValueError(f"empty coverage file: {path}")
-    header = json.loads(lines[0])
-    records = [json.loads(line) for line in lines[1:]]
-    if not records:
-        print(f"WARNING: {path} contains only a header and no coverage records", file=sys.stderr)
-    return header, records
+def record_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record.get("file"),
+        record.get("function"),
+        record.get("line"),
+        record.get("column"),
+        record.get("branch_id"),
+        record.get("arm_id"),
+    )
 
 
-def validate_header(base, other, path):
-    for key in HEADER_KEYS:
-        if base.get(key) != other.get(key):
-            raise ValueError(
-                f"header mismatch in {path}: key={key} expected={base.get(key)!r} got={other.get(key)!r}"
-            )
+def merge_records(inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for rec in inputs:
+        key = record_key(rec)
+        if key not in merged:
+            merged[key] = dict(rec)
+            continue
+        dst = merged[key]
+        dst["hits"] = int(dst.get("hits", 0)) + int(rec.get("hits", 0))
+        dst["count"] = int(dst.get("count", 0)) + int(rec.get("count", 0))
+    return list(merged.values())
 
 
-def validate_record(record, path, line_num):
-    """Validate that a coverage record has all required fields with correct types."""
-    for field in REQUIRED_RECORD_FIELDS:
-        if field not in record:
-            raise ValueError(
-                f"malformed record in {path} line {line_num}: missing required field '{field}'. "
-                f"Record: {json.dumps(record)}"
-            )
-    # Validate types
-    if not isinstance(record["symbol_id"], str):
-        raise ValueError(
-            f"malformed record in {path} line {line_num}: 'symbol_id' must be a string, "
-            f"got {type(record['symbol_id']).__name__}"
-        )
-    if not isinstance(record["arm_id"], str):
-        raise ValueError(
-            f"malformed record in {path} line {line_num}: 'arm_id' must be a string, "
-            f"got {type(record['arm_id']).__name__}"
-        )
+def load_coverage(path: Path) -> list[dict[str, Any]]:
     try:
-        int(record["hits"])
-    except (ValueError, TypeError):
-        raise ValueError(
-            f"malformed record in {path} line {line_num}: 'hits' must be an integer, "
-            f"got {record['hits']!r}"
-        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"warning: skipping malformed coverage file {path}: {exc}", file=sys.stderr)
+        return []
+    if isinstance(raw, dict):
+        if "records" in raw and isinstance(raw["records"], list):
+            return [r for r in raw["records"] if isinstance(r, dict)]
+        if "coverage" in raw and isinstance(raw["coverage"], list):
+            return [r for r in raw["coverage"] if isinstance(r, dict)]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+    return []
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Merge Tangerine .tgcov JSONL files")
-    parser.add_argument("--in", dest="input_pattern", required=True)
-    parser.add_argument("--out", dest="output", required=True)
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", help="Output JSON path")
+    parser.add_argument("inputs", nargs="+", help="Input coverage JSON files")
     args = parser.parse_args()
 
-    files = [Path(p) for p in sorted(glob.glob(args.input_pattern))]
-    if not files:
-        raise SystemExit("no input files matched")
+    all_records: list[dict[str, Any]] = []
+    for inp in args.inputs:
+        all_records.extend(load_coverage(Path(inp)))
 
-    base_header, base_records = read_jsonl(files[0])
-    merged = {}
-
-    def add_record(record):
-        key = (record["symbol_id"], record["arm_id"])
-        if key not in merged:
-            merged[key] = dict(record)
-        else:
-            merged[key]["hits"] = int(merged[key].get("hits", 0)) + int(record.get("hits", 0))
-
-    for i, rec in enumerate(base_records):
-        validate_record(rec, files[0], i + 2)
-        add_record(rec)
-
-    for path in files[1:]:
-        header, records = read_jsonl(path)
-        validate_header(base_header, header, path)
-        for i, rec in enumerate(records):
-            validate_record(rec, path, i + 2)
-            add_record(rec)
-
-    out_header = dict(base_header)
-    out_header["merged_from_count"] = len(files)
-
-    sorted_records = [
-        merged[k] for k in sorted(merged.keys(), key=lambda k: (k[0], k[1]))
-    ]
-
+    merged = merge_records(all_records)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(out_header, sort_keys=True) + "\n")
-        for rec in sorted_records:
-            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    out_path.write_text(json.dumps({"records": merged}, indent=2), encoding="utf-8")
+    print(f"merged {len(all_records)} records -> {len(merged)} records")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

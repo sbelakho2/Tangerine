@@ -180,6 +180,40 @@ struct PthreadKeyT
   key: UInt
 end
 
+#[cfg(target_os = "linux")]
+def pthread_attr_zero() -> PthreadAttrT
+  PthreadAttrT { opaque: [0; 56] }
+end
+
+#[cfg(target_os = "macos")]
+def pthread_attr_zero() -> PthreadAttrT
+  PthreadAttrT { opaque: [0; 64] }
+end
+
+#[cfg(target_os = "linux")]
+def pthread_mutex_zero() -> PthreadMutexT
+  PthreadMutexT { opaque: [0; 40] }
+end
+
+#[cfg(target_os = "macos")]
+def pthread_mutex_zero() -> PthreadMutexT
+  PthreadMutexT { opaque: [0; 64] }
+end
+
+#[cfg(target_os = "linux")]
+def pthread_rwlock_zero() -> PthreadRwlockT
+  PthreadRwlockT { opaque: [0; 56] }
+end
+
+#[cfg(target_os = "macos")]
+def pthread_rwlock_zero() -> PthreadRwlockT
+  PthreadRwlockT { opaque: [0; 200] }
+end
+
+def pthread_cond_zero() -> PthreadCondT
+  PthreadCondT { opaque: [0; 48] }
+end
+
 # ———————————————————————————————————————————————————————————————
 # Thread
 # ———————————————————————————————————————————————————————————————
@@ -249,7 +283,7 @@ impl ThreadBuilder
     ctx_ptr.write(ctx)
     
     # Initialize thread attributes if needed
-    mut attr = PthreadAttrT { opaque: [0; 56] }
+    mut attr = pthread_attr_zero()
     pthread_attr_init(&attr)
     
     match self.stack_size
@@ -406,7 +440,7 @@ struct Mutex[T]
 end
 
 def mutex_new[T](data: T) -> Mutex[T]
-  mut inner = PthreadMutexT { opaque: [0; 40] }
+  mut inner = pthread_mutex_zero()
   pthread_mutex_init(&inner, Ptr::null())
   Mutex { inner: inner, data: data }
 end
@@ -470,7 +504,7 @@ struct RwLock[T]
 end
 
 def rwlock_new[T](data: T) -> RwLock[T]
-  mut inner = PthreadRwlockT { opaque: [0; 56] }
+  mut inner = pthread_rwlock_zero()
   pthread_rwlock_init(&inner, Ptr::null())
   RwLock { inner: inner, data: data }
 end
@@ -618,9 +652,17 @@ struct Barrier
   inner: PthreadBarrierT
 end
 
+#[cfg(target_os = "linux")]
 def barrier_new(count: UInt) -> Barrier
   mut inner = PthreadBarrierT { opaque: [0; 32] }
   pthread_barrier_init(&inner, Ptr::null(), count)
+  Barrier { inner: inner }
+end
+
+#[cfg(target_os = "macos")]
+def barrier_new(count: UInt) -> Barrier
+  panic("barrier_new: pthread barriers are unsupported on macOS")
+  let inner = PthreadBarrierT { opaque: [0; 0] }
   Barrier { inner: inner }
 end
 
@@ -764,11 +806,11 @@ end
 # ———————————————————————————————————————————————————————————————
 
 struct Sender[T]
-  inner: &ChannelInner[T]
+  inner: Ptr[ChannelInner[T]]
 end
 
 struct Receiver[T]
-  inner: &ChannelInner[T]
+  inner: Ptr[ChannelInner[T]]
 end
 
 struct ChannelInner[T]
@@ -781,11 +823,14 @@ end
 
 def channel[T]() -> (Sender[T], Receiver[T])
   let inner = alloc[ChannelInner[T]]()
+  if inner.is_null() then
+    panic("channel: allocation failed")
+  end
   
-  mut mutex = PthreadMutexT { opaque: [0; 40] }
+  mut mutex = pthread_mutex_zero()
   pthread_mutex_init(&mutex, Ptr::null())
   
-  mut cond = PthreadCondT { opaque: [0; 48] }
+  mut cond = pthread_cond_zero()
   pthread_cond_init(&cond, Ptr::null())
   
   inner.write(ChannelInner {
@@ -796,82 +841,97 @@ def channel[T]() -> (Sender[T], Receiver[T])
     sender_count: atomic_int_new(1)
   })
   
-  let sender = Sender { inner: &inner.read() }
-  let receiver = Receiver { inner: &inner.read() }
+  let sender = Sender { inner: inner }
+  let receiver = Receiver { inner: inner }
   
   (sender, receiver)
 end
 
 impl[T] Sender[T]
   def send(self: &Sender[T], value: T) -> Result[Unit, T]
-    pthread_mutex_lock(&self.inner.mutex)
-    
-    if self.inner.closed then
-      pthread_mutex_unlock(&self.inner.mutex)
-      return Result::Err(value)
+    unsafe "pointer dereference — channel send" do
+      let ch = &mut *self.inner
+      pthread_mutex_lock(&ch.mutex)
+      
+      if ch.closed then
+        pthread_mutex_unlock(&ch.mutex)
+        return Result::Err(value)
+      end
+      
+      ch.queue.push(value)
+      pthread_cond_signal(&ch.not_empty)
+      pthread_mutex_unlock(&ch.mutex)
+      
+      Result::Ok(())
     end
-    
-    self.inner.queue.push(value)
-    pthread_cond_signal(&self.inner.not_empty)
-    pthread_mutex_unlock(&self.inner.mutex)
-    
-    Result::Ok(())
   end
 end
 
 impl[T] Clone for Sender[T]
   def clone(self: &Sender[T]) -> Sender[T]
-    self.inner.sender_count.fetch_add(1, Ordering::Relaxed)
+    unsafe "pointer dereference — channel clone" do
+      let ch = &mut *self.inner
+      ch.sender_count.fetch_add(1, Ordering::Relaxed)
+    end
     Sender { inner: self.inner }
   end
 end
 
 impl[T] Drop for Sender[T]
   def drop(self: &mut Sender[T]) -> Unit
-    let prev = self.inner.sender_count.fetch_sub(1, Ordering::AcqRel)
-    if prev == 1 then
-      # Last sender - close channel
-      pthread_mutex_lock(&self.inner.mutex)
-      self.inner.closed = true
-      pthread_cond_broadcast(&self.inner.not_empty)
-      pthread_mutex_unlock(&self.inner.mutex)
+    unsafe "pointer dereference — channel sender drop" do
+      let ch = &mut *self.inner
+      let prev = ch.sender_count.fetch_sub(1, Ordering::AcqRel)
+      if prev == 1 then
+        # Last sender - close channel
+        pthread_mutex_lock(&ch.mutex)
+        ch.closed = true
+        pthread_cond_broadcast(&ch.not_empty)
+        pthread_mutex_unlock(&ch.mutex)
+      end
     end
   end
 end
 
 impl[T] Receiver[T]
   def recv(self: &Receiver[T]) -> Result[T, Unit]
-    pthread_mutex_lock(&self.inner.mutex)
-    
-    while self.inner.queue.is_empty() && !self.inner.closed do
-      pthread_cond_wait(&self.inner.not_empty, &self.inner.mutex)
+    unsafe "pointer dereference — channel recv" do
+      let ch = &mut *self.inner
+      pthread_mutex_lock(&ch.mutex)
+      
+      while ch.queue.is_empty() && !ch.closed do
+        pthread_cond_wait(&ch.not_empty, &ch.mutex)
+      end
+      
+      if ch.queue.is_empty() then
+        pthread_mutex_unlock(&ch.mutex)
+        return Result::Err(())
+      end
+      
+      let value = ch.queue.remove(0)
+      pthread_mutex_unlock(&ch.mutex)
+      
+      Result::Ok(value)
     end
-    
-    if self.inner.queue.is_empty() then
-      pthread_mutex_unlock(&self.inner.mutex)
-      return Result::Err(())
-    end
-    
-    let value = self.inner.queue.remove(0)
-    pthread_mutex_unlock(&self.inner.mutex)
-    
-    Result::Ok(value)
   end
   
   def try_recv(self: &Receiver[T]) -> Option[T]
-    if pthread_mutex_trylock(&self.inner.mutex) != 0 then
-      return Option::None
+    unsafe "pointer dereference — channel try_recv" do
+      let ch = &mut *self.inner
+      if pthread_mutex_trylock(&ch.mutex) != 0 then
+        return Option::None
+      end
+      
+      if ch.queue.is_empty() then
+        pthread_mutex_unlock(&ch.mutex)
+        return Option::None
+      end
+      
+      let value = ch.queue.remove(0)
+      pthread_mutex_unlock(&ch.mutex)
+      
+      Option::Some(value)
     end
-    
-    if self.inner.queue.is_empty() then
-      pthread_mutex_unlock(&self.inner.mutex)
-      return Option::None
-    end
-    
-    let value = self.inner.queue.remove(0)
-    pthread_mutex_unlock(&self.inner.mutex)
-    
-    Option::Some(value)
   end
   
   def iter(self: &Receiver[T]) -> ChannelIter[T]
@@ -977,9 +1037,13 @@ impl[T] ThreadLocal[T]
       typed_ptr.write((self.init)())
       pthread_setspecific(self.key, raw)
       # Destructor registered at key creation will free this
-      &typed_ptr.read()
+      unsafe "pointer dereference — thread-local value" do
+        &*typed_ptr
+      end
     else
-      &(ptr as Ptr[T]).read()
+      unsafe "pointer dereference — thread-local value" do
+        &*(ptr as Ptr[T])
+      end
     end
   end
 end

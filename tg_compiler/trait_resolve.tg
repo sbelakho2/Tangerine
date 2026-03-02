@@ -4,8 +4,8 @@
 # This module resolves method calls by searching inherent impls first
 # then trait impls, ranking candidates by specificity.
 
-use ast::{ Program, Item, ImplBlock, TraitDef, Span }
-use types::{ Type, TypeEnv, TypeDef, TypeDefKind, MethodSig }
+use tg_compiler::ast::{ Program, Item, ItemKind, ImplDecl, TraitDecl, Span, TypeExpr, TypeExprKind }
+use tg_compiler::types::{ Type, TypeId, TypeEnv, TypeDef, TypeDefKind, MethodSig, lifetime_anonymous }
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -64,25 +64,54 @@ def register_impl(resolver: &mut TraitResolver, entry: ImplEntry) -> Unit
   resolver.impls.push(entry)
 end
 
+def ast_type_to_type(ty: &TypeExpr) -> Type
+  match ty.kind
+  when TypeExprKind::Unit then Type::Unit
+  when TypeExprKind::Never then Type::Never
+  when TypeExprKind::Named(name, _args) then Type::Param(name)
+  when TypeExprKind::Ref(inner) then Type::Ref(ast_type_to_type(&inner), lifetime_anonymous())
+  when TypeExprKind::RefMut(inner) then Type::RefMut(ast_type_to_type(&inner), lifetime_anonymous())
+  when TypeExprKind::Slice(inner) then Type::Slice(ast_type_to_type(&inner))
+  when TypeExprKind::Tuple(elems) then
+    let mapped = Vec::new()
+    for e in elems do
+      mapped.push(ast_type_to_type(&e))
+    end
+    Type::Tuple(mapped)
+  when _ then Type::Error
+  end
+end
+
 def collect_impls(resolver: &mut TraitResolver, program: &Program) -> Unit
   for item in program.items do
-    match item
-    when Item::Impl(impl_block) then
+    match item.kind
+    when ItemKind::Impl(impl_block) then
       mut methods = Vec::new()
       for method in impl_block.methods do
+        mut param_types = Vec::new()
+        for p in method.params do
+          match p.ty
+          when Some(param_ty) then param_types.push(ast_type_to_type(&param_ty))
+          when None then param_types.push(Type::Error)
+          end
+        end
         methods.push(MethodSig {
           name: method.name.clone(),
-          params: method.params.iter().map(|p| p.ty.clone()).collect(),
-          ret: method.return_type.clone()
+          params: param_types,
+          ret_type: match method.ret_type
+            when Some(ret_ty) then ast_type_to_type(&ret_ty)
+            when None then Type::Unit
+          end,
+          is_method: true
         })
       end
       let is_inherent = impl_block.trait_name.is_none()
       register_impl(resolver, ImplEntry {
         trait_name: match impl_block.trait_name
           when Some(name) then name
-          when None then impl_block.type_name.clone()
+          when None then "_"
         end,
-        for_type: Type::Named(impl_block.type_name.clone(), Vec::new()),
+        for_type: ast_type_to_type(&impl_block.for_type),
         methods: methods,
         is_inherent: is_inherent,
         span: impl_block.span
@@ -353,7 +382,7 @@ def check_coherence(resolver: &mut TraitResolver) -> Unit
         let b = &resolver.impls[indices[j]]
         if type_matches(&a.for_type, &b.for_type) then
           resolver.errors.push(TraitError {
-            message: "overlapping impls for trait '" ++ a.trait_name ++ "' — coherence violation",
+            message: "overlapping impls for trait '" + a.trait_name + "' — coherence violation",
             span: b.span
           })
         end
@@ -391,8 +420,8 @@ def check_orphan_rules(resolver: &mut TraitResolver) -> Unit
       if !has_local_covered_type(resolver, &imp.for_type) then
         resolver.errors.push(TraitError {
           message: "orphan rule violation: cannot implement foreign trait '" ++
-                   imp.trait_name ++ "' for foreign type '" ++
-                   type_to_string(&imp.for_type) ++ "' — at least one must be " ++
+                   imp.trait_name + "' for foreign type '" ++
+                   type_to_string(&imp.for_type) + "' — at least one must be " ++
                    "defined in the current crate",
           span: imp.span
         })
@@ -415,8 +444,9 @@ end
 
 def is_self_type_local(resolver: &TraitResolver, ty: &Type) -> Bool
   match ty
-  when Type::Named(name) then is_type_local(resolver, name.clone())
-  when Type::Generic(name, _) then is_type_local(resolver, name.clone())
+  when Type::Named(tid, args) then
+    let name = type_id_to_name(resolver, tid)
+    is_type_local(resolver, name)
   when Type::Tuple(_) then false  # Tuples are builtin
   when Type::Array(_, _) then false  # Arrays are builtin
   when Type::Ref(inner, _) then is_self_type_local(resolver, inner)
@@ -428,7 +458,7 @@ def has_local_covered_type(resolver: &TraitResolver, ty: &Type) -> Bool
   # A type is "covered" if a local type appears inside a generic parameter
   # Example: impl Display for Vec[MyLocalType] is OK because MyLocalType covers it
   match ty
-  when Type::Generic(_, args) then
+  when Type::Named(_, args) then
     for arg in args do
       if is_self_type_local(resolver, &arg) then return true end
       if has_local_covered_type(resolver, &arg) then return true end
@@ -451,22 +481,29 @@ def is_builtin_trait(name: String) -> Bool
   name == "From" || name == "Future"
 end
 
+def type_id_to_name(resolver: &TraitResolver, tid: &TypeId) -> String
+  "<type_" + tid.id.to_string() + ">"
+end
+
 def type_to_string(ty: &Type) -> String
   match ty
-  when Type::Named(name) then name.clone()
-  when Type::Generic(name, args) then
-    mut s = name.clone() + "["
-    mut first = true
-    for arg in args do
-      if !first then s = s + ", " end
-      s = s + type_to_string(&arg)
-      first = false
+  when Type::Named(tid, args) then
+    if args.is_empty() then
+      "<type_" + tid.id.to_string() + ">"
+    else
+      mut s = "<type_" + tid.id.to_string() + ">["
+      mut first = true
+      for arg in args do
+        if !first then s = s + ", " end
+        s = s + type_to_string(&arg)
+        first = false
+      end
+      s + "]"
     end
-    s + "]"
-  when Type::Ref(inner, is_mut) then
-    if is_mut then "&mut " + type_to_string(inner)
-    else "&" + type_to_string(inner)
-    end
+  when Type::Ref(inner, _lt) then
+    "&" + type_to_string(inner)
+  when Type::RefMut(inner, _lt) then
+    "&mut " + type_to_string(inner)
   when Type::Tuple(elems) then
     mut s = "("
     mut first = true
@@ -506,7 +543,7 @@ def check_where_bounds(
   for bound in bounds do
     if !satisfies_trait(resolver, ty, bound.clone()) then
       errors.push(TraitError {
-        message: "type does not satisfy trait bound '" ++ bound ++ "'",
+        message: "type does not satisfy trait bound '" + bound + "'",
         span: span
       })
     end
@@ -772,9 +809,9 @@ def type_to_mangled_name(ty: &Type) -> String
   when Type::Unit then "Unit"
   when Type::Named(id, args) then
     if args.is_empty() then
-      id.name.clone()
+      "t" + id.id.to_string()
     else
-      mut s = id.name.clone()
+      mut s = "t" + id.id.to_string()
       for arg in args do
         s = s + "_" + type_to_mangled_name(arg)
       end
@@ -826,7 +863,7 @@ end
 def collect_generic_calls(func: &MirFunction, worklist: &mut Vec[(String, Vec[Type])]) -> Unit
   for block in func.blocks do
     match block.terminator.kind
-    when MirTerminatorKind::Call(_, callee, _, _, _) then
+    when MirTerminatorKind::Call(callee, _, _, _, _) then
       # If callee is a function with type args, record it
       match callee.kind
       when MirOperandKind::Constant(const) then
@@ -908,13 +945,13 @@ end
 
 # Generate mangled name for a monomorphized function
 def mangle_name(base: String, type_args: &Vec[Type]) -> String
-  mut name = base ++ "$"
+  mut name = base + "$"
   mut first = true
   for ty in type_args do
     if !first then
-      name = name ++ "_"
+      name = name + "_"
     end
-    name = name ++ type_to_mangled(ty)
+    name = name + type_to_mangled(ty)
     first = false
   end
   name
@@ -949,11 +986,46 @@ pub def mangle_tangerine_symbol(
   let module_len = module_path.len()
   let name_len = name.len()
   
-  "_TG" ++ TANGERINE_ABI_EDITION ++ "_" ++
-    hex_u64(pkg_hash) ++ "_" ++
-    module_len.to_string() ++ ":" ++ module_path ++ "_" ++
-    name_len.to_string() ++ ":" ++ name ++ "_" ++
+  "_TG" + TANGERINE_ABI_EDITION + "_" ++
+    hex_u64(pkg_hash) + "_" ++
+    module_len.to_string() + ":" + module_path + "_" ++
+    name_len.to_string() + ":" + name + "_" ++
     hex_u64(sig_hash)
+end
+
+# Best-effort demangler for symbols emitted by mangle_tangerine_symbol.
+# Returns a readable summary: module_path::name [edition=..., pkg=..., sig=...]
+pub def demangle_tangerine_symbol(symbol: &String) -> Option[String]
+  if !symbol.starts_with("_TG") then
+    return Option::None
+  end
+
+  let parts = symbol.split("_")
+  if parts.len() < 6 then
+    return Option::None
+  end
+
+  let edition_part = parts[1]
+  if !edition_part.starts_with("TG") then
+    return Option::None
+  end
+
+  let edition = edition_part.slice(2, edition_part.len())
+  let pkg_hash = parts[2]
+  let module_field = parts[3]
+  let name_field = parts[4]
+  let sig_hash = parts[5]
+
+  let module_parts = module_field.split(":")
+  let name_parts = name_field.split(":")
+  if module_parts.len() < 2 || name_parts.len() < 2 then
+    return Option::None
+  end
+
+  let module_path = module_parts[1]
+  let name = name_parts[1]
+
+  Option::Some(module_path + "::" + name + " [edition=" + edition + ", pkg=" + pkg_hash + ", sig=" + sig_hash + "]")
 end
 
 # Compute package identity hash (name + version + registry)
@@ -990,7 +1062,7 @@ def hex_u64(val: UInt) -> String
   mut i = 0
   while i < 16 do
     let nibble = (v >> 60) & 0xf
-    result = result ++ chars.char_at(nibble as UInt).unwrap().to_string()
+    result = result + chars.char_at(nibble as UInt).unwrap().to_string()
     v = v << 4
     i = i + 1
   end
@@ -1021,7 +1093,7 @@ pub def demangle_tangerine_symbol(mangled: String) -> Option[String]
   # Parse moduleLen
   mut module_len_str = ""
   while pos < mangled.len() && mangled.char_at(pos) != Option::Some(':') do
-    module_len_str = module_len_str ++ mangled.char_at(pos).unwrap().to_string()
+    module_len_str = module_len_str + mangled.char_at(pos).unwrap().to_string()
     pos = pos + 1
   end
   pos = pos + 1  # skip ':'
@@ -1038,7 +1110,7 @@ pub def demangle_tangerine_symbol(mangled: String) -> Option[String]
   # Parse nameLen
   mut name_len_str = ""
   while pos < mangled.len() && mangled.char_at(pos) != Option::Some(':') do
-    name_len_str = name_len_str ++ mangled.char_at(pos).unwrap().to_string()
+    name_len_str = name_len_str + mangled.char_at(pos).unwrap().to_string()
     pos = pos + 1
   end
   pos = pos + 1  # skip ':'
@@ -1051,7 +1123,7 @@ pub def demangle_tangerine_symbol(mangled: String) -> Option[String]
   # Extract name
   let name = mangled.slice(pos, pos + name_len)
   
-  Option::Some(module_path ++ "::" ++ name)
+  Option::Some(module_path + "::" + name)
 end
 
 def type_to_mangled(ty: &Type) -> String
@@ -1063,11 +1135,11 @@ def type_to_mangled(ty: &Type) -> String
   when Type::Float then "f64"
   when Type::Char then "char"
   when Type::String then "str"
-  when Type::Named(name, _) then name.clone()
-  when Type::Option(inner) then "opt_" ++ type_to_mangled(inner)
-  when Type::Result(ok, err) then "res_" ++ type_to_mangled(ok) ++ "_" ++ type_to_mangled(err)
-  when Type::Map(k, v) then "map_" ++ type_to_mangled(k) ++ "_" ++ type_to_mangled(v)
-  when Type::Set(inner) then "set_" ++ type_to_mangled(inner)
+  when Type::Named(tid, _) then "t" + tid.id.to_string()
+  when Type::Option(inner) then "opt_" + type_to_mangled(inner)
+  when Type::Result(ok, err) then "res_" + type_to_mangled(ok) + "_" + type_to_mangled(err)
+  when Type::Map(k, v) then "map_" + type_to_mangled(k) + "_" + type_to_mangled(v)
+  when Type::Set(inner) then "set_" + type_to_mangled(inner)
   when _ then "any"
   end
 end
@@ -1095,7 +1167,8 @@ def type_eq(a: &Type, b: &Type) -> Bool
   when (Type::Float, Type::Float) then true
   when (Type::Char, Type::Char) then true
   when (Type::String, Type::String) then true
-  when (Type::Named(n1, _), Type::Named(n2, _)) then n1 == n2
+  when (Type::Named(n1, args1), Type::Named(n2, args2)) then
+    n1 == n2 && types_equal(args1, args2)
   when (Type::Option(t1), Type::Option(t2)) then type_eq(t1, t2)
   when (Type::Result(ok1, err1), Type::Result(ok2, err2)) then
     type_eq(ok1, ok2) && type_eq(err1, err2)
@@ -1134,10 +1207,8 @@ struct VTableEntry
   signature: MethodSig
 end
 
-struct MethodSig
-  param_types: Vec[Type]
-  return_type: Type
-end
+# MethodSig is imported from tg_compiler::types — uses fields:
+# name, params, ret_type, is_method
 
 struct VTableRegistry
   vtables: Map[String, VTable]    # trait_name + "$" + mangled_type -> VTable
@@ -1254,7 +1325,7 @@ end
 # Check if a type is a trait object (dyn Trait)
 def is_trait_object(ty: &Type) -> Bool
   match ty
-  when Type::Named(name, _) then name.starts_with("dyn ")
+  when Type::Dyn(_) then true
   when _ then false
   end
 end
@@ -1262,12 +1333,8 @@ end
 # Extract the trait name from a dyn trait type
 def trait_object_trait_name(ty: &Type) -> Option[String]
   match ty
-  when Type::Named(name, _) then
-    if name.starts_with("dyn ") then
-      Option::Some(name.slice(4, name.len()))
-    else
-      Option::None
-    end
+  when Type::Dyn(tid) then
+    Option::Some("<type_" + tid.id.to_string() + ">")
   when _ then Option::None
   end
 end
@@ -1312,17 +1379,8 @@ def compute_type_size_align(ty: &Type) -> (Int, Int)
   when Type::Char then (4, 4)
   when Type::Unit then (0, 1)
   when Type::Never then (0, 1)
-  when Type::Named(name, args) then
-    match name.as_str()
-    when "String" then (24, 8)
-    when "Vec" then (24, 8)
-    when "Map" then (48, 8)
-    when "Set" then (32, 8)
-    when "Option" then (16, 8)
-    when "Result" then (24, 8)
-    when "Box" then (8, 8)
-    when _ then (8, 8)   # user-defined structs: pointer-width default
-    end
+  when Type::Named(_, _) then
+    (8, 8)
   when Type::Ref(_) then (8, 8)
   when Type::RefMut(_) then (8, 8)
   when Type::Function(_, _) then (16, 8)  # fn pointer + closure env

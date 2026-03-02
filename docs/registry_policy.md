@@ -113,7 +113,9 @@ Removed packages leave a tombstone to prevent name reuse for 90 days.
 ### 4.2 Dependency Confusion Prevention
 
 - The registry rejects package names that shadow standard library modules
-  (`core`, `collections`, `io`, etc.).
+  (`core`, `collections`, `io`, etc.). These names are reserved in the package
+  namespace and cannot be published as third-party crates, even though standard
+  library modules are imported as `std::<module>` in source code.
 - Private registries can be configured in `Tangerine.toml` with explicit
   scoping to prevent cross-registry confusion.
 

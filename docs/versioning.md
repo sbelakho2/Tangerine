@@ -68,7 +68,7 @@ The migration tool:
 
 | Edition | Status    | Key Changes |
 | ------- | --------- | ----------- |
-| 2025    | Frozen    | Initial edition; spec frozen (all APIs remain unstable pre-1.0) |
+| 2025    | Reserved  | Historical pre-1.0 placeholder; no standalone published spec |
 | 2026    | Current   | ABI updates, stdlib and tooling expansion |
 
 ## Standard Library Stability
@@ -117,13 +117,17 @@ The following modules are included in the standard library.
 | `std/fmt` | Display, Debug, formatting, printing | Unstable (pre-1.0) |
 | `std/alloc` | Allocator trait, system/arena allocators | Unstable (pre-1.0) |
 | `std/env` | Environment variables, process arguments | Unstable (pre-1.0) |
+| `std/process` | Process spawning and lifecycle APIs | Unstable (pre-1.0) |
 | `std/backtrace` | Stack trace capture and display | Unstable (pre-1.0) |
 | `std/io` | I/O traits and buffering | Unstable (pre-1.0) |
 | `std/fs` | Filesystem operations | Unstable (pre-1.0) |
 | `std/net` | Network sockets | Unstable (pre-1.0) |
 | `std/async` | Async runtime and futures | Unstable (pre-1.0) |
 | `std/thread` | Threading and synchronization | Unstable (pre-1.0) |
+| `std/sync` | Mutexes, RW locks, atomics, channels | Unstable (pre-1.0) |
 | `std/time` | Date, time, and duration | Unstable (pre-1.0) |
+| `std/locale` | Locale-aware formatting and parsing | Unstable (pre-1.0) |
+| `std/unicode` | Unicode normalization and text operations | Unstable (pre-1.0) |
 | `std/test` | Testing framework | Unstable (pre-1.0) |
 | `std/bench` | Benchmarking | Unstable (pre-1.0) |
 | `std/test_gen` | Automatic test generation | Unstable (pre-1.0) |

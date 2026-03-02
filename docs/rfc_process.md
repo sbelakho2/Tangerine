@@ -152,8 +152,10 @@ Accepted RFCs can be amended via a follow-up RFC or a lightweight amendment PR
 ```
 rfcs/
   0001-block-closures.md
-  0002-capability-system.md
-  0003-effect-tracking.md
+  0002-match-arm-syntax-unification.md
+  0003-mode-system.md
+  0004-capability-and-effects.md
+  0005-cqs-and-cws.md
   ...
   template.md
 ```

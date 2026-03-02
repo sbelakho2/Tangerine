@@ -7,6 +7,7 @@ use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use tg_compiler::mode::{Mode, Span}
 use tg_compiler::cqs::{SurfaceClass, sha256}
+use tg_compiler::util::{to_float, max_int}
 
 # ═══════════════════════════════════════════════════════════════
 # §69 — Capability Vocabulary (v0.2)
@@ -87,7 +88,7 @@ def new_baseline(
     tgc_version: "0.1.0",
     target: target,
     build_id: build_id,
-    generated_utc: __intrinsic_utc_now(),
+    generated_utc: "unknown".to_string(),
     package_name: pkg_name,
     package_version: pkg_version,
     symbols: Vec::new(),
@@ -140,7 +141,27 @@ def effect_to_cap(effect: String) -> Option[String]
   when "db.write" then Option::Some(CAP_DB())
   when "clock.now" then Option::Some(CAP_CLOCK())
   when "random.gen" then Option::Some(CAP_RANDOM())
-  when _ then Option::None
+  when _ then
+    let lowered = effect.to_lowercase()
+    if lowered.starts_with("net.") then
+      Option::Some(CAP_NET())
+    elsif lowered.starts_with("fs.") then
+      if lowered.contains("read") then Option::Some(CAP_FS_READ()) else Option::Some(CAP_FS()) end
+    elsif lowered.starts_with("process.") then
+      Option::Some(CAP_PROC())
+    elsif lowered.starts_with("ffi.") then
+      Option::Some(CAP_FFI())
+    elsif lowered.starts_with("env.") then
+      Option::Some(CAP_ENV())
+    elsif lowered.starts_with("db.") then
+      Option::Some(CAP_DB())
+    elsif lowered.starts_with("clock.") || lowered.starts_with("time.") then
+      Option::Some(CAP_CLOCK())
+    elsif lowered.starts_with("random.") || lowered.starts_with("rand.") then
+      Option::Some(CAP_RANDOM())
+    else
+      Option::None
+    end
   end
 end
 
@@ -150,30 +171,667 @@ def extract_all_caps(
   callee_caps: &Vec[Set[String]],
   effects: &Vec[String],
   has_unsafe: Bool
-) -> Set[String]
-  let caps = extract_direct_caps(param_types)
+) -> CapExtractResult
+  let direct = extract_direct_caps(param_types)
 
   # Transitive: union of callee caps
+  let transitive = Set::new()
   for callee in callee_caps
     for cap in callee
-      caps.insert(cap)
+      transitive.insert(cap)
     end
   end
 
   # Effects → caps
+  let from_effects = Set::new()
   for eff in effects
     match effect_to_cap(eff)
-    when Option::Some(cap) then caps.insert(cap)
+    when Option::Some(cap) then from_effects.insert(cap)
     when Option::None then ()
     end
   end
 
   # Unsafe → UnsafeCap
-  if has_unsafe
-    caps.insert(CAP_UNSAFE())
+  if has_unsafe then
+    from_effects.insert(CAP_UNSAFE())
   end
 
-  caps
+  CapExtractResult {
+    direct: direct,
+    transitive: transitive,
+    from_effects: from_effects,
+    has_unsafe: has_unsafe
+  }
+end
+
+# Analyze a single function declaration and return its extracted capabilities.
+# Walks the function's parameters, body, and annotations to determine all
+# capabilities it requires.
+def analyze_function_caps(
+  func: &FunctionDecl,
+  callee_caps: &Vec[Set[String]]
+) -> CapExtractResult
+  # Collect parameter type names for direct capability extraction
+  mut param_types = Vec::new()
+  for param in func.params do
+    param_types.push(param.ty.to_string())
+  end
+
+  # Collect declared effects from explicit function metadata and annotations.
+  mut effects = Vec::new()
+  for eff in func.effects do
+    if !effects.contains(eff) then
+      effects.push(eff.clone())
+    end
+  end
+
+  for attr in func.attrs do
+    if attr.name == "effect" || attr.name == "effects" then
+      for arg in attr.args do
+        effects.push(arg.clone())
+      end
+    end
+  end
+
+  # Collect inferred effects from AST body traversal.
+  # This keeps capability extraction tied to parsed structure instead of
+  # relying only on textual annotations.
+  let inferred_effects = collect_effects_from_function(func)
+  for eff in inferred_effects do
+    if !effects.contains(eff) then
+      effects.push(eff)
+    end
+  end
+
+  # Check for unsafe blocks in the function body
+  let has_unsafe = function_has_unsafe(func)
+
+  # Start from extracted caps, then merge explicit required capability declarations.
+  let extracted = extract_all_caps(&param_types, callee_caps, &effects, has_unsafe)
+  let merged_direct = extracted.direct.clone()
+  for cap in func.required_caps do
+    merged_direct.insert(cap.clone())
+  end
+
+  CapExtractResult {
+    direct: merged_direct,
+    transitive: extracted.transitive,
+    from_effects: extracted.from_effects,
+    has_unsafe: extracted.has_unsafe
+  }
+end
+
+def collect_effects_from_function(func: &FunctionDecl) -> Vec[String]
+  let effects = Vec::new()
+  match func.body
+  when Option::Some(FnBody::Block(block)) then
+    collect_effects_from_block(&block, &effects)
+  when _ then ()
+  end
+  effects
+end
+
+def push_effect_once(effects: &Vec[String], effect: String) -> Unit
+  if !effects.contains(effect) then
+    effects.push(effect)
+  end
+end
+
+def maybe_effect_from_name(name: String) -> Option[String]
+  let lowered = name.to_lowercase()
+
+  if lowered.contains("net") || lowered.contains("socket") || lowered.contains("http") then
+    if lowered.contains("read") || lowered.contains("recv") then
+      return Option::Some("net.read")
+    end
+    if lowered.contains("write") || lowered.contains("send") || lowered.contains("connect") || lowered.contains("bind") then
+      return Option::Some("net.write")
+    end
+  end
+
+  if lowered.contains("file") || lowered.contains("fs") || lowered.contains("path") then
+    if lowered.contains("read") || lowered.contains("open") || lowered.contains("load") then
+      return Option::Some("fs.read")
+    end
+    if lowered.contains("write") || lowered.contains("create") || lowered.contains("append") || lowered.contains("remove") then
+      return Option::Some("fs.write")
+    end
+  end
+
+  if lowered.contains("spawn") || lowered.contains("exec") || lowered.contains("system") || lowered.contains("process") then
+    return Option::Some("process.spawn")
+  end
+
+  if lowered.contains("ffi") then
+    return Option::Some("ffi.call")
+  end
+
+  if lowered.contains("env") then
+    if lowered.contains("set") || lowered.contains("write") then
+      return Option::Some("env.write")
+    end
+    return Option::Some("env.read")
+  end
+
+  if lowered.contains("db") || lowered.contains("sql") || lowered.contains("query") then
+    if lowered.contains("read") || lowered.contains("select") || lowered.contains("query") then
+      return Option::Some("db.read")
+    end
+    if lowered.contains("write") || lowered.contains("insert") || lowered.contains("update") || lowered.contains("delete") then
+      return Option::Some("db.write")
+    end
+  end
+
+  if lowered.contains("time") || lowered.contains("clock") || lowered == "now" then
+    return Option::Some("clock.now")
+  end
+
+  if lowered.contains("random") || lowered.contains("rand") then
+    return Option::Some("random.gen")
+  end
+
+  Option::None
+end
+
+def maybe_effect_from_path_call(path_name: String) -> Option[String]
+  let lowered = path_name.to_lowercase()
+
+  if lowered.starts_with("std::fs::") || lowered.contains("::fs::") then
+    if lowered.ends_with("::read") || lowered.ends_with("::open") || lowered.ends_with("::load") then
+      return Option::Some("fs.read")
+    end
+    if lowered.ends_with("::write") || lowered.ends_with("::create") || lowered.ends_with("::append") || lowered.ends_with("::remove") then
+      return Option::Some("fs.write")
+    end
+  end
+
+  if lowered.starts_with("std::net::") || lowered.contains("::net::") || lowered.starts_with("std::http::") || lowered.contains("::http::") then
+    if lowered.ends_with("::recv") || lowered.ends_with("::read") then
+      return Option::Some("net.read")
+    end
+    if lowered.ends_with("::send") || lowered.ends_with("::write") || lowered.ends_with("::connect") || lowered.ends_with("::bind") || lowered.ends_with("::listen") then
+      return Option::Some("net.write")
+    end
+  end
+
+  if lowered.starts_with("std::process::") || lowered.contains("::process::") then
+    if lowered.ends_with("::spawn") || lowered.ends_with("::exec") || lowered.ends_with("::system") then
+      return Option::Some("process.spawn")
+    end
+  end
+
+  if lowered.starts_with("std::env::") || lowered.contains("::env::") then
+    if lowered.ends_with("::set") || lowered.ends_with("::set_var") then
+      return Option::Some("env.write")
+    end
+    if lowered.ends_with("::get") || lowered.ends_with("::var") || lowered.ends_with("::getenv") then
+      return Option::Some("env.read")
+    end
+  end
+
+  if lowered.starts_with("std::db::") || lowered.contains("::db::") then
+    if lowered.ends_with("::select") || lowered.ends_with("::query") || lowered.ends_with("::fetch") then
+      return Option::Some("db.read")
+    end
+    if lowered.ends_with("::insert") || lowered.ends_with("::update") || lowered.ends_with("::delete") || lowered.ends_with("::execute") then
+      return Option::Some("db.write")
+    end
+  end
+
+  if lowered.starts_with("std::time::") || lowered.contains("::time::") || lowered.starts_with("std::clock::") || lowered.contains("::clock::") then
+    if lowered.ends_with("::now") then
+      return Option::Some("clock.now")
+    end
+  end
+
+  if lowered.starts_with("std::random::") || lowered.contains("::random::") then
+    return Option::Some("random.gen")
+  end
+
+  Option::None
+end
+
+def maybe_effect_from_method_call(recv_path: String, method: String) -> Option[String]
+  let base = recv_path.to_lowercase()
+  let op = method.to_lowercase()
+
+  if base.contains("::fs") || base.ends_with("fs") || base.contains("file") then
+    if op == "read" || op == "open" || op == "load" then return Option::Some("fs.read") end
+    if op == "write" || op == "append" || op == "create" || op == "remove" then return Option::Some("fs.write") end
+  end
+
+  if base.contains("::net") || base.contains("::http") || base.contains("socket") then
+    if op == "recv" || op == "read" then return Option::Some("net.read") end
+    if op == "send" || op == "write" || op == "connect" || op == "bind" || op == "listen" then return Option::Some("net.write") end
+  end
+
+  if base.contains("::process") || base.contains("process") then
+    if op == "spawn" || op == "exec" || op == "system" then return Option::Some("process.spawn") end
+  end
+
+  if base.contains("::env") || base.contains("env") then
+    if op == "set" || op == "set_var" then return Option::Some("env.write") end
+    if op == "get" || op == "var" || op == "getenv" then return Option::Some("env.read") end
+  end
+
+  if base.contains("::db") || base.contains("database") then
+    if op == "select" || op == "query" || op == "fetch" then return Option::Some("db.read") end
+    if op == "insert" || op == "update" || op == "delete" || op == "execute" then return Option::Some("db.write") end
+  end
+
+  if base.contains("::time") || base.contains("::clock") || base.contains("clock") then
+    if op == "now" then return Option::Some("clock.now") end
+  end
+
+  if base.contains("::random") || base.contains("random") then
+    return Option::Some("random.gen")
+  end
+
+  Option::None
+end
+
+def collect_effects_from_block(block: &Block, effects: &Vec[String]) -> Unit
+  for stmt in block.stmts do
+    collect_effects_from_stmt(&stmt, effects)
+  end
+end
+
+def collect_effects_from_stmt(stmt: &Stmt, effects: &Vec[String]) -> Unit
+  match stmt.kind
+  when StmtKind::Let(_, _, value, _) then
+    collect_effects_from_expr(&value, effects)
+
+  when StmtKind::Assign(target, value) then
+    collect_effects_from_expr(&target, effects)
+    collect_effects_from_expr(&value, effects)
+
+  when StmtKind::Expr(expr) then
+    collect_effects_from_expr(&expr, effects)
+
+  when StmtKind::If(if_stmt) then
+    collect_effects_from_expr(&if_stmt.cond, effects)
+    collect_effects_from_block(&if_stmt.then_block, effects)
+    for (elsif_cond, elsif_block) in if_stmt.elsif_branches do
+      collect_effects_from_expr(&elsif_cond, effects)
+      collect_effects_from_block(&elsif_block, effects)
+    end
+    match if_stmt.else_block
+    when Option::Some(else_block) then collect_effects_from_block(&else_block, effects)
+    when Option::None then ()
+    end
+
+  when StmtKind::While(cond, body) then
+    collect_effects_from_expr(&cond, effects)
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::For(_, iter, body) then
+    collect_effects_from_expr(&iter, effects)
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::Loop(body) then
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::Return(ret_opt) then
+    match ret_opt
+    when Option::Some(ret_expr) then collect_effects_from_expr(&ret_expr, effects)
+    when Option::None then ()
+    end
+
+  when StmtKind::Yield(val_opt) then
+    match val_opt
+    when Option::Some(v) then collect_effects_from_expr(&v, effects)
+    when Option::None then ()
+    end
+
+  when StmtKind::Match(m) then
+    collect_effects_from_expr(&m.scrutinee, effects)
+    for arm in m.arms do
+      match arm.guard
+      when Option::Some(g) then collect_effects_from_expr(&g, effects)
+      when Option::None then ()
+      end
+      collect_effects_from_block(&arm.body, effects)
+    end
+
+  when StmtKind::Unsafe(_, body) then
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::Defer(body) then
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::Guard(cond, _) then
+    collect_effects_from_expr(&cond, effects)
+
+  when StmtKind::Try(body, catches, finally) then
+    collect_effects_from_block(&body, effects)
+    for c in catches do
+      collect_effects_from_block(&c.body, effects)
+    end
+    match finally
+    when Option::Some(finally_block) then collect_effects_from_block(&finally_block, effects)
+    when Option::None then ()
+    end
+
+  when StmtKind::With(resource, _, body) then
+    collect_effects_from_expr(&resource, effects)
+    collect_effects_from_block(&body, effects)
+
+  when StmtKind::HandleWith(effect_expr, handlers) then
+    collect_effects_from_expr(&effect_expr, effects)
+    for h in handlers do
+      for arm in h.arms do
+        collect_effects_from_block(&arm.body, effects)
+      end
+    end
+
+  when _ then ()
+  end
+end
+
+def collect_effects_from_expr(expr: &Expr, effects: &Vec[String]) -> Unit
+  match expr.kind
+  when ExprKind::Call(callee, args) then
+    match callee.kind
+    when ExprKind::Ident(name) then
+      match maybe_effect_from_name(name)
+      when Option::Some(effect_id) then push_effect_once(effects, effect_id)
+      when Option::None then ()
+      end
+    when ExprKind::Path(path) then
+      let joined = path.segments.join("::")
+      match maybe_effect_from_path_call(joined)
+      when Option::Some(effect_id) then push_effect_once(effects, effect_id)
+      when Option::None then
+        match maybe_effect_from_name(joined)
+        when Option::Some(fallback_effect) then push_effect_once(effects, fallback_effect)
+        when Option::None then ()
+        end
+      end
+    when ExprKind::FieldAccess(recv, method_name) then
+      match recv.kind
+      when ExprKind::Path(path) then
+        let recv_joined = path.segments.join("::")
+        match maybe_effect_from_method_call(recv_joined, method_name)
+        when Option::Some(effect_id) then push_effect_once(effects, effect_id)
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+    collect_effects_from_expr(&callee, effects)
+    for a in args do
+      collect_effects_from_expr(&a, effects)
+    end
+
+  when ExprKind::MethodCall(recv, method, _, args) then
+    match recv.kind
+    when ExprKind::Path(path) then
+      let recv_joined = path.segments.join("::")
+      match maybe_effect_from_method_call(recv_joined, method)
+      when Option::Some(effect_id) then push_effect_once(effects, effect_id)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    match maybe_effect_from_name(method)
+    when Option::Some(fallback_effect) then push_effect_once(effects, fallback_effect)
+    when Option::None then ()
+    end
+    collect_effects_from_expr(&recv, effects)
+    for a in args do
+      collect_effects_from_expr(&a, effects)
+    end
+
+  when ExprKind::BinaryOp(_, left, right) then
+    collect_effects_from_expr(&left, effects)
+    collect_effects_from_expr(&right, effects)
+
+  when ExprKind::UnaryOp(_, inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::FieldAccess(recv, _) then
+    collect_effects_from_expr(&recv, effects)
+
+  when ExprKind::Index(recv, index) then
+    collect_effects_from_expr(&recv, effects)
+    collect_effects_from_expr(&index, effects)
+
+  when ExprKind::Ref(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::RefMut(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Deref(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Move(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Copy(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::ArrayLit(elems) then
+    for e in elems do
+      collect_effects_from_expr(&e, effects)
+    end
+
+  when ExprKind::TupleLit(elems) then
+    for e in elems do
+      collect_effects_from_expr(&e, effects)
+    end
+
+  when ExprKind::MapLit(entries) then
+    for (k, v) in entries do
+      collect_effects_from_expr(&k, effects)
+      collect_effects_from_expr(&v, effects)
+    end
+
+  when ExprKind::StructLit(_, fields) then
+    for (_, val) in fields do
+      collect_effects_from_expr(&val, effects)
+    end
+
+  when ExprKind::Closure(_, _, body) then
+    collect_effects_from_expr(&body, effects)
+
+  when ExprKind::If(if_stmt) then
+    collect_effects_from_expr(&if_stmt.cond, effects)
+    collect_effects_from_block(&if_stmt.then_block, effects)
+    for (elsif_cond, elsif_block) in if_stmt.elsif_branches do
+      collect_effects_from_expr(&elsif_cond, effects)
+      collect_effects_from_block(&elsif_block, effects)
+    end
+    match if_stmt.else_block
+    when Option::Some(else_block) then collect_effects_from_block(&else_block, effects)
+    when Option::None then ()
+    end
+
+  when ExprKind::Match(m) then
+    collect_effects_from_expr(&m.scrutinee, effects)
+    for arm in m.arms do
+      match arm.guard
+      when Option::Some(g) then collect_effects_from_expr(&g, effects)
+      when Option::None then ()
+      end
+      collect_effects_from_block(&arm.body, effects)
+    end
+
+  when ExprKind::Block(block) then
+    collect_effects_from_block(&block, effects)
+
+  when ExprKind::Async(block) then
+    collect_effects_from_block(&block, effects)
+
+  when ExprKind::Await(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Try(inner) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Range(start_opt, end_opt, _) then
+    match start_opt
+    when Option::Some(start_expr) then collect_effects_from_expr(&start_expr, effects)
+    when Option::None then ()
+    end
+    match end_opt
+    when Option::Some(end_expr) then collect_effects_from_expr(&end_expr, effects)
+    when Option::None then ()
+    end
+
+  when ExprKind::Cast(inner, _) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::TypeCheck(inner, _) then
+    collect_effects_from_expr(&inner, effects)
+
+  when ExprKind::Comptime(block) then
+    collect_effects_from_block(&block, effects)
+
+  when ExprKind::EnumVariant(_, args) then
+    for a in args do
+      collect_effects_from_expr(&a, effects)
+    end
+
+  when ExprKind::Assign(target, value) then
+    collect_effects_from_expr(&target, effects)
+    collect_effects_from_expr(&value, effects)
+
+  when ExprKind::Pipe(left, right) then
+    collect_effects_from_expr(&left, effects)
+    collect_effects_from_expr(&right, effects)
+
+  when _ then ()
+  end
+end
+
+# Check whether a function's body contains any unsafe blocks.
+def function_has_unsafe(func: &FunctionDecl) -> Bool
+  match func.body
+  when Option::Some(FnBody::Block(block)) then
+    block_has_unsafe(&block)
+  when _ then false
+  end
+end
+
+def block_has_unsafe(block: &Block) -> Bool
+  for stmt in block.stmts do
+    match stmt.kind
+    when StmtKind::Expr(expr) then
+      if expr_has_unsafe(&expr) then return true end
+    when _ then ()
+    end
+  end
+  false
+end
+
+def expr_has_unsafe(expr: &Expr) -> Bool
+  match expr.kind
+  when ExprKind::Unsafe(_, _) then true
+  when ExprKind::Block(b) then block_has_unsafe(&b)
+  when ExprKind::If(cond, then_b, else_b) then
+    if expr_has_unsafe(&cond) then return true end
+    if block_has_unsafe(&then_b) then return true end
+    match else_b
+    when Option::Some(eb) then block_has_unsafe(&eb)
+    when Option::None then false
+    end
+  when _ then false
+  end
+end
+
+# Walk an entire program and produce a mapping from function name to
+# its extracted capabilities.  This is the main public entry point
+# for capability analysis.
+pub def check_program_capabilities(program: &Program) -> Map[String, CapExtractResult]
+  mut results = Map::new()
+
+  # First pass: collect each function's own caps (no transitive yet)
+  mut direct_caps: Map[String, Set[String]] = Map::new()
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(func) then
+      let empty_callee_caps: Vec[Set[String]] = Vec::new()
+      let caps = analyze_function_caps(&func, &empty_callee_caps)
+      # Merge direct + effects into one set for transitive resolution
+      let merged = Set::new()
+      for c in caps.direct do merged.insert(c) end
+      for c in caps.from_effects do merged.insert(c) end
+      direct_caps.insert(func.name.clone(), merged)
+    when _ then ()
+    end
+  end
+
+  # Second pass: resolve transitive capabilities from callees
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(func) then
+      # Collect callee caps from direct_caps of called functions
+      mut callee_caps_list: Vec[Set[String]] = Vec::new()
+      let callees = collect_callees_from_function(&func)
+      for callee_name in callees do
+        match direct_caps.get(&callee_name)
+        when Option::Some(caps) then callee_caps_list.push(caps.clone())
+        when Option::None then ()
+        end
+      end
+
+      let full_caps = analyze_function_caps(&func, &callee_caps_list)
+      results.insert(func.name.clone(), full_caps)
+    when _ then ()
+    end
+  end
+
+  results
+end
+
+# Collect names of functions called from within a function body.
+def collect_callees_from_function(func: &FunctionDecl) -> Vec[String]
+  mut callees = Vec::new()
+  match func.body
+  when Option::Some(FnBody::Block(block)) then
+    collect_callees_from_block(&block, &mut callees)
+  when _ then ()
+  end
+  callees
+end
+
+def collect_callees_from_block(block: &Block, callees: &mut Vec[String]) -> Unit
+  for stmt in block.stmts do
+    match stmt.kind
+    when StmtKind::Expr(expr) then
+      collect_callees_from_expr(&expr, callees)
+    when StmtKind::Let(_, _, init, _) then
+      match init
+      when Option::Some(e) then collect_callees_from_expr(&e, callees)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+def collect_callees_from_expr(expr: &Expr, callees: &mut Vec[String]) -> Unit
+  match expr.kind
+  when ExprKind::Call(callee, args) then
+    match callee.kind
+    when ExprKind::Ident(name) then
+      callees.push(name.clone())
+    when _ then ()
+    end
+    for a in args do
+      collect_callees_from_expr(&a, callees)
+    end
+  when ExprKind::MethodCall(recv, _, _, args) then
+    collect_callees_from_expr(&recv, callees)
+    for a in args do
+      collect_callees_from_expr(&a, callees)
+    end
+  when ExprKind::Block(b) then
+    collect_callees_from_block(&b, callees)
+  when _ then ()
+  end
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -304,14 +962,3 @@ def resolve_integration(
   }
 end
 
-# ═══════════════════════════════════════════════════════════════
-# Utility
-# ═══════════════════════════════════════════════════════════════
-
-def to_float(i: Int) -> Float
-  __intrinsic_int_to_float(i)
-end
-
-def max_int(a: Int, b: Int) -> Int
-  if a > b then a else b end
-end

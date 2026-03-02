@@ -90,7 +90,7 @@ The following patterns are reserved:
 | `\'`      | Single quote (U+0027)            |
 | `\"`      | Double quote (U+0022)            |
 | `\0`      | Null (U+0000)                    |
-| `\xNN`    | Byte value (00-7F only in Char)  |
+| `\xNN`    | Byte value (00-FF)               |
 | `\u{NNNN}`| Unicode code point (1-6 hex digits) |
 
 ### 3.3 Example
@@ -105,7 +105,7 @@ let snowman: Char = '\u{2603}'  # ☃
 
 ### 4.1 Internal Representation
 `String` is a **UTF-8 encoded** sequence of bytes. It is:
-- Immutable (copy-on-write semantics)
+- Owned and mutable via mutable bindings/references
 - Length is byte count, not grapheme/codepoint count
 
 ### 4.2 String Operations
@@ -237,7 +237,7 @@ in `std::locale`.
 
 ## 8. Versioning
 
-This policy tracks **Unicode version 15.0**. When Tangerine updates to a
+This policy tracks **Unicode version 16.0+**. When Tangerine updates to a
 newer Unicode version:
 1. The version is documented in release notes.
 2. New characters/properties are available immediately.

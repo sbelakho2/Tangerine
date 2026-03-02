@@ -10,7 +10,7 @@ A one-page reference card for Tangerine interoperability.
 | `i16/u16` | 2 | 2 | ✓ |
 | `i32/u32` | 4 | 4 | ✓ |
 | `i64/u64` | 8 | 8 | ✓ |
-| `isize/usize` | 8 | 8 | ✓ |
+| `isize/usize` | pointer-sized (32/64-bit) | pointer-sized | ✓ |
 | `Bool` | 1 | 1 | ✓ |
 | `f32` | 4 | 4 | ✓ |
 | `f64` | 8 | 8 | ✓ |
@@ -191,6 +191,9 @@ extern "Tangerine" → _TG{edition}_{pkgHash}_{modLen}:{mod}_{nameLen}:{name}_{s
 | 100-199 | I/O errors |
 | 200-299 | Parse errors |
 | 300-399 | Type errors |
+| 400-499 | Allocation/memory errors |
+| 500-599 | Concurrency/synchronization errors |
+| 600-699 | Capability/effect enforcement errors |
 
 ## Taint Integration
 

@@ -5,8 +5,9 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
+use std::fs::{read_file}
 use tg_compiler::ast::{
-  Expr, Stmt, Item, ItemKind, FunctionDecl, TypeExpr, Block, Span
+  Expr, Stmt, Item, ItemKind, FunctionDecl, TypeExpr, Block, Span, PatternKind
 }
 use tg_compiler::resolver::{ResolvedSymbol, ScopeMap, Binding}
 use tg_compiler::symbol_graph::{SymbolGraph, GraphKind}
@@ -265,7 +266,7 @@ def refactor_extract_function(
   # Build return type from live-out
   let return_type = if live_out.is_empty()
     Option::None
-  else if live_out.len() == 1
+  elsif live_out.len() == 1
     Option::Some(type_env.lookup(live_out[0].type_id).to_type_expr())
   else
     # Construct a tuple type
@@ -278,13 +279,14 @@ def refactor_extract_function(
   # Generate edits: Insert function + Replace selection with call
   let file = selection_span.file
   let edits = Vec::new()
+  let insert_pos = find_enclosing_function_end(selection_span)
 
   # Insert the new function after the current function
   let fn_text = generate_function_text(new_name, &params, &return_type, &selected)
   edits.push(TextEdit {
     file: file,
-    start: find_enclosing_function_end(selection_span),
-    end_pos: find_enclosing_function_end(selection_span),
+    start: insert_pos,
+    end_pos: insert_pos,
     new_text: "\n\n" + fn_text
   })
 
@@ -484,7 +486,7 @@ def generate_call_text(
 
   if live_out.is_empty()
     call
-  else if live_out.len() == 1
+  elsif live_out.len() == 1
     "let " + live_out[0].name + " = " + call
   else
     let names = live_out.iter().map(|v| v.name).collect()
@@ -493,19 +495,204 @@ def generate_call_text(
 end
 
 def find_enclosing_function_end(span: Span) -> Int
-  # Intrinsic: find the `end` keyword that closes the enclosing function
-  __intrinsic_find_enclosing_end(span)
+  # Walk the source forward from span.end_pos to find the matching `end` keyword.
+  # We track nesting depth: block-opening keywords increase depth, `end` decreases it.
+  # When depth reaches 0 we've found the enclosing function's `end`.
+  mut depth = 1
+  mut pos = span.end_pos
+  let source = match read_file(span.file.clone())
+  when Result::Ok(content) then content
+  when Result::Err(_) then
+    return span.end_pos
+  end
+
+  while pos < source.len() do
+    # Skip string literals so we don't confuse keywords inside strings
+    if pos < source.len() && source.char_at(pos) == '"' then
+      pos = pos + 1
+      while pos < source.len() && source.char_at(pos) != '"' do
+        if source.char_at(pos) == '\\' then
+          pos = pos + 1  # skip escaped character
+        end
+        pos = pos + 1
+      end
+      if pos < source.len() then pos = pos + 1 end
+      next
+    end
+
+    # Skip single-line comments
+    if pos + 1 < source.len() && source.char_at(pos) == '#' then
+      while pos < source.len() && source.char_at(pos) != '\n' do
+        pos = pos + 1
+      end
+      next
+    end
+
+    # Try to match a keyword at the current position. Only match whole words
+    # (preceded and followed by a non-identifier character).
+    let before_ok = pos == 0 || !is_ident_char_refactor(source.char_at(pos - 1))
+
+    if before_ok then
+      # Block-opening keywords that require a matching `end`
+      let openers = ["def", "do", "if", "match", "while", "for", "loop",
+                      "struct", "enum", "impl", "trait", "module", "unsafe"]
+      mut matched_opener = false
+      for kw in openers do
+        let kw_len = kw.len()
+        if pos + kw_len <= source.len() then
+          let slice = source.slice(pos, pos + kw_len)
+          if slice == kw then
+            let after_pos = pos + kw_len
+            let after_ok = after_pos >= source.len() || !is_ident_char_refactor(source.char_at(after_pos))
+            if after_ok then
+              depth = depth + 1
+              pos = after_pos
+              matched_opener = true
+              break
+            end
+          end
+        end
+      end
+      if matched_opener then next end
+
+      # Check for `end`
+      if pos + 3 <= source.len() then
+        let maybe_end = source.slice(pos, pos + 3)
+        if maybe_end == "end" then
+          let after_pos = pos + 3
+          let after_ok = after_pos >= source.len() || !is_ident_char_refactor(source.char_at(after_pos))
+          if after_ok then
+            depth = depth - 1
+            if depth == 0 then
+              return after_pos
+            end
+            pos = after_pos
+            next
+          end
+        end
+      end
+    end
+
+    pos = pos + 1
+  end
+
+  # If we ran off the end of the file, return the file length
+  source.len()
+end
+
+def is_ident_char_refactor(c: Char) -> Bool
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 end
 
 def label_target_in_selection(label: Option[String], stmts: &Vec[&Stmt]) -> Bool
-  # Check if the label's target loop is within the selected statements
-  __intrinsic_label_in_selection(label, stmts)
+  # Check if a break/next label's target loop is within the selected statements
+  match label
+  when Option::None then true  # Unlabeled — targets nearest loop which is presumably selected
+  when Option::Some(lbl) then
+    for stmt in stmts do
+      match stmt.kind
+      when StmtKind::Expr(e) then
+        match e.kind
+        when ExprKind::Loop(_, Some(loop_label)) then
+          if loop_label == lbl then return true end
+        when ExprKind::While(_, _, Some(loop_label)) then
+          if loop_label == lbl then return true end
+        when ExprKind::For(_, _, _, Some(loop_label)) then
+          if loop_label == lbl then return true end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+    false
+  end
 end
 
 def collect_used_variables(stmts: &Vec[&Stmt]) -> Vec[Binding]
-  __intrinsic_collect_used(stmts)
+  # Collect all variable names that are referenced within the given statements
+  mut used = Vec::new()
+  mut seen = Set::new()
+  for stmt in stmts do
+    let vars = extract_referenced_names(stmt)
+    for v in vars do
+      if !seen.contains(&v.name) then
+        seen.insert(v.name.clone())
+        used.push(v)
+      end
+    end
+  end
+  used
 end
 
 def collect_defined_variables(stmts: &Vec[&Stmt]) -> Vec[Binding]
-  __intrinsic_collect_defined(stmts)
+  # Collect all variable names that are defined (let/mut) within the given statements
+  mut defined = Vec::new()
+  for stmt in stmts do
+    match stmt.kind
+    when StmtKind::Let(pattern, _, _, _) then
+      match pattern.kind
+      when PatternKind::Ident(name, _) then
+        defined.push(Binding {
+          name: name.clone(),
+          symbol_id: name.clone(),
+          def_span: stmt.span,
+          stmt_span: stmt.span,
+          assignment_count: 1,
+          initializer_has_side_effects: false,
+          initializer_text: "".to_string()
+        })
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  defined
+end
+
+def extract_referenced_names(stmt: &Stmt) -> Vec[Binding]
+  # Simple extraction of variable name references from a statement
+  mut refs = Vec::new()
+  match stmt.kind
+  when StmtKind::Expr(e) then
+    collect_expr_refs(e, &mut refs)
+  when StmtKind::Let(_, _, init, _) then
+    collect_expr_refs(init, &mut refs)
+  when _ then ()
+  end
+  refs
+end
+
+def collect_expr_refs(expr: &Expr, out: &mut Vec[Binding]) -> Unit
+  match expr.kind
+  when ExprKind::Ident(name) then
+    out.push(Binding {
+      name: name.clone(),
+      symbol_id: name.clone(),
+      def_span: expr.span,
+      stmt_span: expr.span,
+      assignment_count: 0,
+      initializer_has_side_effects: false,
+      initializer_text: "".to_string()
+    })
+  when ExprKind::Call(callee, args) then
+    collect_expr_refs(callee, out)
+    for arg in args do
+      collect_expr_refs(arg, out)
+    end
+  when ExprKind::FieldAccess(recv, _) then
+    collect_expr_refs(recv, out)
+  when ExprKind::MethodCall(recv, _, args) then
+    collect_expr_refs(recv, out)
+    for arg in args do
+      collect_expr_refs(arg, out)
+    end
+  when ExprKind::BinaryOp(_, lhs, rhs) then
+    collect_expr_refs(lhs, out)
+    collect_expr_refs(rhs, out)
+  when ExprKind::UnaryOp(_, inner) then
+    collect_expr_refs(inner, out)
+  when ExprKind::If(cond, _, _) then
+    collect_expr_refs(cond, out)
+  when _ then ()
+  end
 end

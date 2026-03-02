@@ -460,16 +460,19 @@ end
 def init_with_level(level: LogLevel) -> Unit
   let mut console = ConsoleLogger::new()
   console.level(level)
+  LOGGER_LOCK.lock()
   GLOBAL_LOG_LEVEL = log_level_ordinal(level)
+  LOGGER_LOCK.unlock()
   set_logger(Box::new(console))
 end
 
 def log(level: LogLevel, message: &str, fields: &[(&str, &str)]) -> Unit
-  # Fast path: check level without lock to avoid mutex contention in hot paths
+  # Synchronized level check and logger access
+  LOGGER_LOCK.lock()
   if log_level_ordinal(level) < GLOBAL_LOG_LEVEL then
+    LOGGER_LOCK.unlock()
     return
   end
-  LOGGER_LOCK.lock()
   match GLOBAL_LOGGER.as_mut()
   when Option::Some(logger) then
     let mut record = LogRecord::new(level, message)
@@ -490,6 +493,7 @@ def log_level_ordinal(level: LogLevel) -> Int
   when LogLevel::Info then 2
   when LogLevel::Warn then 3
   when LogLevel::Error then 4
+  when LogLevel::Fatal then 5
   end
 end
 
@@ -1074,43 +1078,174 @@ end
 static mut GLOBAL_METRICS: Option[MetricsRegistry] = Option::None
 static mut METRICS_LOCK: Mutex = Mutex::new()
 
+struct CounterHandle
+  name: String
+  labels: Map[String, String]
+end
+
+struct GaugeHandle
+  name: String
+  labels: Map[String, String]
+end
+
+struct HistogramHandle
+  name: String
+  labels: Map[String, String]
+end
+
 def init_metrics() -> Unit
   METRICS_LOCK.lock()
   GLOBAL_METRICS = Option::Some(MetricsRegistry::new())
   METRICS_LOCK.unlock()
 end
 
-def counter(name: &str) -> &mut Counter
-  METRICS_LOCK.lock()
-  let registry = GLOBAL_METRICS.as_mut().unwrap()
-  if !registry.counters.contains_key(name) then
-    registry.counters.insert(name.to_string(), Counter::new(name))
+def ensure_metrics_registry() -> Unit
+  match GLOBAL_METRICS
+  when Option::Some(_) then ()
+  when Option::None then GLOBAL_METRICS = Option::Some(MetricsRegistry::new())
   end
-  let c = registry.counters.get_mut(name).unwrap()
-  METRICS_LOCK.unlock()
-  c
 end
 
-def gauge(name: &str) -> &mut Gauge
-  METRICS_LOCK.lock()
-  let registry = GLOBAL_METRICS.as_mut().unwrap()
-  if !registry.gauges.contains_key(name) then
-    registry.gauges.insert(name.to_string(), Gauge::new(name))
-  end
-  let g = registry.gauges.get_mut(name).unwrap()
-  METRICS_LOCK.unlock()
-  g
+def counter(name: &str) -> CounterHandle
+  CounterHandle {
+    name: name.to_string(),
+    labels: Map::new()
+  }
 end
 
-def histogram(name: &str) -> &mut Histogram
-  METRICS_LOCK.lock()
-  let registry = GLOBAL_METRICS.as_mut().unwrap()
-  if !registry.histograms.contains_key(name) then
-    registry.histograms.insert(name.to_string(), Histogram::new(name))
+def gauge(name: &str) -> GaugeHandle
+  GaugeHandle {
+    name: name.to_string(),
+    labels: Map::new()
+  }
+end
+
+def histogram(name: &str) -> HistogramHandle
+  HistogramHandle {
+    name: name.to_string(),
+    labels: Map::new()
+  }
+end
+
+impl CounterHandle
+  def with_label(self: &mut CounterHandle, key: &str, value: &str) -> &mut CounterHandle
+    self.labels.insert(key.to_string(), value.to_string())
+    self
   end
-  let h = registry.histograms.get_mut(name).unwrap()
-  METRICS_LOCK.unlock()
-  h
+
+  def inc(self: &mut CounterHandle) -> Unit
+    self.add(1.0)
+  end
+
+  def add(self: &mut CounterHandle, v: f64) -> Unit
+    METRICS_LOCK.lock()
+    ensure_metrics_registry()
+    let registry = GLOBAL_METRICS.as_mut().unwrap()
+    if !registry.counters.contains_key(&self.name) then
+      registry.counters.insert(self.name.clone(), Counter::new(&self.name))
+    end
+    let c = registry.counters.get_mut(&self.name).unwrap()
+    for (k, val) in &self.labels do
+      c.labels.insert(k.clone(), val.clone())
+    end
+    c.value = c.value + v
+    record_metric(&c.name, c.value, &c.labels, MetricKind::Counter)
+    METRICS_LOCK.unlock()
+  end
+
+  def get(self: &CounterHandle) -> f64
+    METRICS_LOCK.lock()
+    ensure_metrics_registry()
+    let registry = GLOBAL_METRICS.as_ref().unwrap()
+    let value = match registry.counters.get(&self.name)
+    when Option::Some(c) then c.value
+    when Option::None then 0.0
+    end
+    METRICS_LOCK.unlock()
+    value
+  end
+end
+
+impl GaugeHandle
+  def with_label(self: &mut GaugeHandle, key: &str, value: &str) -> &mut GaugeHandle
+    self.labels.insert(key.to_string(), value.to_string())
+    self
+  end
+
+  def set(self: &mut GaugeHandle, v: f64) -> Unit
+    METRICS_LOCK.lock()
+    ensure_metrics_registry()
+    let registry = GLOBAL_METRICS.as_mut().unwrap()
+    if !registry.gauges.contains_key(&self.name) then
+      registry.gauges.insert(self.name.clone(), Gauge::new(&self.name))
+    end
+    let g = registry.gauges.get_mut(&self.name).unwrap()
+    for (k, val) in &self.labels do
+      g.labels.insert(k.clone(), val.clone())
+    end
+    g.value = v
+    record_metric(&g.name, g.value, &g.labels, MetricKind::Gauge)
+    METRICS_LOCK.unlock()
+  end
+
+  def inc(self: &mut GaugeHandle) -> Unit
+    self.add(1.0)
+  end
+
+  def dec(self: &mut GaugeHandle) -> Unit
+    self.sub(1.0)
+  end
+
+  def add(self: &mut GaugeHandle, v: f64) -> Unit
+    self.set(self.get() + v)
+  end
+
+  def sub(self: &mut GaugeHandle, v: f64) -> Unit
+    self.set(self.get() - v)
+  end
+
+  def get(self: &GaugeHandle) -> f64
+    METRICS_LOCK.lock()
+    ensure_metrics_registry()
+    let registry = GLOBAL_METRICS.as_ref().unwrap()
+    let value = match registry.gauges.get(&self.name)
+    when Option::Some(g) then g.value
+    when Option::None then 0.0
+    end
+    METRICS_LOCK.unlock()
+    value
+  end
+end
+
+impl HistogramHandle
+  def with_label(self: &mut HistogramHandle, key: &str, value: &str) -> &mut HistogramHandle
+    self.labels.insert(key.to_string(), value.to_string())
+    self
+  end
+
+  def observe(self: &mut HistogramHandle, value: f64) -> Unit
+    METRICS_LOCK.lock()
+    ensure_metrics_registry()
+    let registry = GLOBAL_METRICS.as_mut().unwrap()
+    if !registry.histograms.contains_key(&self.name) then
+      registry.histograms.insert(self.name.clone(), Histogram::new(&self.name))
+    end
+    let h = registry.histograms.get_mut(&self.name).unwrap()
+    for (k, val) in &self.labels do
+      h.labels.insert(k.clone(), val.clone())
+    end
+    h.sum = h.sum + value
+    h.count = h.count + 1
+    for i in 0..h.buckets.len() do
+      if value <= h.buckets[i] then
+        h.counts[i] = h.counts[i] + 1
+        break
+      end
+    end
+    h.counts[h.buckets.len()] = h.counts[h.buckets.len()] + 1
+    record_histogram_metric(&h.name, &h.buckets, &h.counts, h.sum, h.count, &h.labels)
+    METRICS_LOCK.unlock()
+  end
 end
 
 # ———————————————————————————————————————————————————————————————

@@ -409,7 +409,7 @@ app.listen("0.0.0.0:8080")?
 - JWT and session-based authentication
 - Cookie management
 - File uploads
-- WebSocket support (planned)
+- WebSocket support is not yet available in `std::web`
 
 **Template Example:**
 
@@ -628,17 +628,23 @@ use std::log::{Logger, Level, info, warn, error, debug, Span, Metrics}
 # Initialize logger
 Logger::init(Level::Info)
 
-# Simple logging
-info!("Server started on port {}", port)
-warn!("Connection pool at {}% capacity", percent)
-error!("Failed to process request: {}", error)
+# Simple logging (function API)
+let port_str = port.to_string()
+let percent_str = percent.to_string()
+let err_str = error.to_string()
+info("Server started", [("port", port_str.as_str())])
+warn("Connection pool pressure", [("capacity_pct", percent_str.as_str())])
+error("Failed to process request", [("error", err_str.as_str())])
 
 # Structured logging
-info!(
+let user_id_str = user_id.to_string()
+info(
   "user_action",
-  "action" => "login",
-  "user_id" => user_id,
-  "ip" => ip_addr
+  [
+    ("action", "login"),
+    ("user_id", user_id_str.as_str()),
+    ("ip", ip_addr)
+  ]
 )
 
 # Distributed tracing
@@ -1131,7 +1137,7 @@ end
 - `Contract` - `kind`, `expr`, `has_message`, `message`
 - `ProofObligation` - `origin`, `kind`, `expr`, `verified`
 - `GuardClause` - `condition`, `else_action`, `narrows_type`, `promoted_contract`
-- `GuardElseAction` - `Return(expr)`, `Panic(msg)`, `Break(label)`, `Continue(label)`
+- `GuardElseAction` - `Return(expr)`, `Panic(msg)`, `Break(label)`, `Next(label)`
 
 ### `std/capabilities` - Capability System
 
@@ -1213,7 +1219,8 @@ loop
   
   let stats = timer.end_frame()
   if stats.fps < 55.0 then
-    warn!("Low FPS: {:.1}", stats.fps)
+    let fps_str = stats.fps.to_string()
+    warn("Low FPS", [("fps", fps_str.as_str())])
   end
 end
 
@@ -1256,9 +1263,9 @@ player.open()?
 # Step through execution
 loop
   match player.step()
-    Result::Ok(event) => println("Event: {:?}", event),
-    Result::Err(PlayerError::EndOfRecording) => break,
-    Result::Err(e) => return Result::Err(e),
+    when Result::Ok(event) then println("Event: {:?}", event)
+    when Result::Err(PlayerError::EndOfRecording) then break
+    when Result::Err(e) then return Result::Err(e)
   end
 end
 
@@ -1592,6 +1599,22 @@ let violations = check_policy(&policy, &lockfile)
 - `PackageSource` - `Registry(url)`, `Git(url, rev)`, `Path(path)`
 - `TrustLevel` - `Owner`, `Contributor`, `Auditor`, `Registry`
 - `PolicyViolation` / `ViolationKind` - detailed policy violation reporting
+
+### Additional Core Modules
+
+```tangerine
+# std/locale — locale-aware formatting and parsing
+use std::locale::{Locale, format_number, parse_number}
+
+# std/process — process spawning and status/output capture
+use std::process::{Command, ProcessStatus}
+
+# std/sync — synchronization primitives (Mutex, RwLock, atomics)
+use std::sync::{Mutex, RwLock, AtomicInt}
+
+# std/unicode — normalization, grapheme handling, width calculations
+use std::unicode::{normalize_nfc, grapheme_clusters, display_width}
+```
 
 ---
 

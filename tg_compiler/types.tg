@@ -32,6 +32,18 @@ enum Type
   String
   Never
   
+  # Sized integer types for FFI parity
+  I8
+  I16
+  I32
+  I64
+  U8
+  U16
+  U32
+  U64
+  F32
+  F64
+  
   # Named type with resolved type arguments
   Named(TypeId, Vec[Type])
   
@@ -42,6 +54,18 @@ enum Type
   Ref(Type, Lifetime)
   RefMut(Type, Lifetime)
   Owned(Type)
+  
+  # Smart pointer and raw pointer types
+  Ptr(Type)     # Raw pointer *T
+  PtrMut(Type)  # Mutable raw pointer *mut T
+  Box(Type)     # Owned heap allocation
+  Rc(Type)      # Reference counted
+  
+  # Trait object types
+  Dyn(TypeId)   # Dynamic trait object dyn Trait
+  
+  # Effect types
+  Effect(Vec[String], Type)  # Effect type: effect[Io, Net] T
   
   # Tuple and array
   Tuple(Vec[Type])
@@ -102,6 +126,7 @@ enum TypeDefKind
   Trait(Vec[MethodSig])
   Alias(Type)
   Primitive
+  Opaque  # Built-in types with special semantics (Ptr, Box, Rc, etc.)
 end
 
 struct FieldInfo
@@ -129,7 +154,7 @@ end
 
 struct TypeEnv
   types: Map[String, TypeDef]
-  types_by_id: Map[Int, String]   # TypeId.id -> name lookup
+  types_by_id: Map[Int, TypeDef]   # TypeId.id -> TypeDef fast lookup
   type_id_counter: Int
   
   # Type variable substitution
@@ -145,6 +170,7 @@ struct TypeEnv
   
   # Trait implementations
   impls: Vec[ImplInfo]
+  method_index: Map[String, Vec[Type]]  # method_name -> return types for O(1) lookup
   
   # Send/Sync negative impls
   non_send_types: Set[String]
@@ -152,12 +178,19 @@ struct TypeEnv
   
   # Diagnostics
   errors: Vec[TypeError]
+  warnings: Vec[TypeError]
 end
 
 struct ImplInfo
   trait_name: String
   for_type: Type
-  methods: Vec[String]
+  methods: Vec[MethodInfo]
+end
+
+struct MethodInfo
+  name: String
+  ret_type: Type
+  params: Vec[Type]
 end
 
 struct TypeError
@@ -177,9 +210,11 @@ def type_env_new() -> TypeEnv
     lifetime_counter: 1,
     current_lifetime: lifetime_static(),
     impls: Vec::new(),
+    method_index: Map::new(),
     non_send_types: Set::new(),
     non_sync_types: Set::new(),
-    errors: Vec::new()
+    errors: Vec::new(),
+    warnings: Vec::new()
   }
   
   # Register types that are !Send / !Sync
@@ -198,6 +233,24 @@ def type_env_new() -> TypeEnv
   register_primitive(&mut env, "Char")
   register_primitive(&mut env, "String")
   register_primitive(&mut env, "Never")
+  
+  # Register sized integer types
+  register_primitive(&mut env, "i8")
+  register_primitive(&mut env, "i16")
+  register_primitive(&mut env, "i32")
+  register_primitive(&mut env, "i64")
+  register_primitive(&mut env, "u8")
+  register_primitive(&mut env, "u16")
+  register_primitive(&mut env, "u32")
+  register_primitive(&mut env, "u64")
+  register_primitive(&mut env, "f32")
+  register_primitive(&mut env, "f64")
+  
+  # Register smart pointer types
+  register_builtin_generic(&mut env, "Ptr", 1, TypeDefKind::Opaque)
+  register_builtin_generic(&mut env, "PtrMut", 1, TypeDefKind::Opaque)
+  register_builtin_generic(&mut env, "Box", 1, TypeDefKind::Opaque)
+  register_builtin_generic(&mut env, "Rc", 1, TypeDefKind::Opaque)
   
   # Register built-in generic types (Rust parity)
   register_builtin_generic(&mut env, "Option", 1,
@@ -279,7 +332,8 @@ def register_builtin_generic(env: &mut TypeEnv, name: String, arity: Int, kind: 
   env.type_id_counter = env.type_id_counter + 1
   mut gen_params = Vec::new()
   if arity >= 1 then gen_params.push("T") end
-  if arity >= 2 then gen_params.push("E") end
+  if arity >= 2 then gen_params.push("V") end
+  if arity >= 3 then gen_params.push("E") end
   env.types.insert(name.clone(), TypeDef {
     id: id,
     name: name.clone(),
@@ -354,9 +408,22 @@ def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
   match ty
   when Type::Var(id) then
     match env.subst.get(id)
-    when Option::Some(resolved) then resolve_type_var(env, resolved)
+    when Option::Some(resolved) then
+      resolve_type_var(env, resolved)
     when Option::None then ty
     end
+  # Recurse into compound types for full resolution
+  when Type::Ref(inner, lt) then Type::Ref(resolve_type_var(env, inner), lt)
+  when Type::RefMut(inner, lt) then Type::RefMut(resolve_type_var(env, inner), lt)
+  when Type::Owned(inner) then Type::Owned(resolve_type_var(env, inner))
+  when Type::Tuple(fields) then
+    Type::Tuple(fields.map(|f| resolve_type_var(env, f)))
+  when Type::Fn(params, ret) then
+    Type::Fn(params.map(|p| resolve_type_var(env, p)), resolve_type_var(env, ret))
+  when Type::Named(tid, args) then
+    Type::Named(tid, args.map(|a| resolve_type_var(env, a)))
+  when Type::Slice(inner) then Type::Slice(resolve_type_var(env, inner))
+  when Type::Array(inner, n) then Type::Array(resolve_type_var(env, inner), n)
   when _ then ty
   end
 end
@@ -378,7 +445,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       true
     end
   when (Type::Var(id), _) then
-    if occurs_check(env, id, b) then
+    if occurs_check(env, id, b, span.clone()) then
       add_error(env, "infinite type", span)
       false
     else
@@ -386,7 +453,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       true
     end
   when (_, Type::Var(id)) then
-    if occurs_check(env, id, a) then
+    if occurs_check(env, id, a, span.clone()) then
       add_error(env, "infinite type", span)
       false
     else
@@ -448,9 +515,19 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       end
     end
   when (Type::Ref(t1, l1), Type::Ref(t2, l2)) then
-    unify(env, t1, t2, span)
+    if l1.id != l2.id && l1.id != -1 && l2.id != -1 then
+      add_error(env, "lifetime mismatch: " + l1.name + " vs " + l2.name, span)
+      false
+    else
+      unify(env, t1, t2, span)
+    end
   when (Type::RefMut(t1, l1), Type::RefMut(t2, l2)) then
-    unify(env, t1, t2, span)
+    if l1.id != l2.id && l1.id != -1 && l2.id != -1 then
+      add_error(env, "lifetime mismatch: " + l1.name + " vs " + l2.name, span)
+      false
+    else
+      unify(env, t1, t2, span)
+    end
   when (Type::Tuple(elems1), Type::Tuple(elems2)) then
     if elems1.len() != elems2.len() then
       add_error(env, "tuple length mismatch", span)
@@ -492,18 +569,19 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
   end
 end
 
-def occurs_check(env: &TypeEnv, id: TypeVarId, ty: Type) -> Bool
+def occurs_check(env: &mut TypeEnv, id: TypeVarId, ty: Type, span: Span) -> Bool
   # Use depth limit to prevent stack overflow on deeply recursive types
-  occurs_check_with_depth(env, id, ty, 0)
+  occurs_check_with_depth(env, id, ty, 0, span)
 end
 
 # Maximum recursion depth for type checking (prevents stack overflow)
 def MAX_TYPE_DEPTH() -> Int = 100
 
-def occurs_check_with_depth(env: &TypeEnv, id: TypeVarId, ty: Type, depth: Int) -> Bool
+def occurs_check_with_depth(env: &mut TypeEnv, id: TypeVarId, ty: Type, depth: Int, span: Span) -> Bool
   # Guard against infinite recursion
   if depth > MAX_TYPE_DEPTH() then
-    return true  # Treat as occurs - likely infinite type
+    add_error(env, "type recursion depth exceeded in occurs check", span)
+    return true
   end
   
   let resolved = resolve_type_var(env, ty)
@@ -512,7 +590,7 @@ def occurs_check_with_depth(env: &TypeEnv, id: TypeVarId, ty: Type, depth: Int) 
   when Type::Named(_, args) then
     mut found = false
     for arg in args do
-      if occurs_check_with_depth(env, id, arg, depth + 1) then
+      if occurs_check_with_depth(env, id, arg, depth + 1, span.clone()) then
         found = true
         break
       end
@@ -521,41 +599,45 @@ def occurs_check_with_depth(env: &TypeEnv, id: TypeVarId, ty: Type, depth: Int) 
   when Type::Function(params, ret) then
     mut found = false
     for p in params do
-      if occurs_check_with_depth(env, id, p, depth + 1) then
+      if occurs_check_with_depth(env, id, p, depth + 1, span.clone()) then
         found = true
         break
       end
     end
     if !found then
-      found = occurs_check_with_depth(env, id, ret, depth + 1)
+      found = occurs_check_with_depth(env, id, ret, depth + 1, span)
     end
     found
-  when Type::Ref(inner, _) then occurs_check_with_depth(env, id, inner, depth + 1)
-  when Type::RefMut(inner, _) then occurs_check_with_depth(env, id, inner, depth + 1)
+  when Type::Ref(inner, _) then occurs_check_with_depth(env, id, inner, depth + 1, span)
+  when Type::RefMut(inner, _) then occurs_check_with_depth(env, id, inner, depth + 1, span)
   when Type::Tuple(elems) then
     mut found = false
     for e in elems do
-      if occurs_check_with_depth(env, id, e, depth + 1) then
+      if occurs_check_with_depth(env, id, e, depth + 1, span.clone()) then
         found = true
         break
       end
     end
     found
-  when Type::Array(elem, _) then occurs_check_with_depth(env, id, elem, depth + 1)
-  when Type::Slice(elem) then occurs_check_with_depth(env, id, elem, depth + 1)
-  when Type::Option(inner) then occurs_check_with_depth(env, id, inner, depth + 1)
+  when Type::Array(elem, _) then occurs_check_with_depth(env, id, elem, depth + 1, span)
+  when Type::Slice(elem) then occurs_check_with_depth(env, id, elem, depth + 1, span)
+  when Type::Option(inner) then occurs_check_with_depth(env, id, inner, depth + 1, span)
   when Type::Result(ok, err) then
-    occurs_check_with_depth(env, id, ok, depth + 1) || occurs_check_with_depth(env, id, err, depth + 1)
+    occurs_check_with_depth(env, id, ok, depth + 1, span.clone()) || occurs_check_with_depth(env, id, err, depth + 1, span)
   when Type::Map(key, val) then
-    occurs_check_with_depth(env, id, key, depth + 1) || occurs_check_with_depth(env, id, val, depth + 1)
-  when Type::Set(inner) then occurs_check_with_depth(env, id, inner, depth + 1)
-  when Type::Owned(inner) then occurs_check_with_depth(env, id, inner, depth + 1)
+    occurs_check_with_depth(env, id, key, depth + 1, span.clone()) || occurs_check_with_depth(env, id, val, depth + 1, span)
+  when Type::Set(inner) then occurs_check_with_depth(env, id, inner, depth + 1, span)
+  when Type::Owned(inner) then occurs_check_with_depth(env, id, inner, depth + 1, span)
   when _ then false
   end
 end
 
 def add_error(env: &mut TypeEnv, msg: String, span: Span) -> Unit
   env.errors.push(TypeError { message: msg, span: span, code: Option::None })
+end
+
+def add_warning(env: &mut TypeEnv, msg: String, span: Span) -> Unit
+  env.warnings.push(TypeError { message: msg, span: span, code: Option::None })
 end
 
 def add_error_with_code(env: &mut TypeEnv, msg: String, span: Span, code: String) -> Unit
@@ -659,7 +741,10 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
           param_types.push(fresh_type_var(env))
         end
       end
-      let ret_ty = resolve_type_expr(env, &m.sig.ret_type)
+      let ret_ty = match m.sig.ret_type
+      when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
+      when Option::None then Type::Unit
+      end
       methods.push(MethodSig {
         name: m.sig.name,
         params: param_types,
@@ -753,7 +838,7 @@ end
 
 def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
   match stmt.kind
-  when StmtKind::Let(name, ty_opt, value, is_mut) then
+  when StmtKind::Let(pattern, ty_opt, value, is_mut) then
     let value_type = check_expr(env, &value)
     let var_type = match ty_opt
     when Option::Some(ty_expr) then
@@ -763,7 +848,7 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     when Option::None then
       value_type
     end
-    bind_var(env, name, var_type)
+    check_pattern(env, &pattern, var_type)
     Type::Unit
   when StmtKind::Assign(target, value) then
     let target_type = check_expr(env, &target)
@@ -821,6 +906,42 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     when Option::None then ()
     end
     body_type
+  when StmtKind::Loop(body) then
+    check_block(env, &body)
+    Type::Unit
+  when StmtKind::Guard(cond, else_action) then
+    let cond_type = check_expr(env, &cond)
+    unify(env, cond_type, Type::Bool, cond.span)
+    match else_action
+    when GuardElse::Return(ret_opt) then
+      match ret_opt
+      when Option::Some(ret_expr) then
+        check_expr(env, &ret_expr)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(br_opt) then
+      match br_opt
+      when Option::Some(br_expr) then
+        check_expr(env, &br_expr)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+    Type::Unit
+  when StmtKind::HandleWith(expr, handlers) then
+    let _handled_ty = check_expr(env, &expr)
+    for h in handlers do
+      for arm in h.arms do
+        push_scope(env)
+        for param_name in arm.params do
+          bind_var(env, param_name, fresh_type_var(env))
+        end
+        check_block(env, &arm.body)
+        pop_scope(env)
+      end
+    end
+    Type::Unit
   when _ then Type::Unit
   end
 end
@@ -856,6 +977,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
   
   mut result_type = fresh_type_var(env)
   mut has_wildcard = false
+  mut covered_variants = Set::new()
   
   for arm in m.arms do
     push_scope(env)
@@ -863,6 +985,20 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
     
     match arm.pattern.kind
     when PatternKind::Wildcard then has_wildcard = true
+    when PatternKind::Variant(path, _) then
+      if !path.segments.is_empty() then
+        covered_variants.insert(path.segments[path.segments.len() - 1])
+      end
+    when PatternKind::Or(alts) then
+      for alt in alts do
+        match alt.kind
+        when PatternKind::Variant(path, _) then
+          if !path.segments.is_empty() then
+            covered_variants.insert(path.segments[path.segments.len() - 1])
+          end
+        when _ then ()
+        end
+      end
     when _ then ()
     end
     
@@ -886,10 +1022,15 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
       when Option::Some(td) then
         match td.kind
         when TypeDefKind::Enum(variants) then
-          if m.arms.len() < variants.len() then
-            add_warning(env, "match may not be exhaustive: " +
-              variants.len().to_string() + " variants but only " +
-              m.arms.len().to_string() + " arms (consider adding a wildcard `_` arm)", m.span)
+          let missing = Vec::new()
+          for variant in variants do
+            if !covered_variants.contains(variant.name) then
+              missing.push(variant.name)
+            end
+          end
+          if !missing.is_empty() then
+            add_warning(env, "match may not be exhaustive; missing variants: " +
+              missing.join(", ") + " (consider adding a wildcard `_` arm)", m.span)
           end
         when _ then ()
         end
@@ -1055,7 +1196,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::StringLit(_) then Type::String
   when ExprKind::CharLit(_) then Type::Char
   when ExprKind::BoolLit(_) then Type::Bool
-  when ExprKind::NilLit then fresh_type_var(env)
+  when ExprKind::NilLit then Type::Option(fresh_type_var(env))
   when ExprKind::Ident(name) then
     match lookup_var(env, name)
     when Option::Some(ty) then ty
@@ -1211,15 +1352,22 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
 
   match base
   when Type::Named(tid, type_args) then
-    # Look up the type definition
-    mut found = Option::None
-    for entry in env.types do
-      match entry
-      when (_, td) then
-        if td.id.id == tid.id then
-          found = Option::Some(td)
+    # O(1) lookup via types_by_id index (lazily populated)
+    let found = match env.types_by_id.get(tid.id)
+    when Option::Some(td) then Option::Some(td)
+    when Option::None then
+      # Fallback: linear scan and populate index for next time
+      mut result = Option::None
+      for entry in env.types do
+        match entry
+        when (_, td) then
+          env.types_by_id.insert(td.id.id, td.clone())
+          if td.id.id == tid.id then
+            result = Option::Some(td)
+          end
         end
       end
+      result
     end
     match found
     when Option::Some(td) then
@@ -1394,8 +1542,9 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
   when _ then ()
   end
 
-  # Fallback: infer
-  fresh_type_var(env)
+  # Unknown method: hard error (do not silently infer)
+  add_error(env, "unknown method `" + method + "` for receiver type", span)
+  Type::Error
 end
 
 def check_binary_op(env: &mut TypeEnv, op: BinOp, left: &Expr, right: &Expr, span: Span) -> Type
@@ -1553,7 +1702,7 @@ end
 # Determine whether a type is Send (safe to transfer across threads).
 # A type is Send if all of its field types are Send.
 # Primitive types (Int, UInt, Float, Bool, Char, String) are Send.
-# Raw pointers are NOT Send (but we don't have a Ptr variant currently).
+# Raw pointers (Ptr/PtrMut) are NOT Send.
 # Ref(&T) is Send if T is Sync. RefMut(&mut T) is Send if T is Send.
 def is_send(env: &TypeEnv, ty: &Type) -> Bool
   match ty

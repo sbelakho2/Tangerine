@@ -77,6 +77,117 @@ def is_copy_type(ty: &Type) -> Bool
   end
 end
 
+# Resolve a type expression AST node to a compiler Type for borrow analysis
+def resolve_type_expr_for_borrow(ty_expr: &TypeExpr) -> Type
+  match ty_expr.kind
+  when TypeExprKind::Named(name, args) then
+    if name == "Int" then Type::Int
+    elsif name == "UInt" then Type::UInt
+    elsif name == "Float" then Type::Float
+    elsif name == "Bool" then Type::Bool
+    elsif name == "Char" then Type::Char
+    elsif name == "String" then Type::String
+    elsif name == "Unit" then Type::Unit
+    elsif name == "Vec" then
+      let elem = if args.len() > 0 then resolve_type_expr_for_borrow(&args[0])
+      else Type::Unit
+      end
+      Type::Array(elem, 0)
+    elsif name == "Map" then
+      let k = if args.len() > 0 then resolve_type_expr_for_borrow(&args[0]) else Type::Unit end
+      let v = if args.len() > 1 then resolve_type_expr_for_borrow(&args[1]) else Type::Unit end
+      Type::Map(k, v)
+    elsif name == "Option" then
+      let inner = if args.len() > 0 then resolve_type_expr_for_borrow(&args[0]) else Type::Unit end
+      Type::Option(inner)
+    elsif name == "Result" then
+      let ok = if args.len() > 0 then resolve_type_expr_for_borrow(&args[0]) else Type::Unit end
+      let err = if args.len() > 1 then resolve_type_expr_for_borrow(&args[1]) else Type::Unit end
+      Type::Result(ok, err)
+    else
+      # User-defined types are resolved by the type checker; keep borrow checker conservative.
+      Type::Error
+    end
+  when TypeExprKind::Ref(inner) then
+    Type::Ref(resolve_type_expr_for_borrow(inner), lifetime_anonymous())
+  when TypeExprKind::RefMut(inner) then
+    Type::RefMut(resolve_type_expr_for_borrow(inner), lifetime_anonymous())
+  when TypeExprKind::Tuple(elems) then
+    mut resolved = Vec::new()
+    for e in elems do
+      resolved.push(resolve_type_expr_for_borrow(&e))
+    end
+    Type::Tuple(resolved)
+  when TypeExprKind::Array(elem, size) then
+    Type::Array(resolve_type_expr_for_borrow(elem), size)
+  when TypeExprKind::Fn(params, ret) then
+    mut resolved_params = Vec::new()
+    for p in params do
+      resolved_params.push(resolve_type_expr_for_borrow(&p))
+    end
+    Type::Function(resolved_params, resolve_type_expr_for_borrow(ret))
+  when TypeExprKind::Unit then Type::Unit
+  when _ then Type::Unit
+  end
+end
+
+# Infer the type of an expression for borrow checking purposes
+def infer_expr_type(ctx: &BorrowCtx, expr: &Expr) -> Type
+  match expr.kind
+  when ExprKind::IntLit(_) then Type::Int
+  when ExprKind::FloatLit(_) then Type::Float
+  when ExprKind::StringLit(_) then Type::String
+  when ExprKind::BoolLit(_) then Type::Bool
+  when ExprKind::CharLit(_) then Type::Char
+  when ExprKind::Ident(name) then
+    match ctx.vars.get(name)
+    when Option::Some(vs) then vs.ty.clone()
+    when Option::None then Type::Unit
+    end
+  when ExprKind::Ref(inner) then
+    Type::Ref(infer_expr_type(ctx, inner), lifetime_anonymous())
+  when ExprKind::RefMut(inner) then
+    Type::RefMut(infer_expr_type(ctx, inner), lifetime_anonymous())
+  when ExprKind::Tuple(elems) then
+    mut types = Vec::new()
+    for e in elems do
+      types.push(infer_expr_type(ctx, &e))
+    end
+    Type::Tuple(types)
+  when ExprKind::Call(_, _) then Type::Unit
+  when ExprKind::MethodCall(recv, _, _, _) then
+    infer_expr_type(ctx, recv)
+  when ExprKind::BinaryOp(_, left, _) then
+    infer_expr_type(ctx, left)
+  when ExprKind::UnaryOp(_, inner) then
+    infer_expr_type(ctx, inner)
+  when ExprKind::Array(elems) then
+    if elems.len() > 0 then
+      Type::Array(infer_expr_type(ctx, &elems[0]), elems.len())
+    else
+      Type::Array(Type::Unit, 0)
+    end
+  when _ then Type::Unit
+  end
+end
+
+# Extract the element type from a collection/iterator type
+def extract_iter_element_type(ty: &Type) -> Type
+  match ty
+  when Type::Array(elem, _) then elem.clone()
+  when Type::Slice(elem) then elem.clone()
+  when Type::Named(_, args) then
+    # Vec[T], Set[T], etc: first generic arg is the element type
+    if args.len() > 0 then
+      args[0].clone()
+    else
+      Type::Unit
+    end
+  when Type::String then Type::Char
+  when _ then Type::Unit
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Borrow Information
 # ———————————————————————————————————————————————————————————————
@@ -170,8 +281,11 @@ end
 
 def collect_borrows_in_stmt(stmt: &Stmt, names: &mut Vec[String]) -> Unit
   match stmt.kind
-  when StmtKind::Let(name, _, _, _) then
-    names.push(name.clone())
+  when StmtKind::Let(pattern, _, _, _) then
+    match pattern.kind
+    when PatternKind::Ident(name, _) then names.push(name.clone())
+    when _ then ()
+    end
   when StmtKind::Expr(expr) then
     collect_borrows_in_expr(&expr, names)
   when StmtKind::If(if_stmt) then
@@ -196,13 +310,75 @@ def collect_borrows_in_expr(expr: &Expr, names: &mut Vec[String]) -> Unit
   when ExprKind::Ref(inner) then
     match inner.kind
     when ExprKind::Ident(name) then names.push(name.clone())
-    when _ then ()
+    when _ then collect_borrows_in_expr(&inner, names)
     end
   when ExprKind::RefMut(inner) then
     match inner.kind
     when ExprKind::Ident(name) then names.push(name.clone())
-    when _ then ()
+    when _ then collect_borrows_in_expr(&inner, names)
     end
+
+  when ExprKind::Call(callee, args) then
+    collect_borrows_in_expr(&callee, names)
+    for a in args do
+      collect_borrows_in_expr(&a, names)
+    end
+
+  when ExprKind::MethodCall(recv, _, _, args) then
+    collect_borrows_in_expr(&recv, names)
+    for a in args do
+      collect_borrows_in_expr(&a, names)
+    end
+
+  when ExprKind::BinaryOp(_, left, right) then
+    collect_borrows_in_expr(&left, names)
+    collect_borrows_in_expr(&right, names)
+
+  when ExprKind::UnaryOp(_, inner) then
+    collect_borrows_in_expr(&inner, names)
+
+  when ExprKind::FieldAccess(recv, _) then
+    collect_borrows_in_expr(&recv, names)
+
+  when ExprKind::Index(recv, index) then
+    collect_borrows_in_expr(&recv, names)
+    collect_borrows_in_expr(&index, names)
+
+  when ExprKind::Assign(target, value) then
+    collect_borrows_in_expr(&target, names)
+    collect_borrows_in_expr(&value, names)
+
+  when ExprKind::ArrayLit(elems) then
+    for e in elems do
+      collect_borrows_in_expr(&e, names)
+    end
+
+  when ExprKind::TupleLit(elems) then
+    for e in elems do
+      collect_borrows_in_expr(&e, names)
+    end
+
+  when ExprKind::StructLit(_, fields) then
+    for (_, val) in fields do
+      collect_borrows_in_expr(&val, names)
+    end
+
+  when ExprKind::If(if_stmt) then
+    collect_borrows_in_expr(&if_stmt.cond, names)
+
+  when ExprKind::Match(m) then
+    collect_borrows_in_expr(&m.scrutinee, names)
+
+  when ExprKind::Await(inner) then
+    collect_borrows_in_expr(&inner, names)
+
+  when ExprKind::Try(inner) then
+    collect_borrows_in_expr(&inner, names)
+
+  when ExprKind::Pipe(left, right) then
+    collect_borrows_in_expr(&left, names)
+    collect_borrows_in_expr(&right, names)
+
   when _ then ()
   end
 end
@@ -286,11 +462,8 @@ end
 def collect_unsafe_ops_stmt(stmt: &Stmt, ops: &mut Vec[UnsafeOperation]) -> Unit
   match stmt.kind
   when StmtKind::Expr(expr) then collect_unsafe_ops_expr(expr, ops)
-  when StmtKind::Let(_, _, init) then
-    match init
-    when Option::Some(e) then collect_unsafe_ops_expr(e, ops)
-    when Option::None then ()
-    end
+  when StmtKind::Let(_, _, init, _) then
+    collect_unsafe_ops_expr(init, ops)
   when _ then ()
   end
 end
@@ -309,6 +482,11 @@ def collect_unsafe_ops_expr(expr: &Expr, ops: &mut Vec[UnsafeOperation]) -> Unit
       if name == "transmute" || name == "std::mem::transmute" then
         ops.push(UnsafeOperation::TransmuteCall)
       end
+    when ExprKind::Path(path) then
+      if path.segments.len() > 0 && path.segments[0] == "ffi" then
+        let ffi_name = path.segments[path.segments.len() - 1].clone()
+        ops.push(UnsafeOperation::FfiCall(ffi_name))
+      end
     when ExprKind::FieldAccess(_, field) then
       if field == "offset" || field == "add" || field == "sub" then
         ops.push(UnsafeOperation::RawPointerArithmetic)
@@ -317,9 +495,7 @@ def collect_unsafe_ops_expr(expr: &Expr, ops: &mut Vec[UnsafeOperation]) -> Unit
     end
     collect_unsafe_ops_expr(callee, ops)
     for a in args do collect_unsafe_ops_expr(a, ops) end
-  when ExprKind::FfiCall(name, _) then
-    ops.push(UnsafeOperation::FfiCall(name.clone()))
-  when ExprKind::Binary(_, l, r) then
+  when ExprKind::BinaryOp(_, l, r) then
     collect_unsafe_ops_expr(l, ops)
     collect_unsafe_ops_expr(r, ops)
   when ExprKind::Assign(l, r) then
@@ -487,8 +663,14 @@ def add_var(ctx: &mut BorrowCtx, name: String, ty: Type, span: Span) -> Unit
 end
 
 def drop_var(ctx: &mut BorrowCtx, name: String) -> Unit
+  # Dropping a variable ends all active borrows rooted at that variable.
+  invalidate_borrow(ctx, &name, span_dummy())
+
   match ctx.vars.get_mut(name)
   when Option::Some(state) then
+    state.borrow_count = 0
+    state.mut_borrow_count = 0
+
     match state.ownership
     when OwnershipState::Moved then ()  # Already moved, nothing to drop
     when OwnershipState::Dropped then ()  # Already dropped
@@ -553,40 +735,26 @@ def check_function(ctx: &mut BorrowCtx, f: &FunctionDecl) -> Unit
   # Add parameters to context with resolved types
   for p in f.params do
     let ty = match p.ty
-    when Option::Some(ty_expr) then
-      # Resolve type expression to a Type
-      match ty_expr.kind
-      when TypeExprKind::Named(name, _) then
-        if name == "Int" then Type::Int
-        elsif name == "UInt" then Type::UInt
-        elsif name == "Float" then Type::Float
-        elsif name == "Bool" then Type::Bool
-        elsif name == "Char" then Type::Char
-        elsif name == "String" then Type::String
-        else Type::Named(TypeId { id: 0 }, Vec::new())
-        end
-      when TypeExprKind::Ref(inner) then
-        Type::Ref(Type::Unit, Lifetime { id: 0, name: "'a" })
-      when TypeExprKind::RefMut(inner) then
-        Type::RefMut(Type::Unit, Lifetime { id: 0, name: "'a" })
-      when TypeExprKind::Unit then Type::Unit
-      when _ then Type::Unit
-      end
+    when Option::Some(ty_expr) then resolve_type_expr_for_borrow(&ty_expr)
     when Option::None then Type::Unit
     end
     add_var(ctx, p.name, ty, f.span)
     
     # Handle parameter modifiers
     match p.modifier
-    when ParamModifier::Ref then
-      ctx.vars[p.name].ownership = OwnershipState::Borrowed
-    when ParamModifier::RefMut then
-      ctx.vars[p.name].ownership = OwnershipState::BorrowedMut
-    when ParamModifier::Move then
-      ()  # Already owned
-    when ParamModifier::Copy then
-      ctx.vars[p.name].is_copy = true
-    when _ then ()
+    when Option::Some(modifier) then
+      match modifier
+      when ParamModifier::Ref then
+        ctx.vars[p.name].ownership = OwnershipState::Borrowed
+      when ParamModifier::RefMut then
+        ctx.vars[p.name].ownership = OwnershipState::BorrowedMut
+      when ParamModifier::Move then
+        ()  # Already owned
+      when ParamModifier::Copy then
+        ctx.vars[p.name].is_copy = true
+      when _ then ()
+      end
+    when Option::None then ()
     end
   end
   
@@ -604,23 +772,58 @@ end
 
 def check_block(ctx: &mut BorrowCtx, block: &Block) -> Unit
   push_scope(ctx)
-  
-  for stmt in block.stmts do
+
+  for i in 0..block.stmts.len() do
+    let stmt = &block.stmts[i]
     check_stmt(ctx, &stmt)
+    end_dead_borrows_after_stmt(ctx, block, i, stmt.span)
   end
   
   pop_scope(ctx)
 end
 
+def end_dead_borrows_after_stmt(ctx: &mut BorrowCtx, block: &Block, stmt_idx: UInt, span: Span) -> Unit
+  let mut candidates = Set::new()
+  for b in &ctx.borrows.borrows do
+    candidates.insert(b.target.clone())
+  end
+
+  for name in candidates do
+    let mut used_later = false
+    let mut j = stmt_idx + 1
+    while j < block.stmts.len() do
+      if stmt_uses_var(&block.stmts[j], &name) then
+        used_later = true
+        break
+      end
+      j = j + 1
+    end
+
+    if !used_later then
+      invalidate_borrow(ctx, &name, span)
+    end
+  end
+end
+
 def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
   match stmt.kind
-  when StmtKind::Let(name, ty_opt, value, is_mut) then
+  when StmtKind::Let(pattern, ty_opt, value, is_mut) then
     # Check value expression (may consume values)
     check_expr(ctx, &value)
     
-    # Add variable to context
-    let ty = Type::Unit  # Would get from type checker
-    add_var(ctx, name, ty, stmt.span)
+    # Resolve type from annotation or infer from value
+    let ty = match ty_opt
+    when Option::Some(ty_expr) then
+      resolve_type_expr_for_borrow(ty_expr)
+    when Option::None then
+      # Infer from value expression
+      infer_expr_type(ctx, &value)
+    end
+    match pattern.kind
+    when PatternKind::Ident(name, _) then
+      add_var(ctx, name, ty, stmt.span)
+    when _ then ()
+    end
     
     if is_mut then
       # Mark as mutable (can be mutably borrowed)
@@ -650,11 +853,17 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
   when StmtKind::While(cond, body) then
     check_expr(ctx, &cond)
     check_block(ctx, &body)
+
+  when StmtKind::Loop(body) then
+    check_block(ctx, &body)
     
   when StmtKind::For(var, iter, body) then
     check_expr(ctx, &iter)
     push_scope(ctx)
-    add_var(ctx, var, Type::Unit, stmt.span)
+    # Infer loop variable type from iterator
+    let iter_ty = infer_expr_type(ctx, &iter)
+    let elem_ty = extract_iter_element_type(&iter_ty)
+    add_var(ctx, var, elem_ty, stmt.span)
     
     # Invalidate borrows at loop entry (they may not be valid across iterations)
     let loop_borrows = collect_borrows_in_block(&body)
@@ -675,9 +884,32 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
       check_expr(ctx, &val)
     when Option::None then ()
     end
-    
+
+  when StmtKind::Break(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(ctx, &val)
+    when Option::None then ()
+    end
+
+  when StmtKind::Continue then
+    ()
+
+  when StmtKind::Yield(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(ctx, &val)
+    when Option::None then ()
+    end
+
   when StmtKind::Expr(expr) then
     check_expr(ctx, &expr)
+
+    # NLL-like behavior: borrows created only for a stand-alone expression
+    # end at statement boundary if they are not bound to a named variable.
+    let temp_borrows = Vec::new()
+    collect_borrows_in_expr(&expr, &temp_borrows)
+    for name in temp_borrows do
+      invalidate_borrow(ctx, &name, stmt.span)
+    end
     
   when StmtKind::Match(m) then
     check_expr(ctx, &m.scrutinee)
@@ -728,6 +960,23 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
   when StmtKind::Defer(body) then
     # Defer blocks are checked but executed later
     check_block(ctx, &body)
+
+  when StmtKind::Guard(cond, else_action) then
+    check_expr(ctx, &cond)
+    match else_action
+    when GuardElse::Return(ret_opt) then
+      match ret_opt
+      when Option::Some(ret_expr) then check_expr(ctx, &ret_expr)
+      when Option::None then ()
+      end
+    when GuardElse::Break(br_opt) then
+      match br_opt
+      when Option::Some(br_expr) then check_expr(ctx, &br_expr)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Continue then ()
+    end
     
   when StmtKind::Try(body, catches, finally) then
     check_block(ctx, &body)
@@ -740,6 +989,26 @@ def check_stmt(ctx: &mut BorrowCtx, stmt: &Stmt) -> Unit
     match finally
     when Option::Some(fb) then check_block(ctx, &fb)
     when Option::None then ()
+    end
+
+  when StmtKind::With(resource, bind_name, body) then
+    check_expr(ctx, &resource)
+    push_scope(ctx)
+    add_var(ctx, bind_name, Type::Unit, stmt.span)
+    check_block(ctx, &body)
+    pop_scope(ctx)
+
+  when StmtKind::HandleWith(effect_expr, handlers) then
+    check_expr(ctx, &effect_expr)
+    for h in handlers do
+      for arm in h.arms do
+        push_scope(ctx)
+        for param_name in arm.params do
+          add_var(ctx, param_name, Type::Unit, arm.span)
+        end
+        check_block(ctx, &arm.body)
+        pop_scope(ctx)
+      end
     end
     
   when _ then ()
@@ -771,8 +1040,17 @@ end
 
 def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
   match expr.kind
+  when ExprKind::NilLit then
+    ()
+
   when ExprKind::Ident(name) then
     check_use(ctx, name, expr.span)
+
+  when ExprKind::Path(path) then
+    ()
+
+  when ExprKind::SelfRef then
+    ()
     
   when ExprKind::BinaryOp(op, left, right) then
     check_expr(ctx, &left)
@@ -820,6 +1098,12 @@ def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
     for e in elems do
       check_expr(ctx, &e)
     end
+
+  when ExprKind::MapLit(entries) then
+    for (key, value) in entries do
+      check_expr(ctx, &key)
+      check_expr(ctx, &value)
+    end
     
   when ExprKind::TupleLit(elems) then
     for e in elems do
@@ -842,6 +1126,10 @@ def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
   when ExprKind::If(if_stmt) then
     check_expr(ctx, &if_stmt.cond)
     check_block(ctx, &if_stmt.then_block)
+    for (elsif_cond, elsif_block) in if_stmt.elsif_branches do
+      check_expr(ctx, &elsif_cond)
+      check_block(ctx, &elsif_block)
+    end
     match if_stmt.else_block
     when Option::Some(eb) then check_block(ctx, &eb)
     when Option::None then ()
@@ -852,6 +1140,10 @@ def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
     for arm in m.arms do
       push_scope(ctx)
       check_pattern(ctx, &arm.pattern, expr.span)
+      match arm.guard
+      when Option::Some(guard) then check_expr(ctx, &guard)
+      when Option::None then ()
+      end
       check_block(ctx, &arm.body)
       pop_scope(ctx)
     end
@@ -868,6 +1160,34 @@ def check_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Unit
     
   when ExprKind::Try(inner) then
     check_expr(ctx, &inner)
+
+  when ExprKind::Range(start_opt, end_opt, inclusive) then
+    match start_opt
+    when Option::Some(start) then check_expr(ctx, &start)
+    when Option::None then ()
+    end
+    match end_opt
+    when Option::Some(end_expr) then check_expr(ctx, &end_expr)
+    when Option::None then ()
+    end
+
+  when ExprKind::Cast(inner, ty) then
+    check_expr(ctx, &inner)
+
+  when ExprKind::TypeCheck(inner, ty) then
+    check_expr(ctx, &inner)
+
+  when ExprKind::Comptime(block) then
+    check_block(ctx, &block)
+
+  when ExprKind::EnumVariant(path, args) then
+    for a in args do
+      check_expr(ctx, &a)
+    end
+
+  when ExprKind::Assign(target, value) then
+    check_expr(ctx, &value)
+    check_assign_target(ctx, &target, expr.span)
     
   when ExprKind::Pipe(left, right) then
     check_expr(ctx, &left)
@@ -1043,12 +1363,23 @@ end
 struct LifetimeCtx
   constraints: Vec[LifetimeConstraint]
   var_lifetimes: Map[String, Lifetime]
+  next_lifetime_id: Int
 end
 
 def lifetime_ctx_new() -> LifetimeCtx
   LifetimeCtx {
     constraints: Vec::new(),
-    var_lifetimes: Map::new()
+    var_lifetimes: Map::new(),
+    next_lifetime_id: 1
+  }
+end
+
+def fresh_constraint_lifetime(ctx: &mut LifetimeCtx, label: String) -> Lifetime
+  let id = ctx.next_lifetime_id
+  ctx.next_lifetime_id = ctx.next_lifetime_id + 1
+  Lifetime {
+    id: id,
+    name: label + id.to_string()
   }
 end
 
@@ -1071,10 +1402,26 @@ def outlives(ctx: &LifetimeCtx, a: Lifetime, b: Lifetime) -> Bool
     return true
   end
   
-  # Check transitive constraints
-  for c in ctx.constraints do
-    if c.longer.id == a.id && c.shorter.id == b.id then
+  # Constraint graph traversal:
+  # add_constraint(shorter, longer) encodes shorter : longer (shorter outlives longer).
+  mut visited = Set::new()
+  mut stack = Vec::new()
+  stack.push(a.id)
+
+  while !stack.is_empty() do
+    let cur = stack.pop()
+    if cur == b.id then
       return true
+    end
+    if visited.contains(cur) then
+      continue
+    end
+    visited.insert(cur)
+
+    for c in ctx.constraints do
+      if c.shorter.id == cur && !visited.contains(c.longer.id) then
+        stack.push(c.longer.id)
+      end
     end
   end
   
@@ -1097,13 +1444,17 @@ def compute_drop_order(block: &Block) -> Vec[DropInfo]
   
   for stmt in block.stmts do
     match stmt.kind
-    when StmtKind::Let(name, ty_opt, value, is_mut) then
-      drops.push(DropInfo {
-        name: name,
-        needs_drop: true,  # Would check if type needs drop
-        drop_order: order
-      })
-      order = order + 1
+    when StmtKind::Let(pattern, ty_opt, value, is_mut) then
+      match pattern.kind
+      when PatternKind::Ident(name, _) then
+        drops.push(DropInfo {
+          name: name,
+          needs_drop: true,  # Would check if type needs drop
+          drop_order: order
+        })
+        order = order + 1
+      when _ then ()
+      end
     when _ then ()
     end
   end
@@ -1209,52 +1560,78 @@ def compute_liveness(cfg: &CFG) -> Map[Int, LivenessInfo]
     })
   end
   
-  # Fixed-point iteration (backward dataflow)
-  mut changed = true
-  while changed do
-    changed = false
+  # Worklist-based backward dataflow (only re-process affected nodes)
+  mut worklist: Vec[Int] = Vec::new()
+  # Initialize worklist with all nodes in reverse order
+  mut i = cfg.nodes.len()
+  while i > 0 do
+    i = i - 1
+    worklist.push(cfg.nodes[i].id)
+  end
+  
+  mut in_worklist: Set[Int] = Set::new()
+  for id in &worklist do
+    in_worklist.insert(*id)
+  end
+  
+  while !worklist.is_empty() do
+    let node_id = worklist.pop().unwrap()
+    in_worklist.remove(&node_id)
     
-    # Iterate in reverse order for backward analysis
-    mut i = cfg.nodes.len()
-    while i > 0 do
-      i = i - 1
-      let node = &cfg.nodes[i]
-      
-      # live_out = union of live_in of all successors
-      mut new_live_out = Set::new()
-      for succ in node.successors do
-        match result.get(succ)
-        when Option::Some(succ_info) then
-          for v in succ_info.live_in do
-            new_live_out.insert(v)
-          end
-        when Option::None then ()
-        end
+    # Find the node
+    mut node_opt: Option[&CFGNode] = Option::None
+    for n in &cfg.nodes do
+      if n.id == node_id then
+        node_opt = Option::Some(n)
+        break
       end
-      
-      # live_in = uses(node) ∪ (live_out - defs(node))
-      let (uses, defs) = node_uses_defs(cfg, node)
-      mut new_live_in = Set::new()
-      # Start with live_out minus defs
-      for v in new_live_out do
-        if !defs.contains(v) then
-          new_live_in.insert(v)
-        end
-      end
-      # Add uses
-      for u in uses do
-        new_live_in.insert(u)
-      end
-      
-      match result.get_mut(node.id)
-      when Option::Some(info) then
-        if info.live_out != new_live_out || info.live_in != new_live_in then
-          changed = true
-          info.live_out = new_live_out
-          info.live_in = new_live_in
+    end
+    
+    let node = match node_opt
+    when Option::Some(n) then n
+    when Option::None then next
+    end
+    
+    # live_out = union of live_in of all successors
+    mut new_live_out = Set::new()
+    for succ in &node.successors do
+      match result.get(*succ)
+      when Option::Some(succ_info) then
+        for v in &succ_info.live_in do
+          new_live_out.insert(v.clone())
         end
       when Option::None then ()
       end
+    end
+    
+    # live_in = uses(node) ∪ (live_out - defs(node))
+    let (uses, defs) = node_uses_defs(cfg, node)
+    mut new_live_in = Set::new()
+    # Start with live_out minus defs
+    for v in &new_live_out do
+      if !defs.contains(v) then
+        new_live_in.insert(v.clone())
+      end
+    end
+    # Add uses
+    for u in &uses do
+      new_live_in.insert(u.clone())
+    end
+    
+    match result.get_mut(&node_id)
+    when Option::Some(info) then
+      if info.live_in != new_live_in then
+        info.live_out = new_live_out
+        info.live_in = new_live_in
+        # Add predecessors to worklist (they need to be recomputed)
+        for pred in &node.predecessors do
+          if !in_worklist.contains(pred) then
+            worklist.push(*pred)
+            in_worklist.insert(*pred)
+          end
+        end
+      end
+    when Option::None then ()
     end
   end
   
@@ -1287,9 +1664,12 @@ end
 # Extract uses and defs from a statement
 def extract_stmt_uses_defs(stmt: &Stmt, uses: &mut Set[String], defs: &mut Set[String]) -> Unit
   match stmt.kind
-  when StmtKind::Let(name, ty_opt, value, is_mut) then
+  when StmtKind::Let(pattern, ty_opt, value, is_mut) then
     # Let bindings define a new variable
-    defs.insert(name.clone())
+    match pattern.kind
+    when PatternKind::Ident(name, _) then defs.insert(name.clone())
+    when _ then ()
+    end
     # The initializer expression contains uses
     extract_expr_uses(&value, uses)
     
@@ -1493,13 +1873,12 @@ def extract_closure_captures(body: &Expr, bound: &Set[String], captures: &mut Se
     mut new_bound = bound.clone()
     for stmt in block.stmts do
       match stmt.kind
-      when StmtKind::Let(name, _, init, _) then
-        match init
-        when Option::Some(e) then
-          extract_closure_captures(&e, &new_bound, captures)
-        when Option::None then ()
+      when StmtKind::Let(pattern, _, init, _) then
+        extract_closure_captures(&init, &new_bound, captures)
+        match pattern.kind
+        when PatternKind::Ident(name, _) then new_bound.insert(name.clone())
+        when _ then ()
         end
-        new_bound.insert(name.clone())
       when StmtKind::Expr(e) then
         extract_closure_captures(&e, &new_bound, captures)
       when _ then ()
@@ -1515,7 +1894,272 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def borrow_check(program: &Program) -> Vec[BorrowError]
-  check_program(program)
+  mut errors = check_program(program)
+
+  # Run NLL + escape analysis for more precise diagnostics
+  let _escape_info = analyze_escapes(program)
+
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      run_advanced_analysis(&mut errors, &f)
+    when ItemKind::Impl(i) then
+      for m in i.methods do
+        run_advanced_analysis(&mut errors, &m)
+      end
+    when _ then ()
+    end
+  end
+
+  errors
+end
+
+def run_advanced_analysis(errors: &mut Vec[BorrowError], f: &FunctionDecl) -> Unit
+  # Build CFG from function body for NLL analysis
+  match f.body
+  when FnBody::Block(block) then
+    # 1. Build CFG and compute liveness (NLL)
+    mut cfg = cfg_new()
+    build_cfg_from_block(&mut cfg, &block)
+    let _liveness = compute_liveness(&cfg)
+
+    # 2. Lifetime constraint checking
+    mut lt_ctx = lifetime_ctx_new()
+    collect_lifetime_constraints_block(&mut lt_ctx, &block)
+    check_lifetime_violations(&lt_ctx, errors)
+
+    # 3. Drop order verification
+    let drop_info = compute_drop_order(&block)
+    verify_no_use_after_drop(errors, &drop_info, &block)
+  when _ then ()
+  end
+end
+
+def build_cfg_from_block(cfg: &mut CFG, block: &Block) -> Unit
+  mut prev_id = cfg.entry
+  for stmt in block.stmts do
+    let node_id = cfg.nodes.len() as Int
+    let idx = cfg.statements.len() as Int
+    cfg.statements.push(stmt.clone())
+    cfg.nodes.push(CFGNode {
+      id: node_id,
+      kind: CFGNodeKind::Statement(idx),
+      successors: Vec::new(),
+      predecessors: Vec::new()
+    })
+    cfg.nodes[prev_id].successors.push(node_id)
+    cfg.nodes[node_id].predecessors.push(prev_id)
+    prev_id = node_id
+  end
+  cfg.nodes[prev_id].successors.push(cfg.exit)
+  cfg.nodes[cfg.exit].predecessors.push(prev_id)
+end
+
+def collect_lifetime_constraints_block(lt_ctx: &mut LifetimeCtx, block: &Block) -> Unit
+  for stmt in block.stmts do
+    match stmt.kind
+    when StmtKind::Let(pattern, ty_opt, value, is_mut) then
+      # If binding a reference, add outlives constraint
+      match value.kind
+      when ExprKind::Ref(inner) then
+        let borrow_lt = fresh_constraint_lifetime(lt_ctx, "'borrow")
+        let binding_lt = fresh_constraint_lifetime(lt_ctx, "'binding")
+        add_constraint(lt_ctx, borrow_lt, binding_lt, stmt.span)
+      when ExprKind::RefMut(inner) then
+        let borrow_lt = fresh_constraint_lifetime(lt_ctx, "'borrow")
+        let binding_lt = fresh_constraint_lifetime(lt_ctx, "'binding")
+        add_constraint(lt_ctx, borrow_lt, binding_lt, stmt.span)
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+def check_lifetime_violations(lt_ctx: &LifetimeCtx, errors: &mut Vec[BorrowError]) -> Unit
+  for c in lt_ctx.constraints do
+    if !outlives(lt_ctx, c.shorter, c.longer) then
+      errors.push(BorrowError {
+        kind: BorrowErrorKind::LifetimeError,
+        message: "borrowed value does not live long enough",
+        span: c.span,
+        related: Vec::new()
+      })
+    end
+  end
+end
+
+def verify_no_use_after_drop(errors: &mut Vec[BorrowError], drops: &Vec[DropInfo], block: &Block) -> Unit
+  # Check that no variable is used after it would be dropped
+  for i in 0..drops.len() do
+    let info = &drops[i]
+    if info.needs_drop then
+      # Verify no uses of this variable appear after its drop point
+      for j in (info.drop_order + 1)..block.stmts.len() do
+        if stmt_uses_var(&block.stmts[j], &info.name) then
+          errors.push(BorrowError {
+            kind: BorrowErrorKind::UseAfterDrop,
+            message: "use of variable `" + info.name.clone() + "` after drop",
+            span: block.stmts[j].span,
+            related: Vec::new()
+          })
+        end
+      end
+    end
+  end
+end
+
+def stmt_uses_var(stmt: &Stmt, name: &String) -> Bool
+  match stmt.kind
+  when StmtKind::Expr(expr) then expr_uses_var(&expr, name)
+  when StmtKind::Let(_, _, value, _) then expr_uses_var(&value, name)
+  when StmtKind::Assign(target, value) then
+    expr_uses_var(&target, name) || expr_uses_var(&value, name)
+  when StmtKind::If(if_stmt) then
+    if expr_uses_var(&if_stmt.cond, name) then return true end
+    for s in if_stmt.then_block.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    for (econd, ebody) in if_stmt.elsif_branches do
+      if expr_uses_var(&econd, name) then return true end
+      for s in ebody.stmts do
+        if stmt_uses_var(&s, name) then return true end
+      end
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then
+      for s in eb.stmts do
+        if stmt_uses_var(&s, name) then return true end
+      end
+      false
+    when Option::None then false
+    end
+  when StmtKind::While(cond, body) then
+    if expr_uses_var(&cond, name) then return true end
+    for s in body.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when StmtKind::For(_, iter, body) then
+    if expr_uses_var(&iter, name) then return true end
+    for s in body.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when StmtKind::Loop(body) then
+    for s in body.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when StmtKind::Return(v) then
+    match v
+    when Option::Some(e) then expr_uses_var(&e, name)
+    when Option::None then false
+    end
+  when StmtKind::Yield(v) then
+    match v
+    when Option::Some(e) then expr_uses_var(&e, name)
+    when Option::None then false
+    end
+  when StmtKind::Match(m) then
+    if expr_uses_var(&m.scrutinee, name) then return true end
+    for arm in m.arms do
+      match arm.guard
+      when Option::Some(g) then if expr_uses_var(&g, name) then return true end
+      when Option::None then ()
+      end
+      for s in arm.body.stmts do
+        if stmt_uses_var(&s, name) then return true end
+      end
+    end
+    false
+  when StmtKind::Unsafe(_, body) then
+    for s in body.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when StmtKind::Defer(body) then
+    for s in body.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when _ then false
+  end
+end
+
+def expr_uses_var(expr: &Expr, name: &String) -> Bool
+  match expr.kind
+  when ExprKind::Ident(n) then n == *name
+  when ExprKind::Ref(inner) then expr_uses_var(&inner, name)
+  when ExprKind::RefMut(inner) then expr_uses_var(&inner, name)
+  when ExprKind::Deref(inner) then expr_uses_var(&inner, name)
+  when ExprKind::Move(inner) then expr_uses_var(&inner, name)
+  when ExprKind::Copy(inner) then expr_uses_var(&inner, name)
+  when ExprKind::UnaryOp(_, inner) then expr_uses_var(&inner, name)
+  when ExprKind::BinaryOp(_, left, right) then
+    expr_uses_var(&left, name) || expr_uses_var(&right, name)
+  when ExprKind::FieldAccess(inner, _) then expr_uses_var(&inner, name)
+  when ExprKind::Index(recv, idx) then
+    expr_uses_var(&recv, name) || expr_uses_var(&idx, name)
+  when ExprKind::MethodCall(recv, _, args, _) then
+    if expr_uses_var(&recv, name) then return true end
+    for a in args do
+      if expr_uses_var(&a, name) then return true end
+    end
+    false
+  when ExprKind::Call(callee, args) then
+    if expr_uses_var(&callee, name) then return true end
+    for a in args do
+      if expr_uses_var(&a, name) then return true end
+    end
+    false
+  when ExprKind::ArrayLit(elems) then
+    for e in elems do
+      if expr_uses_var(&e, name) then return true end
+    end
+    false
+  when ExprKind::TupleLit(elems) then
+    for e in elems do
+      if expr_uses_var(&e, name) then return true end
+    end
+    false
+  when ExprKind::StructLit(_, fields) then
+    for (_, v) in fields do
+      if expr_uses_var(&v, name) then return true end
+    end
+    false
+  when ExprKind::Assign(target, value) then
+    expr_uses_var(&target, name) || expr_uses_var(&value, name)
+  when ExprKind::Pipe(left, right) then
+    expr_uses_var(&left, name) || expr_uses_var(&right, name)
+  when ExprKind::Try(inner) then expr_uses_var(&inner, name)
+  when ExprKind::Await(inner) then expr_uses_var(&inner, name)
+  when ExprKind::If(if_stmt) then
+    if expr_uses_var(&if_stmt.cond, name) then return true end
+    for s in if_stmt.then_block.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    for (econd, ebody) in if_stmt.elsif_branches do
+      if expr_uses_var(&econd, name) then return true end
+      for s in ebody.stmts do
+        if stmt_uses_var(&s, name) then return true end
+      end
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then
+      for s in eb.stmts do
+        if stmt_uses_var(&s, name) then return true end
+      end
+      false
+    when Option::None then false
+    end
+  when ExprKind::Block(block) then
+    for s in block.stmts do
+      if stmt_uses_var(&s, name) then return true end
+    end
+    false
+  when _ then false
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1646,7 +2290,7 @@ end
 
 def analyze_stmt_escapes(ctx: &mut EscapeAnalysisContext, stmt: &Stmt) -> Unit
   match stmt.kind
-  when StmtKind::Let(pattern, ty, init) then
+  when StmtKind::Let(pattern, ty, init, _) then
     # Initialize the variable with NoEscape
     match pattern.kind
     when PatternKind::Ident(name, _) then
@@ -1660,11 +2304,7 @@ def analyze_stmt_escapes(ctx: &mut EscapeAnalysisContext, stmt: &Stmt) -> Unit
     end
     
     # Analyze the initializer
-    match init
-    when Option::Some(expr) then
-      analyze_expr_escapes(ctx, &expr)
-    when Option::None then ()
-    end
+    analyze_expr_escapes(ctx, &init)
   
   when StmtKind::Expr(expr) then
     analyze_expr_escapes(ctx, &expr)
@@ -1696,13 +2336,13 @@ def analyze_expr_escapes(ctx: &mut EscapeAnalysisContext, expr: &Expr) -> Unit
       end
     end
   
-  when ExprKind::StructInit(_, fields) then
+  when ExprKind::StructLit(_, fields) then
     # Fields might escape if the struct escapes
-    for field in fields do
-      analyze_expr_escapes(ctx, &field.value)
+    for (_, value) in fields do
+      analyze_expr_escapes(ctx, &value)
     end
   
-  when ExprKind::Closure(params, body) then
+  when ExprKind::Closure(params, _, body) then
     # Variables captured by closure may escape
     let captured = find_captured_variables(&expr)
     for var in captured do
@@ -1712,15 +2352,29 @@ def analyze_expr_escapes(ctx: &mut EscapeAnalysisContext, expr: &Expr) -> Unit
   when ExprKind::Block(block) then
     analyze_block_escapes(ctx, &block)
   
-  when ExprKind::If(cond, then_block, else_block) then
-    analyze_expr_escapes(ctx, &cond)
-    analyze_expr_escapes(ctx, &then_block)
-    match else_block
-    when Option::Some(eb) then analyze_expr_escapes(ctx, &eb)
+  when ExprKind::If(if_stmt) then
+    analyze_expr_escapes(ctx, &if_stmt.cond)
+    for stmt in if_stmt.then_block.stmts do
+      analyze_stmt_escapes(ctx, &stmt)
+    end
+    for (elsif_cond, elsif_block) in if_stmt.elsif_branches do
+      analyze_expr_escapes(ctx, &elsif_cond)
+      for stmt in elsif_block.stmts do
+        analyze_stmt_escapes(ctx, &stmt)
+      end
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then
+      for stmt in eb.stmts do
+        analyze_stmt_escapes(ctx, &stmt)
+      end
     when Option::None then ()
     end
   
-  when ExprKind::Ref(inner, is_mut) then
+  when ExprKind::Ref(inner) then
+    analyze_expr_escapes(ctx, &inner)
+
+  when ExprKind::RefMut(inner) then
     # Taking a reference doesn't cause escape by itself
     # But the reference might escape in the future
     analyze_expr_escapes(ctx, &inner)
@@ -1758,7 +2412,7 @@ end
 def expr_to_var_name(expr: &Expr) -> Option[String]
   match expr.kind
   when ExprKind::Ident(name) then Option::Some(name.clone())
-  when ExprKind::Field(base, _) then expr_to_var_name(&base)
+  when ExprKind::FieldAccess(base, _) then expr_to_var_name(&base)
   when ExprKind::Index(base, _) then expr_to_var_name(&base)
   when _ then Option::None
   end
@@ -1770,7 +2424,7 @@ def find_captured_variables(closure: &Expr) -> Vec[String]
   mut captured = Vec::new()
   
   match closure.kind
-  when ExprKind::Closure(params, body) then
+  when ExprKind::Closure(params, _, body) then
     # Build set of parameter names
     mut param_names = Set::new()
     for p in params do
@@ -1796,20 +2450,17 @@ def collect_free_vars(expr: &Expr, bound: &Set[String], free: &mut Vec[String]) 
     for arg in args do
       collect_free_vars(&arg, bound, free)
     end
-  when ExprKind::BinOp(lhs, _, rhs) then
+  when ExprKind::BinaryOp(_, lhs, rhs) then
     collect_free_vars(&lhs, bound, free)
     collect_free_vars(&rhs, bound, free)
-  when ExprKind::UnOp(_, inner) then
+  when ExprKind::UnaryOp(_, inner) then
     collect_free_vars(&inner, bound, free)
   when ExprKind::Block(block) then
     mut new_bound = bound.clone()
     for stmt in block.stmts do
       match stmt.kind
-      when StmtKind::Let(pattern, _, init) then
-        match init
-        when Option::Some(e) then collect_free_vars(&e, &new_bound, free)
-        when Option::None then ()
-        end
+      when StmtKind::Let(pattern, _, init, _) then
+        collect_free_vars(&init, &new_bound, free)
         match pattern.kind
         when PatternKind::Ident(name, _) then new_bound.insert(name.clone())
         when _ then ()

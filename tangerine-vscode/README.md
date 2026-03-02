@@ -61,7 +61,7 @@ curl -fsSL https://tangerine-lang.org/install.sh | sh
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `tangerine.executablePath` | Path to `tg` compiler | Auto-detect |
-| `tangerine.mode` | Compilation mode | `Development` |
+| `tangerine.mode` | Compilation mode | `Dev` |
 | `tangerine.edition` | Language edition | `2026` |
 | `tangerine.checkOnSave` | Full check on save | `true` |
 | `tangerine.formatOnSave` | Format on save | `false` |
@@ -149,4 +149,4 @@ See the main [Tangerine repository](https://github.com/tangerine-lang/tangerine)
 
 ## License
 
-MIT License — see [LICENSE](../LICENSE) for details.
+MIT License — see [LICENSE](./LICENSE) for details.

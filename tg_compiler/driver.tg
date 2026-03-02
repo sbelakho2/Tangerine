@@ -27,6 +27,7 @@ use tg_compiler::codegen::{generate_native, generate_executable, generate_object
 use tg_compiler::asm::{TargetTriple}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::resolver::{fnv1a_hash}
+use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 
 # ———————————————————————————————————————————————————————————————
 # Compiler Options
@@ -77,6 +78,10 @@ struct CompilerOptions
   # PGO
   pgo_gen: Option[String]    # --pgo-gen=<path> : instrument and write profile
   pgo_use: Option[String]    # --pgo-use=<path> : read profile for optimization
+
+  # Mode system
+  mode: Mode                  # Dev/Strict/Production/Hardened
+  mode_config: ModeConfig     # Derived from mode
 end
 
 enum EmitMode
@@ -110,7 +115,9 @@ def default_options() -> CompilerOptions
     color: true,
     target_triple: Option::None,
     pgo_gen: Option::None,
-    pgo_use: Option::None
+    pgo_use: Option::None,
+    mode: Mode::Dev,
+    mode_config: config_for_mode(Mode::Dev)
   }
 end
 
@@ -143,6 +150,7 @@ end
 
 struct DiagnosticEmitter
   source_map: SourceMap
+  current_source_id: Int
   diagnostics: Vec[Diagnostic]
   error_count: Int
   warning_count: Int
@@ -163,6 +171,7 @@ end
 def emitter_new() -> DiagnosticEmitter
   DiagnosticEmitter {
     source_map: SourceMap { files: Vec::new() },
+    current_source_id: -1,
     diagnostics: Vec::new(),
     error_count: 0,
     warning_count: 0,
@@ -174,6 +183,7 @@ end
 def emitter_new_json() -> DiagnosticEmitter
   DiagnosticEmitter {
     source_map: SourceMap { files: Vec::new() },
+    current_source_id: -1,
     diagnostics: Vec::new(),
     error_count: 0,
     warning_count: 0,
@@ -201,6 +211,8 @@ def add_source(e: &mut DiagnosticEmitter, name: String, content: String) -> Int
     content: content,
     lines: lines
   })
+
+  e.current_source_id = id
   
   id
 end
@@ -278,18 +290,22 @@ def eprint_styled(s: String, style: String) -> Unit
 end
 
 def eprint(s: String) -> Unit
-  # Would use stderr
-  print(s)
+  let bytes = s.as_bytes()
+  let _n = syscall_write(2, bytes.as_ptr(), bytes.len())
 end
 
 def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
   # Find the source file containing this span
   mut found_file: Option[&SourceFile] = Option::None
-  for f in e.source_map.files do
-    let file_len = f.content.len()
-    if span.start < file_len then
-      found_file = Option::Some(&f)
-      break
+  if e.current_source_id >= 0 && e.current_source_id < e.source_map.files.len() then
+    found_file = Option::Some(&e.source_map.files[e.current_source_id])
+  else
+    for f in e.source_map.files do
+      let file_len = f.content.len()
+      if span.start < file_len && span.end_pos <= file_len then
+        found_file = Option::Some(&f)
+        break
+      end
     end
   end
   
@@ -340,7 +356,7 @@ def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
       i = i + 1
     end
     # Draw the caret(s) for the span width
-    let span_len = if span.end > span.start then span.end - span.start else 1 end
+    let span_len = if span.end_pos > span.start then span.end_pos - span.start else 1 end
     i = 0
     while i < span_len do
       caret_line = caret_line + "^"
@@ -418,7 +434,7 @@ end
 def emit_span_json(e: &DiagnosticEmitter, span: Span) -> String
   mut json = "{"
   json = json + "\"byte_start\":" + span.start.to_string() + ","
-  json = json + "\"byte_end\":" + span.end.to_string() + ","
+  json = json + "\"byte_end\":" + span.end_pos.to_string() + ","
   
   # Try to find file and line info
   mut found = false
@@ -439,12 +455,12 @@ def emit_span_json(e: &DiagnosticEmitter, span: Span) -> String
       mut end_line = 1
       mut end_line_start = 0
       for offset in f.lines do
-        if offset > span.end then break end
+        if offset > span.end_pos then break end
         end_line_start = offset
         end_line = end_line + 1
       end
       end_line = end_line - 1
-      let end_col = span.end - end_line_start
+      let end_col = span.end_pos - end_line_start
       
       json = json + "\"file_name\":\"" + json_escape(f.name.clone()) + "\","
       json = json + "\"line_start\":" + line_num.to_string() + ","
@@ -474,7 +490,7 @@ def emit_suggestion_json(sugg: &Suggestion) -> String
   json = json + "\"replacement\":\"" + json_escape(sugg.replacement.clone()) + "\","
   json = json + "\"span\":" + "{"
   json = json + "\"byte_start\":" + sugg.span.start.to_string() + ","
-  json = json + "\"byte_end\":" + sugg.span.end.to_string()
+  json = json + "\"byte_end\":" + sugg.span.end_pos.to_string()
   json = json + "}}"
   json
 end
@@ -640,6 +656,7 @@ def error_code_example(code: String) -> String
     "  # In crate `my_crate`:\n  impl std::fmt::Display for std::vec::Vec[Int]\n  # error: neither Display nor Vec is defined in the current crate"
   when _ then ""
   end
+end
 
 # ———————————————————————————————————————————————————————————————
 # Compilation Pipeline
@@ -702,7 +719,8 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
         message: d.message,
         span: Option::Some(d.span),
         notes: Vec::new(),
-        suggestions: Vec::new()
+        suggestions: Vec::new(),
+        code: Option::None
       })
     end
     return Result::Err("Parse error")
@@ -735,7 +753,8 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
       message: err.message,
       span: Option::Some(err.span),
       notes: Vec::new(),
-      suggestions: Vec::new()
+      suggestions: Vec::new(),
+      code: Option::None
     })
   end
   
@@ -755,7 +774,8 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
       message: err.message,
       span: Option::Some(err.span),
       notes: err.notes,
-      suggestions: Vec::new()
+      suggestions: Vec::new(),
+      code: Option::None
     })
   end
   
@@ -786,6 +806,18 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
   match opts.pgo_gen
   when Option::Some(_) then
     instrument_for_pgo(&mut mir)
+  when Option::None then ()
+  end
+  
+  # PGO-guided optimization: if --pgo-use, load profile and apply
+  match opts.pgo_use
+  when Option::Some(profile_path) then
+    match read_pgo_profile(&profile_path)
+    when Result::Ok(profile) then
+      apply_pgo_profile(&mut mir, &profile)
+    when Result::Err(e) then
+      eprintln("warning: failed to load PGO profile `" + profile_path + "`: " + e)
+    end
   when Option::None then ()
   end
   
@@ -854,7 +886,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def token_debug(tok: Token) -> String
-  tok.kind.to_string() + " @ " + tok.span.start.to_string() + ".." + tok.span.end.to_string()
+  tok.kind.to_string() + " @ " + tok.span.start.to_string() + ".." + tok.span.end_pos.to_string()
 end
 
 def print_ast(program: &Program) -> Unit
@@ -885,13 +917,18 @@ end
 #      result into the AST.
 #   4. Repeat until no more expansions are found (handles nested macros).
 
+# Global expansion stack for recursion detection
+mut MACRO_EXPANSION_STACK: Vec[String] = Vec::new()
+
 struct MacroEnv
   macros: Map[String, MacroDecl]
+  # Recursion stack for hygiene (prevents infinite expansion)
+  expansion_stack: Vec[String]
 end
 
 def expand_macros(program: Program) -> Program
   # Phase 1: collect macro declarations
-  mut env = MacroEnv { macros: Map::new() }
+  mut env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new() }
   for item in program.items do
     match item.kind
     when ItemKind::Macro(m) then
@@ -963,7 +1000,7 @@ def expand_item(env: &MacroEnv, item: Item) -> (Item, Bool)
         effects: f.effects.clone(),
         span: f.span
       }
-      (Item { kind: ItemKind::Function(new_f), annotations: item.annotations.clone(), doc_comment: item.doc_comment.clone(), span: item.span }, expanded)
+      (Item { kind: ItemKind::Function(new_f), attrs: item.attrs.clone(), span: item.span }, expanded)
     when _ then (item, false)
     end
   when _ then (item, false)
@@ -986,13 +1023,9 @@ def expand_stmt(env: &MacroEnv, stmt: Stmt) -> (Stmt, Bool)
   when StmtKind::Expr(expr) then
     let (new_expr, expanded) = expand_expr(env, expr)
     (Stmt { kind: StmtKind::Expr(new_expr), span: stmt.span }, expanded)
-  when StmtKind::Let(pat, ty, init) then
-    match init
-    when Option::Some(expr) then
-      let (new_expr, expanded) = expand_expr(env, expr)
-      (Stmt { kind: StmtKind::Let(pat, ty, Option::Some(new_expr)), span: stmt.span }, expanded)
-    when Option::None then (stmt, false)
-    end
+  when StmtKind::Let(pat, ty, init, is_mut) then
+    let (new_expr, expanded) = expand_expr(env, init)
+    (Stmt { kind: StmtKind::Let(pat, ty, new_expr, is_mut), span: stmt.span }, expanded)
   when _ then (stmt, false)
   end
 end
@@ -1006,9 +1039,22 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> (Expr, Bool)
       let name = path_to_name(&path)
       match env.macros.get(&name)
       when Option::Some(macro_decl) then
-        # Found a macro invocation — expand it
-        let expanded = instantiate_macro(macro_decl, &args, &expr.span)
-        (expanded, true)
+        # Check for recursive macro expansion
+        if MACRO_EXPANSION_STACK.contains(&name) then
+          # Recursive macro invocation detected - return error
+          (Expr {
+            kind: ExprKind::Error("recursive macro invocation: '" + name.clone() + "'"),
+            span: expr.span
+          }, false)
+        else
+          # Push onto expansion stack
+          MACRO_EXPANSION_STACK.push(name.clone())
+          # Found a macro invocation — expand it
+          let expanded = instantiate_macro(macro_decl, &args, &expr.span)
+          # Pop from expansion stack
+          MACRO_EXPANSION_STACK.pop()
+          (expanded, true)
+        end
       when Option::None then
         # Not a macro — recurse into arguments
         mut new_args = Vec::new()
@@ -1049,10 +1095,20 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> (Expr, Bool)
 end
 
 def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span) -> Expr
+  # Validate argument count matches parameter count
+  if args.len() != macro_decl.params.len() then
+    # Return an error expression - type checker will catch this
+    return Expr {
+      kind: ExprKind::Error("macro '" + macro_decl.name.clone() + "' expects " +
+        macro_decl.params.len().to_string() + " arguments, got " + args.len().to_string()),
+      span: call_span.clone()
+    }
+  end
+
   # Build substitution map: param_name → argument expression
   mut subst_map: Map[String, Expr] = Map::new()
   mut i = 0
-  while i < macro_decl.params.len() && i < args.len() do
+  while i < macro_decl.params.len() do
     subst_map.insert(macro_decl.params[i].name.clone(), args[i].clone())
     i = i + 1
   end
@@ -1076,12 +1132,9 @@ def substitute_stmt(subst: &Map[String, Expr], stmt: &Stmt) -> Stmt
   match stmt.kind
   when StmtKind::Expr(expr) then
     Stmt { kind: StmtKind::Expr(substitute_expr(subst, &expr)), span: stmt.span }
-  when StmtKind::Let(pat, ty, init) then
-    let new_init = match init
-    when Option::Some(e) then Option::Some(substitute_expr(subst, &e))
-    when Option::None then Option::None
-    end
-    Stmt { kind: StmtKind::Let(pat.clone(), ty.clone(), new_init), span: stmt.span }
+  when StmtKind::Let(pat, ty, init, is_mut) then
+    let new_init = substitute_expr(subst, &init)
+    Stmt { kind: StmtKind::Let(pat.clone(), ty.clone(), new_init, is_mut), span: stmt.span }
   when _ then stmt.clone()
   end
 end
@@ -1101,9 +1154,9 @@ def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
       new_args.push(substitute_expr(subst, &arg))
     end
     Expr { kind: ExprKind::Call(Box::new(new_callee), new_args), span: expr.span }
-  when ExprKind::BinOp(op, lhs, rhs) then
+  when ExprKind::BinaryOp(op, lhs, rhs) then
     Expr {
-      kind: ExprKind::BinOp(op, Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))),
+      kind: ExprKind::BinaryOp(op, Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))),
       span: expr.span
     }
   when ExprKind::Block(block) then
@@ -1200,6 +1253,32 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       else
         opts.pgo_use = Option::Some(".tg_pgo_profile".to_string())
       end
+    elsif arg == "--mode" then
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for --mode")
+      end
+      let mode_str = argv[i]
+      if mode_str == "dev" then
+        opts.mode = Mode::Dev
+        opts.mode_config = config_for_mode(Mode::Dev)
+      elsif mode_str == "strict" then
+        opts.mode = Mode::Strict
+        opts.mode_config = config_for_mode(Mode::Strict)
+      elsif mode_str == "production" then
+        opts.mode = Mode::Production
+        opts.mode_config = config_for_mode(Mode::Production)
+      elsif mode_str == "hardened" then
+        opts.mode = Mode::Hardened
+        opts.mode_config = config_for_mode(Mode::Hardened)
+      else
+        return Result::Err("Unknown mode: " + mode_str + " (expected dev/strict/production/hardened)")
+      end
+      # Apply mode-driven feature flags
+      opts.enable_contracts = opts.mode_config.enforce_contracts
+      opts.enable_effects = opts.mode_config.enforce_effects
+      opts.enable_budgets = opts.mode_config.enforce_budgets
+      opts.enable_capabilities = opts.mode_config.enforce_capabilities
     elsif arg == "-h" || arg == "--help" then
       print_help()
       return Result::Err("help")
@@ -1272,7 +1351,7 @@ def print_help() -> Unit
 end
 
 def print_version() -> Unit
-  println("Tangerine compiler v0.1.0")
+  println("Tangerine compiler v" + VERSION)
   println("Self-hosting edition")
 end
 
@@ -1581,7 +1660,7 @@ def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
       mut should_panic = false
       mut is_ignored = false
       
-      for attr in item.annotations do
+      for attr in item.attrs do
         if attr.name == "test" then
           is_test = true
         elsif attr.name == "should_panic" then
@@ -1592,14 +1671,32 @@ def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
       end
       
       if is_test then
+        # Capture the function name and source file for on-demand compilation.
+        # The closure compiles the parent file, then executes the resulting
+        # binary with the --run-test flag to invoke the named test function.
+        let captured_func_name = func.name.clone()
+        let captured_file      = file.clone()
+
         mut tc = TestCase {
           name: func.name.clone(),
           module: module_name.clone(),
           func: || -> Unit {
-            # The test function body is compiled and linked separately.
-            # This closure is a placeholder that gets replaced by the
-            # actual compiled function pointer during the test linking phase.
-            panic("test stub: should be replaced by linker")
+            let mut opts = default_options()
+            opts.input_files = Vec::new()
+            opts.input_files.push(captured_file.clone())
+            opts.output = Option::Some(".tg_test_bin".to_string())
+            opts.test_mode = true
+
+            match compile_file(&opts, captured_file.clone())
+            when Result::Ok(exe_path) then
+              let cmd = "./" + exe_path + " --run-test " + captured_func_name.clone()
+              let exit_code = unsafe "FFI system call" do system(cmd.as_ptr()) end
+              if exit_code != 0 then
+                panic("test `" + captured_func_name.clone() + "` failed (exit code " + exit_code.to_string() + ")")
+              end
+            when Result::Err(e) then
+              panic("compilation failed for test `" + captured_func_name.clone() + "`: " + e)
+            end
           },
           should_panic: should_panic,
           ignore: is_ignored,
@@ -1608,7 +1705,7 @@ def extract_test_functions(ast: &Program, file: String) -> Vec[TestCase]
         }
         
         # Check for timeout annotation
-        for attr in item.annotations do
+        for attr in item.attrs do
           if attr.name == "timeout" then
             if !attr.args.is_empty() then
               tc.timeout_ms = Option::Some(attr.args[0].value.parse_uint().unwrap_or(0))
@@ -1966,7 +2063,7 @@ def extract_bench_functions(ast: &Program, file: String) -> Vec[BenchCase]
   for item in ast.items do
     match item.kind
     when ItemKind::Function(func) then
-      for attr in item.annotations do
+      for attr in item.attrs do
         if attr.name == "bench" then
           benches.push(bench_case_new(func.name.clone(), module_name.clone()))
         end
@@ -2167,7 +2264,7 @@ end
 def is_stale(cache: &IncrementalCache, path: String, source: String) -> Bool
   match cache.entries.get(path)
   when Option::Some(entry) then
-    let current_hash = hash_string(source)
+    let current_hash = fnv1a_hash(source).to_string()
     entry.source_hash != current_hash
   when Option::None then
     true
@@ -2243,13 +2340,13 @@ def load_project(path: String) -> Result[Project, String]
       
       # Skip comments and empty lines
       if trimmed.is_empty() || trimmed.starts_with("#") then
-        continue
+        next
       end
       
       # Section headers
       if trimmed.starts_with("[") && trimmed.ends_with("]") then
         section = trimmed.slice(1, trimmed.len() - 1)
-        continue
+        next
       end
       
       # Key-value pairs
@@ -2610,11 +2707,11 @@ def parse_lockfile(content: &String) -> Option[Lockfile]
       current_checksum = "".to_string()
       current_deps = Vec::new()
       in_package = true
-      continue
+      next
     end
     
     if !in_package || trimmed.is_empty() || trimmed.starts_with("#") then
-      continue
+      next
     end
     
     match trimmed.split_once("=")
@@ -2729,13 +2826,13 @@ def load_workspace(path: String) -> Result[Workspace, String]
     for line in content.lines() do
       let trimmed = line.trim()
       if trimmed.is_empty() || trimmed.starts_with("#") then
-        continue
+        next
       end
       
       if trimmed.starts_with("[") && trimmed.ends_with("]") then
         section = trimmed.slice(1, trimmed.len() - 1)
         if section == "workspace" then is_workspace = true end
-        continue
+        next
       end
       
       if section == "workspace" then
@@ -2932,7 +3029,7 @@ def cmd_dep_remove(argv: Vec[String]) -> Int
       if trimmed == "[dependencies]" then
         in_deps = true
         new_lines.push(line.to_string())
-        continue
+        next
       end
       
       if trimmed.starts_with("[") && trimmed.ends_with("]") then
@@ -2941,7 +3038,7 @@ def cmd_dep_remove(argv: Vec[String]) -> Int
       
       if in_deps && trimmed.starts_with(name.as_str()) then
         # Skip this dependency line
-        continue
+        next
       end
       
       new_lines.push(line.to_string())
@@ -3167,7 +3264,7 @@ def cmd_self_update(argv: Vec[String]) -> Int
   println("Tangerine self-update")
   println("")
   
-  let current_version = "0.1.0"
+  let current_version = VERSION
   
   # Determine target triple
   let os = detect_os()
@@ -3388,7 +3485,7 @@ def agent_caps(argv: Vec[String]) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      for attr in item.annotations do
+      for attr in item.attrs do
         if attr.name == "require" then
           for arg in attr.args do
             caps.insert(arg.value.clone())
@@ -3436,7 +3533,7 @@ def agent_effects(argv: Vec[String]) -> Int
     match item.kind
     when ItemKind::Function(f) then
       mut fn_effects = Vec::new()
-      for attr in item.annotations do
+      for attr in item.attrs do
         if attr.name == "performs" || attr.name == "effect" then
           for arg in attr.args do
             fn_effects.push(arg.value.clone())
@@ -3616,12 +3713,12 @@ def agent_audit(argv: Vec[String]) -> Int
   for file in files do
     let source = match read_file(file.clone())
     when Result::Ok(s) then s
-    when Result::Err(_) then continue
+    when Result::Err(_) then next
     end
 
     let tokens = tokenize(source)
     let (ast, parse_diags) = parse(tokens)
-    if diag_has_errors(&parse_diags) then continue end
+    if diag_has_errors(&parse_diags) then next end
 
     for item in ast.items do
       match item.kind
@@ -3629,7 +3726,7 @@ def agent_audit(argv: Vec[String]) -> Int
         total_functions = total_functions + 1
         total_contracts = total_contracts + f.contracts.len()
         if f.is_unsafe then total_unsafe = total_unsafe + 1 end
-        for attr in item.annotations do
+        for attr in item.attrs do
           if attr.name == "require" then
             total_caps = total_caps + attr.args.len()
           end
@@ -3751,15 +3848,15 @@ def bindgen_c(source_file: String, output: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f, &item.annotations) then
+      if is_ffi_exported(&f, &item.attrs) then
         header = header + generate_c_prototype(&f) + "\n"
       end
     when ItemKind::Struct(s) then
-      if is_repr_c(&item.annotations) then
+      if is_repr_c(&item.attrs) then
         header = header + generate_c_struct(&s) + "\n"
       end
     when ItemKind::Enum(e) then
-      if is_repr_c(&item.annotations) then
+      if is_repr_c(&item.attrs) then
         header = header + generate_c_enum(&e) + "\n"
       end
     when _ then ()
@@ -3909,7 +4006,7 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f, &item.annotations) then
+      if is_ffi_exported(&f, &item.attrs) then
         lib_rs = lib_rs + "    " + generate_rust_extern(&f) + "\n"
       end
     when _ then ()
@@ -4005,7 +4102,7 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f, &item.annotations) then
+      if is_ffi_exported(&f, &item.attrs) then
         ext_c = ext_c + generate_ruby_wrapper(&f, &module_name) + "\n"
       end
     when _ then ()
@@ -4017,7 +4114,7 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f, &item.annotations) then
+      if is_ffi_exported(&f, &item.attrs) then
         let argc = f.params.len()
         ext_c = ext_c + "    rb_define_module_function(m" + module_name
         ext_c = ext_c + ", \"" + f.name.clone() + "\", rb_" + f.name.clone()
@@ -4472,7 +4569,7 @@ def extract_exports(ast: &Program) -> Map[String, String]
   for item in ast.items do
     match item.kind
     when ItemKind::Function(f) then
-      if is_ffi_exported(&f, &item.annotations) then
+      if is_ffi_exported(&f, &item.attrs) then
         let sig = function_signature(&f)
         exports.insert(f.name.clone(), sig)
       end
@@ -4515,7 +4612,7 @@ def load_build_cache(output_dir: &String) -> IncrementalCache
     # Parse cache file: each line is "path|source_hash|mir_hash|timestamp"
     for line in content.lines() do
       let trimmed = line.trim()
-      if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+      if trimmed.is_empty() || trimmed.starts_with("#") then next end
       
       let parts = trimmed.split("|")
       if parts.len() >= 4 then
@@ -4688,7 +4785,8 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
         message: pd.message,
         span: Option::Some(pd.span),
         notes: Vec::new(),
-        suggestions: Vec::new()
+        suggestions: Vec::new(),
+        code: Option::None
       })
     end
     
@@ -4705,7 +4803,8 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
           message: err.message,
           span: Option::Some(err.span),
           notes: Vec::new(),
-          suggestions: Vec::new()
+          suggestions: Vec::new(),
+          code: Option::None
         })
       end
       
@@ -4716,7 +4815,8 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
           message: err.message,
           span: Option::Some(err.span),
           notes: err.notes,
-          suggestions: Vec::new()
+          suggestions: Vec::new(),
+          code: Option::None
         })
       end
     end
@@ -4814,7 +4914,7 @@ def lsp_completion(server: &LspServer, uri: String, position: LspPosition) -> Ve
     # Add keyword completions
     let keywords = ["def", "struct", "enum", "trait", "impl", "use", "pub",
                     "let", "mut", "if", "elsif", "else", "match", "when",
-                    "for", "while", "loop", "break", "continue", "return",
+                    "for", "while", "loop", "break", "next", "return",
                     "true", "false", "self", "Self", "in", "do", "end",
                     "then", "module", "type", "where", "as", "unsafe",
                     "extern", "async", "await", "yield"]
@@ -5028,7 +5128,7 @@ def lsp_code_actions(server: &LspServer, uri: String, range: LspRange) -> Vec[Ls
       for diag in diags do
         match diag.span
         when Option::Some(span) then
-          if span.start >= range_start && span.end <= range_end then
+          if span.start >= range_start && span.end_pos <= range_end then
             # Generate fix-it actions from suggestions
             for sugg in diag.suggestions do
               let edit_range = span_to_lsp_range(content, sugg.span)
@@ -5110,7 +5210,7 @@ def read_lsp_header() -> Option[UInt]
   # Parse Content-Length
   for line in header.lines() do
     if line.starts_with("Content-Length:") then
-      let val = line.slice(16, line.len()).trim()
+      let val = line.slice(15, line.len()).trim()
       return Option::Some(val.parse_uint().unwrap_or(0))
     end
   end
@@ -5153,7 +5253,7 @@ def handle_lsp_request(server: &mut LspServer, body: String) -> Option[String]
         "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}," +
         "\"documentFormattingProvider\":true," +
         "\"codeActionProvider\":true" +
-        "},\"serverInfo\":{\"name\":\"tangerine-ls\",\"version\":\"0.1.0\"}}"
+        "},\"serverInfo\":{\"name\":\"tangerine-ls\",\"version\":\"" + VERSION + "\"}}"
       make_json_rpc_response(id, result)
     elsif m == "initialized" then
       Option::None  # Notification, no response
@@ -5493,8 +5593,8 @@ def find_symbol_at(server: &LspServer, uri: String, offset: UInt) -> Option[&Lsp
     mut best_span_size: UInt = UInt::MAX
     
     for sym in symbols do
-      if offset >= sym.span.start && offset <= sym.span.end then
-        let span_size = sym.span.end - sym.span.start
+      if offset >= sym.span.start && offset <= sym.span.end_pos then
+        let span_size = sym.span.end_pos - sym.span.start
         if span_size < best_span_size then
           best = Option::Some(sym)
           best_span_size = span_size
@@ -5545,7 +5645,7 @@ end
 
 def span_to_lsp_range(content: &String, span: Span) -> LspRange
   let start = offset_to_lsp_position(content, span.start)
-  let end_pos = offset_to_lsp_position(content, span.end)
+  let end_pos = offset_to_lsp_position(content, span.end_pos)
   LspRange { start: start, end_pos: end_pos }
 end
 
@@ -5707,7 +5807,7 @@ def extract_doc_comment_before(ast: &Program, span: Span) -> Option[String]
       # Strip the ## prefix and leading space
       let content = line.substring(2, line.len()).trim()
       doc_lines.push(content)
-    else if line.is_empty() then
+    elsif line.is_empty() then
       # Empty line between doc comment and declaration is ok (skip)
       if doc_lines.is_empty() then
         break

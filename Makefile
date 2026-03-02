@@ -1,7 +1,6 @@
 # Tangerine Project Makefile
-# SCRIPT-004: CI/CD & build automation
 
-.PHONY: all build test golden lint fmt coverage clean help
+.PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help
 
 SHELL := /bin/bash
 TG    := tg
@@ -16,13 +15,14 @@ all: build test
 
 build:
 	@echo "==> Building Tangerine compiler..."
-	$(TG) build tg_compiler/driver.tg -o target/tg
+	mkdir -p build
+	$(TG) build tg_compiler/driver.tg -o build/tg
 
 # ————————————————————————————————————————————
 # Tests
 # ————————————————————————————————————————————
 
-test: test-golden test-stdlib test-compiler
+test: test-golden test-stdlib test-compiler test-scripts
 
 test-golden:
 	@echo "==> Running golden tests..."
@@ -40,7 +40,10 @@ test-compiler:
 	$(TG) test golden/compiler_module_tests.tg
 	$(TG) test golden/negative_tests.tg
 	$(TG) test golden/lsp_tests.tg
-	$(TG) test golden/abi_ffi_tests.tg
+
+test-scripts:
+	@echo "==> Running script tests..."
+	$(PYTHON) -m unittest scripts.tests.test_scripts
 
 test-conformance:
 	@echo "==> Running conformance suite..."
@@ -52,8 +55,58 @@ test-frontend:
 		$(TG) test golden/frontend_$$i.tg; \
 	done
 
-test-all: test test-conformance test-frontend
+test-abi:
+	@echo "==> Running ABI/FFI tests..."
+	$(TG) test golden/abi_ffi_tests.tg
+
+test-all: test test-conformance test-frontend test-abi test-gfx-ui
 	@echo "==> All tests passed."
+
+# ————————————————————————————————————————————
+# GFX/UI Module Tests (§20)
+# ————————————————————————————————————————————
+
+test-gfx-ui:
+	@echo "==> Checking GFX/UI modules compile..."
+	$(TG) check std/gfx_errors.tg
+	$(TG) check std/geom.tg
+	$(TG) check std/app.tg
+	$(TG) check std/gfx.tg
+	$(TG) check std/gfx_gpu.tg
+	$(TG) check std/image.tg
+	$(TG) check std/text.tg
+	$(TG) check std/ui_toolkit.tg
+	$(TG) check std/platform.tg
+	$(TG) check std/anim.tg
+	$(TG) check std/compositor.tg
+	$(TG) check std/assets.tg
+	$(TG) check std/accessibility.tg
+	$(TG) check std/backend_abi.tg
+	@echo "==> Running conformance gates..."
+	$(TG) run scripts/conformance_gates.tg
+	@echo "==> GFX/UI module tests passed."
+
+# ————————————————————————————————————————————
+# Stub Scan (§20 — forbidden stub markers)
+# ————————————————————————————————————————————
+
+stub-scan:
+	@echo "==> Scanning for forbidden stub markers in production modules..."
+	@! grep -rn 'TODO\|FIXME\|STUB\|unimplemented\|todo!' std/*.tg || \
+		(echo "ERROR: Stub markers found in std/ — remove before release" && exit 1)
+	@echo "==> No stub markers found."
+
+# ————————————————————————————————————————————
+# ABI Layout Regression Check (§20)
+# ————————————————————————————————————————————
+
+abi-layout-check:
+	@echo "==> Checking ABI struct layout consistency..."
+	$(TG) check std/backend_abi.tg
+	@echo "==> ABI layout check passed."
+
+ci: lint fmt-check test-all stub-scan abi-layout-check coverage
+	@echo "==> CI pipeline completed."
 
 # ————————————————————————————————————————————
 # Linting & Formatting
@@ -93,12 +146,35 @@ docs:
 	$(TG) doc std/*.tg -o target/doc
 
 # ————————————————————————————————————————————
+# Install
+# ————————————————————————————————————————————
+
+PREFIX ?= /usr/local
+
+install: build
+	@echo "==> Installing to $(PREFIX)/bin..."
+	install -d $(PREFIX)/bin
+	install -m 755 build/tg $(PREFIX)/bin/tg
+
+# ————————————————————————————————————————————
+# Benchmarks
+# ————————————————————————————————————————————
+
+bench:
+	@echo "==> Running benchmarks..."
+	$(TG) bench golden/stdlib_tests.tg
+	$(TG) bench golden/compiler_module_tests.tg
+	$(TG) bench golden/features_01.tg
+
+# ————————————————————————————————————————————
 # Clean
 # ————————————————————————————————————————————
 
 clean:
 	@echo "==> Cleaning build artifacts..."
-	rm -rf target/tg target/doc target/cqs/coverage/merged.tgcov
+	rm -rf build/tg target/cqs/coverage/merged.tgcov
+	rm -rf target/doc
+	find target -type f -name '*.o' -delete 2>/dev/null || true
 
 # ————————————————————————————————————————————
 # Help
@@ -109,6 +185,7 @@ help:
 	@echo "  all             Build and run tests (default)"
 	@echo "  build           Compile the Tangerine compiler"
 	@echo "  test            Run golden + stdlib + compiler tests"
+	@echo "  test-scripts    Run Python script tests"
 	@echo "  test-all        Run every test suite including conformance"
 	@echo "  test-conformance Run the conformance runner"
 	@echo "  test-frontend   Run frontend milestone tests"
@@ -118,4 +195,6 @@ help:
 	@echo "  coverage        Generate and merge coverage"
 	@echo "  docs            Generate documentation"
 	@echo "  clean           Remove build artifacts"
+	@echo "  install         Install binary to PREFIX/bin (default /usr/local)"
+	@echo "  bench           Run benchmarks"
 	@echo "  help            Show this help"

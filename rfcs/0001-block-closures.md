@@ -90,7 +90,7 @@ end
 
 1. **Brace-style `{ }`**: Rejected as inconsistent with Tangerine's `do...end` block syntax.
 2. **Ruby-style `do |args| body end`**: Rejected as parameter list position is inconsistent with function definitions.
-3. **Arrow syntax `(args) => body`**: Rejected as `=>` was removed from the language (see INC-001).
+3. **Arrow syntax `(args) => body`**: Rejected for closures to keep block and arm syntax uniform in 2026 edition; `=>` remains reserved for other constructs (for example effect-handler clauses in `handle ... with`).
 
 ## Unresolved Questions
 
@@ -100,5 +100,5 @@ None — this RFC codifies existing practice.
 
 - Tangerine grammar: `docs/grammar.md`
 - Style guide: `docs/style_guide.md`
-- INC-001: Match arm syntax unification
-- INC-013: Block syntax unification
+- Match arm syntax unification: `rfcs/0002-match-arm-syntax-unification.md`
+- Block syntax unification

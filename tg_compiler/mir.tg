@@ -9,7 +9,7 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
-use tg_compiler::token::{Span}
+use tg_compiler::token::{Span, span_dummy}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody,
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind
@@ -549,7 +549,7 @@ def lower_program(program: &Program) -> MirProgram
       when Option::None then ()
       end
     when ItemKind::Static(s) then
-      statics.push(lower_static(&s))
+      statics.push(lower_static(&mut b, &s))
     when ItemKind::Struct(s) then
       types.push(lower_struct_def(&s))
     when ItemKind::Enum(e) then
@@ -623,8 +623,18 @@ def resolve_lowering_type(ty_expr: &TypeExpr) -> Type
   match ty_expr.kind
   when TypeExprKind::Named(name, args) then
     if name == "Int" then Type::Int
+    elsif name == "I8" then Type::I8
+    elsif name == "I16" then Type::I16
+    elsif name == "I32" then Type::I32
+    elsif name == "I64" then Type::I64
     elsif name == "UInt" then Type::UInt
+    elsif name == "U8" then Type::U8
+    elsif name == "U16" then Type::U16
+    elsif name == "U32" then Type::U32
+    elsif name == "U64" then Type::U64
     elsif name == "Float" then Type::Float
+    elsif name == "F32" then Type::F32
+    elsif name == "F64" then Type::F64
     elsif name == "Bool" then Type::Bool
     elsif name == "Char" then Type::Char
     elsif name == "String" then Type::String
@@ -664,6 +674,10 @@ def resolve_lowering_type(ty_expr: &TypeExpr) -> Type
     Type::Array(elem_ty, size)
   when TypeExprKind::Slice(elem) then
     Type::Slice(resolve_lowering_type(&elem))
+  when TypeExprKind::Ptr(inner) then
+    Type::Ptr(resolve_lowering_type(&inner))
+  when TypeExprKind::PtrMut(inner) then
+    Type::PtrMut(resolve_lowering_type(&inner))
   when TypeExprKind::Ref(inner) then
     Type::Ref(resolve_lowering_type(&inner), lifetime_anonymous())
   when TypeExprKind::RefMut(inner) then
@@ -674,16 +688,34 @@ def resolve_lowering_type(ty_expr: &TypeExpr) -> Type
       param_types.push(resolve_lowering_type(&p))
     end
     Type::Function(param_types, resolve_lowering_type(&ret))
+  when TypeExprKind::Async(inner) then
+    Type::Named(TypeId { id: 0 }, Vec::from([resolve_lowering_type(&inner)]))
+  when TypeExprKind::Effect(effect_name, inner) then
+    Type::Effect(Vec::from([effect_name]), resolve_lowering_type(&inner))
+  when TypeExprKind::Path(path) then
+    Type::Named(TypeId { id: 0 }, Vec::new())
   when TypeExprKind::Infer then Type::Unit
   when _ then Type::Unit
   end
 end
 
-def lower_static(s: &StaticDecl) -> MirStatic
+def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
+  let resolved_ty = match s.ty
+  when Option::Some(te) then resolve_lowering_type(&te)
+  when Option::None then Type::Unit
+  end
+
+  let init_val = match s.init
+  when Option::Some(expr) then
+    let lowered = lower_expr(b, &expr)
+    Option::Some(lowered)
+  when Option::None then Option::None
+  end
+
   MirStatic {
     name: s.name,
-    ty: Type::Unit,
-    init: Option::None,
+    ty: resolved_ty,
+    init: init_val,
     is_mut: s.is_mut
   }
 end
@@ -696,7 +728,7 @@ def lower_extern_fn(b: &mut MirBuilder, ef: &ExternFn, abi: String) -> MirFuncti
   mut params = Vec::new()
   mut local_id = 0
   for p in ef.params do
-    let ty = resolve_lowering_type(b, &p.ty)
+    let ty = resolve_lowering_type(&p.ty)
     params.push(MirLocal {
       id: LocalId { id: local_id },
       name: p.name.clone(),
@@ -708,7 +740,7 @@ def lower_extern_fn(b: &mut MirBuilder, ef: &ExternFn, abi: String) -> MirFuncti
   end
   
   let ret_type = match ef.ret_type
-  when Option::Some(rt) then resolve_lowering_type(b, &rt)
+  when Option::Some(rt) then resolve_lowering_type(&rt)
   when Option::None then Type::Unit
   end
   
@@ -829,10 +861,15 @@ def lower_enum_def(e: &EnumDecl) -> MirTypeDef
   mut variants = Vec::new()
   mut disc = 0
   for v in e.variants do
+    # Lower variant payload type expressions to Types
+    mut lowered_fields = Vec::new()
+    for field_ty_expr in v.fields do
+      lowered_fields.push(resolve_lowering_type(&field_ty_expr))
+    end
     variants.push(MirVariantDef {
       name: v.name,
       discriminant: disc,
-      fields: Vec::new()
+      fields: lowered_fields
     })
     disc = disc + 1
   end
@@ -886,11 +923,17 @@ end
 
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   match stmt.kind
-  when StmtKind::Let(name, ty_opt, value, is_mut) then
+  when StmtKind::Let(pattern, ty_opt, value, is_mut) then
     let ty = Type::Unit
-    let local_id = add_local(b, name, ty, is_mut, stmt.span)
-    let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
-    push_assign(b, place_local(local_id), rvalue, stmt.span)
+    match pattern.kind
+    when PatternKind::Ident(name, _) then
+      let local_id = add_local(b, name, ty, is_mut, stmt.span)
+      let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
+      push_assign(b, place_local(local_id), rvalue, stmt.span)
+    when _ then
+      # Non-ident patterns: still evaluate initializer for side effects
+      lower_expr(b, &value, stmt.span)
+    end
     
   when StmtKind::Assign(target, value) then
     let place = lower_place(b, &target)
@@ -1090,7 +1133,10 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
   when ExprKind::FieldAccess(recv, field_name) then
     let base_place = lower_place(b, &recv)
     # Resolve field index — use a simple lookup for common types
-    let field_idx = resolve_field_index(field_name)
+    let field_idx = match resolve_field_index(field_name)
+    when Option::Some(idx) then idx
+    when Option::None then panic("MIR lowering: unknown field access: " + field_name.clone())
+    end
     mut new_projections = base_place.projections.clone()
     new_projections.push(Projection::Field(field_name, field_idx))
     let projected = Place {
@@ -1321,51 +1367,49 @@ end
 # Uses receiver type info from the builder to find the correct field position.
 # For well-known built-in types, this returns hardcoded offsets.
 # For user-defined types, we look through the lowered type definitions.
-def resolve_field_index(name: &String) -> Int
+def resolve_field_index(name: &String) -> Option[Int]
   # Well-known struct fields with fixed layout:
   
   # Vec[T]: { ptr: 0, len: 1, cap: 2 }
-  if name == "ptr" then return 0 end
-  if name == "len" || name == "length" then return 1 end
-  if name == "cap" || name == "capacity" then return 2 end
+  if name == "ptr" then return Option::Some(0) end
+  if name == "len" || name == "length" then return Option::Some(1) end
+  if name == "cap" || name == "capacity" then return Option::Some(2) end
   
   # String: { ptr: 0, len: 1, cap: 2 } (same layout as Vec[u8])
   
   # Map[K,V]: { buckets: 0, len: 1, cap: 2, hash_fn: 3= }
-  if name == "buckets" then return 0 end
-  if name == "hash_fn" then return 3 end
+  if name == "buckets" then return Option::Some(0) end
+  if name == "hash_fn" then return Option::Some(3) end
 
   # Set[T]: { map: 0, len: 1 }
-  if name == "map" then return 0 end
+  if name == "map" then return Option::Some(0) end
 
   # Option[T]: { tag: 0, value: 1 }
   # Result[T,E]: { tag: 0, value: 1, error: 2 }
-  if name == "tag" || name == "discriminant" then return 0 end
-  if name == "value" || name == "val" then return 1 end
-  if name == "error" || name == "err" then return 2 end
+  if name == "tag" || name == "discriminant" then return Option::Some(0) end
+  if name == "value" || name == "val" then return Option::Some(1) end
+  if name == "error" || name == "err" then return Option::Some(2) end
   
   # Common struct fields (conventional ordering)
-  if name == "name" then return 0 end
-  if name == "id" then return 0 end
-  if name == "kind" then return 0 end
-  if name == "data" then return 0 end
-  if name == "ty" || name == "type" then return 1 end
-  if name == "span" then return 2 end
-  if name == "is_mut" then return 3 end
+  if name == "name" then return Option::Some(0) end
+  if name == "id" then return Option::Some(0) end
+  if name == "kind" then return Option::Some(0) end
+  if name == "data" then return Option::Some(0) end
+  if name == "ty" || name == "type" then return Option::Some(1) end
+  if name == "span" then return Option::Some(2) end
+  if name == "is_mut" then return Option::Some(3) end
   
   # File: { fd: 0, path: 1, is_open: 2 }
-  if name == "fd" then return 0 end
-  if name == "path" then return 1 end
-  if name == "is_open" then return 2 end
+  if name == "fd" then return Option::Some(0) end
+  if name == "path" then return Option::Some(1) end
+  if name == "is_open" then return Option::Some(2) end
   
   # RubyValue / Ptr: { raw/address: 0 }
-  if name == "raw" then return 0 end
-  if name == "address" then return 0 end
+  if name == "raw" then return Option::Some(0) end
+  if name == "address" then return Option::Some(0) end
   
-  # Unknown field: return -1 to indicate error
-  # The type checker should have resolved this before MIR lowering
-  # Caller must handle -1 by emitting an error
-  -1
+  # Unknown field: return None so caller cannot treat it as a valid offset.
+  Option::None
 end
 
 # Helper: convert a Path to a String (dot-separated components)
@@ -1479,7 +1523,7 @@ end
 
 def collect_free_vars_stmt(stmt: &Stmt, free: &mut Set[String], bound: &Set[String]) -> Unit
   match stmt.kind
-  when StmtKind::Let(name, _, value, _) then
+  when StmtKind::Let(_, _, value, _) then
     collect_free_vars(&value, free, bound)
   when StmtKind::Expr(expr) then
     collect_free_vars(&expr, free, bound)
@@ -2182,21 +2226,40 @@ def format_mir_type(ty: &Type) -> String
   when Type::Unit then "Unit"
   when Type::Bool then "Bool"
   when Type::Int then "Int"
+  when Type::UInt then "UInt"
   when Type::Float then "Float"
   when Type::Char then "Char"
   when Type::String then "String"
+  when Type::I8 then "I8"
+  when Type::I16 then "I16"
+  when Type::I32 then "I32"
+  when Type::I64 then "I64"
+  when Type::U8 then "U8"
+  when Type::U16 then "U16"
+  when Type::U32 then "U32"
+  when Type::U64 then "U64"
+  when Type::F32 then "F32"
+  when Type::F64 then "F64"
   when Type::Never then "!"
+  when Type::Error then "<error>"
+  when Type::Var(v) then "_T" + v.id.to_string()
   when Type::Param(name) then name.clone()
+  when Type::Owned(inner) then "Owned[" + format_mir_type(inner) + "]"
+  when Type::Ptr(inner) then "*" + format_mir_type(inner)
+  when Type::PtrMut(inner) then "*mut " + format_mir_type(inner)
+  when Type::Box(inner) then "Box[" + format_mir_type(inner) + "]"
+  when Type::Rc(inner) then "Rc[" + format_mir_type(inner) + "]"
+  when Type::Dyn(id) then "dyn T" + id.id.to_string()
+  when Type::Effect(effects, inner) then
+    "effect[" + effects.join(",") + "] " + format_mir_type(inner)
   when Type::Option(inner) then "Option[" + format_mir_type(inner) + "]"
   when Type::Result(ok, err) then "Result[" + format_mir_type(ok) + ", " + format_mir_type(err) + "]"
-  when Type::Vec(inner) then "Vec[" + format_mir_type(inner) + "]"
   when Type::Map(k, v) then "Map[" + format_mir_type(k) + ", " + format_mir_type(v) + "]"
   when Type::Set(inner) then "Set[" + format_mir_type(inner) + "]"
   when Type::Slice(inner) then "[" + format_mir_type(inner) + "]"
   when Type::Array(inner, n) then "[" + format_mir_type(inner) + "; " + n.to_string() + "]"
   when Type::Ref(inner, _) then "&" + format_mir_type(inner)
   when Type::RefMut(inner, _) then "&mut " + format_mir_type(inner)
-  when Type::RawPtr(inner) then "*" + format_mir_type(inner)
   when Type::Tuple(elems) then
     mut out = "("
     mut first = true
@@ -2228,7 +2291,6 @@ def format_mir_type(ty: &Type) -> String
       out = out + "]"
     end
     out
-  when _ then "<unknown>"
   end
 end
 
@@ -2323,8 +2385,16 @@ def build_call_graph(program: &MirProgram) -> CallGraph
     mut callees = Set::new()
     for block in f.blocks do
       match block.terminator.kind
-      when MirTerminatorKind::Call(ref callee, _, _, _) then
-        callees.insert(callee.clone())
+      when MirTerminatorKind::Call(_, ref func_op, _, _, _) then
+        match func_op.kind
+        when MirOperandKind::Constant(c) then
+          match c.kind
+          when MirConstantKind::FnItem(callee) then
+            callees.insert(callee.clone())
+          when _ then ()
+          end
+        when _ then ()
+        end
       when _ then ()
       end
     end
@@ -2402,13 +2472,24 @@ def inline_calls_in_function(caller: &mut MirFunction, func_map: &Map[String, &M
   
   for block in caller.blocks do
     match block.terminator.kind
-    when MirTerminatorKind::Call(ref callee_name, ref args, ref dest, ref next_block) then
-      if inlinable.contains(callee_name.clone()) then
-        match func_map.get(callee_name.clone())
+    when MirTerminatorKind::Call(ref dest, ref func_op, ref args, ref success_block, ref unwind_block) then
+      let maybe_callee_name = match func_op.kind
+      when MirOperandKind::Constant(c) then
+        match c.kind
+        when MirConstantKind::FnItem(name) then Option::Some(name.clone())
+        when _ then Option::None
+        end
+      when _ then Option::None
+      end
+
+      match maybe_callee_name
+      when Option::Some(callee_name) then
+        if inlinable.contains(callee_name.clone()) then
+          match func_map.get(callee_name.clone())
         when Option::Some(callee) then
           # Inline this call
           let (inlined_blocks, local_mapping, entry_block) = prepare_inline_body(
-            callee, &mut next_local_id, &mut next_block_id, args, dest, next_block
+            callee, &mut next_local_id, &mut next_block_id, args, dest, Option::Some(*success_block)
           )
           
           # Add inlined locals to caller
@@ -2446,7 +2527,10 @@ def inline_calls_in_function(caller: &mut MirFunction, func_map: &Map[String, &M
         when Option::None then
           new_blocks.push(block.clone())
         end
-      else
+        else
+          new_blocks.push(block.clone())
+        end
+      when Option::None then
         new_blocks.push(block.clone())
       end
     when _ then
@@ -2581,15 +2665,15 @@ def remap_rvalue(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
     MirRvalue { kind: MirRvalueKind::Ref(remap_place(&place, local_map)) }
   when MirRvalueKind::RefMut(place) then
     MirRvalue { kind: MirRvalueKind::RefMut(remap_place(&place, local_map)) }
-  when MirRvalueKind::Aggregate(fields) then
+  when MirRvalueKind::Aggregate(kind, fields) then
     let remapped = fields.iter().map(|f| remap_operand(&f, local_map)).collect()
-    MirRvalue { kind: MirRvalueKind::Aggregate(remapped) }
+    MirRvalue { kind: MirRvalueKind::Aggregate(kind.clone(), remapped) }
   when MirRvalueKind::Discriminant(place) then
     MirRvalue { kind: MirRvalueKind::Discriminant(remap_place(&place, local_map)) }
   when MirRvalueKind::Len(place) then
     MirRvalue { kind: MirRvalueKind::Len(remap_place(&place, local_map)) }
-  when MirRvalueKind::Cast(op, ty) then
-    MirRvalue { kind: MirRvalueKind::Cast(remap_operand(&op, local_map), ty.clone()) }
+  when MirRvalueKind::Cast(kind, op, ty) then
+    MirRvalue { kind: MirRvalueKind::Cast(kind.clone(), remap_operand(&op, local_map), ty.clone()) }
   when MirRvalueKind::Repeat(op, count) then
     MirRvalue { kind: MirRvalueKind::Repeat(remap_operand(&op, local_map), count) }
   when MirRvalueKind::Phi(args) then
@@ -2636,6 +2720,63 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
       kind: MirTerminatorKind::SwitchInt(remap_operand(&op, local_map), new_targets, BlockId { id: new_fb }),
       span: term.span.clone()
     }
+  when MirTerminatorKind::Call(dest_place, func_op, args, succ, unwind) then
+    mut remapped_args: Vec[MirOperand] = Vec::new()
+    for arg in args do
+      remapped_args.push(remap_operand(&arg, local_map))
+    end
+    let new_succ = block_map.get(succ.id).unwrap_or(succ.id)
+    let new_unwind = match unwind
+    when Option::Some(block_id) then
+      let mapped = block_map.get(block_id.id).unwrap_or(block_id.id)
+      Option::Some(BlockId { id: mapped })
+    when Option::None then Option::None
+    end
+    MirTerminator {
+      kind: MirTerminatorKind::Call(
+        remap_place(&dest_place, local_map),
+        remap_operand(&func_op, local_map),
+        remapped_args,
+        BlockId { id: new_succ },
+        new_unwind
+      ),
+      span: term.span.clone()
+    }
+  when MirTerminatorKind::Drop(place, target, unwind) then
+    let new_target = block_map.get(target.id).unwrap_or(target.id)
+    let new_unwind = match unwind
+    when Option::Some(block_id) then
+      let mapped = block_map.get(block_id.id).unwrap_or(block_id.id)
+      Option::Some(BlockId { id: mapped })
+    when Option::None then Option::None
+    end
+    MirTerminator {
+      kind: MirTerminatorKind::Drop(remap_place(&place, local_map), BlockId { id: new_target }, new_unwind),
+      span: term.span.clone()
+    }
+  when MirTerminatorKind::Assert(cond, expected, msg, target, unwind) then
+    let remapped_msg = match msg
+    when AssertMessage::BoundsCheck(index, length) then
+      AssertMessage::BoundsCheck(remap_operand(&index, local_map), remap_operand(&length, local_map))
+    when AssertMessage::Overflow(binop) then AssertMessage::Overflow(binop)
+    end
+    let new_target = block_map.get(target.id).unwrap_or(target.id)
+    let new_unwind = match unwind
+    when Option::Some(block_id) then
+      let mapped = block_map.get(block_id.id).unwrap_or(block_id.id)
+      Option::Some(BlockId { id: mapped })
+    when Option::None then Option::None
+    end
+    MirTerminator {
+      kind: MirTerminatorKind::Assert(remap_operand(&cond, local_map), expected, remapped_msg, BlockId { id: new_target }, new_unwind),
+      span: term.span.clone()
+    }
+  when MirTerminatorKind::Yield(value, resume) then
+    let new_resume = block_map.get(resume.id).unwrap_or(resume.id)
+    MirTerminator {
+      kind: MirTerminatorKind::Yield(remap_operand(&value, local_map), BlockId { id: new_resume }),
+      span: term.span.clone()
+    }
   when _ then term.clone()
   end
 end
@@ -2668,6 +2809,8 @@ def optimize_function(f: &mut MirFunction, opt_level: Int) -> Unit
   # Final dead code elimination after all other passes
   eliminate_dead_code(f)
 end
+
+def MAX_COPY_PROPAGATION_ITERATIONS() -> Int = 100
 
 def eliminate_dead_code(f: &mut MirFunction) -> Unit
   # Mark reachable blocks from entry
@@ -2734,7 +2877,7 @@ def propagate_copies(f: &mut MirFunction) -> Unit
   # Resolve transitively: if a -> b -> c, then a -> c
   mut changed = true
   mut iterations = 0
-  while changed && iterations < 100 do
+  while changed && iterations < MAX_COPY_PROPAGATION_ITERATIONS() do
     changed = false
     iterations = iterations + 1
     for (id, target) in copy_map do
@@ -2747,6 +2890,10 @@ def propagate_copies(f: &mut MirFunction) -> Unit
       when Option::None then ()
       end
     end
+  end
+
+  if changed then
+    eprintln("MIR copy propagation reached iteration cap (" + MAX_COPY_PROPAGATION_ITERATIONS().to_string() + "); propagation may be incomplete")
   end
   
   # Apply substitution to all operands
@@ -3079,7 +3226,18 @@ def eliminate_bounds_checks(f: &mut MirFunction) -> Unit
     
     for stmt in block.statements do
       match stmt.kind
-      when MirStatementKind::Nop then
+      when MirStatementKind::Assign(place, rvalue) then
+        if place.projections.is_empty() then
+          match extract_int_constant_from_rvalue(&rvalue)
+          when Option::Some(val) then
+            ranges.insert(place.local.id, ValueRange {
+              min: Option::Some(val),
+              max: Option::Some(val)
+            })
+          when Option::None then
+            ranges.remove(place.local.id)
+          end
+        end
         new_stmts.push(stmt.clone())
       when _ then
         new_stmts.push(stmt.clone())
@@ -3372,6 +3530,7 @@ def global_value_numbering(f: &mut MirFunction) -> Unit
   # Map: LocalId.id -> canonical value number (string)
   mut local_vn: Map[Int, String] = Map::new()
   mut vn_counter = 0
+  mut unique_counter = 0
   
   # Assign initial value numbers to parameters (each is unique)
   for p in f.params do
@@ -3388,7 +3547,11 @@ def global_value_numbering(f: &mut MirFunction) -> Unit
       when MirStatementKind::Assign(place, rvalue) then
         if place.projections.is_empty() then
           # Compute the value number key for this rvalue
-          let rv_key = rvalue_to_vn_key(&rvalue, &local_vn)
+          let mut rv_key = rvalue_to_vn_key(&rvalue, &local_vn)
+          if rv_key == "__unique__" then
+            rv_key = "__unique__" + unique_counter.to_string()
+            unique_counter = unique_counter + 1
+          end
           
           match value_table.get(rv_key.clone())
           when Option::Some(existing_local) then
@@ -3459,8 +3622,8 @@ def rvalue_to_vn_key(rv: &MirRvalue, local_vn: &Map[Int, String]) -> String
   when MirRvalueKind::Cast(kind, op, ty) then
     "cast(" + operand_to_vn(&op, local_vn) + ")"
   when _ then
-    # Aggregates, refs, etc. — assign unique key (don't deduplicate)
-    "unique_" + local_vn.len().to_string()
+    # Aggregates, refs, etc. — caller must stamp this with a monotonic id.
+    "__unique__"
   end
 end
 
@@ -3531,6 +3694,21 @@ def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
   # We need to distinguish between "on stack" (current path) and "fully processed".
   
   mut loops = Vec::new()
+
+  mut predecessors: Map[Int, Vec[BlockId]] = Map::new()
+  for block in f.blocks do
+    predecessors.insert(block.id.id, Vec::new())
+  end
+  for block in f.blocks do
+    for succ in terminator_successors(&block.terminator) do
+      match predecessors.get_mut(succ.id)
+      when Option::Some(preds) then
+        preds.push(block.id)
+      when Option::None then
+        predecessors.insert(succ.id, Vec::from([block.id]))
+      end
+    end
+  end
   
   # Use two sets: visited (all seen nodes) and on_stack (current DFS path)
   mut visited = Set::new()
@@ -3563,7 +3741,7 @@ def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
               if on_stack.contains(succ.id) then
                 # Back edge: edge to an ancestor on current path
                 back_edges.push((block_id, succ))
-              else if !visited.contains(succ.id) then
+              elsif !visited.contains(succ.id) then
                 # Tree edge: visit successor
                 stack.push((succ, true))
               end
@@ -3595,14 +3773,15 @@ def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
       while !worklist.is_empty() do
         match worklist.pop()
         when Option::Some(n) then
-          # Add predecessors
-          for block in f.blocks do
-            for succ in terminator_successors(&block.terminator) do
-              if succ.id == n.id && !loop_blocks.contains(block.id.id) then
-                loop_blocks.insert(block.id.id)
-                worklist.push(block.id)
+          match predecessors.get(n.id)
+          when Option::Some(preds) then
+            for pred in preds do
+              if !loop_blocks.contains(pred.id) then
+                loop_blocks.insert(pred.id)
+                worklist.push(pred)
               end
             end
+          when Option::None then ()
           end
         when Option::None then ()
         end
@@ -3655,38 +3834,80 @@ def hoist_loop_invariants(f: &mut MirFunction, loop_info: &NaturalLoop) -> Unit
   # If we found invariant statements, insert them into a preheader block
   # The preheader executes once before the loop, not on every iteration
   if !invariant_stmts.is_empty() then
-    # Find or create preheader: a unique predecessor of the header from outside the loop
-    match get_block_mut(f, loop_info.header)
-    when Option::Some(header_block) then
-      # Find the predecessor that's not in the loop (the preheader)
-      mut preheader_id: Option[BlockId] = Option::None
-      for pred_id in header_block.predecessors do
-        if !loop_info.blocks.contains(pred_id.id) then
-          preheader_id = Option::Some(pred_id.clone())
+    mut outside_preds: Vec[BlockId] = Vec::new()
+    for pred_block in f.blocks do
+      if loop_info.blocks.contains(pred_block.id.id) then
+        continue
+      end
+      for succ in terminator_successors(&pred_block.terminator) do
+        if succ.id == loop_info.header.id then
+          outside_preds.push(pred_block.id.clone())
+          break
         end
       end
-      
-      match preheader_id
-      when Option::Some(ph_id) then
-        # Insert invariant statements at the END of the preheader (before its terminator)
-        match get_block_mut(f, ph_id)
-        when Option::Some(preheader_block) then
-          for inv_stmt in invariant_stmts do
-            preheader_block.statements.push(inv_stmt)
-          end
+    end
+
+    let preheader_id = if outside_preds.len() == 1 then
+      outside_preds[0].clone()
+    else
+      let ph_id = BlockId { id: f.blocks.len() as Int }
+      let ph_span = match get_block(f, loop_info.header)
+      when Option::Some(header_block) then header_block.terminator.span
+      when Option::None then span_dummy()
+      end
+
+      f.blocks.push(MirBlock {
+        id: ph_id.clone(),
+        statements: Vec::new(),
+        terminator: MirTerminator {
+          kind: MirTerminatorKind::Goto(loop_info.header),
+          span: ph_span
+        }
+      })
+
+      for pred_id in outside_preds do
+        match get_block_mut(f, pred_id)
+        when Option::Some(pred_block) then
+          redirect_terminator_edge(&mut pred_block.terminator, loop_info.header.id, ph_id.id)
         when Option::None then ()
         end
-      when Option::None then
-        # No preheader exists (multiple entry points or entry is the header itself)
-        # Fall back to header (imperfect but better than nothing)
-        mut hoisted = invariant_stmts.clone()
-        for s in header_block.statements do
-          hoisted.push(s)
-        end
-        header_block.statements = hoisted
+      end
+
+      if f.entry_block.id == loop_info.header.id then
+        f.entry_block = ph_id.clone()
+      end
+
+      ph_id
+    end
+
+    match get_block_mut(f, preheader_id)
+    when Option::Some(preheader_block) then
+      for inv_stmt in invariant_stmts do
+        preheader_block.statements.push(inv_stmt)
       end
     when Option::None then ()
     end
+  end
+end
+
+def redirect_terminator_edge(term: &mut MirTerminator, from_id: Int, to_id: Int) -> Unit
+  match term.kind.clone()
+  when MirTerminatorKind::Goto(target) then
+    if target.id == from_id then
+      term.kind = MirTerminatorKind::Goto(BlockId { id: to_id })
+    end
+  when MirTerminatorKind::SwitchInt(discriminant, targets, fallback) then
+    mut new_targets = Vec::new()
+    for t in targets do
+      if t.target.id == from_id then
+        new_targets.push(SwitchTarget { value: t.value, target: BlockId { id: to_id } })
+      else
+        new_targets.push(t)
+      end
+    end
+    let new_fallback = if fallback.id == from_id then BlockId { id: to_id } else fallback end
+    term.kind = MirTerminatorKind::SwitchInt(discriminant, new_targets, new_fallback)
+  when _ then ()
   end
 end
 
@@ -4032,9 +4253,45 @@ def operand_escape_state(op: &MirOperand, states: &Map[Int, EscapeState]) -> Esc
   end
 end
 
+def local_stack_promotion_size_bytes(f: &MirFunction, local_id: Int) -> Int
+  for local in f.locals do
+    if local.id.id == local_id then
+      return estimated_type_size_bytes(&local.ty)
+    end
+  end
+  8192
+end
+
+def estimated_type_size_bytes(ty: &Type) -> Int
+  match ty
+  when Type::Unit then 0
+  when Type::Bool then 1
+  when Type::Char then 4
+  when Type::Int then 8
+  when Type::Float then 8
+  when Type::String then 24
+  when Type::Ref(_, _) then 8
+  when Type::RefMut(_, _) then 8
+  when Type::Owned(_) then 8
+  when Type::Slice(_) then 16
+  when Type::Function(_, _) then 8
+  when Type::Named(_, _) then 8
+  when Type::Tuple(fields) then
+    mut total = 0
+    for field_ty in fields do
+      total = total + estimated_type_size_bytes(field_ty)
+    end
+    total
+  when Type::Array(elem_ty, count) then
+    estimated_type_size_bytes(elem_ty) * count
+  when _ then 8192
+  end
+end
+
 def promote_heap_to_stack(f: &mut MirFunction, non_escaping: &Set[Int]) -> Unit
   # Rewrite heap allocation calls (Box::new, alloc::allocate) to stack alloca
   # when the destination local does not escape.
+  let MAX_STACK_PROMOTION_BYTES = 4096
   for block in f.blocks do
     match block.terminator.kind
     when MirTerminatorKind::Call(dest, callee, args, succ, unwind) then
@@ -4050,7 +4307,8 @@ def promote_heap_to_stack(f: &mut MirFunction, non_escaping: &Set[Int]) -> Unit
       when _ then false
       end
 
-      if is_alloc && non_escaping.contains(&dest.local.id) then
+      let estimated_size = local_stack_promotion_size_bytes(f, dest.local.id)
+      if is_alloc && non_escaping.contains(&dest.local.id) && estimated_size <= MAX_STACK_PROMOTION_BYTES then
         # Replace the call with a stack allocation:
         # Instead of: _X = Box::new(val) -> bb_succ
         # Produce:    _X = StackAlloc(val) as a statement; goto bb_succ
@@ -4115,7 +4373,7 @@ def parse_pgo_profile(content: &String) -> PgoProfile
   mut profile = PgoProfile { block_counts: Map::new() }
   for line in content.lines() do
     let trimmed = line.trim()
-    if trimmed.is_empty() || trimmed.starts_with("#") then continue end
+    if trimmed.is_empty() || trimmed.starts_with("#") then next end
     # Format: func_name TAB block_id TAB count
     let parts = trimmed.split("\t")
     if parts.len() >= 3 then
@@ -4154,12 +4412,18 @@ def instrument_for_pgo(program: &mut MirProgram) -> Unit
   
   mut counter_id = 0
   for func in program.functions do
-    if func.is_extern then continue end
+    if func.is_extern then next end
     
     for block in func.blocks do
       # Prepend: __pgo_counters[counter_id] += 1
+      let increment = MirOperand {
+        kind: MirOperandKind::Constant(MirConstant {
+          kind: MirConstantKind::Int(1),
+          ty: Type::Int
+        })
+      }
       let counter_stmt = MirStatement {
-        kind: MirStatementKind::BudgetConsume("__pgo_counter_" + counter_id.to_string(), 1),
+        kind: MirStatementKind::EffectRecord("__pgo_counter_" + counter_id.to_string(), increment),
         span: span_dummy()  # Use the correct Span from token.tg
       }
       # Insert at position 0
@@ -4213,8 +4477,11 @@ def apply_pgo_to_function(f: &mut MirFunction, counts: &Vec[PgoBlockCount]) -> U
     block_order.push((block.id.id, count))
   end
 
-  # Simple loop unrolling for hot loops: if a back-edge block has count > 1000
-  # and the loop body is small (< 20 stmts), duplicate the body once
+  # Loop unrolling for hot loops
+  # If a back-edge block has count > 1000 and the loop body is small
+  # (< 20 stmts), duplicate the body once
+  mut loops_to_unroll: Vec[(Int, Int)] = Vec::new()  # (header_id, back_edge_block)
+  
   for block in f.blocks do
     let block_count = match count_map.get(&block.id.id)
     when Option::Some(c) then c
@@ -4227,15 +4494,107 @@ def apply_pgo_to_function(f: &mut MirFunction, counts: &Vec[PgoBlockCount]) -> U
         # Check for back-edges (target block id < current block id → likely a loop)
         for t in targets do
           if t.target.id < block.id.id then
-            # This is a hot back-edge — the loop is hot
-            # Mark for the inliner to be more aggressive with callees in this loop
-            # (We don't physically unroll here since block duplication requires
-            #  fresh block/local IDs, which is handled by the inliner.)
-            ()
+            # This is a hot back-edge — record for unrolling
+            let header_id = t.target.id
+            # Check if loop body is small (blocks between header and back-edge)
+            let body_size = block.id.id - header_id + 1
+            if body_size <= 10 then
+              loops_to_unroll.push((header_id, block.id.id))
+            end
+          end
+        end
+      when MirTerminatorKind::Goto(target) then
+        # Unconditional back-edge
+        if target.id < block.id.id then
+          let header_id = target.id
+          let body_size = block.id.id - header_id + 1
+          if body_size <= 10 then
+            loops_to_unroll.push((header_id, block.id.id))
           end
         end
       when _ then ()
       end
+    end
+  end
+  
+  # Perform loop unrolling by duplicating blocks
+  for (header_id, back_edge_id) in loops_to_unroll do
+    let next_block_id = f.blocks.len() as Int
+    
+    # Clone the loop body blocks (from header to back-edge, inclusive)
+    mut cloned_blocks: Vec[MirBlock] = Vec::new()
+    let mut id_offset = next_block_id - header_id
+    
+    for block in f.blocks do
+      if block.id.id >= header_id && block.id.id <= back_edge_id then
+        # Clone this block with new ID
+        let mut new_block = block.clone()
+        new_block.id = BlockId { id: block.id.id + id_offset }
+        
+        # Update terminator targets
+        match new_block.terminator.kind.clone()
+        when MirTerminatorKind::Goto(target) then
+          new_block.terminator.kind = MirTerminatorKind::Goto(BlockId { id: target.id + id_offset })
+        when MirTerminatorKind::SwitchInt(discriminant, targets, fallback) then
+          mut remapped_targets = Vec::new()
+          for t in targets do
+            remapped_targets.push(SwitchTarget { value: t.value, target: BlockId { id: t.target.id + id_offset } })
+          end
+          new_block.terminator.kind = MirTerminatorKind::SwitchInt(discriminant, remapped_targets, fallback)
+        when _ then ()
+        end
+        
+        cloned_blocks.push(new_block)
+      end
+    end
+    
+    # Wire the original back-edge to the cloned header
+    for block in f.blocks do
+      if block.id.id == back_edge_id then
+        match block.terminator.kind.clone()
+        when MirTerminatorKind::Goto(target) then
+          if target.id == header_id then
+            block.terminator.kind = MirTerminatorKind::Goto(BlockId { id: header_id + id_offset })
+          end
+        when MirTerminatorKind::SwitchInt(discriminant, targets, fallback) then
+          mut remapped_targets = Vec::new()
+          for t in targets do
+            if t.target.id == header_id then
+              remapped_targets.push(SwitchTarget { value: t.value, target: BlockId { id: header_id + id_offset } })
+            else
+              remapped_targets.push(t)
+            end
+          end
+          block.terminator.kind = MirTerminatorKind::SwitchInt(discriminant, remapped_targets, fallback)
+        when _ then ()
+        end
+        break
+      end
+    end
+    
+    # Add cloned blocks to function
+    for cblock in cloned_blocks do
+      f.blocks.push(cblock)
+    end
+  end
+end
+
+def read_pgo_profile(path: &String) -> Result[PgoProfile, String]
+  match load_pgo_profile(path)
+  when Option::Some(profile) then
+    Result::Ok(profile)
+  when Option::None then
+    Result::Err("could not read or parse profile at " + path.clone())
+  end
+end
+
+def apply_pgo_profile(program: &mut MirProgram, profile: &PgoProfile) -> Unit
+  for func in program.functions do
+    let func_name = func.name.clone()
+    match profile.block_counts.get(&func_name)
+    when Option::Some(counts) then
+      apply_pgo_to_function(func, counts)
+    when Option::None then ()
     end
   end
 end
@@ -4451,19 +4810,96 @@ def find_cross_yield_locals(func: &MirFunction, yield_points: &Vec[BlockId]) -> 
   # Find locals that are defined before a yield and used after a yield.
   # These need to be stored in the coroutine state struct.
   mut cross = Set::new()
+  if yield_points.is_empty() then
+    return cross
+  end
+
+  # Build CFG successor and predecessor maps
+  mut succs: Map[Int, Vec[Int]] = Map::new()
+  mut preds: Map[Int, Vec[Int]] = Map::new()
+  for block in func.blocks do
+    succs.insert(block.id.id, Vec::new())
+    preds.insert(block.id.id, Vec::new())
+  end
+  for block in func.blocks do
+    for succ in terminator_successors(&block.terminator) do
+      match succs.get(block.id.id)
+      when Option::Some(list) then list.push(succ.id)
+      when Option::None then ()
+      end
+      match preds.get(succ.id)
+      when Option::Some(list) then list.push(block.id.id)
+      when Option::None then ()
+      end
+    end
+  end
+
+  # Mark blocks that can reach any yield block (defs before yield candidates)
+  mut can_reach_yield: Set[Int] = Set::new()
+  mut reverse_worklist: Vec[Int] = Vec::new()
+  for yp in yield_points do
+    can_reach_yield.insert(yp.id)
+    reverse_worklist.push(yp.id)
+  end
+  while !reverse_worklist.is_empty() do
+    match reverse_worklist.pop()
+    when Option::Some(current) then
+      match preds.get(current)
+      when Option::Some(ps) then
+        for p in ps do
+          if !can_reach_yield.contains(p) then
+            can_reach_yield.insert(p)
+            reverse_worklist.push(*p)
+          end
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+
+  # Mark blocks reachable from any yield resume target (uses after yield)
+  mut after_yield_blocks: Set[Int] = Set::new()
+  mut forward_worklist: Vec[Int] = Vec::new()
+  for block in func.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::Yield(_, resume) then
+      if !after_yield_blocks.contains(resume.id) then
+        after_yield_blocks.insert(resume.id)
+        forward_worklist.push(resume.id)
+      end
+    when _ then ()
+    end
+  end
+  while !forward_worklist.is_empty() do
+    match forward_worklist.pop()
+    when Option::Some(current) then
+      match succs.get(current)
+      when Option::Some(ss) then
+        for s in ss do
+          if !after_yield_blocks.contains(s) then
+            after_yield_blocks.insert(*s)
+            forward_worklist.push(*s)
+          end
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
   
-  # Build def/use sets for each block
+  # Build def/use sets using CFG-aware before/after-yield block sets
   mut defs_before_yield: Set[Int] = Set::new()
   mut uses_after_yield: Set[Int] = Set::new()
-  mut past_yield = false
   
   for block in func.blocks do
-    let is_yield = yield_points.iter().any(|yp| yp.id == block.id.id)
+    let defs_matter = can_reach_yield.contains(block.id.id)
+    let uses_matter = after_yield_blocks.contains(block.id.id)
     
     for stmt in block.statements do
       match stmt.kind
       when MirStatementKind::Assign(place, rvalue) then
-        if !past_yield then
+        if defs_matter then
           defs_before_yield.insert(place.local.id)
         end
         # Track uses in the rvalue
@@ -4471,19 +4907,56 @@ def find_cross_yield_locals(func: &MirFunction, yield_points: &Vec[BlockId]) -> 
         when MirRvalueKind::Use(op) then
           match op.kind
           when MirOperandKind::Copy(p) then
-            if past_yield then uses_after_yield.insert(p.local.id) end
+            if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::Move(p) then
-            if past_yield then uses_after_yield.insert(p.local.id) end
+            if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
+          end
+        when MirRvalueKind::BinOp(_, lhs, rhs) then
+          match lhs.kind
+          when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when _ then ()
+          end
+          match rhs.kind
+          when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when _ then ()
+          end
+        when MirRvalueKind::UnOp(_, op) then
+          match op.kind
+          when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when _ then ()
+          end
+        when MirRvalueKind::Cast(_, op, _) then
+          match op.kind
+          when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when _ then ()
+          end
+        when MirRvalueKind::Repeat(op, _) then
+          match op.kind
+          when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when _ then ()
+          end
+        when MirRvalueKind::Ref(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+        when MirRvalueKind::RefMut(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+        when MirRvalueKind::Len(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+        when MirRvalueKind::Discriminant(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+        when MirRvalueKind::Aggregate(_, ops) then
+          for op in ops do
+            match op.kind
+            when MirOperandKind::Copy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+            when MirOperandKind::Move(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+            when _ then ()
+            end
           end
         when _ then ()
         end
       when _ then ()
       end
-    end
-    
-    if is_yield then
-      past_yield = true
     end
   end
   
@@ -4808,7 +5281,7 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
             place_local(LocalId { id: local_id }),
             phi_rvalue
           ),
-          span: block.statements.get(0).map(|s| s.span.clone()).unwrap_or(Span::dummy())
+          span: block.statements.get(0).map(|s| s.span.clone()).unwrap_or(span_dummy())
         })
       end
       # Prepend phis to existing statements
@@ -4946,14 +5419,26 @@ def rename_operand(op: &mut MirOperand, version_stack: &Map[Int, Vec[Int]]) -> U
 end
 
 def rename_place(place: &mut Place, version_stack: &Map[Int, Vec[Int]]) -> Unit
-  # Get current version from stack (conceptual - actual renaming tracked in analysis)
-  match version_stack.get(place.local.id)
+  # Proper SSA renaming
+  # Update the place's local to use the current version from the stack
+  # Version is encoded as: (original_id * SSA_VERSION_BASE) + version
+  # Use a large base to avoid collisions once local IDs exceed 10K.
+  let SSA_VERSION_BASE = 1000000000
+  let current_id = place.local.id
+  let orig_id = if current_id >= SSA_VERSION_BASE then
+    current_id / SSA_VERSION_BASE
+  else
+    current_id
+  end
+  match version_stack.get(&orig_id)
   when Option::Some(stack) then
     if !stack.is_empty() then
-      # Version is available - SSA semantics maintained
-      ()
+      let current_version = stack[stack.len() - 1]
+      place.local.id = orig_id * SSA_VERSION_BASE + current_version
     end
-  when Option::None then ()
+  when Option::None then
+    # No version stack for this local - keep original id unversioned.
+    place.local.id = orig_id
   end
 end
 
@@ -5058,22 +5543,21 @@ end
 def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   
-  # 1. Entry block must exist
-  let entry_exists = block_exists(func, func.entry_block)
-  if !entry_exists then
-    errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
-  end
-  
   # 2. Must have at least one block
   if func.blocks.is_empty() then
     errors.push(fn_ctx.clone() + ": function has no blocks")
     return
   end
   
-  # Collect valid block IDs and local IDs
+  # Collect valid block IDs and local IDs (build set FIRST for O(1) lookups)
   mut valid_blocks = Set::new()
   for block in func.blocks do
     valid_blocks.insert(block.id.id)
+  end
+  
+  # 1. Entry block must exist (using O(1) set lookup)
+  if !valid_blocks.contains(&func.entry_block.id) then
+    errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
   end
   
   mut valid_locals = Set::new()
@@ -5104,7 +5588,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   
   while !worklist.is_empty() do
     let bid = worklist.pop().unwrap()
-    if reachable.contains(&bid) then continue end
+    if reachable.contains(&bid) then next end
     reachable.insert(bid)
     
     # Find successors
@@ -5134,7 +5618,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   end
   
   for block in func.blocks do
-    if !reachable.contains(&block.id.id) then continue end
+    if !reachable.contains(&block.id.id) then next end
     for stmt in block.statements do
       match stmt.kind
       when MirStatementKind::Assign(place, _) then
@@ -5197,16 +5681,16 @@ end
 
 def verify_operand(operand: &MirOperand, valid_locals: &Set[Int],
                    ctx: &String, errors: &mut Vec[String]) -> Unit
-  match operand
-  when MirOperand::Copy(place) then
+  match operand.kind
+  when MirOperandKind::Copy(place) then
     if !valid_locals.contains(&place.local.id) then
       errors.push(ctx.clone() + ": copy of undefined local _" + place.local.id.to_string())
     end
-  when MirOperand::Move(place) then
+  when MirOperandKind::Move(place) then
     if !valid_locals.contains(&place.local.id) then
       errors.push(ctx.clone() + ": move of undefined local _" + place.local.id.to_string())
     end
-  when MirOperand::Constant(_) then ()
+  when MirOperandKind::Constant(_) then ()
   end
 end
 
@@ -5279,7 +5763,9 @@ end
 
 def block_exists(func: &MirFunction, id: BlockId) -> Bool
   for block in func.blocks do
-    if block.id.id == id.id then return true end
+    if block.id.id == id.id then
+      return true
+    end
   end
   false
 end

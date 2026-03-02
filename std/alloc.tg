@@ -285,6 +285,15 @@ end
 def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
   # Ensure block size is at least pointer size
   let actual_block_size = if block_size < 8 then 8 else block_size end
+  if block_count == 0 then
+    return PoolAllocator {
+      buffer: Ptr::null(),
+      block_size: actual_block_size,
+      block_count: 0,
+      free_list: Ptr::null(),
+      backing: system_allocator()
+    }
+  end
   let total_size = actual_block_size * block_count
   
   let backing = system_allocator()
@@ -362,6 +371,7 @@ extern "C" do
   # Returns 1 if exchange succeeded (old value was expected)
   def __sync_bool_compare_and_swap_1(ptr: Ptr[u8], expected: u8, desired: u8) -> Bool
   def __sync_synchronize() -> Unit
+  def sched_yield() -> Int
 end
 
 # Spinlock for global allocator - prevents data races on GLOBAL_ALLOCATOR
@@ -369,8 +379,15 @@ mut GLOBAL_ALLOCATOR_LOCK: u8 = 0
 
 def global_allocator_lock() -> Unit
   # Spin until we acquire the lock (compare-and-swap 0 -> 1)
+  mut spins: UInt = 0
   while !__sync_bool_compare_and_swap_1(&GLOBAL_ALLOCATOR_LOCK, 0, 1) do
-    # Spin (could add pause/yield for efficiency)
+    spins = spins + 1
+    if (spins % 64) == 0 then
+      let _ = sched_yield()
+    else
+      # Lightweight memory barrier to avoid a hot empty loop.
+      __sync_synchronize()
+    end
   end
 end
 
@@ -519,7 +536,7 @@ impl[T] Drop for Box[T]
   def drop(self: &mut Box[T]) -> Unit
     if !self.ptr.is_null() then
       # Call drop on the contained value
-      drop(&mut self.ptr.read())
+      self.ptr.drop_in_place()
       dealloc(self.ptr)
       self.ptr = Ptr::null()
     end
@@ -548,7 +565,7 @@ end
 impl[T] Drop for UniquePtr[T]
   def drop(self: &mut UniquePtr[T]) -> Unit
     if !self.ptr.is_null() then
-      drop(&mut self.ptr.read())
+      self.ptr.drop_in_place()
       let layout = layout_for[T]()
       self.allocator.deallocate(self.ptr.cast[u8](), layout.size, layout.align)
       self.ptr = Ptr::null()
@@ -597,14 +614,12 @@ impl[T] Rc[T]
   end
 
   def clone(self: &Rc[T]) -> Rc[T]
-    let inner = self.ptr.as_mut()
-    inner.strong_count = inner.strong_count + 1
+    __sync_fetch_and_add(&self.ptr.as_ref().strong_count, 1)
     Rc { ptr: self.ptr }
   end
 
   def downgrade(self: &Rc[T]) -> WeakRc[T]
-    let inner = self.ptr.as_mut()
-    inner.weak_count = inner.weak_count + 1
+    __sync_fetch_and_add(&self.ptr.as_ref().weak_count, 1)
     WeakRc { ptr: self.ptr }
   end
 
@@ -628,8 +643,8 @@ impl[T] Drop for Rc[T]
   def drop(self: &mut Rc[T]) -> Unit
     if !self.ptr.is_null() then
       let inner = self.ptr.as_mut()
-      inner.strong_count = inner.strong_count - 1
-      if inner.strong_count == 0 then
+      let prev = __sync_fetch_and_sub(&inner.strong_count, 1)
+      if prev == 1 then
         # Drop the contained value
         drop(&mut inner.value)
         if inner.weak_count == 0 then
@@ -658,8 +673,7 @@ impl[T] WeakRc[T]
     if inner.strong_count == 0 then
       Option::None
     else
-      let inner_mut = self.ptr.as_mut()
-      inner_mut.strong_count = inner_mut.strong_count + 1
+      __sync_fetch_and_add(&self.ptr.as_ref().strong_count, 1)
       Option::Some(Rc { ptr: self.ptr })
     end
   end
@@ -674,8 +688,7 @@ impl[T] WeakRc[T]
 
   def clone(self: &WeakRc[T]) -> WeakRc[T]
     if !self.ptr.is_null() then
-      let inner = self.ptr.as_mut()
-      inner.weak_count = inner.weak_count + 1
+      __sync_fetch_and_add(&self.ptr.as_ref().weak_count, 1)
     end
     WeakRc { ptr: self.ptr }
   end
@@ -685,8 +698,8 @@ impl[T] Drop for WeakRc[T]
   def drop(self: &mut WeakRc[T]) -> Unit
     if !self.ptr.is_null() then
       let inner = self.ptr.as_mut()
-      inner.weak_count = inner.weak_count - 1
-      if inner.strong_count == 0 && inner.weak_count == 0 then
+      let prev = __sync_fetch_and_sub(&inner.weak_count, 1)
+      if inner.strong_count == 0 && prev == 1 then
         dealloc(self.ptr)
       end
       self.ptr = Ptr::null()

@@ -12,7 +12,217 @@
 
 use std::core::{Option, Result, Vec, String, Bool, UInt, Int}
 use std::collections::{Map, VecDeque}
+use std::io::{Read, Write, IOError}
+use std::net::{TcpStream}
 use std::time::{Instant, Duration, instant_now, duration_millis, duration_nanos}
+
+# ———————————————————————————————————————————————————————————————
+
+# ———————————————————————————————————————————————————————————————
+
+# Platform detection at compile time
+const USE_EPOLL: Bool = cfg!(target_os = "linux")
+const USE_KQUEUE: Bool = cfg!(target_os = "macos") || cfg!(target_os = "freebsd")
+
+# FFI for epoll (Linux)
+extern "C" def epoll_create1(flags: Int) -> Int
+extern "C" def epoll_ctl(epfd: Int, op: Int, fd: Int, event: *mut EpollEvent) -> Int
+extern "C" def epoll_wait(epfd: Int, events: *mut EpollEvent, maxevents: Int, timeout: Int) -> Int
+
+# FFI for kqueue (macOS/BSD)
+extern "C" def kqueue() -> Int
+extern "C" def kevent(kq: Int, changelist: *const Kevent, nchanges: Int, 
+                       eventlist: *mut Kevent, nevents: Int, timeout: *const Timespec) -> Int
+
+# epoll constants
+const EPOLL_CTL_ADD: Int = 1
+const EPOLL_CTL_DEL: Int = 2
+const EPOLL_CTL_MOD: Int = 3
+const EPOLLIN: u32 = 0x001
+const EPOLLOUT: u32 = 0x004
+const EPOLLERR: u32 = 0x008
+const EPOLLHUP: u32 = 0x010
+
+# kqueue filter/flag constants
+const EVFILT_READ: i16 = -1
+const EVFILT_WRITE: i16 = -2
+const EV_ADD: u16 = 0x0001
+const EV_DELETE: u16 = 0x0002
+const EV_ENABLE: u16 = 0x0004
+const EV_ONESHOT: u16 = 0x0010
+
+struct EpollEvent
+  events: u32
+  data: u64   # user data (task_id)
+end
+
+struct Kevent
+  ident: UInt      # identifier (fd)
+  filter: i16      # filter type
+  flags: u16       # action flags
+  fflags: u32      # filter-specific flags
+  data: Int        # filter-specific data
+  udata: *mut ()   # user data (task_id as pointer)
+end
+
+struct Timespec
+  tv_sec: Int
+  tv_nsec: Int
+end
+
+# Event interest flags
+enum Interest
+  Readable
+  Writable
+  Both
+end
+
+# Platform-independent I/O reactor
+struct IoReactor
+  # Platform-specific fd
+  poll_fd: Int
+  # Registered I/O sources: fd -> (task_id, interest)
+  registrations: Map[Int, (UInt, Interest)]
+end
+
+def io_reactor_new() -> Result[IoReactor, String]
+  if USE_KQUEUE then
+    let kq = kqueue()
+    if kq < 0 then
+      return Result::Err("Failed to create kqueue".to_string())
+    end
+    Result::Ok(IoReactor { poll_fd: kq, registrations: Map::new() })
+  elsif USE_EPOLL then
+    let epfd = epoll_create1(0)
+    if epfd < 0 then
+      return Result::Err("Failed to create epoll".to_string())
+    end
+    Result::Ok(IoReactor { poll_fd: epfd, registrations: Map::new() })
+  else
+    Result::Err("No I/O multiplexing available on this platform".to_string())
+  end
+end
+
+impl IoReactor
+  def register(&mut self, fd: Int, task_id: UInt, interest: Interest) -> Result[Unit, String]
+    if USE_KQUEUE then
+      let filter = match interest
+      when Interest::Readable then EVFILT_READ
+      when Interest::Writable then EVFILT_WRITE
+      when Interest::Both then EVFILT_READ  # For kqueue, add both separately
+      end
+      
+      mut ev = Kevent {
+        ident: fd as UInt,
+        filter: filter,
+        flags: EV_ADD | EV_ENABLE,
+        fflags: 0,
+        data: 0,
+        udata: task_id as *mut ()
+      }
+      
+      if kevent(self.poll_fd, &ev, 1, null_mut(), 0, null()) < 0 then
+        return Result::Err("Failed to register fd with kqueue".to_string())
+      end
+      
+      # For Both interest, register write as well
+      match interest
+      when Interest::Both then
+        ev.filter = EVFILT_WRITE
+        if kevent(self.poll_fd, &ev, 1, null_mut(), 0, null()) < 0 then
+          return Result::Err("Failed to register write with kqueue".to_string())
+        end
+      when _ then ()
+      end
+    elsif USE_EPOLL then
+      let events = match interest
+      when Interest::Readable then EPOLLIN
+      when Interest::Writable then EPOLLOUT
+      when Interest::Both then EPOLLIN | EPOLLOUT
+      end
+      
+      mut ev = EpollEvent {
+        events: events,
+        data: task_id as u64
+      }
+      
+      if epoll_ctl(self.poll_fd, EPOLL_CTL_ADD, fd, &mut ev) < 0 then
+        return Result::Err("Failed to register fd with epoll".to_string())
+      end
+    end
+    
+    self.registrations.insert(fd, (task_id, interest))
+    Result::Ok(())
+  end
+  
+  def deregister(&mut self, fd: Int) -> Result[Unit, String]
+    if USE_KQUEUE then
+      mut ev = Kevent {
+        ident: fd as UInt,
+        filter: EVFILT_READ,
+        flags: EV_DELETE,
+        fflags: 0,
+        data: 0,
+        udata: null_mut()
+      }
+      kevent(self.poll_fd, &ev, 1, null_mut(), 0, null())
+      ev.filter = EVFILT_WRITE
+      kevent(self.poll_fd, &ev, 1, null_mut(), 0, null())
+    elsif USE_EPOLL then
+      epoll_ctl(self.poll_fd, EPOLL_CTL_DEL, fd, null_mut())
+    end
+    
+    self.registrations.remove(&fd)
+    Result::Ok(())
+  end
+  
+  def poll(&mut self, timeout_ms: Int) -> Vec[UInt]
+    mut ready_tasks = Vec::new()
+    
+    if USE_KQUEUE then
+      mut events: [Kevent; 64] = unsafe "zero-initialize kqueue events buffer before kernel fill" do
+        zeroed()
+      end
+      mut ts = Timespec {
+        tv_sec: timeout_ms / 1000,
+        tv_nsec: (timeout_ms % 1000) * 1_000_000
+      }
+      
+      let n = kevent(self.poll_fd, null(), 0, &mut events[0], 64, &ts)
+      let mut i = 0
+      while i < n do
+        let task_id = events[i].udata as UInt
+        if !ready_tasks.contains(&task_id) then
+          ready_tasks.push(task_id)
+        end
+        i = i + 1
+      end
+    elsif USE_EPOLL then
+      mut events: [EpollEvent; 64] = unsafe "zero-initialize epoll events buffer before kernel fill" do
+        zeroed()
+      end
+      
+      let n = epoll_wait(self.poll_fd, &mut events[0], 64, timeout_ms)
+      let mut i = 0
+      while i < n do
+        let task_id = events[i].data as UInt
+        if !ready_tasks.contains(&task_id) then
+          ready_tasks.push(task_id)
+        end
+        i = i + 1
+      end
+    end
+    
+    ready_tasks
+  end
+  
+  def close(&mut self) -> Unit
+    if self.poll_fd >= 0 then
+      close(self.poll_fd)
+      self.poll_fd = -1
+    end
+  end
+end
 
 # ———————————————————————————————————————————————————————————————
 # Poll and Future
@@ -122,6 +332,8 @@ struct Executor
   task_results: Map[UInt, Box[dyn Any]]
   join_waiters: Map[UInt, Waker]     # task_id -> waker of JoinHandle
   timer_heap: Vec[TimerEntry]
+  # GAP-22: I/O reactor for async I/O
+  io_reactor: Option[IoReactor]
   running: Bool
 end
 
@@ -130,7 +342,76 @@ struct TimerEntry
   task_id: UInt
 end
 
+def timer_heap_push(heap: &mut Vec[TimerEntry], entry: TimerEntry) -> Unit
+  heap.push(entry)
+  mut idx = heap.len() - 1
+  while idx > 0 do
+    let parent = (idx - 1) / 2
+    if heap[parent].deadline <= heap[idx].deadline then
+      break
+    end
+    let tmp = heap[parent]
+    heap[parent] = heap[idx]
+    heap[idx] = tmp
+    idx = parent
+  end
+end
+
+def timer_heap_pop_min(heap: &mut Vec[TimerEntry]) -> Option[TimerEntry]
+  if heap.is_empty() then
+    return Option::None
+  end
+
+  let min_entry = heap[0]
+  if heap.len() == 1 then
+    let _ = heap.pop()
+    return Option::Some(min_entry)
+  end
+
+  let last = heap.pop().unwrap()
+  heap[0] = last
+
+  mut idx: UInt = 0
+  loop
+    let left = idx * 2 + 1
+    let right = idx * 2 + 2
+    mut smallest = idx
+
+    if left < heap.len() && heap[left].deadline < heap[smallest].deadline then
+      smallest = left
+    end
+    if right < heap.len() && heap[right].deadline < heap[smallest].deadline then
+      smallest = right
+    end
+
+    if smallest == idx then
+      break
+    end
+
+    let tmp = heap[idx]
+    heap[idx] = heap[smallest]
+    heap[smallest] = tmp
+    idx = smallest
+  end
+
+  Option::Some(min_entry)
+end
+
+def timer_heap_peek_deadline(heap: &Vec[TimerEntry]) -> Option[Instant]
+  if heap.is_empty() then
+    Option::None
+  else
+    Option::Some(heap[0].deadline)
+  end
+end
+
 def executor_new() -> Executor
+  # GAP-22: Try to create I/O reactor (may fail on unsupported platforms)
+  let reactor = match io_reactor_new()
+  when Result::Ok(r) then Option::Some(r)
+  when Result::Err(_) then Option::None
+  end
+  
   Executor {
     tasks: Map::new(),
     ready_queue: VecDeque::new(),
@@ -139,8 +420,9 @@ def executor_new() -> Executor
     task_results: Map::new(),
     join_waiters: Map::new(),
     timer_heap: Vec::new(),
+    io_reactor: reactor,
     running: false
-  end
+  }
 end
 
 impl Executor
@@ -196,6 +478,25 @@ impl Executor
     when _ then ()
     end
   end
+
+  # GAP-22: Register a file descriptor for async I/O
+  def register_io(&mut self, fd: Int, task_id: UInt, interest: Interest) -> Result[Unit, String]
+    match self.io_reactor
+    when Option::Some(ref mut reactor) then
+      reactor.register(fd, task_id, interest)
+    when Option::None then
+      Result::Err("No I/O reactor available".to_string())
+    end
+  end
+  
+  # GAP-22: Deregister a file descriptor
+  def deregister_io(&mut self, fd: Int) -> Unit
+    match self.io_reactor
+    when Option::Some(ref mut reactor) then
+      reactor.deregister(fd)
+    when Option::None then ()
+    end
+  end
   
   def run(&mut self) -> Unit
     self.running = true
@@ -203,6 +504,19 @@ impl Executor
     while self.running do
       # Check timers
       self.check_timers()
+      
+      # GAP-22: Poll I/O reactor for ready file descriptors
+      match self.io_reactor
+      when Option::Some(ref mut reactor) then
+        # Poll with 0 timeout for non-blocking check
+        let io_ready = reactor.poll(0)
+        for task_id in io_ready do
+          if !self.ready_queue.contains(&task_id) then
+            self.ready_queue.push_back(task_id)
+          end
+        end
+      when Option::None then ()
+      end
       
       # Poll ready tasks
       match self.ready_queue.pop_front()
@@ -215,19 +529,29 @@ impl Executor
           break
         end
         
-        # Sleep until next timer or yield
-        match self.next_timer_deadline()
+        # GAP-22: Block on I/O and timers
+        let timeout_ms = match self.next_timer_deadline()
         when Option::Some(deadline) then
           let now = instant_now()
           let remaining = deadline.duration_since(now)
-          let ms = duration_millis(remaining)
-          if ms > 0 then
-            sleep_ms(ms)
+          duration_millis(remaining).max(0).min(100)
+        when Option::None then 100  # Default 100ms timeout
+        end
+        
+        match self.io_reactor
+        when Option::Some(ref mut reactor) then
+          # Block on I/O with timeout
+          let io_ready = reactor.poll(timeout_ms as Int)
+          for task_id in io_ready do
+            self.ready_queue.push_back(task_id)
           end
         when Option::None then
-          # No timers, no ready tasks — deadlock or all waiting on I/O
-          # Yield briefly to avoid busy-spin
-          sleep_ms(1)
+          # No I/O reactor — just sleep
+          if timeout_ms > 0 then
+            sleep_ms(timeout_ms)
+          else
+            sleep_ms(1)
+          end
         end
       end
     end
@@ -263,34 +587,30 @@ impl Executor
   
   def check_timers(&mut self) -> Unit
     let now = instant_now()
-    
-    # Process all expired timers
-    mut i: UInt = 0
-    while i < self.timer_heap.len() do
-      if self.timer_heap[i].deadline <= now then
-        let entry = self.timer_heap.swap_remove(i)
-        self.wake_task(entry.task_id)
-        # Don't increment i since swap_remove moved an element here
-      else
-        i = i + 1
+
+    # Process all expired timers from min-heap root
+    loop
+      match timer_heap_peek_deadline(&self.timer_heap)
+      when Option::Some(deadline) then
+        if deadline <= now then
+          match timer_heap_pop_min(&mut self.timer_heap)
+          when Option::Some(entry) then self.wake_task(entry.task_id)
+          when Option::None then break
+          end
+        else
+          break
+        end
+      when Option::None then break
       end
     end
   end
   
   def next_timer_deadline(&self) -> Option[Instant]
-    if self.timer_heap.is_empty() then return Option::None end
-    
-    mut earliest = self.timer_heap[0].deadline
-    for entry in self.timer_heap do
-      if entry.deadline < earliest then
-        earliest = entry.deadline
-      end
-    end
-    Option::Some(earliest)
+    timer_heap_peek_deadline(&self.timer_heap)
   end
   
   def register_timer(&mut self, deadline: Instant, task_id: UInt) -> Unit
-    self.timer_heap.push(TimerEntry {
+    timer_heap_push(&mut self.timer_heap, TimerEntry {
       deadline: deadline,
       task_id: task_id
     })
@@ -438,6 +758,7 @@ struct ChannelInner[T]
   closed: Bool
   send_waiters: Vec[Waker]
   recv_waiters: Vec[Waker]
+  ref_count: UInt
 end
 
 struct Sender[T]
@@ -448,13 +769,31 @@ struct Receiver[T]
   inner: *mut ChannelInner[T]
 end
 
+def channel_inc_ref[T](ptr: *mut ChannelInner[T]) -> Unit
+  unsafe "pointer dereference — channel refcount" do
+    let ch = &mut *ptr
+    ch.ref_count = ch.ref_count + 1
+  end
+end
+
+def channel_dec_ref[T](ptr: *mut ChannelInner[T]) -> Unit
+  unsafe "pointer dereference — channel refcount" do
+    let ch = &mut *ptr
+    ch.ref_count = ch.ref_count - 1
+    if ch.ref_count == 0 then
+      let _ = Box::from_raw(ptr)
+    end
+  end
+end
+
 pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
   let inner = Box::new(ChannelInner {
     buffer: VecDeque::new(),
     capacity: capacity,
     closed: false,
     send_waiters: Vec::new(),
-    recv_waiters: Vec::new()
+    recv_waiters: Vec::new(),
+    ref_count: 2
   })
   
   let ptr = Box::into_raw(inner)
@@ -473,8 +812,10 @@ impl Sender[T]
   def close(&self) -> Unit
     unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
       let ch = &mut *self.inner
+      if ch.closed then
+        return
+      end
       ch.closed = true
-      # Wake all receivers
       for waker in ch.recv_waiters.drain() do
         waker.wake()
       end
@@ -482,7 +823,12 @@ impl Sender[T]
   end
   
   def clone(&self) -> Sender[T]
+    channel_inc_ref(self.inner)
     Sender { inner: self.inner }
+  end
+
+  def drop(&mut self) -> Unit
+    channel_dec_ref(self.inner)
   end
 end
 
@@ -490,7 +836,11 @@ impl Receiver[T]
   def recv(&self) -> RecvFuture[T]
     RecvFuture {
       receiver: self.inner
-    end
+    }
+  end
+
+  def drop(&mut self) -> Unit
+    channel_dec_ref(self.inner)
   end
 end
 
@@ -585,6 +935,7 @@ impl Future for SelectFuture[A, B]
     if !self.a_done then
       match self.a.poll(cx)
       when Poll::Ready(val) then
+        self.a_done = true
         return Poll::Ready(Either::Left(val))
       when Poll::Pending then ()
       end
@@ -593,6 +944,7 @@ impl Future for SelectFuture[A, B]
     if !self.b_done then
       match self.b.poll(cx)
       when Poll::Ready(val) then
+        self.b_done = true
         return Poll::Ready(Either::Right(val))
       when Poll::Pending then ()
       end
@@ -652,14 +1004,167 @@ pub def join[A: Future, B: Future](a: A, b: B) -> JoinFuture[A, B]
 end
 
 # ———————————————————————————————————————————————————————————————
+# std::io Integration (reactor-backed readiness + I/O futures)
+# ———————————————————————————————————————————————————————————————
+
+trait ReactorFd
+  def reactor_fd(self: &Self) -> Int
+end
+
+impl ReactorFd for TcpStream
+  def reactor_fd(self: &Self) -> Int
+    self.raw_fd()
+  end
+end
+
+struct WaitReadableFuture[T: ReactorFd]
+  io: *mut T
+  registered: Bool
+end
+
+impl Future for WaitReadableFuture[T]
+  type Output = Result[Unit, String]
+
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[Unit, String]]
+    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+      let exec = &mut *cx.waker.executor
+      let fd = (*self.io).reactor_fd()
+
+      if !self.registered then
+        match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
+        when Result::Ok(()) then
+          self.registered = true
+          Poll::Pending
+        when Result::Err(err) then
+          Poll::Ready(Result::Err(err))
+        end
+      else
+        exec.deregister_io(fd)
+        Poll::Ready(Result::Ok(()))
+      end
+    end
+  end
+end
+
+struct WaitWritableFuture[T: ReactorFd]
+  io: *mut T
+  registered: Bool
+end
+
+impl Future for WaitWritableFuture[T]
+  type Output = Result[Unit, String]
+
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[Unit, String]]
+    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+      let exec = &mut *cx.waker.executor
+      let fd = (*self.io).reactor_fd()
+
+      if !self.registered then
+        match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
+        when Result::Ok(()) then
+          self.registered = true
+          Poll::Pending
+        when Result::Err(err) then
+          Poll::Ready(Result::Err(err))
+        end
+      else
+        exec.deregister_io(fd)
+        Poll::Ready(Result::Ok(()))
+      end
+    end
+  end
+end
+
+pub def wait_readable[T: ReactorFd](io: &mut T) -> WaitReadableFuture[T]
+  WaitReadableFuture {
+    io: io as *mut T,
+    registered: false
+  }
+end
+
+pub def wait_writable[T: ReactorFd](io: &mut T) -> WaitWritableFuture[T]
+  WaitWritableFuture {
+    io: io as *mut T,
+    registered: false
+  }
+end
+
+struct AsyncReadFuture[T: Read + ReactorFd]
+  io: *mut T
+  buf: *mut Vec[u8]
+  wait: WaitReadableFuture[T]
+end
+
+impl Future for AsyncReadFuture[T]
+  type Output = Result[Int, IOError]
+
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[Int, IOError]]
+    match self.wait.poll(cx)
+    when Poll::Pending then Poll::Pending
+    when Poll::Ready(Result::Err(err)) then
+      Poll::Ready(Result::Err(IOError::Other(err)))
+    when Poll::Ready(Result::Ok(())) then
+      unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+        let io = &mut *self.io
+        let buf = &mut *self.buf
+        Poll::Ready(io.read(buf))
+      end
+    end
+  end
+end
+
+struct AsyncWriteFuture[T: Write + ReactorFd]
+  io: *mut T
+  buf: *const Vec[u8]
+  wait: WaitWritableFuture[T]
+end
+
+impl Future for AsyncWriteFuture[T]
+  type Output = Result[Int, IOError]
+
+  def poll(&mut self, cx: &mut Context) -> Poll[Result[Int, IOError]]
+    match self.wait.poll(cx)
+    when Poll::Pending then Poll::Pending
+    when Poll::Ready(Result::Err(err)) then
+      Poll::Ready(Result::Err(IOError::Other(err)))
+    when Poll::Ready(Result::Ok(())) then
+      unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+        let io = &mut *self.io
+        let buf = &*self.buf
+        Poll::Ready(io.write(buf))
+      end
+    end
+  end
+end
+
+pub def read_async[T: Read + ReactorFd](io: &mut T, buf: &mut Vec[u8]) -> AsyncReadFuture[T]
+  AsyncReadFuture {
+    io: io as *mut T,
+    buf: buf as *mut Vec[u8],
+    wait: wait_readable(io)
+  }
+end
+
+pub def write_async[T: Write + ReactorFd](io: &mut T, buf: &Vec[u8]) -> AsyncWriteFuture[T]
+  AsyncWriteFuture {
+    io: io as *mut T,
+    buf: buf as *const Vec[u8],
+    wait: wait_writable(io)
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
 # Public Entrypoints
 # ———————————————————————————————————————————————————————————————
 
 # Global executor (thread-local in multi-threaded contexts)
-static mut GLOBAL_EXECUTOR: Option[Executor] = Option::None
+thread_local GLOBAL_EXECUTOR: Option[*mut Executor] = Option::None
 
 pub def block_on[F: Future](future: F) -> F::Output
   mut exec = executor_new()
+  
+  # Set the global executor so spawn() works inside block_on
+  GLOBAL_EXECUTOR = Option::Some(&mut exec as *mut Executor)
   
   # Wrap the main future to capture its output
   mut result: Option[F::Output] = Option::None
@@ -674,16 +1179,24 @@ pub def block_on[F: Future](future: F) -> F::Output
   
   exec.run()
   
-  result.expect("block_on: future did not complete")
+  # Clear the global executor on exit
+  GLOBAL_EXECUTOR = Option::None
+  
+  match result
+  when Option::Some(val) then val
+  when Option::None then panic("block_on: future did not complete")
+  end
 end
 
 pub def spawn(future: impl Future[Output = ()] + 'static) -> JoinHandle[()]
-  unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-    match GLOBAL_EXECUTOR
-    when Option::Some(ref mut exec) then exec.spawn(future)
-    when Option::None then
-      panic("spawn called outside of async runtime — use block_on() first")
+  match GLOBAL_EXECUTOR
+  when Option::Some(exec_ptr) then
+    unsafe "global executor pointer dereference" do
+      let exec = &mut *exec_ptr
+      exec.spawn(future)
     end
+  when Option::None then
+    panic("spawn called outside of async runtime — use block_on() first")
   end
 end
 

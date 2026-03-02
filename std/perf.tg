@@ -1,0 +1,680 @@
+## ---------------------------------------------------------------
+## tg::perf — Performance instrumentation and profiling
+## Covers §23.2–§23.3 of TG-GFX-UI-SPEC-001 v0.1
+## ---------------------------------------------------------------
+
+use std::time
+use std::sync
+use std::io
+use std::fmt
+use std::collections
+
+## ---------------------------------------------------------------
+## 23.2  Frame timing instrumentation
+## ---------------------------------------------------------------
+
+struct FrameTimings
+  frame_id: u64
+  begin_ns: u64
+  draw_end_ns: u64
+  composite_end_ns: u64
+  present_end_ns: u64
+end
+
+impl FrameTimings
+  def total_ms() -> f32
+    let delta = self.present_end_ns - self.begin_ns
+    (delta as f32) / 1_000_000.0
+  end
+
+  def draw_ms() -> f32
+    let delta = self.draw_end_ns - self.begin_ns
+    (delta as f32) / 1_000_000.0
+  end
+
+  def composite_ms() -> f32
+    let delta = self.composite_end_ns - self.draw_end_ns
+    (delta as f32) / 1_000_000.0
+  end
+
+  def present_ms() -> f32
+    let delta = self.present_end_ns - self.composite_end_ns
+    (delta as f32) / 1_000_000.0
+  end
+end
+
+struct FrameTimer
+  current_frame: u64
+  begin_ts: u64
+  draw_end_ts: u64
+  composite_end_ts: u64
+  history: List[FrameTimings]
+  history_capacity: u64
+end
+
+impl FrameTimer
+  def new(capacity: u64) -> FrameTimer
+    FrameTimer {
+      current_frame: 0u64,
+      begin_ts: 0u64,
+      draw_end_ts: 0u64,
+      composite_end_ts: 0u64,
+      history: List.new(),
+      history_capacity: capacity,
+    }
+  end
+
+  def begin_frame() -> Nil
+    self.begin_ts = time::now_ns()
+    self.current_frame = self.current_frame + 1u64
+  end
+
+  def mark_draw_end() -> Nil
+    self.draw_end_ts = time::now_ns()
+  end
+
+  def mark_composite_end() -> Nil
+    self.composite_end_ts = time::now_ns()
+  end
+
+  def end_frame() -> Nil
+    let present_ts = time::now_ns()
+    let timing = FrameTimings {
+      frame_id: self.current_frame,
+      begin_ns: self.begin_ts,
+      draw_end_ns: self.draw_end_ts,
+      composite_end_ns: self.composite_end_ts,
+      present_end_ns: present_ts,
+    }
+    if self.history.len() >= self.history_capacity
+      self.history.remove(0)
+    end
+    self.history.push(timing)
+  end
+
+  def p50_ms() -> f32
+    percentile_ms(self.history, 50)
+  end
+
+  def p95_ms() -> f32
+    percentile_ms(self.history, 95)
+  end
+
+  def p99_ms() -> f32
+    percentile_ms(self.history, 99)
+  end
+end
+
+def percentile_ms(samples: List[FrameTimings], pct: u32) -> f32
+  if samples.is_empty()
+    return 0.0
+  end
+  let mut sorted = List.new()
+  for s in samples
+    sorted.push(s.total_ms())
+  end
+  sorted.sort()
+  let idx = ((pct as f32) / 100.0 * ((sorted.len() - 1) as f32)) as u64
+  sorted.get(idx)
+end
+
+## ---------------------------------------------------------------
+## 23.2  Draw-call and state-change counters
+## ---------------------------------------------------------------
+
+struct FrameCounters
+  draw_calls: u64
+  state_changes: u64
+  clip_depth_max: u32
+  save_restore_pairs: u64
+  overdraw_proxy: u64
+  fill_pixels_total: u64
+end
+
+impl FrameCounters
+  def new() -> FrameCounters
+    FrameCounters {
+      draw_calls: 0u64,
+      state_changes: 0u64,
+      clip_depth_max: 0u32,
+      save_restore_pairs: 0u64,
+      overdraw_proxy: 0u64,
+      fill_pixels_total: 0u64,
+    }
+  end
+
+  def reset() -> Nil
+    self.draw_calls = 0u64
+    self.state_changes = 0u64
+    self.clip_depth_max = 0u32
+    self.save_restore_pairs = 0u64
+    self.overdraw_proxy = 0u64
+    self.fill_pixels_total = 0u64
+  end
+
+  def record_draw(pixel_count: u64) -> Nil
+    self.draw_calls = self.draw_calls + 1u64
+    self.fill_pixels_total = self.fill_pixels_total + pixel_count
+  end
+
+  def record_state_change() -> Nil
+    self.state_changes = self.state_changes + 1u64
+  end
+
+  def record_clip(depth: u32) -> Nil
+    if depth > self.clip_depth_max
+      self.clip_depth_max = depth
+    end
+  end
+
+  def record_save_restore() -> Nil
+    self.save_restore_pairs = self.save_restore_pairs + 1u64
+  end
+
+  def record_overdraw(overlap_pixels: u64) -> Nil
+    self.overdraw_proxy = self.overdraw_proxy + overlap_pixels
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.2  Text shaping/layout latency instrumentation
+## ---------------------------------------------------------------
+
+struct TextPerfCounters
+  shape_calls: u64
+  shape_total_ns: u64
+  layout_calls: u64
+  layout_total_ns: u64
+  cache_hits: u64
+  cache_misses: u64
+  fallback_calls: u64
+  fallback_total_ns: u64
+end
+
+impl TextPerfCounters
+  def new() -> TextPerfCounters
+    TextPerfCounters {
+      shape_calls: 0u64,
+      shape_total_ns: 0u64,
+      layout_calls: 0u64,
+      layout_total_ns: 0u64,
+      cache_hits: 0u64,
+      cache_misses: 0u64,
+      fallback_calls: 0u64,
+      fallback_total_ns: 0u64,
+    }
+  end
+
+  def avg_shape_us() -> f32
+    if self.shape_calls == 0u64
+      return 0.0
+    end
+    let avg_ns = (self.shape_total_ns as f32) / (self.shape_calls as f32)
+    avg_ns / 1_000.0
+  end
+
+  def avg_layout_us() -> f32
+    if self.layout_calls == 0u64
+      return 0.0
+    end
+    let avg_ns = (self.layout_total_ns as f32) / (self.layout_calls as f32)
+    avg_ns / 1_000.0
+  end
+
+  def cache_hit_rate() -> f32
+    let total = self.cache_hits + self.cache_misses
+    if total == 0u64
+      return 0.0
+    end
+    (self.cache_hits as f32) / (total as f32) * 100.0
+  end
+
+  def avg_fallback_ms() -> f32
+    if self.fallback_calls == 0u64
+      return 0.0
+    end
+    let avg_ns = (self.fallback_total_ns as f32) / (self.fallback_calls as f32)
+    avg_ns / 1_000_000.0
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.2  Asset load/decode/upload timing instrumentation
+## ---------------------------------------------------------------
+
+struct AssetPerfCounters
+  load_calls: u64
+  load_total_ns: u64
+  decode_calls: u64
+  decode_total_ns: u64
+  upload_calls: u64
+  upload_total_ns: u64
+  cache_hits: u64
+  cache_misses: u64
+end
+
+impl AssetPerfCounters
+  def new() -> AssetPerfCounters
+    AssetPerfCounters {
+      load_calls: 0u64,
+      load_total_ns: 0u64,
+      decode_calls: 0u64,
+      decode_total_ns: 0u64,
+      upload_calls: 0u64,
+      upload_total_ns: 0u64,
+      cache_hits: 0u64,
+      cache_misses: 0u64,
+    }
+  end
+
+  def avg_load_ms() -> f32
+    if self.load_calls == 0u64
+      return 0.0
+    end
+    (self.load_total_ns as f32) / (self.load_calls as f32) / 1_000_000.0
+  end
+
+  def avg_decode_ms() -> f32
+    if self.decode_calls == 0u64
+      return 0.0
+    end
+    (self.decode_total_ns as f32) / (self.decode_calls as f32) / 1_000_000.0
+  end
+
+  def avg_upload_ms() -> f32
+    if self.upload_calls == 0u64
+      return 0.0
+    end
+    (self.upload_total_ns as f32) / (self.upload_calls as f32) / 1_000_000.0
+  end
+
+  def cache_hit_rate() -> f32
+    let total = self.cache_hits + self.cache_misses
+    if total == 0u64
+      return 0.0
+    end
+    (self.cache_hits as f32) / (total as f32) * 100.0
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.2  Cache hit/miss metrics (compositor/text/image)
+## ---------------------------------------------------------------
+
+struct CacheMetrics
+  name: String
+  hits: u64
+  misses: u64
+  evictions: u64
+  current_bytes: u64
+  budget_bytes: u64
+end
+
+impl CacheMetrics
+  def new(name: String, budget_bytes: u64) -> CacheMetrics
+    CacheMetrics {
+      name: name,
+      hits: 0u64,
+      misses: 0u64,
+      evictions: 0u64,
+      current_bytes: 0u64,
+      budget_bytes: budget_bytes,
+    }
+  end
+
+  def record_hit() -> Nil
+    self.hits = self.hits + 1u64
+  end
+
+  def record_miss() -> Nil
+    self.misses = self.misses + 1u64
+  end
+
+  def record_eviction(freed_bytes: u64) -> Nil
+    self.evictions = self.evictions + 1u64
+    if self.current_bytes >= freed_bytes
+      self.current_bytes = self.current_bytes - freed_bytes
+    end
+  end
+
+  def record_insert(added_bytes: u64) -> Nil
+    self.current_bytes = self.current_bytes + added_bytes
+  end
+
+  def hit_rate() -> f32
+    let total = self.hits + self.misses
+    if total == 0u64
+      return 0.0
+    end
+    (self.hits as f32) / (total as f32) * 100.0
+  end
+
+  def usage_pct() -> f32
+    if self.budget_bytes == 0u64
+      return 0.0
+    end
+    (self.current_bytes as f32) / (self.budget_bytes as f32) * 100.0
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.2  Memory accounting per subsystem and per window
+## ---------------------------------------------------------------
+
+enum Subsystem
+  WidgetTree
+  GlyphCache
+  ImageCache
+  CompositorCache
+  PathCache
+  BackendInternal
+end
+
+struct MemoryAccount
+  subsystem: Subsystem
+  allocated_bytes: u64
+  peak_bytes: u64
+  budget_bytes: u64
+end
+
+impl MemoryAccount
+  def new(subsystem: Subsystem, budget_bytes: u64) -> MemoryAccount
+    MemoryAccount {
+      subsystem: subsystem,
+      allocated_bytes: 0u64,
+      peak_bytes: 0u64,
+      budget_bytes: budget_bytes,
+    }
+  end
+
+  def alloc(bytes: u64) -> Nil
+    self.allocated_bytes = self.allocated_bytes + bytes
+    if self.allocated_bytes > self.peak_bytes
+      self.peak_bytes = self.allocated_bytes
+    end
+  end
+
+  def free(bytes: u64) -> Nil
+    if self.allocated_bytes >= bytes
+      self.allocated_bytes = self.allocated_bytes - bytes
+    end
+  end
+
+  def is_over_budget() -> Bool
+    self.allocated_bytes > self.budget_bytes
+  end
+end
+
+struct WindowMemoryProfile
+  window_id: u64
+  accounts: List[MemoryAccount]
+end
+
+impl WindowMemoryProfile
+  def new(window_id: u64) -> WindowMemoryProfile
+    let accounts = List.new()
+    ## Budgets from docs/performance_budgets.md §5
+    accounts.push(MemoryAccount.new(Subsystem::WidgetTree, 4_194_304u64))       ## 4 MiB
+    accounts.push(MemoryAccount.new(Subsystem::GlyphCache, 16_777_216u64))      ## 16 MiB
+    accounts.push(MemoryAccount.new(Subsystem::ImageCache, 33_554_432u64))      ## 32 MiB
+    accounts.push(MemoryAccount.new(Subsystem::CompositorCache, 8_388_608u64))  ## 8 MiB
+    accounts.push(MemoryAccount.new(Subsystem::PathCache, 4_194_304u64))        ## 4 MiB
+    accounts.push(MemoryAccount.new(Subsystem::BackendInternal, 0u64))          ## no fixed budget
+    WindowMemoryProfile { window_id: window_id, accounts: accounts }
+  end
+
+  def total_bytes() -> u64
+    let mut total = 0u64
+    for acct in self.accounts
+      total = total + acct.allocated_bytes
+    end
+    total
+  end
+
+  def any_over_budget() -> Bool
+    for acct in self.accounts
+      if acct.is_over_budget()
+        return true
+      end
+    end
+    false
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.3  Optimization helpers — buffer pool for hot-path reuse
+## ---------------------------------------------------------------
+
+struct BufferPool
+  buffers: List[List[u8]]
+  max_cached: u64
+end
+
+impl BufferPool
+  def new(max_cached: u64) -> BufferPool
+    BufferPool { buffers: List.new(), max_cached: max_cached }
+  end
+
+  def acquire(min_capacity: u64) -> List[u8]
+    if self.buffers.is_empty()
+      return List.with_capacity(min_capacity)
+    end
+    let buf = self.buffers.pop()
+    buf.clear()
+    buf
+  end
+
+  def release(buf: List[u8]) -> Nil
+    if (self.buffers.len() as u64) < self.max_cached
+      self.buffers.push(buf)
+    end
+    ## else: drop buf (let it be collected)
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.3  Clip/transform stack performance validator
+## ---------------------------------------------------------------
+
+struct StackPerfValidator
+  max_depth_seen: u32
+  depth_warn_threshold: u32
+  current_depth: u32
+  warnings: List[String]
+end
+
+impl StackPerfValidator
+  def new(warn_threshold: u32) -> StackPerfValidator
+    StackPerfValidator {
+      max_depth_seen: 0u32,
+      depth_warn_threshold: warn_threshold,
+      current_depth: 0u32,
+      warnings: List.new(),
+    }
+  end
+
+  def push() -> Nil
+    self.current_depth = self.current_depth + 1u32
+    if self.current_depth > self.max_depth_seen
+      self.max_depth_seen = self.current_depth
+    end
+    if self.current_depth > self.depth_warn_threshold
+      self.warnings.push(
+        fmt::format("Clip/transform depth {} exceeds threshold {}", self.current_depth, self.depth_warn_threshold)
+      )
+    end
+  end
+
+  def pop() -> Nil
+    if self.current_depth > 0u32
+      self.current_depth = self.current_depth - 1u32
+    end
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.3  Compositor dirty-region tracker
+## ---------------------------------------------------------------
+
+struct DirtyRegionTracker
+  dirty_rects: List[Rect]
+  frames_since_full_redraw: u64
+  max_dirty_rects: u64
+end
+
+use std::geom::Rect
+
+impl DirtyRegionTracker
+  def new(max_dirty_rects: u64) -> DirtyRegionTracker
+    DirtyRegionTracker {
+      dirty_rects: List.new(),
+      frames_since_full_redraw: 0u64,
+      max_dirty_rects: max_dirty_rects,
+    }
+  end
+
+  def mark_dirty(rect: Rect) -> Nil
+    self.dirty_rects.push(rect)
+    if (self.dirty_rects.len() as u64) > self.max_dirty_rects
+      ## Too many small rects — merge into full redraw
+      self.mark_full_redraw()
+    end
+  end
+
+  def mark_full_redraw() -> Nil
+    self.dirty_rects.clear()
+    self.frames_since_full_redraw = 0u64
+  end
+
+  def is_full_redraw() -> Bool
+    self.dirty_rects.is_empty()
+  end
+
+  def advance_frame() -> Nil
+    self.frames_since_full_redraw = self.frames_since_full_redraw + 1u64
+    self.dirty_rects.clear()
+  end
+end
+
+## ---------------------------------------------------------------
+## 23.3  GPU pacing helper (Tier C)
+## ---------------------------------------------------------------
+
+struct GpuPacingState
+  target_frame_ns: u64
+  last_present_ns: u64
+  frames_stalled: u64
+end
+
+impl GpuPacingState
+  def new(target_hz: u32) -> GpuPacingState
+    let target_ns = if target_hz > 0u32
+      1_000_000_000u64 / (target_hz as u64)
+    else
+      16_666_667u64  ## default 60 Hz
+    end
+    GpuPacingState {
+      target_frame_ns: target_ns,
+      last_present_ns: 0u64,
+      frames_stalled: 0u64,
+    }
+  end
+
+  def should_present(now_ns: u64) -> Bool
+    if self.last_present_ns == 0u64
+      return true
+    end
+    let elapsed = now_ns - self.last_present_ns
+    elapsed >= self.target_frame_ns
+  end
+
+  def record_present(now_ns: u64) -> Nil
+    let elapsed = now_ns - self.last_present_ns
+    if self.last_present_ns > 0u64 && elapsed > (self.target_frame_ns * 2u64)
+      self.frames_stalled = self.frames_stalled + 1u64
+    end
+    self.last_present_ns = now_ns
+  end
+end
+
+## ---------------------------------------------------------------
+## Unified perf report
+## ---------------------------------------------------------------
+
+struct PerfReport
+  frame_timer: FrameTimer
+  counters: FrameCounters
+  text_perf: TextPerfCounters
+  asset_perf: AssetPerfCounters
+  glyph_cache: CacheMetrics
+  image_cache: CacheMetrics
+  compositor_cache: CacheMetrics
+  memory: WindowMemoryProfile
+end
+
+impl PerfReport
+  def summary() -> String
+    fmt::format(
+      "Frame p95={:.2}ms  draws={}  states={}  text_cache={:.1}%  img_cache={:.1}%  mem={}KiB",
+      self.frame_timer.p95_ms(),
+      self.counters.draw_calls,
+      self.counters.state_changes,
+      self.text_perf.cache_hit_rate(),
+      self.asset_perf.cache_hit_rate(),
+      self.memory.total_bytes() / 1024u64,
+    )
+  end
+end
+
+## ---------------------------------------------------------------
+## Tests
+## ---------------------------------------------------------------
+
+test "FrameCounters tracks draw calls" do
+  let mut c = FrameCounters.new()
+  c.record_draw(1000u64)
+  c.record_draw(2000u64)
+  assert c.draw_calls == 2u64
+  assert c.fill_pixels_total == 3000u64
+end
+
+test "CacheMetrics hit rate" do
+  let mut m = CacheMetrics.new("test", 1024u64)
+  m.record_hit()
+  m.record_hit()
+  m.record_miss()
+  assert m.hit_rate() > 66.0
+  assert m.hit_rate() < 67.0
+end
+
+test "MemoryAccount over-budget detection" do
+  let mut a = MemoryAccount.new(Subsystem::GlyphCache, 100u64)
+  a.alloc(50u64)
+  assert !a.is_over_budget()
+  a.alloc(60u64)
+  assert a.is_over_budget()
+end
+
+test "BufferPool reuses buffers" do
+  let mut pool = BufferPool.new(4u64)
+  let buf = pool.acquire(256u64)
+  pool.release(buf)
+  assert pool.buffers.len() == 1
+end
+
+test "DirtyRegionTracker merges on overflow" do
+  let mut tracker = DirtyRegionTracker.new(2u64)
+  tracker.mark_dirty(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+  tracker.mark_dirty(Rect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 })
+  assert !tracker.is_full_redraw()
+  tracker.mark_dirty(Rect { x: 40.0, y: 40.0, width: 10.0, height: 10.0 })
+  assert tracker.is_full_redraw()
+end
+
+test "GpuPacingState detects stalls" do
+  let mut pacing = GpuPacingState.new(60u32)
+  pacing.record_present(0u64)
+  ## Simulate a stall (>2x frame budget)
+  pacing.record_present(50_000_000u64)
+  assert pacing.frames_stalled == 1u64
+end

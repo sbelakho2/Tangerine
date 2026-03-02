@@ -14,7 +14,9 @@
 
 use std::core::{Option, Result, Vec, String, Bool, Int}
 use std::collections::{Map}
-use std::net::{TcpStream, tcp_connect}
+use std::io::{IOError}
+use std::net::{TcpStream, tcp_connect_host}
+use std::thread::{AtomicInt, Ordering, thread_yield}
 use std::url::{Url, UrlError}
 use std::serde::{Serialize, Deserialize}
 use std::json
@@ -153,7 +155,7 @@ impl HttpHeaders
     let lower = name.to_lowercase()
     for entry in self.entries do
       let (k, v) = entry
-      if k.to_lowercase() == lower then
+      if *k == lower then
         return Option::Some(&v)
       end
     end
@@ -165,7 +167,7 @@ impl HttpHeaders
     let mut result = Vec::new()
     for entry in self.entries do
       let (k, v) = entry
-      if k.to_lowercase() == lower then
+      if *k == lower then
         result.push(&v)
       end
     end
@@ -175,18 +177,18 @@ impl HttpHeaders
   def set(self: &mut HttpHeaders, name: &str, value: &str) -> Unit
     let lower = name.to_lowercase()
     # Remove existing
-    self.entries.retain(|e| e.0.to_lowercase() != lower)
+    self.entries.retain(|e| e.0 != lower)
     # Add new
-    self.entries.push((name.to_string(), value.to_string()))
+    self.entries.push((lower, value.to_string()))
   end
   
   def append(self: &mut HttpHeaders, name: &str, value: &str) -> Unit
-    self.entries.push((name.to_string(), value.to_string()))
+    self.entries.push((name.to_lowercase(), value.to_string()))
   end
   
   def remove(self: &mut HttpHeaders, name: &str) -> Unit
     let lower = name.to_lowercase()
-    self.entries.retain(|e| e.0.to_lowercase() != lower)
+    self.entries.retain(|e| e.0 != lower)
   end
   
   def contains(self: &HttpHeaders, name: &str) -> Bool
@@ -206,6 +208,170 @@ impl HttpHeaders
     when Option::Some(v) then parse_uint(v)
     when Option::None then Option::None
     end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+
+# ———————————————————————————————————————————————————————————————
+
+struct Cookie
+  name: String
+  value: String
+  domain: Option[String]
+  path: Option[String]
+  expires: Option[String]
+  max_age: Option[Int]
+  secure: Bool
+  http_only: Bool
+  same_site: Option[String]
+end
+
+def Cookie::new(name: String, value: String) -> Cookie
+  Cookie {
+    name: name,
+    value: value,
+    domain: Option::None,
+    path: Option::None,
+    expires: Option::None,
+    max_age: Option::None,
+    secure: false,
+    http_only: false,
+    same_site: Option::None
+  }
+end
+
+impl Cookie
+  def to_header_value(self: &Cookie) -> String
+    self.name.clone() + "=" + self.value.clone()
+  end
+  
+  def parse(s: &str) -> Option[Cookie]
+    # Parse "name=value; attr1; attr2=val2"
+    let parts: Vec[&str] = s.split(';').collect()
+    if parts.is_empty() then
+      return Option::None
+    end
+    
+    # First part is name=value
+    let nv: Vec[&str] = parts[0].trim().splitn(2, '=').collect()
+    if nv.len() < 2 then
+      return Option::None
+    end
+    
+    let mut cookie = Cookie::new(nv[0].to_string(), nv[1].to_string())
+    
+    # Parse attributes
+    let mut i = 1
+    while i < parts.len() do
+      let attr = parts[i].trim()
+      let kv: Vec[&str] = attr.splitn(2, '=').collect()
+      let key = kv[0].to_lowercase()
+      
+      match key.as_str()
+      when "domain" then
+        if kv.len() > 1 then cookie.domain = Option::Some(kv[1].to_string()) end
+      when "path" then
+        if kv.len() > 1 then cookie.path = Option::Some(kv[1].to_string()) end
+      when "expires" then
+        if kv.len() > 1 then cookie.expires = Option::Some(kv[1].to_string()) end
+      when "max-age" then
+        if kv.len() > 1 then
+          match kv[1].parse::<Int>()
+          when Result::Ok(n) then cookie.max_age = Option::Some(n)
+          when _ then ()
+          end
+        end
+      when "secure" then cookie.secure = true
+      when "httponly" then cookie.http_only = true
+      when "samesite" then
+        if kv.len() > 1 then cookie.same_site = Option::Some(kv[1].to_string()) end
+      when _ then ()
+      end
+      
+      i = i + 1
+    end
+    
+    Option::Some(cookie)
+  end
+end
+
+# Cookie jar for managing cookies
+struct CookieJar
+  cookies: Map[String, Cookie]   # domain+path+name -> cookie
+end
+
+def CookieJar::new() -> CookieJar
+  CookieJar { cookies: Map::new() }
+end
+
+impl CookieJar
+  def add(self: &mut CookieJar, cookie: Cookie) -> Unit
+    let key = self.cookie_key(&cookie)
+    self.cookies.insert(key, cookie)
+  end
+  
+  def get(self: &CookieJar, name: &str, domain: &str, path: &str) -> Option[&Cookie]
+    let key = domain.to_string() + "|" + path + "|" + name
+    self.cookies.get(&key)
+  end
+  
+  def cookies_for_url(self: &CookieJar, url: &Url) -> Vec[&Cookie]
+    let mut result = Vec::new()
+    for (_, cookie) in self.cookies.iter() do
+      if self.cookie_matches(cookie, url) then
+        result.push(cookie)
+      end
+    end
+    result
+  end
+  
+  def cookie_key(self: &CookieJar, c: &Cookie) -> String
+    let domain = match c.domain
+    when Option::Some(ref d) then d.clone()
+    when Option::None then "".to_string()
+    end
+    let path = match c.path
+    when Option::Some(ref p) then p.clone()
+    when Option::None then "/".to_string()
+    end
+    domain + "|" + path.as_str() + "|" + c.name.as_str()
+  end
+  
+  def cookie_matches(self: &CookieJar, c: &Cookie, url: &Url) -> Bool
+    # Check domain match
+    match c.domain
+    when Option::Some(ref d) then
+      if !url.host().ends_with(d.as_str()) then
+        return false
+      end
+    when Option::None then ()
+    end
+    
+    # Check path match
+    match c.path
+    when Option::Some(ref p) then
+      if !url.path().starts_with(p.as_str()) then
+        return false
+      end
+    when Option::None then ()
+    end
+    
+    # Check secure
+    if c.secure && url.scheme() != "https" then
+      return false
+    end
+    
+    true
+  end
+  
+  def to_header_value(self: &CookieJar, url: &Url) -> String
+    let cookies = self.cookies_for_url(url)
+    let mut parts = Vec::new()
+    for c in cookies do
+      parts.push(c.to_header_value())
+    end
+    parts.join("; ")
   end
 end
 
@@ -361,6 +527,575 @@ impl HttpResponse
 end
 
 # ———————————————————————————————————————————————————————————————
+
+# ———————————————————————————————————————————————————————————————
+
+struct StreamingResponse
+  status: HttpStatus
+  headers: HttpHeaders
+  stream: TcpStream
+  remaining: UInt   # Bytes remaining for content-length, or 0 for chunked
+  chunked: Bool
+  done: Bool
+end
+
+impl StreamingResponse
+  def status_code(self: &StreamingResponse) -> UInt
+    self.status.code
+  end
+  
+  def headers(self: &StreamingResponse) -> &HttpHeaders
+    &self.headers
+  end
+  
+  # Read next chunk of body data
+  def read_chunk(self: &mut StreamingResponse, max_size: UInt) -> Result[Vec[u8], HttpError]
+    if self.done then
+      return Result::Ok(Vec::new())
+    end
+    
+    if self.chunked then
+      # HTTP/1.1 chunked transfer encoding
+      let mut buf: [u8; 256] = [0; 256]
+      
+      # Read chunk size line (hex\r\n)
+      let mut size_line = String::new()
+      loop
+        let mut byte: [u8; 1] = [0; 1]
+        match self.stream.read(&mut byte)
+        when Result::Ok(1) then
+          if byte[0] == '\n' as u8 then
+            break
+          elsif byte[0] != '\r' as u8 then
+            size_line.push(byte[0] as Char)
+          end
+        when Result::Ok(_) then break
+        when Result::Err(e) then return Result::Err(HttpError::Io(e))
+        end
+      end
+      
+      # Parse chunk size
+      let chunk_size = match UInt::from_str_radix(size_line.trim(), 16)
+      when Result::Ok(n) then n
+      when Result::Err(_) then return Result::Err(HttpError::InvalidResponse("invalid chunk size"))
+      end
+      
+      if chunk_size == 0 then
+        self.done = true
+        return Result::Ok(Vec::new())
+      end
+      
+      # Read chunk data
+      let mut data = Vec::new()
+      let to_read = chunk_size.min(max_size)
+      let mut read_buf = vec![0u8; to_read as Int]
+      match self.stream.read(&mut read_buf)
+      when Result::Ok(n) then
+        data.extend(&read_buf[0..n])
+      when Result::Err(e) then return Result::Err(HttpError::Io(e))
+      end
+      
+      # Skip trailing \r\n
+      let mut crlf: [u8; 2] = [0; 2]
+      self.stream.read(&mut crlf)
+      
+      Result::Ok(data)
+    else
+      # Content-Length based
+      if self.remaining == 0 then
+        self.done = true
+        return Result::Ok(Vec::new())
+      end
+      
+      let to_read = self.remaining.min(max_size).min(8192) as Int
+      let mut buf = vec![0u8; to_read]
+      
+      match self.stream.read(&mut buf)
+      when Result::Ok(n) then
+        self.remaining = self.remaining - (n as UInt)
+        if self.remaining == 0 then
+          self.done = true
+        end
+        Result::Ok(buf[0..n].to_vec())
+      when Result::Err(e) then Result::Err(HttpError::Io(e))
+      end
+    end
+  end
+  
+  # Read entire body
+  def read_all(self: &mut StreamingResponse) -> Result[Vec[u8], HttpError]
+    let mut body = Vec::new()
+    while !self.done do
+      let chunk = self.read_chunk(65536)?
+      body.extend(&chunk)
+    end
+    Result::Ok(body)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Frame Types and Multiplexing
+# ———————————————————————————————————————————————————————————————
+
+# HTTP/2 frame type identifiers (RFC 7540 Section 6)
+const H2_FRAME_DATA: u8          = 0x0
+const H2_FRAME_HEADERS: u8       = 0x1
+const H2_FRAME_PRIORITY: u8      = 0x2
+const H2_FRAME_RST_STREAM: u8    = 0x3
+const H2_FRAME_SETTINGS: u8      = 0x4
+const H2_FRAME_PUSH_PROMISE: u8  = 0x5
+const H2_FRAME_PING: u8          = 0x6
+const H2_FRAME_GOAWAY: u8        = 0x7
+const H2_FRAME_WINDOW_UPDATE: u8 = 0x8
+const H2_FRAME_CONTINUATION: u8  = 0x9
+
+# HTTP/2 frame flags
+const H2_FLAG_END_STREAM: u8  = 0x1
+const H2_FLAG_END_HEADERS: u8 = 0x4
+const H2_FLAG_PADDED: u8      = 0x8
+const H2_FLAG_PRIORITY: u8    = 0x20
+
+# HTTP/2 error codes (RFC 7540 Section 7)
+enum H2ErrorCode
+  NoError
+  ProtocolError
+  InternalError
+  FlowControlError
+  SettingsTimeout
+  StreamClosed
+  FrameSizeError
+  RefusedStream
+  Cancel
+  CompressionError
+  ConnectError
+  EnhanceYourCalm
+  InadequateSecurity
+  Http11Required
+end
+
+def h2_error_code_value(e: &H2ErrorCode) -> u32
+  match e
+  when H2ErrorCode::NoError then 0x0
+  when H2ErrorCode::ProtocolError then 0x1
+  when H2ErrorCode::InternalError then 0x2
+  when H2ErrorCode::FlowControlError then 0x3
+  when H2ErrorCode::SettingsTimeout then 0x4
+  when H2ErrorCode::StreamClosed then 0x5
+  when H2ErrorCode::FrameSizeError then 0x6
+  when H2ErrorCode::RefusedStream then 0x7
+  when H2ErrorCode::Cancel then 0x8
+  when H2ErrorCode::CompressionError then 0x9
+  when H2ErrorCode::ConnectError then 0xa
+  when H2ErrorCode::EnhanceYourCalm then 0xb
+  when H2ErrorCode::InadequateSecurity then 0xc
+  when H2ErrorCode::Http11Required then 0xd
+  end
+end
+
+# HTTP/2 settings identifiers
+const H2_SETTINGS_HEADER_TABLE_SIZE: u16      = 0x1
+const H2_SETTINGS_ENABLE_PUSH: u16            = 0x2
+const H2_SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3
+const H2_SETTINGS_INITIAL_WINDOW_SIZE: u16    = 0x4
+const H2_SETTINGS_MAX_FRAME_SIZE: u16         = 0x5
+const H2_SETTINGS_MAX_HEADER_LIST_SIZE: u16   = 0x6
+
+# HTTP/2 connection preface
+const H2_PREFACE: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+# A raw HTTP/2 frame (9-byte header + payload)
+struct H2Frame
+  length: u32       # 24-bit payload length
+  frame_type: u8    # frame type identifier
+  flags: u8         # type-specific flags
+  stream_id: u32    # 31-bit stream identifier (high bit reserved)
+  payload: Vec[u8]  # frame payload
+end
+
+def H2Frame::new(frame_type: u8, flags: u8, stream_id: u32, payload: Vec[u8]) -> H2Frame
+  H2Frame {
+    length: payload.len() as u32,
+    frame_type: frame_type,
+    flags: flags,
+    stream_id: stream_id & 0x7FFFFFFF,
+    payload: payload
+  }
+end
+
+impl H2Frame
+  def serialize(self: &H2Frame) -> Vec[u8]
+    let mut buf = Vec::new()
+    # 3-byte length (big-endian)
+    buf.push(((self.length >> 16) & 0xFF) as u8)
+    buf.push(((self.length >> 8) & 0xFF) as u8)
+    buf.push((self.length & 0xFF) as u8)
+    # 1-byte type
+    buf.push(self.frame_type)
+    # 1-byte flags
+    buf.push(self.flags)
+    # 4-byte stream id (big-endian, high bit reserved = 0)
+    buf.push(((self.stream_id >> 24) & 0x7F) as u8)
+    buf.push(((self.stream_id >> 16) & 0xFF) as u8)
+    buf.push(((self.stream_id >> 8) & 0xFF) as u8)
+    buf.push((self.stream_id & 0xFF) as u8)
+    # Payload
+    buf.extend(&self.payload)
+    buf
+  end
+
+  def parse(data: &[u8]) -> Result[H2Frame, String]
+    if data.len() < 9 then
+      return Result::Err("HTTP/2 frame too short".to_string())
+    end
+    let length = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32)
+    let frame_type = data[3]
+    let flags = data[4]
+    let stream_id = ((data[5] as u32 & 0x7F) << 24) | ((data[6] as u32) << 16) |
+                    ((data[7] as u32) << 8) | (data[8] as u32)
+
+    if data.len() < 9 + length as UInt then
+      return Result::Err("HTTP/2 frame payload incomplete".to_string())
+    end
+
+    let payload = data[9..(9 + length as UInt)].to_vec()
+    Result::Ok(H2Frame {
+      length: length,
+      frame_type: frame_type,
+      flags: flags,
+      stream_id: stream_id,
+      payload: payload
+    })
+  end
+
+  def is_end_stream(self: &H2Frame) -> Bool
+    (self.flags & H2_FLAG_END_STREAM) != 0
+  end
+
+  def is_end_headers(self: &H2Frame) -> Bool
+    (self.flags & H2_FLAG_END_HEADERS) != 0
+  end
+end
+
+def h2_settings_frame(settings: &Vec[(u16, u32)]) -> H2Frame
+  let mut payload = Vec::new()
+  for (id, val) in settings do
+    payload.push(((*id >> 8) & 0xFF) as u8)
+    payload.push((*id & 0xFF) as u8)
+    payload.push(((*val >> 24) & 0xFF) as u8)
+    payload.push(((*val >> 16) & 0xFF) as u8)
+    payload.push(((*val >> 8) & 0xFF) as u8)
+    payload.push((*val & 0xFF) as u8)
+  end
+  H2Frame::new(H2_FRAME_SETTINGS, 0, 0, payload)
+end
+
+def h2_settings_ack() -> H2Frame
+  H2Frame::new(H2_FRAME_SETTINGS, H2_FLAG_END_STREAM, 0, Vec::new())
+end
+
+def h2_data_frame(stream_id: u32, data: Vec[u8], end_stream: Bool) -> H2Frame
+  let flags = if end_stream then H2_FLAG_END_STREAM else 0 end
+  H2Frame::new(H2_FRAME_DATA, flags, stream_id, data)
+end
+
+def h2_headers_frame(stream_id: u32, header_block: Vec[u8], end_stream: Bool, end_headers: Bool) -> H2Frame
+  let mut flags: u8 = 0
+  if end_stream then flags = flags | H2_FLAG_END_STREAM end
+  if end_headers then flags = flags | H2_FLAG_END_HEADERS end
+  H2Frame::new(H2_FRAME_HEADERS, flags, stream_id, header_block)
+end
+
+def h2_rst_stream_frame(stream_id: u32, error_code: H2ErrorCode) -> H2Frame
+  let code = h2_error_code_value(&error_code)
+  let mut payload = Vec::new()
+  payload.push(((code >> 24) & 0xFF) as u8)
+  payload.push(((code >> 16) & 0xFF) as u8)
+  payload.push(((code >> 8) & 0xFF) as u8)
+  payload.push((code & 0xFF) as u8)
+  H2Frame::new(H2_FRAME_RST_STREAM, 0, stream_id, payload)
+end
+
+def h2_goaway_frame(last_stream_id: u32, error_code: H2ErrorCode) -> H2Frame
+  let code = h2_error_code_value(&error_code)
+  let mut payload = Vec::new()
+  payload.push(((last_stream_id >> 24) & 0x7F) as u8)
+  payload.push(((last_stream_id >> 16) & 0xFF) as u8)
+  payload.push(((last_stream_id >> 8) & 0xFF) as u8)
+  payload.push((last_stream_id & 0xFF) as u8)
+  payload.push(((code >> 24) & 0xFF) as u8)
+  payload.push(((code >> 16) & 0xFF) as u8)
+  payload.push(((code >> 8) & 0xFF) as u8)
+  payload.push((code & 0xFF) as u8)
+  H2Frame::new(H2_FRAME_GOAWAY, 0, 0, payload)
+end
+
+def h2_window_update_frame(stream_id: u32, increment: u32) -> H2Frame
+  let mut payload = Vec::new()
+  payload.push(((increment >> 24) & 0x7F) as u8)
+  payload.push(((increment >> 16) & 0xFF) as u8)
+  payload.push(((increment >> 8) & 0xFF) as u8)
+  payload.push((increment & 0xFF) as u8)
+  H2Frame::new(H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload)
+end
+
+def h2_ping_frame(opaque_data: [u8; 8], ack: Bool) -> H2Frame
+  let flags = if ack then H2_FLAG_END_STREAM else 0 end
+  H2Frame::new(H2_FRAME_PING, flags, 0, opaque_data.to_vec())
+end
+
+# HTTP/2 stream states (RFC 7540 Section 5.1)
+enum H2StreamState
+  Idle
+  ReservedLocal
+  ReservedRemote
+  Open
+  HalfClosedLocal
+  HalfClosedRemote
+  Closed
+end
+
+# A single HTTP/2 stream within a multiplexed connection
+struct H2Stream
+  id: u32
+  state: H2StreamState
+  request_headers: HttpHeaders
+  response_headers: HttpHeaders
+  send_window: Int
+  recv_window: Int
+  recv_buffer: Vec[u8]
+end
+
+def H2Stream::new(id: u32) -> H2Stream
+  H2Stream {
+    id: id,
+    state: H2StreamState::Idle,
+    request_headers: HttpHeaders::new(),
+    response_headers: HttpHeaders::new(),
+    send_window: 65535,
+    recv_window: 65535,
+    recv_buffer: Vec::new()
+  }
+end
+
+impl H2Stream
+  def is_open(self: &H2Stream) -> Bool
+    match self.state
+    when H2StreamState::Open then true
+    when H2StreamState::HalfClosedLocal then true
+    when H2StreamState::HalfClosedRemote then true
+    when _ then false
+    end
+  end
+
+  def receive_data(self: &mut H2Stream, data: &[u8]) -> Unit
+    self.recv_buffer.extend(data)
+    self.recv_window = self.recv_window - data.len() as Int
+  end
+
+  def consume_data(self: &mut H2Stream) -> Vec[u8]
+    let data = self.recv_buffer.clone()
+    self.recv_buffer.clear()
+    data
+  end
+end
+
+# HTTP/2 connection settings
+struct H2Settings
+  header_table_size: u32
+  enable_push: Bool
+  max_concurrent_streams: u32
+  initial_window_size: u32
+  max_frame_size: u32
+  max_header_list_size: u32
+end
+
+def H2Settings::default() -> H2Settings
+  H2Settings {
+    header_table_size: 4096,
+    enable_push: true,
+    max_concurrent_streams: 100,
+    initial_window_size: 65535,
+    max_frame_size: 16384,
+    max_header_list_size: 8192
+  }
+end
+
+# Multiplexed HTTP/2 connection managing multiple streams
+struct H2Connection
+  conn: Box[dyn HttpConnection]
+  streams: Map[u32, H2Stream]
+  next_stream_id: u32
+  local_settings: H2Settings
+  remote_settings: H2Settings
+  connection_window: Int
+  goaway_received: Bool
+  last_stream_id: u32
+  recv_buffer: Vec[u8]
+end
+
+def H2Connection::new(conn: Box[dyn HttpConnection]) -> H2Connection
+  H2Connection {
+    conn: conn,
+    streams: Map::new(),
+    next_stream_id: 1,
+    local_settings: H2Settings::default(),
+    remote_settings: H2Settings::default(),
+    connection_window: 65535,
+    goaway_received: false,
+    last_stream_id: 0,
+    recv_buffer: Vec::new()
+  }
+end
+
+impl H2Connection
+  def send_preface(self: &mut H2Connection) -> Result[Unit, HttpError]
+    # Send the connection preface
+    let preface_bytes = H2_PREFACE.as_bytes()
+    self.conn.write_all(preface_bytes)?
+
+    # Send initial SETTINGS frame
+    let settings = Vec::new()
+    let frame = h2_settings_frame(&settings)
+    self.conn.write_all(&frame.serialize())?
+    Result::Ok(())
+  end
+
+  def open_stream(self: &mut H2Connection) -> u32
+    let id = self.next_stream_id
+    self.next_stream_id = self.next_stream_id + 2
+    self.streams.insert(id, H2Stream::new(id))
+    id
+  end
+
+  def send_frame(self: &mut H2Connection, frame: &H2Frame) -> Result[Unit, HttpError]
+    let bytes = frame.serialize()
+    self.conn.write_all(&bytes)
+  end
+
+  def recv_frame(self: &mut H2Connection) -> Result[H2Frame, HttpError]
+    # Ensure we have at least the 9-byte frame header
+    let mut temp = [0u8; 4096]
+    while self.recv_buffer.len() < 9 do
+      let n = self.conn.read(&mut temp)?
+      if n == 0 then
+        return Result::Err(HttpError::InvalidResponse("connection closed during HTTP/2 frame read"))
+      end
+      self.recv_buffer.extend(&temp[0..n])
+    end
+
+    # Parse length from header
+    let length = ((self.recv_buffer[0] as u32) << 16) |
+                 ((self.recv_buffer[1] as u32) << 8) |
+                 (self.recv_buffer[2] as u32)
+
+    let total = 9 + length as UInt
+    while self.recv_buffer.len() < total do
+      let n = self.conn.read(&mut temp)?
+      if n == 0 then
+        return Result::Err(HttpError::InvalidResponse("connection closed during HTTP/2 payload read"))
+      end
+      self.recv_buffer.extend(&temp[0..n])
+    end
+
+    let frame_data = self.recv_buffer[0..total].to_vec()
+    self.recv_buffer = self.recv_buffer[total..].to_vec()
+
+    match H2Frame::parse(&frame_data)
+    when Result::Ok(frame) then Result::Ok(frame)
+    when Result::Err(e) then Result::Err(HttpError::InvalidResponse(e))
+    end
+  end
+
+  def process_frame(self: &mut H2Connection, frame: &H2Frame) -> Result[Unit, HttpError]
+    match frame.frame_type
+    when H2_FRAME_SETTINGS then
+      if (frame.flags & H2_FLAG_END_STREAM) == 0 then
+        # Acknowledge the settings
+        let ack = h2_settings_ack()
+        self.send_frame(&ack)?
+      end
+    when H2_FRAME_WINDOW_UPDATE then
+      if frame.stream_id == 0 then
+        if frame.payload.len() >= 4 then
+          let increment = ((frame.payload[0] as u32 & 0x7F) << 24) |
+                         ((frame.payload[1] as u32) << 16) |
+                         ((frame.payload[2] as u32) << 8) |
+                         (frame.payload[3] as u32)
+          self.connection_window = self.connection_window + increment as Int
+        end
+      else
+        match self.streams.get_mut(&frame.stream_id)
+        when Option::Some(stream) then
+          if frame.payload.len() >= 4 then
+            let increment = ((frame.payload[0] as u32 & 0x7F) << 24) |
+                           ((frame.payload[1] as u32) << 16) |
+                           ((frame.payload[2] as u32) << 8) |
+                           (frame.payload[3] as u32)
+            stream.send_window = stream.send_window + increment as Int
+          end
+        when Option::None then ()
+        end
+      end
+    when H2_FRAME_DATA then
+      match self.streams.get_mut(&frame.stream_id)
+      when Option::Some(stream) then
+        stream.receive_data(&frame.payload)
+        if frame.is_end_stream() then
+          stream.state = H2StreamState::HalfClosedRemote
+        end
+      when Option::None then ()
+      end
+    when H2_FRAME_RST_STREAM then
+      match self.streams.get_mut(&frame.stream_id)
+      when Option::Some(stream) then
+        stream.state = H2StreamState::Closed
+      when Option::None then ()
+      end
+    when H2_FRAME_GOAWAY then
+      self.goaway_received = true
+      if frame.payload.len() >= 4 then
+        self.last_stream_id = ((frame.payload[0] as u32 & 0x7F) << 24) |
+                              ((frame.payload[1] as u32) << 16) |
+                              ((frame.payload[2] as u32) << 8) |
+                              (frame.payload[3] as u32)
+      end
+    when H2_FRAME_PING then
+      if (frame.flags & H2_FLAG_END_STREAM) == 0 then
+        let mut ack_data: [u8; 8] = [0; 8]
+        let copy_len = frame.payload.len().min(8)
+        let mut i = 0
+        while i < copy_len do
+          ack_data[i] = frame.payload[i]
+          i = i + 1
+        end
+        let ack = h2_ping_frame(ack_data, true)
+        self.send_frame(&ack)?
+      end
+    when _ then ()
+    end
+    Result::Ok(())
+  end
+
+  def close_stream(self: &mut H2Connection, stream_id: u32) -> Unit
+    match self.streams.get_mut(&stream_id)
+    when Option::Some(stream) then
+      stream.state = H2StreamState::Closed
+    when Option::None then ()
+    end
+  end
+
+  def active_stream_count(self: &H2Connection) -> UInt
+    let mut count: UInt = 0
+    for (_, stream) in self.streams.iter() do
+      if stream.is_open() then
+        count = count + 1
+      end
+    end
+    count
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # HTTP Error
 # ———————————————————————————————————————————————————————————————
 
@@ -398,22 +1133,24 @@ impl Error for HttpError
   end
 end
 
-def map_tcp_connect_error(host: &String, port: UInt, net_error: &str) -> HttpError
-  let lower = net_error.to_lowercase()
+def map_tcp_connect_error(host: &String, port: UInt, net_error: &IOError) -> HttpError
+  let net_error_str = net_error.to_string()
+  let lower = net_error_str.to_lowercase()
   if lower.contains("timeout") || lower.contains("timed out") then
     HttpError::Timeout
   else
-    let detail = host.clone() + ":" + port.to_string() + " - " + net_error.to_string()
+    let detail = host.clone() + ":" + port.to_string() + " - " + net_error_str
     HttpError::ConnectionFailed(detail)
   end
 end
 
-def map_io_error(io_error: &str) -> HttpError
-  let lower = io_error.to_lowercase()
+def map_io_error(io_error: &IOError) -> HttpError
+  let io_error_str = io_error.to_string()
+  let lower = io_error_str.to_lowercase()
   if lower.contains("timeout") || lower.contains("timed out") then
     HttpError::Timeout
   else
-    HttpError::Io(io_error.to_string())
+    HttpError::Io(io_error_str)
   end
 end
 
@@ -503,17 +1240,26 @@ impl HttpClient
     let mut current_url = req.url.clone()
     let mut current_method = req.method.clone()
     let mut current_body = req.body.clone()
+    let mut current_headers = req.headers.clone()
     
     loop
-      let response = self.do_request(&current_url, &current_method, &req.headers, &current_body)?
+      let response = self.do_request(&current_url, &current_method, &current_headers, &current_body)?
       
       if response.status.is_redirect() && redirect_count < self.max_redirects then
         redirect_count = redirect_count + 1
         
         match response.headers.get("location")
         when Option::Some(location) then
+          let old_url = current_url.clone()
           match current_url.join(location.as_str())
           when Result::Ok(new_url) then
+            let old_host = old_url.host().unwrap_or("")
+            let new_host = new_url.host().unwrap_or("")
+            if old_host != new_host then
+              current_headers.remove("authorization")
+              current_headers.remove("proxy-authorization")
+            end
+
             current_url = new_url
             # Change to GET for 303, or if POST->301/302
             let is_post = match current_method
@@ -525,16 +1271,16 @@ impl HttpClient
               current_method = HttpMethod::Get
               current_body = Option::None
             end
-            continue
+            next
           when Result::Err(e) then return Result::Err(HttpError::InvalidUrl(std::url::url_error_message(&e)))
           end
         when Option::None then return Result::Err(HttpError::InvalidResponse("redirect without location"))
         end
-      else if response.status.is_redirect() && redirect_count >= self.max_redirects then
+      elsif response.status.is_redirect() && redirect_count >= self.max_redirects then
         return Result::Err(HttpError::TooManyRedirects)
       else
         return Result::Ok(response)
-      end end end
+      end
     end
   end
   
@@ -549,9 +1295,9 @@ impl HttpClient
     let is_https = url.is_secure()
     
     # Connect
-    let stream = match tcp_connect(&host, port as UInt)
+    let stream = match tcp_connect_host(host.clone(), port as u16)
     when Result::Ok(s) then s
-    when Result::Err(e) then return Result::Err(map_tcp_connect_error(&host, port as UInt, e.as_str()))
+    when Result::Err(e) then return Result::Err(map_tcp_connect_error(&host, port as UInt, &e))
     end
     
     # For HTTPS, wrap with TLS
@@ -694,19 +1440,27 @@ impl HttpConnection for TcpStream
   def read(self: &mut TcpStream, buf: &mut [u8]) -> Result[UInt, HttpError]
     match self.recv(buf)
     when Result::Ok(n) then Result::Ok(n)
-    when Result::Err(e) then Result::Err(map_io_error(e.as_str()))
+    when Result::Err(e) then Result::Err(map_io_error(&e))
     end
   end
   
   def write_all(self: &mut TcpStream, data: &[u8]) -> Result[Unit, HttpError]
-    match self.send(data)
-    when Result::Ok(_) then Result::Ok(())
-    when Result::Err(e) then Result::Err(map_io_error(e.as_str()))
+    mut offset = 0
+    while offset < data.len() do
+      match self.send(&data[offset..])
+      when Result::Ok(n) then
+        if n == 0 then
+          return Result::Err(HttpError::Io("write returned 0".to_string()))
+        end
+        offset = offset + n as UInt
+      when Result::Err(e) then return Result::Err(map_io_error(&e))
+      end
     end
+    Result::Ok(())
   end
   
   def close(self: &mut TcpStream) -> Unit
-    self.shutdown()
+    let _ = self.shutdown(2)
   end
 end
 
@@ -726,12 +1480,16 @@ extern "C"
   def SSL_load_error_strings() -> Unit
   def TLS_client_method() -> Ptr[u8]
   def SSL_CTX_new(method: Ptr[u8]) -> Ptr[u8]
+  def SSL_CTX_set_verify(ctx: Ptr[u8], mode: Int, verify_callback: Ptr[u8]) -> Unit
+  def SSL_CTX_set_default_verify_paths(ctx: Ptr[u8]) -> Int
   def SSL_CTX_free(ctx: Ptr[u8]) -> Unit
   def SSL_new(ctx: Ptr[u8]) -> Ptr[u8]
   def SSL_free(ssl: Ptr[u8]) -> Unit
   def SSL_set_fd(ssl: Ptr[u8], fd: Int) -> Int
   def SSL_set_tlsext_host_name(ssl: Ptr[u8], name: Ptr[u8]) -> Int
+  def SSL_set1_host(ssl: Ptr[u8], name: Ptr[u8]) -> Int
   def SSL_connect(ssl: Ptr[u8]) -> Int
+  def SSL_get_verify_result(ssl: Ptr[u8]) -> Int
   def SSL_read(ssl: Ptr[u8], buf: Ptr[u8], num: Int) -> Int
   def SSL_write(ssl: Ptr[u8], buf: Ptr[u8], num: Int) -> Int
   def SSL_shutdown(ssl: Ptr[u8]) -> Int
@@ -740,13 +1498,22 @@ extern "C"
   def ERR_error_string(e: UInt, buf: Ptr[u8]) -> Ptr[u8]
 end
 
-static mut TLS_INITIALIZED: Bool = false
+static mut TLS_INIT_STATE: AtomicInt = AtomicInt { value: 0 }
 
 def tls_init() -> Unit
-  if !TLS_INITIALIZED then
+  let INCOMPLETE = 0
+  let RUNNING = 1
+  let COMPLETE = 2
+
+  match TLS_INIT_STATE.compare_exchange(INCOMPLETE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+  when Result::Ok(_) then
     SSL_library_init()
     SSL_load_error_strings()
-    TLS_INITIALIZED = true
+    TLS_INIT_STATE.store(COMPLETE, Ordering::Release)
+  when Result::Err(_) then
+    while TLS_INIT_STATE.load(Ordering::Acquire) == RUNNING do
+      thread_yield()
+    end
   end
 end
 
@@ -762,11 +1529,19 @@ end
 
 def tls_connect(stream: TcpStream, hostname: &String) -> Result[TlsStream, String]
   tls_init()
+  let SSL_VERIFY_PEER = 1
+  let X509_V_OK = 0
   
   let method = TLS_client_method()
   let ctx = SSL_CTX_new(method)
   if ctx.is_null() then
     return Result::Err("failed to create SSL context")
+  end
+
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, Ptr::null())
+  if SSL_CTX_set_default_verify_paths(ctx) != 1 then
+    SSL_CTX_free(ctx)
+    return Result::Err("failed to load system CA trust store")
   end
   
   let ssl = SSL_new(ctx)
@@ -785,7 +1560,17 @@ def tls_connect(stream: TcpStream, hostname: &String) -> Result[TlsStream, Strin
   
   # Set SNI hostname
   let hostname_cstr = hostname.to_cstring()
-  SSL_set_tlsext_host_name(ssl, hostname_cstr.as_ptr())
+  if SSL_set_tlsext_host_name(ssl, hostname_cstr.as_ptr()) != 1 then
+    SSL_free(ssl)
+    SSL_CTX_free(ctx)
+    return Result::Err("failed to set TLS SNI hostname")
+  end
+
+  if SSL_set1_host(ssl, hostname_cstr.as_ptr()) != 1 then
+    SSL_free(ssl)
+    SSL_CTX_free(ctx)
+    return Result::Err("failed to enable TLS hostname verification")
+  end
   
   # Perform handshake
   let ret = SSL_connect(ssl)
@@ -794,6 +1579,12 @@ def tls_connect(stream: TcpStream, hostname: &String) -> Result[TlsStream, Strin
     SSL_free(ssl)
     SSL_CTX_free(ctx)
     return Result::Err(err_msg)
+  end
+
+  if SSL_get_verify_result(ssl) != X509_V_OK then
+    SSL_free(ssl)
+    SSL_CTX_free(ctx)
+    return Result::Err("TLS certificate verification failed")
   end
   
   Result::Ok(TlsStream {
@@ -814,19 +1605,31 @@ impl HttpConnection for TlsStream
   end
   
   def write_all(self: &mut TlsStream, data: &[u8]) -> Result[Unit, HttpError]
-    let ret = SSL_write(self.ssl, data.as_ptr(), data.len() as Int)
-    if ret < 0 then
-      Result::Err(HttpError::Tls(ssl_error_message(self.ssl, ret, "SSL write")))
-    else
-      Result::Ok(())
+    mut offset = 0
+    while offset < data.len() do
+      let ret = SSL_write(self.ssl, data[offset..].as_ptr(), (data.len() - offset) as Int)
+      if ret < 0 then
+        return Result::Err(HttpError::Tls(ssl_error_message(self.ssl, ret, "SSL write")))
+      elsif ret == 0 then
+        return Result::Err(HttpError::Tls("SSL write returned 0".to_string()))
+      else
+        offset = offset + ret as UInt
+      end
     end
+    Result::Ok(())
   end
   
   def close(self: &mut TlsStream) -> Unit
-    SSL_shutdown(self.ssl)
-    SSL_free(self.ssl)
-    SSL_CTX_free(self.ssl_ctx)
-    self.inner.shutdown()
+    if !self.ssl.is_null() then
+      SSL_shutdown(self.ssl)
+      SSL_free(self.ssl)
+      self.ssl = Ptr::null()
+    end
+    if !self.ssl_ctx.is_null() then
+      SSL_CTX_free(self.ssl_ctx)
+      self.ssl_ctx = Ptr::null()
+    end
+    let _ = self.inner.shutdown(2)
   end
 end
 
@@ -854,11 +1657,13 @@ def parse_response(conn: &mut Box[dyn HttpConnection]) -> Result[HttpResponse, H
     buffer.extend(&temp[0..n])
     
     # Look for \r\n\r\n
-    for i in 0..(buffer.len() - 3) do
-      if buffer[i] == '\r' as u8 && buffer[i+1] == '\n' as u8 &&
-         buffer[i+2] == '\r' as u8 && buffer[i+3] == '\n' as u8 then
-        headers_end = Option::Some(i)
-        break
+    if buffer.len() >= 4 then
+      for i in 0..(buffer.len() - 3) do
+        if buffer[i] == '\r' as u8 && buffer[i+1] == '\n' as u8 &&
+           buffer[i+2] == '\r' as u8 && buffer[i+3] == '\n' as u8 then
+          headers_end = Option::Some(i)
+          break
+        end
       end
     end
   end
@@ -953,7 +1758,7 @@ def read_chunked_body(conn: &mut Box[dyn HttpConnection], initial: &Vec[u8]) -> 
       let n = conn.read(&mut temp)?
       if n == 0 then break end
       buffer.extend(&temp[0..n])
-      continue
+      next
     end
     
     let line_end_idx = line_end.unwrap()
@@ -987,6 +1792,7 @@ def read_chunked_body(conn: &mut Box[dyn HttpConnection], initial: &Vec[u8]) -> 
 end
 
 def find_crlf(buf: &Vec[u8]) -> Option[UInt]
+  if buf.len() < 2 then return Option::None end
   for i in 0..(buf.len() - 1) do
     if buf[i] == '\r' as u8 && buf[i+1] == '\n' as u8 then
       return Option::Some(i)
@@ -1010,14 +1816,15 @@ end
 
 impl HttpServer
   def listen(self: &HttpServer) -> Result[Unit, HttpError]
-    let listener = match std::net::tcp_listen(self.port)
+    let bind_addr = std::net::socket_addr_v4(std::net::ipv4_any(), self.port as u16)
+    let listener = match std::net::tcp_bind(bind_addr)
     when Result::Ok(l) then l
     when Result::Err(e) then return Result::Err(HttpError::Io(e.to_string()))
     end
     
     loop
       match listener.accept()
-      when Result::Ok((stream, addr)) then
+      when Result::Ok(stream) then
         # Handle request (single-threaded for simplicity)
         self.handle_connection(stream)
       when Result::Err(e) then
@@ -1042,7 +1849,7 @@ impl HttpServer
       end
     when Result::Err(_) then ()
     end
-    stream.shutdown()
+    let _ = stream.shutdown(2)
   end
 end
 
@@ -1152,13 +1959,13 @@ def parse_hex_uint(s: &String) -> UInt
   for c in s.chars() do
     let digit = if c >= '0' && c <= '9' then
       c as UInt - '0' as UInt
-    else if c >= 'a' && c <= 'f' then
+    elsif c >= 'a' && c <= 'f' then
       c as UInt - 'a' as UInt + 10
-    else if c >= 'A' && c <= 'F' then
+    elsif c >= 'A' && c <= 'F' then
       c as UInt - 'A' as UInt + 10
     else
       break
-    end end end
+    end
     result = result * 16 + digit
   end
   result

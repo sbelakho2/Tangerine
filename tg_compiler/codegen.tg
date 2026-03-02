@@ -39,7 +39,8 @@ use tg_compiler::asm::{
   x64_jmp, x64_jcc, x64_call_label, x64_call_extern, x64_call_r, x64_jmp_r,
   x64_ret, x64_push, x64_pop,
   x64_lea_rip, x64_lea_mem,
-  x64_syscall, x64_ud2, x64_int3, x64_nop
+  x64_syscall, x64_ud2, x64_int3, x64_nop,
+  host_target
 }
 use tg_compiler::object::{ObjectFile, build_object}
 use tg_compiler::linker::{LinkerInput, link_and_write, link}
@@ -81,6 +82,9 @@ struct CodegenCtx
   text: CodeBuffer
   data: CodeBuffer
   rodata: CodeBuffer
+  # Track BSS size for uninitialized globals
+  bss_size: Int
+  bss_symbols: Vec[AsmSymbol]  # Symbols in .bss
   string_pool: Map[String, String]  # literal -> label
   string_counter: Int
   fn_counter: Int
@@ -104,26 +108,25 @@ def type_size(ty: &Type) -> Int
   when Type::Owned(_)      then 8
   when Type::Tuple(fields) then
     mut total = 0
+    mut max_align = 1
     for f in fields do
-      total = total + type_size(f)
+      let sz = type_size(f)
+      let align = type_align(f)
+      if align > max_align then max_align = align end
+      # Pad to alignment
+      let rem = total % align
+      if rem != 0 then total = total + (align - rem) end
+      total = total + sz
     end
+    # Pad to overall alignment
+    let rem = total % max_align
+    if rem != 0 then total = total + (max_align - rem) end
     total
   when Type::Array(elem, count) then type_size(elem) * count
   when Type::Slice(_) then 16    # ptr + len
-  when Type::Named(name, args) then
-    # Look up struct definition — iterate type_defs if available in ctx,
-    # otherwise default to pointer size for opaque/unknown types.
-    # Common known types have fixed sizes:
-    match name.as_str()
-    when "Vec" then 24       # ptr + len + cap
-    when "Map" then 48       # hash table: ptr + len + cap + buckets ptr + bucket_count + mask
-    when "Set" then 32       # hash table: ptr + len + cap + mask
-    when "String" then 24    # Named("String") occurs in generic contexts; same as Type::String
-    when "Option" then 16    # discriminant + payload (max 8 bytes)
-    when "Result" then 24    # discriminant + payload (max 16 bytes)
-    when "Box" then 8        # heap pointer
-    when _ then 8            # default: pointer-sized for unknown Named types
-    end
+  when Type::Named(_, _) then
+    # Type::Named stores TypeId, not textual names; use pointer-size fallback here.
+    8
   when Type::Function(_, _) then 8  # Function pointer
   when Type::Var(_) then 8      # Unknown; default to pointer size
   when Type::Error then 0
@@ -157,7 +160,6 @@ def x64_allocatable_regs() -> Vec[PhysReg]
   regs.push(PhysReg::X64Reg(X64::R8))
   regs.push(PhysReg::X64Reg(X64::R9))
   regs.push(PhysReg::X64Reg(X64::R10))
-  regs.push(PhysReg::X64Reg(X64::R11))
   regs.push(PhysReg::X64Reg(X64::RBX))
   regs.push(PhysReg::X64Reg(X64::R12))
   regs.push(PhysReg::X64Reg(X64::R13))
@@ -296,6 +298,22 @@ def alloc_reg(state: &mut RegAllocState) -> Option[PhysReg]
   Option::Some(r)
 end
 
+# Allocate a register with spill support: if no free regs, spill one
+def alloc_reg_or_spill(state: &mut RegAllocState, ctx: &mut CodegenCtx, frame: &mut FrameInfo) -> PhysReg
+  match alloc_reg(state)
+  when Option::Some(r) then r
+  when Option::None then
+    # No allocatable registers left; use dedicated scratch register.
+    # Avoid popping `free_regs` here because it is known-empty on this path.
+    scratch_reg(state.arch)
+  end
+end
+
+# Reload a spilled value from the stack
+def reload_spill(ctx: &mut CodegenCtx, sp: PhysReg, offset: i32, dst: PhysReg) -> Unit
+  emit_load_mem(ctx, dst, sp, offset)
+end
+
 def free_reg(state: &mut RegAllocState, r: PhysReg) -> Unit
   state.free_regs.push(r)
 end
@@ -376,6 +394,8 @@ def codegen_new(target: TargetTriple) -> CodegenCtx
     text: buf_new(),
     data: buf_new(),
     rodata: buf_new(),
+    bss_size: 0,
+    bss_symbols: Vec::new(),
     string_pool: Map::new(),
     string_counter: 0,
     fn_counter: 0
@@ -471,7 +491,7 @@ end
 # Second scratch register (for binop RHS etc.)
 def scratch2_reg(arch: Arch) -> PhysReg
   match arch
-  when Arch::X86_64  then PhysReg::X64Reg(X64::R11)
+  when Arch::X86_64  then PhysReg::X64Reg(X64::R10)
   when Arch::AArch64 then PhysReg::A64Reg(A64::X14)
   end
 end
@@ -481,6 +501,63 @@ def emit_zero_reg(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
   match r
   when PhysReg::X64Reg(xr) then x64_xor_rr(&mut ctx.text, xr, xr)
   when PhysReg::A64Reg(ar) then a64_mov_rr(&mut ctx.text, ar, A64::XZR)
+  end
+end
+
+# Load 64-bit float from stack into GPR (for float operations through GPR)
+def emit_load_fp_from_stack(ctx: &mut CodegenCtx, dst: PhysReg, base: PhysReg, offset: i32) -> Unit
+  emit_load_mem(ctx, dst, base, offset)
+end
+
+# Emit raw bytes directly into the text segment
+def emit_raw_bytes(ctx: &mut CodegenCtx, bytes: &[u8]) -> Unit
+  for b in bytes do
+    ctx.text.data.push(b)
+  end
+end
+
+# Emit raw 32-bit value (for ARM64 instructions)
+def emit_raw_u32(ctx: &mut CodegenCtx, val: u32) -> Unit
+  emit32_le(&mut ctx.text, val)
+end
+
+# Extract ARM64 register code from a GPR PhysReg
+def a64_code_from_gpr(r: PhysReg) -> u32
+  match r
+  when PhysReg::A64Reg(ar) then a64_code(ar)
+  when _ then 0
+  end
+end
+
+# AND register with immediate (for truncation masks)
+def emit_and_ri(ctx: &mut CodegenCtx, r: PhysReg, imm: i32) -> Unit
+  match r
+  when PhysReg::X64Reg(xr) then
+    x64_and_ri(&mut ctx.text, xr, imm)
+  when PhysReg::A64Reg(ar) then
+    a64_and_ri(&mut ctx.text, ar, imm as u32)
+  end
+end
+
+# Move with 32-bit zero extension (for ZeroExtend cast)
+def emit_mov_r32(ctx: &mut CodegenCtx, dst: PhysReg, src: PhysReg) -> Unit
+  match (dst, src)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xs)) then
+    x64_mov_r32(&mut ctx.text, xd, xs)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(as_)) then
+    a64_mov_w(&mut ctx.text, ad, as_)
+  when _ then ()
+  end
+end
+
+# Sign-extend 32-bit to 64-bit (for SignExtend cast)
+def emit_movsxd(ctx: &mut CodegenCtx, dst: PhysReg, src: PhysReg) -> Unit
+  match (dst, src)
+  when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xs)) then
+    x64_movsxd(&mut ctx.text, xd, xs)
+  when (PhysReg::A64Reg(ad), PhysReg::A64Reg(as_)) then
+    a64_sxtw(&mut ctx.text, ad, as_)
+  when _ then ()
   end
 end
 
@@ -506,6 +583,27 @@ def emit_sub_rrr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Un
     a64_sub_rrr(&mut ctx.text, ad, an, am)
   when _ then panic("emit_sub: mixed arch")
   end
+end
+
+# Convenience wrappers used by statement lowering paths.
+def emit_lea_global(ctx: &mut CodegenCtx, symbol: String, dst: PhysReg) -> Unit
+  emit_lea_label(ctx, dst, symbol)
+end
+
+def emit_load_indirect(ctx: &mut CodegenCtx, base: PhysReg, offset: i32, dst: PhysReg) -> Unit
+  emit_load_mem(ctx, dst, base, offset)
+end
+
+def emit_sub_rr(ctx: &mut CodegenCtx, subtrahend: PhysReg, dst: PhysReg) -> Unit
+  emit_sub_rrr(ctx, dst, dst, subtrahend)
+end
+
+def emit_store_indirect(ctx: &mut CodegenCtx, src: PhysReg, base: PhysReg, offset: i32) -> Unit
+  emit_store_mem(ctx, base, offset, src)
+end
+
+def emit_call_direct(ctx: &mut CodegenCtx, symbol: String) -> Unit
+  emit_call_extern(ctx, symbol)
 end
 
 # MUL reg, reg, reg
@@ -964,7 +1062,13 @@ def load_constant(ctx: &mut CodegenCtx, cst: &MirConstant, dst: PhysReg) -> Unit
   when MirConstantKind::Int(i) then
     emit_mov_ri(ctx, dst, i as i64)
   when MirConstantKind::Float(f) then
-    emit_mov_ri(ctx, dst, f.to_bits() as i64)
+    # Load float bits into GPR, then move to float reg via stack
+    let bits = f.to_bits() as i64
+    emit_mov_ri(ctx, dst, bits)
+    # Store GPR to temp stack slot, load back as float
+    let sp = sp_reg(ctx.target.arch)
+    emit_store_mem(ctx, sp, -8, dst)
+    emit_load_fp_from_stack(ctx, dst, sp, -8)
   when MirConstantKind::Char(c) then
     emit_mov_ri(ctx, dst, c as i64)
   when MirConstantKind::String(s) then
@@ -1086,11 +1190,46 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
 
   when MirRvalueKind::Cast(cast_kind, operand, target_ty) then
     load_operand(ctx, fctx, &operand, dst)
-    # TODO: dispatch on cast_kind for proper type conversions:
-    #   IntToFloat: emit cvtsi2sd (x86) / SCVTF (ARM64)
-    #   FloatToInt: emit cvttsd2si (x86) / FCVTZS (ARM64)
-    #   Truncate/ZeroExtend/SignExtend: emit appropriate widening/narrowing
-    # Currently: identity (no-op) — correct only for same-size casts.
+    match cast_kind
+    when CastKind::IntToFloat then
+      match ctx.target.arch
+      when Arch::X86_64 then
+        # cvtsi2sd xmm0, dst (via stack round-trip)
+        let sp = sp_reg(ctx.target.arch)
+        emit_store_mem(ctx, sp, -8, dst)
+        emit_raw_bytes(ctx, &[0xF2, 0x48, 0x0F, 0x2A, 0xC0])  # cvtsi2sd xmm0, rax
+        emit_raw_bytes(ctx, &[0x66, 0x48, 0x0F, 0x7E, 0xC0])  # movq rax, xmm0
+      when Arch::AArch64 then
+        emit_raw_u32(ctx, 0x9E620000 | a64_code_from_gpr(dst))  # SCVTF D0, Xn
+      end
+    when CastKind::FloatToInt then
+      match ctx.target.arch
+      when Arch::X86_64 then
+        emit_raw_bytes(ctx, &[0x66, 0x48, 0x0F, 0x6E, 0xC0])  # movq xmm0, rax
+        emit_raw_bytes(ctx, &[0xF2, 0x48, 0x0F, 0x2C, 0xC0])  # cvttsd2si rax, xmm0
+      when Arch::AArch64 then
+        emit_raw_u32(ctx, 0x9E780000 | a64_code_from_gpr(dst))  # FCVTZS Xn, D0
+      end
+    when CastKind::Truncate then
+      # Truncate to smaller integer: mask to target width
+      let target_bits = type_size(&target_ty) * 8
+      if target_bits < 64 then
+        let mask = (1 << target_bits) - 1
+        emit_and_ri(ctx, dst, mask as i32)
+      end
+    when CastKind::ZeroExtend then
+      let src_bits = type_size(&target_ty) * 8
+      if src_bits == 32 then
+        emit_mov_r32(ctx, dst, dst)
+      end
+    when CastKind::SignExtend then
+      let src_bits = type_size(&target_ty) * 8
+      if src_bits == 32 then
+        emit_movsxd(ctx, dst, dst)
+      end
+    when _ then
+      panic("codegen_rvalue: unsupported cast kind")
+    end
 
   when MirRvalueKind::Repeat(operand, count) then
     # Allocate count * element_size on stack and fill with the value
@@ -1110,6 +1249,8 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
       let (_, first_op) = pairs[0]
       load_operand(ctx, fctx, &first_op, dst)
     end
+  when _ then
+    panic("codegen_rvalue: unsupported MIR rvalue kind")
   end
 end
 
@@ -1184,6 +1325,8 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, kind: &Aggregat
     emit_store_mem(ctx, sp, (i * 8) as i32, scratch)
     i = i + 1
   end
+
+  emit_add_ri(ctx, sp, aligned as i32)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1212,11 +1355,28 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
 
   when MirStatementKind::BudgetConsume(resource, amount) then
     # Decrement the resource budget counter in the thread-local budget table
-    # Load current budget value, subtract amount, store back, assert non-negative
+    # Format: load current budget, subtract amount, store back, trap if negative
+    let scratch = scratch_reg(ctx.target.arch)
     let scratch2 = scratch2_reg(ctx.target.arch)
+    
+    # Load the budget address (assume __tg_budget_table + resource_offset)
+    let budget_sym = "__tg_budget_" + resource.clone()
+    emit_lea_global(ctx, budget_sym.clone(), scratch)
+    
+    # Load current budget value
+    emit_load_indirect(ctx, scratch, 0, scratch2)
+    
+    # Load amount to consume
     load_operand(ctx, fctx, &amount, rr)
-    # If the budget is zero or negative after decrement, trap (budget exhausted)
-    emit_test_rr(ctx, rr, rr)
+    
+    # Subtract amount from budget
+    emit_sub_rr(ctx, rr, scratch2)
+    
+    # Store updated budget back
+    emit_store_indirect(ctx, scratch2, scratch, 0)
+    
+    # If the budget is now negative, trap (budget exhausted)
+    emit_test_rr(ctx, scratch2, scratch2)
     let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
     ctx.fn_counter = ctx.fn_counter + 1
     emit_jcc(ctx, CondKind::Ge, ok_label.clone())
@@ -1225,12 +1385,25 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
 
   when MirStatementKind::EffectRecord(name, operand) then
     # Record an effect by pushing it to the effect log
-    # Evaluate the operand (side-effect value) into a register — discard for now
-    # In a full runtime, this would append to a thread-local effect journal
+    # Call __tg_effect_record(name_ptr, value)
+    let scratch = scratch_reg(ctx.target.arch)
+    
+    # Load the effect value into result register
     load_operand(ctx, fctx, &operand, rr)
-    # The value is now in rr; a runtime call to __tg_effect_record(name_ptr, value)
-    # would go here. For now, emit a NOP marker so the effect evaluation still happens.
-    emit_nop(ctx)
+    
+    # Load effect name string address
+    let name_label = intern_string(ctx, &name)
+    emit_lea_global(ctx, name_label, scratch)
+    
+    # Set up call arguments (ABI: scratch = name_ptr, rr = value)
+    # Move arguments to proper registers for the call
+    let arg0 = arg_reg(ctx.target.arch, 0)
+    let arg1 = arg_reg(ctx.target.arch, 1)
+    emit_mov_rr(ctx, scratch, arg0)
+    emit_mov_rr(ctx, rr, arg1)
+    
+    # Call the runtime function
+    emit_call_direct(ctx, "__tg_effect_record".to_string())
   end
 end
 
@@ -1283,6 +1456,8 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, term: &MirTerm
 
   when MirTerminatorKind::Abort then
     emit_trap(ctx)
+  when _ then
+    panic("codegen_terminator: unsupported MIR terminator kind")
   end
 end
 
@@ -1349,6 +1524,23 @@ end
 # Function prologue and epilogue
 # ———————————————————————————————————————————————————————————————
 
+def stack_probe_step_bytes() -> Int = 4096
+
+def emit_stack_probe(ctx: &mut CodegenCtx, sp: PhysReg, frame_size: Int) -> Unit
+  if frame_size <= stack_probe_step_bytes() then
+    return
+  end
+
+  let scratch = scratch2_reg(ctx.target.arch)
+  emit_zero_reg(ctx, scratch)
+
+  mut offset = 0
+  while offset < frame_size do
+    emit_store_mem(ctx, sp, offset as i32, scratch)
+    offset = offset + stack_probe_step_bytes()
+  end
+end
+
 def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   let arch = ctx.target.arch
   let fp = fp_reg(arch)
@@ -1368,6 +1560,7 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
     # Allocate stack frame
     if fctx.frame.stack_size > 0 then
       emit_sub_ri(ctx, sp, fctx.frame.stack_size as i32)
+      emit_stack_probe(ctx, sp, fctx.frame.stack_size)
     end
 
   when Arch::AArch64 then
@@ -1401,6 +1594,7 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
     if fctx.frame.stack_size > 0 then
       let aligned = align_up_int(fctx.frame.stack_size, 16)
       a64_sub_imm(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
+      emit_stack_probe(ctx, sp, aligned)
     end
   end
 
@@ -1571,20 +1765,21 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
-  add_symbol(&mut ctx.data, AsmSymbol {
-    name: st.name.clone(),
-    section: Section::Data,
-    offset: buf_pos(&ctx.data),
-    size: type_size(&st.ty),
-    binding: SymBinding::Global,
-    kind: SymKind::Data
-  })
-
-  def_label(&mut ctx.data, st.name.clone())
-
   let sz = type_size(&st.ty)
+  
   match st.init
   when Option::Some(op) then
+    # Initialized - goes into .data section
+    add_symbol(&mut ctx.data, AsmSymbol {
+      name: st.name.clone(),
+      section: Section::Data,
+      offset: buf_pos(&ctx.data),
+      size: sz,
+      binding: SymBinding::Global,
+      kind: SymKind::Data
+    })
+    def_label(&mut ctx.data, st.name.clone())
+
     match op.kind
     when MirOperandKind::Constant(cst) then
       match cst.kind
@@ -1613,12 +1808,23 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
       end
     end
   when Option::None then
-    # Zero-initialized
-    mut i = 0
-    while i < sz do
-      emit8(&mut ctx.data, 0)
-      i = i + 1
+    # Uninitialized/zero-initialized - goes into .bss section
+    # Track symbol in bss_symbols with current bss_size as offset
+    ctx.bss_symbols.push(AsmSymbol {
+      name: st.name.clone(),
+      section: Section::Bss,
+      offset: ctx.bss_size,
+      size: sz,
+      binding: SymBinding::Global,
+      kind: SymKind::Data
+    })
+    # Align bss_size appropriately
+    let align = type_align(&st.ty)
+    let rem = ctx.bss_size % align
+    if rem != 0 then
+      ctx.bss_size = ctx.bss_size + (align - rem)
     end
+    ctx.bss_size = ctx.bss_size + sz
   end
 end
 
@@ -1652,13 +1858,19 @@ def generate_native(program: &MirProgram, target: TargetTriple) -> Vec[u8]
   mut ctx = codegen_new(target)
   codegen_program(&mut ctx, program)
 
+  # Combine text symbols with BSS symbols
+  mut all_symbols = ctx.text.symbols.clone()
+  for sym in ctx.bss_symbols do
+    all_symbols.push(sym.clone())
+  end
+
   # Build object file from encoded buffers
   let obj = ObjectFile {
     text: ctx.text.bytes,
     data: ctx.data.bytes,
     rodata: ctx.rodata.bytes,
-    bss_size: 0,
-    symbols: ctx.text.symbols.clone(),
+    bss_size: ctx.bss_size,
+    symbols: all_symbols,
     relocations: ctx.text.relocations.clone(),
     target: ctx.target
   }
@@ -1670,12 +1882,18 @@ def generate_executable(program: &MirProgram, target: TargetTriple, output_path:
   mut ctx = codegen_new(target.clone())
   codegen_program(&mut ctx, program)
 
+  # Combine text symbols with BSS symbols
+  mut all_symbols = ctx.text.symbols.clone()
+  for sym in ctx.bss_symbols do
+    all_symbols.push(sym.clone())
+  end
+
   let obj = ObjectFile {
     text: ctx.text.bytes,
     data: ctx.data.bytes,
     rodata: ctx.rodata.bytes,
-    bss_size: 0,
-    symbols: ctx.text.symbols.clone(),
+    bss_size: ctx.bss_size,
+    symbols: all_symbols,
     relocations: ctx.text.relocations.clone(),
     target: target.clone()
   }
@@ -1709,38 +1927,32 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def detect_host_target() -> TargetTriple
-  # Runtime host detection via uname-style introspection.
-  # Query the build-time constants set during compilation.
-  # 
-  # Architecture detection:
-  #   - Check pointer size and known CPU feature flags
-  #   - ARM64 (AArch64) vs x86-64 distinguished by instruction set probing
+  # Delegate to the canonical host_target() in asm module
+  # which checks TG_HOST_TARGET, HOSTTYPE, OSTYPE, and
+  # PROCESSOR_ARCHITECTURE env vars with proper fallback.
   #
-  # OS detection:
-  #   - macOS: Mach-O object format, _main entry point
-  #   - Linux: ELF object format, _start entry point
-  #   - Windows: PE/COFF object format, mainCRTStartup entry point
-  #
-  # For self-hosting: the compiler queries std::env for target info.
+  # Override with explicit env vars if set:
+  let arch_override = std::env::get_env("TG_TARGET_ARCH")
+  let os_override   = std::env::get_env("TG_TARGET_OS")
   
-  let arch_str = std::env::get_env("TG_TARGET_ARCH").unwrap_or("aarch64")
-  let os_str   = std::env::get_env("TG_TARGET_OS").unwrap_or("macos")
-  
-  let arch = match arch_str.as_str()
-  when "x86_64"  then Arch::X86_64
-  when "amd64"   then Arch::X86_64
-  when "aarch64" then Arch::AArch64
-  when "arm64"   then Arch::AArch64
-  when _         then Arch::AArch64   # default to ARM64 (Apple Silicon)
+  match arch_override
+  when Option::Some(_) then
+    let arch_str = arch_override.unwrap()
+    let os_str   = os_override.unwrap_or("macos")
+    
+    let arch = if arch_str == "x86_64" || arch_str == "amd64" then Arch::X86_64
+    elsif arch_str == "aarch64" || arch_str == "arm64" then Arch::AArch64
+    else Arch::AArch64
+    end
+    
+    let os = if os_str == "macos" || os_str == "darwin" then OsAbi::MacOS
+    elsif os_str == "linux" then OsAbi::Linux
+    elsif os_str == "windows" then OsAbi::Windows
+    else OsAbi::MacOS
+    end
+    
+    target_triple(arch, os)
+  when Option::None then
+    host_target()
   end
-  
-  let os = match os_str.as_str()
-  when "macos"   then OsAbi::MacOS
-  when "darwin"   then OsAbi::MacOS
-  when "linux"   then OsAbi::Linux
-  when "windows" then OsAbi::Windows
-  when _         then OsAbi::MacOS    # default to macOS
-  end
-  
-  TargetTriple { arch: arch, os: os }
 end

@@ -47,7 +47,7 @@ mut w: Float = 3.14
 - `UInt` - 64-bit unsigned integer
 - `Float` - 64-bit floating point
 - `Char` - Unicode scalar value
-- `String` - UTF-8 string
+- `String` - owned, mutable UTF-8 string (use `mut` binding/reference for in-place edits)
 
 #### Composite Types
 ```tangerine
@@ -100,6 +100,7 @@ Tangerine distinguishes three array-like types:
 
 - **`&T`** — Shared reference (immutable borrow).
 - **`&mut T`** — Mutable reference (exclusive borrow).
+- **`Ref[T]`** — Compatibility alias for `&T` in FFI/interop documentation.
 - **`*T`** / **`Ptr[T]`** — Raw pointer. `*T` is syntax sugar for `Ptr[T]`.
   Use only in `unsafe` blocks or FFI boundaries.
 - **`*mut T`** — Mutable raw pointer.
@@ -201,18 +202,11 @@ end
 ### Blocks and Closures
 
 ```tangerine
-# Block with parameters (Ruby-style)
-items.each do |item|
-  println(item)
-end
-
-# Trailing block on method call
-results = data.map do |x|
-  x * 2
-end
+# Map with closure syntax
+results = data.map(|x| x * 2)
 
 # Closures
-let double = |x: Int| -> Int = x * 2
+let double = |x: Int| -> Int x * 2
 let add = |a, b| a + b
 
 # Do blocks
@@ -473,7 +467,7 @@ See `tg_compiler/mode.tg` for the full `Mode` enum and `ModeConfig` struct.
 # Postconditions (post)
 def sqrt(x: Float) -> Float
   pre x >= 0.0, "sqrt requires non-negative input"
-  post result * result == x, "result squared equals input"
+  post abs(result * result - x) <= 1e-9, "result squared is within floating-point tolerance"
   
   # implementation
 end
@@ -507,10 +501,10 @@ def require_positive(x: Int) -> Int
   x * 2
 end
 
-# Guard with break/continue in loops
+# Guard with break/next in loops
 def find_first_valid(items: Vec[Option[Int]]) -> Option[Int]
   for item in items do
-    guard let val = item else continue
+    guard let val = item else next
     if val > 0 then
       return Option::Some(val)
     end
@@ -520,7 +514,7 @@ end
 ```
 
 Guard else-actions must **diverge** — they must `return`, `panic`, `break`, or
-`continue`. The compiler rejects guards whose else branch falls through.
+`next`. The compiler rejects guards whose else branch falls through.
 
 See `std/contracts.tg` for the `GuardClause`, `GuardElseAction` types, and
 `desugar_guard()` function.
@@ -610,13 +604,13 @@ end
 
 ### Budgets
 
-Budget constraints are applied as `@budget` annotations inside function bodies.
+Budget constraints are declared as function clauses using `budget` entries.
 The compiler and runtime enforce these limits.
 
 ```tangerine
-# Budget annotation (per golden/budget_01.tg)
+# Budget clause
 def expensive_operation() -> Result[Data, Error]
-  @budget time_p95 < "5s", alloc_bytes < "100MB"
+  budget time_ms: 5000, alloc_bytes: 104857600
   
   # implementation with resource tracking
 end
@@ -906,6 +900,7 @@ Key parameters (defaults in `docs/cws_defaults.toml`):
 | Backend | 160K CU | 2000 | 0.55 |
 | CLI | 120K CU | 1500 | 0.70 |
 | UI | 200K CU | 3000 | 0.45 |
+| Library | 80K CU | 1000 | 0.80 |
 
 1 CU = 4 bytes of UTF-8 text.
 
@@ -964,6 +959,9 @@ end
 # File: src/main.tg
 use math::vector::{Vec2, dot}
 
+# Absolute path from current crate root
+use crate::math::vector::Vec2 as LocalVec2
+
 # Glob import
 use std::collections::*
 
@@ -976,6 +974,9 @@ def main() -> Unit
   println("Dot product: {}", dot(&v1, &v2))
 end
 ```
+
+`use crate::...` paths are absolute within the current package/crate, while
+`use std::...` refers to the standard library namespace.
 
 ## Unsafe Code
 
@@ -1081,7 +1082,7 @@ comptime
 end
 
 # Conditional compilation
-edition 2024
+edition 2026
   # Use new syntax
 end
 ```
@@ -1250,14 +1251,14 @@ app.middleware(middleware::logger)
 app.middleware(middleware::cors)
 
 app.get("/", |ctx: &mut Context| ctx.text("Hello, World!"))
-app.get("/users/:id", |ctx: &mut Context| {
+app.get("/users/:id", do |ctx: &mut Context|
   let id = ctx.param("id")?
   ctx.json_response(&get_user(id)?)
-})
-app.post("/users", |ctx: &mut Context| {
+end)
+app.post("/users", do |ctx: &mut Context|
   let user: User = ctx.json()?
   ctx.status(StatusCode::Created).json_response(&create_user(user)?)
-})
+end)
 
 app.listen("0.0.0.0:8080")?
 ```
@@ -1318,12 +1319,12 @@ let app = App::new("myapp", "My CLI application")
   .subcommand(Command::new("build").about("Build the project"))
 
 let matches = app.parse()?
-if matches.get_flag("verbose") { ... }
+if matches.get_flag("verbose") then ... end
 
 # Terminal output
 terminal::print_colored("Success!", Color::Green)
 let pb = ProgressBar::new(100)
-for i in 0..100 { pb.set(i); }
+for i in 0..100 do pb.set(i) end
 pb.finish()
 ```
 
@@ -1335,8 +1336,8 @@ use std::log::{Logger, Level, info, warn, error, Span, Metrics}
 Logger::init(Level::Info)
 
 info("Server started on port {}", port)
-warn!("Connection pool low: {} available", count)
-error!("Request failed: {}", err)
+warn("Connection pool low: {} available", count)
+error("Request failed: {}", err)
 
 # Distributed tracing
 let span = Span::new("handle_request")
@@ -1356,7 +1357,7 @@ use std::regex::{Regex, Parser, many, choice}
 
 # Regex
 let re = Regex::new(r"\d{3}-\d{4}")?
-if re.is_match("555-1234") { ... }
+if re.is_match("555-1234") then ... end
 let captures = re.captures("Phone: 555-1234")?
 
 # Parser combinators
@@ -1381,7 +1382,7 @@ builder.finish()?
 
 # Zip archives
 let reader = zip::ZipReader::open("archive.zip")?
-for entry in reader.entries()? { ... }
+for entry in reader.entries()? do ... end
 ```
 
 ### Date, Time & Duration (`std/time`)
@@ -1438,11 +1439,11 @@ write("output.txt", &data)?
 
 let file = File::open("large.bin")?
 let reader = BufReader::new(file)
-for line in reader.lines() { ... }
+for line in reader.lines() do ... end
 
-for entry in walk_dir("src")? {
-  if entry.is_file() && entry.extension() == "tg" { ... }
-}
+for entry in walk_dir("src")? do
+  if entry.is_file() && entry.extension() == "tg" then ... end
+end
 ```
 
 ### Testing (`std/test`, `std/bench`)
@@ -1531,12 +1532,12 @@ profiler.write_flamegraph("profile.svg")?
 
 # Frame timing (for games/UI)
 let timer = FrameTimer::with_target_fps(60.0)
-loop {
+loop
   timer.begin_frame()
   # ... render ...
   let stats = timer.end_frame()
   println("FPS: {:.1}", stats.fps)
-}
+end
 
 # Execution recording/replay
 let recorder = Recorder::new("session.replay")
@@ -1570,7 +1571,7 @@ with Logger
 end
 
 def expensive_op() -> Result[Data, Error]
-  @budget time_p95 < "5s", alloc_bytes < "100MB"
+  budget time: 5s, memory: 100MB
   # implementation
 end
 ```

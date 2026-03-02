@@ -17,7 +17,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map}
 use std::fs::{write_file_bytes}
-use tg_compiler::asm::{Arch, OsAbi, TargetTriple}
+use tg_compiler::asm::{Arch, OsAbi, TargetTriple, RelocKind}
 use tg_compiler::object::{
   ObjectFile, build_object,
   write16, write32, write64, emit_zeros_vec, append_vec, pad_to, align_up,
@@ -38,6 +38,7 @@ end
 struct LinkedSection
   name: String
   data: Vec[u8]
+  mem_size: u64
   vaddr: u64
   file_offset: u64
   alignment: u64
@@ -58,6 +59,136 @@ struct LinkerCtx
   target: TargetTriple
 end
 
+# GOT/PLT support for dynamic linking
+struct GotEntry
+  symbol_name: String
+  got_offset: u64       # offset within GOT section
+end
+
+struct PltEntry
+  symbol_name: String
+  plt_offset: u64       # offset within PLT section
+  got_index: u64        # corresponding GOT entry index
+end
+
+struct DynamicLinkInfo
+  got_entries: Vec[GotEntry]
+  plt_entries: Vec[PltEntry]
+  got_section_vaddr: u64
+  plt_section_vaddr: u64
+end
+
+# Build GOT and PLT entries for external/undefined symbols
+def build_got_plt(objects: &Vec[ObjectFile], syms: &Map[String, LinkerSymbol]) -> DynamicLinkInfo
+  mut got_entries = Vec::new()
+  mut plt_entries = Vec::new()
+  mut got_offset: u64 = 0
+  mut plt_offset: u64 = 16  # First 16 bytes are PLT0 stub
+  mut got_index: u64 = 0
+
+  # Scan relocations for external references needing GOT/PLT
+  mut extern_syms: Map[String, Bool] = Map::new()
+  for obj in objects do
+    for reloc in obj.relocations do
+      match reloc.kind
+      when RelocKind::R_X86_64_PLT32 then
+        # PLT call - might need PLT entry for dynamic linking
+        match syms.get(&reloc.symbol)
+        when Option::Some(sym) then
+          if !sym.is_defined then
+            extern_syms.insert(reloc.symbol.clone(), true)
+          end
+        when Option::None then
+          extern_syms.insert(reloc.symbol.clone(), true)
+        end
+      when RelocKind::R_X86_64_GOTPCREL then
+        # Reference via GOT
+        match syms.get(&reloc.symbol)
+        when Option::Some(sym) then
+          if !sym.is_defined then
+            extern_syms.insert(reloc.symbol.clone(), true)
+          end
+        when Option::None then
+          extern_syms.insert(reloc.symbol.clone(), true)
+        end
+      when _ then ()
+      end
+    end
+  end
+
+  # Create GOT and PLT entries for external symbols
+  for sym_name in extern_syms.keys() do
+    # GOT entry: 8 bytes per entry (64-bit address)
+    got_entries.push(GotEntry {
+      symbol_name: sym_name.clone(),
+      got_offset: got_offset
+    })
+    
+    # PLT entry: 16 bytes per entry (x86-64 PLT stub)
+    plt_entries.push(PltEntry {
+      symbol_name: sym_name.clone(),
+      plt_offset: plt_offset,
+      got_index: got_index
+    })
+    
+    got_offset = got_offset + 8
+    plt_offset = plt_offset + 16
+    got_index = got_index + 1
+  end
+
+  DynamicLinkInfo {
+    got_entries: got_entries,
+    plt_entries: plt_entries,
+    got_section_vaddr: 0,  # Set later during layout
+    plt_section_vaddr: 0
+  }
+end
+
+# Generate GOT section data (array of 8-byte addresses)
+def emit_got_section(info: &DynamicLinkInfo, syms: &Map[String, LinkerSymbol]) -> Vec[u8]
+  mut data = Vec::new()
+  for entry in info.got_entries do
+    let addr = match syms.get(&entry.symbol_name)
+    when Option::Some(sym) then sym.value
+    when Option::None then 0 as u64  # Lazy binding: filled by dynamic linker
+    end
+    write64(&mut data, addr)
+  end
+  data
+end
+
+# Generate PLT section data (PLT0 + per-symbol stubs)
+def emit_plt_section(info: &DynamicLinkInfo) -> Vec[u8]
+  mut data = Vec::new()
+  
+  # PLT0: push GOT[1], jmp GOT[2] - resolver stub
+  # push [rip+offset to GOT[1]]   ; ff 35 xx xx xx xx
+  # jmp  [rip+offset to GOT[2]]   ; ff 25 xx xx xx xx
+  # nop padding
+  data.push(0xff); data.push(0x35)
+  write32(&mut data, 0)  # Placeholder for GOT[1] offset
+  data.push(0xff); data.push(0x25)
+  write32(&mut data, 0)  # Placeholder for GOT[2] offset
+  emit_zeros_vec(&mut data, 4)  # padding to 16 bytes
+  
+  # Per-symbol PLT entries
+  for entry in info.plt_entries do
+    # jmp [rip+offset_to_got]     ; ff 25 xx xx xx xx
+    # push imm32 (got index)      ; 68 xx xx xx xx
+    # jmp plt0                    ; e9 xx xx xx xx
+    data.push(0xff); data.push(0x25)
+    write32(&mut data, 0)  # Placeholder for GOT offset
+    data.push(0x68)
+    write32(&mut data, entry.got_index as u32)
+    data.push(0xe9)
+    # Jump back to PLT0 (negative offset)
+    let plt0_offset = -((entry.plt_offset as i32) + 16)
+    write32(&mut data, plt0_offset as u32)
+  end
+  
+  data
+end
+
 # ———————————————————————————————————————————————————————————————
 # Symbol resolution
 # ———————————————————————————————————————————————————————————————
@@ -74,16 +205,163 @@ def resolve_symbols(objects: &Vec[ObjectFile]) -> Result[Map[String, LinkerSymbo
         end
       when Option::None then ()
       end
+      let sec_idx = match sym.section
+      when Section::Text   then 0
+      when Section::Data   then 2
+      when Section::Rodata then 1
+      when Section::Bss    then 3
+      when _               then 0
+      end
       syms.insert(sym.name, LinkerSymbol {
         name: sym.name,
         value: sym.offset as u64,
-        section: 0,
+        section: sec_idx,
         is_defined: true
       })
     end
   end
 
   Result::Ok(syms)
+end
+
+
+
+# After sections are merged and virtual addresses assigned we walk every
+# relocation from every object file and patch the bytes in the merged
+# section data so that cross-reference addresses are correct.
+
+def patch_relocations(
+  objects: &Vec[ObjectFile],
+  sections: &mut Vec[LinkedSection],
+  syms: &Map[String, LinkerSymbol],
+  text_offsets: &Vec[u64]       # per-object byte offset into merged .text
+) -> Result[Unit, String]
+
+  mut obj_idx = 0
+  for obj in objects do
+    let obj_text_base = text_offsets[obj_idx]
+
+    for reloc in obj.relocations do
+      # Target symbol virtual address
+      let target_sym = match syms.get(reloc.symbol)
+      when Option::Some(s) then s
+      when Option::None then
+        return Result::Err("undefined symbol in relocation: " + reloc.symbol)
+      end
+
+      # The relocation offset is relative to this object's .text start.
+      # Translate to offset within the merged section.
+      let patch_offset = (obj_text_base as Int) + reloc.offset
+      let target_vaddr = sections[target_sym.section].vaddr + target_sym.value
+
+      # Address of the site being patched (for PC-relative)
+      let site_vaddr = sections[0].vaddr + patch_offset as u64
+
+      match reloc.kind
+      # ---- x86-64 relocations ----
+      when RelocKind::R_X86_64_PC32 then
+        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+        write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+      when RelocKind::R_X86_64_PLT32 then
+        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+        write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+      when RelocKind::R_X86_64_64 then
+        let abs = (target_vaddr as i64) + (reloc.addend as i64)
+        write64_at(&mut sections[0].data, patch_offset, abs as u64)
+
+      when RelocKind::R_X86_64_GOTPCREL then
+        # Without a GOT we treat GOTPCREL the same as PC32 (static link only)
+        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+        write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+      # ---- ARM64 relocations ----
+      when RelocKind::R_AARCH64_CALL26 then
+        let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then
+        let page_target = target_vaddr & 0xFFFFFFFFFFFFF000
+        let page_site   = site_vaddr   & 0xFFFFFFFFFFFFF000
+        let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
+        let immlo = (page_delta as u32) & 0x3
+        let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then
+        let lo12 = (target_vaddr as u32) & 0xFFF
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0xFFC003FF) | (lo12 << 10)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      # ---- Mach-O relocations ----
+      when RelocKind::X86_64_RELOC_BRANCH then
+        let delta = (target_vaddr as i64) - (site_vaddr as i64) - 4
+        write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+      when RelocKind::X86_64_RELOC_SIGNED then
+        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+        write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+      when RelocKind::ARM64_RELOC_BRANCH26 then
+        let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      when RelocKind::ARM64_RELOC_PAGE21 then
+        let page_target = target_vaddr & 0xFFFFFFFFFFFFF000
+        let page_site   = site_vaddr   & 0xFFFFFFFFFFFFF000
+        let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
+        let immlo = (page_delta as u32) & 0x3
+        let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      when RelocKind::ARM64_RELOC_PAGEOFF12 then
+        let lo12 = (target_vaddr as u32) & 0xFFF
+        let existing = read32_at(&sections[0].data, patch_offset)
+        let patched = (existing & 0xFFC003FF) | (lo12 << 10)
+        write32_at(&mut sections[0].data, patch_offset, patched)
+
+      when _ then
+        return Result::Err("unsupported relocation kind during patching")
+      end
+    end
+
+    obj_idx = obj_idx + 1
+  end
+
+  Result::Ok(())
+end
+
+# Helpers for in-place binary patching
+def write32_at(data: &mut Vec[u8], offset: Int, value: u32) -> Unit
+  data[offset]     = (value & 0xFF) as u8
+  data[offset + 1] = ((value >> 8) & 0xFF) as u8
+  data[offset + 2] = ((value >> 16) & 0xFF) as u8
+  data[offset + 3] = ((value >> 24) & 0xFF) as u8
+end
+
+def write64_at(data: &mut Vec[u8], offset: Int, value: u64) -> Unit
+  mut i = 0
+  while i < 8 do
+    data[offset + i] = ((value >> (i * 8)) & 0xFF) as u8
+    i = i + 1
+  end
+end
+
+def read32_at(data: &Vec[u8], offset: Int) -> u32
+  (data[offset] as u32)
+    | ((data[offset + 1] as u32) << 8)
+    | ((data[offset + 2] as u32) << 16)
+    | ((data[offset + 3] as u32) << 24)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -94,17 +372,20 @@ def merge_sections(objects: &Vec[ObjectFile]) -> Vec[LinkedSection]
   mut text_data = Vec::new()
   mut data_data = Vec::new()
   mut rodata_data = Vec::new()
+  mut total_bss: u64 = 0
 
   for obj in objects do
     append_vec(&mut text_data, &obj.text)
     append_vec(&mut data_data, &obj.data)
     append_vec(&mut rodata_data, &obj.rodata)
+    total_bss = total_bss + obj.bss_size as u64
   end
 
   mut sections = Vec::new()
   sections.push(LinkedSection {
     name: ".text",
     data: text_data,
+    mem_size: text_data.len() as u64,
     vaddr: 0,
     file_offset: 0,
     alignment: 16,
@@ -113,6 +394,7 @@ def merge_sections(objects: &Vec[ObjectFile]) -> Vec[LinkedSection]
   sections.push(LinkedSection {
     name: ".rodata",
     data: rodata_data,
+    mem_size: rodata_data.len() as u64,
     vaddr: 0,
     file_offset: 0,
     alignment: 8,
@@ -121,11 +403,25 @@ def merge_sections(objects: &Vec[ObjectFile]) -> Vec[LinkedSection]
   sections.push(LinkedSection {
     name: ".data",
     data: data_data,
+    mem_size: data_data.len() as u64,
     vaddr: 0,
     file_offset: 0,
     alignment: 8,
     flags: 6   # rw-
   })
+
+  # .bss (virtual-only, no file data)
+  if total_bss > 0 then
+    sections.push(LinkedSection {
+      name: ".bss",
+      data: Vec::new(),
+      mem_size: total_bss,
+      vaddr: 0,
+      file_offset: 0,
+      alignment: 8,
+      flags: 6   # rw-
+    })
+  end
 
   sections
 end
@@ -146,6 +442,14 @@ def PF_R() -> u32 = 4
 
 def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
+
+  # Track per-object offsets into merged .text for relocation patching
+  mut text_offsets = Vec::new()
+  mut running_offset: u64 = 0
+  for obj in input.objects do
+    text_offsets.push(running_offset)
+    running_offset = running_offset + obj.text.len() as u64
+  end
 
   # Merge sections
   mut sections = merge_sections(&input.objects)
@@ -175,9 +479,10 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
     sections[i].file_offset = file_offset
     sections[i].vaddr = vaddr
 
-    let sec_size = sections[i].data.len() as u64
-    file_offset = file_offset + sec_size
-    vaddr = vaddr + sec_size
+    let sec_file_size = sections[i].data.len() as u64
+    let sec_mem_size = sections[i].mem_size
+    file_offset = file_offset + sec_file_size
+    vaddr = vaddr + sec_mem_size
 
     # Page-align next segment
     file_offset = align_up(file_offset as Int, 4096) as u64
@@ -186,14 +491,19 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
     i = i + 1
   end
 
-  # Find entry point
-  let entry_addr = match syms.get(input.entry)
+  # Patch relocations now that section addresses are assigned
+  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("relocation error: " + e)
+  end
+
+  # Find entry point and report error if undefined
+  let entry_addr = match syms.get(&input.entry)
   when Option::Some(sym) then
     # entry is relative to .text; add .text vaddr
     sections[0].vaddr + sym.value
   when Option::None then
-    # Default: start of .text
-    sections[0].vaddr
+    return Result::Err("undefined entry point symbol: " + input.entry.clone())
   end
 
   # --- ELF Header ---
@@ -226,12 +536,14 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   # --- Program Headers ---
   for sec in sections do
-    let sec_size = sec.data.len() as u64
+    let sec_file_size = sec.data.len() as u64
+    let sec_mem_size = sec.mem_size
     let pflags = match sec.name
     when ".text"   then PF_R() | PF_X()
     when ".rodata" then PF_R()
     when ".data"   then PF_R() | PF_W()
-    when _         then PF_R()
+    when ".bss"    then PF_R() | PF_W()
+    when _          then PF_R()
     end
 
     write32(&mut out, PT_LOAD())
@@ -239,8 +551,8 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
     write64(&mut out, sec.file_offset)     # p_offset
     write64(&mut out, sec.vaddr)           # p_vaddr
     write64(&mut out, sec.vaddr)           # p_paddr
-    write64(&mut out, sec_size)            # p_filesz
-    write64(&mut out, sec_size)            # p_memsz
+    write64(&mut out, sec_file_size)       # p_filesz
+    write64(&mut out, sec_mem_size)        # p_memsz
     write64(&mut out, sec.alignment)       # p_align
   end
 
@@ -260,6 +572,14 @@ end
 def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
 
+  # Track per-object text offsets for relocation patching
+  mut text_offsets = Vec::new()
+  mut running_offset: u64 = 0
+  for obj in input.objects do
+    text_offsets.push(running_offset)
+    running_offset = running_offset + obj.text.len() as u64
+  end
+
   # Merge sections
   mut sections = merge_sections(&input.objects)
   let syms = match resolve_symbols(&input.objects)
@@ -275,69 +595,125 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let cputype = if is_arm then 0x0100000C as u32 else 0x01000007 as u32 end
   let cpusubtype = if is_arm then 0 as u32 else 3 as u32 end
 
-  # Mach-O MH_EXECUTE
+  # Mach-O constants
   let MH_EXECUTE = 2 as u32
   let LC_SEGMENT_64 = 0x19 as u32
   let LC_MAIN = 0x80000028 as u32
+  let LC_SYMTAB = 0x02 as u32
+  let LC_DYSYMTAB = 0x0B as u32
 
-  # Calculate layout
-  let num_sections = 3
-  let seg_cmd_size = 72 + (num_sections * 80)
-  let main_cmd_size = 24
-  let load_cmds_size = seg_cmd_size + main_cmd_size
-  let header_size = 32
   let page_size = 4096
-
-  let text_fileoff = align_up(header_size + load_cmds_size, page_size)
-  let data_fileoff = text_fileoff + sections[0].data.len()
-  let rodata_fileoff = data_fileoff + sections[2].data.len()
-
   let base: u64 = 0x100000000   # macOS default base = 4GB
 
-  # Entry point offset (relative to __TEXT segment start)
-  let entry_off = match syms.get(input.entry)
-  when Option::Some(sym) then sym.value as u64
-  when Option::None then 0 as u64
+  # Two segments: __TEXT (code + rodata, r-x) and __DATA (data, rw-)
+  let text_sect_count = 2   # __text, __const
+  let data_sect_count = 1   # __data
+
+  let text_seg_cmd_size = 72 + (text_sect_count * 80)
+  let data_seg_cmd_size = 72 + (data_sect_count * 80)
+  let main_cmd_size = 24
+  let symtab_cmd_size = 24
+  let dysymtab_cmd_size = 80
+  let num_cmds = 5
+  let load_cmds_size = text_seg_cmd_size + data_seg_cmd_size + main_cmd_size + symtab_cmd_size + dysymtab_cmd_size
+  let header_size = 32
+
+  # Layout: page-align text segment, then page-align data segment
+  let text_fileoff = align_up(header_size + load_cmds_size, page_size)
+  let rodata_fileoff = text_fileoff + sections[0].data.len()
+  let text_seg_size = align_up(rodata_fileoff + sections[1].data.len() - text_fileoff, page_size)
+
+  let data_fileoff = text_fileoff + text_seg_size
+  let data_seg_size = align_up(sections[2].data.len(), page_size)
+
+  # Assign virtual addresses (separate per segment)
+  let text_vaddr = base + text_fileoff as u64
+  let rodata_vaddr = base + rodata_fileoff as u64
+  let data_vaddr = base + data_fileoff as u64
+
+  sections[0].vaddr = text_vaddr
+  sections[0].file_offset = text_fileoff as u64
+  sections[1].vaddr = rodata_vaddr
+  sections[1].file_offset = rodata_fileoff as u64
+  sections[2].vaddr = data_vaddr
+  sections[2].file_offset = data_fileoff as u64
+
+  # Patch relocations
+  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
+
+  # Entry point offset (relative to start of __TEXT segment file offset)
+  let entry_off = match syms.get(&input.entry)
+  when Option::Some(sym) then sym.value as u64
+  when Option::None then
+    return Result::Err("undefined entry point symbol: " + input.entry.clone())
+  end
+
+  # Empty string table (just a NUL byte) for LC_SYMTAB
+  let strtab_off = data_fileoff + data_seg_size
+  let strtab_size = 1
 
   # --- Mach-O Header (32 bytes) ---
   write32(&mut out, 0xFEEDFACF)       # MH_MAGIC_64
   write32(&mut out, cputype)
   write32(&mut out, cpusubtype)
   write32(&mut out, MH_EXECUTE)
-  write32(&mut out, 2)                 # ncmds
+  write32(&mut out, num_cmds as u32)
   write32(&mut out, load_cmds_size as u32)
-  write32(&mut out, 0x85)              # MH_PIE | MH_DYLDLINK
+  write32(&mut out, 0x200085)          # MH_PIE | MH_DYLDLINK | MH_TWOLEVEL
   write32(&mut out, 0)                 # reserved
 
-  # --- LC_SEGMENT_64: __TEXT + __DATA + __RODATA ---
-  let total = rodata_fileoff + sections[1].data.len()
-  let filesize = total - text_fileoff
-
+  # --- LC_SEGMENT_64: __TEXT (r-x), contains __text + __const ---
   write32(&mut out, LC_SEGMENT_64)
-  write32(&mut out, seg_cmd_size as u32)
-  write_padded_str(&mut out, "", 16)
-  write64(&mut out, base)
-  write64(&mut out, filesize as u64)
-  write64(&mut out, text_fileoff as u64)
-  write64(&mut out, filesize as u64)
-  write32(&mut out, 7); write32(&mut out, 7)
-  write32(&mut out, num_sections as u32)
-  write32(&mut out, 0)
+  write32(&mut out, text_seg_cmd_size as u32)
+  write_padded_str(&mut out, "__TEXT", 16)          # segname
+  write64(&mut out, base + text_fileoff as u64)     # vmaddr
+  write64(&mut out, text_seg_size as u64)           # vmsize
+  write64(&mut out, text_fileoff as u64)            # fileoff
+  write64(&mut out, text_seg_size as u64)           # filesize
+  write32(&mut out, 5)                              # maxprot: r-x
+  write32(&mut out, 5)                              # initprot: r-x
+  write32(&mut out, text_sect_count as u32)         # nsects
+  write32(&mut out, 0)                              # flags
 
-  # __text section
+  # section: __text in __TEXT
   write_padded_str(&mut out, "__text", 16)
   write_padded_str(&mut out, "__TEXT", 16)
-  write64(&mut out, base)
+  write64(&mut out, text_vaddr)
   write64(&mut out, sections[0].data.len() as u64)
   write32(&mut out, text_fileoff as u32)
-  write32(&mut out, 4)
+  write32(&mut out, 4)                   # align = 2^4 = 16
   write32(&mut out, 0); write32(&mut out, 0)
-  write32(&mut out, 0x80000400)
+  write32(&mut out, 0x80000400)          # S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
   write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
 
-  # __data section
-  let data_vaddr = base + (data_fileoff - text_fileoff) as u64
+  # section: __const in __TEXT
+  write_padded_str(&mut out, "__const", 16)
+  write_padded_str(&mut out, "__TEXT", 16)
+  write64(&mut out, rodata_vaddr)
+  write64(&mut out, sections[1].data.len() as u64)
+  write32(&mut out, rodata_fileoff as u32)
+  write32(&mut out, 3)                   # align = 2^3 = 8
+  write32(&mut out, 0); write32(&mut out, 0)
+  write32(&mut out, 0)                   # S_REGULAR
+  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
+
+  # --- LC_SEGMENT_64: __DATA (rw-), contains __data ---
+  write32(&mut out, LC_SEGMENT_64)
+  write32(&mut out, data_seg_cmd_size as u32)
+  write_padded_str(&mut out, "__DATA", 16)          # segname
+  write64(&mut out, data_vaddr)                     # vmaddr
+  write64(&mut out, data_seg_size as u64)           # vmsize
+  write64(&mut out, data_fileoff as u64)            # fileoff
+  write64(&mut out, data_seg_size as u64)           # filesize
+  write32(&mut out, 3)                              # maxprot: rw-
+  write32(&mut out, 3)                              # initprot: rw-
+  write32(&mut out, data_sect_count as u32)
+  write32(&mut out, 0)
+
+  # section: __data in __DATA
   write_padded_str(&mut out, "__data", 16)
   write_padded_str(&mut out, "__DATA", 16)
   write64(&mut out, data_vaddr)
@@ -348,29 +724,35 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, 0)
   write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
 
-  # __const section (rodata)
-  let ro_vaddr = base + (rodata_fileoff - text_fileoff) as u64
-  write_padded_str(&mut out, "__const", 16)
-  write_padded_str(&mut out, "__TEXT", 16)
-  write64(&mut out, ro_vaddr)
-  write64(&mut out, sections[1].data.len() as u64)
-  write32(&mut out, rodata_fileoff as u32)
-  write32(&mut out, 3)
-  write32(&mut out, 0); write32(&mut out, 0)
-  write32(&mut out, 0)
-  write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
-
   # --- LC_MAIN ---
   write32(&mut out, LC_MAIN)
   write32(&mut out, main_cmd_size as u32)
-  write64(&mut out, entry_off)        # entryoff
+  write64(&mut out, entry_off)        # entryoff (relative to __TEXT start)
   write64(&mut out, 0)                # stacksize (default)
+
+  # --- LC_SYMTAB ---
+  write32(&mut out, LC_SYMTAB)
+  write32(&mut out, symtab_cmd_size as u32)
+  write32(&mut out, 0)                # symoff  (no symbols in minimal exe)
+  write32(&mut out, 0)                # nsyms
+  write32(&mut out, strtab_off as u32)  # stroff
+  write32(&mut out, strtab_size as u32) # strsize
+
+  # --- LC_DYSYMTAB ---
+  write32(&mut out, LC_DYSYMTAB)
+  write32(&mut out, dysymtab_cmd_size as u32)
+  emit_zeros_vec(&mut out, dysymtab_cmd_size - 8)  # all fields zero for static exe
 
   # --- Section data ---
   pad_to(&mut out, text_fileoff)
-  append_vec(&mut out, &sections[0].data)   # text
-  append_vec(&mut out, &sections[2].data)   # data
-  append_vec(&mut out, &sections[1].data)   # rodata
+  append_vec(&mut out, &sections[0].data)   # __text
+  append_vec(&mut out, &sections[1].data)   # __const (rodata)
+  pad_to(&mut out, data_fileoff)
+  append_vec(&mut out, &sections[2].data)   # __data
+
+  # String table (single NUL)
+  pad_to(&mut out, strtab_off)
+  out.push(0)
 
   Result::Ok(out)
 end
@@ -382,7 +764,15 @@ end
 def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
 
-  let sections = merge_sections(&input.objects)
+  # Track per-object text offsets for relocation patching
+  mut text_offsets = Vec::new()
+  mut running_offset: u64 = 0
+  for obj in input.objects do
+    text_offsets.push(running_offset)
+    running_offset = running_offset + obj.text.len() as u64
+  end
+
+  mut sections = merge_sections(&input.objects)
   let syms = match resolve_symbols(&input.objects)
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err(e)
@@ -397,8 +787,13 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   out.push(0x50); out.push(0x45); out.push(0x00); out.push(0x00)  # "PE\0\0"
 
   # COFF Header
-  write16(&mut out, 0x8664)         # Machine: AMD64
-  write16(&mut out, 3)              # NumberOfSections
+  let pe_machine = match input.target.arch
+  when Arch::X86_64 then 0x8664   # IMAGE_FILE_MACHINE_AMD64
+  when Arch::AArch64 then 0xAA64  # IMAGE_FILE_MACHINE_ARM64
+  end
+  let num_sections = if sections.len() > 3 then 4 else 3 end
+  write16(&mut out, pe_machine)
+  write16(&mut out, num_sections as u16)
   write32(&mut out, 0)              # TimeDateStamp
   write32(&mut out, 0)              # PointerToSymbolTable
   write32(&mut out, 0)              # NumberOfSymbols
@@ -417,10 +812,12 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   let file_align = 512
 
   let text_rva = section_align
-  let entry_rva = text_rva + match syms.get(input.entry)
+  let entry_offset = match syms.get(&input.entry)
   when Option::Some(sym) then sym.value as Int
-  when Option::None then 0
+  when Option::None then
+    return Result::Err("undefined entry point symbol: " + input.entry.clone())
   end
+  let entry_rva = text_rva + entry_offset
 
   write32(&mut out, entry_rva as u32)  # AddressOfEntryPoint
   write32(&mut out, text_rva as u32)   # BaseOfCode
@@ -441,10 +838,15 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   let text_vsize = align_up(sections[0].data.len(), section_align)
   let rdata_vsize = align_up(sections[1].data.len(), section_align)
   let data_vsize = align_up(sections[2].data.len(), section_align)
-  let total_rva_size = section_align + text_vsize + rdata_vsize + data_vsize
+  let bss_vsize = if sections.len() > 3 then
+    align_up(sections[3].mem_size as Int, section_align)
+  else
+    0
+  end
+  let total_rva_size = section_align + text_vsize + rdata_vsize + data_vsize + bss_vsize
   write32(&mut out, total_rva_size as u32)     # SizeOfImage
 
-  let headers_size = align_up(64 + 4 + 20 + 240 + (3 * 40), file_align)
+  let headers_size = align_up(64 + 4 + 20 + 240 + (num_sections * 40), file_align)
   write32(&mut out, headers_size as u32)       # SizeOfHeaders
   write32(&mut out, 0)                         # CheckSum
   write16(&mut out, 3)                         # Subsystem: CONSOLE
@@ -469,6 +871,21 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   let data_rva = text_rva + align_up(sections[0].data.len(), section_align)
   let rdata_rva = data_rva + align_up(sections[2].data.len(), section_align)
+  let bss_rva = rdata_rva + align_up(sections[1].data.len(), section_align)
+
+  # Assign vaddr on sections for relocation patching
+  sections[0].vaddr = image_base + text_rva as u64
+  sections[1].vaddr = image_base + rdata_rva as u64
+  sections[2].vaddr = image_base + data_rva as u64
+  if sections.len() > 3 then
+    sections[3].vaddr = image_base + bss_rva as u64
+  end
+
+  # Patch relocations
+  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("relocation error: " + e)
+  end
 
   # .text
   write_padded_str(&mut out, ".text", 8)
@@ -499,6 +916,18 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, 0); write32(&mut out, 0)
   write16(&mut out, 0); write16(&mut out, 0)
   write32(&mut out, 0x40000040)  # INITIALIZED|READ
+
+  if sections.len() > 3 then
+    # .bss (uninitialized, virtual only)
+    write_padded_str(&mut out, ".bss", 8)
+    write32(&mut out, sections[3].mem_size as u32)
+    write32(&mut out, bss_rva as u32)
+    write32(&mut out, 0)
+    write32(&mut out, 0)
+    write32(&mut out, 0); write32(&mut out, 0)
+    write16(&mut out, 0); write16(&mut out, 0)
+    write32(&mut out, 0xC0000080)  # UNINITIALIZED|READ|WRITE
+  end
 
   # Section data
   pad_to(&mut out, text_file_off)
@@ -571,7 +1000,7 @@ end
 
 def inject_start_a64_linux(text: &mut CodeBuffer) -> Unit
   use tg_compiler::asm::{
-    a64_mov_rr, a64_bl, a64_mov_ri, a64_svc, def_label, A64
+    a64_mov_rr, a64_bl, a64_mov_ri, a64_svc, a64_ldr, a64_add_rri, def_label, A64
   }
 
   def_label(text, "_start")
@@ -693,8 +1122,9 @@ def lto_thin(ctx: &mut LtoContext) -> Unit
   
   # Phase 3: Cross-module inlining for small functions
   let inline_candidates = find_inline_candidates(ctx)
+  let function_index = build_function_index(ctx)
   for candidate in inline_candidates do
-    inline_cross_module(ctx, &candidate)
+    inline_cross_module(ctx, &candidate, &function_index)
   end
 end
 
@@ -752,9 +1182,24 @@ def lto_fat(ctx: &mut LtoContext) -> Unit
   
   # Phase 3: Aggressive inlining (no cross-module boundary now)
   let candidates = find_inline_candidates(ctx)
+  let function_index = build_function_index(ctx)
   for candidate in candidates do
-    inline_cross_module(ctx, &candidate)
+    inline_cross_module(ctx, &candidate, &function_index)
   end
+end
+
+def build_function_index(ctx: &LtoContext) -> Map[String, (Int, Int)]
+  mut index: Map[String, (Int, Int)] = Map::new()
+  mut mi = 0
+  while mi < ctx.modules.len() do
+    let mut fi = 0
+    while fi < ctx.modules[mi].mir_functions.len() do
+      index.insert(ctx.modules[mi].mir_functions[fi].name.clone(), (mi, fi))
+      fi = fi + 1
+    end
+    mi = mi + 1
+  end
+  index
 end
 
 def build_call_graph(ctx: &mut LtoContext) -> Unit
@@ -765,18 +1210,18 @@ def build_call_graph(ctx: &mut LtoContext) -> Unit
       mut callees = Vec::new()
       
       for block in func.blocks do
-        match block.terminator
-        when MirTerminator::Call(target, _, _, _) then
-          callees.push(target.clone())
-        when _ then ()
-        end
-        
-        for stmt in block.statements do
-          match stmt
-          when MirStatement::Call(target, _, _) then
-            callees.push(target.clone())
+        match block.terminator.kind
+        when MirTerminatorKind::Call(_, func_op, _, _, _) then
+          match func_op.kind
+          when MirOperandKind::Constant(c) then
+            match c.kind
+            when MirConstantKind::FnItem(target) then
+              callees.push(target.clone())
+            when _ then ()
+            end
           when _ then ()
           end
+        when _ then ()
         end
       end
       
@@ -795,22 +1240,30 @@ def find_inline_candidates(ctx: &LtoContext) -> Vec[InlineCandidate]
   mut candidates = Vec::new()
   let max_inline_size = 50  # Maximum MIR statements for inlining
   
+  # Build function index: name -> (size, module_idx) for O(1) lookup
+  mut func_index: Map[String, (Int, Int)] = Map::new()
+  mut mod_idx = 0
+  for module in ctx.modules do
+    for func in module.mir_functions do
+      let size = count_mir_statements(func)
+      func_index.insert(func.name.clone(), (size, mod_idx))
+    end
+    mod_idx = mod_idx + 1
+  end
+  
+  # Now iterate call graph edges with O(1) callee lookup
   for entry in ctx.call_graph do
     for callee_name in entry.value do
-      # Find the callee function
-      for module in ctx.modules do
-        for func in module.mir_functions do
-          if func.name == *callee_name then
-            let size = count_mir_statements(func)
-            if size <= max_inline_size && size > 0 then
-              candidates.push(InlineCandidate {
-                caller: entry.key.clone(),
-                callee: callee_name.clone(),
-                callee_size: size
-              })
-            end
-          end
+      match func_index.get(callee_name)
+      when Option::Some((size, _)) then
+        if size <= max_inline_size && size > 0 then
+          candidates.push(InlineCandidate {
+            caller: entry.key.clone(),
+            callee: callee_name.clone(),
+            callee_size: size
+          })
         end
+      when Option::None then ()
       end
     end
   end
@@ -828,27 +1281,19 @@ def count_mir_statements(func: &MirFunction) -> Int
   count
 end
 
-def inline_cross_module(ctx: &mut LtoContext, candidate: &InlineCandidate) -> Unit
-  # Find callee body
-  mut callee_body: Option[MirFunction] = Option::None
-  for module in ctx.modules do
-    for func in module.mir_functions do
-      if func.name == candidate.callee then
-        callee_body = Option::Some(func.clone())
-        break
-      end
-    end
+def inline_cross_module(ctx: &mut LtoContext, candidate: &InlineCandidate, function_index: &Map[String, (Int, Int)]) -> Unit
+  let callee_body = match function_index.get(candidate.callee.clone())
+  when Option::Some((callee_mod_idx, callee_fn_idx)) then
+    Option::Some(ctx.modules[*callee_mod_idx].mir_functions[*callee_fn_idx].clone())
+  when Option::None then Option::None
   end
-  
+
   match callee_body
   when Option::Some(body) then
-    # For each module, find the caller and inline the callee at call sites
-    for module in ctx.modules do
-      for func in module.mir_functions do
-        if func.name == candidate.caller then
-          inline_calls_in_function(func, &candidate.callee, &body)
-        end
-      end
+    match function_index.get(candidate.caller.clone())
+    when Option::Some((caller_mod_idx, caller_fn_idx)) then
+      inline_calls_in_function(&mut ctx.modules[*caller_mod_idx].mir_functions[*caller_fn_idx], &candidate.callee, &body)
+    when Option::None then ()
     end
   when Option::None then ()
   end
@@ -861,9 +1306,19 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
   mut next_local_id = caller.locals.len() as Int
   
   for block_idx in 0..caller.blocks.len() do
-    match caller.blocks[block_idx].terminator
-    when MirTerminator::Call(target, args, dest, next) then
-      if target == *callee_name then
+    match caller.blocks[block_idx].terminator.kind
+    when MirTerminatorKind::Call(dest, func_op, args, next, unwind) then
+      let target = match func_op.kind
+      when MirOperandKind::Constant(c) then
+        match c.kind
+        when MirConstantKind::FnItem(name) then Option::Some(name.clone())
+        when _ then Option::None
+        end
+      when _ then Option::None
+      end
+      match target
+      when Option::Some(target_name) then
+      if target_name == *callee_name then
         # 1. Build local variable rename map: callee_local_id -> caller_local_id
         mut local_map: Map[Int, Int] = Map::new()
         
@@ -903,15 +1358,15 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
           end
           
           # Remap terminator
-          match new_block.terminator
-          when MirTerminator::Return then
+          match new_block.terminator.kind
+          when MirTerminatorKind::Return then
             # Store return value to dest, then goto continuation
             # Note: simplified - assumes return value is in local 0 or uses operand
-            new_block.terminator = MirTerminator::Goto(next)
-          when MirTerminator::Goto(target) then
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::Goto(next), span: new_block.terminator.span }
+          when MirTerminatorKind::Goto(target) then
             let new_target = block_map.get(target).unwrap_or(target)
-            new_block.terminator = MirTerminator::Goto(new_target)
-          when MirTerminator::SwitchInt(op, targets, default) then
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::Goto(new_target), span: new_block.terminator.span }
+          when MirTerminatorKind::SwitchInt(op, targets, default) then
             let new_op = remap_operand_locals(&op, &local_map)
             mut new_targets = Vec::new()
             for t in targets do
@@ -921,7 +1376,7 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
               })
             end
             let new_default = block_map.get(default).unwrap_or(default)
-            new_block.terminator = MirTerminator::SwitchInt(new_op, new_targets, new_default)
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::SwitchInt(new_op, new_targets, new_default), span: new_block.terminator.span }
           when _ then ()
           end
           
@@ -930,8 +1385,10 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
         
         # 4. Replace the call terminator with a goto to the inlined entry
         let inlined_entry = block_map.get(callee_body.entry_block.id).unwrap_or(block_base)
-        caller.blocks[block_idx].terminator = MirTerminator::Goto(inlined_entry)
+        caller.blocks[block_idx].terminator = MirTerminator { kind: MirTerminatorKind::Goto(inlined_entry), span: caller.blocks[block_idx].terminator.span }
         next_block_id = next_block_id + callee_body.blocks.len() as Int
+      end
+      when Option::None then ()
       end
     when _ then ()
     end
@@ -989,8 +1446,8 @@ def remap_rvalue_locals(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
     MirRvalue { kind: MirRvalueKind::Use(remap_operand_locals(&op, local_map)) }
   when MirRvalueKind::Ref(place) then
     MirRvalue { kind: MirRvalueKind::Ref(remap_place_locals(&place, local_map)) }
-  when MirRvalueKind::BinOp(a, op, b) then
-    MirRvalue { kind: MirRvalueKind::BinOp(remap_operand_locals(&a, local_map), op.clone(), remap_operand_locals(&b, local_map)) }
+  when MirRvalueKind::BinOp(op, a, b) then
+    MirRvalue { kind: MirRvalueKind::BinOp(op.clone(), remap_operand_locals(&a, local_map), remap_operand_locals(&b, local_map)) }
   when MirRvalueKind::UnOp(op, operand) then
     MirRvalue { kind: MirRvalueKind::UnOp(op.clone(), remap_operand_locals(&operand, local_map)) }
   when _ then rv.clone()
