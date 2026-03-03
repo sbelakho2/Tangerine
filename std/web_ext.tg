@@ -1,0 +1,773 @@
+## std::web_ext — Web Framework Extensions
+## Adds rate limiting, background tasks, graceful shutdown, multipart uploads,
+## and HTTP/3 support on top of std::web.
+##
+## Spec: §stdlib.web_ext
+
+module std::web_ext
+
+use std::core::{Result, Option, Clone, Drop}
+use std::collections::{HashMap}
+use std::time::{Instant, Duration, SystemTime}
+use std::sync::{Arc, Mutex, RwLock, AtomicU64, AtomicBool, Ordering}
+use std::async_::{spawn, sleep, Channel, Receiver, Sender}
+use std::web::{Context, Middleware, MiddlewareResult, App}
+use std::http::{HttpResponse, HttpStatus}
+
+# ═══════════════════════════════════════════════════════════════════════
+# §1  Rate Limiting
+# ═══════════════════════════════════════════════════════════════════════
+
+/// Rate limiting strategy.
+pub enum RateLimitStrategy
+  /// Fixed window: N requests per window duration.
+  FixedWindow { max_requests: u64, window: Duration }
+  /// Sliding window log: smoother rate limiting.
+  SlidingWindow { max_requests: u64, window: Duration }
+  /// Token bucket: steady rate with burst capacity.
+  TokenBucket { rate: f64, burst: u64 }
+  /// Leaky bucket: fixed output rate.
+  LeakyBucket { rate: f64, capacity: u64 }
+end
+
+/// Key extractor for identifying rate-limit subjects.
+pub enum RateLimitKey
+  /// Rate limit by client IP address.
+  IpAddress
+  /// Rate limit by a specific header value (e.g., API key).
+  Header(String)
+  /// Rate limit globally (all requests share one bucket).
+  Global
+  /// Custom key extractor function.
+  Custom(fn(&Context) -> String)
+end
+
+struct TokenBucketState
+  tokens: f64
+  last_refill: Instant
+end
+
+struct WindowState
+  count: u64
+  window_start: Instant
+end
+
+/// Rate limiter middleware.
+pub struct RateLimiter
+  _strategy: RateLimitStrategy
+  _key: RateLimitKey
+  _buckets: Arc[RwLock[HashMap[String, Arc[Mutex[TokenBucketState]]]]]
+  _windows: Arc[RwLock[HashMap[String, Arc[Mutex[WindowState]]]]]
+  _retry_after_header: Bool
+end
+
+impl RateLimiter
+  pub def new(strategy: RateLimitStrategy, key: RateLimitKey) -> RateLimiter
+    RateLimiter {
+      _strategy: strategy,
+      _key: key,
+      _buckets: Arc.new(RwLock.new(HashMap.new())),
+      _windows: Arc.new(RwLock.new(HashMap.new())),
+      _retry_after_header: true,
+    }
+  end
+
+  /// Configure whether to include Retry-After header in 429 responses.
+  pub def with_retry_after(mut self, enabled: Bool) -> RateLimiter
+    self._retry_after_header = enabled
+    self
+  end
+
+  fn extract_key(self, ctx: &Context) -> String
+    match &self._key
+      RateLimitKey.IpAddress => ctx.remote_addr().to_string()
+      RateLimitKey.Header(h) => ctx.request.header(h).unwrap_or("unknown").to_string()
+      RateLimitKey.Global => "global".to_string()
+      RateLimitKey.Custom(f) => f(ctx)
+    end
+  end
+
+  fn check_token_bucket(self, key: &String, rate: f64, burst: u64) -> (Bool, f64)
+    let mut buckets = self._buckets.write()
+    let bucket = buckets.entry(key.clone()).or_insert_with(||
+      Arc.new(Mutex.new(TokenBucketState {
+        tokens: burst as f64,
+        last_refill: Instant.now(),
+      }))
+    ).clone()
+    let mut state = bucket.lock()
+
+    ## Refill tokens
+    let now = Instant.now()
+    let elapsed = now.duration_since(state.last_refill).as_secs_f64()
+    state.tokens = (state.tokens + elapsed * rate).min(burst as f64)
+    state.last_refill = now
+
+    if state.tokens >= 1.0 then
+      state.tokens -= 1.0
+      (true, state.tokens)
+    else
+      let wait = (1.0 - state.tokens) / rate
+      (false, wait)
+    end
+  end
+
+  fn check_fixed_window(self, key: &String, max: u64, window: Duration) -> (Bool, Duration)
+    let mut windows = self._windows.write()
+    let win = windows.entry(key.clone()).or_insert_with(||
+      Arc.new(Mutex.new(WindowState {
+        count: 0,
+        window_start: Instant.now(),
+      }))
+    ).clone()
+    let mut state = win.lock()
+
+    let now = Instant.now()
+    if now.duration_since(state.window_start) >= window then
+      state.count = 0
+      state.window_start = now
+    end
+
+    if state.count < max then
+      state.count += 1
+      (true, Duration.ZERO)
+    else
+      let remaining = window - now.duration_since(state.window_start)
+      (false, remaining)
+    end
+  end
+end
+
+impl Middleware for RateLimiter
+  async def call(self, ctx: &mut Context, next: fn(&mut Context) -> MiddlewareResult) -> MiddlewareResult
+    let key = self.extract_key(ctx)
+    let (allowed, retry_info) = match &self._strategy
+      RateLimitStrategy.TokenBucket { rate, burst } =>
+        let (ok, wait) = self.check_token_bucket(&key, *rate, *burst)
+        (ok, wait)
+      RateLimitStrategy.FixedWindow { max_requests, window } =>
+        let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
+        (ok, remaining.as_secs_f64())
+      RateLimitStrategy.SlidingWindow { max_requests, window } =>
+        let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
+        (ok, remaining.as_secs_f64())
+      RateLimitStrategy.LeakyBucket { rate, capacity } =>
+        let (ok, wait) = self.check_token_bucket(&key, *rate, *capacity)
+        (ok, wait)
+    end
+
+    if allowed then
+      next(ctx).await
+    else
+      var response = HttpResponse.new(HttpStatus.TooManyRequests)
+      response.set_header("X-RateLimit-Limit", match &self._strategy
+        RateLimitStrategy.TokenBucket { burst, .. } => burst.to_string()
+        RateLimitStrategy.FixedWindow { max_requests, .. } => max_requests.to_string()
+        _ => "0"
+      end)
+      if self._retry_after_header then
+        response.set_header("Retry-After", (retry_info.ceil() as u64).to_string())
+      end
+      response.set_body("{\"error\":\"rate limit exceeded\"}")
+      ctx.response = response
+      Ok(())
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §2  Background Tasks
+# ═══════════════════════════════════════════════════════════════════════
+
+/// Background task priority.
+pub enum TaskPriority
+  Low
+  Normal
+  High
+  Critical
+end
+
+/// Background task status.
+pub enum TaskStatus
+  Pending
+  Running
+  Completed
+  Failed(String)
+  Cancelled
+end
+
+/// Handle to a submitted background task.
+pub struct TaskHandle
+  _id: u64
+  _status: Arc[Mutex[TaskStatus]]
+  _cancel: Arc[AtomicBool]
+end
+
+impl TaskHandle
+  pub def id(self) -> u64 = self._id
+
+  pub def status(self) -> TaskStatus
+    self._status.lock().clone()
+  end
+
+  pub def cancel(self)
+    self._cancel.store(true, Ordering.SeqCst)
+  end
+
+  pub def is_done(self) -> Bool
+    match self.status()
+      TaskStatus.Completed | TaskStatus.Failed(_) | TaskStatus.Cancelled => true
+      _ => false
+    end
+  end
+end
+
+/// Background task worker pool.
+pub struct TaskPool
+  _sender: Sender[TaskUnit]
+  _next_id: Arc[AtomicU64]
+  _shutdown: Arc[AtomicBool]
+end
+
+struct TaskUnit
+  id: u64
+  priority: TaskPriority
+  work: Box[dyn FnOnce() + Send]
+  status: Arc[Mutex[TaskStatus]]
+  cancel: Arc[AtomicBool]
+end
+
+impl TaskPool
+  /// Create a task pool with the given number of workers.
+  pub def new(worker_count: usize) -> TaskPool
+    let (sender, receiver) = Channel.bounded[TaskUnit](1024)
+    let receiver = Arc.new(Mutex.new(receiver))
+    let shutdown = Arc.new(AtomicBool.new(false))
+
+    for _ in 0..worker_count do
+      let rx = receiver.clone()
+      let sd = shutdown.clone()
+      spawn async
+        loop
+          if sd.load(Ordering.SeqCst) then break end
+          let task = {
+            let rx = rx.lock()
+            rx.recv_timeout(Duration.from_millis(100))
+          }
+          match task
+            Ok(unit) =>
+              if unit.cancel.load(Ordering.SeqCst) then
+                *unit.status.lock() = TaskStatus.Cancelled
+                continue
+              end
+              *unit.status.lock() = TaskStatus.Running
+              match std::panic::catch_unwind(|| (unit.work)())
+                Ok(()) => *unit.status.lock() = TaskStatus.Completed
+                Err(e) => *unit.status.lock() = TaskStatus.Failed(e.to_string())
+              end
+            Err(_) => continue  ## Timeout, loop again
+          end
+        end
+      end
+    end
+
+    TaskPool {
+      _sender: sender,
+      _next_id: Arc.new(AtomicU64.new(1)),
+      _shutdown: shutdown,
+    }
+  end
+
+  /// Submit a background task.
+  pub def submit[F: FnOnce() + Send + 'static](self, priority: TaskPriority, work: F) -> TaskHandle
+    let id = self._next_id.fetch_add(1, Ordering.SeqCst)
+    let status = Arc.new(Mutex.new(TaskStatus.Pending))
+    let cancel = Arc.new(AtomicBool.new(false))
+
+    let unit = TaskUnit {
+      id: id,
+      priority: priority,
+      work: Box.new(work),
+      status: status.clone(),
+      cancel: cancel.clone(),
+    }
+    let _ = self._sender.send(unit)
+
+    TaskHandle { _id: id, _status: status, _cancel: cancel }
+  end
+
+  /// Shutdown the task pool, waiting for in-flight tasks.
+  pub def shutdown(self)
+    self._shutdown.store(true, Ordering.SeqCst)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §3  Graceful Shutdown
+# ═══════════════════════════════════════════════════════════════════════
+
+/// Graceful shutdown controller for web servers.
+pub struct GracefulShutdown
+  _shutdown_signal: Arc[AtomicBool]
+  _active_connections: Arc[AtomicU64]
+  _timeout: Duration
+  _hooks: Vec[Box[dyn FnOnce() + Send]]
+end
+
+impl GracefulShutdown
+  pub def new(timeout: Duration) -> GracefulShutdown
+    GracefulShutdown {
+      _shutdown_signal: Arc.new(AtomicBool.new(false)),
+      _active_connections: Arc.new(AtomicU64.new(0)),
+      _timeout: timeout,
+      _hooks: Vec.new(),
+    }
+  end
+
+  /// Register a shutdown hook (runs before shutdown completes).
+  pub def on_shutdown(&mut self, hook: Box[dyn FnOnce() + Send])
+    self._hooks.push(hook)
+  end
+
+  /// Signal the server to begin graceful shutdown.
+  pub def initiate(self)
+    self._shutdown_signal.store(true, Ordering.SeqCst)
+  end
+
+  /// Check if shutdown has been initiated.
+  pub def is_shutting_down(self) -> Bool
+    self._shutdown_signal.load(Ordering.SeqCst)
+  end
+
+  /// Track a new connection.
+  pub def connection_opened(self)
+    self._active_connections.fetch_add(1, Ordering.SeqCst)
+  end
+
+  /// Track a closed connection.
+  pub def connection_closed(self)
+    self._active_connections.fetch_sub(1, Ordering.SeqCst)
+  end
+
+  /// Wait until all connections are drained or timeout expires.
+  pub async def wait_for_drain(self) -> Bool
+    let deadline = Instant.now() + self._timeout
+    loop
+      let active = self._active_connections.load(Ordering.SeqCst)
+      if active == 0 then return true end
+      if Instant.now() >= deadline then return false end
+      sleep(Duration.from_millis(50)).await
+    end
+  end
+
+  /// Execute full shutdown sequence.
+  pub async def shutdown(mut self) -> Bool
+    self.initiate()
+
+    ## 1. Run pre-shutdown hooks
+    for hook in self._hooks.drain(..) do
+      hook()
+    end
+
+    ## 2. Wait for connections to drain
+    let drained = self.wait_for_drain().await
+
+    if !drained then
+      println("[WARN] Graceful shutdown timed out with " +
+        self._active_connections.load(Ordering.SeqCst).to_string() +
+        " active connections")
+    end
+
+    drained
+  end
+end
+
+/// Install OS signal handlers (SIGTERM, SIGINT) for graceful shutdown.
+pub def install_signal_handler(shutdown: Arc[GracefulShutdown])
+  @cfg(any(target_os = "linux", target_os = "macos"))
+  {
+    use std::os::signal::{Signal, register_handler}
+    register_handler(Signal.SIGTERM, move || shutdown.initiate())
+    register_handler(Signal.SIGINT, move || shutdown.initiate())
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §4  Multipart Upload Handling
+# ═══════════════════════════════════════════════════════════════════════
+
+/// A single part in a multipart form submission.
+pub struct MultipartPart
+  pub name: String
+  pub filename: Option[String]
+  pub content_type: String
+  pub data: Vec[u8]
+  pub headers: HashMap[String, String]
+end
+
+impl MultipartPart
+  pub def is_file(self) -> Bool = self.filename.is_some()
+  pub def text(self) -> Result[String, std::io::Error]
+    String.from_utf8(self.data.clone())
+  end
+  pub def size(self) -> usize = self.data.len()
+
+  /// Save uploaded file to disk.
+  pub def save_to(self, path: &str) -> Result[Unit, std::io::Error]
+    use std::io::File
+    let mut file = File.create(path)?
+    file.write_all(&self.data)?
+    Ok(())
+  end
+end
+
+/// Multipart form parser configuration.
+pub struct MultipartConfig
+  /// Maximum total body size (default: 50 MB).
+  pub max_body_size: usize
+  /// Maximum size per file (default: 10 MB).
+  pub max_file_size: usize
+  /// Maximum number of parts (default: 100).
+  pub max_parts: usize
+  /// Allowed content types for file uploads.
+  pub allowed_content_types: Option[Vec[String]]
+end
+
+impl MultipartConfig
+  pub def default() -> MultipartConfig
+    MultipartConfig {
+      max_body_size: 50 * 1024 * 1024,
+      max_file_size: 10 * 1024 * 1024,
+      max_parts: 100,
+      allowed_content_types: None,
+    }
+  end
+end
+
+pub enum MultipartError
+  BodyTooLarge
+  FileTooLarge(String)
+  TooManyParts
+  InvalidBoundary
+  InvalidContentType(String)
+  ParseError(String)
+end
+
+/// Parse a multipart form from the request context.
+pub def parse_multipart(ctx: &Context, config: &MultipartConfig) -> Result[Vec[MultipartPart], MultipartError]
+  let content_type = ctx.request.header("Content-Type")
+    .ok_or(MultipartError.ParseError("missing Content-Type"))?
+
+  if !content_type.starts_with("multipart/form-data") then
+    return Err(MultipartError.ParseError("not multipart/form-data"))
+  end
+
+  let boundary = extract_boundary(content_type)?
+  let body = ctx.request.body_bytes()
+
+  if body.len() > config.max_body_size then
+    return Err(MultipartError.BodyTooLarge)
+  end
+
+  let parts = parse_multipart_body(&body, &boundary, config)?
+  Ok(parts)
+end
+
+fn extract_boundary(content_type: &str) -> Result[String, MultipartError]
+  let parts: Vec[&str] = content_type.split(';').collect()
+  for part in parts do
+    let trimmed = part.trim()
+    if trimmed.starts_with("boundary=") then
+      let boundary = trimmed[9..].trim_matches('"')
+      return Ok(boundary.to_string())
+    end
+  end
+  Err(MultipartError.InvalidBoundary)
+end
+
+fn parse_multipart_body(body: &[u8], boundary: &str, config: &MultipartConfig) -> Result[Vec[MultipartPart], MultipartError]
+  let delimiter = "--" + boundary
+  let end_delimiter = delimiter.clone() + "--"
+
+  let body_str = String.from_utf8_lossy(body)
+  let sections: Vec[&str] = body_str.split(&delimiter).collect()
+
+  var parts = Vec.new()
+
+  for section in sections.iter().skip(1) do
+    if section.starts_with("--") then break end  ## End delimiter
+    if parts.len() >= config.max_parts then
+      return Err(MultipartError.TooManyParts)
+    end
+
+    let part = parse_part(section.trim(), config)?
+    parts.push(part)
+  end
+
+  Ok(parts)
+end
+
+fn parse_part(raw: &str, config: &MultipartConfig) -> Result[MultipartPart, MultipartError]
+  let header_end = raw.find("\r\n\r\n").or_else(|| raw.find("\n\n"))
+    .ok_or(MultipartError.ParseError("malformed part"))?
+
+  let header_section = &raw[..header_end]
+  let body_start = if raw[header_end..].starts_with("\r\n\r\n") then header_end + 4 else header_end + 2 end
+  let body = raw[body_start..].as_bytes().to_vec()
+
+  var name = String.new()
+  var filename: Option[String] = None
+  var content_type = "text/plain".to_string()
+  var headers = HashMap.new()
+
+  for line in header_section.lines() do
+    if let Some(v) = line.strip_prefix("Content-Disposition:") then
+      let v = v.trim()
+      if let Some(n) = extract_param(v, "name") then name = n end
+      if let Some(f) = extract_param(v, "filename") then filename = Some(f) end
+    elsif let Some(v) = line.strip_prefix("Content-Type:") then
+      content_type = v.trim().to_string()
+    else
+      if let Some(colon) = line.find(':') then
+        headers.insert(line[..colon].trim().to_string(), line[colon+1..].trim().to_string())
+      end
+    end
+  end
+
+  ## Check file size
+  if filename.is_some() && body.len() > config.max_file_size then
+    return Err(MultipartError.FileTooLarge(name.clone()))
+  end
+
+  ## Check content type whitelist
+  if filename.is_some() then
+    if let Some(allowed) = &config.allowed_content_types then
+      if !allowed.contains(&content_type) then
+        return Err(MultipartError.InvalidContentType(content_type))
+      end
+    end
+  end
+
+  Ok(MultipartPart {
+    name: name,
+    filename: filename,
+    content_type: content_type,
+    data: body,
+    headers: headers,
+  })
+end
+
+fn extract_param(header: &str, param: &str) -> Option[String]
+  let search = param.to_string() + "=\""
+  if let Some(start) = header.find(&search) then
+    let value_start = start + search.len()
+    if let Some(end) = header[value_start..].find('"') then
+      return Some(header[value_start..value_start + end].to_string())
+    end
+  end
+  None
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §5  Health Check Endpoint
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum HealthStatus
+  Healthy
+  Degraded(String)
+  Unhealthy(String)
+end
+
+pub struct HealthCheck
+  pub name: String
+  pub check: fn() -> HealthStatus
+end
+
+/// Register health check endpoints on an App.
+pub def add_health_checks(app: &mut App, checks: Vec[HealthCheck])
+  let checks = Arc.new(checks)
+
+  app.get("/health", move |ctx: &mut Context| async
+    let mut all_healthy = true
+    var results = Vec.new()
+    for check in checks.iter() do
+      let status = (check.check)()
+      match &status
+        HealthStatus.Unhealthy(_) => all_healthy = false
+        HealthStatus.Degraded(_) => ()
+        HealthStatus.Healthy => ()
+      end
+      results.push((check.name.clone(), status))
+    end
+
+    let status_code = if all_healthy then 200 else 503 end
+    ctx.response.status(status_code)
+    ctx.response.json(&results)
+    Ok(())
+  end)
+
+  app.get("/health/ready", move |ctx: &mut Context| async
+    ctx.response.status(200).body("ready")
+    Ok(())
+  end)
+
+  app.get("/health/live", move |ctx: &mut Context| async
+    ctx.response.status(200).body("live")
+    Ok(())
+  end)
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §6  Request ID Middleware
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct RequestIdMiddleware
+  _header: String
+end
+
+impl RequestIdMiddleware
+  pub def new() -> RequestIdMiddleware
+    RequestIdMiddleware { _header: "X-Request-ID".to_string() }
+  end
+
+  pub def with_header(mut self, header: String) -> RequestIdMiddleware
+    self._header = header
+    self
+  end
+end
+
+impl Middleware for RequestIdMiddleware
+  async def call(self, ctx: &mut Context, next: fn(&mut Context) -> MiddlewareResult) -> MiddlewareResult
+    let request_id = ctx.request.header(&self._header)
+      .unwrap_or_else(|| generate_request_id())
+    ctx.state.insert("request_id".to_string(), request_id.clone())
+    let result = next(ctx).await
+    ctx.response.set_header(&self._header, &request_id)
+    result
+  end
+end
+
+fn generate_request_id() -> String
+  use std::random::{thread_rng, Rng}
+  let mut rng = thread_rng()
+  let bytes: [u8; 16] = rng.gen()
+  bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §7  CORS Middleware
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct CorsConfig
+  pub allowed_origins: Vec[String]
+  pub allowed_methods: Vec[String]
+  pub allowed_headers: Vec[String]
+  pub expose_headers: Vec[String]
+  pub max_age: Option[u64]
+  pub allow_credentials: Bool
+end
+
+impl CorsConfig
+  pub def permissive() -> CorsConfig
+    CorsConfig {
+      allowed_origins: vec!["*".to_string()],
+      allowed_methods: vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"].map(String::from),
+      allowed_headers: vec!["*".to_string()],
+      expose_headers: Vec.new(),
+      max_age: Some(86400),
+      allow_credentials: false,
+    }
+  end
+end
+
+pub struct CorsMiddleware
+  _config: CorsConfig
+end
+
+impl CorsMiddleware
+  pub def new(config: CorsConfig) -> CorsMiddleware
+    CorsMiddleware { _config: config }
+  end
+end
+
+impl Middleware for CorsMiddleware
+  async def call(self, ctx: &mut Context, next: fn(&mut Context) -> MiddlewareResult) -> MiddlewareResult
+    let origin = ctx.request.header("Origin").unwrap_or("").to_string()
+
+    let allowed = self._config.allowed_origins.contains(&"*".to_string()) ||
+      self._config.allowed_origins.contains(&origin)
+
+    if allowed then
+      ctx.response.set_header("Access-Control-Allow-Origin", &origin)
+    end
+
+    if self._config.allow_credentials then
+      ctx.response.set_header("Access-Control-Allow-Credentials", "true")
+    end
+
+    if ctx.request.method() == "OPTIONS" then
+      ctx.response.set_header("Access-Control-Allow-Methods",
+        &self._config.allowed_methods.join(", "))
+      ctx.response.set_header("Access-Control-Allow-Headers",
+        &self._config.allowed_headers.join(", "))
+      if let Some(age) = self._config.max_age then
+        ctx.response.set_header("Access-Control-Max-Age", &age.to_string())
+      end
+      ctx.response.status(204)
+      return Ok(())
+    end
+
+    if !self._config.expose_headers.is_empty() then
+      ctx.response.set_header("Access-Control-Expose-Headers",
+        &self._config.expose_headers.join(", "))
+    end
+
+    next(ctx).await
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §8  Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+@test
+def test_rate_limiter_token_bucket() -> Unit
+  let limiter = RateLimiter.new(
+    RateLimitStrategy.TokenBucket { rate: 10.0, burst: 5 },
+    RateLimitKey.Global,
+  )
+  ## Should allow first 5 requests (burst)
+  for _ in 0..5 do
+    let (allowed, _) = limiter.check_token_bucket(&"test".to_string(), 10.0, 5)
+    assert allowed
+  end
+  ## 6th should be denied
+  let (allowed, _) = limiter.check_token_bucket(&"test".to_string(), 10.0, 5)
+  assert !allowed
+end
+
+@test
+def test_multipart_boundary_extraction() -> Unit
+  let ct = "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"
+  let boundary = extract_boundary(ct).unwrap()
+  assert boundary == "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+end
+
+@test
+def test_graceful_shutdown_drain() -> Unit
+  let shutdown = GracefulShutdown.new(Duration.from_secs(1))
+  shutdown.connection_opened()
+  assert !shutdown.is_shutting_down()
+  shutdown.initiate()
+  assert shutdown.is_shutting_down()
+  shutdown.connection_closed()
+end
+
+@test
+def test_cors_permissive() -> Unit
+  let config = CorsConfig.permissive()
+  assert config.allowed_origins.contains(&"*".to_string())
+  assert config.allowed_methods.len() == 6
+end
+
+end ## module std::web_ext

@@ -1,0 +1,242 @@
+## examples/web_service.tg — Production-ready web service example
+## Demonstrates routing, middleware, validation, rate limiting, and observability.
+## Run: tg run examples/web_service.tg
+
+use std::web::{App, Context, Middleware, MiddlewareResult}
+use std::web_ext::{
+  RateLimiter, RateLimitStrategy, RateLimitKey,
+  CorsMiddleware, CorsConfig,
+  RequestIdMiddleware,
+  GracefulShutdown, install_signal_handler,
+  TaskPool, TaskPriority,
+  add_health_checks, HealthCheck, HealthStatus,
+}
+use std::validation::{Validate, Required, MinLength, MaxLength, Email, Range}
+use std::opentelemetry::{
+  TracerProvider, OtlpHttpSpanExporter, Sampler, Counter,
+}
+use std::json
+use std::sync::Arc
+use std::time::{Duration, Instant}
+use std::collections::HashMap
+
+# ─── Data Models ─────────────────────────────────────────────────────
+
+struct User
+  pub id: u64
+  pub username: String
+  pub email: String
+  pub age: u32
+end
+
+struct CreateUserRequest
+  @[validate(Required, MinLength(3), MaxLength(50))]
+  pub username: String
+
+  @[validate(Required, Email)]
+  pub email: String
+
+  @[validate(Range(13, 120))]
+  pub age: u32
+end
+
+struct UserResponse
+  pub id: u64
+  pub username: String
+  pub email: String
+end
+
+struct ErrorResponse
+  pub error: String
+  pub code: u32
+end
+
+# ─── Application State ──────────────────────────────────────────────
+
+struct AppState
+  users: Arc[std::sync::RwLock[HashMap[u64, User]]]
+  next_id: Arc[std::sync::AtomicU64]
+  request_count: Counter
+end
+
+impl AppState
+  def new() -> AppState
+    AppState {
+      users: Arc.new(std::sync::RwLock.new(HashMap.new())),
+      next_id: Arc.new(std::sync::AtomicU64.new(1)),
+      request_count: Counter.new("http_requests_total", "Total HTTP requests"),
+    }
+  end
+end
+
+# ─── Logging Middleware ──────────────────────────────────────────────
+
+struct LoggingMiddleware end
+
+impl Middleware for LoggingMiddleware
+  async def call(self, ctx: &mut Context, next: fn(&mut Context) -> MiddlewareResult) -> MiddlewareResult
+    let start = Instant.now()
+    let method = ctx.request.method().to_string()
+    let path = ctx.request.path().to_string()
+
+    let result = next(ctx).await
+
+    let elapsed = start.elapsed()
+    let status = ctx.response.status_code()
+    println("[{status}] {method} {path} ({elapsed:?})")
+
+    result
+  end
+end
+
+# ─── Route Handlers ─────────────────────────────────────────────────
+
+async def list_users(ctx: &mut Context) -> Result[Unit, Error]
+  let state = ctx.state.get::<AppState>()?
+  let users = state.users.read()
+  let response: Vec[UserResponse] = users.values()
+    .map(|u| UserResponse { id: u.id, username: u.username.clone(), email: u.email.clone() })
+    .collect()
+  state.request_count.add(1)
+  ctx.response.json(&response)
+  Ok(())
+end
+
+async def get_user(ctx: &mut Context) -> Result[Unit, Error]
+  let id: u64 = ctx.params.get("id").unwrap().parse()?
+  let state = ctx.state.get::<AppState>()?
+  let users = state.users.read()
+  state.request_count.add(1)
+
+  match users.get(&id)
+    Some(user) =>
+      ctx.response.json(&UserResponse {
+        id: user.id,
+        username: user.username.clone(),
+        email: user.email.clone(),
+      })
+    None =>
+      ctx.response.status(404).json(&ErrorResponse {
+        error: "user not found".to_string(),
+        code: 404,
+      })
+  end
+  Ok(())
+end
+
+async def create_user(ctx: &mut Context) -> Result[Unit, Error]
+  let body: CreateUserRequest = ctx.request.json()?
+  let errors = body.validate()
+  if errors.has_errors() then
+    ctx.response.status(422).json(&errors.to_json())
+    return Ok(())
+  end
+
+  let state = ctx.state.get::<AppState>()?
+  let id = state.next_id.fetch_add(1, std::sync::Ordering.SeqCst)
+  let user = User {
+    id: id,
+    username: body.username,
+    email: body.email,
+    age: body.age,
+  }
+  state.users.write().insert(id, user)
+  state.request_count.add(1)
+
+  ctx.response.status(201).json(&UserResponse {
+    id: id,
+    username: body.username.clone(),
+    email: body.email.clone(),
+  })
+  Ok(())
+end
+
+async def delete_user(ctx: &mut Context) -> Result[Unit, Error]
+  let id: u64 = ctx.params.get("id").unwrap().parse()?
+  let state = ctx.state.get::<AppState>()?
+  let removed = state.users.write().remove(&id)
+  state.request_count.add(1)
+
+  if removed.is_some() then
+    ctx.response.status(204)
+  else
+    ctx.response.status(404).json(&ErrorResponse {
+      error: "user not found".to_string(),
+      code: 404,
+    })
+  end
+  Ok(())
+end
+
+# ─── Main ────────────────────────────────────────────────────────────
+
+def main() -> Result[Unit, Error]
+  println("Starting web service on :8080...")
+
+  let app_state = AppState.new()
+  let task_pool = TaskPool.new(4)
+  let shutdown = Arc.new(GracefulShutdown.new(Duration.from_secs(30)))
+
+  ## Install signal handlers
+  install_signal_handler(shutdown.clone())
+
+  ## Create app
+  let mut app = App.new()
+  app.state(app_state)
+
+  ## Middleware stack
+  app.use_middleware(LoggingMiddleware{})
+  app.use_middleware(RequestIdMiddleware.new())
+  app.use_middleware(CorsMiddleware.new(CorsConfig.permissive()))
+  app.use_middleware(RateLimiter.new(
+    RateLimitStrategy.TokenBucket { rate: 100.0, burst: 200 },
+    RateLimitKey.IpAddress,
+  ))
+
+  ## Health checks
+  add_health_checks(&mut app, vec![
+    HealthCheck {
+      name: "app".to_string(),
+      check: || HealthStatus.Healthy,
+    },
+  ])
+
+  ## Routes
+  let api = app.group("/api/v1")
+  api.get("/users", list_users)
+  api.get("/users/:id", get_user)
+  api.post("/users", create_user)
+  api.delete("/users/:id", delete_user)
+
+  ## Background task example
+  api.post("/reports", |ctx: &mut Context| async
+    let handle = task_pool.submit(TaskPriority.Normal, ||
+      println("Generating report in background...")
+      std::thread::sleep(Duration.from_secs(5))
+      println("Report complete!")
+    end)
+    ctx.response.status(202).json(&json::object!{
+      "task_id": handle.id(),
+      "status": "accepted",
+    })
+    Ok(())
+  end)
+
+  ## Root route
+  app.get("/", |ctx: &mut Context| async
+    ctx.response.json(&json::object!{
+      "name": "Tangerine Web Service",
+      "version": "1.0.0",
+      "endpoints": ["/api/v1/users", "/health"],
+    })
+    Ok(())
+  end)
+
+  ## Start server with graceful shutdown
+  app.listen_with_shutdown("0.0.0.0:8080", shutdown).await?
+
+  ## Cleanup
+  task_pool.shutdown()
+  println("Server stopped gracefully.")
+  Ok(())
+end

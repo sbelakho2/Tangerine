@@ -125,6 +125,11 @@ def greet(name: String) -> String
   greeting + name + "!"
 end
 
+# Default parameters
+def greet(name: String = "World") -> String
+  "Hello, " + name + "!"
+end
+
 # Pure function (no side effects)
 # A `pure` function may not perform I/O, mutate external state, call
 # non-pure functions, or trigger effects. The compiler verifies purity
@@ -196,6 +201,16 @@ end
 for i in 0..10 do
   if i == 5 then next end
   println(i)
+end
+
+# unless — executes when condition is false (sugar for if !cond)
+unless is_valid then
+  panic("invalid state")
+end
+
+# until — loops while condition is false (sugar for while !cond)
+until queue.is_empty() do
+  process(queue.pop())
 end
 ```
 

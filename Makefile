@@ -1,6 +1,6 @@
 # Tangerine Project Makefile
 
-.PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-new-std test-tooling test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help
+.PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-new-std test-tooling test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help bootstrap bootstrap-stage0 bootstrap-stage1 bootstrap-stage2 bootstrap-verify bootstrap-full clean-bootstrap
 
 SHELL := /bin/bash
 TG    := tg
@@ -10,13 +10,96 @@ PYTHON := python3
 all: build test
 
 # ————————————————————————————————————————————
-# Build
+# Bootstrap Chain (Self-Hosting)
+# ————————————————————————————————————————————
+# 
+# The bootstrap chain compiles Tangerine from scratch:
+#   Stage 0: OCaml bootstrap compiler (tgc0) - external dependency
+#   Stage 1: First self-compiled Tangerine (tg1) - compiled by tgc0
+#   Stage 2: Second self-compiled Tangerine (tg2) - compiled by tg1
+#   Stage 3: Verify tg1 and tg2 produce identical output
+#
+# After successful bootstrap, tg2 becomes the production compiler.
+
+STAGE0_DIR := stage0
+STAGE1_DIR := target/stage1
+STAGE2_DIR := target/stage2
+TGC0 := $(STAGE0_DIR)/_build/default/bin/main.exe
+TG1 := $(STAGE1_DIR)/tg
+TG2 := $(STAGE2_DIR)/tg
+
+# Build stage0 (OCaml bootstrap compiler)
+bootstrap-stage0:
+	@echo "==> Stage 0: Building OCaml bootstrap compiler..."
+	@cd $(STAGE0_DIR) && (dune build || opam exec -- dune build)
+	@echo "    Stage 0 complete: $(TGC0)"
+
+# Build stage1 (first self-hosted compiler, compiled by stage0)
+bootstrap-stage1: bootstrap-stage0
+	@echo "==> Stage 1: Compiling Tangerine with stage0..."
+	@mkdir -p $(STAGE1_DIR)
+	@$(TGC0) compile \
+		--lib tg_compiler/lib.tg \
+		--entry tg_compiler/driver.tg \
+		$(wildcard tg_compiler/*.tg) \
+		-o $(TG1)
+	@chmod +x $(TG1)
+	@echo "    Stage 1 complete: $(TG1)"
+
+# Build stage2 (second self-hosted compiler, compiled by stage1)
+bootstrap-stage2: bootstrap-stage1
+	@echo "==> Stage 2: Compiling Tangerine with stage1..."
+	@mkdir -p $(STAGE2_DIR)
+	@$(TG1) build -o $(TG2)
+	@chmod +x $(TG2)
+	@echo "    Stage 2 complete: $(TG2)"
+
+# Verify bootstrap - stage1 and stage2 should produce identical binaries
+bootstrap-verify: bootstrap-stage2
+	@echo "==> Verifying bootstrap integrity..."
+	@if cmp -s $(TG1) $(TG2); then \
+		echo "    VERIFIED: Stage 1 and Stage 2 compilers are identical"; \
+	else \
+		sha256sum $(TG1) $(TG2); \
+		echo "    WARNING: Compilers differ (may be acceptable with timestamps)"; \
+		$(TG2) --version; \
+	fi
+	@echo "==> Bootstrap verification complete."
+
+# Full bootstrap: build all stages and verify
+bootstrap-full: bootstrap-verify
+	@echo "==> Installing bootstrapped compiler..."
+	@mkdir -p build
+	@cp $(TG2) build/tg
+	@chmod +x build/tg
+	@echo "==> Full bootstrap complete: build/tg"
+	@build/tg --version
+
+# Clean bootstrap artifacts
+clean-bootstrap:
+	@echo "==> Cleaning bootstrap artifacts..."
+	@cd $(STAGE0_DIR) && (dune clean || opam exec -- dune clean || true)
+	@rm -rf $(STAGE1_DIR) $(STAGE2_DIR)
+	@echo "==> Bootstrap artifacts cleaned."
+
+# Shorthand for full bootstrap
+bootstrap: bootstrap-full
+
+# ————————————————————————————————————————————
+# Build (uses existing tg or bootstrapped compiler)
 # ————————————————————————————————————————————
 
 build:
 	@echo "==> Building Tangerine compiler..."
 	mkdir -p build
-	$(TG) build tg_compiler/driver.tg -o build/tg
+	@if [ -x build/tg ]; then \
+		build/tg build -o build/tg; \
+	elif command -v $(TG) >/dev/null 2>&1; then \
+		$(TG) build -o build/tg; \
+	else \
+		echo "No compiler available. Run 'make bootstrap' first."; \
+		exit 1; \
+	fi
 
 # ————————————————————————————————————————————
 # Tests

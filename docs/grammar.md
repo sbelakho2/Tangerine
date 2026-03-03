@@ -42,7 +42,7 @@ impl   use    pub    module fn     self   Self   true   false  unsafe
 where  as     type   const  extern super  crate  yield  async  await edition
 cap    effect requires implies handle with rationale budget pre post invariant
 guard  try    catch  finally macro  comptime loop   pure   inline
-mod
+unless until  mod
 ```
 
 **Notes:**
@@ -53,6 +53,8 @@ mod
 - `then` and `do` are optional in multi-line `if`/`while`/`for` expressions.
 - `pure` marks functions with no side effects (see language.md §Functions).
 - `module` is the canonical spelling; `mod` is accepted as a compatibility alias.
+- `unless` is sugar for `if !(cond)` — the body executes when the condition is *false*.
+- `until` is sugar for `while !(cond)` — the loop runs while the condition is *false*.
 
 ### 1.4 Literals
 
@@ -173,7 +175,7 @@ guard_action   = 'return' [ expr ]
                | 'panic' '(' expr ')'
 
 param_list     = param { ',' param } [ ',' ]
-param          = [ 'mut' ] IDENT ':' type_expr
+param          = [ 'mut' ] IDENT ':' type_expr [ '=' expr ]
 
 type_params    = '[' type_param { ',' type_param } ']'
 type_param     = IDENT [ ':' type_bound ]
@@ -404,9 +406,11 @@ primary        = INT_LITERAL
                | '[' [ expr { ',' expr } ] ']'          // Array literal
                | block_expr
                | if_expr
+               | unless_expr
                | match_expr
                | for_expr
                | while_expr
+               | until_expr
                | loop_expr
                | handle_expr
                | closure_expr
@@ -453,6 +457,17 @@ for_expr       = 'for' IDENT 'in' expr [ 'do' ]
 while_expr     = 'while' expr [ 'do' ]
                  block
                  'end'
+
+unless_expr    = 'unless' expr [ 'then' ]
+                 block
+                 [ 'else' block ]
+                 'end'
+                 // Desugars to: if !(expr) then block [else block] end
+
+until_expr     = 'until' expr [ 'do' ]
+                 block
+                 'end'
+                 // Desugars to: while !(expr) do block end
 
 loop_expr      = 'loop' block 'end'
 

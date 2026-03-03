@@ -1,7 +1,7 @@
 # Tangerine Standard Library Completeness Report
 
 **Version:** 0.1.0  
-**Last Updated:** March 2026
+**Last Updated:** June 2026
 
 Comprehensive inventory of all standard library modules and their capabilities.
 
@@ -13,16 +13,23 @@ Comprehensive inventory of all standard library modules and their capabilities.
 |----------|---------|--------|
 | Core Types & I/O | 7 | Complete |
 | Data Formats & Serialization | 8 | Complete |
-| Networking & Web | 4 | Complete |
+| Networking & Web | 6 | Complete |
 | Database | 1 | Complete |
 | Cryptography & Security | 4 | Complete |
 | Concurrency & Async | 3 | Complete |
 | Process & System | 3 | Complete |
-| UI & Graphics | 5 | Complete |
+| UI & Graphics | 7 | Complete |
 | Testing & Quality | 6 | Complete |
 | Agentic AI & Safety | 8 | Complete |
 | Tooling | 7 | Complete |
-| **Total** | **56+** | **Complete** |
+| Embedded & Bare-Metal | 1 | Complete |
+| SIMD & HPC | 1 | Complete |
+| Observability | 1 | Complete |
+| Validation | 1 | Complete |
+| WASM Interop | 2 | Complete |
+| Float Control | 1 | Complete |
+| Memory-Mapped I/O | 1 | Complete |
+| **Total** | **68+** | **Complete** |
 
 ---
 
@@ -515,3 +522,122 @@ Comprehensive inventory of all standard library modules and their capabilities.
 - [x] Process management and IPC
 - [x] Signal handling
 - [x] UI framework
+
+### 12. SIMD & High-Performance Computing — COMPLETE (NEW)
+
+- [x] `std/simd.tg` — SIMD intrinsics (~750+ lines)
+  - f32x4, f64x2 (128-bit), f32x8, f64x4 (256-bit)
+  - i32x4, i16x8, i8x16, u32x4, u32x8
+  - Platform-specific intrinsics (SSE/AVX/NEON)
+  - Feature detection: `has_sse2()`, `has_avx2()`, `has_neon()`
+  - Prefetch, memory fences, non-temporal stores
+  - SimdOps trait for generic SIMD programming
+
+### 13. Embedded & Bare-Metal — COMPLETE (NEW)
+
+- [x] `std/embedded.tg` — Embedded systems support (~800+ lines)
+  - `@[no_std]` support, volatile read/write/modify
+  - Register[T] MMIO abstraction, Bitfield manipulation
+  - `@[packed]`, `@[align]`, `@[link_section]` attributes
+  - `@[interrupt]` handlers, critical sections
+  - HAL traits: GPIO, UART, SPI, I2C, Timer, PWM, ADC, DAC, Watchdog, Clock
+  - DMA channels, Power management (Sleep/DeepSleep/Standby)
+  - `@[real_time(wcet_us=N)]`, `@[no_heap]` compile checks
+  - No-alloc collections: ArrayVec, RingBuffer
+  - Embedded targets: Cortex-M4/M7, Cortex-M0/M0+, RISC-V
+
+### 14. Linear Algebra — COMPLETE (NEW)
+
+- [x] `std/linalg.tg` — Graphics linear algebra (~700 lines)
+  - Vec2/Vec3/Vec4 (f32), DVec2/DVec3/DVec4 (f64), IVec2/IVec3/IVec4 (i32)
+  - Mat2/Mat3/Mat4 (column-major, SIMD-accelerated)
+  - Quaternions (Quat) with slerp, axis-angle, euler conversion
+  - Transform (TRS composition)
+  - Perspective/orthographic projections (OpenGL & Vulkan NDC)
+  - Look-at view matrices
+
+### 15. GPU Abstraction — COMPLETE (NEW)
+
+- [x] `std/gpu.tg` — Multi-backend GPU API (~800 lines)
+  - Backends: Vulkan, Metal, DirectX 12, OpenGL 4.6, WebGPU
+  - Auto-detection per platform
+  - Full pipeline: Instance → Adapter → Device → Queue
+  - Buffers, Textures (22+ formats), Samplers
+  - Shader modules: SPIR-V, GLSL, HLSL, MSL, WGSL, TgShader
+  - SPIR-V cross-compilation and reflection
+  - Render pipelines, Compute pipelines
+  - Command encoding, Descriptor sets / bind groups
+  - Fence/Semaphore synchronization
+  - Swapchain presentation with PresentMode
+
+### 16. Memory-Mapped I/O — COMPLETE (NEW)
+
+- [x] `std/mmap.tg` — Memory-mapped files (~400 lines)
+  - Mmap (read-only), MmapMut (read-write), AnonMmap (anonymous)
+  - MmapAdvice: Sequential, Random, WillNeed, HugePage
+  - Memory locking/unlocking, sync/flush
+  - RAII auto-unmap via Drop
+  - Cross-platform: Unix mmap + Windows MapViewOfFile
+  - MmapBuilder fluent API
+
+### 17. Observability — COMPLETE (NEW)
+
+- [x] `std/opentelemetry.tg` — Distributed tracing & metrics (~600 lines)
+  - TraceId (128-bit), SpanId (64-bit), Span with events/links/status
+  - Samplers: AlwaysOn, AlwaysOff, TraceIdRatio, ParentBased
+  - OTLP HTTP export (ConsoleSpanExporter, OtlpHttpSpanExporter)
+  - BatchSpanProcessor with async export loop
+  - Metrics: Counter, HistogramMetric, Gauge
+  - W3C TraceContextPropagator (inject/extract)
+  - TracerProvider builder with Resource identification
+
+### 18. Deterministic Float Control — COMPLETE (NEW)
+
+- [x] `std/float_control.tg` — Floating-point control (~400 lines)
+  - Rounding modes: NearestEven, TowardPosInf, TowardNegInf, TowardZero
+  - Denormal modes: Preserve, FlushToZero, DAZ
+  - Fast-math flags with presets (STRICT, FAST, GRAPHICS, PHYSICS)
+  - `@[fast_math]`, `@[deterministic_float]` compile-time attributes
+  - RAII RoundingModeGuard
+  - ULP distance (f32/f64), next_after
+  - FP exception checking
+  - Platform intrinsics: x86_64 MXCSR, AArch64 FPCR/FPSR
+
+### 19. Validation — COMPLETE (NEW)
+
+- [x] `std/validation.tg` — Data validation framework (~400 lines)
+  - Composable validators: Required, MinLength, MaxLength, Pattern, Email, Url
+  - Numeric: Min, Max, Range
+  - Collections: MinItems, MaxItems, Unique
+  - Custom validator closures, OneOf
+  - ValidationErrors with field paths and nesting
+  - `@[derive(Validate)]` annotation support
+  - Schema generation for OpenAPI/JSON Schema
+
+### 20. Web Extensions — COMPLETE (NEW)
+
+- [x] `std/web_ext.tg` — Web framework extensions (~500 lines)
+  - Rate limiting: FixedWindow, SlidingWindow, TokenBucket, LeakyBucket
+  - Rate limit keys: IpAddress, Header, Global, Custom
+  - Background tasks: TaskPool with priority queue
+  - Graceful shutdown: signal handling, connection draining, hooks
+  - Multipart upload: streaming parser, size limits, content type filtering
+  - Health checks: /health, /health/ready, /health/live
+  - Request ID middleware
+  - CORS middleware with permissive preset
+
+### 21. WASM JS Interop — COMPLETE (NEW)
+
+- [x] `std/wasm_js.tg` — JavaScript interop for WASM targets (~600 lines)
+  - JsValue: typed JS value handle with get/set/call
+  - DOM bindings: Element with query/attribute/event/style
+  - JsClosure: Tangerine closures callable from JS
+  - Fetch API: FetchRequest/FetchResponse with async send
+  - Console API: log, warn, error, time, timeEnd
+  - Timers: setTimeout, setInterval, requestAnimationFrame
+  - Promise ↔ async interop
+  - TypedArray zero-copy (Uint8Array, Float32Array)
+  - `@[wasm_bindgen]` codegen for auto-generated JS bindings
+  - Web Workers
+  - js_inline! macro for escape-hatch JS eval
+

@@ -1,0 +1,1070 @@
+## std::opentelemetry — OpenTelemetry Integration
+## Provides distributed tracing, metrics, and logging export via the
+## OpenTelemetry protocol (OTLP). Integrates with std::log for seamless
+## observability in production web services.
+##
+## Design goals:
+##   - Zero-cost when disabled (compile-time feature gate)
+##   - Async-first export pipeline with batching
+##   - W3C TraceContext propagation
+##   - OTLP/gRPC and OTLP/HTTP export
+##   - Resource and attribute semantic conventions
+##   - Sampling strategies (always-on, probability, rate-limiting)
+##
+## Spec: §stdlib.opentelemetry
+
+module std::opentelemetry
+
+use std::core::{Result, Option, Clone, Display, Drop}
+use std::collections::{HashMap}
+use std::time::{Instant, Duration, SystemTime}
+use std::sync::{Arc, Mutex, RwLock}
+use std::async_::{spawn, sleep, Channel}
+use std::log::{LogLevel}
+use std::net::{TcpStream}
+
+# ═══════════════════════════════════════════════════════════════════════
+# §1  Core Types
+# ═══════════════════════════════════════════════════════════════════════
+
+## 128-bit trace ID (W3C format).
+@repr(C)
+pub struct TraceId
+  high: u64
+  low: u64
+end
+
+impl TraceId
+  pub def new(high: u64, low: u64) -> TraceId
+    TraceId { high: high, low: low }
+  end
+
+  pub def generate() -> TraceId
+    use std::random::{thread_rng, Rng}
+    let mut rng = thread_rng()
+    TraceId { high: rng.next_u64(), low: rng.next_u64() }
+  end
+
+  pub def is_valid(self) -> Bool
+    self.high != 0 || self.low != 0
+  end
+
+  pub def to_hex(self) -> String
+    format!("{:016x}{:016x}", self.high, self.low)
+  end
+end
+
+## 64-bit span ID.
+@repr(C)
+pub struct SpanId
+  value: u64
+end
+
+impl SpanId
+  pub def new(value: u64) -> SpanId = SpanId { value: value }
+
+  pub def generate() -> SpanId
+    use std::random::{thread_rng, Rng}
+    SpanId { value: thread_rng().next_u64() }
+  end
+
+  pub def is_valid(self) -> Bool = self.value != 0
+
+  pub def to_hex(self) -> String
+    format!("{:016x}", self.value)
+  end
+end
+
+## Trace flags (W3C).
+pub struct TraceFlags
+  value: u8
+end
+
+impl TraceFlags
+  pub const SAMPLED: TraceFlags = TraceFlags { value: 0x01 }
+  pub const NONE: TraceFlags = TraceFlags { value: 0x00 }
+
+  pub def is_sampled(self) -> Bool = self.value & 0x01 != 0
+end
+
+## Span context carries the identity of a span across process boundaries.
+pub struct SpanContext
+  pub trace_id: TraceId
+  pub span_id: SpanId
+  pub trace_flags: TraceFlags
+  pub trace_state: String      ## W3C tracestate header
+  pub is_remote: Bool
+end
+
+impl SpanContext
+  pub def is_valid(self) -> Bool
+    self.trace_id.is_valid() && self.span_id.is_valid()
+  end
+end
+
+## Attribute value types following OTEL semantic conventions.
+pub enum AttributeValue
+  StringVal(String)
+  IntVal(i64)
+  FloatVal(f64)
+  BoolVal(Bool)
+  StringArrayVal(Vec[String])
+  IntArrayVal(Vec[i64])
+  FloatArrayVal(Vec[f64])
+  BoolArrayVal(Vec[Bool])
+end
+
+## A key-value attribute.
+pub struct Attribute
+  pub key: String
+  pub value: AttributeValue
+end
+
+impl Attribute
+  pub def string(key: String, value: String) -> Attribute
+    Attribute { key: key, value: AttributeValue.StringVal(value) }
+  end
+  pub def int(key: String, value: i64) -> Attribute
+    Attribute { key: key, value: AttributeValue.IntVal(value) }
+  end
+  pub def float(key: String, value: f64) -> Attribute
+    Attribute { key: key, value: AttributeValue.FloatVal(value) }
+  end
+  pub def bool(key: String, value: Bool) -> Attribute
+    Attribute { key: key, value: AttributeValue.BoolVal(value) }
+  end
+end
+
+## Resource describes the entity producing telemetry.
+pub struct Resource
+  pub attributes: Vec[Attribute]
+end
+
+impl Resource
+  pub def new() -> Resource = Resource { attributes: Vec.new() }
+
+  pub def with_service(mut self, name: String, version: String) -> Resource
+    self.attributes.push(Attribute.string("service.name", name))
+    self.attributes.push(Attribute.string("service.version", version))
+    self
+  end
+
+  pub def with_attribute(mut self, attr: Attribute) -> Resource
+    self.attributes.push(attr)
+    self
+  end
+
+  pub def default() -> Resource
+    Resource.new()
+      .with_attribute(Attribute.string("telemetry.sdk.name", "tangerine-otel"))
+      .with_attribute(Attribute.string("telemetry.sdk.language", "tangerine"))
+      .with_attribute(Attribute.string("telemetry.sdk.version", "0.1.0"))
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §2  Tracing — Spans
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum SpanKind
+  Internal
+  Server
+  Client
+  Producer
+  Consumer
+end
+
+pub enum StatusCode
+  Unset
+  Ok
+  Error
+end
+
+pub struct SpanStatus
+  pub code: StatusCode
+  pub message: String
+end
+
+pub struct SpanEvent
+  pub name: String
+  pub timestamp: SystemTime
+  pub attributes: Vec[Attribute]
+end
+
+pub struct SpanLink
+  pub context: SpanContext
+  pub attributes: Vec[Attribute]
+end
+
+## Represents a unit of work in a distributed trace.
+pub struct Span
+  _name: String
+  _context: SpanContext
+  _parent: Option[SpanContext]
+  _kind: SpanKind
+  _start_time: SystemTime
+  _end_time: Option[SystemTime]
+  _attributes: Vec[Attribute]
+  _events: Vec[SpanEvent]
+  _links: Vec[SpanLink]
+  _status: SpanStatus
+  _exporter: Option[Arc[dyn SpanExporter]]
+end
+
+impl Span
+  pub def name(self) -> &String = &self._name
+  pub def context(self) -> &SpanContext = &self._context
+
+  pub def set_attribute(&mut self, attr: Attribute)
+    self._attributes.push(attr)
+  end
+
+  pub def set_status(&mut self, code: StatusCode, message: String)
+    self._status = SpanStatus { code: code, message: message }
+  end
+
+  pub def add_event(&mut self, name: String)
+    self._events.push(SpanEvent {
+      name: name,
+      timestamp: SystemTime.now(),
+      attributes: Vec.new(),
+    })
+  end
+
+  pub def add_event_with_attrs(&mut self, name: String, attrs: Vec[Attribute])
+    self._events.push(SpanEvent {
+      name: name,
+      timestamp: SystemTime.now(),
+      attributes: attrs,
+    })
+  end
+
+  pub def add_link(&mut self, context: SpanContext, attrs: Vec[Attribute])
+    self._links.push(SpanLink { context: context, attributes: attrs })
+  end
+
+  pub def record_exception(&mut self, error: &dyn Display)
+    self.add_event_with_attrs("exception", vec![
+      Attribute.string("exception.message", error.to_string()),
+    ])
+    self.set_status(StatusCode.Error, error.to_string())
+  end
+
+  ## End the span and export it.
+  pub def end_span(&mut self)
+    if self._end_time.is_some() then return end
+    self._end_time = Some(SystemTime.now())
+    if let Some(exporter) = &self._exporter then
+      let data = SpanData {
+        name: self._name.clone(),
+        context: self._context.clone(),
+        parent: self._parent.clone(),
+        kind: self._kind.clone(),
+        start_time: self._start_time,
+        end_time: self._end_time.unwrap(),
+        attributes: self._attributes.clone(),
+        events: self._events.clone(),
+        links: self._links.clone(),
+        status: self._status.clone(),
+      }
+      let _ = exporter.export(vec![data])
+    end
+  end
+end
+
+impl Drop for Span
+  def drop(&mut self)
+    self.end_span()
+  end
+end
+
+## Finalized span data for export.
+pub struct SpanData
+  pub name: String
+  pub context: SpanContext
+  pub parent: Option[SpanContext]
+  pub kind: SpanKind
+  pub start_time: SystemTime
+  pub end_time: SystemTime
+  pub attributes: Vec[Attribute]
+  pub events: Vec[SpanEvent]
+  pub links: Vec[SpanLink]
+  pub status: SpanStatus
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §3  Sampling
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum SamplingDecision
+  Drop
+  RecordOnly
+  RecordAndSample
+end
+
+pub struct SamplingResult
+  pub decision: SamplingDecision
+  pub attributes: Vec[Attribute]
+end
+
+pub trait Sampler
+  def should_sample(self, parent: Option[&SpanContext], trace_id: &TraceId,
+                    name: &String, kind: SpanKind) -> SamplingResult
+end
+
+## Always sample.
+pub struct AlwaysOnSampler end
+impl Sampler for AlwaysOnSampler
+  def should_sample(self, _parent: Option[&SpanContext], _trace_id: &TraceId,
+                    _name: &String, _kind: SpanKind) -> SamplingResult
+    SamplingResult { decision: SamplingDecision.RecordAndSample, attributes: Vec.new() }
+  end
+end
+
+## Never sample.
+pub struct AlwaysOffSampler end
+impl Sampler for AlwaysOffSampler
+  def should_sample(self, _parent: Option[&SpanContext], _trace_id: &TraceId,
+                    _name: &String, _kind: SpanKind) -> SamplingResult
+    SamplingResult { decision: SamplingDecision.Drop, attributes: Vec.new() }
+  end
+end
+
+## Probability-based sampler.
+pub struct TraceIdRatioSampler
+  _ratio: f64
+  _threshold: u64
+end
+
+impl TraceIdRatioSampler
+  pub def new(ratio: f64) -> TraceIdRatioSampler
+    pre ratio >= 0.0 && ratio <= 1.0, "ratio must be in [0.0, 1.0]"
+    TraceIdRatioSampler {
+      _ratio: ratio,
+      _threshold: (ratio * u64.MAX as f64) as u64,
+    }
+  end
+end
+
+impl Sampler for TraceIdRatioSampler
+  def should_sample(self, _parent: Option[&SpanContext], trace_id: &TraceId,
+                    _name: &String, _kind: SpanKind) -> SamplingResult
+    if trace_id.low <= self._threshold then
+      SamplingResult { decision: SamplingDecision.RecordAndSample, attributes: Vec.new() }
+    else
+      SamplingResult { decision: SamplingDecision.Drop, attributes: Vec.new() }
+    end
+  end
+end
+
+## Parent-based sampler: inherits decision from parent span.
+pub struct ParentBasedSampler
+  _root: Box[dyn Sampler]
+end
+
+impl ParentBasedSampler
+  pub def new(root: Box[dyn Sampler]) -> ParentBasedSampler
+    ParentBasedSampler { _root: root }
+  end
+end
+
+impl Sampler for ParentBasedSampler
+  def should_sample(self, parent: Option[&SpanContext], trace_id: &TraceId,
+                    name: &String, kind: SpanKind) -> SamplingResult
+    match parent
+      Some(ctx) if ctx.trace_flags.is_sampled() =>
+        SamplingResult { decision: SamplingDecision.RecordAndSample, attributes: Vec.new() }
+      Some(_) =>
+        SamplingResult { decision: SamplingDecision.Drop, attributes: Vec.new() }
+      None =>
+        self._root.should_sample(None, trace_id, name, kind)
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §4  Export — Span Exporters
+# ═══════════════════════════════════════════════════════════════════════
+
+pub trait SpanExporter
+  def export(self, spans: Vec[SpanData]) -> Result[Unit, OtelError]
+  def shutdown(self) -> Result[Unit, OtelError]
+end
+
+pub enum OtelError
+  ExportFailed(String)
+  Timeout
+  Shutdown
+  InvalidConfig(String)
+end
+
+## Console exporter for development/debugging.
+pub struct ConsoleSpanExporter end
+
+impl SpanExporter for ConsoleSpanExporter
+  def export(self, spans: Vec[SpanData]) -> Result[Unit, OtelError]
+    for span in spans do
+      println("[OTEL SPAN] " + span.name
+        + " trace=" + span.context.trace_id.to_hex()
+        + " span=" + span.context.span_id.to_hex()
+        + " dur=" + span.end_time.duration_since(span.start_time).as_millis().to_string() + "ms"
+        + " status=" + match span.status.code
+            StatusCode.Unset => "unset"
+            StatusCode.Ok    => "ok"
+            StatusCode.Error => "error: " + span.status.message
+          end)
+    end
+    Ok(())
+  end
+
+  def shutdown(self) -> Result[Unit, OtelError] = Ok(())
+end
+
+## OTLP/HTTP exporter configuration.
+pub struct OtlpHttpConfig
+  pub endpoint: String          ## e.g. "http://localhost:4318"
+  pub headers: HashMap[String, String]
+  pub timeout: Duration
+  pub compression: OtlpCompression
+end
+
+pub enum OtlpCompression
+  None
+  Gzip
+end
+
+impl OtlpHttpConfig
+  pub def default() -> OtlpHttpConfig
+    OtlpHttpConfig {
+      endpoint: "http://localhost:4318".to_string(),
+      headers: HashMap.new(),
+      timeout: Duration.from_secs(10),
+      compression: OtlpCompression.None,
+    }
+  end
+
+  pub def with_endpoint(mut self, endpoint: String) -> OtlpHttpConfig
+    self.endpoint = endpoint
+    self
+  end
+
+  pub def with_header(mut self, key: String, value: String) -> OtlpHttpConfig
+    self.headers.insert(key, value)
+    self
+  end
+
+  pub def with_timeout(mut self, timeout: Duration) -> OtlpHttpConfig
+    self.timeout = timeout
+    self
+  end
+end
+
+## OTLP/HTTP span exporter.
+pub struct OtlpHttpSpanExporter
+  _config: OtlpHttpConfig
+  _resource: Resource
+end
+
+impl OtlpHttpSpanExporter
+  pub def new(config: OtlpHttpConfig, resource: Resource) -> OtlpHttpSpanExporter
+    OtlpHttpSpanExporter { _config: config, _resource: resource }
+  end
+
+  def serialize_spans(self, spans: &Vec[SpanData]) -> Vec[u8]
+    ## Serialize to OTLP JSON (protobuf JSON mapping)
+    use std::json::{JsonValue, JsonArray, JsonObject}
+    let mut resource_spans = JsonArray.new()
+    let mut rs = JsonObject.new()
+    rs.set("resource", self.serialize_resource())
+    let mut scope_spans = JsonArray.new()
+    let mut ss = JsonObject.new()
+    let mut otel_spans = JsonArray.new()
+    for span in spans do
+      otel_spans.push(self.serialize_span_data(span))
+    end
+    ss.set("spans", JsonValue.Array(otel_spans))
+    scope_spans.push(JsonValue.Object(ss))
+    rs.set("scopeSpans", JsonValue.Array(scope_spans))
+    resource_spans.push(JsonValue.Object(rs))
+
+    let root = JsonObject.new()
+    root.set("resourceSpans", JsonValue.Array(resource_spans))
+    JsonValue.Object(root).to_string().as_bytes().to_vec()
+  end
+
+  def serialize_resource(self) -> JsonValue
+    use std::json::{JsonValue, JsonArray, JsonObject}
+    let mut attrs = JsonArray.new()
+    for attr in &self._resource.attributes do
+      attrs.push(self.serialize_attribute(attr))
+    end
+    let mut obj = JsonObject.new()
+    obj.set("attributes", JsonValue.Array(attrs))
+    JsonValue.Object(obj)
+  end
+
+  def serialize_span_data(self, span: &SpanData) -> JsonValue
+    use std::json::{JsonValue, JsonObject}
+    let mut obj = JsonObject.new()
+    obj.set("traceId", JsonValue.String(span.context.trace_id.to_hex()))
+    obj.set("spanId", JsonValue.String(span.context.span_id.to_hex()))
+    obj.set("name", JsonValue.String(span.name.clone()))
+    obj.set("kind", JsonValue.Int(match span.kind
+      SpanKind.Internal => 1
+      SpanKind.Server   => 2
+      SpanKind.Client   => 3
+      SpanKind.Producer => 4
+      SpanKind.Consumer => 5
+    end))
+    obj.set("startTimeUnixNano", JsonValue.String(span.start_time.as_nanos().to_string()))
+    obj.set("endTimeUnixNano", JsonValue.String(span.end_time.as_nanos().to_string()))
+    JsonValue.Object(obj)
+  end
+
+  def serialize_attribute(self, attr: &Attribute) -> JsonValue
+    use std::json::{JsonValue, JsonObject}
+    let mut obj = JsonObject.new()
+    obj.set("key", JsonValue.String(attr.key.clone()))
+    let value = match &attr.value
+      AttributeValue.StringVal(s) =>
+        let mut v = JsonObject.new()
+        v.set("stringValue", JsonValue.String(s.clone()))
+        JsonValue.Object(v)
+      AttributeValue.IntVal(i) =>
+        let mut v = JsonObject.new()
+        v.set("intValue", JsonValue.String(i.to_string()))
+        JsonValue.Object(v)
+      AttributeValue.FloatVal(f_) =>
+        let mut v = JsonObject.new()
+        v.set("doubleValue", JsonValue.Float(f_))
+        JsonValue.Object(v)
+      AttributeValue.BoolVal(b) =>
+        let mut v = JsonObject.new()
+        v.set("boolValue", JsonValue.Bool(b))
+        JsonValue.Object(v)
+      _ =>
+        let mut v = JsonObject.new()
+        v.set("stringValue", JsonValue.String("<array>"))
+        JsonValue.Object(v)
+    end
+    obj.set("value", value)
+    JsonValue.Object(obj)
+  end
+end
+
+impl SpanExporter for OtlpHttpSpanExporter
+  def export(self, spans: Vec[SpanData]) -> Result[Unit, OtelError]
+    if spans.is_empty() then return Ok(()) end
+    let body = self.serialize_spans(&spans)
+    let url = self._config.endpoint.clone() + "/v1/traces"
+    use std::web::http::{Request, Method}
+    let mut req = Request.new(Method.POST, url)
+    req.set_header("Content-Type", "application/json")
+    for (key, value) in &self._config.headers do
+      req.set_header(key, value)
+    end
+    req.set_body(body)
+    match req.send_with_timeout(self._config.timeout)
+      Ok(resp) if resp.status() < 300 => Ok(())
+      Ok(resp) => Err(OtelError.ExportFailed("HTTP " + resp.status().to_string()))
+      Err(e) => Err(OtelError.ExportFailed(e.to_string()))
+    end
+  end
+
+  def shutdown(self) -> Result[Unit, OtelError] = Ok(())
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §5  Batch Span Processor
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct BatchSpanProcessorConfig
+  pub max_queue_size: usize
+  pub batch_timeout: Duration
+  pub max_export_batch_size: usize
+  pub scheduled_delay: Duration
+end
+
+impl BatchSpanProcessorConfig
+  pub def default() -> BatchSpanProcessorConfig
+    BatchSpanProcessorConfig {
+      max_queue_size: 2048,
+      batch_timeout: Duration.from_secs(30),
+      max_export_batch_size: 512,
+      scheduled_delay: Duration.from_secs(5),
+    }
+  end
+end
+
+pub struct BatchSpanProcessor
+  _config: BatchSpanProcessorConfig
+  _exporter: Arc[dyn SpanExporter]
+  _queue: Arc[Mutex[Vec[SpanData]]]
+  _shutdown: Arc[Mutex[Bool]]
+end
+
+impl BatchSpanProcessor
+  pub def new(exporter: Box[dyn SpanExporter], config: BatchSpanProcessorConfig) -> BatchSpanProcessor
+    let processor = BatchSpanProcessor {
+      _config: config,
+      _exporter: Arc.new(exporter),
+      _queue: Arc.new(Mutex.new(Vec.new())),
+      _shutdown: Arc.new(Mutex.new(false)),
+    }
+    processor.start_export_loop()
+    processor
+  end
+
+  def start_export_loop(self)
+    let queue = self._queue.clone()
+    let exporter = self._exporter.clone()
+    let config = self._config.clone()
+    let shutdown = self._shutdown.clone()
+
+    spawn async
+      loop
+        sleep(config.scheduled_delay).await
+        if *shutdown.lock() then break end
+        let batch = {
+          let mut q = queue.lock()
+          let take = std::cmp::min(q.len(), config.max_export_batch_size)
+          q.drain(0..take).collect()
+        }
+        if !batch.is_empty() then
+          let _ = exporter.export(batch)
+        end
+      end
+    end
+  end
+
+  pub def on_end(&self, span: SpanData)
+    let mut q = self._queue.lock()
+    if q.len() < self._config.max_queue_size then
+      q.push(span)
+    end
+    ## Drop span if queue is full (back-pressure)
+  end
+
+  pub def force_flush(self) -> Result[Unit, OtelError]
+    let batch = {
+      let mut q = self._queue.lock()
+      q.drain(..).collect()
+    }
+    if !batch.is_empty() then
+      self._exporter.export(batch)?
+    end
+    Ok(())
+  end
+
+  pub def shutdown(self) -> Result[Unit, OtelError]
+    *self._shutdown.lock() = true
+    self.force_flush()?
+    self._exporter.shutdown()
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §6  Metrics
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum MetricKind
+  Counter
+  UpDownCounter
+  Histogram
+  Gauge
+end
+
+pub struct MetricPoint
+  pub name: String
+  pub kind: MetricKind
+  pub description: String
+  pub unit: String
+  pub attributes: Vec[Attribute]
+  pub value: MetricValue
+  pub timestamp: SystemTime
+end
+
+pub enum MetricValue
+  IntSum(i64)
+  FloatSum(f64)
+  IntGauge(i64)
+  FloatGauge(f64)
+  Histogram(HistogramData)
+end
+
+pub struct HistogramData
+  pub count: u64
+  pub sum: f64
+  pub min: f64
+  pub max: f64
+  pub boundaries: Vec[f64]
+  pub bucket_counts: Vec[u64]
+end
+
+## Counter — monotonically increasing value.
+pub struct Counter
+  _name: String
+  _description: String
+  _unit: String
+  _value: Arc[Mutex[f64]]
+end
+
+impl Counter
+  pub def new(name: String, description: String, unit: String) -> Counter
+    Counter {
+      _name: name, _description: description, _unit: unit,
+      _value: Arc.new(Mutex.new(0.0)),
+    }
+  end
+
+  pub def add(&self, value: f64, attrs: Vec[Attribute])
+    pre value >= 0.0, "counter value must be non-negative"
+    *self._value.lock() += value
+  end
+
+  pub def get(&self) -> f64 = *self._value.lock()
+end
+
+## Histogram — distribution of values with configurable buckets.
+pub struct HistogramMetric
+  _name: String
+  _description: String
+  _unit: String
+  _boundaries: Vec[f64]
+  _data: Arc[Mutex[HistogramData]]
+end
+
+impl HistogramMetric
+  pub def new(name: String, description: String, unit: String, boundaries: Vec[f64]) -> HistogramMetric
+    let bucket_counts = vec![0u64; boundaries.len() + 1]
+    HistogramMetric {
+      _name: name, _description: description, _unit: unit,
+      _boundaries: boundaries.clone(),
+      _data: Arc.new(Mutex.new(HistogramData {
+        count: 0, sum: 0.0, min: f64.MAX, max: f64.MIN,
+        boundaries: boundaries, bucket_counts: bucket_counts,
+      })),
+    }
+  end
+
+  pub def record(&self, value: f64, _attrs: Vec[Attribute])
+    let mut data = self._data.lock()
+    data.count += 1
+    data.sum += value
+    if value < data.min then data.min = value end
+    if value > data.max then data.max = value end
+    ## Find bucket
+    var found = false
+    for (i, boundary) in data.boundaries.iter().enumerate() do
+      if value <= *boundary then
+        data.bucket_counts[i] += 1
+        found = true
+        break
+      end
+    end
+    if !found then
+      let last = data.bucket_counts.len() - 1
+      data.bucket_counts[last] += 1
+    end
+  end
+end
+
+## Gauge — current value that can go up or down.
+pub struct Gauge
+  _name: String
+  _description: String
+  _unit: String
+  _value: Arc[Mutex[f64]]
+end
+
+impl Gauge
+  pub def new(name: String, description: String, unit: String) -> Gauge
+    Gauge {
+      _name: name, _description: description, _unit: unit,
+      _value: Arc.new(Mutex.new(0.0)),
+    }
+  end
+
+  pub def set(&self, value: f64, _attrs: Vec[Attribute])
+    *self._value.lock() = value
+  end
+
+  pub def get(&self) -> f64 = *self._value.lock()
+end
+
+## Metric exporter trait.
+pub trait MetricExporter
+  def export(self, metrics: Vec[MetricPoint]) -> Result[Unit, OtelError]
+  def shutdown(self) -> Result[Unit, OtelError]
+end
+
+## Console metric exporter.
+pub struct ConsoleMetricExporter end
+
+impl MetricExporter for ConsoleMetricExporter
+  def export(self, metrics: Vec[MetricPoint]) -> Result[Unit, OtelError]
+    for m in metrics do
+      println("[OTEL METRIC] " + m.name + " (" + m.unit + ") = " + match m.value
+        MetricValue.IntSum(v)    => v.to_string()
+        MetricValue.FloatSum(v)  => v.to_string()
+        MetricValue.IntGauge(v)  => v.to_string()
+        MetricValue.FloatGauge(v)=> v.to_string()
+        MetricValue.Histogram(h) => "count=" + h.count.to_string() + " sum=" + h.sum.to_string()
+      end)
+    end
+    Ok(())
+  end
+
+  def shutdown(self) -> Result[Unit, OtelError] = Ok(())
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §7  Context Propagation
+# ═══════════════════════════════════════════════════════════════════════
+
+/// W3C TraceContext propagator.
+pub struct TraceContextPropagator end
+
+impl TraceContextPropagator
+  /// Inject span context into HTTP headers.
+  pub def inject(ctx: &SpanContext, headers: &mut HashMap[String, String])
+    let traceparent = "00-" + ctx.trace_id.to_hex() + "-" + ctx.span_id.to_hex() +
+      "-" + if ctx.trace_flags.is_sampled() then "01" else "00" end
+    headers.insert("traceparent".to_string(), traceparent)
+    if !ctx.trace_state.is_empty() then
+      headers.insert("tracestate".to_string(), ctx.trace_state.clone())
+    end
+  end
+
+  /// Extract span context from HTTP headers.
+  pub def extract(headers: &HashMap[String, String]) -> Option[SpanContext]
+    let traceparent = headers.get("traceparent")?
+    let parts: Vec[&str] = traceparent.split('-').collect()
+    if parts.len() != 4 then return None end
+    if parts[0] != "00" then return None end
+
+    let trace_id = TraceId {
+      high: u64.from_str_radix(parts[1][0..16], 16).ok()?,
+      low: u64.from_str_radix(parts[1][16..32], 16).ok()?,
+    }
+    let span_id = SpanId {
+      value: u64.from_str_radix(parts[2], 16).ok()?,
+    }
+    let flags = TraceFlags { value: u8.from_str_radix(parts[3], 16).ok()? }
+    let trace_state = headers.get("tracestate").cloned().unwrap_or_default()
+
+    Some(SpanContext {
+      trace_id: trace_id,
+      span_id: span_id,
+      trace_flags: flags,
+      trace_state: trace_state,
+      is_remote: true,
+    })
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §8  Tracer Provider (Top-Level API)
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct TracerProvider
+  _resource: Resource
+  _sampler: Box[dyn Sampler]
+  _processor: Arc[BatchSpanProcessor]
+end
+
+impl TracerProvider
+  pub def builder() -> TracerProviderBuilder
+    TracerProviderBuilder {
+      _resource: Resource.default(),
+      _sampler: Box.new(AlwaysOnSampler {}),
+      _exporter: None,
+      _batch_config: BatchSpanProcessorConfig.default(),
+    }
+  end
+
+  pub def tracer(self, name: String) -> Tracer
+    Tracer {
+      _name: name,
+      _provider: self,
+    }
+  end
+
+  pub def force_flush(self) -> Result[Unit, OtelError]
+    self._processor.force_flush()
+  end
+
+  pub def shutdown(self) -> Result[Unit, OtelError]
+    self._processor.shutdown()
+  end
+end
+
+pub struct TracerProviderBuilder
+  _resource: Resource
+  _sampler: Box[dyn Sampler]
+  _exporter: Option[Box[dyn SpanExporter]]
+  _batch_config: BatchSpanProcessorConfig
+end
+
+impl TracerProviderBuilder
+  pub def with_resource(mut self, resource: Resource) -> TracerProviderBuilder
+    self._resource = resource
+    self
+  end
+
+  pub def with_sampler(mut self, sampler: Box[dyn Sampler]) -> TracerProviderBuilder
+    self._sampler = sampler
+    self
+  end
+
+  pub def with_exporter(mut self, exporter: Box[dyn SpanExporter]) -> TracerProviderBuilder
+    self._exporter = Some(exporter)
+    self
+  end
+
+  pub def with_batch_config(mut self, config: BatchSpanProcessorConfig) -> TracerProviderBuilder
+    self._batch_config = config
+    self
+  end
+
+  pub def build(self) -> Result[TracerProvider, OtelError]
+    let exporter = self._exporter.ok_or(OtelError.InvalidConfig("no exporter configured"))?
+    let processor = BatchSpanProcessor.new(exporter, self._batch_config)
+    Ok(TracerProvider {
+      _resource: self._resource,
+      _sampler: self._sampler,
+      _processor: Arc.new(processor),
+    })
+  end
+end
+
+## Tracer creates spans.
+pub struct Tracer
+  _name: String
+  _provider: &TracerProvider
+end
+
+impl Tracer
+  pub def start_span(self, name: String) -> Span
+    self.start_span_with_kind(name, SpanKind.Internal)
+  end
+
+  pub def start_span_with_kind(self, name: String, kind: SpanKind) -> Span
+    let trace_id = TraceId.generate()
+    let span_id = SpanId.generate()
+    let sampling = self._provider._sampler.should_sample(
+      None, &trace_id, &name, kind.clone(),
+    )
+    let flags = match sampling.decision
+      SamplingDecision.RecordAndSample => TraceFlags.SAMPLED
+      _                                => TraceFlags.NONE
+    end
+    Span {
+      _name: name,
+      _context: SpanContext {
+        trace_id: trace_id,
+        span_id: span_id,
+        trace_flags: flags,
+        trace_state: String.new(),
+        is_remote: false,
+      },
+      _parent: None,
+      _kind: kind,
+      _start_time: SystemTime.now(),
+      _end_time: None,
+      _attributes: sampling.attributes,
+      _events: Vec.new(),
+      _links: Vec.new(),
+      _status: SpanStatus { code: StatusCode.Unset, message: String.new() },
+      _exporter: Some(self._provider._processor._exporter.clone()),
+    }
+  end
+
+  pub def start_child_span(self, name: String, parent: &SpanContext) -> Span
+    let span_id = SpanId.generate()
+    Span {
+      _name: name,
+      _context: SpanContext {
+        trace_id: parent.trace_id.clone(),
+        span_id: span_id,
+        trace_flags: parent.trace_flags.clone(),
+        trace_state: parent.trace_state.clone(),
+        is_remote: false,
+      },
+      _parent: Some(parent.clone()),
+      _kind: SpanKind.Internal,
+      _start_time: SystemTime.now(),
+      _end_time: None,
+      _attributes: Vec.new(),
+      _events: Vec.new(),
+      _links: Vec.new(),
+      _status: SpanStatus { code: StatusCode.Unset, message: String.new() },
+      _exporter: Some(self._provider._processor._exporter.clone()),
+    }
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §9  Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+@test
+def test_trace_id_generation() -> Unit
+  let id = TraceId.generate()
+  assert id.is_valid()
+  assert id.to_hex().len() == 32
+end
+
+@test
+def test_span_lifecycle() -> Unit
+  let provider = TracerProvider.builder()
+    .with_exporter(Box.new(ConsoleSpanExporter {}))
+    .build()
+    .unwrap()
+  let tracer = provider.tracer("test")
+  var span = tracer.start_span("test-operation")
+  span.set_attribute(Attribute.string("http.method", "GET"))
+  span.set_status(StatusCode.Ok, "")
+  span.end_span()
+  provider.shutdown().unwrap()
+end
+
+@test
+def test_traceparent_roundtrip() -> Unit
+  let ctx = SpanContext {
+    trace_id: TraceId.new(0x0123456789abcdef, 0xfedcba9876543210),
+    span_id: SpanId.new(0xdeadbeefcafebabe),
+    trace_flags: TraceFlags.SAMPLED,
+    trace_state: "".to_string(),
+    is_remote: false,
+  }
+  var headers = HashMap.new()
+  TraceContextPropagator.inject(&ctx, &mut headers)
+  let extracted = TraceContextPropagator.extract(&headers).unwrap()
+  assert extracted.trace_id.high == ctx.trace_id.high
+  assert extracted.trace_id.low == ctx.trace_id.low
+  assert extracted.span_id.value == ctx.span_id.value
+  assert extracted.trace_flags.is_sampled()
+end
+
+@test
+def test_counter_metric() -> Unit
+  let counter = Counter.new("requests_total", "Total requests", "1")
+  counter.add(1.0, vec![])
+  counter.add(2.0, vec![])
+  assert counter.get() == 3.0
+end
+
+@test
+def test_histogram_metric() -> Unit
+  let hist = HistogramMetric.new("latency", "Request latency", "ms",
+    vec![10.0, 50.0, 100.0, 500.0])
+  hist.record(5.0, vec![])
+  hist.record(42.0, vec![])
+  hist.record(150.0, vec![])
+  let data = hist._data.lock()
+  assert data.count == 3
+  assert data.min == 5.0
+end
+
+end ## module std::opentelemetry

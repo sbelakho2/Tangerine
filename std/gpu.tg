@@ -1,0 +1,1183 @@
+## std::gpu — Multi-Backend GPU Abstraction Layer
+## Provides safe, zero-cost abstractions over Vulkan, Metal, DirectX 12, and
+## OpenGL 4.6+. Builds on std::gfx_gpu with full pipeline, shader, descriptor,
+## and synchronization support.
+##
+## Design goals:
+##   - Backend-agnostic API (write once, run on any GPU)
+##   - Zero-copy buffer management with explicit lifetime control
+##   - Shader compilation pipeline with SPIR-V as IR
+##   - Descriptor set / bind group abstraction
+##   - Safe synchronization primitives (fences, semaphores)
+##   - Render graph for automatic barrier insertion
+##
+## Spec: §stdlib.gpu
+
+module std::gpu
+
+use std::core::{Result, Option, Drop, Clone, Display}
+use std::alloc::{Layout}
+use std::linalg::{Vec2, Vec3, Vec4, Mat4}
+use std::mmap::{Mmap}
+use std::sync::{Arc, Mutex}
+
+# ═══════════════════════════════════════════════════════════════════════
+# §1  Backend Selection
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum Backend
+  Vulkan
+  Metal
+  DirectX12
+  OpenGL46
+  WebGPU
+  Auto          ## Auto-detect best available backend
+end
+
+pub enum GpuError
+  OutOfMemory(String)
+  DeviceLost(String)
+  Unsupported(String)
+  ShaderCompilationError(String)
+  PipelineError(String)
+  SurfaceError(String)
+  ValidationError(String)
+  Timeout
+end
+
+impl Display for GpuError
+  def fmt(self, f: &mut std::fmt::Formatter) -> std::fmt::Result
+    match self
+      GpuError.OutOfMemory(msg)             => f.write_str("GPU OOM: " + msg)
+      GpuError.DeviceLost(msg)              => f.write_str("Device lost: " + msg)
+      GpuError.Unsupported(msg)             => f.write_str("Unsupported: " + msg)
+      GpuError.ShaderCompilationError(msg)  => f.write_str("Shader error: " + msg)
+      GpuError.PipelineError(msg)           => f.write_str("Pipeline error: " + msg)
+      GpuError.SurfaceError(msg)            => f.write_str("Surface error: " + msg)
+      GpuError.ValidationError(msg)         => f.write_str("Validation: " + msg)
+      GpuError.Timeout                      => f.write_str("GPU timeout")
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §2  Instance, Adapter, Device
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct InstanceConfig
+  pub backend: Backend
+  pub validation_layers: Bool
+  pub debug_labels: Bool
+  pub app_name: String
+  pub app_version: (u32, u32, u32)
+end
+
+impl InstanceConfig
+  pub def default() -> InstanceConfig
+    InstanceConfig {
+      backend: Backend.Auto,
+      validation_layers: false,
+      debug_labels: false,
+      app_name: "Tangerine App".to_string(),
+      app_version: (1, 0, 0),
+    }
+  end
+end
+
+pub struct GpuInstance
+  _backend: Backend
+  _handle: u64
+end
+
+impl GpuInstance
+  pub def new(config: InstanceConfig) -> Result[GpuInstance, GpuError]
+    let backend = if config.backend == Backend.Auto then
+      _detect_best_backend()
+    else
+      config.backend
+    end
+    let handle = _backend_create_instance(backend, &config)?
+    Ok(GpuInstance { _backend: backend, _handle: handle })
+  end
+
+  pub def enumerate_adapters(self) -> Result[Vec[GpuAdapter], GpuError]
+    _backend_enumerate_adapters(self._backend, self._handle)
+  end
+
+  pub def backend(self) -> Backend = self._backend
+end
+
+impl Drop for GpuInstance
+  def drop(&mut self)
+    _backend_destroy_instance(self._backend, self._handle)
+  end
+end
+
+pub struct AdapterInfo
+  pub name: String
+  pub vendor_id: u32
+  pub device_id: u32
+  pub device_type: DeviceType
+  pub driver_version: String
+  pub api_version: String
+  pub dedicated_video_memory: u64
+  pub dedicated_system_memory: u64
+  pub shared_system_memory: u64
+end
+
+pub enum DeviceType
+  DiscreteGpu
+  IntegratedGpu
+  VirtualGpu
+  Cpu
+  Other
+end
+
+pub struct GpuAdapter
+  _backend: Backend
+  _handle: u64
+end
+
+impl GpuAdapter
+  pub def info(self) -> AdapterInfo
+    _backend_adapter_info(self._backend, self._handle)
+  end
+
+  pub def request_device(self, features: DeviceFeatures) -> Result[GpuDevice, GpuError]
+    let (dev_handle, queue_handle) = _backend_request_device(self._backend, self._handle, &features)?
+    Ok(GpuDevice {
+      _backend: self._backend,
+      _handle: dev_handle,
+      _queue: GpuQueue { _backend: self._backend, _handle: queue_handle },
+      _features: features,
+    })
+  end
+end
+
+pub struct DeviceFeatures
+  pub geometry_shader: Bool
+  pub tessellation: Bool
+  pub compute_shader: Bool
+  pub multi_draw_indirect: Bool
+  pub texture_compression_bc: Bool
+  pub texture_compression_astc: Bool
+  pub shader_float64: Bool
+  pub shader_int16: Bool
+  pub descriptor_indexing: Bool
+  pub ray_tracing: Bool
+  pub mesh_shading: Bool
+  pub timeline_semaphore: Bool
+end
+
+impl DeviceFeatures
+  pub def default() -> DeviceFeatures
+    DeviceFeatures {
+      geometry_shader: false, tessellation: false, compute_shader: true,
+      multi_draw_indirect: false, texture_compression_bc: false,
+      texture_compression_astc: false, shader_float64: false,
+      shader_int16: false, descriptor_indexing: false,
+      ray_tracing: false, mesh_shading: false, timeline_semaphore: false,
+    }
+  end
+end
+
+pub struct GpuDevice
+  _backend: Backend
+  _handle: u64
+  _queue: GpuQueue
+  _features: DeviceFeatures
+end
+
+impl GpuDevice
+  pub def queue(self) -> &GpuQueue = &self._queue
+  pub def features(self) -> &DeviceFeatures = &self._features
+
+  pub def wait_idle(self) -> Result[Unit, GpuError]
+    _backend_device_wait_idle(self._backend, self._handle)
+  end
+end
+
+impl Drop for GpuDevice
+  def drop(&mut self)
+    let _ = self.wait_idle()
+    _backend_destroy_device(self._backend, self._handle)
+  end
+end
+
+pub struct GpuQueue
+  _backend: Backend
+  _handle: u64
+end
+
+impl GpuQueue
+  pub def submit(self, commands: Vec[CommandBuffer]) -> Result[Unit, GpuError]
+    _backend_queue_submit(self._backend, self._handle, &commands)
+  end
+
+  pub def submit_with_fence(self, commands: Vec[CommandBuffer], fence: &Fence) -> Result[Unit, GpuError]
+    _backend_queue_submit_fence(self._backend, self._handle, &commands, fence._handle)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §3  Buffer Management
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum BufferUsage
+  Vertex
+  Index
+  Uniform
+  Storage
+  Indirect
+  TransferSrc
+  TransferDst
+end
+
+pub enum MemoryLocation
+  GpuOnly           ## Device-local, not host-visible
+  CpuToGpu          ## Host-visible, host-coherent (staging/uniform)
+  GpuToCpu          ## Host-visible, for readback
+end
+
+pub struct BufferDescriptor
+  pub size: u64
+  pub usage: Vec[BufferUsage]
+  pub memory: MemoryLocation
+  pub label: Option[String]
+end
+
+pub struct GpuBuffer
+  _backend: Backend
+  _handle: u64
+  _size: u64
+  _mapped: Option[*mut u8]
+end
+
+impl GpuBuffer
+  pub def size(self) -> u64 = self._size
+
+  ## Map buffer for CPU access. Returns a mutable byte slice.
+  pub def map(self, offset: u64, size: u64) -> Result[&mut [u8], GpuError]
+    pre offset + size <= self._size, "map region out of bounds"
+    let ptr = _backend_buffer_map(self._backend, self._handle, offset, size)?
+    Ok(unsafe { std::slice::from_raw_parts_mut(ptr, size as usize) })
+  end
+
+  /// Unmap a previously mapped buffer.
+  pub def unmap(self)
+    _backend_buffer_unmap(self._backend, self._handle)
+  end
+
+  /// Upload data from CPU memory to the buffer.
+  pub def write(self, device: &GpuDevice, offset: u64, data: &[u8]) -> Result[Unit, GpuError]
+    pre offset + data.len() as u64 <= self._size, "write out of bounds"
+    _backend_buffer_write(self._backend, self._handle, offset, data)
+  end
+
+  /// Read data from buffer to CPU memory.
+  pub def read(self, device: &GpuDevice, offset: u64, dest: &mut [u8]) -> Result[Unit, GpuError]
+    pre offset + dest.len() as u64 <= self._size, "read out of bounds"
+    _backend_buffer_read(self._backend, self._handle, offset, dest)
+  end
+end
+
+impl Drop for GpuBuffer
+  def drop(&mut self)
+    _backend_destroy_buffer(self._backend, self._handle)
+  end
+end
+
+## Create a GPU buffer.
+pub def create_buffer(device: &GpuDevice, desc: &BufferDescriptor) -> Result[GpuBuffer, GpuError]
+  let handle = _backend_create_buffer(device._backend, device._handle, desc)?
+  Ok(GpuBuffer {
+    _backend: device._backend,
+    _handle: handle,
+    _size: desc.size,
+    _mapped: None,
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §4  Texture & Sampler
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum TextureFormat
+  R8Unorm
+  R8Snorm
+  RG8Unorm
+  RGBA8Unorm
+  RGBA8Srgb
+  BGRA8Unorm
+  BGRA8Srgb
+  RG16Float
+  RGBA16Float
+  RGBA32Float
+  R32Float
+  R32Uint
+  R32Sint
+  Depth16Unorm
+  Depth24Plus
+  Depth24PlusStencil8
+  Depth32Float
+  BC1Unorm       ## DXT1
+  BC3Unorm       ## DXT5
+  BC7Unorm       ## Best quality BC
+  ASTC4x4Unorm
+  ASTC8x8Unorm
+end
+
+pub enum TextureDimension
+  D1
+  D2
+  D3
+  Cube
+  Array2D
+  ArrayCube
+end
+
+pub enum TextureUsage
+  Sampled
+  Storage
+  RenderTarget
+  DepthStencil
+  TransferSrc
+  TransferDst
+end
+
+pub struct TextureDescriptor
+  pub width: u32
+  pub height: u32
+  pub depth: u32
+  pub mip_levels: u32
+  pub array_layers: u32
+  pub format: TextureFormat
+  pub dimension: TextureDimension
+  pub usage: Vec[TextureUsage]
+  pub sample_count: u32
+  pub label: Option[String]
+end
+
+pub struct GpuTexture
+  _backend: Backend
+  _handle: u64
+  _desc: TextureDescriptor
+end
+
+impl GpuTexture
+  pub def width(self) -> u32 = self._desc.width
+  pub def height(self) -> u32 = self._desc.height
+  pub def format(self) -> TextureFormat = self._desc.format
+
+  pub def create_view(self, desc: &TextureViewDescriptor) -> Result[TextureView, GpuError]
+    let handle = _backend_create_texture_view(self._backend, self._handle, desc)?
+    Ok(TextureView { _backend: self._backend, _handle: handle })
+  end
+
+  pub def default_view(self) -> Result[TextureView, GpuError]
+    self.create_view(&TextureViewDescriptor.default_from(&self._desc))
+  end
+end
+
+impl Drop for GpuTexture
+  def drop(&mut self)
+    _backend_destroy_texture(self._backend, self._handle)
+  end
+end
+
+pub struct TextureViewDescriptor
+  pub format: TextureFormat
+  pub dimension: TextureDimension
+  pub base_mip_level: u32
+  pub mip_level_count: u32
+  pub base_array_layer: u32
+  pub array_layer_count: u32
+end
+
+impl TextureViewDescriptor
+  pub def default_from(tex: &TextureDescriptor) -> TextureViewDescriptor
+    TextureViewDescriptor {
+      format: tex.format,
+      dimension: tex.dimension,
+      base_mip_level: 0,
+      mip_level_count: tex.mip_levels,
+      base_array_layer: 0,
+      array_layer_count: tex.array_layers,
+    }
+  end
+end
+
+pub struct TextureView
+  _backend: Backend
+  _handle: u64
+end
+
+pub enum FilterMode
+  Nearest
+  Linear
+end
+
+pub enum AddressMode
+  ClampToEdge
+  Repeat
+  MirrorRepeat
+  ClampToBorder
+end
+
+pub enum CompareFunction
+  Never
+  Less
+  Equal
+  LessEqual
+  Greater
+  NotEqual
+  GreaterEqual
+  Always
+end
+
+pub struct SamplerDescriptor
+  pub min_filter: FilterMode
+  pub mag_filter: FilterMode
+  pub mipmap_filter: FilterMode
+  pub address_u: AddressMode
+  pub address_v: AddressMode
+  pub address_w: AddressMode
+  pub lod_min_clamp: f32
+  pub lod_max_clamp: f32
+  pub max_anisotropy: u32
+  pub compare: Option[CompareFunction]
+  pub label: Option[String]
+end
+
+impl SamplerDescriptor
+  pub def linear() -> SamplerDescriptor
+    SamplerDescriptor {
+      min_filter: FilterMode.Linear, mag_filter: FilterMode.Linear,
+      mipmap_filter: FilterMode.Linear,
+      address_u: AddressMode.Repeat, address_v: AddressMode.Repeat,
+      address_w: AddressMode.Repeat,
+      lod_min_clamp: 0.0, lod_max_clamp: 1000.0,
+      max_anisotropy: 1, compare: None, label: None,
+    }
+  end
+
+  pub def nearest() -> SamplerDescriptor
+    SamplerDescriptor {
+      min_filter: FilterMode.Nearest, mag_filter: FilterMode.Nearest,
+      mipmap_filter: FilterMode.Nearest,
+      address_u: AddressMode.ClampToEdge, address_v: AddressMode.ClampToEdge,
+      address_w: AddressMode.ClampToEdge,
+      lod_min_clamp: 0.0, lod_max_clamp: 0.0,
+      max_anisotropy: 1, compare: None, label: None,
+    }
+  end
+end
+
+pub struct GpuSampler
+  _backend: Backend
+  _handle: u64
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §5  Shader Compilation & SPIR-V Pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum ShaderStage
+  Vertex
+  Fragment
+  Compute
+  Geometry
+  TessControl
+  TessEval
+  Mesh
+  Task
+  RayGen
+  RayMiss
+  RayClosestHit
+  RayAnyHit
+  RayIntersect
+end
+
+pub enum ShaderSource
+  SpirV(Vec[u32])          ## Pre-compiled SPIR-V bytecode
+  Glsl(String, ShaderStage)## GLSL source + stage
+  Hlsl(String, ShaderStage)## HLSL source + stage
+  Msl(String)              ## Metal Shading Language source
+  Wgsl(String)             ## WGSL source (WebGPU)
+  TgShader(String)         ## Tangerine shader language (auto-transpile)
+end
+
+pub struct ShaderModuleDescriptor
+  pub source: ShaderSource
+  pub entry_point: String
+  pub label: Option[String]
+end
+
+pub struct ShaderModule
+  _backend: Backend
+  _handle: u64
+  _stage: ShaderStage
+  _entry_point: String
+end
+
+## Compile a shader module.
+pub def create_shader_module(device: &GpuDevice, desc: &ShaderModuleDescriptor) -> Result[ShaderModule, GpuError]
+  ## Cross-compile source to backend-native format:
+  ##   - Vulkan: SPIR-V (pass through or compile from GLSL/HLSL)
+  ##   - Metal: MSL (transpile from SPIR-V via SPIRV-Cross)
+  ##   - DirectX12: DXIL (compile from HLSL or transpile)
+  ##   - OpenGL: GLSL (transpile from SPIR-V)
+  ##   - WebGPU: WGSL (transpile from SPIR-V)
+  let stage = match &desc.source
+    ShaderSource.Glsl(_, s) => s
+    ShaderSource.Hlsl(_, s) => s
+    _ => ShaderStage.Vertex ## default, will be set properly
+  end
+  let handle = _backend_create_shader(device._backend, device._handle, desc)?
+  Ok(ShaderModule {
+    _backend: device._backend,
+    _handle: handle,
+    _stage: stage,
+    _entry_point: desc.entry_point.clone(),
+  })
+end
+
+## SPIR-V utilities.
+pub mod spirv
+  ## Compile GLSL to SPIR-V bytecode.
+  pub def compile_glsl(source: &String, stage: ShaderStage) -> Result[Vec[u32], GpuError]
+    _spirv_compile_glsl(source, stage)
+  end
+
+  ## Compile HLSL to SPIR-V bytecode.
+  pub def compile_hlsl(source: &String, stage: ShaderStage, entry: &String) -> Result[Vec[u32], GpuError]
+    _spirv_compile_hlsl(source, stage, entry)
+  end
+
+  ## Transpile SPIR-V to GLSL.
+  pub def to_glsl(spirv: &[u32], version: u32) -> Result[String, GpuError]
+    _spirv_cross_to_glsl(spirv, version)
+  end
+
+  ## Transpile SPIR-V to MSL (Metal).
+  pub def to_msl(spirv: &[u32]) -> Result[String, GpuError]
+    _spirv_cross_to_msl(spirv)
+  end
+
+  ## Transpile SPIR-V to HLSL.
+  pub def to_hlsl(spirv: &[u32], model: u32) -> Result[String, GpuError]
+    _spirv_cross_to_hlsl(spirv, model)
+  end
+
+  ## Transpile SPIR-V to WGSL.
+  pub def to_wgsl(spirv: &[u32]) -> Result[String, GpuError]
+    _spirv_cross_to_wgsl(spirv)
+  end
+
+  ## Validate SPIR-V bytecode.
+  pub def validate(spirv: &[u32]) -> Result[Unit, GpuError]
+    _spirv_validate(spirv)
+  end
+
+  ## Reflect SPIR-V module to extract binding information.
+  pub def reflect(spirv: &[u32]) -> Result[ShaderReflection, GpuError]
+    _spirv_reflect(spirv)
+  end
+end
+
+pub struct ShaderReflection
+  pub entry_points: Vec[EntryPoint]
+  pub descriptor_sets: Vec[DescriptorSetLayout>]
+  pub push_constants: Vec[PushConstantRange>]
+  pub input_attributes: Vec[VertexAttribute>]
+  pub output_attributes: Vec[ShaderOutput>]
+end
+
+pub struct EntryPoint
+  pub name: String
+  pub stage: ShaderStage
+end
+
+pub struct ShaderOutput
+  pub location: u32
+  pub format: TextureFormat
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §6  Descriptor Sets / Bind Groups
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum BindingType
+  UniformBuffer { dynamic_offset: Bool }
+  StorageBuffer { dynamic_offset: Bool, read_only: Bool }
+  Sampler
+  SampledTexture
+  StorageTexture { access: StorageAccess, format: TextureFormat }
+end
+
+pub enum StorageAccess
+  ReadOnly
+  WriteOnly
+  ReadWrite
+end
+
+pub struct BindGroupLayoutEntry
+  pub binding: u32
+  pub visibility: Vec[ShaderStage]
+  pub ty: BindingType
+  pub count: u32      ## Array count (1 for non-array)
+end
+
+pub struct BindGroupLayout
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_bind_group_layout(device: &GpuDevice, entries: &[BindGroupLayoutEntry]) -> Result[BindGroupLayout, GpuError]
+  let handle = _backend_create_bind_group_layout(device._backend, device._handle, entries)?
+  Ok(BindGroupLayout { _backend: device._backend, _handle: handle })
+end
+
+pub enum BindingResource
+  BufferBinding { buffer: &GpuBuffer, offset: u64, size: u64 }
+  TextureViewBinding(&TextureView)
+  SamplerBinding(&GpuSampler)
+end
+
+pub struct BindGroupEntry
+  pub binding: u32
+  pub resource: BindingResource
+end
+
+pub struct BindGroup
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_bind_group(device: &GpuDevice, layout: &BindGroupLayout, entries: &[BindGroupEntry]) -> Result[BindGroup, GpuError]
+  let handle = _backend_create_bind_group(device._backend, device._handle, layout._handle, entries)?
+  Ok(BindGroup { _backend: device._backend, _handle: handle })
+end
+
+pub struct PushConstantRange
+  pub stage: Vec[ShaderStage]
+  pub offset: u32
+  pub size: u32
+end
+
+pub struct PipelineLayout
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_pipeline_layout(device: &GpuDevice, bind_group_layouts: &[&BindGroupLayout], push_constants: &[PushConstantRange]) -> Result[PipelineLayout, GpuError]
+  let handles: Vec[u64] = bind_group_layouts.iter().map(|l| l._handle).collect()
+  let handle = _backend_create_pipeline_layout(device._backend, device._handle, &handles, push_constants)?
+  Ok(PipelineLayout { _backend: device._backend, _handle: handle })
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §7  Render Pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum PrimitiveTopology
+  PointList
+  LineList
+  LineStrip
+  TriangleList
+  TriangleStrip
+end
+
+pub enum FrontFace
+  Ccw
+  Cw
+end
+
+pub enum CullMode
+  None
+  Front
+  Back
+end
+
+pub enum PolygonMode
+  Fill
+  Line
+  Point
+end
+
+pub struct VertexAttribute
+  pub location: u32
+  pub format: VertexFormat
+  pub offset: u32
+end
+
+pub enum VertexFormat
+  Float32
+  Float32x2
+  Float32x3
+  Float32x4
+  Sint32
+  Sint32x2
+  Uint32
+  Uint32x2
+  Uint8x4
+  Snorm8x4
+  Unorm8x4
+end
+
+pub enum VertexStepMode
+  Vertex
+  Instance
+end
+
+pub struct VertexBufferLayout
+  pub stride: u32
+  pub step_mode: VertexStepMode
+  pub attributes: Vec[VertexAttribute]
+end
+
+pub enum BlendFactor
+  Zero
+  One
+  SrcColor
+  OneMinusSrcColor
+  SrcAlpha
+  OneMinusSrcAlpha
+  DstColor
+  OneMinusDstColor
+  DstAlpha
+  OneMinusDstAlpha
+end
+
+pub enum BlendOp
+  Add
+  Subtract
+  ReverseSubtract
+  Min
+  Max
+end
+
+pub struct BlendState
+  pub color_src: BlendFactor
+  pub color_dst: BlendFactor
+  pub color_op: BlendOp
+  pub alpha_src: BlendFactor
+  pub alpha_dst: BlendFactor
+  pub alpha_op: BlendOp
+end
+
+impl BlendState
+  pub const ALPHA_BLEND: BlendState = BlendState {
+    color_src: BlendFactor.SrcAlpha,
+    color_dst: BlendFactor.OneMinusSrcAlpha,
+    color_op: BlendOp.Add,
+    alpha_src: BlendFactor.One,
+    alpha_dst: BlendFactor.OneMinusSrcAlpha,
+    alpha_op: BlendOp.Add,
+  }
+
+  pub const PREMULTIPLIED: BlendState = BlendState {
+    color_src: BlendFactor.One,
+    color_dst: BlendFactor.OneMinusSrcAlpha,
+    color_op: BlendOp.Add,
+    alpha_src: BlendFactor.One,
+    alpha_dst: BlendFactor.OneMinusSrcAlpha,
+    alpha_op: BlendOp.Add,
+  }
+
+  pub const ADDITIVE: BlendState = BlendState {
+    color_src: BlendFactor.SrcAlpha,
+    color_dst: BlendFactor.One,
+    color_op: BlendOp.Add,
+    alpha_src: BlendFactor.One,
+    alpha_dst: BlendFactor.One,
+    alpha_op: BlendOp.Add,
+  }
+end
+
+pub struct ColorTargetState
+  pub format: TextureFormat
+  pub blend: Option[BlendState]
+  pub write_mask: u32         ## RGBA bitmask
+end
+
+pub struct DepthStencilState
+  pub format: TextureFormat
+  pub depth_write_enabled: Bool
+  pub depth_compare: CompareFunction
+end
+
+pub struct RenderPipelineDescriptor
+  pub layout: &PipelineLayout
+  pub vertex_shader: &ShaderModule
+  pub fragment_shader: Option[&ShaderModule]
+  pub vertex_buffers: Vec[VertexBufferLayout]
+  pub primitive_topology: PrimitiveTopology
+  pub front_face: FrontFace
+  pub cull_mode: CullMode
+  pub polygon_mode: PolygonMode
+  pub color_targets: Vec[ColorTargetState]
+  pub depth_stencil: Option[DepthStencilState]
+  pub multisample_count: u32
+  pub label: Option[String]
+end
+
+pub struct RenderPipeline
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_render_pipeline(device: &GpuDevice, desc: &RenderPipelineDescriptor) -> Result[RenderPipeline, GpuError]
+  let handle = _backend_create_render_pipeline(device._backend, device._handle, desc)?
+  Ok(RenderPipeline { _backend: device._backend, _handle: handle })
+end
+
+## Compute pipeline.
+pub struct ComputePipelineDescriptor
+  pub layout: &PipelineLayout
+  pub shader: &ShaderModule
+  pub label: Option[String]
+end
+
+pub struct ComputePipeline
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_compute_pipeline(device: &GpuDevice, desc: &ComputePipelineDescriptor) -> Result[ComputePipeline, GpuError]
+  let handle = _backend_create_compute_pipeline(device._backend, device._handle, desc)?
+  Ok(ComputePipeline { _backend: device._backend, _handle: handle })
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §8  Command Recording
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct CommandEncoder
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_command_encoder(device: &GpuDevice, label: Option[String]) -> Result[CommandEncoder, GpuError]
+  let handle = _backend_create_command_encoder(device._backend, device._handle)?
+  Ok(CommandEncoder { _backend: device._backend, _handle: handle })
+end
+
+pub struct CommandBuffer
+  _backend: Backend
+  _handle: u64
+end
+
+impl CommandEncoder
+  pub def finish(self) -> Result[CommandBuffer, GpuError]
+    let handle = _backend_finish_command_encoder(self._backend, self._handle)?
+    Ok(CommandBuffer { _backend: self._backend, _handle: handle })
+  end
+
+  pub def begin_render_pass(self, desc: &RenderPassDescriptor) -> RenderPassEncoder
+    let handle = _backend_begin_render_pass(self._backend, self._handle, desc)
+    RenderPassEncoder { _backend: self._backend, _handle: handle }
+  end
+
+  pub def begin_compute_pass(self) -> ComputePassEncoder
+    let handle = _backend_begin_compute_pass(self._backend, self._handle)
+    ComputePassEncoder { _backend: self._backend, _handle: handle }
+  end
+
+  pub def copy_buffer_to_buffer(self, src: &GpuBuffer, src_offset: u64,
+                                 dst: &GpuBuffer, dst_offset: u64, size: u64)
+    _backend_copy_buffer(self._backend, self._handle,
+      src._handle, src_offset, dst._handle, dst_offset, size)
+  end
+
+  pub def copy_buffer_to_texture(self, src: &GpuBuffer, dst: &GpuTexture,
+                                  offset: u64, bytes_per_row: u32, rows: u32)
+    _backend_copy_buffer_to_texture(self._backend, self._handle,
+      src._handle, offset, bytes_per_row, rows, dst._handle)
+  end
+end
+
+pub enum LoadOp
+  Clear
+  Load
+  DontCare
+end
+
+pub enum StoreOp
+  Store
+  Discard
+end
+
+pub struct Color
+  pub r: f64
+  pub g: f64
+  pub b: f64
+  pub a: f64
+end
+
+impl Color
+  pub const BLACK: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+  pub const WHITE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+  pub const TRANSPARENT: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+  pub const CORNFLOWER_BLUE: Color = Color { r: 0.392, g: 0.584, b: 0.929, a: 1.0 }
+end
+
+pub struct RenderPassColorAttachment
+  pub view: &TextureView
+  pub resolve_target: Option[&TextureView]
+  pub load_op: LoadOp
+  pub store_op: StoreOp
+  pub clear_color: Color
+end
+
+pub struct RenderPassDepthAttachment
+  pub view: &TextureView
+  pub depth_load_op: LoadOp
+  pub depth_store_op: StoreOp
+  pub depth_clear_value: f32
+  pub stencil_load_op: LoadOp
+  pub stencil_store_op: StoreOp
+  pub stencil_clear_value: u32
+end
+
+pub struct RenderPassDescriptor
+  pub color_attachments: Vec[RenderPassColorAttachment]
+  pub depth_stencil: Option[RenderPassDepthAttachment]
+  pub label: Option[String]
+end
+
+pub struct RenderPassEncoder
+  _backend: Backend
+  _handle: u64
+end
+
+impl RenderPassEncoder
+  pub def set_pipeline(&self, pipeline: &RenderPipeline)
+    _backend_rp_set_pipeline(self._backend, self._handle, pipeline._handle)
+  end
+
+  pub def set_bind_group(&self, index: u32, group: &BindGroup, dynamic_offsets: &[u32])
+    _backend_rp_set_bind_group(self._backend, self._handle, index, group._handle, dynamic_offsets)
+  end
+
+  pub def set_vertex_buffer(&self, slot: u32, buffer: &GpuBuffer, offset: u64)
+    _backend_rp_set_vertex_buffer(self._backend, self._handle, slot, buffer._handle, offset)
+  end
+
+  pub def set_index_buffer(&self, buffer: &GpuBuffer, format: IndexFormat, offset: u64)
+    _backend_rp_set_index_buffer(self._backend, self._handle, buffer._handle, format, offset)
+  end
+
+  pub def set_viewport(&self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32)
+    _backend_rp_set_viewport(self._backend, self._handle, x, y, w, h, min_depth, max_depth)
+  end
+
+  pub def set_scissor(&self, x: u32, y: u32, w: u32, h: u32)
+    _backend_rp_set_scissor(self._backend, self._handle, x, y, w, h)
+  end
+
+  pub def push_constants(&self, stage: ShaderStage, offset: u32, data: &[u8])
+    _backend_rp_push_constants(self._backend, self._handle, stage, offset, data)
+  end
+
+  pub def draw(&self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32)
+    _backend_rp_draw(self._backend, self._handle, vertex_count, instance_count, first_vertex, first_instance)
+  end
+
+  pub def draw_indexed(&self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32)
+    _backend_rp_draw_indexed(self._backend, self._handle, index_count, instance_count, first_index, vertex_offset, first_instance)
+  end
+
+  pub def end_pass(&self)
+    _backend_rp_end(self._backend, self._handle)
+  end
+end
+
+pub enum IndexFormat
+  Uint16
+  Uint32
+end
+
+pub struct ComputePassEncoder
+  _backend: Backend
+  _handle: u64
+end
+
+impl ComputePassEncoder
+  pub def set_pipeline(&self, pipeline: &ComputePipeline)
+    _backend_cp_set_pipeline(self._backend, self._handle, pipeline._handle)
+  end
+
+  pub def set_bind_group(&self, index: u32, group: &BindGroup, dynamic_offsets: &[u32])
+    _backend_cp_set_bind_group(self._backend, self._handle, index, group._handle, dynamic_offsets)
+  end
+
+  pub def dispatch(&self, x: u32, y: u32, z: u32)
+    _backend_cp_dispatch(self._backend, self._handle, x, y, z)
+  end
+
+  pub def dispatch_indirect(&self, buffer: &GpuBuffer, offset: u64)
+    _backend_cp_dispatch_indirect(self._backend, self._handle, buffer._handle, offset)
+  end
+
+  pub def end_pass(&self)
+    _backend_cp_end(self._backend, self._handle)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §9  Synchronization
+# ═══════════════════════════════════════════════════════════════════════
+
+pub struct Fence
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_fence(device: &GpuDevice, signaled: Bool) -> Result[Fence, GpuError]
+  let handle = _backend_create_fence(device._backend, device._handle, signaled)?
+  Ok(Fence { _backend: device._backend, _handle: handle })
+end
+
+impl Fence
+  pub def wait(self, timeout_ns: u64) -> Result[Bool, GpuError]
+    _backend_fence_wait(self._backend, self._handle, timeout_ns)
+  end
+
+  pub def reset(self) -> Result[Unit, GpuError]
+    _backend_fence_reset(self._backend, self._handle)
+  end
+
+  pub def is_signaled(self) -> Bool
+    _backend_fence_status(self._backend, self._handle)
+  end
+end
+
+impl Drop for Fence
+  def drop(&mut self)
+    _backend_destroy_fence(self._backend, self._handle)
+  end
+end
+
+pub struct Semaphore
+  _backend: Backend
+  _handle: u64
+end
+
+pub def create_semaphore(device: &GpuDevice) -> Result[Semaphore, GpuError]
+  let handle = _backend_create_semaphore(device._backend, device._handle)?
+  Ok(Semaphore { _backend: device._backend, _handle: handle })
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §10  Surface & Swapchain
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum PresentMode
+  Immediate       ## No v-sync, tearing possible
+  Fifo            ## V-sync, queue frames
+  FifoRelaxed     ## V-sync with late frame allowance
+  Mailbox         ## Triple-buffering, always presents latest
+end
+
+pub struct SwapchainConfig
+  pub format: TextureFormat
+  pub present_mode: PresentMode
+  pub width: u32
+  pub height: u32
+  pub min_image_count: u32
+end
+
+pub struct Surface
+  _backend: Backend
+  _handle: u64
+end
+
+pub struct Swapchain
+  _backend: Backend
+  _handle: u64
+  _config: SwapchainConfig
+end
+
+impl Swapchain
+  pub def acquire_next_image(self, timeout_ns: u64) -> Result[(TextureView, u32), GpuError]
+    _backend_swapchain_acquire(self._backend, self._handle, timeout_ns)
+  end
+
+  pub def present(self, image_index: u32) -> Result[Unit, GpuError]
+    _backend_swapchain_present(self._backend, self._handle, image_index)
+  end
+
+  pub def resize(self, width: u32, height: u32) -> Result[Unit, GpuError]
+    _backend_swapchain_resize(self._backend, self._handle, width, height)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §11  Backend Detection
+# ═══════════════════════════════════════════════════════════════════════
+
+def _detect_best_backend() -> Backend
+  @cfg(target_os = "macos")  { Backend.Metal }
+  @cfg(target_os = "ios")    { Backend.Metal }
+  @cfg(target_os = "windows") {
+    if _vulkan_available() then Backend.Vulkan else Backend.DirectX12 end
+  }
+  @cfg(target_os = "linux")  { Backend.Vulkan }
+  @cfg(target_os = "android"){ Backend.Vulkan }
+  @cfg(target_arch = "wasm") { Backend.WebGPU }
+end
+
+pub def available_backends() -> Vec[Backend]
+  var backends = Vec.new()
+  @cfg(target_os = "linux") {
+    if _vulkan_available() then backends.push(Backend.Vulkan) end
+    if _opengl_available() then backends.push(Backend.OpenGL46) end
+  }
+  @cfg(target_os = "macos") {
+    backends.push(Backend.Metal)
+    if _vulkan_available() then backends.push(Backend.Vulkan) end
+  }
+  @cfg(target_os = "windows") {
+    backends.push(Backend.DirectX12)
+    if _vulkan_available() then backends.push(Backend.Vulkan) end
+    if _opengl_available() then backends.push(Backend.OpenGL46) end
+  }
+  @cfg(target_arch = "wasm") {
+    backends.push(Backend.WebGPU)
+  }
+  backends
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §12  Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+@test
+def test_instance_config_default() -> Unit
+  let config = InstanceConfig.default()
+  assert !config.validation_layers
+  assert !config.debug_labels
+end
+
+@test
+def test_backend_detection() -> Unit
+  let backends = available_backends()
+  assert backends.len() >= 1, "at least one GPU backend should be available"
+end
+
+@test
+def test_sampler_descriptors() -> Unit
+  let linear = SamplerDescriptor.linear()
+  assert linear.max_anisotropy == 1
+  let nearest = SamplerDescriptor.nearest()
+  assert nearest.lod_max_clamp == 0.0
+end
+
+@test
+def test_blend_states() -> Unit
+  let alpha = BlendState.ALPHA_BLEND
+  assert alpha.color_op == BlendOp.Add
+end
+
+end ## module std::gpu
