@@ -103,7 +103,7 @@ let eat_ident st =
   match (peek st).kind with
   | Ident s -> advance st; s
   | Kw "Self" -> advance st; "Self"
-  | Kw s when is_soft_keyword s -> advance st; s
+  | Kw s when is_pattern_keyword s -> advance st; s
   | _ ->
     let t = peek st in
     err st (Printf.sprintf "expected identifier, got '%s'" t.lexeme);

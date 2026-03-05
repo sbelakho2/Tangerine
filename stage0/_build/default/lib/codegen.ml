@@ -47,13 +47,14 @@ type local_var = { lv_offset : int; lv_kind : val_kind }
 type frame = {
   mutable locals : (string * local_var) list;
   mutable next_off : int;     (* grows negative from fp *)
-  mutable label_cnt : int;
   mutable loop_labels : (string * string) list;  (* (break_lbl, continue_lbl) stack *)
+  self_type : string;  (* impl target type name, "" for free functions *)
 }
 
 (* Global string literals accumulated during codegen *)
 let string_literals : (string * string) list ref = ref []  (* (label, value) *)
 let string_counter = ref 0
+let label_counter = ref 0
 
 let add_string_literal s =
   (* Check if this string already has a label *)
@@ -79,9 +80,9 @@ let align16 n =
   let r = n mod 16 in
   if r = 0 then n else n + 16 - r
 
-let fresh_label fr prefix =
-  fr.label_cnt <- fr.label_cnt + 1;
-  Printf.sprintf ".L%s_%d" prefix fr.label_cnt
+let fresh_label prefix =
+  incr label_counter;
+  Printf.sprintf ".L%s_%d" prefix !label_counter
 
 let alloc_slot fr kind =
   fr.next_off <- fr.next_off - 8;
@@ -154,7 +155,13 @@ let emit_prologue buf arch =
 let emit_sub_sp buf arch n =
   if n > 0 then
     match arch with
-    | Arm64 -> b buf (Printf.sprintf "  sub sp, sp, #%d\n" n)
+    | Arm64 ->
+      if n <= 4095 then
+        b buf (Printf.sprintf "  sub sp, sp, #%d\n" n)
+      else begin
+        b buf (Printf.sprintf "  mov x16, #%d\n" n);
+        b buf "  sub sp, sp, x16\n"
+      end
     | X86_64 -> b buf (Printf.sprintf "  subq $%d, %%rsp\n" n)
 
 let emit_epilogue buf arch =
@@ -204,19 +211,70 @@ let emit_load_int buf arch v =
   | X86_64 ->
     b buf (Printf.sprintf "  movq $%d, %%rax\n" v)
 
+(* ARM64 fp-relative addressing helpers.
+   ldur/stur: signed 9-bit immediate [-256, 255].
+   ldr/str unsigned offset: [0, 32760] in multiples of 8.
+   For offsets outside these ranges, compute address in x16 (IP0). *)
+
+let arm64_fp_load buf reg off =
+  if off >= -256 && off <= 255 then
+    b buf (Printf.sprintf "  ldur %s, [x29, #%d]\n" reg off)
+  else if off >= 0 && off mod 8 = 0 && off <= 32760 then
+    b buf (Printf.sprintf "  ldr %s, [x29, #%d]\n" reg off)
+  else begin
+    if off < 0 && (-off) <= 4095 then
+      b buf (Printf.sprintf "  sub x16, x29, #%d\n" (-off))
+    else if off > 0 && off <= 4095 then
+      b buf (Printf.sprintf "  add x16, x29, #%d\n" off)
+    else begin
+      b buf (Printf.sprintf "  mov x16, #%d\n" off);
+      b buf "  add x16, x29, x16\n"
+    end;
+    b buf (Printf.sprintf "  ldr %s, [x16]\n" reg)
+  end
+
+let arm64_fp_store buf reg off =
+  if off >= -256 && off <= 255 then
+    b buf (Printf.sprintf "  stur %s, [x29, #%d]\n" reg off)
+  else if off >= 0 && off mod 8 = 0 && off <= 32760 then
+    b buf (Printf.sprintf "  str %s, [x29, #%d]\n" reg off)
+  else begin
+    if off < 0 && (-off) <= 4095 then
+      b buf (Printf.sprintf "  sub x16, x29, #%d\n" (-off))
+    else if off > 0 && off <= 4095 then
+      b buf (Printf.sprintf "  add x16, x29, #%d\n" off)
+    else begin
+      b buf (Printf.sprintf "  mov x16, #%d\n" off);
+      b buf "  add x16, x29, x16\n"
+    end;
+    b buf (Printf.sprintf "  str %s, [x16]\n" reg)
+  end
+
+let arm64_fp_addr buf dst off =
+  if off = 0 then
+    b buf (Printf.sprintf "  mov %s, x29\n" dst)
+  else if off > 0 && off <= 4095 then
+    b buf (Printf.sprintf "  add %s, x29, #%d\n" dst off)
+  else if off < 0 && (-off) <= 4095 then
+    b buf (Printf.sprintf "  sub %s, x29, #%d\n" dst (-off))
+  else begin
+    b buf (Printf.sprintf "  mov %s, #%d\n" dst off);
+    b buf (Printf.sprintf "  add %s, x29, %s\n" dst dst)
+  end
+
 let emit_load_local buf arch off =
   match arch with
-  | Arm64 -> b buf (Printf.sprintf "  ldr x0, [x29, #%d]\n" off)
+  | Arm64 -> arm64_fp_load buf "x0" off
   | X86_64 -> b buf (Printf.sprintf "  movq %d(%%rbp), %%rax\n" off)
 
 let emit_store_local buf arch off =
   match arch with
-  | Arm64 -> b buf (Printf.sprintf "  str x0, [x29, #%d]\n" off)
+  | Arm64 -> arm64_fp_store buf "x0" off
   | X86_64 -> b buf (Printf.sprintf "  movq %%rax, %d(%%rbp)\n" off)
 
 let emit_store_param buf arch i off =
   match arch with
-  | Arm64 -> b buf (Printf.sprintf "  str x%d, [x29, #%d]\n" i off)
+  | Arm64 -> arm64_fp_store buf (Printf.sprintf "x%d" i) off
   | X86_64 ->
     let regs = [|"%rdi"; "%rsi"; "%rdx"; "%rcx"; "%r8"; "%r9"|] in
     if i < 6 then
@@ -234,11 +292,7 @@ let emit_store_field buf arch base_reg field_off =
 
 let emit_addr_of_local buf arch off =
   match arch with
-  | Arm64 ->
-    if off >= 0 then
-      b buf (Printf.sprintf "  add x0, x29, #%d\n" off)
-    else
-      b buf (Printf.sprintf "  sub x0, x29, #%d\n" (-off))
+  | Arm64 -> arm64_fp_addr buf "x0" off
   | X86_64 ->
     b buf (Printf.sprintf "  leaq %d(%%rbp), %%rax\n" off)
 
@@ -423,7 +477,7 @@ let rec emit_expr buf env fr expr =
 
   | EBinOp ((And | Or) as op, left, right, _) ->
     (* Short-circuit *)
-    let lbl = fresh_label fr "sc" in
+    let lbl = fresh_label "sc" in
     emit_expr buf env fr left;
     (match op with
      | And -> emit_cbz buf arch lbl   (* if left=0, skip right, result=0 *)
@@ -514,6 +568,35 @@ let rec emit_expr buf env fr expr =
       done;
       emit_call buf arch name
     end
+
+  | ECall (EFieldAccess (EIdent (type_name, _), variant_name, _), args, _)
+    when List.mem_assoc type_name env.enum_map ->
+    (* Enum variant constructor: EnumType::Variant(arg0, ...) — inline *)
+    let el = List.assoc type_name env.enum_map in
+    let tag = try
+      let (_, t, _) = List.find (fun (n, _, _) -> n = variant_name) el.el_variants in t
+    with Not_found -> 0 in
+    let data_off = alloc_data fr el.el_size in
+    (* Set tag *)
+    emit_load_int buf arch tag;
+    emit_push buf arch;
+    emit_addr_of_local buf arch data_off;
+    emit_pop buf arch (pop_reg arch);
+    (match arch with
+     | Arm64 -> b buf "  str x1, [x0, #0]\n"
+     | X86_64 -> b buf "  movq %rcx, (%rax)\n");
+    (* Set payload fields *)
+    List.iteri (fun i arg ->
+      emit_expr buf env fr arg;
+      emit_push buf arch;
+      emit_addr_of_local buf arch data_off;
+      emit_pop buf arch (pop_reg arch);
+      let foff = 8 + i * 8 in
+      (match arch with
+       | Arm64 -> b buf (Printf.sprintf "  str x1, [x0, #%d]\n" foff)
+       | X86_64 -> b buf (Printf.sprintf "  movq %%rcx, %d(%%rax)\n" foff))
+    ) args;
+    emit_addr_of_local buf arch data_off
 
   | ECall (EFieldAccess (EIdent (type_name, _), method_name, _), args, _) ->
     (* Static method call: Type.method(args) → Type__method(args) *)
@@ -638,14 +721,14 @@ let rec emit_expr buf env fr expr =
     end
 
   | EIf (branches, else_body, _) ->
-    let end_lbl = fresh_label fr "endif" in
+    let end_lbl = fresh_label "endif" in
     let rec emit_branches = function
       | [] ->
         (match else_body with
          | Some stmts -> emit_stmts buf env fr stmts
          | None -> ())
       | { cond; body } :: rest ->
-        let next_lbl = fresh_label fr "elif" in
+        let next_lbl = fresh_label "elif" in
         emit_expr buf env fr cond;
         emit_cbz buf arch next_lbl;
         emit_stmts buf env fr body;
@@ -657,8 +740,8 @@ let rec emit_expr buf env fr expr =
     emit_label buf end_lbl
 
   | EWhile (cond, body, _) ->
-    let top_lbl = fresh_label fr "wtop" in
-    let end_lbl = fresh_label fr "wend" in
+    let top_lbl = fresh_label "wtop" in
+    let end_lbl = fresh_label "wend" in
     fr.loop_labels <- (end_lbl, top_lbl) :: fr.loop_labels;
     emit_label buf top_lbl;
     emit_expr buf env fr cond;
@@ -670,9 +753,9 @@ let rec emit_expr buf env fr expr =
 
   | EFor (var, iter, body, _) ->
     (* For loop: for var in start..end do ... end *)
-    let top_lbl = fresh_label fr "ftop" in
-    let end_lbl = fresh_label fr "fend" in
-    let step_lbl = fresh_label fr "fstep" in
+    let top_lbl = fresh_label "ftop" in
+    let end_lbl = fresh_label "fend" in
+    let step_lbl = fresh_label "fstep" in
     fr.loop_labels <- (end_lbl, step_lbl) :: fr.loop_labels;
     (match iter with
      | ERange (lo, hi, inclusive, _) ->
@@ -730,8 +813,8 @@ let rec emit_expr buf env fr expr =
     fr.loop_labels <- (match fr.loop_labels with _ :: tl -> tl | [] -> [])
 
   | ELoop (body, _) ->
-    let top_lbl = fresh_label fr "ltop" in
-    let end_lbl = fresh_label fr "lend" in
+    let top_lbl = fresh_label "ltop" in
+    let end_lbl = fresh_label "lend" in
     fr.loop_labels <- (end_lbl, top_lbl) :: fr.loop_labels;
     emit_label buf top_lbl;
     emit_stmts buf env fr body;
@@ -740,11 +823,11 @@ let rec emit_expr buf env fr expr =
     fr.loop_labels <- (match fr.loop_labels with _ :: tl -> tl | [] -> [])
 
   | EMatch (scrutinee, arms, _) ->
-    let end_lbl = fresh_label fr "mend" in
+    let end_lbl = fresh_label "mend" in
     emit_expr buf env fr scrutinee;
     emit_push buf arch;  (* save scrutinee on stack *)
     List.iter (fun arm ->
-      let next_lbl = fresh_label fr "marm" in
+      let next_lbl = fresh_label "marm" in
       emit_match_arm buf env fr arm next_lbl end_lbl;
       emit_label buf next_lbl
     ) arms;
@@ -1023,7 +1106,7 @@ and emit_stmts buf env fr stmts =
 and emit_stmt buf env fr = function
   | SLet { name; typ; value; _ } ->
     let kind = match typ with
-      | Some t -> kind_of_typ env t
+      | Some t -> kind_of_typ ~self_type:fr.self_type env t
       | None -> KDirect
     in
     let off = alloc_local fr name kind in
@@ -1070,6 +1153,15 @@ let build_variant_map enum_map =
     ) acc el.el_variants
   ) [] enum_map
 
+(* Ensure impl methods have an explicit self parameter.
+   If the first param is not named "self", prepend one as &mut Self. *)
+let ensure_self_param params =
+  match params with
+  | p :: _ when p.p_name = "self" -> params
+  | _ ->
+    { p_name = "self"; p_typ = TyRef (true, TySelf); p_mut = false; p_default = None }
+    :: params
+
 let build_fn_map env items =
   List.fold_left (fun acc item ->
     match item with
@@ -1091,11 +1183,12 @@ let build_fn_map env items =
         match method_item with
         | IFn { name; params; ret; _ } ->
           let qualified = type_name ^ "__" ^ name in
+          let params = ensure_self_param params in
           let fi_params = List.map (fun p ->
-            (p.p_name, kind_of_typ env p.p_typ)
+            (p.p_name, kind_of_typ ~self_type:type_name env p.p_typ)
           ) params in
           let fi_ret = match ret with
-            | Some t -> kind_of_typ env t
+            | Some t -> kind_of_typ ~self_type:type_name env t
             | None -> KDirect
           in
           (qualified, { fi_params; fi_ret }) :: acc2
@@ -1106,14 +1199,14 @@ let build_fn_map env items =
 
 (* ── Compile a single function ─────────────────────────────────────── *)
 
-let compile_function buf env fn_name fn_params fn_ret fn_body =
+let compile_function ?(self_type="") buf env fn_name fn_params fn_ret fn_body =
   let _ = fn_ret in
   let arch = env.arch in
-  let fr = { locals = []; next_off = 0; label_cnt = 0; loop_labels = [] } in
+  let fr = { locals = []; next_off = 0; loop_labels = []; self_type } in
 
   (* Allocate param slots *)
   let param_offs = List.map (fun p ->
-    let kind = kind_of_typ env p.p_typ in
+    let kind = kind_of_typ ~self_type env p.p_typ in
     alloc_local fr p.p_name kind
   ) fn_params in
 
@@ -1174,7 +1267,8 @@ let compile_program (prog : Ast.program) arch : (string * Diagnostics.t list) =
         match method_item with
         | IFn { name; params; ret; body; _ } ->
           let qualified = type_name ^ "__" ^ name in
-          compile_function buf env qualified params ret body;
+          let params = ensure_self_param params in
+          compile_function ~self_type:type_name buf env qualified params ret body;
           b buf "\n"
         | _ -> ()
       ) methods
