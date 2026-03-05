@@ -192,18 +192,23 @@ def font_db_add_bytes(db: &mut FontDb, bytes: &Vec[u8]) -> Result[FontId, TextEr
 
   # Clone font data for storage.
   let stored = Vec::with_capacity(len)
-  let i = 0
+  var i = 0
   while i < len do
     stored.push(bytes.get(i))
     i = i + 1
   end
+
+  # Parse units_per_em from head table
+  let num_tables = _ttf_read_u16(&stored, 4) as Int
+  let head_off = _ttf_find_table(&stored, num_tables, 104, 101, 97, 100)
+  let upem = if head_off > 0 then _ttf_read_u16(&stored, head_off + 18) else 1000 end
 
   let entry = _FontEntry {
     id: id,
     family: "Unknown".to_string(),
     style: FontStyle { weight: 400, italic: false },
     data: stored,
-    units_per_em: 1000,
+    units_per_em: upem,
   }
   db._fonts.push(entry)
   Result::Ok(id)
@@ -223,12 +228,9 @@ def font_db_resolve(db: &FontDb, family: String, style: FontStyle) -> Option[Fon
 end
 
 def shape(db: &FontDb, text: String, style: TextStyle, opts: ShapingOpts) -> Result[GlyphRun, TextError]
-  # Reference shaper: maps each codepoint to a glyph with uniform advance.
-  # Production backends integrate HarfBuzz or equivalent via backend ABI.
   let font_id = match style.font
   when Option::Some(fid) then fid
   when Option::None then
-    # Use first available font or return error.
     if db._fonts.len() == 0 then
       return Result::Err(TextError::FontNotFound(
         Error::invalid_arg("No fonts loaded in FontDb.".to_string())
@@ -237,20 +239,61 @@ def shape(db: &FontDb, text: String, style: TextStyle, opts: ShapingOpts) -> Res
     db._fonts.get(0).id
   end
 
-  let char_count = text.len()
-  let advance = style.size * 0.6   # Approximate monospace advance
-  let ascent = style.size * 0.8
-  let descent = style.size * 0.2
+  # Find the font entry
+  var font_entry_idx = -1
+  var fi = 0
+  while fi < db._fonts.len() do
+    if db._fonts.get(fi).id.value == font_id.value then
+      font_entry_idx = fi
+    end
+    fi = fi + 1
+  end
+  if font_entry_idx < 0 then
+    return Result::Err(TextError::FontNotFound(
+      Error::invalid_arg("Font not found in database.".to_string())
+    ))
+  end
 
+  let entry = db._fonts.get(font_entry_idx)
+  let font_data = &entry.data
+  let upem = entry.units_per_em
+  let scale = style.size / (upem as f32)
+
+  # Parse font tables for metrics
+  let num_tables = _ttf_read_u16(font_data, 4) as Int
+  let cmap_offset = _ttf_find_table(font_data, num_tables, 99, 109, 97, 112)
+  let hmtx_offset = _ttf_find_table(font_data, num_tables, 104, 109, 116, 120)
+  let hhea_offset = _ttf_find_table(font_data, num_tables, 104, 104, 101, 97)
+  let head_offset = _ttf_find_table(font_data, num_tables, 104, 101, 97, 100)
+
+  # Get ascent/descent from hhea
+  let ascent_raw = if hhea_offset > 0 then _ttf_read_i16(font_data, hhea_offset + 4) else 800 end
+  let descent_raw = if hhea_offset > 0 then _ttf_read_i16(font_data, hhea_offset + 6) else -200 end
+  let num_h_metrics = if hhea_offset > 0 then _ttf_read_u16(font_data, hhea_offset + 34) as Int else 0 end
+
+  let ascent = (ascent_raw as f32) * scale
+  let descent_abs = if descent_raw < 0 then (0 - descent_raw) as f32 * scale else (descent_raw as f32) * scale end
+
+  let char_count = text.len()
   let glyphs = Vec::with_capacity(char_count)
   let xs = Vec::with_capacity(char_count)
   let ys = Vec::with_capacity(char_count)
-  let x_cursor = 0.0f32
+  var x_cursor = 0.0f32
 
-  let idx = 0
+  var idx = 0
   while idx < char_count do
+    let cp = text.char_at(idx) as Int
+    let glyph_id = if cmap_offset > 0 then _cmap_lookup(font_data, cmap_offset, cp) else cp end
+    let adv_raw = if hmtx_offset > 0 && num_h_metrics > 0 then
+      let metric_idx = if glyph_id < num_h_metrics then glyph_id else num_h_metrics - 1 end
+      _ttf_read_u16(font_data, hmtx_offset + metric_idx * 4) as Int
+    else
+      (upem * 6) / 10
+    end
+    let advance = (adv_raw as f32) * scale
+
     let g = Glyph {
-      id: idx,
+      id: glyph_id,
       x_adv: advance,
       y_adv: 0.0f32,
       x_off: 0.0f32,
@@ -267,7 +310,7 @@ def shape(db: &FontDb, text: String, style: TextStyle, opts: ShapingOpts) -> Res
     x: 0.0f32,
     y: 0.0f32 - ascent,
     w: x_cursor,
-    h: ascent + descent,
+    h: ascent + descent_abs,
   }
 
   Result::Ok(GlyphRun {
@@ -470,4 +513,117 @@ def _sub_run(full: &GlyphRun, start: Int, stop: Int, style: TextStyle) -> GlyphR
     ys: ys,
     bounds: bounds,
   }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# TrueType/OpenType parsing helpers
+# ═══════════════════════════════════════════════════════════════
+
+def _ttf_read_u16(data: &Vec[u8], off: Int) -> Int
+  let b0 = data.get(off) as Int
+  let b1 = data.get(off + 1) as Int
+  (b0 << 8) | b1
+end
+
+def _ttf_read_i16(data: &Vec[u8], off: Int) -> Int
+  let v = _ttf_read_u16(data, off)
+  if v >= 32768 then v - 65536 else v end
+end
+
+def _ttf_read_u32(data: &Vec[u8], off: Int) -> Int
+  let b0 = data.get(off) as Int
+  let b1 = data.get(off + 1) as Int
+  let b2 = data.get(off + 2) as Int
+  let b3 = data.get(off + 3) as Int
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+end
+
+def _ttf_find_table(data: &Vec[u8], num_tables: Int, t0: Int, t1: Int, t2: Int, t3: Int) -> Int
+  var i = 0
+  while i < num_tables do
+    let record_off = 12 + i * 16
+    if (data.get(record_off) as Int) == t0 &&
+       (data.get(record_off + 1) as Int) == t1 &&
+       (data.get(record_off + 2) as Int) == t2 &&
+       (data.get(record_off + 3) as Int) == t3 then
+      return _ttf_read_u32(data, record_off + 8)
+    end
+    i = i + 1
+  end
+  0
+end
+
+def _cmap_lookup(data: &Vec[u8], cmap_off: Int, codepoint: Int) -> Int
+  let num_subtables = _ttf_read_u16(data, cmap_off + 2) as Int
+  var best_offset = 0
+  var i = 0
+  while i < num_subtables do
+    let rec = cmap_off + 4 + i * 8
+    let platform = _ttf_read_u16(data, rec)
+    let encoding = _ttf_read_u16(data, rec + 2)
+    let sub_offset = _ttf_read_u32(data, rec + 4)
+    # Prefer format 4 (platform 3 encoding 1) or format 12 (platform 3 encoding 10)
+    if platform == 3 && (encoding == 1 || encoding == 10) then
+      best_offset = cmap_off + sub_offset
+    end
+    i = i + 1
+  end
+  if best_offset == 0 then
+    return codepoint
+  end
+  let fmt = _ttf_read_u16(data, best_offset)
+  if fmt == 4 then
+    _cmap_format4_lookup(data, best_offset, codepoint)
+  elsif fmt == 12 then
+    _cmap_format12_lookup(data, best_offset, codepoint)
+  else
+    codepoint
+  end
+end
+
+def _cmap_format4_lookup(data: &Vec[u8], off: Int, cp: Int) -> Int
+  if cp > 65535 then return 0 end
+  let seg_count = _ttf_read_u16(data, off + 6) / 2
+  var seg = 0
+  while seg < seg_count do
+    let end_code = _ttf_read_u16(data, off + 14 + seg * 2)
+    if end_code >= cp then
+      let start_off = off + 16 + seg_count * 2 + seg * 2
+      let start_code = _ttf_read_u16(data, start_off)
+      if start_code <= cp then
+        let delta_off = off + 16 + seg_count * 4 + seg * 2
+        let id_delta = _ttf_read_i16(data, delta_off)
+        let range_off_pos = off + 16 + seg_count * 6 + seg * 2
+        let id_range_offset = _ttf_read_u16(data, range_off_pos)
+        if id_range_offset == 0 then
+          return (cp + id_delta) & 0xFFFF
+        else
+          let glyph_off = range_off_pos + id_range_offset + (cp - start_code) * 2
+          let glyph_id = _ttf_read_u16(data, glyph_off)
+          if glyph_id != 0 then
+            return (glyph_id + id_delta) & 0xFFFF
+          end
+          return 0
+        end
+      end
+    end
+    seg = seg + 1
+  end
+  0
+end
+
+def _cmap_format12_lookup(data: &Vec[u8], off: Int, cp: Int) -> Int
+  let num_groups = _ttf_read_u32(data, off + 12) as Int
+  var g = 0
+  while g < num_groups do
+    let group_off = off + 16 + g * 12
+    let start_code = _ttf_read_u32(data, group_off)
+    let end_code = _ttf_read_u32(data, group_off + 4)
+    let start_glyph = _ttf_read_u32(data, group_off + 8)
+    if cp >= start_code && cp <= end_code then
+      return start_glyph + (cp - start_code)
+    end
+    g = g + 1
+  end
+  0
 end

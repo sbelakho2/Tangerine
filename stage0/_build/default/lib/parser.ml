@@ -63,17 +63,35 @@ let eat_sym st s =
   if at_sym st s then (advance st; true)
   else (err st (Printf.sprintf "expected '%s'" s); false)
 
-(* Soft keywords: may be used as identifiers in non-keyword position *)
-let is_soft_keyword = function
-  | "var" | "private" | "where" | "crate" | "super" | "move" | "copy"
-  | "drop" | "own" | "ref" | "unsafe" | "pure" | "await" | "yield"
-  | "defer" | "try" | "catch" | "finally" | "handle" | "with"
-  | "implies" | "comptime" | "static" | "alias" | "inline" | "dyn"
-  | "ensures" | "guard" | "budget" | "module" | "is"
-  | "requires" | "pre" | "post" | "invariant" | "effect"
-  | "macro" | "edition" | "cap" | "rationale" | "async"
-  | "const" | "type" | "def" | "extern" | "fn" -> true
-  | _ -> false
+(* Check for duplicate field names in struct literal fields *)
+let check_dup_fields st fields =
+  let seen = Hashtbl.create 8 in
+  List.iter (fun (name, _) ->
+    if Hashtbl.mem seen name then
+      err st (Printf.sprintf "duplicate field '%s' in struct literal" name)
+    else
+      Hashtbl.replace seen name true
+  ) fields
+
+(* Soft keywords: may be used as identifiers in non-keyword position.
+   Single source of truth is in Token.is_soft_keyword. *)
+let is_soft_keyword s = Token.is_soft_keyword s
+
+(* Strip integer type suffix from a numeric literal string.
+   Returns (digits_only, Some suffix) or (original, None). *)
+let strip_int_suffix s =
+  let len = String.length s in
+  (* Check longer suffixes first: usize, isize, u16, i16, u32, i32, u64, i64 *)
+  let try_suffix suf =
+    let slen = String.length suf in
+    if len > slen && String.sub s (len - slen) slen = suf then
+      Some (String.sub s 0 (len - slen), Some suf)
+    else None
+  in
+  let suffixes = ["usize"; "isize"; "u16"; "i16"; "u32"; "i32"; "u64"; "i64"; "u8"; "i8"; "f32"; "f64"] in
+  match List.find_map try_suffix suffixes with
+  | Some result -> result
+  | None -> (s, None)
 
 (* Keywords that can be used as binding names in patterns *)
 let is_pattern_keyword = function
@@ -86,7 +104,11 @@ let eat_ident st =
   | Ident s -> advance st; s
   | Kw "Self" -> advance st; "Self"
   | Kw s when is_soft_keyword s -> advance st; s
-  | _ -> err st "expected identifier"; "_"
+  | _ ->
+    let t = peek st in
+    err st (Printf.sprintf "expected identifier, got '%s'" t.lexeme);
+    advance st; (* consume the bad token to avoid infinite loops *)
+    "<error>"
 
 let skip_nl st =
   while at_nl st do advance st done
@@ -126,9 +148,17 @@ and parse_type_primary st =
     else begin
       let inner = parse_type st in
       if at_sym st ";" then begin
-        (* Fixed-size array: [Type; N] *)
-        advance st;
-        while not (at_sym st "]") && not (at_eof st) do advance st done;
+        (* Fixed-size array: [Type; N] — read the size expression *)
+        advance st; skip_nl st;
+        let size_tok = peek st in
+        let _size = match size_tok.kind with
+          | IntLit s -> advance st; (try int_of_string s with _ -> 0)
+          | Ident _ -> advance st; 0 (* named const — evaluated later *)
+          | _ ->
+            err st "expected array size after ';'";
+            while not (at_sym st "]") && not (at_eof st) do advance st done;
+            0
+        in
         ignore (eat_sym st "]");
         TyName ("Array", [inner])
       end else begin
@@ -142,25 +172,30 @@ and parse_type_primary st =
     if m then advance st;
     TyRef (m, parse_type st)
   | Kw "dyn" ->
-    (* dyn TraitName - treat as the trait type name *)
+    (* dyn TraitName — parse the inner type and wrap with dyn marker *)
     advance st;
-    parse_type st
+    let inner = parse_type st in
+    (* Prefix "dyn " to the type name to preserve the dynamic dispatch marker *)
+    (match inner with
+     | TyName (n, args) -> TyName ("dyn " ^ n, args)
+     | _ -> inner)
   | Symbol "*" ->
-    (* Raw pointer: *mut T or *const T *)
+    (* Raw pointer: *mut T or *const T — preserve mutability *)
     advance st;
-    let _m = at_kw st "mut" in
-    if _m then advance st
+    let is_mut = at_kw st "mut" in
+    if is_mut then advance st
     else if at_kw st "const" then advance st;
-    parse_type st
+    let inner = parse_type st in
+    TyName ((if is_mut then "*mut" else "*const"), [inner])
   | Ident name ->
     advance st;
-    (* Handle qualified type names: ast::Param, Token::Kind *)
-    let final_name = ref name in
+    (* Handle qualified type names: ast::Param, Token::Kind — preserve full path *)
+    let parts = ref [name] in
     while at_sym st "::" do
       advance st;
-      final_name := eat_ident st
+      parts := eat_ident st :: !parts
     done;
-    let name = !final_name in
+    let name = String.concat "::" (List.rev !parts) in
     if at_sym st "[" then begin
       advance st; skip_nl st;
       let args = parse_type_list st in
@@ -227,21 +262,7 @@ let rec parse_pattern st =
         PatBind (vname, l)
     | IntLit s ->
       advance st;
-      let len = String.length s in
-      let num_s =
-        if len >= 4 then
-          let s3 = String.sub s (len-3) 3 in
-          if s3 = "u16" || s3 = "i16" || s3 = "u32" || s3 = "i32" || s3 = "u64" || s3 = "i64" then
-            String.sub s 0 (len-3)
-          else if len >= 3 then
-            let s2 = String.sub s (len-2) 2 in
-            if s2 = "u8" || s2 = "i8" then String.sub s 0 (len-2) else s
-          else s
-        else if len >= 3 then
-          let s2 = String.sub s (len-2) 2 in
-          if s2 = "u8" || s2 = "i8" then String.sub s 0 (len-2) else s
-        else s
-      in
+      let (num_s, _suffix) = strip_int_suffix s in
       PatLit (EInt ((try int_of_string num_s with _ -> 0), l))
     | FloatLit s ->
       advance st; PatLit (EFloat (float_of_string s, l))
@@ -519,19 +540,27 @@ and parse_postfix st =
     | Symbol "::" ->
       let l = loc_of st in advance st;
       if at_sym st "<" then begin
-        (* Turbofish: skip type params ::<Type> *)
+        (* Turbofish: ::<Type>(args) — skip type params, preserve method call *)
         advance st;
         let depth = ref 1 in
         while !depth > 0 && not (at_eof st) do
           if at_sym st "<" then (incr depth; advance st)
           else if at_sym st ">" then (decr depth; advance st)
+          else if at_sym st ">>" then (depth := !depth - 2; advance st)
           else advance st
         done;
         if at_sym st "(" then begin
           advance st; skip_nl st;
           let args = if at_sym st ")" then [] else parse_arg_list st in
           ignore (eat_sym st ")");
-          loop (EMethodCall (e, "collect", args, l))
+          (* Extract method name from preceding expression if possible *)
+          let method_name = match e with
+            | EMethodCall (_, name, _, _) -> name
+            | EFieldAccess (_, name, _) -> name
+            | EIdent (name, _) -> name
+            | _ -> "call"
+          in
+          loop (ECall (EIdent (method_name, l), args, l))
         end else
           loop e
       end else if at_sym st "[" then begin
@@ -586,7 +615,9 @@ and parse_postfix st =
             end
           done;
           ignore (eat_sym st "}");
-          loop (EStructLit (field, List.rev !fields, l))
+          let flds = List.rev !fields in
+          check_dup_fields st flds;
+          loop (EStructLit (field, flds, l))
         end else
           loop (EFieldAccess (e, field, l))
       end else
@@ -623,28 +654,7 @@ and parse_primary st =
   match t.kind with
   | IntLit s ->
     advance st;
-    (* Strip Tangerine integer type suffixes: u8, u16, u32, u64, i8, i16, i32, i64.
-       OCaml's Int64.of_string treats "0u8" as unsigned-8 = 8, but in Tangerine
-       "0u8" means "literal 0 as u8". *)
-    let len = String.length s in
-    let (num_s, ty_suffix) =
-      if len >= 4 then
-        let s3 = String.sub s (len-3) 3 in
-        if s3 = "u16" || s3 = "i16" || s3 = "u32" || s3 = "i32" || s3 = "u64" || s3 = "i64" then
-          (String.sub s 0 (len-3), Some s3)
-        else if len >= 3 then
-          let s2 = String.sub s (len-2) 2 in
-          if s2 = "u8" || s2 = "i8" then
-            (String.sub s 0 (len-2), Some s2)
-          else (s, None)
-        else (s, None)
-      else if len >= 3 then
-        let s2 = String.sub s (len-2) 2 in
-        if s2 = "u8" || s2 = "i8" then
-          (String.sub s 0 (len-2), Some s2)
-        else (s, None)
-      else (s, None)
-    in
+    let (num_s, ty_suffix) = strip_int_suffix s in
     let v = try Int64.to_int (Int64.of_string num_s) with _ -> (try int_of_string num_s with _ -> 0) in
     let base = EInt (v, l) in
     (match ty_suffix with
@@ -764,7 +774,7 @@ and parse_primary st =
               names := eat_ident st :: !names
           done;
           ignore (eat_sym st ")");
-          let joined = "_destructure_" ^ String.concat "," (List.rev !names) in
+          let joined = "_destructure_" ^ String.concat "_" (List.rev !names) in
           { cp_name = joined; cp_typ = None; cp_mut = m }
         end else begin
           let name = eat_ident st in
@@ -803,7 +813,10 @@ and parse_primary st =
         skip_nl st;
         if at_kw st "let" || at_kw st "mut" || at_kw st "var"
            || at_kw st "if" || at_kw st "for" || at_kw st "while"
-           || at_kw st "match" then begin
+           || at_kw st "match" || at_kw st "return" || at_kw st "break"
+           || at_kw st "next" || at_kw st "loop" || at_kw st "do"
+           || at_kw st "unsafe" || at_kw st "defer" || at_kw st "yield"
+           || at_kw st "try" then begin
           st.pos <- saved; skip_nl st;
           let stmts = ref [] in
           while not (at_eof st) && not (at_sym st ")")
@@ -891,18 +904,27 @@ and parse_primary st =
             let fname = eat_ident st in
             ignore (eat_sym st ":");
             let fval = ref (parse_expr st) in
-            (* Continue multi-line field value expressions starting with + on next line *)
+            (* Continue multi-line field value expressions starting with binary op on next line *)
             let cont = ref true in
             while !cont do
               let saved_nl = st.pos in
               skip_nl st;
-              if at_sym st "+" then begin
+              let continuation_op =
+                if at_sym st "+" then Some Add
+                else if at_sym st "-" then Some Sub
+                else if at_sym st "||" then Some Or
+                else if at_sym st "&&" then Some And
+                else if at_sym st "|" then Some BitOr
+                else if at_sym st "&" then Some BitAnd
+                else None
+              in
+              match continuation_op with
+              | Some op ->
                 let l2 = loc_of st in advance st; skip_nl st;
-                fval := EBinOp (Add, !fval, parse_expr st, l2)
-              end else begin
+                fval := EBinOp (op, !fval, parse_expr st, l2)
+              | None ->
                 st.pos <- saved_nl;
                 cont := false
-              end
             done;
             fields := (fname, !fval) :: !fields;
             if at_sym st "," then (advance st; skip_nl st)
@@ -910,7 +932,9 @@ and parse_primary st =
           end
         done;
         ignore (eat_sym st "}");
-        EStructLit (name, List.rev !fields, l)
+        let flds = List.rev !fields in
+        check_dup_fields st flds;
+        EStructLit (name, flds, l)
       end else
         EIdent (name, l)
     end else if at_sym st "!" then begin
@@ -974,7 +998,9 @@ and parse_primary st =
           end
         done;
         ignore (eat_sym st "}");
-        EStructLit (s, List.rev !fields, l)
+        let flds = List.rev !fields in
+        check_dup_fields st flds;
+        EStructLit (s, flds, l)
       end else
         EIdent (s, l)
     end else
@@ -1159,7 +1185,7 @@ and parse_for_expr st =
         parts := read_destr () :: !parts
       done;
       ignore (eat_sym st ")");
-      String.concat "," (List.rev !parts)
+      String.concat "_" (List.rev !parts)
     end else
       eat_ident st
   in
@@ -1171,7 +1197,7 @@ and parse_for_expr st =
       names := read_destr () :: !names
     done;
     ignore (eat_sym st ")");
-    String.concat "," (List.rev !names)
+    String.concat "_" (List.rev !names)
   end else
     eat_ident st
   in
@@ -1717,7 +1743,14 @@ let parse_use_decl st =
       if at_sym st "}" then advance st
     end else if at_sym st "*" then (advance st; path := "*" :: !path)
   done;
-  IUse { path = List.rev !path; loc = l }
+  let alias =
+    if at_kw st "as" then begin
+      advance st;
+      if at_ident st then Some (eat_ident st)
+      else (err st "expected identifier after 'as'"; None)
+    end else None
+  in
+  IUse { path = List.rev !path; alias; loc = l }
 
 let parse_const_decl st =
   let l = loc_of st in
@@ -1732,6 +1765,8 @@ let parse_type_alias_decl st =
   let l = loc_of st in
   ignore (eat_kw st "type");
   let name = eat_ident st in
+  if Token.is_keyword name && not (Token.is_soft_keyword name) then
+    err st (Printf.sprintf "type alias name '%s' shadows a keyword" name);
   ignore (eat_sym st "=");
   let typ = parse_type st in
   ITypeAlias { name; typ; loc = l }
@@ -1899,6 +1934,14 @@ and parse_one_item st =
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_rationale"; typ = None; value = ENil l; loc = l }
+  | Kw "test" ->
+    let l = loc_of st in advance st;
+    (* Skip test name string if present *)
+    (match (peek st).kind with StringLit _ -> advance st | _ -> ());
+    (* Skip to matching 'end' or 'do...end' block *)
+    while not (at_kw st "end") && not (at_eof st) do advance st done;
+    if at_kw st "end" then advance st;
+    IConst { name = "_test"; typ = None; value = ENil l; loc = l }
   | Symbol "@" | Symbol "#" ->
     advance st;
     while not (at_nl st) && not (at_eof st) do advance st done;

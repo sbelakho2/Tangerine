@@ -90,7 +90,10 @@ let sanitize_ident s =
   String.iter (fun c ->
     match c with
     | 'a'..'z' | 'A'..'Z' | '0'..'9' | '_' -> Buffer.add_char buf c
-    | ':' | '.' | '/' | '-' -> Buffer.add_char buf '_'
+    | ':' -> Buffer.add_string buf "_c"
+    | '.' -> Buffer.add_string buf "_d"
+    | '/' -> Buffer.add_string buf "_s"
+    | '-' -> Buffer.add_string buf "_h"
     | _ -> Buffer.add_char buf '_'
   ) s;
   let result = Buffer.contents buf in

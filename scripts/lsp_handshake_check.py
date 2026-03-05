@@ -1,6 +1,18 @@
 import json
+import signal
 import subprocess
 import sys
+
+TIMEOUT_SECS = 15
+
+
+def _timeout_handler(signum, frame):
+    print("ERROR: LSP handshake timed out", file=sys.stderr)
+    sys.exit(2)
+
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+signal.alarm(TIMEOUT_SECS)
 
 p = subprocess.Popen(
     ["./build/tg", "lsp"],

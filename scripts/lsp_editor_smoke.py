@@ -1,12 +1,24 @@
 import json
+import signal
 import subprocess
 import sys
 from pathlib import Path
+
+TIMEOUT_SECS = 30
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_FILE = ROOT / "golden" / "budget_01.tg"
 URI = TEST_FILE.as_uri()
 TEXT = TEST_FILE.read_text(encoding="utf-8")
+
+
+def _timeout_handler(signum, frame):
+    print("ERROR: LSP smoke test timed out", file=sys.stderr)
+    sys.exit(2)
+
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+signal.alarm(TIMEOUT_SECS)
 
 p = subprocess.Popen(
     [str(ROOT / "build" / "tg"), "lsp"],

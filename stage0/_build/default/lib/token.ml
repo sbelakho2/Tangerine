@@ -34,19 +34,57 @@ let kind_to_string = function
 let to_string t =
   Printf.sprintf "%d:%d %s" t.line t.col (kind_to_string t.kind)
 
+(* ────────────────────────────────────────────────────────────────────────
+   Keyword table — canonical list of all reserved words.
+   Keep sorted by category.  When adding keywords here, also update:
+     • parser.ml  is_soft_keyword list
+     • tg_compiler/token.tg  TokenKind enum & keyword_from_str
+     • docs/grammar.md keyword production
+   ──────────────────────────────────────────────────────────────────────── *)
 let keyword_set =
   let tbl = Hashtbl.create 128 in
   List.iter (fun k -> Hashtbl.replace tbl k true)
-    [ "def"; "end"; "do"; "if"; "elsif"; "else"; "then"; "while"; "for"; "in";
-      "loop"; "match"; "when"; "let"; "mut"; "var"; "return"; "break"; "next";
-      "struct"; "enum"; "trait"; "impl"; "dyn"; "module"; "mod"; "use"; "as";
-      "pub"; "private"; "macro"; "where"; "true"; "false"; "nil"; "self";
-      "Self"; "crate"; "super"; "move"; "copy"; "drop"; "own"; "ref";
+    [ (* ── control-flow ────────────────────────────────────────────── *)
+      "if"; "elsif"; "else"; "then"; "match"; "when";
+      "while"; "for"; "in"; "loop"; "do"; "end";
+      "unless"; "until"; "break"; "next"; "return"; "yield"; "defer";
+      (* ── definitions & declarations ──────────────────────────────── *)
+      "def"; "fn"; "let"; "mut"; "var"; "const"; "static"; "type"; "alias";
+      "struct"; "enum"; "trait"; "impl"; "macro"; "where"; "extern"; "inline";
+      "module"; "mod"; "use"; "as"; "pub"; "private"; "test";
+      (* ── values / literals ───────────────────────────────────────── *)
+      "true"; "false"; "nil"; "self"; "Self"; "crate"; "super";
+      (* ── ownership & borrowing ───────────────────────────────────── *)
+      "move"; "copy"; "drop"; "own"; "ref"; "dyn";
+      (* ── contracts & capabilities ────────────────────────────────── *)
       "pre"; "post"; "invariant"; "cap"; "unsafe"; "rationale"; "budget";
-      "edition"; "requires"; "ensures"; "effect"; "pure"; "async"; "await";
-      "yield"; "defer"; "try"; "catch"; "finally"; "guard"; "handle"; "with";
-      "is"; "implies"; "comptime"; "const"; "static"; "type"; "alias";
-      "extern"; "inline"; "fn"; "unless"; "until" ];
+      "edition"; "requires"; "ensures"; "effect"; "pure";
+      (* ── concurrency ─────────────────────────────────────────────── *)
+      "async"; "await";
+      (* ── error handling ──────────────────────────────────────────── *)
+      "try"; "catch"; "finally"; "guard"; "handle"; "with";
+      (* ── misc operators ──────────────────────────────────────────── *)
+      "is"; "implies"; "comptime" ];
   tbl
 
 let is_keyword s = Hashtbl.mem keyword_set s
+
+(* ────────────────────────────────────────────────────────────────────────
+   Soft keywords — keywords that may be used as identifiers in some
+   positions (e.g. struct field names, variable names). NOT hard reserved.
+   Maintained as the single source of truth; parser.ml references this.
+   ──────────────────────────────────────────────────────────────────────── *)
+let soft_keyword_set =
+  let tbl = Hashtbl.create 64 in
+  List.iter (fun k -> Hashtbl.replace tbl k true)
+    [ "var"; "private"; "where"; "crate"; "super"; "move"; "copy";
+      "drop"; "own"; "ref"; "unsafe"; "pure"; "await"; "yield";
+      "defer"; "try"; "catch"; "finally"; "handle"; "with";
+      "implies"; "comptime"; "static"; "alias"; "inline"; "dyn";
+      "ensures"; "guard"; "budget"; "module"; "is";
+      "requires"; "pre"; "post"; "invariant"; "effect";
+      "macro"; "edition"; "cap"; "rationale"; "async"; "test";
+      "const"; "type"; "def"; "extern"; "fn" ];
+  tbl
+
+let is_soft_keyword s = Hashtbl.mem soft_keyword_set s

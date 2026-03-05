@@ -10,14 +10,19 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 #ifdef __APPLE__
+#include <execinfo.h>
+#elif defined(__linux__)
 #include <execinfo.h>
 #endif
 
 /* ── Segfault handler ──────────────────────────────────────────────── */
 static void tg_segfault_handler(int sig) {
     fprintf(stderr, "\nSEGFAULT (signal %d) backtrace:\n", sig);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     void* array[64];
     int size = backtrace(array, 64);
     backtrace_symbols_fd(array, size, STDERR_FILENO);
@@ -30,9 +35,36 @@ static void tg_segfault_handler(int sig) {
 int    g_argc = 0;
 char** g_argv = NULL;
 
+/* Hash salt to prevent HashDoS attacks (randomized at startup). */
+static uint64_t g_hash_salt = 0;
+
+static void tg_init_hash_salt(void) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+    arc4random_buf(&g_hash_salt, sizeof(g_hash_salt));
+#elif defined(__linux__)
+    /* getentropy is available since glibc 2.25 / Linux 3.17 */
+    if (getentropy(&g_hash_salt, sizeof(g_hash_salt)) != 0) {
+        /* Fallback: read from /dev/urandom */
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) {
+            (void)fread(&g_hash_salt, sizeof(g_hash_salt), 1, f);
+            fclose(f);
+        }
+    }
+#else
+    /* Fallback for other POSIX systems */
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) {
+        (void)fread(&g_hash_salt, sizeof(g_hash_salt), 1, f);
+        fclose(f);
+    }
+#endif
+}
+
 void tg_init(int argc, char** argv) {
     g_argc = argc;
     g_argv = argv;
+    tg_init_hash_salt();
     signal(SIGSEGV, tg_segfault_handler);
     signal(SIGBUS, tg_segfault_handler);
 }
@@ -53,7 +85,7 @@ TgVal tg_debug_val(TgVal v) {
 
 void tg_panic(const char* msg) {
     fprintf(stderr, "PANIC: %s\n", msg);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
     void* callstack[128];
     int frames = backtrace(callstack, 128);
     backtrace_symbols_fd(callstack, frames, 2);
@@ -67,9 +99,33 @@ void tg_assert(TgVal cond, const char* msg) {
 
 /* ── Memory allocation ─────────────────────────────────────────────── */
 
+static _Atomic size_t tg_alloc_total_bytes  = 0;
+static _Atomic size_t tg_free_total_bytes   = 0;
+static _Atomic size_t tg_alloc_peak_bytes   = 0;
+static _Atomic size_t tg_alloc_live_bytes   = 0;
+static _Atomic size_t tg_alloc_count_total  = 0;
+static _Atomic size_t tg_free_count_total   = 0;
+
+size_t tg_debug_alloc_total(void) { return tg_alloc_total_bytes; }
+size_t tg_debug_free_total(void)  { return tg_free_total_bytes; }
+size_t tg_debug_alloc_peak(void)  { return tg_alloc_peak_bytes; }
+size_t tg_debug_alloc_count(void) { return tg_alloc_count_total; }
+size_t tg_debug_free_count(void)  { return tg_free_count_total; }
+
+static void track_alloc(size_t size) {
+    tg_alloc_total_bytes += size;
+    tg_alloc_count_total++;
+    size_t live = (tg_alloc_live_bytes += size);
+    /* Relaxed peak update — races are harmless for a debug counter */
+    if (live > tg_alloc_peak_bytes) {
+        tg_alloc_peak_bytes = live;
+    }
+}
+
 void* tg_alloc(size_t size) {
     void* p = calloc(1, size);
     if (!p && size > 0) tg_panic("out of memory");
+    track_alloc(size);
     return p;
 }
 
@@ -80,6 +136,7 @@ void* tg_realloc(void* ptr, size_t size) {
 }
 
 void tg_free(void* ptr) {
+    if (ptr) { tg_free_count_total++; }
     free(ptr);
 }
 
@@ -88,11 +145,15 @@ void tg_free(void* ptr) {
 static TgString* str_ptr(TgVal s) { return (TgString*)tg_as_ptr(s); }
 
 static void str_grow(TgString* s, int64_t needed) {
+    if (needed < 0) return;
     if (s->len + needed <= s->cap) return;
+    /* Guard against integer overflow */
+    if (s->len > INT64_MAX / 2 || needed > INT64_MAX - s->len)
+        tg_panic("string capacity overflow");
     int64_t new_cap = s->cap * 2;
     if (new_cap < s->len + needed) new_cap = s->len + needed;
     if (new_cap < 16) new_cap = 16;
-    s->data = (char*)tg_realloc(s->data, new_cap + 1);
+    s->data = (char*)tg_realloc(s->data, (size_t)new_cap + 1);
     s->cap = new_cap;
 }
 
@@ -336,15 +397,18 @@ TgVal tg_str_neq(TgVal a, TgVal b) {
 TgVal tg_val_eq(TgVal a, TgVal b) {
     if (a == b) return TG_TRUE;
     if (!a || !b) return TG_FALSE;
-    /* Both are non-zero → treat as heap-allocated tagged structs */
+    /* Both are non-zero → treat as heap-allocated tagged enum structs.
+       Layout: [tag, nfields, f0, f1, ...] */
     int64_t* ap = (int64_t*)(void*)a;
     int64_t* bp = (int64_t*)(void*)b;
     if (ap[0] != bp[0]) return TG_FALSE; /* different tags */
-    /* Same tag — compare up to 4 fields */
-    for (int i = 1; i <= 4; i++) {
+    /* Read the field count stored at position 1 */
+    int nf = (int)ap[1];
+    if (nf < 0 || nf > 64) nf = 0; /* safety clamp */
+    /* Compare payload fields starting at position 2 */
+    for (int i = 2; i < 2 + nf; i++) {
         if (ap[i] != bp[i]) {
             /* Fields differ — try string comparison if both look like valid string ptrs */
-            /* Guard: skip string comparison for small values (ints/chars, not pointers) */
             if ((uint64_t)ap[i] < 0x10000 || (uint64_t)bp[i] < 0x10000) {
                 return TG_FALSE;
             }
@@ -383,8 +447,8 @@ TgVal tg_str_cmp(TgVal a, TgVal b) {
 int64_t tg_str_hash(TgVal sv) {
     TgString* s = str_ptr(sv);
     if (!s) return 0;
-    /* FNV-1a */
-    uint64_t h = 14695981039346656037ULL;
+    /* Salted FNV-1a — salt prevents HashDoS */
+    uint64_t h = 14695981039346656037ULL ^ g_hash_salt;
     for (int64_t i = 0; i < s->len; i++) {
         h ^= (unsigned char)s->data[i];
         h *= 1099511628211ULL;
@@ -456,11 +520,17 @@ TgVal tg_str_chars(TgVal sv) {
 static TgVec* vec_ptr(TgVal v) { return (TgVec*)tg_as_ptr(v); }
 
 static void vec_grow(TgVec* v, int64_t extra) {
+    if (extra < 0) return;
     if (v->len + extra <= v->cap) return;
+    /* Guard against integer overflow */
+    if (v->len > INT64_MAX / 2 || extra > INT64_MAX - v->len)
+        tg_panic("vec capacity overflow");
     int64_t new_cap = v->cap * 2;
     if (new_cap < v->len + extra) new_cap = v->len + extra;
     if (new_cap < 8) new_cap = 8;
-    v->data = (TgVal*)tg_realloc(v->data, new_cap * sizeof(TgVal));
+    if ((uint64_t)new_cap > SIZE_MAX / sizeof(TgVal))
+        tg_panic("vec allocation size overflow");
+    v->data = (TgVal*)tg_realloc(v->data, (size_t)new_cap * sizeof(TgVal));
     v->cap = new_cap;
 }
 
@@ -953,6 +1023,7 @@ TgVal tg_set_into_vec(TgVal s) { return tg_map_keys(s); }
 TgVal tg_option_some(TgVal val) {
     TgOption* o = (TgOption*)tg_alloc(sizeof(TgOption));
     o->_tag = 0;  /* Some */
+    o->_nfields = 1;
     o->value = val;
     return tg_from_ptr(o);
 }
@@ -960,6 +1031,7 @@ TgVal tg_option_some(TgVal val) {
 TgVal tg_option_none(void) {
     TgOption* o = (TgOption*)tg_alloc(sizeof(TgOption));
     o->_tag = 1;  /* None */
+    o->_nfields = 0;
     o->value = TG_NIL;
     return tg_from_ptr(o);
 }
@@ -996,6 +1068,7 @@ TgVal tg_option_map(TgVal opt, TgVal fn) {
 TgVal tg_result_ok(TgVal val) {
     TgResult* r = (TgResult*)tg_alloc(sizeof(TgResult));
     r->_tag = 0;  /* Ok */
+    r->_nfields = 1;
     r->value = val;
     return tg_from_ptr(r);
 }
@@ -1003,6 +1076,7 @@ TgVal tg_result_ok(TgVal val) {
 TgVal tg_result_err(TgVal err) {
     TgResult* r = (TgResult*)tg_alloc(sizeof(TgResult));
     r->_tag = 1;  /* Err */
+    r->_nfields = 1;
     r->value = err;
     return tg_from_ptr(r);
 }
@@ -1127,8 +1201,9 @@ TgVal tg_struct_alloc(int64_t n_fields) {
 }
 
 TgVal tg_enum_alloc(int64_t tag, int64_t n_payload) {
-    TgVal* e = (TgVal*)tg_alloc((1 + n_payload) * sizeof(TgVal));
+    TgVal* e = (TgVal*)tg_alloc((2 + n_payload) * sizeof(TgVal));
     e[0] = tag;
+    e[1] = n_payload;  /* _nfields for tg_val_eq */
     return tg_from_ptr(e);
 }
 
@@ -1153,7 +1228,7 @@ int64_t tg_enum_tag(TgVal obj) {
 TgVal tg_enum_payload(TgVal obj, int64_t idx) {
     TgVal* e = (TgVal*)tg_as_ptr(obj);
     if (!e) return TG_NIL;
-    return e[1 + idx];
+    return e[2 + idx];  /* skip tag and _nfields */
 }
 
 /* ── I/O ───────────────────────────────────────────────────────────── */
@@ -1331,25 +1406,26 @@ TgVal tg_temp_file(TgVal prefix, TgVal suffix) {
 /* ── I/O primitives for compiler ───────────────────────────────────── */
 
 TgVal read_line(void) {
-    char buf[4096];
-    if (fgets(buf, sizeof(buf), stdin) == NULL) {
-        return tg_str_from_cstr("");
+    TgVal result = tg_str_new();
+    TgString* s = str_ptr(result);
+    int c;
+    while ((c = fgetc(stdin)) != EOF && c != '\n') {
+        str_grow(s, 1);
+        s->data[s->len++] = (char)c;
     }
-    /* Strip trailing newline */
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-    return tg_str_from_cstr(buf);
+    s->data[s->len] = '\0';
+    if (s->len == 0 && c == EOF) return tg_str_from_cstr("");
+    return result;
 }
 
 TgVal read_bytes(TgVal n) {
     int64_t count = (int64_t)n;
     if (count <= 0) return tg_str_from_cstr("");
-    char* buf = (char*)malloc((size_t)count + 1);
-    if (!buf) return tg_str_from_cstr("");
+    char* buf = (char*)tg_alloc((size_t)count + 1);
     size_t got = fread(buf, 1, (size_t)count, stdin);
     buf[got] = '\0';
-    TgVal result = tg_str_from_cstr(buf);
-    free(buf);
+    TgVal result = tg_str_from_len(buf, (int64_t)got);
+    tg_free(buf);
     return result;
 }
 

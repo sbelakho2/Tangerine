@@ -25,9 +25,17 @@ end
 
 impl RegistryConfig
   pub def default() -> RegistryConfig
+    let url = match std::env::get("TG_REGISTRY_URL")
+    when Some(u) then u
+    when None then "https://registry.tangerine-lang.org".to_string()
+    end
+    let auth_token = match std::env::get("TG_REGISTRY_TOKEN")
+    when Some(t) then Some(t)
+    when None then None
+    end
     RegistryConfig {
-      url: "https://registry.tangerine-lang.org".to_string(),
-      auth_token: None,
+      url: url,
+      auth_token: auth_token,
       mirrors: Array::new(),
       timeout_ms: 30_000,
       max_retries: 3,
@@ -52,6 +60,7 @@ end
 pub struct HttpRegistry
   config: RegistryConfig
   index_cache: Map[String, Array[RegistryEntry]]
+  cache_order: Array[String]  ## Track insertion order for eviction
 end
 
 struct RegistryEntry
@@ -74,6 +83,7 @@ impl HttpRegistry
     HttpRegistry {
       config: config,
       index_cache: Map::new(),
+      cache_order: Array::new(),
     }
   end
 
@@ -96,7 +106,18 @@ impl HttpRegistry
 
     let response = _http_get_with_retry(&url, &headers, self.config.max_retries)?
     let entries = _parse_index_response(&response)?
+
+    ## Evict oldest entry if cache exceeds max size
+    let max_cache_size = 512
+    if self.index_cache.len() >= max_cache_size then
+      if !self.cache_order.is_empty() then
+        let evict_key = self.cache_order.remove(0)
+        self.index_cache.remove(&evict_key)
+      end
+    end
+
     self.index_cache.insert(name.to_string(), entries.clone())
+    self.cache_order.push(name.to_string())
     Ok(entries)
   end
 
@@ -257,29 +278,166 @@ def _http_get_with_retry(url: &str, headers: &Map[String, String], retries: UInt
 end
 
 def _http_get(url: &str, headers: &Map[String, String]) -> Result[String, PkgError]
-  ## Stub — delegates to std::http
-  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+  let client = http::HttpClient::new()
+  let mut builder = client.get(url)
+  for entry in headers.iter() do
+    let (k, v) = entry
+    builder = builder.header(k.as_str(), v.as_str())
+  end
+  match builder.send()
+  when Ok(response) then
+    if !response.is_success() then
+      return Err(PkgError::NetworkError("HTTP " + response.status_code().to_string() + " for " + url))
+    end
+    match response.text()
+    when Ok(body) then Ok(body)
+    when Err(e) then Err(PkgError::NetworkError("invalid UTF-8 in response"))
+    end
+  when Err(e) then Err(PkgError::NetworkError("request failed: " + url))
+  end
 end
 
 def _http_get_bytes(url: &str, headers: &Map[String, String]) -> Result[Array[u8], PkgError]
-  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+  let client = http::HttpClient::new()
+  let mut builder = client.get(url)
+  for entry in headers.iter() do
+    let (k, v) = entry
+    builder = builder.header(k.as_str(), v.as_str())
+  end
+  match builder.send()
+  when Ok(response) then
+    if !response.is_success() then
+      return Err(PkgError::NetworkError("HTTP " + response.status_code().to_string() + " for " + url))
+    end
+    Ok(response.bytes().to_array())
+  when Err(e) then Err(PkgError::NetworkError("request failed: " + url))
+  end
 end
 
 def _http_put(url: &str, headers: &Map[String, String], body: &[u8]) -> Result[Unit, PkgError]
-  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+  let client = http::HttpClient::new()
+  let mut builder = client.put(url)
+  for entry in headers.iter() do
+    let (k, v) = entry
+    builder = builder.header(k.as_str(), v.as_str())
+  end
+  builder = builder.body_bytes(body.to_vec())
+  match builder.send()
+  when Ok(response) then
+    if !response.is_success() then
+      return Err(PkgError::NetworkError("HTTP " + response.status_code().to_string() + " for " + url))
+    end
+    Ok(())
+  when Err(e) then Err(PkgError::NetworkError("request failed: " + url))
+  end
 end
 
 def _http_delete(url: &str, headers: &Map[String, String]) -> Result[Unit, PkgError]
-  Err(PkgError::NetworkError("HTTP client not initialized".to_string()))
+  let client = http::HttpClient::new()
+  let mut builder = client.delete(url)
+  for entry in headers.iter() do
+    let (k, v) = entry
+    builder = builder.header(k.as_str(), v.as_str())
+  end
+  match builder.send()
+  when Ok(response) then
+    if !response.is_success() then
+      return Err(PkgError::NetworkError("HTTP " + response.status_code().to_string() + " for " + url))
+    end
+    Ok(())
+  when Err(e) then Err(PkgError::NetworkError("request failed: " + url))
+  end
 end
 
 def _parse_index_response(body: &str) -> Result[Array[RegistryEntry], PkgError]
-  ## JSON parsing stub
-  Ok(Array::new())
+  ## Parse registry JSON response: each line is a JSON object with
+  ## name, vers, cksum, deps, yanked fields (crates.io-style index format)
+  var entries = Array::new()
+  for line in body.lines() do
+    let trimmed = line.trim()
+    if trimmed.is_empty() || !trimmed.starts_with("{") then
+      next
+    end
+    let name = _json_extract_string(trimmed, "name").unwrap_or("".to_string())
+    let vers_str = _json_extract_string(trimmed, "vers").unwrap_or("0.0.0".to_string())
+    let cksum = _json_extract_string(trimmed, "cksum").unwrap_or("".to_string())
+    let yanked = _json_extract_bool(trimmed, "yanked")
+    let version = Version::parse(&vers_str).unwrap_or(Version { major: 0, minor: 0, patch: 0, pre: "".to_string(), build: "".to_string() })
+    entries.push(RegistryEntry {
+      name: name,
+      version: version,
+      checksum: cksum,
+      dependencies: Array::new(),
+      yanked: yanked,
+    })
+  end
+  Ok(entries)
+end
+
+def _json_extract_string(json: &str, key: &str) -> Option[String]
+  let needle = "\"" + key + "\""
+  match json.find(&needle)
+  when Some(pos) then
+    var i = pos + needle.len()
+    ## Skip to colon
+    while i < json.len() && json.char_at(i) != ':' do i = i + 1 end
+    i = i + 1
+    ## Skip whitespace
+    while i < json.len() && (json.char_at(i) == ' ' || json.char_at(i) == '\t') do i = i + 1 end
+    ## Expect opening quote
+    if i < json.len() && json.char_at(i) == '"' then
+      i = i + 1
+      var end_pos = i
+      while end_pos < json.len() && json.char_at(end_pos) != '"' do
+        if json.char_at(end_pos) == '\\' then end_pos = end_pos + 1 end
+        end_pos = end_pos + 1
+      end
+      Some(json.substring(i, end_pos as Int))
+    else
+      None
+    end
+  when None then None
+  end
+end
+
+def _json_extract_bool(json: &str, key: &str) -> Bool
+  let needle = "\"" + key + "\""
+  match json.find(&needle)
+  when Some(pos) then
+    var i = pos + needle.len()
+    while i < json.len() && json.char_at(i) != ':' do i = i + 1 end
+    i = i + 1
+    while i < json.len() && (json.char_at(i) == ' ' || json.char_at(i) == '\t') do i = i + 1 end
+    if i + 4 <= json.len() && json.substring(i, (i + 4) as Int) == "true" then
+      true
+    else
+      false
+    end
+  when None then false
+  end
 end
 
 def _parse_search_response(body: &str) -> Result[Array[SearchResult], PkgError]
-  Ok(Array::new())
+  ## Parse search API JSON: expects {"crates": [{"name": ..., "description": ..., "max_version": ..., "downloads": ...}]}
+  var results = Array::new()
+  for line in body.lines() do
+    let trimmed = line.trim()
+    if trimmed.is_empty() || !trimmed.starts_with("{") then
+      next
+    end
+    let name = _json_extract_string(trimmed, "name").unwrap_or("".to_string())
+    if name.is_empty() then next end
+    let desc = _json_extract_string(trimmed, "description").unwrap_or("".to_string())
+    let max_ver_str = _json_extract_string(trimmed, "max_version").unwrap_or("0.0.0".to_string())
+    let max_version = Version::parse(&max_ver_str).unwrap_or(Version { major: 0, minor: 0, patch: 0, pre: "".to_string(), build: "".to_string() })
+    results.push(SearchResult {
+      name: name,
+      description: desc,
+      max_version: max_version,
+      downloads: 0,
+    })
+  end
+  Ok(results)
 end
 
 def _entry_to_package(entry: &RegistryEntry) -> Result[Package, PkgError]

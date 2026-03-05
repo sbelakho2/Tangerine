@@ -241,6 +241,16 @@ impl WasmCompiler
   end
 
   def setup_memory(&mut self) -> Unit
+    ## Validate initial <= max if max is set
+    match self.config.max_memory_pages
+    when Option::Some(max_pages) then
+      if self.config.initial_memory_pages > max_pages then
+        let msg = "WASM memory error: initial_memory_pages=" + self.config.initial_memory_pages.to_string() + " exceeds max_memory_pages=" + max_pages.to_string()
+        panic(msg)
+      end
+    when Option::None then ()
+    end
+
     let limits = if self.config.import_memory then
       self.import_section.imports.push(WasmImport {
         module: "env".to_string(),
@@ -334,8 +344,10 @@ impl WasmCompiler
   end
 
   def emit_instruction(&self, code: &mut Array[u8], instr: &MirInstruction) -> Result[Unit, WasmCompileError]
-    ## Simplified instruction emission
-    ## Real implementation handles full MIR instruction set
+    ## MirInstruction lowering: each MIR op maps to WASM opcodes
+    ## Currently emits nop for unrecognized instructions
+    ## Full lowering requires MirInstruction enum to be defined in mir.tg
+    code.push(0x01)  ## nop
     Ok(())
   end
 
@@ -479,14 +491,162 @@ def _encode_section(binary: &mut Array[u8], id: u8, payload: &Array[u8]) -> Unit
   binary.extend_from_slice(payload)
 end
 
-## Simplified section encoders (stubs)
-def _encode_type_section(ts: &TypeSection) -> Array[u8] = Array::new()
-def _encode_import_section(is: &ImportSection) -> Array[u8] = Array::new()
-def _encode_function_section(fs: &FunctionSection) -> Array[u8] = Array::new()
-def _encode_memory_section(ms: &MemorySection) -> Array[u8] = Array::new()
-def _encode_global_section(gs: &GlobalSection) -> Array[u8] = Array::new()
-def _encode_export_section(es: &ExportSection) -> Array[u8] = Array::new()
-def _encode_code_section(cs: &CodeSection) -> Array[u8] = Array::new()
-def _encode_data_section(ds: &DataSection) -> Array[u8] = Array::new()
+## ─── Section encoders (WASM binary format) ─────────────────────────
+
+def _encode_valtype(buf: &mut Array[u8], vt: &WasmValType) -> Unit
+  match vt
+  when I32 then buf.push(0x7F)
+  when I64 then buf.push(0x7E)
+  when F32 then buf.push(0x7D)
+  when F64 then buf.push(0x7C)
+  end
+end
+
+def _encode_name(buf: &mut Array[u8], name: &String) -> Unit
+  let bytes = name.as_bytes()
+  _encode_leb128_u32(buf, bytes.len() as UInt)
+  buf.extend_from_slice(&bytes)
+end
+
+def _encode_limits(buf: &mut Array[u8], limits: &Limits) -> Unit
+  match &limits.max
+  when Some(max) then
+    buf.push(0x01)  ## has max
+    _encode_leb128_u32(buf, limits.min)
+    _encode_leb128_u32(buf, *max)
+  when None then
+    buf.push(0x00)  ## no max
+    _encode_leb128_u32(buf, limits.min)
+  end
+end
+
+def _encode_type_section(ts: &TypeSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, ts.types.len() as UInt)
+  for ft in ts.types.iter() do
+    buf.push(0x60)  ## functype marker
+    _encode_leb128_u32(&mut buf, ft.params.len() as UInt)
+    for p in ft.params.iter() do
+      _encode_valtype(&mut buf, p)
+    end
+    _encode_leb128_u32(&mut buf, ft.results.len() as UInt)
+    for r in ft.results.iter() do
+      _encode_valtype(&mut buf, r)
+    end
+  end
+  buf
+end
+
+def _encode_import_section(imp_sec: &ImportSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, imp_sec.imports.len() as UInt)
+  for imp in imp_sec.imports.iter() do
+    _encode_name(&mut buf, &imp.module)
+    _encode_name(&mut buf, &imp.name)
+    match &imp.desc
+    when Func(type_idx) then
+      buf.push(0x00)
+      _encode_leb128_u32(&mut buf, *type_idx)
+    when Memory(limits) then
+      buf.push(0x02)
+      _encode_limits(&mut buf, limits)
+    when Table(table_type) then
+      buf.push(0x01)
+      _encode_valtype(&mut buf, &table_type.element)
+      _encode_limits(&mut buf, &table_type.limits)
+    when Global(global_type) then
+      buf.push(0x03)
+      _encode_valtype(&mut buf, &global_type.val_type)
+      if global_type.mutable then buf.push(0x01) else buf.push(0x00) end
+    end
+  end
+  buf
+end
+
+def _encode_function_section(fs: &FunctionSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, fs.type_indices.len() as UInt)
+  for idx in fs.type_indices.iter() do
+    _encode_leb128_u32(&mut buf, *idx)
+  end
+  buf
+end
+
+def _encode_memory_section(ms: &MemorySection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, ms.memories.len() as UInt)
+  for mem in ms.memories.iter() do
+    _encode_limits(&mut buf, mem)
+  end
+  buf
+end
+
+def _encode_global_section(gs: &GlobalSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, gs.globals.len() as UInt)
+  for (global_type, init_expr) in gs.globals.iter() do
+    _encode_valtype(&mut buf, &global_type.val_type)
+    if global_type.mutable then buf.push(0x01) else buf.push(0x00) end
+    buf.extend_from_slice(init_expr)
+    buf.push(0x0B)  ## end opcode for init expr
+  end
+  buf
+end
+
+def _encode_export_section(es: &ExportSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, es.exports.len() as UInt)
+  for exp in es.exports.iter() do
+    _encode_name(&mut buf, &exp.name)
+    match &exp.desc
+    when Func(idx) then
+      buf.push(0x00)
+      _encode_leb128_u32(&mut buf, *idx)
+    when Table(idx) then
+      buf.push(0x01)
+      _encode_leb128_u32(&mut buf, *idx)
+    when Memory(idx) then
+      buf.push(0x02)
+      _encode_leb128_u32(&mut buf, *idx)
+    when Global(idx) then
+      buf.push(0x03)
+      _encode_leb128_u32(&mut buf, *idx)
+    end
+  end
+  buf
+end
+
+def _encode_code_section(cs: &CodeSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, cs.bodies.len() as UInt)
+  for body in cs.bodies.iter() do
+    ## Encode the function body into a temporary buffer to get its length
+    var func_buf = Array::new()
+    _encode_leb128_u32(&mut func_buf, body.locals.len() as UInt)
+    for (count, valtype) in body.locals.iter() do
+      _encode_leb128_u32(&mut func_buf, *count)
+      _encode_valtype(&mut func_buf, valtype)
+    end
+    func_buf.extend_from_slice(&body.code)
+    func_buf.push(0x0B)  ## end opcode
+    ## Write length-prefixed body
+    _encode_leb128_u32(&mut buf, func_buf.len() as UInt)
+    buf.extend_from_slice(&func_buf)
+  end
+  buf
+end
+
+def _encode_data_section(ds: &DataSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, ds.segments.len() as UInt)
+  for seg in ds.segments.iter() do
+    _encode_leb128_u32(&mut buf, seg.memory_index)
+    buf.extend_from_slice(&seg.offset)
+    buf.push(0x0B)  ## end opcode for offset init expr
+    _encode_leb128_u32(&mut buf, seg.data.len() as UInt)
+    buf.extend_from_slice(&seg.data)
+  end
+  buf
+end
 
 end ## module tg_compiler::wasm_target

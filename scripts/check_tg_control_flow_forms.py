@@ -14,7 +14,7 @@ from pathlib import Path
 
 DEFAULT_ROOTS = ("std", "tg_compiler", "golden")
 
-BRACE_CONTROL_RE = re.compile(r"^\s*(if|elsif|while|for|match|loop)\b.*\{\s*$")
+BRACE_CONTROL_RE = re.compile(r"^\s*(if|elsif|while|for|match|loop)\b[^=]*\{\s*$")
 CONTINUE_RE = re.compile(r"\bcontinue\b")
 
 

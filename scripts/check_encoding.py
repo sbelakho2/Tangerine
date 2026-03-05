@@ -23,7 +23,14 @@ def iter_files(roots: list[Path]) -> list[Path]:
         if root.is_file():
             files.append(root)
         elif root.is_dir():
-            files.extend(p for p in root.rglob("*") if p.is_file())
+            seen: set[Path] = set()
+            for p in root.rglob("*"):
+                resolved = p.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if p.is_file() and not p.is_symlink():
+                    files.append(p)
     return files
 
 

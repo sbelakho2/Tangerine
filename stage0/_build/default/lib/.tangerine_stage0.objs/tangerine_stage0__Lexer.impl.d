@@ -1,1 +1,1 @@
-lib/lexer.ml: Buffer Diagnostics List String Token
+lib/lexer.ml: Buffer Char Diagnostics Hashtbl List Printf String Token

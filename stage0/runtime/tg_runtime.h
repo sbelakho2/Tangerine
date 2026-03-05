@@ -51,6 +51,12 @@ void* tg_alloc(size_t size);
 void* tg_realloc(void* ptr, size_t size);
 void  tg_free(void* ptr);
 
+size_t tg_debug_alloc_total(void);
+size_t tg_debug_free_total(void);
+size_t tg_debug_alloc_peak(void);
+size_t tg_debug_alloc_count(void);
+size_t tg_debug_free_count(void);
+
 /* ── String ────────────────────────────────────────────────────────── */
 
 typedef struct TgString {
@@ -239,7 +245,8 @@ TgVal tg_set_into_vec(TgVal s);
 /* ── Option ────────────────────────────────────────────────────────── */
 
 typedef struct TgOption {
-    int64_t _tag;   /* 0 = Some, 1 = None  (matches generated enum layout) */
+    int64_t _tag;      /* 0 = Some, 1 = None  (matches generated enum layout) */
+    int64_t _nfields;  /* number of payload fields (for tg_val_eq) */
     TgVal   value;
 } TgOption;
 
@@ -254,7 +261,8 @@ TgVal tg_option_map(TgVal opt, TgVal fn);
 /* ── Result ────────────────────────────────────────────────────────── */
 
 typedef struct TgResult {
-    int64_t _tag;   /* 0 = Ok, 1 = Err  (matches generated enum layout) */
+    int64_t _tag;      /* 0 = Ok, 1 = Err  (matches generated enum layout) */
+    int64_t _nfields;  /* number of payload fields (for tg_val_eq) */
     TgVal   value;
 } TgResult;
 

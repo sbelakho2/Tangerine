@@ -1,1 +1,1 @@
-lib/parser.ml: Array Ast Diagnostics Int64 List Printf String Token
+lib/parser.ml: Array Ast Diagnostics Hashtbl Int64 List Printf String Token

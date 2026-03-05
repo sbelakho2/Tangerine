@@ -5,7 +5,7 @@ golden = sorted(f for f in os.listdir('golden') if f.endswith('.tg'))
 results = []
 for f in golden:
     try:
-        r = subprocess.run(['./target/stage1/tg', 'parse', 'golden/' + f],
+        r = subprocess.run(['./build/tg', 'parse', 'golden/' + f],
                           capture_output=True, text=True, timeout=5)
         status = 'PASS' if r.returncode == 0 else 'FAIL'
     except subprocess.TimeoutExpired:

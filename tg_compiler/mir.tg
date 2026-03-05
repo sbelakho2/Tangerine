@@ -348,6 +348,7 @@ struct MirBuilder
   pending_closures: Vec[PendingClosure]
   break_target: Option[BlockId]
   continue_target: Option[BlockId]
+  enum_variants: Map[String, Vec[String]]
 end
 
 struct PendingClosure
@@ -369,7 +370,8 @@ def builder_new() -> MirBuilder
     blocks: Map::new(),
     pending_closures: Vec::new(),
     break_target: Option::None,
-    continue_target: Option::None
+    continue_target: Option::None,
+    enum_variants: Map::new()
   }
 end
 
@@ -574,7 +576,20 @@ def lower_program(program: &Program) -> MirProgram
   mut functions = Vec::new()
   mut statics = Vec::new()
   mut types = Vec::new()
-  
+
+  # Pre-populate enum variant map so lower_expr can resolve ExprKind::Path
+  for item in program.items do
+    match item.kind
+    when ItemKind::Enum(e) then
+      mut variant_names = Vec::new()
+      for v in e.variants do
+        variant_names.push(v.name.clone())
+      end
+      b.enum_variants.insert(e.name.clone(), variant_names)
+    when _ then ()
+    end
+  end
+
   for item in program.items do
     match item.kind
     when ItemKind::Function(f) then
@@ -941,6 +956,20 @@ def lower_enum_def(e: &EnumDecl) -> MirTypeDef
   mut variants = Vec::new()
   mut disc = 0
   for v in e.variants do
+    # Use explicit discriminant from AST if provided (supports negative values)
+    match v.discriminant
+    when Option::Some(expr) then
+      match expr.kind
+      when ExprKind::IntLit(n) then disc = n
+      when ExprKind::UnaryOp(UnaryOp::Neg, inner) then
+        match inner.kind
+        when ExprKind::IntLit(n) then disc = 0 - n
+        when _ then ()
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
     # Lower variant payload type expressions to Types
     mut lowered_fields = Vec::new()
     for field_ty_expr in v.fields do
@@ -1011,12 +1040,41 @@ def infer_expr_type(expr: &Expr) -> Type
   when ExprKind::NilLit       then Type::Unit
   when ExprKind::BinaryOp(_, lhs, _) then infer_expr_type(lhs)
   when ExprKind::UnaryOp(_, inner)    then infer_expr_type(inner)
-  when ExprKind::Cast(_, _)   then Type::Int
-  when ExprKind::ArrayLit(_)  then Type::Int  # placeholder
-  when ExprKind::TupleLit(_)  then Type::Int  # placeholder
+  when ExprKind::Cast(_, target_ty) then resolve_lowering_type(&target_ty)
+  when ExprKind::ArrayLit(elems) then
+    if elems.len() > 0 then
+      Type::Array(infer_expr_type(&elems[0]))
+    else
+      Type::Array(Type::Unit)
+    end
+  when ExprKind::TupleLit(elems) then
+    mut tys = Vec::new()
+    for e in elems do
+      tys.push(infer_expr_type(&e))
+    end
+    Type::Tuple(tys)
   when ExprKind::Ref(inner)   then Type::Ref(infer_expr_type(inner), lifetime_static())
   when ExprKind::RefMut(inner) then Type::RefMut(infer_expr_type(inner), lifetime_static())
-  when _                      then Type::Int  # default to Int (8 bytes) for register allocation
+  when ExprKind::Deref(inner) then
+    match infer_expr_type(inner)
+    when Type::Ref(t, _)    then t
+    when Type::RefMut(t, _) then t
+    when other              then other
+    end
+  when ExprKind::If(_)                    then Type::Unit
+  when ExprKind::Block(_)                then Type::Unit
+  when ExprKind::Call(_, _)              then Type::Unit
+  when ExprKind::MethodCall(_, _, _, _)  then Type::Unit
+  when ExprKind::Match(_)                then Type::Unit
+  when ExprKind::Closure(_, _, _)        then Type::Unit
+  when ExprKind::Ident(_)                then Type::Unit
+  when ExprKind::SelfRef                  then Type::Unit
+  when ExprKind::Path(_)                  then Type::Unit
+  when ExprKind::Move(inner)             then infer_expr_type(inner)
+  when ExprKind::Copy(inner)             then infer_expr_type(inner)
+  when ExprKind::Await(inner)            then Type::Unit
+  when ExprKind::Try(inner)              then infer_expr_type(inner)
+  when _                                 then Type::Unit
   end
 end
 
@@ -1430,6 +1488,62 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       })
     }) }
 
+  when ExprKind::Path(path) then
+    # Resolve enum variant paths like Operator::None to their discriminant
+    if path.segments.len() >= 2 then
+      let enum_name = path.segments[path.segments.len() - 2]
+      let variant_name = path.segments[path.segments.len() - 1]
+      match b.enum_variants.get(enum_name)
+      when Option::Some(variants) then
+        mut disc = 0
+        mut found = false
+        for v in variants do
+          if v == variant_name then
+            found = true
+            break
+          end
+          disc = disc + 1
+        end
+        if found then
+          MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+            kind: MirOperandKind::Constant(MirConstant {
+              kind: MirConstantKind::Int(disc),
+              ty: Type::Int
+            })
+          }) }
+        else
+          MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+            kind: MirOperandKind::Constant(MirConstant {
+              kind: MirConstantKind::Unit,
+              ty: Type::Unit
+            })
+          }) }
+        end
+      when Option::None then
+        MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+          kind: MirOperandKind::Constant(MirConstant {
+            kind: MirConstantKind::Unit,
+            ty: Type::Unit
+          })
+        }) }
+      end
+    else
+      MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+        kind: MirOperandKind::Constant(MirConstant {
+          kind: MirConstantKind::Unit,
+          ty: Type::Unit
+        })
+      }) }
+    end
+
+  when ExprKind::Match(m) then
+    # Lower match as expression: assign each arm result to a temp
+    let result_tmp = add_temp(b, Type::Int, span)
+    lower_match_to_place(b, &m, place_local(result_tmp), span)
+    MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+      kind: MirOperandKind::Copy(place_local(result_tmp))
+    }) }
+
   when _ then
     MirRvalue { kind: MirRvalueKind::Use(MirOperand {
       kind: MirOperandKind::Constant(MirConstant {
@@ -1679,12 +1793,14 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
     let saved_vars = b.var_map.clone()
     let saved_block_map = b.blocks.clone()
 
+    let closure_span = closure.body.span
+
     # Start a new function for the closure
-    start_function(b, closure.name.clone(), closure.ret_type.clone(), span_dummy())
+    start_function(b, closure.name.clone(), closure.ret_type.clone(), closure_span)
 
     # Add captured variables as implicit leading parameters
     for cap_name in closure.captures do
-      add_param(b, cap_name.clone(), Type::Unit, span_dummy())
+      add_param(b, cap_name.clone(), Type::Unit, closure_span)
     end
 
     # Add explicit closure parameters
@@ -1693,14 +1809,14 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
       when Option::Some(ty_expr) then resolve_lowering_type(&ty_expr)
       when Option::None then Type::Unit
       end
-      add_param(b, p.name.clone(), ty, span_dummy())
+      add_param(b, p.name.clone(), ty, p.span)
     end
 
     # Lower the closure body
-    let body_rvalue = lower_expr_to_rvalue(b, &closure.body, span_dummy())
+    let body_rvalue = lower_expr_to_rvalue(b, &closure.body, closure_span)
     let ret_place = place_local(LocalId { id: 0 })
-    push_stmt(b, MirStatementKind::Assign(ret_place, body_rvalue), span_dummy())
-    set_terminator(b, MirTerminatorKind::Return, span_dummy())
+    push_stmt(b, MirStatementKind::Assign(ret_place, body_rvalue), closure_span)
+    set_terminator(b, MirTerminatorKind::Return, closure_span)
 
     # Finish and add to program
     let closure_fn = finish_function(b)
@@ -1734,6 +1850,9 @@ def lower_expr_assign_to(b: &mut MirBuilder, expr: &Expr, dest: Place, span: Spa
   when ExprKind::If(nested_if) then
     # Nested if: pass our dest directly — branches assign to dest
     lower_if_to_place(b, &nested_if, dest, span)
+  when ExprKind::Match(m) then
+    # Nested match: pass our dest directly — arms assign to dest
+    lower_match_to_place(b, &m, dest, span)
   when _ then
     # Non-if: lower to rvalue and assign in one step
     let rvalue = lower_expr_to_rvalue(b, expr, span)
@@ -2142,6 +2261,7 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
   mut switch_targets = Vec::new()
   mut i = 0
   for arm in m.arms do
+    mut is_catchall = false
     let disc_val = match arm.pattern.kind
     when PatternKind::Literal(expr) then
       match expr.kind
@@ -2150,12 +2270,16 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
       when _ then i
       end
     when PatternKind::Variant(path, _) then i
-    when PatternKind::Wildcard then 0 - 1
-    when PatternKind::Ident(_, _) then 0 - 1
+    when PatternKind::Wildcard then
+      is_catchall = true
+      0
+    when PatternKind::Ident(_, _) then
+      is_catchall = true
+      0
     when _ then i
     end
 
-    if disc_val >= 0 then
+    if !is_catchall then
       switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
     end
     i = i + 1
@@ -2274,6 +2398,7 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
   mut switch_targets = Vec::new()
   mut i = 0
   for arm in m.arms do
+    mut is_catchall = false
     let disc_val = match arm.pattern.kind
     when PatternKind::Literal(expr) then
       match expr.kind
@@ -2282,12 +2407,16 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
       when _ then i
       end
     when PatternKind::Variant(path, _) then i
-    when PatternKind::Wildcard then 0 - 1
-    when PatternKind::Ident(_, _) then 0 - 1
+    when PatternKind::Wildcard then
+      is_catchall = true
+      0
+    when PatternKind::Ident(_, _) then
+      is_catchall = true
+      0
     when _ then i
     end
 
-    if disc_val >= 0 then
+    if !is_catchall then
       switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
     end
     i = i + 1
@@ -2924,6 +3053,12 @@ def find_recursive_functions(cg: &CallGraph) -> Set[String]
 end
 
 def is_reachable_from(cg: &CallGraph, start: String, target: String, visited: Set[String]) -> Bool
+  mut vis = visited.clone()
+  vis.insert(start.clone())
+  is_reachable_impl(cg, start, target, &mut vis)
+end
+
+def is_reachable_impl(cg: &CallGraph, start: String, target: String, visited: &mut Set[String]) -> Bool
   match cg.calls.get(start.clone())
   when Option::Some(callees) then
     for callee in callees do
@@ -2931,9 +3066,8 @@ def is_reachable_from(cg: &CallGraph, start: String, target: String, visited: Se
         return true
       end
       if !visited.contains(callee.clone()) then
-        mut new_visited = visited.clone()
-        new_visited.insert(callee.clone())
-        if is_reachable_from(cg, callee.clone(), target.clone(), new_visited) then
+        visited.insert(callee.clone())
+        if is_reachable_impl(cg, callee.clone(), target.clone(), visited) then
           return true
         end
       end
@@ -4931,7 +5065,7 @@ def instrument_for_pgo(program: &mut MirProgram) -> Unit
       }
       let counter_stmt = MirStatement {
         kind: MirStatementKind::EffectRecord("__pgo_counter_" + counter_id.to_string(), increment),
-        span: span_dummy()  # Use the correct Span from token.tg
+        span: block.terminator.span
       }
       # Insert at position 0
       mut new_stmts = Vec::new()
@@ -5788,7 +5922,7 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
             place_local(LocalId { id: local_id }),
             phi_rvalue
           ),
-          span: block.statements.get(0).map(|s| s.span.clone()).unwrap_or(span_dummy())
+          span: block.statements.get(0).map(|s| s.span.clone()).unwrap_or(block.terminator.span)
         })
       end
       # Prepend phis to existing statements

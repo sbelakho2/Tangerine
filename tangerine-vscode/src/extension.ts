@@ -9,6 +9,7 @@ import {
     LanguageClient,
     LanguageClientOptions,
     ServerOptions,
+    State,
     TransportKind,
     Executable
 } from 'vscode-languageclient/node';
@@ -37,6 +38,10 @@ function resolveExecutableInPath(executableName: string): string | undefined {
 }
 
 function shellEscape(arg: string): string {
+    if (process.platform === 'win32') {
+        // On Windows, use double-quote escaping for cmd.exe/PowerShell
+        return `"${arg.replace(/"/g, '\\"')}"`;
+    }
     return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -119,7 +124,29 @@ function registerHoverFallback(context: vscode.ExtensionContext) {
         post: 'Contract postcondition clause.',
         invariant: 'Declares a condition that should always hold for the annotated scope.',
         guard: 'Additional guard condition, often used with contracts or pattern flows.',
-        end: 'Closes an open block (`def`, `if`, `match`, `struct`, `enum`, `trait`, `impl`, etc.).'
+        end: 'Closes an open block (`def`, `if`, `match`, `struct`, `enum`, `trait`, `impl`, etc.).',
+        async: 'Marks a function as asynchronous, enabling `await` inside its body.',
+        await: 'Suspends execution until the asynchronous expression completes.',
+        yield: 'Produces a value from a generator or coroutine.',
+        defer: 'Schedules an expression to run when the enclosing scope exits.',
+        move: 'Transfers ownership of a value, preventing further use of the original binding.',
+        copy: 'Creates a bitwise copy of a value (requires the `Copy` trait).',
+        drop: 'Explicitly destroys a value before its scope ends.',
+        const: 'Declares a compile-time constant.',
+        static: 'Declares a module-level static variable with a fixed address.',
+        macro: 'Defines a compile-time macro expansion.',
+        where: 'Adds trait-bound constraints to generic type parameters.',
+        type: 'Introduces a type alias.',
+        in: 'Specifies the collection/range to iterate over in a `for` loop.',
+        as: 'Performs a type cast or renames an import.',
+        is: 'Pattern test operator — checks whether a value matches a type or pattern.',
+        not: 'Logical negation operator.',
+        and: 'Logical AND operator (short-circuiting).',
+        or: 'Logical OR operator (short-circuiting).',
+        self: 'Refers to the current instance inside a method body.',
+        Self: 'Refers to the implementing type inside `impl` or `trait` blocks.',
+        super: 'Refers to the parent module in a path.',
+        do: 'Introduces the body of a loop or block expression.'
     };
 
     const buildSymbolIndex = (document: vscode.TextDocument): Map<string, HoverSymbol[]> => {
@@ -468,6 +495,16 @@ function startLanguageServer(context: vscode.ExtensionContext, tgPath: string) {
 
     client.onDidChangeState(e => {
         console.log(`Tangerine LSP state: ${e.oldState} -> ${e.newState}`);
+        if (e.newState === State.Stopped && e.oldState === State.Running) {
+            console.log('Tangerine LSP crashed — restarting in 3 seconds...');
+            setTimeout(() => {
+                const restartPath = findTangerineExecutable();
+                if (restartPath) {
+                    startLanguageServer(context, restartPath);
+                    vscode.window.showWarningMessage('Tangerine language server crashed and was restarted.');
+                }
+            }, 3000);
+        }
     });
 
     // Register configuration change handler

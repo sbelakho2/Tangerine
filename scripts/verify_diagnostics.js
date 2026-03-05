@@ -25,6 +25,9 @@ let errorFiles = 0;
 for (const file of files) {
   const normalized = file.replace(/\\/g, "/");
   if (normalized.endsWith("/golden/diagnostics_quality.tg")) {
+    // Skip: diagnostics_quality.tg contains intentional errors used to
+    // test diagnostic output quality. It is validated separately by the
+    // CQS quality gate, not by structural verification.
     continue;
   }
 

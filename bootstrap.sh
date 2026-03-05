@@ -11,6 +11,15 @@
 
 set -euo pipefail
 
+# Cleanup temporary directories on exit
+BOOTSTRAP_TMP_DIRS=()
+cleanup() {
+  for d in "${BOOTSTRAP_TMP_DIRS[@]}"; do
+    rm -rf "$d" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+
 TARGET=""
 FROM_STAGE0="no"
 
@@ -103,7 +112,10 @@ if [[ "$FROM_STAGE0" == "yes" ]] || [[ -d ./stage0 ]]; then
   # Install dependencies
   echo "Installing stage0 dependencies..."
   cd stage0
-  opam install --yes menhir ppx_deriving cmdliner fmt 2>/dev/null || true
+  if ! opam install --yes menhir ppx_deriving cmdliner fmt; then
+    echo "ERROR: opam install failed. Check network and opam configuration." >&2
+    exit 1
+  fi
   
   # Build stage0
   echo "Building stage0 (tgc0)..."
@@ -125,13 +137,8 @@ if [[ "$FROM_STAGE0" == "yes" ]] || [[ -d ./stage0 ]]; then
     --lib tg_compiler/lib.tg \
     --entry tg_compiler/driver.tg \
     -o target/stage1/tg || {
-      echo "Stage1 compilation failed. Creating minimal bootstrap binary..."
-      # Fallback: just copy tgc0 wrapper
-      cat > target/stage1/tg << 'WRAPPER'
-#!/usr/bin/env bash
-exec "$(dirname "$0")/../../stage0/_build/default/bin/main.exe" "$@"
-WRAPPER
-      chmod +x target/stage1/tg
+      echo "ERROR: Stage1 compilation failed." >&2
+      exit 1
   }
   
   # Build stage2 using stage1
@@ -170,6 +177,7 @@ echo "Bootstrap: attempting release download for ${TARGET} (v${TG_VERSION})"
 for artifact in "${candidates[@]}"; do
   url="${BASE_URL}/${artifact}"
   tmp="$(mktemp -d)"
+  BOOTSTRAP_TMP_DIRS+=("$tmp")
   file="${tmp}/${artifact}"
 
   if curl -fsSL "$url" -o "$file"; then
@@ -181,6 +189,9 @@ for artifact in "${candidates[@]}"; do
           chmod +x ./build/tg
           rm -rf "$tmp"
           echo "Bootstrap: downloaded ${artifact}"
+          if ! ./build/tg --version >/dev/null 2>&1; then
+            echo "WARNING: downloaded binary does not respond to --version" >&2
+          fi
           exit 0
         fi
         ;;
@@ -189,6 +200,9 @@ for artifact in "${candidates[@]}"; do
         chmod +x ./build/tg
         rm -rf "$tmp"
         echo "Bootstrap: downloaded ${artifact}"
+        if ! ./build/tg --version >/dev/null 2>&1; then
+          echo "WARNING: downloaded binary does not respond to --version" >&2
+        fi
         exit 0
         ;;
     esac

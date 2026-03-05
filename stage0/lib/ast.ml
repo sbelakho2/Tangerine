@@ -125,10 +125,42 @@ type item =
       methods : item list;
       loc : loc;
     }
-  | IUse of { path : string list; loc : loc }
+  | IUse of { path : string list; alias : string option; loc : loc }
   | IConst of { name : string; typ : typ option; value : expr; loc : loc }
   | ITypeAlias of { name : string; typ : typ; loc : loc }
+  (* abi: None = default, Some "C" = C ABI, Some "stdcall" = stdcall, etc.
+     Supported ABI values: "C", "stdcall", "fastcall", "system", "Tangerine" *)
   | IExtern of { abi : string option; sigs : fn_sig list; loc : loc }
   | IModule of { pub : bool; name : string; items : item list; loc : loc }
 
 type program = { items : item list }
+
+(* ── Match exhaustiveness helpers ─────────────────────────────────── *)
+
+(** Returns true if the arm list contains a wildcard or catch-all binding pattern *)
+let has_wildcard_arm arms =
+  List.exists (fun arm ->
+    match arm.pat with
+    | PatWild _ | PatBind _ | PatMut _ -> true
+    | _ -> false
+  ) arms
+
+(** Returns the set of variant names covered by the match arms *)
+let covered_variants arms =
+  List.fold_left (fun acc arm ->
+    match arm.pat with
+    | PatVariant (name, _, _) -> name :: acc
+    | PatOr (PatVariant (a, _, _), PatVariant (b, _, _), _) -> a :: b :: acc
+    | _ -> acc
+  ) [] arms
+
+(** Check if a match expression is trivially non-exhaustive.
+    Returns Some missing_info if gaps are detected, None if ok.
+    For full check, the caller must supply the variant list. *)
+let check_match_coverage ~variant_names arms =
+  if has_wildcard_arm arms then None
+  else
+    let covered = covered_variants arms in
+    let missing = List.filter (fun v -> not (List.mem v covered)) variant_names in
+    if missing = [] then None
+    else Some missing

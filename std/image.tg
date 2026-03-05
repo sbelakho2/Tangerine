@@ -108,17 +108,78 @@ def decode(bytes: &Vec[u8], opts: DecodeOpts) -> Result[Bitmap, ImageError]
     ))
   end
 
-  # Reference implementation: parse IHDR for dimensions only, produce placeholder bitmap.
-  # A production backend would provide a full codec via the backend plugin ABI.
+  # Parse IHDR (first chunk after 8-byte signature)
   let w = _read_be_u32(bytes, 16)
   let h = _read_be_u32(bytes, 20)
+  let bit_depth = bytes.get(24) as Int
+  let color_type = bytes.get(25) as Int
+
+  if bit_depth != 8 || (color_type != 2 && color_type != 6) then
+    return Result::Err(ImageError::UnsupportedFormat(
+      Error::unsupported("Only 8-bit RGB or RGBA PNG is supported.".to_string())
+    ))
+  end
+
+  let channels = if color_type == 6 then 4 else 3 end
+
+  # Collect all IDAT chunk data
+  var idat_data = Vec::new()
+  var pos = 8
+  while pos + 8 <= bytes.len() do
+    let chunk_len = _read_be_u32(bytes, pos)
+    let chunk_type_0 = bytes.get(pos + 4)
+    let chunk_type_1 = bytes.get(pos + 5)
+    let chunk_type_2 = bytes.get(pos + 6)
+    let chunk_type_3 = bytes.get(pos + 7)
+    if chunk_type_0 == 73 && chunk_type_1 == 68 && chunk_type_2 == 65 && chunk_type_3 == 84 then
+      # IDAT chunk
+      var j = 0
+      while j < chunk_len do
+        idat_data.push(bytes.get(pos + 8 + j))
+        j = j + 1
+      end
+    end
+    if chunk_type_0 == 73 && chunk_type_1 == 69 && chunk_type_2 == 78 && chunk_type_3 == 68 then
+      # IEND — stop
+      pos = bytes.len()
+    else
+      pos = pos + 12 + chunk_len
+    end
+  end
+
+  # Inflate (zlib stored blocks) the IDAT data
+  let raw_scanlines = _inflate_stored(&idat_data)
+
+  # Reconstruct pixels from filtered scanlines
   let stride = w * 4
-  let data_len = stride * h
-  let data = Vec::with_capacity(data_len)
-  let i = 0
-  while i < data_len do
+  var data = Vec::with_capacity(stride * h)
+  var i = 0
+  while i < stride * h do
     data.push(0u8)
     i = i + 1
+  end
+  let src_stride = w * channels + 1
+
+  var row = 0
+  while row < h do
+    let filter_byte = raw_scanlines.get(row * src_stride) as Int
+    var col = 0
+    while col < w * channels do
+      let raw_val = raw_scanlines.get(row * src_stride + 1 + col) as Int
+      let recon = _png_unfilter(filter_byte, raw_val, col, channels, row, &data, w, stride)
+      let dst_col = if channels == 3 then
+        (col / 3) * 4 + (col % 3)
+      else
+        col
+      end
+      data[row * stride + dst_col] = (recon & 0xFF) as u8
+      # For RGB, fill alpha
+      if channels == 3 && (col % 3) == 2 then
+        data[row * stride + (col / 3) * 4 + 3] = 255u8
+      end
+      col = col + 1
+    end
+    row = row + 1
   end
 
   let info = ImageInfo {
@@ -187,6 +248,111 @@ def _read_be_u32(data: &Vec[u8], offset: Int) -> Int
   let b2 = data.get(offset + 2) as Int
   let b3 = data.get(offset + 3) as Int
   (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+end
+
+def _inflate_stored(data: &Vec[u8]) -> Vec[u8]
+  # Inflate zlib stored (uncompressed) blocks.
+  # Skip 2-byte zlib header, parse DEFLATE stored blocks.
+  var out = Vec::new()
+  var pos = 2
+  var done = false
+  while !done && pos < data.len() do
+    let header = data.get(pos) as Int
+    let bfinal = header & 1
+    let btype = (header >> 1) & 3
+    pos = pos + 1
+    if btype == 0 then
+      # Stored block
+      let len_lo = data.get(pos) as Int
+      let len_hi = data.get(pos + 1) as Int
+      let block_len = len_lo | (len_hi << 8)
+      pos = pos + 4
+      var k = 0
+      while k < block_len do
+        out.push(data.get(pos))
+        pos = pos + 1
+        k = k + 1
+      end
+    else
+      # Compressed block — not supported in reference decoder
+      done = true
+    end
+    if bfinal == 1 then
+      done = true
+    end
+  end
+  out
+end
+
+def _png_unfilter(filter: Int, raw: Int, col: Int, channels: Int, row: Int, data: &Vec[u8], w: Int, stride: Int) -> Int
+  let bpp = channels
+  if filter == 0 then
+    # None
+    raw
+  elsif filter == 1 then
+    # Sub: recon = raw + left
+    let left = if col >= bpp then
+      let dst_col = if channels == 3 then ((col - bpp) / 3) * 4 + ((col - bpp) % 3) else col - bpp end
+      data.get(row * stride + dst_col) as Int
+    else
+      0
+    end
+    (raw + left) & 0xFF
+  elsif filter == 2 then
+    # Up: recon = raw + above
+    let above = if row > 0 then
+      let dst_col = if channels == 3 then (col / 3) * 4 + (col % 3) else col end
+      data.get((row - 1) * stride + dst_col) as Int
+    else
+      0
+    end
+    (raw + above) & 0xFF
+  elsif filter == 3 then
+    # Average: recon = raw + floor((left + above) / 2)
+    let left = if col >= bpp then
+      let dst_col = if channels == 3 then ((col - bpp) / 3) * 4 + ((col - bpp) % 3) else col - bpp end
+      data.get(row * stride + dst_col) as Int
+    else
+      0
+    end
+    let above = if row > 0 then
+      let dst_col = if channels == 3 then (col / 3) * 4 + (col % 3) else col end
+      data.get((row - 1) * stride + dst_col) as Int
+    else
+      0
+    end
+    (raw + (left + above) / 2) & 0xFF
+  elsif filter == 4 then
+    # Paeth
+    let left = if col >= bpp then
+      let dst_col = if channels == 3 then ((col - bpp) / 3) * 4 + ((col - bpp) % 3) else col - bpp end
+      data.get(row * stride + dst_col) as Int
+    else
+      0
+    end
+    let above = if row > 0 then
+      let dst_col = if channels == 3 then (col / 3) * 4 + (col % 3) else col end
+      data.get((row - 1) * stride + dst_col) as Int
+    else
+      0
+    end
+    let above_left = if row > 0 && col >= bpp then
+      let dst_col = if channels == 3 then ((col - bpp) / 3) * 4 + ((col - bpp) % 3) else col - bpp end
+      data.get((row - 1) * stride + dst_col) as Int
+    else
+      0
+    end
+    let p = left + above - above_left
+    let pa = if p - left >= 0 then p - left else left - p end
+    let pb = if p - above >= 0 then p - above else above - p end
+    let pc = if p - above_left >= 0 then p - above_left else above_left - p end
+    let paeth = if pa <= pb && pa <= pc then left
+    elsif pb <= pc then above
+    else above_left end
+    (raw + paeth) & 0xFF
+  else
+    raw
+  end
 end
 
 def _write_be_u32(out: &Vec[u8], val: Int) -> Unit

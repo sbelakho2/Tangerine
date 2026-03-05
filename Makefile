@@ -3,8 +3,9 @@
 .PHONY: all build test test-golden test-stdlib test-compiler test-scripts test-conformance test-frontend test-abi test-gfx-ui test-new-std test-tooling test-all lint fmt fmt-check coverage docs clean install bench stub-scan abi-layout-check ci help bootstrap bootstrap-stage0 bootstrap-stage1 bootstrap-stage2 bootstrap-verify bootstrap-full clean-bootstrap
 
 SHELL := /bin/bash
-TG    := tg
+TG    := build/tg
 PYTHON := python3
+BOOTSTRAP_TIMEOUT := 600
 
 # Default target
 all: build test
@@ -31,15 +32,23 @@ TG2 := $(STAGE2_DIR)/tg
 # Compiler sources excluding entry/lib to avoid duplicate codegen
 TG_COMPILER_SRCS := $(filter-out tg_compiler/lib.tg tg_compiler/driver.tg, $(wildcard tg_compiler/*.tg))
 
+ifeq ($(TG_COMPILER_SRCS),)
+$(error No tg_compiler/*.tg source files found — check your working directory)
+endif
+
 # Build stage0 (OCaml bootstrap compiler)
 bootstrap-stage0:
 	@echo "==> Stage 0: Building OCaml bootstrap compiler..."
 	@if [ -x $(TGC0) ]; then \
 		echo "    Stage 0 already built: $(TGC0)"; \
 	elif command -v dune >/dev/null 2>&1; then \
-		cd $(STAGE0_DIR) && dune build; \
+		DUNE_VER=$$(dune --version); \
+		echo "    Using dune $$DUNE_VER"; \
+		timeout $(BOOTSTRAP_TIMEOUT) sh -c 'cd $(STAGE0_DIR) && dune build'; \
 	elif command -v opam >/dev/null 2>&1; then \
-		cd $(STAGE0_DIR) && opam exec -- dune build; \
+		OPAM_VER=$$(opam --version); \
+		echo "    Using opam $$OPAM_VER"; \
+		timeout $(BOOTSTRAP_TIMEOUT) sh -c 'cd $(STAGE0_DIR) && opam exec -- dune build'; \
 	else \
 		echo "dune not found and no existing stage0 binary; install dune or opam."; \
 		exit 1; \
@@ -50,7 +59,7 @@ bootstrap-stage0:
 bootstrap-stage1: bootstrap-stage0
 	@echo "==> Stage 1: Compiling Tangerine with stage0..."
 	@mkdir -p $(STAGE1_DIR)
-	@$(TGC0) compile \
+	@timeout $(BOOTSTRAP_TIMEOUT) $(TGC0) compile \
 		--lib tg_compiler/lib.tg \
 		--entry tg_compiler/driver.tg \
 		$(TG_COMPILER_SRCS) \

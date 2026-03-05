@@ -33,6 +33,7 @@ def transform_tangerine_lines(lines: list[str]) -> tuple[list[str], int]:
             continue
 
         if CLOSE_RE.match(line) and stack:
+            kw = stack[-1]
             indent = re.match(r"^\s*", line).group(0)
             out.append(f"{indent}end")
             stack.pop()
@@ -107,8 +108,10 @@ def main() -> int:
             if args.dry_run:
                 print(f"would-update {path} ({changes} changes)")
             else:
+                backup = path.with_suffix(path.suffix + ".bak")
+                backup.write_text(content, encoding="utf-8")
                 path.write_text(new_content, encoding="utf-8")
-                print(f"updated {path} ({changes} changes)")
+                print(f"updated {path} ({changes} changes, backup: {backup})")
 
     print(f"done: {total_changes} changes")
     return 0

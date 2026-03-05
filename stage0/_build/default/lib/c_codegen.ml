@@ -296,11 +296,27 @@ let expr_option_inner_type ctx = function
       | TyRef (_, t) -> t
       | t -> t
     in
+    let extract_field_full_type parent field =
+      let parent_type = expr_type_name ctx parent in
+      if parent_type <> "" then
+        let fields = Resolve.struct_fields ctx.res parent_type in
+        try Some (List.find (fun fd -> fd.fd_name = field) fields).fd_typ
+        with Not_found -> None
+      else None
+    in
     if (obj_type = "Map" || obj_type = "HashMap") && meth = "get" then
       (* Extract V from Map[K, V] via the object's full type *)
       (match obj with
        | EIdent (name, _) ->
          (match extract_full_type name with
+          | Some ft ->
+            (match unwrap_ref ft with
+             | TyName (("Map"|"HashMap"), [_; TyName (v, _)]) -> v
+             | TyName (("Map"|"HashMap"), [_; TyRef (_, TyName (v, _))]) -> v
+             | _ -> "")
+          | None -> "")
+       | EFieldAccess (parent, field, _) ->
+         (match extract_field_full_type parent field with
           | Some ft ->
             (match unwrap_ref ft with
              | TyName (("Map"|"HashMap"), [_; TyName (v, _)]) -> v
@@ -313,6 +329,14 @@ let expr_option_inner_type ctx = function
       (match obj with
        | EIdent (name, _) ->
          (match extract_full_type name with
+          | Some ft ->
+            (match unwrap_ref ft with
+             | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
+             | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+             | _ -> "")
+          | None -> "")
+       | EFieldAccess (parent, field, _) ->
+         (match extract_field_full_type parent field with
           | Some ft ->
             (match unwrap_ref ft with
              | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
@@ -514,14 +538,15 @@ let emit_enum_def ctx name variants =
     emitfn ctx "#define TAG_%s_%s ((TgVal)%d)" c_name (c_ident vd.vd_name) tag
   ) variants;
   nl ctx;
-  (* Enum struct: tag + max payload fields, padded to at least 4 for cast safety *)
+  (* Enum struct: tag + _nfields + payload fields *)
   let max_fields = List.fold_left (fun mx vd ->
     max mx (List.length vd.vd_fields)
   ) 0 variants in
-  let padded_fields = max max_fields 4 in
+  let padded_fields = max_fields in
   emitfn ctx "typedef struct %s {" c_name;
   indent ctx;
   emit_indent ctx; emitfn ctx "TgVal _tag;";
+  emit_indent ctx; emitfn ctx "TgVal _nfields;";
   for i = 0 to padded_fields - 1 do
     emit_indent ctx; emitfn ctx "TgVal _f%d;" i
   done;
@@ -547,6 +572,8 @@ let emit_enum_def ctx name variants =
       c_name c_name c_name;
     emit_indent ctx;
     emitfn ctx "_p->_tag = %d;" tag;
+    emit_indent ctx;
+    emitfn ctx "_p->_nfields = %d;" padded_fields;
     List.iteri (fun i _ ->
       emit_indent ctx;
       emitfn ctx "_p->_f%d = _%d;" i i
@@ -1182,8 +1209,23 @@ let rec emit_expr ctx expr =
        emit ctx "tg_tuple_new3(";
        emit_expr ctx a; emit ctx ", "; emit_expr ctx b;
        emit ctx ", "; emit_expr ctx c; emit ctx ")"
+     | [a; b; c; d] ->
+       emit ctx "tg_tuple_new4(";
+       emit_expr ctx a; emit ctx ", "; emit_expr ctx b;
+       emit ctx ", "; emit_expr ctx c; emit ctx ", ";
+       emit_expr ctx d; emit ctx ")"
      | _ ->
-       emit ctx "tg_tuple_new2(TG_NIL, TG_NIL)")
+       (* N-element tuples: allocate as struct with length prefix *)
+       let n = List.length elems in
+       let tmp = fresh_temp ctx in
+       emitf ctx "({ TgVal* %s = (TgVal*)tg_alloc(%d * sizeof(TgVal)); " tmp (n + 1);
+       emitf ctx "%s[0] = %d; " tmp n;
+       List.iteri (fun i e ->
+         emitf ctx "%s[%d] = " tmp (i + 1);
+         emit_expr ctx e;
+         emit ctx "; "
+       ) elems;
+       emitf ctx "tg_from_ptr(%s); })" tmp)
 
   | EArray (elems, _) ->
     let tmp = fresh_temp ctx in
@@ -2464,8 +2506,9 @@ and emit_match_arm_expr ctx tmp arm ~is_first =
              (c_ident n) (resolve_enum_type ctx vi) tmp i;
            (* Try to infer type from variant field *)
            if i < List.length vi.vi_fields then begin
-             let ft = Resolve.type_name_string_of_typ (List.nth vi.vi_fields i) in
-             if ft <> "" then set_var_type ctx n ft
+             let full_t = List.nth vi.vi_fields i in
+             let ft = Resolve.type_name_string_of_typ full_t in
+             if ft <> "" then set_var_type_full ctx n ft full_t
            end
          | PatWild _ -> ()
          | PatMut (n, _) ->
@@ -3438,8 +3481,9 @@ and emit_match_arm_stmt ctx tmp arm ~is_first =
            emitf ctx "TgVal %s = ((%s*)tg_as_ptr(%s_scrut))->_f%d;\n"
              (c_ident n) (resolve_enum_type ctx vi) tmp i;
            if i < List.length vi.vi_fields then begin
-             let ft = Resolve.type_name_string_of_typ (List.nth vi.vi_fields i) in
-             if ft <> "" then set_var_type ctx n ft
+             let full_t = List.nth vi.vi_fields i in
+             let ft = Resolve.type_name_string_of_typ full_t in
+             if ft <> "" then set_var_type_full ctx n ft full_t
            end
          | PatMut (n, _) ->
            emit_indent ctx;
