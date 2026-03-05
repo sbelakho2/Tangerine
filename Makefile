@@ -28,10 +28,22 @@ TGC0 := $(STAGE0_DIR)/_build/default/bin/main.exe
 TG1 := $(STAGE1_DIR)/tg
 TG2 := $(STAGE2_DIR)/tg
 
+# Compiler sources excluding entry/lib to avoid duplicate codegen
+TG_COMPILER_SRCS := $(filter-out tg_compiler/lib.tg tg_compiler/driver.tg, $(wildcard tg_compiler/*.tg))
+
 # Build stage0 (OCaml bootstrap compiler)
 bootstrap-stage0:
 	@echo "==> Stage 0: Building OCaml bootstrap compiler..."
-	@cd $(STAGE0_DIR) && (dune build || opam exec -- dune build)
+	@if [ -x $(TGC0) ]; then \
+		echo "    Stage 0 already built: $(TGC0)"; \
+	elif command -v dune >/dev/null 2>&1; then \
+		cd $(STAGE0_DIR) && dune build; \
+	elif command -v opam >/dev/null 2>&1; then \
+		cd $(STAGE0_DIR) && opam exec -- dune build; \
+	else \
+		echo "dune not found and no existing stage0 binary; install dune or opam."; \
+		exit 1; \
+	fi
 	@echo "    Stage 0 complete: $(TGC0)"
 
 # Build stage1 (first self-hosted compiler, compiled by stage0)
@@ -41,7 +53,7 @@ bootstrap-stage1: bootstrap-stage0
 	@$(TGC0) compile \
 		--lib tg_compiler/lib.tg \
 		--entry tg_compiler/driver.tg \
-		$(wildcard tg_compiler/*.tg) \
+		$(TG_COMPILER_SRCS) \
 		-o $(TG1)
 	@chmod +x $(TG1)
 	@echo "    Stage 1 complete: $(TG1)"

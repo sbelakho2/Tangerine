@@ -134,6 +134,31 @@ let type_name_string_of_typ = function
   | TySelf -> "Self"
   | _ -> ""
 
+(* Extract element type name from a Vec/Array type *)
+let vec_element_type_string fields field_name =
+  try
+    let f = List.find (fun fd -> fd.fd_name = field_name) fields in
+    match f.fd_typ with
+    | TyName (("Vec" | "Array"), [TyName (elem, _)])
+    | TyName (("Vec" | "Array"), [TyRef (_, TyName (elem, _))]) -> elem
+    | TyRef (_, TyName (("Vec" | "Array"), [TyName (elem, _)])) -> elem
+    | _ -> ""
+  with Not_found -> ""
+
+(* Extract Option/Result inner type name from a struct field *)
+let option_inner_type_string fields field_name =
+  try
+    let f = List.find (fun fd -> fd.fd_name = field_name) fields in
+    match f.fd_typ with
+    | TyOption (TyName (inner, _))
+    | TyOption (TyRef (_, TyName (inner, _))) -> inner
+    | TyName ("Option", [TyName (inner, _)])
+    | TyName ("Option", [TyRef (_, TyName (inner, _))]) -> inner
+    | TyRef (_, TyOption (TyName (inner, _)))
+    | TyRef (_, TyName ("Option", [TyName (inner, _)])) -> inner
+    | _ -> ""
+  with Not_found -> ""
+
 (* ── Extract target type name from impl ────────────────────────────── *)
 
 let target_name_of_typ = function

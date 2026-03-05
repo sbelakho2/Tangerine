@@ -8,7 +8,7 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec}
-use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, is_expr_start, is_stmt_start, is_item_start}
+use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, is_expr_start, is_stmt_start, is_item_start, is_doc_comment}
 use tg_compiler::lexer::LexResult
 use tg_compiler::ast::{
   Program, Item, ItemKind, Visibility,
@@ -131,6 +131,13 @@ def skip_newlines(p: &mut Parser) -> Unit
   end
 end
 
+def skip_doc_comments(p: &mut Parser) -> Unit
+  while is_doc_comment(peek(p)) do
+    advance(p)
+    skip_newlines(p)
+  end
+end
+
 # Check if the current token is a keyword matching the given string.
 # Maps known keyword strings to their TokenKind and delegates to at().
 def at_keyword(p: &Parser, kw: String) -> Bool
@@ -209,6 +216,12 @@ def synchronize(p: &mut Parser) -> Unit
     when TokenKind::Impl then break
     when TokenKind::Module then break
     when TokenKind::Use then break
+    when TokenKind::Extern then break
+    when TokenKind::Const then break
+    when TokenKind::Static then break
+    when TokenKind::Pub then break
+    when TokenKind::Type then break
+    when TokenKind::Macro then break
     when _ then advance(p)
     end
   end
@@ -247,8 +260,11 @@ def parse_program(p: &mut Parser) -> Program
   let start = peek_span(p)
   mut items = Vec::new()
   skip_newlines(p)
+  skip_doc_comments(p)
   
   while !at(p, TokenKind::Eof) do
+    skip_newlines(p)
+    skip_doc_comments(p)
     match parse_item(p)
     when Option::Some(item) then
       items.push(item)
@@ -256,6 +272,7 @@ def parse_program(p: &mut Parser) -> Program
       synchronize(p)
     end
     skip_newlines(p)
+    skip_doc_comments(p)
   end
   
   let end_span = peek_span(p)
@@ -276,12 +293,25 @@ def parse_attributes(p: &mut Parser) -> Vec[Attribute]
       mut args = Vec::new()
       if at(p, TokenKind::LParen) then
         advance(p)
-        while !at(p, TokenKind::RParen) && !at(p, TokenKind::Eof) do
-          match expect_ident(p)
-          when Option::Some(arg) then args.push(arg)
-          when Option::None then break
-          end
-          if at(p, TokenKind::Comma) then
+        mut depth = 1
+        while depth > 0 && !at(p, TokenKind::Eof) do
+          match peek(p)
+          when TokenKind::LParen then
+            depth = depth + 1
+            advance(p)
+          when TokenKind::RParen then
+            depth = depth - 1
+            if depth > 0 then advance(p) end
+          when TokenKind::Ident(arg) then
+            args.push(arg)
+            advance(p)
+            if at(p, TokenKind::Comma) then advance(p) end
+          when TokenKind::StringLit(s) then
+            args.push(s)
+            advance(p)
+            if at(p, TokenKind::Comma) then advance(p) end
+          when _ then
+            # Skip other tokens in attribute arguments (operators, literals, etc.)
             advance(p)
           end
         end
@@ -301,6 +331,7 @@ end
 
 def parse_item(p: &mut Parser) -> Option[Item]
   skip_newlines(p)
+  skip_doc_comments(p)
   let attrs = parse_attributes(p)
   
   # Extract @derive attributes
@@ -417,11 +448,7 @@ def parse_item(p: &mut Parser) -> Option[Item]
     end
   when TokenKind::Extern then
     advance(p)
-    match parse_extern_block(p, start)
-    when Option::Some(e) then
-      Option::Some(make_item(ItemKind::ExternBlock(e), span_merge(start, peek_span(p))))
-    when Option::None then Option::None
-    end
+    parse_extern_dispatch(p, start)
   when TokenKind::Async then
     # async def ...
     advance(p)
@@ -494,9 +521,57 @@ def parse_item(p: &mut Parser) -> Option[Item]
     when Option::None then Option::None
     end
   when _ then
-    let span = peek_span(p)
-    diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected item", span)
-    Option::None
+    # Check for test block: test "name" do ... end
+    match peek(p)
+    when TokenKind::Ident(name) then
+      if name == "test" then
+        advance(p)
+        let test_name = match peek(p)
+        when TokenKind::StringLit(s) then
+          advance(p)
+          s
+        when _ then
+          let espan = peek_span(p)
+          diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected string literal for test name", espan)
+          "unnamed_test"
+        end
+        skip_newlines(p)
+        expect(p, TokenKind::Do)
+        let body = match parse_block_body(p)
+        when Option::Some(block) then
+          expect_end(p)
+          FnBody::Block(block)
+        when Option::None then FnBody::None
+        end
+        Option::Some(make_item(ItemKind::Function(FunctionDecl {
+          vis: vis,
+          name: test_name,
+          generic_params: Vec::new(),
+          params: Vec::new(),
+          ret_type: Option::None,
+          where_clause: Vec::new(),
+          body: body,
+          is_async: false,
+          is_unsafe: false,
+          is_const: false,
+          is_inline: false,
+          is_pure: false,
+          contracts: Vec::new(),
+          budget: Option::None,
+          required_caps: Vec::new(),
+          effects: Vec::new(),
+          span: span_merge(start, peek_span(p))
+        }), span_merge(start, peek_span(p))))
+      else
+        let span = peek_span(p)
+        diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected item", span)
+        Option::None
+      end
+    when _ then
+      let span = peek_span(p)
+      diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected item", span)
+      Option::None
+    end
   end
 
   match result
@@ -546,6 +621,7 @@ def parse_use_decl(p: &mut Parser, start: Span) -> Option[UseDecl]
       # Check for destructuring import: use path::{A, B, C}
       if at(p, TokenKind::LBrace) then
         advance(p)
+        skip_newlines(p)
         mut names = Vec::new()
         if !at(p, TokenKind::RBrace) then
           match expect_ident(p)
@@ -554,6 +630,7 @@ def parse_use_decl(p: &mut Parser, start: Span) -> Option[UseDecl]
           end
           while at(p, TokenKind::Comma) do
             advance(p)
+            skip_newlines(p)
             if at(p, TokenKind::RBrace) then break end
             match expect_ident(p)
             when Option::Some(name) then names.push(name)
@@ -561,6 +638,7 @@ def parse_use_decl(p: &mut Parser, start: Span) -> Option[UseDecl]
             end
           end
         end
+        skip_newlines(p)
         expect(p, TokenKind::RBrace)
         eat_optional_semi(p)
         return Option::Some(UseDecl {
@@ -603,6 +681,12 @@ def parse_path(p: &mut Parser) -> Option[Path]
     segments.push(first)
     
     while at(p, TokenKind::ColonColon) do
+      let next_kind = if p.pos + 1 < p.tokens.len() then p.tokens[p.pos + 1].kind else TokenKind::Eof end
+      match next_kind
+      when TokenKind::LBrace then break
+      when TokenKind::Star then break
+      when _ then ()
+      end
       advance(p)
       match expect_ident(p)
       when Option::Some(seg) then
@@ -623,12 +707,72 @@ def expect_ident(p: &mut Parser) -> Option[String]
   when TokenKind::Ident(name) then
     advance(p)
     Option::Some(name)
+  when TokenKind::Module then
+    advance(p)
+    Option::Some("module")
   when TokenKind::Self_ then
     advance(p)
     Option::Some("self")
   when TokenKind::SelfType then
     advance(p)
     Option::Some("Self")
+  when TokenKind::Drop then
+    advance(p)
+    Option::Some("drop")
+  when TokenKind::Async then
+    advance(p)
+    Option::Some("async")
+  when TokenKind::Next then
+    advance(p)
+    Option::Some("next")
+  when TokenKind::Type then
+    advance(p)
+    Option::Some("type")
+  when TokenKind::Cap then
+    advance(p)
+    Option::Some("cap")
+  when TokenKind::Requires then
+    advance(p)
+    Option::Some("requires")
+  when TokenKind::Ensures then
+    advance(p)
+    Option::Some("ensures")
+  when TokenKind::Invariant then
+    advance(p)
+    Option::Some("invariant")
+  when TokenKind::Budget then
+    advance(p)
+    Option::Some("budget")
+  when TokenKind::Move then
+    advance(p)
+    Option::Some("move")
+  when TokenKind::Own then
+    advance(p)
+    Option::Some("own")
+  when TokenKind::Pre then
+    advance(p)
+    Option::Some("pre")
+  when TokenKind::Post then
+    advance(p)
+    Option::Some("post")
+  when TokenKind::Effect then
+    advance(p)
+    Option::Some("effect")
+  when TokenKind::Pure then
+    advance(p)
+    Option::Some("pure")
+  when TokenKind::Ref then
+    advance(p)
+    Option::Some("ref")
+  when TokenKind::Copy then
+    advance(p)
+    Option::Some("copy")
+  when TokenKind::Inline then
+    advance(p)
+    Option::Some("inline")
+  when TokenKind::Edition then
+    advance(p)
+    Option::Some("edition")
   when _ then
     let span = peek_span(p)
     diag_error(&mut p.diag, ErrorCode::E103ExpectedIdent, "expected identifier", span)
@@ -1023,6 +1167,7 @@ end
 
 def parse_param_list(p: &mut Parser) -> Vec[Param]
   mut params = Vec::new()
+  skip_newlines(p)
   if at(p, TokenKind::RParen) then
     return params
   end
@@ -1034,12 +1179,15 @@ def parse_param_list(p: &mut Parser) -> Vec[Param]
   
   while at(p, TokenKind::Comma) do
     advance(p)
+    skip_newlines(p)
+    if at(p, TokenKind::RParen) then break end
     match parse_param(p)
     when Option::Some(param) then params.push(param)
     when Option::None then break
     end
   end
   
+  skip_newlines(p)
   params
 end
 
@@ -1218,6 +1366,28 @@ def parse_enum_decl(p: &mut Parser, vis: Visibility, start: Span, derives: Vec[S
   end
 end
 
+def parse_variant_field(p: &mut Parser) -> Option[TypeExpr]
+  # variant_field = [ IDENT ':' ] type_expr
+  # Check if this is a named field (lookahead for Ident Colon)
+  let saved = p.pos
+  match peek(p)
+  when TokenKind::Ident(_) then
+    if p.pos + 1 < p.tokens.len() then
+      match p.tokens[p.pos + 1].kind
+      when TokenKind::Colon then
+        # Named field — skip name and colon, then parse the type
+        advance(p)
+        advance(p)
+        return parse_type(p)
+      when _ then ()
+      end
+    end
+  when _ then ()
+  end
+  # Positional field — just a type
+  parse_type(p)
+end
+
 def parse_variant_decl(p: &mut Parser) -> Option[VariantDecl]
   let start = peek_span(p)
   match expect_ident(p)
@@ -1226,13 +1396,13 @@ def parse_variant_decl(p: &mut Parser) -> Option[VariantDecl]
     if at(p, TokenKind::LParen) then
       advance(p)
       if !at(p, TokenKind::RParen) then
-        match parse_type(p)
+        match parse_variant_field(p)
         when Option::Some(ty) then fields.push(ty)
         when Option::None then ()
         end
         while at(p, TokenKind::Comma) do
           advance(p)
-          match parse_type(p)
+          match parse_variant_field(p)
           when Option::Some(ty) then fields.push(ty)
           when Option::None then break
           end
@@ -1287,10 +1457,26 @@ def parse_trait_decl(p: &mut Parser, vis: Visibility, start: Span) -> Option[Tra
         match parse_function_sig(p)
         when Option::Some(sig) then
           # Check for default method body
-          let default_body = if at(p, TokenKind::Do) then
-            # Parse a block body as the default implementation
+          # A default body starts either with 'do' or on the next line (not 'end'/'def'/EOF)
+          let saved_pos = p.pos
+          skip_newlines(p)
+          let has_body = if at(p, TokenKind::End) || at(p, TokenKind::Def) || at(p, TokenKind::Eof) then
+            # No body — just a method signature
+            p.pos = saved_pos
+            false
+          elsif at_keyword(p, "type") then
+            p.pos = saved_pos
+            false
+          else
+            # There's a body — restore position for parse_block_body
+            p.pos = saved_pos
+            true
+          end
+          let default_body = if has_body then
             match parse_block_body(p)
-            when Option::Some(body) then Option::Some(body)
+            when Option::Some(body) then
+              expect_end(p)
+              Option::Some(body)
             when Option::None then Option::None
             end
           else
@@ -1372,9 +1558,16 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def parse_impl_decl(p: &mut Parser, start: Span) -> Option[ImplDecl]
+  # Support impl[T] Trait for Type syntax (leading generics)
+  let leading_generics = if at(p, TokenKind::LBracket) then
+    parse_generic_params(p)
+  else
+    Vec::new()
+  end
   match expect_ident(p)
   when Option::Some(first_name) then
-    let generic_params = parse_generic_params(p)
+    let type_generics = parse_generic_params(p)
+    let generic_params = if leading_generics.len() > 0 then leading_generics else type_generics end
     
     # Check if this is `impl Trait for Type` or `impl Type` (inherent)
     if at(p, TokenKind::For) then
@@ -1382,28 +1575,43 @@ def parse_impl_decl(p: &mut Parser, start: Span) -> Option[ImplDecl]
       advance(p)
       match parse_type(p)
       when Option::Some(for_type) then
-        parse_impl_body(p, start, generic_params, Option::Some(first_name), for_type)
+        # Parse optional where clause
+        let where_preds = if at_keyword(p, "where") then
+          advance(p)
+          parse_where_predicates(p)
+        else
+          Vec::new()
+        end
+        parse_impl_body_with_where(p, start, generic_params, Option::Some(first_name), for_type, where_preds)
       when Option::None then Option::None
       end
     else
       # Inherent impl: impl Type
       mut type_args = Vec::new()
       for g in generic_params do
-        type_args.push(TypeExpr::Named(g.name.clone(), Vec::new()))
+        type_args.push(make_type_expr(TypeExprKind::Named(g.name.clone(), Vec::new()), start))
       end
-      let for_type = TypeExpr::Named(first_name, type_args)
-      parse_impl_body(p, start, generic_params, Option::None, for_type)
+      let for_type = make_type_expr(TypeExprKind::Named(first_name, type_args), start)
+      # Parse optional where clause for inherent impl
+      let where_preds = if at_keyword(p, "where") then
+        advance(p)
+        parse_where_predicates(p)
+      else
+        Vec::new()
+      end
+      parse_impl_body_with_where(p, start, generic_params, Option::None, for_type, where_preds)
     end
   when Option::None then Option::None
   end
 end
 
-def parse_impl_body(
+def parse_impl_body_with_where(
   p: &mut Parser, 
   start: Span, 
   generic_params: Vec[GenericParam],
   trait_name: Option[String],
-  for_type: TypeExpr
+  for_type: TypeExpr,
+  where_clause: Vec[WherePredicate]
 ) -> Option[ImplDecl]
   skip_newlines(p)
   
@@ -1447,7 +1655,7 @@ def parse_impl_body(
     generic_params: generic_params,
     trait_name: trait_name,
     for_type: for_type,
-    where_clause: Vec::new(),
+    where_clause: where_clause,
     methods: methods,
     assoc_types: assoc_types,
     span: span_merge(start, peek_span(p))
@@ -1649,9 +1857,29 @@ def parse_rationale_block(p: &mut Parser, start: Span) -> Option[RationaleBlock]
       span: span_merge(start, peek_span(p))
     })
   when _ then
-    let span = peek_span(p)
-    diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected string after 'rationale'", span)
-    Option::None
+    # Compatibility mode: consume rationale key/value block until `end`.
+    mut body = ""
+    while !at(p, TokenKind::End) && !at(p, TokenKind::Eof) do
+      match peek(p)
+      when TokenKind::StringLit(s) then
+        if body == "" then body = s else body = body + "\n" + s end
+      when TokenKind::Ident(k) then
+        if body == "" then body = k else body = body + "\n" + k end
+      when TokenKind::Colon then
+        body = body + ":"
+      when _ then ()
+      end
+      advance(p)
+    end
+    if at(p, TokenKind::End) then advance(p) end
+    eat_optional_semi(p)
+    Option::Some(RationaleBlock {
+      title: "rationale",
+      body: body,
+      author: Option::None,
+      tags: Vec::new(),
+      span: span_merge(start, peek_span(p))
+    })
   end
 end
 
@@ -1669,6 +1897,81 @@ def parse_edition_decl(p: &mut Parser, start: Span) -> Option[EditionDecl]
     diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected edition string", span)
     Option::None
   end
+end
+
+def parse_extern_dispatch(p: &mut Parser, start: Span) -> Option[Item]
+  # Check for optional ABI string: extern "C" def ...
+  let extern_abi = match peek(p)
+  when TokenKind::StringLit(s) then
+    advance(p)
+    skip_newlines(p)
+    Option::Some(s)
+  when _ then Option::None
+  end
+  # Standalone extern def: extern [abi] def foo() -> T (no end block)
+  if at(p, TokenKind::Def) then
+    advance(p)
+    match parse_extern_fn(p)
+    when Option::Some(f) then
+      let ext = ExternBlock {
+        abi: extern_abi,
+        items: Vec::from([ExternItem::Function(f)]),
+        span: span_merge(start, peek_span(p))
+      }
+      Option::Some(make_item(ItemKind::ExternBlock(ext), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  # Standalone extern static: extern [abi] static ...
+  elsif at(p, TokenKind::Static) then
+    advance(p)
+    match parse_extern_static(p)
+    when Option::Some(s) then
+      let ext = ExternBlock {
+        abi: extern_abi,
+        items: Vec::from([ExternItem::Static(s)]),
+        span: span_merge(start, peek_span(p))
+      }
+      Option::Some(make_item(ItemKind::ExternBlock(ext), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  else
+    # Full extern block: extern [abi] ... end
+    match parse_extern_block_with_abi(p, start, extern_abi)
+    when Option::Some(e) then
+      Option::Some(make_item(ItemKind::ExternBlock(e), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  end
+end
+
+def parse_extern_block_with_abi(p: &mut Parser, start: Span, abi: Option[String]) -> Option[ExternBlock]
+  skip_newlines(p)
+  mut items = Vec::new()
+  while !at(p, TokenKind::End) && !at(p, TokenKind::Eof) do
+    skip_newlines(p)
+    if at(p, TokenKind::End) then break end
+    if at(p, TokenKind::Def) then
+      advance(p)
+      match parse_extern_fn(p)
+      when Option::Some(f) then items.push(ExternItem::Function(f))
+      when Option::None then synchronize(p)
+      end
+    elsif at(p, TokenKind::Static) then
+      advance(p)
+      match parse_extern_static(p)
+      when Option::Some(s) then items.push(ExternItem::Static(s))
+      when Option::None then synchronize(p)
+      end
+    else
+      synchronize(p)
+    end
+  end
+  expect_end(p)
+  Option::Some(ExternBlock {
+    abi: abi,
+    items: items,
+    span: span_merge(start, peek_span(p))
+  })
 end
 
 def parse_extern_block(p: &mut Parser, start: Span) -> Option[ExternBlock]
@@ -1913,9 +2216,27 @@ def parse_type(p: &mut Parser) -> Option[TypeExpr]
       Option::Some(base_ty)
     end
   when TokenKind::SelfType then
-    # Self type parsing
+    # Self type parsing, including Self::AssocType paths
     advance(p)
-    Option::Some(make_type_expr(TypeExprKind::Named("Self".to_string(), Vec::new()), span_merge(start, peek_span(p))))
+    if at(p, TokenKind::ColonColon) then
+      advance(p)
+      mut segments = Vec::new()
+      segments.push("Self".to_string())
+      match expect_ident(p)
+      when Option::Some(seg) then segments.push(seg)
+      when Option::None then ()
+      end
+      while at(p, TokenKind::ColonColon) do
+        advance(p)
+        match expect_ident(p)
+        when Option::Some(seg) then segments.push(seg)
+        when Option::None then break
+        end
+      end
+      Option::Some(make_type_expr(TypeExprKind::Path(make_path(segments, span_merge(start, peek_span(p)))), span_merge(start, peek_span(p))))
+    else
+      Option::Some(make_type_expr(TypeExprKind::Named("Self".to_string(), Vec::new()), span_merge(start, peek_span(p))))
+    end
   when _ then
     diag_error(&mut p.diag, ErrorCode::E102ExpectedType, "expected type", start)
     Option::None
@@ -1928,23 +2249,34 @@ end
 
 def parse_block_body(p: &mut Parser) -> Option[Block]
   skip_newlines(p)
+  skip_doc_comments(p)
   let start = peek_span(p)
   mut stmts = Vec::new()
   
   while !at(p, TokenKind::End) && !at(p, TokenKind::Eof) 
       && !at(p, TokenKind::Elsif) && !at(p, TokenKind::Else) 
-      && !at(p, TokenKind::When) do
+      && !at(p, TokenKind::When) && !at(p, TokenKind::Catch)
+      && !at(p, TokenKind::Finally) && !at(p, TokenKind::With) do
     skip_newlines(p)
+    skip_doc_comments(p)
     if at(p, TokenKind::End) || at(p, TokenKind::Eof) 
         || at(p, TokenKind::Elsif) || at(p, TokenKind::Else) 
-        || at(p, TokenKind::When) then
+        || at(p, TokenKind::When) || at(p, TokenKind::Catch)
+        || at(p, TokenKind::Finally) || at(p, TokenKind::With) then
       break
     end
+    let before_pos = p.pos
     match parse_stmt(p)
     when Option::Some(s) then stmts.push(s)
-    when Option::None then synchronize(p)
+    when Option::None then
+      synchronize(p)
+      # If synchronize made no progress, force advance to prevent infinite loop
+      if p.pos == before_pos then
+        advance(p)
+      end
     end
     skip_newlines(p)
+    skip_doc_comments(p)
   end
   
   Option::Some(make_block(stmts, span_merge(start, peek_span(p))))
@@ -1956,8 +2288,8 @@ def parse_stmt(p: &mut Parser) -> Option[Stmt]
   match peek(p)
   when TokenKind::Let then
     advance(p)
-    match expect_ident(p)
-    when Option::Some(name) then
+    match parse_pattern(p)
+    when Option::Some(pat) then
       let ty = if at(p, TokenKind::Colon) then
         advance(p)
         parse_type(p)
@@ -1968,7 +2300,6 @@ def parse_stmt(p: &mut Parser) -> Option[Stmt]
       match parse_expr(p)
       when Option::Some(value) then
         eat_optional_semi(p)
-        let pat = make_pattern(PatternKind::Ident(name, false), span_merge(start, peek_span(p)))
         Option::Some(make_stmt(StmtKind::Let(pat, ty, value, false), span_merge(start, peek_span(p))))
       when Option::None then Option::None
       end
@@ -1992,6 +2323,23 @@ def parse_stmt(p: &mut Parser) -> Option[Stmt]
         Option::Some(make_stmt(StmtKind::Let(pat, ty, value, true), span_merge(start, peek_span(p))))
       when Option::None then Option::None
       end
+    when Option::None then Option::None
+    end
+  when TokenKind::Use then
+    advance(p)
+    match parse_use_decl(p, start)
+    when Option::Some(_) then
+      eat_optional_semi(p)
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  when TokenKind::Budget then
+    advance(p)
+    match parse_budget_annotation(p, start)
+    when Option::Some(_) then
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
     when Option::None then Option::None
     end
   when TokenKind::Return then
@@ -2202,17 +2550,111 @@ def parse_stmt(p: &mut Parser) -> Option[Stmt]
     when Option::Some(s) then Option::Some(s)
     when Option::None then Option::None
     end
+  when TokenKind::Struct then
+    # Nested struct definition inside a block
+    advance(p)
+    match parse_struct_decl(p, Visibility::Private, start, Vec::new())
+    when Option::Some(_) then
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  when TokenKind::Enum then
+    # Nested enum definition inside a block
+    advance(p)
+    match parse_enum_decl(p, Visibility::Private, start, Vec::new())
+    when Option::Some(_) then
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  when TokenKind::Impl then
+    # Nested impl block inside a function body
+    advance(p)
+    match parse_impl_decl(p, start)
+    when Option::Some(_) then
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
+  when TokenKind::At then
+    # Attributes before a nested statement (e.g., @requires on a local def)
+    let attrs = parse_attributes(p)
+    skip_newlines(p)
+    if at(p, TokenKind::Def) then
+      advance(p)
+      let fn_start = peek_span(p)
+      match parse_function_decl(p, Visibility::Private, fn_start)
+      when Option::Some(_) then
+        let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+        Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+      when Option::None then Option::None
+      end
+    else
+      # Attribute on a non-def statement — just continue parsing the inner statement
+      parse_stmt(p)
+    end
+  when TokenKind::Def then
+    # Nested function definition (local def inside a block)
+    advance(p)
+    let fn_start = peek_span(p)
+    match parse_function_decl(p, Visibility::Private, fn_start)
+    when Option::Some(_) then
+      let noop = make_expr(ExprKind::NilLit, span_merge(start, peek_span(p)))
+      Option::Some(make_stmt(StmtKind::Expr(noop), span_merge(start, peek_span(p))))
+    when Option::None then Option::None
+    end
   when _ then
     # Expression statement
     match parse_expr(p)
     when Option::Some(expr) then
-      # Check for assignment
+      # Check for assignment or compound assignment
       if at(p, TokenKind::Eq) then
         advance(p)
         match parse_expr(p)
         when Option::Some(value) then
           eat_optional_semi(p)
           Option::Some(make_stmt(StmtKind::Assign(expr, value), span_merge(start, peek_span(p))))
+        when Option::None then Option::None
+        end
+      elsif at(p, TokenKind::PlusEq) then
+        advance(p)
+        match parse_expr(p)
+        when Option::Some(value) then
+          eat_optional_semi(p)
+          Option::Some(make_stmt(StmtKind::CompoundAssign(BinOp::Add, expr, value), span_merge(start, peek_span(p))))
+        when Option::None then Option::None
+        end
+      elsif at(p, TokenKind::MinusEq) then
+        advance(p)
+        match parse_expr(p)
+        when Option::Some(value) then
+          eat_optional_semi(p)
+          Option::Some(make_stmt(StmtKind::CompoundAssign(BinOp::Sub, expr, value), span_merge(start, peek_span(p))))
+        when Option::None then Option::None
+        end
+      elsif at(p, TokenKind::StarEq) then
+        advance(p)
+        match parse_expr(p)
+        when Option::Some(value) then
+          eat_optional_semi(p)
+          Option::Some(make_stmt(StmtKind::CompoundAssign(BinOp::Mul, expr, value), span_merge(start, peek_span(p))))
+        when Option::None then Option::None
+        end
+      elsif at(p, TokenKind::SlashEq) then
+        advance(p)
+        match parse_expr(p)
+        when Option::Some(value) then
+          eat_optional_semi(p)
+          Option::Some(make_stmt(StmtKind::CompoundAssign(BinOp::Div, expr, value), span_merge(start, peek_span(p))))
+        when Option::None then Option::None
+        end
+      elsif at(p, TokenKind::PercentEq) then
+        advance(p)
+        match parse_expr(p)
+        when Option::Some(value) then
+          eat_optional_semi(p)
+          Option::Some(make_stmt(StmtKind::CompoundAssign(BinOp::Mod, expr, value), span_merge(start, peek_span(p))))
         when Option::None then Option::None
         end
       else
@@ -2316,6 +2758,23 @@ def parse_match_expr(p: &mut Parser) -> Option[MatchExpr]
         when Option::None then break
         end
       when Option::None then break
+      end
+    end
+    
+    # Support else as catch-all arm: match x ... else body end
+    if at(p, TokenKind::Else) then
+      advance(p)
+      skip_newlines(p)
+      match parse_block_body(p)
+      when Option::Some(body) then
+        let wildcard = make_pattern(PatternKind::Wildcard, peek_span(p))
+        arms.push(MatchArm {
+          pattern: wildcard,
+          guard: Option::None,
+          body: body,
+          span: span_merge(start, peek_span(p))
+        })
+      when Option::None then ()
       end
     end
     
@@ -2679,6 +3138,9 @@ def parse_single_pattern(p: &mut Parser) -> Option[Pattern]
         Option::Some(make_pattern(PatternKind::Ident(name, false), start))
       end
     end
+  when TokenKind::Module then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("module", false), span_merge(start, peek_span(p))))
   when TokenKind::Mut then
     advance(p)
     match expect_ident(p)
@@ -2693,6 +3155,10 @@ def parse_single_pattern(p: &mut Parser) -> Option[Pattern]
   when TokenKind::StringLit(s) then
     advance(p)
     let expr = make_expr(ExprKind::StringLit(s), start)
+    Option::Some(make_pattern(PatternKind::Literal(expr), start))
+  when TokenKind::CharLit(c) then
+    advance(p)
+    let expr = make_expr(ExprKind::CharLit(c), start)
     Option::Some(make_pattern(PatternKind::Literal(expr), start))
   when TokenKind::True then
     advance(p)
@@ -2742,6 +3208,61 @@ def parse_single_pattern(p: &mut Parser) -> Option[Pattern]
     end
     expect(p, TokenKind::RParen)
     Option::Some(make_pattern(PatternKind::Tuple(pats), span_merge(start, peek_span(p))))
+  # Contextual keywords that can be used as identifiers in patterns
+  when TokenKind::Drop then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("drop", false), start))
+  when TokenKind::Async then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("async", false), start))
+  when TokenKind::Next then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("next", false), start))
+  when TokenKind::Type then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("type", false), start))
+  when TokenKind::Cap then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("cap", false), start))
+  when TokenKind::Requires then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("requires", false), start))
+  when TokenKind::Ensures then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("ensures", false), start))
+  when TokenKind::Invariant then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("invariant", false), start))
+  when TokenKind::Budget then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("budget", false), start))
+  when TokenKind::Move then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("move", false), start))
+  when TokenKind::Own then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("own", false), start))
+  when TokenKind::Pre then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("pre", false), start))
+  when TokenKind::Post then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("post", false), start))
+  when TokenKind::Effect then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("effect", false), start))
+  when TokenKind::Pure then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("pure", false), start))
+  when TokenKind::Copy then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("copy", false), start))
+  when TokenKind::Inline then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("inline", false), start))
+  when TokenKind::Edition then
+    advance(p)
+    Option::Some(make_pattern(PatternKind::Ident("edition", false), start))
   when _ then
     diag_error(&mut p.diag, ErrorCode::E104ExpectedPattern, "expected pattern", start)
     Option::None
@@ -2763,6 +3284,7 @@ def parse_or(p: &mut Parser) -> Option[Expr]
     while at(p, TokenKind::Or) do
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_and(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(BinOp::Or, result, right), span_merge(start, right.span))
@@ -2781,6 +3303,7 @@ def parse_and(p: &mut Parser) -> Option[Expr]
     while at(p, TokenKind::And) do
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_range(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(BinOp::And, result, right), span_merge(start, right.span))
@@ -2830,13 +3353,19 @@ def parse_equality(p: &mut Parser) -> Option[Expr]
   when Option::Some(left) then
     mut result = left
     while true do
+      # Check for operator — also look across newlines for leading operator continuation
+      let saved = p.pos
+      skip_newlines(p)
       let op = match peek(p)
       when TokenKind::EqEq then BinOp::Eq
       when TokenKind::BangEq then BinOp::Ne
-      when _ then break
+      when _ then
+        p.pos = saved
+        break
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_comparison(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(op, result, right), span_merge(start, right.span))
@@ -2862,6 +3391,7 @@ def parse_comparison(p: &mut Parser) -> Option[Expr]
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_bitwise_or(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(op, result, right), span_merge(start, right.span))
@@ -2883,6 +3413,7 @@ def parse_bitwise_or(p: &mut Parser) -> Option[Expr]
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_bitwise_xor(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(BinOp::BitOr, result, right), span_merge(start, right.span))
@@ -2901,6 +3432,7 @@ def parse_bitwise_xor(p: &mut Parser) -> Option[Expr]
     while at(p, TokenKind::Caret) do
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_bitwise_and(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(BinOp::BitXor, result, right), span_merge(start, right.span))
@@ -2919,6 +3451,7 @@ def parse_bitwise_and(p: &mut Parser) -> Option[Expr]
     while at(p, TokenKind::Amp) do
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_shift(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(BinOp::BitAnd, result, right), span_merge(start, right.span))
@@ -2942,6 +3475,7 @@ def parse_shift(p: &mut Parser) -> Option[Expr]
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_term(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(op, result, right), span_merge(start, right.span))
@@ -2965,6 +3499,7 @@ def parse_term(p: &mut Parser) -> Option[Expr]
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_factor(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(op, result, right), span_merge(start, right.span))
@@ -2990,6 +3525,7 @@ def parse_factor(p: &mut Parser) -> Option[Expr]
       end
       let start = result.span
       advance(p)
+      skip_newlines(p)
       match parse_unary(p)
       when Option::Some(right) then
         result = make_expr(ExprKind::BinaryOp(op, result, right), span_merge(start, right.span))
@@ -3080,7 +3616,15 @@ def parse_postfix(p: &mut Parser) -> Option[Expr]
       when TokenKind::Dot then
         let start = result.span
         advance(p)
-        match expect_ident(p)
+        # Support both named field access and tuple index access (.0, .1)
+        let field_opt = match peek(p)
+        when TokenKind::IntLit(n) then
+          advance(p)
+          Option::Some(n.to_string())
+        when _ then
+          expect_ident(p)
+        end
+        match field_opt
         when Option::Some(field) then
           if at(p, TokenKind::LParen) then
             advance(p)
@@ -3159,22 +3703,40 @@ def parse_postfix(p: &mut Parser) -> Option[Expr]
   end
 end
 
+def skip_named_arg_label(p: &mut Parser)
+  # If we see Ident followed by Colon, treat as named argument label and skip both.
+  match peek(p)
+  when TokenKind::Ident(_) then
+    if p.pos + 1 < p.tokens.len() && p.tokens[p.pos + 1].kind == TokenKind::Colon then
+      advance(p)
+      advance(p)
+    end
+  when _ then ()
+  end
+end
+
 def parse_arg_list(p: &mut Parser) -> Vec[Expr]
   mut args = Vec::new()
+  skip_newlines(p)
   if at(p, TokenKind::RParen) then
     return args
   end
+  skip_named_arg_label(p)
   match parse_expr(p)
   when Option::Some(arg) then args.push(arg)
   when Option::None then ()
   end
   while at(p, TokenKind::Comma) do
     advance(p)
+    skip_newlines(p)
+    if at(p, TokenKind::RParen) then break end
+    skip_named_arg_label(p)
     match parse_expr(p)
     when Option::Some(arg) then args.push(arg)
     when Option::None then break
     end
   end
+  skip_newlines(p)
   args
 end
 
@@ -3279,8 +3841,108 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
   when TokenKind::Self_ then
     advance(p)
     Option::Some(make_expr(ExprKind::SelfRef, start))
+  when TokenKind::Module then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("module"), start))
+  when TokenKind::Drop then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("drop"), start))
+  when TokenKind::Cap then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("cap"), start))
+  when TokenKind::Requires then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("requires"), start))
+  when TokenKind::Ensures then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("ensures"), start))
+  when TokenKind::Invariant then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("invariant"), start))
+  when TokenKind::Move then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("move"), start))
+  when TokenKind::Own then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("own"), start))
+  when TokenKind::Pre then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("pre"), start))
+  when TokenKind::Post then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("post"), start))
+  when TokenKind::Effect then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("effect"), start))
+  when TokenKind::Pure then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("pure"), start))
+  when TokenKind::Ref then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("ref"), start))
+  when TokenKind::Copy then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("copy"), start))
+  when TokenKind::Inline then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("inline"), start))
+  when TokenKind::Edition then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("edition"), start))
+  when TokenKind::Next then
+    advance(p)
+    Option::Some(make_expr(ExprKind::Ident("next"), start))
   when TokenKind::Ident(name) then
     advance(p)
+    # Macro invocation: name![args] or name!(args)
+    if at(p, TokenKind::Bang) then
+      let bang_pos = p.pos
+      advance(p)
+      if at(p, TokenKind::LBracket) then
+        advance(p)
+        skip_newlines(p)
+        mut args = Vec::new()
+        if !at(p, TokenKind::RBracket) then
+          match parse_expr(p)
+          when Option::Some(e) then args.push(e)
+          when Option::None then ()
+          end
+          while at(p, TokenKind::Comma) do
+            advance(p)
+            skip_newlines(p)
+            if at(p, TokenKind::RBracket) then break end
+            match parse_expr(p)
+            when Option::Some(e) then args.push(e)
+            when Option::None then break
+            end
+          end
+        end
+        skip_newlines(p)
+        expect(p, TokenKind::RBracket)
+        return Option::Some(make_expr(ExprKind::MacroCall(name, args), span_merge(start, peek_span(p))))
+      elsif at(p, TokenKind::LParen) then
+        advance(p)
+        let args = parse_arg_list(p)
+        expect(p, TokenKind::RParen)
+        return Option::Some(make_expr(ExprKind::MacroCall(name, args), span_merge(start, peek_span(p))))
+      else
+        # Not a macro call — backtrack past the bang
+        p.pos = bang_pos
+      end
+    end
+    let struct_start_pos = p.pos
+    skip_newlines(p)
+    let is_end_struct_lit = match peek(p)
+    when TokenKind::Ident(_) then
+      if p.pos + 1 < p.tokens.len() then
+        p.tokens[p.pos + 1].kind == TokenKind::Colon
+      else
+        false
+      end
+    when _ then false
+    end
+    p.pos = struct_start_pos
+
     if at(p, TokenKind::ColonColon) then
       mut segments = Vec::new()
       segments.push(name)
@@ -3336,6 +3998,34 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
       expect(p, TokenKind::RBrace)
       let path = make_path(Vec::from([name]), start)
       Option::Some(make_expr(ExprKind::StructLit(path, fields), span_merge(start, peek_span(p))))
+    elsif is_end_struct_lit then
+      let saved_pos = p.pos
+      skip_newlines(p)
+      mut fields = Vec::new()
+      while !at(p, TokenKind::End) && !at(p, TokenKind::Eof) do
+        match expect_ident(p)
+        when Option::Some(fname) then
+          expect(p, TokenKind::Colon)
+          match parse_expr(p)
+          when Option::Some(fval) then
+            fields.push((fname, fval))
+          when Option::None then
+            p.pos = saved_pos
+            return Option::Some(make_expr(ExprKind::Ident(name), start))
+          end
+        when Option::None then
+          p.pos = saved_pos
+          return Option::Some(make_expr(ExprKind::Ident(name), start))
+        end
+        skip_newlines(p)
+        if at(p, TokenKind::Comma) then
+          advance(p)
+          skip_newlines(p)
+        end
+      end
+      expect_end(p)
+      let path = make_path(Vec::from([name]), start)
+      Option::Some(make_expr(ExprKind::StructLit(path, fields), span_merge(start, peek_span(p))))
     else
       Option::Some(make_expr(ExprKind::Ident(name), start))
     end
@@ -3369,6 +4059,7 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
     end
   when TokenKind::LBracket then
     advance(p)
+    skip_newlines(p)
     mut elems = Vec::new()
     if !at(p, TokenKind::RBracket) then
       match parse_expr(p)
@@ -3377,6 +4068,7 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
       end
       while at(p, TokenKind::Comma) do
         advance(p)
+        skip_newlines(p)
         if at(p, TokenKind::RBracket) then break end
         match parse_expr(p)
         when Option::Some(e) then elems.push(e)
@@ -3384,6 +4076,7 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
         end
       end
     end
+    skip_newlines(p)
     expect(p, TokenKind::RBracket)
     Option::Some(make_expr(ExprKind::ArrayLit(elems), span_merge(start, peek_span(p))))
   when TokenKind::LBrace then
@@ -3483,6 +4176,16 @@ def parse_primary(p: &mut Parser) -> Option[Expr]
     advance(p)
     let params = parse_closure_params(p)
     expect(p, TokenKind::Pipe)
+    let ret_type = parse_closure_return_type(p)
+    match parse_expr(p)
+    when Option::Some(body) then
+      Option::Some(make_expr(ExprKind::Closure(params, ret_type, body), span_merge(start, body.span)))
+    when Option::None then Option::None
+    end
+  when TokenKind::Or then
+    # Empty-param closure: || expr
+    advance(p)
+    let params = Vec::new()
     let ret_type = parse_closure_return_type(p)
     match parse_expr(p)
     when Option::Some(body) then

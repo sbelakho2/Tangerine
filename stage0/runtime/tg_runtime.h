@@ -43,6 +43,7 @@ static inline double tg_to_double(TgVal v) {
 
 void tg_panic(const char* msg);
 void tg_assert(TgVal cond, const char* msg);
+TgVal tg_debug_val(TgVal v);
 
 /* ── Memory allocation ─────────────────────────────────────────────── */
 
@@ -70,8 +71,8 @@ int64_t tg_str_len(TgVal s);
 TgVal   tg_str_is_empty(TgVal s);
 
 /* Mutation */
-void tg_str_push_char(TgVal s, TgVal ch);
-void tg_str_push_str(TgVal s, TgVal other);
+TgVal tg_str_push_char(TgVal s, TgVal ch);
+TgVal tg_str_push_str(TgVal s, TgVal other);
 
 /* Concatenation (returns new string) */
 TgVal tg_str_concat(TgVal a, TgVal b);
@@ -98,6 +99,8 @@ TgVal tg_str_lines(TgVal s);
 /* Comparison */
 TgVal tg_str_eq(TgVal a, TgVal b);
 TgVal tg_str_neq(TgVal a, TgVal b);
+TgVal tg_val_eq(TgVal a, TgVal b);
+TgVal tg_val_neq(TgVal a, TgVal b);
 TgVal tg_str_cmp(TgVal a, TgVal b);
 int64_t tg_str_hash(TgVal s);
 
@@ -136,26 +139,26 @@ TgVal   tg_vec_is_empty(TgVal v);
 
 /* Element access */
 TgVal tg_vec_get(TgVal v, TgVal idx);
-void  tg_vec_set(TgVal v, TgVal idx, TgVal val);
+TgVal tg_vec_set(TgVal v, TgVal idx, TgVal val);
 TgVal tg_vec_last(TgVal v);
 
 /* Mutation */
-void  tg_vec_push(TgVal v, TgVal item);
+TgVal tg_vec_push(TgVal v, TgVal item);
 TgVal tg_vec_pop(TgVal v);
-void  tg_vec_insert(TgVal v, TgVal idx, TgVal item);
+TgVal tg_vec_insert(TgVal v, TgVal idx, TgVal item);
 TgVal tg_vec_remove(TgVal v, TgVal idx);
-void  tg_vec_clear(TgVal v);
-void  tg_vec_truncate(TgVal v, TgVal new_len);
-void  tg_vec_reverse(TgVal v);
-void  tg_vec_extend(TgVal v, TgVal other);
-void  tg_vec_extend_from_slice(TgVal v, TgVal other);
+TgVal tg_vec_clear(TgVal v);
+TgVal tg_vec_truncate(TgVal v, TgVal new_len);
+TgVal tg_vec_reverse(TgVal v);
+TgVal tg_vec_extend(TgVal v, TgVal other);
+TgVal tg_vec_extend_from_slice(TgVal v, TgVal other);
 
 /* Queries */
 TgVal tg_vec_contains(TgVal v, TgVal item);
 
 /* Sorting */
-void tg_vec_sort(TgVal v);
-void tg_vec_sort_by(TgVal v, TgVal cmp_fn);
+TgVal tg_vec_sort(TgVal v);
+TgVal tg_vec_sort_by(TgVal v, TgVal cmp_fn);
 
 /* Iteration / functional */
 TgVal tg_vec_map(TgVal v, TgVal fn);
@@ -199,7 +202,7 @@ int64_t tg_map_len(TgVal m);
 TgVal   tg_map_is_empty(TgVal m);
 
 /* Access */
-void  tg_map_insert(TgVal m, TgVal key, TgVal value);
+TgVal tg_map_insert(TgVal m, TgVal key, TgVal value);
 TgVal tg_map_get(TgVal m, TgVal key);
 TgVal tg_map_get_mut(TgVal m, TgVal key);
 TgVal tg_map_contains_key(TgVal m, TgVal key);
@@ -236,8 +239,8 @@ TgVal tg_set_into_vec(TgVal s);
 /* ── Option ────────────────────────────────────────────────────────── */
 
 typedef struct TgOption {
+    int64_t _tag;   /* 0 = Some, 1 = None  (matches generated enum layout) */
     TgVal   value;
-    int64_t has_value;
 } TgOption;
 
 TgVal tg_option_some(TgVal val);
@@ -251,8 +254,8 @@ TgVal tg_option_map(TgVal opt, TgVal fn);
 /* ── Result ────────────────────────────────────────────────────────── */
 
 typedef struct TgResult {
-    TgVal   value;  /* ok or err value */
-    int64_t is_ok;
+    int64_t _tag;   /* 0 = Ok, 1 = Err  (matches generated enum layout) */
+    TgVal   value;
 } TgResult;
 
 TgVal tg_result_ok(TgVal val);
@@ -273,6 +276,7 @@ void  tg_box_free(TgVal bx);
 
 TgVal tg_tuple_new2(TgVal a, TgVal b);
 TgVal tg_tuple_new3(TgVal a, TgVal b, TgVal c);
+TgVal tg_tuple_new4(TgVal a, TgVal b, TgVal c, TgVal d);
 TgVal tg_tuple_get(TgVal tup, TgVal idx);
 
 /* ── Closure ───────────────────────────────────────────────────────── */
@@ -307,7 +311,7 @@ TgVal tg_enum_alloc(int64_t tag, int64_t n_payload);
 
 /* Get/set struct field by index */
 TgVal tg_field_get(TgVal obj, int64_t idx);
-void  tg_field_set(TgVal obj, int64_t idx, TgVal val);
+TgVal tg_field_set(TgVal obj, int64_t idx, TgVal val);
 
 /* Get enum tag */
 int64_t tg_enum_tag(TgVal obj);
@@ -316,10 +320,10 @@ TgVal tg_enum_payload(TgVal obj, int64_t idx);
 
 /* ── I/O ───────────────────────────────────────────────────────────── */
 
-void  tg_print(TgVal s);
-void  tg_println(TgVal s);
-void  tg_eprint(TgVal s);
-void  tg_eprintln(TgVal s);
+TgVal tg_print(TgVal s);
+TgVal tg_println(TgVal s);
+TgVal tg_eprint(TgVal s);
+TgVal tg_eprintln(TgVal s);
 TgVal tg_read_file(TgVal path);
 TgVal tg_write_file(TgVal path, TgVal content);
 
@@ -360,6 +364,12 @@ TgVal tg_format_hex(TgVal i);
 /* ── Temp file ─────────────────────────────────────────────────────── */
 
 TgVal tg_temp_file(TgVal prefix, TgVal suffix);
+
+/* ── I/O primitives for compiler ───────────────────────────────────── */
+
+TgVal read_line(void);
+TgVal read_bytes(TgVal n);
+TgVal system_(TgVal cmd);
 
 /* ── Convenience macros for generated code ─────────────────────────── */
 

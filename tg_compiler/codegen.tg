@@ -172,21 +172,7 @@ end
 # X18 (platform), FP(X29), LR(X30), SP.
 def a64_allocatable_regs() -> Vec[PhysReg]
   mut regs = Vec::new()
-  regs.push(PhysReg::A64Reg(A64::X1))
-  regs.push(PhysReg::A64Reg(A64::X2))
-  regs.push(PhysReg::A64Reg(A64::X3))
-  regs.push(PhysReg::A64Reg(A64::X4))
-  regs.push(PhysReg::A64Reg(A64::X5))
-  regs.push(PhysReg::A64Reg(A64::X6))
-  regs.push(PhysReg::A64Reg(A64::X7))
-  regs.push(PhysReg::A64Reg(A64::X8))
-  regs.push(PhysReg::A64Reg(A64::X9))
-  regs.push(PhysReg::A64Reg(A64::X10))
-  regs.push(PhysReg::A64Reg(A64::X11))
-  regs.push(PhysReg::A64Reg(A64::X12))
-  regs.push(PhysReg::A64Reg(A64::X13))
-  regs.push(PhysReg::A64Reg(A64::X14))
-  regs.push(PhysReg::A64Reg(A64::X15))
+  # Callee-saved registers first (safe across calls)
   regs.push(PhysReg::A64Reg(A64::X19))
   regs.push(PhysReg::A64Reg(A64::X20))
   regs.push(PhysReg::A64Reg(A64::X21))
@@ -291,11 +277,15 @@ def alloc_reg(state: &mut RegAllocState) -> Option[PhysReg]
   if state.free_regs.is_empty() then
     return Option::None
   end
-  let r = state.free_regs.pop()
-  if phys_is_callee_saved(r) then
-    state.used_callee.insert(phys_reg_id(r))
+  match state.free_regs.pop()
+  when Option::Some(r) then
+    if phys_is_callee_saved(r) then
+      state.used_callee.insert(phys_reg_id(r))
+    end
+    Option::Some(r)
+  when Option::None then
+    Option::None
   end
-  Option::Some(r)
 end
 
 # Allocate a register with spill support: if no free regs, spill one
@@ -320,9 +310,9 @@ end
 
 def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameInfo)
   mut ra = reg_alloc_new(arch)
-  mut local_offsets = Map::new()
-  mut var_locs = Map::new()
-  mut spill_off: i32 = -8  # first spill at [fp-8]
+  mut local_offsets: Map[Int, Int] = Map::new()
+  mut var_locs: Map[Int, VarLoc] = Map::new()
+  mut spill_off: i32 = 0  # next spill starts at [fp - 8]
 
   # Try to give each local a register; spill when exhausted
   for local in func.locals do
@@ -343,17 +333,22 @@ def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameI
     end
   end
 
-  # Params get the ABI argument registers (overriding)
+  # Allocate storage for params — callee-saved registers or spill slots.
+  # The prologue will move from ABI arg regs into these locations.
   mut arg_idx = 0
-  let max_args = max_reg_args(arch)
   for param in func.params do
-    match arg_reg(arch, arg_idx)
-    when Option::Some(r) then
-      var_locs.insert(param.id.id, VarLoc::Register(r))
-    when Option::None then
-      # Stack param: positive offset from FP
-      let off = 16 + (arg_idx - max_args) * 8
-      var_locs.insert(param.id.id, VarLoc::Stack(off as i32))
+    let sz = type_size(&param.ty)
+    if sz == 0 then
+      var_locs.insert(param.id.id, VarLoc::Stack(0))
+    else
+      match alloc_reg(&mut ra)
+      when Option::Some(r) then
+        var_locs.insert(param.id.id, VarLoc::Register(r))
+      when Option::None then
+        let aligned_sz = align_up_int(sz, 8)
+        spill_off = spill_off - aligned_sz as i32
+        var_locs.insert(param.id.id, VarLoc::Spilled(spill_off))
+      end
     end
     arg_idx = arg_idx + 1
   end
@@ -969,7 +964,7 @@ def block_label(fn_name: &String, block_id: Int) -> String
 end
 
 def make_block_labels(func: &MirFunction) -> Map[Int, String]
-  mut labels = Map::new()
+  mut labels: Map[Int, String] = Map::new()
   for block in func.blocks do
     labels.insert(block.id.id, block_label(&func.name, block.id.id))
   end
@@ -1034,9 +1029,12 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, projs: &Vec[Pro
       # Load index value into scratch
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
       # Multiply index by element size (default 8 bytes per element)
-      let elem_size_reg = arg_reg(ctx.target.arch, 0)
-      emit_mov_ri(ctx, elem_size_reg, 8)
-      emit_mul_rrr(ctx, scratch, scratch, elem_size_reg)
+      match arg_reg(ctx.target.arch, 0)
+      when Option::Some(elem_size_reg) then
+        emit_mov_ri(ctx, elem_size_reg, 8)
+        emit_mul_rrr(ctx, scratch, scratch, elem_size_reg)
+      when Option::None then ()
+      end
       # Add scaled offset to base address
       emit_add_rrr(ctx, reg, reg, scratch)
       emit_load_mem(ctx, reg, reg, 0)
@@ -1243,12 +1241,9 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
     end
 
   when MirRvalueKind::Phi(pairs) then
-    # Phi nodes should have been lowered to MOVs during SSA destruction.
-    # If we reach here, emit MOV from whichever predecessor value is available.
-    if pairs.len() > 0 then
-      let (_, first_op) = pairs[0]
-      load_operand(ctx, fctx, &first_op, dst)
-    end
+    # Phi nodes: values already placed by predecessor blocks.
+    # Skip — no code generation needed.
+    ()
   when _ then
     panic("codegen_rvalue: unsupported MIR rvalue kind")
   end
@@ -1337,8 +1332,13 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
   let rr = ret_reg(ctx.target.arch)
   match stmt.kind
   when MirStatementKind::Assign(place, rvalue) then
-    codegen_rvalue(ctx, fctx, &rvalue, rr)
-    store_place(ctx, fctx, &place, rr)
+    # Skip phi assignments — values already placed by predecessor blocks
+    match rvalue.kind
+    when MirRvalueKind::Phi(_) then ()
+    when _ then
+      codegen_rvalue(ctx, fctx, &rvalue, rr)
+      store_place(ctx, fctx, &place, rr)
+    end
 
   when MirStatementKind::StorageLive(_) then ()
   when MirStatementKind::StorageDead(_) then ()
@@ -1397,10 +1397,12 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
     
     # Set up call arguments (ABI: scratch = name_ptr, rr = value)
     # Move arguments to proper registers for the call
-    let arg0 = arg_reg(ctx.target.arch, 0)
-    let arg1 = arg_reg(ctx.target.arch, 1)
-    emit_mov_rr(ctx, scratch, arg0)
-    emit_mov_rr(ctx, rr, arg1)
+    match (arg_reg(ctx.target.arch, 0), arg_reg(ctx.target.arch, 1))
+    when (Option::Some(arg0), Option::Some(arg1)) then
+      emit_mov_rr(ctx, scratch, arg0)
+      emit_mov_rr(ctx, rr, arg1)
+    when _ then ()
+    end
     
     # Call the runtime function
     emit_call_direct(ctx, "__tg_effect_record".to_string())
@@ -1472,7 +1474,11 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
   mut arg_idx = 0
   for arg in args do
     if arg_idx < max_ra then
-      load_operand(ctx, fctx, arg, arg_reg(arch, arg_idx))
+      match arg_reg(arch, arg_idx)
+      when Option::Some(abi_r) then
+        load_operand(ctx, fctx, arg, abi_r)
+      when Option::None then ()
+      end
     else
       load_operand(ctx, fctx, arg, scratch)
       emit_push(ctx, scratch)
@@ -1565,36 +1571,31 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
 
   when Arch::AArch64 then
     # stp fp, lr, [sp, #-16]!  (pre-index: push fp and lr)
-    a64_stp_pre(&mut ctx.text, A64::X29, A64::X30, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
     # mov fp, sp
-    a64_mov_rr(&mut ctx.text, A64::X29, A64::SP)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
 
-    # Save callee-saved registers in pairs
-    let saved = &fctx.frame.saved_regs
-    mut si = 0
-    while si + 1 < saved.len() do
-      match (saved[si], saved[si + 1])
-      when (PhysReg::A64Reg(a), PhysReg::A64Reg(b)) then
-        a64_stp_pre(&mut ctx.text, a, b, A64::SP, -16)
-      when _ then ()
-      end
-      si = si + 2
-    end
-    if si < saved.len() then
-      # Odd register — store single
-      match saved[si]
-      when PhysReg::A64Reg(a) then
-        a64_stur(&mut ctx.text, a, A64::SP, -16)
-        a64_sub_imm(&mut ctx.text, A64::SP, A64::SP, 16)
-      when _ then ()
-      end
-    end
-
-    # Allocate stack frame
+    # Allocate full stack frame (callee-saved saves + spill area)
     if fctx.frame.stack_size > 0 then
       let aligned = align_up_int(fctx.frame.stack_size, 16)
-      a64_sub_imm(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
+      a64_sub_rri(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
       emit_stack_probe(ctx, sp, aligned)
+    end
+
+    # Save callee-saved registers at the BOTTOM of the frame (FP-relative)
+    # Callee-saved go at [FP-stack_size], [FP-stack_size+8], etc.
+    # Spill slots are at [FP-8], [FP-16], etc. (near top), so no collision.
+    let saved = &fctx.frame.saved_regs
+    mut si = 0
+    let ss = fctx.frame.stack_size
+    while si < saved.len() do
+      let off = -(ss as i32) + (si * 8) as i32
+      match saved[si]
+      when PhysReg::A64Reg(a) then
+        a64_stur(&mut ctx.text, a, A64::FP, off)
+      when _ then ()
+      end
+      si = si + 1
     end
   end
 
@@ -1603,17 +1604,23 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   mut idx = 0
   for param in fctx.func.params do
     if idx < max_ra then
-      let abi_r = arg_reg(arch, idx)
-      match fctx.var_locs.get(param.id.id)
-      when Option::Some(VarLoc::Register(target_r)) then
-        if phys_reg_id(abi_r) != phys_reg_id(target_r) then
-          emit_mov_rr(ctx, target_r, abi_r)
+      match arg_reg(arch, idx)
+      when Option::Some(abi_r) then
+        match fctx.var_locs.get(param.id.id)
+        when Option::Some(loc) then
+          match loc
+          when VarLoc::Register(target_r) then
+            if phys_reg_id(abi_r) != phys_reg_id(target_r) then
+              emit_mov_rr(ctx, target_r, abi_r)
+            end
+          when VarLoc::Stack(off) then
+            emit_store_mem(ctx, fp, off, abi_r)
+          when VarLoc::Spilled(off) then
+            emit_store_mem(ctx, fp, off, abi_r)
+          end
+        when _ then ()
         end
-      when Option::Some(VarLoc::Stack(off)) then
-        emit_store_mem(ctx, fp, off, abi_r)
-      when Option::Some(VarLoc::Spilled(off)) then
-        emit_store_mem(ctx, fp, off, abi_r)
-      when _ then ()
+      when Option::None then ()
       end
     end
     idx = idx + 1
@@ -1627,21 +1634,27 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   let rr = ret_reg(arch)
 
   # Load return value into the return register if needed (local 0 is return place)
-  if fctx.func.locals.len() > 0 then
+  if type_size(&fctx.func.ret_type) > 0 && fctx.func.locals.len() > 0 then
     let ret_local = fctx.func.locals[0]
     if type_size(&ret_local.ty) > 0 then
       match fctx.var_locs.get(ret_local.id.id)
-      when Option::Some(VarLoc::Register(r)) then
-        if phys_reg_id(r) != phys_reg_id(rr) then
-          emit_mov_rr(ctx, rr, r)
+      when Option::Some(loc) then
+        match loc
+        when VarLoc::Register(r) then
+          if phys_reg_id(r) != phys_reg_id(rr) then
+            emit_mov_rr(ctx, rr, r)
+          end
+        when VarLoc::Stack(off) then
+          emit_load_mem(ctx, rr, fp, off)
+        when VarLoc::Spilled(off) then
+          emit_load_mem(ctx, rr, fp, off)
         end
-      when Option::Some(VarLoc::Stack(off)) then
-        emit_load_mem(ctx, rr, fp, off)
-      when Option::Some(VarLoc::Spilled(off)) then
-        emit_load_mem(ctx, rr, fp, off)
       when _ then ()
       end
     end
+  else
+    # Unit return type: ensure return register is zero
+    emit_zero_reg(ctx, rr)
   end
 
   match arch
@@ -1661,35 +1674,23 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
     emit_ret(ctx)
 
   when Arch::AArch64 then
-    # Deallocate stack frame
-    if fctx.frame.stack_size > 0 then
-      let aligned = align_up_int(fctx.frame.stack_size, 16)
-      a64_add_imm(&mut ctx.text, A64::SP, A64::SP, aligned as u32)
-    end
-    # Restore callee-saved registers (reverse order, paired)
+    # Restore callee-saved registers from bottom of frame (FP-relative)
     let saved = &fctx.frame.saved_regs
-    let n = saved.len()
-    mut si = n
-    # Handle odd register first (it was pushed last)
-    if n % 2 == 1 then
-      si = si - 1
+    let ss = fctx.frame.stack_size
+    mut si = 0
+    while si < saved.len() do
+      let off = -(ss as i32) + (si * 8) as i32
       match saved[si]
       when PhysReg::A64Reg(a) then
-        a64_add_imm(&mut ctx.text, A64::SP, A64::SP, 16)
-        a64_ldur(&mut ctx.text, a, A64::SP, -16)
+        a64_ldur(&mut ctx.text, a, A64::FP, off)
       when _ then ()
       end
+      si = si + 1
     end
-    while si >= 2 do
-      si = si - 2
-      match (saved[si], saved[si + 1])
-      when (PhysReg::A64Reg(a), PhysReg::A64Reg(b)) then
-        a64_ldp_post(&mut ctx.text, a, b, A64::SP, 16)
-      when _ then ()
-      end
-    end
+    # mov sp, fp (deallocate entire frame at once)
+    a64_mov_rr(&mut ctx.text, A64::SP, A64::FP)
     # ldp fp, lr, [sp], #16  (post-index: restore fp and lr)
-    a64_ldp_post(&mut ctx.text, A64::X29, A64::X30, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
   end
 end
@@ -1719,7 +1720,6 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
 
   # Block labels
   let block_labels = make_block_labels(func)
-
   let fctx = FnCodegenCtx {
     func: func.clone(),
     frame: frame,
@@ -1900,7 +1900,7 @@ def generate_executable(program: &MirProgram, target: TargetTriple, output_path:
 
   # Determine entry point name
   let entry = match target.os
-  when OsAbi::MacOS   then "_main"
+  when OsAbi::MacOS   then "main"
   when OsAbi::Linux   then "_start"
   when OsAbi::Windows then "mainCRTStartup"
   end

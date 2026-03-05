@@ -226,7 +226,23 @@ let rec parse_pattern st =
       end else
         PatBind (vname, l)
     | IntLit s ->
-      advance st; PatLit (EInt (int_of_string s, l))
+      advance st;
+      let len = String.length s in
+      let num_s =
+        if len >= 4 then
+          let s3 = String.sub s (len-3) 3 in
+          if s3 = "u16" || s3 = "i16" || s3 = "u32" || s3 = "i32" || s3 = "u64" || s3 = "i64" then
+            String.sub s 0 (len-3)
+          else if len >= 3 then
+            let s2 = String.sub s (len-2) 2 in
+            if s2 = "u8" || s2 = "i8" then String.sub s 0 (len-2) else s
+          else s
+        else if len >= 3 then
+          let s2 = String.sub s (len-2) 2 in
+          if s2 = "u8" || s2 = "i8" then String.sub s 0 (len-2) else s
+        else s
+      in
+      PatLit (EInt ((try int_of_string num_s with _ -> 0), l))
     | FloatLit s ->
       advance st; PatLit (EFloat (float_of_string s, l))
     | StringLit s ->
@@ -470,9 +486,14 @@ and parse_unary st =
   | _ -> parse_postfix st
 
 and parse_postfix st =
+  let _is_block_expr = function
+    | EWhile _ | EFor _ | ELoop _ | EIf _ | EMatch _ | EBlock _ -> true
+    | _ -> false
+  in
   let rec loop e =
     (* Skip newlines and check for method chain continuation *)
     let saved_pos = st.pos in
+    let had_nl = at_nl st in
     skip_nl st;
     let t = peek st in
     match t.kind with
@@ -571,12 +592,16 @@ and parse_postfix st =
       end else
         loop (EFieldAccess (e, field, l))
       end (* close turbofish begin *)
-    | Symbol "(" ->
+    | Symbol "(" when not had_nl ->
+      (* Don't treat ( as function call across a newline —
+         prevents the next line's parenthesised expression from being
+         consumed as call arguments. *)
       let l = loc_of st in advance st; skip_nl st;
       let args = if at_sym st ")" then [] else parse_arg_list st in
       ignore (eat_sym st ")");
       loop (ECall (e, args, l))
-    | Symbol "[" ->
+    | Symbol "[" when not had_nl ->
+      (* Same rationale as '(' above *)
       let l = loc_of st in advance st; skip_nl st;
       let idx = parse_expr st in
       ignore (eat_sym st "]");
@@ -598,8 +623,33 @@ and parse_primary st =
   match t.kind with
   | IntLit s ->
     advance st;
-    let v = try Int64.to_int (Int64.of_string s) with _ -> (try int_of_string s with _ -> 0) in
-    EInt (v, l)
+    (* Strip Tangerine integer type suffixes: u8, u16, u32, u64, i8, i16, i32, i64.
+       OCaml's Int64.of_string treats "0u8" as unsigned-8 = 8, but in Tangerine
+       "0u8" means "literal 0 as u8". *)
+    let len = String.length s in
+    let (num_s, ty_suffix) =
+      if len >= 4 then
+        let s3 = String.sub s (len-3) 3 in
+        if s3 = "u16" || s3 = "i16" || s3 = "u32" || s3 = "i32" || s3 = "u64" || s3 = "i64" then
+          (String.sub s 0 (len-3), Some s3)
+        else if len >= 3 then
+          let s2 = String.sub s (len-2) 2 in
+          if s2 = "u8" || s2 = "i8" then
+            (String.sub s 0 (len-2), Some s2)
+          else (s, None)
+        else (s, None)
+      else if len >= 3 then
+        let s2 = String.sub s (len-2) 2 in
+        if s2 = "u8" || s2 = "i8" then
+          (String.sub s 0 (len-2), Some s2)
+        else (s, None)
+      else (s, None)
+    in
+    let v = try Int64.to_int (Int64.of_string num_s) with _ -> (try int_of_string num_s with _ -> 0) in
+    let base = EInt (v, l) in
+    (match ty_suffix with
+     | Some suf -> ECast (base, TyName (suf, []), l)
+     | None -> base)
   | FloatLit s ->
     advance st;
     (try EFloat (float_of_string s, l) with _ -> err st "invalid float"; EFloat (0.0, l))

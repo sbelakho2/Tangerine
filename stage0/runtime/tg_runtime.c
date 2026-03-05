@@ -9,22 +9,56 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <signal.h>
+#ifdef __APPLE__
+#include <execinfo.h>
+#endif
+
+/* ── Segfault handler ──────────────────────────────────────────────── */
+static void tg_segfault_handler(int sig) {
+    fprintf(stderr, "\nSEGFAULT (signal %d) backtrace:\n", sig);
+#ifdef __APPLE__
+    void* array[64];
+    int size = backtrace(array, 64);
+    backtrace_symbols_fd(array, size, STDERR_FILENO);
+#endif
+    _exit(139);
+}
 
 /* ── Global state ──────────────────────────────────────────────────── */
 
-static int    g_argc = 0;
-static char** g_argv = NULL;
+int    g_argc = 0;
+char** g_argv = NULL;
 
 void tg_init(int argc, char** argv) {
     g_argc = argc;
     g_argv = argv;
+    signal(SIGSEGV, tg_segfault_handler);
+    signal(SIGBUS, tg_segfault_handler);
 }
 
 /* ── Panic / assert ────────────────────────────────────────────────── */
 
+TgVal tg_debug_val(TgVal v) {
+    fprintf(stderr, "[TG_DEBUG] val=%lld (0x%llx)", (long long)v, (unsigned long long)v);
+    if (v == 0) {
+        fprintf(stderr, " [NIL]\n");
+    } else {
+        void* ptr = (void*)(intptr_t)v;
+        int64_t* words = (int64_t*)ptr;
+        fprintf(stderr, " ptr=%p tag=%lld f0=%lld f1=%lld\n", ptr, words[0], words[1], words[2]);
+    }
+    return TG_NIL;
+}
+
 void tg_panic(const char* msg) {
     fprintf(stderr, "PANIC: %s\n", msg);
-    exit(1);
+#ifdef __APPLE__
+    void* callstack[128];
+    int frames = backtrace(callstack, 128);
+    backtrace_symbols_fd(callstack, frames, 2);
+#endif
+    abort();
 }
 
 void tg_assert(TgVal cond, const char* msg) {
@@ -115,23 +149,25 @@ TgVal tg_str_is_empty(TgVal sv) {
     return tg_str_len(sv) == 0 ? TG_TRUE : TG_FALSE;
 }
 
-void tg_str_push_char(TgVal sv, TgVal ch) {
+TgVal tg_str_push_char(TgVal sv, TgVal ch) {
     TgString* s = str_ptr(sv);
-    if (!s) return;
+    if (!s) return TG_NIL;
     char c = (char)(ch & 0xFF);
     str_grow(s, 1);
     s->data[s->len++] = c;
     s->data[s->len] = '\0';
+    return TG_NIL;
 }
 
-void tg_str_push_str(TgVal sv, TgVal other_v) {
+TgVal tg_str_push_str(TgVal sv, TgVal other_v) {
     TgString* s = str_ptr(sv);
     TgString* o = str_ptr(other_v);
-    if (!s || !o || o->len == 0) return;
+    if (!s || !o || o->len == 0) return TG_NIL;
     str_grow(s, o->len);
     memcpy(s->data + s->len, o->data, o->len);
     s->len += o->len;
     s->data[s->len] = '\0';
+    return TG_NIL;
 }
 
 TgVal tg_str_concat(TgVal a, TgVal b) {
@@ -200,7 +236,7 @@ TgVal tg_str_slice(TgVal sv, TgVal start, TgVal end) {
 
 TgVal tg_str_char_at(TgVal sv, TgVal idx) {
     TgString* s = str_ptr(sv);
-    if (!s || idx < 0 || idx >= s->len) return 0;
+    if (!s || idx < 0 || idx >= s->len) return TG_NIL;
     return (TgVal)(unsigned char)s->data[idx];
 }
 
@@ -294,6 +330,40 @@ TgVal tg_str_eq(TgVal a, TgVal b) {
 
 TgVal tg_str_neq(TgVal a, TgVal b) {
     return tg_str_eq(a, b) ? TG_FALSE : TG_TRUE;
+}
+
+/* Deep equality for tagged enum values: compare tag then fields recursively */
+TgVal tg_val_eq(TgVal a, TgVal b) {
+    if (a == b) return TG_TRUE;
+    if (!a || !b) return TG_FALSE;
+    /* Both are non-zero → treat as heap-allocated tagged structs */
+    int64_t* ap = (int64_t*)(void*)a;
+    int64_t* bp = (int64_t*)(void*)b;
+    if (ap[0] != bp[0]) return TG_FALSE; /* different tags */
+    /* Same tag — compare up to 4 fields */
+    for (int i = 1; i <= 4; i++) {
+        if (ap[i] != bp[i]) {
+            /* Fields differ — try string comparison if both look like valid string ptrs */
+            /* Guard: skip string comparison for small values (ints/chars, not pointers) */
+            if ((uint64_t)ap[i] < 0x10000 || (uint64_t)bp[i] < 0x10000) {
+                return TG_FALSE;
+            }
+            TgString* sa = (TgString*)(void*)ap[i];
+            TgString* sb = (TgString*)(void*)bp[i];
+            if (sa && sb && sa->len >= 0 && sa->len < 10000000 &&
+                sb->len >= 0 && sb->len < 10000000 &&
+                sa->len == sb->len && sa->data && sb->data &&
+                memcmp(sa->data, sb->data, sa->len) == 0) {
+                continue; /* string fields match */
+            }
+            return TG_FALSE;
+        }
+    }
+    return TG_TRUE;
+}
+
+TgVal tg_val_neq(TgVal a, TgVal b) {
+    return tg_val_eq(a, b) ? TG_FALSE : TG_TRUE;
 }
 
 TgVal tg_str_cmp(TgVal a, TgVal b) {
@@ -448,10 +518,11 @@ TgVal tg_vec_get(TgVal vv, TgVal idx) {
     return v->data[idx];
 }
 
-void tg_vec_set(TgVal vv, TgVal idx, TgVal val) {
+TgVal tg_vec_set(TgVal vv, TgVal idx, TgVal val) {
     TgVec* v = vec_ptr(vv);
-    if (!v || idx < 0 || idx >= v->len) return;
+    if (!v || idx < 0 || idx >= v->len) return TG_NIL;
     v->data[idx] = val;
+    return TG_NIL;
 }
 
 TgVal tg_vec_last(TgVal vv) {
@@ -460,11 +531,12 @@ TgVal tg_vec_last(TgVal vv) {
     return tg_option_some(v->data[v->len - 1]);
 }
 
-void tg_vec_push(TgVal vv, TgVal item) {
+TgVal tg_vec_push(TgVal vv, TgVal item) {
     TgVec* v = vec_ptr(vv);
-    if (!v) return;
+    if (!v) return TG_NIL;
     vec_grow(v, 1);
     v->data[v->len++] = item;
+    return TG_NIL;
 }
 
 TgVal tg_vec_pop(TgVal vv) {
@@ -473,13 +545,14 @@ TgVal tg_vec_pop(TgVal vv) {
     return tg_option_some(v->data[--v->len]);
 }
 
-void tg_vec_insert(TgVal vv, TgVal idx, TgVal item) {
+TgVal tg_vec_insert(TgVal vv, TgVal idx, TgVal item) {
     TgVec* v = vec_ptr(vv);
-    if (!v || idx < 0 || idx > v->len) return;
+    if (!v || idx < 0 || idx > v->len) return TG_NIL;
     vec_grow(v, 1);
     memmove(&v->data[idx + 1], &v->data[idx], (v->len - idx) * sizeof(TgVal));
     v->data[idx] = item;
     v->len++;
+    return TG_NIL;
 }
 
 TgVal tg_vec_remove(TgVal vv, TgVal idx) {
@@ -491,37 +564,42 @@ TgVal tg_vec_remove(TgVal vv, TgVal idx) {
     return removed;
 }
 
-void tg_vec_clear(TgVal vv) {
+TgVal tg_vec_clear(TgVal vv) {
     TgVec* v = vec_ptr(vv);
     if (v) v->len = 0;
+    return TG_NIL;
 }
 
-void tg_vec_truncate(TgVal vv, TgVal new_len) {
+TgVal tg_vec_truncate(TgVal vv, TgVal new_len) {
     TgVec* v = vec_ptr(vv);
     if (v && new_len < v->len) v->len = new_len;
+    return TG_NIL;
 }
 
-void tg_vec_reverse(TgVal vv) {
+TgVal tg_vec_reverse(TgVal vv) {
     TgVec* v = vec_ptr(vv);
-    if (!v || v->len < 2) return;
+    if (!v || v->len < 2) return TG_NIL;
     for (int64_t i = 0, j = v->len - 1; i < j; i++, j--) {
         TgVal tmp = v->data[i];
         v->data[i] = v->data[j];
         v->data[j] = tmp;
     }
+    return TG_NIL;
 }
 
-void tg_vec_extend(TgVal vv, TgVal other_v) {
+TgVal tg_vec_extend(TgVal vv, TgVal other_v) {
     TgVec* v = vec_ptr(vv);
     TgVec* o = vec_ptr(other_v);
-    if (!v || !o || o->len == 0) return;
+    if (!v || !o || o->len == 0) return TG_NIL;
     vec_grow(v, o->len);
     memcpy(v->data + v->len, o->data, o->len * sizeof(TgVal));
     v->len += o->len;
+    return TG_NIL;
 }
 
-void tg_vec_extend_from_slice(TgVal vv, TgVal other_v) {
+TgVal tg_vec_extend_from_slice(TgVal vv, TgVal other_v) {
     tg_vec_extend(vv, other_v);
+    return TG_NIL;
 }
 
 TgVal tg_vec_contains(TgVal vv, TgVal item) {
@@ -541,10 +619,11 @@ static int sort_cmp_default(const void* a, const void* b) {
     return 0;
 }
 
-void tg_vec_sort(TgVal vv) {
+TgVal tg_vec_sort(TgVal vv) {
     TgVec* v = vec_ptr(vv);
     if (v && v->len > 1)
         qsort(v->data, v->len, sizeof(TgVal), sort_cmp_default);
+    return TG_NIL;
 }
 
 static TgVal g_sort_closure = 0;
@@ -554,12 +633,13 @@ static int sort_cmp_closure(const void* a, const void* b) {
     return (int)tg_closure_call2(g_sort_closure, va, vb);
 }
 
-void tg_vec_sort_by(TgVal vv, TgVal cmp_fn) {
+TgVal tg_vec_sort_by(TgVal vv, TgVal cmp_fn) {
     TgVec* v = vec_ptr(vv);
-    if (!v || v->len <= 1) return;
+    if (!v || v->len <= 1) return TG_NIL;
     g_sort_closure = cmp_fn;
     qsort(v->data, v->len, sizeof(TgVal), sort_cmp_closure);
     g_sort_closure = 0;
+    return TG_NIL;
 }
 
 TgVal tg_vec_map(TgVal vv, TgVal fn) {
@@ -738,9 +818,9 @@ TgVal tg_map_is_empty(TgVal mv) {
     return tg_map_len(mv) == 0 ? TG_TRUE : TG_FALSE;
 }
 
-void tg_map_insert(TgVal mv, TgVal key, TgVal value) {
+TgVal tg_map_insert(TgVal mv, TgVal key, TgVal value) {
     TgMap* m = map_ptr(mv);
-    if (!m) return;
+    if (!m) return TG_NIL;
     if (m->len * 4 >= m->capacity * 3) map_rehash(m);
 
     int64_t h = map_hash_key(m, key);
@@ -754,7 +834,7 @@ void tg_map_insert(TgVal mv, TgVal key, TgVal value) {
             m->buckets[ins].hash = h;
             m->buckets[ins].state = 1;
             m->len++;
-            return;
+            return TG_NIL;
         }
         if (m->buckets[idx].state == 2 && first_tombstone < 0) {
             first_tombstone = idx;
@@ -762,7 +842,7 @@ void tg_map_insert(TgVal mv, TgVal key, TgVal value) {
         if (m->buckets[idx].state == 1 && m->buckets[idx].hash == h &&
             map_keys_eq(m, m->buckets[idx].key, key)) {
             m->buckets[idx].value = value;
-            return;
+            return TG_NIL;
         }
         idx = (idx + 1) % m->capacity;
     }
@@ -872,21 +952,21 @@ TgVal tg_set_into_vec(TgVal s) { return tg_map_keys(s); }
 
 TgVal tg_option_some(TgVal val) {
     TgOption* o = (TgOption*)tg_alloc(sizeof(TgOption));
+    o->_tag = 0;  /* Some */
     o->value = val;
-    o->has_value = 1;
     return tg_from_ptr(o);
 }
 
 TgVal tg_option_none(void) {
     TgOption* o = (TgOption*)tg_alloc(sizeof(TgOption));
+    o->_tag = 1;  /* None */
     o->value = TG_NIL;
-    o->has_value = 0;
     return tg_from_ptr(o);
 }
 
 TgVal tg_option_is_some(TgVal opt) {
     TgOption* o = (TgOption*)tg_as_ptr(opt);
-    return (o && o->has_value) ? TG_TRUE : TG_FALSE;
+    return (o && o->_tag == 0) ? TG_TRUE : TG_FALSE;
 }
 
 TgVal tg_option_is_none(TgVal opt) {
@@ -895,19 +975,19 @@ TgVal tg_option_is_none(TgVal opt) {
 
 TgVal tg_option_unwrap(TgVal opt) {
     TgOption* o = (TgOption*)tg_as_ptr(opt);
-    if (!o || !o->has_value) tg_panic("unwrap on None");
+    if (!o || o->_tag != 0) tg_panic("unwrap on None");
     return o->value;
 }
 
 TgVal tg_option_unwrap_or(TgVal opt, TgVal default_val) {
     TgOption* o = (TgOption*)tg_as_ptr(opt);
-    if (!o || !o->has_value) return default_val;
+    if (!o || o->_tag != 0) return default_val;
     return o->value;
 }
 
 TgVal tg_option_map(TgVal opt, TgVal fn) {
     TgOption* o = (TgOption*)tg_as_ptr(opt);
-    if (!o || !o->has_value) return tg_option_none();
+    if (!o || o->_tag != 0) return tg_option_none();
     return tg_option_some(tg_closure_call1(fn, o->value));
 }
 
@@ -915,21 +995,21 @@ TgVal tg_option_map(TgVal opt, TgVal fn) {
 
 TgVal tg_result_ok(TgVal val) {
     TgResult* r = (TgResult*)tg_alloc(sizeof(TgResult));
+    r->_tag = 0;  /* Ok */
     r->value = val;
-    r->is_ok = 1;
     return tg_from_ptr(r);
 }
 
 TgVal tg_result_err(TgVal err) {
     TgResult* r = (TgResult*)tg_alloc(sizeof(TgResult));
+    r->_tag = 1;  /* Err */
     r->value = err;
-    r->is_ok = 0;
     return tg_from_ptr(r);
 }
 
 TgVal tg_result_is_ok(TgVal res) {
     TgResult* r = (TgResult*)tg_as_ptr(res);
-    return (r && r->is_ok) ? TG_TRUE : TG_FALSE;
+    return (r && r->_tag == 0) ? TG_TRUE : TG_FALSE;
 }
 
 TgVal tg_result_is_err(TgVal res) {
@@ -938,19 +1018,19 @@ TgVal tg_result_is_err(TgVal res) {
 
 TgVal tg_result_unwrap(TgVal res) {
     TgResult* r = (TgResult*)tg_as_ptr(res);
-    if (!r || !r->is_ok) tg_panic("unwrap on Err");
+    if (!r || r->_tag != 0) tg_panic("unwrap on Err");
     return r->value;
 }
 
 TgVal tg_result_unwrap_err(TgVal res) {
     TgResult* r = (TgResult*)tg_as_ptr(res);
-    if (!r || r->is_ok) tg_panic("unwrap_err on Ok");
+    if (!r || r->_tag == 0) tg_panic("unwrap_err on Ok");
     return r->value;
 }
 
 TgVal tg_result_map_err(TgVal res, TgVal fn) {
     TgResult* r = (TgResult*)tg_as_ptr(res);
-    if (!r || r->is_ok) return res;
+    if (!r || r->_tag == 0) return res;
     return tg_result_err(tg_closure_call1(fn, r->value));
 }
 
@@ -983,6 +1063,12 @@ TgVal tg_tuple_new2(TgVal a, TgVal b) {
 TgVal tg_tuple_new3(TgVal a, TgVal b, TgVal c) {
     TgVal* t = (TgVal*)tg_alloc(4 * sizeof(TgVal));
     t[0] = 3; t[1] = a; t[2] = b; t[3] = c;
+    return tg_from_ptr(t);
+}
+
+TgVal tg_tuple_new4(TgVal a, TgVal b, TgVal c, TgVal d) {
+    TgVal* t = (TgVal*)tg_alloc(5 * sizeof(TgVal));
+    t[0] = 4; t[1] = a; t[2] = b; t[3] = c; t[4] = d;
     return tg_from_ptr(t);
 }
 
@@ -1052,9 +1138,10 @@ TgVal tg_field_get(TgVal obj, int64_t idx) {
     return s[1 + idx];
 }
 
-void tg_field_set(TgVal obj, int64_t idx, TgVal val) {
+TgVal tg_field_set(TgVal obj, int64_t idx, TgVal val) {
     TgVal* s = (TgVal*)tg_as_ptr(obj);
     if (s) s[1 + idx] = val;
+    return TG_NIL;
 }
 
 int64_t tg_enum_tag(TgVal obj) {
@@ -1071,26 +1158,30 @@ TgVal tg_enum_payload(TgVal obj, int64_t idx) {
 
 /* ── I/O ───────────────────────────────────────────────────────────── */
 
-void tg_print(TgVal s) {
+TgVal tg_print(TgVal s) {
     TgString* str = (TgString*)tg_as_ptr(s);
     if (str && str->data) fwrite(str->data, 1, str->len, stdout);
+    return TG_NIL;
 }
 
-void tg_println(TgVal s) {
+TgVal tg_println(TgVal s) {
     tg_print(s);
     putchar('\n');
     fflush(stdout);
+    return TG_NIL;
 }
 
-void tg_eprint(TgVal s) {
+TgVal tg_eprint(TgVal s) {
     TgString* str = (TgString*)tg_as_ptr(s);
     if (str && str->data) fwrite(str->data, 1, str->len, stderr);
+    return TG_NIL;
 }
 
-void tg_eprintln(TgVal s) {
+TgVal tg_eprintln(TgVal s) {
     tg_eprint(s);
     fputc('\n', stderr);
     fflush(stderr);
+    return TG_NIL;
 }
 
 TgVal tg_read_file(TgVal path) {
@@ -1235,4 +1326,35 @@ TgVal tg_temp_file(TgVal prefix, TgVal suffix) {
     char buf[256];
     snprintf(buf, sizeof(buf), "/tmp/%s_%d%s", p, (int)getpid(), s);
     return tg_str_from_cstr(buf);
+}
+
+/* ── I/O primitives for compiler ───────────────────────────────────── */
+
+TgVal read_line(void) {
+    char buf[4096];
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        return tg_str_from_cstr("");
+    }
+    /* Strip trailing newline */
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+    return tg_str_from_cstr(buf);
+}
+
+TgVal read_bytes(TgVal n) {
+    int64_t count = (int64_t)n;
+    if (count <= 0) return tg_str_from_cstr("");
+    char* buf = (char*)malloc((size_t)count + 1);
+    if (!buf) return tg_str_from_cstr("");
+    size_t got = fread(buf, 1, (size_t)count, stdin);
+    buf[got] = '\0';
+    TgVal result = tg_str_from_cstr(buf);
+    free(buf);
+    return result;
+}
+
+TgVal system_(TgVal cmd) {
+    const char* c = tg_str_cstr(cmd);
+    int ret = system(c);
+    return (TgVal)ret;
 }

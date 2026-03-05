@@ -390,7 +390,7 @@ def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span)
   b.current_fn = Option::Some(MirFunction {
     name: name,
     params: Vec::new(),
-    ret_type: ret_type,
+    ret_type: ret_type.clone(),
     locals: Vec::new(),
     blocks: Vec::new(),
     entry_block: entry,
@@ -403,6 +403,21 @@ def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span)
   })
   
   b.current_block = Option::Some(entry)
+
+  # Create return place as local 0 (convention: locals[0] is the return place)
+  let ret_local = MirLocal {
+    id: LocalId { id: b.local_counter },
+    name: "_ret".to_string(),
+    ty: ret_type,
+    is_mut: true,
+    span: span
+  }
+  b.local_counter = b.local_counter + 1
+  match b.current_fn
+  when Option::Some(f) then
+    f.locals.push(ret_local)
+  when _ then ()
+  end
 end
 
 def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> LocalId
@@ -604,12 +619,52 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
   # Lower body
   match f.body
   when FnBody::Block(block) then
-    lower_block(b, &block)
-    # If no explicit return, add implicit return unit
+    if ret_type != Type::Unit && block.stmts.len() > 0 then
+      # Lower all statements except the last
+      mut i = 0
+      while i < block.stmts.len() - 1 do
+        lower_stmt(b, &block.stmts[i])
+        i = i + 1
+      end
+      # Last statement: if expression, store to return place (local 0)
+      let last_stmt = block.stmts[block.stmts.len() - 1]
+      match last_stmt.kind
+      when StmtKind::If(if_stmt) then
+        # If/else as last statement: assign each branch result to return place (local 0)
+        lower_if_to_place(b, &if_stmt, place_local(LocalId { id: 0 }), f.span)
+      when StmtKind::Expr(expr) then
+        match expr.kind
+        when ExprKind::If(if_expr) then
+          lower_if_to_place(b, &if_expr, place_local(LocalId { id: 0 }), f.span)
+        when _ then
+          let result = lower_expr(b, &expr, f.span)
+          push_stmt(b, MirStatementKind::Assign(place_local(LocalId { id: 0 }), MirRvalue {
+            kind: MirRvalueKind::Use(result)
+          }), f.span)
+        end
+      when _ then
+        lower_stmt(b, &last_stmt)
+      end
+    else
+      lower_block(b, &block)
+    end
+    # If no explicit return, add implicit return
     set_terminator(b, MirTerminatorKind::Return, f.span)
   when FnBody::Expr(expr) then
-    let result = lower_expr(b, &expr, f.span)
-    # Store result to return place (local 0)
+    # For if/else expressions as function bodies, assign directly to return place
+    if ret_type != Type::Unit then
+      match expr.kind
+      when ExprKind::If(if_expr) then
+        lower_if_to_place(b, &if_expr, place_local(LocalId { id: 0 }), f.span)
+      when _ then
+        let result = lower_expr(b, &expr, f.span)
+        push_stmt(b, MirStatementKind::Assign(place_local(LocalId { id: 0 }), MirRvalue {
+          kind: MirRvalueKind::Use(result)
+        }), f.span)
+      end
+    else
+      let result = lower_expr(b, &expr, f.span)
+    end
     set_terminator(b, MirTerminatorKind::Return, f.span)
   when _ then
     set_terminator(b, MirTerminatorKind::Return, f.span)
@@ -707,7 +762,7 @@ def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
 
   let init_val = match s.init
   when Option::Some(expr) then
-    let lowered = lower_expr(b, &expr)
+    let lowered = lower_expr(b, &expr, s.span)
     Option::Some(lowered)
   when Option::None then Option::None
   end
@@ -921,10 +976,29 @@ def lower_block(b: &mut MirBuilder, block: &Block) -> Unit
   end
 end
 
+def infer_expr_type(expr: &Expr) -> Type
+  match expr.kind
+  when ExprKind::IntLit(_)    then Type::Int
+  when ExprKind::FloatLit(_)  then Type::Float
+  when ExprKind::BoolLit(_)   then Type::Bool
+  when ExprKind::StringLit(_) then Type::String
+  when ExprKind::CharLit(_)   then Type::Char
+  when ExprKind::NilLit       then Type::Unit
+  when ExprKind::BinaryOp(_, lhs, _) then infer_expr_type(lhs)
+  when ExprKind::UnaryOp(_, inner)    then infer_expr_type(inner)
+  when ExprKind::Cast(_, _)   then Type::Int
+  when ExprKind::ArrayLit(_)  then Type::Int  # placeholder
+  when ExprKind::TupleLit(_)  then Type::Int  # placeholder
+  when ExprKind::Ref(inner)   then Type::Ref(infer_expr_type(inner), lifetime_static())
+  when ExprKind::RefMut(inner) then Type::RefMut(infer_expr_type(inner), lifetime_static())
+  when _                      then Type::Int  # default to Int (8 bytes) for register allocation
+  end
+end
+
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   match stmt.kind
   when StmtKind::Let(pattern, ty_opt, value, is_mut) then
-    let ty = Type::Unit
+    let ty = infer_expr_type(&value)
     match pattern.kind
     when PatternKind::Ident(name, _) then
       let local_id = add_local(b, name, ty, is_mut, stmt.span)
@@ -972,7 +1046,7 @@ def lower_expr(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirOperand
   let rvalue = lower_expr_to_rvalue(b, expr, span)
   
   # Create temp and assign
-  let temp = add_temp(b, Type::Unit, span)
+  let temp = add_temp(b, infer_expr_type(expr), span)
   push_assign(b, place_local(temp), rvalue, span)
   
   MirOperand { kind: MirOperandKind::Copy(place_local(temp)) }
@@ -1064,8 +1138,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       mir_args.push(lower_expr(b, &a, span))
     end
     
-    # Allocate a temp for the return value
-    let ret_tmp = add_temp(b, Type::Unit, span)
+    # Allocate a temp for the return value (must be non-Unit so it gets a register)
+    let ret_tmp = add_temp(b, Type::Int, span)
     let dest_place = place_local(ret_tmp)
     
     # Create success continuation block
@@ -1108,8 +1182,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       mir_args.push(lower_expr(b, &a, span))
     end
     
-    # Allocate return temp
-    let ret_tmp = add_temp(b, Type::Unit, span)
+    # Allocate return temp (must be non-Unit so it gets a register)
+    let ret_tmp = add_temp(b, Type::Int, span)
     let dest_place = place_local(ret_tmp)
     
     # Create success block
@@ -1246,7 +1320,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
 
   when ExprKind::Block(stmts, tail) then
     for s in stmts do
-      lower_stmt(b, s, span)
+      lower_stmt(b, s)
     end
     match tail
     when Option::Some(expr) then
@@ -1591,49 +1665,87 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
 end
 
 # Helper: lower if expression as rvalue (returns its value)
-def lower_if_rvalue(b: &mut MirBuilder, if_expr: &IfExpr, span: Span) -> MirRvalue
+def lower_if_rvalue(b: &mut MirBuilder, if_expr: &IfStmt, span: Span) -> MirRvalue
+  # Create a result temp and use lower_if_to_place to assign into it
+  let result_tmp = add_temp(b, Type::Int, span)
+  lower_if_to_place(b, if_expr, place_local(result_tmp), span)
+  MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+    kind: MirOperandKind::Copy(place_local(result_tmp))
+  }) }
+end
+
+# Helper: assign the result of an expression directly into dest.
+# For nested if expressions, calls lower_if_to_place directly with dest
+# to avoid intermediate temps and a sequential push_stmt after lower_expr.
+def lower_expr_assign_to(b: &mut MirBuilder, expr: &Expr, dest: Place, span: Span) -> Unit
+  match expr.kind
+  when ExprKind::If(nested_if) then
+    # Nested if: pass our dest directly — branches assign to dest
+    lower_if_to_place(b, &nested_if, dest, span)
+  when _ then
+    # Non-if: lower to rvalue and assign in one step
+    let rvalue = lower_expr_to_rvalue(b, expr, span)
+    push_assign(b, dest, rvalue, span)
+  end
+end
+
+# Lower an if/else expression, assigning the result of each branch
+# directly into `dest`. After this call, b.current_block is the merge block.
+def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: Span) -> Unit
   let cond_op = lower_expr(b, &if_expr.cond, span)
   let then_blk = create_block(b)
   let else_blk = create_block(b)
   let merge_blk = create_block(b)
-
-  # Allocate result temp
-  let result_tmp = add_temp(b, Type::Unit, span)
 
   # Branch on condition
   mut targets = Vec::new()
   targets.push(SwitchTarget { value: 0, target: else_blk })
   set_terminator(b, MirTerminatorKind::SwitchInt(cond_op, targets, then_blk), span)
 
-  # Then branch
+  # Then branch — lower all stmts, last expression value goes to dest
   b.current_block = Option::Some(then_blk)
-  for s in if_expr.then_block.stmts do
-    lower_stmt(b, s, span)
-  end
-  match if_expr.then_block.tail
-  when Option::Some(expr) then
-    let then_val = lower_expr(b, &expr, span)
-    push_stmt(b, MirStatementKind::Assign(place_local(result_tmp), MirRvalue {
-      kind: MirRvalueKind::Use(then_val)
-    }), span)
-  when Option::None then ()
+  let then_stmts = if_expr.then_block.stmts
+  if then_stmts.len() > 0 then
+    # Lower all but last stmt normally
+    mut ti = 0
+    while ti < then_stmts.len() - 1 do
+      lower_stmt(b, &then_stmts[ti])
+      ti = ti + 1
+    end
+    # Last stmt: evaluate and assign to dest
+    let last_then = then_stmts[then_stmts.len() - 1]
+    match last_then.kind
+    when StmtKind::Expr(expr) then
+      lower_expr_assign_to(b, &expr, dest, span)
+    when StmtKind::If(nested_if) then
+      lower_if_to_place(b, &nested_if, dest, span)
+    when _ then
+      lower_stmt(b, &last_then)
+    end
   end
   set_terminator(b, MirTerminatorKind::Goto(merge_blk), span)
 
-  # Else branch
+  # Else branch — lower all stmts, last expression value goes to dest
   b.current_block = Option::Some(else_blk)
   match if_expr.else_block
   when Option::Some(else_body) then
-    for s in else_body.stmts do
-      lower_stmt(b, s, span)
-    end
-    match else_body.tail
-    when Option::Some(expr) then
-      let else_val = lower_expr(b, &expr, span)
-      push_stmt(b, MirStatementKind::Assign(place_local(result_tmp), MirRvalue {
-        kind: MirRvalueKind::Use(else_val)
-      }), span)
-    when Option::None then ()
+    let else_stmts = else_body.stmts
+    if else_stmts.len() > 0 then
+      mut ei = 0
+      while ei < else_stmts.len() - 1 do
+        lower_stmt(b, &else_stmts[ei])
+        ei = ei + 1
+      end
+      # Last stmt: evaluate and assign to dest
+      let last_else = else_stmts[else_stmts.len() - 1]
+      match last_else.kind
+      when StmtKind::Expr(expr) then
+        lower_expr_assign_to(b, &expr, dest, span)
+      when StmtKind::If(nested_if) then
+        lower_if_to_place(b, &nested_if, dest, span)
+      when _ then
+        lower_stmt(b, &last_else)
+      end
     end
   when Option::None then ()
   end
@@ -1641,10 +1753,22 @@ def lower_if_rvalue(b: &mut MirBuilder, if_expr: &IfExpr, span: Span) -> MirRval
 
   # Continue from merge
   b.current_block = Option::Some(merge_blk)
+end
 
-  MirRvalue { kind: MirRvalueKind::Use(MirOperand {
-    kind: MirOperandKind::Copy(place_local(result_tmp))
-  }) }
+# Helper: lower a statement and return its value as MirRvalue
+def lower_stmt_rvalue(b: &mut MirBuilder, stmt: &Stmt, span: Span) -> MirRvalue
+  match stmt.kind
+  when StmtKind::Expr(expr) then
+    lower_expr_to_rvalue(b, &expr, span)
+  when _ then
+    lower_stmt(b, stmt)
+    MirRvalue { kind: MirRvalueKind::Use(MirOperand {
+      kind: MirOperandKind::Constant(MirConstant {
+        kind: MirConstantKind::Unit,
+        ty: Type::Unit
+      })
+    }) }
+  end
 end
 
 def lower_binop(op: BinOp) -> MirBinOp
@@ -2814,7 +2938,7 @@ def MAX_COPY_PROPAGATION_ITERATIONS() -> Int = 100
 
 def eliminate_dead_code(f: &mut MirFunction) -> Unit
   # Mark reachable blocks from entry
-  mut reachable = Set::new()
+  mut reachable: Set[Int] = Set::new()
   mut worklist = Vec::new()
   worklist.push(f.entry_block)
   
@@ -3711,8 +3835,8 @@ def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
   end
   
   # Use two sets: visited (all seen nodes) and on_stack (current DFS path)
-  mut visited = Set::new()
-  mut on_stack = Set::new()
+  mut visited: Set[Int] = Set::new()
+  mut on_stack: Set[Int] = Set::new()
   mut stack = Vec::new()
   
   # DFS with explicit stack - push (block_id, is_entering)
@@ -3761,7 +3885,7 @@ def find_natural_loops(f: &MirFunction) -> Vec[NaturalLoop]
   # For each back edge, compute the natural loop
   for edge in back_edges do
     let (tail, header) = edge
-    mut loop_blocks = Set::new()
+    mut loop_blocks: Set[Int] = Set::new()
     loop_blocks.insert(header.id)
     
     # Flood backwards from tail to header to find loop body
@@ -4119,7 +4243,7 @@ def escape_analysis(f: &mut MirFunction) -> Unit
   let escape_map = compute_escape_states(f)
 
   # Collect locals that don't escape — eligible for stack promotion
-  mut non_escaping = Set::new()
+  mut non_escaping: Set[Int] = Set::new()
   for (lid, state) in escape_map do
     match state
     when EscapeState::NoEscape then
@@ -4809,7 +4933,7 @@ end
 def find_cross_yield_locals(func: &MirFunction, yield_points: &Vec[BlockId]) -> Set[Int]
   # Find locals that are defined before a yield and used after a yield.
   # These need to be stored in the coroutine state struct.
-  mut cross = Set::new()
+  mut cross: Set[Int] = Set::new()
   if yield_points.is_empty() then
     return cross
   end
@@ -4981,7 +5105,7 @@ end
 
 struct DomInfo
   idom: Map[Int, Int]         # immediate dominator: block_id -> dominator_id
-  dom_frontier: Map[Int, Set[Int]]  # dominance frontier sets
+  dom_frontier: Map[Int, Vec[Int]]  # dominance frontier lists
   dom_tree_children: Map[Int, Vec[Int]]  # dominator tree children
 end
 
@@ -5061,9 +5185,9 @@ def compute_dominators(f: &MirFunction) -> DomInfo
   end
   
   # Compute dominance frontiers
-  mut dom_frontier: Map[Int, Set[Int]] = Map::new()
+  mut dom_frontier: Map[Int, Vec[Int]] = Map::new()
   for b in block_ids do
-    dom_frontier.insert(b, Set::new())
+    dom_frontier.insert(b, Vec::new())
   end
   
   for b in block_ids do
@@ -5082,7 +5206,7 @@ def compute_dominators(f: &MirFunction) -> DomInfo
             end
             match dom_frontier.get(runner)
             when Option::Some(df) then
-              df.insert(b)
+              df.push(b)
             when Option::None then ()
             end
             match idom.get(runner)
@@ -5145,7 +5269,7 @@ def intersect_doms(idom: &Map[Int, Int], b1: Int, b2: Int) -> Int
 end
 
 def compute_reverse_postorder(f: &MirFunction) -> Vec[Int]
-  mut visited = Set::new()
+  mut visited: Set[Int] = Set::new()
   mut postorder = Vec::new()
   
   def dfs(f: &MirFunction, block_id: Int, visited: &mut Set[Int], postorder: &mut Vec[Int]) -> Unit
@@ -5179,8 +5303,8 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
   # For each variable that is assigned in more than one block,
   # insert phi nodes at the dominance frontier
   
-  # Collect defs: local_id -> set of block_ids where it's defined
-  mut defs: Map[Int, Set[Int]] = Map::new()
+  # Collect defs: local_id -> list of block_ids where it's defined
+  mut defs: Map[Int, Vec[Int]] = Map::new()
   
   for block in f.blocks do
     for stmt in block.statements do
@@ -5188,12 +5312,12 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
       when MirStatementKind::Assign(place, _) then
         if place.projections.is_empty() then
           match defs.get(place.local.id)
-          when Option::Some(set) then
-            set.insert(block.id.id)
+          when Option::Some(list) then
+            list.push(block.id.id)
           when Option::None then
-            mut s = Set::new()
-            s.insert(block.id.id)
-            defs.insert(place.local.id, s)
+            mut v = Vec::new()
+            v.push(block.id.id)
+            defs.insert(place.local.id, v)
           end
         end
       when _ then ()
@@ -5206,7 +5330,7 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
   #   - worklist = blocks where v is defined
   #   - for each block in worklist, add phi at DF(block) if not already there
   
-  mut phi_placements: Map[Int, Set[Int]] = Map::new()  # block_id -> set of local_ids needing phi
+  mut phi_placements: Map[Int, Vec[Int]] = Map::new()  # block_id -> list of local_ids needing phi
   
   for entry in defs do
     let (local_id, def_blocks) = entry
@@ -5217,7 +5341,7 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
       worklist.push(b)
     end
     
-    mut processed = Set::new()
+    mut processed: Set[Int] = Set::new()
     while !worklist.is_empty() do
       match worklist.pop()
       when Option::Some(b) then
@@ -5227,16 +5351,16 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
             match phi_placements.get(df_block)
             when Option::Some(locals) then
               if !locals.contains(local_id) then
-                locals.insert(local_id)
+                locals.push(local_id)
                 if !processed.contains(df_block) then
                   processed.insert(df_block)
                   worklist.push(df_block)
                 end
               end
             when Option::None then
-              mut s = Set::new()
-              s.insert(local_id)
-              phi_placements.insert(df_block, s)
+              mut v = Vec::new()
+              v.push(local_id)
+              phi_placements.insert(df_block, v)
               if !processed.contains(df_block) then
                 processed.insert(df_block)
                 worklist.push(df_block)
@@ -5550,7 +5674,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   end
   
   # Collect valid block IDs and local IDs (build set FIRST for O(1) lookups)
-  mut valid_blocks = Set::new()
+  mut valid_blocks: Set[Int] = Set::new()
   for block in func.blocks do
     valid_blocks.insert(block.id.id)
   end
@@ -5560,7 +5684,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
     errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
   end
   
-  mut valid_locals = Set::new()
+  mut valid_locals: Set[Int] = Set::new()
   for local in func.locals do
     valid_locals.insert(local.id.id)
   end
@@ -5582,7 +5706,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   end
   
   # 4. Check for unreachable blocks (reachability from entry)
-  mut reachable = Set::new()
+  mut reachable: Set[Int] = Set::new()
   mut worklist = Vec::new()
   worklist.push(func.entry_block.id)
   
@@ -5612,7 +5736,7 @@ def verify_function(func: &MirFunction, errors: &mut Vec[String]) -> Unit
   end
   
   # 5. Check that StorageLive precedes uses within dominated blocks
-  mut defined_locals = Set::new()
+  mut defined_locals: Set[Int] = Set::new()
   for param in func.params do
     defined_locals.insert(param.id.id)
   end

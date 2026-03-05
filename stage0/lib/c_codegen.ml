@@ -10,6 +10,7 @@ open Ast
 type var_info = {
   v_type : string;   (* type name for method resolution *)
   v_is_mut : bool;
+  v_full_type : Ast.typ option;  (* full AST type for element type extraction *)
 }
 
 type cctx = {
@@ -24,6 +25,8 @@ type cctx = {
   mutable current_module : string;  (* current file's module name *)
   type_map : (string, string) Hashtbl.t;  (* raw type name → C type name *)
   res : Resolve.resolved;
+  mutable block_declared : (string, bool) Hashtbl.t;  (* vars declared in current block scope *)
+  emitted_funcs : (string, bool) Hashtbl.t;  (* functions already emitted *)
 }
 
 (* ── Emission helpers ──────────────────────────────────────────────── *)
@@ -51,7 +54,10 @@ let fresh_closure_name ctx =
 (* ── Type tracking ─────────────────────────────────────────────────── *)
 
 let set_var_type ctx name typ_name =
-  ctx.var_types <- (name, { v_type = typ_name; v_is_mut = false }) :: ctx.var_types
+  ctx.var_types <- (name, { v_type = typ_name; v_is_mut = false; v_full_type = None }) :: ctx.var_types
+
+let set_var_type_full ctx name typ_name full_type =
+  ctx.var_types <- (name, { v_type = typ_name; v_is_mut = false; v_full_type = Some full_type }) :: ctx.var_types
 
 let get_var_type ctx name =
   try Some (List.assoc name ctx.var_types).v_type
@@ -73,6 +79,14 @@ let resolve_type ctx name =
   match Hashtbl.find_opt ctx.type_map name with
   | Some c_name -> c_name
   | None -> Resolve.sanitize_ident name
+
+(* Resolve a type name preferring the current module's definition *)
+let resolve_type_in_module ctx name =
+  if name = "" then "" else
+  (* First try module-qualified: current_module__name *)
+  let qualified = Resolve.sanitize_ident (ctx.current_module ^ "__" ^ name) in
+  if Hashtbl.mem ctx.type_map qualified then qualified
+  else resolve_type ctx name
 
 (* Resolve enum C type name from variant_info, using module to avoid collisions *)
 let resolve_enum_type ctx (vi : Resolve.variant_info) =
@@ -100,6 +114,13 @@ let rec expr_type_name ctx = function
   | EBool _ -> "Bool"
   | EChar _ -> "Char"
   | EStructLit (name, _, _) -> name
+  | EBinOp (Add, left, right, _) ->
+    let lt = expr_type_name ctx left in
+    let rt = expr_type_name ctx right in
+    if lt = "String" || lt = "string" || lt = "str"
+       || rt = "String" || rt = "string" || rt = "str" then "String"
+    else if lt <> "" then lt
+    else rt
   | ECall (EIdent (name, _), _, _) ->
     if Resolve.is_variant ctx.res name then begin
       match Resolve.find_variant ctx.res name with
@@ -117,7 +138,33 @@ let rec expr_type_name ctx = function
     (match Resolve.find_method ctx.res obj_type meth with
      | Some { sym_kind = Resolve.SkMethod (_, _, Some ret); _ } ->
        Resolve.type_name_string_of_typ ret
-     | _ -> "")
+     | _ ->
+       (* Infer return type from well-known method names *)
+       match meth with
+       | "to_string" | "display" | "format" | "trim" | "trim_end"
+       | "trim_start" | "to_lowercase" | "to_uppercase" | "replace"
+       | "join" | "repeat" | "capitalize" | "as_str" | "as_string"
+       | "clone" when obj_type = "String" || obj_type = "string" || obj_type = "str" -> "String"
+       | "to_string" | "display" | "format" -> "String"
+       | "trim" | "trim_end" | "trim_start" | "to_lowercase"
+       | "to_uppercase" | "replace" | "join" | "capitalize"
+       | "as_str" | "as_string" | "substring" | "slice"
+       | "repeat" -> "String"
+       | "len" | "count" | "position" | "index_of" -> "Int"
+       | "is_empty" | "contains" | "starts_with" | "ends_with"
+       | "is_some" | "is_none" | "is_ok" | "is_err"
+       | "any" | "all" -> "Bool"
+       | "char_at" -> "Char"
+       | "push" | "clone" -> obj_type
+       | "pop" | "find" -> "Option"
+       | "unwrap" | "unwrap_or" | "unwrap_or_else" -> ""
+       | "split" | "lines" | "chars" | "bytes" | "collect"
+       | "keys" | "values" | "iter" | "into_iter"
+       | "map" | "filter" | "flat_map" | "enumerate"
+       | "sorted" | "reverse" | "reversed" -> "Vec"
+       | "parse_int" | "parse" | "to_int" -> "Int"
+       | "parse_float" -> "Float"
+       | _ -> "")
   | EFieldAccess (obj, field, _) ->
     let obj_type = expr_type_name ctx obj in
     let fields = Resolve.struct_fields ctx.res obj_type in
@@ -125,6 +172,202 @@ let rec expr_type_name ctx = function
        let f = List.find (fun fd -> fd.fd_name = field) fields in
        Resolve.type_name_string_of_typ f.fd_typ
      with Not_found -> "")
+  | EIndex (obj, _, _) ->
+    (* Infer element type when indexing into a Vec/Array *)
+    (match obj with
+     | EIdent (name, _) ->
+       (* var[i] — extract element type from the variable's full type *)
+       (match List.assoc_opt name ctx.var_types with
+        | Some { v_full_type = Some ft; _ } ->
+          let unwrapped = (match ft with TyRef (_, t) -> t | t -> t) in
+          (match unwrapped with
+           | TyName (("Vec"|"Array"), [TyName (elem, _)]) -> elem
+           | TyName (("Vec"|"Array"), [TyRef (_, TyName (elem, _))]) -> elem
+           | _ -> "")
+        | _ -> "")
+     | EFieldAccess (parent, field, _) ->
+       let parent_type = expr_type_name ctx parent in
+       let fields = Resolve.struct_fields ctx.res parent_type in
+       Resolve.vec_element_type_string fields field
+     | EMethodCall (inner_obj, meth, _, _) ->
+       (* e.g. obj.items().get(i) — try the method return type *)
+       let _ = inner_obj in let _ = meth in ""
+     | _ -> "")
+  | ECall (EFieldAccess (EIdent (name, _), ("new" | "with_capacity" | "from"), _), _, _) -> name
+  | EMatch (scrutinee, _, _) ->
+    (* For Result/Option-returning scrutinee with unwrap pattern, return inner type *)
+    (* Inline the Result ok type extraction to avoid circular dependency *)
+    let result_ok_type =
+      match scrutinee with
+      | ECall (EIdent (fname, _), _, _) ->
+        (match Resolve.find_symbol ctx.res fname with
+         | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyName ("Result", ok_type :: _))); _ } ->
+           Resolve.type_name_string_of_typ ok_type
+         | _ -> "")
+      | EMethodCall (obj, meth, _, _) ->
+        let obj_type = expr_type_name ctx obj in
+        (match Resolve.find_method ctx.res obj_type meth with
+         | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyName ("Result", ok_type :: _))); _ } ->
+           Resolve.type_name_string_of_typ ok_type
+         | _ -> "")
+      | _ -> ""
+    in
+    if result_ok_type <> "" then result_ok_type
+    else begin
+      (* Also try Option inner type: match map.get(k) when Option::Some(v) then v *)
+      let option_inner = match scrutinee with
+        | EMethodCall (obj, meth, _, _) ->
+          let obj_type = expr_type_name ctx obj in
+          let unwrap_ref = function TyRef (_, t) -> t | t -> t in
+          if (obj_type = "Map" || obj_type = "HashMap") && meth = "get" then
+            (match obj with
+             | EIdent (name, _) ->
+               (match List.assoc_opt name ctx.var_types with
+                | Some { v_full_type = Some ft; _ } ->
+                  (match unwrap_ref ft with
+                   | TyName (("Map"|"HashMap"), [_; TyName (v, _)]) -> v
+                   | TyName (("Map"|"HashMap"), [_; TyRef (_, TyName (v, _))]) -> v
+                   | _ -> "")
+                | _ -> "")
+             | _ -> "")
+          else if (obj_type = "Vec" || obj_type = "Array") && (meth = "pop" || meth = "get" || meth = "first" || meth = "last") then
+            (match obj with
+             | EIdent (name, _) ->
+               (match List.assoc_opt name ctx.var_types with
+                | Some { v_full_type = Some ft; _ } ->
+                  (match unwrap_ref ft with
+                   | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
+                   | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+                   | _ -> "")
+                | _ -> "")
+             | _ -> "")
+          else ""
+        | EFieldAccess (obj, field, _) ->
+          let obj_type = expr_type_name ctx obj in
+          if obj_type <> "" then
+            let fields = Resolve.struct_fields ctx.res obj_type in
+            Resolve.option_inner_type_string fields field
+          else ""
+        | _ -> ""
+      in
+      option_inner
+    end
+  | _ -> ""
+
+(* Extract the full Ok-inner type from a Result-returning expression.
+   For e.g. resolve_symbols(...) which returns Result[Map[String, LinkerSymbol], String],
+   returns Some (TyName("Map", [TyName("String",[]); TyName("LinkerSymbol",[])])) *)
+let expr_result_ok_full_type ctx = function
+  | ECall (EIdent (name, _), _, _) ->
+    (match Resolve.find_symbol ctx.res name with
+     | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyName ("Result", ok_type :: _))); _ } ->
+       Some ok_type
+     | _ -> None)
+  | EMethodCall (obj, meth, _, _) ->
+    let obj_type = expr_type_name ctx obj in
+    (match Resolve.find_method ctx.res obj_type meth with
+     | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyName ("Result", ok_type :: _))); _ } ->
+       Some ok_type
+     | _ -> None)
+  | _ -> None
+
+(* Extract the inner type name from an Option expression.
+   For e.g. b.current_fn where current_fn: Option[MirFunction], returns "MirFunction" *)
+let expr_option_inner_type ctx = function
+  | EFieldAccess (obj, field, _) ->
+    let obj_type = expr_type_name ctx obj in
+    if obj_type <> "" then
+      let fields = Resolve.struct_fields ctx.res obj_type in
+      Resolve.option_inner_type_string fields field
+    else ""
+  | EMethodCall (obj, meth, _, _) ->
+    (* Handle common methods that return Option[T]:
+       Map.get(key) -> Option[V] where Map is Map[K, V]
+       Vec.pop() -> Option[T] where Vec is Vec[T]
+       Vec.get(idx) -> Option[T] *)
+    let obj_type = expr_type_name ctx obj in
+    let extract_full_type name =
+      match List.assoc_opt name ctx.var_types with
+      | Some { v_full_type = Some t; _ } -> Some t
+      | _ -> None
+    in
+    (* Unwrap TyRef to get the inner type *)
+    let unwrap_ref = function
+      | TyRef (_, t) -> t
+      | t -> t
+    in
+    if (obj_type = "Map" || obj_type = "HashMap") && meth = "get" then
+      (* Extract V from Map[K, V] via the object's full type *)
+      (match obj with
+       | EIdent (name, _) ->
+         (match extract_full_type name with
+          | Some ft ->
+            (match unwrap_ref ft with
+             | TyName (("Map"|"HashMap"), [_; TyName (v, _)]) -> v
+             | TyName (("Map"|"HashMap"), [_; TyRef (_, TyName (v, _))]) -> v
+             | _ -> "")
+          | None -> "")
+       | _ -> "")
+    else if (obj_type = "Vec" || obj_type = "Array") && (meth = "pop" || meth = "get" || meth = "first" || meth = "last") then
+      (* Extract T from Vec[T] via the object's full type *)
+      (match obj with
+       | EIdent (name, _) ->
+         (match extract_full_type name with
+          | Some ft ->
+            (match unwrap_ref ft with
+             | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
+             | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+             | _ -> "")
+          | None -> "")
+       | _ -> "")
+    else ""
+  | _ -> ""
+
+(* Extract the full AST type of an expression, for propagating through let bindings *)
+let expr_full_type ctx = function
+  | EMatch (scrutinee, _, _) ->
+    (* For Result-returning scrutinee, return the Ok inner type *)
+    expr_result_ok_full_type ctx scrutinee
+  | EIdent (name, _) ->
+    (match List.assoc_opt name ctx.var_types with
+     | Some { v_full_type = Some t; _ } -> Some t
+     | _ -> None)
+  | ECall (EIdent (name, _), _, _) ->
+    (match Resolve.find_symbol ctx.res name with
+     | Some { sym_kind = Resolve.SkFunction (_, Some ret); _ } -> Some ret
+     | _ -> None)
+  | EMethodCall (obj, meth, _, _) ->
+    let obj_type = expr_type_name ctx obj in
+    (match Resolve.find_method ctx.res obj_type meth with
+     | Some { sym_kind = Resolve.SkMethod (_, _, Some ret); _ } -> Some ret
+     | _ -> None)
+  | _ -> None
+
+(* Infer the element type of a Vec/Array from an iterator expression *)
+let infer_iter_element_type ctx expr =
+  match expr with
+  | EFieldAccess (obj, field, _) ->
+    let obj_type = expr_type_name ctx obj in
+    if obj_type <> "" then
+      let fields = Resolve.struct_fields ctx.res obj_type in
+      Resolve.vec_element_type_string fields field
+    else ""
+  | EIdent (name, _) ->
+    (* Look up the variable's full AST type to extract Vec/Array element type *)
+    (match List.assoc_opt name ctx.var_types with
+     | Some { v_full_type = Some (TyName (("Vec"|"Array"), [TyName (elem, _)])); _ } -> elem
+     | Some { v_full_type = Some (TyName (("Vec"|"Array"), [TyRef (_, TyName (elem, _))])); _ } -> elem
+     | Some { v_full_type = Some (TyRef (_, TyName (("Vec"|"Array"), [TyName (elem, _)]))); _ } -> elem
+     | _ -> "")
+  | ECall (EIdent (name, _), _, _) ->
+    (match Resolve.find_symbol ctx.res name with
+     | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyName (("Vec"|"Array"), [Ast.TyName (elem, _)]))); _ } -> elem
+     | _ -> "")
+  | EMethodCall (obj, meth, _, _) ->
+    let obj_type = expr_type_name ctx obj in
+    (match Resolve.find_method ctx.res obj_type meth with
+     | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyName (("Vec"|"Array"), [Ast.TyName (elem, _)]))); _ } -> elem
+     | _ -> "")
   | _ -> ""
 
 (* Check if a type name is a string type *)
@@ -135,6 +378,28 @@ let is_string_type t =
 let is_vec_type t = t = "Vec" || t = "Array"
 let is_map_type t = t = "Map" || t = "HashMap"
 let is_set_type t = t = "Set" || t = "HashSet"
+
+(* Check if a Map/Set::new() expression should use integer keys based on a
+   struct field type. Returns true and emits the correct constructor if so. *)
+let emit_map_set_for_field_typ ctx fexpr field_typ =
+  match fexpr with
+  | ECall (EFieldAccess (EIdent (("Map" | "HashMap"), _), "new", _), [], _) ->
+    (match field_typ with
+     | TyName ("Map", (TyName (k, _) :: _)) when k <> "String" ->
+       emit ctx "tg_map_new()"; true
+     | _ -> false)
+  | ECall (EFieldAccess (EIdent (("Set" | "HashSet"), _), "new", _), [], _) ->
+    (match field_typ with
+     | TyName ("Set", [TyName (k, _)]) when k <> "String" ->
+       emit ctx "tg_set_new()"; true
+     | _ -> false)
+  | _ -> false
+
+(* Look up a struct field's type by struct name and field name *)
+let struct_field_typ ctx struct_name field_name =
+  let fields = Resolve.struct_fields ctx.res struct_name in
+  try Some (List.find (fun f -> f.fd_name = field_name) fields).fd_typ
+  with Not_found -> None
 
 (* ── C name escaping ──────────────────────────────────────────────── *)
 
@@ -307,10 +572,27 @@ let rec emit_expr ctx expr =
     emitf ctx "tg_str_from_cstr(\"%s\")" (c_string_escape s)
 
   | EChar (s, _) ->
-    if String.length s > 0 then
-      emitf ctx "((TgVal)%d)" (Char.code s.[0])
-    else
+    if String.length s = 0 then
       emit ctx "((TgVal)0)"
+    else if String.length s >= 2 && s.[0] = '\\' then begin
+      (* Handle escape sequences *)
+      let code = match s.[1] with
+        | 'n' -> 10   (* newline *)
+        | 'r' -> 13   (* carriage return *)
+        | 't' -> 9    (* tab *)
+        | '0' -> 0    (* null *)
+        | '\\' -> 92  (* backslash *)
+        | '\'' -> 39  (* single quote *)
+        | '"' -> 34   (* double quote *)
+        | 'a' -> 7    (* bell *)
+        | 'b' -> 8    (* backspace *)
+        | 'f' -> 12   (* form feed *)
+        | 'v' -> 11   (* vertical tab *)
+        | c -> Char.code c  (* fallback *)
+      in
+      emitf ctx "((TgVal)%d)" code
+    end else
+      emitf ctx "((TgVal)%d)" (Char.code s.[0])
 
   | EBool (true, _) -> emit ctx "TG_TRUE"
   | EBool (false, _) -> emit ctx "TG_FALSE"
@@ -377,16 +659,22 @@ let rec emit_expr ctx expr =
 
   | EBinOp (Eq, left, right, _) ->
     let lt = expr_type_name ctx left in
-    if is_string_type lt then begin
+    let rt = expr_type_name ctx right in
+    if is_string_type lt || is_string_type rt then begin
       emit ctx "tg_str_eq("; emit_expr ctx left; emit ctx ", "; emit_expr ctx right; emit ctx ")"
+    end else if (lt <> "" && Resolve.is_enum ctx.res lt) || (rt <> "" && Resolve.is_enum ctx.res rt) then begin
+      emit ctx "tg_val_eq("; emit_expr ctx left; emit ctx ", "; emit_expr ctx right; emit ctx ")"
     end else begin
       emit ctx "("; emit_expr ctx left; emit ctx " == "; emit_expr ctx right; emit ctx ")"
     end
 
   | EBinOp (Neq, left, right, _) ->
     let lt = expr_type_name ctx left in
-    if is_string_type lt then begin
+    let rt = expr_type_name ctx right in
+    if is_string_type lt || is_string_type rt then begin
       emit ctx "tg_str_neq("; emit_expr ctx left; emit ctx ", "; emit_expr ctx right; emit ctx ")"
+    end else if (lt <> "" && Resolve.is_enum ctx.res lt) || (rt <> "" && Resolve.is_enum ctx.res rt) then begin
+      emit ctx "tg_val_neq("; emit_expr ctx left; emit ctx ", "; emit_expr ctx right; emit ctx ")"
     end else begin
       emit ctx "("; emit_expr ctx left; emit ctx " != "; emit_expr ctx right; emit ctx ")"
     end
@@ -497,6 +785,12 @@ let rec emit_expr ctx expr =
   | ECall (EIdent ("new", _), [], _) ->
     emit ctx "tg_vec_new()"
 
+  (* 1-arg format_type_expr: docgen.tg defines this but doesn't parse *)
+  | ECall (EIdent ("format_type_expr", _), [arg], _) ->
+    emit ctx "_generic_to_string(";
+    emit_expr ctx arg;
+    emit ctx ")"
+
   | ECall (EIdent (name, _), args, _) ->
     (* Check if it's an enum variant constructor — use arity-based lookup *)
     if Resolve.is_variant ctx.res name then begin
@@ -504,6 +798,13 @@ let rec emit_expr ctx expr =
       | Some vi ->
         emitf ctx "%s_%s__new(" (resolve_enum_type ctx vi) (c_ident name);
         emit_args ctx args;
+        (* Pad with TG_NIL if constructor expects more args than provided *)
+        let nargs = List.length args in
+        let nfields = List.length vi.vi_fields in
+        if nfields > nargs then
+          for _ = nargs + 1 to nfields do
+            emit ctx ", TG_NIL"
+          done;
         emit ctx ")"
       | None ->
         emitf ctx "%s(" (resolve_fn_name ctx name);
@@ -523,18 +824,19 @@ let rec emit_expr ctx expr =
        | _ ->
          (* Multi-arg: pack into tuple *)
          let n = List.length args in
-         if n <= 3 then begin
+         if n <= 4 then begin
            emitf ctx "tg_closure_call1(%s, tg_tuple_new%d(" (c_ident name) n;
            emit_args ctx args;
            emit ctx "))"
          end else begin
-           emitf ctx "({ TgVal _ca = tg_vec_new(); ";
-           List.iter (fun a ->
-             emit ctx "tg_vec_push(_ca, ";
+           (* >4 args: build tuple inline *)
+           emitf ctx "({ TgVal* _ta = (TgVal*)tg_alloc(%d * sizeof(TgVal)); _ta[0] = %d; " (n + 1) n;
+           List.iteri (fun i a ->
+             emitf ctx "_ta[%d] = " (i + 1);
              emit_expr ctx a;
-             emit ctx "); "
+             emit ctx "; "
            ) args;
-           emitf ctx "tg_closure_call1(%s, _ca); })" (c_ident name)
+           emitf ctx "tg_closure_call1(%s, tg_from_ptr(_ta)); })" (c_ident name)
          end)
     end else begin
       (* Regular function call — use module-scoped name *)
@@ -550,6 +852,12 @@ let rec emit_expr ctx expr =
      | Some vi ->
        emitf ctx "%s_%s__new(" (resolve_enum_type ctx vi) (c_ident method_name);
        emit_args ctx args;
+       let nargs = List.length args in
+       let nfields = List.length vi.vi_fields in
+       if nfields > nargs then
+         for _ = nargs + 1 to nfields do
+           emit ctx ", TG_NIL"
+         done;
        emit ctx ")"
      | None ->
        (* Variant not found in the resolved enum — try variant table directly *)
@@ -557,12 +865,27 @@ let rec emit_expr ctx expr =
         | Some vi ->
           emitf ctx "%s_%s__new(" (resolve_enum_type ctx vi) (c_ident method_name);
           emit_args ctx args;
+          let nargs = List.length args in
+          let nfields = List.length vi.vi_fields in
+          if nfields > nargs then
+            for _ = nargs + 1 to nfields do
+              emit ctx ", TG_NIL"
+            done;
           emit ctx ")"
         | None ->
           (* Might be a static method on the enum type *)
           emitf ctx "%s(" (c_method_name type_name method_name);
           emit_args ctx args;
           emit ctx ")"))
+
+  | ECall (EFieldAccess (EIdent (mod_name, _), func_name, _), args, _)
+    when mod_name = "Self" && ctx.self_type <> "" ->
+    (* Self::method(args) → resolve Self to current impl type *)
+    let type_name = ctx.self_type in
+    let c_fn = c_method_name type_name func_name in
+    emitf ctx "%s(" c_fn;
+    emit_args ctx args;
+    emit ctx ")"
 
   | ECall (EFieldAccess (EIdent (mod_name, _), func_name, _), args, _)
     when not (Resolve.is_struct ctx.res mod_name) && not (Resolve.is_enum ctx.res mod_name) ->
@@ -652,32 +975,112 @@ let rec emit_expr ctx expr =
 
   | EFieldAccess (obj, field, _) ->
     let obj_type = expr_type_name ctx obj in
-    if obj_type <> "" && Resolve.is_struct ctx.res obj_type then begin
-      let fidx = Resolve.struct_field_index ctx.res obj_type field in
-      if fidx >= 0 then begin
-        emitf ctx "((%s*)tg_as_ptr(" (resolve_type ctx obj_type);
-        emit_expr ctx obj;
-        emitf ctx "))->%s" (c_ident field)
-      end else begin
-        (* Field not found in primary struct — search ALL module-qualified structs for the field *)
-        let found = ref false in
+    (* Helper: find the best struct for a field access across all known structs.
+       Picks the struct where the field appears at the lowest index, preferring
+       structs with FEWEST fields (most specific type), breaking ties by
+       lowest field index. *)
+    let find_best_struct_for_field field_name =
+      let best = ref None in
+      let best_field_count = ref max_int in
+      let best_idx = ref max_int in
+      Hashtbl.iter (fun _qname sym ->
+        match sym.Resolve.sym_kind with
+        | Resolve.SkStruct fields ->
+          let rec find_idx i = function
+            | [] -> -1
+            | f :: rest -> if f.fd_name = field_name then i else find_idx (i+1) rest
+          in
+          let idx = find_idx 0 fields in
+          let nf = List.length fields in
+          if idx >= 0 && (nf < !best_field_count || (nf = !best_field_count && idx < !best_idx)) then begin
+            best := Some (resolve_type ctx sym.Resolve.sym_name);
+            best_field_count := nf;
+            best_idx := idx
+          end
+        | _ -> ()
+      ) ctx.res.Resolve.symbols;
+      (* Also search qualified *)
+      Hashtbl.iter (fun qname sym ->
+        match sym.Resolve.sym_kind with
+        | Resolve.SkStruct fields ->
+          let rec find_idx i = function
+            | [] -> -1
+            | f :: rest -> if f.fd_name = field_name then i else find_idx (i+1) rest
+          in
+          let idx = find_idx 0 fields in
+          let nf = List.length fields in
+          if idx >= 0 && (nf < !best_field_count || (nf = !best_field_count && idx < !best_idx)) then begin
+            best := Some qname;
+            best_field_count := nf;
+            best_idx := idx
+          end
+        | _ -> ()
+      ) ctx.res.Resolve.qualified;
+      !best
+    in
+    (* Try to resolve the struct type, preferring module-qualified names *)
+    let resolve_struct_type obj_type field =
+      (* First, try module-qualified: current_module__obj_type *)
+      let qualified = ctx.current_module ^ "__" ^ obj_type in
+      let qfidx = Resolve.struct_field_index ctx.res qualified field in
+      if qfidx >= 0 then
+        Some (Resolve.sanitize_ident qualified, qfidx)
+      else begin
+        (* Search all module-qualified variants of this type name.
+           Deterministic: pick lowest field index, break ties by fewest fields
+           (smaller struct = more likely the exact type, avoids out-of-bounds
+           reads from struct layout mismatches). *)
+        let found = ref None in
+        let found_idx = ref max_int in
+        let found_nf = ref max_int in
         Hashtbl.iter (fun qname sym ->
-          if not !found then
             match sym.Resolve.sym_kind with
-            | Resolve.SkStruct fields when List.exists (fun f -> f.fd_name = field) fields ->
-              let alt_c_name = qname in  (* qualified table keys are already sanitized C names *)
-              emitf ctx "((%s*)tg_as_ptr(" alt_c_name;
-              emit_expr ctx obj;
-              emitf ctx "))->%s" (c_ident field);
-              found := true
+            | Resolve.SkStruct fields ->
+              let suffix = "__" ^ obj_type in
+              if String.length qname > String.length suffix &&
+                 String.sub qname (String.length qname - String.length suffix) (String.length suffix) = suffix then begin
+                let rec find_idx_in i = function
+                  | [] -> -1
+                  | f :: rest -> if f.fd_name = field then i else find_idx_in (i+1) rest
+                in
+                let idx = find_idx_in 0 fields in
+                let nf = List.length fields in
+                if idx >= 0 && (idx < !found_idx || (idx = !found_idx && nf < !found_nf)) then begin
+                  found := Some (Resolve.sanitize_ident qname, idx);
+                  found_idx := idx;
+                  found_nf := nf
+                end
+              end
             | _ -> ()
         ) ctx.res.Resolve.qualified;
-        if not !found then begin
-          emitf ctx "((%s*)tg_as_ptr(" (resolve_type ctx obj_type);
-          emit_expr ctx obj;
-          emitf ctx "))->%s" (c_ident field)
-        end
+        (* If qualified search didn't find anything, fall back to bare name *)
+        match !found with
+        | Some _ -> !found
+        | None ->
+          let fidx = Resolve.struct_field_index ctx.res obj_type field in
+          if fidx >= 0 then
+            Some (resolve_type ctx obj_type, fidx)
+          else
+            None
       end
+    in
+    if obj_type <> "" && Resolve.is_struct ctx.res obj_type then begin
+      (match resolve_struct_type obj_type field with
+       | Some (c_name, _) ->
+         emitf ctx "((%s*)tg_as_ptr(" c_name;
+         emit_expr ctx obj;
+         emitf ctx "))->%s" (c_ident field)
+       | None ->
+         (* Field not found in any variant of this struct — try any struct *)
+         (match find_best_struct_for_field field with
+          | Some best_name ->
+            emitf ctx "((%s*)tg_as_ptr(" best_name;
+            emit_expr ctx obj;
+            emitf ctx "))->%s" (c_ident field)
+          | None ->
+            emit ctx "/* unknown field access */ tg_field_get(";
+            emit_expr ctx obj;
+            emitf ctx ", 0) /* .%s */" field))
     end else if obj_type <> "" && Resolve.is_enum ctx.res obj_type then begin
       (* Enum field access — check if field is a variant name *)
       (match Resolve.find_variant_in_enum ctx.res obj_type field with
@@ -687,11 +1090,34 @@ let rec emit_expr ctx expr =
          emitf ctx "((%s*)tg_as_ptr(" (resolve_type ctx obj_type);
          emit_expr ctx obj;
          emitf ctx "))->%s" (c_ident field))
+    end else if obj_type <> "" then begin
+      (* Type known but not resolved as struct/enum — try module-qualified struct lookup *)
+      (match resolve_struct_type obj_type field with
+       | Some (c_name, _) ->
+         emitf ctx "((%s*)tg_as_ptr(" c_name;
+         emit_expr ctx obj;
+         emitf ctx "))->%s" (c_ident field)
+       | None ->
+         (match find_best_struct_for_field field with
+          | Some best_name ->
+            emitf ctx "((%s*)tg_as_ptr(" best_name;
+            emit_expr ctx obj;
+            emitf ctx "))->%s" (c_ident field)
+          | None ->
+            emit ctx "/* unknown field access */ tg_field_get(";
+            emit_expr ctx obj;
+            emitf ctx ", 0) /* .%s */" field))
     end else begin
-      (* Unknown type — try generic access *)
-      emit ctx "/* unknown field access */ tg_field_get(";
-      emit_expr ctx obj;
-      emitf ctx ", 0) /* .%s */" field
+      (* Unknown type — find best matching struct for this field name *)
+      (match find_best_struct_for_field field with
+       | Some best_name ->
+         emitf ctx "((%s*)tg_as_ptr(" best_name;
+         emit_expr ctx obj;
+         emitf ctx "))->%s" (c_ident field)
+       | None ->
+         emit ctx "/* unknown field access */ tg_field_get(";
+         emit_expr ctx obj;
+         emitf ctx ", 0) /* .%s */" field)
     end
 
   | EIndex (obj, idx, _) ->
@@ -734,7 +1160,11 @@ let rec emit_expr ctx expr =
       emitf ctx "%s* _sl = (%s*)tg_alloc(sizeof(%s)); " c_name c_name c_name;
       List.iter (fun (fname, fexpr) ->
         emitf ctx "_sl->%s = " (c_ident fname);
-        emit_expr ctx fexpr;
+        (* Check if Map::new()/Set::new() should use integer keys based on struct field type *)
+        let ftyp = try (List.find (fun f -> f.fd_name = fname) struct_fields).fd_typ
+                   with Not_found -> TyInfer in
+        if not (emit_map_set_for_field_typ ctx fexpr ftyp) then
+          emit_expr ctx fexpr;
         emit ctx "; ";
       ) fields;
       emit ctx "tg_from_ptr(_sl); })"
@@ -818,12 +1248,65 @@ let rec emit_expr ctx expr =
     (* Track scrutinee type for correct enum casts in match arms *)
     let scrut_tname = expr_type_name ctx scrutinee in
     if scrut_tname <> "" then set_var_type ctx (tmp ^ "_scrut") scrut_tname;
+    (* Track Option inner type for propagating through Some(f) arms *)
+    let opt_inner = expr_option_inner_type ctx scrutinee in
+    if opt_inner <> "" then set_var_type ctx (tmp ^ "_option_inner") opt_inner;
+    (* Track Result Ok inner type for propagating through Ok(x) arms *)
+    (match expr_result_ok_full_type ctx scrutinee with
+     | Some ft ->
+       let tname = Resolve.type_name_string_of_typ ft in
+       if tname <> "" then
+         set_var_type_full ctx (tmp ^ "_result_ok_inner") tname ft
+     | None -> ());
     emit_match_expr ctx tmp arms;
     emitf ctx "%s_res; })" tmp
 
-  | EWhile (_, _, _) | EFor (_, _, _, _) | ELoop (_, _) ->
-    (* These should be emitted as statements, not expressions *)
-    emit ctx "TG_NIL"
+  | EWhile (cond, body, _) ->
+    (* Emit while loop as GCC statement expression; loops return TG_NIL *)
+    emit ctx "({ while (";
+    emit_expr ctx cond;
+    emit ctx ") { ";
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "} TG_NIL; })"
+
+  | EFor (var, ERange (start, end_, inclusive, _), body, _) ->
+    (* Optimized for-in-range as expression *)
+    emitf ctx "({ for (TgVal %s = " (c_ident var);
+    emit_expr ctx start;
+    emitf ctx "; %s %s " (c_ident var) (if inclusive then "<=" else "<");
+    emit_expr ctx end_;
+    emitf ctx "; %s++) { " (c_ident var);
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "} TG_NIL; })"
+
+  | EFor (var, iter_expr, body, _) ->
+    (* General for-in as expression *)
+    let tmp = fresh_temp ctx in
+    let elem_type = infer_iter_element_type ctx iter_expr in
+    let iter_type = expr_type_name ctx iter_expr in
+    (* Wrap Map/Set iterables with conversion to Vec *)
+    emitf ctx "({ TgVec* %s_v = (TgVec*)tg_as_ptr(" tmp;
+    if is_map_type iter_type || iter_type = "Map" then
+      emit ctx "tg_map_entries("
+    else if is_set_type iter_type || iter_type = "Set" then
+      emit ctx "tg_set_to_vec(";
+    emit_expr ctx iter_expr;
+    if is_map_type iter_type || iter_type = "Map"
+       || is_set_type iter_type || iter_type = "Set" then
+      emit ctx ")";
+    emitf ctx "); TgVal %s_r = TG_NIL; " tmp;
+    emitf ctx "if (%s_v) for (int64_t %s_i = 0; %s_i < %s_v->len; %s_i++) { "
+      tmp tmp tmp tmp tmp;
+    emitf ctx "TgVal %s = %s_v->data[%s_i]; " (c_ident var) tmp tmp;
+    set_var_type ctx var elem_type;
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emitf ctx "} %s_r; })" tmp
+
+  | ELoop (body, _) ->
+    (* Infinite loop as expression — relies on break *)
+    emit ctx "({ while (1) { ";
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "} TG_NIL; })"
 
   | EBlock (stmts, _) ->
     emit ctx "({ ";
@@ -896,6 +1379,9 @@ and emit_block_expr ctx stmts =
     List.iteri (fun i s ->
       if i = last_idx then begin
         match s with
+        | SExpr (EWhile _ | EFor _ | ELoop _ as e) ->
+          (* Loop as last expr — emit loop then TG_NIL *)
+          emit_expr ctx e
         | SExpr e -> emit_expr ctx e
         | SLet { name; value; typ; _ } ->
           emitf ctx "TgVal %s = " (c_ident name);
@@ -906,7 +1392,14 @@ and emit_block_expr ctx stmts =
             | Some t -> Resolve.type_name_string_of_typ t
             | None -> expr_type_name ctx value
           in
-          if tname <> "" then set_var_type ctx name tname;
+          if tname <> "" then
+            (match typ with
+             | Some t -> set_var_type_full ctx name tname t
+             | None ->
+               (* Try to extract full type from expression for better propagation *)
+               (match expr_full_type ctx value with
+                | Some ft -> set_var_type_full ctx name tname ft
+                | None -> set_var_type ctx name tname));
           emit ctx "TG_NIL"
       end else begin
         emit_stmt_inline ctx s;
@@ -922,6 +1415,8 @@ and emit_block_expr_to ctx stmts target =
     emit_expr ctx e; emit ctx "; "
   | [SExpr (ENext _)] ->
     emit ctx "continue; "
+  | [SExpr (EWhile _ | EFor _ | ELoop _ as e)] ->
+    emit_stmt_inline ctx (SExpr e); emitf ctx " %s = TG_NIL; " target
   | [SExpr e] ->
     emitf ctx "%s = " target; emit_expr ctx e; emit ctx "; "
   | _ ->
@@ -933,6 +1428,8 @@ and emit_block_expr_to ctx stmts target =
           emit_expr ctx e; emit ctx "; "
         | SExpr (ENext _) ->
           emit ctx "continue; "
+        | SExpr (EWhile _ | EFor _ | ELoop _ as e) ->
+          emit_stmt_inline ctx (SExpr e); emitf ctx " %s = TG_NIL; " target
         | SExpr e ->
           emitf ctx "%s = " target; emit_expr ctx e; emit ctx "; "
         | SLet { name; value; typ; _ } ->
@@ -942,7 +1439,13 @@ and emit_block_expr_to ctx stmts target =
             | Some t -> Resolve.type_name_string_of_typ t
             | None -> expr_type_name ctx value
           in
-          if tname <> "" then set_var_type ctx name tname;
+          if tname <> "" then
+            (match typ with
+             | Some t -> set_var_type_full ctx name tname t
+             | None ->
+               (match expr_full_type ctx value with
+                | Some ft -> set_var_type_full ctx name tname ft
+                | None -> set_var_type ctx name tname));
           emitf ctx "%s = TG_NIL; " target
       end else begin
         emit_stmt_inline ctx s;
@@ -951,15 +1454,97 @@ and emit_block_expr_to ctx stmts target =
     ) stmts
 
 and emit_stmt_inline ctx = function
+  | SLet { name; value; typ = _; _ } when String.length name > 13 && String.sub name 0 13 = "_destructure_" ->
+    (* Tuple destructuring in inline context *)
+    let suffix = String.sub name 13 (String.length name - 13) in
+    let parts = String.split_on_char ',' suffix in
+    let tmp = fresh_temp ctx in
+    let elem_types =
+      match value with
+      | ECall (EIdent (fname, _), _, _) ->
+        (match Resolve.find_symbol ctx.res fname with
+         | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyTuple elems)); _ } ->
+           List.map Resolve.type_name_string_of_typ elems
+         | _ -> [])
+      | EMethodCall (obj, meth, _, _) ->
+        let ot = expr_type_name ctx obj in
+        (match Resolve.find_method ctx.res ot meth with
+         | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyTuple elems)); _ } ->
+           List.map Resolve.type_name_string_of_typ elems
+         | _ -> [])
+      | _ -> []
+    in
+    emitf ctx "TgVal %s_tup = " tmp;
+    emit_expr ctx value;
+    emit ctx "; ";
+    List.iteri (fun i part ->
+      if part <> "_" then begin
+        let cpart = c_ident part in
+        emitf ctx "TgVal %s = tg_tuple_get(%s_tup, %d); " cpart tmp i;
+        (match List.nth_opt elem_types i with
+         | Some t when t <> "" -> set_var_type ctx part t
+         | _ -> ())
+      end
+    ) parts
   | SLet { name; value; typ; _ } ->
     emitf ctx "TgVal %s = " (c_ident name);
-    emit_expr ctx value;
+    (* Emit Map/Set constructors with correct key type based on annotation *)
+    (match value, typ with
+     | ECall (EFieldAccess (EIdent (("Map" | "HashMap"), _), "new", _), [], _),
+       Some (TyName (("Map" | "HashMap"), (TyName (kt, _) :: _)))
+       when not (is_string_type kt) ->
+       emit ctx "tg_map_new()"
+     | ECall (EFieldAccess (EIdent (("Set" | "HashSet"), _), "new", _), [], _),
+       Some (TyName (("Set" | "HashSet"), (TyName (kt, _) :: _)))
+       when not (is_string_type kt) ->
+       emit ctx "tg_set_new()"
+     | _ -> emit_expr ctx value);
     emit ctx ";";
     let tname = match typ with
       | Some t -> Resolve.type_name_string_of_typ t
       | None -> expr_type_name ctx value
     in
-    if tname <> "" then set_var_type ctx name tname
+    if tname <> "" then
+      (match typ with
+       | Some t -> set_var_type_full ctx name tname t
+       | None ->
+         (match expr_full_type ctx value with
+          | Some ft -> set_var_type_full ctx name tname ft
+          | None -> set_var_type ctx name tname))
+  | SExpr (EWhile (cond, body, _)) ->
+    emit ctx "while ("; emit_expr ctx cond; emit ctx ") { ";
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "}"
+  | SExpr (EFor (var, ERange (start, end_, inclusive, _), body, _)) ->
+    emitf ctx "for (TgVal %s = " (c_ident var);
+    emit_expr ctx start;
+    emitf ctx "; %s %s " (c_ident var) (if inclusive then "<=" else "<");
+    emit_expr ctx end_;
+    emitf ctx "; %s++) { " (c_ident var);
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "}"
+  | SExpr (EFor (var, iter_expr, body, _)) ->
+    let tmp = fresh_temp ctx in
+    let iter_type = expr_type_name ctx iter_expr in
+    (* Wrap Map/Set iterables with conversion to Vec *)
+    emitf ctx "{ TgVec* %s_v = (TgVec*)tg_as_ptr(" tmp;
+    if is_map_type iter_type || iter_type = "Map" then
+      emit ctx "tg_map_entries("
+    else if is_set_type iter_type || iter_type = "Set" then
+      emit ctx "tg_set_to_vec(";
+    emit_expr ctx iter_expr;
+    if is_map_type iter_type || iter_type = "Map"
+       || is_set_type iter_type || iter_type = "Set" then
+      emit ctx ")";
+    emitf ctx "); if (%s_v) for (int64_t %s_i = 0; %s_i < %s_v->len; %s_i++) { "
+      tmp tmp tmp tmp tmp;
+    emitf ctx "TgVal %s = %s_v->data[%s_i]; " (c_ident var) tmp tmp;
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "} }"
+  | SExpr (ELoop (body, _)) ->
+    emit ctx "while (1) { ";
+    List.iter (fun s -> emit_stmt_inline ctx s; emit ctx " ") body;
+    emit ctx "}"
   | SExpr e ->
     emit_expr ctx e; emit ctx ";"
 
@@ -1001,6 +1586,19 @@ and emit_method_call ctx obj method_name args =
       (match args with [a] -> emit_expr ctx a | _ -> emit ctx "TG_NIL");
       emit ctx "), TG_NIL)"
     | "pop" -> emit ctx "tg_vec_pop("; emit_expr ctx obj; emit ctx ")"
+    | "char_at" ->
+      emit ctx "tg_str_char_at("; emit_expr ctx obj; emit ctx ", ";
+      (match args with [a] -> emit_expr ctx a | _ -> emit ctx "0");
+      emit ctx ")"
+    | "push_str" ->
+      emit ctx "tg_str_push_str("; emit_expr ctx obj; emit ctx ", ";
+      (match args with [a] -> emit_expr ctx a | _ -> emit ctx "TG_NIL");
+      emit ctx ")"
+    | "push_char" ->
+      emit ctx "tg_str_push_char("; emit_expr ctx obj; emit ctx ", ";
+      (match args with [a] -> emit_expr ctx a | _ -> emit ctx "0");
+      emit ctx ")"
+    | "to_int" -> emit ctx "tg_str_to_int("; emit_expr ctx obj; emit ctx ")"
     | "iter" | "into_iter" -> emit ctx "/* .iter() */ ("; emit_expr ctx obj; emit ctx ")"
     | "unwrap" -> emit ctx "tg_option_unwrap("; emit_expr ctx obj; emit ctx ")"
     | "unwrap_or" ->
@@ -1196,6 +1794,7 @@ and emit_string_method ctx obj meth args =
   | "chars" -> emit ctx "tg_str_chars("; emit_expr ctx obj; emit ctx ")"
   | "to_string" -> emit_expr ctx obj
   | "to_int" -> emit ctx "tg_str_to_int("; emit_expr ctx obj; emit ctx ")"
+  | "parse_int" | "parse" -> emit ctx "tg_str_parse_int("; emit_expr ctx obj; emit ctx ")"
   | "parse_float" -> emit ctx "tg_str_parse_float("; emit_expr ctx obj; emit ctx ")"
   | "push_str" | "push" ->
     emit ctx "tg_str_push_str("; emit_expr ctx obj; emit ctx ", ";
@@ -1481,16 +2080,92 @@ and emit_assign_expr ctx lhs rhs =
 
   | EFieldAccess (obj, field, _) ->
     let obj_type = expr_type_name ctx obj in
-    if obj_type <> "" && Resolve.is_struct ctx.res obj_type then begin
-      emitf ctx "((%s*)tg_as_ptr(" (resolve_type ctx obj_type);
-      emit_expr ctx obj;
-      emitf ctx "))->%s = " (c_ident field);
-      emit_expr ctx rhs
-    end else begin
-      emit ctx "/* assign field */ ";
-      emit_expr ctx obj;
-      emitf ctx "/* .%s = */ " field
-    end
+    (* Try to find a struct type for this field assignment *)
+    let try_resolve () =
+      (* 1. If we have a type name, try module-qualified resolution *)
+      if obj_type <> "" then begin
+        let qualified = ctx.current_module ^ "__" ^ obj_type in
+        let qfidx = Resolve.struct_field_index ctx.res qualified field in
+        if qfidx >= 0 then
+          Some (Resolve.sanitize_ident qualified)
+        else begin
+          let fidx = Resolve.struct_field_index ctx.res obj_type field in
+          if fidx >= 0 then
+            Some (resolve_type ctx obj_type)
+          else begin
+            (* Search all module-qualified variants *)
+            let found = ref None in
+            Hashtbl.iter (fun qname sym ->
+              if !found = None then
+                match sym.Resolve.sym_kind with
+                | Resolve.SkStruct fields ->
+                  let suffix = "__" ^ obj_type in
+                  if String.length qname > String.length suffix &&
+                     String.sub qname (String.length qname - String.length suffix) (String.length suffix) = suffix then
+                    let has_field = List.exists (fun f -> f.fd_name = field) fields in
+                    if has_field then found := Some (Resolve.sanitize_ident qname)
+                | _ -> ()
+            ) ctx.res.Resolve.qualified;
+            !found
+          end
+        end
+      end else
+        None
+    in
+    let try_best_struct () =
+      (* Search all structs for one that has this field (lowest index) *)
+      let best = ref None in
+      let best_idx = ref max_int in
+      Hashtbl.iter (fun _qname sym ->
+        match sym.Resolve.sym_kind with
+        | Resolve.SkStruct fields ->
+          let rec find_idx i = function
+            | [] -> -1
+            | f :: rest -> if f.fd_name = field then i else find_idx (i+1) rest
+          in
+          let idx = find_idx 0 fields in
+          if idx >= 0 && idx < !best_idx then begin
+            best := Some (resolve_type ctx sym.Resolve.sym_name);
+            best_idx := idx
+          end
+        | _ -> ()
+      ) ctx.res.Resolve.symbols;
+      Hashtbl.iter (fun qname sym ->
+        match sym.Resolve.sym_kind with
+        | Resolve.SkStruct fields ->
+          let rec find_idx i = function
+            | [] -> -1
+            | f :: rest -> if f.fd_name = field then i else find_idx (i+1) rest
+          in
+          let idx = find_idx 0 fields in
+          if idx >= 0 && idx < !best_idx then begin
+            best := Some qname;
+            best_idx := idx
+          end
+        | _ -> ()
+      ) ctx.res.Resolve.qualified;
+      !best
+    in
+    let struct_name =
+      match try_resolve () with
+      | Some sn -> Some sn
+      | None -> try_best_struct ()
+    in
+    (match struct_name with
+     | Some sn ->
+       emitf ctx "((%s*)tg_as_ptr(" sn;
+       emit_expr ctx obj;
+       emitf ctx "))->%s = " (c_ident field);
+       (* Check if Map::new()/Set::new() should use integer keys based on field type *)
+       let ftyp = if obj_type <> "" then struct_field_typ ctx obj_type field else None in
+       let emitted = match ftyp with
+         | Some t -> emit_map_set_for_field_typ ctx rhs t
+         | None -> false in
+       if not emitted then emit_expr ctx rhs
+     | None ->
+       emit ctx "/* assign field UNKNOWN */ ";
+       emit_expr ctx obj;
+       emitf ctx "/* .%s = */ " field)
 
   | EIndex (obj, idx, _) ->
     emit ctx "tg_vec_set("; emit_expr ctx obj; emit ctx ", ";
@@ -1619,15 +2294,48 @@ and emit_nested_pattern_bindings_stmt ctx unwrapped_var sub_pats =
     ) sub_pats
 
 and emit_match_expr ctx tmp arms =
+  (* Check if a sub-pattern is conditional (needs tag check) *)
+  let rec pat_is_conditional = function
+    | PatVariant _ -> true
+    | PatLit _ -> true
+    | PatBind (name, _) when String.contains name ':' -> true
+    | PatBind (name, _) when Resolve.is_variant ctx.res name -> true
+    | PatOr _ -> true
+    | PatStruct (sname, _, _) when Resolve.is_variant ctx.res sname -> true
+    | PatTuple (subs, _) -> List.exists pat_is_conditional subs
+    | _ -> false
+  in
+  (* Separate conditional arms from wildcard/else arms *)
+  let is_wildcard arm = match arm.pat with
+    | PatWild _ -> true
+    | PatBind (name, _) when not (String.contains name ':')
+      && not (Resolve.is_variant ctx.res name) -> true
+    | PatMut _ -> true
+    | PatTuple (subs, _) when not (List.exists pat_is_conditional subs) -> true
+    | _ -> false
+  in
+  let cond_arms = List.filter (fun a -> not (is_wildcard a)) arms in
+  let wild_arms = List.filter is_wildcard arms in
+  let first = ref true in
   List.iter (fun arm ->
-    emit_match_arm_expr ctx tmp arm
-  ) arms
+    emit_match_arm_expr ctx tmp arm ~is_first:!first;
+    first := false
+  ) cond_arms;
+  (* Emit wildcard/else arm *)
+  (match wild_arms with
+   | arm :: _ ->
+     if not !first then emit ctx "else ";
+     emit_match_arm_expr ctx tmp arm ~is_first:true
+   | [] -> ())
 
-and emit_match_arm_expr ctx tmp arm =
+and emit_match_arm_expr ctx tmp arm ~is_first =
   let res = tmp ^ "_res" in
+  let if_kw = if is_first then "if" else "else if" in
   match arm.pat with
   | PatWild _ ->
-    emit_block_expr_to ctx arm.arm_body res
+    emit ctx "{ ";
+    emit_block_expr_to ctx arm.arm_body res;
+    emit ctx "} "
 
   | PatBind (name, _) when String.contains name ':' ->
     (* Qualified 0-arity variant: EnumName::VariantName *)
@@ -1636,8 +2344,20 @@ and emit_match_arm_expr ctx tmp arm =
       else get_var_type ctx (tmp ^ "_scrut") |> Option.value ~default:"" in
     (match Resolve.find_variant_prefer_enum ctx.res vname 0 ~prefer_enum:prefer with
      | Some vi ->
-       emitf ctx "if (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) { "
-         (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) { "
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       emit_block_expr_to ctx arm.arm_body res;
+       emit ctx "} "
+     | None ->
+       emitf ctx "/* unknown 0-arity variant %s */ " name)
+
+  | PatBind (name, _) when Resolve.is_variant ctx.res name ->
+    (* Unqualified 0-arity variant: e.g. Wasm32 *)
+    let prefer = get_var_type ctx (tmp ^ "_scrut") |> Option.value ~default:"" in
+    (match Resolve.find_variant_prefer_enum ctx.res name 0 ~prefer_enum:prefer with
+     | Some vi ->
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) { "
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
        emit_block_expr_to ctx arm.arm_body res;
        emit ctx "} "
      | None ->
@@ -1655,9 +2375,16 @@ and emit_match_arm_expr ctx tmp arm =
     emit ctx "} "
 
   | PatLit lit ->
-    emit ctx "if (";
-    emitf ctx "%s_scrut == " tmp;
-    emit_expr ctx lit;
+    emitf ctx "%s (" if_kw;
+    (match lit with
+     | EStr _ ->
+       emit ctx "tg_str_eq(";
+       emitf ctx "%s_scrut, " tmp;
+       emit_expr ctx lit;
+       emit ctx ")"
+     | _ ->
+       emitf ctx "%s_scrut == " tmp;
+       emit_expr ctx lit);
     emit ctx ") { ";
     emit_block_expr_to ctx arm.arm_body res;
     emit ctx "} "
@@ -1666,25 +2393,57 @@ and emit_match_arm_expr ctx tmp arm =
     let (enum_hint, vname) = split_qualified_variant vname_raw in
     (* Handle builtin Option/Result variants first *)
     if vname = "Some" then begin
-      emitf ctx "if (tg_option_is_some(%s_scrut)) { " tmp;
-      let unwrapped = tmp ^ "_unwrapped" in
-      emitf ctx "TgVal %s = tg_option_unwrap(%s_scrut); " unwrapped tmp;
-      emit_nested_pattern_bindings_expr ctx unwrapped sub_pats;
-      emit_block_expr_to ctx arm.arm_body res;
-      emit ctx "} "
+      (* Check if sub-pattern is a literal — need both is_some AND value check *)
+      (match sub_pats with
+       | [PatLit lit] ->
+         (match lit with
+          | EStr _ ->
+            emitf ctx "%s (tg_option_is_some(%s_scrut) && tg_str_eq(tg_option_unwrap(%s_scrut), " if_kw tmp tmp;
+            emit_expr ctx lit;
+            emit ctx ")) { "
+          | _ ->
+            emitf ctx "%s (tg_option_is_some(%s_scrut) && tg_option_unwrap(%s_scrut) == " if_kw tmp tmp;
+            emit_expr ctx lit;
+            emit ctx ") { ");
+         emit_block_expr_to ctx arm.arm_body res;
+         emit ctx "} "
+       | _ ->
+         emitf ctx "%s (tg_option_is_some(%s_scrut)) { " if_kw tmp;
+         let unwrapped = tmp ^ "_unwrapped" in
+         emitf ctx "TgVal %s = tg_option_unwrap(%s_scrut); " unwrapped tmp;
+         emit_nested_pattern_bindings_expr ctx unwrapped sub_pats;
+         (* Propagate Option inner type to bound variables *)
+         (match sub_pats with
+          | [PatBind (n, _)] | [PatMut (n, _)] ->
+            let inner = match get_var_type ctx (tmp ^ "_option_inner") with
+              | Some t when t <> "" -> t | _ -> "" in
+            if inner <> "" then set_var_type ctx n inner
+          | _ -> ());
+         emit_block_expr_to ctx arm.arm_body res;
+         emit ctx "} ")
     end else if vname = "None" then begin
-      emitf ctx "if (tg_option_is_none(%s_scrut)) { " tmp;
+      emitf ctx "%s (tg_option_is_none(%s_scrut)) { " if_kw tmp;
       emit_block_expr_to ctx arm.arm_body res;
       emit ctx "} "
     end else if vname = "Ok" then begin
-      emitf ctx "if (tg_result_is_ok(%s_scrut)) { " tmp;
+      emitf ctx "%s (tg_result_is_ok(%s_scrut)) { " if_kw tmp;
       let unwrapped = tmp ^ "_ok_unwrapped" in
       emitf ctx "TgVal %s = tg_result_unwrap(%s_scrut); " unwrapped tmp;
       emit_nested_pattern_bindings_expr ctx unwrapped sub_pats;
+      (* Propagate Result Ok inner type to bound variables *)
+      (match sub_pats with
+       | [PatBind (n, _)] | [PatMut (n, _)] ->
+         (match List.assoc_opt (tmp ^ "_result_ok_inner") ctx.var_types with
+          | Some { v_type = t; v_full_type = ft; _ } when t <> "" ->
+            (match ft with
+             | Some full_t -> set_var_type_full ctx n t full_t
+             | None -> set_var_type ctx n t)
+          | _ -> ())
+       | _ -> ());
       emit_block_expr_to ctx arm.arm_body res;
       emit ctx "} "
     end else if vname = "Err" then begin
-      emitf ctx "if (tg_result_is_err(%s_scrut)) { " tmp;
+      emitf ctx "%s (tg_result_is_err(%s_scrut)) { " if_kw tmp;
       let unwrapped = tmp ^ "_err_unwrapped" in
       emitf ctx "TgVal %s = tg_result_unwrap_err(%s_scrut); " unwrapped tmp;
       emit_nested_pattern_bindings_expr ctx unwrapped sub_pats;
@@ -1696,8 +2455,8 @@ and emit_match_arm_expr ctx tmp arm =
     let prefer = if enum_hint <> "" then enum_hint else scrut_type in
     (match Resolve.find_variant_prefer_enum ctx.res vname (List.length sub_pats) ~prefer_enum:prefer with
      | Some vi ->
-       emitf ctx "if (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) { "
-         (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) { "
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
        List.iteri (fun i sub ->
          match sub with
          | PatBind (n, _) ->
@@ -1748,8 +2507,8 @@ and emit_match_arm_expr ctx tmp arm =
       match Resolve.find_variant ctx.res sname with
       | Some vi ->
         let tag_val = Printf.sprintf "%s_%s__new" (resolve_enum_type ctx vi) (c_ident sname) in
-        emitf ctx "if ((((%s*)tg_as_ptr(%s_scrut))->_tag) == (TgVal)(intptr_t)%s) { "
-          (resolve_enum_type ctx vi) tmp tag_val;
+        emitf ctx "%s ((((%s*)tg_as_ptr(%s_scrut))->_tag) == (TgVal)(intptr_t)%s) { "
+          if_kw (resolve_enum_type ctx vi) tmp tag_val;
         emitf ctx "%s* _ps = (%s*)tg_as_ptr(%s_scrut); "
           (resolve_enum_type ctx vi) (resolve_enum_type ctx vi) tmp;
         List.iteri (fun i (fname, pat_opt) ->
@@ -1792,54 +2551,140 @@ and emit_match_arm_expr ctx tmp arm =
     end
 
   | PatTuple (pats, _) ->
-    List.iteri (fun i sub ->
-      match sub with
-      | PatBind (n, _) when String.contains n ':' ->
-        (* Qualified 0-arity variant in tuple, e.g. Type::Unit — skip binding *)
-        ()
-      | PatBind (n, _) when Resolve.is_variant ctx.res n ->
-        (* 0-arity variant in tuple — just skip (it's a match check, not a binding) *)
-        ()
-      | PatBind (n, _) ->
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
-      | PatMut (n, _) ->
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
-      | PatWild _ -> ()
-      | PatVariant (vname, inner_pats, _) ->
-        (* Nested variant in tuple — extract tuple element, then destructure *)
-        let elem_var = Printf.sprintf "_tup_%d" i in
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " elem_var tmp i;
-        (if vname = "Some" then begin
-          match inner_pats with
-          | [PatBind (n, _)] ->
-            emitf ctx "TgVal %s = tg_option_unwrap(%s); " (c_ident n) elem_var
-          | _ -> ()
-        end else
-          match Resolve.find_variant_by_arity ctx.res vname (List.length inner_pats) with
-          | Some vi ->
-            List.iteri (fun j sub2 ->
-              match sub2 with
-              | PatBind (n, _) ->
-                emitf ctx "TgVal %s = ((%s*)tg_as_ptr(%s))->_f%d; "
-                  (c_ident n) (resolve_enum_type ctx vi) elem_var j
-              | _ -> ()
-            ) inner_pats
-          | None ->
-            List.iteri (fun _j sub2 ->
-              match sub2 with
-              | PatBind (n, _) ->
-                emitf ctx "TgVal %s = %s; " (c_ident n) elem_var
-              | _ -> ()
-            ) inner_pats)
-      | PatLit _ -> () (* literal pattern in tuple — skip for now *)
-      | _ -> ()
-    ) pats;
-    emit_block_expr_to ctx arm.arm_body res
+    (* Check if any sub-pattern needs a conditional check *)
+    let sub_is_conditional = function
+      | PatVariant _ -> true
+      | PatLit _ -> true
+      | PatBind (name, _) when String.contains name ':' -> true
+      | PatBind (name, _) when Resolve.is_variant ctx.res name -> true
+      | _ -> false
+    in
+    let has_conditions = List.exists sub_is_conditional pats in
+    if has_conditions then begin
+      (* Build condition: check each variant sub-pattern's tag *)
+      emitf ctx "%s (" if_kw;
+      let first_cond = ref true in
+      List.iteri (fun i sub ->
+        let elem_expr = Printf.sprintf "tg_tuple_get(%s_scrut, %d)" tmp i in
+        (match sub with
+         | PatVariant (vname, inner_pats, _) ->
+           let (_enum_hint, vname_clean) = split_qualified_variant vname in
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           if vname_clean = "Some" then
+             emitf ctx "tg_option_is_some(%s)" elem_expr
+           else if vname_clean = "None" then
+             emitf ctx "tg_option_is_none(%s)" elem_expr
+           else if vname_clean = "Ok" then
+             emitf ctx "tg_result_is_ok(%s)" elem_expr
+           else if vname_clean = "Err" then
+             emitf ctx "tg_result_is_err(%s)" elem_expr
+           else begin
+             let enum_hint = fst (split_qualified_variant vname) in
+             let prefer = if enum_hint <> "" then enum_hint else "" in
+             match Resolve.find_variant_prefer_enum ctx.res vname_clean (List.length inner_pats) ~prefer_enum:prefer with
+             | Some vi ->
+               emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                 (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+             | None ->
+               emit ctx "1 /* unknown variant */"
+           end
+         | PatBind (name, _) when String.contains name ':' ->
+           let (_eh, vn) = split_qualified_variant name in
+           let prefer = if _eh <> "" then _eh else "" in
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           (match Resolve.find_variant_prefer_enum ctx.res vn 0 ~prefer_enum:prefer with
+            | Some vi ->
+              emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+            | None -> emit ctx "1")
+         | PatBind (name, _) when Resolve.is_variant ctx.res name ->
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           (match Resolve.find_variant_prefer_enum ctx.res name 0 ~prefer_enum:"" with
+            | Some vi ->
+              emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+            | None -> emit ctx "1")
+         | _ -> () (* Non-conditional sub-patterns don't contribute to condition *)
+        )
+      ) pats;
+      emit ctx ") { ";
+      (* Extract bindings *)
+      List.iteri (fun i sub ->
+        match sub with
+        | PatBind (n, _) when String.contains n ':' -> ()
+        | PatBind (n, _) when Resolve.is_variant ctx.res n -> ()
+        | PatBind (n, _) ->
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
+        | PatMut (n, _) ->
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
+        | PatWild _ -> ()
+        | PatVariant (vname, inner_pats, _) ->
+          let elem_var = Printf.sprintf "_tup_%d" i in
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " elem_var tmp i;
+          let (_eh, vname_clean) = split_qualified_variant vname in
+          (if vname_clean = "Some" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emitf ctx "TgVal %s = tg_option_unwrap(%s); " (c_ident n) elem_var
+            | _ -> ()
+          end else if vname_clean = "Ok" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emitf ctx "TgVal %s = tg_result_unwrap(%s); " (c_ident n) elem_var
+            | _ -> ()
+          end else if vname_clean = "Err" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emitf ctx "TgVal %s = tg_result_unwrap_err(%s); " (c_ident n) elem_var
+            | _ -> ()
+          end else begin
+            let enum_hint = fst (split_qualified_variant vname) in
+            let prefer = if enum_hint <> "" then enum_hint else "" in
+            match Resolve.find_variant_by_arity ctx.res vname_clean (List.length inner_pats) with
+            | Some vi ->
+              List.iteri (fun j sub2 ->
+                match sub2 with
+                | PatBind (n, _) ->
+                  emitf ctx "TgVal %s = ((%s*)tg_as_ptr(%s))->_f%d; "
+                    (c_ident n) (resolve_enum_type ctx vi) elem_var j
+                | _ -> ()
+              ) inner_pats
+            | None ->
+              ignore prefer;
+              List.iteri (fun _j sub2 ->
+                match sub2 with
+                | PatBind (n, _) ->
+                  emitf ctx "TgVal %s = %s; " (c_ident n) elem_var
+                | _ -> ()
+              ) inner_pats
+          end)
+        | _ -> ()
+      ) pats;
+      emit_block_expr_to ctx arm.arm_body res;
+      emit ctx "} "
+    end else begin
+      (* Purely binding tuple — unconditional *)
+      emit ctx "{ ";
+      List.iteri (fun i sub ->
+        match sub with
+        | PatBind (n, _) ->
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
+        | PatMut (n, _) ->
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d); " (c_ident n) tmp i
+        | PatWild _ -> ()
+        | _ -> ()
+      ) pats;
+      emit_block_expr_to ctx arm.arm_body res;
+      emit ctx "} "
+    end
 
   | PatOr (p1, p2, _loc) ->
     (* Desugar: try p1, then p2 *)
-    emit_match_arm_expr ctx tmp { arm with pat = p1 };
-    emit_match_arm_expr ctx tmp { arm with pat = p2 }
+    emit_match_arm_expr ctx tmp { arm with pat = p1 } ~is_first;
+    emit_match_arm_expr ctx tmp { arm with pat = p2 } ~is_first:false
 
 (* ── Closure codegen ───────────────────────────────────────────────── *)
 
@@ -1965,9 +2810,10 @@ and emit_closure ctx params body =
   (* Unpack params from _arg *)
   (match params with
    | [] -> ()
-   | [{cp_name; _}] ->
+   | [{cp_name; cp_typ; _}] ->
      Buffer.add_string fn_body (Printf.sprintf "    TgVal %s = _arg;\n" (c_ident cp_name));
-     set_var_type ctx cp_name "";
+     let tname = match cp_typ with Some t -> Resolve.type_name_string_of_typ t | None -> "" in
+     set_var_type ctx cp_name tname;
      (* Handle tuple destructuring: _destructure_a,b or a_b names *)
      let is_destructure = (String.length cp_name > 13 && String.sub cp_name 0 13 = "_destructure_") in
      if is_destructure then begin
@@ -1986,7 +2832,8 @@ and emit_closure ctx params body =
      List.iteri (fun i p ->
        Buffer.add_string fn_body
          (Printf.sprintf "    TgVal %s = tg_tuple_get(_arg, %d);\n" (c_ident p.cp_name) i);
-       set_var_type ctx p.cp_name ""
+       let tname = match p.cp_typ with Some t -> Resolve.type_name_string_of_typ t | None -> "" in
+       set_var_type ctx p.cp_name tname
      ) params);
   (* Emit body into the function buffer *)
   let saved_buf = ctx.buf in
@@ -2071,24 +2918,134 @@ let rec emit_stmt ctx stmt =
     let suffix = String.sub name 13 (String.length name - 13) in
     let parts = String.split_on_char ',' suffix in
     let tmp = fresh_temp ctx in
+    (* Try to infer tuple element types from the value expression *)
+    let elem_types =
+      match value with
+      | ECall (EIdent (fname, _), _, _) ->
+        (match Resolve.find_symbol ctx.res fname with
+         | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyTuple elems)); _ } ->
+           List.map Resolve.type_name_string_of_typ elems
+         | _ -> [])
+      | EMethodCall (obj, meth, _, _) ->
+        let ot = expr_type_name ctx obj in
+        (match Resolve.find_method ctx.res ot meth with
+         | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyTuple elems)); _ } ->
+           List.map Resolve.type_name_string_of_typ elems
+         | _ -> [])
+      | _ -> []
+    in
     emitf ctx "TgVal %s_tup = " tmp;
     emit_expr ctx value;
     emit ctx ";\n";
     List.iteri (fun i part ->
       if part <> "_" then begin
         emit_indent ctx;
-        emitf ctx "TgVal %s = tg_tuple_get(%s_tup, %d);\n" (c_ident part) tmp i
+        let cpart = c_ident part in
+        Hashtbl.replace ctx.block_declared cpart true;
+        emitf ctx "TgVal %s = tg_tuple_get(%s_tup, %d);\n" cpart tmp i;
+        (* Set type from tuple element type if available *)
+        (match List.nth_opt elem_types i with
+         | Some t when t <> "" -> set_var_type ctx part t
+         | _ -> ())
       end
     ) parts
+  | SLet { name; value = EClosure (params, _ret, body, _) as value; typ; _ } ->
+    (* For closures (including nested function defs), pre-register the variable
+       so recursive closures can capture themselves *)
+    set_var_type ctx name "Closure";
+    let cname = c_ident name in
+    (* Detect self-recursive closures: does the body reference its own name? *)
+    let param_names = List.map (fun p -> p.cp_name) params in
+    let free_vars_raw = collect_free_vars_expr ctx param_names body in
+    let is_self_recursive = List.mem name free_vars_raw in
+    if is_self_recursive then begin
+      (* Self-recursive closure: pre-declare as TG_NIL, construct, then patch env *)
+      (* Compute free_vars BEFORE emit_expr, since emit_closure modifies ctx
+         by setting types for closure-local variables. We need the same free_vars
+         that emit_closure will compute inside, which happens before body processing. *)
+      let seen = Hashtbl.create 16 in
+      let free_vars = List.filter (fun v ->
+        if Hashtbl.mem seen v then false
+        else begin
+          Hashtbl.replace seen v true;
+          match get_var_type ctx v with Some _ -> true | None -> false
+        end
+      ) free_vars_raw in
+      let nfv = List.length free_vars in
+      let self_idx = let rec find i = function
+        | [] -> 0
+        | v :: rest -> if v = name then i else find (i+1) rest
+        in find 0 free_vars in
+      if not (Hashtbl.mem ctx.block_declared cname) then begin
+        Hashtbl.replace ctx.block_declared cname true;
+        emitf ctx "TgVal %s = TG_NIL;\n" cname;
+        emit_indent ctx
+      end;
+      emitf ctx "%s = " cname;
+      emit_expr ctx value;
+      emit ctx ";\n";
+      (* Patch the env to include the closure itself *)
+      emit_indent ctx;
+      if nfv = 1 then
+        (* Single free var (just self): env = closure itself *)
+        emitf ctx "((TgClosure*)tg_as_ptr(%s))->env = %s;\n" cname cname
+      else if nfv <= 3 then
+        (* Tuple env: patch the element at self_idx *)
+        emitf ctx "((TgVal*)tg_as_ptr(((TgClosure*)tg_as_ptr(%s))->env))[%d] = %s;\n"
+          cname (1 + self_idx) cname
+      else
+        (* Vec env: patch the element *)
+        emitf ctx "((TgVec*)tg_as_ptr(((TgClosure*)tg_as_ptr(%s))->env))->data[%d] = %s;\n"
+          cname self_idx cname
+    end else begin
+      (* Non-recursive closure: normal single-step construction *)
+      if Hashtbl.mem ctx.block_declared cname then
+        emitf ctx "%s = " cname
+      else begin
+        Hashtbl.replace ctx.block_declared cname true;
+        emitf ctx "TgVal %s = " cname
+      end;
+      emit_expr ctx value;
+      emit ctx ";\n"
+    end;
+    let tname = match typ with
+      | Some t -> Resolve.type_name_string_of_typ t
+      | None -> "Closure"
+    in
+    set_var_type ctx name tname
+
   | SLet { name; value; typ; _ } ->
-    emitf ctx "TgVal %s = " (c_ident name);
-    emit_expr ctx value;
+    let cname = c_ident name in
+    if Hashtbl.mem ctx.block_declared cname then
+      emitf ctx "%s = " cname
+    else begin
+      Hashtbl.replace ctx.block_declared cname true;
+      emitf ctx "TgVal %s = " cname
+    end;
+    (* Emit Map/Set constructors with correct key type based on annotation *)
+    (match value, typ with
+     | ECall (EFieldAccess (EIdent (("Map" | "HashMap"), _), "new", _), [], _),
+       Some (TyName (("Map" | "HashMap"), (TyName (kt, _) :: _)))
+       when not (is_string_type kt) ->
+       emit ctx "tg_map_new()"
+     | ECall (EFieldAccess (EIdent (("Set" | "HashSet"), _), "new", _), [], _),
+       Some (TyName (("Set" | "HashSet"), (TyName (kt, _) :: _)))
+       when not (is_string_type kt) ->
+       emit ctx "tg_set_new()"
+     | _ -> emit_expr ctx value);
     emit ctx ";\n";
     let tname = match typ with
       | Some t -> Resolve.type_name_string_of_typ t
       | None -> expr_type_name ctx value
     in
-    set_var_type ctx name tname
+    if tname <> "" then
+      (match typ with
+       | Some t -> set_var_type_full ctx name tname t
+       | None ->
+         (match expr_full_type ctx value with
+          | Some ft -> set_var_type_full ctx name tname ft
+          | None -> set_var_type ctx name tname))
+    else set_var_type ctx name tname
 
   | SExpr (EIf (branches, else_body, _)) ->
     emit_if_stmt ctx branches else_body
@@ -2120,8 +3077,18 @@ let rec emit_stmt ctx stmt =
   | SExpr (EFor (var, iter_expr, body, _)) ->
     (* General for-in: iterate over collection *)
     let tmp = fresh_temp ctx in
+    let elem_type = infer_iter_element_type ctx iter_expr in
+    let iter_type = expr_type_name ctx iter_expr in
+    (* Wrap Map/Set iterables with conversion to Vec *)
     emitf ctx "{ TgVec* %s_v = (TgVec*)tg_as_ptr(" tmp;
+    if is_map_type iter_type || iter_type = "Map" then
+      emit ctx "tg_map_entries("
+    else if is_set_type iter_type || iter_type = "Set" then
+      emit ctx "tg_set_to_vec(";
     emit_expr ctx iter_expr;
+    if is_map_type iter_type || iter_type = "Map"
+       || is_set_type iter_type || iter_type = "Set" then
+      emit ctx ")";
     emitf ctx ");\n";
     emit_indent ctx;
     emitf ctx "  if (%s_v) for (int64_t %s_i = 0; %s_i < %s_v->len; %s_i++) {\n"
@@ -2129,7 +3096,7 @@ let rec emit_stmt ctx stmt =
     indent ctx;
     emit_indent ctx;
     emitf ctx "TgVal %s = %s_v->data[%s_i];\n" (c_ident var) tmp tmp;
-    set_var_type ctx var "";
+    set_var_type ctx var elem_type;
     (* Handle tuple destructuring in for loops *)
     (let is_destructure = (String.length var > 13 && String.sub var 0 13 = "_destructure_") in
     let has_comma = String.contains var ',' in
@@ -2200,7 +3167,10 @@ let rec emit_stmt ctx stmt =
     emit ctx ";\n")
 
 and emit_stmts ctx stmts =
-  List.iter (emit_stmt ctx) stmts
+  let old_declared = ctx.block_declared in
+  ctx.block_declared <- Hashtbl.create 16;
+  List.iter (emit_stmt ctx) stmts;
+  ctx.block_declared <- old_declared
 
 and emit_if_stmt ctx branches else_body =
   let rec emit_branches first = function
@@ -2237,15 +3207,77 @@ and emit_match_stmt ctx scrutinee arms =
   (* Track scrutinee type for correct enum casts in match arms *)
   let scrut_tname = expr_type_name ctx scrutinee in
   if scrut_tname <> "" then set_var_type ctx (tmp ^ "_scrut") scrut_tname;
+  (* Track Option inner type for propagating through Some(f) arms *)
+  let opt_inner = expr_option_inner_type ctx scrutinee in
+  if opt_inner <> "" then set_var_type ctx (tmp ^ "_option_inner") opt_inner;
   indent ctx;
+  (* Separate conditional arms from wildcard/else arms *)
+  let rec pat_is_conditional = function
+    | PatVariant _ -> true
+    | PatLit _ -> true
+    | PatBind (name, _) when String.contains name ':' -> true
+    | PatBind (name, _) when Resolve.is_variant ctx.res name -> true
+    | PatOr _ -> true
+    | PatStruct (sname, _, _) when Resolve.is_variant ctx.res sname -> true
+    | PatTuple (subs, _) -> List.exists pat_is_conditional subs
+    | _ -> false
+  in
+  let is_wildcard arm = match arm.pat with
+    | PatWild _ -> true
+    | PatBind (name, _) when not (String.contains name ':')
+      && not (Resolve.is_variant ctx.res name) -> true
+    | PatMut _ -> true
+    | PatTuple (subs, _) when not (List.exists pat_is_conditional subs) -> true
+    | _ -> false
+  in
+  let cond_arms = List.filter (fun a -> not (is_wildcard a)) arms in
+  let wild_arms = List.filter is_wildcard arms in
+  let first = ref true in
   List.iter (fun arm ->
-    emit_match_arm_stmt ctx tmp arm
-  ) arms;
+    emit_match_arm_stmt ctx tmp arm ~is_first:!first;
+    first := false
+  ) cond_arms;
+  (* Emit wildcard/else arm *)
+  (match wild_arms with
+   | arm :: _ ->
+     if not !first then begin
+       emit_indent ctx;
+       emit ctx "} else {\n";
+       indent ctx
+     end;
+     emit_match_arm_stmt_body ctx tmp arm;
+     if not !first then begin
+       dedent ctx;
+       emit_indent ctx;
+       emit ctx "}\n"
+     end
+   | [] ->
+     if not !first then begin
+       emit_indent ctx;
+       emit ctx "}\n"
+     end);
   dedent ctx;
   emit_indent ctx;
   emit ctx "}\n"
 
-and emit_match_arm_stmt ctx tmp arm =
+and emit_match_arm_stmt_body ctx tmp arm =
+  (* Emit just the body of a wildcard/bind/mut arm without wrapping if/else *)
+  match arm.pat with
+  | PatWild _ ->
+    emit_stmts ctx arm.arm_body
+  | PatBind (name, _) ->
+    emit_indent ctx;
+    emitf ctx "TgVal %s = %s_scrut;\n" (c_ident name) tmp;
+    emit_stmts ctx arm.arm_body
+  | PatMut (name, _) ->
+    emit_indent ctx;
+    emitf ctx "TgVal %s = %s_scrut;\n" (c_ident name) tmp;
+    emit_stmts ctx arm.arm_body
+  | _ ->
+    emit_stmts ctx arm.arm_body
+
+and emit_match_arm_stmt ctx tmp arm ~is_first =
+  let if_kw = if is_first then "if" else "} else if" in
   match arm.pat with
   | PatWild _ ->
     emit_indent ctx;
@@ -2264,13 +3296,26 @@ and emit_match_arm_stmt ctx tmp arm =
     (match Resolve.find_variant_prefer_enum ctx.res vname 0 ~prefer_enum:prefer with
      | Some vi ->
        emit_indent ctx;
-       emitf ctx "if (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) {\n"
-         (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) {\n"
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
        indent ctx;
        emit_stmts ctx arm.arm_body;
-       dedent ctx;
+       dedent ctx
+     | None ->
        emit_indent ctx;
-       emit ctx "}\n"
+       emitf ctx "/* unknown 0-arity variant %s */\n" name)
+
+  | PatBind (name, _) when Resolve.is_variant ctx.res name ->
+    (* Unqualified 0-arity variant: e.g. Wasm32 *)
+    let prefer = get_var_type ctx (tmp ^ "_scrut") |> Option.value ~default:"" in
+    (match Resolve.find_variant_prefer_enum ctx.res name 0 ~prefer_enum:prefer with
+     | Some vi ->
+       emit_indent ctx;
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) {\n"
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       indent ctx;
+       emit_stmts ctx arm.arm_body;
+       dedent ctx
      | None ->
        emit_indent ctx;
        emitf ctx "/* unknown 0-arity variant %s */\n" name)
@@ -2299,62 +3344,83 @@ and emit_match_arm_stmt ctx tmp arm =
 
   | PatLit lit ->
     emit_indent ctx;
-    emitf ctx "if (%s_scrut == " tmp;
-    emit_expr ctx lit;
-    emit ctx ") {\n";
+    (match lit with
+     | EStr _ ->
+       emitf ctx "%s (tg_str_eq(%s_scrut, " if_kw tmp;
+       emit_expr ctx lit;
+       emit ctx "))"
+     | _ ->
+       emitf ctx "%s (%s_scrut == " if_kw tmp;
+       emit_expr ctx lit;
+       emit ctx ")");
+    emit ctx " {\n";
     indent ctx;
     emit_stmts ctx arm.arm_body;
-    dedent ctx;
-    emit_indent ctx;
-    emit ctx "}\n"
+    dedent ctx
 
   | PatVariant (vname_raw, sub_pats, _) ->
     let (enum_hint, vname) = split_qualified_variant vname_raw in
     (* Handle builtin Option/Result variants first *)
     if vname = "Some" then begin
-      emit_indent ctx;
-      emitf ctx "if (tg_option_is_some(%s_scrut)) {\n" tmp;
-      indent ctx;
-      let unwrapped = tmp ^ "_unwrapped" in
-      emit_indent ctx;
-      emitf ctx "TgVal %s = tg_option_unwrap(%s_scrut);\n" unwrapped tmp;
-      emit_nested_pattern_bindings_stmt ctx unwrapped sub_pats;
-      emit_stmts ctx arm.arm_body;
-      dedent ctx;
-      emit_indent ctx;
-      emit ctx "}\n"
+      (* Check if sub-pattern is a literal — need both is_some AND value check *)
+      (match sub_pats with
+       | [PatLit lit] ->
+         emit_indent ctx;
+         (match lit with
+          | EStr _ ->
+            emitf ctx "%s (tg_option_is_some(%s_scrut) && tg_str_eq(tg_option_unwrap(%s_scrut), " if_kw tmp tmp;
+            emit_expr ctx lit;
+            emit ctx ")) {\n"
+          | _ ->
+            emitf ctx "%s (tg_option_is_some(%s_scrut) && tg_option_unwrap(%s_scrut) == " if_kw tmp tmp;
+            emit_expr ctx lit;
+            emit ctx ") {\n");
+         indent ctx;
+         emit_stmts ctx arm.arm_body;
+         dedent ctx
+       | _ ->
+         emit_indent ctx;
+         emitf ctx "%s (tg_option_is_some(%s_scrut)) {\n" if_kw tmp;
+         indent ctx;
+         let unwrapped = tmp ^ "_unwrapped" in
+         emit_indent ctx;
+         emitf ctx "TgVal %s = tg_option_unwrap(%s_scrut);\n" unwrapped tmp;
+         emit_nested_pattern_bindings_stmt ctx unwrapped sub_pats;
+         (* Propagate Option inner type to bound variables *)
+         (match sub_pats with
+          | [PatBind (n, _)] | [PatMut (n, _)] ->
+            let inner = match get_var_type ctx (tmp ^ "_option_inner") with
+              | Some t when t <> "" -> t | _ -> "" in
+            if inner <> "" then set_var_type ctx n inner
+          | _ -> ());
+         emit_stmts ctx arm.arm_body;
+         dedent ctx)
     end else if vname = "None" then begin
       emit_indent ctx;
-      emitf ctx "if (tg_option_is_none(%s_scrut)) {\n" tmp;
+      emitf ctx "%s (tg_option_is_none(%s_scrut)) {\n" if_kw tmp;
       indent ctx;
       emit_stmts ctx arm.arm_body;
-      dedent ctx;
-      emit_indent ctx;
-      emit ctx "}\n"
+      dedent ctx
     end else if vname = "Ok" then begin
       emit_indent ctx;
-      emitf ctx "if (tg_result_is_ok(%s_scrut)) {\n" tmp;
+      emitf ctx "%s (tg_result_is_ok(%s_scrut)) {\n" if_kw tmp;
       indent ctx;
       let unwrapped = tmp ^ "_ok_unwrapped" in
       emit_indent ctx;
       emitf ctx "TgVal %s = tg_result_unwrap(%s_scrut);\n" unwrapped tmp;
       emit_nested_pattern_bindings_stmt ctx unwrapped sub_pats;
       emit_stmts ctx arm.arm_body;
-      dedent ctx;
-      emit_indent ctx;
-      emit ctx "}\n"
+      dedent ctx
     end else if vname = "Err" then begin
       emit_indent ctx;
-      emitf ctx "if (tg_result_is_err(%s_scrut)) {\n" tmp;
+      emitf ctx "%s (tg_result_is_err(%s_scrut)) {\n" if_kw tmp;
       indent ctx;
       let unwrapped = tmp ^ "_err_unwrapped" in
       emit_indent ctx;
       emitf ctx "TgVal %s = tg_result_unwrap_err(%s_scrut);\n" unwrapped tmp;
       emit_nested_pattern_bindings_stmt ctx unwrapped sub_pats;
       emit_stmts ctx arm.arm_body;
-      dedent ctx;
-      emit_indent ctx;
-      emit ctx "}\n"
+      dedent ctx
     end else begin
     (* Regular enum variant — use arity-based lookup, preferring qualifier or scrutinee type *)
     let scrut_type = get_var_type ctx (tmp ^ "_scrut") |> Option.value ~default:"" in
@@ -2362,8 +3428,8 @@ and emit_match_arm_stmt ctx tmp arm =
     (match Resolve.find_variant_prefer_enum ctx.res vname (List.length sub_pats) ~prefer_enum:prefer with
      | Some vi ->
        emit_indent ctx;
-       emitf ctx "if (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) {\n"
-         (resolve_enum_type ctx vi) tmp vi.vi_tag;
+       emitf ctx "%s (((%s*)tg_as_ptr(%s_scrut))->_tag == %d) {\n"
+         if_kw (resolve_enum_type ctx vi) tmp vi.vi_tag;
        indent ctx;
        List.iteri (fun i sub ->
          match sub with
@@ -2412,9 +3478,7 @@ and emit_match_arm_stmt ctx tmp arm =
          | _ -> ()
        ) sub_pats;
        emit_stmts ctx arm.arm_body;
-       dedent ctx;
-       emit_indent ctx;
-       emit ctx "}\n"
+       dedent ctx
      | None ->
        emit_indent ctx;
        emitf ctx "/* unknown variant %s */\n" vname)
@@ -2427,8 +3491,8 @@ and emit_match_arm_stmt ctx tmp arm =
       | Some vi ->
         let tag_val = Printf.sprintf "%s_%s__new" (resolve_enum_type ctx vi) (c_ident sname) in
         emit_indent ctx;
-        emitf ctx "if ((((%s*)tg_as_ptr(%s_scrut))->_tag) == (TgVal)(intptr_t)%s) {\n"
-          (resolve_enum_type ctx vi) tmp tag_val;
+        emitf ctx "%s ((((%s*)tg_as_ptr(%s_scrut))->_tag) == (TgVal)(intptr_t)%s) {\n"
+          if_kw (resolve_enum_type ctx vi) tmp tag_val;
         indent ctx;
         emit_indent ctx;
         emitf ctx "%s* _ps = (%s*)tg_as_ptr(%s_scrut);\n"
@@ -2444,9 +3508,7 @@ and emit_match_arm_stmt ctx tmp arm =
           | _ -> ()
         ) field_pats;
         emit_stmts ctx arm.arm_body;
-        dedent ctx;
-        emit_indent ctx;
-        emit ctx "}\n"
+        dedent ctx
       | None ->
         emit_indent ctx;
         emit ctx "{\n";
@@ -2490,63 +3552,153 @@ and emit_match_arm_stmt ctx tmp arm =
     end
 
   | PatTuple (pats, _) ->
-    emit_indent ctx;
-    emit ctx "{\n";
-    indent ctx;
-    List.iteri (fun i sub ->
-      match sub with
-      | PatBind (n, _) when String.contains n ':' ->
-        (* Qualified 0-arity variant in tuple, e.g. Type::Unit — skip binding *)
-        ()
-      | PatBind (n, _) when Resolve.is_variant ctx.res n ->
-        (* 0-arity variant in tuple — just skip *)
-        ()
-      | PatBind (n, _) ->
-        emit_indent ctx;
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
-      | PatMut (n, _) ->
-        emit_indent ctx;
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
-      | PatWild _ -> ()
-      | PatVariant (vname, inner_pats, _) ->
-        let elem_var = Printf.sprintf "_tup_%d" i in
-        emit_indent ctx;
-        emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" elem_var tmp i;
-        (if vname = "Some" then begin
-          match inner_pats with
-          | [PatBind (n, _)] ->
-            emit_indent ctx;
-            emitf ctx "TgVal %s = tg_option_unwrap(%s);\n" (c_ident n) elem_var
-          | _ -> ()
-        end else
-          match Resolve.find_variant_by_arity ctx.res vname (List.length inner_pats) with
-          | Some vi ->
-            List.iteri (fun j sub2 ->
-              match sub2 with
-              | PatBind (n, _) ->
-                emit_indent ctx;
-                emitf ctx "TgVal %s = ((%s*)tg_as_ptr(%s))->_f%d;\n"
-                  (c_ident n) (resolve_enum_type ctx vi) elem_var j
-              | _ -> ()
-            ) inner_pats
-          | None ->
-            List.iteri (fun _j sub2 ->
-              match sub2 with
-              | PatBind (n, _) ->
-                emit_indent ctx;
-                emitf ctx "TgVal %s = %s;\n" (c_ident n) elem_var
-              | _ -> ()
-            ) inner_pats)
-      | _ -> ()
-    ) pats;
-    emit_stmts ctx arm.arm_body;
-    dedent ctx;
-    emit_indent ctx;
-    emit ctx "}\n"
+    (* Check if any sub-pattern needs a conditional check *)
+    let sub_is_conditional = function
+      | PatVariant _ -> true
+      | PatLit _ -> true
+      | PatBind (name, _) when String.contains name ':' -> true
+      | PatBind (name, _) when Resolve.is_variant ctx.res name -> true
+      | _ -> false
+    in
+    let has_conditions = List.exists sub_is_conditional pats in
+    if has_conditions then begin
+      (* Build condition check *)
+      emit_indent ctx;
+      emitf ctx "%s (" if_kw;
+      let first_cond = ref true in
+      List.iteri (fun i sub ->
+        let elem_expr = Printf.sprintf "tg_tuple_get(%s_scrut, %d)" tmp i in
+        (match sub with
+         | PatVariant (vname, inner_pats, _) ->
+           let (_enum_hint, vname_clean) = split_qualified_variant vname in
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           if vname_clean = "Some" then
+             emitf ctx "tg_option_is_some(%s)" elem_expr
+           else if vname_clean = "None" then
+             emitf ctx "tg_option_is_none(%s)" elem_expr
+           else if vname_clean = "Ok" then
+             emitf ctx "tg_result_is_ok(%s)" elem_expr
+           else if vname_clean = "Err" then
+             emitf ctx "tg_result_is_err(%s)" elem_expr
+           else begin
+             let enum_hint = fst (split_qualified_variant vname) in
+             let prefer = if enum_hint <> "" then enum_hint else "" in
+             match Resolve.find_variant_prefer_enum ctx.res vname_clean (List.length inner_pats) ~prefer_enum:prefer with
+             | Some vi ->
+               emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                 (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+             | None ->
+               emit ctx "1 /* unknown variant */"
+           end
+         | PatBind (name, _) when String.contains name ':' ->
+           let (_eh, vn) = split_qualified_variant name in
+           let prefer = if _eh <> "" then _eh else "" in
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           (match Resolve.find_variant_prefer_enum ctx.res vn 0 ~prefer_enum:prefer with
+            | Some vi ->
+              emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+            | None -> emit ctx "1")
+         | PatBind (name, _) when Resolve.is_variant ctx.res name ->
+           if not !first_cond then emit ctx " && ";
+           first_cond := false;
+           (match Resolve.find_variant_prefer_enum ctx.res name 0 ~prefer_enum:"" with
+            | Some vi ->
+              emitf ctx "((%s*)tg_as_ptr(%s))->_tag == %d"
+                (resolve_enum_type ctx vi) elem_expr vi.vi_tag
+            | None -> emit ctx "1")
+         | _ -> ())
+      ) pats;
+      emit ctx ") {\n";
+      indent ctx;
+      (* Extract bindings *)
+      List.iteri (fun i sub ->
+        match sub with
+        | PatBind (n, _) when String.contains n ':' -> ()
+        | PatBind (n, _) when Resolve.is_variant ctx.res n -> ()
+        | PatBind (n, _) ->
+          emit_indent ctx;
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
+        | PatMut (n, _) ->
+          emit_indent ctx;
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
+        | PatWild _ -> ()
+        | PatVariant (vname, inner_pats, _) ->
+          let elem_var = Printf.sprintf "_tup_%d" i in
+          emit_indent ctx;
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" elem_var tmp i;
+          let (_eh, vname_clean) = split_qualified_variant vname in
+          (if vname_clean = "Some" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emit_indent ctx;
+              emitf ctx "TgVal %s = tg_option_unwrap(%s);\n" (c_ident n) elem_var
+            | _ -> ()
+          end else if vname_clean = "Ok" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emit_indent ctx;
+              emitf ctx "TgVal %s = tg_result_unwrap(%s);\n" (c_ident n) elem_var
+            | _ -> ()
+          end else if vname_clean = "Err" then begin
+            match inner_pats with
+            | [PatBind (n, _)] ->
+              emit_indent ctx;
+              emitf ctx "TgVal %s = tg_result_unwrap_err(%s);\n" (c_ident n) elem_var
+            | _ -> ()
+          end else begin
+            let enum_hint = fst (split_qualified_variant vname) in
+            ignore enum_hint;
+            match Resolve.find_variant_by_arity ctx.res vname_clean (List.length inner_pats) with
+            | Some vi ->
+              List.iteri (fun j sub2 ->
+                match sub2 with
+                | PatBind (n, _) ->
+                  emit_indent ctx;
+                  emitf ctx "TgVal %s = ((%s*)tg_as_ptr(%s))->_f%d;\n"
+                    (c_ident n) (resolve_enum_type ctx vi) elem_var j
+                | _ -> ()
+              ) inner_pats
+            | None ->
+              List.iteri (fun _j sub2 ->
+                match sub2 with
+                | PatBind (n, _) ->
+                  emit_indent ctx;
+                  emitf ctx "TgVal %s = %s;\n" (c_ident n) elem_var
+                | _ -> ()
+              ) inner_pats
+          end)
+        | _ -> ()
+      ) pats;
+      emit_stmts ctx arm.arm_body;
+      dedent ctx
+    end else begin
+      (* Purely binding tuple — unconditional *)
+      emit_indent ctx;
+      emit ctx "{\n";
+      indent ctx;
+      List.iteri (fun i sub ->
+        match sub with
+        | PatBind (n, _) ->
+          emit_indent ctx;
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
+        | PatMut (n, _) ->
+          emit_indent ctx;
+          emitf ctx "TgVal %s = tg_tuple_get(%s_scrut, %d);\n" (c_ident n) tmp i
+        | PatWild _ -> ()
+        | _ -> ()
+      ) pats;
+      emit_stmts ctx arm.arm_body;
+      dedent ctx;
+      emit_indent ctx;
+      emit ctx "}\n"
+    end
 
   | PatOr (p1, p2, _) ->
-    emit_match_arm_stmt ctx tmp { arm with pat = p1 };
-    emit_match_arm_stmt ctx tmp { arm with pat = p2 }
+    emit_match_arm_stmt ctx tmp { arm with pat = p1 } ~is_first;
+    emit_match_arm_stmt ctx tmp { arm with pat = p2 } ~is_first:false
 
 (* ── Top-level item codegen ────────────────────────────────────────── *)
 
@@ -2575,20 +3727,20 @@ let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
       List.iter (fun p2 ->
         param_list := (Printf.sprintf "TgVal %s" (c_ident p2.p_name)) :: !param_list;
         let tname = Resolve.type_name_string_of_typ p2.p_typ in
-        set_var_type ctx p2.p_name tname
+        set_var_type_full ctx p2.p_name tname p2.p_typ
       ) rest
     | _ ->
       (* No explicit self param — static/associated function, no _self *)
       List.iter (fun p2 ->
         param_list := (Printf.sprintf "TgVal %s" (c_ident p2.p_name)) :: !param_list;
         let tname = Resolve.type_name_string_of_typ p2.p_typ in
-        set_var_type ctx p2.p_name tname
+        set_var_type_full ctx p2.p_name tname p2.p_typ
       ) params
   end else begin
     List.iter (fun p ->
       param_list := (Printf.sprintf "TgVal %s" (c_ident p.p_name)) :: !param_list;
       let tname = Resolve.type_name_string_of_typ p.p_typ in
-      set_var_type ctx p.p_name tname
+      set_var_type_full ctx p.p_name tname p.p_typ
     ) params
   end;
 
@@ -2596,22 +3748,73 @@ let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
     else String.concat ", " (List.rev !param_list) in
 
   (* Forward declaration *)
+  if Hashtbl.mem ctx.emitted_funcs c_name then begin
+    (* Skip duplicate function definition *)
+    ctx.self_type <- old_self;
+    ctx.var_types <- old_vars
+  end else begin
+  Hashtbl.replace ctx.emitted_funcs c_name true;
   Buffer.add_string ctx.decl_buf
     (Printf.sprintf "TgVal %s(%s);\n" c_name params_str);
 
   (* Function definition *)
   emitfn ctx "TgVal %s(%s) {" c_name params_str;
   indent ctx;
-  emit_stmts ctx body;
-  (* Default return *)
-  emit_indent ctx;
-  emitfn ctx "return TG_NIL;";
+  (* Check if last statement is an implicit return expression.
+     Only do this for "safe" expression types that always produce a TgVal.
+     Exclude EIf/EMatch (handled separately with branch-level returns). *)
+  let is_safe_implicit_return e = match e with
+    | ETuple _ | EStructLit _ | EBlock _
+    | EIdent _ | EInt _ | EFloat _ | EStr _ | EChar _
+    | EBool _ | ENil _ | EBinOp _ | EUnOp _ | EClosure _
+    | ECast _ | ERange _ | EFieldAccess _ | EIndex _
+    | EArray _ | ECall _ | EMethodCall _ -> true
+    | _ -> false
+  in
+  (* Helper: inject return into last expression of a statement list *)
+  let rec inject_return stmts = match List.rev stmts with
+    | (SExpr (EIf (branches, else_body, sp))) :: prev ->
+      let branches' = List.map (fun b -> { b with body = inject_return b.body }) branches in
+      let else_body' = Option.map inject_return else_body in
+      List.rev prev @ [SExpr (EIf (branches', else_body', sp))]
+    | (SExpr (EMatch (scrut, arms, sp))) :: prev ->
+      let arms' = List.map (fun arm -> { arm with arm_body = inject_return arm.arm_body }) arms in
+      List.rev prev @ [SExpr (EMatch (scrut, arms', sp))]
+    | (SExpr e) :: prev when is_safe_implicit_return e ->
+      List.rev prev @ [SExpr (EReturn (Some e, { file=""; line=0; col=0 }))]
+    | _ -> stmts @ [SExpr (EReturn (None, { file=""; line=0; col=0 }))]
+  in
+  let (init, last_return) = match List.rev body with
+    | (SExpr e) :: rest when is_safe_implicit_return e ->
+      (List.rev rest, Some e)
+    | (SExpr (EIf (branches, else_body, sp))) :: rest ->
+      let branches' = List.map (fun b -> { b with body = inject_return b.body }) branches in
+      let else_body' = Option.map inject_return else_body in
+      (List.rev rest @ [SExpr (EIf (branches', else_body', sp))], None)
+    | (SExpr (EMatch (scrut, arms, sp))) :: rest ->
+      let arms' = List.map (fun arm -> { arm with arm_body = inject_return arm.arm_body }) arms in
+      (List.rev rest @ [SExpr (EMatch (scrut, arms', sp))], None)
+    | _ -> (body, None)
+  in
+  emit_stmts ctx init;
+  (match last_return with
+   | Some e ->
+     emit_indent ctx;
+     emit ctx "return ";
+     emit_expr ctx e;
+     emit ctx ";\n"
+   | None when init <> body ->
+     () (* inject_return already added returns in branches *)
+   | None ->
+     emit_indent ctx;
+     emitfn ctx "return TG_NIL;");
   dedent ctx;
   emitfn ctx "}";
   nl ctx;
 
   ctx.self_type <- old_self;
   ctx.var_types <- old_vars
+  end
 
 let rec emit_item ctx item =
   match item with
@@ -2640,6 +3843,8 @@ let rec emit_item ctx item =
 
   | IImpl { target; trait_; methods; _ } ->
     let tname = Resolve.target_name_of_typ target in
+    let saved_self = ctx.self_type in
+    ctx.self_type <- tname;
     emitfn ctx "/* impl %s%s */"
       (match trait_ with Some t -> t ^ " for " | None -> "")
       tname;
@@ -2649,7 +3854,8 @@ let rec emit_item ctx item =
         emit_function_def ctx name params ret body
           ~is_method:true ~self_type_name:tname
       | _ -> ()
-    ) methods
+    ) methods;
+    ctx.self_type <- saved_self
 
   | IConst { name; value; _ } ->
     let cname = if ctx.current_module <> "" then
@@ -2699,6 +3905,8 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
     current_module = "";
     type_map = Hashtbl.create 256;
     res;
+    block_declared = Hashtbl.create 16;
+    emitted_funcs = Hashtbl.create 256;
   } in
 
   (* Preamble *)
@@ -2710,6 +3918,9 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
   emitn ctx "#include <string.h>";
   emitn ctx "#include <ctype.h>";
   emitn ctx "#include <math.h>";
+  emitn ctx "#include <unistd.h>";
+  emitn ctx "#include <sys/stat.h>";
+  emitn ctx "#include <sys/utsname.h>";
   emitn ctx "#include \"tg_runtime.h\"";
   nl ctx;
 
@@ -2720,50 +3931,66 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
 
   (* External/stdlib function stubs *)
   emitn ctx "/* -- External function stubs -- */";
-  emitn ctx "static TgVal read_file(TgVal path) { return tg_str_from_cstr(\"/* read_file stub */\"); }";
-  emitn ctx "static TgVal write_file(TgVal path, TgVal content) { (void)path; (void)content; return TG_NIL; }";
-  emitn ctx "static TgVal read_to_string(TgVal path) { return tg_str_from_cstr(\"\"); }";
-  emitn ctx "static TgVal create_dir_all(TgVal path) { (void)path; return TG_NIL; }";
-  emitn ctx "static TgVal path_exists(TgVal path) { (void)path; return TG_FALSE; }";
-  emitn ctx "static TgVal run_command(TgVal cmd, TgVal args) { (void)cmd; (void)args; return ((TgVal)0); }";
+  emitn ctx "static TgVal read_file(TgVal path) { return tg_read_file(path); }";
+  emitn ctx "static TgVal write_file(TgVal path, TgVal content) { return tg_write_file(path, content); }";
+  emitn ctx "static TgVal read_to_string(TgVal path) { TgVal r = tg_read_file(path); if (tg_result_is_ok(r)) return tg_result_unwrap(r); return tg_str_from_cstr(\"\"); }";
+  emitn ctx "static TgVal create_dir_all(TgVal path) { char cmd[4200]; snprintf(cmd, sizeof(cmd), \"mkdir -p '%s'\", tg_str_cstr(path)); system(cmd); return TG_NIL; }";
+  emitn ctx "static TgVal path_exists(TgVal path) { FILE* f = fopen(tg_str_cstr(path), \"r\"); if (f) { fclose(f); return TG_TRUE; } return TG_FALSE; }";
+  emitn ctx "static TgVal run_command(TgVal cmd, TgVal args) { TgVec* av = (TgVec*)tg_as_ptr(args); char cmdline[8192]; int pos = 0; pos += snprintf(cmdline+pos, sizeof(cmdline)-pos, \"%s\", tg_str_cstr(cmd)); if (av) { for (int64_t i = 0; i < av->len; i++) { pos += snprintf(cmdline+pos, sizeof(cmdline)-pos, \" %s\", tg_str_cstr(av->data[i])); } } return (TgVal)system(cmdline); }";
   emitn ctx "static TgVal tokenize(TgVal src) { (void)src; return tg_vec_new(); }";
-  emitn ctx "static TgVal get_env(TgVal name) { (void)name; return tg_str_from_cstr(\"\"); }";
-  emitn ctx "static TgVal current_dir(void) { return tg_str_from_cstr(\".\"); }";
+  emitn ctx "static TgVal get_env(TgVal name) { const char* v = getenv(tg_str_cstr(name)); return v ? tg_option_some(tg_str_from_cstr(v)) : tg_option_none(); }";
+  emitn ctx "static TgVal current_dir(void) { char buf[4096]; if (getcwd(buf, sizeof(buf))) return tg_str_from_cstr(buf); return tg_str_from_cstr(\".\"); }";
   emitn ctx "static TgVal exit_process(TgVal code) { exit((int)code); return TG_NIL; }";
-  emitn ctx "static TgVal write_string(TgVal path, TgVal content) { (void)path; (void)content; return TG_NIL; }";
-  emitn ctx "static TgVal mkdir_p(TgVal path) { (void)path; return TG_NIL; }";
+  emitn ctx "static TgVal write_string(TgVal path, TgVal content) { return tg_write_file(path, content); }";
+  emitn ctx "static TgVal mkdir_p(TgVal path) { char cmd[4200]; snprintf(cmd, sizeof(cmd), \"mkdir -p '%s'\", tg_str_cstr(path)); system(cmd); return TG_NIL; }";
   emitn ctx "static TgVal __read_dir(TgVal path) { (void)path; return tg_vec_new(); }";
   emitn ctx "static TgVal __home_dir(void) { return tg_str_from_cstr(\"/tmp\"); }";
-  emitn ctx "static TgVal __get(TgVal url) { (void)url; return tg_str_from_cstr(\"\"); }";
-  emitn ctx "static TgVal __get_env(TgVal name) { (void)name; return tg_str_from_cstr(\"\"); }";
+  emitn ctx "static TgVal __get(TgVal name) {";
+  emitn ctx "  const char* n = tg_str_cstr(name);";
+  emitn ctx "  const char* v = getenv(n);";
+  emitn ctx "  if (v) return tg_option_some(tg_str_from_cstr(v));";
+  emitn ctx "  /* Platform detection fallback via uname() for HOSTTYPE/OSTYPE */";
+  emitn ctx "  struct utsname uts;";
+  emitn ctx "  if (uname(&uts) == 0) {";
+  emitn ctx "    if (strcmp(n, \"HOSTTYPE\") == 0) return tg_option_some(tg_str_from_cstr(uts.machine));";
+  emitn ctx "    if (strcmp(n, \"OSTYPE\") == 0) {";
+  emitn ctx "      if (strstr(uts.sysname, \"Darwin\")) return tg_option_some(tg_str_from_cstr(\"darwin\"));";
+  emitn ctx "      if (strstr(uts.sysname, \"Linux\")) return tg_option_some(tg_str_from_cstr(\"linux\"));";
+  emitn ctx "      return tg_option_some(tg_str_from_cstr(uts.sysname));";
+  emitn ctx "    }";
+  emitn ctx "  }";
+  emitn ctx "  return tg_option_none();";
+  emitn ctx "}";
+  emitn ctx "static TgVal __get_env(TgVal name) { const char* v = getenv(tg_str_cstr(name)); return v ? tg_option_some(tg_str_from_cstr(v)) : tg_option_none(); }";
   emitn ctx "static TgVal __parse(TgVal src) { (void)src; return TG_NIL; }";
   emitn ctx "static TgVal __run(TgVal cmd, TgVal args) { (void)cmd; (void)args; return TG_NIL; }";
-  emitn ctx "static TgVal __create_dir(TgVal path) { (void)path; return TG_NIL; }";
-  emitn ctx "static TgVal __create_dir_all(TgVal path) { (void)path; return TG_NIL; }";
+  emitn ctx "static TgVal __create_dir(TgVal path) { char cmd[4200]; snprintf(cmd, sizeof(cmd), \"mkdir -p '%s'\", tg_str_cstr(path)); system(cmd); return TG_NIL; }";
+  emitn ctx "static TgVal __create_dir_all(TgVal path) { char cmd[4200]; snprintf(cmd, sizeof(cmd), \"mkdir -p '%s'\", tg_str_cstr(path)); system(cmd); return TG_NIL; }";
   emitn ctx "static TgVal list_directory(TgVal path) { (void)path; return tg_vec_new(); }";
   emitn ctx "static TgVal read_dir(TgVal path) { (void)path; return tg_vec_new(); }";
-  emitn ctx "static TgVal write_file_bytes(TgVal path, TgVal data) { (void)path; (void)data; return TG_NIL; }";
-  emitn ctx "static TgVal write_file_string(TgVal path, TgVal data) { (void)path; (void)data; return TG_NIL; }";
-  emitn ctx "static TgVal read_file_string(TgVal path) { (void)path; return tg_str_from_cstr(\"\"); }";
-  emitn ctx "static TgVal dir_exists(TgVal path) { (void)path; return TG_FALSE; }";
-  emitn ctx "static TgVal file_exists(TgVal path) { (void)path; return TG_FALSE; }";
-  emitn ctx "static TgVal delete_file(TgVal path) { (void)path; return TG_NIL; }";
-  emitn ctx "static TgVal remove_file(TgVal path) { (void)path; return TG_NIL; }";
+  emitn ctx "static TgVal write_file_bytes(TgVal path, TgVal data) { FILE* f = fopen(tg_str_cstr(path), \"wb\"); if (!f) return tg_result_err(tg_str_from_cstr(\"cannot open file\")); TgVec* v = (TgVec*)tg_as_ptr(data); if (v && v->len > 0) { for (int64_t i = 0; i < v->len; i++) { uint8_t b = (uint8_t)v->data[i]; fwrite(&b, 1, 1, f); } } fclose(f); return tg_result_ok(TG_NIL); }";
+  emitn ctx "static TgVal write_file_string(TgVal path, TgVal data) { FILE* f = fopen(tg_str_cstr(path), \"w\"); if (f) { const char* s = tg_str_cstr(data); fwrite(s, 1, strlen(s), f); fclose(f); } return TG_NIL; }";
+  emitn ctx "static TgVal read_file_string(TgVal path) { FILE* f = fopen(tg_str_cstr(path), \"r\"); if (!f) return tg_str_from_cstr(\"error: cannot read file\"); fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET); char* buf = malloc(sz+1); fread(buf, 1, sz, f); buf[sz]=0; fclose(f); TgVal s = tg_str_from_cstr(buf); free(buf); return s; }";
+  emitn ctx "static TgVal dir_exists(TgVal path) { struct stat st; return (stat(tg_str_cstr(path), &st) == 0 && S_ISDIR(st.st_mode)) ? TG_TRUE : TG_FALSE; }";
+  emitn ctx "static TgVal file_exists(TgVal path) { FILE* f = fopen(tg_str_cstr(path), \"r\"); if (f) { fclose(f); return TG_TRUE; } return TG_FALSE; }";
+  emitn ctx "static TgVal delete_file(TgVal path) { unlink(tg_str_cstr(path)); return TG_NIL; }";
+  emitn ctx "static TgVal remove_file(TgVal path) { unlink(tg_str_cstr(path)); return TG_NIL; }";
   emitn ctx "static TgVal home_dir(void) { return tg_str_from_cstr(\"/tmp\"); }";
-  emitn ctx "static TgVal args(void) { return tg_vec_new(); }";
+  emitn ctx "static TgVal args(void) { extern int g_argc; extern char** g_argv; TgVal v = tg_vec_new(); for (int i = 0; i < g_argc; i++) tg_vec_push(v, tg_str_from_cstr(g_argv[i])); return v; }";
   emitn ctx "static TgVal time(TgVal a) { (void)a; return ((TgVal)0); }";
   emitn ctx "static TgVal fnv1a_hash(TgVal data) { (void)data; return ((TgVal)0); }";
   emitn ctx "static TgVal which(TgVal cmd) { (void)cmd; return tg_option_none(); }";
   emitn ctx "static TgVal syscall_write(TgVal fd, TgVal data, TgVal len) { (void)fd; (void)data; (void)len; return TG_NIL; }";
-  emitn ctx "static TgVal tg_map_contains(TgVal map, TgVal key) { (void)map; (void)key; return TG_FALSE; }";
+  emitn ctx "static TgVal tg_map_contains(TgVal map, TgVal key) { return tg_option_is_some(tg_map_get(map, key)) ? TG_TRUE : TG_FALSE; }";
   emitn ctx "static TgVal from_u32(TgVal val) { (void)val; return val; }";
   emitn ctx "static TgVal from_bits(TgVal val) { (void)val; return val; }";
-  emitn ctx "static TgVal filled(TgVal val, TgVal count) { (void)val; (void)count; return tg_vec_new(); }";
+  emitn ctx "static TgVal filled(TgVal count, TgVal val) { TgVal v = tg_vec_new(); for (TgVal i = 0; i < count; i++) tg_vec_push(v, val); return v; }";
   emitn ctx "static TgVal println(TgVal msg, ...) { tg_println(msg); return TG_NIL; }";
   emitn ctx "static TgVal new(TgVal a, TgVal b, TgVal c) { (void)a; (void)b; (void)c; return TG_NIL; }";
-  emitn ctx "static TgVal is_callee_saved(TgVal reg) { (void)reg; return TG_FALSE; }";
+  emitn ctx "static TgVal is_callee_saved(TgVal reg) { TgOption* o = (TgOption*)tg_as_ptr(reg); if (!o) return TG_FALSE; int64_t t = o->_tag; return (t == 3 || (t >= 12 && t <= 15)) ? TG_TRUE : TG_FALSE; }";
   emitn ctx "static TgVal format_type_expr_to_string(TgVal expr) { (void)expr; return tg_str_from_cstr(\"\"); }";
   emitn ctx "static TgVal generate_docs(TgVal a, TgVal b) { (void)a; (void)b; return TG_NIL; }";
+  emitn ctx "static TgVal path_join(TgVal a, TgVal b) { return tg_str_concat(tg_str_concat(a, tg_str_from_cstr(\"/\")), b); }";
   emitn ctx "static TgVal default_doc_config(void) { return TG_NIL; }";
   emitn ctx "static TgVal parse_test_args(TgVal args) { (void)args; return TG_NIL; }";
   emitn ctx "static TgVal parse_bench_args(TgVal args) { (void)args; return TG_NIL; }";
@@ -2779,10 +4006,25 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
   (* Generic clone/to_string stub using identity/placeholder *)
   emitn ctx "/* -- Generic method stubs -- */";
   emitn ctx "static TgVal _generic_clone(TgVal v) { return v; }";
-  emitn ctx "static TgVal _generic_to_string(TgVal v) { return tg_int_to_string(v); }";
+  emitn ctx "static int _tg_is_string(TgVal v) {";
+  emitn ctx "  if ((uint64_t)v <= 0x1000) return 0;";
+  emitn ctx "  TgString* s = (TgString*)tg_as_ptr(v);";
+  emitn ctx "  if (!s) return 0;";
+  emitn ctx "  /* Check len/cap fields for reasonable values without dereferencing data */";
+  emitn ctx "  if (s->len < 0 || s->cap < 0 || s->len > s->cap || s->cap > (1LL<<30)) return 0;";
+  emitn ctx "  if (s->len == 0) return 1; /* empty string is valid */";
+  emitn ctx "  if ((uint64_t)s->data <= 0x1000) return 0;";
+  emitn ctx "  return 1;";
+  emitn ctx "}";
+  emitn ctx "static TgVal _generic_to_string(TgVal v) {";
+  emitn ctx "  if (v == TG_NIL) return tg_str_from_cstr(\"nil\");";
+  emitn ctx "  if (v == TG_TRUE) return tg_str_from_cstr(\"true\");";
+  emitn ctx "  if (_tg_is_string(v)) return v;";
+  emitn ctx "  return tg_int_to_string(v);";
+  emitn ctx "}";
   emitn ctx "/* -- Missing string method stubs -- */";
   emitn ctx "static TgVal tg_str_join(TgVal vec, TgVal sep) { (void)sep; return tg_str_concat(tg_str_from_cstr(\"\"), vec); }";
-  emitn ctx "static TgVal tg_str_parse_int(TgVal s) { return tg_str_parse_float(s); }";
+  emitn ctx "static TgVal tg_str_parse_int(TgVal s) { TgString* _s = (TgString*)tg_as_ptr(s); if (!_s) return 0; return (TgVal)strtoll(_s->data, NULL, 10); }";
   emitn ctx "static TgVal tg_str_is_lowercase(TgVal s) { (void)s; return TG_FALSE; }";
   emitn ctx "static TgVal tg_str_is_uppercase(TgVal s) { (void)s; return TG_FALSE; }";
   emitn ctx "/* -- Format/intrinsic stubs -- */";
@@ -2872,7 +4114,7 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
   List.iter (fun name -> emit_stub name 0) ["A64__X29"; "A64__X30"];
   (* 1-arg stubs *)
   List.iter (fun name -> emit_stub name 1)
-    ["Box__name"; "Box__version";
+    ["Box__name"; "Box__version"; "Box__description"; "Box__default_level";
      "LocalRegistry__into_bytes"; "LocalRegistry__ok";
      "TypeExpr__Tuple"; "types__Struct"];
   (* 2-arg stubs *)
@@ -2881,12 +4123,14 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
      "PluginRegistry__post_parse"; "PkgManager__resolve"; "Requirement__matches";
      "ScopeMap__scopes_containing"; "SymbolGraph__query_all_references";
      "TypeExpr__Named"; "types__Enum"; "Box__fetch_versions";
+     "Box__pre_parse"; "Box__post_parse";
      "BuildPlan__filter_map"; "LocalRegistry__filter_map"];
   (* 3-arg stubs *)
   List.iter (fun name -> emit_stub name 3)
     ["LintRunner__check_item"; "LintRunner__check_function";
      "LintRunner__check_stmt"; "LintRunner__check_expr";
-     "Box__fetch_package"];
+     "Box__check_item"; "Box__check_function"; "Box__check_stmt"; "Box__check_expr";
+     "Box__fetch_package"; "ScopeMap__has_uses_after"];
   nl ctx;
 
   (* Generate main function *)

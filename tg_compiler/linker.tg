@@ -601,38 +601,51 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let LC_MAIN = 0x80000028 as u32
   let LC_SYMTAB = 0x02 as u32
   let LC_DYSYMTAB = 0x0B as u32
+  let LC_BUILD_VERSION = 0x32 as u32
+  let LC_LOAD_DYLINKER = 0x0E as u32
+  let LC_LOAD_DYLIB = 0x0C as u32
 
-  let page_size = 4096
+  # ARM64 macOS requires 16KB page alignment for segments
+  let page_size = if is_arm then 16384 else 4096 end
   let base: u64 = 0x100000000   # macOS default base = 4GB
 
-  # Two segments: __TEXT (code + rodata, r-x) and __DATA (data, rw-)
+  # Segments: __PAGEZERO, __TEXT, __DATA, __LINKEDIT
   let text_sect_count = 2   # __text, __const
   let data_sect_count = 1   # __data
 
+  let pagezero_cmd_size = 72   # LC_SEGMENT_64 with 0 sections
   let text_seg_cmd_size = 72 + (text_sect_count * 80)
   let data_seg_cmd_size = 72 + (data_sect_count * 80)
+  let linkedit_cmd_size = 72   # LC_SEGMENT_64 with 0 sections
   let main_cmd_size = 24
   let symtab_cmd_size = 24
   let dysymtab_cmd_size = 80
-  let num_cmds = 5
-  let load_cmds_size = text_seg_cmd_size + data_seg_cmd_size + main_cmd_size + symtab_cmd_size + dysymtab_cmd_size
+  let build_version_cmd_size = 24  # LC_BUILD_VERSION with 0 tools
+  let dylinker_cmd_size = 32       # LC_LOAD_DYLINKER "/usr/lib/dyld"
+  let dylib_cmd_size = 56          # LC_LOAD_DYLIB "/usr/lib/libSystem.B.dylib"
+  let uuid_cmd_size = 24           # LC_UUID (16 bytes of UUID)
+  let codesign_reserve = 16        # space reserved for codesign to insert LC_CODE_SIGNATURE
+  let num_cmds = 11
+  let load_cmds_size = pagezero_cmd_size + text_seg_cmd_size + data_seg_cmd_size + linkedit_cmd_size + main_cmd_size + symtab_cmd_size + dysymtab_cmd_size + build_version_cmd_size + dylinker_cmd_size + dylib_cmd_size + uuid_cmd_size
   let header_size = 32
+  # __TEXT starts at fileoff 0 (includes header + load commands)
+  # Code is placed right after load commands, 16-byte aligned
+  let code_fileoff = align_up(header_size + load_cmds_size + codesign_reserve, 16)
+  let rodata_fileoff = code_fileoff + sections[0].data.len()
+  let text_seg_filesize = align_up(rodata_fileoff + sections[1].data.len(), page_size)
+  let text_seg_size = text_seg_filesize  # __TEXT segment starts at fileoff=0
 
-  # Layout: page-align text segment, then page-align data segment
-  let text_fileoff = align_up(header_size + load_cmds_size, page_size)
-  let rodata_fileoff = text_fileoff + sections[0].data.len()
-  let text_seg_size = align_up(rodata_fileoff + sections[1].data.len() - text_fileoff, page_size)
+  let data_fileoff = text_seg_filesize
+  let data_seg_size = if sections[2].data.len() > 0 then align_up(sections[2].data.len(), page_size) else 0 end
 
-  let data_fileoff = text_fileoff + text_seg_size
-  let data_seg_size = align_up(sections[2].data.len(), page_size)
-
-  # Assign virtual addresses (separate per segment)
-  let text_vaddr = base + text_fileoff as u64
+  # Assign virtual addresses — __TEXT at base, code within it
+  let text_seg_vaddr = base
+  let text_vaddr = base + code_fileoff as u64
   let rodata_vaddr = base + rodata_fileoff as u64
   let data_vaddr = base + data_fileoff as u64
 
   sections[0].vaddr = text_vaddr
-  sections[0].file_offset = text_fileoff as u64
+  sections[0].file_offset = code_fileoff as u64
   sections[1].vaddr = rodata_vaddr
   sections[1].file_offset = rodata_fileoff as u64
   sections[2].vaddr = data_vaddr
@@ -644,16 +657,19 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
 
-  # Entry point offset (relative to start of __TEXT segment file offset)
+  # Entry point offset (relative to start of __TEXT segment, which is fileoff=0)
   let entry_off = match syms.get(&input.entry)
-  when Option::Some(sym) then sym.value as u64
+  when Option::Some(sym) then (code_fileoff as u64) + (sym.value as u64)
   when Option::None then
     return Result::Err("undefined entry point symbol: " + input.entry.clone())
   end
 
-  # Empty string table (just a NUL byte) for LC_SYMTAB
-  let strtab_off = data_fileoff + data_seg_size
+  # Empty string table (just a NUL byte) for LC_SYMTAB, placed in __LINKEDIT
+  let linkedit_fileoff = data_fileoff + data_seg_size
+  let strtab_off = linkedit_fileoff
   let strtab_size = 1
+  let linkedit_size = align_up(strtab_size, page_size)
+  let linkedit_vaddr = data_vaddr + data_seg_size as u64
 
   # --- Mach-O Header (32 bytes) ---
   write32(&mut out, 0xFEEDFACF)       # MH_MAGIC_64
@@ -662,17 +678,30 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, MH_EXECUTE)
   write32(&mut out, num_cmds as u32)
   write32(&mut out, load_cmds_size as u32)
-  write32(&mut out, 0x200085)          # MH_PIE | MH_DYLDLINK | MH_TWOLEVEL
+  write32(&mut out, 0x200085 as u32)    # MH_PIE | MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL
   write32(&mut out, 0)                 # reserved
 
-  # --- LC_SEGMENT_64: __TEXT (r-x), contains __text + __const ---
+  # --- LC_SEGMENT_64: __PAGEZERO (null guard page) ---
+  write32(&mut out, LC_SEGMENT_64)
+  write32(&mut out, pagezero_cmd_size as u32)
+  write_padded_str(&mut out, "__PAGEZERO", 16)      # segname
+  write64(&mut out, 0)                              # vmaddr
+  write64(&mut out, base)                           # vmsize = 4GB
+  write64(&mut out, 0)                              # fileoff
+  write64(&mut out, 0)                              # filesize
+  write32(&mut out, 0)                              # maxprot: none
+  write32(&mut out, 0)                              # initprot: none
+  write32(&mut out, 0)                              # nsects
+  write32(&mut out, 0)                              # flags
+
+  # --- LC_SEGMENT_64: __TEXT (r-x), contains header + __text + __const ---
   write32(&mut out, LC_SEGMENT_64)
   write32(&mut out, text_seg_cmd_size as u32)
   write_padded_str(&mut out, "__TEXT", 16)          # segname
-  write64(&mut out, base + text_fileoff as u64)     # vmaddr
+  write64(&mut out, text_seg_vaddr)                 # vmaddr = base
   write64(&mut out, text_seg_size as u64)           # vmsize
-  write64(&mut out, text_fileoff as u64)            # fileoff
-  write64(&mut out, text_seg_size as u64)           # filesize
+  write64(&mut out, 0)                              # fileoff = 0 (includes header)
+  write64(&mut out, text_seg_filesize as u64)       # filesize
   write32(&mut out, 5)                              # maxprot: r-x
   write32(&mut out, 5)                              # initprot: r-x
   write32(&mut out, text_sect_count as u32)         # nsects
@@ -683,7 +712,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write_padded_str(&mut out, "__TEXT", 16)
   write64(&mut out, text_vaddr)
   write64(&mut out, sections[0].data.len() as u64)
-  write32(&mut out, text_fileoff as u32)
+  write32(&mut out, code_fileoff as u32)
   write32(&mut out, 4)                   # align = 2^4 = 16
   write32(&mut out, 0); write32(&mut out, 0)
   write32(&mut out, 0x80000400)          # S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
@@ -724,6 +753,19 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, 0)
   write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
 
+  # --- LC_SEGMENT_64: __LINKEDIT (symbol/string table data) ---
+  write32(&mut out, LC_SEGMENT_64)
+  write32(&mut out, linkedit_cmd_size as u32)
+  write_padded_str(&mut out, "__LINKEDIT", 16)      # segname
+  write64(&mut out, linkedit_vaddr)                 # vmaddr
+  write64(&mut out, linkedit_size as u64)           # vmsize
+  write64(&mut out, linkedit_fileoff as u64)        # fileoff
+  write64(&mut out, strtab_size as u64)             # filesize
+  write32(&mut out, 1)                              # maxprot: r--
+  write32(&mut out, 1)                              # initprot: r--
+  write32(&mut out, 0)                              # nsects
+  write32(&mut out, 0)                              # flags
+
   # --- LC_MAIN ---
   write32(&mut out, LC_MAIN)
   write32(&mut out, main_cmd_size as u32)
@@ -743,8 +785,42 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, dysymtab_cmd_size as u32)
   emit_zeros_vec(&mut out, dysymtab_cmd_size - 8)  # all fields zero for static exe
 
+  # --- LC_BUILD_VERSION ---
+  write32(&mut out, LC_BUILD_VERSION)
+  write32(&mut out, build_version_cmd_size as u32)
+  write32(&mut out, 1)                # platform: macOS
+  write32(&mut out, 0x000E0000 as u32)  # minos: 14.0.0
+  write32(&mut out, 0)                # sdk: 0
+  write32(&mut out, 0)                # ntools: 0
+
+  # --- LC_LOAD_DYLINKER ---
+  write32(&mut out, LC_LOAD_DYLINKER)
+  write32(&mut out, dylinker_cmd_size as u32)
+  write32(&mut out, 12)               # name offset (right after these 3 u32s)
+  write_padded_str(&mut out, "/usr/lib/dyld", dylinker_cmd_size - 12)
+
+  # --- LC_LOAD_DYLIB: libSystem.B.dylib ---
+  write32(&mut out, LC_LOAD_DYLIB)
+  write32(&mut out, dylib_cmd_size as u32)
+  write32(&mut out, 24)               # name offset (after cmd+cmdsize+timestamp+current+compat)
+  write32(&mut out, 0)                # timestamp
+  write32(&mut out, 0x010000 as u32)  # current_version: 1.0.0
+  write32(&mut out, 0x010000 as u32)  # compatibility_version: 1.0.0
+  write_padded_str(&mut out, "/usr/lib/libSystem.B.dylib", dylib_cmd_size - 24)
+
+  # --- LC_UUID ---
+  let LC_UUID = 0x1B as u32
+  write32(&mut out, LC_UUID)
+  write32(&mut out, uuid_cmd_size as u32)
+  # Fixed UUID (deterministic): 54 47 43 4F 4D 50 00 00 00 00 00 00 00 00 00 01
+  # "TGCOMP" + version 1
+  write32(&mut out, 0x54474F4D as u32)
+  write32(&mut out, 0x50000000 as u32)
+  write32(&mut out, 0x00000000 as u32)
+  write32(&mut out, 0x00000001 as u32)
+
   # --- Section data ---
-  pad_to(&mut out, text_fileoff)
+  pad_to(&mut out, code_fileoff)
   append_vec(&mut out, &sections[0].data)   # __text
   append_vec(&mut out, &sections[1].data)   # __const (rodata)
   pad_to(&mut out, data_fileoff)
