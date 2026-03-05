@@ -101,7 +101,8 @@ enum Projection
 end
 
 def place_local(id: LocalId) -> Place
-  Place { local: id, projections: Vec::new() }
+  # Clone the LocalId to avoid shared-pointer aliasing.
+  Place { local: LocalId { id: id.id }, projections: Vec::new() }
 end
 
 def place_field(base: Place, name: String, index: Int) -> Place
@@ -345,6 +346,8 @@ struct MirBuilder
   var_map: Map[String, LocalId]
   blocks: Map[Int, MirBlock]
   pending_closures: Vec[PendingClosure]
+  break_target: Option[BlockId]
+  continue_target: Option[BlockId]
 end
 
 struct PendingClosure
@@ -364,7 +367,9 @@ def builder_new() -> MirBuilder
     temp_counter: 0,
     var_map: Map::new(),
     blocks: Map::new(),
-    pending_closures: Vec::new()
+    pending_closures: Vec::new(),
+    break_target: Option::None,
+    continue_target: Option::None
   }
 end
 
@@ -516,6 +521,21 @@ def set_terminator(b: &mut MirBuilder, kind: MirTerminatorKind, span: Span) -> U
   end
 end
 
+def block_is_terminated(b: &MirBuilder) -> Bool
+  match b.current_block
+  when Option::Some(blk_id) then
+    match b.blocks.get(blk_id.id)
+    when Option::Some(block) then
+      match block.terminator.kind
+      when MirTerminatorKind::Unreachable then false
+      when _ then true
+      end
+    when Option::None then false
+    end
+  when Option::None then false
+  end
+end
+
 def switch_to_block(b: &mut MirBuilder, block: BlockId) -> Unit
   b.current_block = Option::Some(block)
 end
@@ -632,10 +652,15 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
       when StmtKind::If(if_stmt) then
         # If/else as last statement: assign each branch result to return place (local 0)
         lower_if_to_place(b, &if_stmt, place_local(LocalId { id: 0 }), f.span)
+      when StmtKind::Match(m) then
+        # Match as last statement: assign each arm result to return place
+        lower_match_to_place(b, &m, place_local(LocalId { id: 0 }), f.span)
       when StmtKind::Expr(expr) then
         match expr.kind
         when ExprKind::If(if_expr) then
           lower_if_to_place(b, &if_expr, place_local(LocalId { id: 0 }), f.span)
+        when ExprKind::Match(m) then
+          lower_match_to_place(b, &m, place_local(LocalId { id: 0 }), f.span)
         when _ then
           let result = lower_expr(b, &expr, f.span)
           push_stmt(b, MirStatementKind::Assign(place_local(LocalId { id: 0 }), MirRvalue {
@@ -1027,7 +1052,9 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     match val_opt
     when Option::Some(val) then
       let operand = lower_expr(b, &val, stmt.span)
-      # Store to return place
+      push_stmt(b, MirStatementKind::Assign(place_local(LocalId { id: 0 }), MirRvalue {
+        kind: MirRvalueKind::Use(operand)
+      }), stmt.span)
     when Option::None then ()
     end
     set_terminator(b, MirTerminatorKind::Return, stmt.span)
@@ -1037,6 +1064,31 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     
   when StmtKind::Match(m) then
     lower_match(b, &m, stmt.span)
+    
+  when StmtKind::Break(val_opt) then
+    match b.break_target
+    when Option::Some(target) then
+      set_terminator(b, MirTerminatorKind::Goto(target), stmt.span)
+    when Option::None then ()
+    end
+    
+  when StmtKind::Continue then
+    match b.continue_target
+    when Option::Some(target) then
+      set_terminator(b, MirTerminatorKind::Goto(target), stmt.span)
+    when Option::None then ()
+    end
+    
+  when StmtKind::Loop(body) then
+    lower_loop(b, &body, stmt.span)
+    
+  when StmtKind::CompoundAssign(op, target, value) then
+    let place = lower_place(b, &target)
+    let lhs_operand = lower_expr(b, &target, stmt.span)
+    let rhs_operand = lower_expr(b, &value, stmt.span)
+    let mir_op = lower_binop(op)
+    let rvalue = MirRvalue { kind: MirRvalueKind::BinOp(mir_op, lhs_operand, rhs_operand) }
+    push_assign(b, place, rvalue, stmt.span)
     
   when _ then ()
   end
@@ -1723,7 +1775,9 @@ def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: S
       lower_stmt(b, &last_then)
     end
   end
-  set_terminator(b, MirTerminatorKind::Goto(merge_blk), span)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(merge_blk), span)
+  end
 
   # Else branch — lower all stmts, last expression value goes to dest
   b.current_block = Option::Some(else_blk)
@@ -1749,7 +1803,9 @@ def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: S
     end
   when Option::None then ()
   end
-  set_terminator(b, MirTerminatorKind::Goto(merge_blk), span)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(merge_blk), span)
+  end
 
   # Continue from merge
   b.current_block = Option::Some(merge_blk)
@@ -1816,7 +1872,9 @@ def lower_if(b: &mut MirBuilder, if_stmt: &IfStmt, span: Span) -> Unit
   # Then block
   switch_to_block(b, then_block)
   lower_block(b, &if_stmt.then_block)
-  set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+  end
   
   # Else block
   switch_to_block(b, else_block)
@@ -1824,7 +1882,9 @@ def lower_if(b: &mut MirBuilder, if_stmt: &IfStmt, span: Span) -> Unit
   when Option::Some(eb) then lower_block(b, &eb)
   when Option::None then ()
   end
-  set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+  end
   
   switch_to_block(b, join_block)
 end
@@ -1833,6 +1893,12 @@ def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span) -> Un
   let header = create_block(b)
   let body_block = create_block(b)
   let exit_block = create_block(b)
+  
+  # Save and set break/continue targets
+  let old_break = b.break_target
+  let old_continue = b.continue_target
+  b.break_target = Option::Some(exit_block)
+  b.continue_target = Option::Some(header)
   
   set_terminator(b, MirTerminatorKind::Goto(header), span)
   
@@ -1844,59 +1910,225 @@ def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span) -> Un
   
   switch_to_block(b, body_block)
   lower_block(b, body)
-  set_terminator(b, MirTerminatorKind::Goto(header), span)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(header), span)
+  end
+  
+  # Restore break/continue targets
+  b.break_target = old_break
+  b.continue_target = old_continue
   
   switch_to_block(b, exit_block)
 end
 
 def lower_for(b: &mut MirBuilder, var: String, iter: &Expr, body: &Block, span: Span) -> Unit
-  # Desugar: let _iter = iter.into_iter()
-  #          loop { match _iter.advance() { Some(var) => body, None => break } }
-  let iter_local = add_temp(b, Type::Unit, span)
-  let iter_op = lower_expr(b, iter, span)
-  push_assign(b, place_local(iter_local), MirRvalue { kind: MirRvalueKind::Use(iter_op) }, span)
+  # Desugar for loops:
+  #   Range-based: for var in lo..hi → while var < hi { body; var += 1 }
+  #   Collection-based: for var in coll → index-based iteration
+  match iter.kind
+  when ExprKind::Range(lo_box, hi_box, _incl) then
+    # Range-based for: lower bounds inside the match arm
+    mut lo_op = MirOperand { kind: MirOperandKind::Constant(MirConstant { kind: MirConstantKind::Int(0), ty: Type::Int }) }
+    match lo_box
+    when Option::Some(lo_e) then
+      lo_op = lower_expr(b, &lo_e, span)
+    when Option::None then ()
+    end
+    mut hi_op = MirOperand { kind: MirOperandKind::Constant(MirConstant { kind: MirConstantKind::Int(0), ty: Type::Int }) }
+    match hi_box
+    when Option::Some(hi_e) then
+      hi_op = lower_expr(b, &hi_e, span)
+    when Option::None then ()
+    end
 
-  let header   = create_block(b)
-  let body_blk = create_block(b)
-  let exit_blk = create_block(b)
+    # Save raw counter values BEFORE add_local calls, then reconstruct
+    # LocalIds from integers to avoid stage0 pointer-aliasing bugs.
+    let hi_counter = b.local_counter
+    add_local(b, "_for_hi", Type::Int, false, span)
+    push_assign(b, place_local(LocalId { id: hi_counter }), MirRvalue { kind: MirRvalueKind::Use(hi_op) }, span)
 
+    let var_counter = b.local_counter
+    add_local(b, var, Type::Int, true, span)
+    push_assign(b, place_local(LocalId { id: var_counter }), MirRvalue { kind: MirRvalueKind::Use(lo_op) }, span)
+
+    let header   = create_block(b)
+    let body_blk = create_block(b)
+    let exit_blk = create_block(b)
+
+    # Save and set break/continue targets
+    let old_break = b.break_target
+    let old_continue = b.continue_target
+    b.break_target = Option::Some(exit_blk)
+    b.continue_target = Option::Some(header)
+
+    set_terminator(b, MirTerminatorKind::Goto(header), span)
+
+    # Header: check var < hi
+    switch_to_block(b, header)
+    let cmp_counter = b.local_counter
+    add_temp(b, Type::Bool, span)
+    # Build comparison operands as separate let bindings to avoid
+    # nested _sl shadowing issues in the generated C
+    let var_place = place_local(LocalId { id: var_counter })
+    let hi_place  = place_local(LocalId { id: hi_counter })
+    let cmp_place = place_local(LocalId { id: cmp_counter })
+    let var_op_cmp = MirOperand { kind: MirOperandKind::Copy(var_place) }
+    let hi_op_cmp  = MirOperand { kind: MirOperandKind::Copy(hi_place) }
+    let cmp_rvalue = MirRvalue { kind: MirRvalueKind::BinOp(MirBinOp::Lt, var_op_cmp, hi_op_cmp) }
+    push_assign(b, cmp_place, cmp_rvalue, span)
+    let cmp_op = MirOperand { kind: MirOperandKind::Copy(place_local(LocalId { id: cmp_counter })) }
+    mut targets = Vec::new()
+    targets.push(SwitchTarget { value: 0, target: exit_blk })
+    set_terminator(b, MirTerminatorKind::SwitchInt(cmp_op, targets, body_blk), span)
+
+    # Body: execute body, increment var, loop back
+    switch_to_block(b, body_blk)
+    lower_block(b, body)
+    if !block_is_terminated(b) then
+      # var = var + 1 — build operands as separate bindings
+      let inc_counter = b.local_counter
+      add_temp(b, Type::Int, span)
+      let var_place2 = place_local(LocalId { id: var_counter })
+      let inc_place  = place_local(LocalId { id: inc_counter })
+      let var_op_inc = MirOperand { kind: MirOperandKind::Copy(var_place2) }
+      let one_const  = MirOperand { kind: MirOperandKind::Constant(MirConstant { kind: MirConstantKind::Int(1), ty: Type::Int }) }
+      let inc_rvalue = MirRvalue { kind: MirRvalueKind::BinOp(MirBinOp::Add, var_op_inc, one_const) }
+      push_assign(b, inc_place, inc_rvalue, span)
+      let var_place3 = place_local(LocalId { id: var_counter })
+      let inc_result = MirOperand { kind: MirOperandKind::Copy(place_local(LocalId { id: inc_counter })) }
+      push_assign(b, var_place3, MirRvalue { kind: MirRvalueKind::Use(inc_result) }, span)
+      set_terminator(b, MirTerminatorKind::Goto(header), span)
+    end
+
+    # Restore break/continue targets
+    b.break_target = old_break
+    b.continue_target = old_continue
+
+    switch_to_block(b, exit_blk)
+  when _ then
+    # Non-range for: fall back to while-like iteration over collection
+    let iter_local = add_temp(b, Type::Unit, span)
+    let iter_op = lower_expr(b, iter, span)
+    push_assign(b, place_local(iter_local), MirRvalue { kind: MirRvalueKind::Use(iter_op) }, span)
+
+    let len_local = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(len_local), MirRvalue { kind: MirRvalueKind::Len(place_local(iter_local)) }, span)
+
+    let idx_local = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::Use(
+      MirOperand { kind: MirOperandKind::Constant(MirConstant { kind: MirConstantKind::Int(0), ty: Type::Int }) }
+    ) }, span)
+
+    let header   = create_block(b)
+    let body_blk = create_block(b)
+    let exit_blk = create_block(b)
+
+    # Save and set break/continue targets
+    let old_break2 = b.break_target
+    let old_continue2 = b.continue_target
+    b.break_target = Option::Some(exit_blk)
+    b.continue_target = Option::Some(header)
+
+    set_terminator(b, MirTerminatorKind::Goto(header), span)
+
+    switch_to_block(b, header)
+    let cmp_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::BinOp(
+      MirBinOp::Lt,
+      MirOperand { kind: MirOperandKind::Copy(place_local(idx_local)) },
+      MirOperand { kind: MirOperandKind::Copy(place_local(len_local)) }
+    ) }, span)
+    let cmp_op = MirOperand { kind: MirOperandKind::Copy(place_local(cmp_tmp)) }
+    mut targets = Vec::new()
+    targets.push(SwitchTarget { value: 0, target: exit_blk })
+    set_terminator(b, MirTerminatorKind::SwitchInt(cmp_op, targets, body_blk), span)
+
+    switch_to_block(b, body_blk)
+    let var_local = add_local(b, var, Type::Int, false, span)
+    # element = iter[idx]
+    mut projs = Vec::new()
+    projs.push(Projection::Index(idx_local))
+    let elem_place = Place { local: iter_local, projections: projs }
+    push_assign(b, place_local(var_local), MirRvalue { kind: MirRvalueKind::Use(
+      MirOperand { kind: MirOperandKind::Copy(elem_place) }
+    ) }, span)
+
+    lower_block(b, body)
+    if !block_is_terminated(b) then
+      # idx = idx + 1
+      let inc_tmp = add_temp(b, Type::Int, span)
+      push_assign(b, place_local(inc_tmp), MirRvalue { kind: MirRvalueKind::BinOp(
+        MirBinOp::Add,
+        MirOperand { kind: MirOperandKind::Copy(place_local(idx_local)) },
+        MirOperand { kind: MirOperandKind::Constant(MirConstant { kind: MirConstantKind::Int(1), ty: Type::Int }) }
+      ) }, span)
+      push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::Use(
+        MirOperand { kind: MirOperandKind::Copy(place_local(inc_tmp)) }
+      ) }, span)
+      set_terminator(b, MirTerminatorKind::Goto(header), span)
+    end
+
+    # Restore break/continue targets
+    b.break_target = old_break2
+    b.continue_target = old_continue2
+
+    switch_to_block(b, exit_blk)
+  end
+end
+
+def lower_loop(b: &mut MirBuilder, body: &Block, span: Span) -> Unit
+  let header = create_block(b)
+  let exit_block = create_block(b)
+  
+  # Save and set break/continue targets
+  let old_break = b.break_target
+  let old_continue = b.continue_target
+  b.break_target = Option::Some(exit_block)
+  b.continue_target = Option::Some(header)
+  
   set_terminator(b, MirTerminatorKind::Goto(header), span)
-
-  # Header: call advance on iterator, get Option — discriminant 0=None, 1=Some
+  
   switch_to_block(b, header)
-  let elem_local = add_local(b, var, Type::Unit, false, span)
-  let call_result = add_temp(b, Type::Unit, span)
-
-  # Call _iter.advance() — modeled as: call_result = Call(advance, [_iter])
-  # For now emit as: load iter, switch on discriminant
-  let discr_tmp = add_temp(b, Type::Int, span)
-  push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(place_local(iter_local)) }, span)
-  let discr_op = MirOperand { kind: MirOperandKind::Copy(place_local(discr_tmp)) }
-
-  mut targets = Vec::new()
-  targets.push(SwitchTarget { value: 0, target: exit_blk })  # None → exit
-  set_terminator(b, MirTerminatorKind::SwitchInt(discr_op, targets, body_blk), span)
-
-  # Body: bind element, execute body, loop back
-  switch_to_block(b, body_blk)
   lower_block(b, body)
-  set_terminator(b, MirTerminatorKind::Goto(header), span)
-
-  switch_to_block(b, exit_blk)
+  if !block_is_terminated(b) then
+    set_terminator(b, MirTerminatorKind::Goto(header), span)
+  end
+  
+  # Restore break/continue targets
+  b.break_target = old_break
+  b.continue_target = old_continue
+  
+  switch_to_block(b, exit_block)
 end
 
 def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
   let scrutinee = lower_expr(b, &m.scrutinee, span)
 
-  # First store the scrutinee value in a local
-  let scrut_local = add_temp(b, Type::Unit, span)
+  # Store the scrutinee value in a local
+  let scrut_local = add_temp(b, Type::Int, span)
   push_assign(b, place_local(scrut_local), MirRvalue { kind: MirRvalueKind::Use(scrutinee.clone()) }, span)
-  
-  # Now get discriminant of the stored scrutinee (not the temp local!)
-  let discr_tmp = add_temp(b, Type::Int, span)
-  push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(
-    place_local(scrut_local)
-  ) }, span)
+
+  # Determine if this is an enum match or literal match
+  # by checking first non-wildcard pattern
+  mut is_enum_match = false
+  for arm in m.arms do
+    match arm.pattern.kind
+    when PatternKind::Variant(_, _) then
+      is_enum_match = true
+    when _ then ()
+    end
+  end
+
+  # For enum matching, extract discriminant; for literal matching, use raw value
+  let switch_local = if is_enum_match then
+    let discr_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(
+      place_local(scrut_local)
+    ) }, span)
+    discr_tmp
+  else
+    scrut_local
+  end
 
   let join_block = create_block(b)
 
@@ -1906,11 +2138,7 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     arm_blocks.push(create_block(b))
   end
 
-  # Default: go to join (unreachable unless exhaustive)
-  let default_target = join_block
-
   # Build switch targets from patterns
-  # For literal/variant patterns, extract the discriminant value
   mut switch_targets = Vec::new()
   mut i = 0
   for arm in m.arms do
@@ -1919,10 +2147,11 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
       match expr.kind
       when ExprKind::IntLit(n) then n
       when ExprKind::BoolLit(b) then if b then 1 else 0 end
-      when _ then i  # fallback: use arm index as discriminant
+      when _ then i
       end
-    when PatternKind::Variant(path, _) then i  # enum discriminant = arm index (matches lowered enum ordering)
-    when PatternKind::Wildcard then -1  # wildcard: will be default
+    when PatternKind::Variant(path, _) then i
+    when PatternKind::Wildcard then 0 - 1
+    when PatternKind::Ident(_, _) then 0 - 1
     when _ then i
     end
 
@@ -1932,20 +2161,29 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     i = i + 1
   end
 
-  # Emit switch
-  let discr_op = MirOperand { kind: MirOperandKind::Copy(place_local(scrut_local)) }
-  # If last arm is wildcard, use it as the default
+  # Find default target: last wildcard/ident arm, or join_block
   let real_default = if m.arms.len() > 0 then
-    let last = &m.arms[m.arms.len() - 1]
-    match last.pattern.kind
-    when PatternKind::Wildcard then arm_blocks[m.arms.len() - 1]
-    when _ then default_target
+    # Look for the last wildcard or ident pattern to use as default
+    mut def_target = join_block
+    mut j = 0
+    for arm in m.arms do
+      match arm.pattern.kind
+      when PatternKind::Wildcard then
+        def_target = arm_blocks[j]
+      when PatternKind::Ident(_, _) then
+        def_target = arm_blocks[j]
+      when _ then ()
+      end
+      j = j + 1
     end
+    def_target
   else
-    default_target
+    join_block
   end
 
-  set_terminator(b, MirTerminatorKind::SwitchInt(discr_op, switch_targets, real_default), span)
+  # Emit switch on the appropriate local
+  let switch_op = MirOperand { kind: MirOperandKind::Copy(place_local(switch_local)) }
+  set_terminator(b, MirTerminatorKind::SwitchInt(switch_op, switch_targets, real_default), span)
 
   # Emit each arm body
   i = 0
@@ -1982,7 +2220,6 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     when Option::Some(guard_expr) then
       let guard_val = lower_expr(b, &guard_expr, span)
       let guard_pass = create_block(b)
-      # If guard fails, fall to next arm or default
       let guard_fail = if i + 1 < arm_blocks.len() then arm_blocks[i + 1] else join_block end
       mut gt = Vec::new()
       gt.push(SwitchTarget { value: 0, target: guard_fail })
@@ -1992,7 +2229,151 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     end
 
     lower_block(b, &arm.body)
-    set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+    if !block_is_terminated(b) then
+      set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+    end
+    i = i + 1
+  end
+
+  switch_to_block(b, join_block)
+end
+
+def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: Span) -> Unit
+  # Same as lower_match but stores each arm's last expression to dest
+  let scrutinee = lower_expr(b, &m.scrutinee, span)
+
+  let scrut_local = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(scrut_local), MirRvalue { kind: MirRvalueKind::Use(scrutinee.clone()) }, span)
+
+  mut is_enum_match = false
+  for arm in m.arms do
+    match arm.pattern.kind
+    when PatternKind::Variant(_, _) then
+      is_enum_match = true
+    when _ then ()
+    end
+  end
+
+  let switch_local = if is_enum_match then
+    let discr_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::Discriminant(
+      place_local(scrut_local)
+    ) }, span)
+    discr_tmp
+  else
+    scrut_local
+  end
+
+  let join_block = create_block(b)
+
+  mut arm_blocks = Vec::new()
+  for arm in m.arms do
+    arm_blocks.push(create_block(b))
+  end
+
+  mut switch_targets = Vec::new()
+  mut i = 0
+  for arm in m.arms do
+    let disc_val = match arm.pattern.kind
+    when PatternKind::Literal(expr) then
+      match expr.kind
+      when ExprKind::IntLit(n) then n
+      when ExprKind::BoolLit(b) then if b then 1 else 0 end
+      when _ then i
+      end
+    when PatternKind::Variant(path, _) then i
+    when PatternKind::Wildcard then 0 - 1
+    when PatternKind::Ident(_, _) then 0 - 1
+    when _ then i
+    end
+
+    if disc_val >= 0 then
+      switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
+    end
+    i = i + 1
+  end
+
+  let real_default = if m.arms.len() > 0 then
+    mut def_target = join_block
+    mut j = 0
+    for arm in m.arms do
+      match arm.pattern.kind
+      when PatternKind::Wildcard then def_target = arm_blocks[j]
+      when PatternKind::Ident(_, _) then def_target = arm_blocks[j]
+      when _ then ()
+      end
+      j = j + 1
+    end
+    def_target
+  else
+    join_block
+  end
+
+  let switch_op = MirOperand { kind: MirOperandKind::Copy(place_local(switch_local)) }
+  set_terminator(b, MirTerminatorKind::SwitchInt(switch_op, switch_targets, real_default), span)
+
+  i = 0
+  for arm in m.arms do
+    switch_to_block(b, arm_blocks[i])
+
+    # Bind pattern variables
+    match arm.pattern.kind
+    when PatternKind::Ident(name, _) then
+      let local = add_local(b, name, Type::Unit, false, span)
+      push_assign(b, place_local(local), MirRvalue { kind: MirRvalueKind::Use(
+        MirOperand { kind: MirOperandKind::Copy(place_local(scrut_local)) }
+      ) }, span)
+    when PatternKind::Variant(path, sub_pats) then
+      mut field_idx = 0
+      for sp in sub_pats do
+        match sp.kind
+        when PatternKind::Ident(name, _) then
+          let local = add_local(b, name, Type::Unit, false, span)
+          let proj_place = place_field(place_local(scrut_local), name, field_idx)
+          push_assign(b, place_local(local), MirRvalue { kind: MirRvalueKind::Use(
+            MirOperand { kind: MirOperandKind::Copy(proj_place) }
+          ) }, span)
+        when _ then ()
+        end
+        field_idx = field_idx + 1
+      end
+    when _ then ()
+    end
+
+    # Guard check
+    match arm.guard
+    when Option::Some(guard_expr) then
+      let guard_val = lower_expr(b, &guard_expr, span)
+      let guard_pass = create_block(b)
+      let guard_fail = if i + 1 < arm_blocks.len() then arm_blocks[i + 1] else join_block end
+      mut gt = Vec::new()
+      gt.push(SwitchTarget { value: 0, target: guard_fail })
+      set_terminator(b, MirTerminatorKind::SwitchInt(guard_val, gt, guard_pass), span)
+      switch_to_block(b, guard_pass)
+    when Option::None then ()
+    end
+
+    # Lower arm body and store result to dest
+    if arm.body.stmts.len() > 0 then
+      # Lower all but last statement
+      mut si = 0
+      while si < arm.body.stmts.len() - 1 do
+        lower_stmt(b, &arm.body.stmts[si])
+        si = si + 1
+      end
+      # Last statement: assign its value to dest
+      let last = arm.body.stmts[arm.body.stmts.len() - 1]
+      match last.kind
+      when StmtKind::Expr(expr) then
+        lower_expr_assign_to(b, &expr, dest.clone(), span)
+      when _ then
+        lower_stmt(b, &last)
+      end
+    end
+
+    if !block_is_terminated(b) then
+      set_terminator(b, MirTerminatorKind::Goto(join_block), span)
+    end
     i = i + 1
   end
 
@@ -2910,8 +3291,10 @@ def optimize_function(f: &mut MirFunction, opt_level: Int) -> Unit
   # Dead code elimination
   eliminate_dead_code(f)
   
-  # Copy propagation
-  propagate_copies(f)
+  # Copy propagation — DISABLED: without SSA, propagating copies of
+  # variables that have multiple definitions (e.g. loop variables)
+  # causes incorrect rewrites across basic blocks.
+  # propagate_copies(f)
   
   # Constant folding
   fold_constants(f)
@@ -5558,11 +5941,13 @@ def rename_place(place: &mut Place, version_stack: &Map[Int, Vec[Int]]) -> Unit
   when Option::Some(stack) then
     if !stack.is_empty() then
       let current_version = stack[stack.len() - 1]
-      place.local.id = orig_id * SSA_VERSION_BASE + current_version
+      # Create a new LocalId instead of modifying in-place to avoid
+      # corrupting other Places that share the same LocalId pointer.
+      place.local = LocalId { id: orig_id * SSA_VERSION_BASE + current_version }
     end
   when Option::None then
     # No version stack for this local - keep original id unversioned.
-    place.local.id = orig_id
+    place.local = LocalId { id: orig_id }
   end
 end
 
@@ -5621,10 +6006,9 @@ end
 
 def lower_to_mir(program: &Program) -> MirProgram
   mut mir = lower_program(program)
-  # Convert to SSA form before optimization
-  for func in mir.functions do
-    convert_to_ssa(&mut func)
-  end
+  # SSA conversion disabled: the rename pass has pointer-aliasing bugs
+  # where shared LocalId objects cause one rename to corrupt unrelated
+  # Places.  The MIR is correct without SSA for codegen purposes.
   # Verify MIR invariants before optimization
   let pre_errors = verify_mir(&mir)
   if !pre_errors.is_empty() then
