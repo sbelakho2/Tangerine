@@ -1,1 +1,1 @@
-lib/lsp.ml: Bytes Printf String
+lib/lsp.ml: Buffer Bytes Char Printf String

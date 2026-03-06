@@ -183,6 +183,8 @@ let rec expr_type_name ctx = function
           (match unwrapped with
            | TyName (("Vec"|"Array"), [TyName (elem, _)]) -> elem
            | TyName (("Vec"|"Array"), [TyRef (_, TyName (elem, _))]) -> elem
+           | TyArray (TyName (elem, _), _) -> elem
+           | TyArray (TyRef (_, TyName (elem, _)), _) -> elem
            | _ -> "")
         | _ -> "")
      | EFieldAccess (parent, field, _) ->
@@ -238,6 +240,8 @@ let rec expr_type_name ctx = function
                   (match unwrap_ref ft with
                    | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
                    | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+                   | TyArray (TyName (t, _), _) -> t
+                   | TyArray (TyRef (_, TyName (t, _)), _) -> t
                    | _ -> "")
                 | _ -> "")
              | _ -> "")
@@ -252,6 +256,44 @@ let rec expr_type_name ctx = function
       in
       option_inner
     end
+  | EArray _ -> "Vec"
+  | ETuple _ -> "Tuple"
+  | ERange _ -> "Range"
+  | ECast (_, typ, _) -> Resolve.type_name_string_of_typ typ
+  | EUnOp (Not, _, _) -> "Bool"
+  | EUnOp (Neg, operand, _) -> expr_type_name ctx operand
+  | EUnOp (_, operand, _) -> expr_type_name ctx operand
+  | EBinOp ((Eq | Neq | Lt | Gt | Le | Ge | And | Or), _, _, _) -> "Bool"
+  | EBinOp (_, left, right, _) ->
+    let lt = expr_type_name ctx left in
+    if lt <> "" then lt else expr_type_name ctx right
+  | EBlock (stmts, _) | EUnsafe (_, stmts, _) ->
+    (* Type of a block is the type of its last expression *)
+    (match List.rev stmts with
+     | SExpr e :: _ -> expr_type_name ctx e
+     | _ -> "")
+  | EIf (branches, else_body, _) ->
+    (* Try to infer from first branch's last expression *)
+    (match branches with
+     | { body; _ } :: _ ->
+       (match List.rev body with
+        | SExpr e :: _ -> expr_type_name ctx e
+        | _ ->
+          (match else_body with
+           | Some els ->
+             (match List.rev els with
+              | SExpr e :: _ -> expr_type_name ctx e
+              | _ -> "")
+           | None -> ""))
+     | [] ->
+       (match else_body with
+        | Some els ->
+          (match List.rev els with
+           | SExpr e :: _ -> expr_type_name ctx e
+           | _ -> "")
+        | None -> ""))
+  | EClosure _ -> "Fn"
+  | ENil _ -> ""
   | _ -> ""
 
 (* Extract the full Ok-inner type from a Result-returning expression.
@@ -333,6 +375,8 @@ let expr_option_inner_type ctx = function
             (match unwrap_ref ft with
              | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
              | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+             | TyArray (TyName (t, _), _) -> t
+             | TyArray (TyRef (_, TyName (t, _)), _) -> t
              | _ -> "")
           | None -> "")
        | EFieldAccess (parent, field, _) ->
@@ -341,6 +385,8 @@ let expr_option_inner_type ctx = function
             (match unwrap_ref ft with
              | TyName (("Vec"|"Array"), [TyName (t, _)]) -> t
              | TyName (("Vec"|"Array"), [TyRef (_, TyName (t, _))]) -> t
+             | TyArray (TyName (t, _), _) -> t
+             | TyArray (TyRef (_, TyName (t, _)), _) -> t
              | _ -> "")
           | None -> "")
        | _ -> "")
@@ -382,15 +428,20 @@ let infer_iter_element_type ctx expr =
      | Some { v_full_type = Some (TyName (("Vec"|"Array"), [TyName (elem, _)])); _ } -> elem
      | Some { v_full_type = Some (TyName (("Vec"|"Array"), [TyRef (_, TyName (elem, _))])); _ } -> elem
      | Some { v_full_type = Some (TyRef (_, TyName (("Vec"|"Array"), [TyName (elem, _)]))); _ } -> elem
+     | Some { v_full_type = Some (TyArray (TyName (elem, _), _)); _ } -> elem
+     | Some { v_full_type = Some (TyArray (TyRef (_, TyName (elem, _)), _)); _ } -> elem
+     | Some { v_full_type = Some (TyRef (_, TyArray (TyName (elem, _), _))); _ } -> elem
      | _ -> "")
   | ECall (EIdent (name, _), _, _) ->
     (match Resolve.find_symbol ctx.res name with
      | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyName (("Vec"|"Array"), [Ast.TyName (elem, _)]))); _ } -> elem
+     | Some { sym_kind = Resolve.SkFunction (_, Some (Ast.TyArray (Ast.TyName (elem, _), _))); _ } -> elem
      | _ -> "")
   | EMethodCall (obj, meth, _, _) ->
     let obj_type = expr_type_name ctx obj in
     (match Resolve.find_method ctx.res obj_type meth with
      | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyName (("Vec"|"Array"), [Ast.TyName (elem, _)]))); _ } -> elem
+     | Some { sym_kind = Resolve.SkMethod (_, _, Some (Ast.TyArray (Ast.TyName (elem, _), _))); _ } -> elem
      | _ -> "")
   | _ -> ""
 
@@ -440,21 +491,34 @@ let resolve_method_name ctx type_name method_name =
   (* Check if bare name exists in qualified table *)
   if Hashtbl.mem ctx.res.Resolve.qualified bare then bare
   else begin
-    (* Search qualified table for *__Type__method *)
-    let suffix = "__" ^ Resolve.sanitize_ident type_name ^ "__" ^ Resolve.sanitize_ident method_name in
-    let found = ref "" in
-    Hashtbl.iter (fun k _v ->
-      if !found = "" && String.length k > String.length suffix &&
-         String.sub k (String.length k - String.length suffix) (String.length suffix) = suffix then
-        found := k
-    ) ctx.res.Resolve.qualified;
-    if !found <> "" then !found
-    else begin
-      (* Try method_map: Type.method *)
-      match Resolve.find_method ctx.res type_name method_name with
-      | Some sym -> sym.Resolve.sym_mangled
-      | None -> bare  (* fallback to bare name *)
-    end
+    (* Try method_map first (most precise lookup) *)
+    match Resolve.find_method ctx.res type_name method_name with
+    | Some sym -> sym.Resolve.sym_mangled
+    | None ->
+      (* Search qualified table for *__Type__method, preferring current module *)
+      let suffix = "__" ^ Resolve.sanitize_ident type_name ^ "__" ^ Resolve.sanitize_ident method_name in
+      let candidates = ref [] in
+      Hashtbl.iter (fun k _v ->
+        if String.length k > String.length suffix &&
+           String.sub k (String.length k - String.length suffix) (String.length suffix) = suffix then
+          candidates := k :: !candidates
+      ) ctx.res.Resolve.qualified;
+      match !candidates with
+      | [] -> bare  (* fallback to bare name *)
+      | [single] -> single
+      | many ->
+        (* Prefer match from current module *)
+        let mod_prefix = if ctx.current_module <> "" then
+          Resolve.sanitize_ident ctx.current_module ^ "__" else "" in
+        (match List.find_opt (fun k ->
+           mod_prefix <> "" && String.length k >= String.length mod_prefix &&
+           String.sub k 0 (String.length mod_prefix) = mod_prefix) many with
+         | Some k -> k
+         | None ->
+           (* No current-module match: pick shortest (most specific) *)
+           List.fold_left (fun acc k ->
+             if String.length k < String.length acc then k else acc
+           ) (List.hd many) (List.tl many))
   end
 
 (* Resolve a function name to its C identifier, considering module context *)
@@ -570,6 +634,9 @@ let emit_enum_def ctx name variants =
     emit_indent ctx;
     emitfn ctx "%s* _p = (%s*)tg_alloc(sizeof(%s));"
       c_name c_name c_name;
+    (* Zero-initialize all payload fields to prevent reading uninitialized memory *)
+    emit_indent ctx;
+    emitfn ctx "memset(_p, 0, sizeof(%s));" c_name;
     emit_indent ctx;
     emitfn ctx "_p->_tag = %d;" tag;
     emit_indent ctx;
@@ -596,7 +663,7 @@ let rec emit_expr ctx expr =
     emitf ctx "tg_from_double(%g)" f
 
   | EStr (s, _) ->
-    emitf ctx "tg_str_from_cstr(\"%s\")" (c_string_escape s)
+    emit ctx "tg_str_from_cstr(\""; emit ctx (c_string_escape s); emit ctx "\")"
 
   | EChar (s, _) ->
     if String.length s = 0 then
@@ -731,6 +798,9 @@ let rec emit_expr ctx expr =
   | EBinOp (Shr, l, r, _) ->
     emit ctx "("; emit_expr ctx l; emit ctx " >> "; emit_expr ctx r; emit ctx ")"
 
+  | EBinOp (Concat, l, r, _) ->
+    emit ctx "tg_concat("; emit_expr ctx l; emit ctx ", "; emit_expr ctx r; emit ctx ")"
+
   | EUnOp (Neg, inner, _) ->
     emit ctx "(-("; emit_expr ctx inner; emit ctx "))"
 
@@ -825,13 +895,16 @@ let rec emit_expr ctx expr =
       | Some vi ->
         emitf ctx "%s_%s__new(" (resolve_enum_type ctx vi) (c_ident name);
         emit_args ctx args;
-        (* Pad with TG_NIL if constructor expects more args than provided *)
+        (* Validate arity: constructor must receive the right number of args *)
         let nargs = List.length args in
         let nfields = List.length vi.vi_fields in
-        if nfields > nargs then
+        if nfields > nargs then begin
+          Printf.eprintf "[codegen] warning: variant '%s' expects %d field(s) but called with %d arg(s), padding with TG_NIL\n%!" name nfields nargs;
           for _ = nargs + 1 to nfields do
             emit ctx ", TG_NIL"
-          done;
+          done
+        end else if nargs > nfields then
+          Printf.eprintf "[codegen] warning: variant '%s' expects %d field(s) but called with %d arg(s), extra args ignored\n%!" name nfields nargs;
         emit ctx ")"
       | None ->
         emitf ctx "%s(" (resolve_fn_name ctx name);
@@ -1007,9 +1080,7 @@ let rec emit_expr ctx expr =
        structs with FEWEST fields (most specific type), breaking ties by
        lowest field index. *)
     let find_best_struct_for_field field_name =
-      let best = ref None in
-      let best_field_count = ref max_int in
-      let best_idx = ref max_int in
+      let candidates = ref [] in
       Hashtbl.iter (fun _qname sym ->
         match sym.Resolve.sym_kind with
         | Resolve.SkStruct fields ->
@@ -1019,14 +1090,10 @@ let rec emit_expr ctx expr =
           in
           let idx = find_idx 0 fields in
           let nf = List.length fields in
-          if idx >= 0 && (nf < !best_field_count || (nf = !best_field_count && idx < !best_idx)) then begin
-            best := Some (resolve_type ctx sym.Resolve.sym_name);
-            best_field_count := nf;
-            best_idx := idx
-          end
+          if idx >= 0 then
+            candidates := (resolve_type ctx sym.Resolve.sym_name, nf, idx) :: !candidates
         | _ -> ()
       ) ctx.res.Resolve.symbols;
-      (* Also search qualified *)
       Hashtbl.iter (fun qname sym ->
         match sym.Resolve.sym_kind with
         | Resolve.SkStruct fields ->
@@ -1036,14 +1103,32 @@ let rec emit_expr ctx expr =
           in
           let idx = find_idx 0 fields in
           let nf = List.length fields in
-          if idx >= 0 && (nf < !best_field_count || (nf = !best_field_count && idx < !best_idx)) then begin
-            best := Some qname;
-            best_field_count := nf;
-            best_idx := idx
-          end
+          if idx >= 0 then
+            candidates := (qname, nf, idx) :: !candidates
         | _ -> ()
       ) ctx.res.Resolve.qualified;
-      !best
+      match !candidates with
+      | [] -> None
+      | _ ->
+        (* Prefer current module match *)
+        let mod_prefix = if ctx.current_module <> "" then
+          Resolve.sanitize_ident ctx.current_module ^ "__" else "" in
+        let in_module = List.filter (fun (name, _, _) ->
+          mod_prefix <> "" && String.length name >= String.length mod_prefix &&
+          String.sub name 0 (String.length mod_prefix) = mod_prefix
+        ) !candidates in
+        let pool = if in_module <> [] then in_module else !candidates in
+        (* Sort: fewest fields first, then lowest field index, then alphabetical *)
+        let sorted = List.sort (fun (n1, nf1, idx1) (n2, nf2, idx2) ->
+          let c = compare nf1 nf2 in
+          if c <> 0 then c
+          else let c = compare idx1 idx2 in
+          if c <> 0 then c
+          else String.compare n1 n2
+        ) pool in
+        match sorted with
+        | (name, _, _) :: _ -> Some name
+        | [] -> None
     in
     (* Try to resolve the struct type, preferring module-qualified names *)
     let resolve_struct_type obj_type field =
@@ -1185,6 +1270,21 @@ let rec emit_expr ctx expr =
         end in
       emit ctx "({ ";
       emitf ctx "%s* _sl = (%s*)tg_alloc(sizeof(%s)); " c_name c_name c_name;
+      (* Initialize all fields to TG_NIL first to prevent uninitialized reads *)
+      emitf ctx "memset(_sl, 0, sizeof(%s)); " c_name;
+      (* Emit fields in struct definition order for predictable evaluation *)
+      let ordered_fields = if struct_fields <> [] then
+        List.filter_map (fun sf ->
+          match List.find_opt (fun (fname, _) -> fname = sf.fd_name) fields with
+          | Some pair -> Some pair
+          | None -> None
+        ) struct_fields
+      else fields in
+      (* Append any user-provided fields not in struct definition (safety) *)
+      let extra = List.filter (fun (fname, _) ->
+        not (List.exists (fun sf -> sf.fd_name = fname) struct_fields)
+      ) fields in
+      let all_fields = ordered_fields @ extra in
       List.iter (fun (fname, fexpr) ->
         emitf ctx "_sl->%s = " (c_ident fname);
         (* Check if Map::new()/Set::new() should use integer keys based on struct field type *)
@@ -1193,7 +1293,7 @@ let rec emit_expr ctx expr =
         if not (emit_map_set_for_field_typ ctx fexpr ftyp) then
           emit_expr ctx fexpr;
         emit ctx "; ";
-      ) fields;
+      ) all_fields;
       emit ctx "tg_from_ptr(_sl); })"
     end else begin
       (* Unknown struct — use generic allocation *)
@@ -1404,6 +1504,24 @@ let rec emit_expr ctx expr =
     emitf ctx "; _ri %s " (if inclusive then "<=" else "<");
     emit_expr ctx end_;
     emitf ctx "; _ri++) tg_vec_push(%s, _ri); %s; })" tmp tmp
+
+  | EAwait (inner, _) ->
+    (* await: emit inner expression — runtime provides actual suspension *)
+    emit_expr ctx inner
+
+  | EAsync (body, _) ->
+    (* async block: emit body inline — runtime wraps in future *)
+    emit_block_expr ctx body
+
+  | ETry (inner, _) ->
+    (* Error propagation: expr? → match on tag, early return on Err/None *)
+    let tmp = fresh_temp ctx in
+    emitf ctx "({ TgVal %s = " tmp;
+    emit_expr ctx inner;
+    emitf ctx "; if (TG_IS_ERR(%s)) return %s; TG_UNWRAP_OK(%s); })" tmp tmp tmp
+
+  | EUnsafe (_, body, _) ->
+    emit_block_expr ctx body
 
 and emit_args ctx args =
   let first = ref true in
@@ -1763,10 +1881,17 @@ and emit_method_call ctx obj method_name args =
       (* User methods — try module dispatch *)
       let resolved_type = if obj_type = "" then ctx.self_type else obj_type in
       if resolved_type <> "" then begin
-        emitf ctx "%s(" (resolve_method_name ctx resolved_type method_name);
-        emit_expr ctx obj;
-        List.iter (fun a -> emit ctx ", "; emit_expr ctx a) args;
-        emit ctx ")"
+        let resolved = resolve_method_name ctx resolved_type method_name in
+        if Hashtbl.mem ctx.res.Resolve.qualified resolved then begin
+          emitf ctx "%s(" resolved;
+          emit_expr ctx obj;
+          List.iter (fun a -> emit ctx ", "; emit_expr ctx a) args;
+          emit ctx ")"
+        end else begin
+          emitf ctx "/* .%s() [unresolved on %s] */ (" method_name resolved_type;
+          emit_expr ctx obj;
+          emit ctx ")"
+        end
       end else begin
         emitf ctx "/* .%s() */ (" method_name;
         emit_expr ctx obj;
@@ -1776,10 +1901,17 @@ and emit_method_call ctx obj method_name args =
       (* Generic fallback — try method dispatch as module_type__method *)
       let resolved_type = if obj_type = "" then ctx.self_type else obj_type in
       if resolved_type <> "" then begin
-        emitf ctx "%s(" (resolve_method_name ctx resolved_type method_name);
-        emit_expr ctx obj;
-        List.iter (fun a -> emit ctx ", "; emit_expr ctx a) args;
-        emit ctx ")"
+        let resolved = resolve_method_name ctx resolved_type method_name in
+        if Hashtbl.mem ctx.res.Resolve.qualified resolved then begin
+          emitf ctx "%s(" resolved;
+          emit_expr ctx obj;
+          List.iter (fun a -> emit ctx ", "; emit_expr ctx a) args;
+          emit ctx ")"
+        end else begin
+          emitf ctx "/* .%s() [unresolved on %s] */ (" method_name resolved_type;
+          emit_expr ctx obj;
+          emit ctx ")"
+        end
       end else begin
         emitf ctx "/* .%s() */ (" method_name;
         emit_expr ctx obj;
@@ -2729,6 +2861,44 @@ and emit_match_arm_expr ctx tmp arm ~is_first =
     emit_match_arm_expr ctx tmp { arm with pat = p1 } ~is_first;
     emit_match_arm_expr ctx tmp { arm with pat = p2 } ~is_first:false
 
+  | PatSlice (pats, _loc) ->
+    (* Slice pattern: check length match and bind elements *)
+    let n_fixed = List.length (List.filter (fun p -> match p with PatRest _ -> false | _ -> true) pats) in
+    let has_rest = List.exists (fun p -> match p with PatRest _ -> true | _ -> false) pats in
+    let cond = if has_rest then
+      Printf.sprintf "tg_array_len(%s) >= %d" tmp n_fixed
+    else
+      Printf.sprintf "tg_array_len(%s) == %d" tmp n_fixed
+    in
+    let kw = if is_first then "if" else "else if" in
+    emitn ctx (Printf.sprintf "%s (%s) {" kw cond);
+    let idx = ref 0 in
+    List.iter (fun p ->
+      match p with
+      | PatRest _ -> ()
+      | PatBind (name, _) ->
+        emitn ctx (Printf.sprintf "  TgVal %s = tg_array_get(%s, %d);" name tmp !idx);
+        incr idx
+      | _ -> incr idx
+    ) pats;
+    emit_block_expr_to ctx arm.arm_body res;
+    emit ctx "} "
+
+  | PatRange (lo, hi, inclusive, _loc) ->
+    let kw = if is_first then "if" else "else if" in
+    let lo_s = match lo with PatLit (EInt (n, _)) -> string_of_int n | PatLit (EChar (c, _)) -> Printf.sprintf "'%s'" c | _ -> "0" in
+    let hi_s = match hi with PatLit (EInt (n, _)) -> string_of_int n | PatLit (EChar (c, _)) -> Printf.sprintf "'%s'" c | _ -> "0" in
+    let op = if inclusive then "<=" else "<" in
+    emitn ctx (Printf.sprintf "%s (%s >= %s && %s %s %s) {" kw tmp lo_s tmp op hi_s);
+    emit_block_expr_to ctx arm.arm_body res;
+    emit ctx "} "
+
+  | PatRest _ ->
+    (* Rest pattern in isolation: treat as wildcard *)
+    emit ctx "{ ";
+    emit_block_expr_to ctx arm.arm_body res;
+    emit ctx "} "
+
 (* ── Closure codegen ───────────────────────────────────────────────── *)
 
 (* Collect free variables from an expression that aren't in the local scope *)
@@ -2742,8 +2912,8 @@ and collect_free_vars_expr ctx bound = function
     else [name]
   | EInt _ | EFloat _ | EStr _ | EBool _ | EChar _ | ENil _ -> []
   | EBinOp (_, l, r, _) -> collect_free_vars_expr ctx bound l @ collect_free_vars_expr ctx bound r
-  | EUnOp (_, e, _) | EReturn (Some e, _) -> collect_free_vars_expr ctx bound e
-  | EReturn (None, _) | EBreak (_, _) | ENext _ -> []
+  | EUnOp (_, e, _) | EReturn (Some e, _) | EBreak (Some e, _) -> collect_free_vars_expr ctx bound e
+  | EReturn (None, _) | EBreak (None, _) | ENext _ -> []
   | ECall (f, args, _) ->
     collect_free_vars_expr ctx bound f @ List.concat_map (collect_free_vars_expr ctx bound) args
   | EMethodCall (obj, _, args, _) ->
@@ -2783,6 +2953,10 @@ and collect_free_vars_expr ctx bound = function
   | ELoop (body, _) ->
     List.concat_map (collect_free_vars_stmt ctx bound) body
   | ECast (e, _, _) -> collect_free_vars_expr ctx bound e
+  | EAwait (e, _) -> collect_free_vars_expr ctx bound e
+  | EAsync (body, _) -> List.concat_map (collect_free_vars_stmt ctx bound) body
+  | ETry (e, _) -> collect_free_vars_expr ctx bound e
+  | EUnsafe (_, body, _) -> List.concat_map (collect_free_vars_stmt ctx bound) body
 
 and collect_free_vars_stmt ctx bound = function
   | SExpr e -> collect_free_vars_expr ctx bound e
@@ -2804,10 +2978,12 @@ and collect_pattern_bindings = function
   | PatVariant (_, subs, _) -> List.concat_map collect_pattern_bindings subs
   | PatTuple (subs, _) -> List.concat_map collect_pattern_bindings subs
   | PatStruct (_, fps, _) ->
-    List.concat_map (fun (_, po) ->
-      match po with Some p -> collect_pattern_bindings p | None -> []
+    List.concat_map (fun (field_name, po) ->
+      match po with Some p -> collect_pattern_bindings p | None -> [field_name]
     ) fps
   | PatOr (p1, p2, _) -> collect_pattern_bindings p1 @ collect_pattern_bindings p2
+  | PatSlice (subs, _) -> List.concat_map collect_pattern_bindings subs
+  | PatRange _ | PatRest _ -> []
   | PatWild _ | PatLit _ -> []
 
 and emit_closure ctx params body =
@@ -2847,7 +3023,12 @@ and emit_closure ctx params body =
       List.iteri (fun i v ->
         Buffer.add_string fn_body
           (Printf.sprintf "    TgVal %s = tg_vec_get(_env, %d);\n" (c_ident v) i)
-      ) free_vars
+      ) free_vars;
+    (* Register captured variables so nested closures can see them *)
+    List.iter (fun v ->
+      let typ = match get_var_type ctx v with Some t -> t | None -> "" in
+      set_var_type ctx v typ
+    ) free_vars
   end;
 
   (* Unpack params from _arg *)
@@ -3744,6 +3925,55 @@ and emit_match_arm_stmt ctx tmp arm ~is_first =
     emit_match_arm_stmt ctx tmp { arm with pat = p1 } ~is_first;
     emit_match_arm_stmt ctx tmp { arm with pat = p2 } ~is_first:false
 
+  | PatSlice (pats, _) ->
+    let n_fixed = List.length (List.filter (fun p -> match p with PatRest _ -> false | _ -> true) pats) in
+    let has_rest = List.exists (fun p -> match p with PatRest _ -> true | _ -> false) pats in
+    let cond = if has_rest then
+      Printf.sprintf "tg_array_len(%s) >= %d" tmp n_fixed
+    else
+      Printf.sprintf "tg_array_len(%s) == %d" tmp n_fixed
+    in
+    let kw = if is_first then "if" else "else if" in
+    emit_indent ctx;
+    emitn ctx (Printf.sprintf "%s (%s) {" kw cond);
+    indent ctx;
+    let idx = ref 0 in
+    List.iter (fun p ->
+      match p with
+      | PatRest _ -> ()
+      | PatBind (name, _) ->
+        emit_indent ctx;
+        emitn ctx (Printf.sprintf "TgVal %s = tg_array_get(%s, %d);" name tmp !idx);
+        incr idx
+      | _ -> incr idx
+    ) pats;
+    List.iter (fun s -> emit_stmt ctx s) arm.arm_body;
+    dedent ctx;
+    emit_indent ctx;
+    emitn ctx "}"
+
+  | PatRange (lo, hi, inclusive, _) ->
+    let kw = if is_first then "if" else "else if" in
+    let lo_s = match lo with PatLit (EInt (n, _)) -> string_of_int n | PatLit (EChar (c, _)) -> Printf.sprintf "'%s'" c | _ -> "0" in
+    let hi_s = match hi with PatLit (EInt (n, _)) -> string_of_int n | PatLit (EChar (c, _)) -> Printf.sprintf "'%s'" c | _ -> "0" in
+    let op = if inclusive then "<=" else "<" in
+    emit_indent ctx;
+    emitn ctx (Printf.sprintf "%s (%s >= %s && %s %s %s) {" kw tmp lo_s tmp op hi_s);
+    indent ctx;
+    List.iter (fun s -> emit_stmt ctx s) arm.arm_body;
+    dedent ctx;
+    emit_indent ctx;
+    emitn ctx "}"
+
+  | PatRest _ ->
+    emit_indent ctx;
+    emitn ctx "{";
+    indent ctx;
+    List.iter (fun s -> emit_stmt ctx s) arm.arm_body;
+    dedent ctx;
+    emit_indent ctx;
+    emitn ctx "}"
+
 (* ── Top-level item codegen ────────────────────────────────────────── *)
 
 let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
@@ -3806,17 +4036,19 @@ let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
   indent ctx;
   (* Check if last statement is an implicit return expression.
      Only do this for "safe" expression types that always produce a TgVal.
-     Exclude EIf/EMatch (handled separately with branch-level returns). *)
+     Exclude EIf/EMatch/EBlock/EUnsafe (handled separately with recursive return injection). *)
   let is_safe_implicit_return e = match e with
-    | ETuple _ | EStructLit _ | EBlock _
+    | ETuple _ | EStructLit _
     | EIdent _ | EInt _ | EFloat _ | EStr _ | EChar _
     | EBool _ | ENil _ | EBinOp _ | EUnOp _ | EClosure _
     | ECast _ | ERange _ | EFieldAccess _ | EIndex _
-    | EArray _ | ECall _ | EMethodCall _ -> true
+    | EArray _ | ECall _ | EMethodCall _
+    | EAwait _ | EAsync _ | ETry _ -> true
     | _ -> false
   in
   (* Helper: inject return into last expression of a statement list *)
   let rec inject_return stmts = match List.rev stmts with
+    | (SExpr (EReturn _)) :: _ -> stmts (* already has a return *)
     | (SExpr (EIf (branches, else_body, sp))) :: prev ->
       let branches' = List.map (fun b -> { b with body = inject_return b.body }) branches in
       let else_body' = Option.map inject_return else_body in
@@ -3824,8 +4056,15 @@ let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
     | (SExpr (EMatch (scrut, arms, sp))) :: prev ->
       let arms' = List.map (fun arm -> { arm with arm_body = inject_return arm.arm_body }) arms in
       List.rev prev @ [SExpr (EMatch (scrut, arms', sp))]
+    | (SExpr (EBlock (inner, sp))) :: prev ->
+      List.rev prev @ [SExpr (EBlock (inject_return inner, sp))]
+    | (SExpr (EUnsafe (lang, inner, sp))) :: prev ->
+      List.rev prev @ [SExpr (EUnsafe (lang, inject_return inner, sp))]
     | (SExpr e) :: prev when is_safe_implicit_return e ->
       List.rev prev @ [SExpr (EReturn (Some e, { file=""; line=0; col=0 }))]
+    | (SLet { name; _ }) :: _ ->
+      let dummy = { file=""; line=0; col=0 } in
+      stmts @ [SExpr (EReturn (Some (EIdent (name, dummy)), dummy))]
     | _ -> stmts @ [SExpr (EReturn (None, { file=""; line=0; col=0 }))]
   in
   let (init, last_return) = match List.rev body with
@@ -3838,6 +4077,12 @@ let emit_function_def ctx name params _ret body ~is_method ~self_type_name =
     | (SExpr (EMatch (scrut, arms, sp))) :: rest ->
       let arms' = List.map (fun arm -> { arm with arm_body = inject_return arm.arm_body }) arms in
       (List.rev rest @ [SExpr (EMatch (scrut, arms', sp))], None)
+    | (SExpr (EBlock (inner, sp))) :: rest ->
+      (List.rev rest @ [SExpr (EBlock (inject_return inner, sp))], None)
+    | (SExpr (EUnsafe (lang, inner, sp))) :: rest ->
+      (List.rev rest @ [SExpr (EUnsafe (lang, inject_return inner, sp))], None)
+    | (SExpr (EReturn _)) :: _ -> (body, None)
+    | (SLet _) :: _ -> (inject_return body, None)
     | _ -> (body, None)
   in
   emit_stmts ctx init;
@@ -3909,7 +4154,7 @@ let rec emit_item ctx item =
     (match value with
      | EInt (v, _) -> emitf ctx "%dLL" v
      | EFloat (f, _) -> emitf ctx "0 /* %g */" f
-     | EStr (s, _) -> emitf ctx "0 /* \"%s\" */" (c_string_escape s)
+     | EStr (s, _) -> emit ctx "0 /* \""; emit ctx (c_string_escape s); emit ctx "\" */"
      | EBool (true, _) -> emit ctx "1"
      | EBool (false, _) -> emit ctx "0"
      | _ -> emit ctx "0");
@@ -3929,8 +4174,11 @@ let rec emit_item ctx item =
     ) sigs
 
   | IModule { name; items; _ } ->
-    emitfn ctx "/* module %s */" name;
-    List.iter (emit_item ctx) items
+    let old_module = ctx.current_module in
+    ctx.current_module <- (if old_module <> "" then old_module ^ "__" ^ name else name);
+    emitfn ctx "/* module %s */" ctx.current_module;
+    List.iter (emit_item ctx) items;
+    ctx.current_module <- old_module
 
   | IUse _ -> ()  (* resolved at linking time *)
 
@@ -3956,6 +4204,11 @@ let compile_to_c (res : Resolve.resolved) ~has_main : string =
   (* Preamble *)
   emitn ctx "/* Generated by Tangerine stage0 C transpiler */";
   emitn ctx "/* This file is auto-generated — do not edit */";
+  nl ctx;
+  (* Suppress diagnostics for GCC statement expressions used throughout *)
+  emitn ctx "#if defined(__clang__)";
+  emitn ctx "#pragma clang diagnostic ignored \"-Wgnu-statement-expression\"";
+  emitn ctx "#endif";
   nl ctx;
   emitn ctx "#include <stdint.h>";
   emitn ctx "#include <stdbool.h>";

@@ -13,7 +13,25 @@ type typ =
   | TyFn of typ list * typ
   | TySelf
   | TyOption of typ
+  | TyArray of typ * int option
   | TyInfer
+
+(* ── Visibility ─────────────────────────────────────────────────────── *)
+
+type visibility =
+  | Private
+  | Public
+  | PubCrate
+  | PubSuper
+  | PubIn of string
+
+(* ── Attributes / annotations ──────────────────────────────────────── *)
+
+type attribute = {
+  attr_name : string;
+  attr_args : string list;
+  attr_loc : loc;
+}
 
 (* ── Operators ─────────────────────────────────────────────────────── *)
 
@@ -22,6 +40,7 @@ type binop =
   | Eq | Neq | Lt | Gt | Le | Ge
   | And | Or
   | BitAnd | BitOr | BitXor | Shl | Shr
+  | Concat
 
 type unop = Neg | Not | AddrOf | AddrMut | Deref
 
@@ -50,6 +69,7 @@ type expr =
   | EFor of string * expr * stmt list * loc
   | ELoop of stmt list * loc
   | EBlock of stmt list * loc
+  | EUnsafe of string option * stmt list * loc
   | EReturn of expr option * loc
   | EBreak of expr option * loc
   | ENext of loc
@@ -57,6 +77,9 @@ type expr =
   | EClosure of cparam list * typ option * expr * loc
   | ECast of expr * typ * loc
   | ERange of expr * expr * bool * loc
+  | EAwait of expr * loc
+  | EAsync of stmt list * loc
+  | ETry of expr * loc
 
 and if_branch = { cond : expr; body : stmt list }
 
@@ -75,6 +98,9 @@ and pattern =
   | PatStruct of string * (string * pattern option) list * loc
   | PatTuple of pattern list * loc
   | PatOr of pattern * pattern * loc
+  | PatSlice of pattern list * loc
+  | PatRange of pattern * pattern * bool * loc  (* lo, hi, inclusive, loc *)
+  | PatRest of loc  (* the '..' element inside slice/struct patterns *)
 
 (* ── Statements ────────────────────────────────────────────────────── *)
 
@@ -88,70 +114,97 @@ type param = { p_name : string; p_typ : typ; p_mut : bool; p_default : expr opti
 
 type field_def = { fd_name : string; fd_typ : typ; fd_pub : bool }
 
-type variant_def = { vd_name : string; vd_fields : typ list }
+type variant_def = { vd_name : string; vd_fields : typ list; vd_field_names : string list }
 
 type fn_sig = { fs_name : string; fs_params : param list; fs_ret : typ option }
 
+type where_bound = { wb_param : string; wb_bounds : string list }
+
+type use_kind = UseSimple | UseGlob | UseMulti of string list
+
 type item =
   | IFn of {
-      pub : bool;
+      vis : visibility;
       name : string;
+      type_params : string list;
       params : param list;
       ret : typ option;
       body : stmt list;
+      is_async : bool;
+      where_clauses : where_bound list;
+      attrs : attribute list;
       loc : loc;
     }
   | IStruct of {
-      pub : bool;
+      vis : visibility;
       name : string;
+      type_params : string list;
       fields : field_def list;
+      where_clauses : where_bound list;
+      attrs : attribute list;
       loc : loc;
     }
   | IEnum of {
-      pub : bool;
+      vis : visibility;
       name : string;
+      type_params : string list;
       variants : variant_def list;
+      attrs : attribute list;
       loc : loc;
     }
   | ITrait of {
-      pub : bool;
+      vis : visibility;
       name : string;
+      type_params : string list;
+      supers : string list;
       items : item list;
+      where_clauses : where_bound list;
+      attrs : attribute list;
       loc : loc;
     }
   | IImpl of {
       target : typ;
       trait_ : string option;
+      type_params : string list;
       methods : item list;
+      where_clauses : where_bound list;
+      attrs : attribute list;
       loc : loc;
     }
-  | IUse of { path : string list; alias : string option; loc : loc }
+  | IUse of { path : string list; use_kind : use_kind; alias : string option; loc : loc }
   | IConst of { name : string; typ : typ option; value : expr; loc : loc }
-  | ITypeAlias of { name : string; typ : typ; loc : loc }
+  | ITypeAlias of { name : string; type_params : string list; typ : typ; loc : loc }
   (* abi: None = default, Some "C" = C ABI, Some "stdcall" = stdcall, etc.
      Supported ABI values: "C", "stdcall", "fastcall", "system", "Tangerine" *)
   | IExtern of { abi : string option; sigs : fn_sig list; loc : loc }
-  | IModule of { pub : bool; name : string; items : item list; loc : loc }
+  | IModule of { vis : visibility; name : string; items : item list; attrs : attribute list; loc : loc }
 
 type program = { items : item list }
 
 (* ── Match exhaustiveness helpers ─────────────────────────────────── *)
 
+(** Returns true if a pattern is a wildcard or catch-all *)
+let rec is_catch_all = function
+  | PatWild _ | PatBind _ | PatMut _ -> true
+  | PatOr (a, b, _) -> is_catch_all a || is_catch_all b
+  | _ -> false
+
 (** Returns true if the arm list contains a wildcard or catch-all binding pattern *)
 let has_wildcard_arm arms =
-  List.exists (fun arm ->
-    match arm.pat with
-    | PatWild _ | PatBind _ | PatMut _ -> true
-    | _ -> false
-  ) arms
+  List.exists (fun arm -> is_catch_all arm.pat) arms
+
+(** Recursively extract all variant names covered by a pattern *)
+let rec variants_of_pattern = function
+  | PatVariant (name, _, _) -> [name]
+  | PatOr (a, b, _) -> variants_of_pattern a @ variants_of_pattern b
+  | PatTuple (pats, _) ->
+    List.concat_map variants_of_pattern pats
+  | _ -> []
 
 (** Returns the set of variant names covered by the match arms *)
 let covered_variants arms =
   List.fold_left (fun acc arm ->
-    match arm.pat with
-    | PatVariant (name, _, _) -> name :: acc
-    | PatOr (PatVariant (a, _, _), PatVariant (b, _, _), _) -> a :: b :: acc
-    | _ -> acc
+    variants_of_pattern arm.pat @ acc
   ) [] arms
 
 (** Check if a match expression is trivially non-exhaustive.

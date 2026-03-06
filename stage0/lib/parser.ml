@@ -49,7 +49,11 @@ let err st msg =
   st.diags <- Diagnostics.make ~code:"E200" ~file:st.file
     ~line:t.line ~col:t.col msg :: st.diags
 
-let at_kw st k = match (peek st).kind with Kw s -> s = k | _ -> false
+let at_kw st k =
+  match (peek st).kind with
+  | Kw s -> s = k
+  | Ident s -> s = k && Token.is_soft_keyword k  (* soft keywords come as Ident from lexer *)
+  | _ -> false
 let at_sym st s = match (peek st).kind with Symbol x -> x = s | _ -> false
 let at_ident st = match (peek st).kind with Ident _ -> true | _ -> false
 let at_nl st = match (peek st).kind with Newline -> true | _ -> false
@@ -76,6 +80,14 @@ let check_dup_fields st fields =
 (* Soft keywords: may be used as identifiers in non-keyword position.
    Single source of truth is in Token.is_soft_keyword. *)
 let is_soft_keyword s = Token.is_soft_keyword s
+
+(* Match a token kind against a keyword string — works for both
+   hard keywords (Kw) and soft keywords (emitted as Ident by lexer) *)
+let kind_is_kw kind k =
+  match kind with
+  | Kw s -> s = k
+  | Ident s -> s = k && Token.is_soft_keyword k
+  | _ -> false
 
 (* Strip integer type suffix from a numeric literal string.
    Returns (digits_only, Some suffix) or (original, None). *)
@@ -116,6 +128,35 @@ let skip_nl st =
 let at_block_end st terms =
   at_eof st || List.exists (at_kw st) terms
 
+(* ── Type parameter parsing ────────────────────────────────────────── *)
+
+(** Parse optional type parameters: [T], [T, U], etc. Returns string list. *)
+let parse_type_params st =
+  if at_sym st "[" then begin
+    advance st; skip_nl st;
+    let params = ref [] in
+    while not (at_sym st "]") && not (at_eof st) do
+      let name = eat_ident st in
+      params := name :: !params;
+      (* Skip optional bounds: T: Trait + Trait2[X] *)
+      if at_sym st ":" then begin
+        advance st;
+        let depth = ref 0 in
+        while (not (at_sym st "," && !depth = 0)
+               && not (at_sym st "]" && !depth = 0)
+               && not (at_eof st)) do
+          if at_sym st "[" || at_sym st "(" then incr depth
+          else if at_sym st "]" || at_sym st ")" then decr depth;
+          advance st
+        done
+      end;
+      if at_sym st "," then (advance st; skip_nl st)
+    done;
+    if at_sym st "]" then advance st;
+    List.rev !params
+  end else
+    []
+
 (* ── Type parsing ──────────────────────────────────────────────────── *)
 
 let rec parse_type st =
@@ -124,15 +165,17 @@ let rec parse_type st =
 
 and parse_type_primary st =
   let t = peek st in
-  match t.kind with
-  | Kw "Self" -> advance st; TySelf
-  | Kw "fn" ->
+  let k = t.kind in
+  if kind_is_kw k "Self" then (advance st; TySelf)
+  else if kind_is_kw k "fn" || (match k with Ident "Fn" -> true | _ -> false) then begin
     advance st;
     ignore (eat_sym st "(");
     let ps = if at_sym st ")" then [] else parse_type_list st in
     ignore (eat_sym st ")");
     if at_sym st "->" then (advance st; TyFn (ps, parse_type st))
     else TyFn (ps, TyTuple [])
+  end
+  else match k with
   | Symbol "(" ->
     advance st; skip_nl st;
     if at_sym st ")" then (advance st; TyTuple [])
@@ -151,16 +194,16 @@ and parse_type_primary st =
         (* Fixed-size array: [Type; N] — read the size expression *)
         advance st; skip_nl st;
         let size_tok = peek st in
-        let _size = match size_tok.kind with
-          | IntLit s -> advance st; (try int_of_string s with _ -> 0)
-          | Ident _ -> advance st; 0 (* named const — evaluated later *)
+        let size = match size_tok.kind with
+          | IntLit s -> advance st; (try Some (int_of_string s) with _ -> Some 0)
+          | Ident _ -> advance st; None (* named const — evaluated later *)
           | _ ->
             err st "expected array size after ';'";
             while not (at_sym st "]") && not (at_eof st) do advance st done;
-            0
+            None
         in
         ignore (eat_sym st "]");
-        TyName ("Array", [inner])
+        TyArray (inner, size)
       end else begin
         ignore (eat_sym st "]");
         TyName ("Vec", [inner])
@@ -171,7 +214,7 @@ and parse_type_primary st =
     let m = at_kw st "mut" in
     if m then advance st;
     TyRef (m, parse_type st)
-  | Kw "dyn" ->
+  | Kw "dyn" | Ident "dyn" ->
     (* dyn TraitName — parse the inner type and wrap with dyn marker *)
     advance st;
     let inner = parse_type st in
@@ -201,7 +244,10 @@ and parse_type_primary st =
       let args = parse_type_list st in
       skip_nl st;
       ignore (eat_sym st "]");
-      TyName (name, args)
+      (* Normalize Option[T] to TyOption T *)
+      match name, args with
+      | "Option", [t] -> TyOption t
+      | _ -> TyName (name, args)
     end else
       TyName (name, [])
   | Kw name when String.length name > 0 && name.[0] >= 'A' && name.[0] <= 'Z' ->
@@ -228,7 +274,7 @@ let rec parse_pattern st =
     | Kw "false" -> advance st; PatLit (EBool (false, l))
     | Kw "mut" ->
       advance st; let name = eat_ident st in PatMut (name, l)
-    | Kw "ref" ->
+    | Kw "ref" | Ident "ref" ->
       (* ref binding: ref x or ref mut x *)
       advance st;
       let _m = at_kw st "mut" in
@@ -265,7 +311,7 @@ let rec parse_pattern st =
       let (num_s, _suffix) = strip_int_suffix s in
       PatLit (EInt ((try int_of_string num_s with _ -> 0), l))
     | FloatLit s ->
-      advance st; PatLit (EFloat (float_of_string s, l))
+      advance st; PatLit (EFloat ((try float_of_string s with _ -> 0.0), l))
     | StringLit s ->
       advance st; PatLit (EStr (s, l))
     | CharLit s ->
@@ -323,8 +369,40 @@ let rec parse_pattern st =
       end;
       ignore (eat_sym st ")");
       PatTuple (List.rev !pats, l)
+    | Symbol "[" ->
+      advance st; skip_nl st;
+      let pats = ref [] in
+      if not (at_sym st "]") then begin
+        if at_sym st ".." then begin
+          advance st; pats := [PatRest l]
+        end else
+          pats := parse_pattern st :: !pats;
+        while at_sym st "," do
+          advance st; skip_nl st;
+          if at_sym st ".." then begin
+            advance st; pats := PatRest l :: !pats
+          end else if not (at_sym st "]") then
+            pats := parse_pattern st :: !pats
+        done
+      end;
+      ignore (eat_sym st "]");
+      PatSlice (List.rev !pats, l)
     | _ ->
       err st "expected pattern"; advance st; PatWild l
+  in
+  (* Range patterns: 1..5 or 1..=5 *)
+  let base =
+    if at_sym st ".." then begin
+      advance st;
+      let inclusive = at_sym st "=" in
+      if inclusive then advance st;
+      let hi = parse_pattern st in
+      PatRange (base, hi, inclusive, l)
+    end else if at_sym st "..=" then begin
+      advance st;
+      let hi = parse_pattern st in
+      PatRange (base, hi, true, l)
+    end else base
   in
   if at_sym st "|" && not (at_sym st "||") then begin
     advance st; skip_nl st;
@@ -346,6 +424,20 @@ and parse_assignment st =
     advance st;
     let rhs = parse_assignment st in
     EAssign (e, rhs, l)
+  | Symbol op when (match op with
+      | "+=" | "-=" | "*=" | "/=" | "%="
+      | "&=" | "|=" | "^=" | "<<=" | ">>=" -> true
+      | _ -> false) ->
+    let l = loc_of st in
+    advance st;
+    let rhs = parse_assignment st in
+    let binop = match op with
+      | "+=" -> Add | "-=" -> Sub | "*=" -> Mul | "/=" -> Div | "%=" -> Mod
+      | "&=" -> BitAnd | "|=" -> BitOr | "^=" -> BitXor
+      | "<<=" -> Shl | ">>=" -> Shr
+      | _ -> Add (* unreachable *)
+    in
+    EAssign (e, EBinOp (binop, e, rhs, l), l)
   | _ -> e
 
 and parse_logical_or st =
@@ -447,6 +539,8 @@ and parse_shift st =
 
 and parse_addition st =
   let rec loop left =
+    let saved = st.pos in
+    skip_nl st;
     let t = peek st in
     match t.kind with
     | Symbol "+" ->
@@ -454,17 +548,22 @@ and parse_addition st =
       loop (EBinOp (Add, left, parse_multiplication st, l))
     | Symbol "++" ->
       let l = loc_of st in advance st; skip_nl st;
-      loop (EBinOp (Add, left, parse_multiplication st, l))
-    | Symbol "-" ->
-      let l = loc_of st in advance st; skip_nl st;
-      loop (EBinOp (Sub, left, parse_multiplication st, l))
+      loop (EBinOp (Concat, left, parse_multiplication st, l))
     | Symbol ".." ->
       let l = loc_of st in advance st;
       let inclusive = at_sym st "=" in
       if inclusive then advance st;
       let right = parse_multiplication st in
       ERange (left, right, inclusive, l)
-    | _ -> left
+    | Symbol "..=" ->
+      let l = loc_of st in advance st;
+      let right = parse_multiplication st in
+      ERange (left, right, true, l)
+    | Symbol "-" when saved = st.pos ->
+      (* Only parse '-' on the same line (no newline was skipped) *)
+      let l = loc_of st in advance st; skip_nl st;
+      loop (EBinOp (Sub, left, parse_multiplication st, l))
+    | _ -> st.pos <- saved; left
   in loop (parse_multiplication st)
 
 and parse_multiplication st =
@@ -529,7 +628,9 @@ and parse_postfix st =
         loop (EFieldAccess (e, string_of_int idx, l))
       | _ ->
         let field = eat_ident st in
-        if at_sym st "(" then begin
+        if field = "await" then
+          loop (EAwait (e, l))
+        else if at_sym st "(" then begin
           advance st; skip_nl st;
           let args = if at_sym st ")" then [] else parse_arg_list st in
           ignore (eat_sym st ")");
@@ -544,9 +645,14 @@ and parse_postfix st =
         advance st;
         let depth = ref 1 in
         while !depth > 0 && not (at_eof st) do
-          if at_sym st "<" then (incr depth; advance st)
+          if at_sym st "<<" then (depth := !depth + 2; advance st)
+          else if at_sym st "<" then (incr depth; advance st)
+          else if at_sym st ">>" then begin
+            (* >> closes two levels; if depth is 1, we can only close one *)
+            if !depth >= 2 then (depth := !depth - 2; advance st)
+            else (decr depth)  (* leave >> for outer scope — don't advance *)
+          end
           else if at_sym st ">" then (decr depth; advance st)
-          else if at_sym st ">>" then (depth := !depth - 2; advance st)
           else advance st
         done;
         if at_sym st "(" then begin
@@ -608,8 +714,35 @@ and parse_postfix st =
             else begin
               let fname = eat_ident st in
               ignore (eat_sym st ":");
-              let fval = parse_expr st in
-              fields := (fname, fval) :: !fields;
+              let fval = ref (parse_expr st) in
+              let cont = ref true in
+              while !cont do
+                let saved_nl = st.pos in
+                skip_nl st;
+                let continuation_op =
+                  if at_sym st "+" then Some Add
+                  else if at_sym st "-" then Some Sub
+                  else if at_sym st "*" then Some Mul
+                  else if at_sym st "/" then Some Div
+                  else if at_sym st "%" then Some Mod
+                  else if at_sym st "||" then Some Or
+                  else if at_sym st "&&" then Some And
+                  else if at_sym st "|" then Some BitOr
+                  else if at_sym st "&" then Some BitAnd
+                  else if at_sym st "^" then Some BitXor
+                  else if at_sym st "<<" then Some Shl
+                  else if at_sym st ">>" then Some Shr
+                  else None
+                in
+                match continuation_op with
+                | Some op ->
+                  let l2 = loc_of st in advance st; skip_nl st;
+                  fval := EBinOp (op, !fval, parse_expr st, l2)
+                | None ->
+                  st.pos <- saved_nl;
+                  cont := false
+              done;
+              fields := (fname, !fval) :: !fields;
               if at_sym st "," then (advance st; skip_nl st)
               else skip_nl st
             end
@@ -642,9 +775,9 @@ and parse_postfix st =
       let typ = parse_type st in
       loop (ECast (e, typ, l))
     | Symbol "?" ->
-      (* Error propagation: expr? → match expr when Ok(v) then v when Err(e) then return Err(e) end *)
+      (* Error propagation: expr? desugars to early-return on Err/None *)
       let l = loc_of st in advance st;
-      loop (EMethodCall (e, "unwrap", [], l))  (* simplified for bootstrap *)
+      loop (ETry (e, l))
     | _ -> st.pos <- saved_pos; e
   in loop (parse_primary st)
 
@@ -662,7 +795,11 @@ and parse_primary st =
      | None -> base)
   | FloatLit s ->
     advance st;
-    (try EFloat (float_of_string s, l) with _ -> err st "invalid float"; EFloat (0.0, l))
+    let (num_s, ty_suffix) = strip_int_suffix s in
+    let base = (try EFloat (float_of_string num_s, l) with _ -> err st "invalid float"; EFloat (0.0, l)) in
+    (match ty_suffix with
+     | Some suf -> ECast (base, TyName (suf, []), l)
+     | None -> base)
   | StringLit s -> advance st; EStr (s, l)
   | CharLit s -> advance st; EChar (s, l)
   | Kw "true" -> advance st; EBool (true, l)
@@ -691,17 +828,20 @@ and parse_primary st =
       EArray (List.rev !elts, l)
     end else
       EArray ([], l)
-  | Kw "unsafe" ->
+  | Kw "unsafe" | Ident "unsafe" ->
     advance st;
-    (* Skip optional reason string *)
-    (match (peek st).kind with StringLit _ -> advance st | _ -> ());
+    (* Capture optional reason string *)
+    let reason = match (peek st).kind with
+      | StringLit s -> advance st; Some s
+      | _ -> None
+    in
     if at_kw st "do" then begin
       advance st; skip_nl st;
       let body = parse_block_until st ["end"] in
       ignore (eat_kw st "end");
-      EBlock (body, l)
+      EUnsafe (reason, body, l)
     end else
-      parse_expr st
+      EUnsafe (reason, [SExpr (parse_expr st)], l)
   | Kw "return" ->
     advance st;
     if at_nl st || at_eof st || at_kw st "end" then EReturn (None, l)
@@ -710,7 +850,19 @@ and parse_primary st =
     advance st;
     if at_nl st || at_eof st || at_kw st "end" then EBreak (None, l)
     else EBreak (Some (parse_expr st), l)
-  | Kw "next" -> advance st; ENext l
+  | Kw "next" | Ident "next" -> advance st; ENext l
+  | Kw "async" | Ident "async" ->
+    advance st;
+    if at_kw st "do" then begin
+      advance st; skip_nl st;
+      let body = parse_block_until st ["end"] in
+      ignore (eat_kw st "end");
+      EAsync (body, l)
+    end else begin
+      (* async expr — wrap expression in an async block *)
+      let e = parse_expr st in
+      EAsync ([SExpr e], l)
+    end
   | Kw "if" -> parse_if_expr st
   | Kw "unless" -> parse_unless_expr st
   | Kw "match" -> parse_match_expr st
@@ -735,6 +887,7 @@ and parse_primary st =
               rest := parse_expr st :: !rest
           done
         end;
+        skip_nl st;
         ignore (eat_sym st ")");
         ETuple (List.rev !rest, l)
       end else begin
@@ -760,12 +913,13 @@ and parse_primary st =
     (* Closure: |params| expr or |params| do ... end *)
     advance st;
     let params = ref [] in
+    let destr_bindings = ref [] in
     if not (at_sym st "|") then begin
       let parse_cparam () =
         let m = at_kw st "mut" in
         if m then advance st;
         if at_sym st "(" then begin
-          (* Tuple destructuring: |(a, b)| → desugar to single param *)
+          (* Tuple destructuring: |(a, b)| → desugar to unpacking *)
           advance st; skip_nl st;
           let names = ref [eat_ident st] in
           while at_sym st "," do
@@ -774,8 +928,15 @@ and parse_primary st =
               names := eat_ident st :: !names
           done;
           ignore (eat_sym st ")");
-          let joined = "_destructure_" ^ String.concat "_" (List.rev !names) in
-          { cp_name = joined; cp_typ = None; cp_mut = m }
+          let name_list = List.rev !names in
+          let synth = "_tup_" ^ String.concat "_" name_list in
+          (* Record bindings to inject: let a = _tup_a_b.0; let b = _tup_a_b.1; ... *)
+          List.iteri (fun i n ->
+            destr_bindings := SLet { mut = m; name = n; typ = None;
+              value = EFieldAccess (EIdent (synth, l), string_of_int i, l);
+              loc = l } :: !destr_bindings
+          ) name_list;
+          { cp_name = synth; cp_typ = None; cp_mut = m }
         end else begin
           let name = eat_ident st in
           let typ = if at_sym st ":" then (advance st; Some (parse_type st)) else None in
@@ -832,7 +993,15 @@ and parse_primary st =
         end
       end
     in
-    EClosure (List.rev !params, ret, body, l)
+    (* Inject destructuring bindings into body if needed *)
+    let final_body = if !destr_bindings = [] then body
+      else
+        let bindings = List.rev !destr_bindings in
+        match body with
+        | EBlock (stmts, bl) -> EBlock (bindings @ stmts, bl)
+        | _ -> EBlock (bindings @ [SExpr body], l)
+    in
+    EClosure (List.rev !params, ret, final_body, l)
   | Symbol "||" ->
     (* Empty-param closure: || expr or || -> T { body } *)
     advance st;
@@ -912,10 +1081,16 @@ and parse_primary st =
               let continuation_op =
                 if at_sym st "+" then Some Add
                 else if at_sym st "-" then Some Sub
+                else if at_sym st "*" then Some Mul
+                else if at_sym st "/" then Some Div
+                else if at_sym st "%" then Some Mod
                 else if at_sym st "||" then Some Or
                 else if at_sym st "&&" then Some And
                 else if at_sym st "|" then Some BitOr
                 else if at_sym st "&" then Some BitAnd
+                else if at_sym st "^" then Some BitXor
+                else if at_sym st "<<" then Some Shl
+                else if at_sym st ">>" then Some Shr
                 else None
               in
               match continuation_op with
@@ -991,8 +1166,35 @@ and parse_primary st =
           else begin
             let fname = eat_ident st in
             ignore (eat_sym st ":");
-            let fval = parse_expr st in
-            fields := (fname, fval) :: !fields;
+            let fval = ref (parse_expr st) in
+            let cont = ref true in
+            while !cont do
+              let saved_nl = st.pos in
+              skip_nl st;
+              let continuation_op =
+                if at_sym st "+" then Some Add
+                else if at_sym st "-" then Some Sub
+                else if at_sym st "*" then Some Mul
+                else if at_sym st "/" then Some Div
+                else if at_sym st "%" then Some Mod
+                else if at_sym st "||" then Some Or
+                else if at_sym st "&&" then Some And
+                else if at_sym st "|" then Some BitOr
+                else if at_sym st "&" then Some BitAnd
+                else if at_sym st "^" then Some BitXor
+                else if at_sym st "<<" then Some Shl
+                else if at_sym st ">>" then Some Shr
+                else None
+              in
+              match continuation_op with
+              | Some op ->
+                let l2 = loc_of st in advance st; skip_nl st;
+                fval := EBinOp (op, !fval, parse_expr st, l2)
+              | None ->
+                st.pos <- saved_nl;
+                cont := false
+            done;
+            fields := (fname, !fval) :: !fields;
             if at_sym st "," then (advance st; skip_nl st)
             else skip_nl st
           end
@@ -1022,13 +1224,23 @@ and parse_if_expr st =
     if at_kw st "then" then advance st;
     skip_nl st;
     let body = parse_block_until st ["elsif"; "else"; "end"] in
-    let else_body =
-      if at_kw st "else" then begin
-        advance st; skip_nl st;
-        Some (parse_block_until st ["end"])
-      end else None
+    let (else_body, chained) =
+      if at_kw st "elsif" then
+        (* elsif after if-let: chain as nested if in else branch *)
+        (Some [SExpr (parse_if_expr st)], true)
+      else if at_kw st "else" then begin
+        advance st;
+        (* Only treat 'else if' as chained elsif when 'if' is on the same line *)
+        if at_kw st "if" then
+          (Some [SExpr (parse_if_expr st)], true)
+        else begin
+          skip_nl st;
+          (Some (parse_block_until st ["end"]), false)
+        end
+      end else (None, false)
     in
-    ignore (eat_kw st "end");
+    (* Chained if/elsif/if-let consume their own 'end'; otherwise eat it here *)
+    if not chained then ignore (eat_kw st "end");
     (* Desugar: if let P = e then body else eb end → match e when P then body else eb end *)
     EMatch (scrutinee, [
       { pat; guard = None; arm_body = body };
@@ -1050,17 +1262,19 @@ and parse_if_expr st =
     let b = parse_block_until st ["elsif"; "else"; "end"] in
     branches := { cond = c; body = b } :: !branches
   done;
-  let else_body =
+  let (else_body, chained) =
     if at_kw st "else" then begin
-      advance st; skip_nl st;
-      (* Treat 'else if' as 'elsif' — parse chained if as single expression *)
+      advance st;
+      (* Only treat 'else if' as chained elsif when 'if' is on the same line (no newline between) *)
       if at_kw st "if" then
-        Some [SExpr (parse_if_expr st)]
-      else
-        Some (parse_block_until st ["end"])
-    end else None
+        (Some [SExpr (parse_if_expr st)], true)
+      else begin
+        skip_nl st;
+        (Some (parse_block_until st ["end"]), false)
+      end
+    end else (None, false)
   in
-  if else_body = None || (match else_body with Some [SExpr (EIf _)] -> false | _ -> true) then
+  if not chained then
     ignore (eat_kw st "end");
   EIf (List.rev !branches, else_body, l)
   end (* close the else branch of 'if let' check *)
@@ -1101,7 +1315,8 @@ and parse_match_expr st =
           if at_sym st "," then (advance st; skip_nl st)
           else skip_nl st)
         else begin
-          (* Recovery: skip token to avoid infinite loop *)
+          (* Recovery: report error and skip token to avoid infinite loop *)
+          err st (Printf.sprintf "expected '=>' or 'then' after match pattern, got '%s'" (peek st).lexeme);
           st.pos <- saved_pos;
           advance st
         end
@@ -1175,43 +1390,47 @@ and parse_until_expr st =
 and parse_for_expr st =
   let l = loc_of st in
   advance st;
-  (* Support tuple destructuring: for (a, b) in ... and for (a, (b, c)) in ... *)
-  let rec read_destr () =
-    if at_sym st "(" then begin
-      advance st; skip_nl st;
-      let parts = ref [read_destr ()] in
-      while at_sym st "," do
-        advance st; skip_nl st;
-        parts := read_destr () :: !parts
-      done;
-      ignore (eat_sym st ")");
-      String.concat "_" (List.rev !parts)
-    end else
-      eat_ident st
-  in
-  let var = if at_sym st "(" then begin
+  (* Support tuple destructuring: for (a, b) in ... *)
+  if at_sym st "(" then begin
     advance st; skip_nl st;
-    let names = ref [read_destr ()] in
+    let names = ref [eat_ident st] in
     while at_sym st "," do
       advance st; skip_nl st;
-      names := read_destr () :: !names
+      if not (at_sym st ")") then
+        names := eat_ident st :: !names
     done;
     ignore (eat_sym st ")");
-    String.concat "_" (List.rev !names)
-  end else
-    eat_ident st
-  in
-  ignore (eat_kw st "in");
-  let iter = parse_expr st in
-  if at_kw st "do" then advance st;
-  skip_nl st;
-  let body = parse_block_until st ["end"] in
-  ignore (eat_kw st "end");
-  EFor (var, iter, body, l)
+    let name_list = List.rev !names in
+    let synth = "_for_tup" in
+    (* Generate bindings: let a = _for_tup.0; let b = _for_tup.1; etc. *)
+    let bindings = List.mapi (fun i n ->
+      SLet { mut = false; name = n; typ = None;
+             value = EFieldAccess (EIdent (synth, l), string_of_int i, l);
+             loc = l }
+    ) name_list in
+    ignore (eat_kw st "in");
+    let iter = parse_expr st in
+    if at_kw st "do" then advance st;
+    skip_nl st;
+    let body = parse_block_until st ["end"] in
+    ignore (eat_kw st "end");
+    EFor (synth, iter, bindings @ body, l)
+  end else begin
+    let var = eat_ident st in
+    ignore (eat_kw st "in");
+    let iter = parse_expr st in
+    if at_kw st "do" then advance st;
+    skip_nl st;
+    let body = parse_block_until st ["end"] in
+    ignore (eat_kw st "end");
+    EFor (var, iter, body, l)
+  end
 
 and parse_loop_expr st =
   let l = loc_of st in
   advance st;
+  (* Skip optional 'do' after 'loop' *)
+  if at_kw st "do" then advance st;
   skip_nl st;
   let body = parse_block_until st ["end"] in
   ignore (eat_kw st "end");
@@ -1226,11 +1445,24 @@ and parse_block_expr st =
   EBlock (body, l)
 
 and parse_arg_list st =
-  let args = ref [parse_expr st] in
+  let parse_one_arg () =
+    (* Support named arguments: name: expr — consume the name: prefix and return the expr *)
+    let saved = st.pos in
+    let maybe_named =
+      if at_ident st || (match (peek st).kind with Kw s when is_soft_keyword s -> true | _ -> false) then begin
+        let _ = eat_ident st in
+        if at_sym st ":" then (advance st; true)
+        else (st.pos <- saved; false)
+      end else false
+    in
+    ignore maybe_named;
+    parse_expr st
+  in
+  let args = ref [parse_one_arg ()] in
   while at_sym st "," do
     advance st; skip_nl st;
     if not (at_sym st ")") && not (at_sym st "]") then
-      args := parse_expr st :: !args
+      args := parse_one_arg () :: !args
   done;
   skip_nl st;
   List.rev !args
@@ -1255,8 +1487,7 @@ and parse_stmt st =
       let value = parse_expr st in
       (* Desugar: let (a, b) = expr → let _tup = expr; let a = _tup.0; ... *)
       let name = "_destructure_" ^ (String.concat "," (List.rev !names)) in
-      ignore typ;
-      SLet { mut = m; name; typ = None; value; loc = l }
+      SLet { mut = m; name; typ; value; loc = l }
     end else begin
       let name = eat_ident st in
       let typ = if at_sym st ":" then (advance st; Some (parse_type st)) else None in
@@ -1279,8 +1510,7 @@ and parse_stmt st =
       ignore (eat_sym st "=");
       let value = parse_expr st in
       let name = "_destructure_" ^ (String.concat "_" (List.rev !names)) in
-      ignore typ;
-      SLet { mut = true; name; typ = None; value; loc = l }
+      SLet { mut = true; name; typ; value; loc = l }
     end else begin
       let name = eat_ident st in
       let typ = if at_sym st ":" then (advance st; Some (parse_type st)) else None in
@@ -1352,14 +1582,18 @@ and parse_stmt st =
     if at_sym st "(" then begin
       advance st; skip_nl st;
       while not (at_sym st ")") && not (at_eof st) do
-        (* Skip &, &mut, self modifiers *)
+        (* Skip &, &mut, ref modifiers *)
         if at_sym st "&" then advance st;
-        if at_kw st "mut" then advance st;
+        if at_kw st "ref" then advance st;
+        let is_mut = at_kw st "mut" in
+        if is_mut then advance st;
         if at_kw st "self" then begin advance st end
         else begin
           let pname = eat_ident st in
           let ptyp = if at_sym st ":" then (advance st; Some (parse_type st)) else None in
-          params := { cp_name = pname; cp_typ = ptyp; cp_mut = false } :: !params
+          (* Skip default value if present *)
+          if at_sym st "=" then begin advance st; ignore (parse_expr st) end;
+          params := { cp_name = pname; cp_typ = ptyp; cp_mut = is_mut } :: !params
         end;
         if at_sym st "," then advance st;
         skip_nl st
@@ -1459,10 +1693,110 @@ let parse_param_list st =
     List.rev !ps
   end
 
-let parse_fn_def st ~pub =
+let parse_attribute st =
+  let l = loc_of st in
+  advance st; (* consume '@' or '#' *)
+  (* Handle #[attr] style *)
+  let has_bracket = at_sym st "[" in
+  if has_bracket then advance st;
+  let name =
+    if at_ident st then eat_ident st
+    else begin err st "expected attribute name"; "<error>" end
+  in
+  let args = ref [] in
+  if at_sym st "(" then begin
+    advance st;
+    while not (at_sym st ")") && not (at_eof st) && not (at_nl st) do
+      let t = peek st in
+      (match t.kind with
+       | Ident s -> args := s :: !args; advance st
+       | StringLit s -> args := s :: !args; advance st
+       | IntLit s -> args := s :: !args; advance st
+       | _ -> advance st);
+      if at_sym st "," then advance st
+    done;
+    if at_sym st ")" then advance st
+  end else if not has_bracket then begin
+    (* No parens — bare attribute like @thread_local; don't consume rest of line *)
+    ()
+  end else begin
+    (* Inside brackets #[...]: collect remaining tokens as raw args *)
+    while not (at_nl st) && not (at_eof st) && not (at_sym st "]") do
+      let t = peek st in
+      (match t.kind with
+       | Ident s | StringLit s | IntLit s -> args := s :: !args
+       | _ -> ());
+      advance st
+    done
+  end;
+  if has_bracket && at_sym st "]" then advance st;
+  { attr_name = name; attr_args = List.rev !args; attr_loc = l }
+
+let parse_attributes st =
+  let attrs = ref [] in
+  while at_sym st "@" || at_sym st "#" do
+    attrs := parse_attribute st :: !attrs;
+    skip_nl st
+  done;
+  List.rev !attrs
+
+let parse_visibility st =
+  if at_kw st "pub" then begin
+    advance st;
+    if at_sym st "(" then begin
+      advance st;
+      if at_kw st "crate" then begin
+        advance st; ignore (eat_sym st ")"); PubCrate
+      end else if at_kw st "super" then begin
+        advance st; ignore (eat_sym st ")"); PubSuper
+      end else if at_kw st "in" then begin
+        advance st;
+        let path = eat_ident st in
+        ignore (eat_sym st ")");
+        PubIn path
+      end else begin
+        (* Unknown visibility restriction — emit error, treat as public *)
+        err st "expected 'crate', 'super', or 'in' after 'pub('";
+        while not (at_sym st ")") && not (at_eof st) do advance st done;
+        if at_sym st ")" then advance st;
+        Public
+      end
+    end else
+      Public
+  end else
+    Private
+
+let parse_where_clause st =
+  if at_kw st "where" then begin
+    advance st;
+    let bounds = ref [] in
+    let continue = ref true in
+    while !continue do
+      if at_ident st || (match (peek st).kind with Kw s when is_soft_keyword s -> true | _ -> false) then begin
+        let param = eat_ident st in
+        if at_sym st ":" then begin
+          advance st;
+          let bs = ref [eat_ident st] in
+          while at_sym st "+" do
+            advance st;
+            bs := eat_ident st :: !bs
+          done;
+          bounds := { wb_param = param; wb_bounds = List.rev !bs } :: !bounds;
+          if at_sym st "," then (advance st; skip_nl st)
+          else continue := false
+        end else
+          continue := false
+      end else
+        continue := false
+    done;
+    List.rev !bounds
+  end else []
+
+let parse_fn_def st ~vis ~attrs ~is_async =
   let l = loc_of st in
   ignore (eat_kw st "def");
   let name = eat_ident st in
+  let type_params = parse_type_params st in
   ignore (eat_sym st "(");
   let params = parse_param_list st in
   ignore (eat_sym st ")");
@@ -1471,6 +1805,7 @@ let parse_fn_def st ~pub =
   skip_nl st;
   let ret = if at_sym st "->" then (advance st; Some (parse_type st))
             else (st.pos <- saved; None) in
+  let where_clauses = parse_where_clause st in
   skip_nl st;
   while at_kw st "requires" || at_kw st "effect" || at_kw st "budget"
         || at_kw st "pre" || at_kw st "post" || at_kw st "invariant"
@@ -1486,7 +1821,7 @@ let parse_fn_def st ~pub =
     advance st;
     let value = parse_expr st in
     let body = [SExpr (EReturn (Some value, l))] in
-    IFn { pub; name; params; ret; body; loc = l }
+    IFn { vis; name; type_params; params; ret; body; is_async; where_clauses; attrs; loc = l }
   end else if at_sym st "{" then begin
     (* Brace-delimited function body: def foo() -> T { ... } *)
     advance st; skip_nl st;
@@ -1497,22 +1832,19 @@ let parse_fn_def st ~pub =
       skip_nl st
     done;
     ignore (eat_sym st "}");
-    IFn { pub; name; params; ret; body = List.rev !stmts; loc = l }
+    IFn { vis; name; type_params; params; ret; body = List.rev !stmts; is_async; where_clauses; attrs; loc = l }
   end else begin
     let body = parse_block_until st ["end"] in
     ignore (eat_kw st "end");
-    IFn { pub; name; params; ret; body; loc = l }
+    IFn { vis; name; type_params; params; ret; body; is_async; where_clauses; attrs; loc = l }
   end
 
-let parse_struct_def st ~pub =
+let parse_struct_def st ~vis ~attrs =
   let l = loc_of st in
   ignore (eat_kw st "struct");
   let name = eat_ident st in
-  if at_sym st "[" then begin
-    advance st;
-    while not (at_sym st "]") && not (at_eof st) do advance st done;
-    if at_sym st "]" then advance st
-  end;
+  let type_params = parse_type_params st in
+  let where_clauses = parse_where_clause st in
   skip_nl st;
   let fields = ref [] in
   while not (at_kw st "end") && not (at_eof st) do
@@ -1522,27 +1854,44 @@ let parse_struct_def st ~pub =
       let p = at_kw st "pub" in
       if p then advance st;
       let saved_pos = st.pos in
-      let fname = eat_ident st in
-      ignore (eat_sym st ":");
-      let ftyp = parse_type st in
-      fields := { fd_name = fname; fd_typ = ftyp; fd_pub = p } :: !fields;
-      (* Safety: if nothing was consumed, advance to prevent infinite loop *)
+      if at_ident st || (match (peek st).kind with Kw s when is_soft_keyword s -> true | _ -> false) then begin
+        let fname = eat_ident st in
+        if at_sym st ":" then begin
+          ignore (eat_sym st ":");
+          let ftyp = parse_type st in
+          fields := { fd_name = fname; fd_typ = ftyp; fd_pub = p } :: !fields
+        end else begin
+          err st (Printf.sprintf "expected ':' after field name '%s'" fname);
+          (* Recovery: skip to next newline or end *)
+          while not (at_nl st) && not (at_kw st "end") && not (at_eof st) do advance st done
+        end
+      end else begin
+        err st "expected field name";
+        (* Recovery: skip to next newline or end to prevent infinite loop *)
+        while not (at_nl st) && not (at_kw st "end") && not (at_eof st) do advance st done
+      end;
+      (* Final safety: if absolutely nothing was consumed, force advance *)
       if st.pos = saved_pos then advance st;
       skip_nl st
     end
   done;
   ignore (eat_kw st "end");
-  IStruct { pub; name; fields = List.rev !fields; loc = l }
+  let sfields = List.rev !fields in
+  (* Check for duplicate field names *)
+  let seen = Hashtbl.create 8 in
+  List.iter (fun fd ->
+    if Hashtbl.mem seen fd.fd_name then
+      err st (Printf.sprintf "duplicate field '%s' in struct definition" fd.fd_name)
+    else
+      Hashtbl.replace seen fd.fd_name true
+  ) sfields;
+  IStruct { vis; name; type_params; fields = sfields; where_clauses; attrs; loc = l }
 
-let parse_enum_def st ~pub =
+let parse_enum_def st ~vis ~attrs =
   let l = loc_of st in
   ignore (eat_kw st "enum");
   let name = eat_ident st in
-  if at_sym st "[" then begin
-    advance st;
-    while not (at_sym st "]") && not (at_eof st) do advance st done;
-    if at_sym st "]" then advance st
-  end;
+  let type_params = parse_type_params st in
   skip_nl st;
   let variants = ref [] in
   while not (at_kw st "end") && not (at_eof st) do
@@ -1553,13 +1902,42 @@ let parse_enum_def st ~pub =
       (advance st; skip_nl st)
     else begin
       let vname = eat_ident st in
-      let vfields =
+      let (vfields, vfield_names) =
         if at_sym st "(" then begin
           advance st; skip_nl st;
-          let ts = if at_sym st ")" then [] else parse_type_list st in
-          skip_nl st;
-          ignore (eat_sym st ")");
-          ts
+          if at_sym st ")" then (ignore (eat_sym st ")"); ([], []))
+          else begin
+            (* Parse enum variant fields: supports positional V(Type), named V(name: Type),
+               and mixed V(Type, name: Type) forms. For each element, look ahead to see if
+               ident followed by ':' → named field, otherwise parse as positional type. *)
+            let fs = ref [] in
+            let parse_one_field () =
+              let saved = st.pos in
+              let maybe_named =
+                if at_ident st || (match (peek st).kind with Kw s when is_soft_keyword s -> true | _ -> false) then begin
+                  let n = eat_ident st in
+                  if at_sym st ":" then (advance st; Some n)
+                  else (st.pos <- saved; None)
+                end else None
+              in
+              match maybe_named with
+              | Some fname ->
+                let t = parse_type st in
+                fs := (fname, t) :: !fs
+              | None ->
+                let t = parse_type st in
+                fs := ("", t) :: !fs
+            in
+            parse_one_field ();
+            while at_sym st "," do
+              advance st; skip_nl st;
+              if not (at_sym st ")") then parse_one_field ()
+            done;
+            skip_nl st;
+            ignore (eat_sym st ")");
+            let pairs = List.rev !fs in
+            (List.map snd pairs, List.map fst pairs)
+          end
         end else if at_sym st "{" then begin
           (* Named-field enum variant: Variant { field: Type, ... } *)
           advance st; skip_nl st;
@@ -1567,46 +1945,64 @@ let parse_enum_def st ~pub =
           while not (at_sym st "}") && not (at_eof st) do
             skip_nl st;
             if at_sym st "}" then ()
-            else begin
-              let _fname = eat_ident st in
+            else if at_ident st || (match (peek st).kind with Kw s when is_soft_keyword s -> true | _ -> false) then begin
+              let saved_pos = st.pos in
+              let fname = eat_ident st in
               if at_sym st ":" then begin
                 advance st;
-                fs := parse_type st :: !fs
+                fs := (fname, parse_type st) :: !fs
               end;
               if at_sym st "," then (advance st; skip_nl st)
-              else skip_nl st
+              else skip_nl st;
+              (* Safety: force progress *)
+              if st.pos = saved_pos then advance st
+            end else begin
+              (* Recovery: skip unexpected token *)
+              advance st; skip_nl st
             end
           done;
           ignore (eat_sym st "}");
-          List.rev !fs
-        end else []
+          let pairs = List.rev !fs in
+          (List.map snd pairs, List.map fst pairs)
+        end else ([], [])
       in
-      variants := { vd_name = vname; vd_fields = vfields } :: !variants;
+      variants := { vd_name = vname; vd_fields = vfields; vd_field_names = vfield_names } :: !variants;
       skip_nl st
     end
   done;
   ignore (eat_kw st "end");
-  IEnum { pub; name; variants = List.rev !variants; loc = l }
+  IEnum { vis; name; type_params; variants = List.rev !variants; attrs; loc = l }
 
-let parse_trait_def st ~pub =
+let parse_trait_def st ~vis ~attrs =
   let l = loc_of st in
   ignore (eat_kw st "trait");
   let name = eat_ident st in
-  (* Skip type params, supertraits, where clauses *)
-  while not (at_nl st) && not (at_eof st) && not (at_kw st "end") do advance st done;
+  let type_params = parse_type_params st in
+  (* Parse supertrait bounds: trait Foo: Bar + Baz *)
+  let supers =
+    if at_sym st ":" then begin
+      advance st;
+      let ss = ref [eat_ident st] in
+      while at_sym st "+" do
+        advance st;
+        ss := eat_ident st :: !ss
+      done;
+      List.rev !ss
+    end else []
+  in
+  let where_clauses = parse_where_clause st in
   skip_nl st;
   let items = ref [] in
   while not (at_kw st "end") && not (at_eof st) do
     skip_nl st;
     if at_kw st "end" then ()
-    else if at_sym st "@" then begin
-      advance st;
-      while not (at_nl st) && not (at_eof st) do advance st done;
-      skip_nl st
-    end
-    else if at_kw st "pub" || at_kw st "def" then begin
-      let is_pub = at_kw st "pub" in
-      if is_pub then advance st;
+    else begin
+      (* Collect annotations for the following item *)
+      let method_attrs = parse_attributes st in
+      skip_nl st;
+      if at_kw st "end" then ()
+      else if at_kw st "pub" || at_kw st "def" then begin
+      let method_vis = if at_kw st "pub" then (advance st; Public) else Private in
       if at_kw st "def" then begin
         let fl = loc_of st in
         ignore (eat_kw st "def");
@@ -1629,8 +2025,8 @@ let parse_trait_def st ~pub =
         if at_sym st "=" then begin
           advance st;
           let value = parse_expr st in
-          items := IFn { pub = is_pub; name = fname; params; ret;
-                         body = [SExpr (EReturn (Some value, fl))]; loc = fl } :: !items
+          items := IFn { vis = method_vis; name = fname; type_params = []; params; ret;
+                         body = [SExpr (EReturn (Some value, fl))]; is_async = false; where_clauses = []; attrs = method_attrs; loc = fl } :: !items
         end else if at_sym st "{" then begin
           (* Brace-style method body: def name() -> T { expr } *)
           advance st; skip_nl st;
@@ -1641,42 +2037,49 @@ let parse_trait_def st ~pub =
             skip_nl st
           done;
           ignore (eat_sym st "}");
-          items := IFn { pub = is_pub; name = fname; params; ret;
-                         body = List.rev !stmts; loc = fl } :: !items
+          items := IFn { vis = method_vis; name = fname; type_params = []; params; ret;
+                         body = List.rev !stmts; is_async = false; where_clauses = []; attrs = method_attrs; loc = fl } :: !items
         end else if at_kw st "def" || at_kw st "end" || at_kw st "pub"
-                    || at_sym st "@" || at_eof st then
+                    || at_sym st "@" || at_sym st "#" || at_eof st then
           (* Signature-only method: no body *)
-          items := IFn { pub = is_pub; name = fname; params; ret;
-                         body = []; loc = fl } :: !items
+          items := IFn { vis = method_vis; name = fname; type_params = []; params; ret;
+                         body = []; is_async = false; where_clauses = []; attrs = method_attrs; loc = fl } :: !items
         else begin
           (* Default implementation with end *)
           let body = parse_block_until st ["end"] in
           ignore (eat_kw st "end");
-          items := IFn { pub = is_pub; name = fname; params; ret;
-                         body; loc = fl } :: !items
+          items := IFn { vis = method_vis; name = fname; type_params = []; params; ret;
+                         body; is_async = false; where_clauses = []; attrs = method_attrs; loc = fl } :: !items
         end
       end else
         (advance st; skip_nl st)
     end
     else if at_kw st "type" then begin
-      (* Associated type declaration in trait - skip it *)
+      (* Associated type declaration in trait *)
       let tl = loc_of st in
       advance st;
       let tname = eat_ident st in
-      if at_sym st "=" then begin
-        advance st; ignore (parse_type st)
+      (* Skip trait bounds: type Item: Display + Debug *)
+      if at_sym st ":" then begin
+        advance st; ignore (parse_type st);
+        while at_sym st "+" do advance st; ignore (parse_type st) done
       end;
-      items := IConst { name = tname; typ = None; value = ENil tl; loc = tl } :: !items
+      let typ = if at_sym st "=" then begin
+        advance st; parse_type st
+      end else TyInfer in
+      items := ITypeAlias { name = tname; type_params = []; typ; loc = tl } :: !items
     end
     else
-      (advance st; skip_nl st)
+      (advance st; skip_nl st);
+    end
   done;
   ignore (eat_kw st "end");
-  ITrait { pub; name; items = List.rev !items; loc = l }
+  ITrait { vis; name; type_params; supers; items = List.rev !items; where_clauses; attrs; loc = l }
 
-let parse_impl_block st =
+let parse_impl_block st ~attrs =
   let l = loc_of st in
   ignore (eat_kw st "impl");
+  let type_params = parse_type_params st in
   let first_name = eat_ident st in
   let (trait_name, target) =
     if at_kw st "for" then begin
@@ -1686,16 +2089,17 @@ let parse_impl_block st =
     end else
       (None, TyName (first_name, []))
   in
+  let where_clauses = parse_where_clause st in
   skip_nl st;
   let methods = ref [] in
   while not (at_kw st "end") && not (at_eof st) do
     skip_nl st;
     if at_kw st "def" then
-      methods := parse_fn_def st ~pub:false :: !methods
+      methods := parse_fn_def st ~vis:Private ~attrs:[] ~is_async:false :: !methods
     else if at_kw st "pub" then begin
       advance st;
       if at_kw st "def" then
-        methods := parse_fn_def st ~pub:true :: !methods
+        methods := parse_fn_def st ~vis:Public ~attrs:[] ~is_async:false :: !methods
       else (advance st; skip_nl st)
     end
     else if at_sym st "@" then begin
@@ -1718,30 +2122,39 @@ let parse_impl_block st =
       let tl = loc_of st in
       advance st;
       let tname = eat_ident st in
-      if at_sym st "=" then begin
-        advance st;
-        let typ = parse_type st in
-        methods := ITypeAlias { name = tname; typ; loc = tl } :: !methods
-      end else
-        methods := IConst { name = tname; typ = None; value = ENil tl; loc = tl } :: !methods
+      let typ = if at_sym st "=" then begin
+        advance st; parse_type st
+      end else TyInfer in
+      methods := ITypeAlias { name = tname; type_params = []; typ; loc = tl } :: !methods
     end
     else if not (at_kw st "end") then
       (advance st; skip_nl st)
   done;
   ignore (eat_kw st "end");
-  IImpl { target; trait_ = trait_name; methods = List.rev !methods; loc = l }
+  IImpl { target; trait_ = trait_name; type_params; methods = List.rev !methods; where_clauses; attrs; loc = l }
 
 let parse_use_decl st =
   let l = loc_of st in
   ignore (eat_kw st "use");
   let path = ref [eat_ident st] in
+  let use_kind = ref UseSimple in
   while at_sym st "::" do
     advance st;
     if at_ident st then path := eat_ident st :: !path
     else if at_sym st "{" then begin
-      while not (at_sym st "}") && not (at_eof st) do advance st done;
-      if at_sym st "}" then advance st
-    end else if at_sym st "*" then (advance st; path := "*" :: !path)
+      advance st; skip_nl st;
+      let names = ref [] in
+      while not (at_sym st "}") && not (at_eof st) do
+        if at_ident st then names := eat_ident st :: !names;
+        if at_sym st "," then (advance st; skip_nl st)
+        else skip_nl st
+      done;
+      if at_sym st "}" then advance st;
+      use_kind := UseMulti (List.rev !names)
+    end else if at_sym st "*" then begin
+      advance st;
+      use_kind := UseGlob
+    end
   done;
   let alias =
     if at_kw st "as" then begin
@@ -1750,7 +2163,7 @@ let parse_use_decl st =
       else (err st "expected identifier after 'as'"; None)
     end else None
   in
-  IUse { path = List.rev !path; alias; loc = l }
+  IUse { path = List.rev !path; use_kind = !use_kind; alias; loc = l }
 
 let parse_const_decl st =
   let l = loc_of st in
@@ -1765,11 +2178,12 @@ let parse_type_alias_decl st =
   let l = loc_of st in
   ignore (eat_kw st "type");
   let name = eat_ident st in
+  let type_params = parse_type_params st in
   if Token.is_keyword name && not (Token.is_soft_keyword name) then
     err st (Printf.sprintf "type alias name '%s' shadows a keyword" name);
   ignore (eat_sym st "=");
   let typ = parse_type st in
-  ITypeAlias { name; typ; loc = l }
+  ITypeAlias { name; type_params; typ; loc = l }
 
 let parse_extern_block st =
   let l = loc_of st in
@@ -1778,35 +2192,49 @@ let parse_extern_block st =
     | StringLit s -> advance st; Some s
     | _ -> None
   in
-  let sigs = ref [] in
-  if at_kw st "def" then begin
+  let is_fn_kw () = at_kw st "def" || at_kw st "fn" || at_kw st "fun" in
+  let parse_extern_fn () =
     advance st;
     let name = eat_ident st in
+    (* Skip optional type parameters [T, U, ...] *)
+    if at_sym st "[" then begin
+      advance st; skip_nl st;
+      while not (at_sym st "]") && not (at_eof st) do advance st done;
+      if at_sym st "]" then advance st
+    end;
     ignore (eat_sym st "(");
     let ps = parse_param_list st in
     ignore (eat_sym st ")");
     let ret = if at_sym st "->" then (advance st; Some (parse_type st)) else None in
-    sigs := [{ fs_name = name; fs_params = ps; fs_ret = ret }]
+    { fs_name = name; fs_params = ps; fs_ret = ret }
+  in
+  let sigs = ref [] in
+  if is_fn_kw () then begin
+    sigs := [parse_extern_fn ()]
   end else begin
     if at_kw st "do" then advance st;
     skip_nl st;
     while not (at_kw st "end") && not (at_eof st) do
-      if at_kw st "def" then begin
-        advance st;
-        let name = eat_ident st in
-        ignore (eat_sym st "(");
-        let ps = parse_param_list st in
-        ignore (eat_sym st ")");
-        let ret = if at_sym st "->" then (advance st; Some (parse_type st)) else None in
-        sigs := { fs_name = name; fs_params = ps; fs_ret = ret } :: !sigs;
+      if is_fn_kw () then begin
+        sigs := parse_extern_fn () :: !sigs;
         skip_nl st
-      end else (advance st; skip_nl st)
+      end else if at_kw st "static" then begin
+        (* Skip static declarations: parse name, optional type *)
+        advance st;
+        if at_kw st "mut" then advance st;
+        if at_ident st then (ignore (eat_ident st));
+        if at_sym st ":" then (advance st; ignore (parse_type st));
+        skip_nl st
+      end else begin
+        err st (Printf.sprintf "expected 'def' or 'static' in extern block, got '%s'" (peek st).lexeme);
+        advance st; skip_nl st
+      end
     done;
     if at_kw st "end" then advance st
   end;
   IExtern { abi; sigs = List.rev !sigs; loc = l }
 
-let rec parse_module_def st ~pub =
+let rec parse_module_def st ~vis ~attrs =
   let l = loc_of st in
   if at_kw st "module" then advance st else ignore (eat_kw st "mod");
   let name = eat_ident st in
@@ -1818,19 +2246,20 @@ let rec parse_module_def st ~pub =
   (* Check for single-line 'pub mod X' / 'mod X' — no body *)
   let is_single_line =
     at_nl st || at_eof st ||
-    (match (peek st).kind with
-     | Kw "pub" | Kw "def" | Kw "struct" | Kw "enum" | Kw "trait"
-     | Kw "impl" | Kw "use" | Kw "const" | Kw "type" | Kw "mod"
-     | Kw "module" | Kw "extern" | Symbol "#" | Symbol "@" -> true
-     | _ -> false)
+    (let k = (peek st).kind in
+     kind_is_kw k "pub" || kind_is_kw k "def" || kind_is_kw k "struct" ||
+     kind_is_kw k "enum" || kind_is_kw k "trait" || kind_is_kw k "impl" ||
+     kind_is_kw k "use" || kind_is_kw k "const" || kind_is_kw k "type" ||
+     kind_is_kw k "mod" || kind_is_kw k "module" || kind_is_kw k "extern" ||
+     (match k with Symbol "#" | Symbol "@" -> true | _ -> false))
   in
   if is_single_line then begin
     skip_nl st;
-    IModule { pub; name; items = []; loc = l }
+    IModule { vis; name; items = []; attrs; loc = l }
   end else begin
   skip_nl st;
   if at_kw st "end" || at_eof st then
-    IModule { pub; name; items = []; loc = l }
+    IModule { vis; name; items = []; attrs; loc = l }
   else begin
     let items = ref [] in
     while not (at_kw st "end") && not (at_eof st) do
@@ -1839,43 +2268,60 @@ let rec parse_module_def st ~pub =
       else items := parse_one_item st :: !items
     done;
     if at_kw st "end" then (advance st);
-    IModule { pub; name; items = List.rev !items; loc = l }
+    IModule { vis; name; items = List.rev !items; attrs; loc = l }
   end
   end (* close is_single_line else *)
 
 and parse_one_item st =
   skip_nl st;
+  let item_attrs = parse_attributes st in
+  skip_nl st;
   let t = peek st in
-  match t.kind with
-  | Kw "pub" ->
-    advance st;
+  let k = t.kind in
+  if kind_is_kw k "pub" then begin
+    let item_vis = parse_visibility st in
     let t2 = peek st in
-    (match t2.kind with
-     | Kw "def" -> parse_fn_def st ~pub:true
-     | Kw "struct" -> parse_struct_def st ~pub:true
-     | Kw "enum" -> parse_enum_def st ~pub:true
-     | Kw "trait" -> parse_trait_def st ~pub:true
-     | Kw "const" -> parse_const_decl st
-     | Kw "type" -> parse_type_alias_decl st
-     | Kw "use" -> parse_use_decl st
-     | Kw "module" | Kw "mod" -> parse_module_def st ~pub:true
-     | _ ->
-       err st "expected item after 'pub'"; advance st;
-       IConst { name = "_"; typ = None;
-                value = EInt (0, loc_of st); loc = loc_of st })
-  | Kw "def" -> parse_fn_def st ~pub:false
-  | Kw "async" ->
-    advance st; parse_fn_def st ~pub:false
-  | Kw "struct" -> parse_struct_def st ~pub:false
-  | Kw "enum" -> parse_enum_def st ~pub:false
-  | Kw "trait" -> parse_trait_def st ~pub:false
-  | Kw "impl" -> parse_impl_block st
-  | Kw "use" -> parse_use_decl st
-  | Kw "const" -> parse_const_decl st
-  | Kw "type" -> parse_type_alias_decl st
-  | Kw "extern" -> parse_extern_block st
-  | Kw "module" | Kw "mod" -> parse_module_def st ~pub:false
-  | Kw "mut" ->
+    let k2 = t2.kind in
+    if kind_is_kw k2 "def" then parse_fn_def st ~vis:item_vis ~attrs:item_attrs ~is_async:false
+    else if kind_is_kw k2 "struct" then parse_struct_def st ~vis:item_vis ~attrs:item_attrs
+    else if kind_is_kw k2 "enum" then parse_enum_def st ~vis:item_vis ~attrs:item_attrs
+    else if kind_is_kw k2 "trait" then parse_trait_def st ~vis:item_vis ~attrs:item_attrs
+    else if kind_is_kw k2 "const" then parse_const_decl st
+    else if kind_is_kw k2 "type" then parse_type_alias_decl st
+    else if kind_is_kw k2 "use" then parse_use_decl st
+    else if kind_is_kw k2 "module" || kind_is_kw k2 "mod" then parse_module_def st ~vis:item_vis ~attrs:item_attrs
+    else begin
+      err st "expected item after 'pub'"; advance st;
+      IConst { name = "_"; typ = None;
+               value = EInt (0, loc_of st); loc = loc_of st }
+    end
+  end
+  else if kind_is_kw k "def" then parse_fn_def st ~vis:Private ~attrs:item_attrs ~is_async:false
+  else if kind_is_kw k "async" then (advance st; parse_fn_def st ~vis:Private ~attrs:item_attrs ~is_async:true)
+  else if kind_is_kw k "struct" then parse_struct_def st ~vis:Private ~attrs:item_attrs
+  else if kind_is_kw k "enum" then parse_enum_def st ~vis:Private ~attrs:item_attrs
+  else if kind_is_kw k "trait" then parse_trait_def st ~vis:Private ~attrs:item_attrs
+  else if kind_is_kw k "impl" then parse_impl_block st ~attrs:item_attrs
+  else if kind_is_kw k "use" then parse_use_decl st
+  else if kind_is_kw k "const" then parse_const_decl st
+  else if kind_is_kw k "type" then parse_type_alias_decl st
+  else if kind_is_kw k "extern" then parse_extern_block st
+  else if kind_is_kw k "module" || kind_is_kw k "mod" then parse_module_def st ~vis:Private ~attrs:item_attrs
+  else if (match k with Ident "thread_local" | Ident "static" -> true | _ -> false) then begin
+    (* thread_local name: Type = expr  OR  static [mut] name: Type = expr *)
+    let l = loc_of st in
+    advance st;
+    if at_kw st "mut" then advance st;
+    (* Also skip 'static mut' after thread_local *)
+    if (match (peek st).kind with Ident "static" -> true | _ -> false) then begin
+      advance st; if at_kw st "mut" then advance st
+    end;
+    let name = eat_ident st in
+    let typ = if at_sym st ":" then (advance st; Some (parse_type st)) else None in
+    let value = if at_sym st "=" then (advance st; parse_expr st) else ENil l in
+    IConst { name; typ; value; loc = l }
+  end
+  else if kind_is_kw k "mut" then begin
     (* Module-level mutable variable *)
     let l = loc_of st in
     advance st;
@@ -1884,7 +2330,8 @@ and parse_one_item st =
     ignore (eat_sym st "=");
     let value = parse_expr st in
     IConst { name; typ; value; loc = l }
-  | Kw "let" ->
+  end
+  else if kind_is_kw k "let" then begin
     (* Module-level let binding, with optional tuple destructuring *)
     let l = loc_of st in
     advance st;
@@ -1910,31 +2357,37 @@ and parse_one_item st =
       let value = parse_expr st in
       IConst { name; typ; value; loc = l }
     end
-  | Kw "macro" ->
+  end
+  else if kind_is_kw k "macro" then begin
     let l = loc_of st in advance st;
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_macro"; typ = None; value = ENil l; loc = l }
-  | Kw "edition" ->
+  end
+  else if kind_is_kw k "edition" then begin
     let l = loc_of st in advance st;
     while not (at_nl st) && not (at_eof st) do advance st done;
     IConst { name = "_edition"; typ = None; value = ENil l; loc = l }
-  | Kw "cap" ->
+  end
+  else if kind_is_kw k "cap" then begin
     let l = loc_of st in advance st;
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_cap"; typ = None; value = ENil l; loc = l }
-  | Kw "effect" ->
+  end
+  else if kind_is_kw k "effect" then begin
     let l = loc_of st in advance st;
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_effect"; typ = None; value = ENil l; loc = l }
-  | Kw "rationale" ->
+  end
+  else if kind_is_kw k "rationale" then begin
     let l = loc_of st in advance st;
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_rationale"; typ = None; value = ENil l; loc = l }
-  | Kw "test" ->
+  end
+  else if kind_is_kw k "test" then begin
     let l = loc_of st in advance st;
     (* Skip test name string if present *)
     (match (peek st).kind with StringLit _ -> advance st | _ -> ());
@@ -1942,21 +2395,25 @@ and parse_one_item st =
     while not (at_kw st "end") && not (at_eof st) do advance st done;
     if at_kw st "end" then advance st;
     IConst { name = "_test"; typ = None; value = ENil l; loc = l }
-  | Symbol "@" | Symbol "#" ->
+  end
+  else if (match k with Symbol "@" | Symbol "#" -> true | _ -> false) then begin
     advance st;
     while not (at_nl st) && not (at_eof st) do advance st done;
     skip_nl st;
     parse_one_item st
-  | Kw "end" ->
+  end
+  else if at_kw st "end" then begin
     (* Orphan 'end' at top level — skip silently (e.g. module-closing end) *)
     let l = loc_of st in
     advance st; skip_nl st;
     IConst { name = "_end"; typ = None; value = ENil l; loc = l }
-  | _ ->
+  end
+  else begin
     err st (Printf.sprintf "unexpected token '%s' at top level" t.lexeme);
     advance st; skip_nl st;
     IConst { name = "_err"; typ = None;
              value = EInt (0, loc_of st); loc = loc_of st }
+  end
 
 (* ── Program parsing ───────────────────────────────────────────────── *)
 

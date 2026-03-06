@@ -88,17 +88,20 @@ let extract_json_id_raw body =
         end
 
 let read_header_content_length ic =
-  let rec loop content_length =
+  let max_header_lines = 64 in
+  let rec loop content_length remaining =
+    if remaining <= 0 then content_length  (* guard against malformed input *)
+    else
     let line = input_line ic in
     let line_trimmed = String.trim line in
     if line_trimmed = "" then content_length
     else if starts_with (String.lowercase_ascii line_trimmed) "content-length:" then
       let v = String.trim (String.sub line_trimmed 15 (String.length line_trimmed - 15)) in
-      loop (int_of_string_opt v)
+      loop (int_of_string_opt v) (remaining - 1)
     else
-      loop content_length
+      loop content_length (remaining - 1)
   in
-  try loop None with End_of_file -> None
+  try loop None max_header_lines with End_of_file -> None
 
 let read_exact ic n =
   let buf = Bytes.create n in
@@ -121,9 +124,24 @@ let send_response oc id_raw result_json =
   in
   send_json oc json
 
+let json_escape_string s =
+  let buf = Buffer.create (String.length s * 2) in
+  String.iter (fun c ->
+    match c with
+    | '"' -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '\n' -> Buffer.add_string buf "\\n"
+    | '\r' -> Buffer.add_string buf "\\r"
+    | '\t' -> Buffer.add_string buf "\\t"
+    | c when Char.code c < 0x20 ->
+      Buffer.add_string buf (Printf.sprintf "\\u%04x" (Char.code c))
+    | c -> Buffer.add_char buf c
+  ) s;
+  Buffer.contents buf
+
 let send_error oc id_raw code message =
   let id_part = match id_raw with Some s -> s | None -> "null" in
-  let msg = String.escaped message in
+  let msg = json_escape_string message in
   let json =
     Printf.sprintf
       "{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":\"%s\"}}"

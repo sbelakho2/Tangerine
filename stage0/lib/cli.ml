@@ -69,6 +69,7 @@ let compile_multi_file ~files ~output ~cc =
     let file_errors = Diagnostics.count_errors (lexed.diagnostics @ parsed.parse_diags) in
     if file_errors > 0 then begin
       Printf.eprintf "warning: skipping %s (%d parse errors)\n" f file_errors;
+      all_diags := !all_diags @ lexed.diagnostics @ parsed.parse_diags;
       skipped := !skipped + 1
     end else begin
       all_diags := !all_diags @ lexed.diagnostics @ parsed.parse_diags;
@@ -117,10 +118,12 @@ let compile_multi_file ~files ~output ~cc =
     if out_dir <> "." then (try Unix.mkdir out_dir 0o755 with _ -> ());
 
     (* Compile with cc *)
-    let link_flag = if has_main_fn then Printf.sprintf "-o %s" output
-                    else Printf.sprintf "-c -o %s.o" output in
+    let link_flag = if has_main_fn then Printf.sprintf "-o %s" (Filename.quote output)
+                    else Printf.sprintf "-c -o %s.o" (Filename.quote output) in
     let cmd = Printf.sprintf "%s -O2 -w -std=c11 -I%s %s %s %s -lm 2>&1"
-      cc runtime_h_dir link_flag c_file (if has_main_fn then runtime_c else "") in
+      (Filename.quote cc) (Filename.quote runtime_h_dir) link_flag
+      (Filename.quote c_file)
+      (if has_main_fn then Filename.quote runtime_c else "") in
     Printf.printf "  CC  %s\n" output;
     let exit_code = Sys.command cmd in
     if exit_code <> 0 then begin
@@ -129,7 +132,7 @@ let compile_multi_file ~files ~output ~cc =
       1
     end else begin
       (* Clean up generated C file on success *)
-      (* (try Sys.remove c_file with _ -> ()); *)
+      (try Sys.remove c_file with _ -> ());
       0
     end
   end
@@ -260,12 +263,12 @@ let run_compile ~allow_defaults args =
       code
   end
 
+let version_string = "tgc0 0.1.0-clean"
+
 let run argv =
   match Array.to_list argv with
   | [ _ ] | [ _; "help" ] -> usage (); 0
-  | [ _; "version" ] -> print_endline "tgc0 0.1.0-clean"; 0
-  | [ _; "--version" ] -> print_endline "tgc0 0.1.0-clean"; 0
-  | [ _; "-V" ] -> print_endline "tgc0 0.1.0-clean"; 0
+  | [ _; "version" ] | [ _; "--version" ] | [ _; "-V" ] -> print_endline version_string; 0
   | [ _; "lsp" ] -> Lsp.run ()
   | [ _; "lex"; file ] -> lex_file file
   | [ _; "parse"; file ] -> parse_file file

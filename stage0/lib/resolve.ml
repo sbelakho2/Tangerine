@@ -114,7 +114,7 @@ let rec type_name_of_typ = function
   | TyName ("Vec", _) -> TiVec
   | TyName ("Map", _) -> TiMap
   | TyName ("Set", _) -> TiSet
-  | TyName ("Option", _) -> TiOption
+  | TyName ("Option", [t]) -> type_name_of_typ (TyOption t)
   | TyName ("Result", _) -> TiResult
   | TyName ("Box", _) -> TiBox
   | TyName ("String", []) -> TiPrimitive "String"
@@ -126,16 +126,24 @@ let rec type_name_of_typ = function
   | TyName ("Bool", []) -> TiPrimitive "Bool"
   | TyName ("Char", []) -> TiPrimitive "Char"
   | TyName (name, _) -> TiStruct name  (* default: assume struct *)
+  | TyArray _ -> TiVec
   | TyRef (_, inner) -> type_name_of_typ inner
   | TySelf -> TiUnknown
   | TyOption _ -> TiOption
-  | _ -> TiUnknown
+  | TyTuple _ -> TiPrimitive "Tuple"
+  | TyFn _ -> TiClosure
+  | TyInfer -> TiUnknown
 
-let type_name_string_of_typ = function
+let rec type_name_string_of_typ = function
   | TyName (name, _) -> name
   | TyRef (_, TyName (name, _)) -> name
+  | TyRef (_, inner) -> type_name_string_of_typ inner
+  | TyArray _ -> "Array"
   | TySelf -> "Self"
-  | _ -> ""
+  | TyOption _ -> "Option"
+  | TyTuple _ -> "Tuple"
+  | TyFn _ -> "Fn"
+  | TyInfer -> ""
 
 (* Extract element type name from a Vec/Array type *)
 let vec_element_type_string fields field_name =
@@ -145,6 +153,10 @@ let vec_element_type_string fields field_name =
     | TyName (("Vec" | "Array"), [TyName (elem, _)])
     | TyName (("Vec" | "Array"), [TyRef (_, TyName (elem, _))]) -> elem
     | TyRef (_, TyName (("Vec" | "Array"), [TyName (elem, _)])) -> elem
+    | TyRef (_, TyName (("Vec" | "Array"), [TyRef (_, TyName (elem, _))])) -> elem
+    | TyArray (TyName (elem, _), _)
+    | TyArray (TyRef (_, TyName (elem, _)), _) -> elem
+    | TyRef (_, TyArray (TyName (elem, _), _)) -> elem
     | _ -> ""
   with Not_found -> ""
 
@@ -166,6 +178,7 @@ let option_inner_type_string fields field_name =
 
 let target_name_of_typ = function
   | TyName (n, _) -> n
+  | TyArray _ -> "Array"
   | TySelf -> "Self"
   | _ -> "Unknown"
 
@@ -206,6 +219,12 @@ let resolve_files (file_programs : (string * program) list) : resolved =
       let mangled = mangle_name mod_name name in
       let sym = { sym_name = name; sym_module = mod_name;
                   sym_kind = kind; sym_mangled = sanitize_ident mangled } in
+      (* Warn on redefinition from a different module *)
+      (match Hashtbl.find_opt symbols name with
+       | Some prev when prev.sym_module <> mod_name ->
+         Printf.eprintf "Warning: symbol '%s' (module %s) shadows definition from module %s\n"
+           name mod_name prev.sym_module
+       | _ -> ());
       Hashtbl.replace symbols name sym;
       Hashtbl.replace qualified (sanitize_ident mangled) sym
     in
@@ -237,7 +256,10 @@ let resolve_files (file_programs : (string * program) list) : resolved =
                register_symbol vd.vd_name
                  (SkFunction (
                    List.mapi (fun i t ->
-                     { p_name = Printf.sprintf "_%d" i; p_typ = t;
+                     let pname = if i < List.length vd.vd_field_names then
+                       List.nth vd.vd_field_names i
+                     else Printf.sprintf "_%d" i in
+                     { p_name = pname; p_typ = t;
                        p_mut = false; p_default = None }
                    ) vd.vd_fields,
                    Some (TyName (name, [])))))
@@ -263,7 +285,13 @@ let resolve_files (file_programs : (string * program) list) : resolved =
               let sym = { sym_name = mname; sym_module = mod_name;
                           sym_kind = SkMethod (tname, params, ret);
                           sym_mangled = sanitize_ident mangled } in
-              Hashtbl.replace method_map (tname ^ "." ^ mname) sym;
+              let method_key = tname ^ "." ^ mname in
+              (match Hashtbl.find_opt method_map method_key with
+               | Some prev when prev.sym_module <> mod_name ->
+                 Printf.eprintf "Warning: method '%s' on type '%s' (module %s) shadows definition from module %s\n"
+                   mname tname mod_name prev.sym_module
+               | _ -> ());
+              Hashtbl.replace method_map method_key sym;
               Hashtbl.replace qualified (sanitize_ident mangled) sym;
               (* For trait impls, also register as Trait__Type__method *)
               (match trait_ with
@@ -302,7 +330,18 @@ let find_symbol res name =
   try Some (Hashtbl.find res.symbols name) with Not_found -> None
 
 let find_variant res name =
-  try Some (Hashtbl.find res.variants name) with Not_found -> None
+  let all = Hashtbl.find_all res.variants name in
+  match all with
+  | [] -> None
+  | [single] -> Some single
+  | _ :: _ ->
+    (* Ambiguous: multiple enums define this variant name.
+       Sort deterministically by enum name to avoid Hashtbl ordering dependency. *)
+    let sorted = List.sort (fun a b -> String.compare a.vi_enum b.vi_enum) all in
+    Printf.eprintf "Warning: variant '%s' is ambiguous (defined in enums: %s), using %s\n"
+      name (String.concat ", " (List.map (fun vi -> vi.vi_enum) sorted))
+      (List.hd sorted).vi_enum;
+    Some (List.hd sorted)
 
 let find_method res type_name method_name =
   let key = type_name ^ "." ^ method_name in

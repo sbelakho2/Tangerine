@@ -95,6 +95,7 @@ let struct_field_name line =
   if t = "" || is_doc_or_comment t || starts_with t "end" then None
   else
     let t = if starts_with t "pub " then String.sub t 4 (String.length t - 4) |> trim_left else t in
+    let t = if starts_with t "mut " then String.sub t 4 (String.length t - 4) |> trim_left else t in
     let n = String.length t in
     let rec sep i =
       if i >= n then -1
@@ -124,6 +125,24 @@ let match_literal_key line =
     let n = String.length after in
     let rec find_then i =
       if i + 5 > n then -1
+      else if after.[i] = '"' then
+        (* Skip past closing quote, handling escapes *)
+        let rec skip_str j =
+          if j >= n then j
+          else if after.[j] = '\\' then skip_str (j + 2)
+          else if after.[j] = '"' then j + 1
+          else skip_str (j + 1)
+        in
+        find_then (skip_str (i + 1))
+      else if after.[i] = '\'' then
+        (* Skip past closing single quote *)
+        let rec skip_char j =
+          if j >= n then j
+          else if after.[j] = '\\' then skip_char (j + 2)
+          else if after.[j] = '\'' then j + 1
+          else skip_char (j + 1)
+        in
+        find_then (skip_char (i + 1))
       else if String.sub after i 5 = " then " then i
       else find_then (i + 1)
     in

@@ -157,7 +157,10 @@ let lex ~file (source : string) : result =
                   diags := Diagnostics.make ~code:"E113" ~file ~line:!line ~col:!col "invalid \\u{..} escape" :: !diags
               in
               read_braced_hex ();
-              if !count > 0 then add_utf8 !v;
+              if !count > 0 then add_utf8 !v
+              else
+                diags := Diagnostics.make ~code:"E113" ~file ~line:!line ~col:!col
+                  "empty \\u{} escape — at least one hex digit required" :: !diags;
               loop ()
             | _ ->
               (* \uXXXX — exactly 4 hex digits *)
@@ -196,8 +199,9 @@ let lex ~file (source : string) : result =
           match peek 0 with
           | None ->
             let diag = Diagnostics.make ~code:"E120" ~file ~line:l ~col:c
-              "Unterminated block comment" in
-            diags := diag :: !diags
+              "Unterminated block comment — reached end of file" in
+            diags := diag :: !diags;
+            push (Error "unterminated block comment") "#|" l c
           | Some '#' when starts_with "#|" ->
             bump (); bump (); (* skip nested #| *)
             skip_block_comment (depth + 1)
@@ -213,8 +217,14 @@ let lex ~file (source : string) : result =
         let l, c = (!line, !col) in
         skip_line ();
         push Newline "\\n" l c
-    | Some '#' -> skip_line ()
-    | Some '/' when starts_with "//" -> skip_line ()
+    | Some '#' ->
+        let l, c = (!line, !col) in
+        skip_line ();
+        push Newline "\\n" l c
+    | Some '/' when starts_with "//" ->
+        let l, c = (!line, !col) in
+        skip_line ();
+        push Newline "\\n" l c
     | Some '"' ->
         let l, c = (!line, !col) in
         (match read_string '"' with
@@ -246,22 +256,38 @@ let lex ~file (source : string) : result =
         let safe_peek offset =
           let idx = !i + offset in
           if idx < len then Some source.[idx] else None in
-        (* Detect base prefix *)
+        (* Detect base prefix — require at least 1 valid digit after prefix *)
         let base = ref 10 in
         if ch = '0' then begin
           match safe_peek 1 with
           | Some 'x' | Some 'X' ->
-            base := 16;
-            Buffer.add_char buf2 '0'; bump ();
-            Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'x'); bump ()
+            (match safe_peek 2 with
+             | Some c when is_hex c ->
+               base := 16;
+               Buffer.add_char buf2 '0'; bump ();
+               Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'x'); bump ()
+             | _ ->
+               (* 0x without valid hex digit — emit diagnostic, treat as just '0' *)
+               diags := Diagnostics.make ~code:"E131" ~file ~line:l ~col:c
+                 "hex literal `0x` requires at least one hex digit" :: !diags)
           | Some 'o' | Some 'O' ->
-            base := 8;
-            Buffer.add_char buf2 '0'; bump ();
-            Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'o'); bump ()
+            (match safe_peek 2 with
+             | Some c when c >= '0' && c <= '7' ->
+               base := 8;
+               Buffer.add_char buf2 '0'; bump ();
+               Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'o'); bump ()
+             | _ ->
+               diags := Diagnostics.make ~code:"E131" ~file ~line:l ~col:c
+                 "octal literal `0o` requires at least one octal digit" :: !diags)
           | Some 'b' | Some 'B' ->
-            base := 2;
-            Buffer.add_char buf2 '0'; bump ();
-            Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'b'); bump ()
+            (match safe_peek 2 with
+             | Some ('0' | '1') ->
+               base := 2;
+               Buffer.add_char buf2 '0'; bump ();
+               Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'b'); bump ()
+             | _ ->
+               diags := Diagnostics.make ~code:"E131" ~file ~line:l ~col:c
+                 "binary literal `0b` requires at least one binary digit" :: !diags)
           | _ -> ()
         end;
         let is_valid_digit c =
@@ -276,33 +302,48 @@ let lex ~file (source : string) : result =
             (* Underscore separator — consume but add to buffer for faithfulness *)
             Buffer.add_char buf2 '_'; bump (); read_num ()
           | Some '.' ->
-            (* Stop if: range op '..' or '..=', already have dot, method call, or non-decimal *)
+            (* Stop if: range op '..' or '..=' or '...' splat, already have dot, method call, or non-decimal *)
             if !base <> 10 then ()
             else begin match safe_peek 1 with
-              | Some '.' -> () (* range operator .. or ..= *)
+              | Some '.' -> () (* range operator '..' / '..=' / '...' splat *)
               | _ when !has_dot -> () (* already have a decimal point *)
               | Some c when is_ident_start c && not (is_digit c) -> ()
               (* dot followed by non-digit letter = method call *)
+              | None -> () (* trailing dot at EOF — not a decimal *)
               | _ ->
                 has_dot := true;
                 Buffer.add_char buf2 '.'; bump (); read_num ()
             end
           | Some ('e' | 'E') when !base = 10 && not !has_exp ->
-            (* Scientific notation *)
-            has_exp := true;
-            has_dot := true; (* exponent makes it a float *)
-            Buffer.add_char buf2 (match peek 0 with Some c -> c | None -> 'e'); bump ();
-            (* Optional + or - sign after exponent *)
-            (match peek 0 with
-             | Some ('+' | '-') as sign_opt ->
-               Buffer.add_char buf2 (match sign_opt with Some c -> c | None -> '+'); bump ()
+            (* Scientific notation — require at least one digit after exponent *)
+            let exp_char = (match peek 0 with Some c -> c | None -> 'e') in
+            (* Look ahead past the 'e'/'E' and optional sign to find a digit *)
+            let ahead = ref 1 in
+            (match safe_peek !ahead with
+             | Some '+' | Some '-' -> ahead := !ahead + 1
              | _ -> ());
-            read_num ()
+            (match safe_peek !ahead with
+             | Some c when is_digit c ->
+               (* Valid exponent: consume e/E, optional sign, then digits *)
+               has_exp := true;
+               has_dot := true; (* exponent makes it a float *)
+               Buffer.add_char buf2 exp_char; bump ();
+               (match peek 0 with
+                | Some ('+' | '-') as sign_opt ->
+                  Buffer.add_char buf2 (match sign_opt with Some c -> c | None -> '+'); bump ()
+                | _ -> ());
+               read_num ()
+             | _ ->
+               (* No digit after exponent — do NOT consume, treat as end of number *)
+               ())
           | Some x when is_valid_digit x ->
             Buffer.add_char buf2 x; bump (); read_num ()
           | _ -> ()
         in
         read_num ();
+        let suffix_start = !i in
+        let suffix_line = !line in
+        let suffix_col = !col in
         (* Now check for optional type suffix *)
         let suffix = Buffer.create 8 in
         let rec read_suffix () =
@@ -314,7 +355,33 @@ let lex ~file (source : string) : result =
         read_suffix ();
         let suf_str = Buffer.contents suffix in
         let whole = Buffer.contents buf2 in
-        (* Validate suffix if present *)
+        (* Validate underscore usage: no leading, trailing, or consecutive underscores *)
+        let digits_part =
+          if !base = 16 && String.length whole > 2 then String.sub whole 2 (String.length whole - 2)
+          else if (!base = 8 || !base = 2) && String.length whole > 2 then String.sub whole 2 (String.length whole - 2)
+          else whole
+        in
+        let dp_len = String.length digits_part in
+        if dp_len > 0 then begin
+          if digits_part.[0] = '_' then
+            diags := Diagnostics.make ~code:"E132" ~file ~line:l ~col:c
+              "numeric literal cannot start with underscore after prefix" :: !diags;
+          if digits_part.[dp_len - 1] = '_' then
+            diags := Diagnostics.make ~code:"E132" ~file ~line:l ~col:c
+              "numeric literal cannot end with underscore" :: !diags;
+          let prev_under = ref false in
+          String.iter (fun ch ->
+            if ch = '_' then begin
+              if !prev_under then
+                diags := Diagnostics.make ~code:"E132" ~file ~line:l ~col:c
+                  "numeric literal cannot have consecutive underscores" :: !diags;
+              prev_under := true
+            end else
+              prev_under := false
+          ) digits_part;
+        end;
+        (* Suffix validation — if invalid, rewind and leave as separate ident *)
+        let actual_suffix = ref suf_str in
         if suf_str <> "" then begin
           let valid_suffixes = [
             "u8"; "u16"; "u32"; "u64"; "usize";
@@ -322,12 +389,13 @@ let lex ~file (source : string) : result =
             "f32"; "f64";
           ] in
           if not (List.mem suf_str valid_suffixes) then begin
-            let diag = Diagnostics.make ~code:"E130" ~file ~line:l ~col:c
-              ("Invalid numeric suffix `" ^ suf_str ^ "`") in
-            diags := diag :: !diags
+            i := suffix_start;
+            line := suffix_line;
+            col := suffix_col;
+            actual_suffix := ""
           end
         end;
-        let full = whole ^ suf_str in
+        let full = whole ^ !actual_suffix in
         if !has_dot then push (FloatLit full) full l c
         else push (IntLit full) full l c
     | Some _ ->

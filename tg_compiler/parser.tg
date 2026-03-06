@@ -862,7 +862,12 @@ def parse_function_decl_full(
     
     let ret_type = if at(p, TokenKind::Arrow) then
       advance(p)
-      parse_type(p)
+      match parse_type(p)
+      when Option::Some(ty) then Option::Some(ty)
+      when Option::None then
+        diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected type after '->'", peek_span(p))
+        Option::None
+      end
     else
       Option::None
     end
@@ -1123,12 +1128,17 @@ def parse_where_clause(p: &mut Parser, params: &mut Vec[GenericParam]) -> Unit
         advance(p)
         let bounds = parse_type_bounds(p)
         # Find the matching generic param and add bounds
+        mut found = false
         for param in params do
           if param.name == type_name then
             for b in bounds do
               param.bounds.push(b)
             end
+            found = true
           end
+        end
+        if !found then
+          diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "where clause references unknown type parameter: " + type_name, peek_span(p))
         end
       end
       if !at(p, TokenKind::Comma) then break end
@@ -1374,26 +1384,25 @@ def parse_enum_decl(p: &mut Parser, vis: Visibility, start: Span, derives: Vec[S
   end
 end
 
-def parse_variant_field(p: &mut Parser) -> Option[TypeExpr]
+def parse_variant_field(p: &mut Parser) -> (Option[String], Option[TypeExpr])
   # variant_field = [ IDENT ':' ] type_expr
   # Check if this is a named field (lookahead for Ident Colon)
-  let saved = p.pos
   match peek(p)
   when TokenKind::Ident(_) then
     if p.pos + 1 < p.tokens.len() then
       match p.tokens[p.pos + 1].kind
       when TokenKind::Colon then
-        # Named field — skip name and colon, then parse the type
+        # Named field — capture name, skip colon, then parse the type
+        let field_name = expect_ident(p)
         advance(p)
-        advance(p)
-        return parse_type(p)
+        return (field_name, parse_type(p))
       when _ then ()
       end
     end
   when _ then ()
   end
   # Positional field — just a type
-  parse_type(p)
+  (Option::None, parse_type(p))
 end
 
 def parse_variant_decl(p: &mut Parser) -> Option[VariantDecl]
@@ -1401,17 +1410,24 @@ def parse_variant_decl(p: &mut Parser) -> Option[VariantDecl]
   match expect_ident(p)
   when Option::Some(name) then
     mut fields = Vec::new()
+    mut field_names = Vec::new()
     if at(p, TokenKind::LParen) then
       advance(p)
       if !at(p, TokenKind::RParen) then
-        match parse_variant_field(p)
-        when Option::Some(ty) then fields.push(ty)
+        let (fn0, ty0) = parse_variant_field(p)
+        match ty0
+        when Option::Some(ty) then
+          fields.push(ty)
+          field_names.push(fn0)
         when Option::None then ()
         end
         while at(p, TokenKind::Comma) do
           advance(p)
-          match parse_variant_field(p)
-          when Option::Some(ty) then fields.push(ty)
+          let (fn_n, ty_n) = parse_variant_field(p)
+          match ty_n
+          when Option::Some(ty) then
+            fields.push(ty)
+            field_names.push(fn_n)
           when Option::None then break
           end
         end
@@ -1423,6 +1439,7 @@ def parse_variant_decl(p: &mut Parser) -> Option[VariantDecl]
     Option::Some(VariantDecl {
       name: name,
       fields: fields,
+      field_names: field_names,
       discriminant: Option::None,
       span: span_merge(start, peek_span(p))
     })
@@ -2885,7 +2902,27 @@ def parse_guard_stmt(p: &mut Parser, start: Span) -> Option[Stmt]
       match parse_expr(p)
       when Option::Some(expr) then
         match expr.kind
-        when ExprKind::StringLit(msg) then GuardElse::Panic(msg)
+        when ExprKind::Call(callee, args) then
+          match callee.kind
+          when ExprKind::Ident(name) then
+            if name == "panic" && args.len() == 1 then
+              match args[0].kind
+              when ExprKind::StringLit(msg) then GuardElse::Panic(msg)
+              when _ then
+                diag_error(&mut p.diag, ErrorCode::E104ExpectedPattern,
+                  "panic() argument must be a string literal", args[0].span)
+                return Option::None
+              end
+            else
+              diag_error(&mut p.diag, ErrorCode::E104ExpectedPattern,
+                "guard else action must be return/break/continue or panic(\"msg\")", expr.span)
+              return Option::None
+            end
+          when _ then
+            diag_error(&mut p.diag, ErrorCode::E104ExpectedPattern,
+              "guard else action must be return/break/continue or panic(\"msg\")", expr.span)
+            return Option::None
+          end
         when _ then
           diag_error(&mut p.diag, ErrorCode::E104ExpectedPattern,
             "guard else action must be return/break/continue or panic(\"msg\")", expr.span)
@@ -3188,7 +3225,18 @@ def parse_single_pattern(p: &mut Parser) -> Option[Pattern]
   when TokenKind::IntLit(n) then
     advance(p)
     let expr = make_expr(ExprKind::IntLit(n), start)
-    Option::Some(make_pattern(PatternKind::Literal(expr), start))
+    # Check for range pattern: N..M or N..=M
+    if at(p, TokenKind::DotDot) then
+      advance(p)
+      let end_expr = if at_expr_start(p) then parse_primary(p) else Option::None end
+      Option::Some(make_pattern(PatternKind::Range(Option::Some(expr), end_expr, false), span_merge(start, peek_span(p))))
+    elsif at(p, TokenKind::DotDotEq) then
+      advance(p)
+      let end_expr = parse_primary(p)
+      Option::Some(make_pattern(PatternKind::Range(Option::Some(expr), end_expr, true), span_merge(start, peek_span(p))))
+    else
+      Option::Some(make_pattern(PatternKind::Literal(expr), start))
+    end
   when TokenKind::StringLit(s) then
     advance(p)
     let expr = make_expr(ExprKind::StringLit(s), start)
@@ -3196,7 +3244,18 @@ def parse_single_pattern(p: &mut Parser) -> Option[Pattern]
   when TokenKind::CharLit(c) then
     advance(p)
     let expr = make_expr(ExprKind::CharLit(c), start)
-    Option::Some(make_pattern(PatternKind::Literal(expr), start))
+    # Check for range pattern: 'a'..'z' or 'a'..='z'
+    if at(p, TokenKind::DotDot) then
+      advance(p)
+      let end_expr = if at_expr_start(p) then parse_primary(p) else Option::None end
+      Option::Some(make_pattern(PatternKind::Range(Option::Some(expr), end_expr, false), span_merge(start, peek_span(p))))
+    elsif at(p, TokenKind::DotDotEq) then
+      advance(p)
+      let end_expr = parse_primary(p)
+      Option::Some(make_pattern(PatternKind::Range(Option::Some(expr), end_expr, true), span_merge(start, peek_span(p))))
+    else
+      Option::Some(make_pattern(PatternKind::Literal(expr), start))
+    end
   when TokenKind::True then
     advance(p)
     let expr = make_expr(ExprKind::BoolLit(true), start)
