@@ -78,33 +78,41 @@ impl RateLimiter
     self
   end
 
-  fn extract_key(self, ctx: &Context) -> String
+  def extract_key(self: &Self, ctx: &Context) -> String
     match &self._key
-      RateLimitKey.IpAddress => ctx.remote_addr().to_string()
-      RateLimitKey.Header(h) => ctx.request.header(h).unwrap_or("unknown").to_string()
-      RateLimitKey.Global => "global".to_string()
-      RateLimitKey.Custom(f) => f(ctx)
+    when RateLimitKey::IpAddress then ctx.remote_addr().to_string()
+    when RateLimitKey::Header(h) then 
+      match ctx.request.header(h)
+      when Option::Some(v) then v.clone()
+      when Option::None then "unknown".to_string()
+      end
+    when RateLimitKey::Global then "global".to_string()
+    when RateLimitKey::Custom(f) then f(ctx)
     end
   end
 
-  fn check_token_bucket(self, key: &String, rate: f64, burst: u64) -> (Bool, f64)
+  def check_token_bucket(self: &Self, key: &String, rate: f64, burst: u64) -> (Bool, f64)
     let mut buckets = self._buckets.write()
-    let bucket = buckets.entry(key.clone()).or_insert_with(||
-      Arc.new(Mutex.new(TokenBucketState {
-        tokens: burst as f64,
-        last_refill: Instant.now(),
-      }))
-    ).clone()
+    
+    if !buckets.contains(key) then
+      buckets.insert(key.clone(), Arc::new(Mutex::new(TokenBucketState {
+        tokens: burst,
+        last_refill: Instant::now(),
+      })))
+    end
+    
+    let bucket = buckets.get(key).unwrap().clone()
     let mut state = bucket.lock()
 
     ## Refill tokens
-    let now = Instant.now()
+    let now = Instant::now()
     let elapsed = now.duration_since(state.last_refill).as_secs_f64()
-    state.tokens = (state.tokens + elapsed * rate).min(burst as f64)
+    state.tokens = (state.tokens + elapsed * rate)
+    if state.tokens > burst then state.tokens = burst end
     state.last_refill = now
 
     if state.tokens >= 1.0 then
-      state.tokens -= 1.0
+      state.tokens = state.tokens - 1.0
       (true, state.tokens)
     else
       let wait = (1.0 - state.tokens) / rate
@@ -112,25 +120,28 @@ impl RateLimiter
     end
   end
 
-  fn check_fixed_window(self, key: &String, max: u64, window: Duration) -> (Bool, Duration)
+  def check_fixed_window(self: &Self, key: &String, max: u64, window: Duration) -> (Bool, Duration)
     let mut windows = self._windows.write()
-    let win = windows.entry(key.clone()).or_insert_with(||
-      Arc.new(Mutex.new(WindowState {
+    
+    if !windows.contains(key) then
+      windows.insert(key.clone(), Arc::new(Mutex::new(WindowState {
         count: 0,
-        window_start: Instant.now(),
-      }))
-    ).clone()
+        window_start: Instant::now(),
+      })))
+    end
+    
+    let win = windows.get(key).unwrap().clone()
     let mut state = win.lock()
 
-    let now = Instant.now()
+    let now = Instant::now()
     if now.duration_since(state.window_start) >= window then
       state.count = 0
       state.window_start = now
     end
 
     if state.count < max then
-      state.count += 1
-      (true, Duration.ZERO)
+      state.count = state.count + 1
+      (true, Duration::ZERO)
     else
       let remaining = window - now.duration_since(state.window_start)
       (false, remaining)
@@ -142,35 +153,39 @@ impl Middleware for RateLimiter
   async def call(self, ctx: &mut Context, next: fn(&mut Context) -> MiddlewareResult) -> MiddlewareResult
     let key = self.extract_key(ctx)
     let (allowed, retry_info) = match &self._strategy
-      RateLimitStrategy.TokenBucket { rate, burst } =>
-        let (ok, wait) = self.check_token_bucket(&key, *rate, *burst)
-        (ok, wait)
-      RateLimitStrategy.FixedWindow { max_requests, window } =>
-        let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
-        (ok, remaining.as_secs_f64())
-      RateLimitStrategy.SlidingWindow { max_requests, window } =>
-        let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
-        (ok, remaining.as_secs_f64())
-      RateLimitStrategy.LeakyBucket { rate, capacity } =>
-        let (ok, wait) = self.check_token_bucket(&key, *rate, *capacity)
-        (ok, wait)
+    when RateLimitStrategy::TokenBucket { rate, burst } then
+      let (ok, wait) = self.check_token_bucket(&key, *rate, *burst)
+      (ok, wait)
+    when RateLimitStrategy::FixedWindow { max_requests, window } then
+      let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
+      (ok, remaining.as_secs_f64())
+    when RateLimitStrategy::SlidingWindow { max_requests, window } then
+      let (ok, remaining) = self.check_fixed_window(&key, *max_requests, *window)
+      (ok, remaining.as_secs_f64())
+    when RateLimitStrategy::LeakyBucket { rate, capacity } then
+      let (ok, wait) = self.check_token_bucket(&key, *rate, *capacity)
+      (ok, wait)
     end
 
     if allowed then
       next(ctx).await
     else
-      var response = HttpResponse.new(HttpStatus.TooManyRequests)
-      response.set_header("X-RateLimit-Limit", match &self._strategy
-        RateLimitStrategy.TokenBucket { burst, .. } => burst.to_string()
-        RateLimitStrategy.FixedWindow { max_requests, .. } => max_requests.to_string()
-        _ => "0"
-      end)
+      let mut response = HttpResponse::new(HttpStatus::TooManyRequests)
+      match &self._strategy
+      when RateLimitStrategy::TokenBucket { burst, .. } then
+        response.set_header("X-RateLimit-Limit", burst.to_string())
+      when RateLimitStrategy::FixedWindow { max_requests, .. } then
+        response.set_header("X-RateLimit-Limit", max_requests.to_string())
+      when _ then
+        response.set_header("X-RateLimit-Limit", "0")
+      end
+      
       if self._retry_after_header then
         response.set_header("Retry-After", (retry_info.ceil() as u64).to_string())
       end
       response.set_body("{\"error\":\"rate limit exceeded\"}")
       ctx.response = response
-      Ok(())
+      Result::Ok(())
     end
   end
 end
