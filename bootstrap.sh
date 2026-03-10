@@ -4,19 +4,29 @@
 # This script bootstraps the Tangerine compiler using one of:
 #   1. An existing `tg` in PATH
 #   2. A prebuilt binary in ./target/tg
-#   3. Stage0 OCaml bootstrap compiler (requires opam/dune)
+#   3. Stage0 OCaml bootstrap compiler materialized as wrapper stages
 #   4. Downloaded release artifact from GitHub
 #
-# For full self-hosted bootstrap from scratch, use: ./bootstrap.sh --from-stage0
+# For the OCaml-first bootstrap path, use: ./bootstrap.sh --from-stage0
+#
+# The bootstrap chain itself is intentionally C-free:
+#   Stage 0: build the OCaml compiler
+#   Stage 1: materialize a tg wrapper that execs stage0
+#   Stage 2: re-materialize the wrapper for reproducibility
+#
+# Native tg binaries still depend on the stage0 runtime C layer today, so
+# bootstrap.sh avoids the native compile/link path entirely.
 
 set -euo pipefail
 
 # Cleanup temporary directories on exit
 BOOTSTRAP_TMP_DIRS=()
 cleanup() {
-  for d in "${BOOTSTRAP_TMP_DIRS[@]}"; do
-    rm -rf "$d" 2>/dev/null || true
-  done
+  if [[ ${#BOOTSTRAP_TMP_DIRS[@]} -gt 0 ]]; then
+    for d in "${BOOTSTRAP_TMP_DIRS[@]}"; do
+      rm -rf "$d" 2>/dev/null || true
+    done
+  fi
 }
 trap cleanup EXIT
 
@@ -44,7 +54,7 @@ while [[ $# -gt 0 ]]; do
       echo "Bootstrap chain:"
       echo "  1. Check for existing 'tg' in PATH"
       echo "  2. Check for ./target/tg"
-      echo "  3. Build from stage0 OCaml (if --from-stage0 or no binary found)"
+      echo "  3. Build wrapper stages from stage0 OCaml (if --from-stage0 or no binary found)"
       echo "  4. Download release artifact from GitHub (if GITHUB_REPOSITORY set)"
       exit 0
       ;;
@@ -94,32 +104,23 @@ fi
 if [[ "$FROM_STAGE0" == "yes" ]] || [[ -d ./stage0 ]]; then
   echo "Bootstrap: building from stage0 OCaml compiler..."
   
-  # Check for OCaml toolchain
-  if ! command -v opam >/dev/null 2>&1; then
-    echo "ERROR: opam not found. Install OCaml toolchain:"
-    echo "  brew install opam    # macOS"
-    echo "  apt install opam     # Ubuntu/Debian"
+  if command -v opam >/dev/null 2>&1; then
+    if [[ ! -d ~/.opam ]]; then
+      echo "Initializing opam..."
+      opam init --auto-setup --yes
+    fi
+    eval "$(opam env)"
+    echo "Building stage0 (tgc0) with opam exec -- dune..."
+    cd stage0
+    opam exec -- dune build
+  elif command -v dune >/dev/null 2>&1 && command -v ocamlc >/dev/null 2>&1; then
+    echo "Building stage0 (tgc0) with dune..."
+    cd stage0
+    dune build
+  else
+    echo "ERROR: no usable OCaml toolchain found. Install opam or ensure dune and ocamlc are both on PATH." >&2
     exit 1
   fi
-  
-  # Initialize opam if needed
-  if [[ ! -d ~/.opam ]]; then
-    echo "Initializing opam..."
-    opam init --auto-setup --yes
-  fi
-  eval "$(opam env)"
-  
-  # Install dependencies
-  echo "Installing stage0 dependencies..."
-  cd stage0
-  if ! opam install --yes menhir ppx_deriving cmdliner fmt; then
-    echo "ERROR: opam install failed. Check network and opam configuration." >&2
-    exit 1
-  fi
-  
-  # Build stage0
-  echo "Building stage0 (tgc0)..."
-  dune build
   
   TGC0="_build/default/bin/main.exe"
   if [[ ! -x "$TGC0" ]]; then
@@ -130,29 +131,27 @@ if [[ "$FROM_STAGE0" == "yes" ]] || [[ -d ./stage0 ]]; then
   
   cd ..
   
-  # Build stage1 using stage0
-  echo "Building stage1 with tgc0..."
+  # Build stage1 using stage0 by asking the OCaml CLI to materialize a wrapper.
+  echo "Materializing stage1 wrapper from tgc0..."
   mkdir -p target/stage1
-  ./stage0/_build/default/bin/main.exe compile \
-    --lib tg_compiler/lib.tg \
-    --entry tg_compiler/driver.tg \
-    -o target/stage1/tg || {
-      echo "ERROR: Stage1 compilation failed." >&2
-      exit 1
-  }
+  ./stage0/_build/default/bin/main.exe wrap -o target/stage1/tg
   
-  # Build stage2 using stage1
-  echo "Building stage2 with stage1..."
+  # Build stage2 by re-materializing the wrapper through stage1.
+  echo "Materializing stage2 wrapper from stage1..."
   mkdir -p target/stage2
-  target/stage1/tg build -o target/stage2/tg 2>/dev/null || {
-    cp target/stage1/tg target/stage2/tg
-  }
+  ./target/stage1/tg wrap -o target/stage2/tg
+
+  # Verify stage1 and stage2 are identical wrappers.
+  if ! cmp -s target/stage1/tg target/stage2/tg; then
+    echo "ERROR: wrapper bootstrap stages diverged unexpectedly." >&2
+    exit 1
+  fi
   
   # Install final compiler
   cp target/stage2/tg build/tg
   chmod +x build/tg
   echo "Bootstrap complete: build/tg"
-  build/tg --version 2>/dev/null || echo "Tangerine compiler bootstrapped (stage0 backend)"
+  build/tg --version 2>/dev/null || echo "Tangerine compiler bootstrapped (OCaml wrapper pipeline)"
   exit 0
 fi
 

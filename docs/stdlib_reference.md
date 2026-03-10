@@ -90,6 +90,772 @@ Foundation types and traits built into the language.
 
 ---
 
+### `std/diagnostics` - Diagnostics & Observability
+
+Runtime diagnostics, structured logging, and observability (TG-GFX-UI-SPEC-001 v0.1, Section 27).
+
+```tangerine
+use std::diagnostics::{LogEntry, LogLevel, LogCategory, FilteredLogger}
+
+let mut logger = FilteredLogger::new(LogLevel::Info, 1000u64)
+logger.log(LogEntry {
+  timestamp_ns: 123456789u64,
+  level: LogLevel::Info,
+  category: LogCategory::App,
+  message: "Application started".to_string(),
+  correlation_id: "req-001".to_string(),
+})
+```
+
+#### How it fails
+- **`InvalidArg`**: Provided logging parameters or capture dimensions are invalid.
+- **`Internal`**: Unexpected failure in the diagnostics system or when capturing system state.
+
+#### Security & Capabilities
+- Diagnostics are primarily for observability and do not require special capabilities for basic logging.
+- Advanced captures (like frame capture or memory snapshots) might be gated by system-specific security policies in the future.
+
+#### Performance
+- Logging uses an efficient buffered approach.
+- `FilteredLogger` performs O(1) removals when the maximum entry count is reached.
+- Large dumps (UI tree, compositor) are generated on-demand to minimize runtime overhead.
+
+#### Compatibility
+- Pure Tangerine implementation; consistent across all platforms.
+- Structured logs can be exported to platform-specific sinks (e.g., syslog, Windows Event Log) by a custom `Logger` implementation.
+
+---
+
+### `std/config` - Unified Configuration
+
+Layered configuration from environment variables, files (TOML, JSON, YAML), defaults, and overrides.
+
+```tangerine
+use std::config::{ConfigBuilder, Value}
+
+let config = ConfigBuilder::new()
+  .defaults(my_defaults)
+  .file_optional("config.toml")
+  .env("MYAPP")
+  .set("debug", Value::Bool(true))
+  .build()?;
+
+let port = config.get_int("server.port")?;
+```
+
+#### How it fails
+- **`NotFound`**: A requested configuration key does not exist.
+- **`TypeError`**: The configuration value exists but cannot be converted to the requested type.
+- **`ParseError`**: A configuration file contains syntax errors.
+- **`IoError`**: A configuration file could not be read.
+- **`MergeConflict`**: A structural conflict occurred during source merging (e.g., trying to merge a table with a scalar).
+
+#### Security & Capabilities
+- Loading configuration from files requires the `File` capability.
+- Loading from environment variables requires the `Env` capability.
+- Programmatic overrides (`set`, `set_all`, `defaults`) are pure and do not require capabilities.
+
+#### Performance
+- Source merging is performed once during `build()`.
+- Access via `get` is O(D) where D is the depth of the nested key path.
+- Reference implementations use efficient hash maps for storage.
+
+#### Compatibility
+- Consistent behavior across Linux, macOS, Windows, and Web.
+- Path handling is platform-aware.
+- Environment variable case-sensitivity follows platform conventions (case-insensitive on Windows, case-sensitive on others).
+
+---
+
+### `std/crypto` - Cryptography
+
+Safe cryptographic primitives and binary encoding utilities (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::crypto::{sha256, aes_encrypt, aes_decrypt}
+
+let data = "hello world".as_bytes()
+let hash = sha256(data)
+
+let key = [0u8; 16] # 128-bit key
+let encrypted = aes_encrypt(&key, data)?
+let decrypted = aes_decrypt(&key, &encrypted)?
+```
+
+#### How it fails
+- **`InvalidKey`**: The provided key length is incorrect for the chosen algorithm (e.g., 10 bytes for AES-128).
+- **`InvalidInput`**: The input data is malformed or has an incorrect size for the operation (e.g., ciphertext block size mismatch).
+- **`Unsupported`**: The requested cryptographic algorithm or mode is not supported by the current backend.
+- **`Internal`**: An unexpected error occurred within the cryptographic provider.
+
+#### Security & Capabilities
+- Cryptographic operations are pure CPU-bound tasks and do not require special capabilities themselves.
+- Key generation (randomness) requires the `Random` capability.
+- Hardware-backed key storage (Secure Enclave, TPM) requires specific platform capabilities.
+
+#### Performance
+- Hash functions (SHA-2, SHA-3) are highly optimized for streaming data.
+- AES implementation uses hardware acceleration (AES-NI, ARM Cryptography Extensions) when available.
+- Reference implementations are constant-time where required to prevent side-channel attacks.
+
+#### Compatibility
+- Consistent behavior across Linux, macOS, Windows, and Web (Wasm).
+- Uses platform-native providers (CommonCrypto, BCrypt, OpenSSL) for performance and security.
+
+---
+
+### `std/ctx` - Context Packs
+
+Deterministic, budgeted context pack generation for agent consumption (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::ctx::{build_pack}
+
+let seeds = ["my_module::my_function".to_string()]
+let pack = build_pack(seeds, 10000)?
+println("Generated pack with ID: " + pack.id)
+```
+
+#### How it fails
+- **`BudgetExceeded`**: The requested budget is too small to include the minimum necessary context (e.g., the seed itself).
+- **`InvalidArg`**: One or more provided seed symbols could not be found in the symbol graph.
+- **`Internal`**: An error occurred during the submodular optimization or pack serialization.
+
+#### Security & Capabilities
+- Context pack generation is a pure analysis task based on the project's symbol graph.
+- It does not require special capabilities, but its output might contain sensitive information (source code excerpts).
+- Access to the underlying symbol graph and source files is governed by the compiler's safety policies.
+
+#### Performance
+- Pack selection uses a submodular greedy algorithm with O(N * K) complexity, where N is the number of candidates and K is the budget.
+- The reference implementation is optimized for typical project sizes (10k-100k symbols).
+
+#### Compatibility
+- Context packs are serialized to a canonical JSON format (`ctxpack.schema.json`) for cross-tool and cross-agent compatibility.
+- Hashing (SHA-256) ensures pack IDs are consistent across different machines and OSs.
+
+---
+
+### `std/serde` - Serialization
+
+Format-agnostic serialization and deserialization framework (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+#[derive(Serialize, Deserialize)]
+struct User {
+  id: Int,
+  name: String,
+}
+
+let user = User { id: 1, name: "Alice".to_string() };
+let value = to_value(&user)?;
+let json = std::json::stringify(&value);
+```
+
+#### How it fails
+- **`InvalidType`**: Data type mismatch during deserialization (e.g., expected `Int`, got `String`).
+- **`MissingField`**: A required struct field is missing from the input.
+- **`UnexpectedToken`**: Malformed input format.
+- **`InvalidValue`**: A value was successfully parsed but is invalid for the target type (e.g., out-of-range integer).
+- **`Eof`**: Unexpected end of input.
+- **`Io`**: Error reading from or writing to an I/O stream.
+
+#### Security & Capabilities
+- `serde` is a pure data transformation library and does not require special capabilities.
+- Format-specific parsers (like `std/json`) implement depth limits to prevent stack overflow attacks.
+
+#### Performance
+- Zero-copy deserialization is supported for some formats.
+- Derived implementations are generated at compile-time for maximum efficiency.
+- Intermediate `Value` representation allows for flexible, though slightly less performant, dynamic data handling.
+
+#### Compatibility
+- Pluggable format registry allows adding support for new formats (JSON, TOML, YAML, MsgPack, etc.).
+- Consistent behavior across all Tangerine platforms and targets.
+
+---
+
+### `std/json` - JSON Format
+
+Full RFC 8259 compliant JSON parsing and generation.
+
+```tangerine
+use std::json::{parse, stringify}
+
+let obj = parse("{\"key\": 42}")?;
+let s = stringify(&obj);
+```
+
+#### How it fails
+- **`UnexpectedChar`**: An invalid character was encountered at a given line/column.
+- **`UnexpectedEof`**: The JSON string ended prematurely.
+- **`MaxDepthExceeded`**: The nesting depth of the JSON exceeded the safe limit (`MAX_JSON_DEPTH`).
+- **`TrailingComma`**: A trailing comma was found in an object or array (forbidden by spec).
+
+#### Security & Capabilities
+- Implements strict RFC 8259 compliance.
+- Depth limiting (default 128) prevents recursion-based DoS.
+
+---
+
+### `std/math` - Mathematics
+
+Floating point math, integer utilities, and arbitrary-precision arithmetic (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::math::{PI, sin, BigInt, BigDecimal}
+
+let y = sin(PI / 2.0); # 1.0
+
+let large = BigInt::from_string("123456789012345678901234567890".to_string())?;
+let precise = BigDecimal::from_string("1.23456789".to_string())?;
+```
+
+#### How it fails
+- **`InvalidArg`**: Provided arguments are outside the domain of the function (e.g., negative factorial, division by zero).
+- **`Internal`**: Unexpected error in the mathematical provider or hardware.
+
+#### Security & Capabilities
+- Pure computational library; no special capabilities required.
+- Contract-gated functions provide runtime protection against invalid inputs.
+
+#### Performance
+- Floating point operations delegate to platform-optimized `libm` via FFI.
+- BigInt/BigDecimal implementations are optimized for common financial and engineering use cases.
+
+#### Compatibility
+- Consistent behavior across all Tangerine platforms.
+- IEEE 754 compliance for floating point operations.
+
+---
+
+### `std/random` - Randomness
+
+Fast pseudo-random and cryptographically-secure random number generation (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::random::{Xoshiro256StarStar, Rng, thread_rng}
+
+let mut rng = Xoshiro256StarStar::from_seed(42u64);
+let x = rng.next_float(); # [0.0, 1.0)
+let i = rng.next_int_range(1, 100);
+
+let mut secure_rng = CryptoRng::new();
+let bytes = secure_rng.fill_bytes(&mut buf);
+```
+
+#### How it fails
+- **`InvalidArg`**: Provided range or distribution parameters are invalid (e.g., negative standard deviation).
+- **`Internal`**: Unexpected failure in the entropy source or the PRNG state.
+
+#### Security & Capabilities
+- Fast PRNGs (`Xoshiro256StarStar`, `Pcg32`) are for simulation and non-security tasks.
+- Cryptographically secure RNGs (`CryptoRng`) are backed by OS entropy and should be used for all security-sensitive operations.
+- `from_entropy()` and `CryptoRng` require the `Random` capability.
+
+#### Performance
+- `Xoshiro256StarStar` is among the fastest 64-bit PRNGs.
+- `thread_rng()` provides a pre-seeded, high-performance RNG to minimize initialization overhead.
+- `CryptoRng` may be slower as it potentially involves syscalls to the OS entropy source.
+
+#### Compatibility
+- Floating point generation uses a standard 53-bit shift for consistency.
+- Distributions (Uniform, Normal, Bernoulli, Exponential) are implemented using deterministic algorithms.
+
+---
+
+### `std/cli` - CLI Foundation
+
+Command-line argument parsing, terminal handling, and utilities (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::cli::{App, Arg, Flag}
+
+let mut app = App::new("myapp", "A sample app")
+  .arg(Arg::new("input").required(true))
+  .flag(Flag::new("verbose").short('v'));
+
+let matches = app.parse()?;
+if matches.get_bool("verbose") {
+  println("Verbose mode enabled");
+}
+```
+
+#### How it fails
+- **`UnknownFlag`**: An unrecognized flag was provided on the command line.
+- **`MissingArg`**: A required positional argument was not provided.
+- **`MissingValue`**: A flag that requires a value was provided without one.
+- **`HelpDisplayed` / `VersionDisplayed`**: Special "errors" returned when help or version information is printed, to signal that the program should exit.
+
+#### Security & Capabilities
+- Parsing arguments requires the `Env` capability to access `env::args()`.
+- Terminal control and cursor manipulation require the `Io` capability.
+- Password prompts mask input to prevent sensitive data from leaking to the terminal.
+
+#### Performance
+- Argument parsing is O(N) where N is the number of provided arguments.
+- Minimal allocations during parsing; use of internal hash maps for fast lookup of matched values.
+
+#### Compatibility
+- ANSI color and style codes are used for terminal output; these are automatically disabled if stdout is not a TTY.
+- Cross-platform support for terminal size detection (`ioctl` on Linux/macOS, Win32 API on Windows).
+
+---
+
+### `std/assets` - Asset Management
+
+Asset loading, content-addressable caching, and hot reloading (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::assets::{load_image, load_font}
+
+let fs = fs_cap();
+let (id, bitmap) = load_image("assets/player.png".to_string(), &fs)?;
+println("Loaded asset with SHA-256: " + id.hash_hex());
+```
+
+#### How it fails
+- **`IOError`**: The asset file could not be found or read from disk.
+- **`InvalidData`**: The asset file format is recognized but the content is malformed.
+- **`Unsupported`**: The asset format (e.g., a specific image codec) is not supported by the backend.
+
+#### Security & Capabilities
+- Asset loading from the filesystem requires the `Fs` capability.
+- Assets are identified by their SHA-256 content hash, enabling secure content-addressable storage.
+
+#### Performance
+- Decoded assets are cached by their `AssetId` to prevent redundant processing.
+- Loading is asynchronous in production backends to avoid blocking the main thread.
+
+#### Compatibility
+- Consistent asset ID generation across all platforms.
+- Pluggable decoders for various formats (PNG, JPEG, TrueType, etc.).
+
+---
+
+### `std/audit` - Code Audit
+
+Deterministic audit reports covering safety, security, and quality signals (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::audit::{run_audit, Severity}
+
+let report = run_audit("std/".to_string())?;
+for finding in report.findings {
+  if finding.severity == Severity::Critical {
+    println("CRITICAL: " + finding.message);
+  }
+}
+```
+
+#### How it fails
+- **`InvalidArg`**: The provided audit scope is invalid or inaccessible.
+- **`Internal`**: Unexpected error during static analysis or report generation.
+
+#### Security & Capabilities
+- Auditing is a pure analysis task and does not require special capabilities.
+- It provides visibility into "capability drift" and "taint flows" across the codebase.
+
+#### Performance
+- Audit passes are designed to be run in parallel where possible.
+- The reference implementation is a skeletal reporter; production versions integrate with the compiler's analysis engine.
+
+#### Compatibility
+- Consistent finding IDs across all Tangerine tools.
+- Normalized location reporting for cross-platform IDE integration.
+
+---
+
+### `std/async` - Async Runtime
+
+Cooperative multitasking with `async/await`, task spawning, and I/O multiplexing (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::async::{Executor, sleep}
+
+let mut ex = Executor::new()?;
+ex.spawn(async {
+  println("Hello from task!");
+  sleep(Duration::from_secs(1)).await;
+  println("Goodbye from task!");
+});
+
+ex.run();
+```
+
+#### How it fails
+- **`TaskPanic`**: An async task panicked during execution.
+- **`Io`**: An error occurred in the underlying I/O reactor (e.g., `epoll` or `kqueue` failure).
+- **`Internal`**: Unexpected error in the task scheduler or waker mechanism.
+
+#### Security & Capabilities
+- Spawning tasks and running the executor is an effectful operation (`Async`).
+- I/O reactor handles file descriptors securely, ensuring tasks only access authorized resources.
+
+#### Performance
+- Zero-allocation futures for simple state machines.
+- O(1) task scheduling and O(log N) timer management.
+- Efficient I/O multiplexing using platform-native APIs.
+
+#### Compatibility
+- **Linux**: Uses `epoll`.
+- **macOS/BSD**: Uses `kqueue`.
+- **Windows/Embedded**: Uses a portable fallback based on `select` or a simple polling loop.
+
+---
+
+### `std/compositor` - Layer Composition
+
+Layer-based composition, damage tracking, and hardware-accelerated blending (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::compositor::{layer_tree_new, add_layer, compose}
+
+let mut tree = layer_tree_new();
+let layer_id = add_layer(&mut tree, rect, 1.0, Transform2D::identity());
+
+compose(&tree, &mut canvas)?;
+```
+
+#### How it fails
+- **`BackendUnavailable`**: The graphics backend required for hardware composition is lost or unavailable.
+- **`InvalidLayer`**: Attempted to manipulate a layer ID that no longer exists.
+- **`Unsupported`**: The current hardware does not support the requested blending mode or layer count.
+- **`OutOfMemory`**: Failed to allocate backing store for a new layer or cached surface.
+
+#### Security & Capabilities
+- Composition requires the `Display` capability to output to a window or screen.
+- Layer isolation ensures that one layer's drawing commands cannot read from or interfere with another's memory unless explicitly shared.
+
+#### Performance
+- Damage tracking ensures only modified regions are re-composed, minimizing GPU bandwidth.
+- Cached surfaces (`Layer::cached`) allow complex sub-trees to be drawn once and reused as textures.
+
+#### Compatibility
+- Consistent blending behavior across all supported GPU backends (Vulkan, Metal, DX12).
+- Pure software fallback for platforms without hardware acceleration.
+
+---
+
+### `std/device` - Device Abstraction
+
+Physical and logical device abstraction for input, sensors, and hardware state (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::device::{list_devices, DeviceKind}
+
+let devices = list_devices(Some(DeviceKind::Keyboard))?;
+for dev in devices {
+  println("Found device: " + dev.name);
+}
+```
+
+#### How it fails
+- **`NotFound`**: A specifically requested device ID could not be found.
+- **`PermissionDenied`**: The application does not have permission to access the requested hardware device.
+- **`Unsupported`**: The current platform or hardware does not support the requested device type (e.g., gyroscope on a desktop).
+- **`Internal`**: An error occurred in the platform's device driver or subsystem.
+
+#### Security & Capabilities
+- Accessing hardware devices requires the `Display` or specific hardware capabilities.
+- Device IDs are anonymized where possible to prevent hardware-based fingerprinting.
+
+#### Performance
+- Device listing is O(N) where N is the number of connected devices.
+- State updates (e.g., sensor data) use a high-frequency event stream or shared memory buffers.
+
+#### Compatibility
+- Maps to `udev` on Linux, `IOKit` on macOS, and `Win32/HID` on Windows.
+- Standardized `DeviceKind` enum ensures portable input handling.
+
+---
+
+### `std/embed_trace` - Embedded Tracing
+
+Embedded-friendly deterministic tracing and transcript capture for replay and emulator comparison (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::embed_trace::{TraceBuffer, create_transcript}
+
+let mut buffer = TraceBuffer::new(1024);
+buffer.record(0x01, [1, 2, 3, 0, 0, 0, 0, 0])?;
+
+let csv = create_transcript(&buffer);
+```
+
+#### How it fails
+- **`BufferFull`**: The fixed-size trace buffer has reached its capacity.
+- **`InvalidArg`**: Provided event ID or data payload is invalid.
+- **`Internal`**: Unexpected error in the timing source or buffer management.
+
+#### Security & Capabilities
+- Recording traces requires the `Io` capability if they are to be persisted to disk.
+- Fixed-size data payloads prevent memory exhaustion attacks in memory-constrained environments.
+
+#### Performance
+- Recording is O(1) and designed to be called from high-frequency loops or interrupt handlers.
+- Minimal overhead; no dynamic allocation during `record()` once the buffer is initialized.
+
+#### Compatibility
+- Deterministic timestamps and event ordering allow for exact replay across physical hardware and emulators.
+- CSV transcript format is portable across all analysis tools.
+
+---
+
+### `std/encoding` - Binary Encoding
+
+Strict, efficient binary-to-text and text-to-binary encodings (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::encoding::{hex_encode, hex_decode}
+
+let data = [0x41, 0x42, 0x43];
+let hex = hex_encode(&data); # "414243"
+let back = hex_decode(&hex)?;
+```
+
+#### How it fails
+- **`InvalidInput`**: The input string contains characters that are not valid for the chosen encoding (e.g., 'G' in hex) or has an invalid length.
+- **`BufferFull`**: The provided output buffer is too small for the encoded/decoded result.
+- **`Internal`**: Unexpected error in the encoding engine.
+
+#### Security & Capabilities
+- Encodings are pure data transformations and do not require special capabilities.
+- Strict validation prevents "encoding-based attacks" like null-byte injection or invalid UTF-8 sequences.
+
+#### Performance
+- Highly optimized loops for Base64 and Hex.
+- Minimal allocations; supports encoding/decoding directly into provided buffers.
+
+#### Compatibility
+- RFC 4648 compliant for Base64 and Hex.
+- Consistent behavior across all platforms and endians.
+
+---
+
+### `std/fuzz` - Fuzzing Foundation
+
+Fuzz harness support including corpus capture, deterministic seeds, and minimization (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::fuzz::{FuzzHarness}
+
+let mut h = FuzzHarness::new("my_parser".to_string(), 42u64);
+let input = h.next_input(1024);
+# Test your function with input
+```
+
+#### How it fails
+- **`InvalidArg`**: Provided harness parameters are invalid.
+- **`CorpusFull`**: The in-memory corpus has reached its size limit.
+- **`Internal`**: Unexpected error in the fuzzing engine.
+
+#### Security & Capabilities
+- Fuzzing requires the `Random` capability for generating inputs.
+- Corpus persistence requires the `Fs` capability.
+
+#### Performance
+- Input generation is O(N) where N is the requested length.
+- Minimal overhead; designed for high-throughput fuzzing loops.
+
+#### Compatibility
+- Deterministic seeds ensure identical input sequences across all platforms.
+- Corpus format is portable between different OS/arch combinations.
+
+---
+
+### `std/hal` - Hardware Abstraction
+
+Hardware Abstraction Layer for CPU, GPU, and specialized accelerators (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::hal::{init_hal, HalConfig, BackendKind}
+
+let config = HalConfig {
+  preferred_backend: Some(BackendKind::Vulkan),
+  enable_validation: true,
+};
+
+let instance = init_hal(config)?;
+println("Initialized HAL with " + instance.device_count.fmt() + " devices");
+```
+
+#### How it fails
+- **`InvalidBackend`**: The requested hardware backend (e.g., Vulkan) is not available on this system.
+- **`DeviceLost`**: The connection to the physical hardware device was lost during or after initialization.
+- **`Internal`**: Unexpected error in the HAL provider or native driver.
+
+#### Security & Capabilities
+- Hardware initialization requires the `Display` capability.
+- Memory isolation is enforced between different hardware contexts.
+
+#### Performance
+- Zero-cost abstractions over native graphics APIs.
+- Minimized overhead for command submission and buffer synchronization.
+
+#### Compatibility
+- Supports Vulkan (Linux/Windows), Metal (macOS/iOS), D3D12 (Windows), and Software fallback.
+- Unified interface for compute and graphics tasks across all backends.
+
+---
+
+### `std/gfx` - 2D Graphics
+
+Normative 2D drawing API including Paint, Stroke, Blend, Surface, and Canvas (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::gfx::{surface_offscreen, Paint, Color}
+
+let cap = display_cap();
+let mut surface = surface_offscreen(800, 600, cap)?;
+let mut canvas = surface.begin_frame()?;
+
+canvas.clear(Color::WHITE);
+canvas.fill_rect(Rect::new(10, 10, 100, 100), &Paint::solid(Color::RED));
+
+surface.end_frame()?;
+```
+
+#### How it fails
+- **`InvalidArg`**: Provided coordinates, dimensions, or state stack operations are invalid.
+- **`Unsupported`**: The requested blending mode or path operation is not supported by the current backend.
+- **`BackendLost`**: The connection to the GPU backend was lost.
+- **`Internal`**: Unexpected error in the rendering engine.
+
+#### Security & Capabilities
+- Accessing the display or offscreen surfaces requires the `Display` capability.
+- Drawing commands are validated to ensure they stay within surface bounds.
+
+#### Performance
+- Command batching and hardware acceleration (Vulkan/Metal) are used where available.
+- Software rasterizer provides a deterministic CPU reference path for testing.
+
+#### Compatibility
+- Consistent rendering output across all platforms through the use of a shared reference rasterizer.
+- Supports sRGB and other high-dynamic-range color spaces.
+
+---
+
+### `std/gfx_gpu` - GPU Abstraction
+
+Explicit GPU resource management and compute/graphics pipeline control (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::gfx_gpu::{instance_new, BufferUsage}
+
+let instance = instance_new()?;
+let adapters = instance_adapters(&instance);
+let (device, queue) = adapter_request_device(&adapters[0])?;
+
+let buffer = buffer_create(&device, 1024, [BufferUsage::Vertex].to_vec())?;
+```
+
+#### How it fails
+- **`OutOfMemory`**: Failed to allocate GPU-resident memory for a buffer or texture.
+- **`DeviceLost`**: The physical GPU device was disconnected or reset by the OS.
+- **`Unsupported`**: The requested feature (e.g., specific texture format) is not supported by the hardware.
+- **`InvalidArg`**: Provided resource handles or parameters are invalid.
+
+#### Security & Capabilities
+- Explicit resource management prevents hidden side effects.
+- Access to the GPU is gated by the `Display` capability.
+- Memory isolation between different application contexts is enforced by the hardware and driver.
+
+#### Performance
+- Zero-overhead mapping to Vulkan, Metal, and D3D12.
+- Supports asynchronous command submission and multi-threaded resource creation.
+
+#### Compatibility
+- Consistent behavior across a wide range of hardware through a unified abstraction.
+- Automatic feature probing and fallback to software rendering where necessary.
+
+---
+
+### `std/graph` - Symbol Graph
+
+Persistent symbol, effect, contract, and test graph with incremental indexing and query engine (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::graph::{load_graph, SymbolGraph}
+
+let graph = load_graph("project.tg")?;
+let deps = graph.query_dependencies("my_module::my_function");
+```
+
+#### How it fails
+- **`NotFound`**: A requested symbol or edge does not exist in the graph.
+- **`InvalidGraph`**: The persisted graph file is malformed or uses an incompatible version.
+- **`Internal`**: Unexpected error in the graph indexing or query engine.
+
+#### Security & Capabilities
+- Loading and saving the graph requires the `Fs` capability.
+- The graph provides a "view" of the codebase that respects visibility and safety boundaries.
+
+#### Performance
+- Incremental indexing ensures that only modified files are re-processed, maintaining O(1) performance for most changes.
+- Dependency queries use optimized adjacency lists for fast traversal.
+
+#### Compatibility
+- Consistent graph schema across all Tangerine platforms.
+- Stable symbol IDs ensure portability of analysis results.
+
+---
+
+### `std/secure_types` - Secure Wrappers
+
+Zero-cost secure wrappers for sensitive data including `Secret`, `SqlQuery`, and `HtmlSafe` (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::secure_types::{Secret, sql_query, html_escape}
+
+let password = Secret::new("p@ssword".to_string());
+# password is not displayable or loggable
+
+let q = sql_query("SELECT * FROM users WHERE id = $1".to_string(), [SqlParam::Int(1)].to_vec())?;
+let html = html_escape(&"<script>".to_string()); # "&lt;script&gt;"
+```
+
+#### How it fails
+- **`AccessDenied`**: Attempted to expose a `Secret` without the `Unsafe` capability.
+- **`InvalidInput`**: Provided a malformed SQL template or an unsafe URL/path traversal.
+- **`Internal`**: Unexpected error in the security provider.
+
+#### Security & Capabilities
+- `Secret::expose` requires the `Unsafe` capability.
+- `SqlQuery` prevents SQL injection by enforcing parameterized templates at construction time.
+- `HtmlSafe` prevents XSS by requiring explicit escaping or trusted-source marking.
+
+#### Performance
+- Most secure types are zero-cost wrappers that are elided at runtime after verification.
+- Memory for `Secret` types is zeroed automatically when dropped.
+
+#### Compatibility
+- Consistent security properties across all platforms.
+- Path and URL validation rules follow RFC and platform standards.
+
+---
+
+### `std/taint` - Taint Tracking
+
+Static and dynamic taint analysis for tracking and validating untrusted data (TG-GFX-UI-SPEC-001 v0.1).
+
+```tangerine
+use std::taint::{taint, validate, TaintLabel, MaxLengthValidator}
+
+let data = taint("user_input".to_string(), TaintLabel::UserInput);
+let clean = validate(&data, &MaxLengthValidator { max_len: 10 })?;
+```
+
+#### How it fails
+- **`ValidationError`**: Tainted data failed to satisfy the requirements of the chosen validator.
+- **`Internal`**: Unexpected error in the taint propagation engine.
+
+#### Security & Capabilities
+- Integrates with the compiler's static analysis to prevent unvalidated data from reaching sensitive sinks (SQL, Shell, HTML).
+- Taint labels track the provenance of untrusted data across function boundaries.
+
+---
+
 ## Collections
 
 **Module:** `std/collections`
@@ -966,6 +1732,44 @@ let rev = tg_abi_revision()       # UInt = 1
 
 ---
 
+### `std/contracts` - Design-by-Contract
+
+Lightweight contracts/invariants usable by humans, tooling, and agents (TG-GFX-UI-SPEC-001 v0.1, Section 2).
+
+```tangerine
+use std::contracts::{check_pre, check_post, make_guard, GuardElseAction}
+
+def divide(a: Int, b: Int) -> Int
+  check_pre(b != 0, "denominator must not be zero".to_string())
+  let result = a / b
+  check_post(result * b == a, "division must be precise".to_string())
+  result
+end
+
+def process(x: Option[Int]) -> Int
+  guard let Some(val) = x else { return 0 }
+  val * 2
+end
+```
+
+#### How it fails
+- **`ContractViolation`**: A precondition, postcondition, or invariant was violated at runtime. Triggers a `panic` and an error log.
+- **`GuardViolation`**: A `guard` clause condition was false, and the `else` branch triggered a panic.
+
+#### Security & Capabilities
+- Contracts are pure logic and have no direct side effects other than logging and panicking.
+- In `release` mode, some contracts may be elided by the compiler, but `guard` statements are always preserved as they affect control flow.
+
+#### Performance
+- Runtime checks are O(1) per check.
+- The overhead of a contract check is minimal, typically a branch and a potential call to the logger.
+
+#### Compatibility
+- Pure Tangerine implementation; consistent across all platforms.
+- Integrated with the global diagnostics system for consistent error reporting.
+
+---
+
 ## Testing & Benchmarking
 
 ### `std/test` - Testing Framework
@@ -1053,9 +1857,105 @@ end
 - `FunctionInfo` - `name`, `params`, `return_type`, `contracts`
 - `TestExpectation` - `Returns(String)`, `Panics(String)`, `Satisfies(String)`, `NoException`
 
+### `std/app` - Application & Windowing
+
+Cross-platform windowing, event loop, input, timers, and surface acquisition (TG-GFX-UI-SPEC-001 v0.1, Section 6).
+
+```tangerine
+use std::app::{SoftwareApp, AppOpts, App, Window, display_cap}
+use std::core::{Result}
+
+let opts = AppOpts::default()
+mut app = SoftwareApp::new(opts)
+let cap = display_cap()
+
+let mut win = app.window_new("My App".to_string(), 800, 600, cap)?
+win.set_title("Updated Title".to_string())
+
+while let Some(ev) = win.poll_event() do
+  # Handle events
+end
+```
+
+#### How it fails
+- **`BackendUnavailable`**: The requested graphics backend (e.g., Vulkan, Metal) could not be initialized.
+- **`InvalidArg`**: Invalid window dimensions or malformed title string.
+- **`Unsupported`**: The current platform does not support the requested operation (e.g., high-DPI surfaces on some backends).
+- **`PermissionDenied`**: A capability-gated operation (like clipboard access) was attempted without a valid capability token.
+- **`Internal`**: An unexpected error occurred in the platform's windowing system.
+
+#### Security & Capabilities
+- Side effects like window creation, clipboard access, and filesystem interaction (via the recorder) are capability-gated.
+- Capabilities include `DisplayCap`, `ClipboardCap`, `ImeCap`, `DragDropCap`, `ClockCap`, `RandomCap`, and `FsCap`.
+
+#### Performance
+- Event polling is O(1) and non-blocking.
+- Timer management uses a high-efficiency heap in production backends (O(log N)).
+- Reference implementation `SoftwareApp` is optimized for testing and minimal overhead.
+
+#### Compatibility
+- **Linux**: X11 and Wayland support.
+- **macOS**: AppKit integration.
+- **Windows**: Win32 / WinUI 3 support.
+- **Web**: Canvas-based windowing via WebAssembly.
+
 ---
 
 ## UI & Graphics
+
+### `std/accessibility` - Accessibility Tree
+
+Accessibility tree emission for platform screen readers (TG-GFX-UI-SPEC-001 v0.1, Section 13.4).
+
+```tangerine
+use std::accessibility::{A11yNode, Role, tree_emit, accessibility_cap}
+use std::geom::{Rect}
+
+let cap = accessibility_cap()
+let root = A11yNode {
+  id: 1,
+  role: Role::Window,
+  label: "Main Window",
+  rect: Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 },
+  focusable: false,
+  children: Vec::of(
+    A11yNode {
+      id: 2,
+      role: Role::Button,
+      label: "Submit",
+      rect: Rect { x: 10.0, y: 10.0, width: 80.0, height: 30.0 },
+      focusable: true,
+      children: Vec::new(),
+    }
+  ),
+}
+
+match tree_emit(&root, &cap)
+when Ok(_) then println("Accessibility tree emitted")
+when Err(e) then println("Error emitting tree: " + e.message())
+end
+```
+
+#### How it fails
+- **`PermissionDenied`**: The required `Accessibility` capability was not provided to `tree_emit`.
+- **`Unsupported`**: The current platform or backend does not support accessibility tree emission.
+- **`BackendUnavailable`**: The connection to the platform accessibility bridge was lost.
+- **`InvalidArg`**: The provided accessibility tree is malformed (e.g., circular references or invalid coordinates).
+
+#### Security & Capabilities
+- All side effects are gated by the `Accessibility` capability.
+- Use `accessibility_cap()` to obtain a capability handle (subject to system security policy).
+
+#### Performance
+- Tree traversal is O(N) where N is the number of nodes.
+- Reference implementation is non-allocating during traversal.
+- Production implementations may involve IPC overhead to the platform bridge.
+
+#### Compatibility
+- **Linux**: Maps to AT-SPI2.
+- **macOS**: Maps to NSAccessibility.
+- **Windows**: Maps to UI Automation (UIA).
+- **Web**: Maps to ARIA live regions and tree updates.
 
 ### `std/ui` - 2D Graphics
 

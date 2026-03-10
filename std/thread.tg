@@ -1,15 +1,20 @@
 # Tangerine Standard Library — Threading & Synchronization
 #
-# POSIX threads (pthreads) based threading with:
-#   - Thread spawning and joining
-#   - Mutex locks
-#   - Condition variables
-#   - Read-write locks
-#   - Atomic operations
-#   - Thread-local storage
-#   - Barriers
-#   - Channels (message passing)
+# [METADATA]
+# module: tg::thread
+# status: alpha
+# effects: [Kernel]
+# capabilities: [Unsafe]
+# error_codes: [ThreadCreationError, JoinError, Internal]
+# description: "POSIX threads (pthreads) based threading, synchronization, and atomic operations."
+# examples:
+#   - |
+#     use std::thread::{spawn, JoinHandle}
+#     let handle = spawn(|| 42)
+#     assert(handle.join().unwrap() == 42)
 
+use std::ctx
+use std::gfx_errors::{Error, ErrorCode, SyncError}
 use std::core::{Option, Result, panic}
 use std::collections::{Vec}
 use std::alloc::{alloc, dealloc, Box}
@@ -106,68 +111,29 @@ impl Sync for u64 {}
 # Time functions
 @ffi("c") extern def clock_gettime(clockid: Int, tp: &TimeSpec) -> Int end
 
-# Opaque pthread types (platform-specific sizes)
-# Gated per-platform via #[cfg(target_os)]:
-# - Linux glibc x86-64: PthreadMutexT = 40 bytes, PthreadRwlockT = 56 bytes
-# - macOS: PthreadMutexT = 64 bytes, PthreadRwlockT = 200 bytes, PthreadBarrierT = 0 (unsupported)
-
-#[cfg(target_os = "linux")]
+# Opaque pthread types.
+# Stage0 currently does not evaluate #[cfg] item gates during self-host bootstrap,
+# so keep a single host-target layout here to avoid duplicate C definitions.
 struct PthreadT
   opaque: [u8; 8]
 end
 
-#[cfg(target_os = "linux")]
-struct PthreadAttrT
-  opaque: [u8; 56]
-end
-
-#[cfg(target_os = "linux")]
-struct PthreadMutexT
-  opaque: [u8; 40]
-end
-
-#[cfg(target_os = "linux")]
-struct PthreadCondT
-  opaque: [u8; 48]
-end
-
-#[cfg(target_os = "linux")]
-struct PthreadRwlockT
-  opaque: [u8; 56]
-end
-
-#[cfg(target_os = "linux")]
-struct PthreadBarrierT
-  opaque: [u8; 32]
-end
-
-#[cfg(target_os = "macos")]
-struct PthreadT
-  opaque: [u8; 8]
-end
-
-#[cfg(target_os = "macos")]
 struct PthreadAttrT
   opaque: [u8; 64]
 end
 
-#[cfg(target_os = "macos")]
 struct PthreadMutexT
   opaque: [u8; 64]
 end
 
-#[cfg(target_os = "macos")]
 struct PthreadCondT
   opaque: [u8; 48]
 end
 
-#[cfg(target_os = "macos")]
 struct PthreadRwlockT
   opaque: [u8; 200]
 end
 
-# Note: macOS does not support pthread_barrier_t; barrier API is unavailable.
-#[cfg(target_os = "macos")]
 struct PthreadBarrierT
   opaque: [u8; 0]
 end
@@ -176,32 +142,14 @@ struct PthreadKeyT
   key: UInt
 end
 
-#[cfg(target_os = "linux")]
-def pthread_attr_zero() -> PthreadAttrT
-  PthreadAttrT { opaque: [0; 56] }
-end
-
-#[cfg(target_os = "macos")]
 def pthread_attr_zero() -> PthreadAttrT
   PthreadAttrT { opaque: [0; 64] }
 end
 
-#[cfg(target_os = "linux")]
-def pthread_mutex_zero() -> PthreadMutexT
-  PthreadMutexT { opaque: [0; 40] }
-end
-
-#[cfg(target_os = "macos")]
 def pthread_mutex_zero() -> PthreadMutexT
   PthreadMutexT { opaque: [0; 64] }
 end
 
-#[cfg(target_os = "linux")]
-def pthread_rwlock_zero() -> PthreadRwlockT
-  PthreadRwlockT { opaque: [0; 56] }
-end
-
-#[cfg(target_os = "macos")]
 def pthread_rwlock_zero() -> PthreadRwlockT
   PthreadRwlockT { opaque: [0; 200] }
 end
@@ -268,7 +216,7 @@ impl ThreadBuilder
     let ctx = ThreadContext {
       closure: closure_ptr as Ptr[u8],
       result: result_ptr as Ptr[u8],
-      run: thread_run_wrapper[F, T]
+      run: thread_run_wrapper
     }
     let ctx_ptr = alloc[ThreadContext]()
     if ctx_ptr.is_null() then
@@ -343,7 +291,7 @@ def spawn[F, T](f: F) -> JoinHandle[T]
 end
 
 impl[T] JoinHandle[T]
-  def join(mut self: JoinHandle[T]) -> Result[T, String]
+  def join(self: JoinHandle[T]) -> Result[T, String]
     if self.joined then
       return Result::Err("Thread already joined".to_string())
     end
@@ -413,6 +361,11 @@ impl Thread
 end
 
 def thread_yield() -> Unit
+  sched_yield()
+end
+
+# Alias for compatibility with code expecting yield_now naming
+def yield_now() -> Unit
   sched_yield()
 end
 
@@ -588,7 +541,7 @@ end
 def condvar_new() -> Condvar
   mut inner = PthreadCondT { opaque: [0; 48] }
   pthread_cond_init(&inner, Ptr::null())
-  Condlet mut { inner: inner }
+  Condvar { inner: inner }
 end
 
 impl Condvar
@@ -600,7 +553,7 @@ impl Condvar
   def wait_timeout[T](self: &Condvar, guard: MutexGuard[T], timeout_ms: UInt) -> (MutexGuard[T], Bool)
     # pthread_cond_timedwait requires ABSOLUTE time, not relative
     mut now = TimeSpec { tv_sec: 0, tv_nsec: 0 }
-    clock_gettime(CLOCK_REALTIME, &mut now)
+    clock_gettime(CLOCK_REALTIME(), &mut now)
     
     let timeout_secs = (timeout_ms / 1000) as i64
     let timeout_nanos = ((timeout_ms % 1000) * 1000000) as i64
@@ -637,87 +590,35 @@ impl Drop for Condvar
   end
 end
 
-impl Send for Condlet mut {}
-impl Sync for Condlet mut {}
+impl Send for Condvar {}
+impl Sync for Condvar {}
 
 # ———————————————————————————————————————————————————————————————
 # Barrier
 # ———————————————————————————————————————————————————————————————
 
-#[cfg(target_os = "linux")]
 struct Barrier
   inner: PthreadBarrierT
 end
 
-#[cfg(target_os = "macos")]
-struct Barrier
-  mu: PthreadMutexT
-  cv: PthreadCondT
-  threshold: UInt
-  count: UInt
-  generation: UInt
-end
-
-#[cfg(target_os = "linux")]
 def barrier_new(count: UInt) -> Barrier
-  mut inner = PthreadBarrierT { opaque: [0; 32] }
+  mut inner = PthreadBarrierT { opaque: [0; 0] }
   pthread_barrier_init(&inner, Ptr::null(), count)
   Barrier { inner: inner }
 end
 
-#[cfg(target_os = "macos")]
-def barrier_new(count: UInt) -> Barrier
-  let mut mu = pthread_mutex_zero()
-  pthread_mutex_init(&mu, Ptr::null())
-  let mut cv = pthread_cond_zero()
-  pthread_cond_init(&cv, Ptr::null())
-  Barrier { mu: mu, cv: cv, threshold: count, count: count, generation: 0 }
-end
-
-#[cfg(target_os = "linux")]
 impl Barrier
-  def wait(self: &Barrier) -> Bool
+  def wait(self: &mut Barrier) -> Bool
     let ret = pthread_barrier_wait(&self.inner)
     ret == PTHREAD_BARRIER_SERIAL_THREAD()
   end
 end
 
-#[cfg(target_os = "macos")]
-impl Barrier
-  def wait(self: &mut Barrier) -> Bool
-    pthread_mutex_lock(&self.mu)
-    let gen = self.generation
-    self.count = self.count - 1
-    if self.count == 0 then
-      self.generation = self.generation + 1
-      self.count = self.threshold
-      pthread_cond_broadcast(&self.cv)
-      pthread_mutex_unlock(&self.mu)
-      true
-    else
-      while gen == self.generation do
-        pthread_cond_wait(&self.cv, &self.mu)
-      end
-      pthread_mutex_unlock(&self.mu)
-      false
-    end
-  end
-end
-
 def PTHREAD_BARRIER_SERIAL_THREAD() -> Int = -1
 
-#[cfg(target_os = "linux")]
 impl Drop for Barrier
   def drop(self: &mut Barrier) -> Unit
     pthread_barrier_destroy(&self.inner)
-  end
-end
-
-#[cfg(target_os = "macos")]
-impl Drop for Barrier
-  def drop(self: &mut Barrier) -> Unit
-    pthread_mutex_destroy(&self.mu)
-    pthread_cond_destroy(&self.cv)
   end
 end
 
@@ -1049,7 +950,7 @@ struct ThreadLocal[T]
 end
 
 # Thread-local destructor (called when thread exits)
-extern "C" def tls_destructor[T](value: Ptr[u8]) -> Unit
+def tls_destructor[T](value: Ptr[u8]) -> Unit
   if !value.is_null() then
     let ptr = value as Ptr[T]
     ptr.drop_in_place()
@@ -1101,7 +1002,7 @@ end
 ## A fixed-size thread pool that distributes work across worker threads.
 struct ThreadPool
   workers: Vec[Worker]
-  job_queue: Mutex[VecDeque[Box[dyn FnOnce() + Send]]]
+  job_queue: Mutex[VecDeque[Box[dyn FnOnce()]]]
   condvar: Condvar
   shutdown: AtomicBool
   active_jobs: AtomicInt
@@ -1158,7 +1059,7 @@ end
 
 impl ThreadPool
   ## Submit a job to the pool.
-  def execute[F: FnOnce() + Send + 'static](self: &ThreadPool, f: F) -> Unit
+  def execute(self: &ThreadPool, f: FnOnce() -> Unit) -> Unit
     let mut guard = self.job_queue.lock()
     guard.push_back(Box::new(f))
     drop(guard)
@@ -1166,9 +1067,9 @@ impl ThreadPool
   end
 
   ## Submit a job and get a handle to its result.
-  def submit[T: Send + 'static, F: FnOnce() -> T + Send + 'static](
+  def submit[T](
     self: &ThreadPool,
-    f: F
+    f: FnOnce() -> T
   ) -> ThreadPoolHandle[T]
     let result = Arc::new(Mutex::new(Option::None))
     let result_clone = result.clone()
@@ -1247,59 +1148,32 @@ end
 
 ## Scoped threads guarantee all spawned threads complete before the scope exits,
 ## allowing safe borrowing of stack data.
-struct Scope[_: 'scope]
+struct Scope
   threads: Vec[JoinHandle[Unit]]
 end
 
 ## Run a closure that can spawn scoped threads. All threads are joined
 ## before this function returns, so spawned threads can borrow from the parent.
-def scope[T, F: FnOnce(&mut Scope) -> T](body: F) -> T
+def scoped[T](body: FnOnce(&mut Scope) -> T) -> T
   let mut s = Scope { threads: Vec::new() }
   let result = body(&mut s)
   ## Join all threads — this makes the borrow safe
-  for handle in s.threads.drain(..) do
-    handle.join()
+  while !s.threads.is_empty() do
+    match s.threads.pop()
+    when Option::Some(handle) then
+      handle.join()
+    when Option::None then ()
+    end
   end
   result
 end
 
 impl Scope
   ## Spawn a scoped thread. The closure may borrow data from the enclosing scope.
-  def spawn[F: FnOnce() + Send](self: &mut Scope, f: F) -> &JoinHandle[Unit]
+  def spawn(self: &mut Scope, f: FnOnce() -> Unit) -> &JoinHandle[Unit]
     let handle = ThreadBuilder::new().spawn(f)
     self.threads.push(handle)
     &self.threads[self.threads.len() - 1]
-  end
-end
-
-# ———————————————————————————————————————————————————————————————
-# Once (lazy one-time initialization)
-# ———————————————————————————————————————————————————————————————
-
-struct Once
-  done: AtomicBool
-  lock: Mutex[Unit]
-end
-
-def once_new() -> Once
-  Once { done: atomic_bool_new(false), lock: Mutex::new(()) }
-end
-
-impl Once
-  def call_once[F: FnOnce()](self: &Once, f: F) -> Unit
-    if self.done.load(Ordering::Acquire) then
-      return
-    end
-    let guard = self.lock.lock()
-    if !self.done.load(Ordering::Relaxed) then
-      f()
-      self.done.store(true, Ordering::Release)
-    end
-    drop(guard)
-  end
-
-  def is_completed(self: &Once) -> Bool
-    self.done.load(Ordering::Acquire)
   end
 end
 
@@ -1329,19 +1203,98 @@ def unpark(t: &Thread) -> Unit
   drop(guard)
 end
 
-## Placeholder thread-park state accessors (implementation depends on TLS)
+# ———————————————————————————————————————————————————————————————
+# Thread Registry for cross-thread operations (e.g. unpark)
+# ———————————————————————————————————————————————————————————————
+
+struct ThreadRegistry
+  states: Mutex[Map[u64, &ThreadParkState]]
+end
+
+static THREAD_REGISTRY: ThreadRegistry = ThreadRegistry { states: Mutex::new(Map::new()) }
+
+impl ThreadRegistry
+  def get() -> &ThreadRegistry
+    &THREAD_REGISTRY
+  end
+
+  def register(self: &ThreadRegistry, tid: u64, state: &ThreadParkState) -> Unit
+    let mut guard = self.states.lock().unwrap()
+    guard.get_mut().insert(tid, state)
+  end
+
+  def unregister(self: &ThreadRegistry, tid: u64) -> Unit
+    let mut guard = self.states.lock().unwrap()
+    guard.get_mut().remove(&tid)
+  end
+
+  def get_state(self: &ThreadRegistry, tid: u64) -> Option[&ThreadParkState]
+    let guard = self.states.lock().unwrap()
+    match guard.get().get(&tid)
+    when Option::Some(state) then Option::Some(*state)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Thread-park state accessors
+struct ThreadParkState
+  mutex: Mutex[Unit]
+  cond: Condvar
+  unparked: AtomicBool
+end
+
+static TLS_PARK: ThreadLocal[ThreadParkState] = thread_local_new(|| {
+  let state = ThreadParkState {
+    mutex: Mutex::new(()),
+    cond: condvar_new(),
+    unparked: atomic_bool_new(false)
+  }
+  let boxed = Box::new(state)
+  let ptr = Box::into_raw(boxed)
+  let state_ref = unsafe { &*ptr }
+  ThreadRegistry::get().register(thread_current_id(), state_ref)
+  state_ref
+})
+
+def thread_current_park_state() -> &ThreadParkState
+  # Use TLS to store park state per thread
+  TLS_PARK.get()
+end
+
 def thread_current_park_mutex() -> &Mutex[Unit]
-  panic("park/unpark requires thread-local park state")
+  &thread_current_park_state().mutex
 end
+
 def thread_current_park_cond() -> &Condvar
-  panic("park/unpark requires thread-local park state")
+  &thread_current_park_state().cond
 end
-def thread_current_unparked() -> Bool = false
-def thread_clear_unpark() -> Unit = ()
+
+def thread_current_unparked() -> Bool
+  thread_current_park_state().unparked.load(Ordering::Acquire)
+end
+
+def thread_clear_unpark() -> Unit
+  thread_current_park_state().unparked.store(false, Ordering::Release)
+end
+
 def thread_park_mutex(t: &Thread) -> &Mutex[Unit]
-  panic("park/unpark requires thread-local park state")
+  match ThreadRegistry::get().get_state(t.id)
+  when Option::Some(state) then &state.mutex
+  when Option::None then panic("Thread not found in registry")
+  end
 end
+
 def thread_park_cond(t: &Thread) -> &Condvar
-  panic("park/unpark requires thread-local park state")
+  match ThreadRegistry::get().get_state(t.id)
+  when Option::Some(state) then &state.cond
+  when Option::None then panic("Thread not found in registry")
+  end
 end
-def thread_set_unpark(t: &Thread) -> Unit = ()
+
+def thread_set_unpark(t: &Thread) -> Unit
+  match ThreadRegistry::get().get_state(t.id)
+  when Option::Some(state) then state.unparked.store(true, Ordering::Release)
+  when Option::None then () # Thread might have already exited
+  end
+end

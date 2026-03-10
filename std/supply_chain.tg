@@ -8,6 +8,22 @@ use std::collections::{Vec, Map, Set}
 use std::crypto::{sha256, ed25519_verify, PublicKey, Signature}
 use std::fs::{File, read_to_string}
 
+# [METADATA]
+# module: tg::supply_chain
+# status: alpha
+# effects: [Io]
+# capabilities: [Net]
+# error_codes: [UntrustedSource, VerificationFailed, InvalidSemVer, Internal]
+# description: "Signed packages, lockfiles, reproducible builds, and dependency trust graph."
+# examples:
+#   - |
+#     use std::supply_chain::{semver_parse, SemVer}
+#     let v = semver_parse("1.2.3-alpha.1+20260307").unwrap()
+#     assert(v.major == 1)
+
+use std::ctx
+use std::gfx_errors::{Error, ErrorCode, SupplyChainError}
+
 # ═══════════════════════════════════════════════════════════════
 # §16.1 — Package Identity
 # ═══════════════════════════════════════════════════════════════
@@ -26,18 +42,18 @@ struct SemVer
   build: Option[String]  # e.g. "20260101"
 end
 
-def semver_parse(s: &str) -> Result[SemVer, String]
+def semver_parse(s: &str) -> Result[SemVer, SupplyChainError]
   let parts = s.split(".")
   if parts.len() < 3 then
-    return Result::Err("Invalid semver: ".to_string() + s.to_string())
+    return Result::Err(SupplyChainError::InvalidSemVer(Error::invalid_arg("Invalid semver: ".to_string() + s.to_string())))
   end
   let major = match parts[0].parse_int()
     when Result::Ok(n) then n
-    when Result::Err(_) then return Result::Err("Invalid major version".to_string())
+    when Result::Err(_) then return Result::Err(SupplyChainError::InvalidSemVer(Error::invalid_arg("Invalid major version")))
   end
   let minor = match parts[1].parse_int()
     when Result::Ok(n) then n
-    when Result::Err(_) then return Result::Err("Invalid minor version".to_string())
+    when Result::Err(_) then return Result::Err(SupplyChainError::InvalidSemVer(Error::invalid_arg("Invalid minor version")))
   end
   # Patch may contain pre-release/build metadata
   let patch_str = parts[2]
@@ -50,7 +66,7 @@ def semver_parse(s: &str) -> Result[SemVer, String]
   end
   let patch = match patch_str.slice(0, patch_end).parse_int()
     when Result::Ok(n) then n
-    when Result::Err(_) then return Result::Err("Invalid patch version".to_string())
+    when Result::Err(_) then return Result::Err(SupplyChainError::InvalidSemVer(Error::invalid_arg("Invalid patch version")))
   end
   let pre = match pre_idx
     when Option::Some(idx) then
@@ -109,13 +125,22 @@ end
 def verify_package_signature(
   pkg_hash: &String,
   sig: &PackageSignature
-) -> Result[(), String]
+) -> Result[(), SupplyChainError]
   if pkg_hash != sig.signed_hash
-    return Result::Err("Package hash mismatch: expected "
-      + sig.signed_hash + " got " + pkg_hash)
+    return Result::Err(SupplyChainError::VerificationFailed(Error::invalid_arg("Package hash mismatch: expected "
+      + sig.signed_hash + " got " + pkg_hash)))
   end
   if !ed25519_verify(&sig.signer.public_key, pkg_hash.as_bytes(), &sig.signature)
-    return Result::Err("Invalid signature from " + sig.signer.name)
+    # Integrate with ctxpacks: Capture signature failure context
+    let mut seeds = Vec::new()
+    seeds.push("supply_chain::verification_failed".to_string())
+    seeds.push("signer::" + sig.signer.name)
+    match std::ctx::build_pack(seeds, 2000)
+    when Ok(pack) then
+      std::ctx::register_pack(pack)
+    when Err(_) then {}
+    end
+    return Result::Err(SupplyChainError::VerificationFailed(Error::permission_denied("Invalid signature from " + sig.signer.name)))
   end
   Result::Ok(())
 end
@@ -145,7 +170,7 @@ enum PackageSource
   Path(path: String)
 end
 
-def lockfile_verify(lock: &Lockfile) -> Result[(), Vec[String]]
+def lockfile_verify(lock: &Lockfile) -> Result[(), Vec[SupplyChainError]]
   let errors = Vec::new()
 
   # Verify integrity hash
@@ -155,13 +180,13 @@ def lockfile_verify(lock: &Lockfile) -> Result[(), Vec[String]]
   sorted_ids.sort()
   let expected_hash = sha256(sorted_ids.join("\n").as_bytes())
   if expected_hash != lock.integrity_hash
-    errors.push("Lockfile integrity hash mismatch")
+    errors.push(SupplyChainError::VerificationFailed(Error::invalid_arg("Lockfile integrity hash mismatch")))
   end
 
   # Verify each package signature
   for pkg in &lock.packages do
     if pkg.signatures.is_empty()
-      errors.push("Package " + pkg.id.name + " has no signatures")
+      errors.push(SupplyChainError::VerificationFailed(Error::permission_denied("Package " + pkg.id.name + " has no signatures")))
     end
     for sig in &pkg.signatures do
       match verify_package_signature(&pkg.integrity, sig)
@@ -178,25 +203,25 @@ def lockfile_verify(lock: &Lockfile) -> Result[(), Vec[String]]
   end
 end
 
-def lockfile_parse(content: &String) -> Result[Lockfile, String]
+def lockfile_parse(content: &String) -> Result[Lockfile, SupplyChainError]
   # Parse Tangerine.lock TOML format
   use std::toml::{toml_parse, TomlValue}
   
   let doc = match toml_parse(content)
   when Result::Ok(v) then v
-  when Result::Err(e) then return Result::Err("Lockfile parse error: " + e)
+  when Result::Err(e) then return Result::Err(SupplyChainError::Internal(Error::io_error("Lockfile parse error: " + e)))
   end
   
   # Extract format_version
   let format_version = match doc.get("format_version")
   when Option::Some(TomlValue::String(s)) then s.clone()
-  when _ then return Result::Err("Missing format_version")
+  when _ then return Result::Err(SupplyChainError::Internal(Error::invalid_arg("Missing format_version")))
   end
   
   # Extract integrity_hash
   let integrity_hash = match doc.get("integrity_hash")
   when Option::Some(TomlValue::String(s)) then s.clone()
-  when _ then return Result::Err("Missing integrity_hash")
+  when _ then return Result::Err(SupplyChainError::Internal(Error::invalid_arg("Missing integrity_hash")))
   end
   
   # Extract packages array

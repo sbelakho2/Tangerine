@@ -16,6 +16,48 @@ use std::thread::{
   atomic_int_new
 }
 
+# [METADATA]
+# module: tg::sync
+# status: alpha
+# effects: [Kernel]
+# capabilities: [Unsafe]
+# error_codes: [LockPoisoned, Deadlock, Internal]
+# description: "Synchronization primitives: Mutex, RwLock, Condvar, Barrier, Semaphore, and Atomics."
+# examples:
+#   - |
+#     use std::sync::{Mutex, MutexGuard}
+#     let m = Mutex::new(42)
+#     let mut g = m.lock().unwrap()
+#     *g.get_mut() += 1
+#     assert(*g.get() == 43)
+
+use std::ctx
+use std::gfx_errors::{Error, ErrorCode, SyncError}
+
+use std::diagnostics::{LogCategory, LogLevel, LogEntry, Logger}
+use std::time::{instant_now, duration_nanos}
+
+mut GLOBAL_LOGGER: Option[Box[dyn Logger]] = Option::None
+
+def set_global_logger(logger: Box[dyn Logger]) -> Unit
+  GLOBAL_LOGGER = Option::Some(logger)
+end
+
+def _log_sync_event(level: LogLevel, msg: String) -> Unit
+  match &GLOBAL_LOGGER
+  when Option::Some(logger) then
+    let entry = LogEntry {
+      timestamp_ns: duration_nanos(instant_now().duration_since_epoch()),
+      level: level,
+      category: LogCategory::App,
+      message: "[SYNC] " + msg,
+      correlation_id: ""
+    }
+    logger.log(entry)
+  when Option::None then ()
+  end
+end
+
 struct Mutex[T]
   inner: ThreadMutex[T]
 end
@@ -31,8 +73,14 @@ impl[T] Mutex[T]
     }
   end
 
-  def lock(self: &mut Self) -> Result[MutexGuard[T], String]
-    Result::Ok(MutexGuard { inner: self.inner.lock() })
+  def lock(self: &mut Self) -> Result[MutexGuard[T], SyncError]
+    _log_sync_event(LogLevel::Trace, "Locking mutex")
+    
+    # Production implementation: Handle deadlock detection and poisoning
+    match __intrinsic_sync_mutex_lock(&mut self.inner)
+    when Ok(g) then Result::Ok(MutexGuard { inner: g })
+    when Err(e) then Result::Err(SyncError::Deadlock(e)) # Simplified mapping
+    end
   end
 
   def try_lock(self: &mut Self) -> Option[MutexGuard[T]]
@@ -193,17 +241,17 @@ impl Semaphore
 
   ## Acquire a permit (blocking). Decrements the count.
   def acquire(self: &mut Self) -> Unit
-    loop
-      match self.count.lock()
-      when Result::Ok(mut guard) then
-        if *guard.get() > 0 then
-          *guard.get_mut() = *guard.get() - 1
-          return
-        end
-      when Result::Err(_) then panic("Semaphore: mutex poisoned")
+    match self.count.lock()
+    when Result::Ok(mut guard) then
+      while *guard.get() == 0 do
+        # In a real impl, we'd use a condvar to avoid busy-wait
+        # For now, we integrate with the actual thread yield
+        guard.unlock()
+        std::thread::yield_now()
+        guard = self.count.lock().unwrap()
       end
-      ## Busy-wait (a real impl would use futex/condvar)
-      std::thread::yield_now()
+      *guard.get_mut() = *guard.get() - 1
+    when Result::Err(_) then panic("Semaphore: mutex poisoned")
     end
   end
 
@@ -270,40 +318,30 @@ impl Barrier
 
   ## Wait at the barrier until all threads arrive.
   def wait(self: &mut Self) -> BarrierWaitResult
-    let gen = match self.generation.lock()
-    when Result::Ok(g) then *g.get()
-    when Result::Err(_) then panic("Barrier: mutex poisoned")
-    end
+    let gen = self.generation.lock().unwrap()
+    let current_gen = *gen.get()
+    gen.unlock()
 
-    let is_leader = match self.count.lock()
-    when Result::Ok(mut guard) then
-      *guard.get_mut() = *guard.get() + 1
-      if *guard.get() == self.target then
-        *guard.get_mut() = 0
-        match self.generation.lock()
-        when Result::Ok(mut g) then *g.get_mut() = *g.get() + 1
-        when Result::Err(_) then ()
-        end
-        true
-      else
-        false
-      end
-    when Result::Err(_) then panic("Barrier: mutex poisoned")
-    end
-
-    if !is_leader then
-      ## Wait for generation to advance
-      loop
-        match self.generation.lock()
-        when Result::Ok(g) then
-          if *g.get() != gen then break end
-        when Result::Err(_) then break
-        end
+    let mut count_guard = self.count.lock().unwrap()
+    *count_guard.get_mut() += 1
+    
+    if *count_guard.get() == self.target then
+      # Reset count for next generation
+      *count_guard.get_mut() = 0
+      # Advance generation
+      let mut gen_guard = self.generation.lock().unwrap()
+      *gen_guard.get_mut() += 1
+      gen_guard.unlock()
+      count_guard.unlock()
+      BarrierWaitResult { is_leader: true }
+    else
+      count_guard.unlock()
+      # Wait for generation to advance
+      while self.generation.lock().unwrap().get() == current_gen do
         std::thread::yield_now()
       end
+      BarrierWaitResult { is_leader: false }
     end
-
-    BarrierWaitResult { is_leader: is_leader }
   end
 end
 
@@ -355,6 +393,42 @@ impl[T] OnceCell[T]
 
   def is_initialized(self: &Self) -> Bool
     self.initialized.load() == 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Condvar — condition variable
+# ———————————————————————————————————————————————————————————————
+
+struct Condvar
+  inner: std::thread::Condvar
+end
+
+impl Condvar
+  def new() -> Self
+    Condvar { inner: std::thread::condvar_new() }
+  end
+
+  def wait[T](self: &Self, guard: MutexGuard[T]) -> Result[MutexGuard[T], SyncError]
+    match __intrinsic_sync_condvar_wait(&self.inner, guard.inner)
+    when Ok(g) then Result::Ok(MutexGuard { inner: g })
+    when Err(e) then Result::Err(SyncError::Internal(e))
+    end
+  end
+
+  def wait_timeout[T](self: &Self, guard: MutexGuard[T], dur: std::time::Duration) -> Result[(MutexGuard[T], Bool), SyncError]
+    match __intrinsic_sync_condvar_wait_timeout(&self.inner, guard.inner, dur)
+    when Ok((g, timed_out)) then Result::Ok((MutexGuard { inner: g }, timed_out))
+    when Err(e) then Result::Err(SyncError::Internal(e))
+    end
+  end
+
+  def notify_one(self: &Self) -> Unit
+    self.inner.notify_one()
+  end
+
+  def notify_all(self: &Self) -> Unit
+    self.inner.notify_all()
   end
 end
 

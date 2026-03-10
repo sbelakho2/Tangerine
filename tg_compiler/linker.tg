@@ -17,7 +17,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map}
 use std::fs::{write_file_bytes}
-use tg_compiler::asm::{Arch, OsAbi, TargetTriple, RelocKind}
+use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind}
 use tg_compiler::object::{
   ObjectFile, build_object,
   write16, write32, write64, emit_zeros_vec, append_vec, pad_to, align_up,
@@ -32,7 +32,7 @@ struct LinkerInput
   objects: Vec[ObjectFile]
   entry: String           # entry point symbol (_start or _main)
   output: String          # output file path
-  target: TargetTriple
+  target: AsmTarget
 end
 
 struct LinkedSection
@@ -56,7 +56,7 @@ struct LinkerCtx
   sections: Vec[LinkedSection]
   symbols: Map[String, LinkerSymbol]
   entry_addr: u64
-  target: TargetTriple
+  target: AsmTarget
 end
 
 # GOT/PLT support for dynamic linking
@@ -1025,7 +1025,7 @@ end
 # Public API
 # ———————————————————————————————————————————————————————————————
 
-def link(input: &LinkerInput) -> Result[Vec[u8], String]
+def perform_link(input: &LinkerInput) -> Result[Vec[u8], String]
   match input.target.os
   when OsAbi::Linux   then link_elf64(input)
   when OsAbi::MacOS   then link_macho64(input)
@@ -1033,8 +1033,8 @@ def link(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 end
 
-def link_and_write(input: &LinkerInput) -> Result[Unit, String]
-  let bytes = match link(input)
+def link_executable(input: &LinkerInput) -> Result[Unit, String]
+  let bytes = match perform_link(input)
   when Result::Ok(b) then b
   when Result::Err(e) then return Result::Err(e)
   end
@@ -1103,14 +1103,14 @@ end
 # Link-Time Optimization (LTO)
 # ———————————————————————————————————————————————————————————————
 
-enum LtoMode
-  None        # No LTO
-  Thin        # Thin LTO — per-module optimization + cross-module import
-  Fat         # Full LTO — all modules merged into one then optimized
+enum LinkerLtoMode
+  LtoNone        # No LTO
+  LtoThin        # Thin LTO — per-module optimization + cross-module import
+  LtoFat         # Full LTO — all modules merged into one then optimized
 end
 
 struct LtoContext
-  mode: LtoMode
+  mode: LinkerLtoMode
   modules: Vec[LtoModule]
   symbol_table: Map[String, LtoSymbolInfo]
   call_graph: Map[String, Vec[String]]   # caller -> callees
@@ -1130,7 +1130,7 @@ struct LtoSymbolInfo
   call_count: Int     # How many times this symbol is referenced
 end
 
-def lto_context_new(mode: LtoMode) -> LtoContext
+def lto_context_new(mode: LinkerLtoMode) -> LtoContext
   LtoContext {
     mode: mode,
     modules: Vec::new(),
@@ -1152,10 +1152,10 @@ end
 # Perform LTO: cross-module dead code elimination and inlining
 def perform_lto(ctx: &mut LtoContext) -> Unit
   match ctx.mode
-  when LtoMode::None then return
-  when LtoMode::Thin then
+  when LinkerLtoMode::LtoNone then return
+  when LinkerLtoMode::LtoThin then
     lto_thin(ctx)
-  when LtoMode::Fat then
+  when LinkerLtoMode::LtoFat then
     lto_fat(ctx)
   end
 end
@@ -1292,11 +1292,11 @@ def build_call_graph(ctx: &mut LtoContext) -> Unit
       
       for block in func.blocks do
         match block.terminator.kind
-        when MirTerminatorKind::Call(_, func_op, _, _, _) then
+        when MirTerminatorKind::MirCall(_, func_op, _, _, _) then
           match func_op.kind
-          when MirOperandKind::Constant(c) then
+          when MirOperandKind::MirConstant(c) then
             match c.kind
-            when MirConstantKind::FnItem(target) then
+            when MirConstantKind::MirFnItem(target) then
               callees.push(target.clone())
             when _ then ()
             end
@@ -1388,11 +1388,11 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
   
   for block_idx in 0..caller.blocks.len() do
     match caller.blocks[block_idx].terminator.kind
-    when MirTerminatorKind::Call(dest, func_op, args, next, unwind) then
+    when MirTerminatorKind::MirCall(dest, func_op, args, next, unwind) then
       let target = match func_op.kind
-      when MirOperandKind::Constant(c) then
+      when MirOperandKind::MirConstant(c) then
         match c.kind
-        when MirConstantKind::FnItem(name) then Option::Some(name.clone())
+        when MirConstantKind::MirFnItem(name) then Option::Some(name.clone())
         when _ then Option::None
         end
       when _ then Option::None
@@ -1440,14 +1440,14 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
           
           # Remap terminator
           match new_block.terminator.kind
-          when MirTerminatorKind::Return then
+          when MirTerminatorKind::MirReturn then
             # Store return value to dest, then goto continuation
             # Note: simplified - assumes return value is in local 0 or uses operand
-            new_block.terminator = MirTerminator { kind: MirTerminatorKind::Goto(next), span: new_block.terminator.span }
-          when MirTerminatorKind::Goto(target) then
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::MirGoto(next), span: new_block.terminator.span }
+          when MirTerminatorKind::MirGoto(target) then
             let new_target = block_map.get(target).unwrap_or(target)
-            new_block.terminator = MirTerminator { kind: MirTerminatorKind::Goto(new_target), span: new_block.terminator.span }
-          when MirTerminatorKind::SwitchInt(op, targets, default) then
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::MirGoto(new_target), span: new_block.terminator.span }
+          when MirTerminatorKind::MirSwitchInt(op, targets, default) then
             let new_op = remap_operand_locals(&op, &local_map)
             mut new_targets = Vec::new()
             for t in targets do
@@ -1457,7 +1457,7 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
               })
             end
             let new_default = block_map.get(default).unwrap_or(default)
-            new_block.terminator = MirTerminator { kind: MirTerminatorKind::SwitchInt(new_op, new_targets, new_default), span: new_block.terminator.span }
+            new_block.terminator = MirTerminator { kind: MirTerminatorKind::MirSwitchInt(new_op, new_targets, new_default), span: new_block.terminator.span }
           when _ then ()
           end
           
@@ -1466,7 +1466,7 @@ def inline_calls_in_function(caller: &mut MirFunction, callee_name: &String, cal
         
         # 4. Replace the call terminator with a goto to the inlined entry
         let inlined_entry = block_map.get(callee_body.entry_block.id).unwrap_or(block_base)
-        caller.blocks[block_idx].terminator = MirTerminator { kind: MirTerminatorKind::Goto(inlined_entry), span: caller.blocks[block_idx].terminator.span }
+        caller.blocks[block_idx].terminator = MirTerminator { kind: MirTerminatorKind::MirGoto(inlined_entry), span: caller.blocks[block_idx].terminator.span }
         next_block_id = next_block_id + callee_body.blocks.len() as Int
       end
       when Option::None then ()
@@ -1478,9 +1478,9 @@ end
 
 def extract_operand_local(op: &MirOperand) -> Int
   match op.kind
-  when MirOperandKind::Copy(place) then place.local.id
-  when MirOperandKind::Move(place) then place.local.id
-  when MirOperandKind::Constant(_) then -1
+  when MirOperandKind::MirCopy(place) then place.local.id
+  when MirOperandKind::MirMovePlace(place) then place.local.id
+  when MirOperandKind::MirConstant(_) then -1
   end
 end
 
@@ -1493,21 +1493,21 @@ end
 
 def remap_statement_kind_locals(kind: &MirStatementKind, local_map: &Map[Int, Int]) -> MirStatementKind
   match kind
-  when MirStatementKind::Assign(place, rvalue) then
-    MirStatementKind::Assign(remap_place_locals(&place, local_map), remap_rvalue_locals(&rvalue, local_map))
-  when MirStatementKind::StorageLive(local) then
+  when MirStatementKind::MirAssign(place, rvalue) then
+    MirStatementKind::MirAssign(remap_place_locals(&place, local_map), remap_rvalue_locals(&rvalue, local_map))
+  when MirStatementKind::MirStorageLive(local) then
     let new_id = local_map.get(local.id).unwrap_or(local.id)
-    MirStatementKind::StorageLive(LocalId { id: new_id })
-  when MirStatementKind::StorageDead(local) then
+    MirStatementKind::MirStorageLive(LocalId { id: new_id })
+  when MirStatementKind::MirStorageDead(local) then
     let new_id = local_map.get(local.id).unwrap_or(local.id)
-    MirStatementKind::StorageDead(LocalId { id: new_id })
-  when MirStatementKind::Nop then MirStatementKind::Nop
-  when MirStatementKind::ContractCheck(contract, operand) then
-    MirStatementKind::ContractCheck(contract.clone(), remap_operand_locals(&operand, local_map))
-  when MirStatementKind::BudgetConsume(name, amount) then
-    MirStatementKind::BudgetConsume(name.clone(), amount)
-  when MirStatementKind::EffectRecord(name, operand) then
-    MirStatementKind::EffectRecord(name.clone(), remap_operand_locals(&operand, local_map))
+    MirStatementKind::MirStorageDead(LocalId { id: new_id })
+  when MirStatementKind::MirNop then MirStatementKind::MirNop
+  when MirStatementKind::MirContractCheck(contract, operand) then
+    MirStatementKind::MirContractCheck(contract.clone(), remap_operand_locals(&operand, local_map))
+  when MirStatementKind::MirBudgetConsume(name, amount) then
+    MirStatementKind::MirBudgetConsume(name.clone(), amount)
+  when MirStatementKind::MirEffectRecord(name, operand) then
+    MirStatementKind::MirEffectRecord(name.clone(), remap_operand_locals(&operand, local_map))
   end
 end
 
@@ -1518,25 +1518,25 @@ end
 
 def remap_operand_locals(op: &MirOperand, local_map: &Map[Int, Int]) -> MirOperand
   match op.kind
-  when MirOperandKind::Copy(place) then
-    MirOperand { kind: MirOperandKind::Copy(remap_place_locals(&place, local_map)) }
-  when MirOperandKind::Move(place) then
-    MirOperand { kind: MirOperandKind::Move(remap_place_locals(&place, local_map)) }
-  when MirOperandKind::Constant(c) then
-    MirOperand { kind: MirOperandKind::Constant(c.clone()) }
+  when MirOperandKind::MirCopy(place) then
+    MirOperand { kind: MirOperandKind::MirCopy(remap_place_locals(&place, local_map)) }
+  when MirOperandKind::MirMovePlace(place) then
+    MirOperand { kind: MirOperandKind::MirMovePlace(remap_place_locals(&place, local_map)) }
+  when MirOperandKind::MirConstant(c) then
+    MirOperand { kind: MirOperandKind::MirConstant(c.clone()) }
   end
 end
 
 def remap_rvalue_locals(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
   match rv.kind
-  when MirRvalueKind::Use(op) then
-    MirRvalue { kind: MirRvalueKind::Use(remap_operand_locals(&op, local_map)) }
-  when MirRvalueKind::Ref(place) then
-    MirRvalue { kind: MirRvalueKind::Ref(remap_place_locals(&place, local_map)) }
-  when MirRvalueKind::BinOp(op, a, b) then
-    MirRvalue { kind: MirRvalueKind::BinOp(op.clone(), remap_operand_locals(&a, local_map), remap_operand_locals(&b, local_map)) }
-  when MirRvalueKind::UnOp(op, operand) then
-    MirRvalue { kind: MirRvalueKind::UnOp(op.clone(), remap_operand_locals(&operand, local_map)) }
+  when MirRvalueKind::MirMove(op) then
+    MirRvalue { kind: MirRvalueKind::MirMove(remap_operand_locals(&op, local_map)) }
+  when MirRvalueKind::MirRef(place) then
+    MirRvalue { kind: MirRvalueKind::MirRef(remap_place_locals(&place, local_map)) }
+  when MirRvalueKind::MirBinOp(op, a, b) then
+    MirRvalue { kind: MirRvalueKind::MirBinOp(op.clone(), remap_operand_locals(&a, local_map), remap_operand_locals(&b, local_map)) }
+  when MirRvalueKind::MirUnOp(op, operand) then
+    MirRvalue { kind: MirRvalueKind::MirUnOp(op.clone(), remap_operand_locals(&operand, local_map)) }
   when _ then rv.clone()
   end
 end

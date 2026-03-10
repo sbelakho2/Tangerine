@@ -14,13 +14,14 @@ all: build test
 # Bootstrap Chain (Self-Hosting)
 # ————————————————————————————————————————————
 # 
-# The bootstrap chain compiles Tangerine from scratch:
-#   Stage 0: OCaml bootstrap compiler (tgc0) - external dependency
-#   Stage 1: First self-compiled Tangerine (tg1) - compiled by tgc0
-#   Stage 2: Second self-compiled Tangerine (tg2) - compiled by tg1
-#   Stage 3: Verify tg1 and tg2 produce identical output
+# The bootstrap chain is currently OCaml-first and C-free:
+#   Stage 0: Build the OCaml bootstrap compiler (tgc0)
+#   Stage 1: Materialize a tg wrapper backed by tgc0
+#   Stage 2: Re-materialize the wrapper for reproducibility checks
+#   Stage 3: Verify both wrapper stages are identical
 #
-# After successful bootstrap, tg2 becomes the production compiler.
+# Native self-hosting stays a separate backend-readiness goal until the
+# stage0 runtime is no longer linked through tg_runtime.c.
 
 STAGE0_DIR := stage0
 STAGE1_DIR := target/stage1
@@ -55,39 +56,33 @@ bootstrap-stage0:
 	fi
 	@echo "    Stage 0 complete: $(TGC0)"
 
-# Build stage1 (first self-hosted compiler, compiled by stage0)
+# Build stage1 (OCaml-backed tg wrapper, no native/C link step)
 bootstrap-stage1: bootstrap-stage0
-	@echo "==> Stage 1: Compiling Tangerine with stage0..."
+	@echo "==> Stage 1: Materializing tg wrapper from stage0..."
 	@mkdir -p $(STAGE1_DIR)
-	@timeout $(BOOTSTRAP_TIMEOUT) $(TGC0) compile \
-		--lib tg_compiler/lib.tg \
-		--entry tg_compiler/driver.tg \
-		$(TG_COMPILER_SRCS) \
-		-o $(TG1)
-	@chmod +x $(TG1)
+	@$(TGC0) wrap -o $(TG1)
 	@echo "    Stage 1 complete: $(TG1)"
 
-# Build stage2 (second self-hosted compiler, compiled by stage1)
+# Build stage2 (repeat wrapper materialization for reproducibility)
 bootstrap-stage2: bootstrap-stage1
-	@echo "==> Stage 2: Compiling Tangerine with stage1..."
+	@echo "==> Stage 2: Re-materializing tg wrapper..."
 	@mkdir -p $(STAGE2_DIR)
-	@$(TG1) build -o $(TG2)
-	@chmod +x $(TG2)
+	@$(TG1) wrap -o $(TG2)
 	@echo "    Stage 2 complete: $(TG2)"
 
-# Verify bootstrap - stage1 and stage2 should produce identical binaries
+# Verify bootstrap - stage1 and stage2 should produce identical wrappers
 bootstrap-verify: bootstrap-stage2
 	@echo "==> Verifying bootstrap integrity..."
 	@if cmp -s $(TG1) $(TG2); then \
-		echo "    VERIFIED: Stage 1 and Stage 2 compilers are identical"; \
+		echo "    VERIFIED: Stage 1 and Stage 2 wrappers are identical"; \
 	else \
 		sha256sum $(TG1) $(TG2); \
-		echo "    WARNING: Compilers differ (may be acceptable with timestamps)"; \
+		echo "    WARNING: Wrappers differ"; \
 		$(TG2) --version; \
 	fi
 	@echo "==> Bootstrap verification complete."
 
-# Full bootstrap: build all stages and verify
+# Full bootstrap: install the OCaml-backed tg wrapper
 bootstrap-full: bootstrap-verify
 	@echo "==> Installing bootstrapped compiler..."
 	@mkdir -p build
@@ -114,9 +109,9 @@ build:
 	@echo "==> Building Tangerine compiler..."
 	mkdir -p build
 	@if [ -x build/tg ]; then \
-		build/tg build -o build/tg; \
+		build/tg build --wrapper -o build/tg; \
 	elif command -v $(TG) >/dev/null 2>&1; then \
-		$(TG) build -o build/tg; \
+		$(TG) build --wrapper -o build/tg; \
 	else \
 		echo "No compiler available. Run 'make bootstrap' first."; \
 		exit 1; \

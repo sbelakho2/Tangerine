@@ -16,6 +16,67 @@ use std::io::{Read, Write, IOError}
 use std::net::{TcpStream}
 use std::time::{Instant, Duration, instant_now, duration_millis, duration_nanos}
 
+# [METADATA]
+# module: tg::async
+# status: alpha
+# effects: [Async, Kernel, Io]
+# capabilities: [Net, Unsafe]
+# error_codes: [TaskPanic, Io, Internal]
+# description: "Async runtime, task scheduling, timers, and deterministic scheduler mode."
+# examples:
+#   - |
+#     use std::async::{Executor, block_on}
+#     block_on(async { 42 })
+
+use std::gfx_errors::{Error, ErrorCode}
+
+enum AsyncError
+  TaskPanic(Error)
+  Io(Error)
+  Internal(Error)
+end
+
+impl AsyncError
+  def message(self: &AsyncError) -> &String
+    match self
+    when AsyncError::TaskPanic(e) then &e.message
+    when AsyncError::Io(e) then &e.message
+    when AsyncError::Internal(e) then &e.message
+    end
+  end
+
+  def code(self: &AsyncError) -> ErrorCode
+    match self
+    when AsyncError::TaskPanic(_) then ErrorCode::Internal
+    when AsyncError::Io(_) then ErrorCode::IOError
+    when AsyncError::Internal(_) then ErrorCode::Internal
+    end
+  end
+end
+
+use std::diagnostics::{LogCategory, LogLevel, LogEntry, Logger}
+
+mut GLOBAL_LOGGER: Option[Box[dyn Logger]] = Option::None
+
+def set_global_logger(logger: Box[dyn Logger]) -> Unit
+  GLOBAL_LOGGER = Option::Some(logger)
+end
+
+def _log_async_event(level: LogLevel, msg: String) -> Unit
+  match &GLOBAL_LOGGER
+  when Option::Some(logger) then
+    let entry = LogEntry {
+      timestamp_ns: 0,
+      level: level,
+      category: LogCategory::App,
+      message: "[ASYNC] " + msg,
+      correlation_id: ""
+    }
+    logger.log(entry)
+  when Option::None then {}
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 
 # ———————————————————————————————————————————————————————————————
@@ -335,6 +396,11 @@ struct Executor
   # GAP-22: I/O reactor for async I/O
   io_reactor: Option[IoReactor]
   running: Bool
+  # Deterministic mode support
+  deterministic: Bool
+  seed: u64
+  virtual_time: Instant
+  rand_state: u64
 end
 
 struct TimerEntry
@@ -500,24 +566,30 @@ impl Executor
   
   def run(&mut self) -> Unit
     self.running = true
-    
+
     while self.running do
       # Check timers
-      self.check_timers()
-      
-      # GAP-22: Poll I/O reactor for ready file descriptors
-      match self.io_reactor
-      when Option::Some(ref mut reactor) then
-        # Poll with 0 timeout for non-blocking check
-        let io_ready = reactor.poll(0)
-        for task_id in io_ready do
-          if !self.ready_queue.contains(&task_id) then
-            self.ready_queue.push_back(task_id)
-          end
-        end
-      when Option::None then ()
+      if self.deterministic then
+        self.check_timers_deterministic()
+      else
+        self.check_timers()
       end
-      
+
+      # GAP-22: Poll I/O reactor for ready file descriptors
+      if !self.deterministic then
+        match self.io_reactor
+        when Option::Some(ref mut reactor) then
+          # Poll with 0 timeout for non-blocking check
+          let io_ready = reactor.poll(0)
+          for task_id in io_ready do
+            if !self.ready_queue.contains(&task_id) then
+              self.ready_queue.push_back(task_id)
+            end
+          end
+        when Option::None then ()
+        end
+      end
+
       # Poll ready tasks
       match self.ready_queue.pop_front()
       when Option::Some(task_id) then
@@ -528,31 +600,60 @@ impl Executor
           self.running = false
           break
         end
-        
-        # GAP-22: Block on I/O and timers
-        let timeout_ms = match self.next_timer_deadline()
-        when Option::Some(deadline) then
-          let now = instant_now()
-          let remaining = deadline.duration_since(now)
-          duration_millis(remaining).max(0).min(100)
-        when Option::None then 100  # Default 100ms timeout
-        end
-        
-        match self.io_reactor
-        when Option::Some(ref mut reactor) then
-          # Block on I/O with timeout
-          let io_ready = reactor.poll(timeout_ms as Int)
-          for task_id in io_ready do
-            self.ready_queue.push_back(task_id)
-          end
-        when Option::None then
-          # No I/O reactor — just sleep
-          if timeout_ms > 0 then
-            sleep_ms(timeout_ms)
+
+        # Advance virtual time or block on I/O/timers
+        if self.deterministic then
+          if !self.timer_heap.is_empty() then
+            # Advance to next timer
+            let min_entry = self.timer_heap[0]
+            self.virtual_time = min_entry.deadline
+            self.check_timers_deterministic()
           else
-            sleep_ms(1)
+            # No ready tasks and no timers in deterministic mode == deadlock or finished
+            self.running = false
+          end
+        else
+          # GAP-22: Block on I/O and timers
+          let timeout_ms = match self.next_timer_deadline()
+          when Option::Some(deadline) then
+            let now = instant_now()
+            let remaining = deadline.duration_since(now)
+            duration_millis(remaining).max(0).min(100)
+          when Option::None then 100  # Default 100ms timeout
+          end
+
+          match self.io_reactor
+          when Option::Some(ref mut reactor) then
+            # Block on I/O with timeout
+            let io_ready = reactor.poll(timeout_ms as Int)
+            for task_id in io_ready do
+              self.ready_queue.push_back(task_id)
+            end
+          when Option::None then
+            # No I/O reactor — just sleep
+            if timeout_ms > 0 then
+              sleep_ms(timeout_ms)
+            else
+              sleep_ms(1)
+            end
           end
         end
+      end
+    end
+  end
+
+  def check_timers_deterministic(&mut self) -> Unit
+    # Process all expired timers from min-heap root based on virtual time
+    loop do
+      match timer_heap_peek_deadline(&self.timer_heap)
+      when Option::Some(deadline) then
+        if deadline <= self.virtual_time then
+          let entry = timer_heap_pop_min(&mut self.timer_heap).unwrap()
+          self.ready_queue.push_back(entry.task_id)
+        else
+          break
+        end
+      when Option::None then break
       end
     end
   end
@@ -565,15 +666,18 @@ impl Executor
         task_id: task_id,
         executor: self as *mut Executor
       }
-      
+
       mut cx = Context { waker: waker }
-      
+
+      # CAP-44: Integrate with diagnostics for task polling
+      _log_async_event(LogLevel::Trace, "Polling task " + task_id.to_string())
+
       match task.future.poll(&mut cx)
       when Poll::Ready(()) then
         # Task completed
         self.tasks.remove(&task_id)
         self.task_states.insert(task_id, TaskState::Completed)
-        
+
         # Wake any JoinHandle waiters
         match self.join_waiters.remove(&task_id)
         when Option::Some(waiter) then waiter.wake()
@@ -581,6 +685,15 @@ impl Executor
         end
       when Poll::Pending then
         self.task_states.insert(task_id, TaskState::Waiting)
+        
+        # Integration with ctxpacks: capture context if task is stuck or interesting
+        let mut seeds = Vec::new()
+        seeds.push("async::task_pending".to_string())
+        seeds.push("task_id::" + task_id.to_string())
+        match std::ctx::build_pack(seeds, 1000)
+        when Ok(pack) then std::ctx::register_pack(pack)
+        when Err(_) then {}
+        end
       end
     end
   end
@@ -607,6 +720,23 @@ impl Executor
   
   def next_timer_deadline(&self) -> Option[Instant]
     timer_heap_peek_deadline(&self.timer_heap)
+  end
+
+  def set_deterministic(&mut self, seed: u64) -> Unit
+    self.deterministic = true
+    self.seed = seed
+    self.rand_state = seed
+    self.virtual_time = Instant::now() # Base time for virtual clock
+  end
+
+  def rand_u64(&mut self) -> u64
+    # PCG-style simple PRNG for deterministic task ordering
+    let mut x = self.rand_state
+    let count = (x >> 59) as UInt
+    x ^= x >> 18
+    let rot = ((x >> 27) as u32).rotate_right(count as u32)
+    self.rand_state = self.rand_state * 6364136223846793005u64 + 1442695040888963407u64
+    rot as u64
   end
   
   def register_timer(&mut self, deadline: Instant, task_id: UInt) -> Unit

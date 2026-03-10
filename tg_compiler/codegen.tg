@@ -20,12 +20,12 @@ use tg_compiler::mir::{
   MirConstant, MirConstantKind,
   MirBinOp, MirUnOp, CastKind,
   AggregateKind, SwitchTarget, AssertMessage,
-  Place, Projection, LocalId, BlockId, ContractKind
+  Place, Projection, LocalId, BlockId, AstContractKind
 }
 use tg_compiler::asm::{
   CodeBuffer, buf_new, buf_pos, emit8, emit32_le, emit64_le,
   def_label, add_fixup, add_reloc, add_symbol, resolve_fixups, align_to,
-  Arch, OsAbi, TargetTriple, Section, SymBinding, SymKind, AsmSymbol,
+  Arch, OsAbi, AsmTarget, Section, SymBinding, SymKind, AsmSymbol,
   FixupKind, RelocKind, CC,
   X64, x64_code, x64_arg_reg, x64_callee_saved,
   x64_mov_ri, x64_mov_rr, x64_mov_rm, x64_mov_mr,
@@ -43,7 +43,7 @@ use tg_compiler::asm::{
   host_target
 }
 use tg_compiler::object::{ObjectFile, build_object}
-use tg_compiler::linker::{LinkerInput, link_and_write, link}
+use tg_compiler::linker::{LinkerInput, link_executable, perform_link}
 
 # ———————————————————————————————————————————————————————————————
 # Code Generation Context
@@ -78,7 +78,7 @@ struct FnCodegenCtx
 end
 
 struct CodegenCtx
-  target: TargetTriple
+  target: AsmTarget
   text: CodeBuffer
   data: CodeBuffer
   rodata: CodeBuffer
@@ -383,7 +383,7 @@ end
 # Code Generation — Context Creation
 # ———————————————————————————————————————————————————————————————
 
-def codegen_new(target: TargetTriple) -> CodegenCtx
+def codegen_new(target: AsmTarget) -> CodegenCtx
   CodegenCtx {
     target: target,
     text: buf_new(),
@@ -708,7 +708,7 @@ def emit_shr(ctx: &mut CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
   when (PhysReg::X64Reg(xd), PhysReg::X64Reg(xn), PhysReg::X64Reg(xm)) then
     if x64_code(xd) != x64_code(xn) then x64_mov_rr(&mut ctx.text, xd, xn) end
     x64_mov_rr(&mut ctx.text, X64::RCX, xm)
-    x64_sar_rcl(&mut ctx.text, xd)
+    x64_shr_rcl(&mut ctx.text, xd)
   when (PhysReg::A64Reg(ad), PhysReg::A64Reg(an), PhysReg::A64Reg(am)) then
     # ASRV Xd, Xn, Xm
     emit32_le(&mut ctx.text, 0x9AC02800 | (a64_code(am) << 16) | (a64_code(an) << 5) | a64_code(ad))
@@ -879,8 +879,8 @@ def emit_pop(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
   match r
   when PhysReg::X64Reg(xr) then x64_pop(&mut ctx.text, xr)
   when PhysReg::A64Reg(ar) then
-    a64_ldr(&mut ctx.text, ar, A64::SP, 0)
-    a64_add_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+    # ARM64: LDR Xr, [SP], #16  (post-index: load then increment SP by 16)
+    a64_ldr_post(&mut ctx.text, ar, A64::SP, 16)
   end
 end
 
@@ -977,11 +977,11 @@ end
 
 def load_operand(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand, dst: PhysReg) -> Unit
   match op.kind
-  when MirOperandKind::Copy(place) then
+  when MirOperandKind::MirCopy(place) then
     load_place(ctx, fctx, &place, dst)
-  when MirOperandKind::Move(place) then
+  when MirOperandKind::MirMovePlace(place) then
     load_place(ctx, fctx, &place, dst)
-  when MirOperandKind::Constant(cst) then
+  when MirOperandKind::MirConstant(cst) then
     load_constant(ctx, &cst, dst)
   end
 end
@@ -1020,12 +1020,12 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, projs: &Vec[Pro
   let scratch = ret_reg(ctx.target.arch)  # use return reg as scratch for index loads
   for proj in projs do
     match proj
-    when Projection::Deref then
+    when Projection::ProjDeref then
       emit_load_mem(ctx, reg, reg, 0)
-    when Projection::Field(name, idx) then
+    when Projection::ProjField(name, idx) then
       let offset = idx * 8
       emit_load_mem(ctx, reg, reg, offset as i32)
-    when Projection::Index(local_id) then
+    when Projection::ProjIndex(local_id) then
       # Load index value into scratch
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
       # Multiply index by element size (default 8 bytes per element)
@@ -1038,10 +1038,10 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, projs: &Vec[Pro
       # Add scaled offset to base address
       emit_add_rrr(ctx, reg, reg, scratch)
       emit_load_mem(ctx, reg, reg, 0)
-    when Projection::ConstantIndex(i) then
+    when Projection::ProjConstantIndex(i) then
       let offset = i * 8
       emit_load_mem(ctx, reg, reg, offset as i32)
-    when Projection::Downcast(name, disc) then
+    when Projection::ProjDowncast(name, disc) then
       emit_add_ri(ctx, reg, 8)
     end
   end
@@ -1049,17 +1049,17 @@ end
 
 def load_constant(ctx: &mut CodegenCtx, cst: &MirConstant, dst: PhysReg) -> Unit
   match cst.kind
-  when MirConstantKind::Unit then
+  when MirConstantKind::MirUnit then
     emit_zero_reg(ctx, dst)
-  when MirConstantKind::Bool(b) then
+  when MirConstantKind::MirBool(b) then
     if b then
       emit_mov_ri(ctx, dst, 1)
     else
       emit_zero_reg(ctx, dst)
     end
-  when MirConstantKind::Int(i) then
+  when MirConstantKind::MirInt(i) then
     emit_mov_ri(ctx, dst, i as i64)
-  when MirConstantKind::Float(f) then
+  when MirConstantKind::MirFloat(f) then
     # Load float bits into GPR, then move to float reg via stack
     let bits = f.to_bits() as i64
     emit_mov_ri(ctx, dst, bits)
@@ -1067,15 +1067,15 @@ def load_constant(ctx: &mut CodegenCtx, cst: &MirConstant, dst: PhysReg) -> Unit
     let sp = sp_reg(ctx.target.arch)
     emit_store_mem(ctx, sp, -8, dst)
     emit_load_fp_from_stack(ctx, dst, sp, -8)
-  when MirConstantKind::Char(c) then
+  when MirConstantKind::MirChar(c) then
     emit_mov_ri(ctx, dst, c as i64)
-  when MirConstantKind::String(s) then
+  when MirConstantKind::MirString(s) then
     let label = intern_string(ctx, &s)
     emit_lea_label(ctx, dst, label)
-  when MirConstantKind::FnItem(fn_name) then
+  when MirConstantKind::MirFnItem(fn_name) then
     # Load the address of the named function
     emit_lea_label(ctx, dst, fn_name)
-  when MirConstantKind::ZeroSized then
+  when MirConstantKind::MirZeroSized then
     emit_zero_reg(ctx, dst)
   end
 end
@@ -1119,11 +1119,11 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       while i < n - 1 do
         let proj = place.projections[i]
         match proj
-        when Projection::Deref then
+        when Projection::ProjDeref then
           emit_load_mem(ctx, scratch, scratch, 0)
-        when Projection::Field(_, idx) then
+        when Projection::ProjField(_, idx) then
           emit_add_ri(ctx, scratch, (idx * 8) as i32)
-        when Projection::Downcast(_, _) then
+        when Projection::ProjDowncast(_, _) then
           emit_add_ri(ctx, scratch, 8)
         when _ then ()
         end
@@ -1133,10 +1133,10 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       # Last projection determines final store offset
       let last = place.projections[n - 1]
       let store_off: i32 = match last
-      when Projection::Deref then 0
-      when Projection::Field(_, idx) then (idx * 8) as i32
-      when Projection::ConstantIndex(ci) then (ci * 8) as i32
-      when Projection::Downcast(_, _) then 8
+      when Projection::ProjDeref then 0
+      when Projection::ProjField(_, idx) then (idx * 8) as i32
+      when Projection::ProjConstantIndex(ci) then (ci * 8) as i32
+      when Projection::ProjDowncast(_, _) then 8
       when _ then 0
       end
 
@@ -1152,15 +1152,15 @@ end
 # Rvalue code generation
 # ———————————————————————————————————————————————————————————————
 
-def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, dst: PhysReg) -> Unit
+def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, rv: &MirRvalue, dst: PhysReg) -> Unit
   match rv.kind
-  when MirRvalueKind::Use(op) then
+  when MirRvalueKind::MirMove(op) then
     load_operand(ctx, fctx, &op, dst)
 
-  when MirRvalueKind::BinOp(bin_op, left, right) then
+  when MirRvalueKind::MirBinOp(bin_op, left, right) then
     codegen_binop(ctx, fctx, bin_op, &left, &right, dst)
 
-  when MirRvalueKind::UnOp(un_op, operand) then
+  when MirRvalueKind::MirUnOp(un_op, operand) then
     load_operand(ctx, fctx, &operand, dst)
     match un_op
     when MirUnOp::Neg    then emit_neg(ctx, dst)
@@ -1170,23 +1170,23 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
     when MirUnOp::BitNot then emit_not(ctx, dst)
     end
 
-  when MirRvalueKind::Ref(place) then
+  when MirRvalueKind::MirRef(place) then
     codegen_address_of(ctx, fctx, &place, dst)
 
-  when MirRvalueKind::RefMut(place) then
+  when MirRvalueKind::MirRefMut(place) then
     codegen_address_of(ctx, fctx, &place, dst)
 
-  when MirRvalueKind::Aggregate(kind, operands) then
+  when MirRvalueKind::MirAggregate(kind, operands) then
     codegen_aggregate(ctx, fctx, &kind, &operands, dst)
 
-  when MirRvalueKind::Discriminant(place) then
+  when MirRvalueKind::MirDiscriminant(place) then
     load_place(ctx, fctx, &place, dst)
 
-  when MirRvalueKind::Len(place) then
+  when MirRvalueKind::MirLen(place) then
     load_place(ctx, fctx, &place, dst)
     emit_load_mem(ctx, dst, dst, 8)
 
-  when MirRvalueKind::Cast(cast_kind, operand, target_ty) then
+  when MirRvalueKind::MirCast(cast_kind, operand, target_ty) then
     load_operand(ctx, fctx, &operand, dst)
     match cast_kind
     when CastKind::IntToFloat then
@@ -1229,7 +1229,7 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
       panic("codegen_rvalue: unsupported cast kind")
     end
 
-  when MirRvalueKind::Repeat(operand, count) then
+  when MirRvalueKind::MirRepeat(operand, count) then
     # Allocate count * element_size on stack and fill with the value
     let scratch = ret_reg(ctx.target.arch)
     load_operand(ctx, fctx, &operand, scratch)
@@ -1240,7 +1240,7 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, rv: &MirRvalue, ds
       i = i + 1
     end
 
-  when MirRvalueKind::Phi(pairs) then
+  when MirRvalueKind::MirPhi(pairs) then
     # Phi nodes: values already placed by predecessor blocks.
     # Skip — no code generation needed.
     ()
@@ -1286,13 +1286,16 @@ def codegen_binop(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: MirBinOp, left:
   end
 end
 
-def codegen_address_of(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
   let fp = fp_reg(ctx.target.arch)
   match fctx.var_locs.get(place.local.id)
   when Option::Some(loc) then
     match loc
     when VarLoc::Register(r) then
+      # Spill the register-allocated variable to a dedicated temp slot below the frame
+      # Use a stable spill slot that won't conflict with other spills
       let spill_off = fctx.frame.spill_offset - 8
+      fctx.frame.spill_offset = spill_off  # Update to track used spill space
       emit_store_mem(ctx, fp, spill_off, r)
       emit_lea_fp(ctx, dst, spill_off)
     when VarLoc::Stack(offset) then
@@ -1331,20 +1334,20 @@ end
 def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirStatement) -> Unit
   let rr = ret_reg(ctx.target.arch)
   match stmt.kind
-  when MirStatementKind::Assign(place, rvalue) then
+  when MirStatementKind::MirAssign(place, rvalue) then
     # Skip phi assignments — values already placed by predecessor blocks
     match rvalue.kind
-    when MirRvalueKind::Phi(_) then ()
+    when MirRvalueKind::MirPhi(_) then ()
     when _ then
       codegen_rvalue(ctx, fctx, &rvalue, rr)
       store_place(ctx, fctx, &place, rr)
     end
 
-  when MirStatementKind::StorageLive(_) then ()
-  when MirStatementKind::StorageDead(_) then ()
-  when MirStatementKind::Nop then ()
+  when MirStatementKind::MirStorageLive(_) then ()
+  when MirStatementKind::MirStorageDead(_) then ()
+  when MirStatementKind::MirNop then ()
 
-  when MirStatementKind::ContractCheck(contract, cond) then
+  when MirStatementKind::MirContractCheck(contract, cond) then
     load_operand(ctx, fctx, &cond, rr)
     emit_test_rr(ctx, rr, rr)
     let ok_label = ".Lcontract_ok." + ctx.fn_counter.to_string()
@@ -1353,7 +1356,7 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
     emit_trap(ctx)
     def_label(&mut ctx.text, ok_label)
 
-  when MirStatementKind::BudgetConsume(resource, amount) then
+  when MirStatementKind::MirBudgetConsume(resource, amount) then
     # Decrement the resource budget counter in the thread-local budget table
     # Format: load current budget, subtract amount, store back, trap if negative
     let scratch = scratch_reg(ctx.target.arch)
@@ -1383,7 +1386,7 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirState
     emit_trap(ctx)
     def_label(&mut ctx.text, ok_label)
 
-  when MirStatementKind::EffectRecord(name, operand) then
+  when MirStatementKind::MirEffectRecord(name, operand) then
     # Record an effect by pushing it to the effect log
     # Call __tg_effect_record(name_ptr, value)
     let scratch = scratch_reg(ctx.target.arch)
@@ -1416,11 +1419,11 @@ end
 def codegen_terminator(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, term: &MirTerminator) -> Unit
   let rr = ret_reg(ctx.target.arch)
   match term.kind
-  when MirTerminatorKind::Goto(target) then
+  when MirTerminatorKind::MirGoto(target) then
     let label = fctx.block_labels.get(target.id).unwrap()
     emit_jmp(ctx, label)
 
-  when MirTerminatorKind::SwitchInt(discr, targets, default_target) then
+  when MirTerminatorKind::MirSwitchInt(discr, targets, default_target) then
     load_operand(ctx, fctx, &discr, rr)
     for sw in targets do
       emit_cmp_ri(ctx, rr, sw.value as i32)
@@ -1430,20 +1433,20 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, term: &MirTerm
     let def_label = fctx.block_labels.get(default_target.id).unwrap()
     emit_jmp(ctx, def_label)
 
-  when MirTerminatorKind::Return then
+  when MirTerminatorKind::MirReturn then
     codegen_epilogue(ctx, fctx)
 
-  when MirTerminatorKind::Unreachable then
+  when MirTerminatorKind::MirUnreachable then
     emit_trap(ctx)
 
-  when MirTerminatorKind::Call(dest, callee, args, success, unwind) then
+  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
     codegen_call(ctx, fctx, &dest, &callee, &args, success, &unwind)
 
-  when MirTerminatorKind::Drop(place, target, unwind) then
+  when MirTerminatorKind::MirDrop(place, target, unwind) then
     let label = fctx.block_labels.get(target.id).unwrap()
     emit_jmp(ctx, label)
 
-  when MirTerminatorKind::Assert(cond, expected, msg, target, unwind) then
+  when MirTerminatorKind::MirAssert(cond, expected, msg, target, unwind) then
     load_operand(ctx, fctx, &cond, rr)
     emit_test_rr(ctx, rr, rr)
     let ck = if expected then CondKind::Ne else CondKind::Eq end
@@ -1451,12 +1454,12 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, term: &MirTerm
     emit_jcc(ctx, ck, tgt_label)
     emit_trap(ctx)
 
-  when MirTerminatorKind::Yield(value, resume) then
+  when MirTerminatorKind::MirYield(value, resume) then
     load_operand(ctx, fctx, &value, rr)
     let label = fctx.block_labels.get(resume.id).unwrap()
     emit_jmp(ctx, label)
 
-  when MirTerminatorKind::Abort then
+  when MirTerminatorKind::MirAbort then
     emit_trap(ctx)
   when _ then
     panic("codegen_terminator: unsupported MIR terminator kind")
@@ -1488,12 +1491,12 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
 
   # Call the function
   match callee.kind
-  when MirOperandKind::Constant(cst) then
+  when MirOperandKind::MirConstant(cst) then
     match cst.kind
-    when MirConstantKind::FnItem(fn_name) then
+    when MirConstantKind::MirFnItem(fn_name) then
       # Direct call to named function
       emit_call_extern(ctx, fn_name)
-    when MirConstantKind::ZeroSized then
+    when MirConstantKind::MirZeroSized then
       match cst.ty
       when Type::Function(_, _) then
         # ZeroSized function type — extract name from mangled type if possible
@@ -1505,10 +1508,10 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
     when _ then
       emit_trap(ctx)
     end
-  when MirOperandKind::Copy(place) then
+  when MirOperandKind::MirCopy(place) then
     load_place(ctx, fctx, &place, rr)
     emit_call_r(ctx, rr)
-  when MirOperandKind::Move(place) then
+  when MirOperandKind::MirMovePlace(place) then
     load_place(ctx, fctx, &place, rr)
     emit_call_r(ctx, rr)
   end
@@ -1781,11 +1784,11 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
     def_label(&mut ctx.data, st.name.clone())
 
     match op.kind
-    when MirOperandKind::Constant(cst) then
+    when MirOperandKind::MirConstant(cst) then
       match cst.kind
-      when MirConstantKind::Int(v) then
+      when MirConstantKind::MirInt(v) then
         emit64_le(&mut ctx.data, v as u64)
-      when MirConstantKind::Bool(b) then
+      when MirConstantKind::MirBool(b) then
         if b then emit8(&mut ctx.data, 1) else emit8(&mut ctx.data, 0) end
         # Pad to alignment
         mut pad = sz - 1
@@ -1854,7 +1857,7 @@ end
 # Public API — Full pipeline: MIR → native binary
 # ———————————————————————————————————————————————————————————————
 
-def generate_native(program: &MirProgram, target: TargetTriple) -> Vec[u8]
+def generate_native(program: &MirProgram, target: AsmTarget) -> Vec[u8]
   mut ctx = codegen_new(target)
   codegen_program(&mut ctx, program)
 
@@ -1878,7 +1881,7 @@ def generate_native(program: &MirProgram, target: TargetTriple) -> Vec[u8]
   build_object(&obj)
 end
 
-def generate_executable(program: &MirProgram, target: TargetTriple, output_path: String) -> Result[Unit, String]
+def generate_executable(program: &MirProgram, target: AsmTarget, output_path: String) -> Result[Unit, String]
   mut ctx = codegen_new(target.clone())
   codegen_program(&mut ctx, program)
 
@@ -1915,10 +1918,10 @@ def generate_executable(program: &MirProgram, target: TargetTriple, output_path:
     target: target
   }
 
-  link_and_write(&input)
+  link_executable(&input)
 end
 
-def generate_object_file(program: &MirProgram, target: TargetTriple) -> Vec[u8]
+def generate_object_file(program: &MirProgram, target: AsmTarget) -> Vec[u8]
   generate_native(program, target)
 end
 
@@ -1926,7 +1929,7 @@ end
 # Host target detection
 # ———————————————————————————————————————————————————————————————
 
-def detect_host_target() -> TargetTriple
+def detect_host_target() -> AsmTarget
   # Delegate to the canonical host_target() in asm module
   # which checks TG_HOST_TARGET, HOSTTYPE, OSTYPE, and
   # PROCESSOR_ARCHITECTURE env vars with proper fallback.

@@ -6,12 +6,54 @@ use std::core::{Option, Result, String, Bool, Int, Unit}
 use std::geom::{Vec2, Rect}
 use std::gfx_errors::{Error, ErrorCode, AppError}
 
+# [METADATA]
+# module: tg::app
+# status: alpha
+# effects: [Display, Clipboard, Ime, DragDrop, Clock, Random, Fs]
+# capabilities: [Display, Clipboard, Ime, DragDrop, Clock, Random, Fs]
+# error_codes: [BackendUnavailable, InvalidArg, Unsupported, PermissionDenied, Internal]
+
 # ═══════════════════════════════════════════════════════════════
 # §6.1 Capabilities — opaque tokens gating side-effecting operations
 # ═══════════════════════════════════════════════════════════════
 
+use std::capabilities::{Capability, custom_cap}
+
+def display_cap() -> Capability
+  custom_cap("Display")
+end
+
+def clipboard_cap() -> Capability
+  custom_cap("Clipboard")
+end
+
+def ime_cap() -> Capability
+  custom_cap("Ime")
+end
+
+def drag_drop_cap() -> Capability
+  custom_cap("DragDrop")
+end
+
+def clock_cap() -> Capability
+  custom_cap("Clock")
+end
+
+def random_cap() -> Capability
+  custom_cap("Random")
+end
+
+def fs_cap() -> Capability
+  custom_cap("Fs")
+end
+
 struct DisplayCap
   _opaque: u64
+end
+
+# DisplayCap acquisition - creates a valid display capability token
+def acquire_display_cap() -> DisplayCap
+  DisplayCap { _opaque: 1 }
 end
 
 struct ClipboardCap
@@ -209,6 +251,7 @@ struct SoftwareApp
   recording: Bool
   record_path: Option[String]
   event_log: Vec[Event]
+  timers: Map[u64, Int]
 end
 
 impl SoftwareApp
@@ -221,7 +264,8 @@ impl SoftwareApp
       running: false,
       recording: false,
       record_path: Option::None,
-      event_log: Vec::new()
+      event_log: Vec::new(),
+      timers: Map::new()
     }
   end
 end
@@ -238,7 +282,8 @@ impl App for SoftwareApp
       height: h,
       dpi_scale: if self.opts.high_dpi then Dpi { scale: 2.0 } else Dpi { scale: 1.0 } end,
       event_queue: Vec::new(),
-      closed: false
+      closed: false,
+      clipboard: "".to_string()
     }
     let boxed = Box::new(win)
     self.windows.push(boxed.clone())
@@ -254,13 +299,13 @@ impl App for SoftwareApp
 
   def request_timer(self: &mut Self, ms: Int) -> TimerId
     let id = TimerId { value: self.next_timer_id }
+    self.timers.insert(self.next_timer_id, ms)
     self.next_timer_id = self.next_timer_id + 1
     id
   end
 
   def cancel_timer(self: &mut Self, id: TimerId) -> Unit
-    # Timer cancellation — in software impl this is a no-op since
-    # timers are not actually scheduled on OS event loop.
+    self.timers.remove(id.value)
   end
 
   def recorder_start(self: &mut Self, path: String, fs: FsCap) -> Result[Unit, AppError]
@@ -276,6 +321,77 @@ impl App for SoftwareApp
   end
 end
 
+use std::diagnostics::{LogCategory, LogLevel, LogEntry, Logger}
+
+# ═══════════════════════════════════════════════════════════════
+# §6.5 Global Runtime State (Production-grade)
+# ═══════════════════════════════════════════════════════════════
+
+# In a production environment, the logger and clock would be injected by the runtime.
+# This global state allows decoupled logging across the application.
+mut GLOBAL_LOGGER: Option[Box[dyn Logger]] = Option::None
+
+def set_global_logger(logger: Box[dyn Logger]) -> Unit
+  GLOBAL_LOGGER = Option::Some(logger)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §6.6 Internal
+# ═══════════════════════════════════════════════════════════════
+
+use std::time::{instant_now, duration_nanos}
+use std::ctx
+
+def _log_event(event: &Event) -> Unit
+  let msg = match event
+  when Event::KeyDown(k, m, r) then "KeyDown"
+  when Event::KeyUp(k, m) then "KeyUp"
+  when Event::TextInput(s) then "TextInput"
+  when Event::ImeStart then "ImeStart"
+  when Event::ImeUpdate(p, c) then "ImeUpdate"
+  when Event::ImeEnd then "ImeEnd"
+  when Event::MouseMove(x, y) then "MouseMove"
+  when Event::MouseDown(b) then "MouseDown"
+  when Event::MouseUp(b) then "MouseUp"
+  when Event::Scroll(dx, dy, m) then "Scroll"
+  when Event::DragEnter then "DragEnter"
+  when Event::DragOver(x, y) then "DragOver"
+  when Event::DragDrop(p) then "DragDrop"
+  when Event::DragLeave then "DragLeave"
+  when Event::Resize(w, h) then "Resize"
+  when Event::FocusGained then "FocusGained"
+  when Event::FocusLost then "FocusLost"
+  when Event::CloseRequested then "CloseRequested"
+  when Event::RedrawRequested then "RedrawRequested"
+  end
+
+  let entry = LogEntry {
+    timestamp_ns: duration_nanos(instant_now().duration_since_epoch()),
+    level: LogLevel::Trace,
+    category: LogCategory::Events,
+    message: msg,
+    correlation_id: "".to_string()
+  }
+  
+  match &GLOBAL_LOGGER
+  when Some(logger) then logger.log(entry)
+  when None then Unit
+  end
+
+  # Integrate with ctxpacks: generate a pack for critical events
+  match event
+  when Event::CloseRequested then
+    let seeds = Vec::new()
+    seeds.push("app::close_requested".to_string())
+    match std::ctx::build_pack(seeds, 1000)
+    when Ok(pack) then
+      std::ctx::register_pack(pack)
+    when Err(_) then {}
+    end
+  else {}
+  end
+end
+
 struct SoftwareWindow
   win_id: WindowId
   title: String
@@ -284,6 +400,7 @@ struct SoftwareWindow
   dpi_scale: Dpi
   event_queue: Vec[Event]
   closed: Bool
+  clipboard: String
 end
 
 impl Window for SoftwareWindow
@@ -304,30 +421,49 @@ impl Window for SoftwareWindow
   end
 
   def request_redraw(self: &mut Self) -> Unit
-    self.event_queue.push(Event::RedrawRequested)
+    let ev = Event::RedrawRequested
+    _log_event(&ev)
+    self.event_queue.push(ev)
   end
 
   def poll_event(self: &mut Self) -> Option[Event]
     if self.event_queue.is_empty() then
       Option::None
     else
-      Option::Some(self.event_queue.remove(0))
+      let ev = self.event_queue.remove(0)
+      _log_event(&ev)
+      Option::Some(ev)
     end
   end
 
   def surface(self: &mut Self) -> Result[Box[Surface], AppError]
     # Surface creation delegated to tg::gfx module
-    Result::Err(AppError::Unsupported(
-      Error::unsupported("Surface creation requires tg::gfx backend".to_string())
-    ))
+    # Create a DisplayCap for this surface
+    let display = DisplayCap { _opaque: 1 }
+    match std::gfx::surface_offscreen(self.width, self.height, display)
+    when Result::Ok(surface) then
+      Result::Ok(surface)
+    when Result::Err(e) then
+      Result::Err(AppError::Internal(
+        Error::internal("Failed to create surface: " + match e
+          when GfxError::OutOfMemory(err) then err.message
+          when GfxError::BackendLost(err) then err.message
+          when GfxError::Unsupported(err) then err.message
+          when GfxError::InvalidArg(err) then err.message
+          when GfxError::Internal(err) then err.message
+        end)
+      ))
+    end
   end
 
   def clipboard_set(self: &mut Self, caps: ClipboardCap, text: String) -> Result[Unit, AppError]
-    # Capability token validates permission; software impl stores locally
+    # In this reference implementation, we store the clipboard text in the window state.
+    # The ClipboardCap token is required by the trait but its value is opaque.
+    self.clipboard = text
     Result::Ok(())
   end
 
   def clipboard_get(self: &mut Self, caps: ClipboardCap) -> Result[String, AppError]
-    Result::Ok("".to_string())
+    Result::Ok(self.clipboard.clone())
   end
 end

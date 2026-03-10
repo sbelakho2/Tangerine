@@ -1,16 +1,5 @@
-# Tangerine stage0 (clean rebuild)
+# Stage0
 
-This stage0 is a clean, resilient bootstrap frontend focused on:
-- robust lexing for Tangerine syntax,
-- structural parsing/validation (blocks and delimiters),
-- consistent diagnostics,
-- stable CLI commands for tooling pipelines.
+This is the clean-slate OCaml bootstrap root for Tangerine.
 
-## Commands
-
-- `main.exe help`
-- `main.exe lex <file>`
-- `main.exe parse <file>`
-- `main.exe compile <file...>`
-
-`compile` currently validates input files and reports structural syntax diagnostics.
+This stage0 restores the repository bootstrap root after a clean-slate reset. It is intentionally C-free.

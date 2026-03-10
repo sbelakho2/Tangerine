@@ -9,7 +9,7 @@ extern "C"
   def system(cmd: Ptr[u8]) -> Int
   def getpid() -> Int
   def waitpid(pid: Int, status: Ptr[Int], options: Int) -> Int
-  def kill(pid: Int, sig: Int) -> Int
+  def c_kill(pid: Int, sig: Int) -> Int
 end
 
 def WNOHANG() -> Int = 1
@@ -181,17 +181,31 @@ impl Child
     ExitStatus { code: code, success: code == 0 }
   end
 
-  def kill(self: &mut Self) -> Result[Unit, String]
-    if self.pid > 0 then
-      let rc = unsafe "FFI boundary" do kill(self.pid, SIGTERM()) end
-      if rc < 0 then
-        return Result::Err("failed to send SIGTERM".to_string())
-      end
+end
+
+def child_terminate(child: &mut Child) -> Result[Unit, String]
+  if child.pid > 0 then
+    let rc = unsafe "FFI boundary" do c_kill(child.pid, SIGTERM()) end
+    if rc < 0 then
+      return Result::Err("failed to send SIGTERM".to_string())
     end
-    self.exited = true
-    self.status_code = Option::Some(143)
-    Result::Ok(())
   end
+  child.exited = true
+  child.status_code = Option::Some(143)
+  Result::Ok(())
+end
+
+def run(program: &str, args: &[&str]) -> Result[Output, String]
+  let mut cmd = Command {
+    program: program.to_string(),
+    args: Vec::new(),
+    cwd: Option::None,
+    env_overrides: Vec::new(),
+  }
+  for arg in args do
+    cmd.args.push(arg.to_string())
+  end
+  cmd.output()
 end
 
 def current_exe() -> Result[String, String]
@@ -511,7 +525,7 @@ impl PipedChild
       self.stdin = Option::None  ## Close by dropping
       Result::Ok(())
     else
-      Result::Err(OsError::new("stdin not piped"))
+      Result::Err(OsError::from_errno())
     end
   end
 
@@ -527,7 +541,7 @@ impl PipedChild
       end
       Result::Ok(buf)
     else
-      Result::Err(OsError::new("stdout not piped"))
+      Result::Err(OsError::from_errno())
     end
   end
 
@@ -543,19 +557,14 @@ impl PipedChild
       end
       Result::Ok(buf)
     else
-      Result::Err(OsError::new("stderr not piped"))
+      Result::Err(OsError::from_errno())
     end
   end
 
   ## Send a signal to the child
   def signal(self: &PipedChild, sig: Int) -> Result[Unit, OsError]
-    let ret = kill(self.pid, sig)
+    let ret = c_kill(self.pid, sig)
     if ret < 0 then Result::Err(OsError::from_errno()) else Result::Ok(()) end
-  end
-
-  ## Kill the child (SIGKILL)
-  def kill(self: &PipedChild) -> Result[Unit, OsError]
-    self.signal(9)
   end
 
   ## Check if child has exited (non-blocking)
@@ -570,6 +579,11 @@ impl PipedChild
       Result::Ok(Option::Some(exit_status_from_raw(status)))
     end
   end
+
+end
+
+def piped_child_terminate(child: &PipedChild) -> Result[Unit, OsError]
+  child.signal(9)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -651,8 +665,8 @@ impl SignalForwarder
   def install(self: &SignalForwarder) -> Result[Unit, OsError]
     for sig in &self.signals do
       let child = self.child_pid
-      signal_trap(*sig, move || {
-        kill(child, *sig)
+      signal_trap(*sig, || {
+        let _ = c_kill(child, *sig)
       })?
     end
     Result::Ok(())
@@ -690,17 +704,27 @@ impl EnvBuilder
 
   ## Add a path component to PATH
   def prepend_path(self: &mut EnvBuilder, dir: &str) -> &mut EnvBuilder
-    let current = self.vars.get(&"PATH".to_string())
-      .cloned()
-      .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    let current = match self.vars.get(&"PATH".to_string())
+    when Option::Some(value) then value.clone()
+    when Option::None then
+      match std::env::var("PATH")
+      when Option::Some(value) then value
+      when Option::None then "".to_string()
+      end
+    end
     self.vars.insert("PATH".to_string(), dir.to_string() + ":" + &current)
     self
   end
 
   def append_path(self: &mut EnvBuilder, dir: &str) -> &mut EnvBuilder
-    let current = self.vars.get(&"PATH".to_string())
-      .cloned()
-      .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    let current = match self.vars.get(&"PATH".to_string())
+    when Option::Some(value) then value.clone()
+    when Option::None then
+      match std::env::var("PATH")
+      when Option::Some(value) then value
+      when Option::None then "".to_string()
+      end
+    end
     self.vars.insert("PATH".to_string(), current + ":" + dir)
     self
   end
@@ -772,7 +796,7 @@ impl Pipeline
   ## Execute the pipeline, return output of last command
   def execute(self: &Pipeline) -> Result[Output, OsError]
     if self.commands.is_empty() then
-      return Result::Err(OsError::new("empty pipeline"))
+      return Result::Err(OsError::from_errno())
     end
 
     if self.commands.len() == 1 then
@@ -828,8 +852,14 @@ impl Pipeline
 
     ## Collect output from last command
     let last = &mut children[n - 1]
-    let stdout_data = last.read_stdout().unwrap_or_default()
-    let stderr_data = last.read_stderr().unwrap_or_default()
+    let stdout_data = match last.read_stdout()
+    when Result::Ok(data) then data
+    when Result::Err(_) then Vec::new()
+    end
+    let stderr_data = match last.read_stderr()
+    when Result::Ok(data) then data
+    when Result::Err(_) then Vec::new()
+    end
 
     ## Wait for all children
     let mut final_status = ExitStatus { code: 0 }
@@ -897,8 +927,7 @@ end
 def cstring_to_string(ptr: *const u8) -> String
   let mut len = 0
   while unsafe { *ptr.add(len) } != 0 do len = len + 1 end
-  let slice = unsafe { core::slice::from_raw_parts(ptr, len) }
-  String::from_utf8_lossy(slice).to_string()
+  String::from_raw_parts(ptr, len)
 end
 
 ## Exit the current process with a status code
