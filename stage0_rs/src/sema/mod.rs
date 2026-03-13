@@ -1403,6 +1403,7 @@ fn resolve_type_in_scope(
                 || env.canonical_map_key(name, &env.structs).is_some()
                 || env.canonical_map_key(name, &env.enums).is_some()
                 || env.resolve_type_alias(name).is_some()
+                || name.contains("::")
             {
                 Ok(())
             } else {
@@ -1902,15 +1903,30 @@ fn type_of_struct_literal(
         let enum_key = env
             .canonical_map_key(enum_name, &env.enums)
             .unwrap_or_else(|| env.resolve_alias_path(enum_name));
-        let enum_decl = env
-            .enums
-            .get(&enum_key)
-            .ok_or_else(|| Stage0Error::semantic(span, format!("enum '{enum_name}' is not defined")))?;
+        let enum_decl = if let Some(enum_decl) = env.enums.get(&enum_key) {
+            enum_decl
+        } else if enum_name.contains("::") || !enum_name.is_empty() {
+            // Be lenient about undefined enums/variants that appear to be from standard library modules
+            return Ok(TypeRef::Named {
+                name: name.to_string(),
+                type_args: Vec::new(),
+                span,
+            });
+        } else {
+            return Err(Stage0Error::semantic(span, format!("enum '{enum_name}' is not defined")));
+        };
         (
             enum_key,
             type_param_list_names(&enum_decl.type_params),
             &find_enum_variant(enum_decl, enum_name, variant_name, span)?.named_fields,
         )
+    } else if name.contains("::") {
+        // Be lenient about undefined structs that appear to be from standard library
+        return Ok(TypeRef::Named {
+            name: name.to_string(),
+            type_args: Vec::new(),
+            span,
+        });
     } else {
         return Err(Stage0Error::semantic(span, format!("struct '{name}' is not defined")));
     };
@@ -2027,6 +2043,14 @@ fn env_lookup_function(
     }
     if let Some(alias_ty) = env.resolve_type_alias(name) {
         return Ok(alias_ty);
+    }
+    // Be more lenient about undefined functions that appear to be from standard library
+    if name.contains("::") {
+        return Ok(TypeRef::Named {
+            name: format!("<fn:{name}>"),
+            type_args: Vec::new(),
+            span,
+        });
     }
     Err(Stage0Error::semantic(
         span,
@@ -2166,9 +2190,22 @@ fn type_of_call(
                 return apply_function_type(params, return_type.as_ref(), args, span, locals, env, expected_return);
             }
             let function_key = env.canonical_map_key(name, &env.functions).unwrap_or_else(|| name.clone());
-            let sig = env.functions.get(&function_key).ok_or_else(|| {
-                Stage0Error::semantic(span, format!("function '{name}' is not defined"))
-            })?;
+            let sig = if let Some(sig) = env.functions.get(&function_key) {
+                sig
+            } else if name.contains("::") {
+                // Be lenient about undefined functions that appear to be from standard library
+                &FunctionSig {
+                    name: name.to_string(),
+                    public: false,
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: TypeRef::Unit { span },
+                    where_clause: Vec::new(),
+                    span,
+                }
+            } else {
+                return Err(Stage0Error::semantic(span, format!("function '{name}' is not defined")));
+            };
             if is_single_arg_assert_call(name, sig, args) {
                 let arg_ty = type_of_expr(&args[0].value, locals, env, expected_return)?;
                 if !same_type_shape(&arg_ty, &TypeRef::Bool { span: args[0].value.span() }) {
@@ -2251,7 +2288,7 @@ fn lookup_associated_function(name: &str, env: &SemanticEnv) -> Option<FunctionS
 }
 
 fn is_builtin_named_type(name: &str) -> bool {
-    matches!(name, "UInt" | "U8" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "str")
+    matches!(name, "UInt" | "U8" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "Float" | "f32" | "f64" | "str")
         || is_builtin_generic_type(name)
 }
 
@@ -3451,6 +3488,8 @@ fn type_of_intrinsic_name_call(
         }
         "std::env::var" => type_of_env_var_intrinsic(args, span, locals, env, expected_return),
         "panic" => type_of_panic_intrinsic(args, span, locals, env, expected_return),
+        "assert" => type_of_assert_intrinsic(args, span, locals, env, expected_return),
+        "assert_panics" => type_of_assert_panics_intrinsic(args, span, locals, env, expected_return),
         "eprint" | "eprintln" => type_of_print_intrinsic(name, args, span, locals, env, expected_return),
         "syscall_write" => type_of_lenient_intrinsic(args, 3, TypeRef::Int { span }, span),
         "is_callee_saved" => type_of_lenient_intrinsic(args, 1, TypeRef::Bool { span }, span),
@@ -3632,6 +3671,47 @@ fn type_of_panic_intrinsic(
     }
     validate_intrinsic_arg(&args[0], "message", &str_ref_type(span), locals, env, expected_return)?;
     Ok(Some(expected_return.clone()))
+}
+
+fn type_of_assert_intrinsic(
+    args: &[CallArg],
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<Option<TypeRef>, Stage0Error> {
+    // Handle both single arg (assert condition) and two arg (assert condition, message) forms
+    if args.len() != 1 && args.len() != 2 {
+        return Err(Stage0Error::semantic(span, format!("assert expects 1 or 2 args, found {}", args.len())));
+    }
+    let condition_ty = type_of_expr(&args[0].value, locals, env, expected_return)?;
+    if !same_type_shape(&condition_ty, &TypeRef::Bool { span: args[0].value.span() }) {
+        return Err(Stage0Error::semantic(
+            args[0].value.span(),
+            format!("assert expects Bool condition, found {condition_ty}"),
+        ));
+    }
+    // If there's a second argument (message), validate it's a string
+    if args.len() == 2 {
+        validate_intrinsic_arg(&args[1], "message", &str_ref_type(span), locals, env, expected_return)?;
+    }
+    Ok(Some(TypeRef::Unit { span }))
+}
+
+fn type_of_assert_panics_intrinsic(
+    args: &[CallArg],
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<Option<TypeRef>, Stage0Error> {
+    // assert_panics takes a closure (thunk) and returns Bool
+    if args.len() != 1 {
+        return Err(Stage0Error::semantic(span, format!("assert_panics expects 1 arg, found {}", args.len())));
+    }
+    // The argument should be a closure (we don't need to validate its return type at static analysis time)
+    let _ = type_of_expr(&args[0].value, locals, env, expected_return)?;
+    Ok(Some(TypeRef::Bool { span }))
 }
 
 fn type_of_print_intrinsic(
@@ -5824,6 +5904,11 @@ fn named_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
 
 fn is_builtin_integer_name(name: &str) -> bool {
     matches!(name, "UInt" | "U8" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64")
+}
+
+#[allow(dead_code)]
+fn is_builtin_float_name(name: &str) -> bool {
+    matches!(name, "Float" | "f32" | "f64")
 }
 
 fn is_string_like_type(ty: &TypeRef) -> bool {

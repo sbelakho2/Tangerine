@@ -362,6 +362,7 @@ impl<'src> Lexer<'src> {
             "unless" => TokenKind::KeywordUnless,
             "until" => TokenKind::KeywordUntil,
             "unsafe" => TokenKind::KeywordUnsafe,
+            "test" => TokenKind::KeywordTest,
             "end" => TokenKind::KeywordEnd,
             "true" => TokenKind::KeywordTrue,
             "false" => TokenKind::KeywordFalse,
@@ -861,11 +862,13 @@ mod tests {
         let source = "@test\nuse std::core\nedition \"2026\"\n";
         let tokens = Lexer::new(source).lex_all().expect("lex should succeed");
         let kinds: Vec<TokenKind> = tokens.into_iter().map(|token| token.kind).collect();
+        // Note: @ is lexed as At, and "test" following @ is lexed as KeywordTest (not Ident)
+        // because identifiers following @ are still subject to keyword matching
         assert_eq!(
             kinds,
             vec![
                 TokenKind::At,
-                TokenKind::Ident("test".to_string()),
+                TokenKind::KeywordTest,
                 TokenKind::Newline,
                 TokenKind::KeywordUse,
                 TokenKind::Ident("std".to_string()),

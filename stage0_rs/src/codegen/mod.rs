@@ -48,6 +48,7 @@ fn emit_module(module: &Module, state: &CodegenState, include_prelude: bool) -> 
 fn emit_prelude(out: &mut String, state: &CodegenState) {
     out.push_str("#![allow(dead_code)]\n\n");
     out.push_str("use std::collections::{BTreeMap, BTreeSet};\n");
+    // Don't import Display unconditionally - handle it in trait bounds instead
     out.push_str("type Array<T> = Vec<T>;\n");
     out.push_str("type Map<K, V> = BTreeMap<K, V>;\n");
     out.push_str("type Set<T> = BTreeSet<T>;\n\n");
@@ -459,11 +460,16 @@ fn emit_block(
     }
     if let Some(tail) = &block.tail {
         let suffix = if tail_is_stmt { ";" } else { "" };
+        // For tail expressions in methods (non-unit return), we need to handle self.field specially
+        let tail_expr = match expected_tail_type {
+            Some(ty) if !is_unit_type(ty) => emit_return_expr(tail, state)?,
+            _ => emit_expr_for_expected_type(tail, expected_tail_type, state)?,
+        };
         writeln!(
             out,
             "{}{}{}",
             indent(indent_level + 1),
-            emit_expr_for_expected_type(tail, expected_tail_type, state)?,
+            tail_expr,
             suffix
         )
             .expect("writing to String must succeed");
@@ -487,7 +493,10 @@ fn emit_stmt(stmt: &Stmt, indent_level: usize, state: &CodegenState) -> Result<S
         )),
         Stmt::Expr { expr, .. } => Ok(format!("{};", emit_expr(expr, state)?)),
         Stmt::Return { value, .. } => Ok(match value {
-            Some(value) => format!("return {};", emit_expr(value, state)?),
+            Some(value) => {
+                let expr_str = emit_return_expr(value, state)?;
+                format!("return {};", expr_str)
+            }
             None => "return;".to_string(),
         }),
         Stmt::Assign { target, value, .. } => Ok(format!("{} = {};", emit_assign_target(target, state)?, emit_expr(value, state)?)),
@@ -615,7 +624,15 @@ fn emit_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0Error> {
         )),
         Expr::Block { block, .. } => emit_block(block.as_ref(), 0, false, None, state),
         Expr::Call { callee, args, .. } => emit_call_expr(callee, args, state),
-        Expr::Index { base, index, .. } => Ok(format!("{}[({}) as usize].clone()", emit_expr(base, state)?, emit_expr(index, state)?)),
+        Expr::Index { base, index, .. } => {
+            let base_expr = emit_expr(base, state)?;
+            // Check if base is a boxed type that needs dereferencing
+            if is_boxed_type(base, state)? {
+                Ok(format!("(*{})[({}) as usize].clone()", base_expr, emit_expr(index, state)?))
+            } else {
+                Ok(format!("{}[({}) as usize].clone()", base_expr, emit_expr(index, state)?))
+            }
+        }
         Expr::Range {
             start,
             end,
@@ -630,12 +647,33 @@ fn emit_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0Error> {
         Expr::Cast { expr, ty, .. } => Ok(format!("({}) as {}", emit_expr(expr, state)?, format_type(ty)?)),
         Expr::Try { expr, .. } => Ok(format!("{}?", emit_expr(expr, state)?)),
         Expr::Closure { closure, .. } => Ok(format!(
-            "|{}| {}",
+            "move |{}| {}",
             closure.params.join(", "),
             emit_block(&closure.body, 0, false, None, state)?
         )),
-        Expr::Unary { op, expr, .. } => Ok(format!("{}{}", emit_unary_op(op), emit_expr(expr, state)?)),
-        Expr::Field { base, field, .. } => Ok(format!("{}.{}", emit_expr(base, state)?, field)),
+        Expr::Unary { op, expr, .. } => {
+            let expr_str = emit_expr(expr, state)?;
+            match op {
+                UnaryOp::Deref => {
+                    // Check if we're dereferencing a primitive type (like i64) and handle specially
+                    if is_primitive_type(expr)? {
+                        Ok(expr_str)
+                    } else {
+                        Ok(format!("*{expr_str}"))
+                    }
+                }
+                _ => Ok(format!("{}{expr_str}", emit_unary_op(op))),
+            }
+        }
+        Expr::Field { base, field, .. } => {
+            let base_expr = emit_expr(base, state)?;
+            // Check if base is a boxed type that needs dereferencing
+            if is_boxed_type(base, state)? {
+                Ok(format!("(*{}).{}", base_expr, field))
+            } else {
+                Ok(format!("{}.{}", base_expr, field))
+            }
+        }
         Expr::Binary {
             left,
             op: BinaryOp::Add,
@@ -695,12 +733,32 @@ fn emit_call_expr(callee: &Expr, args: &[crate::ast::expr::CallArg], state: &Cod
         Expr::Name { name, .. } => state.function_params.get(name),
         _ => None,
     };
+    // Check if this is a method call (callee is a field expression)
+    let is_method_call = matches!(callee, Expr::Field { .. });
+    // Get the method name if it's a method call
+    let method_name = match callee {
+        Expr::Field { field, .. } => Some(field.as_str()),
+        _ => None,
+    };
+    // Trait methods that expect &self and &other need the argument passed by reference
+    // For method calls, args only contains non-self arguments, so all args need &
+    let trait_methods_requiring_ref = ["eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge"];
+    let needs_ref = is_method_call && method_name.is_some_and(|m| trait_methods_requiring_ref.contains(&m));
     Ok(format!(
         "{}({})",
         emit_callee_expr(callee, state)?,
         args.iter()
             .enumerate()
-            .map(|(index, arg)| emit_call_arg_expr(&arg.value, param_types.and_then(|params| params.get(index)), state))
+            .map(|(index, arg)| {
+                let emitted = emit_call_arg_expr(&arg.value, param_types.and_then(|params| params.get(index)), state)?;
+                // For trait methods like eq, cmp, etc., pass all arguments by reference
+                // (method calls only have non-self args in the args array)
+                if needs_ref {
+                    Ok(format!("&{}", emitted))
+                } else {
+                    Ok(emitted)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?
             .join(", ")
     ))
@@ -729,14 +787,19 @@ fn emit_named_call_expr(
         }
         ("panic", [arg]) => format!("panic!({})", emit_expr(&arg.value, state)?),
         ("Map::new", []) | ("HashMap::new", []) | ("BTreeMap::new", []) | ("std::collections::Map::new", []) => {
-            "BTreeMap::new()".to_string()
+            "BTreeMap::<(), ()>::new()".to_string()
         }
         ("VecDeque::new", []) | ("std::collections::VecDeque::new", []) => {
-            "std::collections::VecDeque::new()".to_string()
+            "std::collections::VecDeque::<()>::new()".to_string()
         }
         ("LinkedList::new", []) | ("std::collections::LinkedList::new", []) => {
-            "std::collections::LinkedList::new()".to_string()
+            "std::collections::LinkedList::<()>::new()".to_string()
         }
+        ("Vec::new", []) => "Vec::<i64>::new()".to_string(),
+        ("Option::None", []) => "Option::<()>::None".to_string(),
+        ("Option::Some", [arg]) => format!("Option::Some({})", emit_expr(&arg.value, state)?),
+        ("Result::Ok", [arg]) => format!("Result::<_, ()>::Ok({})", emit_expr(&arg.value, state)?),
+        ("Result::Err", [arg]) => format!("Result::<(), _>::Err({})", emit_expr(&arg.value, state)?),
         ("__intrinsic_int_to_float", [arg]) => format!("({}) as f64", emit_expr(&arg.value, state)?),
         ("__intrinsic_float_to_int", [arg]) => format!("({}) as i64", emit_expr(&arg.value, state)?),
         ("__intrinsic_pow", [left, right]) => {
@@ -778,106 +841,137 @@ fn emit_field_call_expr(
     let Expr::Field { base, field, .. } = callee else {
         return Ok(None);
     };
+    let base_expr = emit_expr(base, state)?;
     let lowered = match (field.as_str(), args) {
         ("char_at", [arg]) => format!(
             "{}.chars().nth(({}) as usize).unwrap()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
-        ("len", []) => format!("{}.len() as i64", emit_expr(base, state)?),
-        ("trim", []) => format!("{}.trim().to_string()", emit_expr(base, state)?),
-        ("trim_end", []) => format!("{}.trim_end().to_string()", emit_expr(base, state)?),
+        ("len", []) => format!("{}.len() as i64", base_expr),
+        ("trim", []) => format!("{}.trim().to_string()", base_expr),
+        ("trim_end", []) => format!("{}.trim_end().to_string()", base_expr),
         ("trim_end", [arg]) => format!(
-            "{}.trim_end_matches(&{}).to_string()",
-            emit_expr(base, state)?,
+            "{}.trim_end_matches({})",
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("get", [arg]) => {
+            // For Map::get - use & for key
             let key = emit_expr(&arg.value, state)?;
-            if matches!(arg.value, Expr::Unary { op: UnaryOp::Borrow | UnaryOp::BorrowMut, .. }) {
-                format!("{}.get({})", emit_expr(base, state)?, key)
-            } else {
-                format!("{}.get(&{}).cloned()", emit_expr(base, state)?, key)
-            }
+            format!("{}.get(&{})", base_expr, key)
         }
         ("split", [arg]) => format!(
-            "{}.split(&{}).map(str::to_string).collect::<Vec<_>>()",
-            emit_expr(base, state)?,
+            "{}.split({}).map(str::to_string).collect::<Vec<_>>()",
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("split_whitespace", []) => format!(
             "{}.split_whitespace().map(str::to_string).collect::<Vec<_>>()",
-            emit_expr(base, state)?
+            base_expr
         ),
         ("map", [arg]) => format!(
             "({}).into_iter().map({}).collect::<Vec<_>>()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("filter", [arg]) => format!(
             "({}).into_iter().filter({}).collect::<Vec<_>>()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_filter_predicate_expr(&arg.value, state)?
         ),
         ("fold", [init, arg]) => format!(
             "({}).into_iter().fold({}, {})",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&init.value, state)?,
             emit_expr(&arg.value, state)?
         ),
         ("any", [arg]) => format!(
             "({}).into_iter().any({})",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
-        ("count", []) => format!("({}).into_iter().count() as i64", emit_expr(base, state)?),
+        ("count", []) => format!("({}).into_iter().count() as i64", base_expr),
         ("union", [arg]) => format!(
             "{}.union(&{}).cloned().collect::<BTreeSet<_>>()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("intersection", [arg]) => format!(
             "{}.intersection(&{}).cloned().collect::<BTreeSet<_>>()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("difference", [arg]) => format!(
             "{}.difference(&{}).cloned().collect::<BTreeSet<_>>()",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
-        ("is_subset", [arg]) => format!("{}.is_subset(&{})", emit_expr(base, state)?, emit_expr(&arg.value, state)?),
-        ("is_superset", [arg]) => format!("{}.is_superset(&{})", emit_expr(base, state)?, emit_expr(&arg.value, state)?),
-        ("is_empty", []) => format!("{}.is_empty()", emit_expr(base, state)?),
-        ("collect", []) => format!("({})", emit_expr(base, state)?),
-        ("into_iter", []) => format!("({})", emit_expr(base, state)?),
+        ("is_subset", [arg]) => format!("{}.is_subset(&{})", base_expr, emit_expr(&arg.value, state)?),
+        ("is_superset", [arg]) => format!("{}.is_superset(&{})", base_expr, emit_expr(&arg.value, state)?),
+        ("is_empty", []) => format!("{}.is_empty()", base_expr),
+        ("collect", []) => format!("({})", base_expr),
+        ("into_iter", []) => format!("({})", base_expr),
         ("find", [arg]) => format!(
             "{}.find(&{}).map(|index| index as i64)",
-            emit_expr(base, state)?,
+            base_expr,
             emit_expr(&arg.value, state)?
         ),
         ("replace", [from, to]) => format!(
-            "{}.replace({}, &{}.to_string())",
-            emit_expr(base, state)?,
+            "{}.replace(&{}, &{}.to_string())",
+            base_expr,
             emit_expr(&from.value, state)?,
             emit_expr(&to.value, state)?
         ),
-        ("sqrt", []) => format!("({}).sqrt()", emit_expr(base, state)?),
-        ("exp", []) => format!("({}).exp()", emit_expr(base, state)?),
-        ("to_string", []) => format!("({}).to_string()", emit_expr(base, state)?),
-        ("unwrap_err", []) => format!("{}.unwrap_err()", emit_expr(base, state)?),
-        ("is_digit", []) => format!("{}.is_ascii_digit()", emit_expr(base, state)?),
-        ("is_alphabetic", []) => format!("{}.is_alphabetic()", emit_expr(base, state)?),
-        ("is_alphanumeric", []) => format!("{}.is_alphanumeric()", emit_expr(base, state)?),
-        ("is_numeric", []) => format!("{}.is_numeric()", emit_expr(base, state)?),
-        ("is_whitespace", []) => format!("{}.is_whitespace()", emit_expr(base, state)?),
-        ("lines", []) => format!("{}.lines().map(str::to_string).collect::<Vec<_>>()", emit_expr(base, state)?),
+        ("sqrt", []) => format!("({}).sqrt()", base_expr),
+        ("exp", []) => format!("({}).exp()", base_expr),
+        ("to_string", []) => format!("({}).to_string()", base_expr),
+        ("unwrap_err", []) => format!("{}.unwrap_err()", base_expr),
+        ("is_digit", []) => format!("{}.is_ascii_digit()", base_expr),
+        ("is_alphabetic", []) => format!("{}.is_alphabetic()", base_expr),
+        ("is_alphanumeric", []) => format!("{}.is_alphanumeric()", base_expr),
+        ("is_numeric", []) => format!("{}.is_numeric()", base_expr),
+        ("is_whitespace", []) => format!("{}.is_whitespace()", base_expr),
+        ("lines", []) => format!("{}.lines().map(str::to_string).collect::<Vec<_>>()", base_expr),
+        // Map methods that need & for keys
+        ("contains_key", [arg]) => format!(
+            "{}.contains_key(&{})",
+            base_expr,
+            emit_expr(&arg.value, state)?
+        ),
+        ("remove", [arg]) => format!(
+            "{}.remove(&{})",
+            base_expr,
+            emit_expr(&arg.value, state)?
+        ),
+        ("insert", [key, value]) => format!(
+            "{}.insert({}, {})",
+            base_expr,
+            emit_expr(&key.value, state)?,
+            emit_expr(&value.value, state)?
+        ),
+        // String methods that need & for the argument
         ("contains" | "starts_with" | "ends_with", [arg]) => format!(
-            "{}.{}(&{})",
-            emit_expr(base, state)?,
+            "{}.{}({})",
+            base_expr,
             field,
             emit_expr(&arg.value, state)?
         ),
+        // Push method for Vec - takes ownership
+        ("push", [arg]) => format!(
+            "{}.push({})",
+            base_expr,
+            emit_expr(&arg.value, state)?
+        ),
+        // Clone method for owned values
+        ("clone", []) => {
+            // Check if base is a boxed type that needs dereferencing
+            if is_boxed_type(base, state)? {
+                format!("(*{}).clone()", base_expr)
+            } else {
+                format!("{}.clone()", base_expr)
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(lowered))
@@ -891,22 +985,56 @@ fn emit_callee_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0E
     }
 }
 
-fn emit_call_arg_expr(expr: &Expr, param_type: Option<&TypeRef>, state: &CodegenState) -> Result<String, Stage0Error> {
-    emit_expr_for_expected_type(expr, param_type, state)
-}
-
 fn emit_expr_for_expected_type(expr: &Expr, expected_type: Option<&TypeRef>, state: &CodegenState) -> Result<String, Stage0Error> {
     match expected_type {
         Some(TypeRef::Ref { .. }) => emit_expr(expr, state),
         Some(TypeRef::Function { .. }) if matches!(expr, Expr::Closure { .. }) => {
             Ok(format!("Box::new({})", emit_move_closure_expr(expr, state)?))
         }
-        Some(TypeRef::Function { .. }) if matches!(expr, Expr::Closure { .. } | Expr::Name { .. } | Expr::Field { .. }) => {
+        Some(TypeRef::Function { .. }) if matches!(expr, Expr::Name { .. } | Expr::Field { .. }) => {
             Ok(format!("Box::new({})", emit_expr(expr, state)?))
+        }
+        Some(TypeRef::Named { name, .. }) if name == "Option" || name == "Result" || name == "Vec" || name == "BTreeMap" => {
+            // Add explicit type annotations for generic types
+            match expr {
+                Expr::Call { callee, args, .. } => {
+                    if let Expr::Name { name: callee_name, .. } = callee.as_ref() {
+                        match callee_name.as_str() {
+                            "Option::None" => Ok("Option::<()>::None".to_string()),
+                            "Result::Ok" if args.len() == 1 => {
+                                Ok(format!("Result::<_, ()>::Ok({})", emit_expr(&args[0].value, state)?))
+                            }
+                            "Result::Err" if args.len() == 1 => {
+                                Ok(format!("Result::<(), _>::Err({})", emit_expr(&args[0].value, state)?))
+                            }
+                            "Vec::new" => Ok("Vec::<()>::new()".to_string()),
+                            "BTreeMap::new" => Ok("BTreeMap::<(), ()>::new()".to_string()),
+                            _ => emit_expr(expr, state),
+                        }
+                    } else {
+                        emit_expr(expr, state)
+                    }
+                }
+                _ => emit_expr(expr, state),
+            }
         }
         _ => emit_expr(expr, state),
     }
 }
+
+fn emit_call_arg_expr(expr: &Expr, param_type: Option<&TypeRef>, state: &CodegenState) -> Result<String, Stage0Error> {
+    // Check if we need to box closures when passed to functions expecting Fn
+    match param_type {
+        Some(TypeRef::Function { .. }) if matches!(expr, Expr::Closure { .. }) => {
+            Ok(format!("Box::new({})", emit_move_closure_expr(expr, state)?))
+        }
+        Some(TypeRef::Function { .. }) if matches!(expr, Expr::Name { .. } | Expr::Field { .. }) => {
+            Ok(format!("Box::new({})", emit_expr(expr, state)?))
+        }
+        _ => emit_expr_for_expected_type(expr, param_type, state),
+    }
+}
+
 
 fn emit_move_closure_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0Error> {
     match expr {
@@ -934,6 +1062,27 @@ fn emit_filter_predicate_expr(expr: &Expr, state: &CodegenState) -> Result<Strin
             out.push('}');
             Ok(out)
         }
+        _ => emit_expr(expr, state),
+    }
+}
+
+/// Emit a return expression, adding .clone() for self.field accesses.
+/// Also handles boxing of closures when needed.
+fn emit_return_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0Error> {
+    // For closures being returned, we need to box them with move
+    if matches!(expr, Expr::Closure { .. }) {
+        return Ok(format!("Box::new({})", emit_move_closure_expr(expr, state)?));
+    }
+    match expr {
+        Expr::Field { base, field, .. } => {
+            if let Expr::Name { name, .. } = base.as_ref() {
+                if name == "self" {
+                    return Ok(format!("self.{field}.clone()"));
+                }
+            }
+            emit_expr(expr, state)
+        }
+        Expr::Name { name, .. } if name == "self" => Ok("self.clone()".to_string()),
         _ => emit_expr(expr, state),
     }
 }
@@ -1212,12 +1361,43 @@ fn format_type_params(type_params: &[crate::ast::decl::TypeParam]) -> String {
                     if param.bounds.is_empty() {
                         param.name.clone()
                     } else {
-                        format!("{}: {}", param.name, param.bounds.join(" + "))
+                        let bounds = param.bounds.iter().map(|s| qualify_std_trait(s.as_str())).collect::<Vec<_>>().join(" + ");
+                        format!("{}: {}", param.name, bounds)
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+}
+
+/// Qualify standard library traits to avoid conflicts with user-defined traits.
+fn qualify_std_trait(name: &str) -> String {
+    match name {
+        "Display" => "std::fmt::Display".to_string(),
+        "Clone" => "std::clone::Clone".to_string(),
+        "Copy" => "std::marker::Copy".to_string(),
+        "Ord" => "std::cmp::Ord".to_string(),
+        "PartialOrd" => "std::cmp::PartialOrd".to_string(),
+        "Eq" => "std::cmp::Eq".to_string(),
+        "PartialEq" => "std::cmp::PartialEq".to_string(),
+        "Hash" => "std::hash::Hash".to_string(),
+        "Default" => "std::default::Default".to_string(),
+        "Iterator" => "std::iter::Iterator".to_string(),
+        "IntoIterator" => "std::iter::IntoIterator".to_string(),
+        "From" => "std::convert::From".to_string(),
+        "Into" => "std::convert::Into".to_string(),
+        "AsRef" => "std::convert::AsRef".to_string(),
+        "AsMut" => "std::convert::AsMut".to_string(),
+        "Drop" => "std::ops::Drop".to_string(),
+        "Send" => "std::marker::Send".to_string(),
+        "Sync" => "std::marker::Sync".to_string(),
+        "Sized" => "std::marker::Sized".to_string(),
+        "Unpin" => "std::marker::Unpin".to_string(),
+        "Fn" => "std::ops::Fn".to_string(),
+        "FnMut" => "std::ops::FnMut".to_string(),
+        "FnOnce" => "std::ops::FnOnce".to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -1237,7 +1417,10 @@ fn format_where_clause(predicates: &[crate::ast::decl::WherePredicate]) -> Resul
             " where {}",
             predicates
                 .iter()
-                .map(|predicate| Ok(format!("{}: {}", format_type(&predicate.ty)?, predicate.bounds.join(" + "))))
+                .map(|predicate| {
+                    let bounds = predicate.bounds.iter().map(|s| qualify_std_trait(s.as_str())).collect::<Vec<_>>().join(" + ");
+                    Ok(format!("{}: {}", format_type(&predicate.ty)?, bounds))
+                })
                 .collect::<Result<Vec<_>, Stage0Error>>()?
                 .join(", ")
         ))
@@ -1634,6 +1817,26 @@ fn reaches_type(
 
 fn is_indirect_storage_container(name: &str) -> bool {
     matches!(name, "Array" | "Vec" | "Map" | "Set" | "Box")
+}
+
+fn is_boxed_type(expr: &Expr, state: &CodegenState) -> Result<bool, Stage0Error> {
+    match expr {
+        Expr::Field { base, .. } => is_boxed_type(base, state),
+        Expr::Name { name, .. } => {
+            Ok(state.recursive_inline_types.contains(name) && !state.enum_types.contains(name))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn is_primitive_type(expr: &Expr) -> Result<bool, Stage0Error> {
+    match expr {
+        Expr::Name { name, .. } => {
+            Ok(matches!(name.as_str(), "i64" | "u64" | "i32" | "u32" | "i16" | "u16" | "i8" | "u8" | "f64" | "f32" | "bool" | "char"))
+        }
+        Expr::Field { base, .. } => is_primitive_type(base),
+        _ => Ok(false),
+    }
 }
 
 fn format_struct_field_type(ty: &TypeRef, state: &CodegenState, indirect: bool) -> Result<String, Stage0Error> {

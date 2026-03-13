@@ -92,6 +92,7 @@ impl Parser {
             TokenKind::KeywordConst => self.parse_const_decl(public).map(Decl::Const),
             TokenKind::KeywordMut => self.parse_global_decl(public).map(Decl::Global),
             TokenKind::KeywordExtern => self.parse_extern_decl().map(Decl::Extern),
+            TokenKind::KeywordTest => self.parse_test_decl().map(Decl::Meta),
             other => Err(Stage0Error::parse(
                 self.peek().span,
                 format!("unexpected token at top level: {other:?}"),
@@ -1717,6 +1718,10 @@ impl Parser {
                 name: "next".to_string(),
                 span: token.span,
             }),
+            TokenKind::KeywordTest => Ok(Expr::Name {
+                name: "test".to_string(),
+                span: token.span,
+            }),
             TokenKind::KeywordType => Ok(Expr::Name {
                 name: "type".to_string(),
                 span: token.span,
@@ -2173,6 +2178,7 @@ impl Parser {
             TokenKind::KeywordRationale => self.parse_ident_pattern("rationale".to_string(), token.span),
             TokenKind::KeywordPub => self.parse_ident_pattern("pub".to_string(), token.span),
             TokenKind::KeywordWhen => self.parse_ident_pattern("when".to_string(), token.span),
+            TokenKind::KeywordTest => self.parse_ident_pattern("test".to_string(), token.span),
             other => Err(Stage0Error::parse(
                 token.span,
                 format!("unexpected pattern token: {other:?}"),
@@ -2211,6 +2217,11 @@ impl Parser {
         if self.match_kind(&TokenKind::ColonColon) {
             enum_name = Some(name.clone());
             variant_name = self.expect_ident()?;
+            // Handle additional :: for qualified paths like app::Key::Char
+            if self.match_kind(&TokenKind::ColonColon) {
+                enum_name = Some(format!("{}::{}", enum_name.unwrap(), variant_name));
+                variant_name = self.expect_ident()?;
+            }
         }
         if enum_name.is_some() || self.check(&TokenKind::LParen) || starts_with_uppercase(&variant_name) {
             let fields = if self.match_kind(&TokenKind::LParen) {
@@ -3294,6 +3305,26 @@ impl Parser {
         Ok(MetaDecl {
             kind: MetaKind::Capability,
             detail: name,
+            span: merge_spans(start, end),
+        })
+    }
+
+    fn parse_test_decl(&mut self) -> Result<MetaDecl, Stage0Error> {
+        let start = self.expect(&TokenKind::KeywordTest)?.span;
+        let name = if let TokenKind::String(value) = self.peek_kind() {
+            let value = value.clone();
+            let _ = self.bump();
+            value
+        } else {
+            self.expect_ident()?
+        };
+        let _ = self.expect(&TokenKind::KeywordDo)?;
+        self.skip_newlines();
+        let detail = self.collect_until_keyword_end();
+        let end = self.expect(&TokenKind::KeywordEnd)?.span;
+        Ok(MetaDecl {
+            kind: MetaKind::Test,
+            detail: format!("{} {}", name, detail),
             span: merge_spans(start, end),
         })
     }

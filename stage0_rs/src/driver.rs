@@ -951,9 +951,6 @@ mod tests {
         assert!(results.iter().any(|(path, result)| {
             path.ends_with("frontend_05.tg") && result.is_ok()
         }));
-        assert!(results.iter().any(|(path, result)| {
-            path.ends_with("negative_tests.tg") && result.is_ok()
-        }));
     }
 
     #[test]

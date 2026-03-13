@@ -59,6 +59,7 @@ pub enum MetaKind {
     Edition,
     Rationale,
     Capability,
+    Test,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

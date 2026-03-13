@@ -70,6 +70,7 @@ pub enum TokenKind {
     KeywordUnless,
     KeywordUntil,
     KeywordUnsafe,
+    KeywordTest,
     KeywordEnd,
     KeywordTrue,
     KeywordFalse,
