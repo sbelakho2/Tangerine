@@ -2858,36 +2858,142 @@ def ed25519_verify(
   constant_time_eq(&sb_bytes, &rhs_bytes)
 end
 
+# ———————————————————————————————————————————————————————————————
+# Ed25519 256-bit modular scalar arithmetic
+# ———————————————————————————————————————————————————————————————
+
+# Ed25519 group order q as little-endian Vec[Int] (each entry 0..255)
+# q = 2^252 + 27742317777372353535851937790883648493
+def _sc_q_le() -> Vec[Int]
+  let mut q = Vec::new()
+  q.push(0xED); q.push(0xD3); q.push(0xF5); q.push(0x5C)
+  q.push(0x1A); q.push(0x63); q.push(0x12); q.push(0x58)
+  q.push(0xD6); q.push(0x9C); q.push(0xF7); q.push(0xA2)
+  q.push(0xDE); q.push(0xF9); q.push(0xDE); q.push(0x14)
+  q.push(0x00); q.push(0x00); q.push(0x00); q.push(0x00)
+  q.push(0x00); q.push(0x00); q.push(0x00); q.push(0x00)
+  q.push(0x00); q.push(0x00); q.push(0x00); q.push(0x00)
+  q.push(0x00); q.push(0x00); q.push(0x00); q.push(0x10)
+  q
+end
+
+# Compare two unsigned little-endian integers (Vec[Int], each entry 0..255).
+# Returns true if a >= b. Lengths may differ; shorter is zero-extended.
+def _sc_le_geq(a: &Vec[Int], b: &Vec[Int]) -> Bool
+  let la = a.len()
+  let lb = b.len()
+  let maxlen = if la > lb then la else lb end
+  for idx in 0..maxlen do
+    let i = maxlen - 1 - idx
+    let av = if i < la then a[i] else 0 end
+    let bv = if i < lb then b[i] else 0 end
+    if av > bv then return true end
+    if av < bv then return false end
+  end
+  true
+end
+
+# Subtract b from a in-place (little-endian), assumes a >= b.
+# Lengths may differ; shorter is zero-extended.
+def _sc_le_sub(a: &mut Vec[Int], b: &Vec[Int]) -> Unit
+  let mut borrow = 0
+  for i in 0..a.len() do
+    let bv = if i < b.len() then b[i] else 0 end
+    let diff = a[i] - bv - borrow
+    if diff < 0 then
+      a[i] = diff + 256
+      borrow = 1
+    else
+      a[i] = diff
+      borrow = 0
+    end
+  end
+end
+
 # Scalar reduction modulo q (curve order)
 # q = 2^252 + 27742317777372353535851937790883648493
+# Input: 32-byte little-endian scalar (up to 256 bits).
+# Reduces in-place via iterative subtraction (at most ~15 times for 256-bit input).
 def _sc_reduce(s: &mut [u8; 32]) -> Unit
-  # Simplified reduction - in production, use full implementation
-  # This ensures s < q by masking high bits
-  s[31] = s[31] & 0x7F
+  let q = _sc_q_le()
+  let mut v = Vec::new()
+  for i in 0..32 do v.push(s[i] as Int) end
+  while _sc_le_geq(&v, &q) do
+    _sc_le_sub(&mut v, &q)
+  end
+  for i in 0..32 do s[i] = v[i] as u8 end
 end
 
 # Check if scalar is in valid range [0, q)
 def _sc_check(s: &[u8; 32]) -> Bool
-  # q = 2^252 + 27742317777372353535851937790883648493
-  # In bytes: 0x7F FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF ...
-  # Check that s < q
-  if (s[31] & 0x80) != 0 then return false end
+  let q = _sc_q_le()
+  let mut v = Vec::new()
+  for i in 0..32 do v.push(s[i] as Int) end
+  # s < q means s is NOT >= q
+  if _sc_le_geq(&v, &q) then return false end
   true
 end
 
-# Compute (a * b + c) mod q
+# Compute (a * b + c) mod q using schoolbook multiplication and
+# bit-at-a-time modular reduction.
+# All inputs are 32-byte little-endian scalars.
 def _sc_muladd(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32]
-  # Simplified implementation - in production, use full bigint arithmetic
-  # This is a placeholder that returns a hash-based result
-  let mut input = Vec::new()
-  input.extend(a)
-  input.extend(b)
-  input.extend(c)
-  let h = sha512(&input.as_slice())
-  
+  # Schoolbook multiply a * b -> 64-element product (little-endian, base 256)
+  let mut prod = Vec::new()
+  for _ in 0..64 do prod.push(0) end
+  for i in 0..32 do
+    let mut carry = 0
+    for j in 0..32 do
+      let s = prod[i + j] + (a[i] as Int) * (b[j] as Int) + carry
+      prod[i + j] = s & 0xFF
+      carry = s >> 8
+    end
+    prod[i + 32] = prod[i + 32] + carry
+  end
+
+  # Add c into low 32 bytes of product
+  let mut carry = 0
+  for i in 0..32 do
+    let s = prod[i] + (c[i] as Int) + carry
+    prod[i] = s & 0xFF
+    carry = s >> 8
+  end
+  let mut idx = 32
+  while carry > 0 && idx < 64 do
+    let s = prod[idx] + carry
+    prod[idx] = s & 0xFF
+    carry = s >> 8
+    idx = idx + 1
+  end
+
+  # Reduce 512-bit product mod q via bit-at-a-time long division.
+  # Invariant: rem < q after each bit is processed.
+  let q = _sc_q_le()
+  let mut rem = Vec::new()
+  for _ in 0..33 do rem.push(0) end
+
+  for byte_from_top in 0..64 do
+    let byte_val = prod[63 - byte_from_top]
+    for bit in 0..8 do
+      # Left-shift rem by 1
+      let mut c = 0
+      for j in 0..33 do
+        let v = rem[j] * 2 + c
+        rem[j] = v & 0xFF
+        c = (v >> 8) & 1
+      end
+      # Shift in next bit (MSB first within each byte)
+      let bval = (byte_val >> (7 - bit)) & 1
+      rem[0] = rem[0] | bval
+      # If rem >= q, subtract
+      if _sc_le_geq(&rem, &q) then
+        _sc_le_sub(&mut rem, &q)
+      end
+    end
+  end
+
   let mut result = [0u8; 32]
-  for i in 0..32 do result[i] = h[i] end
-  result[31] = result[31] & 0x7F
+  for i in 0..32 do result[i] = rem[i] as u8 end
   result
 end
 

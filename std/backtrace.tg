@@ -344,34 +344,99 @@ def parse_debug_line_section(exe_path: String, target_pc: UInt) -> Option[Source
       let opcode_base = bytes[offset] as UInt
       offset = offset + 1
       
-      # Skip standard opcode lengths
-      offset = offset + (opcode_base - 1) as UInt
+      # Read standard opcode operand counts (for proper skipping of unknown opcodes)
+      let mut opcode_lengths = Vec::new()
+      opcode_lengths.push(0)  # Index 0 unused
+      for _i in 1..opcode_base do
+        opcode_lengths.push(bytes[offset] as UInt)
+        offset = offset + 1
+      end
       
       # Parse include directories
       mut dirs = Vec::new()
       dirs.push("".to_string())  # Current directory
-      while offset < end_offset && bytes[offset] != 0 do
-        let dir = read_null_terminated_string(&bytes, &mut offset)
-        dirs.push(dir)
-      end
-      offset = offset + 1  # Skip null terminator
-      
-      # Parse file names
       mut files = Vec::new()
       files.push("".to_string())  # Index 0 unused
-      while offset < end_offset && bytes[offset] != 0 do
-        let file_name = read_null_terminated_string(&bytes, &mut offset)
-        let dir_index = read_uleb128(&bytes, &mut offset)
-        let _mod_time = read_uleb128(&bytes, &mut offset)
-        let _file_length = read_uleb128(&bytes, &mut offset)
-        
-        if dir_index > 0 && dir_index < dirs.len() then
-          files.push(dirs[dir_index] + "/" + file_name)
-        else
-          files.push(file_name)
+      
+      if version >= 5 then
+        # DWARF v5 directory table (new format)
+        let dir_format_count = bytes[offset] as UInt
+        offset = offset + 1
+        let mut dir_formats = Vec::new()
+        for _df in 0..dir_format_count do
+          let content_type = read_uleb128(&bytes, &mut offset)
+          let form = read_uleb128(&bytes, &mut offset)
+          dir_formats.push((content_type, form))
         end
+        let dir_count = read_uleb128(&bytes, &mut offset)
+        for _d in 0..dir_count do
+          let mut dir_str = "".to_string()
+          for idx in 0..dir_formats.len() do
+            let (ct, form) = dir_formats[idx]
+            if ct == 1 then
+              # DW_LNCT_path
+              dir_str = _read_dwarf_form_string(&bytes, &mut offset, form)
+            else
+              _skip_dwarf_form(&bytes, &mut offset, form)
+            end
+          end
+          dirs.push(dir_str)
+        end
+
+        # DWARF v5 file table
+        let file_format_count = bytes[offset] as UInt
+        offset = offset + 1
+        let mut file_formats = Vec::new()
+        for _ff in 0..file_format_count do
+          let content_type = read_uleb128(&bytes, &mut offset)
+          let form = read_uleb128(&bytes, &mut offset)
+          file_formats.push((content_type, form))
+        end
+        let file_count = read_uleb128(&bytes, &mut offset)
+        for _fn in 0..file_count do
+          let mut file_name = "".to_string()
+          let mut dir_index: UInt = 0
+          for idx in 0..file_formats.len() do
+            let (ct, form) = file_formats[idx]
+            if ct == 1 then
+              file_name = _read_dwarf_form_string(&bytes, &mut offset, form)
+            elsif ct == 2 then
+              dir_index = _read_dwarf_form_udata(&bytes, &mut offset, form)
+            else
+              _skip_dwarf_form(&bytes, &mut offset, form)
+            end
+          end
+          if dir_index > 0 && dir_index < dirs.len() then
+            files.push(dirs[dir_index] + "/" + file_name)
+          else
+            files.push(file_name)
+          end
+        end
+      else
+        # DWARF v4 and earlier: null-terminated string lists
+        while offset < end_offset && bytes[offset] != 0 do
+          let dir = read_null_terminated_string(&bytes, &mut offset)
+          dirs.push(dir)
+        end
+        offset = offset + 1  # Skip null terminator
+      
+        # Parse file names (v4)
+        mut files = Vec::new()
+        files.push("".to_string())  # Index 0 unused
+        while offset < end_offset && bytes[offset] != 0 do
+          let file_name = read_null_terminated_string(&bytes, &mut offset)
+          let dir_index = read_uleb128(&bytes, &mut offset)
+          let _mod_time = read_uleb128(&bytes, &mut offset)
+          let _file_length = read_uleb128(&bytes, &mut offset)
+        
+          if dir_index > 0 && dir_index < dirs.len() then
+            files.push(dirs[dir_index] + "/" + file_name)
+          else
+            files.push(file_name)
+          end
+        end
+        offset = offset + 1  # Skip null terminator
       end
-      offset = offset + 1  # Skip null terminator
       
       # Execute line number program (state machine)
       mut address: UInt = 0
@@ -403,6 +468,20 @@ def parse_debug_line_section(exe_path: String, target_pc: UInt) -> Option[Source
             # DW_LNE_set_address
             address = read_usize_le(&bytes, offset)
             offset = offset + 8  # 64-bit address
+          elsif ext_opcode == 3 then
+            # DW_LNE_define_file — add a file entry
+            let dfile = read_null_terminated_string(&bytes, &mut offset)
+            let ddir_idx = read_uleb128(&bytes, &mut offset)
+            let _dmod = read_uleb128(&bytes, &mut offset)
+            let _dlen = read_uleb128(&bytes, &mut offset)
+            if ddir_idx > 0 && ddir_idx < dirs.len() then
+              files.push(dirs[ddir_idx] + "/" + dfile)
+            else
+              files.push(dfile)
+            end
+          elsif ext_opcode == 4 then
+            # DW_LNE_set_discriminator
+            let _discriminator = read_uleb128(&bytes, &mut offset)
           else
             offset = offset + (ext_len - 1) as UInt
           end
@@ -455,9 +534,22 @@ def parse_debug_line_section(exe_path: String, target_pc: UInt) -> Option[Source
             let advance = read_u16_le(&bytes, offset) as UInt
             offset = offset + 2
             address = address + advance
-          else
-            # Skip unknown standard opcodes
+          elsif opcode == 10 then
+            # DW_LNS_set_prologue_end — no operands
             ()
+          elsif opcode == 11 then
+            # DW_LNS_set_epilogue_begin — no operands
+            ()
+          elsif opcode == 12 then
+            # DW_LNS_set_isa
+            let _isa = read_uleb128(&bytes, &mut offset)
+          else
+            # Skip unknown standard opcodes using their operand count
+            if opcode < opcode_lengths.len() then
+              for _sk in 0..opcode_lengths[opcode] do
+                let _ = read_uleb128(&bytes, &mut offset)
+              end
+            end
           end
         else
           # Special opcode
@@ -490,6 +582,81 @@ def parse_debug_line_section(exe_path: String, target_pc: UInt) -> Option[Source
       
       best_match
     end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# DWARF v5 Form Helpers
+# ———————————————————————————————————————————————————————————————
+
+# Read a string value based on DWARF form type
+def _read_dwarf_form_string(bytes: &Vec[u8], offset: &mut UInt, form: UInt) -> String
+  if form == 0x08 then
+    # DW_FORM_string — inline null-terminated
+    read_null_terminated_string(bytes, offset)
+  elsif form == 0x0E || form == 0x1F then
+    # DW_FORM_strp or DW_FORM_line_strp — 4-byte offset into .debug_str/.debug_line_str
+    let _str_offset = read_u32_le(bytes, *offset)
+    *offset = *offset + 4
+    "<strp>".to_string()
+  elsif form == 0x19 then
+    # DW_FORM_strx — ULEB128 index into string offset table
+    let _idx = read_uleb128(bytes, offset)
+    "<strx>".to_string()
+  else
+    "<unknown_form>".to_string()
+  end
+end
+
+# Read an unsigned data value based on DWARF form type
+def _read_dwarf_form_udata(bytes: &Vec[u8], offset: &mut UInt, form: UInt) -> UInt
+  if form == 0x0B then
+    # DW_FORM_data1
+    let v = bytes[*offset] as UInt
+    *offset = *offset + 1
+    v
+  elsif form == 0x05 then
+    # DW_FORM_data2
+    let v = read_u16_le(bytes, *offset) as UInt
+    *offset = *offset + 2
+    v
+  elsif form == 0x06 then
+    # DW_FORM_data4
+    let v = read_u32_le(bytes, *offset) as UInt
+    *offset = *offset + 4
+    v
+  elsif form == 0x0F then
+    # DW_FORM_udata
+    read_uleb128(bytes, offset)
+  else
+    _skip_dwarf_form(bytes, offset, form)
+    0
+  end
+end
+
+# Skip over a DWARF form value without reading it
+def _skip_dwarf_form(bytes: &Vec[u8], offset: &mut UInt, form: UInt) -> Unit
+  if form == 0x0B || form == 0x25 || form == 0x0E then
+    # DW_FORM_data1, DW_FORM_strx1, DW_FORM_strp
+    *offset = *offset + 1
+  elsif form == 0x05 || form == 0x26 then
+    # DW_FORM_data2, DW_FORM_strx2
+    *offset = *offset + 2
+  elsif form == 0x06 || form == 0x1F then
+    # DW_FORM_data4, DW_FORM_line_strp
+    *offset = *offset + 4
+  elsif form == 0x07 then
+    # DW_FORM_data8
+    *offset = *offset + 8
+  elsif form == 0x0F || form == 0x19 then
+    # DW_FORM_udata, DW_FORM_strx (ULEB128)
+    let _ = read_uleb128(bytes, offset)
+  elsif form == 0x08 then
+    # DW_FORM_string — skip null-terminated
+    while *offset < bytes.len() && bytes[*offset] != 0 do
+      *offset = *offset + 1
+    end
+    *offset = *offset + 1
   end
 end
 

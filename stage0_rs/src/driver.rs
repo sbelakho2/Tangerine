@@ -2,31 +2,343 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::decl::{
-    EnumDecl, FieldDecl, FunctionDecl, FunctionSig, Module, Param, StructDecl, TraitDecl, TypeAliasDecl, TypeParam,
+    Decl, EnumDecl, FieldDecl, FunctionDecl, FunctionSig, MetaKind, Module, Param, StructDecl, TraitDecl, TypeAliasDecl, TypeParam,
     VariantDecl, WherePredicate,
 };
+use crate::ast::expr::{BlockBody, FunctionBody};
 use crate::ast::types::TypeRef;
 use crate::codegen::{emit_rust, rustc_check};
 use crate::error::Stage0Error;
 use crate::lexer::lex;
 use crate::parser::Parser;
-use crate::sema::{analyze, analyze_with_env, SemanticEnv};
+use crate::sema::{analyze_with_env, SemanticEnv};
 use crate::span::Span;
 
 pub type FileAnalysis = (PathBuf, Result<Module, Stage0Error>);
 pub type CodegenAnalysis = (PathBuf, Result<(), Stage0Error>);
 
+fn vm_size_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            for line in s.lines() {
+                if line.starts_with("VmSize:") {
+                    return line.split_whitespace().nth(1)?.parse::<u64>().ok();
+                }
+            }
+            None
+        })
+        .unwrap_or(0)
+}
+
+/// Ask glibc to release unused heap pages back to the OS.
+///
+/// The support-environment build loop allocates and frees many intermediate
+/// objects.  glibc's `brk`-based allocator never shrinks the data segment,
+/// so the virtual-memory footprint can grow to ~2 GB even though peak live
+/// data is only ~35 MB.  A single `malloc_trim(0)` call after the heavy
+/// allocation phase lets glibc `MADV_DONTNEED` the freed pages, reclaiming
+/// address space for the analysis phase.
+#[cfg(target_os = "linux")]
+fn trim_heap() {
+    unsafe {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_heap() {}
+
+fn brk_addr() -> String {
+    extern "C" {
+        fn sbrk(increment: isize) -> *mut u8;
+    }
+    let addr = unsafe { sbrk(0) };
+    format!("{addr:?}")
+}
+
+// ---------------------------------------------------------------------------
+// @cfg conditional compilation
+// ---------------------------------------------------------------------------
+
+/// Platform configuration for evaluating `@cfg(...)` predicates.
+struct CfgConfig {
+    target_os: String,
+    target_arch: String,
+    debug: bool,
+    features: BTreeSet<String>,
+}
+
+impl CfgConfig {
+    /// Build a `CfgConfig` from the current compilation host, with optional
+    /// overrides via environment variables `TG_TARGET_OS`, `TG_TARGET_ARCH`,
+    /// `TG_CFG_DEBUG`, and `TG_CFG_FEATURES` (comma-separated).
+    fn from_env() -> Self {
+        let target_os = std::env::var("TG_TARGET_OS").unwrap_or_else(|_| {
+            if cfg!(target_os = "linux") {
+                "linux".to_string()
+            } else if cfg!(target_os = "macos") {
+                "macos".to_string()
+            } else if cfg!(target_os = "windows") {
+                "windows".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+
+        let target_arch = std::env::var("TG_TARGET_ARCH").unwrap_or_else(|_| {
+            if cfg!(target_arch = "x86_64") {
+                "x86_64".to_string()
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64".to_string()
+            } else if cfg!(target_arch = "arm") {
+                "arm".to_string()
+            } else if cfg!(target_arch = "riscv64") {
+                "riscv64".to_string()
+            } else if cfg!(target_arch = "wasm32") {
+                "wasm".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+
+        let debug = std::env::var("TG_CFG_DEBUG")
+            .map_or(cfg!(debug_assertions), |v| v == "1" || v == "true");
+
+        let features = std::env::var("TG_CFG_FEATURES")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        Self { target_os, target_arch, debug, features }
+    }
+}
+
+/// Evaluate a `@cfg(...)` predicate string against the given configuration.
+///
+/// Supports:
+///   - `cfg(target_os = "linux")`
+///   - `cfg(target_arch = "x86_64")`
+///   - `cfg(debug)`
+///   - `cfg(not(...))`
+///   - `cfg(any(..., ...))`
+///   - `cfg(all(..., ...))`
+fn evaluate_cfg_predicate(detail: &str, config: &CfgConfig) -> bool {
+    let inner = detail.trim();
+    // Strip outer `cfg(...)` wrapper if present.
+    let pred = if inner.starts_with("cfg(") && inner.ends_with(')') {
+        &inner[4..inner.len() - 1]
+    } else {
+        inner
+    };
+    eval_pred(pred.trim(), config)
+}
+
+/// Recursively evaluate a single predicate expression.
+fn eval_pred(pred: &str, config: &CfgConfig) -> bool {
+    let pred = pred.trim();
+
+    // not(...)
+    if let Some(inner) = strip_combinator(pred, "not") {
+        return !eval_pred(inner, config);
+    }
+
+    // any(...)
+    if let Some(inner) = strip_combinator(pred, "any") {
+        return split_top_level_commas(inner)
+            .iter()
+            .any(|p| eval_pred(p, config));
+    }
+
+    // all(...)
+    if let Some(inner) = strip_combinator(pred, "all") {
+        return split_top_level_commas(inner)
+            .iter()
+            .all(|p| eval_pred(p, config));
+    }
+
+    // key = "value"
+    if let Some((key, value)) = parse_key_value(pred) {
+        return match key {
+            "target_os" => config.target_os == value,
+            "target_arch" => config.target_arch == value,
+            "feature" => config.features.contains(value),
+            _ => false,
+        };
+    }
+
+    // bare flag
+    match pred {
+        "debug" => config.debug,
+        _ => config.features.contains(pred),
+    }
+}
+
+/// Strip a combinator like `not(...)`, `any(...)`, `all(...)` and return
+/// the inner content. Returns `None` if the predicate doesn't match.
+fn strip_combinator<'a>(pred: &'a str, name: &str) -> Option<&'a str> {
+    let rest = pred.strip_prefix(name)?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    // Find matching closing paren (accounting for nesting).
+    let mut depth = 1u32;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a string by top-level commas (not inside nested parentheses).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+/// Parse `key = "value"` into `(key, value)`.
+fn parse_key_value(pred: &str) -> Option<(&str, &str)> {
+    let (key, rest) = pred.split_once('=')?;
+    let key = key.trim();
+    let rest = rest.trim();
+    let value = rest.strip_prefix('"')?.strip_suffix('"')?;
+    Some((key, value))
+}
+
+/// Remove declarations from a module whose preceding `@cfg(...)` evaluates to
+/// false. An `@cfg` annotation applies to the immediately following non-meta
+/// declaration. Multiple consecutive `@cfg` annotations are AND-combined.
+fn filter_module_by_cfg(module: &mut Module, config: &CfgConfig) {
+    let mut filtered = Vec::with_capacity(module.decls.len());
+    let mut pending_cfgs: Vec<String> = Vec::new();
+
+    for decl in module.decls.drain(..) {
+        match &decl {
+            Decl::Meta(meta)
+                if meta.kind == MetaKind::Annotation
+                    && meta.detail.starts_with("cfg(") =>
+            {
+                pending_cfgs.push(meta.detail.clone());
+                // Don't emit the @cfg annotation itself — it's been evaluated.
+            }
+            _ => {
+                if pending_cfgs.is_empty() {
+                    // Recurse into nested modules.
+                    let decl = filter_nested_module(decl, config);
+                    filtered.push(decl);
+                } else {
+                    let all_pass = pending_cfgs
+                        .iter()
+                        .all(|cfg| evaluate_cfg_predicate(cfg, config));
+                    pending_cfgs.clear();
+                    if all_pass {
+                        let decl = filter_nested_module(decl, config);
+                        filtered.push(decl);
+                    }
+                    // else: drop the declaration (cfg is false)
+                }
+            }
+        }
+    }
+
+    module.decls = filtered;
+}
+
+/// If the declaration is a module, recursively filter its children by @cfg.
+fn filter_nested_module(decl: Decl, config: &CfgConfig) -> Decl {
+    if let Decl::Module(mut m) = decl {
+        let mut inner = Module { decls: std::mem::take(&mut m.decls) };
+        filter_module_by_cfg(&mut inner, config);
+        m.decls = inner.decls;
+        Decl::Module(m)
+    } else {
+        decl
+    }
+}
+
+
 /// Read, lex, parse, and analyze a Tangerine source file.
+///
+/// When the file lives inside a repository that contains a `std/` folder,
+/// standard-library definitions are loaded automatically so that `use std::*`
+/// imports resolve.
 ///
 /// # Errors
 /// Returns `Stage0Error` if the file cannot be read or if any compiler phase fails.
 pub fn analyze_module_from_path(path: &Path) -> Result<(Module, SemanticEnv), Stage0Error> {
-    let module = parse_module_from_path(path)?;
-    let env = analyze(&module)?;
-    Ok((module, env))
+    let mut module = parse_module_from_path(path)?;
+    let cfg = CfgConfig::from_env();
+    filter_module_by_cfg(&mut module, &cfg);
+    if std::env::var("TG_TRACE").is_ok() {
+        eprintln!("[driver] after parse: vm={} KB brk={}", vm_size_kb(), brk_addr());
+    }
+    let support_env = build_support_env_for_file(path)?;
+    if std::env::var("TG_TRACE").is_ok() {
+        eprintln!("[driver] after build_support_env: vm={} KB brk={} env_items={} impls={}", vm_size_kb(), brk_addr(),
+            support_env.structs.len() + support_env.enums.len() + support_env.traits.len()
+            + support_env.functions.len() + support_env.type_aliases.len()
+            + support_env.consts.len() + support_env.globals.len()
+            + support_env.aliases.len() + support_env.impls.len(),
+            support_env.impls.len());
+    }
+    let mut file_env = SemanticEnv::collect(&module).map(normalize_semantic_env_aliases)?;
+    if std::env::var("TG_TRACE").is_ok() {
+        eprintln!("[driver] after file_env collect: vm={} KB brk={} file_items={}", vm_size_kb(), brk_addr(),
+            file_env.structs.len() + file_env.enums.len() + file_env.traits.len()
+            + file_env.functions.len() + file_env.type_aliases.len()
+            + file_env.consts.len() + file_env.globals.len()
+            + file_env.aliases.len() + file_env.impls.len());
+    }
+    merge_semantic_env(&mut file_env, &support_env, false);
+    if std::env::var("TG_TRACE").is_ok() {
+        eprintln!("[driver] after merge: vm={} KB brk={} merged_items={} impls={}", vm_size_kb(), brk_addr(),
+            file_env.structs.len() + file_env.enums.len() + file_env.traits.len()
+            + file_env.functions.len() + file_env.type_aliases.len()
+            + file_env.consts.len() + file_env.globals.len()
+            + file_env.aliases.len() + file_env.impls.len(),
+            file_env.impls.len());
+    }
+    drop(support_env);
+    // After building the support environment, the heap is heavily fragmented
+    // (glibc brk grows to ~2 GB despite only ~35 MB peak live data).
+    // Force glibc to release unused heap pages back to the OS so that
+    // subsequent allocations during analysis can succeed within ulimit -v.
+    trim_heap();
+    if std::env::var("TG_TRACE").is_ok() {
+        eprintln!("[driver] after drop support_env + trim: vm={} KB brk={}", vm_size_kb(), brk_addr());
+    }
+    analyze_with_env(&module, &file_env)?;
+    Ok((module, file_env))
 }
 
 /// Read, lex, parse, analyze, emit Rust, and validate the generated Rust for a Tangerine file.
@@ -38,7 +350,9 @@ pub fn codegen_module_from_path(path: &Path) -> Result<(), Stage0Error> {
     let rust = emit_rust(&module, &env)?;
     let temp_path = write_temp_rust_file(path, &rust)?;
     let check_result = rustc_check(&temp_path);
-    remove_codegen_artifacts(&temp_path);
+    if !should_keep_codegen_artifacts() {
+        remove_codegen_artifacts(&temp_path);
+    }
     check_result
 }
 
@@ -59,40 +373,60 @@ pub fn parse_module_from_path(path: &Path) -> Result<Module, Stage0Error> {
 
 /// Analyze every `.tg` file directly inside a repository folder and return successes and failures.
 ///
+/// Memory-efficient: environments are re-collected from ASTs on demand rather
+/// than stored simultaneously, keeping peak memory close to `shared_env` + one
+/// file env instead of `shared_env` + N file envs.
+///
 /// # Errors
 /// Returns `Stage0Error` if the directory itself cannot be read.
 pub fn analyze_directory(path: &Path) -> Result<Vec<FileAnalysis>, Stage0Error> {
     let parsed = parse_directory_modules(path)?;
-    let support_env = build_support_env(path)?;
-    let mut shared_env = support_env.clone();
-    let mut file_envs = Vec::with_capacity(parsed.len());
+    let mut shared_env = build_support_env(path)?;
+
+    // Phase 1: qualify and merge each file env + count raw names (one at a time).
+    let mut raw_name_counts = RawNameCounts::default();
     for (file_path, result) in &parsed {
-        let file_env = match result {
-            Ok(module) => SemanticEnv::collect(module).map(normalize_semantic_env_aliases),
-            Err(error) => Err(error.clone()),
-        };
-        if let Ok(env) = &file_env {
-            merge_semantic_env(&mut shared_env, &qualify_semantic_env(env.clone(), file_path), false);
-        }
-        file_envs.push(file_env);
-    }
-    let raw_name_counts = collect_raw_name_counts(&file_envs);
-    for file_env in &file_envs {
-        if let Ok(env) = file_env {
-            merge_unique_raw_semantic_env(&mut shared_env, env, &raw_name_counts);
+        if let Ok(module) = result {
+            if let Ok(env) = SemanticEnv::collect(module).map(normalize_semantic_env_aliases) {
+                merge_semantic_env(&mut shared_env, &qualify_semantic_env(&env, file_path), false);
+                count_raw_names(&mut raw_name_counts.structs, env.structs.keys());
+                count_raw_names(&mut raw_name_counts.enums, env.enums.keys());
+                count_raw_names(&mut raw_name_counts.traits, env.traits.keys());
+                count_raw_names(&mut raw_name_counts.functions, env.functions.keys());
+                count_raw_names(&mut raw_name_counts.type_aliases, env.type_aliases.keys());
+                count_raw_names(&mut raw_name_counts.consts, env.consts.keys());
+                count_raw_names(&mut raw_name_counts.globals, env.globals.keys());
+            }
         }
     }
 
-    let mut results = Vec::with_capacity(parsed.len());
-    for ((file_path, result), file_env) in parsed.into_iter().zip(file_envs) {
-        let analyzed = match (result, file_env) {
-            (Ok(module), Ok(file_specific_env)) => {
-                let mut env = shared_env.clone();
-                merge_semantic_env(&mut env, &file_specific_env, true);
-                analyze_with_env(&module, &env).map(|()| module)
+
+    // Phase 2: merge unique raw names (one env at a time, re-collected).
+    for (_file_path, result) in &parsed {
+        if let Ok(module) = result {
+            if let Ok(env) = SemanticEnv::collect(module).map(normalize_semantic_env_aliases) {
+                merge_unique_raw_semantic_env(&mut shared_env, &env, &raw_name_counts);
             }
-            (Ok(module), Err(_)) => Ok(module),
-            (Err(error), _) => Err(error),
+        }
+    }
+
+    // Phase 3: analyze each file (re-collect file env as needed).
+    let mut results = Vec::with_capacity(parsed.len());
+    for (_i, (file_path, result)) in parsed.into_iter().enumerate() {
+        let analyzed = match result {
+            Ok(module) => {
+                match SemanticEnv::collect(&module).map(normalize_semantic_env_aliases) {
+                    Ok(file_specific_env) => {
+                        let snapshot_keys = snapshot_new_keys(&shared_env, &file_specific_env);
+                        merge_semantic_env(&mut shared_env, &file_specific_env, true);
+                        let result = analyze_with_env(&module, &shared_env).map(|()| module);
+                        remove_snapshot_keys(&mut shared_env, &snapshot_keys);
+                        result
+                    }
+                    Err(_) => Ok(module),
+                }
+            }
+            Err(error) => Err(error),
         };
         results.push((file_path, analyzed));
     }
@@ -111,40 +445,57 @@ pub fn codegen_directory(path: &Path) -> Result<Vec<CodegenAnalysis>, Stage0Erro
     let parsed = parse_directory_modules(path)?;
 
     let mut merged_env = build_support_env(path)?;
-    let mut file_envs = Vec::with_capacity(parsed.len());
+
+    // Phase 1: qualify and merge + count raw names (one env at a time).
+    let mut raw_name_counts = RawNameCounts::default();
     for (file_path, parsed_module) in &parsed {
-        let file_env = match parsed_module {
-            Ok(module) => SemanticEnv::collect(module).map(normalize_semantic_env_aliases),
-            Err(error) => Err(error.clone()),
-        };
-        if let Ok(env) = &file_env {
-            merge_semantic_env(&mut merged_env, &qualify_semantic_env(env.clone(), file_path), false);
-        }
-        file_envs.push(file_env);
-    }
-    let raw_name_counts = collect_raw_name_counts(&file_envs);
-    for file_env in &file_envs {
-        if let Ok(env) = file_env {
-            merge_unique_raw_semantic_env(&mut merged_env, env, &raw_name_counts);
+        if let Ok(module) = parsed_module {
+            if let Ok(env) = SemanticEnv::collect(module).map(normalize_semantic_env_aliases) {
+                merge_semantic_env(&mut merged_env, &qualify_semantic_env(&env, file_path), false);
+                count_raw_names(&mut raw_name_counts.structs, env.structs.keys());
+                count_raw_names(&mut raw_name_counts.enums, env.enums.keys());
+                count_raw_names(&mut raw_name_counts.traits, env.traits.keys());
+                count_raw_names(&mut raw_name_counts.functions, env.functions.keys());
+                count_raw_names(&mut raw_name_counts.type_aliases, env.type_aliases.keys());
+                count_raw_names(&mut raw_name_counts.consts, env.consts.keys());
+                count_raw_names(&mut raw_name_counts.globals, env.globals.keys());
+            }
         }
     }
 
-    let mut results = Vec::with_capacity(parsed.len());
-    for ((file_path, parsed_module), file_env) in parsed.into_iter().zip(file_envs) {
-        let result = match (parsed_module, file_env) {
-            (Ok(module), Ok(file_specific_env)) => {
-                let mut env = merged_env.clone();
-                merge_semantic_env(&mut env, &file_specific_env, true);
-                analyze_with_env(&module, &env)
-                    .and_then(|()| emit_rust(&module, &env))
-                    .and_then(|rust| {
-                        let temp_path = write_temp_rust_file(&file_path, &rust)?;
-                        let check_result = rustc_check(&temp_path);
-                        remove_codegen_artifacts(&temp_path);
-                        check_result
-                    })
+    // Phase 2: merge unique raw names (re-collect one at a time).
+    for (_file_path, parsed_module) in &parsed {
+        if let Ok(module) = parsed_module {
+            if let Ok(env) = SemanticEnv::collect(module).map(normalize_semantic_env_aliases) {
+                merge_unique_raw_semantic_env(&mut merged_env, &env, &raw_name_counts);
             }
-            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    // Phase 3: analyze + codegen each file (re-collect env as needed).
+    let mut results = Vec::with_capacity(parsed.len());
+    for (file_path, parsed_module) in parsed {
+        let result = match parsed_module {
+            Ok(module) => {
+                match SemanticEnv::collect(&module).map(normalize_semantic_env_aliases) {
+                    Ok(file_specific_env) => {
+                        let snapshot_keys = snapshot_new_keys(&merged_env, &file_specific_env);
+                        merge_semantic_env(&mut merged_env, &file_specific_env, true);
+                        let result = analyze_with_env(&module, &merged_env)
+                            .and_then(|()| emit_rust(&module, &merged_env))
+                            .and_then(|rust| {
+                                let temp_path = write_temp_rust_file(&file_path, &rust)?;
+                                let check_result = rustc_check(&temp_path);
+                                remove_codegen_artifacts(&temp_path);
+                                check_result
+                            });
+                        remove_snapshot_keys(&mut merged_env, &snapshot_keys);
+                        result
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
         };
         results.push((file_path, result));
     }
@@ -154,6 +505,7 @@ pub fn codegen_directory(path: &Path) -> Result<Vec<CodegenAnalysis>, Stage0Erro
 
 fn parse_directory_modules(path: &Path) -> Result<Vec<FileAnalysis>, Stage0Error> {
     let mut parsed = Vec::new();
+    let cfg = CfgConfig::from_env();
     let entries = fs::read_dir(path).map_err(|error| {
         Stage0Error::parse(
             Span::new(1, 1, 0, 0),
@@ -166,7 +518,11 @@ fn parse_directory_modules(path: &Path) -> Result<Vec<FileAnalysis>, Stage0Error
         })?;
         let file_path = entry.path();
         if file_path.extension().and_then(|ext| ext.to_str()) == Some("tg") {
-            parsed.push((file_path.clone(), parse_module_from_path(&file_path)));
+            let result = parse_module_from_path(&file_path).map(|mut module| {
+                filter_module_by_cfg(&mut module, &cfg);
+                module
+            });
+            parsed.push((file_path, result));
         }
     }
     parsed.sort_by(|left, right| left.0.cmp(&right.0));
@@ -178,48 +534,125 @@ fn build_support_env(path: &Path) -> Result<SemanticEnv, Stage0Error> {
     let Some(repo_root) = path.parent() else {
         return Ok(support_env);
     };
-    for support_name in ["std", "tg_compiler"] {
-        let support_dir = repo_root.join(support_name);
-        if !support_dir.is_dir() || support_dir == path {
-            continue;
-        }
-
-        let mut file_envs = Vec::new();
-
-        for (file_path, parsed_module) in parse_directory_modules(&support_dir)? {
-            if let Ok(module) = parsed_module {
-                if let Ok(env) = SemanticEnv::collect(&module) {
-                    let env = normalize_semantic_env_aliases(env);
-                    if support_name == "std" {
-                        merge_semantic_env(&mut support_env, &env, false);
-                    } else {
-                        file_envs.push(env.clone());
-                    }
-                    merge_semantic_env(&mut support_env, &qualify_semantic_env(env, &file_path), false);
-                }
-            }
-        }
-
-        if support_name == "tg_compiler" {
-            let raw_name_counts = collect_raw_name_counts(
-                &file_envs
-                    .iter()
-                    .cloned()
-                    .map(Ok)
-                    .collect::<Vec<Result<SemanticEnv, Stage0Error>>>(),
-            );
-            for env in &file_envs {
-                merge_unique_raw_semantic_env(&mut support_env, env, &raw_name_counts);
-            }
-        }
-    }
-
+    load_support_dirs(&mut support_env, repo_root, path)?;
     Ok(support_env)
 }
 
-fn qualify_semantic_env(env: SemanticEnv, file_path: &Path) -> SemanticEnv {
+/// Build a support environment for analysing a single `.tg` file.
+/// Walks up the directory tree from the file to find a repo root that
+/// contains a `std/` folder.
+fn build_support_env_for_file(file_path: &Path) -> Result<SemanticEnv, Stage0Error> {
+    let mut support_env = SemanticEnv::default();
+    let abs = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let mut candidate = abs.parent();
+    while let Some(dir) = candidate {
+        if dir.join("std").is_dir() {
+            load_support_dirs(&mut support_env, dir, dir)?;
+            break;
+        }
+        candidate = dir.parent();
+    }
+    Ok(support_env)
+}
+
+fn load_support_dirs(
+    support_env: &mut SemanticEnv,
+    repo_root: &Path,
+    caller_path: &Path,
+) -> Result<(), Stage0Error> {
+    let caller_canonical = caller_path.canonicalize().unwrap_or_else(|_| caller_path.to_path_buf());
+    for support_name in ["std", "tg_compiler"] {
+        let support_dir = repo_root.join(support_name);
+        if !support_dir.is_dir() {
+            continue;
+        }
+        let support_canonical = support_dir.canonicalize().unwrap_or_else(|_| support_dir.clone());
+        if support_canonical == caller_canonical {
+            continue;
+        }
+
+        // Collect sorted file paths first (lightweight).
+        let file_paths = sorted_tg_paths(&support_dir)?;
+        let mut raw_counts = RawNameCounts::default();
+        let cfg = CfgConfig::from_env();
+
+        // First pass: parse one file at a time, collect qualified names and count raw names.
+        for (i, file_path) in file_paths.iter().enumerate() {
+            if let Ok(mut module) = parse_module_from_path(file_path) {
+                filter_module_by_cfg(&mut module, &cfg);
+                if let Ok(env) = SemanticEnv::collect(&module) {
+                    let env = normalize_semantic_env_aliases(env);
+                    merge_semantic_env(support_env, &qualify_semantic_env(&env, file_path), false);
+                    if support_name == "std" {
+                        merge_semantic_env(support_env, &env, false);
+                    } else {
+                        count_raw_names(&mut raw_counts.structs, env.structs.keys());
+                        count_raw_names(&mut raw_counts.enums, env.enums.keys());
+                        count_raw_names(&mut raw_counts.traits, env.traits.keys());
+                        count_raw_names(&mut raw_counts.functions, env.functions.keys());
+                        count_raw_names(&mut raw_counts.type_aliases, env.type_aliases.keys());
+                        count_raw_names(&mut raw_counts.consts, env.consts.keys());
+                        count_raw_names(&mut raw_counts.globals, env.globals.keys());
+                    }
+                }
+            }
+            if std::env::var("TG_TRACE").is_ok() {
+                let vm = vm_size_kb();
+                eprintln!("[driver] pass1 {support_name} {}/{}: vm={vm} KB – {}", i + 1, file_paths.len(), file_path.file_name().unwrap_or_default().to_string_lossy());
+            }
+            // module and env dropped here — only one alive at a time
+        }
+        trim_heap();
+
+        // Second pass for tg_compiler: merge unique raw names (re-parse one at a time).
+        if support_name == "tg_compiler" {
+            for (i, file_path) in file_paths.iter().enumerate() {
+                if let Ok(mut module) = parse_module_from_path(file_path) {
+                    filter_module_by_cfg(&mut module, &cfg);
+                    if let Ok(env) = SemanticEnv::collect(&module) {
+                        let env = normalize_semantic_env_aliases(env);
+                        merge_unique_raw_semantic_env(support_env, &env, &raw_counts);
+                    }
+                }
+                if std::env::var("TG_TRACE").is_ok() {
+                    let vm = vm_size_kb();
+                    eprintln!("[driver] pass2 {support_name} {}/{}: vm={vm} KB – {}", i + 1, file_paths.len(), file_path.file_name().unwrap_or_default().to_string_lossy());
+                }
+            }
+            trim_heap();
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect sorted `.tg` file paths from a directory without parsing.
+fn sorted_tg_paths(dir: &Path) -> Result<Vec<PathBuf>, Stage0Error> {
+    let entries = fs::read_dir(dir).map_err(|error| {
+        Stage0Error::parse(
+            Span::new(1, 1, 0, 0),
+            format!("failed to read directory {}: {error}", dir.display()),
+        )
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            Stage0Error::parse(Span::new(1, 1, 0, 0), format!("failed to read directory entry: {error}"))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("tg") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn qualify_semantic_env(env: &SemanticEnv, file_path: &Path) -> SemanticEnv {
     let Some(stem) = file_path.file_stem().and_then(|stem| stem.to_str()) else {
-        return env;
+        return env.clone();
     };
     let mut qualified = SemanticEnv::default();
     let mut prefixes = vec![stem.to_string()];
@@ -245,21 +678,48 @@ fn qualify_semantic_env(env: SemanticEnv, file_path: &Path) -> SemanticEnv {
         .collect::<BTreeSet<_>>();
     let aliases = env.aliases.clone();
 
+    // Deduplicate impls within the source env first by (trait_name, for_type) key
+    let mut seen_impl_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unique_impls: Vec<crate::sema::env::ImplInfo> = Vec::new();
+    for impl_info in env.impls.iter() {
+        let key = format!("{} for {}", impl_info.trait_name, impl_info.for_type);
+        if seen_impl_keys.insert(key) {
+            unique_impls.push(impl_info.clone());
+        }
+    }
+
     for prefix in &prefixes {
-        insert_prefixed_structs(&mut qualified.structs, &env.structs, prefix, &local_type_names, &aliases);
-        insert_prefixed_enums(&mut qualified.enums, &env.enums, prefix, &local_type_names, &aliases);
-        insert_prefixed_traits(&mut qualified.traits, &env.traits, prefix, &local_type_names, &aliases);
-        insert_prefixed_functions(&mut qualified.functions, &env.functions, prefix, &local_type_names, &aliases);
-        insert_prefixed_type_aliases(&mut qualified.type_aliases, &env.type_aliases, prefix, &local_type_names, &aliases);
-        insert_prefixed_consts(&mut qualified.consts, &env.consts, prefix, &local_type_names, &aliases);
-        insert_prefixed_globals(&mut qualified.globals, &env.globals, prefix, &local_type_names, &aliases);
-        insert_prefixed_aliases(&mut qualified.aliases, &env.aliases, prefix, &local_type_names, &aliases);
-        for impl_info in &env.impls {
-            qualified.impls.push(qualify_impl_info(impl_info, prefix, &local_type_names, &aliases));
+        insert_prefixed_structs(Rc::make_mut(&mut qualified.structs), &env.structs, prefix, &local_type_names, &aliases);
+        insert_prefixed_enums(Rc::make_mut(&mut qualified.enums), &env.enums, prefix, &local_type_names, &aliases);
+        insert_prefixed_traits(Rc::make_mut(&mut qualified.traits), &env.traits, prefix, &local_type_names, &aliases);
+        insert_prefixed_functions(Rc::make_mut(&mut qualified.functions), &env.functions, prefix, &local_type_names, &aliases);
+        insert_prefixed_type_aliases(Rc::make_mut(&mut qualified.type_aliases), &env.type_aliases, prefix, &local_type_names, &aliases);
+        insert_prefixed_consts(Rc::make_mut(&mut qualified.consts), &env.consts, prefix, &local_type_names, &aliases);
+        insert_prefixed_globals(Rc::make_mut(&mut qualified.globals), &env.globals, prefix, &local_type_names, &aliases);
+        insert_prefixed_aliases(Rc::make_mut(&mut qualified.aliases), &env.aliases, prefix, &local_type_names, &aliases);
+        for impl_info in unique_impls.iter() {
+            Rc::make_mut(&mut qualified.impls).push(qualify_impl_info(impl_info, prefix, &local_type_names, &aliases));
         }
     }
 
     qualified
+}
+
+/// Unwrap an `Rc`, returning the inner value if the reference count is one,
+/// or cloning the contents otherwise.
+fn unwrap_rc<T: Clone>(rc: Rc<T>) -> T {
+    Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone())
+}
+
+fn compact_function_body(body: &FunctionBody) -> FunctionBody {
+    match body {
+        FunctionBody::Declaration { span } => FunctionBody::Declaration { span: *span },
+        FunctionBody::Block(block) => FunctionBody::Block(BlockBody {
+            stmts: Vec::new(),
+            tail: None,
+            span: block.span,
+        }),
+    }
 }
 
 fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
@@ -268,8 +728,7 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
     let empty_prefix = "";
 
     SemanticEnv {
-        structs: env
-            .structs
+        structs: Rc::new(unwrap_rc(env.structs)
             .into_iter()
             .map(|(name, decl)| {
                 let normalized = StructDecl {
@@ -282,9 +741,8 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
                 };
                 (name, normalized)
             })
-            .collect(),
-        enums: env
-            .enums
+            .collect()),
+        enums: Rc::new(unwrap_rc(env.enums)
             .into_iter()
             .map(|(name, decl)| {
                 let normalized = EnumDecl {
@@ -310,9 +768,8 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
                 };
                 (name, normalized)
             })
-            .collect(),
-        traits: env
-            .traits
+            .collect()),
+        traits: Rc::new(unwrap_rc(env.traits)
             .into_iter()
             .map(|(name, decl)| {
                 let normalized = TraitDecl {
@@ -331,7 +788,7 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
                         .map(|method| FunctionDecl {
                             sig: qualify_function_sig(&method.sig, empty_prefix, &local_type_names, &aliases),
                             clauses: method.clauses.clone(),
-                            body: method.body.clone(),
+                            body: compact_function_body(&method.body),
                             span: method.span,
                         })
                         .collect(),
@@ -352,24 +809,20 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
                 };
                 (name, normalized)
             })
-            .collect(),
-        functions: env
-            .functions
+            .collect()),
+        functions: Rc::new(unwrap_rc(env.functions)
             .into_iter()
             .map(|(name, sig)| (name, qualify_function_sig(&sig, empty_prefix, &local_type_names, &aliases)))
-            .collect(),
-        type_aliases: env
-            .type_aliases
+            .collect()),
+        type_aliases: Rc::new(unwrap_rc(env.type_aliases)
             .into_iter()
             .map(|(name, ty)| (name, qualify_type_ref(&ty, empty_prefix, &local_type_names, &aliases)))
-            .collect(),
-        consts: env
-            .consts
+            .collect()),
+        consts: Rc::new(unwrap_rc(env.consts)
             .into_iter()
             .map(|(name, ty)| (name, qualify_type_ref(&ty, empty_prefix, &local_type_names, &aliases)))
-            .collect(),
-        globals: env
-            .globals
+            .collect()),
+        globals: Rc::new(unwrap_rc(env.globals)
             .into_iter()
             .map(|(name, global)| {
                 (
@@ -380,24 +833,42 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
                     },
                 )
             })
-            .collect(),
+            .collect()),
         aliases: env.aliases,
-        impls: env
+        impls: Rc::new(env
             .impls
             .iter()
             .map(|impl_info| qualify_impl_info(impl_info, empty_prefix, &local_type_names, &aliases))
-            .collect(),
+            .collect()),
         active_trait: env.active_trait,
+        fn_return_type: None,
     }
 }
 
-fn resolve_imported_alias(name: &str, aliases: &std::collections::BTreeMap<String, String>) -> String {
+fn is_self_referencing_alias(alias: &str, target: &str) -> bool {
+    target.starts_with(alias)
+        && target
+            .get(alias.len()..)
+            .is_some_and(|suffix| suffix.starts_with("::"))
+}
+
+fn resolve_imported_alias(
+    name: &str,
+    prefix: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> String {
     if let Some(resolved) = aliases.get(name) {
+        if !prefix.is_empty() && is_self_referencing_alias(name, resolved) {
+            return format!("{prefix}::{resolved}");
+        }
         return resolved.clone();
     }
     if let Some((head, tail)) = name.split_once("::") {
-        if let Some(prefix) = aliases.get(head) {
-            return format!("{prefix}::{tail}");
+        if let Some(target) = aliases.get(head) {
+            if !prefix.is_empty() && is_self_referencing_alias(head, target) {
+                return format!("{prefix}::{name}");
+            }
+            return format!("{target}::{tail}");
         }
     }
     name.to_string()
@@ -409,7 +880,7 @@ fn qualify_named_symbol(
     local_type_names: &BTreeSet<String>,
     aliases: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let resolved = resolve_imported_alias(name, aliases);
+    let resolved = resolve_imported_alias(name, prefix, aliases);
     if resolved != name {
         return resolved;
     }
@@ -639,7 +1110,7 @@ fn insert_prefixed_traits(
                 .map(|method| FunctionDecl {
                     sig: qualify_function_sig(&method.sig, prefix, local_type_names, aliases),
                     clauses: method.clauses.clone(),
-                    body: method.body.clone(),
+                    body: compact_function_body(&method.body),
                     span: method.span,
                 })
                 .collect(),
@@ -780,32 +1251,71 @@ fn qualify_impl_info(
 }
 
 fn merge_semantic_env(target: &mut SemanticEnv, source: &SemanticEnv, overwrite: bool) {
-    merge_map(&mut target.structs, &source.structs, overwrite);
-    merge_map(&mut target.enums, &source.enums, overwrite);
-    merge_map(&mut target.traits, &source.traits, overwrite);
-    merge_map(&mut target.functions, &source.functions, overwrite);
-    merge_map(&mut target.type_aliases, &source.type_aliases, overwrite);
-    merge_map(&mut target.consts, &source.consts, overwrite);
-    merge_map(&mut target.globals, &source.globals, overwrite);
-    merge_map(&mut target.aliases, &source.aliases, overwrite);
-    target.impls.extend(source.impls.clone());
+    merge_map(Rc::make_mut(&mut target.structs), &source.structs, overwrite);
+    merge_map(Rc::make_mut(&mut target.enums), &source.enums, overwrite);
+    merge_map(Rc::make_mut(&mut target.traits), &source.traits, overwrite);
+    merge_map(Rc::make_mut(&mut target.functions), &source.functions, overwrite);
+    merge_map(Rc::make_mut(&mut target.type_aliases), &source.type_aliases, overwrite);
+    merge_map(Rc::make_mut(&mut target.consts), &source.consts, overwrite);
+    merge_map(Rc::make_mut(&mut target.globals), &source.globals, overwrite);
+    merge_map(Rc::make_mut(&mut target.aliases), &source.aliases, overwrite);
+    
+    // Deduplicate impls by (trait_name, for_type) key to prevent unbounded growth
+    let target_impls = Rc::make_mut(&mut target.impls);
+    let mut seen_impls = std::collections::BTreeSet::new();
+    for impl_info in target_impls.iter() {
+        let key = format!("{} for {}", impl_info.trait_name, impl_info.for_type);
+        seen_impls.insert(key);
+    }
+    for impl_info in source.impls.iter() {
+        let key = format!("{} for {}", impl_info.trait_name, impl_info.for_type);
+        if overwrite || !seen_impls.contains(&key) {
+            if seen_impls.insert(key) {
+                target_impls.push(impl_info.clone());
+            }
+        }
+    }
 }
 
-fn collect_raw_name_counts(file_envs: &[Result<SemanticEnv, Stage0Error>]) -> RawNameCounts {
-    let mut counts = RawNameCounts::default();
-    for file_env in file_envs {
-        let Ok(env) = file_env else {
-            continue;
-        };
-        count_raw_names(&mut counts.structs, env.structs.keys());
-        count_raw_names(&mut counts.enums, env.enums.keys());
-        count_raw_names(&mut counts.traits, env.traits.keys());
-        count_raw_names(&mut counts.functions, env.functions.keys());
-        count_raw_names(&mut counts.type_aliases, env.type_aliases.keys());
-        count_raw_names(&mut counts.consts, env.consts.keys());
-        count_raw_names(&mut counts.globals, env.globals.keys());
+/// Record which keys from `source` are new (absent from `target`) so they can
+/// be removed after a temporary merge.
+struct EnvKeySnapshot {
+    structs: Vec<String>,
+    enums: Vec<String>,
+    traits: Vec<String>,
+    functions: Vec<String>,
+    type_aliases: Vec<String>,
+    consts: Vec<String>,
+    globals: Vec<String>,
+    aliases: Vec<String>,
+}
+
+fn snapshot_new_keys(target: &SemanticEnv, source: &SemanticEnv) -> EnvKeySnapshot {
+    EnvKeySnapshot {
+        structs: new_map_keys(&target.structs, &source.structs),
+        enums: new_map_keys(&target.enums, &source.enums),
+        traits: new_map_keys(&target.traits, &source.traits),
+        functions: new_map_keys(&target.functions, &source.functions),
+        type_aliases: new_map_keys(&target.type_aliases, &source.type_aliases),
+        consts: new_map_keys(&target.consts, &source.consts),
+        globals: new_map_keys(&target.globals, &source.globals),
+        aliases: new_map_keys(&target.aliases, &source.aliases),
     }
-    counts
+}
+
+fn new_map_keys<V1, V2>(target: &std::collections::BTreeMap<String, V1>, source: &std::collections::BTreeMap<String, V2>) -> Vec<String> {
+    source.keys().filter(|k| !target.contains_key(*k)).cloned().collect()
+}
+
+fn remove_snapshot_keys(env: &mut SemanticEnv, snapshot: &EnvKeySnapshot) {
+    for key in &snapshot.structs { Rc::make_mut(&mut env.structs).remove(key); }
+    for key in &snapshot.enums { Rc::make_mut(&mut env.enums).remove(key); }
+    for key in &snapshot.traits { Rc::make_mut(&mut env.traits).remove(key); }
+    for key in &snapshot.functions { Rc::make_mut(&mut env.functions).remove(key); }
+    for key in &snapshot.type_aliases { Rc::make_mut(&mut env.type_aliases).remove(key); }
+    for key in &snapshot.consts { Rc::make_mut(&mut env.consts).remove(key); }
+    for key in &snapshot.globals { Rc::make_mut(&mut env.globals).remove(key); }
+    for key in &snapshot.aliases { Rc::make_mut(&mut env.aliases).remove(key); }
 }
 
 fn count_raw_names<'a>(counts: &mut std::collections::BTreeMap<String, usize>, names: impl Iterator<Item = &'a String>) {
@@ -818,13 +1328,13 @@ fn count_raw_names<'a>(counts: &mut std::collections::BTreeMap<String, usize>, n
 }
 
 fn merge_unique_raw_semantic_env(target: &mut SemanticEnv, source: &SemanticEnv, counts: &RawNameCounts) {
-    merge_unique_raw_map(&mut target.structs, &source.structs, &counts.structs);
-    merge_unique_raw_map(&mut target.enums, &source.enums, &counts.enums);
-    merge_unique_raw_map(&mut target.traits, &source.traits, &counts.traits);
-    merge_unique_raw_map(&mut target.functions, &source.functions, &counts.functions);
-    merge_unique_raw_map(&mut target.type_aliases, &source.type_aliases, &counts.type_aliases);
-    merge_unique_raw_map(&mut target.consts, &source.consts, &counts.consts);
-    merge_unique_raw_map(&mut target.globals, &source.globals, &counts.globals);
+    merge_unique_raw_map(Rc::make_mut(&mut target.structs), &source.structs, &counts.structs);
+    merge_unique_raw_map(Rc::make_mut(&mut target.enums), &source.enums, &counts.enums);
+    merge_unique_raw_map(Rc::make_mut(&mut target.traits), &source.traits, &counts.traits);
+    merge_unique_raw_map(Rc::make_mut(&mut target.functions), &source.functions, &counts.functions);
+    merge_unique_raw_map(Rc::make_mut(&mut target.type_aliases), &source.type_aliases, &counts.type_aliases);
+    merge_unique_raw_map(Rc::make_mut(&mut target.consts), &source.consts, &counts.consts);
+    merge_unique_raw_map(Rc::make_mut(&mut target.globals), &source.globals, &counts.globals);
 }
 
 fn merge_unique_raw_map<T: Clone>(
@@ -880,6 +1390,12 @@ fn write_temp_rust_file(source_path: &Path, rust: &str) -> Result<PathBuf, Stage
     Ok(temp_path)
 }
 
+fn should_keep_codegen_artifacts() -> bool {
+    std::env::var("TG_KEEP_CODEGEN_ARTIFACTS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn remove_codegen_artifacts(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("rmeta"));
@@ -888,11 +1404,12 @@ fn remove_codegen_artifacts(path: &Path) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use crate::ast::decl::{EnumDecl, FunctionSig, VariantDecl};
     use crate::sema::SemanticEnv;
 
-    use super::{analyze_directory, analyze_module_from_path, build_support_env, codegen_module_from_path, merge_semantic_env, parse_module_from_path, qualify_semantic_env};
+    use super::{analyze_directory, analyze_module_from_path, build_support_env, build_support_env_for_file, codegen_module_from_path, merge_semantic_env, parse_module_from_path, qualify_semantic_env};
 
     #[test]
     fn analyzes_real_repo_fixture() {
@@ -903,8 +1420,9 @@ mod tests {
         let fixture = repo_root.join("golden/frontend_01.tg");
         let (module, env) = analyze_module_from_path(&fixture).expect("fixture should analyze successfully");
         assert_eq!(module.decls.len(), 3);
-        assert!(env.structs.is_empty());
-        assert!(env.traits.is_empty());
+        assert!(env.functions.contains_key("add"));
+        assert!(env.functions.contains_key("identity"));
+        assert!(env.functions.contains_key("constant"));
     }
 
     #[test]
@@ -966,7 +1484,7 @@ mod tests {
     #[test]
     fn qualifies_lib_exports_at_directory_root() {
         let mut env = SemanticEnv::default();
-        env.functions.insert(
+        Rc::make_mut(&mut env.functions).insert(
             "tokenize".to_string(),
             FunctionSig {
                 name: "tokenize".to_string(),
@@ -985,7 +1503,7 @@ mod tests {
             .parent()
             .expect("stage0_rs should live directly under the repo root")
             .to_path_buf();
-        let qualified = qualify_semantic_env(env, &repo_root.join("tg_compiler/lib.tg"));
+        let qualified = qualify_semantic_env(&env, &repo_root.join("tg_compiler/lib.tg"));
 
         assert!(qualified.functions.contains_key("tg_compiler::tokenize"));
         assert!(qualified.functions.contains_key("tg_compiler::lib::tokenize"));
@@ -994,8 +1512,8 @@ mod tests {
     #[test]
     fn qualifies_imported_alias_types_in_function_signatures() {
         let mut env = SemanticEnv::default();
-        env.aliases.insert("Value".to_string(), "std::serde::Value".to_string());
-        env.functions.insert(
+        Rc::make_mut(&mut env.aliases).insert("Value".to_string(), "std::serde::Value".to_string());
+        Rc::make_mut(&mut env.functions).insert(
             "json_parse".to_string(),
             FunctionSig {
                 name: "json_parse".to_string(),
@@ -1016,7 +1534,7 @@ mod tests {
             .parent()
             .expect("stage0_rs should live directly under the repo root")
             .to_path_buf();
-        let qualified = qualify_semantic_env(env, &repo_root.join("std/json.tg"));
+        let qualified = qualify_semantic_env(&env, &repo_root.join("std/json.tg"));
         let json_parse = qualified
             .functions
             .get("std::json::json_parse")
@@ -1035,16 +1553,16 @@ mod tests {
     #[test]
     fn preserves_qualified_alias_chains_for_reexports() {
         let mut json_env = SemanticEnv::default();
-        json_env.aliases.insert("Value".to_string(), "std::serde::Value".to_string());
+        Rc::make_mut(&mut json_env.aliases).insert("Value".to_string(), "std::serde::Value".to_string());
 
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("stage0_rs should live directly under the repo root")
             .to_path_buf();
-        let qualified_json_env = qualify_semantic_env(json_env, &repo_root.join("std/json.tg"));
+        let qualified_json_env = qualify_semantic_env(&json_env, &repo_root.join("std/json.tg"));
 
         let mut merged = SemanticEnv::default();
-        merged.enums.insert(
+        Rc::make_mut(&mut merged.enums).insert(
             "std::serde::Value".to_string(),
             EnumDecl {
                 name: "std::serde::Value".to_string(),
@@ -1060,7 +1578,7 @@ mod tests {
                 span: crate::span::Span::new(1, 1, 0, 0),
             },
         );
-        merged.aliases.insert("Value".to_string(), "std::json::Value".to_string());
+        Rc::make_mut(&mut merged.aliases).insert("Value".to_string(), "std::json::Value".to_string());
         merge_semantic_env(&mut merged, &qualified_json_env, false);
 
         assert_eq!(merged.resolve_alias_path("Value"), "std::serde::Value");
@@ -1082,7 +1600,7 @@ mod tests {
             .expect("std/serde.tg declarations should collect directly");
         assert!(serde_env.enums.contains_key("Value"));
 
-        let qualified_serde_env = qualify_semantic_env(serde_env, &repo_root.join("std/serde.tg"));
+        let qualified_serde_env = qualify_semantic_env(&serde_env, &repo_root.join("std/serde.tg"));
         assert!(qualified_serde_env.enums.contains_key("std::serde::Value"));
 
         let support_env = build_support_env(&repo_root.join("golden")).expect("support env should build");
@@ -1092,5 +1610,60 @@ mod tests {
             .expect("std::serde::Value should exist in support env");
 
         assert!(value_enum.variants.iter().any(|variant| variant.name == "Object"));
+    }
+
+    #[test]
+    fn support_env_preserves_borrow_check_signature_shape() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("stage0_rs should live directly under the repo root")
+            .to_path_buf();
+        let driver_path = repo_root.join("tg_compiler/driver.tg");
+
+        let support_env = build_support_env_for_file(&driver_path)
+            .expect("support env should build for tg_compiler/driver.tg");
+        assert_eq!(
+            support_env.aliases.get("tg_compiler::borrow_check").cloned(),
+            Some("tg_compiler::borrow_check::borrow_check".to_string())
+        );
+        assert_eq!(
+            support_env.aliases.get("tg_compiler::driver::borrow_check").cloned(),
+            Some("tg_compiler::borrow_check::borrow_check".to_string())
+        );
+        assert_eq!(
+            support_env.aliases.get("tg_compiler::BorrowError").cloned(),
+            Some("tg_compiler::borrow_check::BorrowError".to_string())
+        );
+
+        let borrow_check_key = "tg_compiler::borrow_check::borrow_check".to_string();
+        let borrow_check_sig = support_env
+            .functions
+            .get(&borrow_check_key)
+            .expect("qualified borrow_check signature should be present");
+
+        assert_eq!(borrow_check_sig.params.len(), 1, "borrow_check params: {borrow_check_sig:?}");
+        match &borrow_check_sig.params[0].ty {
+            crate::ast::types::TypeRef::Ref { inner, .. } => match inner.as_ref() {
+                crate::ast::types::TypeRef::Named { name, .. } => {
+                    assert_eq!(name, "tg_compiler::ast::Program", "borrow_check param: {borrow_check_sig:?}");
+                }
+                other => panic!("borrow_check param should reference Program, found {other:?}"),
+            },
+            other => panic!("borrow_check param should be a ref, found {other:?}"),
+        }
+
+        match &borrow_check_sig.return_type {
+            crate::ast::types::TypeRef::Named { name, type_args, .. } => {
+                assert_eq!(name, "std::collections::Vec", "borrow_check return: {borrow_check_sig:?}");
+                assert_eq!(type_args.len(), 1, "borrow_check return: {borrow_check_sig:?}");
+                match &type_args[0] {
+                    crate::ast::types::TypeRef::Named { name, .. } => {
+                        assert_eq!(name, "tg_compiler::borrow_check::BorrowError", "borrow_check return: {borrow_check_sig:?}");
+                    }
+                    other => panic!("borrow_check return element should be BorrowError, found {other:?}"),
+                }
+            }
+            other => panic!("borrow_check return should be Vec[BorrowError], found {other:?}"),
+        }
     }
 }

@@ -1,24 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
-use crate::ast::decl::{ConstDecl, Decl, EnumDecl, FunctionSig, GlobalDecl, ImplDecl, MetaKind, Module, Param, StructDecl, TraitDecl, TypeAliasDecl};
-use crate::ast::expr::{Expr, FunctionBody};
+use crate::ast::decl::{ConstDecl, Decl, EnumDecl, FunctionDecl, FunctionSig, GlobalDecl, ImplDecl, MetaKind, Module, Param, StructDecl, TraitDecl, TypeAliasDecl};
+use crate::ast::expr::{BlockBody, Expr, FunctionBody};
 use crate::ast::types::TypeRef;
 use crate::error::Stage0Error;
 use crate::sema::is_builtin_named_type;
 use crate::span::Span;
 
+/// The semantic environment used during type-checking.
+///
+/// Large, rarely-mutated declaration maps are wrapped in `Rc` so that
+/// `env.clone()` (which happens for every nested scope) is nearly free —
+/// it only increments reference counts instead of deep-copying thousands
+/// of declarations.  The few mutation sites use `Rc::make_mut` for
+/// copy-on-write semantics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SemanticEnv {
-    pub structs: BTreeMap<String, StructDecl>,
-    pub enums: BTreeMap<String, EnumDecl>,
-    pub traits: BTreeMap<String, TraitDecl>,
-    pub functions: BTreeMap<String, FunctionSig>,
-    pub type_aliases: BTreeMap<String, TypeRef>,
-    pub consts: BTreeMap<String, TypeRef>,
-    pub globals: BTreeMap<String, GlobalInfo>,
-    pub aliases: BTreeMap<String, String>,
-    pub impls: Vec<ImplInfo>,
+    pub structs: Rc<BTreeMap<String, StructDecl>>,
+    pub enums: Rc<BTreeMap<String, EnumDecl>>,
+    pub traits: Rc<BTreeMap<String, TraitDecl>>,
+    pub functions: Rc<BTreeMap<String, FunctionSig>>,
+    pub type_aliases: Rc<BTreeMap<String, TypeRef>>,
+    pub consts: Rc<BTreeMap<String, TypeRef>>,
+    pub globals: Rc<BTreeMap<String, GlobalInfo>>,
+    pub aliases: Rc<BTreeMap<String, String>>,
+    pub impls: Rc<Vec<ImplInfo>>,
     pub active_trait: Option<String>,
+    /// The return type of the enclosing function.  Used by `Stmt::Return`
+    /// so that inner expression contexts (e.g. a let-binding annotation)
+    /// do not override the function-level expectation.
+    pub fn_return_type: Option<TypeRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +47,39 @@ pub struct ImplInfo {
     pub methods: BTreeMap<String, FunctionSig>,
     pub associated_types: BTreeMap<String, TypeRef>,
     pub span: Span,
+}
+
+fn compact_function_body(body: &FunctionBody) -> FunctionBody {
+    match body {
+        FunctionBody::Declaration { span } => FunctionBody::Declaration { span: *span },
+        FunctionBody::Block(block) => FunctionBody::Block(BlockBody {
+            stmts: Vec::new(),
+            tail: None,
+            span: block.span,
+        }),
+    }
+}
+
+fn compact_trait_decl(decl: &TraitDecl) -> TraitDecl {
+    TraitDecl {
+        name: decl.name.clone(),
+        public: decl.public,
+        type_params: decl.type_params.clone(),
+        supertraits: decl.supertraits.clone(),
+        where_clause: decl.where_clause.clone(),
+        methods: decl
+            .methods
+            .iter()
+            .map(|method| FunctionDecl {
+                sig: method.sig.clone(),
+                clauses: method.clauses.clone(),
+                body: compact_function_body(&method.body),
+                span: method.span,
+            })
+            .collect(),
+        associated_types: decl.associated_types.clone(),
+        span: decl.span,
+    }
 }
 
 impl SemanticEnv {
@@ -68,6 +113,12 @@ impl SemanticEnv {
                 break;
             };
             if next == resolved {
+                break;
+            }
+            // Detect growing-prefix cycles: if the new string simply prepends
+            // a prefix onto the old string (e.g. "X" → "X::X"), stop.
+            if next.starts_with(&resolved) && next[resolved.len()..].starts_with("::") {
+                resolved = next;
                 break;
             }
             resolved = next;
@@ -110,7 +161,7 @@ impl SemanticEnv {
     }
 
     fn validate_references(&self) -> Result<(), Stage0Error> {
-        for impl_info in &self.impls {
+        for impl_info in self.impls.iter() {
             let for_type = self.resolve_alias_path(&impl_info.for_type);
             if self.canonical_map_key(&for_type, &self.structs).is_none()
                 && self.canonical_map_key(&for_type, &self.enums).is_none()
@@ -175,7 +226,18 @@ impl SemanticEnv {
 fn resolve_alias_prefix(name: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
     let mut best_match: Option<(&String, &String)> = None;
     for (alias, target) in aliases {
-        if name == alias || name.strip_prefix(alias).is_some_and(|suffix| suffix.starts_with("::")) {
+        // Skip self-referencing aliases for prefix matching: if the target
+        // starts with "alias::", applying this to a prefix match would produce
+        // infinite expansion (e.g. alias "X" → "X::Y" applied to "X::Z"
+        // gives "X::Y::Z" which still has prefix "X").
+        let is_prefix_match = name != alias
+            && name.strip_prefix(alias.as_str()).is_some_and(|suffix| suffix.starts_with("::"));
+        let is_self_referencing = target.starts_with(alias.as_str())
+            && target[alias.len()..].starts_with("::");
+        if is_prefix_match && is_self_referencing {
+            continue;
+        }
+        if name == alias || is_prefix_match {
             let should_replace = best_match
                 .as_ref()
                 .is_none_or(|(current_alias, _)| alias.len() > current_alias.len());
@@ -250,7 +312,7 @@ fn collect_decl_scope(
         if let Decl::Meta(meta) = decl {
             if meta.kind == MetaKind::Use {
                 for (alias, target) in parse_use_aliases(&meta.detail) {
-                    let _ = env.aliases.insert(alias, target);
+                    let _ = Rc::make_mut(&mut env.aliases).insert(alias, target);
                 }
             }
         }
@@ -260,40 +322,40 @@ fn collect_decl_scope(
         match decl {
             Decl::Struct(struct_decl) => {
                 validate_struct_decl(struct_decl)?;
-                insert_unique_struct(&mut env.structs, struct_decl)?;
-                insert_qualified_struct(&mut env.structs, struct_decl, module_prefix, &local_type_names);
+                insert_unique_struct(Rc::make_mut(&mut env.structs), struct_decl)?;
+                insert_qualified_struct(Rc::make_mut(&mut env.structs), struct_decl, module_prefix, &local_type_names);
             }
             Decl::Enum(enum_decl) => {
                 validate_enum_decl(enum_decl)?;
-                insert_unique_enum(&mut env.enums, enum_decl)?;
-                insert_qualified_enum(&mut env.enums, enum_decl, module_prefix, &local_type_names);
+                insert_unique_enum(Rc::make_mut(&mut env.enums), enum_decl)?;
+                insert_qualified_enum(Rc::make_mut(&mut env.enums), enum_decl, module_prefix, &local_type_names);
             }
             Decl::Trait(trait_decl) => {
                 validate_trait_methods(trait_decl)?;
-                insert_unique_trait(&mut env.traits, trait_decl)?;
-                insert_qualified_trait(&mut env.traits, trait_decl, module_prefix, &local_type_names);
+                insert_unique_trait(Rc::make_mut(&mut env.traits), trait_decl)?;
+                insert_qualified_trait(Rc::make_mut(&mut env.traits), trait_decl, module_prefix, &local_type_names);
             }
             Decl::Impl(impl_decl) => {
                 let _ = named_type(&impl_decl.for_type)?;
-                env.impls.push(build_impl_info(impl_decl)?);
+                Rc::make_mut(&mut env.impls).push(build_impl_info(impl_decl)?);
             }
             Decl::Function(function_decl) => {
-                insert_unique_function(&mut env.functions, &function_decl.sig)?;
-                insert_qualified_function(&mut env.functions, &function_decl.sig, module_prefix, &local_type_names);
+                insert_unique_function(Rc::make_mut(&mut env.functions), &function_decl.sig)?;
+                insert_qualified_function(Rc::make_mut(&mut env.functions), &function_decl.sig, module_prefix, &local_type_names);
             }
-            Decl::TypeAlias(alias_decl) => insert_type_alias(&mut env.type_aliases, alias_decl, module_prefix, &local_type_names)?,
+            Decl::TypeAlias(alias_decl) => insert_type_alias(Rc::make_mut(&mut env.type_aliases), alias_decl, module_prefix, &local_type_names)?,
             Decl::Const(const_decl) => {
-                insert_unique_const(&mut env.consts, const_decl)?;
-                insert_qualified_const(&mut env.consts, const_decl, module_prefix, &local_type_names);
+                insert_unique_const(Rc::make_mut(&mut env.consts), const_decl)?;
+                insert_qualified_const(Rc::make_mut(&mut env.consts), const_decl, module_prefix, &local_type_names);
             }
             Decl::Global(global_decl) => {
-                insert_unique_global(&mut env.globals, global_decl)?;
-                insert_qualified_global(&mut env.globals, global_decl, module_prefix, &local_type_names);
+                insert_unique_global(Rc::make_mut(&mut env.globals), global_decl)?;
+                insert_qualified_global(Rc::make_mut(&mut env.globals), global_decl, module_prefix, &local_type_names);
             }
             Decl::Extern(extern_decl) => {
                 for function in &extern_decl.functions {
-                    insert_unique_function(&mut env.functions, function)?;
-                    insert_qualified_function(&mut env.functions, function, module_prefix, &local_type_names);
+                    insert_unique_function(Rc::make_mut(&mut env.functions), function)?;
+                    insert_qualified_function(Rc::make_mut(&mut env.functions), function, module_prefix, &local_type_names);
                 }
             }
             Decl::Module(module_decl) => {
@@ -517,7 +579,7 @@ fn insert_qualified_trait(
     local_type_names: &BTreeSet<String>,
 ) {
     if let Some(name) = qualified_name(prefix, &decl.name) {
-        let mut qualified = decl.clone();
+        let mut qualified = compact_trait_decl(decl);
         qualified.name.clone_from(&name);
         if let Some(prefix) = prefix {
             qualified.type_params = qualify_type_params(&qualified.type_params, prefix, local_type_names);
@@ -533,7 +595,7 @@ fn insert_qualified_trait(
                 .map(|method| crate::ast::decl::FunctionDecl {
                     sig: qualify_function_sig(&method.sig, prefix, local_type_names),
                     clauses: method.clauses.clone(),
-                    body: method.body.clone(),
+                    body: compact_function_body(&method.body),
                     span: method.span,
                 })
                 .collect();
@@ -685,7 +747,7 @@ fn insert_unique_trait(
     table: &mut BTreeMap<String, TraitDecl>,
     decl: &TraitDecl,
 ) -> Result<(), Stage0Error> {
-    if table.insert(decl.name.clone(), decl.clone()).is_some() {
+    if table.insert(decl.name.clone(), compact_trait_decl(decl)).is_some() {
         return Err(Stage0Error::semantic(
             decl.span,
             format!("duplicate trait '{}'", decl.name),

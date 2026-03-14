@@ -206,7 +206,9 @@ end
 
 # Forward-declare Bitmap from tg::image (defined in std/image.tg)
 struct Bitmap
-  _opaque: u64
+  info: ImageInfo
+  stride: Int
+  data: Vec[u8]
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -347,24 +349,58 @@ impl Canvas for SoftwareCanvas
   end
 
   def fill_rect(self: &mut Self, r: Rect, paint: &Paint) -> Unit
-    let color = match &paint.kind
-    when PaintKind::Solid(c) then *c
-    when _ then Color::black()  # Gradient sampling deferred to full implementation
-    end
-
-    let (cr, cg, cb, ca) = color.to_srgb8()
     let x0 = r.x.max(0.0) as Int
     let y0 = r.y.max(0.0) as Int
     let x1 = (r.x + r.w).min(self.width as f32) as Int
     let y1 = (r.y + r.h).min(self.height as f32) as Int
 
-    for py in y0..y1 do
-      for px in x0..x1 do
-        let offset = (py * self.width + px) * 4
-        self.pixels[offset] = cr
-        self.pixels[offset + 1] = cg
-        self.pixels[offset + 2] = cb
-        self.pixels[offset + 3] = ca
+    match &paint.kind
+    when PaintKind::Solid(c) then
+      let (cr, cg, cb, ca) = c.to_srgb8()
+      for py in y0..y1 do
+        for px in x0..x1 do
+          let offset = (py * self.width + px) * 4
+          self.pixels[offset] = cr
+          self.pixels[offset + 1] = cg
+          self.pixels[offset + 2] = cb
+          self.pixels[offset + 3] = ca
+        end
+      end
+    when PaintKind::LinearGradient(from, to, stops) then
+      let dx = to.x - from.x
+      let dy = to.y - from.y
+      let len_sq = dx * dx + dy * dy
+      if len_sq < 0.0001 || stops.len() == 0 then return end
+      for py in y0..y1 do
+        for px in x0..x1 do
+          let px_f = px as f32 - from.x
+          let py_f = py as f32 - from.y
+          let t = ((px_f * dx + py_f * dy) / len_sq).max(0.0).min(1.0)
+          let c = _sample_gradient(t, stops)
+          let (cr, cg, cb, ca) = c.to_srgb8()
+          let offset = (py * self.width + px) * 4
+          self.pixels[offset] = cr
+          self.pixels[offset + 1] = cg
+          self.pixels[offset + 2] = cb
+          self.pixels[offset + 3] = ca
+        end
+      end
+    when PaintKind::RadialGradient(center, radius, stops) then
+      if *radius < 0.0001 || stops.len() == 0 then return end
+      for py in y0..y1 do
+        for px in x0..x1 do
+          let dx = px as f32 - center.x
+          let dy = py as f32 - center.y
+          let dist = (dx * dx + dy * dy).sqrt()
+          let t = (dist / *radius).max(0.0).min(1.0)
+          let c = _sample_gradient(t, stops)
+          let (cr, cg, cb, ca) = c.to_srgb8()
+          let offset = (py * self.width + px) * 4
+          self.pixels[offset] = cr
+          self.pixels[offset + 1] = cg
+          self.pixels[offset + 2] = cb
+          self.pixels[offset + 3] = ca
+        end
       end
     end
   end
@@ -456,9 +492,67 @@ impl Canvas for SoftwareCanvas
   end
 
   def draw_image(self: &mut Self, img: Image, dst: Rect, src: Option[Rect], opts: ImageDrawOpts) -> Unit
-    # Image drawing: blit from image data to canvas pixels
-    # Full implementation requires image registry lookup + scaling
-    # This is the conformant API surface with complete signature.
+    # Blit image from registry to canvas pixels with nearest-neighbor scaling
+    let img_data = _lookup_image(img._opaque)
+    match img_data
+    when Option::None then return
+    when Option::Some(entry) then
+      let src_w = entry.width
+      let src_h = entry.height
+      let src_pixels = &entry.data
+
+      let sx0 = match &src
+      when Option::Some(r) then r.x as Int
+      when Option::None then 0
+      end
+      let sy0 = match &src
+      when Option::Some(r) then r.y as Int
+      when Option::None then 0
+      end
+      let sw = match &src
+      when Option::Some(r) then r.w as Int
+      when Option::None then src_w
+      end
+      let sh = match &src
+      when Option::Some(r) then r.h as Int
+      when Option::None then src_h
+      end
+
+      let dx0 = dst.x.max(0.0) as Int
+      let dy0 = dst.y.max(0.0) as Int
+      let dx1 = (dst.x + dst.w).min(self.width as f32) as Int
+      let dy1 = (dst.y + dst.h).min(self.height as f32) as Int
+      let dw = (dst.w as Int).max(1)
+      let dh = (dst.h as Int).max(1)
+
+      for py in dy0..dy1 do
+        for px in dx0..dx1 do
+          # Nearest-neighbor sampling
+          let src_x = sx0 + ((px - dx0) * sw) / dw
+          let src_y = sy0 + ((py - dy0) * sh) / dh
+          if src_x >= 0 && src_x < src_w && src_y >= 0 && src_y < src_h then
+            let si = (src_y * src_w + src_x) * 4
+            let di = (py * self.width + px) * 4
+            if si + 3 < src_pixels.len() && di + 3 < self.pixels.len() then
+              let sa = src_pixels[si + 3] as Int
+              if sa == 255 then
+                self.pixels[di] = src_pixels[si]
+                self.pixels[di+1] = src_pixels[si+1]
+                self.pixels[di+2] = src_pixels[si+2]
+                self.pixels[di+3] = src_pixels[si+3]
+              elsif sa > 0 then
+                # Alpha blend: dst = src*alpha + dst*(1-alpha)
+                let inv_a = 255 - sa
+                self.pixels[di]   = ((src_pixels[si] as Int * sa + self.pixels[di] as Int * inv_a) / 255) as u8
+                self.pixels[di+1] = ((src_pixels[si+1] as Int * sa + self.pixels[di+1] as Int * inv_a) / 255) as u8
+                self.pixels[di+2] = ((src_pixels[si+2] as Int * sa + self.pixels[di+2] as Int * inv_a) / 255) as u8
+                self.pixels[di+3] = ((sa + self.pixels[di+3] as Int * inv_a / 255).min(255)) as u8
+              end
+            end
+          end
+        end
+      end
+    end
   end
 
   def draw_glyph_run(self: &mut Self, run: &GlyphRun, x: f32, y: f32, paint: &Paint) -> Unit
@@ -516,16 +610,64 @@ impl Canvas for SoftwareCanvas
 end
 
 # ═══════════════════════════════════════════════════════════════
+# Internal gradient and image helpers
+# ═══════════════════════════════════════════════════════════════
+
+# Sample a gradient at parameter t ∈ [0, 1]
+def _sample_gradient(t: f32, stops: &Vec[ColorStop]) -> Color
+  if stops.len() == 0 then return Color::black() end
+  if stops.len() == 1 || t <= stops[0].offset then return stops[0].color end
+  let last = stops.len() - 1
+  if t >= stops[last].offset then return stops[last].color end
+
+  # Find the two stops that bracket t
+  var i = 0
+  while i < last do
+    if stops[i + 1].offset >= t then break end
+    i = i + 1
+  end
+  let s0 = &stops[i]
+  let s1 = &stops[i + 1]
+  let range = s1.offset - s0.offset
+  let frac = if range > 0.0001 then (t - s0.offset) / range else 0.0 end
+
+  # Linear interpolate in sRGB space
+  let (r0, g0, b0, a0) = s0.color.to_srgb8()
+  let (r1, g1, b1, a1) = s1.color.to_srgb8()
+  let inv = 1.0 - frac
+  Color::from_srgb8(
+    (r0 as f32 * inv + r1 as f32 * frac) as u8,
+    (g0 as f32 * inv + g1 as f32 * frac) as u8,
+    (b0 as f32 * inv + b1 as f32 * frac) as u8,
+    (a0 as f32 * inv + a1 as f32 * frac) as u8
+  )
+end
+
+# ═══════════════════════════════════════════════════════════════
 # Internal image registry for software path
 # ═══════════════════════════════════════════════════════════════
 
-mut _image_registry: Vec[Option[Vec[u8]]] = Vec::new()
+struct _ImageEntry
+  data: Vec[u8]
+  width: Int
+  height: Int
+end
+
+mut _image_registry: Vec[Option[_ImageEntry]] = Vec::new()
 mut _next_image_id: u64 = 1
 
 def _register_image(bmp: &Bitmap) -> u64
   let id = _next_image_id
   _next_image_id = _next_image_id + 1
-  _image_registry.push(Option::Some(Vec::new()))
+  ## Copy pixel data from bitmap into the registry entry.
+  ## Bitmap has info (width/height), stride, and data fields.
+  var data = Vec::with_capacity(bmp.data.len())
+  var i = 0
+  while i < bmp.data.len() do
+    data.push(bmp.data.get(i))
+    i = i + 1
+  end
+  _image_registry.push(Option::Some(_ImageEntry { data: data, width: bmp.info.width, height: bmp.info.height }))
   id
 end
 
@@ -538,8 +680,20 @@ def _register_image_data(pixels: &Vec[u8], w: Int, h: Int) -> u64
     data.push(pixels.get(i))
     i = i + 1
   end
-  _image_registry.push(Option::Some(data))
+  _image_registry.push(Option::Some(_ImageEntry { data: data, width: w, height: h }))
   id
+end
+
+def _lookup_image(id: u64) -> Option[&_ImageEntry]
+  let idx = (id - 1) as Int
+  if idx >= 0 && idx < _image_registry.len() as Int then
+    match &_image_registry[idx]
+    when Option::Some(entry) then Option::Some(entry)
+    when Option::None then Option::None
+    end
+  else
+    Option::None
+  end
 end
 
 def _unregister_image(id: u64) -> Unit

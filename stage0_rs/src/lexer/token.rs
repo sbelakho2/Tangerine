@@ -40,6 +40,7 @@ pub enum TokenKind {
     KeywordModule,
     KeywordMod,
     KeywordConst,
+    KeywordStatic,
     KeywordType,
     KeywordExtern,
     KeywordWhere,

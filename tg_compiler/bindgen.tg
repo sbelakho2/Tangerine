@@ -186,36 +186,24 @@ impl Bindgen
     match fs::read_to_string(path.to_string())
     when Result::Err(e) then Result::Err(BindgenError::IoError(e.to_string()))
     when Result::Ok(content) then
-      ## Simple C header parser (real impl would use libclang)
-      let lines = content.lines()
-      for line in lines do
-        let trimmed = line.trim()
-        match trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*")
-        when true then continue
-        when false then
-          match trimmed.starts_with("#")
-          when true then continue
-          when false then
-            ## Detect struct declarations
-            match trimmed.starts_with("typedef struct") || trimmed.starts_with("struct ")
-            when true then continue
-            when false then
-              ## Detect function declarations
-              match trimmed.contains("(") && trimmed.ends_with(";")
-              when true then
-                match _parse_c_function(trimmed)
-                when Some(func) then
-                  match self.should_include(&func.name)
-                  when true then
-                    self.declarations.push(Declaration::Function(func))
-                  when false then ()
-                  end
-                when None then ()
-                end
-              when false then ()
-              end
-            end
-          end
+      ## Recursive-descent C header parser
+      let mut parser = CHeaderParser::new(content)
+      let decls = match parser.parse_translation_unit()
+      when Result::Ok(d) then d
+      when Result::Err(msg) then return Result::Err(BindgenError::ParseError(msg))
+      end
+      for decl in decls.iter() do
+        let name = match decl
+        when Declaration::Function(f) then f.name.clone()
+        when Declaration::Struct(s) then s.name.clone()
+        when Declaration::Union(u) then u.name.clone()
+        when Declaration::Enum(e) then e.name.clone()
+        when Declaration::Typedef(n, _) then n.clone()
+        when Declaration::Constant(n, _, _) then n.clone()
+        end
+        match self.should_include(&name)
+        when true then self.declarations.push(decl.clone())
+        when false then ()
         end
       end
       Result::Ok(())
@@ -474,15 +462,87 @@ pub def generate_c_header(module_path: &str) -> Result[String, BindgenError]
     out = out + "#include <stdint.h>\n#include <stddef.h>\n\n"
     out = out + "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
 
-    ## Parse @export annotated functions (simplified)
-    for line in content.lines() do
-      let trimmed = line.trim()
-      match trimmed.starts_with("@export") || trimmed.starts_with("@ffi_export")
-      when true then ()
-        ## Next line should be the function signature
-        ## Simplified — real impl would use the AST
-      when false then ()
+    ## Parse @export / @ffi_export annotated functions from Tangerine source
+    let lines = content.lines()
+    mut i = 0
+    while i < lines.len() do
+      let trimmed = lines[i].trim()
+      if trimmed.starts_with("@export") || trimmed.starts_with("@ffi_export") then
+        ## Look ahead for the function signature on subsequent lines
+        mut j = i + 1
+        while j < lines.len() do
+          let next = lines[j].trim()
+          if next.is_empty() || next.starts_with("@") || next.starts_with("##") then
+            j = j + 1
+            continue
+          end
+          ## Parse "pub def name(params) -> RetType" or "def name(...)"
+          if next.starts_with("pub def ") || next.starts_with("def ") then
+            let sig_start = if next.starts_with("pub def ") then 8 else 4 end
+            let rest = next.substring(sig_start, next.len() as Int)
+            let paren_pos = rest.find("(")
+            match paren_pos
+            when Option::Some(pp) then
+              let fn_name = rest.substring(0, pp as Int).trim()
+              let close_paren = rest.rfind(")")
+              match close_paren
+              when Option::Some(cp) then
+                let params_str = rest.substring((pp + 1) as Int, cp as Int)
+                let after = rest.substring((cp + 1) as Int, rest.len() as Int).trim()
+                ## Parse return type
+                let c_ret = if after.starts_with("->") then
+                  let ret_name = after.substring(2, after.len() as Int).trim()
+                  _tg_type_to_c(ret_name)
+                else
+                  "void"
+                end
+                ## Parse parameters
+                mut c_params = Array::new()
+                if !params_str.is_empty() then
+                  let parts = params_str.split(",")
+                  for part in parts do
+                    let p = part.trim()
+                    let colon = p.find(":")
+                    match colon
+                    when Option::Some(cpos) then
+                      let pname = p.substring(0, cpos as Int).trim()
+                      ## Strip mut/ref markers from param name
+                      let clean_name = if pname.starts_with("mut ") then
+                        pname.substring(4, pname.len() as Int).trim()
+                      else
+                        pname
+                      end
+                      let ptype = p.substring((cpos + 1) as Int, p.len() as Int).trim()
+                      c_params.push((_tg_type_to_c(ptype).to_string() + " " + clean_name))
+                    when Option::None then
+                      if !p.is_empty() then
+                        c_params.push(p.to_string())
+                      end
+                    end
+                  end
+                end
+                ## Emit C declaration
+                out = out + c_ret + " " + fn_name + "("
+                if c_params.is_empty() then
+                  out = out + "void"
+                else
+                  mut pidx = 0
+                  for cp in c_params.iter() do
+                    if pidx > 0 then out = out + ", " end
+                    out = out + cp
+                    pidx = pidx + 1
+                  end
+                end
+                out = out + ");\n\n"
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+          end
+          break
+        end
       end
+      i = i + 1
     end
 
     out = out + "#ifdef __cplusplus\n}\n#endif\n\n"
@@ -513,6 +573,987 @@ end
 
 pub struct FfiError
   pub message: String
+end
+
+# ─── Recursive-descent C header parser ───────────────────────────────
+
+enum CToken
+  Ident(String)
+  IntLit(i64)
+  LParen
+  RParen
+  LBrace
+  RBrace
+  LBracket
+  RBracket
+  Semi
+  Comma
+  Star
+  Eq
+  Ellipsis
+  Arrow        ## ->
+  KwStruct
+  KwUnion
+  KwEnum
+  KwTypedef
+  KwConst
+  KwVoid
+  KwExtern
+  KwStatic
+  KwInline
+  KwVolatile
+  KwUnsigned
+  KwSigned
+  KwChar
+  KwShort
+  KwInt
+  KwLong
+  KwFloat
+  KwDouble
+  KwBool
+  Eof
+end
+
+struct CHeaderParser
+  src: String
+  pos: Int
+  tokens: Array[CToken]
+  tok_pos: Int
+end
+
+impl CHeaderParser
+  def new(source: String) -> CHeaderParser
+    let mut p = CHeaderParser {
+      src: source,
+      pos: 0,
+      tokens: Array::new(),
+      tok_pos: 0,
+    }
+    p.tokenize()
+    p
+  end
+
+  ## ── Tokenizer ──────────────────────────────────────────────────
+  def tokenize(&mut self)
+    let len = self.src.len()
+    while self.pos < len do
+      let ch = self.src.char_at(self.pos)
+      ## Skip whitespace
+      if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' then
+        self.pos = self.pos + 1
+        continue
+      end
+      ## Skip // comments
+      if ch == '/' && self.pos + 1 < len && self.src.char_at(self.pos + 1) == '/' then
+        while self.pos < len && self.src.char_at(self.pos) != '\n' do
+          self.pos = self.pos + 1
+        end
+        continue
+      end
+      ## Skip /* */ comments
+      if ch == '/' && self.pos + 1 < len && self.src.char_at(self.pos + 1) == '*' then
+        self.pos = self.pos + 2
+        while self.pos + 1 < len do
+          if self.src.char_at(self.pos) == '*' && self.src.char_at(self.pos + 1) == '/' then
+            self.pos = self.pos + 2
+            break
+          end
+          self.pos = self.pos + 1
+        end
+        continue
+      end
+      ## Skip preprocessor lines (# directives) — but extract #define constants
+      if ch == '#' then
+        let directive_start = self.pos
+        self.pos = self.pos + 1
+        self._skip_whitespace_inline()
+        let word = self._read_ident_raw()
+        if word == "define" then
+          self._skip_whitespace_inline()
+          let macro_name = self._read_ident_raw()
+          if !macro_name.is_empty() then
+            self._skip_whitespace_inline()
+            ## Only simple integer constants: #define NAME 123
+            if self.pos < len then
+              let nc = self.src.char_at(self.pos)
+              if nc >= '0' && nc <= '9' then
+                let val = self._read_int_raw()
+                self.tokens.push(CToken::KwConst)
+                self.tokens.push(CToken::KwInt)
+                self.tokens.push(CToken::Ident(macro_name))
+                self.tokens.push(CToken::Eq)
+                self.tokens.push(CToken::IntLit(val))
+                self.tokens.push(CToken::Semi)
+              end
+            end
+          end
+        end
+        ## Skip rest of line (handles multi-line with backslash)
+        while self.pos < len do
+          let lc = self.src.char_at(self.pos)
+          if lc == '\n' then
+            self.pos = self.pos + 1
+            break
+          end
+          if lc == '\\' && self.pos + 1 < len && self.src.char_at(self.pos + 1) == '\n' then
+            self.pos = self.pos + 2
+            continue
+          end
+          self.pos = self.pos + 1
+        end
+        continue
+      end
+      ## Punctuation
+      if ch == '(' then self.tokens.push(CToken::LParen); self.pos = self.pos + 1; continue end
+      if ch == ')' then self.tokens.push(CToken::RParen); self.pos = self.pos + 1; continue end
+      if ch == '{' then self.tokens.push(CToken::LBrace); self.pos = self.pos + 1; continue end
+      if ch == '}' then self.tokens.push(CToken::RBrace); self.pos = self.pos + 1; continue end
+      if ch == '[' then self.tokens.push(CToken::LBracket); self.pos = self.pos + 1; continue end
+      if ch == ']' then self.tokens.push(CToken::RBracket); self.pos = self.pos + 1; continue end
+      if ch == ';' then self.tokens.push(CToken::Semi); self.pos = self.pos + 1; continue end
+      if ch == ',' then self.tokens.push(CToken::Comma); self.pos = self.pos + 1; continue end
+      if ch == '*' then self.tokens.push(CToken::Star); self.pos = self.pos + 1; continue end
+      if ch == '=' then self.tokens.push(CToken::Eq); self.pos = self.pos + 1; continue end
+      if ch == '.' && self.pos + 2 < len && self.src.char_at(self.pos + 1) == '.' && self.src.char_at(self.pos + 2) == '.' then
+        self.tokens.push(CToken::Ellipsis); self.pos = self.pos + 3; continue
+      end
+      if ch == '-' && self.pos + 1 < len && self.src.char_at(self.pos + 1) == '>' then
+        self.tokens.push(CToken::Arrow); self.pos = self.pos + 2; continue
+      end
+      ## Integer literals
+      if ch >= '0' && ch <= '9' then
+        let val = self._read_int_raw()
+        self.tokens.push(CToken::IntLit(val))
+        continue
+      end
+      ## Negative integer literals
+      if ch == '-' && self.pos + 1 < len then
+        let next_c = self.src.char_at(self.pos + 1)
+        if next_c >= '0' && next_c <= '9' then
+          self.pos = self.pos + 1
+          let val = self._read_int_raw()
+          self.tokens.push(CToken::IntLit(-val))
+          continue
+        end
+      end
+      ## Identifiers / keywords
+      if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' then
+        let word = self._read_ident_raw()
+        let tok = match word.as_str()
+        when "struct" then CToken::KwStruct
+        when "union" then CToken::KwUnion
+        when "enum" then CToken::KwEnum
+        when "typedef" then CToken::KwTypedef
+        when "const" then CToken::KwConst
+        when "void" then CToken::KwVoid
+        when "extern" then CToken::KwExtern
+        when "static" then CToken::KwStatic
+        when "inline" then CToken::KwInline
+        when "__inline" then CToken::KwInline
+        when "__inline__" then CToken::KwInline
+        when "volatile" then CToken::KwVolatile
+        when "__volatile__" then CToken::KwVolatile
+        when "unsigned" then CToken::KwUnsigned
+        when "signed" then CToken::KwSigned
+        when "char" then CToken::KwChar
+        when "short" then CToken::KwShort
+        when "int" then CToken::KwInt
+        when "long" then CToken::KwLong
+        when "float" then CToken::KwFloat
+        when "double" then CToken::KwDouble
+        when "bool" then CToken::KwBool
+        when "_Bool" then CToken::KwBool
+        when _ then CToken::Ident(word)
+        end
+        self.tokens.push(tok)
+        continue
+      end
+      ## Skip string literals
+      if ch == '"' then
+        self.pos = self.pos + 1
+        while self.pos < len do
+          let sc = self.src.char_at(self.pos)
+          if sc == '\\' then self.pos = self.pos + 2; continue end
+          if sc == '"' then self.pos = self.pos + 1; break end
+          self.pos = self.pos + 1
+        end
+        continue
+      end
+      ## Skip char literals
+      if ch == '\'' then
+        self.pos = self.pos + 1
+        while self.pos < len && self.src.char_at(self.pos) != '\'' do
+          if self.src.char_at(self.pos) == '\\' then self.pos = self.pos + 1 end
+          self.pos = self.pos + 1
+        end
+        if self.pos < len then self.pos = self.pos + 1 end
+        continue
+      end
+      ## Skip unknown characters
+      self.pos = self.pos + 1
+    end
+    self.tokens.push(CToken::Eof)
+  end
+
+  def _skip_whitespace_inline(&mut self)
+    let len = self.src.len()
+    while self.pos < len do
+      let c = self.src.char_at(self.pos)
+      if c == ' ' || c == '\t' then self.pos = self.pos + 1
+      else break end
+    end
+  end
+
+  def _read_ident_raw(&mut self) -> String
+    let start = self.pos
+    let len = self.src.len()
+    while self.pos < len do
+      let c = self.src.char_at(self.pos)
+      if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' then
+        self.pos = self.pos + 1
+      else break end
+    end
+    self.src.substring(start, self.pos)
+  end
+
+  def _read_int_raw(&mut self) -> i64
+    let len = self.src.len()
+    mut val: i64 = 0
+    ## Handle hex: 0x...
+    if self.pos + 1 < len && self.src.char_at(self.pos) == '0' then
+      let nx = self.src.char_at(self.pos + 1)
+      if nx == 'x' || nx == 'X' then
+        self.pos = self.pos + 2
+        while self.pos < len do
+          let c = self.src.char_at(self.pos)
+          if c >= '0' && c <= '9' then val = val * 16 + ((c as i64) - ('0' as i64))
+          elsif c >= 'a' && c <= 'f' then val = val * 16 + ((c as i64) - ('a' as i64) + 10)
+          elsif c >= 'A' && c <= 'F' then val = val * 16 + ((c as i64) - ('A' as i64) + 10)
+          else break end
+          self.pos = self.pos + 1
+        end
+        ## Skip U/L/UL suffixes
+        while self.pos < len do
+          let c = self.src.char_at(self.pos)
+          if c == 'u' || c == 'U' || c == 'l' || c == 'L' then self.pos = self.pos + 1
+          else break end
+        end
+        return val
+      end
+    end
+    while self.pos < len do
+      let c = self.src.char_at(self.pos)
+      if c >= '0' && c <= '9' then
+        val = val * 10 + ((c as i64) - ('0' as i64))
+        self.pos = self.pos + 1
+      else break end
+    end
+    ## Skip U/L suffixes
+    while self.pos < len do
+      let c = self.src.char_at(self.pos)
+      if c == 'u' || c == 'U' || c == 'l' || c == 'L' then self.pos = self.pos + 1
+      else break end
+    end
+    val
+  end
+
+  ## ── Token access ───────────────────────────────────────────────
+  def peek(&self) -> &CToken
+    &self.tokens[self.tok_pos]
+  end
+
+  def advance(&mut self) -> &CToken
+    let t = &self.tokens[self.tok_pos]
+    if self.tok_pos < self.tokens.len() - 1 then
+      self.tok_pos = self.tok_pos + 1
+    end
+    t
+  end
+
+  def expect_semi(&mut self) -> Result[Unit, String]
+    match self.peek()
+    when CToken::Semi then self.advance(); Result::Ok(())
+    when _ then Result::Err("expected ';'".to_string())
+    end
+  end
+
+  ## ── Top-level parser ───────────────────────────────────────────
+  def parse_translation_unit(&mut self) -> Result[Array[Declaration], String]
+    mut decls = Array::new()
+    while !self._at_eof() do
+      match self._parse_top_level()
+      when Result::Ok(maybe_decl) then
+        match maybe_decl
+        when Option::Some(d) then decls.push(d)
+        when Option::None then ()
+        end
+      when Result::Err(e) then
+        ## Skip to next semicolon or closing brace to recover
+        self._skip_to_sync()
+      end
+    end
+    Result::Ok(decls)
+  end
+
+  def _at_eof(&self) -> Bool
+    match self.peek()
+    when CToken::Eof then true
+    when _ then false
+    end
+  end
+
+  def _skip_to_sync(&mut self)
+    while !self._at_eof() do
+      match self.peek()
+      when CToken::Semi then self.advance(); return
+      when CToken::RBrace then self.advance(); return
+      when _ then self.advance()
+      end
+    end
+  end
+
+  def _parse_top_level(&mut self) -> Result[Option[Declaration], String]
+    ## Skip storage class specifiers and qualifiers
+    self._skip_storage_qualifiers()
+    match self.peek()
+    when CToken::KwTypedef then return self._parse_typedef()
+    when CToken::KwStruct then return self._parse_struct_or_func()
+    when CToken::KwUnion then return self._parse_union_decl()
+    when CToken::KwEnum then return self._parse_enum_decl()
+    when CToken::Eof then return Result::Ok(Option::None)
+    when _ then ()
+    end
+    ## Possibly a function or variable declaration
+    self._parse_func_or_var()
+  end
+
+  def _skip_storage_qualifiers(&mut self)
+    loop do
+      match self.peek()
+      when CToken::KwExtern then self.advance()
+      when CToken::KwStatic then self.advance()
+      when CToken::KwInline then self.advance()
+      when CToken::KwVolatile then self.advance()
+      when _ then break
+      end
+    end
+  end
+
+  ## ── Typedef ────────────────────────────────────────────────────
+  def _parse_typedef(&mut self) -> Result[Option[Declaration], String]
+    self.advance()  ## consume 'typedef'
+    ## typedef struct { ... } Name;
+    ## typedef enum { ... } Name;
+    ## typedef TYPE NAME;
+    ## typedef RETTYPE (*NAME)(PARAMS);
+    match self.peek()
+    when CToken::KwStruct then
+      self.advance()
+      let tag = self._maybe_ident()
+      match self.peek()
+      when CToken::LBrace then
+        let fields = self._parse_struct_body()?
+        let name = self._expect_ident()?
+        self.expect_semi()?
+        let s = CStruct { name: name.clone(), fields: fields, packed: false }
+        Result::Ok(Option::Some(Declaration::Typedef(name, CType::Struct(s))))
+      when _ then
+        let alias = match tag
+        when Option::Some(t) then t
+        when Option::None then return Result::Err("expected struct name".to_string())
+        end
+        let name = self._expect_ident()?
+        self.expect_semi()?
+        Result::Ok(Option::Some(Declaration::Typedef(name, CType::Typedef(alias, Box::new(CType::Void)))))
+      end
+    when CToken::KwEnum then
+      self.advance()
+      let _tag = self._maybe_ident()
+      match self.peek()
+      when CToken::LBrace then
+        let variants = self._parse_enum_body()?
+        let name = self._expect_ident()?
+        self.expect_semi()?
+        let e = CEnum { name: name.clone(), variants: variants }
+        Result::Ok(Option::Some(Declaration::Typedef(name, CType::Enum(e))))
+      when _ then
+        let name = self._expect_ident()?
+        self.expect_semi()?
+        Result::Ok(Option::Some(Declaration::Typedef(name, CType::Int)))
+      end
+    when _ then
+      ## typedef BASETYPE ...
+      let base = self._parse_type_specifier()?
+      ## Check for function pointer: typedef RET (*NAME)(PARAMS);
+      match self.peek()
+      when CToken::LParen then
+        self.advance()
+        match self.peek()
+        when CToken::Star then
+          self.advance()
+          let name = self._expect_ident()?
+          self._expect_token_rparen()?
+          self._expect_token_lparen()?
+          let params = self._parse_param_types()?
+          self._expect_token_rparen()?
+          self.expect_semi()?
+          let fp = CType::FuncPointer(params, Box::new(base))
+          Result::Ok(Option::Some(Declaration::Typedef(name, fp)))
+        when _ then
+          self._skip_to_sync()
+          Result::Ok(Option::None)
+        end
+      when _ then
+        ## typedef TYPE *NAME or TYPE NAME
+        mut ty = base
+        while self._peek_is_star() do
+          self.advance()
+          match self._peek_is_const() 
+          when true then self.advance(); ty = CType::ConstPointer(Box::new(ty))
+          when false then ty = CType::Pointer(Box::new(ty))
+          end
+        end
+        let name = self._expect_ident()?
+        ## Array typedef: typedef int arr[10];
+        match self.peek()
+        when CToken::LBracket then
+          self.advance()
+          let size = self._parse_int_lit()?
+          self._expect_token_rbracket()?
+          ty = CType::Array(Box::new(ty), size as UInt)
+        when _ then ()
+        end
+        self.expect_semi()?
+        Result::Ok(Option::Some(Declaration::Typedef(name, ty)))
+      end
+    end
+  end
+
+  ## ── Struct ─────────────────────────────────────────────────────
+  def _parse_struct_or_func(&mut self) -> Result[Option[Declaration], String]
+    self.advance()  ## consume 'struct'
+    let name_opt = self._maybe_ident()
+    match self.peek()
+    when CToken::LBrace then
+      let name = match name_opt
+      when Option::Some(n) then n
+      when Option::None then "_anon_struct".to_string()
+      end
+      let fields = self._parse_struct_body()?
+      ## Possibly followed by variable name + ;
+      match self.peek()
+      when CToken::Semi then self.advance()
+      when _ then
+        let _var_name = self._maybe_ident()
+        self.expect_semi()?
+      end
+      Result::Ok(Option::Some(Declaration::Struct(CStruct { name: name, fields: fields, packed: false })))
+    when CToken::Semi then
+      self.advance()
+      Result::Ok(Option::None)
+    when _ then
+      ## Forward declaration or "struct Name var;" — skip
+      self._skip_to_sync()
+      Result::Ok(Option::None)
+    end
+  end
+
+  def _parse_struct_body(&mut self) -> Result[Array[CField], String]
+    self.advance()  ## consume '{'
+    mut fields = Array::new()
+    while !self._at_eof() do
+      match self.peek()
+      when CToken::RBrace then self.advance(); return Result::Ok(fields)
+      when _ then
+        let ty = self._parse_full_type()?
+        let fname = self._expect_ident()?
+        ## Handle array fields: int buf[256];
+        mut final_ty = ty
+        match self.peek()
+        when CToken::LBracket then
+          self.advance()
+          let sz = self._parse_int_lit()?
+          self._expect_token_rbracket()?
+          final_ty = CType::Array(Box::new(final_ty), sz as UInt)
+        when _ then ()
+        end
+        self.expect_semi()?
+        fields.push(CField { name: fname, ty: final_ty, doc: Option::None })
+      end
+    end
+    Result::Err("unterminated struct body".to_string())
+  end
+
+  ## ── Union ──────────────────────────────────────────────────────
+  def _parse_union_decl(&mut self) -> Result[Option[Declaration], String]
+    self.advance()  ## consume 'union'
+    let name = match self._maybe_ident()
+    when Option::Some(n) then n
+    when Option::None then "_anon_union".to_string()
+    end
+    match self.peek()
+    when CToken::LBrace then
+      let fields = self._parse_struct_body()?
+      match self.peek()
+      when CToken::Semi then self.advance()
+      when _ then ()
+      end
+      Result::Ok(Option::Some(Declaration::Union(CUnion { name: name, variants: fields })))
+    when _ then
+      self._skip_to_sync()
+      Result::Ok(Option::None)
+    end
+  end
+
+  ## ── Enum ───────────────────────────────────────────────────────
+  def _parse_enum_decl(&mut self) -> Result[Option[Declaration], String]
+    self.advance()  ## consume 'enum'
+    let name = match self._maybe_ident()
+    when Option::Some(n) then n
+    when Option::None then "_anon_enum".to_string()
+    end
+    match self.peek()
+    when CToken::LBrace then
+      let variants = self._parse_enum_body()?
+      match self.peek()
+      when CToken::Semi then self.advance()
+      when _ then ()
+      end
+      Result::Ok(Option::Some(Declaration::Enum(CEnum { name: name, variants: variants })))
+    when _ then
+      self._skip_to_sync()
+      Result::Ok(Option::None)
+    end
+  end
+
+  def _parse_enum_body(&mut self) -> Result[Array[(String, i64)], String]
+    self.advance()  ## consume '{'
+    mut variants = Array::new()
+    mut next_val: i64 = 0
+    while !self._at_eof() do
+      match self.peek()
+      when CToken::RBrace then self.advance(); return Result::Ok(variants)
+      when CToken::Comma then self.advance(); continue
+      when _ then
+        let vname = self._expect_ident()?
+        match self.peek()
+        when CToken::Eq then
+          self.advance()
+          let val = self._parse_int_lit()?
+          next_val = val
+        when _ then ()
+        end
+        variants.push((vname, next_val))
+        next_val = next_val + 1
+        ## Optional comma
+        match self.peek()
+        when CToken::Comma then self.advance()
+        when _ then ()
+        end
+      end
+    end
+    Result::Err("unterminated enum body".to_string())
+  end
+
+  ## ── Function or variable declaration ────────────────────────────
+  def _parse_func_or_var(&mut self) -> Result[Option[Declaration], String]
+    let base_type = self._parse_type_specifier()?
+    ## Parse pointer decorations and name
+    mut ty = base_type.clone()
+    while self._peek_is_star() do
+      self.advance()
+      match self._peek_is_const()
+      when true then self.advance(); ty = CType::ConstPointer(Box::new(ty))
+      when false then ty = CType::Pointer(Box::new(ty))
+      end
+    end
+    let name = match self._maybe_ident()
+    when Option::Some(n) then n
+    when Option::None then
+      ## Might be a standalone type specifier (e.g. bare struct ref) — skip
+      self._skip_to_sync()
+      return Result::Ok(Option::None)
+    end
+    ## Is this a function? Check for '('
+    match self.peek()
+    when CToken::LParen then
+      self.advance()
+      let (params, variadic) = self._parse_params()?
+      self._expect_token_rparen()?
+      ## Skip function body if present
+      match self.peek()
+      when CToken::LBrace then self._skip_braced_block()
+      when CToken::Semi then self.advance()
+      when _ then self._skip_to_sync()
+      end
+      let func = CFunction {
+        name: name,
+        params: params,
+        return_type: ty,
+        variadic: variadic,
+        doc: Option::None,
+      }
+      Result::Ok(Option::Some(Declaration::Function(func)))
+    when _ then
+      ## Variable declaration — skip
+      self._skip_to_sync()
+      Result::Ok(Option::None)
+    end
+  end
+
+  ## ── Parameter parsing ──────────────────────────────────────────
+  def _parse_params(&mut self) -> Result[(Array[(String, CType)], Bool), String]
+    mut params = Array::new()
+    mut variadic = false
+    ## Handle void or empty
+    match self.peek()
+    when CToken::RParen then return Result::Ok((params, false))
+    when CToken::KwVoid then
+      self.advance()
+      match self.peek()
+      when CToken::RParen then return Result::Ok((params, false))
+      when _ then
+        ## "void *ptr" — reparse as full param
+        let name = self._expect_ident()?
+        params.push((name, CType::Pointer(Box::new(CType::Void))))
+      end
+    when _ then ()
+    end
+    ## Parse first param (if not already parsed above from void*)
+    if params.is_empty() then
+      let (pname, pty, is_variadic) = self._parse_one_param()?
+      if is_variadic then
+        return Result::Ok((params, true))
+      end
+      params.push((pname, pty))
+    end
+    ## Parse remaining params
+    loop do
+      match self.peek()
+      when CToken::Comma then
+        self.advance()
+        match self.peek()
+        when CToken::Ellipsis then
+          self.advance()
+          variadic = true
+          break
+        when _ then
+          let (pname, pty, is_v) = self._parse_one_param()?
+          if is_v then variadic = true; break end
+          params.push((pname, pty))
+        end
+      when _ then break
+      end
+    end
+    Result::Ok((params, variadic))
+  end
+
+  def _parse_one_param(&mut self) -> Result[(String, CType, Bool), String]
+    match self.peek()
+    when CToken::Ellipsis then
+      self.advance()
+      return Result::Ok(("...".to_string(), CType::Void, true))
+    when _ then ()
+    end
+    let ty = self._parse_full_type()?
+    let name = match self._maybe_ident()
+    when Option::Some(n) then n
+    when Option::None then "_arg".to_string()
+    end
+    ## Handle array param: int arr[]
+    mut final_ty = ty
+    match self.peek()
+    when CToken::LBracket then
+      self.advance()
+      match self.peek()
+      when CToken::RBracket then self.advance()
+      when _ then
+        let _sz = self._parse_int_lit()?
+        self._expect_token_rbracket()?
+      end
+      final_ty = CType::Pointer(Box::new(final_ty))
+    when _ then ()
+    end
+    Result::Ok((name, final_ty, false))
+  end
+
+  ## Parse types used in function pointer param lists (no names)
+  def _parse_param_types(&mut self) -> Result[Array[CType], String]
+    mut types = Array::new()
+    match self.peek()
+    when CToken::RParen then return Result::Ok(types)
+    when CToken::KwVoid then
+      self.advance()
+      match self.peek()
+      when CToken::RParen then return Result::Ok(types)
+      when _ then types.push(CType::Pointer(Box::new(CType::Void)))
+      end
+    when _ then ()
+    end
+    if types.is_empty() then
+      types.push(self._parse_full_type()?)
+      let _ = self._maybe_ident()  ## optional param name
+    end
+    loop do
+      match self.peek()
+      when CToken::Comma then
+        self.advance()
+        match self.peek()
+        when CToken::Ellipsis then self.advance(); break
+        when _ then
+          types.push(self._parse_full_type()?)
+          let _ = self._maybe_ident()
+        end
+      when _ then break
+      end
+    end
+    Result::Ok(types)
+  end
+
+  ## ── Type parsing ───────────────────────────────────────────────
+  def _parse_full_type(&mut self) -> Result[CType, String]
+    ## Parse base type then pointer/const decorations
+    let base = self._parse_type_specifier()?
+    mut ty = base
+    while self._peek_is_star() do
+      self.advance()
+      match self._peek_is_const()
+      when true then self.advance(); ty = CType::ConstPointer(Box::new(ty))
+      when false then ty = CType::Pointer(Box::new(ty))
+      end
+    end
+    Result::Ok(ty)
+  end
+
+  def _parse_type_specifier(&mut self) -> Result[CType, String]
+    ## Skip leading const/volatile
+    self._skip_cv_qualifiers()
+    match self.peek()
+    when CToken::KwVoid then self.advance(); Result::Ok(CType::Void)
+    when CToken::KwBool then self.advance(); Result::Ok(CType::Bool)
+    when CToken::KwFloat then self.advance(); Result::Ok(CType::Float)
+    when CToken::KwDouble then self.advance(); Result::Ok(CType::Double)
+    when CToken::KwChar then
+      self.advance()
+      Result::Ok(CType::Char)
+    when CToken::KwShort then
+      self.advance()
+      self._skip_int_keyword()
+      Result::Ok(CType::Short)
+    when CToken::KwInt then
+      self.advance()
+      Result::Ok(CType::Int)
+    when CToken::KwLong then
+      self.advance()
+      match self.peek()
+      when CToken::KwLong then
+        self.advance()
+        self._skip_int_keyword()
+        Result::Ok(CType::LongLong)
+      when CToken::KwDouble then
+        self.advance()
+        Result::Ok(CType::Double)
+      when CToken::KwInt then
+        self.advance()
+        Result::Ok(CType::Long)
+      when _ then Result::Ok(CType::Long)
+      end
+    when CToken::KwUnsigned then
+      self.advance()
+      match self.peek()
+      when CToken::KwChar then self.advance(); Result::Ok(CType::UChar)
+      when CToken::KwShort then self.advance(); self._skip_int_keyword(); Result::Ok(CType::UShort)
+      when CToken::KwInt then self.advance(); Result::Ok(CType::UInt)
+      when CToken::KwLong then
+        self.advance()
+        match self.peek()
+        when CToken::KwLong then self.advance(); self._skip_int_keyword(); Result::Ok(CType::ULongLong)
+        when KwInt then self.advance(); Result::Ok(CType::ULong)
+        when _ then Result::Ok(CType::ULong)
+        end
+      when _ then Result::Ok(CType::UInt)
+      end
+    when CToken::KwSigned then
+      self.advance()
+      match self.peek()
+      when CToken::KwChar then self.advance(); Result::Ok(CType::Char)
+      when CToken::KwShort then self.advance(); self._skip_int_keyword(); Result::Ok(CType::Short)
+      when CToken::KwInt then self.advance(); Result::Ok(CType::Int)
+      when CToken::KwLong then
+        self.advance()
+        match self.peek()
+        when CToken::KwLong then self.advance(); self._skip_int_keyword(); Result::Ok(CType::LongLong)
+        when _ then Result::Ok(CType::Long)
+        end
+      when _ then Result::Ok(CType::Int)
+      end
+    when CToken::KwStruct then
+      self.advance()
+      let name = self._expect_ident()?
+      match self.peek()
+      when CToken::LBrace then
+        let fields = self._parse_struct_body()?
+        Result::Ok(CType::Struct(CStruct { name: name, fields: fields, packed: false }))
+      when _ then
+        Result::Ok(CType::Struct(CStruct { name: name, fields: Array::new(), packed: false }))
+      end
+    when CToken::KwUnion then
+      self.advance()
+      let name = self._expect_ident()?
+      Result::Ok(CType::Union(CUnion { name: name, variants: Array::new() }))
+    when CToken::KwEnum then
+      self.advance()
+      let name = self._expect_ident()?
+      Result::Ok(CType::Enum(CEnum { name: name, variants: Array::new() }))
+    when CToken::Ident(name) then
+      self.advance()
+      ## Known standard types
+      if name == "size_t" || name == "SIZE_T" then Result::Ok(CType::SizeT)
+      elsif name == "ssize_t" then Result::Ok(CType::Long)
+      elsif name == "int8_t" || name == "__int8" then Result::Ok(CType::Char)
+      elsif name == "uint8_t" then Result::Ok(CType::UChar)
+      elsif name == "int16_t" || name == "__int16" then Result::Ok(CType::Short)
+      elsif name == "uint16_t" then Result::Ok(CType::UShort)
+      elsif name == "int32_t" || name == "__int32" then Result::Ok(CType::Int)
+      elsif name == "uint32_t" then Result::Ok(CType::UInt)
+      elsif name == "int64_t" || name == "__int64" then Result::Ok(CType::LongLong)
+      elsif name == "uint64_t" then Result::Ok(CType::ULongLong)
+      elsif name == "intptr_t" || name == "ptrdiff_t" then Result::Ok(CType::Long)
+      elsif name == "uintptr_t" then Result::Ok(CType::ULong)
+      else Result::Ok(CType::Typedef(name.clone(), Box::new(CType::Int)))
+      end
+    when _ then
+      Result::Err("expected type specifier".to_string())
+    end
+  end
+
+  ## ── Helpers ────────────────────────────────────────────────────
+  def _skip_cv_qualifiers(&mut self)
+    loop do
+      match self.peek()
+      when CToken::KwConst then self.advance()
+      when CToken::KwVolatile then self.advance()
+      when _ then break
+      end
+    end
+  end
+
+  def _skip_int_keyword(&mut self)
+    match self.peek()
+    when CToken::KwInt then self.advance()
+    when _ then ()
+    end
+  end
+
+  def _peek_is_star(&self) -> Bool
+    match self.peek()
+    when CToken::Star then true
+    when _ then false
+    end
+  end
+
+  def _peek_is_const(&self) -> Bool
+    match self.peek()
+    when CToken::KwConst then true
+    when _ then false
+    end
+  end
+
+  def _maybe_ident(&mut self) -> Option[String]
+    match self.peek()
+    when CToken::Ident(name) then
+      let n = name.clone()
+      self.advance()
+      Option::Some(n)
+    when _ then Option::None
+    end
+  end
+
+  def _expect_ident(&mut self) -> Result[String, String]
+    match self.peek()
+    when CToken::Ident(name) then
+      let n = name.clone()
+      self.advance()
+      Result::Ok(n)
+    when _ then Result::Err("expected identifier".to_string())
+    end
+  end
+
+  def _expect_token_lparen(&mut self) -> Result[Unit, String]
+    match self.peek()
+    when CToken::LParen then self.advance(); Result::Ok(())
+    when _ then Result::Err("expected '('".to_string())
+    end
+  end
+
+  def _expect_token_rparen(&mut self) -> Result[Unit, String]
+    match self.peek()
+    when CToken::RParen then self.advance(); Result::Ok(())
+    when _ then Result::Err("expected ')'".to_string())
+    end
+  end
+
+  def _expect_token_rbracket(&mut self) -> Result[Unit, String]
+    match self.peek()
+    when CToken::RBracket then self.advance(); Result::Ok(())
+    when _ then Result::Err("expected ']'".to_string())
+    end
+  end
+
+  def _parse_int_lit(&mut self) -> Result[i64, String]
+    match self.peek()
+    when CToken::IntLit(v) then
+      let val = *v
+      self.advance()
+      Result::Ok(val)
+    when _ then Result::Err("expected integer literal".to_string())
+    end
+  end
+
+  def _skip_braced_block(&mut self)
+    self.advance()  ## consume '{'
+    mut depth = 1
+    while !self._at_eof() && depth > 0 do
+      match self.peek()
+      when CToken::LBrace then depth = depth + 1; self.advance()
+      when CToken::RBrace then depth = depth - 1; self.advance()
+      when _ then self.advance()
+      end
+    end
+  end
+end
+
+## Map Tangerine types to C types for @export header generation
+def _tg_type_to_c(ty_str: &str) -> String
+  let t = ty_str.trim()
+  if t == "Unit" || t == "()" then "void"
+  elsif t == "Bool" then "bool"
+  elsif t == "i8" then "int8_t"
+  elsif t == "u8" then "uint8_t"
+  elsif t == "i16" then "int16_t"
+  elsif t == "u16" then "uint16_t"
+  elsif t == "i32" || t == "Int" then "int32_t"
+  elsif t == "u32" || t == "UInt" then "uint32_t"
+  elsif t == "i64" then "int64_t"
+  elsif t == "u64" then "uint64_t"
+  elsif t == "f32" then "float"
+  elsif t == "f64" || t == "Float" then "double"
+  elsif t == "String" || t == "&str" then "const char*"
+  elsif t.starts_with("&mut ") then
+    let inner = t.substring(5, t.len() as Int).trim()
+    _tg_type_to_c(inner).to_string() + "*"
+  elsif t.starts_with("&") then
+    let inner = t.substring(1, t.len() as Int).trim()
+    "const " + &_tg_type_to_c(inner) + "*"
+  elsif t.starts_with("*mut ") then
+    let inner = t.substring(5, t.len() as Int).trim()
+    _tg_type_to_c(inner).to_string() + "*"
+  elsif t.starts_with("*const ") then
+    let inner = t.substring(7, t.len() as Int).trim()
+    "const " + &_tg_type_to_c(inner) + "*"
+  else
+    t.to_string()
+  end
 end
 
 # ─── Internal helpers ────────────────────────────────────────────────

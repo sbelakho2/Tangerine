@@ -67,37 +67,197 @@ struct DeviceProfile
 end
 
 def list_devices(class_filter: Option[DeviceClass]) -> Result[Vec[Device], DeviceError]
-  # Reference implementation: returns discovered CPU and mock GPU/Accelerator.
-  # Production backends query udev/sysfs (Linux), IOKit (macOS), Win32.
+  # Discover real hardware via platform-specific introspection.
   let mut devices = Vec[Device].new()
   
-  # CPU Discovery (Skeletal)
-  let mut cpu_caps = Map[String, DeviceCapability].new()
-  cpu_caps.insert("threads".to_string(), DeviceCapability { name: "threads".to_string(), version: 1, value: "8".to_string() })
-  
-  devices.push(Device {
+  # CPU Discovery — read /proc/cpuinfo on Linux, sysctl on macOS
+  let cpu_info = _discover_cpu()
+  devices.push(cpu_info)
+
+  # GPU/Accelerator Discovery — read /sys/class/drm on Linux, IOKit on macOS
+  let gpu_list = _discover_gpus()
+  for gpu in gpu_list do
+    devices.push(gpu)
+  end
+
+  # Apply class filter if provided
+  match class_filter
+  when Option::Some(cls) then
+    let mut filtered = Vec::new()
+    for dev in devices do
+      if _device_class_eq(&dev.class, &cls) then
+        filtered.push(dev)
+      end
+    end
+    Result::Ok(filtered)
+  when Option::None then Result::Ok(devices)
+  end
+end
+
+def _device_class_eq(a: &DeviceClass, b: &DeviceClass) -> Bool
+  match (a, b)
+  when (DeviceClass::Cpu, DeviceClass::Cpu) then true
+  when (DeviceClass::Gpu, DeviceClass::Gpu) then true
+  when (DeviceClass::Accelerator, DeviceClass::Accelerator) then true
+  when _ then false
+  end
+end
+
+def _discover_cpu() -> Device
+  let mut name = "System CPU".to_string()
+  let mut threads = 1
+  let mut caps = Map[String, DeviceCapability].new()
+
+  # Try /proc/cpuinfo (Linux)
+  match std::fs::read_to_string("/proc/cpuinfo".to_string())
+  when Result::Ok(info) then
+    let lines = info.lines()
+    for line in lines do
+      if line.starts_with("model name") then
+        match line.find(": ") 
+        when Option::Some(idx) then name = line[idx + 2..].trim().to_string()
+        when Option::None then ()
+        end
+      elsif line.starts_with("processor") then
+        threads = threads + 1
+      end
+    end
+    # Last line increments one too many
+    if threads > 1 then threads = threads - 1 end
+  when Result::Err(_) then
+    # Fallback: try sysctl on macOS
+    match std::process::command_output("sysctl", ["-n", "machdep.cpu.brand_string"])
+    when Result::Ok(out) then name = out.trim().to_string()
+    when Result::Err(_) then ()
+    end
+    match std::process::command_output("sysctl", ["-n", "hw.ncpu"])
+    when Result::Ok(out) then
+      match out.trim().parse_int()
+      when Option::Some(n) then threads = n
+      when Option::None then ()
+      end
+    when Result::Err(_) then ()
+    end
+  end
+
+  caps.insert("threads".to_string(),
+    DeviceCapability { name: "threads".to_string(), version: 1, value: threads.to_string() })
+
+  Device {
     id: "cpu-0".to_string(),
     class: DeviceClass::Cpu,
-    name: "System CPU".to_string(),
+    name: name,
     vendor_id: 0,
     device_id: 0,
-    capabilities: cpu_caps
-  })
-  
-  # Mock GPU
-  let mut gpu_caps = Map[String, DeviceCapability].new()
-  gpu_caps.insert("vulkan".to_string(), DeviceCapability { name: "vulkan".to_string(), version: 120, value: "1.2".to_string() })
-  
-  devices.push(Device {
-    id: "gpu-0".to_string(),
-    class: DeviceClass::Gpu,
-    name: "Integrated GPU".to_string(),
-    vendor_id: 0x8086,
-    device_id: 0x1234,
-    capabilities: gpu_caps
-  })
-  
-  Result::Ok(devices)
+    capabilities: caps
+  }
+end
+
+def _discover_gpus() -> Vec[Device]
+  let mut gpus = Vec::new()
+  let mut gpu_idx = 0
+
+  # Try /sys/class/drm on Linux for each card*
+  match std::fs::list_dir("/sys/class/drm".to_string())
+  when Result::Ok(entries) then
+    for entry in entries do
+      if !entry.starts_with("card") || entry.contains("-") then next end
+      let dev_path = "/sys/class/drm/" + entry + "/device"
+      let mut gpu_name = entry.clone()
+      let mut vendor: u32 = 0
+      let mut devid: u32 = 0
+      let mut caps = Map[String, DeviceCapability].new()
+
+      match std::fs::read_to_string(dev_path + "/vendor")
+      when Result::Ok(v) then
+        let trimmed = v.trim()
+        if trimmed.starts_with("0x") then
+          match _parse_hex(&trimmed[2..])
+          when Option::Some(n) then vendor = n as u32
+          when Option::None then ()
+          end
+        end
+      when Result::Err(_) then ()
+      end
+
+      match std::fs::read_to_string(dev_path + "/device")
+      when Result::Ok(v) then
+        let trimmed = v.trim()
+        if trimmed.starts_with("0x") then
+          match _parse_hex(&trimmed[2..])
+          when Option::Some(n) then devid = n as u32
+          when Option::None then ()
+          end
+        end
+      when Result::Err(_) then ()
+      end
+
+      # Try to get a better name from uevent
+      match std::fs::read_to_string(dev_path + "/uevent")
+      when Result::Ok(uevent) then
+        for line in uevent.lines() do
+          if line.starts_with("PCI_SLOT_NAME=") then
+            gpu_name = "GPU [" + line[14..].trim().to_string() + "]"
+          end
+        end
+      when Result::Err(_) then ()
+      end
+
+      # Detect Vulkan support
+      match std::fs::list_dir("/usr/share/vulkan/icd.d")
+      when Result::Ok(_) then
+        caps.insert("vulkan".to_string(),
+          DeviceCapability { name: "vulkan".to_string(), version: 100, value: "detected".to_string() })
+      when Result::Err(_) then ()
+      end
+
+      gpus.push(Device {
+        id: "gpu-" + gpu_idx.to_string(),
+        class: DeviceClass::Gpu,
+        name: gpu_name,
+        vendor_id: vendor,
+        device_id: devid,
+        capabilities: caps
+      })
+      gpu_idx = gpu_idx + 1
+    end
+  when Result::Err(_) then
+    # macOS: try system_profiler for GPU info
+    match std::process::command_output("system_profiler", ["SPDisplaysDataType", "-detailLevel", "mini"])
+    when Result::Ok(output) then
+      for line in output.lines() do
+        let trimmed = line.trim()
+        if trimmed.starts_with("Chipset Model:") then
+          let gpu_name = trimmed[15..].trim().to_string()
+          let caps = Map[String, DeviceCapability].new()
+          gpus.push(Device {
+            id: "gpu-" + gpu_idx.to_string(),
+            class: DeviceClass::Gpu,
+            name: gpu_name,
+            vendor_id: 0,
+            device_id: 0,
+            capabilities: caps
+          })
+          gpu_idx = gpu_idx + 1
+        end
+      end
+    when Result::Err(_) then ()
+    end
+  end
+  gpus
+end
+
+def _parse_hex(s: &str) -> Option[Int]
+  let mut result = 0
+  for ch in s.chars() do
+    let digit = if ch >= '0' && ch <= '9' then (ch as Int) - ('0' as Int)
+    elsif ch >= 'a' && ch <= 'f' then (ch as Int) - ('a' as Int) + 10
+    elsif ch >= 'A' && ch <= 'F' then (ch as Int) - ('A' as Int) + 10
+    else return Option::None
+    end
+    result = result * 16 + digit
+  end
+  Option::Some(result)
 end
 
 def select_device(profile: DeviceProfile) -> Result[Device, DeviceError]

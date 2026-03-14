@@ -13,6 +13,7 @@ use std::fs::{write_file_bytes}
 use tg_compiler::types::{Type, TypeId}
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirBlock, MirLocal, MirStatic,
+  MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
   MirStatement, MirStatementKind,
   MirTerminator, MirTerminatorKind,
   MirRvalue, MirRvalueKind,
@@ -88,13 +89,14 @@ struct CodegenCtx
   string_pool: Map[String, String]  # literal -> label
   string_counter: Int
   fn_counter: Int
+  type_layout: Map[Int, Int]    # TypeId.id -> byte size
 end
 
 # ———————————————————————————————————————————————————————————————
 # Type layout
 # ———————————————————————————————————————————————————————————————
 
-def type_size(ty: &Type) -> Int
+def type_size(ty: &Type, layout: &Map[Int, Int]) -> Int
   match ty
   when Type::Unit    then 0
   when Type::Bool    then 1
@@ -110,7 +112,7 @@ def type_size(ty: &Type) -> Int
     mut total = 0
     mut max_align = 1
     for f in fields do
-      let sz = type_size(f)
+      let sz = type_size(f, layout)
       let align = type_align(f)
       if align > max_align then max_align = align end
       # Pad to alignment
@@ -122,11 +124,13 @@ def type_size(ty: &Type) -> Int
     let rem = total % max_align
     if rem != 0 then total = total + (max_align - rem) end
     total
-  when Type::Array(elem, count) then type_size(elem) * count
+  when Type::Array(elem, count) then type_size(elem, layout) * count
   when Type::Slice(_) then 16    # ptr + len
-  when Type::Named(_, _) then
-    # Type::Named stores TypeId, not textual names; use pointer-size fallback here.
-    8
+  when Type::Named(tid, _) then
+    match layout.get(tid.id)
+    when Option::Some(sz) then sz
+    when Option::None then 8  # fallback for unknown types
+    end
   when Type::Function(_, _) then 8  # Function pointer
   when Type::Var(_) then 8      # Unknown; default to pointer size
   when Type::Error then 0
@@ -144,6 +148,46 @@ end
 
 def align_up_int(v: Int, align: Int) -> Int
   ((v + align - 1) / align) * align
+end
+
+def build_type_layout(types: &Vec[MirTypeDef]) -> Map[Int, Int]
+  mut layout: Map[Int, Int] = Map::new()
+  # First pass: insert 0 for all type ids to break potential cycles
+  for td in types do
+    layout.insert(td.id.id, 0)
+  end
+  # Second pass: compute real sizes
+  for td in types do
+    let sz = match td.kind
+    when MirTypeDefKind::Struct(fields) then
+      mut total = 0
+      mut max_align = 1
+      for f in fields do
+        let fsz = type_size(&f.ty, &layout)
+        let fa = type_align(&f.ty)
+        if fa > max_align then max_align = fa end
+        let rem = total % fa
+        if rem != 0 then total = total + (fa - rem) end
+        total = total + fsz
+      end
+      let rem = total % max_align
+      if rem != 0 then total = total + (max_align - rem) end
+      total
+    when MirTypeDefKind::Enum(variants) then
+      # tag (8 bytes) + max payload
+      mut max_payload = 0
+      for v in variants do
+        mut payload = 0
+        for fty in v.fields do
+          payload = payload + type_size(fty, &layout)
+        end
+        if payload > max_payload then max_payload = payload end
+      end
+      8 + max_payload
+    end
+    layout.insert(td.id.id, sz)
+  end
+  layout
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -293,9 +337,30 @@ def alloc_reg_or_spill(state: &mut RegAllocState, ctx: &mut CodegenCtx, frame: &
   match alloc_reg(state)
   when Option::Some(r) then r
   when Option::None then
-    # No allocatable registers left; use dedicated scratch register.
-    # Avoid popping `free_regs` here because it is known-empty on this path.
-    scratch_reg(state.arch)
+    # No free registers — find an in-use register, spill its value to the
+    # stack, and reclaim it.  Pick the first register-allocated variable
+    # found in the assignments map.
+    mut spill_victim_id = -1
+    mut spill_reg = scratch_reg(state.arch)
+    for entry in state.assignments do
+      match entry.1
+      when VarLoc::Register(r) then
+        spill_victim_id = entry.0
+        spill_reg = r
+        break
+      when _ then ()
+      end
+    end
+    if spill_victim_id >= 0 then
+      # Allocate a spill slot on the stack.
+      let fp = fp_reg(state.arch)
+      frame.spill_offset = frame.spill_offset - 8
+      let offset = frame.spill_offset
+      emit_store_mem(ctx, fp, offset, spill_reg)
+      state.assignments.insert(spill_victim_id, VarLoc::Spilled(offset))
+      frame.local_offsets.insert(spill_victim_id, offset)
+    end
+    spill_reg
   end
 end
 
@@ -340,7 +405,7 @@ def saved_reg_bytes(saved: &Vec[PhysReg]) -> Int
   count * 8
 end
 
-def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameInfo)
+def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (Map[Int, VarLoc], FrameInfo)
   mut ra = reg_alloc_new(arch)
   mut local_offsets: Map[Int, Int] = Map::new()
   mut var_locs: Map[Int, VarLoc] = Map::new()
@@ -348,7 +413,7 @@ def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameI
 
   # Try to give each local a register; spill when exhausted
   for local in func.locals do
-    let sz = type_size(&local.ty)
+    let sz = type_size(&local.ty, layout)
     if sz == 0 then
       var_locs.insert(local.id.id, VarLoc::Stack(0))
       next
@@ -369,7 +434,7 @@ def allocate_locals(func: &MirFunction, arch: Arch) -> (Map[Int, VarLoc], FrameI
   # The prologue will move from ABI arg regs into these locations.
   mut arg_idx = 0
   for param in func.params do
-    let sz = type_size(&param.ty)
+    let sz = type_size(&param.ty, layout)
     if sz == 0 then
       var_locs.insert(param.id.id, VarLoc::Stack(0))
     else
@@ -418,7 +483,8 @@ def codegen_new(target: AsmTarget) -> CodegenCtx
     bss_symbols: Vec::new(),
     string_pool: Map::new(),
     string_counter: 0,
-    fn_counter: 0
+    fn_counter: 0,
+    type_layout: Map::new()
   }
 end
 
@@ -1414,7 +1480,7 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, rv: &MirRvalue
       end
     when CastKind::IntToInt then
       # Narrowing integer casts need an explicit mask; widening is a register no-op here.
-      let target_bits = type_size(&target_ty) * 8
+      let target_bits = type_size(&target_ty, &ctx.type_layout) * 8
       if target_bits < 64 then
         let mask = (1 << target_bits) - 1
         emit_and_ri(ctx, dst, mask as i32)
@@ -1528,7 +1594,7 @@ end
 # Statement code generation
 # ———————————————————————————————————————————————————————————————
 
-def codegen_statement(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, stmt: &MirStatement) -> Unit
+def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStatement) -> Unit
   let rr = ret_reg(ctx.target.arch)
   match stmt.kind
   when MirStatementKind::MirAssign(place, rvalue) then
@@ -1838,9 +1904,9 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   let rr = ret_reg(arch)
 
   # Load return value into the return register if needed (local 0 is return place)
-  if type_size(&fctx.func.ret_type) > 0 && fctx.func.locals.len() > 0 then
+  if type_size(&fctx.func.ret_type, &ctx.type_layout) > 0 && fctx.func.locals.len() > 0 then
     let ret_local = fctx.func.locals[0]
-    if type_size(&ret_local.ty) > 0 then
+    if type_size(&ret_local.ty, &ctx.type_layout) > 0 then
       match fctx.var_locs.get(ret_local.id.id)
       when Option::Some(loc) then
         match loc
@@ -1920,7 +1986,7 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
   end
 
   # Register allocation
-  let (var_locs, frame) = allocate_locals(func, ctx.target.arch)
+  let (var_locs, frame) = allocate_locals(func, ctx.target.arch, &ctx.type_layout)
 
   # Block labels
   let block_labels = make_block_labels(func)
@@ -1953,7 +2019,7 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
     def_label(&mut ctx.text, label)
 
     for stmt in block.statements do
-      codegen_statement(ctx, &fctx, stmt)
+      codegen_statement(ctx, &mut fctx, stmt)
     end
 
     codegen_terminator(ctx, &fctx, &block.terminator)
@@ -1969,7 +2035,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
-  let sz = type_size(&st.ty)
+  let sz = type_size(&st.ty, &ctx.type_layout)
   
   match st.init
   when Option::Some(op) then
@@ -2037,6 +2103,9 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Unit
+  # Build type layout map from MIR type definitions
+  ctx.type_layout = build_type_layout(&program.types)
+
   # Emit all statics
   for st in program.statics do
     codegen_static(ctx, st)

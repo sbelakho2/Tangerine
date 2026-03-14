@@ -332,6 +332,7 @@ impl<'src> Lexer<'src> {
             "module" => TokenKind::KeywordModule,
             "mod" => TokenKind::KeywordMod,
             "const" => TokenKind::KeywordConst,
+            "static" => TokenKind::KeywordStatic,
             "type" => TokenKind::KeywordType,
             "extern" => TokenKind::KeywordExtern,
             "where" => TokenKind::KeywordWhere,
@@ -502,10 +503,14 @@ impl<'src> Lexer<'src> {
                 }
                 self.consume_decimal_digits();
             }
+            // Consume optional type suffix (e.g. f32, f64)
+            self.consume_optional_numeric_suffix();
             let lexeme = self.slice(start.index, self.index);
             return Ok(Token::new(TokenKind::Float(lexeme.to_string()), lexeme, self.span_from(start)));
         }
 
+        // Consume optional type suffix (e.g. u8, u32, i64, u, usize)
+        self.consume_optional_numeric_suffix();
         let lexeme = self.slice(start.index, self.index);
         Ok(Token::new(TokenKind::Integer(lexeme.to_string()), lexeme, self.span_from(start)))
     }
@@ -640,6 +645,43 @@ impl<'src> Lexer<'src> {
     fn consume_decimal_digits(&mut self) {
         while matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit() || ch == '_') {
             let _ = self.bump_char();
+        }
+    }
+
+    /// Consume a type suffix like u8, u16, u32, u64, usize, i8, i16, i32, i64,
+    /// f32, f64, or bare u/i.
+    fn consume_optional_numeric_suffix(&mut self) {
+        let Some(ch) = self.peek_char() else { return };
+        if !matches!(ch, 'u' | 'i' | 'f') {
+            return;
+        }
+        // Save position — only commit if it matches a known suffix
+        let save_idx = self.index;
+        let save_line = self.line;
+        let save_col = self.col;
+        let _ = self.bump_char(); // consume u/i/f
+        // Try to consume digits after the prefix letter
+        let digits_start = self.index;
+        while matches!(self.peek_char(), Some(d) if d.is_ascii_digit()) {
+            let _ = self.bump_char();
+        }
+        let suffix_tail = self.slice(digits_start, self.index);
+        let head = ch;
+        let valid = match head {
+            'u' => matches!(suffix_tail, "" | "8" | "16" | "32" | "64" | "size"),
+            'i' => matches!(suffix_tail, "8" | "16" | "32" | "64"),
+            'f' => matches!(suffix_tail, "32" | "64"),
+            _ => false,
+        };
+        // If the next char is alphanumeric or underscore, this isn't a suffix — it's part of
+        // a different identifier that happens to start with u/i/f (e.g. variable named `u`).
+        if valid && !matches!(self.peek_char(), Some(c) if c.is_alphanumeric() || c == '_') {
+            // Suffix consumed successfully — keep position
+        } else {
+            // Not a valid suffix — revert
+            self.index = save_idx;
+            self.line = save_line;
+            self.col = save_col;
         }
     }
 

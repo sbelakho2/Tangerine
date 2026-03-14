@@ -19,11 +19,15 @@ use std::bench::{BenchCase, bench_case_new}
 
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
-use tg_compiler::ast::{Program, AstPath}
+use tg_compiler::ast::{
+  Program, AstPath, TypeExpr, TypeExprKind,
+  MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind,
+  FnBody, FunctionDecl
+}
 use tg_compiler::parser::{parse, diag_has_errors, DiagnosticBag}
 use tg_compiler::types::{type_check, TypeError}
 use tg_compiler::borrow_check::{borrow_check, BorrowError}
-use tg_compiler::mir::{lower_to_mir, MirProgram, optimize_mir, pretty_print_mir, instrument_for_pgo}
+use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, type_size, type_align}
 use tg_compiler::asm::{AsmTarget}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
@@ -491,6 +495,17 @@ def json_escape(s: String) -> String
       result = result + "\\r"
     elsif c == '\t' then
       result = result + "\\t"
+    elsif c == '\x08' then
+      result = result + "\\b"
+    elsif c == '\x0C' then
+      result = result + "\\f"
+    elsif (c as UInt) < 0x20 then
+      # Escape other control characters as \u00XX
+      let code = c as UInt
+      let hex_digits = "0123456789abcdef"
+      result = result + "\\u00"
+      result = result + hex_digits.char_at(((code >> 4) & 0xF) as Int).to_string()
+      result = result + hex_digits.char_at((code & 0xF) as Int).to_string()
     else
       result = result + c.to_string()
     end
@@ -991,7 +1006,6 @@ def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
 end
 
 def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
-  # For function items, expand macro calls inside the function body
   match item.kind
   when ItemKind::Function(f) then
     match f.body
@@ -1022,6 +1036,47 @@ def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
       }
     when _ then ExpandedItem { item, did_expand: false }
     end
+  when ItemKind::ImplBlock(impl_block) then
+    mut new_methods = Vec::new()
+    mut did_expand = false
+    for method in impl_block.methods do
+      let expanded_method = expand_item(env, method)
+      new_methods.push(expanded_method.item)
+      if expanded_method.did_expand then did_expand = true end
+    end
+    let new_impl = ImplBlock {
+      self_type: impl_block.self_type.clone(),
+      trait_ref: impl_block.trait_ref.clone(),
+      generic_params: impl_block.generic_params.clone(),
+      where_clause: impl_block.where_clause.clone(),
+      methods: new_methods,
+      span: impl_block.span
+    }
+    ExpandedItem {
+      item: Item { kind: ItemKind::ImplBlock(new_impl), attrs: item.attrs.clone(), span: item.span, is_pub: item.is_pub },
+      did_expand
+    }
+  when ItemKind::TraitDecl(trait_decl) then
+    mut new_items = Vec::new()
+    mut did_expand = false
+    for ti in trait_decl.items do
+      let expanded = expand_item(env, ti)
+      new_items.push(expanded.item)
+      if expanded.did_expand then did_expand = true end
+    end
+    let new_trait = TraitDecl {
+      vis: trait_decl.vis,
+      name: trait_decl.name.clone(),
+      generic_params: trait_decl.generic_params.clone(),
+      supertraits: trait_decl.supertraits.clone(),
+      where_clause: trait_decl.where_clause.clone(),
+      items: new_items,
+      span: trait_decl.span
+    }
+    ExpandedItem {
+      item: Item { kind: ItemKind::TraitDecl(new_trait), attrs: item.attrs.clone(), span: item.span, is_pub: item.is_pub },
+      did_expand
+    }
   when _ then ExpandedItem { item, did_expand: false }
   end
 end
@@ -1053,6 +1108,74 @@ def expand_stmt(env: &MacroEnv, stmt: Stmt) -> ExpandedStmt
       stmt: Stmt { kind: StmtKind::StmtLet(pat, ty, expanded_expr.expr, is_mut), span: stmt.span },
       did_expand: expanded_expr.did_expand
     }
+  when StmtKind::StmtAssign(target, value) then
+    let et = expand_expr(env, target)
+    let ev = expand_expr(env, value)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtAssign(et.expr, ev.expr), span: stmt.span },
+      did_expand: et.did_expand || ev.did_expand
+    }
+  when StmtKind::StmtCompoundAssign(op, target, value) then
+    let et = expand_expr(env, target)
+    let ev = expand_expr(env, value)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtCompoundAssign(op, et.expr, ev.expr), span: stmt.span },
+      did_expand: et.did_expand || ev.did_expand
+    }
+  when StmtKind::StmtIf(if_stmt) then
+    let ec = expand_expr(env, *if_stmt.cond)
+    let eb = expand_block(env, if_stmt.then_block)
+    let did = ec.did_expand || eb.did_expand
+    let new_if = IfStmt {
+      cond: ec.expr,
+      then_block: eb.block,
+      elsif_branches: if_stmt.elsif_branches.clone(),
+      else_block: if_stmt.else_block.clone(),
+      span: if_stmt.span
+    }
+    ExpandedStmt { stmt: Stmt { kind: StmtKind::StmtIf(new_if), span: stmt.span }, did_expand: did }
+  when StmtKind::StmtWhile(cond, body) then
+    let ec = expand_expr(env, cond)
+    let eb = expand_block(env, body)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtWhile(ec.expr, eb.block), span: stmt.span },
+      did_expand: ec.did_expand || eb.did_expand
+    }
+  when StmtKind::StmtFor(pat, iter_expr, body) then
+    let ei = expand_expr(env, iter_expr)
+    let eb = expand_block(env, body)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtFor(pat, ei.expr, eb.block), span: stmt.span },
+      did_expand: ei.did_expand || eb.did_expand
+    }
+  when StmtKind::StmtLoop(body) then
+    let eb = expand_block(env, body)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtLoop(eb.block), span: stmt.span },
+      did_expand: eb.did_expand
+    }
+  when StmtKind::StmtReturn(opt_expr) then
+    match opt_expr
+    when Option::Some(expr) then
+      let ee = expand_expr(env, expr)
+      ExpandedStmt {
+        stmt: Stmt { kind: StmtKind::StmtReturn(Option::Some(ee.expr)), span: stmt.span },
+        did_expand: ee.did_expand
+      }
+    when Option::None then ExpandedStmt { stmt, did_expand: false }
+    end
+  when StmtKind::StmtUnsafe(reason, body) then
+    let eb = expand_block(env, body)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtUnsafe(reason, eb.block), span: stmt.span },
+      did_expand: eb.did_expand
+    }
+  when StmtKind::StmtDefer(body) then
+    let eb = expand_block(env, body)
+    ExpandedStmt {
+      stmt: Stmt { kind: StmtKind::StmtDefer(eb.block), span: stmt.span },
+      did_expand: eb.did_expand
+    }
   when _ then ExpandedStmt { stmt, did_expand: false }
   end
 end
@@ -1073,15 +1196,13 @@ end
 def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
   match expr.kind
   when ExprKind::ExprCall(callee, args) then
-    # Check if callee is a path that matches a macro name
+    ## Check if callee is a path that matches a macro name
     match callee.kind
     when ExprKind::ExprPath(path) then
       let name = path_to_name(&path)
       match env.macros.get(&name)
       when Option::Some(macro_decl) then
-        # Check for recursive macro expansion
         if env.expansion_stack.contains(&name) then
-          # Recursive macro invocation detected - return error
           ExpandedExpr {
             expr: Expr {
               kind: ExprKind::ExprError("recursive macro invocation: '" + name.clone() + "'"),
@@ -1090,20 +1211,48 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
             did_expand: false
           }
         else
-          # Push onto expansion stack
           env.expansion_stack.push(name.clone())
-          # Found a macro invocation — expand it
           let expanded = instantiate_macro(macro_decl, &args, &expr.span)
-          # Pop from expansion stack
           env.expansion_stack.pop()
           ExpandedExpr { expr: expanded, did_expand: true }
         end
       when Option::None then
-        # Leave ordinary calls unchanged in stage0.
-        ExpandedExpr { expr, did_expand: false }
+        ## Not a macro — expand arguments recursively
+        let ea = expand_exprs(env, &args)
+        let ec = expand_expr(env, *callee)
+        ExpandedExpr {
+          expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span },
+          did_expand: ec.did_expand || ea.did_expand
+        }
       end
     when _ then
-      ExpandedExpr { expr, did_expand: false }
+      let ea = expand_exprs(env, &args)
+      let ec = expand_expr(env, *callee)
+      ExpandedExpr {
+        expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span },
+        did_expand: ec.did_expand || ea.did_expand
+      }
+    end
+  when ExprKind::ExprMacroCall(name, args) then
+    match env.macros.get(&name)
+    when Option::Some(macro_decl) then
+      if env.expansion_stack.contains(&name) then
+        ExpandedExpr {
+          expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + name.clone() + "'"), span: expr.span },
+          did_expand: false
+        }
+      else
+        env.expansion_stack.push(name.clone())
+        let expanded = instantiate_macro(macro_decl, &args, &expr.span)
+        env.expansion_stack.pop()
+        ExpandedExpr { expr: expanded, did_expand: true }
+      end
+    when Option::None then
+      let ea = expand_exprs(env, &args)
+      ExpandedExpr {
+        expr: Expr { kind: ExprKind::ExprMacroCall(name, ea.args), span: expr.span },
+        did_expand: ea.did_expand
+      }
     end
   when ExprKind::ExprBlock(block) then
     let expanded_block = expand_block(env, block)
@@ -1123,6 +1272,125 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
       span: if_expr.span
     }
     ExpandedExpr { expr: Expr { kind: ExprKind::ExprIf(new_if), span: expr.span }, did_expand: expanded }
+  when ExprKind::ExprBinaryOp(op, lhs, rhs) then
+    let el = expand_expr(env, *lhs)
+    let er = expand_expr(env, *rhs)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(el.expr), Box::new(er.expr)), span: expr.span },
+      did_expand: el.did_expand || er.did_expand
+    }
+  when ExprKind::ExprUnaryOp(op, operand) then
+    let eo = expand_expr(env, *operand)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(eo.expr)), span: expr.span },
+      did_expand: eo.did_expand
+    }
+  when ExprKind::ExprMethodCall(receiver, method, targs, args) then
+    let er = expand_expr(env, *receiver)
+    let ea = expand_exprs(env, &args)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprMethodCall(Box::new(er.expr), method, targs, ea.args), span: expr.span },
+      did_expand: er.did_expand || ea.did_expand
+    }
+  when ExprKind::ExprFieldAccess(obj, field) then
+    let eo = expand_expr(env, *obj)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprFieldAccess(Box::new(eo.expr), field), span: expr.span },
+      did_expand: eo.did_expand
+    }
+  when ExprKind::ExprIndex(obj, idx) then
+    let eo = expand_expr(env, *obj)
+    let ei = expand_expr(env, *idx)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprIndex(Box::new(eo.expr), Box::new(ei.expr)), span: expr.span },
+      did_expand: eo.did_expand || ei.did_expand
+    }
+  when ExprKind::ExprArrayLit(elems) then
+    let ea = expand_exprs(env, &elems)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprArrayLit(ea.args), span: expr.span },
+      did_expand: ea.did_expand
+    }
+  when ExprKind::ExprTupleLit(elems) then
+    let ea = expand_exprs(env, &elems)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprTupleLit(ea.args), span: expr.span },
+      did_expand: ea.did_expand
+    }
+  when ExprKind::ExprRef(inner) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprRef(Box::new(ei.expr)), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprRefMut(inner) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprRefMut(Box::new(ei.expr)), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprDeref(inner) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprDeref(Box::new(ei.expr)), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprClosure(params, ret_ty, body) then
+    let eb = expand_expr(env, *body)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprClosure(params, ret_ty, Box::new(eb.expr)), span: expr.span },
+      did_expand: eb.did_expand
+    }
+  when ExprKind::ExprUnsafe(reason, block) then
+    let eb = expand_block(env, block)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprUnsafe(reason, eb.block), span: expr.span },
+      did_expand: eb.did_expand
+    }
+  when ExprKind::ExprAwait(inner) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprAwait(Box::new(ei.expr)), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprTry(inner) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprTry(Box::new(ei.expr)), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprAssign(target, value) then
+    let et = expand_expr(env, *target)
+    let ev = expand_expr(env, *value)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprAssign(Box::new(et.expr), Box::new(ev.expr)), span: expr.span },
+      did_expand: et.did_expand || ev.did_expand
+    }
+  when ExprKind::ExprPipe(lhs, rhs) then
+    let el = expand_expr(env, *lhs)
+    let er = expand_expr(env, *rhs)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprPipe(Box::new(el.expr), Box::new(er.expr)), span: expr.span },
+      did_expand: el.did_expand || er.did_expand
+    }
+  when ExprKind::ExprCast(inner, ty) then
+    let ei = expand_expr(env, *inner)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprCast(Box::new(ei.expr), ty), span: expr.span },
+      did_expand: ei.did_expand
+    }
+  when ExprKind::ExprAsync(block) then
+    let eb = expand_block(env, block)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprAsync(eb.block), span: expr.span },
+      did_expand: eb.did_expand
+    }
+  when ExprKind::ExprComptime(block) then
+    let eb = expand_block(env, block)
+    ExpandedExpr {
+      expr: Expr { kind: ExprKind::ExprComptime(eb.block), span: expr.span },
+      did_expand: eb.did_expand
+    }
   when _ then ExpandedExpr { expr, did_expand: false }
   end
 end
@@ -1182,6 +1450,11 @@ def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
     when Option::Some(replacement) then replacement.clone()
     when Option::None then expr.clone()
     end
+  when ExprKind::ExprIdent(name) then
+    match subst.get(&name)
+    when Option::Some(replacement) then replacement.clone()
+    when Option::None then expr.clone()
+    end
   when ExprKind::ExprCall(callee, args) then
     let new_callee = substitute_expr(subst, &callee)
     mut new_args = Vec::new()
@@ -1196,8 +1469,62 @@ def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
       kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))),
       span: expr.span
     }
+  when ExprKind::ExprUnaryOp(op, operand) then
+    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, &operand))), span: expr.span }
   when ExprKind::ExprBlock(block) then
     Expr { kind: ExprKind::ExprBlock(substitute_block(subst, &block)), span: expr.span }
+  when ExprKind::ExprMethodCall(receiver, method, targs, args) then
+    let new_recv = substitute_expr(subst, &receiver)
+    mut new_args = Vec::new()
+    mut i = 0
+    while i < args.len() do
+      new_args.push(substitute_expr(subst, &args[i]))
+      i = i + 1
+    end
+    Expr { kind: ExprKind::ExprMethodCall(Box::new(new_recv), method.clone(), targs.clone(), new_args), span: expr.span }
+  when ExprKind::ExprFieldAccess(obj, field) then
+    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, &obj)), field.clone()), span: expr.span }
+  when ExprKind::ExprIndex(obj, idx) then
+    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, &obj)), Box::new(substitute_expr(subst, &idx))), span: expr.span }
+  when ExprKind::ExprArrayLit(elems) then
+    mut new_elems = Vec::new()
+    for e in elems do new_elems.push(substitute_expr(subst, &e)) end
+    Expr { kind: ExprKind::ExprArrayLit(new_elems), span: expr.span }
+  when ExprKind::ExprTupleLit(elems) then
+    mut new_elems = Vec::new()
+    for e in elems do new_elems.push(substitute_expr(subst, &e)) end
+    Expr { kind: ExprKind::ExprTupleLit(new_elems), span: expr.span }
+  when ExprKind::ExprRef(inner) then
+    Expr { kind: ExprKind::ExprRef(Box::new(substitute_expr(subst, &inner))), span: expr.span }
+  when ExprKind::ExprRefMut(inner) then
+    Expr { kind: ExprKind::ExprRefMut(Box::new(substitute_expr(subst, &inner))), span: expr.span }
+  when ExprKind::ExprDeref(inner) then
+    Expr { kind: ExprKind::ExprDeref(Box::new(substitute_expr(subst, &inner))), span: expr.span }
+  when ExprKind::ExprAwait(inner) then
+    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, &inner))), span: expr.span }
+  when ExprKind::ExprTry(inner) then
+    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, &inner))), span: expr.span }
+  when ExprKind::ExprCast(inner, ty) then
+    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, &inner)), ty.clone()), span: expr.span }
+  when ExprKind::ExprAssign(target, value) then
+    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, &target)), Box::new(substitute_expr(subst, &value))), span: expr.span }
+  when ExprKind::ExprPipe(lhs, rhs) then
+    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))), span: expr.span }
+  when ExprKind::ExprIf(if_expr) then
+    let new_cond = substitute_expr(subst, &if_expr.cond)
+    let new_then = substitute_block(subst, &if_expr.then_block)
+    let new_if = IfStmt {
+      cond: new_cond,
+      then_block: new_then,
+      elsif_branches: if_expr.elsif_branches.clone(),
+      else_block: if_expr.else_block.clone(),
+      span: if_expr.span
+    }
+    Expr { kind: ExprKind::ExprIf(new_if), span: expr.span }
+  when ExprKind::ExprUnsafe(reason, block) then
+    Expr { kind: ExprKind::ExprUnsafe(reason.clone(), substitute_block(subst, &block)), span: expr.span }
+  when ExprKind::ExprClosure(params, ret_ty, body) then
+    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, &body))), span: expr.span }
   when _ then expr.clone()
   end
 end
@@ -1603,11 +1930,6 @@ def cmd_parse(argv: Vec[String]) -> Int
   exit_code
 end
 
-def bootstrap_copy_self_binary(opts: &CompilerOptions) -> Bool
-  # This was a bootstrap workaround and is no longer used in the final version.
-  false
-end
-
 # ———————————————————————————————————————————————————————————————
 # Subcommand: run
 # ———————————————————————————————————————————————————————————————
@@ -1677,8 +1999,109 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def cmd_test(argv: Vec[String]) -> Int
-  # Real implementation of test runner
-  0
+  # Discover test sources: from project or CLI args.
+  let test_files = match parse_args(argv)
+  when Result::Ok(o) then
+    if o.input_files.is_empty() then
+      match load_project(".")
+      when Result::Ok(project) then project.sources.clone()
+      when Result::Err(_) then find_tg_files(".")
+      end
+    else
+      o.input_files.clone()
+    end
+  when Result::Err(e) then
+    if e == "help" then
+      println("Usage: tg test [OPTIONS] [FILES]...")
+      println("Discover and run @test functions")
+      return 0
+    elsif e == "No input files" then
+      match load_project(".")
+      when Result::Ok(project) then project.sources.clone()
+      when Result::Err(_) then find_tg_files(".")
+      end
+    else
+      eprintln("Error: " + e)
+      return 1
+    end
+  end
+
+  mut total = 0
+  mut passed = 0
+  mut failed = 0
+  mut fail_names: Vec[String] = Vec::new()
+
+  let opts = default_options()
+
+  for file in test_files do
+    let source = match read_file(file.clone())
+    when Result::Ok(content) then content
+    when Result::Err(_) then next
+    end
+    let lex_result = tokenize(source)
+    let (ast, parse_diags) = parse(lex_result)
+    if diag_has_errors(&parse_diags) then next end
+
+    # Find @test functions
+    for item in ast.items do
+      mut is_test = false
+      for attr in item.attrs do
+        if attr.name == "test" then
+          is_test = true
+        end
+      end
+      if is_test then
+        match item.kind
+        when ItemKind::ItemFunction(func_decl) then
+          total = total + 1
+          let test_name = file.clone() + "::" + func_decl.name.clone()
+          # Compile and run the test function
+          match compile_and_run_test(&opts, file.clone(), &func_decl)
+          when Result::Ok(_) then
+            passed = passed + 1
+            println("  PASS  " + test_name)
+          when Result::Err(e) then
+            failed = failed + 1
+            fail_names.push(test_name.clone())
+            println("  FAIL  " + test_name + ": " + e)
+          end
+        when _ then ()
+        end
+      end
+    end
+  end
+
+  println("")
+  println("test result: " + if failed == 0 then "ok" else "FAILED" end
+    + ". " + passed.to_string() + " passed; " + failed.to_string()
+    + " failed; " + total.to_string() + " total")
+
+  if !fail_names.is_empty() then
+    println("")
+    println("failures:")
+    for name in fail_names do
+      println("    " + name)
+    end
+  end
+
+  if failed > 0 then 1 else 0 end
+end
+
+def compile_and_run_test(opts: &CompilerOptions, path: String, func: &FunctionDecl) -> Result[Unit, String]
+  # Compile the test file, then invoke the test function.
+  match compile_file(opts, path)
+  when Result::Ok(output_path) then
+    # Execute the compiled test binary with the test function name.
+    let cmd = output_path + " --run-test " + func.name.clone()
+    let exit_code = bootstrap_call_system(cmd)
+    if exit_code == 0 then
+      Result::Ok(())
+    else
+      Result::Err("test exited with code " + exit_code.to_string())
+    end
+  when Result::Err(e) then
+    Result::Err("compilation failed: " + e)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1954,38 +2377,65 @@ end
 use std::bench::{BenchSuite, bench_suite_new, run_benchmarks, parse_bench_args}
 
 def cmd_bench(argv: Vec[String]) -> Int
-  let bench_config = parse_bench_args(argv)
-  
-  let bench_files = find_bench_files(".")
-  
-  if bench_files.is_empty() then
-    eprintln("Error: no benchmark files found")
-    return 1
-  end
-  
-  mut suite = bench_suite_new("tangerine".to_string())
-  
-  for file in bench_files do
-    match read_file(file.clone())
-    when Result::Ok(source) then
-      let tokens = tokenize(source)
-      let (ast, parse_diags) = parse(tokens)
-      if diag_has_errors(&parse_diags) then
-        eprintln("Parse error in " + file)
-      else
-        let benches = extract_bench_functions(&ast, file.clone())
-        for b in benches do
-          suite.add(b)
-        end
+  # Discover benchmark sources: from CLI args or project.
+  let bench_files = if argv.len() > 1 && !argv[1].starts_with("-") then
+    mut files = Vec::new()
+    mut i: UInt = 1
+    while i < argv.len() do
+      if !argv[i].starts_with("-") then
+        files.push(argv[i].clone())
       end
-    when Result::Err(e) then
-      eprintln("Cannot read " + file + ": " + e)
+      i = i + 1
+    end
+    files
+  else
+    match load_project(".")
+    when Result::Ok(project) then project.sources.clone()
+    when Result::Err(_) then find_bench_files(".")
     end
   end
-  
-  suite = suite.with_config(bench_config)
-  run_benchmarks(&mut suite)
-  0
+
+  if bench_files.is_empty() then
+    println("No benchmark files found.")
+    return 0
+  end
+
+  let opts = default_options()
+  mut total = 0
+  mut ok_count = 0
+
+  for file in bench_files do
+    let source = match read_file(file.clone())
+    when Result::Ok(content) then content
+    when Result::Err(_) then next
+    end
+    let lex_result = tokenize(source)
+    let (ast, parse_diags) = parse(lex_result)
+    if diag_has_errors(&parse_diags) then next end
+
+    let cases = extract_bench_functions(&ast, file.clone())
+    for bench in cases do
+      total = total + 1
+      # Compile the file to get a runnable binary, then invoke the bench by name.
+      match compile_file(&opts, file.clone())
+      when Result::Ok(output_path) then
+        let cmd = output_path + " --run-bench " + bench.name.clone()
+        let exit_code = bootstrap_call_system(cmd)
+        if exit_code == 0 then
+          ok_count = ok_count + 1
+          println("  bench " + bench.name + " ... ok")
+        else
+          println("  bench " + bench.name + " ... FAILED (exit " + exit_code.to_string() + ")")
+        end
+      when Result::Err(e) then
+        println("  bench " + bench.name + " ... COMPILE ERROR: " + e)
+      end
+    end
+  end
+
+  println("")
+  println("bench result: " + ok_count.to_string() + "/" + total.to_string() + " ok")
+  if ok_count < total then 1 else 0 end
 end
 
 def find_bench_files(dir: String) -> Vec[String]
@@ -2016,21 +2466,31 @@ def find_bench_files(dir: String) -> Vec[String]
 end
 
 def extract_bench_functions(ast: &Program, file: String) -> Vec[BenchCase]
-  mut benches = Vec::new()
-  let module_name = file.replace("/", "::").replace(".tg", "")
-  
+  mut cases: Vec[BenchCase] = Vec::new()
   for item in ast.items do
-    match item.kind
-    when ItemKind::Function(func) then
-      for attr in item.attrs do
-        if attr.name == "bench" then
-          benches.push(bench_case_new(func.name.clone(), module_name.clone()))
-        end
+    mut is_bench = false
+    for attr in item.attrs do
+      if attr.name == "bench" then
+        is_bench = true
       end
-    when _ then ()
+    end
+    if is_bench then
+      match item.kind
+      when ItemKind::ItemFunction(func_decl) then
+        cases.push(BenchCase {
+          name: func_decl.name.clone(),
+          func: || (),
+          setup: Option::None,
+          teardown: Option::None,
+          iterations: Option::None,
+          warmup_iterations: 3,
+          input_size: Option::None
+        })
+      when _ then ()
+      end
     end
   end
-  benches
+  cases
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2240,11 +2700,21 @@ def update_cache(cache: &mut IncrementalCache, path: String, source: String, mir
 end
 
 def current_time() -> Int
-  0
+  # Return seconds since Unix epoch via std::time.
+  let now = std::time::SystemTime::now()
+  now.tv.tv_sec as Int
 end
 
 def bootstrap_call_system(cmd: String) -> Int
-  unsafe "FFI system call" do system(cmd.as_ptr()) end
+  # Use the safe std::process::Command API instead of raw FFI system().
+  # Split the command string at the first space to get program + args.
+  mut command = std::process::Command::new("sh".to_string())
+  command.arg("-c".to_string())
+  command.arg(cmd)
+  match command.status()
+  when Result::Ok(status) then status.code
+  when Result::Err(_) then 127
+  end
 end
 
 # Use Dependency and related types from pkg_manager
@@ -3914,7 +4384,7 @@ end
 
 def generate_c_prototype(f: &FunctionDecl) -> String
   let ret_type = match f.ret_type
-    when Option::Some(rt) then tangerine_type_to_c(rt)
+    when Option::Some(rt) then tangerine_type_expr_to_c(rt)
     when Option::None then "void"
   end
   mut params = ""
@@ -3922,7 +4392,7 @@ def generate_c_prototype(f: &FunctionDecl) -> String
   for p in f.params do
     if !first then params = params + ", " end
     let ty_str = match p.ty
-      when Option::Some(t) then tangerine_type_to_c(t)
+      when Option::Some(t) then tangerine_type_expr_to_c(t)
       when Option::None then "void*"
     end
     params = params + ty_str + " " + p.name.clone()
@@ -3935,7 +4405,7 @@ end
 def generate_c_struct(s: &Struct) -> String
   mut result = "typedef struct {\n"
   for field in s.fields do
-    result = result + "    " + tangerine_type_to_c(&field.ty) + " " + field.name.clone() + ";\n"
+    result = result + "    " + tangerine_type_expr_to_c(&field.ty) + " " + field.name.clone() + ";\n"
   end
   result = result + "} " + s.name.clone() + ";\n"
   result
@@ -3953,18 +4423,33 @@ def generate_c_enum(e: &Enum) -> String
   result
 end
 
-def tangerine_type_to_c(ty: &Type) -> String
-  match ty
-  when Type::Unit then "void"
-  when Type::Bool then "bool"
-  when Type::Int then "int64_t"
-  when Type::UInt then "uint64_t"
-  when Type::Float then "double"
-  when Type::Char then "uint32_t"
-  when Type::String then "tg_str"
-  when Type::Ref(inner, _) then "const " + tangerine_type_to_c(inner) + "*"
-  when Type::RefMut(inner, _) then tangerine_type_to_c(inner) + "*"
-  when Type::Named(name, _) then name.clone()
+def tangerine_type_to_c(ty: String) -> String
+  if ty == "Bool" then "bool"
+  elsif ty == "Int" then "tg_int"
+  elsif ty == "UInt" then "tg_uint"
+  elsif ty == "Float" then "tg_float"
+  elsif ty == "Char" then "tg_char"
+  elsif ty == "String" then "tg_str"
+  elsif ty == "U8" then "tg_u8"
+  else ty.clone()
+  end
+end
+
+def tangerine_type_expr_to_c(ty: &TypeExpr) -> String
+  match ty.kind
+  when TypeExprKind::Unit then "void"
+  when TypeExprKind::Named(name, _) then
+    if name == "Bool" then "bool"
+    elsif name == "Int" then "int64_t"
+    elsif name == "UInt" then "uint64_t"
+    elsif name == "Float" then "double"
+    elsif name == "Char" then "uint32_t"
+    elsif name == "String" then "tg_str"
+    else name.clone()
+    end
+  when TypeExprKind::Ref(inner) then "const " + tangerine_type_expr_to_c(&inner) + "*"
+  when TypeExprKind::RefMut(inner) then tangerine_type_expr_to_c(&inner) + "*"
+  when TypeExprKind::Path(path) then path.segments.join("::")
   when _ then "void*"
   end
 end
@@ -4063,18 +4548,21 @@ def generate_rust_extern(f: &FunctionDecl) -> String
   "pub fn " + f.name.clone() + "(" + params + ")" + ret_clause + ";"
 end
 
-def tangerine_type_to_rust(ty: &Type) -> String
-  match ty
-  when Type::Unit then "()"
-  when Type::Bool then "bool"
-  when Type::Int then "i64"
-  when Type::UInt then "u64"
-  when Type::Float then "f64"
-  when Type::Char then "u32"
-  when Type::String then "TgStr"
-  when Type::Ref(inner, _) then "*const " + tangerine_type_to_rust(inner)
-  when Type::RefMut(inner, _) then "*mut " + tangerine_type_to_rust(inner)
-  when Type::Named(name, _) then name.clone()
+def tangerine_type_to_rust(ty: &TypeExpr) -> String
+  match ty.kind
+  when TypeExprKind::Unit then "()"
+  when TypeExprKind::Named(name, _) then
+    if name == "Bool" then "bool"
+    elsif name == "Int" then "i64"
+    elsif name == "UInt" then "u64"
+    elsif name == "Float" then "f64"
+    elsif name == "Char" then "u32"
+    elsif name == "String" then "TgStr"
+    else name.clone()
+    end
+  when TypeExprKind::Ref(inner) then "*const " + tangerine_type_to_rust(&inner)
+  when TypeExprKind::RefMut(inner) then "*mut " + tangerine_type_to_rust(&inner)
+  when TypeExprKind::Path(path) then path.segments.join("::")
   when _ then "*mut std::ffi::c_void"
   end
 end
@@ -4175,11 +4663,10 @@ def generate_ruby_wrapper(f: &FunctionDecl, module_name: &String) -> String
     let conv_name = "c_" + arg_name
     
     # Generate conversion based on parameter type
-    let param_ty = match param.ty
-      when Option::Some(t) then t
-      when Option::None then &Type::Unit
+    let (conv_code, c_type) = match param.ty
+      when Option::Some(t) then ruby_to_c_conversion(arg_name.clone(), t)
+      when Option::None then ("(void*)" + arg_name.clone(), "void*")
     end
-    let (conv_code, c_type) = ruby_to_c_conversion(arg_name.clone(), param_ty)
     conversions = conversions + "    " + c_type + " " + conv_name + " = " + conv_code + ";\n"
     
     if i > 0 then call_args = call_args + ", " end
@@ -4202,9 +4689,9 @@ def generate_ruby_wrapper(f: &FunctionDecl, module_name: &String) -> String
 end
 
 # Convert Ruby VALUE to C type for function call
-def ruby_to_c_conversion(arg: String, ty: &Type) -> (String, String)
-  match ty
-  when Type::Named(name, _) then
+def ruby_to_c_conversion(arg: String, ty: &TypeExpr) -> (String, String)
+  match ty.kind
+  when TypeExprKind::Named(name, _) then
     match name.as_str()
     when "Int" then ("NUM2LONG(" + arg + ")", "long")
     when "UInt" then ("NUM2ULONG(" + arg + ")", "unsigned long")
@@ -4214,13 +4701,15 @@ def ruby_to_c_conversion(arg: String, ty: &Type) -> (String, String)
     when "RubyValue" then (arg, "VALUE")
     when _ then ("(void*)" + arg, "void*")
     end
-  when Type::Ref(inner, _) then
-    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), inner)
+  when TypeExprKind::Ref(inner) then
+    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), &inner)
     ("&" + inner_conv, inner_type + "*")
-  when Type::RefMut(inner, _) then
-    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), inner)
+  when TypeExprKind::RefMut(inner) then
+    let (inner_conv, inner_type) = ruby_to_c_conversion(arg.clone(), &inner)
     ("&" + inner_conv, inner_type + "*")
-  when Type::RawPtr(inner) then
+  when TypeExprKind::Ptr(_) then
+    ("(void*)" + arg, "void*")
+  when TypeExprKind::PtrMut(_) then
     ("(void*)" + arg, "void*")
   when _ then
     ("(void*)" + arg, "void*")
@@ -4228,11 +4717,11 @@ def ruby_to_c_conversion(arg: String, ty: &Type) -> (String, String)
 end
 
 # Generate C return handling code for Ruby
-def c_to_ruby_return(ty: &Type) -> (String, String, String)
-  match ty
-  when Type::Unit then
+def c_to_ruby_return(ty: &TypeExpr) -> (String, String, String)
+  match ty.kind
+  when TypeExprKind::Unit then
     ("", "", "    return Qnil;\n")
-  when Type::Named(name, _) then
+  when TypeExprKind::Named(name, _) then
     match name.as_str()
     when "Int" then
       ("    long tg_result;\n", "tg_result = ", "    return LONG2NUM(tg_result);\n")
@@ -4322,9 +4811,10 @@ def abi_test(argv: Vec[String]) -> Int
   ]
 
   println("Primitive type layout tests:")
+  let empty_layout: Map[Int, Int] = Map::new()
   
   # Test Int (i64)
-  let int_size = type_size(&Type::Int)
+  let int_size = type_size(&Type::Int, &empty_layout)
   let int_align = type_align(&Type::Int)
   if int_size == 8 && int_align == 8 then
     println("  ✓ Int: size=8, align=8")
@@ -4335,7 +4825,7 @@ def abi_test(argv: Vec[String]) -> Int
   end
 
   # Test Bool
-  let bool_size = type_size(&Type::Bool)
+  let bool_size = type_size(&Type::Bool, &empty_layout)
   let bool_align = type_align(&Type::Bool)
   if bool_size == 1 && bool_align == 1 then
     println("  ✓ Bool: size=1, align=1")
@@ -4346,7 +4836,7 @@ def abi_test(argv: Vec[String]) -> Int
   end
 
   # Test Float (f64)
-  let float_size = type_size(&Type::Float)
+  let float_size = type_size(&Type::Float, &empty_layout)
   let float_align = type_align(&Type::Float)
   if float_size == 8 && float_align == 8 then
     println("  ✓ Float: size=8, align=8")
@@ -4357,7 +4847,7 @@ def abi_test(argv: Vec[String]) -> Int
   end
 
   # Test Ref (pointer)
-  let ref_size = type_size(&Type::Ref(Box::new(Type::Int), lifetime_static()))
+  let ref_size = type_size(&Type::Ref(Box::new(Type::Int), lifetime_static()), &empty_layout)
   if ref_size == 8 then
     println("  ✓ &T: size=8")
     passed = passed + 1
@@ -4367,7 +4857,7 @@ def abi_test(argv: Vec[String]) -> Int
   end
 
   # Test String (ptr + len + cap)
-  let str_size = type_size(&Type::String)
+  let str_size = type_size(&Type::String, &empty_layout)
   if str_size == 24 then
     println("  ✓ String: size=24")
     passed = passed + 1
@@ -4377,7 +4867,7 @@ def abi_test(argv: Vec[String]) -> Int
   end
 
   # Test Slice (ptr + len)
-  let slice_size = type_size(&Type::Slice(Box::new(Type::Int)))
+  let slice_size = type_size(&Type::Slice(Box::new(Type::Int)), &empty_layout)
   if slice_size == 16 then
     println("  ✓ Slice[T]: size=16")
     passed = passed + 1
@@ -4424,13 +4914,14 @@ def abi_dump(argv: Vec[String]) -> Int
   println("==============================")
   println("")
 
+  let empty_layout: Map[Int, Int] = Map::new()
   for item in ast.items do
     match item.kind
     when ItemKind::Struct(s) then
       println("struct " + s.name.clone() + " {")
       mut offset = 0
       for field in s.fields do
-        let sz = type_size(&field.ty)
+        let sz = type_size(&field.ty, &empty_layout)
         let al = type_align(&field.ty)
         # Compute padding
         let padding = if offset % al != 0 then al - (offset % al) else 0 end
@@ -4468,22 +4959,29 @@ def max_field_align(fields: &Vec[Field]) -> Int
   max_al
 end
 
-def type_name(ty: &Type) -> String
-  match ty
-  when Type::Unit then "Unit"
-  when Type::Bool then "Bool"
-  when Type::Int then "Int"
-  when Type::UInt then "UInt"
-  when Type::Float then "Float"
-  when Type::Char then "Char"
-  when Type::String then "String"
-  when Type::Named(n, _) then n.clone()
-  when Type::Ref(inner, _) then "&" + type_name(inner)
-  when Type::RefMut(inner, _) then "&mut " + type_name(inner)
-  when Type::Option(inner) then "Option[" + type_name(inner) + "]"
-  when Type::Result(ok, err) then "Result[" + type_name(ok) + ", " + type_name(err) + "]"
-  when Type::Vec(inner) then "Vec[" + type_name(inner) + "]"
-  when Type::Array(inner, n) then "[" + type_name(inner) + "; " + n.to_string() + "]"
+def type_name(ty: &TypeExpr) -> String
+  match ty.kind
+  when TypeExprKind::Unit then "Unit"
+  when TypeExprKind::Named(name, args) then
+    if args.is_empty() then
+      name.clone()
+    else
+      mut rendered = name.clone() + "["
+      mut first = true
+      for arg in args do
+        if !first then rendered = rendered + ", " end
+        rendered = rendered + type_name(&arg)
+        first = false
+      end
+      rendered + "]"
+    end
+  when TypeExprKind::Ref(inner) then "&" + type_name(&inner)
+  when TypeExprKind::RefMut(inner) then "&mut " + type_name(&inner)
+  when TypeExprKind::Array(inner, n) then "[" + type_name(&inner) + "; " + n.to_string() + "]"
+  when TypeExprKind::Slice(inner) then "[" + type_name(&inner) + "]"
+  when TypeExprKind::Path(path) then path.segments.join("::")
+  when TypeExprKind::Never then "Never"
+  when TypeExprKind::Infer then "_"
   when _ then "?"
   end
 end
@@ -4635,8 +5133,8 @@ def load_build_cache(output_dir: &String) -> IncrementalCache
         let source_hash = parts[1].to_string()
         let mir_hash = parts[2].to_string()
         let timestamp = match parts[3].parse_int()
-        when Result::Ok(t) then t
-        when Result::Err(_) then 0
+        when Option::Some(t) then t
+        when Option::None then 0
         end
         
         cache.entries.insert(path, CacheEntry {

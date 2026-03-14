@@ -1,4 +1,4 @@
-use crate::ast::decl::{ConstDecl, Decl, EnumDecl, ExternBlockDecl, GlobalDecl, Module, StructDecl, TraitDecl, TypeAliasDecl};
+use crate::ast::decl::{ConstDecl, Decl, EnumDecl, ExternBlockDecl, FunctionSig, GlobalDecl, MetaKind, Module, StructDecl, TraitDecl, TypeAliasDecl};
 use crate::ast::expr::{BinaryOp, BlockBody, Expr, FunctionBody, Pattern, Stmt, UnaryOp};
 use crate::ast::types::TypeRef;
 use crate::error::Stage0Error;
@@ -19,6 +19,40 @@ struct CodegenState {
     mutable_trait_methods: OrderedSet<String>,
     emit_span_type: bool,
     emit_span_merge: bool,
+    local_names: OrderedSet<String>,
+    support_use_paths: Vec<String>,
+    support_modules: SupportModuleTree,
+}
+
+#[derive(Default)]
+struct SupportModuleTree {
+    children: OrderedMap<String, SupportModuleTree>,
+    items: Vec<SupportItem>,
+    impls: Vec<SupportImpl>,
+}
+
+enum SupportItem {
+    Struct(StructDecl),
+    Enum(EnumDecl),
+    Trait(TraitDecl),
+    Function(FunctionSig),
+    TypeAlias(String, TypeRef),
+    Const(String, TypeRef),
+    Global(String, TypeRef, bool),
+}
+
+struct SupportImpl {
+    trait_name: String,
+    type_params: Vec<String>,
+    for_type: TypeRef,
+    methods: Vec<FunctionSig>,
+    associated_types: Vec<(String, TypeRef)>,
+}
+
+#[derive(Default)]
+struct SupportReferences {
+    items: OrderedSet<String>,
+    use_paths: OrderedSet<String>,
 }
 
 /// Emit a Rust source file for the parsed Tangerine module.
@@ -27,8 +61,7 @@ struct CodegenState {
 /// Returns `Stage0Error` if any Tangerine type in the module cannot be lowered
 /// to Rust source without loss of semantic information.
 pub fn emit_rust(module: &Module, env: &SemanticEnv) -> Result<String, Stage0Error> {
-    let _ = env;
-    let state = build_codegen_state(module);
+    let state = build_codegen_state(module, env);
     emit_module(module, &state, true)
 }
 
@@ -36,6 +69,8 @@ fn emit_module(module: &Module, state: &CodegenState, include_prelude: bool) -> 
     let mut out = String::new();
     if include_prelude {
         emit_prelude(&mut out, state);
+        emit_support_modules(&mut out, state)?;
+        emit_use_metadata(&mut out, module, state);
     }
 
     for decl in &module.decls {
@@ -62,6 +97,25 @@ fn emit_prelude(out: &mut String, state: &CodegenState) {
     if state.emit_span_type || state.emit_span_merge {
         out.push('\n');
     }
+}
+
+fn emit_support_modules(out: &mut String, state: &CodegenState) -> Result<(), Stage0Error> {
+    for item in &state.support_modules.items {
+        emit_support_item(out, item, state, 0)?;
+    }
+    for support_impl in &state.support_modules.impls {
+        emit_support_impl(out, support_impl, state, 0)?;
+    }
+    if !state.support_modules.items.is_empty() {
+        out.push('\n');
+    }
+    for (name, module) in &state.support_modules.children {
+        emit_support_module(out, name, module, state, 0)?;
+    }
+    if !state.support_modules.children.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
 }
 
 fn emit_decl(out: &mut String, decl: &Decl, state: &CodegenState) -> Result<(), Stage0Error> {
@@ -429,6 +483,1421 @@ fn format_const_expr(expr: &Expr) -> Result<String, Stage0Error> {
     }
 }
 
+fn emit_support_module(
+    out: &mut String,
+    name: &str,
+    module: &SupportModuleTree,
+    state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    writeln!(out, "{}pub mod {} {{", indent(indent_level), name).expect("writing to String must succeed");
+    writeln!(out, "{}use super::*;", indent(indent_level + 1)).expect("writing to String must succeed");
+    for (child_name, child) in &module.children {
+        emit_support_module(out, child_name, child, state, indent_level + 1)?;
+    }
+    for item in &module.items {
+        emit_support_item(out, item, state, indent_level + 1)?;
+    }
+    for support_impl in &module.impls {
+        emit_support_impl(out, support_impl, state, indent_level + 1)?;
+    }
+    writeln!(out, "{}}}", indent(indent_level)).expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_item(
+    out: &mut String,
+    item: &SupportItem,
+    state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    match item {
+        SupportItem::Struct(decl) => emit_support_struct(out, decl, state, indent_level)?,
+        SupportItem::Enum(decl) => emit_support_enum(out, decl, state, indent_level)?,
+        SupportItem::Trait(decl) => emit_support_trait(out, decl, state, indent_level)?,
+        SupportItem::Function(sig) => emit_support_function(out, sig, indent_level)?,
+        SupportItem::TypeAlias(name, ty) => emit_support_type_alias(out, name, ty, indent_level)?,
+        SupportItem::Const(name, ty) => emit_support_const(out, name, ty, indent_level)?,
+        SupportItem::Global(name, ty, mutable) => emit_support_global(out, name, ty, *mutable, indent_level)?,
+    }
+    Ok(())
+}
+
+fn emit_support_struct(
+    out: &mut String,
+    decl: &StructDecl,
+    state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    writeln!(out, "{}#[derive(Clone)]", indent(indent_level)).expect("writing to String must succeed");
+    writeln!(
+        out,
+        "{}pub struct {}{}{} {{",
+        indent(indent_level),
+        leaf_name(&decl.name),
+        format_type_params(&decl.type_params),
+        format_where_clause(&decl.where_clause)?
+    )
+    .expect("writing to String must succeed");
+    for field in &decl.fields {
+        writeln!(
+            out,
+            "{}pub {}: {},",
+            indent(indent_level + 1),
+            field.name,
+            format_struct_field_type(&field.ty, state, false)?
+        )
+        .expect("writing to String must succeed");
+    }
+    writeln!(out, "{}}}", indent(indent_level)).expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_enum(
+    out: &mut String,
+    decl: &EnumDecl,
+    state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    if decl
+        .variants
+        .iter()
+        .all(|variant| variant.tuple_fields.is_empty() && variant.named_fields.is_empty())
+    {
+        writeln!(out, "{}#[derive(Clone, Copy)]", indent(indent_level)).expect("writing to String must succeed");
+    } else {
+        writeln!(out, "{}#[derive(Clone)]", indent(indent_level)).expect("writing to String must succeed");
+    }
+    writeln!(
+        out,
+        "{}pub enum {}{}{} {{",
+        indent(indent_level),
+        leaf_name(&decl.name),
+        format_type_params(&decl.type_params),
+        format_where_clause(&decl.where_clause)?
+    )
+    .expect("writing to String must succeed");
+    for variant in &decl.variants {
+        if variant.tuple_fields.is_empty() && variant.named_fields.is_empty() {
+            writeln!(out, "{}{},", indent(indent_level + 1), variant.name)
+                .expect("writing to String must succeed");
+        } else if !variant.named_fields.is_empty() {
+            let payload = variant
+                .named_fields
+                .iter()
+                .map(|field| format_struct_field_type(&field.ty, state, false).map(|ty| format!("{}: {ty}", field.name)))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            writeln!(out, "{}{} {{ {} }},", indent(indent_level + 1), variant.name, payload)
+                .expect("writing to String must succeed");
+        } else {
+            let payload = variant
+                .tuple_fields
+                .iter()
+                .map(|ty| format_storage_type(ty, state, false))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            writeln!(out, "{}{}({}),", indent(indent_level + 1), variant.name, payload)
+                .expect("writing to String must succeed");
+        }
+    }
+    writeln!(out, "{}}}", indent(indent_level)).expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_trait(
+    out: &mut String,
+    decl: &TraitDecl,
+    state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    let header = format!(
+        "{}pub trait {}{}{}{} {{",
+        indent(indent_level),
+        leaf_name(&decl.name),
+        format_type_params(&decl.type_params),
+        format_supertraits(&decl.supertraits),
+        format_where_clause(&decl.where_clause)?
+    );
+    writeln!(out, "{header}").expect("writing to String must succeed");
+    for associated_type in &decl.associated_types {
+        match associated_type.target.as_ref() {
+            Some(target) => {
+                writeln!(
+                    out,
+                    "{}type {} = {};",
+                    indent(indent_level + 1),
+                    associated_type.name,
+                    format_type(target)?
+                )
+                .expect("writing to String must succeed");
+            }
+            None => {
+                writeln!(out, "{}type {};", indent(indent_level + 1), associated_type.name)
+                    .expect("writing to String must succeed");
+            }
+        }
+    }
+    for method in &decl.methods {
+        writeln!(
+            out,
+            "{}fn {}{}({}) -> {}{};",
+            indent(indent_level + 1),
+            leaf_name(&method.sig.name),
+            format_type_params(&method.sig.type_params),
+            format_params(&method.sig.params)?,
+            format_type(&method.sig.return_type)?,
+            format_where_clause(&method.sig.where_clause)?
+        )
+        .expect("writing to String must succeed");
+    }
+    writeln!(out, "{}}}", indent(indent_level)).expect("writing to String must succeed");
+    let _ = state;
+    Ok(())
+}
+
+fn emit_support_function(out: &mut String, sig: &FunctionSig, indent_level: usize) -> Result<(), Stage0Error> {
+    let fn_name = leaf_name(&sig.name);
+    writeln!(
+        out,
+        "{}pub fn {}{}({}) -> {}{} {{ todo!(\"support function '{}' not yet linked\") }}",
+        indent(indent_level),
+        fn_name,
+        format_type_params(&sig.type_params),
+        format_params(&sig.params)?,
+        format_type(&sig.return_type)?,
+        format_where_clause(&sig.where_clause)?,
+        fn_name
+    )
+    .expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_const(out: &mut String, name: &str, ty: &TypeRef, indent_level: usize) -> Result<(), Stage0Error> {
+    writeln!(
+        out,
+        "{}pub const {}: {} = {};",
+        indent(indent_level),
+        leaf_name(name),
+        format_support_value_type(ty)?,
+        format_support_value_initializer(ty)?
+    )
+    .expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_global(
+    out: &mut String,
+    name: &str,
+    ty: &TypeRef,
+    mutable: bool,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    let qualifier = if mutable { "pub static mut" } else { "pub static" };
+    writeln!(
+        out,
+        "{}{} {}: {} = {};",
+        indent(indent_level),
+        qualifier,
+        leaf_name(name),
+        format_support_value_type(ty)?,
+        format_support_value_initializer(ty)?
+    )
+    .expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_impl(
+    out: &mut String,
+    support_impl: &SupportImpl,
+    _state: &CodegenState,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    let impl_type_params = format_support_impl_type_params(&support_impl.type_params);
+    if support_impl.trait_name.is_empty() {
+        writeln!(
+            out,
+            "{}impl{} {} {{",
+            indent(indent_level),
+            impl_type_params,
+            format_type(&support_impl.for_type)?
+        )
+        .expect("writing to String must succeed");
+    } else {
+        writeln!(
+            out,
+            "{}impl{} {} for {} {{",
+            indent(indent_level),
+            impl_type_params,
+            qualify_rust_path(&support_impl.trait_name),
+            format_type(&support_impl.for_type)?
+        )
+        .expect("writing to String must succeed");
+    }
+    for (name, ty) in &support_impl.associated_types {
+        writeln!(
+            out,
+            "{}type {} = {};",
+            indent(indent_level + 1),
+            name,
+            format_type(ty)?
+        )
+        .expect("writing to String must succeed");
+    }
+    for method in &support_impl.methods {
+        let visibility = if support_impl.trait_name.is_empty() {
+            visibility_prefix(method.public)
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "{}{}fn {}{}({}) -> {}{} {{ unimplemented!() }}",
+            indent(indent_level + 1),
+            visibility,
+            leaf_name(&method.name),
+            format_type_params(&method.type_params),
+            format_params(&method.params)?,
+            format_type(&method.return_type)?,
+            format_where_clause(&method.where_clause)?
+        )
+        .expect("writing to String must succeed");
+    }
+    writeln!(out, "{}}}", indent(indent_level)).expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_support_type_alias(
+    out: &mut String,
+    name: &str,
+    ty: &TypeRef,
+    indent_level: usize,
+) -> Result<(), Stage0Error> {
+    writeln!(
+        out,
+        "{}pub type {} = {};",
+        indent(indent_level),
+        leaf_name(name),
+        format_type(ty)?
+    )
+    .expect("writing to String must succeed");
+    Ok(())
+}
+
+fn emit_use_metadata(out: &mut String, module: &Module, state: &CodegenState) {
+    let mut paths = OrderedSet::new();
+    for decl in &module.decls {
+        if let Decl::Meta(meta) = decl {
+            if meta.kind == MetaKind::Use {
+                for path in rewrite_use_paths(&meta.detail, &state.local_names) {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    paths.extend(state.support_use_paths.iter().cloned());
+    let emitted = !paths.is_empty();
+    for path in paths {
+        writeln!(out, "use {path};").expect("writing to String must succeed");
+    }
+    if emitted {
+        out.push('\n');
+    }
+}
+
+fn rewrite_use_paths(detail: &str, local_names: &OrderedSet<String>) -> Vec<String> {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some((prefix, inner)) = split_braced_use(trimmed) {
+        let mut paths = Vec::new();
+        for item in split_top_level_items(inner) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let combined = join_use_prefix(prefix, item);
+            paths.extend(rewrite_use_paths(&combined, local_names));
+        }
+        return paths;
+    }
+
+    let (base, alias) = split_use_alias(trimmed);
+    let imported_name = alias.unwrap_or_else(|| leaf_name(base));
+    if local_names.contains(imported_name) || is_generated_prelude_name(imported_name) {
+        return Vec::new();
+    }
+
+    rewrite_simple_use_path(base)
+        .into_iter()
+        .map(|path| match alias {
+            Some(alias) => format!("{path} as {alias}"),
+            None => path,
+        })
+        .collect()
+}
+
+fn is_generated_prelude_name(name: &str) -> bool {
+    matches!(name, "Array" | "Map" | "Set" | "Span" | "span_merge")
+}
+
+fn split_use_alias(detail: &str) -> (&str, Option<&str>) {
+    if let Some((base, alias)) = detail.split_once(" as ") {
+        (base.trim(), Some(alias.trim()))
+    } else {
+        (detail.trim(), None)
+    }
+}
+
+fn rewrite_simple_use_path(path: &str) -> Vec<String> {
+    match path {
+        "std::core::Option" | "std::core::Result" | "std::core::Vec" | "std::core::String" | "std::core::Bool" | "std::core::UInt"
+        | "std::core::Int" | "std::core::Float" | "std::core::panic" | "std::collections::Vec" | "std::collections::Map"
+        | "std::collections::Set" | "std::collections::Array" | "std::io::print" | "std::io::println" | "std::io::eprint"
+        | "std::io::eprintln" => Vec::new(),
+        "std::core::Display" => vec!["std::fmt::Display".to_string()],
+        "std::core::catch_unwind" => vec!["std::panic::catch_unwind".to_string()],
+        "std::collections::VecDeque" | "std::collections::LinkedList" | "std::collections::BTreeMap" | "std::collections::BTreeSet" => {
+            vec![path.to_string()]
+        }
+        _ if path.starts_with("std::") => vec![format!("crate::{}", &path["std::".len()..])],
+        _ if path.starts_with("crate::") => vec![path.to_string()],
+        _ => vec![format!("crate::{path}")],
+    }
+}
+
+fn leaf_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+fn collect_support_modules(module: &Module, env: &SemanticEnv, local_names: &OrderedSet<String>) -> SupportModuleTree {
+    let mut root = SupportModuleTree::default();
+    let included = collect_included_support_names(module, env, local_names);
+    for (name, decl) in env.structs.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::Struct(decl.clone()));
+        }
+    }
+    for (name, decl) in env.enums.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::Enum(decl.clone()));
+        }
+    }
+    for (name, decl) in env.traits.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::Trait(decl.clone()));
+        }
+    }
+    for (name, sig) in env.functions.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::Function(sig.clone()));
+        }
+    }
+    for (name, ty) in env.type_aliases.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::TypeAlias(name.clone(), ty.clone()));
+        }
+    }
+    for (name, ty) in env.consts.iter() {
+        if included.contains(name) {
+            insert_support_item(&mut root, name, SupportItem::Const(name.clone(), ty.clone()));
+        }
+    }
+    for (name, global) in env.globals.iter() {
+        if included.contains(name) {
+            insert_support_item(
+                &mut root,
+                name,
+                SupportItem::Global(name.clone(), global.ty.clone(), global.mutable),
+            );
+        }
+    }
+    let mut inserted_impls = OrderedSet::new();
+    for impl_info in env.impls.iter() {
+        let canonical_for_type = canonical_type_name_from_type_ref(&impl_info.for_type_ref).unwrap_or_else(|| env.resolve_alias_path(&impl_info.for_type));
+        if !included.contains(&canonical_for_type) {
+            continue;
+        }
+        let key = format!("{} for {}", impl_info.trait_name, canonical_for_type);
+        if !inserted_impls.insert(key) {
+            continue;
+        }
+        insert_support_impl(
+            &mut root,
+            &canonical_for_type,
+            build_support_impl(impl_info, env),
+        );
+    }
+    root
+}
+
+fn collect_included_support_names(module: &Module, env: &SemanticEnv, local_names: &OrderedSet<String>) -> OrderedSet<String> {
+    let mut included = OrderedSet::new();
+    let mut queue = collect_support_references(module, env, local_names).items.into_iter().collect::<Vec<_>>();
+
+    while let Some(name) = queue.pop() {
+        let Some(name) = canonical_support_name(env, &name) else {
+            continue;
+        };
+        if !included.insert(name.clone()) {
+            continue;
+        }
+
+        if let Some(decl) = env.structs.get(&name) {
+            for field in &decl.fields {
+                queue_type_dependencies(&field.ty, env, &mut queue);
+            }
+        }
+        if let Some(decl) = env.enums.get(&name) {
+            for variant in &decl.variants {
+                for field in &variant.tuple_fields {
+                    queue_type_dependencies(field, env, &mut queue);
+                }
+                for field in &variant.named_fields {
+                    queue_type_dependencies(&field.ty, env, &mut queue);
+                }
+            }
+        }
+        if let Some(decl) = env.traits.get(&name) {
+            for supertrait in &decl.supertraits {
+                queue.push(supertrait.clone());
+            }
+            for assoc in &decl.associated_types {
+                if let Some(target) = &assoc.target {
+                    queue_type_dependencies(target, env, &mut queue);
+                }
+            }
+            for method in &decl.methods {
+                for param in &method.sig.params {
+                    queue_type_dependencies(&param.ty, env, &mut queue);
+                }
+                queue_type_dependencies(&method.sig.return_type, env, &mut queue);
+            }
+        }
+        if let Some(sig) = env.functions.get(&name) {
+            for param in &sig.params {
+                queue_type_dependencies(&param.ty, env, &mut queue);
+            }
+            queue_type_dependencies(&sig.return_type, env, &mut queue);
+        }
+        if let Some(ty) = env.type_aliases.get(&name) {
+            queue_type_dependencies(ty, env, &mut queue);
+        }
+        if let Some(ty) = env.consts.get(&name) {
+            queue_type_dependencies(ty, env, &mut queue);
+        }
+        if let Some(global) = env.globals.get(&name) {
+            queue_type_dependencies(&global.ty, env, &mut queue);
+        }
+        queue_impl_dependencies(&name, env, &mut queue);
+    }
+
+    included
+}
+
+fn collect_support_references(
+    module: &Module,
+    env: &SemanticEnv,
+    local_names: &OrderedSet<String>,
+) -> SupportReferences {
+    let mut refs = SupportReferences::default();
+    let mut scopes = vec![local_names.clone()];
+    walk_module_support_refs(module, env, &mut refs, &mut scopes);
+    refs
+}
+
+fn walk_module_support_refs(
+    module: &Module,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    for decl in &module.decls {
+        walk_decl_support_refs(decl, env, refs, scopes);
+    }
+}
+
+fn walk_decl_support_refs(
+    decl: &Decl,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    match decl {
+        Decl::Meta(meta) if meta.kind == MetaKind::Use => {
+            collect_use_targets(&meta.detail, env, &mut refs.items.iter().cloned().collect::<Vec<_>>());
+            for target in collect_use_targets_to_vec(&meta.detail, env) {
+                refs.items.insert(target);
+            }
+        }
+        Decl::Module(module_decl) => {
+            if let Some(scope) = scopes.last_mut() {
+                scope.insert(module_decl.name.split("::").next().unwrap_or(&module_decl.name).to_string());
+            }
+            scopes.push(OrderedSet::new());
+            for child in &module_decl.decls {
+                walk_decl_support_refs(child, env, refs, scopes);
+            }
+            scopes.pop();
+        }
+        Decl::Struct(struct_decl) => {
+            for field in &struct_decl.fields {
+                walk_type_support_refs(&field.ty, env, refs);
+            }
+            for predicate in &struct_decl.where_clause {
+                walk_where_predicate_support_refs(predicate, env, refs);
+            }
+        }
+        Decl::Enum(enum_decl) => {
+            for variant in &enum_decl.variants {
+                for field in &variant.tuple_fields {
+                    walk_type_support_refs(field, env, refs);
+                }
+                for field in &variant.named_fields {
+                    walk_type_support_refs(&field.ty, env, refs);
+                }
+            }
+            for predicate in &enum_decl.where_clause {
+                walk_where_predicate_support_refs(predicate, env, refs);
+            }
+        }
+        Decl::Trait(trait_decl) => {
+            for supertrait in &trait_decl.supertraits {
+                record_support_ref(supertrait, env, refs, scopes, true);
+            }
+            for associated_type in &trait_decl.associated_types {
+                if let Some(target) = &associated_type.target {
+                    walk_type_support_refs(target, env, refs);
+                }
+            }
+            for method in &trait_decl.methods {
+                walk_function_support_refs(method, env, refs, scopes);
+            }
+            for predicate in &trait_decl.where_clause {
+                walk_where_predicate_support_refs(predicate, env, refs);
+            }
+        }
+        Decl::Impl(impl_decl) => {
+            walk_type_support_refs(&impl_decl.for_type, env, refs);
+            if !impl_decl.trait_name.is_empty() {
+                record_support_ref(&impl_decl.trait_name, env, refs, scopes, true);
+            }
+            for associated_type in &impl_decl.associated_types {
+                if let Some(target) = &associated_type.target {
+                    walk_type_support_refs(target, env, refs);
+                }
+            }
+            for method in &impl_decl.methods {
+                walk_function_support_refs(method, env, refs, scopes);
+            }
+            for predicate in &impl_decl.where_clause {
+                walk_where_predicate_support_refs(predicate, env, refs);
+            }
+        }
+        Decl::Function(function_decl) => walk_function_support_refs(function_decl, env, refs, scopes),
+        Decl::TypeAlias(type_alias_decl) => {
+            if let Some(target) = &type_alias_decl.target {
+                walk_type_support_refs(target, env, refs);
+            }
+        }
+        Decl::Const(const_decl) => {
+            if let Some(ty) = &const_decl.ty {
+                walk_type_support_refs(ty, env, refs);
+            }
+            walk_expr_support_refs(&const_decl.value, env, refs, scopes);
+        }
+        Decl::Global(global_decl) => {
+            if let Some(ty) = &global_decl.ty {
+                walk_type_support_refs(ty, env, refs);
+            }
+            walk_expr_support_refs(&global_decl.value, env, refs, scopes);
+        }
+        Decl::Extern(extern_decl) => {
+            for function in &extern_decl.functions {
+                walk_sig_support_refs(function, env, refs, scopes);
+            }
+        }
+        Decl::Meta(_) => {}
+    }
+}
+
+fn walk_function_support_refs(
+    function_decl: &crate::ast::decl::FunctionDecl,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    walk_sig_support_refs(&function_decl.sig, env, refs, scopes);
+    let mut fn_scope = OrderedSet::new();
+    for param in &function_decl.sig.params {
+        fn_scope.insert(param.name.clone());
+    }
+    scopes.push(fn_scope);
+    match &function_decl.body {
+        FunctionBody::Declaration { .. } => {}
+        FunctionBody::Block(block) => walk_block_support_refs(block, env, refs, scopes),
+    }
+    scopes.pop();
+}
+
+fn walk_sig_support_refs(
+    sig: &FunctionSig,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    for param in &sig.params {
+        walk_type_support_refs(&param.ty, env, refs);
+        if let Some(default_value) = &param.default_value {
+            walk_expr_support_refs(default_value, env, refs, scopes);
+        }
+    }
+    walk_type_support_refs(&sig.return_type, env, refs);
+    for predicate in &sig.where_clause {
+        walk_where_predicate_support_refs(predicate, env, refs);
+    }
+}
+
+fn walk_where_predicate_support_refs(
+    predicate: &crate::ast::decl::WherePredicate,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+) {
+    walk_type_support_refs(&predicate.ty, env, refs);
+    for bound in &predicate.bounds {
+        record_support_ref(bound, env, refs, &mut Vec::new(), true);
+    }
+}
+
+fn walk_block_support_refs(
+    block: &BlockBody,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    scopes.push(OrderedSet::new());
+    for stmt in &block.stmts {
+        walk_stmt_support_refs(stmt, env, refs, scopes);
+    }
+    if let Some(tail) = &block.tail {
+        walk_expr_support_refs(tail, env, refs, scopes);
+    }
+    scopes.pop();
+}
+
+fn walk_stmt_support_refs(
+    stmt: &Stmt,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    match stmt {
+        Stmt::Requires { .. } | Stmt::Break { .. } | Stmt::Next { .. } => {}
+        Stmt::While { condition, body, .. } => {
+            walk_expr_support_refs(condition, env, refs, scopes);
+            walk_block_support_refs(body, env, refs, scopes);
+        }
+        Stmt::Loop { body, .. } => walk_block_support_refs(body, env, refs, scopes),
+        Stmt::For { pattern, iterable, body, .. } => {
+            walk_expr_support_refs(iterable, env, refs, scopes);
+            let bound_names = collect_pattern_names(pattern);
+            scopes.push(bound_names.into_iter().collect());
+            walk_block_support_refs(body, env, refs, scopes);
+            scopes.pop();
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                walk_expr_support_refs(value, env, refs, scopes);
+            }
+        }
+        Stmt::Let {
+            pattern,
+            value,
+            inferred_type,
+            ..
+        } => {
+            if let Some(ty) = inferred_type {
+                walk_type_support_refs(ty, env, refs);
+            }
+            walk_expr_support_refs(value, env, refs, scopes);
+            if let Some(scope) = scopes.last_mut() {
+                scope.extend(collect_pattern_names(pattern));
+            }
+        }
+        Stmt::Assign { target, value, .. } => {
+            walk_expr_support_refs(target, env, refs, scopes);
+            walk_expr_support_refs(value, env, refs, scopes);
+        }
+        Stmt::Expr { expr, .. } => walk_expr_support_refs(expr, env, refs, scopes),
+        Stmt::Decl { decl, .. } => walk_decl_support_refs(decl, env, refs, scopes),
+        Stmt::Use { path, .. } => {
+            for target in collect_use_targets_to_vec(path, env) {
+                refs.items.insert(target);
+            }
+        }
+        Stmt::Meta { decl, .. } if decl.kind == MetaKind::Use => {
+            for target in collect_use_targets_to_vec(&decl.detail, env) {
+                refs.items.insert(target);
+            }
+        }
+        Stmt::Meta { .. } => {}
+        Stmt::Function { decl, .. } => {
+            if let Some(scope) = scopes.last_mut() {
+                scope.insert(decl.sig.name.clone());
+            }
+            walk_function_support_refs(decl, env, refs, scopes);
+        }
+    }
+}
+
+fn walk_expr_support_refs(
+    expr: &Expr,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    match expr {
+        Expr::Integer { .. } | Expr::Float { .. } | Expr::Char { .. } | Expr::String { .. } | Expr::Bool { .. } => {}
+        Expr::Name { name, .. } => record_support_ref(name, env, refs, scopes, false),
+        Expr::Array { elements, .. } | Expr::Tuple { elements, .. } => {
+            for element in elements {
+                walk_expr_support_refs(element, env, refs, scopes);
+            }
+        }
+        Expr::StructLiteral { name, fields, .. } => {
+            record_support_ref(name, env, refs, scopes, true);
+            for (_, value) in fields {
+                walk_expr_support_refs(value, env, refs, scopes);
+            }
+        }
+        Expr::Block { block, .. } | Expr::UnsafeBlock { block, .. } => walk_block_support_refs(block, env, refs, scopes),
+        Expr::If { branches, else_branch, .. } => {
+            for branch in branches {
+                match &branch.guard {
+                    crate::ast::expr::BranchGuard::Expr(expr) => walk_expr_support_refs(expr, env, refs, scopes),
+                    crate::ast::expr::BranchGuard::Let { pattern, value } => {
+                        walk_expr_support_refs(value, env, refs, scopes);
+                        walk_pattern_support_refs(pattern, env, refs, scopes);
+                    }
+                }
+                walk_block_support_refs(branch.body.as_ref(), env, refs, scopes);
+            }
+            if let Some(else_branch) = else_branch {
+                walk_block_support_refs(else_branch, env, refs, scopes);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            walk_expr_support_refs(callee, env, refs, scopes);
+            for arg in args {
+                walk_expr_support_refs(&arg.value, env, refs, scopes);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            walk_expr_support_refs(base, env, refs, scopes);
+            walk_expr_support_refs(index, env, refs, scopes);
+        }
+        Expr::Range { start, end, .. } => {
+            walk_expr_support_refs(start, env, refs, scopes);
+            walk_expr_support_refs(end, env, refs, scopes);
+        }
+        Expr::Match { value, arms, .. } => {
+            walk_expr_support_refs(value, env, refs, scopes);
+            for arm in arms {
+                walk_pattern_support_refs(&arm.pattern, env, refs, scopes);
+                walk_block_support_refs(&arm.body, env, refs, scopes);
+            }
+        }
+        Expr::Cast { expr, ty, .. } => {
+            walk_expr_support_refs(expr, env, refs, scopes);
+            walk_type_support_refs(ty, env, refs);
+        }
+        Expr::Try { expr, .. } => walk_expr_support_refs(expr, env, refs, scopes),
+        Expr::Closure { closure, .. } => {
+            let mut closure_scope = OrderedSet::new();
+            closure_scope.extend(closure.params.iter().cloned());
+            scopes.push(closure_scope);
+            walk_block_support_refs(&closure.body, env, refs, scopes);
+            scopes.pop();
+        }
+        Expr::Unary { expr, .. } => walk_expr_support_refs(expr, env, refs, scopes),
+        Expr::Field { base, .. } => walk_expr_support_refs(base, env, refs, scopes),
+        Expr::Binary { left, right, .. } => {
+            walk_expr_support_refs(left, env, refs, scopes);
+            walk_expr_support_refs(right, env, refs, scopes);
+        }
+    }
+}
+
+fn walk_pattern_support_refs(
+    pattern: &Pattern,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+) {
+    match pattern {
+        Pattern::Tuple { elements, .. } | Pattern::Or { alternatives: elements, .. } => {
+            for element in elements {
+                walk_pattern_support_refs(element, env, refs, scopes);
+            }
+        }
+        Pattern::Variant {
+            enum_name,
+            variant_name,
+            fields,
+            named_fields,
+            ..
+        } => {
+            if let Some(enum_name) = enum_name {
+                record_support_ref(enum_name, env, refs, scopes, true);
+            } else {
+                record_support_ref(variant_name, env, refs, scopes, true);
+            }
+            for field in fields {
+                walk_pattern_support_refs(field, env, refs, scopes);
+            }
+            for (_, pattern) in named_fields {
+                walk_pattern_support_refs(pattern, env, refs, scopes);
+            }
+        }
+        Pattern::Binding { name, .. } => {
+            if let Some(scope) = scopes.last_mut() {
+                scope.insert(name.clone());
+            }
+        }
+        Pattern::Wildcard { .. }
+        | Pattern::Integer { .. }
+        | Pattern::Float { .. }
+        | Pattern::Char { .. }
+        | Pattern::String { .. }
+        | Pattern::Bool { .. } => {}
+    }
+}
+
+fn walk_type_support_refs(ty: &TypeRef, env: &SemanticEnv, refs: &mut SupportReferences) {
+    match ty {
+        TypeRef::Tuple { elements, .. } => {
+            for element in elements {
+                walk_type_support_refs(element, env, refs);
+            }
+        }
+        TypeRef::Array { element, .. } => walk_type_support_refs(element, env, refs),
+        TypeRef::Named { name, type_args, .. } => {
+            if let Some(canonical) = canonical_support_name(env, name) {
+                refs.items.insert(canonical.clone());
+            }
+            for type_arg in type_args {
+                walk_type_support_refs(type_arg, env, refs);
+            }
+        }
+        TypeRef::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                walk_type_support_refs(param, env, refs);
+            }
+            walk_type_support_refs(return_type, env, refs);
+        }
+        TypeRef::DynTrait { trait_name, .. } => {
+            if let Some(canonical) = canonical_support_name(env, trait_name) {
+                refs.items.insert(canonical);
+            }
+        }
+        TypeRef::Ref { inner, .. } => walk_type_support_refs(inner, env, refs),
+        TypeRef::Int { .. }
+        | TypeRef::Float { .. }
+        | TypeRef::Char { .. }
+        | TypeRef::String { .. }
+        | TypeRef::Bool { .. }
+        | TypeRef::Unit { .. }
+        | TypeRef::SelfTy { .. } => {}
+    }
+}
+
+fn record_support_ref(
+    raw_name: &str,
+    env: &SemanticEnv,
+    refs: &mut SupportReferences,
+    scopes: &mut Vec<OrderedSet<String>>,
+    type_context: bool,
+) {
+    if raw_name.is_empty() {
+        return;
+    }
+    if !raw_name.contains("::") && scopes.iter().rev().any(|scope| scope.contains(raw_name)) {
+        return;
+    }
+    if let Some(canonical) = canonical_support_name(env, raw_name) {
+        refs.items.insert(canonical.clone());
+        if !raw_name.contains("::") || type_context {
+            if let Some(use_path) = support_auto_use_path(raw_name, &canonical) {
+                refs.use_paths.insert(use_path);
+            }
+        }
+        return;
+    }
+    if let Some(owner) = canonical_support_owner_name(env, raw_name) {
+        refs.items.insert(owner.clone());
+        if !raw_name.starts_with("std::") && !raw_name.starts_with("tg_compiler::") && !raw_name.starts_with("crate::") {
+            if let Some(use_path) = support_auto_use_path(raw_name, &owner) {
+                refs.use_paths.insert(use_path);
+            }
+        }
+    }
+}
+
+fn support_auto_use_path(raw_name: &str, canonical: &str) -> Option<String> {
+    if raw_name.starts_with("std::") || raw_name.starts_with("tg_compiler::") || raw_name.starts_with("crate::") {
+        return None;
+    }
+    rewrite_simple_use_path(canonical).into_iter().next()
+}
+
+fn canonical_support_owner_name(env: &SemanticEnv, name: &str) -> Option<String> {
+    let mut current = name;
+    while let Some((prefix, _)) = current.rsplit_once("::") {
+        if let Some(canonical) = canonical_support_name(env, prefix) {
+            return Some(canonical);
+        }
+        current = prefix;
+    }
+    None
+}
+
+fn collect_use_targets_to_vec(detail: &str, env: &SemanticEnv) -> Vec<String> {
+    let mut queue = Vec::new();
+    collect_use_targets(detail, env, &mut queue);
+    queue
+}
+
+fn collect_use_targets(detail: &str, env: &SemanticEnv, queue: &mut Vec<String>) {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Some((prefix, inner)) = split_braced_use(trimmed) {
+        for item in split_top_level_items(inner) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((nested_prefix, nested_inner)) = split_braced_use(item) {
+                let combined_prefix = join_use_prefix(prefix, nested_prefix);
+                collect_use_targets(&format!("{}{{{}}}", combined_prefix, nested_inner), env, queue);
+                continue;
+            }
+            let target = item.split(" as ").next().unwrap_or(item).trim();
+            if target == "*" {
+                queue.extend(collect_module_members(prefix, env).into_iter().filter(|name| !skip_support_symbol(name)));
+            } else {
+                let joined = join_use_prefix(prefix, target);
+                if !skip_support_symbol(&joined) {
+                    queue.push(joined);
+                }
+            }
+        }
+        return;
+    }
+
+    let target = trimmed.split(" as ").next().unwrap_or(trimmed).trim();
+    if target.is_empty() || skip_support_symbol(target) {
+        return;
+    }
+    if has_exact_support_symbol(env, target) {
+        queue.push(target.to_string());
+    } else {
+        queue.extend(collect_module_members(target, env).into_iter().filter(|name| !skip_support_symbol(name)));
+    }
+}
+
+fn skip_support_symbol(name: &str) -> bool {
+    matches!(
+        leaf_name(name),
+        "Option"
+            | "Result"
+            | "Vec"
+            | "String"
+            | "Bool"
+            | "UInt"
+            | "Int"
+            | "Float"
+            | "panic"
+            | "Map"
+            | "Set"
+            | "Array"
+            | "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+    )
+}
+
+fn split_braced_use(detail: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, ch) in detail.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let brace_start = start?;
+                    let prefix = detail[..brace_start].trim().trim_end_matches("::").trim();
+                    let inner = detail[brace_start + 1..index].trim();
+                    return Some((prefix, inner));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_items(detail: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for (index, ch) in detail.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(detail[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(detail[start..].trim());
+    items
+}
+
+fn join_use_prefix(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() {
+        suffix.to_string()
+    } else if suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}::{suffix}")
+    }
+}
+
+fn collect_module_members(prefix: &str, env: &SemanticEnv) -> Vec<String> {
+    let module_prefix = format!("{prefix}::");
+    let mut members = OrderedSet::new();
+    members.extend(env.structs.keys().filter(|name| name.starts_with(&module_prefix)).cloned());
+    members.extend(env.enums.keys().filter(|name| name.starts_with(&module_prefix)).cloned());
+    members.extend(env.traits.keys().filter(|name| name.starts_with(&module_prefix)).cloned());
+    members.extend(env.functions.keys().filter(|name| name.starts_with(&module_prefix)).cloned());
+    members.extend(env.type_aliases.keys().filter(|name| name.starts_with(&module_prefix)).cloned());
+    members.into_iter().collect()
+}
+
+fn has_exact_support_symbol(env: &SemanticEnv, name: &str) -> bool {
+    env.structs.contains_key(name)
+        || env.enums.contains_key(name)
+        || env.traits.contains_key(name)
+        || env.functions.contains_key(name)
+        || env.type_aliases.contains_key(name)
+}
+
+fn canonical_support_name(env: &SemanticEnv, name: &str) -> Option<String> {
+    if skip_support_symbol(name) {
+        return None;
+    }
+    if has_exact_support_symbol(env, name) && name.contains("::") {
+        return Some(name.to_string());
+    }
+
+    let resolved = env.resolve_alias_path(name);
+    if has_exact_support_symbol(env, &resolved) && resolved.contains("::") {
+        return Some(resolved);
+    }
+
+    let suffix = format!("::{}", resolved.rsplit("::").next().unwrap_or(&resolved));
+    if let Some(found) = env.structs.keys().filter(|candidate| candidate.ends_with(&suffix)).min().cloned() {
+        return Some(found);
+    }
+    if let Some(found) = env.enums.keys().filter(|candidate| candidate.ends_with(&suffix)).min().cloned() {
+        return Some(found);
+    }
+    if let Some(found) = env.traits.keys().filter(|candidate| candidate.ends_with(&suffix)).min().cloned() {
+        return Some(found);
+    }
+    if let Some(found) = env.functions.keys().filter(|candidate| candidate.ends_with(&suffix)).min().cloned() {
+        return Some(found);
+    }
+    if let Some(found) = env.type_aliases.keys().filter(|candidate| candidate.ends_with(&suffix)).min().cloned() {
+        return Some(found);
+    }
+
+    None
+}
+
+fn queue_type_dependencies(ty: &TypeRef, env: &SemanticEnv, queue: &mut Vec<String>) {
+    match ty {
+        TypeRef::Tuple { elements, .. } => {
+            for element in elements {
+                queue_type_dependencies(element, env, queue);
+            }
+        }
+        TypeRef::Array { element, .. } => queue_type_dependencies(element, env, queue),
+        TypeRef::Named { name, type_args, .. } => {
+            if let Some(name) = canonical_support_name(env, name) {
+                if !skip_support_symbol(&name) {
+                    queue.push(name);
+                }
+            }
+            for type_arg in type_args {
+                queue_type_dependencies(type_arg, env, queue);
+            }
+        }
+        TypeRef::Function { params, return_type, .. } => {
+            for param in params {
+                queue_type_dependencies(param, env, queue);
+            }
+            queue_type_dependencies(return_type, env, queue);
+        }
+        TypeRef::DynTrait { trait_name, .. } => {
+            if let Some(name) = canonical_support_name(env, trait_name) {
+                if !skip_support_symbol(&name) {
+                    queue.push(name);
+                }
+            }
+        }
+        TypeRef::Ref { inner, .. } => queue_type_dependencies(inner, env, queue),
+        TypeRef::Int { .. }
+        | TypeRef::Float { .. }
+        | TypeRef::Char { .. }
+        | TypeRef::String { .. }
+        | TypeRef::Bool { .. }
+        | TypeRef::Unit { .. }
+        | TypeRef::SelfTy { .. } => {}
+    }
+}
+
+fn insert_support_item(root: &mut SupportModuleTree, qualified_name: &str, item: SupportItem) {
+    let mut segments = qualified_name.split("::").collect::<Vec<_>>();
+    if segments.len() < 2 {
+        root.items.push(item);
+        return;
+    }
+    if segments.first() == Some(&"std") {
+        segments.remove(0);
+        if segments.len() < 2 {
+            root.items.push(item);
+            return;
+        }
+    }
+    let _ = segments.pop();
+    let mut node = root;
+    for segment in segments {
+        node = node.children.entry(segment.to_string()).or_default();
+    }
+    node.items.push(item);
+}
+
+fn insert_support_impl(root: &mut SupportModuleTree, qualified_name: &str, support_impl: SupportImpl) {
+    let mut segments = qualified_name.split("::").collect::<Vec<_>>();
+    if segments.is_empty() {
+        root.impls.push(support_impl);
+        return;
+    }
+    if segments.first() == Some(&"std") {
+        segments.remove(0);
+    }
+    let _ = segments.pop();
+    let mut node = root;
+    for segment in segments {
+        node = node.children.entry(segment.to_string()).or_default();
+    }
+    node.impls.push(support_impl);
+}
+
+fn queue_impl_dependencies(type_name: &str, env: &SemanticEnv, queue: &mut Vec<String>) {
+    for impl_info in env.impls.iter() {
+        let canonical_for_type = canonical_type_name_from_type_ref(&impl_info.for_type_ref)
+            .unwrap_or_else(|| env.resolve_alias_path(&impl_info.for_type));
+        if canonical_for_type != type_name {
+            continue;
+        }
+        if !impl_info.trait_name.is_empty() {
+            queue.push(impl_info.trait_name.clone());
+        }
+        for ty in impl_info.associated_types.values() {
+            queue_type_dependencies(ty, env, queue);
+        }
+        for sig in impl_info.methods.values() {
+            for param in &sig.params {
+                queue_type_dependencies(&param.ty, env, queue);
+            }
+            queue_type_dependencies(&sig.return_type, env, queue);
+        }
+    }
+}
+
+fn build_support_impl(impl_info: &crate::sema::env::ImplInfo, env: &SemanticEnv) -> SupportImpl {
+    let mut type_params = OrderedSet::new();
+    collect_support_impl_type_params(&impl_info.for_type_ref, env, &mut type_params);
+    for ty in impl_info.associated_types.values() {
+        collect_support_impl_type_params(ty, env, &mut type_params);
+    }
+    for sig in impl_info.methods.values() {
+        for param in &sig.params {
+            collect_support_impl_type_params(&param.ty, env, &mut type_params);
+        }
+        collect_support_impl_type_params(&sig.return_type, env, &mut type_params);
+    }
+    SupportImpl {
+        trait_name: impl_info.trait_name.clone(),
+        type_params: type_params.into_iter().collect(),
+        for_type: impl_info.for_type_ref.clone(),
+        methods: impl_info.methods.values().cloned().collect(),
+        associated_types: impl_info
+            .associated_types
+            .iter()
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect(),
+    }
+}
+
+fn collect_support_impl_type_params(ty: &TypeRef, env: &SemanticEnv, params: &mut OrderedSet<String>) {
+    match ty {
+        TypeRef::Named { name, type_args, .. } => {
+            if !name.contains("::")
+                && !is_builtin_named_support_name(name)
+                && env.canonical_map_key(name, &env.structs).is_none()
+                && env.canonical_map_key(name, &env.enums).is_none()
+                && env.canonical_map_key(name, &env.traits).is_none()
+                && env.resolve_type_alias(name).is_none()
+            {
+                params.insert(name.clone());
+            }
+            for type_arg in type_args {
+                collect_support_impl_type_params(type_arg, env, params);
+            }
+        }
+        TypeRef::Tuple { elements, .. } => {
+            for element in elements {
+                collect_support_impl_type_params(element, env, params);
+            }
+        }
+        TypeRef::Array { element, .. } | TypeRef::Ref { inner: element, .. } => {
+            collect_support_impl_type_params(element, env, params);
+        }
+        TypeRef::Function {
+            params: fn_params,
+            return_type,
+            ..
+        } => {
+            for param in fn_params {
+                collect_support_impl_type_params(param, env, params);
+            }
+            collect_support_impl_type_params(return_type, env, params);
+        }
+        TypeRef::DynTrait { trait_name, .. } => {
+            if !trait_name.contains("::") && env.canonical_map_key(trait_name, &env.traits).is_none() {
+                params.insert(trait_name.clone());
+            }
+        }
+        TypeRef::Int { .. }
+        | TypeRef::Float { .. }
+        | TypeRef::Char { .. }
+        | TypeRef::String { .. }
+        | TypeRef::Bool { .. }
+        | TypeRef::Unit { .. }
+        | TypeRef::SelfTy { .. } => {}
+    }
+}
+
+fn is_builtin_named_support_name(name: &str) -> bool {
+    matches!(name, "Option" | "Result" | "Vec" | "List" | "Map" | "Set" | "Array" | "Range" | "Box" | "String" | "Bool" | "UInt" | "U8" | "Int" | "Float" | "str")
+        || matches!(name, "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64")
+}
+
+fn canonical_type_name_from_type_ref(ty: &TypeRef) -> Option<String> {
+    match ty {
+        TypeRef::Named { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn collect_pattern_names(pattern: &Pattern) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_pattern_names_into(pattern, &mut names);
+    names
+}
+
+fn collect_pattern_names_into(pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern {
+        Pattern::Binding { name, .. } => names.push(name.clone()),
+        Pattern::Tuple { elements, .. } | Pattern::Or { alternatives: elements, .. } => {
+            for element in elements {
+                collect_pattern_names_into(element, names);
+            }
+        }
+        Pattern::Variant {
+            fields,
+            named_fields,
+            ..
+        } => {
+            for field in fields {
+                collect_pattern_names_into(field, names);
+            }
+            for (_, pattern) in named_fields {
+                collect_pattern_names_into(pattern, names);
+            }
+        }
+        Pattern::Wildcard { .. }
+        | Pattern::Integer { .. }
+        | Pattern::Float { .. }
+        | Pattern::Char { .. }
+        | Pattern::String { .. }
+        | Pattern::Bool { .. } => {}
+    }
+}
+
+fn format_support_impl_type_params(type_params: &[String]) -> String {
+    if type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", type_params.join(", "))
+    }
+}
+
+fn format_support_value_type(ty: &TypeRef) -> Result<String, Stage0Error> {
+    match ty {
+        TypeRef::String { .. } => Ok("&'static str".to_string()),
+        _ => format_type(ty),
+    }
+}
+
+fn format_support_value_initializer(ty: &TypeRef) -> Result<String, Stage0Error> {
+    match ty {
+        TypeRef::Int { .. } => Ok("0".to_string()),
+        TypeRef::Named { name, .. }
+            if matches!(name.as_str(), "UInt" | "U8" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64") =>
+        {
+            Ok("0".to_string())
+        }
+        TypeRef::Float { .. } => Ok("0.0".to_string()),
+        TypeRef::Named { name, .. } if matches!(name.as_str(), "Float" | "f32" | "f64") => Ok("0.0".to_string()),
+        TypeRef::Char { .. } => Ok("'\\0'".to_string()),
+        TypeRef::String { .. } => Ok("\"\"".to_string()),
+        TypeRef::Bool { .. } => Ok("false".to_string()),
+        TypeRef::Unit { .. } => Ok("()".to_string()),
+        _ => Ok("panic!(\"support stub\")".to_string()),
+    }
+}
 fn emit_function_body(
     body: &FunctionBody,
     indent_level: usize,
@@ -644,7 +2113,7 @@ fn emit_expr(expr: &Expr, state: &CodegenState) -> Result<String, Stage0Error> {
             if *inclusive { "..=" } else { ".." },
             emit_expr(end, state)?
         )),
-        Expr::Cast { expr, ty, .. } => Ok(format!("({}) as {}", emit_expr(expr, state)?, format_type(ty)?)),
+        Expr::Cast { expr, ty, .. } => Ok(format!("(({}) as {})", emit_expr(expr, state)?, format_type(ty)?)),
         Expr::Try { expr, .. } => Ok(format!("{}?", emit_expr(expr, state)?)),
         Expr::Closure { closure, .. } => Ok(format!(
             "move |{}| {}",
@@ -786,6 +2255,18 @@ fn emit_named_call_expr(
             format!("assert_eq!({}, {})", emit_expr(&left.value, state)?, emit_expr(&right.value, state)?)
         }
         ("panic", [arg]) => format!("panic!({})", emit_expr(&arg.value, state)?),
+        ("print", [arg]) | ("std::io::print", [arg]) => {
+            format!("print!(\"{{}}\", {})", emit_expr(&arg.value, state)?)
+        }
+        ("println", [arg]) | ("std::io::println", [arg]) => {
+            format!("println!(\"{{}}\", {})", emit_expr(&arg.value, state)?)
+        }
+        ("eprint", [arg]) | ("std::io::eprint", [arg]) => {
+            format!("eprint!(\"{{}}\", {})", emit_expr(&arg.value, state)?)
+        }
+        ("eprintln", [arg]) | ("std::io::eprintln", [arg]) => {
+            format!("eprintln!(\"{{}}\", {})", emit_expr(&arg.value, state)?)
+        }
         ("Map::new", []) | ("HashMap::new", []) | ("BTreeMap::new", []) | ("std::collections::Map::new", []) => {
             "BTreeMap::<(), ()>::new()".to_string()
         }
@@ -800,8 +2281,8 @@ fn emit_named_call_expr(
         ("Option::Some", [arg]) => format!("Option::Some({})", emit_expr(&arg.value, state)?),
         ("Result::Ok", [arg]) => format!("Result::<_, ()>::Ok({})", emit_expr(&arg.value, state)?),
         ("Result::Err", [arg]) => format!("Result::<(), _>::Err({})", emit_expr(&arg.value, state)?),
-        ("__intrinsic_int_to_float", [arg]) => format!("({}) as f64", emit_expr(&arg.value, state)?),
-        ("__intrinsic_float_to_int", [arg]) => format!("({}) as i64", emit_expr(&arg.value, state)?),
+        ("__intrinsic_int_to_float", [arg]) => format!("(({}) as f64)", emit_expr(&arg.value, state)?),
+        ("__intrinsic_float_to_int", [arg]) => format!("(({}) as i64)", emit_expr(&arg.value, state)?),
         ("__intrinsic_pow", [left, right]) => {
             format!("({}).powf({})", emit_expr(&left.value, state)?, emit_expr(&right.value, state)?)
         }
@@ -848,7 +2329,7 @@ fn emit_field_call_expr(
             base_expr,
             emit_expr(&arg.value, state)?
         ),
-        ("len", []) => format!("{}.len() as i64", base_expr),
+        ("len", []) => format!("({}.len() as i64)", base_expr),
         ("trim", []) => format!("{}.trim().to_string()", base_expr),
         ("trim_end", []) => format!("{}.trim_end().to_string()", base_expr),
         ("trim_end", [arg]) => format!(
@@ -891,7 +2372,7 @@ fn emit_field_call_expr(
             base_expr,
             emit_expr(&arg.value, state)?
         ),
-        ("count", []) => format!("({}).into_iter().count() as i64", base_expr),
+        ("count", []) => format!("(({}).into_iter().count() as i64)", base_expr),
         ("union", [arg]) => format!(
             "{}.union(&{}).cloned().collect::<BTreeSet<_>>()",
             base_expr,
@@ -913,7 +2394,7 @@ fn emit_field_call_expr(
         ("collect", []) => format!("({})", base_expr),
         ("into_iter", []) => format!("({})", base_expr),
         ("find", [arg]) => format!(
-            "{}.find(&{}).map(|index| index as i64)",
+            "{}.find(&{}).map(|index| (index as i64))",
             base_expr,
             emit_expr(&arg.value, state)?
         ),
@@ -1227,7 +2708,7 @@ pub fn rustc_check(path: &Path) -> Result<(), Stage0Error> {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(Stage0Error::codegen(
             Span::new(1, 1, 0, 0),
-            format!("rustc metadata check failed: {stderr}"),
+            format!("rustc metadata check failed for {}: {stderr}", path.display()),
         ))
     }
 }
@@ -1361,7 +2842,12 @@ fn format_type_params(type_params: &[crate::ast::decl::TypeParam]) -> String {
                     if param.bounds.is_empty() {
                         param.name.clone()
                     } else {
-                        let bounds = param.bounds.iter().map(|s| qualify_std_trait(s.as_str())).collect::<Vec<_>>().join(" + ");
+                        let bounds = param
+                            .bounds
+                            .iter()
+                            .map(|s| qualify_rust_path(&qualify_std_trait(s.as_str())))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
                         format!("{}: {}", param.name, bounds)
                     }
                 })
@@ -1405,7 +2891,49 @@ fn format_supertraits(supertraits: &[String]) -> String {
     if supertraits.is_empty() {
         String::new()
     } else {
-        format!(": {}", supertraits.join(" + "))
+        format!(": {}", supertraits.iter().map(|s| qualify_rust_path(&qualify_std_trait(s))).collect::<Vec<_>>().join(" + "))
+    }
+}
+
+fn qualify_rust_path(name: &str) -> String {
+    let is_real_rust_std = matches!(
+        name,
+        n if n.starts_with("std::ops::")
+            || n.starts_with("std::fmt::")
+            || n.starts_with("std::cmp::")
+            || n.starts_with("std::hash::")
+            || n.starts_with("std::default::")
+            || n.starts_with("std::iter::")
+            || n.starts_with("std::collections::VecDeque")
+            || n.starts_with("std::collections::LinkedList")
+            || n.starts_with("std::collections::BTreeMap")
+            || n.starts_with("std::collections::BTreeSet")
+            || n.starts_with("std::convert::")
+            || n.starts_with("std::marker::")
+            || n.starts_with("std::clone::")
+    );
+    let rewritten = match name {
+        "std::core::Option" => "Option".to_string(),
+        "std::core::Result" => "Result".to_string(),
+        "std::core::Vec" => "Vec".to_string(),
+        "std::core::String" => "String".to_string(),
+        "std::core::Bool" => "bool".to_string(),
+        "std::core::UInt" => "u64".to_string(),
+        "std::core::Int" => "i64".to_string(),
+        "std::core::Float" => "f64".to_string(),
+        "std::collections::Vec" => "Vec".to_string(),
+        "std::collections::Map" => "Map".to_string(),
+        "std::collections::Set" => "Set".to_string(),
+        "std::collections::Array" => "Array".to_string(),
+        _ if name.starts_with("std::") && !is_real_rust_std => {
+            format!("crate::{}", &name["std::".len()..])
+        }
+        _ => name.to_string(),
+    };
+    if rewritten.contains("::") && !is_real_rust_std && !rewritten.starts_with("core::") && !rewritten.starts_with("crate::") {
+        format!("crate::{rewritten}")
+    } else {
+        rewritten
     }
 }
 
@@ -1418,7 +2946,12 @@ fn format_where_clause(predicates: &[crate::ast::decl::WherePredicate]) -> Resul
             predicates
                 .iter()
                 .map(|predicate| {
-                    let bounds = predicate.bounds.iter().map(|s| qualify_std_trait(s.as_str())).collect::<Vec<_>>().join(" + ");
+                    let bounds = predicate
+                        .bounds
+                        .iter()
+                        .map(|s| qualify_rust_path(&qualify_std_trait(s.as_str())))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
                     Ok(format!("{}: {}", format_type(&predicate.ty)?, bounds))
                 })
                 .collect::<Result<Vec<_>, Stage0Error>>()?
@@ -1458,13 +2991,15 @@ fn format_type(ty: &TypeRef) -> Result<String, Stage0Error> {
         TypeRef::Named { name, type_args, .. } => {
             let rust_name = match name.as_str() {
                 "Array" => "Array",
+                "List" => "Vec",
                 "Map" => "Map",
                 "Set" => "Set",
                 "Range" => "std::ops::Range",
                 other => other,
             };
+            let rust_name = qualify_rust_path(rust_name);
             if type_args.is_empty() {
-                Ok(rust_name.to_string())
+                Ok(rust_name)
             } else {
                 Ok(format!(
                     "{}<{}>",
@@ -1529,14 +3064,16 @@ fn format_storage_type(ty: &TypeRef, state: &CodegenState, indirect: bool) -> Re
         TypeRef::Named { name, type_args, .. } => {
             let rust_name = match name.as_str() {
                 "Array" => "Array",
+                "List" => "Vec",
                 "Map" => "Map",
                 "Set" => "Set",
                 "Range" => "std::ops::Range",
                 other => other,
             };
+            let rust_name = qualify_rust_path(rust_name);
             let arg_indirect = is_indirect_storage_container(name);
             let rendered = if type_args.is_empty() {
-                rust_name.to_string()
+                rust_name
             } else {
                 format!(
                     "{}<{}>",
@@ -1640,13 +3177,19 @@ impl CodegenState {
             mutable_trait_methods: OrderedSet::new(),
             emit_span_type: true,
             emit_span_merge: true,
+            local_names: OrderedSet::new(),
+            support_use_paths: Vec::new(),
+            support_modules: SupportModuleTree::default(),
         }
     }
 }
 
-fn build_codegen_state(module: &Module) -> CodegenState {
+fn build_codegen_state(module: &Module, env: &SemanticEnv) -> CodegenState {
     let mut metadata = CodegenMetadata::default();
     collect_codegen_metadata(&module.decls, &mut metadata);
+    collect_support_metadata(env, &mut metadata);
+    let local_names = collect_local_decl_names(&module.decls);
+    let support_refs = collect_support_references(module, env, &local_names);
     CodegenState {
         recursive_inline_types: find_recursive_inline_types(&metadata.edges),
         enum_types: metadata.enum_types,
@@ -1656,9 +3199,79 @@ fn build_codegen_state(module: &Module) -> CodegenState {
         mutable_trait_methods: metadata.mutable_trait_methods,
         emit_span_type: metadata.emit_span_type,
         emit_span_merge: metadata.emit_span_merge,
+        local_names: local_names.clone(),
+        support_use_paths: support_refs.use_paths.into_iter().collect(),
+        support_modules: collect_support_modules(module, env, &local_names),
     }
 }
 
+fn collect_local_decl_names(decls: &[Decl]) -> OrderedSet<String> {
+    let mut names = OrderedSet::new();
+    for decl in decls {
+        match decl {
+            Decl::Struct(decl) => {
+                names.insert(leaf_name(&decl.name).to_string());
+            }
+            Decl::Enum(decl) => {
+                names.insert(leaf_name(&decl.name).to_string());
+            }
+            Decl::Trait(decl) => {
+                names.insert(leaf_name(&decl.name).to_string());
+            }
+            Decl::Function(decl) => {
+                names.insert(leaf_name(&decl.sig.name).to_string());
+            }
+            Decl::TypeAlias(decl) => {
+                names.insert(leaf_name(&decl.name).to_string());
+            }
+            Decl::Const(decl) => {
+                names.insert(decl.name.clone());
+            }
+            Decl::Global(decl) => {
+                names.insert(decl.name.clone());
+            }
+            Decl::Module(decl) => {
+                names.insert(decl.name.split("::").next().unwrap_or(&decl.name).to_string());
+            }
+            Decl::Impl(_) | Decl::Extern(_) | Decl::Meta(_) => {}
+        }
+    }
+    names
+}
+
+fn collect_support_metadata(env: &SemanticEnv, metadata: &mut CodegenMetadata) {
+    for decl in env.structs.values() {
+        let entry = metadata.edges.entry(decl.name.clone()).or_default();
+        for field in &decl.fields {
+            collect_inline_type_edges(&field.ty, false, entry);
+        }
+    }
+    for decl in env.enums.values() {
+        metadata.enum_types.insert(decl.name.clone());
+        let entry = metadata.edges.entry(decl.name.clone()).or_default();
+        for variant in &decl.variants {
+            metadata
+                .variant_owners
+                .entry(variant.name.clone())
+                .or_insert_with(|| decl.name.clone());
+            for field in &variant.tuple_fields {
+                collect_inline_type_edges(field, false, entry);
+            }
+            for field in &variant.named_fields {
+                collect_inline_type_edges(&field.ty, false, entry);
+            }
+        }
+    }
+    for sig in env.functions.values() {
+        if matches!(sig.return_type, TypeRef::String { .. }) {
+            metadata.string_returning_functions.insert(sig.name.clone());
+        }
+        metadata
+            .function_params
+            .entry(sig.name.clone())
+            .or_insert_with(|| sig.params.iter().map(|param| param.ty.clone()).collect());
+    }
+}
 fn collect_codegen_metadata(decls: &[Decl], metadata: &mut CodegenMetadata) {
     for decl in decls {
         match decl {
@@ -1858,13 +3471,15 @@ fn format_struct_field_type(ty: &TypeRef, state: &CodegenState, indirect: bool) 
         {
             let rust_name = match name.as_str() {
                 "Array" => "Array",
+                "List" => "Vec",
                 "Map" => "Map",
                 "Set" => "Set",
                 "Range" => "std::ops::Range",
                 other => other,
             };
+            let rust_name = qualify_rust_path(rust_name);
             if type_args.is_empty() {
-                Ok(rust_name.to_string())
+                Ok(rust_name)
             } else {
                 let arg_indirect = is_indirect_storage_container(name);
                 Ok(format!(
@@ -1881,11 +3496,13 @@ fn format_struct_field_type(ty: &TypeRef, state: &CodegenState, indirect: bool) 
         TypeRef::Named { name, type_args, .. } if !type_args.is_empty() => {
             let rust_name = match name.as_str() {
                 "Array" => "Array",
+                "List" => "Vec",
                 "Map" => "Map",
                 "Set" => "Set",
                 "Range" => "std::ops::Range",
                 other => other,
             };
+            let rust_name = qualify_rust_path(rust_name);
             let arg_indirect = is_indirect_storage_container(name);
             let rendered = format!(
                 "{}<{}>",
@@ -1959,9 +3576,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::ast::decl::Decl;
+    use crate::driver::analyze_module_from_path;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::sema::analyze;
+    use crate::sema::{analyze, SemanticEnv};
 
     use super::{build_codegen_state, emit_rust, gen_dyn_ref, gen_struct, gen_trait, rustc_check, rustc_check_command};
 
@@ -2001,7 +3619,7 @@ mod tests {
             Decl::Struct(decl) => decl,
             other => panic!("expected struct, got {other:?}"),
         };
-        let state = build_codegen_state(&module);
+        let state = build_codegen_state(&module, &SemanticEnv::default());
         assert_eq!(
             gen_trait(trait_decl, &state).expect("trait codegen should succeed"),
             "pub trait Draw {\n    fn draw(&self) -> Box<dyn Surface>;\n}\n"
@@ -2210,6 +3828,56 @@ mod tests {
         assert_eq!(rust.matches("struct Span").count(), 1);
         assert_eq!(rust.matches("fn span_merge").count(), 1);
         assert!(rust.contains("const LF: char = '\\n';"));
+    }
+
+    #[test]
+    fn emits_std_support_modules_for_driver_fixture() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("stage0_rs should live directly under the repo root");
+        let driver_path = repo_root.join("tg_compiler/driver.tg");
+
+        let (module, env) = analyze_module_from_path(&driver_path)
+            .expect("driver fixture should analyze successfully");
+        let local_names = super::collect_local_decl_names(&module.decls);
+        let included = super::collect_included_support_names(&module, &env, &local_names);
+        assert!(
+            included.contains("std::bench::BenchCase") || included.contains("bench::BenchCase"),
+            "included support names missing bench::BenchCase: {included:?}"
+        );
+        assert!(
+            included.contains("std::env::args") || included.contains("env::args"),
+            "included support names missing env::args: {included:?}"
+        );
+        assert!(
+            included.contains("std::semver::Version") || included.contains("semver::Version"),
+            "included support names missing semver::Version: {included:?}"
+        );
+
+        let state = build_codegen_state(&module, &env);
+        assert!(
+            state.support_modules.children.contains_key("bench"),
+            "support module tree missing bench child: {:?}",
+            state.support_modules.children.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state.support_modules.children.contains_key("env"),
+            "support module tree missing env child: {:?}",
+            state.support_modules.children.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state.support_modules.children.contains_key("semver"),
+            "support module tree missing semver child: {:?}",
+            state.support_modules.children.keys().collect::<Vec<_>>()
+        );
+
+        let rust = emit_rust(&module, &env).expect("codegen should succeed");
+
+        assert!(rust.contains("use crate::env::args;"));
+        assert!(rust.contains("use crate::bench::BenchCase;"));
+        assert!(rust.contains("pub mod env {"), "missing env support module");
+        assert!(rust.contains("pub mod bench {"), "missing bench support module");
+        assert!(rust.contains("pub mod semver {"), "missing semver support module");
     }
 
     #[test]

@@ -114,13 +114,47 @@ def decode(bytes: &Vec[u8], opts: DecodeOpts) -> Result[Bitmap, ImageError]
   let bit_depth = bytes.get(24) as Int
   let color_type = bytes.get(25) as Int
 
-  if bit_depth != 8 || (color_type != 2 && color_type != 6) then
+  if bit_depth != 8 && bit_depth != 16 then
     return Result::Err(ImageError::UnsupportedFormat(
-      Error::unsupported("Only 8-bit RGB or RGBA PNG is supported.".to_string())
+      Error::unsupported("Only 8-bit and 16-bit PNG is supported.".to_string())
     ))
   end
 
-  let channels = if color_type == 6 then 4 else 3 end
+  # color_type: 0=gray, 2=RGB, 3=palette, 4=gray+alpha, 6=RGBA
+  let channels = if color_type == 0 then 1
+    elsif color_type == 2 then 3
+    elsif color_type == 3 then 1
+    elsif color_type == 4 then 2
+    elsif color_type == 6 then 4
+    else
+      return Result::Err(ImageError::UnsupportedFormat(
+        Error::unsupported("Unsupported PNG color type.".to_string())
+      ))
+    end
+  let bytes_per_pixel = channels * (bit_depth / 8)
+
+  # Parse PLTE chunk if present (needed for color_type 3)
+  var palette = Vec::new()
+  var plte_pos = 8
+  while plte_pos + 8 <= bytes.len() do
+    let pl = _read_be_u32(bytes, plte_pos)
+    let pt0 = bytes.get(plte_pos + 4)
+    let pt1 = bytes.get(plte_pos + 5)
+    let pt2 = bytes.get(plte_pos + 6)
+    let pt3 = bytes.get(plte_pos + 7)
+    if pt0 == 80 && pt1 == 76 && pt2 == 84 && pt3 == 69 then
+      # PLTE chunk: sequence of (R,G,B) entries
+      var pi = 0
+      while pi + 2 < pl do
+        palette.push(bytes.get(plte_pos + 8 + pi))      # R
+        palette.push(bytes.get(plte_pos + 8 + pi + 1))  # G
+        palette.push(bytes.get(plte_pos + 8 + pi + 2))  # B
+        pi = pi + 3
+      end
+    end
+    if pt0 == 73 && pt1 == 69 && pt2 == 78 && pt3 == 68 then break end
+    plte_pos = plte_pos + 12 + pl
+  end
 
   # Collect all IDAT chunk data
   var idat_data = Vec::new()
@@ -150,7 +184,7 @@ def decode(bytes: &Vec[u8], opts: DecodeOpts) -> Result[Bitmap, ImageError]
   # Inflate (zlib stored blocks) the IDAT data
   let raw_scanlines = _inflate_stored(&idat_data)
 
-  # Reconstruct pixels from filtered scanlines
+  # Reconstruct pixels from filtered scanlines → always output RGBA8
   let stride = w * 4
   var data = Vec::with_capacity(stride * h)
   var i = 0
@@ -158,26 +192,61 @@ def decode(bytes: &Vec[u8], opts: DecodeOpts) -> Result[Bitmap, ImageError]
     data.push(0u8)
     i = i + 1
   end
-  let src_stride = w * channels + 1
+  let src_stride = w * bytes_per_pixel + 1
 
   var row = 0
   while row < h do
     let filter_byte = raw_scanlines.get(row * src_stride) as Int
     var col = 0
-    while col < w * channels do
+    while col < w * bytes_per_pixel do
       let raw_val = raw_scanlines.get(row * src_stride + 1 + col) as Int
-      let recon = _png_unfilter(filter_byte, raw_val, col, channels, row, &data, w, stride)
-      let dst_col = if channels == 3 then
-        (col / 3) * 4 + (col % 3)
-      else
-        col
-      end
-      data[row * stride + dst_col] = (recon & 0xFF) as u8
-      # For RGB, fill alpha
-      if channels == 3 && (col % 3) == 2 then
-        data[row * stride + (col / 3) * 4 + 3] = 255u8
+      let recon = _png_unfilter(filter_byte, raw_val, col, bytes_per_pixel, row, &data, w, stride)
+      # Temporarily store reconstructed byte in data buffer for filter dependency
+      # We use a scratch position; final RGBA conversion happens below
+      let scratch_col = col
+      let scratch_offset = row * stride + scratch_col
+      if scratch_offset < data.len() then
+        data[scratch_offset] = (recon & 0xFF) as u8
       end
       col = col + 1
+    end
+
+    # Convert reconstructed scanline to RGBA8
+    var px = 0
+    while px < w do
+      let src_base = row * stride + px * bytes_per_pixel
+      let dst_base = row * stride + px * 4
+      if color_type == 0 then
+        # Grayscale
+        let g = if bit_depth == 16 then data[src_base] else data[src_base] end
+        data[dst_base] = g; data[dst_base+1] = g; data[dst_base+2] = g; data[dst_base+3] = 255u8
+      elsif color_type == 2 then
+        # RGB
+        if bit_depth == 16 then
+          data[dst_base] = data[src_base]; data[dst_base+1] = data[src_base+2]; data[dst_base+2] = data[src_base+4]; data[dst_base+3] = 255u8
+        else
+          data[dst_base] = data[src_base]; data[dst_base+1] = data[src_base+1]; data[dst_base+2] = data[src_base+2]; data[dst_base+3] = 255u8
+        end
+      elsif color_type == 3 then
+        # Palette index
+        let idx = (data[src_base] as Int) * 3
+        if idx + 2 < palette.len() then
+          data[dst_base] = palette[idx]; data[dst_base+1] = palette[idx+1]; data[dst_base+2] = palette[idx+2]; data[dst_base+3] = 255u8
+        end
+      elsif color_type == 4 then
+        # Grayscale + alpha
+        let g = data[src_base]
+        let a = if bit_depth == 16 then data[src_base+2] else data[src_base+1] end
+        data[dst_base] = g; data[dst_base+1] = g; data[dst_base+2] = g; data[dst_base+3] = a
+      elsif color_type == 6 then
+        # RGBA — already in correct order if 8-bit
+        if bit_depth == 16 then
+          data[dst_base] = data[src_base]; data[dst_base+1] = data[src_base+2]; data[dst_base+2] = data[src_base+4]; data[dst_base+3] = data[src_base+6]
+        else
+          data[dst_base] = data[src_base]; data[dst_base+1] = data[src_base+1]; data[dst_base+2] = data[src_base+2]; data[dst_base+3] = data[src_base+3]
+        end
+      end
+      px = px + 1
     end
     row = row + 1
   end
@@ -192,12 +261,33 @@ def decode(bytes: &Vec[u8], opts: DecodeOpts) -> Result[Bitmap, ImageError]
 end
 
 def decode_file(path: String, fs: &FsCap, opts: DecodeOpts) -> Result[Bitmap, ImageError]
-  # Read file using FsCap, then delegate to in-memory decode.
-  # This is the reference implementation stub — actual file I/O
-  # is provided by the FsCap capability and runtime.
-  Result::Err(ImageError::IOError(
-    Error::io_error("decode_file requires FsCap runtime integration; use decode() with in-memory bytes.".to_string())
-  ))
+  # Read file using FsCap (authorizes the read) and std::fs (performs it).
+  match std::fs::file_open(path)
+  when Result::Ok(mut f) then
+    let mut all_bytes = Vec::new()
+    let chunk_size = 8192
+    let mut done = false
+    while !done do
+      let mut chunk = Vec::new()
+      match std::fs::file_read(&f, &mut chunk, chunk_size)
+      when Result::Ok(n) then
+        if n == 0 then done = true
+        else all_bytes.extend(&chunk)
+        end
+      when Result::Err(e) then
+        std::fs::file_close(&mut f)
+        return Result::Err(ImageError::IOError(
+          Error::io_error(e.message())
+        ))
+      end
+    end
+    std::fs::file_close(&mut f)
+    decode(&all_bytes, opts)
+  when Result::Err(e) then
+    Result::Err(ImageError::IOError(
+      Error::io_error(e.message())
+    ))
+  end
 end
 
 def encode_png(bmp: &Bitmap, opts: EncodeOpts) -> Result[Vec[u8], ImageError]
@@ -251,37 +341,231 @@ def _read_be_u32(data: &Vec[u8], offset: Int) -> Int
 end
 
 def _inflate_stored(data: &Vec[u8]) -> Vec[u8]
-  # Inflate zlib stored (uncompressed) blocks.
-  # Skip 2-byte zlib header, parse DEFLATE stored blocks.
+  # Full DEFLATE decompression (RFC 1951) with zlib wrapper.
+  # Handles stored (btype=0), fixed Huffman (btype=1), and dynamic Huffman (btype=2).
   var out = Vec::new()
+  # Skip 2-byte zlib header
+  var bit_buf = 0
+  var bits_avail = 0
   var pos = 2
+
   var done = false
   while !done && pos < data.len() do
-    let header = data.get(pos) as Int
-    let bfinal = header & 1
-    let btype = (header >> 1) & 3
-    pos = pos + 1
+    # Refill bit buffer
+    while bits_avail < 24 && pos < data.len() do
+      bit_buf = bit_buf | ((data.get(pos) as Int) << bits_avail)
+      pos = pos + 1
+      bits_avail = bits_avail + 8
+    end
+
+    let bfinal = bit_buf & 1
+    bit_buf = bit_buf >> 1; bits_avail = bits_avail - 1
+    let btype = bit_buf & 3
+    bit_buf = bit_buf >> 2; bits_avail = bits_avail - 2
+
     if btype == 0 then
-      # Stored block
-      let len_lo = data.get(pos) as Int
-      let len_hi = data.get(pos + 1) as Int
-      let block_len = len_lo | (len_hi << 8)
+      # Stored block — align to byte boundary
+      bit_buf = 0; bits_avail = 0
+      if pos + 4 > data.len() then done = true; next end
+      let block_len = (data.get(pos) as Int) | ((data.get(pos + 1) as Int) << 8)
       pos = pos + 4
       var k = 0
-      while k < block_len do
+      while k < block_len && pos < data.len() do
         out.push(data.get(pos))
         pos = pos + 1
         k = k + 1
       end
-    else
-      # Compressed block — not supported in reference decoder
-      done = true
+    elsif btype == 1 || btype == 2 then
+      # Build Huffman tables
+      var lit_lengths = Vec::new()
+      var dist_lengths = Vec::new()
+      if btype == 1 then
+        # Fixed Huffman codes per RFC 1951 §3.2.6
+        for i in 0..288 do
+          if i < 144 then lit_lengths.push(8)
+          elsif i < 256 then lit_lengths.push(9)
+          elsif i < 280 then lit_lengths.push(7)
+          else lit_lengths.push(8) end
+        end
+        for i in 0..32 do dist_lengths.push(5) end
+      else
+        # Dynamic Huffman — read code length tables
+        let hlit = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 5) + 257
+        let hdist = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 5) + 1
+        let hclen = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 4) + 4
+        let cl_order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+        var cl_lens = Vec::new()
+        for _ in 0..19 do cl_lens.push(0) end
+        for i in 0..hclen do
+          cl_lens[cl_order[i]] = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 3)
+        end
+        let cl_table = _dfl_build_table(&cl_lens, 19)
+
+        # Read literal/length + distance code lengths
+        var all_lens = Vec::new()
+        let total = hlit + hdist
+        while all_lens.len() < total do
+          let sym = _dfl_decode(&data, &mut bit_buf, &mut bits_avail, &mut pos, &cl_table)
+          if sym < 16 then
+            all_lens.push(sym)
+          elsif sym == 16 then
+            let rep = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 2) + 3
+            let prev = if all_lens.len() > 0 then all_lens[all_lens.len() - 1] else 0 end
+            for _ in 0..rep do all_lens.push(prev) end
+          elsif sym == 17 then
+            let rep = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 3) + 3
+            for _ in 0..rep do all_lens.push(0) end
+          elsif sym == 18 then
+            let rep = _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, 7) + 11
+            for _ in 0..rep do all_lens.push(0) end
+          end
+        end
+        for i in 0..hlit do lit_lengths.push(all_lens[i]) end
+        for i in 0..hdist do dist_lengths.push(all_lens[hlit + i]) end
+      end
+
+      let lit_table = _dfl_build_table(&lit_lengths, lit_lengths.len())
+      let dist_table = _dfl_build_table(&dist_lengths, dist_lengths.len())
+
+      # Decode compressed data
+      var block_done = false
+      while !block_done do
+        let sym = _dfl_decode(&data, &mut bit_buf, &mut bits_avail, &mut pos, &lit_table)
+        if sym < 256 then
+          out.push(sym as u8)
+        elsif sym == 256 then
+          block_done = true
+        else
+          # Length code 257-285
+          let (base_len, extra_len) = _dfl_len_info(sym)
+          let length = base_len + (if extra_len > 0 then _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, extra_len) else 0 end)
+
+          let dist_sym = _dfl_decode(&data, &mut bit_buf, &mut bits_avail, &mut pos, &dist_table)
+          let (base_dist, extra_dist) = _dfl_dist_info(dist_sym)
+          let distance = base_dist + (if extra_dist > 0 then _dfl_bits(&data, &mut bit_buf, &mut bits_avail, &mut pos, extra_dist) else 0 end)
+
+          # Copy from output back-reference
+          var j = 0
+          while j < length do
+            let src_idx = out.len() - distance
+            out.push(out[src_idx])
+            j = j + 1
+          end
+        end
+      end
     end
-    if bfinal == 1 then
-      done = true
-    end
+    if bfinal == 1 then done = true end
   end
   out
+end
+
+# DEFLATE bit reader: read n bits from the bitstream (LSB-first)
+def _dfl_bits(data: &Vec[u8], bit_buf: &mut Int, bits_avail: &mut Int, pos: &mut Int, n: Int) -> Int
+  while *bits_avail < n do
+    if *pos < data.len() then
+      *bit_buf = *bit_buf | ((data.get(*pos) as Int) << *bits_avail)
+      *pos = *pos + 1
+      *bits_avail = *bits_avail + 8
+    else break end
+  end
+  let mask = (1 << n) - 1
+  let val = *bit_buf & mask
+  *bit_buf = *bit_buf >> n
+  *bits_avail = *bits_avail - n
+  val
+end
+
+# DEFLATE Huffman lookup table: entries[code] = (symbol << 5) | code_length
+# Table size = 2^max_bits. Entries for shorter codes are duplicated.
+struct _DflTable
+  entries: Vec[Int]
+  max_bits: Int
+end
+
+def _dfl_build_table(code_lengths: &Vec[Int], num_syms: Int) -> _DflTable
+  var max_bits = 0
+  for i in 0..num_syms do
+    if i < code_lengths.len() && code_lengths[i] > max_bits then
+      max_bits = code_lengths[i]
+    end
+  end
+  if max_bits == 0 then max_bits = 1 end
+  if max_bits > 15 then max_bits = 15 end
+
+  let table_size = 1 << max_bits
+  var entries = Vec::with_capacity(table_size)
+  for _ in 0..table_size do entries.push(0) end
+
+  # Count codes per length
+  var bl_count = Vec::new()
+  for _ in 0..(max_bits + 1) do bl_count.push(0) end
+  for i in 0..num_syms do
+    let cl = if i < code_lengths.len() then code_lengths[i] else 0 end
+    if cl > 0 then bl_count[cl] = bl_count[cl] + 1 end
+  end
+
+  # Compute first code for each length
+  var next_code = Vec::new()
+  for _ in 0..(max_bits + 2) do next_code.push(0) end
+  var code = 0
+  for bits in 1..(max_bits + 1) do
+    code = (code + bl_count[bits - 1]) << 1
+    next_code[bits] = code
+  end
+
+  # Assign codes and fill table
+  for sym in 0..num_syms do
+    let cl = if sym < code_lengths.len() then code_lengths[sym] else 0 end
+    if cl > 0 then
+      let c = next_code[cl]
+      next_code[cl] = next_code[cl] + 1
+      # Bit-reverse the code (DEFLATE is LSB-first)
+      var rev = 0
+      for b in 0..cl do
+        rev = rev | (((c >> (cl - 1 - b)) & 1) << b)
+      end
+      let pad = max_bits - cl
+      for fill in 0..(1 << pad) do
+        entries[rev | (fill << cl)] = (sym << 5) | cl
+      end
+    end
+  end
+  _DflTable { entries: entries, max_bits: max_bits }
+end
+
+# Decode one symbol from the DEFLATE bitstream using a Huffman table
+def _dfl_decode(data: &Vec[u8], bit_buf: &mut Int, bits_avail: &mut Int, pos: &mut Int, table: &_DflTable) -> Int
+  while *bits_avail < table.max_bits do
+    if *pos < data.len() then
+      *bit_buf = *bit_buf | ((data.get(*pos) as Int) << *bits_avail)
+      *pos = *pos + 1
+      *bits_avail = *bits_avail + 8
+    else break end
+  end
+  let mask = (1 << table.max_bits) - 1
+  let entry = table.entries[*bit_buf & mask]
+  let cl = entry & 0x1F
+  let sym = entry >> 5
+  *bit_buf = *bit_buf >> cl
+  *bits_avail = *bits_avail - cl
+  sym
+end
+
+# Length code table (codes 257-285): returns (base_length, extra_bits)
+def _dfl_len_info(code: Int) -> (Int, Int)
+  let len_bases = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+  let len_extra = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+  let idx = code - 257
+  if idx >= 0 && idx < 29 then (len_bases[idx], len_extra[idx])
+  else (3, 0) end
+end
+
+# Distance code table (codes 0-29): returns (base_distance, extra_bits)
+def _dfl_dist_info(code: Int) -> (Int, Int)
+  let dist_bases = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+  let dist_extra = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+  if code >= 0 && code < 30 then (dist_bases[code], dist_extra[code])
+  else (1, 0) end
 end
 
 def _png_unfilter(filter: Int, raw: Int, col: Int, channels: Int, row: Int, data: &Vec[u8], w: Int, stride: Int) -> Int
