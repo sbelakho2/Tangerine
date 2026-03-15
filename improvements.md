@@ -87,3 +87,34 @@ Progress on resolving all hack.md items for full self-hosting.
   - thread.tg: added @cfg gates with per-platform opaque struct sizes
   - net.tg: migrated #[cfg]→@cfg syntax, added platform-specific SockAddrIn6/SockAddrUn
   - profile.tg: migrated #[cfg]→@cfg syntax, gated Linux/macOS-specific constants
+
+## D. tg_compiler Scan Failure Fixes
+
+- [x] D1. Parse errors (2 items)
+- [x] D2. Real type/logic errors (4 items)
+- [x] D3. Sema/parser improvements (5 files)
+  - D3a. Cross-module environment during multi-module scan
+  - D3b. Generic type_args propagation for Map/Vec
+  - D3c. Missing intrinsic methods (sorted_by, as_str, is_empty, find)
+  - D3d. Map iteration tuple element tracking
+  - D3e. matches!() macro desugaring in parser
+- [x] D4. Named-field variant positional matching in bind_pattern
+  - When variant has named fields but pattern uses positional syntax, zip positional elements with declared fields in declaration order
+- [x] D5. Ambiguous raw enum name disambiguation by variant match
+  - When enum_key lookup fails for ambiguous names, iterate candidates and pick the one containing the requested variant
+- [x] D6. Missing intrinsic methods
+  - D6a. Added `expect` to option_intrinsic_method_sig
+  - D6b. Added `entries` to map_intrinsic_method_sig
+  - D6c. Added `entries` to vec_intrinsic_method_sig
+  - D6d. Added `enumerate` to array_intrinsic_method_sig
+  - D6e. Added `find` to array_intrinsic_method_sig
+- [x] D7. Or-pattern span-insensitive equality
+  - Replaced `scope != first_scope` with `same_type_shape()` comparison to ignore Span differences
+- [x] D8a/D8b. Forward-inference gaps (already handled by existing inference + D4-D7 fixes)
+- [x] D9b. Added missing struct definitions to resolver.tg
+  - ResolvedSymbol (id, name, is_extern, def_span)
+  - ScopeMap with scopes_containing method
+  - Scope with has_binding method
+  - Binding with all fields used by refactor.tg
+- [x] D10a. types.tg check_pattern: discarded unify() return values with ()
+- [x] D10b. cap_baseline.tg: added attrs parameter to analyze_function_caps, passed item.attrs from call sites

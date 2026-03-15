@@ -89,7 +89,20 @@ impl SemanticEnv {
     /// Returns `Stage0Error` on duplicate declarations or invalid impl targets discovered during collection.
     pub fn collect(module: &Module) -> Result<Self, Stage0Error> {
         let mut env = Self::default();
-        collect_decl_scope(&module.decls, None, &mut env)?;
+        // Unwrap a file-level module declaration so its inner
+        // declarations are treated as top-level (unqualified names).
+        // Sub-modules within it will still get qualified via
+        // collect_decl_scope's Decl::Module handler.
+        let decls = if module.decls.len() == 1 {
+            if let Decl::Module(module_decl) = &module.decls[0] {
+                &module_decl.decls
+            } else {
+                &module.decls[..]
+            }
+        } else {
+            &module.decls[..]
+        };
+        collect_decl_scope(decls, None, &mut env)?;
         Ok(env)
     }
 
@@ -322,17 +335,23 @@ fn collect_decl_scope(
         match decl {
             Decl::Struct(struct_decl) => {
                 validate_struct_decl(struct_decl)?;
-                insert_unique_struct(Rc::make_mut(&mut env.structs), struct_decl)?;
+                if module_prefix.is_none() {
+                    insert_unique_struct(Rc::make_mut(&mut env.structs), struct_decl)?;
+                }
                 insert_qualified_struct(Rc::make_mut(&mut env.structs), struct_decl, module_prefix, &local_type_names);
             }
             Decl::Enum(enum_decl) => {
                 validate_enum_decl(enum_decl)?;
-                insert_unique_enum(Rc::make_mut(&mut env.enums), enum_decl)?;
+                if module_prefix.is_none() {
+                    insert_unique_enum(Rc::make_mut(&mut env.enums), enum_decl)?;
+                }
                 insert_qualified_enum(Rc::make_mut(&mut env.enums), enum_decl, module_prefix, &local_type_names);
             }
             Decl::Trait(trait_decl) => {
                 validate_trait_methods(trait_decl)?;
-                insert_unique_trait(Rc::make_mut(&mut env.traits), trait_decl)?;
+                if module_prefix.is_none() {
+                    insert_unique_trait(Rc::make_mut(&mut env.traits), trait_decl)?;
+                }
                 insert_qualified_trait(Rc::make_mut(&mut env.traits), trait_decl, module_prefix, &local_type_names);
             }
             Decl::Impl(impl_decl) => {
@@ -340,21 +359,29 @@ fn collect_decl_scope(
                 Rc::make_mut(&mut env.impls).push(build_impl_info(impl_decl)?);
             }
             Decl::Function(function_decl) => {
-                insert_unique_function(Rc::make_mut(&mut env.functions), &function_decl.sig)?;
+                if module_prefix.is_none() {
+                    insert_unique_function(Rc::make_mut(&mut env.functions), &function_decl.sig)?;
+                }
                 insert_qualified_function(Rc::make_mut(&mut env.functions), &function_decl.sig, module_prefix, &local_type_names);
             }
             Decl::TypeAlias(alias_decl) => insert_type_alias(Rc::make_mut(&mut env.type_aliases), alias_decl, module_prefix, &local_type_names)?,
             Decl::Const(const_decl) => {
-                insert_unique_const(Rc::make_mut(&mut env.consts), const_decl)?;
+                if module_prefix.is_none() {
+                    insert_unique_const(Rc::make_mut(&mut env.consts), const_decl)?;
+                }
                 insert_qualified_const(Rc::make_mut(&mut env.consts), const_decl, module_prefix, &local_type_names);
             }
             Decl::Global(global_decl) => {
-                insert_unique_global(Rc::make_mut(&mut env.globals), global_decl)?;
+                if module_prefix.is_none() {
+                    insert_unique_global(Rc::make_mut(&mut env.globals), global_decl)?;
+                }
                 insert_qualified_global(Rc::make_mut(&mut env.globals), global_decl, module_prefix, &local_type_names);
             }
             Decl::Extern(extern_decl) => {
                 for function in &extern_decl.functions {
-                    insert_unique_function(Rc::make_mut(&mut env.functions), function)?;
+                    if module_prefix.is_none() {
+                        insert_unique_function(Rc::make_mut(&mut env.functions), function)?;
+                    }
                     insert_qualified_function(Rc::make_mut(&mut env.functions), function, module_prefix, &local_type_names);
                 }
             }

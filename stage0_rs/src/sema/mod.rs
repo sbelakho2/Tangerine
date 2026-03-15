@@ -406,8 +406,20 @@ pub fn check_method_call(
             }
             // Method not found in any impl or trait for this type — the
             // definition may live in a compilation unit not loaded into this
-            // environment.  Return a fallback signature with self parameter.
-            Ok(intrinsic_sig(method_name, vec![self_param(obj_type.clone(), *span)], TypeRef::Unit { span: *span }, *span))
+            // environment.  Recognise well-known method return types before
+            // falling back.  For unknown methods, use <extern::unresolved>
+            // rather than Unit so that downstream checks recognise the
+            // return as "unresolvable" rather than "void".
+            let return_type = match method_name {
+                "is_empty" | "is_some" | "is_none" | "is_ok" | "is_err"
+                | "contains" | "contains_key" | "starts_with" | "ends_with"
+                | "any" | "all" | "exists" => TypeRef::Bool { span: *span },
+                "len" | "count" | "size" | "capacity" | "position" => TypeRef::Int { span: *span },
+                "to_string" | "as_str" | "join" | "trim" | "to_lowercase" | "to_uppercase" => TypeRef::String { span: *span },
+                "clone" | "sorted" | "reversed" | "iter" | "into_iter" | "values" | "keys" => obj_type.clone(),
+                _ => unresolved_external_type(*span),
+            };
+            Ok(intrinsic_sig(method_name, vec![self_param(obj_type.clone(), *span)], return_type, *span))
         }
         TypeRef::String { span }
         | TypeRef::Int { span }
@@ -733,14 +745,14 @@ fn type_check_function_with_locals(
                 }
                 // External module types may be aliases for the expected return
                 // type — accept when exact resolution is not possible.
-                if is_external_module_type(&actual) || is_external_module_type(&expected_return) {
+                if is_externally_typed(&actual) || is_externally_typed(&expected_return) {
                     return Ok(());
                 }
                 Err(Stage0Error::semantic(
                     function.sig.span,
                     format!("function '{}' expected return type {}, found {actual}", function.sig.name, expected_return),
                 ))
-            } else if is_external_module_type(&expected_return) {
+            } else if is_externally_typed(&expected_return) || is_externally_typed(&actual) {
                 Ok(())
             } else {
                 Err(Stage0Error::semantic(
@@ -760,6 +772,7 @@ fn type_check_stmt(
     env: &mut SemanticEnv,
     expected_return: &TypeRef,
     following_stmts: &[Stmt],
+    tail_expr: Option<&Expr>,
 ) -> Result<(), Stage0Error> {
     match stmt {
         Stmt::Requires { .. } | Stmt::Meta { .. } | Stmt::Break { .. } | Stmt::Next { .. } => Ok(()),
@@ -880,6 +893,7 @@ fn type_check_stmt(
                     value,
                     &inferred_ty,
                     following_stmts,
+                    tail_expr,
                     locals,
                     env,
                     expected_return,
@@ -910,7 +924,7 @@ fn type_check_stmt(
         }
         Stmt::While { condition, body, span } => {
             let condition_ty = type_of_expr(condition, locals, env, expected_return)?;
-            if !same_type_shape(&condition_ty, &TypeRef::Bool { span: *span }) && !matches!(condition_ty, TypeRef::Unit { .. }) {
+            if !same_type_shape(&condition_ty, &TypeRef::Bool { span: *span }) && !matches!(condition_ty, TypeRef::Unit { .. }) && !is_externally_typed(&condition_ty) {
                 return Err(Stage0Error::semantic(
                     condition.span(),
                     format!("while condition must be Bool, found {condition_ty}"),
@@ -938,6 +952,7 @@ fn type_check_stmt(
             span,
         } => {
             let iterable_ty = type_of_expr(iterable, locals, env, expected_return)?;
+            let iterable_ty = refine_empty_collection_type(&iterable_ty, iterable, locals);
             let item_ty = iterable_item_type(&iterable_ty, *span)?;
             let mut scoped = bind_pattern(pattern, &item_ty, locals, env)?;
             let existing_names = locals.keys().cloned().collect::<BTreeSet<_>>();
@@ -1972,6 +1987,7 @@ fn type_check_block_in_scope(
             env,
             expected_return,
             &block.stmts[index + 1..],
+            block.tail.as_ref(),
         )?;
         if TRACE_STMTS.load(Ordering::Relaxed) {
             let vm = resident_kb();
@@ -2019,6 +2035,7 @@ fn type_check_discarded_block_in_scope(
             env,
             expected_return,
             &block.stmts[index + 1..],
+            block.tail.as_ref(),
         )?;
     }
     if let Some(expr) = &block.tail {
@@ -2110,6 +2127,7 @@ fn infer_binding_type_from_future_stmts(
     value: &Expr,
     inferred_ty: &TypeRef,
     stmts: &[Stmt],
+    tail_expr: Option<&Expr>,
     locals: &BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
@@ -2124,7 +2142,7 @@ fn infer_binding_type_from_future_stmts(
     if !needs_forward_named_inference(inferred_ty, env) || !initializer_matches_forward_target(value, inferred_ty) {
         return inferred_ty.clone();
     }
-    match infer_local_type_from_future_stmts(name, inferred_ty, stmts, locals, env, expected_return) {
+    match infer_local_type_from_future_stmts(name, inferred_ty, stmts, tail_expr, locals, env, expected_return) {
         Ok(Some(refined)) => refined,
         _ => inferred_ty.clone(),
     }
@@ -2135,16 +2153,27 @@ fn infer_local_type_from_future_stmts(
     name: &str,
     current_ty: &TypeRef,
     stmts: &[Stmt],
+    tail_expr: Option<&Expr>,
     locals: &BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<Option<TypeRef>, Stage0Error> {
     let mut scoped_locals = locals.clone();
     for stmt in stmts {
-        if let Some(refined_ty) = infer_local_type_from_stmt(name, current_ty, stmt, &scoped_locals, env, expected_return)? {
+        match infer_local_type_from_stmt(name, current_ty, stmt, &scoped_locals, env, expected_return) {
+            Ok(Some(refined_ty)) => return Ok(Some(refined_ty)),
+            Ok(None) => {}
+            Err(_) => {} // Errors in unrelated code are non-fatal for forward inference.
+        }
+        let _ = extend_inference_scope_from_stmt(stmt, &mut scoped_locals, env, expected_return);
+    }
+    // When no refinement was found in the remaining stmts, also check the
+    // block's tail expression (the last expression in a block that produces
+    // the block's value, which is not parsed as a Stmt).
+    if let Some(tail) = tail_expr {
+        if let Ok(Some(refined_ty)) = infer_local_type_from_expr(name, current_ty, tail, &scoped_locals, env, expected_return) {
             return Ok(Some(refined_ty));
         }
-        extend_inference_scope_from_stmt(stmt, &mut scoped_locals, env, expected_return)?;
     }
     Ok(None)
 }
@@ -2168,6 +2197,23 @@ fn extend_inference_scope_from_stmt(
         let scoped = bind_pattern(pattern, &ty, locals, env)?;
         for (name, bound_ty) in scoped {
             locals.insert(name, bound_ty);
+        }
+    }
+    // E1: Handle expression stmts that are method calls refining empty containers.
+    // e.g. `list.push(item)` where `list` is `Vec[]` → refine to `Vec[item_ty]`
+    if let Stmt::Expr { expr, .. } = stmt {
+        if let Expr::Call { callee, args, .. } = expr {
+            if let Expr::Field { base, field, .. } = callee.as_ref() {
+                if let Expr::Name { name: base_name, .. } = base.as_ref() {
+                    if let Some(current_ty) = locals.get(base_name).cloned() {
+                        if let Ok(Some(refined)) = refine_empty_container_type(
+                            &current_ty, field, args, locals, env, expected_return,
+                        ) {
+                            locals.insert(base_name.clone(), refined);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2233,12 +2279,22 @@ fn infer_local_type_from_block(
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<Option<TypeRef>, Stage0Error> {
-    if let Some(refined_ty) = infer_local_type_from_future_stmts(name, current_ty, &block.stmts, locals, env, expected_return)? {
+    if let Some(refined_ty) = infer_local_type_from_future_stmts(name, current_ty, &block.stmts, block.tail.as_ref(), locals, env, expected_return)? {
         return Ok(Some(refined_ty));
     }
-    block.tail.as_ref().map_or(Ok(None), |expr| {
-        infer_local_type_from_expr(name, current_ty, expr, locals, env, expected_return)
-    })
+    // When the refinement target appears only in the tail expression,
+    // extend locals with declarations from the block's stmts so that
+    // variables defined earlier in the block are visible.
+    match &block.tail {
+        Some(tail_expr) => {
+            let mut tail_locals = locals.clone();
+            for stmt in &block.stmts {
+                let _ = extend_inference_scope_from_stmt(stmt, &mut tail_locals, env, expected_return);
+            }
+            infer_local_type_from_expr(name, current_ty, tail_expr, &tail_locals, env, expected_return)
+        }
+        None => Ok(None),
+    }
 }
 
 #[allow(dead_code)]
@@ -2322,6 +2378,37 @@ fn infer_local_type_from_call_expr(
                     refine_empty_container_type(current_ty, field, args, locals, env, expected_return)?
                 {
                     return Ok(Some(refined_ty));
+                }
+            }
+        }
+    }
+    // E2: Recognise `target.entry(key).or_insert(default)` chain for Map inference.
+    // The outer callee is `<entry_call>.or_insert` and the entry_call is `target.entry(key)`.
+    if let Expr::Field { base: outer_base, field: outer_field, .. } = callee {
+        if matches!(outer_field.as_str(), "or_insert" | "or_insert_with" | "or_default") {
+            if let Expr::Call { callee: entry_callee, args: entry_args, .. } = outer_base.as_ref() {
+                if let Expr::Field { base: inner_base, field: inner_field, .. } = entry_callee.as_ref() {
+                    if inner_field == "entry" {
+                        if let Expr::Name { name: base_name, .. } = inner_base.as_ref() {
+                            if base_name == name {
+                                if let TypeRef::Named { name: type_name, type_args, span } = current_ty {
+                                    if is_named_type(type_name, "Map") && type_args.is_empty() && !entry_args.is_empty() {
+                                        let key_ty = type_of_expr(&entry_args[0].value, locals, env, expected_return)?;
+                                        let value_ty = if !args.is_empty() && outer_field.as_str() == "or_insert" {
+                                            type_of_expr(&args[0].value, locals, env, expected_return)?
+                                        } else {
+                                            TypeRef::Unit { span: *span }
+                                        };
+                                        return Ok(Some(TypeRef::Named {
+                                            name: type_name.clone(),
+                                            type_args: vec![key_ty, value_ty],
+                                            span: *span,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2528,9 +2615,10 @@ fn type_of_struct_literal(
             enum_decl
         } else if enum_name.contains("::") || !enum_name.is_empty() {
             // Enum/variant name from an external module whose definition is
-            // not loaded — return a Named type preserving the original name.
+            // not loaded — return the *enum* name (not the full variant path)
+            // because a variant constructor always produces the enum type.
             return Ok(TypeRef::Named {
-                name: name.to_string(),
+                name: enum_key,
                 type_args: Vec::new(),
                 span,
             });
@@ -2998,7 +3086,7 @@ fn is_single_arg_assert_call(name: &str, sig: &crate::ast::decl::FunctionSig, ar
 fn lookup_associated_function(name: &str, env: &SemanticEnv) -> Option<FunctionSig> {
     let (type_name, method_name) = name.rsplit_once("::")?;
     let type_name = env.resolve_alias_path(type_name);
-    env.impls
+    let from_impls = env.impls
         .iter()
         .find(|impl_info| {
             if impl_info.trait_name.is_empty() {
@@ -3011,7 +3099,36 @@ fn lookup_associated_function(name: &str, env: &SemanticEnv) -> Option<FunctionS
                 false
             }
         })
-        .and_then(|impl_info| impl_info.methods.get(method_name).cloned())
+        .and_then(|impl_info| impl_info.methods.get(method_name).cloned());
+    if from_impls.is_some() {
+        return from_impls;
+    }
+    // E4: Fallback for primitive type static methods not in env.impls.
+    let bare_type = type_name.rsplit("::").next().unwrap_or(&type_name);
+    primitive_static_method(bare_type, method_name)
+}
+
+/// Built-in static methods on primitive types (char, Int, etc.).
+fn primitive_static_method(type_name: &str, method: &str) -> Option<FunctionSig> {
+    let span = Span::new(0, 0, 0, 0);
+    match (type_name, method) {
+        ("char" | "Char", "from_u32") => Some(intrinsic_sig(
+            "from_u32",
+            vec![plain_param("code", TypeRef::Named { name: "u32".to_string(), type_args: vec![], span }, span)],
+            TypeRef::Named { name: "Option".to_string(), type_args: vec![TypeRef::Char { span }], span },
+            span,
+        )),
+        ("Int", "from_str_radix") => Some(intrinsic_sig(
+            "from_str_radix",
+            vec![
+                plain_param("src", TypeRef::Ref { inner: Box::new(TypeRef::String { span }), mutable: false, span }, span),
+                plain_param("radix", TypeRef::Int { span }, span),
+            ],
+            TypeRef::Named { name: "Result".to_string(), type_args: vec![TypeRef::Int { span }, TypeRef::String { span }], span },
+            span,
+        )),
+        _ => None,
+    }
 }
 
 fn field_alias(name: &str) -> Option<&str> {
@@ -3188,6 +3305,7 @@ fn type_of_method_call(
     expected_return: &TypeRef,
 ) -> Result<TypeRef, Stage0Error> {
     let base_ty = type_of_expr(base, locals, env, expected_return)?;
+    let base_ty = refine_empty_collection_type(&base_ty, base, locals);
     if let Some(inferred) = infer_intrinsic_method_sig(&base_ty, field, args, span, locals, env, expected_return)? {
         return apply_callable_signature(&inferred, args, span, locals, env, expected_return);
     }
@@ -3201,6 +3319,39 @@ fn type_of_method_call(
         }
         Err(method_error) => Err(method_error),
     }
+}
+
+/// When `inferred_ty` is a Vec/Map/Set with empty type_args, try to recover the
+/// full generic type from the base expression's declared local binding.
+fn refine_empty_collection_type(
+    inferred_ty: &TypeRef,
+    base: &Expr,
+    locals: &BTreeMap<String, TypeRef>,
+) -> TypeRef {
+    let needs_refinement = match inferred_ty {
+        TypeRef::Named { name, type_args, .. } => {
+            type_args.is_empty()
+                && (is_named_type(name, "Vec")
+                    || is_named_type(name, "Map")
+                    || is_named_type(name, "Set")
+                    || is_named_type(name, "Option")
+                    || is_named_type(name, "Result"))
+        }
+        _ => false,
+    };
+    if !needs_refinement {
+        return inferred_ty.clone();
+    }
+    if let Expr::Name { name, .. } = base {
+        if let Some(local_ty) = locals.get(name) {
+            if let TypeRef::Named { type_args, .. } = local_ty {
+                if !type_args.is_empty() {
+                    return local_ty.clone();
+                }
+            }
+        }
+    }
+    inferred_ty.clone()
 }
 
 fn apply_callable_signature(
@@ -3618,7 +3769,7 @@ fn infer_empty_map_lookup_sig(
     let key_ty = type_of_expr(&args[0].value, locals, env, expected_return)?;
     let value_ty = infer_empty_map_value_type(field, span, expected_return);
     Ok(match field {
-        "get" | "get_mut" => intrinsic_sig(
+        "get" => intrinsic_sig(
             field,
             vec![
                 self_param(base_ty.clone(), span),
@@ -3633,6 +3784,23 @@ fn infer_empty_map_lookup_sig(
                 ),
             ],
             option_ref_type(value_ty, span),
+            span,
+        ),
+        "get_mut" => intrinsic_sig(
+            field,
+            vec![
+                self_param(base_ty.clone(), span),
+                plain_param(
+                    "key",
+                    TypeRef::Ref {
+                        inner: Box::new(key_ty),
+                        mutable: false,
+                        span,
+                    },
+                    span,
+                ),
+            ],
+            named_type("Option", vec![TypeRef::Ref { inner: Box::new(value_ty), mutable: true, span }], span),
             span,
         ),
         "remove" => intrinsic_sig(
@@ -4827,13 +4995,20 @@ fn intrinsic_method_sig(base_ty: &TypeRef, field: &str, span: Span) -> Option<Fu
             TypeRef::String { span },
             span,
         )),
+        _ if field == "as_str" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            TypeRef::String { span },
+            span,
+        )),
         _ => None,
     }
 }
 
 fn char_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
     match field {
-        "is_digit" | "is_alphabetic" | "is_alphanumeric" | "is_numeric" | "is_whitespace" => Some(intrinsic_sig(
+        "is_digit" | "is_alphabetic" | "is_alphanumeric" | "is_numeric" | "is_whitespace"
+        | "is_uppercase" | "is_lowercase" | "is_ascii" | "is_control" => Some(intrinsic_sig(
             field,
             vec![self_param(TypeRef::Char { span }, span)],
             TypeRef::Bool { span },
@@ -4870,7 +5045,7 @@ fn float_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
 fn vec_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str, span: Span) -> Option<FunctionSig> {
     match field {
         "clone" | "sorted" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], base_ty.clone(), span)),
-        "iter" => Some(intrinsic_sig(
+        "iter" | "entries" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span)],
             TypeRef::Ref {
@@ -4934,6 +5109,23 @@ fn vec_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str, s
                 ),
             ],
             TypeRef::Unit { span },
+            span,
+        )),
+        "sorted_by" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(base_ty.clone(), span),
+                plain_param(
+                    "f",
+                    TypeRef::Function {
+                        params: vec![item_ty.clone(), item_ty.clone()],
+                        return_type: Box::new(TypeRef::Bool { span }),
+                        span,
+                    },
+                    span,
+                ),
+            ],
+            base_ty.clone(),
             span,
         )),
         "for_each" => Some(intrinsic_sig(
@@ -5138,6 +5330,16 @@ fn map_intrinsic_method_sig(
     span: Span,
 ) -> Option<FunctionSig> {
     match field {
+        "iter" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            TypeRef::Ref {
+                inner: Box::new(base_ty.clone()),
+                mutable: false,
+                span,
+            },
+            span,
+        )),
         "insert" => Some(intrinsic_sig(
             field,
             vec![
@@ -5148,7 +5350,7 @@ fn map_intrinsic_method_sig(
             TypeRef::Unit { span },
             span,
         )),
-        "get" | "get_mut" => Some(intrinsic_sig(
+        "get" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span), plain_param("key", TypeRef::Ref { inner: Box::new(key_ty.clone()), mutable: false, span }, span)],
             TypeRef::Named {
@@ -5156,6 +5358,20 @@ fn map_intrinsic_method_sig(
                 type_args: vec![TypeRef::Ref {
                     inner: Box::new(value_ty.clone()),
                     mutable: false,
+                    span,
+                }],
+                span,
+            },
+            span,
+        )),
+        "get_mut" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span), plain_param("key", TypeRef::Ref { inner: Box::new(key_ty.clone()), mutable: false, span }, span)],
+            TypeRef::Named {
+                name: "Option".to_string(),
+                type_args: vec![TypeRef::Ref {
+                    inner: Box::new(value_ty.clone()),
+                    mutable: true,
                     span,
                 }],
                 span,
@@ -5188,6 +5404,12 @@ fn map_intrinsic_method_sig(
         )),
         "len" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], TypeRef::Int { span }, span)),
         "is_empty" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], TypeRef::Bool { span }, span)),
+        "entries" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            base_ty.clone(),
+            span,
+        )),
         _ => None,
     }
 }
@@ -5607,6 +5829,29 @@ fn array_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str,
             TypeRef::Int { span },
             span,
         )),
+        "enumerate" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            named_type("Vec", vec![TypeRef::Tuple { elements: vec![TypeRef::Int { span }, item_ty.clone()], span }], span),
+            span,
+        )),
+        "find" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(base_ty.clone(), span),
+                plain_param(
+                    "f",
+                    TypeRef::Function {
+                        params: vec![TypeRef::Ref { inner: Box::new(item_ty.clone()), mutable: false, span }],
+                        return_type: Box::new(TypeRef::Bool { span }),
+                        span,
+                    },
+                    span,
+                ),
+            ],
+            named_type("Option", vec![item_ty.clone()], span),
+            span,
+        )),
         _ => None,
     }
 }
@@ -5642,6 +5887,12 @@ fn option_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str
             span,
         )),
         "unwrap" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], item_ty.clone(), span)),
+        "expect" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span), plain_param("msg", TypeRef::Ref { inner: Box::new(TypeRef::String { span }), mutable: false, span }, span)],
+            item_ty.clone(),
+            span,
+        )),
         "unwrap_or" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span), plain_param("default", item_ty.clone(), span)],
@@ -5841,7 +6092,7 @@ fn bind_branch_guard(
     match guard {
         BranchGuard::Expr(expr) => {
             let condition_ty = type_of_expr(expr, locals, env, expected_return)?;
-            if same_type_shape(&condition_ty, &TypeRef::Bool { span: expr.span() }) || matches!(condition_ty, TypeRef::Unit { .. }) {
+            if same_type_shape(&condition_ty, &TypeRef::Bool { span: expr.span() }) || matches!(condition_ty, TypeRef::Unit { .. }) || is_externally_typed(&condition_ty) {
                 Ok(locals.clone())
             } else {
                 Err(Stage0Error::semantic(
@@ -5925,11 +6176,22 @@ fn bind_pattern(
             let first_scope = first_scope?;
             for scope in alternative_scopes {
                 let scope = scope?;
-                if scope != first_scope {
+                if scope.len() != first_scope.len() {
                     return Err(Stage0Error::semantic(
                         *span,
                         "or-pattern alternatives must bind the same names with the same types",
                     ));
+                }
+                for (key, first_ty) in &first_scope {
+                    match scope.get(key) {
+                        Some(other_ty) if same_type_shape(first_ty, other_ty) => {}
+                        _ => {
+                            return Err(Stage0Error::semantic(
+                                *span,
+                                "or-pattern alternatives must bind the same names with the same types",
+                            ));
+                        }
+                    }
                 }
             }
             Ok(first_scope)
@@ -5973,20 +6235,59 @@ fn bind_pattern(
             let enum_decl = match env.enums.get(&enum_key) {
                 Some(decl) => decl,
                 None => {
-                    // Enum definition not loaded — this is an external module
-                    // enum.  Bind all pattern fields as Unit (unknown type).
-                    let mut scoped = locals.clone();
-                    for field in fields {
-                        if let Pattern::Binding { name: field_name, .. } = field {
-                            scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                    // Enum definition not loaded — try to disambiguate by
+                    // finding which enum actually contains the requested variant.
+                    let suffix = name.rsplit("::").next().unwrap_or(name);
+                    let mut candidate: Option<&EnumDecl> = None;
+                    for (key, decl) in env.enums.iter() {
+                        let key_suffix = key.rsplit("::").next().unwrap_or(key);
+                        if key_suffix == suffix {
+                            if find_matching_variant(decl, key, variant_name).is_some() {
+                                candidate = Some(decl);
+                                break;
+                            }
                         }
                     }
-                    for (_, field_pat) in named_fields {
-                        if let Pattern::Binding { name: field_name, .. } = field_pat {
-                            scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                    match candidate {
+                        Some(decl) => decl,
+                        None => {
+                            // When the value is genuinely unresolved (external),
+                            // dispatch Ok/Err/Some/None to builtin handlers and
+                            // bind other variants as <extern::unresolved>.
+                            if is_externally_typed(value_ty) {
+                                match variant_name.as_str() {
+                                    "Some" | "None" => return bind_builtin_option_pattern(variant_name, fields, named_fields, type_args, *span, locals, env),
+                                    "Ok" | "Err" => return bind_builtin_result_pattern(variant_name, fields, named_fields, type_args, *span, locals, env),
+                                    _ => {}
+                                }
+                                let mut scoped = locals.clone();
+                                let ext = unresolved_external_type(*span);
+                                for field in fields {
+                                    if let Pattern::Binding { name: field_name, .. } = field {
+                                        scoped.insert(field_name.clone(), ext.clone());
+                                    }
+                                }
+                                for (_, field_pat) in named_fields {
+                                    if let Pattern::Binding { name: field_name, .. } = field_pat {
+                                        scoped.insert(field_name.clone(), ext.clone());
+                                    }
+                                }
+                                return Ok(scoped);
+                            }
+                            let mut scoped = locals.clone();
+                            for field in fields {
+                                if let Pattern::Binding { name: field_name, .. } = field {
+                                    scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                                }
+                            }
+                            for (_, field_pat) in named_fields {
+                                if let Pattern::Binding { name: field_name, .. } = field_pat {
+                                    scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                                }
+                            }
+                            return Ok(scoped);
                         }
                     }
-                    return Ok(scoped);
                 }
             };
             if let Some(expected_enum) = enum_name.as_ref() {
@@ -6005,20 +6306,33 @@ fn bind_pattern(
             let mut scoped = locals.clone();
             if !variant.named_fields.is_empty() {
                 let type_param_names = type_param_list_names(&enum_decl.type_params);
-                for declared_field in &variant.named_fields {
-                    if let Some((_, field_pattern)) = named_fields
-                        .iter()
-                        .find(|(field_name, _)| field_name == &declared_field.name)
-                    {
+                if !named_fields.is_empty() {
+                    // Named-field pattern: match by field name
+                    for declared_field in &variant.named_fields {
+                        if let Some((_, field_pattern)) = named_fields
+                            .iter()
+                            .find(|(field_name, _)| field_name == &declared_field.name)
+                        {
+                            let payload_ty = substitute_type_params(&declared_field.ty, &type_param_names, type_args);
+                            scoped = bind_pattern(field_pattern, &payload_ty, &scoped, env)?;
+                        }
+                    }
+                    for (field_name, field_pattern) in named_fields {
+                        if !variant.named_fields.iter().any(|f| f.name == *field_name) {
+                            scoped = bind_pattern(field_pattern, &TypeRef::Unit { span: *span }, &scoped, env)?;
+                        }
+                    }
+                    return Ok(scoped);
+                }
+                if !fields.is_empty() {
+                    // Positional pattern on a named-field variant: zip positional
+                    // elements with declared fields in declaration order.
+                    let max_len = fields.len().min(variant.named_fields.len());
+                    for (field_pattern, declared_field) in fields.iter().zip(&variant.named_fields).take(max_len) {
                         let payload_ty = substitute_type_params(&declared_field.ty, &type_param_names, type_args);
                         scoped = bind_pattern(field_pattern, &payload_ty, &scoped, env)?;
                     }
-                }
-                // Also bind any extra pattern fields as Unit
-                for (field_name, field_pattern) in named_fields {
-                    if !variant.named_fields.iter().any(|f| f.name == *field_name) {
-                        scoped = bind_pattern(field_pattern, &TypeRef::Unit { span: *span }, &scoped, env)?;
-                    }
+                    return Ok(scoped);
                 }
                 return Ok(scoped);
             }
@@ -6533,9 +6847,13 @@ fn type_of_field_from_type(
             let struct_key = match env.canonical_map_key(name, &env.structs) {
                 Some(key) => key,
                 None => {
-                    // Struct definition not loaded (external module type) —
-                    // return Unit as the field type.  The actual type will be
-                    // resolved by the downstream Rust compilation.
+                    // Struct not in env — if the type is from an external module
+                    // (name contains "::"), propagate the unresolved status rather
+                    // than collapsing to Unit.  This ensures downstream checks
+                    // recognise the type as externally typed and tolerate it.
+                    if name.contains("::") {
+                        return Ok(unresolved_external_type(span));
+                    }
                     return Ok(TypeRef::Unit { span });
                 }
             };
@@ -7064,8 +7382,25 @@ fn is_external_module_type(ty: &TypeRef) -> bool {
 /// Return `true` when the type's definition may not be available in the current
 /// environment — either because it came from an external module.  Operator and
 /// method checks should accept these types rather than reporting errors.
+/// Also unwraps wrappers like `&T`, `&mut T`, `[T]`, `Vec[T]`, `Option[T]`,
+/// `Result[T,E]`, etc. to check the inner type.
 fn is_externally_typed(ty: &TypeRef) -> bool {
-    is_external_module_type(ty)
+    match ty {
+        TypeRef::Ref { inner, .. } => {
+            is_externally_typed(inner)
+        }
+        TypeRef::Array { element, .. } => {
+            is_externally_typed(element)
+        }
+        TypeRef::Tuple { elements, .. } => {
+            elements.iter().any(|e| is_externally_typed(e))
+        }
+        TypeRef::Named { type_args, .. } => {
+            is_external_module_type(ty)
+                || type_args.iter().any(|a| is_externally_typed(a))
+        }
+        _ => is_external_module_type(ty),
+    }
 }
 
 /// Check whether a cast from `source` to `target` is legal.

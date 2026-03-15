@@ -584,8 +584,7 @@ fn load_support_dirs(
                 filter_module_by_cfg(&mut module, &cfg);
                 if let Ok(env) = SemanticEnv::collect(&module) {
                     let env = normalize_semantic_env_aliases(env);
-                    merge_semantic_env(support_env, &qualify_semantic_env(&env, file_path), false);
-                    if support_name == "std" {
+                    merge_semantic_env(support_env, &qualify_semantic_env(&env, file_path), false);                    if support_name == "std" {
                         merge_semantic_env(support_env, &env, false);
                     } else {
                         count_raw_names(&mut raw_counts.structs, env.structs.keys());

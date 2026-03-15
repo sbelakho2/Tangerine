@@ -1525,6 +1525,10 @@ impl Parser {
                 expr = desugared;
                 continue;
             }
+            if let Some(desugared) = self.try_parse_matches_macro_expr(&expr)? {
+                expr = desugared;
+                continue;
+            }
             let saved = self.cursor;
             self.skip_postfix_newlines();
             let crossed_newline = self.cursor != saved;
@@ -1661,6 +1665,58 @@ impl Parser {
                 value: array_expr,
             }],
             span: merge_spans(*span, end),
+        }))
+    }
+
+    /// Desugar `matches!(expr, pat1 | pat2 | ...)` into
+    /// `match expr { when pat1 | pat2 | ... then true else false end }`.
+    fn try_parse_matches_macro_expr(&mut self, expr: &Expr) -> Result<Option<Expr>, Stage0Error> {
+        let Expr::Name { name, span } = expr else {
+            return Ok(None);
+        };
+        if name != "matches" || !self.check(&TokenKind::Bang) {
+            return Ok(None);
+        }
+        let Some(next_kind) = self.tokens.get(self.cursor + 1).map(|token| &token.kind) else {
+            return Ok(None);
+        };
+        if !matches!(next_kind, TokenKind::LParen) {
+            return Ok(None);
+        }
+        let _ = self.bump(); // consume `!`
+        let _ = self.expect(&TokenKind::LParen)?; // consume `(`
+        let scrutinee = self.parse_expr()?;
+        let _ = self.expect(&TokenKind::Comma)?;
+        self.skip_newlines();
+        let pattern = self.parse_pattern()?;
+        self.skip_newlines();
+        let end = self.expect(&TokenKind::RParen)?.span;
+        let match_span = merge_spans(*span, end);
+        let true_body = BlockBody {
+            stmts: Vec::new(),
+            tail: Some(Expr::Bool { value: true, span: match_span }),
+            span: match_span,
+        };
+        let false_body = BlockBody {
+            stmts: Vec::new(),
+            tail: Some(Expr::Bool { value: false, span: match_span }),
+            span: match_span,
+        };
+        Ok(Some(Expr::Match {
+            value: Box::new(scrutinee),
+            arms: vec![
+                MatchArm {
+                    pattern,
+                    body: true_body,
+                    span: match_span,
+                },
+                MatchArm {
+                    pattern: Pattern::Wildcard { span: match_span },
+                    body: false_body,
+                    span: match_span,
+                },
+            ],
+            span: match_span,
         }))
     }
 
