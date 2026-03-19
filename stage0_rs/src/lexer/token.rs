@@ -106,6 +106,7 @@ pub enum TokenKind {
     PipePipe,
     Caret,
     Tilde,
+    Dollar,
     Shl,
     Shr,
     Plus,

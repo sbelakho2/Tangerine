@@ -60,6 +60,7 @@ pub enum MetaKind {
     Rationale,
     Capability,
     Test,
+    Macro,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,11 +115,13 @@ pub struct TraitDecl {
 pub struct ImplDecl {
     pub type_params: Vec<TypeParam>,
     pub trait_name: String,
+    pub trait_type: Option<TypeRef>,
     pub target_type: String,
     pub for_type: TypeRef,
     pub where_clause: Vec<WherePredicate>,
     pub methods: Vec<MethodBody>,
     pub associated_types: Vec<TypeAliasDecl>,
+    pub consts: Vec<ConstDecl>,
     pub span: Span,
 }
 
@@ -233,5 +236,6 @@ pub struct GlobalDecl {
 pub struct ExternBlockDecl {
     pub abi: Option<String>,
     pub functions: Vec<FunctionSig>,
+    pub structs: Vec<StructDecl>,
     pub span: Span,
 }

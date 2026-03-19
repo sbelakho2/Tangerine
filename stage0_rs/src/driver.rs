@@ -6,12 +6,12 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::decl::{
-    Decl, EnumDecl, FieldDecl, FunctionDecl, FunctionSig, MetaKind, Module, Param, StructDecl, TraitDecl, TypeAliasDecl, TypeParam,
-    VariantDecl, WherePredicate,
+    Decl, EnumDecl, FieldDecl, FunctionDecl, FunctionSig, Module, Param, StructDecl, TraitDecl, TypeAliasDecl,
+    TypeParam, VariantDecl, WherePredicate,
 };
 use crate::ast::expr::{BlockBody, FunctionBody};
 use crate::ast::types::TypeRef;
-use crate::codegen::{emit_rust, rustc_check};
+use crate::codegen::{emit_rust_with_support_sources, rustc_build_binary, rustc_check, SupportSourceModule};
 use crate::error::Stage0Error;
 use crate::lexer::lex;
 use crate::parser::Parser;
@@ -64,228 +64,6 @@ fn brk_addr() -> String {
     format!("{addr:?}")
 }
 
-// ---------------------------------------------------------------------------
-// @cfg conditional compilation
-// ---------------------------------------------------------------------------
-
-/// Platform configuration for evaluating `@cfg(...)` predicates.
-struct CfgConfig {
-    target_os: String,
-    target_arch: String,
-    debug: bool,
-    features: BTreeSet<String>,
-}
-
-impl CfgConfig {
-    /// Build a `CfgConfig` from the current compilation host, with optional
-    /// overrides via environment variables `TG_TARGET_OS`, `TG_TARGET_ARCH`,
-    /// `TG_CFG_DEBUG`, and `TG_CFG_FEATURES` (comma-separated).
-    fn from_env() -> Self {
-        let target_os = std::env::var("TG_TARGET_OS").unwrap_or_else(|_| {
-            if cfg!(target_os = "linux") {
-                "linux".to_string()
-            } else if cfg!(target_os = "macos") {
-                "macos".to_string()
-            } else if cfg!(target_os = "windows") {
-                "windows".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        });
-
-        let target_arch = std::env::var("TG_TARGET_ARCH").unwrap_or_else(|_| {
-            if cfg!(target_arch = "x86_64") {
-                "x86_64".to_string()
-            } else if cfg!(target_arch = "aarch64") {
-                "aarch64".to_string()
-            } else if cfg!(target_arch = "arm") {
-                "arm".to_string()
-            } else if cfg!(target_arch = "riscv64") {
-                "riscv64".to_string()
-            } else if cfg!(target_arch = "wasm32") {
-                "wasm".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        });
-
-        let debug = std::env::var("TG_CFG_DEBUG")
-            .map_or(cfg!(debug_assertions), |v| v == "1" || v == "true");
-
-        let features = std::env::var("TG_CFG_FEATURES")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_default();
-
-        Self { target_os, target_arch, debug, features }
-    }
-}
-
-/// Evaluate a `@cfg(...)` predicate string against the given configuration.
-///
-/// Supports:
-///   - `cfg(target_os = "linux")`
-///   - `cfg(target_arch = "x86_64")`
-///   - `cfg(debug)`
-///   - `cfg(not(...))`
-///   - `cfg(any(..., ...))`
-///   - `cfg(all(..., ...))`
-fn evaluate_cfg_predicate(detail: &str, config: &CfgConfig) -> bool {
-    let inner = detail.trim();
-    // Strip outer `cfg(...)` wrapper if present.
-    let pred = if inner.starts_with("cfg(") && inner.ends_with(')') {
-        &inner[4..inner.len() - 1]
-    } else {
-        inner
-    };
-    eval_pred(pred.trim(), config)
-}
-
-/// Recursively evaluate a single predicate expression.
-fn eval_pred(pred: &str, config: &CfgConfig) -> bool {
-    let pred = pred.trim();
-
-    // not(...)
-    if let Some(inner) = strip_combinator(pred, "not") {
-        return !eval_pred(inner, config);
-    }
-
-    // any(...)
-    if let Some(inner) = strip_combinator(pred, "any") {
-        return split_top_level_commas(inner)
-            .iter()
-            .any(|p| eval_pred(p, config));
-    }
-
-    // all(...)
-    if let Some(inner) = strip_combinator(pred, "all") {
-        return split_top_level_commas(inner)
-            .iter()
-            .all(|p| eval_pred(p, config));
-    }
-
-    // key = "value"
-    if let Some((key, value)) = parse_key_value(pred) {
-        return match key {
-            "target_os" => config.target_os == value,
-            "target_arch" => config.target_arch == value,
-            "feature" => config.features.contains(value),
-            _ => false,
-        };
-    }
-
-    // bare flag
-    match pred {
-        "debug" => config.debug,
-        _ => config.features.contains(pred),
-    }
-}
-
-/// Strip a combinator like `not(...)`, `any(...)`, `all(...)` and return
-/// the inner content. Returns `None` if the predicate doesn't match.
-fn strip_combinator<'a>(pred: &'a str, name: &str) -> Option<&'a str> {
-    let rest = pred.strip_prefix(name)?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('(')?;
-    // Find matching closing paren (accounting for nesting).
-    let mut depth = 1u32;
-    for (i, ch) in rest.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&rest[..i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split a string by top-level commas (not inside nested parentheses).
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0u32;
-    let mut start = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(s[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = s[start..].trim();
-    if !tail.is_empty() {
-        parts.push(tail);
-    }
-    parts
-}
-
-/// Parse `key = "value"` into `(key, value)`.
-fn parse_key_value(pred: &str) -> Option<(&str, &str)> {
-    let (key, rest) = pred.split_once('=')?;
-    let key = key.trim();
-    let rest = rest.trim();
-    let value = rest.strip_prefix('"')?.strip_suffix('"')?;
-    Some((key, value))
-}
-
-/// Remove declarations from a module whose preceding `@cfg(...)` evaluates to
-/// false. An `@cfg` annotation applies to the immediately following non-meta
-/// declaration. Multiple consecutive `@cfg` annotations are AND-combined.
-fn filter_module_by_cfg(module: &mut Module, config: &CfgConfig) {
-    let mut filtered = Vec::with_capacity(module.decls.len());
-    let mut pending_cfgs: Vec<String> = Vec::new();
-
-    for decl in module.decls.drain(..) {
-        match &decl {
-            Decl::Meta(meta)
-                if meta.kind == MetaKind::Annotation
-                    && meta.detail.starts_with("cfg(") =>
-            {
-                pending_cfgs.push(meta.detail.clone());
-                // Don't emit the @cfg annotation itself — it's been evaluated.
-            }
-            _ => {
-                if pending_cfgs.is_empty() {
-                    // Recurse into nested modules.
-                    let decl = filter_nested_module(decl, config);
-                    filtered.push(decl);
-                } else {
-                    let all_pass = pending_cfgs
-                        .iter()
-                        .all(|cfg| evaluate_cfg_predicate(cfg, config));
-                    pending_cfgs.clear();
-                    if all_pass {
-                        let decl = filter_nested_module(decl, config);
-                        filtered.push(decl);
-                    }
-                    // else: drop the declaration (cfg is false)
-                }
-            }
-        }
-    }
-
-    module.decls = filtered;
-}
-
-/// If the declaration is a module, recursively filter its children by @cfg.
-fn filter_nested_module(decl: Decl, config: &CfgConfig) -> Decl {
-    if let Decl::Module(mut m) = decl {
-        let mut inner = Module { decls: std::mem::take(&mut m.decls) };
-        filter_module_by_cfg(&mut inner, config);
-        m.decls = inner.decls;
-        Decl::Module(m)
-    } else {
-        decl
-    }
-}
-
 
 /// Read, lex, parse, and analyze a Tangerine source file.
 ///
@@ -296,9 +74,7 @@ fn filter_nested_module(decl: Decl, config: &CfgConfig) -> Decl {
 /// # Errors
 /// Returns `Stage0Error` if the file cannot be read or if any compiler phase fails.
 pub fn analyze_module_from_path(path: &Path) -> Result<(Module, SemanticEnv), Stage0Error> {
-    let mut module = parse_module_from_path(path)?;
-    let cfg = CfgConfig::from_env();
-    filter_module_by_cfg(&mut module, &cfg);
+    let module = parse_module_from_path(path)?;
     if std::env::var("TG_TRACE").is_ok() {
         eprintln!("[driver] after parse: vm={} KB brk={}", vm_size_kb(), brk_addr());
     }
@@ -347,7 +123,8 @@ pub fn analyze_module_from_path(path: &Path) -> Result<(Module, SemanticEnv), St
 /// Returns `Stage0Error` if any compiler phase fails or if generated Rust fails `rustc` metadata validation.
 pub fn codegen_module_from_path(path: &Path) -> Result<(), Stage0Error> {
     let (module, env) = analyze_module_from_path(path)?;
-    let rust = emit_rust(&module, &env)?;
+    let support_sources = build_support_source_modules_for_file(path)?;
+    let rust = emit_rust_with_support_sources(&module, &env, &support_sources)?;
     let temp_path = write_temp_rust_file(path, &rust)?;
     let check_result = rustc_check(&temp_path);
     if !should_keep_codegen_artifacts() {
@@ -481,8 +258,9 @@ pub fn codegen_directory(path: &Path) -> Result<Vec<CodegenAnalysis>, Stage0Erro
                     Ok(file_specific_env) => {
                         let snapshot_keys = snapshot_new_keys(&merged_env, &file_specific_env);
                         merge_semantic_env(&mut merged_env, &file_specific_env, true);
+                        let support_sources = build_support_source_modules_for_file(&file_path)?;
                         let result = analyze_with_env(&module, &merged_env)
-                            .and_then(|()| emit_rust(&module, &merged_env))
+                            .and_then(|()| emit_rust_with_support_sources(&module, &merged_env, &support_sources))
                             .and_then(|rust| {
                                 let temp_path = write_temp_rust_file(&file_path, &rust)?;
                                 let check_result = rustc_check(&temp_path);
@@ -503,9 +281,43 @@ pub fn codegen_directory(path: &Path) -> Result<Vec<CodegenAnalysis>, Stage0Erro
     Ok(results)
 }
 
+/// Build a Tangerine directory as a native executable.
+///
+/// The directory entrypoint follows Tangerine package conventions: prefer
+/// `main.tg`, then fall back to `lib.tg`, then to the sole `.tg` file when
+/// the directory contains exactly one source file.
+///
+/// # Errors
+/// Returns `Stage0Error` if the directory has no valid entrypoint, if the
+/// entry module fails compilation, or if the generated Rust binary fails to
+/// build with `rustc`.
+pub fn build_directory_binary(path: &Path, output: &Path) -> Result<(), Stage0Error> {
+    let entry_path = select_binary_entrypoint(path)?;
+    let (module, env) = analyze_module_from_path(&entry_path)?;
+    let support_sources = build_support_source_modules_for_file(&entry_path)?;
+    let rust = emit_rust_with_support_sources(&module, &env, &support_sources)?;
+    let generated_path = write_temp_rust_file(&entry_path, &rust)?;
+    let wrapper_path = write_binary_wrapper_file(&entry_path, &module, &generated_path)?;
+
+    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|error| {
+            Stage0Error::codegen(
+                Span::new(1, 1, 0, 0),
+                format!("failed to create output directory {}: {error}", parent.display()),
+            )
+        })?;
+    }
+
+    let build_result = rustc_build_binary(&wrapper_path, output);
+    if !should_keep_codegen_artifacts() {
+        let _ = fs::remove_file(&wrapper_path);
+        remove_codegen_artifacts(&generated_path);
+    }
+    build_result
+}
+
 fn parse_directory_modules(path: &Path) -> Result<Vec<FileAnalysis>, Stage0Error> {
     let mut parsed = Vec::new();
-    let cfg = CfgConfig::from_env();
     let entries = fs::read_dir(path).map_err(|error| {
         Stage0Error::parse(
             Span::new(1, 1, 0, 0),
@@ -518,11 +330,7 @@ fn parse_directory_modules(path: &Path) -> Result<Vec<FileAnalysis>, Stage0Error
         })?;
         let file_path = entry.path();
         if file_path.extension().and_then(|ext| ext.to_str()) == Some("tg") {
-            let result = parse_module_from_path(&file_path).map(|mut module| {
-                filter_module_by_cfg(&mut module, &cfg);
-                module
-            });
-            parsed.push((file_path, result));
+            parsed.push((file_path.clone(), parse_module_from_path(&file_path)));
         }
     }
     parsed.sort_by(|left, right| left.0.cmp(&right.0));
@@ -549,12 +357,82 @@ fn build_support_env_for_file(file_path: &Path) -> Result<SemanticEnv, Stage0Err
     let mut candidate = abs.parent();
     while let Some(dir) = candidate {
         if dir.join("std").is_dir() {
-            load_support_dirs(&mut support_env, dir, dir)?;
+            load_support_dirs(&mut support_env, dir, &abs)?;
             break;
         }
         candidate = dir.parent();
     }
     Ok(support_env)
+}
+
+pub(crate) fn build_support_source_modules_for_file(file_path: &Path) -> Result<Vec<SupportSourceModule>, Stage0Error> {
+    let abs = file_path
+        .canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let mut candidate = abs.parent();
+    while let Some(dir) = candidate {
+        if dir.join("std").is_dir() {
+            return load_support_source_dirs(dir, &abs);
+        }
+        candidate = dir.parent();
+    }
+    Ok(Vec::new())
+}
+
+fn load_support_source_dirs(repo_root: &Path, caller_path: &Path) -> Result<Vec<SupportSourceModule>, Stage0Error> {
+    let caller_canonical = caller_path.canonicalize().unwrap_or_else(|_| caller_path.to_path_buf());
+    let mut support_sources = Vec::new();
+    for support_name in ["std", "tg_compiler"] {
+        let support_dir = repo_root.join(support_name);
+        if !support_dir.is_dir() {
+            continue;
+        }
+        let support_canonical = support_dir.canonicalize().unwrap_or_else(|_| support_dir.clone());
+        if support_canonical == caller_canonical {
+            continue;
+        }
+        for file_path in sorted_tg_paths(&support_dir)? {
+            let file_canonical = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+            if file_canonical == caller_canonical {
+                continue;
+            }
+            let module = parse_module_from_path(&file_path)?;
+            support_sources.push(SupportSourceModule {
+                prefixes: support_prefixes_for_module(&file_path, &module),
+                module,
+            });
+        }
+    }
+    Ok(support_sources)
+}
+
+fn support_prefixes_for_module(file_path: &Path, module: &Module) -> Vec<String> {
+    if has_explicit_top_level_module_decl(module) {
+        return vec![String::new()];
+    }
+
+    let Some(stem) = file_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+    let mut prefixes = vec![stem.to_string()];
+    if let Some(dir_name) = file_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    {
+        prefixes.push(format!("{dir_name}::{stem}"));
+        if stem == "lib" {
+            prefixes.push(dir_name.to_string());
+        }
+    }
+    prefixes
+}
+
+fn has_explicit_top_level_module_decl(module: &Module) -> bool {
+    module
+        .decls
+        .iter()
+        .any(|decl| matches!(decl, Decl::Module(module_decl) if module_decl.name.contains("::")))
 }
 
 fn load_support_dirs(
@@ -576,15 +454,18 @@ fn load_support_dirs(
         // Collect sorted file paths first (lightweight).
         let file_paths = sorted_tg_paths(&support_dir)?;
         let mut raw_counts = RawNameCounts::default();
-        let cfg = CfgConfig::from_env();
 
         // First pass: parse one file at a time, collect qualified names and count raw names.
         for (i, file_path) in file_paths.iter().enumerate() {
-            if let Ok(mut module) = parse_module_from_path(file_path) {
-                filter_module_by_cfg(&mut module, &cfg);
+            let file_canonical = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+            if file_canonical == caller_canonical {
+                continue;
+            }
+            if let Ok(module) = parse_module_from_path(file_path) {
                 if let Ok(env) = SemanticEnv::collect(&module) {
                     let env = normalize_semantic_env_aliases(env);
-                    merge_semantic_env(support_env, &qualify_semantic_env(&env, file_path), false);                    if support_name == "std" {
+                    merge_semantic_env(support_env, &qualify_semantic_env(&env, file_path), false);
+                    if support_name == "std" {
                         merge_semantic_env(support_env, &env, false);
                     } else {
                         count_raw_names(&mut raw_counts.structs, env.structs.keys());
@@ -608,8 +489,11 @@ fn load_support_dirs(
         // Second pass for tg_compiler: merge unique raw names (re-parse one at a time).
         if support_name == "tg_compiler" {
             for (i, file_path) in file_paths.iter().enumerate() {
-                if let Ok(mut module) = parse_module_from_path(file_path) {
-                    filter_module_by_cfg(&mut module, &cfg);
+                let file_canonical = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+                if file_canonical == caller_canonical {
+                    continue;
+                }
+                if let Ok(module) = parse_module_from_path(file_path) {
                     if let Ok(env) = SemanticEnv::collect(&module) {
                         let env = normalize_semantic_env_aliases(env);
                         merge_unique_raw_semantic_env(support_env, &env, &raw_counts);
@@ -840,6 +724,7 @@ fn normalize_semantic_env_aliases(env: SemanticEnv) -> SemanticEnv {
             .map(|impl_info| qualify_impl_info(impl_info, empty_prefix, &local_type_names, &aliases))
             .collect()),
         active_trait: env.active_trait,
+        active_self_type: env.active_self_type,
         fn_return_type: None,
     }
 }
@@ -1389,6 +1274,107 @@ fn write_temp_rust_file(source_path: &Path, rust: &str) -> Result<PathBuf, Stage
     Ok(temp_path)
 }
 
+fn select_binary_entrypoint(path: &Path) -> Result<PathBuf, Stage0Error> {
+    for candidate_name in ["main.tg", "lib.tg"] {
+        let candidate = path.join(candidate_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let tg_paths = sorted_tg_paths(path)?;
+    if tg_paths.len() == 1 {
+        return Ok(tg_paths[0].clone());
+    }
+
+    Err(Stage0Error::codegen(
+        Span::new(1, 1, 0, 0),
+        format!(
+            "failed to choose binary entrypoint in {}: expected main.tg, lib.tg, or exactly one .tg file",
+            path.display()
+        ),
+    ))
+}
+
+fn write_binary_wrapper_file(source_path: &Path, module: &Module, generated_path: &Path) -> Result<PathBuf, Stage0Error> {
+    let wrapper = render_binary_wrapper(module, generated_path)?;
+    write_temp_rust_file(source_path, &wrapper)
+}
+
+fn render_binary_wrapper(module: &Module, generated_path: &Path) -> Result<String, Stage0Error> {
+    let Some(main_return_type) = find_top_level_main_return_type(module) else {
+        return Err(Stage0Error::codegen(
+            Span::new(1, 1, 0, 0),
+            "build-bin requires a top-level main function in the selected entry module".to_string(),
+        ));
+    };
+
+    let include_path = format!("{:?}", generated_path.to_string_lossy());
+    let wrapper_main = if returns_exit_code(main_return_type) {
+        "fn main() {\n    ::std::process::exit(tangerine_entry::main() as i32);\n}\n".to_string()
+    } else if returns_unit_or_never(main_return_type) {
+        "fn main() {\n    tangerine_entry::main();\n}\n".to_string()
+    } else {
+        "fn main() -> ::std::process::ExitCode {\n    ::std::process::Termination::report(tangerine_entry::main())\n}\n".to_string()
+    };
+
+    let module_reexports = render_binary_wrapper_reexports(generated_path)?;
+
+    Ok(format!(
+        "#[path = {include_path}]\nmod tangerine_entry;\n\n{module_reexports}{wrapper_main}"
+    ))
+}
+
+fn render_binary_wrapper_reexports(generated_path: &Path) -> Result<String, Stage0Error> {
+    let generated = fs::read_to_string(generated_path).map_err(|error| {
+        Stage0Error::codegen(
+            Span::new(1, 1, 0, 0),
+            format!("failed to read generated Rust {}: {error}", generated_path.display()),
+        )
+    })?;
+
+    let modules = collect_top_level_public_modules(&generated);
+    if modules.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(modules
+        .into_iter()
+        .map(|name| format!("pub use tangerine_entry::{name};\n"))
+        .collect())
+}
+
+fn collect_top_level_public_modules(generated: &str) -> Vec<String> {
+    let mut modules = BTreeSet::new();
+    for line in generated.lines().filter(|line| line.starts_with("pub mod ")) {
+        let rest = &line["pub mod ".len()..];
+        if let Some(name) = rest
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .next()
+            .filter(|name| !name.is_empty())
+        {
+            modules.insert(name.to_string());
+        }
+    }
+    modules.into_iter().collect()
+}
+
+fn find_top_level_main_return_type(module: &Module) -> Option<&TypeRef> {
+    module.decls.iter().find_map(|decl| match decl {
+        Decl::Function(function_decl) if function_decl.sig.name == "main" => Some(&function_decl.sig.return_type),
+        _ => None,
+    })
+}
+
+fn returns_exit_code(ty: &TypeRef) -> bool {
+    matches!(ty, TypeRef::Int { .. })
+}
+
+fn returns_unit_or_never(ty: &TypeRef) -> bool {
+    matches!(ty, TypeRef::Unit { .. })
+        || matches!(ty, TypeRef::Named { name, .. } if name == "Nil" || name == "!")
+}
+
 fn should_keep_codegen_artifacts() -> bool {
     std::env::var("TG_KEEP_CODEGEN_ARTIFACTS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -1402,13 +1388,15 @@ fn remove_codegen_artifacts(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::ast::decl::{EnumDecl, FunctionSig, VariantDecl};
     use crate::sema::SemanticEnv;
 
-    use super::{analyze_directory, analyze_module_from_path, build_support_env, build_support_env_for_file, codegen_module_from_path, merge_semantic_env, parse_module_from_path, qualify_semantic_env};
+    use super::{analyze_directory, analyze_module_from_path, build_support_env, build_support_env_for_file, codegen_module_from_path, collect_top_level_public_modules, has_explicit_top_level_module_decl, merge_semantic_env, parse_module_from_path, qualify_semantic_env, render_binary_wrapper, support_prefixes_for_module};
 
     #[test]
     fn analyzes_real_repo_fixture() {
@@ -1664,5 +1652,87 @@ mod tests {
             }
             other => panic!("borrow_check return should be Vec[BorrowError], found {other:?}"),
         }
+    }
+
+    #[test]
+    fn support_source_prefixes_defer_to_explicit_top_level_module_decls() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("stage0_rs should live directly under the repo root")
+            .to_path_buf();
+        let semver_path = repo_root.join("std/semver.tg");
+        let semver_module = parse_module_from_path(&semver_path)
+            .expect("std/semver.tg should parse directly");
+
+        assert!(
+            has_explicit_top_level_module_decl(&semver_module),
+            "std/semver.tg should expose an explicit top-level module decl"
+        );
+        assert_eq!(support_prefixes_for_module(&semver_path, &semver_module), vec![String::new()]);
+    }
+
+    #[test]
+    fn support_source_prefixes_fall_back_to_file_paths_without_explicit_module_decls() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("stage0_rs should live directly under the repo root")
+            .to_path_buf();
+        let bindgen_path = repo_root.join("tg_compiler/bindgen.tg");
+        let bindgen_module = parse_module_from_path(&bindgen_path)
+            .expect("tg_compiler/bindgen.tg should parse directly");
+
+        assert!(
+            !has_explicit_top_level_module_decl(&bindgen_module),
+            "tg_compiler/bindgen.tg should rely on file-based support prefixes"
+        );
+        assert_eq!(
+            support_prefixes_for_module(&bindgen_path, &bindgen_module),
+            vec!["bindgen".to_string(), "tg_compiler::bindgen".to_string()]
+        );
+    }
+
+    #[test]
+    fn binary_wrapper_uses_path_module_instead_of_include_macro() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("stage0_rs should live directly under the repo root")
+            .to_path_buf();
+        let fixture = repo_root.join("golden/simple_test.tg");
+        let module = parse_module_from_path(&fixture).expect("simple_test fixture should parse");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let generated = std::env::temp_dir().join(format!("stage0_rs_wrapper_test_{}_{}.rs", std::process::id(), unique));
+        fs::write(&generated, "#![allow(dead_code)]\npub mod helper {}\npub fn main() {}\n")
+            .expect("test should be able to create a generated rust fixture");
+
+        let wrapper = render_binary_wrapper(&module, &generated)
+            .expect("binary wrapper should render for simple_test fixture");
+
+        fs::remove_file(&generated).expect("test should clean up generated rust fixture");
+
+        let expected_path = format!("#[path = {:?}]", generated.to_string_lossy());
+        assert!(wrapper.contains(&expected_path));
+        assert!(wrapper.contains("mod tangerine_entry;"));
+        assert!(wrapper.contains("pub use tangerine_entry::helper;"));
+        assert!(!wrapper.contains("include!("));
+    }
+
+    #[test]
+    fn collect_top_level_public_modules_ignores_nested_modules() {
+        let generated = concat!(
+            "pub mod first {\n",
+            "    pub fn render() -> &'static str { \"{not a module}\" }\n",
+            "    pub mod nested {\n",
+            "        pub fn helper() {}\n",
+            "    }\n",
+            "}\n",
+            "pub mod second {\n",
+            "    pub fn run() {}\n",
+            "}\n"
+        );
+
+        assert_eq!(collect_top_level_public_modules(generated), vec!["first".to_string(), "second".to_string()]);
     }
 }

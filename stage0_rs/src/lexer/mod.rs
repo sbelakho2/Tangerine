@@ -113,6 +113,7 @@ impl<'src> Lexer<'src> {
                 '|' => self.lex_pipe_family(),
                 '^' => self.single(TokenKind::Caret),
                 '~' => self.single(TokenKind::Tilde),
+                '$' => self.single(TokenKind::Dollar),
                 '+' => self.lex_plus_family(),
                 '%' => self.lex_percent_family(),
                 '*' => self.lex_star_family(),

@@ -82,8 +82,17 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Platform detection at compile time
-const USE_EPOLL: Bool = cfg!(target_os = "linux")
-const USE_KQUEUE: Bool = cfg!(target_os = "macos") || cfg!(target_os = "freebsd")
+@cfg(target_os = "linux")
+const USE_EPOLL: Bool = true
+
+@cfg(not(target_os = "linux"))
+const USE_EPOLL: Bool = false
+
+@cfg(any(target_os = "macos", target_os = "freebsd"))
+const USE_KQUEUE: Bool = true
+
+@cfg(not(any(target_os = "macos", target_os = "freebsd")))
+const USE_KQUEUE: Bool = false
 
 # FFI for epoll (Linux)
 extern "C" def epoll_create1(flags: Int) -> Int
@@ -105,12 +114,18 @@ const EPOLLERR: u32 = 0x008
 const EPOLLHUP: u32 = 0x010
 
 # kqueue filter/flag constants
-const EVFILT_READ: i16 = -1
-const EVFILT_WRITE: i16 = -2
 const EV_ADD: u16 = 0x0001
 const EV_DELETE: u16 = 0x0002
 const EV_ENABLE: u16 = 0x0004
 const EV_ONESHOT: u16 = 0x0010
+
+def evfilt_read() -> i16
+  -1
+end
+
+def evfilt_write() -> i16
+  -2
+end
 
 struct EpollEvent
   events: u32
@@ -168,9 +183,9 @@ impl IoReactor
   def register(&mut self, fd: Int, task_id: UInt, interest: Interest) -> Result[Unit, String]
     if USE_KQUEUE then
       let filter = match interest
-      when Interest::Readable then EVFILT_READ
-      when Interest::Writable then EVFILT_WRITE
-      when Interest::Both then EVFILT_READ  # For kqueue, add both separately
+      when Interest::Readable then evfilt_read()
+      when Interest::Writable then evfilt_write()
+      when Interest::Both then evfilt_read()  # For kqueue, add both separately
       end
       
       mut ev = Kevent {
@@ -189,7 +204,7 @@ impl IoReactor
       # For Both interest, register write as well
       match interest
       when Interest::Both then
-        ev.filter = EVFILT_WRITE
+        ev.filter = evfilt_write()
         if kevent(self.poll_fd, &ev, 1, null_mut(), 0, null()) < 0 then
           return Result::Err("Failed to register write with kqueue".to_string())
         end
@@ -220,14 +235,14 @@ impl IoReactor
     if USE_KQUEUE then
       mut ev = Kevent {
         ident: fd as UInt,
-        filter: EVFILT_READ,
+        filter: evfilt_read(),
         flags: EV_DELETE,
         fflags: 0,
         data: 0,
         udata: null_mut()
       }
       kevent(self.poll_fd, &ev, 1, null_mut(), 0, null())
-      ev.filter = EVFILT_WRITE
+      ev.filter = evfilt_write()
       kevent(self.poll_fd, &ev, 1, null_mut(), 0, null())
     elsif USE_EPOLL then
       epoll_ctl(self.poll_fd, EPOLL_CTL_DEL, fd, null_mut())
@@ -249,7 +264,7 @@ impl IoReactor
         tv_nsec: (timeout_ms % 1000) * 1_000_000
       }
       
-      let n = kevent(self.poll_fd, null(), 0, &mut events[0], 64, &ts)
+      let n = kevent(self.poll_fd, null(), 0, events.as_mut_ptr(), 64, &ts)
       let mut i = 0
       while i < n do
         let task_id = events[i].udata as UInt
@@ -263,7 +278,7 @@ impl IoReactor
         zeroed()
       end
       
-      let n = epoll_wait(self.poll_fd, &mut events[0], 64, timeout_ms)
+      let n = epoll_wait(self.poll_fd, events.as_mut_ptr(), 64, timeout_ms)
       let mut i = 0
       while i < n do
         let task_id = events[i].data as UInt
@@ -822,14 +837,16 @@ impl Future for TimeoutFuture[F]
     # Check the inner future first
     match self.inner.poll(cx)
     when Poll::Ready(val) then
-      return Poll::Ready(Result::Ok(val))
+        let ready_result: Result[F::Output, TimeoutError] = Result::Ok(val)
+        return Poll::Ready(ready_result)
     when Poll::Pending then ()
     end
     
     # Check timeout
     let now = instant_now()
     if now >= self.deadline then
-      Poll::Ready(Result::Err(TimeoutError::TimedOut))
+        let timeout_result: Result[F::Output, TimeoutError] = Result::Err(TimeoutError::TimedOut)
+        Poll::Ready(timeout_result)
     else
       if !self.timer_registered then
         unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
@@ -917,23 +934,23 @@ def channel_dec_ref[T](ptr: *mut ChannelInner[T]) -> Unit
 end
 
 pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
-  let inner = Box::new(ChannelInner {
-    buffer: VecDeque::new(),
+  let inner = Box::new(ChannelInner[T] {
+    buffer: VecDeque[T]::new(),
     capacity: capacity,
     closed: false,
-    send_waiters: Vec::new(),
-    recv_waiters: Vec::new(),
+    send_waiters: Vec[Waker]::new(),
+    recv_waiters: Vec[Waker]::new(),
     ref_count: 2
   })
   
   let ptr = Box::into_raw(inner)
   
-  (Sender { inner: ptr }, Receiver { inner: ptr })
+  (Sender[T] { inner: ptr }, Receiver[T] { inner: ptr })
 end
 
 impl Sender[T]
   def send(&self, value: T) -> SendFuture[T]
-    SendFuture {
+    SendFuture[T] {
       sender: self.inner,
       value: Option::Some(value)
     }
@@ -954,7 +971,7 @@ impl Sender[T]
   
   def clone(&self) -> Sender[T]
     channel_inc_ref(self.inner)
-    Sender { inner: self.inner }
+    Sender[T] { inner: self.inner }
   end
 
   def drop(&mut self) -> Unit
@@ -964,7 +981,7 @@ end
 
 impl Receiver[T]
   def recv(&self) -> RecvFuture[T]
-    RecvFuture {
+    RecvFuture[T] {
       receiver: self.inner
     }
   end
@@ -987,7 +1004,8 @@ impl Future for SendFuture[T]
       let ch = &mut *self.sender
       
       if ch.closed then
-        return Poll::Ready(Result::Err("channel closed".to_string()))
+        let closed_result: Result[(), String] = Result::Err("channel closed".to_string())
+        return Poll::Ready(closed_result)
       end
       
       if ch.buffer.len() < ch.capacity then
@@ -999,9 +1017,11 @@ impl Future for SendFuture[T]
           if !ch.recv_waiters.is_empty() then
             ch.recv_waiters.pop().unwrap().wake()
           end
-          Poll::Ready(Result::Ok(()))
+          let sent_result: Result[(), String] = Result::Ok(())
+          Poll::Ready(sent_result)
         when Option::None then
-          Poll::Ready(Result::Err("value already sent".to_string()))
+          let missing_result: Result[(), String] = Result::Err("value already sent".to_string())
+          Poll::Ready(missing_result)
         end
       else
         # Buffer full, wait
@@ -1066,7 +1086,8 @@ impl Future for SelectFuture[A, B]
       match self.a.poll(cx)
       when Poll::Ready(val) then
         self.a_done = true
-        return Poll::Ready(Either::Left(val))
+        let ready: Either[A::Output, B::Output] = Either::Left(val)
+        return Poll::Ready(ready)
       when Poll::Pending then ()
       end
     end
@@ -1075,7 +1096,8 @@ impl Future for SelectFuture[A, B]
       match self.b.poll(cx)
       when Poll::Ready(val) then
         self.b_done = true
-        return Poll::Ready(Either::Right(val))
+        let ready: Either[A::Output, B::Output] = Either::Right(val)
+        return Poll::Ready(ready)
       when Poll::Pending then ()
       end
     end
@@ -1166,11 +1188,13 @@ impl Future for WaitReadableFuture[T]
           self.registered = true
           Poll::Pending
         when Result::Err(err) then
-          Poll::Ready(Result::Err(err))
+          let read_error: Result[Unit, String] = Result::Err(err)
+          Poll::Ready(read_error)
         end
       else
         exec.deregister_io(fd)
-        Poll::Ready(Result::Ok(()))
+        let read_ready: Result[Unit, String] = Result::Ok(())
+        Poll::Ready(read_ready)
       end
     end
   end
@@ -1195,11 +1219,13 @@ impl Future for WaitWritableFuture[T]
           self.registered = true
           Poll::Pending
         when Result::Err(err) then
-          Poll::Ready(Result::Err(err))
+          let write_error: Result[Unit, String] = Result::Err(err)
+          Poll::Ready(write_error)
         end
       else
         exec.deregister_io(fd)
-        Poll::Ready(Result::Ok(()))
+        let write_ready: Result[Unit, String] = Result::Ok(())
+        Poll::Ready(write_ready)
       end
     end
   end
@@ -1288,30 +1314,28 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Global executor (thread-local in multi-threaded contexts)
-thread_local GLOBAL_EXECUTOR: Option[*mut Executor] = Option::None
+@thread_local
+static mut GLOBAL_EXECUTOR: Option[*mut Executor] = Option::None
 
 pub def block_on[F: Future](future: F) -> F::Output
   mut exec = executor_new()
-  
-  # Set the global executor so spawn() works inside block_on
+
   GLOBAL_EXECUTOR = Option::Some(&mut exec as *mut Executor)
-  
-  # Wrap the main future to capture its output
+
   mut result: Option[F::Output] = Option::None
   let result_ptr = &mut result as *mut Option[F::Output]
-  
+
   exec.spawn(async {
     let val = future.await
     unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
       *result_ptr = Option::Some(val)
     end
   })
-  
+
   exec.run()
-  
-  # Clear the global executor on exit
+
   GLOBAL_EXECUTOR = Option::None
-  
+
   match result
   when Option::Some(val) then val
   when Option::None then panic("block_on: future did not complete")
@@ -1334,13 +1358,13 @@ end
 # Platform Sleep (FFI)
 # ———————————————————————————————————————————————————————————————
 
-extern "C" {
+extern "C"
   def usleep(usec: UInt) -> Int
 end
 
 def sleep_ms(ms: UInt) -> Unit
   if ms > 0 then
-    usleep(ms * 1000)
+    let _ = usleep(ms * 1000)
   end
 end
 
@@ -1368,11 +1392,15 @@ end
 
 impl MutexGuard[T]
   def get(&self) -> &T
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do &(*self.mutex).value }
+    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+      &(*self.mutex).value
+    end
   end
   
   def get_mut(&mut self) -> &mut T
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do &mut (*self.mutex).value }
+    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+      &mut (*self.mutex).value
+    end
   end
 end
 
@@ -1482,7 +1510,7 @@ impl TaskScope
   def spawn[F: Future](self: &mut TaskScope, future: F) -> JoinHandle[F::Output]
     let task = Task {
       id: self.tasks.len() as UInt,
-      future: Box::new(future) as Box[dyn Future[Output = ()>>,
+      future: Box::new(future) as Box[dyn Future[Output = ()]],
       state: TaskState::Ready,
       waker: Option::None,
     }

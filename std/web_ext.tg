@@ -9,8 +9,8 @@ module std::web_ext
 use std::core::{Result, Option, Clone, Drop}
 use std::collections::{HashMap}
 use std::time::{Instant, Duration, SystemTime}
-use std::sync::{Arc, Mutex, RwLock, AtomicU64, AtomicBool, Ordering}
-use std::async_::{spawn, sleep, Channel, Receiver, Sender}
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, AtomicU64, AtomicBool, Ordering}
+use std::async_::{sleep, Channel, Receiver, Sender}
 use std::web::{Context, Middleware, MiddlewareResult, App}
 use std::http::{HttpResponse, HttpStatus}
 
@@ -172,9 +172,9 @@ impl Middleware for RateLimiter
     else
       let mut response = HttpResponse::new(HttpStatus::TooManyRequests)
       match &self._strategy
-      when RateLimitStrategy::TokenBucket { burst, .. } then
+      when RateLimitStrategy::TokenBucket { rate: _, burst } then
         response.set_header("X-RateLimit-Limit", burst.to_string())
-      when RateLimitStrategy::FixedWindow { max_requests, .. } then
+      when RateLimitStrategy::FixedWindow { max_requests, window: _ } then
         response.set_header("X-RateLimit-Limit", max_requests.to_string())
       when _ then
         response.set_header("X-RateLimit-Limit", "0")
@@ -222,7 +222,7 @@ impl TaskHandle
   pub def id(self) -> u64 = self._id
 
   pub def status(self) -> TaskStatus
-    self._status.lock().clone()
+    task_status_read(&self._status)
   end
 
   pub def cancel(self)
@@ -247,9 +247,54 @@ end
 struct TaskUnit
   id: u64
   priority: TaskPriority
-  work: Box[dyn FnOnce() + Send]
+  work: Box[dyn FnOnce()]
   status: Arc[Mutex[TaskStatus]]
   cancel: Arc[AtomicBool]
+end
+
+def task_status_read(handle: &Arc[Mutex[TaskStatus]]) -> TaskStatus
+  let mut status_handle = handle.clone()
+  match status_handle.lock()
+  when Result::Ok(status) then status.get().clone()
+  when Result::Err(_) then TaskStatus.Pending
+  end
+end
+
+def task_status_write(handle: &Arc[Mutex[TaskStatus]], next_status: TaskStatus) -> Unit
+  let mut status_handle = handle.clone()
+  match status_handle.lock()
+  when Result::Ok(mut status) then
+    let status_ref = status.get_mut()
+    *status_ref = next_status
+  when Result::Err(_) then {}
+  end
+end
+
+def task_pool_worker(rx: Arc[Mutex[Receiver[TaskUnit]]], sd: Arc[AtomicBool]) -> Unit
+  loop
+    if sd.load(Ordering.SeqCst) then break end
+    let task = {
+      match rx.lock()
+      when Result::Ok(mut guard) then guard.recv_timeout(Duration.from_millis(100))
+      when Result::Err(_) then continue
+      end
+    }
+    match task
+    when Ok(unit) then
+        if unit.cancel.load(Ordering.SeqCst) then
+          task_status_write(&unit.status, TaskStatus.Cancelled)
+          continue
+        end
+        task_status_write(&unit.status, TaskStatus.Running)
+        match std::panic::catch_unwind(|| (unit.work)())
+        when Ok(()) then
+          task_status_write(&unit.status, TaskStatus.Completed)
+        when Err(e) then
+          task_status_write(&unit.status, TaskStatus.Failed(e.to_string()))
+        end
+    when Err(_) then continue  ## Timeout, loop again
+    end
+  end
 end
 
 impl TaskPool
@@ -262,28 +307,7 @@ impl TaskPool
     for _ in 0..worker_count do
       let rx = receiver.clone()
       let sd = shutdown.clone()
-      spawn async
-        loop
-          if sd.load(Ordering.SeqCst) then break end
-          let task = {
-            let rx = rx.lock()
-            rx.recv_timeout(Duration.from_millis(100))
-          }
-          match task
-            Ok(unit) =>
-              if unit.cancel.load(Ordering.SeqCst) then
-                *unit.status.lock() = TaskStatus.Cancelled
-                continue
-              end
-              *unit.status.lock() = TaskStatus.Running
-              match std::panic::catch_unwind(|| (unit.work)())
-                Ok(()) => *unit.status.lock() = TaskStatus.Completed
-                Err(e) => *unit.status.lock() = TaskStatus.Failed(e.to_string())
-              end
-            Err(_) => continue  ## Timeout, loop again
-          end
-        end
-      end
+      std::thread::spawn(|| task_pool_worker(rx, sd))
     end
 
     TaskPool {
@@ -326,7 +350,7 @@ pub struct GracefulShutdown
   _shutdown_signal: Arc[AtomicBool]
   _active_connections: Arc[AtomicU64]
   _timeout: Duration
-  _hooks: Vec[Box[dyn FnOnce() + Send]]
+  _hooks: Vec[Box[dyn FnOnce()]]
 end
 
 impl GracefulShutdown
@@ -340,7 +364,7 @@ impl GracefulShutdown
   end
 
   /// Register a shutdown hook (runs before shutdown completes).
-  pub def on_shutdown(&mut self, hook: Box[dyn FnOnce() + Send])
+  pub def on_shutdown(&mut self, hook: Box[dyn FnOnce()])
     self._hooks.push(hook)
   end
 
@@ -380,8 +404,11 @@ impl GracefulShutdown
     self.initiate()
 
     ## 1. Run pre-shutdown hooks
-    for hook in self._hooks.drain(..) do
-      hook()
+    loop
+      match self._hooks.pop()
+      when Some(hook) then hook()
+      when None then break
+      end
     end
 
     ## 2. Wait for connections to drain
@@ -470,15 +497,21 @@ end
 
 /// Parse a multipart form from the request context.
 pub def parse_multipart(ctx: &Context, config: &MultipartConfig) -> Result[Vec[MultipartPart], MultipartError]
-  let content_type = ctx.request.header("Content-Type")
-    .ok_or(MultipartError.ParseError("missing Content-Type"))?
+  let content_type = match ctx.request.header("Content-Type")
+  when Option::Some(value) then value
+  when Option::None then return Err(MultipartError.ParseError("missing Content-Type"))
+  end
 
-  if !content_type.starts_with("multipart/form-data") then
+  if content_type.as_str().starts_with("multipart/form-data") then
+  else
     return Err(MultipartError.ParseError("not multipart/form-data"))
   end
 
-  let boundary = extract_boundary(content_type)?
-  let body = ctx.request.body_bytes()
+  let boundary = extract_boundary(content_type.as_str())?
+  let body: Vec[u8] = match &ctx.request.body
+  when Option::Some(bytes) then bytes.as_slice().to_vec()
+  when Option::None then Vec::new()
+  end
 
   if body.len() > config.max_body_size then
     return Err(MultipartError.BodyTooLarge)
@@ -509,7 +542,8 @@ fn parse_multipart_body(body: &[u8], boundary: &str, config: &MultipartConfig) -
 
   var parts = Vec.new()
 
-  for section in sections.iter().skip(1) do
+  for i in 1..sections.len() do
+    let section = sections[i]
     if section.starts_with("--") then break end  ## End delimiter
     if parts.len() >= config.max_parts then
       return Err(MultipartError.TooManyParts)
@@ -523,8 +557,14 @@ fn parse_multipart_body(body: &[u8], boundary: &str, config: &MultipartConfig) -
 end
 
 fn parse_part(raw: &str, config: &MultipartConfig) -> Result[MultipartPart, MultipartError]
-  let header_end = raw.find("\r\n\r\n").or_else(|| raw.find("\n\n"))
-    .ok_or(MultipartError.ParseError("malformed part"))?
+  let header_end = match raw.find("\r\n\r\n")
+  when Option::Some(index) then index
+  when Option::None then
+    match raw.find("\n\n")
+    when Option::Some(index) then index
+    when Option::None then return Err(MultipartError.ParseError("malformed part"))
+    end
+  end
 
   let header_section = &raw[..header_end]
   let body_start = if raw[header_end..].starts_with("\r\n\r\n") then header_end + 4 else header_end + 2 end
@@ -535,16 +575,30 @@ fn parse_part(raw: &str, config: &MultipartConfig) -> Result[MultipartPart, Mult
   var content_type = "text/plain".to_string()
   var headers = HashMap.new()
 
-  for line in header_section.lines() do
-    if let Some(v) = line.strip_prefix("Content-Disposition:") then
-      let v = v.trim()
-      if let Some(n) = extract_param(v, "name") then name = n end
-      if let Some(f) = extract_param(v, "filename") then filename = Some(f) end
-    elsif let Some(v) = line.strip_prefix("Content-Type:") then
-      content_type = v.trim().to_string()
-    else
-      if let Some(colon) = line.find(':') then
-        headers.insert(line[..colon].trim().to_string(), line[colon+1..].trim().to_string())
+  let header_lines: Vec[&str] = header_section.split('\n').collect()
+  for raw_line in header_lines do
+    let line = raw_line.trim()
+    match line.strip_prefix("Content-Disposition:")
+    when Option::Some(disposition_value) then
+      let v = disposition_value.trim()
+      match extract_param(v, "name")
+      when Option::Some(extracted_name) then name = extracted_name
+      when Option::None then {}
+      end
+      match extract_param(v, "filename")
+      when Option::Some(extracted_filename) then filename = Some(extracted_filename)
+      when Option::None then {}
+      end
+    when Option::None then
+      match line.strip_prefix("Content-Type:")
+      when Option::Some(content_type_value) then
+        content_type = content_type_value.trim().to_string()
+      when Option::None then
+        match line.find(':')
+        when Option::Some(colon) then
+          headers.insert(line[..colon].trim().to_string(), line[colon+1..].trim().to_string())
+        when Option::None then {}
+        end
       end
     end
   end
@@ -598,38 +652,45 @@ pub struct HealthCheck
   pub check: fn() -> HealthStatus
 end
 
+static mut HEALTH_CHECKS: Vec[HealthCheck] = Vec::new()
+
+def handle_health_checks(ctx: &mut Context) -> HttpResponse
+  let mut all_healthy = true
+  let mut results = Vec::new()
+  for check in HEALTH_CHECKS.iter() do
+    let status = (check.check)()
+    match &status
+    when HealthStatus.Unhealthy(_) then all_healthy = false
+    when HealthStatus.Degraded(_) then ()
+    when HealthStatus.Healthy then ()
+    end
+    results.push((check.name.clone(), status))
+  end
+
+  if all_healthy then
+    ctx.status(HttpStatus::new(200))
+  else
+    ctx.status(HttpStatus::new(503))
+  end
+  ctx.json_response(&results)
+end
+
+def handle_health_ready(ctx: &mut Context) -> HttpResponse
+  ctx.status(HttpStatus::new(200))
+  ctx.text("ready")
+end
+
+def handle_health_live(ctx: &mut Context) -> HttpResponse
+  ctx.status(HttpStatus::new(200))
+  ctx.text("live")
+end
+
 /// Register health check endpoints on an App.
 pub def add_health_checks(app: &mut App, checks: Vec[HealthCheck])
-  let checks = Arc.new(checks)
-
-  app.get("/health", move |ctx: &mut Context| async
-    let mut all_healthy = true
-    var results = Vec.new()
-    for check in checks.iter() do
-      let status = (check.check)()
-      match &status
-        HealthStatus.Unhealthy(_) => all_healthy = false
-        HealthStatus.Degraded(_) => ()
-        HealthStatus.Healthy => ()
-      end
-      results.push((check.name.clone(), status))
-    end
-
-    let status_code = if all_healthy then 200 else 503 end
-    ctx.response.status(status_code)
-    ctx.response.json(&results)
-    Ok(())
-  end)
-
-  app.get("/health/ready", move |ctx: &mut Context| async
-    ctx.response.status(200).body("ready")
-    Ok(())
-  end)
-
-  app.get("/health/live", move |ctx: &mut Context| async
-    ctx.response.status(200).body("live")
-    Ok(())
-  end)
+  HEALTH_CHECKS = checks
+  app.get("/health", handle_health_checks)
+  app.get("/health/ready", handle_health_ready)
+  app.get("/health/live", handle_health_live)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -666,7 +727,11 @@ fn generate_request_id() -> String
   use std::random::{thread_rng, Rng}
   let mut rng = thread_rng()
   let bytes: [u8; 16] = rng.gen()
-  bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+  let mut result = String::new()
+  for byte in bytes.iter() do
+    result = result + &format!("{:02x}", byte)
+  end
+  result
 end
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -729,7 +794,7 @@ impl Middleware for CorsMiddleware
         ctx.response.set_header("Access-Control-Max-Age", &age.to_string())
       end
       ctx.response.status(204)
-      return Ok(())
+      return next(ctx).await
     end
 
     if !self._config.expose_headers.is_empty() then
@@ -748,8 +813,8 @@ end
 @test
 def test_rate_limiter_token_bucket() -> Unit
   let limiter = RateLimiter.new(
-    RateLimitStrategy.TokenBucket { rate: 10.0, burst: 5 },
-    RateLimitKey.Global,
+    RateLimitStrategy::TokenBucket { rate: 10.0, burst: 5 },
+    RateLimitKey::Global,
   )
   ## Should allow first 5 requests (burst)
   for _ in 0..5 do

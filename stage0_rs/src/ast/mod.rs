@@ -149,6 +149,7 @@ mod tests {
                 field: "length".to_string(),
                 span,
             }),
+            type_args: vec![],
             args: vec![CallArg {
                 label: None,
                 value: Expr::Bool { value: true, span },

@@ -102,6 +102,7 @@ impl Pattern {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard: Option<Box<Expr>>,
     pub body: BlockBody,
     pub span: Span,
 }
@@ -144,13 +145,20 @@ pub enum Expr {
         elements: Vec<Expr>,
         span: Span,
     },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+        span: Span,
+    },
     Tuple {
         elements: Vec<Expr>,
         span: Span,
     },
     StructLiteral {
         name: String,
+        type_args: Vec<TypeRef>,
         fields: Vec<(String, Expr)>,
+        rest: Option<Box<Expr>>,
         span: Span,
     },
     Block {
@@ -169,6 +177,7 @@ pub enum Expr {
     },
     Call {
         callee: Box<Expr>,
+        type_args: Vec<TypeRef>,
         args: Vec<CallArg>,
         span: Span,
     },
@@ -217,6 +226,15 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    Await {
+        expr: Box<Expr>,
+        span: Span,
+    },
+    MacroCall {
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -230,6 +248,7 @@ impl Expr {
             | Self::Bool { span, .. }
             | Self::Name { span, .. }
             | Self::Array { span, .. }
+            | Self::ArrayRepeat { span, .. }
             | Self::Tuple { span, .. }
             | Self::StructLiteral { span, .. }
             | Self::Block { span, .. }
@@ -244,7 +263,9 @@ impl Expr {
             | Self::Closure { span, .. }
             | Self::Unary { span, .. }
             | Self::Field { span, .. }
-            | Self::Binary { span, .. } => *span,
+            | Self::Binary { span, .. }
+            | Self::Await { span, .. }
+            | Self::MacroCall { span, .. } => *span,
         }
     }
 }

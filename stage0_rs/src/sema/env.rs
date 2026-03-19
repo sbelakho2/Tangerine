@@ -27,6 +27,7 @@ pub struct SemanticEnv {
     pub aliases: Rc<BTreeMap<String, String>>,
     pub impls: Rc<Vec<ImplInfo>>,
     pub active_trait: Option<String>,
+    pub active_self_type: Option<TypeRef>,
     /// The return type of the enclosing function.  Used by `Stmt::Return`
     /// so that inner expression contexts (e.g. a let-binding annotation)
     /// do not override the function-level expectation.
@@ -145,9 +146,9 @@ impl SemanticEnv {
         if map.contains_key(&aliased) {
             return Some(aliased);
         }
-        if map.contains_key(name) {
-            return Some(name.to_string());
-        }
+            if map.contains_key(name) {
+                return Some(name.to_string());
+            }
         if let Some(key) = fallback_map_key(name, map) {
             return Some(key);
         }
@@ -270,6 +271,11 @@ fn resolve_alias_prefix(name: &str, aliases: &BTreeMap<String, String>) -> Optio
 fn legacy_type_alias(name: &str) -> Option<TypeRef> {
     let alias = name.rsplit("::").next().unwrap_or(name);
     match alias {
+        "JsonValue" => Some(TypeRef::Named {
+            name: "std::serde::Value".to_string(),
+            type_args: Vec::new(),
+            span: Span::new(0, 0, 0, 0),
+        }),
         "Annotation" => Some(TypeRef::Named {
             name: "Attribute".to_string(),
             type_args: Vec::new(),
@@ -356,7 +362,25 @@ fn collect_decl_scope(
             }
             Decl::Impl(impl_decl) => {
                 let _ = named_type(&impl_decl.for_type)?;
-                Rc::make_mut(&mut env.impls).push(build_impl_info(impl_decl)?);
+                let mut impl_info = build_impl_info(impl_decl)?;
+                if let Some(prefix) = module_prefix {
+                    impl_info.for_type_ref = qualify_type_ref(&impl_info.for_type_ref, prefix, &local_type_names);
+                    impl_info.for_type = named_type(&impl_info.for_type_ref)?;
+                    if !impl_info.trait_name.is_empty() {
+                        impl_info.trait_name = qualify_named_symbol(&impl_info.trait_name, prefix, &local_type_names);
+                    }
+                    impl_info.methods = impl_info
+                        .methods
+                        .iter()
+                        .map(|(name, sig)| (name.clone(), qualify_function_sig(sig, prefix, &local_type_names)))
+                        .collect();
+                    impl_info.associated_types = impl_info
+                        .associated_types
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), qualify_type_ref(ty, prefix, &local_type_names)))
+                        .collect();
+                }
+                Rc::make_mut(&mut env.impls).push(impl_info);
             }
             Decl::Function(function_decl) => {
                 if module_prefix.is_none() {
@@ -908,12 +932,16 @@ fn insert_unique_function(
     sig: &FunctionSig,
 ) -> Result<(), Stage0Error> {
     validate_function_sig(sig)?;
-    if table.insert(sig.name.clone(), sig.clone()).is_some() {
+    if let Some(existing) = table.get(&sig.name) {
+        if signatures_match(existing, sig) {
+            return Ok(());
+        }
         return Err(Stage0Error::semantic(
             sig.span,
             format!("duplicate function '{}'", sig.name),
         ));
     }
+    table.insert(sig.name.clone(), sig.clone());
     Ok(())
 }
 

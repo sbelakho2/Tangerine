@@ -1,7 +1,8 @@
 pub mod env;
 
 use crate::ast::decl::{
-    ContractKind, Decl, EnumDecl, FunctionClause, FunctionDecl, FunctionSig, Module, TraitDecl, VariantDecl,
+    ContractKind, Decl, EnumDecl, FieldDecl, FunctionClause, FunctionDecl, FunctionSig, Module, StructDecl, TraitDecl,
+    VariantDecl,
 };
 use crate::ast::expr::{BinaryOp, BranchGuard, CallArg, Expr, FunctionBody, Pattern, Stmt, UnaryOp};
 use crate::ast::types::TypeRef;
@@ -96,7 +97,7 @@ fn expr_kind(expr: &Expr) -> &'static str {
 }
 
 fn is_builtin_generic_type(name: &str) -> bool {
-    matches!(name, "Array" | "Vec" | "Map" | "Set" | "Option" | "Result" | "Range" | "Box")
+    matches!(name, "Array" | "Vec" | "List" | "Map" | "Set" | "Option" | "Result" | "Range" | "Box")
 }
 
 /// Create a synthetic Named type representing an unresolved external type.
@@ -345,9 +346,19 @@ pub fn check_method_call(
                 return Ok(sig);
             }
             let canonical = env.resolve_alias_path(name);
+            let canonical_bare = canonical.rsplit("::").next().unwrap_or(&canonical);
             if let Some(result) = env.impls
                 .iter()
-                .find(|impl_info| env.resolve_alias_path(&impl_info.for_type) == canonical && impl_info.methods.contains_key(method_name))
+                .find(|impl_info| {
+                    if !impl_info.methods.contains_key(method_name) {
+                        return false;
+                    }
+                    let impl_type = env.resolve_alias_path(&impl_info.for_type);
+                    let impl_bare = impl_type.rsplit("::").next().unwrap_or(&impl_type);
+                    impl_type == canonical
+                        || impl_info.for_type == canonical
+                        || impl_bare == canonical_bare
+                })
                 .and_then(|impl_info| {
                     let mut sig = impl_info.methods.get(method_name)?.clone();
                     // Substitute the impl's generic type params with the
@@ -570,8 +581,9 @@ pub fn type_check_function_bodies(module: &Module, env: &SemanticEnv) -> Result<
         match decl {
             Decl::Function(function) => type_check_function(function, env, None)?,
             Decl::Impl(impl_decl) => {
+                let self_type = resolved_impl_self_type(impl_decl, env);
                 for method in &impl_decl.methods {
-                    type_check_impl_method(method, env, &impl_decl.for_type, &impl_decl.type_params)?;
+                    type_check_impl_method(method, env, &self_type, &impl_decl.type_params)?;
                 }
             }
             Decl::Trait(trait_decl) => {
@@ -646,6 +658,14 @@ fn type_check_impl_method(
     type_check_function_with_locals(function, env, Some(self_type), &extra_type_params, &BTreeMap::new())
 }
 
+fn resolved_impl_self_type(impl_decl: &crate::ast::decl::ImplDecl, env: &SemanticEnv) -> TypeRef {
+    env.impls
+        .iter()
+        .find(|info| info.span == impl_decl.span)
+    .map(|info| info.for_type_ref.clone())
+    .unwrap_or_else(|| impl_decl.for_type.clone())
+}
+
 fn type_check_function_with_locals(
     function: &FunctionDecl,
     env: &SemanticEnv,
@@ -704,6 +724,7 @@ fn type_check_function_with_locals(
             } else {
                 function.sig.return_type.clone()
             };
+            fn_env.active_self_type = self_type.cloned();
             fn_env.fn_return_type = Some(fn_ret);
             locals.insert(function.sig.name.clone(), function_type(function));
             if let Some(TypeRef::Named { name, .. }) = self_type {
@@ -717,7 +738,18 @@ fn type_check_function_with_locals(
             }
             for param in &function.sig.params {
                 let binding_ty = if param.name == "self" {
-                    self_type.cloned().unwrap_or_else(|| param.ty.clone())
+                    match (&param.ty, self_type) {
+                        // Preserve &/ &mut wrapper from the declared param type.
+                        (TypeRef::Ref { mutable, span, .. }, Some(st)) => {
+                            TypeRef::Ref {
+                                inner: Box::new(st.clone()),
+                                mutable: *mutable,
+                                span: *span,
+                            }
+                        }
+                        (_, Some(st)) => st.clone(),
+                        _ => param.ty.clone(),
+                    }
                 } else {
                     param.ty.clone()
                 };
@@ -726,11 +758,32 @@ fn type_check_function_with_locals(
                     mutable_locals.insert(param.name.clone());
                 }
             }
+            if let Some(st) = self_type {
+                if !function.sig.params.iter().any(|param| param.name == "self") {
+                    locals.insert("self".to_string(), st.clone());
+                    mutable_locals.insert("self".to_string());
+                }
+            }
 
             type_check_function_clauses(&function.clauses, &locals, &fn_env, &function.sig.return_type)?;
 
             let actual = type_of_block(block, &locals, &mut mutable_locals, &fn_env, &function.sig.return_type)?;
             let expected_return = fn_env.fn_return_type.clone().unwrap_or_else(|| function.sig.return_type.clone());
+            // When the body type is Unit but contains explicit return
+            // statements (which are already typed against fn_return_type),
+            // accept it — the function diverges via returns.
+            if matches!(actual, TypeRef::Unit { .. })
+                && !matches!(expected_return, TypeRef::Unit { .. })
+                && block_has_return(&block.stmts)
+            {
+                return Ok(());
+            }
+            if matches!(actual, TypeRef::Unit { .. })
+                && !matches!(expected_return, TypeRef::Unit { .. })
+                && block_is_intrinsic_body(block)
+            {
+                return Ok(());
+            }
             // is_type_compatible handles Unit (unresolved) on either side as wildcard.
             if is_type_compatible(&actual, &expected_return) {
                 Ok(())
@@ -827,8 +880,9 @@ fn type_check_stmt(
                 Decl::Impl(impl_decl) => {
                     let impl_info = build_impl_info(impl_decl)?;
                     Rc::make_mut(&mut env.impls).push(impl_info);
+                    let self_type = resolved_impl_self_type(impl_decl, env);
                     for method in &impl_decl.methods {
-                        type_check_impl_method(method, env, &impl_decl.for_type, &impl_decl.type_params)?;
+                        type_check_impl_method(method, env, &self_type, &impl_decl.type_params)?;
                     }
                     Ok(())
                 }
@@ -1270,6 +1324,14 @@ fn type_of_expr(
         Expr::String { span, .. } => Ok(TypeRef::String { span: *span }),
         Expr::Bool { span, .. } => Ok(TypeRef::Bool { span: *span }),
         Expr::Array { elements, span } => type_of_array(elements, *span, locals, env, expected_return),
+        Expr::ArrayRepeat { value, span, .. } => {
+            let elem_type = type_of_expr(value, locals, env, expected_return)?;
+            Ok(TypeRef::Named {
+                name: format!("Vec[{}]", elem_type),
+                type_args: vec![elem_type],
+                span: *span,
+            })
+        }
         Expr::Tuple { elements, span } => {
             if elements.is_empty() {
                 Ok(TypeRef::Unit { span: *span })
@@ -1287,14 +1349,16 @@ fn type_of_expr(
         Expr::Name { name, span } => {
             if let Some(local) = locals.get(name) {
                 Ok(local.clone())
+            } else if name == "Self" {
+                Ok(env.active_self_type.clone().unwrap_or(TypeRef::SelfTy { span: *span }))
             } else if let Some(variant_ty) = type_of_variant_value(name, *span, env, expected_return)? {
                 Ok(variant_ty)
             } else {
                 env_lookup_function(name, *span, locals, env)
             }
         }
-        Expr::StructLiteral { name, fields, span } => {
-            type_of_struct_literal(name, fields, *span, locals, env, expected_return)
+        Expr::StructLiteral { name, type_args, fields, span, .. } => {
+            type_of_struct_literal(name, type_args, fields, *span, locals, env, expected_return)
         }
         Expr::Block { block, .. } => {
             let mut mutable_locals = BTreeSet::new();
@@ -1309,7 +1373,12 @@ fn type_of_expr(
             else_branch,
             span,
         } => type_of_if(branches, else_branch.as_deref(), *span, locals, env, expected_return),
-        Expr::Call { callee, args, span } => type_of_call(callee, args, *span, locals, env, expected_return),
+        Expr::Call {
+            callee,
+            type_args,
+            args,
+            span,
+        } => type_of_call(callee, type_args, args, *span, locals, env, expected_return),
         Expr::Index { base, index, span } => type_of_index(base, index, *span, locals, env, expected_return),
         Expr::Range {
             start,
@@ -1353,6 +1422,8 @@ fn type_of_expr(
             type_of_binary_expr(left, op, right, *span, locals, env, expected_return)
         }
         Expr::Unary { op, expr, span } => type_of_unary_expr(op, expr, *span, locals, env, expected_return),
+        Expr::Await { expr, .. } => type_of_expr(expr, locals, env, expected_return),
+        Expr::MacroCall { span, .. } => Ok(TypeRef::Unit { span: *span }),
     }
 }
 
@@ -1530,13 +1601,10 @@ fn type_of_unary_expr(
     let inner_ty = type_of_expr(expr, locals, env, expected_return)?;
     match op {
         crate::ast::expr::UnaryOp::Not => {
-            // Not applies to Bool directly, but also to integer types
-            // (bitwise not) and external types that may implement Not.
-            if same_type_shape(&inner_ty, &TypeRef::Bool { span })
-                || is_integer_type(&inner_ty)
-                || is_externally_typed(&inner_ty)
-            {
+            if same_type_shape(&inner_ty, &TypeRef::Bool { span }) {
                 Ok(TypeRef::Bool { span })
+            } else if is_integer_type(&inner_ty) || is_externally_typed(&inner_ty) {
+                Ok(inner_ty)
             } else {
                 Err(Stage0Error::semantic(span, format!("'!' requires Bool or Int operand, found {inner_ty}")))
             }
@@ -1555,8 +1623,8 @@ fn type_of_unary_expr(
         crate::ast::expr::UnaryOp::Neg => {
             if is_integer_type(&inner_ty) {
                 Ok(inner_ty)
-            } else if same_type_shape(&inner_ty, &TypeRef::Float { span }) {
-                Ok(TypeRef::Float { span })
+            } else if is_float_type(&inner_ty) {
+                Ok(inner_ty)
             } else {
                 Err(Stage0Error::semantic(
                     span,
@@ -1569,6 +1637,8 @@ fn type_of_unary_expr(
                 Ok(*inner.clone())
             } else if let TypeRef::Named { name, type_args, .. } = &inner_ty {
                 if name == "Box" && !type_args.is_empty() {
+                    Ok(type_args[0].clone())
+                } else if is_named_type(name, "Ptr") && !type_args.is_empty() {
                     Ok(type_args[0].clone())
                 } else {
                     // *val on a non-Box/non-Ref value type returns the value
@@ -1722,7 +1792,7 @@ fn prefer_non_plain_int(left_ty: &TypeRef, right_ty: &TypeRef) -> TypeRef {
 
 fn is_integer_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::Int { .. })
-        || matches!(ty, TypeRef::Named { name, .. } if is_builtin_named_type(bare_type_name(name)))
+    || matches!(ty, TypeRef::Named { name, .. } if is_builtin_integer_name(bare_type_name(name)))
 }
 
 #[allow(dead_code)]
@@ -1789,7 +1859,6 @@ fn type_check_assignment(
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<(), Stage0Error> {
-    let value_ty = type_of_expr(value, locals, env, expected_return)?;
     let target_ty = match target {
         Expr::Name { name, span } => {
             let global_key = env.canonical_map_key(name, &env.globals);
@@ -1824,6 +1893,16 @@ fn type_check_assignment(
             ensure_mutable_assignment_base(base, locals, mutable_locals, env)?;
             type_of_index(base, index, *span, locals, env, expected_return)?
         }
+        Expr::Unary { op: crate::ast::expr::UnaryOp::Deref, expr, span: _ } => {
+            let inner_ty = type_of_expr(expr, locals, env, expected_return)?;
+            match &inner_ty {
+                TypeRef::Ref { inner, .. } => *inner.clone(),
+                TypeRef::Named { name, type_args, .. } if is_named_type(name, "Ptr") && !type_args.is_empty() => {
+                    type_args[0].clone()
+                }
+                _ => inner_ty,
+            }
+        }
         other => {
             return Err(Stage0Error::semantic(
                 span,
@@ -1831,8 +1910,9 @@ fn type_check_assignment(
             ));
         }
     };
+    let value_ty = type_of_expr(value, locals, env, &target_ty)?;
 
-    if is_type_compatible(&value_ty, &target_ty) {
+    if is_assignment_type_compatible(&value_ty, &target_ty, env) {
         Ok(())
     } else if is_externally_typed(&value_ty) || is_externally_typed(&target_ty) {
         // External / unresolved types are accepted — the downstream Rust
@@ -1843,6 +1923,22 @@ fn type_check_assignment(
             span,
             format!("assignment type mismatch: expected {target_ty}, found {value_ty}"),
         ))
+    }
+}
+
+fn is_assignment_type_compatible(value_ty: &TypeRef, target_ty: &TypeRef, env: &SemanticEnv) -> bool {
+    if is_type_compatible(value_ty, target_ty) {
+        return true;
+    }
+
+    match (value_ty, target_ty) {
+        (_, TypeRef::Named { name, .. }) => env
+            .resolve_type_alias(name)
+            .is_some_and(|alias_ty| is_type_compatible(value_ty, &alias_ty)),
+        (TypeRef::Named { name, .. }, _) => env
+            .resolve_type_alias(name)
+            .is_some_and(|alias_ty| is_type_compatible(&alias_ty, target_ty)),
+        _ => false,
     }
 }
 
@@ -2004,12 +2100,15 @@ fn type_check_block_in_scope(
             eprintln!("[sema]     POST stmt[{index}] vm={vm} peak={peak} KB – {stmt_kind}");
         }
     }
-    block.tail.as_ref().map_or_else(
+    trailing_block_expr(block).map_or_else(
         || {
-            // Blocks ending in `return` diverge — they don't produce a value
-            // for the enclosing expression.  Return Unit so that
-            // unify_compatible_types can filter them out.
-            Ok(TypeRef::Unit { span: block.span })
+            if !matches!(expected_return, TypeRef::Unit { .. })
+                && (block_has_return(&block.stmts) || block_tail_diverges(&block.stmts))
+            {
+                Ok(expected_return.clone())
+            } else {
+                Ok(TypeRef::Unit { span: block.span })
+            }
         },
         |expr| {
             let ty = type_of_expr(expr, locals, env, expected_return)?;
@@ -2050,6 +2149,107 @@ fn predeclare_block_functions(block: &crate::ast::expr::BlockBody, locals: &mut 
         if let Stmt::Function { decl, .. } = stmt {
             locals.insert(decl.sig.name.clone(), function_type(decl));
         }
+    }
+}
+
+/// Check if a slice of statements contains at least one `return` statement
+/// (possibly nested inside loops, if/else, match).
+fn block_has_return(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return { .. } => return true,
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+                if block_has_return(&body.stmts) {
+                    return true;
+                }
+            }
+            Stmt::Expr { expr, .. } => {
+                if expr_has_return(expr) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn block_tail_diverges(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Loop { body, .. }) => !loop_body_has_break(body),
+        _ => false,
+    }
+}
+
+fn loop_body_has_break(body: &crate::ast::expr::BlockBody) -> bool {
+    stmts_have_break(&body.stmts)
+}
+
+fn stmts_have_break(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Break { .. } => return true,
+            Stmt::Expr { expr, .. } => {
+                if expr_has_break(expr) {
+                    return true;
+                }
+            }
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Return { .. }
+            | Stmt::While { .. }
+            | Stmt::Loop { .. }
+            | Stmt::For { .. }
+            | Stmt::Requires { .. }
+            | Stmt::Next { .. }
+            | Stmt::Use { .. }
+            | Stmt::Meta { .. }
+            | Stmt::Function { .. }
+            | Stmt::Decl { .. } => {}
+        }
+    }
+    false
+}
+
+fn block_is_intrinsic_body(block: &crate::ast::expr::BlockBody) -> bool {
+    block.tail.is_none()
+        && !block.stmts.is_empty()
+        && block.stmts.iter().all(|stmt| {
+            matches!(stmt,
+                Stmt::Meta { decl, .. }
+                    if decl.kind == crate::ast::decl::MetaKind::Annotation && decl.detail.starts_with("intrinsic(")
+            )
+        })
+}
+
+fn trailing_block_expr<'a>(block: &'a crate::ast::expr::BlockBody) -> Option<&'a Expr> {
+    block.tail.as_ref().or_else(|| match block.stmts.last() {
+        Some(Stmt::Expr { expr, .. }) => Some(expr),
+        _ => None,
+    })
+}
+
+fn expr_has_return(expr: &Expr) -> bool {
+    match expr {
+        Expr::If { branches, else_branch, .. } => {
+            branches.iter().any(|b| block_has_return(&b.body.stmts))
+                || else_branch.as_ref().is_some_and(|eb| block_has_return(&eb.stmts))
+        }
+        Expr::Match { arms, .. } => {
+            arms.iter().any(|arm| block_has_return(&arm.body.stmts))
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_break(expr: &Expr) -> bool {
+    match expr {
+        Expr::If { branches, else_branch, .. } => {
+            branches.iter().any(|b| stmts_have_break(&b.body.stmts))
+                || else_branch.as_ref().is_some_and(|eb| stmts_have_break(&eb.stmts))
+        }
+        Expr::Match { arms, .. } => arms.iter().any(|arm| stmts_have_break(&arm.body.stmts)),
+        _ => false,
     }
 }
 
@@ -2135,6 +2335,19 @@ fn infer_binding_type_from_future_stmts(
     let Pattern::Binding { name, .. } = pattern else {
         return inferred_ty.clone();
     };
+    if matches!(value, Expr::Closure { .. }) {
+        if let Some(Expr::Name { name: tail_name, .. }) = tail_expr {
+            if tail_name == name && !matches!(expected_return, TypeRef::Unit { .. }) {
+                return expected_return.clone();
+            }
+        }
+        let mut forward_locals = locals.clone();
+        forward_locals.insert(name.clone(), inferred_ty.clone());
+        if let Ok(Some(refined)) = infer_local_type_from_future_stmts(name, inferred_ty, stmts, tail_expr, &forward_locals, env, expected_return) {
+            return refined;
+        }
+        return inferred_ty.clone();
+    }
     // Only attempt forward-inference for unresolved generic named types
     // (e.g. Vec without type args from Vec::new()). Concrete monomorphic
     // types like String or DiagnosticEmitter do not need a whole-function
@@ -2142,7 +2355,12 @@ fn infer_binding_type_from_future_stmts(
     if !needs_forward_named_inference(inferred_ty, env) || !initializer_matches_forward_target(value, inferred_ty) {
         return inferred_ty.clone();
     }
-    match infer_local_type_from_future_stmts(name, inferred_ty, stmts, tail_expr, locals, env, expected_return) {
+    // Pre-seed the variable being refined into forward-inference locals so
+    // that code like `return files` inside a match arm can resolve the name
+    // instead of falling back to Unit.
+    let mut forward_locals = locals.clone();
+    forward_locals.insert(name.clone(), inferred_ty.clone());
+    match infer_local_type_from_future_stmts(name, inferred_ty, stmts, tail_expr, &forward_locals, env, expected_return) {
         Ok(Some(refined)) => refined,
         _ => inferred_ty.clone(),
     }
@@ -2159,13 +2377,20 @@ fn infer_local_type_from_future_stmts(
     expected_return: &TypeRef,
 ) -> Result<Option<TypeRef>, Stage0Error> {
     let mut scoped_locals = locals.clone();
-    for stmt in stmts {
+    for (idx, stmt) in stmts.iter().enumerate() {
         match infer_local_type_from_stmt(name, current_ty, stmt, &scoped_locals, env, expected_return) {
             Ok(Some(refined_ty)) => return Ok(Some(refined_ty)),
             Ok(None) => {}
             Err(_) => {} // Errors in unrelated code are non-fatal for forward inference.
         }
-        let _ = extend_inference_scope_from_stmt(stmt, &mut scoped_locals, env, expected_return);
+        let _ = extend_inference_scope_from_stmt(
+            stmt,
+            &stmts[idx + 1..],
+            tail_expr,
+            &mut scoped_locals,
+            env,
+            expected_return,
+        );
     }
     // When no refinement was found in the remaining stmts, also check the
     // block's tail expression (the last expression in a block that produces
@@ -2181,6 +2406,8 @@ fn infer_local_type_from_future_stmts(
 #[allow(dead_code)]
 fn extend_inference_scope_from_stmt(
     stmt: &Stmt,
+    following_stmts: &[Stmt],
+    tail_expr: Option<&Expr>,
     locals: &mut BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
@@ -2193,7 +2420,17 @@ fn extend_inference_scope_from_stmt(
     } = stmt
     {
         let value_context = inferred_type.as_ref().unwrap_or(expected_return);
-        let ty = type_of_expr(value, locals, env, value_context)?;
+        let inferred_ty = type_of_expr(value, locals, env, value_context)?;
+        let ty = infer_binding_type_from_future_stmts(
+            pattern,
+            value,
+            &inferred_ty,
+            following_stmts,
+            tail_expr,
+            locals,
+            env,
+            expected_return,
+        );
         let scoped = bind_pattern(pattern, &ty, locals, env)?;
         for (name, bound_ty) in scoped {
             locals.insert(name, bound_ty);
@@ -2288,8 +2525,15 @@ fn infer_local_type_from_block(
     match &block.tail {
         Some(tail_expr) => {
             let mut tail_locals = locals.clone();
-            for stmt in &block.stmts {
-                let _ = extend_inference_scope_from_stmt(stmt, &mut tail_locals, env, expected_return);
+            for (idx, stmt) in block.stmts.iter().enumerate() {
+                let _ = extend_inference_scope_from_stmt(
+                    stmt,
+                    &block.stmts[idx + 1..],
+                    block.tail.as_ref(),
+                    &mut tail_locals,
+                    env,
+                    expected_return,
+                );
             }
             infer_local_type_from_expr(name, current_ty, tail_expr, &tail_locals, env, expected_return)
         }
@@ -2316,6 +2560,10 @@ fn infer_local_type_from_expr(
                     return Ok(Some(refined_ty));
                 }
             }
+            Ok(None)
+        }
+        Expr::ArrayRepeat { value, .. } => {
+            infer_local_type_from_expr(name, current_ty, value, locals, env, expected_return)?;
             Ok(None)
         }
         Expr::StructLiteral { fields, .. } => {
@@ -2358,6 +2606,8 @@ fn infer_local_type_from_expr(
         | Expr::String { .. }
         | Expr::Bool { .. }
         | Expr::Name { .. } => Ok(None),
+        Expr::Await { expr, .. } => infer_local_type_from_expr(name, current_ty, expr, locals, env, expected_return),
+        Expr::MacroCall { .. } => Ok(None),
     }
 }
 
@@ -2594,14 +2844,14 @@ fn merge_existing_bindings(
 
 fn type_of_struct_literal(
     name: &str,
+    explicit_type_args: &[TypeRef],
     fields: &[(String, Expr)],
     span: Span,
     locals: &BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<TypeRef, Stage0Error> {
-    let (result_name, type_param_names, declared_fields) = if let Some(struct_key) = env.canonical_map_key(name, &env.structs) {
-        let struct_decl = &env.structs[&struct_key];
+    let (result_name, type_param_names, declared_fields): (String, Vec<String>, &Vec<FieldDecl>) = if let Some((struct_key, struct_decl)) = resolve_struct_decl_for_fields(name, fields, env) {
         (
             struct_key,
             type_param_list_names(&struct_decl.type_params),
@@ -2649,49 +2899,60 @@ fn type_of_struct_literal(
         });
     };
 
-    let mut inferred = seed_type_args_from_expected_return(expected_return, &result_name, type_param_names.len(), env)
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    while inferred.len() < type_param_names.len() {
-        inferred.push(None);
-    }
-
-    for declared_field in declared_fields {
-        let found = fields
-            .iter()
-            .find(|(field_name, _)| field_name == &declared_field.name || field_alias(field_name) == Some(&declared_field.name));
-        let (_, value) = match found {
-            Some(pair) => pair,
-            None if declared_field.name.starts_with('_') => continue,
-            None => {
-                // Missing field — Tangerine supports default field values and
-                // optional fields, so a missing field is not an error at this
-                // stage.  The self-hosted compiler performs full field checking.
-                continue;
-            }
-        };
-        let actual = type_of_expr(value, locals, env, expected_return)?;
-        if !type_param_names.is_empty() {
-            unify_type_arg(&declared_field.ty, &actual, &type_param_names, &mut inferred)?;
+    let type_args = if !explicit_type_args.is_empty() {
+        if explicit_type_args.len() != type_param_names.len() {
+            return Err(Stage0Error::semantic(
+                span,
+                format!(
+                    "struct literal '{name}' expected {} type arguments, found {}",
+                    type_param_names.len(),
+                    explicit_type_args.len()
+                ),
+            ));
         }
-    }
+        explicit_type_args.to_vec()
+    } else {
+        let mut inferred = seed_type_args_from_expected_return(expected_return, &result_name, type_param_names.len(), env)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        while inferred.len() < type_param_names.len() {
+            inferred.push(None);
+        }
 
-    let type_args = inferred
-        .into_iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            candidate.ok_or_else(|| {
-                Stage0Error::semantic(
-                    span,
-                    format!(
-                        "could not infer type parameter '{}' for struct literal '{name}'",
-                        type_param_names[index]
-                    ),
-                )
+        for declared_field in declared_fields {
+            let found = fields
+                .iter()
+                .find(|(field_name, _)| field_name == &declared_field.name || field_alias(field_name) == Some(&declared_field.name));
+            let (_, value) = match found {
+                Some(pair) => pair,
+                None if declared_field.name.starts_with('_') => continue,
+                None => {
+                    continue;
+                }
+            };
+            let actual = type_of_expr(value, locals, env, expected_return)?;
+            if !type_param_names.is_empty() {
+                unify_type_arg(&declared_field.ty, &actual, &type_param_names, &mut inferred)?;
+            }
+        }
+
+        inferred
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                candidate.ok_or_else(|| {
+                    Stage0Error::semantic(
+                        span,
+                        format!(
+                            "could not infer type parameter '{}' for struct literal '{name}'",
+                            type_param_names[index]
+                        ),
+                    )
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     for declared_field in declared_fields {
         let found = fields
@@ -2747,6 +3008,11 @@ fn seed_type_args_from_expected_return(
     env: &SemanticEnv,
 ) -> Vec<TypeRef> {
     match expected_return {
+        TypeRef::SelfTy { .. } => env
+            .active_self_type
+            .as_ref()
+            .map(|self_ty| seed_type_args_from_expected_return(self_ty, result_name, type_param_count, env))
+            .unwrap_or_default(),
         TypeRef::Named {
             name,
             type_args,
@@ -2887,6 +3153,7 @@ fn function_type_from_sig(sig: &crate::ast::decl::FunctionSig) -> TypeRef {
 
 fn type_of_call(
     callee: &Expr,
+    explicit_type_args: &[TypeRef],
     args: &[CallArg],
     span: Span,
     locals: &BTreeMap<String, TypeRef>,
@@ -2896,10 +3163,11 @@ fn type_of_call(
     match callee {
         Expr::Call {
             callee: inner_callee,
+            type_args: inner_type_args,
             args: inner_args,
             span: inner_span,
         } => {
-            let inner_ty = type_of_call(inner_callee, inner_args, *inner_span, locals, env, expected_return)?;
+            let inner_ty = type_of_call(inner_callee, inner_type_args, inner_args, *inner_span, locals, env, expected_return)?;
             match inner_ty {
                 TypeRef::Function {
                     params,
@@ -2921,7 +3189,7 @@ fn type_of_call(
                 return Ok(intrinsic_ty);
             }
             if let Some(sig) = lookup_associated_function(name, env) {
-                return apply_callable_signature(&sig, args, span, locals, env, expected_return);
+                return apply_callable_signature(&sig, explicit_type_args, args, span, locals, env, expected_return);
             }
             if let Some(TypeRef::Function {
                 params,
@@ -2936,26 +3204,50 @@ fn type_of_call(
             let sig = if let Some(sig) = env.functions.get(&function_key) {
                 sig
             } else if name.contains("::") {
-                // Module-qualified function — try suffix matching across the env.
-                let bare = name.rsplit("::").next().unwrap_or(name);
-                let found = env.functions.iter().find(|(k, _)| {
-                    k.rsplit("::").next().map_or(false, |kb| kb == bare)
-                        || k.ends_with(&format!("::{bare}"))
+                // Module-qualified function — try full qualified suffix first.
+                let found_full = env.functions.iter().find(|(k, _)| {
+                    *k == name || k.ends_with(&format!("::{name}"))
                 });
-                if let Some((_, sig)) = found {
+                if let Some((_, sig)) = found_full {
                     sig
                 } else {
-                    // Truly unresolvable external — create minimal fallback.
-                    owned_fallback = FunctionSig {
-                        name: name.to_string(),
-                        public: false,
-                        type_params: Vec::new(),
-                        params: Vec::new(),
-                        return_type: unresolved_external_type(span),
-                        where_clause: Vec::new(),
-                        span,
-                    };
-                    &owned_fallback
+                    // Fall back to bare method name, but only if unambiguous.
+                    let bare = name.rsplit("::").next().unwrap_or(name);
+                    let mut matches = env.functions.iter().filter(|(k, _)| {
+                        k.rsplit("::").next().map_or(false, |kb| kb == bare)
+                            || k.ends_with(&format!("::{bare}"))
+                    });
+                    let first_match = matches.next();
+                    if let Some((_, sig)) = first_match {
+                        if matches.next().is_none() {
+                            // Single unambiguous match — use it.
+                            sig
+                        } else {
+                            // Ambiguous (multiple ::new etc.) — use external fallback.
+                            owned_fallback = FunctionSig {
+                                name: name.to_string(),
+                                public: false,
+                                type_params: Vec::new(),
+                                params: Vec::new(),
+                                return_type: unresolved_external_type(span),
+                                where_clause: Vec::new(),
+                                span,
+                            };
+                            &owned_fallback
+                        }
+                    } else {
+                        // No match at all — use external fallback.
+                        owned_fallback = FunctionSig {
+                            name: name.to_string(),
+                            public: false,
+                            type_params: Vec::new(),
+                            params: Vec::new(),
+                            return_type: unresolved_external_type(span),
+                            where_clause: Vec::new(),
+                            span,
+                        };
+                        &owned_fallback
+                    }
                 }
             } else {
                 // Bare function not found — may be a forward reference to
@@ -2997,48 +3289,11 @@ fn type_of_call(
                 }
                 return Ok(sig.return_type.clone());
             }
-            let mut inferred = vec![None; sig.type_params.len()];
-            let type_param_names = type_param_list_names(&sig.type_params);
-            for (arg, param) in args.iter().zip(&sig.params) {
-                let arg_ty = if let Expr::Closure { closure, .. } = &arg.value {
-                    type_of_closure(closure, arg.value.span(), locals, env, expected_return, Some(&param.ty))?
-                } else {
-                    type_of_expr(&arg.value, locals, env, expected_return)?
-                };
-                if sig.type_params.is_empty() {
-                    if !is_type_compatible(&arg_ty, &param.ty)
-                        && !is_externally_typed(&arg_ty)
-                        && !is_externally_typed(&param.ty)
-                    {
-                        return Err(Stage0Error::semantic(
-                            arg.value.span(),
-                            format!(
-                                "argument type mismatch for '{}': expected {}, found {arg_ty}",
-                                sig.name, param.ty
-                            ),
-                        ));
-                    }
-                } else if let Err(_error) = unify_type_arg(&param.ty, &arg_ty, &type_param_names, &mut inferred) {
-                    // Type argument unification failed — the actual type may
-                    // be an alias or external reference that cannot be unified.
-                    // Accept and continue inferring remaining type parameters.
-                }
-            }
-            let type_args = inferred
-                .into_iter()
-                .enumerate()
-                .map(|(index, candidate)| {
-                    candidate.ok_or_else(|| {
-                        Stage0Error::semantic(
-                            span,
-                            format!("could not infer type argument '{}' for function '{name}'", sig.type_params[index].name),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(substitute_type_params(&sig.return_type, &type_param_names, &type_args))
+            apply_callable_signature(sig, explicit_type_args, args, span, locals, env, expected_return)
         }
-        Expr::Field { base, field, .. } => type_of_method_call(base, field, args, span, locals, env, expected_return),
+        Expr::Field { base, field, .. } => {
+            type_of_method_call(base, field, explicit_type_args, args, span, locals, env, expected_return)
+        }
         Expr::Unary {
             op: UnaryOp::Deref,
             expr,
@@ -3099,7 +3354,12 @@ fn lookup_associated_function(name: &str, env: &SemanticEnv) -> Option<FunctionS
                 false
             }
         })
-        .and_then(|impl_info| impl_info.methods.get(method_name).cloned());
+        .and_then(|impl_info| {
+            impl_info
+                .methods
+                .get(method_name)
+                .map(|sig| substitute_self_type_in_sig(sig, &impl_info.for_type_ref))
+        });
     if from_impls.is_some() {
         return from_impls;
     }
@@ -3144,9 +3404,13 @@ fn field_alias(name: &str) -> Option<&str> {
 fn is_builtin_named_type(name: &str) -> bool {
     matches!(
         name,
-        "UInt"
+        "String"
+            | "Bool"
+            | "Char"
+            | "UInt"
             | "U8"
             | "u8"
+            | "Byte"
             | "u16"
             | "u32"
             | "u64"
@@ -3163,6 +3427,77 @@ fn is_builtin_named_type(name: &str) -> bool {
             | "str"
     )
         || is_builtin_generic_type(name)
+}
+
+fn builtin_type_name_ref(name: &str, span: Span) -> Option<TypeRef> {
+    match name {
+        "String" => Some(TypeRef::String { span }),
+        "Bool" => Some(TypeRef::Bool { span }),
+        "Char" => Some(TypeRef::Char { span }),
+        "Float" => Some(TypeRef::Float { span }),
+        n if is_builtin_named_type(n) => Some(TypeRef::Named {
+            name: n.to_string(),
+            type_args: Vec::new(),
+            span,
+        }),
+        _ => None,
+    }
+}
+
+fn associated_type_base_name(base: &Expr, env: &SemanticEnv) -> Option<String> {
+    let Expr::Name { name, .. } = base else {
+        return None;
+    };
+
+    if is_builtin_named_type(name) {
+        return Some(name.clone());
+    }
+    if let Some(enum_key) = env.canonical_map_key(name, &env.enums) {
+        return Some(enum_key);
+    }
+    if let Some(struct_key) = env.canonical_map_key(name, &env.structs) {
+        return Some(struct_key);
+    }
+
+    None
+}
+
+fn builtin_associated_constant_type(base_ty: &TypeRef, field: &str, span: Span) -> Option<TypeRef> {
+    match base_ty {
+        TypeRef::Float { .. } => match field {
+            "MAX" | "MIN" | "EPSILON" => Some(TypeRef::Float { span }),
+            _ => None,
+        },
+        TypeRef::Int { .. } => match field {
+            "MAX" | "MIN" => Some(TypeRef::Int { span }),
+            _ => None,
+        },
+        TypeRef::Named { name, type_args, .. } if type_args.is_empty() => {
+            let bare = bare_type_name(name);
+            if is_builtin_integer_name(bare) {
+                match field {
+                    "MAX" | "MIN" => Some(TypeRef::Named {
+                        name: name.clone(),
+                        type_args: Vec::new(),
+                        span,
+                    }),
+                    _ => None,
+                }
+            } else if is_builtin_float_name(bare) {
+                match field {
+                    "MAX" | "MIN" | "EPSILON" => Some(TypeRef::Named {
+                        name: name.clone(),
+                        type_args: Vec::new(),
+                        span,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn integer_literal_type(value: &str, span: Span) -> TypeRef {
@@ -3226,6 +3561,17 @@ fn apply_function_type(
     Ok(return_type.clone())
 }
 
+fn resolve_closure_expected_fn_type(ty: &TypeRef, env: &SemanticEnv) -> Option<TypeRef> {
+    match ty {
+        TypeRef::Function { .. } => Some(ty.clone()),
+        TypeRef::Named { name, .. } => env.resolve_type_alias(name).and_then(|alias_ty| match alias_ty {
+            TypeRef::Function { .. } => Some(alias_ty),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 fn type_of_closure(
     closure: &crate::ast::expr::ClosureExpr,
     span: Span,
@@ -3234,20 +3580,16 @@ fn type_of_closure(
     expected_return: &TypeRef,
     expected_fn_type: Option<&TypeRef>,
 ) -> Result<TypeRef, Stage0Error> {
+    let resolved_expected_fn = expected_fn_type
+        .and_then(|ty| resolve_closure_expected_fn_type(ty, env))
+        .or_else(|| resolve_closure_expected_fn_type(expected_return, env));
     let (param_types, closure_return) = if let Some(TypeRef::Function {
         params,
         return_type,
         ..
-    }) = expected_fn_type
+    }) = resolved_expected_fn
     {
-        (params.clone(), return_type.as_ref().clone())
-    } else if let TypeRef::Function {
-        params,
-        return_type,
-        ..
-    } = expected_return
-    {
-        (params.clone(), return_type.as_ref().clone())
+        (params, return_type.as_ref().clone())
     } else {
         let inferred_params = closure
             .params
@@ -3276,21 +3618,26 @@ fn type_of_closure(
     }
     let mut mutable_locals = BTreeSet::new();
     let actual_return = type_of_block(&closure.body, &scoped, &mut mutable_locals, env, &closure_return)?;
-    if !same_type_shape(&closure_return, &TypeRef::Unit { span: closure_return.span() })
-        && !is_type_compatible(&actual_return, &closure_return)
+    let resolved_return = if is_unresolved_generic_placeholder(&closure_return, env) {
+        actual_return.clone()
+    } else {
+        closure_return.clone()
+    };
+    if !same_type_shape(&resolved_return, &TypeRef::Unit { span: resolved_return.span() })
+        && !is_type_compatible(&actual_return, &resolved_return)
     {
         // Closure return type mismatch — accept when either side involves
         // external types, otherwise report an error.
-        if !is_externally_typed(&actual_return) && !is_externally_typed(&closure_return) {
+        if !is_externally_typed(&actual_return) && !is_externally_typed(&resolved_return) {
             return Err(Stage0Error::semantic(
                 span,
-                format!("closure return type mismatch: expected {closure_return}, found {actual_return}"),
+                format!("closure return type mismatch: expected {resolved_return}, found {actual_return}"),
             ));
         }
     }
     Ok(TypeRef::Function {
         params: param_types,
-        return_type: Box::new(closure_return),
+        return_type: Box::new(resolved_return),
         span,
     })
 }
@@ -3298,22 +3645,62 @@ fn type_of_closure(
 fn type_of_method_call(
     base: &Expr,
     field: &str,
+    explicit_type_args: &[TypeRef],
     args: &[CallArg],
     span: Span,
     locals: &BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<TypeRef, Stage0Error> {
-    let base_ty = type_of_expr(base, locals, env, expected_return)?;
+    if let Some(type_name) = associated_type_base_name(base, env) {
+        let associated_name = format!("{type_name}::{field}");
+        if let Some(variant_ty) = type_of_variant_constructor(&associated_name, args, span, locals, env, expected_return)? {
+            return Ok(variant_ty);
+        }
+        if let Some(intrinsic_ty) = type_of_intrinsic_name_call(&associated_name, args, span, locals, env, expected_return)? {
+            return Ok(intrinsic_ty);
+        }
+        if let Some(sig) = lookup_associated_function(&associated_name, env) {
+            return apply_callable_signature(&sig, explicit_type_args, args, span, locals, env, expected_return);
+        }
+    }
+
+    let base_ty = if let Expr::Name { name, .. } = base {
+        if let Some(builtin_ty) = builtin_type_name_ref(name, base.span()) {
+            builtin_ty
+        } else if is_builtin_generic_type(name) {
+            TypeRef::Named {
+                name: name.clone(),
+                type_args: Vec::new(),
+                span: base.span(),
+            }
+        } else if let Some(enum_key) = env.canonical_map_key(name, &env.enums) {
+            TypeRef::Named {
+                name: enum_key,
+                type_args: Vec::new(),
+                span: base.span(),
+            }
+        } else if let Some(struct_key) = env.canonical_map_key(name, &env.structs) {
+            TypeRef::Named {
+                name: struct_key,
+                type_args: Vec::new(),
+                span: base.span(),
+            }
+        } else {
+            type_of_expr(base, locals, env, expected_return)?
+        }
+    } else {
+        type_of_expr(base, locals, env, expected_return)?
+    };
     let base_ty = refine_empty_collection_type(&base_ty, base, locals);
     if let Some(inferred) = infer_intrinsic_method_sig(&base_ty, field, args, span, locals, env, expected_return)? {
-        return apply_callable_signature(&inferred, args, span, locals, env, expected_return);
+        return apply_callable_signature(&inferred, explicit_type_args, args, span, locals, env, expected_return);
     }
     if let Some(intrinsic) = intrinsic_method_sig(&base_ty, field, span) {
-        return apply_callable_signature(&intrinsic, args, span, locals, env, expected_return);
+        return apply_callable_signature(&intrinsic, explicit_type_args, args, span, locals, env, expected_return);
     }
     match check_method_call(&base_ty, field, env) {
-        Ok(sig) => apply_callable_signature(&sig, args, span, locals, env, expected_return),
+        Ok(sig) => apply_callable_signature(&sig, explicit_type_args, args, span, locals, env, expected_return),
         Err(method_error) if args.is_empty() => {
             type_of_field_from_type(&base_ty, field, span, env).or(Err(method_error))
         }
@@ -3356,8 +3743,9 @@ fn refine_empty_collection_type(
 
 fn apply_callable_signature(
     sig: &FunctionSig,
+    explicit_type_args: &[TypeRef],
     args: &[CallArg],
-    _span: Span,
+    span: Span,
     locals: &BTreeMap<String, TypeRef>,
     env: &SemanticEnv,
     expected_return: &TypeRef,
@@ -3381,23 +3769,133 @@ fn apply_callable_signature(
         }
         return Ok(sig.return_type.clone());
     }
+    let type_param_names = callable_type_param_names(sig, env);
+    let has_callable_type_params = !type_param_names.is_empty();
+    if !explicit_type_args.is_empty() && explicit_type_args.len() != type_param_names.len() {
+        return Err(Stage0Error::semantic(
+            span,
+            format!(
+                "function '{}' expected {} type arguments, found {}",
+                sig.name,
+                type_param_names.len(),
+                explicit_type_args.len()
+            ),
+        ));
+    }
+    let mut inferred = vec![None; type_param_names.len()];
+    for (index, type_arg) in explicit_type_args.iter().enumerate() {
+        inferred[index] = Some(type_arg.clone());
+    }
     for (arg, param) in args.iter().zip(params) {
-        let arg_ty = if let Expr::Closure { closure, .. } = &arg.value {
-            type_of_closure(closure, arg.value.span(), locals, env, expected_return, Some(&param.ty))?
+        let expected_param_ty = if !has_callable_type_params {
+            param.ty.clone()
         } else {
-            type_of_expr(&arg.value, locals, env, &param.ty)?
+            let provisional_type_args = inferred
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    candidate.clone().unwrap_or_else(|| TypeRef::Named {
+                        name: type_param_names[index].clone(),
+                        type_args: Vec::new(),
+                        span,
+                    })
+                })
+                .collect::<Vec<_>>();
+            substitute_type_params(&param.ty, &type_param_names, &provisional_type_args)
         };
-        if !is_type_compatible(&arg_ty, &param.ty)
-            && !is_externally_typed(&arg_ty)
-            && !is_externally_typed(&param.ty)
-        {
-            return Err(Stage0Error::semantic(
-                arg.value.span(),
-                format!("method argument type mismatch: expected {}, found {arg_ty}", param.ty),
-            ));
+        let arg_ty = if let Expr::Closure { closure, .. } = &arg.value {
+            type_of_closure(closure, arg.value.span(), locals, env, expected_return, Some(&expected_param_ty))?
+        } else {
+            type_of_expr(&arg.value, locals, env, &expected_param_ty)?
+        };
+        if !has_callable_type_params || !explicit_type_args.is_empty() {
+            if !is_type_compatible(&arg_ty, &expected_param_ty)
+                && !is_externally_typed(&arg_ty)
+                && !is_externally_typed(&expected_param_ty)
+            {
+                return Err(Stage0Error::semantic(
+                    arg.value.span(),
+                    format!("method argument type mismatch: expected {}, found {arg_ty}", expected_param_ty),
+                ));
+            }
+        } else if let Err(_error) = unify_type_arg(&param.ty, &arg_ty, &type_param_names, &mut inferred) {
+            // Accept unresolved aliases/external types and continue inferring.
         }
     }
-    Ok(sig.return_type.clone())
+    let type_args = inferred
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            candidate.unwrap_or_else(|| TypeRef::Named {
+                name: type_param_names[index].clone(),
+                type_args: Vec::new(),
+                span,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(substitute_type_params(&sig.return_type, &type_param_names, &type_args))
+}
+
+fn callable_type_param_names(sig: &FunctionSig, env: &SemanticEnv) -> Vec<String> {
+    let mut names = type_param_list_names(&sig.type_params);
+    let mut seen = names.iter().cloned().collect::<BTreeSet<_>>();
+    let params = if sig.params.first().is_some_and(|param| param.name == "self") {
+        &sig.params[1..]
+    } else {
+        &sig.params[..]
+    };
+    for param in params {
+        collect_callable_type_params(&param.ty, env, &mut names, &mut seen);
+    }
+    collect_callable_type_params(&sig.return_type, env, &mut names, &mut seen);
+    names
+}
+
+fn collect_callable_type_params(
+    ty: &TypeRef,
+    env: &SemanticEnv,
+    names: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    match ty {
+        TypeRef::Named { name, type_args, .. } => {
+            for type_arg in type_args {
+                collect_callable_type_params(type_arg, env, names, seen);
+            }
+            if !type_args.is_empty() || name.contains("::") || name == "Self" {
+                return;
+            }
+            let resolved = env.resolve_alias_path(name);
+            if is_builtin_named_type(name)
+                || env.structs.contains_key(&resolved)
+                || env.enums.contains_key(&resolved)
+                || env.type_aliases.contains_key(&resolved)
+                || env.traits.contains_key(&resolved)
+                || !seen.insert(name.clone())
+            {
+                return;
+            }
+            names.push(name.clone());
+        }
+        TypeRef::Tuple { elements, .. } => {
+            for element in elements {
+                collect_callable_type_params(element, env, names, seen);
+            }
+        }
+        TypeRef::Array { element, .. } => collect_callable_type_params(element, env, names, seen),
+        TypeRef::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                collect_callable_type_params(param, env, names, seen);
+            }
+            collect_callable_type_params(return_type, env, names, seen);
+        }
+        TypeRef::Ref { inner, .. } => collect_callable_type_params(inner, env, names, seen),
+        _ => {}
+    }
 }
 
 fn infer_intrinsic_method_sig(
@@ -3430,14 +3928,120 @@ fn infer_string_method_sig(
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Option<Result<FunctionSig, Stage0Error>> {
-    if !matches!(base_ty, TypeRef::String { .. }) {
+    if !is_string_like_type(base_ty) {
         return None;
     }
     match (field, args) {
         ("trim_end", [arg]) => Some(infer_string_trim_end_sig(base_ty, arg, span, locals, env, expected_return)),
         ("replace", [from, to]) => Some(infer_string_replace_sig(base_ty, from, to, span, locals, env, expected_return)),
+        ("contains" | "starts_with" | "ends_with", [arg]) => {
+            Some(infer_string_char_predicate_sig(base_ty, field, arg, span, locals, env, expected_return))
+        }
+        ("find" | "rfind" | "index_of" | "last_index_of", [arg]) => {
+            Some(infer_string_char_find_sig(base_ty, field, arg, span, locals, env, expected_return))
+        }
+        ("split", [arg]) => Some(infer_string_split_sig(base_ty, field, arg, span, locals, env, expected_return)),
+        ("splitn", [count, sep]) => Some(infer_string_splitn_sig(base_ty, field, count, sep, span, locals, env, expected_return)),
         _ => None,
     }
+}
+
+fn infer_string_char_predicate_sig(
+    base_ty: &TypeRef,
+    field: &str,
+    arg: &CallArg,
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<FunctionSig, Stage0Error> {
+    let arg_ty = type_of_expr(&arg.value, locals, env, expected_return)?;
+    let value_ty = if matches!(arg_ty, TypeRef::Char { .. }) {
+        TypeRef::Char { span }
+    } else {
+        TypeRef::String { span }
+    };
+    Ok(intrinsic_sig(
+        field,
+        vec![self_param(base_ty.clone(), span), plain_param("value", value_ty, span)],
+        TypeRef::Bool { span },
+        span,
+    ))
+}
+
+fn infer_string_char_find_sig(
+    base_ty: &TypeRef,
+    field: &str,
+    arg: &CallArg,
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<FunctionSig, Stage0Error> {
+    let arg_ty = type_of_expr(&arg.value, locals, env, expected_return)?;
+    let value_ty = if matches!(arg_ty, TypeRef::Char { .. }) {
+        TypeRef::Char { span }
+    } else {
+        TypeRef::String { span }
+    };
+    Ok(intrinsic_sig(
+        field,
+        vec![self_param(base_ty.clone(), span), plain_param("value", value_ty, span)],
+        named_type("Option", vec![TypeRef::Int { span }], span),
+        span,
+    ))
+}
+
+fn infer_string_split_sig(
+    base_ty: &TypeRef,
+    field: &str,
+    arg: &CallArg,
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<FunctionSig, Stage0Error> {
+    let arg_ty = type_of_expr(&arg.value, locals, env, expected_return)?;
+    let sep_ty = if matches!(arg_ty, TypeRef::Char { .. }) {
+        TypeRef::Char { span }
+    } else {
+        TypeRef::String { span }
+    };
+    Ok(intrinsic_sig(
+        field,
+        vec![self_param(base_ty.clone(), span), plain_param("sep", sep_ty, span)],
+        named_type("Vec", vec![TypeRef::String { span }], span),
+        span,
+    ))
+}
+
+fn infer_string_splitn_sig(
+    base_ty: &TypeRef,
+    field: &str,
+    count: &CallArg,
+    sep: &CallArg,
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+) -> Result<FunctionSig, Stage0Error> {
+    let _ = type_of_expr(&count.value, locals, env, expected_return)?;
+    let sep_ty = type_of_expr(&sep.value, locals, env, expected_return)?;
+    let sep_ty = if matches!(sep_ty, TypeRef::Char { .. }) {
+        TypeRef::Char { span }
+    } else {
+        TypeRef::String { span }
+    };
+    Ok(intrinsic_sig(
+        field,
+        vec![
+            self_param(base_ty.clone(), span),
+            plain_param("count", TypeRef::Int { span }, span),
+            plain_param("sep", sep_ty, span),
+        ],
+        named_type("Vec", vec![TypeRef::String { span }], span),
+        span,
+    ))
 }
 
 fn infer_array_method_sig(
@@ -3599,6 +4203,9 @@ fn infer_option_method_sig(
     match base_ty {
         TypeRef::Named { name, type_args, .. } if is_named_type(name, "Option") && type_args.len() == 1 && field == "ok_or" && args.len() == 1 => {
             Some(infer_option_ok_or_sig(base_ty, args, span, locals, env, expected_return, &type_args[0]))
+        }
+        TypeRef::Named { name, type_args, .. } if is_named_type(name, "Option") && type_args.len() == 1 && field == "and_then" && args.len() == 1 => {
+            Some(infer_option_and_then_sig(base_ty, args, span, locals, env, expected_return, &type_args[0]))
         }
         TypeRef::Named { name, type_args, .. } if is_named_type(name, "Option") && type_args.len() == 1 && field == "map" && args.len() == 1 => {
             Some(infer_option_map_sig(base_ty, args, span, locals, env, expected_return, &type_args[0]))
@@ -3767,7 +4374,24 @@ fn infer_empty_map_lookup_sig(
     expected_return: &TypeRef,
 ) -> Result<FunctionSig, Stage0Error> {
     let key_ty = type_of_expr(&args[0].value, locals, env, expected_return)?;
-    let value_ty = infer_empty_map_value_type(field, span, expected_return);
+    let (lookup_key_ty, value_ty) = match base_ty {
+        TypeRef::Named { type_args, .. } if type_args.len() == 2 => {
+            let existing_key_ty = &type_args[0];
+            let existing_value_ty = &type_args[1];
+            let refined_key_ty = if matches!(existing_key_ty, TypeRef::Unit { .. }) {
+                key_ty.clone()
+            } else {
+                existing_key_ty.clone()
+            };
+            let refined_value_ty = if matches!(existing_value_ty, TypeRef::Unit { .. }) {
+                infer_empty_map_value_type(field, span, expected_return)
+            } else {
+                existing_value_ty.clone()
+            };
+            (refined_key_ty, refined_value_ty)
+        }
+        _ => (key_ty.clone(), infer_empty_map_value_type(field, span, expected_return)),
+    };
     Ok(match field {
         "get" => intrinsic_sig(
             field,
@@ -3776,7 +4400,7 @@ fn infer_empty_map_lookup_sig(
                 plain_param(
                     "key",
                     TypeRef::Ref {
-                        inner: Box::new(key_ty),
+                        inner: Box::new(lookup_key_ty),
                         mutable: false,
                         span,
                     },
@@ -3793,7 +4417,7 @@ fn infer_empty_map_lookup_sig(
                 plain_param(
                     "key",
                     TypeRef::Ref {
-                        inner: Box::new(key_ty),
+                        inner: Box::new(lookup_key_ty),
                         mutable: false,
                         span,
                     },
@@ -3810,7 +4434,7 @@ fn infer_empty_map_lookup_sig(
                 plain_param(
                     "key",
                     TypeRef::Ref {
-                        inner: Box::new(key_ty),
+                        inner: Box::new(lookup_key_ty),
                         mutable: false,
                         span,
                     },
@@ -3827,7 +4451,7 @@ fn infer_empty_map_lookup_sig(
                 plain_param(
                     "key",
                     TypeRef::Ref {
-                        inner: Box::new(key_ty),
+                        inner: Box::new(lookup_key_ty),
                         mutable: false,
                         span,
                     },
@@ -3953,6 +4577,64 @@ fn infer_option_map_sig(
                 TypeRef::Function {
                     params: vec![item_ty.clone()],
                     return_type: Box::new(result_item_ty.clone()),
+                    span,
+                },
+                span,
+            ),
+        ],
+        named_type("Option", vec![result_item_ty], span),
+        span,
+    ))
+}
+
+fn infer_option_and_then_sig(
+    base_ty: &TypeRef,
+    args: &[CallArg],
+    span: Span,
+    locals: &BTreeMap<String, TypeRef>,
+    env: &SemanticEnv,
+    expected_return: &TypeRef,
+    item_ty: &TypeRef,
+) -> Result<FunctionSig, Stage0Error> {
+    let mapper_ty = if let Expr::Closure { closure, .. } = &args[0].value {
+        infer_closure_with_param_types(closure, args[0].value.span(), locals, env, vec![item_ty.clone()])?
+    } else {
+        type_of_expr(&args[0].value, locals, env, expected_return)?
+    };
+    let TypeRef::Function { params, return_type, .. } = mapper_ty else {
+        return Err(Stage0Error::semantic(
+            args[0].value.span(),
+            format!("argument for 'f' expected function, found {mapper_ty}"),
+        ));
+    };
+    if params.len() != 1 || !is_type_compatible(&params[0], item_ty) {
+        return Err(Stage0Error::semantic(
+            args[0].value.span(),
+            format!("and_then function must accept {}, found ({})", item_ty, params.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")),
+        ));
+    }
+    let TypeRef::Named { name, type_args, .. } = return_type.as_ref() else {
+        return Err(Stage0Error::semantic(
+            args[0].value.span(),
+            format!("and_then function must return Option[T], found {}", return_type.as_ref()),
+        ));
+    };
+    if !is_named_type(name, "Option") || type_args.len() != 1 {
+        return Err(Stage0Error::semantic(
+            args[0].value.span(),
+            format!("and_then function must return Option[T], found {}", return_type.as_ref()),
+        ));
+    }
+    let result_item_ty = type_args[0].clone();
+    Ok(intrinsic_sig(
+        "and_then",
+        vec![
+            self_param(base_ty.clone(), span),
+            plain_param(
+                "f",
+                TypeRef::Function {
+                    params: vec![item_ty.clone()],
+                    return_type: Box::new(named_type("Option", vec![result_item_ty.clone()], span)),
                     span,
                 },
                 span,
@@ -4474,19 +5156,45 @@ fn type_of_intrinsic_name_call(
     if intrinsic_associated_name_matches(&resolved_name, "Vec", "from") {
         return Ok(Some(type_of_array_like_constructor("Vec", args, span, locals, env, expected_return)?));
     }
-    if intrinsic_associated_name_matches(&resolved_name, "Vec", "filled") || intrinsic_associated_name_matches(&resolved_name, "Vec", "with_capacity") {
-        // Vec::filled(n, value) or Vec::with_capacity(n) → Vec[T]
-        if !args.is_empty() {
-            let elem_ty = if args.len() >= 2 {
-                type_of_expr(&args[1].value, locals, env, expected_return)?
-            } else {
-                TypeRef::Unit { span }
-            };
+    if intrinsic_associated_name_matches(&resolved_name, "Vec", "filled") {
+        // Vec::filled(n, value) → Vec[T] where T = typeof(value)
+        if args.len() >= 2 {
+            let elem_ty = type_of_expr(&args[1].value, locals, env, expected_return)?;
             return Ok(Some(named_type("Vec", vec![elem_ty], span)));
         }
         return Ok(Some(infer_builtin_container(expected_return, "Vec", 1, span)));
     }
+    if intrinsic_associated_name_matches(&resolved_name, "Vec", "with_capacity") {
+        // Vec::with_capacity(n) → Vec[T] with T inferred from context
+        return Ok(Some(infer_builtin_container(expected_return, "Vec", 1, span)));
+    }
     if intrinsic_constructor_name_matches(&resolved_name, "String") {
+        return Ok(Some(TypeRef::String { span }));
+    }
+    if intrinsic_associated_name_matches(&resolved_name, "String", "with_capacity") {
+        if args.len() != 1 {
+            return Err(Stage0Error::semantic(span, format!("{resolved_name} expects 1 arg, found {}", args.len())));
+        }
+        let _ = type_of_expr(&args[0].value, locals, env, expected_return)?;
+        return Ok(Some(TypeRef::String { span }));
+    }
+    if intrinsic_associated_name_matches(&resolved_name, "String", "from_utf8") {
+        if args.len() != 1 {
+            return Err(Stage0Error::semantic(span, format!("{resolved_name} expects 1 arg, found {}", args.len())));
+        }
+        let _ = type_of_expr(&args[0].value, locals, env, expected_return)?;
+        return Ok(Some(result_type(TypeRef::String { span }, TypeRef::String { span }, span)));
+    }
+    if intrinsic_associated_name_matches(&resolved_name, "String", "from_utf8_lossy")
+        || intrinsic_associated_name_matches(&resolved_name, "String", "from_utf8_unchecked")
+        || intrinsic_associated_name_matches(&resolved_name, "String", "from_raw_parts")
+    {
+        if args.is_empty() {
+            return Err(Stage0Error::semantic(span, format!("{resolved_name} expects at least 1 arg, found 0")));
+        }
+        for arg in args {
+            let _ = type_of_expr(&arg.value, locals, env, expected_return)?;
+        }
         return Ok(Some(TypeRef::String { span }));
     }
     if intrinsic_constructor_name_matches(&resolved_name, "Box") {
@@ -4557,7 +5265,7 @@ fn type_of_intrinsic_name_call(
                 Ok(Some(TypeRef::Float { span }))
             }
         }
-        "__intrinsic_null_ptr" => Ok(Some(TypeRef::Unit { span })),
+        "__intrinsic_null_ptr" => Ok(Some(named_type("Ptr", vec![TypeRef::Unit { span }], span))),
         // fmt::format is a compiler intrinsic: accepts a format string plus
         // any number/type of additional arguments and returns String.
         "format" | "fmt::format" | "std::fmt::format" => {
@@ -4922,6 +5630,10 @@ fn type_of_array_like_constructor(
 }
 
 fn intrinsic_method_sig(base_ty: &TypeRef, field: &str, span: Span) -> Option<FunctionSig> {
+    if field == "rev" && !matches!(iterable_item_type(base_ty, span), Ok(TypeRef::Unit { .. })) && iterable_item_type(base_ty, span).is_ok() {
+        return Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], base_ty.clone(), span));
+    }
+
     match base_ty {
         TypeRef::Ref { inner, .. } => intrinsic_method_sig(inner, field, span),
         TypeRef::Char { .. } => char_intrinsic_method_sig(field, span),
@@ -4930,6 +5642,7 @@ fn intrinsic_method_sig(base_ty: &TypeRef, field: &str, span: Span) -> Option<Fu
         TypeRef::Int { .. } => int_intrinsic_method_sig(field, span),
         TypeRef::Array { element, .. } => array_intrinsic_method_sig(base_ty, element, field, span),
         TypeRef::Named { name, .. } if name == "str" => string_intrinsic_method_sig(field, span),
+        TypeRef::Named { name, .. } if is_named_type(name, "CString") => cstring_intrinsic_method_sig(field, span),
         TypeRef::Named { name, .. }
             if matches!(name.as_str(), "Value" | "serde::Value" | "std::serde::Value") =>
         {
@@ -4941,10 +5654,14 @@ fn intrinsic_method_sig(base_ty: &TypeRef, field: &str, span: Span) -> Option<Fu
         TypeRef::Named { name, type_args, .. } if is_named_type(name, "Array") && type_args.is_empty() => {
             array_intrinsic_method_sig(base_ty, &TypeRef::Unit { span }, field, span)
         }
-        TypeRef::Named { name, type_args, .. } if is_named_type(name, "Vec") && type_args.len() == 1 => {
+        TypeRef::Named { name, type_args, .. }
+            if (is_named_type(name, "Vec") || is_named_type(name, "List")) && type_args.len() == 1 =>
+        {
             vec_intrinsic_method_sig(base_ty, &type_args[0], field, span)
         }
-        TypeRef::Named { name, type_args, .. } if is_named_type(name, "Vec") && type_args.is_empty() => {
+        TypeRef::Named { name, type_args, .. }
+            if (is_named_type(name, "Vec") || is_named_type(name, "List")) && type_args.is_empty() =>
+        {
             vec_intrinsic_method_sig(base_ty, &TypeRef::Unit { span }, field, span)
         }
         TypeRef::Named { name, type_args, .. } if is_deque_like_name(name) && type_args.len() == 1 => {
@@ -4988,6 +5705,17 @@ fn intrinsic_method_sig(base_ty: &TypeRef, field: &str, span: Span) -> Option<Fu
         {
             int_intrinsic_method_sig(field, span)
         }
+        TypeRef::Named { name, .. }
+            if matches!(name.as_str(), "f32" | "f64" | "F32" | "F64") =>
+        {
+            float_intrinsic_method_sig(field, span)
+        }
+        TypeRef::Tuple { elements, .. } if field == "key" && !elements.is_empty() => {
+            Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], elements[0].clone(), span))
+        }
+        TypeRef::Tuple { elements, .. } if field == "value" && elements.len() >= 2 => {
+            Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], elements[1].clone(), span))
+        }
         _ if field == "clone" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], base_ty.clone(), span)),
         _ if field == "to_string" => Some(intrinsic_sig(
             field,
@@ -5020,15 +5748,41 @@ fn char_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
             TypeRef::String { span },
             span,
         )),
+        "to_int" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Char { span }, span)],
+            TypeRef::Int { span },
+            span,
+        )),
+        "to_lowercase" | "to_uppercase" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Char { span }, span)],
+            TypeRef::Char { span },
+            span,
+        )),
         _ => None,
     }
 }
 
 fn float_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
     match field {
-        "sqrt" | "exp" => Some(intrinsic_sig(
+        "sqrt" | "exp" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "abs" | "floor" | "ceil" | "round" | "log" | "log2" | "log10"
+        | "recip" | "signum" | "fract" | "trunc" | "cbrt" | "exp2" => Some(intrinsic_sig(
             field,
             vec![self_param(TypeRef::Float { span }, span)],
+            TypeRef::Float { span },
+            span,
+        )),
+        "atan2" | "powf" | "max" | "min" | "copysign" | "hypot" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Float { span }, span), plain_param("other", TypeRef::Float { span }, span)],
+            TypeRef::Float { span },
+            span,
+        )),
+        "powi" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Float { span }, span), plain_param("n", TypeRef::Int { span }, span)],
             TypeRef::Float { span },
             span,
         )),
@@ -5036,6 +5790,18 @@ fn float_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
             field,
             vec![self_param(TypeRef::Float { span }, span)],
             TypeRef::String { span },
+            span,
+        )),
+        "to_int" | "to_bits" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Float { span }, span)],
+            TypeRef::Int { span },
+            span,
+        )),
+        "is_nan" | "is_infinite" | "is_finite" | "is_normal" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Float { span }, span)],
+            TypeRef::Bool { span },
             span,
         )),
         _ => None,
@@ -5056,6 +5822,18 @@ fn vec_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str, s
             span,
         )),
         "len" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], TypeRef::Int { span }, span)),
+        "as_ptr" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            named_type("Ptr", vec![item_ty.clone()], span),
+            span,
+        )),
+        "as_mut_ptr" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            named_type("Ptr", vec![item_ty.clone()], span),
+            span,
+        )),
         "push" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span), plain_param("value", item_ty.clone(), span)],
@@ -5247,7 +6025,7 @@ fn vec_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str, s
         "get" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span), plain_param("index", TypeRef::Int { span }, span)],
-            named_type("Option", vec![TypeRef::Ref { inner: Box::new(item_ty.clone()), mutable: false, span }], span),
+            TypeRef::Ref { inner: Box::new(item_ty.clone()), mutable: false, span },
             span,
         )),
         "flatten" => Some(intrinsic_sig(
@@ -5407,7 +6185,14 @@ fn map_intrinsic_method_sig(
         "entries" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span)],
-            base_ty.clone(),
+            TypeRef::Named {
+                name: "Vec".to_string(),
+                type_args: vec![TypeRef::Tuple {
+                    elements: vec![key_ty.clone(), value_ty.clone()],
+                    span,
+                }],
+                span,
+            },
             span,
         )),
         _ => None,
@@ -5490,24 +6275,51 @@ fn string_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
             Some(intrinsic_sig(field, vec![self_param(TypeRef::String { span }, span)], TypeRef::Int { span }, span))
         }
         "parse_uint" | "parse_int" => {
-            Some(intrinsic_sig(field, vec![self_param(TypeRef::String { span }, span)], named_type("Option", vec![TypeRef::Int { span }], span), span))
+            Some(intrinsic_sig(field, vec![self_param(TypeRef::String { span }, span)], result_type(TypeRef::Int { span }, TypeRef::String { span }, span), span))
         }
         "parse_float" => Some(intrinsic_sig(
             field,
             vec![self_param(TypeRef::String { span }, span)],
-            TypeRef::Float { span },
+            result_type(TypeRef::Float { span }, TypeRef::String { span }, span),
             span,
         )),
         "to_string" | "trim" | "trim_end" | "clone" | "to_lowercase" | "to_uppercase" => {
             Some(string_string_return_sig(field, span))
         }
         "as_str" => Some(string_as_str_sig(field, span)),
-        "trim_matches" => Some(string_char_arg_sig(field, span)),
+        "trim_matches" | "trim_start_matches" | "trim_end_matches" => Some(string_char_arg_sig(field, span)),
         "push_str" => Some(string_push_str_sig(field, span)),
         "push" => Some(string_push_sig(field, span)),
         "bytes" | "as_bytes" => Some(string_bytes_sig(field, span)),
+        "as_ptr" => Some(string_ptr_sig(field, false, span)),
+        "as_mut_ptr" => Some(string_ptr_sig(field, true, span)),
+        "to_cstring" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::String { span }, span)],
+            named_type("CString", Vec::new(), span),
+            span,
+        )),
         "contains" | "starts_with" | "ends_with" => Some(string_contains_sig(field, span)),
-        "find" | "rfind" => Some(string_find_sig(field, span)),
+        "find" | "rfind" | "index_of" => Some(string_find_sig(field, span)),
+        "find_first_of" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(TypeRef::String { span }, span),
+                plain_param("chars", TypeRef::String { span }, span),
+            ],
+            named_type("Option", vec![TypeRef::Int { span }], span),
+            span,
+        )),
+        "index_of_from" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(TypeRef::String { span }, span),
+                plain_param("needle", TypeRef::String { span }, span),
+                plain_param("from", TypeRef::Int { span }, span),
+            ],
+            named_type("Option", vec![TypeRef::Int { span }], span),
+            span,
+        )),
         "is_empty" => Some(intrinsic_sig(field, vec![self_param(TypeRef::String { span }, span)], TypeRef::Bool { span }, span)),
         "slice" | "substring" => Some(string_slice_sig(field, span)),
         "char_at" => Some(string_index_sig(field, TypeRef::Char { span }, span)),
@@ -5515,6 +6327,12 @@ fn string_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
         "byte_at" => Some(string_index_sig(field, TypeRef::Int { span }, span)),
         "chars" => Some(string_chars_sig(field, span)),
         "split" => Some(string_split_sig(field, span)),
+        "split_once" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::String { span }, span), plain_param("sep", TypeRef::String { span }, span)],
+            named_type("Option", vec![TypeRef::Tuple { elements: vec![TypeRef::String { span }, TypeRef::String { span }], span }], span),
+            span,
+        )),
         "split_whitespace" => Some(string_lines_sig(field, span)),
         "lines" => Some(string_lines_sig(field, span)),
         "replace" | "replacen" => Some(intrinsic_sig(
@@ -5559,8 +6377,61 @@ fn string_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
     }
 }
 
+fn cstring_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
+    match field {
+        "as_ptr" => Some(intrinsic_sig(
+            field,
+            vec![self_param(named_type("CString", Vec::new(), span), span)],
+            named_type(
+                "Ptr",
+                vec![TypeRef::Named {
+                    name: "u8".to_string(),
+                    type_args: Vec::new(),
+                    span,
+                }],
+                span,
+            ),
+            span,
+        )),
+        "to_string" => Some(intrinsic_sig(
+            field,
+            vec![self_param(named_type("CString", Vec::new(), span), span)],
+            TypeRef::String { span },
+            span,
+        )),
+        _ => None,
+    }
+}
+
 fn serde_value_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
     match field {
+        "get" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(named_type("std::serde::Value", Vec::new(), span), span),
+                plain_param("key", str_ref_type(span), span),
+            ],
+            option_ref_type(named_type("std::serde::Value", Vec::new(), span), span),
+            span,
+        )),
+        "as_str" => Some(intrinsic_sig(
+            field,
+            vec![self_param(named_type("std::serde::Value", Vec::new(), span), span)],
+            named_type("Option", vec![TypeRef::String { span }], span),
+            span,
+        )),
+        "as_number" => Some(intrinsic_sig(
+            field,
+            vec![self_param(named_type("std::serde::Value", Vec::new(), span), span)],
+            named_type("Option", vec![TypeRef::Float { span }], span),
+            span,
+        )),
+        "as_object" => Some(intrinsic_sig(
+            field,
+            vec![self_param(named_type("std::serde::Value", Vec::new(), span), span)],
+            option_ref_type(named_type("Map", vec![TypeRef::String { span }, named_type("std::serde::Value", Vec::new(), span)], span), span),
+            span,
+        )),
         "get_string" => Some(intrinsic_sig(
             field,
             vec![self_param(named_type("std::serde::Value", Vec::new(), span), span), plain_param("key", str_ref_type(span), span)],
@@ -5618,6 +6489,24 @@ fn string_bytes_sig(field: &str, span: Span) -> FunctionSig {
             }],
             span,
         },
+        span,
+    )
+}
+
+fn string_ptr_sig(field: &str, mutable: bool, span: Span) -> FunctionSig {
+    let _ = mutable;
+    intrinsic_sig(
+        field,
+        vec![self_param(TypeRef::String { span }, span)],
+        named_type(
+            "Ptr",
+            vec![TypeRef::Named {
+                name: "u8".to_string(),
+                type_args: Vec::new(),
+                span,
+            }],
+            span,
+        ),
         span,
     )
 }
@@ -5742,6 +6631,22 @@ fn string_char_arg_sig(field: &str, span: Span) -> FunctionSig {
 fn int_intrinsic_method_sig(field: &str, span: Span) -> Option<FunctionSig> {
     match field {
         "to_string" => Some(intrinsic_sig(field, vec![self_param(TypeRef::Int { span }, span)], TypeRef::String { span }, span)),
+        "max" | "min" => Some(intrinsic_sig(
+            field,
+            vec![self_param(TypeRef::Int { span }, span), plain_param("other", TypeRef::Int { span }, span)],
+            TypeRef::Int { span },
+            span,
+        )),
+        "clamp" => Some(intrinsic_sig(
+            field,
+            vec![
+                self_param(TypeRef::Int { span }, span),
+                plain_param("min", TypeRef::Int { span }, span),
+                plain_param("max", TypeRef::Int { span }, span),
+            ],
+            TypeRef::Int { span },
+            span,
+        )),
         _ => None,
     }
 }
@@ -5761,6 +6666,18 @@ fn array_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str,
         )),
         "len" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], TypeRef::Int { span }, span)),
         "is_empty" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], TypeRef::Bool { span }, span)),
+        "as_ptr" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            named_type("Ptr", vec![item_ty.clone()], span),
+            span,
+        )),
+        "as_mut_ptr" => Some(intrinsic_sig(
+            field,
+            vec![self_param(base_ty.clone(), span)],
+            named_type("Ptr", vec![item_ty.clone()], span),
+            span,
+        )),
         "push" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span), plain_param("value", item_ty.clone(), span)],
@@ -5859,6 +6776,18 @@ fn array_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str,
 fn option_intrinsic_method_sig(base_ty: &TypeRef, item_ty: &TypeRef, field: &str, span: Span) -> Option<FunctionSig> {
     match field {
         "clone" => Some(intrinsic_sig(field, vec![self_param(base_ty.clone(), span)], base_ty.clone(), span)),
+        "cloned" => {
+            let cloned_item_ty = match item_ty {
+                TypeRef::Ref { inner, .. } => (**inner).clone(),
+                other => other.clone(),
+            };
+            Some(intrinsic_sig(
+                field,
+                vec![self_param(base_ty.clone(), span)],
+                named_type("Option", vec![cloned_item_ty], span),
+                span,
+            ))
+        }
         "as_ref" => Some(intrinsic_sig(
             field,
             vec![self_param(base_ty.clone(), span)],
@@ -6203,13 +7132,43 @@ fn bind_pattern(
             named_fields,
             span,
         } => {
-            let TypeRef::Named {
-                name,
-                type_args,
-                ..
-            } = value_ty else {
-                // Matching a non-Named value type with a variant pattern —
-                // bind all fields as Unit (the type may be an unresolved alias).
+            let resolve_enum_pattern_name = |candidate: &str| -> String {
+                if let Some(TypeRef::Named { name: alias_name, .. }) = env.resolve_type_alias(candidate) {
+                    alias_name
+                } else {
+                    env.resolve_alias_path(candidate)
+                }
+            };
+            // When value_ty is not Named (e.g. Unit from unresolved cross-module
+            // field access), try to recover via the pattern's enum_name.
+            let (name, type_args);
+            if let TypeRef::Named { name: n, type_args: ta, .. } = value_ty {
+                name = n.as_str();
+                type_args = ta.as_slice();
+            } else if let Some(en) = enum_name.as_ref() {
+                // Use the enum name from the pattern to look up the enum
+                // definition, so cross-module variant payloads are typed correctly.
+                let resolved_en = resolve_enum_pattern_name(en);
+                if let Some(_) = env.canonical_map_key(&resolved_en, &env.enums) {
+                    name = Box::leak(resolved_en.into_boxed_str());
+                    type_args = &[][..];
+                } else {
+                    // Enum not found — bind all fields as Unit.
+                    let mut scoped = locals.clone();
+                    for field in fields {
+                        if let Pattern::Binding { name: field_name, .. } = field {
+                            scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                        }
+                    }
+                    for (_, field_pat) in named_fields {
+                        if let Pattern::Binding { name: field_name, .. } = field_pat {
+                            scoped.insert(field_name.clone(), TypeRef::Unit { span: *span });
+                        }
+                    }
+                    return Ok(scoped);
+                }
+            } else {
+                // No enum name and non-Named value type — bind all as Unit.
                 let mut scoped = locals.clone();
                 for field in fields {
                     if let Pattern::Binding { name: field_name, .. } = field {
@@ -6229,15 +7188,16 @@ fn bind_pattern(
             if name == "Result" {
                 return bind_builtin_result_pattern(variant_name, fields, named_fields, type_args, *span, locals, env);
             }
+            let resolved_name = resolve_enum_pattern_name(name);
             let enum_key = env
-                .canonical_map_key(name, &env.enums)
-                .unwrap_or_else(|| name.clone());
+                .canonical_map_key(&resolved_name, &env.enums)
+                .unwrap_or_else(|| resolved_name.clone());
             let enum_decl = match env.enums.get(&enum_key) {
                 Some(decl) => decl,
                 None => {
                     // Enum definition not loaded — try to disambiguate by
                     // finding which enum actually contains the requested variant.
-                    let suffix = name.rsplit("::").next().unwrap_or(name);
+                    let suffix = resolved_name.rsplit("::").next().unwrap_or(&resolved_name);
                     let mut candidate: Option<&EnumDecl> = None;
                     for (key, decl) in env.enums.iter() {
                         let key_suffix = key.rsplit("::").next().unwrap_or(key);
@@ -6255,9 +7215,24 @@ fn bind_pattern(
                             // dispatch Ok/Err/Some/None to builtin handlers and
                             // bind other variants as <extern::unresolved>.
                             if is_externally_typed(value_ty) {
+                                let ext = unresolved_external_type(*span);
                                 match variant_name.as_str() {
-                                    "Some" | "None" => return bind_builtin_option_pattern(variant_name, fields, named_fields, type_args, *span, locals, env),
-                                    "Ok" | "Err" => return bind_builtin_result_pattern(variant_name, fields, named_fields, type_args, *span, locals, env),
+                                    "Some" | "None" => {
+                                        let opt_args = if type_args.is_empty() {
+                                            vec![ext.clone()]
+                                        } else {
+                                            type_args.to_vec()
+                                        };
+                                        return bind_builtin_option_pattern(variant_name, fields, named_fields, &opt_args, *span, locals, env);
+                                    }
+                                    "Ok" | "Err" => {
+                                        let res_args = if type_args.is_empty() {
+                                            vec![ext.clone(), ext.clone()]
+                                        } else {
+                                            type_args.to_vec()
+                                        };
+                                        return bind_builtin_result_pattern(variant_name, fields, named_fields, &res_args, *span, locals, env);
+                                    }
                                     _ => {}
                                 }
                                 let mut scoped = locals.clone();
@@ -6291,9 +7266,10 @@ fn bind_pattern(
                 }
             };
             if let Some(expected_enum) = enum_name.as_ref() {
+                let resolved_expected = resolve_enum_pattern_name(expected_enum);
                 let expected_key = env
-                    .canonical_map_key(expected_enum, &env.enums)
-                    .unwrap_or_else(|| env.resolve_alias_path(expected_enum));
+                    .canonical_map_key(&resolved_expected, &env.enums)
+                    .unwrap_or(resolved_expected);
                 if let Some(expected_decl) = env.enums.get(&expected_key) {
                     if enum_decl.span != expected_decl.span {
                         // Enum name mismatch — the pattern references a different
@@ -6302,7 +7278,7 @@ fn bind_pattern(
                     }
                 }
             }
-            let variant = find_enum_variant(enum_decl, name, variant_name, *span)?;
+            let variant = find_enum_variant(enum_decl, &resolved_name, variant_name, *span)?;
             let mut scoped = locals.clone();
             if !variant.named_fields.is_empty() {
                 let type_param_names = type_param_list_names(&enum_decl.type_params);
@@ -6632,7 +7608,13 @@ fn type_of_variant_constructor(
         return Ok(Some(named_type(enum_name, type_args, span)));
     }
 
-    let mut inferred = vec![None; enum_decl.type_params.len()];
+    let mut inferred = seed_type_args_from_expected_return(expected_return, &enum_key, enum_decl.type_params.len(), env)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    while inferred.len() < enum_decl.type_params.len() {
+        inferred.push(None);
+    }
     let type_param_names = type_param_list_names(&enum_decl.type_params);
     for (field_ty, arg_expr) in variant.tuple_fields.iter().zip(args) {
         let actual = type_of_expr(&arg_expr.value, locals, env, expected_return)?;
@@ -6810,6 +7792,35 @@ fn type_of_field(
     env: &SemanticEnv,
     expected_return: &TypeRef,
 ) -> Result<TypeRef, Stage0Error> {
+    if let Expr::Name { name, .. } = base {
+        if let Some(builtin_ty) = builtin_type_name_ref(name, base.span()) {
+            return type_of_field_from_type(&builtin_ty, field, span, env);
+        }
+        if is_builtin_generic_type(name) {
+            let base_ty = TypeRef::Named {
+                name: name.clone(),
+                type_args: Vec::new(),
+                span: base.span(),
+            };
+            return type_of_field_from_type(&base_ty, field, span, env);
+        }
+        if let Some(enum_key) = env.canonical_map_key(name, &env.enums) {
+            let base_ty = TypeRef::Named {
+                name: enum_key,
+                type_args: Vec::new(),
+                span: base.span(),
+            };
+            return type_of_field_from_type(&base_ty, field, span, env);
+        }
+        if let Some(struct_key) = env.canonical_map_key(name, &env.structs) {
+            let base_ty = TypeRef::Named {
+                name: struct_key,
+                type_args: Vec::new(),
+                span: base.span(),
+            };
+            return type_of_field_from_type(&base_ty, field, span, env);
+        }
+    }
     let base_ty = type_of_expr(base, locals, env, expected_return)?;
     type_of_field_from_type(&base_ty, field, span, env)
 }
@@ -6820,6 +7831,10 @@ fn type_of_field_from_type(
     span: Span,
     env: &SemanticEnv,
 ) -> Result<TypeRef, Stage0Error> {
+    if let Some(constant_ty) = builtin_associated_constant_type(base_ty, field, span) {
+        return Ok(constant_ty);
+    }
+
     match base_ty {
         TypeRef::Ref { inner, .. } => type_of_field_from_type(inner, field, span, env),
         TypeRef::Named { name, type_args, .. }
@@ -6844,17 +7859,24 @@ fn type_of_field_from_type(
                 .ok_or_else(|| Stage0Error::semantic(span, format!("tuple field index {index} is out of bounds")))
         }
         TypeRef::Named { name, type_args, .. } => {
-            let struct_key = match env.canonical_map_key(name, &env.structs) {
+            if let Some(enum_key) = env.canonical_map_key(name, &env.enums) {
+                let enum_decl = &env.enums[&enum_key];
+                if enum_decl.variants.iter().any(|v| v.name == field) {
+                    return Ok(TypeRef::Named {
+                        name: enum_key,
+                        type_args: type_args.clone(),
+                        span,
+                    });
+                }
+            }
+
+            let struct_key = match resolve_struct_key_for_field(name, field, env).or_else(|| env.canonical_map_key(name, &env.structs)) {
                 Some(key) => key,
                 None => {
-                    // Struct not in env — if the type is from an external module
-                    // (name contains "::"), propagate the unresolved status rather
-                    // than collapsing to Unit.  This ensures downstream checks
+                    // Struct not in env — propagate unresolved status rather
+                    // than collapsing to Unit, so that downstream checks
                     // recognise the type as externally typed and tolerate it.
-                    if name.contains("::") {
-                        return Ok(unresolved_external_type(span));
-                    }
-                    return Ok(TypeRef::Unit { span });
+                    return Ok(unresolved_external_type(span));
                 }
             };
             let struct_decl = &env.structs[&struct_key];
@@ -6880,6 +7902,46 @@ fn resolve_legacy_struct_field_alias<'a>(struct_name: &str, field: &'a str) -> &
     match (struct_name.rsplit("::").next().unwrap_or(struct_name), field) {
         ("Item", "annotations") => "attrs",
         _ => field,
+    }
+}
+
+fn resolve_struct_key_for_field(name: &str, field: &str, env: &SemanticEnv) -> Option<String> {
+    let bare = bare_type_name(name);
+    let mut matches = env.structs.iter().filter_map(|(key, decl)| {
+        (key.rsplit("::").next().unwrap_or(key) == bare
+            && decl.fields.iter().any(|candidate| {
+                candidate.name == field || field_alias(field) == Some(&candidate.name)
+            }))
+            .then(|| key.clone())
+    });
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn resolve_struct_decl_for_fields<'a>(
+    name: &str,
+    fields: &[(String, Expr)],
+    env: &'a SemanticEnv,
+) -> Option<(String, &'a StructDecl)> {
+    let bare = bare_type_name(name);
+    let mut matches = env.structs.iter().filter_map(|(key, decl)| {
+        (key.rsplit("::").next().unwrap_or(key) == bare
+            && fields.iter().all(|(field_name, _)| {
+                decl.fields.iter().any(|candidate| {
+                    candidate.name == *field_name || field_alias(field_name) == Some(&candidate.name)
+                })
+            }))
+            .then(|| (key.clone(), decl))
+    });
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
     }
 }
 
@@ -6943,6 +8005,26 @@ fn type_of_index(
     expected_return: &TypeRef,
 ) -> Result<TypeRef, Stage0Error> {
     let base_ty = type_of_expr(base, locals, env, expected_return)?;
+
+    // Range indexing (e.g. arr[a..b]) returns a slice of the same type,
+    // not a single element.
+    if matches!(index, Expr::Range { .. }) {
+        let base_inner = match &base_ty {
+            TypeRef::Ref { inner, .. } => inner.as_ref(),
+            other => other,
+        };
+        return match base_inner {
+            TypeRef::Named { name, type_args, .. }
+                if (is_named_type(name, "Array") || is_named_type(name, "Vec") || is_named_type(name, "List")) =>
+            {
+                Ok(base_inner.clone())
+            }
+            TypeRef::String { .. } => Ok(TypeRef::String { span }),
+            TypeRef::Array { .. } => Ok(base_inner.clone()),
+            _ => Ok(base_inner.clone()),
+        };
+    }
+
     let index_ty = type_of_expr(index, locals, env, expected_return)?;
     // Map/HashMap types support non-integer key types.  Only require Int
     // index for arrays, vecs, tuples, and strings.
@@ -6975,7 +8057,9 @@ fn type_of_index_from_type(base_ty: &TypeRef, index: &Expr, span: Span) -> Resul
             name,
             type_args,
             ..
-        } if (is_named_type(name, "Array") || is_named_type(name, "Vec")) && type_args.len() == 1 => Ok(type_args[0].clone()),
+        } if (is_named_type(name, "Array") || is_named_type(name, "Vec") || is_named_type(name, "List")) && type_args.len() == 1 => {
+            Ok(type_args[0].clone())
+        }
         TypeRef::String { .. } => Ok(TypeRef::Char { span }),
         TypeRef::Named { name, .. } if name == "str" => Ok(TypeRef::Char { span }),
         TypeRef::Array { element, .. } => Ok(element.as_ref().clone()),
@@ -7056,15 +8140,29 @@ fn type_of_match(
     let mut arm_types = Vec::new();
     for arm in arms {
         let scoped = bind_pattern(&arm.pattern, &value_ty, &value_locals, env)?;
+        if let Some(guard) = &arm.guard {
+            let guard_ty = type_of_expr(guard, &scoped, env, expected_return)?;
+            if !same_type_shape(&guard_ty, &TypeRef::Bool { span: guard.span() })
+                && !matches!(guard_ty, TypeRef::Unit { .. })
+                && !is_externally_typed(&guard_ty)
+            {
+                return Err(Stage0Error::semantic(
+                    guard.span(),
+                    format!("match guard must be Bool, found {guard_ty}"),
+                ));
+            }
+        }
         let mut mutable_locals = mutable_locals_from_locals(&scoped);
         arm_types.push(type_of_block(&arm.body, &scoped, &mut mutable_locals, env, expected_return)?);
     }
     if let Some(unified) = unify_compatible_types(&arm_types) {
         Ok(unified)
     } else {
-        // When used as a statement, arms don't need to produce the same type.
-        // Fall back to Unit if all arms type-check successfully.
-        Ok(TypeRef::Unit { span })
+        Ok(arm_types
+            .iter()
+            .find(|ty| !matches!(ty, TypeRef::Unit { .. }))
+            .cloned()
+            .unwrap_or(TypeRef::Unit { span }))
     }
 }
 
@@ -7270,6 +8368,7 @@ fn same_type_shape(left: &TypeRef, right: &TypeRef) -> bool {
         | (TypeRef::Bool { .. }, TypeRef::Bool { .. })
         | (TypeRef::Unit { .. }, TypeRef::Unit { .. })
         | (TypeRef::SelfTy { .. }, TypeRef::SelfTy { .. }) => true,
+        (left, right) if is_char_type(left) && is_char_type(right) => true,
         (TypeRef::Unit { .. }, TypeRef::Tuple { elements, .. })
         | (TypeRef::Tuple { elements, .. }, TypeRef::Unit { .. }) if elements.is_empty() => true,
         (
@@ -7370,6 +8469,15 @@ fn same_type_shape(left: &TypeRef, right: &TypeRef) -> bool {
 /// not be fully loaded into the current semantic environment.  This covers
 /// module-qualified names (e.g. `parser::Expr`, `std::io::Error`) and compiler-
 /// internal function wrapper types (e.g. `<fn:foo::bar>`).
+fn is_nil_or_unit(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Unit { .. } => true,
+        TypeRef::Named { name, .. } => name == "Nil",
+        TypeRef::Tuple { elements, .. } => elements.is_empty(),
+        _ => false,
+    }
+}
+
 fn is_external_module_type(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Named { name, .. } => name.contains("::"),
@@ -7457,10 +8565,20 @@ fn is_bool_type(ty: &TypeRef) -> bool {
 
 fn is_char_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::Char { .. })
+        || matches!(ty, TypeRef::Named { name, .. } if bare_type_name(name) == "char" || bare_type_name(name) == "Char")
 }
 
 fn is_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
     if same_type_shape(actual, expected) {
+        return true;
+    }
+
+    if matches!(actual, TypeRef::SelfTy { .. }) || matches!(expected, TypeRef::SelfTy { .. }) {
+        return true;
+    }
+
+    // Nil ↔ Unit compatibility: the language uses both interchangeably
+    if is_nil_or_unit(actual) && is_nil_or_unit(expected) {
         return true;
     }
 
@@ -7474,6 +8592,12 @@ fn is_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
             return true;
         }
         _ => {}
+    }
+
+    // External/unresolved types are compatible with any concrete type —
+    // we can't verify the actual shape, so accept optimistically.
+    if is_externally_typed(actual) || is_externally_typed(expected) {
+        return true;
     }
 
     match (actual, expected) {
@@ -7525,6 +8649,28 @@ fn is_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
                 ..
             },
         ) => (!right_mut || *left_mut) && is_type_compatible(left_inner, right_inner),
+        (
+            TypeRef::Named { name, type_args, .. },
+            TypeRef::Ref { inner, .. },
+        ) if is_named_type(name, "Ptr") && type_args.len() == 1 => {
+            if let TypeRef::Named { name: inner_name, type_args: inner_args, .. } = inner.as_ref() {
+                if is_named_type(inner_name, "Ptr") && inner_args.len() == 1 {
+                    return is_type_compatible(&type_args[0], &inner_args[0]);
+                }
+            }
+            is_type_compatible(&type_args[0], inner)
+        }
+        (
+            TypeRef::Ref { inner, .. },
+            TypeRef::Named { name, type_args, .. },
+        ) if is_named_type(name, "Ptr") && type_args.len() == 1 => {
+            if let TypeRef::Named { name: inner_name, type_args: inner_args, .. } = inner.as_ref() {
+                if is_named_type(inner_name, "Ptr") && inner_args.len() == 1 {
+                    return is_type_compatible(&inner_args[0], &type_args[0]);
+                }
+            }
+            is_type_compatible(inner, &type_args[0])
+        }
         (_, TypeRef::Ref { inner, .. }) => is_type_compatible(actual, inner),
         (TypeRef::Ref { inner, .. }, _) => is_type_compatible(inner, expected),
         (TypeRef::String { .. }, TypeRef::Named { name, .. }) if name == "str" || bare_type_name(name) == "str" => true,
@@ -7572,7 +8718,9 @@ fn is_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
                 len: expected_len,
                 ..
             },
-        ) if actual_len == expected_len => is_type_compatible(actual_element, expected_element),
+        ) if actual_len == expected_len || actual_len.is_none() || expected_len.is_none() => {
+            is_type_compatible(actual_element, expected_element)
+        }
         (
             TypeRef::Function {
                 params: actual_params,
@@ -7711,7 +8859,10 @@ fn named_type_compatible(actual: &TypeRef, expected: &TypeRef) -> bool {
 }
 
 fn is_builtin_integer_name(name: &str) -> bool {
-    matches!(name, "Int" | "UInt" | "U8" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64")
+    matches!(
+        name,
+        "Int" | "UInt" | "U8" | "Byte" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
+    )
 }
 
 fn is_builtin_float_name(name: &str) -> bool {
@@ -7722,6 +8873,22 @@ fn is_string_like_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::String { .. })
         || matches!(ty, TypeRef::Named { name, .. } if bare_type_name(name) == "str" || bare_type_name(name) == "String")
         || matches!(ty, TypeRef::Ref { inner, .. } if is_string_like_type(inner))
+}
+
+fn is_unresolved_generic_placeholder(ty: &TypeRef, env: &SemanticEnv) -> bool {
+    match ty {
+        TypeRef::Named { name, type_args, .. } => {
+            type_args.is_empty()
+                && !name.contains("::")
+                && name != "Self"
+                && !is_builtin_named_type(name)
+                && !env.structs.contains_key(name)
+                && !env.enums.contains_key(name)
+                && !env.type_aliases.contains_key(name)
+                && !env.traits.contains_key(name)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
