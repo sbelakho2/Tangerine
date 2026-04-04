@@ -1,0 +1,832 @@
+## Tangerine Standard Library — std::websocket
+## WebSocket Protocol (RFC 6455)
+##
+## Provides WebSocket client and server:
+## - Full-duplex communication
+## - Frame masking/unmasking
+## - Ping/pong heartbeat
+## - Close handshake
+## - Binary and text messages
+
+use std::collections::{Vec, Map}
+use std::ffi::Ptr
+use std::core::{Option, Result}
+use std::io::{Read, Write}
+use std::net::{TcpStream, TcpListener}
+use std::crypto::Sha1
+use std::random::Random
+
+# ———————————————————————————————————————————————————————————————
+# Constants
+# ———————————————————————————————————————————————————————————————
+
+pub const WS_MAGIC_STRING: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+pub const WS_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024  # 16MB
+
+# ———————————————————————————————————————————————————————————————
+# Enums
+# ———————————————————————————————————————————————————————————————
+
+pub enum OpCode
+  when Continuation  # 0x0
+  when Text          # 0x1
+  when Binary        # 0x2
+  when Close         # 0x8
+  when Ping          # 0x9
+  when Pong          # 0xA
+end
+
+impl OpCode
+  pub fn from_u8(value: u8) -> Option[OpCode]
+    match value
+      when 0x0 then Option::Some(OpCode::Continuation)
+      when 0x1 then Option::Some(OpCode::Text)
+      when 0x2 then Option::Some(OpCode::Binary)
+      when 0x8 then Option::Some(OpCode::Close)
+      when 0x9 then Option::Some(OpCode::Ping)
+      when 0xA then Option::Some(OpCode::Pong)
+      else Option::None
+    end
+  end
+  
+  pub fn to_u8(self: &Self) -> u8
+    match self
+      when OpCode::Continuation then 0x0
+      when OpCode::Text then 0x1
+      when OpCode::Binary then 0x2
+      when OpCode::Close then 0x8
+      when OpCode::Ping then 0x9
+      when OpCode::Pong then 0xA
+    end
+  end
+end
+
+pub enum CloseCode
+  when Normal           # 1000
+  when GoingAway        # 1001
+  when ProtocolError    # 1002
+  when Unsupported      # 1003
+  when NoStatus         # 1005
+  when Abnormal         # 1006
+  when InvalidData      # 1007
+  when PolicyViolation  # 1008
+  when TooBig           # 1009
+  when MandatoryExt     # 1010
+  when InternalError    # 1011
+  when ServiceRestart   # 1012
+  when TryAgainLater    # 1013
+end
+
+impl CloseCode
+  pub fn to_u16(self: &Self) -> u16
+    match self
+      when CloseCode::Normal then 1000
+      when CloseCode::GoingAway then 1001
+      when CloseCode::ProtocolError then 1002
+      when CloseCode::Unsupported then 1003
+      when CloseCode::NoStatus then 1005
+      when CloseCode::Abnormal then 1006
+      when CloseCode::InvalidData then 1007
+      when CloseCode::PolicyViolation then 1008
+      when CloseCode::TooBig then 1009
+      when CloseCode::MandatoryExt then 1010
+      when CloseCode::InternalError then 1011
+      when CloseCode::ServiceRestart then 1012
+      when CloseCode::TryAgainLater then 1013
+    end
+  end
+  
+  pub fn from_u16(value: u16) -> CloseCode
+    match value
+      when 1000 then CloseCode::Normal
+      when 1001 then CloseCode::GoingAway
+      when 1002 then CloseCode::ProtocolError
+      when 1003 then CloseCode::Unsupported
+      when 1005 then CloseCode::NoStatus
+      when 1006 then CloseCode::Abnormal
+      when 1007 then CloseCode::InvalidData
+      when 1008 then CloseCode::PolicyViolation
+      when 1009 then CloseCode::TooBig
+      when 1010 then CloseCode::MandatoryExt
+      when 1011 then CloseCode::InternalError
+      when 1012 then CloseCode::ServiceRestart
+      when 1013 then CloseCode::TryAgainLater
+      else CloseCode::Normal
+    end
+  end
+end
+
+pub enum WsState
+  when Connecting
+  when Open
+  when Closing
+  when Closed
+end
+
+pub enum WsError
+  when HandshakeFailed
+  when InvalidFrame
+  when ProtocolError
+  when PayloadTooLarge
+  when IoError(String)
+  when ConnectionClosed
+  when Utf8Error
+end
+
+# ———————————————————————————————————————————————————————————————
+# WebSocket Frame
+# ———————————————————————————————————————————————————————————————
+
+pub struct WsFrame
+  fin: Bool
+  opcode: OpCode
+  masked: Bool
+  payload: Vec[u8]
+end
+
+impl WsFrame
+  pub fn new(opcode: OpCode, payload: Vec[u8], fin: Bool) -> WsFrame
+    WsFrame {
+      fin: fin,
+      opcode: opcode,
+      masked: false,
+      payload: payload
+    }
+  end
+  
+  pub fn text(message: &String) -> WsFrame
+    let bytes = message.as_bytes().to_vec()
+    WsFrame::new(OpCode::Text, bytes, true)
+  end
+  
+  pub fn binary(data: Vec[u8]) -> WsFrame
+    WsFrame::new(OpCode::Binary, data, true)
+  end
+  
+  pub fn ping(data: Vec[u8]) -> WsFrame
+    WsFrame::new(OpCode::Ping, data, true)
+  end
+  
+  pub fn pong(data: Vec[u8]) -> WsFrame
+    WsFrame::new(OpCode::Pong, data, true)
+  end
+  
+  pub fn close(code: CloseCode, reason: &String) -> WsFrame
+    let mut payload: Vec[u8] = Vec::with_capacity(2 + reason.len())
+    let code_val = code.to_u16()
+    payload.push((code_val >> 8) as u8)
+    payload.push((code_val & 0xFF) as u8)
+    payload.extend_from_slice(reason.as_bytes())
+    WsFrame::new(OpCode::Close, payload, true)
+  end
+  
+  pub fn opcode(self: &Self) -> OpCode
+    self.opcode
+  end
+  
+  pub fn payload(self: &Self) -> &Vec[u8]
+    &self.payload
+  end
+  
+  pub fn fin(self: &Self) -> Bool
+    self.fin
+  end
+  
+  pub fn is_text(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Text then true
+      else false
+    end
+  end
+  
+  pub fn is_binary(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Binary then true
+      else false
+    end
+  end
+  
+  pub fn is_close(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Close then true
+      else false
+    end
+  end
+  
+  pub fn is_ping(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Ping then true
+      else false
+    end
+  end
+  
+  pub fn is_pong(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Pong then true
+      else false
+    end
+  end
+  
+  pub fn as_text(self: &Self) -> Option[String]
+    if self.is_text() then
+      Option::Some(String::from_utf8_lossy(&self.payload))
+    else
+      Option::None
+    end
+  end
+  
+  pub fn close_code(self: &Self) -> Option[CloseCode]
+    if self.is_close() && self.payload.len() >= 2 then
+      let code = (self.payload[0] as u16) << 8 | (self.payload[1] as u16)
+      Option::Some(CloseCode::from_u16(code))
+    else
+      Option::None
+    end
+  end
+  
+  pub fn close_reason(self: &Self) -> String
+    if self.is_close() && self.payload.len() > 2 then
+      String::from_utf8_lossy(&self.payload[2..])
+    else
+      String::new()
+    end
+  end
+  
+  pub def encode(self: &Self, mask: Option<&[u8; 4]>) -> Vec[u8]
+    let mut frame: Vec[u8] = Vec::new()
+    
+    # First byte: FIN + RSV1-3 + Opcode
+    let mut first: u8 = self.opcode.to_u8()
+    if self.fin then first |= 0x80 end
+    frame.push(first)
+    
+    # Second byte: MASK + Payload length
+    let payload_len = self.payload.len()
+    let masked = mask.is_some()
+    
+    if payload_len <= 125 then
+      let mut second = payload_len as u8
+      if masked then second |= 0x80 end
+      frame.push(second)
+    else if payload_len <= 65535 then
+      let mut second: u8 = 126
+      if masked then second |= 0x80 end
+      frame.push(second)
+      frame.push((payload_len >> 8) as u8)
+      frame.push((payload_len & 0xFF) as u8)
+    else
+      let mut second: u8 = 127
+      if masked then second |= 0x80 end
+      frame.push(second)
+      # 8 bytes for length (only use lower 4 for practicality)
+      frame.push(0)
+      frame.push(0)
+      frame.push(0)
+      frame.push(0)
+      frame.push((payload_len >> 24) as u8)
+      frame.push((payload_len >> 16) as u8)
+      frame.push((payload_len >> 8) as u8)
+      frame.push((payload_len & 0xFF) as u8)
+    end
+    
+    # Masking key
+    match mask
+      when Option::Some(m) then
+        frame.extend_from_slice(m)
+        # Mask payload
+        for i in 0..payload_len do
+          frame.push(self.payload[i] ^ m[i % 4])
+        end
+      when Option::None then
+        frame.extend_from_slice(&self.payload)
+    end
+    
+    frame
+  end
+  
+  pub def decode(stream: &mut TcpStream) -> Result[WsFrame, WsError]
+    let mut header: [u8; 2] = [0; 2]
+    
+    match stream.read_exact(&mut header)
+      when Result::Err(_) then return Result::Err(WsError::ConnectionClosed)
+      when Result::Ok(_) then
+    end
+    
+    let fin = (header[0] & 0x80) != 0
+    let opcode = match OpCode::from_u8(header[0] & 0x0F)
+      when Option::Some(op) then op
+      when Option::None then return Result::Err(WsError::InvalidFrame)
+    end
+    let masked = (header[1] & 0x80) != 0
+    let mut payload_len = (header[1] & 0x7F) as usize
+    
+    # Extended payload length
+    if payload_len == 126 then
+      let mut ext: [u8; 2] = [0; 2]
+      match stream.read_exact(&mut ext)
+        when Result::Err(_) then return Result::Err(WsError::ConnectionClosed)
+        when Result::Ok(_) then
+      end
+      payload_len = (ext[0] as usize) << 8 | (ext[1] as usize)
+    else if payload_len == 127 then
+      let mut ext: [u8; 8] = [0; 8]
+      match stream.read_exact(&mut ext)
+        when Result::Err(_) then return Result::Err(WsError::ConnectionClosed)
+        when Result::Ok(_) then
+      end
+      payload_len = 0
+      for i in 4..8 do
+        payload_len = (payload_len << 8) | (ext[i] as usize)
+      end
+    end
+    
+    if payload_len > WS_MAX_FRAME_SIZE then
+      return Result::Err(WsError::PayloadTooLarge)
+    end
+    
+    # Masking key
+    let mask_key: [u8; 4] = if masked then
+      let mut key: [u8; 4] = [0; 4]
+      match stream.read_exact(&mut key)
+        when Result::Err(_) then return Result::Err(WsError::ConnectionClosed)
+        when Result::Ok(_) then
+      end
+      key
+    else
+      [0; 4]
+    end
+    
+    # Payload
+    let mut payload: Vec[u8] = Vec::with_capacity(payload_len)
+    match stream.read_exact(&mut payload)
+      when Result::Err(_) then return Result::Err(WsError::ConnectionClosed)
+      when Result::Ok(_) then
+    end
+    
+    # Unmask
+    if masked then
+      for i in 0..payload_len do
+        payload[i] ^= mask_key[i % 4]
+      end
+    end
+    
+    Result::Ok(WsFrame {
+      fin: fin,
+      opcode: opcode,
+      masked: masked,
+      payload: payload
+    })
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# WebSocket Message (aggregated from frames)
+# ———————————————————————————————————————————————————————————————
+
+pub struct WsMessage
+  opcode: OpCode
+  data: Vec[u8]
+end
+
+impl WsMessage
+  pub fn text(content: String) -> WsMessage
+    WsMessage {
+      opcode: OpCode::Text,
+      data: content.into_bytes()
+    }
+  end
+  
+  pub fn binary(data: Vec[u8]) -> WsMessage
+    WsMessage {
+      opcode: OpCode::Binary,
+      data: data
+    }
+  end
+  
+  pub fn is_text(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Text then true
+      else false
+    end
+  end
+  
+  pub fn is_binary(self: &Self) -> Bool
+    match self.opcode
+      when OpCode::Binary then true
+      else false
+    end
+  end
+  
+  pub fn as_text(self: &Self) -> Option[String]
+    if self.is_text() then
+      Option::Some(String::from_utf8_lossy(&self.data))
+    else
+      Option::None
+    end
+  end
+  
+  pub fn as_bytes(self: &Self) -> &Vec[u8]
+    &self.data
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# WebSocket Client
+# ———————————————————————————————————————————————————————————————
+
+pub struct WebSocketClient
+  stream: TcpStream
+  state: WsState
+  url: String
+  protocols: Vec[String]
+end
+
+impl WebSocketClient
+  pub fn connect(url: &String) -> Result[WebSocketClient, WsError]
+    WebSocketClient::connect_with_protocols(url, &Vec::new())
+  end
+  
+  pub fn connect_with_protocols(url: &String, protocols: &Vec[String]) -> Result[WebSocketClient, WsError]
+    # Parse URL
+    let (host, port, path) = WebSocketClient::parse_url(url)?
+    
+    # Connect TCP
+    let addr = format!("{}:{}", host, port)
+    let mut stream = match TcpStream::connect(&addr)
+      when Result::Ok(s) then s
+      when Result::Err(e) then return Result::Err(WsError::IoError(e))
+    end
+    
+    # Generate key
+    let key = WebSocketClient::generate_key()
+    
+    # Send handshake
+    let handshake = WebSocketClient::build_handshake(&host, &path, &key, protocols)
+    match stream.write_all(handshake.as_bytes())
+      when Result::Err(e) then return Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then
+    end
+    
+    # Read response
+    let mut response: Vec[u8] = Vec::with_capacity(1024)
+    match stream.read_to_end(&mut response)
+      when Result::Err(e) then return Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then
+    end
+    
+    # Validate handshake
+    let response_str = String::from_utf8_lossy(&response)
+    if !WebSocketClient::validate_handshake(&response_str, &key) then
+      return Result::Err(WsError::HandshakeFailed)
+    end
+    
+    Result::Ok(WebSocketClient {
+      stream: stream,
+      state: WsState::Open,
+      url: url.clone(),
+      protocols: protocols.clone()
+    })
+  end
+  
+  pub fn parse_url(url: &String) -> Result[(String, u16, String), WsError]
+    let mut host: String = String::new()
+    let mut port: u16 = 80
+    let mut path: String = String::from("/")
+    
+    # Simple URL parsing
+    let url_str = url.as_str()
+    let mut offset = 0
+    
+    # Skip scheme
+    if url_str.starts_with("ws://") then
+      offset = 5
+      port = 80
+    else if url_str.starts_with("wss://") then
+      offset = 6
+      port = 443
+    else
+      return Result::Err(WsError::HandshakeFailed)
+    end
+    
+    # Extract host
+    let mut host_start = offset
+    while offset < url_str.len() && url_str.char_at(offset) != ':' && url_str.char_at(offset) != '/' do
+      offset += 1
+    end
+    host = url_str.substring(host_start, offset).to_string()
+    
+    # Extract port if present
+    if offset < url_str.len() && url_str.char_at(offset) == ':' then
+      offset += 1
+      let mut port_str: String = String::new()
+      while offset < url_str.len() && url_str.char_at(offset).is_digit() do
+        port_str.push(url_str.char_at(offset))
+        offset += 1
+      end
+      port = port_str.parse().unwrap_or(port)
+    end
+    
+    # Extract path
+    if offset < url_str.len() then
+      path = url_str.substring(offset).to_string()
+    end
+    
+    Result::Ok((host, port, path))
+  end
+  
+  pub fn generate_key() -> String
+    let mut rng = Random::new()
+    let mut key: [u8; 16] = [0; 16]
+    rng.fill_bytes(&mut key)
+    key.to_base64()
+  end
+  
+  pub fn build_handshake(host: &String, path: &String, key: &String, protocols: &Vec[String]) -> String
+    let mut request = format!("GET {} HTTP/1.1\r\n", path)
+    request += &format!("Host: {}\r\n", host)
+    request += "Upgrade: websocket\r\n"
+    request += "Connection: Upgrade\r\n"
+    request += &format!("Sec-WebSocket-Key: {}\r\n", key)
+    request += "Sec-WebSocket-Version: 13\r\n"
+    
+    if !protocols.is_empty() then
+      request += &format!("Sec-WebSocket-Protocol: {}\r\n", protocols.join(", "))
+    end
+    
+    request += "\r\n"
+    request
+  end
+  
+  pub fn validate_handshake(response: &String, key: &String) -> Bool
+    if !response.contains("101") then return false end
+    if !response.contains("Upgrade: websocket") then return false end
+    
+    # Verify accept key
+    let accept = key.clone() + WS_MAGIC_STRING
+    let hash = Sha256::hash(accept.as_bytes())
+    let expected = hash.to_base64()
+    
+    response.contains(&expected)
+  end
+  
+  pub fn state(self: &Self) -> WsState
+    self.state
+  end
+  
+  pub fn is_open(self: &Self) -> Bool
+    match self.state
+      when WsState::Open then true
+      else false
+    end
+  end
+  
+  pub def send(self: &mut Self, message: &WsMessage) -> Result[Unit, WsError]
+    if !self.is_open() then return Result::Err(WsError::ConnectionClosed) end
+    
+    let frame = WsFrame::new(message.opcode, message.data.clone(), true)
+    let mask = WebSocketClient::generate_mask()
+    let encoded = frame.encode(Option::Some(&mask))
+    
+    match self.stream.write_all(&encoded)
+      when Result::Err(e) then Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then Result::Ok(())
+    end
+  end
+  
+  pub def send_text(self: &mut Self, text: &String) -> Result[Unit, WsError]
+    self.send(&WsMessage::text(text.clone()))
+  end
+  
+  pub def send_binary(self: &mut Self, data: &Vec[u8]) -> Result[Unit, WsError]
+    self.send(&WsMessage::binary(data.clone()))
+  end
+  
+  pub def receive(self: &mut Self) -> Result[WsMessage, WsError]
+    if !self.is_open() then return Result::Err(WsError::ConnectionClosed) end
+    
+    let frame = WsFrame::decode(&mut self.stream)?
+    
+    # Handle control frames
+    if frame.is_ping() then
+      let pong = WsFrame::pong(frame.payload.clone())
+      let encoded = pong.encode(Option::Some(&WebSocketClient::generate_mask()))
+      self.stream.write_all(&encoded)?
+      return self.receive()
+    end
+    
+    if frame.is_close() then
+      self.state = WsState::Closed
+      return Result::Err(WsError::ConnectionClosed)
+    end
+    
+    Result::Ok(WsMessage {
+      opcode: frame.opcode,
+      data: frame.payload
+    })
+  end
+  
+  pub def close(self: &mut Self) -> Result[Unit, WsError]
+    self.close_with_code(CloseCode::Normal, &String::from("Goodbye"))
+  end
+  
+  pub def close_with_code(self: &mut Self, code: CloseCode, reason: &String) -> Result[Unit, WsError]
+    if !self.is_open() then return Result::Ok(()) end
+    
+    let frame = WsFrame::close(code, reason)
+    let mask = WebSocketClient::generate_mask()
+    let encoded = frame.encode(Option::Some(&mask))
+    
+    self.stream.write_all(&encoded)?
+    self.state = WsState::Closed
+    Result::Ok(())
+  end
+  
+  pub fn generate_mask() -> [u8; 4]
+    let mut rng = Random::new()
+    let mut mask: [u8; 4] = [0; 4]
+    rng.fill_bytes(&mut mask)
+    mask
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# WebSocket Server
+# ———————————————————————————————————————————————————————————————
+
+pub struct WebSocketServer
+  listener: TcpListener
+end
+
+pub struct WebSocketConnection
+  stream: TcpStream
+  state: WsState
+  path: String
+  protocols: Vec[String]
+end
+
+impl WebSocketServer
+  pub fn bind(addr: &String, port: u16) -> Result[WebSocketServer, String]
+    let bind_addr = format!("{}:{}", addr, port)
+    match TcpListener::bind(&bind_addr)
+      when Result::Ok(l) then Result::Ok(WebSocketServer { listener: l })
+      when Result::Err(e) then Result::Err(e)
+    end
+  end
+  
+  pub def accept(self: &mut Self) -> Result[WebSocketConnection, WsError]
+    match self.listener.accept()
+      when Result::Ok((stream, _addr)) then
+        WebSocketConnection::accept(stream)
+      when Result::Err(e) then Result::Err(WsError::IoError(e))
+    end
+  end
+end
+
+impl WebSocketConnection
+  pub fn accept(mut stream: TcpStream) -> Result[WebSocketConnection, WsError]
+    # Read handshake
+    let mut request: Vec[u8] = Vec::with_capacity(4096)
+    match stream.read_to_end(&mut request)
+      when Result::Err(e) then return Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then
+    end
+    
+    let request_str = String::from_utf8_lossy(&request)
+    
+    # Parse handshake
+    let (key, path, protocols) = WebSocketConnection::parse_handshake(&request_str)?
+    
+    # Send response
+    let response = WebSocketConnection::build_response(&key)
+    match stream.write_all(response.as_bytes())
+      when Result::Err(e) then return Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then
+    end
+    
+    Result::Ok(WebSocketConnection {
+      stream: stream,
+      state: WsState::Open,
+      path: path,
+      protocols: protocols
+    })
+  end
+  
+  pub fn parse_handshake(request: &String) -> Result[(String, String, Vec[String]), WsError]
+    let mut key: String = String::new()
+    let mut path: String = String::from("/")
+    let mut protocols: Vec[String] = Vec::new()
+    
+    for line in request.lines() do
+      let line_lower = line.to_lowercase()
+      if line_lower.starts_with("get ") then
+        let parts = line.split(" ")
+        if parts.len() >= 2 then
+          path = parts[1].to_string()
+        end
+      else if line_lower.starts_with("sec-websocket-key:") then
+        key = line.substring(18).trim().to_string()
+      else if line_lower.starts_with("sec-websocket-protocol:") then
+        let proto_str = line.substring(23).trim()
+        protocols = proto_str.split(",").map(|p| p.trim().to_string()).collect()
+      end
+    end
+    
+    if key.is_empty() then
+      return Result::Err(WsError::HandshakeFailed)
+    end
+    
+    Result::Ok((key, path, protocols))
+  end
+  
+  pub fn build_response(key: &String) -> String
+    let accept = key.clone() + WS_MAGIC_STRING
+    let hash = Sha256::hash(accept.as_bytes())
+    let accept_key = hash.to_base64()
+    
+    format!(
+      "HTTP/1.1 101 Switching Protocols\r\n\
+       Upgrade: websocket\r\n\
+       Connection: Upgrade\r\n\
+       Sec-WebSocket-Accept: {}\r\n\r\n",
+      accept_key
+    )
+  end
+  
+  pub fn state(self: &Self) -> WsState
+    self.state
+  end
+  
+  pub fn is_open(self: &Self) -> Bool
+    match self.state
+      when WsState::Open then true
+      else false
+    end
+  end
+  
+  pub fn path(self: &Self) -> &String
+    &self.path
+  end
+  
+  pub fn protocols(self: &Self) -> &Vec[String]
+    &self.protocols
+  end
+  
+  pub def send(self: &mut Self, message: &WsMessage) -> Result[Unit, WsError]
+    if !self.is_open() then return Result::Err(WsError::ConnectionClosed) end
+    
+    let frame = WsFrame::new(message.opcode, message.data.clone(), true)
+    let encoded = frame.encode(Option::None)  # Server doesn't mask
+    
+    match self.stream.write_all(&encoded)
+      when Result::Err(e) then Result::Err(WsError::IoError(e))
+      when Result::Ok(_) then Result::Ok(())
+    end
+  end
+  
+  pub def send_text(self: &mut Self, text: &String) -> Result[Unit, WsError]
+    self.send(&WsMessage::text(text.clone()))
+  end
+  
+  pub def send_binary(self: &mut Self, data: &Vec[u8]) -> Result[Unit, WsError]
+    self.send(&WsMessage::binary(data.clone()))
+  end
+  
+  pub def receive(self: &mut Self) -> Result[WsMessage, WsError]
+    if !self.is_open() then return Result::Err(WsError::ConnectionClosed) end
+    
+    let frame = WsFrame::decode(&mut self.stream)?
+    
+    # Handle ping
+    if frame.is_ping() then
+      let pong = WsFrame::pong(frame.payload.clone())
+      let encoded = pong.encode(Option::None)
+      self.stream.write_all(&encoded)?
+      return self.receive()
+    end
+    
+    # Handle close
+    if frame.is_close() then
+      # Echo close back
+      let close_frame = WsFrame::close(CloseCode::Normal, &String::new())
+      let encoded = close_frame.encode(Option::None)
+      self.stream.write_all(&encoded)?
+      self.state = WsState::Closed
+      return Result::Err(WsError::ConnectionClosed)
+    end
+    
+    Result::Ok(WsMessage {
+      opcode: frame.opcode,
+      data: frame.payload
+    })
+  end
+  
+  pub def close(self: &mut Self) -> Result[Unit, WsError]
+    if !self.is_open() then return Result::Ok(()) end
+    
+    let frame = WsFrame::close(CloseCode::Normal, &String::new())
+    let encoded = frame.encode(Option::None)
+    self.stream.write_all(&encoded)?
+    self.state = WsState::Closed
+    Result::Ok(())
+  end
+end

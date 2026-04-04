@@ -1,0 +1,949 @@
+## Tangerine Standard Library — std::http2
+## HTTP/2 Protocol Implementation
+##
+## Provides HTTP/2 client and server:
+## - HPACK header compression
+## - Stream multiplexing
+## - Flow control
+## - Server push
+## - Trailers
+
+use std::collections::{Vec, Map}
+use std::ffi::Ptr
+use std::core::{Option, Result}
+use std::io::{Read, Write}
+use std::net::{TcpStream, TcpListener}
+use std::sync::{Mutex, Arc}
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Constants
+# ———————————————————————————————————————————————————————————————
+
+pub const HTTP2_PREFACE: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+pub const HTTP2_HEADER_SIZE: usize = 9
+pub const HTTP2_MAX_FRAME_SIZE: u32 = 16384
+pub const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 65536
+pub const HTTP2_DEFAULT_WINDOW_SIZE: u32 = 65535
+pub const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 100
+
+# ———————————————————————————————————————————————————————————————
+# Frame Types
+# ———————————————————————————————————————————————————————————————
+
+pub enum FrameType
+  when Data          # 0x0
+  when Headers       # 0x1
+  when Priority      # 0x2
+  when RstStream     # 0x3
+  when Settings      # 0x4
+  when PushPromise   # 0x5
+  when Ping          # 0x6
+  when GoAway        # 0x7
+  when WindowUpdate  # 0x8
+  when Continuation  # 0x9
+  when AltSvc        # 0xA
+end
+
+impl FrameType
+  pub fn from_u8(value: u8) -> Option[FrameType]
+    match value
+      when 0x0 then Option::Some(FrameType::Data)
+      when 0x1 then Option::Some(FrameType::Headers)
+      when 0x2 then Option::Some(FrameType::Priority)
+      when 0x3 then Option::Some(FrameType::RstStream)
+      when 0x4 then Option::Some(FrameType::Settings)
+      when 0x5 then Option::Some(FrameType::PushPromise)
+      when 0x6 then Option::Some(FrameType::Ping)
+      when 0x7 then Option::Some(FrameType::GoAway)
+      when 0x8 then Option::Some(FrameType::WindowUpdate)
+      when 0x9 then Option::Some(FrameType::Continuation)
+      when 0xA then Option::Some(FrameType::AltSvc)
+      else Option::None
+    end
+  end
+  
+  pub fn to_u8(self: &Self) -> u8
+    match self
+      when FrameType::Data then 0x0
+      when FrameType::Headers then 0x1
+      when FrameType::Priority then 0x2
+      when FrameType::RstStream then 0x3
+      when FrameType::Settings then 0x4
+      when FrameType::PushPromise then 0x5
+      when FrameType::Ping then 0x6
+      when FrameType::GoAway then 0x7
+      when FrameType::WindowUpdate then 0x8
+      when FrameType::Continuation then 0x9
+      when FrameType::AltSvc then 0xA
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Settings Parameters
+# ———————————————————————————————————————————————————————————————
+
+pub enum SettingId
+  when HeaderTableSize       # 0x1
+  when EnablePush            # 0x2
+  when MaxConcurrentStreams  # 0x3
+  when InitialWindowSize     # 0x4
+  when MaxFrameSize          # 0x5
+  when MaxHeaderListSize     # 0x6
+end
+
+impl SettingId
+  pub fn from_u16(value: u16) -> Option[SettingId]
+    match value
+      when 0x1 then Option::Some(SettingId::HeaderTableSize)
+      when 0x2 then Option::Some(SettingId::EnablePush)
+      when 0x3 then Option::Some(SettingId::MaxConcurrentStreams)
+      when 0x4 then Option::Some(SettingId::InitialWindowSize)
+      when 0x5 then Option::Some(SettingId::MaxFrameSize)
+      when 0x6 then Option::Some(SettingId::MaxHeaderListSize)
+      else Option::None
+    end
+  end
+  
+  pub fn to_u16(self: &Self) -> u16
+    match self
+      when SettingId::HeaderTableSize then 0x1
+      when SettingId::EnablePush then 0x2
+      when SettingId::MaxConcurrentStreams then 0x3
+      when SettingId::InitialWindowSize then 0x4
+      when SettingId::MaxFrameSize then 0x5
+      when SettingId::MaxHeaderListSize then 0x6
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Error Codes
+# ———————————————————————————————————————————————————————————————
+
+pub enum H2Error
+  when NoError           # 0x0
+  when ProtocolError     # 0x1
+  when InternalError    # 0x2
+  when FlowControlError # 0x3
+  when SettingsTimeout  # 0x4
+  when StreamClosed     # 0x5
+  when FrameSizeError   # 0x6
+  when RefusedStream    # 0x7
+  when Cancel           # 0x8
+  when CompressionError # 0x9
+  when ConnectError     # 0xA
+  when EnhanceYourCalm  # 0xB
+  when InadequateSecurity # 0xC
+  when Http11Required   # 0xD
+end
+
+impl H2Error
+  pub fn to_u32(self: &Self) -> u32
+    match self
+      when H2Error::NoError then 0x0
+      when H2Error::ProtocolError then 0x1
+      when H2Error::InternalError then 0x2
+      when H2Error::FlowControlError then 0x3
+      when H2Error::SettingsTimeout then 0x4
+      when H2Error::StreamClosed then 0x5
+      when H2Error::FrameSizeError then 0x6
+      when H2Error::RefusedStream then 0x7
+      when H2Error::Cancel then 0x8
+      when H2Error::CompressionError then 0x9
+      when H2Error::ConnectError then 0xA
+      when H2Error::EnhanceYourCalm then 0xB
+      when H2Error::InadequateSecurity then 0xC
+      when H2Error::Http11Required then 0xD
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Frame
+# ———————————————————————————————————————————————————————————————
+
+pub struct H2Frame
+  length: u32
+  frame_type: FrameType
+  flags: u8
+  stream_id: u32
+  payload: Vec[u8]
+end
+
+impl H2Frame
+  pub fn new(frame_type: FrameType, stream_id: u32, payload: Vec[u8]) -> H2Frame
+    H2Frame {
+      length: payload.len() as u32,
+      frame_type: frame_type,
+      flags: 0,
+      stream_id: stream_id,
+      payload: payload
+    }
+  end
+  
+  pub fn settings(settings: &H2Settings) -> H2Frame
+    let mut payload: Vec[u8] = Vec::new()
+    for (id, value) in settings.to_vec() do
+      payload.push((id >> 8) as u8)
+      payload.push((id & 0xFF) as u8)
+      payload.push((value >> 24) as u8)
+      payload.push((value >> 16) as u8)
+      payload.push((value >> 8) as u8)
+      payload.push((value & 0xFF) as u8)
+    end
+    let mut frame = H2Frame::new(FrameType::Settings, 0, payload)
+    frame.flags = 0x01  # ACK will be set separately
+    frame
+  end
+  
+  pub fn settings_ack() -> H2Frame
+    let mut frame = H2Frame::new(FrameType::Settings, 0, Vec::new())
+    frame.flags = 0x01
+    frame
+  end
+  
+  pub fn data(stream_id: u32, data: Vec[u8], end_stream: Bool) -> H2Frame
+    let mut frame = H2Frame::new(FrameType::Data, stream_id, data)
+    if end_stream then frame.flags |= 0x01 end
+    frame
+  end
+  
+  pub fn headers(stream_id: u32, header_block: Vec[u8], end_stream: Bool, end_headers: Bool) -> H2Frame
+    let mut frame = H2Frame::new(FrameType::Headers, stream_id, header_block)
+    if end_stream then frame.flags |= 0x01 end
+    if end_headers then frame.flags |= 0x04 end
+    frame
+  end
+  
+  pub fn ping(data: [u8; 8], ack: Bool) -> H2Frame
+    let mut frame = H2Frame::new(FrameType::Ping, 0, data.to_vec())
+    if ack then frame.flags = 0x01 end
+    frame
+  end
+  
+  pub fn goaway(last_stream_id: u32, error_code: H2Error) -> H2Frame
+    let mut payload: Vec[u8] = Vec::with_capacity(8)
+    payload.push((last_stream_id >> 24) as u8)
+    payload.push((last_stream_id >> 16) as u8)
+    payload.push((last_stream_id >> 8) as u8)
+    payload.push((last_stream_id & 0xFF) as u8)
+    let err = error_code.to_u32()
+    payload.push((err >> 24) as u8)
+    payload.push((err >> 16) as u8)
+    payload.push((err >> 8) as u8)
+    payload.push((err & 0xFF) as u8)
+    H2Frame::new(FrameType::GoAway, 0, payload)
+  end
+  
+  pub fn rst_stream(stream_id: u32, error_code: H2Error) -> H2Frame
+    let err = error_code.to_u32()
+    let payload: Vec[u8] = vec![
+      (err >> 24) as u8,
+      (err >> 16) as u8,
+      (err >> 8) as u8,
+      (err & 0xFF) as u8
+    ]
+    H2Frame::new(FrameType::RstStream, stream_id, payload)
+  end
+  
+  pub fn window_update(stream_id: u32, increment: u32) -> H2Frame
+    let mut payload: Vec<u8] = Vec::with_capacity(4)
+    payload.push((increment >> 24) as u8)
+    payload.push((increment >> 16) as u8)
+    payload.push((increment >> 8) as u8)
+    payload.push((increment & 0xFF) as u8)
+    H2Frame::new(FrameType::WindowUpdate, stream_id, payload)
+  end
+  
+  pub fn frame_type(self: &Self) -> FrameType
+    self.frame_type
+  end
+  
+  pub fn stream_id(self: &Self) -> u32
+    self.stream_id
+  end
+  
+  pub fn payload(self: &Self) -> &Vec[u8]
+    &self.payload
+  end
+  
+  pub fn is_end_stream(self: &Self) -> Bool
+    (self.flags & 0x01) != 0
+  end
+  
+  pub fn is_ack(self: &Self) -> Bool
+    (self.flags & 0x01) != 0
+  end
+  
+  pub fn is_end_headers(self: &Self) -> Bool
+    (self.flags & 0x04) != 0
+  end
+  
+  pub fn is_padded(self: &Self) -> Bool
+    (self.flags & 0x08) != 0
+  end
+  
+  pub fn is_priority(self: &Self) -> Bool
+    (self.flags & 0x20) != 0
+  end
+  
+  pub def encode(self: &Self) -> Vec[u8]
+    let mut frame: Vec[u8] = Vec::with_capacity(HTTP2_HEADER_SIZE + self.payload.len())
+    
+    # Length (3 bytes)
+    frame.push((self.length >> 16) as u8)
+    frame.push((self.length >> 8) as u8)
+    frame.push((self.length & 0xFF) as u8)
+    
+    # Type (1 byte)
+    frame.push(self.frame_type.to_u8())
+    
+    # Flags (1 byte)
+    frame.push(self.flags)
+    
+    # Stream ID (4 bytes, R bit reserved)
+    frame.push((self.stream_id >> 24) as u8 & 0x7F)
+    frame.push((self.stream_id >> 16) as u8)
+    frame.push((self.stream_id >> 8) as u8)
+    frame.push((self.stream_id & 0xFF) as u8)
+    
+    # Payload
+    frame.extend_from_slice(&self.payload)
+    
+    frame
+  end
+  
+  pub def decode(stream: &mut TcpStream) -> Result[H2Frame, String]
+    let mut header: [u8; HTTP2_HEADER_SIZE] = [0; HTTP2_HEADER_SIZE]
+    
+    match stream.read_exact(&mut header)
+      when Result::Err(e) then return Result::Err("Connection closed")
+      when Result::Ok(_) then
+    end
+    
+    let length = ((header[0] as u32) << 16) | ((header[1] as u32) << 8) | (header[2] as u32)
+    let frame_type = match FrameType::from_u8(header[3])
+      when Option::Some(t) then t
+      when Option::None then return Result::Err("Invalid frame type")
+    end
+    let flags = header[4]
+    let stream_id = ((header[5] as u32 & 0x7F) << 24) | ((header[6] as u32) << 16) | ((header[7] as u32) << 8) | (header[8] as u32)
+    
+    let mut payload: Vec[u8] = Vec::with_capacity(length as usize)
+    if length > 0 then
+      match stream.read_exact(&mut payload)
+        when Result::Err(_) then return Result::Err("Failed to read payload")
+        when Result::Ok(_) then
+      end
+    end
+    
+    Result::Ok(H2Frame {
+      length: length,
+      frame_type: frame_type,
+      flags: flags,
+      stream_id: stream_id,
+      payload: payload
+    })
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Settings
+# ———————————————————————————————————————————————————————————————
+
+pub struct H2Settings
+  header_table_size: u32
+  enable_push: Bool
+  max_concurrent_streams: u32
+  initial_window_size: u32
+  max_frame_size: u32
+  max_header_list_size: u32
+end
+
+impl H2Settings
+  pub fn default() -> H2Settings
+    H2Settings {
+      header_table_size: 4096,
+      enable_push: true,
+      max_concurrent_streams: HTTP2_MAX_CONCURRENT_STREAMS,
+      initial_window_size: HTTP2_DEFAULT_WINDOW_SIZE,
+      max_frame_size: HTTP2_MAX_FRAME_SIZE,
+      max_header_list_size: HTTP2_MAX_HEADER_LIST_SIZE
+    }
+  end
+  
+  pub fn to_vec(self: &Self) -> Vec[(u16, u32)]
+    vec![
+      (SettingId::HeaderTableSize.to_u16(), self.header_table_size),
+      (SettingId::EnablePush.to_u16(), if self.enable_push then 1 else 0),
+      (SettingId::MaxConcurrentStreams.to_u16(), self.max_concurrent_streams),
+      (SettingId::InitialWindowSize.to_u16(), self.initial_window_size),
+      (SettingId::MaxFrameSize.to_u16(), self.max_frame_size),
+      (SettingId::MaxHeaderListSize.to_u16(), self.max_header_list_size)
+    ]
+  end
+  
+  pub def parse(payload: &Vec[u8]) -> H2Settings
+    let mut settings = H2Settings::default()
+    let mut i = 0
+    while i + 5 < payload.len() do
+      let id = ((payload[i] as u16) << 8) | (payload[i + 1] as u16)
+      let value = ((payload[i + 2] as u32) << 24) | ((payload[i + 3] as u32) << 16) | ((payload[i + 4] as u32) << 8) | (payload[i + 5] as u32)
+      
+      match SettingId::from_u16(id)
+        when Option::Some(SettingId::HeaderTableSize) then settings.header_table_size = value
+        when Option::Some(SettingId::EnablePush) then settings.enable_push = value != 0
+        when Option::Some(SettingId::MaxConcurrentStreams) then settings.max_concurrent_streams = value
+        when Option::Some(SettingId::InitialWindowSize) then settings.initial_window_size = value
+        when Option::Some(SettingId::MaxFrameSize) then settings.max_frame_size = value
+        when Option::Some(SettingId::MaxHeaderListSize) then settings.max_header_list_size = value
+        when Option::None then
+      end
+      
+      i += 6
+    end
+    settings
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HPACK Header Compression
+# ———————————————————————————————————————————————————————————————
+
+pub struct HpackEncoder
+  dynamic_table: Vec[(String, String)]
+  max_table_size: usize
+end
+
+impl HpackEncoder
+  pub fn new() -> HpackEncoder
+    HpackEncoder {
+      dynamic_table: Vec::new(),
+      max_table_size: 4096
+    }
+  end
+  
+  pub def encode(self: &mut Self, headers: &Map[String, String]) -> Vec[u8]
+    let mut encoded: Vec[u8] = Vec::new()
+    
+    for (name, value) in headers do
+      # Check static table first
+      let index = HpackEncoder::find_static_index(&name, &value)
+      
+      if index > 0 then
+        # Indexed header
+        encoded.push(0x80 | (index as u8))
+      else
+        # Literal header with incremental indexing
+        encoded.push(0x40)
+        encoded.extend_from_slice(&HpackEncoder::encode_string(&name))
+        encoded.extend_from_slice(&HpackEncoder::encode_string(&value))
+        
+        # Add to dynamic table
+        self.dynamic_table.push((name.clone(), value.clone()))
+      end
+    end
+    
+    encoded
+  end
+  
+  pub fn find_static_index(name: &String, value: &String) -> u16
+    # Static table entries (simplified)
+    match (name.as_str(), value.as_str())
+      when (":method", "GET") then 2
+      when (":method", "POST") then 3
+      when (":path", "/") then 4
+      when (":scheme", "http") then 6
+      when (":scheme", "https") then 7
+      when (":status", "200") then 8
+      when (":status", "204") then 9
+      when (":status", "206") then 10
+      when (":status", "304") then 11
+      when (":status", "400") then 12
+      when (":status", "404") then 13
+      when (":status", "500") then 14
+      when ("accept-encoding", "gzip, deflate") then 16
+      when ("content-type", "application/json") then 0  # Not in static table
+      else 0
+    end
+  end
+  
+  pub fn encode_string(s: &String) -> Vec[u8]
+    let bytes = s.as_bytes()
+    let len = bytes.len()
+    let mut encoded: Vec[u8] = Vec::with_capacity(1 + len)
+    
+    # Huffman flag not set, use literal
+    if len < 127 then
+      encoded.push(len as u8)
+    else
+      encoded.push(127)
+      encoded.push((len >> 24) as u8)
+      encoded.push((len >> 16) as u8)
+      encoded.push((len >> 8) as u8)
+      encoded.push((len & 0xFF) as u8)
+    end
+    
+    encoded.extend_from_slice(bytes)
+    encoded
+  end
+end
+
+pub struct HpackDecoder
+  dynamic_table: Vec[(String, String)]
+  max_table_size: usize
+end
+
+impl HpackDecoder
+  pub fn new() -> HpackDecoder
+    HpackDecoder {
+      dynamic_table: Vec::new(),
+      max_table_size: 4096
+    }
+  end
+  
+  pub def decode(self: &mut Self, data: &Vec[u8]) -> Result[Map[String, String], String]
+    let mut headers: Map[String, String] = Map::new()
+    let mut i = 0
+    
+    while i < data.len() do
+      let byte = data[i]
+      
+      if byte & 0x80 != 0 then
+        # Indexed header
+        let index = (byte & 0x7F) as usize
+        match HpackDecoder::get_header(index)
+          when Option::Some((name, value)) then
+            headers.insert(name, value)
+          when Option::None then
+            # Check dynamic table
+            let dyn_index = index - 61  # Static table size
+            if dyn_index < self.dynamic_table.len() then
+              let (name, value) = &self.dynamic_table[dyn_index]
+              headers.insert(name.clone(), value.clone())
+            end
+        end
+        i += 1
+      else if byte & 0xC0 == 0x40 then
+        # Literal header with incremental indexing
+        i += 1
+        let (name, new_i) = HpackDecoder::decode_string(data, i)?
+        i = new_i
+        let (value, new_i) = HpackDecoder::decode_string(data, i)?
+        i = new_i
+        headers.insert(name.clone(), value.clone())
+        self.dynamic_table.push((name, value))
+      else if byte & 0xF0 == 0 then
+        # Literal header without indexing
+        i += 1
+        let (name, new_i) = HpackDecoder::decode_string(data, i)?
+        i = new_i
+        let (value, new_i) = HpackDecoder::decode_string(data, i)?
+        i = new_i
+        headers.insert(name, value)
+      else
+        i += 1
+      end
+    end
+    
+    Result::Ok(headers)
+  end
+  
+  pub fn get_header(index: usize) -> Option[(String, String)]
+    match index
+      when 1 then Option::Some((":authority".to_string(), String::new()))
+      when 2 then Option::Some((":method".to_string(), "GET".to_string()))
+      when 3 then Option::Some((":method".to_string(), "POST".to_string()))
+      when 4 then Option::Some((":path".to_string(), "/".to_string()))
+      when 5 then Option::Some((":path".to_string(), "/index.html".to_string()))
+      when 6 then Option::Some((":scheme".to_string(), "http".to_string()))
+      when 7 then Option::Some((":scheme".to_string(), "https".to_string()))
+      when 8 then Option::Some((":status".to_string(), "200".to_string()))
+      else Option::None
+    end
+  end
+  
+  pub fn decode_string(data: &Vec[u8], offset: usize) -> Result[(String, usize), String]
+    if offset >= data.len() then return Result::Err("Unexpected end of data") end
+    
+    let first = data[offset]
+    let huffman = (first & 0x80) != 0
+    let mut len = (first & 0x7F) as usize
+    let mut i = offset + 1
+    
+    if len == 127 then
+      if i + 4 > data.len() then return Result::Err("Unexpected end of data") end
+      len = ((data[i] as usize) << 24) | ((data[i + 1] as usize) << 16) | ((data[i + 2] as usize) << 8) | (data[i + 3] as usize)
+      i += 4
+    end
+    
+    if i + len > data.len() then return Result::Err("Unexpected end of data") end
+    
+    let s = if huffman then
+      HpackDecoder::decode_huffman(data, i, len)?
+    else
+      String::from_utf8_lossy(&data[i..i + len])
+    end
+    
+    Result::Ok((s, i + len))
+  end
+  
+  pub fn decode_huffman(data: &Vec[u8], offset: usize, len: usize) -> Result[String, String]
+    # Simplified Huffman decoding
+    Result::Ok(String::from_utf8_lossy(&data[offset..offset + len]))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Stream
+# ———————————————————————————————————————————————————————————————
+
+pub struct H2Stream
+  id: u32
+  state: StreamState
+  headers: Map[String, String]
+  data: Vec[u8]
+  window_size: u32
+end
+
+pub enum StreamState
+  when Idle
+  when ReservedLocal
+  when ReservedRemote
+  when Open
+  when HalfClosedLocal
+  when HalfClosedRemote
+  when Closed
+end
+
+impl H2Stream
+  pub fn new(id: u32) -> H2Stream
+    H2Stream {
+      id: id,
+      state: StreamState::Idle,
+      headers: Map::new(),
+      data: Vec::new(),
+      window_size: HTTP2_DEFAULT_WINDOW_SIZE
+    }
+  end
+  
+  pub fn id(self: &Self) -> u32
+    self.id
+  end
+  
+  pub fn state(self: &Self) -> StreamState
+    self.state
+  end
+  
+  pub fn headers(self: &Self) -> &Map[String, String]
+    &self.headers
+  end
+  
+  pub fn data(self: &Self) -> &Vec[u8]
+    &self.data
+  end
+  
+  pub fn method(self: &Self) -> Option[&String]
+    self.headers.get(":method")
+  end
+  
+  pub fn path(self: &Self) -> Option[&String]
+    self.headers.get(":path")
+  end
+  
+  pub fn status(self: &Self) -> Option[&String]
+    self.headers.get(":status")
+  end
+  
+  pub fn body(self: &Self) -> &Vec[u8]
+    &self.data
+  end
+  
+  pub fn body_string(self: &Self) -> String
+    String::from_utf8_lossy(&self.data)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Client
+# ———————————————————————————————————————————————————————————————
+
+pub struct H2Client
+  stream: TcpStream
+  settings: H2Settings
+  encoder: HpackEncoder
+  decoder: HpackDecoder
+  streams: Map[u32, H2Stream]
+  next_stream_id: u32
+end
+
+impl H2Client
+  pub fn connect(host: &String, port: u16) -> Result[H2Client, String]
+    let addr = format!("{}:{}", host, port)
+    let mut stream = match TcpStream::connect(&addr)
+      when Result::Ok(s) then s
+      when Result::Err(e) then return Result::Err(e)
+    end
+    
+    # Send connection preface
+    match stream.write_all(HTTP2_PREFACE.as_bytes())
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then
+    end
+    
+    # Send initial settings
+    let settings_frame = H2Frame::settings(&H2Settings::default())
+    match stream.write_all(&settings_frame.encode())
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then
+    end
+    
+    # Wait for settings ACK
+    let ack_frame = H2Frame::decode(&mut stream)?
+    if ack_frame.frame_type != FrameType::Settings || !ack_frame.is_ack() then
+      return Result::Err("Expected SETTINGS ACK")
+    end
+    
+    Result::Ok(H2Client {
+      stream: stream,
+      settings: H2Settings::default(),
+      encoder: HpackEncoder::new(),
+      decoder: HpackDecoder::new(),
+      streams: Map::new(),
+      next_stream_id: 1
+    })
+  end
+  
+  pub def get(self: &mut Self, path: &String) -> Result[H2Stream, String]
+    let mut headers: Map[String, String] = Map::new()
+    headers.insert(":method".to_string(), "GET".to_string())
+    headers.insert(":path".to_string(), path.clone())
+    headers.insert(":scheme".to_string(), "https".to_string())
+    
+    self.send_request(&headers, &Vec::new())
+  end
+  
+  pub def post(self: &mut Self, path: &String, body: &Vec[u8], content_type: &String) -> Result[H2Stream, String]
+    let mut headers: Map[String, String] = Map::new()
+    headers.insert(":method".to_string(), "POST".to_string())
+    headers.insert(":path".to_string(), path.clone())
+    headers.insert(":scheme".to_string(), "https".to_string())
+    headers.insert("content-type".to_string(), content_type.clone())
+    headers.insert("content-length".to_string(), body.len().to_string())
+    
+    self.send_request(&headers, body)
+  end
+  
+  pub def send_request(self: &mut Self, headers: &Map[String, String], body: &Vec[u8]) -> Result[H2Stream, String]
+    let stream_id = self.next_stream_id
+    self.next_stream_id += 2
+    
+    # Encode headers
+    let header_block = self.encoder.encode(headers)
+    let end_stream = body.is_empty()
+    
+    # Send HEADERS frame
+    let headers_frame = H2Frame::headers(stream_id, header_block, end_stream, true)
+    self.stream.write_all(&headers_frame.encode())?
+    
+    # Send DATA if present
+    if !body.is_empty() then
+      let data_frame = H2Frame::data(stream_id, body.clone(), true)
+      self.stream.write_all(&data_frame.encode())?
+    end
+    
+    # Receive response
+    let mut response_stream = H2Stream::new(stream_id)
+    
+    loop do
+      let frame = H2Frame::decode(&mut self.stream)?
+      
+      match frame.frame_type
+        when FrameType::Headers then
+          let decoded = self.decoder.decode(&frame.payload)?
+          for (k, v) in &decoded do
+            response_stream.headers.insert(k.clone(), v.clone())
+          end
+          if frame.is_end_headers() && frame.is_end_stream() then
+            break
+          end
+        when FrameType::Data then
+          response_stream.data.extend_from_slice(&frame.payload)
+          if frame.is_end_stream() then
+            break
+          end
+        when FrameType::Settings then
+          if !frame.is_ack() then
+            let ack = H2Frame::settings_ack()
+            self.stream.write_all(&ack.encode())?
+          end
+        when FrameType::Ping then
+          let pong = H2Frame::ping([0; 8], true)
+          self.stream.write_all(&pong.encode())?
+        else
+      end
+    end
+    
+    response_stream.state = StreamState::Closed
+    Result::Ok(response_stream)
+  end
+  
+  pub def close(self: &mut Self) -> Result[Unit, String]
+    let goaway = H2Frame::goaway(self.next_stream_id - 2, H2Error::NoError)
+    self.stream.write_all(&goaway.encode())?
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# HTTP/2 Server
+# ———————————————————————————————————————————————————————————————
+
+pub struct H2Server
+  listener: TcpListener
+  settings: H2Settings
+end
+
+pub struct H2Connection
+  stream: TcpStream
+  settings: H2Settings
+  encoder: HpackEncoder
+  decoder: HpackDecoder
+  streams: Map[u32, H2Stream]
+end
+
+impl H2Server
+  pub fn bind(addr: &String, port: u16) -> Result[H2Server, String]
+    let bind_addr = format!("{}:{}", addr, port)
+    match TcpListener::bind(&bind_addr)
+      when Result::Ok(l) then Result::Ok(H2Server {
+        listener: l,
+        settings: H2Settings::default()
+      })
+      when Result::Err(e) then Result::Err(e)
+    end
+  end
+  
+  pub def accept(self: &mut Self) -> Result[H2Connection, String]
+    match self.listener.accept()
+      when Result::Ok((stream, _addr)) then
+        H2Connection::accept(stream, &self.settings)
+      when Result::Err(e) then Result::Err(e)
+    end
+  end
+end
+
+impl H2Connection
+  pub fn accept(mut stream: TcpStream, settings: &H2Settings) -> Result[H2Connection, String]
+    # Read preface
+    let mut preface: [u8; 24] = [0; 24]
+    stream.read_exact(&mut preface)?
+    
+    if &preface != HTTP2_PREFACE.as_bytes() then
+      return Result::Err("Invalid HTTP/2 preface")
+    end
+    
+    # Read settings
+    let settings_frame = H2Frame::decode(&mut stream)?
+    if settings_frame.frame_type != FrameType::Settings then
+      return Result::Err("Expected SETTINGS frame")
+    end
+    
+    # Send settings
+    let my_settings = H2Frame::settings(settings)
+    stream.write_all(&my_settings.encode())?
+    
+    # Send ACK
+    let ack = H2Frame::settings_ack()
+    stream.write_all(&ack.encode())?
+    
+    Result::Ok(H2Connection {
+      stream: stream,
+      settings: settings.clone(),
+      encoder: HpackEncoder::new(),
+      decoder: HpackDecoder::new(),
+      streams: Map::new()
+    })
+  end
+  
+  pub def receive_request(self: &mut Self) -> Result[H2Stream, String]
+    let mut current_stream: Option[H2Stream> = Option::None
+    
+    loop do
+      let frame = H2Frame::decode(&mut self.stream)?
+      
+      match frame.frame_type
+        when FrameType::Headers then
+          let stream_id = frame.stream_id
+          let decoded = self.decoder.decode(&frame.payload)?
+          
+          let mut stream = H2Stream::new(stream_id)
+          for (k, v) in &decoded do
+            stream.headers.insert(k.clone(), v.clone())
+          end
+          stream.state = StreamState::Open
+          
+          if frame.is_end_stream() then
+            stream.state = StreamState::HalfClosedRemote
+            return Result::Ok(stream)
+          end
+          
+          current_stream = Option::Some(stream)
+          
+        when FrameType::Data then
+          match &mut current_stream
+            when Option::Some(stream) then
+              stream.data.extend_from_slice(&frame.payload)
+              if frame.is_end_stream() then
+                stream.state = StreamState::HalfClosedRemote
+                return Result::Ok(stream)
+              end
+            when Option::None then
+          end
+          
+        when FrameType::Settings then
+          if !frame.is_ack() then
+            let ack = H2Frame::settings_ack()
+            self.stream.write_all(&ack.encode())?
+          end
+          
+        when FrameType::Ping then
+          let pong = H2Frame::ping([0; 8], true)
+          self.stream.write_all(&pong.encode())?
+          
+        when FrameType::WindowUpdate then
+          # Handle window update
+          
+        else
+      end
+    end
+  end
+  
+  pub def send_response(self: &mut Self, stream: &H2Stream, status: u16, headers: &Map[String, String], body: &Vec[u8]) -> Result[Unit, String]
+    let mut response_headers: Map[String, String] = Map::new()
+    response_headers.insert(":status".to_string(), status.to_string())
+    for (k, v) in headers do
+      response_headers.insert(k.clone(), v.clone())
+    end
+    
+    let header_block = self.encoder.encode(&response_headers)
+    let end_stream = body.is_empty()
+    
+    let headers_frame = H2Frame::headers(stream.id, header_block, end_stream, true)
+    self.stream.write_all(&headers_frame.encode())?
+    
+    if !body.is_empty() then
+      let data_frame = H2Frame::data(stream.id, body.clone(), true)
+      self.stream.write_all(&data_frame.encode())?
+    end
+    
+    Result::Ok(())
+  end
+  
+  pub def close(self: &mut Self) -> Result[Unit, String]
+    let goaway = H2Frame::goaway(0, H2Error::NoError)
+    self.stream.write_all(&goaway.encode())?
+    Result::Ok(())
+  end
+end

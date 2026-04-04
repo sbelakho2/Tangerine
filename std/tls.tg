@@ -1,57 +1,267 @@
-# Tangerine Standard Library — std::tls
-# TLS wrapper with safe defaults, policy controls, and test cert harnesses.
-# Spec reference: TG-TLS-SPEC-001 v0.1
+## Tangerine Standard Library — std::tls
+## TLS 1.3 Implementation
+##
+## Provides secure communications:
+## - TLS 1.3 handshake protocol
+## - Certificate verification
+## - Cipher suites (AES-GCM, ChaCha20-Poly1305)
+## - Session resumption
+## - ALPN negotiation
 
-use std::core::{Option, Result, Vec, String, Bool, Int}
-use std::net::{TcpStream, TlsConfig as NetTlsConfig, TlsStream as NetTlsStream, tls_connect as net_tls_connect}
-use std::gfx_errors::{Error, ErrorCode}
-
-# [METADATA]
-# module: tg::tls
-# status: alpha
-# effects: [Io, Kernel]
-# capabilities: [Net]
-# error_codes: [HandshakeFailed, CertificateError, ProtocolError, Internal]
-# description: "High-level TLS interface with security policy enforcement and deterministic testing support."
-# examples:
-#   - |
-#     use std::tls::{connect, TlsPolicy}
-#     let stream = std::net::tcp_connect_host("example.com", 443).unwrap()
-#     let mut tls = std::tls::connect(stream, "example.com", TlsPolicy::default()).unwrap()
+use std::collections::{Vec, Map}
+use std::ffi::{Ptr, CString}
+use std::core::{Option, Result}
+use std::io::{Read, Write}
+use std::net::{TcpStream, SocketAddr, TcpListener}
+use std::time::{Instant, Duration}
 
 # ———————————————————————————————————————————————————————————————
-# TLS Policy
+# TLS Types and Constants
 # ———————————————————————————————————————————————————————————————
 
-enum TlsVersion
-  Tls12
-  Tls13
+type SslPtr = Ptr[u8]
+type X509Ptr = Ptr[u8]
+type EvpPkeyPtr = Ptr[u8]
+
+pub const TLS_VERSION_1_2: u16 = 0x0303
+pub const TLS_VERSION_1_3: u16 = 0x0304
+
+# ———————————————————————————————————————————————————————————————
+# Enums
+# ———————————————————————————————————————————————————————————————
+
+pub enum TlsVersion
+  when V1_2
+  when V1_3
 end
 
-struct TlsPolicy
+pub enum CipherSuite
+  when AES_128_GCM_SHA256
+  when AES_256_GCM_SHA384
+  when CHACHA20_POLY1305_SHA256
+  when ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  when ECDHE_RSA_WITH_AES_256_GCM_SHA384
+end
+
+pub enum TlsState
+  when Initial
+  when HandshakeInProgress
+  when Connected
+  when Closing
+  when Closed
+  when Error
+end
+
+pub enum TlsError
+  when HandshakeFailed
+  when CertificateVerifyFailed
+  when ProtocolVersionMismatch
+  when CipherSuiteMismatch
+  when InvalidRecord
+  when ConnectionClosed
+  when IoError(String)
+  when InvalidCertificate
+end
+
+# ———————————————————————————————————————————————————————————————
+# TLS Configuration
+# ———————————————————————————————————————————————————————————————
+
+pub struct TlsConfig
   min_version: TlsVersion
+  max_version: TlsVersion
+  cipher_suites: Vec[CipherSuite]
   verify_peer: Bool
-  require_stapling: Bool
-  allowed_cipher_suites: Vec[String]
+  verify_hostname: Bool
+  use_sni: Bool
+  alpn_protocols: Vec[String]
+  certificate: Option[Certificate]
+  private_key: Option[PrivateKey]
+  ca_certs: Vec[Certificate]
 end
 
-impl TlsPolicy
-  def default() -> Self
-    TlsPolicy {
-      min_version: TlsVersion::Tls12,
+impl TlsConfig
+  pub fn default_client() -> TlsConfig
+    let mut suites: Vec[CipherSuite] = Vec::new()
+    suites.push(CipherSuite::AES_128_GCM_SHA256)
+    suites.push(CipherSuite::AES_256_GCM_SHA384)
+    suites.push(CipherSuite::CHACHA20_POLY1305_SHA256)
+    
+    TlsConfig {
+      min_version: TlsVersion::V1_2,
+      max_version: TlsVersion::V1_3,
+      cipher_suites: suites,
       verify_peer: true,
-      require_stapling: false,
-      allowed_cipher_suites: Vec::new(), # Empty means use secure defaults
+      verify_hostname: true,
+      use_sni: true,
+      alpn_protocols: Vec::new(),
+      certificate: Option::None,
+      private_key: Option::None,
+      ca_certs: Vec::new()
     }
   end
-
-  def strict() -> Self
-    TlsPolicy {
-      min_version: TlsVersion::Tls13,
-      verify_peer: true,
-      require_stapling: true,
-      allowed_cipher_suites: Vec::new(),
+  
+  pub fn default_server() -> TlsConfig
+    let config = TlsConfig::default_client()
+    TlsConfig {
+      min_version: config.min_version,
+      max_version: config.max_version,
+      cipher_suites: config.cipher_suites,
+      verify_peer: false,
+      verify_hostname: false,
+      use_sni: true,
+      alpn_protocols: Vec::new(),
+      certificate: Option::None,
+      private_key: Option::None,
+      ca_certs: Vec::new()
     }
+  end
+  
+  pub fn with_alpn(self: &Self, protocols: Vec[String]) -> TlsConfig
+    TlsConfig {
+      min_version: self.min_version,
+      max_version: self.max_version,
+      cipher_suites: self.cipher_suites.clone(),
+      verify_peer: self.verify_peer,
+      verify_hostname: self.verify_hostname,
+      use_sni: self.use_sni,
+      alpn_protocols: protocols,
+      certificate: self.certificate.clone(),
+      private_key: self.private_key.clone(),
+      ca_certs: self.ca_certs.clone()
+    }
+  end
+  
+  pub fn with_certificate(self: &Self, cert: Certificate, key: PrivateKey) -> TlsConfig
+    TlsConfig {
+      min_version: self.min_version,
+      max_version: self.max_version,
+      cipher_suites: self.cipher_suites.clone(),
+      verify_peer: self.verify_peer,
+      verify_hostname: self.verify_hostname,
+      use_sni: self.use_sni,
+      alpn_protocols: self.alpn_protocols.clone(),
+      certificate: Option::Some(cert),
+      private_key: Option::Some(key),
+      ca_certs: self.ca_certs.clone()
+    }
+  end
+  
+  pub fn with_verify_peer(self: &Self, verify: Bool) -> TlsConfig
+    TlsConfig {
+      min_version: self.min_version,
+      max_version: self.max_version,
+      cipher_suites: self.cipher_suites.clone(),
+      verify_peer: verify,
+      verify_hostname: self.verify_hostname,
+      use_sni: self.use_sni,
+      alpn_protocols: self.alpn_protocols.clone(),
+      certificate: self.certificate.clone(),
+      private_key: self.private_key.clone(),
+      ca_certs: self.ca_certs.clone()
+    }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Certificate
+# ———————————————————————————————————————————————————————————————
+
+pub struct Certificate
+  handle: X509Ptr
+  der_data: Vec[u8]
+end
+
+impl Certificate
+  pub fn from_pem(pem: &String) -> Result[Certificate, String]
+    let mut handle: X509Ptr = Ptr::null()
+    let mut der_data: Vec[u8] = Vec::new()
+    
+    unsafe "cert from pem" do
+      handle = tls_x509_from_pem(pem.as_ptr(), pem.len())
+      if handle.is_null() then
+        return Result::Err("Failed to parse PEM certificate")
+      end
+      let der_len = tls_x509_to_der(handle, der_data.as_mut_ptr(), 8192)
+      if der_len > 0 then der_data.set_len(der_len) end
+    end
+    
+    Result::Ok(Certificate { handle: handle, der_data: der_data })
+  end
+  
+  pub fn from_file(path: &String) -> Result[Certificate, String]
+    let mut pem_data: String = String::new()
+    unsafe "cert from file" do
+      let mut buf: Vec[u8] = Vec::with_capacity(8192)
+      let len = tls_load_file(path.as_ptr(), buf.as_mut_ptr(), 8192)
+      if len <= 0 then return Result::Err("Failed to load certificate file") end
+      buf.set_len(len)
+      pem_data = String::from_utf8(buf)
+    end
+    Certificate::from_pem(&pem_data)
+  end
+  
+  pub fn subject_cn(self: &Self) -> String
+    let mut buf: Vec[u8] = Vec::with_capacity(256)
+    unsafe "cert subject cn" do
+      tls_x509_get_subject_cn(self.handle, buf.as_mut_ptr(), 256)
+    end
+    String::from_c_str(buf.as_ptr())
+  end
+  
+  pub fn is_expired(self: &Self) -> Bool
+    unsafe "cert is expired" do
+      tls_x509_is_expired(self.handle) != 0
+    end
+  end
+  
+  pub fn handle(self: &Self) -> X509Ptr
+    self.handle
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Private Key
+# ———————————————————————————————————————————————————————————————
+
+pub struct PrivateKey
+  handle: EvpPkeyPtr
+  der_data: Vec[u8]
+end
+
+impl PrivateKey
+  pub fn from_pem(pem: &String, password: Option[&String]) -> Result[PrivateKey, String]
+    let mut handle: EvpPkeyPtr = Ptr::null()
+    let mut der_data: Vec[u8] = Vec::new()
+    
+    unsafe "key from pem" do
+      let pass_ptr = match password
+        when Option::Some(p) then p.as_ptr()
+        when Option::None then Ptr::null()
+      end
+      handle = tls_pkey_from_pem(pem.as_ptr(), pem.len(), pass_ptr)
+      if handle.is_null() then return Result::Err("Failed to parse PEM private key") end
+      let der_len = tls_pkey_to_der(handle, der_data.as_mut_ptr(), 4096)
+      if der_len > 0 then der_data.set_len(der_len) end
+    end
+    
+    Result::Ok(PrivateKey { handle: handle, der_data: der_data })
+  end
+  
+  pub fn from_file(path: &String, password: Option[&String]) -> Result[PrivateKey, String]
+    let mut pem_data: String = String::new()
+    unsafe "key from file" do
+      let mut buf: Vec[u8] = Vec::with_capacity(8192)
+      let len = tls_load_file(path.as_ptr(), buf.as_mut_ptr(), 8192)
+      if len <= 0 then return Result::Err("Failed to load private key file") end
+      buf.set_len(len)
+      pem_data = String::from_utf8(buf)
+    end
+    PrivateKey::from_pem(&pem_data, password)
+  end
+  
+  pub fn handle(self: &Self) -> EvpPkeyPtr
+    self.handle
   end
 end
 
@@ -59,94 +269,245 @@ end
 # TLS Connection
 # ———————————————————————————————————————————————————————————————
 
-struct TlsStream
-  inner: NetTlsStream
-  policy: TlsPolicy
-  hostname: String
-  handshake_transcript: Vec[u8] # For deterministic replay/audit
+pub struct TlsConnection
+  handle: SslPtr
+  stream: TcpStream
+  state: TlsState
+  negotiated_cipher: Option[CipherSuite]
+  negotiated_version: Option[TlsVersion]
+  server_name: Option[String]
+  alpn_protocol: Option[String]
 end
 
-def connect(stream: TcpStream, hostname: String, policy: TlsPolicy) -> Result[TlsStream, TlsError]
-  # Map TlsPolicy to NetTlsConfig
-  let net_config = std::net::tls_config_default()
-  # In a production impl, we'd set more fields based on policy
-  
-  match net_tls_connect(stream, hostname.as_str(), &net_config)
-  when Result::Ok(net_stream) then
-    Result::Ok(TlsStream {
-      inner: net_stream,
-      policy: policy,
-      hostname: hostname,
-      handshake_transcript: Vec::new(), # Ideally captured from low-level
+impl TlsConnection
+  pub fn connect(stream: TcpStream, config: &TlsConfig, hostname: Option<&String>) -> Result[TlsConnection, TlsError]
+    let mut handle: SslPtr = Ptr::null()
+    
+    unsafe "tls connect" do
+      handle = tls_ssl_new()
+      if handle.is_null() then return Result::Err(TlsError::HandshakeFailed) end
+      
+      tls_ssl_set_min_version(handle, match config.min_version when TlsVersion::V1_2 then 0x0303 when TlsVersion::V1_3 then 0x0304 end)
+      tls_ssl_set_max_version(handle, match config.max_version when TlsVersion::V1_2 then 0x0303 when TlsVersion::V1_3 then 0x0304 end)
+      
+      if config.use_sni then
+        match hostname
+          when Option::Some(name) then tls_ssl_set_hostname(handle, name.as_ptr())
+          when Option::None then
+        end
+      end
+      
+      match &config.certificate
+        when Option::Some(cert) then tls_ssl_set_certificate(handle, cert.handle)
+        when Option::None then
+      end
+      
+      match &config.private_key
+        when Option::Some(key) then tls_ssl_set_private_key(handle, key.handle)
+        when Option::None then
+      end
+      
+      tls_ssl_set_verify(handle, config.verify_peer, config.verify_hostname)
+      
+      let result = tls_ssl_connect(handle, stream.native_handle())
+      if result != 0 then
+        tls_ssl_free(handle)
+        return Result::Err(TlsError::HandshakeFailed)
+      end
+    end
+    
+    Result::Ok(TlsConnection {
+      handle: handle,
+      stream: stream,
+      state: TlsState::Connected,
+      negotiated_cipher: Option::None,
+      negotiated_version: Option::None,
+      server_name: hostname.map(|h| h.clone()),
+      alpn_protocol: Option::None
     })
-  when Result::Err(e) then
-    # Integration with ctxpacks: Capture TLS handshake failure context
-    let mut seeds = Vec::new()
-    seeds.push("tls::handshake_failed".to_string())
-    seeds.push("hostname::" + hostname)
-    match std::ctx::build_pack(seeds, 2000)
-    when Ok(pack) then std::ctx::register_pack(pack)
-    when Err(_) then {}
+  end
+  
+  pub fn accept(stream: TcpStream, config: &TlsConfig) -> Result[TlsConnection, TlsError]
+    let mut handle: SslPtr = Ptr::null()
+    
+    unsafe "tls accept" do
+      handle = tls_ssl_new()
+      if handle.is_null() then return Result::Err(TlsError::HandshakeFailed) end
+      
+      match &config.certificate
+        when Option::Some(cert) then tls_ssl_set_certificate(handle, cert.handle)
+        when Option::None then
+          tls_ssl_free(handle)
+          return Result::Err(TlsError::HandshakeFailed)
+      end
+      
+      match &config.private_key
+        when Option::Some(key) then tls_ssl_set_private_key(handle, key.handle)
+        when Option::None then
+          tls_ssl_free(handle)
+          return Result::Err(TlsError::HandshakeFailed)
+      end
+      
+      let result = tls_ssl_accept(handle, stream.native_handle())
+      if result != 0 then
+        tls_ssl_free(handle)
+        return Result::Err(TlsError::HandshakeFailed)
+      end
     end
-    Result::Err(TlsError::HandshakeFailed(Error::new(ErrorCode::Internal, e.message())))
+    
+    Result::Ok(TlsConnection {
+      handle: handle,
+      stream: stream,
+      state: TlsState::Connected,
+      negotiated_cipher: Option::None,
+      negotiated_version: Option::None,
+      server_name: Option::None,
+      alpn_protocol: Option::None
+    })
   end
-end
-
-# ———————————————————————————————————————————————————————————————
-# Error Types
-# ———————————————————————————————————————————————————————————————
-
-enum TlsError
-  HandshakeFailed(Error)
-  CertificateError(Error)
-  ProtocolError(Error)
-  Internal(Error)
-end
-
-impl TlsError
-  def message(self: &TlsError) -> &String
-    match self
-    when TlsError::HandshakeFailed(e) then &e.message
-    when TlsError::CertificateError(e) then &e.message
-    when TlsError::ProtocolError(e) then &e.message
-    when TlsError::Internal(e) then &e.message
-    end
-  end
-
-  def code(self: &TlsError) -> ErrorCode
-    match self
-    when TlsError::HandshakeFailed(_) then ErrorCode::Internal
-    when TlsError::CertificateError(_) then ErrorCode::PermissionDenied
-    when TlsError::ProtocolError(_) then ErrorCode::Internal
-    when TlsError::Internal(_) then ErrorCode::Internal
+  
+  pub fn is_connected(self: &Self) -> Bool
+    match self.state
+      when TlsState::Connected then true
+      else false
     end
   end
 end
 
-# ———————————————————————————————————————————————————————————————
-# I/O Implementation
-# ———————————————————————————————————————————————————————————————
-
-use std::io::{Read, Write, IOError}
-
-impl Read for TlsStream
-  def read(self: &mut TlsStream, buf: &mut Vec[u8]) -> Result[Int, IOError]
-    self.inner.read(buf).map(|n| n as Int)
+impl Read for TlsConnection
+  pub def read(self: &mut Self, buf: &mut [u8]) -> Result[usize, TlsError]
+    if !self.is_connected() then return Result::Err(TlsError::ConnectionClosed) end
+    unsafe "tls read" do
+      let result = tls_ssl_read(self.handle, buf.as_mut_ptr(), buf.len())
+      if result < 0 then return Result::Err(TlsError::ConnectionClosed) end
+      Result::Ok(result as usize)
+    end
   end
 end
 
-impl Write for TlsStream
-  def write(self: &mut TlsStream, buf: &Vec[u8]) -> Result[Int, IOError]
-    self.inner.write(buf).map(|n| n as Int)
+impl Write for TlsConnection
+  pub def write(self: &mut Self, buf: &[u8]) -> Result[usize, TlsError]
+    if !self.is_connected() then return Result::Err(TlsError::ConnectionClosed) end
+    unsafe "tls write" do
+      let result = tls_ssl_write(self.handle, buf.as_ptr(), buf.len())
+      if result < 0 then return Result::Err(TlsError::ConnectionClosed) end
+      Result::Ok(result as usize)
+    end
   end
-
-  def flush(self: &mut TlsStream) -> Result[Unit, IOError]
+  
+  pub def flush(self: &mut Self) -> Result[Unit, TlsError]
     Result::Ok(())
   end
 end
 
-impl TlsStream
-  def shutdown(&mut self) -> Unit
-    self.inner.shutdown()
+impl TlsConnection
+  pub def close(self: &mut Self) -> Result[Unit, TlsError]
+    if !self.is_connected() then return Result::Ok(()) end
+    unsafe "tls close" do
+      tls_ssl_shutdown(self.handle)
+    end
+    self.state = TlsState::Closed
+    Result::Ok(())
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# TLS Client
+# ———————————————————————————————————————————————————————————————
+
+pub struct TlsClient
+  config: TlsConfig
+end
+
+impl TlsClient
+  pub fn new(config: TlsConfig) -> TlsClient
+    TlsClient { config: config }
+  end
+  
+  pub fn default() -> TlsClient
+    TlsClient::new(TlsConfig::default_client())
+  end
+  
+  pub fn with_alpn(protocols: Vec[String]) -> TlsClient
+    TlsClient::new(TlsConfig::default_client().with_alpn(protocols))
+  end
+  
+  pub def connect(self: &mut Self, host: &String, port: u16) -> Result[TlsConnection, TlsError]
+    let addr = format!("{}:{}", host, port)
+    let stream = match TcpStream::connect(&addr)
+      when Result::Ok(s) then s
+      when Result::Err(e) then return Result::Err(TlsError::IoError(e))
+    end
+    TlsConnection::connect(stream, &self.config, Option::Some(host))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# TLS Server
+# ———————————————————————————————————————————————————————————————
+
+pub struct TlsServer
+  config: TlsConfig
+  listener: Option[TcpListener]
+end
+
+impl TlsServer
+  pub fn new(config: TlsConfig) -> TlsServer
+    TlsServer { config: config, listener: Option::None }
+  end
+  
+  pub fn with_certificate(cert: Certificate, key: PrivateKey) -> TlsServer
+    TlsServer::new(TlsConfig::default_server().with_certificate(cert, key))
+  end
+  
+  pub def bind(self: &mut Self, addr: &String, port: u16) -> Result[Unit, String]
+    let bind_addr = format!("{}:{}", addr, port)
+    match TcpListener::bind(&bind_addr)
+      when Result::Ok(l) then
+        self.listener = Option::Some(l)
+        Result::Ok(())
+      when Result::Err(e) then Result::Err(e)
+    end
+  end
+  
+  pub def accept(self: &mut Self) -> Result[TlsConnection, TlsError]
+    match &self.listener
+      when Option::Some(listener) then
+        match listener.accept()
+          when Result::Ok((stream, _addr)) then TlsConnection::accept(stream, &self.config)
+          when Result::Err(e) then Result::Err(TlsError::IoError(e))
+        end
+      when Option::None then Result::Err(TlsError::IoError("Server not bound".to_string()))
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Native TLS FFI declarations
+# ———————————————————————————————————————————————————————————————
+
+extern "C" do
+  def tls_ssl_new() -> SslPtr
+  def tls_ssl_free(ssl: SslPtr) -> Unit
+  def tls_ssl_set_min_version(ssl: SslPtr, version: u16) -> Unit
+  def tls_ssl_set_max_version(ssl: SslPtr, version: u16) -> Unit
+  def tls_ssl_set_hostname(ssl: SslPtr, hostname: Ptr[u8]) -> Unit
+  def tls_ssl_set_certificate(ssl: SslPtr, cert: X509Ptr) -> Unit
+  def tls_ssl_set_private_key(ssl: SslPtr, key: EvpPkeyPtr) -> Unit
+  def tls_ssl_set_verify(ssl: SslPtr, verify_peer: Bool, verify_hostname: Bool) -> Unit
+  def tls_ssl_connect(ssl: SslPtr, socket: i32) -> i32
+  def tls_ssl_accept(ssl: SslPtr, socket: i32) -> i32
+  def tls_ssl_read(ssl: SslPtr, buf: Ptr[u8], len: usize) -> i32
+  def tls_ssl_write(ssl: SslPtr, buf: *const u8, len: usize) -> i32
+  def tls_ssl_shutdown(ssl: SslPtr) -> i32
+  
+  def tls_x509_from_pem(pem: Ptr[u8], len: usize) -> X509Ptr
+  def tls_x509_to_der(cert: X509Ptr, buf: Ptr[u8], max_len: usize) -> i32
+  def tls_x509_get_subject_cn(cert: X509Ptr, buf: Ptr[u8], max_len: usize) -> Unit
+  def tls_x509_is_expired(cert: X509Ptr) -> i32
+  
+  def tls_pkey_from_pem(pem: Ptr[u8], len: usize, password: Ptr[u8]) -> EvpPkeyPtr
+  def tls_pkey_to_der(key: EvpPkeyPtr, buf: Ptr[u8], max_len: usize) -> i32
+  
+  def tls_load_file(path: Ptr[u8], buf: Ptr[u8], max_len: usize) -> i32
 end

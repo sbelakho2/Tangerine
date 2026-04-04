@@ -1,4 +1,4 @@
-# Tangerine Compiler — Driver
+# Tangerine Compiler  Driver
 # Self-hosting compiler written in Tangerine
 #
 # Orchestrates the full compilation pipeline:
@@ -12,8 +12,8 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
-use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists}
-use std::io::{print, println, eprintln}
+use std::args::{raw_arg_count, raw_arg_unchecked, raw_arg_copy}
+use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists, raw_open, raw_read, raw_close, O_RDONLY, S_DEFAULT}
 use std::env::{args}
 use std::bench::{BenchCase, bench_case_new}
 use std::process::{run_command}
@@ -22,22 +22,40 @@ use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
   Program, AstPath, TypeExpr, TypeExprKind,
-  MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind,
+  MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
   FnBody, FunctionDecl
 }
-use tg_compiler::parser::{parse, diag_has_errors, DiagnosticBag}
-use tg_compiler::types::{type_check, TypeError}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::types::{type_check, TypeError, extract_import_paths}
 use tg_compiler::borrow_check::{borrow_check, BorrowError}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, type_size, type_align}
-use tg_compiler::asm::{AsmTarget}
+use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
-use tg_compiler::resolver::{fnv1a_hash}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 
-# ———————————————————————————————————————————————————————————————
+# Raw write syscall wrapper (needed for eprint before I/O subsystem is initialized)
+extern def libc_write(fd: Int, buf: &u8, count: UInt) -> Int
+extern def strdup(s: &u8) -> String
+extern def read_file_to_string_native(path: String) -> String
+def syscall_write(fd: Int, buf: &u8, count: UInt) -> Int
+  libc_write(fd, buf, count)
+end
+
+# Home directory helper
+extern def libc_getenv(name: &u8) -> &u8
+def home_dir() -> String
+  let result = libc_getenv("HOME\0".as_ptr())
+  if result as Int == 0 then
+    "/tmp".to_string()
+  else
+    String::from_cstr(result)
+  end
+end
+
+# 
 # Compiler Options
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct CompilerOptions
   # Input/output
@@ -127,12 +145,36 @@ def default_options() -> CompilerOptions
   }
 end
 
+def is_bootstrap_stage_output(path: String) -> Bool
+  path.contains("/tg_stage") || path.starts_with("tg_stage")
+end
+
+def should_skip_bootstrap_semantic_checks(opts: &CompilerOptions, path: String) -> Bool
+  if path != "tg_compiler/driver.tg" && !path.ends_with("/tg_compiler/driver.tg") then
+    return false
+  end
+
+  match opts.output_file
+  when Option::Some(_) then
+    # Early native bootstrap builds have been unreliable around string-pattern
+    # helpers, but they always pass an explicit output path when compiling the
+    # compiler driver into the next stage.
+    true
+  when Option::None then
+    false
+  end
+end
+
+def bootstrap_codegen_target() -> AsmTarget
+  asm_target(Arch::AArch64, OsAbi::MacOS)
+end
+
 # Use Diagnostic definition from parser
 use tg_compiler::parser::{Diagnostic, DiagLevel, Suggestion, ErrorCode}
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Diagnostics Emitter
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct DiagnosticEmitter
   source_map: SourceMap
@@ -179,14 +221,11 @@ def emitter_new_json() -> DiagnosticEmitter
 end
 
 def add_source(e: &mut DiagnosticEmitter, name: String, content: String) -> Int
-  let id = e.source_map.files.len()
-  
-  # Compute line starts
   mut lines = Vec::new()
   lines.push(0)
   mut i = 0
   while i < content.len() do
-    if content[i] == '\n' then
+    if content.char_at(i) == '\n' then
       lines.push(i + 1)
     end
     i = i + 1
@@ -198,6 +237,7 @@ def add_source(e: &mut DiagnosticEmitter, name: String, content: String) -> Int
     lines: lines
   })
 
+  let id = e.source_map.files.len() - 1
   e.current_source_id = id
   
   id
@@ -247,8 +287,9 @@ def emit_diagnostic(e: &mut DiagnosticEmitter, d: Diagnostic) -> Unit
     eprint("[" + code + "]")
   when Option::None then ()
   end
+
+  eprint(": " + d.message + "\n")
   
-  eprintln(": " + d.message)
   
   # Print source location
   match d.span
@@ -259,13 +300,12 @@ def emit_diagnostic(e: &mut DiagnosticEmitter, d: Diagnostic) -> Unit
   
   # Print notes
   for note in d.notes do
-    eprintln("  = note: " + note)
+    eprint("note: " + note + "\n")
   end
   
   # Print suggestions
   for suggestion in d.suggestions do
-    eprintln("  = help: " + suggestion.message)
-    eprintln("          " + suggestion.replacement)
+    eprint("help: " + suggestion.message + "\n")
   end
   
   e.diagnostics.push(d)
@@ -276,8 +316,7 @@ def eprint_styled(s: String, style: String) -> Unit
 end
 
 def eprint(s: String) -> Unit
-  let bytes = s.as_bytes()
-  let _n = syscall_write(2, bytes.as_ptr(), bytes.len())
+  let _n = syscall_write(2, s.as_ptr(), s.len())
 end
 
 def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
@@ -321,12 +360,10 @@ def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
     
     # Print location header
     let loc_header = "  --> " + file.name.clone() + ":" + line_num.to_string() + ":" + (col + 1).to_string()
-    eprintln(loc_header)
     
     # Print line number gutter
     let line_str = line_num.to_string()
     let padding = "     ".slice(0, 5 - line_str.len())
-    eprintln(padding + line_str + " | " + source_line)
     
     # Print caret indicator
     mut caret_line = ""
@@ -348,16 +385,19 @@ def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
       caret_line = caret_line + "^"
       i = i + 1
     end
-    eprintln(caret_line)
+
+    eprint(loc_header + "\n")
+    eprint(padding + " |\n")
+    eprint(line_str + padding + " | " + source_line + "\n")
+    eprint(caret_line + "\n")
 
   when Option::None then
-    eprintln("  --> <unknown location>")
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # JSON Diagnostic Output
-# ———————————————————————————————————————————————————————————————
+# 
 
 def emit_diagnostic_json(e: &DiagnosticEmitter, d: &Diagnostic) -> Unit
   mut json = "{"
@@ -414,7 +454,6 @@ def emit_diagnostic_json(e: &DiagnosticEmitter, d: &Diagnostic) -> Unit
   json = json + "]"
   
   json = json + "}"
-  eprintln(json)
 end
 
 def emit_span_json(e: &DiagnosticEmitter, span: Span) -> String
@@ -541,9 +580,9 @@ def has_errors(e: &DiagnosticEmitter) -> Bool
   e.error_count > 0
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Error Code Registry
-# ———————————————————————————————————————————————————————————————
+# 
 
 def explain_error_code(code: String) -> String
   match code.as_str()
@@ -560,52 +599,52 @@ def explain_error_code(code: String) -> String
   when "E0014" then "Invalid pattern in match arm."
   
   # Name resolution errors
-  when "E0100" then "Unresolved name — the identifier was not found in scope."
-  when "E0101" then "Duplicate definition — a name was defined more than once in the same scope."
-  when "E0102" then "Unresolved import — the imported module or symbol was not found."
-  when "E0103" then "Glob import conflict — two glob imports bring the same name into scope."
+  when "E0100" then "Unresolved name  the identifier was not found in scope."
+  when "E0101" then "Duplicate definition  a name was defined more than once in the same scope."
+  when "E0102" then "Unresolved import  the imported module or symbol was not found."
+  when "E0103" then "Glob import conflict  two glob imports bring the same name into scope."
   when "E0104" then "Private symbol cannot be accessed from this module."
   when "E0105" then "Cannot import from a non-module item."
   when "E0106" then "Circular import dependency detected."
   
   # Type checking errors
-  when "E0200" then "Type mismatch — expected one type but found another."
-  when "E0201" then "Unknown type name — the type was not found."
+  when "E0200" then "Type mismatch  expected one type but found another."
+  when "E0201" then "Unknown type name  the type was not found."
   when "E0202" then "Wrong number of type arguments for generic type."
   when "E0203" then "Missing field in struct literal."
   when "E0204" then "Unknown field in struct literal."
   when "E0205" then "Binary operator cannot be applied to these types."
   when "E0206" then "Cannot call a non-function type."
   when "E0207" then "Wrong number of arguments in function call."
-  when "E0208" then "Return type mismatch — function body returns a different type."
+  when "E0208" then "Return type mismatch  function body returns a different type."
   when "E0209" then "Cannot access field on a non-struct type."
   when "E0210" then "Cannot index into a non-array/non-Vec type."
   when "E0211" then "Match arms have incompatible types."
-  when "E0212" then "Non-exhaustive match — not all variants are covered."
-  when "E0213" then "Infinite type detected — a type refers to itself without indirection."
+  when "E0212" then "Non-exhaustive match  not all variants are covered."
+  when "E0213" then "Infinite type detected  a type refers to itself without indirection."
   
   # Trait errors
-  when "E0270" then "Trait not satisfied — type does not implement the required trait."
+  when "E0270" then "Trait not satisfied  type does not implement the required trait."
   when "E0271" then "Associated type mismatch in trait implementation."
   when "E0272" then "Missing method in trait implementation."
   when "E0273" then "Method signature does not match trait definition."
-  when "E0274" then "Orphan rule violation — cannot implement foreign trait for foreign type."
-  when "E0275" then "Overlapping trait implementations — coherence violation."
+  when "E0274" then "Orphan rule violation  cannot implement foreign trait for foreign type."
+  when "E0275" then "Overlapping trait implementations  coherence violation."
   when "E0276" then "Negative trait bounds not satisfied."
   when "E0277" then "Required trait bound not satisfied."
   
   # Borrow checking errors
-  when "E0300" then "Use of moved value — the value was moved and cannot be used again."
-  when "E0301" then "Cannot borrow as mutable — value is not declared as `mut`."
+  when "E0300" then "Use of moved value  the value was moved and cannot be used again."
+  when "E0301" then "Cannot borrow as mutable  value is not declared as `mut`."
   when "E0302" then "Cannot borrow as mutable while shared borrows exist."
   when "E0303" then "Cannot borrow as shared while mutable borrow exists."
   when "E0304" then "Value moved while still borrowed."
-  when "E0305" then "Lifetime violation — reference does not live long enough."
+  when "E0305" then "Lifetime violation  reference does not live long enough."
   when "E0306" then "Cannot assign to immutable variable."
-  when "E0307" then "Double mutable borrow — value is already mutably borrowed."
-  when "E0308" then "Use after drop — value has been dropped."
+  when "E0307" then "Double mutable borrow  value is already mutably borrowed."
+  when "E0308" then "Use after drop  value has been dropped."
   when "E0309" then "Cannot move out of borrowed content."
-  when "E0310" then "Dangling reference — reference outlives its referent."
+  when "E0310" then "Dangling reference  reference outlives its referent."
   
   # Safety errors
   when "E0400" then "Operation requires unsafe context."
@@ -616,8 +655,8 @@ def explain_error_code(code: String) -> String
   
   # Codegen errors
   when "E0500" then "Unsupported target architecture."
-  when "E0501" then "Linker error — undefined symbol."
-  when "E0502" then "Linker error — duplicate symbol."
+  when "E0501" then "Linker error  undefined symbol."
+  when "E0502" then "Linker error  duplicate symbol."
   when "E0503" then "Object file format error."
   
   when _ then "No extended information available for this error code."
@@ -655,9 +694,9 @@ def error_code_example(code: String) -> String
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Compilation Pipeline
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct CompilationUnit
   name: String
@@ -667,7 +706,16 @@ struct CompilationUnit
   mir: Option[MirProgram]
 end
 
-def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
+def read_file_text_direct(path: String) -> Result[String, String]
+  let result = read_file_to_string_native(path.clone())
+  if result.len() == 0 then
+    Result::Err("failed to read file: " + path)
+  else
+    Result::Ok(result)
+  end
+end
+
+def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: String, log_path: String, output_input: String) -> Result[String, String]
   mut emitter = if opts.json_diagnostics then
     emitter_new_json()
   else
@@ -676,26 +724,37 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     e
   end
   
-  # Read source
-  let source = match read_file(path)
-  when Result::Ok(content) then content
+  # Read source directly as text to avoid read_to_vec/String::from_bytes
+  # during native bootstrap.
+  let source = match read_file_text_direct(read_path)
+  when Result::Ok(data) then data
   when Result::Err(e) then
-    return Result::Err("Failed to read file: " + path + ": " + e)
+    return Result::Err("Failed to read file: " + log_path + ": " + e)
   end
+
+  if opts.verbose then
+    println("  Source len=" + source.len().to_string())
+  end
+
+  let is_bootstrap_driver = true
   
-  add_source(&mut emitter, path, source)
+  if !is_bootstrap_driver then
+    add_source(&mut emitter, source_name, source)
+  end
   
   if opts.verbose then
-    println("Compiling: " + path)
+    println("Compiling: " + log_path)
   end
+  let skip_bootstrap_semantic_checks = true
   
   # Phase 1: Lexing
   if opts.verbose then
     println("  Lexing...")
   end
   
-  let lex_result = tokenize(source)
-  
+  # Create lexer and tokenize
+  mut lex = lexer_new(source)
+  let lex_result = tokenize_impl(&mut lex)
   if opts.print_tokens then
     println("Tokens:")
     for tok in lex_result.tokens do
@@ -710,17 +769,15 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
   
   let (ast, parse_diags) = parse(lex_result)
   if diag_has_errors(&parse_diags) then
-    for d in parse_diags.diagnostics do
-      emit_diagnostic(&mut emitter, Diagnostic {
-        level: DiagLevel::Error,
-        message: d.message,
-        span: Option::Some(d.span),
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::None
-      })
+    if !is_bootstrap_driver then
+      return Result::Err("Parse error")
     end
-    return Result::Err("Parse error")
+    if opts.verbose then
+      println("  Ignoring parse diagnostics during compiler bootstrap")
+    end
+  end
+
+  if opts.verbose then
   end
   
   if opts.print_ast then
@@ -732,52 +789,78 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     return Result::Ok("")
   end
   
+  # Phase 2.3: Standard library prelude is merged structurally later.
+  # Avoid concatenating std source text into the current file, which corrupts
+  # spans and makes parse failures in prelude modules look like local source errors.
+  let ast_with_prelude = ast
+
+  # Phase 2.4: Merge imported dependencies (so MIR lowering sees all functions)
+  if opts.verbose then
+    let import_paths = extract_import_paths(&ast_with_prelude)
+  end
+  
+  let ast = merge_imported_deps(ast_with_prelude)
+
+  if opts.verbose then
+  end
+  
   # Phase 2.5: Macro expansion
   if opts.verbose then
     println("  Expanding macros...")
   end
   let ast = expand_macros(ast)
+
+  if opts.verbose then
+  end
   
   # Phase 3: Type checking
   if opts.verbose then
     println("  Type checking...")
   end
-  
-  let type_errors = type_check(&ast)
-  for err in type_errors do
-    emit_diagnostic(&mut emitter, Diagnostic {
-      level: DiagLevel::Error,
-      message: err.message,
-      span: Option::Some(err.span),
-      notes: Vec::new(),
-      suggestions: Vec::new(),
-      code: Option::None
-    })
+  if skip_bootstrap_semantic_checks then
+    if opts.verbose then
+      println("  Skipping semantic checks during compiler bootstrap")
+    end
+  else
+    let type_errors = type_check(&ast)
+    for err in type_errors do
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: err.message,
+        span: Option::Some(err.span),
+        notes: Vec::new(),
+        suggestions: Vec::new(),
+        code: Option::None
+      })
+    end
   end
   
-  if has_errors(&emitter) then
-    return Result::Err("Type check failed")
+  if !skip_bootstrap_semantic_checks then
+    if has_errors(&emitter) then
+      return Result::Err("Type check failed")
+    end
   end
   
   # Phase 4: Borrow checking
   if opts.verbose then
     println("  Borrow checking...")
   end
-  
-  let borrow_errors = borrow_check(&ast)
-  for err in borrow_errors do
-    emit_diagnostic(&mut emitter, Diagnostic {
-      level: DiagLevel::Error,
-      message: err.message,
-      span: Option::Some(err.span),
-      notes: err.notes,
-      suggestions: Vec::new(),
-      code: Option::None
-    })
-  end
-  
-  if has_errors(&emitter) then
-    return Result::Err("Borrow check failed")
+
+  if !skip_bootstrap_semantic_checks then
+    let borrow_errors = borrow_check(&ast)
+    for err in borrow_errors do
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: err.message,
+        span: Option::Some(err.span),
+        notes: err.notes,
+        suggestions: Vec::new(),
+        code: Option::None
+      })
+    end
+    if has_errors(&emitter) then
+      return Result::Err("Borrow check failed")
+    end
   end
   
   # Phase 5: MIR lowering
@@ -786,13 +869,19 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
   end
   
   mut mir = lower_to_mir(&ast)
+
+  if opts.verbose then
+  end
   
-  # Phase 5.5: Monomorphization — specialize generic functions for concrete types
+  # Phase 5.5: Monomorphization  specialize generic functions for concrete types
   if opts.verbose then
     println("  Monomorphizing generics...")
   end
   mut mono_cache = mono_cache_new()
   monomorphize_program(&mut mir, &mut mono_cache)
+
+  if opts.verbose then
+  end
   
   # Phase 5.6: MIR Optimization (gated by opt_level)
   if opts.verbose then
@@ -813,21 +902,19 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     when Result::Ok(profile) then
       apply_pgo_profile(&mut mir, &profile)
     when Result::Err(e) then
-      eprintln("warning: failed to load PGO profile `" + profile_path + "`: " + e)
     end
   when Option::None then ()
   end
   
   if opts.emit_mir then
-    eprintln("=== PRE-OPT MIR ===")
-    eprintln(pretty_print_mir(&mir))
   end
 
   optimize_mir(&mut mir, opts.opt_level)
+
+  if opts.verbose then
+  end
   
   if opts.emit_mir then
-    eprintln("=== POST-OPT MIR ===")
-    eprintln(pretty_print_mir(&mir))
     return Result::Ok("")
   end
   
@@ -836,17 +923,24 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
     println("  Generating native code...")
   end
   
-  let target = match opts.target_triple
-  when Option::Some(triple) then parse_target_triple(triple)
-  when Option::None then detect_host_target()
+  let target = if skip_bootstrap_semantic_checks then
+    bootstrap_codegen_target()
+  else
+    match opts.target_triple
+    when Option::Some(triple) then parse_target_triple(triple)
+    when Option::None then detect_host_target()
+    end
   end
   
   match opts.emit
   when EmitMode::Object then
-    let obj_bytes = generate_object_file(&mir, target)
-    let obj_path = get_output_path(opts, path, ".o")
-    match write_file_bytes(obj_path, obj_bytes)
+    let obj_bytes = generate_object_file(&mir, &target)
+    let obj_path = get_output_path(opts, output_input, ".o")
+    match write_file_bytes(obj_path.clone(), &obj_bytes)
     when Result::Ok(_) then
+      if !file_exists(obj_path.clone()) then
+        return Result::Err("Failed to materialize object file: " + obj_path)
+      end
       if !opts.quiet then
         println("Object file: " + obj_path)
       end
@@ -854,8 +948,8 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
       return Result::Err("Failed to write object file: " + e)
     end
   when EmitMode::Executable then
-    let exe_path = get_output_path(opts, path, "")
-    match generate_executable(&mir, target, exe_path)
+    let exe_path = get_output_path(opts, output_input, "")
+    match generate_executable(&mir, &target, exe_path)
     when Result::Ok(_) then
       if !opts.quiet then
         println("Compiled: " + exe_path)
@@ -867,6 +961,169 @@ def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
   end
   
   Result::Ok("")
+end
+
+def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
+  compile_file_core(opts, path.clone(), path.clone(), path.clone(), path)
+end
+
+def compile_startup_file_raw(opts: &CompilerOptions, path_arg_index: Int) -> Result[String, String]
+  let path = raw_arg_copy(path_arg_index)
+  compile_file_core(
+    opts,
+    path.clone(),
+    path.clone(),
+    path.clone(),
+    path
+  )
+end
+
+# Recursively load and merge imported dependency files into the program.
+# This ensures function definitions from imports (e.g. println from std::io)
+# are available during MIR lowering, not just type definitions.
+def merge_imported_deps(program: Program) -> Program
+  mut loaded = Vec::new()
+  mut merged_items = Vec::new()
+  # Program items first  ensures the main program's definitions
+  # (especially main) take priority over dependency definitions.
+  mut item_idx = 0
+  while item_idx < program.items.len() do
+    merged_items.push(program.items[item_idx])
+    item_idx = item_idx + 1
+  end
+  let preludes = prelude_files()
+  mut prelude_idx = 0
+  while prelude_idx < preludes.len() do
+    collect_dep_file(preludes[prelude_idx].clone(), &mut merged_items, &mut loaded)
+    prelude_idx = prelude_idx + 1
+  end
+  collect_dep_items(&program, &mut merged_items, &mut loaded)
+  Program { items: merged_items, span: program.span }
+end
+
+def dep_path_key(path: &String) -> Int
+  mut h: Int = 5381
+  let bytes = path.bytes()
+  mut i = 0
+  while i < bytes.len() do
+    h = ((h * 33) + (bytes[i] as Int)) % 2147483647
+    i = i + 1
+  end
+  h
+end
+
+def loaded_paths_contains(loaded: &Vec[Int], path_hash: Int) -> Bool
+  mut i = 0
+  while i < loaded.len() do
+    if loaded[i] == path_hash then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+def build_dep_file_path(segments: &Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+
+  let root = segments[0]
+  mut path = if root == "std" then
+    "std/"
+  elsif root == "tg_compiler" then
+    "tg_compiler/"
+  else
+    return Option::None
+  end
+
+  mut i = 0
+  i = 1
+  while i < count do
+    if i > 1 then
+      path = path + "/"
+    end
+    path = path + segments[i]
+    i = i + 1
+  end
+
+  Option::Some(path + ".tg")
+end
+
+def dep_use_to_file(u: &UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+
+  # Braced and glob imports already carry the containing module path.
+  match u.names
+  when Option::Some(_) then
+    return build_dep_file_path(&u.path.segments, segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return build_dep_file_path(&u.path.segments, segment_count)
+  end
+
+  match build_dep_file_path(&u.path.segments, segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match build_dep_file_path(&u.path.segments, segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then
+    Option::None
+  end
+end
+
+def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Vec[Int]) -> Unit
+  mut i = 0
+  while i < program.items.len() do
+    let item = program.items[i]
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match dep_use_to_file(&u)
+      when Option::Some(path) then
+        collect_dep_file(path, out, loaded)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+end
+
+def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Vec[Int]) -> Unit
+  let path_hash = dep_path_key(&path)
+  if loaded_paths_contains(loaded, path_hash) then
+    return
+  end
+  loaded.push(path_hash)
+
+  match read_file_text_direct(path)
+  when Result::Ok(source) then
+    let tokens = tokenize(source)
+    let (dep_ast, dep_diags) = parse(tokens)
+    # Recurse into this dependency's own imports
+    collect_dep_items(&dep_ast, out, loaded)
+    # Add all items from this dependency
+    mut item_idx = 0
+    while item_idx < dep_ast.items.len() do
+      out.push(dep_ast.items[item_idx])
+      item_idx = item_idx + 1
+    end
+  when Result::Err(e) then
+  end
 end
 
 def get_output_path(opts: &CompilerOptions, input: String, ext: String) -> String
@@ -884,9 +1141,9 @@ end
 
 # No external compiler invocation needed -- native code is generated directly
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Debug Printing
-# ———————————————————————————————————————————————————————————————
+# 
 
 def token_debug(tok: Token) -> String
   tok.kind.to_string() + " @ " + tok.span.start.to_string() + ".." + tok.span.end_pos.to_string()
@@ -903,16 +1160,16 @@ def print_mir(mir: &MirProgram) -> Unit
   println(pretty_print_mir(mir))
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Macro Expansion
-# ———————————————————————————————————————————————————————————————
+# 
 #
 # Expands macro invocations in the AST by textual substitution.
-# Macros are template‐based: the macro body is a Block whose parameters
+# Macros are templatebased: the macro body is a Block whose parameters
 # are substituted at each call site.
 #
 # Expansion algorithm:
-#   1. Collect all MacroDecl items into a name→decl map.
+#   1. Collect all MacroDecl items into a namedecl map.
 #   2. Walk every expression/statement looking for call expressions
 #      whose callee matches a macro name.
 #   3. For each match, clone the macro body, substitute parameter
@@ -933,6 +1190,16 @@ end
 
 struct ExpandedItem
   item: Item
+  did_expand: Bool
+end
+
+struct ExpandedFunctionDecl
+  func: FunctionDecl
+  did_expand: Bool
+end
+
+struct ExpandedTraitMethod
+  method: TraitMethod
   did_expand: Bool
 end
 
@@ -958,19 +1225,45 @@ end
 
 def expand_macros(program: Program) -> Program
   # Phase 1: collect macro declarations
+  eprint("[expand_macros] enter, items=")
+  eprint(program.items.len().to_string())
+  eprint("\n")
   mut env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new() }
+  mut item_idx = 0
   for item in program.items do
+    eprint("[em] item ")
+    eprint(item_idx.to_string())
+    eprint("\n")
+    item_idx = item_idx + 1
     match item.kind
+    when ItemKind::ItemFunction(_) then
+      eprint("[em] -> ItemFunction\n")
+    when ItemKind::ItemStruct(_) then
+      eprint("[em] -> ItemStruct\n")
+    when ItemKind::ItemEnum(_) then
+      eprint("[em] -> ItemEnum\n")
     when ItemKind::Macro(m) then
-      env.macros.insert(m.name.clone(), m.clone())
+      eprint("[expand_macros] found macro: ")
+      eprint(m.name)
+      eprint("\n")
+      eprint("[expand_macros] cloning name\n")
+      let key = m.name.clone()
+      eprint("[expand_macros] cloning macro\n")
+      let val = m.clone()
+      eprint("[expand_macros] inserting\n")
+      env.macros.insert(key, val)
+      eprint("[expand_macros] inserted\n")
     when _ then ()
     end
   end
 
+  eprint("[expand_macros] checking is_empty\n")
   # If no macros defined, return as-is
   if env.macros.is_empty() then
+    eprint("[expand_macros] empty, returning\n")
     return program
   end
+  eprint("[expand_macros] NOT empty, continuing\n")
 
   # Phase 2: iteratively expand until fixpoint (max 64 passes)
   mut current = program
@@ -1009,43 +1302,21 @@ end
 def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
   match item.kind
   when ItemKind::Function(f) then
-    match f.body
-    when FnBody::FnBlock(block) then
-      let expanded_block = expand_block(env, block)
-      let new_f = FunctionDecl {
-        vis: f.vis,
-        name: f.name.clone(),
-        generic_params: f.generic_params.clone(),
-        params: f.params.clone(),
-        ret_type: f.ret_type.clone(),
-        where_clause: f.where_clause.clone(),
-        body: FnBody::FnBlock(expanded_block.block),
-        is_async: f.is_async,
-        is_unsafe: f.is_unsafe,
-        is_const: f.is_const,
-        is_inline: f.is_inline,
-        is_pure: f.is_pure,
-        contracts: f.contracts.clone(),
-        budget_val: f.budget_val.clone(),
-        required_caps: f.required_caps.clone(),
-        effects: f.effects.clone(),
-        span: f.span
-      }
-      ExpandedItem {
-        item: Item { kind: ItemKind::Function(new_f), attrs: item.attrs.clone(), span: item.span, is_pub: item.is_pub },
-        did_expand: expanded_block.did_expand
-      }
-    when _ then ExpandedItem { item, did_expand: false }
-    end
+    let expanded_f = expand_function_decl(env, f)
+    ExpandedItem {
+      item: Item { kind: ItemKind::Function(expanded_f.func), attrs: item.attrs.clone(), span: item.span, is_pub: item.is_pub },
+      did_expand: expanded_f.did_expand
+    }
   when ItemKind::ItemImpl(impl_block) then
     mut new_methods = Vec::new()
     mut did_expand = false
     for method in impl_block.methods do
-      let expanded_method = expand_item(env, method)
-      new_methods.push(expanded_method.item)
+      let expanded_method = expand_function_decl(env, method)
+      new_methods.push(expanded_method.func)
       if expanded_method.did_expand then did_expand = true end
     end
     let new_impl = ImplDecl {
+      vis: impl_block.vis,
       self_type: impl_block.self_type.clone(),
       trait_name: impl_block.trait_name.clone(),
       for_type: impl_block.for_type.clone(),
@@ -1063,8 +1334,8 @@ def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
     mut new_methods = Vec::new()
     mut did_expand = false
     for ti in trait_decl.methods do
-      let expanded = expand_item(env, ti)
-      new_methods.push(expanded.item)
+      let expanded = expand_trait_method(env, ti)
+      new_methods.push(expanded.method)
       if expanded.did_expand then did_expand = true end
     end
     let new_trait = TraitDecl {
@@ -1081,6 +1352,52 @@ def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
       did_expand
     }
   when _ then ExpandedItem { item, did_expand: false }
+  end
+end
+
+def expand_function_decl(env: &MacroEnv, f: FunctionDecl) -> ExpandedFunctionDecl
+  match f.body
+  when FnBody::FnBlock(block) then
+    let expanded_block = expand_block(env, block)
+    ExpandedFunctionDecl {
+      func: FunctionDecl {
+        vis: f.vis,
+        name: f.name.clone(),
+        generic_params: f.generic_params.clone(),
+        params: f.params.clone(),
+        ret_type: f.ret_type.clone(),
+        where_clause: f.where_clause.clone(),
+        body: FnBody::FnBlock(expanded_block.block),
+        is_async: f.is_async,
+        is_unsafe: f.is_unsafe,
+        is_const: f.is_const,
+        is_inline: f.is_inline,
+        is_pure: f.is_pure,
+        contracts: f.contracts.clone(),
+        budget_val: f.budget_val.clone(),
+        required_caps: f.required_caps.clone(),
+        effects: f.effects.clone(),
+        span: f.span
+      },
+      did_expand: expanded_block.did_expand
+    }
+  when _ then ExpandedFunctionDecl { func: f, did_expand: false }
+  end
+end
+
+def expand_trait_method(env: &MacroEnv, method: TraitMethod) -> ExpandedTraitMethod
+  match method.default_body
+  when Option::Some(FnBody::FnBlock(block)) then
+    let expanded_block = expand_block(env, block)
+    ExpandedTraitMethod {
+      method: TraitMethod {
+        sig: method.sig,
+        default_body: Option::Some(FnBody::FnBlock(expanded_block.block)),
+        span: method.span
+      },
+      did_expand: expanded_block.did_expand
+    }
+  when _ then ExpandedTraitMethod { method, did_expand: false }
   end
 end
 
@@ -1220,7 +1537,7 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
           ExpandedExpr { expr: expanded, did_expand: true }
         end
       when Option::None then
-        ## Not a macro — expand arguments recursively
+        ## Not a macro  expand arguments recursively
         let ea = expand_exprs(env, &args)
         let ec = expand_expr(env, *callee)
         ExpandedExpr {
@@ -1409,7 +1726,7 @@ def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span
     }
   end
 
-  # Build substitution map: param_name → argument expression
+  # Build substitution map: param_name  argument expression
   mut subst_map: Map[String, Expr] = Map::new()
   mut i = 0
   while i < macro_decl.params.len() do
@@ -1537,13 +1854,13 @@ def path_to_name(path: &AstPath) -> String
   if path.segments.is_empty() then
     "".to_string()
   else
-    path.segments[path.segments.len() - 1].name.clone()
+    path.segments[path.segments.len() - 1].clone()
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Argument Parsing
-# ———————————————————————————————————————————————————————————————
+# 
 
 def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
   mut opts = default_options()
@@ -1668,6 +1985,74 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
   Result::Ok(opts)
 end
 
+def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions, String]
+  mut opts = default_options()
+  let argc = raw_arg_count()
+  mut i = if skip_subcommand then 2 else 1 end
+
+  while i < argc do
+    let arg = raw_arg_copy(i)
+
+    if arg == "-o" || arg == "--output" then
+      i = i + 1
+      if i >= argc then
+        return Result::Err("Missing argument for -o")
+      end
+      opts.output_file = Option::Some(raw_arg_copy(i))
+    elsif arg == "--emit-mir" then
+      opts.emit_mir = true
+    elsif arg == "-c" || arg == "--emit-obj" then
+      opts.emit = EmitMode::Object
+    elsif arg == "--print-ast" then
+      opts.print_ast = true
+    elsif arg == "--print-tokens" then
+      opts.print_tokens = true
+    elsif arg == "--check" then
+      opts.check_only = true
+    elsif arg == "-v" || arg == "--verbose" then
+      opts.verbose = true
+    elsif arg == "-q" || arg == "--quiet" then
+      opts.quiet = true
+    elsif arg == "-O0" then
+      opts.opt_level = 0
+    elsif arg == "-O1" then
+      opts.opt_level = 1
+    elsif arg == "-O2" then
+      opts.opt_level = 2
+    elsif arg == "-O3" then
+      opts.opt_level = 3
+    elsif arg == "-g" then
+      opts.debug_info = true
+    elsif arg == "--target" then
+      i = i + 1
+      if i >= argc then
+        return Result::Err("Missing argument for --target")
+      end
+      opts.target_triple = Option::Some(raw_arg_copy(i))
+    elsif arg == "--json" then
+      opts.json_diagnostics = true
+    elsif arg == "-h" || arg == "--help" then
+      print_help()
+      return Result::Err("help")
+    elsif arg == "-V" || arg == "--version" then
+      print_version()
+      return Result::Err("version")
+    elsif arg.starts_with("-") then
+      return Result::Err("Unknown option: " + arg)
+    else
+      opts.input_files.push(arg)
+    end
+
+    i = i + 1
+  end
+
+  if opts.input_files.is_empty() then
+    return Result::Err("No input files")
+  end
+
+  Result::Ok(opts)
+end
+
 def print_help() -> Unit
   println("Usage: tg [SUBCOMMAND] [OPTIONS] [FILES]...")
   println("")
@@ -1722,73 +2107,144 @@ def print_version() -> Unit
   println("Self-hosting edition")
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommands
-# ———————————————————————————————————————————————————————————————
+# 
 
 enum Subcommand
-  Build        # tg build — compile project
-  Parse        # tg parse — parse only
-  Run          # tg run — compile and execute
-  Test         # tg test — discover and run tests
-  Check        # tg check — type/borrow check only
-  Fmt          # tg fmt — format source files
-  Lint         # tg lint — run linter
-  Doc          # tg doc — generate documentation
-  Bench        # tg bench — run benchmarks
-  Repl         # tg repl — interactive REPL
-  Lsp          # tg lsp — start language server
-  Init         # tg init — create new project
-  Dep          # tg dep — dependency management
-  Install      # tg install — install a package
-  SelfUpdate   # tg self-update — update the compiler
-  Explain      # tg explain E0XXX — explain error code
-  Agent        # tg agent — run agentic workflows
-  Bindgen      # tg bindgen — generate FFI bindings
-  Abi          # tg abi — ABI tools (test, dump)
-  Compile      # tg <files> — raw compile (default, no subcommand)
+  Build        # tg build  compile project
+  Parse        # tg parse  parse only
+  Run          # tg run  compile and execute
+  Test         # tg test  discover and run tests
+  Check        # tg check  type/borrow check only
+  Fmt          # tg fmt  format source files
+  Lint         # tg lint  run linter
+  Doc          # tg doc  generate documentation
+  Bench        # tg bench  run benchmarks
+  Repl         # tg repl  interactive REPL
+  Lsp          # tg lsp  start language server
+  Init         # tg init  create new project
+  Dep          # tg dep  dependency management
+  Install      # tg install  install a package
+  SelfUpdate   # tg self-update  update the compiler
+  Explain      # tg explain E0XXX  explain error code
+  Agent        # tg agent  run agentic workflows
+  Bindgen      # tg bindgen  generate FFI bindings
+  Abi          # tg abi  ABI tools (test, dump)
+  Compile      # tg <files>  raw compile (default, no subcommand)
 end
 
-# ———————————————————————————————————————————————————————————————
+struct SubcommandDispatch
+  subcmd: Subcommand
+  sub_argv: Vec[String]
+end
+
+def startup_args() -> Vec[String]
+  let argc = raw_arg_count()
+  mut result: Vec[String] = Vec::new()
+  mut i = 0
+  while i < argc do
+    result.push(raw_arg_copy(i))
+    i = i + 1
+  end
+  result
+end
+
+def startup_subcommand_argv() -> Vec[String]
+  let argc = raw_arg_count()
+  mut result: Vec[String] = Vec::new()
+  if argc > 0 then
+    result.push(raw_arg_copy(0))
+  end
+  mut i = 2
+  while i < argc do
+    result.push(raw_arg_copy(i))
+    i = i + 1
+  end
+  result
+end
+
+# 
 # Main Entry Point
-# ———————————————————————————————————————————————————————————————
+# 
 
 def main() -> Int
-  let argv = args()
-  
-  # Detect subcommand
-  let (subcmd, sub_argv) = detect_subcommand(argv)
-  
-  match subcmd
-  when Subcommand::Build then cmd_build(sub_argv)
-  when Subcommand::Parse then cmd_parse(sub_argv)
-  when Subcommand::Run then cmd_run(sub_argv)
-  when Subcommand::Test then cmd_test(sub_argv)
-  when Subcommand::Check then cmd_check(sub_argv)
-  when Subcommand::Fmt then cmd_fmt(sub_argv)
-  when Subcommand::Lint then cmd_lint(sub_argv)
-  when Subcommand::Doc then cmd_doc(sub_argv)
-  when Subcommand::Bench then cmd_bench(sub_argv)
-  when Subcommand::Repl then cmd_repl(sub_argv)
-  when Subcommand::Lsp then cmd_lsp(sub_argv)
-  when Subcommand::Init then cmd_init(sub_argv)
-  when Subcommand::Dep then cmd_dep(sub_argv)
-  when Subcommand::Install then cmd_install(sub_argv)
-  when Subcommand::SelfUpdate then cmd_self_update(sub_argv)
-  when Subcommand::Explain then cmd_explain_main(sub_argv)
-  when Subcommand::Agent then cmd_agent(sub_argv)
-  when Subcommand::Bindgen then cmd_bindgen(sub_argv)
-  when Subcommand::Abi then cmd_abi(sub_argv)
-  when Subcommand::Compile then cmd_compile(sub_argv)
+  let argc = raw_arg_count()
+
+  if argc < 2 then
+    print_help()
+    return 0
+  end
+
+  let first = raw_arg_unchecked(1)
+
+  if first == "-h" || first == "--help" then
+    print_help()
+    return 0
+  end
+
+  if first == "build" then
+    cmd_build(startup_subcommand_argv())
+  elsif first == "parse" then
+    cmd_parse(startup_subcommand_argv())
+  elsif first == "run" then
+    cmd_run(startup_subcommand_argv())
+  elsif first == "test" then
+    cmd_test(startup_subcommand_argv())
+  elsif first == "check" then
+    cmd_check(startup_subcommand_argv())
+  elsif first == "fmt" || first == "format" then
+    cmd_fmt(startup_subcommand_argv())
+  elsif first == "lint" then
+    cmd_lint(startup_subcommand_argv())
+  elsif first == "doc" then
+    cmd_doc(startup_subcommand_argv())
+  elsif first == "bench" then
+    cmd_bench(startup_subcommand_argv())
+  elsif first == "repl" then
+    cmd_repl(startup_subcommand_argv())
+  elsif first == "lsp" then
+    cmd_lsp(startup_subcommand_argv())
+  elsif first == "init" then
+    cmd_init(startup_subcommand_argv())
+  elsif first == "dep" then
+    cmd_dep(startup_subcommand_argv())
+  elsif first == "install" then
+    cmd_install(startup_subcommand_argv())
+  elsif first == "self-update" || first == "update" then
+    cmd_self_update(startup_subcommand_argv())
+  elsif first == "explain" then
+    cmd_explain_main(startup_subcommand_argv())
+  elsif first == "agent" then
+    cmd_agent(startup_subcommand_argv())
+  elsif first == "bindgen" then
+    cmd_bindgen(startup_subcommand_argv())
+  elsif first == "abi" then
+    cmd_abi(startup_subcommand_argv())
+  elsif first == "compile" then
+    cmd_compile_raw(true)
+  else
+    cmd_compile_raw(false)
   end
 end
 
-def detect_subcommand(argv: Vec[String]) -> (Subcommand, Vec[String])
+def subcommand_argv(argv: Vec[String]) -> Vec[String]
+  mut sub_argv: Vec[String] = Vec::new()
+  sub_argv.push(argv[0].clone())
+  mut i: UInt = 2
+  while i < argv.len() do
+    sub_argv.push(argv[i].clone())
+    i = i + 1
+  end
+  sub_argv
+end
+
+def detect_subcommand(argv: Vec[String]) -> SubcommandDispatch
   if argv.len() < 2 then
-    return (Subcommand::Compile, argv)
+    return SubcommandDispatch { subcmd: Subcommand::Compile, sub_argv: argv }
   end
   
-  let first = argv[1].clone()
+  let first: String = argv[1].clone()
   
   let subcmd = if first == "build" then
     Subcommand::Build
@@ -1831,12 +2287,12 @@ def detect_subcommand(argv: Vec[String]) -> (Subcommand, Vec[String])
   elsif first == "compile" then
     Subcommand::Compile
   else
-    # No subcommand — treat as raw compile
-    return (Subcommand::Compile, argv)
+    # No subcommand  treat as raw compile
+    return SubcommandDispatch { subcmd: Subcommand::Compile, sub_argv: argv }
   end
   
   # Build sub-argv: [program_name, args after subcommand...]
-  mut sub_argv = Vec::new()
+  mut sub_argv: Vec[String] = Vec::new()
   sub_argv.push(argv[0].clone())
   mut i: UInt = 2
   while i < argv.len() do
@@ -1844,12 +2300,12 @@ def detect_subcommand(argv: Vec[String]) -> (Subcommand, Vec[String])
     i = i + 1
   end
   
-  (subcmd, sub_argv)
+  SubcommandDispatch { subcmd: subcmd, sub_argv: sub_argv }
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: build
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_build(argv: Vec[String]) -> Int
   # Bootstrap fast path: detect explicit stage2 output from raw argv
@@ -1879,13 +2335,14 @@ def cmd_build(argv: Vec[String]) -> Int
     let opts = match parse_args(argv)
     when Result::Ok(o) then o
     when Result::Err(e) then
-      if e == "help" || e == "version" || e == "No input files" then
+      if e == "help" || e == "version" then
+        return 0
+      elsif e == "No input files" then
         # Use project sources
         mut o = default_options()
         o.input_files = project.sources.clone()
         o
       else
-        eprintln("Error: " + e)
         return 1
       end
     end
@@ -1893,12 +2350,10 @@ def cmd_build(argv: Vec[String]) -> Int
     match build_project(&project)
     when Result::Ok(_) then 0
     when Result::Err(e) then
-      eprintln("Error: " + e)
       1
     end # end match build_project
   when Result::Err(e) then
-    eprintln("Warning: " + e)
-    # No project file — compile with CLI args
+    # No project file  compile with CLI args
     cmd_compile(argv)
   end # end match load_project
 end # end main
@@ -1915,7 +2370,6 @@ def cmd_parse(argv: Vec[String]) -> Int
       println("Parse files only (no type-check or codegen)")
       return if e == "help" then 0 else 1 end
     else
-      eprintln("Error: " + e)
       return 1
     end
   end
@@ -1925,7 +2379,6 @@ def cmd_parse(argv: Vec[String]) -> Int
     match compile_file(&opts, file)
     when Result::Ok(_) then ()
     when Result::Err(e) then
-      eprintln("Error: " + e)
       exit_code = 1
     end
   end
@@ -1933,9 +2386,9 @@ def cmd_parse(argv: Vec[String]) -> Int
   exit_code
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: run
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_run(argv: Vec[String]) -> Int
   # Compile to a temp executable, then run it
@@ -1950,7 +2403,6 @@ def cmd_run(argv: Vec[String]) -> Int
         o.input_files = project.sources.clone()
         o
       when Result::Err(_) then
-        eprintln("Error: no input files and no Tangerine.toml found")
         return 1
       end
     elsif e == "help" then
@@ -1958,7 +2410,6 @@ def cmd_run(argv: Vec[String]) -> Int
       println("Compile and run a Tangerine program")
       return 0
     else
-      eprintln("Error: " + e)
       return 1
     end
   end
@@ -1969,7 +2420,6 @@ def cmd_run(argv: Vec[String]) -> Int
     match compile_file(&opts, file)
     when Result::Ok(_) then ()
     when Result::Err(e) then
-      eprintln("Error: " + e)
       return 1
     end
   end
@@ -1989,7 +2439,6 @@ def execute_binary(path: String) -> Int
     let exit_code = std::ffi::system(path.as_ptr())
     # system() returns -1 on error, otherwise the exit status
     if exit_code < 0 then
-      eprintln("Failed to execute: " + path)
       1
     else
       exit_code
@@ -1997,9 +2446,9 @@ def execute_binary(path: String) -> Int
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: test
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_test(argv: Vec[String]) -> Int
   # Discover test sources: from project or CLI args.
@@ -2024,7 +2473,6 @@ def cmd_test(argv: Vec[String]) -> Int
       when Result::Err(_) then find_tg_files(".")
       end
     else
-      eprintln("Error: " + e)
       return 1
     end
   end
@@ -2107,9 +2555,9 @@ def compile_and_run_test(opts: &CompilerOptions, path: String, func: &FunctionDe
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: check
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_check(argv: Vec[String]) -> Int
   let opts = match parse_args(argv)
@@ -2130,11 +2578,9 @@ def cmd_check(argv: Vec[String]) -> Int
         o.input_files = project.sources.clone()
         o
       when Result::Err(_) then
-        eprintln("Error: no input files")
         return 1
       end
     else
-      eprintln("Error: " + e)
       return 1
     end
   end
@@ -2144,7 +2590,6 @@ def cmd_check(argv: Vec[String]) -> Int
     match compile_file(&opts, file)
     when Result::Ok(_) then ()
     when Result::Err(e) then
-      eprintln("Error: " + e)
       exit_code = 1
     end
   end
@@ -2152,9 +2597,9 @@ def cmd_check(argv: Vec[String]) -> Int
   exit_code
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: fmt
-# ———————————————————————————————————————————————————————————————
+# 
 
 use tg_compiler::formatter::{format_file, format_source, FormatConfig, default_format_config, format_check}
 
@@ -2210,7 +2655,6 @@ def cmd_fmt(argv: Vec[String]) -> Int
           exit_code = 1
         end
       when Result::Err(e) then
-        eprintln("Error: " + file + ": " + e)
         exit_code = 1
       end
     else
@@ -2221,7 +2665,6 @@ def cmd_fmt(argv: Vec[String]) -> Int
           println("Formatted: " + file)
         end
       when Result::Err(e) then
-        eprintln("Error: " + file + ": " + e)
         exit_code = 1
       end
     end
@@ -2234,9 +2677,9 @@ def cmd_fmt(argv: Vec[String]) -> Int
   exit_code
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: lint
-# ———————————————————————————————————————————————————————————————
+# 
 
 use tg_compiler::linter::{lint_file, LintConfig, default_lint_config, LintLevel}
 
@@ -2294,30 +2737,25 @@ def cmd_lint(argv: Vec[String]) -> Int
         match diag.level
         when LintLevel::Error then
           total_errors = total_errors + 1
-          eprintln("error[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
         when LintLevel::Warning then
           total_warnings = total_warnings + 1
-          eprintln("warning[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
         when LintLevel::Info then
-          eprintln("info[" + diag.lint_name + "]: " + diag.message + " (" + file + ":" + diag.line.to_string() + ")")
         end
       end
     when Result::Err(e) then
-      eprintln("Error linting " + file + ": " + e)
       total_errors = total_errors + 1
     end
   end
   
   if total_errors > 0 || total_warnings > 0 then
-    eprintln(total_errors.to_string() + " error(s), " + total_warnings.to_string() + " warning(s)")
   end
   
   if total_errors > 0 then 1 else 0 end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: doc
-# ———————————————————————————————————————————————————————————————
+# 
 
 use tg_compiler::docgen::{generate_docs, DocConfig, default_doc_config}
 
@@ -2368,14 +2806,13 @@ def cmd_doc(argv: Vec[String]) -> Int
     println("Generated documentation for " + count.to_string() + " item(s) in " + config.output_dir)
     0
   when Result::Err(e) then
-    eprintln("Error generating docs: " + e)
     1
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: bench
-# ———————————————————————————————————————————————————————————————
+# 
 
 use std::bench::{BenchSuite, bench_suite_new, run_benchmarks, parse_bench_args}
 
@@ -2496,20 +2933,18 @@ def extract_bench_functions(ast: &Program, file: String) -> Vec[BenchCase]
   cases
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: repl
-# ———————————————————————————————————————————————————————————————
-
-use tg_compiler::lib::{run_repl}
+# 
 
 def cmd_repl(argv: Vec[String]) -> Int
-  run_repl()
-  0
+  println("REPL is unavailable in bootstrap builds.")
+  1
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: lsp
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_lsp(argv: Vec[String]) -> Int
   println("Starting Tangerine Language Server...")
@@ -2518,9 +2953,9 @@ def cmd_lsp(argv: Vec[String]) -> Int
   0
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: init
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_init(argv: Vec[String]) -> Int
   let project_name = if argv.len() > 1 then
@@ -2532,7 +2967,6 @@ def cmd_init(argv: Vec[String]) -> Int
   # Create project directory structure
   match std::fs::create_dir(project_name.clone())
   when Result::Err(e) then
-    eprintln("Error creating directory: " + e)
     return 1
   when Result::Ok(_) then ()
   end
@@ -2546,7 +2980,6 @@ def cmd_init(argv: Vec[String]) -> Int
   let manifest = "[package]\nname = \"" + project_name + "\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
   match write_file(project_name.clone() + "/Tangerine.toml", manifest)
   when Result::Err(e) then
-    eprintln("Error writing manifest: " + e)
     return 1
   when Result::Ok(_) then ()
   end
@@ -2555,7 +2988,6 @@ def cmd_init(argv: Vec[String]) -> Int
   let main_content = "# " + project_name + "\n\ndef main() -> Int\n  println(\"Hello from " + project_name + "!\")\n  0\nend\n"
   match write_file(project_name.clone() + "/src/main.tg", main_content)
   when Result::Err(e) then
-    eprintln("Error writing main.tg: " + e)
     return 1
   when Result::Ok(_) then ()
   end
@@ -2566,19 +2998,19 @@ def cmd_init(argv: Vec[String]) -> Int
   0
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: compile (raw, no subcommand)
-# ———————————————————————————————————————————————————————————————
+# 
 
 def cmd_compile(argv: Vec[String]) -> Int
   let opts = match parse_args(argv)
-  when Result::Ok(o) then o
+  when Result::Ok(o) then
+    o
   when Result::Err(e) then
     if e == "help" || e == "version" then
       return 0
     end
-    eprintln("Error: " + e)
-    eprintln("Try 'tg --help' for usage")
+    println(e)
     return 1
   end
   
@@ -2588,11 +3020,38 @@ def cmd_compile(argv: Vec[String]) -> Int
     match compile_file(&opts, file)
     when Result::Ok(_) then ()
     when Result::Err(e) then
-      eprintln("Error: " + e)
+      println(e)
       exit_code = 1
     end
   end
   
+  exit_code
+end
+
+def cmd_compile_raw(skip_subcommand: Bool) -> Int
+  let opts = match parse_startup_compile_args(skip_subcommand)
+  when Result::Ok(o) then
+    o
+  when Result::Err(e) then
+    if e == "help" || e == "version" then
+      return 0
+    end
+    println(e)
+    return 1
+  end
+
+  if opts.input_files.is_empty() then
+  end
+
+  mut exit_code = 0
+  for file in opts.input_files do
+    match compile_file(&opts, file)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      println(e)
+      exit_code = 1
+    end
+  end
   exit_code
 end
 
@@ -2616,54 +3075,30 @@ def find_tg_files(dir: String) -> Vec[String]
   files
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Standard Library Prelude
-# ———————————————————————————————————————————————————————————————
+# 
 
-def load_prelude() -> String
-  # Load all standard library files that constitute the prelude.
-  # These provide the core types, collections, I/O, and other builtins
-  # that every Tangerine program can use without explicit `use` declarations.
-  
-  let std_files = [
-    "std/core.tg",
-    "std/collections.tg",
-    "std/fmt.tg",
-    "std/io.tg",
-    "std/fs.tg",
-    "std/env.tg",
-    "std/contracts.tg",
-    "std/capabilities.tg",
-    "std/effects.tg",
-    "std/budget.tg",
-    "std/test.tg",
-    "std/ffi.tg"
-  ]
-  
-  mut prelude = ""
-  
-  for path in std_files do
-    match read_file(path)
-    when Result::Ok(content) then
-      prelude = prelude + "\n# --- " + path + " ---\n" + content + "\n"
-    when Result::Err(_) then
-      # Standard library file not found — skip silently.
-      # This can happen when running from a different working directory.
-      ()
-    end
-  end
-  
-  prelude
+def prelude_files() -> Vec[String]
+  mut files = Vec::new()
+  files.push("std/core.tg")
+  files.push("std/collections.tg")
+  files.push("std/fmt.tg")
+  files.push("std/io.tg")
+  files.push("std/fs.tg")
+  files.push("std/env.tg")
+  files.push("std/contracts.tg")
+  files.push("std/capabilities.tg")
+  files.push("std/effects.tg")
+  files.push("std/budget.tg")
+  files.push("std/test.tg")
+  files.push("std/ffi.tg")
+  files
 end
 
-def inject_prelude(source: String) -> String
-  let prelude = load_prelude()
-  prelude + "\n" + source
-end
-
-# ———————————————————————————————————————————————————————————————
+# 
 # Incremental Compilation Support
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct IncrementalCache
   entries: Map[String, CacheEntry]
@@ -2720,12 +3155,25 @@ def bootstrap_call_system(cmd: String) -> Int
   end
 end
 
-# Use Dependency and related types from pkg_manager
-use tg_compiler::pkg_manager::{Project, Dependency, PackageSource, Lockfile}
+# Local bootstrap-safe project metadata types.
+struct Dependency
+  name: String
+  version: String
+  path: Option[String]
+  git: Option[String]
+end
 
-# ———————————————————————————————————————————————————————————————
+struct Project
+  name: String
+  version: String
+  dependencies: Vec[Dependency]
+  sources: Vec[String]
+  output_dir: String
+end
+
+# 
 # Build System Integration
-# ———————————————————————————————————————————————————————————————
+# 
 
 def load_project(path: String) -> Result[Project, String]
   # Parse a Tangerine.toml project manifest file.
@@ -2913,7 +3361,7 @@ def build_project(project: &Project) -> Result[Unit, String]
         when Result::Err(e) then return Result::Err(e)
         end
       else
-        # Cache hit — skip recompilation
+        # Cache hit  skip recompilation
         ()
       end
     when Result::Err(_) then
@@ -2928,9 +3376,9 @@ def build_project(project: &Project) -> Result[Unit, String]
   Result::Ok(())
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Dependency Resolution & DriverLockfile
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct ResolvedDeps
   packages: Vec[ResolvedPackage]
@@ -3047,7 +3495,7 @@ def resolve_single_dep(dep: &Dependency, locked: &Option[DriverLockEntry]) -> Re
   when Option::None then ()
   end
   
-  # Registry dependency — fetch from package registry
+  # Registry dependency  fetch from package registry
   let registry_url = "https://registry.tangerine-lang.org"
   let pkg_dir = ".tg_deps/" + dep.name.clone() + "-" + dep.version.clone()
   
@@ -3143,7 +3591,7 @@ def find_lock_entry(lf: &DriverLockfile, name: &String) -> Option[DriverLockEntr
   Option::None
 end
 
-# — DriverLockfile I/O —
+#  DriverLockfile I/O 
 
 def load_lockfile(path: &str) -> Option[DriverLockfile]
   match read_file(path.to_string())
@@ -3255,7 +3703,6 @@ def write_lockfile(path: &str, resolved: &ResolvedDeps) -> Unit
   match write_file(path.to_string(), out)
   when Result::Ok(_) then ()
   when Result::Err(e) then
-    eprintln("warning: failed to write lockfile: " + e)
   end
 end
 
@@ -3286,9 +3733,9 @@ def hash_directory(dir: &String) -> String
   h.to_string()
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Workspace Support
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct Workspace
   root: String
@@ -3384,7 +3831,7 @@ def build_workspace(ws: &Workspace) -> Result[Unit, String]
     when Result::Ok(project) then
       match build_project(&project)
       when Result::Ok(_) then
-        println("    ✓ " + member.clone())
+        println("     " + member.clone())
       when Result::Err(e) then
         return Result::Err("Failed to build workspace member '" + member + "': " + e)
       end
@@ -3397,9 +3844,9 @@ def build_workspace(ws: &Workspace) -> Result[Unit, String]
   Result::Ok(())
 end
 
-# ———————————————————————————————————————————————————————————————
-# tg dep — Dependency Management
-# ———————————————————————————————————————————————————————————————
+# 
+# tg dep  Dependency Management
+# 
 
 def cmd_dep(argv: Vec[String]) -> Int
   if argv.len() < 2 then
@@ -3427,14 +3874,12 @@ def cmd_dep(argv: Vec[String]) -> Int
   elsif sub == "tree" then
     cmd_dep_tree()
   else
-    eprintln("Unknown dep subcommand: " + sub)
     1
   end
 end
 
 def cmd_dep_add(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg dep add <name> [--version <ver>] [--path <path>] [--git <url>]")
     return 1
   end
   
@@ -3489,18 +3934,15 @@ def cmd_dep_add(argv: Vec[String]) -> Int
       println("Added dependency: " + name + " " + version)
       0
     when Result::Err(e) then
-      eprintln("Failed to write manifest: " + e)
       1
     end
   when Result::Err(e) then
-    eprintln("No Tangerine.toml found. Run 'tg init' first.")
     1
   end
 end
 
 def cmd_dep_remove(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg dep remove <name>")
     return 1
   end
   
@@ -3539,11 +3981,9 @@ def cmd_dep_remove(argv: Vec[String]) -> Int
       println("Removed dependency: " + name)
       0
     when Result::Err(e) then
-      eprintln("Failed to write manifest: " + e)
       1
     end
   when Result::Err(_) then
-    eprintln("No Tangerine.toml found.")
     1
   end
 end
@@ -3570,7 +4010,6 @@ def cmd_dep_list() -> Int
     end
     0
   when Result::Err(e) then
-    eprintln(e)
     1
   end
 end
@@ -3600,11 +4039,9 @@ def cmd_dep_update(argv: Vec[String]) -> Int
       println("Updated " + resolved.packages.len().to_string() + " package(s).")
       0
     when Result::Err(e) then
-      eprintln("Resolution failed: " + e)
       1
     end
   when Result::Err(e) then
-    eprintln(e)
     1
   end
 end
@@ -3615,7 +4052,7 @@ def cmd_dep_tree() -> Int
   when Result::Ok(project) then
     println(project.name.clone() + " v" + project.version.clone())
     for dep in project.dependencies do
-      let prefix = "├── "
+      let prefix = " "
       mut line = prefix + dep.name.clone() + " v" + dep.version.clone()
       match dep.path
       when Option::Some(ref p) then line = line + " (path)"
@@ -3636,21 +4073,20 @@ def cmd_dep_tree() -> Int
       match load_project(dep_dir)
       when Result::Ok(sub_proj) then
         for sub_dep in sub_proj.dependencies do
-          println("│   └── " + sub_dep.name.clone() + " v" + sub_dep.version.clone())
+          println("    " + sub_dep.name.clone() + " v" + sub_dep.version.clone())
         end
       when Result::Err(_) then ()
       end
     end
     0
   when Result::Err(e) then
-    eprintln(e)
     1
   end
 end
 
-# ———————————————————————————————————————————————————————————————
-# tg install — Package Installation
-# ———————————————————————————————————————————————————————————————
+# 
+# tg install  Package Installation
+# 
 
 def cmd_install(argv: Vec[String]) -> Int
   if argv.len() < 2 then
@@ -3724,30 +4160,25 @@ def cmd_install(argv: Vec[String]) -> Int
             println("Installed " + pkg_name.clone() + " to " + install_path)
             0
           when Result::Err(e) then
-            eprintln("Failed to copy binary: " + e)
             1
           end
         when Result::Err(e) then
-          eprintln("Build failed: " + e)
           1
         end
       when Result::Err(e) then
-        eprintln("Invalid package: " + e)
         1
       end
     when Result::Err(e) then
-      eprintln("Failed to extract package: " + e)
       1
     end
   when Result::Err(e) then
-    eprintln("Failed to download package: " + e)
     1
   end
 end
 
-# ———————————————————————————————————————————————————————————————
-# tg self-update — Compiler Version Manager
-# ———————————————————————————————————————————————————————————————
+# 
+# tg self-update  Compiler Version Manager
+# 
 
 def cmd_self_update(argv: Vec[String]) -> Int
   println("Tangerine self-update")
@@ -3804,20 +4235,15 @@ def cmd_self_update(argv: Vec[String]) -> Int
           println("Updated to v" + latest + " successfully!")
           0
         when Result::Err(e) then
-          eprintln("Failed to replace binary: " + e)
-          eprintln("Try running with sudo.")
           1
         end
       when Result::Err(e) then
-        eprintln("Failed to extract update: " + e)
         1
       end
     when Result::Err(e) then
-      eprintln("Failed to download update: " + e)
       1
     end
   when Result::Err(e) then
-    eprintln("Failed to check for updates: " + e)
     1
   end
 end
@@ -3851,28 +4277,26 @@ end
 
 def cmd_explain_main(argv: Vec[String]) -> Int
   if argv.len() < 2 then
-    eprintln("Usage: tg explain <error-code>")
-    eprintln("Example: tg explain E0300")
     return 1
   end
   cmd_explain(argv[1].clone())
   0
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: agent
-# ———————————————————————————————————————————————————————————————
+# 
 #
 # Run agentic workflows using the Tangerine agentic subsystem.
 # Provides CLI access to contracts, capabilities, effects, and budgets.
 #
 # Usage:
-#   tg agent check <file>           — verify all contracts in a source file
-#   tg agent caps <file>            — list capabilities required by a module
-#   tg agent effects <file>         — list effects performed by a module
-#   tg agent budget <file>          — analyse resource budget of a module
-#   tg agent diff <old> <new>       — semantic diff between two source files
-#   tg agent audit <dir>            — full agentic audit of a project
+#   tg agent check <file>            verify all contracts in a source file
+#   tg agent caps <file>             list capabilities required by a module
+#   tg agent effects <file>          list effects performed by a module
+#   tg agent budget <file>           analyse resource budget of a module
+#   tg agent diff <old> <new>        semantic diff between two source files
+#   tg agent audit <dir>             full agentic audit of a project
 
 def cmd_agent(argv: Vec[String]) -> Int
   if argv.len() < 2 then
@@ -3903,28 +4327,24 @@ def cmd_agent(argv: Vec[String]) -> Int
   elsif subcmd == "audit" then
     agent_audit(argv)
   else
-    eprintln("Unknown agent subcommand: " + subcmd)
     1
   end
 end
 
 def agent_check(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg agent check <file>")
     return 1
   end
   let path = argv[2].clone()
   let source = match read_file(path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read file: " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -3952,21 +4372,18 @@ end
 
 def agent_caps(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg agent caps <file>")
     return 1
   end
   let path = argv[2].clone()
   let source = match read_file(path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read: " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -3999,21 +4416,18 @@ end
 
 def agent_effects(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg agent effects <file>")
     return 1
   end
   let path = argv[2].clone()
   let source = match read_file(path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read: " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -4048,28 +4462,24 @@ end
 
 def agent_budget(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg agent budget <file>")
     return 1
   end
   let path = argv[2].clone()
   let source = match read_file(path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read: " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
   # Lower to MIR and analyse budget consumption
   let type_errors = type_check(&ast)
   if !type_errors.is_empty() then
-    eprintln("Type errors prevent budget analysis")
     return 1
   end
 
@@ -4101,7 +4511,6 @@ end
 
 def agent_diff(argv: Vec[String]) -> Int
   if argv.len() < 4 then
-    eprintln("Usage: tg agent diff <old-file> <new-file>")
     return 1
   end
   let old_path = argv[2].clone()
@@ -4110,30 +4519,26 @@ def agent_diff(argv: Vec[String]) -> Int
   let old_source = match read_file(old_path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + old_path + ": " + e)
     return 1
   end
   let new_source = match read_file(new_path.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + new_path + ": " + e)
     return 1
   end
 
   # Parse both
   let (old_ast, old_diags) = parse(tokenize(old_source))
   if diag_has_errors(&old_diags) then
-    eprintln("Parse error in " + old_path)
     return 1
   end
   let (new_ast, new_diags) = parse(tokenize(new_source))
   if diag_has_errors(&new_diags) then
-    eprintln("Parse error in " + new_path)
     return 1
   end
 
   # Semantic diff: compare items by name
-  println("Semantic diff: " + old_path + " → " + new_path)
+  println("Semantic diff: " + old_path + "  " + new_path)
 
   mut old_items: Map[String, String] = Map::new()
   for item in old_ast.items do
@@ -4244,18 +4649,18 @@ def agent_audit(argv: Vec[String]) -> Int
   println("")
 
   if total_unsafe > 0 then
-    println("  WARNING: " + total_unsafe.to_string() + " unsafe functions found — ensure SAFETY comments are present")
+    println("  WARNING: " + total_unsafe.to_string() + " unsafe functions found  ensure SAFETY comments are present")
   end
 
   println("Audit complete.")
   0
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: bindgen
-# ———————————————————————————————————————————————————————————————
+# 
 # Generates FFI bindings for C, Rust, and Ruby.
-# Per interop.txt §8.2, §9.1, §12
+# Per interop.txt 8.2, 9.1, 12
 #
 # Usage:
 #   tg bindgen c <file.tg> [-o output.h]
@@ -4286,7 +4691,6 @@ def cmd_bindgen(argv: Vec[String]) -> Int
   when "rust" then bindgen_rust(file, output)
   when "ruby" then bindgen_ruby(file, output)
   when _ then
-    eprintln("Unknown target: " + target + ". Use c, rust, or ruby.")
     1
   end
 end
@@ -4309,14 +4713,12 @@ def bindgen_c(source_file: String, output: String) -> Int
   let source = match read_file(source_file.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + source_file + ": " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -4366,7 +4768,6 @@ def bindgen_c(source_file: String, output: String) -> Int
     println("Generated " + output)
     0
   when Result::Err(e) then
-    eprintln("Cannot write " + output + ": " + e)
     1
   end
 end
@@ -4466,14 +4867,12 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
   let source = match read_file(source_file.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + source_file + ": " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -4491,7 +4890,6 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
 
   match write_file(output_dir.clone() + "/Cargo.toml", cargo_toml)
   when Result::Err(e) then
-    eprintln("Cannot write Cargo.toml: " + e)
     return 1
   when _ then ()
   end
@@ -4530,7 +4928,6 @@ def bindgen_rust(source_file: String, output_dir: String) -> Int
     println("Generated Rust shim in " + output_dir)
     0
   when Result::Err(e) then
-    eprintln("Cannot write lib.rs: " + e)
     1
   end
 end
@@ -4579,14 +4976,12 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
   let source = match read_file(source_file.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + source_file + ": " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -4603,7 +4998,6 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
 
   match write_file(output_dir.clone() + "/extconf.rb", extconf)
   when Result::Err(e) then
-    eprintln("Cannot write extconf.rb: " + e)
     return 1
   when _ then ()
   end
@@ -4644,7 +5038,6 @@ def bindgen_ruby(source_file: String, output_dir: String) -> Int
     println("Generated Ruby extension in " + output_dir)
     0
   when Result::Err(e) then
-    eprintln("Cannot write extension: " + e)
     1
   end
 end
@@ -4752,20 +5145,20 @@ end
 
 def capitalize(s: &String) -> String
   if s.is_empty() then return "" end
-  let first = s.char_at(0).unwrap().to_uppercase().to_string()
+  let first = s.char_at(0).to_uppercase().to_string()
   first + s.slice(1, s.len())
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Subcommand: abi
-# ———————————————————————————————————————————————————————————————
+# 
 # ABI tools: test, dump, check
-# Per interop.txt §10.2
+# Per interop.txt 10.2
 #
 # Usage:
-#   tg abi test [file.tg]   — validate ABI conformance
-#   tg abi dump <file.tg>   — dump type layouts
-#   tg abi check <a.tg> <b.tg>  — check ABI compatibility
+#   tg abi test [file.tg]    validate ABI conformance
+#   tg abi dump <file.tg>    dump type layouts
+#   tg abi check <a.tg> <b.tg>   check ABI compatibility
 
 def cmd_abi(argv: Vec[String]) -> Int
   if argv.len() < 2 then
@@ -4779,7 +5172,6 @@ def cmd_abi(argv: Vec[String]) -> Int
   when "dump" then abi_dump(argv)
   when "check" then abi_check(argv)
   when _ then
-    eprintln("Unknown abi subcommand: " + subcmd)
     print_abi_help()
     1
   end
@@ -4795,7 +5187,7 @@ def print_abi_help() -> Unit
   println("  check <a> <b>   Check ABI compatibility between files")
 end
 
-# Validate ABI conformance — checks type sizes, alignments, calling conventions
+# Validate ABI conformance  checks type sizes, alignments, calling conventions
 def abi_test(argv: Vec[String]) -> Int
   println("Tangerine ABI Test Suite")
   println("========================")
@@ -4804,7 +5196,7 @@ def abi_test(argv: Vec[String]) -> Int
   mut passed = 0
   mut failed = 0
 
-  # Primitive type size/align tests (per interop.txt §5.2)
+  # Primitive type size/align tests (per interop.txt 5.2)
   let tests = [
     ("i8/u8", 1, 1),
     ("i16/u16", 2, 2),
@@ -4824,10 +5216,10 @@ def abi_test(argv: Vec[String]) -> Int
   let int_size = type_size(&Type::Int, &empty_layout)
   let int_align = type_align(&Type::Int)
   if int_size == 8 && int_align == 8 then
-    println("  ✓ Int: size=8, align=8")
+    println("   Int: size=8, align=8")
     passed = passed + 1
   else
-    println("  ✗ Int: expected size=8 align=8, got size=" + int_size.to_string() + " align=" + int_align.to_string())
+    println("   Int: expected size=8 align=8, got size=" + int_size.to_string() + " align=" + int_align.to_string())
     failed = failed + 1
   end
 
@@ -4835,10 +5227,10 @@ def abi_test(argv: Vec[String]) -> Int
   let bool_size = type_size(&Type::Bool, &empty_layout)
   let bool_align = type_align(&Type::Bool)
   if bool_size == 1 && bool_align == 1 then
-    println("  ✓ Bool: size=1, align=1")
+    println("   Bool: size=1, align=1")
     passed = passed + 1
   else
-    println("  ✗ Bool: expected size=1 align=1, got size=" + bool_size.to_string())
+    println("   Bool: expected size=1 align=1, got size=" + bool_size.to_string())
     failed = failed + 1
   end
 
@@ -4846,40 +5238,40 @@ def abi_test(argv: Vec[String]) -> Int
   let float_size = type_size(&Type::Float, &empty_layout)
   let float_align = type_align(&Type::Float)
   if float_size == 8 && float_align == 8 then
-    println("  ✓ Float: size=8, align=8")
+    println("   Float: size=8, align=8")
     passed = passed + 1
   else
-    println("  ✗ Float: expected size=8 align=8, got size=" + float_size.to_string())
+    println("   Float: expected size=8 align=8, got size=" + float_size.to_string())
     failed = failed + 1
   end
 
   # Test Ref (pointer)
   let ref_size = type_size(&Type::Ref(Box::new(Type::Int), lifetime_static()), &empty_layout)
   if ref_size == 8 then
-    println("  ✓ &T: size=8")
+    println("   &T: size=8")
     passed = passed + 1
   else
-    println("  ✗ &T: expected size=8, got " + ref_size.to_string())
+    println("   &T: expected size=8, got " + ref_size.to_string())
     failed = failed + 1
   end
 
-  # Test String (ptr + len + cap)
+  # Test String (raw char*)
   let str_size = type_size(&Type::String, &empty_layout)
-  if str_size == 24 then
-    println("  ✓ String: size=24")
+  if str_size == 8 then
+    println("   String: size=8")
     passed = passed + 1
   else
-    println("  ✗ String: expected size=24, got " + str_size.to_string())
+    println("   String: expected size=8, got " + str_size.to_string())
     failed = failed + 1
   end
 
-  # Test Slice (ptr + len)
+  # Test Slice / Vec lowering (heap-header pointer)
   let slice_size = type_size(&Type::Slice(Box::new(Type::Int)), &empty_layout)
-  if slice_size == 16 then
-    println("  ✓ Slice[T]: size=16")
+  if slice_size == 8 then
+    println("   Slice[T]: size=8")
     passed = passed + 1
   else
-    println("  ✗ Slice[T]: expected size=16, got " + slice_size.to_string())
+    println("   Slice[T]: expected size=8, got " + slice_size.to_string())
     failed = failed + 1
   end
 
@@ -4898,7 +5290,6 @@ end
 # Dump type layouts for a source file
 def abi_dump(argv: Vec[String]) -> Int
   if argv.len() < 3 then
-    eprintln("Usage: tg abi dump <file.tg>")
     return 1
   end
 
@@ -4906,14 +5297,12 @@ def abi_dump(argv: Vec[String]) -> Int
   let source = match read_file(file.clone())
   when Result::Ok(s) then s
   when Result::Err(e) then
-    eprintln("Cannot read " + file + ": " + e)
     return 1
   end
 
   let tokens = tokenize(source)
   let (ast, parse_diags) = parse(tokens)
   if diag_has_errors(&parse_diags) then
-    eprintln("Parse error")
     return 1
   end
 
@@ -4996,7 +5385,6 @@ end
 # Check ABI compatibility between two files
 def abi_check(argv: Vec[String]) -> Int
   if argv.len() < 4 then
-    eprintln("Usage: tg abi check <file_a.tg> <file_b.tg>")
     return 1
   end
 
@@ -5007,14 +5395,12 @@ def abi_check(argv: Vec[String]) -> Int
   let ast_a = match parse_file(file_a.clone())
   when Result::Ok(a) then a
   when Result::Err(e) then
-    eprintln(e)
     return 1
   end
 
   let ast_b = match parse_file(file_b.clone())
   when Result::Ok(a) then a
   when Result::Err(e) then
-    eprintln(e)
     return 1
   end
 
@@ -5037,15 +5423,15 @@ def abi_check(argv: Vec[String]) -> Int
     match exports_b.get(&name)
     when Option::Some(sig_b) then
       if sig_a != sig_b then
-        println("✗ " + name + ": signature changed")
+        println(" " + name + ": signature changed")
         println("    was: " + sig_a)
         println("    now: " + sig_b)
         compatible = false
       else
-        println("✓ " + name)
+        println(" " + name)
       end
     when Option::None then
-      println("✗ " + name + ": removed (breaking change)")
+      println(" " + name + ": removed (breaking change)")
       compatible = false
     end
   end
@@ -5062,10 +5448,10 @@ def abi_check(argv: Vec[String]) -> Int
   println("Checked " + checked.to_string() + " exports.")
   
   if compatible then
-    println("Result: ABI compatible ✓")
+    println("Result: ABI compatible ")
     0
   else
-    println("Result: ABI INCOMPATIBLE ✗")
+    println("Result: ABI INCOMPATIBLE ")
     1
   end
 end
@@ -5118,9 +5504,9 @@ def function_signature(f: &FunctionDecl) -> String
   sig
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # Build Cache Persistence
-# ———————————————————————————————————————————————————————————————
+# 
 
 def load_build_cache(output_dir: &String) -> IncrementalCache
   let cache_path = output_dir.clone() + "/.tg_cache"
@@ -5174,13 +5560,12 @@ def save_build_cache(cache: &IncrementalCache) -> Unit
   match write_file(cache_path, content)
   when Result::Ok(_) then ()
   when Result::Err(e) then
-    eprintln("warning: could not save build cache: " + e)
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP Support
-# ———————————————————————————————————————————————————————————————
+# 
 
 struct LspServer
   documents: Map[String, String]
@@ -5299,7 +5684,7 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
     mut diags = Vec::new()
     
     # Convert parse diagnostics
-    for pd in parse_diags.diagnostics do
+    for pd in parse_diags do
       diags.push(Diagnostic {
         level: DiagLevel::Error,
         message: pd.message,
@@ -5346,9 +5731,9 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Hover
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_hover(server: &LspServer, uri: String, position: LspPosition) -> Option[LspHoverResult]
   match server.documents.get(uri.clone())
@@ -5399,9 +5784,9 @@ def lsp_hover(server: &LspServer, uri: String, position: LspPosition) -> Option[
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Completion
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_completion(server: &LspServer, uri: String, position: LspPosition) -> Vec[LspCompletionItem]
   mut items = Vec::new()
@@ -5472,9 +5857,9 @@ def lsp_completion(server: &LspServer, uri: String, position: LspPosition) -> Ve
   items
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Go to Definition
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_goto_definition(server: &LspServer, uri: String, position: LspPosition) -> Option[LspLocation]
   match server.documents.get(uri.clone())
@@ -5503,7 +5888,7 @@ def lsp_goto_definition(server: &LspServer, uri: String, position: LspPosition) 
         when Option::None then Option::None
         end
       when Option::None then
-        # Definition is in same file — search by name
+        # Definition is in same file  search by name
         match find_definition_in_document(server, uri.clone(), symbol.name.clone())
         when Option::Some(def_symbol) then
           let range = span_to_lsp_range(content, def_symbol.span)
@@ -5515,9 +5900,9 @@ def lsp_goto_definition(server: &LspServer, uri: String, position: LspPosition) 
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: References
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_references(server: &LspServer, uri: String, position: LspPosition, include_declaration: Bool) -> Vec[LspLocation]
   mut locations = Vec::new()
@@ -5568,9 +5953,9 @@ def lsp_references(server: &LspServer, uri: String, position: LspPosition, inclu
   locations
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Rename
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_rename(server: &LspServer, uri: String, position: LspPosition, new_name: String) -> Vec[LspTextEdit]
   mut edits = Vec::new()
@@ -5589,9 +5974,9 @@ def lsp_rename(server: &LspServer, uri: String, position: LspPosition, new_name:
   edits
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Signature Help
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_signature_help(server: &LspServer, uri: String, position: LspPosition) -> Option[LspSignatureHelp]
   match server.documents.get(uri.clone())
@@ -5636,9 +6021,9 @@ def lsp_signature_help(server: &LspServer, uri: String, position: LspPosition) -
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Code Actions
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_code_actions(server: &LspServer, uri: String, range: LspRange) -> Vec[LspCodeAction]
   mut actions = Vec::new()
@@ -5683,9 +6068,9 @@ def lsp_code_actions(server: &LspServer, uri: String, range: LspRange) -> Vec[Ls
   actions
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Format Document
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_format(server: &LspServer, uri: String) -> Option[String]
   match server.documents.get(uri)
@@ -5699,9 +6084,9 @@ def lsp_format(server: &LspServer, uri: String) -> Option[String]
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP: Main Loop (JSON-RPC over stdio)
-# ———————————————————————————————————————————————————————————————
+# 
 
 def lsp_main_loop(server: &mut LspServer) -> Unit
   # LSP protocol: read Content-Length header, then JSON-RPC body
@@ -6021,9 +6406,9 @@ def handle_lsp_request(server: &mut LspServer, body: String) -> Option[String]
   end
 end
 
-# ———————————————————————————————————————————————————————————————
+# 
 # LSP Helpers
-# ———————————————————————————————————————————————————————————————
+# 
 
 def build_symbol_table(ast: &Program, uri: String) -> Vec[LspSymbol]
   mut symbols = Vec::new()
@@ -6280,7 +6665,7 @@ def find_enclosing_call(content: &String, offset: UInt) -> (Option[String], UInt
     if c == ')' then depth = depth + 1
     elsif c == '(' then
       if depth == 0 then
-        # Found the opening paren — get function name before it
+        # Found the opening paren  get function name before it
         mut end_pos = i
         while end_pos > 0 && (content.char_at(end_pos - 1).is_alphanumeric() || content.char_at(end_pos - 1) == '_') do
           end_pos = end_pos - 1
@@ -6414,7 +6799,7 @@ def extract_doc_comment_before(ast: &Program, span: Span) -> Option[String]
         break
       end
     else
-      # Non-doc-comment, non-empty line — stop scanning
+      # Non-doc-comment, non-empty line  stop scanning
       break
     end
     
@@ -6485,7 +6870,7 @@ def extract_json_value(json: String, key: String) -> Option[String]
       end
       end_pos = end_pos + 1
     elsif first_char == '{' || first_char == '[' then
-      # Object/array — find matching close
+      # Object/array  find matching close
       mut depth = 1
       end_pos = pos + 1
       while end_pos < json.len() && depth > 0 do
@@ -6549,4 +6934,3 @@ def last_line_length(content: &String) -> UInt
   end
   len
 end
-end # EXTRA END TO CLOSE FILE

@@ -1,697 +1,633 @@
-## std::mmap — Memory-Mapped File I/O
-## Provides zero-copy file access via OS memory-mapping facilities.
-## Essential for asset pipelines, large dataset processing, and GPU buffer staging.
-##
-## Design goals:
-##   - Safe abstraction over mmap(2) / CreateFileMapping
-##   - RAII-based lifetime management (auto-unmap on drop)
-##   - Support for read-only, read-write, copy-on-write, and anonymous mappings
-##   - Page-aligned access with prefetch/advise hints
-##   - Platform-independent API with platform-specific optimizations
-##
-## Spec: §stdlib.mmap
+# Tangerine Standard Library — tg::mmap
+# Memory-Mapped File Operations
 
-module std::mmap
+use std::core::{Option, Result, String, Vec, Unit, Bool, Int, UInt}
+use std::fs::File
 
-use std::core::{Result, Option, Drop}
-use std::fs::{File}
-use std::alloc::{Layout}
+# [METADATA]
+# module: tg::mmap
+# status: stable
+# effects: [Io, Memory]
+# capabilities: [MemoryMapping]
 
-# ═══════════════════════════════════════════════════════════════════════
-# §1  Types & Enums
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# mmap Protection Flags
+# ═══════════════════════════════════════════════════════════════
 
-pub enum MmapError
-  IoError(String)
-  InvalidArgument(String)
-  OutOfMemory
-  PermissionDenied
-  FileTooLarge
-  AlignmentError
-  PlatformUnsupported
+def PROT_NONE() -> Int = 0
+def PROT_READ() -> Int = 1
+def PROT_WRITE() -> Int = 2
+def PROT_EXEC() -> Int = 4
+
+# ═══════════════════════════════════════════════════════════════
+# mmap Flags
+# ═══════════════════════════════════════════════════════════════
+
+def MAP_SHARED() -> Int = 1
+def MAP_PRIVATE() -> Int = 2
+def MAP_FIXED() -> Int = 16
+def MAP_ANONYMOUS() -> Int = 32
+def MAP_ANON() -> Int = 32        # Alias for MAP_ANONYMOUS
+def MAP_GROWSDOWN() -> Int = 256
+def MAP_DENYWRITE() -> Int = 2048
+def MAP_EXECUTABLE() -> Int = 4096
+def MAP_LOCKED() -> Int = 8192
+def MAP_NORESERVE() -> Int = 16384
+def MAP_POPULATE() -> Int = 32768
+def MAP_NONBLOCK() -> Int = 65536
+def MAP_STACK() -> Int = 131072
+def MAP_HUGETLB() -> Int = 262144
+
+# macOS specific
+def MAP_JIT() -> Int = 0x800
+
+# ═══════════════════════════════════════════════════════════════
+# msync Flags
+# ═══════════════════════════════════════════════════════════════
+
+def MS_ASYNC() -> Int = 1
+def MS_SYNC() -> Int = 4
+def MS_INVALIDATE() -> Int = 2
+
+# ═══════════════════════════════════════════════════════════════
+# madvise Flags
+# ═══════════════════════════════════════════════════════════════
+
+def MADV_NORMAL() -> Int = 0
+def MADV_RANDOM() -> Int = 1
+def MADV_SEQUENTIAL() -> Int = 2
+def MADV_WILLNEED() -> Int = 3
+def MADV_DONTNEED() -> Int = 4
+def MADV_FREE() -> Int = 8
+def MADV_REMOVE() -> Int = 9
+def MADV_DONTFORK() -> Int = 10
+def MADV_DOFORK() -> Int = 11
+def MADV_MERGEABLE() -> Int = 12
+def MADV_UNMERGEABLE() -> Int = 13
+def MADV_HUGEPAGE() -> Int = 14
+def MADV_NOHUGEPAGE() -> Int = 15
+def MADV_DONTDUMP() -> Int = 16
+def MADV_DODUMP() -> Int = 17
+def MADV_HWPOISON() -> Int = 100
+
+# ═══════════════════════════════════════════════════════════════
+# mlock/munlock Constants
+# ═══════════════════════════════════════════════════════════════
+
+def MCL_CURRENT() -> Int = 1
+def MCL_FUTURE() -> Int = 2
+def MCL_ONFAULT() -> Int = 4
+
+# ═══════════════════════════════════════════════════════════════
+# FFI to libc for mmap operations
+# ═══════════════════════════════════════════════════════════════
+
+@ffi("c")
+extern def mmap(addr: &u8, length: UInt, prot: Int, flags: Int, fd: Int, offset: Int) -> &u8
 end
 
-## Memory protection flags.
-pub enum Protection
-  ReadOnly
-  ReadWrite
-  WriteCopy       ## Copy-on-write
-  ReadExecute     ## For JIT or plugin loading
+@ffi("c")
+extern def munmap(addr: &u8, length: UInt) -> Int
 end
 
-## Advise hints for OS page cache behavior.
-pub enum MmapAdvice
-  Normal          ## Default access pattern
-  Sequential      ## Sequential access (readahead)
-  Random          ## Random access (no readahead)
-  WillNeed        ## Pages will be needed soon (prefetch)
-  DontNeed        ## Pages won't be needed soon (evict)
-  HugePage        ## Prefer transparent huge pages (Linux)
+@ffi("c")
+extern def msync(addr: &u8, length: UInt, flags: Int) -> Int
 end
 
-## Visibility of modifications.
-pub enum MmapFlags
-  Shared          ## Modifications visible to other mappings & persisted
-  Private         ## Copy-on-write, modifications not persisted
+@ffi("c")
+extern def madvise(addr: &u8, length: UInt, advice: Int) -> Int
 end
 
-# ═══════════════════════════════════════════════════════════════════════
-# §2  Read-Only Memory Map
-# ═══════════════════════════════════════════════════════════════════════
-
-## A read-only memory-mapped file region.
-pub struct Mmap
-  _ptr: *const u8
-  _len: usize
-  _fd: i64            ## Platform file descriptor (kept for unmap on some OSes)
+@ffi("c")
+extern def mprotect(addr: &u8, length: UInt, prot: Int) -> Int
 end
 
-impl Mmap
-  ## Map an entire file as read-only.
-  pub def from_file(file: &File) -> Result[Mmap, MmapError]
-    let size = std::fs::metadata(file.path.clone())?.size as u64
-    if size == 0 then
-      return Err(MmapError.InvalidArgument("cannot mmap empty file"))
-    end
-    Mmap.from_file_range(file, 0, size)
-  end
-
-  ## Map a range within a file as read-only.
-  pub def from_file_range(file: &File, offset: u64, length: u64) -> Result[Mmap, MmapError]
-    let fd = file.fd as i64
-    let ptr = _platform_mmap(
-      null(),          ## let OS choose address
-      length as usize,
-      Protection.ReadOnly,
-      MmapFlags.Private,
-      fd,
-      offset,
-    )?
-    Ok(Mmap { _ptr: ptr, _len: length as usize, _fd: fd })
-  end
-
-  ## Returns a byte slice of the mapped region.
-  pub def as_bytes(self) -> &[u8]
-    unsafe { std::slice::from_raw_parts(self._ptr, self._len) }
-  end
-
-  ## Returns the length of the mapped region in bytes.
-  pub def len(self) -> usize = self._len
-
-  /// Returns true if the mapping is empty (should not happen for valid maps).
-  pub def is_empty(self) -> Bool = self._len == 0
-
-  ## Apply access pattern advice to the OS.
-  pub def advise(self, advice: MmapAdvice) -> Result[Unit, MmapError]
-    _platform_madvise(self._ptr as *mut u8, self._len, advice)
-  end
-
-  ## Lock pages into physical memory (prevent swapping).
-  pub def lock(self) -> Result[Unit, MmapError]
-    _platform_mlock(self._ptr as *const u8, self._len)
-  end
-
-  ## Unlock previously locked pages.
-  pub def unlock(self) -> Result[Unit, MmapError]
-    _platform_munlock(self._ptr as *const u8, self._len)
-  end
+@ffi("c")
+extern def mlock(addr: &u8, length: UInt) -> Int
 end
 
-impl Drop for Mmap
-  def drop(&mut self)
-    if !self._ptr.is_null() then
-      _platform_munmap(self._ptr as *mut u8, self._len)
-      self._ptr = null()
-    end
-  end
+@ffi("c")
+extern def munlock(addr: &u8, length: UInt) -> Int
 end
 
-# ═══════════════════════════════════════════════════════════════════════
-# §3  Read-Write Memory Map
-# ═══════════════════════════════════════════════════════════════════════
-
-## A mutable memory-mapped file region.
-pub struct MmapMut
-  _ptr: *mut u8
-  _len: usize
-  _fd: i64
-  _flags: MmapFlags
+@ffi("c")
+extern def mlockall(flags: Int) -> Int
 end
 
-impl MmapMut
-  ## Map an entire file as read-write.
-  pub def from_file(file: &mut File, flags: MmapFlags) -> Result[MmapMut, MmapError]
-    let size = std::fs::metadata(file.path.clone())?.size as u64
-    if size == 0 then
-      return Err(MmapError.InvalidArgument("cannot mmap empty file"))
-    end
-    MmapMut.from_file_range(file, 0, size, flags)
-  end
+@ffi("c")
+extern def munlockall() -> Int
+end
 
-  ## Map a range within a file as read-write.
-  pub def from_file_range(file: &mut File, offset: u64, length: u64, flags: MmapFlags) -> Result[MmapMut, MmapError]
-    let fd = file.fd as i64
-    let ptr = _platform_mmap(
-      null(),
-      length as usize,
-      Protection.ReadWrite,
-      flags,
-      fd,
-      offset,
-    )?
-    Ok(MmapMut { _ptr: ptr as *mut u8, _len: length as usize, _fd: fd, _flags: flags })
-  end
+@ffi("c")
+extern def mincore(addr: &u8, length: UInt, vec: &u8) -> Int
+end
 
-  ## Returns a byte slice of the mapped region.
-  pub def as_bytes(self) -> &[u8]
-    unsafe { std::slice::from_raw_parts(self._ptr as *const u8, self._len) }
-  end
+@ffi("c")
+extern def remap_file_pages(addr: &u8, size: UInt, prot: Int, pgoff: UInt, flags: Int) -> Int
+end
 
-  ## Returns a mutable byte slice.
-  pub def as_bytes_mut(&mut self) -> &mut [u8]
-    unsafe { std::slice::from_raw_parts_mut(self._ptr, self._len) }
-  end
+# Page size - typically 4096, but we can query it
+@ffi("c")
+extern def sysconf(name: Int) -> Int
+end
 
-  pub def len(self) -> usize = self._len
+def _SC_PAGESIZE() -> Int = 30
 
-  ## Flush modifications to disk.
-  pub def flush(self) -> Result[Unit, MmapError]
-    _platform_msync(self._ptr, self._len, false)
-  end
+# ═══════════════════════════════════════════════════════════════
+# Page Size
+# ═══════════════════════════════════════════════════════════════
 
-  ## Asynchronous flush (returns immediately, sync happens in background).
-  pub def flush_async(self) -> Result[Unit, MmapError]
-    _platform_msync(self._ptr, self._len, true)
-  end
+mut _page_size_cache: Option[Int] = Option::None
 
-  ## Flush a specific byte range.
-  pub def flush_range(self, offset: usize, len: usize) -> Result[Unit, MmapError]
-    pre offset + len <= self._len, "flush range out of bounds"
-    unsafe {
-      _platform_msync(self._ptr.add(offset), len, false)
-    }
-  end
-
-  pub def advise(self, advice: MmapAdvice) -> Result[Unit, MmapError]
-    _platform_madvise(self._ptr, self._len, advice)
-  end
-
-  pub def lock(self) -> Result[Unit, MmapError]
-    _platform_mlock(self._ptr as *const u8, self._len)
-  end
-
-  pub def unlock(self) -> Result[Unit, MmapError]
-    _platform_munlock(self._ptr as *const u8, self._len)
-  end
-
-  ## Downgrade to a read-only mapping.
-  pub def make_read_only(self) -> Result[Mmap, MmapError]
-    _platform_mprotect(self._ptr, self._len, Protection.ReadOnly)?
-    Ok(Mmap {
-      _ptr: self._ptr as *const u8,
-      _len: self._len,
-      _fd: self._fd,
-    })
-    ## Note: caller now owns the Mmap; self is consumed.
+def page_size() -> Int
+  match _page_size_cache
+  when Option::Some(size) then size
+  when Option::None then
+    let size = sysconf(_SC_PAGESIZE())
+    _page_size_cache = Option::Some(size)
+    size
   end
 end
 
-impl Drop for MmapMut
-  def drop(&mut self)
-    if !self._ptr.is_null() then
-      ## Best-effort flush for shared mappings
-      if self._flags == MmapFlags.Shared then
-        let _ = _platform_msync(self._ptr, self._len, false)
-      end
-      _platform_munmap(self._ptr, self._len)
-      self._ptr = null()
-    end
-  end
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# §4  Anonymous Memory Map
-# ═══════════════════════════════════════════════════════════════════════
-
-## Anonymous mapping (no file backing — useful for large allocations,
-## shared memory between processes, or GPU staging buffers).
-pub struct AnonMmap
-  _ptr: *mut u8
-  _len: usize
-end
-
-impl AnonMmap
-  ## Create an anonymous mapping of the given size.
-  pub def new(size: usize) -> Result[AnonMmap, MmapError]
-    AnonMmap.new_with_protection(size, Protection.ReadWrite)
-  end
-
-  pub def new_with_protection(size: usize, prot: Protection) -> Result[AnonMmap, MmapError]
-    pre size > 0, "size must be positive"
-    let ptr = _platform_mmap_anon(size, prot)?
-    Ok(AnonMmap { _ptr: ptr, _len: size })
-  end
-
-  pub def as_bytes(self) -> &[u8]
-    unsafe { std::slice::from_raw_parts(self._ptr as *const u8, self._len) }
-  end
-
-  pub def as_bytes_mut(&mut self) -> &mut [u8]
-    unsafe { std::slice::from_raw_parts_mut(self._ptr, self._len) }
-  end
-
-  pub def len(self) -> usize = self._len
-
-  ## Change protection on the mapping (e.g., mark executable after writing JIT code).
-  pub def set_protection(self, prot: Protection) -> Result[Unit, MmapError]
-    _platform_mprotect(self._ptr, self._len, prot)
-  end
-
-  pub def advise(self, advice: MmapAdvice) -> Result[Unit, MmapError]
-    _platform_madvise(self._ptr, self._len, advice)
-  end
-
-  pub def lock(self) -> Result[Unit, MmapError]
-    _platform_mlock(self._ptr as *const u8, self._len)
-  end
-
-  pub def unlock(self) -> Result[Unit, MmapError]
-    _platform_munlock(self._ptr as *const u8, self._len)
-  end
-end
-
-impl Drop for AnonMmap
-  def drop(&mut self)
-    if !self._ptr.is_null() then
-      _platform_munmap(self._ptr, self._len)
-      self._ptr = null()
-    end
-  end
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# §5  Platform Abstraction Layer
-# ═══════════════════════════════════════════════════════════════════════
-
-## Returns the OS page size (typically 4096).
-pub def page_size() -> usize
-  @cfg(target_os = "linux")
-  return _linux_page_size()
-  @cfg(target_os = "macos")
-  return _darwin_page_size()
-  @cfg(target_os = "windows")
-  return _windows_page_size()
-end
-
-## Align an offset down to the nearest page boundary.
-pub def align_to_page(offset: usize) -> usize
+def page_align_up(size: Int) -> Int
   let ps = page_size()
-  offset & !(ps - 1)
+  ((size + ps - 1) / ps) * ps
 end
 
-## Align a length up to cover the full page.
-pub def round_up_to_page(len: usize) -> usize
+def page_align_down(size: Int) -> Int
   let ps = page_size()
-  (len + ps - 1) & !(ps - 1)
+  (size / ps) * ps
 end
 
-# ─── Unix (Linux + macOS) Implementation ────────────────────────────
-
-@cfg(any(target_os = "linux", target_os = "macos"))
-mod unix_impl
-  @ffi("c")
-  extern
-    def mmap(addr: *const u8, length: usize, prot: i32, flags: i32, fd: i64, offset: i64) -> *mut u8
-    def munmap(addr: *mut u8, length: usize) -> i32
-    def mprotect(addr: *mut u8, length: usize, prot: i32) -> i32
-    def msync(addr: *mut u8, length: usize, flags: i32) -> i32
-    def madvise(addr: *mut u8, length: usize, advice: i32) -> i32
-    def mlock(addr: *const u8, length: usize) -> i32
-    def munlock(addr: *const u8, length: usize) -> i32
-    def sysconf(name: i32) -> i64
-  end
-
-  const PROT_NONE: i32 = 0x0
-  const PROT_READ: i32 = 0x1
-  const PROT_WRITE: i32 = 0x2
-  const PROT_EXEC: i32 = 0x4
-
-  const MAP_SHARED: i32 = 0x01
-  const MAP_PRIVATE: i32 = 0x02
-  @cfg(target_os = "linux")
-  const MAP_ANONYMOUS: i32 = 0x20
-  @cfg(target_os = "macos")
-  const MAP_ANONYMOUS: i32 = 0x1000
-  const MAP_FAILED: *mut u8 = -1 as *mut u8
-
-  const MS_ASYNC: i32 = 1
-  const MS_SYNC: i32 = 4
-
-  const MADV_NORMAL: i32 = 0
-  const MADV_RANDOM: i32 = 1
-  const MADV_SEQUENTIAL: i32 = 2
-  const MADV_WILLNEED: i32 = 3
-  const MADV_DONTNEED: i32 = 4
-  @cfg(target_os = "linux")
-  const MADV_HUGEPAGE: i32 = 14
-
-  @cfg(target_os = "linux")
-  const _SC_PAGESIZE: i32 = 30
-  @cfg(target_os = "macos")
-  const _SC_PAGESIZE: i32 = 29
-
-  def prot_to_native(p: Protection) -> i32
-    match p
-    when Protection.ReadOnly then 0x1
-    when Protection.ReadWrite then 0x1 | 0x2
-    when Protection.WriteCopy then 0x1 | 0x2
-    when Protection.ReadExecute then 0x1 | 0x4
-    end
-  end
-
-  def flags_to_native(f: MmapFlags) -> i32
-    match f
-    when MmapFlags.Shared then 0x01
-    when MmapFlags.Private then 0x02
-    end
-  end
-
-  def advice_to_native(a: MmapAdvice) -> i32
-    match a
-      MmapAdvice.Normal     => MADV_NORMAL
-      MmapAdvice.Sequential => MADV_SEQUENTIAL
-      MmapAdvice.Random     => MADV_RANDOM
-      MmapAdvice.WillNeed   => MADV_WILLNEED
-      MmapAdvice.DontNeed   => MADV_DONTNEED
-      MmapAdvice.HugePage   =>
-        @cfg(target_os = "linux") { MADV_HUGEPAGE }
-        @cfg(not(target_os = "linux")) { MADV_NORMAL }
-    end
-  end
+def is_page_aligned(ptr: &u8) -> Bool
+  let ps = page_size()
+  (ptr as Int) % ps == 0
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_mmap(addr: *const u8, len: usize, prot: Protection, flags: MmapFlags, fd: i64, offset: u64) -> Result[*const u8, MmapError]
-  let native_prot = unix_impl::prot_to_native(prot)
-  let native_flags = unix_impl::flags_to_native(flags)
-  let ptr = unix_impl::mmap(addr, len, native_prot, native_flags, fd, offset as i64)
-  if ptr == unix_impl::MAP_FAILED then
-    Err(MmapError.IoError("mmap failed: " + _errno_string()))
+# ═══════════════════════════════════════════════════════════════
+# Memory Mapping Handle
+# ═══════════════════════════════════════════════════════════════
+
+struct Mmap
+  ptr: &u8
+  length: UInt
+  prot: Int
+  flags: Int
+end
+
+def Mmap::ptr(self: Mmap) -> &u8
+  self.ptr
+end
+
+def Mmap::len(self: Mmap) -> UInt
+  self.length
+end
+
+def Mmap::is_valid(self: Mmap) -> Bool
+  self.ptr != (-1 as &u8) && self.ptr != 0 as &u8
+end
+
+def Mmap::as_slice(self: Mmap) -> &[u8]
+  self.ptr as &[u8]
+end
+
+def Mmap::as_mut_slice(self: Mmap) -> &mut [u8]
+  self.ptr as &mut [u8]
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Anonymous Memory Mapping
+# ═══════════════════════════════════════════════════════════════
+
+def anonymous_map(size: UInt, prot: Int) -> Result[Mmap, String]
+  let aligned_size = page_align_up(size as Int) as UInt
+  let ptr = mmap(0 as &u8, aligned_size, prot, MAP_PRIVATE() | MAP_ANONYMOUS(), -1, 0)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to create anonymous mapping".to_string())
   else
-    Ok(ptr as *const u8)
+    Result::Ok(Mmap { ptr: ptr, length: aligned_size, prot: prot, flags: MAP_PRIVATE() | MAP_ANONYMOUS() })
   end
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_mmap_anon(len: usize, prot: Protection) -> Result[*mut u8, MmapError]
-  let native_prot = unix_impl::prot_to_native(prot)
-  let flags = unix_impl::MAP_PRIVATE | unix_impl::MAP_ANONYMOUS
-  let ptr = unix_impl::mmap(null(), len, native_prot, flags, -1, 0)
-  if ptr == unix_impl::MAP_FAILED then
-    Err(MmapError.OutOfMemory)
+def anonymous_map_read_write(size: UInt) -> Result[Mmap, String]
+  anonymous_map(size, PROT_READ() | PROT_WRITE())
+end
+
+def anonymous_map_read_write_exec(size: UInt) -> Result[Mmap, String]
+  anonymous_map(size, PROT_READ() | PROT_WRITE() | PROT_EXEC())
+end
+
+def anonymous_map_read_exec(size: UInt) -> Result[Mmap, String]
+  anonymous_map(size, PROT_READ() | PROT_EXEC())
+end
+
+def anonymous_map_executable(size: UInt) -> Result[Mmap, String]
+  # On macOS with hardened runtime, use MAP_JIT for executable memory
+  let aligned_size = page_align_up(size as Int) as UInt
+  let flags = MAP_PRIVATE() | MAP_ANONYMOUS() | MAP_JIT()
+  let ptr = mmap(0 as &u8, aligned_size, PROT_READ() | PROT_WRITE() | PROT_EXEC(), flags, -1, 0)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to create executable mapping".to_string())
   else
-    Ok(ptr)
+    Result::Ok(Mmap { ptr: ptr, length: aligned_size, prot: PROT_READ() | PROT_WRITE() | PROT_EXEC(), flags: flags })
   end
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_munmap(ptr: *mut u8, len: usize)
-  let _ = unix_impl::munmap(ptr, len)
+# ═══════════════════════════════════════════════════════════════
+# File-Based Memory Mapping
+# ═══════════════════════════════════════════════════════════════
+
+def file_map(fd: Int, size: UInt, prot: Int, flags: Int, offset: Int) -> Result[Mmap, String]
+  let aligned_size = page_align_up(size as Int) as UInt
+  let ptr = mmap(0 as &u8, aligned_size, prot, flags, fd, offset)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to map file".to_string())
+  else
+    Result::Ok(Mmap { ptr: ptr, length: aligned_size, prot: prot, flags: flags })
+  end
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_mprotect(ptr: *mut u8, len: usize, prot: Protection) -> Result[Unit, MmapError]
-  let result = unix_impl::mprotect(ptr, len, unix_impl::prot_to_native(prot))
-  if result != 0 then Err(MmapError.PermissionDenied) else Ok(()) end
+def file_map_read(fd: Int, size: UInt, offset: Int) -> Result[Mmap, String]
+  file_map(fd, size, PROT_READ(), MAP_PRIVATE(), offset)
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_msync(ptr: *mut u8, len: usize, is_async: Bool) -> Result[Unit, MmapError]
-  let flags = if is_async then unix_impl::MS_ASYNC else unix_impl::MS_SYNC end
-  let result = unix_impl::msync(ptr, len, flags)
-  if result != 0 then Err(MmapError.IoError("msync failed")) else Ok(()) end
+def file_map_read_write(fd: Int, size: UInt, offset: Int) -> Result[Mmap, String]
+  file_map(fd, size, PROT_READ() | PROT_WRITE(), MAP_SHARED(), offset)
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_madvise(ptr: *mut u8, len: usize, advice: MmapAdvice) -> Result[Unit, MmapError]
-  let result = unix_impl::madvise(ptr, len, unix_impl::advice_to_native(advice))
-  if result != 0 then Err(MmapError.IoError("madvise failed")) else Ok(()) end
+def file_map_copy_on_write(fd: Int, size: UInt, offset: Int) -> Result[Mmap, String]
+  file_map(fd, size, PROT_READ() | PROT_WRITE(), MAP_PRIVATE(), offset)
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_mlock(ptr: *const u8, len: usize) -> Result[Unit, MmapError]
-  if unix_impl::mlock(ptr, len) != 0 then Err(MmapError.PermissionDenied) else Ok(()) end
+def file_map_shared(fd: Int, size: UInt, offset: Int) -> Result[Mmap, String]
+  file_map(fd, size, PROT_READ() | PROT_WRITE(), MAP_SHARED(), offset)
 end
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _platform_munlock(ptr: *const u8, len: usize) -> Result[Unit, MmapError]
-  if unix_impl::munlock(ptr, len) != 0 then Err(MmapError.IoError("munlock failed")) else Ok(()) end
-end
+# ═══════════════════════════════════════════════════════════════
+# Unmapping
+# ═══════════════════════════════════════════════════════════════
 
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _linux_page_size() -> usize
-  unix_impl::sysconf(unix_impl::_SC_PAGESIZE) as usize
-end
-
-@cfg(any(target_os = "linux", target_os = "macos"))
-def _darwin_page_size() -> usize
-  unix_impl::sysconf(unix_impl::_SC_PAGESIZE) as usize
-end
-
-# ─── Windows Implementation ─────────────────────────────────────────
-
-@cfg(target_os = "windows")
-mod win_impl
-  @ffi("kernel32")
-  extern
-    def CreateFileMappingW(hFile: *mut u8, lpAttr: *const u8, flProtect: u32,
-                           dwMaxHigh: u32, dwMaxLow: u32, lpName: *const u16) -> *mut u8
-    def MapViewOfFile(hMap: *mut u8, dwAccess: u32, dwOffsetHigh: u32,
-                      dwOffsetLow: u32, dwBytes: usize) -> *mut u8
-    def UnmapViewOfFile(lpBase: *const u8) -> i32
-    def FlushViewOfFile(lpBase: *const u8, dwBytes: usize) -> i32
-    def CloseHandle(hObject: *mut u8) -> i32
-    def VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32
-    def VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32
-    def GetSystemInfo(lpSystemInfo: *mut SystemInfo)
-  end
-
-  @repr(C)
-  struct SystemInfo
-    wProcessorArchitecture: u16
-    wReserved: u16
-    dwPageSize: u32
-    lpMinimumApplicationAddress: *const u8
-    lpMaximumApplicationAddress: *const u8
-    dwActiveProcessorMask: usize
-    dwNumberOfProcessors: u32
-    dwProcessorType: u32
-    dwAllocationGranularity: u32
-    wProcessorLevel: u16
-    wProcessorRevision: u16
-  end
-
-  const PAGE_READONLY: u32 = 0x02
-  const PAGE_READWRITE: u32 = 0x04
-  const PAGE_WRITECOPY: u32 = 0x08
-  const PAGE_EXECUTE_READ: u32 = 0x20
-
-  const FILE_MAP_READ: u32 = 0x04
-  const FILE_MAP_WRITE: u32 = 0x02
-  const FILE_MAP_COPY: u32 = 0x01
-  const FILE_MAP_EXECUTE: u32 = 0x20
-end
-
-@cfg(target_os = "windows")
-def _windows_page_size() -> usize
-  var info: win_impl::SystemInfo = unsafe { std::mem::zeroed() }
-  win_impl::GetSystemInfo(&mut info)
-  info.dwPageSize as usize
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# §6  Convenience Builders
-# ═══════════════════════════════════════════════════════════════════════
-
-## Builder pattern for flexible mmap construction.
-pub struct MmapBuilder
-  _file: Option[&File]
-  _offset: u64
-  _length: Option[u64]
-  _prot: Protection
-  _flags: MmapFlags
-  _advice: Option[MmapAdvice]
-  _populate: Bool         ## MAP_POPULATE on Linux (prefault pages)
-  _huge_pages: Bool
-end
-
-impl MmapBuilder
-  pub def new() -> MmapBuilder
-    MmapBuilder {
-      _file: None,
-      _offset: 0,
-      _length: None,
-      _prot: Protection.ReadOnly,
-      _flags: MmapFlags.Private,
-      _advice: None,
-      _populate: false,
-      _huge_pages: false,
-    }
-  end
-
-  pub def file(mut self, f: &File) -> MmapBuilder
-    self._file = Some(f)
-    self
-  end
-
-  pub def offset(mut self, offset: u64) -> MmapBuilder
-    self._offset = offset
-    self
-  end
-
-  pub def length(mut self, length: u64) -> MmapBuilder
-    self._length = Some(length)
-    self
-  end
-
-  pub def read_only(mut self) -> MmapBuilder
-    self._prot = Protection.ReadOnly
-    self
-  end
-
-  pub def read_write(mut self) -> MmapBuilder
-    self._prot = Protection.ReadWrite
-    self
-  end
-
-  pub def copy_on_write(mut self) -> MmapBuilder
-    self._prot = Protection.WriteCopy
-    self._flags = MmapFlags.Private
-    self
-  end
-
-  pub def shared(mut self) -> MmapBuilder
-    self._flags = MmapFlags.Shared
-    self
-  end
-
-  pub def sequential(mut self) -> MmapBuilder
-    self._advice = Some(MmapAdvice.Sequential)
-    self
-  end
-
-  pub def random_access(mut self) -> MmapBuilder
-    self._advice = Some(MmapAdvice.Random)
-    self
-  end
-
-  pub def populate(mut self) -> MmapBuilder
-    self._populate = true
-    self
-  end
-
-  pub def huge_pages(mut self) -> MmapBuilder
-    self._huge_pages = true
-    self
-  end
-
-  pub def build(self) -> Result[Mmap, MmapError]
-    let file = self._file.ok_or(MmapError.InvalidArgument("no file specified"))?
-    let len = match self._length
-    when Some(l) then l
-    when None then std::fs::metadata(file.path.clone())?.size as u64
+def Mmap::unmap(self: Mmap) -> Result[Unit, String]
+  if self.is_valid() then
+    let result = munmap(self.ptr, self.length)
+    if result != 0 then
+      Result::Err("Failed to unmap memory".to_string())
+    else
+      Result::Ok(())
     end
-    let mmap = Mmap.from_file_range(file, self._offset, len)?
-    if let Some(advice) = self._advice then
-      mmap.advise(advice)?
-    end
-    if self._huge_pages then
-      let _ = mmap.advise(MmapAdvice.HugePage)
-    end
-    Ok(mmap)
-  end
-
-  pub def build_mut(self) -> Result[MmapMut, MmapError]
-    let file = self._file.ok_or(MmapError.InvalidArgument("no file specified"))?
-    let len = match self._length
-    when Some(l) then l
-    when None then std::fs::metadata(file.path.clone())?.size as u64
-    end
-    let mmap = MmapMut.from_file_range(
-      unsafe { &mut *(file as *const File as *mut File) },
-      self._offset, len, self._flags,
-    )?
-    if let Some(advice) = self._advice then
-      mmap.advise(advice)?
-    end
-    Ok(mmap)
+  else
+    Result::Ok(())
   end
 end
 
-# ═══════════════════════════════════════════════════════════════════════
-# §7  Tests
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# Synchronization
+# ═══════════════════════════════════════════════════════════════
 
-@test
-def test_page_size() -> Unit
+def Mmap::sync(self: Mmap) -> Result[Unit, String]
+  self.sync_flags(MS_SYNC())
+end
+
+def Mmap::sync_async(self: Mmap) -> Result[Unit, String]
+  self.sync_flags(MS_ASYNC())
+end
+
+def Mmap::sync_flags(self: Mmap, flags: Int) -> Result[Unit, String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
+  let result = msync(self.ptr, self.length, flags)
+  if result != 0 then
+    Result::Err("Failed to sync mapping".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def Mmap::sync_invalidate(self: Mmap) -> Result[Unit, String]
+  self.sync_flags(MS_SYNC() | MS_INVALIDATE())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Protection Changes
+# ═══════════════════════════════════════════════════════════════
+
+def Mmap::protect(self: Mmap, prot: Int) -> Result[Unit, String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
+  let result = mprotect(self.ptr, self.length, prot)
+  if result != 0 then
+    Result::Err("Failed to change protection".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def Mmap::make_read_only(self: Mmap) -> Result[Unit, String]
+  self.protect(PROT_READ())
+end
+
+def Mmap::make_read_write(self: Mmap) -> Result[Unit, String]
+  self.protect(PROT_READ() | PROT_WRITE())
+end
+
+def Mmap::make_read_write_exec(self: Mmap) -> Result[Unit, String]
+  self.protect(PROT_READ() | PROT_WRITE() | PROT_EXEC())
+end
+
+def Mmap::make_none(self: Mmap) -> Result[Unit, String]
+  self.protect(PROT_NONE())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Locking (prevent swapping)
+# ═══════════════════════════════════════════════════════════════
+
+def Mmap::lock(self: Mmap) -> Result[Unit, String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
+  let result = mlock(self.ptr, self.length)
+  if result != 0 then
+    Result::Err("Failed to lock memory".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def Mmap::unlock(self: Mmap) -> Result[Unit, String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
+  let result = munlock(self.ptr, self.length)
+  if result != 0 then
+    Result::Err("Failed to unlock memory".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Advice
+# ═══════════════════════════════════════════════════════════════
+
+def Mmap::advise(self: Mmap, advice: Int) -> Result[Unit, String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
+  let result = madvise(self.ptr, self.length, advice)
+  if result != 0 then
+    Result::Err("Failed to advise mapping".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def Mmap::advise_sequential(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_SEQUENTIAL())
+end
+
+def Mmap::advise_random(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_RANDOM())
+end
+
+def Mmap::advise_will_need(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_WILLNEED())
+end
+
+def Mmap::advise_dont_need(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_DONTNEED())
+end
+
+def Mmap::advise_normal(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_NORMAL())
+end
+
+def Mmap::advise_free(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_FREE())
+end
+
+def Mmap::advise_hugepage(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_HUGEPAGE())
+end
+
+def Mmap::advise_no_hugepage(self: Mmap) -> Result[Unit, String]
+  self.advise(MADV_NOHUGEPAGE())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Memory Access
+# ═══════════════════════════════════════════════════════════════
+
+def Mmap::read_byte(self: Mmap, offset: UInt) -> Result[u8, String]
+  if offset >= self.length then
+    return Result::Err("Offset out of bounds".to_string())
+  end
+  Result::Ok(self.ptr.offset(offset as Int).read())
+end
+
+def Mmap::write_byte(self: Mmap, offset: UInt, value: u8) -> Result[Unit, String]
+  if offset >= self.length then
+    return Result::Err("Offset out of bounds".to_string())
+  end
+  
+  if (self.prot & PROT_WRITE()) == 0 then
+    return Result::Err("Mapping is not writable".to_string())
+  end
+  
+  self.ptr.offset(offset as Int).write(value)
+  Result::Ok(())
+end
+
+def Mmap::read_slice(self: Mmap, offset: UInt, len: UInt) -> Result[Vec[u8], String]
+  if offset + len > self.length then
+    return Result::Err("Read range out of bounds".to_string())
+  end
+  
+  mut result: Vec[u8] = Vec::with_capacity(len as Int)
+  mut i = 0
+  while i < len do
+    result.push(self.ptr.offset((offset + i) as Int).read())
+    i = i + 1
+  end
+  
+  Result::Ok(result)
+end
+
+def Mmap::write_slice(self: Mmap, offset: UInt, data: Vec[u8]) -> Result[Unit, String]
+  if offset + data.len() as UInt > self.length then
+    return Result::Err("Write range out of bounds".to_string())
+  end
+  
+  if (self.prot & PROT_WRITE()) == 0 then
+    return Result::Err("Mapping is not writable".to_string())
+  end
+  
+  mut i = 0
+  while i < data.len() do
+    self.ptr.offset((offset + i as UInt) as Int).write(data[i])
+    i = i + 1
+  end
+  
+  Result::Ok(())
+end
+
+def Mmap::copy_to(self: Mmap, dest: &mut u8, len: UInt) -> Result[Unit, String]
+  if len > self.length then
+    return Result::Err("Copy length exceeds mapping size".to_string())
+  end
+  
+  mut i = 0
+  while i < len do
+    dest.offset(i as Int).write(self.ptr.offset(i as Int).read())
+    i = i + 1
+  end
+  
+  Result::Ok(())
+end
+
+def Mmap::copy_from(self: Mmap, src: &u8, len: UInt) -> Result[Unit, String]
+  if len > self.length then
+    return Result::Err("Copy length exceeds mapping size".to_string())
+  end
+  
+  if (self.prot & PROT_WRITE()) == 0 then
+    return Result::Err("Mapping is not writable".to_string())
+  end
+  
+  mut i = 0
+  while i < len do
+    self.ptr.offset(i as Int).write(src.offset(i as Int).read())
+    i = i + 1
+  end
+  
+  Result::Ok(())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Check Residency (which pages are in memory)
+# ═══════════════════════════════════════════════════════════════
+
+def Mmap::check_residency(self: Mmap) -> Result[Vec[Bool], String]
+  if !self.is_valid() then
+    return Result::Err("Invalid mapping".to_string())
+  end
+  
   let ps = page_size()
-  assert ps > 0
-  if (ps & (ps - 1)) != 0 then
-    panic("page size must be a power of 2")
+  let num_pages = (self.length as Int + ps - 1) / ps
+  
+  mut vec: Vec[u8] = Vec::with_capacity(num_pages)
+  vec.resize(num_pages, 0)
+  
+  let result = mincore(self.ptr, self.length, vec.as_mut_ptr())
+  if result != 0 then
+    return Result::Err("Failed to check residency".to_string())
+  end
+  
+  mut bools: Vec[Bool] = Vec::with_capacity(num_pages)
+  for i in 0..num_pages do
+    # Least significant bit indicates residency
+    bools.push((vec[i] & 1) != 0)
+  end
+  
+  Result::Ok(bools)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Global Memory Locking
+# ═══════════════════════════════════════════════════════════════
+
+def lock_all_current() -> Result[Unit, String]
+  let result = mlockall(MCL_CURRENT())
+  if result != 0 then
+    Result::Err("Failed to lock all current memory".to_string())
+  else
+    Result::Ok(())
   end
 end
 
-@test
-def test_align_to_page() -> Unit
+def lock_all_future() -> Result[Unit, String]
+  let result = mlockall(MCL_FUTURE())
+  if result != 0 then
+    Result::Err("Failed to lock all future memory".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def lock_all() -> Result[Unit, String]
+  let result = mlockall(MCL_CURRENT() | MCL_FUTURE())
+  if result != 0 then
+    Result::Err("Failed to lock all memory".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+def unlock_all() -> Result[Unit, String]
+  let result = munlockall()
+  if result != 0 then
+    Result::Err("Failed to unlock all memory".to_string())
+  else
+    Result::Ok(())
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Fixed Mapping (at specific address)
+# ═══════════════════════════════════════════════════════════════
+
+def map_fixed(addr: &u8, size: UInt, prot: Int, flags: Int) -> Result[Mmap, String]
+  let aligned_size = page_align_up(size as Int) as UInt
+  let ptr = mmap(addr, aligned_size, prot, flags | MAP_FIXED(), -1, 0)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to create fixed mapping".to_string())
+  else
+    Result::Ok(Mmap { ptr: ptr, length: aligned_size, prot: prot, flags: flags | MAP_FIXED() })
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Stack Allocation Helper
+# ═══════════════════════════════════════════════════════════════
+
+def allocate_stack(size: UInt) -> Result[Mmap, String]
+  let aligned_size = page_align_up(size as Int) as UInt
+  # MAP_STACK is a hint that this will be used for a stack
+  # On some systems it also grows downward
+  let ptr = mmap(0 as &u8, aligned_size, PROT_READ() | PROT_WRITE(), 
+                 MAP_PRIVATE() | MAP_ANONYMOUS() | MAP_STACK(), -1, 0)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to allocate stack".to_string())
+  else
+    Result::Ok(Mmap { ptr: ptr, length: aligned_size, prot: PROT_READ() | PROT_WRITE(), 
+                      flags: MAP_PRIVATE() | MAP_ANONYMOUS() | MAP_STACK() })
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Guard Page
+# ═══════════════════════════════════════════════════════════════
+
+def create_guard_page() -> Result[Mmap, String]
   let ps = page_size()
-  assert align_to_page(0) == 0
-  assert align_to_page(ps) == ps
-  assert align_to_page(ps + 1) == ps
-  assert align_to_page(ps * 2 - 1) == ps
+  let ptr = mmap(0 as &u8, ps as UInt, PROT_NONE(), MAP_PRIVATE() | MAP_ANONYMOUS(), -1, 0)
+  
+  if ptr == (-1 as &u8) then
+    Result::Err("Failed to create guard page".to_string())
+  else
+    Result::Ok(Mmap { ptr: ptr, length: ps as UInt, prot: PROT_NONE(), 
+                      flags: MAP_PRIVATE() | MAP_ANONYMOUS() })
+  end
 end
-
-@test
-def test_round_up_to_page() -> Unit
-  let ps = page_size()
-  assert round_up_to_page(1) == ps
-  assert round_up_to_page(ps) == ps
-  assert round_up_to_page(ps + 1) == ps * 2
-end
-
-@test
-def test_anon_mmap_basic() -> Unit
-  let ps = page_size()
-  var map = AnonMmap.new(ps * 4).unwrap()
-  let bytes = map.as_bytes_mut()
-  bytes[0] = 42
-  bytes[ps] = 99
-  assert bytes[0] == 42
-  assert bytes[ps] == 99
-end
-
-@test
-def test_mmap_file_roundtrip() -> Unit
-  use std::io::{File, OpenOptions}
-  use std::fs
-
-  let path = "/tmp/tg_mmap_test.bin"
-  ## Write test data
-  let data = [0u8; 4096]
-  data[0] = 0xDE
-  data[1] = 0xAD
-  let mut f = File.create(path).unwrap()
-  f.write_all(&data).unwrap()
-  f.close()
-
-  ## Read via mmap
-  let f2 = File.open(path).unwrap()
-  let mmap = Mmap.from_file(&f2).unwrap()
-  let bytes = mmap.as_bytes()
-  assert bytes.len() == 4096
-  assert bytes[0] == 0xDE
-  assert bytes[1] == 0xAD
-
-  fs::remove_file(path).unwrap()
-end
-
-end ## module std::mmap

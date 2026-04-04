@@ -1,0 +1,838 @@
+# Tangerine Standard Library — std::package
+# Package manager for Tangerine
+# Handles dependency resolution, downloading, and building
+
+use std::core::{Option, Result, String, Vec, Unit, Bool, Int, UInt, Ptr}
+use std::collections::{Map}
+use std::fs
+use std::http
+use std::json
+use std::toml
+use std::env
+
+# ═══════════════════════════════════════════════════════════════
+# Package Identifiers
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageId
+  name: String
+  version: Version
+  source: PackageSource
+end
+
+struct Version
+  major: UInt
+  minor: UInt
+  patch: UInt
+  pre: String
+  build: String
+end
+
+def Version::new(major: UInt, minor: UInt, patch: UInt) -> Version
+  Version {
+    major: major,
+    minor: minor,
+    patch: patch,
+    pre: "".to_string(),
+    build: "".to_string()
+  }
+end
+
+def Version::parse(s: &String) -> Result[Version, PackageError]
+  let parts = s.split(".")
+  let mut nums = Vec::new()
+  for p in parts do
+    match p.parse::<UInt>()
+    when Option::Some(n) => nums.push(n)
+    when Option::None => return Result::Err(PackageError::InvalidVersion)
+    end
+  end
+  
+  if nums.len() < 3 then
+    return Result::Err(PackageError::InvalidVersion)
+  end
+  
+  Result::Ok(Version::new(nums[0], nums[1], nums[2]))
+end
+
+def Version::to_string(self: &Version) -> String
+  let mut s = "{}.{}.{}".format(self.major, self.minor, self.patch)
+  if self.pre.len() > 0 then
+    s = s + "-" + self.pre
+  end
+  if self.build.len() > 0 then
+    s = s + "+" + self.build
+  end
+  s
+end
+
+enum PackageSource
+  Registry(String)      # Official/custom registry
+  Git(String)          # Git repository
+  Path(String)         # Local path
+  Tarball(String)      # Remote tarball URL
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Manifest
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageManifest
+  name: String
+  version: Version
+  description: Option[String]
+  authors: Vec[String]
+  license: Option[String]
+  homepage: Option[String]
+  repository: Option[String]
+  
+  # Dependencies
+  dependencies: Map[String, VersionReq]
+  dev_dependencies: Map[String, VersionReq]
+  
+  # Build info
+  edition: String
+  build_script: Option[String]
+  targets: Vec[String]
+  
+  # Features
+  features: Map[String, Vec[String]]
+  default_features: Vec[String]
+end
+
+def PackageManifest::default() -> PackageManifest
+  PackageManifest {
+    name: "".to_string(),
+    version: Version::new(0, 1, 0),
+    description: Option::None,
+    authors: Vec::new(),
+    license: Option::None,
+    homepage: Option::None,
+    repository: Option::None,
+    dependencies: Map::new(),
+    dev_dependencies: Map::new(),
+    edition: "2024".to_string(),
+    build_script: Option::None,
+    targets: Vec::new(),
+    features: Map::new(),
+    default_features: Vec::new()
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Version Requirements
+# ═══════════════════════════════════════════════════════════════
+
+enum VersionReq
+  Any
+  Exact(Version)
+  Greater(Version)
+  GreaterOrEqual(Version)
+  Less(Version)
+  LessOrEqual(Version)
+  Range(Version, Version)
+  Wildcard
+end
+
+def VersionReq::parse(s: &String) -> Result[VersionReq, PackageError]
+  if s == "*" then return Result::Ok(VersionReq::Wildcard) end
+  
+  let s = s.trim()
+  
+  if s.starts_with(">=") then
+    let v = s.slice(2, s.len())?.trim()
+    match Version::parse(&v.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::GreaterOrEqual(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  elsif s.starts_with(">") then
+    let v = s.slice(1, s.len())?.trim()
+    match Version::parse(&v.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::Greater(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  elsif s.starts_with("<=") then
+    let v = s.slice(2, s.len())?.trim()
+    match Version::parse(&v.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::LessOrEqual(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  elsif s.starts_with("<") then
+    let v = s.slice(1, s.len())?.trim()
+    match Version::parse(&v.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::Less(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  elsif s.starts_with("=") then
+    let v = s.slice(1, s.len())?.trim()
+    match Version::parse(&v.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::Exact(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  else
+    match Version::parse(&s.to_string())
+    when Option::Some(ver) => Result::Ok(VersionReq::Exact(ver))
+    when Option::None => Result::Err(PackageError::InvalidVersion)
+    end
+  end
+end
+
+def VersionReq::matches(self: &VersionReq, version: &Version) -> Bool
+  match self
+  when VersionReq::Any then true
+  when VersionReq::Exact(v) => version.major == v.major && version.minor == v.minor && version.patch == v.patch
+  when VersionReq::Greater(v) => version.major > v.major || (version.major == v.major && version.minor > v.minor) || (version.major == v.major && version.minor == v.minor && version.patch > v.patch)
+  when VersionReq::GreaterOrEqual(v) => self.matches_greater(v) || self.matches_exact(v)
+  when VersionReq::Less(v) => version.major < v.major || (version.major == v.major && version.minor < v.minor) || (version.major == v.major && version.minor == v.minor && version.patch < v.patch)
+  when VersionReq::LessOrEqual(v) => self.matches_less(v) || self.matches_exact(v)
+  when VersionReq::Range(min, max) => (self.matches_greater_or_equal(&min)) && (self.matches_less_or_equal(&max))
+  when VersionReq::Wildcard then true
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Registry
+# ═══════════════════════════════════════════════════════════════
+
+struct RegistryIndex
+  url: String
+  cache: Map[String, Vec[PackageId]]
+end
+
+def RegistryIndex::new(url: String) -> RegistryIndex
+  RegistryIndex {
+    url: url,
+    cache: Map::new()
+  }
+end
+
+def RegistryIndex::search(&mut self, name: &String) -> Result[Vec[PackageId], PackageError]
+  # Check cache first
+  match self.cache.get(name)
+  when Option::Some(pkgs) => Result::Ok(pkgs.clone())
+  when Option::None =>
+    # Fetch from registry
+    let url = self.url.clone() + "/api/v1/packages/" + name
+    match http::get(&url)
+    when Option::Some(response) =>
+      let pkgs = parse_package_list(&response)?
+      self.cache.insert(name.clone(), pkgs.clone())
+      Result::Ok(pkgs)
+    when Option::None => Result::Err(PackageError::NetworkError)
+    end
+  end
+end
+
+def parse_package_list(data: &String) -> Result[Vec[PackageId], PackageError]
+  # Parse JSON response from registry
+  match json::parse(data)
+  when Option::Some(json_val) =>
+    mut pkgs = Vec::new()
+    match json_val.get("versions")
+    when Option::Some(versions_arr) =>
+      for v in versions_arr.each() do
+        let name = match v.get("name") when Option::Some(n) => n.as_string() when Option::None => continue end
+        let version_str = match v.get("version") when Option::Some(vs) => vs.as_string() when Option::None => continue end
+        let version = match Version::parse(&version_str) when Result::Ok(ver) => ver when Result::Err(_) => continue end
+        
+        pkgs.push(PackageId {
+          name: name,
+          version: version,
+          source: PackageSource::Registry("https://packages.tangerine-lang.org".to_string())
+        })
+      end
+    when Option::None => ()
+    end
+    Result::Ok(pkgs)
+  when Option::None => Result::Err(PackageError::ManifestParseError)
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Dependency Resolution
+# ═══════════════════════════════════════════════════════════════
+
+struct ResolvedDependency
+  id: PackageId
+  source: PackageSource
+  checksum: Option[String]
+end
+
+struct ResolutionResult
+  packages: Vec[ResolvedDependency]
+  conflicts: Vec[String]
+end
+
+def resolve_dependencies(manifest: &PackageManifest, registry: &mut RegistryIndex) -> Result[ResolutionResult, PackageError]
+  let mut resolved = Vec::new()
+  let mut conflicts = Vec::new()
+  
+  # Resolve each dependency
+  for (name, req) in manifest.dependencies do
+    match registry.search(&name)
+    when Result::Ok(versions) =>
+      # Find matching version
+      let mut best: Option[PackageId] = Option::None
+      for pkg in versions do
+        if req.matches(&pkg.version) then
+          match best
+          when Option::None => best = Option::Some(pkg)
+          when Option::Some(best_pkg) =>
+            if pkg.version.major > best_pkg.version.major || (pkg.version.major == best_pkg.version.major && pkg.version.minor > best_pkg.version.minor) then
+              best = Option::Some(pkg)
+            end
+          end
+        end
+      end
+      
+      match best
+      when Option::Some(pkg) => resolved.push(ResolvedDependency { id: pkg, source: PackageSource::Registry("https://packages.tangerine-lang.org".to_string()), checksum: Option::None })
+      when Option::None => conflicts.push("no matching version found for ".to_string() + &name)
+      end
+    when Result::Err(_) =>
+      conflicts.push("package not found: ".to_string() + &name)
+    end
+  end
+  
+  Result::Ok(ResolutionResult {
+    packages: resolved,
+    conflicts: conflicts
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Cache
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageCache
+  base_path: String
+  packages: Map[String, CachedPackage]
+end
+
+struct CachedPackage
+  id: PackageId
+  path: String
+  checksum: Option[String]
+  size: UInt
+  downloaded_at: UInt64
+end
+
+def PackageCache::new(base_path: String) -> PackageCache
+  PackageCache {
+    base_path: base_path,
+    packages: Map::new()
+  }
+end
+
+def PackageCache::get_package_path(&self, id: &PackageId) -> String
+  self.base_path.clone() + "/pkg/" + &id.name + "-" + &id.version.to_string()
+end
+
+def PackageCache::has(&self, id: &PackageId) -> Bool
+  self.packages.contains_key(&id.name)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Downloader
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageDownloader
+  cache: PackageCache
+  temp_dir: String
+end
+
+def PackageDownloader::new(cache_dir: String) -> PackageDownloader
+  PackageDownloader {
+    cache: PackageCache::new(cache_dir),
+    temp_dir: cache_dir.clone() + "/tmp"
+  }
+end
+
+def PackageDownloader::download(&mut self, pkg: &PackageId) -> Result[String, PackageError]
+  # Check if already cached
+  if self.cache.has(pkg) then
+    return Result::Ok(self.cache.get_package_path(pkg))
+  end
+  
+  # Download based on source
+  let path = match pkg.source
+  when PackageSource::Tarball(url) => self.download_tarball(pkg, &url)?
+  when PackageSource::Git(url) => self.clone_git(pkg, &url)?
+  when PackageSource::Path(p) => Result::Ok(p)
+  when PackageSource::Registry(reg) => self.download_from_registry(pkg, &reg)?
+  end
+  
+  # Add to cache
+  Result::Ok(path)
+end
+
+def PackageDownloader::download_tarball(&mut self, pkg: &PackageId, url: &String) -> Result[String, PackageError]
+  # Ensure temp directory exists
+  fs::create_dir_all(&self.temp_dir)?
+  
+  # Download tarball
+  let filename = &pkg.name + "-" + &pkg.version.to_string() + ".tar.gz"
+  let dest_path = self.temp_dir.clone() + "/" + &filename
+  
+  match http::download(url, &dest_path)
+  when Option::Some(_) => ()
+  when Option::None => return Result::Err(PackageError::DownloadFailed)
+  end
+  
+  # Extract tarball
+  let extract_path = self.cache.get_package_path(pkg)
+  fs::create_dir_all(&extract_path)?
+  
+  let mut tar_cmd = std::process::Command::new("tar")
+  tar_cmd.arg("xzf").arg(&dest_path)
+  tar_cmd.arg("-C").arg(&extract_path)
+  
+  let result = tar_cmd.output()?
+  if !result.status.success() then
+    return Result::Err(PackageError::ExtractFailed(
+      String::from_utf8_lossy(&result.stderr).to_string()
+    ))
+  end
+  
+  # Clean up tarball
+  fs::remove_file(&dest_path)?
+  
+  Result::Ok(extract_path)
+end
+
+def PackageDownloader::download_from_registry(&mut self, pkg: &PackageId, registry: &String) -> Result[String, PackageError]
+  let url = "{}/api/v1/packages/{}/{}/download".format(registry, &pkg.name, &pkg.version.to_string())
+  self.download_tarball(pkg, &url)
+end
+
+def PackageDownloader::clone_git(&mut self, pkg: &PackageId, url: &String) -> Result[String, PackageError]
+  let target_path = self.cache.get_package_path(pkg)
+  
+  # Create parent directory if needed
+  let parent = target_path.clone().rsplitn(1, "/")[0]
+  fs::create_dir_all(&parent)?
+  
+  # Run git clone with depth 1 for efficiency
+  let mut cmd = std::process::Command::new("git")
+  cmd.arg("clone").arg("--depth").arg("1")
+  cmd.arg("--branch").arg(&pkg.version.to_string())
+  cmd.arg(url).arg(&target_path)
+  
+  let result = cmd.output()?
+  
+  if !result.status.success() then
+    return Result::Err(PackageError::GitCloneFailed(
+      String::from_utf8_lossy(&result.stderr).to_string()
+    ))
+  end
+  
+  if !fs::exists(&target_path) then
+    return Result::Err(PackageError::GitCloneFailed("clone directory not found".to_string()))
+  end
+  
+  # Add to cache
+  self.cache.packages.insert(pkg.name.clone(), CachedPackage {
+    id: pkg.clone(),
+    path: target_path.clone(),
+    checksum: Option::None,
+    size: fs::dir_size(&target_path).unwrap_or(0),
+    downloaded_at: std::time::unix_time()
+  })
+  
+  Result::Ok(target_path)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Builder
+# ═══════════════════════════════════════════════════════════════
+
+struct BuildResult
+  success: Bool
+  artifacts: Vec[String]
+  logs: String
+end
+
+def build_package(pkg_path: &String, target: Option[String]) -> Result[BuildResult, PackageError]
+  # Read package manifest
+  let manifest_path = pkg_path.clone() + "/tangerine.toml"
+  
+  match toml::parse_file(&manifest_path)
+  when Option::Some(manifest) =>
+    # Run build script if present
+    match manifest.build_script
+    when Option::Some(script) =>
+      run_build_script(pkg_path, &script, target)?
+    when Option::None =>
+      # Default build: compile all .tg files
+      run_default_build(pkg_path, target)?
+    end
+  when Option::None =>
+    Result::Err(PackageError::ManifestParseError)
+  end
+end
+
+def run_build_script(pkg_path: &String, script: &String, target: Option[String]) -> Result[BuildResult, PackageError]
+  let mut cmd = std::process::Command::new("sh")
+  cmd.arg("-c").arg(script)
+  cmd.cwd(pkg_path)
+  
+  # Set target environment variable if provided
+  match target
+  when Option::Some(t) => cmd.env("TANGERINE_TARGET", t)
+  when Option::None => ()
+  end
+  
+  let result = cmd.output()?
+  
+  Result::Ok(BuildResult {
+    success: result.status.success(),
+    artifacts: Vec::new(),
+    logs: String::from_utf8_lossy(&result.stdout).to_string() + String::from_utf8_lossy(&result.stderr).to_string()
+  })
+end
+
+def run_default_build(pkg_path: &String, target: Option[String]) -> Result[BuildResult, PackageError]
+  # Find all .tg files in src/
+  let src_dir = pkg_path.clone() + "/src"
+  let mut sources = Vec::new()
+  
+  if fs::exists(&src_dir) then
+    let entries = fs::read_dir(&src_dir)?
+    for entry in entries do
+      if entry.ends_with(".tg") then
+        sources.push(src_dir.clone() + "/" + entry)
+      end
+    end
+  end
+  
+  # Run tangerine compiler
+  let mut cmd = std::process::Command::new("tgc")
+  for src in sources do
+    cmd.arg(src)
+  end
+  
+  match target
+  when Option::Some(t) => cmd.arg("--target").arg(t)
+  when Option::None => ()
+  end
+  
+  cmd.arg("-o").arg(pkg_path.clone() + "/bin/main")
+  cmd.cwd(pkg_path)
+  
+  let result = cmd.output()?
+  
+  Result::Ok(BuildResult {
+    success: result.status.success(),
+    artifacts: vec![pkg_path.clone() + "/bin/main"],
+    logs: String::from_utf8_lossy(&result.stdout).to_string() + String::from_utf8_lossy(&result.stderr).to_string()
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Package Manager
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageManager
+  workspace: String
+  registry: RegistryIndex
+  cache: PackageCache
+  manifest: Option[PackageManifest]
+end
+
+def PackageManager::new(workspace: String) -> PackageManager
+  let config = load_config(&workspace)
+  
+  let registry_url = match config
+  when Result::Ok(cfg) => cfg.registry_url
+  when Result::Err(_) => "https://packages.tangerine-lang.org".to_string()
+  end
+  
+  PackageManager {
+    workspace: workspace,
+    registry: RegistryIndex::new(registry_url),
+    cache: PackageCache::new(workspace.clone() + "/.tangerine"),
+    manifest: Option::None
+  }
+end
+
+def PackageManager::init(&mut self, name: String, version: Version) -> Result[Unit, PackageError]
+  let manifest = PackageManifest {
+    name: name,
+    version: version,
+    description: Option::None,
+    authors: Vec::new(),
+    license: Option::None,
+    homepage: Option::None,
+    repository: Option::None,
+    dependencies: Map::new(),
+    dev_dependencies: Map::new(),
+    edition: "2024".to_string(),
+    build_script: Option::None,
+    targets: Vec::new(),
+    features: Map::new(),
+    default_features: Vec::new()
+  }
+  
+  # Write tangerine.toml
+  let path = self.workspace.clone() + "/tangerine.toml"
+  let content = toml::encode(&manifest)
+  fs::write(&path, &content)?
+  
+  # Create src directory
+  fs::create_dir_all(&self.workspace.clone() + "/src")?
+  
+  self.manifest = Option::Some(manifest)
+  Result::Ok(())
+end
+
+def PackageManager::load_manifest(&mut self) -> Result[Unit, PackageError]
+  let path = self.workspace.clone() + "/tangerine.toml"
+  
+  match toml::parse_file(&path)
+  when Option::Some(m) then
+    self.manifest = Option::Some(m)
+    Result::Ok(())
+  when Option::None then
+    Result::Err(PackageError::NoManifest)
+  end
+end
+
+def PackageManager::add_dependency(&mut self, name: String, version: String) -> Result[Unit, PackageError]
+  let req = VersionReq::parse(&version)?
+  
+  match self.manifest
+  when Option::Some(ref mut m) =>
+    m.dependencies.insert(name, req)
+    # Update tangerine.toml
+    let path = self.workspace.clone() + "/tangerine.toml"
+    let content = toml::encode(m)
+    fs::write(&path, &content)?
+    Result::Ok(())
+  when Option::None =>
+    Result::Err(PackageError::NoManifest)
+  end
+end
+
+def PackageManager::build(&mut self, target: Option[String]) -> Result[Unit, PackageError]
+  # Load manifest if not loaded
+  if self.manifest.is_none() then
+    self.load_manifest()?
+  end
+  
+  match self.manifest
+  when Option::Some(ref manifest) =>
+    let result = resolve_dependencies(manifest, &mut self.registry)?
+    
+    if result.conflicts.len() > 0 then
+      return Result::Err(PackageError::DependencyConflict(result.conflicts.join(", ")))
+    end
+    
+    # Download all dependencies
+    let mut downloader = PackageDownloader::new(self.cache.base_path.clone())
+    for dep in result.packages do
+      downloader.download(&dep.id)?
+    end
+    
+    # Build all packages
+    for dep in result.packages do
+      let path = self.cache.get_package_path(&dep.id)
+      build_package(&path, target.clone())?
+    end
+    
+    # Build main package
+    build_package(&self.workspace, target)
+  when Option::None =>
+    Result::Err(PackageError::NoManifest)
+  end
+end
+
+def PackageManager::test(&mut self) -> Result[Unit, PackageError]
+  # Build first
+  self.build(Option::None)?
+  
+  # Run tests
+  let test_path = self.workspace.clone() + "/bin/test"
+  
+  if !fs::exists(&test_path) then
+    # Try running tgc with --test flag
+    let mut cmd = std::process::Command::new("tgc")
+    cmd.arg("--test")
+    cmd.arg(self.workspace.clone() + "/src")
+    cmd.arg("-o").arg(&test_path)
+    
+    let result = cmd.output()?
+    if !result.status.success() then
+      return Result::Err(PackageError::BuildFailed)
+    end
+  end
+  
+  # Run the test binary
+  let mut cmd = std::process::Command::new(&test_path)
+  let result = cmd.output()?
+  
+  if !result.status.success() then
+    return Result::Err(PackageError::TestFailed(
+      String::from_utf8_lossy(&result.stdout).to_string()
+    ))
+  end
+  
+  Result::Ok(())
+end
+
+def PackageManager::publish(&mut self) -> Result[Unit, PackageError]
+  # Load manifest if not loaded
+  if self.manifest.is_none() then
+    self.load_manifest()?
+  end
+  
+  # Require a manifest
+  let manifest = match &self.manifest
+  when Option::Some(m) => m
+  when Option::None => return Result::Err(PackageError::NoManifest)
+  end
+  
+  # Validate manifest has required fields
+  if manifest.name.len() == 0 then
+    return Result::Err(PackageError::InvalidManifest)
+  end
+  
+  # Build the package first
+  self.build(Option::None)?
+  
+  # Create tarball of the package
+  let pkg_dir = self.workspace.clone()
+  let tarball_path = self.cache.base_path.clone() + "/.publish/" + &manifest.name + "-" + &manifest.version.to_string() + ".tar.gz"
+  
+  # Ensure .publish directory exists
+  fs::create_dir_all(&self.cache.base_path.clone() + "/.publish")?
+  
+  # Create tarball using tar command
+  let mut tar_cmd = std::process::Command::new("tar")
+  tar_cmd.arg("czf").arg(&tarball_path)
+  tar_cmd.arg("-C").arg(&pkg_dir)
+  tar_cmd.arg("--exclude=.tangerine")
+  tar_cmd.arg("--exclude=.git")
+  tar_cmd.arg("--exclude=target")
+  tar_cmd.arg(".")
+  
+  let tar_result = tar_cmd.output()?
+  if !tar_result.status.success() then
+    return Result::Err(PackageError::PackageFailed(
+      "Failed to create tarball: " + String::from_utf8_lossy(&tar_result.stderr).to_string()
+    ))
+  end
+  
+  # Calculate checksum of tarball
+  let checksum = fs::sha256_file(&tarball_path)?
+  
+  # Read API token from environment or config
+  let api_token = match env::get("TANGERINE_API_TOKEN")
+  when Option::Some(token) => token
+  when Option::None => return Result::Err(PackageError::MissingApiToken)
+  end
+  
+  # Upload to registry
+  let upload_url = self.registry.url.clone() + "/api/v1/publish"
+  
+  let mut req = http::Request::new("POST", &upload_url)
+  req.header("Authorization", "Bearer " + &api_token)
+  req.header("Content-Type", "application/octet-stream")
+  req.header("X-Package-Name", &manifest.name)
+  req.header("X-Package-Version", &manifest.version.to_string())
+  req.header("X-Checksum", &checksum)
+  
+  # Read tarball and attach as body
+  let tarball_data = fs::read_to_vec(&tarball_path)?
+  req.body(tarball_data)
+  
+  let response = req.send()?
+  
+  if !response.status.is_success() then
+    return Result::Err(PackageError::PublishFailed(
+      "Registry rejected package: " + response.status.to_string() + " - " + response.body
+    ))
+  end
+  
+  # Clean up tarball
+  fs::remove_file(&tarball_path)?
+  
+  Result::Ok(())
+end
+
+def PackageManager::clean(&mut self) -> Result[Unit, PackageError]
+  # Remove build artifacts
+  let bin_dir = self.workspace.clone() + "/bin"
+  if fs::exists(&bin_dir) then
+    fs::remove_dir_all(&bin_dir)?
+  end
+  
+  # Remove cache
+  let cache_dir = self.cache.base_path.clone()
+  if fs::exists(&cache_dir) then
+    fs::remove_dir_all(&cache_dir)?
+  end
+  
+  Result::Ok(())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════
+
+struct PackageConfig
+  registry_url: String
+  cache_dir: Option[String]
+  proxy: Option[String]
+end
+
+def PackageConfig::default() -> PackageConfig
+  PackageConfig {
+    registry_url: "https://packages.tangerine-lang.org".to_string(),
+    cache_dir: Option::None,
+    proxy: Option::None
+  }
+end
+
+def load_config(workspace: &String) -> Result[PackageConfig, PackageError]
+  # Try to load from tangerine.toml or environment
+  let config_path = workspace.clone() + "/tangerine-config.toml"
+  
+  if fs::exists(&config_path) then
+    match toml::parse_file(&config_path)
+    when Option::Some(config) => Result::Ok(config)
+    when Option::None => Result::Ok(PackageConfig::default())
+    end
+  else
+    # Check environment variables
+    let registry = env::get("TANGERINE_REGISTRY")
+    Result::Ok(PackageConfig {
+      registry_url: registry.unwrap_or("https://packages.tangerine-lang.org".to_string()),
+      cache_dir: Option::None,
+      proxy: Option::None
+    })
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Error Handling
+# ═══════════════════════════════════════════════════════════════
+
+enum PackageError
+  InvalidManifest
+  ManifestParseError
+  InvalidVersion
+  PackageNotFound
+  VersionNotFound
+  DependencyConflict(String)
+  NetworkError
+  DownloadFailed
+  BuildFailed
+  NoManifest
+  GitCloneFailed(String)
+  ExtractFailed(String)
+  PackageFailed(String)
+  MissingApiToken
+  PublishFailed(String)
+  ChecksumFailed(String)
+  TestFailed(String)
+end

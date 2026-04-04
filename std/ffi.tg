@@ -59,7 +59,19 @@ impl Ptr[T]
   end
 
   # Unsafe dereference — requires explicit unsafe block
+  # 
+  # # Safety
+  # The caller must ensure:
+  # - The pointer is valid and properly aligned for type T
+  # - The pointer points to initialized memory of type T
+  # - The referenced memory is not mutated while the reference exists
+  #
+  # This method will panic in debug builds if the pointer is null.
+  # In release builds, null dereference causes undefined behavior.
   def deref(self: &Self) -> &T
+    # Debug assertion for null pointer - catches bugs early in development
+    debug_assert!(!self.is_null(), "Ptr::deref() called on null pointer")
+    
     if self.address == 0 then
       panic("null pointer dereference")
     end
@@ -74,14 +86,42 @@ impl Ptr[T]
   end
 
   # Offset pointer by count elements
+  #
+  # # Safety
+  # The caller must ensure:
+  # - The resulting pointer remains within the same allocated object
+  # - Or is one byte past the end of the allocated object
+  #
+  # In debug builds, this method performs bounds checking when possible.
   def offset(self: &Self, count: Int) -> Ptr[T]
     let elem_size = size_of[T]()
-    Ptr { address: self.address + (count * elem_size) as UInt }
+    let new_addr = self.address + (count * elem_size) as UInt
+    
+    # Debug assertion: check for overflow/underflow
+    debug_assert!(
+      count >= 0 || new_addr <= self.address,
+      "Ptr::offset() caused underflow"
+    )
+    debug_assert!(
+      count <= 0 || new_addr >= self.address,
+      "Ptr::offset() caused overflow"
+    )
+    
+    Ptr { address: new_addr }
   end
 
   # Add byte offset
+  #
+  # # Safety
+  # The caller must ensure the resulting pointer remains valid.
+  # Prefer offset() for element-based arithmetic when possible.
   def byte_add(self: &Self, bytes: UInt) -> Ptr[T]
-    Ptr { address: self.address + bytes }
+    let new_addr = self.address + bytes
+    
+    # Debug assertion: check for overflow
+    debug_assert!(new_addr >= self.address, "Ptr::byte_add() caused overflow")
+    
+    Ptr { address: new_addr }
   end
 end
 
@@ -114,9 +154,18 @@ impl NonNull[T]
     self.ptr
   end
 
-  # Safe dereference — pointer is guaranteed valid
+  # Safe dereference — pointer is guaranteed non-null
+  #
+  # # Safety
+  # While NonNull guarantees the pointer is not null, the caller must still ensure:
+  # - The pointer points to valid, initialized memory of type T
+  # - The pointer is properly aligned for type T
+  # - The memory is not simultaneously accessed in a way that violates aliasing rules
+  #
+  # Unlike Ptr::deref(), this method does not check for null since
+  # NonNull's invariant guarantees non-nullness.
   def deref(self: &Self) -> &T
-    unsafe "NonNull pointer dereference — guaranteed non-null" do
+    unsafe "NonNull pointer dereference — guaranteed non-null by type invariant" do
       &(*self.ptr)
     end
   end
@@ -148,29 +197,44 @@ struct CStr
   len: Int
 end
 
-# Owned C-compatible string with NUL terminator
+# Owned C-compatible string with NUL terminator.
+# Holds an independently allocated copy of the source string data so the
+# CString remains valid after the source String is dropped.
 struct CString
-  data: Vec[u8]
+  ptr: Ptr[u8]
 end
 
 def cstring_new(s: String) -> CString
-  mut data = Vec::new()
-  for b in s.bytes() do
-    data.push(b)
+  # Copy the string data into a freshly allocated, independently-owned buffer
+  # so the CString does not alias the original String's storage.
+  let src = s.as_ptr()
+  let len = s.len()
+  let buf = alloc(len + 1) as Ptr[u8]
+  mut i = 0
+  while i < len do
+    unsafe "copy string byte to CString buffer" do
+      *(buf.offset(i as isize)) = *(src.offset(i as isize))
+    end
+    i = i + 1
   end
-  data.push(0)  # NUL terminator
-  CString { data: data }
+  unsafe "NUL-terminate CString" do
+    *(buf.offset(len as isize)) = 0
+  end
+  CString { ptr: buf }
 end
 
 def cstring_as_ptr(cs: &CString) -> Ptr[u8]
-  # In codegen, this becomes a pointer to the Vec's heap buffer
-  Ptr { address: cs.data.as_ptr_address() }
+  cs.ptr
 end
 
 def cstring_to_string(cs: &CString) -> String
-  # Strip the NUL terminator and return as String
-  let len = cs.data.len() - 1
-  String::from_bytes(cs.data.slice(0, len))
+  if cs.ptr.is_null() then
+    String::new()
+  else
+    unsafe "CString pointer must reference a NUL-terminated buffer" do
+      String::from_c_str(cs.ptr)
+    end
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -520,23 +584,23 @@ extern "C" do
   def __sync_synchronize() -> Unit
 end
 
-mut RUBY_RUNTIME_LOCK: u8 = 0
-mut RUBY_RUNTIME: Option[RubyRuntime] = Option::None
+mut _RUBY_RUNTIME_LOCK: u8 = 0
+mut _RUBY_RUNTIME: Option[RubyRuntime] = Option::None
 
 def ruby_runtime_lock() -> Unit
-  while !__sync_bool_compare_and_swap_1(&RUBY_RUNTIME_LOCK, 0, 1) do
+  while !__sync_bool_compare_and_swap_1(&_RUBY_RUNTIME_LOCK, 0, 1) do
     # Spin
   end
 end
 
 def ruby_runtime_unlock() -> Unit
   __sync_synchronize()
-  RUBY_RUNTIME_LOCK = 0
+  _RUBY_RUNTIME_LOCK = 0
 end
 
 def ruby_start() -> Result[RubyRuntime, String]
   ruby_runtime_lock()
-  match RUBY_RUNTIME
+  match _RUBY_RUNTIME
   when Option::Some(_) then
     ruby_runtime_unlock()
     return Result::Err("Ruby runtime already initialized")
@@ -547,17 +611,17 @@ def ruby_start() -> Result[RubyRuntime, String]
   ruby_init_loadpath()
   
   let rt = RubyRuntime { initialized: true }
-  RUBY_RUNTIME = Option::Some(rt)
+  _RUBY_RUNTIME = Option::Some(rt)
   ruby_runtime_unlock()
   Result::Ok(rt)
 end
 
 def ruby_stop() -> Unit
   ruby_runtime_lock()
-  match RUBY_RUNTIME
+  match _RUBY_RUNTIME
   when Option::Some(_) then
     ruby_finalize()
-    RUBY_RUNTIME = Option::None
+    _RUBY_RUNTIME = Option::None
   when Option::None then ()
   end
   ruby_runtime_unlock()

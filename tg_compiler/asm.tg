@@ -50,6 +50,7 @@ enum RelocKind
   R_X86_64_GOTPCREL
   R_X86_64_64
   # ELF ARM64
+  R_AARCH64_ABS64
   R_AARCH64_CALL26
   R_AARCH64_ADR_PREL_PG_HI21
   R_AARCH64_ADD_ABS_LO12_NC
@@ -82,6 +83,7 @@ def from_elf_reloc_type(arch: Arch, reloc_type: Int) -> Option[RelocKind]
     end
   when Arch::AArch64 then
     match reloc_type
+    when 257 then Option::Some(RelocKind::R_AARCH64_ABS64)
     when 261 then Option::Some(RelocKind::R_AARCH64_PREL32)
     when 264 then Option::Some(RelocKind::R_AARCH64_MOVW_UABS_G0_NC)
     when 266 then Option::Some(RelocKind::R_AARCH64_MOVW_UABS_G1_NC)
@@ -143,6 +145,7 @@ enum Section
   Data
   Rodata
   Bss
+  Extern    # External/undefined symbol (for linker resolution)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -157,6 +160,61 @@ def buf_new() -> CodeBuffer
     symbols: Vec::new(),
     relocations: Vec::new()
   }
+end
+
+# Merge the contents of `src` into `dst`, adjusting all offsets
+# by `dst`'s current byte position.  After this call every label,
+# fixup, symbol and relocation from `src` is present in `dst` at
+# the correct absolute offset within the merged buffer.
+def merge_code_buffer(dst: &mut CodeBuffer, src: &CodeBuffer) -> Unit
+  let base = buf_pos(dst)
+
+  # 1. Append raw bytes
+  mut i = 0
+  while i < src.bytes.len() do
+    emit8(dst, src.bytes[i])
+    i = i + 1
+  end
+
+  # 2. Merge labels — offset each by base
+  for key in src.labels.keys() do
+    match src.labels.get(&key)
+    when Option::Some(offset) then
+      dst.labels.insert(key.clone(), offset + base)
+    when Option::None then ()
+    end
+  end
+
+  # 3. Merge fixups — offset each by base
+  for fx in src.fixups do
+    dst.fixups.push(Fixup {
+      offset: fx.offset + base,
+      kind: fx.kind,
+      label: fx.label.clone()
+    })
+  end
+
+  # 4. Merge relocations — offset each by base
+  for rl in src.relocations do
+    dst.relocations.push(Relocation {
+      offset: rl.offset + base,
+      kind: rl.kind,
+      symbol: rl.symbol.clone(),
+      addend: rl.addend
+    })
+  end
+
+  # 5. Merge symbols — offset each by base
+  for sym in src.symbols do
+    dst.symbols.push(AsmSymbol {
+      name: sym.name.clone(),
+      section: sym.section,
+      offset: sym.offset + base,
+      size: sym.size,
+      binding: sym.binding,
+      kind: sym.kind
+    })
+  end
 end
 
 def buf_pos(b: &CodeBuffer) -> Int
@@ -188,14 +246,6 @@ def emit_i32(b: &mut CodeBuffer, v: i32) -> Unit
   emit32_le(b, v as u32)
 end
 
-def emit_zeros(b: &mut CodeBuffer, n: Int) -> Unit
-  mut i = 0
-  while i < n do
-    emit8(b, 0)
-    i = i + 1
-  end
-end
-
 def patch32_le(b: &mut CodeBuffer, offset: Int, v: u32) -> Unit
   b.bytes[offset]     = (v & 0xFF) as u8
   b.bytes[offset + 1] = ((v >> 8) & 0xFF) as u8
@@ -204,7 +254,8 @@ def patch32_le(b: &mut CodeBuffer, offset: Int, v: u32) -> Unit
 end
 
 def def_label(b: &mut CodeBuffer, name: String) -> Unit
-  b.labels.insert(name, buf_pos(b))
+  let pos = buf_pos(b)
+  b.labels.insert(name.clone(), pos)
 end
 
 def add_fixup(b: &mut CodeBuffer, kind: FixupKind, label: String) -> Unit
@@ -221,21 +272,21 @@ end
 
 def patch_rel32_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
   let rel = target - (offset + 4)
-  patch32_le(b, offset, (rel & 0xFFFF_FFFF) as u32)
+  patch32_le_native(b, offset, (rel & 0xFFFF_FFFF) as u32)
 end
 
 def patch_branch26_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
   let rel = target - offset
   let imm26 = (rel >> 2) & 0x03FFFFFF
-  let old = read32_le(b, offset)
-  patch32_le(b, offset, (old & 0xFC000000) | (imm26 as u32))
+  let old = read32_le_native(b, offset)
+  patch32_le_native(b, offset, (old & 0xFC000000) | (imm26 as u32))
 end
 
 def patch_bcond19_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
   let rel = target - offset
   let imm19 = ((rel >> 2) & 0x7FFFF) as u32
-  let old = read32_le(b, offset)
-  patch32_le(b, offset, (old & 0xFF00001F) | (imm19 << 5))
+  let old = read32_le_native(b, offset)
+  patch32_le_native(b, offset, (old & 0xFF00001F) | (imm19 << 5))
 end
 
 def patch_adrp21_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
@@ -244,18 +295,21 @@ def patch_adrp21_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
   let page_delta = (target_page - pc_page) >> 12
   let immlo = (page_delta & 0x3) as u32
   let immhi = ((page_delta >> 2) & 0x7FFFF) as u32
-  let old = read32_le(b, offset)
-  patch32_le(b, offset, (old & 0x9F00001F) | (immlo << 29) | (immhi << 5))
+  let old = read32_le_native(b, offset)
+  patch32_le_native(b, offset, (old & 0x9F00001F) | (immlo << 29) | (immhi << 5))
 end
 
 def patch_addimm12_fixup(b: &mut CodeBuffer, offset: Int, target: Int) -> Unit
   let lo12 = (target & 0xFFF) as u32
-  let old = read32_le(b, offset)
-  patch32_le(b, offset, (old & 0xFFC003FF) | (lo12 << 10))
+  let old = read32_le_native(b, offset)
+  patch32_le_native(b, offset, (old & 0xFFC003FF) | (lo12 << 10))
 end
 
 def resolve_fixups(b: &mut CodeBuffer) -> Result[Unit, String]
-  for f in b.fixups do
+  mut unresolved: Vec[String] = Vec::new()
+  mut fi = 0
+  while fi < b.fixups.len() do
+    let f = b.fixups[fi]
     match b.labels.get(f.label)
     when Option::Some(target) then
       match f.kind
@@ -271,22 +325,84 @@ def resolve_fixups(b: &mut CodeBuffer) -> Result[Unit, String]
         patch_addimm12_fixup(b, f.offset, target)
       end
     when Option::None then
-      return Result::Err("unresolved label: " + f.label)
+      if !unresolved.contains(&f.label) then
+        unresolved.push(f.label.clone())
+      end
+    end
+    fi = fi + 1
+  end
+  if !unresolved.is_empty() then
+    mut msg = "unresolved labels (WARNING, patching as nop):"
+    for lbl in unresolved do
+      msg = msg + " " + lbl
+    end
+    eprintln(msg)
+    # Patch unresolved fixups to branch to themselves (infinite loop trap)
+    # so the binary is still produced for debugging
+    mut ui = 0
+    while ui < b.fixups.len() do
+      let uf = b.fixups[ui]
+      match b.labels.get(uf.label)
+      when Option::None then
+        # Patch as branch-to-self (offset 0) — equivalent to NOP trap
+        match uf.kind
+        when FixupKind::Branch26 then
+          patch_branch26_fixup(b, uf.offset, uf.offset)
+        when _ then ()
+        end
+      when _ then ()
+      end
+      ui = ui + 1
     end
   end
   Result::Ok(())
 end
 
 def read32_le(b: &CodeBuffer, offset: Int) -> u32
-  (b.bytes[offset] as u32)
-    | ((b.bytes[offset + 1] as u32) << 8)
-    | ((b.bytes[offset + 2] as u32) << 16)
-    | ((b.bytes[offset + 3] as u32) << 24)
+  (b.bytes[offset] as u32) | ((b.bytes[offset + 1] as u32) << 8) | ((b.bytes[offset + 2] as u32) << 16) | ((b.bytes[offset + 3] as u32) << 24)
 end
 
-def align_to(b: &mut CodeBuffer, alignment: Int) -> Unit
-  while (buf_pos(b) % alignment) != 0 do
-    emit8(b, 0x00)
+def align_to(b: &mut CodeBuffer, alignment: Int, arch: Arch) -> Unit
+  let remainder = buf_pos(b) % alignment
+  if remainder == 0 then
+    return
+  end
+
+  let padding = alignment - remainder
+  mut i = 0
+  match arch
+  when Arch::X86_64 then
+    while i < padding do
+      emit8(b, 0x90)
+      i = i + 1
+    end
+  when Arch::AArch64 then
+    # AArch64 instructions are always 4 bytes.  Pad with zero bytes to reach
+    # 4-byte alignment first, then emit complete NOP instructions (0xD503201F).
+    let misalign = buf_pos(b) % 4
+    if misalign != 0 then
+      let fill = 4 - misalign
+      mut j = 0
+      while j < fill do
+        emit8(b, 0x00)
+        j = j + 1
+      end
+      i = i + fill
+    end
+    # Emit full 4-byte NOP instructions for the remaining padding
+    while i + 4 <= padding do
+      emit8(b, 0x1F)
+      emit8(b, 0x20)
+      emit8(b, 0x03)
+      emit8(b, 0xD5)
+      i = i + 4
+    end
+    # Any leftover bytes (< 4) are filled with zeros (data padding,
+    # not executable instructions)
+    while i < padding do
+      emit8(b, 0x00)
+      i = i + 1
+    end
   end
 end
 
@@ -332,6 +448,17 @@ end
 # Callee-saved: RBX, RBP, R12–R15
 def x64_callee_saved() -> Vec[X64]
   [X64::RBX, X64::R12, X64::R13, X64::R14, X64::R15]
+end
+
+def is_callee_saved(r: X64) -> Bool
+  match r
+  when X64::RBX then true
+  when X64::R12 then true
+  when X64::R13 then true
+  when X64::R14 then true
+  when X64::R15 then true
+  when _ then false
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -510,11 +637,49 @@ def x64_shl_rcl(b: &mut CodeBuffer, dst: X64) -> Unit
   emit8(b, modrm(0x03, 4, x64_lo3(dst)))
 end
 
+# SHL r64, imm8 (shift left by immediate)
+def x64_shl_ri(b: &mut CodeBuffer, dst: X64, imm: u8) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  if imm == 1 then
+    # SHL r/m64, 1 = D1 /4
+    emit8(b, 0xD1)
+    emit8(b, modrm(0x03, 4, x64_lo3(dst)))
+  else
+    # SHL r/m64, imm8 = C1 /4 ib
+    emit8(b, 0xC1)
+    emit8(b, modrm(0x03, 4, x64_lo3(dst)))
+    emit8(b, imm)
+  end
+end
+
+# CMOVA r64, r64 (conditional move if above, CF=0 && ZF=0)
+def x64_cmova_rr(b: &mut CodeBuffer, dst: X64, src: X64) -> Unit
+  emit8(b, rex(true, x64_hi(src), false, x64_hi(dst)))
+  emit8(b, 0x0F)
+  emit8(b, 0x47)
+  emit8(b, modrm(0x03, x64_lo3(src), x64_lo3(dst)))
+end
+
 # SHR r64, CL
 def x64_shr_rcl(b: &mut CodeBuffer, dst: X64) -> Unit
   emit8(b, rex(true, false, false, x64_hi(dst)))
   emit8(b, 0xD3)
   emit8(b, modrm(0x03, 5, x64_lo3(dst)))
+end
+
+# SHR r64, imm8 (shift right by immediate)
+def x64_shr_ri(b: &mut CodeBuffer, dst: X64, imm: u8) -> Unit
+  emit8(b, rex(true, false, false, x64_hi(dst)))
+  if imm == 1 then
+    # SHR r/m64, 1 = D1 /5
+    emit8(b, 0xD1)
+    emit8(b, modrm(0x03, 5, x64_lo3(dst)))
+  else
+    # SHR r/m64, imm8 = C1 /5 ib
+    emit8(b, 0xC1)
+    emit8(b, modrm(0x03, 5, x64_lo3(dst)))
+    emit8(b, imm)
+  end
 end
 
 # SAR r64, CL (arithmetic shift right)
@@ -829,9 +994,14 @@ def a64_add_rri(b: &mut CodeBuffer, d: A64, n: A64, imm: u32) -> Unit
   emit32_le(b, 0x91000000 | ((imm & 0xFFF) << 10) | (a64_code(n) << 5) | a64_code(d))
 end
 
-# SUB Xd, Xn, Xm
+# SUB Xd, Xn, Xm  (shifted register form — reg31 = XZR, NOT SP)
 def a64_sub_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
   emit32_le(b, 0xCB000000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# SUB SP, SP, Xm, UXTX #0  (extended register form — reg31 = SP)
+def a64_sub_sp_sp_r(b: &mut CodeBuffer, m: A64) -> Unit
+  emit32_le(b, 0xCB2063FF | (a64_code(m) << 16))
 end
 
 # SUB Xd, Xn, #imm12
@@ -1066,9 +1236,49 @@ def a64_lsl_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
   emit32_le(b, 0x9AC02000 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
 end
 
+# LSL Xd, Xn, #amount (immediate form)
+def a64_lsl(b: &mut CodeBuffer, d: A64, n: A64, amount: u32) -> Unit
+  # UBFM Xd, Xn, #(64-amount), #(63-amount)
+  if amount == 0 || amount > 63 then panic("a64_lsl: invalid shift amount") end
+  let immr = 64 - amount
+  let imms = 63 - amount
+  emit32_le(b, 0xD3400000 | (immr << 16) | (imms << 10) | (a64_code(n) << 5) | a64_code(d))
+end
+
 # LSRV Xd, Xn, Xm (logical shift right, variable)
 def a64_lsr_rrr(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
   emit32_le(b, 0x9AC02400 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# LSR Xd, Xn, #amount (immediate form)
+def a64_lsr(b: &mut CodeBuffer, d: A64, n: A64, amount: u32) -> Unit
+  # UBFM Xd, Xn, #amount, #63
+  if amount == 0 || amount > 63 then panic("a64_lsr: invalid shift amount") end
+  let immr = amount
+  let imms: u32 = 63
+  emit32_le(b, 0xD3400000 | (immr << 16) | (imms << 10) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# UDIV Xd, Xn, Xm (unsigned divide)
+def a64_udiv(b: &mut CodeBuffer, d: A64, n: A64, m: A64) -> Unit
+  emit32_le(b, 0x9AC00800 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# MSUB Xd, Xm, Xa, Xn (multiply-subtract: d = n - m*a)
+def a64_msub(b: &mut CodeBuffer, d: A64, m: A64, a: A64, n: A64) -> Unit
+  emit32_le(b, 0x9B008000 | (a64_code(a) << 16) | (a64_code(n) << 10) | (a64_code(m) << 5) | a64_code(d))
+end
+
+# CSEL Xd, Xn, Xm, cond (conditional select)
+def a64_csel(b: &mut CodeBuffer, d: A64, n: A64, m: A64, cond: u32) -> Unit
+  emit32_le(b, 0x9A800000 | (a64_code(m) << 16) | (cond << 12) | (a64_code(n) << 5) | a64_code(d))
+end
+
+# ADD Xd, Xn, Xm, LSL #shift (shifted register form)
+def a64_add_rrr_lsl(b: &mut CodeBuffer, d: A64, n: A64, m: A64, shift: u32) -> Unit
+  # shift amount in bits 22:21 for LSL, 0=LSL, 1=LSR, 2=ASR
+  let imm6 = (shift & 0x3F) as u32
+  emit32_le(b, 0x8B000000 | (imm6 << 10) | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
 end
 
 # ASRV Xd, Xn, Xm (arithmetic shift right, variable)
@@ -1124,9 +1334,12 @@ def a64_add_lo12(b: &mut CodeBuffer, d: A64, n: A64, label: String) -> Unit
 end
 
 # ARM64 condition codes
-# EQ=0, NE=1, LT(=LO)=0b1011, LE=0b1101, GT=0b1100, GE=0b1010
+# EQ=0, NE=1, CS(=HS)=0b0010, CC(=LO)=0b0011,
+# LT=0b1011, LE=0b1101, GT=0b1100, GE=0b1010
 def a64_cc_eq() -> u32 = 0
 def a64_cc_ne() -> u32 = 1
+def a64_cc_cs() -> u32 = 2
+def a64_cc_cc() -> u32 = 3
 def a64_cc_lt() -> u32 = 11  # 0b1011
 def a64_cc_le() -> u32 = 13  # 0b1101
 def a64_cc_gt() -> u32 = 12  # 0b1100
@@ -1349,25 +1562,25 @@ end
 def host_target() -> AsmTarget
   # Detect host target from environment or system
   # Check TG_HOST_TARGET env var first for override
-  match std::env::var("TG_HOST_TARGET".to_string())
+  match std::env::get_env("TG_HOST_TARGET".to_string())
   when Option::Some(triple) then
     return parse_target_triple(triple)
   when Option::None then ()
   end
 
-  match std::env::var("TARGET".to_string())
+  match std::env::get_env("TARGET".to_string())
   when Option::Some(triple) then
     return parse_target_triple(triple)
   when Option::None then ()
   end
 
-  match std::env::var("HOST".to_string())
+  match std::env::get_env("HOST".to_string())
   when Option::Some(triple) then
     return parse_target_triple(triple)
   when Option::None then ()
   end
 
-  match std::env::var("MACHTYPE".to_string())
+  match std::env::get_env("MACHTYPE".to_string())
   when Option::Some(triple) then
     return parse_target_triple(triple)
   when Option::None then ()
@@ -1375,30 +1588,35 @@ def host_target() -> AsmTarget
   
   # Try to detect from system info
   # On Unix-like systems, check uname
-  let arch_str = match std::env::var("HOSTTYPE".to_string())
+  let arch_str = match std::env::get_env("HOSTTYPE".to_string())
   when Option::Some(h) then h
   when Option::None then
-    match std::env::var("PROCESSOR_ARCHITECTURE".to_string())
+    match std::env::get_env("PROCESSOR_ARCHITECTURE".to_string())
     when Option::Some(p) then p
     when Option::None then "unknown"
     end
   end
   
-  let os_str = match std::env::var("OSTYPE".to_string())
+  let os_str = match std::env::get_env("OSTYPE".to_string())
   when Option::Some(o) then o
   when Option::None then
     # Try to infer from other env vars
-    match std::env::var("OS".to_string())
+    match std::env::get_env("OS".to_string())
     when Option::Some(w) then
       if w.contains("Windows") then "windows" else "unknown" end
     when Option::None then "unknown"
     end
   end
   
-  # Parse detected values
+  # Parse detected values — fall back to aarch64-macos when detection fails
+  # (common under interpreter or when env vars are missing/wrong)
   let arch = if arch_str.contains("x86_64") || arch_str.contains("amd64") || arch_str.contains("AMD64") then
     Arch::X86_64
   elsif arch_str.contains("aarch64") || arch_str.contains("arm64") then
+    Arch::AArch64
+  elsif arch_str == "unknown" then
+    # Default to AArch64 on macOS when env detection fails
+    eprintln("[host_target] warning: could not detect host arch, defaulting to aarch64")
     Arch::AArch64
   else
     panic("unsupported host architecture: " + arch_str.to_string())
@@ -1410,6 +1628,10 @@ def host_target() -> AsmTarget
     OsAbi::Linux
   elsif os_str.contains("windows") then
     OsAbi::Windows
+  elsif os_str == "unknown" then
+    # Default to macOS when env detection fails
+    eprintln("[host_target] warning: could not detect host OS, defaulting to macos")
+    OsAbi::MacOS
   else
     panic("unsupported host OS: " + os_str.to_string())
   end

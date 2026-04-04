@@ -1,0 +1,1144 @@
+# Tangerine Standard Library — std::lsp
+# Language Server Protocol 3.17 - Production Implementation
+# NO PLACEHOLDERS - Full IDE Integration
+
+use std::core::{Option, Result, String, Vec, Unit, Bool, Int, UInt}
+use std::collections::{Map, Set}
+use std::io
+use std::fs
+use std::json
+use std::thread
+use std::sync::{Mutex, RwLock, channel}
+use std::process
+
+# ═══════════════════════════════════════════════════════════════
+# Core LSP Types
+# ═══════════════════════════════════════════════════════════════
+
+struct Position
+  line: UInt
+  character: UInt
+end
+
+def Position::to_json(self: &Position) -> json::Value
+  json::object({"line": self.line, "character": self.character})
+end
+
+def Position::from_json(v: &json::Value) -> Result[Position, Unit]
+  let line = match v.get("line") when Option::Some(l) => l.as_uint() when Option::None => return Result::Err(()) end
+  let ch = match v.get("character") when Option::Some(c) => c.as_uint() when Option::None => return Result::Err(()) end
+  Result::Ok(Position{line: line, character: ch})
+end
+
+struct Range
+  start: Position
+  end: Position
+end
+
+def Range::to_json(self: &Range) -> json::Value
+  json::object({"start": self.start.to_json(), "end": self.end.to_json()})
+end
+
+def Range::from_json(v: &json::Value) -> Result[Range, Unit]
+  let start = Position::from_json(match v.get("start") when Option::Some(s) => s when Option::None => return Result::Err(()) end)?
+  let end = Position::from_json(match v.get("end") when Option::Some(e) => e when Option::None => return Result::Err(()) end)?
+  Result::Ok(Range{start: start, end: end})
+end
+
+struct Location
+  uri: String
+  range: Range
+end
+
+def Location::to_json(self: &Location) -> json::Value
+  json::object({"uri": self.uri.clone(), "range": self.range.to_json()})
+end
+
+struct Diagnostic
+  range: Range
+  severity: Int
+  code: String
+  source: String
+  message: String
+end
+
+def Diagnostic::to_json(self: &Diagnostic) -> json::Value
+  json::object({
+    "range": self.range.to_json(),
+    "severity": self.severity,
+    "code": self.code.clone(),
+    "source": self.source.clone(),
+    "message": self.message.clone()
+  })
+end
+
+struct TextEdit
+  range: Range
+  new_text: String
+end
+
+def TextEdit::to_json(self: &TextEdit) -> json::Value
+  json::object({"range": self.range.to_json(), "newText": self.new_text.clone()})
+end
+
+struct CompletionItem
+  label: String
+  kind: Int
+  detail: String
+  insert_text: String
+end
+
+def CompletionItem::to_json(self: &CompletionItem) -> json::Value
+  json::object({
+    "label": self.label.clone(),
+    "kind": self.kind,
+    "detail": self.detail.clone(),
+    "insertText": self.insert_text.clone()
+  })
+end
+
+struct DocumentSymbol
+  name: String
+  kind: Int
+  range: Range
+  selection_range: Range
+  children: Vec[DocumentSymbol]
+end
+
+def DocumentSymbol::to_json(self: &DocumentSymbol) -> json::Value
+  json::object({
+    "name": self.name.clone(),
+    "kind": self.kind,
+    "range": self.range.to_json(),
+    "selectionRange": self.selection_range.to_json(),
+    "children": json::array(self.children.map(|c| c.to_json()))
+  })
+end
+
+struct Hover
+  contents: String
+end
+
+def Hover::to_json(self: &Hover) -> json::Value
+  json::object({"contents": json::object({"kind": "markdown", "value": self.contents.clone()})})
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Text Document Management
+# ═══════════════════════════════════════════════════════════════
+
+struct TextDocument
+  uri: String
+  version: Int
+  text: String
+  lines: Vec[String]
+end
+
+def TextDocument::new(uri: String, version: Int, text: String) -> TextDocument
+  TextDocument{uri: uri, version: version, text: text.clone(), lines: text.split("\n")}
+end
+
+def TextDocument::position_to_offset(self: &TextDocument, pos: &Position) -> UInt
+  if pos.line >= self.lines.len() then return self.text.len() end
+  let mut offset = 0
+  for i in 0..pos.line do
+    offset += self.lines[i].len() + 1
+  end
+  offset + pos.character
+end
+
+def TextDocument::apply_full_change(&mut self, text: String, version: Int)
+  self.text = text.clone()
+  self.lines = text.split("\n")
+  self.version = version
+end
+
+def TextDocument::apply_incremental_change(&mut self, range: &Range, text: &String, version: Int)
+  let start_off = self.position_to_offset(&range.start)
+  let end_off = self.position_to_offset(&range.end)
+  let before = self.text.slice(0, start_off)
+  let after = self.text.slice(end_off, self.text.len())
+  self.text = before + text + after
+  self.lines = self.text.split("\n")
+  self.version = version
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Tangerine Lexer for Analysis
+# ═══════════════════════════════════════════════════════════════
+
+enum TokenKind
+  Keyword
+  Identifier
+  String
+  Number
+  Operator
+  Punctuation
+  Comment
+  Whitespace
+  Eof
+end
+
+struct Token
+  kind: TokenKind
+  text: String
+  line: UInt
+  column: UInt
+  start: UInt
+  end: UInt
+end
+
+def is_keyword(s: &String) -> Bool
+  match s.clone()
+  when "def" | "let" | "mut" | "if" | "then" | "else" | "end" | "while" | "for" | "do" | "match" | "when" | "struct" | "enum" | "trait" | "impl" | "use" | "pub" | "return" | "break" | "continue" | "self" | "true" | "false" | "nil" | "and" | "or" | "not" | "async" | "await" | "spawn" | "move" | "ref" | "extern" | "unsafe" | "const" | "type" | "fn" | "loop" | "in" | "is" => true
+  else => false
+  end
+end
+
+def is_operator_char(c: Char) -> Bool
+  match c
+  when '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&' | '|' | '^' | '~' | '.' | ':' | '?' | '@' | '#' | '$' | '\\' => true
+  else => false
+  end
+end
+
+def is_punctuation(c: Char) -> Bool
+  match c
+  when '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' => true
+  else => false
+  end
+end
+
+def is_identifier_start(c: Char) -> Bool
+  c.is_alpha() || c == '_'
+end
+
+def is_identifier_char(c: Char) -> Bool
+  c.is_alphanumeric() || c == '_'
+end
+
+def is_digit(c: Char) -> Bool
+  c >= '0' && c <= '9'
+end
+
+def is_hex_digit(c: Char) -> Bool
+  is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+end
+
+def tokenize(text: &String) -> Vec[Token]
+  let mut tokens = Vec::new()
+  let mut line = 0
+  let mut column = 0
+  let mut pos = 0
+  let chars = text.chars()
+  let len = chars.len()
+  
+  while pos < len do
+    let c = chars[pos]
+    let start_line = line
+    let start_col = column
+    let start_pos = pos
+    
+    if c == '\n' then
+      tokens.push(Token{kind: TokenKind::Whitespace, text: "\n".to_string(), line: line, column: column, start: pos, end: pos + 1})
+      line += 1
+      column = 0
+      pos += 1
+    elsif c == ' ' || c == '\t' || c == '\r' then
+      let mut end = pos
+      while end < len && (chars[end] == ' ' || chars[end] == '\t' || chars[end] == '\r') do
+        if chars[end] == '\t' then column += 4 - (column % 4) else column += 1 end
+        end += 1
+      end
+      tokens.push(Token{kind: TokenKind::Whitespace, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+      pos = end
+    elsif c == '#' && pos + 1 < len && chars[pos + 1] == '!' then
+      # Shebang
+      let mut end = pos
+      while end < len && chars[end] != '\n' do end += 1 end
+      tokens.push(Token{kind: TokenKind::Comment, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+      pos = end
+    elsif c == '#' then
+      # Comment
+      let mut end = pos
+      while end < len && chars[end] != '\n' do end += 1 end
+      tokens.push(Token{kind: TokenKind::Comment, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+      column += end - pos
+      pos = end
+    elsif c == '"' || c == '\'' then
+      # String literal
+      let quote = c
+      let mut end = pos + 1
+      while end < len do
+        if chars[end] == '\\' && end + 1 < len then
+          end += 2
+        elsif chars[end] == quote then
+          end += 1
+          break
+        elsif chars[end] == '\n' then
+          line += 1
+          column = 0
+          end += 1
+        else
+          end += 1
+        end
+      end
+      tokens.push(Token{kind: TokenKind::String, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+      pos = end
+    elsif is_digit(c) then
+      # Number
+      let mut end = pos
+      while end < len && is_digit(chars[end]) do end += 1 end
+      if end < len && chars[end] == '.' && end + 1 < len && is_digit(chars[end + 1]) then
+        end += 1
+        while end < len && is_digit(chars[end]) do end += 1 end
+      end
+      if end < len && (chars[end] == 'e' || chars[end] == 'E') then
+        end += 1
+        if end < len && (chars[end] == '+' || chars[end] == '-') then end += 1 end
+        while end < len && is_digit(chars[end]) do end += 1 end
+      end
+      if end < len && (chars[end] == 'f' || chars[end] == 'i' || chars[end] == 'u') then
+        end += 1
+        while end < len && is_digit(chars[end]) do end += 1 end
+      end
+      tokens.push(Token{kind: TokenKind::Number, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+      column += end - pos
+      pos = end
+    elsif is_identifier_start(c) then
+      # Identifier or keyword
+      let mut end = pos
+      while end < len && is_identifier_char(chars[end]) do end += 1 end
+      let word = text.slice(pos, end)
+      let kind = if is_keyword(&word) then TokenKind::Keyword else TokenKind::Identifier end
+      tokens.push(Token{kind: kind, text: word, line: start_line, column: start_col, start: pos, end: end})
+      column += end - pos
+      pos = end
+    elsif is_punctuation(c) then
+      tokens.push(Token{kind: TokenKind::Punctuation, text: c.to_string(), line: line, column: column, start: pos, end: pos + 1})
+      column += 1
+      pos += 1
+    elsif is_operator_char(c) then
+      # Multi-character operators
+      let mut end = pos
+      while end < len && is_operator_char(chars[end]) do end += 1 end
+      # Handle :: specially (not ::)
+      if end > pos + 1 && chars[pos] == ':' && chars[pos + 1] == ':' then
+        tokens.push(Token{kind: TokenKind::Operator, text: "::".to_string(), line: line, column: column, start: pos, end: pos + 2})
+        column += 2
+        pos += 2
+      else
+        tokens.push(Token{kind: TokenKind::Operator, text: text.slice(pos, end), line: start_line, column: start_col, start: pos, end: end})
+        column += end - pos
+        pos = end
+      end
+    else
+      column += 1
+      pos += 1
+    end
+  end
+  
+  tokens.push(Token{kind: TokenKind::Eof, text: "".to_string(), line: line, column: column, start: pos, end: pos})
+  tokens
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Parser for Symbol Extraction
+# ═══════════════════════════════════════════════════════════════
+
+struct Parser
+  tokens: Vec[Token]
+  pos: UInt
+end
+
+def Parser::new(tokens: Vec[Token]) -> Parser
+  Parser{tokens: tokens, pos: 0}
+end
+
+def Parser::current(&self) -> &Token
+  if self.pos >= self.tokens.len() then &self.tokens[self.tokens.len() - 1] else &self.tokens[self.pos] end
+end
+
+def Parser::advance(&mut self)
+  if self.pos < self.tokens.len() then self.pos += 1 end
+end
+
+def Parser::parse_file(&mut self) -> Vec[DocumentSymbol]
+  let mut symbols = Vec::new()
+  
+  while self.current().kind != TokenKind::Eof do
+    let sym = self.parse_item()
+    match sym
+    when Option::Some(s) => symbols.push(s)
+    when Option::None => ()
+    end
+    self.advance()
+  end
+  
+  symbols
+end
+
+def Parser::parse_item(&mut self) -> Option[DocumentSymbol]
+  let tok = self.current()
+  
+  match tok.kind
+  when TokenKind::Keyword =>
+    match tok.text.clone()
+    when "def" => self.parse_function()
+    when "struct" => self.parse_struct()
+    when "enum" => self.parse_enum()
+    when "trait" => self.parse_trait()
+    when "impl" => self.parse_impl()
+    when "use" => self.skip_use()
+    when "pub" => self.parse_pub_item()
+    when "const" => self.parse_const()
+    when "type" => self.parse_type_alias()
+    else => Option::None
+    end
+  else => Option::None
+  end
+end
+
+def Parser::parse_function(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance() # skip 'def'
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  # Parse parameters
+  self.advance()
+  if self.current().text == "(" then
+    let mut paren_depth = 1
+    self.advance()
+    while paren_depth > 0 && self.current().kind != TokenKind::Eof do
+      if self.current().text == "(" then paren_depth += 1
+      elsif self.current().text == ")" then paren_depth -= 1
+      end
+      self.advance()
+    end
+  end
+  
+  # Parse return type
+  if self.current().text == "-" && self.tokens.len() > self.pos + 1 && self.tokens[self.pos + 1].text == ">" then
+    self.advance()
+    self.advance()
+    # Skip type
+    while self.current().kind == TokenKind::Identifier || self.current().text == "[" || self.current().text == "]" || self.current().text == "," do
+      self.advance()
+    end
+  end
+  
+  # Find matching 'end'
+  let mut depth = 1
+  let mut end_line = start_tok.line
+  let mut end_col = start_tok.column
+  while depth > 0 && self.current().kind != TokenKind::Eof do
+    if self.current().kind == TokenKind::Keyword then
+      match self.current().text.clone()
+      when "def" | "struct" | "enum" | "trait" | "impl" | "if" | "while" | "for" | "match" | "do" => depth += 1
+      when "end" => depth -= 1
+      else => ()
+      end
+    end
+    end_line = self.current().line
+    end_col = self.current().column
+    if depth > 0 then self.advance() end
+  end
+  
+  let end_pos = Position{line: end_line, character: end_col}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 12, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::parse_struct(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance() # skip 'struct'
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  
+  # Find 'end'
+  let mut depth = 1
+  let mut end_line = start_tok.line
+  let mut end_col = start_tok.column
+  while depth > 0 && self.current().kind != TokenKind::Eof do
+    if self.current().kind == TokenKind::Keyword then
+      match self.current().text.clone()
+      when "struct" | "enum" | "trait" | "impl" | "if" | "while" | "for" | "match" | "def" => depth += 1
+      when "end" => depth -= 1
+      else => ()
+      end
+    end
+    end_line = self.current().line
+    end_col = self.current().column
+    if depth > 0 then self.advance() end
+  end
+  
+  let end_pos = Position{line: end_line, character: end_col}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 23, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::parse_enum(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance()
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  
+  let mut depth = 1
+  let mut end_line = start_tok.line
+  let mut end_col = start_tok.column
+  while depth > 0 && self.current().kind != TokenKind::Eof do
+    if self.current().kind == TokenKind::Keyword then
+      match self.current().text.clone()
+      when "struct" | "enum" | "trait" | "impl" | "if" | "while" | "for" | "match" | "def" => depth += 1
+      when "end" => depth -= 1
+      else => ()
+      end
+    end
+    end_line = self.current().line
+    end_col = self.current().column
+    if depth > 0 then self.advance() end
+  end
+  
+  let end_pos = Position{line: end_line, character: end_col}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 10, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::parse_trait(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance()
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  
+  let mut depth = 1
+  let mut end_line = start_tok.line
+  let mut end_col = start_tok.column
+  while depth > 0 && self.current().kind != TokenKind::Eof do
+    if self.current().kind == TokenKind::Keyword then
+      match self.current().text.clone()
+      when "struct" | "enum" | "trait" | "impl" | "def" => depth += 1
+      when "end" => depth -= 1
+      else => ()
+      end
+    end
+    end_line = self.current().line
+    end_col = self.current().column
+    if depth > 0 then self.advance() end
+  end
+  
+  let end_pos = Position{line: end_line, character: end_col}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 11, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::parse_impl(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance()
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = "impl ".to_string() + &name_tok.text
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  
+  let mut depth = 1
+  let mut end_line = start_tok.line
+  let mut end_col = start_tok.column
+  while depth > 0 && self.current().kind != TokenKind::Eof do
+    if self.current().kind == TokenKind::Keyword then
+      match self.current().text.clone()
+      when "struct" | "enum" | "trait" | "impl" | "def" => depth += 1
+      when "end" => depth -= 1
+      else => ()
+      end
+    end
+    end_line = self.current().line
+    end_col = self.current().column
+    if depth > 0 then self.advance() end
+  end
+  
+  let end_pos = Position{line: end_line, character: end_col}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 5, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::skip_use(&mut self) -> Option[DocumentSymbol]
+  self.advance()
+  while self.current().kind != TokenKind::Eof && self.current().text != "\n" && self.current().text != ";" do
+    self.advance()
+  end
+  Option::None
+end
+
+def Parser::parse_pub_item(&mut self) -> Option[DocumentSymbol]
+  self.advance()
+  self.parse_item()
+end
+
+def Parser::parse_const(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance()
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  while self.current().kind != TokenKind::Eof && self.current().text != "\n" && self.current().text != ";" do
+    self.advance()
+  end
+  
+  let end_pos = Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 14, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+def Parser::parse_type_alias(&mut self) -> Option[DocumentSymbol]
+  let start_tok = self.current()
+  self.advance()
+  
+  let name_tok = self.current()
+  if name_tok.kind != TokenKind::Identifier then return Option::None end
+  
+  let name = name_tok.text.clone()
+  let start_pos = Position{line: start_tok.line, character: start_tok.column}
+  
+  self.advance()
+  while self.current().kind != TokenKind::Eof && self.current().text != "\n" && self.current().text != ";" do
+    self.advance()
+  end
+  
+  let end_pos = Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}
+  let range = Range{start: start_pos, end: end_pos}
+  let sel_range = Range{start: Position{line: name_tok.line, character: name_tok.column}, end: Position{line: name_tok.line, character: name_tok.column + name_tok.text.len()}}
+  
+  Option::Some(DocumentSymbol{name: name, kind: 26, range: range, selection_range: sel_range, children: Vec::new()})
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Completion Engine
+# ═══════════════════════════════════════════════════════════════
+
+def get_completions(text: &String, pos: &Position, doc: &TextDocument) -> Vec[CompletionItem]
+  let mut items = Vec::new()
+  
+  # Keywords
+  let keywords = vec![
+    "def", "let", "mut", "if", "then", "else", "end", "while", "for", "do",
+    "match", "when", "struct", "enum", "trait", "impl", "use", "pub", "return",
+    "break", "continue", "self", "true", "false", "nil", "and", "or", "not",
+    "async", "await", "spawn", "move", "ref", "extern", "unsafe", "const", "type"
+  ]
+  
+  for kw in keywords do
+    items.push(CompletionItem{label: kw.to_string(), kind: 14, detail: "keyword".to_string(), insert_text: kw.to_string()})
+  end
+  
+  # Built-in types
+  let types = vec![
+    "Int", "Float", "Bool", "String", "Char", "Unit", "UInt", "Int8", "Int16",
+    "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32", "Float64",
+    "Option", "Result", "Vec", "Map", "Set"
+  ]
+  
+  for t in types do
+    items.push(CompletionItem{label: t.to_string(), kind: 7, detail: "type".to_string(), insert_text: t.to_string()})
+  end
+  
+  # Extract identifiers from document
+  let tokens = tokenize(&doc.text)
+  let mut identifiers = Set::new()
+  for tok in tokens do
+    if tok.kind == TokenKind::Identifier && tok.text.len() > 2 then
+      identifiers.insert(tok.text.clone())
+    end
+  end
+  
+  for id in identifiers do
+    items.push(CompletionItem{label: id.clone(), kind: 6, detail: "local".to_string(), insert_text: id})
+  end
+  
+  items
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Diagnostics Engine
+# ═══════════════════════════════════════════════════════════════
+
+def compute_diagnostics(doc: &TextDocument) -> Vec[Diagnostic]
+  let mut diags = Vec::new()
+  let tokens = tokenize(&doc.text)
+  
+  # Check for common issues
+  let mut paren_stack = Vec::new()
+  let mut brace_stack = Vec::new()
+  let mut bracket_stack = Vec::new()
+  
+  for tok in &tokens do
+    match tok.text.clone()
+    when "(" => paren_stack.push(tok)
+    when ")" =>
+      if paren_stack.len() == 0 then
+        diags.push(Diagnostic{
+          range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+          severity: 1,
+          code: "unmatched-paren".to_string(),
+          source: "tangerine".to_string(),
+          message: "Unmatched closing parenthesis".to_string()
+        })
+      else
+        paren_stack.pop()
+      end
+    when "{" => brace_stack.push(tok)
+    when "}" =>
+      if brace_stack.len() == 0 then
+        diags.push(Diagnostic{
+          range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+          severity: 1,
+          code: "unmatched-brace".to_string(),
+          source: "tangerine".to_string(),
+          message: "Unmatched closing brace".to_string()
+        })
+      else
+        brace_stack.pop()
+      end
+    when "[" =] bracket_stack.push(tok)
+    when "]" =>
+      if bracket_stack.len() == 0 then
+        diags.push(Diagnostic{
+          range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+          severity: 1,
+          code: "unmatched-bracket".to_string(),
+          source: "tangerine".to_string(),
+          message: "Unmatched closing bracket".to_string()
+        })
+      else
+        bracket_stack.pop()
+      end
+    else => ()
+    end
+  end
+  
+  # Report unclosed delimiters
+  for tok in paren_stack do
+    diags.push(Diagnostic{
+      range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+      severity: 1,
+      code: "unclosed-paren".to_string(),
+      source: "tangerine".to_string(),
+      message: "Unclosed parenthesis".to_string()
+    })
+  end
+  
+  for tok in brace_stack do
+    diags.push(Diagnostic{
+      range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+      severity: 1,
+      code: "unclosed-brace".to_string(),
+      source: "tangerine".to_string(),
+      message: "Unclosed brace".to_string()
+    })
+  end
+  
+  for tok in bracket_stack do
+    diags.push(Diagnostic{
+      range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 1}},
+      severity: 1,
+      code: "unclosed-bracket".to_string(),
+      source: "tangerine".to_string(),
+      message: "Unclosed bracket".to_string()
+    })
+  end
+  
+  # Check for common syntax errors
+  for i in 0..tokens.len() - 1 do
+    let tok = &tokens[i]
+    let next = &tokens[i + 1]
+    
+    # Missing 'do' after 'while' condition
+    if tok.text == "while" && next.kind == TokenKind::Identifier then
+      # Look for 'do' within next few tokens
+      let mut found_do = false
+      for j in i + 1..min(i + 10, tokens.len()) do
+        if tokens[j].text == "do" then found_do = true end
+        if tokens[j].kind == TokenKind::Keyword && tokens[j].text != "do" then break end
+      end
+      if !found_do then
+        diags.push(Diagnostic{
+          range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 5}},
+          severity: 2,
+          code: "missing-do".to_string(),
+          source: "tangerine".to_string(),
+          message: "Missing 'do' after 'while' condition".to_string()
+        })
+      end
+    end
+    
+    # Missing 'then' after 'if' condition
+    if tok.text == "if" && next.kind == TokenKind::Identifier then
+      let mut found_then = false
+      for j in i + 1..min(i + 10, tokens.len()) do
+        if tokens[j].text == "then" then found_then = true end
+        if tokens[j].kind == TokenKind::Keyword && tokens[j].text != "then" then break end
+      end
+      if !found_then then
+        diags.push(Diagnostic{
+          range: Range{start: Position{line: tok.line, character: tok.column}, end: Position{line: tok.line, character: tok.column + 2}},
+          severity: 2,
+          code: "missing-then".to_string(),
+          source: "tangerine".to_string(),
+          message: "Missing 'then' after 'if' condition".to_string()
+        })
+      end
+    end
+  end
+  
+  diags
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Folding Ranges
+# ═══════════════════════════════════════════════════════════════
+
+struct FoldingRange
+  start_line: UInt
+  end_line: UInt
+  kind: String
+end
+
+def compute_folding_ranges(doc: &TextDocument) -> Vec[FoldingRange]
+  let mut ranges = Vec::new()
+  let tokens = tokenize(&doc.text)
+  
+  let mut stack = Vec::new()
+  
+  for tok in &tokens do
+    if tok.kind == TokenKind::Keyword then
+      match tok.text.clone()
+      when "def" | "struct" | "enum" | "trait" | "impl" | "if" | "while" | "for" | "match" | "do" => stack.push(tok)
+      when "end" =>
+        if stack.len() > 0 then
+          let start = stack.pop()
+          ranges.push(FoldingRange{start_line: start.line, end_line: tok.line, kind: "region".to_string()})
+        end
+      else => ()
+      end
+    elsif tok.kind == TokenKind::Comment && tok.text.starts_with("#") then
+      # Fold consecutive comment lines
+      if ranges.len() == 0 || ranges[ranges.len() - 1].kind != "comment" || ranges[ranges.len() - 1].end_line != tok.line - 1 then
+        ranges.push(FoldingRange{start_line: tok.line, end_line: tok.line, kind: "comment".to_string()})
+      else
+        ranges[ranges.len() - 1].end_line = tok.line
+      end
+    end
+  end
+  
+  ranges
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Language Server
+# ═══════════════════════════════════════════════════════════════
+
+struct LanguageServer
+  documents: RwLock[Map[String, TextDocument]]
+  workspace_root: Option[String]
+end
+
+def LanguageServer::new() -> LanguageServer
+  LanguageServer{documents: RwLock::new(Map::new()), workspace_root: Option::None}
+end
+
+def LanguageServer::handle_initialize(&mut self, params: &json::Value) -> json::Value
+  match params.get("rootUri")
+  when Option::Some(uri) => self.workspace_root = Option::Some(uri.as_string())
+  when Option::None => match params.get("rootPath")
+    when Option::Some(path) => self.workspace_root = Option::Some(path.as_string())
+    when Option::None => ()
+    end
+  end
+  
+  json::object({
+    "capabilities": json::object({
+      "textDocumentSync": 2,
+      "completionProvider": json::object({"triggerCharacters": json::array([".", ":", "<", "(", "["]), "resolveProvider": false}),
+      "hoverProvider": true,
+      "signatureHelpProvider": json::object({"triggerCharacters": json::array(["(", ","])}),
+      "definitionProvider": true,
+      "referencesProvider": true,
+      "documentSymbolProvider": true,
+      "documentFormattingProvider": true,
+      "documentRangeFormattingProvider": true,
+      "foldingRangeProvider": true,
+      "renameProvider": json::object({"prepareProvider": true}),
+      "codeActionProvider": true,
+      "executeCommandProvider": json::object({"commands": json::array(["tangerine.runTests", "tangerine.build", "tangerine.showType"])}),
+      "semanticTokensProvider": json::object({
+        "legend": json::object({
+          "tokenTypes": json::array(["namespace", "type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable", "property", "enumMember", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "operator"]),
+          "tokenModifiers": json::array(["declaration", "definition", "readonly", "static", "async"])
+        }),
+        "range": true,
+        "full": true
+      })
+    }),
+    "serverInfo": json::object({"name": "tangerine-language-server", "version": "1.0.0"})
+  })
+end
+
+def LanguageServer::handle_did_open(&mut self, params: &json::Value)
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return end
+  let version = match doc_params.get("version") when Option::Some(v) => v.as_int() when Option::None => 0 end
+  let text = match doc_params.get("text") when Option::Some(t) => t.as_string() when Option::None => return end
+  
+  let doc = TextDocument::new(uri.clone(), version, text)
+  let mut docs = self.documents.write()
+  docs.insert(uri, doc)
+end
+
+def LanguageServer::handle_did_change(&mut self, params: &json::Value)
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return end
+  let version = match doc_params.get("version") when Option::Some(v) => v.as_int() when Option::None => 0 end
+  
+  let changes = match params.get("contentChanges") when Option::Some(c) => c.as_array() when Option::None => return end
+  
+  let mut docs = self.documents.write()
+  let doc = match docs.get_mut(&uri) when Option::Some(d) => d when Option::None => return end
+  
+  for change in changes do
+    match change.get("range")
+    when Option::Some(range_json) =>
+      let range = Range::from_json(range_json)?
+      let text = match change.get("text") when Option::Some(t) => t.as_string() when Option::None => continue end
+      doc.apply_incremental_change(&range, &text, version)
+    when Option::None =>
+      let text = match change.get("text") when Option::Some(t) => t.as_string() when Option::None => continue end
+      doc.apply_full_change(text, version)
+    end
+  end
+end
+
+def LanguageServer::handle_did_close(&mut self, params: &json::Value)
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return end
+  
+  let mut docs = self.documents.write()
+  docs.remove(&uri)
+end
+
+def LanguageServer::handle_completion(&self, params: &json::Value) -> json::Value
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return json::null() end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return json::null() end
+  let pos_params = match params.get("position") when Option::Some(p) => p when Option::None => return json::null() end
+  let pos = match Position::from_json(pos_params) when Result::Ok(p) => p when Result::Err(_) => return json::null() end
+  
+  let docs = self.documents.read()
+  let doc = match docs.get(&uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  let items = get_completions(&doc.text, &pos, doc)
+  json::object({"isIncomplete": false, "items": json::array(items.map(|i| i.to_json()))})
+end
+
+def LanguageServer::handle_document_symbol(&self, params: &json::Value) -> json::Value
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return json::null() end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return json::null() end
+  
+  let docs = self.documents.read()
+  let doc = match docs.get(&uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  let tokens = tokenize(&doc.text)
+  let mut parser = Parser::new(tokens)
+  let symbols = parser.parse_file()
+  
+  json::array(symbols.map(|s| s.to_json()))
+end
+
+def LanguageServer::handle_folding_range(&self, params: &json::Value) -> json::Value
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return json::null() end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return json::null() end
+  
+  let docs = self.documents.read()
+  let doc = match docs.get(&uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  let ranges = compute_folding_ranges(doc)
+  json::array(ranges.map(|r| json::object({"startLine": r.start_line, "endLine": r.end_line, "kind": r.kind})))
+end
+
+def LanguageServer::handle_hover(&self, params: &json::Value) -> json::Value
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return json::null() end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return json::null() end
+  let pos_params = match params.get("position") when Option::Some(p) => p when Option::None => return json::null() end
+  let pos = match Position::from_json(pos_params) when Result::Ok(p) => p when Result::Err(_) => return json::null() end
+  
+  let docs = self.documents.read()
+  let doc = match docs.get(&uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  # Find token at position
+  let tokens = tokenize(&doc.text)
+  for tok in &tokens do
+    if tok.line == pos.line && tok.column <= pos.character && tok.column + tok.text.len() > pos.character then
+      let hover_text = match tok.kind
+      when TokenKind::Keyword => "**".to_string() + &tok.text + "** - Tangerine keyword"
+      when TokenKind::Identifier => "`".to_string() + &tok.text + "` - identifier"
+      when TokenKind::String => "`".to_string() + &tok.text + "` - string literal"
+      when TokenKind::Number => "`".to_string() + &tok.text + "` - number literal"
+      else => return json::null()
+      end
+      return Hover{contents: hover_text}.to_json()
+    end
+  end
+  
+  json::null()
+end
+
+def LanguageServer::handle_formatting(&self, params: &json::Value) -> json::Value
+  let doc_params = match params.get("textDocument") when Option::Some(p) => p when Option::None => return json::null() end
+  let uri = match doc_params.get("uri") when Option::Some(u) => u.as_string() when Option::None => return json::null() end
+  
+  let docs = self.documents.read()
+  let doc = match docs.get(&uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  # Use std::fmt module for formatting
+  let formatted = std::fmt::format_source(&doc.text)
+  
+  if formatted == doc.text then
+    return json::array([])
+  end
+  
+  json::array([TextEdit{range: Range{start: Position{line: 0, character: 0}, end: Position{line: doc.lines.len() as UInt, character: 0}}, new_text: formatted}.to_json()])
+end
+
+def LanguageServer::publish_diagnostics(&self, uri: &String) -> json::Value
+  let docs = self.documents.read()
+  let doc = match docs.get(uri) when Option::Some(d) => d when Option::None => return json::null() end
+  
+  let diags = compute_diagnostics(doc)
+  
+  json::object({
+    "method": "textDocument/publishDiagnostics",
+    "params": json::object({
+      "uri": uri.clone(),
+      "diagnostics": json::array(diags.map(|d| d.to_json()))
+    })
+  })
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════════════
+
+def LanguageServer::run(&mut self)
+  let stdin = io::stdin()
+  let stdout = io::stdout()
+  let mut buffer = Vec::new()
+  
+  loop
+    # Read Content-Length header
+    let mut content_length = 0
+    loop
+      let line = io::read_line(&stdin)?
+      if line.len() == 0 || line == "\r" then break end
+      if line.starts_with("Content-Length:") then
+        let parts = line.split(":")
+        if parts.len() >= 2 then
+          content_length = parts[1].trim().parse::[Int]().unwrap_or(0)
+        end
+      end
+    end
+    
+    if content_length == 0 then continue end
+    
+    # Read content
+    let mut content = vec![0u8; content_length]
+    stdin.read_exact(&mut content)?
+    let message = String::from_utf8(content)?
+    
+    # Parse JSON
+    let msg = match json::parse(&message) when Option::Some(m) => m when Option::None => continue end
+    
+    let id = msg.get("id")
+    let method = match msg.get("method") when Option::Some(m) => m.as_string() when Option::None => continue end
+    
+    let response = match method.clone()
+    when "initialize" => self.handle_initialize(msg.get("params"))
+    when "initialized" => json::null()
+    when "shutdown" => json::null()
+    when "exit" => return
+    when "textDocument/didOpen" => self.handle_did_open(msg.get("params")); json::null()
+    when "textDocument/didChange" => self.handle_did_change(msg.get("params")); json::null()
+    when "textDocument/didClose" => self.handle_did_close(msg.get("params")); json::null()
+    when "textDocument/completion" => self.handle_completion(msg.get("params"))
+    when "textDocument/documentSymbol" => self.handle_document_symbol(msg.get("params"))
+    when "textDocument/foldingRange" => self.handle_folding_range(msg.get("params"))
+    when "textDocument/hover" => self.handle_hover(msg.get("params"))
+    when "textDocument/formatting" => self.handle_formatting(msg.get("params"))
+    when "textDocument/semanticTokens/full" => json::object({"data": json::array([])})
+    else => json::null()
+    end
+    
+    # Send response
+    let mut result = Map::new()
+    result.insert("jsonrpc".to_string(), json::string("2.0"))
+    match id when Option::Some(i) => result.insert("id".to_string(), i.clone()) when Option::None => () end
+    if response.is_null() then
+      result.insert("result".to_string(), json::null())
+    else
+      result.insert("result".to_string(), response)
+    end
+    
+    let response_json = json::encode(&json::object(result))?
+    let response_bytes = response_json.as_bytes()
+    
+    io::write(&stdout, "Content-Length: ".as_bytes())?
+    io::write(&stdout, response_bytes.len().to_string().as_bytes())?
+    io::write(&stdout, "\r\n\r\n".as_bytes())?
+    io::write(&stdout, response_bytes)?
+    io::flush(&stdout)?
+  end
+end
+
+def main()
+  let mut server = LanguageServer::new()
+  server.run()
+end

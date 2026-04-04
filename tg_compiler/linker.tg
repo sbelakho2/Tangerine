@@ -16,7 +16,8 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
-use std::fs::{write_file_bytes}
+use std::fs::{write_file_bytes, file_exists}
+use std::process::{run_command}
 use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind, Section}
 use tg_compiler::object::{
   ObjectFile, build_object,
@@ -198,15 +199,39 @@ end
 # Symbol resolution
 # ———————————————————————————————————————————————————————————————
 
-def resolve_symbols(objects: &Vec[ObjectFile]) -> Result[Map[String, LinkerSymbol], String]
-  mut syms = Map::new()
+def is_stdlib_static(name: &String) -> Bool
+  # Static variables from std/ library that may appear in multiple compilation units.
+  # These start with underscore and are safe to deduplicate since they have identical
+  # definitions across all compilation units that include the same std/ files.
+  # 
+  # Pattern: _name (static variables in std/core.tg and other std modules)
+  # Excludes: __intrinsic_* (these are function wrappers, not statics)
+  name.starts_with("_") && 
+    !name.starts_with("__") && 
+    !name.contains("::")
+end
 
-  for obj in objects do
-    for sym in obj.symbols do
+def resolve_symbols(all_symbols: &Vec[AsmSymbol]) -> Result[Map[String, LinkerSymbol], String]
+  mut syms = Map::new()
+  # Track extern (undefined) symbols that need runtime resolution
+  mut extern_syms = Vec::new()
+
+  # Collect all defined symbols and note extern references
+  mut i = 0
+  while i < all_symbols.len() do
+    let sym = &all_symbols[i]
+    # Check if this is an extern symbol (size=0, offset=0, not in any real section)
+    let is_extern = sym.size == 0 && sym.offset == 0 && sym.section != Section::Text && sym.section != Section::Data && sym.section != Section::Rodata && sym.section != Section::Bss
+    
+    if is_extern then
+      extern_syms.push(sym.name.clone())
+    else
       match syms.get(sym.name)
       when Option::Some(existing) then
         if existing.is_defined then
-          return Result::Err("duplicate symbol: " + sym.name)
+          if !is_stdlib_static(&sym.name) then
+            return Result::Err("duplicate symbol: " + sym.name)
+          end
         end
       when Option::None then ()
       end
@@ -217,13 +242,29 @@ def resolve_symbols(objects: &Vec[ObjectFile]) -> Result[Map[String, LinkerSymbo
       when Section::Bss    then 3
       when _               then 0
       end
-      syms.insert(sym.name, LinkerSymbol {
-        name: sym.name,
+      syms.insert(sym.name.clone(), LinkerSymbol {
+        name: sym.name.clone(),
         value: sym.offset as u64,
         section: sec_idx,
         is_defined: true
       })
     end
+    i = i + 1
+  end
+
+  # Add remaining extern symbols as undefined
+  mut j = 0
+  while j < extern_syms.len() do
+    let ext_name = &extern_syms[j]
+    if !syms.contains_key(ext_name) then
+      syms.insert(ext_name.clone(), LinkerSymbol {
+        name: ext_name.clone(),
+        value: 0,
+        section: 0,
+        is_defined: false
+      })
+    end
+    j = j + 1
   end
 
   Result::Ok(syms)
@@ -236,111 +277,128 @@ end
 # section data so that cross-reference addresses are correct.
 
 def patch_relocations(
-  objects: &Vec[ObjectFile],
+  all_relocations: &Vec[Relocation],
   sections: &mut Vec[LinkedSection],
   syms: &Map[String, LinkerSymbol],
-  text_offsets: &Vec[u64]       # per-object byte offset into merged .text
+  section_vaddrs: &Vec[u64]
 ) -> Result[Unit, String]
 
-  mut obj_idx = 0
-  for obj in objects do
-    let obj_text_base = text_offsets[obj_idx]
-
-    for reloc in obj.relocations do
-      # Target symbol virtual address
-      let target_sym = match syms.get(reloc.symbol)
-      when Option::Some(s) then s
-      when Option::None then
-        return Result::Err("undefined symbol in relocation: " + reloc.symbol)
+  mut undefined_syms = Vec::new()
+  mut i = 0
+  while i < all_relocations.len() do
+    let reloc = &all_relocations[i]
+    # Target symbol virtual address
+    let target_sym = match syms.get(reloc.symbol)
+    when Option::Some(s) then s
+    when Option::None then
+      if !undefined_syms.contains(&reloc.symbol) then
+        undefined_syms.push(reloc.symbol.clone())
       end
-
-      # The relocation offset is relative to this object's .text start.
-      # Translate to offset within the merged section.
-      let patch_offset = (obj_text_base as Int) + reloc.offset
-      let target_vaddr = sections[target_sym.section].vaddr + target_sym.value
-
-      # Address of the site being patched (for PC-relative)
-      let site_vaddr = sections[0].vaddr + patch_offset as u64
-
-      match reloc.kind
-      # ---- x86-64 relocations ----
-      when RelocKind::R_X86_64_PC32 then
-        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
-        write32_at(&mut sections[0].data, patch_offset, delta as u32)
-
-      when RelocKind::R_X86_64_PLT32 then
-        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
-        write32_at(&mut sections[0].data, patch_offset, delta as u32)
-
-      when RelocKind::R_X86_64_64 then
-        let abs = (target_vaddr as i64) + (reloc.addend as i64)
-        write64_at(&mut sections[0].data, patch_offset, abs as u64)
-
-      when RelocKind::R_X86_64_GOTPCREL then
-        # Without a GOT we treat GOTPCREL the same as PC32 (static link only)
-        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
-        write32_at(&mut sections[0].data, patch_offset, delta as u32)
-
-      # ---- ARM64 relocations ----
-      when RelocKind::R_AARCH64_CALL26 then
-        let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then
-        let page_target = target_vaddr & 0xFFFFFFFFFFFFF000
-        let page_site   = site_vaddr   & 0xFFFFFFFFFFFFF000
-        let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
-        let immlo = (page_delta as u32) & 0x3
-        let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then
-        let lo12 = (target_vaddr as u32) & 0xFFF
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0xFFC003FF) | (lo12 << 10)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      # ---- Mach-O relocations ----
-      when RelocKind::X86_64_RELOC_BRANCH then
-        let delta = (target_vaddr as i64) - (site_vaddr as i64) - 4
-        write32_at(&mut sections[0].data, patch_offset, delta as u32)
-
-      when RelocKind::X86_64_RELOC_SIGNED then
-        let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
-        write32_at(&mut sections[0].data, patch_offset, delta as u32)
-
-      when RelocKind::ARM64_RELOC_BRANCH26 then
-        let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      when RelocKind::ARM64_RELOC_PAGE21 then
-        let page_target = target_vaddr & 0xFFFFFFFFFFFFF000
-        let page_site   = site_vaddr   & 0xFFFFFFFFFFFFF000
-        let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
-        let immlo = (page_delta as u32) & 0x3
-        let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      when RelocKind::ARM64_RELOC_PAGEOFF12 then
-        let lo12 = (target_vaddr as u32) & 0xFFF
-        let existing = read32_at(&sections[0].data, patch_offset)
-        let patched = (existing & 0xFFC003FF) | (lo12 << 10)
-        write32_at(&mut sections[0].data, patch_offset, patched)
-
-      when _ then
-        return Result::Err("unsupported relocation kind during patching")
-      end
+      i = i + 1
+      continue
     end
 
-    obj_idx = obj_idx + 1
+    if !target_sym.is_defined then
+      if !undefined_syms.contains(&reloc.symbol) then
+        undefined_syms.push(reloc.symbol.clone())
+      end
+      i = i + 1
+      continue
+    end
+
+    # Relocation offset is already adjusted to merged text position
+    let patch_offset = reloc.offset
+    let target_vaddr = section_vaddrs[target_sym.section] + target_sym.value
+
+    # Address of the site being patched (for PC-relative)
+    let site_vaddr = section_vaddrs[0] + patch_offset as u64
+
+    match reloc.kind
+    # ---- x86-64 relocations ----
+    when RelocKind::R_X86_64_PC32 then
+      let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+      write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+    when RelocKind::R_X86_64_PLT32 then
+      let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+      write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+    when RelocKind::R_X86_64_64 then
+      let abs = (target_vaddr as i64) + (reloc.addend as i64)
+      write64_at(&mut sections[0].data, patch_offset, abs as u64)
+
+    when RelocKind::R_X86_64_GOTPCREL then
+      let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+      write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+    # ---- ARM64 relocations ----
+    when RelocKind::R_AARCH64_CALL26 then
+      let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then
+      let page_target = (target_vaddr >> 12) << 12
+      let page_site   = (site_vaddr >> 12) << 12
+      let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
+      let immlo = (page_delta as u32) & 0x3
+      let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then
+      let lo12 = (target_vaddr as u32) & 0xFFF
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0xFFC003FF) | (lo12 << 10)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    # ---- Mach-O relocations ----
+    when RelocKind::X86_64_RELOC_BRANCH then
+      let delta = (target_vaddr as i64) - (site_vaddr as i64) - 4
+      write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+    when RelocKind::X86_64_RELOC_SIGNED then
+      let delta = (target_vaddr as i64) - (site_vaddr as i64) + (reloc.addend as i64)
+      write32_at(&mut sections[0].data, patch_offset, delta as u32)
+
+    when RelocKind::ARM64_RELOC_BRANCH26 then
+      let delta = ((target_vaddr as i64) - (site_vaddr as i64)) >> 2
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0xFC000000) | ((delta as u32) & 0x03FFFFFF)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    when RelocKind::ARM64_RELOC_PAGE21 then
+      let page_target = (target_vaddr >> 12) << 12
+      let page_site   = (site_vaddr >> 12) << 12
+      let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
+      let immlo = (page_delta as u32) & 0x3
+      let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0x9F00001F) | (immlo << 29) | (immhi << 5)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    when RelocKind::ARM64_RELOC_PAGEOFF12 then
+      let lo12 = (target_vaddr as u32) & 0xFFF
+      let existing = read32_at(&sections[0].data, patch_offset)
+      let patched = (existing & 0xFFC003FF) | (lo12 << 10)
+      write32_at(&mut sections[0].data, patch_offset, patched)
+
+    when _ then
+      return Result::Err("unsupported relocation kind during patching")
+    end
+    i = i + 1
+  end
+
+  if !undefined_syms.is_empty() then
+    mut msg = "undefined symbols in relocations:"
+    mut j = 0
+    while j < undefined_syms.len() do
+      msg = msg + " " + undefined_syms[j]
+      j = j + 1
+    end
+    return Result::Err(msg)
   end
 
   Result::Ok(())
@@ -371,27 +429,52 @@ def add_u64(left: u64, right: u64) -> u64
 end
 
 def read32_at(data: &Vec[u8], offset: Int) -> u32
-  (data[offset] as u32)
-    | ((data[offset + 1] as u32) << 8)
-    | ((data[offset + 2] as u32) << 16)
-    | ((data[offset + 3] as u32) << 24)
+  (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24)
 end
 
 # ———————————————————————————————————————————————————————————————
 # Section merging
 # ———————————————————————————————————————————————————————————————
 
-def merge_sections(objects: &Vec[ObjectFile]) -> Vec[LinkedSection]
-  mut text_data = Vec::new()
-  mut data_data = Vec::new()
-  mut rodata_data = Vec::new()
+def merge_sections(objects: &Vec[ObjectFile], text_offsets: &mut Vec[u64], all_symbols: &mut Vec[AsmSymbol], all_relocations: &mut Vec[Relocation]) -> Vec[LinkedSection]
+  mut text_data: Vec[u8] = Vec::new()
+  mut data_data: Vec[u8] = Vec::new()
+  mut rodata_data: Vec[u8] = Vec::new()
   mut total_bss: u64 = 0
 
-  for obj in objects do
-    append_vec(&mut text_data, &obj.text)
-    append_vec(&mut data_data, &obj.data)
-    append_vec(&mut rodata_data, &obj.rodata)
+  eprintln("  [merge] objects.len()=" + objects.len().to_string())
+  mut oi = 0
+  while oi < objects.len() do
+    let obj = &objects[oi]
+    eprintln("  [merge] obj[" + oi.to_string() + "] text=" + obj.text.len().to_string() + " data=" + obj.data.len().to_string() + " rodata=" + obj.rodata.len().to_string())
+    # Record text offset for this object before appending
+    let obj_text_off = text_data.len() as u64
+    text_offsets.push(obj_text_off)
+    # Directly extend instead of calling append_vec to avoid &mut write-back issues
+    text_data.extend(&obj.text)
+    eprintln("  [merge] after extend text_data=" + text_data.len().to_string())
+    data_data.extend(&obj.data)
+    rodata_data.extend(&obj.rodata)
     total_bss = total_bss + obj.bss_size as u64
+    # Collect symbols in the same pass
+    mut si = 0
+    while si < obj.symbols.len() do
+      all_symbols.push(obj.symbols[si].clone())
+      si = si + 1
+    end
+    # Collect relocations, adjusting offset to merged text position
+    mut ri = 0
+    while ri < obj.relocations.len() do
+      let reloc = &obj.relocations[ri]
+      all_relocations.push(Relocation {
+        offset: reloc.offset + obj_text_off as Int,
+        kind: reloc.kind,
+        symbol: reloc.symbol.clone(),
+        addend: reloc.addend
+      })
+      ri = ri + 1
+    end
+    oi = oi + 1
   end
 
   mut sections = Vec::new()
@@ -456,19 +539,14 @@ def PF_R() -> u32 = 4
 def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
 
-  # Track per-object offsets into merged .text for relocation patching
+  # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
-  mut running_offset: u64 = 0
-  for obj in input.objects do
-    text_offsets.push(running_offset)
-    running_offset = running_offset + obj.text.len() as u64
-  end
-
-  # Merge sections
-  mut sections = merge_sections(&input.objects)
+  mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_relocations: Vec[Relocation] = Vec::new()
+  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
 
   # Resolve symbols
-  let syms = match resolve_symbols(&input.objects)
+  let syms = match resolve_symbols(&all_symbols)
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err(e)
   end
@@ -487,10 +565,12 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut vaddr = base_addr + file_offset
 
   # Assign addresses to sections
+  mut section_vaddrs = Vec::new()
   mut i = 0
   while i < sections.len() do
     sections[i].file_offset = file_offset
     sections[i].vaddr = vaddr
+    section_vaddrs.push(vaddr)
 
     let sec_file_size = sections[i].data.len() as u64
     let sec_mem_size = sections[i].mem_size
@@ -505,7 +585,7 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Patch relocations now that section addresses are assigned
-  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
@@ -570,9 +650,11 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # --- Section data ---
-  for sec in sections do
-    pad_to(&mut out, sec.file_offset as Int)
-    append_vec(&mut out, &sec.data)
+  mut si = 0
+  while si < sections.len() do
+    pad_to(&mut out, sections[si].file_offset as Int)
+    out.extend(&sections[si].data)
+    si = si + 1
   end
 
   Result::Ok(out)
@@ -585,17 +667,14 @@ end
 def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
 
-  # Track per-object text offsets for relocation patching
+  # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
-  mut running_offset: u64 = 0
-  for obj in input.objects do
-    text_offsets.push(running_offset)
-    running_offset = running_offset + obj.text.len() as u64
-  end
+  mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_relocations: Vec[Relocation] = Vec::new()
+  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
+  eprintln("  [linker] merged text=" + sections[0].data.len().to_string() + " rodata=" + sections[1].data.len().to_string() + " data=" + sections[2].data.len().to_string())
 
-  # Merge sections
-  mut sections = merge_sections(&input.objects)
-  let syms = match resolve_symbols(&input.objects)
+  let syms = match resolve_symbols(&all_symbols)
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err(e)
   end
@@ -664,8 +743,19 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   sections[2].vaddr = data_vaddr
   sections[2].file_offset = data_fileoff as u64
 
+  # Build section vaddrs Vec for reliable relocation patching
+  mut section_vaddrs = Vec::new()
+  section_vaddrs.push(text_vaddr)
+  section_vaddrs.push(rodata_vaddr)
+  section_vaddrs.push(data_vaddr)
+  if sections.len() > 3 then
+    # BSS follows data in virtual memory (no file backing, S_ZEROFILL)
+    let bss_vaddr = data_vaddr + (align_up(sections[2].data.len(), page_size) as u64)
+    section_vaddrs.push(bss_vaddr)
+  end
+
   # Patch relocations
-  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
@@ -715,7 +805,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write64(&mut out, text_seg_size as u64)           # vmsize
   write64(&mut out, 0)                              # fileoff = 0 (includes header)
   write64(&mut out, text_seg_filesize as u64)       # filesize
-  write32(&mut out, 5)                              # maxprot: r-x
+  write32(&mut out, 7)                              # maxprot: rwx (allow LLDB breakpoints)
   write32(&mut out, 5)                              # initprot: r-x
   write32(&mut out, text_sect_count as u32)         # nsects
   write32(&mut out, 0)                              # flags
@@ -834,10 +924,12 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   # --- Section data ---
   pad_to(&mut out, code_fileoff)
-  append_vec(&mut out, &sections[0].data)   # __text
-  append_vec(&mut out, &sections[1].data)   # __const (rodata)
+  eprintln("  [linker] writing text: " + sections[0].data.len().to_string() + " bytes at offset " + out.len().to_string())
+  out.extend(&sections[0].data)   # __text
+  eprintln("  [linker] after text: out=" + out.len().to_string())
+  out.extend(&sections[1].data)   # __const (rodata)
   pad_to(&mut out, data_fileoff)
-  append_vec(&mut out, &sections[2].data)   # __data
+  out.extend(&sections[2].data)   # __data
 
   # String table (single NUL)
   pad_to(&mut out, strtab_off)
@@ -853,16 +945,12 @@ end
 def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
 
-  # Track per-object text offsets for relocation patching
+  # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
-  mut running_offset: u64 = 0
-  for obj in input.objects do
-    text_offsets.push(running_offset)
-    running_offset = running_offset + obj.text.len() as u64
-  end
-
-  mut sections = merge_sections(&input.objects)
-  let syms = match resolve_symbols(&input.objects)
+  mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_relocations: Vec[Relocation] = Vec::new()
+  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
+  let syms = match resolve_symbols(&all_symbols)
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err(e)
   end
@@ -970,8 +1058,17 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
     sections[3].vaddr = add_u64(image_base, bss_rva)
   end
 
+  # Build section vaddrs Vec for reliable relocation patching
+  mut section_vaddrs = Vec::new()
+  section_vaddrs.push(add_u64(image_base, text_rva))
+  section_vaddrs.push(add_u64(image_base, rdata_rva))
+  section_vaddrs.push(add_u64(image_base, data_rva))
+  if sections.len() > 3 then
+    section_vaddrs.push(add_u64(image_base, bss_rva))
+  end
+
   # Patch relocations
-  match patch_relocations(&input.objects, &mut sections, &syms, &text_offsets)
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
@@ -1020,11 +1117,11 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   # Section data
   pad_to(&mut out, text_file_off as Int)
-  append_vec(&mut out, &sections[0].data)
+  out.extend(&sections[0].data)
   pad_to(&mut out, data_file_off as Int)
-  append_vec(&mut out, &sections[2].data)
+  out.extend(&sections[2].data)
   pad_to(&mut out, rdata_file_off as Int)
-  append_vec(&mut out, &sections[1].data)
+  out.extend(&sections[1].data)
 
   Result::Ok(out)
 end
@@ -1047,10 +1144,26 @@ def link_executable(input: &LinkerInput) -> Result[Unit, String]
   when Result::Err(e) then return Result::Err(e)
   end
 
-  match write_file_bytes(input.output, bytes)
-  when Result::Ok(_) then Result::Ok(())
-  when Result::Err(e) then Result::Err("failed to write executable: " + e)
+  let output_path = input.output.clone()
+
+  match write_file_bytes(output_path.clone(), &bytes)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("failed to write executable: " + e)
   end
+
+  if !file_exists(output_path.clone()) then
+    return Result::Err("failed to materialize executable: " + output_path)
+  end
+
+  # Ad-hoc code sign on macOS (required for execution)
+  if input.target.os == OsAbi::MacOS then
+    match run_command("/usr/bin/codesign", vec!["-s", "-", output_path.as_str()])
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("codesign failed: " + e)
+    end
+  end
+
+  Result::Ok(())
 end
 
 # ———————————————————————————————————————————————————————————————

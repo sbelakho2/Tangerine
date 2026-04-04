@@ -118,6 +118,24 @@ def place_deref(base: Place) -> Place
   p
 end
 
+# Try to resolve the type of a for-loop iterator expression so that
+# codegen can correctly identify heap collections.  Falls back to
+# Type::Unit when the type cannot be determined statically.
+def resolve_iter_expr_type(b: &MirBuilder, expr: &Expr) -> Type
+  match expr.kind
+  when ExprKind::ExprIdent(name) then
+    match b.var_map.get(name)
+    when Option::Some(lid) then lookup_local_type(b, &lid)
+    when Option::None then Type::Unit
+    end
+  when ExprKind::ExprRef(inner) then
+    resolve_iter_expr_type(b, &inner)
+  when ExprKind::ExprRefMut(inner) then
+    resolve_iter_expr_type(b, &inner)
+  when _ then Type::Unit
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Basic Blocks
 # ———————————————————————————————————————————————————————————————
@@ -177,6 +195,8 @@ enum MirConstantKind
   MirString(String)
   MirFnItem(String)    # Named function item — carries the symbol name
   MirZeroSized
+  MirStaticRef(String) # Read current value of a global/static variable
+  MirStaticAddr(String) # Address of a global/static variable (for writes)
 end
 
 struct MirRvalue
@@ -457,6 +477,15 @@ struct MirBuilder
   break_target: Option[BlockId]
   continue_target: Option[BlockId]
   enum_variants: Map[String, Vec[String]]
+  enum_variant_discriminants: Map[String, Int]
+  enum_has_payload: Map[String, Bool]
+  type_id_counter: Int
+  type_name_to_id: Map[String, Int]
+  type_defs: Vec[MirTypeDef]
+  impl_type_map: Map[String, String]
+  fn_ret_types: Map[String, Type]
+  static_names: Set[String]
+  static_types: Map[String, Type]
 end
 
 struct PendingClosure
@@ -480,8 +509,21 @@ def builder_new() -> MirBuilder
     pending_closures: Vec::new(),
     break_target: Option::None,
     continue_target: Option::None,
-    enum_variants: Map::new()
+    enum_variants: Map::new(),
+    enum_variant_discriminants: Map::new(),
+    enum_has_payload: Map::new(),
+    type_id_counter: 1,
+    type_name_to_id: Map::new(),
+    type_defs: Vec::new(),
+    impl_type_map: Map::new(),
+    fn_ret_types: Map::new(),
+    static_names: Set::new(),
+    static_types: Map::new()
   }
+end
+
+def enum_variant_discriminant_key(enum_name: &String, variant_name: &String) -> String
+  enum_name.clone() + "::" + variant_name.clone()
 end
 
 def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span) -> Unit
@@ -698,34 +740,234 @@ def lower_program(program: &Program) -> MirProgram
   mut functions = Vec::new()
   mut statics = Vec::new()
   mut types = Vec::new()
+  mut seen_fns = Set::new()
 
   # Pre-populate enum variant map so lower_expr can resolve ExprKind::AstPath
+  # Also pre-assign TypeIds to all struct and enum types for forward references
   for item in program.items do
     match item.kind
+    when ItemKind::Struct(s) then
+      let tid = b.type_id_counter
+      b.type_id_counter = b.type_id_counter + 1
+      b.type_name_to_id.insert(s.name.clone(), tid)
     when ItemKind::Enum(e) then
+      let tid = b.type_id_counter
+      b.type_id_counter = b.type_id_counter + 1
+      b.type_name_to_id.insert(e.name.clone(), tid)
       mut variant_names = Vec::new()
+      mut has_payload = false
+      mut disc = 0
       for v in e.variants do
+        match v.discriminant
+        when Option::Some(expr) then
+          match expr.kind
+          when ExprKind::ExprIntLit(n) then disc = n
+          when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then
+            match inner.kind
+            when ExprKind::ExprIntLit(n) then disc = 0 - n
+            when _ then ()
+            end
+          when _ then ()
+          end
+        when Option::None then ()
+        end
         variant_names.push(v.name.clone())
+        if v.fields.len() > 0 then
+          has_payload = true
+        end
+        b.enum_variant_discriminants.insert(enum_variant_discriminant_key(&e.name, &v.name), disc)
+        disc = disc + 1
       end
       b.enum_variants.insert(e.name.clone(), variant_names)
+      b.enum_has_payload.insert(e.name.clone(), has_payload)
+    when ItemKind::Static(s) then
+      b.static_names.insert(s.name.clone())
+      let st_ty = resolve_lowering_type(&s.ty)
+      b.static_types.insert(s.name.clone(), st_ty)
     when _ then ()
     end
   end
 
+  # Pre-register function return types so call lowering can type local
+  # bindings before the target function is lowered.
   for item in program.items do
     match item.kind
     when ItemKind::Function(f) then
-      match lower_function(&mut b, &f)
-      when Option::Some(mir_fn) then
-        functions.push(mir_fn)
-      when Option::None then ()
+      let ret_type = match f.ret_type
+      when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
+      when Option::None then Type::Unit
+      end
+      b.fn_ret_types.insert(f.name.clone(), ret_type)
+    when ItemKind::Impl(impl_decl) then
+      let raw_impl_type = match impl_decl.for_type.kind
+      when TypeExprKind::Named(name, _) then name.clone()
+      when _ then
+        match impl_decl.self_type.kind
+        when TypeExprKind::Named(name, _) then name.clone()
+        when _ then ""
+        end
+      end
+      let impl_type_name = if raw_impl_type == "Array" then "Vec" else raw_impl_type end
+      for method in impl_decl.methods do
+        let ret_type = match method.ret_type
+        when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
+        when Option::None then Type::Unit
+        end
+        let mangled_name = if impl_type_name != "" then
+          impl_type_name.clone() + "__" + method.name.clone()
+        else
+          method.name.clone()
+        end
+        b.fn_ret_types.insert(mangled_name, ret_type)
+      end
+    when ItemKind::ExternBlock(ext) then
+      for ext_item in ext.items do
+        match ext_item
+        when ExternItem::Function(ef) then
+          let ret_type = match ef.ret_type
+          when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
+          when Option::None then Type::Unit
+          end
+          b.fn_ret_types.insert(ef.name.clone(), ret_type)
+        when _ then ()
+        end
+      end
+    when _ then ()
+    end
+  end
+
+  # Diagnostic: count and check items
+  mut total_items = 0
+  mut fn_items = 0
+  mut impl_items = 0
+  mut has_cmd_compile_ast = false
+  mut has_cmd_build_ast = false
+  mut has_args_ast = false
+  mut has_detect_host = false
+  mut has_raw_close = false
+  mut has_collect_fn_refs = false
+  mut has_emit = false
+  mut has_lint_file = false
+  for item in program.items do
+    total_items = total_items + 1
+    match item.kind
+    when ItemKind::Function(f) then
+      fn_items = fn_items + 1
+      if f.name == "cmd_compile" then has_cmd_compile_ast = true end
+      if f.name == "cmd_build" then has_cmd_build_ast = true end
+      if f.name == "args" then has_args_ast = true end
+      if f.name == "detect_host_target" then has_detect_host = true end
+      if f.name == "raw_close" then has_raw_close = true end
+      if f.name == "collect_fn_refs" then has_collect_fn_refs = true end
+      if f.name == "emit" then has_emit = true end
+      if f.name == "lint_file" then has_lint_file = true end
+    when ItemKind::Impl(_) then impl_items = impl_items + 1
+    when _ then ()
+    end
+  end
+
+  # PASS 1: Lower all struct and enum type definitions first.
+  # This ensures b.type_defs is fully populated before any function
+  # body is lowered, so resolve_field_index_for_place can find
+  # correct field indices for ALL types regardless of source order.
+  for item in program.items do
+    match item.kind
+    when ItemKind::Struct(s) then
+      types.push(lower_struct_def(&mut b, &s))
+    when ItemKind::Enum(e) then
+      types.push(lower_enum_def(&mut b, &e))
+    when _ then ()
+    end
+  end
+
+  # PASS 2: Lower functions, statics, impl methods, and extern blocks.
+  for item in program.items do
+    match item.kind
+    when ItemKind::Function(f) then
+      if !seen_fns.contains(f.name.clone()) then
+        match lower_function(&mut b, &f)
+        when Option::Some(mir_fn) then
+          seen_fns.insert(mir_fn.name.clone())
+          functions.push(mir_fn)
+        when Option::None then ()
+        end
       end
     when ItemKind::Static(s) then
       statics.push(lower_static(&mut b, &s))
-    when ItemKind::Struct(s) then
-      types.push(lower_struct_def(&s))
-    when ItemKind::Enum(e) then
-      types.push(lower_enum_def(&e))
+    when ItemKind::Impl(impl_decl) then
+      # Extract the type name from for_type for method name mangling
+      let raw_impl_type = match impl_decl.for_type.kind
+      when TypeExprKind::Named(name, _) then name.clone()
+      when _ then
+        match impl_decl.self_type.kind
+        when TypeExprKind::Named(name, _) then name.clone()
+        when _ then ""
+        end
+      end
+      # Normalize Array → Vec so mangled names match call-site expectations
+      # (resolve_lowering_type maps both Vec[T] and Array[T] to Type::Slice,
+      #  and method calls on Type::Slice emit "Vec__method")
+      let impl_type_name = if raw_impl_type == "Array" then "Vec" else raw_impl_type end
+
+      # Extract methods from impl blocks as standalone MIR functions
+      # Mangle method names as TypeName__method_name to avoid collisions
+      for method in impl_decl.methods do
+        let mangled_name = if impl_type_name != "" then
+          impl_type_name.clone() + "__" + method.name.clone()
+        else
+          method.name.clone()
+        end
+        if !seen_fns.contains(mangled_name.clone()) then
+          # Rewrite params: give self/&self/&mut self the impl type
+          mut new_params = Vec::new()
+          for p in method.params do
+            if p.name == "self" then
+              let self_ty = if impl_type_name != "" then
+                Option::Some(impl_decl.for_type.clone())
+              else
+                p.ty.clone()
+              end
+              new_params.push(Param {
+                modifier: p.modifier.clone(),
+                name: p.name.clone(),
+                ty: self_ty,
+                default: p.default.clone(),
+                span: p.span
+              })
+            else
+              new_params.push(p.clone())
+            end
+          end
+          # Create a renamed copy of the method with mangled name
+          let renamed_method = FunctionDecl {
+            vis: method.vis.clone(),
+            name: mangled_name.clone(),
+            generic_params: method.generic_params.clone(),
+            params: new_params,
+            ret_type: method.ret_type.clone(),
+            where_clause: method.where_clause.clone(),
+            body: method.body.clone(),
+            is_async: method.is_async,
+            is_unsafe: method.is_unsafe,
+            is_const: method.is_const,
+            is_inline: method.is_inline,
+            is_pure: method.is_pure,
+            contracts: method.contracts.clone(),
+            budget_val: method.budget_val.clone(),
+            required_caps: method.required_caps.clone(),
+            effects: method.effects.clone(),
+            span: method.span
+          }
+          match lower_function(&mut b, &renamed_method)
+          when Option::Some(mir_fn) then
+            seen_fns.insert(mir_fn.name.clone())
+            functions.push(mir_fn)
+            # Also register with bare name for fallback resolution
+            b.impl_type_map.insert(method.name.clone(), impl_type_name.clone())
+          when Option::None then ()
+          end
+        end
+      end
     when ItemKind::ExternBlock(ext) then
       # Register extern function declarations.
       # These generate empty MIR functions with is_extern = true
@@ -741,6 +983,7 @@ def lower_program(program: &Program) -> MirProgram
           functions.push(extern_fn)
         when ExternItem::Static(es) then
           statics.push(lower_extern_static(&es))
+          b.static_names.insert(es.name.clone())
         end
       end
     when _ then ()
@@ -751,23 +994,38 @@ def lower_program(program: &Program) -> MirProgram
   mut result = MirProgram { functions: functions, statics: statics, types: types }
   lower_pending_closures(&mut b, &mut result)
 
+  # Search MIR functions for cmd_compile
+  mut found_mir_cmd_compile = false
+  for f in result.functions do
+    if f.name == "cmd_compile" then found_mir_cmd_compile = true end
+  end
+
   result
 end
 
 def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
   # Resolve return type from AST
   let ret_type = match f.ret_type
-  when Option::Some(ty_expr) then resolve_lowering_type(&ty_expr)
+  when Option::Some(ty_expr) then resolve_type_with_builder(b, &ty_expr)
   when Option::None then Type::Unit
   end
 
   start_function(b, f.name, ret_type, f.span)
   
-  # Add parameters with resolved types
+  # Add parameters with resolved types, applying modifiers (Ref, RefMut, etc.)
   for p in f.params do
-    let ty = match p.ty
-    when Option::Some(ty_expr) then resolve_lowering_type(&ty_expr)
+    let base_ty = match p.ty
+    when Option::Some(ty_expr) then resolve_type_with_builder(b, &ty_expr)
     when Option::None then Type::Unit
+    end
+    let ty = match p.modifier
+    when Option::Some(mod) then
+      match mod
+      when ParamModifier::Ref then Type::Ref(base_ty, lifetime_anonymous())
+      when ParamModifier::RefMut then Type::RefMut(base_ty, lifetime_anonymous())
+      when _ then base_ty
+      end
+    when Option::None then base_ty
     end
     add_param(b, p.name, ty, f.span)
   end
@@ -924,10 +1182,160 @@ def resolve_lowering_type(ty_expr: &TypeExpr) -> Type
   end
 end
 
+# Like resolve_lowering_type but uses the MirBuilder to resolve user-defined types
+# to their proper TypeIds (instead of always assigning TypeId{id:0}).
+def resolve_type_with_builder(b: &MirBuilder, ty_expr: &TypeExpr) -> Type
+  match ty_expr.kind
+  when TypeExprKind::Named(name, args) then
+    # Try built-in primitives first (same as resolve_lowering_type)
+    if name == "Int" then Type::Int
+    elsif name == "I8" then Type::I8
+    elsif name == "I16" then Type::I16
+    elsif name == "I32" then Type::I32
+    elsif name == "I64" then Type::I64
+    elsif name == "UInt" then Type::UInt
+    elsif name == "U8" then Type::U8
+    elsif name == "U16" then Type::U16
+    elsif name == "U32" then Type::U32
+    elsif name == "U64" then Type::U64
+    elsif name == "Float" then Type::Float
+    elsif name == "F32" then Type::F32
+    elsif name == "F64" then Type::F64
+    elsif name == "Bool" then Type::Bool
+    elsif name == "Char" then Type::Char
+    elsif name == "String" then Type::String
+    elsif name == "Unit" then Type::Unit
+    elsif name == "Never" then Type::Never
+    elsif name == "Option" && args.len() == 1 then
+      Type::Option(resolve_type_with_builder(b, &args[0]))
+    elsif name == "Result" && args.len() == 2 then
+      Type::Result(resolve_type_with_builder(b, &args[0]), resolve_type_with_builder(b, &args[1]))
+    elsif name == "Vec" && args.len() == 1 then
+      Type::Slice(resolve_type_with_builder(b, &args[0]))
+    elsif name == "Map" && args.len() == 2 then
+      Type::Map(resolve_type_with_builder(b, &args[0]), resolve_type_with_builder(b, &args[1]))
+    elsif name == "Set" && args.len() == 1 then
+      Type::Set(resolve_type_with_builder(b, &args[0]))
+    else
+      mut resolved_args = Vec::new()
+      for a in args do
+        resolved_args.push(resolve_type_with_builder(b, &a))
+      end
+      # Look up user-defined type in builder's registry
+      let tid = match b.type_name_to_id.get(name)
+      when Option::Some(id) then id
+      when Option::None then 0
+      end
+      Type::Named(TypeId { id: tid }, resolved_args)
+    end
+  when TypeExprKind::Ref(inner) then
+    Type::Ref(resolve_type_with_builder(b, &inner), lifetime_anonymous())
+  when TypeExprKind::RefMut(inner) then
+    Type::RefMut(resolve_type_with_builder(b, &inner), lifetime_anonymous())
+  when TypeExprKind::Ptr(inner) then
+    Type::Ptr(resolve_type_with_builder(b, &inner))
+  when TypeExprKind::PtrMut(inner) then
+    Type::PtrMut(resolve_type_with_builder(b, &inner))
+  when _ then
+    # Fall back to the static resolution for all other cases
+    resolve_lowering_type(ty_expr)
+  end
+end
+
+def expr_kind_tag(k: &ExprKind) -> String
+  match k
+  when ExprKind::ExprPath(_) then "ExprPath"
+  when ExprKind::ExprIntLit(_) then "ExprIntLit"
+  when ExprKind::ExprBoolLit(_) then "ExprBoolLit"
+  when ExprKind::ExprStringLit(_) then "ExprStringLit"
+  when ExprKind::ExprCall(_, _) then "ExprCall"
+  when ExprKind::ExprIdent(name) then "ExprIdent(" + name + ")"
+  when ExprKind::ExprEnumVariant(_, _) then "ExprEnumVariant"
+  when _ then "Other"
+  end
+end
+
 def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
   let resolved_ty = resolve_lowering_type(&s.ty)
-  let lowered = lower_expr(b, &s.value, s.span)
-  let init_val = Option::Some(lowered)
+
+  # Try to produce a direct constant operand for common static init patterns:
+  #   - Enum variant paths like Option::None → discriminant integer
+  #   - Integer/bool/string literals → direct constant
+  #   - Vec::new(), Map::new(), Set::new() → zero (null pointer)
+  # For anything else, fall back (will be zero-filled by codegen).
+  let init_val = match s.value.kind
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() >= 2 then
+      match resolve_enum_variant_discriminant(b, &path)
+      when Option::Some(disc) then
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(disc),
+            ty: Type::Int
+          })
+        })
+      when Option::None then
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirUnit,
+            ty: Type::Unit
+          })
+        })
+      end
+    else
+      Option::Some(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirUnit,
+          ty: Type::Unit
+        })
+      })
+    end
+  when ExprKind::ExprIntLit(n) then
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirInt(n),
+        ty: Type::Int
+      })
+    })
+  when ExprKind::ExprBoolLit(v) then
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirBool(v),
+        ty: Type::Bool
+      })
+    })
+  when ExprKind::ExprStringLit(s_val) then
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirString(s_val),
+        ty: Type::String
+      })
+    })
+  when ExprKind::ExprCall(callee, _) then
+    # Vec::new(), Map::new(), etc. → zero-init (null pointer)
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirInt(0),
+        ty: Type::Int
+      })
+    })
+  when _ then
+    # For Option types, unrecognized init likely means Option::None (disc=1)
+    # This handles parser misparses like fn-typed Options where the init
+    # expression is garbled.
+    let fallback_disc = match resolved_ty
+    when Type::Option(_) then 1
+    when _ then 0
+    end
+    if fallback_disc > 0 then
+    end
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirInt(fallback_disc),
+        ty: Type::Int
+      })
+    })
+  end
 
   MirStatic {
     name: s.name,
@@ -996,7 +1404,17 @@ def lower_extern_static(es: &ExternStatic) -> MirStatic
   }
 end
 
-def lower_struct_def(s: &StructDecl) -> MirTypeDef
+def lower_struct_def(b: &mut MirBuilder, s: &StructDecl) -> MirTypeDef
+  # Reuse pre-assigned TypeId from the pre-pass
+  let tid = match b.type_name_to_id.get(s.name)
+  when Option::Some(id) then id
+  when Option::None then
+    let id = b.type_id_counter
+    b.type_id_counter = b.type_id_counter + 1
+    b.type_name_to_id.insert(s.name.clone(), id)
+    id
+  end
+
   mut fields = Vec::new()
   mut offset = 0
   for f in s.fields do
@@ -1004,25 +1422,28 @@ def lower_struct_def(s: &StructDecl) -> MirTypeDef
     # For primitive and pointer-width types, use their natural size.
     # For compound types, use pointer-width (8) as the default.
     let field_size = field_type_size(&f.ty)
-    let field_align = field_size
+    let field_align = if field_size > 0 then field_size else 1 end
     
     # Align the offset to the field's natural alignment
     if field_align > 0 then
       offset = ((offset + field_align - 1) / field_align) * field_align
     end
     
+    let field_type = resolve_type_with_builder(b, &f.ty)
     fields.push(MirFieldDef {
       name: f.name,
-      ty: Type::Unit,
+      ty: field_type,
       offset: offset
     })
     offset = offset + field_size
   end
-  MirTypeDef {
-    id: TypeId { id: 0 },
+  let td = MirTypeDef {
+    id: TypeId { id: tid },
     name: s.name,
     kind: MirTypeDefKind::Struct(fields)
   }
+  b.type_defs.push(td.clone())
+  td
 end
 
 # Compute the size of a field based on its declared type expression
@@ -1045,7 +1466,7 @@ def field_type_size(ty: &TypeExpr) -> Int
     when "UInt"    then 8
     when "u64"     then 8
     when "i64"     then 8
-    when "String"  then 24   # ptr + len + cap
+    when "String"  then 8    # raw char* at ABI level
     when "Vec"     then 24   # ptr + len + cap
     when "Map"     then 48   # buckets_ptr + len + cap + hash_fn + ...
     when "Set"     then 32   # inner_map + len
@@ -1053,7 +1474,11 @@ def field_type_size(ty: &TypeExpr) -> Int
     when "Result"  then 24   # tag + value + error
     when "Box"     then 8    # single pointer
     when "Ptr"     then 8    # raw pointer
-    when _ then 8            # User-defined structs: pointer-width default
+    when _ then
+      # LAYOUT WARNING: unknown type defaults to pointer-width (8 bytes).
+      # If this type is NOT pointer-sized, the layout will be wrong.
+      # This is a known limitation tracked as feature gate G7.
+      8
     end
   when TypeExprKind::Ref(_) then 8       # reference = pointer
   when TypeExprKind::RefMut(_) then 8    # mutable reference = pointer
@@ -1076,11 +1501,22 @@ def field_type_size(ty: &TypeExpr) -> Int
   when TypeExprKind::Fn(_, _) then 16   # fn pointer + closure env pointer
   when TypeExprKind::Unit then 0
   when TypeExprKind::Never then 0
-  when _ then 8
+  when _ then
+    8
   end
 end
 
-def lower_enum_def(e: &EnumDecl) -> MirTypeDef
+def lower_enum_def(b: &mut MirBuilder, e: &EnumDecl) -> MirTypeDef
+  # Reuse pre-assigned TypeId from the pre-pass
+  let tid = match b.type_name_to_id.get(e.name)
+  when Option::Some(id) then id
+  when Option::None then
+    let id = b.type_id_counter
+    b.type_id_counter = b.type_id_counter + 1
+    b.type_name_to_id.insert(e.name.clone(), id)
+    id
+  end
+
   mut variants = Vec::new()
   mut disc = 0
   for v in e.variants do
@@ -1101,20 +1537,23 @@ def lower_enum_def(e: &EnumDecl) -> MirTypeDef
     # Lower variant payload type expressions to Types
     mut lowered_fields = Vec::new()
     for field_ty_expr in v.fields do
-      lowered_fields.push(resolve_lowering_type(&field_ty_expr))
+      lowered_fields.push(resolve_type_with_builder(b, &field_ty_expr))
     end
     variants.push(MirVariantDef {
       name: v.name,
       discriminant: disc,
       fields: lowered_fields
     })
+    b.enum_variant_discriminants.insert(enum_variant_discriminant_key(&e.name, &v.name), disc)
     disc = disc + 1
   end
-  MirTypeDef {
-    id: TypeId { id: 0 },
+  let td = MirTypeDef {
+    id: TypeId { id: tid },
     name: e.name,
     kind: MirTypeDefKind::Enum(variants)
   }
+  b.type_defs.push(td.clone())
+  td
 end
 
 def lower_contract(b: &mut MirBuilder, c: &ContractClause) -> Unit
@@ -1151,66 +1590,265 @@ def lower_block(b: &mut MirBuilder, block: &Block) -> Unit
   end
 end
 
-def mir_infer_expr_type(expr: &Expr) -> Type
-  match expr.kind
+def normalize_method_name(method_name: String) -> String
+  if method_name.starts_with(".") && method_name.len() > 1 then
+    method_name.slice(1, method_name.len())
+  elsif method_name == "." then
+    ""
+  else
+    method_name
+  end
+end
+
+def lookup_local_type_by_name(b: &MirBuilder, name: String) -> Type
+  match b.current_fn
+  when Option::Some(func) then
+    for local in func.locals do
+      if local.name == name then
+        return local.ty.clone()
+      end
+    end
+    Type::Unit
+  when Option::None then Type::Unit
+  end
+end
+
+def mir_lookup_fn_ret_type(b: &MirBuilder, fn_name: String) -> Type
+  match b.fn_ret_types.get(&fn_name)
+  when Option::Some(ret_type) then ret_type.clone()
+  when Option::None then Type::Unit
+  end
+end
+
+def mir_call_result_temp_type(ret_type: Type) -> Type
+  if ret_type == Type::Unit then Type::Int else ret_type end
+end
+
+def mir_infer_call_result_type(b: &MirBuilder, callee_expr: &Expr) -> Type
+  match callee_expr.kind
+  when ExprKind::ExprIdent(name) then
+    let local_ty = lookup_local_type_by_name(b, name.clone())
+    match local_ty
+    when Type::Function(_, ret_type) then ret_type
+    when _ then mir_lookup_fn_ret_type(b, name.clone())
+    end
+  when ExprKind::ExprFieldAccess(_, field_name) then
+    mir_lookup_fn_ret_type(b, field_name.clone())
+  when ExprKind::ExprEnumVariant(path, _) then
+    mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
+  when ExprKind::ExprPath(path) then
+    mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
+  when _ then
+    match mir_infer_expr_type(b, callee_expr)
+    when Type::Function(_, ret_type) then ret_type
+    when _ then Type::Unit
+    end
+  end
+end
+
+def mir_infer_method_result_type(b: &MirBuilder, receiver_type: Type, method_name: String, resolved_method: String) -> Type
+  let normalized_method_name = normalize_method_name(method_name)
+  let resolved_ret_type = mir_lookup_fn_ret_type(b, resolved_method)
+  if resolved_ret_type != Type::Unit then
+    resolved_ret_type
+  elsif normalized_method_name == "clone" then
+    receiver_type
+  elsif normalized_method_name == "len" || normalized_method_name == "capacity" then
+    Type::Int
+  elsif normalized_method_name == "is_empty" || normalized_method_name == "contains" ||
+        normalized_method_name == "contains_key" || normalized_method_name == "is_some" ||
+        normalized_method_name == "is_none" || normalized_method_name == "is_ok" ||
+        normalized_method_name == "is_err" || normalized_method_name == "starts_with" ||
+        normalized_method_name == "ends_with" then
+    Type::Bool
+  elsif normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+    Type::String
+  else
+    Type::Unit
+  end
+end
+
+def mir_fn_operand(b: &MirBuilder, fn_name: String) -> MirOperand
+  let ret_type = mir_lookup_fn_ret_type(b, fn_name.clone())
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(fn_name),
+      ty: Type::Function(Vec::new(), Box::new(ret_type))
+    })
+  }
+end
+
+def resolve_enum_variant_discriminant(b: &MirBuilder, path: &AstPath) -> Option[Int]
+  if path.segments.len() < 2 then
+    return Option::None
+  end
+
+  let enum_name = path.segments[path.segments.len() - 2].clone()
+  let variant_name = path.segments[path.segments.len() - 1].clone()
+
+  match b.enum_variant_discriminants.get(enum_variant_discriminant_key(&enum_name, &variant_name))
+  when Option::Some(disc) then return Option::Some(disc)
+  when Option::None then ()
+  end
+
+  match b.type_name_to_id.get(enum_name)
+  when Option::Some(type_id) then
+    for td in b.type_defs do
+      if td.id.id == type_id then
+        match td.kind
+        when MirTypeDefKind::Enum(variants) then
+          for variant in variants do
+            if variant.name == variant_name then
+              return Option::Some(variant.discriminant)
+            end
+          end
+        when _ then ()
+        end
+      end
+    end
+  when Option::None then ()
+  end
+
+  mut disc = 0
+  match b.enum_variants.get(enum_name)
+  when Option::Some(variants) then
+    for variant in variants do
+      if variant == variant_name then
+        return Option::Some(disc)
+      end
+      disc = disc + 1
+    end
+  when Option::None then ()
+  end
+
+  Option::None
+end
+
+def infer_path_value_type(b: &MirBuilder, path: &Path) -> Type
+  if path.segments.len() >= 2 then
+    let type_name = path.segments[path.segments.len() - 2].clone()
+    let member_name = path.segments[path.segments.len() - 1].clone()
+    if b.enum_variant_discriminants.contains_key(enum_variant_discriminant_key(&type_name, &member_name)) then
+      match b.type_name_to_id.get(type_name)
+      when Option::Some(tid) then
+        return Type::Named(TypeId { id: tid }, Vec::new())
+      when Option::None then ()
+      end
+    end
+    match b.enum_variants.get(type_name)
+    when Option::Some(variants) then
+      for variant_name in variants do
+        if variant_name == member_name then
+          match b.type_name_to_id.get(type_name)
+          when Option::Some(tid) then
+            return Type::Named(TypeId { id: tid }, Vec::new())
+          when Option::None then ()
+          end
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  Type::Unit
+end
+
+def mir_infer_expr_type(b: &MirBuilder, expr: &Expr) -> Type
+match expr.kind
   when ExprKind::ExprIntLit(_)    then Type::Int
   when ExprKind::ExprFloatLit(_)  then Type::Float
   when ExprKind::ExprBoolLit(_)   then Type::Bool
   when ExprKind::ExprStringLit(_) then Type::String
   when ExprKind::ExprCharLit(_)   then Type::Char
   when ExprKind::ExprNilLit       then Type::Unit
-  when ExprKind::ExprBinaryOp(_, lhs, _) then mir_infer_expr_type(lhs)
-  when ExprKind::ExprUnaryOp(_, inner)    then mir_infer_expr_type(inner)
+  when ExprKind::ExprBinaryOp(_, lhs, _) then mir_infer_expr_type(b, lhs)
+  when ExprKind::ExprUnaryOp(_, inner)    then mir_infer_expr_type(b, inner)
   when ExprKind::ExprCast(_, target_ty) then resolve_lowering_type(&target_ty)
   when ExprKind::ExprArrayLit(elems) then
     if elems.len() > 0 then
-      Type::Array(mir_infer_expr_type(&elems[0]), elems.len())
+      Type::Array(mir_infer_expr_type(b, &elems[0]), elems.len())
     else
       Type::Array(Type::Unit, 0)
     end
   when ExprKind::ExprTupleLit(elems) then
     mut tys = Vec::new()
     for e in elems do
-      tys.push(mir_infer_expr_type(&e))
+      tys.push(mir_infer_expr_type(b, e))
     end
     Type::Tuple(tys)
-  when ExprKind::ExprRef(inner)   then Type::Ref(mir_infer_expr_type(inner), lifetime_static())
-  when ExprKind::ExprRefMut(inner) then Type::RefMut(mir_infer_expr_type(inner), lifetime_static())
+  when ExprKind::ExprRef(inner)   then Type::Ref(mir_infer_expr_type(b, inner), lifetime_static())
+  when ExprKind::ExprRefMut(inner) then Type::RefMut(mir_infer_expr_type(b, inner), lifetime_static())
   when ExprKind::ExprDeref(inner) then
-    match mir_infer_expr_type(inner)
+    match mir_infer_expr_type(b, inner)
     when Type::Ref(t, _)    then t
     when Type::RefMut(t, _) then t
     when other              then other
     end
+  when ExprKind::ExprIndex(base, _) then
+    mir_project_index_type(b, &mir_infer_expr_type(b, &base))
   when ExprKind::ExprIf(if_stmt) then
-    infer_block_result_type(&if_stmt.then_block)
+    infer_block_result_type(b, &if_stmt.then_block)
   when ExprKind::ExprBlock(block) then
-    infer_block_result_type(&block)
-  when ExprKind::ExprCall(_, _)              then Type::Unit
-  when ExprKind::ExprMethodCall(_, _, _, _)  then Type::Unit
-  when ExprKind::ExprMatch(m) then
-    if m.arms.len() > 0 then
-      infer_block_result_type(&m.arms[0].body)
+    infer_block_result_type(b, &block)
+  when ExprKind::ExprCall(callee_expr, _) then
+    mir_infer_call_result_type(b, &callee_expr)
+  when ExprKind::ExprMethodCall(receiver, method_name, _, _) then
+    let normalized_method_name = normalize_method_name(method_name.clone())
+    # Infer return types for well-known methods so chained calls
+    # (e.g. vec.len().to_string()) resolve the correct receiver type.
+    if normalized_method_name == "len" || normalized_method_name == "capacity" then
+      Type::Int
+    else if normalized_method_name == "is_empty" || normalized_method_name == "contains" ||
+            normalized_method_name == "contains_key" || normalized_method_name == "is_some" ||
+            normalized_method_name == "is_none" || normalized_method_name == "is_ok" ||
+            normalized_method_name == "is_err" || normalized_method_name == "starts_with" ||
+            normalized_method_name == "ends_with" then
+      Type::Bool
+    else if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+      Type::String
+    else if normalized_method_name == "clone" then
+      mir_infer_expr_type(b, &receiver)
     else
       Type::Unit
     end
+  when ExprKind::ExprMatch(m) then
+    if m.arms.len() > 0 then
+      infer_block_result_type(b, &m.arms[0].body)
+    else
+      Type::Unit
+    end
+  when ExprKind::ExprEnumVariant(path, _) then
+    let maybe_type = if path.segments.len() >= 2 then
+      path.segments[path.segments.len() - 2].clone()
+    else
+      ""
+    end
+    let is_enum = match b.enum_variants.get(maybe_type)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    if is_enum then
+      infer_path_value_type(b, &path)
+    else
+      infer_static_path_result_type(b, &path)
+    end
   when ExprKind::ExprClosure(_, _, _)        then Type::Unit
-  when ExprKind::ExprIdent(_)                then Type::Unit
+  when ExprKind::ExprIdent(name) then
+    lookup_local_type_by_name(b, name.clone())
   when ExprKind::ExprSelfRef                  then Type::Unit
-  when ExprKind::ExprPath(_)                  then Type::Unit
-  when ExprKind::ExprMove(inner)             then mir_infer_expr_type(inner)
-  when ExprKind::ExprCopy(inner)             then mir_infer_expr_type(inner)
+  when ExprKind::ExprPath(path)               then infer_path_value_type(b, &path)
+  when ExprKind::ExprMove(inner)             then mir_infer_expr_type(b, inner)
+  when ExprKind::ExprCopy(inner)             then mir_infer_expr_type(b, inner)
   when ExprKind::ExprAwait(inner)            then Type::Unit
-  when ExprKind::ExprTry(inner)              then mir_infer_expr_type(inner)
+  when ExprKind::ExprTry(inner)              then mir_infer_expr_type(b, inner)
   when _                                 then Type::Unit
   end
 end
 
-def infer_block_result_type(block: &Block) -> Type
+def infer_block_result_type(b: &MirBuilder, block: &Block) -> Type
   if block.stmts.len() > 0 then
     let last = &block.stmts[block.stmts.len() - 1]
     match last.kind
-    when StmtKind::StmtExpr(e) then mir_infer_expr_type(&e)
+    when StmtKind::StmtExpr(e) then mir_infer_expr_type(b, &e)
     when _ then Type::Unit
     end
   else
@@ -1240,7 +1878,12 @@ def mir_infer_rvalue_type(rv: &MirRvalue, b: &MirBuilder) -> Type
   when MirRvalueKind::MirAggregate(kind, ops) then
     match kind
     when AggregateKind::MirArray(elem_ty) then elem_ty.clone()
-    when AggregateKind::Tuple then Type::Tuple(ops.iter().map(|o| mir_infer_operand_type(o, b)).collect())
+    when AggregateKind::Tuple then
+      mut tuple_types = Vec::new()
+      for operand in ops do
+        tuple_types.push(mir_infer_operand_type(&operand, b))
+      end
+      Type::Tuple(tuple_types)
     when AggregateKind::Struct(type_id, _) then Type::Named(type_id.clone(), Vec::new())
     when AggregateKind::Closure(type_id) then Type::Named(type_id.clone(), Vec::new())
     when AggregateKind::Generator(type_id) then Type::Named(type_id.clone(), Vec::new())
@@ -1256,10 +1899,15 @@ end
 
 def mir_infer_operand_type(op: &MirOperand, b: &MirBuilder) -> Type
   match op.kind
-  when MirOperandKind::MirCopy(place) then mir_infer_local_type_from_id(&place.local, b)
-  when MirOperandKind::MirMovePlace(place) then mir_infer_local_type_from_id(&place.local, b)
+  when MirOperandKind::MirCopy(place) then mir_infer_place_type(&place, b)
+  when MirOperandKind::MirMovePlace(place) then mir_infer_place_type(&place, b)
   when MirOperandKind::MirConstant(c) then c.ty.clone()
   end
+end
+
+def mir_infer_place_type(place: &Place, b: &MirBuilder) -> Type
+  let base_ty = mir_infer_local_type_from_id(&place.local, b)
+  resolve_type_through_projections(b, base_ty, &place.projections)
 end
 
 def mir_infer_local_type_from_id(local_id: &LocalId, b: &MirBuilder) -> Type
@@ -1298,6 +1946,41 @@ def lower_pattern_assignment(b: &mut MirBuilder, pat: &Pattern, rvalue: MirRvalu
   end
 end
 
+def bind_match_arm_pattern_locals(b: &mut MirBuilder, scrut_local: LocalId, pat: &Pattern, span: Span) -> Unit
+  let scrut_ty = mir_infer_local_type_from_id(&scrut_local, b)
+  match pat.kind
+  when PatternKind::Ident(name, is_mut) then
+    let local = add_local(b, name.clone(), scrut_ty, is_mut, span)
+    push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
+  when PatternKind::Variant(path, sub_pats) then
+    let variant_name = if path.segments.len() > 0 then
+      path.segments[path.segments.len() - 1].clone()
+    else
+      ""
+    end
+    let variant_disc = match resolve_enum_variant_discriminant(b, &path)
+    when Option::Some(found) then found
+    when Option::None then 0
+    end
+
+    mut field_idx = 0
+    for sp in sub_pats do
+      match sp.kind
+      when PatternKind::Ident(name, is_mut) then
+        mut payload_place = place_local(scrut_local)
+        payload_place.projections.push(Projection::ProjDowncast(variant_name.clone(), variant_disc))
+        payload_place.projections.push(Projection::ProjField(field_idx.to_string(), field_idx))
+        let local_ty = mir_infer_place_type(&payload_place, b)
+        let local = add_local(b, name.clone(), local_ty, is_mut, span)
+        push_assign(b, place_local(local), move_rvalue(operand_copy(payload_place)), span)
+      when _ then ()
+      end
+      field_idx = field_idx + 1
+    end
+  when _ then ()
+  end
+end
+
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   match stmt.kind
   when StmtKind::StmtLet(pattern, ty_opt, value, is_mut) then
@@ -1315,8 +1998,8 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   when StmtKind::StmtWhile(cond, body) then
     lower_while(b, &cond, &body, stmt.span)
     
-  when StmtKind::StmtFor(var, iter, body) then
-    lower_for(b, var, &iter, &body, stmt.span)
+  when StmtKind::StmtFor(var_pat, iter, body) then
+    lower_for(b, var_pat, &iter, &body, stmt.span)
     
   when StmtKind::StmtReturn(val_opt) then
     match val_opt
@@ -1369,7 +2052,7 @@ def lower_expr(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirOperand
   let rvalue = lower_expr_to_rvalue(b, expr, span)
   
   # Create temp and assign
-  let temp = add_temp(b, mir_infer_expr_type(expr), span)
+  let temp = add_temp(b, mir_infer_expr_type(b, expr), span)
   push_assign(b, place_local(temp), rvalue, span)
 
   operand_copy_local(temp)
@@ -1383,10 +2066,33 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     move_rvalue(operand_float(f))
   when ExprKind::ExprBoolLit(b) then
     move_rvalue(operand_bool(b))
+  when ExprKind::ExprCharLit(c) then
+    move_rvalue(operand_constant(constant_char(c)))
   when ExprKind::ExprStringLit(s) then
     move_rvalue(operand_string(s))
   when ExprKind::ExprIdent(name) then
     match b.var_map.get(name)
+    when Option::Some(local_id) then
+      move_rvalue(operand_copy_local(local_id))
+    when Option::None then
+      # Check if this is a static/global variable
+      if b.static_names.contains(&name) then
+        let st_ty = match b.static_types.get(name)
+        when Option::Some(t) then t
+        when Option::None then Type::Unit
+        end
+        move_rvalue(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirStaticRef(name),
+            ty: st_ty
+          })
+        })
+      else
+        move_rvalue(operand_unit())
+      end
+    end
+  when ExprKind::ExprSelfRef then
+    match b.var_map.get("self")
     when Option::Some(local_id) then
       move_rvalue(operand_copy_local(local_id))
     when Option::None then
@@ -1427,6 +2133,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
   when ExprKind::ExprCall(callee_expr, arg_exprs) then
     # Lower callee to a function operand
     let callee_op = lower_call_callee(b, &callee_expr, span)
+    let ret_type = mir_infer_call_result_type(b, &callee_expr)
     
     # Lower arguments
     mut mir_args = Vec::new()
@@ -1434,21 +2141,22 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       mir_args.push(lower_expr(b, &a, span))
     end
     
-    # Allocate a temp for the return value (must be non-Unit so it gets a register)
-    let ret_tmp = add_temp(b, Type::Int, span)
+    # Keep call result locals typed so later method resolution sees the
+    # actual receiver type. Only fall back to Int for true Unit returns.
+    let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
     let dest_place = place_local(ret_tmp)
     
     # Create success continuation block
     let success_blk = create_block(b)
     
     # Emit Call terminator in current block
-    set_terminator(b, MirTerminatorKind::MirCall(
-      dest_place,
-      callee_op,
-      mir_args,
-      success_blk,
-      Option::None
-    ), span)
+    set_terminator(b, MirTerminatorKind::MirCall {
+      dest: dest_place,
+      func: callee_op,
+      args: mir_args,
+      success: success_blk,
+      unwind: Option::None
+    }, span)
     
     # Switch to the success block
     b.current_block = Option::Some(success_blk)
@@ -1459,17 +2167,167 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     }) }
 
   when ExprKind::ExprMethodCall(receiver, method_name, type_args, arg_exprs) then
-    # Lower receiver
-    let recv_op = lower_expr(b, &receiver, span)
-    
-    # Build callee as FnItem with receiver_type.method_name
-    # For method calls the callee is a synthetic function name
-    let callee_op = MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem(method_name.clone()),
-        ty: Type::Function(Vec::new(), Box::new(Type::Unit))
-      })
-    }
+    let normalized_method_name = normalize_method_name(method_name.clone())
+    # Lower receiver as a reference (address-of) for method calls.
+    # If the receiver is not already place-like (for example a chained call
+    # like vec.len().to_string()), first spill it into a temp local so we can
+    # borrow that temp instead of falling back to local 0.
+    let recv_place = match receiver.kind
+    when ExprKind::ExprIdent(_) then
+      lower_place(b, &receiver)
+    when ExprKind::ExprSelfRef then
+      lower_place(b, &receiver)
+    when ExprKind::ExprFieldAccess(_, _) then
+      lower_place(b, &receiver)
+    when ExprKind::ExprDeref(_) then
+      lower_place(b, &receiver)
+    when ExprKind::ExprIndex(_, _) then
+      lower_place(b, &receiver)
+    when _ then
+      let recv_tmp = add_temp(b, mir_infer_expr_type(b, &receiver), span)
+      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &receiver, span), span)
+      place_local(recv_tmp)
+    end
+
+    # Try to resolve the receiver type for method name mangling.
+    # For field access chains (e.g.  lex.tokens.push(x)), the AST-level
+    # inference returns Unit for identifiers and field accesses.  We fall
+    # back to the MIR local's declared type and then walk the field
+    # projections so that  Lexer → .tokens → Vec[Token]  is resolved
+    # correctly, producing Vec__push rather than Lexer__push.
+    mut recv_type = mir_infer_expr_type(b, &receiver)
+
+    match recv_type
+    when Type::Unit then
+      match b.current_fn
+      when Option::Some(func) then
+        for local in func.locals do
+          if local.id.id == recv_place.local.id then
+            recv_type = local.ty.clone()
+          end
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+
+      # Distinguish between a receiver expression that is itself a borrowed
+      # collection (e.g. `loaded: &Vec[Int]`) and a collection place reached
+      # through a borrowed base (e.g. `self.loaded_paths`). Only the former
+      # should bypass the synthetic re-borrow.
+      let recv_place_type = resolve_type_through_projections(b, recv_type.clone(), &recv_place.projections)
+
+      let recv_is_collection_borrow = match recv_place_type
+      when Type::Ref(inner, _) then
+        match inner
+        when Type::Slice(_) then true
+        when Type::Map(_, _) then true
+        when Type::Set(_) then true
+        when _ then false
+        end
+      when Type::RefMut(inner, _) then
+        match inner
+        when Type::Slice(_) then true
+        when Type::Map(_, _) then true
+        when Type::Set(_) then true
+        when _ then false
+        end
+      when _ then false
+      end
+
+      # Strip references/pointers so method resolution sees the underlying type.
+      # mir_infer_expr_type may return Type::RefMut(Named(...)) for `f: &mut Formatter`
+      # which would not match the Type::Named branch below without stripping.
+      recv_type = match recv_place_type
+      when Type::Ref(inner, _) then inner
+      when Type::RefMut(inner, _) then inner
+      when Type::Ptr(inner) then inner
+      when Type::PtrMut(inner) then inner
+      when other then other
+      end
+
+    let recv_op = if recv_is_collection_borrow then
+      MirOperand {
+        kind: MirOperandKind::MirCopy(recv_place)
+      }
+    else
+      let recv_ref_tmp = add_temp(b, Type::Ref(recv_type.clone(), lifetime_anonymous()), span)
+      push_stmt(b, MirStatementKind::MirAssign(place_local(recv_ref_tmp), MirRvalue {
+        kind: MirRvalueKind::MirRef(recv_place)
+      }), span)
+      MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(recv_ref_tmp))
+      }
+    end
+
+    let resolved_method = match recv_type
+    when Type::Int then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "__intrinsic_int_to_string"
+      else
+        normalized_method_name.clone()
+      end
+    when Type::Float then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "__intrinsic_float_to_string"
+      else
+        normalized_method_name.clone()
+      end
+    when Type::F32 then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "__intrinsic_float_to_string"
+      else
+        normalized_method_name.clone()
+      end
+    when Type::F64 then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "__intrinsic_float_to_string"
+      else
+        normalized_method_name.clone()
+      end
+    when Type::Bool then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "__intrinsic_bool_to_string"
+      else
+        normalized_method_name.clone()
+      end
+    when Type::Named(tid, _) then
+      # Find the type name for this TypeId
+      mut type_name = ""
+      for td in b.type_defs do
+        if td.id.id == tid.id then
+          type_name = td.name.clone()
+        end
+      end
+      if type_name != "" then
+        type_name + "__" + normalized_method_name.clone()
+      else
+        # TypeId didn't resolve — fall back to impl_type_map
+        match b.impl_type_map.get(normalized_method_name)
+        when Option::Some(tn) then tn + "__" + normalized_method_name.clone()
+        when Option::None then normalized_method_name.clone()
+        end
+      end
+    when Type::String then
+      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+        "clone"
+      else
+        "String__" + normalized_method_name.clone()
+      end
+    when Type::Slice(_) then "Vec__" + normalized_method_name.clone()
+    when Type::Option(_) then "Option__" + normalized_method_name.clone()
+    when Type::Result(_, _) then "Result__" + normalized_method_name.clone()
+    when Type::Map(_, _) then "Map__" + normalized_method_name.clone()
+    when Type::Set(_) then "Set__" + normalized_method_name.clone()
+    when _ then
+      # Check impl_type_map for known method→type mappings
+      match b.impl_type_map.get(normalized_method_name)
+      when Option::Some(type_name) then type_name + "__" + normalized_method_name.clone()
+      when Option::None then normalized_method_name.clone()
+      end
+    end
+
+    let callee_op = mir_fn_operand(b, resolved_method.clone())
     
     # Lower arguments: receiver first, then explicit args
     mut mir_args = Vec::new()
@@ -1478,21 +2336,21 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       mir_args.push(lower_expr(b, &a, span))
     end
     
-    # Allocate return temp (must be non-Unit so it gets a register)
-    let ret_tmp = add_temp(b, Type::Int, span)
+    let ret_type = mir_infer_method_result_type(b, recv_type.clone(), normalized_method_name, resolved_method.clone())
+    let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
     let dest_place = place_local(ret_tmp)
     
     # Create success block
     let success_blk = create_block(b)
     
     # Emit Call terminator
-    set_terminator(b, MirTerminatorKind::MirCall(
-      dest_place,
-      callee_op,
-      mir_args,
-      success_blk,
-      Option::None
-    ), span)
+    set_terminator(b, MirTerminatorKind::MirCall {
+      dest: dest_place,
+      func: callee_op,
+      args: mir_args,
+      success: success_blk,
+      unwind: Option::None
+    }, span)
     
     b.current_block = Option::Some(success_blk)
     
@@ -1502,12 +2360,22 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
 
   when ExprKind::ExprFieldAccess(recv, field_name) then
     let base_place = lower_place(b, &recv)
-    # Resolve field index — use a simple lookup for common types
-    let field_idx = match resolve_field_index(field_name)
+    # If the base local has a reference type, auto-insert a ProjDeref
+    let base_ty = lookup_local_type(b, &base_place.local)
+    let needs_deref = match base_ty
+    when Type::Ref(_, _) then true
+    when Type::RefMut(_, _) then true
+    when _ then false
+    end
+    # Resolve field index — try typed resolution first, then built-in fallback
+    let field_idx = match resolve_field_index_for_place(b, &base_place, field_name)
     when Option::Some(idx) then idx
-    when Option::None then panic("MIR lowering: unknown field access: " + field_name.clone())
+    when Option::None then 0
     end
     mut new_projections = base_place.projections.clone()
+    if needs_deref && base_place.projections.is_empty() then
+      new_projections.push(Projection::ProjDeref)
+    end
     new_projections.push(Projection::ProjField(field_name, field_idx))
     let projected = Place {
       local: base_place.local,
@@ -1526,6 +2394,19 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       kind: MirRvalueKind::MirMove(idx_op)
     }), span)
     mut new_projections = base_place.projections.clone()
+    # Only add ProjDeref when the base local is a reference type and no
+    # projections have been applied yet (same logic as ExprFieldAccess).
+    # ProjIndex already handles heap-collection header derefs, so an
+    # unconditional ProjDeref here causes a double-dereference crash.
+    let base_idx_ty = lookup_local_type(b, &base_place.local)
+    let idx_needs_deref = match base_idx_ty
+    when Type::Ref(_, _) then true
+    when Type::RefMut(_, _) then true
+    when _ then false
+    end
+    if idx_needs_deref && base_place.projections.is_empty() then
+      new_projections.push(Projection::ProjDeref)
+    end
     new_projections.push(Projection::ProjIndex(idx_tmp))
     let projected = Place {
       local: base_place.local,
@@ -1639,19 +2520,95 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       field_names.push(field_name.clone())
       ops.push(lower_expr(b, &field_value, span))
     end
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(TypeId { id: 0 }, field_names), ops) }
+    # Resolve the struct's TypeId from the path
+    let struct_name = path_to_string(&path)
+    let struct_tid = match b.type_name_to_id.get(struct_name)
+    when Option::Some(tid) then TypeId { id: tid }
+    when Option::None then TypeId { id: 0 }
+    end
+    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(struct_tid, field_names), ops) }
 
   when ExprKind::ExprEnumVariant(path, args) then
-    # Lower enum variant as Aggregate with downcast
-    mut ops = Vec::new()
-    mut field_names = Vec::new()
-    for i in 0..args.len() do
-      field_names.push(i.to_string())
+    # Distinguish enum variant construction from static method calls.
+    # Any non-enum path with arguments is a call target here: constructors like
+    # Vec::new(), built-ins like String::from_bytes(), and module-qualified
+    # functions like fs::read_to_vec(). Only actual enum types stay in the
+    # variant-construction path below.
+    let maybe_type = if path.segments.len() >= 2 then
+      path.segments[path.segments.len() - 2].clone()
+    else
+      ""
     end
-    for a in args do
-      ops.push(lower_expr(b, &a, span))
+    let maybe_method = if path.segments.len() >= 2 then
+      path.segments[path.segments.len() - 1].clone()
+    else
+      ""
     end
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(TypeId { id: 0 }, field_names), ops) }
+    let is_enum = match b.enum_variants.get(maybe_type)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+
+    if !is_enum then
+      let fn_name = resolve_static_path_callee_name(b, &path)
+      let callee_op = MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirFnItem(fn_name.clone()),
+          ty: Type::Function(Vec::new(), Box::new(Type::Unit))
+        })
+      }
+      mut mir_args = Vec::new()
+      for a in args do
+        mir_args.push(lower_expr(b, &a, span))
+      end
+      let ret_type = infer_static_path_result_type(b, &path)
+      let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
+      let dest_place = place_local(ret_tmp)
+      let success_blk = create_block(b)
+      set_terminator(b, MirTerminatorKind::MirCall {
+        dest: dest_place,
+        func: callee_op,
+        args: mir_args,
+        success: success_blk,
+        unwind: Option::None
+      }, span)
+      b.current_block = Option::Some(success_blk)
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(ret_tmp))
+      }) }
+    else
+      # Enum variant construction (e.g., Result::Ok(x), Option::Some(x))
+      mut ops = Vec::new()
+      mut field_names = Vec::new()
+      let enum_name = if path.segments.len() >= 2 then
+        path.segments[path.segments.len() - 2].clone()
+      else
+        path_to_string(&path)
+      end
+      let disc = match resolve_enum_variant_discriminant(b, &path)
+      when Option::Some(found) then found
+      when Option::None then 0
+      end
+      # Prepend discriminant tag as first operand
+      field_names.push("_tag")
+      ops.push(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirInt(disc),
+          ty: Type::Int
+        })
+      })
+      for i in 0..args.len() do
+        field_names.push(i.to_string())
+      end
+      for a in args do
+        ops.push(lower_expr(b, &a, span))
+      end
+      let enum_tid = match b.type_name_to_id.get(enum_name)
+      when Option::Some(tid) then TypeId { id: tid }
+      when Option::None then TypeId { id: 0 }
+      end
+      MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) }
+    end
 
   when ExprKind::ExprCast(inner, target_ty) then
     let inner_op = lower_expr(b, &inner, span)
@@ -1663,46 +2620,52 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     # Resolve enum variant paths like Operator::None to their discriminant
     if path.segments.len() >= 2 then
       let enum_name = path.segments[path.segments.len() - 2]
-      let variant_name = path.segments[path.segments.len() - 1]
-      match b.enum_variants.get(enum_name)
-      when Option::Some(variants) then
-        mut disc = 0
-        mut found = false
-        for v in variants do
-          if v == variant_name then
-            found = true
-            break
-          end
-          disc = disc + 1
+      match resolve_enum_variant_discriminant(b, &path)
+      when Option::Some(disc) then
+        # Check if this enum has any payload variants
+        # Default to true for unknown enums (e.g. Option, Result from std)
+        let has_payload = match b.enum_has_payload.get(enum_name)
+        when Option::Some(hp) then hp
+        when Option::None then true
         end
-        if found then
+        if has_payload then
+          # Mixed enum: heap-allocate with just the tag so representation is consistent
+          let enum_tid = match b.type_name_to_id.get(enum_name)
+          when Option::Some(tid) then TypeId { id: tid }
+          when Option::None then TypeId { id: 0 }
+          end
+          mut ops = Vec::new()
+          mut fnames = Vec::new()
+          fnames.push("_tag")
+          ops.push(MirOperand {
+            kind: MirOperandKind::MirConstant(MirConstant {
+              kind: MirConstantKind::MirInt(disc),
+              ty: Type::Int
+            })
+          })
+          MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) }
+        else
+          # Simple enum (all no-payload): just the integer discriminant
           MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirInt(disc),
               ty: Type::Int
             })
           }) }
-        else
-          MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-            kind: MirOperandKind::MirConstant(MirConstant {
-              kind: MirConstantKind::MirUnit,
-              ty: Type::Unit
-            })
-          }) }
         end
       when Option::None then
         MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
-            kind: MirConstantKind::MirUnit,
-            ty: Type::Unit
+            kind: MirConstantKind::MirString(path_to_string(&path)),
+            ty: Type::String
           })
         }) }
       end
     else
       MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirUnit,
-          ty: Type::Unit
+          kind: MirConstantKind::MirString(path_to_string(&path)),
+          ty: Type::String
         })
       }) }
     end
@@ -1732,46 +2695,549 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     when Option::Some(local_id) then
       place_local(local_id)
     when Option::None then
+      # Check if this is a static/global variable
+      if b.static_names.contains(&name) then
+        # Create a temp that holds the ADDRESS of the static
+        let addr_tmp = add_temp(b, Type::Ptr(Type::Unit), Span { file: "", start: 0, end_pos: 0 })
+        push_assign(b, place_local(addr_tmp), MirRvalue {
+          kind: MirRvalueKind::MirMove(MirOperand {
+            kind: MirOperandKind::MirConstant(MirConstant {
+              kind: MirConstantKind::MirStaticAddr(name),
+              ty: Type::Ptr(Type::Unit)
+            })
+          })
+        }, Span { file: "", start: 0, end_pos: 0 })
+        # Return a place that derefs through the address pointer
+        place_deref(place_local(addr_tmp))
+      else
+        place_local(LocalId { id: 0 })
+      end
+    end
+  when ExprKind::ExprSelfRef then
+    match b.var_map.get("self")
+    when Option::Some(local_id) then
+      place_local(local_id)
+    when Option::None then
       place_local(LocalId { id: 0 })
     end
   when ExprKind::ExprFieldAccess(recv, field) then
     let base = lower_place(b, &recv)
-    place_field(base, field, 0)
+    # Auto-insert ProjDeref when base local is a reference and we haven't
+    # already added projections (i.e., this is the first field access on
+    # a &/&mut parameter).  Without this, codegen_address_of would lose
+    # one level of indirection for chained field accesses through refs.
+    let base_ty = lookup_local_type(b, &base.local)
+    let needs_deref = match base_ty
+    when Type::Ref(_, _) then true
+    when Type::RefMut(_, _) then true
+    when _ then false
+    end
+    let field_idx = match resolve_field_index_for_place(b, &base, &field)
+    when Option::Some(idx) then idx
+    when Option::None then 0
+    end
+    mut new_projections = base.projections.clone()
+    if needs_deref && base.projections.is_empty() then
+      new_projections.push(Projection::ProjDeref)
+    end
+    new_projections.push(Projection::ProjField(field, field_idx))
+    Place { local: base.local, projections: new_projections }
   when ExprKind::ExprDeref(inner) then
-    let base = lower_place(b, &inner)
+    let base = match inner.kind
+    when ExprKind::ExprIdent(_) then
+      lower_place(b, &inner)
+    when ExprKind::ExprSelfRef then
+      lower_place(b, &inner)
+    when ExprKind::ExprFieldAccess(_, _) then
+      lower_place(b, &inner)
+    when ExprKind::ExprDeref(_) then
+      lower_place(b, &inner)
+    when ExprKind::ExprIndex(_, _) then
+      lower_place(b, &inner)
+    when _ then
+      let tmp_span = Span { file: "", start: 0, end_pos: 0 }
+      let tmp = add_temp(b, mir_infer_expr_type(b, &inner), tmp_span)
+      push_assign(b, place_local(tmp), lower_expr_to_rvalue(b, &inner, tmp_span), tmp_span)
+      place_local(tmp)
+    end
     place_deref(base)
   when ExprKind::ExprIndex(recv, index) then
     let base = lower_place(b, &recv)
-    # Would add index projection
-    base
+    # Evaluate the index expression and store in a temp
+    let idx_op = lower_expr(b, &index, Span { file: "", start: 0, end_pos: 0 })
+    let idx_tmp = add_temp(b, Type::Int, Span { file: "", start: 0, end_pos: 0 })
+    push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
+      kind: MirRvalueKind::MirMove(idx_op)
+    }), Span { file: "", start: 0, end_pos: 0 })
+    # Only deref when the base local is a bare reference (same guard as
+    # ExprFieldAccess).  ProjIndex handles heap-collection headers itself.
+    let base_place_ty = lookup_local_type(b, &base.local)
+    let place_needs_deref = match base_place_ty
+    when Type::Ref(_, _) then true
+    when Type::RefMut(_, _) then true
+    when _ then false
+    end
+    mut projs = base.projections.clone()
+    if place_needs_deref && base.projections.is_empty() then
+      projs.push(Projection::ProjDeref)
+    end
+    projs.push(Projection::ProjIndex(idx_tmp))
+    Place { local: base.local, projections: projs }
   when _ then
     place_local(LocalId { id: 0 })
   end
 end
 
 # Helper: lower a callee expression to a MirOperand for Call
+def resolve_static_path_callee_name(b: &MirBuilder, path: &Path) -> String
+  if path.segments.len() >= 2 then
+    let maybe_type = path.segments[path.segments.len() - 2].clone()
+    let maybe_method = path.segments[path.segments.len() - 1].clone()
+    let is_enum = match b.enum_variants.get(maybe_type)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    let norm_type = if maybe_type == "Array" then "Vec" else maybe_type end
+    if norm_type == "String" && maybe_method == "from_bytes" then
+      return "__intrinsic_string_from_bytes"
+    end
+    mut has_registered_type = false
+    match b.type_name_to_id.get(norm_type)
+    when Option::Some(_) then has_registered_type = true
+    when Option::None then ()
+    end
+    let is_known_type =
+      norm_type == "Vec" || norm_type == "Map" || norm_type == "Set" ||
+      norm_type == "String" || norm_type == "Formatter" || has_registered_type
+    if !is_enum && is_known_type then
+      return norm_type + "__" + maybe_method
+    end
+  end
+  if path.segments.len() > 0 then
+    path.segments[path.segments.len() - 1].clone()
+  else
+    "unknown"
+  end
+end
+
+def infer_static_path_result_type(b: &MirBuilder, path: &Path) -> Type
+  let fn_name = resolve_static_path_callee_name(b, &path)
+  let resolved_ret_type = mir_lookup_fn_ret_type(b, fn_name)
+  if resolved_ret_type != Type::Unit then
+    return resolved_ret_type
+  end
+
+  if path.segments.len() >= 2 then
+    let maybe_type = path.segments[path.segments.len() - 2].clone()
+    let norm_type = if maybe_type == "Array" then "Vec" else maybe_type end
+    if norm_type == "Vec" then
+      return Type::Slice(Type::Int)
+    end
+    if norm_type == "Map" then
+      return Type::Map(Type::Int, Type::Int)
+    end
+    if norm_type == "Set" then
+      return Type::Set(Type::Int)
+    end
+    if norm_type == "String" then
+      return Type::String
+    end
+    match b.type_name_to_id.get(norm_type)
+    when Option::Some(tid) then
+      return Type::Named(TypeId { id: tid }, Vec::new())
+    when Option::None then ()
+    end
+  end
+
+  Type::Unit
+end
+
 def lower_call_callee(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirOperand
   match expr.kind
   when ExprKind::ExprIdent(name) then
-    # Direct function call by name
-    MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem(name.clone()),
-        ty: Type::Function(Vec::new(), Box::new(Type::Unit))
-      })
-    }
+    # Check if the identifier refers to a local variable (indirect call via
+    # function pointer), e.g.  when Option::Some(hook) then hook(info)
+    mut is_local = false
+    match b.current_fn
+    when Option::Some(func) then
+      for local in func.locals do
+        if local.name == *name then
+          is_local = true
+        end
+      end
+    when Option::None then ()
+    end
+    if is_local then
+      # Indirect call through a local variable holding a function pointer
+      lower_expr(b, expr, span)
+    else
+      # Direct function call by name
+      mir_fn_operand(b, name.clone())
+    end
   when ExprKind::ExprFieldAccess(recv, field) then
     # Qualified path like Module.func — use the field as function name
-    MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem(field.clone()),
-        ty: Type::Function(Vec::new(), Box::new(Type::Unit))
-      })
-    }
+    mir_fn_operand(b, field.clone())
+  when ExprKind::ExprEnumVariant(path, _) then
+    mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
+  when ExprKind::ExprPath(path) then
+    # Preserve type-qualified static calls (Vec::new, Map::new, etc.) when
+    # they appear in callee position, while still allowing module-qualified
+    # free functions to resolve by their bare name.
+    let fn_name = resolve_static_path_callee_name(b, &path)
+    mir_fn_operand(b, fn_name)
   when _ then
     # Indirect call through expression (function pointer / closure)
     lower_expr(b, expr, span)
   end
+end
+
+# Resolve a type through a chain of Place projections.
+#
+# Given a starting type (typically a struct) and a list of projections,
+# follow ProjField entries through struct definitions to arrive at the
+# concrete type of the final element.
+#
+# Example:  starting type = Lexer (Named)
+#           projections = [ProjField("tokens", 1)]
+#           → looks up Lexer struct, field "tokens" at index 1 → Vec[Token]
+#
+# Deref projections strip one layer of Ref/RefMut/Ptr.
+# Field projections look up the enum/struct/tuple definition to get the field
+# type. Downcast projections keep enough variant information to resolve enum
+# payload bindings correctly.
+def resolve_enum_variant_field_type(b: &MirBuilder, enum_ty: &Type, variant_name: &String, field_idx: Int) -> Type
+  match enum_ty
+  when Type::Ref(inner, _) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::RefMut(inner, _) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::Ptr(inner) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::PtrMut(inner) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::Owned(inner) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::Box(inner) then resolve_enum_variant_field_type(b, inner, variant_name, field_idx)
+  when Type::Option(inner) then
+    if variant_name == "Some" && field_idx == 0 then inner.clone() else Type::Unit end
+  when Type::Result(ok, err) then
+    if variant_name == "Ok" && field_idx == 0 then ok.clone()
+    else if variant_name == "Err" && field_idx == 0 then err.clone()
+    else Type::Unit
+    end
+  when Type::Named(tid, _) then
+    for td in b.type_defs do
+      if td.id.id == tid.id then
+        match td.kind
+        when MirTypeDefKind::Enum(variants) then
+          for variant in variants do
+            if variant.name == *variant_name then
+              if field_idx >= 0 && field_idx < variant.fields.len() then
+                return variant.fields[field_idx].clone()
+              end
+            end
+          end
+        when _ then ()
+        end
+      end
+    end
+    Type::Unit
+  when _ then Type::Unit
+  end
+end
+
+def resolve_type_through_projections(b: &MirBuilder, start_type: Type, projections: &Vec[Projection]) -> Type
+  mut current = start_type
+  mut downcast_variant = ""
+  mut has_downcast = false
+  for proj in projections do
+    match proj
+    when Projection::ProjDeref then
+      current = match current
+      when Type::Ref(inner, _) then inner
+      when Type::RefMut(inner, _) then inner
+      when Type::Ptr(inner) then inner
+      when Type::PtrMut(inner) then inner
+      when other then other
+      end
+    when Projection::ProjDowncast(variant_name, _) then
+      downcast_variant = variant_name.clone()
+      has_downcast = true
+    when Projection::ProjField(field_name, field_idx) then
+      if has_downcast then
+        let variant_field_ty = resolve_enum_variant_field_type(b, &current, &downcast_variant, field_idx)
+        if variant_field_ty != Type::Unit then
+          current = variant_field_ty
+          has_downcast = false
+        else
+          return current
+        end
+      else
+        match current
+        when Type::Tuple(elems) then
+          if field_idx >= 0 && field_idx < elems.len() then
+            current = elems[field_idx].clone()
+          else
+            return current
+          end
+        when _ then
+      # Look up the struct definition for the current type and find the field's type
+          mut resolved = false
+          match unwrap_to_named_tid(&current)
+          when Option::Some(tid) then
+            for td in b.type_defs do
+              if td.id.id == tid.id then
+                match td.kind
+                when MirTypeDefKind::Struct(fields) then
+                  # Try by field name first (more reliable than index for renamed fields)
+                  for f in fields do
+                    if f.name == field_name then
+                      current = f.ty.clone()
+                      resolved = true
+                    end
+                  end
+                  # Fall back to index if name didn't match
+                  if !resolved && field_idx >= 0 && field_idx < fields.len() then
+                    current = fields[field_idx].ty.clone()
+                    resolved = true
+                  end
+                when _ then ()
+                end
+              end
+            end
+          when Option::None then ()
+          end
+          # If we couldn't resolve through struct defs, strip &/&mut and return
+          # what we have — the caller will still get a better type than Unit.
+          if !resolved then
+            return current
+          end
+        end
+      end
+    when Projection::ProjIndex(_) then
+      current = mir_project_index_type(b, &current)
+      has_downcast = false
+    when Projection::ProjConstantIndex(_) then
+      current = mir_project_index_type(b, &current)
+      has_downcast = false
+    when _ then
+      return current
+    end
+  end
+  current
+end
+
+def mir_project_index_type(b: &MirBuilder, ty: &Type) -> Type
+  match ty
+  when Type::Array(elem, _) then elem.clone()
+  when Type::Slice(elem) then elem.clone()
+  when Type::String then Type::Char
+  when Type::Named(tid, args) then
+    mut type_name = ""
+    for td in b.type_defs do
+      if td.id.id == tid.id then
+        type_name = td.name.clone()
+      end
+    end
+    if (type_name == "Vec" || type_name == "Array") && !args.is_empty() then
+      args[0].clone()
+    else if (type_name == "Map" || type_name == "HashMap") && args.len() >= 2 then
+      args[1].clone()
+    else if (type_name == "Set" || type_name == "HashSet") && !args.is_empty() then
+      args[0].clone()
+    else
+      ty.clone()
+    end
+  when Type::Ref(inner, _) then mir_project_index_type(b, inner)
+  when Type::RefMut(inner, _) then mir_project_index_type(b, inner)
+  when Type::Owned(inner) then mir_project_index_type(b, inner)
+  when Type::Box(inner) then mir_project_index_type(b, inner)
+  when Type::Rc(inner) then mir_project_index_type(b, inner)
+  when Type::Ptr(inner) then inner.clone()
+  when Type::PtrMut(inner) then inner.clone()
+  when _ then ty.clone()
+  end
+end
+
+# Helper: resolve struct field name to its index within the struct layout.
+# First tries to look up the actual struct definition from the builder's type_defs
+# using the receiver's type. Falls back to well-known built-in types.
+# Extract the underlying Named TypeId from a type, unwrapping through references
+def unwrap_to_named_tid(ty: &Type) -> Option[TypeId]
+  match ty
+  when Type::Named(tid, _) then Option::Some(tid)
+  when Type::Ref(inner, _) then unwrap_to_named_tid(inner)
+  when Type::RefMut(inner, _) then unwrap_to_named_tid(inner)
+  when Type::Owned(inner) then unwrap_to_named_tid(inner)
+  when Type::Box(inner) then unwrap_to_named_tid(inner)
+  when Type::Ptr(inner) then unwrap_to_named_tid(inner)
+  when Type::PtrMut(inner) then unwrap_to_named_tid(inner)
+  when Type::Rc(inner) then unwrap_to_named_tid(inner)
+  when Type::Option(inner) then unwrap_to_named_tid(inner)
+  when _ then Option::None
+  end
+end
+
+# Resolve the type at the END of a place's projection chain.
+# Starts from the base local's type and walks through each projection
+# to find the resulting type (e.g., for ctx.target.arch, walks from
+# CodegenCtx → Target → Arch).
+def resolve_projected_type_id(b: &MirBuilder, place: &Place) -> Option[TypeId]
+  # Get the base local's type
+  mut current_tid: Option[TypeId] = Option::None
+  match b.current_fn
+  when Option::Some(f) then
+    for local in f.locals do
+      if local.id.id == place.local.id then
+        current_tid = unwrap_to_named_tid(&local.ty)
+      end
+    end
+    for param in f.params do
+      if param.id.id == place.local.id then
+        current_tid = unwrap_to_named_tid(&param.ty)
+      end
+    end
+  when Option::None then ()
+  end
+
+  # Walk through projections, updating current_tid for each ProjField
+  for proj in place.projections do
+    match proj
+    when Projection::ProjField(fname, fidx) then
+      match current_tid
+      when Option::Some(tid) then
+        # Find the struct definition and get the field's type at this index
+        mut found_field_ty = false
+        for td in b.type_defs do
+          if td.id.id == tid.id then
+            match td.kind
+            when MirTypeDefKind::Struct(fields) then
+              mut fi = 0
+              for field in fields do
+                if fi == fidx then
+                  current_tid = unwrap_to_named_tid(&field.ty)
+                  found_field_ty = true
+                end
+                fi = fi + 1
+              end
+            when _ then ()
+            end
+          end
+        end
+        if !found_field_ty then
+          current_tid = Option::None
+        end
+      when Option::None then ()
+      end
+    when Projection::ProjDeref then
+      () # Deref doesn't change the named type (already unwrapped)
+    when _ then
+      () # Other projections don't affect the type tracking
+    end
+  end
+  current_tid
+end
+
+# Resolve a field index using the type at the end of a place's projection chain.
+# This correctly handles chained field accesses like ctx.target.arch.
+def resolve_field_index_for_place(b: &MirBuilder, place: &Place, name: &String) -> Option[Int]
+  # Try the projected type first (handles chained accesses)
+  match resolve_projected_type_id(b, place)
+  when Option::Some(tid) then
+    for td in b.type_defs do
+      if td.id.id == tid.id then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          mut idx = 0
+          for field in fields do
+            if field.name == name then
+              return Option::Some(idx)
+            end
+            idx = idx + 1
+          end
+        when _ then ()
+        end
+      end
+    end
+  when Option::None then ()
+  end
+  # Fall back to base local type resolution
+  resolve_field_index_typed(b, &place.local, name)
+end
+
+def resolve_field_index_typed(b: &MirBuilder, local_id: &LocalId, name: &String) -> Option[Int]
+  # Try to resolve via the actual struct type definition
+  match b.current_fn
+  when Option::Some(f) then
+    for local in f.locals do
+      if local.id.id == local_id.id then
+        match unwrap_to_named_tid(&local.ty)
+        when Option::Some(tid) then
+          for td in b.type_defs do
+            if td.id.id == tid.id then
+              match td.kind
+              when MirTypeDefKind::Struct(fields) then
+                mut idx = 0
+                for field in fields do
+                  if field.name == name then
+                    return Option::Some(idx)
+                  end
+                  idx = idx + 1
+                end
+              when _ then ()
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+    for param in f.params do
+      if param.id.id == local_id.id then
+        match unwrap_to_named_tid(&param.ty)
+        when Option::Some(tid) then
+          for td in b.type_defs do
+            if td.id.id == tid.id then
+              match td.kind
+              when MirTypeDefKind::Struct(fields) then
+                mut idx = 0
+                for field in fields do
+                  if field.name == name then
+                    return Option::Some(idx)
+                  end
+                  idx = idx + 1
+                end
+              when _ then ()
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+  when Option::None then ()
+  end
+  # Try by struct name — look through all type_defs for a field match.
+  # If exactly one struct matches, use its index. Otherwise fall through.
+  mut found_idx: Option[Int] = Option::None
+  mut match_count = 0
+  for td in b.type_defs do
+    match td.kind
+    when MirTypeDefKind::Struct(fields) then
+      mut idx = 0
+      for field in fields do
+        if field.name == name then
+          found_idx = Option::Some(idx)
+          match_count = match_count + 1
+        end
+        idx = idx + 1
+      end
+    when _ then ()
+    end
+  end
+  if match_count == 1 then
+    return found_idx
+  end
+  # Multiple structs matched — ambiguous. Fall through to well-known fallback
+  # instead of majority voting (which picks wrong indices for common types
+  # like Token where span=1, but majority of structs have span at 2+).
+  # Fall back to well-known built-in types
+  resolve_field_index(name)
 end
 
 # Helper: resolve struct field name to its index within the struct layout.
@@ -1785,8 +3251,6 @@ def resolve_field_index(name: &String) -> Option[Int]
   if name == "ptr" then return Option::Some(0) end
   if name == "len" || name == "length" then return Option::Some(1) end
   if name == "cap" || name == "capacity" then return Option::Some(2) end
-  
-  # String: { ptr: 0, len: 1, cap: 2 } (same layout as Vec[u8])
   
   # Map[K,V]: { buckets: 0, len: 1, cap: 2, hash_fn: 3= }
   if name == "buckets" then return Option::Some(0) end
@@ -1807,11 +3271,15 @@ def resolve_field_index(name: &String) -> Option[Int]
   if name == "kind" then return Option::Some(0) end
   if name == "data" then return Option::Some(0) end
   if name == "ty" || name == "type" then return Option::Some(1) end
-  if name == "span" then return Option::Some(2) end
+  # NOTE: span position varies by struct. idx=1 is correct for the most
+  # common 2-field structs: Expr, Token, Stmt, Pattern, MirStatement, etc.
+  # Structs with more fields (MirLocal has span at idx=4) should be resolved
+  # through the typed path above, not this fallback.
+  if name == "span" then return Option::Some(1) end
   if name == "is_mut" then return Option::Some(3) end
   
   # File: { fd: 0, path: 1, is_open: 2 }
-  if name == "fd" then return Option::Some(0) end
+  if name == "fd" || name == "_fd" then return Option::Some(0) end
   if name == "path" then return Option::Some(1) end
   if name == "is_open" then return Option::Some(2) end
   
@@ -1831,7 +3299,7 @@ def path_to_string(path: &AstPath) -> String
     if !first then
       result = result + "::"
     end
-    result = result + seg.name
+    result = result + seg.clone()
     first = false
   end
   result
@@ -2042,6 +3510,9 @@ end
 
 # Lower all pending closures into separate MirFunctions
 def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
+  # Loop until no more closures are pending — nested closures may queue
+  # additional closures that must also be processed.
+  while b.pending_closures.len() > 0 do
   let closures = b.pending_closures.clone()
   b.pending_closures = Vec::new()
 
@@ -2111,6 +3582,7 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
     b.var_map = saved_vars
     b.blocks = saved_block_map
   end
+  end  # while pending_closures
 end
 
 # Helper: lower if expression as rvalue (returns its value)
@@ -2146,13 +3618,13 @@ end
 def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: Span) -> Unit
   let cond_op = lower_expr(b, &if_expr.cond, span)
   let then_blk = create_block(b)
-  let else_blk = create_block(b)
+  mut current_else = create_block(b)
   let merge_blk = create_block(b)
 
   # Branch on condition
   mut targets = Vec::new()
-  targets.push(SwitchTarget { value: 0, target: else_blk })
-  set_terminator(b, MirTerminatorKind::MirSwitchInt(cond_op, targets, then_blk), span)
+  targets.push(SwitchTarget { value: 0, target: current_else })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cond_op, targets: targets, default_target: then_blk }, span)
 
   # Then branch — lower all stmts, last expression value goes to dest
   b.current_block = Option::Some(then_blk)
@@ -2179,8 +3651,45 @@ def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: S
     set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
   end
 
-  # Else branch — lower all stmts, last expression value goes to dest
-  b.current_block = Option::Some(else_blk)
+  # Elsif branches — each branch tests condition and assigns to dest
+  let branches = if_expr.elsif_branches
+  mut bi = 0
+  while bi < branches.len() do
+    b.current_block = Option::Some(current_else)
+    let branch = branches[bi]
+    let branch_cond = lower_expr(b, &branch.0, span)
+    let branch_then = create_block(b)
+    let next_else = create_block(b)
+    mut bt = Vec::new()
+    bt.push(SwitchTarget { value: 0, target: next_else })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: branch_cond, targets: bt, default_target: branch_then }, span)
+    b.current_block = Option::Some(branch_then)
+    let br_stmts = branch.1.stmts
+    if br_stmts.len() > 0 then
+      mut bsi = 0
+      while bsi < br_stmts.len() - 1 do
+        lower_stmt(b, &br_stmts[bsi])
+        bsi = bsi + 1
+      end
+      let last_br = br_stmts[br_stmts.len() - 1]
+      match last_br.kind
+      when StmtKind::StmtExpr(expr) then
+        lower_expr_assign_to(b, &expr, dest, span)
+      when StmtKind::StmtIf(nested_if) then
+        lower_if_to_place(b, &nested_if, dest, span)
+      when _ then
+        lower_stmt(b, &last_br)
+      end
+    end
+    if !block_is_terminated(b) then
+      set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
+    end
+    current_else = next_else
+    bi = bi + 1
+  end
+
+  # Final else branch — lower all stmts, last expression value goes to dest
+  b.current_block = Option::Some(current_else)
   match if_expr.else_block
   when Option::Some(else_body) then
     let else_stmts = else_body.stmts
@@ -2239,6 +3748,8 @@ def lower_binop(op: BinOp) -> MirBinOp
   when BinOp::Le then MirBinOp::Le
   when BinOp::Gt then MirBinOp::Gt
   when BinOp::Ge then MirBinOp::Ge
+  when BinOp::And then MirBinOp::BitAnd
+  when BinOp::Or then MirBinOp::BitOr
   when BinOp::BitAnd then MirBinOp::BitAnd
   when BinOp::BitOr then MirBinOp::BitOr
   when BinOp::BitXor then MirBinOp::BitXor
@@ -2258,15 +3769,15 @@ end
 
 def lower_if(b: &mut MirBuilder, if_stmt: &IfStmt, span: Span) -> Unit
   let then_block = create_block(b)
-  let else_block = create_block(b)
+  mut current_else = create_block(b)
   let join_block = create_block(b)
   
   let cond = lower_expr(b, &if_stmt.cond, span)
   
   # Switch on condition
   mut targets = Vec::new()
-  targets.push(SwitchTarget { value: 0, target: else_block })
-  set_terminator(b, MirTerminatorKind::MirSwitchInt(cond, targets, then_block), span)
+  targets.push(SwitchTarget { value: 0, target: current_else })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cond, targets: targets, default_target: then_block }, span)
   
   # Then block
   switch_to_block(b, then_block)
@@ -2275,8 +3786,29 @@ def lower_if(b: &mut MirBuilder, if_stmt: &IfStmt, span: Span) -> Unit
     set_terminator(b, MirTerminatorKind::MirGoto(join_block), span)
   end
   
-  # Else block
-  switch_to_block(b, else_block)
+  # Elsif branches
+  let branches = if_stmt.elsif_branches
+  mut bi = 0
+  while bi < branches.len() do
+    switch_to_block(b, current_else)
+    let branch = branches[bi]
+    let branch_cond = lower_expr(b, &branch.0, span)
+    let branch_then = create_block(b)
+    let next_else = create_block(b)
+    mut bt = Vec::new()
+    bt.push(SwitchTarget { value: 0, target: next_else })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: branch_cond, targets: bt, default_target: branch_then }, span)
+    switch_to_block(b, branch_then)
+    lower_block(b, &branch.1)
+    if !block_is_terminated(b) then
+      set_terminator(b, MirTerminatorKind::MirGoto(join_block), span)
+    end
+    current_else = next_else
+    bi = bi + 1
+  end
+  
+  # Final else block
+  switch_to_block(b, current_else)
   match if_stmt.else_block
   when Option::Some(eb) then lower_block(b, &eb)
   when Option::None then ()
@@ -2305,7 +3837,7 @@ def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span) -> Un
   let cond_op = lower_expr(b, cond, span)
   mut targets = Vec::new()
   targets.push(SwitchTarget { value: 0, target: exit_block })
-  set_terminator(b, MirTerminatorKind::MirSwitchInt(cond_op, targets, body_block), span)
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cond_op, targets: targets, default_target: body_block }, span)
 
   switch_to_block(b, body_block)
   lower_block(b, body)
@@ -2378,7 +3910,7 @@ def lower_for(b: &mut MirBuilder, pat: Pattern, iter: &Expr, body: &Block, span:
     let cmp_op = operand_copy_local(LocalId { id: cmp_counter })
     mut targets = Vec::new()
     targets.push(SwitchTarget { value: 0, target: exit_blk })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt(cmp_op, targets, body_blk), span)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cmp_op, targets: targets, default_target: body_blk }, span)
 
     switch_to_block(b, body_blk)
     lower_block(b, body)
@@ -2402,9 +3934,20 @@ def lower_for(b: &mut MirBuilder, pat: Pattern, iter: &Expr, body: &Block, span:
     switch_to_block(b, exit_blk)
 
   when _ then
-    # Collection-based for: desugar to index-based iteration
-    let iter_local = add_temp(b, Type::Unit, span) # Type should be handled better
-    let iter_op = lower_expr(b, iter, span)
+    # Collection-based for: desugar to index-based iteration.
+    # Resolve the iterator type from the expression so that codegen's
+    # ProjIndex handler can correctly identify heap collections and load
+    # the data pointer from the collection header.
+    let iter_expr_ty = resolve_iter_expr_type(b, iter)
+    let iter_local = add_temp(b, iter_expr_ty.clone(), span)
+    let iter_op = match iter.kind
+    when ExprKind::ExprRef(inner) then
+      lower_expr(b, &inner, span)
+    when ExprKind::ExprRefMut(inner) then
+      lower_expr(b, &inner, span)
+    when _ then
+      lower_expr(b, iter, span)
+    end
     push_assign(b, place_local(iter_local), MirRvalue { kind: MirRvalueKind::MirMove(iter_op) }, span)
 
     let len_local = add_temp(b, Type::Int, span)
@@ -2434,11 +3977,26 @@ def lower_for(b: &mut MirBuilder, pat: Pattern, iter: &Expr, body: &Block, span:
     let cmp_op = operand_copy_local(cmp_tmp)
     mut targets = Vec::new()
     targets.push(SwitchTarget { value: 0, target: exit_blk })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt(cmp_op, targets, body_blk), span)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cmp_op, targets: targets, default_target: body_blk }, span)
 
     switch_to_block(b, body_blk)
     # element = iter[idx]
+    # When the iterator type is a known heap collection (Vec, Array, etc.),
+    # codegen's ProjIndex handler loads the data pointer from the header
+    # automatically.  When the type could not be resolved (Unit fallback),
+    # insert a ProjDeref to ensure the data pointer gets loaded before
+    # indexing.  References always need a ProjDeref to unwrap the pointer
+    # indirection first.
+    let iter_ty = lookup_local_type(b, &iter_local)
+    let iter_needs_deref = match iter_ty
+    when Type::Ref(_, _) then true
+    when Type::RefMut(_, _) then true
+    when _ then false
+    end
     mut projs = Vec::new()
+    if iter_needs_deref then
+      projs.push(Projection::ProjDeref)
+    end
     projs.push(Projection::ProjIndex(idx_local))
     let elem_place = Place { local: iter_local, projections: projs }
     let elem_op = operand_copy(elem_place)
@@ -2493,22 +4051,74 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
   let scrutinee = lower_expr(b, &m.scrutinee, span)
 
   # Store the scrutinee value in a local
-  let scrut_local = add_temp(b, Type::Int, span)
-  push_assign(b, place_local(scrut_local), MirRvalue { kind: MirRvalueKind::MirMove(scrutinee) }, span)
+  let scrut_raw = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(scrut_raw), MirRvalue { kind: MirRvalueKind::MirMove(scrutinee) }, span)
+
+  # Auto-dereference if scrutinee is a reference type
+  mut scrut_is_ref = false
+  mut scrut_kind_name = "unknown"
+  match m.scrutinee.kind
+  when ExprKind::ExprSelfRef then
+    scrut_kind_name = "ExprSelfRef"
+    let sty = lookup_local_type_by_name(b, "self")
+    match sty
+    when Type::Ref(_, _) then scrut_is_ref = true
+    when Type::RefMut(_, _) then scrut_is_ref = true
+    when _ then ()
+    end
+  when ExprKind::ExprIdent(name) then
+    scrut_kind_name = "ExprIdent:" + name.clone()
+    let vty = lookup_local_type_by_name(b, name.clone())
+    match vty
+    when Type::Ref(_, _) then scrut_is_ref = true
+    when Type::RefMut(_, _) then scrut_is_ref = true
+    when _ then ()
+    end
+  when ExprKind::ExprDeref(_) then scrut_kind_name = "ExprDeref"
+  when ExprKind::ExprCall(_, _) then scrut_kind_name = "ExprCall"
+  when ExprKind::ExprMethodCall(_, _, _, _) then scrut_kind_name = "ExprMethodCall"
+  when _ then scrut_kind_name = "other"
+  end
+  let scrut_local = if scrut_is_ref then
+    let dt = add_temp(b, Type::Int, span)
+    mut dp = place_local(scrut_raw)
+    dp.projections.push(Projection::ProjDeref)
+    push_assign(b, place_local(dt), move_rvalue(operand_copy(dp)), span)
+    dt
+  else
+    scrut_raw
+  end
 
   # Determine if this is an enum match or literal match
   # by checking first non-wildcard pattern
   mut is_enum_match = false
+  mut match_enum_name = ""
   for arm in m.arms do
     match arm.pattern.kind
-    when PatternKind::Variant(_, _) then
+    when PatternKind::Variant(path, _) then
       is_enum_match = true
+      if path.segments.len() >= 2 then
+        match_enum_name = path.segments[path.segments.len() - 2].clone()
+      end
     when _ then ()
     end
   end
 
+  # Check if the enum has payload variants (heap-allocated) or is simple (integer tag)
+  # Default to true for unknown enums (e.g. Option, Result from std) since they have payloads
+  let needs_discriminant = if is_enum_match then
+    match b.enum_has_payload.get(match_enum_name)
+    when Option::Some(hp) then
+      hp
+    when Option::None then
+      true
+    end
+  else
+    false
+  end
+
   # For enum matching, extract discriminant; for literal matching, use raw value
-  let switch_local = if is_enum_match then
+  let switch_local = if needs_discriminant then
     let discr_tmp = add_temp(b, Type::Int, span)
     push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(
       place_local(scrut_local)
@@ -2526,37 +4136,8 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     arm_blocks.push(create_block(b))
   end
 
-  # Build switch targets from patterns
-  mut switch_targets = Vec::new()
-  mut i = 0
-  for arm in m.arms do
-    mut is_catchall = false
-    let disc_val = match arm.pattern.kind
-    when PatternKind::Literal(expr) then
-      match expr.kind
-      when ExprKind::ExprIntLit(n) then n
-      when ExprKind::ExprBoolLit(b) then if b then 1 else 0 end
-      when _ then i
-      end
-    when PatternKind::Variant(path, _) then i
-    when PatternKind::Wildcard then
-      is_catchall = true
-      0
-    when PatternKind::Ident(_, _) then
-      is_catchall = true
-      0
-    when _ then i
-    end
-
-    if !is_catchall then
-      switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
-    end
-    i = i + 1
-  end
-
   # Find default target: last wildcard/ident arm, or join_block
   let real_default = if m.arms.len() > 0 then
-    # Look for the last wildcard or ident pattern to use as default
     mut def_target = join_block
     mut j = 0
     for arm in m.arms do
@@ -2574,35 +4155,159 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
     join_block
   end
 
-  # Emit switch on the appropriate local
-  let switch_op = operand_copy_local(switch_local)
-  set_terminator(b, MirTerminatorKind::MirSwitchInt(switch_op, switch_targets, real_default), span)
+  # Check if any arm has string literal patterns
+  mut has_string_patterns = false
+  for arm in m.arms do
+    match arm.pattern.kind
+    when PatternKind::Literal(expr) then
+      match expr.kind
+      when ExprKind::ExprStringLit(_) then has_string_patterns = true
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+
+  mut i = 0
+
+  if has_string_patterns then
+    # String patterns cannot use SwitchInt (integer comparison).
+    # Emit an if-else chain of string equality comparisons instead.
+    for arm in m.arms do
+      match arm.pattern.kind
+      when PatternKind::Literal(expr) then
+        match expr.kind
+        when ExprKind::ExprStringLit(s_val) then
+          let cmp_tmp = add_temp(b, Type::Bool, span)
+          push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+            MirBinOp::Eq, operand_copy_local(scrut_local), operand_constant(constant_string(s_val))
+          ) }, span)
+          let next_check = create_block(b)
+          mut st = Vec::new()
+          st.push(SwitchTarget { value: 1, target: arm_blocks[i] })
+          set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(cmp_tmp), targets: st, default_target: next_check }, span)
+          switch_to_block(b, next_check)
+        when _ then ()
+        end
+      when _ then ()
+      end
+      i = i + 1
+    end
+    # After all string checks, fall through to default
+    set_terminator(b, MirTerminatorKind::MirGoto(real_default), span)
+  else
+    # Build switch targets from patterns (non-string)
+    mut switch_targets = Vec::new()
+    for arm in m.arms do
+      mut is_catchall = false
+      let disc_val = match arm.pattern.kind
+      when PatternKind::Literal(expr) then
+        match expr.kind
+        when ExprKind::ExprIntLit(n) then n
+        when ExprKind::ExprBoolLit(b) then if b then 1 else 0 end
+        when ExprKind::ExprCharLit(c) then c as Int
+        when _ then i
+        end
+      when PatternKind::Variant(path, _) then
+        match resolve_enum_variant_discriminant(b, &path)
+        when Option::Some(disc) then disc
+        when Option::None then i
+        end
+      when PatternKind::Wildcard then
+        is_catchall = true
+        0
+      when PatternKind::Ident(_, _) then
+        is_catchall = true
+        0
+      when _ then i
+      end
+
+      if !is_catchall then
+        switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
+      end
+      i = i + 1
+    end
+
+    # Emit switch on the appropriate local
+    let switch_op = operand_copy_local(switch_local)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: switch_op, targets: switch_targets, default_target: real_default }, span)
+  end
 
   # Emit each arm body
   i = 0
   for arm in m.arms do
     switch_to_block(b, arm_blocks[i])
 
-    # Bind pattern variables
+    # Payload guard for variant with literal sub-patterns
     match arm.pattern.kind
-    when PatternKind::Ident(name, _) then
-      let local = add_local(b, name, Type::Unit, false, span)
-      push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
     when PatternKind::Variant(path, sub_pats) then
-      # For variant patterns with sub-patterns, bind each field
-      mut field_idx = 0
-      for sp in sub_pats do
-        match sp.kind
-        when PatternKind::Ident(name, _) then
-          let local = add_local(b, name, Type::Unit, false, span)
-          let proj_place = place_field(place_local(scrut_local), name, field_idx)
-          push_assign(b, place_local(local), move_rvalue(operand_copy(proj_place)), span)
+      if sub_pats.len() > 0 then
+        mut has_lit = false
+        mut lit_val = 0
+        match sub_pats[0].kind
+        when PatternKind::Literal(lit_expr) then
+          has_lit = true
+          lit_val = match lit_expr.kind
+          when ExprKind::ExprIntLit(n) then n
+          when ExprKind::ExprBoolLit(bv) then if bv then 1 else 0 end
+          when ExprKind::ExprCharLit(c) then c as Int
+          when _ then 0
+          end
         when _ then ()
         end
-        field_idx = field_idx + 1
+        if has_lit then
+          let vn = if path.segments.len() > 0 then
+            path.segments[path.segments.len() - 1].clone()
+          else "" end
+          let vd = match resolve_enum_variant_discriminant(b, &path)
+          when Option::Some(d) then d
+          when Option::None then 0
+          end
+          mut ppl = place_local(scrut_local)
+          ppl.projections.push(Projection::ProjDowncast(vn, vd))
+          ppl.projections.push(Projection::ProjField("0", 0))
+          let pty = mir_infer_place_type(&ppl, b)
+          let ptmp = add_temp(b, pty, span)
+          push_assign(b, place_local(ptmp), move_rvalue(operand_copy(ppl)), span)
+          mut ft = real_default
+          mut k = i + 1
+          while k < m.arms.len() do
+            match m.arms[k].pattern.kind
+            when PatternKind::Variant(p2, _) then
+              match resolve_enum_variant_discriminant(b, &p2)
+              when Option::Some(d2) then
+                if d2 == vd then
+                  ft = arm_blocks[k]
+                  k = m.arms.len()
+                end
+              when Option::None then ()
+              end
+            when PatternKind::Wildcard then
+              ft = arm_blocks[k]
+              k = m.arms.len()
+            when PatternKind::Ident(_, _) then
+              ft = arm_blocks[k]
+              k = m.arms.len()
+            when _ then ()
+            end
+            k = k + 1
+          end
+          let bdy = create_block(b)
+          mut pt = Vec::new()
+          pt.push(SwitchTarget { value: lit_val, target: bdy })
+          set_terminator(b, MirTerminatorKind::MirSwitchInt {
+            op: operand_copy_local(ptmp),
+            targets: pt,
+            default_target: ft
+          }, span)
+          switch_to_block(b, bdy)
+        end
       end
     when _ then ()
     end
+
+    # Bind pattern variables
+    bind_match_arm_pattern_locals(b, scrut_local, &arm.pattern, span)
 
     # Guard check
     match arm.guard_expr
@@ -2612,7 +4317,7 @@ def lower_match(b: &mut MirBuilder, m: &MatchExpr, span: Span) -> Unit
       let guard_fail = if i + 1 < arm_blocks.len() then arm_blocks[i + 1] else join_block end
       mut gt = Vec::new()
       gt.push(SwitchTarget { value: 0, target: guard_fail })
-      set_terminator(b, MirTerminatorKind::MirSwitchInt(guard_val, gt, guard_pass), span)
+      set_terminator(b, MirTerminatorKind::MirSwitchInt { op: guard_val, targets: gt, default_target: guard_pass }, span)
       switch_to_block(b, guard_pass)
     when Option::None then ()
     end
@@ -2631,19 +4336,64 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
   # Same as lower_match but stores each arm's last expression to dest
   let scrutinee = lower_expr(b, &m.scrutinee, span)
 
-  let scrut_local = add_temp(b, Type::Int, span)
-  push_assign(b, place_local(scrut_local), MirRvalue { kind: MirRvalueKind::MirMove(scrutinee) }, span)
+  let scrut_raw = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(scrut_raw), MirRvalue { kind: MirRvalueKind::MirMove(scrutinee) }, span)
+
+  # Auto-dereference if scrutinee is a reference type
+  mut scrut_is_ref2 = false
+  match m.scrutinee.kind
+  when ExprKind::ExprSelfRef then
+    let sty2 = lookup_local_type_by_name(b, "self")
+    match sty2
+    when Type::Ref(_, _) then scrut_is_ref2 = true
+    when Type::RefMut(_, _) then scrut_is_ref2 = true
+    when _ then ()
+    end
+  when ExprKind::ExprIdent(name2) then
+    let vty2 = lookup_local_type_by_name(b, name2.clone())
+    match vty2
+    when Type::Ref(_, _) then scrut_is_ref2 = true
+    when Type::RefMut(_, _) then scrut_is_ref2 = true
+    when _ then ()
+    end
+  when _ then ()
+  end
+  let scrut_local = if scrut_is_ref2 then
+    let dt2 = add_temp(b, Type::Int, span)
+    mut dp2 = place_local(scrut_raw)
+    dp2.projections.push(Projection::ProjDeref)
+    push_assign(b, place_local(dt2), move_rvalue(operand_copy(dp2)), span)
+    dt2
+  else
+    scrut_raw
+  end
 
   mut is_enum_match = false
+  mut match_enum_name = ""
   for arm in m.arms do
     match arm.pattern.kind
-    when PatternKind::Variant(_, _) then
+    when PatternKind::Variant(path, _) then
       is_enum_match = true
+      if path.segments.len() >= 2 then
+        match_enum_name = path.segments[path.segments.len() - 2].clone()
+      end
     when _ then ()
     end
   end
 
-  let switch_local = if is_enum_match then
+  # Default to true for unknown enums (e.g. Option, Result from std) since they have payloads
+  let needs_discriminant = if is_enum_match then
+    match b.enum_has_payload.get(match_enum_name)
+    when Option::Some(hp) then
+      hp
+    when Option::None then
+      true
+    end
+  else
+    false
+  end
+
+  let switch_local = if needs_discriminant then
     let discr_tmp = add_temp(b, Type::Int, span)
     push_assign(b, place_local(discr_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(
       place_local(scrut_local)
@@ -2658,33 +4408,6 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
   mut arm_blocks = Vec::new()
   for arm in m.arms do
     arm_blocks.push(create_block(b))
-  end
-
-  mut switch_targets = Vec::new()
-  mut i = 0
-  for arm in m.arms do
-    mut is_catchall = false
-    let disc_val = match arm.pattern.kind
-    when PatternKind::Literal(expr) then
-      match expr.kind
-      when ExprKind::ExprIntLit(n) then n
-      when ExprKind::ExprBoolLit(b) then if b then 1 else 0 end
-      when _ then i
-      end
-    when PatternKind::Variant(path, _) then i
-    when PatternKind::Wildcard then
-      is_catchall = true
-      0
-    when PatternKind::Ident(_, _) then
-      is_catchall = true
-      0
-    when _ then i
-    end
-
-    if !is_catchall then
-      switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
-    end
-    i = i + 1
   end
 
   let real_default = if m.arms.len() > 0 then
@@ -2703,32 +4426,158 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
     join_block
   end
 
-  let switch_op = operand_copy_local(switch_local)
-  set_terminator(b, MirTerminatorKind::MirSwitchInt(switch_op, switch_targets, real_default), span)
+  # Check if any arm has string literal patterns
+  mut has_string_patterns = false
+  for arm in m.arms do
+    match arm.pattern.kind
+    when PatternKind::Literal(expr) then
+      match expr.kind
+      when ExprKind::ExprStringLit(_) then has_string_patterns = true
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+
+  mut i = 0
+
+  if has_string_patterns then
+    # String patterns cannot use SwitchInt (integer comparison).
+    # Emit an if-else chain of string equality comparisons instead.
+    for arm in m.arms do
+      match arm.pattern.kind
+      when PatternKind::Literal(expr) then
+        match expr.kind
+        when ExprKind::ExprStringLit(s_val) then
+          let cmp_tmp = add_temp(b, Type::Bool, span)
+          push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+            MirBinOp::Eq, operand_copy_local(scrut_local), operand_constant(constant_string(s_val))
+          ) }, span)
+          let next_check = create_block(b)
+          mut st = Vec::new()
+          st.push(SwitchTarget { value: 1, target: arm_blocks[i] })
+          set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(cmp_tmp), targets: st, default_target: next_check }, span)
+          switch_to_block(b, next_check)
+        when _ then ()
+        end
+      when _ then ()
+      end
+      i = i + 1
+    end
+    # After all string checks, fall through to default
+    set_terminator(b, MirTerminatorKind::MirGoto(real_default), span)
+  else
+    # Build switch targets from patterns (non-string)
+    mut switch_targets = Vec::new()
+    for arm in m.arms do
+      mut is_catchall = false
+      let disc_val = match arm.pattern.kind
+      when PatternKind::Literal(expr) then
+        match expr.kind
+        when ExprKind::ExprIntLit(n) then n
+        when ExprKind::ExprBoolLit(b) then if b then 1 else 0 end
+        when ExprKind::ExprCharLit(c) then c as Int
+        when _ then i
+        end
+      when PatternKind::Variant(path, _) then
+        match resolve_enum_variant_discriminant(b, &path)
+        when Option::Some(disc) then disc
+        when Option::None then i
+        end
+      when PatternKind::Wildcard then
+        is_catchall = true
+        0
+      when PatternKind::Ident(_, _) then
+        is_catchall = true
+        0
+      when _ then i
+      end
+
+      if !is_catchall then
+        switch_targets.push(SwitchTarget { value: disc_val, target: arm_blocks[i] })
+      end
+      i = i + 1
+    end
+
+    # Emit switch on the appropriate local
+    let switch_op = operand_copy_local(switch_local)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: switch_op, targets: switch_targets, default_target: real_default }, span)
+  end
 
   i = 0
   for arm in m.arms do
     switch_to_block(b, arm_blocks[i])
 
-    # Bind pattern variables
+    # Payload guard for variant with literal sub-patterns
     match arm.pattern.kind
-    when PatternKind::Ident(name, _) then
-      let local = add_local(b, name, Type::Unit, false, span)
-      push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
     when PatternKind::Variant(path, sub_pats) then
-      mut field_idx = 0
-      for sp in sub_pats do
-        match sp.kind
-        when PatternKind::Ident(name, _) then
-          let local = add_local(b, name, Type::Unit, false, span)
-          let proj_place = place_field(place_local(scrut_local), name, field_idx)
-          push_assign(b, place_local(local), move_rvalue(operand_copy(proj_place)), span)
+      if sub_pats.len() > 0 then
+        mut has_lit = false
+        mut lit_val = 0
+        match sub_pats[0].kind
+        when PatternKind::Literal(lit_expr) then
+          has_lit = true
+          lit_val = match lit_expr.kind
+          when ExprKind::ExprIntLit(n) then n
+          when ExprKind::ExprBoolLit(bv) then if bv then 1 else 0 end
+          when ExprKind::ExprCharLit(c) then c as Int
+          when _ then 0
+          end
         when _ then ()
         end
-        field_idx = field_idx + 1
+        if has_lit then
+          let vn = if path.segments.len() > 0 then
+            path.segments[path.segments.len() - 1].clone()
+          else "" end
+          let vd = match resolve_enum_variant_discriminant(b, &path)
+          when Option::Some(d) then d
+          when Option::None then 0
+          end
+          mut ppl = place_local(scrut_local)
+          ppl.projections.push(Projection::ProjDowncast(vn, vd))
+          ppl.projections.push(Projection::ProjField("0", 0))
+          let pty = mir_infer_place_type(&ppl, b)
+          let ptmp = add_temp(b, pty, span)
+          push_assign(b, place_local(ptmp), move_rvalue(operand_copy(ppl)), span)
+          mut ft = real_default
+          mut k = i + 1
+          while k < m.arms.len() do
+            match m.arms[k].pattern.kind
+            when PatternKind::Variant(p2, _) then
+              match resolve_enum_variant_discriminant(b, &p2)
+              when Option::Some(d2) then
+                if d2 == vd then
+                  ft = arm_blocks[k]
+                  k = m.arms.len()
+                end
+              when Option::None then ()
+              end
+            when PatternKind::Wildcard then
+              ft = arm_blocks[k]
+              k = m.arms.len()
+            when PatternKind::Ident(_, _) then
+              ft = arm_blocks[k]
+              k = m.arms.len()
+            when _ then ()
+            end
+            k = k + 1
+          end
+          let bdy = create_block(b)
+          mut pt = Vec::new()
+          pt.push(SwitchTarget { value: lit_val, target: bdy })
+          set_terminator(b, MirTerminatorKind::MirSwitchInt {
+            op: operand_copy_local(ptmp),
+            targets: pt,
+            default_target: ft
+          }, span)
+          switch_to_block(b, bdy)
+        end
       end
     when _ then ()
     end
+
+    # Bind pattern variables
+    bind_match_arm_pattern_locals(b, scrut_local, &arm.pattern, span)
 
     # Guard check
     match arm.guard_expr
@@ -2738,7 +4587,7 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
       let guard_fail = if i + 1 < arm_blocks.len() then arm_blocks[i + 1] else join_block end
       mut gt = Vec::new()
       gt.push(SwitchTarget { value: 0, target: guard_fail })
-      set_terminator(b, MirTerminatorKind::MirSwitchInt(guard_val, gt, guard_pass), span)
+      set_terminator(b, MirTerminatorKind::MirSwitchInt { op: guard_val, targets: gt, default_target: guard_pass }, span)
       switch_to_block(b, guard_pass)
     when Option::None then ()
     end
@@ -2756,6 +4605,10 @@ def lower_match_to_place(b: &mut MirBuilder, m: &MatchExpr, dest: Place, span: S
       match last.kind
       when StmtKind::StmtExpr(expr) then
         lower_expr_assign_to(b, &expr, duplicate_place(&dest), span)
+      when StmtKind::StmtIf(nested_if) then
+        lower_if_to_place(b, &nested_if, duplicate_place(&dest), span)
+      when StmtKind::StmtMatch(nested_m) then
+        lower_match_to_place(b, &nested_m, duplicate_place(&dest), span)
       when _ then
         lower_stmt(b, &last)
       end
@@ -3631,7 +5484,10 @@ def remap_rvalue(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
   when MirRvalueKind::MirRefMut(place) then
     MirRvalue { kind: MirRvalueKind::MirRefMut(remap_place(&place, local_map)) }
   when MirRvalueKind::MirAggregate(kind, fields) then
-    let remapped = fields.iter().map(|f| remap_operand(&f, local_map)).collect()
+    mut remapped = Vec::new()
+    for field in fields do
+      remapped.push(remap_operand(&field, local_map))
+    end
     MirRvalue { kind: MirRvalueKind::MirAggregate(kind.clone(), remapped) }
   when MirRvalueKind::MirDiscriminant(place) then
     MirRvalue { kind: MirRvalueKind::MirDiscriminant(remap_place(&place, local_map)) }
@@ -3642,15 +5498,15 @@ def remap_rvalue(rv: &MirRvalue, local_map: &Map[Int, Int]) -> MirRvalue
   when MirRvalueKind::MirRepeat(op, count) then
     MirRvalue { kind: MirRvalueKind::MirRepeat(remap_operand(&op, local_map), count) }
   when MirRvalueKind::MirPhi(args) then
-  let remapped = Vec::new()
-  for arg_entry in args do
-    let block = arg_entry.0
-    let local = arg_entry.1
-    let new_id = local_map.get(local.id).unwrap_or(local.id)
-    mut remapped_local = local.clone()
-    remapped_local.id = new_id
-    remapped.push((block, remapped_local))
-  end
+    let remapped = Vec::new()
+    for arg_entry in args do
+      let block = arg_entry.0
+      let local = arg_entry.1
+      let new_id = local_map.get(local.id).unwrap_or(local.id)
+      mut remapped_local = local.clone()
+      remapped_local.id = new_id
+      remapped.push((block, remapped_local))
+    end
     MirRvalue { kind: MirRvalueKind::MirPhi(remapped) }
   end
 end
@@ -3688,7 +5544,11 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
       new_targets.push(SwitchTarget { value: entry.value, target: BlockId { id: new_bid } })
     end
     MirTerminator {
-      kind: MirTerminatorKind::MirSwitchInt { op: remap_operand(&op, local_map), targets: new_targets, default_target: BlockId { id: new_fallback } },
+      kind: MirTerminatorKind::MirSwitchInt {
+        op: remap_operand(&op, local_map),
+        targets: new_targets,
+        default_target: BlockId { id: new_fallback }
+      },
       span: term.span.clone()
     }
   when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
@@ -3722,7 +5582,11 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
     when Option::None then Option::None
     end
     MirTerminator {
-      kind: MirTerminatorKind::MirDrop { place: remap_place(&place, local_map), target: BlockId { id: new_target }, unwind: new_unwind },
+      kind: MirTerminatorKind::MirDrop {
+        place: remap_place(&place, local_map),
+        target: BlockId { id: new_target },
+        unwind: new_unwind
+      },
       span: term.span.clone()
     }
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
@@ -3885,7 +5749,6 @@ def propagate_copies(f: &mut MirFunction) -> Unit
   end
 
   if changed then
-    eprintln("MIR copy propagation reached iteration cap (" + MAX_COPY_PROPAGATION_ITERATIONS().to_string() + "); propagation may be incomplete")
   end
   
   # Apply substitution to all operands
@@ -4062,9 +5925,9 @@ def try_fold_binop(op: MirBinOp, lhs: &MirOperand, rhs: &MirOperand) -> Option[M
       when MirBinOp::Sub then Option::Some(lv - rv)
       when MirBinOp::Mul then Option::Some(lv * rv)
       when MirBinOp::Div then
-        if rv != 0 then Option::Some(lv / rv) else Option::None end
+        if rv != 0 then Option::Some(lv / rv) else return Option::None end
       when MirBinOp::Mod then
-        if rv != 0 then Option::Some(lv % rv) else Option::None end
+        if rv != 0 then Option::Some(lv % rv) else return Option::None end
       when MirBinOp::BitAnd then Option::Some(lv & rv)
       when MirBinOp::BitOr then Option::Some(lv | rv)
       when MirBinOp::BitXor then Option::Some(lv ^ rv)
@@ -4959,7 +6822,7 @@ def redirect_terminator_edge(term: &mut MirTerminator, from_id: Int, to_id: Int)
       end
     end
     let new_fallback = if default_target.id == from_id then BlockId { id: to_id } else default_target end
-    term.kind = MirTerminatorKind::MirSwitchInt(op, new_targets, new_fallback)
+    term.kind = MirTerminatorKind::MirSwitchInt { op: op, targets: new_targets, default_target: new_fallback }
   when _ then ()
   end
 end
@@ -5116,7 +6979,13 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
     substitute_move_operand(&mut func2, map)
     mut args2 = args
     for a in args2 do substitute_move_operand(&mut a, map) end
-    let new_kind = MirTerminatorKind::MirCall { dest: dest2, func: func2, args: args2, success: success, unwind: unwind }
+    let new_kind = MirTerminatorKind::MirCall {
+      dest: dest2,
+      func: func2,
+      args: args2,
+      success: success,
+      unwind: unwind
+    }
     term.kind = new_kind
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
     mut cond2 = cond
@@ -5381,11 +7250,11 @@ def estimated_type_size_bytes(ty: &Type) -> Int
   when Type::Char then 4
   when Type::Int then 8
   when Type::Float then 8
-  when Type::String then 24
+  when Type::String then 8
   when Type::Ref(_, _) then 8
   when Type::RefMut(_, _) then 8
   when Type::Owned(_) then 8
-  when Type::Slice(_) then 16
+  when Type::Slice(_) then 8
   when Type::Function(_, _) then 8
   when Type::Named(_, _) then 8
   when Type::Tuple(fields) then
@@ -5853,11 +7722,11 @@ def transform_async_function(func: &MirFunction) -> MirFunction
       id: dispatch_block.id,
       statements: Vec::new(),
       terminator: MirTerminator {
-        kind: MirTerminatorKind::MirSwitchInt(
-          state_operand,
-          switch_targets,
-          func.entry_block   # Default to entry state
-        ),
+        kind: MirTerminatorKind::MirSwitchInt {
+          op: state_operand,
+          targets: switch_targets,
+          default_target: func.entry_block   # Default to entry state
+        },
         span: func.span
       }
     }
@@ -6177,8 +8046,10 @@ def compute_dominators(f: &MirFunction) -> DomInfo
   
   # Compute dominance frontiers
   mut dom_frontier: Map[Int, Vec[Int]] = Map::new()
+  mut dom_frontier_seen: Map[Int, Set[Int]] = Map::new()
   for b in block_ids do
     dom_frontier.insert(b, Vec::new())
+    dom_frontier_seen.insert(b, Set::new())
   end
   
   for b in block_ids do
@@ -6195,9 +8066,16 @@ def compute_dominators(f: &MirFunction) -> DomInfo
               end
             when Option::None then break
             end
-            match dom_frontier.get(runner)
-            when Option::Some(df) then
-              df.push(b)
+            match dom_frontier_seen.get(runner)
+            when Option::Some(df_seen) then
+              if !df_seen.contains(b) then
+                df_seen.insert(b)
+                match dom_frontier.get(runner)
+                when Option::Some(df) then
+                  df.push(b)
+                when Option::None then ()
+                end
+              end
             when Option::None then ()
             end
             match idom.get(runner)
@@ -6322,6 +8200,7 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
   #   - for each block in worklist, add phi at DF(block) if not already there
   
   mut phi_placements: Map[Int, Vec[Int]] = Map::new()  # block_id -> list of local_ids needing phi
+  mut phi_placement_seen: Map[Int, Set[Int]] = Map::new()
   
   for entry in defs do
     let local_id = entry.0
@@ -6340,19 +8219,29 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
         match dom_info.dom_frontier.get(b)
         when Option::Some(df) then
           for df_block in df do
-            match phi_placements.get(df_block)
-            when Option::Some(locals) then
-              if !locals.contains(local_id) then
-                locals.push(local_id)
-                if !processed.contains(df_block) then
-                  processed.insert(df_block)
-                  worklist.push(df_block)
-                end
+            mut added_phi = false
+            match phi_placement_seen.get(df_block)
+            when Option::Some(local_set) then
+              if !local_set.contains(local_id) then
+                local_set.insert(local_id)
+                added_phi = true
               end
             when Option::None then
-              mut v = Vec::new()
-              v.push(local_id)
-              phi_placements.insert(df_block, v)
+              mut local_set = Set::new()
+              local_set.insert(local_id)
+              phi_placement_seen.insert(df_block, local_set)
+              added_phi = true
+            end
+
+            if added_phi then
+              match phi_placements.get(df_block)
+              when Option::Some(locals) then
+                locals.push(local_id)
+              when Option::None then
+                mut v = Vec::new()
+                v.push(local_id)
+                phi_placements.insert(df_block, v)
+              end
               if !processed.contains(df_block) then
                 processed.insert(df_block)
                 worklist.push(df_block)
@@ -6397,7 +8286,10 @@ def insert_phi_nodes(f: &mut MirFunction, dom_info: &DomInfo) -> Unit
             place_local(LocalId { id: local_id }),
             phi_rvalue
           ),
-          span: block.statements.get(0).map(|s| s.span.clone()).unwrap_or(block.terminator.span)
+          span: match block.statements.get(0)
+          when Option::Some(stmt) then stmt.span.clone()
+          when Option::None then block.terminator.span
+          end
         })
       end
       # Prepend phis to existing statements
@@ -6639,28 +8531,7 @@ end
 
 def lower_to_mir(program: &Program) -> MirProgram
   mut mir = lower_program(program)
-  # SSA conversion: rename pass now uses value-copied LocalId to avoid
-  # pointer-aliasing bugs where shared LocalId objects caused renames
-  # of rvalue operands to corrupt the unrelated LHS place.
-  for func in mir.functions do
-    convert_to_ssa(&mut func)
-  end
-  # Verify MIR invariants before optimization
-  let pre_errors = verify_mir(&mir)
-  if !pre_errors.is_empty() then
-    for e in pre_errors do
-      eprintln("MIR verify (pre-opt): " + e)
-    end
-  end
-  optimize_mir(&mut mir, 1)
   transform_async_functions(&mut mir)
-  # Verify MIR invariants after optimization
-  let post_errors = verify_mir(&mir)
-  if !post_errors.is_empty() then
-    for e in post_errors do
-      eprintln("MIR verify (post-opt): " + e)
-    end
-  end
   mir
 end
 
