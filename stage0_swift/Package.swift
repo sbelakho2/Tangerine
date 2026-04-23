@@ -24,11 +24,6 @@ let package = Package(
             dependencies: ["TangerineCompiler"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        .testTarget(
-            name: "TangerineCompilerTests",
-            dependencies: ["TangerineCompiler"],
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
         .executableTarget(
             name: "TangerineTestRunner",
             dependencies: ["TangerineCompiler"],

@@ -126,15 +126,14 @@ end
 
 # O(1) type def lookup by type ID using the pre-built index map.
 def lookup_type_def(ctx: &CodegenCtx, type_id: Int) -> Option[&MirTypeDef]
-  match ctx.type_def_index.get(type_id)
-  when Option::Some(idx) then
-    if idx < ctx.type_defs.len() then
-      Option::Some(&ctx.type_defs[idx])
-    else
-      Option::None
+  mut idx = 0
+  while idx < ctx.type_defs.len() do
+    if ctx.type_defs[idx].id.id == type_id then
+      return Option::Some(&ctx.type_defs[idx])
     end
-  when Option::None then Option::None
+    idx = idx + 1
   end
+  Option::None
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -654,6 +653,34 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
     for stmt in block.statements do
       match stmt.kind
       when MirStatementKind::MirAssign(place, rvalue) then
+        if !place.projections.is_empty() then
+          match var_locs.get(place.local.id)
+          when Option::Some(loc) then
+            match loc
+            when VarLoc::Register(_) then
+              mut place_ty = Type::Unit
+              for local in func.locals do
+                if local.id.id == place.local.id then
+                  place_ty = local.ty.clone()
+                end
+              end
+              if place_ty == Type::Unit then
+                for param in func.params do
+                  if param.id.id == place.local.id then
+                    place_ty = param.ty.clone()
+                  end
+                end
+              end
+              if !is_ref_like_type(&place_ty) then
+                # store_place spills register-held aggregate bases before
+                # projected writes (e.g. opts.verbose = true).
+                dynamic_extra = dynamic_extra + 8
+              end
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+        end
         match rvalue.kind
         when MirRvalueKind::MirAggregate(kind, operands) then
           let type_id = match kind
@@ -667,7 +694,9 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
           when Option::Some(sz) then if sz > 0 then sz else count * 8 end
           when Option::None then count * 8
           end
-          dynamic_extra = dynamic_extra + align_up_int(total_size, 8)
+          # codegen_aggregate uses one extra spill slot to preserve the heap
+          # pointer returned by _tg_bump_alloc while it stores fields.
+          dynamic_extra = dynamic_extra + align_up_int(total_size, 8) + 8
         when MirRvalueKind::MirRef(ref_place) then
           match var_locs.get(ref_place.local.id)
           when Option::Some(loc) then
@@ -1601,6 +1630,14 @@ def resolve_field_byte_offset(ctx: &CodegenCtx, type_id: Int, idx: Int) -> Int
   end
 end
 
+def resolve_field_byte_size(ctx: &CodegenCtx, type_id: Int, idx: Int) -> Int
+  match ctx.type_field_sizes.get(type_id)
+  when Option::Some(sizes) then
+    if idx < sizes.len() then sizes[idx] else 8 end
+  when Option::None then 8
+  end
+end
+
 # Get the TypeId from a local's type, returns -1 if not a Named type.
 # Extract the TypeId from a type, unwrapping through Ref/RefMut
 def extract_named_type_id(ty: &Type) -> Int
@@ -1644,7 +1681,7 @@ def project_index_type(ctx: &CodegenCtx, ty: &Type) -> Type
   when Type::Slice(elem) then elem.clone()
   when Type::String then Type::Char
   when Type::Named(tid, args) then
-    let type_name = type_name_by_id(ctx, tid.id)
+    let type_name = bare_name_from_qualified(&type_name_by_id(ctx, tid.id))
     if (type_name == "Vec" || type_name == "Array") && !args.is_empty() then
       args[0].clone()
     else if (type_name == "Map" || type_name == "HashMap") && args.len() >= 2 then
@@ -1709,6 +1746,17 @@ def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: I
   end
 end
 
+def resolve_projected_field_size(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Int
+  let tid = extract_named_type_id(ty)
+  if tid >= 0 && downcast_disc >= 0 && is_enum_type_id(ctx, tid) then
+    8
+  else if tid >= 0 then
+    resolve_field_byte_size(ctx, tid, idx)
+  else
+    8
+  end
+end
+
 def local_type_id(fctx: &FnCodegenCtx, local_id: Int) -> Int
   for local in fctx.func.locals do
     if local.id.id == local_id then
@@ -1737,18 +1785,38 @@ def local_type(fctx: &FnCodegenCtx, local_id: Int) -> Type
   Type::Unit
 end
 
-def operand_type_id(fctx: &FnCodegenCtx, op: &MirOperand) -> Int
+def place_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, place: &Place) -> Type
+  mut current_ty = local_type(fctx, place.local.id)
+  mut downcast_disc = -1
+  for proj in place.projections do
+    match proj
+    when Projection::ProjDeref then
+      current_ty = project_deref_type(&current_ty)
+    when Projection::ProjDowncast(_, disc) then
+      downcast_disc = disc
+    when Projection::ProjField(_, idx) then
+      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+    when Projection::ProjIndex(_) then
+      current_ty = project_index_type(ctx, &current_ty)
+    when Projection::ProjConstantIndex(_) then
+      current_ty = project_index_type(ctx, &current_ty)
+    end
+  end
+  current_ty
+end
+
+def operand_type_id(ctx: &CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand) -> Int
   match op.kind
-  when MirOperandKind::MirCopy(place) then local_type_id(fctx, place.local.id)
-  when MirOperandKind::MirMovePlace(place) then local_type_id(fctx, place.local.id)
+  when MirOperandKind::MirCopy(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
+  when MirOperandKind::MirMovePlace(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
   when MirOperandKind::MirConstant(cst) then extract_named_type_id(&cst.ty)
   end
 end
 
-def operand_type(fctx: &FnCodegenCtx, op: &MirOperand) -> Type
+def operand_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand) -> Type
   match op.kind
-  when MirOperandKind::MirCopy(place) then local_type(fctx, place.local.id)
-  when MirOperandKind::MirMovePlace(place) then local_type(fctx, place.local.id)
+  when MirOperandKind::MirCopy(place) then place_type(ctx, fctx, &place)
+  when MirOperandKind::MirMovePlace(place) then place_type(ctx, fctx, &place)
   when MirOperandKind::MirConstant(cst) then cst.ty.clone()
   end
 end
@@ -1807,6 +1875,8 @@ end
 
 def is_heap_collection_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
+  when Type::Array(_, _) then
+    true
   when Type::Slice(_) then
     true
   when Type::Map(_, _) then
@@ -1814,7 +1884,7 @@ def is_heap_collection_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   when Type::Set(_) then
     true
   when Type::Named(tid, _) then
-    let type_name = type_name_by_id(ctx, tid.id)
+    let type_name = bare_name_from_qualified(&type_name_by_id(ctx, tid.id))
     type_name == "Vec" || type_name == "Array" ||
     type_name == "Map" || type_name == "HashMap" ||
     type_name == "Set" || type_name == "HashSet"
@@ -1828,7 +1898,7 @@ def deref_all_ref_like_args(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Ve
     return
   end
 
-  mut arg_ty = operand_type(fctx, &args[0])
+  mut arg_ty = operand_type(ctx, fctx, &args[0])
   while is_ref_like_type(&arg_ty) do
     emit_load_mem(ctx, rr, rr, 0)
     arg_ty = project_deref_type(&arg_ty)
@@ -1869,9 +1939,9 @@ def is_enum_type_id(ctx: &CodegenCtx, type_id: Int) -> Bool
 end
 
 def enum_type_id_for_operands(ctx: &CodegenCtx, fctx: &FnCodegenCtx, left: &MirOperand, right: &MirOperand) -> Int
-  let left_tid = operand_type_id(fctx, left)
+  let left_tid = operand_type_id(ctx, fctx, left)
   if is_enum_type_id(ctx, left_tid) then return left_tid end
-  let right_tid = operand_type_id(fctx, right)
+  let right_tid = operand_type_id(ctx, fctx, right)
   if is_enum_type_id(ctx, right_tid) then return right_tid end
   -1
 end
@@ -2130,6 +2200,14 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
   while i < projs.len() do
     let proj = projs[i]
     match proj
+    when Projection::ProjDeref then ()
+    when _ then
+      if is_ref_like_type(&current_ty) then
+        emit_load_mem(ctx, reg, reg, 0)
+        current_ty = project_deref_type(&current_ty)
+      end
+    end
+    match proj
     when Projection::ProjDeref then
       last_deref_unwrapped_ref = is_ref_like_type(&current_ty)
       emit_load_mem(ctx, reg, reg, 0)
@@ -2143,31 +2221,57 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       if is_heap_collection_type(ctx, &current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
       end
-      # Heap collections carry a header pointer in the value slot; index from
-      # the header's data pointer, not from the header itself.
       let idx_reg = scratch2_reg(ctx.target.arch)
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
-      # Multiply index by element size (8) using shift left 3
-      match idx_reg
-      when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
-      when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+      # Determine element size from the collection type.
+      # Strings use 1-byte characters; everything else uses 8-byte pointers/ints.
+      let is_byte_indexed = is_string_like_type(&current_ty)
+      if !is_byte_indexed then
+        # Multiply index by element size (8) using shift left 3
+        match idx_reg
+        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
+        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+        end
       end
       # Add scaled offset to base address
       emit_add_rrr(ctx, reg, reg, idx_reg)
-      emit_load_mem(ctx, reg, reg, 0)
+      if is_byte_indexed then
+        # Load a single byte (zero-extended to register)
+        match reg
+        when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+        when PhysReg::X64Reg(_) then emit_load_mem(ctx, reg, reg, 0)  # TODO: x86 MOVZX byte
+        end
+      else
+        emit_load_mem(ctx, reg, reg, 0)
+      end
       current_ty = project_index_type(ctx, &current_ty)
       last_deref_unwrapped_ref = false
     when Projection::ProjConstantIndex(ci) then
       if is_heap_collection_type(ctx, &current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
       end
-      let offset = ci * 8
-      emit_load_mem(ctx, reg, reg, offset as i32)
+      let is_byte_indexed = is_string_like_type(&current_ty)
+      if is_byte_indexed then
+        emit_add_ri(ctx, reg, ci as i32)
+        match reg
+        when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+        when PhysReg::X64Reg(_) then emit_load_mem(ctx, reg, reg, 0)  # TODO: x86 MOVZX byte
+        end
+      else
+        let offset = ci * 8
+        emit_load_mem(ctx, reg, reg, offset as i32)
+      end
       current_ty = project_index_type(ctx, &current_ty)
       last_deref_unwrapped_ref = false
     when Projection::ProjDowncast(name, disc) then
       downcast_disc = disc
       emit_add_ri(ctx, reg, 8)
+      # When downcast is the last projection, the MIR interpreter returns the
+      # payload VALUE, but the codegen has only computed the payload ADDRESS
+      # (base + 8).  Load the value so the semantics match.
+      if i == projs.len() - 1 then
+        emit_load_mem(ctx, reg, reg, 0)
+      end
       last_deref_unwrapped_ref = false
     end
     i = i + 1
@@ -2221,6 +2325,7 @@ end
 def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: PhysReg) -> Unit
   let fp = fp_reg(ctx.target.arch)
   let scratch = ret_reg(ctx.target.arch)
+  let place_ty = local_type(fctx, place.local.id)
   match fctx.var_locs.get(place.local.id)
   when Option::Some(loc) then
     if place.projections.is_empty() then
@@ -2250,12 +2355,20 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       end
 
       # Walk projections except last to compute base address
-      mut current_ty = local_type(fctx, place.local.id)
+      mut current_ty = place_ty
       mut downcast_disc = -1
       mut i = 0
       let n = place.projections.len()
       while i < n - 1 do
         let proj = place.projections[i]
+        match proj
+        when Projection::ProjDeref then ()
+        when _ then
+          if is_ref_like_type(&current_ty) then
+            emit_load_mem(ctx, base, base, 0)
+            current_ty = project_deref_type(&current_ty)
+          end
+        end
         match proj
         when Projection::ProjDeref then
           emit_load_mem(ctx, base, base, 0)
@@ -2294,6 +2407,14 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       # Last projection determines final store offset
       let last = place.projections[n - 1]
       mut store_off: i32 = 0
+      match last
+      when Projection::ProjDeref then ()
+      when _ then
+        if is_ref_like_type(&current_ty) then
+          emit_load_mem(ctx, base, base, 0)
+          current_ty = project_deref_type(&current_ty)
+        end
+      end
       match last
       when Projection::ProjDeref then
         store_off = 0
@@ -2633,8 +2754,8 @@ def codegen_binop(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: MirBinOp, left:
   load_operand(ctx, fctx, right, scratch)
 
   let is_float = is_float_operand(left, fctx) || is_float_operand(right, fctx)
-  let left_ty = operand_type(fctx, left)
-  let right_ty = operand_type(fctx, right)
+  let left_ty = operand_type(ctx, fctx, left)
+  let right_ty = operand_type(ctx, fctx, right)
   let left_is_string =
     is_string_operand(left, fctx) ||
     is_string_like_type(&left_ty) ||
@@ -2893,6 +3014,14 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
       let proj = place.projections[i]
       let is_last = i == n - 1
       match proj
+      when Projection::ProjDeref then ()
+      when _ then
+        if is_ref_like_type(&current_ty) then
+          emit_load_mem(ctx, dst, dst, 0)
+          current_ty = project_deref_type(&current_ty)
+        end
+      end
+      match proj
       when Projection::ProjDeref then
         if !is_last then
           emit_load_mem(ctx, dst, dst, 0)
@@ -2909,25 +3038,52 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         end
         current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
       when Projection::ProjIndex(local_id) then
+        let is_byte_indexed = is_string_like_type(&current_ty)
+        if is_heap_collection_type(ctx, &current_ty) then
+          emit_load_mem(ctx, dst, dst, 0)
+        end
         let idx_reg = scratch2_reg(ctx.target.arch)
         load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
-        match idx_reg
-        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
-        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+        if !is_byte_indexed then
+          match idx_reg
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+          end
         end
         emit_add_rrr(ctx, dst, dst, idx_reg)
         if !is_last then
-          emit_load_mem(ctx, dst, dst, 0)
+          if is_byte_indexed then
+            match dst
+            when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+            when PhysReg::X64Reg(_) then emit_load_mem(ctx, dst, dst, 0)
+            end
+          else
+            emit_load_mem(ctx, dst, dst, 0)
+          end
         end
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::ProjConstantIndex(ci) then
-        let offset = ci * 8
+        let is_byte_indexed = is_string_like_type(&current_ty)
+        if is_heap_collection_type(ctx, &current_ty) then
+          emit_load_mem(ctx, dst, dst, 0)
+        end
+        let offset = if is_byte_indexed then ci else ci * 8 end
         if is_last then
           if offset != 0 then
             emit_add_ri(ctx, dst, offset as i32)
           end
         else
-          emit_load_mem(ctx, dst, dst, offset as i32)
+          if is_byte_indexed then
+            if offset != 0 then
+              emit_add_ri(ctx, dst, offset as i32)
+            end
+            match dst
+            when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+            when PhysReg::X64Reg(_) then emit_load_mem(ctx, dst, dst, 0)
+            end
+          else
+            emit_load_mem(ctx, dst, dst, offset as i32)
+          end
         end
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::ProjDowncast(name, disc) then
@@ -2948,37 +3104,38 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   # so that for-loop iteration (ProjDeref + MirLen + ProjIndex) works correctly.
   match kind
   when AggregateKind::MirArray(_) then
-    let count = operands.len()
-    # 1. Allocate data buffer for elements
-    let data_size = if count > 0 then count * 8 else 8 end
-    emit_mov_ri(ctx, dst, data_size as i64)
-    emit_call_label(ctx, "_tg_bump_alloc")
-    # dst (x0/rax) = data buffer pointer
+    # Build array literals through the same runtime path used by Vec::new()+push.
+    # The manual header synthesis above can leave fixed-array values pointing at
+    # partially initialized storage when later loaded through the normal place path.
+    emit_call_label(ctx, "_tg_array_new")
+    emit_push(ctx, dst)
 
-    # 2. Store each operand into the data buffer
-    mut i = 0
     for op in operands do
       load_operand(ctx, fctx, &op, scratch)
-      emit_store_mem(ctx, dst, (i * 8) as i32, scratch)
-      i = i + 1
+      emit_load_mem(ctx, dst, sp, 0)
+      match ctx.target.arch
+      when Arch::AArch64 then
+        let elem = match scratch
+        when PhysReg::A64Reg(r) then r
+        when _ then A64::X1
+        end
+        if a64_code(elem) != a64_code(A64::X1) then
+          a64_mov_rr(&mut ctx.text, A64::X1, elem)
+        end
+      when Arch::X86_64 then
+        let elem = match scratch
+        when PhysReg::X64Reg(r) then r
+        when _ then X64::RSI
+        end
+        if x64_code(elem) != x64_code(X64::RSI) then
+          x64_mov_rr(&mut ctx.text, X64::RSI, elem)
+        end
+      end
+      emit_call_label(ctx, "_tg_array_push")
     end
 
-    # 3. Save data buffer pointer to FP-relative spill slot (safe across calls)
-    let spill_off = fctx.frame.spill_offset - 8
-    fctx.frame.spill_offset = spill_off
-    emit_store_mem(ctx, fp, spill_off, dst)
-
-    # 4. Allocate Vec header {data_ptr, len, cap}
-    emit_mov_ri(ctx, dst, 24)
-    emit_call_label(ctx, "_tg_bump_alloc")
-    # dst = Vec header pointer
-
-    # 5. Fill Vec header: data_ptr at +0, len at +8, cap at +16
-    emit_load_mem(ctx, scratch, fp, spill_off)
-    emit_store_mem(ctx, dst, 0, scratch)
-    emit_mov_ri(ctx, scratch, count as i64)
-    emit_store_mem(ctx, dst, 8, scratch)
-    emit_store_mem(ctx, dst, 16, scratch)
+    emit_load_mem(ctx, dst, sp, 0)
+    emit_pop(ctx, scratch)
     return
   when _ then ()
   end
@@ -3034,6 +3191,9 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   emit_mov_ri(ctx, dst, aligned as i64)
   emit_call_label(ctx, "_tg_bump_alloc")
   # After call: dst (x0/rax) = heap pointer to allocated memory
+  let base_off = fctx.frame.spill_offset - 8
+  fctx.frame.spill_offset = base_off
+  emit_store_mem(ctx, fp, base_off, dst)
 
   # Store each field at its proper offset
   let enum_discriminant = if type_id >= 0 && is_enum_type_id(ctx, type_id) && operands.len() > 0 then
@@ -3052,6 +3212,7 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   mut i = 0
   for op in operands do
     load_operand(ctx, fctx, op, scratch)
+    emit_load_mem(ctx, dst, fp, base_off)
     let field_off = if enum_discriminant >= 0 then
       if i == 0 then 0 else 8 + enum_field_offset_for_discriminant(ctx, type_id, enum_discriminant, i - 1) end
     else if has_layout then
@@ -3066,6 +3227,7 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
     emit_store_mem(ctx, dst, field_off as i32, scratch)
     i = i + 1
   end
+  emit_load_mem(ctx, dst, fp, base_off)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3232,6 +3394,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
       load_operand(ctx, fctx, arg, scratch)
       emit_push(ctx, scratch)
     end
+
     arg_idx = arg_idx + 1
   end
 
@@ -3245,15 +3408,6 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
       mut resolved_fn_name = fn_name.clone()
       if fn_name.len() > 1 && fn_name.slice(0, 1) == "." then
         resolved_fn_name = resolve_dot_method(ctx, fctx, &fn_name, args)
-        eprint("[dot-resolve] ")
-        eprint(fn_name)
-        eprint(" -> ")
-        eprint(resolved_fn_name)
-        eprint("\n")
-      else if fn_name == "is_empty" || fn_name == "keys" || fn_name == "insert" then
-        eprint("[bare-call] ")
-        eprint(fn_name)
-        eprint("\n")
       end
       let intr_name = bare_intrinsic_name(&resolved_fn_name)
       let is_explicit_intrinsic =
@@ -3275,7 +3429,15 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
       let force_intrinsic = is_explicit_intrinsic ||
         intr_name == "int_to_string" || intr_name == "uint_to_string" ||
         intr_name == "float_to_string" || intr_name == "bool_to_string" ||
+        intr_name == "char_to_string" ||
         intr_name == "str_to_string" || intr_name == "read_file_to_string_native"
+      let has_real_body =
+        ctx.extern_fns.contains(&resolved_fn_name) ||
+        ctx.reachable_fns.contains(&resolved_fn_name)
+      let fallback_clone_intrinsic =
+        !has_real_body &&
+        resolved_fn_name.len() >= 7 &&
+        resolved_fn_name.slice(resolved_fn_name.len() - 7, resolved_fn_name.len()) == "__clone"
       # Prefer calling compiled function bodies over intrinsic inlining.
       # If a function was compiled (is in reachable_fns), ALWAYS call it
       # directly — never fall through to the intrinsic/NOP path.
@@ -3285,6 +3447,8 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
         codegen_intrinsic(ctx, fctx, intr_name, args, resolved_fn_name)
       else if force_intrinsic then
         codegen_intrinsic(ctx, fctx, intr_name, args, resolved_fn_name)
+      else if fallback_clone_intrinsic then
+        codegen_intrinsic(ctx, fctx, "clone", args, resolved_fn_name)
       else if prefer_intrinsic && is_intrinsic(&intr_name) then
         codegen_intrinsic(ctx, fctx, intr_name, args, resolved_fn_name)
       else if ctx.extern_fns.contains(&resolved_fn_name) then
@@ -3344,10 +3508,10 @@ end
 def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, args: &Vec[MirOperand], orig_fn_name: String) -> Unit
   let arch = ctx.target.arch
   let rr = ret_reg(arch)
-  let receiver_ty = if args.len() > 0 then strip_ref_like_type(&operand_type(fctx, &args[0])) else Type::Unit end
+  let receiver_ty = if args.len() > 0 then strip_ref_like_type(&operand_type(ctx, fctx, &args[0])) else Type::Unit end
   let receiver_is_string = if args.len() > 0 then is_string_operand(&args[0], fctx) else false end
-  let receiver_is_string_like = if args.len() > 0 then is_string_like_type(&operand_type(fctx, &args[0])) else false end
-  let needle_ty = if args.len() > 1 then operand_type(fctx, &args[1]) else Type::Unit end
+  let receiver_is_string_like = if args.len() > 0 then is_string_like_type(&operand_type(ctx, fctx, &args[0])) else false end
+  let needle_ty = if args.len() > 1 then operand_type(ctx, fctx, &args[1]) else Type::Unit end
   let needle_value_ty = strip_ref_like_type(&needle_ty)
   let needle_is_ref = match needle_ty
     when Type::Ref(_, _) then true
@@ -3375,6 +3539,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     return
   end
   if name == "read_file_to_string_native" then
+    deref_all_ref_like_args(ctx, fctx, args, rr)
     # arg0 = path string pointer (already in rr from arg loading)
     emit_call_label(ctx, "_tg_read_file_to_string")
     return
@@ -3569,6 +3734,10 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     deref_all_ref_like_args(ctx, fctx, args, rr)
     codegen_bool_to_str(ctx)
 
+  else if name == "char_to_string" then
+    deref_all_ref_like_args(ctx, fctx, args, rr)
+    codegen_char_to_str(ctx)
+
   else if name == "str_to_string" then
     deref_all_ref_like_args(ctx, fctx, args, rr)
 
@@ -3576,7 +3745,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_string_from_bytes(ctx)
 
   else if name == "to_string" then
-    let arg_ty = if args.len() > 0 then operand_type(fctx, &args[0]) else Type::Unit end
+    let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_ref_like_type(&arg_ty)
     deref_all_ref_like_args(ctx, fctx, args, rr)
     match value_ty
@@ -3591,7 +3760,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
 
   # Method-receiver intrinsics: the argument is &self (a reference).
   else if name == "as_bytes" then
-    let arg_ty = if args.len() > 0 then operand_type(fctx, &args[0]) else Type::Unit end
+    let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     match value_ty
     when Type::String then
@@ -3600,7 +3769,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     when _ then deref_all_ref_like_args(ctx, fctx, args, rr)
     end
   else if name == "as_ptr" || name == "as_str" then
-    let arg_ty = if args.len() > 0 then operand_type(fctx, &args[0]) else Type::Unit end
+    let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     let is_string_receiver =
       is_string_like_type(&value_ty) ||
@@ -3621,7 +3790,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
 
   # String intrinsics
   else if name == "len" then
-    let arg_ty = if args.len() > 0 then operand_type(fctx, &args[0]) else Type::Unit end
+    let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     let is_pure_string =
       (match value_ty
@@ -3631,7 +3800,14 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       orig_fn_name == "String__len" ||
       orig_fn_name == "__intrinsic_string_len" ||
       orig_fn_name == "string_len"
-    let is_collection_receiver = is_heap_collection_type(ctx, &value_ty)
+    let is_collection_receiver =
+      is_heap_collection_type(ctx, &value_ty) ||
+      orig_fn_name == "Vec__len" ||
+      orig_fn_name == "Array__len" ||
+      orig_fn_name == "Map__len" ||
+      orig_fn_name == "Set__len" ||
+      orig_fn_name == "__intrinsic_array_len" ||
+      orig_fn_name == "array_len"
     if is_collection_receiver then
       # Vec/Map/Set/Slice — len is stored at offset 8 of the heap header
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
@@ -4418,11 +4594,7 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
 
   let fn_start = buf_pos(&ctx.text)
   ctx.debug_current_fn = func.name.clone()
-  eprint("[cgfn] ")
-  eprint(func.name)
-  eprint(" @ ")
-  eprint(fn_start.to_string())
-  eprint("\n")
+  println("[FN-OFF] " + fn_start.to_string() + " " + func.name.clone())
 
   # Emit function symbol
   add_symbol(&mut ctx.text, AsmSymbol {
@@ -4473,6 +4645,7 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
 
   # Detect Vec/Slice-typed statics — they need a pointer to a 24-byte struct
   let is_vec_type = match st.ty
+  when Type::Array(_, _) then true
   when Type::Slice(_) then true
   when _ then false
   end
@@ -4855,12 +5028,16 @@ def resolve_dot_method(ctx: &CodegenCtx, fctx: &FnCodegenCtx, fn_name: &String, 
   if args.len() == 0 then
     return method
   end
-  let recv_ty = strip_ref_like_type(&operand_type(fctx, &args[0]))
+  let recv_ty = strip_ref_like_type(&operand_type(ctx, fctx, &args[0]))
   match recv_ty
   when Type::Map(_, _) then "Map__" + method
   when Type::Set(_) then "Set__" + method
   when Type::Array(_, _) then "Vec__" + method
   when Type::Slice(_) then "Vec__" + method
+  when Type::Char then
+    if method == "to_string" then "__intrinsic_char_to_string"
+    else "Char__" + method
+    end
   when Type::String then "String__" + method
   when Type::Option(_) then "Option__" + method
   when Type::Result(_, _) then "Result__" + method
@@ -5039,6 +5216,7 @@ def is_intrinsic(name: &String) -> Bool
   if name == "uint_to_string" then return true end
   if name == "float_to_string" then return true end
   if name == "bool_to_string" then return true end
+  if name == "char_to_string" then return true end
   if name == "str_to_string" then return true end
   if name == "string_from_bytes" then return true end
   if name == "int_to_string_intrinsic" then return true end
@@ -6249,7 +6427,16 @@ def codegen_char_to_str(ctx: &mut CodegenCtx) -> Unit
     def_label(&mut ctx.text, lbl_ascii.clone())
     a64_mov_rr(&mut ctx.text, A64::X1, A64::X0)
 
-    # rdi = ptr. Use rcx as counter
+    # All branches packed UTF-8 bytes into X1. Allocate 8-byte buffer, store, return ptr.
+    def_label(&mut ctx.text, lbl_packed)
+    a64_stp_pre(&mut ctx.text, A64::X1, A64::XZR, A64::SP, -16)
+    a64_mov_ri(&mut ctx.text, A64::X0, 8)
+    emit_call_label(ctx, "_tg_bump_alloc")
+    a64_ldp_post(&mut ctx.text, A64::X1, A64::XZR, A64::SP, 16)
+    a64_stur(&mut ctx.text, A64::X1, A64::X0, 0)
+
+  when Arch::X86_64 then
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x7F)
     x64_jcc(&mut ctx.text, CC::LE, lbl_ascii.clone())
     x64_cmp_ri(&mut ctx.text, X64::RAX, 0x7FF)
     x64_jcc(&mut ctx.text, CC::LE, lbl_two.clone())
@@ -7088,7 +7275,6 @@ end
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, String]
   # Build type layout map and field layouts from MIR type definitions (single LayoutEngine pass)
-  println("[codegen_program] layout")
   let (type_layout, field_offsets, field_sizes) = build_all_layouts(&program.types)
   ctx.type_layout = type_layout
   ctx.type_field_offsets = field_offsets
@@ -7102,11 +7288,7 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
     tdi = tdi + 1
   end
 
-  # Dump layout table for debugging (controlled by env or unconditional during bootstrap)
-  dump_layout_table(&program.types, &ctx.type_layout, &ctx.type_field_offsets, &ctx.type_field_sizes)
-
   # Build set of extern function names (for call dispatch)
-  println("[codegen_program] externs")
   for func in program.functions do
     if func.is_extern then
       ctx.extern_fns.insert(func.name.clone())
@@ -7114,7 +7296,6 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   end
 
   # Compute reachable functions from main
-  println("[codegen_program] reachable")
   let reachable = compute_reachable(program)
   ctx.reachable_fns = reachable.clone()
 
@@ -7122,7 +7303,6 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   # This resolves label mismatches where MIR call refs use bare names (e.g., "read_all")
   # but function bodies are emitted with mangled names (e.g., "File__read_all").
   # First, collect all real function names so we never shadow them with aliases.
-  println("[codegen_program] aliases")
   mut real_fn_names: Set[String] = Set::new()
   for func in program.functions do
     real_fn_names.insert(func.name.clone())
@@ -7141,7 +7321,6 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   end
 
   # Emit all statics
-  println("[codegen_program] statics")
   for st in program.statics do
     codegen_static(ctx, st)
   end
@@ -7151,7 +7330,6 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   # Build set of functions with compiled bodies (non-extern, has blocks)
   # This is used by codegen_call to prefer direct calls over intrinsic inlining
   mut has_body_fns: Set[String] = Set::new()
-  println("[codegen_program] body-set")
   for func in program.functions do
     let is_closure = func.name.starts_with("_closure")
     let should_emit = reachable.contains(&func.name) || func.name == "_start" || func.is_extern || is_closure
@@ -7161,7 +7339,6 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   end
   ctx.reachable_fns = has_body_fns.clone()
 
-  println("[codegen_program] bodies")
   for func in program.functions do
     # Emit if: reachable OR _start OR extern OR closure (closures are always emitted when present)
     let is_closure = func.name.starts_with("_closure")
@@ -7170,11 +7347,9 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
       codegen_function(ctx, func)
     end
   end
-  println("[codegen_program] enum-helpers")
   emit_pending_enum_eq_helpers(ctx)
 
   # Emit runtime helper functions
-  println("[codegen_program] runtime-helpers")
   emit_runtime_str_concat(ctx)
   emit_runtime_str_chars(ctx)
   
@@ -7183,58 +7358,29 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   # text section.  This avoids interpreter issues with nested &mut references
   # through the RuntimeEmitCtx wrapper and is also the standard pattern for
   # separate compilation units that are linked together.
-  println("[codegen_program] runtime-lib")
   mut runtime_ctx = runtime_ctx_new(ctx.target.clone())
   emit_all_runtime(&mut runtime_ctx)
-
-  # Debug: check labels BEFORE merge
-  match ctx.text.labels.get("_tg_array_new")
-  end
-  match runtime_ctx.text.labels.get("_tg_array_new")
-  end
-
-  println("[codegen_program] merge-runtime")
   merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
-
-  # Debug: check key labels before fixup resolution
-  match ctx.text.labels.get("_tg_array_new")
-  end
-  match ctx.text.labels.get("_tg_bump_alloc")
-  end
-  match ctx.text.labels.get("_tg_map_new")
-  end
 
   # Emit stub function bodies for referenced-but-uncompiled labels.
   # These are intrinsics or unreachable functions whose addresses are taken
   # (via MirFnItem in assignments) but have no real body.
   # Emitting a simple RET stub prevents unresolved label errors at fixup.
-  mut stub_count = 0
-  mut stub_report = ""
-  println("[codegen_program] stub-fixups")
   mut fi = 0
   while fi < ctx.text.fixups.len() do
     let f = ctx.text.fixups[fi]
     match ctx.text.labels.get(f.label)
     when Option::None then
       # Label not defined yet — emit a stub function (just RET)
-      if stub_report.len() > 0 then
-        stub_report = stub_report + ", "
-      end
-      stub_report = stub_report + f.label.clone()
       align_to(&mut ctx.text, 4, ctx.target.arch)
       def_label(&mut ctx.text, f.label.clone())
       emit_ret(ctx)
-      stub_count = stub_count + 1
     when Option::Some(_) then ()
     end
     fi = fi + 1
   end
-  if stub_count > 0 then
-    println("[codegen_program] stub-count=" + stub_count.to_string() + " labels=[" + stub_report + "]")
-  end
 
   # Resolve local branch fixups
-  println("[codegen_program] resolve-fixups")
   match resolve_fixups(&mut ctx.text)
   when Result::Ok(_) then Result::Ok(())
   when Result::Err(e) then Result::Err("codegen fixup error: " + e)
@@ -7431,14 +7577,12 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def generate_native(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
-  println("[native] codegen_program")
   mut ctx = codegen_new(target)
   codegen_program(&mut ctx, program)
 
   # Reserve 16 bytes in .data for saved argc/argv so the runtime can
   # read them via tg_get_argc / tg_get_argv after the entry point
   # stores the real values at program start.
-  println("[native] argc_argv")
   emit_argc_argv_data(&mut ctx)
 
   # Combine text symbols with data, rodata, and BSS symbols so the
@@ -7494,15 +7638,14 @@ def generate_native(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
     bss_size: ctx.bss_size,
     symbols: all_symbols,
     relocations: ctx.text.relocations.clone(),
+    data_relocations: ctx.data.relocations.clone(),
     target: ctx.target
   }
 
-  println("[native] build_object")
   build_object(&obj)
 end
 
 def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: String) -> Result[Unit, String]
-  println("[native-exe] codegen_program")
   mut ctx = codegen_new(target)
   match codegen_program(&mut ctx, program)
   when Result::Err(e) then
@@ -7511,7 +7654,6 @@ def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: S
   end
 
   # Reserve 16 bytes in .data for saved argc/argv
-  println("[native-exe] argc_argv")
   emit_argc_argv_data(&mut ctx)
 
   # Combine symbols from all sections + convert labels to symbols for cross-section refs
@@ -7565,6 +7707,7 @@ def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: S
     bss_size: ctx.bss_size,
     symbols: all_symbols,
     relocations: ctx.text.relocations.clone(),
+    data_relocations: ctx.data.relocations.clone(),
     target: target.clone()
   }
 
@@ -7581,11 +7724,11 @@ def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: S
   let input = LinkerInput {
     objects: objects,
     entry: entry.to_string(),
+    entry_offset: -1,
     output: output_path,
     target: target.clone()
   }
 
-  println("[native-exe] link")
   let link_result = link_executable(&input)
   link_result
 end

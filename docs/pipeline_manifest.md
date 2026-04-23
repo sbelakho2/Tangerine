@@ -152,15 +152,33 @@ No fallback paths bypass normal stages in the bootstrap subset.
 
 ## Stage0 (Swift) Bootstrap Pipeline
 
-The stage0 Swift compiler currently implements a subset of the full pipeline:
+The stage0 Swift compiler implements the self-hosted bootstrap pipeline:
 
-| # | Stage | Status | File |
-|---|-------|--------|------|
-| 1 | Lexing | IMPLEMENTED | Lexer.swift |
-| 2 | Parsing | IMPLEMENTED | Parser.swift |
-| 2.5 | Subset Check | IMPLEMENTED | SubsetChecker.swift |
-| 3-13 | All other stages | NOT IMPLEMENTED | — |
+| # | Stage | Status | File | Description |
+|---|-------|--------|------|-------------|
+| 1 | Lexing | ✅ IMPLEMENTED | Lexer.swift | Token stream from source text |
+| 2 | Parsing | ✅ IMPLEMENTED | Parser.swift | AST from tokens |
+| 2.5 | Subset Check | ✅ IMPLEMENTED | SubsetChecker.swift | Validates bootstrap subset |
+| 3 | MIR Lowering | ✅ IMPLEMENTED | MIRLowering.swift | AST → MIR (control-flow graph) |
+| 4 | MIR Interpretation | ✅ IMPLEMENTED | MIRInterpreter.swift | Executes MIR directly |
+| 5 | Bootstrap Profiling | ✅ IMPLEMENTED | BootstrapProfile.swift | Minimal stdlib for self-host |
+| 6 | Self-Host Execution | ✅ IMPLEMENTED | main.swift (cmdSelfHost) | Interprets compiler to compile itself |
+| 7 | Native Compilation | ✅ IMPLEMENTED | main.swift (cmdCompile) | Interpreted compiler emits Mach-O/ELF |
 
-The stage0 compiler is a parse-and-check tool. It validates that .tg source files
-conform to the stabilized language subset. Further pipeline stages will be added
-as the stabilization process progresses.
+### Stage0 Pipeline Commands
+
+| Command | Pipeline Stages | Description |
+|---------|----------------|-------------|
+| `lex <file>` | 1 | Lex only |
+| `parse <file>` | 1–2 | Parse and print summary |
+| `check <file>` | 1–2.5 | Parse + subset check |
+| `lower <file>` | 1–3 | Parse + lower to MIR |
+| `interpret <file>` | 1–4 | Full interpret pipeline |
+| `selfhost` | 1–6 | Self-hosted bootstrap (release build required) |
+| `compile <file>` | 1–7 | Compile .tg to native binary |
+
+### Build Requirements
+
+**IMPORTANT**: The `selfhost` and `compile` commands require a **release build** (`swift build -c release`).
+The debug build is too slow for the MIR interpreter, which needs to execute ~3000+ functions.
+Use `make release` or `make selfhost` from the `stage0_swift/` directory.

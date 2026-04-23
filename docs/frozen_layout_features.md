@@ -55,7 +55,7 @@ All pointer and reference types are 8 bytes on LP64 targets.
 - Frozen since v0.1
 
 ### F5: Function Type
-- Function/closure: 16 bytes (fn pointer + env pointer)
+- Function/closure: 8 bytes (raw fn pointer, no env pointer)
 - Frozen since v0.1
 
 ### F6: Zero-Sized Types

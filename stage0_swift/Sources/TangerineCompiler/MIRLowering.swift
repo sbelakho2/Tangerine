@@ -11,6 +11,8 @@ public final class MIRLowering {
     private var functions: [MirFunction] = []
     private var statics: [MirStatic] = []
     private var typeDefs: [MirTypeDef] = []
+    private var typeDefByName: [String: MirTypeDef] = [:]
+    private var variantCache: [String: (MirTypeDef, Int)] = [:]  // "TypeName::VariantName" → (def, idx)
     public private(set) var errors: [String] = []
     private var currentSelfType: String?
     private let rootModulePath: [String]
@@ -31,6 +33,10 @@ public final class MIRLowering {
     private var loopBreakTargets: [BlockId] = []
     private var loopContinueTargets: [BlockId] = []
 
+    // Function resolution cache: name → resolved name
+    private var fnCache: [String: String] = [:]
+    private var functionReturnTypes: [String: MirType] = [:]
+
     public init(moduleName: String? = nil) {
         let initialPath = moduleName.map { [$0] } ?? []
         self.rootModulePath = initialPath
@@ -40,6 +46,38 @@ public final class MIRLowering {
     /// Pre-load type definitions from other modules for cross-file enum resolution
     public func preloadTypes(_ types: [MirTypeDef]) {
         typeDefs.append(contentsOf: types)
+        rebuildTypeCache()
+    }
+
+    /// Rebuild the type definition lookup caches for O(1) resolution.
+    private func rebuildTypeCache() {
+        typeDefByName.removeAll(keepingCapacity: true)
+        variantCache.removeAll(keepingCapacity: true)
+        for td in typeDefs {
+            // Index by exact name
+            typeDefByName[td.name] = td
+            // Also index by bare name (last segment) if unambiguous
+            let bareName = typeNameParts(td.name).last ?? td.name
+            if typeDefByName[bareName] == nil {
+                typeDefByName[bareName] = td
+            }
+            // Build variant cache for enums
+            if case .enumDef(let variants) = td.kind {
+                for (idx, variant) in variants.enumerated() {
+                    let key = "\(td.name)::\(variant.0)"
+                    variantCache[key] = (td, idx)
+                    // Also cache by bare type name
+                    let bareKey = "\(bareName)::\(variant.0)"
+                    if variantCache[bareKey] == nil {
+                        variantCache[bareKey] = (td, idx)
+                    }
+                    // Cache variant name alone (for unqualified resolution)
+                    if variantCache[variant.0] == nil {
+                        variantCache[variant.0] = (td, idx)
+                    }
+                }
+            }
+        }
     }
 
     private func resetModulePath() {
@@ -158,7 +196,117 @@ public final class MIRLowering {
         return types
     }
 
+    private func collectFunctionReturnTypes(_ items: [Item]) {
+        for item in items {
+            switch item.kind {
+            case .function(let fn):
+                functionReturnTypes[fn.sig.name] = fn.sig.returnType.map(lowerTypeExpr) ?? .unit
+            case .moduleDef(let d):
+                pushModule(d.name)
+                if let children = d.items {
+                    collectFunctionReturnTypes(children)
+                }
+                popModule()
+            case .implBlock(let d):
+                let previousSelfType = currentSelfType
+                currentSelfType = d.targetType
+                for method in d.methods {
+                    functionReturnTypes["\(d.targetType)::\(method.sig.name)"] = method.sig.returnType.map(lowerTypeExpr) ?? .unit
+                }
+                currentSelfType = previousSelfType
+            default:
+                break
+            }
+        }
+    }
+
+    private func functionAliases(for qualified: String) -> [String] {
+        let parts = qualified.split(separator: ":", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count >= 2 else { return [] }
+
+        let member = parts.last!
+        let owner = parts.dropLast().joined(separator: "::")
+
+        switch owner {
+        case "Vec":
+            return ["Array::\(member)"]
+        case "Array":
+            return ["Vec::\(member)"]
+        case "HashMap":
+            return ["Map::\(member)"]
+        case "Map":
+            return ["HashMap::\(member)"]
+        case "HashSet":
+            return ["Set::\(member)"]
+        case "Set":
+            return ["HashSet::\(member)"]
+        default:
+            return []
+        }
+    }
+
+    private func lookupFunctionReturnType(_ name: String) -> MirType? {
+        if let ret = functionReturnTypes[name] {
+            return ret
+        }
+
+        let resolvedName = resolveFunctionName(name)
+        if let ret = functionReturnTypes[resolvedName] {
+            return ret
+        }
+
+        for alias in functionAliases(for: name) {
+            if let ret = functionReturnTypes[alias] {
+                return ret
+            }
+        }
+
+        return nil
+    }
+
+    private func inferDirectCallResultType(_ callee: Expr, loweredCallee: MirOperand? = nil) -> MirType {
+        switch callee {
+        case .name(let name, _):
+            if let id = lookupScope(name), case .fn(_, let retType) = locals[id].type {
+                return retType
+            }
+            return lookupFunctionReturnType(name) ?? .unknown
+        case .path(let lhs, let rhs, _):
+            return lookupFunctionReturnType("\(lhs)::\(rhs)") ?? .unknown
+        default:
+            if let loweredCallee,
+               let calleeType = operandType(loweredCallee),
+               case .fn(_, let retType) = calleeType {
+                return retType
+            }
+            return .unknown
+        }
+    }
+
+    private func inferMethodCallResultType(receiverType: MirType?, methodName: String) -> MirType {
+        if let typeName = extractTypeName(receiverType),
+           let retType = lookupFunctionReturnType("\(typeName)::\(methodName)") {
+            return retType
+        }
+
+        switch methodName {
+        case "clone":
+            return receiverType ?? .unknown
+        case "len", "capacity":
+            return .int
+        case "is_empty", "contains", "contains_key", "is_some", "is_none", "is_ok", "is_err", "starts_with", "ends_with":
+            return .bool
+        case "to_string", "fmt":
+            return .string
+        default:
+            return .unknown
+        }
+    }
+
     public func lower(_ program: Program) -> MirProgram {
+        resetModulePath()
+        functionReturnTypes.removeAll(keepingCapacity: true)
+        collectFunctionReturnTypes(program.items)
         resetModulePath()
         for item in program.items {
             lowerItem(item)
@@ -186,9 +334,28 @@ public final class MIRLowering {
                                       initializer: evalConstant(d.value), isMutable: d.isMutable))
         case .structDef(let d):
             let fields = d.fields.map { ($0.name, lowerTypeExpr($0.type)) }
-            typeDefs.append(MirTypeDef(name: qualifiedTypeName(d.name), kind: .structDef(fields: fields)))
+            let td = MirTypeDef(name: qualifiedTypeName(d.name), kind: .structDef(fields: fields))
+            typeDefs.append(td)
+            typeDefByName[td.name] = td
         case .enumDef(let d):
+            let beforeCount = typeDefs.count
             appendEnumTypeDefs(d, to: &typeDefs)
+            // Rebuild cache for new enum types (including variants)
+            if typeDefs.count > beforeCount {
+                for i in beforeCount..<typeDefs.count {
+                    let td = typeDefs[i]
+                    typeDefByName[td.name] = td
+                    if case .enumDef(let variants) = td.kind {
+                        let bareName = typeNameParts(td.name).last ?? td.name
+                        for (idx, variant) in variants.enumerated() {
+                            variantCache["\(td.name)::\(variant.0)"] = (td, idx)
+                            if variantCache[variant.0] == nil { variantCache[variant.0] = (td, idx) }
+                            let bareKey = "\(bareName)::\(variant.0)"
+                            if variantCache[bareKey] == nil { variantCache[bareKey] = (td, idx) }
+                        }
+                    }
+                }
+            }
         case .moduleDef(let d):
             pushModule(d.name)
             for child in d.items ?? [] { lowerItem(child) }
@@ -261,6 +428,7 @@ public final class MIRLowering {
                                  locals: locals, blocks: blocks, entryBlock: entry,
                                  isAsync: fn.sig.isAsync)
         functions.append(mirFn)
+        fnCache.removeAll()  // Invalidate cache when functions are added
     }
 
     // MARK: - Block lowering
@@ -450,7 +618,8 @@ public final class MIRLowering {
             if case .field(let base, let methodName, _) = callee {
                 let baseOp = lowerExpr(base)
                 let argOps = [baseOp] + args.map { lowerExpr($0.value) }
-                let result = freshTemp()
+                let resultType = inferMethodCallResultType(receiverType: operandType(baseOp), methodName: methodName)
+                let result = freshTemp(type: resultType)
                 let nextBB = freshBlock()
                 terminateWith(.call(dest: .local(result),
                                     callee: .constant(.fnItem(".\(methodName)")),
@@ -470,9 +639,16 @@ public final class MIRLowering {
 
                 return .copy(.local(result))
             }
+            if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
+                let argOps = args.map { lowerExpr($0.value) }
+                let result = freshTemp(type: .named(ctor.typeName))
+                emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
+                return .copy(.local(result))
+            }
             let calleeOp = lowerExpr(callee)
             let argOps = args.map { lowerExpr($0.value) }
-            let result = freshTemp()
+            let resultType = inferDirectCallResultType(callee, loweredCallee: calleeOp)
+            let result = freshTemp(type: resultType)
             let nextBB = freshBlock()
             terminateWith(.call(dest: .local(result), callee: calleeOp, args: argOps,
                                 next: nextBB, unwind: nil))
@@ -757,17 +933,23 @@ public final class MIRLowering {
 
     /// Resolve a possibly module-qualified type name (e.g. "app::Event") against typeDefs.
     private func resolveTypeDef(_ typeName: String) -> MirTypeDef? {
-        // Try exact match first
-        if let td = typeDefs.first(where: { $0.name == typeName }) { return td }
+        // Fast path: cache lookup (O(1))
+        if let td = typeDefByName[typeName] { return td }
+
         let requestedParts = typeNameParts(typeName)
         let bareName = requestedParts.last ?? typeName
 
+        // Try bare name in cache
+        if bareName != typeName, let td = typeDefByName[bareName] { return td }
+
+        // Try module-qualified candidates in cache
         for candidate in moduleQualifiedTypeNames(for: bareName) {
-            if let td = typeDefs.first(where: { $0.name == candidate }) {
+            if let td = typeDefByName[candidate] {
                 return td
             }
         }
 
+        // Slow path: linear scan with type name matching (only if cache misses)
         var matches = typeDefs.filter { typeNameMatches(typeName, actual: $0.name) }
         if matches.isEmpty {
             matches = typeDefs.filter {
@@ -935,9 +1117,6 @@ public final class MIRLowering {
                 return .named(payloadTd.name)
             }
             let fields = variants[variantIndex].1
-            if fields.count == 1 {
-                return fields[0]
-            }
             return .tuple(fields)
         }
     }
@@ -964,6 +1143,17 @@ public final class MIRLowering {
                                                expectedFieldCount: expectedFieldCount,
                                                allowExtraFields: allowExtraFields) {
                 return match
+            }
+        }
+        // Fast path: check unqualified variant cache
+        if let cached = variantCache[variantName] {
+            if let expectedFieldCount {
+                let actualFields = variantFieldCount(cached)
+                if allowExtraFields ? actualFields >= expectedFieldCount : actualFields == expectedFieldCount {
+                    return cached
+                }
+            } else {
+                return cached
             }
         }
         // Fallback: only succeed if the variant resolves uniquely across all enums.
@@ -1034,6 +1224,33 @@ public final class MIRLowering {
     private func resolveNamedVariant(_ typeName: String, variantName: String,
                                      expectedFieldCount: Int? = nil,
                                      allowExtraFields: Bool = false) -> (MirTypeDef, Int)? {
+        // Fast path: cache lookup (O(1))
+        let cacheKey = "\(typeName)::\(variantName)"
+        if let cached = variantCache[cacheKey] {
+            if let expectedFieldCount {
+                let actualFields = variantFieldCount(cached)
+                if allowExtraFields ? actualFields >= expectedFieldCount : actualFields == expectedFieldCount {
+                    return cached
+                }
+            } else {
+                return cached
+            }
+        }
+        // Also try bare type name in cache
+        let bareName = typeNameParts(typeName).last ?? typeName
+        let bareKey = "\(bareName)::\(variantName)"
+        if bareKey != cacheKey, let cached = variantCache[bareKey] {
+            if let expectedFieldCount {
+                let actualFields = variantFieldCount(cached)
+                if allowExtraFields ? actualFields >= expectedFieldCount : actualFields == expectedFieldCount {
+                    return cached
+                }
+            } else {
+                return cached
+            }
+        }
+
+        // Slow path: linear scan (only if cache misses)
         var matchesByKey: [String: (MirTypeDef, Int)] = [:]
         for td in typeDefs {
             guard typeNameMatches(typeName, actual: td.name),
@@ -1046,7 +1263,6 @@ public final class MIRLowering {
         let matches = filterVariantMatches(Array(matchesByKey.values), expectedFieldCount: expectedFieldCount,
                                            allowExtraFields: allowExtraFields)
 
-        let bareName = typeNameParts(typeName).last ?? typeName
         for candidate in moduleQualifiedTypeNames(for: bareName) {
             if let match = matches.first(where: { $0.0.name == candidate }) {
                 return match
@@ -1060,6 +1276,28 @@ public final class MIRLowering {
             }
         }
         return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func resolveVariantConstructor(_ expr: Expr, argCount: Int) -> (typeName: String, variantIdx: Int)? {
+        switch expr {
+        case .name(let name, _):
+            guard name.contains("::") else { return nil }
+            let parts = typeNameParts(name)
+            guard parts.count >= 2 else { return nil }
+            let enumName = parts.dropLast().joined(separator: "::")
+            let variantName = parts.last!
+            guard let match = resolveNamedVariant(enumName, variantName: variantName, expectedFieldCount: argCount) else {
+                return nil
+            }
+            return (match.0.name, match.1)
+        case .path(let typeName, let variantName, _):
+            guard let match = resolveNamedVariant(typeName, variantName: variantName, expectedFieldCount: argCount) else {
+                return nil
+            }
+            return (match.0.name, match.1)
+        default:
+            return nil
+        }
     }
 
     /// Extract enum type hint from a list of patterns (scan for any qualified variant)
@@ -1160,7 +1398,7 @@ public final class MIRLowering {
             let inner = freshTemp()
             emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(idx)])))))
             var subResult: MirOperand = .constant(.bool(true))
-            if subPats.count == 1 && variantFieldCount(variantMatch) == 1 {
+            if subPats.count == 1 {
                 subResult = lowerPatternTest(subPats[0], value: .copy(.local(inner)))
             } else {
                 for (i, pat) in subPats.enumerated() {
@@ -1255,7 +1493,7 @@ public final class MIRLowering {
                 let variantIdx = variantMatch.1
                 let inner = freshTemp()
                 emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
-                if fields.count == 1 && variantFieldCount(variantMatch) == 1 {
+                if fields.count == 1 {
                     lowerPatternBind(fields[0], value: .copy(.local(inner)), enumHint: enumHint)
                 } else {
                     for (i, pat) in fields.enumerated() {
@@ -1307,26 +1545,21 @@ public final class MIRLowering {
         let iterableOp = lowerExpr(forE.iterable)
         let iterableLocal = placeOf(iterableOp)
 
-        // Propagate the iterable's type to the iterator local so that codegen's
-        // ProjIndex handler can recognise heap collections (Vec, Map, Set, etc.)
-        // and emit the data-pointer load from the collection header.
+        // Copy the iterable directly into the iterator local (identity .iter()).
+        // Using a direct assignment avoids a function-call stub that would lose
+        // the multi-word Vec/Map header (only 8 bytes survive a register return).
         let iterType = operandType(.copy(.local(iterableLocal))) ?? .unknown
         let iterLocal = freshTemp(type: iterType)
-        let iterBB = freshBlock()
-        terminateWith(.call(dest: .local(iterLocal), callee: .constant(.fnItem(".iter")),
-                            args: [.copy(.local(iterableLocal))], next: iterBB, unwind: nil))
-        currentBlock = iterBB
+        emit(.assign(.local(iterLocal), .use(.copy(.local(iterableLocal)))))
 
         // Index variable: mut _idx = 0
         let idxLocal = freshTemp()
         emit(.assign(.local(idxLocal), .use(.constant(.int(0)))))
 
-        // Length of collection
+        // Length of collection — use MirLen rvalue so codegen reads the len
+        // field directly from the collection header without an extra deref.
         let lenLocal = freshTemp()
-        let lenBB = freshBlock()
-        terminateWith(.call(dest: .local(lenLocal), callee: .constant(.fnItem(".len")),
-                            args: [.copy(.local(iterLocal))], next: lenBB, unwind: nil))
-        currentBlock = lenBB
+        emit(.assign(.local(lenLocal), .len(.local(iterLocal))))
 
         let condBB = freshBlock()
         let bodyBB = freshBlock()
@@ -1474,6 +1707,7 @@ public final class MIRLowering {
         let mirFn = MirFunction(name: closureName, params: allParams, returnType: retType,
                                  locals: locals, blocks: blocks, entryBlock: entry)
         functions.append(mirFn)
+        fnCache.removeAll()  // Invalidate cache when functions are added
 
         // Restore state
         blocks = savedBlocks; locals = savedLocals
@@ -1715,10 +1949,15 @@ public final class MIRLowering {
     }
 
     /// Resolve a bare function name to its fully qualified name.
-    /// First checks if the name is already qualified (contains ::).
-    /// Then searches all lowered functions for a matching bare name.
-    /// Falls back to the original name if no match found.
+    /// Uses caching for performance - scans functions only once per unique name.
     private func resolveFunctionName(_ name: String) -> String {
+        // Check cache first
+        if let cached = fnCache[name] {
+            return cached
+        }
+
+        let result: String
+
         func hasFunction(named candidate: String) -> Bool {
             for fn in functions {
                 if fn.name == candidate {
@@ -1757,49 +1996,33 @@ public final class MIRLowering {
         // impls are defined on Array/Map while source frequently calls Vec/HashMap.
         if name.contains("::") {
             if hasFunction(named: name) {
-                return name
+                result = name
+            } else {
+                result = qualifiedAliases(for: name).first { hasFunction(named: $0) } ?? name
             }
-            for alias in qualifiedAliases(for: name) {
-                if hasFunction(named: alias) {
-                    return alias
-                }
-            }
-            return name
-        }
-        
-        // Search existing functions for a matching bare name.
-        // Two-pass: prefer exact match over qualified/mangled suffix match.
-        for fn in functions {
-            if fn.name == name {
-                return fn.name
-            }
-        }
-        // Second pass: try qualified suffix matches
-        for fn in functions {
-            let fnName = fn.name
-            // Match bare name (last segment after ::)
-            if fnName.hasSuffix("::" + name) {
-                return fnName
-            }
-            // Match Type__method mangled name
-            if fnName.hasSuffix("__" + name) {
-                return fnName
-            }
-        }
-        
-        // Search type definitions for methods
-        for td in typeDefs {
-            // Check for methods like TypeName::method
-            let qualifiedMethod = td.name + "::" + name
-            for fn in functions {
-                if fn.name == qualifiedMethod {
-                    return qualifiedMethod
+        } else {
+            // Search existing functions for a matching bare name.
+            // Two-pass: prefer exact match over qualified/mangled suffix match.
+            if let exactMatch = functions.first(where: { $0.name == name }) {
+                result = exactMatch.name
+            } else {
+                // Second pass: try qualified suffix matches
+                let suffix = "::" + name
+                let mangleSuffix = "__" + name
+                if let suffixMatch = functions.first(where: { $0.name.hasSuffix(suffix) || $0.name.hasSuffix(mangleSuffix) }) {
+                    result = suffixMatch.name
+                } else {
+                    // Search type definitions for methods
+                    result = typeDefs.first { td in
+                        functions.contains { $0.name == td.name + "::" + name }
+                    }.map { $0.name + "::" + name } ?? name
                 }
             }
         }
-        
-        // Fall back to original name - it may be an intrinsic or extern
-        return name
+
+        // Cache the result
+        fnCache[name] = result
+        return result
     }
 
     /// Parse an integer literal string, supporting hex (0x), binary (0b), octal (0o),

@@ -30,10 +30,6 @@ public struct BootstrapProfile {
             reason: "Foundational types: Option, Result, Bool, Int, String, fundamental traits"),
         ProfileEntry(file: "alloc.tg",
             reason: "Memory allocation primitives needed by collections and compiler runtime"),
-        ProfileEntry(file: "args.tg",
-            reason: "Command-line argument access for the compiler driver entrypoint"),
-        ProfileEntry(file: "bench.tg",
-            reason: "Benchmark subcommand support used by the compiler driver"),
         ProfileEntry(file: "collections.tg",
             reason: "Vec, Map, Set — compiler data structures for AST, symbol tables, IR"),
         ProfileEntry(file: "ffi.tg",
@@ -42,16 +38,8 @@ public struct BootstrapProfile {
             reason: "Display/Debug traits, formatting — compiler diagnostic rendering"),
         ProfileEntry(file: "fs.tg",
             reason: "Source loading and file output used by compiler commands and tooling modules"),
-        ProfileEntry(file: "gfx_errors.tg",
-            reason: "Shared error model required by filesystem helpers in the bootstrap profile"),
         ProfileEntry(file: "io.tg",
             reason: "File reading, stdout/stderr — compiler I/O for source loading and output"),
-        ProfileEntry(file: "process.tg",
-            reason: "Process control, exit codes — compiler driver exit handling"),
-        ProfileEntry(file: "env.tg",
-            reason: "Environment variables — compiler configuration via env"),
-        ProfileEntry(file: "time.tg",
-            reason: "Timing primitives required by benchmarking and build metadata paths"),
     ]
 
     /// File names in the minimal bootstrap profile.

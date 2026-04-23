@@ -55,7 +55,7 @@ These values MUST NOT change. Any bug in these values is a bug in the layout eng
 | Box[T] | 8 |
 | *const T | 8 |
 | *mut T | 8 |
-| fn() | 16 (fn ptr + env) |
+| fn() | 8 |
 
 ## F5: Fat Pointer Layout (FROZEN)
 

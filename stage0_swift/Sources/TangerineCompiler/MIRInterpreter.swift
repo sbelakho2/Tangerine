@@ -14,6 +14,8 @@ public final class MIRInterpreter {
     public var runtimeArgs: [String] = ["tg", "compile", "--help"]
     public var maxSteps: Int = 2_000_000_000
     private var stepCount: Int = 0
+    private let progressReportInterval: Int
+    private var nextProgressReportStep: Int = .max
 
     private var halted: Bool = false
     private var runtimeError: String?
@@ -59,6 +61,23 @@ public final class MIRInterpreter {
         var hasPending: Bool = false
     }
 
+    private struct CallSiteKey: Hashable {
+        let functionIdx: Int
+        let blockId: BlockId
+        let stmtIndex: Int
+    }
+
+    private struct StaticMethodCallSiteKey: Hashable {
+        let site: CallSiteKey
+        let receiverType: String
+    }
+
+    private enum EnumPayloadShape {
+        case unit
+        case namedStruct
+        case unnamed(Int)
+    }
+
     // Deferred user-function call state (set by dispatchCall, consumed by trampoline)
     private var hasDeferredCall = false
     private var deferredFnIdx: Int = -1
@@ -67,6 +86,12 @@ public final class MIRInterpreter {
     public init(program: MirProgram, enableTrace: Bool = false) {
         self.program = program
         self.enableTrace = enableTrace
+        if let rawInterval = ProcessInfo.processInfo.environment["TG_INTERPRETER_PROGRESS_INTERVAL"],
+           let interval = Int(rawInterval), interval > 0 {
+            self.progressReportInterval = interval
+        } else {
+            self.progressReportInterval = 0
+        }
         // Build function name → array index for O(1) lookups
         var idx: [String: Int] = [:]
         idx.reserveCapacity(program.functions.count)
@@ -95,7 +120,7 @@ public final class MIRInterpreter {
             fn.locals.first?.id ?? 0
         }
         // Pre-allocate flat locals stack (grows as needed)
-        self.localsStack = [MirValue](repeating: .unit, count: 65536)
+        self.localsStack = [MirValue](repeating: .unit, count: 8192)
         // Pre-build type name → indices for O(1) enum construction (handles duplicate names)
         var tdi: [String: [Int]] = [:]
         tdi.reserveCapacity(program.typeDefs.count)
@@ -103,8 +128,41 @@ public final class MIRInterpreter {
             tdi[td.name, default: []].append(i)
         }
         self.typeDefIndex = tdi
+        var payloadShapes: [String: [EnumPayloadShape]] = [:]
+        payloadShapes.reserveCapacity(program.typeDefs.count)
+        for td in program.typeDefs {
+            guard case .enumDef(let variants) = td.kind else { continue }
+            var shapes: [EnumPayloadShape] = []
+            shapes.reserveCapacity(variants.count)
+            for (variantName, fields) in variants {
+                if fields.isEmpty {
+                    shapes.append(.unit)
+                    continue
+                }
+                let payloadTypeName = "\(td.name)::\(variantName)"
+                if let payloadIndices = tdi[payloadTypeName] {
+                    var hasNamedPayloadStruct = false
+                    for payloadIdx in payloadIndices {
+                        if case .structDef = program.typeDefs[payloadIdx].kind {
+                            hasNamedPayloadStruct = true
+                            break
+                        }
+                    }
+                    shapes.append(hasNamedPayloadStruct ? .namedStruct : .unnamed(fields.count))
+                } else {
+                    shapes.append(.unnamed(fields.count))
+                }
+            }
+            payloadShapes[td.name] = shapes
+        }
+        self.enumPayloadShapes = payloadShapes
         // Pre-allocate array-based call profile
         self.callProfileArray = [Int](repeating: 0, count: program.functions.count)
+        self.methodDispatchCache.reserveCapacity(512)
+        self.nativeFastPathAliasCache.reserveCapacity(1024)
+        self.nativeFastPathSiteCache.reserveCapacity(program.functions.count * 2)
+        self.directCallSiteCache.reserveCapacity(program.functions.count * 4)
+        self.methodCallSiteCache.reserveCapacity(program.functions.count)
     }
     private let functionIndex: [String: Int]
     private let blockIndices: [[BlockId: MirBlock]]
@@ -118,7 +176,13 @@ public final class MIRInterpreter {
     private var lastCallFinalParams: [MirValue] = []
     private var lastCallMutRefMask: [Bool] = []
     private var dispatchCache: [String: Int] = [:]
+    private var methodDispatchCache: [String: [String: Int]] = [:]
+    private var nativeFastPathAliasCache: [String: String] = [:]
+    private var nativeFastPathSiteCache: [CallSiteKey: String] = [:]
+    private var directCallSiteCache: [CallSiteKey: Int] = [:]
+    private var methodCallSiteCache: [StaticMethodCallSiteKey: Int] = [:]
     private var typeDefIndex: [String: [Int]]  // typeName → indices for enum construction (handles dupes)
+    private let enumPayloadShapes: [String: [EnumPayloadShape]]
     private var callProfileArray: [Int]  // array-based call profile (indexed by fnIdx)
     // Native Map/Set cache: maps a unique ID to a native Swift dictionary
     private var nativeMapStore: [Int: MirNativeMap] = [:]
@@ -131,6 +195,9 @@ public final class MIRInterpreter {
         ".push", ".pop", ".insert", ".remove", ".extend",
         ".clear", ".truncate", ".reverse", ".sort", ".resize", ".set"
     ]
+    private static let eofTokenKindValue: MirValue = .enumVal("TokenKind", 132, .unit)
+    private static let emptySpanValue: MirValue = .structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
+    private static let eofTokenValue: MirValue = .structVal("Token", ["kind": eofTokenKindValue, "span": emptySpanValue])
 
     /// Get or upgrade a CodeBuffer's "bytes" field to a MirByteBuffer.
     /// If already a .byteBuffer, returns it directly.
@@ -155,15 +222,32 @@ public final class MIRInterpreter {
         .array(MirArrayBuffer(elements))
     }
 
+
+
+    /// Optimized cloneValue with fast-path for immutable types.
+    /// Immutable types (unit, bool, int, float, char, string, fn) return the same reference (COW).
+    /// Only mutable types (array, tuple, struct, enum, byteBuffer) are deep cloned.
     private func cloneValue(_ value: MirValue) -> MirValue {
-        switch value {
-        case .array(let elements):
+        // Fast path: immutable types - return same reference (copy-on-write)
+        if case .unit = value { return value }
+        if case .bool = value { return value }
+        if case .int = value { return value }
+        if case .float = value { return value }
+        if case .char = value { return value }
+        if case .string = value { return value }
+        if case .fn = value { return value }
+
+        // Slow path: mutable types require deep clone
+        if case .array(let elements) = value {
             return makeArray(elements.map(cloneValue))
-        case .byteBuffer(let byteBuffer):
+        }
+        if case .byteBuffer(let byteBuffer) = value {
             return .byteBuffer(MirByteBuffer(data: byteBuffer.data))
-        case .tuple(let elements):
+        }
+        if case .tuple(let elements) = value {
             return .tuple(elements.map(cloneValue))
-        case .structVal("Map", let fields):
+        }
+        if case .structVal("Map", let fields) = value {
             var clonedFields = Dictionary(uniqueKeysWithValues: fields.map { ($0.key, cloneValue($0.value)) })
             if let nativeMap = getNativeMap(value) {
                 let newId = nextNativeMapId
@@ -178,14 +262,16 @@ public final class MIRInterpreter {
                 clonedFields["_nid"] = .int(newId)
             }
             return .structVal("Map", clonedFields)
-        case .structVal(let name, let fields):
-            return .structVal(name, Dictionary(uniqueKeysWithValues: fields.map { ($0.key, cloneValue($0.value)) }))
-        case .enumVal(let name, let tag, let payload):
-            return .enumVal(name, tag, cloneValue(payload))
-        default:
-            return value
         }
+        if case .structVal(let name, let fields) = value {
+            return .structVal(name, Dictionary(uniqueKeysWithValues: fields.map { ($0.key, cloneValue($0.value)) }))
+        }
+        if case .enumVal(let name, let tag, let payload) = value {
+            return .enumVal(name, tag, cloneValue(payload))
+        }
+        return value
     }
+
 
     private func valueKindName(_ value: MirValue) -> String {
         switch value {
@@ -300,6 +386,7 @@ public final class MIRInterpreter {
         dispatchCache = [:]
         halted = false
         runtimeError = nil
+        nextProgressReportStep = progressReportInterval > 0 ? progressReportInterval : .max
 
         guard let fn = findFunction(entryFunction) else {
             return InterpreterResult(exitCode: 1, output: ["Error: function '\(entryFunction)' not found"],
@@ -322,7 +409,7 @@ public final class MIRInterpreter {
             }
             return InterpreterResult(exitCode: 1, output: finalOutput, trace: trace, returnValue: result)
         }
-        return InterpreterResult(exitCode: result.asInt ?? 0, output: output, trace: trace, returnValue: result)
+        return InterpreterResult(exitCode: 0, output: output, trace: trace, returnValue: result)
     }
 
     public struct InterpreterResult {
@@ -556,6 +643,14 @@ public final class MIRInterpreter {
             stepCount += 1
             let blockId = callStack[callStack.count - 1].currentBlock
 
+            if stepCount >= nextProgressReportStep {
+                let message = "INTERPRETER_PROGRESS step=\(stepCount) fn=\(fn.name) block=\(blockId)"
+                if let data = (message + "\n").data(using: .utf8) {
+                    FileHandle.standardOutput.write(data)
+                }
+                nextProgressReportStep += progressReportInterval
+            }
+
             guard let block = blockIndex[blockId] else {
                 return .unit
             }
@@ -563,11 +658,13 @@ public final class MIRInterpreter {
             if enableTrace { addTrace(fn.name, blockId, .enterBlock, "stmts=\(block.statements.count)") }
 
             // Execute statements
-            for stmt in block.statements {
+            for (stmtIndex, stmt) in block.statements.enumerated() {
+                callStack[callStack.count - 1].stmtIndex = stmtIndex
                 executeStatement(stmt, fn: fn)
             }
 
             // Execute terminator
+            callStack[callStack.count - 1].stmtIndex = block.statements.count
             switch block.terminator {
             case .ret:
                 if enableTrace { addTrace(fn.name, blockId, .terminator, "return") }
@@ -601,9 +698,15 @@ public final class MIRInterpreter {
 
                 let result: MirValue
                 if case .fn(let name) = calleeVal {
+                    let staticSiteKey: CallSiteKey?
+                    if case .constant(.fnItem(let staticName)) = callee, staticName == name {
+                        staticSiteKey = currentCallSiteKey()
+                    } else {
+                        staticSiteKey = nil
+                    }
                     lastCallFinalParams = []
                     lastCallMutRefMask = []
-                    result = dispatchCall(name, args: argVals)
+                    result = dispatchCall(name, args: argVals, staticSite: staticSiteKey)
                     // Check if dispatchCall deferred a user-function call
                     if hasDeferredCall {
                         // Save continuation on current frame and return to trampoline
@@ -880,7 +983,51 @@ public final class MIRInterpreter {
                 structFieldOrders[name] = fieldNames
                 return .structVal(name, dict)
             case .enumCtor(let name, let idx):
-                return .enumVal(name, idx, vals.first ?? .unit)
+                let payload: MirValue
+                if let tdIndices = typeDefIndex[name] {
+                    var resolvedPayload: MirValue? = nil
+                    for tdIdx in tdIndices {
+                        guard tdIdx < program.typeDefs.count else { continue }
+                        let td = program.typeDefs[tdIdx]
+                        guard case .enumDef(let variants) = td.kind, idx < variants.count else { continue }
+
+                        let payloadTypeName = "\(td.name)::\(variants[idx].0)"
+                        let hasNamedPayloadStruct: Bool
+                        if let payloadIndices = typeDefIndex[payloadTypeName] {
+                            var foundStruct = false
+                            for payloadIdx in payloadIndices {
+                                guard payloadIdx < program.typeDefs.count else { continue }
+                                if case .structDef = program.typeDefs[payloadIdx].kind {
+                                    foundStruct = true
+                                    break
+                                }
+                            }
+                            hasNamedPayloadStruct = foundStruct
+                        } else {
+                            hasNamedPayloadStruct = false
+                        }
+
+                        if hasNamedPayloadStruct {
+                            resolvedPayload = vals.first ?? .unit
+                        } else {
+                            let fieldCount = variants[idx].1.count
+                            if fieldCount == 0 {
+                                resolvedPayload = .unit
+                            } else if fieldCount == 1 {
+                                resolvedPayload = vals.first ?? .unit
+                            } else {
+                                resolvedPayload = .tuple(vals)
+                            }
+                        }
+                        break
+                    }
+                    payload = resolvedPayload ?? (vals.isEmpty ? .unit : .tuple(vals))
+                } else if vals.isEmpty {
+                    payload = .unit
+                } else {
+                    payload = .tuple(vals)
+                }
+                return .enumVal(name, idx, payload)
             case .closure(let name):
                 if vals.isEmpty {
                     return .fn(name)
@@ -1115,10 +1262,17 @@ public final class MIRInterpreter {
                 }
                 structFieldMissCount += 1
                 return failProjection(proj, on: val, detail: "struct \(name) has no positional field \(idx)", fallback: .unit)
-            case .enumVal(_, _, let inner):
-                // Unwrap single-payload enum: field(0) on the enum extracts payload
-                if idx == 0 { return inner }
-                return failProjection(proj, on: val, detail: "enum payload only exposes field 0", fallback: .unit)
+            case .enumVal(let name, let variantIdx, let inner):
+                let payload = normalizedEnumPayload(enumTypeName: name, variantIdx: variantIdx, inner: inner)
+                switch payload {
+                case .tuple(let elems):
+                    return idx < elems.count
+                        ? elems[idx]
+                        : failProjection(proj, on: val, detail: "enum payload field \(idx) out of range (count=\(elems.count))", fallback: .unit)
+                default:
+                    if idx == 0 { return payload }
+                    return failProjection(proj, on: val, detail: "enum payload only exposes field 0", fallback: .unit)
+                }
             default:
                 // field(0) on a scalar value (string, int, bool, etc.) after enum
                 // downcast: treat as identity — the scalar IS the single payload.
@@ -1173,8 +1327,8 @@ public final class MIRInterpreter {
             }
             return failProjection(proj, on: val, detail: "constant index \(idx) out of range", fallback: .unit)
         case .downcast(let variantIdx):
-            if case .enumVal(_, let idx, let inner) = val, idx == variantIdx {
-                return inner
+            if case .enumVal(let name, let idx, let inner) = val, idx == variantIdx {
+                return normalizedEnumPayload(enumTypeName: name, variantIdx: idx, inner: inner)
             }
             // If the value is an enum but wrong variant, that's a genuine mismatch
             if case .enumVal(_, let idx, _) = val {
@@ -1264,6 +1418,14 @@ public final class MIRInterpreter {
     private static let nativeFastPathNames: Set<String> = [
         // Parser
         "peek", "at", "advance", "skip_newlines",
+        // Lexer
+        "lexer::char_at", "lexer::is_whitespace", "lexer::is_newline", "lexer::is_digit",
+        "lexer::is_alpha", "lexer::is_ident_start", "lexer::is_ident_char",
+        "lexer::lex_peek", "lexer::lex_peek_next", "lexer::lex_advance", "lexer::at_end",
+        "tg_compiler::lexer::char_at", "tg_compiler::lexer::is_whitespace", "tg_compiler::lexer::is_newline",
+        "tg_compiler::lexer::is_digit", "tg_compiler::lexer::is_alpha", "tg_compiler::lexer::is_ident_start",
+        "tg_compiler::lexer::is_ident_char", "tg_compiler::lexer::lex_peek", "tg_compiler::lexer::lex_peek_next",
+        "tg_compiler::lexer::lex_advance", "tg_compiler::lexer::at_end",
         // Codegen byte emission
         "emit8", "emit16_le", "emit32_le", "emit64_le", "emit_zeros",
         "buf_pos", "patch32_le", "align_to", "rex", "modrm", "sib", "span_new",
@@ -1324,16 +1486,131 @@ public final class MIRInterpreter {
         "a64_stp_pre", "a64_ldp_post", "a64_mov_w", "a64_sxtw", "a64_sub_sp_sp_r",
     ]
 
-    private static func nativeFastPathAlias(_ name: String) -> String {
-        for prefix in ["asm::", "tg_compiler::asm::", "codegen::", "tg_compiler::codegen::"] {
+    private static let nativeFastPathPrefixes = [
+        "asm::", "tg_compiler::asm::", "codegen::", "tg_compiler::codegen::"
+    ]
+
+    @inline(__always)
+    private static func resolveNativeFastPathAlias(_ name: String) -> String? {
+        if nativeFastPathNames.contains(name) {
+            return name
+        }
+        for prefix in nativeFastPathPrefixes {
             if name.hasPrefix(prefix) {
                 let candidate = String(name.dropFirst(prefix.count))
                 if nativeFastPathNames.contains(candidate) {
                     return candidate
                 }
+                return nil
             }
         }
-        return name
+        return nil
+    }
+
+    @inline(__always)
+    private func cachedNativeFastPathAlias(_ name: String) -> String? {
+        if let cached = nativeFastPathAliasCache[name] {
+            return cached.isEmpty ? nil : cached
+        }
+        let resolved = Self.resolveNativeFastPathAlias(name)
+        nativeFastPathAliasCache[name] = resolved ?? ""
+        return resolved
+    }
+
+    @inline(__always)
+    private func currentCallSiteKey() -> CallSiteKey? {
+        guard !callStack.isEmpty else { return nil }
+        let frameIdx = callStack.count - 1
+        return CallSiteKey(
+            functionIdx: callStack[frameIdx].functionIdx,
+            blockId: callStack[frameIdx].currentBlock,
+            stmtIndex: callStack[frameIdx].stmtIndex
+        )
+    }
+
+    @inline(__always)
+    private func isMethodName(_ name: String) -> Bool {
+        let utf8 = name.utf8
+        guard !utf8.isEmpty else { return false }
+        return utf8[utf8.startIndex] == 46
+    }
+
+    @inline(__always)
+    private func methodCallSiteKey(receiverType: String, site: CallSiteKey?) -> StaticMethodCallSiteKey? {
+        guard let site else { return nil }
+        return StaticMethodCallSiteKey(site: site, receiverType: receiverType)
+    }
+
+    @inline(__always)
+    private func cachedNativeFastPathAliasForCurrentSite(_ name: String, site: CallSiteKey?) -> String? {
+        guard let site else {
+            return cachedNativeFastPathAlias(name)
+        }
+        if let cached = nativeFastPathSiteCache[site] {
+            return cached.isEmpty ? nil : cached
+        }
+        let resolved = cachedNativeFastPathAlias(name)
+        nativeFastPathSiteCache[site] = resolved ?? ""
+        return resolved
+    }
+
+    @inline(__always)
+    private func receiverTypeName(_ value: MirValue) -> String? {
+        switch value {
+        case .structVal(let typeName, _):
+            return typeName
+        case .enumVal(let typeName, _, _):
+            return typeName
+        default:
+            return nil
+        }
+    }
+
+    @inline(__always)
+    private func deferResolvedUserCall(_ fnIdx: Int, args: [MirValue]) -> MirValue {
+        hasDeferredCall = true
+        deferredFnIdx = fnIdx
+        deferredArgs = args
+        return .unit
+    }
+
+    @inline(__always)
+    private func recordCallSiteResolution(_ name: String, args: [MirValue], fnIdx: Int, site: CallSiteKey?) {
+        if isMethodName(name) {
+            guard !args.isEmpty, let typeName = receiverTypeName(args[0]) else {
+                return
+            }
+            guard let siteKey = methodCallSiteKey(receiverType: typeName, site: site) else {
+                return
+            }
+            methodCallSiteCache[siteKey] = fnIdx
+            return
+        }
+
+        guard let site else { return }
+        directCallSiteCache[site] = fnIdx
+    }
+
+    @inline(__always)
+    private func resolveCachedUserCall(_ name: String, args: [MirValue], site: CallSiteKey?) -> MirValue? {
+        if isMethodName(name) {
+            guard !args.isEmpty, let typeName = receiverTypeName(args[0]) else {
+                return nil
+            }
+            guard let siteKey = methodCallSiteKey(receiverType: typeName, site: site) else {
+                return nil
+            }
+            if let fnIdx = methodCallSiteCache[siteKey] {
+                return deferResolvedUserCall(fnIdx, args: args)
+            }
+            return nil
+        }
+
+        guard let site else { return nil }
+        if let fnIdx = directCallSiteCache[site] {
+            return deferResolvedUserCall(fnIdx, args: args)
+        }
+        return nil
     }
 
     @inline(__always)
@@ -1510,6 +1787,11 @@ public final class MIRInterpreter {
     private func stringCharacter(_ string: String, at index: Int) -> Character? {
         let nsString = string as NSString
         guard index >= 0 && index < nsString.length else { return nil }
+        let codeUnit = nsString.character(at: index)
+        if codeUnit < 0xD800 || codeUnit > 0xDFFF,
+           let scalar = UnicodeScalar(Int(codeUnit)) {
+            return Character(scalar)
+        }
         return nsString.substring(with: NSRange(location: index, length: 1)).first
     }
 
@@ -1530,34 +1812,38 @@ public final class MIRInterpreter {
         return range.location
     }
 
-    private func dispatchCall(_ name: String, args: [MirValue]) -> MirValue {
-        // If name has a native fast-path, skip the dispatch cache and go straight to the switch
-        let fastPathName = Self.nativeFastPathAlias(name)
-        let hasNativeFastPath = Self.nativeFastPathNames.contains(fastPathName)
-        if !hasNativeFastPath {
+    @inline(__always)
+    private func optionCharValue(_ char: Character?) -> MirValue {
+        if let char {
+            return .enumVal("Option", 0, .char(char))
+        }
+        return .enumVal("Option", 1, .unit)
+    }
+
+    private func dispatchCall(_ name: String, args: [MirValue], staticSite: CallSiteKey? = nil) -> MirValue {
+        // If name has a native fast-path, skip the dispatch cache and go straight to the switch.
+        // Cache alias resolution because interpreted compilation revisits the same call names
+        // millions of times and repeated prefix/set lookups become dominant.
+        let siteKey = staticSite
+        let isMethod = isMethodName(name)
+        let nativeFastPathName = cachedNativeFastPathAliasForCurrentSite(name, site: siteKey)
+        let fastPathName = nativeFastPathName ?? name
+        if nativeFastPathName == nil {
+            if let resolved = resolveCachedUserCall(name, args: args, site: siteKey) {
+                return resolved
+            }
             // Fast path: check dispatch cache (skips 200+ case comparisons)
-            if let cachedIdx = dispatchCache[name] {
-                hasDeferredCall = true
-                deferredFnIdx = cachedIdx
-                deferredArgs = args
-                return .unit
+            if !isMethod, let cachedIdx = dispatchCache[name] {
+                recordCallSiteResolution(name, args: args, fnIdx: cachedIdx, site: siteKey)
+                return deferResolvedUserCall(cachedIdx, args: args)
             }
             // For method calls, check type-qualified cache
-            if name.hasPrefix("."), let recv = args.first {
-                let typeName: String?
-                switch recv {
-                case .structVal(let t, _): typeName = t
-                case .enumVal(let t, _, _): typeName = t
-                default: typeName = nil
-                }
-                if let t = typeName {
-                    let cacheKey = "\(name)\t\(t)"
-                    if let cachedIdx = dispatchCache[cacheKey] {
-                        hasDeferredCall = true
-                        deferredFnIdx = cachedIdx
-                        deferredArgs = args
-                        return .unit
-                    }
+            if isMethod, !args.isEmpty {
+                let typeName = receiverTypeName(args[0])
+                if let t = typeName,
+                   let cachedIdx = methodDispatchCache[name]?[t] {
+                        recordCallSiteResolution(name, args: args, fnIdx: cachedIdx, site: siteKey)
+                        return deferResolvedUserCall(cachedIdx, args: args)
                 }
             }
         }
@@ -1566,35 +1852,35 @@ public final class MIRInterpreter {
         switch fastPathName {
         case "peek":
             // peek(p: &TgcParser) -> TokenKind = p.tokens[p.pos].kind or Eof
-            if let parser = args.first,
-               case .structVal(_, let pf) = parser,
+            if !args.isEmpty,
+               case .structVal(_, let pf) = args[0],
                case .int(let pos) = pf["pos"],
                case .array(let tokens) = pf["tokens"] {
                 if pos >= 0 && pos < tokens.count,
                    case .structVal(_, let tf) = tokens[pos] {
-                    return tf["kind"] ?? .enumVal("TokenKind", 132, .unit)  // Eof
+                    return tf["kind"] ?? Self.eofTokenKindValue
                 }
-                return .enumVal("TokenKind", 132, .unit)  // Eof
+                return Self.eofTokenKindValue
             }
         case "at":
             // at(p: &TgcParser, kind: TokenKind) -> Bool = peek(p) == kind
-            if args.count >= 2, let parser = args.first,
-               case .structVal(_, let pf) = parser,
+            if args.count >= 2,
+               case .structVal(_, let pf) = args[0],
                case .int(let pos) = pf["pos"],
                case .array(let tokens) = pf["tokens"] {
                 let currentKind: MirValue
                 if pos >= 0 && pos < tokens.count,
                    case .structVal(_, let tf) = tokens[pos] {
-                    currentKind = tf["kind"] ?? .enumVal("TokenKind", 132, .unit)
+                    currentKind = tf["kind"] ?? Self.eofTokenKindValue
                 } else {
-                    currentKind = .enumVal("TokenKind", 132, .unit)  // Eof
+                    currentKind = Self.eofTokenKindValue
                 }
                 return .bool(currentKind == args[1])
             }
         case "advance":
             // advance(p: &mut TgcParser) -> Token (reads token, increments pos)
-            if let parser = args.first,
-               case .structVal(let sn, var pf) = parser,
+            if !args.isEmpty,
+               case .structVal(let sn, var pf) = args[0],
                case .int(let pos) = pf["pos"],
                case .array(let tokens) = pf["tokens"] {
                 let tok: MirValue
@@ -1602,8 +1888,7 @@ public final class MIRInterpreter {
                     tok = tokens[pos]
                     pf["pos"] = .int(pos + 1)
                 } else {
-                    let eofSpan = MirValue.structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
-                    tok = .structVal("Token", ["kind": .enumVal("TokenKind", 132, .unit), "span": eofSpan])
+                    tok = Self.eofTokenValue
                 }
                 // Write back mutated parser to receiver
                 let mutatedParser = MirValue.structVal(sn, pf)
@@ -1613,20 +1898,20 @@ public final class MIRInterpreter {
             }
         case "peek_span":
             // peek_span(p: &TgcParser) -> Span = p.tokens[p.pos].span or span_new(0,0)
-            if let parser = args.first,
-               case .structVal(_, let pf) = parser,
+            if !args.isEmpty,
+               case .structVal(_, let pf) = args[0],
                case .int(let pos) = pf["pos"],
                case .array(let tokens) = pf["tokens"] {
                 if pos >= 0 && pos < tokens.count,
                    case .structVal(_, let tf) = tokens[pos] {
-                    return tf["span"] ?? .structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
+                    return tf["span"] ?? Self.emptySpanValue
                 }
-                return .structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
+                return Self.emptySpanValue
             }
         case "skip_newlines":
             // skip_newlines(p: &mut TgcParser) — advance past all Newline tokens
-            if let parser = args.first,
-               case .structVal(let sn, var pf) = parser,
+            if !args.isEmpty,
+               case .structVal(let sn, var pf) = args[0],
                case .int(var pos) = pf["pos"],
                case .array(let tokens) = pf["tokens"] {
                 // Newline variant index — find it by checking Token at pos
@@ -1644,6 +1929,80 @@ public final class MIRInterpreter {
                 recordMutatedFirstArg(MirValue.structVal(sn, pf))
                 return .unit
             }
+        case "lexer::char_at", "tg_compiler::lexer::char_at":
+            if args.count >= 2,
+               case .string(let source) = args[0],
+               let idx = args[1].asInt {
+                return optionCharValue(stringCharacter(source, at: idx))
+            }
+            return .enumVal("Option", 1, .unit)
+        case "lexer::is_whitespace", "tg_compiler::lexer::is_whitespace":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool(code == 32 || code == 9 || code == 13)
+            }
+            return .bool(false)
+        case "lexer::is_newline", "tg_compiler::lexer::is_newline":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool(code == 10)
+            }
+            return .bool(false)
+        case "lexer::is_digit", "tg_compiler::lexer::is_digit":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool(code >= 48 && code <= 57)
+            }
+            return .bool(false)
+        case "lexer::is_alpha", "tg_compiler::lexer::is_alpha":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool((code >= 97 && code <= 122) || (code >= 65 && code <= 90))
+            }
+            return .bool(false)
+        case "lexer::is_ident_start", "tg_compiler::lexer::is_ident_start":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool((code >= 97 && code <= 122) || (code >= 65 && code <= 90) || code == 95)
+            }
+            return .bool(false)
+        case "lexer::is_ident_char", "tg_compiler::lexer::is_ident_char":
+            if !args.isEmpty, let code = args[0].asInt {
+                return .bool((code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code == 95)
+            }
+            return .bool(false)
+        case "lexer::lex_peek", "tg_compiler::lexer::lex_peek":
+            if !args.isEmpty,
+               case .structVal(_, let fields) = args[0],
+               case .string(let source) = fields["source"],
+               case .int(let pos) = fields["pos"] {
+                return optionCharValue(stringCharacter(source, at: pos))
+            }
+            return .enumVal("Option", 1, .unit)
+        case "lexer::lex_peek_next", "tg_compiler::lexer::lex_peek_next":
+            if !args.isEmpty,
+               case .structVal(_, let fields) = args[0],
+               case .string(let source) = fields["source"],
+               case .int(let pos) = fields["pos"] {
+                return optionCharValue(stringCharacter(source, at: pos + 1))
+            }
+            return .enumVal("Option", 1, .unit)
+        case "lexer::lex_advance", "tg_compiler::lexer::lex_advance":
+            if !args.isEmpty,
+               case .structVal(let name, var fields) = args[0],
+               case .string(let source) = fields["source"],
+               case .int(let pos) = fields["pos"] {
+                let char = stringCharacter(source, at: pos)
+                if char != nil {
+                    fields["pos"] = .int(pos + 1)
+                    recordMutatedFirstArg(.structVal(name, fields))
+                }
+                return optionCharValue(char)
+            }
+            return .enumVal("Option", 1, .unit)
+        case "lexer::at_end", "tg_compiler::lexer::at_end":
+            if !args.isEmpty,
+               case .structVal(_, let fields) = args[0],
+               case .string(let source) = fields["source"],
+               case .int(let pos) = fields["pos"] {
+                return .bool(pos >= stringLength(source))
+            }
+            return .bool(true)
         case "is_doc_comment":
             // is_doc_comment(kind: TokenKind) -> Bool
             if let kind = args.first, case .enumVal("TokenKind", let idx, _) = kind {
@@ -3166,23 +3525,26 @@ public final class MIRInterpreter {
             }
             return args.first ?? .string("")
         case ".chars":
-            if case .string(let s) = args.first {
+            if !args.isEmpty, case .string(let s) = args[0] {
                 return makeArray(s.map { .char($0) })
             }
             return .array([])
         case ".char_at":
-            if case .string(let s) = args.first,
-               let idx = args.dropFirst().first?.asInt,
+            if args.count >= 2,
+               case .string(let s) = args[0],
+               let idx = args[1].asInt,
                let ch = stringCharacter(s, at: idx) {
                 return .char(ch)
             }
             return .char("\0")
         case ".substring", ".slice":
-            if case .string(let s) = args.first, let start = args.dropFirst().first?.asInt {
+            if args.count >= 2,
+               case .string(let s) = args[0],
+               let start = args[1].asInt {
                 let end = args.count > 2 ? (args[2].asInt ?? stringLength(s)) : stringLength(s)
                 return .string(stringSlice(s, start: start, end: end))
             }
-            return args.first ?? .string("")
+            return args.isEmpty ? .string("") : args[0]
         case ".find", ".index_of":
             if case .string(let s) = args.first, let needle = args.dropFirst().first?.displayString {
                 if let index = stringFind(s, needle: needle) {
@@ -3895,29 +4257,29 @@ public final class MIRInterpreter {
 
         default:
             // Check dispatch cache first (avoids repeated name resolution)
-            let cacheKey: String
-            if name.hasPrefix("."), let recv = args.first {
-                switch recv {
-                case .structVal(let t, _): cacheKey = "\(name)\t\(t)"
-                case .enumVal(let t, _, _): cacheKey = "\(name)\t\(t)"
-                default: cacheKey = name
+            if isMethodName(name), !args.isEmpty, let typeName = receiverTypeName(args[0]) {
+                if let cachedIdx = methodDispatchCache[name]?[typeName] {
+                    recordCallSiteResolution(name, args: args, fnIdx: cachedIdx, site: siteKey)
+                    return deferResolvedUserCall(cachedIdx, args: args)
                 }
-            } else {
-                cacheKey = name
-            }
-            if let cachedIdx = dispatchCache[cacheKey] {
-                hasDeferredCall = true
-                deferredFnIdx = cachedIdx
-                deferredArgs = args
-                return .unit
+                for candidate in resolveFunctionCandidates(name: name, args: args) {
+                    if let idx = functionIndex[candidate] {
+                        var perType = methodDispatchCache[name] ?? [:]
+                        perType[typeName] = idx
+                        methodDispatchCache[name] = perType
+                        recordCallSiteResolution(name, args: args, fnIdx: idx, site: siteKey)
+                        return deferResolvedUserCall(idx, args: args)
+                    }
+                }
+            } else if let cachedIdx = dispatchCache[name] {
+                recordCallSiteResolution(name, args: args, fnIdx: cachedIdx, site: siteKey)
+                return deferResolvedUserCall(cachedIdx, args: args)
             }
             for candidate in resolveFunctionCandidates(name: name, args: args) {
                 if let idx = functionIndex[candidate] {
-                    dispatchCache[cacheKey] = idx
-                    hasDeferredCall = true
-                    deferredFnIdx = idx
-                    deferredArgs = args
-                    return .unit
+                    dispatchCache[name] = idx
+                    recordCallSiteResolution(name, args: args, fnIdx: idx, site: siteKey)
+                    return deferResolvedUserCall(idx, args: args)
                 }
             }
             // Try enum variant construction: TypeName::VariantName(args)
@@ -4307,17 +4669,23 @@ public final class MIRInterpreter {
         }
     }
 
-    private func enumPayloadStructFields(enumTypeName: String, variantName: String) -> (name: String, fields: [String])? {
-        let payloadTypeName = "\(enumTypeName)::\(variantName)"
-        guard let tdIndices = typeDefIndex[payloadTypeName] else {
-            return nil
+    private func normalizedEnumPayload(enumTypeName: String, variantIdx: Int, inner: MirValue) -> MirValue {
+        guard let shapes = enumPayloadShapes[enumTypeName],
+              variantIdx >= 0, variantIdx < shapes.count else {
+            return inner
         }
-        for tdIdx in tdIndices {
-            if case .structDef(let fields) = program.typeDefs[tdIdx].kind {
-                return (payloadTypeName, fields.map { $0.0 })
+
+        switch shapes[variantIdx] {
+        case .unit:
+            return .unit
+        case .namedStruct:
+            return inner
+        case .unnamed(let fieldCount):
+            if fieldCount == 1 {
+                return inner
             }
+            return inner
         }
-        return nil
     }
 
     private func findFunction(_ name: String) -> MirFunction? {
@@ -4376,15 +4744,26 @@ public final class MIRInterpreter {
         return deduped
     }
 
+
     @inline(__always)
+
     private func getLocal(_ id: LocalId) -> MirValue {
-        return id < currentLocalsCount ? localsStack[currentLocalsBase + id] : .unit
+        let idx = currentLocalsBase + id
+        if id < currentLocalsCount && idx < localsStack.count {
+            return localsStack[idx]
+        }
+        return .unit
     }
 
     @inline(__always)
     private func setLocal(_ id: LocalId, _ value: MirValue) {
+        let idx = currentLocalsBase + id
         if id < currentLocalsCount {
-            localsStack[currentLocalsBase + id] = value
+            localsStack[idx] = value
+        } else if idx >= localsStack.count {
+            // Grow array dynamically when needed
+            localsStack.append(contentsOf: repeatElement(.unit, count: idx - localsStack.count + 1))
+            localsStack[idx] = value
         }
     }
 
@@ -5123,7 +5502,10 @@ public indirect enum MirValue: Equatable, CustomStringConvertible {
         switch self {
         case .int(let i): return i
         case .bool(let b): return b ? 1 : 0
-        case .char(let c): return Int(c.unicodeScalars.first?.value ?? 0)
+        case .char(let c):
+            let scalars = c.unicodeScalars
+            guard !scalars.isEmpty else { return 0 }
+            return Int(scalars[scalars.startIndex].value)
         default: return nil
         }
     }

@@ -21,6 +21,12 @@ use std::process::{run_command}
 use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind, Section}
 use tg_compiler::object::{
   ObjectFile, build_object,
+  object_bss_size, object_data_clone, object_data_len,
+  object_data_relocations_clone,
+  object_shifted_data_relocations_clone,
+  object_relocations_clone, object_resolve_symbols, object_rodata_clone,
+  object_rodata_len, object_symbols_clone, object_text_clone, ResolvedSymbol,
+  object_text_len,
   write16, write32, write64, emit_zeros_vec, append_vec, pad_to, align_up,
   push_str, write_padded_str
 }
@@ -32,8 +38,41 @@ use tg_compiler::object::{
 struct LinkerInput
   objects: Vec[ObjectFile]
   entry: String           # entry point symbol (_start or _main)
+  entry_offset: Int
   output: String          # output file path
   target: AsmTarget
+end
+
+def linker_input_objects_clone(input: &LinkerInput) -> Vec[ObjectFile]
+  input.objects.clone()
+end
+
+def linker_input_output_clone(input: &LinkerInput) -> String
+  input.output.clone()
+end
+
+def linker_input_entry_clone(input: &LinkerInput) -> String
+  input.entry.clone()
+end
+
+def linker_input_entry_offset(input: &LinkerInput) -> Int
+  input.entry_offset
+end
+
+def linker_input_os(input: &LinkerInput) -> OsAbi
+  input.target.os
+end
+
+def linker_input_arch(input: &LinkerInput) -> Arch
+  input.target.arch
+end
+
+def linker_default_entry_name(input: &LinkerInput) -> String
+  match linker_input_os(input)
+  when OsAbi::MacOS   then "main".to_string()
+  when OsAbi::Linux   then "_start".to_string()
+  when OsAbi::Windows then "mainCRTStartup".to_string()
+  end
 end
 
 struct LinkedSection
@@ -270,6 +309,24 @@ def resolve_symbols(all_symbols: &Vec[AsmSymbol]) -> Result[Map[String, LinkerSy
   Result::Ok(syms)
 end
 
+def linker_symbols_from_resolved(resolved: &Map[String, ResolvedSymbol]) -> Map[String, LinkerSymbol]
+  mut syms = Map::new()
+  let entries = resolved.entries()
+  mut i = 0
+  while i < entries.len() do
+    let entry = &entries[i]
+    let sym = entry.1
+    syms.insert(entry.0.clone(), LinkerSymbol {
+      name: sym.name.clone(),
+      value: sym.value,
+      section: sym.section,
+      is_defined: sym.is_defined
+    })
+    i = i + 1
+  end
+  syms
+end
+
 
 
 # After sections are merged and virtual addresses assigned we walk every
@@ -428,6 +485,10 @@ def add_u64(left: u64, right: u64) -> u64
   left + right
 end
 
+def linked_section_data_len(section: &LinkedSection) -> Int
+  section.data.len()
+end
+
 def read32_at(data: &Vec[u8], offset: Int) -> u32
   (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24)
 end
@@ -436,45 +497,55 @@ end
 # Section merging
 # ———————————————————————————————————————————————————————————————
 
-def merge_sections(objects: &Vec[ObjectFile], text_offsets: &mut Vec[u64], all_symbols: &mut Vec[AsmSymbol], all_relocations: &mut Vec[Relocation]) -> Vec[LinkedSection]
+def merge_sections(objects: &Vec[ObjectFile], text_offsets: &mut Vec[u64], all_symbols: &mut Vec[AsmSymbol], all_relocations: &mut Vec[Relocation], all_data_relocations: &mut Vec[Relocation]) -> Vec[LinkedSection]
   mut text_data: Vec[u8] = Vec::new()
   mut data_data: Vec[u8] = Vec::new()
   mut rodata_data: Vec[u8] = Vec::new()
   mut total_bss: u64 = 0
 
-  eprintln("  [merge] objects.len()=" + objects.len().to_string())
-  mut oi = 0
-  while oi < objects.len() do
-    let obj = &objects[oi]
-    eprintln("  [merge] obj[" + oi.to_string() + "] text=" + obj.text.len().to_string() + " data=" + obj.data.len().to_string() + " rodata=" + obj.rodata.len().to_string())
-    # Record text offset for this object before appending
-    let obj_text_off = text_data.len() as u64
-    text_offsets.push(obj_text_off)
-    # Directly extend instead of calling append_vec to avoid &mut write-back issues
-    text_data.extend(&obj.text)
-    eprintln("  [merge] after extend text_data=" + text_data.len().to_string())
-    data_data.extend(&obj.data)
-    rodata_data.extend(&obj.rodata)
-    total_bss = total_bss + obj.bss_size as u64
-    # Collect symbols in the same pass
-    mut si = 0
-    while si < obj.symbols.len() do
-      all_symbols.push(obj.symbols[si].clone())
-      si = si + 1
+  if objects.len() == 1 then
+    let obj = &objects[0]
+    let obj_text = object_text_clone(obj)
+    let obj_data = object_data_clone(obj)
+    let obj_rodata = object_rodata_clone(obj)
+    let obj_symbols = object_symbols_clone(obj)
+    let obj_relocations = object_relocations_clone(obj)
+    text_offsets.push(0 as u64)
+    text_data.extend(&obj_text)
+    data_data.extend(&obj_data)
+    rodata_data.extend(&obj_rodata)
+    total_bss = object_bss_size(obj) as u64
+    all_symbols.extend(&obj_symbols)
+    all_relocations.extend(&obj_relocations)
+    let obj_data_relocations = object_data_relocations_clone(obj)
+    all_data_relocations.extend(&obj_data_relocations)
+  else
+    mut oi = 0
+    while oi < objects.len() do
+      let obj = &objects[oi]
+      let obj_text = object_text_clone(obj)
+      let obj_data = object_data_clone(obj)
+      let obj_rodata = object_rodata_clone(obj)
+      # Record text offset for this object before appending
+      let obj_text_off = text_data.len() as u64
+      text_offsets.push(obj_text_off)
+      # Directly extend instead of calling append_vec to avoid &mut write-back issues
+      text_data.extend(&obj_text)
+      data_data.extend(&obj_data)
+      rodata_data.extend(&obj_rodata)
+      total_bss = total_bss + object_bss_size(obj) as u64
+      # Collect symbols in the same pass
+      let obj_symbols = object_symbols_clone(obj)
+      all_symbols.extend(&obj_symbols)
+      # Collect relocations, adjusting offset to merged text position
+      let shifted_relocations = object_shifted_relocations_clone(obj, obj_text_off as Int)
+      all_relocations.extend(&shifted_relocations)
+      # Collect data relocations, adjusting offset for merged data position
+      let merged_data_base = data_data.len() - object_data_len(obj)
+      let shifted_data_relocations = object_shifted_data_relocations_clone(obj, merged_data_base)
+      all_data_relocations.extend(&shifted_data_relocations)
+      oi = oi + 1
     end
-    # Collect relocations, adjusting offset to merged text position
-    mut ri = 0
-    while ri < obj.relocations.len() do
-      let reloc = &obj.relocations[ri]
-      all_relocations.push(Relocation {
-        offset: reloc.offset + obj_text_off as Int,
-        kind: reloc.kind,
-        symbol: reloc.symbol.clone(),
-        addend: reloc.addend
-      })
-      ri = ri + 1
-    end
-    oi = oi + 1
   end
 
   mut sections = Vec::new()
@@ -542,8 +613,9 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
   mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_data_relocations: Vec[Relocation] = Vec::new()
   mut all_relocations: Vec[Relocation] = Vec::new()
-  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
+  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations, &mut all_data_relocations)
 
   # Resolve symbols
   let syms = match resolve_symbols(&all_symbols)
@@ -591,12 +663,13 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Find entry point and report error if undefined
-  let entry_addr = match syms.get(&input.entry)
+  let entry_name = linker_default_entry_name(input)
+  let entry_addr = match syms.get(&entry_name)
   when Option::Some(sym) then
     # entry is relative to .text; add .text vaddr
     sections[0].vaddr + sym.value
   when Option::None then
-    return Result::Err("undefined entry point symbol: " + input.entry.clone())
+    return Result::Err("undefined entry point symbol: " + entry_name)
   end
 
   # --- ELF Header ---
@@ -666,20 +739,27 @@ end
 
 def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   mut out = Vec::new()
+  let objects = linker_input_objects_clone(input)
 
   # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
   mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_data_relocations: Vec[Relocation] = Vec::new()
   mut all_relocations: Vec[Relocation] = Vec::new()
-  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
-  eprintln("  [linker] merged text=" + sections[0].data.len().to_string() + " rodata=" + sections[1].data.len().to_string() + " data=" + sections[2].data.len().to_string())
+  mut sections = merge_sections(&objects, &mut text_offsets, &mut all_symbols, &mut all_relocations, &mut all_data_relocations)
 
-  let syms = match resolve_symbols(&all_symbols)
-  when Result::Ok(s) then s
-  when Result::Err(e) then return Result::Err(e)
+  let syms = if objects.len() == 1 then
+    let resolved = object_resolve_symbols(&objects[0])
+    let syms = linker_symbols_from_resolved(&resolved)
+    syms
+  else
+    match resolve_symbols(&all_symbols)
+    when Result::Ok(s) then s
+    when Result::Err(e) then return Result::Err(e)
+    end
   end
 
-  let is_arm = match input.target.arch
+  let is_arm = match linker_input_arch(input)
   when Arch::AArch64 then true
   when _ then false
   end
@@ -696,6 +776,10 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let lc_build_version = 0x32 as u32
   let lc_load_dylinker = 0x0E as u32
   let lc_load_dylib = 0x0C as u32
+
+  let text_len = linked_section_data_len(&sections[0])
+  let rodata_len = linked_section_data_len(&sections[1])
+  let data_len = linked_section_data_len(&sections[2])
 
   # ARM64 macOS requires 16KB page alignment for segments
   let page_size = if is_arm then 16384 else 4096 end
@@ -723,12 +807,12 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   # __TEXT starts at fileoff 0 (includes header + load commands)
   # Code is placed right after load commands, 16-byte aligned
   let code_fileoff = align_up(header_size + load_cmds_size + codesign_reserve, 16)
-  let rodata_fileoff = code_fileoff + sections[0].data.len()
-  let text_seg_filesize = align_up(rodata_fileoff + sections[1].data.len(), page_size)
+  let rodata_fileoff = code_fileoff + text_len
+  let text_seg_filesize = align_up(rodata_fileoff + rodata_len, page_size)
   let text_seg_size = text_seg_filesize  # __TEXT segment starts at fileoff=0
 
   let data_fileoff = text_seg_filesize
-  let data_seg_size = if sections[2].data.len() > 0 then align_up(sections[2].data.len(), page_size) else 0 end
+  let data_seg_size = if data_len > 0 then align_up(data_len, page_size) else 0 end
 
   # Assign virtual addresses — __TEXT at base, code within it
   let text_seg_vaddr = base
@@ -750,7 +834,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   section_vaddrs.push(data_vaddr)
   if sections.len() > 3 then
     # BSS follows data in virtual memory (no file backing, S_ZEROFILL)
-    let bss_vaddr = data_vaddr + (align_up(sections[2].data.len(), page_size) as u64)
+    let bss_vaddr = data_vaddr + (align_up(data_len, page_size) as u64)
     section_vaddrs.push(bss_vaddr)
   end
 
@@ -761,10 +845,29 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Entry point offset (relative to start of __TEXT segment, which is fileoff=0)
-  let entry_off = match syms.get(&input.entry)
-  when Option::Some(sym) then (code_fileoff as u64) + (sym.value as u64)
-  when Option::None then
-    return Result::Err("undefined entry point symbol: " + input.entry.clone())
+  let entry_off = if objects.len() == 1 then
+    let direct_entry_offset = linker_input_entry_offset(input)
+    if direct_entry_offset >= 0 then
+      (code_fileoff as u64) + (direct_entry_offset as u64)
+    else
+      let entry_name = linker_default_entry_name(input)
+      let maybe_entry = syms.get(&entry_name)
+      match maybe_entry
+      when Option::Some(sym) then
+        (code_fileoff as u64) + (sym.value as u64)
+      when Option::None then
+        return Result::Err("missing entry point symbol '" + entry_name + "' for Mach-O executable")
+      end
+    end
+  else
+    let entry_name = linker_default_entry_name(input)
+    let maybe_entry = syms.get(&entry_name)
+    match maybe_entry
+    when Option::Some(sym) then
+      (code_fileoff as u64) + (sym.value as u64)
+    when Option::None then
+      return Result::Err("undefined entry point symbol: " + entry_name)
+    end
   end
 
   # Empty string table (just a NUL byte) for LC_SYMTAB, placed in __LINKEDIT
@@ -924,9 +1027,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   # --- Section data ---
   pad_to(&mut out, code_fileoff)
-  eprintln("  [linker] writing text: " + sections[0].data.len().to_string() + " bytes at offset " + out.len().to_string())
   out.extend(&sections[0].data)   # __text
-  eprintln("  [linker] after text: out=" + out.len().to_string())
   out.extend(&sections[1].data)   # __const (rodata)
   pad_to(&mut out, data_fileoff)
   out.extend(&sections[2].data)   # __data
@@ -948,8 +1049,9 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   # Single-pass: merge sections, collect text offsets, symbols, and relocations
   mut text_offsets = Vec::new()
   mut all_symbols: Vec[AsmSymbol] = Vec::new()
+  mut all_data_relocations: Vec[Relocation] = Vec::new()
   mut all_relocations: Vec[Relocation] = Vec::new()
-  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations)
+  mut sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations, &mut all_data_relocations)
   let syms = match resolve_symbols(&all_symbols)
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err(e)
@@ -989,10 +1091,11 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   let file_align: u64 = 512
 
   let text_rva: u64 = section_align
-  let entry_offset: u64 = match syms.get(&input.entry)
+  let entry_name = linker_default_entry_name(input)
+  let entry_offset: u64 = match syms.get(&entry_name)
   when Option::Some(sym) then sym.value as u64
   when Option::None then
-    return Result::Err("undefined entry point symbol: " + input.entry.clone())
+    return Result::Err("undefined entry point symbol: " + entry_name)
   end
   let entry_rva: u64 = add_u64(text_rva, entry_offset)
 
@@ -1131,7 +1234,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def perform_link(input: &LinkerInput) -> Result[Vec[u8], String]
-  match input.target.os
+  match linker_input_os(input)
   when OsAbi::Linux   then link_elf64(input)
   when OsAbi::MacOS   then link_macho64(input)
   when OsAbi::Windows then link_pe64(input)
@@ -1144,7 +1247,7 @@ def link_executable(input: &LinkerInput) -> Result[Unit, String]
   when Result::Err(e) then return Result::Err(e)
   end
 
-  let output_path = input.output.clone()
+  let output_path = linker_input_output_clone(input)
 
   match write_file_bytes(output_path.clone(), &bytes)
   when Result::Ok(_) then ()
@@ -1156,7 +1259,7 @@ def link_executable(input: &LinkerInput) -> Result[Unit, String]
   end
 
   # Ad-hoc code sign on macOS (required for execution)
-  if input.target.os == OsAbi::MacOS then
+  if linker_input_os(input) == OsAbi::MacOS then
     match run_command("/usr/bin/codesign", vec!["-s", "-", output_path.as_str()])
     when Result::Ok(_) then ()
     when Result::Err(e) then return Result::Err("codesign failed: " + e)

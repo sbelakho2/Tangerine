@@ -378,10 +378,15 @@ struct TangerineCLI {
             return program
         }
 
+        // Use the bootstrap profile std files instead of loading ALL std files.
+        // Some std files (e.g. blas.tg) use syntax not yet supported by the parser,
+        // which would cause all interpret commands to fail.
+        let profileFiles = BootstrapProfile.profileFiles
         var filesToLoad: [String] = []
-        if let entries = try? fm.contentsOfDirectory(atPath: "std") {
-            for entry in entries where entry.hasSuffix(".tg") {
-                filesToLoad.append(("std" as NSString).appendingPathComponent(entry))
+        for file in profileFiles {
+            let fullPath = ("std" as NSString).appendingPathComponent(file)
+            if fm.fileExists(atPath: fullPath) {
+                filesToLoad.append(fullPath)
             }
         }
         filesToLoad.sort()
@@ -707,6 +712,8 @@ struct TangerineCLI {
         var moduleStats: [BootstrapLoweringStats] = []
 
         for module in modules {
+            print("  Lowering: \(module.path)...")
+            fflush(stdout)
             let lowering = MIRLowering(moduleName: module.moduleName)
             lowering.preloadTypes(allTypes)
             let rawMIR = lowering.lower(module.program)

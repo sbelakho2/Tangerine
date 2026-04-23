@@ -72,7 +72,7 @@ enum LayoutCategory
   DynContainer
   # Zero-sized types (Unit, Never, zero-variant enums)
   ZeroSized
-  # Function types (fn pointer + optional closure env)
+  # Function types (raw function pointers)
   FunctionType
 end
 
@@ -135,7 +135,7 @@ struct TargetDescriptor
   int_size: Int            # 8 for LP64
   bool_size: Int           # 1
   char_size: Int           # 4 (Unicode scalar)
-  fn_ptr_size: Int         # 16 (fn ptr + env)
+  fn_ptr_size: Int         # 8 (raw function pointer)
   float_size: Int          # 8 (f64)
   double_size: Int         # 8 (f64, same as float)
   endianness: String       # "little" or "big"
@@ -150,9 +150,9 @@ def aarch64_target() -> TargetDescriptor
     pointer_align: 8,
     max_align: 16,
     int_size: 8,
-    bool_size: 1,
+    bool_size: 8,
     char_size: 4,
-    fn_ptr_size: 16,
+    fn_ptr_size: 8,
     float_size: 8,
     double_size: 8,
     endianness: "little",
@@ -167,9 +167,9 @@ def x86_64_target() -> TargetDescriptor
     pointer_align: 8,
     max_align: 16,
     int_size: 8,
-    bool_size: 1,
+    bool_size: 8,
     char_size: 4,
-    fn_ptr_size: 16,
+    fn_ptr_size: 8,
     float_size: 8,
     double_size: 8,
     endianness: "little",
@@ -245,7 +245,7 @@ end
 def primitive_align(engine: &LayoutEngine, ty: &Type) -> Int
   match ty
   when Type::Unit    then 1
-  when Type::Bool    then 1
+  when Type::Bool    then 8
   when Type::Char    then 4
   when Type::I8      then 1
   when Type::U8      then 1
@@ -254,13 +254,13 @@ def primitive_align(engine: &LayoutEngine, ty: &Type) -> Int
   when Type::I32     then 4
   when Type::U32     then 4
   when Type::F32     then 4
-    when Type::I64     then 8
-    when Type::U64     then 8
-    when Type::F64     then 8
-    when Type::I128    then 16
-    when Type::U128    then 16
-    when Type::ISize   then engine.target.pointer_align
-    when Type::USize   then engine.target.pointer_align
+  when Type::I64     then 8
+  when Type::U64     then 8
+  when Type::F64     then 8
+  when Type::I128    then 16
+  when Type::U128    then 16
+  when Type::ISize   then engine.target.pointer_align
+  when Type::USize   then engine.target.pointer_align
   when _             then engine.target.pointer_align  # Default to pointer alignment
   end
 end
@@ -307,7 +307,7 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Type::Ptr(_)        then engine.target.pointer_size
   when Type::PtrMut(_)     then engine.target.pointer_size
   when Type::Slice(_)      then engine.target.pointer_size  # current runtime lowers slices/Vec to heap-header pointers
-  when Type::Function(_, _) then engine.target.fn_ptr_size  # 16 bytes
+  when Type::Function(_, _) then engine.target.fn_ptr_size
   when Type::Tuple(fields) then
     let tl = compute_tuple_layout(engine, fields)
     tl.size
@@ -405,6 +405,42 @@ def compute_tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Tuple
   }
 end
 
+def struct_field_storage_align(engine: &LayoutEngine, ty: &Type) -> Int
+  let prim_align = primitive_align(engine, ty)
+  if prim_align > 0 then
+    return prim_align
+  end
+
+  match ty
+  when Type::Slice(_) then engine.target.pointer_align
+  when Type::Map(_, _) then engine.target.pointer_align
+  when Type::Set(_) then engine.target.pointer_align
+  when Type::Option(_) then engine.target.pointer_align
+  when Type::Result(_, _) then engine.target.pointer_align
+  when _ then
+    engine.target.pointer_align
+  end
+end
+
+def struct_field_storage_size(engine: &LayoutEngine, ty: &Type) -> Int
+  let prim_size = primitive_size(engine, ty)
+  if prim_size >= 0 then
+    return prim_size
+  end
+
+  match ty
+  when Type::Slice(_) then engine.target.pointer_size
+  when Type::Map(_, _) then engine.target.pointer_size
+  when Type::Set(_) then engine.target.pointer_size
+  when Type::Option(_) then engine.target.pointer_size
+  when Type::Result(_, _) then engine.target.pointer_size
+  when _ then
+    # Heap containers, named structs/enums, tuples, and other compound values
+    # flow through runtime handle slots when embedded in a struct field.
+    engine.target.pointer_size
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Struct Layout Computation (F7 - declaration order, no reordering)
 # ———————————————————————————————————————————————————————————————
@@ -415,9 +451,8 @@ def compute_struct_layout(engine: &mut LayoutEngine, type_id: Int, fields: &Vec[
   mut max_align = 1
   
   for f in fields do
-    # Tangerine runtime uses uniform pointer-sized (8-byte) slots for ALL struct fields
-    let f_size = engine.target.pointer_size
-    let f_align = engine.target.pointer_align
+    let f_size = struct_field_storage_size(engine, &f.ty)
+    let f_align = struct_field_storage_align(engine, &f.ty)
     
     if f_align > max_align then
       max_align = f_align
@@ -474,8 +509,13 @@ def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[
     mut field_layouts = Vec::new()
 
     for fty in v.fields do
-      let f_size = size_of(engine, fty)
-      let f_align = align_of(engine, fty)
+      # Use uniform pointer-sized slots for ALL enum payload fields,
+      # matching struct field handling.  This avoids dependency-order
+      # bugs where size_of returns 0 from placeholder records during
+      # compute_all_layouts, and is correct because Tangerine stores
+      # all values (including nested structs/enums) as pointer-sized.
+      let f_size = engine.target.pointer_size
+      let f_align = engine.target.pointer_align
 
       if f_align > max_align then
         max_align = f_align
@@ -929,7 +969,7 @@ def should_pass_directly(engine: &LayoutEngine, ty: &Type) -> Bool
   when Type::Ptr(_) then 8
   when Type::PtrMut(_) then 8
   when Type::Slice(_) then engine.target.pointer_size
-  when Type::Function(_, _) then 16  # Function pointer - indirect
+  when Type::Function(_, _) then engine.target.fn_ptr_size
   when Type::Tuple(fields) then
     # Small tuples (<= 16 bytes, power of 2) can be direct
     mut total = 0

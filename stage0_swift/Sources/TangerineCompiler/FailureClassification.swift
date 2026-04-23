@@ -17,13 +17,6 @@ public struct FailureClassification {
         case abiRuntime = "abi-runtime"
         case stdlibMisuse = "stdlib-misuse"
         case testHarnessBug = "test-harness-bug"
-
-        // Layout-specific failure classes (§ Layout Engine Deep Analysis)
-        case layoutComputationBug = "layout-computation-bug"    // field_type_size / lower_struct_def miscalculation
-        case layoutConsumerBug = "layout-consumer-bug"          // codegen reads wrong offset from correct layout
-        case headerModelBug = "header-model-bug"                // MirFieldDef/MirVariantDef struct definition wrong
-        case abiBoundaryBug = "abi-boundary-bug"                // mismatch at FFI / runtime call boundary
-        case targetDescriptorBug = "target-descriptor-bug"      // per-target size/align table wrong
     }
 
     public enum Tag: String, CaseIterable, Equatable, Hashable {
