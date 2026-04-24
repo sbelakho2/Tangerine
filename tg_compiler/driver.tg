@@ -29,7 +29,7 @@ use tg_compiler::ast::{
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::types::{type_check, TypeError, extract_import_paths}
 use tg_compiler::borrow_check::{borrow_check, BorrowError}
-use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo}
+use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, type_size, type_align}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
@@ -707,16 +707,19 @@ struct CompilationUnit
   mir: Option[MirProgram]
 end
 
-def read_file_text_direct(path: String) -> Result[String, String]
-  let result = read_file_to_string_native(path.clone())
-  if result.len() == 0 then
-    Result::Err("failed to read file: " + path)
-  else
-    Result::Ok(result)
-  end
+def read_file_text_direct(path: String) -> String
+  read_file_to_string_native(path.clone())
 end
 
-def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: String, log_path: String, output_input: String) -> Result[String, String]
+def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, String]
+  match opts.output_file
+  when Option::Some(out) then
+    if out.ends_with("tg_stage2") then
+      panic("compile_file_core stage2 sentinel")
+    end
+  when Option::None then ()
+  end
+
   mut emitter = if opts.json_diagnostics then
     emitter_new_json()
   else
@@ -727,10 +730,9 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
   
   # Read source directly as text to avoid read_to_vec/String::from_bytes
   # during native bootstrap.
-  let source = match read_file_text_direct(read_path)
-  when Result::Ok(data) then data
-  when Result::Err(e) then
-    return Result::Err("Failed to read file: " + log_path + ": " + e)
+  let source = read_file_text_direct(path.clone())
+  if source.len() == 0 then
+    return Result::Err("Failed to read file: " + path.clone())
   end
 
   if opts.verbose then
@@ -740,11 +742,11 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
   let is_bootstrap_driver = true
   
   if !is_bootstrap_driver then
-    add_source(&mut emitter, source_name, source)
+    add_source(&mut emitter, path.clone(), source)
   end
   
   if opts.verbose then
-    println("Compiling: " + log_path)
+    println("Compiling: " + path.clone())
   end
   let skip_bootstrap_semantic_checks = true
   
@@ -875,7 +877,16 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
 
   if opts.verbose then
   end
-  
+
+  # Verify MIR invariants after lowering.
+  let post_lower_errs = verify_mir(&mir)
+  if !post_lower_errs.is_empty() then
+    for e in post_lower_errs do
+      eprintln("MIR verifier (post-lower): " + e)
+    end
+    return Result::Err("MIR verification failed after lowering")
+  end
+
   # Phase 5.5: Monomorphization  specialize generic functions for concrete types
   if opts.verbose then
     println("  Monomorphizing generics...")
@@ -885,7 +896,16 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
 
   if opts.verbose then
   end
-  
+
+  # Verify MIR invariants after monomorphization.
+  let post_mono_errs = verify_mir(&mir)
+  if !post_mono_errs.is_empty() then
+    for e in post_mono_errs do
+      eprintln("MIR verifier (post-mono): " + e)
+    end
+    return Result::Err("MIR verification failed after monomorphization")
+  end
+
   # Phase 5.6: MIR Optimization (gated by opt_level)
   if opts.verbose then
     println("  Optimizing MIR (O" + opts.opt_level.to_string() + ")...")
@@ -916,7 +936,16 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
 
   if opts.verbose then
   end
-  
+
+  # Verify MIR invariants after optimization.
+  let post_opt_errs = verify_mir(&mir)
+  if !post_opt_errs.is_empty() then
+    for e in post_opt_errs do
+      eprintln("MIR verifier (post-opt): " + e)
+    end
+    return Result::Err("MIR verification failed after optimization")
+  end
+
   if opts.emit_mir then
     print_mir(&mir)
     return Result::Ok("")
@@ -939,7 +968,7 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
   match opts.emit
   when EmitMode::Object then
     let obj_bytes = generate_object_file(&mir, &target)
-    let obj_path = get_output_path(opts, output_input, ".o")
+    let obj_path = get_output_path(opts, path.clone(), ".o")
     match write_file_bytes(obj_path.clone(), &obj_bytes)
     when Result::Ok(_) then
       if !file_exists(obj_path.clone()) then
@@ -952,14 +981,18 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
       return Result::Err("Failed to write object file: " + e)
     end
   when EmitMode::Executable then
-    let exe_path = get_output_path(opts, output_input, "")
-    match generate_executable(&mir, &target, exe_path)
-    when Result::Ok(_) then
-      if !opts.quiet then
-        println("Compiled: " + exe_path)
-      end
-    when Result::Err(e) then
-      return Result::Err("Native compilation failed: " + e)
+    let exe_path = get_output_path(opts, path.clone(), "")
+    if file_exists(exe_path.clone()) then
+      let _ = delete_file(exe_path.clone())
+    end
+
+    let _ = generate_executable(&mir, &target, exe_path.clone())
+    if !file_exists(exe_path.clone()) then
+      return Result::Err("Native compilation failed: output binary was not produced or updated")
+    end
+
+    if !opts.quiet then
+      println("Compiled: " + exe_path)
     end
   when _ then ()
   end
@@ -972,18 +1005,252 @@ def compile_file_core(opts: &CompilerOptions, read_path: String, source_name: St
 end
 
 def compile_file(opts: &CompilerOptions, path: String) -> Result[String, String]
-  compile_file_core(opts, path.clone(), path.clone(), path.clone(), path)
+  compile_file_core(opts, path)
 end
 
 def compile_startup_file_raw(opts: &CompilerOptions, path_arg_index: Int) -> Result[String, String]
-  let path = raw_arg_unchecked(path_arg_index)
-  compile_file_core(
-    opts,
-    path.clone(),
-    path.clone(),
-    path.clone(),
-    path
-  )
+  let path = raw_arg_copy(path_arg_index)
+  compile_file_core(opts, path)
+end
+
+def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: String) -> Int
+  mut emitter = if opts.json_diagnostics then
+    emitter_new_json()
+  else
+    mut e = emitter_new()
+    e.color_enabled = opts.color
+    e
+  end
+
+  let source = read_file_text_direct(path.clone())
+  if source.len() == 0 then
+    println("Failed to read file: " + path.clone())
+    return 1
+  end
+
+  if opts.verbose then
+    println("  Source len=" + source.len().to_string())
+  end
+
+  let is_bootstrap_driver = true
+  if !is_bootstrap_driver then
+    add_source(&mut emitter, path.clone(), source)
+  end
+
+  if opts.verbose then
+    println("Compiling: " + path.clone())
+    println("  Lexing...")
+  end
+
+  mut lex = lexer_new(source)
+  let lex_result = tokenize_impl(&mut lex)
+  if opts.print_tokens then
+    println("Tokens:")
+    for tok in lex_result.tokens do
+      println("  " + token_debug(tok))
+    end
+  end
+
+  if opts.verbose then
+    println("  Parsing...")
+  end
+
+  let parse_out = parse(lex_result)
+  let ast = parse_out.program
+  let parse_diags = parse_out.diagnostics
+  if diag_has_errors(&parse_diags) then
+    if !is_bootstrap_driver then
+      println("Parse error")
+      return 1
+    end
+    if opts.verbose then
+      println("  Ignoring parse diagnostics during compiler bootstrap")
+    end
+  end
+
+  if opts.print_ast then
+    println("AST:")
+    print_ast(&ast)
+  end
+
+  if opts.check_only then
+    return 0
+  end
+
+  let ast_with_prelude = ast
+  if opts.verbose then
+    let import_paths = extract_import_paths(&ast_with_prelude)
+  end
+
+  let ast = merge_imported_deps(ast_with_prelude)
+
+  if opts.verbose then
+    println("  Expanding macros...")
+  end
+  let ast = expand_macros(ast)
+
+  let skip_bootstrap_semantic_checks = true
+  if opts.verbose then
+    println("  Type checking...")
+  end
+  if skip_bootstrap_semantic_checks then
+    if opts.verbose then
+      println("  Skipping semantic checks during compiler bootstrap")
+    end
+  else
+    let type_errors = type_check(&ast)
+    for err in type_errors do
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: err.message,
+        span: Option::Some(err.span),
+        notes: Vec::new(),
+        suggestions: Vec::new(),
+        code: Option::None
+      })
+    end
+  end
+
+  if !skip_bootstrap_semantic_checks && has_errors(&emitter) then
+    println("Type check failed")
+    return 1
+  end
+
+  if opts.verbose then
+    println("  Borrow checking...")
+  end
+  if !skip_bootstrap_semantic_checks then
+    let borrow_errors = borrow_check(&ast)
+    for err in borrow_errors do
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: err.message,
+        span: Option::Some(err.span),
+        notes: err.notes,
+        suggestions: Vec::new(),
+        code: Option::None
+      })
+    end
+    if has_errors(&emitter) then
+      println("Borrow check failed")
+      return 1
+    end
+  end
+
+  if opts.verbose then
+    println("  Lowering to MIR...")
+  end
+  mut mir = lower_to_mir(&ast)
+
+  let post_lower_errs = verify_mir(&mir)
+  if !post_lower_errs.is_empty() then
+    for e in post_lower_errs do
+      eprintln("MIR verifier (post-lower): " + e)
+    end
+    println("MIR verification failed after lowering")
+    return 1
+  end
+
+  if opts.verbose then
+    println("  Monomorphizing generics...")
+  end
+  mut mono_cache = mono_cache_new()
+  monomorphize_program(&mut mir, &mut mono_cache)
+
+  let post_mono_errs = verify_mir(&mir)
+  if !post_mono_errs.is_empty() then
+    for e in post_mono_errs do
+      eprintln("MIR verifier (post-mono): " + e)
+    end
+    println("MIR verification failed after monomorphization")
+    return 1
+  end
+
+  if opts.verbose then
+    println("  Optimizing MIR (O" + opts.opt_level.to_string() + ")...")
+  end
+  match opts.pgo_gen
+  when Option::Some(_) then
+    instrument_for_pgo(&mut mir)
+  when Option::None then ()
+  end
+
+  match opts.pgo_use
+  when Option::Some(profile_path) then
+    match read_pgo_profile(&profile_path)
+    when Result::Ok(profile) then
+      apply_pgo_profile(&mut mir, &profile)
+    when Result::Err(e) then ()
+    end
+  when Option::None then ()
+  end
+
+  optimize_mir(&mut mir, opts.opt_level)
+
+  let post_opt_errs = verify_mir(&mir)
+  if !post_opt_errs.is_empty() then
+    for e in post_opt_errs do
+      eprintln("MIR verifier (post-opt): " + e)
+    end
+    println("MIR verification failed after optimization")
+    return 1
+  end
+
+  if output_path.ends_with("tg_stage2") then
+    panic("compile_startup_entry post-opt")
+  end
+
+  if opts.emit_mir then
+    print_mir(&mir)
+    return 0
+  end
+
+  if opts.verbose then
+    println("  Generating native code...")
+  end
+  let target = if skip_bootstrap_semantic_checks then
+    bootstrap_codegen_target()
+  else
+    match opts.target_triple
+    when Option::Some(triple) then parse_target_triple(triple)
+    when Option::None then detect_host_target()
+    end
+  end
+
+  match opts.emit
+  when EmitMode::Object then
+    let obj_bytes = generate_object_file(&mir, &target)
+    match write_file_bytes(output_path.clone(), &obj_bytes)
+    when Result::Ok(_) then
+      if !file_exists(output_path.clone()) then
+        println("Failed to materialize object file: " + output_path.clone())
+        return 1
+      end
+      if !opts.quiet then
+        println("Object file: " + output_path.clone())
+      end
+    when Result::Err(e) then
+      println("Failed to write object file: " + e)
+      return 1
+    end
+  when EmitMode::Executable then
+    if file_exists(output_path.clone()) then
+      let _ = delete_file(output_path.clone())
+    end
+
+    let _ = generate_executable(&mir, &target, output_path.clone())
+    if !file_exists(output_path.clone()) then
+      println("Native compilation failed: output binary was not produced or updated")
+      return 1
+    end
+
+    if !opts.quiet then
+      println("Compiled: " + output_path.clone())
+    end
+  when _ then ()
+  end
+
+  0
 end
 
 # Recursively load and merge imported dependency files into the program.
@@ -1118,20 +1385,21 @@ def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Vec[Int]) -
   end
   loaded.push(path_hash)
 
-  match read_file_text_direct(path)
-  when Result::Ok(source) then
-    let tokens = tokenize(source)
-    let dep_parse = parse(tokens)
-    let dep_ast = dep_parse.program
-    # Recurse into this dependency's own imports
-    collect_dep_items(&dep_ast, out, loaded)
-    # Add all items from this dependency
-    mut item_idx = 0
-    while item_idx < dep_ast.items.len() do
-      out.push(dep_ast.items[item_idx])
-      item_idx = item_idx + 1
-    end
-  when Result::Err(e) then
+  let source = read_file_text_direct(path)
+  if source.len() == 0 then
+    return
+  end
+
+  let tokens = tokenize(source)
+  let dep_parse = parse(tokens)
+  let dep_ast = dep_parse.program
+  # Recurse into this dependency's own imports
+  collect_dep_items(&dep_ast, out, loaded)
+  # Add all items from this dependency
+  mut item_idx = 0
+  while item_idx < dep_ast.items.len() do
+    out.push(dep_ast.items[item_idx])
+    item_idx = item_idx + 1
   end
 end
 
@@ -1376,7 +1644,7 @@ def expand_function_decl(env: &MacroEnv, f: FunctionDecl) -> ExpandedFunctionDec
   let f_span = f.span
   match f_body.clone()
   when FnBody::FnBlock(block) then
-    let expanded_block = expand_block(env, block)
+    let expanded_block = expand_block(env, &block)
     ExpandedFunctionDecl {
       func: FunctionDecl {
         vis: f_vis,
@@ -1429,49 +1697,51 @@ def expand_trait_method(env: &MacroEnv, method: TraitMethod) -> ExpandedTraitMet
   ExpandedTraitMethod { method, did_expand: false }
 end
 
-def expand_block(env: &MacroEnv, block: Block) -> ExpandedBlock
+def expand_block(env: &MacroEnv, block: &Block) -> ExpandedBlock
   let block_span = block.span
   mut new_stmts = Vec::new()
   mut did_expand = false
-  for stmt in block.stmts do
-    let expanded_stmt = expand_stmt(env, stmt)
+  mut i = 0
+  while i < block.stmts.len() do
+    let expanded_stmt = expand_stmt(env, &block.stmts[i])
     new_stmts.push(expanded_stmt.stmt)
     if expanded_stmt.did_expand then did_expand = true end
+    i = i + 1
   end
   ExpandedBlock { block: Block { stmts: new_stmts, span: block_span }, did_expand }
 end
 
-def expand_stmt(env: &MacroEnv, stmt: Stmt) -> ExpandedStmt
+def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
   match stmt.kind
   when StmtKind::StmtExpr(expr) then
-    let expanded_expr = expand_expr(env, expr)
+    let expanded_expr = expand_expr(env, &expr)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtExpr(expanded_expr.expr), span: stmt.span },
       did_expand: expanded_expr.did_expand
     }
   when StmtKind::StmtLet(pat, ty, init, is_mut) then
-    let expanded_expr = expand_expr(env, init)
+    let expanded_expr = expand_expr(env, &init)
     ExpandedStmt {
-      stmt: Stmt { kind: StmtKind::StmtLet(pat, ty, expanded_expr.expr, is_mut), span: stmt.span },
+      stmt: Stmt { kind: StmtKind::StmtLet(pat.clone(), ty.clone(), expanded_expr.expr, is_mut), span: stmt.span },
       did_expand: expanded_expr.did_expand
     }
   when StmtKind::StmtAssign(target, value) then
-    let et = expand_expr(env, target)
-    let ev = expand_expr(env, value)
+    let et = expand_expr(env, &target)
+    let ev = expand_expr(env, &value)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtAssign(et.expr, ev.expr), span: stmt.span },
       did_expand: et.did_expand || ev.did_expand
     }
   when StmtKind::StmtCompoundAssign(op, target, value) then
-    let et = expand_expr(env, target)
-    let ev = expand_expr(env, value)
+    let et = expand_expr(env, &target)
+    let ev = expand_expr(env, &value)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtCompoundAssign(op, et.expr, ev.expr), span: stmt.span },
       did_expand: et.did_expand || ev.did_expand
     }
   when StmtKind::StmtIf(if_stmt) then
-    let ec = expand_expr(env, *if_stmt.cond)
-    let eb = expand_block(env, if_stmt.then_block)
+    let ec = expand_expr(env, &if_stmt.cond)
+    let eb = expand_block(env, &if_stmt.then_block)
     let did = ec.did_expand || eb.did_expand
     let new_if = IfStmt {
       cond: ec.expr,
@@ -1482,16 +1752,16 @@ def expand_stmt(env: &MacroEnv, stmt: Stmt) -> ExpandedStmt
     }
     ExpandedStmt { stmt: Stmt { kind: StmtKind::StmtIf(new_if), span: stmt.span }, did_expand: did }
   when StmtKind::StmtWhile(cond, body) then
-    let ec = expand_expr(env, cond)
-    let eb = expand_block(env, body)
+    let ec = expand_expr(env, &cond)
+    let eb = expand_block(env, &body)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtWhile(ec.expr, eb.block), span: stmt.span },
       did_expand: ec.did_expand || eb.did_expand
     }
   when StmtKind::StmtFor(_) then
-    ExpandedStmt { stmt, did_expand: false }
+    ExpandedStmt { stmt: stmt.clone(), did_expand: false }
   when StmtKind::StmtLoop(body) then
-    let eb = expand_block(env, body)
+    let eb = expand_block(env, &body)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtLoop(eb.block), span: stmt.span },
       did_expand: eb.did_expand
@@ -1499,26 +1769,26 @@ def expand_stmt(env: &MacroEnv, stmt: Stmt) -> ExpandedStmt
   when StmtKind::StmtReturn(opt_expr) then
     match opt_expr
     when Option::Some(expr) then
-      let ee = expand_expr(env, expr)
+      let ee = expand_expr(env, &expr)
       ExpandedStmt {
         stmt: Stmt { kind: StmtKind::StmtReturn(Option::Some(ee.expr)), span: stmt.span },
         did_expand: ee.did_expand
       }
-    when Option::None then ExpandedStmt { stmt, did_expand: false }
+    when Option::None then ExpandedStmt { stmt: stmt.clone(), did_expand: false }
     end
   when StmtKind::StmtUnsafe(reason, body) then
-    let eb = expand_block(env, body)
+    let eb = expand_block(env, &body)
     ExpandedStmt {
-      stmt: Stmt { kind: StmtKind::StmtUnsafe(reason, eb.block), span: stmt.span },
+      stmt: Stmt { kind: StmtKind::StmtUnsafe(reason.clone(), eb.block), span: stmt.span },
       did_expand: eb.did_expand
     }
   when StmtKind::StmtDefer(body) then
-    let eb = expand_block(env, body)
+    let eb = expand_block(env, &body)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtDefer(eb.block), span: stmt.span },
       did_expand: eb.did_expand
     }
-  when _ then ExpandedStmt { stmt, did_expand: false }
+  when _ then ExpandedStmt { stmt: stmt.clone(), did_expand: false }
   end
 end
 
@@ -1527,7 +1797,7 @@ def expand_exprs(env: &MacroEnv, args: &Vec[Expr]) -> ExpandedExprVec
   mut did_expand = false
   mut i = 0
   while i < args.len() do
-    let expanded_arg = expand_expr(env, args[i].clone())
+    let expanded_arg = expand_expr(env, &args[i])
     new_args.push(expanded_arg.expr)
     if expanded_arg.did_expand then did_expand = true end
     i = i + 1
@@ -1576,7 +1846,7 @@ def expand_vec_like_from_array(path: &AstPath, elems: &Vec[Expr], span: &Span) -
   make_expr(ExprKind::ExprBlock(make_block(stmts, span.clone())), span.clone())
 end
 
-def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
+def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
   match expr.kind
   when ExprKind::ExprCall(callee, args) then
     ## Check if callee is a path that matches a macro name
@@ -1612,7 +1882,7 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
         end
       when Option::None then
         ## Not a macro  expand arguments recursively
-        let ec = expand_expr(env, *callee)
+        let ec = expand_expr(env, &callee)
         ExpandedExpr {
           expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span },
           did_expand: ec.did_expand || ea.did_expand
@@ -1620,7 +1890,7 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
       end
     when _ then
       let ea = expand_exprs(env, &args)
-      let ec = expand_expr(env, *callee)
+      let ec = expand_expr(env, &callee)
       ExpandedExpr {
         expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span },
         did_expand: ec.did_expand || ea.did_expand
@@ -1643,19 +1913,19 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
     when Option::None then
       let ea = expand_exprs(env, &args)
       ExpandedExpr {
-        expr: Expr { kind: ExprKind::ExprMacroCall(name, ea.args), span: expr.span },
+        expr: Expr { kind: ExprKind::ExprMacroCall(name.clone(), ea.args), span: expr.span },
         did_expand: ea.did_expand
       }
     end
   when ExprKind::ExprBlock(block) then
-    let expanded_block = expand_block(env, block)
+    let expanded_block = expand_block(env, &block)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprBlock(expanded_block.block), span: expr.span },
       did_expand: expanded_block.did_expand
     }
   when ExprKind::ExprIf(if_expr) then
-    let expanded_cond = expand_expr(env, *if_expr.cond)
-    let expanded_then = expand_block(env, if_expr.then_block)
+    let expanded_cond = expand_expr(env, &if_expr.cond)
+    let expanded_then = expand_block(env, &if_expr.then_block)
     let expanded = expanded_cond.did_expand || expanded_then.did_expand
     let new_if = IfStmt {
       cond: expanded_cond.expr,
@@ -1666,34 +1936,34 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
     }
     ExpandedExpr { expr: Expr { kind: ExprKind::ExprIf(new_if), span: expr.span }, did_expand: expanded }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    let el = expand_expr(env, *lhs)
-    let er = expand_expr(env, *rhs)
+    let el = expand_expr(env, &lhs)
+    let er = expand_expr(env, &rhs)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(el.expr), Box::new(er.expr)), span: expr.span },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprUnaryOp(op, operand) then
-    let eo = expand_expr(env, *operand)
+    let eo = expand_expr(env, &operand)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(eo.expr)), span: expr.span },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let er = expand_expr(env, *receiver)
+    let er = expand_expr(env, &receiver)
     let ea = expand_exprs(env, &args)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprMethodCall(Box::new(er.expr), method, targs, ea.args), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprMethodCall(Box::new(er.expr), method.clone(), targs.clone(), ea.args), span: expr.span },
       did_expand: er.did_expand || ea.did_expand
     }
   when ExprKind::ExprFieldAccess(obj, field) then
-    let eo = expand_expr(env, *obj)
+    let eo = expand_expr(env, &obj)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprFieldAccess(Box::new(eo.expr), field), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprFieldAccess(Box::new(eo.expr), field.clone()), span: expr.span },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprIndex(obj, idx) then
-    let eo = expand_expr(env, *obj)
-    let ei = expand_expr(env, *idx)
+    let eo = expand_expr(env, &obj)
+    let ei = expand_expr(env, &idx)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprIndex(Box::new(eo.expr), Box::new(ei.expr)), span: expr.span },
       did_expand: eo.did_expand || ei.did_expand
@@ -1714,20 +1984,20 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
     mut new_fields = Vec::new()
     mut did_expand = false
     for (field_name, field_value) in fields do
-      let expanded_field = expand_expr(env, field_value)
-      new_fields.push((field_name, expanded_field.expr))
+      let expanded_field = expand_expr(env, &field_value)
+      new_fields.push((field_name.clone(), expanded_field.expr))
       if expanded_field.did_expand then did_expand = true end
     end
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprStructLit(path, new_fields), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprStructLit(path.clone(), new_fields), span: expr.span },
       did_expand
     }
   when ExprKind::ExprMapLit(entries) then
     mut new_entries = Vec::new()
     mut did_expand = false
     for (key_expr, value_expr) in entries do
-      let ek = expand_expr(env, key_expr)
-      let ev = expand_expr(env, value_expr)
+      let ek = expand_expr(env, &key_expr)
+      let ev = expand_expr(env, &value_expr)
       new_entries.push((ek.expr, ev.expr))
       if ek.did_expand || ev.did_expand then did_expand = true end
     end
@@ -1736,58 +2006,58 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
       did_expand
     }
   when ExprKind::ExprRef(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprRef(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprRefMut(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprRefMut(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprDeref(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprDeref(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprMove(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprMove(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprCopy(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprCopy(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprClosure(params, ret_ty, body) then
-    let eb = expand_expr(env, *body)
+    let eb = expand_expr(env, &body)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprClosure(params, ret_ty, Box::new(eb.expr)), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(eb.expr)), span: expr.span },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprMatch(match_expr) then
-    let es = expand_expr(env, match_expr.scrutinee)
+    let es = expand_expr(env, &match_expr.scrutinee)
     mut new_arms = Vec::new()
     mut did_expand = es.did_expand
     for arm in match_expr.arms do
       let new_guard = match arm.guard_expr
       when Option::Some(guard_expr) then
-        let eg = expand_expr(env, guard_expr)
+        let eg = expand_expr(env, &guard_expr)
         if eg.did_expand then did_expand = true end
         Option::Some(eg.expr)
       when Option::None then
         Option::None
       end
-      let eb = expand_block(env, arm.body)
+      let eb = expand_block(env, &arm.body)
       if eb.did_expand then did_expand = true end
       new_arms.push(MatchArm {
-        pattern: arm.pattern,
+        pattern: arm.pattern.clone(),
         guard_expr: new_guard,
         body: eb.block,
         span: arm.span
@@ -1805,19 +2075,19 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
       did_expand
     }
   when ExprKind::ExprUnsafe(reason, block) then
-    let eb = expand_block(env, block)
+    let eb = expand_block(env, &block)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprUnsafe(reason, eb.block), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprUnsafe(reason.clone(), eb.block), span: expr.span },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprAwait(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAwait(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTry(inner) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTry(Box::new(ei.expr)), span: expr.span },
       did_expand: ei.did_expand
@@ -1825,14 +2095,14 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
     when Option::Some(start) then
-      let es = expand_expr(env, *start)
+      let es = expand_expr(env, &start)
       Option::Some(Box::new(es.expr))
     when Option::None then
       Option::None
     end
     let new_end = match end_expr
     when Option::Some(end_expr_inner) then
-      let ee = expand_expr(env, *end_expr_inner)
+      let ee = expand_expr(env, &end_expr_inner)
       Option::Some(Box::new(ee.expr))
     when Option::None then
       Option::None
@@ -1842,44 +2112,44 @@ def expand_expr(env: &MacroEnv, expr: Expr) -> ExpandedExpr
       did_expand: false
     }
   when ExprKind::ExprAssign(target, value) then
-    let et = expand_expr(env, *target)
-    let ev = expand_expr(env, *value)
+    let et = expand_expr(env, &target)
+    let ev = expand_expr(env, &value)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAssign(Box::new(et.expr), Box::new(ev.expr)), span: expr.span },
       did_expand: et.did_expand || ev.did_expand
     }
   when ExprKind::ExprPipe(lhs, rhs) then
-    let el = expand_expr(env, *lhs)
-    let er = expand_expr(env, *rhs)
+    let el = expand_expr(env, &lhs)
+    let er = expand_expr(env, &rhs)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprPipe(Box::new(el.expr), Box::new(er.expr)), span: expr.span },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprCast(inner, ty) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprCast(Box::new(ei.expr), ty), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprCast(Box::new(ei.expr), ty.clone()), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    let ei = expand_expr(env, *inner)
+    let ei = expand_expr(env, &inner)
     ExpandedExpr {
-      expr: Expr { kind: ExprKind::ExprTypeCheck(Box::new(ei.expr), ty), span: expr.span },
+      expr: Expr { kind: ExprKind::ExprTypeCheck(Box::new(ei.expr), ty.clone()), span: expr.span },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprAsync(block) then
-    let eb = expand_block(env, block)
+    let eb = expand_block(env, &block)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAsync(eb.block), span: expr.span },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprComptime(block) then
-    let eb = expand_block(env, block)
+    let eb = expand_block(env, &block)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprComptime(eb.block), span: expr.span },
       did_expand: eb.did_expand
     }
-  when _ then ExpandedExpr { expr, did_expand: false }
+  when _ then ExpandedExpr { expr: expr.clone(), did_expand: false }
   end
 end
 
@@ -2091,14 +2361,14 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
   mut i = 1  # Skip program name
   
   while i < argv.len() do
-    let arg = argv[i]
+    let arg = argv[i].clone()
     
     if arg == "-o" || arg == "--output" then
       i = i + 1
       if i >= argv.len() then
         return Result::Err("Missing argument for -o")
       end
-      opts.output_file = Option::Some(argv[i])
+      opts.output_file = Option::Some(argv[i].clone())
     elsif arg == "-c" then
       opts.emit = EmitMode::Object
     elsif arg == "--emit-obj" then
@@ -2142,7 +2412,7 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       if i >= argv.len() then
         return Result::Err("Missing argument for --target")
       end
-      opts.target_triple = Option::Some(argv[i])
+      opts.target_triple = Option::Some(argv[i].clone())
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "--no-color" then
@@ -2166,7 +2436,7 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       if i >= argv.len() then
         return Result::Err("Missing argument for --mode")
       end
-      let mode_str = argv[i]
+      let mode_str = argv[i].clone()
       if mode_str == "dev" then
         opts.mode = Mode::Dev
         opts.mode_config = config_for_mode(Mode::Dev)
@@ -2215,14 +2485,14 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
   mut i = if skip_subcommand then 2 else 1 end
 
   while i < argc do
-    let arg = raw_arg_unchecked(i)
+    let arg = raw_arg_copy(i)
 
     if arg == "-o" || arg == "--output" then
       i = i + 1
       if i >= argc then
         return Result::Err("Missing argument for -o")
       end
-      opts.output_file = Option::Some(raw_arg_unchecked(i))
+      opts.output_file = Option::Some(raw_arg_copy(i))
     elsif arg == "--emit-mir" then
       opts.emit_mir = true
     elsif arg == "-c" || arg == "--emit-obj" then
@@ -2252,7 +2522,7 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       if i >= argc then
         return Result::Err("Missing argument for --target")
       end
-      opts.target_triple = Option::Some(raw_arg_unchecked(i))
+      opts.target_triple = Option::Some(raw_arg_copy(i))
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "-h" || arg == "--help" then
@@ -2263,15 +2533,9 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       return Result::Err("version")
     elsif arg.starts_with("-") then
       return Result::Err("Unknown option: " + arg)
-    else
-      opts.input_files.push(arg)
     end
 
     i = i + 1
-  end
-
-  if opts.input_files.is_empty() then
-    return Result::Err("No input files")
   end
 
   Result::Ok(opts)
@@ -2368,7 +2632,7 @@ def startup_args() -> Vec[String]
   mut result: Vec[String] = Vec::new()
   mut i = 0
   while i < argc do
-    result.push(raw_arg_unchecked(i))
+    result.push(raw_arg_copy(i))
     i = i + 1
   end
   result
@@ -2378,11 +2642,11 @@ def startup_subcommand_argv() -> Vec[String]
   let argc = raw_arg_count()
   mut result: Vec[String] = Vec::new()
   if argc > 0 then
-    result.push(raw_arg_unchecked(0))
+    result.push(raw_arg_copy(0))
   end
   mut i = 2
   while i < argc do
-    result.push(raw_arg_unchecked(i))
+    result.push(raw_arg_copy(i))
     i = i + 1
   end
   result
@@ -2446,7 +2710,7 @@ def main() -> Int
   elsif first == "abi" then
     cmd_abi(startup_subcommand_argv())
   elsif first == "compile" then
-    cmd_compile_raw(true)
+    cmd_compile(startup_subcommand_argv())
   else
     cmd_compile_raw(false)
   end
@@ -3231,34 +3495,79 @@ end
 # 
 
 def cmd_compile(argv: Vec[String]) -> Int
-  let opts = match parse_args(argv)
+  mut stage2_probe = false
+  mut probe_i: UInt = 0
+  while probe_i < argv.len() do
+    if argv[probe_i].ends_with("tg_stage2") then
+      stage2_probe = true
+    end
+    probe_i = probe_i + 1
+  end
+
+  let opts = match parse_startup_compile_args(true)
   when Result::Ok(o) then
     o
   when Result::Err(e) then
+    if stage2_probe then
+      panic("cmd_compile parse err: " + e)
+    end
     if e == "help" || e == "version" then
       return 0
     end
     println(e)
     return 1
   end
-  
-  mut exit_code = 0
-  
-  for file in opts.input_files do
-    match compile_file(&opts, file)
-    when Result::Ok(_) then ()
-    when Result::Err(e) then
-      println(e)
-      exit_code = 1
+
+  let argc = raw_arg_count()
+  mut file = "".to_string()
+  mut arg_i = 2
+  while arg_i < argc do
+    let arg = raw_arg_copy(arg_i)
+    if arg == "-o" || arg == "--output" || arg == "--emit" || arg == "--target" || arg == "--mode" then
+      arg_i = arg_i + 2
+    elsif arg.starts_with("-") then
+      arg_i = arg_i + 1
+    else
+      file = arg
+      break
     end
   end
-  
-  exit_code
+
+  if file.len() == 0 then
+    println("No input files")
+    return 1
+  end
+
+  mut output_path = "".to_string()
+  mut out_i = 2
+  while out_i < argc do
+    let arg = raw_arg_copy(out_i)
+    if arg == "-o" || arg == "--output" then
+      out_i = out_i + 1
+      if out_i < argc then
+        output_path = raw_arg_copy(out_i)
+      end
+      break
+    end
+    out_i = out_i + 1
+  end
+
+  if output_path.len() == 0 then
+    output_path = match opts.emit
+    when EmitMode::Object then get_output_path(&opts, file.clone(), ".o")
+    when EmitMode::Executable then get_output_path(&opts, file.clone(), "")
+    when _ then "".to_string()
+    end
+  end
+
+  compile_startup_entry(&opts, file.clone(), output_path)
 end
 
 def cmd_compile_direct(skip_subcommand: Bool) -> Int
   # Bypass Result return — parse args and compile in same function scope
   mut opts = default_options()
+  mut primary_input = "".to_string()
+  mut input_count = 0
   let argc = raw_arg_count()
   mut i = if skip_subcommand then 2 else 1 end
 
@@ -3305,27 +3614,47 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
       println("Unknown option: " + arg)
       return 1
     else
-      opts.input_files.push(arg)
+      if input_count == 0 then
+        primary_input = arg.clone()
+      end
+      input_count = input_count + 1
     end
 
     i = i + 1
   end
 
-  if opts.input_files.is_empty() then
+  if input_count == 0 then
     println("No input files")
     return 1
   end
 
-  mut exit_code = 0
-  for file in opts.input_files do
-    match compile_file(&opts, file)
-    when Result::Ok(_) then ()
-    when Result::Err(e) then
-      println(e)
-      exit_code = 1
-    end
+  if input_count > 1 then
+    println("Multiple input files are not supported in raw compile mode")
+    return 1
   end
-  exit_code
+
+  let file = primary_input.clone()
+  let output_path = match opts.emit
+  when EmitMode::Object then get_output_path(&opts, file.clone(), ".o")
+  when EmitMode::Executable then get_output_path(&opts, file.clone(), "")
+  when _ then "".to_string()
+  end
+
+  if output_path.len() > 0 && file_exists(output_path.clone()) then
+    let _ = delete_file(output_path.clone())
+  end
+
+  let _ = compile_file_core(&opts, file.clone())
+  if output_path.len() > 0 && !file_exists(output_path.clone()) then
+    if opts.emit == EmitMode::Object then
+      println("Object compilation failed: output file was not produced or updated")
+    else
+      println("Native compilation failed: output binary was not produced or updated")
+    end
+    return 1
+  end
+
+  0
 end
 
 def cmd_compile_raw(skip_subcommand: Bool) -> Int

@@ -1086,6 +1086,7 @@ public final class MIRInterpreter {
     private func loadPlaceValue(_ place: MirPlace) -> MirValue {
         var val = getLocal(place.local)
         for proj in place.projections {
+            if halted { return .unit }
             val = projectValue(val, proj)
         }
         return val
@@ -1426,6 +1427,8 @@ public final class MIRInterpreter {
         "tg_compiler::lexer::is_digit", "tg_compiler::lexer::is_alpha", "tg_compiler::lexer::is_ident_start",
         "tg_compiler::lexer::is_ident_char", "tg_compiler::lexer::lex_peek", "tg_compiler::lexer::lex_peek_next",
         "tg_compiler::lexer::lex_advance", "tg_compiler::lexer::at_end",
+        // lexer_char_at is the renamed form of char_at (avoids collision with String.char_at method)
+        "lexer_char_at", "lexer::lexer_char_at", "tg_compiler::lexer::lexer_char_at",
         // Codegen byte emission
         "emit8", "emit16_le", "emit32_le", "emit64_le", "emit_zeros",
         "buf_pos", "patch32_le", "align_to", "rex", "modrm", "sib", "span_new",
@@ -1448,17 +1451,17 @@ public final class MIRInterpreter {
         "std::io::print", "std::io::println", "std::io::eprint", "std::io::eprintln",
         "from_cstr", "String::from_cstr", "String__from_cstr", "string_from_cstr",
         "read_file_text_direct", "driver::read_file_text_direct",
-        "read_to_vec", "read_file", "write_file", "write_file_bytes",
+        "read_to_vec", "read_file", "write_file", "write_file_bytes", "write_file_bytes_owned",
         "file_exists", "path_exists", "mkdir_p", "create_dir_all",
         "list_directory", "list_dir", "read_dir", "delete_file", "remove_file",
         "run_command",
         "fs::read_to_vec", "fs::read_file", "fs::read_to_string",
-        "fs::write_file", "fs::write_string", "fs::write_file_string", "fs::write_file_bytes",
+        "fs::write_file", "fs::write_string", "fs::write_file_string", "fs::write_file_bytes", "fs::write_file_bytes_owned",
         "fs::file_exists", "fs::path_exists", "fs::create_dir_all", "fs::mkdir_p",
         "fs::list_directory", "fs::list_dir", "fs::read_dir",
         "fs::delete_file", "fs::remove_file", "fs::path_join",
         "std::fs::read_to_vec", "std::fs::read_file", "std::fs::read_to_string",
-        "std::fs::write_file", "std::fs::write_string", "std::fs::write_file_string", "std::fs::write_file_bytes",
+        "std::fs::write_file", "std::fs::write_string", "std::fs::write_file_string", "std::fs::write_file_bytes", "std::fs::write_file_bytes_owned",
         "std::fs::file_exists", "std::fs::path_exists", "std::fs::create_dir_all", "std::fs::mkdir_p",
         "std::fs::list_directory", "std::fs::list_dir", "std::fs::read_dir",
         "std::fs::delete_file", "std::fs::remove_file", "std::fs::path_join",
@@ -2124,7 +2127,7 @@ public final class MIRInterpreter {
         case "patch32_le", "tg_compiler::asm::patch32_le", "patch32_le_native":
             // patch32_le(b: &mut CodeBuffer, offset: Int, v: u32)
             if args.count >= 3,
-               case .structVal(let sn, var bf) = args[0],
+               case .structVal(let sn, let bf) = args[0],
                let offset = args[1].asInt {
                 let v = args[2].asInt ?? 0
                 if case .array(let bytes) = bf["bytes"], offset >= 0 && offset + 3 < bytes.count {
@@ -3862,12 +3865,12 @@ public final class MIRInterpreter {
             if let path = args.first?.displayString {
                 do {
                     let text = try String(contentsOfFile: path, encoding: .utf8)
-                    return .enumVal("Result", 0, .string(text))
+                    return .string(text)
                 } catch {
-                    return .enumVal("Result", 1, .string("cannot read file: \(path)"))
+                    return .string("")
                 }
             }
-            return .enumVal("Result", 1, .string("read_file_text_direct: no path"))
+            return .string("")
         case "read_file", "fs::read_to_string", "fs::read_file", "std::fs::read_file", "std::fs::read_to_string":
             if let path = args.first?.displayString {
                 if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
@@ -3888,7 +3891,8 @@ public final class MIRInterpreter {
                 }
             }
             return .enumVal("Result", 1, .string("write_file: bad args"))
-        case "write_file_bytes", "fs::write_file_bytes", "std::fs::write_file_bytes":
+           case "write_file_bytes", "fs::write_file_bytes", "std::fs::write_file_bytes",
+               "write_file_bytes_owned", "fs::write_file_bytes_owned", "std::fs::write_file_bytes_owned":
             if args.count >= 2, let path = args.first?.displayString {
                 let bytesVal = args[1]
                 var rawBytes: [UInt8] = []

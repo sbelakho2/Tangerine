@@ -55,7 +55,6 @@
 use std::core::{Option, Result, String, Bool, Int, Unit, Vec}
 use std::gfx_errors::{ErrorCode}
 use std::io::{syscall1, syscall2, syscall3, syscall4}
-use std::process
 
 @ffi("c")
 extern def _tg_read_vec_u8(fd: Int, buf: &mut Vec[u8], count: UInt) -> Int
@@ -63,6 +62,10 @@ end
 
 @ffi("c")
 extern def _tg_write_vec_u8(fd: Int, buf: &Vec[u8], count: UInt) -> Int
+end
+
+@ffi("c")
+extern def libc_write(fd: Int, buf: &u8, count: UInt) -> Int
 end
 
 # [METADATA]
@@ -247,9 +250,9 @@ def SYS_CHDIR_MAC() -> Int = 9
 def O_RDONLY() -> Int = 0
 def O_WRONLY() -> Int = 1
 def O_RDWR() -> Int = 2
-def O_CREAT() -> Int = 64
-def O_TRUNC() -> Int = 512
-def O_APPEND() -> Int = 1024
+def O_CREAT() -> Int = if is_linux() then 64 else 512 end
+def O_TRUNC() -> Int = if is_linux() then 512 else 1024 end
+def O_APPEND() -> Int = if is_linux() then 1024 else 8 end
 def O_DIRECTORY() -> Int = 65536
 def O_CLOEXEC() -> Int = 524288
 
@@ -298,47 +301,32 @@ def FILE_ATTRIBUTE_SYSTEM() -> UInt = 0x04
 # ═══════════════════════════════════════════════════════════════
 # Platform Detection
 # ═══════════════════════════════════════════════════════════════
+#
+# Platform is resolved at compile time via @cfg so each build sees exactly
+# one definition of is_macos/is_linux/is_windows. This avoids the runtime
+# env-var heuristic (the old __CF_USER_TEXT_ENCODING probe) which gave
+# wrong answers whenever the parent process stripped that variable.
 
-# These will be set by the runtime based on target
-mut _is_macos: Bool = false
-mut _is_linux: Bool = false
-mut _is_windows: Bool = false
+@cfg(target_os = "macos")
+def is_macos() -> Bool = true
+@cfg(target_os = "macos")
+def is_linux() -> Bool = false
+@cfg(target_os = "macos")
+def is_windows() -> Bool = false
 
-def init_platform() -> Unit
-  # Debug: dump first 5 env entries
-  let env_count = std::env::_tg_env_count()
-  mut dbg_i = 0
-  while dbg_i < 5 && dbg_i < env_count do
-    let entry: String = std::env::_tg_env_entry(dbg_i)
-    dbg_i = dbg_i + 1
-  end
-  # Detect platform at runtime
-  # __CF_USER_TEXT_ENCODING is always set in envp on macOS by the system.
-  # This is more reliable than OSTYPE which is a shell variable and
-  # may not be exported to process environment.
-  let cf_env = std::env::get_env("__CF_USER_TEXT_ENCODING")
-  match cf_env
-  when Option::Some(_) then
-    _is_macos = true
-  when Option::None then
-    _is_linux = true
-  end
-end
+@cfg(target_os = "linux")
+def is_macos() -> Bool = false
+@cfg(target_os = "linux")
+def is_linux() -> Bool = true
+@cfg(target_os = "linux")
+def is_windows() -> Bool = false
 
-def is_macos() -> Bool
-  if !_is_macos && !_is_linux then init_platform() end
-  _is_macos
-end
-
-def is_linux() -> Bool
-  if !_is_macos && !_is_linux then init_platform() end
-  _is_linux
-end
-
-def is_windows() -> Bool
-  if !_is_macos && !_is_linux && !_is_windows then init_platform() end
-  _is_windows
-end
+@cfg(target_os = "windows")
+def is_macos() -> Bool = false
+@cfg(target_os = "windows")
+def is_linux() -> Bool = false
+@cfg(target_os = "windows")
+def is_windows() -> Bool = true
 
 # ═══════════════════════════════════════════════════════════════
 # Windows API Functions (FFI)
@@ -393,15 +381,18 @@ end
 # They use __intrinsic_syscall* functions
 
 # Raw syscall wrappers with errno handling
-def raw_open(path: String, flags: Int, mode: UInt) -> Result[Int, IoError]
+def raw_open_fd(path: String, flags: Int, mode: UInt) -> Int
   let path_ptr = path.as_ptr() as Int
-  
+
   let sys_num = if is_linux() then SYS_OPEN() else SYS_OPEN_MAC() end
-  let result = syscall3(sys_num, path_ptr, flags, mode as Int)
+  syscall3(sys_num, path_ptr, flags, mode as Int)
+end
+
+def raw_open(path: String, flags: Int, mode: UInt) -> Result[Int, IoError]
+  let result = raw_open_fd(path.clone(), flags, mode)
   
   if result < 0 then
-    eprintln("[FS-OPEN-ERR] errno=" + (-result).to_string() + " sys=" + sys_num.to_string() + " flags=" + flags.to_string() + " path_ptr=" + path_ptr.to_string() + " path=" + path.clone())
-    Result::Err(IoError::InvalidInput("open failed: errno=" + (-result).to_string() + " sys=" + sys_num.to_string() + " flags=" + flags.to_string() + " path_ptr=" + path_ptr.to_string() + " path=" + path.clone()))
+    Result::Err(IoError::from_errno(-result, path.clone()))
   else
     Result::Ok(result)
   end
@@ -766,9 +757,9 @@ def read_to_string(path: String) -> Result[String, IoError]
 end
 
 def write_file_bytes(path: String, data: &Vec[u8]) -> Result[Unit, IoError]
-  match open(path.clone(), OpenMode::Create)
-  when Result::Ok(mut file) then
-    if is_windows() then
+  if is_windows() then
+    match open(path.clone(), OpenMode::Create)
+    when Result::Ok(mut file) then
       match write(&file, data, data.len() as UInt)
       when Result::Ok(_) then
         let _ = close(&mut file)
@@ -777,18 +768,46 @@ def write_file_bytes(path: String, data: &Vec[u8]) -> Result[Unit, IoError]
         let _ = close(&mut file)
         Result::Err(e)
       end
-    else
-      match raw_write(file.fd, data, data.len() as UInt)
-      when Result::Ok(_) then
-        let _ = raw_close(file.fd)
-        Result::Ok(())
-      when Result::Err(e) then
-        let _ = raw_close(file.fd)
-        Result::Err(e)
-      end
+    when Result::Err(e) then
+      Result::Err(e)
     end
-  when Result::Err(e) then
-    Result::Err(e)
+  else
+    let flags = O_WRONLY() | O_CREAT() | O_TRUNC()
+    let fd = raw_open_fd(path.clone(), flags, S_DEFAULT())
+    if fd < 0 then
+      return Result::Err(IoError::from_errno(-fd, path))
+    end
+
+    # raw_write clamps to the actual Vec length; avoid calling len() on this
+    # &Vec parameter until the collection-ref lowering bug is fixed globally.
+    match raw_write(fd, data, 2147483647 as UInt)
+    when Result::Ok(_) then
+      let _ = raw_close(fd)
+      Result::Ok(())
+    when Result::Err(e) then
+      let _ = raw_close(fd)
+      Result::Err(e)
+    end
+  end
+end
+
+def write_file_bytes_owned(path: String, data: Vec[u8]) -> Result[Unit, IoError]
+  if is_windows() then
+    write_file_bytes(path, &data)
+  else
+    let flags = O_WRONLY() | O_CREAT() | O_TRUNC()
+    let fd = raw_open_fd(path.clone(), flags, S_DEFAULT())
+    if fd < 0 then
+      return Result::Err(IoError::from_errno(-fd, path))
+    end
+
+    let wrote = libc_write(fd, data.as_ptr(), data.len() as UInt)
+    let _ = raw_close(fd)
+    if wrote < 0 then
+      Result::Err(IoError::from_errno(-wrote, path))
+    else
+      Result::Ok(())
+    end
   end
 end
 
@@ -1600,8 +1619,11 @@ end
 
 def temp_file() -> Result[File, IoError]
   _temp_counter = _temp_counter + 1
-  let pid = std::process::current_pid()
-  let name = temp_dir() + "/tg_temp_" + pid.to_string() + "_" + _temp_counter.to_string()
+  # NOTE: PID is intentionally omitted here to keep std::fs bootstrap-profile
+  # compliant (no std::process import). Uniqueness is provided by the monotonic
+  # counter plus the O_EXCL flag below; callers needing per-process isolation
+  # should wrap this with their own namespace.
+  let name = temp_dir() + "/tg_temp_" + _temp_counter.to_string()
   
   # Create with O_EXCL to ensure uniqueness
   let flags = O_RDWR() | O_CREAT() | 0o200  # O_EXCL

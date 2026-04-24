@@ -3542,11 +3542,10 @@ public final class Parser {
     /// Parse a zero-parameter closure: || body
     private func parseZeroParamClosure() -> Expr {
         let start = currentSpan
-        // Check for `move ||` syntax
-        var isMove = eat(.kwMut)
+        // Check for `move ||` syntax (move-ness not yet threaded into ClosureExpr)
+        _ = eat(.kwMut)
         if case .ident("move") = peekKind() {
             advance()
-            isMove = true
         }
         advance() // skip ||
         let body: Expr
