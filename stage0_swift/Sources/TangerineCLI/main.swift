@@ -943,8 +943,8 @@ struct TangerineCLI {
         print("Merged MIR: \(mergedMIR.functions.count) functions, \(mergedMIR.statics.count) statics, \(mergedMIR.typeDefs.count) types")
         fflush(stdout)
 
-        guard mergedMIR.functions.contains(where: { $0.name == "driver::main" }) else {
-            fputs("error: no 'driver::main' entry point found in merged MIR\n", stderr)
+        guard mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" }) else {
+            fputs("error: no 'driver::driver_main' entry point found in merged MIR\n", stderr)
             exit(1)
         }
 
@@ -982,7 +982,7 @@ struct TangerineCLI {
         print("Args: \(compileArgs.joined(separator: " "))")
         fflush(stdout)
 
-        let result = interp.run(entryFunction: "driver::main")
+        let result = interp.run(entryFunction: "driver::driver_main")
         let outputAttrsAfter = try? fm.attributesOfItem(atPath: outputPath)
         let outputSize = (outputAttrsAfter?[.size] as? NSNumber)?.int64Value ?? 0
         let hadPanic = result.output.contains(where: { $0.hasPrefix("PANIC:") })
@@ -1110,13 +1110,13 @@ struct TangerineCLI {
         fflush(stdout)
 
         // Step 4: Verify MIR has a main function
-        let hasDriverMain = mergedMIR.functions.contains(where: { $0.name == "driver::main" })
-        print("Entry point 'driver::main': \(hasDriverMain ? "found" : "NOT FOUND")")
+        let hasDriverMain = mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" })
+        print("Entry point 'driver::driver_main': \(hasDriverMain ? "found" : "NOT FOUND")")
         fflush(stdout)
 
         if dryRun {
             print("\n--- Dry Run Complete ---")
-            print("Would interpret merged MIR (\(mergedMIR.functions.count) functions) with entry 'driver::main'")
+            print("Would interpret merged MIR (\(mergedMIR.functions.count) functions) with entry 'driver::driver_main'")
 
             let drySuccess = hasDriverMain
             let ts = iso8601Now()
@@ -1138,7 +1138,7 @@ struct TangerineCLI {
         }
 
         guard hasDriverMain else {
-            fputs("error: no 'driver::main' function found in merged MIR\n", stderr)
+            fputs("error: no 'driver::driver_main' function found in merged MIR\n", stderr)
             exit(1)
         }
 
@@ -1154,7 +1154,7 @@ struct TangerineCLI {
             }
         }
         interp.runtimeArgs = selfHostArgs
-        let result = interp.run(entryFunction: "driver::main")
+        let result = interp.run(entryFunction: "driver::driver_main")
 
         for line in result.output {
             print(line)

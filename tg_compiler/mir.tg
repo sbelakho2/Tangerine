@@ -332,6 +332,10 @@ def duplicate_constant(constant: &MirConstant) -> MirConstant
   when MirConstantKind::MirString(value) then constant_string(value.clone())
   when MirConstantKind::MirFnItem(name) then constant_fn_item(name.clone(), constant.ty.clone())
   when MirConstantKind::MirZeroSized then constant_zero_sized(constant.ty.clone())
+  when MirConstantKind::MirStaticRef(name) then
+    MirConstant { kind: MirConstantKind::MirStaticRef(name.clone()), ty: constant.ty.clone() }
+  when MirConstantKind::MirStaticAddr(name) then
+    MirConstant { kind: MirConstantKind::MirStaticAddr(name.clone()), ty: constant.ty.clone() }
   end
 end
 
@@ -2986,12 +2990,30 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
         end
       end
       if type_name != "" then
-        type_name + "__" + normalized_method_name.clone()
+        # For `.clone()`, only dispatch to TypeName__clone when it's a
+        # known refcounted wrapper whose clone has real side effects.
+        # Otherwise emit bare "clone" so codegen's intrinsic
+        # (deref_all_ref_like_args) handles it correctly. This avoids
+        # mis-dispatching clones on values whose recv_type happens to
+        # resolve to a sentinel TypeId (e.g. tid=0 → "WeakArc").
+        if normalized_method_name == "clone" then
+          if type_name == "Rc" || type_name == "WeakRc" || type_name == "ArcStrong" || type_name == "WeakArc" then
+            type_name + "__clone"
+          else
+            "clone"
+          end
+        else
+          type_name + "__" + normalized_method_name.clone()
+        end
       else
         # TypeId didn't resolve — fall back to impl_type_map
-        match b.impl_type_map.get(normalized_method_name)
-        when Option::Some(tn) then tn + "__" + normalized_method_name.clone()
-        when Option::None then normalized_method_name.clone()
+        if normalized_method_name == "clone" then
+          "clone"
+        else
+          match b.impl_type_map.get(normalized_method_name)
+          when Option::Some(tn) then tn + "__" + normalized_method_name.clone()
+          when Option::None then normalized_method_name.clone()
+          end
         end
       end
     when Type::String then
@@ -3007,15 +3029,22 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     when Type::Map(_, _) then "Map__" + normalized_method_name.clone()
     when Type::Set(_) then "Set__" + normalized_method_name.clone()
     when _ then
-      # Check impl_type_map for known method→type mappings
-      match b.impl_type_map.get(normalized_method_name)
-      when Option::Some(type_name) then type_name + "__" + normalized_method_name.clone()
-      when Option::None then normalized_method_name.clone()
+      # Check impl_type_map for known method→type mappings.
+      # For `.clone()`, the impl_type_map cache is unreliable (last impl
+      # wins, which is typically WeakArc), so always emit bare "clone"
+      # and let codegen's intrinsic fallback handle it.
+      if normalized_method_name == "clone" then
+        "clone"
+      else
+        match b.impl_type_map.get(normalized_method_name)
+        when Option::Some(type_name) then type_name + "__" + normalized_method_name.clone()
+        when Option::None then normalized_method_name.clone()
+        end
       end
     end
 
     let callee_op = mir_fn_operand(b, resolved_method.clone())
-    
+
     # Lower arguments: receiver first, then explicit args
     mut mir_args = Vec::new()
     mir_args.push(recv_op)
@@ -3465,7 +3494,23 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
       place_local(LocalId { id: 0 })
     end
   when ExprKind::ExprFieldAccess(recv, field) then
-    let base = lower_place(b, &recv)
+    # If recv is not place-like (e.g. a chained method call like
+    # self.ptr.as_mut()), evaluate it into a temp local first and use
+    # that as the place base.  Falling through to lower_place's catch-all
+    # would otherwise yield place_local(LocalId{id:0}) and silently
+    # compute the field address off local 0, corrupting unrelated memory.
+    let base = match recv.kind
+    when ExprKind::ExprIdent(_) then lower_place(b, &recv)
+    when ExprKind::ExprSelfRef then lower_place(b, &recv)
+    when ExprKind::ExprFieldAccess(_, _) then lower_place(b, &recv)
+    when ExprKind::ExprDeref(_) then lower_place(b, &recv)
+    when ExprKind::ExprIndex(_, _) then lower_place(b, &recv)
+    when _ then
+      let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
+      let recv_tmp = add_temp(b, mir_infer_expr_type(b, &recv), recv_tmp_span)
+      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &recv, recv_tmp_span), recv_tmp_span)
+      place_local(recv_tmp)
+    end
     # Auto-insert ProjDeref when base local is a reference and we haven't
     # already added projections (i.e., this is the first field access on
     # a &/&mut parameter).  Without this, codegen_address_of would lose
@@ -3506,7 +3551,19 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     end
     place_deref(base)
   when ExprKind::ExprIndex(recv, index) then
-    let base = lower_place(b, &recv)
+    # Same spill-non-place-receivers rule as ExprFieldAccess.
+    let base = match recv.kind
+    when ExprKind::ExprIdent(_) then lower_place(b, &recv)
+    when ExprKind::ExprSelfRef then lower_place(b, &recv)
+    when ExprKind::ExprFieldAccess(_, _) then lower_place(b, &recv)
+    when ExprKind::ExprDeref(_) then lower_place(b, &recv)
+    when ExprKind::ExprIndex(_, _) then lower_place(b, &recv)
+    when _ then
+      let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
+      let recv_tmp = add_temp(b, mir_infer_expr_type(b, &recv), recv_tmp_span)
+      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &recv, recv_tmp_span), recv_tmp_span)
+      place_local(recv_tmp)
+    end
     # Evaluate the index expression and store in a temp
     let idx_op = lower_expr(b, &index, Span { file: "", start: 0, end_pos: 0 })
     let idx_tmp = add_temp(b, Type::Int, Span { file: "", start: 0, end_pos: 0 })

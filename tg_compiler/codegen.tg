@@ -1435,6 +1435,73 @@ def emit_call_extern(ctx: &mut CodegenCtx, sym: String) -> Unit
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# GCC __sync_* atomic builtins → inline ARMv8.1 LSE atomics
+# ———————————————————————————————————————————————————————————————
+# These names look like external functions but are actually compiler builtins
+# that must be emitted inline. There is no `__sync_*` symbol in libSystem
+# or any system library. Without inlining, the linker would reject every
+# allocator/Rc/Arc operation.
+#
+# Returns true if the call was intercepted and emitted inline; false otherwise.
+def try_emit_atomic_builtin(ctx: &mut CodegenCtx, name: &String) -> Bool
+  match ctx.target.arch
+  when Arch::AArch64 then
+    if name == "__sync_synchronize" then
+      a64_dmb_ish(&mut ctx.text)
+      true
+    else if name == "__sync_bool_compare_and_swap_1" then
+      # x0=ptr, w1=expected, w2=desired → x0 = 1 if swapped else 0
+      # CASALB clobbers Ws (w8) with original [x0]; preserve expected in w1
+      a64_mov_w_rr(&mut ctx.text, A64::X8, A64::X1)   # mov w8, w1
+      a64_casalb(&mut ctx.text, A64::X8, A64::X2, A64::X0)  # casalb w8, w2, [x0]
+      a64_cmp_w(&mut ctx.text, A64::X8, A64::X1)      # cmp w8, w1
+      a64_cset_eq(&mut ctx.text, A64::X0)             # cset x0, eq
+      true
+    else if name == "__sync_val_compare_and_swap_uint" || name == "__sync_val_compare_and_swap_4" then
+      # 32-bit CAS, returns original value
+      a64_mov_w_rr(&mut ctx.text, A64::X8, A64::X1)
+      a64_casal_w(&mut ctx.text, A64::X8, A64::X2, A64::X0)
+      a64_mov_w_rr(&mut ctx.text, A64::X0, A64::X8)
+      true
+    else if name == "__sync_val_compare_and_swap_8" then
+      # 64-bit CAS
+      a64_mov_rr(&mut ctx.text, A64::X8, A64::X1)
+      a64_casal_x(&mut ctx.text, A64::X8, A64::X2, A64::X0)
+      a64_mov_rr(&mut ctx.text, A64::X0, A64::X8)
+      true
+    else if name == "__sync_fetch_and_sub_4" then
+      # 32-bit atomic subtract: prev = *ptr; *ptr -= val; return prev
+      # LDADDAL reads from [Xn] into Wt, atomically adds Ws to memory.
+      # Avoid Wt aliasing Xn (UNPREDICTABLE) — use w9 as the dest.
+      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)              # w8 = -val
+      a64_ldaddal_w(&mut ctx.text, A64::X8, A64::X9, A64::X0) # ldaddal w8, w9, [x0]
+      a64_mov_w_rr(&mut ctx.text, A64::X0, A64::X9)           # mov w0, w9
+      true
+    else if name == "__sync_fetch_and_sub_8" || name == "__sync_fetch_and_sub" then
+      # 64-bit atomic subtract
+      a64_neg(&mut ctx.text, A64::X8, A64::X1)                # x8 = -val
+      a64_ldaddal_x(&mut ctx.text, A64::X8, A64::X9, A64::X0) # ldaddal x8, x9, [x0]
+      a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)             # mov x0, x9
+      true
+    else if name == "__sync_fetch_and_add_4" then
+      a64_mov_w_rr(&mut ctx.text, A64::X8, A64::X1)
+      a64_ldaddal_w(&mut ctx.text, A64::X8, A64::X9, A64::X0)
+      a64_mov_w_rr(&mut ctx.text, A64::X0, A64::X9)
+      true
+    else if name == "__sync_fetch_and_add_8" || name == "__sync_fetch_and_add" then
+      a64_mov_rr(&mut ctx.text, A64::X8, A64::X1)
+      a64_ldaddal_x(&mut ctx.text, A64::X8, A64::X9, A64::X0)
+      a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)
+      true
+    else
+      false
+    end
+  when _ then
+    false
+  end
+end
+
 # CALL reg (indirect)
 def emit_call_r(ctx: &mut CodegenCtx, r: PhysReg) -> Unit
   match r
@@ -3944,7 +4011,9 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
       # Prefer calling compiled function bodies over intrinsic inlining.
       # If a function was compiled (is in reachable_fns), ALWAYS call it
       # directly — never fall through to the intrinsic/NOP path.
-      if resolved_fn_name == "String__new" || intr_name == "string_new" then
+      if try_emit_atomic_builtin(ctx, &resolved_fn_name) then
+        ()
+      else if resolved_fn_name == "String__new" || intr_name == "string_new" then
         codegen_array_new(ctx)
       else if resolved_fn_name == "cstring_new" || resolved_fn_name == "cstring_as_ptr" then
         codegen_intrinsic(ctx, fctx, intr_name, args, resolved_fn_name)
@@ -4156,6 +4225,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "Set__unwrap" || name == "set_unwrap" then "unwrap"
     # String__ prefixed methods
     else if name == "String__parse_float" || name == "__intrinsic_string_parse_float" || name == "str_parse_float" then "str_to_float"
+    else if name == "String__clone" then "clone"
     # Additional string_ prefixed variants (from bare_intrinsic_name transformation)
     else if name == "string_clone" || name == "string_is_empty" || name == "string_chars" then "clone"
     else if name == "string_as_bytes" then "as_bytes"
@@ -4516,33 +4586,49 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_setcc(ctx, CondKind::Ne, rr)
 
   # Option/Result unwrap: arg0 = &self (ptr to enum)
-  # If Some/Ok (discriminant == 0), return payload at [heap_ptr + 8]; else trap
+  # Representation:
+  #   - raw value < 256: inline tag (uninitialized field => 0, or explicit
+  #     small inline). Treat as None/Err.
+  #   - raw value >= 256: heap pointer to {discriminant, payload}.
+  #     discriminant 0 == Some/Ok, 1 == None/Err.
   else if name == "unwrap" then
     let scratch = scratch_reg(arch)
     emit_load_mem(ctx, rr, rr, 0)
     emit_mov_rr(ctx, scratch, rr)
-    normalize_enum_value_to_tag(ctx, rr)
-    emit_cmp_ri(ctx, rr, 0)
     let ok_label = ".Lunwrap_ok." + ctx.fn_counter.to_string()
+    let trap_label = ".Lunwrap_trap." + ctx.fn_counter.to_string()
     ctx.fn_counter = ctx.fn_counter + 1
+    emit_cmp_ri(ctx, scratch, 256)
+    emit_jcc(ctx, CondKind::Lt, trap_label.clone())
+    # Heap pointer: load discriminant
+    emit_load_mem(ctx, rr, scratch, 0)
+    emit_cmp_ri(ctx, rr, 0)
     emit_jcc(ctx, CondKind::Eq, ok_label.clone())
+    def_label(&mut ctx.text, trap_label)
     emit_trap(ctx)
     def_label(&mut ctx.text, ok_label)
-    # scratch holds raw enum value (heap pointer for Some/Ok)
+    # scratch holds heap pointer; payload at [+8]
     emit_load_mem(ctx, rr, scratch, 8)
 
   # Option/Result unwrap_or: arg0 = &self (ptr to enum), arg1 = default
-  # If Some/Ok (discriminant == 0), return payload at [heap_ptr + 8]; else return default
   else if name == "unwrap_or" then
     let scratch = scratch_reg(arch)
     emit_load_mem(ctx, rr, rr, 0)
     emit_mov_rr(ctx, scratch, rr)
-    normalize_enum_value_to_tag(ctx, rr)
-    emit_cmp_ri(ctx, rr, 0)
     let none_label = ".Lunwrap_or_none." + ctx.fn_counter.to_string()
+    let some_label = ".Lunwrap_or_some." + ctx.fn_counter.to_string()
     let done_label = ".Lunwrap_or_done." + ctx.fn_counter.to_string()
     ctx.fn_counter = ctx.fn_counter + 1
-    emit_jcc(ctx, CondKind::Ne, none_label.clone())
+    # If raw < 256, treat as None (inline tag or uninitialized field)
+    emit_cmp_ri(ctx, scratch, 256)
+    emit_jcc(ctx, CondKind::Lt, none_label.clone())
+    # Heap pointer: load discriminant and compare to 1 (None/Err)
+    emit_load_mem(ctx, rr, scratch, 0)
+    emit_cmp_ri(ctx, rr, 0)
+    emit_jcc(ctx, CondKind::Eq, some_label.clone())
+    # disc != 0 => None/Err
+    emit_jmp(ctx, none_label.clone())
+    def_label(&mut ctx.text, some_label)
     # Some case: payload at [heap_ptr + 8]
     emit_load_mem(ctx, rr, scratch, 8)
     emit_jmp(ctx, done_label.clone())
@@ -7041,10 +7127,35 @@ def codegen_float_to_str(ctx: &mut CodegenCtx) -> Unit
   emit_call_label(ctx, "_tg_float_to_str")
 end
 
-# str_to_int: Parse string to integer. Arg in x0/rdi, returns int in x0/rax
+# str_to_int: Parse string to integer. Arg in x0/rdi.
+# Returns a heap-allocated Option[Int]::Some(value) pointer in x0/rax,
+# matching the `parse_int(...) -> Option[Int]` source-level contract.
+# Layout of the Option heap cell: { disc: Int (0=Some), payload: Int } (16 bytes).
 def codegen_str_to_int(ctx: &mut CodegenCtx) -> Unit
-  # Call runtime function _tg_str_to_int
+  let arch = ctx.target.arch
+  let rr = ret_reg(arch)
+  let scratch = scratch_reg(arch)
+  # Call runtime function _tg_str_to_int → raw int in rr.
   emit_call_label(ctx, "_tg_str_to_int")
+  # Save parsed value across the bump_alloc call.
+  emit_push(ctx, rr)
+  # arg0 = 16 bytes
+  match arg_reg(arch, 0)
+  when Option::Some(a0) then emit_mov_ri(ctx, a0, 16)
+  when Option::None then ()
+  end
+  emit_call_label(ctx, "_tg_bump_alloc")  # rr = heap pointer
+  # Restore parsed value into scratch.
+  emit_pop(ctx, scratch)
+  # Zero the discriminant slot (Some = 0). Use a separate temporary register
+  # so we don't clobber scratch before storing the payload.
+  let zero_r = match arg_reg(arch, 1)
+    when Option::Some(r) then r
+    when Option::None then scratch
+    end
+  emit_mov_ri(ctx, zero_r, 0)
+  emit_store_mem(ctx, rr, 0, zero_r)      # disc = 0 (Some)
+  emit_store_mem(ctx, rr, 8, scratch)     # payload = parsed value
 end
 
 # str_to_float: Parse string to float. Arg in x0/rdi, returns float bits in x0/rax

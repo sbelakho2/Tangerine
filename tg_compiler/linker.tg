@@ -235,6 +235,218 @@ def emit_plt_section(info: &DynamicLinkInfo) -> Vec[u8]
 end
 
 # ———————————————————————————————————————————————————————————————
+# Mach-O dyld imports support
+# ———————————————————————————————————————————————————————————————
+
+# Symbol-name remap for extern declarations whose Tangerine-side name does
+# not match the underlying C symbol. Add new entries here as needed.
+def map_extern_to_c_symbol(sym: &String) -> String
+  if sym == "_tg_obj_time" then "time".to_string()
+  else sym.clone()
+  end
+end
+
+# Mach-O dyld expects C symbols with a leading underscore. Tangerine's relocation
+# symbol names do not include the underscore, so prepend it (unless already there).
+def macho_sym_name(sym: &String) -> String
+  let c = map_extern_to_c_symbol(sym)
+  if c.len() > 0 && c.slice(0, 1) == "_" then
+    c
+  else
+    "_".to_string() + c
+  end
+end
+
+# Decide which dylib provides a given imported symbol.
+# Positive value (1..N) = 1-based LC_LOAD_DYLIB index.
+# Negative value = special ordinal (-1=main exe, -2=flat lookup, -3=weak lookup).
+# Symbols that may not be present at runtime are flagged as weak imports and
+# routed through flat lookup so the binary loads without that dylib present.
+def classify_dylib_ordinal(sym: &String) -> Int
+  # Ruby symbols may not be present — flat lookup so they're optional.
+  if sym.starts_with("rb_") || sym.starts_with("ruby_") then -2 else 1 end
+end
+
+def is_weak_extern(sym: &String) -> Bool
+  # Mark Ruby imports weak so the binary loads even without libruby installed.
+  sym.starts_with("rb_") || sym.starts_with("ruby_")
+end
+
+# ULEB128 encoding (LSB-first, 7 bits per byte, MSB=continuation).
+def encode_uleb128(value: u64) -> Vec[u8]
+  mut out = Vec::new()
+  mut v = value
+  loop
+    mut byte = (v & 0x7F) as u8
+    v = v >> 7
+    if v != 0 then
+      byte = byte | 0x80
+    end
+    out.push(byte)
+    if v == 0 then break end
+  end
+  out
+end
+
+# Emit an arm64 stub trampoline (12 bytes) at out[write_offset..write_offset+12].
+# The stub loads the GOT entry into x16 and branches to it:
+#   adrp x16, page(got_entry)
+#   ldr  x16, [x16, #lo12(got_entry)]
+#   br   x16
+def emit_arm64_stub(out: &mut Vec[u8], stub_vaddr: u64, got_entry_vaddr: u64) -> Unit
+  let page_target = (got_entry_vaddr >> 12) << 12
+  let page_site   = (stub_vaddr >> 12) << 12
+  let page_delta  = ((page_target as i64) - (page_site as i64)) >> 12
+  let immlo = (page_delta as u32) & 0x3
+  let immhi = ((page_delta as u32) >> 2) & 0x7FFFF
+  let adrp = 0x90000010 | (immlo << 29) | (immhi << 5)
+  write32(out, adrp)
+  let lo12 = (got_entry_vaddr as u32) & 0xFFF
+  # LDR (immediate, unsigned offset, 64-bit): scale = 8
+  let ldr = 0xF9400210 | ((lo12 >> 3) << 10)
+  write32(out, ldr)
+  write32(out, 0xD61F0200)   # br x16
+end
+
+# Walk all relocations and collect a deduplicated, deterministically-ordered
+# list of undefined extern symbol names (those not satisfied by any object).
+def collect_macho_imports(relocations: &Vec[Relocation], syms: &Map[String, LinkerSymbol]) -> Vec[String]
+  mut imports = Vec::new()
+  mut seen: Map[String, Bool] = Map::new()
+  mut i = 0
+  while i < relocations.len() do
+    let r = &relocations[i]
+    let needs_import = match syms.get(&r.symbol)
+      when Option::Some(s) then !s.is_defined
+      when Option::None then true
+      end
+    if needs_import then
+      if !seen.contains_key(&r.symbol) then
+        seen.insert(r.symbol.clone(), true)
+        imports.push(r.symbol.clone())
+      end
+    end
+    i = i + 1
+  end
+  # Sort imports so libSystem ordinal symbols are grouped together for the
+  # bind opcode stream (dyld bind opcodes are stateful per-ordinal).
+  mut sorted: Vec[String] = Vec::new()
+  mut ord_i = 0
+  while ord_i < imports.len() do
+    let s = &imports[ord_i]
+    if classify_dylib_ordinal(s) == 1 then sorted.push(s.clone()) end
+    ord_i = ord_i + 1
+  end
+  ord_i = 0
+  while ord_i < imports.len() do
+    let s = &imports[ord_i]
+    if classify_dylib_ordinal(s) != 1 then sorted.push(s.clone()) end
+    ord_i = ord_i + 1
+  end
+  sorted
+end
+
+# Build the dyld lazy bind opcode stream. We bind every import eagerly via the
+# regular (non-lazy) bind table — simpler than lazy_bind because lazy_bind
+# requires a stub-helper section per import.
+#
+# Each import's GOT slot is bound to the corresponding dylib symbol. The bind
+# opcodes are stateful: dyld walks them sequentially, updating its current
+# ordinal/segment/offset/symbol cursor and writing pointers when DO_BIND fires.
+def build_macho_bind_opcodes(imports: &Vec[String], got_seg_idx: Int, got_offset: u64) -> Vec[u8]
+  let bind_opcode_done                       = 0x00 as u8
+  let bind_opcode_set_dylib_ordinal_imm      = 0x10 as u8
+  let bind_opcode_set_dylib_special_imm      = 0x30 as u8
+  let bind_opcode_set_symbol_trailing_flags  = 0x40 as u8
+  let bind_opcode_set_type_imm               = 0x50 as u8
+  let bind_opcode_set_seg_and_offset_uleb    = 0x70 as u8
+  let bind_opcode_do_bind                    = 0x90 as u8
+  let bind_type_pointer                      = 0x01 as u8
+
+  mut out = Vec::new()
+  mut current_ordinal = -1
+  mut emitted_segment = false
+  mut i = 0
+  while i < imports.len() do
+    let sym = &imports[i]
+    let ordinal = classify_dylib_ordinal(sym)
+    if ordinal != current_ordinal then
+      if ordinal >= 0 then
+        out.push(bind_opcode_set_dylib_ordinal_imm | (ordinal as u8))
+      else
+        # Special ordinal: encode as 4-bit signed value (sign-extended).
+        let imm = ((ordinal as Int) & 0x0F) as u8
+        out.push(bind_opcode_set_dylib_special_imm | imm)
+      end
+      out.push(bind_opcode_set_type_imm | bind_type_pointer)
+      current_ordinal = ordinal
+    end
+    if !emitted_segment then
+      out.push(bind_opcode_set_seg_and_offset_uleb | (got_seg_idx as u8))
+      let off_bytes = encode_uleb128(got_offset)
+      mut j = 0
+      while j < off_bytes.len() do
+        out.push(off_bytes[j])
+        j = j + 1
+      end
+      emitted_segment = true
+    end
+    let flags = if is_weak_extern(sym) then 0x01 as u8 else 0x00 as u8 end
+    out.push(bind_opcode_set_symbol_trailing_flags | flags)
+    let nm = macho_sym_name(sym)
+    let nb = nm.as_bytes()
+    mut k = 0
+    while k < nb.len() do
+      out.push(nb[k])
+      k = k + 1
+    end
+    out.push(0 as u8)   # null terminator
+    out.push(bind_opcode_do_bind)
+    i = i + 1
+  end
+  out.push(bind_opcode_done)
+  out
+end
+
+# Build the LC_SYMTAB symbol-table and string-table for our imports.
+# Mach-O nlist_64 (16 bytes):
+#   u32 n_strx
+#   u8  n_type     (0x01=N_UNDF, 0x0E=N_SECT; bit 0x01=N_EXT)
+#   u8  n_sect     (0 for undefined)
+#   u16 n_desc     (library ordinal in upper byte for two-level namespace)
+#   u64 n_value
+def build_macho_symtab_strtab(imports: &Vec[String]) -> (Vec[u8], Vec[u8]) 
+  mut symtab = Vec::new()
+  mut strtab = Vec::new()
+  strtab.push(0 as u8)           # strtab[0] = NUL (convention)
+  mut i = 0
+  while i < imports.len() do
+    let sym = &imports[i]
+    let nm = macho_sym_name(sym)
+    let nb = nm.as_bytes()
+    let strx = strtab.len() as u32
+    mut k = 0
+    while k < nb.len() do
+      strtab.push(nb[k])
+      k = k + 1
+    end
+    strtab.push(0 as u8)
+    let ordinal = classify_dylib_ordinal(sym)
+    # n_desc: upper byte = library ordinal (or DYNAMIC_LOOKUP_ORDINAL=0xFE for flat).
+    let lib_byte: u16 = if ordinal >= 0 then ordinal as u16 else 0xFE as u16 end
+    let n_desc = (lib_byte << 8) | (if is_weak_extern(sym) then 0x40 as u16 else 0 as u16 end)
+    write32(&mut symtab, strx)
+    symtab.push(0x01 as u8)      # N_UNDF | N_EXT
+    symtab.push(0 as u8)         # n_sect = 0
+    write16(&mut symtab, n_desc)
+    write64(&mut symtab, 0 as u64)
+    i = i + 1
+  end
+  (symtab, strtab)
+end
+
+
+# ———————————————————————————————————————————————————————————————
 # Symbol resolution
 # ———————————————————————————————————————————————————————————————
 
@@ -337,25 +549,34 @@ def patch_relocations(
   all_relocations: &Vec[Relocation],
   sections: &mut Vec[LinkedSection],
   syms: &Map[String, LinkerSymbol],
-  section_vaddrs: &Vec[u64]
+  section_vaddrs: &Vec[u64],
+  extern_stub_map: &Map[String, u64]
 ) -> Result[Unit, String]
 
   mut undefined_syms = Vec::new()
   mut i = 0
   while i < all_relocations.len() do
     let reloc = &all_relocations[i]
-    # Target symbol virtual address
-    let target_sym = match syms.get(reloc.symbol)
-    when Option::Some(s) then s
-    when Option::None then
-      if !undefined_syms.contains(&reloc.symbol) then
-        undefined_syms.push(reloc.symbol.clone())
+    # Target symbol virtual address. If the symbol is undefined but has a
+    # dyld import stub registered, redirect through the stub.
+    mut target_vaddr_opt: Option[u64] = Option::None
+    match syms.get(reloc.symbol)
+    when Option::Some(s) then
+      if s.is_defined then
+        target_vaddr_opt = Option::Some(section_vaddrs[s.section] + s.value)
       end
-      i = i + 1
-      continue
+    when Option::None then ()
     end
-
-    if !target_sym.is_defined then
+    if target_vaddr_opt.is_none() then
+      match extern_stub_map.get(&reloc.symbol)
+      when Option::Some(stub_addr) then
+        target_vaddr_opt = Option::Some(stub_addr.clone())
+      when Option::None then ()
+      end
+    end
+    let target_vaddr = match target_vaddr_opt
+    when Option::Some(v) then v
+    when Option::None then
       if !undefined_syms.contains(&reloc.symbol) then
         undefined_syms.push(reloc.symbol.clone())
       end
@@ -365,7 +586,6 @@ def patch_relocations(
 
     # Relocation offset is already adjusted to merged text position
     let patch_offset = reloc.offset
-    let target_vaddr = section_vaddrs[target_sym.section] + target_sym.value
 
     # Address of the site being patched (for PC-relative)
     let site_vaddr = section_vaddrs[0] + patch_offset as u64
@@ -449,7 +669,7 @@ def patch_relocations(
   end
 
   if !undefined_syms.is_empty() then
-    mut msg = "undefined symbols in relocations:"
+    mut msg = "undefined symbols in relocations: [stub_map_size=" + extern_stub_map.len().to_string() + "]"
     mut j = 0
     while j < undefined_syms.len() do
       msg = msg + " " + undefined_syms[j]
@@ -657,7 +877,8 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Patch relocations now that section addresses are assigned
-  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
+  let empty_stub_map: Map[String, u64] = Map::new()
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs, &empty_stub_map)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
@@ -776,10 +997,27 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let lc_build_version = 0x32 as u32
   let lc_load_dylinker = 0x0E as u32
   let lc_load_dylib = 0x0C as u32
+  let lc_dyld_info_only = 0x80000022 as u32
 
-  let text_len = linked_section_data_len(&sections[0])
+  # ── dyld imports ───────────────────────────────────────────────
+  # Collect undefined extern symbols. Each gets a 12-byte stub appended
+  # to __text (within branch range of all callers) and an 8-byte GOT slot
+  # appended to __data (filled by dyld at load via bind opcodes). Only
+  # arm64 stubs are implemented here; on x86_64 imports are unsupported
+  # for now (no Mach-O x86_64 host bootstrap).
+  let imports = if is_arm then
+    collect_macho_imports(&all_relocations, &syms)
+  else
+    let empty: Vec[String] = Vec::new()
+    empty
+  end
+  let num_imports = imports.len()
+  let stubs_total_size = num_imports * 12
+  let got_total_size = num_imports * 8
+
+  let text_len = linked_section_data_len(&sections[0]) + stubs_total_size
   let rodata_len = linked_section_data_len(&sections[1])
-  let data_len = linked_section_data_len(&sections[2])
+  let data_len = linked_section_data_len(&sections[2]) + got_total_size
 
   # ARM64 macOS requires 16KB page alignment for segments
   let page_size = if is_arm then 16384 else 4096 end
@@ -800,9 +1038,10 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let dylinker_cmd_size = 32       # LC_LOAD_DYLINKER "/usr/lib/dyld"
   let dylib_cmd_size = 56          # LC_LOAD_DYLIB "/usr/lib/libSystem.B.dylib"
   let uuid_cmd_size = 24           # LC_UUID (16 bytes of UUID)
+  let dyld_info_cmd_size = 48      # LC_DYLD_INFO_ONLY
   let codesign_reserve = 16        # space reserved for codesign to insert LC_CODE_SIGNATURE
-  let num_cmds = 11
-  let load_cmds_size = pagezero_cmd_size + text_seg_cmd_size + data_seg_cmd_size + linkedit_cmd_size + main_cmd_size + symtab_cmd_size + dysymtab_cmd_size + build_version_cmd_size + dylinker_cmd_size + dylib_cmd_size + uuid_cmd_size
+  let num_cmds = 12
+  let load_cmds_size = pagezero_cmd_size + text_seg_cmd_size + data_seg_cmd_size + linkedit_cmd_size + main_cmd_size + symtab_cmd_size + dysymtab_cmd_size + build_version_cmd_size + dylinker_cmd_size + dylib_cmd_size + uuid_cmd_size + dyld_info_cmd_size
   let header_size = 32
   # __TEXT starts at fileoff 0 (includes header + load commands)
   # Code is placed right after load commands, 16-byte aligned
@@ -838,10 +1077,46 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
     section_vaddrs.push(bss_vaddr)
   end
 
-  # Patch relocations
-  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
+  # ── dyld imports: layout stubs and GOT slots ───────────────────
+  # Stubs are appended at the end of the original __text data, just before
+  # __const within the __TEXT segment. GOT entries are appended at the end
+  # of the original __data data within the __DATA segment.
+  # NOTE: sections[0].data and sections[2].data have not been mutated yet,
+  # so their current length IS the original (pre-stub/pre-GOT) length.
+  let orig_text_len = linked_section_data_len(&sections[0])
+  let orig_data_len = linked_section_data_len(&sections[2])
+  let stubs_base_vaddr = text_vaddr + (orig_text_len as u64)
+  let got_base_vaddr = data_vaddr + (orig_data_len as u64)
+  let got_offset_in_data_seg = orig_data_len as u64
+
+  # Build name → stub address map for relocation redirection.
+  mut extern_stub_map: Map[String, u64] = Map::new()
+  mut imp_i = 0
+  while imp_i < num_imports do
+    let stub_addr = stubs_base_vaddr + ((imp_i * 12) as u64)
+    extern_stub_map.insert(imports[imp_i].clone(), stub_addr)
+    imp_i = imp_i + 1
+  end
+
+  # Patch relocations (external refs go through stubs)
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs, &extern_stub_map)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
+  end
+
+  # Append stub bytes to __text section data and zero-filled GOT to __data.
+  # The asm.write32 helpers append little-endian words.
+  mut stub_i = 0
+  while stub_i < num_imports do
+    let stub_addr = stubs_base_vaddr + ((stub_i * 12) as u64)
+    let got_addr  = got_base_vaddr  + ((stub_i * 8) as u64)
+    emit_arm64_stub(&mut sections[0].data, stub_addr, got_addr)
+    stub_i = stub_i + 1
+  end
+  mut got_i = 0
+  while got_i < got_total_size do
+    sections[2].data.push(0 as u8)
+    got_i = got_i + 1
   end
 
   # Entry point offset (relative to start of __TEXT segment, which is fileoff=0)
@@ -870,12 +1145,37 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
     end
   end
 
-  # Empty string table (just a NUL byte) for LC_SYMTAB, placed in __LINKEDIT
+  # ── __LINKEDIT contents ───────────────────────────────────────
+  # Layout: bind opcodes | symtab | strtab
+  # All offsets are absolute file offsets (Mach-O convention).
+  let bind_opcodes = if num_imports > 0 then
+    build_macho_bind_opcodes(&imports, 2, got_offset_in_data_seg)
+  else
+    let empty: Vec[u8] = Vec::new()
+    empty
+  end
+  let pair = build_macho_symtab_strtab(&imports)
+  let symtab_bytes = pair.0
+  let strtab_bytes = pair.1
+
   let linkedit_fileoff = data_fileoff + data_seg_size
-  let strtab_off = linkedit_fileoff
-  let strtab_size = 1
-  let linkedit_size = align_up(strtab_size, page_size)
+
+  # Bind opcodes are placed first within __LINKEDIT, with no required alignment.
+  let bind_off = linkedit_fileoff
+  let bind_size = bind_opcodes.len()
+  # Symbol table must be 8-byte aligned.
+  let symtab_off = align_up(bind_off + bind_size, 8)
+  let nsyms = num_imports
+  let symtab_size = symtab_bytes.len()
+  let strtab_off = symtab_off + symtab_size
+  let strtab_size = strtab_bytes.len()
+  let linkedit_used = (strtab_off + strtab_size) - linkedit_fileoff
+  let linkedit_size = align_up(linkedit_used, page_size)
   let linkedit_vaddr = data_vaddr + data_seg_size as u64
+
+  # MH flags: MH_PIE (0x200000) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80).
+  # MH_NOUNDEFS (0x1) is cleared because we now have undefined imports.
+  let mh_flags = 0x200084 as u32
 
   # --- Mach-O Header (32 bytes) ---
   write32(&mut out, 0xFEEDFACF)       # MH_MAGIC_64
@@ -884,7 +1184,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, mh_execute)
   write32(&mut out, num_cmds as u32)
   write32(&mut out, load_cmds_size as u32)
-  write32(&mut out, 0x200085 as u32)    # MH_PIE | MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL
+  write32(&mut out, mh_flags)
   write32(&mut out, 0)                 # reserved
 
   # --- LC_SEGMENT_64: __PAGEZERO (null guard page) ---
@@ -959,18 +1259,32 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, 0)
   write32(&mut out, 0); write32(&mut out, 0); write32(&mut out, 0)
 
-  # --- LC_SEGMENT_64: __LINKEDIT (symbol/string table data) ---
+  # --- LC_SEGMENT_64: __LINKEDIT (dyld info, symtab, strtab) ---
   write32(&mut out, lc_segment_64)
   write32(&mut out, linkedit_cmd_size as u32)
   write_padded_str(&mut out, "__LINKEDIT", 16)      # segname
   write64(&mut out, linkedit_vaddr)                 # vmaddr
   write64(&mut out, linkedit_size as u64)           # vmsize
   write64(&mut out, linkedit_fileoff as u64)        # fileoff
-  write64(&mut out, strtab_size as u64)             # filesize
+  write64(&mut out, linkedit_used as u64)           # filesize
   write32(&mut out, 1)                              # maxprot: r--
   write32(&mut out, 1)                              # initprot: r--
   write32(&mut out, 0)                              # nsects
   write32(&mut out, 0)                              # flags
+
+  # --- LC_DYLD_INFO_ONLY ---
+  write32(&mut out, lc_dyld_info_only)
+  write32(&mut out, dyld_info_cmd_size as u32)
+  write32(&mut out, 0)                              # rebase_off
+  write32(&mut out, 0)                              # rebase_size
+  write32(&mut out, bind_off as u32)                # bind_off
+  write32(&mut out, bind_size as u32)               # bind_size
+  write32(&mut out, 0)                              # weak_bind_off
+  write32(&mut out, 0)                              # weak_bind_size
+  write32(&mut out, 0)                              # lazy_bind_off
+  write32(&mut out, 0)                              # lazy_bind_size
+  write32(&mut out, 0)                              # export_off
+  write32(&mut out, 0)                              # export_size
 
   # --- LC_MAIN ---
   write32(&mut out, lc_main)
@@ -981,15 +1295,33 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   # --- LC_SYMTAB ---
   write32(&mut out, lc_symtab)
   write32(&mut out, symtab_cmd_size as u32)
-  write32(&mut out, 0)                # symoff  (no symbols in minimal exe)
-  write32(&mut out, 0)                # nsyms
-  write32(&mut out, strtab_off as u32)  # stroff
-  write32(&mut out, strtab_size as u32) # strsize
+  write32(&mut out, symtab_off as u32)              # symoff
+  write32(&mut out, nsyms as u32)                   # nsyms
+  write32(&mut out, strtab_off as u32)              # stroff
+  write32(&mut out, strtab_size as u32)             # strsize
 
   # --- LC_DYSYMTAB ---
+  # Layout: ilocalsym=0 nlocalsym=0  iextdefsym=0 nextdefsym=0  iundefsym=0 nundefsym=N
   write32(&mut out, lc_dysymtab)
   write32(&mut out, dysymtab_cmd_size as u32)
-  emit_zeros_vec(&mut out, dysymtab_cmd_size - 8)  # all fields zero for static exe
+  write32(&mut out, 0)                # ilocalsym
+  write32(&mut out, 0)                # nlocalsym
+  write32(&mut out, 0)                # iextdefsym
+  write32(&mut out, 0)                # nextdefsym
+  write32(&mut out, 0)                # iundefsym
+  write32(&mut out, nsyms as u32)     # nundefsym
+  write32(&mut out, 0)                # tocoff
+  write32(&mut out, 0)                # ntoc
+  write32(&mut out, 0)                # modtaboff
+  write32(&mut out, 0)                # nmodtab
+  write32(&mut out, 0)                # extrefsymoff
+  write32(&mut out, 0)                # nextrefsyms
+  write32(&mut out, 0)                # indirectsymoff
+  write32(&mut out, 0)                # nindirectsyms
+  write32(&mut out, 0)                # extreloff
+  write32(&mut out, 0)                # nextrel
+  write32(&mut out, 0)                # locreloff
+  write32(&mut out, 0)                # nlocrel
 
   # --- LC_BUILD_VERSION ---
   write32(&mut out, lc_build_version)
@@ -1027,14 +1359,18 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
 
   # --- Section data ---
   pad_to(&mut out, code_fileoff)
-  out.extend(&sections[0].data)   # __text
+  out.extend(&sections[0].data)   # __text (with appended stubs at end)
   out.extend(&sections[1].data)   # __const (rodata)
   pad_to(&mut out, data_fileoff)
-  out.extend(&sections[2].data)   # __data
+  out.extend(&sections[2].data)   # __data (with appended GOT slots at end)
 
-  # String table (single NUL)
+  # __LINKEDIT contents: bind opcodes, then symtab, then strtab.
+  pad_to(&mut out, bind_off)
+  out.extend(&bind_opcodes)
+  pad_to(&mut out, symtab_off)
+  out.extend(&symtab_bytes)
   pad_to(&mut out, strtab_off)
-  out.push(0)
+  out.extend(&strtab_bytes)
 
   Result::Ok(out)
 end
@@ -1171,7 +1507,8 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Patch relocations
-  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs)
+  let empty_stub_map_pe: Map[String, u64] = Map::new()
+  match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs, &empty_stub_map_pe)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
