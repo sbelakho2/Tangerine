@@ -85,6 +85,7 @@ struct FrameInfo
   local_offsets: Map[Int, i32]   # LocalId.id -> FP offset
   spill_offset: i32         # current spill position
   saved_regs: Vec[PhysReg]  # callee-saved regs used
+  sret_offset: i32          # FP offset where x8 is saved (0 = no sret)
 end
 
 struct FnCodegenCtx
@@ -160,13 +161,13 @@ def type_size(ty: &Type, layout: &Map[Int, Int]) -> Int
   when _ then ()
   end
   
-  # For Named types, use the layout map (populated by layout_engine)
+  # For Named types: VALUE size is always 8 (heap-handle pointer or inline
+  # discriminant tag). The full box size lives in `layout` for malloc use
+  # (codegen_aggregate calls _tg_bump_alloc with that), but the by-value ABI
+  # is uniformly 8 bytes — see codegen_aggregate (heap-allocates) and
+  # normalize_enum_value_to_tag (handles small-tag vs heap-pointer).
   match ty
-  when Type::Named(tid, _) then
-    match layout.get(tid.id)
-    when Option::Some(sz) then return sz
-    when Option::None then ()
-    end
+  when Type::Named(_, _) then return 8
   when _ then ()
   end
   
@@ -213,11 +214,7 @@ def type_size(ty: &Type, layout: &Map[Int, Int]) -> Int
     if rem != 0 then total = total + (max_align - rem) end
     total
   when Type::Array(elem, count) then type_size(elem, layout) * count
-  when Type::Named(tid, _) then
-    match layout.get(tid.id)
-    when Option::Some(sz) then sz
-    when Option::None then 8
-    end
+  when Type::Named(_, _) then 8
   when Type::Var(_) then 8
   when Type::Error then 0
   when _ then 8
@@ -563,6 +560,19 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
   mut spill_off: i32 = 0  # next spill starts at [fp - 8]
   mut address_taken_locals: Set[Int] = Set::new()
 
+  # sret ABI: if return type (local 0) is > 8 bytes, reserve a slot to save
+  # the caller-supplied indirect-return pointer (x8 on AArch64). Caller passes
+  # &dest in x8; epilogue copies local 0 into [x8]. We must reserve this BEFORE
+  # other allocations so the offset is fixed.
+  mut sret_offset: i32 = 0
+  if func.locals.len() > 0 then
+    let ret_sz = type_size(&func.locals[0].ty, layout)
+    if ret_sz > 8 then
+      spill_off = spill_off - 8
+      sret_offset = spill_off
+    end
+  end
+
   # Locals whose address is taken need a stable stack home. Keeping them in
   # registers and synthesizing temporary spill slots later has proven fragile
   # during native bootstrap, especially for method receivers lowered as &self.
@@ -597,7 +607,10 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
       let sz = type_size(&local.ty, layout)
       let alloc_sz = if sz == 0 then 8 else sz end
 
-      if address_taken_locals.contains(local.id.id) then
+      # Multi-word locals (>8 bytes) cannot fit in a single register; force them
+      # onto the stack so all words are addressable.
+      let force_stack = alloc_sz > 8
+      if address_taken_locals.contains(local.id.id) || force_stack then
         let aligned_sz = align_up_int(alloc_sz, 8)
         spill_off = spill_off - aligned_sz as i32
         var_locs.insert(local.id.id, VarLoc::Spilled(spill_off))
@@ -621,8 +634,10 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
   mut arg_idx = 0
   for param in func.params do
     let sz = type_size(&param.ty, layout)
-    if address_taken_locals.contains(param.id.id) then
-      let aligned_sz = align_up_int(if sz == 0 then 8 else sz end, 8)
+    let alloc_sz_p = if sz == 0 then 8 else sz end
+    let force_stack_p = alloc_sz_p > 8
+    if address_taken_locals.contains(param.id.id) || force_stack_p then
+      let aligned_sz = align_up_int(alloc_sz_p, 8)
       spill_off = spill_off - aligned_sz as i32
       var_locs.insert(param.id.id, VarLoc::Spilled(spill_off))
       local_offsets.insert(param.id.id, spill_off)
@@ -643,60 +658,17 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
   # Collect callee-saved regs used
   let saved = collect_saved_regs(&ra, arch)
 
-  # Pre-scan MIR to account for dynamic spill growth during codegen.
-  # codegen_aggregate allocates stack space for each aggregate construction,
-  # and codegen_address_of spills register-allocated locals when their address
-  # is taken.  We must reserve this space NOW so the prologue's `sub sp, #N`
-  # covers all future growth.
+  # Pre-scan MIR to account for fallback spill growth during codegen.
+  # Address-taken locals are normally stack-homed above. This remains as a
+  # guard for any ref emitted before the address-taken scan can see it.
   mut dynamic_extra = 0
   for block in func.blocks do
     for stmt in block.statements do
       match stmt.kind
       when MirStatementKind::MirAssign(place, rvalue) then
-        if !place.projections.is_empty() then
-          match var_locs.get(place.local.id)
-          when Option::Some(loc) then
-            match loc
-            when VarLoc::Register(_) then
-              mut place_ty = Type::Unit
-              for local in func.locals do
-                if local.id.id == place.local.id then
-                  place_ty = local.ty.clone()
-                end
-              end
-              if place_ty == Type::Unit then
-                for param in func.params do
-                  if param.id.id == place.local.id then
-                    place_ty = param.ty.clone()
-                  end
-                end
-              end
-              if !is_ref_like_type(&place_ty) then
-                # store_place spills register-held aggregate bases before
-                # projected writes (e.g. opts.verbose = true).
-                dynamic_extra = dynamic_extra + 8
-              end
-            when _ then ()
-            end
-          when Option::None then ()
-          end
-        end
         match rvalue.kind
-        when MirRvalueKind::MirAggregate(kind, operands) then
-          let type_id = match kind
-          when AggregateKind::Struct(tid, _) then tid.id
-          when AggregateKind::Closure(tid) then tid.id
-          when AggregateKind::Generator(tid) then tid.id
-          when _ then 0
-          end
-          let count = operands.len()
-          let total_size = match layout.get(type_id)
-          when Option::Some(sz) then if sz > 0 then sz else count * 8 end
-          when Option::None then count * 8
-          end
-          # codegen_aggregate uses one extra spill slot to preserve the heap
-          # pointer returned by _tg_bump_alloc while it stores fields.
-          dynamic_extra = dynamic_extra + align_up_int(total_size, 8) + 8
+        when MirRvalueKind::MirAggregate(_, _) then
+          ()
         when MirRvalueKind::MirRef(ref_place) then
           match var_locs.get(ref_place.local.id)
           when Option::Some(loc) then
@@ -722,10 +694,8 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
     end
   end
 
-  # Extend spill_off to cover the dynamic needs.  This reserves space in
-  # the frame before the callee-saved area is placed so they never collide.
-  # Save the original spill_off as the starting point for codegen —
-  # the actual codegen will re-decrement from this position.
+  # Extend spill_off to cover the fallback dynamic needs. Save the original
+  # spill_off as the starting point for codegen.
   let codegen_spill_start = spill_off
   spill_off = spill_off - dynamic_extra as i32
 
@@ -740,7 +710,8 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
     stack_size: stack_size,
     local_offsets: local_offsets,
     spill_offset: codegen_spill_start,
-    saved_regs: saved
+    saved_regs: saved,
+    sret_offset: sret_offset
   }
 
   (var_locs, frame)
@@ -2503,6 +2474,11 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
   mut current_ty = local_type(fctx, place.local.id)
   mut downcast_disc = -1
   mut last_deref_unwrapped_ref = false
+  # Label to skip remaining projections after an inline-tag ProjDowncast.
+  # Inline tags (< 256) have no heap allocation, so there is no payload
+  # struct to project into — remaining field/offset projections must be
+  # skipped to avoid null-pointer dereference (ldr x0, [x0] on xzr).
+  let lbl_skip_remaining = next_codegen_label(ctx, ".Lskip_remaining.")
 
   mut i = 0
   while i < projs.len() do
@@ -2573,17 +2549,35 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       last_deref_unwrapped_ref = false
     when Projection::ProjDowncast(name, disc) then
       downcast_disc = disc
+      # Enum values may be inline tags (0..255) or heap pointers (>= 256).
+      # Inline tags have no heap allocation, so there's no payload to access.
+      # Heap pointers have {discriminant, payload} layout; add 8 to reach payload.
+      let lbl_payload_skip = next_codegen_label(ctx, ".Lpayload_skip.")
+      let lbl_payload_done = next_codegen_label(ctx, ".Lpayload_done.")
+      emit_cmp_ri(ctx, reg, 256)
+      emit_jcc(ctx, CondKind::Lt, lbl_payload_skip.clone())
+      # Heap pointer: add 8 to skip discriminant, reach payload.
       emit_add_ri(ctx, reg, 8)
-      # When downcast is the last projection, the MIR interpreter returns the
-      # payload VALUE, but the codegen has only computed the payload ADDRESS
-      # (base + 8).  Load the value so the semantics match.
       if i == projs.len() - 1 then
         emit_load_mem(ctx, reg, reg, 0)
       end
+      emit_jmp(ctx, lbl_payload_done.clone())
+      def_label(&mut ctx.text, lbl_payload_skip)
+      # Inline tag: no heap allocation, zero out the payload reference.
+      emit_zero_reg(ctx, reg)
+      # If there are remaining projections after ProjDowncast, skip them.
+      # An inline tag has no heap-allocated payload struct, so there is
+      # nothing to project into — remaining projections would dereference
+      # null (ldr x0, [x0]) and crash.
+      if i < projs.len() - 1 then
+        emit_jmp(ctx, lbl_skip_remaining.clone())
+      end
+      def_label(&mut ctx.text, lbl_payload_done)
       last_deref_unwrapped_ref = false
     end
     i = i + 1
   end
+  def_label(&mut ctx.text, lbl_skip_remaining)
 end
 
 def load_constant(ctx: &mut CodegenCtx, cst: &MirConstant, dst: PhysReg) -> Unit
@@ -2667,6 +2661,10 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       mut downcast_disc = -1
       mut i = 0
       let n = place.projections.len()
+      # Label to skip remaining projections after an inline-tag ProjDowncast.
+      # Inline tags (< 256) have no heap allocation, so subsequent projection
+      # code would compute garbage addresses from a zeroed base register.
+      let lbl_skip_store = next_codegen_label(ctx, ".Lskip_store_proj.")
       while i < n - 1 do
         let proj = place.projections[i]
         match proj
@@ -2687,7 +2685,23 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
           current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
         when Projection::ProjDowncast(_, disc) then
           downcast_disc = disc
+          # Normalize inline tags vs heap pointers before accessing payload.
+          let lbl_payload_skip = next_codegen_label(ctx, ".Lpayload_skip.")
+          let lbl_payload_done = next_codegen_label(ctx, ".Lpayload_done.")
+          emit_cmp_ri(ctx, base, 256)
+          emit_jcc(ctx, CondKind::Lt, lbl_payload_skip.clone())
           emit_add_ri(ctx, base, 8)
+          emit_jmp(ctx, lbl_payload_done.clone())
+          def_label(&mut ctx.text, lbl_payload_skip)
+          # Inline tag: no heap allocation, zero out the payload reference.
+          emit_zero_reg(ctx, base)
+          # If there are remaining non-last projections, skip them since
+          # the inline tag has no heap-allocated payload struct to compute
+          # addresses into.
+          if i < n - 2 then
+            emit_jmp(ctx, lbl_skip_store.clone())
+          end
+          def_label(&mut ctx.text, lbl_payload_done)
         when Projection::ProjIndex(local_id) then
           if is_heap_collection_type(ctx, &current_ty) then
             emit_load_mem(ctx, base, base, 0)
@@ -2711,6 +2725,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
         end
         i = i + 1
       end
+      def_label(&mut ctx.text, lbl_skip_store)
 
       # Last projection determines final store offset
       let last = place.projections[n - 1]
@@ -3479,6 +3494,10 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
     let n = place.projections.len()
     mut downcast_disc = -1
     mut i = 0
+    # Label to skip remaining projections after an inline-tag ProjDowncast.
+    # Inline tags (< 256) have no heap allocation, so there is no payload
+    # struct to compute addresses into.
+    let lbl_skip_addr = next_codegen_label(ctx, ".Lskip_addr_proj.")
     while i < n do
       let proj = place.projections[i]
       let is_last = i == n - 1
@@ -3557,10 +3576,28 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::ProjDowncast(name, disc) then
         downcast_disc = disc
+        # Same inline-tag check as apply_projections: ensure value is a heap pointer
+        # (>= 256) before adding 8 to reach payload struct.
+        let lbl_payload_skip = next_codegen_label(ctx, ".Lpayload_skip.")
+        let lbl_payload_done = next_codegen_label(ctx, ".Lpayload_done.")
+        emit_cmp_ri(ctx, dst, 256)
+        emit_jcc(ctx, CondKind::Lt, lbl_payload_skip.clone())
         emit_add_ri(ctx, dst, 8)
+        emit_jmp(ctx, lbl_payload_done.clone())
+        def_label(&mut ctx.text, lbl_payload_skip)
+        # Inline tag: no heap allocation, zero out the payload reference.
+        emit_zero_reg(ctx, dst)
+        # If there are remaining projections after ProjDowncast, skip them.
+        # An inline tag has no heap-allocated payload struct, so subsequent
+        # projections would dereference null and crash.
+        if !is_last then
+          emit_jmp(ctx, lbl_skip_addr.clone())
+        end
+        def_label(&mut ctx.text, lbl_payload_done)
       end
       i = i + 1
     end
+    def_label(&mut ctx.text, lbl_skip_addr)
   end
 end
 
@@ -3661,10 +3698,9 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   # a dangling pointer when the struct escapes via return value.
   emit_mov_ri(ctx, dst, aligned as i64)
   emit_call_label(ctx, "_tg_bump_alloc")
-  # After call: dst (x0/rax) = heap pointer to allocated memory
-  let base_off = fctx.frame.spill_offset - 8
-  fctx.frame.spill_offset = base_off
-  emit_store_mem(ctx, fp, base_off, dst)
+  # After call: dst (x0/rax) = heap pointer to allocated memory. Preserve it
+  # with a balanced stack push while operand lowering may make calls/clobber dst.
+  emit_push(ctx, dst)
 
   # Store each field at its proper offset
   let enum_discriminant = if type_id >= 0 && is_enum_type_id(ctx, type_id) && operands.len() > 0 then
@@ -3683,7 +3719,7 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   mut i = 0
   while i < operands.len() do
     load_operand_aggregate_item(ctx, fctx, &operands[i], scratch)
-    emit_load_mem(ctx, dst, fp, base_off)
+    emit_load_mem(ctx, dst, sp, 0)
     let field_off = if enum_discriminant >= 0 then
       if i == 0 then 0 else 8 + enum_field_offset_for_discriminant(ctx, type_id, enum_discriminant, i - 1) end
     else if has_layout then
@@ -3698,7 +3734,8 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
     emit_store_mem(ctx, dst, field_off as i32, scratch)
     i = i + 1
   end
-  emit_load_mem(ctx, dst, fp, base_off)
+  emit_load_mem(ctx, dst, sp, 0)
+  emit_pop(ctx, scratch)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3950,9 +3987,40 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
   let sp     = sp_reg(arch)
   let max_ra = max_reg_args(arch)
 
-  # Place arguments in ABI registers
-  mut arg_idx = 0
-  while arg_idx < args.len() do
+  # sret eligibility: AArch64 only, dest type > 8 bytes, dest has no
+  # projections, dest local has a stable stack home. When eligible we will
+  # pass &dest in x8 to the callee (which uses sret) and skip storing rr.
+  let dest_ty = place_type(ctx, fctx, dest)
+  let dest_sz = type_size(&dest_ty, &ctx.type_layout)
+  mut sret_dest_off: i32 = 0
+  mut sret_dest_ok = false
+  if dest_sz > 8 && dest.projections.is_empty() then
+    match arch
+    when Arch::AArch64 then
+      match fctx.var_locs.get(dest.local.id)
+      when Option::Some(loc) then
+        match loc
+        when VarLoc::Stack(off) then
+          sret_dest_off = off
+          sret_dest_ok = true
+        when VarLoc::Spilled(off) then
+          sret_dest_off = off
+          sret_dest_ok = true
+        when _ then ()
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  mut did_sret = false
+
+  # Place arguments in reverse order. Loading a projected operand may use x0/rax
+  # as scratch, so left-to-right loading can clobber an already prepared arg0.
+  let total_args = args.len()
+  mut arg_idx = total_args
+  while arg_idx > 0 do
+    arg_idx = arg_idx - 1
     let arg = &args[arg_idx]
     if arg_idx < max_ra then
       match arg_reg(arch, arg_idx)
@@ -3964,8 +4032,6 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
       load_operand_call_arg(ctx, fctx, arg, scratch)
       emit_push(ctx, scratch)
     end
-
-    arg_idx = arg_idx + 1
   end
 
   # Call the function
@@ -4031,6 +4097,11 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
           when Option::Some(actual) then actual
           when Option::None then resolved_fn_name.clone()
           end
+        if sret_dest_ok then
+          # Pass &dest in x8 for sret-returning callee
+          emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
+          did_sret = true
+        end
         emit_call_label(ctx, resolved)
       else if is_intrinsic(&intr_name) then
         codegen_intrinsic(ctx, fctx, intr_name, args, resolved_fn_name)
@@ -4040,6 +4111,10 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
           when Option::Some(actual) then actual
           when Option::None then resolved_fn_name.clone()
           end
+        if sret_dest_ok then
+          emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
+          did_sret = true
+        end
         emit_call_label(ctx, resolved)
       end
     when MirConstantKind::MirZeroSized then
@@ -4061,12 +4136,18 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, callee
   end
 
   # Clean up stack args
-  if arg_idx > max_ra then
-    emit_add_ri(ctx, sp, ((arg_idx - max_ra) * 8) as i32)
+  if total_args > max_ra then
+    let stack_arg_slot = match arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    end
+    emit_add_ri(ctx, sp, ((total_args - max_ra) * stack_arg_slot) as i32)
   end
 
   # Store return value
-  store_place(ctx, fctx, dest, rr)
+  if !did_sret then
+    store_place(ctx, fctx, dest, rr)
+  end
 
   # Jump to success block
   let label = fctx.block_labels.get(success.id).unwrap()
@@ -4194,7 +4275,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       "clone"
     else if name == "parse_int" then "str_to_int"
     else if name == "starts_with" then "starts_with"
-    else if name == "ends_with" then "str_cmp"
+    else if name == "ends_with" then "ends_with"
     else if name == "string_replace" || name == "replace" then "str_concat"
     else if name == "string_find" || name == "find" then "str_find"
     else if name == "string_new" then "array_new"
@@ -4233,7 +4314,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "string_as_str" then "as_str"
     else if name == "string_to_wide_string" || name == "string_to_string" then "to_string"
     else if name == "string_starts_with" then "starts_with"
-    else if name == "string_ends_with" then "str_cmp"
+    else if name == "string_ends_with" then "ends_with"
     else if name == "string_index_of" then "str_find"
     else if name == "string_last_index_of" || name == "string_rfind" then "str_find"
     else if name == "string_find" then "str_find"
@@ -4401,8 +4482,31 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   else if name == "str_find" then
     codegen_str_find(ctx)
   else if name == "starts_with" then
+    if args.len() > 0 then
+      let arg0_ty = operand_type(ctx, fctx, &args[0])
+      let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+        deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
+      end
+    end
     codegen_starts_with(ctx)
+  else if name == "ends_with" then
+    if args.len() > 0 then
+      let arg0_ty = operand_type(ctx, fctx, &args[0])
+      let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+        deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
+      end
+    end
+    codegen_ends_with(ctx)
   else if name == "string_contains" then
+    if args.len() > 0 then
+      let arg0_ty = operand_type(ctx, fctx, &args[0])
+      let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+        deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
+      end
+    end
     codegen_string_contains(ctx)
   else if name == "str_copy" then
     codegen_str_copy(ctx)
@@ -4966,6 +5070,15 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
 
   # Move register-assigned params from ABI regs to their assigned regs
   let max_ra = max_reg_args(arch)
+  # sret ABI: save the caller-supplied indirect-return pointer (x8) into
+  # the reserved frame slot before any callee work clobbers it.
+  if fctx.frame.sret_offset != 0 then
+    match arch
+    when Arch::AArch64 then
+      emit_store_mem(ctx, PhysReg::A64Reg(A64::FP), fctx.frame.sret_offset as i32, PhysReg::A64Reg(A64::X8))
+    when _ then ()
+    end
+  end
   mut idx = 0
   for param in fctx.func.params do
     if idx < max_ra then
@@ -4998,11 +5111,43 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   let sp = sp_reg(arch)
   let rr = ret_reg(arch)
 
+  # sret ABI: if function uses indirect return, copy local 0 (return slot)
+  # into the buffer pointed to by the saved x8 pointer. Skip the x0 load.
+  mut loaded_ret = false
+  if fctx.frame.sret_offset != 0 then
+    match arch
+    when Arch::AArch64 then
+      let ret_local = fctx.func.locals[0]
+      let ret_sz = type_size(&ret_local.ty, &ctx.type_layout)
+      # Reload saved x8 into x16 (scratch)
+      emit_load_mem(ctx, PhysReg::A64Reg(A64::X16), PhysReg::A64Reg(A64::FP), fctx.frame.sret_offset as i32)
+      # Find local 0's stack offset
+      mut src_off: i32 = 0
+      match fctx.var_locs.get(ret_local.id.id)
+      when Option::Some(loc) then
+        match loc
+        when VarLoc::Stack(off) then src_off = off
+        when VarLoc::Spilled(off) then src_off = off
+        when _ then ()
+        end
+      when _ then ()
+      end
+      # Copy ret_sz bytes from [fp + src_off] to [x16] in 8-byte chunks
+      mut copied = 0
+      while copied < ret_sz do
+        emit_load_mem(ctx, PhysReg::A64Reg(A64::X17), PhysReg::A64Reg(A64::FP), (src_off + copied as i32) as i32)
+        emit_store_mem(ctx, PhysReg::A64Reg(A64::X16), copied as i32, PhysReg::A64Reg(A64::X17))
+        copied = copied + 8
+      end
+      loaded_ret = true
+    when _ then ()
+    end
+  end
+
   # Load return value into the return register (local 0 is return place).
   # Always check var_locs for local 0 regardless of type_size, because
   # type_size may report 0 for Named types whose layout has forward references.
-  mut loaded_ret = false
-  if fctx.func.locals.len() > 0 then
+  if !loaded_ret && fctx.func.locals.len() > 0 then
     let ret_local = fctx.func.locals[0]
     match fctx.var_locs.get(ret_local.id.id)
     when Option::Some(loc) then
@@ -5255,6 +5400,14 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
     # emit the static as a pointer to that struct
     if is_vec_type then
       let vec_data_label = "__vec_init_" + st.name.clone()
+      add_symbol(&mut ctx.data, AsmSymbol {
+        name: vec_data_label.clone(),
+        section: Section::Data,
+        offset: buf_pos(&ctx.data),
+        size: 24,
+        binding: SymBinding::Local,
+        kind: SymKind::Data
+      })
       def_label(&mut ctx.data, vec_data_label.clone())
       # Emit 24 bytes of zeros: [ptr=0, len=0, cap=0]
       emit64_le(&mut ctx.data, 0)
@@ -5509,21 +5662,22 @@ def canonical_fn_ref(name: &String) -> String
 end
 
 def compute_reachable(program: &MirProgram) -> Set[String]
-  # Native bootstrap still mis-handles parts of the MIR reachability walk.
-  # When compiling the compiler driver itself, conservatively emit all
-  # functions instead of blocking stage progression on DCE discovery.
-  mut bootstrap_reachable: Set[String] = Set::new()
-  mut is_bootstrap_driver = false
+  # EMIT ALL FUNCTIONS — bootstrap mode.
+  # During bootstrap compilation, the compiler compiles individual compiler source
+  # files (e.g. agentic.tg) whose MIR may NOT contain the compiler driver functions
+  # (cmd_compile, compile_startup_entry) needed to trigger the old bootstrap
+  # heuristics. Rather than trying to detect "is this a bootstrap compile?" from
+  # the MIR contents (which is fragile), we unconditionally emit all functions.
+  # Dead-code elimination (DCE) can be reintroduced as an optimization pass once
+  # the compiler is fully self-hosted and the bootstrap chain is complete.
+  mut all_fns: Set[String] = Set::new()
   for func in program.functions do
-    bootstrap_reachable.insert(func.name.clone())
-    if func.name == "compile_startup_entry" || func.name == "cmd_compile" then
-      is_bootstrap_driver = true
-    end
+    all_fns.insert(func.name.clone())
   end
-  if is_bootstrap_driver then
-    return bootstrap_reachable
-  end
+  all_fns
+end
 
+def compute_reachable_dce(program: &MirProgram) -> Set[String]
   # Build name -> function index map with MULTIPLE aliases per function.
   # This is the production fix: each function is registered under:
   # 1. Its full MIR name (e.g., "std::env::args")
@@ -5845,6 +5999,11 @@ def is_intrinsic(name: &String) -> Bool
   if name == "str_concat" || name == "str_len" || name == "str_cmp" ||
      name == "str_copy" || name == "str_slice" || name == "str_find" || name == "int_to_str" ||
      name == "float_to_str" || name == "str_to_int" || name == "str_to_float" then
+    return true
+  end
+  if name == "starts_with" || name == "ends_with" ||
+     name == "string_starts_with" || name == "string_ends_with" ||
+     name == "string_contains" then
     return true
   end
   if name == "clone" || name == "to_string" || name == "len" ||
@@ -6455,6 +6614,162 @@ def codegen_starts_with(ctx: &mut CodegenCtx) -> Unit
     def_label(&mut ctx.text, lbl_yes)
     x64_mov_ri(&mut ctx.text, X64::RAX, 1)
     x64_jmp(&mut ctx.text, lbl_done)
+
+    def_label(&mut ctx.text, lbl_no)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+
+    def_label(&mut ctx.text, lbl_done)
+  end
+end
+
+# ends_with: Check if a null-terminated string ends with a suffix.
+# Args: x0/rdi = string, x1/rsi = suffix
+# Returns: 1 if string ends with suffix, 0 otherwise
+def codegen_ends_with(ctx: &mut CodegenCtx) -> Unit
+  let lbl_len_s = ".Lew_len_s." + ctx.fn_counter.to_string()
+  let lbl_len_s_done = ".Lew_len_s_done." + ctx.fn_counter.to_string()
+  let lbl_len_suffix = ".Lew_len_suffix." + ctx.fn_counter.to_string()
+  let lbl_len_suffix_done = ".Lew_len_suffix_done." + ctx.fn_counter.to_string()
+  let lbl_cmp = ".Lew_cmp." + ctx.fn_counter.to_string()
+  let lbl_yes = ".Lew_yes." + ctx.fn_counter.to_string()
+  let lbl_no = ".Lew_no." + ctx.fn_counter.to_string()
+  let lbl_done = ".Lew_done." + ctx.fn_counter.to_string()
+  ctx.fn_counter = ctx.fn_counter + 1
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    maybe_load_string_data_ptr(
+      ctx,
+      PhysReg::A64Reg(A64::X0),
+      PhysReg::A64Reg(A64::X11),
+      PhysReg::A64Reg(A64::X12),
+      PhysReg::A64Reg(A64::X13),
+      PhysReg::A64Reg(A64::X14)
+    )
+    maybe_load_string_data_ptr(
+      ctx,
+      PhysReg::A64Reg(A64::X1),
+      PhysReg::A64Reg(A64::X11),
+      PhysReg::A64Reg(A64::X12),
+      PhysReg::A64Reg(A64::X13),
+      PhysReg::A64Reg(A64::X14)
+    )
+
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X1)
+
+    a64_mov_rr(&mut ctx.text, A64::X4, A64::X2)
+    a64_mov_ri(&mut ctx.text, A64::X11, 0)
+    def_label(&mut ctx.text, lbl_len_s.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X4, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_len_s_done.clone())
+    a64_add_rri(&mut ctx.text, A64::X4, A64::X4, 1)
+    a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 1)
+    a64_b(&mut ctx.text, lbl_len_s)
+
+    def_label(&mut ctx.text, lbl_len_s_done)
+    a64_mov_rr(&mut ctx.text, A64::X5, A64::X3)
+    a64_mov_ri(&mut ctx.text, A64::X12, 0)
+    def_label(&mut ctx.text, lbl_len_suffix.clone())
+    a64_ldrb(&mut ctx.text, A64::X10, A64::X5, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X10, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_len_suffix_done.clone())
+    a64_add_rri(&mut ctx.text, A64::X5, A64::X5, 1)
+    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
+    a64_b(&mut ctx.text, lbl_len_suffix)
+
+    def_label(&mut ctx.text, lbl_len_suffix_done)
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X11)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_no.clone())
+    a64_sub_rrr(&mut ctx.text, A64::X13, A64::X11, A64::X12)
+    a64_add_rrr(&mut ctx.text, A64::X0, A64::X2, A64::X13)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X3)
+
+    def_label(&mut ctx.text, lbl_cmp.clone())
+    a64_ldrb(&mut ctx.text, A64::X10, A64::X1, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X10, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_yes.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X0, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X9, A64::X10)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_no.clone())
+    a64_add_rri(&mut ctx.text, A64::X0, A64::X0, 1)
+    a64_add_rri(&mut ctx.text, A64::X1, A64::X1, 1)
+    a64_b(&mut ctx.text, lbl_cmp)
+
+    def_label(&mut ctx.text, lbl_yes)
+    a64_mov_ri(&mut ctx.text, A64::X0, 1)
+    a64_b(&mut ctx.text, lbl_done.clone())
+
+    def_label(&mut ctx.text, lbl_no)
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+
+    def_label(&mut ctx.text, lbl_done)
+
+  when Arch::X86_64 then
+    maybe_load_string_data_ptr(
+      ctx,
+      PhysReg::X64Reg(X64::RDI),
+      PhysReg::X64Reg(X64::R8),
+      PhysReg::X64Reg(X64::R9),
+      PhysReg::X64Reg(X64::R10),
+      PhysReg::X64Reg(X64::R11)
+    )
+    maybe_load_string_data_ptr(
+      ctx,
+      PhysReg::X64Reg(X64::RSI),
+      PhysReg::X64Reg(X64::R8),
+      PhysReg::X64Reg(X64::R9),
+      PhysReg::X64Reg(X64::R10),
+      PhysReg::X64Reg(X64::R11)
+    )
+
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::RSI)
+    x64_mov_rr(&mut ctx.text, X64::R10, X64::R8)
+    x64_mov_ri(&mut ctx.text, X64::RDX, 0)
+    def_label(&mut ctx.text, lbl_len_s.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::R10, 0)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_len_s_done.clone())
+    x64_add_ri(&mut ctx.text, X64::R10, 1)
+    x64_add_ri(&mut ctx.text, X64::RDX, 1)
+    x64_jmp(&mut ctx.text, lbl_len_s)
+
+    def_label(&mut ctx.text, lbl_len_s_done)
+    x64_mov_rr(&mut ctx.text, X64::R11, X64::R9)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_len_suffix.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::R11, 0)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_len_suffix_done.clone())
+    x64_add_ri(&mut ctx.text, X64::R11, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_len_suffix)
+
+    def_label(&mut ctx.text, lbl_len_suffix_done)
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::G, lbl_no.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RDX)
+    x64_sub_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R8)
+    x64_add_rr(&mut ctx.text, X64::RDI, X64::RAX)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R9)
+
+    def_label(&mut ctx.text, lbl_cmp.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RSI, 0)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_yes.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::R10, X64::RDI, 0)
+    x64_cmp_rr(&mut ctx.text, X64::R10, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_no.clone())
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_add_ri(&mut ctx.text, X64::RSI, 1)
+    x64_jmp(&mut ctx.text, lbl_cmp)
+
+    def_label(&mut ctx.text, lbl_yes)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+    x64_jmp(&mut ctx.text, lbl_done.clone())
 
     def_label(&mut ctx.text, lbl_no)
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)

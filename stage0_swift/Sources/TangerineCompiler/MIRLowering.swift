@@ -642,7 +642,36 @@ public final class MIRLowering {
             if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
                 let argOps = args.map { lowerExpr($0.value) }
                 let result = freshTemp(type: .named(ctor.typeName))
-                emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
+                // Check if this variant has a named payload struct (synthetic struct type).
+                // Positional call syntax on a named-field variant (e.g. MirCall(a,b,c,d,e))
+                // must be lowered by creating the struct payload first, then wrapping in the enum.
+                // Otherwise enumCtor's hasNamedPayloadStruct check picks only vals.first (the
+                // first field value) as the payload, discarding the rest.
+                if let td = resolveTypeDef(ctor.typeName),
+                   case .enumDef(let variants) = td.kind,
+                   ctor.variantIdx >= 0, ctor.variantIdx < variants.count {
+                    let payloadTypeName = "\(ctor.typeName)::\(variants[ctor.variantIdx].0)"
+                    // IMPORTANT: only use the named-payload-struct path when an EXACT
+                    // fully-qualified match exists in typeDefByName.  resolveTypeDef has a
+                    // bare-name fallback that can mis-resolve "types::Type::Map" to an
+                    // unrelated struct named just "Map" (e.g. collections::Map), corrupting
+                    // the enum payload arity.  Synthetic payload structs are registered
+                    // under their exact qualified name (see syntheticEnumPayloadTypeDef),
+                    // so an exact lookup is the only safe check here.
+                    if let payloadTD = typeDefByName[payloadTypeName],
+                       case .structDef(let fields) = payloadTD.kind {
+                        // Named-field variant: create struct payload, then wrap in enum ctor
+                        let fieldNames = fields.map { $0.0 }
+                        let payloadTmp = freshTemp(type: .named(payloadTD.name))
+                        emit(.assign(.local(payloadTmp), .aggregate(.structCtor(payloadTD.name, fieldNames), argOps)))
+                        emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), [.copy(.local(payloadTmp))])))
+                    } else {
+                        // Tuple-like variant: pass args directly
+                        emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
+                    }
+                } else {
+                    emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
+                }
                 return .copy(.local(result))
             }
             let calleeOp = lowerExpr(callee)

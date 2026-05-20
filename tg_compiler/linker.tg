@@ -18,7 +18,7 @@ use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::fs::{write_file_bytes, write_file_bytes_owned}
 use std::process::{run_command}
-use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind, Section}
+use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind, Section, SymBinding}
 use tg_compiler::object::{
   ObjectFile, build_object,
   object_bss_size, object_data_clone, object_data_len,
@@ -408,18 +408,137 @@ def build_macho_bind_opcodes(imports: &Vec[String], got_seg_idx: Int, got_offset
   out
 end
 
-# Build the LC_SYMTAB symbol-table and string-table for our imports.
+def data_relocation_needs_rebase(kind: RelocKind) -> Bool
+  match kind
+  when RelocKind::R_AARCH64_ABS64 then true
+  when RelocKind::R_X86_64_64 then true
+  when _ then false
+  end
+end
+
+def build_macho_rebase_opcodes(data_relocations: &Vec[Relocation], data_seg_idx: Int) -> Vec[u8]
+  let rebase_opcode_done                    = 0x00 as u8
+  let rebase_opcode_set_type_imm            = 0x10 as u8
+  let rebase_opcode_set_seg_and_offset_uleb = 0x20 as u8
+  let rebase_opcode_do_rebase_imm_times     = 0x50 as u8
+  let rebase_type_pointer                   = 0x01 as u8
+
+  mut out = Vec::new()
+  mut emitted_type = false
+  mut i = 0
+  while i < data_relocations.len() do
+    let reloc = &data_relocations[i]
+    if data_relocation_needs_rebase(reloc.kind) then
+      if !emitted_type then
+        out.push(rebase_opcode_set_type_imm | rebase_type_pointer)
+        emitted_type = true
+      end
+      out.push(rebase_opcode_set_seg_and_offset_uleb | (data_seg_idx as u8))
+      let off_bytes = encode_uleb128(reloc.offset as u64)
+      mut j = 0
+      while j < off_bytes.len() do
+        out.push(off_bytes[j])
+        j = j + 1
+      end
+      out.push(rebase_opcode_do_rebase_imm_times | (1 as u8))
+    end
+    i = i + 1
+  end
+
+  if emitted_type then
+    out.push(rebase_opcode_done)
+  end
+  out
+end
+
+# Emit a single Mach-O nlist_64 entry for a defined AsmSymbol.
+# Adds the symbol name to the strtab and the 16-byte nlist entry to symtab.
+def emit_sym_nlist_entry(sym: &AsmSymbol, strtab: &mut Vec[u8], symtab: &mut Vec[u8], section_vaddrs: &Vec[u64]) -> Unit
+  # Mach-O symbols have a leading underscore
+  strtab.push(0x5F as u8)        # '_'
+  let nb = sym.name.as_bytes()
+  let strx = (strtab.len() - 1) as u32  # string offset includes the underscore
+  mut k = 0
+  while k < nb.len() do
+    strtab.push(nb[k])
+    k = k + 1
+  end
+  strtab.push(0 as u8)
+
+  let n_sect: u8 = match sym.section
+  when Section::Text   then 1
+  when Section::Rodata then 2
+  when Section::Data   then 3
+  when _               then 0
+  end
+
+  let (n_type, n_desc): (u8, u16) = match sym.binding
+  when SymBinding::Local  then (0x0E as u8, 0 as u16)    # N_SECT
+  when SymBinding::Global then (0x0F as u8, 0 as u16)    # N_SECT | N_EXT
+  when SymBinding::Weak   then (0x0F as u8, 0x0080 as u16)  # N_SECT | N_EXT, N_WEAK_DEF
+  end
+
+  # n_value = section_vaddr + offset within section
+  let sec_vaddr: u64 = match sym.section
+  when Section::Text   then section_vaddrs[0]
+  when Section::Rodata then section_vaddrs[1]
+  when Section::Data   then section_vaddrs[2]
+  when _               then 0
+  end
+  let n_value = sec_vaddr + (sym.offset as u64)
+
+  write32(symtab, strx)
+  symtab.push(n_type)
+  symtab.push(n_sect)
+  write16(symtab, n_desc)
+  write64(symtab, n_value)
+end
+
+# Build the LC_SYMTAB symbol-table and string-table for ALL symbols:
+# local defined → external defined → undefined imports.
+# Returns (symtab_bytes, strtab_bytes, nlocalsym, nextdefsym, nundefsym).
 # Mach-O nlist_64 (16 bytes):
 #   u32 n_strx
 #   u8  n_type     (0x01=N_UNDF, 0x0E=N_SECT; bit 0x01=N_EXT)
-#   u8  n_sect     (0 for undefined)
+#   u8  n_sect     (0 for undefined, 1..N for defined)
 #   u16 n_desc     (library ordinal in upper byte for two-level namespace)
 #   u64 n_value
-def build_macho_symtab_strtab(imports: &Vec[String]) -> (Vec[u8], Vec[u8]) 
+def build_macho_full_symtab_strtab(
+  all_symbols: &Vec[AsmSymbol],
+  imports: &Vec[String],
+  section_vaddrs: &Vec[u64]
+) -> (Vec[u8], Vec[u8], Int, Int, Int)
   mut symtab = Vec::new()
   mut strtab = Vec::new()
   strtab.push(0 as u8)           # strtab[0] = NUL (convention)
+
+  # Phase 1: Local defined symbols
+  mut nlocalsym = 0
   mut i = 0
+  while i < all_symbols.len() do
+    let sym = &all_symbols[i]
+    if sym.binding == SymBinding::Local then
+      emit_sym_nlist_entry(sym, &mut strtab, &mut symtab, section_vaddrs)
+      nlocalsym = nlocalsym + 1
+    end
+    i = i + 1
+  end
+
+  # Phase 2: External defined symbols (Global or Weak)
+  mut nextdefsym = 0
+  i = 0
+  while i < all_symbols.len() do
+    let sym = &all_symbols[i]
+    if sym.binding == SymBinding::Global || sym.binding == SymBinding::Weak then
+      emit_sym_nlist_entry(sym, &mut strtab, &mut symtab, section_vaddrs)
+      nextdefsym = nextdefsym + 1
+    end
+    i = i + 1
+  end
+
+  # Phase 3: Undefined/import symbols
+  mut nundefsym = 0
+  i = 0
   while i < imports.len() do
     let sym = &imports[i]
     let nm = macho_sym_name(sym)
@@ -440,9 +559,11 @@ def build_macho_symtab_strtab(imports: &Vec[String]) -> (Vec[u8], Vec[u8])
     symtab.push(0 as u8)         # n_sect = 0
     write16(&mut symtab, n_desc)
     write64(&mut symtab, 0 as u64)
+    nundefsym = nundefsym + 1
     i = i + 1
   end
-  (symtab, strtab)
+
+  (symtab, strtab, nlocalsym, nextdefsym, nundefsym)
 end
 
 
@@ -681,6 +802,63 @@ def patch_relocations(
   Result::Ok(())
 end
 
+def patch_data_relocations(
+  data_relocations: &Vec[Relocation],
+  sections: &mut Vec[LinkedSection],
+  syms: &Map[String, LinkerSymbol],
+  section_vaddrs: &Vec[u64]
+) -> Result[Unit, String]
+
+  mut undefined_syms = Vec::new()
+  mut i = 0
+  while i < data_relocations.len() do
+    let reloc = &data_relocations[i]
+    mut target_vaddr_opt: Option[u64] = Option::None
+    match syms.get(reloc.symbol)
+    when Option::Some(s) then
+      if s.is_defined then
+        target_vaddr_opt = Option::Some(section_vaddrs[s.section] + s.value)
+      end
+    when Option::None then ()
+    end
+
+    let target_vaddr = match target_vaddr_opt
+    when Option::Some(v) then v
+    when Option::None then
+      if !undefined_syms.contains(&reloc.symbol) then
+        undefined_syms.push(reloc.symbol.clone())
+      end
+      i = i + 1
+      continue
+    end
+
+    let patch_offset = reloc.offset
+    match reloc.kind
+    when RelocKind::R_AARCH64_ABS64 then
+      let abs = (target_vaddr as i64) + (reloc.addend as i64)
+      write64_at(&mut sections[2].data, patch_offset, abs as u64)
+    when RelocKind::R_X86_64_64 then
+      let abs = (target_vaddr as i64) + (reloc.addend as i64)
+      write64_at(&mut sections[2].data, patch_offset, abs as u64)
+    when _ then
+      return Result::Err("unsupported data relocation kind during patching")
+    end
+    i = i + 1
+  end
+
+  if !undefined_syms.is_empty() then
+    mut msg = "undefined symbols in data relocations:"
+    mut j = 0
+    while j < undefined_syms.len() do
+      msg = msg + " " + undefined_syms[j]
+      j = j + 1
+    end
+    return Result::Err(msg)
+  end
+
+  Result::Ok(())
+end
+
 # Helpers for in-place binary patching
 def write32_at(data: &mut Vec[u8], offset: Int, value: u32) -> Unit
   data[offset]     = (value & 0xFF) as u8
@@ -881,6 +1059,10 @@ def link_elf64(input: &LinkerInput) -> Result[Vec[u8], String]
   match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs, &empty_stub_map)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
+  end
+  match patch_data_relocations(&all_data_relocations, &mut sections, &syms, &section_vaddrs)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("data relocation error: " + e)
   end
 
   # Find entry point and report error if undefined
@@ -1103,6 +1285,10 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
   end
+  match patch_data_relocations(&all_data_relocations, &mut sections, &syms, &section_vaddrs)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("data relocation error: " + e)
+  end
 
   # Append stub bytes to __text section data and zero-filled GOT to __data.
   # The asm.write32 helpers append little-endian words.
@@ -1146,26 +1332,34 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # ── __LINKEDIT contents ───────────────────────────────────────
-  # Layout: bind opcodes | symtab | strtab
+  # Layout: rebase opcodes | bind opcodes | symtab | strtab
   # All offsets are absolute file offsets (Mach-O convention).
+  let rebase_opcodes = build_macho_rebase_opcodes(&all_data_relocations, 2)
+  let rebase_size = rebase_opcodes.len()
   let bind_opcodes = if num_imports > 0 then
     build_macho_bind_opcodes(&imports, 2, got_offset_in_data_seg)
   else
     let empty: Vec[u8] = Vec::new()
     empty
   end
-  let pair = build_macho_symtab_strtab(&imports)
-  let symtab_bytes = pair.0
-  let strtab_bytes = pair.1
+  let build_result = build_macho_full_symtab_strtab(&all_symbols, &imports, &section_vaddrs)
+  let symtab_bytes = build_result.0
+  let strtab_bytes = build_result.1
+  let nlocalsym = build_result.2
+  let nextdefsym = build_result.3
+  let nundefsym = build_result.4
+  let nsyms = nlocalsym + nextdefsym + nundefsym
 
   let linkedit_fileoff = data_fileoff + data_seg_size
 
-  # Bind opcodes are placed first within __LINKEDIT, with no required alignment.
-  let bind_off = linkedit_fileoff
+  # dyld_info validates each LINKEDIT payload offset, so keep opcode streams aligned.
+  let rebase_off = if rebase_size > 0 then linkedit_fileoff else 0 end
   let bind_size = bind_opcodes.len()
+  let bind_start = align_up(linkedit_fileoff + rebase_size, 8)
+  let bind_off = if bind_size > 0 then bind_start else 0 end
+  let opcode_end = bind_start + bind_size
   # Symbol table must be 8-byte aligned.
-  let symtab_off = align_up(bind_off + bind_size, 8)
-  let nsyms = num_imports
+  let symtab_off = align_up(opcode_end, 8)
   let symtab_size = symtab_bytes.len()
   let strtab_off = symtab_off + symtab_size
   let strtab_size = strtab_bytes.len()
@@ -1275,8 +1469,8 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   # --- LC_DYLD_INFO_ONLY ---
   write32(&mut out, lc_dyld_info_only)
   write32(&mut out, dyld_info_cmd_size as u32)
-  write32(&mut out, 0)                              # rebase_off
-  write32(&mut out, 0)                              # rebase_size
+  write32(&mut out, rebase_off as u32)              # rebase_off
+  write32(&mut out, rebase_size as u32)             # rebase_size
   write32(&mut out, bind_off as u32)                # bind_off
   write32(&mut out, bind_size as u32)               # bind_size
   write32(&mut out, 0)                              # weak_bind_off
@@ -1301,15 +1495,18 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, strtab_size as u32)             # strsize
 
   # --- LC_DYSYMTAB ---
-  # Layout: ilocalsym=0 nlocalsym=0  iextdefsym=0 nextdefsym=0  iundefsym=0 nundefsym=N
+  # Layout: local symbols | external defined symbols | undefined symbols
+  let ilocalsym_idx = 0
+  let iextdefsym_idx = nlocalsym
+  let iundefsym_idx = nlocalsym + nextdefsym
   write32(&mut out, lc_dysymtab)
   write32(&mut out, dysymtab_cmd_size as u32)
-  write32(&mut out, 0)                # ilocalsym
-  write32(&mut out, 0)                # nlocalsym
-  write32(&mut out, 0)                # iextdefsym
-  write32(&mut out, 0)                # nextdefsym
-  write32(&mut out, 0)                # iundefsym
-  write32(&mut out, nsyms as u32)     # nundefsym
+  write32(&mut out, ilocalsym_idx as u32)   # ilocalsym
+  write32(&mut out, nlocalsym as u32)       # nlocalsym
+  write32(&mut out, iextdefsym_idx as u32)  # iextdefsym
+  write32(&mut out, nextdefsym as u32)      # nextdefsym
+  write32(&mut out, iundefsym_idx as u32)   # iundefsym
+  write32(&mut out, nundefsym as u32)       # nundefsym
   write32(&mut out, 0)                # tocoff
   write32(&mut out, 0)                # ntoc
   write32(&mut out, 0)                # modtaboff
@@ -1364,9 +1561,15 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   pad_to(&mut out, data_fileoff)
   out.extend(&sections[2].data)   # __data (with appended GOT slots at end)
 
-  # __LINKEDIT contents: bind opcodes, then symtab, then strtab.
-  pad_to(&mut out, bind_off)
-  out.extend(&bind_opcodes)
+  # __LINKEDIT contents: rebase opcodes, bind opcodes, then symtab and strtab.
+  if rebase_size > 0 then
+    pad_to(&mut out, rebase_off)
+    out.extend(&rebase_opcodes)
+  end
+  if bind_size > 0 then
+    pad_to(&mut out, bind_off)
+    out.extend(&bind_opcodes)
+  end
   pad_to(&mut out, symtab_off)
   out.extend(&symtab_bytes)
   pad_to(&mut out, strtab_off)
@@ -1511,6 +1714,10 @@ def link_pe64(input: &LinkerInput) -> Result[Vec[u8], String]
   match patch_relocations(&all_relocations, &mut sections, &syms, &section_vaddrs, &empty_stub_map_pe)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("relocation error: " + e)
+  end
+  match patch_data_relocations(&all_data_relocations, &mut sections, &syms, &section_vaddrs)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("data relocation error: " + e)
   end
 
   # .text

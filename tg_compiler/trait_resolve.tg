@@ -705,6 +705,151 @@ def mono_cache_new() -> MonoCache
   MonoCache { entries: Vec::new(), specialized_bodies: Map::new() }
 end
 
+# ———————————————————————————————————————————————————————————————
+# Type-Param Helper Predicates
+# ———————————————————————————————————————————————————————————————
+
+# Check whether a type contains any Type::Param reference.
+def type_has_params(ty: &Type) -> Bool
+  match ty
+  when Type::Param(_) then true
+  when Type::Option(inner) then type_has_params(inner)
+  when Type::Result(ok, err) then type_has_params(ok) || type_has_params(err)
+  when Type::Map(k, v) then type_has_params(k) || type_has_params(v)
+  when Type::Set(inner) then type_has_params(inner)
+  when Type::Slice(inner) then type_has_params(inner)
+  when Type::Array(inner, _) then type_has_params(inner)
+  when Type::Ref(inner, _) then type_has_params(inner)
+  when Type::RefMut(inner, _) then type_has_params(inner)
+  when Type::Tuple(elems) then
+    mut found = false
+    for e in elems do
+      if type_has_params(&e) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    mut found = false
+    for p in params do
+      if type_has_params(&p) then found = true; break end
+    end
+    found || type_has_params(ret)
+  when Type::Named(_, args) then
+    mut found = false
+    for a in args do
+      if type_has_params(&a) then found = true; break end
+    end
+    found
+  when _ then false
+  end
+end
+
+# Check whether a specific Type::Param name appears in a type.
+def type_uses_param_name(ty: &Type, name: &String) -> Bool
+  match ty
+  when Type::Param(n) then n == *name
+  when Type::Option(inner) then type_uses_param_name(inner, name)
+  when Type::Result(ok, err) then type_uses_param_name(ok, name) || type_uses_param_name(err, name)
+  when Type::Map(k, v) then type_uses_param_name(k, name) || type_uses_param_name(v, name)
+  when Type::Set(inner) then type_uses_param_name(inner, name)
+  when Type::Slice(inner) then type_uses_param_name(inner, name)
+  when Type::Array(inner, _) then type_uses_param_name(inner, name)
+  when Type::Ref(inner, _) then type_uses_param_name(inner, name)
+  when Type::RefMut(inner, _) then type_uses_param_name(inner, name)
+  when Type::Tuple(elems) then
+    mut found = false
+    for e in elems do
+      if type_uses_param_name(&e, name) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    mut found = false
+    for p in params do
+      if type_uses_param_name(&p, name) then found = true; break end
+    end
+    found || type_uses_param_name(ret, name)
+  when Type::Named(_, args) then
+    mut found = false
+    for a in args do
+      if type_uses_param_name(&a, name) then found = true; break end
+    end
+    found
+  when _ then false
+  end
+end
+
+# Check whether a function is generic (has Type::Param in its signature).
+def is_generic_function(func: &MirFunction) -> Bool
+  if type_has_params(&func.ret_type) then return true end
+  for param in func.params do
+    if type_has_params(&param.ty) then return true end
+  end
+  for local in func.locals do
+    if type_has_params(&local.ty) then return true end
+  end
+  false
+end
+
+# Get the concrete type of a MirOperand from the function context.
+def operand_type_from_func(func: &MirFunction, op: &MirOperand) -> Type
+  match op.kind
+  when MirOperandKind::MirCopy(place) then
+    let idx = place.local.id
+    if idx >= 0 && idx < func.locals.len() then
+      func.locals[idx].ty.clone()
+    else
+      Type::Unit
+    end
+  when MirOperandKind::MirMovePlace(place) then
+    let idx = place.local.id
+    if idx >= 0 && idx < func.locals.len() then
+      func.locals[idx].ty.clone()
+    else
+      Type::Unit
+    end
+  when MirOperandKind::MirConstant(c) then
+    c.ty.clone()
+  end
+end
+
+# Infer concrete type arguments for a generic function from a call site.
+# For each type parameter name in the generic function, match it against
+# the corresponding call argument type.  Returns type_args in the same
+# order as type_param_names.
+def infer_type_args_for_call(
+  generic_func: &MirFunction,
+  type_param_names: &Vec[String],
+  caller_func: &MirFunction,
+  call_args: &Vec[MirOperand]
+) -> Vec[Type]
+  mut type_args = Vec::new()
+  for param_name in type_param_names do
+    # Find the first param position in generic_func that uses this param_name
+    mut inferred = Type::Unit
+    mut found = false
+    mut param_idx: Int = 0
+    while param_idx < generic_func.params.len() do
+      if type_uses_param_name(&generic_func.params[param_idx].ty, &param_name) then
+        # The concrete type is the call argument's type at the same position
+        if param_idx < call_args.len() then
+          inferred = operand_type_from_func(caller_func, &call_args[param_idx])
+          found = true
+        end
+        break
+      end
+      param_idx = param_idx + 1
+    end
+    # If not found in params, check return type (for phantom params)
+    if !found then
+      # Try to infer from the first arg whose type changed after substitution
+      if call_args.len() > 0 then
+        inferred = operand_type_from_func(caller_func, &call_args[0])
+      end
+    end
+    type_args.push(inferred)
+  end
+  type_args
+end
+
 # Look up or create a monomorphized instance for a generic function call.
 # Returns the mangled name.
 def monomorphize(cache: &mut MonoCache, func_name: String, type_args: Vec[Type]) -> String
@@ -985,62 +1130,59 @@ def type_to_mangled_name(ty: &Type) -> String
   end
 end
 
-# Monomorphize all generic functions in a MIR program
-def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
-  # Collect all generic call sites
-  mut worklist = Vec::new()  # (func_name, type_args)
-  
-  for func in mir.functions do
-    collect_generic_calls(&func, &mut worklist)
-  end
-  
-  # Specialize each generic call
-  mut new_functions = Vec::new()
-  for (func_name, type_args) in worklist do
-    # Find the original generic function
-    mut found: Option[&MirFunction] = Option::None
-    for f in mir.functions do
-      if f.name == func_name then
-        found = Option::Some(&f)
-        break
-      end
-    end
-    
-    match found
-    when Option::Some(original) then
-      # Extract type param names from function (heuristic: single-letter uppercase)
-      let type_param_names = infer_type_param_names(original)
-      if !type_param_names.is_empty() then
-        let specialized = specialize_function(cache, original, &type_param_names, &type_args)
-        new_functions.push(specialized)
-      end
-    when Option::None then ()
-    end
-  end
-  
-  # Add specialized functions to program
-  for f in new_functions do
-    mir.functions.push(f)
-  end
-end
+# ———————————————————————————————————————————————————————————————
+# Call-Site Rewriting
+# ———————————————————————————————————————————————————————————————
 
-def collect_generic_calls(func: &MirFunction, worklist: &mut Vec[(String, Vec[Type])]) -> Unit
-  for block in func.blocks do
-    match block.terminator.kind
-    when MirTerminatorKind::MirCall(_, callee, _, _, _) then
-      # If callee is a function with type args, record it
-      match callee.kind
-      when MirOperandKind::MirConstant(const_val) then
-        match const_val.kind
-        when MirConstantKind::MirFnItem(name) then
-          # Check if the function type has type arguments
-          match const_val.ty
-          when Type::Function(params, ret) then
-            # Extract any type parameters from function signature
-            mut type_args = Vec::new()
-            collect_type_args_from_types(&params, &mut type_args)
-            if !type_args.is_empty() then
-              worklist.push((name.clone(), type_args))
+# After monomorphization, rewrite all call sites that reference generic
+# functions so they point to the specialized (mangled) version instead.
+def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &MonoCache) -> Unit
+  # Pre-build a set of generic function names for fast lookup
+  mut generic_names = Set::new()
+  for f in mir.functions do
+    if is_generic_function(f) then
+      generic_names.insert(f.name.clone())
+    end
+  end
+
+  for func in mir.functions do
+    for block in func.blocks do
+      match block.terminator.kind
+      when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
+        match callee.kind
+        when MirOperandKind::MirConstant(const_val) then
+          match const_val.kind
+          when MirConstantKind::MirFnItem(callee_name) then
+            # Only process calls to known generic functions
+            if generic_names.contains(&callee_name) then
+              # Look up the function definition in the program
+              for candidate in mir.functions do
+                if candidate.name == callee_name then
+                  # Infer concrete type args from this call site
+                  let type_param_names = infer_type_param_names(candidate)
+                  let type_args = infer_type_args_for_call(
+                    candidate, &type_param_names, func, args
+                  )
+                  # Compute the mangled name and check the cache
+                  let mangled = mangle_name(callee_name.clone(), &type_args)
+                  if cache.specialized_bodies.contains_key(&mangled) then
+                    # Rewrite the call site to use the mangled name
+                    block.terminator.kind = MirTerminatorKind::MirCall(
+                      dest.clone(),
+                      MirOperand {
+                        kind: MirOperandKind::MirConstant(MirConstant {
+                          kind: MirConstantKind::MirFnItem(mangled),
+                          ty: const_val.ty.clone()
+                        })
+                      },
+                      args.clone(),
+                      success.clone(),
+                      unwind.clone()
+                    )
+                  end
+                  break
+                end
+              end
             end
           when _ then ()
           end
@@ -1048,20 +1190,236 @@ def collect_generic_calls(func: &MirFunction, worklist: &mut Vec[(String, Vec[Ty
         end
       when _ then ()
       end
-    when _ then ()
     end
   end
 end
 
-def collect_type_args_from_types(types: &Vec[Type], args: &mut Vec[Type]) -> Unit
+# Check if any type in a vector contains Type::Param.
+def has_any_param_types(types: &Vec[Type]) -> Bool
   for ty in types do
-    match ty
-    when Type::Named(_, inner_args) then
-      for a in inner_args do
-        args.push(a.clone())
+    if type_has_params(ty) then return true end
+  end
+  false
+end
+
+# Infer type args from a call site using the callee's function signature (params).
+# This is used when the callee type is Type::Function(params, ret) at the call site
+# — it matches concrete arg types against generic param types.
+def infer_type_args_for_call_by_params(
+  callee_params: &Vec[Type],
+  caller_func: &MirFunction,
+  call_args: &Vec[MirOperand]
+) -> Vec[Type]
+  mut type_args_set: Map[String, Type] = Map::new()
+  mut ordered_names: Vec[String] = Vec::new()
+
+  # Walk each param position
+  mut param_idx: Int = 0
+  while param_idx < callee_params.len() do
+    let param_ty = &callee_params[param_idx]
+    # Collect all Type::Param names from this param type
+    mut names_for_pos: Vec[String] = Vec::new()
+    collect_type_param_names(param_ty, &mut names_for_pos)
+    
+    # Map each name to the concrete arg type at this position
+    if param_idx < call_args.len() then
+      let arg_ty = operand_type_from_func(caller_func, &call_args[param_idx])
+      for name in names_for_pos do
+        if !type_args_set.contains_key(&name) then
+          type_args_set.insert(name.clone(), arg_ty.clone())
+          ordered_names.push(name.clone())
+        end
       end
-    when _ then ()
     end
+    param_idx = param_idx + 1
+  end
+
+  # Return type args in the order they were discovered (positional)
+  mut result = Vec::new()
+  for name in ordered_names do
+    match type_args_set.get(&name)
+    when Option::Some(ty) then result.push(ty.clone())
+    when Option::None then ()
+    end
+  end
+  result
+end
+
+# Collect all Type::Param names from a type into a list.
+def collect_type_param_names(ty: &Type, names: &mut Vec[String]) -> Unit
+  match ty
+  when Type::Param(name) then names.push(name.clone())
+  when Type::Option(inner) then collect_type_param_names(inner, names)
+  when Type::Result(ok, err) then
+    collect_type_param_names(ok, names)
+    collect_type_param_names(err, names)
+  when Type::Map(k, v) then
+    collect_type_param_names(k, names)
+    collect_type_param_names(v, names)
+  when Type::Set(inner) then collect_type_param_names(inner, names)
+  when Type::Slice(inner) then collect_type_param_names(inner, names)
+  when Type::Array(inner, _) then collect_type_param_names(inner, names)
+  when Type::Ref(inner, _) then collect_type_param_names(inner, names)
+  when Type::RefMut(inner, _) then collect_type_param_names(inner, names)
+  when Type::Tuple(elems) then
+    for e in elems do collect_type_param_names(&e, names) end
+  when Type::Function(params, ret) then
+    for p in params do collect_type_param_names(&p, names) end
+    collect_type_param_names(ret, names)
+  when Type::Named(_, args) then
+    for a in args do collect_type_param_names(&a, names) end
+  when _ then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Monomorphize Program: worklist-based entry point
+# ———————————————————————————————————————————————————————————————
+# Iterates until no new generic call sites remain.  After each
+# iteration, calls rewrite_call_sites_in_program so that existing
+# call sites are updated to point to the newly-mangled names.
+
+def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
+  mut changed = true
+  mut iter = 0
+  while changed do
+    changed = false
+    iter = iter + 1
+    eprintln("[mono] iter=" + iter.to_string() + " functions=" + mir.functions.len().to_string())
+    if iter > 8 then
+      eprintln("[mono] giving up after 8 iterations — probable runaway")
+      return
+    end
+
+    # Phase 1: collect generic call sites and infer type args
+    mut worklist: Vec[(String, Vec[Type])] = Vec::new()
+    for func in mir.functions do
+      for block in func.blocks do
+        match block.terminator.kind
+        when MirTerminatorKind::MirCall(_, callee, args, _, _) then
+          match callee.kind
+          when MirOperandKind::MirConstant(cv) then
+            match cv.kind
+            when MirConstantKind::MirFnItem(callee_name) then
+              # Look up the callee in the program — is it generic?
+              for candidate in mir.functions do
+                if candidate.name == callee_name then
+                  if is_generic_function(candidate) then
+                    let type_param_names = infer_type_param_names(candidate)
+                    if !type_param_names.is_empty() then
+                      # Infer concrete type args from the call site
+                      let type_args = infer_type_args_for_call(
+                        candidate, &type_param_names, func, args
+                      )
+                      # Skip entries where any inferred arg is itself a Param —
+                      # those would create $any$any-mangled cycles when the
+                      # caller is itself a specialization whose locals still
+                      # carry Param types.  Only enqueue fully-concrete args.
+                      if !has_any_param_types(&type_args) then
+                        worklist.push((callee_name.clone(), type_args))
+                      end
+                    end
+                  end
+                  break
+                end
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      end
+    end
+
+    # Phase 2: specialize each entry and add to program
+    mut new_funcs: Vec[MirFunction] = Vec::new()
+    for (func_name, type_args) in worklist do
+      # Check if already specialized (cache hit)
+      let mangled = mangle_name(func_name.clone(), &type_args)
+      if cache.specialized_bodies.contains_key(&mangled) then
+        next
+      end
+
+      mut found: Option[&MirFunction] = Option::None
+      for f in mir.functions do
+        if f.name == func_name then
+          found = Option::Some(f)
+          break
+        end
+      end
+
+      match found
+      when Option::Some(original) then
+        let type_param_names = infer_type_param_names(original)
+        if !type_param_names.is_empty() then
+          let specialized = specialize_function(cache, original, &type_param_names, &type_args)
+          new_funcs.push(specialized)
+          changed = true
+        end
+      when Option::None then ()
+      end
+    end
+
+    for f in new_funcs do
+      mir.functions.push(f)
+    end
+    eprintln("[mono]   worklist=" + worklist.len().to_string() + " new_specs=" + new_funcs.len().to_string())
+
+    # Phase 3: rewrite existing call sites to use mangled names
+    if changed then
+      rewrite_call_sites_in_program(mir, cache)
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API: mono_specialize_function
+# ———————————————————————————————————————————————————————————————
+# Specialize a single generic function with concrete type arguments
+# and add the result to the MIR program.  Returns the mangled name
+# on success, or None if the function was not found.
+pub def mono_specialize_function(
+  cache: &mut MonoCache,
+  mir: &mut MirProgram,
+  func_name: String,
+  type_args: Vec[Type]
+) -> Option[String]
+  # Find the generic function
+  mut found: Option[&MirFunction] = Option::None
+  for f in mir.functions do
+    if f.name == func_name then
+      found = Option::Some(f)
+      break
+    end
+  end
+
+  match found
+  when Option::None then
+    return Option::None
+  when Option::Some(original) then
+    # If not generic, return the name as-is
+    if !is_generic_function(original) then
+      return Option::Some(func_name)
+    end
+
+    let type_param_names = infer_type_param_names(original)
+    if type_param_names.is_empty() then
+      return Option::Some(func_name)
+    end
+
+    # Specialize — specialize_function handles caching internally
+    let mangled = mangle_name(func_name.clone(), &type_args)
+    if !cache.specialized_bodies.contains_key(&mangled) then
+      let specialized = specialize_function(cache, original, &type_param_names, &type_args)
+      mir.functions.push(specialized)
+
+      # Rewrite call sites in the entire program to catch any calls
+      # that should now point to the mangled name
+      rewrite_call_sites_in_program(mir, cache)
+    end
+
+    Option::Some(mangled)
   end
 end
 

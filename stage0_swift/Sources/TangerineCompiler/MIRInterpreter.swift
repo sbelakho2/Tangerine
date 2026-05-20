@@ -1235,7 +1235,87 @@ public final class MIRInterpreter {
     private func failProjection<T>(_ proj: MirProjection, on value: MirValue, detail: String, fallback: T) -> T {
         if !halted {
             let functionName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "<no-frame>"
-            let msg = "INTERPRETER: invalid projection \(String(describing: proj)) on \(valueKindName(value)) in \(functionName): \(detail)"
+            let stmtInfo: String = {
+                guard let frame = callStack.last else { return "<no-frame>" }
+                let fn = program.functions[frame.functionIdx]
+                let blockIdx = frame.currentBlock
+                let block = fn.blocks[blockIdx]
+                let stmtIdx = frame.stmtIndex
+                let stmtDesc: String
+                if stmtIdx >= 0 && stmtIdx < block.statements.count {
+                    stmtDesc = "\(block.statements[stmtIdx])"
+                } else {
+                    stmtDesc = "\(block.terminator)"
+                }
+                return "fn=\(fn.name) block=\(blockIdx) stmt#\(stmtIdx): \(stmtDesc)"
+            }()
+            let stackTrace: String = {
+                var result = ""
+                for (i, frame) in callStack.enumerated() {
+                    let fn = program.functions[frame.functionIdx]
+                    result += "\n    #\(i) \(fn.name) block=\(frame.currentBlock) stmt=\(frame.stmtIndex)"
+                }
+                return result
+            }()
+            let valDesc = "\(valueKindName(value))"
+            // Dump the full failing block so we can locate it in source.
+            let blockDump: String = {
+                guard let frame = callStack.last else { return "" }
+                let fn = program.functions[frame.functionIdx]
+                let blockIdx = frame.currentBlock
+                let block = fn.blocks[blockIdx]
+                var s = ""
+                for (i, st) in block.statements.enumerated() {
+                    let marker = (i == frame.stmtIndex) ? ">>>" : "   "
+                    s += "\n    \(marker) [\(i)] \(st)"
+                }
+                s += "\n        term: \(block.terminator)"
+                return s
+            }()
+            // Dump value contents (for tuple/struct).
+            let valDump: String = {
+                switch value {
+                case .tuple(let elems):
+                    var inner = "["
+                    for (i, e) in elems.enumerated() {
+                        if i > 0 { inner += ", " }
+                        inner += valueKindName(e)
+                    }
+                    inner += "]"
+                    return " elems=\(inner) count=\(elems.count)"
+                case .structVal(let n, let fs): return " struct=\(n) fields=\(fs.keys.sorted())"
+                case .enumVal(let n, let v, let inner): return " enum=\(n) variant=\(v) inner=\(valueKindName(inner))"
+                default: return ""
+                }
+            }()
+            // Dump locals at the moment of failure (last 8 locals + scrutinee).
+            let localsDump: String = {
+                guard let frame = callStack.last else { return "" }
+                let fn = program.functions[frame.functionIdx]
+                // Dump key locals around the failing area: 480-510 + 750-760
+                var s = ""
+                let ranges: [(Int, Int)] = [(480, 520), (745, 760)]
+                for (lo, hi) in ranges {
+                    let lo2 = max(0, lo)
+                    let hi2 = min(fn.locals.count, hi)
+                    if lo2 >= hi2 { continue }
+                    s += "\n      --- range [\(lo2)..\(hi2)) ---"
+                    for li in lo2..<hi2 {
+                        let lv = getLocal(li)
+                        var desc = valueKindName(lv)
+                        if case .enumVal(let n, let v, let inner) = lv {
+                            desc = "enum(\(n)#\(v) inner=\(valueKindName(inner)))"
+                        } else if case .tuple(let elems) = lv {
+                            desc = "tuple(count=\(elems.count) elems=\(elems.prefix(4).map { valueKindName($0) }))"
+                        } else if case .structVal(let n, _) = lv {
+                            desc = "struct(\(n))"
+                        }
+                        s += "\n      _\(li): \(desc)"
+                    }
+                }
+                return s
+            }()
+            let msg = "INTERPRETER: invalid projection \(String(describing: proj)) on \(valDesc)\(valDump) in \(functionName): \(detail)\n  [context] \(stmtInfo)\n  [block dump]\(blockDump)\n  [locals tail]\(localsDump)\n  [stack]\(stackTrace)"
             output.append(msg)
             runtimeError = msg
             halted = true

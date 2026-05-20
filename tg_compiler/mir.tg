@@ -12,7 +12,7 @@ use std::collections::{Vec, Map, Set}
 use std::fs::{write_file_string}
 use tg_compiler::token::{Span, span_dummy}
 use tg_compiler::ast::{
-  Program, Item, ItemKind, FunctionDecl, FnBody,
+  Program, Item, ItemKind, FunctionDecl, FnBody, ConstDecl,
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath
 }
 use tg_compiler::types::{Type, TypeId}
@@ -1084,12 +1084,14 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def lower_program(program: &Program) -> MirProgram
+  println("[lower_program] start, items=" + program.items.len().to_string())
   mut b = builder_new()
   mut functions = Vec::new()
   mut statics = Vec::new()
   mut types = Vec::new()
   mut seen_fns = Set::new()
 
+  println("[lower_program] PASS0: pre-populate enum variants, items=" + program.items.len().to_string())
   # Pre-populate enum variant map so lower_expr can resolve ExprKind::AstPath
   # Also pre-assign TypeIds to all struct and enum types for forward references
   for item in program.items do
@@ -1132,10 +1134,14 @@ def lower_program(program: &Program) -> MirProgram
       b.static_names.insert(s.name.clone())
       let st_ty = resolve_lowering_type(&s.ty)
       b.static_types.insert(s.name.clone(), st_ty)
+    when ItemKind::Const(c) then
+      b.static_names.insert(c.name.clone())
+      b.static_types.insert(c.name.clone(), const_decl_type(&c))
     when _ then ()
     end
   end
 
+  println("[lower_program] PASS0b: pre-register fn return types")
   # Pre-register function return types so call lowering can type local
   # bindings before the target function is lowered.
   for item in program.items do
@@ -1196,6 +1202,7 @@ def lower_program(program: &Program) -> MirProgram
   mut has_collect_fn_refs = false
   mut has_emit = false
   mut has_lint_file = false
+  println("[lower_program] diagnostic count pass")
   for item in program.items do
     total_items = total_items + 1
     match item.kind
@@ -1214,6 +1221,7 @@ def lower_program(program: &Program) -> MirProgram
     end
   end
 
+  println("[lower_program] PASS1: lower struct/enum type defs")
   # PASS 1: Lower all struct and enum type definitions first.
   # This ensures b.type_defs is fully populated before any function
   # body is lowered, so resolve_field_index_for_place can find
@@ -1228,6 +1236,7 @@ def lower_program(program: &Program) -> MirProgram
     end
   end
 
+  println("[lower_program] PASS2: lower functions/statics/impl/extern")
   # PASS 2: Lower functions, statics, impl methods, and extern blocks.
   for item in program.items do
     match item.kind
@@ -1242,6 +1251,8 @@ def lower_program(program: &Program) -> MirProgram
       end
     when ItemKind::Static(s) then
       statics.push(lower_static(&mut b, &s))
+    when ItemKind::Const(c) then
+      statics.push(lower_const(&mut b, &c))
     when ItemKind::Impl(impl_decl) then
       # Extract the type name from for_type for method name mangling
       let raw_impl_type = match impl_decl.for_type.kind
@@ -1338,6 +1349,7 @@ def lower_program(program: &Program) -> MirProgram
     end
   end
   
+  println("[lower_program] emitting pending closures")
   # Emit any closures that were queued during lowering
   mut result = MirProgram { functions: functions, statics: statics, types: types }
   lower_pending_closures(&mut b, &mut result)
@@ -1352,18 +1364,32 @@ def lower_program(program: &Program) -> MirProgram
 end
 
 def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
+  println("[lower_function] " + f.name.clone())
+  # Collect generic parameter names (e.g., T, U) so that type resolution
+  # can produce Type::Param("T") instead of Type::Named(TypeId{id:0}, []).
+  # This preserves generic type information in the MIR, enabling
+  # monomorphization to detect and specialize generic functions.
+  mut generic_names = Set::new()
+  println("[LF1]")
+  for gp in f.generic_params do
+    generic_names.insert(gp.name.clone())
+  end
+
   # Resolve return type from AST
+  println("[LF2]")
   let ret_type = match f.ret_type
-  when Option::Some(ty_expr) then resolve_type_with_builder(b, &ty_expr)
+  when Option::Some(ty_expr) then resolve_lowering_type_in_fn(b, &ty_expr, &generic_names)
   when Option::None then Type::Unit
   end
 
+  println("[LF3]")
   start_function(b, f.name, ret_type, f.span)
   
   # Add parameters with resolved types, applying modifiers (Ref, RefMut, etc.)
+  println("[LF4]")
   for p in f.params do
     let base_ty = match p.ty
-    when Option::Some(ty_expr) then resolve_type_with_builder(b, &ty_expr)
+    when Option::Some(ty_expr) then resolve_lowering_type_in_fn(b, &ty_expr, &generic_names)
     when Option::None then Type::Unit
     end
     let ty = match p.modifier
@@ -1379,17 +1405,20 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
   end
   
   # Lower contracts
+  println("[LF5]")
   for c in f.contracts do
     lower_contract(b, &c)
   end
   
   # Lower body
+  println("[LF6]")
   match f.body
   when FnBody::FnBlock(block) then
     if ret_type != Type::Unit && block.stmts.len() > 0 then
       # Lower all statements except the last
       mut i = 0
       while i < block.stmts.len() - 1 do
+        println("[LF7] i=" + i.to_string())
         lower_stmt(b, &block.stmts[i])
         i = i + 1
       end
@@ -1590,6 +1619,109 @@ def resolve_type_with_builder(b: &MirBuilder, ty_expr: &TypeExpr) -> Type
   end
 end
 
+# Resolve a TypeExpr in the context of a function declaration whose generic
+# parameter names are given in generic_names.  Returns Type::Param(name) for
+# type parameter references, preserving generic type information in the MIR
+# so that monomorphization can detect and specialize generic functions.
+def resolve_lowering_type_in_fn(b: &MirBuilder, ty_expr: &TypeExpr, generic_names: &Set[String]) -> Type
+  match ty_expr.kind
+  when TypeExprKind::Named(name, args) then
+    if generic_names.contains(&name) then
+      # Generic type parameter — use Type::Param instead of resolving via builder
+      mut resolved_args = Vec::new()
+      for a in args do
+        resolved_args.push(resolve_lowering_type_in_fn(b, &a, generic_names))
+      end
+      Type::Param(name)
+    elsif name == "Int" then Type::Int
+    elsif name == "I8" then Type::I8
+    elsif name == "I16" then Type::I16
+    elsif name == "I32" then Type::I32
+    elsif name == "I64" then Type::I64
+    elsif name == "UInt" then Type::UInt
+    elsif name == "U8" then Type::U8
+    elsif name == "U16" then Type::U16
+    elsif name == "U32" then Type::U32
+    elsif name == "U64" then Type::U64
+    elsif name == "Float" then Type::Float
+    elsif name == "F32" then Type::F32
+    elsif name == "F64" then Type::F64
+    elsif name == "Bool" then Type::Bool
+    elsif name == "Char" then Type::Char
+    elsif name == "String" then Type::String
+    elsif name == "Unit" then Type::Unit
+    elsif name == "Never" then Type::Never
+    elsif name == "Option" && args.len() == 1 then
+      Type::Option(resolve_lowering_type_in_fn(b, &args[0], generic_names))
+    elsif name == "Result" && args.len() == 2 then
+      Type::Result(resolve_lowering_type_in_fn(b, &args[0], generic_names),
+                   resolve_lowering_type_in_fn(b, &args[1], generic_names))
+    elsif (name == "Vec" || name == "Array") && args.len() == 1 then
+      Type::Slice(resolve_lowering_type_in_fn(b, &args[0], generic_names))
+    elsif name == "Map" && args.len() == 2 then
+      Type::Map(resolve_lowering_type_in_fn(b, &args[0], generic_names),
+                resolve_lowering_type_in_fn(b, &args[1], generic_names))
+    elsif name == "Set" && args.len() == 1 then
+      Type::Set(resolve_lowering_type_in_fn(b, &args[0], generic_names))
+    else
+      # User-defined type — resolve via builder for proper TypeId,
+      # but still propagate generic names for any nested type args
+      mut resolved_args = Vec::new()
+      for a in args do
+        resolved_args.push(resolve_lowering_type_in_fn(b, &a, generic_names))
+      end
+      let tid = match b.type_name_to_id.get(name)
+      when Option::Some(id) then id
+      when Option::None then 0
+      end
+      Type::Named(TypeId { id: tid }, resolved_args)
+    end
+  when TypeExprKind::Unit then Type::Unit
+  when TypeExprKind::Never then Type::Never
+  when TypeExprKind::Tuple(elems) then
+    mut types = Vec::new()
+    for e in elems do
+      types.push(resolve_lowering_type_in_fn(b, &e, generic_names))
+    end
+    Type::Tuple(types)
+  when TypeExprKind::Array(elem, size_opt) then
+    let elem_ty = resolve_lowering_type_in_fn(b, &elem, generic_names)
+    let size = match size_opt
+    when Option::Some(size_expr) then
+      match size_expr.kind
+      when ExprKind::ExprIntLit(n) then n
+      when _ then 0
+      end
+    when Option::None then 0
+    end
+    Type::Array(elem_ty, size)
+  when TypeExprKind::Slice(elem) then
+    Type::Slice(resolve_lowering_type_in_fn(b, &elem, generic_names))
+  when TypeExprKind::Ptr(inner) then
+    Type::Ptr(resolve_lowering_type_in_fn(b, &inner, generic_names))
+  when TypeExprKind::PtrMut(inner) then
+    Type::PtrMut(resolve_lowering_type_in_fn(b, &inner, generic_names))
+  when TypeExprKind::Ref(inner) then
+    Type::Ref(resolve_lowering_type_in_fn(b, &inner, generic_names), lifetime_anonymous())
+  when TypeExprKind::RefMut(inner) then
+    Type::RefMut(resolve_lowering_type_in_fn(b, &inner, generic_names), lifetime_anonymous())
+  when TypeExprKind::Fn(params, ret) then
+    mut param_types = Vec::new()
+    for p in params do
+      param_types.push(resolve_lowering_type_in_fn(b, &p, generic_names))
+    end
+    Type::Function(param_types, resolve_lowering_type_in_fn(b, &ret, generic_names))
+  when TypeExprKind::Async(inner) then
+    Type::Named(TypeId { id: 0 }, Vec::from([resolve_lowering_type_in_fn(b, &inner, generic_names)]))
+  when TypeExprKind::Effect(effect_name, inner) then
+    Type::Effect(Vec::from([effect_name]), resolve_lowering_type_in_fn(b, &inner, generic_names))
+  when TypeExprKind::Path(path) then
+    Type::Named(TypeId { id: 0 }, Vec::new())
+  when TypeExprKind::Infer then Type::Unit
+  when _ then Type::Unit
+  end
+end
+
 def expr_kind_tag(k: &ExprKind) -> String
   match k
   when ExprKind::ExprPath(_) then "ExprPath"
@@ -1603,15 +1735,31 @@ def expr_kind_tag(k: &ExprKind) -> String
   end
 end
 
-def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
-  let resolved_ty = resolve_lowering_type(&s.ty)
+def infer_const_expr_type(expr: &Expr) -> Type
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then Type::Int
+  when ExprKind::ExprFloatLit(_) then Type::Float
+  when ExprKind::ExprBoolLit(_) then Type::Bool
+  when ExprKind::ExprCharLit(_) then Type::Char
+  when ExprKind::ExprStringLit(_) then Type::String
+  when _ then Type::Unit
+  end
+end
 
+def const_decl_type(c: &ConstDecl) -> Type
+  match c.ty
+  when Option::Some(ty_expr) then resolve_lowering_type(&ty_expr)
+  when Option::None then infer_const_expr_type(&c.value)
+  end
+end
+
+def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Type) -> Option[MirOperand]
   # Try to produce a direct constant operand for common static init patterns:
   #   - Enum variant paths like Option::None → discriminant integer
   #   - Integer/bool/string literals → direct constant
   #   - Vec::new(), Map::new(), Set::new() → zero (null pointer)
   # For anything else, fall back (will be zero-filled by codegen).
-  let init_val = match s.value.kind
+  match value.kind
   when ExprKind::ExprPath(path) then
     if path.segments.len() >= 2 then
       match resolve_enum_variant_discriminant(b, &path)
@@ -1652,6 +1800,20 @@ def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
         ty: Type::Bool
       })
     })
+  when ExprKind::ExprFloatLit(v) then
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFloat(v),
+        ty: Type::Float
+      })
+    })
+  when ExprKind::ExprCharLit(v) then
+    Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirChar(v),
+        ty: Type::Char
+      })
+    })
   when ExprKind::ExprStringLit(s_val) then
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
@@ -1684,12 +1846,29 @@ def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
       })
     })
   end
+end
+
+def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
+  let resolved_ty = resolve_lowering_type(&s.ty)
+  let init_val = lower_static_init_operand(b, &s.value, resolved_ty.clone())
 
   MirStatic {
     name: s.name,
     ty: resolved_ty,
     init: init_val,
     is_mut: s.is_mut
+  }
+end
+
+def lower_const(b: &mut MirBuilder, c: &ConstDecl) -> MirStatic
+  let resolved_ty = const_decl_type(c)
+  let init_val = lower_static_init_operand(b, &c.value, resolved_ty.clone())
+
+  MirStatic {
+    name: c.name,
+    ty: resolved_ty,
+    init: init_val,
+    is_mut: false
   }
 end
 
@@ -2565,7 +2744,80 @@ def bind_match_arm_pattern_locals(b: &mut MirBuilder, scrut_local: LocalId, pat:
   end
 end
 
+def stmt_kind_name(kind: &StmtKind) -> String
+  match kind
+  when StmtKind::StmtLet(_, _, _, _) then "StmtLet"
+  when StmtKind::StmtAssign(_, _) then "StmtAssign"
+  when StmtKind::StmtCompoundAssign(_, _, _) then "StmtCompoundAssign"
+  when StmtKind::StmtIf(_) then "StmtIf"
+  when StmtKind::StmtMatch(_) then "StmtMatch"
+  when StmtKind::StmtWhile(_, _) then "StmtWhile"
+  when StmtKind::StmtFor(_) then "StmtFor"
+  when StmtKind::StmtLoop(_) then "StmtLoop"
+  when StmtKind::StmtReturn(_) then "StmtReturn"
+  when StmtKind::StmtBreak(_) then "StmtBreak"
+  when StmtKind::StmtContinue then "StmtContinue"
+  when StmtKind::StmtYield(_) then "StmtYield"
+  when StmtKind::StmtExpr(_) then "StmtExpr"
+  when StmtKind::StmtUnsafe(_, _) then "StmtUnsafe"
+  when StmtKind::StmtDefer(_) then "StmtDefer"
+  when StmtKind::StmtGuard(_, _) then "StmtGuard"
+  when StmtKind::StmtTry(_, _, _) then "StmtTry"
+  when StmtKind::StmtWith(_, _, _) then "StmtWith"
+  when StmtKind::StmtHandleWith(_, _) then "StmtHandleWith"
+  when _ then "StmtKind(?)"
+  end
+end
+
+def expr_kind_name(kind: &ExprKind) -> String
+  match kind
+  when ExprKind::ExprIntLit(_) then "ExprIntLit"
+  when ExprKind::ExprFloatLit(_) then "ExprFloatLit"
+  when ExprKind::ExprStringLit(_) then "ExprStringLit"
+  when ExprKind::ExprCharLit(_) then "ExprCharLit"
+  when ExprKind::ExprBoolLit(_) then "ExprBoolLit"
+  when ExprKind::ExprNilLit then "ExprNilLit"
+  when ExprKind::ExprArrayLit(_) then "ExprArrayLit"
+  when ExprKind::ExprTupleLit(_) then "ExprTupleLit"
+  when ExprKind::ExprStructLit(_, _) then "ExprStructLit"
+  when ExprKind::ExprMapLit(_) then "ExprMapLit"
+  when ExprKind::ExprIdent(_) then "ExprIdent"
+  when ExprKind::ExprPath(_) then "ExprPath"
+  when ExprKind::ExprSelfRef then "ExprSelfRef"
+  when ExprKind::ExprBinaryOp(_, _, _) then "ExprBinaryOp"
+  when ExprKind::ExprUnaryOp(_, _) then "ExprUnaryOp"
+  when ExprKind::ExprFieldAccess(_, _) then "ExprFieldAccess"
+  when ExprKind::ExprMethodCall(_, _, _, _) then "ExprMethodCall"
+  when ExprKind::ExprIndex(_, _) then "ExprIndex"
+  when ExprKind::ExprCall(_, _) then "ExprCall"
+  when ExprKind::ExprClosure(_, _, _) then "ExprClosure"
+  when ExprKind::ExprRef(_) then "ExprRef"
+  when ExprKind::ExprRefMut(_) then "ExprRefMut"
+  when ExprKind::ExprDeref(_) then "ExprDeref"
+  when ExprKind::ExprMove(_) then "ExprMove"
+  when ExprKind::ExprCopy(_) then "ExprCopy"
+  when ExprKind::ExprIf(_) then "ExprIf"
+  when ExprKind::ExprMatch(_) then "ExprMatch"
+  when ExprKind::ExprBlock(_) then "ExprBlock"
+  when ExprKind::ExprUnsafe(_, _) then "ExprUnsafe"
+  when ExprKind::ExprAsync(_) then "ExprAsync"
+  when ExprKind::ExprAwait(_) then "ExprAwait"
+  when ExprKind::ExprTry(_) then "ExprTry"
+  when ExprKind::ExprRange(_, _, _) then "ExprRange"
+  when ExprKind::ExprCast(_, _) then "ExprCast"
+  when ExprKind::ExprTypeCheck(_, _) then "ExprTypeCheck"
+  when ExprKind::ExprComptime(_) then "ExprComptime"
+  when ExprKind::ExprEnumVariant(_, _) then "ExprEnumVariant"
+  when ExprKind::ExprAssign(_, _) then "ExprAssign"
+  when ExprKind::ExprPipe(_, _) then "ExprPipe"
+  when ExprKind::ExprMacroCall(_, _) then "ExprMacroCall"
+  when ExprKind::ExprError(_) then "ExprError"
+  when _ then "ExprKind(?)"
+  end
+end
+
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
+  println("[lower_stmt] kind=" + stmt_kind_name(&stmt.kind))
   match stmt.kind
   when StmtKind::StmtLet(pattern, ty_opt, value, is_mut) then
     let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
@@ -2642,11 +2894,9 @@ end
 
 def lower_expr(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirOperand
   let rvalue = lower_expr_to_rvalue(b, expr, span)
-  
-  # Create temp and assign
-  let temp = add_temp(b, mir_infer_expr_type(b, expr), span)
+  let inferred_ty = mir_infer_expr_type(b, expr)
+  let temp = add_temp(b, inferred_ty, span)
   push_assign(b, place_local(temp), rvalue, span)
-
   operand_copy_local(temp)
 end
 
@@ -2718,519 +2968,678 @@ def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &V
   lower_expr_to_rvalue(b, &block_expr, span)
 end
 
-def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRvalue
-  match expr.kind
-  when ExprKind::ExprIntLit(n) then
-    move_rvalue(operand_int(n))
-  when ExprKind::ExprFloatLit(f) then
-    move_rvalue(operand_float(f))
-  when ExprKind::ExprBoolLit(bool_lit) then
-    move_rvalue(operand_bool(bool_lit))
-  when ExprKind::ExprCharLit(c) then
-    move_rvalue(operand_constant(constant_char(c)))
-  when ExprKind::ExprStringLit(s) then
-    move_rvalue(operand_string(s))
-  when ExprKind::ExprIdent(name) then
-    match lookup_current_local_id_by_name(b, name)
-    when Option::Some(local_id) then
-      move_rvalue(operand_copy_local(local_id))
-    when Option::None then
-      # Check if this is a static/global variable
-      if b.static_names.contains(&name) then
-        let st_ty = match b.static_types.get(name)
-        when Option::Some(t) then t
-        when Option::None then Type::Unit
-        end
-        move_rvalue(MirOperand {
-          kind: MirOperandKind::MirConstant(MirConstant {
-            kind: MirConstantKind::MirStaticRef(name),
-            ty: st_ty
-          })
-        })
-      else
-        move_rvalue(operand_unit())
+# Per-arm helpers extracted from lower_expr_to_rvalue.
+# stage0_swift's codegen has a bug returning multi-word structs through
+# deeply-nested match arms (corrupts caller stack frame on return). Each
+# arm here returns directly from a fresh function frame, avoiding that
+# pattern.
+def lr_self_ref(b: &mut MirBuilder) -> MirRvalue
+  match lookup_current_local_id_by_name(b, "self")
+  when Option::Some(local_id) then
+    move_rvalue(operand_copy_local(local_id))
+  when Option::None then
+    move_rvalue(operand_unit())
+  end
+end
+
+def lr_ident(b: &mut MirBuilder, name: String) -> MirRvalue
+  match lookup_current_local_id_by_name(b, name)
+  when Option::Some(local_id) then move_rvalue(operand_copy_local(local_id))
+  when Option::None then
+    if b.static_names.contains(&name) then
+      let st_ty = match b.static_types.get(name)
+      when Option::Some(t) then t
+      when Option::None then Type::Unit
       end
-    end
-  when ExprKind::ExprSelfRef then
-    match lookup_current_local_id_by_name(b, "self")
-    when Option::Some(local_id) then
-      move_rvalue(operand_copy_local(local_id))
-    when Option::None then
+      move_rvalue(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirStaticRef(name),
+          ty: st_ty
+        })
+      })
+    else
       move_rvalue(operand_unit())
     end
-  when ExprKind::ExprBinaryOp(op, left, right) then
-    let left_op = lower_expr(b, &left, span)
-    let right_op = lower_expr(b, &right, span)
-    let mir_op = lower_binop(op)
-    MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
-  when ExprKind::ExprUnaryOp(op, inner) then
-    let inner_op = lower_expr(b, &inner, span)
-    let mir_op = lower_unop(op)
-    MirRvalue { kind: MirRvalueKind::MirUnOp(mir_op, inner_op) }
-  when ExprKind::ExprRef(inner) then
-    let place = lower_place(b, &inner)
-    MirRvalue { kind: MirRvalueKind::MirRef(place) }
-  when ExprKind::ExprRefMut(inner) then
-    let place = lower_place(b, &inner)
-    MirRvalue { kind: MirRvalueKind::MirRefMut(place) }
-  when ExprKind::ExprDeref(inner) then
-    let inner_op = lower_expr(b, &inner, span)
-    # Would project deref
-    MirRvalue { kind: MirRvalueKind::MirMove(inner_op) }
-  when ExprKind::ExprArrayLit(elems) then
-    mut ops = Vec::new()
-    for e in elems do
-      ops.push(lower_expr(b, &e, span))
-    end
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::MirArray(Type::Unit), ops) }
-  when ExprKind::ExprTupleLit(elems) then
-    mut ops = Vec::new()
-    for e in elems do
-      ops.push(lower_expr(b, &e, span))
-    end
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple, ops) }
+  end
+end
 
-  when ExprKind::ExprCall(callee_expr, arg_exprs) then
+def lr_deref(b: &mut MirBuilder, inner: &Expr, span: Span) -> MirRvalue
+  let inner_op = lower_expr(b, inner, span)
+  MirRvalue { kind: MirRvalueKind::MirMove(inner_op) }
+end
+
+def lr_binary(b: &mut MirBuilder, op: BinOp, left: &Expr, right: &Expr, span: Span) -> MirRvalue
+  let left_op = lower_expr(b, left, span)
+  let right_op = lower_expr(b, right, span)
+  let mir_op = lower_binop(op)
+  MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+end
+
+def lr_unary(b: &mut MirBuilder, op: UnOp, inner: &Expr, span: Span) -> MirRvalue
+  let inner_op = lower_expr(b, inner, span)
+  let mir_op = lower_unop(op)
+  MirRvalue { kind: MirRvalueKind::MirUnOp(mir_op, inner_op) }
+end
+
+def lr_ref(b: &mut MirBuilder, inner: &Expr) -> MirRvalue
+  let place = lower_place(b, inner)
+  MirRvalue { kind: MirRvalueKind::MirRef(place) }
+end
+
+def lr_ref_mut(b: &mut MirBuilder, inner: &Expr) -> MirRvalue
+  let place = lower_place(b, inner)
+  MirRvalue { kind: MirRvalueKind::MirRefMut(place) }
+end
+
+def lr_array_lit(b: &mut MirBuilder, elems: &Vec[Expr], span: Span) -> MirRvalue
+  mut ops = Vec::new()
+  for e in elems do
+    ops.push(lower_expr(b, &e, span))
+  end
+  MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::MirArray(Type::Unit), ops) }
+end
+
+def lr_tuple_lit(b: &mut MirBuilder, elems: &Vec[Expr], span: Span) -> MirRvalue
+  mut ops = Vec::new()
+  for e in elems do
+    ops.push(lower_expr(b, &e, span))
+  end
+  MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple, ops) }
+end
+
+# Extract the AstPath from an Expr that is known to be ExprPath.
+# Uses a tiny 2-arm match (safe from the large-enum Swift compiler bug).
+def path_in_expr(expr: &Expr) -> AstPath
+  match expr.kind
+  when ExprKind::ExprPath(path) then path
+  when _ then AstPath { segments: Vec::new(), span: Span { file: "", start: 0, end_pos: 0 } }
+  end
+end
+
+# Lower a callee expression to a function operand, using string dispatch
+# on ExprKind to avoid the large-enum Swift compiler match bug.
+def lower_callee_expr(b: &mut MirBuilder, callee_expr: &Expr, span: Span) -> MirOperand
+  let ck = expr_kind_name(&callee_expr.kind)
+  if ck == "ExprIdent" then
     match callee_expr.kind
-    when ExprKind::ExprPath(path) then
-      if is_vec_like_from_path(&path) && arg_exprs.len() == 1 then
-        match arg_exprs[0].kind
-        when ExprKind::ExprArrayLit(elems) then
-          return lower_vec_like_from_array_call(b, &path, &elems, span)
-        when _ then ()
-        end
-      end
-    when _ then ()
-    end
-
-    # Lower callee to a function operand. Inline the only lower_call_callee
-    # call site here so call-lowering does not depend on an extra helper call.
-    let callee_op = match callee_expr.kind
     when ExprKind::ExprIdent(name) then
       match lookup_current_local_id_by_name(b, name)
-      when Option::Some(_) then
-        lower_expr(b, &callee_expr, span)
-      when Option::None then
-        mir_fn_operand(b, name.clone())
-      end
-    when ExprKind::ExprFieldAccess(recv, field) then
-      mir_fn_operand(b, qualify_field_callee_name(&recv, field.clone()))
-    when ExprKind::ExprEnumVariant(path, _) then
-      mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
-    when ExprKind::ExprPath(path) then
-      let fn_name = resolve_static_path_callee_name(b, &path)
-      mir_fn_operand(b, fn_name)
-    when _ then
-      lower_expr(b, &callee_expr, span)
-    end
-    let ret_type = mir_infer_call_result_type(b, &callee_expr)
-    
-    # Lower arguments
-    mut mir_args = Vec::new()
-    for a in arg_exprs do
-      mir_args.push(lower_expr(b, &a, span))
-    end
-    
-    # Keep call result locals typed so later method resolution sees the
-    # actual receiver type. Only fall back to Int for true Unit returns.
-    let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
-    let dest_place = place_local(ret_tmp)
-    
-    # Create success continuation block
-    let success_blk = create_block(b)
-    
-    # Emit Call terminator in current block
-    set_terminator(b, MirTerminatorKind::MirCall {
-      dest: dest_place,
-      func: callee_op,
-      args: mir_args,
-      success: success_blk,
-      unwind: Option::None
-    }, span)
-    
-    # Switch to the success block
-    b.current_block = Option::Some(success_blk)
-    
-    # The result is the destination local
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(ret_tmp))
-    }) }
-
-  when ExprKind::ExprMethodCall(receiver, method_name, type_args, arg_exprs) then
-    let normalized_method_name = normalize_method_name(method_name.clone())
-    # Lower receiver as a reference (address-of) for method calls.
-    # If the receiver is not already place-like (for example a chained call
-    # like vec.len().to_string()), first spill it into a temp local so we can
-    # borrow that temp instead of falling back to local 0.
-    let recv_place = match receiver.kind
-    when ExprKind::ExprIdent(_) then
-      lower_place(b, &receiver)
-    when ExprKind::ExprSelfRef then
-      lower_place(b, &receiver)
-    when ExprKind::ExprFieldAccess(_, _) then
-      lower_place(b, &receiver)
-    when ExprKind::ExprDeref(_) then
-      lower_place(b, &receiver)
-    when ExprKind::ExprIndex(_, _) then
-      lower_place(b, &receiver)
-    when _ then
-      let recv_tmp = add_temp(b, mir_infer_expr_type(b, &receiver), span)
-      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &receiver, span), span)
-      place_local(recv_tmp)
-    end
-
-    # Try to resolve the receiver type for method name mangling.
-    # For field access chains (e.g.  lex.tokens.push(x)), the AST-level
-    # inference returns Unit for identifiers and field accesses.  We fall
-    # back to the MIR local's declared type and then walk the field
-    # projections so that  Lexer → .tokens → Vec[Token]  is resolved
-    # correctly, producing Vec__push rather than Lexer__push.
-    mut recv_place_type = mir_infer_place_type(&recv_place, b)
-    if recv_place_type == Type::Unit then
-      recv_place_type = mir_infer_expr_type(b, &receiver)
-    end
-
-    match recv_place_type
-    when Type::Unit then
-      match b.current_fn
-      when Option::Some(func) then
-        for local in func.locals do
-          if local.id.id == recv_place.local.id then
-            recv_place_type = local.ty.clone()
-          end
-        end
-      when Option::None then ()
+      when Option::Some(_) then return lower_expr(b, &callee_expr, span)
+      when Option::None then return mir_fn_operand(b, name.clone())
       end
     when _ then ()
     end
+  elsif ck == "ExprFieldAccess" then
+    match callee_expr.kind
+    when ExprKind::ExprFieldAccess(recv, field) then
+      return mir_fn_operand(b, qualify_field_callee_name(&recv, field.clone()))
+    when _ then ()
+    end
+  elsif ck == "ExprEnumVariant" then
+    match callee_expr.kind
+    when ExprKind::ExprEnumVariant(path, _) then
+      return mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
+    when _ then ()
+    end
+  elsif ck == "ExprPath" then
+    match callee_expr.kind
+    when ExprKind::ExprPath(path) then
+      let fn_name = resolve_static_path_callee_name(b, &path)
+      return mir_fn_operand(b, fn_name)
+    when _ then ()
+    end
+  end
+  # Default fallback
+  lower_expr(b, &callee_expr, span)
+end
 
-    mut recv_type = recv_place_type.clone()
+# Lower a method-call receiver expression to a Place, using string dispatch
+# on ExprKind to avoid the large-enum Swift compiler match bug.
+def lower_receiver_place(b: &mut MirBuilder, receiver: &Expr, span: Span) -> Place
+  let rk = expr_kind_name(&receiver.kind)
+  mut recv_place = place_local(LocalId { id: 0 })
+  if rk == "ExprIdent" then
+    match receiver.kind
+    when ExprKind::ExprIdent(_) then recv_place = lower_place(b, &receiver)
+    when _ then ()
+    end
+  elsif rk == "ExprSelfRef" then
+    match receiver.kind
+    when ExprKind::ExprSelfRef then recv_place = lower_place(b, &receiver)
+    when _ then ()
+    end
+  elsif rk == "ExprFieldAccess" then
+    match receiver.kind
+    when ExprKind::ExprFieldAccess(_, _) then recv_place = lower_place(b, &receiver)
+    when _ then ()
+    end
+  elsif rk == "ExprDeref" then
+    match receiver.kind
+    when ExprKind::ExprDeref(_) then recv_place = lower_place(b, &receiver)
+    when _ then ()
+    end
+  elsif rk == "ExprIndex" then
+    match receiver.kind
+    when ExprKind::ExprIndex(_, _) then recv_place = lower_place(b, &receiver)
+    when _ then ()
+    end
+  else
+    let recv_tmp = add_temp(b, mir_infer_expr_type(b, &receiver), span)
+    push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &receiver, span), span)
+    recv_place = place_local(recv_tmp)
+  end
+  recv_place
+end
 
-      # Distinguish between a receiver expression that is already a borrowed
-      # value (e.g. `s: &String`, `lex: &Lexer`, `loaded: &Vec[Int]`) and a
-      # place reached through a borrowed base (e.g. `self.loaded_paths`).
-      # Only the former should bypass the synthetic re-borrow; otherwise we
-      # accidentally turn `&T` receivers into `&&T` at runtime.
-      let recv_is_borrowed = match recv_place_type
-      when Type::Ref(_, _) then true
-      when Type::RefMut(_, _) then true
-      when Type::Ptr(_) then true
-      when Type::PtrMut(_) then true
-      when _ then false
-      end
-
-      # Strip references/pointers so method resolution sees the underlying type.
-      # mir_infer_expr_type may return Type::RefMut(Named(...)) for `f: &mut Formatter`
-      # which would not match the Type::Named branch below without stripping.
-      recv_type = match recv_place_type
-      when Type::Ref(inner, _) then inner
-      when Type::RefMut(inner, _) then inner
-      when Type::Ptr(inner) then inner
-      when Type::PtrMut(inner) then inner
-      when other then other
-      end
-
-    let recv_op = if recv_is_borrowed then
-      MirOperand {
-        kind: MirOperandKind::MirCopy(recv_place)
-      }
-    else
-      let recv_ref_tmp = add_temp(b, Type::Ref(recv_type.clone(), lifetime_anonymous()), span)
-      push_stmt(b, MirStatementKind::MirAssign(place_local(recv_ref_tmp), MirRvalue {
-        kind: MirRvalueKind::MirRef(recv_place)
-      }), span)
-      MirOperand {
-        kind: MirOperandKind::MirCopy(place_local(recv_ref_tmp))
-      }
+def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRvalue
+  
+  # Use string-based dispatch via expr_kind_name() to avoid Stage0 Swift
+  # compiler bug with value matches on large (41-variant) enums like ExprKind.
+  # expr_kind_name() matches on &ExprKind (reference) which works correctly.
+  # Each arm below uses a tiny 2-arm match (1 specific + 1 default) which
+  # the Swift compiler's if-else chain generation handles correctly.
+  let kind_name = expr_kind_name(&expr.kind)
+  
+  if kind_name == "ExprIntLit" then
+    match expr.kind
+    when ExprKind::ExprIntLit(n) then return move_rvalue(operand_int(n))
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprFloatLit" then
+    match expr.kind
+    when ExprKind::ExprFloatLit(f) then return move_rvalue(operand_float(f))
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprBoolLit" then
+    match expr.kind
+    when ExprKind::ExprBoolLit(bool_lit) then return move_rvalue(operand_bool(bool_lit))
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprCharLit" then
+    match expr.kind
+    when ExprKind::ExprCharLit(c) then return move_rvalue(operand_constant(constant_char(c)))
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprStringLit" then
+    match expr.kind
+    when ExprKind::ExprStringLit(s) then return move_rvalue(operand_string(s))
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprNilLit" then
+    return move_rvalue(operand_unit())
+    
+  elsif kind_name == "ExprIdent" then
+    match expr.kind
+    when ExprKind::ExprIdent(name) then return lr_ident(b, name)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprSelfRef" then
+    return lr_self_ref(b)
+    
+  elsif kind_name == "ExprBinaryOp" then
+    match expr.kind
+    when ExprKind::ExprBinaryOp(op, left, right) then return lr_binary(b, op, &left, &right, span)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprUnaryOp" then
+    match expr.kind
+    when ExprKind::ExprUnaryOp(op, inner) then return lr_unary(b, op, &inner, span)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprRef" then
+    match expr.kind
+    when ExprKind::ExprRef(inner) then return lr_ref(b, &inner)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprRefMut" then
+    match expr.kind
+    when ExprKind::ExprRefMut(inner) then return lr_ref_mut(b, &inner)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprDeref" then
+    match expr.kind
+    when ExprKind::ExprDeref(inner) then return lr_deref(b, &inner, span)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprArrayLit" then
+    match expr.kind
+    when ExprKind::ExprArrayLit(elems) then return lr_array_lit(b, &elems, span)
+    when _ then ()
+    end
+    
+  elsif kind_name == "ExprTupleLit" then
+    match expr.kind
+    when ExprKind::ExprTupleLit(elems) then return lr_tuple_lit(b, &elems, span)
+    when _ then ()
     end
 
-    let resolved_method = match recv_type
-    when Type::Int then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_int_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::Float then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_float_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::F32 then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_float_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::F64 then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_float_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::Bool then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_bool_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::Char then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "__intrinsic_char_to_string"
-      else
-        normalized_method_name.clone()
-      end
-    when Type::Named(tid, _) then
-      # Find the type name for this TypeId
-      mut type_name = ""
-      for td in b.type_defs do
-        if td.id.id == tid.id then
-          type_name = td.name.clone()
+  elsif kind_name == "ExprCall" then
+    match expr.kind
+    when ExprKind::ExprCall(callee_expr, arg_exprs) then
+      # Use string dispatch for inner callee kind checks (also ExprKind)
+      let callee_kind = expr_kind_name(&callee_expr.kind)
+      if callee_kind == "ExprPath" then
+        if is_vec_like_from_path(&path_in_expr(&callee_expr)) && arg_exprs.len() == 1 then
+          let args0_kind = expr_kind_name(&arg_exprs[0].kind)
+          if args0_kind == "ExprArrayLit" then
+            match arg_exprs[0].kind
+            when ExprKind::ExprArrayLit(elems) then
+              return lower_vec_like_from_array_call(b, &path_in_expr(&callee_expr), &elems, span)
+            when _ then ()
+            end
+          end
         end
       end
-      if type_name != "" then
-        # For `.clone()`, only dispatch to TypeName__clone when it's a
-        # known refcounted wrapper whose clone has real side effects.
-        # Otherwise emit bare "clone" so codegen's intrinsic
-        # (deref_all_ref_like_args) handles it correctly. This avoids
-        # mis-dispatching clones on values whose recv_type happens to
-        # resolve to a sentinel TypeId (e.g. tid=0 → "WeakArc").
-        if normalized_method_name == "clone" then
-          if type_name == "Rc" || type_name == "WeakRc" || type_name == "ArcStrong" || type_name == "WeakArc" then
-            type_name + "__clone"
+
+      # Lower callee to a function operand.
+      let callee_op = lower_callee_expr(b, &callee_expr, span)
+
+      let ret_type = mir_infer_call_result_type(b, &callee_expr)
+
+      # Lower arguments
+      mut mir_args = Vec::new()
+      for a in arg_exprs do
+        mir_args.push(lower_expr(b, &a, span))
+      end
+
+      # Keep call result locals typed so later method resolution sees the
+      # actual receiver type. Only fall back to Int for true Unit returns.
+      let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
+      let dest_place = place_local(ret_tmp)
+
+      # Create success continuation block
+      let success_blk = create_block(b)
+
+      # Emit Call terminator in current block
+      set_terminator(b, MirTerminatorKind::MirCall {
+        dest: dest_place,
+        func: callee_op,
+        args: mir_args,
+        success: success_blk,
+        unwind: Option::None
+      }, span)
+
+      # Switch to the success block
+      b.current_block = Option::Some(success_blk)
+
+      # The result is the destination local
+      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(ret_tmp))
+      }) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprMethodCall" then
+    match expr.kind
+    when ExprKind::ExprMethodCall(receiver, method_name, type_args, arg_exprs) then
+      let normalized_method_name = normalize_method_name(method_name.clone())
+      # Lower receiver as a reference (address-of) for method calls.
+      # If the receiver is not already place-like (for example a chained call
+      # like vec.len().to_string()), first spill it into a temp local so we can
+      # borrow that temp instead of falling back to local 0.
+      mut recv_place = lower_receiver_place(b, &receiver, span)
+  
+      # Try to resolve the receiver type for method name mangling.
+      # For field access chains (e.g.  lex.tokens.push(x)), the AST-level
+      # inference returns Unit for identifiers and field accesses.  We fall
+      # back to the MIR local's declared type and then walk the field
+      # projections so that  Lexer → .tokens → Vec[Token]  is resolved
+      # correctly, producing Vec__push rather than Lexer__push.
+      mut recv_place_type = mir_infer_place_type(&recv_place, b)
+      if recv_place_type == Type::Unit then
+        recv_place_type = mir_infer_expr_type(b, &receiver)
+      end
+
+      match recv_place_type
+      when Type::Unit then
+        match b.current_fn
+        when Option::Some(func) then
+          for local in func.locals do
+            if local.id.id == recv_place.local.id then
+              recv_place_type = local.ty.clone()
+            end
+          end
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+
+      mut recv_type = recv_place_type.clone()
+
+        # Distinguish between a receiver expression that is already a borrowed
+        # value (e.g. `s: &String`, `lex: &Lexer`, `loaded: &Vec[Int]`) and a
+        # place reached through a borrowed base (e.g. `self.loaded_paths`).
+        # Only the former should bypass the synthetic re-borrow; otherwise we
+        # accidentally turn `&T` receivers into `&&T` at runtime.
+        mut recv_is_borrowed = false
+        match recv_place_type
+        when Type::Ref(_, _) then recv_is_borrowed = true
+        when Type::RefMut(_, _) then recv_is_borrowed = true
+        when Type::Ptr(_) then recv_is_borrowed = true
+        when Type::PtrMut(_) then recv_is_borrowed = true
+        when _ then ()
+        end
+
+        # Strip references/pointers so method resolution sees the underlying type.
+        # mir_infer_expr_type may return Type::RefMut(Named(...)) for `f: &mut Formatter`
+        # which would not match the Type::Named branch below without stripping.
+        match recv_place_type
+        when Type::Ref(inner, _) then recv_type = inner
+        when Type::RefMut(inner, _) then recv_type = inner
+        when Type::Ptr(inner) then recv_type = inner
+        when Type::PtrMut(inner) then recv_type = inner
+        when _ then ()
+        end
+
+      mut recv_op = MirOperand { kind: MirOperandKind::MirCopy(recv_place) }
+      if recv_is_borrowed then
+        ()
+      else
+        let recv_ref_tmp = add_temp(b, Type::Ref(recv_type.clone(), lifetime_anonymous()), span)
+        push_stmt(b, MirStatementKind::MirAssign(place_local(recv_ref_tmp), MirRvalue {
+          kind: MirRvalueKind::MirRef(recv_place)
+        }), span)
+        recv_op = MirOperand {
+          kind: MirOperandKind::MirCopy(place_local(recv_ref_tmp))
+        }
+      end
+
+      mut resolved_method = normalized_method_name.clone()
+      match recv_type
+      when Type::Int then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_int_to_string"
+        end
+      when Type::Float then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_float_to_string"
+        end
+      when Type::F32 then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_float_to_string"
+        end
+      when Type::F64 then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_float_to_string"
+        end
+      when Type::Bool then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_bool_to_string"
+        end
+      when Type::Char then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "__intrinsic_char_to_string"
+        end
+      when Type::Named(tid, _) then
+        # Find the type name for this TypeId
+        mut type_name = ""
+        for td in b.type_defs do
+          if td.id.id == tid.id then
+            type_name = td.name.clone()
+          end
+        end
+        if type_name != "" then
+          if normalized_method_name == "clone" then
+            if type_name == "Rc" || type_name == "WeakRc" || type_name == "ArcStrong" || type_name == "WeakArc" then
+              resolved_method = type_name + "__clone"
+            else
+              resolved_method = "clone"
+            end
           else
-            "clone"
+            resolved_method = type_name + "__" + normalized_method_name.clone()
           end
         else
-          type_name + "__" + normalized_method_name.clone()
+          if normalized_method_name == "clone" then
+            resolved_method = "clone"
+          else
+            match b.impl_type_map.get(normalized_method_name)
+            when Option::Some(tn) then resolved_method = tn + "__" + normalized_method_name.clone()
+            when Option::None then ()
+            end
+          end
         end
-      else
-        # TypeId didn't resolve — fall back to impl_type_map
+      when Type::String then
+        if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
+          resolved_method = "clone"
+        else
+          resolved_method = "String__" + normalized_method_name.clone()
+        end
+      when Type::Slice(_) then resolved_method = "Vec__" + normalized_method_name.clone()
+      when Type::Array(_, _) then resolved_method = "Vec__" + normalized_method_name.clone()
+      when Type::Option(_) then
+        resolved_method = "Option__" + normalized_method_name.clone()
+      when Type::Result(_, _) then resolved_method = "Result__" + normalized_method_name.clone()
+      when Type::Map(_, _) then resolved_method = "Map__" + normalized_method_name.clone()
+      when Type::Set(_) then resolved_method = "Set__" + normalized_method_name.clone()
+      when _ then
         if normalized_method_name == "clone" then
-          "clone"
+          resolved_method = "clone"
         else
           match b.impl_type_map.get(normalized_method_name)
-          when Option::Some(tn) then tn + "__" + normalized_method_name.clone()
-          when Option::None then normalized_method_name.clone()
+          when Option::Some(type_name) then resolved_method = type_name + "__" + normalized_method_name.clone()
+          when Option::None then ()
           end
         end
       end
-    when Type::String then
-      if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
-        "clone"
-      else
-        "String__" + normalized_method_name.clone()
+
+      let callee_op = mir_fn_operand(b, resolved_method.clone())
+
+      # Lower arguments: receiver first, then explicit args
+      mut mir_args = Vec::new()
+      mir_args.push(recv_op)
+      for a in arg_exprs do
+        mir_args.push(lower_expr(b, &a, span))
       end
-    when Type::Slice(_) then "Vec__" + normalized_method_name.clone()
-    when Type::Array(_, _) then "Vec__" + normalized_method_name.clone()
-    when Type::Option(_) then "Option__" + normalized_method_name.clone()
-    when Type::Result(_, _) then "Result__" + normalized_method_name.clone()
-    when Type::Map(_, _) then "Map__" + normalized_method_name.clone()
-    when Type::Set(_) then "Set__" + normalized_method_name.clone()
-    when _ then
-      # Check impl_type_map for known method→type mappings.
-      # For `.clone()`, the impl_type_map cache is unreliable (last impl
-      # wins, which is typically WeakArc), so always emit bare "clone"
-      # and let codegen's intrinsic fallback handle it.
-      if normalized_method_name == "clone" then
-        "clone"
-      else
-        match b.impl_type_map.get(normalized_method_name)
-        when Option::Some(type_name) then type_name + "__" + normalized_method_name.clone()
-        when Option::None then normalized_method_name.clone()
+
+      if normalized_method_name == "push" && arg_exprs.len() > 0 then
+        let pushed_ty = mir_infer_expr_type(b, &arg_exprs[0])
+        refine_collection_local_type_from_push(b, &recv_place, &recv_place_type, &pushed_ty)
+      end
+      
+      let ret_type = mir_infer_method_result_type(b, recv_type.clone(), normalized_method_name, resolved_method.clone())
+      let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
+      let dest_place = place_local(ret_tmp)
+      
+      # Create success block
+      let success_blk = create_block(b)
+      
+      # Emit Call terminator
+      set_terminator(b, MirTerminatorKind::MirCall {
+        dest: dest_place,
+        func: callee_op,
+        args: mir_args,
+        success: success_blk,
+        unwind: Option::None
+      }, span)
+      
+      b.current_block = Option::Some(success_blk)
+      
+      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(ret_tmp))
+      }) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprFieldAccess" then
+    match expr.kind
+    when ExprKind::ExprFieldAccess(recv, field_name) then
+      let base_place = lower_place(b, &recv)
+      # If the base local has a reference type, auto-insert a ProjDeref
+      let base_ty = lookup_local_type(b, &base_place.local)
+      let needs_deref = match base_ty
+      when Type::Ref(_, _) then true
+      when Type::RefMut(_, _) then true
+      when _ then false
+      end
+      # Resolve field index — try typed resolution first, then built-in fallback
+      let field_idx = match resolve_field_index_for_place(b, &base_place, field_name)
+      when Option::Some(idx) then idx
+      when Option::None then 0
+      end
+      mut new_projections = base_place.projections.clone()
+      if needs_deref && base_place.projections.is_empty() then
+        new_projections.push(Projection::ProjDeref)
+      end
+      new_projections.push(Projection::ProjField(field_name, field_idx))
+      let projected = Place {
+        local: base_place.local,
+        projections: new_projections
+      }
+      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(projected)
+      }) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprIndex" then
+    match expr.kind
+    when ExprKind::ExprIndex(base_expr, index_expr) then
+      let base_place = lower_place(b, &base_expr)
+      let idx_op = lower_expr(b, &index_expr, span)
+      # Store index into a temp so we can reference it as a LocalId
+      let idx_tmp = add_temp(b, Type::Int, span)
+      push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
+        kind: MirRvalueKind::MirMove(idx_op)
+      }), span)
+      mut new_projections = base_place.projections.clone()
+      # Only add ProjDeref when the base local is a reference type and no
+      # projections have been applied yet (same logic as ExprFieldAccess).
+      # ProjIndex already handles heap-collection header derefs, so an
+      # unconditional ProjDeref here causes a double-dereference crash.
+      let base_idx_ty = lookup_local_type(b, &base_place.local)
+      let idx_needs_deref = match base_idx_ty
+      when Type::Ref(_, _) then true
+      when Type::RefMut(_, _) then true
+      when _ then false
+      end
+      if idx_needs_deref && base_place.projections.is_empty() then
+        new_projections.push(Projection::ProjDeref)
+      end
+      new_projections.push(Projection::ProjIndex(idx_tmp))
+      let projected = Place {
+        local: base_place.local,
+        projections: new_projections
+      }
+      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(projected)
+      }) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprClosure" then
+    match expr.kind
+    when ExprKind::ExprClosure(params, ret_ty, body) then
+      # Full closure lowering with capture analysis and environment generation.
+      #
+      # 1. Analyze the closure body to find all free variables (captures)
+      # 2. Create an environment struct holding captured values
+      # 3. Generate a separate function taking the env as first parameter
+      # 4. Return a closure aggregate (fn_ptr + env_ptr)
+      
+      let closure_name = "_closure" + b.temp_counter.to_string()
+      b.temp_counter = b.temp_counter + 1
+      
+      # Step 1: Capture analysis — find free variables in body
+      let captures = analyze_captures(&body, &params, &b.var_map)
+      
+      # Step 2: Build captured operands and resolve their types from the current scope
+      mut capture_ops = Vec::new()
+      mut capture_types = Vec::new()
+      for cap_name in captures do
+        match lookup_current_local_id_by_name(b, cap_name)
+        when Option::Some(local_id) then
+          let cap_ty = lookup_local_type(b, &local_id)
+          capture_types.push(cap_ty)
+          capture_ops.push(MirOperand {
+            kind: MirOperandKind::MirCopy(place_local(local_id))
+          })
+        when Option::None then
+          # Should not happen — analyze_captures filters by scope.
+          # Produce a copy of a synthetic local rather than silently using Unit.
+          capture_types.push(Type::Unit)
+          capture_ops.push(MirOperand {
+            kind: MirOperandKind::MirConstant(MirConstant {
+              kind: MirConstantKind::MirUnit,
+              ty: Type::Unit
+            })
+          })
         end
       end
-    end
-
-    let callee_op = mir_fn_operand(b, resolved_method.clone())
-
-    # Lower arguments: receiver first, then explicit args
-    mut mir_args = Vec::new()
-    mir_args.push(recv_op)
-    for a in arg_exprs do
-      mir_args.push(lower_expr(b, &a, span))
-    end
-
-    if normalized_method_name == "push" && arg_exprs.len() > 0 then
-      let pushed_ty = mir_infer_expr_type(b, &arg_exprs[0])
-      refine_collection_local_type_from_push(b, &recv_place, &recv_place_type, &pushed_ty)
-    end
-    
-    let ret_type = mir_infer_method_result_type(b, recv_type.clone(), normalized_method_name, resolved_method.clone())
-    let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
-    let dest_place = place_local(ret_tmp)
-    
-    # Create success block
-    let success_blk = create_block(b)
-    
-    # Emit Call terminator
-    set_terminator(b, MirTerminatorKind::MirCall {
-      dest: dest_place,
-      func: callee_op,
-      args: mir_args,
-      success: success_blk,
-      unwind: Option::None
-    }, span)
-    
-    b.current_block = Option::Some(success_blk)
-    
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(ret_tmp))
-    }) }
-
-  when ExprKind::ExprFieldAccess(recv, field_name) then
-    let base_place = lower_place(b, &recv)
-    # If the base local has a reference type, auto-insert a ProjDeref
-    let base_ty = lookup_local_type(b, &base_place.local)
-    let needs_deref = match base_ty
-    when Type::Ref(_, _) then true
-    when Type::RefMut(_, _) then true
-    when _ then false
-    end
-    # Resolve field index — try typed resolution first, then built-in fallback
-    let field_idx = match resolve_field_index_for_place(b, &base_place, field_name)
-    when Option::Some(idx) then idx
-    when Option::None then 0
-    end
-    mut new_projections = base_place.projections.clone()
-    if needs_deref && base_place.projections.is_empty() then
-      new_projections.push(Projection::ProjDeref)
-    end
-    new_projections.push(Projection::ProjField(field_name, field_idx))
-    let projected = Place {
-      local: base_place.local,
-      projections: new_projections
-    }
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(projected)
-    }) }
-
-  when ExprKind::ExprIndex(base_expr, index_expr) then
-    let base_place = lower_place(b, &base_expr)
-    let idx_op = lower_expr(b, &index_expr, span)
-    # Store index into a temp so we can reference it as a LocalId
-    let idx_tmp = add_temp(b, Type::Int, span)
-    push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
-      kind: MirRvalueKind::MirMove(idx_op)
-    }), span)
-    mut new_projections = base_place.projections.clone()
-    # Only add ProjDeref when the base local is a reference type and no
-    # projections have been applied yet (same logic as ExprFieldAccess).
-    # ProjIndex already handles heap-collection header derefs, so an
-    # unconditional ProjDeref here causes a double-dereference crash.
-    let base_idx_ty = lookup_local_type(b, &base_place.local)
-    let idx_needs_deref = match base_idx_ty
-    when Type::Ref(_, _) then true
-    when Type::RefMut(_, _) then true
-    when _ then false
-    end
-    if idx_needs_deref && base_place.projections.is_empty() then
-      new_projections.push(Projection::ProjDeref)
-    end
-    new_projections.push(Projection::ProjIndex(idx_tmp))
-    let projected = Place {
-      local: base_place.local,
-      projections: new_projections
-    }
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(projected)
-    }) }
-
-  when ExprKind::ExprClosure(params, ret_ty, body) then
-    # Full closure lowering with capture analysis and environment generation.
-    # 
-    # 1. Analyze the closure body to find all free variables (captures)
-    # 2. Create an environment struct holding captured values
-    # 3. Generate a separate function taking the env as first parameter
-    # 4. Return a closure aggregate (fn_ptr + env_ptr)
-    
-    let closure_name = "_closure" + b.temp_counter.to_string()
-    b.temp_counter = b.temp_counter + 1
-    
-    # Step 1: Capture analysis — find free variables in body
-    let captures = analyze_captures(&body, &params, &b.var_map)
-    
-    # Step 2: Build captured operands and resolve their types from the current scope
-    mut capture_ops = Vec::new()
-    mut capture_types = Vec::new()
-    for cap_name in captures do
-      match lookup_current_local_id_by_name(b, cap_name)
-      when Option::Some(local_id) then
-        let cap_ty = lookup_local_type(b, &local_id)
-        capture_types.push(cap_ty)
-        capture_ops.push(MirOperand {
-          kind: MirOperandKind::MirCopy(place_local(local_id))
+      
+      # Step 3: Build the closure function's parameter types
+      mut param_types = Vec::new()
+      for p in params do
+        match p.ty
+        when Option::Some(ty) then param_types.push(resolve_lowering_type(&ty))
+        when Option::None then param_types.push(Type::Unit)
+        end
+      end
+      
+      let ret_type = match ret_ty
+      when Option::Some(ty) then resolve_lowering_type(&ty)
+      when Option::None then Type::Unit
+      end
+      
+      # Step 4: Record the closure body to be lowered as a separate MirFunction
+      # (This would be processed after the containing function)
+      b.pending_closures.push(PendingClosure {
+        name: closure_name.clone(),
+        params: params.clone(),
+        captures: captures.clone(),
+        capture_types: capture_types.clone(),
+        body: body.clone(),
+        ret_type: ret_type.clone()
+      })
+      
+      # Step 5: Create the closure aggregate — (fn_ptr, env)
+      let fn_op = MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirFnItem(closure_name.clone()),
+          ty: Type::Function(param_types.clone(), Box::new(ret_type.clone()))
         })
-      when Option::None then
-        # Should not happen — analyze_captures filters by scope.
-        # Produce a copy of a synthetic local rather than silently using Unit.
-        capture_types.push(Type::Unit)
-        capture_ops.push(MirOperand {
+      }
+      
+      mut agg_ops = Vec::new()
+      agg_ops.push(fn_op)
+      for cap_op in capture_ops do
+        agg_ops.push(cap_op)
+      end
+      
+      let closure_type_id = TypeId { id: b.temp_counter }
+      b.temp_counter = b.temp_counter + 1
+      
+      return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Closure(closure_type_id), agg_ops) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprIf" then
+    match expr.kind
+    when ExprKind::ExprIf(if_expr) then return lower_if_rvalue(b, &if_expr, span)
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprBlock" then
+    match expr.kind
+    when ExprKind::ExprBlock(block) then
+      if block.stmts.is_empty() then
+        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirUnit,
             ty: Type::Unit
           })
-        })
+        }) }
       end
-    end
-    
-    # Step 3: Build the closure function's parameter types
-    mut param_types = Vec::new()
-    for p in params do
-      match p.ty
-      when Option::Some(ty) then param_types.push(resolve_lowering_type(&ty))
-      when Option::None then param_types.push(Type::Unit)
-      end
-    end
-    
-    let ret_type = match ret_ty
-    when Option::Some(ty) then resolve_lowering_type(&ty)
-    when Option::None then Type::Unit
-    end
-    
-    # Step 4: Record the closure body to be lowered as a separate MirFunction
-    # (This would be processed after the containing function)
-    b.pending_closures.push(PendingClosure {
-      name: closure_name.clone(),
-      params: params.clone(),
-      captures: captures.clone(),
-      capture_types: capture_types.clone(),
-      body: body.clone(),
-      ret_type: ret_type.clone()
-    })
-    
-    # Step 5: Create the closure aggregate — (fn_ptr, env)
-    let fn_op = MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem(closure_name.clone()),
-        ty: Type::Function(param_types.clone(), Box::new(ret_type.clone()))
-      })
-    }
-    
-    mut agg_ops = Vec::new()
-    agg_ops.push(fn_op)
-    for cap_op in capture_ops do
-      agg_ops.push(cap_op)
-    end
-    
-    let closure_type_id = TypeId { id: b.temp_counter }
-    b.temp_counter = b.temp_counter + 1
-    
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Closure(closure_type_id), agg_ops) }
-
-  when ExprKind::ExprIf(if_expr) then
-    lower_if_rvalue(b, &if_expr, span)
-
-  when ExprKind::ExprBlock(block) then
-    if block.stmts.is_empty() then
-      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirUnit,
-          ty: Type::Unit
-        })
-      }) }
-    else
       let last_idx = block.stmts.len() - 1
       mut i = 0
       while i < last_idx do
@@ -3249,210 +3658,239 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       let last_stmt = block.stmts[last_idx]
       match last_stmt.kind
       when StmtKind::StmtExpr(last_expr) then
-        lower_expr_to_rvalue(b, &last_expr, last_stmt.span)
+        return lower_expr_to_rvalue(b, &last_expr, last_stmt.span)
       when _ then
         lower_stmt(b, &last_stmt)
-        MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirUnit,
             ty: Type::Unit
           })
         }) }
       end
+    when _ then ()
     end
 
-  when ExprKind::ExprStructLit(path, fields) then
-    # Lower struct literal as Aggregate
-    mut ops = Vec::new()
-    mut field_names = Vec::new()
-    for (field_name, field_value) in fields do
-      field_names.push(field_name.clone())
-      ops.push(lower_expr(b, &field_value, span))
-    end
-    # Resolve the struct's TypeId from the path
-    let struct_name = path_to_string(&path)
-    let struct_tid = match b.type_name_to_id.get(struct_name)
-    when Option::Some(tid) then TypeId { id: tid }
-    when Option::None then TypeId { id: 0 }
-    end
-    MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(struct_tid, field_names), ops) }
-
-  when ExprKind::ExprEnumVariant(path, args) then
-    # Distinguish enum variant construction from static method calls.
-    # Any non-enum path with arguments is a call target here: constructors like
-    # Vec::new(), built-ins like String::from_bytes(), and module-qualified
-    # functions like fs::read_to_vec(). Only actual enum types stay in the
-    # variant-construction path below.
-    let maybe_type = if path.segments.len() >= 2 then
-      path.segments[path.segments.len() - 2].clone()
-    else
-      ""
-    end
-    let maybe_method = if path.segments.len() >= 2 then
-      path.segments[path.segments.len() - 1].clone()
-    else
-      ""
-    end
-    let is_enum = match b.enum_variants.get(maybe_type)
-    when Option::Some(_) then true
-    when Option::None then false
-    end
-
-    if !is_enum then
-      if is_vec_like_from_path(&path) && args.len() == 1 then
-        match args[0].kind
-        when ExprKind::ExprArrayLit(elems) then
-          return lower_vec_like_from_array_call(b, &path, &elems, span)
-        when _ then ()
-        end
-      end
-
-      let fn_name = resolve_static_path_callee_name(b, &path)
-      let callee_op = MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirFnItem(fn_name.clone()),
-          ty: Type::Function(Vec::new(), Box::new(Type::Unit))
-        })
-      }
-      mut mir_args = Vec::new()
-      for a in args do
-        mir_args.push(lower_expr(b, &a, span))
-      end
-      let ret_type = infer_static_path_result_type(b, &path)
-      let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
-      let dest_place = place_local(ret_tmp)
-      let success_blk = create_block(b)
-      set_terminator(b, MirTerminatorKind::MirCall {
-        dest: dest_place,
-        func: callee_op,
-        args: mir_args,
-        success: success_blk,
-        unwind: Option::None
-      }, span)
-      b.current_block = Option::Some(success_blk)
-      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-        kind: MirOperandKind::MirCopy(place_local(ret_tmp))
-      }) }
-    else
-      # Enum variant construction (e.g., Result::Ok(x), Option::Some(x))
+  elsif kind_name == "ExprStructLit" then
+    match expr.kind
+    when ExprKind::ExprStructLit(path, fields) then
       mut ops = Vec::new()
       mut field_names = Vec::new()
-      let enum_name = if path.segments.len() >= 2 then
-        path.segments[path.segments.len() - 2].clone()
-      else
-        path_to_string(&path)
+      for (field_name, field_value) in fields do
+        field_names.push(field_name.clone())
+        ops.push(lower_expr(b, &field_value, span))
       end
-      let disc = match resolve_enum_variant_discriminant(b, &path)
-      when Option::Some(found) then found
-      when Option::None then 0
-      end
-      # Prepend discriminant tag as first operand
-      field_names.push("_tag")
-      ops.push(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirInt(disc),
-          ty: Type::Int
-        })
-      })
-      for i in 0..args.len() do
-        field_names.push(i.to_string())
-      end
-      for a in args do
-        ops.push(lower_expr(b, &a, span))
-      end
-      let enum_tid = match b.type_name_to_id.get(enum_name)
+      # Resolve the struct's TypeId from the path
+      let struct_name = path_to_string(&path)
+      let struct_tid = match b.type_name_to_id.get(struct_name)
       when Option::Some(tid) then TypeId { id: tid }
       when Option::None then TypeId { id: 0 }
       end
-      MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) }
+      return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(struct_tid, field_names), ops) }
+    when _ then ()
     end
 
-  when ExprKind::ExprCast(inner, target_ty) then
-    let inner_op = lower_expr(b, &inner, span)
-    let target = resolve_lowering_type(&target_ty)
-    # Use Transmute as the generic cast kind - specific casts would require type inference
-    MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) }
+  elsif kind_name == "ExprEnumVariant" then
+    match expr.kind
+    when ExprKind::ExprEnumVariant(path, args) then
+      if path.segments.len() >= 2 then
+      end
+      # Distinguish enum variant construction from static method calls.
+      # Any non-enum path with arguments is a call target here: constructors like
+      # Vec::new(), built-ins like String::from_bytes(), and module-qualified
+      # functions like fs::read_to_vec(). Only actual enum types stay in the
+      # variant-construction path below.
+      let maybe_type = if path.segments.len() >= 2 then
+        path.segments[path.segments.len() - 2].clone()
+      else
+        ""
+      end
+      let maybe_method = if path.segments.len() >= 2 then
+        path.segments[path.segments.len() - 1].clone()
+      else
+        ""
+      end
+      let is_enum = match b.enum_variants.get(maybe_type)
+      when Option::Some(_) then true
+      when Option::None then false
+      end
 
-  when ExprKind::ExprPath(path) then
-    # Resolve enum variant paths like Operator::None to their discriminant
-    if path.segments.len() >= 2 then
-      let enum_name = path.segments[path.segments.len() - 2]
-      match resolve_enum_variant_discriminant(b, &path)
-      when Option::Some(disc) then
-        # Check if this enum has any payload variants
-        # Default to true for unknown enums (e.g. Option, Result from std)
-        let has_payload = match b.enum_has_payload.get(enum_name)
-        when Option::Some(hp) then hp
-        when Option::None then true
-        end
-        if has_payload then
-          # Mixed enum: heap-allocate with just the tag so representation is consistent
-          let enum_tid = match b.type_name_to_id.get(enum_name)
-          when Option::Some(tid) then TypeId { id: tid }
-          when Option::None then TypeId { id: 0 }
+      if !is_enum then
+        if is_vec_like_from_path(&path) && args.len() == 1 then
+          let args0_kind = expr_kind_name(&args[0].kind)
+          if args0_kind == "ExprArrayLit" then
+            match args[0].kind
+            when ExprKind::ExprArrayLit(elems) then
+              return lower_vec_like_from_array_call(b, &path, &elems, span)
+            when _ then ()
+            end
           end
-          mut ops = Vec::new()
-          mut fnames = Vec::new()
-          fnames.push("_tag")
-          ops.push(MirOperand {
-            kind: MirOperandKind::MirConstant(MirConstant {
-              kind: MirConstantKind::MirInt(disc),
-              ty: Type::Int
-            })
+        end
+
+        let fn_name = resolve_static_path_callee_name(b, &path)
+        let callee_op = MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirFnItem(fn_name.clone()),
+            ty: Type::Function(Vec::new(), Box::new(Type::Unit))
           })
-          MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) }
+        }
+        mut mir_args = Vec::new()
+        for a in args do
+          mir_args.push(lower_expr(b, &a, span))
+        end
+        let ret_type = infer_static_path_result_type(b, &path)
+        let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
+        let dest_place = place_local(ret_tmp)
+        let success_blk = create_block(b)
+        set_terminator(b, MirTerminatorKind::MirCall {
+          dest: dest_place,
+          func: callee_op,
+          args: mir_args,
+          success: success_blk,
+          unwind: Option::None
+        }, span)
+        b.current_block = Option::Some(success_blk)
+        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+          kind: MirOperandKind::MirCopy(place_local(ret_tmp))
+        }) }
+      else
+        # Enum variant construction (e.g., Result::Ok(x), Option::Some(x))
+        mut ops = Vec::new()
+        mut field_names = Vec::new()
+        let enum_name = if path.segments.len() >= 2 then
+          path.segments[path.segments.len() - 2].clone()
         else
-          # Simple enum (all no-payload): just the integer discriminant
-          MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+          path_to_string(&path)
+        end
+        let disc = match resolve_enum_variant_discriminant(b, &path)
+        when Option::Some(found) then found
+        when Option::None then 0
+        end
+        # Prepend discriminant tag as first operand
+        field_names.push("_tag")
+        ops.push(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(disc),
+            ty: Type::Int
+          })
+        })
+        for i in 0..args.len() do
+          field_names.push(i.to_string())
+        end
+        for a in args do
+          ops.push(lower_expr(b, &a, span))
+        end
+        let enum_tid = match b.type_name_to_id.get(enum_name)
+        when Option::Some(tid) then TypeId { id: tid }
+        when Option::None then TypeId { id: 0 }
+        end
+        return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) }
+      end
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprCast" then
+    match expr.kind
+    when ExprKind::ExprCast(inner, target_ty) then
+      let inner_op = lower_expr(b, &inner, span)
+      let target = resolve_lowering_type(&target_ty)
+      # Use Transmute as the generic cast kind - specific casts would require type inference
+      return MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) }
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprPath" then
+    match expr.kind
+    when ExprKind::ExprPath(path) then
+      # Resolve enum variant paths like Operator::None to their discriminant
+      if path.segments.len() >= 2 then
+        let enum_name = path.segments[path.segments.len() - 2]
+        match resolve_enum_variant_discriminant(b, &path)
+        when Option::Some(disc) then
+          # Check if this enum has any payload variants
+          # Default to true for unknown enums (e.g. Option, Result from std)
+          let has_payload = match b.enum_has_payload.get(enum_name)
+          when Option::Some(hp) then hp
+          when Option::None then true
+          end
+          if has_payload then
+            # Mixed enum: heap-allocate with just the tag so representation is consistent
+            let enum_tid = match b.type_name_to_id.get(enum_name)
+            when Option::Some(tid) then TypeId { id: tid }
+            when Option::None then TypeId { id: 0 }
+            end
+            mut ops = Vec::new()
+            mut fnames = Vec::new()
+            fnames.push("_tag")
+            ops.push(MirOperand {
+              kind: MirOperandKind::MirConstant(MirConstant {
+                kind: MirConstantKind::MirInt(disc),
+                ty: Type::Int
+              })
+            })
+            return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) }
+          else
+            # Simple enum (all no-payload): just the integer discriminant
+            return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+              kind: MirOperandKind::MirConstant(MirConstant {
+                kind: MirConstantKind::MirInt(disc),
+                ty: Type::Int
+              })
+            }) }
+          end
+        when Option::None then
+          return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
-              kind: MirConstantKind::MirInt(disc),
-              ty: Type::Int
+              kind: MirConstantKind::MirString(path_to_string(&path)),
+              ty: Type::String
             })
           }) }
         end
-      when Option::None then
-        MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      else
+        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirString(path_to_string(&path)),
             ty: Type::String
           })
         }) }
       end
-    else
-      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirString(path_to_string(&path)),
-          ty: Type::String
-        })
-      }) }
+    when _ then ()
     end
 
-  when ExprKind::ExprMatch(m) then
-    # Lower match as expression: assign each arm result to a temp
-    let result_tmp = add_temp(b, Type::Int, span)
-    lower_match_to_place(b, &m, place_local(result_tmp), span)
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(result_tmp))
-    }) }
-
-  when ExprKind::ExprMacroCall(name, args) then
-    if name == "vec" then
-      let vec_path = AstPath {
-        segments: Vec::from(["Vec".to_string(), "from".to_string()]),
-        span: span.clone()
-      }
-      lower_vec_like_from_array_call(b, &vec_path, &args, span)
-    else
-      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirUnit,
-          ty: Type::Unit
-        })
+  elsif kind_name == "ExprMatch" then
+    match expr.kind
+    when ExprKind::ExprMatch(m) then
+      let result_tmp = add_temp(b, Type::Int, span)
+      lower_match_to_place(b, &m, place_local(result_tmp), span)
+      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(result_tmp))
       }) }
+    when _ then ()
     end
 
-  when _ then
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+  elsif kind_name == "ExprMacroCall" then
+    match expr.kind
+    when ExprKind::ExprMacroCall(name, args) then
+      if name == "vec" then
+        let vec_path = AstPath {
+          segments: Vec::from(["Vec".to_string(), "from".to_string()]),
+          span: span.clone()
+        }
+        return lower_vec_like_from_array_call(b, &vec_path, &args, span)
+      else
+        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirUnit,
+            ty: Type::Unit
+          })
+        }) }
+      end
+    when _ then ()
+    end
+
+  else
+    # Default fallback for unhandled variants
+    return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirUnit,
         ty: Type::Unit
