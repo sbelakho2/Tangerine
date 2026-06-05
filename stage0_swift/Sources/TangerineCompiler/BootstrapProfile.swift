@@ -26,12 +26,12 @@ public struct BootstrapProfile {
     /// The minimal set of stdlib files required for the compiler kernel.
     /// Each entry documents why it is included.
     public static let profileEntries: [ProfileEntry] = [
-        ProfileEntry(file: "core.tg",
-            reason: "Foundational types: Option, Result, Bool, Int, String, fundamental traits"),
         ProfileEntry(file: "alloc.tg",
             reason: "Memory allocation primitives needed by collections and compiler runtime"),
         ProfileEntry(file: "collections.tg",
             reason: "Vec, Map, Set — compiler data structures for AST, symbol tables, IR"),
+        ProfileEntry(file: "core.tg",
+            reason: "Foundational types: Option, Result, Bool, Int, String, fundamental traits"),
         ProfileEntry(file: "ffi.tg",
             reason: "C string and pointer interop needed by filesystem access during bootstrap"),
         ProfileEntry(file: "fmt.tg",
@@ -40,6 +40,8 @@ public struct BootstrapProfile {
             reason: "Source loading and file output used by compiler commands and tooling modules"),
         ProfileEntry(file: "io.tg",
             reason: "File reading, stdout/stderr — compiler I/O for source loading and output"),
+        ProfileEntry(file: "taint.tg",
+            reason: "Taint tracking types (Tainted, TaintLabel) used by ffi.tg for safe FFI interop"),
     ]
 
     /// File names in the minimal bootstrap profile.

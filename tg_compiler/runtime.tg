@@ -22,7 +22,7 @@ use tg_compiler::asm::{
   x64_and_rr, x64_or_rr, x64_xor_rr,
   x64_cmp_rr, x64_cmp_ri, x64_test_rr,
   x64_jmp, x64_jcc, x64_call_label, x64_call_r, x64_call_extern,
-  x64_ret, x64_push, x64_pop, x64_sub_ri, x64_shl_ri, x64_cmova_rr,
+  x64_ret, x64_push, x64_pop, x64_sub_ri, x64_shl_ri, x64_shr_ri, x64_cmova_rr,
   x64_lea_mem, x64_syscall, x64_ud2, x64_neg_r,
   a64_mov_ri, a64_mov_rr, a64_add_rrr, a64_add_rri,
   a64_sub_rrr, a64_sub_rri, a64_mul_rrr,
@@ -32,7 +32,7 @@ use tg_compiler::asm::{
   a64_ldrb, a64_strb, a64_ldr_post, a64_stp_pre, a64_ldp_post,
   a64_bl, a64_blr, a64_ret, a64_b, a64_bcond, a64_brk,
   a64_svc, a64_udf, a64_nop, a64_lsl, a64_lsl_rrr,
-  a64_sdiv_rrr, a64_udiv, a64_msub, a64_csel, a64_add_rrr_lsl,
+  a64_sdiv_rrr, a64_udiv, a64_msub, a64_csel, a64_add_rrr_lsl, a64_lsr,
   a64_cc_eq, a64_cc_ne, a64_cc_lt, a64_cc_le, a64_cc_gt, a64_cc_ge, a64_cc_cs, a64_cc_cc,
   a64_neg, CC
 }
@@ -1044,12 +1044,12 @@ def emit_tg_array_push(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # vec ptr
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # element
     
-    # Sanity check: if vec ptr is 0 or len > 10M, trap immediately
+    # Sanity check: if vec ptr is 0 or len > 1B, trap immediately
     let sanity_ok = fresh_label(ctx, ".Larr_push_sanity_ok")
     a64_cmp_ri(&mut ctx.text, A64::X19, 0)
     a64_bcond(&mut ctx.text, a64_cc_eq(), sanity_ok.clone())  # skip check if null (trap later)
     a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8)   # len
-    a64_mov_ri(&mut ctx.text, A64::X0, 10000000)
+    a64_mov_ri(&mut ctx.text, A64::X0, 1000000000)
     a64_cmp_rr(&mut ctx.text, A64::X21, A64::X0)
     a64_bcond(&mut ctx.text, a64_cc_lt(), sanity_ok.clone())
     a64_brk(&mut ctx.text, 0xBEEF)  # trap with identifiable code
@@ -1994,6 +1994,13 @@ def emit_tg_array_extend(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
 
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # x19 = dest vec ptr
+    # x1 already holds the src Vec handle: codegen's array_extend arm calls
+    # deref_arg_once_if_ref_like(args, 1) so the `&other` arg is deref'd at the
+    # call site (same as map_get/array_contains). Do NOT deref again here.
+    # Guard against a null/empty src handle (an empty Vec is a null handle);
+    # extending by an empty src is a no-op, so skip to done to avoid a null deref.
+    a64_cmp_ri(&mut ctx.text, A64::X1, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblDone.clone())
     a64_ldur(&mut ctx.text, A64::X20, A64::X1, 0)  # x20 = src data ptr
     a64_ldur(&mut ctx.text, A64::X21, A64::X1, 8)  # x21 = src length
     a64_mov_ri(&mut ctx.text, A64::X22, 0)          # x22 = index i
@@ -2029,6 +2036,10 @@ def emit_tg_array_extend(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_push(&mut ctx.text, X64::R14)
 
     x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)    # rbx = dest
+    # rsi already holds the src Vec handle (deref'd at call site by codegen).
+    # Guard against a null/empty src handle: extending by an empty src is a no-op.
+    x64_cmp_ri(&mut ctx.text, X64::RSI, 0)
+    x64_jcc(&mut ctx.text, CC::E, lblDone.clone())
     x64_mov_rm(&mut ctx.text, X64::R12, X64::RSI, 0)  # r12 = src data
     x64_mov_rm(&mut ctx.text, X64::R13, X64::RSI, 8)  # r13 = src len
     x64_mov_ri(&mut ctx.text, X64::R14, 0)            # r14 = i
@@ -2192,6 +2203,7 @@ end
 
 def emit_map_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_map_new(ctx)
+  emit_tg_map_clone(ctx)
   emit_tg_map_get(ctx)
   emit_tg_map_insert(ctx)
   emit_tg_map_insert_full(ctx)
@@ -2203,9 +2215,85 @@ def emit_map_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_map_keys(ctx)
 end
 
+# _tg_map_clone: Create a shallow clone of a map by re-inserting all entries.
+# Args: x0/rdi = source map ptr
+# Returns: x0/rax = cloned map ptr
+def emit_tg_map_clone(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_map_clone")
+
+  let lblBuckLoop = fresh_label(ctx, ".Lmap_clone_bloop")
+  let lblChainLoop = fresh_label(ctx, ".Lmap_clone_chain")
+  let lblNextBuck = fresh_label(ctx, ".Lmap_clone_next")
+  let lblDone = fresh_label(ctx, ".Lmap_clone_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # source map
+    a64_bl(&mut ctx.text, "_tg_map_new")
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X0)   # destination map
+
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 0)   # buckets
+    a64_ldur(&mut ctx.text, A64::X22, A64::X19, 16)  # capacity
+    a64_mov_ri(&mut ctx.text, A64::X23, 0)           # index
+
+    def_label(&mut ctx.text, lblBuckLoop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X23, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblDone.clone())
+
+    # bucket = buckets + index * 32
+    a64_lsl(&mut ctx.text, A64::X0, A64::X23, 5)
+    a64_add_rrr(&mut ctx.text, A64::X24, A64::X21, A64::X0)
+
+    def_label(&mut ctx.text, lblChainLoop.clone())
+    # if hash == 0, move to next bucket
+    a64_ldur(&mut ctx.text, A64::X0, A64::X24, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNextBuck.clone())
+
+    # dst.insert(bucket.key, bucket.value)
+    a64_ldur(&mut ctx.text, A64::X1, A64::X24, 8)
+    a64_ldur(&mut ctx.text, A64::X2, A64::X24, 16)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+    a64_bl(&mut ctx.text, "_tg_map_insert")
+
+    # follow overflow chain
+    a64_ldur(&mut ctx.text, A64::X24, A64::X24, 24)
+    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblChainLoop.clone())
+
+    def_label(&mut ctx.text, lblNextBuck.clone())
+    a64_add_rri(&mut ctx.text, A64::X23, A64::X23, 1)
+    a64_b(&mut ctx.text, lblBuckLoop)
+
+    def_label(&mut ctx.text, lblDone.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    # Minimal x86_64 fallback
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_call_label(&mut ctx.text, "_tg_map_new")
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
 # _tg_map_new: Create empty map
 def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_new")
+  let lblClearBuckets = fresh_label(ctx, ".Lmap_new_clear_buckets")
   
   match ctx.target.arch
   when Arch::AArch64 then
@@ -2221,6 +2309,14 @@ def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
     # Allocate initial buckets (16 buckets * 32 bytes = 512 bytes)
     a64_mov_ri(&mut ctx.text, A64::X0, 512)
     a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X0)
+    a64_mov_ri(&mut ctx.text, A64::X2, 64)
+    def_label(&mut ctx.text, lblClearBuckets.clone())
+    a64_str(&mut ctx.text, A64::XZR, A64::X1, 0)
+    a64_add_rri(&mut ctx.text, A64::X1, A64::X1, 8)
+    a64_sub_rri(&mut ctx.text, A64::X2, A64::X2, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblClearBuckets.clone())
     
     # Initialize map struct
     a64_stur(&mut ctx.text, A64::X0, A64::X19, 0)    # buckets
@@ -3052,9 +3148,11 @@ end
 
 def emit_set_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_set_new(ctx)
+  emit_tg_set_clone(ctx)
   emit_tg_set_insert(ctx)
   emit_tg_set_contains(ctx)
   emit_tg_set_remove(ctx)
+  emit_tg_set_entries(ctx)
   emit_tg_set_clear(ctx)
 end
 
@@ -3068,15 +3166,25 @@ def emit_tg_set_new(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
+def emit_tg_set_clone(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_set_clone")
+  # Set is map-backed; clone through map clone helper.
+  match ctx.target.arch
+  when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_map_clone")
+  when Arch::X86_64  then x64_jmp(&mut ctx.text, "_tg_map_clone")
+  end
+end
+
 def emit_tg_set_insert(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_set_insert")
-  # Call map_insert with value = key (as marker), then tail-call
+  # Call map_insert with a non-null marker value.  A set item can be 0, and
+  # map_contains is implemented as map_get(key) != null.
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_mov_rr(&mut ctx.text, A64::X2, A64::X1)  # value = key (as marker)
+    a64_mov_ri(&mut ctx.text, A64::X2, 1)
     a64_b(&mut ctx.text, "_tg_map_insert")
   when Arch::X86_64 then
-    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RSI)  # value = key
+    x64_mov_ri(&mut ctx.text, X64::RDX, 1)
     x64_jmp(&mut ctx.text, "_tg_map_insert")
   end
 end
@@ -3094,6 +3202,15 @@ def emit_tg_set_remove(ctx: &mut RuntimeEmitCtx) -> Unit
   match ctx.target.arch
   when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_map_remove")
   when Arch::X86_64  then x64_jmp(&mut ctx.text, "_tg_map_remove")
+  end
+end
+
+def emit_tg_set_entries(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_set_entries")
+  # A Set is backed by a map; set entries are map keys.
+  match ctx.target.arch
+  when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_map_keys")
+  when Arch::X86_64  then x64_jmp(&mut ctx.text, "_tg_map_keys")
   end
 end
 
@@ -3492,35 +3609,86 @@ def emit_tg_mem_free(ctx: &mut RuntimeEmitCtx) -> Unit
 end
 
 # _tg_runtime_hash_ptr: Content-aware hash
-# Args: x0/rdi = key value (string pointer or integer)
+# Args: x0/rdi = key value (string pointer, packed inline string, or integer)
 # Returns: hash
-# For values >= 0x100000 (likely string pointers): FNV-1a hash of string bytes
-# For smaller values (likely integers): FNV-1a hash of integer value
+# Some bootstrap strings arrive as packed little-endian ASCII bytes in the value
+# word. Detect that representation before pointer hashing so values like
+# "Int__fmt" are not dereferenced as addresses.
 def emit_tg_runtime_hash_ptr(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_runtime_hash_ptr")
   
+  let lblInlineScan = fresh_label(ctx, ".Lhash_inline_scan")
+  let lblInlineMaybeDone = fresh_label(ctx, ".Lhash_inline_maybe_done")
+  let lblInlineHash = fresh_label(ctx, ".Lhash_inline")
+  let lblInlineLoop = fresh_label(ctx, ".Lhash_inline_loop")
+  let lblNotInline = fresh_label(ctx, ".Lhash_not_inline")
+  let lblIntHash = fresh_label(ctx, ".Lhash_int")
   let lblStrHash = fresh_label(ctx, ".Lhash_str")
   let lblStrLoop = fresh_label(ctx, ".Lhash_str_loop")
   let lblDone = fresh_label(ctx, ".Lhash_done")
   
   match ctx.target.arch
   when Arch::AArch64 then
-    # Check if value looks like a pointer (>= 0x100000)
-    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000)
+    # Inline packed ASCII string check. Bytes must be printable ASCII up to a
+    # zero byte, or all eight bytes may be printable for an 8-byte short string.
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X0)
+    a64_mov_ri(&mut ctx.text, A64::X4, 0)
+    a64_mov_ri(&mut ctx.text, A64::X10, 255)
+    def_label(&mut ctx.text, lblInlineScan.clone())
+    a64_and_rrr(&mut ctx.text, A64::X2, A64::X3, A64::X10)
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 32)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lblNotInline.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 127)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblNotInline.clone())
+    a64_add_rri(&mut ctx.text, A64::X4, A64::X4, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X4, 8)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblInlineHash.clone())
+    a64_lsr(&mut ctx.text, A64::X3, A64::X3, 8)
+    a64_b(&mut ctx.text, lblInlineScan.clone())
+    def_label(&mut ctx.text, lblInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblInlineHash.clone())
+
+    def_label(&mut ctx.text, lblNotInline.clone())
+    # Pointers in native stage1 are high VM addresses. Smaller values are ints.
+    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000000)
     a64_cmp_rr(&mut ctx.text, A64::X0, A64::X9)
     a64_bcond(&mut ctx.text, a64_cc_cs(), lblStrHash.clone())
     
-    # Integer hash: FNV-1a on raw value
-    a64_mov_ri(&mut ctx.text, A64::X9, 0xcbf29ce484222325 as i64)
+    # Integer hash: seeded raw value hash
+    def_label(&mut ctx.text, lblIntHash.clone())
+    a64_mov_ri(&mut ctx.text, A64::X9, 5381)
     a64_eor_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X0)
-    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000001b3 as i64)
+    a64_mov_ri(&mut ctx.text, A64::X9, 33)
     a64_mul_rrr(&mut ctx.text, A64::X0, A64::X0, A64::X9)
     a64_ret(&mut ctx.text)
+
+    # Inline string hash: hash bytes from the value word.
+    def_label(&mut ctx.text, lblInlineHash.clone())
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X0)
+    a64_mov_ri(&mut ctx.text, A64::X4, 0)
+    a64_mov_ri(&mut ctx.text, A64::X1, 5381)
+    a64_mov_ri(&mut ctx.text, A64::X9, 33)
+    a64_mov_ri(&mut ctx.text, A64::X10, 255)
+
+    def_label(&mut ctx.text, lblInlineLoop.clone())
+    a64_and_rrr(&mut ctx.text, A64::X2, A64::X3, A64::X10)
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblDone.clone())
+    a64_eor_rrr(&mut ctx.text, A64::X1, A64::X1, A64::X2)
+    a64_mul_rrr(&mut ctx.text, A64::X1, A64::X1, A64::X9)
+    a64_add_rri(&mut ctx.text, A64::X4, A64::X4, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X4, 8)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblDone.clone())
+    a64_lsr(&mut ctx.text, A64::X3, A64::X3, 8)
+    a64_b(&mut ctx.text, lblInlineLoop.clone())
     
-    # String hash: FNV-1a on each byte
+    # String hash: seeded byte hash
     def_label(&mut ctx.text, lblStrHash)
-    a64_mov_ri(&mut ctx.text, A64::X1, 0xcbf29ce484222325 as i64)  # hash = offset basis
-    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000001b3 as i64)       # prime
+    a64_mov_ri(&mut ctx.text, A64::X1, 5381)
+    a64_mov_ri(&mut ctx.text, A64::X9, 33)
     
     def_label(&mut ctx.text, lblStrLoop)
     a64_ldrb(&mut ctx.text, A64::X2, A64::X0, 0)    # load byte
@@ -3536,22 +3704,67 @@ def emit_tg_runtime_hash_ptr(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ret(&mut ctx.text)
     
   when Arch::X86_64 then
-    # Check if value looks like a pointer (>= 0x100000)
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0x100000)
+    # Inline packed ASCII string check.
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RDI)
+    x64_mov_ri(&mut ctx.text, X64::R8, 0)
+    x64_mov_ri(&mut ctx.text, X64::R9, 255)
+    def_label(&mut ctx.text, lblInlineScan.clone())
+    x64_mov_rr(&mut ctx.text, X64::R10, X64::RDX)
+    x64_and_rr(&mut ctx.text, X64::R10, X64::R9)
+    x64_test_rr(&mut ctx.text, X64::R10, X64::R10)
+    x64_jcc(&mut ctx.text, CC::E, lblInlineMaybeDone.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 32)
+    x64_jcc(&mut ctx.text, CC::B, lblNotInline.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 127)
+    x64_jcc(&mut ctx.text, CC::AE, lblNotInline.clone())
+    x64_add_ri(&mut ctx.text, X64::R8, 1)
+    x64_cmp_ri(&mut ctx.text, X64::R8, 8)
+    x64_jcc(&mut ctx.text, CC::E, lblInlineHash.clone())
+    x64_shr_ri(&mut ctx.text, X64::RDX, 8)
+    x64_jmp(&mut ctx.text, lblInlineScan.clone())
+    def_label(&mut ctx.text, lblInlineMaybeDone.clone())
+    x64_test_rr(&mut ctx.text, X64::R8, X64::R8)
+    x64_jcc(&mut ctx.text, CC::NE, lblInlineHash.clone())
+
+    def_label(&mut ctx.text, lblNotInline.clone())
+    # Check if value looks like a native pointer.
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0x100000000)
     x64_cmp_rr(&mut ctx.text, X64::RDI, X64::RAX)
     x64_jcc(&mut ctx.text, CC::AE, lblStrHash.clone())
     
     # Integer hash
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0x84222325)
+    def_label(&mut ctx.text, lblIntHash.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 5381)
     x64_xor_rr(&mut ctx.text, X64::RAX, X64::RDI)
-    x64_mov_ri(&mut ctx.text, X64::RCX, 31)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 33)
     x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)
     x64_ret(&mut ctx.text)
+
+    # Inline string hash: hash bytes from the value word.
+    def_label(&mut ctx.text, lblInlineHash.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RDI)
+    x64_mov_ri(&mut ctx.text, X64::R8, 0)
+    x64_mov_ri(&mut ctx.text, X64::R9, 255)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 5381)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 33)
+
+    def_label(&mut ctx.text, lblInlineLoop.clone())
+    x64_mov_rr(&mut ctx.text, X64::R10, X64::RDX)
+    x64_and_rr(&mut ctx.text, X64::R10, X64::R9)
+    x64_test_rr(&mut ctx.text, X64::R10, X64::R10)
+    x64_jcc(&mut ctx.text, CC::E, lblDone.clone())
+    x64_xor_rr(&mut ctx.text, X64::RAX, X64::R10)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_add_ri(&mut ctx.text, X64::R8, 1)
+    x64_cmp_ri(&mut ctx.text, X64::R8, 8)
+    x64_jcc(&mut ctx.text, CC::E, lblDone.clone())
+    x64_shr_ri(&mut ctx.text, X64::RDX, 8)
+    x64_jmp(&mut ctx.text, lblInlineLoop.clone())
     
-    # String hash: FNV-1a on each byte
+    # String hash: seeded byte hash
     def_label(&mut ctx.text, lblStrHash)
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0x84222325)  # hash = offset basis
-    x64_mov_ri(&mut ctx.text, X64::RCX, 31)           # prime
+    x64_mov_ri(&mut ctx.text, X64::RAX, 5381)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 33)
     
     def_label(&mut ctx.text, lblStrLoop)
     x64_movzx_r64_m8(&mut ctx.text, X64::RDX, X64::RDI, 0)  # load byte
@@ -3568,22 +3781,73 @@ def emit_tg_runtime_hash_ptr(ctx: &mut RuntimeEmitCtx) -> Unit
 end
 
 # _tg_key_equal: Compare two map keys for equality.
-# For string keys (both >= 0x100000): byte-by-byte strcmp.
-# For integer keys: value equality.
+# Pointer strings compare by bytes. Packed inline strings and integers compare by
+# raw value; the hash helper classifies packed ASCII the same way on insert and lookup.
 # Args: x0/rdi = key_a, x1/rsi = key_b
 # Returns: x0/rax = 1 if equal, 0 if not. Clobbers x9,x10 (AArch64) or rcx,rdx (x86_64).
 def emit_tg_key_equal(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_key_equal")
   
-  let lblStrCmp = fresh_label(ctx, ".Lkeyeq_strcmp")
+  let lblAInlineScan = fresh_label(ctx, ".Lkeyeq_a_inline_scan")
+  let lblAInlineMaybeDone = fresh_label(ctx, ".Lkeyeq_a_inline_maybe_done")
+  let lblANotInline = fresh_label(ctx, ".Lkeyeq_a_not_inline")
+  let lblBInlineScan = fresh_label(ctx, ".Lkeyeq_b_inline_scan")
+  let lblBInlineMaybeDone = fresh_label(ctx, ".Lkeyeq_b_inline_maybe_done")
+  let lblBNotInline = fresh_label(ctx, ".Lkeyeq_b_not_inline")
   let lblStrLoop = fresh_label(ctx, ".Lkeyeq_loop")
   let lblEqual = fresh_label(ctx, ".Lkeyeq_equal")
   let lblNotEqual = fresh_label(ctx, ".Lkeyeq_neq")
   
   match ctx.target.arch
   when Arch::AArch64 then
-    # Check if BOTH values look like pointers (>= 0x100000)
-    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000)
+    a64_cmp_rr(&mut ctx.text, A64::X0, A64::X1)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblEqual.clone())
+
+    # If either side is packed inline ASCII, raw value equality above is enough.
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X0)
+    a64_mov_ri(&mut ctx.text, A64::X4, 0)
+    a64_mov_ri(&mut ctx.text, A64::X10, 255)
+    def_label(&mut ctx.text, lblAInlineScan.clone())
+    a64_and_rrr(&mut ctx.text, A64::X2, A64::X3, A64::X10)
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblAInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 32)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lblANotInline.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 127)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblANotInline.clone())
+    a64_add_rri(&mut ctx.text, A64::X4, A64::X4, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X4, 8)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNotEqual.clone())
+    a64_lsr(&mut ctx.text, A64::X3, A64::X3, 8)
+    a64_b(&mut ctx.text, lblAInlineScan.clone())
+    def_label(&mut ctx.text, lblAInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblNotEqual.clone())
+
+    def_label(&mut ctx.text, lblANotInline.clone())
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X1)
+    a64_mov_ri(&mut ctx.text, A64::X4, 0)
+    a64_mov_ri(&mut ctx.text, A64::X10, 255)
+    def_label(&mut ctx.text, lblBInlineScan.clone())
+    a64_and_rrr(&mut ctx.text, A64::X2, A64::X3, A64::X10)
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblBInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 32)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lblBNotInline.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X2, 127)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblBNotInline.clone())
+    a64_add_rri(&mut ctx.text, A64::X4, A64::X4, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X4, 8)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNotEqual.clone())
+    a64_lsr(&mut ctx.text, A64::X3, A64::X3, 8)
+    a64_b(&mut ctx.text, lblBInlineScan.clone())
+    def_label(&mut ctx.text, lblBInlineMaybeDone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblNotEqual.clone())
+
+    def_label(&mut ctx.text, lblBNotInline.clone())
+    # Check if BOTH values look like native pointers.
+    a64_mov_ri(&mut ctx.text, A64::X9, 0x100000000)
     a64_cmp_rr(&mut ctx.text, A64::X0, A64::X9)
     a64_bcond(&mut ctx.text, a64_cc_cc(), lblNotEqual.clone())  # a < threshold → value compare
     a64_cmp_rr(&mut ctx.text, A64::X1, A64::X9)
@@ -3612,8 +3876,56 @@ def emit_tg_key_equal(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ret(&mut ctx.text)
     
   when Arch::X86_64 then
+    x64_cmp_rr(&mut ctx.text, X64::RDI, X64::RSI)
+    x64_jcc(&mut ctx.text, CC::E, lblEqual.clone())
+
+    # If either side is packed inline ASCII, raw value equality above is enough.
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RDI)
+    x64_mov_ri(&mut ctx.text, X64::R8, 0)
+    x64_mov_ri(&mut ctx.text, X64::R9, 255)
+    def_label(&mut ctx.text, lblAInlineScan.clone())
+    x64_mov_rr(&mut ctx.text, X64::R10, X64::RDX)
+    x64_and_rr(&mut ctx.text, X64::R10, X64::R9)
+    x64_test_rr(&mut ctx.text, X64::R10, X64::R10)
+    x64_jcc(&mut ctx.text, CC::E, lblAInlineMaybeDone.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 32)
+    x64_jcc(&mut ctx.text, CC::B, lblANotInline.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 127)
+    x64_jcc(&mut ctx.text, CC::AE, lblANotInline.clone())
+    x64_add_ri(&mut ctx.text, X64::R8, 1)
+    x64_cmp_ri(&mut ctx.text, X64::R8, 8)
+    x64_jcc(&mut ctx.text, CC::E, lblNotEqual.clone())
+    x64_shr_ri(&mut ctx.text, X64::RDX, 8)
+    x64_jmp(&mut ctx.text, lblAInlineScan.clone())
+    def_label(&mut ctx.text, lblAInlineMaybeDone.clone())
+    x64_test_rr(&mut ctx.text, X64::R8, X64::R8)
+    x64_jcc(&mut ctx.text, CC::NE, lblNotEqual.clone())
+
+    def_label(&mut ctx.text, lblANotInline.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RSI)
+    x64_mov_ri(&mut ctx.text, X64::R8, 0)
+    x64_mov_ri(&mut ctx.text, X64::R9, 255)
+    def_label(&mut ctx.text, lblBInlineScan.clone())
+    x64_mov_rr(&mut ctx.text, X64::R10, X64::RDX)
+    x64_and_rr(&mut ctx.text, X64::R10, X64::R9)
+    x64_test_rr(&mut ctx.text, X64::R10, X64::R10)
+    x64_jcc(&mut ctx.text, CC::E, lblBInlineMaybeDone.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 32)
+    x64_jcc(&mut ctx.text, CC::B, lblBNotInline.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R10, 127)
+    x64_jcc(&mut ctx.text, CC::AE, lblBNotInline.clone())
+    x64_add_ri(&mut ctx.text, X64::R8, 1)
+    x64_cmp_ri(&mut ctx.text, X64::R8, 8)
+    x64_jcc(&mut ctx.text, CC::E, lblNotEqual.clone())
+    x64_shr_ri(&mut ctx.text, X64::RDX, 8)
+    x64_jmp(&mut ctx.text, lblBInlineScan.clone())
+    def_label(&mut ctx.text, lblBInlineMaybeDone.clone())
+    x64_test_rr(&mut ctx.text, X64::R8, X64::R8)
+    x64_jcc(&mut ctx.text, CC::NE, lblNotEqual.clone())
+
+    def_label(&mut ctx.text, lblBNotInline.clone())
     # Check if BOTH values look like pointers
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0x100000)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0x100000000)
     x64_cmp_rr(&mut ctx.text, X64::RDI, X64::RAX)
     x64_jcc(&mut ctx.text, CC::B, lblNotEqual.clone())
     x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RAX)

@@ -151,17 +151,18 @@ def is_bootstrap_stage_output(path: String) -> Bool
   path.contains("/tg_stage") || path.starts_with("tg_stage")
 end
 
+def is_compiler_driver_path(path: String) -> Bool
+  path == "tg_compiler/driver.tg" || path.ends_with("/tg_compiler/driver.tg")
+end
+
 def should_skip_bootstrap_semantic_checks(opts: &CompilerOptions, path: String) -> Bool
-  if path != "tg_compiler/driver.tg" && !path.ends_with("/tg_compiler/driver.tg") then
+  if !is_compiler_driver_path(path.clone()) then
     return false
   end
 
   match opts.output_file
-  when Option::Some(_) then
-    # Early native bootstrap builds have been unreliable around string-pattern
-    # helpers, but they always pass an explicit output path when compiling the
-    # compiler driver into the next stage.
-    true
+  when Option::Some(out) then
+    is_bootstrap_stage_output(out)
   when Option::None then
     false
   end
@@ -322,17 +323,12 @@ def eprint(s: String) -> Unit
 end
 
 def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
-  # Find the source file containing this span
+  # Find the source file containing this span using span.file
   mut found_file: Option[&SourceFile] = Option::None
-  if e.current_source_id >= 0 && e.current_source_id < e.source_map.files.len() then
-    found_file = Option::Some(&e.source_map.files[e.current_source_id])
-  else
-    for f in e.source_map.files do
-      let file_len = f.content.len()
-      if span.start < file_len && span.end_pos <= file_len then
-        found_file = Option::Some(&f)
-        break
-      end
+  for f in e.source_map.files do
+    if f.name == span.file then
+      found_file = Option::Some(&f)
+      break
     end
   end
   
@@ -709,22 +705,12 @@ struct CompilationUnit
 end
 
 def read_file_text_direct(path: String) -> String
-  println("[diag] read_file_text_direct: path=" + path.clone())
-  let result = read_file_to_string_native(path.clone())
-  println("[diag] read_file_text_direct: result.len=" + result.len().to_string())
-  result
+  read_file_to_string_native(path)
 end
 
 def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, String]
   if opts.verbose then
     println("[diag] compile_file_core entered, path=" + path.clone())
-  end
-  match opts.output_file
-  when Option::Some(out) then
-    if out.ends_with("tg_stage2") then
-      panic("compile_file_core stage2 sentinel")
-    end
-  when Option::None then ()
   end
 
   mut emitter = if opts.json_diagnostics then
@@ -746,7 +732,7 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     println("  Source len=" + source.len().to_string())
   end
 
-  let is_bootstrap_driver = true
+  let is_bootstrap_driver = is_compiler_driver_path(path.clone())
   
   if !is_bootstrap_driver then
     add_source(&mut emitter, path.clone(), source)
@@ -755,7 +741,7 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
   if opts.verbose then
     println("Compiling: " + path.clone())
   end
-  let skip_bootstrap_semantic_checks = true
+  let skip_bootstrap_semantic_checks = should_skip_bootstrap_semantic_checks(opts, path.clone())
   
   # Phase 1: Lexing
   if opts.verbose then
@@ -814,7 +800,7 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
   if opts.verbose then
     println("[diag] before merge_imported_deps")
   end
-  let ast = merge_imported_deps(ast_with_prelude)
+  let ast = merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
   if opts.verbose then
     println("[diag] after merge_imported_deps")
   end
@@ -1049,7 +1035,7 @@ def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: Str
     println("  Source len=" + source.len().to_string())
   end
 
-  let is_bootstrap_driver = true
+  let is_bootstrap_driver = is_compiler_driver_path(path.clone())
   if !is_bootstrap_driver then
     add_source(&mut emitter, path.clone(), source)
   end
@@ -1077,7 +1063,12 @@ def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: Str
   let parse_diags = parse_out.diagnostics
   if diag_has_errors(&parse_diags) then
     if !is_bootstrap_driver then
-      println("Parse error")
+      mut i = 0
+      while i < parse_diags.len() do
+        let d = &parse_diags[i]
+        println("Parse error: " + d.message)
+        i = i + 1
+      end
       return 1
     end
     if opts.verbose then
@@ -1099,14 +1090,14 @@ def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: Str
     let import_paths = extract_import_paths(&ast_with_prelude)
   end
 
-  let ast = merge_imported_deps(ast_with_prelude)
+  let ast = merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
 
   if opts.verbose then
     println("  Expanding macros...")
   end
   let ast = expand_macros(ast)
 
-  let skip_bootstrap_semantic_checks = true
+  let skip_bootstrap_semantic_checks = should_skip_bootstrap_semantic_checks(opts, path.clone())
   if opts.verbose then
     println("  Type checking...")
   end
@@ -1213,10 +1204,6 @@ def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: Str
     return 1
   end
 
-  if output_path.ends_with("tg_stage2") then
-    panic("compile_startup_entry post-opt")
-  end
-
   if opts.emit_mir then
     print_mir(&mir)
     return 0
@@ -1278,53 +1265,27 @@ end
 # Recursively load and merge imported dependency files into the program.
 # This ensures function definitions from imports (e.g. println from std::io)
 # are available during MIR lowering, not just type definitions.
-def merge_imported_deps(program: Program) -> Program
-  println("[diag] merge_imported_deps enter, program.items=" + program.items.len().to_string())
-  mut loaded = Vec::new()
+# include_compiler_lib: when true, also preload tg_compiler/lib.tg so the
+# compiler's internal types are available during type checking of the
+# compiler's own source files. For user code compilation, this should be
+# false to avoid polluting the type namespace with compiler internals.
+def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Program
+  mut loaded = Set::new()
   mut merged_items = Vec::new()
   # Program items first  ensures the main program's definitions
   # (especially main) take priority over dependency definitions.
-  mut item_idx = 0
-  while item_idx < program.items.len() do
-    merged_items.push(program.items[item_idx])
-    item_idx = item_idx + 1
+  for item in program.items do
+    merged_items.push(item)
   end
-  println("[diag] merged program items, count=" + merged_items.len().to_string())
   let preludes = prelude_files()
-  println("[diag] prelude count=" + preludes.len().to_string())
-  mut prelude_idx = 0
-  while prelude_idx < preludes.len() do
-    println("[diag] loading prelude " + prelude_idx.to_string() + ": " + preludes[prelude_idx].clone())
-    collect_dep_file(preludes[prelude_idx].clone(), &mut merged_items, &mut loaded)
-    println("[diag] done prelude " + prelude_idx.to_string())
-    prelude_idx = prelude_idx + 1
+  for prelude in preludes do
+    collect_dep_file(prelude, &mut merged_items, &mut loaded)
   end
-  println("[diag] collecting dep items from program")
+  if include_compiler_lib then
+    collect_dep_file("tg_compiler/lib.tg", &mut merged_items, &mut loaded)
+  end
   collect_dep_items(&program, &mut merged_items, &mut loaded)
-  println("[diag] merge_imported_deps done, merged=" + merged_items.len().to_string())
   Program { items: merged_items, span: program.span }
-end
-
-def dep_path_key(path: &String) -> Int
-  mut h: Int = 5381
-  let bytes = path.bytes()
-  mut i = 0
-  while i < bytes.len() do
-    h = ((h * 33) + (bytes[i] as Int)) % 2147483647
-    i = i + 1
-  end
-  h
-end
-
-def loaded_paths_contains(loaded: &Vec[Int], path_hash: Int) -> Bool
-  mut i = 0
-  while i < loaded.len() do
-    if loaded[i] == path_hash then
-      return true
-    end
-    i = i + 1
-  end
-  false
 end
 
 def build_dep_file_path(segments: &Vec[String], count: Int) -> Option[String]
@@ -1390,10 +1351,8 @@ def dep_use_to_file(u: &UseDecl) -> Option[String]
   end
 end
 
-def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Vec[Int]) -> Unit
-  mut i = 0
-  while i < program.items.len() do
-    let item = program.items[i]
+def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String]) -> Unit
+  for item in program.items do
     match item.kind
     when ItemKind::ItemUse(u) then
       match dep_use_to_file(&u)
@@ -1403,45 +1362,33 @@ def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Vec[I
       end
     when _ then ()
     end
-    i = i + 1
   end
 end
 
-def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Vec[Int]) -> Unit
-  let path_hash = dep_path_key(&path)
-  println("[diag] collect_dep_file: path=" + path.clone() + " hash=" + path_hash.to_string())
-  if loaded_paths_contains(loaded, path_hash) then
-    println("[diag] collect_dep_file: already loaded, returning")
+def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String]) -> Unit
+  if loaded.contains(&path) then
     return
   end
-  loaded.push(path_hash)
-  println("[diag] collect_dep_file: after push loaded.len=" + loaded.len().to_string())
+  loaded.insert(path.clone())
 
   let source = read_file_text_direct(path)
-  println("[diag] collect_dep_file: source.len=" + source.len().to_string())
   if source.len() == 0 then
-    println("[diag] collect_dep_file: source empty, returning")
     return
   end
 
-  println("[diag] collect_dep_file: about to tokenize")
   let tokens = tokenize(source)
-  println("[diag] collect_dep_file: tokenized, tokens.len=" + tokens.tokens.len().to_string())
-  println("[diag] collect_dep_file: about to parse")
   let dep_parse = parse(tokens)
-  println("[diag] collect_dep_file: parsed, dep_parse.program.items.len=" + dep_parse.program.items.len().to_string())
+
+  # Include items even if parse errors exist — most items are still valid,
+  # and skipping them entirely causes far more cascading type errors
+  # than the few parse errors themselves.
   let dep_ast = dep_parse.program
   # Recurse into this dependency's own imports
-  println("[diag] collect_dep_file: about to collect_dep_items")
   collect_dep_items(&dep_ast, out, loaded)
-  println("[diag] collect_dep_file: done collect_dep_items")
   # Add all items from this dependency
-  mut item_idx = 0
-  while item_idx < dep_ast.items.len() do
-    out.push(dep_ast.items[item_idx])
-    item_idx = item_idx + 1
+  for item in dep_ast.items do
+    out.push(item)
   end
-  println("[diag] collect_dep_file: done, out.len=" + out.len().to_string())
 end
 
 def get_output_path(opts: &CompilerOptions, input: String, ext: String) -> String
@@ -3626,8 +3573,8 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
     e
   end
 
-  let is_bootstrap_driver = true
-  let skip_bootstrap_semantic_checks = true
+  let is_bootstrap_driver = files.len() == 1 && is_compiler_driver_path(files[0].clone())
+  let skip_bootstrap_semantic_checks = is_bootstrap_driver && is_bootstrap_stage_output(output_path.clone())
   mut all_items: Vec[Item] = Vec::new()
 
   if opts.verbose then
@@ -3662,6 +3609,13 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
     if diag_has_errors(&parse_diags) then
       if !is_bootstrap_driver then
         println("Parse error in " + path.clone())
+        for d in parse_diags do
+          let pos_info = match d.span
+          when Option::Some(s) then " at offset " + s.start.to_string()
+          when Option::None then ""
+          end
+          println("  " + d.message + pos_info)
+        end
         return 1
       end
       if opts.verbose then
@@ -3689,7 +3643,7 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
   if opts.verbose then
     println("  Merging imported dependencies...")
   end
-  let ast = merge_imported_deps(merged_ast)
+  let ast = merge_imported_deps(merged_ast, include_compiler_lib: is_bootstrap_driver)
 
   if opts.verbose then
     println("  Expanding macros...")
@@ -3794,10 +3748,6 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
     end
     println("MIR verification failed after optimization")
     return 1
-  end
-
-  if output_path.ends_with("tg_stage2") then
-    panic("compile_multiple_files post-opt")
   end
 
   if opts.emit_mir then
@@ -3991,8 +3941,8 @@ def prelude_files() -> Vec[String]
   files.push("std/effects.tg")
   files.push("std/budget.tg")
   files.push("std/test.tg")
+  files.push("std/taint.tg")
   files.push("std/ffi.tg")
-  files.push("tg_compiler/lib.tg")
   files
 end
 
@@ -4619,7 +4569,8 @@ def hash_directory(dir: &String) -> String
       if f.ends_with(".tg") then
         match read_file(dir.clone() + "/" + f)
         when Result::Ok(content) then
-          for c in content.bytes() do
+          let content_bytes: Vec[Int] = content.bytes()
+          for c in content_bytes do
             h = h ^ (c as UInt)
             h = h * prime
           end

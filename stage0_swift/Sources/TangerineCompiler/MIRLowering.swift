@@ -626,17 +626,12 @@ public final class MIRLowering {
                                     args: argOps, next: nextBB, unwind: nil))
                 currentBlock = nextBB
 
-                // For mutating methods on struct fields, emit writeback to the original field
-                let mutatingMethods: Set<String> = ["push","pop","insert","remove","extend",
-                                                    "clear","truncate","reverse","sort","sort_by"]
-                if mutatingMethods.contains(methodName),
-                   case .field(let parentBase, let fieldName, _) = base {
-                    let parentOp = lowerExpr(parentBase)
-                    let parentLocal = placeOf(parentOp)
-                    emit(.assign(MirPlace(local: parentLocal, projections: [.namedField(fieldName)]),
-                                .use(.copy(.local(result)))))
-                }
-
+                // NOTE: No explicit write-back is emitted here for mutating methods on struct
+                // fields because the MIR interpreter handles write-back directly inside its
+                // .call terminator handler (MIRInterpreter.swift lines 734–770).  Emitting an
+                // extra .assign here would overwrite the struct field with the method's return
+                // value (e.g. Option::Some(last) for .pop, or Unit for .push) instead of the
+                // correctly mutated receiver reference, corrupting the field.
                 return .copy(.local(result))
             }
             if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
@@ -822,10 +817,11 @@ public final class MIRLowering {
         case .closure(let closureE):
             return lowerClosure(closureE)
 
-        case .cast(let inner, _, _):
+        case .cast(let inner, let targetType, _):
             let val = lowerExpr(inner)
-            let tmp = freshTemp()
-            emit(.assign(.local(tmp), .cast(val, .unknown)))
+            let targetMirType = lowerTypeExpr(targetType)
+            let tmp = freshTemp(type: targetMirType)
+            emit(.assign(.local(tmp), .cast(val, targetMirType)))
             return .copy(.local(tmp))
 
         case .tryOp(let inner, _):
@@ -1500,15 +1496,18 @@ public final class MIRLowering {
     private func lowerPatternBind(_ pattern: Pattern, value: MirOperand, enumHint: String? = nil) {
         switch pattern {
         case .ident(let name, let mutable, _):
-            let id = freshLocal(name: name, type: .unknown, mutable: mutable)
+            let bindType = operandType(value) ?? .unknown
+            let id = freshLocal(name: name, type: bindType, mutable: mutable)
             defineInScope(name, id)
             emit(.assign(.local(id), .use(value)))
         case .refPattern(let name, _):
-            let id = freshLocal(name: name, type: .unknown, mutable: false)
+            let bindType = operandType(value) ?? .unknown
+            let id = freshLocal(name: name, type: bindType, mutable: false)
             defineInScope(name, id)
             emit(.assign(.local(id), .ref(.shared, MirPlace(local: placeOf(value), projections: []))))
         case .refMutPattern(let name, _):
-            let id = freshLocal(name: name, type: .unknown, mutable: true)
+            let bindType = operandType(value) ?? .unknown
+            let id = freshLocal(name: name, type: bindType, mutable: true)
             defineInScope(name, id)
             emit(.assign(.local(id), .ref(.mutable, MirPlace(local: placeOf(value), projections: []))))
         case .variant(let typeName, let variantName, let fields, _):
@@ -1687,13 +1686,13 @@ public final class MIRLowering {
                 outerBindings.append((name, id))
             }
         }
-
         let savedBlocks = blocks
         let savedLocals = locals
         let savedCurrentBlock = currentBlock
         let savedNextLocal = nextLocal
         let savedNextBlock = nextBlock
         let savedReturnLocal = returnLocal
+        let savedScopes = scopes
 
         resetFunctionState()
         pushScope()
@@ -1716,7 +1715,11 @@ public final class MIRLowering {
         for (name, outerId) in outerBindings {
             if !seenNames.contains(name) {
                 seenNames.insert(name)
-                let captureId = freshLocal(name: name, type: .unknown, mutable: false)
+                // Propagate the actual type from the outer scope's local, not .unknown.
+                // savedLocals was captured before resetFunctionState() cleared self.locals,
+                // so savedLocals[outerId] refers to the original outer-scope local.
+                let captureType = savedLocals[outerId].type
+                let captureId = freshLocal(name: name, type: captureType, mutable: false)
                 defineInScope(name, captureId)
                 captureParamLocals.append(locals[captureId])
                 captureOuterIds.append(outerId)
@@ -1742,6 +1745,7 @@ public final class MIRLowering {
         blocks = savedBlocks; locals = savedLocals
         currentBlock = savedCurrentBlock; nextLocal = savedNextLocal
         nextBlock = savedNextBlock; returnLocal = savedReturnLocal
+        scopes = savedScopes
 
         // ── 6. Emit closure value in parent function ──
         if captureOuterIds.isEmpty {

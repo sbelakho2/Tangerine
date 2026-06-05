@@ -3,10 +3,7 @@
 #
 # Produces native executables directly — NO external linker dependency.
 # Supports:
-#   ELF64 executable  (Linux)
 #   Mach-O executable (macOS)
-#   PE executable     (Windows)
-#
 # This linker handles:
 #   - Symbol resolution across object files
 #   - Relocation patching
@@ -394,10 +391,10 @@ def build_macho_bind_opcodes(imports: &Vec[String], got_seg_idx: Int, got_offset
     let flags = if is_weak_extern(sym) then 0x01 as u8 else 0x00 as u8 end
     out.push(bind_opcode_set_symbol_trailing_flags | flags)
     let nm = macho_sym_name(sym)
-    let nb = nm.as_bytes()
     mut k = 0
-    while k < nb.len() do
-      out.push(nb[k])
+    let nm_len = nm.len()
+    while k < nm_len do
+      out.push(nm.char_at(k) as u8)
       k = k + 1
     end
     out.push(0 as u8)   # null terminator
@@ -456,12 +453,13 @@ end
 def emit_sym_nlist_entry(sym: &AsmSymbol, strtab: &mut Vec[u8], symtab: &mut Vec[u8], section_vaddrs: &Vec[u64]) -> Unit
   # Mach-O symbols have a leading underscore
   strtab.push(0x5F as u8)        # '_'
-  let nb = sym.name.as_bytes()
   let strx = (strtab.len() - 1) as u32  # string offset includes the underscore
-  mut k = 0
-  while k < nb.len() do
-    strtab.push(nb[k])
-    k = k + 1
+  let name_str = sym.name.clone()
+  let name_len = name_str.len()
+  mut name_i = 0
+  while name_i < name_len do
+    strtab.push(name_str.char_at(name_i) as u8)
+    name_i = name_i + 1
   end
   strtab.push(0 as u8)
 
@@ -513,6 +511,7 @@ def build_macho_full_symtab_strtab(
   strtab.push(0 as u8)           # strtab[0] = NUL (convention)
 
   # Phase 1: Local defined symbols
+  eprintln("[sdiag] before locals")
   mut nlocalsym = 0
   mut i = 0
   while i < all_symbols.len() do
@@ -523,8 +522,10 @@ def build_macho_full_symtab_strtab(
     end
     i = i + 1
   end
+  eprintln("[sdiag] after locals")
 
   # Phase 2: External defined symbols (Global or Weak)
+  eprintln("[sdiag] before globals")
   mut nextdefsym = 0
   i = 0
   while i < all_symbols.len() do
@@ -535,18 +536,20 @@ def build_macho_full_symtab_strtab(
     end
     i = i + 1
   end
+  eprintln("[sdiag] after globals")
 
   # Phase 3: Undefined/import symbols
+  eprintln("[sdiag] before imports")
   mut nundefsym = 0
   i = 0
   while i < imports.len() do
     let sym = &imports[i]
     let nm = macho_sym_name(sym)
-    let nb = nm.as_bytes()
     let strx = strtab.len() as u32
     mut k = 0
-    while k < nb.len() do
-      strtab.push(nb[k])
+    let nm_len = nm.len()
+    while k < nm_len do
+      strtab.push(nm.char_at(k) as u8)
       k = k + 1
     end
     strtab.push(0 as u8)
@@ -562,6 +565,7 @@ def build_macho_full_symtab_strtab(
     nundefsym = nundefsym + 1
     i = i + 1
   end
+  eprintln("[sdiag] after imports")
 
   (symtab, strtab, nlocalsym, nextdefsym, nundefsym)
 end
@@ -644,18 +648,36 @@ end
 
 def linker_symbols_from_resolved(resolved: &Map[String, ResolvedSymbol]) -> Map[String, LinkerSymbol]
   mut syms = Map::new()
-  let entries = resolved.entries()
-  mut i = 0
-  while i < entries.len() do
-    let entry = &entries[i]
-    let sym = entry.1
-    syms.insert(entry.0.clone(), LinkerSymbol {
-      name: sym.name.clone(),
-      value: sym.value,
-      section: sym.section,
-      is_defined: sym.is_defined
+  # NOTE: bind entries() to an EXPLICITLY-TYPED local before iterating. The
+  # for-loop iterable type is resolved by resolve_iter_expr_type, which returns
+  # Type::Unit for any method call (e.g. `resolved.entries()`). A Unit iterable
+  # type makes lower_for insert a spurious ProjDeref, so MirLen reads the length
+  # from [data+8] (a garbage element) instead of [handle+8], yielding an
+  # enormous bogus length that over-iterates into a null tuple slot and faults.
+  # Binding to `let entries: Vec[(String, ResolvedSymbol)] = ...` makes the
+  # iterable an ExprIdent whose local type is the annotated Vec, so codegen
+  # dereferences the handle exactly once for both the length and the indexing.
+  let entries: Vec[(String, ResolvedSymbol)] = resolved.entries()
+  for (key, sym) in entries do
+    # Bind the tuple element to an EXPLICITLY-TYPED local. The for-loop
+    # tuple-destructure infers `sym`'s type via mir_infer_rvalue_type, which
+    # only exposes the first two struct fields (name/value) for field-index
+    # resolution, so `sym.section`/`sym.is_defined` fall back to field index 0
+    # (reading [sym+0], the name pointer) and produce a garbage section index.
+    # An annotated `let rs: ResolvedSymbol = sym` forces resolve_type_with_builder
+    # to resolve the full 4-field struct, so all field offsets are correct.
+    let rs: ResolvedSymbol = sym
+    syms.insert(key.clone(), LinkerSymbol {
+      name: rs.name.clone(),
+      value: rs.value,
+      section: rs.section,
+      is_defined: rs.is_defined
     })
-    i = i + 1
+  end
+  if syms.contains_key("main") then
+    eprintln("[ldiag] syms has main")
+  else
+    eprintln("[ldiag] syms MISSING main")
   end
   syms
 end
@@ -698,8 +720,9 @@ def patch_relocations(
     let target_vaddr = match target_vaddr_opt
     when Option::Some(v) then v
     when Option::None then
-      if !undefined_syms.contains(&reloc.symbol) then
-        undefined_syms.push(reloc.symbol.clone())
+      let reloc_symbol = reloc.symbol.clone()
+      if !undefined_syms.contains(&reloc_symbol) then
+        undefined_syms.push(reloc_symbol)
       end
       i = i + 1
       continue
@@ -825,8 +848,9 @@ def patch_data_relocations(
     let target_vaddr = match target_vaddr_opt
     when Option::Some(v) then v
     when Option::None then
-      if !undefined_syms.contains(&reloc.symbol) then
-        undefined_syms.push(reloc.symbol.clone())
+      let reloc_symbol = reloc.symbol.clone()
+      if !undefined_syms.contains(&reloc_symbol) then
+        undefined_syms.push(reloc_symbol)
       end
       i = i + 1
       continue
@@ -1306,6 +1330,11 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 
   # Entry point offset (relative to start of __TEXT segment, which is fileoff=0)
+  if syms.contains_key("main") then
+    eprintln("[ediag] entry-site syms has main")
+  else
+    eprintln("[ediag] entry-site syms MISSING main")
+  end
   let entry_off = if objects.len() == 1 then
     let direct_entry_offset = linker_input_entry_offset(input)
     if direct_entry_offset >= 0 then
@@ -1334,22 +1363,33 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   # ── __LINKEDIT contents ───────────────────────────────────────
   # Layout: rebase opcodes | bind opcodes | symtab | strtab
   # All offsets are absolute file offsets (Mach-O convention).
+  eprintln("[mdiag] before rebase")
   let rebase_opcodes = build_macho_rebase_opcodes(&all_data_relocations, 2)
+  eprintln("[mdiag] after rebase")
   let rebase_size = rebase_opcodes.len()
+  eprintln("[mdiag] before bind")
   let bind_opcodes = if num_imports > 0 then
     build_macho_bind_opcodes(&imports, 2, got_offset_in_data_seg)
   else
     let empty: Vec[u8] = Vec::new()
     empty
   end
+  eprintln("[mdiag] after bind")
+  eprintln("[mdiag] before symtab")
   let build_result = build_macho_full_symtab_strtab(&all_symbols, &imports, &section_vaddrs)
-  let symtab_bytes = build_result.0
-  let strtab_bytes = build_result.1
-  let nlocalsym = build_result.2
-  let nextdefsym = build_result.3
-  let nundefsym = build_result.4
+  eprintln("[mdiag] after symtab")
+  eprintln("[fdiag] before result fields")
+  let symtab_bytes: Vec[u8] = build_result.0
+  eprintln("[fdiag] after symtab bytes")
+  let strtab_bytes: Vec[u8] = build_result.1
+  eprintln("[fdiag] after strtab bytes")
+  let nlocalsym: Int = build_result.2
+  let nextdefsym: Int = build_result.3
+  let nundefsym: Int = build_result.4
   let nsyms = nlocalsym + nextdefsym + nundefsym
+  eprintln("[fdiag] after symbol counts")
 
+  eprintln("[fdiag] before linkedit offsets")
   let linkedit_fileoff = data_fileoff + data_seg_size
 
   # dyld_info validates each LINKEDIT payload offset, so keep opcode streams aligned.
@@ -1366,6 +1406,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   let linkedit_used = (strtab_off + strtab_size) - linkedit_fileoff
   let linkedit_size = align_up(linkedit_used, page_size)
   let linkedit_vaddr = data_vaddr + data_seg_size as u64
+  eprintln("[fdiag] after linkedit offsets")
 
   # MH flags: MH_PIE (0x200000) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80).
   # MH_NOUNDEFS (0x1) is cleared because we now have undefined imports.
@@ -1553,27 +1594,51 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, 0x50000000 as u32)
   write32(&mut out, 0x00000000 as u32)
   write32(&mut out, 0x00000001 as u32)
+  eprintln("[fdiag] after load commands")
 
   # --- Section data ---
+  eprintln("[fdiag] before pad code")
   pad_to(&mut out, code_fileoff)
+  eprintln("[fdiag] after pad code")
+  eprintln("[fdiag] before text extend")
   out.extend(&sections[0].data)   # __text (with appended stubs at end)
+  eprintln("[fdiag] after text extend")
+  eprintln("[fdiag] before rodata extend")
   out.extend(&sections[1].data)   # __const (rodata)
+  eprintln("[fdiag] after rodata extend")
+  eprintln("[fdiag] before pad data")
   pad_to(&mut out, data_fileoff)
+  eprintln("[fdiag] after pad data")
+  eprintln("[fdiag] before data extend")
   out.extend(&sections[2].data)   # __data (with appended GOT slots at end)
+  eprintln("[fdiag] after data extend")
 
   # __LINKEDIT contents: rebase opcodes, bind opcodes, then symtab and strtab.
   if rebase_size > 0 then
+    eprintln("[fdiag] before pad rebase")
     pad_to(&mut out, rebase_off)
+    eprintln("[fdiag] after pad rebase")
+    eprintln("[fdiag] before rebase extend")
     out.extend(&rebase_opcodes)
+    eprintln("[fdiag] after rebase extend")
   end
   if bind_size > 0 then
+    eprintln("[fdiag] before pad bind")
     pad_to(&mut out, bind_off)
+    eprintln("[fdiag] after pad bind")
+    eprintln("[fdiag] before bind extend")
     out.extend(&bind_opcodes)
+    eprintln("[fdiag] after bind extend")
   end
+  eprintln("[fdiag] before pad symtab")
   pad_to(&mut out, symtab_off)
+  eprintln("[fdiag] after pad symtab")
+  eprintln("[fdiag] before symtab extend")
   out.extend(&symtab_bytes)
-  pad_to(&mut out, strtab_off)
+  eprintln("[fdiag] after symtab extend")
+  eprintln("[fdiag] before strtab extend")
   out.extend(&strtab_bytes)
+  eprintln("[fdiag] after strtab extend")
 
   Result::Ok(out)
 end
@@ -1792,7 +1857,7 @@ def link_executable(input: &LinkerInput) -> Result[Unit, String]
   end
 
   let output_path = linker_input_output_clone(input)
-  match write_file_bytes_owned(output_path.clone(), bytes)
+  match write_file_bytes(output_path.clone(), &bytes)
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err("failed to write executable: " + e)
   end
@@ -1946,9 +2011,10 @@ def lto_thin(ctx: &mut LtoContext) -> Unit
   end
   
   # Also keep "main" and "_start"
-  if !reachable.contains("main") then
-    worklist.push("main".to_string())
-    reachable.insert("main".to_string())
+  let main_name = "main".to_string()
+  if !reachable.contains(&main_name) then
+    worklist.push(main_name.clone())
+    reachable.insert(main_name)
   end
   
   while !worklist.is_empty() do
@@ -1957,9 +2023,10 @@ def lto_thin(ctx: &mut LtoContext) -> Unit
       match ctx.call_graph.get(sym.clone())
       when Option::Some(callees) then
         for callee in callees do
-          if !reachable.contains(callee.clone()) then
-            reachable.insert(callee.clone())
-            worklist.push(callee.clone())
+          let callee_name = callee.clone()
+          if !reachable.contains(&callee_name) then
+            reachable.insert(callee_name.clone())
+            worklist.push(callee_name)
           end
         end
       when Option::None then ()
@@ -2023,9 +2090,10 @@ def lto_fat(ctx: &mut LtoContext) -> Unit
       match ctx.call_graph.get(sym.clone())
       when Option::Some(callees) then
         for callee in callees do
-          if !reachable.contains(callee.clone()) then
-            reachable.insert(callee.clone())
-            worklist.push(callee.clone())
+          let callee_name = callee.clone()
+          if !reachable.contains(&callee_name) then
+            reachable.insert(callee_name.clone())
+            worklist.push(callee_name)
           end
         end
       when Option::None then ()
@@ -2066,7 +2134,8 @@ end
 def filter_reachable_functions(functions: &Vec[MirFunction], reachable: &Set[String]) -> Vec[MirFunction]
   mut kept = Vec::new()
   for func in functions do
-    if reachable.contains(func.name.clone()) then
+    let func_name = func.name.clone()
+    if reachable.contains(&func_name) then
       kept.push(func)
     end
   end

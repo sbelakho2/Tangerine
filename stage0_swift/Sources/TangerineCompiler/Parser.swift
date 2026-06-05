@@ -3447,15 +3447,20 @@ public final class Parser {
         while !at(.pipe) && !atEof() {
             let pStart = currentSpan
             if at(.lParen) {
-                let after = skipDelimitedTokens(from: cursor, open: .lParen, close: .rParen)
-                if after > cursor {
-                    cursor = after
-                } else {
-                    _ = advance()
+                advance() // skip (
+                while !at(.rParen) && !atEof() {
+                    let innerStart = currentSpan
+                    let isMut = eat(.kwMut)
+                    let name = expectIdent()
+                    var paramType: TypeExpr? = nil
+                    if eat(.colon) {
+                        paramType = parseTypeExpr()
+                    }
+                    params.append(ClosureParam(name: name, isMutable: isMut, type: paramType,
+                                               span: innerStart.merged(with: currentSpan)))
+                    if !at(.rParen) { eat(.comma) }
                 }
-                let placeholder = "_p\(params.count)"
-                params.append(ClosureParam(name: placeholder, isMutable: false, type: nil,
-                                           span: pStart.merged(with: currentSpan)))
+                expect(.rParen)
                 if !at(.pipe) { eat(.comma) }
                 continue
             }

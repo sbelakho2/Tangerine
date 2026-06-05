@@ -12,7 +12,7 @@ public final class MIRInterpreter {
     private var trace: [TraceEntry] = []
     private let enableTrace: Bool
     public var runtimeArgs: [String] = ["tg", "compile", "--help"]
-    public var maxSteps: Int = 2_000_000_000
+    public var maxSteps: Int = 8_000_000_000
     private var stepCount: Int = 0
     private let progressReportInterval: Int
     private var nextProgressReportStep: Int = .max
@@ -190,6 +190,12 @@ public final class MIRInterpreter {
     private var nextNativeMapId: Int = 1
     private var nativeMapGcCounter: Int = 0  // counter for periodic GC
 
+    // DBG: tracks the current lookup_var name and checking context across entry/exit
+    private var lastLookupVarName: String = ""
+    // DBG: tracks the current bind_var name
+    private var lastBindVarName: String = ""
+    // DBG: tracks the current function being type-checked for context in lookup failure traces
+    private var currentCheckFnName: String = ""
     // Static set for mutating method check — avoids allocating array on every call
     private static let mutatingMethods: Set<String> = [
         ".push", ".pop", ".insert", ".remove", ".extend",
@@ -423,8 +429,86 @@ public final class MIRInterpreter {
 
     /// Push a new call frame for function at `fnIdx` with given arguments.
     private func pushCallFrame(_ fnIdx: Int, args: [MirValue]) {
-        callProfileArray[fnIdx] += 1
         let fn = program.functions[fnIdx]
+        // TEST: verify stderr output works
+        if fn.name == "types::check_program" {
+            fputs("DBG_TEST: check_program called fn.name='\(fn.name)'\n", stderr)
+            fflush(stderr)
+        }
+        if enableTrace, fn.name.contains("resolve_type_var") || fn.name.contains("__closure_") || fn.name.contains("unify") {
+            let paramInfo = fn.params.map { "\($0.name ?? "?")(id=\($0.id))" }.joined(separator: ", ")
+            let argInfo = args.enumerated().map { (i, v) -> String in
+                let kind = valueKindName(v)
+                if case .fn(let n) = v { return "arg\(i)=fn(\(n))" }
+                if case .structVal(let n, _) = v { return "arg\(i)=struct(\(n))" }
+                if case .enumVal(let n, let idx, _) = v { return "arg\(i)=enum(\(n)#\(idx))" }
+                return "arg\(i)=\(kind)"
+            }.joined(separator: ", ")
+            fputs("DBG_CALL: \(fn.name) params=[\(paramInfo)] args=[\(argInfo)]\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace check_function entry
+        if fn.name == "types::check_function" {
+            let fnName: String
+            if args.count > 1, case .structVal(_, let fields) = args[1], case .string(let n)? = fields["name"] {
+                fnName = n
+            } else {
+                fnName = args.count > 1 ? args[1].displayString : "?"
+            }
+            currentCheckFnName = fnName
+            fputs("DBG_CHECK_FN: ENTER fn='\(fnName)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace check_impl entry
+        if fn.name == "types::check_impl" {
+            let implDesc = args.count > 1 ? args[1].displayString : "?"
+            fputs("DBG_CHECK_IMPL: ENTER impl='\(implDesc)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace lookup_var entry (tracks name for exit correlation)
+        if fn.name == "types::lookup_var" {
+            lastLookupVarName = args.count > 1 ? args[1].displayString : "?"
+            // Print env.scopes.len() — access scopes field from TypeEnv struct
+            var scopeCount = -1
+            if args.count >= 1, case .structVal(_, let envFields) = args[0] {
+                if case .array(let scopesArr) = envFields["scopes"] {
+                    scopeCount = scopesArr.count
+                }
+            }
+            fputs("DBG_LOOKUP: ENTER name='\(lastLookupVarName)' scopes=\(scopeCount) callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace push_scope entry
+        if fn.name == "types::push_scope" {
+            fputs("DBG_PUSH_SCOPE: inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace pop_scope entry
+        if fn.name == "types::pop_scope" {
+            fputs("DBG_POP_SCOPE: inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace bind_var entry (tracks which variables are being registered in scope)
+        if fn.name == "types::bind_var" {
+            let name = args.count > 1 ? args[1].displayString : "?"
+            lastBindVarName = name
+            fputs("DBG_BIND_VAR: ENTER name='\(name)' inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        // DBG: trace check_block entry
+        if fn.name == "types::check_block" {
+            fputs("DBG_CHECK_BLOCK: ENTER inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
+            fflush(stderr)
+        }
+
+        callProfileArray[fnIdx] += 1
         let maxLocal = maxLocals[fnIdx]
         let localsBase = localsStackTop
         let needed = localsBase + maxLocal
@@ -455,7 +539,7 @@ public final class MIRInterpreter {
 
     /// Clean up current frame: capture &mut write-back params, release maps, pop frame.
     private func popCallFrame() {
-        let calleeFrame = callStack[callStack.count - 1]
+        let calleeFrame = callStack.removeLast()
         let calleeFn = program.functions[calleeFrame.functionIdx]
         // Capture mut write-back params
         var hasMutRef = false
@@ -475,28 +559,25 @@ public final class MIRInterpreter {
             lastCallFinalParams = []
         }
         let localsBase = calleeFrame.localsBase
-        callStack.removeLast()
-        // Clear locals
-        for i in localsBase..<localsStackTop {
-            localsStack[i] = .unit
-        }
+        // Slots are reinitialized in pushCallFrame, so avoid eager per-return clears.
         localsStackTop = localsBase
         // Update cached locals base/count for the caller frame
-        if !callStack.isEmpty {
-            currentLocalsBase = callStack[callStack.count - 1].localsBase
-            currentLocalsCount = callStack[callStack.count - 1].localsCount
+        if let callerFrame = callStack.last {
+            currentLocalsBase = callerFrame.localsBase
+            currentLocalsCount = callerFrame.localsCount
         }
     }
 
     /// Apply call result to the caller frame using saved continuation.
     private func applyCallContinuation(_ result: MirValue) {
         let frameIdx = callStack.count - 1
-        let dest = callStack[frameIdx].pendingDest
-        let next = callStack[frameIdx].pendingNext
-        let calleeName = callStack[frameIdx].pendingCalleeName
-        let callArgs = callStack[frameIdx].pendingCallOperands
-        let argVals = callStack[frameIdx].pendingArgVals
-        callStack[frameIdx].hasPending = false
+        var caller = callStack[frameIdx]
+        let dest = caller.pendingDest
+        let next = caller.pendingNext
+        let calleeName = caller.pendingCalleeName
+        let callArgs = caller.pendingCallOperands
+        let argVals = caller.pendingArgVals
+        caller.hasPending = false
 
         // Handle mutating method write-back
         if calleeName.hasPrefix("."), !argVals.isEmpty {
@@ -530,7 +611,6 @@ public final class MIRInterpreter {
 
         // Handle &mut argument write-back
         if !lastCallFinalParams.isEmpty {
-            let curFrame = callStack[callStack.count - 1]
             for (i, arg) in callArgs.enumerated() {
                 guard i < lastCallFinalParams.count else { break }
                 guard i < lastCallMutRefMask.count, lastCallMutRefMask[i] else { continue }
@@ -540,7 +620,7 @@ public final class MIRInterpreter {
                 default: argPlace = nil
                 }
                 if let ap = argPlace {
-                    let borrowedPlace = curFrame.mutBorrows[ap.local] ?? ap
+                    let borrowedPlace = caller.mutBorrows[ap.local] ?? ap
                     let modifiedVal = lastCallFinalParams[i]
                     if borrowedPlace.projections.isEmpty {
                         setLocal(borrowedPlace.local, modifiedVal)
@@ -565,15 +645,24 @@ public final class MIRInterpreter {
             default: receiverPlace = nil
             }
             if let receiverPlace {
-                callStack[callStack.count - 1].mapMutOptions[dest] = (mapPlace: receiverPlace, key: argVals[1])
+                caller.mapMutOptions[dest] = (mapPlace: receiverPlace, key: argVals[1])
             }
         }
 
-        callStack[callStack.count - 1].currentBlock = next
+        caller.currentBlock = next
+        callStack[frameIdx] = caller
     }
 
     private func callFunction(_ fn: MirFunction, args: [MirValue]) -> MirValue {
         if enableTrace { addTrace(fn.name, fn.entryBlock, .enterFunction, "args=\(args.map(\.description))") }
+
+        // DBG: trace get_type_def_by_name entry
+        if fn.name == "types::get_type_def_by_name" {
+            let nameStr = args.count > 1 ? args[1].displayString : "?"
+            let scopeDepth = callStack.count
+            fputs("DBG_GTDBN: ENTER name='\(nameStr)' scopeDepth=\(scopeDepth)\n", stderr)
+            fflush(stderr)
+        }
 
         guard let fnIdx = functionIndex[fn.name] else {
             let msg = "INTERPRETER: function '\(fn.name)' not found in program"
@@ -609,6 +698,32 @@ public final class MIRInterpreter {
 
             // Normal return — clean up and deliver to caller
             let calleeFnName = program.functions[callStack[callStack.count - 1].functionIdx].name
+            // DBG: trace get_type_def_by_name return
+            if calleeFnName == "types::get_type_def_by_name" {
+                let resultDesc = lastResult.description
+                let resultStr: String
+                // Note: MIR program uses fully-qualified type names like "core::Option"
+                if case .enumVal("core::Option", 0, let val) = lastResult {
+                    if case .structVal(let sn, _) = val { resultStr = "Some(\(sn))" }
+                    else { resultStr = "Some(\(val.displayString))" }
+                } else if case .enumVal("core::Option", 1, _) = lastResult { resultStr = "None" }
+                else { resultStr = resultDesc }
+                fputs("DBG_GTDBN: RESULT=\(resultStr)\n", stderr)
+                fflush(stderr)
+            }
+
+            // DBG: trace lookup_var return (FOUND vs FAIL)
+            if calleeFnName == "types::lookup_var" {
+                // Note: MIR program uses fully-qualified type names like "core::Option"
+                if case .enumVal("core::Option", 1, _) = lastResult {
+                    fputs("DBG_LOOKUP: FAIL name='\(lastLookupVarName)' inFn='\(currentCheckFnName)'\n", stderr)
+                    fflush(stderr)
+                } else if case .enumVal("core::Option", 0, let val) = lastResult {
+                    let tyStr = val.displayString
+                    fputs("DBG_LOOKUP: FOUND name='\(lastLookupVarName)' ty=\(tyStr) inFn='\(currentCheckFnName)'\n", stderr)
+                    fflush(stderr)
+                }
+            }
             popCallFrame()
             if enableTrace { addTrace(calleeFnName, -1, .exitFunction, "result=\(lastResult.description)") }
 
@@ -641,7 +756,8 @@ public final class MIRInterpreter {
         while steps < maxSteps && !halted {
             steps += 1
             stepCount += 1
-            let blockId = callStack[callStack.count - 1].currentBlock
+            let frameIdx = callStack.count - 1
+            let blockId = callStack[frameIdx].currentBlock
 
             if stepCount >= nextProgressReportStep {
                 let message = "INTERPRETER_PROGRESS step=\(stepCount) fn=\(fn.name) block=\(blockId)"
@@ -658,13 +774,16 @@ public final class MIRInterpreter {
             if enableTrace { addTrace(fn.name, blockId, .enterBlock, "stmts=\(block.statements.count)") }
 
             // Execute statements
-            for (stmtIndex, stmt) in block.statements.enumerated() {
-                callStack[callStack.count - 1].stmtIndex = stmtIndex
-                executeStatement(stmt, fn: fn)
+            var stmtIndex = 0
+            let stmtCount = block.statements.count
+            while stmtIndex < stmtCount {
+                callStack[frameIdx].stmtIndex = stmtIndex
+                executeStatement(block.statements[stmtIndex], fn: fn)
+                stmtIndex += 1
             }
 
             // Execute terminator
-            callStack[callStack.count - 1].stmtIndex = block.statements.count
+            callStack[frameIdx].stmtIndex = stmtCount
             switch block.terminator {
             case .ret:
                 if enableTrace { addTrace(fn.name, blockId, .terminator, "return") }
@@ -672,7 +791,7 @@ public final class MIRInterpreter {
 
             case .goto(let target):
                 if enableTrace { addTrace(fn.name, blockId, .terminator, "goto bb\(target)") }
-                callStack[callStack.count - 1].currentBlock = target
+                callStack[frameIdx].currentBlock = target
 
             case .switchInt(let operand, let targets, let otherwise):
                 let val = evalOperand(operand)
@@ -681,7 +800,7 @@ public final class MIRInterpreter {
                     for (targetVal, targetBB) in targets {
                         if intVal == targetVal {
                             if enableTrace { addTrace(fn.name, blockId, .terminator, "switch \(intVal) -> bb\(targetBB)") }
-                            callStack[callStack.count - 1].currentBlock = targetBB
+                            callStack[frameIdx].currentBlock = targetBB
                             jumped = true
                             break
                         }
@@ -689,7 +808,7 @@ public final class MIRInterpreter {
                 }
                 if !jumped {
                     if enableTrace { addTrace(fn.name, blockId, .terminator, "switch otherwise -> bb\(otherwise)") }
-                    callStack[callStack.count - 1].currentBlock = otherwise
+                    callStack[frameIdx].currentBlock = otherwise
                 }
 
             case .call(let dest, let callee, let callArgs, let next, _):
@@ -710,12 +829,12 @@ public final class MIRInterpreter {
                     // Check if dispatchCall deferred a user-function call
                     if hasDeferredCall {
                         // Save continuation on current frame and return to trampoline
-                        callStack[callStack.count - 1].pendingDest = dest.local
-                        callStack[callStack.count - 1].pendingNext = next
-                        callStack[callStack.count - 1].pendingCalleeName = name
-                        callStack[callStack.count - 1].pendingCallOperands = callArgs
-                        callStack[callStack.count - 1].pendingArgVals = argVals
-                        callStack[callStack.count - 1].hasPending = true
+                        callStack[frameIdx].pendingDest = dest.local
+                        callStack[frameIdx].pendingNext = next
+                        callStack[frameIdx].pendingCalleeName = name
+                        callStack[frameIdx].pendingCallOperands = callArgs
+                        callStack[frameIdx].pendingArgVals = argVals
+                        callStack[frameIdx].hasPending = true
                         return .unit
                     }
                     // For mutating method calls, write result back to receiver
@@ -866,7 +985,8 @@ public final class MIRInterpreter {
             if place.projections.isEmpty {
                 setLocal(place.local, val)
                 if case .ref(.mutable, let borrowedPlace) = rvalue {
-                    callStack[callStack.count - 1].mutBorrows[place.local] = borrowedPlace
+                    let frameIdx = callStack.count - 1
+                    callStack[frameIdx].mutBorrows[place.local] = borrowedPlace
                 }
                 // Track field copies and downcast extractions for mutation propagation
                 if case .use(let operand) = rvalue {
@@ -876,13 +996,15 @@ public final class MIRInterpreter {
                     default: srcPlace = nil
                     }
                     if let sp = srcPlace {
+                        let frameIdx = callStack.count - 1
+                        var frame = callStack[frameIdx]
                         // Track downcast projections (e.g., Option::Some payload extraction)
                         if let lastProj = sp.projections.last,
                            case .downcast(let variantIdx) = lastProj {
-                            callStack[callStack.count - 1].downcastTracker[place.local] = (enumLocal: sp.local, variantIdx: variantIdx)
+                            frame.downcastTracker[place.local] = (enumLocal: sp.local, variantIdx: variantIdx)
                             // Also propagate get_mut tracking through downcast
-                            if let tracking = callStack[callStack.count - 1].mapMutOptions[sp.local] {
-                                callStack[callStack.count - 1].mapMutPayloads[place.local] = tracking
+                            if let tracking = frame.mapMutOptions[sp.local] {
+                                frame.mapMutPayloads[place.local] = tracking
                             }
                         }
                         // Track lvalue copies so mutating method results can write back through
@@ -896,20 +1018,21 @@ public final class MIRInterpreter {
                                    return false
                                }
                            }) {
-                            callStack[callStack.count - 1].fieldCopyTracker[place.local] = sp
+                            frame.fieldCopyTracker[place.local] = sp
                         }
                         // Propagate if source is already a tracked payload (copy/alias)
                         if sp.projections.isEmpty {
-                            if let tracking = callStack[callStack.count - 1].mapMutPayloads[sp.local] {
-                                callStack[callStack.count - 1].mapMutPayloads[place.local] = tracking
+                            if let tracking = frame.mapMutPayloads[sp.local] {
+                                frame.mapMutPayloads[place.local] = tracking
                             }
-                            if let tracking = callStack[callStack.count - 1].downcastTracker[sp.local] {
-                                callStack[callStack.count - 1].downcastTracker[place.local] = tracking
+                            if let tracking = frame.downcastTracker[sp.local] {
+                                frame.downcastTracker[place.local] = tracking
                             }
-                            if let tracking = callStack[callStack.count - 1].fieldCopyTracker[sp.local] {
-                                callStack[callStack.count - 1].fieldCopyTracker[place.local] = tracking
+                            if let tracking = frame.fieldCopyTracker[sp.local] {
+                                frame.fieldCopyTracker[place.local] = tracking
                             }
                         }
+                        callStack[frameIdx] = frame
                     }
                 }
                 if enableTrace { addTrace(fn.name, callStack.last!.currentBlock, .statement,
@@ -942,6 +1065,11 @@ public final class MIRInterpreter {
                 releaseNativeMaps(val)
             }
             localsStack[deadIdx] = .unit
+            // Keep per-frame tracking maps bounded by removing dead locals.
+            callStack[callStack.count - 1].mapMutPayloads.removeValue(forKey: id)
+            callStack[callStack.count - 1].fieldCopyTracker.removeValue(forKey: id)
+            callStack[callStack.count - 1].downcastTracker.removeValue(forKey: id)
+            callStack[callStack.count - 1].mutBorrows.removeValue(forKey: id)
             if enableTrace { addTrace(fn.name, callStack.last!.currentBlock, .statement, "StorageDead(_\(id))") }
 
         case .setDiscriminant(let place, let disc):
@@ -1285,6 +1413,7 @@ public final class MIRInterpreter {
                     return " elems=\(inner) count=\(elems.count)"
                 case .structVal(let n, let fs): return " struct=\(n) fields=\(fs.keys.sorted())"
                 case .enumVal(let n, let v, let inner): return " enum=\(n) variant=\(v) inner=\(valueKindName(inner))"
+                case .fn(let n): return " fn=\(n)"
                 default: return ""
                 }
             }()
@@ -1292,9 +1421,10 @@ public final class MIRInterpreter {
             let localsDump: String = {
                 guard let frame = callStack.last else { return "" }
                 let fn = program.functions[frame.functionIdx]
-                // Dump key locals around the failing area: 480-510 + 750-760
+                // Dump key locals around the failing area: low-numbered (params) + 480-520 + 745-760
                 var s = ""
-                let ranges: [(Int, Int)] = [(480, 520), (745, 760)]
+                // Always dump low locals 0..15 to see params
+                let ranges: [(Int, Int)] = [(0, 15), (480, 520), (745, 760)]
                 for (lo, hi) in ranges {
                     let lo2 = max(0, lo)
                     let hi2 = min(fn.locals.count, hi)
@@ -1520,6 +1650,8 @@ public final class MIRInterpreter {
         "read32_at", "write32_at", "write64_at",
         // String/intrinsic fast-paths
         "is_intrinsic", "bare_intrinsic_name", "canonical_fn_ref", "bare_name_from_qualified",
+        // Array helpers used by std::collections wrappers
+        "array_get", "collections::array_get", "std::collections::array_get", "__intrinsic_array_get",
         // Startup argv helpers
         "raw_arg_count", "raw_arg", "raw_arg_unchecked", "raw_arg_copy",
         "std::args::raw_arg_count", "std::args::raw_arg", "std::args::raw_arg_unchecked", "std::args::raw_arg_copy",
@@ -3257,6 +3389,14 @@ public final class MIRInterpreter {
         case "Vec::from", "Array::from", "__intrinsic_array_from_list", "array_from_list":
             if case .array = args.first { return args.first! }
             return args.first ?? .array([])
+        case "array_get", "collections::array_get", "std::collections::array_get", "__intrinsic_array_get":
+            if case .array(let elems) = args.first,
+               let idx = args.dropFirst().first?.asInt,
+               idx >= 0,
+               idx < elems.count {
+                return elems[idx]
+            }
+            return .unit
         case "Vec::filled":
             let n = args.first?.asInt ?? 0
             let val = args.count > 1 ? args[1] : .unit
@@ -3345,9 +3485,39 @@ public final class MIRInterpreter {
                let s = f["start"]?.asInt, let e = f["end"]?.asInt {
                 return .int(max(0, e - s + 1))
             }
+            // DBG: trace Vec.len when called from get_type_def_by_name
+            let isGTDBN = callStack.last.map({ program.functions[$0.functionIdx].name == "types::get_type_def_by_name" }) ?? false
+            if isGTDBN, case .array(let elems) = args.first {
+                fputs("DBG_GTDBN: type_list.len() = \(elems.count)\n", stderr)
+                fflush(stderr)
+            }
+            // DBG: detect .len fallthrough during type checking
+            if callStack.last.map({ program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("type_check") }) ?? false {
+                let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
+                let valKind = valueKindName(args.first ?? .unit)
+                if case .structVal(let sn, let fields) = args.first ?? .unit {
+                    fputs("DBG_LEN: fn=\(fnName) struct=\(sn) fields=[\(fields.keys.joined(separator: ","))]\n", stderr)
+                } else {
+                    fputs("DBG_LEN: fn=\(fnName) kind=\(valKind)\n", stderr)
+                }
+                fflush(stderr)
+            }
             return .int(0)
         case ".get":
             if case .array(let elems) = args.first, let idx = args.dropFirst().first?.asInt {
+                // DBG: trace Vec.get when called from get_type_def_by_name
+                let isGTDBN = callStack.last.map({ program.functions[$0.functionIdx].name == "types::get_type_def_by_name" }) ?? false
+                if isGTDBN && idx >= 0 && idx < elems.count {
+                    let elemDesc: String
+                    if case .structVal(let sn, let fields) = elems[idx] {
+                        let nameField = fields["name"]?.displayString ?? "?"
+                        elemDesc = "struct \(sn)(name=\(nameField))"
+                    } else {
+                        elemDesc = elems[idx].displayString
+                    }
+                    fputs("DBG_GTDBN: Vec.get(\(idx)) = \(elemDesc) (vecSize=\(elems.count))\n", stderr)
+                    fflush(stderr)
+                }
                 if idx >= 0 && idx < elems.count {
                     return .enumVal("Option", 0, elems[idx])
                 }
@@ -3355,6 +3525,15 @@ public final class MIRInterpreter {
             // Native Map.get(key)
             if let nm = getNativeMap(args.first ?? .unit) {
                 let key = args.count > 1 ? args[1] : .unit
+                let isTypeCheck = callStack.last.map({ program.functions[$0.functionIdx].name.contains("type_check") || program.functions[$0.functionIdx].name.contains("bind_var") || program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("check_item") || program.functions[$0.functionIdx].name.contains("lookup_var") }) ?? false
+                if isTypeCheck {
+                    let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
+                    let keyStr = key.displayString
+                    let found = nm.get(key) != nil
+                    let mapCount = nm.count
+                    fputs("DBG_GET: fn=\(fnName) key='\(keyStr)' found=\(found) mapSize=\(mapCount) _nid=\(args.first.flatMap { v in if case .structVal("Map", let f) = v, case .int(let nid)? = f["_nid"] { return nid } else { return nil } } ?? -1)\n", stderr)
+                    fflush(stderr)
+                }
                 if let val = nm.get(key) { return .enumVal("Option", 0, val) }
                 return .enumVal("Option", 1, .unit)
             }
@@ -3676,6 +3855,15 @@ public final class MIRInterpreter {
         case ".insert":
             // Native Map.insert(key, value)
             if let nm = getNativeMap(args.first ?? .unit), args.count >= 3 {
+                let isTypeCheck = callStack.last.map({ program.functions[$0.functionIdx].name.contains("type_check") || program.functions[$0.functionIdx].name.contains("bind_var") || program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("check_item") || program.functions[$0.functionIdx].name.contains("lookup_var") }) ?? false
+                if isTypeCheck {
+                    let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
+                    let keyStr = args[1].displayString
+                    let valStr = args[2].displayString
+                    let mapCount = nm.count
+                    fputs("DBG_INSERT: fn=\(fnName) key='\(keyStr)' val='\(valStr)' mapSizeBefore=\(mapCount) _nid=\(args.first.flatMap { v in if case .structVal("Map", let f) = v, case .int(let nid)? = f["_nid"] { return nid } else { return nil } } ?? -1)\n", stderr)
+                    fflush(stderr)
+                }
                 nm.insert(args[1], args[2])
                 return args.first!
             }

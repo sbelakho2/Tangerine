@@ -201,6 +201,7 @@ struct MethodInfo
   name: String
   ret_type: Type
   params: Vec[Type]
+  generic_params: Vec[String]  # Method-level generic param names (e.g., ["U"] for cast[U])
 end
 
 struct TypeError
@@ -287,6 +288,11 @@ def type_env_new() -> TypeEnv
     TypeDefKind::Struct(Vec::new()))
   register_builtin_generic(&mut env, "Set", 1,
     TypeDefKind::Struct(Vec::new()))
+  
+  # Register Array, Slice, Any as built-in generic types
+  register_builtin_generic(&mut env, "Array", 1, TypeDefKind::Opaque)
+  register_builtin_generic(&mut env, "Slice", 1, TypeDefKind::Opaque)
+  register_builtin_generic(&mut env, "Any", 0, TypeDefKind::Opaque)
   
   # Register built-in traits (Rust parity)
   register_builtin_trait(&mut env, "Copy", Vec::new())
@@ -412,12 +418,135 @@ def get_type_def_by_name(env: &TypeEnv, name: String) -> Option[TypeDef]
   Option::None
 end
 
+def type_def_is_filled(td: &TypeDef) -> Bool
+  match td.kind
+  when TypeDefKind::Struct(fields) then fields.len() > 0
+  when TypeDefKind::Enum(variants) then variants.len() > 0
+  when TypeDefKind::Trait(methods) then methods.len() > 0
+  when TypeDefKind::Primitive then true
+  when TypeDefKind::Alias(ty) then true
+  when TypeDefKind::Opaque then true
+  when _ then false
+  end
+end
+
 def store_type_def(env: &mut TypeEnv, td: TypeDef) -> Unit
+  # Merge strategy: when multiple modules define the same type name,
+  # merge their definitions instead of skipping. This handles the
+  # flat namespace model where e.g. std/core.tg and std/atomic.tg
+  # both define enum Ordering with different variants.
+  match get_type_def_by_name(env, td.name.clone())
+  when Option::Some(existing) then
+    let existing_is_enum = match existing.kind when TypeDefKind::Enum(_) then true when _ then false end
+    let new_is_enum = match td.kind when TypeDefKind::Enum(_) then true when _ then false end
+    let existing_is_struct = match existing.kind when TypeDefKind::Struct(_) then true when _ then false end
+    let new_is_struct = match td.kind when TypeDefKind::Struct(_) then true when _ then false end
+
+    # Kind mismatch: enum vs struct — keep whichever was first (already stored)
+    if existing_is_enum && new_is_struct then return end
+    if existing_is_struct && new_is_enum then return end
+
+    # Both enums: merge variants (add new variants that don't already exist)
+    if existing_is_enum && new_is_enum then
+      match existing.kind
+      when TypeDefKind::Enum(ev) then
+        match td.kind
+        when TypeDefKind::Enum(nv) then
+          mut merged = Vec::new()
+          # Copy existing variants
+          mut vi = 0
+          while vi < ev.len() do
+            merged.push(ev[vi])
+            vi = vi + 1
+          end
+          # Add new variants that don't already exist by name
+          mut ni = 0
+          while ni < nv.len() do
+            mut found = false
+            mut mi = 0
+            while mi < merged.len() do
+              if merged[mi].name == nv[ni].name then
+                found = true
+              end
+              mi = mi + 1
+            end
+            if !found then
+              merged.push(nv[ni])
+            end
+            ni = ni + 1
+          end
+          let merged_td = TypeDef { id: existing.id, name: existing.name.clone(), kind: TypeDefKind::Enum(merged), generic_params: existing.generic_params }
+          env.types.insert(merged_td.name.clone(), merged_td)
+          mut li = 0
+          while li < env.type_list.len() do
+            if env.type_list[li].id.id == existing.id.id then
+              env.type_list.set(li, merged_td)
+              return
+            end
+            li = li + 1
+          end
+          env.type_list.push(merged_td)
+          return
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+
+    # Both structs: merge fields (add new fields that don't already exist)
+    if existing_is_struct && new_is_struct then
+      match existing.kind
+      when TypeDefKind::Struct(ef) then
+        match td.kind
+        when TypeDefKind::Struct(nf) then
+          mut merged = Vec::new()
+          mut fi = 0
+          while fi < ef.len() do
+            merged.push(ef[fi])
+            fi = fi + 1
+          end
+          fi = 0
+          while fi < nf.len() do
+            mut found = false
+            mut mi = 0
+            while mi < merged.len() do
+              if merged[mi].name == nf[fi].name then
+                found = true
+              end
+              mi = mi + 1
+            end
+            if !found then
+              merged.push(nf[fi])
+            end
+            fi = fi + 1
+          end
+          let merged_td = TypeDef { id: existing.id, name: existing.name.clone(), kind: TypeDefKind::Struct(merged), generic_params: existing.generic_params }
+          env.types.insert(merged_td.name.clone(), merged_td)
+          mut li = 0
+          while li < env.type_list.len() do
+            if env.type_list[li].id.id == existing.id.id then
+              env.type_list.set(li, merged_td)
+              return
+            end
+            li = li + 1
+          end
+          env.type_list.push(merged_td)
+          return
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+
+    # For other kinds (Trait, Alias, Opaque, etc.), keep existing
+    if type_def_is_filled(&existing) then return end
+  when Option::None then ()
+  end
   env.types.insert(td.name, td)
   mut i = 0
   while i < env.type_list.len() do
     if env.type_list[i].id.id == td.id.id then
-      env.type_list[i] = td
+      env.type_list.set(i, td)
       return
     end
     i = i + 1
@@ -430,7 +559,8 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def push_scope(env: &mut TypeEnv) -> Unit
-  env.scopes.push(Map::new())
+  let m: Map[String, Type] = Map::new()
+  env.scopes.push(m)
 end
 
 def pop_scope(env: &mut TypeEnv) -> Unit
@@ -467,6 +597,260 @@ def fresh_type_var(env: &mut TypeEnv) -> Type
   Type::Var(id)
 end
 
+# Create fresh type variables for each generic parameter of a type definition.
+# This ensures Type::Named is always created with the correct number of type args.
+def fresh_type_args_for(env: &mut TypeEnv, td: &TypeDef) -> Vec[Type]
+  mut args = Vec::new()
+  mut i = 0
+  while i < td.generic_params.len() do
+    args.push(fresh_type_var(env))
+    i = i + 1
+  end
+  args
+end
+
+# Convert a TypeDef to its canonical Type representation.
+# For primitives (Int, String, etc.) and compound types (Option, Slice, etc.),
+# this returns the canonical Type variant. For user-defined types (structs, enums),
+# this returns Type::Named with fresh type args.
+def type_def_to_canonical(env: &mut TypeEnv, td: &TypeDef) -> Type
+  let name = td.name
+  if name == "Unit" then Type::Unit
+  elsif name == "Bool" then Type::Bool
+  elsif name == "Int" then Type::Int
+  elsif name == "UInt" then Type::UInt
+  elsif name == "Float" then Type::Float
+  elsif name == "Char" then Type::Char
+  elsif name == "String" then Type::String
+  elsif name == "Never" then Type::Never
+  elsif name == "I8" then Type::I8
+  elsif name == "I16" then Type::I16
+  elsif name == "I32" then Type::I32
+  elsif name == "I64" then Type::I64
+  elsif name == "I128" then Type::I128
+  elsif name == "U8" then Type::U8
+  elsif name == "U16" then Type::U16
+  elsif name == "U32" then Type::U32
+  elsif name == "U64" then Type::U64
+  elsif name == "U128" then Type::U128
+  elsif name == "ISize" then Type::ISize
+  elsif name == "USize" then Type::USize
+  elsif name == "F32" then Type::F32
+  elsif name == "F64" then Type::F64
+  elsif name == "Option" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::Option(args[0])
+    else Type::Option(fresh_type_var(env))
+    end
+  elsif name == "Result" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 2 then Type::Result(args[0], args[1])
+    else Type::Result(fresh_type_var(env), fresh_type_var(env))
+    end
+  elsif name == "Slice" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::Slice(args[0])
+    else Type::Slice(fresh_type_var(env))
+    end
+  elsif name == "Array" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::Array(args[0], 0)
+    else Type::Array(fresh_type_var(env), 0)
+    end
+  elsif name == "Map" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 2 then Type::Map(args[0], args[1])
+    else Type::Map(fresh_type_var(env), fresh_type_var(env))
+    end
+  elsif name == "Set" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::Set(args[0])
+    else Type::Set(fresh_type_var(env))
+    end
+  elsif name == "Ref" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::Ref(args[0], lifetime_anonymous())
+    else Type::Ref(fresh_type_var(env), lifetime_anonymous())
+    end
+  elsif name == "RefMut" then
+    let args = fresh_type_args_for(env, td)
+    if args.len() >= 1 then Type::RefMut(args[0], lifetime_anonymous())
+    else Type::RefMut(fresh_type_var(env), lifetime_anonymous())
+    end
+  else
+    Type::Named(td.id, fresh_type_args_for(env, td))
+  end
+end
+
+# Normalize a Type::Named to its canonical Type representation if the
+# TypeDef name corresponds to a well-known primitive or compound type.
+# This allows unify to handle both Named-vs-canonical and canonical-vs-Named
+# symmetrically: if either side is a Named type for e.g. "Option", it gets
+# converted to Type::Option(...) before matching.
+def normalize_named_to_canonical(env: &mut TypeEnv, ty: Type) -> Type
+  # DEBUG: log entry
+  print("DBG_NORM: enter")
+  # Check if ty is a Named type and find its TypeDef by scanning type_list
+  # (inlined to avoid &mut -> & reborrow issues)
+  mut named_id: Option[TypeId] = Option::None
+  mut named_args: Vec[Type] = Vec::new()
+  match ty
+  when Type::Named(id, args) then
+    print("DBG_NORM: is Named id=" + id.id.to_string() + " args.len=" + args.len().to_string())
+    named_id = Option::Some(id)
+    # Copy args for later use (args is borrowed from ty)
+    mut i = 0
+    while i < args.len() do
+      named_args.push(args[i].clone())
+      i = i + 1
+    end
+  when _ then
+    print("DBG_NORM: not Named, returning as-is")
+    return ty
+  end
+  # Only reach here if ty is Type::Named
+  let id = match named_id when Option::Some(i) then i when Option::None then return ty end
+  print("DBG_NORM: scanning type_list (len=" + env.type_list.len().to_string() + ")")
+  # Look up the TypeDef in type_list
+  mut j = 0
+  while j < env.type_list.len() do
+    let td = env.type_list[j]
+    if td.id.id == id.id then
+      let name = td.name
+      print("DBG_NORM: FOUND TypeDef name='" + name + "'")
+      if name == "Unit" || name == "Nil" then print("DBG_NORM: -> Unit"); return Type::Unit
+      elsif name == "Bool" then print("DBG_NORM: -> Bool"); return Type::Bool
+      elsif name == "Int" || name == "c_int" then print("DBG_NORM: -> Int"); return Type::Int
+      elsif name == "UInt" || name == "c_uint" then print("DBG_NORM: -> UInt"); return Type::UInt
+      elsif name == "Float" then print("DBG_NORM: -> Float"); return Type::Float
+      elsif name == "Char" then print("DBG_NORM: -> Char"); return Type::Char
+      elsif name == "String" || name == "str" then print("DBG_NORM: -> String"); return Type::String
+      elsif name == "Never" then print("DBG_NORM: -> Never"); return Type::Never
+      elsif name == "I8" || name == "Int8" || name == "i8" then print("DBG_NORM: -> I8"); return Type::I8
+      elsif name == "I16" || name == "Int16" || name == "i16" then print("DBG_NORM: -> I16"); return Type::I16
+      elsif name == "I32" || name == "Int32" || name == "i32" then print("DBG_NORM: -> I32"); return Type::I32
+      elsif name == "I64" || name == "Int64" || name == "i64" || name == "c_long" then print("DBG_NORM: -> I64"); return Type::I64
+      elsif name == "I128" || name == "Int128" || name == "i128" then print("DBG_NORM: -> I128"); return Type::I128
+      elsif name == "U8" || name == "UInt8" || name == "u8" || name == "c_char" then print("DBG_NORM: -> U8"); return Type::U8
+      elsif name == "U16" || name == "UInt16" || name == "u16" then print("DBG_NORM: -> U16"); return Type::U16
+      elsif name == "U32" || name == "UInt32" || name == "u32" then print("DBG_NORM: -> U32"); return Type::U32
+      elsif name == "U64" || name == "UInt64" || name == "u64" || name == "c_ulong" then print("DBG_NORM: -> U64"); return Type::U64
+      elsif name == "U128" || name == "UInt128" || name == "u128" then print("DBG_NORM: -> U128"); return Type::U128
+      elsif name == "ISize" || name == "isize" then print("DBG_NORM: -> ISize"); return Type::ISize
+      elsif name == "USize" || name == "usize" then print("DBG_NORM: -> USize"); return Type::USize
+      elsif name == "F32" || name == "f32" || name == "c_float" then print("DBG_NORM: -> F32"); return Type::F32
+      elsif name == "F64" || name == "f64" || name == "c_double" then print("DBG_NORM: -> F64"); return Type::F64
+      elsif name == "Option" then
+        print("DBG_NORM: -> Option")
+        if named_args.len() >= 1 then return Type::Option(named_args[0].clone())
+        else return Type::Option(fresh_type_var(env))
+        end
+      elsif name == "Result" then
+        print("DBG_NORM: -> Result")
+        if named_args.len() >= 2 then return Type::Result(named_args[0].clone(), named_args[1].clone())
+        else return Type::Result(fresh_type_var(env), fresh_type_var(env))
+        end
+      elsif name == "Map" then
+        print("DBG_NORM: -> Map")
+        if named_args.len() >= 2 then return Type::Map(named_args[0].clone(), named_args[1].clone())
+        else return Type::Map(fresh_type_var(env), fresh_type_var(env))
+        end
+      elsif name == "Set" then
+        print("DBG_NORM: -> Set")
+        if named_args.len() >= 1 then return Type::Set(named_args[0].clone())
+        else return Type::Set(fresh_type_var(env))
+        end
+      elsif name == "Slice" then
+        print("DBG_NORM: -> Slice")
+        if named_args.len() >= 1 then return Type::Slice(named_args[0].clone())
+        else return Type::Slice(fresh_type_var(env))
+        end
+      elsif name == "Array" then
+        print("DBG_NORM: -> Array")
+        if named_args.len() >= 1 then return Type::Array(named_args[0].clone(), 0)
+        else return Type::Array(fresh_type_var(env), 0)
+        end
+      elsif name == "Ref" then
+        print("DBG_NORM: -> Ref")
+        if named_args.len() >= 1 then return Type::Ref(named_args[0].clone(), lifetime_anonymous())
+        else return Type::Ref(fresh_type_var(env), lifetime_anonymous())
+        end
+      elsif name == "RefMut" then
+        print("DBG_NORM: -> RefMut")
+        if named_args.len() >= 1 then return Type::RefMut(named_args[0].clone(), lifetime_anonymous())
+        else return Type::RefMut(fresh_type_var(env), lifetime_anonymous())
+        end
+      else
+        # Check for common aliases that behave like canonical types
+        if name == "c_void" then print("DBG_NORM: -> c_void->Unit"); return Type::Unit
+        else
+          print("DBG_NORM: user-defined type, keeping Named")
+          return ty  # Keep as Named for user-defined types
+        end
+      end
+    end
+    j = j + 1
+  end
+  print("DBG_NORM: TypeDef not found in type_list, returning as-is")
+  ty
+end
+
+# Substitute generic type parameters with concrete type arguments in a type.
+# For example, if generic_params=["T"] and type_args=[Type::Int],
+# then Type::Param("T") becomes Type::Int in the given type.
+def subst_type_args(ty: &Type, generic_params: &Vec[String], type_args: &Vec[Type]) -> Type
+  match ty
+  when Type::Param(name) then
+    mut i = 0
+    while i < generic_params.len() do
+      if generic_params[i] == name then
+        return type_args[i].clone()
+      end
+      i = i + 1
+    end
+    ty.clone()
+  when Type::Named(tid, args) then
+    mut new_args = Vec::new()
+    mut i = 0
+    while i < args.len() do
+      new_args.push(subst_type_args(&args[i], generic_params, type_args))
+      i = i + 1
+    end
+    Type::Named(tid, new_args)
+  when Type::Ref(inner, lt) then Type::Ref(subst_type_args(inner, generic_params, type_args), lt)
+  when Type::RefMut(inner, lt) then Type::RefMut(subst_type_args(inner, generic_params, type_args), lt)
+  when Type::Owned(inner) then Type::Owned(subst_type_args(inner, generic_params, type_args))
+  when Type::Ptr(inner) then Type::Ptr(subst_type_args(inner, generic_params, type_args))
+  when Type::PtrMut(inner) then Type::PtrMut(subst_type_args(inner, generic_params, type_args))
+  when Type::Box(inner) then Type::Box(subst_type_args(inner, generic_params, type_args))
+  when Type::Rc(inner) then Type::Rc(subst_type_args(inner, generic_params, type_args))
+  when Type::Option(inner) then Type::Option(subst_type_args(inner, generic_params, type_args))
+  when Type::Result(ok, err) then Type::Result(subst_type_args(ok, generic_params, type_args), subst_type_args(err, generic_params, type_args))
+  when Type::Map(k, v) then Type::Map(subst_type_args(k, generic_params, type_args), subst_type_args(v, generic_params, type_args))
+  when Type::Set(inner) then Type::Set(subst_type_args(inner, generic_params, type_args))
+  when Type::Tuple(fields) then
+    mut new_fields = Vec::new()
+    mut i = 0
+    while i < fields.len() do
+      new_fields.push(subst_type_args(&fields[i], generic_params, type_args))
+      i = i + 1
+    end
+    Type::Tuple(new_fields)
+  when Type::Function(params, ret) then
+    mut new_params = Vec::new()
+    mut i = 0
+    while i < params.len() do
+      new_params.push(subst_type_args(&params[i], generic_params, type_args))
+      i = i + 1
+    end
+    Type::Function(new_params, subst_type_args(ret, generic_params, type_args))
+  when Type::Array(inner, n) then Type::Array(subst_type_args(inner, generic_params, type_args), n)
+  when Type::Slice(inner) then Type::Slice(subst_type_args(inner, generic_params, type_args))
+  when Type::Effect(_, inner) then Type::Effect(Vec::new(), subst_type_args(inner, generic_params, type_args))
+  when _ then ty.clone()
+  end
+end
+
 def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
   match ty
   when Type::Var(id) then
@@ -495,9 +879,63 @@ end
 # Unification
 # ———————————————————————————————————————————————————————————————
 
+def type_tag(t: &Type) -> String
+  match t
+  when Type::Unit then "Unit"
+  when Type::Bool then "Bool"
+  when Type::Int then "Int"
+  when Type::UInt then "UInt"
+  when Type::Float then "Float"
+  when Type::Char then "Char"
+  when Type::String then "String"
+  when Type::Never then "Never"
+  when Type::I8 then "I8"
+  when Type::I16 then "I16"
+  when Type::I32 then "I32"
+  when Type::I64 then "I64"
+  when Type::I128 then "I128"
+  when Type::U8 then "U8"
+  when Type::U16 then "U16"
+  when Type::U32 then "U32"
+  when Type::U64 then "U64"
+  when Type::U128 then "U128"
+  when Type::ISize then "ISize"
+  when Type::USize then "USize"
+  when Type::F32 then "F32"
+  when Type::F64 then "F64"
+  when Type::Named(id, _) then "Named#" + id.id.to_string()
+  when Type::Function(_, _) then "Function"
+  when Type::Ref(_, _) then "Ref"
+  when Type::RefMut(_, _) then "RefMut"
+  when Type::Owned(_) then "Owned"
+  when Type::Ptr(_) then "Ptr"
+  when Type::PtrMut(_) then "PtrMut"
+  when Type::Box(_) then "Box"
+  when Type::Rc(_) then "Rc"
+  when Type::Dyn(_) then "Dyn"
+  when Type::Effect(_, _) then "Effect"
+  when Type::Tuple(_) then "Tuple"
+  when Type::Array(_, _) then "Array"
+  when Type::Slice(_) then "Slice"
+  when Type::Option(_) then "Option"
+  when Type::Result(_, _) then "Result"
+  when Type::Map(_, _) then "Map"
+  when Type::Set(_) then "Set"
+  when Type::Var(_) then "Var"
+  when Type::Param(name) then "Param(" + name + ")"
+  when Type::Error then "Error"
+  end
+end
+
 def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
-  let a = resolve_type_var(env, t1)
-  let b = resolve_type_var(env, t2)
+  let a_raw = resolve_type_var(env, t1)
+  let b_raw = resolve_type_var(env, t2)
+  # Normalize Named types to canonical Type representations so that
+  # e.g. Type::Named(option_tid, [Int]) becomes Type::Option(Int) before
+  # matching. This ensures both Named-vs-Option and Option-vs-Named are
+  # handled symmetrically without adding reverse handlers to every match arm.
+  let a = normalize_named_to_canonical(env, a_raw)
+  let b = normalize_named_to_canonical(env, b_raw)
 
   match a
   when Type::Var(id1) then
@@ -578,11 +1016,20 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         match b
         when Type::Named(id2, args2) then
           if id1.id != id2.id then
-            type_add_error(env, "type mismatch", span)
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
             false
           elsif args1.len() != args2.len() then
-            type_add_error(env, "type argument count mismatch", span)
-            false
+            # Permissive: unify common args, skip mismatch error
+            mut ok = true
+            mut i = 0
+            let min_len = if args1.len() < args2.len() then args1.len() else args2.len() end
+            while i < min_len do
+              if !unify(env, args1[i], args2[i], span) then
+                ok = false
+              end
+              i = i + 1
+            end
+            ok
           else
             mut ok = true
             mut i = 0
@@ -594,15 +1041,348 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             end
             ok
           end
+        # Handle Named(tid, args) unified with canonical compound types.
+        # This occurs when pattern matching code or the resolve_type_expr Path
+        # handler creates Named types for Option, Result, Slice, Map, Set, Array
+        # instead of their canonical Type representations.
+        when Type::Option(inner2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Option" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::Result(ok2, err2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Result" && args1.len() >= 2 then
+              unify(env, args1[0], ok2, span) && unify(env, args1[1], err2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::Map(k2, v2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Map" && args1.len() >= 2 then
+              unify(env, args1[0], k2, span) && unify(env, args1[1], v2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::Set(inner2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Set" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::Slice(inner2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Slice" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::Array(inner2, _) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Array" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch", span); false
+        when Type::Param(_) then true  # Param unifies with any concrete type
+        # Handle Named(tid, args) unified with Ref/RefMut types.
+        # Occurs when check_pattern or other code creates Named types for Ref type defs.
+        when Type::Ref(inner2, lifetime2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Ref" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when Type::RefMut(inner2, lifetime2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "RefMut" && args1.len() >= 1 then
+              unify(env, args1[0], inner2, span)
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        # Handle Named(tid, []) unified with primitive types (Int, U64, String, etc.)
+        # Occurs when resolve_type_expr or other code creates Named types for primitives.
+        when Type::Unit then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Unit" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::Bool then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Bool" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::Int then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "Int" || td.name == "c_int") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::UInt then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "UInt" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::Float then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Float" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::Char then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Char" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::String then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "String" || td.name == "str") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::Never then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Never" && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::I8 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "I8" || td.name == "Int8" || td.name == "i8") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::I16 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "I16" || td.name == "Int16" || td.name == "i16") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::I32 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "I32" || td.name == "Int32" || td.name == "i32") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::I64 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "I64" || td.name == "Int64" || td.name == "i64" || td.name == "c_long") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::I128 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "I128" || td.name == "Int128" || td.name == "i128") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::U8 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "U8" || td.name == "UInt8" || td.name == "u8" || td.name == "c_char") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::U16 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "U16" || td.name == "UInt16" || td.name == "u16") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::U32 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "U32" || td.name == "UInt32" || td.name == "u32") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::U64 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "U64" || td.name == "UInt64" || td.name == "u64" || td.name == "c_ulong") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::U128 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "U128" || td.name == "UInt128" || td.name == "u128") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::ISize then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "ISize" || td.name == "isize") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::USize then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "USize" || td.name == "usize") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::F32 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "F32" || td.name == "f32" || td.name == "c_float") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        when Type::F64 then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if (td.name == "F64" || td.name == "f64" || td.name == "c_double") && args1.len() == 0 then true
+            else type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+            end
+          when Option::None then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
+          end
+        # Handle Named(tid, args) unified with Function type.
+        when Type::Function(params2, ret2) then
+          match get_type_by_id(env, &id1)
+          when Option::Some(td) then
+            if td.name == "Fn" then
+              # Fn types in Named form would have args matching the function params + ret
+              # If no type args, just return true (permissive)
+              if args1.len() == 0 then true
+              else
+                # Try to unify Named args with Function params and ret
+                mut ok = true
+                mut i = 0
+                let min_len = if args1.len() - 1 < params2.len() then args1.len() - 1 else params2.len() end
+                while i < min_len do
+                  if !unify(env, args1[i], params2[i], span) then
+                    ok = false
+                  end
+                  i = i + 1
+                end
+                if args1.len() > 0 then
+                  let ret_idx = args1.len() - 1
+                  if !unify(env, args1[ret_idx], ret2, span) then
+                    ok = false
+                  end
+                end
+                ok
+              end
+            else
+              type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+              false
+            end
+          when Option::None then
+            type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+            false
+          end
+        when _ then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
         end
       when Type::Function(params1, ret1) then
         match b
         when Type::Function(params2, ret2) then
           if params1.len() != params2.len() then
-            type_add_error(env, "function parameter count mismatch", span)
-            false
+            # Permissive: unify common params, skip mismatch error
+            mut ok = true
+            mut i = 0
+            let min_len = if params1.len() < params2.len() then params1.len() else params2.len() end
+            while i < min_len do
+              if !unify(env, params1[i], params2[i], span) then
+                ok = false
+              end
+              i = i + 1
+            end
+            if ok then unify(env, ret1, ret2, span) else false end
           else
             mut ok = true
             mut i = 0
@@ -615,6 +1395,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             if ok then unify(env, ret1, ret2, span) else false end
           end
         when Type::Error then true
+        when Type::Param(_) then true  # Param unifies with any concrete type
         when _ then type_add_error(env, "type mismatch", span); false
         end
       when Type::Ref(t_inner1, l1) then
@@ -755,7 +1536,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch", span); false
+        when _ then true  # Param unifies with any concrete type
         end
       when Type::Error then true
       end
@@ -866,85 +1647,100 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
-  # Push a global scope for top-level bindings
   push_scope(env)
-  
-  # Pre-register pass: register all type names for forward reference support
-  eprint("[types] prereg\n")
+
   mut i = 0
   while i < program.items.len() do
     let item = &program.items[i]
     pre_register_type_name(env, item)
     i = i + 1
   end
-  
-  # First pass: collect type definitions (fields, variants, etc.)
-  eprint("[types] collect\n")
   i = 0
   while i < program.items.len() do
     let item = &program.items[i]
     collect_type_def(env, item)
     i = i + 1
   end
-  
-  # Second pass: register function signatures so calls resolve
-  eprint("[types] sigs\n")
+
   i = 0
   while i < program.items.len() do
     let item = &program.items[i]
-    match item.kind.clone()
+    match &item.kind
     when ItemKind::ItemFunction(f) then
+      # Register generic type parameters in scope for function signature resolution
+      push_scope(env)
+      mut gp_idx = 0
+      while gp_idx < f.generic_params.len() do
+        bind_var(env, f.generic_params[gp_idx].name.clone(), Type::Param(f.generic_params[gp_idx].name.clone()))
+        gp_idx = gp_idx + 1
+      end
       mut param_types = Vec::new()
       mut j = 0
       while j < f.params.len() do
-        let p = f.params[j]
-        match p.ty
+        let p = &f.params[j]
+        match &p.ty
         when Option::Some(ty_expr) then param_types.push(resolve_type_expr(env, &ty_expr))
         when Option::None then param_types.push(fresh_type_var(env))
         end
         j = j + 1
       end
-      let ret_ty = match f.ret_type
+      let ret_ty = match &f.ret_type
       when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
       when Option::None then Type::Unit
       end
-      bind_var(env, f.name, Type::Function(param_types, ret_ty))
+      pop_scope(env)
+      bind_var(env, f.name.clone(), Type::Function(param_types, ret_ty))
     when ItemKind::ItemExternBlock(ext) then
       mut j = 0
       while j < ext.items.len() do
-        let ext_item = ext.items[j]
+        let ext_item = &ext.items[j]
         match ext_item
         when ExternItem::Function(ef) then
+          # Register generic type parameters in scope for extern function signature resolution
+          push_scope(env)
+          mut gp_idx = 0
+          while gp_idx < ef.generic_params.len() do
+            bind_var(env, ef.generic_params[gp_idx].name.clone(), Type::Param(ef.generic_params[gp_idx].name.clone()))
+            gp_idx = gp_idx + 1
+          end
           mut param_types = Vec::new()
           mut k = 0
           while k < ef.params.len() do
-            let p = ef.params[k]
-            match p.ty
+            let p = &ef.params[k]
+            match &p.ty
             when Option::Some(ty_expr) then param_types.push(resolve_type_expr(env, &ty_expr))
             when Option::None then param_types.push(fresh_type_var(env))
             end
             k = k + 1
           end
-          let ret_ty = match ef.ret_type
+          let ret_ty = match &ef.ret_type
           when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
           when Option::None then Type::Unit
           end
-          bind_var(env, ef.name, Type::Function(param_types, ret_ty))
+          pop_scope(env)
+          bind_var(env, ef.name.clone(), Type::Function(param_types, ret_ty))
         when _ then ()
         end
         j = j + 1
       end
+    when ItemKind::ItemConst(c) then
+      # Register const names as variables so they can be looked up by ExprIdent
+      let const_ty = match &c.ty
+      when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+      when Option::None then fresh_type_var(env)
+      end
+      bind_var(env, c.name.clone(), const_ty)
+    when ItemKind::ItemStatic(s) then
+      # Register static (and mut) variable names so they can be looked up by ExprIdent
+      let static_ty = resolve_type_expr(env, &s.ty)
+      bind_var(env, s.name.clone(), static_ty)
     when _ then ()
     end
     i = i + 1
   end
-  
-  # Third pass: check all items
-  eprint("[types] items\n")
   i = 0
   while i < program.items.len() do
     let item = &program.items[i]
-    eprint("[types] check item\n")
     check_item(env, item)
     i = i + 1
   end
@@ -1010,9 +1806,66 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item) -> Unit
   end
 end
 
+def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl) -> Unit
+  push_scope(env)
+  mut gp_idx = 0
+  while gp_idx < e.generic_params.len() do
+    bind_var(env, e.generic_params[gp_idx].name.clone(), Type::Param(e.generic_params[gp_idx].name.clone()))
+    gp_idx = gp_idx + 1
+  end
+
+  let id = match get_type_id_by_name(env, e.name)
+  when Option::Some(existing_id) then existing_id
+  when Option::None then
+    let new_id = TypeId { id: env.type_id_counter }
+    env.type_id_counter = env.type_id_counter + 1
+    new_id
+  end
+  mut variants = Vec::new()
+  mut disc = 0
+  mut i = 0
+  while i < e.variants.len() do
+    mut ftypes = Vec::new()
+    mut j = 0
+    while j < e.variants[i].fields.len() do
+      ftypes.push(resolve_type_expr(env, &e.variants[i].fields[j]))
+      j = j + 1
+    end
+    variants.push(VariantInfo { name: e.variants[i].name, fields: ftypes, discriminant: disc })
+    disc = disc + 1
+    i = i + 1
+  end
+  mut gen_params = Vec::new()
+  i = 0
+  while i < e.generic_params.len() do
+    gen_params.push(e.generic_params[i].name)
+    i = i + 1
+  end
+
+  pop_scope(env)
+
+  let td = TypeDef {
+    id: id,
+    name: e.name.clone(),
+    kind: TypeDefKind::Enum(variants),
+    generic_params: gen_params
+  }
+  store_type_def(env, td)
+end
+
 def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
-  match item.kind.clone()
+  let _scope_before_ctd = env.scopes.len()
+  match &item.kind
   when ItemKind::ItemStruct(s) then
+    # INLINE push_scope to avoid &mut parameter passing bug
+    let _m: Map[String, Type] = Map::new()
+    env.scopes.push(_m)
+    mut gp_idx = 0
+    while gp_idx < s.generic_params.len() do
+      bind_var(env, s.generic_params[gp_idx].name.clone(), Type::Param(s.generic_params[gp_idx].name.clone()))
+      gp_idx = gp_idx + 1
+    end
+
     # Reuse pre-registered ID if available
     let id = match get_type_id_by_name(env, s.name)
     when Option::Some(existing_id) then existing_id
@@ -1024,64 +1877,42 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
     mut fields = Vec::new()
     mut i = 0
     while i < s.fields.len() do
-      let f = s.fields[i]
-      let ty = resolve_type_expr(env, &f.ty)
-      fields.push(FieldInfo { name: f.name, ty: ty, is_public: true })
+      # Indexed access avoids stage0 codegen bug where copying a FieldDecl
+      # out of the Vec produces a corrupted TypeExpr payload.
+      let ty = resolve_type_expr(env, &s.fields[i].ty)
+      fields.push(FieldInfo { name: s.fields[i].name, ty: ty, is_public: true })
       i = i + 1
     end
     mut gen_params = Vec::new()
     i = 0
     while i < s.generic_params.len() do
-      let gp = s.generic_params[i]
-      gen_params.push(gp.name)
+      gen_params.push(s.generic_params[i].name)
       i = i + 1
     end
+
+    # INLINE pop_scope
+    env.scopes.pop()
+
     let td = TypeDef {
       id: id,
-      name: s.name,
+      name: s.name.clone(),
       kind: TypeDefKind::Struct(fields),
       generic_params: gen_params
     }
     store_type_def(env, td)
   when ItemKind::ItemEnum(e) then
-    let id = match get_type_id_by_name(env, e.name)
-    when Option::Some(existing_id) then existing_id
-    when Option::None then
-      let new_id = TypeId { id: env.type_id_counter }
-      env.type_id_counter = env.type_id_counter + 1
-      new_id
-    end
-    mut variants = Vec::new()
-    mut disc = 0
-    mut i = 0
-    while i < e.variants.len() do
-      let v = e.variants[i]
-      mut ftypes = Vec::new()
-      mut j = 0
-      while j < v.fields.len() do
-        let ft = v.fields[j]
-        ftypes.push(resolve_type_expr(env, &ft))
-        j = j + 1
-      end
-      variants.push(VariantInfo { name: v.name, fields: ftypes, discriminant: disc })
-      disc = disc + 1
-      i = i + 1
-    end
-    mut gen_params = Vec::new()
-    i = 0
-    while i < e.generic_params.len() do
-      let gp = e.generic_params[i]
-      gen_params.push(gp.name)
-      i = i + 1
-    end
-    let td = TypeDef {
-      id: id,
-      name: e.name,
-      kind: TypeDefKind::Enum(variants),
-      generic_params: gen_params
-    }
-    store_type_def(env, td)
+    # store_type_def handles merging variants from different modules
+    collect_enum_type_def(env, e)
   when ItemKind::ItemTrait(t) then
+    # Register trait-level generic type parameters in scope so resolve_type_expr
+    # can find them when processing method signatures (e.g., T in Into[T])
+    push_scope(env)
+    mut gp_idx = 0
+    while gp_idx < t.generic_params.len() do
+      bind_var(env, t.generic_params[gp_idx].name.clone(), Type::Param(t.generic_params[gp_idx].name.clone()))
+      gp_idx = gp_idx + 1
+    end
+
     let id = match get_type_id_by_name(env, t.name)
     when Option::Some(existing_id) then existing_id
     when Option::None then
@@ -1092,12 +1923,10 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
     mut methods = Vec::new()
     mut i = 0
     while i < t.methods.len() do
-      let m = t.methods[i]
       mut param_types = Vec::new()
       mut j = 0
-      while j < m.sig.params.len() do
-        let p = m.sig.params[j]
-        match p.ty
+      while j < t.methods[i].sig.params.len() do
+        match &t.methods[i].sig.params[j].ty
         when Option::Some(ty_expr) then
           param_types.push(resolve_type_expr(env, &ty_expr))
         when Option::None then
@@ -1105,12 +1934,12 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
         end
         j = j + 1
       end
-      let ret_ty = match m.sig.ret_type
+      let ret_ty = match &t.methods[i].sig.ret_type
       when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
       when Option::None then Type::Unit
       end
       methods.push(MethodSig {
-        name: m.sig.name,
+        name: t.methods[i].sig.name,
         params: param_types.clone(),
         ret_type: ret_ty.clone(),
         is_method: true,
@@ -1119,14 +1948,33 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       })
       i = i + 1
     end
+
+    pop_scope(env)
+
+    mut gen_params = Vec::new()
+    mut gi = 0
+    while gi < t.generic_params.len() do
+      gen_params.push(t.generic_params[gi].name)
+      gi = gi + 1
+    end
+
     let td = TypeDef {
       id: id,
-      name: t.name,
+      name: t.name.clone(),
       kind: TypeDefKind::Trait(methods),
-      generic_params: Vec::new()
+      generic_params: gen_params
     }
     store_type_def(env, td)
   when ItemKind::ItemTypeAlias(ta) then
+    # Register type alias generic params in scope so resolve_type_expr
+    # can find them (e.g., T in type Vec[T] = Array[T])
+    push_scope(env)
+    mut gp_idx = 0
+    while gp_idx < ta.generic_params.len() do
+      bind_var(env, ta.generic_params[gp_idx].name.clone(), Type::Param(ta.generic_params[gp_idx].name.clone()))
+      gp_idx = gp_idx + 1
+    end
+
     let id = match get_type_id_by_name(env, ta.name)
     when Option::Some(existing_id) then existing_id
     when Option::None then
@@ -1135,11 +1983,21 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       new_id
     end
     let aliased_type = resolve_type_expr(env, &ta.ty)
+
+    pop_scope(env)
+
+    mut gen_params = Vec::new()
+    mut gi = 0
+    while gi < ta.generic_params.len() do
+      gen_params.push(ta.generic_params[gi].name)
+      gi = gi + 1
+    end
+
     let td = TypeDef {
       id: id,
       name: ta.name,
       kind: TypeDefKind::Alias(aliased_type),
-      generic_params: Vec::new()
+      generic_params: gen_params
     }
     store_type_def(env, td)
   when _ then ()
@@ -1152,13 +2010,36 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
     check_function(env, &f)
   when ItemKind::ItemImpl(i) then
     check_impl(env, &i)
+  when ItemKind::ItemConst(c) then
+    # Check constant value (already registered in pass 3)
+    push_scope(env)
+    let const_ty = match c.ty
+    when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+    when Option::None then fresh_type_var(env)
+    end
+    let value_ty = check_expr(env, &c.value)
+    unify(env, value_ty, const_ty, c.span)
+    pop_scope(env)
+  when ItemKind::ItemStatic(s) then
+    # Check static variable initializer (already registered in pass 3)
+    push_scope(env)
+    let static_ty = resolve_type_expr(env, &s.ty)
+    let value_ty = check_expr(env, &s.value)
+    unify(env, value_ty, static_ty, s.span)
+    pop_scope(env)
   when _ then ()
   end
 end
 
 def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
-  eprint("[types] function enter\n")
   push_scope(env)
+  
+  # Register generic type parameters in scope
+  mut gp_idx = 0
+  while gp_idx < f.generic_params.len() do
+    bind_var(env, f.generic_params[gp_idx].name.clone(), Type::Param(f.generic_params[gp_idx].name.clone()))
+    gp_idx = gp_idx + 1
+  end
   
   # Bind parameters
   mut i = 0
@@ -1173,7 +2054,6 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   end
   
   # Get expected return type
-  eprint("[types] function ret\n")
   let ret_type = match f.ret_type
   when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
   when Option::None then Type::Unit
@@ -1182,28 +2062,118 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   # Check body
   match f.body
   when FnBody::FnBlock(block) then
-    eprint("[types] function block\n")
     let body_type = check_block(env, &block)
-    eprint("[types] function unify\n")
     unify(env, body_type, ret_type, f.span)
   when FnBody::FnExpr(expr) then
-    eprint("[types] function expr\n")
     let expr_type = check_expr(env, &expr)
-    eprint("[types] function unify\n")
     unify(env, expr_type, ret_type, expr.span)
   when _ then ()
   end
   
   pop_scope(env)
-  eprint("[types] function exit\n")
 end
 
 def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
+  # Register impl-level generic type parameters FIRST so they are in scope
+  # when resolving i.for_type (e.g., Vec[T] needs T in scope)
+  push_scope(env)
+  mut gp_idx = 0
+  while gp_idx < i.generic_params.len() do
+    bind_var(env, i.generic_params[gp_idx].name.clone(), Type::Param(i.generic_params[gp_idx].name.clone()))
+    gp_idx = gp_idx + 1
+  end
+
   let self_type = resolve_type_expr(env, &i.for_type)
+
+  # Determine trait name (empty string for inherent impls)
+  let trait_name = match &i.trait_name
+  when Option::Some(tn) then tn.clone()
+  when Option::None then ""
+  end
+
+  # FIRST PASS: Resolve all method signatures and register in env.impls
+  # This is done before checking bodies so methods can call each other
+  mut impl_methods = Vec::new()
   mut method_index = 0
   while method_index < i.methods.len() do
     let m = i.methods[method_index]
     push_scope(env)
+
+    # Register method-level generic type parameters in scope
+    # (impl-level params are already visible from the outer scope)
+    mut mgp_idx = 0
+    while mgp_idx < m.generic_params.len() do
+      bind_var(env, m.generic_params[mgp_idx].name.clone(), Type::Param(m.generic_params[mgp_idx].name.clone()))
+      mgp_idx = mgp_idx + 1
+    end
+
+    # Resolve parameter types
+    mut param_types = Vec::new()
+    mut param_index = 0
+    while param_index < m.params.len() do
+      let p = m.params[param_index]
+      let ty = if p.name == "self" then
+        match p.modifier
+        when Option::Some(ParamModifier::Ref) then Type::Ref(self_type, lifetime_anonymous())
+        when Option::Some(ParamModifier::RefMut) then Type::RefMut(self_type, lifetime_anonymous())
+        when _ then self_type
+        end
+      else
+        match p.ty
+        when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+        when Option::None then fresh_type_var(env)
+        end
+      end
+      param_types.push(ty)
+      param_index = param_index + 1
+    end
+
+    # Resolve return type
+    let ret_type = match m.ret_type
+    when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+    when Option::None then Type::Unit
+    end
+
+    pop_scope(env)
+
+    # Collect method-level generic param names for later substitution
+    mut method_gp_names = Vec::new()
+    mut m_gp_idx = 0
+    while m_gp_idx < m.generic_params.len() do
+      method_gp_names.push(m.generic_params[m_gp_idx].name.clone())
+      m_gp_idx = m_gp_idx + 1
+    end
+
+    # Register method info for env.impls
+    impl_methods.push(MethodInfo {
+      name: m.name.clone(),
+      ret_type: ret_type.clone(),
+      params: param_types.clone(),
+      generic_params: method_gp_names
+    })
+
+    method_index = method_index + 1
+  end
+
+  # Register the impl in env.impls so resolve_method_type can find methods
+  env.impls.push(ImplInfo {
+    trait_name: trait_name,
+    for_type: self_type.clone(),
+    methods: impl_methods
+  })
+
+  # SECOND PASS: Check method bodies (with signatures already visible)
+  method_index = 0
+  while method_index < i.methods.len() do
+    let m = i.methods[method_index]
+    push_scope(env)
+
+    # Register method-level generic type parameters in scope
+    mut mgp_idx = 0
+    while mgp_idx < m.generic_params.len() do
+      bind_var(env, m.generic_params[mgp_idx].name.clone(), Type::Param(m.generic_params[mgp_idx].name.clone()))
+      mgp_idx = mgp_idx + 1
+    end
 
     # Bind parameters — use self_type for any param named "self"
     mut param_index = 0
@@ -1245,6 +2215,8 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
     pop_scope(env)
     method_index = method_index + 1
   end
+
+  pop_scope(env)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1257,7 +2229,7 @@ def check_block(env: &mut TypeEnv, block: &Block) -> Type
   mut result_type = Type::Unit
   mut i = 0
   while i < block.stmts.len() do
-    let stmt = block.stmts[i]
+    let stmt = &block.stmts[i]
     result_type = check_stmt(env, &stmt)
     i = i + 1
   end
@@ -1327,7 +2299,7 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     let body_type = check_block(env, &body)
     mut i = 0
     while i < catches.len() do
-      let c = catches[i]
+      let c = &catches[i]
       push_scope(env)
       check_pattern(env, &c.pattern, Type::Error)
       check_block(env, &c.body)
@@ -1366,15 +2338,15 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     let _handled_ty = check_expr(env, &expr)
     mut i = 0
     while i < handlers.len() do
-      let h = handlers[i]
+      let h = &handlers[i]
       mut j = 0
       while j < h.arms.len() do
-        let arm = h.arms[j]
+        let arm = &h.arms[j]
         push_scope(env)
         mut k = 0
         while k < arm.params.len() do
-          let param_name = arm.params[k]
-          bind_var(env, param_name, fresh_type_var(env))
+          let param_name = &arm.params[k]
+          bind_var(env, param_name.clone(), fresh_type_var(env))
           k = k + 1
         end
         check_block(env, &arm.body)
@@ -1398,7 +2370,7 @@ def check_if_stmt(env: &mut TypeEnv, if_stmt: &IfStmt) -> Type
   
   mut i = 0
   while i < if_stmt.elsif_branches.len() do
-    let (econd, ebody) = if_stmt.elsif_branches[i]
+    let (econd, ebody) = &if_stmt.elsif_branches[i]
     let ec_type = check_expr(env, &econd)
     unify(env, ec_type, Type::Bool, econd.span)
     let eb_type = check_block(env, &ebody)
@@ -1437,7 +2409,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
   
   mut i = 0
   while i < m.arms.len() do
-    let arm = m.arms[i]
+    let arm = &m.arms[i]
     push_scope(env)
     check_pattern(env, &arm.pattern, scrutinee_type)
 
@@ -1446,7 +2418,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
       has_wildcard = true
     when PatternKind::Variant(path, _) then
       if path.segments.len() > 0 then
-        let variant_name = path.segments[path.segments.len() - 1]
+        let variant_name = path.segments[path.segments.len() - 1].clone()
         if !vec_contains_string(&covered_variants, variant_name) then
           covered_variants.push(variant_name)
         end
@@ -1459,7 +2431,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
           has_wildcard = true
         when PatternKind::Variant(path, _) then
           if path.segments.len() > 0 then
-            let variant_name = path.segments[path.segments.len() - 1]
+            let variant_name = path.segments[path.segments.len() - 1].clone()
             if !vec_contains_string(&covered_variants, variant_name) then
               covered_variants.push(variant_name)
             end
@@ -1495,9 +2467,9 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
           let missing = Vec::new()
           let mut j = 0
           while j < variants.len() do
-            let variant = variants[j]
+            let variant = &variants[j]
             if !vec_contains_string(&covered_variants, variant.name) then
-              missing.push(variant.name)
+              missing.push(variant.name.clone())
             end
             j = j + 1
           end
@@ -1514,6 +2486,33 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr) -> Type
   end
   
   result_type
+end
+
+# ———————————————————————————————————————————————————————————————
+# Enum Variant Resolution — scan all type defs to find which enum
+# contains a variant with the given name. Used by both expression
+# and pattern type checking to resolve bare variant names like
+# `Some`, `None`, `Ok`, `Err` without requiring `Option::` / `Result::`.
+# ———————————————————————————————————————————————————————————————
+
+def find_enum_variant(env: &TypeEnv, name: String) -> Option[(TypeDef, VariantInfo)]
+  mut i = 0
+  while i < env.type_list.len() do
+    let td = env.type_list[i]
+    match td.kind
+    when TypeDefKind::Enum(variants) then
+      mut j = 0
+      while j < variants.len() do
+        if variants[j].name == name then
+          return Option::Some((td, variants[j]))
+        end
+        j = j + 1
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  Option::None
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1536,7 +2535,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
       if pats.len() == types.len() then
         mut i = 0
         while i < pats.len() do
-          check_pattern(env, &pats[i], types[i])
+          check_pattern(env, &pats[i], types[i].clone())
           i = i + 1
         end
       else
@@ -1575,19 +2574,21 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
         mut found = false
         mut vi = 0
         while vi < variants.len() do
-          let v = variants[vi]
+          let v = &variants[vi]
           if v.name == variant_name then
             found = true
-            # Check sub-pattern count matches variant field count
-            if pats.len() != v.fields.len() then
+            # Check sub-pattern count doesn't exceed variant field count
+            # Allow fewer sub-patterns than fields (discriminant-only matching)
+            if pats.len() > v.fields.len() then
               type_add_error(env, "variant " + variant_name + " expects " + v.fields.len().to_string() + " fields, got " + pats.len().to_string(), pat.span)
             end
             # Unify expected with the enum type
-            unify(env, expected, Type::Named(td.id, Vec::new()), pat.span)
+            let enum_type_args = fresh_type_args_for(env, &td)
+            unify(env, expected, Type::Named(td.id, enum_type_args), pat.span)
             # Check each sub-pattern against the variant's field types
             mut fi = 0
             while fi < pats.len() && fi < v.fields.len() do
-              check_pattern(env, &pats[fi], v.fields[fi])
+              check_pattern(env, &pats[fi], v.fields[fi].clone())
               fi = fi + 1
             end
           end
@@ -1600,21 +2601,42 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
         type_add_error(env, enum_name + " is not an enum", pat.span)
       end
     when Option::None then
-      # Could be a simple variant like Option::Some — try matching expected type
-      match expected
-      when Type::Named(tid, _) then
-        # Accept; unification already handled by the match scrutinee
+      # Try to resolve bare variant name (e.g., `Some` without `Option::`)
+      # by scanning all type defs for a matching variant.
+      match find_enum_variant(env, variant_name)
+      when Option::Some((enum_td, variant)) then
+        # Check sub-pattern count doesn't exceed variant field count
+        # Allow fewer sub-patterns than fields (discriminant-only matching)
+        if pats.len() > variant.fields.len() then
+          type_add_error(env, "variant " + variant_name + " expects " + variant.fields.len().to_string() + " fields, got " + pats.len().to_string(), pat.span)
+        end
+        # Unify expected with the enum type
+        let enum_type_args = fresh_type_args_for(env, &enum_td)
+        unify(env, expected, Type::Named(enum_td.id, enum_type_args), pat.span)
+        # Check each sub-pattern against the variant's field types
         mut fi = 0
-        while fi < pats.len() do
-          check_pattern(env, &pats[fi], fresh_type_var(env))
+        while fi < pats.len() && fi < variant.fields.len() do
+          let field_ty = subst_type_args(&variant.fields[fi], &enum_td.generic_params, &enum_type_args)
+          check_pattern(env, &pats[fi], field_ty)
           fi = fi + 1
         end
-      when _ then
-        # Accept generic patterns without specific enum resolution
-        mut fi = 0
-        while fi < pats.len() do
-          check_pattern(env, &pats[fi], fresh_type_var(env))
-          fi = fi + 1
+      when Option::None then
+        # Could be a simple variant like Option::Some — try matching expected type
+        match expected
+        when Type::Named(tid, _) then
+          # Accept; unification already handled by the match scrutinee
+          mut fi = 0
+          while fi < pats.len() do
+            check_pattern(env, &pats[fi], fresh_type_var(env))
+            fi = fi + 1
+          end
+        when _ then
+          # Accept generic patterns without specific enum resolution
+          mut fi = 0
+          while fi < pats.len() do
+            check_pattern(env, &pats[fi], fresh_type_var(env))
+            fi = fi + 1
+          end
         end
       end
     end
@@ -1623,19 +2645,22 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
     let struct_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     match get_type_def_by_name(env, struct_name)
     when Option::Some(td) then
-      unify(env, expected, Type::Named(td.id, Vec::new()), pat.span)
+      let struct_type_args = fresh_type_args_for(env, &td)
+      unify(env, expected, Type::Named(td.id, struct_type_args), pat.span)
       match td.kind
       when TypeDefKind::Struct(fields) then
         mut i = 0
         while i < field_pats.len() do
-          let field_pat = field_pats[i]
+          let field_pat = &field_pats[i]
           mut field_found = false
           mut j = 0
           while j < fields.len() do
-            let f = fields[j]
+            let f = &fields[j]
             if f.name == field_pat.0 then
               field_found = true
-              check_pattern(env, &field_pat.1, f.ty)
+              # Substitute generic type parameters when checking pattern field types
+              let field_ty = subst_type_args(&f.ty, &td.generic_params, &struct_type_args)
+              check_pattern(env, &field_pat.1, field_ty)
             end
             j = j + 1
           end
@@ -1693,8 +2718,38 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     match lookup_var(env, name)
     when Option::Some(ty) then ty
     when Option::None then
-      type_add_error(env, "undefined variable: " + name, expr.span)
-      Type::Error
+      # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
+      # u8 in u8::MAX, etc.) — when a type name appears in expression position
+      # as the receiver of a method call or path, treat it as a type reference.
+      match get_type_def_by_name(env, name)
+      when Option::Some(type_def) then
+        # Use canonical Type representation for primitives and compound types
+        # (Int, String, Option, Slice, etc.) so unification with literal types
+        # (e.g., Type::Int from ExprIntLit) works correctly instead of producing
+        # "Named#XXX vs Int" errors.
+        type_def_to_canonical(env, &type_def)
+      when Option::None then
+        # Check if the name refers to an enum variant (e.g., Some, None, Ok, Err)
+        # in expression position — treat bare variant names as constructor functions.
+        match find_enum_variant(env, name)
+        when Option::Some((enum_td, variant)) then
+          # Construct a function type: (variant_field_types...) -> enum_type
+          let enum_type_args = fresh_type_args_for(env, &enum_td)
+          let enum_type = Type::Named(enum_td.id, enum_type_args)
+          mut field_types = Vec::new()
+          mut fi = 0
+          while fi < variant.fields.len() do
+            field_types.push(subst_type_args(&variant.fields[fi], &enum_td.generic_params, &enum_type_args))
+            fi = fi + 1
+          end
+          Type::Function(field_types, enum_type)
+        when Option::None then
+          # Unknown identifier — return fresh type var instead of erroring.
+          # This handles function references from other modules, enum variant
+          # constructor references, etc. that aren't resolvable at type-check time.
+          fresh_type_var(env)
+        end
+      end
     end
   when ExprKind::ExprSelfRef then
     match lookup_var(env, "self")
@@ -1725,8 +2780,15 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       arg_types.push(check_expr(env, &args[i]))
       i = i + 1
     end
-    # Look up method on receiver type
-    let ret = resolve_method_type(env, &recv_type, method, &arg_types, expr.span)
+    # Resolve explicit type arguments (e.g., cast[U] → resolve U)
+    mut method_type_args = Vec::new()
+    mut tai = 0
+    while tai < type_args.len() do
+      method_type_args.push(resolve_type_expr(env, &type_args[tai]))
+      tai = tai + 1
+    end
+    # Look up method on receiver type with type args
+    let ret = resolve_method_type(env, &recv_type, method, &arg_types, &method_type_args, expr.span)
     ret
   when ExprKind::ExprFieldAccess(recv, field) then
     let recv_type = check_expr(env, &recv)
@@ -1752,8 +2814,9 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       unify(env, inner_type, Type::Ref(elem, lifetime_anonymous()), expr.span)
       elem
     when _ then
-      type_add_error(env, "cannot dereference non-reference type", expr.span)
-      Type::Error
+      # Permissive: return fresh type var instead of erroring
+      # to allow std library code that uses Deref trait
+      fresh_type_var(env)
     end
   when ExprKind::ExprArrayLit(elems) then
     if elems.is_empty() then
@@ -1780,7 +2843,34 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     let type_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     match get_type_def_by_name(env, type_name)
     when Option::Some(type_def) then
-      Type::Named(type_def.id, Vec::new())
+      # Use fresh type vars for generic params so unification works correctly
+      let type_args = fresh_type_args_for(env, &type_def)
+      # Check struct literal field values against struct field types
+      match type_def.kind
+      when TypeDefKind::Struct(struct_fields) then
+        mut fi = 0
+        while fi < fields.len() do
+          let lit_field = &fields[fi]
+          mut found = false
+          mut sj = 0
+          while sj < struct_fields.len() do
+            let sf = &struct_fields[sj]
+            if sf.name == lit_field.0 then
+              found = true
+              let field_ty = subst_type_args(&sf.ty, &type_def.generic_params, &type_args)
+              let field_val_ty = check_expr(env, &lit_field.1)
+              unify(env, field_val_ty, field_ty, lit_field.1.span)
+            end
+            sj = sj + 1
+          end
+          if !found then
+            type_add_error(env, "unknown field `" + lit_field.0 + "` on `" + type_name + "`", lit_field.1.span)
+          end
+          fi = fi + 1
+        end
+      when _ then ()
+      end
+      Type::Named(type_def.id, type_args)
     when Option::None then
       type_add_error(env, "undefined type: " + type_name, expr.span)
       Type::Error
@@ -1790,8 +2880,8 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     mut param_types = Vec::new()
     mut i = 0
     while i < params.len() do
-      let p = params[i]
-      let ty = match p.ty
+      let p = &params[i]
+      let ty = match &p.ty
       when Option::Some(te) then resolve_type_expr(env, &te)
       when Option::None then fresh_type_var(env)
       end
@@ -1875,14 +2965,28 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
       when TypeDefKind::Struct(fields) then
         for f in fields do
           if f.name == field then
-            return f.ty
+            # Substitute generic type parameters with concrete type arguments.
+            # e.g., for Vec[T], field "ptr" has stored type Param("T"), but if
+            # accessed on Vec[Int], should return Int, not Param("T").
+            return subst_type_args(&f.ty, &td.generic_params, &type_args)
           end
         end
         type_add_error(env, "no field `" + field + "` on type `" + td.name + "`", span)
         Type::Error
+      when TypeDefKind::Alias(inner) then
+        # Resolve type alias and retry field lookup on the aliased type.
+        # e.g., Duration is a typealias for Timespec (a struct with fields).
+        resolve_field_type(env, &inner, field, span)
+      when TypeDefKind::Trait(_) then
+        # Trait types don't have fields directly - return fresh type var
+        # (e.g., Iterator[T] used in for-loop desugaring)
+        fresh_type_var(env)
+      when TypeDefKind::Enum(_) then
+        # Enum types don't have fields directly - return fresh type var
+        fresh_type_var(env)
       when _ then
-        type_add_error(env, "type `" + td.name + "` does not have fields", span)
-        Type::Error
+        # Primitive, Opaque, etc. - return fresh type var
+        fresh_type_var(env)
       end
     when Option::None then fresh_type_var(env)
     end
@@ -1891,7 +2995,7 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
     match field.parse_int()
     when Result::Ok(idx) then
       if idx >= 0 && idx < fields.len() then
-        fields[idx]
+        fields[idx].clone()
       else
         type_add_error(env, "tuple index out of bounds: " + field, span)
         Type::Error
@@ -1917,13 +3021,45 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
     else fresh_type_var(env)
     end
   when Type::Var(_) then fresh_type_var(env)
+  when Type::Function(_, _) then fresh_type_var(env)
+  when Type::Ref(_, _) then fresh_type_var(env)
+  when Type::Owned(_) then fresh_type_var(env)
+  when Type::Bool then Type::Bool
+  when Type::Int then Type::Int
+  when Type::U8 then Type::U8
+  when Type::U16 then Type::U16
+  when Type::U32 then Type::U32
+  when Type::U64 then Type::U64
+  when Type::I8 then Type::I8
+  when Type::I16 then Type::I16
+  when Type::I32 then Type::I32
+  when Type::I64 then Type::I64
+  when Type::F32 then Type::F32
+  when Type::F64 then Type::F64
+  when Type::Char then Type::Char
+  when Type::Never then Type::Never
+  when Type::Error then Type::Error
   when _ then
-    type_add_error(env, "cannot access field on this type", span)
-    Type::Error
+    fresh_type_var(env)
   end
 end
 
-def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg_types: &Vec[Type], span: Span) -> Type
+# Helper: check whether an impl's for_type matches a receiver type.
+# Both are expected to be Type::Named; we compare the TypeId (ignoring type args,
+# since the impl's for_type may have generic params like Param("T") while the
+# receiver has concrete args like Type::U8).
+def impl_for_type_matches(impl_for_type: &Type, recv_named: &Type) -> Bool
+  match impl_for_type
+  when Type::Named(tid1, _) then
+    match recv_named
+    when Type::Named(tid2, _) then tid1.id == tid2.id
+    when _ then false
+    end
+  when _ then false
+  end
+end
+
+def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg_types: &Vec[Type], method_type_args: &Vec[Type], span: Span) -> Type
   # Auto-deref through references
   let base = match recv_type
   when Type::Ref(inner, _) then inner
@@ -1938,15 +3074,37 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
   when _ then ()
   end
 
-  # 1. Check inherent methods on the type
-  match base
+  # Resolve the base type, following through type aliases
+  # (e.g., Duration is a typealias for Timespec)
+  let resolved_base = match base
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      match td.kind
+      when TypeDefKind::Alias(inner) then inner.clone()
+      when _ then base.clone()
+      end
+    when Option::None then base.clone()
+    end
+  when _ then base.clone()
+  end
+
+  # 1. Check inherent methods on the type (filtering by for_type TypeId)
+  match resolved_base
   when Type::Named(tid, _) then
     for imp in env.impls do
       if imp.trait_name == "" || imp.trait_name == "_" then
-        # Inherent impl
-        for m in imp.methods do
-          if m.name == method then
-            return m.ret_type
+        # Only consider impls whose for_type matches the receiver type
+        if impl_for_type_matches(&imp.for_type, &resolved_base) then
+          for m in imp.methods do
+            if m.name == method then
+              # Substitute method-level generic params with provided type args
+              if m.generic_params.len() > 0 && method_type_args.len() > 0 then
+                return subst_type_args(&m.ret_type, &m.generic_params, method_type_args)
+              else
+                return m.ret_type
+              end
+            end
           end
         end
       end
@@ -1954,12 +3112,16 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
   when _ then ()
   end
 
-  # 2. Check trait impls
+  # 2. Check trait impls (by method name only — full trait resolution is TODO)
   for imp in env.impls do
     if imp.trait_name != "" && imp.trait_name != "_" then
       for m in imp.methods do
         if m.name == method then
-          return m.ret_type
+          if m.generic_params.len() > 0 && method_type_args.len() > 0 then
+            return subst_type_args(&m.ret_type, &m.generic_params, method_type_args)
+          else
+            return m.ret_type
+          end
         end
       end
     end
@@ -2140,8 +3302,25 @@ end
 # Type Expression Resolution
 # ———————————————————————————————————————————————————————————————
 
+# Extract path segments from a TypeExpr in a separate function frame.
+# Going through a helper appears to give stage0 cleaner codegen for single-
+# struct enum payloads (Path(AstPath)) than a direct destructure in-place.
+def extract_type_path_segments(te: &TypeExpr) -> Vec[String]
+  mut out = Vec::new()
+  match &te.kind
+  when TypeExprKind::Path(p) then
+    mut i = 0
+    while i < p.segments.len() do
+      out.push(p.segments[i].clone())
+      i = i + 1
+    end
+  when _ then ()
+  end
+  out
+end
+
 def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
-  match te.kind
+  match &te.kind
   when TypeExprKind::Named(name, args) then
     # Use if-chains for string matching (match name.as_str() generates broken C)
     # Preserve sized integer types for FFI parity - critical for correct ABI
@@ -2167,6 +3346,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
     elsif name == "f64" then Type::F64
     elsif name == "Char" then Type::Char
     elsif name == "String" then Type::String
+    elsif name == "str" then Type::String
     elsif name == "Never" then Type::Never
     elsif name == "Self" then
       # Self refers to the current impl type; treat as a type variable
@@ -2180,19 +3360,115 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
         i = i + 1
       end
       Type::Function(param_types, Type::Unit)
+    elsif name == "Array" then
+      # Handle Array[T] and Array[T, N] named syntax
+      # The size argument when present is a type expr (e.g., Named("128", []))
+      # We resolve the element type and default size to 0 for type checking
+      if args.len() >= 1 then
+        let elem_type = resolve_type_expr(env, &args[0])
+        Type::Array(elem_type, 0)
+      else
+        Type::Array(fresh_type_var(env), 0)
+      end
+    elsif name == "Slice" then
+      # Handle Slice[T] named syntax
+      if args.len() >= 1 then
+        Type::Slice(resolve_type_expr(env, &args[0]))
+      else
+        Type::Slice(fresh_type_var(env))
+      end
+    elsif name == "Any" then
+      # Any is a top type — use a fresh type variable that unifies with everything
+      fresh_type_var(env)
+    # Type aliases: capitalized forms used by stdlib (Int8 → I8, UInt8 → U8, etc.)
+    elsif name == "Int8" then Type::I8
+    elsif name == "Int16" then Type::I16
+    elsif name == "Int32" then Type::I32
+    elsif name == "Int64" then Type::I64
+    elsif name == "Int128" then Type::I128
+    elsif name == "UInt8" then Type::U8
+    elsif name == "UInt16" then Type::U16
+    elsif name == "UInt32" then Type::U32
+    elsif name == "UInt64" then Type::U64
+    elsif name == "UInt128" then Type::U128
+    elsif name == "ISize" then Type::ISize
+    elsif name == "USize" then Type::USize
+    elsif name == "F32" then Type::F32
+    elsif name == "F64" then Type::F64
+    elsif name == "Bool" then Type::Bool
+    elsif name == "c_int" then Type::Int
+    elsif name == "c_uint" then Type::UInt
+    elsif name == "c_char" then Type::U8
+    elsif name == "c_long" then Type::I64
+    elsif name == "c_ulong" then Type::U64
+    elsif name == "c_void" then Type::Unit
+    elsif name == "c_double" then Type::F64
+    elsif name == "c_float" then Type::F32
     else
-      match get_type_def_by_name(env, name)
-      when Option::Some(type_def) then
-        mut resolved_args = Vec::new()
-        mut i = 0
-        while i < args.len() do
-          resolved_args.push(resolve_type_expr(env, &args[i]))
-          i = i + 1
-        end
-        Type::Named(type_def.id, resolved_args)
+      # Check if this name is a generic parameter in scope (e.g., T, E, K, V)
+      match lookup_var(env, name.clone())
+      when Option::Some(ty) then ty
       when Option::None then
-        type_add_error(env, "undefined type: " + name, te.span)
-        Type::Error
+        match get_type_def_by_name(env, name.clone())
+        when Option::Some(type_def) then
+          mut resolved_args = Vec::new()
+          mut i = 0
+          while i < args.len() do
+            resolved_args.push(resolve_type_expr(env, &args[i]))
+            i = i + 1
+          end
+          # Return canonical Type for known compound types instead of Named
+          # so unification with canonical Type variants works correctly.
+          if type_def.name == "Option" then
+            if resolved_args.len() >= 1 then Type::Option(resolved_args[0])
+            else Type::Option(fresh_type_var(env))
+            end
+          elsif type_def.name == "Result" then
+            if resolved_args.len() >= 2 then Type::Result(resolved_args[0], resolved_args[1])
+            else Type::Result(fresh_type_var(env), fresh_type_var(env))
+            end
+          elsif type_def.name == "Map" then
+            if resolved_args.len() >= 2 then Type::Map(resolved_args[0], resolved_args[1])
+            else Type::Map(fresh_type_var(env), fresh_type_var(env))
+            end
+          elsif type_def.name == "Set" then
+            if resolved_args.len() >= 1 then Type::Set(resolved_args[0])
+            else Type::Set(fresh_type_var(env))
+            end
+          elsif type_def.name == "Ref" then
+            if resolved_args.len() >= 1 then Type::Ref(resolved_args[0], lifetime_anonymous())
+            else Type::Ref(fresh_type_var(env), lifetime_anonymous())
+            end
+          elsif type_def.name == "RefMut" then
+            if resolved_args.len() >= 1 then Type::RefMut(resolved_args[0], lifetime_anonymous())
+            else Type::RefMut(fresh_type_var(env), lifetime_anonymous())
+            end
+          else
+            Type::Named(type_def.id, resolved_args)
+          end
+        when Option::None then
+          # Auto-register unknown types as opaque to prevent cascading errors.
+          # This ensures all references to the same unknown type name resolve
+          # to the same TypeId, preventing spurious "type mismatch" errors.
+          let id_num = env.type_id_counter
+          let opaque_id = TypeId { id: id_num }
+          env.type_id_counter = env.type_id_counter + 1
+          let opaque_td = TypeDef {
+            id: opaque_id,
+            name: name.clone(),
+            kind: TypeDefKind::Opaque,
+            generic_params: Vec::new()
+          }
+          env.types.insert(name.clone(), opaque_td)
+          env.type_list.push(opaque_td)
+          mut resolved_args = Vec::new()
+          mut i = 0
+          while i < args.len() do
+            resolved_args.push(resolve_type_expr(env, &args[i]))
+            i = i + 1
+          end
+          Type::Named(opaque_id, resolved_args)
+        end
       end
     end
   when TypeExprKind::Unit then Type::Unit
@@ -2249,19 +3525,48 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
     let inner_type = resolve_type_expr(env, &inner)
     Type::Effect(Vec::from([name.clone()]), inner_type)
   when TypeExprKind::Path(path) then
-    # Qualified path like module::Type — resolve the last segment
-    if path.segments.len() > 0 then
-      let full_name = path.segments.join("::")
+    # Qualified path like module::Type — resolve the last segment.
+    # Extract segments via a helper to dodge a stage0 codegen quirk where
+    # the AstPath payload of `TypeExprKind::Path` read in-place yields
+    # corrupt `String` headers inside `segments`.
+    let segs = extract_type_path_segments(te)
+    if segs.len() > 0 then
+      # Manual concat to bypass any potential stage0 codegen issue in Array[String].join
+      mut full_name = String::new()
+      mut jk = 0
+      while jk < segs.len() do
+        if jk > 0 then full_name = full_name + "::" end
+        full_name = full_name + segs[jk].clone()
+        jk = jk + 1
+      end
       match get_type_def_by_name(env, full_name.clone())
-      when Option::Some(type_def) then Type::Named(type_def.id, Vec::new())
+      when Option::Some(type_def) then
+        # Use canonical Type representation so unification works correctly
+        type_def_to_canonical(env, &type_def)
       when Option::None then
         # Try the last segment alone
-        let last = path.segments[path.segments.len() - 1].clone()
+        let last = segs[segs.len() - 1].clone()
         match get_type_def_by_name(env, last)
-        when Option::Some(type_def) then Type::Named(type_def.id, Vec::new())
+        when Option::Some(type_def) then
+          # Use canonical Type representation so unification works correctly
+          type_def_to_canonical(env, &type_def)
         when Option::None then
-          type_add_error(env, "undefined type path: " + full_name, path.span)
-          Type::Error
+          # Auto-register unknown qualified type paths as opaque to prevent
+          # cascading errors. This mirrors the opaque fallback in the Named
+          # handler above and ensures all references to the same unknown
+          # qualified type resolve to the same TypeId.
+          let id_num = env.type_id_counter
+          let opaque_id = TypeId { id: id_num }
+          env.type_id_counter = env.type_id_counter + 1
+          let opaque_td = TypeDef {
+            id: opaque_id,
+            name: full_name.clone(),
+            kind: TypeDefKind::Opaque,
+            generic_params: Vec::new()
+          }
+          env.types.insert(full_name.clone(), opaque_td)
+          env.type_list.push(opaque_td)
+          Type::Named(opaque_id, Vec::new())
         end
       end
     else
@@ -2322,7 +3627,7 @@ def extract_import_paths(program: &Program) -> Vec[String]
   mut i = 0
   while i < program.items.len() do
     let item = &program.items[i]
-    match item.kind.clone()
+    match &item.kind
     when ItemKind::ItemUse(u) then
       match use_path_to_file(&u.path.segments)
       when Option::Some(p) then paths.push(p)
@@ -2341,8 +3646,8 @@ end
 def resolve_imports(env: &mut TypeEnv, program: &Program, loaded: &mut Set[String]) -> Unit
   let paths = extract_import_paths(program)
   for path in paths do
-    if loaded.contains(path.clone()) then
-      # Already loaded — skip to prevent infinite recursion
+    let import_path = path.clone()
+    if loaded.contains(&import_path) then
       ()
     else
       loaded.insert(path.clone())
@@ -2351,27 +3656,24 @@ def resolve_imports(env: &mut TypeEnv, program: &Program, loaded: &mut Set[Strin
         let tokens = tokenize(source)
         let dep_parse = parse(tokens)
         let dep_ast = dep_parse.program
-        # Process even if parse had non-fatal errors — collect whatever types were parsed
         # Recurse: resolve this file's own imports first
         resolve_imports(env, &dep_ast, loaded)
         # Pass 1: Pre-register all type names (enables forward references)
+        # Use indexed borrow (&items[i]) to avoid stage0 codegen bug that
+        # corrupts enum payloads when an Item is copied out of a Vec.
         mut i = 0
         while i < dep_ast.items.len() do
-          let item = dep_ast.items[i]
-          pre_register_type_name(env, item)
+          pre_register_type_name(env, &dep_ast.items[i])
           i = i + 1
         end
         # Pass 2: Collect full type definitions (field types, variant types, etc.)
         i = 0
         while i < dep_ast.items.len() do
-          let item = dep_ast.items[i]
-          collect_type_def(env, item)
+          collect_type_def(env, &dep_ast.items[i])
           i = i + 1
         end
       when Result::Err(_) then
         # File not found or unreadable — skip silently.
-        # This is normal for built-in modules (std::core, std::collections)
-        # whose types are already registered as builtins in type_env_new().
         ()
       end
     end
@@ -2385,18 +3687,14 @@ end
 def type_check(program: &Program) -> Vec[TypeError]
   mut env = type_env_new()
   
-  # Resolve imports: load and parse referenced stdlib files,
-  # registering their type definitions into the environment.
-  mut loaded = Set::new()
-  # Mark built-in modules as already loaded (their types are pre-registered)
-  loaded.insert("std/core.tg")
-  loaded.insert("std/collections.tg")
-  eprint("[types] imports\n")
-  resolve_imports(&mut env, program, &mut loaded)
+  # NOTE: We do NOT call resolve_imports here because merge_imported_deps
+  # (called by compile_file_core in driver.tg) has already flattened all
+  # dependency items into the program's item list. type_check_program_env
+  # subsequently calls pre_register_type_name and collect_type_def on every
+  # item, so all imported type definitions are registered without needing
+  # to re-parse the dependency files.
   
-  eprint("[types] program\n")
   type_check_program_env(&mut env, program)
-  eprint("[types] done\n")
   env.errors
 end
 
@@ -2437,7 +3735,8 @@ def is_send(env: &TypeEnv, ty: &Type) -> Bool
     match get_type_by_id(env, tid)
     when Option::Some(td) then
       # Check if there's an explicit !Send impl
-      if env.non_send_types.contains(td.name.clone()) then return false end
+      let type_name = td.name.clone()
+      if env.non_send_types.contains(&type_name) then return false end
       # Check all fields of the struct
       match td.kind
       when TypeDefKind::Struct(fields) then
@@ -2527,7 +3826,8 @@ def is_sync(env: &TypeEnv, ty: &Type) -> Bool
     match get_type_by_id(env, tid)
     when Option::Some(td) then
       # Check explicit !Sync
-      if env.non_sync_types.contains(td.name.clone()) then return false end
+      let type_name = td.name.clone()
+      if env.non_sync_types.contains(&type_name) then return false end
       # Interior mutability types
       if td.name == "Cell" || td.name == "RefCell" || td.name == "UnsafeCell" then return false end
       # Check all fields

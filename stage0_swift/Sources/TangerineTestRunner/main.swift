@@ -2865,8 +2865,8 @@ test("15.6: Profile documentation") {
         try assertTrue(entry.file.hasSuffix(".tg"), "Profile entry must be .tg: \(entry.file)")
     }
     // NEGATIVE: must have exactly the known count
-    try assertEqual(BootstrapProfile.profileEntries.count, 7,
-        "Must have exactly 7 bootstrap profile entries")
+    try assertEqual(BootstrapProfile.profileEntries.count, 8,
+        "Must have exactly 8 bootstrap profile entries")
 }
 
 // 15.7: FAIL-FIRST — profileFileSet is a consistent set
