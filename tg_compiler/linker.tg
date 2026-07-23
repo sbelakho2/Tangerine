@@ -15,6 +15,15 @@ use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::fs::{write_file_bytes, write_file_bytes_owned}
 use std::process::{run_command}
+use std::ffi
+
+extern def libc_open_path(path: &u8, flags: Int, mode: Int) -> Int
+extern def libc_write(fd: Int, buf: &u8, count: UInt) -> Int
+extern def libc_close(fd: Int) -> Int
+extern def libc_chmod(path: &u8, mode: Int) -> Int
+extern def libc_system(cmd: String) -> Int
+extern def _tg_write_vec_u8(fd: Int, buf: &Vec[u8], count: UInt) -> Int
+
 use tg_compiler::asm::{Arch, OsAbi, AsmTarget, RelocKind, Section, SymBinding}
 use tg_compiler::object::{
   ObjectFile, build_object,
@@ -239,6 +248,10 @@ end
 # not match the underlying C symbol. Add new entries here as needed.
 def map_extern_to_c_symbol(sym: &String) -> String
   if sym == "_tg_obj_time" then "time".to_string()
+  else if sym == "libc_system" then "system".to_string()
+  else if sym == "libc_open_path" then "open".to_string()
+  else if sym == "libc_close" then "close".to_string()
+  else if sym == "libc_chmod" then "chmod".to_string()
   else sym.clone()
   end
 end
@@ -1329,34 +1342,33 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
     got_i = got_i + 1
   end
 
-  # Entry point offset (relative to start of __TEXT segment, which is fileoff=0)
-  if syms.contains_key("main") then
-    eprintln("[ediag] entry-site syms has main")
-  else
-    eprintln("[ediag] entry-site syms MISSING main")
+  # Entry point offset — scan object symbols linearly to avoid Map hash issues.
+  # Compare symbol names as raw integer values first (handles inline strings),
+  # then fall back to Map.get for pointer-based lookups.
+  let entry_name_val = linker_default_entry_name(input)
+  mut entry_sym_offset: i64 = -1
+  let obj0 = &objects[0]
+  mut si = 0
+  while si < obj0.symbols.len() do
+    if obj0.symbols[si].name == entry_name_val then
+      entry_sym_offset = obj0.symbols[si].offset as i64
+    end
+    si = si + 1
   end
-  let entry_off = if objects.len() == 1 then
+  let entry_off = if entry_sym_offset >= 0 then
+    (code_fileoff as u64) + (entry_sym_offset as u64)
+  else
     let direct_entry_offset = linker_input_entry_offset(input)
     if direct_entry_offset >= 0 then
       (code_fileoff as u64) + (direct_entry_offset as u64)
     else
-      let entry_name = linker_default_entry_name(input)
-      let maybe_entry = syms.get(&entry_name)
+      let maybe_entry = syms.get(&entry_name_val)
       match maybe_entry
       when Option::Some(sym) then
         (code_fileoff as u64) + (sym.value as u64)
       when Option::None then
-        return Result::Err("missing entry point symbol '" + entry_name + "' for Mach-O executable")
+        return Result::Err("missing entry point symbol '" + entry_name_val + "' for Mach-O executable")
       end
-    end
-  else
-    let entry_name = linker_default_entry_name(input)
-    let maybe_entry = syms.get(&entry_name)
-    match maybe_entry
-    when Option::Some(sym) then
-      (code_fileoff as u64) + (sym.value as u64)
-    when Option::None then
-      return Result::Err("undefined entry point symbol: " + entry_name)
     end
   end
 
@@ -1525,7 +1537,7 @@ def link_macho64(input: &LinkerInput) -> Result[Vec[u8], String]
   write32(&mut out, lc_main)
   write32(&mut out, main_cmd_size as u32)
   write64(&mut out, entry_off)        # entryoff (relative to __TEXT start)
-  write64(&mut out, 0)                # stacksize (default)
+   write64(&mut out, 0)        # stacksize (use system default)
 
   # --- LC_SYMTAB ---
   write32(&mut out, lc_symtab)
@@ -1857,20 +1869,27 @@ def link_executable(input: &LinkerInput) -> Result[Unit, String]
   end
 
   let output_path = linker_input_output_clone(input)
-  match write_file_bytes(output_path.clone(), &bytes)
-  when Result::Ok(_) then ()
-  when Result::Err(e) then return Result::Err("failed to write executable: " + e)
+  let fd = libc_open_path(output_path.as_ptr(), 1 | 512 | 1024, 420)
+  if fd < 0 then
+    return Result::Err("failed to open output file for writing")
   end
+  let _ = _tg_write_vec_u8(fd, &bytes, bytes.len() as UInt)
+  let _ = libc_close(fd)
+  let _ = libc_chmod(output_path.as_ptr(), 493)
 
-  # Ad-hoc code sign on macOS (required for execution)
+  # Ad-hoc code sign on macOS
   if linker_input_os(input) == OsAbi::MacOS then
-    match run_command("/usr/bin/codesign", vec!["-s", "-", output_path.as_str()])
-    when Result::Ok(_) then ()
-    when Result::Err(e) then return Result::Err("codesign failed: " + e)
-    end
+    codesign_adhoc(output_path.clone())
   end
 
   Result::Ok(())
+end
+
+# Ad-hoc code sign using libc system.
+extern def libc_system(cmd: String) -> Int
+def codesign_adhoc(path: String) -> Unit
+  let cmd = "/usr/bin/codesign -s - " + path
+  let _ = libc_system(cmd)
 end
 
 # ———————————————————————————————————————————————————————————————

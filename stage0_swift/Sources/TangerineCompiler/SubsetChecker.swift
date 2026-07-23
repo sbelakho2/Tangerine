@@ -354,6 +354,8 @@ public final class SubsetChecker {
             break
         case .attributed(_, let inner, _):
             checkStmt(inner)
+        case .deferStmt(let body, _):
+            checkBlock(body)
         case .item(let item):
             checkItem(item)
         }

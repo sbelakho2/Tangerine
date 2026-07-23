@@ -216,6 +216,11 @@ public final class ASTDumper {
             }
             dumpStmt(inner)
             pop()
+        case .deferStmt(let body, _):
+            emit("Defer")
+            push()
+            dumpBlock(body)
+            pop()
         case .item(let item):
             dumpItem(item)
         }

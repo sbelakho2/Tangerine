@@ -137,6 +137,8 @@ public final class ASTVerifier {
                 verifySpan(attr.span, context: "attribute @\(attr.name)")
             }
             verifyStmt(inner)
+        case .deferStmt(let body, _):
+            verifyBlock(body)
         case .item(let item):
             verifyItem(item)
         }

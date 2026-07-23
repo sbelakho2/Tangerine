@@ -86,6 +86,7 @@ public final class Parser {
         case .kwEffect:   advance(); return "effect"
         case .kwEdition:  advance(); return "edition"
         case .kwGuard:    advance(); return "guard"
+        case .kwDefer:    advance(); return "defer"
         case .kwHandle:   advance(); return "handle"
         case .kwImplies:  advance(); return "implies"
         case .kwInline:   advance(); return "inline"
@@ -140,7 +141,7 @@ public final class Parser {
         case .ident: return true
         case .kwBudget, .kwDef, .kwExtern, .kwFinally, .kwLoop, .kwSelfValue,
              .kwNext, .kwModule, .kwType, .kwCap, .kwConst, .kwEffect, .kwEdition,
-             .kwGuard, .kwHandle, .kwImplies, .kwInline, .kwMut, .kwAsync,
+             .kwGuard, .kwDefer, .kwHandle, .kwImplies, .kwInline, .kwMut, .kwAsync,
              .kwEnd, .kwDo, .kwPre, .kwPost, .kwPub, .kwTest, .kwPure,
              .kwStatic, .kwAwait, .kwWhen, .kwMod,
              .kwRequires, .kwInvariant, .kwWith, .kwCatch, .kwTry, .kwYield,
@@ -2298,6 +2299,11 @@ public final class Parser {
             return parseMutStatement()
         }
 
+        // defer statement
+        if at(.kwDefer) {
+            return parseDeferStmt()
+        }
+
         // Items inside blocks (limited set — not module, enum, trait, extern, etc.)
         if atBlockItemStart() {
             if let item = parseItem() {
@@ -2312,6 +2318,14 @@ public final class Parser {
         }
 
         return nil
+    }
+
+    private func parseDeferStmt() -> Stmt {
+        let start = currentSpan
+        advance() // skip 'defer'
+        let body = parseBlock()
+        expect(.kwEnd)
+        return .deferStmt(body, start.merged(with: currentSpan))
     }
 
     private func parseLetStatement() -> Stmt {
@@ -3272,6 +3286,8 @@ public final class Parser {
         let start = currentSpan
         var stmts: [Stmt] = []
         while !at(.kwWhen) && !at(.kwEnd) && !at(.kwElse) && !atEof() {
+            // Skip semicolons (statement separators)
+            if eat(.semi) { continue }
             if let stmt = parseStatement() {
                 stmts.append(stmt)
             } else {

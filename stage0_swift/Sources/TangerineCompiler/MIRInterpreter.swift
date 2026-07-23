@@ -12,10 +12,17 @@ public final class MIRInterpreter {
     private var trace: [TraceEntry] = []
     private let enableTrace: Bool
     public var runtimeArgs: [String] = ["tg", "compile", "--help"]
-    public var maxSteps: Int = 8_000_000_000
+    public var maxSteps: Int = {
+        if let raw = ProcessInfo.processInfo.environment["TG_INTERPRETER_MAX_STEPS"],
+           let val = Int(raw), val > 0 {
+            return val
+        }
+        return 80_000_000_000
+    }()
     private var stepCount: Int = 0
     private let progressReportInterval: Int
     private var nextProgressReportStep: Int = .max
+    private var startTime: Date = .distantPast
 
     private var halted: Bool = false
     private var runtimeError: String?
@@ -111,9 +118,20 @@ public final class MIRInterpreter {
             bIdx.append(bi)
         }
         self.blockIndices = bIdx
-        // Pre-compute maxLocal per function (avoids .reduce() on every call)
+        // Pre-compute maxLocal per function (avoids .reduce() on every call).
+        // MUST consider BOTH fn.locals AND fn.params: params and locals share the
+        // single LocalId id-space, and a parameter's id can exceed the maximum id
+        // in fn.locals (e.g. a function with high-id params but few/no body
+        // locals). When maxLocal was computed from fn.locals only, pushCallFrame's
+        // `param.id < maxLocal` guard at the parameter-write loop silently skipped
+        // those high-id parameters, leaving them as .unit. The interpreted codegen
+        // then read .unit (NULL) for those params and emitted NULL stores into
+        // enum/struct payloads — the bootstrap "NULL payload" crash that only
+        // surfaced for large compiler functions.
         self.maxLocals = program.functions.map { fn in
-            fn.locals.reduce(0) { max($0, $1.id) } + 1
+            let maxLocalId = fn.locals.reduce(0) { max($0, $1.id) }
+            let maxParamId = fn.params.reduce(0) { max($0, $1.id) }
+            return Swift.max(maxLocalId, maxParamId) + 1
         }
         // Pre-compute return local per function
         self.retLocals = program.functions.map { fn in
@@ -204,6 +222,10 @@ public final class MIRInterpreter {
     private static let eofTokenKindValue: MirValue = .enumVal("TokenKind", 132, .unit)
     private static let emptySpanValue: MirValue = .structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
     private static let eofTokenValue: MirValue = .structVal("Token", ["kind": eofTokenKindValue, "span": emptySpanValue])
+    /// Create a Span value with the given file, start, and end positions
+    private static func spanValue(file: String, start: Int, end: Int) -> MirValue {
+        .structVal("Span", ["file": .string(file), "start": .int(start), "end_pos": .int(end)])
+    }
 
     /// Get or upgrade a CodeBuffer's "bytes" field to a MirByteBuffer.
     /// If already a .byteBuffer, returns it directly.
@@ -392,6 +414,7 @@ public final class MIRInterpreter {
         dispatchCache = [:]
         halted = false
         runtimeError = nil
+        startTime = Date()
         nextProgressReportStep = progressReportInterval > 0 ? progressReportInterval : .max
 
         guard let fn = findFunction(entryFunction) else {
@@ -430,84 +453,6 @@ public final class MIRInterpreter {
     /// Push a new call frame for function at `fnIdx` with given arguments.
     private func pushCallFrame(_ fnIdx: Int, args: [MirValue]) {
         let fn = program.functions[fnIdx]
-        // TEST: verify stderr output works
-        if fn.name == "types::check_program" {
-            fputs("DBG_TEST: check_program called fn.name='\(fn.name)'\n", stderr)
-            fflush(stderr)
-        }
-        if enableTrace, fn.name.contains("resolve_type_var") || fn.name.contains("__closure_") || fn.name.contains("unify") {
-            let paramInfo = fn.params.map { "\($0.name ?? "?")(id=\($0.id))" }.joined(separator: ", ")
-            let argInfo = args.enumerated().map { (i, v) -> String in
-                let kind = valueKindName(v)
-                if case .fn(let n) = v { return "arg\(i)=fn(\(n))" }
-                if case .structVal(let n, _) = v { return "arg\(i)=struct(\(n))" }
-                if case .enumVal(let n, let idx, _) = v { return "arg\(i)=enum(\(n)#\(idx))" }
-                return "arg\(i)=\(kind)"
-            }.joined(separator: ", ")
-            fputs("DBG_CALL: \(fn.name) params=[\(paramInfo)] args=[\(argInfo)]\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace check_function entry
-        if fn.name == "types::check_function" {
-            let fnName: String
-            if args.count > 1, case .structVal(_, let fields) = args[1], case .string(let n)? = fields["name"] {
-                fnName = n
-            } else {
-                fnName = args.count > 1 ? args[1].displayString : "?"
-            }
-            currentCheckFnName = fnName
-            fputs("DBG_CHECK_FN: ENTER fn='\(fnName)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace check_impl entry
-        if fn.name == "types::check_impl" {
-            let implDesc = args.count > 1 ? args[1].displayString : "?"
-            fputs("DBG_CHECK_IMPL: ENTER impl='\(implDesc)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace lookup_var entry (tracks name for exit correlation)
-        if fn.name == "types::lookup_var" {
-            lastLookupVarName = args.count > 1 ? args[1].displayString : "?"
-            // Print env.scopes.len() — access scopes field from TypeEnv struct
-            var scopeCount = -1
-            if args.count >= 1, case .structVal(_, let envFields) = args[0] {
-                if case .array(let scopesArr) = envFields["scopes"] {
-                    scopeCount = scopesArr.count
-                }
-            }
-            fputs("DBG_LOOKUP: ENTER name='\(lastLookupVarName)' scopes=\(scopeCount) callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace push_scope entry
-        if fn.name == "types::push_scope" {
-            fputs("DBG_PUSH_SCOPE: inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace pop_scope entry
-        if fn.name == "types::pop_scope" {
-            fputs("DBG_POP_SCOPE: inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace bind_var entry (tracks which variables are being registered in scope)
-        if fn.name == "types::bind_var" {
-            let name = args.count > 1 ? args[1].displayString : "?"
-            lastBindVarName = name
-            fputs("DBG_BIND_VAR: ENTER name='\(name)' inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
-        // DBG: trace check_block entry
-        if fn.name == "types::check_block" {
-            fputs("DBG_CHECK_BLOCK: ENTER inFn='\(currentCheckFnName)' callDepth=\(callStack.count)\n", stderr)
-            fflush(stderr)
-        }
-
         callProfileArray[fnIdx] += 1
         let maxLocal = maxLocals[fnIdx]
         let localsBase = localsStackTop
@@ -637,8 +582,8 @@ public final class MIRInterpreter {
 
         setLocal(dest, result)
 
-        // Track .get_mut results
-        if calleeName == ".get_mut" && callArgs.count >= 2 {
+        // Track .get_mut / .get results for Map mutation write-back
+        if (calleeName == ".get_mut" || calleeName == ".get") && callArgs.count >= 2 {
             let receiverPlace: MirPlace?
             switch callArgs[0] {
             case .copy(let p), .move(let p): receiverPlace = p
@@ -655,14 +600,6 @@ public final class MIRInterpreter {
 
     private func callFunction(_ fn: MirFunction, args: [MirValue]) -> MirValue {
         if enableTrace { addTrace(fn.name, fn.entryBlock, .enterFunction, "args=\(args.map(\.description))") }
-
-        // DBG: trace get_type_def_by_name entry
-        if fn.name == "types::get_type_def_by_name" {
-            let nameStr = args.count > 1 ? args[1].displayString : "?"
-            let scopeDepth = callStack.count
-            fputs("DBG_GTDBN: ENTER name='\(nameStr)' scopeDepth=\(scopeDepth)\n", stderr)
-            fflush(stderr)
-        }
 
         guard let fnIdx = functionIndex[fn.name] else {
             let msg = "INTERPRETER: function '\(fn.name)' not found in program"
@@ -698,32 +635,6 @@ public final class MIRInterpreter {
 
             // Normal return — clean up and deliver to caller
             let calleeFnName = program.functions[callStack[callStack.count - 1].functionIdx].name
-            // DBG: trace get_type_def_by_name return
-            if calleeFnName == "types::get_type_def_by_name" {
-                let resultDesc = lastResult.description
-                let resultStr: String
-                // Note: MIR program uses fully-qualified type names like "core::Option"
-                if case .enumVal("core::Option", 0, let val) = lastResult {
-                    if case .structVal(let sn, _) = val { resultStr = "Some(\(sn))" }
-                    else { resultStr = "Some(\(val.displayString))" }
-                } else if case .enumVal("core::Option", 1, _) = lastResult { resultStr = "None" }
-                else { resultStr = resultDesc }
-                fputs("DBG_GTDBN: RESULT=\(resultStr)\n", stderr)
-                fflush(stderr)
-            }
-
-            // DBG: trace lookup_var return (FOUND vs FAIL)
-            if calleeFnName == "types::lookup_var" {
-                // Note: MIR program uses fully-qualified type names like "core::Option"
-                if case .enumVal("core::Option", 1, _) = lastResult {
-                    fputs("DBG_LOOKUP: FAIL name='\(lastLookupVarName)' inFn='\(currentCheckFnName)'\n", stderr)
-                    fflush(stderr)
-                } else if case .enumVal("core::Option", 0, let val) = lastResult {
-                    let tyStr = val.displayString
-                    fputs("DBG_LOOKUP: FOUND name='\(lastLookupVarName)' ty=\(tyStr) inFn='\(currentCheckFnName)'\n", stderr)
-                    fflush(stderr)
-                }
-            }
             popCallFrame()
             if enableTrace { addTrace(calleeFnName, -1, .exitFunction, "result=\(lastResult.description)") }
 
@@ -760,7 +671,15 @@ public final class MIRInterpreter {
             let blockId = callStack[frameIdx].currentBlock
 
             if stepCount >= nextProgressReportStep {
-                let message = "INTERPRETER_PROGRESS step=\(stepCount) fn=\(fn.name) block=\(blockId)"
+                let elapsed = Date().timeIntervalSince(startTime)
+                let rate: String
+                if elapsed > 0 {
+                    let stepsPerSec = Int(Double(stepCount) / elapsed)
+                    rate = " \(stepsPerSec) steps/s"
+                } else {
+                    rate = ""
+                }
+                let message = "INTERPRETER_PROGRESS step=\(stepCount) elapsed=\(String(format: "%.1f", elapsed))s\(rate) fn=\(fn.name) block=\(blockId)"
                 if let data = (message + "\n").data(using: .utf8) {
                     FileHandle.standardOutput.write(data)
                 }
@@ -851,19 +770,25 @@ public final class MIRInterpreter {
                             default:
                                 writeBackValue = result
                             }
-                            // The first arg operand is the receiver — update its local
+                            // The first arg operand is the receiver — update its local.
+                            // With borrow synthesis, callArgs[0] is a borrow ref temp;
+                            // follow mutBorrows back to the original place.
                             if let receiverPlace = { () -> MirPlace? in
                                 switch callArgs[0] {
                                 case .copy(let p), .move(let p): return p
                                 default: return nil
                                 }
                             }() {
-                                if receiverPlace.projections.isEmpty {
-                                    setLocal(receiverPlace.local, writeBackValue)
+                                let curFrame = callStack[callStack.count - 1]
+                                let borrowedPlace = curFrame.mutBorrows[receiverPlace.local] ?? receiverPlace
+                                if borrowedPlace.projections.isEmpty {
+                                    setLocal(borrowedPlace.local, writeBackValue)
+                                    propagateFieldCopy(borrowedPlace.local)
                                 } else {
-                                    var base = getLocal(receiverPlace.local)
-                                    base = setProjected(base, projections: receiverPlace.projections, value: writeBackValue)
-                                    setLocal(receiverPlace.local, base)
+                                    var base = getLocal(borrowedPlace.local)
+                                    base = setProjected(base, projections: borrowedPlace.projections, value: writeBackValue)
+                                    setLocal(borrowedPlace.local, base)
+                                    propagateFieldCopy(borrowedPlace.local)
                                 }
                                 // Map-mut write-back for mutating methods on tracked payloads
                                 if let tracking = callStack[callStack.count - 1].mapMutPayloads[receiverPlace.local] {
@@ -926,8 +851,8 @@ public final class MIRInterpreter {
 
                 setLocal(dest.local, result)
                 
-                // Track .get_mut results for map mutation write-back
-                if case .fn(let name) = calleeVal, name == ".get_mut" {
+                // Track .get_mut / .get results for map mutation write-back
+                if case .fn(let name) = calleeVal, name == ".get_mut" || name == ".get" {
                     if callArgs.count >= 2 {
                         let receiverPlace: MirPlace?
                         switch callArgs[0] {
@@ -978,6 +903,7 @@ public final class MIRInterpreter {
 
     // MARK: - Statement execution
 
+    @inline(__always)
     private func executeStatement(_ stmt: MirStatement, fn: MirFunction) {
         switch stmt {
         case .assign(let place, let rvalue):
@@ -997,14 +923,15 @@ public final class MIRInterpreter {
                     }
                     if let sp = srcPlace {
                         let frameIdx = callStack.count - 1
-                        var frame = callStack[frameIdx]
+                        // Direct subscript access — avoids copying the entire Frame struct
+                        // (which contains 5 dictionaries) on every assignment.
                         // Track downcast projections (e.g., Option::Some payload extraction)
                         if let lastProj = sp.projections.last,
                            case .downcast(let variantIdx) = lastProj {
-                            frame.downcastTracker[place.local] = (enumLocal: sp.local, variantIdx: variantIdx)
+                            callStack[frameIdx].downcastTracker[place.local] = (enumLocal: sp.local, variantIdx: variantIdx)
                             // Also propagate get_mut tracking through downcast
-                            if let tracking = frame.mapMutOptions[sp.local] {
-                                frame.mapMutPayloads[place.local] = tracking
+                            if let tracking = callStack[frameIdx].mapMutOptions[sp.local] {
+                                callStack[frameIdx].mapMutPayloads[place.local] = tracking
                             }
                         }
                         // Track lvalue copies so mutating method results can write back through
@@ -1018,21 +945,20 @@ public final class MIRInterpreter {
                                    return false
                                }
                            }) {
-                            frame.fieldCopyTracker[place.local] = sp
+                            callStack[frameIdx].fieldCopyTracker[place.local] = sp
                         }
                         // Propagate if source is already a tracked payload (copy/alias)
                         if sp.projections.isEmpty {
-                            if let tracking = frame.mapMutPayloads[sp.local] {
-                                frame.mapMutPayloads[place.local] = tracking
+                            if let tracking = callStack[frameIdx].mapMutPayloads[sp.local] {
+                                callStack[frameIdx].mapMutPayloads[place.local] = tracking
                             }
-                            if let tracking = frame.downcastTracker[sp.local] {
-                                frame.downcastTracker[place.local] = tracking
+                            if let tracking = callStack[frameIdx].downcastTracker[sp.local] {
+                                callStack[frameIdx].downcastTracker[place.local] = tracking
                             }
-                            if let tracking = frame.fieldCopyTracker[sp.local] {
-                                frame.fieldCopyTracker[place.local] = tracking
+                            if let tracking = callStack[frameIdx].fieldCopyTracker[sp.local] {
+                                callStack[frameIdx].fieldCopyTracker[place.local] = tracking
                             }
                         }
-                        callStack[frameIdx] = frame
                     }
                 }
                 if enableTrace { addTrace(fn.name, callStack.last!.currentBlock, .statement,
@@ -1082,6 +1008,7 @@ public final class MIRInterpreter {
 
     // MARK: - Rvalue evaluation
 
+    @inline(__always)
     private func evalRvalue(_ rvalue: MirRvalue) -> MirValue {
         switch rvalue {
         case .use(let op):
@@ -1103,14 +1030,20 @@ public final class MIRInterpreter {
                 return .tuple(vals)
             case .array:
                 return makeArray(vals)
-            case .structCtor(let name, let fieldNames):
-                var dict: [String: MirValue] = [:]
-                for (i, fname) in fieldNames.enumerated() {
-                    dict[fname] = i < vals.count ? vals[i] : .unit
-                }
-                structFieldOrders[name] = fieldNames
-                return .structVal(name, dict)
-            case .enumCtor(let name, let idx):
+             case .structCtor(let name, let fieldNames):
+                 var dict: [String: MirValue] = [:]
+                 for (i, fname) in fieldNames.enumerated() {
+                     dict[fname] = i < vals.count ? vals[i] : .unit
+                 }
+                 structFieldOrders[name] = fieldNames
+                 // Store by variant index if tagged struct, so downcast
+                 // can find the correct field order for each variant.
+                 if fieldNames.first == "_tag",
+                    let tagIdx = vals.first?.asInt {
+                     structFieldOrders["\(name)::v\(tagIdx)"] = Array(fieldNames.dropFirst())
+                 }
+                 return .structVal(name, dict)
+             case .enumCtor(let name, let idx):
                 let payload: MirValue
                 if let tdIndices = typeDefIndex[name] {
                     var resolvedPayload: MirValue? = nil
@@ -1136,7 +1069,12 @@ public final class MIRInterpreter {
                         }
 
                         if hasNamedPayloadStruct {
-                            resolvedPayload = vals.first ?? .unit
+                            let payloadStruct = vals.first ?? .unit
+                            // structFieldOrders is already populated at struct
+                            // construction (line 1032) with declaration-ordered
+                            // field names. Do NOT overwrite with Dictionary keys
+                            // which are hash-ordered and nondeterministic.
+                            resolvedPayload = payloadStruct
                         } else {
                             let fieldCount = variants[idx].1.count
                             if fieldCount == 0 {
@@ -1173,6 +1111,15 @@ public final class MIRInterpreter {
             if case .enumVal(_, let idx, _) = val {
                 return .int(idx)
             }
+            // Handle structVal-based enum: _tag field holds the discriminant
+            if case .structVal(_, let fields) = val, let tagVal = fields["_tag"] {
+                return tagVal
+            }
+            // Handle unit-only enum variants represented as bare integers
+            // (MIR lowers ExprPath for unit-only enums to MirInt(discriminant))
+            if case .int(let v) = val {
+                return .int(v)
+            }
             return .int(0)
 
         case .len(let place):
@@ -1195,13 +1142,63 @@ public final class MIRInterpreter {
             }
             return .int(0)
 
-        case .cast(let op, _):
-            return evalOperand(op)
+        case .cast(let op, let targetType):
+            let val = evalOperand(op)
+            // Integer-like types (Int, I8-U128, ISize, U8-U128, USize)
+            let intLikeNames: Set<String> = [
+                "I8", "I16", "I32", "I64", "I128", "ISize",
+                "U8", "U16", "U32", "U64", "U128", "USize"
+            ]
+            switch targetType {
+            case .int:
+                return convertToInt(val)
+            case .named(let n) where intLikeNames.contains(n):
+                return convertToInt(val)
+            case .float:
+                if let f = val.asFloat { return .float(f) }
+                if let i = val.asInt { return .float(Double(i)) }
+                if case .unit = val { return .float(0) }
+                return .float(0)
+            case .bool:
+                if let b = val.asBool { return .bool(b) }
+                if let i = val.asInt { return .bool(i != 0) }
+                if case .unit = val { return .bool(false) }
+                return .bool(false)
+            case .char:
+                if case .char(let c) = val { return .char(c) }
+                if let i = val.asInt, let u = UInt32(exactly: i),
+                   let scalar = UnicodeScalar(u) {
+                    return .char(Character(scalar))
+                }
+                if case .string(let s) = val, let first = s.first { return .char(first) }
+                return .char("\0")
+            case .string:
+                if case .string(let s) = val { return .string(s) }
+                return .string(val.displayString)
+            case .unit:
+                return .unit
+            default:
+                // For .named (non-integer type constructors), .ref, .rawPtr,
+                // .array, .slice, .tuple, .fn, .unknown — identity (no conversion)
+                return val
+            }
         }
+    }
+
+    /// Convert any value to an integer representation (.int).
+    @inline(__always)
+    private func convertToInt(_ val: MirValue) -> MirValue {
+        if let i = val.asInt { return .int(i) }
+        if case .unit = val { return .int(0) }
+        if case .float(let f) = val { return .int(Int(f)) }
+        if case .string(let s) = val { return .int(Int(s) ?? 0) }
+        if case .bool(let b) = val { return .int(b ? 1 : 0) }
+        return .int(0)
     }
 
     // MARK: - Operand evaluation
 
+    @inline(__always)
     private func evalOperand(_ op: MirOperand) -> MirValue {
         switch op {
         case .copy(let place), .move(let place):
@@ -1211,15 +1208,21 @@ public final class MIRInterpreter {
         }
     }
 
+    @inline(__always)
     private func loadPlaceValue(_ place: MirPlace) -> MirValue {
         var val = getLocal(place.local)
-        for proj in place.projections {
+        let projections = place.projections
+        let count = projections.count
+        var i = 0
+        while i < count {
             if halted { return .unit }
-            val = projectValue(val, proj)
+            val = projectValue(val, projections[i])
+            i += 1
         }
         return val
     }
 
+    @inline(__always)
     private func evalConstant(_ c: MirConstant) -> MirValue {
         switch c {
         case .unit: return .unit
@@ -1392,7 +1395,7 @@ public final class MIRInterpreter {
                 let fn = program.functions[frame.functionIdx]
                 let blockIdx = frame.currentBlock
                 let block = fn.blocks[blockIdx]
-                var s = ""
+                var s = "block=\(blockIdx) total_blocks=\(fn.blocks.count)"
                 for (i, st) in block.statements.enumerated() {
                     let marker = (i == frame.stmtIndex) ? ">>>" : "   "
                     s += "\n    \(marker) [\(i)] \(st)"
@@ -1421,10 +1424,9 @@ public final class MIRInterpreter {
             let localsDump: String = {
                 guard let frame = callStack.last else { return "" }
                 let fn = program.functions[frame.functionIdx]
-                // Dump key locals around the failing area: low-numbered (params) + 480-520 + 745-760
                 var s = ""
-                // Always dump low locals 0..15 to see params
-                let ranges: [(Int, Int)] = [(0, 15), (480, 520), (745, 760)]
+                // Dump key locals around the failing area
+                let ranges: [(Int, Int)] = [(0, 20), (310, 400), (480, 520), (745, 760)]
                 for (lo, hi) in ranges {
                     let lo2 = max(0, lo)
                     let hi2 = min(fn.locals.count, hi)
@@ -1437,10 +1439,36 @@ public final class MIRInterpreter {
                             desc = "enum(\(n)#\(v) inner=\(valueKindName(inner)))"
                         } else if case .tuple(let elems) = lv {
                             desc = "tuple(count=\(elems.count) elems=\(elems.prefix(4).map { valueKindName($0) }))"
-                        } else if case .structVal(let n, _) = lv {
-                            desc = "struct(\(n))"
+                        } else if case .structVal(let n, let fs) = lv {
+                            desc = "struct(\(n)) fields=\(fs.keys.sorted())"
                         }
                         s += "\n      _\(li): \(desc)"
+                    }
+                }
+                // Dump caller frame locals too for context
+                if callStack.count >= 2 {
+                    let callerFrame = callStack[callStack.count - 2]
+                    let callerFn = program.functions[callerFrame.functionIdx]
+                    let callerBlock = callerFrame.currentBlock
+                    s += "\n    [caller frame: \(callerFn.name) block=\(callerBlock)]"
+                    let callerRanges: [(Int, Int)] = [(0, 20), (310, 400)]
+                    for (lo, hi) in callerRanges {
+                        let lo2 = max(0, lo)
+                        let hi2 = min(callerFn.locals.count, hi)
+                        if lo2 >= hi2 { continue }
+                        s += "\n      --- caller range [\(lo2)..\(hi2)) ---"
+                        for li in lo2..<hi2 {
+                            let lv = getLocal(li)
+                            var desc = valueKindName(lv)
+                            if case .enumVal(let n, let v, let inner) = lv {
+                                desc = "enum(\(n)#\(v) inner=\(valueKindName(inner)))"
+                            } else if case .tuple(let elems) = lv {
+                                desc = "tuple(count=\(elems.count) elems=\(elems.prefix(4).map { valueKindName($0) }))"
+                            } else if case .structVal(let n, let fs) = lv {
+                                desc = "struct(\(n)) fields=\(fs.keys.sorted())"
+                            }
+                            s += "\n      _\(li): \(desc)"
+                        }
                     }
                 }
                 return s
@@ -1492,9 +1520,16 @@ public final class MIRInterpreter {
                 return failProjection(proj, on: val, detail: "raw value has no field \(idx)", fallback: .unit)
             }
         case .namedField(let name):
-            if case .structVal(_, let fields) = val {
-                return fields[name]
-                    ?? failProjection(proj, on: val, detail: "struct has no field '\(name)'", fallback: .unit)
+            if case .structVal(let sname, let fields) = val {
+                if let fieldVal = fields[name] {
+                    return fieldVal
+                }
+                // Single-field "ptr" structs (Box, Owned, Rc, Ptr) are transparent
+                // wrappers. Auto-deref through "ptr" when the field doesn't match.
+                if fields.count == 1, let inner = fields["ptr"] {
+                    return projectValue(inner, proj)
+                }
+                return failProjection(proj, on: val, detail: "struct \(sname) has no field '\(name)'", fallback: .unit)
             }
             // Handle tuple indexing via numeric field names ("0", "1", ...)
             if case .tuple(let elems) = val, let idx = Int(name), idx >= 0 && idx < elems.count {
@@ -1504,6 +1539,26 @@ public final class MIRInterpreter {
             return failProjection(proj, on: val, detail: "value has no named field '\(name)'", fallback: .unit)
         case .index(let localId):
             let idxVal = getLocal(localId)
+            // Map string-key indexing: map["key"] → lookup in native map
+            if case .string(let key) = idxVal,
+               case .structVal("Map", let fields) = val,
+               let nid = fields["_nid"]?.asInt,
+               let nativeMap = nativeMapStore[nid] {
+                if let result = nativeMap.get(.string(key)) {
+                    return result
+                }
+                return failProjection(proj, on: val, detail: "map key '\(key)' not found", fallback: .unit)
+            }
+            // Map integer-key indexing: map[int_key] → lookup in native map
+            if case .int(let intKey) = idxVal,
+               case .structVal("Map", let fields) = val,
+               let nid = fields["_nid"]?.asInt,
+               let nativeMap = nativeMapStore[nid] {
+                if let result = nativeMap.get(.int(intKey)) {
+                    return result
+                }
+                return failProjection(proj, on: val, detail: "map key \(intKey) not found", fallback: .unit)
+            }
             if let idx = idxVal.asInt {
                 if case .array(let elems) = val, idx >= 0 && idx < elems.count {
                     let result = elems[idx]
@@ -1531,7 +1586,7 @@ public final class MIRInterpreter {
                 }
                 return failProjection(proj, on: val, detail: "index \(idx) is invalid for \(valueKindName(val))", fallback: .unit)
             }
-            return failProjection(proj, on: val, detail: "index operand local _\(localId) was \(valueKindName(idxVal)), expected int", fallback: .unit)
+            return failProjection(proj, on: val, detail: "index operand local _\(localId) was \(valueKindName(idxVal)), expected int or string", fallback: .unit)
         case .constantIndex(let idx):
             if case .array(let elems) = val, idx < elems.count {
                 return elems[idx]
@@ -1545,10 +1600,60 @@ public final class MIRInterpreter {
             if case .enumVal(_, let idx, _) = val {
                 return failProjection(proj, on: val, detail: "downcast expected variant \(variantIdx), found \(idx)", fallback: .unit)
             }
+            // Handle structVal-based enum (from structCtor with _tag field):
+            // strip _tag field and return the payload fields only.
+            // IMPORTANT: structFieldOrders is SHARED across all variants of an enum type
+            // and may be overwritten by a different variant's construction.  We therefore
+            // determine payload fields from the ACTUAL dict keys (minus "_tag") rather
+            // than relying solely on structFieldOrders.
+            if case .structVal(let name, let fields) = val,
+               let tagVal = fields["_tag"],
+               tagVal.asInt == variantIdx {
+                // Compute payload field names from actual dict keys minus "_tag"
+                let payloadKeys = Set(fields.keys).subtracting(["_tag"])
+                if payloadKeys.isEmpty {
+                    return .unit
+                }
+                // Determine ordering: prefer structFieldOrders keyed by
+                // variant index (stable per-variant), falling back to
+                // the per-enum entry (shared/overwritten).
+                let payloadFieldNames: [String]
+                let variantKey = "\(name)::v\(variantIdx)"
+                if let order = structFieldOrders[variantKey],
+                   Set(order) == payloadKeys {
+                    payloadFieldNames = order
+                } else if let order = structFieldOrders[name],
+                   order.first == "_tag",
+                   Set(order.dropFirst()) == payloadKeys {
+                    payloadFieldNames = Array(order.dropFirst())
+                } else {
+                    // Type-def fallback: try to get declaration order from variant fields.
+                    // Since field names aren't stored, use alphabetical as last resort.
+                    payloadFieldNames = payloadKeys.sorted()
+                }
+                if payloadFieldNames.count == 1 {
+                    // Single-field payload: unwrap and return the value directly,
+                    // matching normalizedEnumPayload behavior for single-field variants.
+                    return fields[payloadFieldNames[0]] ?? .unit
+                }
+                // Multi-field payload: return as structVal with payload fields
+                var payloadFields: [String: MirValue] = [:]
+                for fname in payloadFieldNames {
+                    payloadFields[fname] = fields[fname] ?? .unit
+                }
+                let payloadName = "\(name)::payload_\(variantIdx)"
+                structFieldOrders[payloadName] = payloadFieldNames
+                return .structVal(payloadName, payloadFields)
+            }
             // Non-enum value: likely already unwrapped — return as-is instead of losing data
             return val
         case .deref:
-            return val // simplified: no real pointers
+            // Dereference through single-ptr-field wrappers (Box, Owned, Rc, etc.)
+            // and Ptr values to get the inner value.
+            if case .structVal(_, let fields) = val, fields.count == 1, let inner = fields["ptr"] {
+                return inner
+            }
+            return val // no-op for ref/rawPtr (transparent in interpreter)
         }
     }
 
@@ -1588,6 +1693,22 @@ public final class MIRInterpreter {
                 return failProjection(first, on: base, detail: "value has no named field '\(name)' for write", fallback: base)
             case .index(let localId):
                 let idxVal = getLocal(localId)
+                // Map string-key write: map["key"] = value → insert into native map
+                if case .string(let key) = idxVal,
+                   case .structVal("Map", let fields) = base,
+                   let nid = fields["_nid"]?.asInt,
+                   let nativeMap = nativeMapStore[nid] {
+                    nativeMap.insert(.string(key), value)
+                    return base  // Map is a reference type via nativeMapStore, already mutated
+                }
+                // Map integer-key write: map[int_key] = value → insert into native map
+                if case .int(let intKey) = idxVal,
+                   case .structVal("Map", let fields) = base,
+                   let nid = fields["_nid"]?.asInt,
+                   let nativeMap = nativeMapStore[nid] {
+                    nativeMap.insert(.int(intKey), value)
+                    return base
+                }
                 if let idx = idxVal.asInt {
                     if case .array(let elems) = base, idx >= 0 && idx < elems.count {
                         elems[idx] = value
@@ -1601,7 +1722,7 @@ public final class MIRInterpreter {
                     }
                     return failProjection(first, on: base, detail: "index \(idx) is invalid for write", fallback: base)
                 }
-                return failProjection(first, on: base, detail: "index operand local _\(localId) was \(valueKindName(idxVal)), expected int for write", fallback: base)
+                return failProjection(first, on: base, detail: "index operand local _\(localId) was \(valueKindName(idxVal)), expected int or string for write", fallback: base)
             case .constantIndex(let idx):
                 if case .array(let elems) = base, idx >= 0 && idx < elems.count {
                     elems[idx] = value
@@ -1650,8 +1771,8 @@ public final class MIRInterpreter {
         "read32_at", "write32_at", "write64_at",
         // String/intrinsic fast-paths
         "is_intrinsic", "bare_intrinsic_name", "canonical_fn_ref", "bare_name_from_qualified",
-        // Array helpers used by std::collections wrappers
-        "array_get", "collections::array_get", "std::collections::array_get", "__intrinsic_array_get",
+         // Array helpers used by std::collections wrappers
+         "array_get", "collections::array_get", "std::collections::array_get", "__intrinsic_array_get",
         // Startup argv helpers
         "raw_arg_count", "raw_arg", "raw_arg_unchecked", "raw_arg_copy",
         "std::args::raw_arg_count", "std::args::raw_arg", "std::args::raw_arg_unchecked", "std::args::raw_arg_copy",
@@ -1699,6 +1820,8 @@ public final class MIRInterpreter {
         "a64_and_rrr", "a64_orr_rrr", "a64_eor_rrr", "a64_mul_rrr", "a64_sdiv_rrr",
         "a64_sub_rri", "a64_blr", "a64_ret",
         "a64_stp_pre", "a64_ldp_post", "a64_mov_w", "a64_sxtw", "a64_sub_sp_sp_r",
+        "__intrinsic_syscall1", "__intrinsic_syscall2", "__intrinsic_syscall3",
+        "__intrinsic_syscall4", "__intrinsic_syscall5", "__intrinsic_syscall6",
     ]
 
     private static let nativeFastPathPrefixes = [
@@ -1830,21 +1953,56 @@ public final class MIRInterpreter {
 
     @inline(__always)
     private static func enumTag(_ value: MirValue, named expected: String) -> Int? {
-        guard case .enumVal(let name, let idx, _) = value else { return nil }
-        return nativeBareNameFromQualified(name) == expected ? idx : nil
+        if case .enumVal(let name, let idx, _) = value {
+            return nativeBareNameFromQualified(name) == expected ? idx : nil
+        }
+        // Handle structVal-based enum (Swift MIRLowering uses structCtor with _tag for enum constants)
+        if case .structVal(let name, let fields) = value, let tagVal = fields["_tag"], let idx = tagVal.asInt {
+            return nativeBareNameFromQualified(name) == expected ? idx : nil
+        }
+        return nil
     }
 
     @inline(__always)
     private static func enumCase(_ value: MirValue, named expected: String) -> (Int, MirValue)? {
-        guard case .enumVal(let name, let idx, let payload) = value else { return nil }
-        guard nativeBareNameFromQualified(name) == expected else { return nil }
-        return (idx, payload)
+        if case .enumVal(let name, let idx, let payload) = value {
+            guard nativeBareNameFromQualified(name) == expected else { return nil }
+            return (idx, payload)
+        }
+        // Handle structVal-based enum (Swift MIRLowering uses structCtor with _tag for enum constants)
+        if case .structVal(let name, let fields) = value, let tagVal = fields["_tag"], let idx = tagVal.asInt {
+            guard nativeBareNameFromQualified(name) == expected else { return nil }
+            return (idx, value)
+        }
+        return nil
+    }
+
+    @inline(__always)
+    private static func physRegDecompose(_ value: MirValue) -> (isA64: Bool, innerEnum: MirValue)? {
+        // Decompose a PhysReg value into (isA64, innerEnumValue).
+        // Handles both native .enumVal and structVal-based enum representations.
+        // The MIRLowering lowers enum variants WITH fields to structCtor with _tag,
+        // while unit variants use enumCtor — so PhysReg (which wraps X64/A64) is
+        // always structVal-based, but we handle both for robustness.
+        // Native enumVal representation
+        if case .enumVal(let name, let idx, let payload) = value,
+           nativeBareNameFromQualified(name) == "PhysReg" {
+            return (idx == 1, payload)
+        }
+        // StructVal-based enum representation (MIRLowering structCtor with _tag)
+        if case .structVal(let name, let fields) = value,
+           nativeBareNameFromQualified(name) == "PhysReg",
+           let tagVal = fields["_tag"], let tag = tagVal.asInt {
+            let inner = fields["0"] ?? .unit
+            return (tag == 1, inner)
+        }
+        return nil
     }
 
     @inline(__always)
     private static func physRegA64Index(_ value: MirValue) -> Int? {
-        guard let (kind, payload) = enumCase(value, named: "PhysReg"), kind == 1 else { return nil }
-        return enumTag(payload, named: "A64")
+        guard let (isA64, inner) = physRegDecompose(value), isA64 else { return nil }
+        return enumTag(inner, named: "A64")
     }
 
     @inline(__always)
@@ -2240,6 +2398,17 @@ public final class MIRInterpreter {
                     "end_pos": bf["end_pos"] ?? .int(0)
                 ])
             }
+        case "array_push", "__intrinsic_array_push":
+            // Emit: ldr x0, [x0] + bl _tg_array_push
+            fputs("[NATIVE] array_push handler called!\n", stderr)
+            if args.count >= 2,
+               case .structVal(let sn, var bf) = args[0] {
+                let bb = getOrUpgradeByteBuffer(&bf)
+                appendWord(bb, 0xF9400000) // ldr x0, [x0]
+                appendWord(bb, 0x94000000) // bl _tg_array_push
+                recordMutatedFirstArg(.structVal(sn, bf))
+                return .unit
+            }
         default:
             break  // Fall through to codegen shortcuts
         }
@@ -2248,6 +2417,19 @@ public final class MIRInterpreter {
         // These eliminate deep call chains (emit32_le calls emit8 4x each)
         // Use MirByteBuffer (reference type) to avoid O(n) COW copies on every emit.
         switch fastPathName {
+        case "array_push", "__intrinsic_array_push":
+            // Emit: ldr x0, [x0] + bl _tg_array_push
+            fputs("[NATIVE] array_push handler called!\n", stderr)
+            if args.count >= 2,
+               case .structVal(let sn, var bf) = args[0] {
+                let bb = getOrUpgradeByteBuffer(&bf)
+                // ldr x0, [x0]  = 0xF9400000
+                appendWord(bb, 0xF9400000)
+                // bl _tg_array_push — emit BL with relocation fixup
+                appendWord(bb, 0x94000000)
+                recordMutatedFirstArg(.structVal(sn, bf))
+                return .unit
+            }
         case "emit8", "tg_compiler::asm::emit8":
             // emit8(b: &mut CodeBuffer, v: u8) → b.bytes.push(v)
             if args.count >= 2,
@@ -2492,8 +2674,10 @@ public final class MIRInterpreter {
                 return .int(((scale & 3) << 6) | ((idx & 7) << 3) | (base & 7))
             }
         case "span_new":
-            // span_new(start: Int, end_pos: Int) -> Span
-            if args.count >= 2 {
+            // span_new(start: Int, end_pos: Int, path: String = "") -> Span
+            if args.count >= 3, case .string(let file) = args[2] {
+                return .structVal("Span", ["file": .string(file), "start": args[0], "end_pos": args[1]])
+            } else if args.count >= 2 {
                 return .structVal("Span", ["file": .string(""), "start": args[0], "end_pos": args[1]])
             }
         case "is_intrinsic":
@@ -2550,9 +2734,12 @@ public final class MIRInterpreter {
             }
             return .bool(false)
         case "phys_reg_id":
-            if let (_, inner) = Self.enumCase(args.first ?? .unit, named: "PhysReg") {
-                if let idx = Self.enumTag(inner, named: "X64") { return .int(idx) }
-                if let idx = Self.enumTag(inner, named: "A64") { return .int(min(idx, 31)) }
+            if let (isA64, inner) = Self.physRegDecompose(args.first ?? .unit) {
+                if isA64 {
+                    if let idx = Self.enumTag(inner, named: "A64") { return .int(min(idx, 31)) }
+                } else {
+                    if let idx = Self.enumTag(inner, named: "X64") { return .int(idx) }
+                }
             }
             return .int(0)
         // ── ARM64 instruction encoding (inline emit32_le via CodeBuffer structVal) ──
@@ -2647,9 +2834,23 @@ public final class MIRInterpreter {
                 if let r = emitWordToCodeBuf(args[0], 0xEB00_001F | (UInt32(min(mIdx,31)) << 16) | (UInt32(min(nIdx,31)) << 5)) { return r }
             }
         case "a64_cmp_ri":
-            if let nIdx = Self.enumTag(args[1], named: "A64"),
+            if case .structVal(let sn, var bf) = args[0],
+               let nIdx = Self.enumTag(args[1], named: "A64"),
                let imm = args[2].asInt {
-                if let r = emitWordToCodeBuf(args[0], 0xF100_001F | (UInt32(imm & 0xFFF) << 10) | (UInt32(min(nIdx,31)) << 5)) { return r }
+                let bb = getOrUpgradeByteBuffer(&bf)
+                let uimm = UInt32(imm & 0xFFFFFFFF)
+                let n = UInt32(min(nIdx, 31))
+                if uimm <= 0xFFF {
+                    appendWord(bb, 0xF100_001F | (uimm << 10) | (n << 5))
+                } else if (uimm & 0xFFF) == 0 && (uimm >> 12) <= 0xFFF {
+                    appendWord(bb, 0xF140_001F | ((uimm >> 12) << 10) | (n << 5))
+                } else {
+                    let scratch = (nIdx == 16) ? 17 : 16
+                    emitA64MoveImmediate(bb, dstIndex: scratch, imm: Int(uimm))
+                    appendWord(bb, 0xEB00_001F | (UInt32(scratch) << 16) | (n << 5))
+                }
+                recordMutatedFirstArg(.structVal(sn, bf))
+                return .unit
             }
         case "a64_cset":
             if let dIdx = Self.enumTag(args[1], named: "A64"),
@@ -2695,10 +2896,25 @@ public final class MIRInterpreter {
                 if let r = emitWordToCodeBuf(args[0], 0x9AC0_0C00 | (UInt32(min(mIdx,31)) << 16) | (UInt32(min(nIdx,31)) << 5) | UInt32(min(dIdx,31))) { return r }
             }
         case "a64_sub_rri":
-            if let dIdx = Self.enumTag(args[1], named: "A64"),
+            if case .structVal(let sn, var bf) = args[0],
+               let dIdx = Self.enumTag(args[1], named: "A64"),
                let nIdx = Self.enumTag(args[2], named: "A64"),
                let imm = args[3].asInt {
-                if let r = emitWordToCodeBuf(args[0], 0xD100_0000 | (UInt32(imm & 0xFFF) << 10) | (UInt32(min(nIdx,31)) << 5) | UInt32(min(dIdx,31))) { return r }
+                let bb = getOrUpgradeByteBuffer(&bf)
+                let uimm = UInt32(imm & 0xFFFFFFFF)
+                let n = UInt32(min(nIdx, 31))
+                let d = UInt32(min(dIdx, 31))
+                if uimm <= 0xFFF {
+                    appendWord(bb, 0xD100_0000 | (uimm << 10) | (n << 5) | d)
+                } else if (uimm & 0xFFF) == 0 && (uimm >> 12) <= 0xFFF {
+                    appendWord(bb, 0xD140_0000 | ((uimm >> 12) << 10) | (n << 5) | d)
+                } else {
+                    let scratch = (nIdx == 16 || dIdx == 16) ? 17 : 16
+                    emitA64MoveImmediate(bb, dstIndex: scratch, imm: Int(uimm))
+                    appendWord(bb, 0xCB00_0000 | (UInt32(scratch) << 16) | (n << 5) | d)
+                }
+                recordMutatedFirstArg(.structVal(sn, bf))
+                return .unit
             }
         case "a64_blr":
             if let nIdx = Self.enumTag(args[1], named: "A64") {
@@ -2902,69 +3118,69 @@ public final class MIRInterpreter {
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 } else if offset < 0 {
-                    // Negative large offset: load abs value into X15, SUB from base, LDUR
-                    let x15: UInt32 = 15
+                    // Negative large offset: load abs value into X13, SUB from base, LDUR
+                    let x13: UInt32 = 13
                     let absOff = UInt64(Int64(-offset))
-                    var w: UInt32 = 0xD280_0000 | (UInt32(absOff & 0xFFFF) << 5) | x15 // MOVZ
+                    var w: UInt32 = 0xD280_0000 | (UInt32(absOff & 0xFFFF) << 5) | x13 // MOVZ
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     let lane1 = UInt32((absOff >> 16) & 0xFFFF)
                     if lane1 != 0 {
-                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x15
+                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane2 = UInt32((absOff >> 32) & 0xFFFF)
                     if lane2 != 0 {
-                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x15
+                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane3 = UInt32((absOff >> 48) & 0xFFFF)
                     if lane3 != 0 {
-                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x15
+                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
-                    // SUB X15, base, X15
-                    w = 0xCB00_0000 | (x15 << 16) | (b << 5) | x15
+                    // SUB X13, base, X13
+                    w = 0xCB00_0000 | (x13 << 16) | (b << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
-                    // LDUR d, [X15, #0]
-                    w = 0xF840_0000 | (x15 << 5) | d
+                    // LDUR d, [X13, #0]
+                    w = 0xF840_0000 | (x13 << 5) | d
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 } else {
-                    // Positive large offset: load value into X15, ADD to base, LDUR
-                    let x15: UInt32 = 15
+                    // Positive large offset: load value into X13, ADD to base, LDUR
+                    let x13: UInt32 = 13
                     let u = UInt64(bitPattern: Int64(offset))
-                    var w: UInt32 = 0xD280_0000 | (UInt32(u & 0xFFFF) << 5) | x15
+                    var w: UInt32 = 0xD280_0000 | (UInt32(u & 0xFFFF) << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     let lane1 = UInt32((u >> 16) & 0xFFFF)
                     if lane1 != 0 {
-                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x15
+                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane2 = UInt32((u >> 32) & 0xFFFF)
                     if lane2 != 0 {
-                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x15
+                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane3 = UInt32((u >> 48) & 0xFFFF)
                     if lane3 != 0 {
-                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x15
+                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
-                    // ADD X15, base, X15
-                    w = 0x8B00_0000 | (x15 << 16) | (b << 5) | x15
+                    // ADD X13, base, X13
+                    w = 0x8B00_0000 | (x13 << 16) | (b << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
-                    // LDUR d, [X15, #0]
-                    w = 0xF840_0000 | (x15 << 5) | d
+                    // LDUR d, [X13, #0]
+                    w = 0xF840_0000 | (x13 << 5) | d
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 }
@@ -2992,69 +3208,69 @@ public final class MIRInterpreter {
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 } else if offset < 0 {
-                    // Negative large offset: load abs value into X15, SUB from base, STUR
-                    let x15: UInt32 = 15
+                    // Negative large offset: load abs value into X13, SUB from base, STUR
+                    let x13: UInt32 = 13
                     let absOff = UInt64(Int64(-offset))
-                    var w: UInt32 = 0xD280_0000 | (UInt32(absOff & 0xFFFF) << 5) | x15 // MOVZ
+                    var w: UInt32 = 0xD280_0000 | (UInt32(absOff & 0xFFFF) << 5) | x13 // MOVZ
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     let lane1 = UInt32((absOff >> 16) & 0xFFFF)
                     if lane1 != 0 {
-                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x15
+                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane2 = UInt32((absOff >> 32) & 0xFFFF)
                     if lane2 != 0 {
-                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x15
+                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane3 = UInt32((absOff >> 48) & 0xFFFF)
                     if lane3 != 0 {
-                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x15
+                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
-                    // SUB X15, base, X15
-                    w = 0xCB00_0000 | (x15 << 16) | (b << 5) | x15
+                    // SUB X13, base, X13
+                    w = 0xCB00_0000 | (x13 << 16) | (b << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
-                    // STUR s, [X15, #0]
-                    w = 0xF800_0000 | (x15 << 5) | s
+                    // STUR s, [X13, #0]
+                    w = 0xF800_0000 | (x13 << 5) | s
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 } else {
-                    // Positive large offset: load value into X15, ADD to base, STUR
-                    let x15: UInt32 = 15
+                    // Positive large offset: load value into X13, ADD to base, STUR
+                    let x13: UInt32 = 13
                     let u = UInt64(bitPattern: Int64(offset))
-                    var w: UInt32 = 0xD280_0000 | (UInt32(u & 0xFFFF) << 5) | x15
+                    var w: UInt32 = 0xD280_0000 | (UInt32(u & 0xFFFF) << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     let lane1 = UInt32((u >> 16) & 0xFFFF)
                     if lane1 != 0 {
-                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x15
+                        w = 0xF280_0000 | (1 << 21) | (lane1 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane2 = UInt32((u >> 32) & 0xFFFF)
                     if lane2 != 0 {
-                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x15
+                        w = 0xF280_0000 | (2 << 21) | (lane2 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
                     let lane3 = UInt32((u >> 48) & 0xFFFF)
                     if lane3 != 0 {
-                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x15
+                        w = 0xF280_0000 | (3 << 21) | (lane3 << 5) | x13
                         bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                         bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                     }
-                    // ADD X15, base, X15
-                    w = 0x8B00_0000 | (x15 << 16) | (b << 5) | x15
+                    // ADD X13, base, X13
+                    w = 0x8B00_0000 | (x13 << 16) | (b << 5) | x13
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
-                    // STUR s, [X15, #0]
-                    w = 0xF800_0000 | (x15 << 5) | s
+                    // STUR s, [X13, #0]
+                    w = 0xF800_0000 | (x13 << 5) | s
                     bb.data.append(UInt8(truncatingIfNeeded: w)); bb.data.append(UInt8(truncatingIfNeeded: w >> 8))
                     bb.data.append(UInt8(truncatingIfNeeded: w >> 16)); bb.data.append(UInt8(truncatingIfNeeded: w >> 24))
                 }
@@ -3174,13 +3390,13 @@ public final class MIRInterpreter {
                 }
                 let reg = freeRegs.removeLast()
                 fields["free_regs"] = .array(freeRegs)
-                if let (kind, inner) = Self.enumCase(reg, named: "PhysReg") {
+                if let (isA64, inner) = Self.physRegDecompose(reg) {
                     var isCalleeSaved = false
                     var regId = 0
-                    if kind == 1, let idx = Self.enumTag(inner, named: "A64") {
+                    if isA64, let idx = Self.enumTag(inner, named: "A64") {
                         regId = min(idx, 31)
                         isCalleeSaved = idx >= 19 && idx <= 28
-                    } else if kind == 0, let idx = Self.enumTag(inner, named: "X64") {
+                    } else if !isA64, let idx = Self.enumTag(inner, named: "X64") {
                         regId = idx
                         isCalleeSaved = idx == 3 || idx == 5 || (idx >= 12 && idx <= 15)
                     }
@@ -3278,10 +3494,19 @@ public final class MIRInterpreter {
         case "emit_cmp_ri":
             if let rIdx = Self.physRegA64Index(args[1]),
                let imm = args[2].asInt,
-               imm >= 0 && imm <= 0xFFF,
                let r = withCodegenTextBuffer(args[0], { bb in
-                   appendWord(bb, 0xF100_001F | (UInt32(imm) << 10) | (UInt32(min(rIdx, 31)) << 5))
-               }) {
+                    let uimm = UInt32(imm & 0xFFFFFFFF)
+                    let n = UInt32(min(rIdx, 31))
+                    if uimm <= 0xFFF {
+                        appendWord(bb, 0xF100_001F | (uimm << 10) | (n << 5))
+                    } else if (uimm & 0xFFF) == 0 && (uimm >> 12) <= 0xFFF {
+                        appendWord(bb, 0xF140_001F | ((uimm >> 12) << 10) | (n << 5))
+                    } else {
+                        let scratch = (rIdx == 16) ? 17 : 16
+                        emitA64MoveImmediate(bb, dstIndex: scratch, imm: Int(uimm))
+                        appendWord(bb, 0xEB00_001F | (UInt32(scratch) << 16) | (n << 5))
+                    }
+                }) {
                 return r
             }
         case "emit_setcc":
@@ -3371,7 +3596,9 @@ public final class MIRInterpreter {
             case 1:
                 FileHandle.standardOutput.write(data)
             default:
-                break
+                let _ = data.withUnsafeBytes { buf in
+                    write(Int32(fd), buf.baseAddress, data.count)
+                }
             }
             return .int(bytes.count)
         case "libc_getenv":
@@ -3381,6 +3608,78 @@ public final class MIRInterpreter {
             }
             let bytes = value.utf8.map { MirValue.int(Int($0)) } + [.int(0)]
             return makeArray(bytes)
+        case "libc_system":
+            guard let cmd = cString(from: args.first ?? .int(0)) else {
+                return .int(-1)
+            }
+            let proc = Process()
+            proc.launchPath = "/bin/sh"
+            proc.arguments = ["-c", cmd]
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                return .int(Int(proc.terminationStatus))
+            } catch {
+                return .int(-1)
+            }
+        case "libc_open_path":
+            guard let path = cString(from: args.first ?? .int(0)) else {
+                return .int(-1)
+            }
+            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            return .int(Int(fd))
+        case "libc_close":
+            let fd = args.first?.asInt ?? -1
+            return .int(Int(close(Int32(fd))))
+        case "libc_chmod":
+            guard let path = cString(from: args.first ?? .int(0)) else {
+                return .int(-1)
+            }
+            let mode = args.count > 1 ? args[1].asInt ?? 0 : 0
+            return .int(Int(chmod(path, mode_t(mode))))
+        case "_tg_write_vec_u8":
+            let fd = args.first?.asInt ?? -1
+            let count = args.count > 2 ? max(0, args[2].asInt ?? 0) : Int.max
+            let bytes = byteSlice(from: args.count > 1 ? args[1] : .unit, limit: count)
+            let data = Data(bytes)
+            if fd == 1 {
+                FileHandle.standardOutput.write(data)
+            } else if fd == 2 {
+                FileHandle.standardError.write(data)
+            } else {
+                _ = data.withUnsafeBytes { buf in
+                    write(Int32(fd), buf.baseAddress, data.count)
+                }
+            }
+            return .int(bytes.count)
+        case "_tg_normalize_string":
+            return args.first ?? .int(0)
+        case "clock_gettime_nsec":
+            // Return monotonic time in nanoseconds using Mach absolute time.
+            // This is only called when --time is passed; during normal bootstrap
+            // compilation --time is not set, so this path is typically unreachable.
+            var info = mach_timebase_info_data_t(numer: 0, denom: 0)
+            mach_timebase_info(&info)
+            let now = mach_absolute_time()
+            let nanos = now * UInt64(info.numer) / UInt64(info.denom)
+            return .int(Int(truncatingIfNeeded: nanos))
+        case "get_current_rss_kb":
+            // Return current resident set size in kilobytes using getrusage.
+            // Only called when --time is passed; bootstrap runs do not use this.
+            var usage = rusage()
+            let result = withUnsafeMutablePointer(to: &usage) { ptr in
+                getrusage(RUSAGE_SELF, ptr)
+            }
+            if result == 0 {
+                // On macOS ru_maxrss is in bytes, convert to KB
+                return .int(Int(usage.ru_maxrss) / 1024)
+            }
+            return .int(0)
+
+        case "_tg_bump_reset":
+            // Interpreter uses host memory management; bump reset is a no-op
+            // at the interpreted level (only meaningful in native codegen).
+            return .unit
 
         // ── Type constructors ───────────────────────────────────
         case "Vec::new", "Array::new", "Vec::with_capacity", "Array::with_capacity",
@@ -3401,8 +3700,125 @@ public final class MIRInterpreter {
             let n = args.first?.asInt ?? 0
             let val = args.count > 1 ? args[1] : .unit
             return makeArray(Array(repeating: val, count: n))
-        case "Map::new", "HashMap::new", "Set::new":
+        case "Map::new", "HashMap::new", "Set::new",
+             "Map::with_capacity", "HashMap::with_capacity", "Set::with_capacity",
+             "__intrinsic_map_with_capacity":
             return makeNativeMap()
+
+        // ── Map native fast-paths (used by borrow checker and type checker) ──
+        // These ensure Map operations work correctly even when the interpreted
+        // stdlib implementation would hit unsupported patterns.
+        case "map_get", "Map::get", "collections::map_get", "std::collections::map_get":
+            // map_get(map: Map[K,V], key: K) -> Option[V]
+            if args.count >= 2, let nativeMap = getNativeMap(args[0]) {
+                if let result = nativeMap.get(args[1]) {
+                    return .enumVal("Option", 0, result)
+                }
+                return .enumVal("Option", 1, .unit)
+            }
+            // Fallback: search entries array for non-native maps
+            if args.count >= 2,
+               case .structVal("Map", let fields) = args[0],
+               case .array(let entries) = fields["entries"] {
+                for entry in entries {
+                    if case .tuple(let kv) = entry, kv.count >= 2, kv[0] == args[1] {
+                        return .enumVal("Option", 0, kv[1])
+                    }
+                }
+                return .enumVal("Option", 1, .unit)
+            }
+            return .enumVal("Option", 1, .unit)
+        case "map_insert", "Map::insert", "collections::map_insert", "std::collections::map_insert":
+            // map_insert(map: &mut Map[K,V], key: K, value: V) -> Unit
+            if args.count >= 3, let nativeMap = getNativeMap(args[0]) {
+                nativeMap.insert(args[1], args[2])
+                return args[0]
+            }
+            // Fallback for non-native maps
+            if args.count >= 3,
+               case .structVal("Map", var fields) = args[0],
+               case .array(var entries) = fields["entries"] {
+                var found = false
+                for i in 0..<entries.count {
+                    if case .tuple(let kv) = entries[i], kv.count >= 2, kv[0] == args[1] {
+                        entries[i] = .tuple([args[1], args[2]])
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    entries.append(.tuple([args[1], args[2]]))
+                }
+                fields["entries"] = .array(entries)
+                return .structVal("Map", fields)
+            }
+            return args[0]
+        case "map_contains", "map_contains_key", "Map::contains_key", "collections::map_contains_key", "std::collections::map_contains_key":
+            // map_contains_key(map: &Map[K,V], key: K) -> Bool
+            if args.count >= 2, let nativeMap = getNativeMap(args[0]) {
+                return .bool(nativeMap.get(args[1]) != nil)
+            }
+            if args.count >= 2,
+               case .structVal("Map", let fields) = args[0],
+               case .array(let entries) = fields["entries"] {
+                for entry in entries {
+                    if case .tuple(let kv) = entry, kv.count >= 2, kv[0] == args[1] {
+                        return .bool(true)
+                    }
+                }
+            }
+            return .bool(false)
+        case "map_remove", "Map::remove", "collections::map_remove", "std::collections::map_remove":
+            // map_remove(map: &mut Map[K,V], key: K) -> Option[V]
+            if args.count >= 2, let nativeMap = getNativeMap(args[0]) {
+                if let result = nativeMap.get(args[1]) {
+                    nativeMap.remove(args[1])
+                    return .enumVal("Option", 0, result)
+                }
+                return .enumVal("Option", 1, .unit)
+            }
+            return .enumVal("Option", 1, .unit)
+        case "map_len", "Map::len", "collections::map_len", "std::collections::map_len":
+            // map_len(map: &Map[K,V]) -> Int
+            if let nativeMap = getNativeMap(args.first ?? .unit) {
+                return .int(nativeMap.count)
+            }
+            if case .structVal("Map", let fields) = args.first,
+               case .array(let entries) = fields["entries"] {
+                return .int(entries.count)
+            }
+            return .int(0)
+        case "map_clear", "Map::clear", "collections::map_clear", "std::collections::map_clear":
+            // map_clear(map: &mut Map[K,V]) -> Unit
+            if let nativeMap = getNativeMap(args.first ?? .unit) {
+                nativeMap.dict.removeAll()
+            }
+            return args.first ?? .unit
+        case "map_keys", "Map::keys", "collections::map_keys", "std::collections::map_keys":
+            // map_keys(map: &Map[K,V]) -> Vec[K]
+            if let nativeMap = getNativeMap(args.first ?? .unit) {
+                let keys = nativeMap.dict.values.map { $0.key }
+                return makeArray(keys)
+            }
+            return makeArray([MirValue]())
+        case "map_values", "Map::values", "collections::map_values", "std::collections::map_values":
+            // map_values(map: &Map[K,V]) -> Vec[V]
+            if let nativeMap = getNativeMap(args.first ?? .unit) {
+                let values = nativeMap.dict.values.map { $0.value }
+                return makeArray(values)
+            }
+            return makeArray([MirValue]())
+        case "map_entries", "Map::entries", "collections::map_entries", "std::collections::map_entries":
+            // map_entries(map: &Map[K,V]) -> Vec[(K,V)]
+            if let nativeMap = getNativeMap(args.first ?? .unit) {
+                return makeArray(nativeMap.toEntries())
+            }
+            if case .structVal("Map", let fields) = args.first,
+               case .array(let entries) = fields["entries"] {
+                return makeArray(entries)
+            }
+            return makeArray([MirValue]())
+
         case "String::new":
             return .string("")
         case "String::from_bytes":
@@ -3414,7 +3830,9 @@ public final class MIRInterpreter {
             }
             return .string("")
         case "Box::new":
-            return args.first ?? .unit
+            // Box::new(val): wrap the value in a Box struct so projections work.
+            // Box[T] = struct { ptr: Ptr[T] }
+            return .structVal("Box", ["ptr": args.first ?? .unit])
         case "Option::Some":
             return .enumVal("Option", 0, args.first ?? .unit)
         case "Option::None":
@@ -3442,6 +3860,14 @@ public final class MIRInterpreter {
             return .structVal("Sha256", ["_data": .array([])])
 
         // ── Vec / Array methods (receiver is args[0]) ───────────
+        case ".reserve":
+            // .reserve(capacity: Int) — Pre-allocate Vec/Array capacity (no-op in interpreter,
+            // but must not fail to resolve)
+            if case .array(let elems) = args.first, args.count > 1, let n = args[1].asInt {
+                elems.elements.reserveCapacity(n)
+                return args.first!
+            }
+            return args.first ?? .unit
         case ".push":
             if case .array(var elems) = args.first, args.count > 1 {
                 if case .unit = args[1] {
@@ -3485,39 +3911,9 @@ public final class MIRInterpreter {
                let s = f["start"]?.asInt, let e = f["end"]?.asInt {
                 return .int(max(0, e - s + 1))
             }
-            // DBG: trace Vec.len when called from get_type_def_by_name
-            let isGTDBN = callStack.last.map({ program.functions[$0.functionIdx].name == "types::get_type_def_by_name" }) ?? false
-            if isGTDBN, case .array(let elems) = args.first {
-                fputs("DBG_GTDBN: type_list.len() = \(elems.count)\n", stderr)
-                fflush(stderr)
-            }
-            // DBG: detect .len fallthrough during type checking
-            if callStack.last.map({ program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("type_check") }) ?? false {
-                let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
-                let valKind = valueKindName(args.first ?? .unit)
-                if case .structVal(let sn, let fields) = args.first ?? .unit {
-                    fputs("DBG_LEN: fn=\(fnName) struct=\(sn) fields=[\(fields.keys.joined(separator: ","))]\n", stderr)
-                } else {
-                    fputs("DBG_LEN: fn=\(fnName) kind=\(valKind)\n", stderr)
-                }
-                fflush(stderr)
-            }
             return .int(0)
         case ".get":
             if case .array(let elems) = args.first, let idx = args.dropFirst().first?.asInt {
-                // DBG: trace Vec.get when called from get_type_def_by_name
-                let isGTDBN = callStack.last.map({ program.functions[$0.functionIdx].name == "types::get_type_def_by_name" }) ?? false
-                if isGTDBN && idx >= 0 && idx < elems.count {
-                    let elemDesc: String
-                    if case .structVal(let sn, let fields) = elems[idx] {
-                        let nameField = fields["name"]?.displayString ?? "?"
-                        elemDesc = "struct \(sn)(name=\(nameField))"
-                    } else {
-                        elemDesc = elems[idx].displayString
-                    }
-                    fputs("DBG_GTDBN: Vec.get(\(idx)) = \(elemDesc) (vecSize=\(elems.count))\n", stderr)
-                    fflush(stderr)
-                }
                 if idx >= 0 && idx < elems.count {
                     return .enumVal("Option", 0, elems[idx])
                 }
@@ -3525,15 +3921,6 @@ public final class MIRInterpreter {
             // Native Map.get(key)
             if let nm = getNativeMap(args.first ?? .unit) {
                 let key = args.count > 1 ? args[1] : .unit
-                let isTypeCheck = callStack.last.map({ program.functions[$0.functionIdx].name.contains("type_check") || program.functions[$0.functionIdx].name.contains("bind_var") || program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("check_item") || program.functions[$0.functionIdx].name.contains("lookup_var") }) ?? false
-                if isTypeCheck {
-                    let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
-                    let keyStr = key.displayString
-                    let found = nm.get(key) != nil
-                    let mapCount = nm.count
-                    fputs("DBG_GET: fn=\(fnName) key='\(keyStr)' found=\(found) mapSize=\(mapCount) _nid=\(args.first.flatMap { v in if case .structVal("Map", let f) = v, case .int(let nid)? = f["_nid"] { return nid } else { return nil } } ?? -1)\n", stderr)
-                    fflush(stderr)
-                }
                 if let val = nm.get(key) { return .enumVal("Option", 0, val) }
                 return .enumVal("Option", 1, .unit)
             }
@@ -3855,15 +4242,6 @@ public final class MIRInterpreter {
         case ".insert":
             // Native Map.insert(key, value)
             if let nm = getNativeMap(args.first ?? .unit), args.count >= 3 {
-                let isTypeCheck = callStack.last.map({ program.functions[$0.functionIdx].name.contains("type_check") || program.functions[$0.functionIdx].name.contains("bind_var") || program.functions[$0.functionIdx].name.contains("check_function") || program.functions[$0.functionIdx].name.contains("check_item") || program.functions[$0.functionIdx].name.contains("lookup_var") }) ?? false
-                if isTypeCheck {
-                    let fnName = callStack.last.map { program.functions[$0.functionIdx].name } ?? "?"
-                    let keyStr = args[1].displayString
-                    let valStr = args[2].displayString
-                    let mapCount = nm.count
-                    fputs("DBG_INSERT: fn=\(fnName) key='\(keyStr)' val='\(valStr)' mapSizeBefore=\(mapCount) _nid=\(args.first.flatMap { v in if case .structVal("Map", let f) = v, case .int(let nid)? = f["_nid"] { return nid } else { return nil } } ?? -1)\n", stderr)
-                    fflush(stderr)
-                }
                 nm.insert(args[1], args[2])
                 return args.first!
             }
@@ -4141,10 +4519,13 @@ public final class MIRInterpreter {
             return .string("")
         case "read_file", "fs::read_to_string", "fs::read_file", "std::fs::read_file", "std::fs::read_to_string":
             if let path = args.first?.displayString {
-                if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                do {
+                    let contents = try String(contentsOfFile: path, encoding: .utf8)
                     return .enumVal("Result", 0, .string(contents))
+                } catch {
+                    fputs("[read_file] failed to read '\(path)': \(error.localizedDescription)\n", stderr)
+                    return .enumVal("Result", 1, .string("cannot read file: \(path): \(error.localizedDescription)"))
                 }
-                return .enumVal("Result", 1, .string("cannot read file: \(path)"))
             }
             return .enumVal("Result", 1, .string("read_file: no path"))
         case "write_file", "fs::write_file", "fs::write_string", "fs::write_file_string",
@@ -4219,20 +4600,37 @@ public final class MIRInterpreter {
         case "mkdir_p", "create_dir_all", "fs::create_dir_all", "fs::mkdir_p",
              "std::fs::create_dir_all", "std::fs::mkdir_p":
             if let path = args.first?.displayString {
-                try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+                do {
+                    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+                } catch {
+                    fputs("[mkdir_p] failed to create directory '\(path)': \(error.localizedDescription)\n", stderr)
+                    return .enumVal("Result", 1, .string("mkdir failed: \(error.localizedDescription)"))
+                }
             }
             return .enumVal("Result", 0, .unit)
         case "list_directory", "list_dir", "read_dir",
              "fs::list_directory", "fs::list_dir", "fs::read_dir",
              "std::fs::list_directory", "std::fs::list_dir", "std::fs::read_dir":
-            if let path = args.first?.displayString,
-               let entries = try? FileManager.default.contentsOfDirectory(atPath: path) {
+            if let path = args.first?.displayString {
+                let entries: [String]
+                do {
+                    entries = try FileManager.default.contentsOfDirectory(atPath: path)
+                } catch {
+                    fputs("[list_directory] failed to list '\(path)': \(error.localizedDescription)\n", stderr)
+                    return .enumVal("Result", 1, .string("cannot list directory: \(error.localizedDescription)"))
+                }
                 let renderedEntries = entries.map { entryName -> MirValue in
                     let entryPath = path.hasSuffix("/") ? path + entryName : path + "/" + entryName
                     var isDirectoryFlag = ObjCBool(false)
                     let exists = FileManager.default.fileExists(atPath: entryPath, isDirectory: &isDirectoryFlag)
                     let isDirectory = exists && isDirectoryFlag.boolValue
-                    let attrs = try? FileManager.default.attributesOfItem(atPath: entryPath)
+                    let attrs: [FileAttributeKey: Any]?
+                    do {
+                        attrs = try FileManager.default.attributesOfItem(atPath: entryPath)
+                    } catch {
+                        fputs("[list_directory] warning: could not read attributes for '\(entryPath)': \(error.localizedDescription)\n", stderr)
+                        attrs = nil
+                    }
                     let attrType = attrs?[.type] as? FileAttributeType
                     let isSymlink = attrType == .typeSymbolicLink
                     let isFile = exists && !isDirectory
@@ -4263,7 +4661,12 @@ public final class MIRInterpreter {
         case "delete_file", "remove_file", "fs::remove_file", "fs::delete_file",
              "std::fs::remove_file", "std::fs::delete_file":
             if let path = args.first?.displayString {
-                try? FileManager.default.removeItem(atPath: path)
+                do {
+                    try FileManager.default.removeItem(atPath: path)
+                } catch {
+                    fputs("[delete_file] failed to remove '\(path)': \(error.localizedDescription)\n", stderr)
+                    return .enumVal("Result", 1, .string("delete failed: \(error.localizedDescription)"))
+                }
             }
             return .enumVal("Result", 0, .unit)
         case "fs::path_join", "std::fs::path_join":
@@ -4328,13 +4731,21 @@ public final class MIRInterpreter {
         // matching the tg_compiler TokenKind/Token/LexResult types exactly.
         case "tokenize", "lex":
             guard case .string(let source) = args.first else { return .unit }
-            return nativeTokenize(source: source)
+            let path: String = {
+                if args.count >= 2, case .string(let p) = args[1] { return p }
+                return ""
+            }()
+            return nativeTokenize(source: source, path: path)
         case "tokenize_impl":
             guard case .structVal(let lexerName, var lexerFields) = args.first,
                   case .string(let source)? = lexerFields["source"] else {
                 return .unit
             }
-            let result = nativeTokenize(source: source)
+            let path: String = {
+                if case .string(let p)? = lexerFields["path"] { return p }
+                return ""
+            }()
+            let result = nativeTokenize(source: source, path: path)
             if case .structVal("LexResult", let resultFields) = result {
                 lexerFields["tokens"] = resultFields["tokens"] ?? .array([])
                 lexerFields["errors"] = resultFields["errors"] ?? .array([])
@@ -4966,9 +5377,21 @@ public final class MIRInterpreter {
     }
 
     private func resolveFunctionCandidates(name: String, args: [MirValue]) -> [String] {
-        // Fast path for simple names (no . prefix, no ::) — just return the name itself
+        // Fast path for simple names (no . prefix, no ::) — try exact match first,
+        // then search for qualified variants (module::name) in the function index.
         if !name.hasPrefix(".") && !name.contains("::") {
-            return [name]
+            if functionIndex[name] != nil {
+                return [name]
+            }
+            // Search for qualified names ending with "::name"
+            let suffix = "::\(name)"
+            var matches: [String] = []
+            for key in functionIndex.keys {
+                if key.hasSuffix(suffix) {
+                    matches.append(key)
+                }
+            }
+            return [name] + matches
         }
 
         var candidates: [String] = [name]
@@ -5074,7 +5497,7 @@ public final class MIRInterpreter {
 
     /// Run the Swift Lexer at native speed and convert the result to TG MirValues
     /// matching tg_compiler's LexResult { tokens: Vec[Token], errors: Vec[(String,Span)] }.
-    private func nativeTokenize(source: String) -> MirValue {
+    private func nativeTokenize(source: String, path: String = "") -> MirValue {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: 0, diagnostics: diags)
         let rawTokens = lexer.lexPreservingTrivia()
@@ -5092,11 +5515,7 @@ public final class MIRInterpreter {
             }
             let (kindVal, consumed) = swiftTokenToTgKind(rawTokens, at: i)
             let lastTok = rawTokens[i + consumed - 1]
-            let spanVal = MirValue.structVal("Span", [
-                "file": .string(""),
-                "start": .int(tok.span.start),
-                "end_pos": .int(lastTok.span.end)
-            ])
+            let spanVal = Self.spanValue(file: path, start: tok.span.start, end: lastTok.span.end)
             mirTokens.append(.structVal("Token", [
                 "kind": kindVal,
                 "span": spanVal
@@ -5194,6 +5613,7 @@ public final class MIRInterpreter {
         case .kwCatch:     return (tkEnum(65), 1)
         case .kwFinally:   return (tkEnum(66), 1)
         case .kwGuard:     return (tkEnum(67), 1)
+        case .kwDefer:     return (tkEnum(63), 1)
         case .kwHandle:    return (tkEnum(68), 1)
         case .kwWith:      return (tkEnum(69), 1)
         case .kwImplies:   return (tkEnum(71), 1)
@@ -5365,6 +5785,7 @@ public final class MIRInterpreter {
         var s = Set<String>(minimumCapacity: 256)
         // Syscall intrinsics
         for n in ["syscall6","syscall5","syscall4","syscall3","syscall2","syscall1"] { s.insert(n) }
+        for n in ["__intrinsic_syscall6","__intrinsic_syscall5","__intrinsic_syscall4","__intrinsic_syscall3","__intrinsic_syscall2","__intrinsic_syscall1"] { s.insert(n) }
         // Resize intrinsic
         for n in ["resize"] { s.insert(n) }
         // String conversion
@@ -5385,7 +5806,7 @@ public final class MIRInterpreter {
                    "string_replace","string_find","string_char_at","string_push",
                    "string_push_str","string_split","string_slice","string_len","string_parse_int"] { s.insert(n) }
         // Array/Vec
-        for n in ["array_new","array_push","array_pop","array_get","array_set","array_len",
+         for n in ["array_new","array_push","array_pop","array_get","array_set","array_len",
                    "array_cap","array_remove","array_insert","array_clear","array_contains",
                    "array_last","array_first","array_is_empty","array_reverse","array_sort",
                    "array_extend","array_truncate","array_resize",
@@ -5756,7 +6177,7 @@ public final class MirNativeMap {
 
 // MARK: - MirValue (runtime value)
 
-public indirect enum MirValue: Equatable, CustomStringConvertible {
+public enum MirValue: Equatable, CustomStringConvertible {
     case unit
     case bool(Bool)
     case int(Int)
@@ -5768,7 +6189,10 @@ public indirect enum MirValue: Equatable, CustomStringConvertible {
     case array(MirArrayBuffer)
     case byteBuffer(MirByteBuffer)
     case structVal(String, [String: MirValue])
-    case enumVal(String, Int, MirValue)
+    // Only enumVal needs indirect because it directly contains a MirValue.
+    // All other cases use reference-counted types (Array, Dictionary, class)
+    // which are already boxed, so the enum itself stays inline-allocated.
+    indirect case enumVal(String, Int, MirValue)
 
     public var asInt: Int? {
         switch self {

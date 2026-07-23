@@ -777,11 +777,12 @@ public indirect enum Stmt {
     case exprStmt(Expr, Span)
     case attributeStmt([Attribute], Span)
     case attributed([Attribute], Stmt, Span)
+    case deferStmt(BlockBody, Span)
     case item(Item)
 
     public var span: Span {
         switch self {
-        case .letBinding(_, _, _, _, let s), .exprStmt(_, let s), .attributeStmt(_, let s), .attributed(_, _, let s):
+        case .letBinding(_, _, _, _, let s), .exprStmt(_, let s), .attributeStmt(_, let s), .attributed(_, _, let s), .deferStmt(_, let s):
             return s
         case .item(let item):
             return item.span

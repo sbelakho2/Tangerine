@@ -87,6 +87,7 @@ public enum TokenKind: Equatable, Hashable, Sendable {
     case kwPost
     case kwInvariant
     case kwGuard
+    case kwDefer
     case kwTry
     case kwCatch
     case kwFinally
@@ -215,6 +216,7 @@ extension TokenKind {
         case "post":      return .kwPost
         case "invariant": return .kwInvariant
         case "guard":     return .kwGuard
+        case "defer":     return .kwDefer
         case "try":       return .kwTry
         case "catch":     return .kwCatch
         case "finally":   return .kwFinally
@@ -300,6 +302,7 @@ extension TokenKind {
         case .kwPost:          return "'post'"
         case .kwInvariant:     return "'invariant'"
         case .kwGuard:         return "'guard'"
+        case .kwDefer:         return "'defer'"
         case .kwTry:           return "'try'"
         case .kwCatch:         return "'catch'"
         case .kwFinally:       return "'finally'"

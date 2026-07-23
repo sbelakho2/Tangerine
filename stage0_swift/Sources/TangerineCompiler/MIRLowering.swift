@@ -37,6 +37,9 @@ public final class MIRLowering {
     private var fnCache: [String: String] = [:]
     private var functionReturnTypes: [String: MirType] = [:]
 
+    /// Set of qualified function names whose `self` parameter is by-value (no &/&mut).
+    private var methodSelfByValue: Set<String> = []
+
     public init(moduleName: String? = nil) {
         let initialPath = moduleName.map { [$0] } ?? []
         self.rootModulePath = initialPath
@@ -384,6 +387,17 @@ public final class MIRLowering {
         if !sig.name.contains("::") {
             sig.name = "\(targetType)::\(sig.name)"
         }
+
+        // Record whether self is by-value (no &/&mut on the type).
+        // Methods with &self/&mut self are NOT by-value; default to borrowing.
+        if let firstParam = fn.sig.params.first, firstParam.name == "self" {
+            if case .ref(_, _, _) = firstParam.type {
+                // &self or &mut self → NOT by-value
+            } else {
+                methodSelfByValue.insert(sig.name)
+            }
+        }
+
         let lowered = FunctionDecl(sig: sig, clauses: fn.clauses, body: fn.body, span: fn.span)
         lowerFunction(lowered)
     }
@@ -459,6 +473,13 @@ public final class MIRLowering {
             lowerStmt(inner)
         case .item(let item):
             lowerItem(item)
+        case .deferStmt(let body, _):
+            for s in body.stmts {
+                lowerStmt(s)
+            }
+            if let tail = body.tailExpr {
+                _ = lowerExpr(tail)
+            }
         }
     }
 
@@ -616,7 +637,29 @@ public final class MIRLowering {
         case .call(let callee, _, let args, _):
             // Detect method calls: expr.method(args) → .method(expr, args...)
             if case .field(let base, let methodName, _) = callee {
-                let baseOp = lowerExpr(base)
+                let receiverPlace = exprToPlace(base)
+                let receiverType: MirType? = receiverPlace.flatMap { operandType(.copy($0)) }
+
+                // Determine if the method's self parameter is by-value or by-reference.
+                // By default, borrow the receiver (&self/&mut self convention).
+                // Only pass by value if the method is explicitly recorded as by-value self.
+                let shouldBorrow: Bool
+                if let typeName = extractTypeName(receiverType) {
+                    let qualifiedName = "\(typeName)::\(methodName)"
+                    shouldBorrow = !methodSelfByValue.contains(qualifiedName)
+                } else {
+                    shouldBorrow = true
+                }
+
+                let baseOp: MirOperand
+                if shouldBorrow, let place = receiverPlace {
+                    let refTmp = freshTemp(type: .ref(receiverType ?? .unknown, mutable: true))
+                    emit(.assign(.local(refTmp), .ref(.mutable, place)))
+                    baseOp = .copy(.local(refTmp))
+                } else {
+                    baseOp = lowerExpr(base)
+                }
+
                 let argOps = [baseOp] + args.map { lowerExpr($0.value) }
                 let resultType = inferMethodCallResultType(receiverType: operandType(baseOp), methodName: methodName)
                 let result = freshTemp(type: resultType)
@@ -625,13 +668,6 @@ public final class MIRLowering {
                                     callee: .constant(.fnItem(".\(methodName)")),
                                     args: argOps, next: nextBB, unwind: nil))
                 currentBlock = nextBB
-
-                // NOTE: No explicit write-back is emitted here for mutating methods on struct
-                // fields because the MIR interpreter handles write-back directly inside its
-                // .call terminator handler (MIRInterpreter.swift lines 734–770).  Emitting an
-                // extra .assign here would overwrite the struct field with the method's return
-                // value (e.g. Option::Some(last) for .pop, or Unit for .push) instead of the
-                // correctly mutated receiver reference, corrupting the field.
                 return .copy(.local(result))
             }
             if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
