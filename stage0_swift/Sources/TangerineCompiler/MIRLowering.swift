@@ -592,6 +592,8 @@ public final class MIRLowering {
             case .borrow:
                 if let place = exprToPlace(inner) {
                     let borrowedType = operandType(.copy(place)) ?? .unknown
+                    if let baseName = placeName(place) {
+                    }
                     let tmp = freshTemp(type: .ref(borrowedType, mutable: false))
                     emit(.assign(.local(tmp), .ref(.shared, place)))
                     return .copy(.local(tmp))
@@ -1078,6 +1080,13 @@ public final class MIRLowering {
         }
     }
 
+    private func placeName(_ place: MirPlace) -> String? {
+        if place.local < locals.count {
+            return locals[place.local].name
+        }
+        return nil
+    }
+
     private func operandType(_ operand: MirOperand) -> MirType? {
         switch operand {
         case .copy(let place), .move(let place):
@@ -1383,6 +1392,15 @@ public final class MIRLowering {
         return "MIRLowering \(context): unresolved or ambiguous enum variant \(renderedType)::\(variantName)\(hintText)"
     }
 
+    private static func variantPayloadTypes(_ def: MirTypeDef, _ idx: Int) -> [MirType] {
+        if case .enumDef(let variants) = def.kind, idx < variants.count {
+            if def.name.contains("FnBody") {
+            }
+            return variants[idx].1
+        }
+        return []
+    }
+
     private func requireVariantMatch(typeName: String, variantName: String, enumHint: String?,
                                      expectedFieldCount: Int? = nil, allowExtraFields: Bool = false,
                                      context: String) -> (MirTypeDef, Int)? {
@@ -1533,20 +1551,29 @@ public final class MIRLowering {
         switch pattern {
         case .ident(let name, let mutable, _):
             let bindType = operandType(value) ?? .unknown
+            if name == "block" || name == "ty_expr" {
+            }
             let id = freshLocal(name: name, type: bindType, mutable: mutable)
             defineInScope(name, id)
             emit(.assign(.local(id), .use(value)))
         case .refPattern(let name, _):
             let bindType = operandType(value) ?? .unknown
-            let id = freshLocal(name: name, type: bindType, mutable: false)
+            // The binding's VALUE is a reference to the payload (a heap
+            // address in the compiled representation), so the local must be
+            // typed as a reference. Otherwise field reads through the binding
+            // treat the reference address as the struct pointer and apply
+            // field offsets one deref too early.
+            let id = freshLocal(name: name, type: .ref(bindType, mutable: false), mutable: false)
             defineInScope(name, id)
             emit(.assign(.local(id), .ref(.shared, MirPlace(local: placeOf(value), projections: []))))
         case .refMutPattern(let name, _):
             let bindType = operandType(value) ?? .unknown
-            let id = freshLocal(name: name, type: bindType, mutable: true)
+            let id = freshLocal(name: name, type: .ref(bindType, mutable: true), mutable: true)
             defineInScope(name, id)
             emit(.assign(.local(id), .ref(.mutable, MirPlace(local: placeOf(value), projections: []))))
         case .variant(let typeName, let variantName, let fields, _):
+            if variantName == "FnBlock" {
+            }
             // Bind payload: downcast to get inner value, then bind field patterns
             if !fields.isEmpty {
                 guard let variantMatch = requireVariantMatch(typeName: typeName, variantName: variantName,
@@ -1555,13 +1582,21 @@ public final class MIRLowering {
                     return
                 }
                 let variantIdx = variantMatch.1
-                let inner = freshTemp()
+                let payloadTypes = Self.variantPayloadTypes(variantMatch.0, variantIdx)
+                let payloadType = fields.count == 1 ? (payloadTypes.first ?? .unknown) : .unknown
+                // The downcast payload is materialized as the ADDRESS of the
+                // payload field in the compiled representation (the enum's
+                // tag is skipped by adding 8, without an extra deref).  Type
+                // the temp as a reference so field reads through the bound
+                // local dereference the payload address correctly.
+                let inner = freshTemp(type: .ref(payloadType, mutable: false))
                 emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
                 if fields.count == 1 {
                     lowerPatternBind(fields[0], value: .copy(.local(inner)), enumHint: enumHint)
                 } else {
                     for (i, pat) in fields.enumerated() {
-                        let elem = freshTemp()
+                        let elemType = i < payloadTypes.count ? payloadTypes[i] : .unknown
+                        let elem = freshTemp(type: elemType)
                         emit(.assign(.local(elem), .use(.copy(MirPlace(local: inner, projections: [.field(i)])))))
                         lowerPatternBind(pat, value: .copy(.local(elem)), enumHint: enumHint)
                     }

@@ -113,6 +113,7 @@ struct CodegenCtx
   type_field_sizes: Map[Int, Vec[Int]]    # TypeId.id -> per-field byte sizes
   type_defs: Vec[MirTypeDef]              # All type definitions for lookup
   type_def_index: Map[Int, Int]           # TypeId.id -> index in type_defs (O(1) lookup)
+  type_field_name_index: Map[Int, Map[String, Int]]  # TypeId.id -> (field name -> index)
   extern_fns: Set[String]                 # Names of extern (FFI) functions
   reachable_fns: Set[String]               # Names of all reachable compiled functions
   fn_alias: Map[String, String]            # MIR reference name → actual compiled function label
@@ -245,7 +246,7 @@ end
 # This ensures single source of truth for all type sizes.
 # Also computes field-level offsets and sizes in one pass to avoid
 # creating a second LayoutEngine.
-def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]])
+def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]], Map[Int, Map[String, Int]])
   mut layout: Map[Int, Int] = Map::new()
   mut offsets_map: Map[Int, Vec[Int]] = Map::new()
   mut sizes_map: Map[Int, Vec[Int]] = Map::new()
@@ -268,21 +269,25 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
   end
   
   # Build per-field offsets and sizes using the SAME engine
+  mut name_index_map: Map[Int, Map[String, Int]] = Map::new()
   for td in types do
     match td.kind
     when MirTypeDefKind::Struct(fields) then
       mut field_offsets = Vec::new()
       mut field_sizes = Vec::new()
       mut i = 0
+      mut name_map = Map::new()
       for f in fields do
         let off = field_offset(&mut engine, td.id.id, i)
         field_offsets.push(off)
         let sz = field_size(&mut engine, td.id.id, i)
         field_sizes.push(sz)
+        name_map.insert(f.name.clone(), i)
         i = i + 1
       end
       offsets_map.insert(td.id.id, field_offsets)
       sizes_map.insert(td.id.id, field_sizes)
+      name_index_map.insert(td.id.id, name_map)
     when MirTypeDefKind::Enum(variants) then
       mut field_offsets = Vec::new()
       mut field_sizes = Vec::new()
@@ -301,7 +306,7 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
     end
   end
 
-  (layout, offsets_map, sizes_map)
+  (layout, offsets_map, sizes_map, name_index_map)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -744,6 +749,7 @@ def codegen_new(target: &AsmTarget) -> CodegenCtx
     type_field_sizes: Map::new(),
     type_defs: Vec::new(),
     type_def_index: Map::new(),
+    type_field_name_index: Map::new(),
     extern_fns: Set::new(),
     reachable_fns: Set::new(),
     fn_alias: Map::new(),
@@ -2018,7 +2024,7 @@ def project_index_type(ctx: &CodegenCtx, ty: &Type) -> Type
   end
 end
 
-def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Type
+def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int, field_name: &String) -> Type
   match ty
   when Type::Tuple(elems) then
     if idx < elems.len() then elems[idx].clone() else Type::Unit end
@@ -2027,8 +2033,15 @@ def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int
     when Option::Some(td) then
       match td.kind
       when MirTypeDefKind::Struct(fields) then
-        if idx < fields.len() then
-          return fields[idx].ty.clone()
+        # The lowering may emit projections whose index is a name hash rather
+        # than the real position (stage0 fieldIndex).  Resolve by NAME first
+        # so the projected type tracks the correct field.
+        let resolved_idx = match resolve_field_idx_by_name(ctx, tid.id, field_name)
+        when Option::Some(fidx) then fidx
+        when Option::None then idx
+        end
+        if resolved_idx < fields.len() then
+          return fields[resolved_idx].ty.clone()
         end
       when MirTypeDefKind::Enum(variants) then
         for variant in variants do
@@ -2040,26 +2053,60 @@ def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int
     when Option::None then ()
     end
     Type::Unit
-  when Type::Ref(inner, _) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::RefMut(inner, _) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::Owned(inner) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::Ptr(inner) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::PtrMut(inner) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::Box(inner) then project_field_type(ctx, inner, downcast_disc, idx)
-  when Type::Rc(inner) then project_field_type(ctx, inner, downcast_disc, idx)
+  when Type::Ref(inner, _) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::RefMut(inner, _) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::Owned(inner) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::Ptr(inner) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::PtrMut(inner) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::Box(inner) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
+  when Type::Rc(inner) then project_field_type(ctx, inner, downcast_disc, idx, field_name)
   when _ then Type::Unit
   end
 end
 
-def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Int
+def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int, field_name: &String) -> Int
   let tid = extract_named_type_id(ty)
   if tid >= 0 && downcast_disc >= 0 && is_enum_type_id(ctx, tid) then
     enum_field_offset_for_discriminant(ctx, tid, downcast_disc, idx)
   else if tid >= 0 then
-    resolve_field_byte_offset(ctx, tid, idx)
+    # The lowering may emit projections whose index is a name hash rather
+    # than the real position (stage0 fieldIndex).  Resolve by NAME against
+    # the type definition so struct field offsets stay correct.
+    let resolved_idx = match resolve_field_idx_by_name(ctx, tid, field_name)
+    when Option::Some(fidx) then fidx
+    when Option::None then idx
+    end
+    resolve_field_byte_offset(ctx, tid, resolved_idx)
   else
     idx * 8
   end
+end
+
+def resolve_field_idx_by_name(ctx: &CodegenCtx, type_id: Int, name: &String) -> Option[Int]
+  match ctx.type_field_name_index.get(type_id)
+  when Option::Some(name_map) then
+    match name_map.get(name)
+    when Option::Some(fidx) then return Option::Some(fidx)
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  # Fall back to a linear scan of the type definition (covers types without
+  # a precomputed layout, e.g. enum payload field lookups).
+  match lookup_type_def(ctx, type_id)
+  when Option::Some(td) then
+    match td.kind
+    when MirTypeDefKind::Struct(fields) then
+      mut i = 0
+      while i < fields.len() do
+        if fields[i].name == name then return Option::Some(i) end
+        i = i + 1
+      end
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  Option::None
 end
 
 def resolve_projected_field_size(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Int
@@ -2110,8 +2157,8 @@ def place_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, place: &Place) -> Type
       current_ty = project_deref_type(&current_ty)
     when Projection::ProjDowncast(_, disc) then
       downcast_disc = disc
-    when Projection::ProjField(_, idx) then
-      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+    when Projection::ProjField(name, idx) then
+      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx, name)
     when Projection::ProjIndex(_) then
       current_ty = project_index_type(ctx, &current_ty)
     when Projection::ProjConstantIndex(_) then
@@ -2641,9 +2688,23 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       emit_load_mem(ctx, reg, reg, 0)
       current_ty = project_deref_type(&current_ty)
     when Projection::ProjField(name, idx) then
-      let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
-      emit_load_mem(ctx, reg, reg, offset as i32)
-      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+      let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx, name)
+      # Intermediate struct-typed fields (Expr, Vec, Span, ...) are stored
+      # inline; the next projection's address must pass through the field
+      # slot (base + offset) without loading, because loading would take the
+      # first word of the inline struct and dereference it as a pointer.
+      # Only Ref/RefMut fields hold a pointer to the next level, so those
+      # still load. The LAST projection always loads the final value.
+      let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx, name)
+      let is_last_field = i == projs.len() - 1
+      if is_last_field then
+        emit_load_mem(ctx, reg, reg, offset as i32)
+      else if is_ref_like_type(&field_ty) then
+        emit_load_mem(ctx, reg, reg, offset as i32)
+      else if offset != 0 then
+        emit_add_ri(ctx, reg, offset as i32)
+      end
+      current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjIndex(local_id) then
       if is_heap_collection_type(ctx, &current_ty) then
@@ -2823,10 +2884,14 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
         when Projection::ProjDeref then
           emit_load_mem(ctx, base, base, 0)
           current_ty = project_deref_type(&current_ty)
-        when Projection::ProjField(_, idx) then
-          let field_off = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
-          emit_add_ri(ctx, base, field_off as i32)
-          current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+        when Projection::ProjField(name, idx) then
+          # Non-last field projection: load the field VALUE so the base
+          # becomes the pointed-to object (e.g. the Vec pointer for a
+          # Vec-typed field), matching apply_projections semantics.
+          # Only the LAST projection computes a store address via ADD.
+          let field_off = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx, name)
+          emit_load_mem(ctx, base, base, field_off as i32)
+          current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx, name)
         when Projection::ProjDowncast(_, disc) then
           downcast_disc = disc
           # Normalize inline tags vs heap pointers before accessing payload.
@@ -2885,8 +2950,8 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       match last
       when Projection::ProjDeref then
         store_off = 0
-      when Projection::ProjField(_, idx) then
-        let fo = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+      when Projection::ProjField(name, idx) then
+        let fo = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx, name)
         store_off = fo as i32
       when Projection::ProjIndex(local_id) then
         if is_heap_collection_type(ctx, &current_ty) then
@@ -3594,15 +3659,23 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         end
         current_ty = project_deref_type(&current_ty)
       when Projection::ProjField(name, idx) then
-        let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+        let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx, name)
         if is_last then
           if offset != 0 then
             emit_add_ri(ctx, dst, offset as i32)
           end
         else
-          emit_load_mem(ctx, dst, dst, offset as i32)
+          # Same inline-vs-pointer rule as apply_projections: only Ref-like
+          # fields hold a pointer to the next level and must be loaded;
+          # inline struct fields pass the address through.
+          let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx, name)
+          if is_ref_like_type(&field_ty) then
+            emit_load_mem(ctx, dst, dst, offset as i32)
+          else if offset != 0 then
+            emit_add_ri(ctx, dst, offset as i32)
+          end
         end
-        current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+        current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx, name)
       when Projection::ProjIndex(local_id) then
         let is_byte_indexed = is_string_like_type(&current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
@@ -3863,6 +3936,14 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
 
     when MirRvalueKind::MirDiscriminant(ref discr_place) then
       load_place(ctx, fctx, discr_place, rr)
+      normalize_enum_value_to_tag(ctx, rr)
+      # A discriminant place may hold a REFERENCE to an enum value (e.g. a
+      # &StmtKind parameter or a `match &f.body` subject).  In the compiled
+      # representation a reference is the address of the field that holds the
+      # enum value, so the first normalize yields the enum struct pointer
+      # (still >= 256); dereference once more to extract the actual tag.
+      # For plain enum values the first normalize already yields a tag < 256
+      # and this second pass is a no-op.
       normalize_enum_value_to_tag(ctx, rr)
 
     when MirRvalueKind::MirLen(ref len_place) then
@@ -4608,8 +4689,11 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       codegen_strlen(ctx)
     else
+      # Unknown receiver type: fall back to the collection header layout
+      # (len at offset 8). A strlen is only correct for C-string payloads,
+      # and the compiler's Strings/Vecs both use the {data, len, cap} header.
       deref_all_ref_like_args(ctx, fctx, args, rr)
-      codegen_strlen(ctx)
+      codegen_array_len(ctx)
     end
   else if name == "str_concat" then
     emit_call_label(ctx, "_tg_str_concat")
@@ -8438,10 +8522,11 @@ end
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, String]
   # Build type layout map and field layouts from MIR type definitions (single LayoutEngine pass)
-  let (type_layout, field_offsets, field_sizes) = build_all_layouts(&program.types, &ctx.target)
+  let (type_layout, field_offsets, field_sizes, field_name_index) = build_all_layouts(&program.types, &ctx.target)
   ctx.type_layout = type_layout
   ctx.type_field_offsets = field_offsets
   ctx.type_field_sizes = field_sizes
+  ctx.type_field_name_index = field_name_index
   ctx.type_defs = program.types.clone()
   # Reference the MIR functions/statics directly for all codegen passes in this routine.
   # program is an immutable borrow and is never mutated here, so a borrow is both
