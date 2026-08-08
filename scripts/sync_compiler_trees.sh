@@ -91,7 +91,7 @@ TOTAL_DIFFS=0
 [[ -n "$MISMATCHED"     ]] && TOTAL_DIFFS=$((TOTAL_DIFFS + $(echo -e "$MISMATCHED" | grep -c . || true)))
 
 if [[ "$TOTAL_DIFFS" -eq 0 ]]; then
-  echo "OK: tg_compiler/ and stage0_swift/tg_compiler/ are in sync ($($echo_command wc -l <<< "$SOURCE_FILES") files)"
+  echo "OK: tg_compiler/ and stage0_swift/tg_compiler/ are in sync ($(wc -l <<< "$SOURCE_FILES") files)"
   if [[ "$MODE" == "check" ]]; then
     exit 0
   fi
