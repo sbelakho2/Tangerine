@@ -2222,16 +2222,28 @@ end
 
 # True when dereferencing a reference to this type must LOAD [ptr] to obtain
 # the referent's value, rather than passing the pointer through.  Scalar
-# values, collection handles and strings are stored AT the referenced address
-# (the reference points at their slot).  Struct/enum referents are inline at
-# the reference address: dereferencing passes the pointer and the following
-# field/index projection loads [address + offset].
+# values, collection handles, strings and enums are stored AT the referenced
+# address (the reference points at their slot).  Small structs (<= 32 bytes)
+# are stored inline at the reference address: dereferencing passes the pointer
+# and the following field/index projection loads [address + offset].  Larger
+# structs are heap handles stored in the referenced slot, so dereferencing
+# must load the handle first.
 def is_deref_load_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   if is_scalar_value_type(ty) then return true end
   if is_heap_collection_type(ctx, ty) then return true end
   if is_string_like_type(ty) then return true end
   match strip_ref_like_type(ty)
   when Type::Char then true
+  when Type::Named(tid, _) then
+    let type_id = tid.id
+    if is_enum_type_id(ctx, type_id) then
+      true
+    else
+      match ctx.type_layout.get(type_id)
+      when Option::Some(sz) then sz > 32
+      when Option::None then true
+      end
+    end
   when _ then false
   end
 end
@@ -2724,9 +2736,6 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
     when Projection::ProjDeref then
       last_deref_unwrapped_ref = is_ref_like_type(&current_ty)
       if is_deref_load_type(ctx, &current_ty) then
-        # Scalar/collection/string referents store their value AT the reference
-        # address: deref loads [ptr].  Struct/enum referents are inline: pass
-        # the address and let the following projection load [address + offset].
         emit_load_mem(ctx, reg, reg, 0)
       end
       current_ty = project_deref_type(&current_ty)
@@ -3691,7 +3700,9 @@ def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
       match proj
       when Projection::ProjDeref then
         if !is_last then
-          emit_load_mem(ctx, dst, dst, 0)
+          if is_deref_load_type(ctx, &current_ty) then
+            emit_load_mem(ctx, dst, dst, 0)
+          end
         end
         current_ty = project_deref_type(&current_ty)
       when Projection::ProjField(name, idx) then
@@ -8817,7 +8828,7 @@ def emit_save_argc_argv(ctx: &mut CodegenCtx) -> Unit
       # Pre-allocate the bump arena ONCE at a fixed high address.
       # A per-call mmap-based grow path returned the same overlapping
       # chunk every time on this platform, so every allocation aliased
-      # 0x100ae8000 and corrupted live objects.  Allocating a single
+      # the same address and corrupted live objects.  Allocating a single
       # fixed-address arena at startup and bumping within it avoids
       # address-space overlap entirely.
       # mmap(0x600000000, 256MB, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_PRIVATE|MAP_ANON, -1, 0)
@@ -8829,19 +8840,15 @@ def emit_save_argc_argv(ctx: &mut CodegenCtx) -> Unit
       a64_mov_ri(&mut ctx.text, A64::X5, 0)
       a64_mov_ri(&mut ctx.text, A64::X16, 197)
       a64_svc(&mut ctx.text, 0x80)
-      # _tg_bump_ptr = 0x600000000, _tg_bump_end = 0x600000000 + 256MB
-      add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_bump_ptr".to_string(), 0)
-      emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X15))  # ADRP X15, ...
-      add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_bump_ptr".to_string(), 0)
-      a64_add_rri(&mut ctx.text, A64::X15, A64::X15, 0)          # ADD X15, X15, :lo12:...
-      a64_mov_ri(&mut ctx.text, A64::X14, 0x600000000)
-      a64_str(&mut ctx.text, A64::X14, A64::X15, 0)              # STR X14, [X15]
+      # Bump state lives in the arena header (heap memory, where stores
+      # persist): [header+0] = bump_ptr, [header+8] = bump_end.  Allocations
+      # begin at header+16.  The header sits one page past the arena start
+      # because stores to the arena's first page were observed to revert.
+      a64_mov_ri(&mut ctx.text, A64::X15, 0x600100010)
       a64_mov_ri(&mut ctx.text, A64::X14, 0x610000000)
-      add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_bump_end".to_string(), 0)
-      emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X15))  # ADRP X15, ...
-      add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_bump_end".to_string(), 0)
-      a64_add_rri(&mut ctx.text, A64::X15, A64::X15, 0)          # ADD X15, X15, :lo12:...
-      a64_str(&mut ctx.text, A64::X14, A64::X15, 0)              # STR X14, [X15]
+      a64_mov_ri(&mut ctx.text, A64::X13, 0x600100000)
+      a64_str(&mut ctx.text, A64::X15, A64::X13, 0)   # [header+0] = first bump ptr
+      a64_str(&mut ctx.text, A64::X14, A64::X13, 8)   # [header+8] = bump end
     when OsAbi::Linux then
       # Linux _start: argc at [FP+16], argv = FP + 24 (after prologue)
       # FP was set to SP by the prologue; the kernel placed argc at [original_sp]
