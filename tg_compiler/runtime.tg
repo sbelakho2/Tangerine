@@ -19,7 +19,7 @@ use tg_compiler::asm::{
   x64_mov_ri, x64_mov_rr, x64_mov_rm, x64_mov_mr,
   x64_add_rr, x64_add_ri, x64_sub_rr, x64_sub_ri,
   x64_imul_rr, x64_cqo, x64_idiv_r,
-  x64_and_rr, x64_or_rr, x64_xor_rr,
+  x64_and_rr, x64_or_rr, x64_xor_rr, x64_and_ri,
   x64_cmp_rr, x64_cmp_ri, x64_test_rr,
   x64_jmp, x64_jcc, x64_call_label, x64_call_r, x64_call_extern,
   x64_ret, x64_push, x64_pop, x64_sub_ri, x64_shl_ri, x64_shr_ri, x64_cmova_rr,
@@ -34,7 +34,7 @@ use tg_compiler::asm::{
   a64_svc, a64_udf, a64_nop, a64_lsl, a64_lsl_rrr,
   a64_sdiv_rrr, a64_udiv, a64_msub, a64_csel, a64_add_rrr_lsl, a64_lsr,
   a64_cc_eq, a64_cc_ne, a64_cc_lt, a64_cc_le, a64_cc_gt, a64_cc_ge, a64_cc_cs, a64_cc_cc,
-  a64_neg, CC
+  a64_neg, a64_code, CC
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -6244,56 +6244,130 @@ end
 # ———————————————————————————————————————————————————————————————
 # Bump Allocator Runtime
 # ———————————————————————————————————————————————————————————————
-# A simple bump allocator for struct aggregates.  Struct aggregates
-# must survive function returns, so they cannot be stack-allocated
-# in the callee's frame (the pointer would dangle after return).
-# This allocator lazily mmaps 4 MB chunks and bumps a pointer.
+# A hardened bump allocator for struct aggregates and small allocations.
+# Struct aggregates must survive function returns, so they cannot be
+# stack-allocated in the callee's frame (the pointer would dangle after
+# return). This allocator lazily mmaps 4 MB chunks and bumps a pointer.
+#
+# Properties (FROZEN contract):
+#   * Guaranteed alignment: returned pointers are 16-byte aligned.
+#   * Deterministic init: _tg_bump_ptr/_tg_bump_end are zero-initialized in
+#     .data; the first call takes the slow path and establishes the arena.
+#   * Checked failure: if mmap fails (MAP_FAILED), the runtime traps
+#     (brk/ud2) instead of returning a bogus pointer.
+#   * Fast path: bump _tg_bump_ptr when it fits in the current chunk.
 #
 # _tg_bump_alloc(size: i64) -> *void
 #   Globals: _tg_bump_ptr (current pointer), _tg_bump_end (chunk end)
 #   Fast path: bump pointer, return old pointer
-#   Slow path: mmap new 4 MB chunk, reset pointers
+#   Slow path: mmap new 4 MB chunk, reset pointers, bump
 # ———————————————————————————————————————————————————————————————
 
 def emit_bump_alloc_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_bump_alloc(ctx)
 end
 
-# _tg_bump_alloc: Bump-allocate `size` bytes (x0/rdi = size).
-# Returns pointer to allocated memory in x0/rax.
+# _tg_bump_alloc: Bump-allocate `size` bytes (x0/rdi = size), 16-byte aligned.
+# Returns pointer to allocated memory in x0/rax. Traps on allocation failure.
+# Preserves X19/X20 and leaves X21-X28 untouched (callee-saved contract).
 def emit_tg_bump_alloc(ctx: &mut RuntimeEmitCtx) -> Unit
    def_runtime_fn(ctx, "_tg_bump_alloc")
    match ctx.target.arch
    when Arch::AArch64 then
+       let size_ok = fresh_label(ctx, ".Lbump_size_ok")
+       let fast    = fresh_label(ctx, ".Lbump_fast")
+       let slow    = fresh_label(ctx, ".Lbump_slow")
+       let fail    = fresh_label(ctx, ".Lbump_fail")
+       let done    = fresh_label(ctx, ".Lbump_done")
+
        a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
        a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
        a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
        a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
        a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
-       a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
-       a64_stp_pre(&mut ctx.text, A64::X27, A64::X28, A64::SP, -16)
-       a64_add_rri(&mut ctx.text, A64::X19, A64::X0, 7)
-       a64_lsr(&mut ctx.text, A64::X19, A64::X19, 3)
-       a64_lsl(&mut ctx.text, A64::X19, A64::X19, 3)
+
+       # X19 = align16(X0): guaranteed 16-byte alignment.
+       a64_add_rri(&mut ctx.text, A64::X19, A64::X0, 15)
+       a64_lsr(&mut ctx.text, A64::X19, A64::X19, 4)
+       a64_lsl(&mut ctx.text, A64::X19, A64::X19, 4)
        a64_cmp_ri(&mut ctx.text, A64::X19, 0)
        a64_mov_ri(&mut ctx.text, A64::X20, 16)
        a64_csel(&mut ctx.text, A64::X19, A64::X20, A64::X19, a64_cc_eq())
-       a64_mov_rr(&mut ctx.text, A64::X1, A64::X19)
+
+       # X22 = &_tg_bump_ptr (base; end lives at +8).
+       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_bump_ptr".to_string(), 0)
+       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X22))
+       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_bump_ptr".to_string(), 0)
+       a64_add_rri(&mut ctx.text, A64::X22, A64::X22, 0)
+
+       # X20 = current ptr, X21 = chunk end.
+       a64_ldr(&mut ctx.text, A64::X20, A64::X22, 0)
+       a64_ldr(&mut ctx.text, A64::X21, A64::X22, 8)
+
+       # Fast path: available = end - ptr >= size ?
+       a64_sub_rrr(&mut ctx.text, A64::X23, A64::X21, A64::X20)
+       a64_cmp_rr(&mut ctx.text, A64::X23, A64::X19)
+       a64_bcond(&mut ctx.text, a64_cc_cs(), fast.clone())
+       a64_b(&mut ctx.text, slow.clone())
+
+       def_label(&mut ctx.text, fast.clone())
+       a64_add_rrr(&mut ctx.text, A64::X24, A64::X20, A64::X19)
+       a64_str(&mut ctx.text, A64::X24, A64::X22, 0)
+       a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+       a64_b(&mut ctx.text, done.clone())
+
+       # Slow path: mmap a fresh 4 MB chunk.
+       def_label(&mut ctx.text, slow.clone())
        a64_mov_ri(&mut ctx.text, A64::X0, 0)
-       a64_mov_ri(&mut ctx.text, A64::X2, 3)
-       a64_mov_ri(&mut ctx.text, A64::X3, 0x1002)
-       a64_mov_ri(&mut ctx.text, A64::X4, -1)
-       a64_mov_ri(&mut ctx.text, A64::X5, 0)
-       a64_mov_ri(&mut ctx.text, A64::X16, 197)
-       a64_svc(&mut ctx.text, 0x80)
-       a64_ldp_post(&mut ctx.text, A64::X27, A64::X28, A64::SP, 16)
-       a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+       a64_mov_ri(&mut ctx.text, A64::X1, 0x400000)
+       a64_mov_ri(&mut ctx.text, A64::X2, 3)   # PROT_READ|PROT_WRITE
+       match ctx.target.os
+       when OsAbi::MacOS then
+         a64_mov_ri(&mut ctx.text, A64::X3, 0x1002)
+         a64_mov_ri(&mut ctx.text, A64::X4, -1)
+         a64_mov_ri(&mut ctx.text, A64::X5, 0)
+         a64_mov_ri(&mut ctx.text, A64::X16, 197)
+         a64_svc(&mut ctx.text, 0x80)
+       when OsAbi::Linux then
+         a64_mov_ri(&mut ctx.text, A64::X3, 0x22)
+         a64_mov_ri(&mut ctx.text, A64::X4, -1)
+         a64_mov_ri(&mut ctx.text, A64::X5, 0)
+         a64_mov_ri(&mut ctx.text, A64::X8, 222)
+         a64_svc(&mut ctx.text, 0)
+       when _ then a64_brk(&mut ctx.text, 1)
+       end
+       # Checked failure: MAP_FAILED has the sign bit set.
+       a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+       a64_bcond(&mut ctx.text, a64_cc_lt(), fail.clone())
+
+       # Deterministic arena init: base = X0, end = base + 4 MB.
+       a64_mov_rr(&mut ctx.text, A64::X20, A64::X0)
+       a64_mov_ri(&mut ctx.text, A64::X23, 0x400000)
+       a64_add_rrr(&mut ctx.text, A64::X21, A64::X20, A64::X23)
+       a64_str(&mut ctx.text, A64::X20, A64::X22, 0)
+       a64_str(&mut ctx.text, A64::X21, A64::X22, 8)
+       # Bump and return base.
+       a64_add_rrr(&mut ctx.text, A64::X24, A64::X20, A64::X19)
+       a64_str(&mut ctx.text, A64::X24, A64::X22, 0)
+       a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+       a64_b(&mut ctx.text, done.clone())
+
+       def_label(&mut ctx.text, fail.clone())
+       a64_brk(&mut ctx.text, 1)
+
+       def_label(&mut ctx.text, done.clone())
        a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
        a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
        a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
        a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
        a64_ret(&mut ctx.text)
    when Arch::X86_64 then
+       let size_ok = fresh_label(ctx, ".Lbump_size_ok")
+       let fast    = fresh_label(ctx, ".Lbump_fast")
+       let slow    = fresh_label(ctx, ".Lbump_slow")
+       let fail    = fresh_label(ctx, ".Lbump_fail")
+       let done    = fresh_label(ctx, ".Lbump_done")
+
        x64_push(&mut ctx.text, X64::RBP)
        x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
        x64_push(&mut ctx.text, X64::RBX)
@@ -6301,20 +6375,82 @@ def emit_tg_bump_alloc(ctx: &mut RuntimeEmitCtx) -> Unit
        x64_push(&mut ctx.text, X64::R13)
        x64_push(&mut ctx.text, X64::R14)
        x64_push(&mut ctx.text, X64::R15)
-       x64_add_ri(&mut ctx.text, X64::RDI, 7)
-       x64_mov_ri(&mut ctx.text, X64::RAX, -8)
-       x64_and_rr(&mut ctx.text, X64::RDI, X64::RAX)
+
+       # RBX = align16(RDI): guaranteed 16-byte alignment.
+       x64_add_ri(&mut ctx.text, X64::RDI, 15)
+       x64_and_ri(&mut ctx.text, X64::RDI, -16)
        x64_cmp_ri(&mut ctx.text, X64::RDI, 0)
-       x64_mov_ri(&mut ctx.text, X64::RAX, 16)
-       x64_cmove_rr(&mut ctx.text, X64::RDI, X64::RAX)
-       x64_mov_rr(&mut ctx.text, X64::RSI, X64::RDI)
+       x64_jcc(&mut ctx.text, CC::NE, size_ok.clone())
+       x64_mov_ri(&mut ctx.text, X64::RDI, 16)
+       def_label(&mut ctx.text, size_ok.clone())
+       x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)
+
+       # R12 = &_tg_bump_ptr (RIP-relative; end lives at +8).
+       emit8(&mut ctx.text, 0x48)
+       emit8(&mut ctx.text, 0x8D)
+       emit8(&mut ctx.text, 0x05)
+       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_bump_ptr".to_string(), -4)
+       emit32_le(&mut ctx.text, 0)
+       x64_mov_rr(&mut ctx.text, X64::R12, X64::RAX)
+
+       # R13 = current ptr, R14 = chunk end.
+       x64_mov_rm(&mut ctx.text, X64::R13, X64::R12, 0)
+       x64_mov_rm(&mut ctx.text, X64::R14, X64::R12, 8)
+
+       # Fast path: available = end - ptr >= size ?
+       x64_mov_rr(&mut ctx.text, X64::R15, X64::R14)
+       x64_sub_rr(&mut ctx.text, X64::R15, X64::R13)
+       x64_cmp_rr(&mut ctx.text, X64::R15, X64::RBX)
+       x64_jcc(&mut ctx.text, CC::AE, fast.clone())
+       x64_jmp(&mut ctx.text, slow.clone())
+
+       def_label(&mut ctx.text, fast.clone())
+       x64_mov_rr(&mut ctx.text, X64::R15, X64::R13)
+       x64_add_rr(&mut ctx.text, X64::R15, X64::RBX)
+       x64_mov_mr(&mut ctx.text, X64::R12, 0, X64::R15)
+       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+       x64_jmp(&mut ctx.text, done.clone())
+
+       # Slow path: mmap a fresh 4 MB chunk.
+       def_label(&mut ctx.text, slow.clone())
+       x64_mov_ri(&mut ctx.text, X64::RSI, 0x400000)
        x64_mov_ri(&mut ctx.text, X64::RDI, 0)
-       x64_mov_ri(&mut ctx.text, X64::RDX, 3)
-       x64_mov_ri(&mut ctx.text, X64::RCX, 0x1002)
-       x64_mov_ri(&mut ctx.text, X64::R8, -1)
-       x64_mov_ri(&mut ctx.text, X64::R9, 0)
-       emit32_le(&mut ctx.text, 0x2000000 + 197)
+       x64_mov_ri(&mut ctx.text, X64::RDX, 3)   # PROT_READ|PROT_WRITE
+       match ctx.target.os
+       when OsAbi::MacOS then
+         x64_mov_ri(&mut ctx.text, X64::R10, 0x1002)
+         x64_mov_ri(&mut ctx.text, X64::R8, -1)
+         x64_mov_ri(&mut ctx.text, X64::R9, 0)
+         x64_mov_ri(&mut ctx.text, X64::RAX, 0x20000C5)
+       when OsAbi::Linux then
+         x64_mov_ri(&mut ctx.text, X64::R10, 0x22)
+         x64_mov_ri(&mut ctx.text, X64::R8, -1)
+         x64_mov_ri(&mut ctx.text, X64::R9, 0)
+         x64_mov_ri(&mut ctx.text, X64::RAX, 9)
+       when _ then x64_ud2(&mut ctx.text)
+       end
        x64_syscall(&mut ctx.text)
+       # Checked failure: MAP_FAILED has the sign bit set.
+       x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+       x64_jcc(&mut ctx.text, CC::S, fail.clone())
+
+       # Deterministic arena init: base = RAX, end = base + 4 MB.
+       x64_mov_rr(&mut ctx.text, X64::R13, X64::RAX)
+       x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)
+       x64_add_ri(&mut ctx.text, X64::R14, 0x400000)
+       x64_mov_mr(&mut ctx.text, X64::R12, 0, X64::R13)
+       x64_mov_mr(&mut ctx.text, X64::R12, 8, X64::R14)
+       # Bump and return base.
+       x64_mov_rr(&mut ctx.text, X64::R15, X64::R13)
+       x64_add_rr(&mut ctx.text, X64::R15, X64::RBX)
+       x64_mov_mr(&mut ctx.text, X64::R12, 0, X64::R15)
+       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+       x64_jmp(&mut ctx.text, done.clone())
+
+       def_label(&mut ctx.text, fail.clone())
+       x64_ud2(&mut ctx.text)
+
+       def_label(&mut ctx.text, done.clone())
        x64_pop(&mut ctx.text, X64::R15)
        x64_pop(&mut ctx.text, X64::R14)
        x64_pop(&mut ctx.text, X64::R13)

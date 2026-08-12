@@ -35,10 +35,18 @@ These container type layouts are frozen.
 
 | Type     | Size | Layout (ptr, len, cap, ...)     | Frozen Since |
 |----------|------|---------------------------------|--------------|
-| String   | 24   | ptr:0, len:8, cap:16            | v0.1         |
+| String   | 8    | raw pointer to null-terminated UTF-8 | v0.1    |
 | Vec[T]   | 24   | ptr:0, len:8, cap:16            | v0.1         |
 | Map[K,V] | 48   | buckets:0, len:8, cap:16, hash_fn:24 | v0.1   |
 | Set[T]   | 32   | map:0, len:8                    | v0.1         |
+
+**String ABI note (FROZEN):** String values are an 8-byte raw pointer to a
+null-terminated UTF-8 byte buffer. There is NO inline `{ptr,len,cap}` header
+on String values. The 24-byte `{ptr:0, len:8, cap:16}` shape sometimes
+described for String is ONLY the internal char-vector buffer produced by
+`str.chars()` (a `Vec[Int]`), never the String value ABI. This must match
+`layout_engine.string_abi_size()` and `codegen.normalize_string_arg0_for_current_arch`.
+Changing it is a breaking ABI change.
 
 ### F3: Enum Representation
 - Tag is always 8 bytes at offset 0

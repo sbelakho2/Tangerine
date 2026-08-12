@@ -24,7 +24,7 @@ These values MUST NOT change. Any bug in these values is a bug in the layout eng
 
 | Container | Header Size | Fields |
 |-----------|-------------|--------|
-| String | 24 | ptr(0), len(8), cap(16) |
+| String | 8 | raw pointer to null-terminated UTF-8 (no inline header) |
 | Vec[T] | 24 | data(0), length(8), capacity(16) |
 | Array[T] | 24 | data(0), length(8), capacity(16) |
 | Map[K,V] | 48 | buckets(0), size(8), cap(16), hash_fn(24), eq_fn(32), aux(40) |
@@ -119,8 +119,9 @@ use tg_compiler::layout_engine::{
   discriminant_offset, discriminant_size, payload_offset
 }
 
-# Get String header size (F2 - FROZEN)
-let str_size = container_header_size(&"String".to_string())  # 24
+# Get String ABI size (F2 - FROZEN)
+# String values use the raw-pointer ABI: 8 bytes, no inline header.
+let str_size = string_abi_size()  # 8
 
 # Get Vec.len offset (F2 - FROZEN)
 let len_off = container_field_offset(&"Vec".to_string(), &"length".to_string())  # 8
