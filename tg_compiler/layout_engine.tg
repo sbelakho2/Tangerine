@@ -124,6 +124,33 @@ struct LayoutRecord
 end
 
 # ———————————————————————————————————————————————————————————————
+# Unified ABI Layout (Single ABI Authority)
+# ———————————————————————————————————————————————————————————————
+
+# The canonical result of every layout query.  ABI consumers (codegen,
+# lowering, runtime glue) must derive size/alignment/stride/field placement
+# and enum tagging from a single Layout value instead of reconstructing
+# offsets with ad-hoc `* 8` arithmetic.  This makes the layout engine the
+# single authority for the machine-level ABI.
+
+# Discriminated-union (enum) tagging info.
+struct EnumLayout
+  tag_offset: Int          # Offset of the discriminant tag from the base
+  tag_size: Int            # Byte width of the discriminant tag
+  payload_offset: Int      # Offset of the variant payload from the base
+  variants: Vec[VariantLayout]
+end
+
+# One fully-resolved layout for a type.
+struct Layout
+  size: Int                # Total byte size
+  align: Int               # Required alignment in bytes
+  stride: Int              # Distance between consecutive elements
+  fields: Vec[FieldLayout] # Field placements (structs/tuples)
+  enum_layout: Option[EnumLayout]  # Present for tagged unions only
+end
+
+# ———————————————————————————————————————————————————————————————
 # Target Layout Descriptor (Step 1)
 # ———————————————————————————————————————————————————————————————
 
@@ -369,6 +396,112 @@ def stride_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   let sz = size_of(engine, ty)
   let al = align_of(engine, ty)
   layout_align_up(sz, al)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Unified Layout Query (Single ABI Authority)
+# ———————————————————————————————————————————————————————————————
+
+# Return a complete Layout for a type.  This is the canonical ABI query:
+# consumers should use layout_of instead of reconstructing size/align/
+# stride/field offsets independently.
+def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
+  let prim_size = primitive_size(engine, ty)
+  if prim_size >= 0 then
+    let psize = prim_size
+    let palign = primitive_align(engine, ty)
+    Layout {
+      size: psize,
+      align: palign,
+      stride: layout_align_up(psize, palign),
+      fields: Vec::new(),
+      enum_layout: Option::None
+    }
+  else
+    match ty
+    when Type::Unit then
+      Layout { size: 0, align: 1, stride: 0, fields: Vec::new(), enum_layout: Option::None }
+    when Type::Never then
+      Layout { size: 0, align: 1, stride: 0, fields: Vec::new(), enum_layout: Option::None }
+    when Type::Ref(_, _) then pointer_layout(engine)
+    when Type::RefMut(_, _) then pointer_layout(engine)
+    when Type::Owned(_) then pointer_layout(engine)
+    when Type::Ptr(_) then pointer_layout(engine)
+    when Type::PtrMut(_) then pointer_layout(engine)
+    when Type::Function(_, _) then fn_ptr_layout(engine)
+    when Type::Tuple(fields) then tuple_layout(engine, fields)
+    when Type::Array(elem, count) then
+      let elem_layout = layout_of(engine, elem)
+      let elem_stride = elem_layout.stride
+      Layout {
+        size: elem_stride * count,
+        align: elem_layout.align,
+        stride: elem_stride,
+        fields: Vec::new(),
+        enum_layout: Option::None
+      }
+    when Type::Named(tid, _) then
+      let rec = compute_type_layout(engine, tid.id)
+      record_to_layout(&rec)
+    when _ then pointer_layout(engine)
+    end
+  end
+end
+
+def pointer_layout(engine: &LayoutEngine) -> Layout
+  let s = engine.target.pointer_size
+  Layout { size: s, align: engine.target.pointer_align, stride: s, fields: Vec::new(), enum_layout: Option::None }
+end
+
+def fn_ptr_layout(engine: &LayoutEngine) -> Layout
+  let s = engine.target.fn_ptr_size
+  Layout { size: s, align: engine.target.pointer_align, stride: s, fields: Vec::new(), enum_layout: Option::None }
+end
+
+def record_to_layout(rec: &LayoutRecord) -> Layout
+  let enum_info = if rec.category == LayoutCategory::TaggedUnion then
+    Option::Some(EnumLayout {
+      tag_offset: rec.tag_offset,
+      tag_size: rec.tag_size,
+      payload_offset: rec.payload_offset,
+      variants: rec.variants.clone()
+    })
+  else
+    Option::None
+  end
+  Layout {
+    size: rec.size,
+    align: rec.align,
+    stride: rec.stride,
+    fields: rec.fields.clone(),
+    enum_layout: enum_info
+  }
+end
+
+def tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Layout
+  let tl = compute_tuple_layout(engine, fields)
+  mut field_layouts = Vec::new()
+  mut i = 0
+  for fty in fields do
+    let fsize = size_of(engine, fty)
+    let falign = align_of(engine, fty)
+    let off = if i < tl.field_offsets.len() then tl.field_offsets[i] else 0 end
+    field_layouts.push(FieldLayout {
+      name: i.to_string(),
+      offset: off,
+      size: fsize,
+      align: falign,
+      type_id: extract_type_id(fty)
+    })
+    i = i + 1
+  end
+  Layout {
+    size: tl.size,
+    align: tl.align,
+    stride: tl.size,
+    fields: field_layouts,
+    enum_layout: Option::None
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -639,23 +772,21 @@ end
 
 # Get the byte offset of a field by index
 def field_offset(engine: &mut LayoutEngine, type_id: Int, field_index: Int) -> Int
-  let rec = compute_type_layout(engine, type_id)
-  mut idx = 0
-  for f in rec.fields do
-    if idx == field_index then
-      return f.offset
-    end
-    idx = idx + 1
+  let ty = Type::Named(TypeId { id: type_id }, Vec::new())
+  let layout = layout_of(engine, &ty)
+  if field_index >= 0 && field_index < layout.fields.len() then
+    layout.fields[field_index].offset
+  else
+    panic("field_offset: field index " + field_index.to_string() + " out of range for type id " + type_id.to_string())
   end
-  # F8: unknown fields default to index * 8
-  field_index * 8
 end
 
 # Get the byte offset of a field by name
 def field_offset_by_name(engine: &mut LayoutEngine, type_id: Int, field_name: &String) -> Option[Int]
-  let rec = compute_type_layout(engine, type_id)
+  let ty = Type::Named(TypeId { id: type_id }, Vec::new())
+  let layout = layout_of(engine, &ty)
   mut i = 0
-  for f in rec.fields do
+  for f in layout.fields do
     if f.name == *field_name then
       return Option::Some(f.offset)
     end
@@ -666,15 +797,13 @@ end
 
 # Get field size by index
 def field_size(engine: &mut LayoutEngine, type_id: Int, field_index: Int) -> Int
-  let rec = compute_type_layout(engine, type_id)
-  mut idx = 0
-  for f in rec.fields do
-    if idx == field_index then
-      return f.size
-    end
-    idx = idx + 1
+  let ty = Type::Named(TypeId { id: type_id }, Vec::new())
+  let layout = layout_of(engine, &ty)
+  if field_index >= 0 && field_index < layout.fields.len() then
+    layout.fields[field_index].size
+  else
+    panic("field_size: field index " + field_index.to_string() + " out of range for type id " + type_id.to_string())
   end
-  8  # Default to pointer size
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1005,6 +1134,38 @@ def arg_register_count(engine: &LayoutEngine, ty: &Type) -> Int
     if should_pass_directly(engine, ty) then 1 else 1 end  # Indirect = 1 pointer
   end
   sz
+end
+
+# Absolute byte offsets of each payload field for an enum variant, taken from
+# the single layout authority.  Offsets are relative to the enum base (tag at
+# 0, payload at tag_size).  Replaces any ad-hoc `payload_offset + i * 8`.
+def enum_variant_field_offsets(engine: &LayoutEngine, type_id: Int, variant_index: Int) -> Vec[Int]
+  mut offs = Vec::new()
+  match engine.records.get(&type_id)
+  when Option::Some(rec) then
+    if variant_index >= 0 && variant_index < rec.variants.len() then
+      for f in rec.variants[variant_index].fields do
+        offs.push(f.offset)
+      end
+    end
+  when Option::None then ()
+  end
+  offs
+end
+
+# Variant payload sizes, from the layout authority.
+def enum_variant_field_sizes(engine: &LayoutEngine, type_id: Int, variant_index: Int) -> Vec[Int]
+  mut sizes = Vec::new()
+  match engine.records.get(&type_id)
+  when Option::Some(rec) then
+    if variant_index >= 0 && variant_index < rec.variants.len() then
+      for f in rec.variants[variant_index].fields do
+        sizes.push(f.size)
+      end
+    end
+  when Option::None then ()
+  end
+  sizes
 end
 
 # ———————————————————————————————————————————————————————————————

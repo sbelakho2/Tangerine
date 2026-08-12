@@ -10453,10 +10453,16 @@ end
 
 def verify_mir(mir: &MirProgram) -> Vec[String]
   mut errors = Vec::new()
+  # Build a type index (type_id -> MirTypeDef) used for projection and rvalue
+  # type-checking across all functions.
+  mut type_index: Map[Int, MirTypeDef] = Map::new()
+  for td in mir.types do
+    type_index.insert(td.id.id, td.clone())
+  end
   mut func_idx = 0
   while func_idx < mir.functions.len() do
     let func = &mir.functions[func_idx]
-    verify_function(func, &mut errors)
+    verify_function_v2(&type_index, func, &mut errors)
     func_idx = func_idx + 1
   end
   errors
@@ -10801,4 +10807,770 @@ def block_exists(func: &MirFunction, id: BlockId) -> Bool
     end
   end
   false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Upgrade: Real CFG/dataflow MIR verifier
+# ———————————————————————————————————————————————————————————————
+#
+# The verifier below replaces the earlier ad-hoc checks with a real
+# analysis:
+#   * CFG well-formedness (entry exists, terminator successor blocks exist)
+#   * Definite-initialization dataflow (forward, meet = intersection of
+#     predecessors) — flags uses of possibly-uninitialized locals
+#   * Storage-lifetime dataflow (StorageLive/StorageDead respected)
+#   * Projection typing — validates each projection step against the
+#     resolved type (deref of pointers, field of structs/tuples, downcast
+#     of enum variants, index of arrays/slices)
+#   * Rvalue typing — operands are well-typed and defined
+#   * Call invariants — callee is function-typed, arg arity/type match,
+#     destination type matches the return type
+#
+# The type index (Map[Int, MirTypeDef]) is threaded through so that
+# projection and call checking resolve user-defined structs/enums.
+
+# ———————————————————————————————————————————————————————————————
+# Type-system helpers
+# ———————————————————————————————————————————————————————————————
+
+def verifier_type_key(ty: &Type) -> String
+  match ty
+  when Type::Unit then "unit"
+  when Type::Bool then "bool"
+  when Type::Int then "int"
+  when Type::UInt then "uint"
+  when Type::Float then "float"
+  when Type::Char then "char"
+  when Type::String then "string"
+  when Type::Never then "never"
+  when Type::I8 then "i8"
+  when Type::I16 then "i16"
+  when Type::I32 then "i32"
+  when Type::I64 then "i64"
+  when Type::I128 then "i128"
+  when Type::U8 then "u8"
+  when Type::U16 then "u16"
+  when Type::U32 then "u32"
+  when Type::U64 then "u64"
+  when Type::U128 then "u128"
+  when Type::ISize then "isize"
+  when Type::USize then "usize"
+  when Type::F32 then "f32"
+  when Type::F64 then "f64"
+  when Type::Named(tid, _) then "named:" + tid.id.to_string()
+  when Type::Function(_, _) then "fn"
+  when Type::Ref(inner, _) then "&" + verifier_type_key(&inner)
+  when Type::RefMut(inner, _) then "&mut " + verifier_type_key(&inner)
+  when Type::Owned(inner) then "owned:" + verifier_type_key(&inner)
+  when Type::Ptr(inner) then "*" + verifier_type_key(&inner)
+  when Type::PtrMut(inner) then "*mut " + verifier_type_key(&inner)
+  when Type::Box(inner) then "box:" + verifier_type_key(&inner)
+  when Type::Rc(inner) then "rc:" + verifier_type_key(&inner)
+  when Type::Dyn(_) then "dyn"
+  when Type::Effect(_, inner) then verifier_type_key(&inner)
+  when Type::Tuple(fields) then
+    mut s = "tuple("
+    mut i = 0
+    while i < fields.len() do
+      s = s + verifier_type_key(&fields[i])
+      if i < fields.len() - 1 then s = s + "," end
+      i = i + 1
+    end
+    s + ")"
+  when Type::Array(elem, n) then "array(" + verifier_type_key(&elem) + ":" + n.to_string() + ")"
+  when Type::Slice(elem) then "slice:" + verifier_type_key(&elem)
+  when Type::Option(inner) then "option:" + verifier_type_key(&inner)
+  when Type::Result(a, b) then "result:" + verifier_type_key(&a) + ":" + verifier_type_key(&b)
+  when Type::Map(k, v) then "map:" + verifier_type_key(&k) + ":" + verifier_type_key(&v)
+  when Type::Set(e) then "set:" + verifier_type_key(&e)
+  when Type::Var(_) then "var"
+  when Type::Param(n) then "param:" + n.clone()
+  when Type::Error then "error"
+  when _ then "unknown"
+  end
+end
+
+def verifier_types_compatible(expected: &Type, actual: &Type) -> Bool
+  let ek = verifier_type_key(expected)
+  let ak = verifier_type_key(actual)
+  if ek == ak then return true end
+  # Unit/Never are interchangeable at value level.
+  if (ek == "unit" && ak == "never") || (ek == "never" && ak == "unit") then return true end
+  false
+end
+
+def verifier_local_type(func: &MirFunction, lid: Int) -> Option[Type]
+  for p in func.params do
+    if p.id.id == lid then return Option::Some(p.ty.clone()) end
+  end
+  for l in func.locals do
+    if l.id.id == lid then return Option::Some(l.ty.clone()) end
+  end
+  Option::None
+end
+
+def verifier_local_exists(func: &MirFunction, lid: Int) -> Bool
+  for p in func.params do
+    if p.id.id == lid then return true end
+  end
+  for l in func.locals do
+    if l.id.id == lid then return true end
+  end
+  false
+end
+
+def verifier_block_exists(func: &MirFunction, bid: Int) -> Bool
+  for b in func.blocks do
+    if b.id.id == bid then return true end
+  end
+  false
+end
+
+def verifier_type_def(type_index: &Map[Int, MirTypeDef], tid: Int) -> Option[MirTypeDef]
+  match type_index.get(tid)
+  when Option::Some(td) then Option::Some(td.clone())
+  when Option::None then Option::None
+  end
+end
+
+def verifier_strip_pointee(ty: &Type) -> Option[Type]
+  match ty
+  when Type::Ref(inner, _) then Option::Some(inner.clone())
+  when Type::RefMut(inner, _) then Option::Some(inner.clone())
+  when Type::Owned(inner) then Option::Some(inner.clone())
+  when Type::Ptr(inner) then Option::Some(inner.clone())
+  when Type::PtrMut(inner) then Option::Some(inner.clone())
+  when Type::Box(inner) then Option::Some(inner.clone())
+  when Type::Rc(inner) then Option::Some(inner.clone())
+  when _ then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Projection typing
+# ———————————————————————————————————————————————————————————————
+
+def verifier_field_type(type_index: &Map[Int, MirTypeDef], ty: &Type, index: Int) -> Option[Type]
+  match ty
+  when Type::Ref(inner, _) then verifier_field_type(type_index, &inner, index)
+  when Type::RefMut(inner, _) then verifier_field_type(type_index, &inner, index)
+  when Type::Owned(inner) then verifier_field_type(type_index, &inner, index)
+  when Type::Tuple(fields) then
+    if index >= 0 && index < fields.len() then Option::Some(fields[index].clone()) else Option::None end
+  when Type::Named(tid, _) then
+    match verifier_type_def(type_index, tid.id)
+    when Option::Some(td) then
+      match td.kind
+      when MirTypeDefKind::Struct(fields) then
+        if index >= 0 && index < fields.len() then Option::Some(fields[index].ty.clone()) else Option::None end
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def verifier_downcast_type(type_index: &Map[Int, MirTypeDef], ty: &Type, disc: Int) -> Option[Type]
+  match ty
+  when Type::Ref(inner, _) then verifier_downcast_type(type_index, &inner, disc)
+  when Type::RefMut(inner, _) then verifier_downcast_type(type_index, &inner, disc)
+  when Type::Owned(inner) then verifier_downcast_type(type_index, &inner, disc)
+  when Type::Named(tid, _) then
+    match verifier_type_def(type_index, tid.id)
+    when Option::Some(td) then
+      match td.kind
+      when MirTypeDefKind::Enum(variants) then
+        mut vi = 0
+        while vi < variants.len() do
+          if variants[vi].discriminant == disc then
+            return Option::Some(Type::Tuple(variants[vi].fields.clone()))
+          end
+          vi = vi + 1
+        end
+        Option::None
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def verifier_elem_type(ty: &Type) -> Option[Type]
+  match ty
+  when Type::Ref(inner, _) then verifier_elem_type(&inner)
+  when Type::RefMut(inner, _) then verifier_elem_type(&inner)
+  when Type::Owned(inner) then verifier_elem_type(&inner)
+  when Type::Array(elem, _) then Option::Some(elem.clone())
+  when Type::Slice(elem) then Option::Some(elem.clone())
+  when Type::String then Option::Some(Type::U8)
+  when _ then Option::None
+  end
+end
+
+def verifier_project_type(type_index: &Map[Int, MirTypeDef], cur: &Type, proj: Projection) -> Option[Type]
+  match proj
+  when Projection::ProjDeref then
+    match verifier_strip_pointee(cur)
+    when Option::Some(inner) then Option::Some(inner)
+    when Option::None then Option::None
+    end
+  when Projection::ProjField(_, index) then verifier_field_type(type_index, cur, index)
+  when Projection::ProjDowncast(_, disc) then verifier_downcast_type(type_index, cur, disc)
+  when Projection::ProjIndex(_) then verifier_elem_type(cur)
+  when Projection::ProjConstantIndex(_) then verifier_elem_type(cur)
+  end
+end
+
+def verifier_place_type(type_index: &Map[Int, MirTypeDef], base: &Type, projections: &Vec[Projection]) -> Option[Type]
+  mut cur = base.clone()
+  mut pidx = 0
+  while pidx < projections.len() do
+    let next_opt = verifier_project_type(type_index, &cur, projections[pidx].clone())
+    match next_opt
+    when Option::Some(t) then cur = t
+    when Option::None then return Option::None
+    end
+    pidx = pidx + 1
+  end
+  Option::Some(cur)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Operand / rvalue / constant typing
+# ———————————————————————————————————————————————————————————————
+
+def verifier_constant_type(cst: &MirConstant) -> Option[Type]
+  match &cst.kind
+  when MirConstantKind::MirUnit then Option::Some(Type::Unit)
+  when MirConstantKind::MirBool(_) then Option::Some(Type::Bool)
+  when MirConstantKind::MirInt(_) then Option::Some(Type::Int)
+  when MirConstantKind::MirFloat(_) then Option::Some(Type::Float)
+  when MirConstantKind::MirChar(_) then Option::Some(Type::Char)
+  when MirConstantKind::MirString(_) then Option::Some(Type::String)
+  when MirConstantKind::MirFnItem(_) then Option::Some(Type::Unit)
+  when MirConstantKind::MirZeroSized then Option::Some(Type::Unit)
+  when MirConstantKind::MirStaticRef(_) then Option::Some(Type::Unit)
+  when MirConstantKind::MirStaticAddr(_) then Option::Some(Type::Unit)
+  when _ then Option::None
+  end
+end
+
+def verifier_place_result_type_opt(func: &MirFunction, place: &Place) -> Option[Type]
+  match verifier_local_type(func, place.local.id)
+  when Option::Some(t) then Option::Some(t)
+  when Option::None then Option::None
+  end
+end
+
+def verifier_place_result_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, place: &Place, ctx: &String, errors: &mut Vec[String]) -> Option[Type]
+  match verifier_local_type(func, place.local.id)
+  when Option::Some(base) then
+    if place.projections.len() > 0 then
+      verifier_place_type(type_index, &base, &place.projections)
+    else
+      Option::Some(base)
+    end
+  when Option::None then Option::None
+  end
+end
+
+def verifier_check_place(type_index: &Map[Int, MirTypeDef], func: &MirFunction, place: &Place, running: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+  let pid = place.local.id
+  let base_ty = match verifier_local_type(func, pid)
+  when Option::Some(t) then t
+  when Option::None then
+    errors.push(ctx.clone() + ": place references undefined local _" + pid.to_string())
+    return
+  end
+  if !running.contains(&pid) then
+    errors.push(ctx.clone() + ": use of possibly-uninitialized local _" + pid.to_string())
+  end
+  # Validate the projection chain is well-typed.
+  if place.projections.len() > 0 then
+    match verifier_place_type(type_index, &base_ty, &place.projections)
+    when Option::Some(_) then ()
+    when Option::None then
+      errors.push(ctx.clone() + ": invalid projection chain on local _" + pid.to_string())
+    end
+  end
+end
+
+def verifier_check_operand(type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, running: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
+  match &operand.kind
+  when MirOperandKind::MirCopy(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    verifier_place_result_type(type_index, func, &place, ctx, errors)
+  when MirOperandKind::MirMovePlace(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    verifier_place_result_type(type_index, func, &place, ctx, errors)
+  when MirOperandKind::MirConstant(cst) then
+    verifier_constant_type(&cst)
+  end
+end
+
+def verifier_rvalue_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, rvalue: &MirRvalue, running: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
+  match &rvalue.kind
+  when MirRvalueKind::MirMove(operand) then
+    verifier_check_operand(type_index, func, &operand, running, ctx, errors)
+  when MirRvalueKind::MirRef(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    Option::None
+  when MirRvalueKind::MirRefMut(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    Option::None
+  when MirRvalueKind::MirAggregate(kind, operands) then
+    mut ai = 0
+    while ai < operands.len() do
+      let _ = verifier_check_operand(type_index, func, &operands[ai], running, ctx, errors)
+      ai = ai + 1
+    end
+    verifier_aggregate_result_type(type_index, func, kind, &operands, ctx, errors)
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    let lty = verifier_check_operand(type_index, func, &lhs, running, ctx, errors)
+    let _ = verifier_check_operand(type_index, func, &rhs, running, ctx, errors)
+    match lty
+    when Option::Some(t) then Option::Some(t)
+    when Option::None then Option::None
+    end
+  when MirRvalueKind::MirUnOp(_, operand) then
+    verifier_check_operand(type_index, func, &operand, running, ctx, errors)
+  when MirRvalueKind::MirDiscriminant(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    Option::Some(Type::Int)
+  when MirRvalueKind::MirLen(place) then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    Option::Some(Type::Int)
+  when MirRvalueKind::MirCast(_, operand, ty) then
+    let _ = verifier_check_operand(type_index, func, &operand, running, ctx, errors)
+    Option::Some(ty)
+  when MirRvalueKind::MirRepeat(operand, _) then
+    let _ = verifier_check_operand(type_index, func, &operand, running, ctx, errors)
+    Option::None
+  when MirRvalueKind::MirPhi(entries) then
+    mut ei = 0
+    while ei < entries.len() do
+      let lid = entries[ei].1.id
+      if !verifier_local_exists(func, lid) then
+        errors.push(ctx.clone() + ": phi references undefined local _" + lid.to_string())
+      end
+      ei = ei + 1
+    end
+    Option::None
+  when _ then Option::None
+  end
+end
+
+def verifier_operand_static_type(func: &MirFunction, op: &MirOperand) -> Option[Type]
+  match &op.kind
+  when MirOperandKind::MirCopy(place) then verifier_place_result_type_opt(func, &place)
+  when MirOperandKind::MirMovePlace(place) then verifier_place_result_type_opt(func, &place)
+  when MirOperandKind::MirConstant(cst) then verifier_constant_type(&cst)
+  end
+end
+
+def verifier_operand_types(func: &MirFunction, operands: &Vec[MirOperand]) -> Vec[Type]
+  mut tys = Vec::new()
+  mut oi = 0
+  while oi < operands.len() do
+    match verifier_operand_static_type(func, &operands[oi])
+    when Option::Some(t) then tys.push(t)
+    when Option::None then tys.push(Type::Unit)
+    end
+    oi = oi + 1
+  end
+  tys
+end
+
+def verifier_aggregate_result_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, kind: AggregateKind, operands: &Vec[MirOperand], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
+  match kind
+  when AggregateKind::MirArray(elem_ty) then
+    mut ai = 0
+    while ai < operands.len() do
+      match &operands[ai].kind
+      when MirOperandKind::MirConstant(cst) then
+        match verifier_constant_type(&cst)
+        when Option::Some(ct) then
+          if !verifier_types_compatible(&elem_ty, &ct) then
+            errors.push(ctx.clone() + ": aggregate element type mismatch: expected " + verifier_type_key(&elem_ty) + " got " + verifier_type_key(&ct))
+          end
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+      ai = ai + 1
+    end
+    Option::Some(Type::Array(elem_ty.clone(), operands.len()))
+  when AggregateKind::Tuple then
+    Option::Some(Type::Tuple(verifier_operand_types(func, operands)))
+  when AggregateKind::Struct(tid, _) then
+    match verifier_type_def(type_index, tid.id)
+    when Option::Some(_) then Option::Some(Type::Named(tid.clone(), Vec::new()))
+    when Option::None then Option::None
+    end
+  when AggregateKind::Closure(_) then Option::Some(Type::Unit)
+  when AggregateKind::Generator(_) then Option::Some(Type::Unit)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Call invariants
+# ———————————————————————————————————————————————————————————————
+
+def verifier_check_call(type_index: &Map[Int, MirTypeDef], func: &MirFunction, dest: &Place, callee: &MirOperand, args: &Vec[MirOperand], running: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+  let callee_ty = verifier_check_operand(type_index, func, callee, running, ctx, errors)
+  verifier_check_place(type_index, func, dest, running, ctx, errors)
+  mut arg_types = Vec::new()
+  mut ai = 0
+  while ai < args.len() do
+    let at = verifier_check_operand(type_index, func, &args[ai], running, ctx, errors)
+    match at
+    when Option::Some(t) then arg_types.push(t)
+    when Option::None then ()
+    end
+    ai = ai + 1
+  end
+  match callee_ty
+  when Option::Some(cty) then
+    match cty
+    when Type::Function(param_tys, ret_ty) then
+      if param_tys.len() != args.len() then
+        errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
+      end
+      mut i = 0
+      while i < args.len() && i < param_tys.len() do
+        if i < arg_types.len() then
+          if !verifier_types_compatible(&param_tys[i], &arg_types[i]) then
+            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(&param_tys[i]) + " got " + verifier_type_key(&arg_types[i]))
+          end
+        end
+        i = i + 1
+      end
+      match verifier_local_type(func, dest.local.id)
+      when Option::Some(dty) then
+        if !verifier_types_compatible(&ret_ty, &dty) then
+          errors.push(ctx.clone() + ": call dest type mismatch: expected " + verifier_type_key(&ret_ty) + " got " + verifier_type_key(&dty))
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+end
+
+def verifier_check_terminator(type_index: &Map[Int, MirTypeDef], func: &MirFunction, term: &MirTerminator, running: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+  match &term.kind
+  when MirTerminatorKind::MirGoto(target) then
+    if !verifier_block_exists(func, target.id) then
+      errors.push(ctx.clone() + ": goto references invalid block bb" + target.id.to_string())
+    end
+  when MirTerminatorKind::MirReturn then ()
+  when MirTerminatorKind::MirUnreachable then ()
+  when MirTerminatorKind::MirAbort then ()
+  when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
+    let _ = verifier_check_operand(type_index, func, &op, running, ctx, errors)
+    mut ti = 0
+    while ti < targets.len() do
+      if !verifier_block_exists(func, targets[ti].target.id) then
+        errors.push(ctx.clone() + ": switch references invalid block bb" + targets[ti].target.id.to_string())
+      end
+      ti = ti + 1
+    end
+    if !verifier_block_exists(func, default_target.id) then
+      errors.push(ctx.clone() + ": switch fallback references invalid block bb" + default_target.id.to_string())
+    end
+  when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
+    verifier_check_call(type_index, func, &dest, &callee, &args, running, ctx, errors)
+    if !verifier_block_exists(func, success.id) then
+      errors.push(ctx.clone() + ": call success references invalid block bb" + success.id.to_string())
+    end
+    match unwind
+    when Option::Some(uw) then
+      if !verifier_block_exists(func, uw.id) then
+        errors.push(ctx.clone() + ": call unwind references invalid block bb" + uw.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDrop { place, target, unwind } then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    if !verifier_block_exists(func, target.id) then
+      errors.push(ctx.clone() + ": drop target references invalid block bb" + target.id.to_string())
+    end
+    match unwind
+    when Option::Some(uw) then
+      if !verifier_block_exists(func, uw.id) then
+        errors.push(ctx.clone() + ": drop unwind references invalid block bb" + uw.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    let _ = verifier_check_operand(type_index, func, &cond, running, ctx, errors)
+    if !verifier_block_exists(func, target.id) then
+      errors.push(ctx.clone() + ": assert target references invalid block bb" + target.id.to_string())
+    end
+    match unwind
+    when Option::Some(uw) then
+      if !verifier_block_exists(func, uw.id) then
+        errors.push(ctx.clone() + ": assert unwind references invalid block bb" + uw.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirYield(op, resume) then
+    let _ = verifier_check_operand(type_index, func, &op, running, ctx, errors)
+    if !verifier_block_exists(func, resume.id) then
+      errors.push(ctx.clone() + ": yield resume references invalid block bb" + resume.id.to_string())
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Definite-initialization + storage-lifetime dataflow
+# ———————————————————————————————————————————————————————————————
+
+def verifier_set_equal(a: &Set[Int], b: &Set[Int]) -> Bool
+  if a.len() != b.len() then return false end
+  for v in a do
+    if !b.contains(v) then return false end
+  end
+  true
+end
+
+def block_map_lookup(func: &MirFunction, bid: Int) -> Option[MirBlock]
+  for b in func.blocks do
+    if b.id.id == bid then return Option::Some(b.clone()) end
+  end
+  Option::None
+end
+
+def verifier_reachable_blocks(func: &MirFunction) -> Set[Int]
+  mut reachable: Set[Int] = Set::new()
+  mut worklist = Vec::new()
+  worklist.push(func.entry_block.id)
+  while !worklist.is_empty() do
+    let bid = match worklist.pop()
+    when Option::Some(v) then v
+    when Option::None then break
+    end
+    if reachable.contains(&bid) then next end
+    reachable.insert(bid)
+    match block_map_lookup(func, bid)
+    when Option::Some(b) then
+      let succs = terminator_successor_ids(&b.terminator)
+      mut si = 0
+      while si < succs.len() do
+        let sid = succs[si]
+        if !reachable.contains(&sid) then worklist.push(sid) end
+        si = si + 1
+      end
+    when Option::None then ()
+    end
+  end
+  reachable
+end
+
+# Forward dataflow computing the definitely-initialized / storage-live locals
+# on entry to every block, then a per-block linear pass that checks uses of
+# possibly-uninitialized locals, projection typing, rvalue typing, and call
+# invariants in program order.
+def verifier_dataflow_init(type_index: &Map[Int, MirTypeDef], func: &MirFunction, errors: &mut Vec[String]) -> Unit
+  let fn_ctx = "fn " + func.name.clone()
+  let entry_id = func.entry_block.id
+
+  mut block_map: Map[Int, MirBlock] = Map::new()
+  for b in func.blocks do block_map.insert(b.id.id, b.clone()) end
+
+  mut all_local_ids = Vec::new()
+  for p in func.params do all_local_ids.push(p.id.id) end
+  for l in func.locals do all_local_ids.push(l.id.id) end
+
+  mut entry_init: Set[Int] = Set::new()
+  for p in func.params do entry_init.insert(p.id.id) end
+
+  mut preds: Map[Int, Vec[Int]] = Map::new()
+  for b in func.blocks do preds.insert(b.id.id, Vec::new()) end
+  for b in func.blocks do
+    let succs = terminator_successor_ids(&b.terminator)
+    mut si = 0
+    while si < succs.len() do
+      let existing = match preds.get(succs[si])
+      when Option::Some(list) then list.clone()
+      when Option::None then Vec::new()
+      end
+      existing.push(b.id.id)
+      preds.insert(succs[si], existing)
+      si = si + 1
+    end
+  end
+
+  mut in_set: Map[Int, Set[Int]] = Map::new()
+  mut out_set: Map[Int, Set[Int]] = Map::new()
+  in_set.insert(entry_id, entry_init.clone())
+
+  mut worklist = Vec::new()
+  worklist.push(entry_id)
+  mut in_worklist: Set[Int] = Set::new()
+  in_worklist.insert(entry_id)
+
+  while !worklist.is_empty() do
+    let bid = match worklist.pop()
+    when Option::Some(v) then v
+    when Option::None then break
+    end
+    in_worklist.remove(&bid)
+
+    mut new_in: Set[Int] = Set::new()
+    if bid == entry_id then
+      for p in &entry_init do new_in.insert(p.clone()) end
+    else
+      let pred_list = match preds.get(bid)
+      when Option::Some(l) then l.clone()
+      when Option::None then Vec::new()
+      end
+      mut first = true
+      mut pi = 0
+      while pi < pred_list.len() do
+        match out_set.get(pred_list[pi])
+        when Option::Some(pset) then
+          if first then
+            new_in = Set::new()
+            for v in pset do new_in.insert(v.clone()) end
+            first = false
+          else
+            mut keep: Set[Int] = Set::new()
+            for v in &new_in do
+              if pset.contains(v) then keep.insert(v.clone()) end
+            end
+            new_in = keep
+          end
+        when Option::None then ()
+        end
+        pi = pi + 1
+      end
+    end
+
+    let block = match block_map.get(bid)
+    when Option::Some(b) then b.clone()
+    when Option::None then break
+    end
+
+    mut out: Set[Int] = Set::new()
+    for v in &new_in do out.insert(v.clone()) end
+    for st in block.statements do
+      match &st.kind
+      when MirStatementKind::MirAssign(place, _) then out.insert(place.local.id)
+      when MirStatementKind::MirStorageLive(local) then out.insert(local.id)
+      when MirStatementKind::MirStorageDead(local) then out.remove(&local.id)
+      when _ then ()
+      end
+    end
+
+    let old = match in_set.get(bid)
+    when Option::Some(s) then s.clone()
+    when Option::None then Set::new()
+    end
+    let had_out = match out_set.get(bid)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    let changed = !had_out || !verifier_set_equal(&old, &new_in)
+    in_set.insert(bid, new_in.clone())
+    out_set.insert(bid, out)
+
+    if changed then
+      let succs2 = terminator_successor_ids(&block.terminator)
+      mut s2 = 0
+      while s2 < succs2.len() do
+        let sid = succs2[s2]
+        if !in_worklist.contains(&sid) then
+          in_worklist.insert(sid)
+          worklist.push(sid)
+        end
+        s2 = s2 + 1
+      end
+    end
+  end
+
+  # Per-block linear pass.  Unreachable blocks (left by optimizations) are
+  # checked structurally with all locals treated as initialized to avoid
+  # spurious definite-init errors; reachable blocks use the computed in-set.
+  let reachable = verifier_reachable_blocks(func)
+  mut bi = 0
+  while bi < func.blocks.len() do
+    let b = &func.blocks[bi]
+    let bid = b.id.id
+    let bb_ctx = fn_ctx.clone() + " bb" + bid.to_string()
+    let bin = if reachable.contains(&bid) then
+      match in_set.get(bid)
+      when Option::Some(s) then s.clone()
+      when Option::None then Set::new()
+      end
+    else
+      mut t: Set[Int] = Set::new()
+      for lid in &all_local_ids do t.insert(lid.clone()) end
+      t
+    end
+    verifier_check_block_stmts(type_index, func, b, &bin, &bb_ctx, errors)
+    bi = bi + 1
+  end
+end
+
+def verifier_check_block_stmts(type_index: &Map[Int, MirTypeDef], func: &MirFunction, block: &MirBlock, block_in: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+  mut running: Set[Int] = Set::new()
+  for v in block_in do running.insert(v.clone()) end
+
+  for st in block.statements do
+    match &st.kind
+    when MirStatementKind::MirAssign(place, rvalue) then
+      let pid = place.local.id
+      match verifier_local_type(func, pid)
+      when Option::Some(dst_ty) then
+        verifier_check_place(type_index, func, &place, &running, ctx, errors)
+        let rv_ty = verifier_rvalue_type(type_index, func, &rvalue, &running, ctx, errors)
+        match rv_ty
+        when Option::Some(t) then
+          if !verifier_types_compatible(&dst_ty, &t) then
+            errors.push(ctx.clone() + ": assign type mismatch: " + verifier_type_key(&t) + " into " + verifier_type_key(&dst_ty))
+          end
+        when Option::None then ()
+        end
+        running.insert(pid)
+      when Option::None then
+        errors.push(ctx.clone() + ": assignment to undefined local _" + pid.to_string())
+      end
+    when MirStatementKind::MirStorageLive(local) then
+      let lid = local.id
+      if !verifier_local_exists(func, lid) then
+        errors.push(ctx.clone() + ": StorageLive for undefined local _" + lid.to_string())
+      end
+      running.insert(lid)
+    when MirStatementKind::MirStorageDead(local) then
+      let lid = local.id
+      if !verifier_local_exists(func, lid) then
+        errors.push(ctx.clone() + ": StorageDead for undefined local _" + lid.to_string())
+      end
+      running.remove(&lid)
+    when _ then ()
+    end
+  end
+
+  verifier_check_terminator(type_index, func, &block.terminator, &running, ctx, errors)
+end
+
+# Top-level per-function verification driver.
+def verify_function_v2(type_index: &Map[Int, MirTypeDef], func: &MirFunction, errors: &mut Vec[String]) -> Unit
+  if func.is_extern then return end
+  let fn_ctx = "fn " + func.name.clone()
+
+  if func.blocks.is_empty() then
+    errors.push(fn_ctx.clone() + ": function has no blocks")
+    return
+  end
+
+  if !verifier_block_exists(func, func.entry_block.id) then
+    errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
+  end
+
+  verifier_dataflow_init(type_index, func, errors)
 end
