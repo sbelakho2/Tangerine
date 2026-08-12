@@ -146,6 +146,20 @@ public final class MIRInterpreter {
             tdi[td.name, default: []].append(i)
         }
         self.typeDefIndex = tdi
+        for td in program.typeDefs {
+            if case .structDef(let fields) = td.kind {
+                let fieldNames = fields.map { $0.0 }
+                if structFieldOrders[td.name] == nil {
+                    structFieldOrders[td.name] = fieldNames
+                }
+                if let range = td.name.range(of: "::") {
+                    let unqualified = String(td.name[td.name.index(after: range.upperBound)...])
+                    if structFieldOrders[unqualified] == nil {
+                        structFieldOrders[unqualified] = fieldNames
+                    }
+                }
+            }
+        }
         var payloadShapes: [String: [EnumPayloadShape]] = [:]
         payloadShapes.reserveCapacity(program.typeDefs.count)
         for td in program.typeDefs {
