@@ -1253,7 +1253,7 @@ end
 # AST to MIR Lowering
 # ———————————————————————————————————————————————————————————————
 
-def lower_program(program: &Program) -> MirProgram
+def lower_program(program: &Program) -> Result[MirProgram, String]
   mut b = builder_new()
   mut functions = Vec::new()
   mut statics = Vec::new()
@@ -1535,7 +1535,10 @@ def lower_program(program: &Program) -> MirProgram
     result_func_idx = result_func_idx + 1
   end
 
-  result
+  if b.errors.len() > 0 then
+    return Result::Err(b.errors[0].clone())
+  end
+  Result::Ok(result)
 end
 
 def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
@@ -1829,7 +1832,7 @@ end
 # parameter names are given in generic_names.  Returns Type::Param(name) for
 # type parameter references, preserving generic type information in the MIR
 # so that monomorphization can detect and specialize generic functions.
-def resolve_lowering_type_in_fn(b: &MirBuilder, ty_expr: &TypeExpr, generic_names: &Set[String]) -> Type
+def resolve_lowering_type_in_fn(b: &mut MirBuilder, ty_expr: &TypeExpr, generic_names: &Set[String]) -> Type
   match ty_expr.kind
   when TypeExprKind::Named(name, args) then
     if generic_names.contains(&name) then
@@ -1877,10 +1880,14 @@ def resolve_lowering_type_in_fn(b: &MirBuilder, ty_expr: &TypeExpr, generic_name
         resolved_args.push(resolve_lowering_type_in_fn(b, &a, generic_names))
       end
       let tid = match b.type_name_to_id.get(name)
-      when Option::Some(id) then id
-      when Option::None then 0
+      when Option::Some(id) then
+        Type::Named(TypeId { id: id }, resolved_args)
+      when Option::None then
+        # Not-found: surface a lowering error instead of silently emitting a
+        # bogus TypeId{id:0}, and use the Error type so later passes reject it.
+        b.errors.push("cannot resolve type name '" + name + "' during lowering")
+        Type::Error
       end
-      Type::Named(TypeId { id: tid }, resolved_args)
     end
   when TypeExprKind::Unit then Type::Unit
   when TypeExprKind::Never then Type::Never
@@ -3214,33 +3221,41 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       match pattern.kind
       when PatternKind::Ident(name, pattern_mut) then
         let binding_mut = is_mut || pattern_mut
-        let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
-        match ty_opt
-        when Option::Some(ty_expr) then
-          let declared_ty = resolve_type_with_builder(b, &ty_expr)
-          let local_id = add_local(b, name.clone(), declared_ty, binding_mut, stmt.span)
-          push_assign(b, place_local(local_id), rvalue, stmt.span)
-        when Option::None then
-          let inferred_ty = mir_infer_expr_type(b, &value)
-          let local_id = add_local(b, name.clone(), inferred_ty, binding_mut, stmt.span)
-          push_assign(b, place_local(local_id), rvalue, stmt.span)
+        match lower_expr_to_rvalue(b, &value, stmt.span)
+        when Result::Ok(rvalue) then
+          match ty_opt
+          when Option::Some(ty_expr) then
+            let declared_ty = resolve_type_with_builder(b, &ty_expr)
+            let local_id = add_local(b, name.clone(), declared_ty, binding_mut, stmt.span)
+            push_assign(b, place_local(local_id), rvalue, stmt.span)
+          when Option::None then
+            let inferred_ty = mir_infer_expr_type(b, &value)
+            let local_id = add_local(b, name.clone(), inferred_ty, binding_mut, stmt.span)
+            push_assign(b, place_local(local_id), rvalue, stmt.span)
+          end
+        when Result::Err(e) then
+          b.errors.push(e)
         end
         return
       when _ then ()
       end
 
-      let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
-      match ty_opt
-      when Option::Some(ty_expr) then
-        let declared_ty = resolve_type_with_builder(b, &ty_expr)
-        let typed_tmp = add_temp(b, declared_ty, stmt.span)
-        push_assign(b, place_local(typed_tmp), rvalue, stmt.span)
-        lower_pattern_place_assignment(b, &pattern, place_local(typed_tmp), stmt.span)
-      when Option::None then
-        let inferred_ty = mir_infer_expr_type(b, &value)
-        let typed_tmp = add_temp(b, inferred_ty, stmt.span)
-        push_assign(b, place_local(typed_tmp), rvalue, stmt.span)
-        lower_pattern_place_assignment(b, &pattern, place_local(typed_tmp), stmt.span)
+      match lower_expr_to_rvalue(b, &value, stmt.span)
+      when Result::Ok(rvalue) then
+        match ty_opt
+        when Option::Some(ty_expr) then
+          let declared_ty = resolve_type_with_builder(b, &ty_expr)
+          let typed_tmp = add_temp(b, declared_ty, stmt.span)
+          push_assign(b, place_local(typed_tmp), rvalue, stmt.span)
+          lower_pattern_place_assignment(b, &pattern, place_local(typed_tmp), stmt.span)
+        when Option::None then
+          let inferred_ty = mir_infer_expr_type(b, &value)
+          let typed_tmp = add_temp(b, inferred_ty, stmt.span)
+          push_assign(b, place_local(typed_tmp), rvalue, stmt.span)
+          lower_pattern_place_assignment(b, &pattern, place_local(typed_tmp), stmt.span)
+        end
+      when Result::Err(e) then
+        b.errors.push(e)
       end
       return
     when _ then ()
@@ -3250,10 +3265,14 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     when StmtKind::StmtAssign(target, value) then
       let place = lower_place(b, &target)
       let value_ty = mir_infer_expr_type(b, &value)
-      let rvalue = lower_expr_to_rvalue(b, &value, stmt.span)
-      push_assign(b, place, rvalue, stmt.span)
-      refine_assignment_target_type(b, &place, &rvalue)
-      refine_assignment_target_type_from_type(b, &place, &value_ty)
+      match lower_expr_to_rvalue(b, &value, stmt.span)
+      when Result::Ok(rvalue) then
+        push_assign(b, place, rvalue, stmt.span)
+        refine_assignment_target_type(b, &place, &rvalue)
+        refine_assignment_target_type_from_type(b, &place, &value_ty)
+      when Result::Err(e) then
+        b.errors.push(e)
+      end
       return
     when _ then ()
     end
@@ -3344,10 +3363,14 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
 end
 
 def lower_expr(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirOperand
-  let rvalue = lower_expr_to_rvalue(b, expr, span)
   let inferred_ty = mir_infer_expr_type(b, expr)
   let temp = add_temp(b, inferred_ty, span)
-  push_assign(b, place_local(temp), rvalue, span)
+  match lower_expr_to_rvalue(b, expr, span)
+  when Result::Ok(rvalue) then
+    push_assign(b, place_local(temp), rvalue, span)
+  when Result::Err(e) then
+    b.errors.push(e)
+  end
   operand_copy_local(temp)
 end
 
@@ -3360,7 +3383,7 @@ def is_vec_like_from_path(path: &AstPath) -> Bool
   method == "from" && (owner == "Vec" || owner == "Array")
 end
 
-def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &Vec[Expr], span: Span) -> MirRvalue
+def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &Vec[Expr], span: Span) -> Result[MirRvalue, String]
   mut new_segments = Vec::new()
   for segment in path.segments do
     new_segments.push(segment.clone())
@@ -3401,16 +3424,14 @@ def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &V
     })
   end
 
+  mut block_stmts = stmts
+  block_stmts.push(Stmt {
+    kind: StmtKind::StmtExpr(Expr { kind: ExprKind::ExprIdent(temp_name), span: span.clone() }),
+    span: span.clone()
+  })
   let block_expr = Expr {
     kind: ExprKind::ExprBlock(Block {
-      stmts: {
-        let mut result = stmts
-        result.push(Stmt {
-          kind: StmtKind::StmtExpr(Expr { kind: ExprKind::ExprIdent(temp_name), span: span.clone() }),
-          span: span.clone()
-        })
-        result
-      },
+      stmts: block_stmts,
       span: span.clone()
     }),
     span: span.clone()
@@ -3557,7 +3578,10 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
       if first_arg_kind == "ExprArrayLit" then
         match arg_exprs[0].kind
         when ExprKind::ExprArrayLit(elems) then
-          return lower_vec_like_from_array_call(b, &callee_path, &elems, span)
+          match lower_vec_like_from_array_call(b, &callee_path, &elems, span)
+          when Result::Ok(rv) then return rv
+          when Result::Err(e) then b.errors.push(e)
+          end
         when _ then ()
         end
       end
@@ -3611,7 +3635,10 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
     if args0_kind == "ExprArrayLit" then
       match args[0].kind
       when ExprKind::ExprArrayLit(elems) then
-        return lower_vec_like_from_array_call(b, path, &elems, span)
+        match lower_vec_like_from_array_call(b, path, &elems, span)
+        when Result::Ok(rv) then return rv
+        when Result::Err(e) then b.errors.push(e)
+        end
       when _ then ()
       end
     end
@@ -3647,7 +3674,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   }) }
 end
 
-def lr_enum_construct(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> MirRvalue
+def lr_enum_construct(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> Result[MirRvalue, String]
   mut ops = Vec::new()
   mut field_names = Vec::new()
   let enum_name = if path.segments.len() >= 2 then
@@ -3676,12 +3703,13 @@ def lr_enum_construct(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span
   end
   let enum_tid = match b.type_name_to_id.get(enum_name)
   when Option::Some(tid) then TypeId { id: tid }
-  when Option::None then TypeId { id: 0 }
+  when Option::None then
+    return Result::Err("cannot lower enum variant: unknown enum type '" + enum_name + "'")
   end
-  MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) }
+  Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) })
 end
 
-def lr_enum_record_construct(b: &mut MirBuilder, path: &AstPath, fields: &Vec[(String, Expr)], span: Span) -> MirRvalue
+def lr_enum_record_construct(b: &mut MirBuilder, path: &AstPath, fields: &Vec[(String, Expr)], span: Span) -> Result[MirRvalue, String]
   mut ops = Vec::new()
   mut field_names = Vec::new()
   let enum_name = if path.segments.len() >= 2 then
@@ -3709,16 +3737,17 @@ def lr_enum_record_construct(b: &mut MirBuilder, path: &AstPath, fields: &Vec[(S
   end
   let enum_tid = match b.type_name_to_id.get(enum_name)
   when Option::Some(tid) then TypeId { id: tid }
-  when Option::None then TypeId { id: 0 }
+  when Option::None then
+    return Result::Err("cannot lower enum record: unknown enum type '" + enum_name + "'")
   end
-  MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) }
+  Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) })
 end
 
-def lr_enum_variant(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> MirRvalue
+def lr_enum_variant(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> Result[MirRvalue, String]
   if is_registered_enum_path(b, path) then
     return lr_enum_construct(b, path, args, span)
   end
-  lr_static_path_call(b, path, args, span)
+  Result::Ok(lr_static_path_call(b, path, args, span))
 end
 
 # Lower a method-call receiver expression to a Place, using string dispatch
@@ -3753,13 +3782,18 @@ def lower_receiver_place(b: &mut MirBuilder, receiver: &Expr, span: Span) -> Pla
     end
   else
     let recv_tmp = add_temp(b, mir_infer_expr_type(b, &receiver), span)
-    push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, &receiver, span), span)
+    match lower_expr_to_rvalue(b, &receiver, span)
+    when Result::Ok(rv) then
+      push_assign(b, place_local(recv_tmp), rv, span)
+    when Result::Err(e) then
+      b.errors.push(e)
+    end
     recv_place = place_local(recv_tmp)
   end
   recv_place
 end
 
-def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRvalue
+def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[MirRvalue, String]
   
   # Use string-based dispatch via expr_kind_name() to avoid Stage0 Swift
   # compiler bug with value matches on large (41-variant) enums like ExprKind.
@@ -3770,92 +3804,92 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
   
   if kind_name == "ExprIntLit" then
     match expr.kind
-    when ExprKind::ExprIntLit(n) then return move_rvalue(operand_int(n))
+    when ExprKind::ExprIntLit(n) then return Result::Ok(move_rvalue(operand_int(n)))
     when _ then ()
     end
     
   elsif kind_name == "ExprFloatLit" then
     match expr.kind
-    when ExprKind::ExprFloatLit(f) then return move_rvalue(operand_float(f))
+    when ExprKind::ExprFloatLit(f) then return Result::Ok(move_rvalue(operand_float(f)))
     when _ then ()
     end
     
   elsif kind_name == "ExprBoolLit" then
     match expr.kind
-    when ExprKind::ExprBoolLit(bool_lit) then return move_rvalue(operand_bool(bool_lit))
+    when ExprKind::ExprBoolLit(bool_lit) then return Result::Ok(move_rvalue(operand_bool(bool_lit)))
     when _ then ()
     end
     
   elsif kind_name == "ExprCharLit" then
     match expr.kind
-    when ExprKind::ExprCharLit(c) then return move_rvalue(operand_constant(constant_char(c)))
+    when ExprKind::ExprCharLit(c) then return Result::Ok(move_rvalue(operand_constant(constant_char(c))))
     when _ then ()
     end
     
   elsif kind_name == "ExprStringLit" then
     match expr.kind
-    when ExprKind::ExprStringLit(s) then return move_rvalue(operand_string(s))
+    when ExprKind::ExprStringLit(s) then return Result::Ok(move_rvalue(operand_string(s)))
     when _ then ()
     end
     
   elsif kind_name == "ExprNilLit" then
-    return move_rvalue(operand_unit())
+    return Result::Ok(move_rvalue(operand_unit()))
     
   elsif kind_name == "ExprIdent" then
     match expr.kind
-    when ExprKind::ExprIdent(name) then return lr_ident(b, name)
+    when ExprKind::ExprIdent(name) then return Result::Ok(lr_ident(b, name))
     when _ then ()
     end
     
   elsif kind_name == "ExprSelfRef" then
-    return lr_self_ref(b)
+    return Result::Ok(lr_self_ref(b))
     
   elsif kind_name == "ExprBinaryOp" then
     match expr.kind
-    when ExprKind::ExprBinaryOp(op, left, right) then return lr_binary(b, op, &left, &right, span)
+    when ExprKind::ExprBinaryOp(op, left, right) then return Result::Ok(lr_binary(b, op, &left, &right, span))
     when _ then ()
     end
     
   elsif kind_name == "ExprUnaryOp" then
     match expr.kind
-    when ExprKind::ExprUnaryOp(op, inner) then return lr_unary(b, op, &inner, span)
+    when ExprKind::ExprUnaryOp(op, inner) then return Result::Ok(lr_unary(b, op, &inner, span))
     when _ then ()
     end
     
   elsif kind_name == "ExprRef" then
     match expr.kind
-    when ExprKind::ExprRef(inner) then return lr_ref(b, &inner)
+    when ExprKind::ExprRef(inner) then return Result::Ok(lr_ref(b, &inner))
     when _ then ()
     end
     
   elsif kind_name == "ExprRefMut" then
     match expr.kind
-    when ExprKind::ExprRefMut(inner) then return lr_ref_mut(b, &inner)
+    when ExprKind::ExprRefMut(inner) then return Result::Ok(lr_ref_mut(b, &inner))
     when _ then ()
     end
     
   elsif kind_name == "ExprDeref" then
     match expr.kind
-    when ExprKind::ExprDeref(inner) then return lr_deref(b, &inner, span)
+    when ExprKind::ExprDeref(inner) then return Result::Ok(lr_deref(b, &inner, span))
     when _ then ()
     end
 
   elsif kind_name == "ExprArrayLit" then
     match expr.kind
-    when ExprKind::ExprArrayLit(elems) then return lr_array_lit(b, &elems, span)
+    when ExprKind::ExprArrayLit(elems) then return Result::Ok(lr_array_lit(b, &elems, span))
     when _ then ()
     end
 
   elsif kind_name == "ExprTupleLit" then
     match expr.kind
-    when ExprKind::ExprTupleLit(elems) then return lr_tuple_lit(b, &elems, span)
+    when ExprKind::ExprTupleLit(elems) then return Result::Ok(lr_tuple_lit(b, &elems, span))
     when _ then ()
     end
 
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee_expr, arg_exprs) then
-      return lr_call(b, &callee_expr, &arg_exprs, span)
+      return Result::Ok(lr_call(b, &callee_expr, &arg_exprs, span))
     when _ then ()
     end
 
@@ -4046,9 +4080,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       
       b.current_block = Option::Some(success_blk)
       
-      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirCopy(place_local(ret_tmp))
-      }) }
+      }) })
     when _ then ()
     end
 
@@ -4077,9 +4111,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
         local: base_place.local,
         projections: new_projections
       }
-      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirCopy(projected)
-      }) }
+      }) })
     when _ then ()
     end
 
@@ -4112,9 +4146,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
         local: base_place.local,
         projections: new_projections
       }
-      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirCopy(projected)
-      }) }
+      }) })
     when _ then ()
     end
 
@@ -4200,13 +4234,13 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       let closure_type_id = TypeId { id: b.temp_counter }
       b.temp_counter = b.temp_counter + 1
       
-      return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Closure(closure_type_id), agg_ops) }
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Closure(closure_type_id), agg_ops) })
     when _ then ()
     end
 
   elsif kind_name == "ExprIf" then
     match expr.kind
-    when ExprKind::ExprIf(if_expr) then return lower_if_rvalue(b, &if_expr, span)
+    when ExprKind::ExprIf(if_expr) then return Result::Ok(lower_if_rvalue(b, &if_expr, span))
     when _ then ()
     end
 
@@ -4214,24 +4248,24 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
     match expr.kind
     when ExprKind::ExprBlock(block) then
       if block.stmts.is_empty() then
-        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirUnit,
             ty: Type::Unit
           })
-        }) }
+        }) })
       end
       let last_idx = block.stmts.len() - 1
       mut i = 0
       while i < last_idx do
         lower_stmt(b, &block.stmts[i])
         if block_is_terminated(b) then
-          return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+          return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirUnit,
               ty: Type::Unit
             })
-          }) }
+          }) })
         end
         i = i + 1
       end
@@ -4256,9 +4290,10 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       let struct_name = path_to_string(&path)
       let struct_tid = match b.type_name_to_id.get(struct_name)
       when Option::Some(tid) then TypeId { id: tid }
-      when Option::None then TypeId { id: 0 }
+      when Option::None then
+        return Result::Err("cannot lower struct literal: unknown struct type '" + struct_name + "'")
       end
-      return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(struct_tid, field_names), ops) }
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(struct_tid, field_names), ops) })
     when _ then ()
     end
 
@@ -4275,7 +4310,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       let inner_op = lower_expr(b, &inner, span)
       let target = resolve_lowering_type(&target_ty)
       # Use Transmute as the generic cast kind - specific casts would require type inference
-      return MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) }
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) })
     when _ then ()
     end
 
@@ -4297,7 +4332,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
             # Mixed enum: heap-allocate with just the tag so representation is consistent
             let enum_tid = match b.type_name_to_id.get(enum_name)
             when Option::Some(tid) then TypeId { id: tid }
-            when Option::None then TypeId { id: 0 }
+            when Option::None then
+              return Result::Err("cannot lower enum variant: unknown enum type '" + enum_name + "'")
             end
             mut ops = Vec::new()
             mut fnames = Vec::new()
@@ -4308,31 +4344,31 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
                 ty: Type::Int
               })
             })
-            return MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) }
+            return Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) })
           else
             # Simple enum (all no-payload): just the integer discriminant
-            return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+            return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
               kind: MirOperandKind::MirConstant(MirConstant {
                 kind: MirConstantKind::MirInt(disc),
                 ty: Type::Int
               })
-            }) }
+            }) })
           end
         when Option::None then
-          return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+          return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirString(path_to_string(&path)),
               ty: Type::String
             })
-          }) }
+          }) })
         end
       else
-        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirString(path_to_string(&path)),
             ty: Type::String
           })
-        }) }
+        }) })
       end
     when _ then ()
     end
@@ -4343,9 +4379,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
       let result_ty = mir_infer_expr_type(b, expr)
       let result_tmp = add_temp(b, result_ty, span)
       lower_match_to_place(b, &m, place_local(result_tmp), span)
-      return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirCopy(place_local(result_tmp))
-      }) }
+      }) })
     when _ then ()
     end
 
@@ -4359,28 +4395,20 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> MirRval
         }
         return lower_vec_like_from_array_call(b, &vec_path, &args, span)
       else
-        return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-          kind: MirOperandKind::MirConstant(MirConstant {
-            kind: MirConstantKind::MirUnit,
-            ty: Type::Unit
-          })
-        }) }
+        return Result::Err("unhandled macro invocation in lowering: " + name)
       end
     when _ then ()
     end
 
   else
-    # Default fallback for unhandled variants
-    return MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirUnit,
-        ty: Type::Unit
-      })
-    }) }
+    # Default fallback for unhandled variants: fail instead of silently
+    # producing a Unit rvalue, so unsupported expression kinds surface as
+    # lowering errors rather than corrupting generated code.
+    return Result::Err("unhandled expression kind in lowering: " + kind_name)
   end
 end
 
-def lower_final_block_stmt_to_rvalue(b: &mut MirBuilder, stmt: &Stmt) -> MirRvalue
+def lower_final_block_stmt_to_rvalue(b: &mut MirBuilder, stmt: &Stmt) -> Result[MirRvalue, String]
   let last_kind = stmt_kind_name(&stmt.kind)
   if last_kind == "StmtExpr" then
     match stmt.kind
@@ -4391,12 +4419,12 @@ def lower_final_block_stmt_to_rvalue(b: &mut MirBuilder, stmt: &Stmt) -> MirRval
   end
 
   lower_stmt(b, stmt)
-  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+  Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirUnit,
       ty: Type::Unit
     })
-  }) }
+  }) })
 end
 
 def expr_is_place_like(expr: &Expr) -> Bool
@@ -4459,7 +4487,12 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     else
       let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
       let recv_tmp = add_temp(b, mir_infer_expr_type(b, recv), recv_tmp_span)
-      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, recv, recv_tmp_span), recv_tmp_span)
+      match lower_expr_to_rvalue(b, recv, recv_tmp_span)
+      when Result::Ok(rv) then
+        push_assign(b, place_local(recv_tmp), rv, recv_tmp_span)
+      when Result::Err(e) then
+        b.errors.push(e)
+      end
       place_local(recv_tmp)
     end
     # Auto-insert ProjDeref when base local is a reference and we haven't
@@ -4492,7 +4525,12 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     else
       let tmp_span = Span { file: "", start: 0, end_pos: 0 }
       let tmp = add_temp(b, mir_infer_expr_type(b, inner), tmp_span)
-      push_assign(b, place_local(tmp), lower_expr_to_rvalue(b, inner, tmp_span), tmp_span)
+      match lower_expr_to_rvalue(b, inner, tmp_span)
+      when Result::Ok(rv) then
+        push_assign(b, place_local(tmp), rv, tmp_span)
+      when Result::Err(e) then
+        b.errors.push(e)
+      end
       place_local(tmp)
     end
     return place_deref(base)
@@ -4507,7 +4545,12 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     else
       let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
       let recv_tmp = add_temp(b, mir_infer_expr_type(b, recv), recv_tmp_span)
-      push_assign(b, place_local(recv_tmp), lower_expr_to_rvalue(b, recv, recv_tmp_span), recv_tmp_span)
+      match lower_expr_to_rvalue(b, recv, recv_tmp_span)
+      when Result::Ok(rv) then
+        push_assign(b, place_local(recv_tmp), rv, recv_tmp_span)
+      when Result::Err(e) then
+        b.errors.push(e)
+      end
       place_local(recv_tmp)
     end
     # Evaluate the index expression and store in a temp
@@ -5352,9 +5395,13 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
     end
 
     # Lower the closure body
-    let body_rvalue = lower_expr_to_rvalue(b, &closure.body, closure_span)
-    let ret_place = place_local(LocalId { id: 0 })
-    push_stmt(b, MirStatementKind::MirAssign(ret_place, body_rvalue), closure_span)
+    match lower_expr_to_rvalue(b, &closure.body, closure_span)
+    when Result::Ok(body_rvalue) then
+      let ret_place = place_local(LocalId { id: 0 })
+      push_stmt(b, MirStatementKind::MirAssign(ret_place, body_rvalue), closure_span)
+    when Result::Err(e) then
+      b.errors.push(e)
+    end
     set_terminator(b, MirTerminatorKind::MirReturn, closure_span)
 
     # Finish and add to program
@@ -5399,8 +5446,12 @@ def lower_expr_assign_to(b: &mut MirBuilder, expr: &Expr, dest: Place, span: Spa
     lower_match_to_place(b, &m, dest, span)
   when _ then
     # Non-if: lower to rvalue and assign in one step
-    let rvalue = lower_expr_to_rvalue(b, expr, span)
-    push_assign(b, dest, rvalue, span)
+    match lower_expr_to_rvalue(b, expr, span)
+    when Result::Ok(rvalue) then
+      push_assign(b, dest, rvalue, span)
+    when Result::Err(e) then
+      b.errors.push(e)
+    end
   end
 end
 
@@ -5511,18 +5562,18 @@ def lower_if_to_place(b: &mut MirBuilder, if_expr: &IfStmt, dest: Place, span: S
 end
 
 # Helper: lower a statement and return its value as MirRvalue
-def lower_stmt_rvalue(b: &mut MirBuilder, stmt: &Stmt, span: Span) -> MirRvalue
+def lower_stmt_rvalue(b: &mut MirBuilder, stmt: &Stmt, span: Span) -> Result[MirRvalue, String]
   match stmt.kind
   when StmtKind::StmtExpr(expr) then
     lower_expr_to_rvalue(b, &expr, span)
   when _ then
     lower_stmt(b, stmt)
-    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirUnit,
         ty: Type::Unit
       })
-    }) }
+    }) })
   end
 end
 
@@ -10433,10 +10484,14 @@ end
 # Public API
 # ———————————————————————————————————————————————————————————————
 
-def lower_to_mir(program: &Program) -> MirProgram
-  mut mir = lower_program(program)
-  transform_async_functions(&mut mir)
-  mir
+def lower_to_mir(program: &Program) -> Result[MirProgram, String]
+  match lower_program(program)
+  when Result::Ok(mut mir) then
+    transform_async_functions(&mut mir)
+    Result::Ok(mir)
+  when Result::Err(e) then
+    Result::Err(e)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
