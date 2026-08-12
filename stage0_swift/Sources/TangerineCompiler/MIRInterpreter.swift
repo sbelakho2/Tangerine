@@ -3641,17 +3641,30 @@ public final class MIRInterpreter {
             let fd = args.first?.asInt ?? -1
             let count = args.count > 2 ? max(0, args[2].asInt ?? 0) : Int.max
             let bytes = byteSlice(from: args.count > 1 ? args[1] : .unit, limit: count)
+            if bytes.isEmpty { return .int(0) }
             let data = Data(bytes)
-            if fd == 1 {
-                FileHandle.standardOutput.write(data)
-            } else if fd == 2 {
-                FileHandle.standardError.write(data)
+            var written = 0
+            if fd == 1 || fd == 2 {
+                // Foundation's FileHandle.write is all-or-nothing (throws on failure).
+                let handle: FileHandle = fd == 1 ? .standardOutput : .standardError
+                try? handle.write(contentsOf: data)
+                written = data.count
             } else {
-                _ = data.withUnsafeBytes { buf in
-                    write(Int32(fd), buf.baseAddress, data.count)
+                // write-all loop: a single write(2) may do a partial write.
+                let fds = Int32(fd)
+                let n = data.count
+                var offset = 0
+                while offset < n {
+                    let result = data.withUnsafeBytes { buf -> Int in
+                        let rc = write(fds, buf.baseAddress!.advanced(by: offset), n - offset)
+                        return Int(rc)
+                    }
+                    if result <= 0 { break }
+                    offset += result
                 }
+                written = offset
             }
-            return .int(bytes.count)
+            return .int(written)
         case "_tg_normalize_string":
             return args.first ?? .int(0)
         case "clock_gettime_nsec":
