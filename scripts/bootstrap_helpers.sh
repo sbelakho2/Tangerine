@@ -384,8 +384,13 @@ run_canary_files() {
     fi
     chmod +x "$bin"
     local rc
-    "$bin" >/dev/null 2>&1
-    rc=$?
+    # set -e must not abort before diagnostics: capture the exit code via an
+    # if/else so a nonzero canary is classified and reported, not fatal.
+    if "$bin" >/dev/null 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then
       bh_err "native canary $name exited nonzero ($rc)"
       failures=$((failures + 1))
