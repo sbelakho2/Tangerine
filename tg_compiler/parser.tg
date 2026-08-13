@@ -512,6 +512,24 @@ def at_function_decl_start(p: &TgcParser) -> Bool
   end
 end
 
+# True when the current token closes a block/statement list, so a trailing
+# attribute statement must stop rather than recurse into expression parsing.
+def at_block_terminator(p: &TgcParser) -> Bool
+  match peek(p)
+  when TokenKind::End then true
+  when TokenKind::Else then true
+  when TokenKind::Elsif then true
+  when TokenKind::When then true
+  when TokenKind::Catch then true
+  when TokenKind::Finally then true
+  when TokenKind::With then true
+  when TokenKind::Comma then true
+  when TokenKind::RBrace then true
+  when TokenKind::Eof then true
+  when _ then false
+  end
+end
+
 def parse_prefixed_function_decl(p: &mut TgcParser, vis: Visibility, start: Span) -> Option[FunctionDecl]
   mut is_async = false
   mut is_unsafe = false
@@ -987,6 +1005,9 @@ def expect_ident(p: &mut TgcParser) -> Option[String]
   when TokenKind::Edition then
     advance(p)
     return Option::Some("edition")
+  when TokenKind::Handle then
+    advance(p)
+    return Option::Some("handle")
   when _ then
     let span = peek_span(p)
     diag_error(&mut p.diag, ErrorCode::E103ExpectedIdent, "expected identifier", span)
@@ -1887,12 +1908,33 @@ def parse_impl_decl(p: &mut TgcParser, vis: Visibility, start: Span) -> Option[I
   end
   match expect_ident(p)
   when Option::Some(first_name) then
-    let type_generics = parse_generic_params(p)
-    mut generic_params = type_generics
+    # Parse the trait's / type's generic ARGUMENTS (arbitrary type expressions,
+    # e.g. Iterator[(A, B)], which may contain tuples and nested generics).
+    mut trait_type_args: Vec[TypeExpr] = Vec::new()
+    if at(p, TokenKind::LBracket) then
+      advance(p)
+      if !at(p, TokenKind::RBracket) then
+        trait_type_args = parse_type_arg_list(p)
+      end
+      expect(p, TokenKind::RBracket)
+    end
+
+    # The impl's own generic parameters come from the leading `impl[A, B]` when
+    # present; otherwise they are derived from the trait's simple type args
+    # (the `impl Iterator[T] for Type` form).
+    mut generic_params = Vec::new()
     if leading_generics.len() > 0 then
       generic_params = leading_generics
+    else
+      for ta in trait_type_args do
+        match ta.kind
+        when TypeExprKind::Named(gname, _) then
+          generic_params.push(GenericParam { name: gname, bounds: Vec::new() })
+        when _ then ()
+        end
+      end
     end
-    
+
     # Check if this is `impl Trait for Type` or `impl Type` (inherent)
     if at(p, TokenKind::For) then
       # Trait impl: impl TraitName[T] for Type
@@ -1911,8 +1953,12 @@ def parse_impl_decl(p: &mut TgcParser, vis: Visibility, start: Span) -> Option[I
     else
       # Inherent impl: impl Type
       mut type_args = Vec::new()
-      for g in generic_params do
-        type_args.push(make_type_expr(TypeExprKind::Named(g.name.clone(), Vec::new()), start))
+      if generic_params.len() > 0 then
+        for g in generic_params do
+          type_args.push(make_type_expr(TypeExprKind::Named(g.name.clone(), Vec::new()), start))
+        end
+      else
+        type_args = trait_type_args
       end
       let for_type = make_type_expr(TypeExprKind::Named(first_name, type_args), start)
       # Parse optional where clause for inherent impl
@@ -2614,6 +2660,16 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
     advance(p)
     if at(p, TokenKind::RParen) then
       advance(p)
+      # `() -> Ret` is a zero-argument function type.
+      if at(p, TokenKind::Arrow) then
+        advance(p)
+        match parse_type(p)
+        when Option::Some(ret) then
+          let no_params: Vec[TypeExpr] = Vec::new()
+          return Option::Some(make_type_expr(TypeExprKind::Fn(no_params, ret), span_merge(start, ret.span)))
+        when Option::None then return Option::None
+        end
+      end
       return Option::Some(make_type_expr(TypeExprKind::Unit, span_merge(start, peek_span(p))))
     else
       mut types = Vec::new()
@@ -2629,6 +2685,15 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
         end
       end
       expect(p, TokenKind::RParen)
+      # `(A, B) -> Ret` is a function type whose params are A and B.
+      if at(p, TokenKind::Arrow) then
+        advance(p)
+        match parse_type(p)
+        when Option::Some(ret) then
+          return Option::Some(make_type_expr(TypeExprKind::Fn(types, ret), span_merge(start, ret.span)))
+        when Option::None then return Option::None
+        end
+      end
       if types.len() == 1 then
         return Option::Some(types[0])
       else
@@ -2657,6 +2722,14 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
     match parse_type(p)
     when Option::Some(inner) then
       return Option::Some(make_type_expr(TypeExprKind::Async(inner), span_merge(start, inner.span)))
+    when Option::None then return Option::None
+    end
+  when TokenKind::Impl then
+    # Argument-position `impl Trait` type: desugars to the trait itself.
+    advance(p)
+    match parse_type(p)
+    when Option::Some(trait_ty) then
+      return Option::Some(trait_ty)
     when Option::None then return Option::None
     end
   when TokenKind::SelfType then
@@ -3097,6 +3170,11 @@ def parse_stmt(p: &mut TgcParser) -> Option[Stmt]
         return Option::Some(make_stmt(StmtKind::StmtExpr(noop), span_merge(start, peek_span(p))))
       when Option::None then return Option::None
       end
+    elsif at_block_terminator(p) then
+      # A bare attribute statement (e.g. `@intrinsic(...)` alone in a body) is
+      # not followed by a statement — stop before the block terminator.
+      let noop = make_expr(ExprKind::ExprNilLit, span_merge(start, peek_span(p)))
+      return Option::Some(make_stmt(StmtKind::StmtExpr(noop), span_merge(start, peek_span(p))))
     else
       return parse_stmt(p)
     end
@@ -3797,6 +3875,9 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
       return Option::Some(make_pattern(PatternKind::Ref(inner), span_merge(start, peek_span(p))))
     when Option::None then return Option::None
     end
+  when TokenKind::Handle then
+    advance(p)
+    return Option::Some(make_pattern(PatternKind::Ident("handle".to_string(), false), start))
   when TokenKind::Ident(name) then
     if name == "_" then
       advance(p)
@@ -3826,20 +3907,20 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
       # Check for struct pattern: Name { field: pat, ... }
       elsif at(p, TokenKind::LBrace) then
         advance(p)
-        mut fields = Map::new()
+        mut fields: Vec[(String, Pattern)] = Vec::new()
         if !at(p, TokenKind::RBrace) then
           match expect_ident(p)
           when Option::Some(fname) then
             if at(p, TokenKind::Colon) then
               advance(p)
               match parse_pattern(p)
-              when Option::Some(fpat) then fields.insert(fname, fpat)
+              when Option::Some(fpat) then fields.push((fname, fpat))
               when Option::None then ()
               end
             else
               # Shorthand: just the field name as ident pattern
               let fpat = make_pattern(PatternKind::Ident(fname.clone(), false), peek_span(p))
-              fields.insert(fname, fpat)
+              fields.push((fname, fpat))
             end
           when Option::None then ()
           end
@@ -3851,12 +3932,12 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
               if at(p, TokenKind::Colon) then
                 advance(p)
                 match parse_pattern(p)
-                when Option::Some(fpat) then fields.insert(fname, fpat)
+                when Option::Some(fpat) then fields.push((fname, fpat))
                 when Option::None then break
                 end
               else
                 let fpat = make_pattern(PatternKind::Ident(fname.clone(), false), peek_span(p))
-                fields.insert(fname, fpat)
+                fields.push((fname, fpat))
               end
             when Option::None then break
             end
@@ -4416,6 +4497,14 @@ def parse_factor(p: &mut TgcParser) -> Option[Expr]
     while true do
       let saved = p.pos
       skip_newlines(p)
+      let crossed_newline = p.pos != saved
+      # A `*` at the start of a new line is a dereference expression starting a
+      # new statement, NOT a multiplication continuation. Only treat `*` as a
+      # binary multiply when it appears on the same line as the left operand.
+      if crossed_newline && at(p, TokenKind::Star) then
+        set_pos(p, saved)
+        break
+      end
       if at(p, TokenKind::Star) then
         let op = BinOp::Mul
         let start = result.span
@@ -4531,6 +4620,16 @@ def parse_unary(p: &mut TgcParser) -> Option[Expr]
     match parse_unary(p)
     when Option::Some(expr) then
       return Option::Some(make_expr(ExprKind::ExprDeref(Box::new(expr)), span_merge(start, expr.span)))
+    when Option::None then return Option::None
+    end
+  when TokenKind::DoubleStar then
+    # Double dereference (**expr). `**` at prefix position cannot be
+    # exponentiation (no left operand), so it always means deref-of-deref.
+    advance(p)
+    match parse_unary(p)
+    when Option::Some(inner) then
+      let d1 = make_expr(ExprKind::ExprDeref(Box::new(inner)), span_merge(start, inner.span))
+      return Option::Some(make_expr(ExprKind::ExprDeref(Box::new(d1)), span_merge(start, inner.span)))
     when Option::None then return Option::None
     end
   when _ then
@@ -4935,6 +5034,9 @@ def parse_primary(p: &mut TgcParser) -> Option[Expr]
   when TokenKind::Next then
     advance(p)
     return Option::Some(make_expr(ExprKind::ExprIdent("next"), start))
+  when TokenKind::Handle then
+    advance(p)
+    return Option::Some(make_expr(ExprKind::ExprIdent("handle"), start))
   when TokenKind::Ident(name) then
     advance(p)
     let _ident_start_pos = span_start(&start)
@@ -5055,6 +5157,32 @@ def parse_primary(p: &mut TgcParser) -> Option[Expr]
         let rb_pos = p.pos
         advance(p) # consume `]`
         skip_newlines(p)
+        if at(p, TokenKind::ColonColon) then
+          # Generic-typed associated call: `Vec[u8]::new(...)`.
+          advance(p)
+          mut segs = Vec::new()
+          segs.push(name)
+          while at(p, TokenKind::ColonColon) do
+            advance(p)
+            match expect_ident(p)
+            when Option::Some(seg) then segs.push(seg)
+            when Option::None then break
+            end
+          end
+          match expect_ident(p)
+          when Option::Some(method) then segs.push(method)
+          when Option::None then ()
+          end
+          let gpath = make_path(segs, span_merge(start, peek_span(p)))
+          if at(p, TokenKind::LParen) then
+            advance(p)
+            let gargs = parse_arg_list(p)
+            expect(p, TokenKind::RParen)
+            return Option::Some(make_expr(ExprKind::ExprEnumVariant(gpath, gargs), span_merge(start, peek_span(p))))
+          else
+            return Option::Some(make_expr(ExprKind::ExprPath(gpath), span_merge(start, peek_span(p))))
+          end
+        end
         if at(p, TokenKind::LBrace) then
           # Confirm it looks like struct literal: `{` then `}` (empty) or `Ident :`
           let lb_peek_pos = p.pos
