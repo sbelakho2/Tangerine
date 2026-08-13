@@ -90,9 +90,11 @@ struct CompilerOptions
   
   # Special modes
   check_only: Bool
+  stop_after: StopAfter
   emit_mir: Bool
   print_ast: Bool
   print_tokens: Bool
+  dump_phase: Option[String]
   
   # Output format
   json_diagnostics: Bool
@@ -117,6 +119,41 @@ enum EmitMode
   MIR
 end
 
+# Explicit compilation stopping phase. Commands map onto a single phase:
+#   tg parse   -> Parse
+#   tg check   -> Mir
+#   tg compile -> Link
+# Each phase includes everything before it (lex, parse, dependency resolution,
+# macro expansion, name/type checking, borrow checking, MIR lowering,
+# MIR verification), so `tg check` is a real semantic gate and never a
+# parse-only shortcut.
+enum StopAfter
+  Parse
+  Semantic
+  Mir
+  Object
+  Link
+end
+
+# Failures while collecting imported dependencies. Each distinguishes the
+# stage that failed so a partially parsed dependency is never silently merged
+# into a compiler program.
+enum DependencyError
+  Read
+  Lex
+  Parse
+  Recursive
+end
+
+def dep_error_message(e: DependencyError, path: String) -> String
+  match e
+  when DependencyError::Read      then "failed to read dependency: " + path
+  when DependencyError::Lex       then "failed to lex dependency: " + path
+  when DependencyError::Parse     then "failed to parse dependency: " + path
+  when DependencyError::Recursive then "failed to collect transitive dependency of: " + path
+  end
+end
+
 def default_options() -> CompilerOptions
   CompilerOptions {
     input_files: Vec::new(),
@@ -134,9 +171,11 @@ def default_options() -> CompilerOptions
     verbose: false,
     quiet: false,
     check_only: false,
+    stop_after: StopAfter::Link,
     emit_mir: false,
     print_ast: false,
     print_tokens: false,
+    dump_phase: Option::None,
     json_diagnostics: false,
     color: true,
     target_triple: Option::None,
@@ -147,20 +186,15 @@ def default_options() -> CompilerOptions
   }
 end
 
-def is_bootstrap_stage_output(path: String) -> Bool
-  path.contains("/tg_stage") || path.starts_with("tg_stage")
-end
-
 def is_compiler_driver_path(path: String) -> Bool
   path == "tg_compiler/driver.tg" || path.ends_with("/tg_compiler/driver.tg")
 end
 
 def should_skip_bootstrap_semantic_checks(opts: &CompilerOptions, path: String) -> Bool
-  # Semantic checks are never skipped for source files. The only files exempt
-  # are generated bootstrap stage outputs (tg_stage...) which stage0 has already
-  # type-checked as part of the bootstrap pipeline. driver.tg itself is always
-  # checked so the compiler cannot silently ship type errors.
-  is_bootstrap_stage_output(path)
+  # Semantic checks are never skipped. Stage outputs are executables, not
+  # source programs; their filename must never alter frontend correctness.
+  # `-o tg_stage2` must behave identically to `-o foo` for identical inputs.
+  false
 end
 
 def bootstrap_codegen_target() -> AsmTarget
@@ -752,6 +786,11 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
       println("  " + token_debug(tok))
     end
   end
+  match opts.dump_phase
+  when Option::Some("tokens") then
+    return Result::Ok("")
+  when _ then ()
+  end
   
   # Phase 2: Parsing
   if opts.verbose then
@@ -773,7 +812,15 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     print_ast(&ast)
   end
   
-  if opts.check_only then
+  match opts.dump_phase
+  when Option::Some("ast") then
+    println("AST:")
+    print_ast(&ast)
+    return Result::Ok("")
+  when _ then ()
+  end
+  
+  if opts.stop_after == StopAfter::Parse then
     return Result::Ok("")
   end
   
@@ -790,7 +837,11 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
   if opts.verbose then
     println("[diag] before merge_imported_deps")
   end
-  let ast = merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  let ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    return Result::Err(e)
+  end
   if opts.verbose then
     println("[diag] after merge_imported_deps")
   end
@@ -803,6 +854,14 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     println("  Expanding macros...")
   end
   let ast = expand_macros(ast)
+
+  match opts.dump_phase
+  when Option::Some("resolved-ast") then
+    println("Resolved AST:")
+    print_ast(&ast)
+    return Result::Ok("")
+  when _ then ()
+  end
 
   if opts.verbose then
   end
@@ -857,6 +916,10 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     end
   end
   
+  if opts.stop_after == StopAfter::Semantic then
+    return Result::Ok("")
+  end
+  
   # Phase 5: MIR lowering
   if opts.verbose then
     println("  Lowering to MIR...")
@@ -883,6 +946,20 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     return Result::Err("MIR verification failed after lowering")
   end
 
+  # `tg check` stops here: the program has been lexed, parsed, dependencies
+  # resolved, macros expanded, type-checked, borrow-checked, lowered to MIR and
+  # verified — without generating native code.
+  match opts.dump_phase
+  when Option::Some("mir-lowered") then
+    print_mir(&mir)
+    return Result::Ok("")
+  when _ then ()
+  end
+
+  if opts.stop_after == StopAfter::Mir then
+    return Result::Ok("")
+  end
+
   # Phase 5.5: Monomorphization  specialize generic functions for concrete types
   if opts.verbose then
     println("  Monomorphizing generics...")
@@ -900,6 +977,13 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
       eprintln("MIR verifier (post-mono): " + e)
     end
     return Result::Err("MIR verification failed after monomorphization")
+  end
+
+  match opts.dump_phase
+  when Option::Some("mir-mono") then
+    print_mir(&mir)
+    return Result::Ok("")
+  when _ then ()
   end
 
   # Phase 5.6: MIR Optimization (gated by opt_level)
@@ -946,6 +1030,13 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
     print_mir(&mir)
     return Result::Ok("")
   end
+
+  match opts.dump_phase
+  when Option::Some("mir-opt") then
+    print_mir(&mir)
+    return Result::Ok("")
+  when _ then ()
+  end
   
   # Phase 6: Native code generation
   if opts.verbose then
@@ -975,6 +1066,9 @@ def compile_file_core(opts: &CompilerOptions, path: String) -> Result[String, St
       end
     when Result::Err(e) then
       return Result::Err("Failed to write object file: " + e)
+    end
+    if opts.stop_after == StopAfter::Object then
+      return Result::Ok("")
     end
   when EmitMode::Executable then
     let exe_path = get_output_path(opts, path.clone(), "")
@@ -1078,7 +1172,12 @@ def compile_startup_entry(opts: &CompilerOptions, path: String, output_path: Str
     let import_paths = extract_import_paths(&ast_with_prelude)
   end
 
-  let ast = merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  let ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    println(e)
+    return 1
+  end
 
   if opts.verbose then
     println("  Expanding macros...")
@@ -1264,7 +1363,7 @@ end
 # code compilation, this should be false to avoid polluting the type namespace
 # with compiler internals. The full lib.tg is only for users embedding the
 # complete compiler.
-def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Program
+def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Result[Program, String]
   mut loaded = Set::new()
   mut merged_items = Vec::new()
   # Program items first  ensures the main program's definitions
@@ -1274,17 +1373,29 @@ def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) ->
   end
   let preludes = prelude_files()
   for prelude in preludes do
-    collect_dep_file(prelude, &mut merged_items, &mut loaded)
+    match collect_dep_file(prelude, &mut merged_items, &mut loaded)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err(dep_error_message(e, prelude))
+    end
   end
   if include_compiler_lib then
     # Bootstrap loads the KERNEL library (lib_kernel.tg), which re-exports only
     # the minimal self-hostable module set. The full lib.tg is reserved for
     # user embedding and pulls in non-bootstrap tooling modules. This keeps the
     # bootstrap compiler closure small (bootstrap/compiler_kernel.manifest).
-    collect_dep_file("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded)
+    match collect_dep_file("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err(dep_error_message(e, "tg_compiler/lib_kernel.tg"))
+    end
   end
-  collect_dep_items(&program, &mut merged_items, &mut loaded)
-  Program { items: merged_items, span: program.span }
+  match collect_dep_items(&program, &mut merged_items, &mut loaded)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err(dep_error_message(e, "<program>"))
+  end
+  Result::Ok(Program { items: merged_items, span: program.span })
 end
 
 def build_dep_file_path(segments: &Vec[String], count: Int) -> Option[String]
@@ -1350,44 +1461,58 @@ def dep_use_to_file(u: &UseDecl) -> Option[String]
   end
 end
 
-def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String]) -> Unit
+def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String]) -> Result[Unit, DependencyError]
   for item in program.items do
     match item.kind
     when ItemKind::ItemUse(u) then
       match dep_use_to_file(&u)
       when Option::Some(path) then
-        collect_dep_file(path, out, loaded)
+        match collect_dep_file(path, out, loaded)
+        when Result::Ok(_) then ()
+        when Result::Err(e) then
+          return Result::Err(e)
+        end
       when Option::None then ()
       end
     when _ then ()
     end
   end
+  Result::Ok(())
 end
 
-def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String]) -> Unit
+def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String]) -> Result[Unit, DependencyError]
   if loaded.contains(&path) then
-    return
+    return Result::Ok(())
   end
   loaded.insert(path.clone())
 
-  let source = read_file_text_direct(path)
-  if source.len() == 0 then
-    return
+  # Distinguish a legitimate empty module from a failed read. An empty string
+  # from a non-existent/unreadable file is an error, not an empty module.
+  if !file_exists(path.clone()) then
+    return Result::Err(DependencyError::Read)
   end
+  let source = read_file_text_direct(path)
 
   let tokens = tokenize(source)
   let dep_parse = parse(tokens)
+  let dep_parse_diags = dep_parse.diagnostics
+  if diag_has_errors(&dep_parse_diags) then
+    # Never merge a partially valid dependency into a compiler program.
+    return Result::Err(DependencyError::Parse)
+  end
 
-  # Include items even if parse errors exist — most items are still valid,
-  # and skipping them entirely causes far more cascading type errors
-  # than the few parse errors themselves.
   let dep_ast = dep_parse.program
   # Recurse into this dependency's own imports
-  collect_dep_items(&dep_ast, out, loaded)
+  match collect_dep_items(&dep_ast, out, loaded)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err(e)
+  end
   # Add all items from this dependency
   for item in dep_ast.items do
     out.push(item)
   end
+  Result::Ok(())
 end
 
 def get_output_path(opts: &CompilerOptions, input: String, ext: String) -> String
@@ -2366,6 +2491,22 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       opts.print_ast = true
     elsif arg == "--print-tokens" then
       opts.print_tokens = true
+    elsif arg == "--dump-tokens" then
+      opts.print_tokens = true
+      opts.dump_phase = Option::Some("tokens")
+    elsif arg == "--dump-ast" then
+      opts.dump_phase = Option::Some("ast")
+    elsif arg == "--dump-resolved-ast" then
+      opts.dump_phase = Option::Some("resolved-ast")
+    elsif arg == "--dump-mir-lowered" then
+      opts.dump_phase = Option::Some("mir-lowered")
+      opts.emit_mir = true
+    elsif arg == "--dump-mir-mono" then
+      opts.dump_phase = Option::Some("mir-mono")
+      opts.emit_mir = true
+    elsif arg == "--dump-mir-opt" then
+      opts.dump_phase = Option::Some("mir-opt")
+      opts.emit_mir = true
     elsif arg == "-O0" then
       opts.opt_level = 0
     elsif arg == "-O1" then
@@ -2488,6 +2629,22 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       opts.print_ast = true
     elsif arg == "--print-tokens" then
       opts.print_tokens = true
+    elsif arg == "--dump-tokens" then
+      opts.print_tokens = true
+      opts.dump_phase = Option::Some("tokens")
+    elsif arg == "--dump-ast" then
+      opts.dump_phase = Option::Some("ast")
+    elsif arg == "--dump-resolved-ast" then
+      opts.dump_phase = Option::Some("resolved-ast")
+    elsif arg == "--dump-mir-lowered" then
+      opts.dump_phase = Option::Some("mir-lowered")
+      opts.emit_mir = true
+    elsif arg == "--dump-mir-mono" then
+      opts.dump_phase = Option::Some("mir-mono")
+      opts.emit_mir = true
+    elsif arg == "--dump-mir-opt" then
+      opts.dump_phase = Option::Some("mir-opt")
+      opts.emit_mir = true
     elsif arg == "--check" then
       opts.check_only = true
     elsif arg == "-v" || arg == "--verbose" then
@@ -2843,6 +3000,7 @@ def cmd_parse(argv: Vec[String]) -> Int
   when Result::Ok(o) then
     mut o2 = o
     o2.check_only = true
+    o2.stop_after = StopAfter::Parse
     o2
   when Result::Err(e) then
     if e == "help" || e == "No input files" then
@@ -3046,6 +3204,7 @@ def cmd_check(argv: Vec[String]) -> Int
   when Result::Ok(o) then
     mut o2 = o
     o2.check_only = true
+    o2.stop_after = StopAfter::Mir
     o2
   when Result::Err(e) then
     if e == "help" then
@@ -3057,6 +3216,7 @@ def cmd_check(argv: Vec[String]) -> Int
       when Result::Ok(project) then
         mut o = default_options()
         o.check_only = true
+        o.stop_after = StopAfter::Mir
         o.input_files = project.sources.clone()
         o
       when Result::Err(_) then
@@ -3573,7 +3733,9 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
   end
 
   let is_bootstrap_driver = files.len() == 1 && is_compiler_driver_path(files[0].clone())
-  let skip_bootstrap_semantic_checks = is_bootstrap_driver && is_bootstrap_stage_output(output_path.clone())
+  # Stage outputs are executables, not source programs. Their filename never
+  # alters frontend correctness, so semantic checks are never skipped here.
+  let skip_bootstrap_semantic_checks = false
   mut all_items: Vec[Item] = Vec::new()
 
   if opts.verbose then
@@ -3637,7 +3799,12 @@ def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], output_pa
   if opts.verbose then
     println("  Merging imported dependencies...")
   end
-  let ast = merge_imported_deps(merged_ast, include_compiler_lib: is_bootstrap_driver)
+  let ast = match merge_imported_deps(merged_ast, include_compiler_lib: is_bootstrap_driver)
+  when Result::Ok(a) then a
+  when Result::Err(e) then
+    println(e)
+    return 1
+  end
 
   if opts.verbose then
     println("  Expanding macros...")
@@ -3884,9 +4051,13 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     let _ = delete_file(output_path.clone())
   end
 
-  let _ = compile_file_core(&opts, file.clone())
-
-  0
+  match compile_file_core(&opts, file.clone())
+  when Result::Ok(_) then
+    0
+  when Result::Err(e) then
+    eprintln(e)
+    1
+  end
 end
 
 def cmd_compile_raw(skip_subcommand: Bool) -> Int
@@ -3918,20 +4089,20 @@ end
 # 
 
 def prelude_files() -> Vec[String]
+  # The bootstrap stdlib set is defined ONLY by bootstrap/compiler_kernel.manifest.
+  # This list must mirror that manifest exactly and must never independently
+  # describe bootstrap semantics. Modules the driver imports explicitly (env,
+  # contracts, capabilities, effects, budget, test) are pulled in by
+  # collect_dep_items on demand; they are not part of the always-loaded prelude.
   mut files = Vec::new()
-  files.push("std/core.tg")
+  files.push("std/alloc.tg")
   files.push("std/collections.tg")
-  files.push("std/fmt.tg")
-  files.push("std/io.tg")
-  files.push("std/fs.tg")
-  files.push("std/env.tg")
-  files.push("std/contracts.tg")
-  files.push("std/capabilities.tg")
-  files.push("std/effects.tg")
-  files.push("std/budget.tg")
-  files.push("std/test.tg")
-  files.push("std/taint.tg")
+  files.push("std/core.tg")
   files.push("std/ffi.tg")
+  files.push("std/fmt.tg")
+  files.push("std/fs.tg")
+  files.push("std/io.tg")
+  files.push("std/taint.tg")
   files
 end
 

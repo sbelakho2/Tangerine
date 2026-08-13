@@ -1,8 +1,14 @@
 # Tangerine CI/CD Pipeline
 #
-# This workflow builds, tests, lints, and checks the Tangerine compiler
-# on every push and pull request. It also runs benchmarks on the main branch
-# to track performance regressions.
+# Radical simplification per the bootstrap audit:
+#   macOS/AArch64 bootstrap fixed point
+#         -> stage3 artifact
+#         -> bootstrap tests / conformance / stdlib / tooling
+#
+# Everything that needs `tg` downloads the validated stage3 artifact from the
+# `bootstrap` job. There is no pretend Linux/x86_64 self-host matrix: Tangerine
+# does not yet supply a Linux bootstrap artifact, and the empty `build/tg`
+# placeholder fallback has been removed.
 
 name: CI
 
@@ -19,6 +25,7 @@ jobs:
   # ———————————————————————————————————————
   # From-source bootstrap fixed-point
   # Proves: stage0 (Swift) -> stage1 -> stage2 -> stage3, stage2 == stage3.
+  # Produces the validated stage3 artifact consumed by every other job.
   # ———————————————————————————————————————
   bootstrap:
     name: Bootstrap fixed point (macos aarch64)
@@ -65,144 +72,31 @@ jobs:
             build/tg_stage3
 
   # ———————————————————————————————————————
-  # Build & Test
+  # Reusable step: materialize the validated stage3 artifact as build/tg.
+  # All tg-consuming jobs `needs: bootstrap` and run on macos-14 (the only
+  # host that can execute the macOS/aarch64 stage3 binary).
   # ———————————————————————————————————————
-  build:
-    name: Build (${{ matrix.os }}, ${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            arch: x86_64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: linux
-            arch: aarch64
-            runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: macos
-            arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-          - os: macos
-            arch: aarch64
-            runner: macos-14
-            target: aarch64-apple-darwin
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cross toolchain (Linux aarch64)
-        if: matrix.os == 'linux' && matrix.arch == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-
-      - name: Bootstrap compiler
-        run: |
-          # The Tangerine compiler self-hosts via run_bootstrap.sh on macOS aarch64.
-          # On other targets we currently fall back to any pre-built tg on PATH.
-          if [ "${{ matrix.os }}" = "macos" ] && [ "${{ matrix.arch }}" = "aarch64" ]; then
-            bash ./run_bootstrap.sh
-            mkdir -p build
-            cp build/tg_stage1 build/tg
-            chmod +x build/tg
-          elif [ -x ./target/tg ]; then
-            mkdir -p build
-            cp ./target/tg ./build/tg
-            chmod +x ./build/tg
-          elif command -v tg >/dev/null 2>&1; then
-            mkdir -p build
-            cp "$(command -v tg)" ./build/tg
-            chmod +x ./build/tg
-          else
-            echo "No bootstrap compiler available for ${{ matrix.target }} yet; skipping."
-            mkdir -p build
-            # Produce an empty placeholder so subsequent artifact upload does not fail.
-            : > build/tg
-            chmod +x build/tg
-          fi
-
-      - name: Build compiler (stage 1)
-        run: |
-          ./build/tg build --target ${{ matrix.target }}
-
-      - name: Build compiler (stage 2 — self-host verification)
-        run: |
-          # Stage 2: compile the compiler with itself
-          mv build/tg build/tg-stage1
-          ./build/tg-stage1 build --target ${{ matrix.target }}
-          # Verify stage 1 and stage 2 produce identical output
-          hash_cmd() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$1" | cut -d' ' -f1
-            else
-              shasum -a 256 "$1" | cut -d' ' -f1
-            fi
-          }
-          diff <(hash_cmd build/tg-stage1) <(hash_cmd build/tg) \
-            && echo "✓ Reproducible build verified" \
-            || echo "⚠ Stage 1 and Stage 2 differ (expected during development)"
-
-      - name: Run tests
-        run: |
-          ./build/tg test --verbose
-
-      - name: Run golden tests
-        run: |
-          ./build/tg test golden/ --verbose
-
-      - name: Type checking
-        run: |
-          ./build/tg check tg_compiler/*.tg std/*.tg
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tg-${{ matrix.target }}
-          path: build/tg
-
-  # ———————————————————————————————————————
-  # SAST (CodeQL)
-  # ———————————————————————————————————————
-  sast:
-    name: SAST (CodeQL)
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: actions
-
-      - name: Analyze
-        uses: github/codeql-action/analyze@v3
 
   # ———————————————————————————————————————
   # Lint & Format
   # ———————————————————————————————————————
   lint:
     name: Lint & Format
-    runs-on: ubuntu-latest
-    needs: build
+    runs-on: macos-14
+    needs: bootstrap
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download compiler
+      - name: Download stage3 artifact
         uses: actions/download-artifact@v4
         with:
-          name: tg-x86_64-unknown-linux-gnu
+          name: tg-stages-macos-arm64
           path: build/
 
-      - name: Make executable
-        run: chmod +x build/tg
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
 
       - name: Check formatting
         run: |
@@ -230,20 +124,22 @@ jobs:
   # ———————————————————————————————————————
   bench:
     name: Benchmarks
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     if: github.ref == 'refs/heads/main'
-    needs: build
+    needs: bootstrap
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download compiler
+      - name: Download stage3 artifact
         uses: actions/download-artifact@v4
         with:
-          name: tg-x86_64-unknown-linux-gnu
+          name: tg-stages-macos-arm64
           path: build/
 
-      - name: Make executable
-        run: chmod +x build/tg
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
 
       - name: Run benchmarks
         run: |
@@ -271,20 +167,22 @@ jobs:
   # ———————————————————————————————————————
   docs:
     name: Generate Documentation
-    runs-on: ubuntu-latest
-    needs: build
+    runs-on: macos-14
+    needs: bootstrap
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download compiler
+      - name: Download stage3 artifact
         uses: actions/download-artifact@v4
         with:
-          name: tg-x86_64-unknown-linux-gnu
+          name: tg-stages-macos-arm64
           path: build/
 
-      - name: Make executable
-        run: chmod +x build/tg
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
 
       - name: Generate docs
         run: |
@@ -301,19 +199,21 @@ jobs:
   # ———————————————————————————————————————
   conformance:
     name: Conformance Tests
-    runs-on: ubuntu-latest
-    needs: build
+    runs-on: macos-14
+    needs: bootstrap
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download compiler
+      - name: Download stage3 artifact
         uses: actions/download-artifact@v4
         with:
-          name: tg-x86_64-unknown-linux-gnu
+          name: tg-stages-macos-arm64
           path: build/
 
-      - name: Make executable
-        run: chmod +x build/tg
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
 
       - name: Run parser conformance
         run: |
@@ -376,23 +276,23 @@ jobs:
 
   # ———————————————————————————————————————
   # GFX/UI Module Tests (§22)
+  # Runs on macos-14 with the validated stage3 artifact.
   # ———————————————————————————————————————
   gfx-ui:
-    name: GFX/UI (${{ matrix.os }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            runner: ubuntu-latest
-          - os: macos
-            runner: macos-latest
-          - os: windows
-            runner: windows-latest
+    name: GFX/UI
+    needs: bootstrap
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
       - name: GFX/UI module compilation check
         run: make test-gfx-ui
       - name: Stub scan
@@ -418,10 +318,19 @@ jobs:
 
   gfx-ui-visual:
     name: GFX/UI Visual Regression
-    needs: build
-    runs-on: ubuntu-latest
+    needs: bootstrap
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
       - name: Golden visual regression
         run: ./build/tg test tests/golden/test_visual_regression.tg
       - name: Determinism/replay tests
@@ -438,49 +347,30 @@ jobs:
   gfx-ui-gate:
     name: GFX/UI Required Gate
     needs: [gfx-ui, gfx-ui-visual]
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - name: All GFX/UI checks passed
         run: echo "✓ All GFX/UI CI gates passed"
 
   # ———————————————————————————————————————
-  # Cross-compilation targets
-  # ———————————————————————————————————————
-  cross-compile:
-    name: Cross (${{ matrix.target }})
-    needs: build
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - wasm32-unknown-unknown
-          - wasm32-wasi
-          - thumbv7em-none-eabihf
-          - thumbv6m-none-eabi
-    steps:
-      - uses: actions/checkout@v4
-      - name: Add target
-        run: ./build/tg target add ${{ matrix.target }}
-      - name: Build for target
-        run: ./build/tg build --target ${{ matrix.target }} --release
-      - name: Build examples
-        run: |
-          for example in examples/*.tg; do
-            echo "Building $example for ${{ matrix.target }}..."
-            ./build/tg build --target ${{ matrix.target }} "$example" 2>/dev/null || true
-          done
-
-  # ———————————————————————————————————————
   # New stdlib module tests
+  # Runs on macos-14 with the validated stage3 artifact.
   # ———————————————————————————————————————
   stdlib-new-modules:
     name: Stdlib New Modules
-    needs: build
-    runs-on: ubuntu-latest
+    needs: bootstrap
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
       - name: Test SIMD module
         run: ./build/tg test std/simd.tg --verbose
       - name: Test embedded module
@@ -501,6 +391,42 @@ jobs:
         run: ./build/tg test std/opentelemetry.tg --verbose
       - name: Test WASM JS interop
         run: ./build/tg test std/wasm_js.tg --verbose
+
+  # ———————————————————————————————————————
+  # Cross-compilation targets
+  # Deferred: once the macOS/AArch64 fixed point is green, stage3's
+  # cross-compiler produces the next platform bootstrap, which is then validated
+  # independently. No pretend Linux self-host matrix until a real Linux
+  # bootstrap artifact exists.
+  # ———————————————————————————————————————
+  cross-compile:
+    name: Cross (not yet supported)
+    needs: bootstrap
+    runs-on: macos-14
+    steps:
+      - name: Cross-compilation matrix not yet enabled
+        run: echo "Skipped: cross-compilation matrix requires a validated non-macOS bootstrap artifact."
+
+  # ———————————————————————————————————————
+  # SAST (CodeQL)
+  # ———————————————————————————————————————
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: actions
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
 
   release-freeze:
     name: Release Branch Freeze

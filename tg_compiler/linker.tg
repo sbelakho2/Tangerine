@@ -13,7 +13,7 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
-use std::fs::{write_file_bytes, write_file_bytes_owned}
+use std::fs::{write_file_bytes, write_file_bytes_owned, rename, delete_file, file_exists, file_size}
 use std::process::{run_command}
 use std::ffi
 
@@ -1869,41 +1869,204 @@ def perform_link(input: &LinkerInput) -> Result[Vec[u8], String]
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# In-memory binary validation
+# ———————————————————————————————————————————————————————————————
+def le_u32_at(b: &Vec[u8], off: Int) -> Option[Int]
+  if off + 4 > b.len() then return Option::None end
+  let v = (b[off] as Int) | ((b[off+1] as Int) << 8) | ((b[off+2] as Int) << 16) | ((b[off+3] as Int) << 24)
+  Option::Some(v)
+end
+
+def le_u64_at(b: &Vec[u8], off: Int) -> Option[Int]
+  if off + 8 > b.len() then return Option::None end
+  let v0 = (b[off] as Int) | ((b[off+1] as Int) << 8) | ((b[off+2] as Int) << 16) | ((b[off+3] as Int) << 24)
+  let v1 = ((b[off+4] as Int) | ((b[off+5] as Int) << 8) | ((b[off+6] as Int) << 16) | ((b[off+7] as Int) << 24)) << 32
+  Option::Some(v0 | v1)
+end
+
+# Validate a 64-bit Mach-O executable in memory before it is written to disk.
+# Returns an error string describing the first structural problem found.
+def validate_macho64(b: &Vec[u8]) -> Option[String]
+  # magic + header
+  match le_u32_at(b, 0)
+  when Option::Some(0xFEEDFACF) then ()
+  when Option::Some(_) then return Option::Some("bad Mach-O magic")
+  when Option::None then return Option::Some("file too short for Mach-O header")
+  end
+  match le_u32_at(b, 12)
+  when Option::Some(2) then ()   # MH_EXECUTE
+  when Option::Some(_) then return Option::Some("not an MH_EXECUTE image")
+  when Option::None then return Option::Some("file too short for Mach-O header")
+  end
+  let ncmds = match le_u32_at(b, 16) when Option::Some(v) then v when Option::None then return Option::Some("file too short for Mach-O header") end
+  let sizeofcmds = match le_u32_at(b, 20) when Option::Some(v) then v when Option::None then return Option::Some("file too short for Mach-O header") end
+  if ncmds < 1 then return Option::Some("no load commands") end
+  if sizeofcmds <= 0 then return Option::Some("sizeofcmds is zero") end
+  if 32 + sizeofcmds > b.len() then return Option::Some("load commands exceed file size") end
+
+  mut off = 32
+  mut found_main = false
+  mut cmd_i = 0
+  while cmd_i < ncmds do
+    let cmd = match le_u32_at(b, off) when Option::Some(v) then v when Option::None then return Option::Some("load command header out of bounds") end
+    let cmdsize = match le_u32_at(b, off + 4) when Option::Some(v) then v when Option::None then return Option::Some("load command size out of bounds") end
+    if cmdsize < 8 then return Option::Some("load command size too small") end
+    if off + cmdsize > 32 + sizeofcmds then return Option::Some("load command runs past sizeofcmds") end
+
+    # LC_SEGMENT_64: validate fileoff/filesize and section ranges.
+    if cmd == 0x19 then
+      let nsects = match le_u32_at(b, off + 64) when Option::Some(v) then v when Option::None then return Option::Some("segment cmd truncated") end
+      let fileoff = match le_u64_at(b, off + 24) when Option::Some(v) then v when Option::None then return Option::Some("segment cmd truncated") end
+      let filesize = match le_u64_at(b, off + 32) when Option::Some(v) then v when Option::None then return Option::Some("segment cmd truncated") end
+      if fileoff + filesize > b.len() then return Option::Some("segment file range exceeds file size") end
+      # 72-byte segment header, then nsects * 80-byte sections
+      if 72 + (nsects * 80) > cmdsize then return Option::Some("segment command too small for its sections") end
+      mut si = 0
+      let sect_base = off + 72
+      while si < nsects do
+        let soff = sect_base + (si * 80)
+        let s_offset = match le_u32_at(b, soff + 48) when Option::Some(v) then v when Option::None then return Option::Some("section truncated") end
+        let s_size = match le_u32_at(b, soff + 56) when Option::Some(v) then v when Option::None then return Option::Some("section truncated") end
+        if s_offset + s_size > b.len() then return Option::Some("section range exceeds file size") end
+        si = si + 1
+      end
+    end
+    # LC_MAIN: entrypoint must be present exactly once.
+    if cmd == 0x80000028 then
+      if found_main then return Option::Some("duplicate LC_MAIN") end
+      found_main = true
+    end
+    # LC_SYMTAB: validate symbol/string table bounds.
+    if cmd == 0x02 then
+      let symoff = match le_u32_at(b, off + 8) when Option::Some(v) then v when Option::None then return Option::Some("symtab cmd truncated") end
+      let nsyms = match le_u32_at(b, off + 12) when Option::Some(v) then v when Option::None then return Option::Some("symtab cmd truncated") end
+      let stroff = match le_u32_at(b, off + 16) when Option::Some(v) then v when Option::None then return Option::Some("symtab cmd truncated") end
+      let strsize = match le_u32_at(b, off + 20) when Option::Some(v) then v when Option::None then return Option::Some("symtab cmd truncated") end
+      if symoff + (nsyms * 16) > b.len() then return Option::Some("symbol table exceeds file size") end
+      if stroff + strsize > b.len() then return Option::Some("string table exceeds file size") end
+    end
+    # LC_DYLD_INFO_ONLY: validate rebase/bind/export ranges.
+    if cmd == 0x80000022 then
+      mut fi = 0
+      while fi < 6 do
+        let dataoff = match le_u32_at(b, off + 8 + (fi * 8)) when Option::Some(v) then v when Option::None then return Option::Some("dyld info cmd truncated") end
+        let datasize = match le_u32_at(b, off + 12 + (fi * 8)) when Option::Some(v) then v when Option::None then return Option::Some("dyld info cmd truncated") end
+        if dataoff + datasize > b.len() then return Option::Some("dyld info range exceeds file size") end
+        fi = fi + 1
+      end
+    end
+
+    off = off + cmdsize
+    cmd_i = cmd_i + 1
+  end
+
+  if !found_main then return Option::Some("no LC_MAIN entrypoint") end
+  Option::None
+end
+
 def link_executable(input: &LinkerInput) -> Result[Unit, String]
   let bytes = match perform_link(input)
   when Result::Ok(b) then b
   when Result::Err(e) then return Result::Err(e)
   end
 
-  let output_path = linker_input_output_clone(input)
-  eprintln("[wdiag] linker: writing " + bytes.len().to_string() + " bytes to " + output_path)
-  let fd = libc_open_path(output_path.as_ptr(), 1 | 512 | 1024, 420)
-  if fd < 0 then
-    return Result::Err("failed to open output file for writing (fd=" + fd.to_string() + ")")
+  # Validate the in-memory image before touching the filesystem.
+  if linker_input_os(input) == OsAbi::MacOS then
+    match validate_macho64(&bytes)
+    when Option::Some(err) then
+      return Result::Err("in-memory Mach-O validation failed: " + err)
+    when Option::None then ()
+    end
   end
-  eprintln("[wdiag] linker: opened fd=" + fd.to_string())
+
+  # Transactional publication: write output.tmp, verify, then atomically
+  # rename to output. On any error the .tmp file is removed and output is left
+  # untouched.
+  let output_path = linker_input_output_clone(input)
+  let tmp_path = output_path.clone() + ".tmp"
+  if file_exists(tmp_path.clone()) then
+    let _ = delete_file(tmp_path.clone())
+  end
+
+  let fd = libc_open_path(tmp_path.as_ptr(), 1 | 512 | 1024, 420)
+  if fd < 0 then
+    return Result::Err("failed to open output.tmp for writing (fd=" + fd.to_string() + ")")
+  end
   let written = _tg_write_vec_u8(fd, &bytes, bytes.len() as UInt)
   let close_rc = libc_close(fd)
-  eprintln("[wdiag] linker: wrote " + written.to_string() + " of " + bytes.len().to_string() + " bytes (close rc=" + close_rc.to_string() + ")")
   if written != bytes.len() then
+    let _ = delete_file(tmp_path.clone())
     return Result::Err("failed to write all output bytes: wrote " + written.to_string() + " of " + bytes.len().to_string())
   end
-  let chmod_rc = libc_chmod(output_path.as_ptr(), 493)
-  eprintln("[wdiag] linker: chmod rc=" + chmod_rc.to_string())
+  if close_rc != 0 then
+    let _ = delete_file(tmp_path.clone())
+    return Result::Err("failed to close output.tmp (close rc=" + close_rc.to_string() + ")")
+  end
 
-  # Ad-hoc code sign on macOS
+  # Verify the on-disk size matches what we wrote.
+  match file_size(tmp_path.clone())
+  when Option::Some(sz) then
+    if sz != bytes.len() as UInt then
+      let _ = delete_file(tmp_path.clone())
+      return Result::Err("output.tmp size mismatch: wrote " + sz.to_string() + " bytes, expected " + bytes.len().to_string())
+    end
+  when Option::None then
+    let _ = delete_file(tmp_path.clone())
+    return Result::Err("failed to stat output.tmp")
+  end
+
+  let chmod_rc = libc_chmod(tmp_path.as_ptr(), 493)
+  if chmod_rc != 0 then
+    let _ = delete_file(tmp_path.clone())
+    return Result::Err("chmod output.tmp failed (rc=" + chmod_rc.to_string() + ")")
+  end
+
+  # Ad-hoc code sign and verify on macOS (argv-based, no shell construction).
   if linker_input_os(input) == OsAbi::MacOS then
-    codesign_adhoc(output_path.clone())
+    match codesign_adhoc_verify(tmp_path.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      let _ = delete_file(tmp_path.clone())
+      return Result::Err(e)
+    end
+  end
+
+  # Atomic rename into place.
+  if file_exists(output_path.clone()) then
+    let _ = delete_file(output_path.clone())
+  end
+  match rename(tmp_path.clone(), output_path.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(_) then
+    let _ = delete_file(tmp_path.clone())
+    return Result::Err("failed to rename output.tmp into place")
   end
 
   Result::Ok(())
 end
 
-# Ad-hoc code sign using libc system.
+# Ad-hoc code sign using an argv-based process API (never a shell string).
 extern def libc_system(cmd: String) -> Int
-def codesign_adhoc(path: String) -> Unit
-  let cmd = "/usr/bin/codesign -s - " + path
-  let _ = libc_system(cmd)
+def codesign_adhoc_verify(path: String) -> Result[Unit, String]
+  let args1: Vec[String] = Vec::new()
+  args1.push("-s")
+  args1.push("-")
+  args1.push(path.clone())
+  match run_command("/usr/bin/codesign", args1)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("codesign failed: " + e)
+  end
+  let args2: Vec[String] = Vec::new()
+  args2.push("--verify")
+  args2.push(path.clone())
+  match run_command("/usr/bin/codesign", args2)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("codesign --verify failed: " + e)
+  end
+  Result::Ok(())
 end
 
 # ———————————————————————————————————————————————————————————————

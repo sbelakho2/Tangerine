@@ -129,6 +129,15 @@ run_logged() {
   return "${PIPESTATUS[0]}"
 }
 
+# Build the canonical bootstrap unit from the kernel manifest (single source of
+# truth). Fails the harness if the manifest closure is invalid or has an
+# import outside the kernel.
+bh_log "== Bootstrap unit (compiler_kernel.manifest) =="
+if ! run_logged gen_bootstrap_input bash "$ROOT_DIR/scripts/gen_bootstrap_input.sh"; then
+  bh_err "bootstrap kernel manifest closure is invalid"
+  exit 1
+fi
+
 # ———————————————————————————————————————————————————————————————
 # Step 1 — build stage0 (Swift interpreter)
 # ———————————————————————————————————————————————————————————————
@@ -159,6 +168,16 @@ if ! validate_stage tg_stage1 "$STAGE1"; then
   exit 1
 fi
 
+# Critical canaries under stage1: prove stage1's runtime can compile the
+# compiler before spending a full self-host cycle.
+if [ "$RUN_NATIVE_TESTS" = "1" ]; then
+  bh_log "== Critical canaries (via stage1) =="
+  if ! run_critical_canaries "$STAGE1" "$BUILD_DIR/.native_stage1"; then
+    bh_err "stage1 critical canaries failed"
+    exit 1
+  fi
+fi
+
 # ———————————————————————————————————————————————————————————————
 # Step 3 — stage2 (self-host: stage1 compiles itself)
 # ———————————————————————————————————————————————————————————————
@@ -172,6 +191,15 @@ chmod +x "$STAGE2"
 if ! validate_stage tg_stage2 "$STAGE2"; then
   bh_err "stage2 failed validation"
   exit 1
+fi
+
+# Critical canaries under stage2 before the full stage3 cycle.
+if [ "$RUN_NATIVE_TESTS" = "1" ]; then
+  bh_log "== Critical canaries (via stage2) =="
+  if ! run_critical_canaries "$STAGE2" "$BUILD_DIR/.native_stage2"; then
+    bh_err "stage2 critical canaries failed"
+    exit 1
+  fi
 fi
 
 # ———————————————————————————————————————————————————————————————
@@ -235,13 +263,7 @@ bh_log "stage2 == stage3 (reproducible fixed point, 'cmp' OK)"
 
 if [ "$RUN_DETERMINISM" = "1" ]; then
   bh_log "== Two-clean-directory determinism check =="
-  mkdir -p "$BUILD_DIR/.clean_a" "$BUILD_DIR/.clean_b"
-  cp "$DRIVER_SRC" "$BUILD_DIR/.clean_a/driver.tg"
-  cp "$DRIVER_SRC" "$BUILD_DIR/.clean_b/driver.tg"
-  if ! check_two_clean_dirs tg_det "$STAGE2" \
-        "$BUILD_DIR/.clean_a/driver.tg" \
-        "$BUILD_DIR/.clean_b/driver.tg" \
-        "$BUILD_DIR"; then
+  if ! check_two_clean_dirs tg_det "$STAGE2" "$BUILD_DIR" "$ROOT_DIR"; then
     bh_err "two-clean-directory determinism check failed"
     exit 2
   fi
