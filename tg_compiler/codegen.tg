@@ -3019,10 +3019,10 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
       end
 
     when MirRvalueKind::MirRef(place) then
-      codegen_address_of(ctx, fctx, place, dst)
+      emit_ref_place(ctx, fctx, place, dst)
 
     when MirRvalueKind::MirRefMut(place) then
-      codegen_address_of(ctx, fctx, place, dst)
+      emit_ref_place(ctx, fctx, place, dst)
 
     when MirRvalueKind::MirAggregate(kind, operands) then
       codegen_aggregate(ctx, fctx, kind, operands, dst)
@@ -3528,7 +3528,25 @@ def codegen_float_binop(ctx: &mut CodegenCtx, op: MirBinOp, dst: PhysReg, scratc
   end
 end
 
-def codegen_address_of(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+# ———————————————————————————————————————————————————————————————
+# Place-address primitive — CANONICAL place-addressing entry point.
+#
+# Computes the byte ADDRESS of `place` into register `dst`. For a
+# zero-projection place this is the address of the local's storage; for a
+# projected place it walks the projection chain, following pointer-typed
+# (struct/collection/reference) intermediates by LOADING their stored value
+# and applying the final projection as a pure offset so that the result is
+# the address of the field/component slot itself.
+#
+# Every place-based operation is built on top of this single primitive so
+# loads, stores, borrows and method receivers all agree on nested field
+# addressing:
+#   emit_load_place        = emit_place_address + dereference value
+#   emit_store_place       = emit_place_address + store
+#   emit_ref_place         = emit_place_address (a reference is an address)
+#   emit_method_receiver   = emit_place_address (receiver borrows the place)
+# ———————————————————————————————————————————————————————————————
+def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
   let fp = fp_reg(ctx.target.arch)
 
   if place.projections.is_empty() then
@@ -3716,6 +3734,76 @@ def struct_field_offset_by_name(ctx: &CodegenCtx, type_id: Int, field_name: &Str
   -1
 end
 
+# Load the VALUE of `place` into `dst`. For a zero-projection place this is a
+# plain move/load of the local; for a projected place it composes the canonical
+# address primitive with a single dereference of the final slot.
+def emit_load_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+  let fp = fp_reg(ctx.target.arch)
+  if place.projections.is_empty() then
+    match fctx.var_locs.get(place.local.id)
+    when Option::Some(loc) then
+      match loc
+      when VarLoc::Register(r) then
+        if phys_reg_id(r) != phys_reg_id(dst) then
+          emit_mov_rr(ctx, dst, r)
+        end
+      when VarLoc::Stack(offset) then
+        emit_load_mem(ctx, dst, fp, offset)
+      when VarLoc::Spilled(offset) then
+        emit_load_mem(ctx, dst, fp, offset)
+      end
+    when Option::None then
+      panic("emit_load_place: unknown local " + place.local.id.to_string())
+    end
+  else
+    emit_place_address(ctx, fctx, place, dst)
+    emit_load_mem(ctx, dst, dst, 0)
+  end
+end
+
+# Store `src` into `place`. Computes the place address through the canonical
+# primitive (preserving `src` across the address walk) and stores into it.
+def emit_store_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, src: PhysReg) -> Unit
+  let fp = fp_reg(ctx.target.arch)
+  if place.projections.is_empty() then
+    match fctx.var_locs.get(place.local.id)
+    when Option::Some(loc) then
+      match loc
+      when VarLoc::Register(r) then
+        if phys_reg_id(r) != phys_reg_id(src) then
+          emit_mov_rr(ctx, r, src)
+        end
+      when VarLoc::Stack(offset) then
+        emit_store_mem(ctx, fp, offset, src)
+      when VarLoc::Spilled(offset) then
+        emit_store_mem(ctx, fp, offset, src)
+      end
+    when Option::None then
+      panic("emit_store_place: unknown local " + place.local.id.to_string())
+    end
+  else
+    # Compute the place address into a distinct register so popping `src`
+    # does not clobber the computed base.
+    let base = scratch2_reg(ctx.target.arch)
+    emit_push(ctx, src)
+    emit_place_address(ctx, fctx, place, base)
+    emit_pop(ctx, src)
+    emit_store_mem(ctx, base, 0, src)
+  end
+end
+
+# Take a reference (borrow) of `place`: a reference to a place is exactly its
+# address. Used to lower MirRef / MirRefMut.
+def emit_ref_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+  emit_place_address(ctx, fctx, place, dst)
+end
+
+# Compute the method receiver for a call on `place`. A method receiver is the
+# borrow (&self / &mut self) of the receiver place, so it is the place address.
+def emit_method_receiver(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, dst: PhysReg) -> Unit
+  emit_place_address(ctx, fctx, place, dst)
+end
+
 def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &AggregateKind, operands: &Vec[MirOperand], dst: PhysReg) -> Unit
   let fp = fp_reg(ctx.target.arch)
   let scratch = scratch2_reg(ctx.target.arch)
@@ -3896,10 +3984,10 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
       end
 
     when MirRvalueKind::MirRef(ref ref_place) then
-      codegen_address_of(ctx, fctx, ref_place, rr)
+      emit_ref_place(ctx, fctx, ref_place, rr)
 
     when MirRvalueKind::MirRefMut(ref ref_place) then
-      codegen_address_of(ctx, fctx, ref_place, rr)
+      emit_ref_place(ctx, fctx, ref_place, rr)
 
     when MirRvalueKind::MirAggregate(ref kind, ref operands) then
       codegen_aggregate(ctx, fctx, kind, operands, rr)
@@ -8842,8 +8930,9 @@ def generate_native(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
     all_symbols.push(sym.clone())
   end
   # Convert rodata labels to symbols (e.g., .Lstr.0 string constants)
-  # NOTE: bind the labels Map to a local first (see generate_executable) to
-  # avoid the two-level field method-receiver projection bug.
+  # NOTE: binding the labels Map to a local first keeps the receiver simple.
+  # The two-level field method-receiver projection bug this worked around is
+  # fixed by the canonical emit_place_address primitive (see generate_executable).
   let rodata_labels = ctx.rodata.labels
   for name in rodata_labels.keys() do
     match rodata_labels.get(name)
@@ -8923,13 +9012,11 @@ def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: S
     all_symbols.push(sym.clone())
   end
   # Convert rodata labels to symbols (e.g., .Lstr.0 string constants)
-  # NOTE: bind the labels Map to a local before calling methods on it.
-  # `ctx.rodata.labels.keys()` (a method call on a TWO-level field access)
-  # mis-computes the receiver: codegen_address_of drops the final `.labels`
-  # field offset and passes &ctx.rodata (the CodeBuffer) instead of the labels
-  # Map, so _tg_map_entries reads CodeBuffer fields as buckets/size/capacity
-  # and walks garbage (crash in .Lmap_ent_chain). A plain value read into a
-  # local (like `e.source_map.files`) projects correctly.
+  # NOTE: binding the labels Map to a local keeps the receiver simple.
+  # The nested field-address projection bug this historically worked around is
+  # fixed by the canonical emit_place_address primitive, which applies the
+  # FINAL field offset for multi-level places (e.g. `ctx.rodata.labels`), so a
+  # method receiver borrows the labels Map rather than the parent CodeBuffer.
   let rodata_labels = ctx.rodata.labels
   for name in rodata_labels.keys() do
     match rodata_labels.get(name)
