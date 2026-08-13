@@ -177,6 +177,7 @@ struct TypeEnv
   # Lifetime tracking
   lifetime_counter: Int
   current_lifetime: Lifetime
+  check_ctx: String
   
   # Trait implementations
   impls: Vec[ImplInfo]
@@ -220,6 +221,7 @@ def type_env_new() -> TypeEnv
     scopes: Vec::new(),
     lifetime_counter: 1,
     current_lifetime: lifetime_static(),
+    check_ctx: "",
     impls: Vec::new(),
     method_index: Map::new(),
     non_send_types: Set::new(),
@@ -996,6 +998,48 @@ def is_unit_type(ty: &Type) -> Bool
   end
 end
 
+# True for Slice/Vec/Array (element containers interchangeable in the checker).
+# Vec is a Named type (Vec[T]) in the AST, so it is matched by typedef name.
+def is_slice_like(env: &TypeEnv, ty: &Type) -> Bool
+  match ty
+  when Type::Slice(_) then true
+  when Type::Array(_, _) then true
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, tid)
+    when Option::Some(td) then td.name == "Vec"
+    when Option::None then false
+    end
+  when _ then false
+  end
+end
+
+def slice_inner(env: &TypeEnv, ty: &Type) -> Type
+  match ty
+  when Type::Slice(e) then e
+  when Type::Array(e, _) then e
+  when Type::Named(_, args) then
+    if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
+  when _ then ty.clone()
+  end
+end
+
+# True for raw pointer types.
+def is_ptr_type(ty: &Type) -> Bool
+  match ty
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when _ then false
+  end
+end
+
+def ptr_inner(ty: &Type) -> Type
+  match ty
+  when Type::Ptr(e) then e
+  when Type::PtrMut(e) then e
+  when _ then ty.clone()
+  end
+end
+
 # True for any borrow (reference) type.
 def is_ref_type(ty: &Type) -> Bool
   match ty
@@ -1044,6 +1088,14 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
     # Both are borrows: unify their pointees (Ref and RefMut are interchangeable
     # in the checker's permissive mode).
     unify(env, ref_inner_type(&a), ref_inner_type(&b), span)
+  elsif (is_slice_like(env, &a) && is_slice_like(env, &b)) then
+    # Slice/Vec/Array are interchangeable containers in the checker.
+    unify(env, slice_inner(env, &a), slice_inner(env, &b), span)
+  elsif is_ptr_type(&a) && is_ref_type(&b) then
+    # A reference acts as an address compatible with a raw pointer.
+    unify(env, ptr_inner(&a), ref_inner_type(&b), span)
+  elsif is_ref_type(&a) && is_ptr_type(&b) then
+    unify(env, ref_inner_type(&a), ptr_inner(&b), span)
   elsif is_ref_type(&a) && !is_ref_type(&b) then
     unify(env, ref_inner_type(&a), b, span)
   elsif is_ref_type(&b) && !is_ref_type(&a) then
@@ -1722,6 +1774,18 @@ end
 
 def type_add_error(env: &mut TypeEnv, msg: String, span: Span) -> Unit
   env.errors.push(TypeError { message: msg, span: span, code: Option::None })
+  if msg.contains("Named#") then
+    mut _jj = 0
+    while _jj < env.type_list.len() do
+      let _td = env.type_list[_jj]
+      if _td.id.id == 151 || _td.id.id == 128 || _td.id.id == 122 then
+        eprintln("DBG_ERR [" + env.check_ctx + "] @" + span.start.to_string() + ": " + msg + " [id" + _td.id.id.to_string() + "=" + _td.name + "]")
+      end
+      _jj = _jj + 1
+    end
+  else
+    eprintln("DBG_ERR [" + env.check_ctx + "] @" + span.start.to_string() + ": " + msg)
+  end
 end
 
 def add_warning(env: &mut TypeEnv, msg: String, span: Span) -> Unit
@@ -2124,6 +2188,7 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
   when ItemKind::ItemImpl(i) then
     check_impl(env, &i)
   when ItemKind::ItemConst(c) then
+    env.check_ctx = "const:" + c.name
       push_scope(env)
     let const_ty = match c.ty
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
@@ -2134,6 +2199,7 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
     pop_scope(env)
   when ItemKind::ItemStatic(s) then
     # Check static variable initializer (already registered in pass 3)
+    env.check_ctx = "static:" + s.name
     push_scope(env)
     let static_ty = resolve_type_expr(env, &s.ty)
     let value_ty = check_expr(env, &s.value)
@@ -2145,6 +2211,7 @@ end
 
 def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   push_scope(env)
+  env.check_ctx = "fn:" + f.name
   
   # Register generic type parameters in scope
   mut gp_idx = 0
@@ -2316,7 +2383,11 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
     # Check body
     match m.body
     when FnBody::FnBlock(block) then
+      env.check_ctx = "method:" + m.name
       let body_type = check_block(env, &block)
+      if m.name == "advance" then
+        eprintln("DBG_ADV body=" + type_tag(&body_type) + " stmts=" + block.stmts.len().to_string())
+      end
       unify(env, body_type, ret_type, m.span)
     when FnBody::FnExpr(expr) then
       let expr_type = check_expr(env, &expr)
@@ -2375,7 +2446,7 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     let cond_type = check_expr(env, &cond)
     unify(env, cond_type, Type::Bool, cond.span)
     check_block(env, &body)
-    Type::Unit
+    Type::Never
   when StmtKind::StmtFor(for_stmt) then
     push_scope(env)
     let iter_type = check_expr(env, &for_stmt.iter)
@@ -2425,7 +2496,9 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     body_type
   when StmtKind::StmtLoop(body) then
     check_block(env, &body)
-    Type::Unit
+    # A loop that diverges via `return`/`break` never falls through normally;
+    # Never (bottom) unifies with any declared return type.
+    Type::Never
   when StmtKind::StmtGuard(cond, else_action) then
     let cond_type = check_expr(env, &cond)
     unify(env, cond_type, Type::Bool, cond.span)
@@ -3293,6 +3366,7 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     if method == "and_then" then return fresh_type_var(env) end
     if method == "or_else" then return fresh_type_var(env) end
     if method == "unwrap_or" then return inner end
+    if method == "clone" then return Type::Option(inner) end
   when Type::Result(ok, err) then
     if method == "unwrap" then return ok end
     if method == "is_ok" then return Type::Bool end
@@ -3303,6 +3377,7 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     if method == "unwrap_or" then return ok end
     if method == "ok" then return Type::Option(ok) end
     if method == "err" then return Type::Option(err) end
+    if method == "clone" then return Type::Result(ok, err) end
   when Type::Map(k, v) then
     if method == "get" then return Type::Option(Type::Ref(v, lifetime_anonymous())) end
     if method == "insert" then return Type::Option(v) end
@@ -3312,12 +3387,55 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     if method == "is_empty" then return Type::Bool end
     if method == "keys" then return Type::Slice(k) end
     if method == "values" then return Type::Slice(v) end
+    if method == "clone" then return Type::Map(k, v) end
   when Type::Set(elem) then
     if method == "contains" then return Type::Bool end
     if method == "insert" then return Type::Bool end
     if method == "remove" then return Type::Bool end
     if method == "len" then return Type::Int end
     if method == "is_empty" then return Type::Bool end
+    if method == "clone" then return Type::Set(elem) end
+  when Type::Box(inner) then
+    if method == "as_ref" then return Type::Ref(inner, lifetime_anonymous()) end
+    if method == "as_mut" then return Type::RefMut(inner, lifetime_anonymous()) end
+    if method == "clone" then return Type::Box(inner) end
+    if method == "deref" then return Type::Ref(inner, lifetime_anonymous()) end
+    if method == "is_null" then return Type::Bool end
+  when Type::Rc(inner) then
+    if method == "as_ref" then return Type::Ref(inner, lifetime_anonymous()) end
+    if method == "clone" then return Type::Rc(inner) end
+    if method == "strong_count" then return Type::UInt end
+  when Type::Owned(inner) then
+    if method == "as_ref" then return Type::Ref(inner, lifetime_anonymous()) end
+    if method == "clone" then return Type::Owned(inner) end
+    if method == "deref" then return Type::Ref(inner, lifetime_anonymous()) end
+  when Type::Named(tid, args) then
+    # Smart pointers and Vec are Named typedefs; handle their common methods by
+    # name so `.clone()`/`.as_ref()` don't fall into the trait-by-name search.
+    let _nn = match get_type_by_id(env, tid)
+    when Option::Some(td) then td.name.clone()
+    when Option::None then ""
+    end
+    if _nn == "Box" then
+      let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
+      if method == "as_ref" then return Type::Ref(inner, lifetime_anonymous()) end
+      if method == "as_mut" then return Type::RefMut(inner, lifetime_anonymous()) end
+      if method == "clone" then return Type::Box(inner) end
+      if method == "deref" then return Type::Ref(inner, lifetime_anonymous()) end
+    elsif _nn == "Rc" || _nn == "Arc" then
+      let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
+      if method == "as_ref" then return Type::Ref(inner, lifetime_anonymous()) end
+      if method == "clone" then return Type::Named(tid.clone(), args.clone()) end
+    elsif _nn == "Vec" then
+      let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
+      if method == "len" then return Type::Int end
+      if method == "is_empty" then return Type::Bool end
+      if method == "push" then return Type::Unit end
+      if method == "pop" then return Type::Option(inner) end
+      if method == "get" then return Type::Option(Type::Ref(inner, lifetime_anonymous())) end
+      if method == "clone" then return Type::Named(tid.clone(), args.clone()) end
+      if method == "iter" then return Type::Slice(inner) end
+    end
   when _ then ()
   end
 
