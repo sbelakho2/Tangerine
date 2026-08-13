@@ -69,45 +69,86 @@ if [ "${#REL_PATHS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# Reject transitive imports outside the manifest (kernel must be closed under
-# std: and compiler: prefixes). Check each source for `use std::` and
-# `use tg_compiler::` imports and confirm the referenced module resolves within
-# the manifest closure.
-import_outside() {
-  local src="$1"
-  local root
-  case "$src" in
-    std/*)       root="std/" ;;
-    tg_compiler/*) root="tg_compiler/" ;;
-    *) return 1 ;;
-  esac
-  local mod
-  # Match:  use std::collections::{...}   or   use tg_compiler::asm::{...}
-  # Extract the module name after the root prefix (root is literal, no slashes
-  # in the substituted delimiter).
-  mod="$(grep -oE "use ${root}[a-z0-9_]+" "$src" | sed -E "s|use ${root}||" || true)"
-  local m
-  for m in $mod; do
-    local target="${root}${m}.tg"
-    if [ ! -f "$target" ]; then
-      echo "[bootstrap-unit:error] $src imports $target which is outside the kernel manifest" >&2
-      return 1
-    fi
-  done
-  return 0
+# Build the canonical set of manifest source paths for membership checks.
+MANIFEST_SET=()
+for rel in "${REL_PATHS[@]}"; do
+  MANIFEST_SET+=("$rel")
+done
+
+# Reject any transitive import outside the manifest closure. Tangerine imports
+# use `use std::foo` and `use tg_compiler::foo` (double-colon module paths, not
+# slashes). The kernel must be closed: every import of every listed source must
+# resolve to a path that is itself a member of compiler_kernel.manifest, and the
+# check iterates to a fixed point over newly-discovered sources.
+imports_of() {
+  # Emit normalized source paths (std/foo.tg, tg_compiler/foo.tg) for every
+  # `use std::foo` / `use tg_compiler::foo` import in the file.
+  grep -oE "use (std|tg_compiler)::[a-z0-9_]+" "$1" 2>/dev/null \
+    | sed -E 's/^use (std|tg_compiler)::/\1\//; s/$/.tg/' || true
 }
 
-for rel in "${REL_PATHS[@]}"; do
-  if ! import_outside "$rel"; then
-    exit 1
+closure_error=0
+CHECKED=()
+checked_of() {
+  local c
+  for c in ${CHECKED[@]+"${CHECKED[@]}"}; do
+    if [ "$c" = "$1" ]; then return 0; fi
+  done
+  return 1
+}
+mut_worklist=("${REL_PATHS[@]}")
+while [ ${#mut_worklist[@]} -gt 0 ]; do
+  src="${mut_worklist[0]}"
+  mut_worklist=("${mut_worklist[@]:1}")
+  if checked_of "$src"; then
+    continue
   fi
+  CHECKED+=("$src")
+  imps="$(imports_of "$src")"
+  if [ -z "$imps" ]; then
+    continue
+  fi
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    in_manifest=0
+    for m in ${MANIFEST_SET[@]+"${MANIFEST_SET[@]}"}; do
+      if [ "$m" = "$target" ]; then
+        in_manifest=1
+        break
+      fi
+    done
+    if [ "$in_manifest" -eq 0 ]; then
+      echo "[bootstrap-unit:error] $src imports $target which is NOT a member of the kernel manifest" >&2
+      closure_error=1
+    elif ! checked_of "$target"; then
+      mut_worklist+=("$target")
+    fi
+  done <<< "$imps"
 done
+
+if [ "$closure_error" -ne 0 ]; then
+  echo "[bootstrap-unit:error] kernel closure is not closed under compiler_kernel.manifest" >&2
+  exit 1
+fi
 
 # Sort entries canonically for a stable aggregate hash (sort by kind then path).
 SORTED_REL=( $(printf '%s\n' "${REL_PATHS[@]}" | sort) )
 
-# Build the JSON document.
-AGG="$(printf '%s\n' "${SORTED_REL[@]}" | sha256f /dev/stdin)"
+# Aggregate hash is over CONTENTS, not filenames: manifest hash + a NUL-separated
+# stream of (canonical path, file content SHA256) pairs. Changing any source's
+# contents changes the aggregate.
+AGG_STREAM=""
+{
+  printf '%s' "$(sha256f "$MANIFEST")"
+  printf '\0'
+  for rel in "${SORTED_REL[@]}"; do
+    printf '%s' "$rel"
+    printf '\0'
+    printf '%s' "$(sha256f "$rel")"
+    printf '\0'
+  done
+} > /tmp/bootstrap_agg_stream.bin
+AGG="$(sha256f /tmp/bootstrap_agg_stream.bin)"
 {
   echo "{"
   echo "  \"manifest\": \"$MANIFEST\","
