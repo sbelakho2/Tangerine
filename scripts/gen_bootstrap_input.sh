@@ -137,7 +137,15 @@ SORTED_REL=( $(printf '%s\n' "${REL_PATHS[@]}" | sort) )
 # Aggregate hash is over CONTENTS, not filenames: manifest hash + a NUL-separated
 # stream of (canonical path, file content SHA256) pairs. Changing any source's
 # contents changes the aggregate.
+# The self-host bootstrap harness is macOS/AArch64-only. The target is threaded
+# from the harness via TG_BOOTSTRAP_TARGET when set, else the canonical default.
+BOOT_TARGET="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
+
 AGG_STREAM=""
+# Temporary stream file: use mktemp + trap so concurrent bootstrap processes
+# never race on a fixed path and the temp file is always cleaned up.
+AGG_TMP="$(mktemp "${TMPDIR:-/tmp}/bootstrap_agg.XXXXXX")"
+trap 'rm -f "$AGG_TMP"' EXIT
 {
   printf '%s' "$(sha256f "$MANIFEST")"
   printf '\0'
@@ -147,13 +155,13 @@ AGG_STREAM=""
     printf '%s' "$(sha256f "$rel")"
     printf '\0'
   done
-} > /tmp/bootstrap_agg_stream.bin
-AGG="$(sha256f /tmp/bootstrap_agg_stream.bin)"
+} > "$AGG_TMP"
+AGG="$(sha256f "$AGG_TMP")"
 {
   echo "{"
   echo "  \"manifest\": \"$MANIFEST\","
   echo "  \"manifest_sha256\": \"$(sha256f "$MANIFEST")\","
-  echo "  \"target\": \"aarch64-apple-darwin\","
+  echo "  \"target\": \"$BOOT_TARGET\","
   echo "  \"aggregate_source_hash\": \"$AGG\","
   echo "  \"sources\": ["
   n="${#SORTED_REL[@]}"
