@@ -342,6 +342,61 @@ EOF
     return_code=0
   fi
 
+  # Strict name-resolution fixtures (--strict): unknown local, unknown type,
+  # unknown enum variant, nonexistent method, unknown field.
+  cat > "$scratch/ladder_unknown_local.tg" <<'EOF'
+def main() -> Int
+  let x = compielr_options
+  x
+end
+EOF
+  cat > "$scratch/ladder_unknown_type.tg" <<'EOF'
+def main() -> Int
+  let x: DefinitlyNotAType = 0
+  0
+end
+EOF
+  cat > "$scratch/ladder_unknown_variant.tg" <<'EOF'
+enum E
+  A
+end
+def main() -> Int
+  let x = E::NoSuchVariant
+  0
+end
+EOF
+  cat > "$scratch/ladder_unknown_method.tg" <<'EOF'
+def main() -> Int
+  let s = "hello"
+  s.does_not_exist()
+  0
+end
+EOF
+  cat > "$scratch/ladder_unknown_field.tg" <<'EOF'
+struct S
+  a: Int
+end
+def main() -> Int
+  let s = S { a: 1 }
+  s.no_such_field
+  0
+end
+EOF
+
+  local strict_failures=0
+  local fixture
+  for fixture in ladder_unknown_local ladder_unknown_type ladder_unknown_variant \
+                 ladder_unknown_method ladder_unknown_field; do
+    if "$compiler" check --strict "$scratch/$fixture.tg" >/dev/null 2>&1; then
+      strict_failures=$((strict_failures + 1))
+      bh_err "ladder: $fixture accepted (expected strict rejection)"
+    fi
+  done
+  if [ "$strict_failures" -ne 0 ]; then
+    bh_err "stage2 strict-resolution ladder FAILED ($strict_failures accepted)"
+    failures=$((failures + strict_failures))
+  fi
+
   bh_log "stage2 diag ladder: clean=${ok_code} type=${type_code} parse=${parse_code} return=${return_code}"
 
   if [ "$failures" -ne 0 ]; then
