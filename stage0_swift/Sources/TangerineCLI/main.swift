@@ -544,7 +544,61 @@ struct TangerineCLI {
         }
     }
 
+    /// Parse the compiler kernel manifest (bootstrap/compiler_kernel.manifest).
+    /// Returns (stdFiles, compilerFiles) relative paths. Returns nil when the
+    /// manifest is absent so callers can fall back to directory scanning.
+    private static func readKernelManifest(fileManager: FileManager = .default) -> (stdFiles: [String], compilerFiles: [String])? {
+        let manifestPath = "bootstrap/compiler_kernel.manifest"
+        guard fileManager.fileExists(atPath: manifestPath),
+              let text = try? String(contentsOfFile: manifestPath, encoding: .utf8) else {
+            return nil
+        }
+
+        var stdFiles: [String] = []
+        var compilerFiles: [String] = []
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[..<colon].trimmingCharacters(in: .whitespaces)
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if value.isEmpty { continue }
+            switch key {
+            case "std":
+                stdFiles.append(value)
+            case "compiler":
+                compilerFiles.append(value)
+            default:
+                continue
+            }
+        }
+
+        guard !stdFiles.isEmpty || !compilerFiles.isEmpty else { return nil }
+        return (stdFiles.sorted(), compilerFiles.sorted())
+    }
+
     private static func collectBootstrapCompilerFiles(fileManager: FileManager = .default) -> (stdFiles: [String], compilerFiles: [String]) {
+        // Kernel is manifest-driven (single source of truth). The manifest
+        // shrinks the bootstrap closure to the minimal self-hostable module
+        // set instead of scanning every .tg under tg_compiler/.
+        if let kernel = readKernelManifest(fileManager: fileManager) {
+            let availableStd = Set(collectTgFiles(in: "std", fileManager: fileManager).map {
+                ($0 as NSString).lastPathComponent
+            })
+            let missingProfileFiles = kernel.stdFiles.filter { !availableStd.contains($0) }
+            if !missingProfileFiles.isEmpty {
+                fputs("error: missing bootstrap profile stdlib files:\n", stderr)
+                for missing in missingProfileFiles {
+                    fputs("  \(missing)\n", stderr)
+                }
+                exit(1)
+            }
+            let stdFiles = kernel.stdFiles.map { ("std" as NSString).appendingPathComponent($0) }
+            let compilerFiles = kernel.compilerFiles.map { ("tg_compiler" as NSString).appendingPathComponent($0) }
+            return (stdFiles, compilerFiles)
+        }
+
+        // Fallback (no manifest): previous behavior — full directory scan.
         let availableStd = Set(collectTgFiles(in: "std", fileManager: fileManager).map {
             ($0 as NSString).lastPathComponent
         })
