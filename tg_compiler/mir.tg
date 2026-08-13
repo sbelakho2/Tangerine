@@ -11260,14 +11260,36 @@ def verifier_rvalue_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, 
     Option::None
   when MirRvalueKind::MirPhi(entries) then
     mut ei = 0
+    mut seen_preds: Set[Int] = Set::new()
+    mut phi_ty: Option[Type] = Option::None
     while ei < entries.len() do
+      let pred_id = entries[ei].0.id
       let lid = entries[ei].1.id
+      if seen_preds.contains(&pred_id) then
+        errors.push(ctx.clone() + ": phi has duplicate predecessor bb" + pred_id.to_string())
+      else
+        seen_preds.insert(pred_id)
+      end
       if !verifier_local_exists(func, lid) then
         errors.push(ctx.clone() + ": phi references undefined local _" + lid.to_string())
+      else
+        # All incoming values must have the same type; the destination type is
+        # checked by the surrounding MirAssign via the returned phi type.
+        match verifier_local_type(func, lid)
+        when Option::Some(ity) then
+          match phi_ty
+          when Option::Some(pt) then
+            if !verifier_types_compatible(&pt, &ity) then
+              errors.push(ctx.clone() + ": phi incoming value type mismatch: " + verifier_type_key(&pt) + " vs " + verifier_type_key(&ity))
+            end
+          when Option::None then phi_ty = Option::Some(ity)
+          end
+        when Option::None then ()
+        end
       end
       ei = ei + 1
     end
-    Option::None
+    phi_ty
   when _ then Option::None
   end
 end
@@ -11652,6 +11674,8 @@ def verifier_dataflow_init(type_index: &Map[Int, MirTypeDef], func: &MirFunction
   # checked structurally with all locals treated as initialized to avoid
   # spurious definite-init errors; reachable blocks use the computed in-set.
   let reachable = verifier_reachable_blocks(func)
+  # Cross-block moved-state dataflow (may-moved per block IN set).
+  let moved_in_map = verifier_compute_moved_dataflow(func, &block_map, &preds, entry_id)
   mut bi = 0
   while bi < func.blocks.len() do
     let b = &func.blocks[bi]
@@ -11667,15 +11691,121 @@ def verifier_dataflow_init(type_index: &Map[Int, MirTypeDef], func: &MirFunction
       for lid in &all_local_ids do t.insert(lid.clone()) end
       t
     end
-    verifier_check_block_stmts(type_index, func, b, &bin, &bb_ctx, errors)
+    let bmoved = match moved_in_map.get(bid)
+    when Option::Some(s) then s.clone()
+    when Option::None then Set::new()
+    end
+    verifier_check_block_stmts(type_index, func, b, &bin, &bmoved, &bb_ctx, errors)
     bi = bi + 1
   end
 end
 
-def verifier_check_block_stmts(type_index: &Map[Int, MirTypeDef], func: &MirFunction, block: &MirBlock, block_in: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+# Collect the locals moved (consumed by value) by an rvalue's operands.
+def verifier_operand_moved_target(op: &MirOperand, out: &mut Set[Int]) -> Unit
+  match &op.kind
+  when MirOperandKind::MirMovePlace(place) then out.insert(place.local.id)
+  when _ then ()
+  end
+end
+
+def verifier_rvalue_moved_targets(rvalue: &MirRvalue, out: &mut Set[Int]) -> Unit
+  match &rvalue.kind
+  when MirRvalueKind::MirMove(operand) then verifier_operand_moved_target(operand, out)
+  when MirRvalueKind::MirAggregate(_, operands) then
+    for op in operands do verifier_operand_moved_target(op, out) end
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    verifier_operand_moved_target(lhs, out)
+    verifier_operand_moved_target(rhs, out)
+  when MirRvalueKind::MirUnOp(_, operand) then verifier_operand_moved_target(operand, out)
+  when MirRvalueKind::MirCast(_, operand, _) then verifier_operand_moved_target(operand, out)
+  when MirRvalueKind::MirRepeat(operand, _) then verifier_operand_moved_target(operand, out)
+  when _ then ()
+  end
+end
+
+# Forward may-moved dataflow: a local is "moved-in" to a block if ANY
+# predecessor moved it and the block did not reinitialize it. This catches
+# cross-block use-after-move (move in pred; use in successor).
+def verifier_compute_moved_dataflow(func: &MirFunction, block_map: &Map[Int, MirBlock], preds: &Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[Int]]
+  mut moved_in: Map[Int, Set[Int]] = Map::new()
+  mut moved_out: Map[Int, Set[Int]] = Map::new()
+  mut entry_set: Set[Int] = Set::new()
+  moved_in.insert(entry_id, entry_set.clone())
+
+  mut worklist = Vec::new()
+  worklist.push(entry_id)
+  mut in_worklist: Set[Int] = Set::new()
+  in_worklist.insert(entry_id)
+
+  while !worklist.is_empty() do
+    let bid = match worklist.pop()
+    when Option::Some(v) then v
+    when Option::None then break
+    end
+    in_worklist.remove(&bid)
+
+    mut new_in: Set[Int] = Set::new()
+    if bid != entry_id then
+      let pred_list = match preds.get(bid)
+      when Option::Some(l) then l.clone()
+      when Option::None then Vec::new()
+      end
+      mut pi = 0
+      while pi < pred_list.len() do
+        match moved_out.get(pred_list[pi])
+        when Option::Some(pset) then
+          for v in pset do new_in.insert(v.clone()) end
+        when Option::None then ()
+        end
+        pi = pi + 1
+      end
+    end
+
+    let block = match block_map.get(bid)
+    when Option::Some(b) then b.clone()
+    when Option::None then break
+    end
+
+    mut out: Set[Int] = Set::new()
+    for v in &new_in do out.insert(v.clone()) end
+    for st in block.statements do
+      match &st.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        verifier_rvalue_moved_targets(rvalue, &mut out)
+        out.remove(&place.local.id)
+      when _ then ()
+      end
+    end
+
+    let had = match moved_in.get(bid)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    let changed = !had || !verifier_set_equal(match moved_in.get(bid) when Option::Some(s) then s when Option::None then &entry_set end, &new_in)
+    moved_in.insert(bid, new_in.clone())
+    moved_out.insert(bid, out)
+
+    if changed then
+      let succs2 = terminator_successor_ids(&block.terminator)
+      mut s2 = 0
+      while s2 < succs2.len() do
+        let sid = succs2[s2]
+        if !in_worklist.contains(&sid) then
+          in_worklist.insert(sid)
+          worklist.push(sid)
+        end
+        s2 = s2 + 1
+      end
+    end
+  end
+  moved_in
+end
+
+def verifier_check_block_stmts(type_index: &Map[Int, MirTypeDef], func: &MirFunction, block: &MirBlock, block_in: &Set[Int], moved_in: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
   mut running: Set[Int] = Set::new()
   for v in block_in do running.insert(v.clone()) end
   mut moved: Set[Int] = Set::new()
+  for v in moved_in do moved.insert(v.clone()) end
 
   for st in block.statements do
     match &st.kind
