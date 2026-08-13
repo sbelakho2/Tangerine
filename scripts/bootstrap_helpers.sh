@@ -466,6 +466,7 @@ run_canary_files() {
 # Usage: run_critical_canaries <compiler> <outdir>
 run_critical_canaries() {
   run_canary_files "$1" "$2" \
+    tests/canary/test_canary_borrowed_enum.tg \
     tests/canary/test_canary_representation.tg \
     tests/canary/test_canary_narrow_storage.tg \
     tests/canary/test_canary_aggregate_copy.tg \
