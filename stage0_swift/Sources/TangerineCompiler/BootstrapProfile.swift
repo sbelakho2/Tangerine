@@ -54,6 +54,8 @@ public struct BootstrapProfile {
             reason: "Error types imported by fs.tg"),
         ProfileEntry(file: "time.tg",
             reason: "Timing types imported by bench.tg"),
+        ProfileEntry(file: "resolver.tg",
+            reason: "Name resolution (symbol table, imports, references) in the bootstrap kernel"),
     ]
 
     /// File names in the minimal bootstrap profile.
