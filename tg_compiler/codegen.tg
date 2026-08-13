@@ -896,6 +896,193 @@ def emit_store_mem(ctx: &mut CodegenCtx, base: PhysReg, offset: i32, src: PhysRe
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# Sized memory access (respects narrow storage widths)
+# ———————————————————————————————————————————————————————————————
+# The layout engine defines narrow storage sizes (Bool=1, i8/u8=1, i16/u16=2,
+# i32/u32=4, 64-bit=8). These primitives load/store exactly the field's storage
+# width so adjacent narrow fields are never corrupted by an 8-byte access.
+enum MemWidth
+  W8
+  W16
+  W32
+  W64
+end
+
+enum Extension
+  Zero
+  Sign
+  None
+end
+
+# Storage width of a scalar type in memory (bytes).
+def storage_width_of(ty: &Type) -> MemWidth
+  match ty
+  when Type::Bool then MemWidth::W8
+  when Type::I8 then MemWidth::W8
+  when Type::U8 then MemWidth::W8
+  when Type::I16 then MemWidth::W16
+  when Type::U16 then MemWidth::W16
+  when Type::I32 then MemWidth::W32
+  when Type::U32 then MemWidth::W32
+  when Type::F32 then MemWidth::W32
+  when Type::Char then MemWidth::W32
+  when Type::I64 then MemWidth::W64
+  when Type::U64 then MemWidth::W64
+  when Type::Int then MemWidth::W64
+  when Type::UInt then MemWidth::W64
+  when Type::ISize then MemWidth::W64
+  when Type::USize then MemWidth::W64
+  when Type::F64 then MemWidth::W64
+  when _ then MemWidth::W64
+  end
+end
+
+# Extension rule when loading a narrow value into a 64-bit register.
+def storage_signedness_of(ty: &Type) -> Extension
+  match ty
+  when Type::I8 then Extension::Sign
+  when Type::I16 then Extension::Sign
+  when Type::I32 then Extension::Sign
+  when Type::Int then Extension::Sign
+  when Type::ISize then Extension::Sign
+  when Type::I64 then Extension::Sign
+  when Type::Char then Extension::Sign
+  when Type::Bool then Extension::Zero
+  when Type::U8 then Extension::Zero
+  when Type::U16 then Extension::Zero
+  when Type::U32 then Extension::Zero
+  when Type::UInt then Extension::Zero
+  when Type::USize then Extension::Zero
+  when Type::U64 then Extension::Zero
+  when _ then Extension::None
+  end
+end
+
+# LOAD a value of `width` bytes from [addr + offset] into `dst`, applying the
+# given extension when widening into the 64-bit register.
+def emit_load_mem_sized(ctx: &mut CodegenCtx, dst: PhysReg, addr: PhysReg, offset: i32, width: MemWidth, extension: Extension) -> Unit
+  match dst
+  when PhysReg::X64Reg(d) then
+    match addr
+    when PhysReg::X64Reg(b) then
+      match width
+      when MemWidth::W8 then
+        match extension
+        when Extension::Sign then x64_movsx_r64_m8(&mut ctx.text, d, b, offset)
+        when _ then x64_movzx_r64_m8(&mut ctx.text, d, b, offset)
+        end
+      when MemWidth::W16 then
+        match extension
+        when Extension::Sign then x64_movsx_r64_m16(&mut ctx.text, d, b, offset)
+        when _ then x64_movzx_r64_m16(&mut ctx.text, d, b, offset)
+        end
+      when MemWidth::W32 then
+        match extension
+        when Extension::Sign then x64_movsx_r64_m32(&mut ctx.text, d, b, offset)
+        when _ then x64_mov_r32_m32(&mut ctx.text, d, b, offset)
+        end
+      when MemWidth::W64 then
+        x64_mov_rm(&mut ctx.text, d, b, offset)
+      end
+    when _ then panic("emit_load_mem_sized: mixed architectures")
+    end
+  when PhysReg::A64Reg(d) then
+    match addr
+    when PhysReg::A64Reg(b) then
+      # Resolve the effective address. Narrow AArch64 loads use an unsigned
+      # scaled immediate; materialize the address into X15 whenever the offset
+      # is nonzero so the sized access always uses offset 0.
+      mut ab = b
+      mut off = offset
+      if off != 0 then
+        let raw = off as i64
+        mut ext = raw
+        if (raw & 2147483648) != 0 then
+          ext = raw | (-4294967296)
+        end
+        a64_mov_ri(&mut ctx.text, A64::X15, ext)
+        if ext < 0 then
+          a64_sub_rrr(&mut ctx.text, A64::X15, b, A64::X15)
+        else
+          a64_add_rrr(&mut ctx.text, A64::X15, b, A64::X15)
+        end
+        ab = A64::X15
+        off = 0
+      end
+      match width
+      when MemWidth::W8 then
+        a64_ldrb(&mut ctx.text, d, ab, off as u32)
+        if extension == Extension::Sign then
+          a64_lsl(&mut ctx.text, d, d, 56)
+          a64_mov_ri(&mut ctx.text, A64::X15, 56)
+          a64_asr_rrr(&mut ctx.text, d, d, A64::X15)
+        end
+      when MemWidth::W16 then
+        a64_ldrh(&mut ctx.text, d, ab, off as u32)
+        if extension == Extension::Sign then
+          a64_lsl(&mut ctx.text, d, d, 48)
+          a64_mov_ri(&mut ctx.text, A64::X15, 48)
+          a64_asr_rrr(&mut ctx.text, d, d, A64::X15)
+        end
+      when MemWidth::W32 then
+        a64_ldr_w(&mut ctx.text, d, ab, off as u32)
+        if extension == Extension::Sign then
+          a64_sxtw(&mut ctx.text, d, d)
+        end
+      when MemWidth::W64 then
+        a64_ldr(&mut ctx.text, d, ab, off as u32)
+      end
+    when _ then panic("emit_load_mem_sized: mixed architectures")
+    end
+  end
+end
+
+# STORE the low `width` bytes of `src` into [addr + offset].
+def emit_store_mem_sized(ctx: &mut CodegenCtx, addr: PhysReg, offset: i32, src: PhysReg, width: MemWidth) -> Unit
+  match addr
+  when PhysReg::X64Reg(b) then
+    match src
+    when PhysReg::X64Reg(s) then
+      match width
+      when MemWidth::W8 then x64_mov_m8_r8(&mut ctx.text, b, offset, s)
+      when MemWidth::W16 then x64_mov_m16_r16(&mut ctx.text, b, offset, s)
+      when MemWidth::W32 then x64_mov_m32_r32(&mut ctx.text, b, offset, s)
+      when MemWidth::W64 then x64_mov_mr(&mut ctx.text, b, offset, s)
+      end
+    when _ then panic("emit_store_mem_sized: mixed architectures")
+    end
+  when PhysReg::A64Reg(b) then
+    match src
+    when PhysReg::A64Reg(s) then
+      mut ab = b
+      mut off = offset
+      if off != 0 then
+        let raw = off as i64
+        mut ext = raw
+        if (raw & 2147483648) != 0 then
+          ext = raw | (-4294967296)
+        end
+        a64_mov_ri(&mut ctx.text, A64::X15, ext)
+        if ext < 0 then
+          a64_sub_rrr(&mut ctx.text, A64::X15, b, A64::X15)
+        else
+          a64_add_rrr(&mut ctx.text, A64::X15, b, A64::X15)
+        end
+        ab = A64::X15
+        off = 0
+      end
+      match width
+      when MemWidth::W8 then a64_strb(&mut ctx.text, s, ab, off as u32)
+      when MemWidth::W16 then a64_strh(&mut ctx.text, s, ab, off as u32)
+      when MemWidth::W32 then a64_str_w(&mut ctx.text, s, ab, off as u32)
+      when MemWidth::W64 then a64_str(&mut ctx.text, s, ab, off as u32)
+      end
+    when _ then panic("emit_store_mem_sized: mixed architectures")
+    end
+  end
+end
+
 # Frame pointer register
 def fp_reg(arch: Arch) -> PhysReg
   match arch
@@ -2632,6 +2819,29 @@ def projection_is_field(proj: &Projection) -> Bool
   end
 end
 
+# Storage size of a scalar type in bytes (1/2/4/8), matching storage_width_of.
+def storage_size_bytes(ty: &Type) -> Int
+  match ty
+  when Type::Bool then 1
+  when Type::I8 then 1
+  when Type::U8 then 1
+  when Type::I16 then 2
+  when Type::U16 then 2
+  when Type::I32 then 4
+  when Type::U32 then 4
+  when Type::F32 then 4
+  when Type::Char then 4
+  when Type::I64 then 8
+  when Type::U64 then 8
+  when Type::Int then 8
+  when Type::UInt then 8
+  when Type::ISize then 8
+  when Type::USize then 8
+  when Type::F64 then 8
+  when _ then 8
+  end
+end
+
 def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, projs: &Vec[Projection], reg: PhysReg) -> Unit
   let scratch = ret_reg(ctx.target.arch)  # use return reg as scratch for index loads
   mut current_ty = local_type(fctx, place.local.id)
@@ -2661,8 +2871,11 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       current_ty = project_deref_type(&current_ty)
     when Projection::ProjField(name, idx) then
       let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
-      emit_load_mem(ctx, reg, reg, offset as i32)
-      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+      let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+      let fwidth = storage_width_of(&field_ty)
+      let fext = storage_signedness_of(&field_ty)
+      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjIndex(local_id) then
       if is_heap_collection_type(ctx, &current_ty) then
@@ -2671,10 +2884,30 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       let idx_reg = scratch2_reg(ctx.target.arch)
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
       # Determine element size from the collection type.
-      # Strings use 1-byte characters; everything else uses 8-byte pointers/ints.
+      let elem_ty = project_index_type(ctx, &current_ty)
+      let elem_size = storage_size_bytes(&elem_ty)
       let is_byte_indexed = is_string_like_type(&current_ty)
-      if !is_byte_indexed then
-        # Multiply index by element size (8) using shift left 3
+      if !is_byte_indexed && elem_size != 8 then
+        # Scale index by the actual element storage size.
+        match elem_size
+        when 1 then ()
+        when 2 then
+          match idx_reg
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 1)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 1)
+          end
+        when 4 then
+          match idx_reg
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 2)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 2)
+          end
+        when _ then
+          match idx_reg
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+          end
+        end
+      elsif !is_byte_indexed then
         match idx_reg
         when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
         when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
@@ -2683,32 +2916,37 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       # Add scaled offset to base address
       emit_add_rrr(ctx, reg, reg, idx_reg)
       if is_byte_indexed then
-        # Load a single byte (zero-extended to register)
         match reg
         when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
-        when PhysReg::X64Reg(_) then emit_load_mem(ctx, reg, reg, 0)  # TODO: x86 MOVZX byte
+        when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
         end
       else
-        emit_load_mem(ctx, reg, reg, 0)
+        let ewidth = storage_width_of(&elem_ty)
+        let eext = storage_signedness_of(&elem_ty)
+        emit_load_mem_sized(ctx, reg, reg, 0, ewidth, eext)
       end
-      current_ty = project_index_type(ctx, &current_ty)
+      current_ty = elem_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjConstantIndex(ci) then
       if is_heap_collection_type(ctx, &current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
       end
       let is_byte_indexed = is_string_like_type(&current_ty)
+      let elem_ty2 = project_index_type(ctx, &current_ty)
+      let elem_size2 = storage_size_bytes(&elem_ty2)
       if is_byte_indexed then
         emit_add_ri(ctx, reg, ci as i32)
         match reg
         when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
-        when PhysReg::X64Reg(_) then emit_load_mem(ctx, reg, reg, 0)  # TODO: x86 MOVZX byte
+        when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
         end
       else
-        let offset = ci * 8
-        emit_load_mem(ctx, reg, reg, offset as i32)
+        let offset = ci * elem_size2
+        let ewidth2 = storage_width_of(&elem_ty2)
+        let eext2 = storage_signedness_of(&elem_ty2)
+        emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
       end
-      current_ty = project_index_type(ctx, &current_ty)
+      current_ty = elem_ty2
       last_deref_unwrapped_ref = false
     when Projection::ProjDowncast(name, disc) then
       downcast_disc = disc
@@ -2912,25 +3150,48 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
           emit_load_mem(ctx, base, base, 0)
         end
         load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
-        match scratch
-        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
-        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+        let idx_elem_ty = project_index_type(ctx, &current_ty)
+        let idx_elem_size = storage_size_bytes(&idx_elem_ty)
+        match idx_elem_size
+        when 1 then ()
+        when 2 then
+          match scratch
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 1)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 1)
+          end
+        when 4 then
+          match scratch
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 2)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 2)
+          end
+        when _ then
+          match scratch
+          when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
+          when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+          end
         end
         emit_add_rrr(ctx, base, base, scratch)
         store_off = 0
+        current_ty = idx_elem_ty
       when Projection::ProjConstantIndex(ci) then
         if is_heap_collection_type(ctx, &current_ty) then
           emit_load_mem(ctx, base, base, 0)
         end
-        store_off = (ci * 8) as i32
+        let celem_ty = project_index_type(ctx, &current_ty)
+        store_off = (ci * storage_size_bytes(&celem_ty)) as i32
+        current_ty = celem_ty
       when Projection::ProjDowncast(_, _) then
         store_off = 8
+        current_ty = Type::Int
       when _ then
         store_off = 0
       end
 
       emit_pop(ctx, src)  # restore value
-      emit_store_mem(ctx, base, store_off, src)
+      # Store exactly the final projected value's storage width so a narrow
+      # field/element is never overwritten by an 8-byte write.
+      let final_store_width = storage_width_of(&current_ty)
+      emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
     end
   when Option::None then
     panic("store_place: unknown local " + place.local.id.to_string())
@@ -3195,10 +3456,13 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
         emit_lea_label(ctx, scratch, name.clone())
       end
     end
-    # Store element for each repetition at dst + i * 8
+    # Store element for each repetition at dst + i * element_size
+    let repeat_ty = operand_type(ctx, fctx, &operand)
+    let repeat_width = storage_width_of(&repeat_ty)
+    let repeat_stride = storage_size_bytes(&repeat_ty)
     mut i: UInt = 0
     while i < count do
-      emit_store_mem(ctx, dst, (i * 8) as i32, scratch)
+      emit_store_mem_sized(ctx, dst, (i as Int * repeat_stride) as i32, scratch, repeat_width)
       i = i + 1
     end
 
@@ -3807,7 +4071,10 @@ def emit_store_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Plac
     emit_push(ctx, src)
     emit_place_address(ctx, fctx, place, base)
     emit_pop(ctx, src)
-    emit_store_mem(ctx, base, 0, src)
+    # Store exactly the place's final storage width.
+    let pty = place_type(ctx, fctx, place)
+    let pwidth = storage_width_of(&pty)
+    emit_store_mem_sized(ctx, base, 0, src, pwidth)
   end
 end
 
@@ -3964,7 +4231,11 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
     else
       panic("codegen_aggregate: no layout for concrete aggregate of type " + type_id.to_string())
     end
-    emit_store_mem(ctx, dst, field_off as i32, scratch)
+    # Store exactly the field's storage width so adjacent narrow fields are not
+    # corrupted by an 8-byte write.
+    let field_ty = operand_type(ctx, fctx, &operands[i])
+    let field_width = storage_width_of(&field_ty)
+    emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
     i = i + 1
   end
   emit_load_mem(ctx, dst, sp, 0)
@@ -4078,9 +4349,12 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
     when MirRvalueKind::MirRepeat(ref operand, count) then
       let scratch = ret_reg(ctx.target.arch)
       load_operand_rvalue_item(ctx, fctx, operand, scratch)
+      let rpty = operand_type(ctx, fctx, operand)
+      let rpwidth = storage_width_of(&rpty)
+      let rpstride = storage_size_bytes(&rpty)
       mut i: UInt = 0
       while i < count do
-        emit_store_mem(ctx, rr, (i * 8) as i32, scratch)
+        emit_store_mem_sized(ctx, rr, (i as Int * rpstride) as i32, scratch, rpwidth)
         i = i + 1
       end
 
@@ -5701,6 +5975,31 @@ def clone_static_init_operand(st: &MirStatic) -> Option[MirOperand]
   end
 end
 
+# Emit a scalar integer constant into a buffer at exactly its storage width
+# (1/2/4/8 bytes). Used by statics, constant globals and any scalar image that
+# must match the layout engine's storage record rather than an 8-byte slot.
+def emit_scalar_constant_for_storage(buf: &mut CodeBuffer, value: i64, width: Int) -> Unit
+  match width
+  when 1 then emit8(buf, (value & 255) as u8)
+  when 2 then emit16_le(buf, (value & 65535) as u16)
+  when 4 then emit32_le(buf, (value & 4294967295) as u32)
+  when _ then emit64_le(buf, value as u64)
+  end
+end
+
+def emit_static_initializer_scalar(op: &MirOperand, buf: &mut CodeBuffer, st_ty: &Type) -> Unit
+  match &op.kind
+  when MirOperandKind::MirConstant(cst) then
+    match &cst.kind
+    when MirConstantKind::MirInt(v) then
+      let w = storage_size_bytes(st_ty)
+      emit_scalar_constant_for_storage(buf, v, w)
+    when _ then ()
+    end
+  when _ then ()
+  end
+end
+
 def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
   let sz = type_size(&st.ty, &ctx.type_layout)
   let init_opt = clone_static_init_operand(st)
@@ -5763,9 +6062,9 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
     when MirOperandKind::MirConstant(cst) then
       match &cst.kind
       when MirConstantKind::MirInt(v) then
-        emit64_le(&mut ctx.data, v as u64)
+        emit_scalar_constant_for_storage(&mut ctx.data, v, storage_size_bytes(&st.ty))
         # Pad remaining bytes to fill the full type size
-        mut emitted = 8
+        mut emitted = storage_size_bytes(&st.ty)
         while emitted < sz do
           emit8(&mut ctx.data, 0)
           emitted = emitted + 1
