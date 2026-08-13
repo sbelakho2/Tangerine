@@ -22,7 +22,9 @@ use tg_compiler::layout_engine::{
   validate_layout, dump_layout_table, layout_align_up,
   LayoutAssertion,
   # New imports for direct layout engine queries
-  primitive_size, primitive_align
+  primitive_size, primitive_align,
+  # Single-ABI-authority queries
+  layout_of, enum_variant_field_offsets, enum_variant_field_sizes
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirBlock, MirLocal, MirStatic,
@@ -288,13 +290,19 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
       mut field_sizes = Vec::new()
       field_offsets.push(discriminant_offset(&engine, td.id.id))
       field_sizes.push(discriminant_size(&engine, td.id.id))
-      for v in variants do
+      mut vi = 0
+      for variant in variants do
+        let voffs = enum_variant_field_offsets(&engine, td.id.id, vi)
+        let vsizes = enum_variant_field_sizes(&engine, td.id.id, vi)
         mut j = 0
-        for fty in v.fields do
-          field_offsets.push(payload_offset(&engine, td.id.id) + j * 8)
-          field_sizes.push(8)
+        for fty in variant.fields do
+          let off = if j < voffs.len() then voffs[j] else payload_offset(&engine, td.id.id) end
+          let sz = if j < vsizes.len() then vsizes[j] else 8 end
+          field_offsets.push(off)
+          field_sizes.push(sz)
           j = j + 1
         end
+        vi = vi + 1
       end
       offsets_map.insert(td.id.id, field_offsets)
       sizes_map.insert(td.id.id, field_sizes)
@@ -1918,17 +1926,18 @@ end
 def resolve_field_byte_offset(ctx: &CodegenCtx, type_id: Int, idx: Int) -> Int
   match ctx.type_field_offsets.get(type_id)
   when Option::Some(offsets) then
-    if idx < offsets.len() then offsets[idx] else idx * 8 end
-  when Option::None then 
-    idx * 8
+    if idx < offsets.len() then offsets[idx] else panic("resolve_field_byte_offset: field index " + idx.to_string() + " out of range for type " + type_id.to_string()) end
+  when Option::None then
+    panic("resolve_field_byte_offset: no layout recorded for type " + type_id.to_string())
   end
 end
 
 def resolve_field_byte_size(ctx: &CodegenCtx, type_id: Int, idx: Int) -> Int
   match ctx.type_field_sizes.get(type_id)
   when Option::Some(sizes) then
-    if idx < sizes.len() then sizes[idx] else 8 end
-  when Option::None then 8
+    if idx < sizes.len() then sizes[idx] else panic("resolve_field_byte_size: field index " + idx.to_string() + " out of range for type " + type_id.to_string()) end
+  when Option::None then
+    panic("resolve_field_byte_size: no layout recorded for type " + type_id.to_string())
   end
 end
 
@@ -2058,7 +2067,7 @@ def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: I
   else if tid >= 0 then
     resolve_field_byte_offset(ctx, tid, idx)
   else
-    idx * 8
+    panic("resolve_projected_field_offset: cannot project field of non-named type")
   end
 end
 
@@ -2069,7 +2078,7 @@ def resolve_projected_field_size(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int
   else if tid >= 0 then
     resolve_field_byte_size(ctx, tid, idx)
   else
-    8
+    panic("resolve_projected_field_size: cannot project field of non-named type")
   end
 end
 
@@ -2401,34 +2410,35 @@ def normalize_enum_value_to_tag(ctx: &mut CodegenCtx, reg: PhysReg) -> Unit
   def_label(&mut ctx.text, lbl_done)
 end
 
-def enum_field_relative_offset(field_types: &Vec[Type], field_idx: Int, layout: &Map[Int, Int]) -> Int
-  mut rel = 0
-  mut i = 0
-  while i < field_types.len() do
-    let field_ty = field_types[i]
-    rel = align_up_int(rel, type_align(&field_ty))
-    if i == field_idx then return rel end
-    rel = rel + type_size(&field_ty, layout)
-    i = i + 1
-  end
-  field_idx * 8
-end
-
+# Return the payload-relative offset (0 = first payload field) of an enum
+# field, taken from the single layout authority (ctx.type_field_offsets).
 def enum_field_offset_for_discriminant(ctx: &CodegenCtx, type_id: Int, discriminant: Int, field_idx: Int) -> Int
   match lookup_type_def(ctx, type_id)
   when Option::Some(td) then
     match td.kind
     when MirTypeDefKind::Enum(variants) then
+      mut vi = 0
       for variant in variants do
         if variant.discriminant == discriminant then
-          return enum_field_relative_offset(&variant.fields, field_idx, &ctx.type_layout)
+          # Flat offset list is [tag, v0.f0..v0.fN, v1.f0..v1.fN, ...]
+          mut flat = 1
+          mut pi = 0
+          while pi < vi do
+            flat = flat + variants[pi].fields.len()
+            pi = pi + 1
+          end
+          flat = flat + field_idx
+          let abs = resolve_field_byte_offset(ctx, type_id, flat)
+          # Subtract the tag/payload-start offset to get a payload-relative value.
+          return abs - 8
         end
+        vi = vi + 1
       end
     when _ then ()
     end
   when Option::None then ()
   end
-  field_idx * 8
+  panic("enum_field_offset_for_discriminant: no variant " + discriminant.to_string() + " in type " + type_id.to_string())
 end
 
 def emit_enum_eq_loaded(ctx: &mut CodegenCtx, type_id: Int, dst: PhysReg, scratch: PhysReg) -> Unit
@@ -2524,7 +2534,7 @@ def emit_enum_eq_helper_body(ctx: &mut CodegenCtx, type_id: Int) -> Unit
 
             mut field_idx = 0
             for field_ty in variant.fields do
-              let field_off = 8 + enum_field_relative_offset(&variant.fields, field_idx, &ctx.type_layout)
+              let field_off = 8 + enum_field_offset_for_discriminant(ctx, type_id, variant.discriminant, field_idx)
               emit_load_mem(ctx, dst, fp, saved_left_offset)
               emit_load_mem(ctx, scratch, fp, saved_right_offset)
               emit_load_mem(ctx, dst, dst, field_off as i32)
@@ -3891,8 +3901,8 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
   # Calculate total size
   let total_size = if has_layout then
     match ctx.type_layout.get(type_id)
-    when Option::Some(sz) then if sz > 0 then sz else operands.len() * 8 end
-    when Option::None then operands.len() * 8
+    when Option::Some(sz) then sz
+    when Option::None then panic("codegen_aggregate: no size recorded for type " + type_id.to_string())
     end
   else
     operands.len() * 8
@@ -3932,15 +3942,17 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
       # Named struct: resolve the declared offset of the field this operand names.
       # This is correct even when the literal lists fields in a different order
       # than the struct declaration (positional offsets[i] would misplace them).
+      # A missing/unknown field or a missing layout is a compiler invariant
+      # violation and must fail compilation, never fall back to `i * 8`.
       match struct_field_names
       when Option::Some(names) then
         let off = struct_field_offset_by_name(ctx, type_id, &names[i])
-        if off >= 0 then off else i * 8 end
+        if off >= 0 then off else panic("codegen_aggregate: unknown struct field '" + names[i] + "' for type " + type_id.to_string()) end
       when Option::None then
         match ctx.type_field_offsets.get(type_id)
         when Option::Some(offsets) then
-          if i < offsets.len() then offsets[i] else i * 8 end
-        when Option::None then i * 8
+          if i < offsets.len() then offsets[i] else panic("codegen_aggregate: field index " + i.to_string() + " out of range for type " + type_id.to_string()) end
+        when Option::None then panic("codegen_aggregate: no field offsets for type " + type_id.to_string())
         end
       end
     else
