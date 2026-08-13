@@ -113,6 +113,7 @@ struct CodegenCtx
   type_layout: Map[Int, Int]    # TypeId.id -> byte size
   type_field_offsets: Map[Int, Vec[Int]]  # TypeId.id -> per-field byte offsets
   type_field_sizes: Map[Int, Vec[Int]]    # TypeId.id -> per-field byte sizes
+  enum_payload_offsets: Map[Int, Int]     # TypeId.id -> enum payload base offset
   type_defs: Vec[MirTypeDef]              # All type definitions for lookup
   type_def_index: Map[Int, Int]           # TypeId.id -> index in type_defs (O(1) lookup)
   extern_fns: Set[String]                 # Names of extern (FFI) functions
@@ -255,10 +256,11 @@ end
 # This ensures single source of truth for all type sizes.
 # Also computes field-level offsets and sizes in one pass to avoid
 # creating a second LayoutEngine.
-def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]])
+def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]], Map[Int, Int])
   mut layout: Map[Int, Int] = Map::new()
   mut offsets_map: Map[Int, Vec[Int]] = Map::new()
   mut sizes_map: Map[Int, Vec[Int]] = Map::new()
+  mut payload_map: Map[Int, Int] = Map::new()
   
   # Create a layout engine for the target — ONE engine for everything
   let layout_target = match target.arch
@@ -298,6 +300,7 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
       mut field_sizes = Vec::new()
       field_offsets.push(discriminant_offset(&engine, td.id.id))
       field_sizes.push(discriminant_size(&engine, td.id.id))
+      payload_map.insert(td.id.id, payload_offset(&engine, td.id.id))
       mut vi = 0
       for variant in variants do
         let voffs = enum_variant_field_offsets(&engine, td.id.id, vi)
@@ -317,7 +320,7 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
     end
   end
 
-  (layout, offsets_map, sizes_map)
+  (layout, offsets_map, sizes_map, payload_map)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -758,6 +761,7 @@ def codegen_new(target: &AsmTarget) -> CodegenCtx
     type_layout: Map::new(),
     type_field_offsets: Map::new(),
     type_field_sizes: Map::new(),
+    enum_payload_offsets: Map::new(),
     type_defs: Vec::new(),
     type_def_index: Map::new(),
     extern_fns: Set::new(),
@@ -2626,7 +2630,12 @@ def enum_field_offset_for_discriminant(ctx: &CodegenCtx, type_id: Int, discrimin
           flat = flat + field_idx
           let abs = resolve_field_byte_offset(ctx, type_id, flat)
           # Subtract the tag/payload-start offset to get a payload-relative value.
-          return abs - 8
+          # The payload base comes from the layout engine, never a hardcoded 8.
+          let pbase = match ctx.enum_payload_offsets.get(type_id)
+          when Option::Some(o) then o
+          when Option::None then 8
+          end
+          return abs - pbase
         end
         vi = vi + 1
       end
@@ -8909,15 +8918,17 @@ end
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, String]
   # Build type layout map and field layouts from MIR type definitions (single LayoutEngine pass)
-  let (type_layout, field_offsets, field_sizes) = build_all_layouts(&program.types, &ctx.target)
+  let (type_layout, field_offsets, field_sizes, payload_offsets) = build_all_layouts(&program.types, &ctx.target)
   ctx.type_layout = type_layout
   ctx.type_field_offsets = field_offsets
   ctx.type_field_sizes = field_sizes
+  ctx.enum_payload_offsets = payload_offsets
   ctx.type_defs = program.types.clone()
-  # Reference the MIR functions/statics directly for all codegen passes in this routine.
-  # program is an immutable borrow and is never mutated here, so a borrow is both
-  # safe and avoids a whole-MirFunction deep clone (which miscompiles in this build,
-  # corrupting fields like ret_type for some functions, e.g. default_options).
+  # Reference the MIR functions/statics directly for all codegen passes in this
+  # routine. program is an immutable borrow and is never mutated here, so a
+  # borrow is both safe and avoids an unnecessary whole-MirFunction deep clone.
+  # Whole-aggregate copy/clone semantics (including MirFunction-shaped records
+  # with adjacent Bool fields) are covered by tests/canary/test_canary_aggregate_copy.tg.
   let functions = &program.functions
   let statics = &program.statics
 
@@ -9248,9 +9259,13 @@ end
 # Public API — Full pipeline: MIR → native binary
 # ———————————————————————————————————————————————————————————————
 
-def generate_native(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
+def generate_native(program: &MirProgram, target: &AsmTarget) -> Result[Vec[u8], String]
   mut ctx = codegen_new(target)
-  codegen_program(&mut ctx, program)
+  match codegen_program(&mut ctx, program)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("codegen failed: " + e)
+  end
 
   # Reserve 16 bytes in .data for saved argc/argv so the runtime can
   # read them via tg_get_argc / tg_get_argv after the entry point
@@ -9340,7 +9355,8 @@ def generate_native(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
     strings: Map::new()
   }
 
-  build_object(&obj)
+  let obj_bytes = build_object(&obj)
+  Result::Ok(obj_bytes)
 end
 
 def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: String) -> Result[Unit, String]
@@ -9458,7 +9474,7 @@ def generate_executable(program: &MirProgram, target: &AsmTarget, output_path: S
   link_result
 end
 
-def generate_object_file(program: &MirProgram, target: &AsmTarget) -> Vec[u8]
+def generate_object_file(program: &MirProgram, target: &AsmTarget) -> Result[Vec[u8], String]
   generate_native(program, target)
 end
 
