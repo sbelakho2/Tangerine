@@ -407,6 +407,7 @@ run_canary_files() {
 run_critical_canaries() {
   run_canary_files "$1" "$2" \
     tests/canary/test_canary_narrow_storage.tg \
+    tests/canary/test_canary_aggregate_copy.tg \
     tests/canary/test_canary_bump_alloc_boundary.tg \
     tests/canary/test_canary_large_vec_write.tg \
     tests/canary/test_canary_struct_field_order.tg \

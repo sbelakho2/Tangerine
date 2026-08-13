@@ -42,6 +42,18 @@ public struct BootstrapProfile {
             reason: "File reading, stdout/stderr — compiler I/O for source loading and output"),
         ProfileEntry(file: "taint.tg",
             reason: "Taint tracking types (Tainted, TaintLabel) used by ffi.tg for safe FFI interop"),
+        ProfileEntry(file: "args.tg",
+            reason: "Command-line argument parsing used by driver.tg"),
+        ProfileEntry(file: "env.tg",
+            reason: "Environment access used by driver.tg"),
+        ProfileEntry(file: "bench.tg",
+            reason: "Benchmark harness imported by driver.tg"),
+        ProfileEntry(file: "process.tg",
+            reason: "Subprocess/command execution (codesign) used by linker.tg"),
+        ProfileEntry(file: "gfx_errors.tg",
+            reason: "Error types imported by fs.tg"),
+        ProfileEntry(file: "time.tg",
+            reason: "Timing types imported by bench.tg"),
     ]
 
     /// File names in the minimal bootstrap profile.
