@@ -23,7 +23,7 @@ use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
   Program, AstPath, TypeExpr, TypeExprKind,
   MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
-  FnBody, FunctionDecl, PatternKind, type_expr_name,
+  FnBody, FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, PatternKind, type_expr_name,
   make_block, make_stmt, make_expr, make_pattern, make_path
 }
 use tg_compiler::parser::{parse, diag_has_errors}
@@ -39,6 +39,7 @@ use tg_compiler::version::{VERSION}
 
 # Raw write syscall wrapper (needed for eprint before I/O subsystem is initialized)
 extern def libc_write(fd: Int, buf: &u8, count: UInt) -> Int
+extern def libc_system(cmd: String) -> Int
 extern def strdup(s: &u8) -> String
 extern def read_file_to_string_native(path: String) -> String
 def syscall_write(fd: Int, buf: &u8, count: UInt) -> Int
@@ -3144,7 +3145,7 @@ def execute_binary(path: String) -> Int
   # Execute the compiled binary using libc system() call.
   # Returns the exit code from the executed program.
   unsafe "FFI system call" do
-    let exit_code = std::ffi::system(path.as_ptr())
+    let exit_code = libc_system(path.clone())
     # system() returns -1 on error, otherwise the exit status
     if exit_code < 0 then
       1
@@ -5511,7 +5512,11 @@ def agent_check(argv: Vec[String]) -> Int
       for contract in f.contracts do
         contract_count = contract_count + 1
         # Verify contract is well-formed (condition references in-scope names)
-        println("  [" + contract.kind.to_string() + "] " + f.name.clone() + ": " + contract.condition_source.clone())
+        let cond_note = match contract.message
+        when Option::Some(m) then m.clone()
+        when Option::None then "(no message)"
+        end
+        println("  [" + contract.kind.to_string() + "] " + f.name.clone() + ": " + cond_note)
       end
     when _ then ()
     end
@@ -5952,7 +5957,7 @@ def bindgen_c(source_file: String, output: String) -> Int
   end
 end
 
-def is_ffi_exported(f: &FunctionDecl, annotations: &Vec[Annotation]) -> Bool
+def is_ffi_exported(f: &FunctionDecl, annotations: &Vec[Attribute]) -> Bool
   # Check if function has extern "C" abi or has #[export] annotation
   annotations.iter().any(|a| a.name == "export")
 end
@@ -5990,7 +5995,7 @@ def generate_c_prototype(f: &FunctionDecl) -> String
   ret_type + " " + f.name.clone() + "(" + params + ");"
 end
 
-def generate_c_struct(s: &Struct) -> String
+def generate_c_struct(s: &StructDecl) -> String
   mut result = "typedef struct {\n"
   for field in s.fields do
     result = result + "    " + tangerine_type_expr_to_c(&field.ty) + " " + field.name.clone() + ";\n"
@@ -5999,7 +6004,7 @@ def generate_c_struct(s: &Struct) -> String
   result
 end
 
-def generate_c_enum(e: &Enum) -> String
+def generate_c_enum(e: &EnumDecl) -> String
   mut result = "typedef enum {\n"
   mut val = 0
   for variant in e.variants do
@@ -6485,10 +6490,11 @@ def abi_dump(argv: Vec[String]) -> Int
   end
 
   let tokens = tokenize(source)
-  let (ast, parse_diags) = parse(tokens)
-  if diag_has_errors(&parse_diags) then
+  let parse_output = parse(tokens)
+  if diag_has_errors(&parse_output.diagnostics) then
     return 1
   end
+  let ast = parse_output.program
 
   println("Type layouts for " + file + ":")
   println("==============================")
@@ -6501,8 +6507,8 @@ def abi_dump(argv: Vec[String]) -> Int
       println("struct " + s.name.clone() + " {")
       mut offset = 0
       for field in s.fields do
-        let sz = type_size(&field.ty, &empty_layout)
-        let al = type_align(&field.ty)
+        let sz = type_expr_size(&field.ty)
+        let al = type_expr_align(&field.ty)
         # Compute padding
         let padding = if offset % al != 0 then al - (offset % al) else 0 end
         offset = offset + padding
@@ -6530,7 +6536,52 @@ def abi_dump(argv: Vec[String]) -> Int
   0
 end
 
-def max_field_align(fields: &Vec[Field]) -> Int
+def type_expr_size(ty: &TypeExpr) -> Int
+  match ty.kind
+  when TypeExprKind::Unit then 1
+  when TypeExprKind::Never then 1
+  when TypeExprKind::Named(name, _) then
+    if name == "Bool" || name == "u8" || name == "i8" || name == "char" then 1
+    elsif name == "u16" || name == "i16" then 2
+    elsif name == "u32" || name == "i32" || name == "Float" || name == "float" || name == "f32" then 4
+    elsif name == "u64" || name == "i64" || name == "USize" || name == "ISize" then 8
+    else 8
+    end
+  when TypeExprKind::Tuple(parts) then
+    mut total = 0
+    mut max_al = 1
+    for p2 in parts do
+      let sz2 = type_expr_size(&p2)
+      let al2 = type_expr_align(&p2)
+      let pad = if total % al2 != 0 then al2 - (total % al2) else 0 end
+      total = total + pad + sz2
+      if al2 > max_al then max_al = al2 end
+    end
+    let final_pad = if total % max_al != 0 then max_al - (total % max_al) else 0 end
+    total + final_pad
+  when TypeExprKind::Array(elem, _) then
+    let esz = type_expr_size(&elem)
+    if esz > 0 then esz * 4 else 8 end
+  when TypeExprKind::Slice(_) then 16
+  when TypeExprKind::Ref(_) then 8
+  when TypeExprKind::RefMut(_) then 8
+  when TypeExprKind::Ptr(_) then 8
+  when TypeExprKind::PtrMut(_) then 8
+  when TypeExprKind::Fn(_, _) then 8
+  when _ then 8
+  end
+end
+
+def type_expr_align(ty: &TypeExpr) -> Int
+  let sz = type_expr_size(ty)
+  if sz == 1 then 1
+  elsif sz == 2 then 2
+  elsif sz <= 4 then 4
+  else 8
+  end
+end
+
+def max_field_align(fields: &Vec[FieldDecl]) -> Int
   mut max_al = 1
   for f in fields do
     let al = type_align(&f.ty)

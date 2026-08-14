@@ -1865,10 +1865,9 @@ def occurs_check_with_depth(env: &mut TypeEnv, id: TypeVarId, ty: Type, depth: I
   end
 end
 
+
 def type_add_error(env: &mut TypeEnv, msg: String, span: Span) -> Unit
   env.errors.push(TypeError { message: msg, span: span, code: Option::None })
-
-
 
 
 
@@ -2559,7 +2558,26 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
   when StmtKind::StmtFor(for_stmt) then
     push_scope(env)
     let iter_type = check_expr(env, &for_stmt.iter)
-    let elem_type = fresh_type_var(env)
+    # The element type comes from the collection being iterated, so `for f in
+    # program.functions` binds f to MirFunction (not a fresh var that poisons
+    # every use of f with inference variables).
+    let elem_type = match iter_type
+    when Type::Slice(e) then e
+    when Type::Array(e, _) then e
+    when Type::String then Type::Char
+    when Type::Named(tid, args) then
+      # Vec is a Named typedef (Vec[T]); its element is the first type arg.
+      # Map is a Named typedef (Map[K, V]); iterating it yields (K, V) pairs.
+      match get_type_by_id(env, tid)
+      when Option::Some(td) then
+        if td.name == "Vec" && args.len() >= 1 then args[0].clone()
+        elsif td.name == "Map" && args.len() >= 2 then Type::Tuple([args[0].clone(), args[1].clone()])
+        else fresh_type_var(env)
+        end
+      when Option::None then fresh_type_var(env)
+      end
+    when _ then fresh_type_var(env)
+    end
     check_pattern(env, &for_stmt.pattern, elem_type)
     check_block(env, &for_stmt.body, false)
     pop_scope(env)
@@ -2583,12 +2601,12 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
   when StmtKind::StmtMatch(m) then
     check_match(env, &m, true)
   when StmtKind::StmtUnsafe(_, body) then
-    check_block(env, &body, false)
+    check_block(env, &body, true)
   when StmtKind::StmtDefer(body) then
     check_block(env, &body, false)
     Type::Unit
   when StmtKind::StmtTry(body, catches, finally_block) then
-    let body_type = check_block(env, &body, false)
+    let body_type = check_block(env, &body, true)
     mut i = 0
     while i < catches.len() do
       let c = &catches[i]
@@ -2828,17 +2846,30 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
+  # Patterns match through references (e.g. `let (a, b) = &pair` where the
+  # scrutinee is a reference to a tuple).
+  let expected_base = match expected
+  when Type::Ref(inner, _) then inner
+  when Type::RefMut(inner, _) then inner
+  when Type::Box(inner) then inner
+  when Type::Owned(inner) then inner
+  when _ then expected
+  end
   match pat.kind
   when PatternKind::Wildcard then
     ()
+  when PatternKind::Ref(inner) then
+    # `&x` / `ref x` patterns bind the inner pattern (the scrutinee's
+    # reference is already handled by expected_base deref above).
+    check_pattern(env, &inner, expected_base)
   when PatternKind::Ident(name, is_mut) then
-    bind_var(env, name, expected)
+    bind_var(env, name, expected_base)
   when PatternKind::Literal(expr) then
     let lit_type = check_expr(env, &expr)
-    unify(env, lit_type, expected, pat.span)
+    unify(env, lit_type, expected_base, pat.span)
     ()
   when PatternKind::Tuple(pats) then
-    match expected
+    match expected_base
     when Type::Tuple(types) then
       if pats.len() == types.len() then
         mut i = 0
@@ -2858,7 +2889,19 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
         types.push(t)
         i = i + 1
       end
-      unify(env, expected, Type::Tuple(types), pat.span)
+      unify(env, expected_base, Type::Tuple(types), pat.span)
+      ()
+    when Type::Param(_) then
+      # Generic parameter standing in for a tuple (e.g. Option::Some's payload)
+      mut types = Vec::new()
+      mut i = 0
+      while i < pats.len() do
+        let t = fresh_type_var(env)
+        check_pattern(env, &pats[i], t)
+        types.push(t)
+        i = i + 1
+      end
+      unify(env, expected_base, Type::Tuple(types), pat.span)
       ()
     when _ then
       type_add_error(env, "expected tuple type", pat.span)
@@ -2896,7 +2939,8 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
             # Check each sub-pattern against the variant's field types
             mut fi = 0
             while fi < pats.len() && fi < v.fields.len() do
-              check_pattern(env, &pats[fi], v.fields[fi].clone())
+              let field_ty = subst_type_args(&v.fields[fi], &td.generic_params, &enum_type_args)
+              check_pattern(env, &pats[fi], field_ty)
               fi = fi + 1
             end
           end
@@ -3080,7 +3124,13 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
             field_types.push(subst_type_args(&variant.fields[fi], &enum_td.generic_params, &enum_type_args))
             fi = fi + 1
           end
-          Type::Function(field_types, enum_type)
+          # A bare field-less variant in value position (e.g. `x: None`) is the
+          # enum value itself; variants with fields yield constructor functions.
+          if variant.fields.len() == 0 then
+            enum_type
+          else
+            Type::Function(field_types, enum_type)
+          end
         when Option::None then
           # Unknown identifier — return fresh type var instead of erroring.
           # This handles function references from other modules, enum variant
@@ -3140,8 +3190,42 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::ExprIndex(recv, index) then
     let recv_type = check_expr(env, &recv)
     let index_type = check_expr(env, &index)
-    unify(env, index_type, Type::Int, index.span)
-    fresh_type_var(env)
+    match recv_type
+    when Type::Array(elem, _) then
+      unify(env, index_type, Type::Int, index.span)
+      elem
+    when Type::Slice(elem) then
+      unify(env, index_type, Type::Int, index.span)
+      elem
+    when Type::String then
+      unify(env, index_type, Type::Int, index.span)
+      Type::Char
+    when Type::Map(k, v) then
+      # Map[K, V] indexing (normalized form): key type K, result V
+      unify(env, index_type, k, index.span)
+      v
+    when Type::Set(elem) then
+      unify(env, index_type, elem, index.span)
+      Type::Bool
+    when Type::Named(tid, args) then
+      # Map[K, V] indexing in Named form: key type K, result V
+      match get_type_by_id(env, tid)
+      when Option::Some(td) then
+        if td.name == "Map" && args.len() >= 2 then
+          unify(env, index_type, args[0].clone(), index.span)
+          args[1].clone()
+        else
+          unify(env, index_type, Type::Int, index.span)
+          fresh_type_var(env)
+        end
+      when Option::None then
+        unify(env, index_type, Type::Int, index.span)
+        fresh_type_var(env)
+      end
+    when _ then
+      unify(env, index_type, Type::Int, index.span)
+      fresh_type_var(env)
+    end
   when ExprKind::ExprRef(inner) then
     let inner_type = check_expr(env, &inner)
     Type::Ref(inner_type, env.current_lifetime)
@@ -3386,8 +3470,11 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
     when Option::None then fresh_type_var(env)
     end
   when Type::Tuple(fields) then
-    # Tuple field access by numeric index (e.g., .0, .1)
-    match field.parse_int()
+    # Tuple field access by numeric index (e.g., .0, .1); map entries also
+    # support .key/.value as aliases for .0/.1.
+    let field_idx = if field == "key" then "0" else field end
+    let field_idx2 = if field == "value" then "1" else field_idx end
+    match field_idx2.parse_int()
     when Result::Ok(idx) then
       if idx >= 0 && idx < fields.len() then
         fields[idx].clone()
