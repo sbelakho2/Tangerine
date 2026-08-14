@@ -423,6 +423,7 @@ public final class MIRInterpreter {
         }
 
         let result = callFunction(fn, args: [])
+        dumpCallProfileIfRequested()
         if let runtimeError {
             var finalOutput = output
             if finalOutput.last != runtimeError {
@@ -439,6 +440,23 @@ public final class MIRInterpreter {
             return InterpreterResult(exitCode: 1, output: finalOutput, trace: trace, returnValue: result)
         }
         return InterpreterResult(exitCode: 0, output: output, trace: trace, returnValue: result)
+    }
+
+    private func dumpCallProfileIfRequested() {
+        guard ProcessInfo.processInfo.environment["TG_INTERPRETER_CALL_PROFILE"] != nil else { return }
+        var entries: [(idx: Int, name: String, count: Int)] = []
+        for (i, fn) in program.functions.enumerated() {
+            let count = callProfileArray[i]
+            if count > 0 {
+                entries.append((i, fn.name, count))
+            }
+        }
+        entries.sort { $0.count > $1.count }
+        var lines = ["=== TG_INTERPRETER_CALL_PROFILE ==="]
+        for e in entries.prefix(60) {
+            lines.append(String(format: "%10d %@", e.count, e.name))
+        }
+        FileHandle.standardError.write((lines.joined(separator: "\n") + "\n").data(using: .utf8)!)
     }
 
     public struct InterpreterResult {
