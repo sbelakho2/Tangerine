@@ -271,11 +271,15 @@ public enum FormVerifier {
         case .ret: return []
         case .switchInt(_, let targets, let otherwise):
             return targets.map { $0.1 } + [otherwise]
-        case .call(_, _, _, let next, let unwind):
+        case .call(_, _, _, _, let next, let unwind):
             var s = [next]
             if let u = unwind { s.append(u) }
             return s
         case .drop(_, let next, let unwind):
+            var s = [next]
+            if let u = unwind { s.append(u) }
+            return s
+        case .`deinit`(_, let next, let unwind):
             var s = [next]
             if let u = unwind { s.append(u) }
             return s

@@ -877,15 +877,18 @@ struct TangerineCLI {
             return terminator
         case .switchInt(let operand, let targets, let otherwise):
             return .switchInt(rewrite(operand, moduleName: moduleName, catalog: catalog), targets: targets, otherwise: otherwise)
-        case .call(let dest, let callee, let args, let next, let unwind):
+        case .call(let dest, let callee, let args, let argEffects, let next, let unwind):
             return .call(
                 dest: dest,
                 callee: rewrite(callee, moduleName: moduleName, catalog: catalog),
                 args: args.map { rewrite($0, moduleName: moduleName, catalog: catalog) },
+                argEffects: argEffects,
                 next: next,
                 unwind: unwind
             )
         case .drop:
+            return terminator
+        case .`deinit`:
             return terminator
         case .assert(let operand, let expected, let message, let target):
             return .assert(rewrite(operand, moduleName: moduleName, catalog: catalog), expected: expected, message: message, target: target)
@@ -913,7 +916,7 @@ struct TangerineCLI {
 
     private static func rewrite(_ operand: MirOperand, moduleName: String, catalog: FunctionCatalog) -> MirOperand {
         switch operand {
-        case .copy, .move:
+        case .copy, .move, .read, .consume:
             return operand
         case .constant(let constant):
             return .constant(rewrite(constant, moduleName: moduleName, catalog: catalog))

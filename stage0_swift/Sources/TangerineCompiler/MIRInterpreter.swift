@@ -337,7 +337,7 @@ public final class MIRInterpreter {
         guard case .structVal(_, let opFields) = op,
               case .enumVal(_, let kindIdx, let payload) = opFields["kind"] else { return false }
         if kindIdx == 2 { return true } // MirConstant — always valid
-        guard kindIdx == 0 || kindIdx == 1, // MirCopy or MirMovePlace
+        guard kindIdx == 0 || kindIdx == 1 || kindIdx == 3 || kindIdx == 4, // MirCopy, MirMovePlace, MirRead, MirConsume
               case .structVal(_, let placeFields) = payload,
               case .structVal(_, let lidFields) = placeFields["local"],
               let localId = lidFields["id"]?.asInt else { return false }
@@ -552,7 +552,7 @@ public final class MIRInterpreter {
                 }
                 if let receiverPlace = { () -> MirPlace? in
                     switch callArgs[0] {
-                    case .copy(let p), .move(let p): return p
+                    case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
                     default: return nil
                     }
                 }() {
@@ -579,7 +579,7 @@ public final class MIRInterpreter {
                 guard i < lastCallMutRefMask.count, lastCallMutRefMask[i] else { continue }
                 let argPlace: MirPlace?
                 switch arg {
-                case .copy(let p), .move(let p): argPlace = p
+                case .copy(let p), .move(let p), .read(let p), .consume(let p): argPlace = p
                 default: argPlace = nil
                 }
                 if let ap = argPlace {
@@ -604,7 +604,7 @@ public final class MIRInterpreter {
         if (calleeName == ".get_mut" || calleeName == ".get") && callArgs.count >= 2 {
             let receiverPlace: MirPlace?
             switch callArgs[0] {
-            case .copy(let p), .move(let p): receiverPlace = p
+            case .copy(let p), .move(let p), .read(let p), .consume(let p): receiverPlace = p
             default: receiverPlace = nil
             }
             if let receiverPlace {
@@ -748,7 +748,7 @@ public final class MIRInterpreter {
                     callStack[frameIdx].currentBlock = otherwise
                 }
 
-            case .call(let dest, let callee, let callArgs, let next, _):
+            case .call(let dest, let callee, let callArgs, _, let next, _):
                 let calleeVal = evalOperand(callee)
                 let argVals = callArgs.map { evalOperand($0) }
 
@@ -793,7 +793,7 @@ public final class MIRInterpreter {
                             // follow mutBorrows back to the original place.
                             if let receiverPlace = { () -> MirPlace? in
                                 switch callArgs[0] {
-                                case .copy(let p), .move(let p): return p
+                                case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
                                 default: return nil
                                 }
                             }() {
@@ -826,7 +826,7 @@ public final class MIRInterpreter {
                             guard i < lastCallMutRefMask.count, lastCallMutRefMask[i] else { continue }
                             let argPlace: MirPlace?
                             switch arg {
-                            case .copy(let p), .move(let p): argPlace = p
+                            case .copy(let p), .move(let p), .read(let p), .consume(let p): argPlace = p
                             default: argPlace = nil
                             }
                             if let ap = argPlace {
@@ -874,7 +874,7 @@ public final class MIRInterpreter {
                     if callArgs.count >= 2 {
                         let receiverPlace: MirPlace?
                         switch callArgs[0] {
-                        case .copy(let p), .move(let p): receiverPlace = p
+                        case .copy(let p), .move(let p), .read(let p), .consume(let p): receiverPlace = p
                         default: receiverPlace = nil
                         }
                         if let receiverPlace {
@@ -896,6 +896,9 @@ public final class MIRInterpreter {
                 callStack[callStack.count - 1].currentBlock = target
 
             case .drop(_, let next, _):
+                callStack[callStack.count - 1].currentBlock = next
+
+            case .`deinit`(_, let next, _):
                 callStack[callStack.count - 1].currentBlock = next
 
             case .unreachable:
@@ -936,7 +939,7 @@ public final class MIRInterpreter {
                 if case .use(let operand) = rvalue {
                     let srcPlace: MirPlace?
                     switch operand {
-                    case .copy(let p), .move(let p): srcPlace = p
+                    case .copy(let p), .move(let p), .read(let p), .consume(let p): srcPlace = p
                     default: srcPlace = nil
                     }
                     if let sp = srcPlace {
@@ -1219,7 +1222,7 @@ public final class MIRInterpreter {
     @inline(__always)
     private func evalOperand(_ op: MirOperand) -> MirValue {
         switch op {
-        case .copy(let place), .move(let place):
+        case .copy(let place), .move(let place), .read(let place), .consume(let place):
             return loadPlaceValue(place)
         case .constant(let c):
             return evalConstant(c)
@@ -1822,7 +1825,7 @@ public final class MIRInterpreter {
         // Codegen helpers
         "ret_reg", "fp_reg", "place_local", "get_block", "terminator_successors",
         // MIR builder
-        "operand_copy_local", "operand_copy", "push_assign", "push_stmt",
+        "operand_copy_local", "operand_copy", "operand_read", "operand_consume", "push_assign", "push_stmt",
         // Codegen load/store and simple register/immediate helpers
         "emit_load_mem", "emit_store_mem", "emit_mov_rr", "load_constant",
         "emit_zero_reg", "emit_mov_ri", "emit_cmp_rr", "emit_cmp_ri",
@@ -3051,6 +3054,11 @@ public final class MIRInterpreter {
                         if let target = dropFields["target"] { result.append(target) }
                         if case .enumVal(_, 0, let uw) = dropFields["unwind"] { result.append(uw) }
                     }
+                case 9: // MirDeinit { place, target, unwind }
+                    if case .structVal(_, let dropFields) = kindPayload {
+                        if let target = dropFields["target"] { result.append(target) }
+                        if case .enumVal(_, 0, let uw) = dropFields["unwind"] { result.append(uw) }
+                    }
                 case 6: // MirAssert { cond, expected, msg, target, unwind }
                     if case .structVal(_, let assertFields) = kindPayload {
                         if let target = assertFields["target"] { result.append(target) }
@@ -3078,6 +3086,10 @@ public final class MIRInterpreter {
         case "operand_copy":
             // operand_copy(place: Place) → MirOperand { kind: MirCopy(place) }
             return .structVal("MirOperand", ["kind": .enumVal("MirOperandKind", 0, args[0])])
+        case "operand_read":
+            return .structVal("MirOperand", ["kind": .enumVal("MirOperandKind", 3, args[0])])
+        case "operand_consume":
+            return .structVal("MirOperand", ["kind": .enumVal("MirOperandKind", 4, args[0])])
         case "push_assign":
             // push_assign(b: &mut MirBuilder, place, rvalue, span) — inlined push_stmt
             // blocks is a Map[Int, MirBlock], backed by native MirNativeMap
@@ -3369,6 +3381,19 @@ public final class MIRInterpreter {
                         }
                     }
                 case 5: // MirDrop { place, target, unwind }
+                    if case .structVal(_, let df) = kindPayload,
+                       case .structVal(_, let pf) = df["place"],
+                       case .structVal(_, let lf) = pf["local"],
+                       let lid = lf["id"]?.asInt, validLocals.contains(.int(lid)),
+                       case .structVal(_, let tf) = df["target"],
+                       let bid = tf["id"]?.asInt, validBlocks.contains(.int(bid)) {
+                        if case .enumVal(_, 0, let uwBlock) = df["unwind"],
+                           case .structVal(_, let uwf) = uwBlock,
+                           let uwid = uwf["id"]?.asInt {
+                            if validBlocks.contains(.int(uwid)) { return .unit }
+                        } else { return .unit }
+                    }
+                case 9: // MirDeinit { place, target, unwind }
                     if case .structVal(_, let df) = kindPayload,
                        case .structVal(_, let pf) = df["place"],
                        case .structVal(_, let lf) = pf["local"],
@@ -6343,12 +6368,14 @@ public struct MIRPrettyPrinter {
         case .switchInt(let op, let targets, let otherwise):
             let arms = targets.map { "\($0.0): bb\($0.1)" }.joined(separator: ", ")
             return "switchInt(\(printOperand(op))) -> [\(arms), otherwise: bb\(otherwise)];"
-        case .call(let dest, let callee, let args, let next, let unwind):
+        case .call(let dest, let callee, let args, _, let next, let unwind):
             let argStr = args.map(printOperand).joined(separator: ", ")
             let unwindStr = unwind.map { ", unwind: bb\($0)" } ?? ""
             return "\(printPlace(dest)) = \(printOperand(callee))(\(argStr)) -> [bb\(next)\(unwindStr)];"
         case .drop(let place, let next, _):
             return "drop(\(printPlace(place))) -> bb\(next);"
+        case .`deinit`(let place, let next, _):
+            return "deinit(\(printPlace(place))) -> bb\(next);"
         case .assert(let cond, let expected, let msg, let target):
             return "assert(\(printOperand(cond)), \(expected), \"\(msg)\") -> bb\(target);"
         case .yield(let val, let resume):
@@ -6392,6 +6419,8 @@ public struct MIRPrettyPrinter {
         switch op {
         case .copy(let p): return printPlace(p)
         case .move(let p): return "move \(printPlace(p))"
+        case .read(let p): return "read \(printPlace(p))"
+        case .consume(let p): return "consume \(printPlace(p))"
         case .constant(let c): return printConstant(c)
         }
     }

@@ -36,6 +36,7 @@ public final class MIRLowering {
     // Function resolution cache: name → resolved name
     private var fnCache: [String: String] = [:]
     private var functionReturnTypes: [String: MirType] = [:]
+    private var functionParamConventions: [String: [AccessConvention]] = [:]
 
     /// Set of qualified function names whose `self` parameter is by-value (no &/&mut).
     private var methodSelfByValue: Set<String> = []
@@ -204,6 +205,7 @@ public final class MIRLowering {
             switch item.kind {
             case .function(let fn):
                 functionReturnTypes[fn.sig.name] = fn.sig.returnType.map(lowerTypeExpr) ?? .unit
+                functionParamConventions[fn.sig.name] = fn.sig.params.map { $0.convention }
             case .moduleDef(let d):
                 pushModule(d.name)
                 if let children = d.items {
@@ -215,6 +217,7 @@ public final class MIRLowering {
                 currentSelfType = d.targetType
                 for method in d.methods {
                     functionReturnTypes["\(d.targetType)::\(method.sig.name)"] = method.sig.returnType.map(lowerTypeExpr) ?? .unit
+                    functionParamConventions["\(d.targetType)::\(method.sig.name)"] = method.sig.params.map { $0.convention }
                 }
                 currentSelfType = previousSelfType
             default:
@@ -267,6 +270,51 @@ public final class MIRLowering {
         return nil
     }
 
+    private func lookupFunctionConventions(_ name: String) -> [AccessConvention]? {
+        if let conventions = functionParamConventions[name] {
+            return conventions
+        }
+
+        let resolvedName = resolveFunctionName(name)
+        if let conventions = functionParamConventions[resolvedName] {
+            return conventions
+        }
+
+        for alias in functionAliases(for: name) {
+            if let conventions = functionParamConventions[alias] {
+                return conventions
+            }
+        }
+
+        return nil
+    }
+
+    private func effect(for convention: AccessConvention) -> AccessEffect {
+        switch convention {
+        case .letAccess: return .read
+        case .inoutAccess: return .modify
+        case .sink: return .consume
+        case .set: return .initialize
+        }
+    }
+
+    private func argEffects(forCallee name: String, argCount: Int) -> [AccessEffect] {
+        let conventions = lookupFunctionConventions(name)
+        if let conventions {
+            var effects: [AccessEffect] = []
+            effects.reserveCapacity(argCount)
+            for i in 0..<argCount {
+                if i < conventions.count {
+                    effects.append(effect(for: conventions[i]))
+                } else {
+                    effects.append(.read)
+                }
+            }
+            return effects
+        }
+        return Array(repeating: .read, count: argCount)
+    }
+
     private func inferDirectCallResultType(_ callee: Expr, loweredCallee: MirOperand? = nil) -> MirType {
         switch callee {
         case .name(let name, _):
@@ -309,6 +357,7 @@ public final class MIRLowering {
     public func lower(_ program: Program) -> MirProgram {
         resetModulePath()
         functionReturnTypes.removeAll(keepingCapacity: true)
+        functionParamConventions.removeAll(keepingCapacity: true)
         collectFunctionReturnTypes(program.items)
         resetModulePath()
         for item in program.items {
@@ -664,9 +713,17 @@ public final class MIRLowering {
                 let resultType = inferMethodCallResultType(receiverType: operandType(baseOp), methodName: methodName)
                 let result = freshTemp(type: resultType)
                 let nextBB = freshBlock()
+                let methodCalleeName: String
+                if let typeName = extractTypeName(receiverType) {
+                    methodCalleeName = "\(typeName)::\(methodName)"
+                } else {
+                    methodCalleeName = ".\(methodName)"
+                }
                 terminateWith(.call(dest: .local(result),
                                     callee: .constant(.fnItem(".\(methodName)")),
-                                    args: argOps, next: nextBB, unwind: nil))
+                                    args: argOps,
+                                    argEffects: argEffects(forCallee: methodCalleeName, argCount: argOps.count),
+                                    next: nextBB, unwind: nil))
                 currentBlock = nextBB
                 return .copy(.local(result))
             }
@@ -710,8 +767,23 @@ public final class MIRLowering {
             let resultType = inferDirectCallResultType(callee, loweredCallee: calleeOp)
             let result = freshTemp(type: resultType)
             let nextBB = freshBlock()
+            let directCalleeName: String?
+            switch callee {
+            case .name(let name, _):
+                directCalleeName = name
+            case .path(let lhs, let rhs, _):
+                directCalleeName = "\(lhs)::\(rhs)"
+            default:
+                directCalleeName = nil
+            }
+            let directArgEffects: [AccessEffect]
+            if let directCalleeName {
+                directArgEffects = argEffects(forCallee: directCalleeName, argCount: argOps.count)
+            } else {
+                directArgEffects = Array(repeating: .read, count: argOps.count)
+            }
             terminateWith(.call(dest: .local(result), callee: calleeOp, args: argOps,
-                                next: nextBB, unwind: nil))
+                                argEffects: directArgEffects, next: nextBB, unwind: nil))
             currentBlock = nextBB
             return .copy(.local(result))
 
@@ -727,7 +799,9 @@ public final class MIRLowering {
             let result = freshTemp()
             let nextBB = freshBlock()
             terminateWith(.call(dest: .local(result), callee: .constant(.fnItem("__macro_\(name)")),
-                                args: argOps, next: nextBB, unwind: nil))
+                                args: argOps,
+                                argEffects: Array(repeating: .read, count: argOps.count),
+                                next: nextBB, unwind: nil))
             currentBlock = nextBB
             return .copy(.local(result))
 
@@ -1080,7 +1154,7 @@ public final class MIRLowering {
 
     private func operandType(_ operand: MirOperand) -> MirType? {
         switch operand {
-        case .copy(let place), .move(let place):
+        case .copy(let place), .move(let place), .read(let place), .consume(let place):
             guard place.local < locals.count else {
                 return nil
             }
@@ -1951,7 +2025,7 @@ public final class MIRLowering {
 
     private func placeOf(_ op: MirOperand) -> LocalId {
         switch op {
-        case .copy(let p), .move(let p): return p.local
+        case .copy(let p), .move(let p), .read(let p), .consume(let p): return p.local
         case .constant:
             let tmp = freshTemp()
             emit(.assign(.local(tmp), .use(op)))

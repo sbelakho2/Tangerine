@@ -16,7 +16,7 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath,
   Param, AccessConvention
 }
-use tg_compiler::types::{Type, TypeId}
+use tg_compiler::types::{Type, TypeId, AccessEffect}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -269,6 +269,8 @@ enum MirOperandKind
   MirCopy(Place)
   MirMovePlace(Place)
   MirConstant(MirConstant)
+  MirRead(Place)
+  MirConsume(Place)
 end
 
 struct MirConstant
@@ -303,6 +305,14 @@ end
 
 def operand_move_place(place: Place) -> MirOperand
   MirOperand { kind: MirOperandKind::MirMovePlace(place) }
+end
+
+def operand_read(place: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirRead(place) }
+end
+
+def operand_consume(place: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirConsume(place) }
 end
 
 def operand_constant(constant: MirConstant) -> MirOperand
@@ -396,6 +406,8 @@ def duplicate_operand(operand: &MirOperand) -> MirOperand
   match &operand.kind
   when MirOperandKind::MirCopy(place) then operand_copy(duplicate_place(place))
   when MirOperandKind::MirMovePlace(place) then operand_move_place(duplicate_place(place))
+  when MirOperandKind::MirRead(place) then operand_read(duplicate_place(place))
+  when MirOperandKind::MirConsume(place) then operand_consume(duplicate_place(place))
   when MirOperandKind::MirConstant(constant) then operand_constant(duplicate_constant(constant))
   end
 end
@@ -544,6 +556,7 @@ enum MirTerminatorKind
     dest: Place,
     func: MirOperand,
     args: Vec[MirOperand],
+    arg_effects: Vec[AccessEffect],
     success: BlockId,
     unwind: Option[BlockId]
   }
@@ -551,6 +564,7 @@ enum MirTerminatorKind
   MirAssert { cond: MirOperand, expected: Bool, msg: AssertMessage, target: BlockId, unwind: Option[BlockId] }
   MirYield(MirOperand, BlockId)
   MirAbort
+  MirDeinit { place: Place, target: BlockId, unwind: Option[BlockId] }
 end
 
 struct SwitchTarget
@@ -745,11 +759,12 @@ def mir_terminator_kind_name(kind: &MirTerminatorKind) -> String
   when MirTerminatorKind::MirReturn then "MirReturn"
   when MirTerminatorKind::MirUnreachable then "MirUnreachable"
   when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then "MirSwitchInt"
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then "MirCall"
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then "MirCall"
   when MirTerminatorKind::MirDrop { place, target, unwind } then "MirDrop"
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then "MirAssert"
   when MirTerminatorKind::MirYield(_, _) then "MirYield"
   when MirTerminatorKind::MirAbort then "MirAbort"
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then "MirDeinit"
   end
 end
 
@@ -797,13 +812,20 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
     end
   elsif kind_name == "MirCall" then
     match &term.kind
-    when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+    when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
       mut duplicated_args = Vec::new()
       mut arg_idx = 0
       while arg_idx < args.len() do
         let arg = &args[arg_idx]
         duplicated_args.push(duplicate_operand(arg))
         arg_idx = arg_idx + 1
+      end
+      mut duplicated_arg_effects = Vec::new()
+      mut effect_idx = 0
+      while effect_idx < arg_effects.len() do
+        let effect = &arg_effects[effect_idx]
+        duplicated_arg_effects.push(effect.clone())
+        effect_idx = effect_idx + 1
       end
       let duplicated_unwind = match unwind
       when Option::Some(block_id) then Option::Some(BlockId { id: block_id.id })
@@ -814,6 +836,7 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
           dest: duplicate_place(dest),
           func: duplicate_operand(func),
           args: duplicated_args,
+          arg_effects: duplicated_arg_effects,
           success: BlockId { id: success.id },
           unwind: duplicated_unwind
         },
@@ -830,6 +853,23 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
       end
       return MirTerminator {
         kind: MirTerminatorKind::MirDrop {
+          place: duplicate_place(place),
+          target: BlockId { id: target.id },
+          unwind: duplicated_unwind
+        },
+        span: duplicate_span(&term.span)
+      }
+    when _ then ()
+    end
+  elsif kind_name == "MirDeinit" then
+    match &term.kind
+    when MirTerminatorKind::MirDeinit { place, target, unwind } then
+      let duplicated_unwind = match unwind
+      when Option::Some(block_id) then Option::Some(BlockId { id: block_id.id })
+      when Option::None then Option::None
+      end
+      return MirTerminator {
+        kind: MirTerminatorKind::MirDeinit {
           place: duplicate_place(place),
           target: BlockId { id: target.id },
           unwind: duplicated_unwind
@@ -903,6 +943,7 @@ struct MirBuilder
   type_defs: Vec[MirTypeDef]
   impl_type_map: Map[String, String]
   fn_ret_types: Map[String, Type]
+  fn_param_conventions: Map[String, Vec[AccessConvention]]
   static_names: Set[String]
   static_types: Map[String, Type]
 end
@@ -937,6 +978,7 @@ def builder_new() -> MirBuilder
     type_defs: Vec::new(),
     impl_type_map: Map::new(),
     fn_ret_types: Map::new(),
+    fn_param_conventions: Map::new(),
     static_names: Set::new(),
     static_types: Map::new()
   }
@@ -1322,6 +1364,7 @@ def lower_program(program: &Program) -> Result[MirProgram, String]
       when Option::None then Type::Unit
       end
       b.fn_ret_types.insert(f.name.clone(), ret_type)
+      b.fn_param_conventions.insert(f.name.clone(), param_conventions_of(&f.params))
     when ItemKind::ItemImpl(impl_decl) then
       let raw_impl_type = match impl_decl.for_type.kind
       when TypeExprKind::Named(name, _) then name.clone()
@@ -1343,6 +1386,7 @@ def lower_program(program: &Program) -> Result[MirProgram, String]
           method.name.clone()
         end
         b.fn_ret_types.insert(mangled_name, ret_type)
+        b.fn_param_conventions.insert(mangled_name, param_conventions_of(&method.params))
       end
     when ItemKind::ItemExternBlock(ext) then
       for ext_item in ext.items do
@@ -1353,6 +1397,7 @@ def lower_program(program: &Program) -> Result[MirProgram, String]
           when Option::None then Type::Unit
           end
           b.fn_ret_types.insert(ef.name.clone(), ret_type)
+          b.fn_param_conventions.insert(ef.name.clone(), param_conventions_of(&ef.params))
         when _ then ()
         end
       end
@@ -2369,6 +2414,80 @@ def mir_lookup_fn_ret_type(b: &MirBuilder, fn_name: String) -> Type
   end
 end
 
+def param_conventions_of(params: &Vec[Param]) -> Vec[AccessConvention]
+  mut conventions = Vec::new()
+  mut param_idx = 0
+  while param_idx < params.len() do
+    let param = &params[param_idx]
+    conventions.push(param.convention)
+    param_idx = param_idx + 1
+  end
+  conventions
+end
+
+def convention_access_effect(convention: AccessConvention) -> AccessEffect
+  match convention
+  when AccessConvention::Let then AccessEffect::Read
+  when AccessConvention::Inout then AccessEffect::Modify
+  when AccessConvention::Sink then AccessEffect::Consume
+  when AccessConvention::Set then AccessEffect::Initialize
+  end
+end
+
+def mir_call_arg_effects(b: &MirBuilder, callee_name: String, arg_count: Int) -> Vec[AccessEffect]
+  mut effects = Vec::new()
+  match b.fn_param_conventions.get(&callee_name)
+  when Option::Some(conventions) then
+    mut arg_idx = 0
+    while arg_idx < arg_count do
+      if arg_idx < conventions.len() then
+        effects.push(convention_access_effect(conventions[arg_idx]))
+      else
+        effects.push(AccessEffect::Read)
+      end
+      arg_idx = arg_idx + 1
+    end
+  when Option::None then
+    mut arg_idx = 0
+    while arg_idx < arg_count do
+      effects.push(AccessEffect::Read)
+      arg_idx = arg_idx + 1
+    end
+  end
+  effects
+end
+
+def resolve_callee_name(b: &MirBuilder, callee_expr: &Expr) -> String
+  let ck = expr_kind_name(&callee_expr.kind)
+  if ck == "ExprIdent" then
+    match callee_expr.kind
+    when ExprKind::ExprIdent(name) then
+      match lookup_current_local_id_by_name(b, name)
+      when Option::Some(_) then ""
+      when Option::None then name.clone()
+      end
+    when _ then ""
+    end
+  elsif ck == "ExprFieldAccess" then
+    match callee_expr.kind
+    when ExprKind::ExprFieldAccess(recv, field) then qualify_field_callee_name(&recv, field.clone())
+    when _ then ""
+    end
+  elsif ck == "ExprEnumVariant" then
+    match callee_expr.kind
+    when ExprKind::ExprEnumVariant(path, _) then resolve_static_path_callee_name(b, &path)
+    when _ then ""
+    end
+  elsif ck == "ExprPath" then
+    match callee_expr.kind
+    when ExprKind::ExprPath(path) then resolve_static_path_callee_name(b, &path)
+    when _ then ""
+    end
+  else
+    ""
+  end
+end
+
 def mir_call_result_temp_type(ret_type: Type) -> Type
   if ret_type == Type::Unit then Type::Int else ret_type end
 end
@@ -3037,6 +3156,8 @@ def mir_infer_operand_type(op: &MirOperand, b: &MirBuilder) -> Type
   match op.kind
   when MirOperandKind::MirCopy(place) then mir_infer_place_type(&place, b)
   when MirOperandKind::MirMovePlace(place) then mir_infer_place_type(&place, b)
+  when MirOperandKind::MirRead(place) then mir_infer_place_type(&place, b)
+  when MirOperandKind::MirConsume(place) then mir_infer_place_type(&place, b)
   when MirOperandKind::MirConstant(c) then c.ty.clone()
   end
 end
@@ -3605,11 +3726,13 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
   let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
   let dest_place = place_local(ret_tmp)
   let success_blk = create_block(b)
+  let callee_fn_name = resolve_callee_name(b, callee_expr)
 
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: dest_place,
     func: callee_op,
     args: mir_args,
+    arg_effects: mir_call_arg_effects(b, callee_fn_name, mir_args.len()),
     success: success_blk,
     unwind: Option::None
   }, span)
@@ -3669,6 +3792,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
     dest: dest_place,
     func: callee_op,
     args: mir_args,
+    arg_effects: mir_call_arg_effects(b, fn_name.clone(), mir_args.len()),
     success: success_blk,
     unwind: Option::None
   }, span)
@@ -4078,6 +4202,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         dest: dest_place,
         func: callee_op,
         args: mir_args,
+        arg_effects: mir_call_arg_effects(b, resolved_method.clone(), mir_args.len()),
         success: success_blk,
         unwind: Option::None
       }, span)
@@ -6705,7 +6830,7 @@ def format_mir_terminator(term: &MirTerminator) -> String
     "return"
   when MirTerminatorKind::MirUnreachable then
     "unreachable"
-  when MirTerminatorKind::MirCall { dest, func: func_op, args, success: succ, unwind } then
+  when MirTerminatorKind::MirCall { dest, func: func_op, args, arg_effects, success: succ, unwind } then
     mut out = format_place(&dest) + " = " + format_operand(&func_op) + "("
     mut first = true
     for a in args do
@@ -6722,6 +6847,14 @@ def format_mir_terminator(term: &MirTerminator) -> String
     out
   when MirTerminatorKind::MirDrop { place, target, unwind } then
     mut out = "drop(" + format_place(&place) + ") -> [bb" + target.id.to_string()
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
+    when Option::None then ()
+    end
+    out = out + "]"
+    out
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    mut out = "deinit(" + format_place(&place) + ") -> [bb" + target.id.to_string()
     match unwind
     when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
     when Option::None then ()
@@ -6776,6 +6909,8 @@ def format_operand(op: &MirOperand) -> String
   match op.kind
   when MirOperandKind::MirCopy(place) then "copy " + format_place(&place)
   when MirOperandKind::MirMovePlace(place) then "move " + format_place(&place)
+  when MirOperandKind::MirRead(place) then "read " + format_place(&place)
+  when MirOperandKind::MirConsume(place) then "consume " + format_place(&place)
   when MirOperandKind::MirConstant(c) then format_mir_constant(&c)
   end
 end
@@ -7051,7 +7186,7 @@ def mir_build_call_graph(program: &MirProgram) -> CallGraph
     mut callees = Set::new()
     for block in f.blocks do
       match block.terminator.kind
-      when MirTerminatorKind::MirCall { dest, func: ref func_op, args, success, unwind } then
+      when MirTerminatorKind::MirCall { dest, func: ref func_op, args, arg_effects, success, unwind } then
         match func_op.kind
         when MirOperandKind::MirConstant(c) then
           match c.kind
@@ -7145,7 +7280,7 @@ def inline_calls_in_function(caller: &mut MirFunction, func_map: &Map[String, &M
   
   for block in caller.blocks do
     match block.terminator.kind
-    when MirTerminatorKind::MirCall { dest: ref dest, func: ref func_op, args: ref args, success: ref success_block, unwind: ref unwind_block } then
+    when MirTerminatorKind::MirCall { dest: ref dest, func: ref func_op, args: ref args, arg_effects, success: ref success_block, unwind: ref unwind_block } then
       let maybe_callee_name = match func_op.kind
       when MirOperandKind::MirConstant(c) then
         match c.kind
@@ -7435,6 +7570,10 @@ def remap_operand(op: &MirOperand, local_map: &Map[Int, Int]) -> MirOperand
     operand_copy(remap_place(&place, local_map))
   when MirOperandKind::MirMovePlace(place) then
     operand_move_place(remap_place(&place, local_map))
+  when MirOperandKind::MirRead(place) then
+    operand_read(remap_place(&place, local_map))
+  when MirOperandKind::MirConsume(place) then
+    operand_consume(remap_place(&place, local_map))
   when MirOperandKind::MirConstant(constant) then
     operand_constant(duplicate_constant(&constant))
   end
@@ -7469,7 +7608,7 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
       },
       span: term.span.clone()
     }
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
     mut remapped_args: Vec[MirOperand] = Vec::new()
     for arg in args do
       remapped_args.push(remap_operand(&arg, local_map))
@@ -7486,6 +7625,7 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
         dest: remap_place(&dest, local_map),
         func: remap_operand(&func, local_map),
         args: remapped_args,
+        arg_effects: arg_effects.clone(),
         success: BlockId { id: new_succ },
         unwind: new_unwind
       },
@@ -7501,6 +7641,22 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
     end
     MirTerminator {
       kind: MirTerminatorKind::MirDrop {
+        place: remap_place(&place, local_map),
+        target: BlockId { id: new_target },
+        unwind: new_unwind
+      },
+      span: term.span.clone()
+    }
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    let new_target = block_map.get(target.id).unwrap_or(target.id)
+    let new_unwind = match unwind
+    when Option::Some(block_id) then
+      let mapped = block_map.get(block_id.id).unwrap_or(block_id.id)
+      Option::Some(BlockId { id: mapped })
+    when Option::None then Option::None
+    end
+    MirTerminator {
+      kind: MirTerminatorKind::MirDeinit {
         place: remap_place(&place, local_map),
         target: BlockId { id: new_target },
         unwind: new_unwind
@@ -7711,6 +7867,26 @@ def substitute_operand_copies(op: &mut MirOperand, map: &Map[Int, LocalId]) -> U
       when Option::None then ()
       end
     end
+  when MirOperandKind::MirRead(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        mut new_place = duplicate_place(&place)
+        new_place.local = new_local
+        op.kind = MirOperandKind::MirRead(new_place)
+      when Option::None then ()
+      end
+    end
+  when MirOperandKind::MirConsume(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(new_local) then
+        mut new_place = duplicate_place(&place)
+        new_place.local = new_local
+        op.kind = MirOperandKind::MirConsume(new_place)
+      when Option::None then ()
+      end
+    end
   when _ then ()
   end
 end
@@ -7777,7 +7953,7 @@ def substitute_terminator_copies(term: &mut MirTerminator, map: &Map[Int, LocalI
   match term.kind
   when MirTerminatorKind::MirSwitchInt { op: mut discr, targets, default_target } then
     substitute_operand_copies(&mut discr, map)
-  when MirTerminatorKind::MirCall { dest, func: mut callee, args: mut args_val, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func: mut callee, args: mut args_val, arg_effects, success, unwind } then
     substitute_operand_copies(&mut callee, map)
     for arg_inner in args_val do
       substitute_operand_copies(&mut arg_inner, map)
@@ -8468,6 +8644,24 @@ def operand_to_vn(op: &MirOperand, local_vn: &Map[Int, String]) -> String
     else
       "proj_" + place.local.id.to_string()
     end
+  when MirOperandKind::MirRead(place) then
+    if place.projections.is_empty() then
+      match local_vn.get(place.local.id)
+      when Option::Some(vn) then vn.clone()
+      when Option::None then "l" + place.local.id.to_string()
+      end
+    else
+      "proj_" + place.local.id.to_string()
+    end
+  when MirOperandKind::MirConsume(place) then
+    if place.projections.is_empty() then
+      match local_vn.get(place.local.id)
+      when Option::Some(vn) then vn.clone()
+      when Option::None then "l" + place.local.id.to_string()
+      end
+    else
+      "proj_" + place.local.id.to_string()
+    end
   end
 end
 
@@ -8784,6 +8978,12 @@ def is_loop_invariant_operand(op: &MirOperand, loop_defs: &Set[Int]) -> Bool
   when MirOperandKind::MirMovePlace(place) then
     let local_id = place.local.id
     !loop_defs.contains(&local_id)
+  when MirOperandKind::MirRead(place) then
+    let local_id = place.local.id
+    !loop_defs.contains(&local_id)
+  when MirOperandKind::MirConsume(place) then
+    let local_id = place.local.id
+    !loop_defs.contains(&local_id)
   end
 end
 
@@ -8837,6 +9037,16 @@ def count_op_uses(op: &MirOperand, counts: &mut Map[Int, Int]) -> Unit
     when Option::Some(n) then counts.insert(place.local.id, n + 1)
     when Option::None then counts.insert(place.local.id, 1)
     end
+  when MirOperandKind::MirRead(place) then
+    match counts.get(place.local.id)
+    when Option::Some(n) then counts.insert(place.local.id, n + 1)
+    when Option::None then counts.insert(place.local.id, 1)
+    end
+  when MirOperandKind::MirConsume(place) then
+    match counts.get(place.local.id)
+    when Option::Some(n) then counts.insert(place.local.id, n + 1)
+    when Option::None then counts.insert(place.local.id, 1)
+    end
   when _ then ()
   end
 end
@@ -8860,7 +9070,7 @@ end
 def count_terminator_uses(term: &MirTerminator, counts: &mut Map[Int, Int]) -> Unit
   match term.kind
   when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then count_op_uses(&op, counts)
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
     count_op_uses(&func, counts)
     for _loop_i90 in 0..args.len() do
   let a = &args[_loop_i90] count_op_uses(&a, counts) end
@@ -8871,6 +9081,7 @@ def count_terminator_uses(term: &MirTerminator, counts: &mut Map[Int, Int]) -> U
   when MirTerminatorKind::MirUnreachable then ()
   when MirTerminatorKind::MirDrop { place, target, unwind } then ()
   when MirTerminatorKind::MirAbort then ()
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then ()
   end
 end
 
@@ -8895,7 +9106,7 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
     substitute_move_operand(&mut op2, map)
     let new_kind = MirTerminatorKind::MirSwitchInt { op: op2, targets: targets, default_target: default_target }
     term.kind = new_kind
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
     # Note: dest is Place, not MirOperand
     mut dest2 = dest
     match map.get(dest2.local.id)
@@ -8914,6 +9125,7 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
       dest: dest2,
       func: func2,
       args: args2,
+      arg_effects: arg_effects.clone(),
       success: success,
       unwind: unwind
     }
@@ -8938,6 +9150,17 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
     when Option::None then ()
     end
     let new_kind = MirTerminatorKind::MirDrop { place: place2, target: target, unwind: unwind }
+    term.kind = new_kind
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    mut place2 = place
+    match map.get(place2.local.id)
+    when Option::Some(src) then
+      if place2.projections.is_empty() then
+        place2 = src.clone()
+      end
+    when Option::None then ()
+    end
+    let new_kind = MirTerminatorKind::MirDeinit { place: place2, target: target, unwind: unwind }
     term.kind = new_kind
   when _ then ()
   end
@@ -8976,13 +9199,19 @@ def terminator_successors(term: &MirTerminator) -> Vec[BlockId]
       result.push(t.target)
     end
     result.push(default_target)
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
     result.push(success)
     match unwind
     when Option::Some(uw) then result.push(uw)
     when Option::None then ()
     end
   when MirTerminatorKind::MirDrop { place, target, unwind } then
+    result.push(target)
+    match unwind
+    when Option::Some(uw) then result.push(uw)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
     result.push(target)
     match unwind
     when Option::Some(uw) then result.push(uw)
@@ -9011,13 +9240,19 @@ def terminator_successor_ids(term: &MirTerminator) -> Vec[Int]
       result.push(t.target.id)
     end
     result.push(default_target.id)
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
     result.push(success.id)
     match unwind
     when Option::Some(uw) then result.push(uw.id)
     when Option::None then ()
     end
   when MirTerminatorKind::MirDrop { place, target, unwind } then
+    result.push(target.id)
+    match unwind
+    when Option::Some(uw) then result.push(uw.id)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
     result.push(target.id)
     match unwind
     when Option::Some(uw) then result.push(uw.id)
@@ -9123,7 +9358,7 @@ def compute_escape_states(f: &MirFunction) -> Map[Int, EscapeState]
 
       # Analyze terminators
       match block.terminator.kind
-      when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
+      when MirTerminatorKind::MirCall { dest, func, args, arg_effects, success, unwind } then
         # Arguments passed to calls escape to at least ArgEscape
         for arg in args do
           match arg.kind
@@ -9132,6 +9367,14 @@ def compute_escape_states(f: &MirFunction) -> Map[Int, EscapeState]
               changed = true
             end
           when MirOperandKind::MirCopy(p) then
+            if escalate_escape(&mut states, p.local.id, EscapeState::ArgEscape) then
+              changed = true
+            end
+          when MirOperandKind::MirRead(p) then
+            if escalate_escape(&mut states, p.local.id, EscapeState::ArgEscape) then
+              changed = true
+            end
+          when MirOperandKind::MirConsume(p) then
             if escalate_escape(&mut states, p.local.id, EscapeState::ArgEscape) then
               changed = true
             end
@@ -9196,6 +9439,8 @@ def operand_escape_state(op: &MirOperand, states: &Map[Int, EscapeState]) -> Esc
   match op.kind
   when MirOperandKind::MirCopy(place) then lookup_escape(states, place.local.id)
   when MirOperandKind::MirMovePlace(place) then lookup_escape(states, place.local.id)
+  when MirOperandKind::MirRead(place) then lookup_escape(states, place.local.id)
+  when MirOperandKind::MirConsume(place) then lookup_escape(states, place.local.id)
   when MirOperandKind::MirConstant(_) then EscapeState::NoEscape
   end
 end
@@ -9241,7 +9486,7 @@ def promote_heap_to_stack(f: &mut MirFunction, non_escaping: &Set[Int]) -> Unit
   let max_stack_promotion_bytes = 4096
   for block in f.blocks do
     match block.terminator.kind
-    when MirTerminatorKind::MirCall { dest, func: callee, args, success: succ, unwind } then
+    when MirTerminatorKind::MirCall { dest, func: callee, args, arg_effects, success: succ, unwind } then
       # Check if this is a heap allocation call to a non-escaping destination
       let is_alloc = match callee.kind
       when MirOperandKind::MirConstant(c) then
@@ -9866,35 +10111,49 @@ def find_cross_yield_locals(func: &MirFunction, yield_points: &Vec[BlockId]) -> 
             if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then
             if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then
+            if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then
+            if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
         when MirRvalueKind::MirBinOp(_, lhs, rhs) then
           match lhs.kind
           when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
           match rhs.kind
           when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
         when MirRvalueKind::MirUnOp(_, op) then
           match op.kind
           when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
         when MirRvalueKind::MirCast(_, op, _) then
           match op.kind
           when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
         when MirRvalueKind::MirRepeat(op, _) then
           match op.kind
           when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+          when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
           when _ then ()
           end
         when MirRvalueKind::MirRef(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
@@ -9906,6 +10165,8 @@ def find_cross_yield_locals(func: &MirFunction, yield_points: &Vec[BlockId]) -> 
             match op.kind
             when MirOperandKind::MirCopy(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
             when MirOperandKind::MirMovePlace(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+            when MirOperandKind::MirRead(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
+            when MirOperandKind::MirConsume(p) then if uses_matter then uses_after_yield.insert(p.local.id) end
             when _ then ()
             end
           end
@@ -10411,6 +10672,10 @@ def rename_operand(op: &mut MirOperand, version_stack: &Map[Int, Vec[Int]]) -> U
     rename_place(&mut place, version_stack)
   when MirOperandKind::MirMovePlace(place) then
     rename_place(&mut place, version_stack)
+  when MirOperandKind::MirRead(place) then
+    rename_place(&mut place, version_stack)
+  when MirOperandKind::MirConsume(place) then
+    rename_place(&mut place, version_stack)
   when _ then ()
   end
 end
@@ -10451,7 +10716,7 @@ def rename_operands_in_terminator(term: &mut MirTerminator, version_stack: &Map[
   when MirTerminatorKind::MirReturn then
     # Return has no operand - return value is in local 0
     ()
-  when MirTerminatorKind::MirCall { dest, func: mut func_op, args: mut args_op, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func: mut func_op, args: mut args_op, arg_effects, success, unwind } then
     rename_operand(&mut func_op, version_stack)
     for arg_val in args_op do
       rename_operand(&mut arg_val, version_stack)
@@ -10654,7 +10919,7 @@ def verify_function(func: &MirFunction, types: &Vec[MirTypeDef], errors: &mut Ve
             end
             let default_id = default_target.id
             if !reachable.contains(&default_id) then worklist.push(default_id) end
-          when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
+          when MirTerminatorKind::MirCall { dest, func: callee, args, arg_effects, success, unwind } then
             let succ_id = success.id
             if !reachable.contains(&succ_id) then worklist.push(succ_id) end
             match unwind
@@ -10664,6 +10929,15 @@ def verify_function(func: &MirFunction, types: &Vec[MirTypeDef], errors: &mut Ve
             when Option::None then ()
             end
           when MirTerminatorKind::MirDrop { place, target, unwind } then
+            let succ_id = target.id
+            if !reachable.contains(&succ_id) then worklist.push(succ_id) end
+            match unwind
+            when Option::Some(uw) then
+              let unwind_id = uw.id
+              if !reachable.contains(&unwind_id) then worklist.push(unwind_id) end
+            when Option::None then ()
+            end
+          when MirTerminatorKind::MirDeinit { place, target, unwind } then
             let succ_id = target.id
             if !reachable.contains(&succ_id) then worklist.push(succ_id) end
             match unwind
@@ -10833,6 +11107,16 @@ def verify_operand(operand: &MirOperand, valid_locals: &Set[Int],
     if !valid_locals.contains(&local_id) then
       errors.push(ctx.clone() + ": move of undefined local _" + local_id.to_string())
     end
+  when MirOperandKind::MirRead(place) then
+    let local_id = place.local.id
+    if !valid_locals.contains(&local_id) then
+      errors.push(ctx.clone() + ": read of undefined local _" + local_id.to_string())
+    end
+  when MirOperandKind::MirConsume(place) then
+    let local_id = place.local.id
+    if !valid_locals.contains(&local_id) then
+      errors.push(ctx.clone() + ": consume of undefined local _" + local_id.to_string())
+    end
   when MirOperandKind::MirConstant(_) then ()
   end
 end
@@ -10863,7 +11147,7 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
     end
   when MirTerminatorKind::MirReturn then ()
   when MirTerminatorKind::MirUnreachable then ()
-  when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func: callee, args, arg_effects, success, unwind } then
     verify_operand(callee, valid_locals, ctx, errors)
     mut arg_idx = 0
     while arg_idx < args.len() do
@@ -10897,6 +11181,23 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
       let unwind_id = ub.id
       if !valid_blocks.contains(&unwind_id) then
         errors.push(ctx.clone() + ": drop unwind references invalid block bb" + unwind_id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    let local_id = place.local.id
+    if !valid_locals.contains(&local_id) then
+      errors.push(ctx.clone() + ": deinit of undefined local _" + local_id.to_string())
+    end
+    let target_id = target.id
+    if !valid_blocks.contains(&target_id) then
+      errors.push(ctx.clone() + ": deinit target references invalid block bb" + target_id.to_string())
+    end
+    match unwind
+    when Option::Some(ub) then
+      let unwind_id = ub.id
+      if !valid_blocks.contains(&unwind_id) then
+        errors.push(ctx.clone() + ": deinit unwind references invalid block bb" + unwind_id.to_string())
       end
     when Option::None then ()
     end
@@ -11316,6 +11617,8 @@ def verifier_operand_static_type(func: &MirFunction, op: &MirOperand) -> Option[
   match &op.kind
   when MirOperandKind::MirCopy(place) then verifier_place_result_type_opt(func, &place)
   when MirOperandKind::MirMovePlace(place) then verifier_place_result_type_opt(func, &place)
+  when MirOperandKind::MirRead(place) then verifier_place_result_type_opt(func, &place)
+  when MirOperandKind::MirConsume(place) then verifier_place_result_type_opt(func, &place)
   when MirOperandKind::MirConstant(cst) then verifier_constant_type(&cst)
   end
 end
@@ -11477,7 +11780,7 @@ def verifier_check_terminator(type_index: &Map[Int, MirTypeDef], func: &MirFunct
     if !verifier_block_exists(func, default_target.id) then
       errors.push(ctx.clone() + ": switch fallback references invalid block bb" + default_target.id.to_string())
     end
-  when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
+  when MirTerminatorKind::MirCall { dest, func: callee, args, arg_effects, success, unwind } then
     verifier_check_call(type_index, func, &dest, &callee, &args, running, &mut moved, ctx, errors)
     if !verifier_block_exists(func, success.id) then
       errors.push(ctx.clone() + ": call success references invalid block bb" + success.id.to_string())
@@ -11498,6 +11801,18 @@ def verifier_check_terminator(type_index: &Map[Int, MirTypeDef], func: &MirFunct
     when Option::Some(uw) then
       if !verifier_block_exists(func, uw.id) then
         errors.push(ctx.clone() + ": drop unwind references invalid block bb" + uw.id.to_string())
+      end
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    verifier_check_place(type_index, func, &place, running, ctx, errors)
+    if !verifier_block_exists(func, target.id) then
+      errors.push(ctx.clone() + ": deinit target references invalid block bb" + target.id.to_string())
+    end
+    match unwind
+    when Option::Some(uw) then
+      if !verifier_block_exists(func, uw.id) then
+        errors.push(ctx.clone() + ": deinit unwind references invalid block bb" + uw.id.to_string())
       end
     when Option::None then ()
     end

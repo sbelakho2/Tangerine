@@ -99,12 +99,22 @@ public enum MirTerminator {
     case goto(BlockId)
     case ret
     case switchInt(MirOperand, targets: [(Int, BlockId)], otherwise: BlockId)
-    case call(dest: MirPlace, callee: MirOperand, args: [MirOperand], next: BlockId, unwind: BlockId?)
+    case call(dest: MirPlace, callee: MirOperand, args: [MirOperand], argEffects: [AccessEffect], next: BlockId, unwind: BlockId?)
     case drop(MirPlace, next: BlockId, unwind: BlockId?)
+    case `deinit`(MirPlace, next: BlockId, unwind: BlockId?)
     case assert(MirOperand, expected: Bool, message: String, target: BlockId)
     case yield(MirOperand, resume: BlockId)
     case unreachable
     case abort
+}
+
+// MARK: - Access Effect
+
+public enum AccessEffect {
+    case read
+    case modify
+    case consume
+    case initialize
 }
 
 // MARK: - Place & Projection
@@ -132,6 +142,8 @@ public enum MirProjection {
 public enum MirOperand {
     case copy(MirPlace)
     case move(MirPlace)
+    case read(MirPlace)
+    case consume(MirPlace)
     case constant(MirConstant)
 }
 
