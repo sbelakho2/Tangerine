@@ -102,6 +102,11 @@ public enum TokenKind: Equatable, Hashable, Sendable {
     case kwTest
     case kwDyn
     case kwTypealias
+    case kwInout
+    case kwSink
+    case kwSet
+    case kwResource
+    case kwDeinit
 
     // ── Delimiters ────────────────────────────────────────────────────
     case lParen        // (
@@ -174,6 +179,12 @@ extension TokenKind {
         case "do":        return .kwDo
         case "let":       return .kwLet
         case "mut":       return .kwMut
+        case "var":       return .kwMut
+        case "inout":     return .kwInout
+        case "sink":      return .kwSink
+        case "set":       return .kwSet
+        case "resource":  return .kwResource
+        case "deinit":    return .kwDeinit
         case "return":    return .kwReturn
         case "break":     return .kwBreak
         case "next":      return .kwNext
@@ -317,6 +328,11 @@ extension TokenKind {
         case .kwTest:          return "'test'"
         case .kwDyn:           return "'dyn'"
         case .kwTypealias:     return "'typealias'"
+        case .kwInout:         return "'inout'"
+        case .kwSink:          return "'sink'"
+        case .kwSet:           return "'set'"
+        case .kwResource:      return "'resource'"
+        case .kwDeinit:        return "'deinit'"
         case .lParen:          return "'('"
         case .rParen:          return "')'"
         case .lBracket:        return "'['"

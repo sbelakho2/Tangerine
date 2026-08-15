@@ -1045,7 +1045,7 @@ test("mutation test: one corrupted span among valid nodes") {
     let fn = FunctionDecl(
         sig: FunctionSig(name: "f", isPublic: false, isAsync: false, isPure: false,
             isInline: false, typeParams: [],
-            params: [Param(name: "a", isMutable: false, type: .named("Int", typeArgs: [], ok), defaultValue: nil, span: ok)],
+            params: [Param(name: "a", isMutable: false, convention: .letAccess, type: .named("Int", typeArgs: [], ok), defaultValue: nil, span: ok)],
             returnType: .named("Bool", typeArgs: [], bad), // THE ONLY BAD SPAN
             whereClause: [], span: ok),
         clauses: [],

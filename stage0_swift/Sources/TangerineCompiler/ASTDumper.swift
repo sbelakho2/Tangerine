@@ -71,7 +71,7 @@ public final class ASTDumper {
             emit("Test \(d.name)")
             push(); dumpBlock(d.body); pop()
         case .structDef(let d):
-            emit("Struct \(d.name)\(d.isPublic ? " [pub]" : "")\(typeParamsStr(d.typeParams))")
+            emit("Struct \(d.name)\(d.isPublic ? " [pub]" : "")\(typeParamsStr(d.typeParams))\(d.kind == .resource ? " [resource]" : "")")
             push()
             for f in d.fields {
                 emit("Field \(f.name)")
@@ -152,7 +152,7 @@ public final class ASTDumper {
             emit("Params:")
             push()
             for p in d.sig.params {
-                emit("\(p.name)\(p.isMutable ? " [mut]" : "")")
+                emit("\(p.name)\(p.isMutable ? " [mut]" : "")\(conventionTag(p.convention))")
                 push(); dumpTypeExpr(p.type); pop()
             }
             pop()
@@ -163,6 +163,15 @@ public final class ASTDumper {
         }
         dumpFunctionBody(d.body)
         pop()
+    }
+
+    private func conventionTag(_ c: AccessConvention) -> String {
+        switch c {
+        case .letAccess:   return ""
+        case .inoutAccess: return " [inout]"
+        case .sink:        return " [sink]"
+        case .set:         return " [set]"
+        }
     }
 
     private func dumpFunctionBody(_ body: FunctionBody) {

@@ -154,17 +154,31 @@ public struct FunctionSig {
 public struct Param {
     public var name: String
     public var isMutable: Bool
+    public var convention: AccessConvention
     public var type: TypeExpr
     public var defaultValue: Expr?
     public var span: Span
 
-    public init(name: String, isMutable: Bool = false, type: TypeExpr, defaultValue: Expr? = nil, span: Span) {
+    public init(name: String, isMutable: Bool = false, convention: AccessConvention, type: TypeExpr, defaultValue: Expr? = nil, span: Span) {
         self.name = name
         self.isMutable = isMutable
+        self.convention = convention
         self.type = type
         self.defaultValue = defaultValue
         self.span = span
     }
+}
+
+public enum AccessConvention {
+    case letAccess
+    case inoutAccess
+    case sink
+    case set
+}
+
+public enum NominalKind {
+    case value
+    case resource
 }
 
 public struct TypeParam {
@@ -264,15 +278,18 @@ public struct StructDecl {
     public var typeParams: [TypeParam]
     public var whereClause: [WherePredicate]
     public var fields: [FieldDecl]
+    public var kind: NominalKind
     public var span: Span
 
     public init(name: String, isPublic: Bool = false, typeParams: [TypeParam] = [],
-                whereClause: [WherePredicate] = [], fields: [FieldDecl] = [], span: Span) {
+                whereClause: [WherePredicate] = [], fields: [FieldDecl] = [],
+                kind: NominalKind = .value, span: Span) {
         self.name = name
         self.isPublic = isPublic
         self.typeParams = typeParams
         self.whereClause = whereClause
         self.fields = fields
+        self.kind = kind
         self.span = span
     }
 }

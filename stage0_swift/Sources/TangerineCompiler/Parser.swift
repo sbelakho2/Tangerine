@@ -122,6 +122,11 @@ public final class Parser {
         case .kwUse:      advance(); return "use"
         case .kwWhere:    advance(); return "where"
         case .kwAs:       advance(); return "as"
+        case .kwInout:    advance(); return "inout"
+        case .kwSink:     advance(); return "sink"
+        case .kwSet:      advance(); return "set"
+        case .kwResource: advance(); return "resource"
+        case .kwDeinit:   advance(); return "deinit"
         default:
             let tok = peek()
             diagnostics.error(
@@ -146,7 +151,8 @@ public final class Parser {
              .kwStatic, .kwAwait, .kwWhen, .kwMod,
              .kwRequires, .kwInvariant, .kwWith, .kwCatch, .kwTry, .kwYield,
              .kwIn, .kwDyn, .kwFn, .kwCrate, .kwSuper, .kwMacro, .kwComptime,
-             .kwUnless, .kwUntil, .kwRationale, .kwUse, .kwWhere, .kwAs:
+             .kwUnless, .kwUntil, .kwRationale, .kwUse, .kwWhere, .kwAs,
+             .kwInout, .kwSink, .kwSet, .kwResource, .kwDeinit:
             return true
         default:
             return false
@@ -229,6 +235,8 @@ public final class Parser {
             kind = parseModifiedFunctionItem(initialPublic: isPublic)
         case .kwStruct:
             kind = parseStructItem(isPublic: isPublic)
+        case .kwResource:
+            kind = parseResourceItem(isPublic: isPublic)
         case .kwEnum:
             kind = parseEnumItem(isPublic: isPublic)
         case .kwTrait:
@@ -435,7 +443,7 @@ public final class Parser {
     private func looksLikeBlockItemStart(from index: Int) -> Bool {
         let i = skipAttributes(from: index)
         switch tokenKind(at: i) {
-        case .kwDef, .kwFn, .kwStruct, .kwImpl, .kwUse, .kwConst, .kwStatic:
+        case .kwDef, .kwFn, .kwStruct, .kwResource, .kwImpl, .kwUse, .kwConst, .kwStatic:
             return true
         case .kwPub, .kwAsync, .kwUnsafe, .kwPure, .kwInline:
             return looksLikeFunctionDeclAfterModifiers(from: i)
@@ -524,10 +532,11 @@ public final class Parser {
         let start = currentSpan
         let (name, typeParams) = parseFunctionNameAndTypeParams()
         expect(.lParen)
-        let params = parseParamList()
+        var params = parseParamList()
         expect(.rParen)
         let retType = parseOptionalReturnType()
         let whereClause = parseOptionalWhereClause()
+        consumeTrailingReceiverConvention(&params)
 
         let sig = FunctionSig(
             name: name, isPublic: isPublic, isAsync: isAsync,
@@ -784,77 +793,21 @@ public final class Parser {
         var params: [Param] = []
         while !at(.rParen) && !atEof() {
             let start = currentSpan
-            
+
             // Check for variadic parameter: ...
             if at(.dotDotDot) {
                 advance() // consume ...
                 // Create a variadic param with special name
                 params.append(Param(
-                    name: "...", isMutable: false,
+                    name: "...", isMutable: false, convention: .letAccess,
                     type: .named("VarArgs", typeArgs: [], start.merged(with: currentSpan)),
                     span: start.merged(with: currentSpan)
                 ))
                 if !at(.rParen) { eat(.comma) }
                 continue
             }
-            
-            // Check for self parameter
-            if at(.kwSelfValue) {
-                advance()
-                if eat(.colon) {
-                    // self: Type (explicit type annotation)
-                    let type = parseTypeExpr()
-                    params.append(Param(
-                        name: "self", isMutable: false,
-                        type: type, span: start.merged(with: currentSpan)
-                    ))
-                } else {
-                    // bare self (implicit Self type)
-                    params.append(Param(
-                        name: "self", isMutable: false,
-                        type: .selfType(currentSpan),
-                        span: start.merged(with: currentSpan)
-                    ))
-                }
-            } else if at(.amp) && peekAhead(1) == .kwSelfValue {
-                // &self
-                advance() // &
-                advance() // self
-                let selfParam = Param(
-                    name: "self", isMutable: false,
-                    type: .ref(.selfType(currentSpan), mutable: false, currentSpan),
-                    span: start.merged(with: currentSpan)
-                )
-                params.append(selfParam)
-            } else if at(.amp) && peekAhead(1) == .kwMut && peekAhead(2) == .kwSelfValue {
-                // &mut self
-                advance() // &
-                advance() // mut
-                advance() // self
-                let selfParam = Param(
-                    name: "self", isMutable: true,
-                    type: .ref(.selfType(currentSpan), mutable: true, currentSpan),
-                    span: start.merged(with: currentSpan)
-                )
-                params.append(selfParam)
-            } else if at(.kwMut) && peekAhead(1) == .kwSelfValue {
-                // mut self
-                advance() // mut
-                advance() // self
-                if eat(.colon) {
-                    let type = parseTypeExpr()
-                    params.append(Param(
-                        name: "self", isMutable: true,
-                        type: type, span: start.merged(with: currentSpan)
-                    ))
-                } else {
-                    params.append(Param(
-                        name: "self", isMutable: true,
-                        type: .selfType(currentSpan),
-                        span: start.merged(with: currentSpan)
-                    ))
-                }
-            } else if at(.lParen) && isFunctionTypeStart() {
+
+            if at(.lParen) && isFunctionTypeStart() {
                 // Function type parameter: f: () -> T
                 // First parse the parameter name and colon, then parse the function type
                 let paramName = expectIdent()
@@ -868,22 +821,78 @@ public final class Parser {
                 params.append(Param(
                     name: paramName,
                     isMutable: false,
+                    convention: .letAccess,
                     type: funcType,
                     defaultValue: defaultVal,
                     span: start.merged(with: currentSpan)
                 ))
-            } else {
-                let isMutable = eat(.kwMut)
-                let name = expectIdent()
-                expect(.colon)
-                let type = parseTypeExpr()
-                var defaultVal: Expr? = nil
-                if eat(.eq) {
-                    defaultVal = parseExpr()
-                }
-                params.append(Param(name: name, isMutable: isMutable, type: type,
-                                    defaultValue: defaultVal, span: start.merged(with: currentSpan)))
+                if !at(.rParen) { eat(.comma) }
+                continue
             }
+
+            // Access convention (new syntax) and legacy modifiers, normalized immediately.
+            var convention = AccessConvention.letAccess
+            var legacyRef = false
+            var legacyRefMut = false
+            if at(.kwInout) {
+                advance()
+                convention = .inoutAccess
+            } else if at(.kwSink) {
+                advance()
+                convention = .sink
+            } else if at(.kwSet) {
+                advance()
+                convention = .set
+            } else if at(.kwMut) {
+                advance()
+                convention = .inoutAccess
+            } else if at(.amp) {
+                advance()
+                if at(.kwMut) {
+                    advance()
+                    convention = .inoutAccess
+                    legacyRef = true
+                    legacyRefMut = true
+                } else {
+                    convention = .letAccess
+                    legacyRef = true
+                }
+            } else if case .ident("move") = peekKind(), peekAhead(1) != .colon {
+                advance()
+                convention = .sink
+            } else if case .ident("own") = peekKind(), peekAhead(1) != .colon {
+                advance()
+                convention = .sink
+            }
+
+            let isSelf = at(.kwSelfValue)
+            let name = expectIdent()
+            let isMutable = convention != .letAccess
+
+            var type: TypeExpr
+            if eat(.colon) {
+                type = parseTypeExpr()
+            } else if isSelf {
+                // bare self (implicit Self type)
+                type = .selfType(start.merged(with: currentSpan))
+            } else {
+                expect(.colon)
+                type = .inferred(currentSpan)
+            }
+
+            // &self / &mut self keep the legacy ref type: MIR lowering relies on it
+            // to distinguish by-value self from borrowed self.
+            if isSelf && legacyRef {
+                type = .ref(type, mutable: legacyRefMut, type.span)
+            }
+
+            var defaultVal: Expr? = nil
+            if eat(.eq) {
+                defaultVal = parseExpr()
+            }
+            params.append(Param(name: name, isMutable: isMutable, convention: convention,
+                                type: type, defaultValue: defaultVal,
+                                span: start.merged(with: currentSpan)))
             if !at(.rParen) { eat(.comma) }
         }
         return params
@@ -893,6 +902,18 @@ public final class Parser {
         let idx = cursor + offset
         if idx < tokens.count { return tokens[idx].kind }
         return .eof
+    }
+
+    /// Trailing `inout` after a method signature sets the receiver convention:
+    /// `def foo(...) -> T inout` makes the implicit self inout.
+    private func consumeTrailingReceiverConvention(_ params: inout [Param]) {
+        if at(.kwInout) {
+            advance()
+            if let idx = params.firstIndex(where: { $0.name == "self" }) {
+                params[idx].convention = .inoutAccess
+                params[idx].isMutable = true
+            }
+        }
     }
 
     // MARK: - Type Parameters
@@ -1255,7 +1276,7 @@ public final class Parser {
 
     // MARK: - Struct
 
-    private func parseStructItem(isPublic: Bool) -> ItemKind {
+    private func parseStructItem(isPublic: Bool, kind: NominalKind = .value) -> ItemKind {
         let start = currentSpan
         advance() // skip 'struct'
         let name = expectIdent()
@@ -1277,7 +1298,7 @@ public final class Parser {
             expect(.rBrace)
             return .structDef(StructDecl(name: name, isPublic: isPublic,
                                          typeParams: typeParams, whereClause: whereClause,
-                                         fields: fields,
+                                         fields: fields, kind: kind,
                                          span: start.merged(with: currentSpan)))
         }
 
@@ -1296,7 +1317,39 @@ public final class Parser {
 
         return .structDef(StructDecl(name: name, isPublic: isPublic,
                                      typeParams: typeParams, whereClause: whereClause,
-                                     fields: fields,
+                                     fields: fields, kind: kind,
+                                     span: start.merged(with: currentSpan)))
+    }
+
+    // MARK: - Resource
+
+    private func parseResourceItem(isPublic: Bool) -> ItemKind {
+        let start = currentSpan
+        advance() // skip 'resource'
+        let name = expectIdent()
+        let typeParams = parseOptionalTypeParams()
+        let whereClause = parseOptionalWhereClause()
+
+        var fields: [FieldDecl] = []
+        while !at(.kwEnd) && !atEof() {
+            if looksLikeFunctionDeclAfterModifiers(from: cursor) {
+                _ = parseModifiedFunctionItem()
+                continue
+            }
+            let fStart = currentSpan
+            let fPub = eat(.kwPub)
+            let fName = expectIdent()
+            expect(.colon)
+            let fType = parseTypeExpr()
+            eat(.comma)
+            fields.append(FieldDecl(name: fName, isPublic: fPub, type: fType,
+                                    span: fStart.merged(with: currentSpan)))
+        }
+        expect(.kwEnd)
+
+        return .structDef(StructDecl(name: name, isPublic: isPublic,
+                                     typeParams: typeParams, whereClause: whereClause,
+                                     fields: fields, kind: .resource,
                                      span: start.merged(with: currentSpan)))
     }
 
@@ -1419,10 +1472,11 @@ public final class Parser {
         while eat(.colonColon) { name += "::" + expectIdent() }
         let typeParams = parseOptionalTypeParams()
         expect(.lParen)
-        let params = parseParamList()
+        var params = parseParamList()
         expect(.rParen)
         let retType = parseOptionalReturnType()
         let whereClause = parseOptionalWhereClause()
+        consumeTrailingReceiverConvention(&params)
 
         let sig = FunctionSig(
             name: name, isPublic: mods.isPublic,
@@ -1752,10 +1806,11 @@ public final class Parser {
         let start = currentSpan
         let (name, typeParams) = parseFunctionNameAndTypeParams()
         expect(.lParen)
-        let params = parseParamList()
+        var params = parseParamList()
         expect(.rParen)
         let retType = parseOptionalReturnType()
         let whereClause = parseOptionalWhereClause()
+        consumeTrailingReceiverConvention(&params)
         return FunctionSig(name: name, isPublic: isPublic, isAsync: isAsync,
                    isUnsafe: isUnsafe, isConst: isConst,
                    isPure: isPure, isInline: isInline, isExtern: isExtern,
@@ -1920,7 +1975,7 @@ public final class Parser {
         switch kind {
         case .kwDo, .kwIf, .kwMatch, .kwFor, .kwWhile, .kwLoop,
              .kwHandle, .kwTry, .kwComptime, .kwUnsafe,
-             .kwStruct, .kwEnum, .kwTrait, .kwImpl, .kwModule, .kwMod,
+             .kwStruct, .kwResource, .kwEnum, .kwTrait, .kwImpl, .kwModule, .kwMod,
              .kwExtern:
             return true
         default:
@@ -3937,7 +3992,7 @@ public final class Parser {
 
     private func atItemStart() -> Bool {
         switch peekKind() {
-                case .kwDef, .kwFn, .kwStruct, .kwEnum, .kwTrait, .kwImpl, .kwUse,
+                case .kwDef, .kwFn, .kwStruct, .kwResource, .kwEnum, .kwTrait, .kwImpl, .kwUse,
                .kwConst, .kwStatic, .kwType, .kwTypealias, .kwExtern, .kwModule, .kwMod,
              .kwCap, .kwEffect, .kwRationale, .kwMacro, .kwEdition,
                .kwPub, .kwAsync, .kwUnsafe, .kwPure, .kwInline, .kwLet, .kwMut, .kwTest:

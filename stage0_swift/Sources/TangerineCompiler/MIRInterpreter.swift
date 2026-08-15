@@ -5661,6 +5661,11 @@ public final class MIRInterpreter {
         case .kwCrate:     return (tkEnum(4, .string("crate")), 1)
         case .kwTest:      return (tkEnum(4, .string("test")), 1)
         case .kwDyn:       return (tkEnum(4, .string("dyn")), 1)
+        case .kwInout:     return (tkEnum(4, .string("inout")), 1)
+        case .kwSink:      return (tkEnum(4, .string("sink")), 1)
+        case .kwSet:       return (tkEnum(4, .string("set")), 1)
+        case .kwResource:  return (tkEnum(4, .string("resource")), 1)
+        case .kwDeinit:    return (tkEnum(4, .string("deinit")), 1)
         // ── Operators ──
         case .plus:        return (tkEnum(79), 1)
         case .minus:       return (tkEnum(80), 1)
