@@ -1679,7 +1679,475 @@ public final class MIRLowering {
         }
     }
 
+    private func tryLowerForProjected(_ forE: ForExpr) -> MirOperand? {
+        guard case .ident(let varName, let patMut, _) = forE.pattern, varName != "_" else { return nil }
+        guard let iterType = iterablePlaceType(forE.iterable) else { return nil }
+        guard let elemTy = projectedCollectionElementType(iterType) else { return nil }
+        guard forBodyIsReadOnly(varName: varName, body: forE.body) else { return nil }
+        lowerProjectedFor(forE, varName: varName, patMut: patMut, iterType: iterType, elemTy: elemTy)
+        return .constant(.unit)
+    }
+
+    private func iterablePlaceType(_ expr: Expr) -> MirType? {
+        switch expr {
+        case .name(let n, _):
+            guard let id = lookupScope(n) else { return nil }
+            return locals[id].type
+        case .field(let base, let field, _):
+            guard let baseType = iterablePlaceType(base) else { return nil }
+            return projectedType(baseType, by: .namedField(field))
+        case .index(let base, _, _):
+            guard let baseType = iterablePlaceType(base) else { return nil }
+            return projectedType(baseType, by: .index(0))
+        default:
+            return nil
+        }
+    }
+
+    private func projectedCollectionElementType(_ type: MirType) -> MirType? {
+        switch type {
+        case .slice(let inner), .array(let inner, _):
+            return inner
+        case .ref(let inner, _), .rawPtr(let inner):
+            return projectedCollectionElementType(inner)
+        case .named(let name):
+            let bare = bareTypeName(name)
+            if bare == "Vec" || bare == "Array" {
+                return .unknown
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    private func bareTypeName(_ name: String) -> String {
+        for separator in ["<", "[", "("] {
+            if let idx = name.firstIndex(of: Character(separator)) {
+                return String(name[name.startIndex..<idx])
+            }
+        }
+        return name
+    }
+
+    private func forBodyIsReadOnly(varName: String, body: BlockBody) -> Bool {
+        for stmt in body.stmts {
+            if !stmtIsReadOnly(varName: varName, stmt: stmt) {
+                return false
+            }
+        }
+        if let tail = body.tailExpr, !exprIsReadOnly(varName: varName, expr: tail) {
+            return false
+        }
+        return true
+    }
+
+    private func blockIsReadOnly(varName: String, body: BlockBody) -> Bool {
+        for stmt in body.stmts {
+            if !stmtIsReadOnly(varName: varName, stmt: stmt) {
+                return false
+            }
+        }
+        if let tail = body.tailExpr, !exprIsReadOnly(varName: varName, expr: tail) {
+            return false
+        }
+        return true
+    }
+
+    private func stmtIsReadOnly(varName: String, stmt: Stmt) -> Bool {
+        switch stmt {
+        case .letBinding(_, _, _, let value, _):
+            return exprIsReadOnly(varName: varName, expr: value)
+        case .exprStmt(let expr, _):
+            return exprIsReadOnly(varName: varName, expr: expr)
+        case .attributeStmt:
+            return true
+        case .attributed(_, let inner, _):
+            return stmtIsReadOnly(varName: varName, stmt: inner)
+        case .deferStmt(let body, _):
+            return blockIsReadOnly(varName: varName, body: body)
+        case .item:
+            return false
+        }
+    }
+
+    private func exprsAreReadOnly(varName: String, exprs: [Expr]) -> Bool {
+        for expr in exprs {
+            if !exprIsReadOnly(varName: varName, expr: expr) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func exprRootIs(_ varName: String, expr: Expr) -> Bool {
+        switch expr {
+        case .name(let n, _):
+            return n == varName
+        case .field(let base, _, _):
+            return exprRootIs(varName, expr: base)
+        case .index(let base, _, _):
+            return exprRootIs(varName, expr: base)
+        default:
+            return false
+        }
+    }
+
+    private func exprIsReadOnly(varName: String, expr: Expr) -> Bool {
+        switch expr {
+        case .intLit, .floatLit, .stringLit, .charLit, .boolLit, .path:
+            return true
+        case .name(let n, _):
+            return n != varName
+        case .array(let elems, _), .tuple(let elems, _):
+            return exprsAreReadOnly(varName: varName, exprs: elems)
+        case .arrayRepeat(let value, let count, _):
+            return exprIsReadOnly(varName: varName, expr: value)
+                && exprIsReadOnly(varName: varName, expr: count)
+        case .structLit(_, _, let fields, let rest, _):
+            for field in fields {
+                if !exprIsReadOnly(varName: varName, expr: field.1) {
+                    return false
+                }
+            }
+            if let rest, !exprIsReadOnly(varName: varName, expr: rest) {
+                return false
+            }
+            return true
+        case .block(let body, _), .unsafeBlock(_, let body, _):
+            return blockIsReadOnly(varName: varName, body: body)
+        case .ifExpr(let ifE):
+            if !exprIsReadOnly(varName: varName, expr: ifE.condition) { return false }
+            if !blockIsReadOnly(varName: varName, body: ifE.thenBlock) { return false }
+            for clause in ifE.elsifClauses {
+                if !exprIsReadOnly(varName: varName, expr: clause.condition) { return false }
+                if !blockIsReadOnly(varName: varName, body: clause.body) { return false }
+            }
+            if let elseBlock = ifE.elseBlock, !blockIsReadOnly(varName: varName, body: elseBlock) {
+                return false
+            }
+            if let ifLetValue = ifE.ifLetValue, !exprIsReadOnly(varName: varName, expr: ifLetValue) {
+                return false
+            }
+            return true
+        case .call(let callee, _, let args, _):
+            if case .field(let base, _, _) = callee {
+                if exprRootIs(varName, expr: base) { return false }
+                if !exprIsReadOnly(varName: varName, expr: base) { return false }
+            } else {
+                if exprRootIs(varName, expr: callee) { return false }
+                if !exprIsReadOnly(varName: varName, expr: callee) { return false }
+            }
+            return callArgsAreReadOnly(varName: varName, callee: callee, args: args)
+        case .index(let base, let idx, _):
+            if case .name(let n, _) = base {
+                if n == varName { return true }
+                return exprIsReadOnly(varName: varName, expr: idx)
+            }
+            return exprIsReadOnly(varName: varName, expr: base)
+                && exprIsReadOnly(varName: varName, expr: idx)
+        case .range(let start, let end, _, _):
+            return exprIsReadOnly(varName: varName, expr: start)
+                && exprIsReadOnly(varName: varName, expr: end)
+        case .matchExpr(let matchE):
+            if !exprIsReadOnly(varName: varName, expr: matchE.subject) { return false }
+            for arm in matchE.arms {
+                if let guardExpr = arm.guardExpr, !exprIsReadOnly(varName: varName, expr: guardExpr) {
+                    return false
+                }
+                if !exprIsReadOnly(varName: varName, expr: arm.body) { return false }
+            }
+            return true
+        case .cast(let inner, _, _), .tryOp(let inner, _), .awaitExpr(let inner, _):
+            return exprIsReadOnly(varName: varName, expr: inner)
+        case .closure(let closureE):
+            return !closureMentions(varName, expr: closureE.body)
+        case .unary(let op, let inner, _):
+            switch op {
+            case .borrow, .borrowMut, .deref:
+                if exprRootIs(varName, expr: inner) { return false }
+                return exprIsReadOnly(varName: varName, expr: inner)
+            default:
+                return exprIsReadOnly(varName: varName, expr: inner)
+            }
+        case .field(let base, _, _):
+            if case .name(let n, _) = base {
+                return n != varName
+            }
+            return exprIsReadOnly(varName: varName, expr: base)
+        case .binary(let left, _, let right, _):
+            return exprIsReadOnly(varName: varName, expr: left)
+                && exprIsReadOnly(varName: varName, expr: right)
+        case .macroCall(_, let args, _):
+            for arg in args {
+                if case .expr(let e) = arg, !exprIsReadOnly(varName: varName, expr: e) {
+                    return false
+                }
+            }
+            return true
+        case .assign(let target, let value, _), .compoundAssign(let target, _, let value, _):
+            if exprRootIs(varName, expr: target) { return false }
+            return exprIsReadOnly(varName: varName, expr: target)
+                && exprIsReadOnly(varName: varName, expr: value)
+        case .returnExpr(let v, _), .breakExpr(let v, _):
+            if let v { return exprIsReadOnly(varName: varName, expr: v) }
+            return true
+        case .nextExpr:
+            return true
+        case .forExpr(let forE):
+            if exprRootIs(varName, expr: forE.iterable) { return false }
+            return exprIsReadOnly(varName: varName, expr: forE.iterable)
+                && blockIsReadOnly(varName: varName, body: forE.body)
+        case .whileExpr(let whileE):
+            return exprIsReadOnly(varName: varName, expr: whileE.condition)
+                && blockIsReadOnly(varName: varName, body: whileE.body)
+        case .loopExpr(let body, _):
+            return blockIsReadOnly(varName: varName, body: body)
+        case .handleExpr(let handleE):
+            if !exprIsReadOnly(varName: varName, expr: handleE.expr) { return false }
+            for arm in handleE.arms {
+                if !exprIsReadOnly(varName: varName, expr: arm.body) { return false }
+            }
+            return true
+        case .unlessExpr(let unlessE):
+            if !exprIsReadOnly(varName: varName, expr: unlessE.condition) { return false }
+            if !blockIsReadOnly(varName: varName, body: unlessE.body) { return false }
+            if let elseBlock = unlessE.elseBlock, !blockIsReadOnly(varName: varName, body: elseBlock) {
+                return false
+            }
+            return true
+        case .untilExpr(let untilE):
+            return exprIsReadOnly(varName: varName, expr: untilE.condition)
+                && blockIsReadOnly(varName: varName, body: untilE.body)
+        case .tryBlock(let tryB):
+            if !blockIsReadOnly(varName: varName, body: tryB.body) { return false }
+            for clause in tryB.catchClauses {
+                if !blockIsReadOnly(varName: varName, body: clause.body) { return false }
+            }
+            if let finally = tryB.finallyBlock, !blockIsReadOnly(varName: varName, body: finally) {
+                return false
+            }
+            return true
+        case .comptimeBlock(let body, _):
+            return blockIsReadOnly(varName: varName, body: body)
+        }
+    }
+
+    private func callArgsAreReadOnly(varName: String, callee: Expr, args: [CallArg]) -> Bool {
+        for (index, arg) in args.enumerated() {
+            if !callArgIsReadOnly(varName: varName, callee: callee, argIndex: index, arg: arg.value) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func callArgIsReadOnly(varName: String, callee: Expr, argIndex: Int, arg: Expr) -> Bool {
+        if case .unary(.borrow, let inner, _) = arg {
+            if exprRootIs(varName, expr: inner) {
+                if case .name(let n, _) = inner {
+                    return n != varName
+                }
+                return refParamIsLet(callee: callee, argIndex: argIndex)
+            }
+            return exprIsReadOnly(varName: varName, expr: inner)
+        }
+        return exprIsReadOnly(varName: varName, expr: arg)
+    }
+
+    private func refParamIsLet(callee: Expr, argIndex: Int) -> Bool {
+        let calleeName: String?
+        switch callee {
+        case .name(let n, _):
+            calleeName = n
+        case .path(let a, let b, _):
+            calleeName = "\(a)::\(b)"
+        default:
+            calleeName = nil
+        }
+        guard let name = calleeName,
+              let conventions = lookupFunctionConventions(name),
+              argIndex < conventions.count else {
+            return false
+        }
+        if case .letAccess = conventions[argIndex] {
+            return true
+        }
+        return false
+    }
+
+    private func closureMentions(_ varName: String, expr: Expr) -> Bool {
+        switch expr {
+        case .name(let n, _):
+            return n == varName
+        case .intLit, .floatLit, .stringLit, .charLit, .boolLit, .path:
+            return false
+        case .array(let elems, _), .tuple(let elems, _):
+            return elems.contains { closureMentions(varName, expr: $0) }
+        case .arrayRepeat(let value, let count, _):
+            return closureMentions(varName, expr: value) || closureMentions(varName, expr: count)
+        case .structLit(_, _, let fields, let rest, _):
+            if fields.contains(where: { closureMentions(varName, expr: $0.1) }) { return true }
+            if let rest { return closureMentions(varName, expr: rest) }
+            return false
+        case .block(let body, _), .unsafeBlock(_, let body, _), .comptimeBlock(let body, _):
+            return closureBlockMentions(varName, body: body)
+        case .ifExpr(let ifE):
+            if closureMentions(varName, expr: ifE.condition) { return true }
+            if closureBlockMentions(varName, body: ifE.thenBlock) { return true }
+            for clause in ifE.elsifClauses {
+                if closureMentions(varName, expr: clause.condition) { return true }
+                if closureBlockMentions(varName, body: clause.body) { return true }
+            }
+            if let elseBlock = ifE.elseBlock, closureBlockMentions(varName, body: elseBlock) { return true }
+            if let ifLetValue = ifE.ifLetValue, closureMentions(varName, expr: ifLetValue) { return true }
+            return false
+        case .call(let callee, _, let args, _):
+            if closureMentions(varName, expr: callee) { return true }
+            return args.contains { closureMentions(varName, expr: $0.value) }
+        case .index(let base, let idx, _):
+            return closureMentions(varName, expr: base) || closureMentions(varName, expr: idx)
+        case .range(let start, let end, _, _):
+            return closureMentions(varName, expr: start) || closureMentions(varName, expr: end)
+        case .matchExpr(let matchE):
+            if closureMentions(varName, expr: matchE.subject) { return true }
+            for arm in matchE.arms {
+                if let guardExpr = arm.guardExpr, closureMentions(varName, expr: guardExpr) { return true }
+                if closureMentions(varName, expr: arm.body) { return true }
+            }
+            return false
+        case .cast(let inner, _, _), .tryOp(let inner, _), .awaitExpr(let inner, _):
+            return closureMentions(varName, expr: inner)
+        case .closure(let closureE):
+            return closureMentions(varName, expr: closureE.body)
+        case .unary(_, let inner, _):
+            return closureMentions(varName, expr: inner)
+        case .field(let base, _, _):
+            return closureMentions(varName, expr: base)
+        case .binary(let left, _, let right, _):
+            return closureMentions(varName, expr: left) || closureMentions(varName, expr: right)
+        case .macroCall(_, let args, _):
+            for arg in args {
+                if case .expr(let e) = arg, closureMentions(varName, expr: e) { return true }
+            }
+            return false
+        case .assign(let target, let value, _), .compoundAssign(let target, _, let value, _):
+            return closureMentions(varName, expr: target) || closureMentions(varName, expr: value)
+        case .returnExpr(let v, _), .breakExpr(let v, _):
+            if let v { return closureMentions(varName, expr: v) }
+            return false
+        case .nextExpr:
+            return false
+        case .forExpr(let forE):
+            return closureMentions(varName, expr: forE.iterable)
+                || closureBlockMentions(varName, body: forE.body)
+        case .whileExpr(let whileE):
+            return closureMentions(varName, expr: whileE.condition)
+                || closureBlockMentions(varName, body: whileE.body)
+        case .loopExpr(let body, _):
+            return closureBlockMentions(varName, body: body)
+        case .handleExpr(let handleE):
+            if closureMentions(varName, expr: handleE.expr) { return true }
+            return handleE.arms.contains { closureMentions(varName, expr: $0.body) }
+        case .unlessExpr(let unlessE):
+            if closureMentions(varName, expr: unlessE.condition) { return true }
+            if closureBlockMentions(varName, body: unlessE.body) { return true }
+            if let elseBlock = unlessE.elseBlock { return closureBlockMentions(varName, body: elseBlock) }
+            return false
+        case .untilExpr(let untilE):
+            return closureMentions(varName, expr: untilE.condition)
+                || closureBlockMentions(varName, body: untilE.body)
+        case .tryBlock(let tryB):
+            if closureBlockMentions(varName, body: tryB.body) { return true }
+            for clause in tryB.catchClauses {
+                if closureBlockMentions(varName, body: clause.body) { return true }
+            }
+            if let finally = tryB.finallyBlock { return closureBlockMentions(varName, body: finally) }
+            return false
+        }
+    }
+
+    private func closureBlockMentions(_ varName: String, body: BlockBody) -> Bool {
+        for stmt in body.stmts {
+            if closureStmtMentions(varName, stmt: stmt) { return true }
+        }
+        if let tail = body.tailExpr, closureMentions(varName, expr: tail) { return true }
+        return false
+    }
+
+    private func closureStmtMentions(_ varName: String, stmt: Stmt) -> Bool {
+        switch stmt {
+        case .letBinding(_, _, _, let value, _):
+            return closureMentions(varName, expr: value)
+        case .exprStmt(let expr, _):
+            return closureMentions(varName, expr: expr)
+        case .attributeStmt:
+            return false
+        case .attributed(_, let inner, _):
+            return closureStmtMentions(varName, stmt: inner)
+        case .deferStmt(let body, _):
+            return closureBlockMentions(varName, body: body)
+        case .item:
+            return false
+        }
+    }
+
+    private func lowerProjectedFor(_ forE: ForExpr, varName: String, patMut: Bool,
+                                   iterType: MirType, elemTy: MirType) {
+        guard let iterPlace = exprToPlace(forE.iterable) else { return }
+        let iterLocal = freshTemp(type: iterType)
+        emit(.assign(.local(iterLocal), .use(.copy(iterPlace))))
+
+        // Index variable: _idx = 0
+        let idxLocal = freshTemp()
+        emit(.assign(.local(idxLocal), .use(.constant(.int(0)))))
+
+        // Length of collection, evaluated once at entry
+        let lenLocal = freshTemp()
+        emit(.assign(.local(lenLocal), .len(.local(iterLocal))))
+
+        let condBB = freshBlock()
+        let bodyBB = freshBlock()
+        let incrBB = freshBlock()
+        let exitBB = freshBlock()
+
+        terminateWith(.goto(condBB))
+
+        // Condition: idx < len
+        currentBlock = condBB
+        let cmpTmp = freshTemp()
+        emit(.assign(.local(cmpTmp), .binaryOp(.lt, .copy(.local(idxLocal)), .copy(.local(lenLocal)))))
+        terminateWith(.switchInt(.copy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
+
+        // Body: let x = &iter[idx]; execute body
+        currentBlock = bodyBB
+        loopBreakTargets.append(exitBB)
+        loopContinueTargets.append(incrBB)
+        pushScope()
+        let xLocal = freshLocal(name: varName, type: .ref(elemTy, mutable: false), mutable: patMut)
+        defineInScope(varName, xLocal)
+        emit(.assign(.local(xLocal), .ref(.shared, MirPlace(local: iterLocal, projections: [.index(idxLocal)]))))
+        let tmp = freshTemp()
+        lowerBlock(forE.body, resultInto: tmp)
+        popScope()
+        loopBreakTargets.removeLast()
+        loopContinueTargets.removeLast()
+        terminateIfNeeded(.goto(incrBB))
+
+        // Increment: idx = idx + 1, then back to condition
+        currentBlock = incrBB
+        let incTmp = freshTemp()
+        emit(.assign(.local(incTmp), .binaryOp(.add, .copy(.local(idxLocal)), .constant(.int(1)))))
+        emit(.assign(.local(idxLocal), .use(.copy(.local(incTmp)))))
+        terminateWith(.goto(condBB))
+
+        currentBlock = exitBB
+    }
+
     private func lowerFor(_ forE: ForExpr) -> MirOperand {
+        if let projected = tryLowerForProjected(forE) {
+            return projected
+        }
         let iterableOp = lowerExpr(forE.iterable)
         let iterableLocal = placeOf(iterableOp)
 
