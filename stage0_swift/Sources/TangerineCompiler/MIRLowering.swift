@@ -1684,13 +1684,29 @@ public final class MIRLowering {
         guard let iterType = iterablePlaceType(forE.iterable) else { return nil }
         guard let elemTy = projectedCollectionElementType(iterType) else { return nil }
         guard forBodyIsReadOnly(varName: varName, body: forE.body) else { return nil }
+        if indexMentionsLoopVar(varName: varName, expr: forE.iterable) {
+            return nil
+        }
         lowerProjectedFor(forE, varName: varName, patMut: patMut, iterType: iterType, elemTy: elemTy)
         return .constant(.unit)
+    }
+
+    private func indexMentionsLoopVar(varName: String, expr: Expr) -> Bool {
+        switch expr {
+        case .index(let base, let idx, _):
+            if !exprIsReadOnly(varName: varName, expr: idx) { return true }
+            return indexMentionsLoopVar(varName: varName, expr: base)
+        case .field(let base, _, _):
+            return indexMentionsLoopVar(varName: varName, expr: base)
+        default:
+            return false
+        }
     }
 
     private func iterablePlaceType(_ expr: Expr) -> MirType? {
         switch expr {
         case .name(let n, _):
+            if n == "self" { return nil }
             guard let id = lookupScope(n) else { return nil }
             return locals[id].type
         case .field(let base, let field, _):

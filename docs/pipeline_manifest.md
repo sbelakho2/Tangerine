@@ -18,29 +18,30 @@ Each stage runs to completion before the next begins.
 | 1 | Lexing | `tokenize(source)` | lexer.tg |
 | 2 | Parsing | `parse(lex_result)` | parser.tg |
 | 3 | Macro Expansion | `expand_macros(ast)` | parser.tg |
-| 4 | Type Checking | `type_check(&ast)` | types.tg |
-| 5 | Borrow Checking | `borrow_check(&ast)` | borrow_check.tg |
-| 6 | MIR Lowering | `lower_to_mir(&ast)` | mir.tg |
-| 7 | Monomorphization | `monomorphize_program(&mut mir, &mut mono_cache)` | trait_resolve.tg |
-| 8 | PGO Instrumentation | `instrument_for_pgo(&mut mir)` | mir.tg |
-| 9 | PGO Profile Load | `apply_pgo_profile(&mut mir, profile)` | mir.tg |
-| 10 | MIR Optimization | `optimize_mir(&mut mir, opt_level)` | mir.tg |
-| 11 | Code Generation | `generate_code(target, mir)` | codegen.tg |
-| 12 | Object Generation | `generate_object_file(code, target)` | object.tg |
-| 13 | Linking | `link(objects, target)` | linker.tg |
+| 4 | Type Checking | `type_check_typed(&mut env, &ast, &res)` | types.tg |
+| 5 | Access Checking | `access_check(&ast)` | access_check.tg |
+| 6 | Resource Checking | `resource_check(&ast, type_kinds)` | resource_check.tg |
+| 7 | MIR Lowering | `lower_to_mir(&ast)` | mir.tg |
+| 8 | Monomorphization | `monomorphize_program(&mut mir, &mut mono_cache)` | trait_resolve.tg |
+| 9 | PGO Instrumentation | `instrument_for_pgo(&mut mir)` | mir.tg |
+| 10 | PGO Profile Load | `apply_pgo_profile(&mut mir, profile)` | mir.tg |
+| 11 | MIR Optimization | `optimize_mir(&mut mir, opt_level)` | mir.tg |
+| 12 | Code Generation | `generate_code(target, mir)` | codegen.tg |
+| 13 | Object Generation | `generate_object_file(code, target)` | object.tg |
+| 14 | Linking | `link(objects, target)` | linker.tg |
 
 ### Early Exit Points
 
-- `--check` mode: exits after Stage 2 (Parsing). No lowering or codegen.
-- `--emit-mir` mode: exits after Stage 10 (MIR Optimization). No codegen.
-- Any error in stages 2, 4, or 5 causes a hard stop.
+- `--check` mode: exits after Stage 7 (MIR Lowering, verified). No codegen.
+- `--emit-mir` mode: exits after Stage 11 (MIR Optimization). No codegen.
+- Any error in stages 2, 4, 5, or 6 causes a hard stop.
 
 ### Alternative Pipelines
 
 | Pipeline | Stages | Entry |
 |----------|--------|-------|
-| `compile()` | 1–13 | lib.tg |
-| `check()` | 1–5 | lib.tg |
+| `compile()` | 1–14 | lib.tg |
+| `check()` | 1–7 | lib.tg |
 | `parse_only()` | 1–2 | lib.tg |
 
 ---
@@ -53,9 +54,10 @@ Each stage runs to completion before the next begins.
 | Parsing | Convert tokens to AST | Infer types, resolve imports |
 | Macro Expansion | Replace macro invocations with expanded AST | Introduce new types, modify semantics |
 | Type Checking | Infer and validate types, generics, bounds | Mutate ownership, emit code |
-| Borrow Checking | Validate ownership, moves, borrows, lifetimes | Modify types, emit code |
+| Access Checking | Validate per-call access overlap; enforce exclusivity of Modify/Consume/Initialize | Modify types, emit code |
+| Resource Checking | Validate resource state flow (consumption, capability transfer, deinit) | Modify types, emit code |
 | MIR Lowering | Convert typed AST to control-flow graph (SSA) | Optimize, select instructions |
-| Monomorphization | Instantiate generic functions with concrete types | Re-type-check, re-borrow-check |
+| Monomorphization | Instantiate generic functions with concrete types | Re-type-check, re-access/resource-check |
 | PGO Instrumentation | Insert profiling counters in MIR | Optimize, change semantics |
 | PGO Profile Load | Apply profile data to MIR annotations | Optimize, change semantics |
 | MIR Optimization | Transform MIR for performance (DCE, inlining) | Change observable semantics |
@@ -73,8 +75,9 @@ Each stage runs to completion before the next begins.
 | Parsing | `LexResult` | `Program` (AST) | Program |
 | Macro Expansion | `Program` | `Program` (macros removed) | Program |
 | Type Checking | `Program` | `Program` (type-annotated) + type errors | Program |
-| Borrow Checking | `Program` (typed) | `Program` (ownership-verified) + borrow errors | Program |
-| MIR Lowering | `Program` (typed, borrow-checked) | `MirProgram` (CFG, SSA) | MirProgram |
+| Access Checking | `Program` (typed) | `Program` (access-verified) + access errors | Program |
+| Resource Checking | `Program` (access-verified) | `Program` (resource-verified) + resource errors | Program |
+| MIR Lowering | `Program` (typed, access/resource-checked) | `MirProgram` (CFG, SSA) | MirProgram |
 | Monomorphization | `MirProgram` | `MirProgram` (generic-free) | MirProgram (mutated) |
 | PGO Instrumentation | `MirProgram` | `MirProgram` (instrumented) | MirProgram (mutated) |
 | PGO Profile Load | `MirProgram` + profile file | `MirProgram` (annotated) | MirProgram (mutated) |
@@ -94,7 +97,8 @@ Each stage runs to completion before the next begins.
 | Parsed AST | VERIFIED at boundary | Parser emits diagnostics; hard stop on error |
 | Macro-expanded AST | UNVERIFIED | Expansion not re-validated after transform |
 | Type-annotated AST | VERIFIED at boundary | Type checker emits diagnostics; hard stop on error |
-| Borrow-checked AST | VERIFIED at boundary | Borrow checker emits diagnostics; hard stop on error |
+| Access-checked AST | VERIFIED at boundary | Access checker emits diagnostics; hard stop on error |
+| Resource-checked AST | VERIFIED at boundary | Resource checker emits diagnostics; hard stop on error |
 | MIR (lowered) | UNVERIFIED | No post-lowering validation |
 | MIR (monomorphized) | UNVERIFIED | No post-mono validation |
 | MIR (optimized) | UNVERIFIED | No post-optimization validation |
@@ -123,14 +127,14 @@ Three artifacts transition from VERIFIED to UNVERIFIED without validation:
 |-------|----------|----------|--------|
 | Macro expansion happens post-parse, loses source provenance | driver.tg Phase 2.5 | Medium | DOCUMENTED — macro declarations are preserved as inert AST in bootstrap; stage0 does not expand them |
 | PGO profile load failure is a silent warning, not a hard error | driver.tg line 817 | Low | DOCUMENTED — PGO not in bootstrap subset |
-| Name resolution not shown as separate stage in driver | driver.tg | Info | DOCUMENTED — resolver.tg exists but is invoked within type_check |
+| Name resolution not shown as separate stage in driver | driver.tg | Info | RESOLVED — resolve_names(&ast) runs as an explicit driver step before type_check_typed |
 
 ### Resolution
 
 In the bootstrap subset, none of the problematic cross-stage leakage paths are reachable:
 - Macro declarations are preserved as inert AST, and stage0 lowers macro invocations explicitly without executing user macro bodies.
 - PGO is not part of the bootstrap subset.
-- Name resolution within type_check is a design choice, not a leak.
+- Name resolution (resolve_names) runs as an explicit driver step ahead of type_check_typed; it is a design choice, not a leak.
 
 No silent cross-stage work leakage exists in the bootstrap pipeline.
 
@@ -143,7 +147,7 @@ No silent cross-stage work leakage exists in the bootstrap pipeline.
 | Silent default typing fallback | No | Parser and type checker fail hard |
 | Symbol invention/recovery | No | Unresolved symbols are errors |
 | Placeholder IR emission | No | MIR lowering does not emit placeholders |
-| Ownership weakening | No | Borrow checker is strict |
+| Ownership weakening | No | Access/resource checkers are strict |
 | PGO profile load silent fallback | Yes (warning only) | Not in bootstrap subset |
 
 No fallback paths bypass normal stages in the bootstrap subset.

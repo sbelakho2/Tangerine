@@ -9,9 +9,9 @@ MIR is the compiler's canonical narrow waist. All stages below type checking
 target MIR, and all stages above codegen consume MIR.
 
 ```
-Source → Tokens → AST → [Type Check] → [Borrow Check] → MIR → [Optimize] → Codegen → Object → Executable
-                                                          ^^^
-                                                    Canonical IR
+Source → Tokens → AST → [Type Check] → [Access Check] → [Resource Check] → MIR → [Optimize] → Codegen → Object → Executable
+                                                                           ^^^
+                                                                     Canonical IR
 ```
 
 ---
@@ -186,7 +186,7 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 |----|--------|----------|
 | AST (parsed) | Non-canonical | Verified at parse boundary |
 | AST (typed) | Non-canonical | Verified at type-check boundary |
-| AST (borrow-checked) | Non-canonical | Verified at borrow-check boundary |
+| AST (access/resource-checked) | Non-canonical | Verified at access/resource-check boundary |
 | MIR (lowered from AST) | **CANONICAL** | Verified by MIR verifier |
 | MIR (optimized) | **CANONICAL** | Should be re-verified (Stage 5 work) |
 | CodeBuffer (from codegen) | Non-canonical | Not independently verified |

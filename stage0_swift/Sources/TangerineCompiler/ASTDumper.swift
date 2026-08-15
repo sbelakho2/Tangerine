@@ -152,7 +152,7 @@ public final class ASTDumper {
             emit("Params:")
             push()
             for p in d.sig.params {
-                emit("\(p.name)\(p.isMutable ? " [mut]" : "")\(conventionTag(p.convention))")
+                emit("\(p.name)\(p.isMutable ? " [mut]" : "")\(conventionTag(p.convention))\(modifierTag(p.modifier))")
                 push(); dumpTypeExpr(p.type); pop()
             }
             pop()
@@ -171,6 +171,17 @@ public final class ASTDumper {
         case .inoutAccess: return " [inout]"
         case .sink:        return " [sink]"
         case .set:         return " [set]"
+        }
+    }
+
+    private func modifierTag(_ m: ParamModifier?) -> String {
+        switch m {
+        case .mut:    return " [mod:mut]"
+        case .ref:    return " [mod:ref]"
+        case .refMut: return " [mod:refmut]"
+        case .move:   return " [mod:move]"
+        case .own:    return " [mod:own]"
+        case nil:     return ""
         }
     }
 

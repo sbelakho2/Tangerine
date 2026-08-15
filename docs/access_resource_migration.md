@@ -176,3 +176,43 @@ MirCallArg { effect: AccessEffect, value: MirCallValue }; MirCallValue = Value(M
 MirRead(Place)/MirConsume(Place) replace MirCopy/MirMovePlace and MirRef/MirRefMut;
 no general MirRef value; MirDrop → MirDeinit (auto/explicit/unsafe-raw distinguished);
 ProjDeref removed for safe places (ProjRawDeref only, unsafe).
+
+## Audit results (post-wave-12)
+
+Audit date: 2026-08-15.
+
+The transition is structurally sound through wave 12: the driver pipeline now
+runs lex → parse → expand → assign_node_ids → resolve → type_check_typed →
+access_check → resource_check → MIR → verify → monomorphize → optimize →
+codegen, and one critical item was fixed by this audit — the pipeline manifest
+closure (all borrow-check references replaced with the access/resource stages;
+docs/pipeline_manifest.md, docs/invariants.md, docs/canonical_ir_spec.md,
+tools/type_check_gate.tg). The key latent items below remain, in priority order:
+
+1. TypedProgram is produced but not consumed by MIR (call_targets/
+   field_targets/access_effects/type_kinds empty; DefId never constructed) —
+   the central architecture flip.
+2. MirRead/MirConsume/MirDeinit are never emitted by lowering; codegen drops
+   arg_effects; MirCallArg{effect,value} not implemented.
+3. Expression-level `&` still parses to ExprRef→MirRef (spec: ExprAccess) —
+   references survive end-to-end; `let r = &x` not rejected.
+4. Resource auto-deinit not wired (MirDeinit never emitted; deinit is only a
+   user method).
+5. trait_resolve method identity is convention-blind (Type only).
+6. Type::Ref/RefMut/Owned + Lifetime deletion pending; collections
+   get→&T/ArrayIterator pending; COW pending.
+7. Resolver declaration pass duplication (point 23).
+8. TypeEnv lookups return TypeDef by value (point 26).
+9. layout_of_concrete has no callers; permissive fallbacks still live in
+   codegen's path (point 25 partial).
+10. No access/resource canary suite yet (point 32).
+11. compiler_core.tg split pending; DRIVER_SRC still driver.tg
+    (transitional); tooling temporarily back in the manifest.
+12. Strictness is flag-driven, not the default compilation semantics
+    (point 29 partial).
+13. Docs rewrite (grammar/memory model/language) pending — this doc remains
+    the reference until then.
+14. Closure capture-effect inference (point 19) not started.
+15. Final ladder: stage0→stage1→stage2→stage3, stage2==stage3, clean-root
+    determinism, canary suite — pending until all of the above are complete
+    (per the migration rule: no bootstrap runs until the migration is done).

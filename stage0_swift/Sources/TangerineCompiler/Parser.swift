@@ -834,18 +834,20 @@ public final class Parser {
             var convention = AccessConvention.letAccess
             var legacyRef = false
             var legacyRefMut = false
-            if at(.kwInout) {
+            var modifier: ParamModifier? = nil
+            if at(.kwInout), peekAhead(1) != .colon {
                 advance()
                 convention = .inoutAccess
-            } else if at(.kwSink) {
+            } else if at(.kwSink), peekAhead(1) != .colon {
                 advance()
                 convention = .sink
-            } else if at(.kwSet) {
+            } else if at(.kwSet), peekAhead(1) != .colon {
                 advance()
                 convention = .set
             } else if at(.kwMut) {
                 advance()
                 convention = .inoutAccess
+                modifier = .mut
             } else if at(.amp) {
                 advance()
                 if at(.kwMut) {
@@ -853,16 +855,20 @@ public final class Parser {
                     convention = .inoutAccess
                     legacyRef = true
                     legacyRefMut = true
+                    modifier = .refMut
                 } else {
                     convention = .letAccess
                     legacyRef = true
+                    modifier = .ref
                 }
             } else if case .ident("move") = peekKind(), peekAhead(1) != .colon {
                 advance()
                 convention = .sink
+                modifier = .move
             } else if case .ident("own") = peekKind(), peekAhead(1) != .colon {
                 advance()
                 convention = .sink
+                modifier = .own
             }
 
             let isSelf = at(.kwSelfValue)
@@ -876,7 +882,6 @@ public final class Parser {
                 // bare self (implicit Self type)
                 type = .selfType(start.merged(with: currentSpan))
             } else {
-                expect(.colon)
                 type = .inferred(currentSpan)
             }
 
@@ -891,7 +896,7 @@ public final class Parser {
                 defaultVal = parseExpr()
             }
             params.append(Param(name: name, isMutable: isMutable, convention: convention,
-                                type: type, defaultValue: defaultVal,
+                                modifier: modifier, type: type, defaultValue: defaultVal,
                                 span: start.merged(with: currentSpan)))
             if !at(.rParen) { eat(.comma) }
         }

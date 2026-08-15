@@ -28,7 +28,7 @@ struct ResFrame
   spans: Map[String, Span]
 end
 
-def resource_check(program: &Program, type_kinds: &Map[String, TypeKind]) -> Vec[ResourceError]
+pub def resource_check(program: &Program, type_kinds: &Map[String, TypeKind]) -> Vec[ResourceError]
   mut errors = Vec::new()
   mut i = 0
   while i < program.items.len() do
@@ -119,7 +119,9 @@ def check_function(program: &Program, type_kinds: &Map[String, TypeKind], f: &Fu
     i = i + 1
   end
   check_fn_body(program, type_kinds, &f.body, &mut frame, errors)
-  exit_scope(&mut frame, &Vec::new(), errors)
+  let entry_names = fn_param_names(&f.params)
+  exit_scope(&mut frame, &entry_names, errors)
+  check_uninitialized_exit(&frame, errors)
 end
 
 def check_trait_method(program: &Program, type_kinds: &Map[String, TypeKind], m: &TraitMethod, errors: &mut Vec[ResourceError]) -> Unit
@@ -127,7 +129,9 @@ def check_trait_method(program: &Program, type_kinds: &Map[String, TypeKind], m:
   bind_params(type_kinds, &m.sig.params, &mut frame)
   check_params_defaults(program, type_kinds, &m.sig.params, &mut frame, errors)
   check_fn_body(program, type_kinds, &m.default_body, &mut frame, errors)
-  exit_scope(&mut frame, &Vec::new(), errors)
+  let entry_names = fn_param_names(&m.sig.params)
+  exit_scope(&mut frame, &entry_names, errors)
+  check_uninitialized_exit(&frame, errors)
 end
 
 def bind_params(type_kinds: &Map[String, TypeKind], params: &Vec[Param], frame: &mut ResFrame) -> Unit
@@ -136,6 +140,16 @@ def bind_params(type_kinds: &Map[String, TypeKind], params: &Vec[Param], frame: 
     bind_param(type_kinds, &params[i], frame)
     i = i + 1
   end
+end
+
+def fn_param_names(params: &Vec[Param]) -> Vec[String]
+  mut out = Vec::new()
+  mut i = 0
+  while i < params.len() do
+    out.push(params[i].name.clone())
+    i = i + 1
+  end
+  out
 end
 
 def bind_param(type_kinds: &Map[String, TypeKind], p: &Param, frame: &mut ResFrame) -> Unit
@@ -203,7 +217,7 @@ def check_stmt(program: &Program, type_kinds: &Map[String, TypeKind], stmt: &Stm
     check_expr(program, type_kinds, &value, loop_outer, frame, errors)
     bind_pattern(type_kinds, &pattern, &ty, stmt.span, frame)
   when StmtKind::StmtAssign(target, value) then
-    check_expr(program, type_kinds, &target, loop_outer, frame, errors)
+    check_assign_target(program, type_kinds, &target, loop_outer, frame, errors)
     check_expr(program, type_kinds, &value, loop_outer, frame, errors)
   when StmtKind::StmtCompoundAssign(_, target, value) then
     check_expr(program, type_kinds, &target, loop_outer, frame, errors)
@@ -537,7 +551,9 @@ def check_expr(program: &Program, type_kinds: &Map[String, TypeKind], expr: &Exp
       i = i + 1
     end
     check_expr(program, type_kinds, &body, &Vec::new(), &mut cframe, errors)
-    exit_scope(&mut cframe, &Vec::new(), errors)
+    let entry_names = closure_param_names(&params)
+    exit_scope(&mut cframe, &entry_names, errors)
+    check_uninitialized_exit(&cframe, errors)
   when ExprKind::ExprRef(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
   when ExprKind::ExprRefMut(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
   when ExprKind::ExprDeref(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
@@ -575,7 +591,7 @@ def check_expr(program: &Program, type_kinds: &Map[String, TypeKind], expr: &Exp
       i = i + 1
     end
   when ExprKind::ExprAssign(target, value) then
-    check_expr(program, type_kinds, &target, loop_outer, frame, errors)
+    check_assign_target(program, type_kinds, &target, loop_outer, frame, errors)
     check_expr(program, type_kinds, &value, loop_outer, frame, errors)
   when ExprKind::ExprPipe(lhs, rhs) then
     check_expr(program, type_kinds, &lhs, loop_outer, frame, errors)
@@ -619,6 +635,7 @@ def check_expr_call(program: &Program, type_kinds: &Map[String, TypeKind], calle
 end
 
 def check_expr_method_call(program: &Program, type_kinds: &Map[String, TypeKind], receiver: &Expr, method: &String, args: &Vec[Expr], loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  let is_deinit = *method == "deinit"
   match find_method(program, method)
   when Option::Some(params) then
     mut self_idx = -1
@@ -630,7 +647,9 @@ def check_expr_method_call(program: &Program, type_kinds: &Map[String, TypeKind]
       end
       i = i + 1
     end
-    let recv_effect = if self_idx >= 0 then
+    let recv_effect = if is_deinit then
+      AccessEffect::Consume
+    elsif self_idx >= 0 then
       match params[self_idx].convention
       when AccessConvention::Inout then AccessEffect::Modify
       when AccessConvention::Sink then AccessEffect::Consume
@@ -646,12 +665,33 @@ def check_expr_method_call(program: &Program, type_kinds: &Map[String, TypeKind]
       i = i + 1
     end
   when Option::None then
-    apply_arg_effect(program, type_kinds, receiver, AccessEffect::Read, loop_outer, frame, errors)
+    let recv_effect = if is_deinit then AccessEffect::Consume else AccessEffect::Read end
+    apply_arg_effect(program, type_kinds, receiver, recv_effect, loop_outer, frame, errors)
     mut i = 0
     while i < args.len() do
       apply_arg_effect(program, type_kinds, &args[i], AccessEffect::Read, loop_outer, frame, errors)
       i = i + 1
     end
+  end
+end
+
+def check_assign_target(program: &Program, type_kinds: &Map[String, TypeKind], target: &Expr, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match expr_root_name(target)
+  when Option::Some(name) then
+    if res_frame_has(frame, &name) then
+      match res_frame_get(frame, &name)
+      when Option::Some(ResourceState::Uninitialized) then
+        if expr_is_plain(target) then
+          apply_set(&name, frame)
+        else
+          check_use(&name, target.span, frame, errors)
+        end
+      when _ then
+        check_use(&name, target.span, frame, errors)
+      end
+    end
+  when Option::None then
+    check_expr(program, type_kinds, target, loop_outer, frame, errors)
   end
 end
 
@@ -748,6 +788,11 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[String], errors: &mut Vec
             span: frame_span(frame, &name)
           })
         end
+      when Option::Some(ResourceState::Uninitialized) then
+        errors.push(ResourceError {
+          message: "resource `" + name + "` left uninitialized",
+          span: frame_span(frame, &name)
+        })
       when _ then ()
       end
       to_forget.push(name)
@@ -757,6 +802,22 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[String], errors: &mut Vec
   i = 0
   while i < to_forget.len() do
     res_frame_forget(frame, &to_forget[i])
+    i = i + 1
+  end
+end
+
+def check_uninitialized_exit(frame: &ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  mut i = 0
+  while i < frame.names.len() do
+    let name = frame.names[i].clone()
+    match res_frame_get(frame, &name)
+    when Option::Some(ResourceState::Uninitialized) then
+      errors.push(ResourceError {
+        message: "resource `" + name + "` left uninitialized",
+        span: frame_span(frame, &name)
+      })
+    when _ then ()
+    end
     i = i + 1
   end
 end
@@ -991,6 +1052,19 @@ def bind_closure_param(type_kinds: &Map[String, TypeKind], cp: &ClosureParam, fr
     end
   when _ then ()
   end
+end
+
+def closure_param_names(params: &Vec[ClosureParam]) -> Vec[String]
+  mut out = Vec::new()
+  mut i = 0
+  while i < params.len() do
+    match params[i].pat.kind
+    when PatternKind::Ident(name, _) then out.push(name.clone())
+    when _ then ()
+    end
+    i = i + 1
+  end
+  out
 end
 
 def expr_root_name(expr: &Expr) -> Option[String]

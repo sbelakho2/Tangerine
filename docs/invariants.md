@@ -46,14 +46,14 @@ Every invariant has a unique ID, a description, and a severity level.
 | INV-TYPE-008 | Type Checking | Integer literals fit declared type width | warning |
 | INV-TYPE-009 | Type Checking | Enum variant construction matches variant signature | error |
 | INV-TYPE-010 | Type Checking | Trait objects use dyn keyword | error |
-| INV-OWN-001 | Borrow Checking | No use-after-move errors | error |
-| INV-OWN-002 | Borrow Checking | At most one mutable borrow at a time | error |
-| INV-OWN-003 | Borrow Checking | No mutable aliasing through closures | error |
-| INV-OWN-004 | Borrow Checking | Lifetime annotations are consistent | error |
-| INV-OWN-005 | Borrow Checking | Shared borrows are valid for their duration | error |
-| INV-OWN-006 | Borrow Checking | Move semantics preserve linear ownership | error |
-| INV-OWN-007 | Borrow Checking | Copy types allow implicit duplication | error |
-| INV-OWN-008 | Borrow Checking | Drop order follows declaration reverse order | error |
+| INV-OWN-001 | Access Checking | Per-call access overlap is exclusive for Modify/Consume/Initialize | error |
+| INV-OWN-002 | Access Checking | At most one mutable access is active per call | error |
+| INV-OWN-003 | Access Checking | Access duration is the containing call | error |
+| INV-OWN-004 | Access Checking | Fixed struct fields are statically disjoint under access checks | error |
+| INV-OWN-005 | Resource Checking | Resource locals are consumed at most once per CFG path | error |
+| INV-OWN-006 | Resource Checking | Capabilities are transferred exactly once | error |
+| INV-OWN-007 | Resource Checking | Resources created in a loop are consumed per iteration | error |
+| INV-OWN-008 | Resource Checking | Resources are auto-deinitialized at scope exit in declaration reverse order | error |
 | INV-LOWER-001 | MIR Lowering | Every AST function produces at least one MIR basic block | error |
 | INV-LOWER-002 | MIR Lowering | All local variables are allocated in scope | error |
 | INV-LOWER-003 | MIR Lowering | Terminators are only at block ends | error |

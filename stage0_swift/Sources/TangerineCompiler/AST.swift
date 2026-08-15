@@ -155,18 +155,28 @@ public struct Param {
     public var name: String
     public var isMutable: Bool
     public var convention: AccessConvention
+    public var modifier: ParamModifier?
     public var type: TypeExpr
     public var defaultValue: Expr?
     public var span: Span
 
-    public init(name: String, isMutable: Bool = false, convention: AccessConvention, type: TypeExpr, defaultValue: Expr? = nil, span: Span) {
+    public init(name: String, isMutable: Bool = false, convention: AccessConvention, modifier: ParamModifier? = nil, type: TypeExpr, defaultValue: Expr? = nil, span: Span) {
         self.name = name
         self.isMutable = isMutable
         self.convention = convention
+        self.modifier = modifier
         self.type = type
         self.defaultValue = defaultValue
         self.span = span
     }
+}
+
+public enum ParamModifier {
+    case mut
+    case ref
+    case refMut
+    case move
+    case own
 }
 
 public enum AccessConvention {
