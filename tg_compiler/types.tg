@@ -15,6 +15,7 @@ use tg_compiler::token::{Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::resolver::{ResolvedNames}
+use tg_compiler::ids::{DefId, DefKind, FieldId, TypeId}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
@@ -100,10 +101,6 @@ end
 struct ParamType
   ty: Type
   convention: AccessConvention
-end
-
-struct TypeId
-  id: Int
 end
 
 struct TypeVarId
@@ -210,7 +207,10 @@ struct TypeEnv
   local_ids: Vec[Map[String, Int]]
   resolutions: Option[ResolvedNames]
   typed_call_targets: Map[Int, DefId]
-  typed_field_targets: Map[Int, String]
+  typed_field_targets: Map[Int, FieldId]
+  typed_local_bindings: Map[Int, LocalBinding]
+  typed_ident_resolutions: Map[Int, Int]
+  typed_access_effects: Map[Int, AccessEffect]
 end
 
 struct ImplInfo
@@ -222,7 +222,7 @@ end
 struct MethodInfo
   name: String
   ret_type: Type
-  params: Vec[Type]
+  params: Vec[ParamType]
   generic_params: Vec[String]  # Method-level generic param names (e.g., ["U"] for cast[U])
 end
 
@@ -239,9 +239,9 @@ enum AccessEffect
   Initialize
 end
 
-struct DefId
-  module: String
-  index: UInt
+struct LocalBinding
+  name: String
+  ty: Type
 end
 
 struct TypedProgram
@@ -249,8 +249,10 @@ struct TypedProgram
   resolutions: ResolvedNames
   expr_types: Map[Int, Type]
   call_targets: Map[Int, DefId]
-  field_targets: Map[Int, String]
+  field_targets: Map[Int, FieldId]
   access_effects: Map[Int, AccessEffect]
+  local_bindings: Map[Int, LocalBinding]
+  ident_resolutions: Map[Int, Int]
   type_kinds: Map[Int, TypeKind]
 end
 
@@ -283,7 +285,10 @@ def type_env_new() -> TypeEnv
     local_ids: Vec::new(),
     resolutions: Option::None,
     typed_call_targets: Map::new(),
-    typed_field_targets: Map::new()
+    typed_field_targets: Map::new(),
+    typed_local_bindings: Map::new(),
+    typed_ident_resolutions: Map::new(),
+    typed_access_effects: Map::new()
   }
   
   # Register types that are !Send / !Sync
@@ -760,8 +765,9 @@ end
 def bind_var(env: &mut TypeEnv, name: String, ty: Type) -> Unit
   if !env.scopes.is_empty() then
     let idx = env.scopes.len() - 1
-    env.scopes[idx].insert(name.clone(), ty)
-    env.local_ids[idx].insert(name, env.local_id_counter)
+    env.scopes[idx].insert(name.clone(), ty.clone())
+    env.local_ids[idx].insert(name.clone(), env.local_id_counter)
+    env.typed_local_bindings.insert(env.local_id_counter, LocalBinding { name: name.clone(), ty: ty })
     env.local_id_counter = env.local_id_counter + 1
   end
 end
@@ -2619,7 +2625,6 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
 end
 
 def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
-  env.local_id_counter = 0
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   
@@ -2719,7 +2724,7 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
         when Option::None then fresh_type_var(env)
         end
       end
-      param_types.push(ty)
+      param_types.push(ParamType { ty: ty, convention: p.convention })
       param_index = param_index + 1
     end
 
@@ -2785,7 +2790,6 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
   method_index = 0
   while method_index < i.methods.len() do
     let m = i.methods[method_index]
-    env.local_id_counter = 0
     push_scope(env)
 
     # Register method-level generic type parameters in scope
@@ -3430,6 +3434,163 @@ end
 # Expression Type Checking
 # ———————————————————————————————————————————————————————————————
 
+def convention_to_effect(c: AccessConvention) -> AccessEffect
+  match c
+  when AccessConvention::Let then AccessEffect::Read
+  when AccessConvention::Inout then AccessEffect::Modify
+  when AccessConvention::Sink then AccessEffect::Consume
+  when AccessConvention::Set then AccessEffect::Initialize
+  end
+end
+
+def record_arg_effect(env: &mut TypeEnv, arg: &Expr, c: AccessConvention) -> Unit
+  let effect = convention_to_effect(c)
+  env.typed_access_effects.insert(arg.node_id, effect)
+  match arg.kind
+  when ExprKind::ExprRef(inner) then env.typed_access_effects.insert(inner.node_id, effect)
+  when ExprKind::ExprRefMut(inner) then env.typed_access_effects.insert(inner.node_id, effect)
+  when _ then ()
+  end
+end
+
+def resolved_receiver_base(env: &TypeEnv, recv_type: &Type) -> Type
+  let base = match recv_type
+  when Type::Ref(inner, _) then inner
+  when Type::RefMut(inner, _) then inner
+  when Type::Owned(inner) then inner
+  when Type::Box(inner) then inner
+  when _ then recv_type
+  end
+  match base
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Alias(inner) then inner.clone()
+      when _ then base.clone()
+      end
+    when Option::None then base.clone()
+    end
+  when _ then base.clone()
+  end
+end
+
+def resolver_method_key(env: &TypeEnv, recv_type: &Type, method: String) -> String
+  let base = resolved_receiver_base(env, recv_type)
+  var name = "".to_string()
+  var generic = false
+  match base
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      name = td.name.clone()
+      generic = td.generic_params.len() > 0
+    when Option::None then ()
+    end
+  when Type::String then name = "String"
+  when Type::Int then name = "Int"
+  when Type::UInt then name = "UInt"
+  when Type::Float then name = "Float"
+  when Type::Bool then name = "Bool"
+  when Type::Char then name = "Char"
+  when Type::Slice(_) then name = "Slice"; generic = true
+  when Type::Array(_, _) then name = "Array"; generic = true
+  when Type::Option(_) then name = "Option"; generic = true
+  when Type::Result(_, _) then name = "Result"; generic = true
+  when Type::Map(_, _) then name = "Map"; generic = true
+  when Type::Set(_) then name = "Set"; generic = true
+  when Type::Box(_) then name = "Box"; generic = true
+  when Type::Rc(_) then name = "Rc"; generic = true
+  when Type::Ptr(_) then name = "Ptr"; generic = true
+  when Type::PtrMut(_) then name = "PtrMut"; generic = true
+  when Type::Owned(_) then name = "Owned"; generic = true
+  when _ then ()
+  end
+  if name == "" then return "".to_string() end
+  var key = if generic then name + "[...]" else name end
+  key + "::" + method
+end
+
+def method_def_for(env: &TypeEnv, recv_type: &Type, method: String) -> Option[DefId]
+  let key = resolver_method_key(env, recv_type, method)
+  if key == "" then return Option::None end
+  match env.resolutions
+  when Option::Some(res) then
+    match res.method_defs.get(key)
+    when Option::Some(did) then Option::Some(did)
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Option[Vec[ParamType]]
+  let resolved_base = resolved_receiver_base(env, recv_type)
+  match resolved_base
+  when Type::Error then return Option::None
+  when _ then ()
+  end
+  match resolved_base
+  when Type::Named(tid, _) then
+    match env.method_lookup.get(tid.id)
+    when Option::Some(mmap) then
+      match mmap.get(method)
+      when Option::Some(cands) then
+        var ci = 0
+        while ci < cands.len() do
+          let imp = &env.impls[cands[ci]]
+          if impl_for_type_matches(&imp.for_type, &resolved_base) then
+            var mi = 0
+            while mi < imp.methods.len() do
+              let m = &imp.methods[mi]
+              if m.name == method then
+                return Option::Some(m.params.clone())
+              end
+              mi = mi + 1
+            end
+          end
+          ci = ci + 1
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  Option::None
+end
+
+def field_target_of(env: &TypeEnv, recv_type: &Type, field: String) -> Option[FieldId]
+  let base = match recv_type
+  when Type::Ref(inner, _) then inner
+  when Type::RefMut(inner, _) then inner
+  when Type::Owned(inner) then inner
+  when Type::Box(inner) then inner
+  when _ then recv_type
+  end
+  match base
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        var i = 0
+        while i < fields.len() do
+          if fields[i].name == field then
+            return Option::Some(FieldId { owner: tid, index: i })
+          end
+          i = i + 1
+        end
+        Option::None
+      when TypeDefKind::Alias(inner) then field_target_of(env, &inner, field)
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
 def record_typed_call_target(env: &mut TypeEnv, span_start: Int, node_id: Int) -> Unit
   var did_opt: Option[DefId] = Option::None
   match env.resolutions
@@ -3456,7 +3617,10 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::ExprNilLit then Type::Option(fresh_type_var(env))
   when ExprKind::ExprIdent(name) then
     match lookup_var(env, name)
-    when Option::Some(ty) then ty
+    when Option::Some(ty) then
+      let lid = local_id_of(env, name)
+      env.typed_ident_resolutions.insert(expr.node_id, lid)
+      ty
     when Option::None then
       # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
       # u8 in u8::MAX, etc.) — when a type name appears in expression position
@@ -3527,14 +3691,27 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       i = i + 1
     end
     let ret_type = fresh_type_var(env)
-    var fn_params = Vec::new()
-    var pi = 0
-    while pi < arg_types.len() do
-      fn_params.push(ParamType { ty: arg_types[pi], convention: AccessConvention::Let })
-      pi = pi + 1
+    match func_type
+    when Type::Function(params, ret) then
+      var pi = 0
+      while pi < args.len() do
+        if pi < params.len() then
+          let pt = params[pi]
+          unify(env, arg_types[pi], pt.ty, args[pi].span)
+          record_arg_effect(env, &args[pi], pt.convention)
+        else
+          record_arg_effect(env, &args[pi], AccessConvention::Let)
+        end
+        pi = pi + 1
+      end
+      unify(env, ret_type, ret, expr.span)
+    when _ then
+      var ri = 0
+      while ri < args.len() do
+        record_arg_effect(env, &args[ri], AccessConvention::Let)
+        ri = ri + 1
+      end
     end
-    let expected_func = Type::Function(fn_params, ret_type)
-    unify(env, func_type, expected_func, expr.span)
     record_typed_call_target(env, expr.span.start, expr.node_id)
     ret_type
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
@@ -3554,11 +3731,45 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     end
     # Look up method on receiver type with type args
     let ret = resolve_method_type(env, &recv_type, method, &arg_types, &method_type_args, expr.span)
-    record_typed_call_target(env, expr.span.start, expr.node_id)
+    let mdid = method_def_for(env, &recv_type, method)
+    match mdid
+    when Option::Some(did) then env.typed_call_targets.insert(expr.node_id, did)
+    when Option::None then
+      env.typed_call_targets.insert(expr.node_id, DefId { module: "".to_string(), index: 0 as UInt, kind: DefKind::Method })
+    end
+    let mparams = find_method_params(env, &recv_type, method)
+    match mparams
+    when Option::Some(params) then
+      if params.len() >= 1 then
+        record_arg_effect(env, &recv, params[0].convention)
+      else
+        record_arg_effect(env, &recv, AccessConvention::Let)
+      end
+      var ai = 0
+      while ai < args.len() do
+        if ai + 1 < params.len() then
+          record_arg_effect(env, &args[ai], params[ai + 1].convention)
+        else
+          record_arg_effect(env, &args[ai], AccessConvention::Let)
+        end
+        ai = ai + 1
+      end
+    when Option::None then
+      record_arg_effect(env, &recv, AccessConvention::Let)
+      var ai2 = 0
+      while ai2 < args.len() do
+        record_arg_effect(env, &args[ai2], AccessConvention::Let)
+        ai2 = ai2 + 1
+      end
+    end
     ret
   when ExprKind::ExprFieldAccess(recv, field) then
     let recv_type = check_expr(env, &recv)
-    env.typed_field_targets.insert(expr.node_id, field.clone())
+    let fdid = field_target_of(env, &recv_type, field)
+    match fdid
+    when Option::Some(fid) then env.typed_field_targets.insert(expr.node_id, fid)
+    when Option::None then ()
+    end
     resolve_field_type(env, &recv_type, field, expr.span)
   when ExprKind::ExprIndex(recv, index) then
     let recv_type = check_expr(env, &recv)
@@ -3734,7 +3945,6 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       end
     end
   when ExprKind::ExprClosure(params, ret_ty, body) then
-    env.local_id_counter = 0
     push_scope(env)
     var param_types = Vec::new()
     var i = 0
@@ -4709,6 +4919,9 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   env.local_ids.clear()
   env.typed_call_targets.clear()
   env.typed_field_targets.clear()
+  env.typed_local_bindings.clear()
+  env.typed_ident_resolutions.clear()
+  env.typed_access_effects.clear()
   env.resolutions = Option::Some(resolutions.clone())
   type_check_program_env(env, program)
   var kinds = Map::new()
@@ -4723,7 +4936,9 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     field_targets: env.typed_field_targets.clone(),
-    access_effects: Map::new(),
+    access_effects: env.typed_access_effects.clone(),
+    local_bindings: env.typed_local_bindings.clone(),
+    ident_resolutions: env.typed_ident_resolutions.clone(),
     type_kinds: kinds
   }
   env.resolutions = Option::None

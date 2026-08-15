@@ -14,7 +14,7 @@ use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
                         Pattern, PatternKind, TypeExpr, TypeExprKind, UseDecl, ModuleDecl, Visibility, AstPath,
                         Param, TraitMethod, GenericParam, Function, ExternItem}
 use tg_compiler::token::{Span}
-use tg_compiler::types::{DefId}
+use tg_compiler::ids::{DefId, DefKind}
 
 # ———————————————————————————————————————————————————————————————
 # Resolution Errors
@@ -151,6 +151,10 @@ struct ResolvedNames
   type_resolutions: Map[Int, ResolvedType]
   pattern_resolutions: Map[Int, ResolvedPattern]
   call_targets: Map[Int, DefId]
+
+  # Qualified method keys ("Type::method") -> DefId, recorded at impl-method
+  # registration so the type checker can emit method DefIds.
+  method_defs: Map[String, DefId]
 
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
@@ -337,7 +341,7 @@ struct ResolutionContext
   symbols: SymbolTable
 
   # Current scope stack for local variables
-  local_scopes: Vec[Map[String, LocalBinding]]
+  local_scopes: Vec[Map[String, ResolverLocalBinding]]
 
   # Output: resolved references
   resolved: ResolvedNames
@@ -346,7 +350,7 @@ struct ResolutionContext
   prelude_imports: Vec[String]
 end
 
-struct LocalBinding
+struct ResolverLocalBinding
   name: String
   kind: LocalBindingKind
   is_mut: Bool
@@ -392,6 +396,7 @@ def context_new() -> ResolutionContext
       type_resolutions: Map::new(),
       pattern_resolutions: Map::new(),
       call_targets: Map::new(),
+      method_defs: Map::new(),
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"]
@@ -546,6 +551,12 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
       if !module.functions.contains_key(&key) then
         module.functions.insert(key.clone(), sym)
         assign_symbol_index(module, &key)
+        let midx = symbol_index_of(module, &key)
+        ctx.resolved.method_defs.insert(key.clone(), DefId {
+          module: ctx.symbols.current_module.join("::"),
+          index: midx as UInt,
+          kind: DefKind::Method
+        })
       end
     end
 
@@ -880,7 +891,7 @@ def resolve_import_path(symbols: &SymbolTable, path: &Vec[String]) -> Bool
   if path.is_empty() then return false end
 
   let known_compiler = [
-    "access_check", "ast", "token", "lexer", "parser", "types", "trait_resolve",
+    "access_check", "ast", "ids", "token", "lexer", "parser", "types", "trait_resolve",
     "resolver", "mir", "codegen", "asm", "object",
     "linker", "driver", "formatter", "linter", "docgen", "cqs",
     "coverage", "agentic", "symbol_graph", "context_pack",
@@ -983,7 +994,7 @@ def resolve_item(ctx: &mut ResolutionContext, item: &Item) -> Unit
     # scope for every method body.
     rs_push_scope(ctx)
     for gp in impl_block.generic_params do
-      define_local(ctx, gp.name.clone(), LocalBinding {
+      define_local(ctx, gp.name.clone(), ResolverLocalBinding {
         name: gp.name.clone(),
         kind: LocalBindingKind::Parameter(-1),
         is_mut: false,
@@ -1009,7 +1020,7 @@ def resolve_function(ctx: &mut ResolutionContext, f: &FunctionDecl) -> Unit
 
   # Add generic type parameters to scope so `T` in `def f[T](x: T)` resolves.
   for gp in f.generic_params do
-    define_local(ctx, gp.name.clone(), LocalBinding {
+    define_local(ctx, gp.name.clone(), ResolverLocalBinding {
       name: gp.name.clone(),
       kind: LocalBindingKind::Parameter(-1),
       is_mut: false,
@@ -1020,7 +1031,7 @@ def resolve_function(ctx: &mut ResolutionContext, f: &FunctionDecl) -> Unit
   # Add parameters to scope
   var param_idx = 0
   for param in f.params do
-    define_local(ctx, param.name.clone(), LocalBinding {
+    define_local(ctx, param.name.clone(), ResolverLocalBinding {
       name: param.name.clone(),
       kind: LocalBindingKind::Parameter(param_idx),
       is_mut: param_is_mut(&param),
@@ -1178,7 +1189,7 @@ end
 def resolve_pattern(ctx: &mut ResolutionContext, pattern: &Pattern) -> Unit
   match pattern.kind
   when PatternKind::Ident(name, is_mut) then
-    define_local(ctx, name.clone(), LocalBinding {
+    define_local(ctx, name.clone(), ResolverLocalBinding {
       name: name.clone(),
       kind: LocalBindingKind::MatchBinding,
       is_mut: is_mut.clone(),
@@ -1218,7 +1229,7 @@ end
 def resolve_pattern_definition(ctx: &mut ResolutionContext, pattern: &Pattern) -> Unit
   match pattern.kind
   when PatternKind::Ident(name, is_mut) then
-    define_local(ctx, name.clone(), LocalBinding {
+    define_local(ctx, name.clone(), ResolverLocalBinding {
       name: name.clone(),
       kind: LocalBindingKind::Variable,
       is_mut: is_mut.clone(),
@@ -1269,7 +1280,8 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
       })
       ctx.resolved.call_targets.insert(span.start, DefId {
         module: ctx.symbols.current_module.join("::"),
-        index: vidx as UInt
+        index: vidx as UInt,
+        kind: DefKind::EnumVariant
       })
       return
     end
@@ -1357,20 +1369,56 @@ def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr)
     end
 
     if import_name == name.clone() then
-      let target_idx = symbol_index_for(ctx, &import.path, name)
+      # DefId.module is the importing module path WITHOUT the final item
+      # segment (e.g. "foo" for `use foo::bar`); the symbol index comes from
+      # the TARGET module's symbol table under the imported item's name.
+      var module_path = Vec::new()
+      var mpi = 0
+      while mpi < import.path.len() - 1 do
+        module_path.push(import.path[mpi].clone())
+        mpi = mpi + 1
+      end
+      let target_name = import.path[import.path.len() - 1].clone()
+      let target_idx = symbol_index_for(ctx, &module_path, &target_name)
+      let target_kind = import_target_kind(ctx, &module_path, &target_name)
+      let resolved_kind = match target_kind
+      when DefKind::Static then ResolvedExprKind::Static(target_name.clone())
+      when DefKind::Constant then ResolvedExprKind::Constant(target_name.clone())
+      when DefKind::EnumVariant then ResolvedExprKind::EnumVariant("".to_string(), target_name.clone())
+      when _ then ResolvedExprKind::Function(name.clone())
+      end
       ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
-        kind: ResolvedExprKind::Function(name.clone()),
+        kind: resolved_kind,
         module_path: import.path.clone()
       })
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: import.path.join("::"),
-        index: target_idx as UInt
+        module: module_path.join("::"),
+        index: target_idx as UInt,
+        kind: target_kind
       })
       return true
     end
   end
 
   false
+end
+
+def import_target_kind(ctx: &ResolutionContext, module_path: &Vec[String], name: &String) -> DefKind
+  match get_module_by_path(&ctx.symbols, module_path)
+  when Option::Some(m) then
+    if m.functions.contains_key(name) then return DefKind::Function end
+    if m.constants.contains_key(name) then return DefKind::Constant end
+    if m.statics.contains_key(name) then return DefKind::Static end
+    if m.variants.contains(name.clone()) then return DefKind::EnumVariant end
+    if m.types.contains_key(name) then return DefKind::TypeName end
+  when Option::None then ()
+  end
+  if ctx.symbols.root.functions.contains_key(name) then return DefKind::Function end
+  if ctx.symbols.root.constants.contains_key(name) then return DefKind::Constant end
+  if ctx.symbols.root.statics.contains_key(name) then return DefKind::Static end
+  if ctx.symbols.root.variants.contains(name.clone()) then return DefKind::EnumVariant end
+  if ctx.symbols.root.types.contains_key(name) then return DefKind::TypeName end
+  DefKind::Function
 end
 
 def resolve_via_imports_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Bool
@@ -1516,14 +1564,14 @@ def rs_pop_scope(ctx: &mut ResolutionContext) -> Unit
   let _ = ctx.local_scopes.pop()
 end
 
-def define_local(ctx: &mut ResolutionContext, name: String, binding: LocalBinding) -> Unit
+def define_local(ctx: &mut ResolutionContext, name: String, binding: ResolverLocalBinding) -> Unit
   if !ctx.local_scopes.is_empty() then
     let idx = ctx.local_scopes.len() - 1
     ctx.local_scopes[idx].insert(name, binding)
   end
 end
 
-def lookup_local(ctx: &ResolutionContext, name: &String) -> Option[LocalBinding]
+def lookup_local(ctx: &ResolutionContext, name: &String) -> Option[ResolverLocalBinding]
   var i = ctx.local_scopes.len()
   while i > 0 do
     i = i - 1
@@ -1632,7 +1680,8 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
       module: ctx.symbols.current_module.join("::"),
-      index: fidx as UInt
+      index: fidx as UInt,
+      kind: DefKind::Function
     })
     return
   end
@@ -1646,7 +1695,8 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
       module: ctx.symbols.current_module.join("::"),
-      index: cidx as UInt
+      index: cidx as UInt,
+      kind: DefKind::Constant
     })
     return
   end
@@ -1660,7 +1710,8 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
       module: ctx.symbols.current_module.join("::"),
-      index: sidx as UInt
+      index: sidx as UInt,
+      kind: DefKind::Static
     })
     return
   end
@@ -1674,8 +1725,9 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
-      module: ctx.symbols.current_module.join("::"),
-      index: 0 as UInt
+      module: "".to_string(),
+      index: 0 as UInt,
+      kind: DefKind::Intrinsic
     })
     return
   end
@@ -1690,8 +1742,9 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
-      module: ctx.symbols.current_module.join("::"),
-      index: 0 as UInt
+      module: "".to_string(),
+      index: 0 as UInt,
+      kind: DefKind::TypeName
     })
     return
   end
@@ -1706,7 +1759,8 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     ctx.resolved.call_targets.insert(expr.span.start, DefId {
       module: ctx.symbols.current_module.join("::"),
-      index: vidx as UInt
+      index: vidx as UInt,
+      kind: DefKind::EnumVariant
     })
     return
   end
