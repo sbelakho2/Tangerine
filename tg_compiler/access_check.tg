@@ -1,0 +1,745 @@
+use std::core::{Option}
+use std::collections::{Vec, Set}
+use tg_compiler::token::{Span}
+use tg_compiler::ast::{
+  Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
+  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
+  AccessConvention, GuardElse, MatchExpr
+}
+use tg_compiler::types::{AccessEffect}
+
+enum AccessProjection
+  Field(String)
+  Index
+end
+
+struct AccessPath
+  root: String
+  projections: Vec[AccessProjection]
+end
+
+struct ActiveAccess
+  path: AccessPath
+  effect: AccessEffect
+end
+
+struct AccessError
+  message: String
+  span: Span
+end
+
+pub def access_check(program: &Program) -> Vec[AccessError]
+  mut errors = Vec::new()
+  mut i = 0
+  while i < program.items.len() do
+    check_item(program, &program.items[i], &mut errors)
+    i = i + 1
+  end
+  errors
+end
+
+def check_item(program: &Program, item: &Item, errors: &mut Vec[AccessError]) -> Unit
+  match item.kind
+  when ItemKind::ItemFunction(f) then
+    check_function(program, &f, errors)
+  when ItemKind::ItemStruct(s) then
+    mut consumed = Set::new()
+    mut i = 0
+    while i < s.fields.len() do
+      match s.fields[i].default
+      when Option::Some(e) then check_expr(program, &e, &mut consumed, errors)
+      when Option::None then ()
+      end
+      i = i + 1
+    end
+  when ItemKind::ItemEnum(e) then
+    mut consumed = Set::new()
+    mut i = 0
+    while i < e.variants.len() do
+      match e.variants[i].discriminant
+      when Option::Some(d) then check_expr(program, &d, &mut consumed, errors)
+      when Option::None then ()
+      end
+      i = i + 1
+    end
+  when ItemKind::ItemTrait(t) then
+    mut i = 0
+    while i < t.methods.len() do
+      check_trait_method(program, &t.methods[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemImpl(im) then
+    mut i = 0
+    while i < im.methods.len() do
+      check_function(program, &im.methods[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemModule(m) then
+    mut i = 0
+    while i < m.items.len() do
+      check_item(program, &m.items[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemUse(_) then ()
+  when ItemKind::ItemMacro(mac) then
+    mut consumed = Set::new()
+    check_block(program, &mac.body, &mut consumed, errors)
+  when ItemKind::ItemTypeAlias(_) then ()
+  when ItemKind::ItemConst(c) then
+    mut consumed = Set::new()
+    check_expr(program, &c.value, &mut consumed, errors)
+  when ItemKind::ItemStatic(s) then
+    mut consumed = Set::new()
+    check_expr(program, &s.value, &mut consumed, errors)
+  when ItemKind::ItemCapabilityDecl(_) then ()
+  when ItemKind::ItemEffectDecl(_) then ()
+  when ItemKind::ItemRationaleBlock(_) then ()
+  when ItemKind::ItemEditionDecl(_) then ()
+  when ItemKind::ItemExternBlock(ext) then
+    mut consumed = Set::new()
+    mut i = 0
+    while i < ext.items.len() do
+      match ext.items[i]
+      when ExternItem::Function(ef) then
+        check_params_defaults(program, &ef.params, &mut consumed, errors)
+      when ExternItem::Static(_) then ()
+      end
+      i = i + 1
+    end
+  end
+end
+
+def check_function(program: &Program, f: &FunctionDecl, errors: &mut Vec[AccessError]) -> Unit
+  mut consumed = Set::new()
+  check_params_defaults(program, &f.params, &mut consumed, errors)
+  mut i = 0
+  while i < f.contracts.len() do
+    check_expr(program, &f.contracts[i].expr, &mut consumed, errors)
+    i = i + 1
+  end
+  check_fn_body(program, &f.body, &mut consumed, errors)
+end
+
+def check_trait_method(program: &Program, m: &TraitMethod, errors: &mut Vec[AccessError]) -> Unit
+  mut consumed = Set::new()
+  check_params_defaults(program, &m.sig.params, &mut consumed, errors)
+  check_fn_body(program, &m.default_body, &mut consumed, errors)
+end
+
+def check_params_defaults(program: &Program, params: &Vec[Param], consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  mut i = 0
+  while i < params.len() do
+    match params[i].default
+    when Option::Some(e) then check_expr(program, &e, consumed, errors)
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+end
+
+def check_fn_body(program: &Program, body: &FnBody, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match body
+  when FnBody::FnBlock(b) then check_block(program, &b, consumed, errors)
+  when FnBody::FnExpr(e) then check_expr(program, &e, consumed, errors)
+  when FnBody::FnExtern(_) then ()
+  when FnBody::FnNone then ()
+  end
+end
+
+def check_block(program: &Program, block: &Block, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  mut i = 0
+  while i < block.stmts.len() do
+    check_stmt(program, &block.stmts[i], consumed, errors)
+    i = i + 1
+  end
+end
+
+def check_stmt(program: &Program, stmt: &Stmt, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match stmt.kind
+  when StmtKind::StmtLet(pattern, _, value, _) then
+    check_pattern(program, &pattern, consumed, errors)
+    check_expr(program, &value, consumed, errors)
+  when StmtKind::StmtAssign(target, value) then
+    check_expr(program, &target, consumed, errors)
+    check_expr(program, &value, consumed, errors)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    check_expr(program, &target, consumed, errors)
+    check_expr(program, &value, consumed, errors)
+  when StmtKind::StmtIf(if_stmt) then
+    check_expr(program, &if_stmt.cond, consumed, errors)
+    check_block(program, &if_stmt.then_block, consumed, errors)
+    mut i = 0
+    while i < if_stmt.elsif_branches.len() do
+      check_expr(program, &if_stmt.elsif_branches[i].0, consumed, errors)
+      check_block(program, &if_stmt.elsif_branches[i].1, consumed, errors)
+      i = i + 1
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then check_block(program, &eb, consumed, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtMatch(m) then
+    check_match(program, &m, consumed, errors)
+  when StmtKind::StmtWhile(cond, body) then
+    check_expr(program, &cond, consumed, errors)
+    check_block(program, &body, consumed, errors)
+  when StmtKind::StmtFor(for_stmt) then
+    check_pattern(program, &for_stmt.pattern, consumed, errors)
+    check_expr(program, &for_stmt.iter, consumed, errors)
+    check_block(program, &for_stmt.body, consumed, errors)
+  when StmtKind::StmtLoop(body) then
+    check_block(program, &body, consumed, errors)
+  when StmtKind::StmtReturn(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, &val, consumed, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, &val, consumed, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtYield(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, &val, consumed, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtExpr(e) then
+    check_expr(program, &e, consumed, errors)
+  when StmtKind::StmtUnsafe(_, body) then
+    check_block(program, &body, consumed, errors)
+  when StmtKind::StmtDefer(body) then
+    check_block(program, &body, consumed, errors)
+  when StmtKind::StmtGuard(cond, else_action) then
+    check_expr(program, &cond, consumed, errors)
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(val) then check_expr(program, &val, consumed, errors)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(val) then check_expr(program, &val, consumed, errors)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_block) then
+    check_block(program, &body, consumed, errors)
+    mut i = 0
+    while i < catches.len() do
+      check_pattern(program, &catches[i].pattern, consumed, errors)
+      check_block(program, &catches[i].body, consumed, errors)
+      i = i + 1
+    end
+    match finally_block
+    when Option::Some(fb) then check_block(program, &fb, consumed, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, _, body) then
+    check_expr(program, &expr, consumed, errors)
+    check_block(program, &body, consumed, errors)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    check_expr(program, &expr, consumed, errors)
+    mut i = 0
+    while i < handlers.len() do
+      mut j = 0
+      while j < handlers[i].arms.len() do
+        check_block(program, &handlers[i].arms[j].body, consumed, errors)
+        j = j + 1
+      end
+      i = i + 1
+    end
+  end
+end
+
+def check_match(program: &Program, m: &MatchExpr, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  check_expr(program, &m.scrutinee, consumed, errors)
+  mut i = 0
+  while i < m.arms.len() do
+    check_pattern(program, &m.arms[i].pattern, consumed, errors)
+    match m.arms[i].guard_expr
+    when Option::Some(g) then check_expr(program, &g, consumed, errors)
+    when Option::None then ()
+    end
+    check_block(program, &m.arms[i].body, consumed, errors)
+    i = i + 1
+  end
+end
+
+def check_pattern(program: &Program, pat: &Pattern, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match pat.kind
+  when PatternKind::Wildcard then ()
+  when PatternKind::Ident(_, _) then ()
+  when PatternKind::Literal(e) then check_expr(program, &e, consumed, errors)
+  when PatternKind::Tuple(pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, &pats[i], consumed, errors)
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, &pats[i], consumed, errors)
+      i = i + 1
+    end
+  when PatternKind::Struct(_, field_pats) then
+    mut i = 0
+    while i < field_pats.len() do
+      check_pattern(program, &field_pats[i].1, consumed, errors)
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, &pats[i], consumed, errors)
+      i = i + 1
+    end
+  when PatternKind::Or(alts) then
+    mut i = 0
+    while i < alts.len() do
+      check_pattern(program, &alts[i], consumed, errors)
+      i = i + 1
+    end
+  when PatternKind::Range(lo, hi, _) then
+    match lo
+    when Option::Some(e) then check_expr(program, &e, consumed, errors)
+    when Option::None then ()
+    end
+    match hi
+    when Option::Some(e) then check_expr(program, &e, consumed, errors)
+    when Option::None then ()
+    end
+  when PatternKind::Ref(inner) then check_pattern(program, &inner, consumed, errors)
+  when PatternKind::RefMut(inner) then check_pattern(program, &inner, consumed, errors)
+  end
+end
+
+def check_expr(program: &Program, expr: &Expr, consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+  when ExprKind::ExprArrayLit(elems) then
+    mut i = 0
+    while i < elems.len() do
+      check_expr(program, &elems[i], consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    mut i = 0
+    while i < elems.len() do
+      check_expr(program, &elems[i], consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    mut i = 0
+    while i < fields.len() do
+      check_expr(program, &fields[i].1, consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    mut i = 0
+    while i < entries.len() do
+      check_expr(program, &entries[i].0, consumed, errors)
+      check_expr(program, &entries[i].1, consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprIdent(_) then ()
+  when ExprKind::ExprPath(_) then ()
+  when ExprKind::ExprSelfRef then ()
+  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
+    check_expr(program, &lhs, consumed, errors)
+    check_expr(program, &rhs, consumed, errors)
+  when ExprKind::ExprUnaryOp(_, operand) then
+    check_expr(program, &operand, consumed, errors)
+  when ExprKind::ExprFieldAccess(base, _) then
+    check_expr(program, &base, consumed, errors)
+  when ExprKind::ExprMethodCall(recv, method, _, args) then
+    check_expr(program, &recv, consumed, errors)
+    check_expr_method_call(program, &recv, &method, &args, consumed, errors)
+  when ExprKind::ExprIndex(base, index) then
+    check_expr(program, &base, consumed, errors)
+    check_expr(program, &index, consumed, errors)
+  when ExprKind::ExprCall(callee, args) then
+    check_expr(program, &callee, consumed, errors)
+    check_expr_call(program, &callee, &args, consumed, errors)
+  when ExprKind::ExprClosure(params, _, body) then
+    mut i = 0
+    while i < params.len() do
+      check_pattern(program, &params[i].pat, consumed, errors)
+      i = i + 1
+    end
+    check_expr(program, &body, consumed, errors)
+  when ExprKind::ExprRef(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprRefMut(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprDeref(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprMove(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprCopy(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprIf(if_stmt) then
+    check_expr(program, &if_stmt.cond, consumed, errors)
+    check_block(program, &if_stmt.then_block, consumed, errors)
+    mut i = 0
+    while i < if_stmt.elsif_branches.len() do
+      check_expr(program, &if_stmt.elsif_branches[i].0, consumed, errors)
+      check_block(program, &if_stmt.elsif_branches[i].1, consumed, errors)
+      i = i + 1
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then check_block(program, &eb, consumed, errors)
+    when Option::None then ()
+    end
+  when ExprKind::ExprMatch(m) then
+    check_match(program, &m, consumed, errors)
+  when ExprKind::ExprBlock(block) then
+    check_block(program, &block, consumed, errors)
+  when ExprKind::ExprUnsafe(_, block) then
+    check_block(program, &block, consumed, errors)
+  when ExprKind::ExprAsync(block) then
+    check_block(program, &block, consumed, errors)
+  when ExprKind::ExprAwait(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprTry(inner) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then check_expr(program, &s, consumed, errors)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then check_expr(program, &e, consumed, errors)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprTypeCheck(inner, _) then check_expr(program, &inner, consumed, errors)
+  when ExprKind::ExprComptime(block) then check_block(program, &block, consumed, errors)
+  when ExprKind::ExprEnumVariant(_, args) then
+    mut i = 0
+    while i < args.len() do
+      check_expr(program, &args[i], consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprAssign(target, value) then
+    check_expr(program, &target, consumed, errors)
+    check_expr(program, &value, consumed, errors)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    check_expr(program, &lhs, consumed, errors)
+    check_expr(program, &rhs, consumed, errors)
+  when ExprKind::ExprMacroCall(_, args) then
+    mut i = 0
+    while i < args.len() do
+      check_expr(program, &args[i], consumed, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprError(_) then ()
+  end
+end
+
+def check_expr_call(program: &Program, callee: &Expr, args: &Vec[Expr], consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match callee_name(callee)
+  when Option::Some(name) then
+    match find_function(program, &name)
+    when Option::Some(params) then
+      mut effects = Vec::new()
+      mut i = 0
+      while i < args.len() do
+        let eff = if i < params.len() then convention_effect(params[i].convention) else AccessEffect::Read end
+        effects.push(eff)
+        i = i + 1
+      end
+      check_call_site(Option::None, AccessEffect::Read, &effects, args, consumed, errors)
+    when Option::None then
+      let effects = all_read_effects(args.len())
+      check_call_site(Option::None, AccessEffect::Read, &effects, args, consumed, errors)
+    end
+  when Option::None then
+    let effects = all_read_effects(args.len())
+    check_call_site(Option::None, AccessEffect::Read, &effects, args, consumed, errors)
+  end
+end
+
+def check_expr_method_call(program: &Program, receiver: &Expr, method: &String, args: &Vec[Expr], consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  match find_method(program, method)
+  when Option::Some(params) then
+    mut self_idx = -1
+    mut i = 0
+    while i < params.len() do
+      if params[i].name == "self" then
+        self_idx = i
+        break
+      end
+      i = i + 1
+    end
+    let recv_effect = if self_idx >= 0 then
+      match params[self_idx].convention
+      when AccessConvention::Inout then AccessEffect::Modify
+      when AccessConvention::Sink then AccessEffect::Consume
+      when _ then AccessEffect::Read
+      end
+    else AccessEffect::Read end
+    mut effects = Vec::new()
+    i = 0
+    while i < args.len() do
+      let param_idx = if self_idx >= 0 then self_idx + 1 + i else i end
+      let eff = if param_idx < params.len() then convention_effect(params[param_idx].convention) else AccessEffect::Read end
+      effects.push(eff)
+      i = i + 1
+    end
+    check_call_site(Option::Some(receiver), recv_effect, &effects, args, consumed, errors)
+  when Option::None then
+    let effects = all_read_effects(args.len())
+    check_call_site(Option::Some(receiver), AccessEffect::Read, &effects, args, consumed, errors)
+  end
+end
+
+def check_call_site(receiver: Option[&Expr], receiver_effect: AccessEffect, arg_effects: &Vec[AccessEffect], args: &Vec[Expr], consumed: &mut Set[String], errors: &mut Vec[AccessError]) -> Unit
+  mut actives = Vec::new()
+  mut spans = Vec::new()
+  match receiver
+  when Option::Some(r) then
+    record_access(r, receiver_effect, consumed, errors, &mut actives, &mut spans)
+  when Option::None then ()
+  end
+  mut i = 0
+  while i < args.len() do
+    let eff = if i < arg_effects.len() then arg_effects[i] else AccessEffect::Read end
+    let a = &args[i]
+    record_access(a, eff, consumed, errors, &mut actives, &mut spans)
+    i = i + 1
+  end
+  check_overlaps(&actives, &spans, errors)
+  mark_consumed(&actives, consumed)
+end
+
+def record_access(expr: &Expr, effect: AccessEffect, consumed: &mut Set[String], errors: &mut Vec[AccessError], actives: &mut Vec[ActiveAccess], spans: &mut Vec[Span]) -> Unit
+  match derive_access_path(expr)
+  when Option::Some(path) then
+    if effect != AccessEffect::Initialize then
+      if consumed.contains(&path.root) then
+        errors.push(AccessError {
+          message: "use of consumed value: `" + path.root + "`",
+          span: expr.span
+        })
+      end
+    end
+    actives.push(ActiveAccess { path: path, effect: effect })
+    spans.push(expr.span)
+  when Option::None then ()
+  end
+end
+
+def check_overlaps(actives: &Vec[ActiveAccess], spans: &Vec[Span], errors: &mut Vec[AccessError]) -> Unit
+  mut i = 0
+  while i < actives.len() do
+    mut j = i + 1
+    while j < actives.len() do
+      if accesses_conflict(&actives[i], &actives[j]) then
+        errors.push(AccessError {
+          message: "conflicting accesses to `" + path_to_string(&actives[j].path) + "` (" + effect_name(actives[i].effect) + " vs " + effect_name(actives[j].effect) + ")",
+          span: spans[j]
+        })
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+end
+
+def accesses_conflict(a: &ActiveAccess, b: &ActiveAccess) -> Bool
+  if a.effect == AccessEffect::Read && b.effect == AccessEffect::Read then
+    return false
+  end
+  paths_overlap(&a.path, &b.path)
+end
+
+def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
+  if a.root != b.root then
+    return false
+  end
+  mut i = 0
+  while i < a.projections.len() && i < b.projections.len() do
+    let pa = a.projections[i]
+    let pb = b.projections[i]
+    match pa
+    when AccessProjection::Field(fa) then
+      match pb
+      when AccessProjection::Field(fb) then
+        if fa != fb then
+          return false
+        end
+      when AccessProjection::Index then
+        return true
+      end
+    when AccessProjection::Index then
+      match pb
+      when AccessProjection::Field(_) then
+        return true
+      when AccessProjection::Index then
+        ()
+      end
+    end
+    i = i + 1
+  end
+  true
+end
+
+def mark_consumed(actives: &Vec[ActiveAccess], consumed: &mut Set[String]) -> Unit
+  mut i = 0
+  while i < actives.len() do
+    if actives[i].effect == AccessEffect::Consume then
+      consumed.insert(actives[i].path.root.clone())
+    end
+    i = i + 1
+  end
+end
+
+def derive_access_path(expr: &Expr) -> Option[AccessPath]
+  match expr.kind
+  when ExprKind::ExprIdent(name) then
+    Option::Some(AccessPath { root: name.clone(), projections: Vec::new() })
+  when ExprKind::ExprFieldAccess(base, field) then
+    match derive_access_path(&base)
+    when Option::Some(mut p) then
+      p.projections.push(AccessProjection::Field(field.clone()))
+      Option::Some(p)
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprIndex(base, _) then
+    match derive_access_path(&base)
+    when Option::Some(mut p) then
+      p.projections.push(AccessProjection::Index)
+      Option::Some(p)
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprDeref(inner) then derive_access_path(&inner)
+  when ExprKind::ExprRef(inner) then derive_access_path(&inner)
+  when ExprKind::ExprRefMut(inner) then derive_access_path(&inner)
+  when ExprKind::ExprMove(inner) then derive_access_path(&inner)
+  when ExprKind::ExprCopy(inner) then derive_access_path(&inner)
+  when ExprKind::ExprCast(inner, _) then derive_access_path(&inner)
+  when _ then Option::None
+  end
+end
+
+def callee_name(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
+  when ExprKind::ExprPath(p) then
+    if p.segments.len() > 0 then
+      Option::Some(p.segments[p.segments.len() - 1].clone())
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def find_function(program: &Program, name: &String) -> Option[Vec[Param]]
+  find_function_in_items(&program.items, name)
+end
+
+def find_function_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
+  mut i = 0
+  while i < items.len() do
+    match items[i].kind
+    when ItemKind::ItemFunction(f) then
+      if f.name == *name then
+        return Option::Some(f.params.clone())
+      end
+    when ItemKind::ItemExternBlock(ext) then
+      mut j = 0
+      while j < ext.items.len() do
+        match ext.items[j]
+        when ExternItem::Function(ef) then
+          if ef.name == *name then
+            return Option::Some(ef.params.clone())
+          end
+        when ExternItem::Static(_) then ()
+        end
+        j = j + 1
+      end
+    when ItemKind::ItemModule(m) then
+      match find_function_in_items(&m.items, name)
+      when Option::Some(ps) then return Option::Some(ps)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+def find_method(program: &Program, name: &String) -> Option[Vec[Param]]
+  find_method_in_items(&program.items, name)
+end
+
+def find_method_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
+  mut i = 0
+  while i < items.len() do
+    match items[i].kind
+    when ItemKind::ItemImpl(im) then
+      mut j = 0
+      while j < im.methods.len() do
+        if im.methods[j].name == *name then
+          return Option::Some(im.methods[j].params.clone())
+        end
+        j = j + 1
+      end
+    when ItemKind::ItemModule(m) then
+      match find_method_in_items(&m.items, name)
+      when Option::Some(ps) then return Option::Some(ps)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+def convention_effect(c: AccessConvention) -> AccessEffect
+  match c
+  when AccessConvention::Let then AccessEffect::Read
+  when AccessConvention::Inout then AccessEffect::Modify
+  when AccessConvention::Sink then AccessEffect::Consume
+  when AccessConvention::Set then AccessEffect::Initialize
+  end
+end
+
+def all_read_effects(count: Int) -> Vec[AccessEffect]
+  mut effects = Vec::new()
+  mut i = 0
+  while i < count do
+    effects.push(AccessEffect::Read)
+    i = i + 1
+  end
+  effects
+end
+
+def effect_name(e: AccessEffect) -> String
+  match e
+  when AccessEffect::Read then "read"
+  when AccessEffect::Modify then "modify"
+  when AccessEffect::Consume then "consume"
+  when AccessEffect::Initialize then "initialize"
+  end
+end
+
+def path_to_string(p: &AccessPath) -> String
+  mut s = p.root.clone()
+  mut i = 0
+  while i < p.projections.len() do
+    match p.projections[i]
+    when AccessProjection::Field(f) then s = s + "." + f
+    when AccessProjection::Index then s = s + "[]"
+    end
+    i = i + 1
+  end
+  s
+end
