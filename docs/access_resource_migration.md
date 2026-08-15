@@ -98,3 +98,81 @@ state checker (Uninitialized/Live/Consumed/MaybeLive dataflow over the CFG).
   gates above). If a change cannot pass, do not commit it; fix or revert.
 - No comments unless they explain a non-obvious semantic rule.
 - Determinism: no map-iteration-order dependence in any output.
+
+## Exact specs (authoritative for all waves)
+
+### New grammar (native + stage0 must converge)
+
+Keywords added: `var`, `inout`, `sink`, `set`, `resource`, `deinit`.
+`var` is the canonical mutable-binding keyword (existing `mut`/`let mut` remain migration aliases, normalized to `var`).
+
+```
+param        = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ]
+             | legacy: [ 'mut' | '&' | '&mut' | 'move' | 'own' ] IDENT [ ':' type_expr ]
+resource_def = [ 'pub' ] 'resource' IDENT [ type_params ] { field_def | function_def } 'end'
+method_head  = def NAME ... 'inout'            # receiver convention after '-> ret' or params
+```
+Legacy normalization (immediately after parsing, one semantic implementation):
+`&mut T` → `inout T`; `&T` / `&self` → `let T`; `move T` → `sink T`;
+`own T` → `sink T`; `mut x`/`let mut x` → `var x`.
+
+### AST v2 (tg_compiler/ast.tg)
+
+```
+enum AccessConvention { Let, Inout, Sink, Set }
+struct Param { name, convention: AccessConvention, modifier: ParamModifier /*transitional*/, ty, ... }
+enum NominalKind { Value, Resource }
+TypeExprKind: delete Ref, RefMut; keep Ptr/PtrMut (later renamed RawPtr/RawMutPtr).
+ExprKind: delete ExprRef, ExprRefMut, ExprMove, ExprCopy, ExprDeref;
+         add ExprAccess(Box[Expr]) /* &place access marker */; unsafe ExprRawDeref(Box[Expr]).
+Pattern: delete Ref, RefMut.
+```
+Transitional rule: legacy `&expr` parses to ExprAccess; `&`/`&mut`/`move`/`own` parameter
+modifiers normalize to conventions above; ParamModifier is retained during migration and
+deleted only after all semantic layers consume AccessConvention.
+
+### types.tg
+
+```
+enum TypeKind { Value, Resource, Capability }
+struct TypeDef { ..., kind: TypeKind }           # default Value; CapabilityDecl -> Capability
+struct ParamType { ty: Type, convention: AccessConvention }
+Function(Vec[ParamType], Type)                   # function types carry per-param conventions
+```
+Deferred deletions (after semantic layers are migrated): Type::Ref/RefMut/Owned, Lifetime,
+lifetime_* helpers, TypeEnv.lifetime_counter/current_lifetime.
+
+### TypedProgram (resolver + type checker produce; MIR consumes)
+
+```
+struct TypedProgram {
+  ast: Program
+  resolutions: ResolvedNames
+  expr_types: Map[NodeId, Type]
+  call_targets: Map[NodeId, DefId]
+  field_targets: Map[NodeId, FieldId]
+  access_effects: Map[NodeId, AccessEffect]
+  type_kinds: Map[TypeId, TypeKind]
+}
+struct DefId { module: ModuleId, index: UInt }
+```
+
+### access_check.tg (replaces borrow_check.tg)
+
+```
+enum AccessEffect { Read, Modify, Consume, Initialize }
+struct AccessPath { root: LocalId, projections: Vec[AccessProjection] }
+struct ActiveAccess { path: AccessPath, effect: AccessEffect }
+```
+Rules: multiple Reads coexist; Modify/Consume/Initialize are exclusive; fixed struct fields
+statically disjoint; dynamic index overlap conservatively rejected. Sink sources marked
+consumed. Resource dataflow: Uninitialized/Live/Consumed/MaybeLive over CFG; auto deinit at
+scope exit; branch merge inconsistency rejected; loop-created resources must be consumed per
+iteration.
+
+### MIR
+
+MirCallArg { effect: AccessEffect, value: MirCallValue }; MirCallValue = Value(MirOperand) | Place(Place).
+MirRead(Place)/MirConsume(Place) replace MirCopy/MirMovePlace and MirRef/MirRefMut;
+no general MirRef value; MirDrop → MirDeinit (auto/explicit/unsafe-raw distinguished);
+ProjDeref removed for safe places (ProjRawDeref only, unsafe).
