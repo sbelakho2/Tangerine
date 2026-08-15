@@ -17,7 +17,7 @@ use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::resolver::{ResolvedNames}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
-  UseDecl, AstPath, ExternItem, NominalKind,
+  UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
   TypeExpr, TypeExprKind, Param, ParamModifier, GenericParam,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind
 }
@@ -57,7 +57,7 @@ enum Type
   Named(TypeId, Vec[Type])
   
   # Function type
-  Function(Vec[Type], Type)
+  Function(Vec[ParamType], Type)
   
   # Reference types (ownership model)
   Ref(Type, Lifetime)
@@ -95,6 +95,11 @@ enum Type
   
   # Error type (for error recovery)
   Error
+end
+
+struct ParamType
+  ty: Type
+  convention: AccessConvention
 end
 
 struct TypeId
@@ -159,10 +164,10 @@ end
 
 struct MethodSig
   name: String
-  params: Vec[Type]
+  params: Vec[ParamType]
   ret_type: Type
   is_method: Bool
-  param_types: Vec[Type]
+  param_types: Vec[ParamType]
   return_type: Type
 end
 
@@ -201,6 +206,11 @@ struct TypeEnv
   errors: Vec[TypeError]
   warnings: Vec[TypeError]
   typed_expr_types: Map[Int, Type]
+  local_id_counter: Int
+  local_ids: Vec[Map[String, Int]]
+  resolutions: Option[ResolvedNames]
+  typed_call_targets: Map[Int, DefId]
+  typed_field_targets: Map[Int, String]
 end
 
 struct ImplInfo
@@ -268,7 +278,12 @@ def type_env_new() -> TypeEnv
     non_sync_types: Set::new(),
     errors: Vec::new(),
     warnings: Vec::new(),
-    typed_expr_types: Map::new()
+    typed_expr_types: Map::new(),
+    local_id_counter: 0,
+    local_ids: Vec::new(),
+    resolutions: Option::None,
+    typed_call_targets: Map::new(),
+    typed_field_targets: Map::new()
   }
   
   # Register types that are !Send / !Sync
@@ -357,10 +372,10 @@ def type_env_new() -> TypeEnv
   register_builtin_trait(&mut env, "Send", Vec::new())
   register_builtin_trait(&mut env, "Sync", Vec::new())
   register_builtin_trait(&mut env, "Eq", [
-    MethodSig { name: "eq", params: [Type::Param("Self")], ret_type: Type::Bool, is_method: true, param_types: [Type::Param("Self")], return_type: Type::Bool }
+    MethodSig { name: "eq", params: [ParamType { ty: Type::Param("Self"), convention: AccessConvention::Let }], ret_type: Type::Bool, is_method: true, param_types: [ParamType { ty: Type::Param("Self"), convention: AccessConvention::Let }], return_type: Type::Bool }
   ])
   register_builtin_trait(&mut env, "Ord", [
-    MethodSig { name: "cmp", params: [Type::Param("Self")], ret_type: Type::Int, is_method: true, param_types: [Type::Param("Self")], return_type: Type::Int }
+    MethodSig { name: "cmp", params: [ParamType { ty: Type::Param("Self"), convention: AccessConvention::Let }], ret_type: Type::Int, is_method: true, param_types: [ParamType { ty: Type::Param("Self"), convention: AccessConvention::Let }], return_type: Type::Int }
   ])
   register_builtin_trait(&mut env, "Hash", [
     MethodSig { name: "hash", params: Vec::new(), ret_type: Type::Int, is_method: true, param_types: Vec::new(), return_type: Type::Int }
@@ -372,7 +387,7 @@ def type_env_new() -> TypeEnv
     MethodSig { name: "into", params: Vec::new(), ret_type: Type::Param("T"), is_method: true, param_types: Vec::new(), return_type: Type::Param("T") }
   ])
   register_builtin_trait(&mut env, "From", [
-    MethodSig { name: "from", params: [Type::Param("T")], ret_type: Type::Param("Self"), is_method: false, param_types: [Type::Param("T")], return_type: Type::Param("Self") }
+    MethodSig { name: "from", params: [ParamType { ty: Type::Param("T"), convention: AccessConvention::Let }], ret_type: Type::Param("Self"), is_method: false, param_types: [ParamType { ty: Type::Param("T"), convention: AccessConvention::Let }], return_type: Type::Param("Self") }
   ])
   
   env
@@ -511,7 +526,7 @@ def type_has_resource_kind(env: &TypeEnv, ty: &Type) -> Bool
     var i = 0
     var found = false
     while i < params.len() do
-      if type_has_resource_kind(env, &params[i]) then
+      if type_has_resource_kind(env, &params[i].ty) then
         found = true
         break
       end
@@ -732,17 +747,22 @@ end
 def push_scope(env: &mut TypeEnv) -> Unit
   let m: Map[String, Type] = Map::new()
   env.scopes.push(m)
+  let lm: Map[String, Int] = Map::new()
+  env.local_ids.push(lm)
 end
 
 def pop_scope(env: &mut TypeEnv) -> Unit
   env.scopes.pop()
+  env.local_ids.pop()
   ()
 end
 
 def bind_var(env: &mut TypeEnv, name: String, ty: Type) -> Unit
   if !env.scopes.is_empty() then
     let idx = env.scopes.len() - 1
-    env.scopes[idx].insert(name, ty)
+    env.scopes[idx].insert(name.clone(), ty)
+    env.local_ids[idx].insert(name, env.local_id_counter)
+    env.local_id_counter = env.local_id_counter + 1
   end
 end
 
@@ -756,6 +776,18 @@ def lookup_var(env: &TypeEnv, name: String) -> Option[Type]
     end
   end
   Option::None
+end
+
+def local_id_of(env: &TypeEnv, name: String) -> Int
+  var i = env.local_ids.len()
+  while i > 0 do
+    i = i - 1
+    match env.local_ids[i].get(&name)
+    when Option::Some(id) then return id
+    when Option::None then ()
+    end
+  end
+  0
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1072,7 +1104,8 @@ def subst_type_args(ty: &Type, generic_params: &Vec[String], type_args: &Vec[Typ
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
-      new_params.push(subst_type_args(&params[i], generic_params, type_args))
+      let pt = params[i]
+      new_params.push(ParamType { ty: subst_type_args(&pt.ty, generic_params, type_args), convention: pt.convention })
       i = i + 1
     end
     Type::Function(new_params, subst_type_args(ret, generic_params, type_args))
@@ -1098,7 +1131,14 @@ def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
   when Type::Tuple(fields) then
     Type::Tuple(fields.map(|f| resolve_type_var(env, f)))
   when Type::Function(params, ret) then
-    Type::Function(params.map(|p| resolve_type_var(env, p)), resolve_type_var(env, ret))
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: resolve_type_var(env, pt.ty), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Function(new_params, resolve_type_var(env, ret))
   when Type::Named(tid, args) then
     Type::Named(tid, args.map(|a| resolve_type_var(env, a)))
   when Type::Slice(inner) then Type::Slice(resolve_type_var(env, inner))
@@ -1793,7 +1833,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
                 var i = 0
                 let min_len = if args1.len() - 1 < params2.len() then args1.len() - 1 else params2.len() end
                 while i < min_len do
-                  if !unify(env, args1[i], params2[i], span) then
+                  if !unify(env, args1[i], params2[i].ty, span) then
                     ok = false
                   end
                   i = i + 1
@@ -1825,7 +1865,10 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             var i = 0
             let min_len = if params1.len() < params2.len() then params1.len() else params2.len() end
             while i < min_len do
-              if !unify(env, params1[i], params2[i], span) then
+              if !(params1[i].convention == params2[i].convention) then
+                ok = false
+              end
+              if !unify(env, params1[i].ty, params2[i].ty, span) then
                 ok = false
               end
               i = i + 1
@@ -1835,7 +1878,10 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             var ok = true
             var i = 0
             while i < params1.len() do
-              if !unify(env, params1[i], params2[i], span) then
+              if !(params1[i].convention == params2[i].convention) then
+                ok = false
+              end
+              if !unify(env, params1[i].ty, params2[i].ty, span) then
                 ok = false
               end
               i = i + 1
@@ -2031,7 +2077,7 @@ def occurs_check_with_depth(env: &mut TypeEnv, id: TypeVarId, ty: Type, depth: I
   when Type::Function(params, ret) then
     var found = false
     for p in params do
-      if occurs_check_with_depth(env, id, p, depth + 1, span.clone()) then
+      if occurs_check_with_depth(env, id, p.ty, depth + 1, span.clone()) then
         found = true
         break
       end
@@ -2152,10 +2198,11 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
       var j = 0
       while j < f.params.len() do
         let p = &f.params[j]
-        match &p.ty
-        when Option::Some(ty_expr) then param_types.push(resolve_type_expr(env, &ty_expr))
-        when Option::None then param_types.push(fresh_type_var(env))
+        let resolved_ty = match &p.ty
+        when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+        when Option::None then fresh_type_var(env)
         end
+        param_types.push(ParamType { ty: resolved_ty, convention: p.convention })
         j = j + 1
       end
       let ret_ty = match &f.ret_type
@@ -2181,10 +2228,11 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
           var k = 0
           while k < ef.params.len() do
             let p = &ef.params[k]
-            match &p.ty
-            when Option::Some(ty_expr) then param_types.push(resolve_type_expr(env, &ty_expr))
-            when Option::None then param_types.push(fresh_type_var(env))
+            let resolved_ty = match &p.ty
+            when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+            when Option::None then fresh_type_var(env)
             end
+            param_types.push(ParamType { ty: resolved_ty, convention: p.convention })
             k = k + 1
           end
           let ret_ty = match &ef.ret_type
@@ -2371,6 +2419,8 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
     # INLINE push_scope to avoid &mut parameter passing bug
     let _m: Map[String, Type] = Map::new()
     env.scopes.push(_m)
+    let _lm: Map[String, Int] = Map::new()
+    env.local_ids.push(_lm)
     var gp_idx = 0
     while gp_idx < s.generic_params.len() do
       bind_var(env, s.generic_params[gp_idx].name.clone(), Type::Param(s.generic_params[gp_idx].name.clone()))
@@ -2422,6 +2472,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
 
     # INLINE pop_scope
     env.scopes.pop()
+    env.local_ids.pop()
 
     let td = TypeDef {
       id: id,
@@ -2457,12 +2508,14 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       var param_types = Vec::new()
       var j = 0
       while j < t.methods[i].sig.params.len() do
-        match &t.methods[i].sig.params[j].ty
+        let p = &t.methods[i].sig.params[j]
+        let resolved_ty = match &p.ty
         when Option::Some(ty_expr) then
-          param_types.push(resolve_type_expr(env, &ty_expr))
+          resolve_type_expr(env, &ty_expr)
         when Option::None then
-          param_types.push(fresh_type_var(env))
+          fresh_type_var(env)
         end
+        param_types.push(ParamType { ty: resolved_ty, convention: p.convention })
         j = j + 1
       end
       let ret_ty = match &t.methods[i].sig.ret_type
@@ -2566,6 +2619,7 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
 end
 
 def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
+  env.local_id_counter = 0
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   
@@ -2731,6 +2785,7 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
   method_index = 0
   while method_index < i.methods.len() do
     let m = i.methods[method_index]
+    env.local_id_counter = 0
     push_scope(env)
 
     # Register method-level generic type parameters in scope
@@ -3375,6 +3430,22 @@ end
 # Expression Type Checking
 # ———————————————————————————————————————————————————————————————
 
+def record_typed_call_target(env: &mut TypeEnv, span_start: Int, node_id: Int) -> Unit
+  var did_opt: Option[DefId] = Option::None
+  match env.resolutions
+  when Option::Some(res) then
+    match res.call_targets.get(span_start)
+    when Option::Some(did) then did_opt = Option::Some(did)
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  match did_opt
+  when Option::Some(did) then env.typed_call_targets.insert(node_id, did)
+  when Option::None then ()
+  end
+end
+
 def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   let result = match expr.kind
   when ExprKind::ExprIntLit(_) then Type::Int
@@ -3416,7 +3487,13 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
           if variant.fields.len() == 0 then
             enum_type
           else
-            Type::Function(field_types, enum_type)
+            var fn_params = Vec::new()
+            var fi2 = 0
+            while fi2 < field_types.len() do
+              fn_params.push(ParamType { ty: field_types[fi2], convention: AccessConvention::Let })
+              fi2 = fi2 + 1
+            end
+            Type::Function(fn_params, enum_type)
           end
         when Option::None then
           # Unknown identifier — return fresh type var instead of erroring.
@@ -3450,8 +3527,15 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       i = i + 1
     end
     let ret_type = fresh_type_var(env)
-    let expected_func = Type::Function(arg_types, ret_type)
+    var fn_params = Vec::new()
+    var pi = 0
+    while pi < arg_types.len() do
+      fn_params.push(ParamType { ty: arg_types[pi], convention: AccessConvention::Let })
+      pi = pi + 1
+    end
+    let expected_func = Type::Function(fn_params, ret_type)
     unify(env, func_type, expected_func, expr.span)
+    record_typed_call_target(env, expr.span.start, expr.node_id)
     ret_type
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
     let recv_type = check_expr(env, &recv)
@@ -3470,9 +3554,11 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     end
     # Look up method on receiver type with type args
     let ret = resolve_method_type(env, &recv_type, method, &arg_types, &method_type_args, expr.span)
+    record_typed_call_target(env, expr.span.start, expr.node_id)
     ret
   when ExprKind::ExprFieldAccess(recv, field) then
     let recv_type = check_expr(env, &recv)
+    env.typed_field_targets.insert(expr.node_id, field.clone())
     resolve_field_type(env, &recv_type, field, expr.span)
   when ExprKind::ExprIndex(recv, index) then
     let recv_type = check_expr(env, &recv)
@@ -3648,6 +3734,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       end
     end
   when ExprKind::ExprClosure(params, ret_ty, body) then
+    env.local_id_counter = 0
     push_scope(env)
     var param_types = Vec::new()
     var i = 0
@@ -3658,7 +3745,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       when Option::None then fresh_type_var(env)
       end
       check_pattern(env, &p.pat, ty)
-      param_types.push(ty)
+      param_types.push(ParamType { ty: ty, convention: AccessConvention::Let })
       i = i + 1
     end
     let body_type = check_expr(env, &body)
@@ -4268,7 +4355,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
       var param_types = Vec::new()
       var i = 0
       while i < args.len() do
-        param_types.push(resolve_type_expr(env, &args[i]))
+        param_types.push(ParamType { ty: resolve_type_expr(env, &args[i]), convention: AccessConvention::Let })
         i = i + 1
       end
       Type::Function(param_types, Type::Unit)
@@ -4424,7 +4511,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
     var param_types = Vec::new()
     var i = 0
     while i < params.len() do
-      param_types.push(resolve_type_expr(env, &params[i]))
+      param_types.push(ParamType { ty: resolve_type_expr(env, &params[i]), convention: AccessConvention::Let })
       i = i + 1
     end
     let ret_type = resolve_type_expr(env, &ret)
@@ -4618,16 +4705,28 @@ def type_check_strict(program: &Program, strict: Bool) -> Vec[TypeError]
 end
 
 def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &ResolvedNames) -> TypeCheckResult
+  env.local_id_counter = 0
+  env.local_ids.clear()
+  env.typed_call_targets.clear()
+  env.typed_field_targets.clear()
+  env.resolutions = Option::Some(resolutions.clone())
   type_check_program_env(env, program)
+  var kinds = Map::new()
+  var ki = 0
+  while ki < env.type_list.len() do
+    kinds.insert(env.type_list[ki].id.id, env.type_list[ki].kind)
+    ki = ki + 1
+  end
   let typed = TypedProgram {
     ast: program.clone(),
     resolutions: resolutions.clone(),
     expr_types: env.typed_expr_types.clone(),
-    call_targets: Map::new(),
-    field_targets: Map::new(),
+    call_targets: env.typed_call_targets.clone(),
+    field_targets: env.typed_field_targets.clone(),
     access_effects: Map::new(),
-    type_kinds: Map::new()
+    type_kinds: kinds
   }
+  env.resolutions = Option::None
   TypeCheckResult {
     errors: env.errors.clone(),
     program: typed
@@ -4885,7 +4984,7 @@ def type_display(ty: &Type) -> String
     var first = true
     for p in params do
       if !first then s = s + ", " end
-      s = s + type_display(p)
+      s = s + type_display(&p.ty)
       first = false
     end
     s = s + ") -> " + type_display(ret)

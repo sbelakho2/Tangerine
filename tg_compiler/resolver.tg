@@ -14,6 +14,7 @@ use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
                         Pattern, PatternKind, TypeExpr, TypeExprKind, UseDecl, ModuleDecl, Visibility, AstPath,
                         Param, TraitMethod, GenericParam, Function, ExternItem}
 use tg_compiler::token::{Span}
+use tg_compiler::types::{DefId}
 
 # ———————————————————————————————————————————————————————————————
 # Resolution Errors
@@ -77,6 +78,10 @@ struct ModuleSymbols
 
   # Visibility of this module
   visibility: Visibility
+
+  next_symbol_index: Int
+  symbol_indices: Map[String, Int]
+  variant_indices: Map[String, Int]
 end
 
 struct TypeDefSymbol
@@ -145,6 +150,7 @@ struct ResolvedNames
   expr_resolutions: Map[Int, ResolvedExpr]
   type_resolutions: Map[Int, ResolvedType]
   pattern_resolutions: Map[Int, ResolvedPattern]
+  call_targets: Map[Int, DefId]
 
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
@@ -385,6 +391,7 @@ def context_new() -> ResolutionContext
       expr_resolutions: Map::new(),
       type_resolutions: Map::new(),
       pattern_resolutions: Map::new(),
+      call_targets: Map::new(),
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"]
@@ -412,8 +419,25 @@ def module_symbols_new(name: String) -> ModuleSymbols
     imports: Vec::new(),
     glob_imports: Vec::new(),
     submodules: Map::new(),
-    visibility: Visibility::Private
+    visibility: Visibility::Private,
+    next_symbol_index: 0,
+    symbol_indices: Map::new(),
+    variant_indices: Map::new()
   }
+end
+
+def assign_symbol_index(module: &mut ModuleSymbols, name: &String) -> Unit
+  if !module.symbol_indices.contains_key(name) then
+    module.symbol_indices.insert(name.clone(), module.next_symbol_index)
+    module.next_symbol_index = module.next_symbol_index + 1
+  end
+end
+
+def assign_variant_index(module: &mut ModuleSymbols, name: &String) -> Unit
+  if !module.variant_indices.contains_key(name) then
+    module.variant_indices.insert(name.clone(), module.next_symbol_index)
+    module.next_symbol_index = module.next_symbol_index + 1
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -453,6 +477,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
 
     if !module_name_in_use(module, &f.name) then
       module.functions.insert(f.name.clone(), sym)
+      assign_symbol_index(module, &f.name)
     end
 
   when ItemKind::ItemStruct(s) then
@@ -483,7 +508,10 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     # Record every variant name so bare references (`Some`, `None`, `Zero`)
     # in expression position resolve as enum variants.
     for v in e.variants do
-      module.variants.insert(v.name.clone())
+      if !module.variants.contains(&v.name) then
+        module.variants.insert(v.name.clone())
+        assign_variant_index(module, &v.name)
+      end
     end
 
   when ItemKind::ItemTrait(t) then
@@ -516,7 +544,8 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
       # Store with qualified name: Type::method (first definition wins)
       let key = type_expr_to_string(&impl_block.for_type) + "::" + f.name
       if !module.functions.contains_key(&key) then
-        module.functions.insert(key, sym)
+        module.functions.insert(key.clone(), sym)
+        assign_symbol_index(module, &key)
       end
     end
 
@@ -538,6 +567,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     }
     if !module_name_in_use(module, &c.name) then
       module.constants.insert(c.name.clone(), csym)
+      assign_symbol_index(module, &c.name)
     end
 
   when ItemKind::ItemModule(m) then
@@ -558,6 +588,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     }
     if !module_name_in_use(module, &s.name) then
       module.statics.insert(s.name.clone(), sym)
+      assign_symbol_index(module, &s.name)
     end
 
   when ItemKind::ItemTypeAlias(t) then
@@ -588,6 +619,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
         }
         if !module_name_in_use(module, &f.name) then
           module.functions.insert(f.name.clone(), sym)
+          assign_symbol_index(module, &f.name)
         end
       when ExternItem::Static(s) then
         let sym = StaticSymbol {
@@ -599,6 +631,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
         }
         if !module_name_in_use(module, &s.name) then
           module.statics.insert(s.name.clone(), sym)
+          assign_symbol_index(module, &s.name)
         end
       end
     end
@@ -1229,9 +1262,14 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
     if module.types.contains_key(first) then
       let second = &path[1]
       # Could be enum variant or associated item
+      let vidx = variant_index_of(module, second)
       ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
         kind: ResolvedExprKind::EnumVariant(first.clone(), second.clone()),
         module_path: ctx.symbols.current_module.clone()
+      })
+      ctx.resolved.call_targets.insert(span.start, DefId {
+        module: ctx.symbols.current_module.join("::"),
+        index: vidx as UInt
       })
       return
     end
@@ -1319,9 +1357,14 @@ def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr)
     end
 
     if import_name == name.clone() then
+      let target_idx = symbol_index_for(ctx, &import.path, name)
       ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
         kind: ResolvedExprKind::Function(name.clone()),
         module_path: import.path.clone()
+      })
+      ctx.resolved.call_targets.insert(expr.span.start, DefId {
+        module: import.path.join("::"),
+        index: target_idx as UInt
       })
       return true
     end
@@ -1500,6 +1543,36 @@ def get_current_module_ref(symbols: &SymbolTable) -> &ModuleSymbols
   module
 end
 
+def symbol_index_of(module: &ModuleSymbols, name: &String) -> Int
+  match module.symbol_indices.get(name)
+  when Option::Some(idx) then idx
+  when Option::None then 0
+  end
+end
+
+def variant_index_of(module: &ModuleSymbols, name: &String) -> Int
+  match module.variant_indices.get(name)
+  when Option::Some(idx) then idx
+  when Option::None then 0
+  end
+end
+
+def symbol_index_for(ctx: &ResolutionContext, module_path: &Vec[String], name: &String) -> Int
+  match get_module_by_path(&ctx.symbols, module_path)
+  when Option::Some(m) then
+    match m.symbol_indices.get(name)
+    when Option::Some(idx) then return idx
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  match ctx.symbols.root.symbol_indices.get(name)
+  when Option::Some(idx2) then return idx2
+  when Option::None then ()
+  end
+  0
+end
+
 # ———————————————————————————————————————————————————————————————
 # Error Reporting
 # ———————————————————————————————————————————————————————————————
@@ -1551,29 +1624,44 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   # Try to resolve as function or constant
   let module = get_current_module_ref(&ctx.symbols)
   if module.functions.contains_key(name) then
+    let fidx = symbol_index_of(module, name)
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Function(name.clone()),
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: fidx as UInt
+    })
     return
   end
 
   if module.constants.contains_key(name) then
+    let cidx = symbol_index_of(module, name)
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Constant(name.clone()),
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: cidx as UInt
+    })
     return
   end
 
   if module.statics.contains_key(name) then
+    let sidx = symbol_index_of(module, name)
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Static(name.clone()),
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: sidx as UInt
+    })
     return
   end
 
@@ -1585,6 +1673,10 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: 0 as UInt
+    })
     return
   end
 
@@ -1597,16 +1689,25 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: 0 as UInt
+    })
     return
   end
 
   # Bare enum variant references (`Some`, `None`, `Zero`) resolve as variants.
   if module2.variants.contains(name.clone()) then
+    let vidx = variant_index_of(module2, name)
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::EnumVariant("".to_string(), name.clone()),
       module_path: ctx.symbols.current_module.clone()
     }
     let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+      module: ctx.symbols.current_module.join("::"),
+      index: vidx as UInt
+    })
     return
   end
 
