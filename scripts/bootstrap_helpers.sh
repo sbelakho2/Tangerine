@@ -118,7 +118,7 @@ bh_fingerprints() {
 
   local obj_file="$obj_fp_dir/${stage}.o"
   bh_log "fingerprinting $stage: object-metadata"
-  if "$compiler" compile "$source_file" -o "$obj_file" -c --target aarch64-apple-darwin >/dev/null 2>&1; then
+  if "$compiler" compile --strict-resolution "$source_file" -o "$obj_file" -c --target aarch64-apple-darwin >/dev/null 2>&1; then
     obj_hash="$(bh_sha256_file "$obj_file")"
   else
     bh_err "object emission failed for $stage; an object-fingerprint failure is fatal during bootstrap tracing"
@@ -570,13 +570,13 @@ check_two_clean_dirs() {
   local out_a="$outdir/${stage}_a" out_b="$outdir/${stage}_b"
 
   bh_log "$stage determinism: building from clean tree A (root=$dir_a)"
-  if ! ( cd "$dir_a" && "$compiler" compile tg_compiler/driver.tg -o "$out_a" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_a" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$out_a" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build A failed"
     return 1
   fi
 
   bh_log "$stage determinism: building from clean tree B (root=$dir_b)"
-  if ! ( cd "$dir_b" && "$compiler" compile tg_compiler/driver.tg -o "$out_b" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_b" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$out_b" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build B failed"
     return 1
   fi

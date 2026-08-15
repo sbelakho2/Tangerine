@@ -160,7 +160,7 @@ bh_log "stage0 ready: $STAGE0_BIN"
 bh_log "== Stage 1: native compiler via stage0 interpreter =="
 STAGE1="$BUILD_DIR/tg_stage1"
 run_logged stage1_compile \
-  "$STAGE0_BIN" compile "$DRIVER_SRC" -o "$STAGE1" --target "$TARGET_TRIPLE"
+  "$STAGE0_BIN" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE1" --target "$TARGET_TRIPLE"
 
 chmod +x "$STAGE1"
 if ! validate_stage tg_stage1 "$STAGE1"; then
@@ -185,7 +185,7 @@ fi
 bh_log "== Stage 2: self-host via stage1 =="
 STAGE2="$BUILD_DIR/tg_stage2"
 run_logged stage2_compile \
-  "$STAGE1" compile "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"
+  "$STAGE1" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"
 
 chmod +x "$STAGE2"
 if ! validate_stage tg_stage2 "$STAGE2"; then
@@ -221,7 +221,7 @@ fi
 bh_log "== Stage 3: self-host via stage2 =="
 STAGE3="$BUILD_DIR/tg_stage3"
 run_logged stage3_compile \
-  "$STAGE2" compile "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"
+  "$STAGE2" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"
 
 chmod +x "$STAGE3"
 if ! validate_stage tg_stage3 "$STAGE3"; then
