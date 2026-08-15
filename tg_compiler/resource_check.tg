@@ -1,0 +1,1107 @@
+use std::core::{Option}
+use std::collections::{Vec, Map}
+use tg_compiler::token::{Span}
+use tg_compiler::ast::{
+  Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
+  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
+  AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam,
+  TypeExpr, type_expr_name
+}
+use tg_compiler::types::{TypeKind, AccessEffect}
+
+enum ResourceState
+  Uninitialized
+  Live
+  Consumed
+  MaybeLive
+end
+
+struct ResourceError
+  message: String
+  span: Span
+end
+
+struct ResFrame
+  names: Vec[String]
+  states: Map[String, ResourceState]
+  caps: Vec[String]
+  spans: Map[String, Span]
+end
+
+def resource_check(program: &Program, type_kinds: &Map[String, TypeKind]) -> Vec[ResourceError]
+  mut errors = Vec::new()
+  mut i = 0
+  while i < program.items.len() do
+    check_item(program, type_kinds, &program.items[i], &mut errors)
+    i = i + 1
+  end
+  errors
+end
+
+def check_item(program: &Program, type_kinds: &Map[String, TypeKind], item: &Item, errors: &mut Vec[ResourceError]) -> Unit
+  match item.kind
+  when ItemKind::ItemFunction(f) then
+    check_function(program, type_kinds, &f, errors)
+  when ItemKind::ItemStruct(s) then
+    mut frame = res_frame_new()
+    mut i = 0
+    while i < s.fields.len() do
+      match s.fields[i].default
+      when Option::Some(e) then check_expr(program, type_kinds, &e, &Vec::new(), &mut frame, errors)
+      when Option::None then ()
+      end
+      i = i + 1
+    end
+  when ItemKind::ItemEnum(e) then
+    mut frame = res_frame_new()
+    mut i = 0
+    while i < e.variants.len() do
+      match e.variants[i].discriminant
+      when Option::Some(d) then check_expr(program, type_kinds, &d, &Vec::new(), &mut frame, errors)
+      when Option::None then ()
+      end
+      i = i + 1
+    end
+  when ItemKind::ItemTrait(t) then
+    mut i = 0
+    while i < t.methods.len() do
+      check_trait_method(program, type_kinds, &t.methods[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemImpl(im) then
+    mut i = 0
+    while i < im.methods.len() do
+      check_function(program, type_kinds, &im.methods[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemModule(m) then
+    mut i = 0
+    while i < m.items.len() do
+      check_item(program, type_kinds, &m.items[i], errors)
+      i = i + 1
+    end
+  when ItemKind::ItemUse(_) then ()
+  when ItemKind::ItemMacro(mac) then
+    mut frame = res_frame_new()
+    check_block(program, type_kinds, &mac.body, &Vec::new(), &mut frame, errors)
+  when ItemKind::ItemTypeAlias(_) then ()
+  when ItemKind::ItemConst(c) then
+    mut frame = res_frame_new()
+    check_expr(program, type_kinds, &c.value, &Vec::new(), &mut frame, errors)
+  when ItemKind::ItemStatic(s) then
+    mut frame = res_frame_new()
+    check_expr(program, type_kinds, &s.value, &Vec::new(), &mut frame, errors)
+  when ItemKind::ItemCapabilityDecl(_) then ()
+  when ItemKind::ItemEffectDecl(_) then ()
+  when ItemKind::ItemRationaleBlock(_) then ()
+  when ItemKind::ItemEditionDecl(_) then ()
+  when ItemKind::ItemExternBlock(ext) then
+    mut frame = res_frame_new()
+    mut i = 0
+    while i < ext.items.len() do
+      match ext.items[i]
+      when ExternItem::Function(ef) then
+        check_params_defaults(program, type_kinds, &ef.params, &mut frame, errors)
+      when ExternItem::Static(_) then ()
+      end
+      i = i + 1
+    end
+  end
+end
+
+def check_function(program: &Program, type_kinds: &Map[String, TypeKind], f: &FunctionDecl, errors: &mut Vec[ResourceError]) -> Unit
+  mut frame = res_frame_new()
+  bind_params(type_kinds, &f.params, &mut frame)
+  check_params_defaults(program, type_kinds, &f.params, &mut frame, errors)
+  mut i = 0
+  while i < f.contracts.len() do
+    check_expr(program, type_kinds, &f.contracts[i].expr, &Vec::new(), &mut frame, errors)
+    i = i + 1
+  end
+  check_fn_body(program, type_kinds, &f.body, &mut frame, errors)
+  exit_scope(&mut frame, &Vec::new(), errors)
+end
+
+def check_trait_method(program: &Program, type_kinds: &Map[String, TypeKind], m: &TraitMethod, errors: &mut Vec[ResourceError]) -> Unit
+  mut frame = res_frame_new()
+  bind_params(type_kinds, &m.sig.params, &mut frame)
+  check_params_defaults(program, type_kinds, &m.sig.params, &mut frame, errors)
+  check_fn_body(program, type_kinds, &m.default_body, &mut frame, errors)
+  exit_scope(&mut frame, &Vec::new(), errors)
+end
+
+def bind_params(type_kinds: &Map[String, TypeKind], params: &Vec[Param], frame: &mut ResFrame) -> Unit
+  mut i = 0
+  while i < params.len() do
+    bind_param(type_kinds, &params[i], frame)
+    i = i + 1
+  end
+end
+
+def bind_param(type_kinds: &Map[String, TypeKind], p: &Param, frame: &mut ResFrame) -> Unit
+  if p.convention == AccessConvention::Inout then
+    return
+  end
+  match &p.ty
+  when Option::Some(te) then
+    let type_name = type_expr_name(&te)
+    match kind_of(type_kinds, &type_name)
+    when Option::Some(TypeKind::Resource) then
+      let init_state = match p.convention
+      when AccessConvention::Set then ResourceState::Uninitialized
+      when _ then ResourceState::Live
+      end
+      res_frame_set(frame, p.name.clone(), init_state)
+      res_frame_set_span(frame, &p.name, p.span)
+    when Option::Some(TypeKind::Capability) then
+      let init_state = match p.convention
+      when AccessConvention::Set then ResourceState::Uninitialized
+      when _ then ResourceState::Live
+      end
+      res_frame_set(frame, p.name.clone(), init_state)
+      res_frame_mark_cap(frame, &p.name)
+      res_frame_set_span(frame, &p.name, p.span)
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+end
+
+def check_params_defaults(program: &Program, type_kinds: &Map[String, TypeKind], params: &Vec[Param], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  mut i = 0
+  while i < params.len() do
+    match params[i].default
+    when Option::Some(e) then check_expr(program, type_kinds, &e, &Vec::new(), frame, errors)
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+end
+
+def check_fn_body(program: &Program, type_kinds: &Map[String, TypeKind], body: &FnBody, frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match body
+  when FnBody::FnBlock(b) then check_block(program, type_kinds, &b, &Vec::new(), frame, errors)
+  when FnBody::FnExpr(e) then check_expr(program, type_kinds, &e, &Vec::new(), frame, errors)
+  when FnBody::FnExtern(_) then ()
+  when FnBody::FnNone then ()
+  end
+end
+
+def check_block(program: &Program, type_kinds: &Map[String, TypeKind], block: &Block, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  let entry_names = res_frame_names_clone(frame)
+  mut i = 0
+  while i < block.stmts.len() do
+    check_stmt(program, type_kinds, &block.stmts[i], loop_outer, frame, errors)
+    i = i + 1
+  end
+  exit_scope(frame, &entry_names, errors)
+end
+
+def check_stmt(program: &Program, type_kinds: &Map[String, TypeKind], stmt: &Stmt, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match stmt.kind
+  when StmtKind::StmtLet(pattern, ty, value, _) then
+    check_expr(program, type_kinds, &value, loop_outer, frame, errors)
+    bind_pattern(type_kinds, &pattern, &ty, stmt.span, frame)
+  when StmtKind::StmtAssign(target, value) then
+    check_expr(program, type_kinds, &target, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &value, loop_outer, frame, errors)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    check_expr(program, type_kinds, &target, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &value, loop_outer, frame, errors)
+  when StmtKind::StmtIf(if_stmt) then
+    check_if(program, type_kinds, &if_stmt, loop_outer, frame, errors)
+  when StmtKind::StmtMatch(m) then
+    check_match(program, type_kinds, &m, loop_outer, frame, errors)
+  when StmtKind::StmtWhile(cond, body) then
+    check_loop(program, type_kinds, Option::Some(&cond), &body, loop_outer, frame, errors)
+  when StmtKind::StmtFor(for_stmt) then
+    check_for(program, type_kinds, &for_stmt, loop_outer, frame, errors)
+  when StmtKind::StmtLoop(body) then
+    check_loop(program, type_kinds, Option::None, &body, loop_outer, frame, errors)
+  when StmtKind::StmtReturn(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, type_kinds, &val, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, type_kinds, &val, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtYield(val_opt) then
+    match val_opt
+    when Option::Some(val) then check_expr(program, type_kinds, &val, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtExpr(e) then
+    check_expr(program, type_kinds, &e, loop_outer, frame, errors)
+  when StmtKind::StmtUnsafe(_, body) then
+    check_block(program, type_kinds, &body, loop_outer, frame, errors)
+  when StmtKind::StmtDefer(body) then
+    check_block(program, type_kinds, &body, loop_outer, frame, errors)
+  when StmtKind::StmtGuard(cond, else_action) then
+    check_expr(program, type_kinds, &cond, loop_outer, frame, errors)
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(val) then check_expr(program, type_kinds, &val, loop_outer, frame, errors)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(val) then check_expr(program, type_kinds, &val, loop_outer, frame, errors)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_block) then
+    check_block(program, type_kinds, &body, loop_outer, frame, errors)
+    mut i = 0
+    while i < catches.len() do
+      check_block(program, type_kinds, &catches[i].body, loop_outer, frame, errors)
+      i = i + 1
+    end
+    match finally_block
+    when Option::Some(fb) then check_block(program, type_kinds, &fb, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, _, body) then
+    check_expr(program, type_kinds, &expr, loop_outer, frame, errors)
+    check_block(program, type_kinds, &body, loop_outer, frame, errors)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    check_expr(program, type_kinds, &expr, loop_outer, frame, errors)
+    mut i = 0
+    while i < handlers.len() do
+      mut j = 0
+      while j < handlers[i].arms.len() do
+        check_block(program, type_kinds, &handlers[i].arms[j].body, loop_outer, frame, errors)
+        j = j + 1
+      end
+      i = i + 1
+    end
+  end
+end
+
+def check_if(program: &Program, type_kinds: &Map[String, TypeKind], if_stmt: &IfStmt, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  check_expr(program, type_kinds, &if_stmt.cond, loop_outer, frame, errors)
+  mut arms = Vec::new()
+  mut then_frame = res_frame_clone(frame)
+  check_block(program, type_kinds, &if_stmt.then_block, loop_outer, &mut then_frame, errors)
+  arms.push(then_frame)
+  mut i = 0
+  while i < if_stmt.elsif_branches.len() do
+    check_expr(program, type_kinds, &if_stmt.elsif_branches[i].0, loop_outer, frame, errors)
+    mut arm = res_frame_clone(frame)
+    check_block(program, type_kinds, &if_stmt.elsif_branches[i].1, loop_outer, &mut arm, errors)
+    arms.push(arm)
+    i = i + 1
+  end
+  match if_stmt.else_block
+  when Option::Some(eb) then
+    mut arm = res_frame_clone(frame)
+    check_block(program, type_kinds, &eb, loop_outer, &mut arm, errors)
+    arms.push(arm)
+  when Option::None then
+    arms.push(res_frame_clone(frame))
+  end
+  let merged = merge_frames(&arms)
+  frame_assign(frame, &merged)
+end
+
+def check_match(program: &Program, type_kinds: &Map[String, TypeKind], m: &MatchExpr, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  check_expr(program, type_kinds, &m.scrutinee, loop_outer, frame, errors)
+  mut arms = Vec::new()
+  mut i = 0
+  while i < m.arms.len() do
+    check_pattern(program, type_kinds, &m.arms[i].pattern, loop_outer, frame, errors)
+    match m.arms[i].guard_expr
+    when Option::Some(g) then check_expr(program, type_kinds, &g, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+    mut arm = res_frame_clone(frame)
+    check_block(program, type_kinds, &m.arms[i].body, loop_outer, &mut arm, errors)
+    arms.push(arm)
+    i = i + 1
+  end
+  let merged = merge_frames(&arms)
+  frame_assign(frame, &merged)
+end
+
+def check_loop(program: &Program, type_kinds: &Map[String, TypeKind], cond: Option[&Expr], body: &Block, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  let entry = res_frame_clone(frame)
+  let entry_names = res_frame_names_clone(&entry)
+  match cond
+  when Option::Some(c) then
+    check_expr(program, type_kinds, c, &entry_names, frame, errors)
+  when Option::None then ()
+  end
+  let after = check_loop_body(program, type_kinds, body, &entry, &entry_names, errors)
+  frame_assign(frame, &after)
+end
+
+def check_for(program: &Program, type_kinds: &Map[String, TypeKind], for_stmt: &ForStmt, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  let entry = res_frame_clone(frame)
+  let entry_names = res_frame_names_clone(&entry)
+  check_pattern(program, type_kinds, &for_stmt.pattern, &entry_names, frame, errors)
+  check_expr(program, type_kinds, &for_stmt.iter, &entry_names, frame, errors)
+  let after = check_loop_body(program, type_kinds, &for_stmt.body, &entry, &entry_names, errors)
+  frame_assign(frame, &after)
+end
+
+def check_loop_body(program: &Program, type_kinds: &Map[String, TypeKind], body: &Block, entry: &ResFrame, entry_names: &Vec[String], errors: &mut Vec[ResourceError]) -> ResFrame
+  mut bf = res_frame_clone(entry)
+  mut i = 0
+  while i < body.stmts.len() do
+    check_stmt(program, type_kinds, &body.stmts[i], entry_names, &mut bf, errors)
+    i = i + 1
+  end
+  let to_forget = check_loop_created(entry, entry_names, &bf, errors)
+  i = 0
+  while i < to_forget.len() do
+    res_frame_forget(&mut bf, &to_forget[i])
+    i = i + 1
+  end
+  res_frame_clone(entry)
+end
+
+def check_loop_created(entry: &ResFrame, entry_names: &Vec[String], bf: &ResFrame, errors: &mut Vec[ResourceError]) -> Vec[String]
+  mut to_forget = Vec::new()
+  mut i = 0
+  while i < bf.names.len() do
+    let name = bf.names[i].clone()
+    match res_frame_get(bf, &name)
+    when Option::Some(ResourceState::Live) then
+      if is_loop_created(entry, entry_names, &name) then
+        errors.push(ResourceError {
+          message: "resource `" + name + "` created in loop must be consumed each iteration",
+          span: frame_span(bf, &name)
+        })
+        to_forget.push(name)
+      end
+    when Option::Some(ResourceState::MaybeLive) then
+      if is_loop_created(entry, entry_names, &name) then
+        errors.push(ResourceError {
+          message: "resource `" + name + "` created in loop must be consumed each iteration",
+          span: frame_span(bf, &name)
+        })
+        to_forget.push(name)
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  to_forget
+end
+
+def is_loop_created(entry: &ResFrame, entry_names: &Vec[String], name: &String) -> Bool
+  if !entry_names.contains(name) then
+    return true
+  end
+  match res_frame_get(entry, name)
+  when Option::Some(ResourceState::Uninitialized) then true
+  when _ then false
+  end
+end
+
+def check_pattern(program: &Program, type_kinds: &Map[String, TypeKind], pat: &Pattern, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match pat.kind
+  when PatternKind::Wildcard then ()
+  when PatternKind::Ident(_, _) then ()
+  when PatternKind::Literal(e) then check_expr(program, type_kinds, &e, loop_outer, frame, errors)
+  when PatternKind::Tuple(pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, type_kinds, &pats[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, type_kinds, &pats[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when PatternKind::Struct(_, field_pats) then
+    mut i = 0
+    while i < field_pats.len() do
+      check_pattern(program, type_kinds, &field_pats[i].1, loop_outer, frame, errors)
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    mut i = 0
+    while i < pats.len() do
+      check_pattern(program, type_kinds, &pats[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when PatternKind::Or(alts) then
+    mut i = 0
+    while i < alts.len() do
+      check_pattern(program, type_kinds, &alts[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when PatternKind::Range(lo, hi, _) then
+    match lo
+    when Option::Some(e) then check_expr(program, type_kinds, &e, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+    match hi
+    when Option::Some(e) then check_expr(program, type_kinds, &e, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when PatternKind::Ref(inner) then check_pattern(program, type_kinds, &inner, loop_outer, frame, errors)
+  when PatternKind::RefMut(inner) then check_pattern(program, type_kinds, &inner, loop_outer, frame, errors)
+  end
+end
+
+def bind_pattern(type_kinds: &Map[String, TypeKind], pat: &Pattern, ty: &Option[TypeExpr], span: Span, frame: &mut ResFrame) -> Unit
+  match pat.kind
+  when PatternKind::Ident(name, _) then
+    match ty
+    when Option::Some(te) then
+      let type_name = type_expr_name(&te)
+      match kind_of(type_kinds, &type_name)
+      when Option::Some(TypeKind::Resource) then
+        res_frame_set(frame, name.clone(), ResourceState::Live)
+        res_frame_set_span(frame, &name, span)
+      when Option::Some(TypeKind::Capability) then
+        res_frame_set(frame, name.clone(), ResourceState::Live)
+        res_frame_mark_cap(frame, &name)
+        res_frame_set_span(frame, &name, span)
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def check_expr(program: &Program, type_kinds: &Map[String, TypeKind], expr: &Expr, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+  when ExprKind::ExprArrayLit(elems) then
+    mut i = 0
+    while i < elems.len() do
+      check_expr(program, type_kinds, &elems[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    mut i = 0
+    while i < elems.len() do
+      check_expr(program, type_kinds, &elems[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    mut i = 0
+    while i < fields.len() do
+      check_expr(program, type_kinds, &fields[i].1, loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    mut i = 0
+    while i < entries.len() do
+      check_expr(program, type_kinds, &entries[i].0, loop_outer, frame, errors)
+      check_expr(program, type_kinds, &entries[i].1, loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprIdent(name) then
+    check_use(&name, expr.span, frame, errors)
+  when ExprKind::ExprPath(_) then ()
+  when ExprKind::ExprSelfRef then
+    let self_name = "self"
+    check_use(&self_name, expr.span, frame, errors)
+  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
+    check_expr(program, type_kinds, &lhs, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &rhs, loop_outer, frame, errors)
+  when ExprKind::ExprUnaryOp(_, operand) then
+    check_expr(program, type_kinds, &operand, loop_outer, frame, errors)
+  when ExprKind::ExprFieldAccess(base, _) then
+    check_expr(program, type_kinds, &base, loop_outer, frame, errors)
+  when ExprKind::ExprMethodCall(recv, method, _, args) then
+    check_expr_method_call(program, type_kinds, &recv, &method, &args, loop_outer, frame, errors)
+  when ExprKind::ExprIndex(base, index) then
+    check_expr(program, type_kinds, &base, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &index, loop_outer, frame, errors)
+  when ExprKind::ExprCall(callee, args) then
+    check_expr_call(program, type_kinds, &callee, &args, loop_outer, frame, errors)
+  when ExprKind::ExprClosure(params, _, body) then
+    mut cframe = res_frame_new()
+    mut i = 0
+    while i < params.len() do
+      bind_closure_param(type_kinds, &params[i], &mut cframe)
+      i = i + 1
+    end
+    check_expr(program, type_kinds, &body, &Vec::new(), &mut cframe, errors)
+    exit_scope(&mut cframe, &Vec::new(), errors)
+  when ExprKind::ExprRef(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprRefMut(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprDeref(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprMove(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprCopy(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprIf(if_stmt) then
+    check_if(program, type_kinds, &if_stmt, loop_outer, frame, errors)
+  when ExprKind::ExprMatch(m) then
+    check_match(program, type_kinds, &m, loop_outer, frame, errors)
+  when ExprKind::ExprBlock(block) then
+    check_block(program, type_kinds, &block, loop_outer, frame, errors)
+  when ExprKind::ExprUnsafe(_, block) then
+    check_block(program, type_kinds, &block, loop_outer, frame, errors)
+  when ExprKind::ExprAsync(block) then
+    check_block(program, type_kinds, &block, loop_outer, frame, errors)
+  when ExprKind::ExprAwait(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprTry(inner) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then check_expr(program, type_kinds, &s, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then check_expr(program, type_kinds, &e, loop_outer, frame, errors)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprTypeCheck(inner, _) then check_expr(program, type_kinds, &inner, loop_outer, frame, errors)
+  when ExprKind::ExprComptime(block) then
+    check_block(program, type_kinds, &block, loop_outer, frame, errors)
+  when ExprKind::ExprEnumVariant(_, args) then
+    mut i = 0
+    while i < args.len() do
+      check_expr(program, type_kinds, &args[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprAssign(target, value) then
+    check_expr(program, type_kinds, &target, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &value, loop_outer, frame, errors)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    check_expr(program, type_kinds, &lhs, loop_outer, frame, errors)
+    check_expr(program, type_kinds, &rhs, loop_outer, frame, errors)
+  when ExprKind::ExprMacroCall(_, args) then
+    mut i = 0
+    while i < args.len() do
+      check_expr(program, type_kinds, &args[i], loop_outer, frame, errors)
+      i = i + 1
+    end
+  when ExprKind::ExprError(_) then ()
+  end
+end
+
+def check_expr_call(program: &Program, type_kinds: &Map[String, TypeKind], callee: &Expr, args: &Vec[Expr], loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  check_expr(program, type_kinds, callee, loop_outer, frame, errors)
+  match callee_name(callee)
+  when Option::Some(name) then
+    match find_function(program, &name)
+    when Option::Some(params) then
+      mut i = 0
+      while i < args.len() do
+        let eff = if i < params.len() then convention_effect(params[i].convention) else AccessEffect::Read end
+        apply_arg_effect(program, type_kinds, &args[i], eff, loop_outer, frame, errors)
+        i = i + 1
+      end
+    when Option::None then
+      mut i = 0
+      while i < args.len() do
+        apply_arg_effect(program, type_kinds, &args[i], AccessEffect::Read, loop_outer, frame, errors)
+        i = i + 1
+      end
+    end
+  when Option::None then
+    mut i = 0
+    while i < args.len() do
+      apply_arg_effect(program, type_kinds, &args[i], AccessEffect::Read, loop_outer, frame, errors)
+      i = i + 1
+    end
+  end
+end
+
+def check_expr_method_call(program: &Program, type_kinds: &Map[String, TypeKind], receiver: &Expr, method: &String, args: &Vec[Expr], loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match find_method(program, method)
+  when Option::Some(params) then
+    mut self_idx = -1
+    mut i = 0
+    while i < params.len() do
+      if params[i].name == "self" then
+        self_idx = i
+        break
+      end
+      i = i + 1
+    end
+    let recv_effect = if self_idx >= 0 then
+      match params[self_idx].convention
+      when AccessConvention::Inout then AccessEffect::Modify
+      when AccessConvention::Sink then AccessEffect::Consume
+      when _ then AccessEffect::Read
+      end
+    else AccessEffect::Read end
+    apply_arg_effect(program, type_kinds, receiver, recv_effect, loop_outer, frame, errors)
+    i = 0
+    while i < args.len() do
+      let param_idx = if self_idx >= 0 then self_idx + 1 + i else i end
+      let eff = if param_idx < params.len() then convention_effect(params[param_idx].convention) else AccessEffect::Read end
+      apply_arg_effect(program, type_kinds, &args[i], eff, loop_outer, frame, errors)
+      i = i + 1
+    end
+  when Option::None then
+    apply_arg_effect(program, type_kinds, receiver, AccessEffect::Read, loop_outer, frame, errors)
+    mut i = 0
+    while i < args.len() do
+      apply_arg_effect(program, type_kinds, &args[i], AccessEffect::Read, loop_outer, frame, errors)
+      i = i + 1
+    end
+  end
+end
+
+def apply_arg_effect(program: &Program, type_kinds: &Map[String, TypeKind], arg: &Expr, effect: AccessEffect, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match expr_root_name(arg)
+  when Option::Some(name) then
+    if res_frame_has(frame, &name) then
+      if expr_is_plain(arg) then
+        match effect
+        when AccessEffect::Consume then apply_consume(&name, arg.span, loop_outer, frame, errors)
+        when AccessEffect::Initialize then apply_set(&name, frame)
+        when _ then check_use(&name, arg.span, frame, errors)
+        end
+      else
+        check_use(&name, arg.span, frame, errors)
+      end
+    end
+  when Option::None then
+    check_expr(program, type_kinds, arg, loop_outer, frame, errors)
+  end
+end
+
+def apply_consume(name: &String, span: Span, loop_outer: &Vec[String], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  if loop_outer.contains(name) then
+    errors.push(ResourceError {
+      message: "resource `" + *name + "` cannot be consumed inside a repeatable loop",
+      span: span
+    })
+  end
+  match res_frame_get(frame, name)
+  when Option::Some(ResourceState::Consumed) then
+    errors.push(ResourceError {
+      message: "resource `" + *name + "` consumed twice",
+      span: span
+    })
+  when Option::Some(ResourceState::Uninitialized) then
+    errors.push(ResourceError {
+      message: "use of uninitialized resource `" + *name + "`",
+      span: span
+    })
+  when Option::Some(ResourceState::MaybeLive) then
+    errors.push(ResourceError {
+      message: "resource `" + *name + "` may be consumed on one path",
+      span: span
+    })
+  when _ then ()
+  end
+  res_frame_set(frame, name.clone(), ResourceState::Consumed)
+end
+
+def apply_set(name: &String, frame: &mut ResFrame) -> Unit
+  res_frame_set(frame, name.clone(), ResourceState::Live)
+end
+
+def check_use(name: &String, span: Span, frame: &ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  match res_frame_get(frame, name)
+  when Option::Some(ResourceState::Consumed) then
+    errors.push(ResourceError {
+      message: "use of consumed resource `" + *name + "`",
+      span: span
+    })
+  when Option::Some(ResourceState::Uninitialized) then
+    errors.push(ResourceError {
+      message: "use of uninitialized resource `" + *name + "`",
+      span: span
+    })
+  when Option::Some(ResourceState::MaybeLive) then
+    errors.push(ResourceError {
+      message: "resource `" + *name + "` may be consumed on one path",
+      span: span
+    })
+  when _ then ()
+  end
+end
+
+def exit_scope(frame: &mut ResFrame, entry_names: &Vec[String], errors: &mut Vec[ResourceError]) -> Unit
+  mut to_forget = Vec::new()
+  mut i = 0
+  while i < frame.names.len() do
+    let name = frame.names[i].clone()
+    if !entry_names.contains(&name) then
+      match res_frame_get(frame, &name)
+      when Option::Some(ResourceState::Live) then
+        if frame.caps.contains(&name) then
+          errors.push(ResourceError {
+            message: "capability `" + name + "` silently discarded",
+            span: frame_span(frame, &name)
+          })
+        end
+      when Option::Some(ResourceState::MaybeLive) then
+        if frame.caps.contains(&name) then
+          errors.push(ResourceError {
+            message: "capability `" + name + "` silently discarded",
+            span: frame_span(frame, &name)
+          })
+        end
+      when _ then ()
+      end
+      to_forget.push(name)
+    end
+    i = i + 1
+  end
+  i = 0
+  while i < to_forget.len() do
+    res_frame_forget(frame, &to_forget[i])
+    i = i + 1
+  end
+end
+
+def res_frame_new() -> ResFrame
+  ResFrame {
+    names: Vec::new(),
+    states: Map::new(),
+    caps: Vec::new(),
+    spans: Map::new()
+  }
+end
+
+def res_frame_has(frame: &ResFrame, name: &String) -> Bool
+  frame.states.contains_key(name)
+end
+
+def res_frame_get(frame: &ResFrame, name: &String) -> Option[ResourceState]
+  match frame.states.get(name)
+  when Option::Some(s) then Option::Some(*s)
+  when Option::None then Option::None
+  end
+end
+
+def res_frame_set(frame: &mut ResFrame, name: String, state: ResourceState) -> Unit
+  if !frame.states.contains_key(&name) then
+    frame.names.push(name.clone())
+  end
+  frame.states.insert(name, state)
+end
+
+def res_frame_set_span(frame: &mut ResFrame, name: &String, span: Span) -> Unit
+  frame.spans.insert(name.clone(), span)
+end
+
+def frame_span(frame: &ResFrame, name: &String) -> Span
+  match frame.spans.get(name)
+  when Option::Some(s) then *s
+  when Option::None then Span { file: String::new(), start: 0, end_pos: 0 }
+  end
+end
+
+def res_frame_mark_cap(frame: &mut ResFrame, name: &String) -> Unit
+  frame.caps.push(name.clone())
+end
+
+def res_frame_forget(frame: &mut ResFrame, name: &String) -> Unit
+  frame.states.remove(name)
+  frame.spans.remove(name)
+  mut i = 0
+  while i < frame.names.len() do
+    if frame.names[i] == *name then
+      frame.names.remove(i)
+      break
+    end
+    i = i + 1
+  end
+  mut j = 0
+  while j < frame.caps.len() do
+    if frame.caps[j] == *name then
+      frame.caps.remove(j)
+      break
+    end
+    j = j + 1
+  end
+end
+
+def res_frame_names_clone(frame: &ResFrame) -> Vec[String]
+  mut out = Vec::new()
+  mut i = 0
+  while i < frame.names.len() do
+    out.push(frame.names[i].clone())
+    i = i + 1
+  end
+  out
+end
+
+def res_frame_clone(frame: &ResFrame) -> ResFrame
+  mut out = res_frame_new()
+  mut i = 0
+  while i < frame.names.len() do
+    match res_frame_get(frame, &frame.names[i])
+    when Option::Some(s) then
+      res_frame_set(&mut out, frame.names[i].clone(), s)
+      res_frame_set_span(&mut out, &frame.names[i], frame_span(frame, &frame.names[i]))
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  mut j = 0
+  while j < frame.caps.len() do
+    out.caps.push(frame.caps[j].clone())
+    j = j + 1
+  end
+  out
+end
+
+def frame_assign(dst: &mut ResFrame, src: &ResFrame) -> Unit
+  while dst.names.len() > 0 do
+    let name = dst.names[0].clone()
+    res_frame_forget(dst, &name)
+  end
+  mut i = 0
+  while i < src.names.len() do
+    match res_frame_get(src, &src.names[i])
+    when Option::Some(s) then
+      res_frame_set(dst, src.names[i].clone(), s)
+      res_frame_set_span(dst, &src.names[i], frame_span(src, &src.names[i]))
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  mut j = 0
+  while j < src.caps.len() do
+    dst.caps.push(src.caps[j].clone())
+    j = j + 1
+  end
+end
+
+def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
+  mut out = res_frame_new()
+  mut union = Vec::new()
+  mut a = 0
+  while a < arms.len() do
+    let arm = &arms[a]
+    mut i = 0
+    while i < arm.names.len() do
+      if !union.contains(&arm.names[i]) then
+        union.push(arm.names[i].clone())
+      end
+      i = i + 1
+    end
+    a = a + 1
+  end
+  mut i = 0
+  while i < union.len() do
+    let name = union[i].clone()
+    let first = res_frame_get(&arms[0], &name)
+    match first
+    when Option::Some(s0) then
+      mut same = true
+      mut a = 1
+      while a < arms.len() do
+        match res_frame_get(&arms[a], &name)
+        when Option::Some(sx) then
+          if !(s0 == sx) then same = false end
+        when Option::None then same = false
+        end
+        a = a + 1
+      end
+      if same then
+        res_frame_set(&mut out, name.clone(), s0)
+      else
+        res_frame_set(&mut out, name.clone(), ResourceState::MaybeLive)
+      end
+      res_frame_set_span(&mut out, &name, frame_span_any(arms, &name))
+      if frame_caps_any(arms, &name) then
+        out.caps.push(name.clone())
+      end
+    when Option::None then
+      mut absent_all = true
+      mut a = 1
+      while a < arms.len() do
+        match res_frame_get(&arms[a], &name)
+        when Option::Some(_) then absent_all = false
+        when Option::None then ()
+        end
+        a = a + 1
+      end
+      if !absent_all then
+        res_frame_set(&mut out, name.clone(), ResourceState::MaybeLive)
+        res_frame_set_span(&mut out, &name, frame_span_any(arms, &name))
+        if frame_caps_any(arms, &name) then
+          out.caps.push(name.clone())
+        end
+      end
+    end
+    i = i + 1
+  end
+  out
+end
+
+def frame_caps_any(arms: &Vec[ResFrame], name: &String) -> Bool
+  mut a = 0
+  while a < arms.len() do
+    let arm = &arms[a]
+    if arm.caps.contains(name) then
+      return true
+    end
+    a = a + 1
+  end
+  false
+end
+
+def frame_span_any(arms: &Vec[ResFrame], name: &String) -> Span
+  mut a = 0
+  while a < arms.len() do
+    let arm = &arms[a]
+    match arm.spans.get(name)
+    when Option::Some(s) then return *s
+    when Option::None then ()
+    end
+    a = a + 1
+  end
+  Span { file: String::new(), start: 0, end_pos: 0 }
+end
+
+def kind_of(type_kinds: &Map[String, TypeKind], name: &String) -> Option[TypeKind]
+  match type_kinds.get(name)
+  when Option::Some(k) then Option::Some(*k)
+  when Option::None then Option::None
+  end
+end
+
+def bind_closure_param(type_kinds: &Map[String, TypeKind], cp: &ClosureParam, frame: &mut ResFrame) -> Unit
+  match cp.pat.kind
+  when PatternKind::Ident(name, _) then
+    match &cp.ty
+    when Option::Some(te) then
+      let type_name = type_expr_name(&te)
+      match kind_of(type_kinds, &type_name)
+      when Option::Some(TypeKind::Resource) then
+        res_frame_set(frame, name.clone(), ResourceState::Live)
+        res_frame_set_span(frame, &name, cp.span)
+      when Option::Some(TypeKind::Capability) then
+        res_frame_set(frame, name.clone(), ResourceState::Live)
+        res_frame_mark_cap(frame, &name)
+        res_frame_set_span(frame, &name, cp.span)
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def expr_root_name(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::ExprIdent(name) then Option::Some(name.clone())
+  when ExprKind::ExprFieldAccess(base, _) then expr_root_name(&base)
+  when ExprKind::ExprIndex(base, _) then expr_root_name(&base)
+  when ExprKind::ExprDeref(inner) then expr_root_name(&inner)
+  when ExprKind::ExprRef(inner) then expr_root_name(&inner)
+  when ExprKind::ExprRefMut(inner) then expr_root_name(&inner)
+  when ExprKind::ExprMove(inner) then expr_root_name(&inner)
+  when ExprKind::ExprCopy(inner) then expr_root_name(&inner)
+  when ExprKind::ExprCast(inner, _) then expr_root_name(&inner)
+  when _ then Option::None
+  end
+end
+
+def expr_is_plain(expr: &Expr) -> Bool
+  match expr.kind
+  when ExprKind::ExprIdent(_) then true
+  when ExprKind::ExprMove(inner) then expr_is_plain(&inner)
+  when ExprKind::ExprCopy(inner) then expr_is_plain(&inner)
+  when ExprKind::ExprRef(inner) then expr_is_plain(&inner)
+  when ExprKind::ExprRefMut(inner) then expr_is_plain(&inner)
+  when ExprKind::ExprCast(inner, _) then expr_is_plain(&inner)
+  when _ then false
+  end
+end
+
+def callee_name(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
+  when ExprKind::ExprPath(p) then
+    if p.segments.len() > 0 then
+      Option::Some(p.segments[p.segments.len() - 1].clone())
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def find_function(program: &Program, name: &String) -> Option[Vec[Param]]
+  find_function_in_items(&program.items, name)
+end
+
+def find_function_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
+  mut i = 0
+  while i < items.len() do
+    match items[i].kind
+    when ItemKind::ItemFunction(f) then
+      if f.name == *name then
+        return Option::Some(f.params.clone())
+      end
+    when ItemKind::ItemExternBlock(ext) then
+      mut j = 0
+      while j < ext.items.len() do
+        match ext.items[j]
+        when ExternItem::Function(ef) then
+          if ef.name == *name then
+            return Option::Some(ef.params.clone())
+          end
+        when ExternItem::Static(_) then ()
+        end
+        j = j + 1
+      end
+    when ItemKind::ItemModule(m) then
+      match find_function_in_items(&m.items, name)
+      when Option::Some(ps) then return Option::Some(ps)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+def find_method(program: &Program, name: &String) -> Option[Vec[Param]]
+  find_method_in_items(&program.items, name)
+end
+
+def find_method_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
+  mut i = 0
+  while i < items.len() do
+    match items[i].kind
+    when ItemKind::ItemImpl(im) then
+      mut j = 0
+      while j < im.methods.len() do
+        if im.methods[j].name == *name then
+          return Option::Some(im.methods[j].params.clone())
+        end
+        j = j + 1
+      end
+    when ItemKind::ItemModule(m) then
+      match find_method_in_items(&m.items, name)
+      when Option::Some(ps) then return Option::Some(ps)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+def convention_effect(c: AccessConvention) -> AccessEffect
+  match c
+  when AccessConvention::Let then AccessEffect::Read
+  when AccessConvention::Inout then AccessEffect::Modify
+  when AccessConvention::Sink then AccessEffect::Consume
+  when AccessConvention::Set then AccessEffect::Initialize
+  end
+end
