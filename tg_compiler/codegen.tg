@@ -2343,6 +2343,8 @@ def place_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, place: &Place) -> Type
       downcast_disc = disc
     when Projection::ProjField(_, idx) then
       current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+    when Projection::ProjFieldIndex(idx) then
+      current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
     when Projection::ProjIndex(_) then
       current_ty = project_index_type(ctx, &current_ty)
     when Projection::ProjConstantIndex(_) then
@@ -2855,6 +2857,7 @@ end
 def projection_is_field(proj: &Projection) -> Bool
   match proj
   when Projection::ProjField(_, _) then true
+  when Projection::ProjFieldIndex(_) then true
   when _ then false
   end
 end
@@ -2910,6 +2913,14 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       emit_load_mem(ctx, reg, reg, 0)
       current_ty = project_deref_type(&current_ty)
     when Projection::ProjField(name, idx) then
+      let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+      let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+      let fwidth = storage_width_of(&field_ty)
+      let fext = storage_signedness_of(&field_ty)
+      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      current_ty = field_ty
+      last_deref_unwrapped_ref = false
+    when Projection::ProjFieldIndex(idx) then
       let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
       let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
       let fwidth = storage_width_of(&field_ty)
@@ -3124,6 +3135,10 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
           let field_off = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
           emit_add_ri(ctx, base, field_off as i32)
           current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+        when Projection::ProjFieldIndex(idx) then
+          let field_off = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+          emit_add_ri(ctx, base, field_off as i32)
+          current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
         when Projection::ProjDowncast(_, disc) then
           downcast_disc = disc
           # Normalize inline tags vs heap pointers before accessing payload.
@@ -3202,6 +3217,9 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       when Projection::ProjDeref then
         store_off = 0
       when Projection::ProjField(_, idx) then
+        let fo = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+        store_off = fo as i32
+      when Projection::ProjFieldIndex(idx) then
         let fo = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
         store_off = fo as i32
       when Projection::ProjIndex(local_id) then
@@ -4031,6 +4049,16 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
           emit_load_mem(ctx, dst, dst, offset as i32)
         end
         current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
+      when Projection::ProjFieldIndex(idx) then
+        let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
+        if is_last then
+          if offset != 0 then
+            emit_add_ri(ctx, dst, offset as i32)
+          end
+        else
+          emit_load_mem(ctx, dst, dst, offset as i32)
+        end
+        current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
       when Projection::ProjIndex(local_id) then
         let is_byte_indexed = is_string_like_type(&current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
@@ -4639,8 +4667,8 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, term: &Mir
     let label = block_label_for(fctx, target.id)
     emit_jmp(ctx, label)
 
-  when MirTerminatorKind::MirDeinit(place, target, unwind) then
-    codegen_finalizer_call(ctx, fctx, &place)
+  when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
+    codegen_finalizer_call(ctx, fctx, &place, &deinit_fn)
     let label = block_label_for(fctx, target.id)
     emit_jmp(ctx, label)
 
@@ -4856,34 +4884,18 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   emit_jmp(ctx, label)
 end
 
-def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place) -> Unit
-  let place_ty = place_type(ctx, fctx, place)
-  match place_ty
-  when Type::Named(tid, _) then
-    var type_name = ""
-    match ctx.type_def_index.get(tid.id)
-    when Option::Some(idx) then
-      if idx < ctx.type_defs.len() then
-        type_name = ctx.type_defs[idx].name.clone()
-      end
+def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, deinit_fn: &String) -> Unit
+  if ctx.reachable_fns.contains(deinit_fn) then
+    let resolved = match ctx.fn_alias.get(deinit_fn)
+    when Option::Some(actual) then actual.clone()
+    when Option::None then deinit_fn.clone()
+    end
+    match arg_reg(ctx.target.arch, 0)
+    when Option::Some(r0) then
+      emit_place_address(ctx, fctx, place, r0)
+      emit_call_label(ctx, resolved)
     when Option::None then ()
     end
-    if type_name != "" then
-      let deinit_fn = type_name + "__deinit"
-      if ctx.reachable_fns.contains(&deinit_fn) then
-        let resolved = match ctx.fn_alias.get(&deinit_fn)
-        when Option::Some(actual) then actual.clone()
-        when Option::None then deinit_fn
-        end
-        match arg_reg(ctx.target.arch, 0)
-        when Option::Some(r0) then
-          emit_place_address(ctx, fctx, place, r0)
-          emit_call_label(ctx, resolved)
-        when Option::None then ()
-        end
-      end
-    end
-  when _ then ()
   end
 end
 
@@ -6045,7 +6057,7 @@ def get_successor_ids(term: &MirTerminator) -> Vec[Int]
     succs.push(success.id)
   when MirTerminatorKind::MirDrop(place, target, unwind) then
     succs.push(target.id)
-  when MirTerminatorKind::MirDeinit(place, target, unwind) then
+  when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
     succs.push(target.id)
   when MirTerminatorKind::MirAssert(cond, expected, msg, target, unwind) then
     succs.push(target.id)

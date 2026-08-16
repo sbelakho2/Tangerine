@@ -20,6 +20,7 @@ use tg_compiler::types::{
   Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding, TypeKind,
   type_kinds_contain_resource
 }
+use tg_compiler::ids::{FieldId}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -100,6 +101,7 @@ end
 enum Projection
   ProjDeref
   ProjField(String, Int)
+  ProjFieldIndex(Int)
   ProjIndex(LocalId)
   ProjConstantIndex(Int)
   ProjDowncast(String, Int)  # For enum variants
@@ -147,10 +149,13 @@ def resolve_iter_expr_type(b: &MirBuilder, expr: &Expr) -> Type
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
     when ExprKind::ExprFieldAccess(ref base_box, ref field_name) then
-    # Resolve the base expression type, then look up the field type
-    # in the struct definition.
+    # The typed program's field identity (index) is authoritative; fall back
+    # to the struct definition name lookup only when unrecorded.
     let base_ty = resolve_iter_expr_type(b, base_box)
-    resolve_field_type_from_struct(b, &base_ty, field_name.clone())
+    match b.field_targets.get(expr.node_id)
+    when Option::Some(fid) then mir_infer_field_type_at_index(b, &base_ty, fid.index)
+    when Option::None then resolve_field_type_from_struct(b, &base_ty, field_name.clone())
+    end
     when _ then Type::Unit
     end
   elsif kind_name == "ExprMethodCall" then
@@ -579,7 +584,7 @@ enum MirTerminatorKind
   MirAssert { cond: MirOperand, expected: Bool, msg: AssertMessage, target: BlockId, unwind: Option[BlockId] }
   MirYield(MirOperand, BlockId)
   MirAbort
-  MirDeinit { place: Place, target: BlockId, unwind: Option[BlockId] }
+  MirDeinit { place: Place, deinit_fn: String, target: BlockId, unwind: Option[BlockId] }
 end
 
 struct SwitchTarget
@@ -636,6 +641,7 @@ def duplicate_projection(projection: &Projection) -> Projection
   match projection
   when Projection::ProjDeref then Projection::ProjDeref
   when Projection::ProjField(name, idx) then Projection::ProjField(name.clone(), idx)
+  when Projection::ProjFieldIndex(idx) then Projection::ProjFieldIndex(idx)
   when Projection::ProjIndex(id) then Projection::ProjIndex(LocalId { id: id.id })
   when Projection::ProjConstantIndex(idx) then Projection::ProjConstantIndex(idx)
   when Projection::ProjDowncast(name, idx) then Projection::ProjDowncast(name.clone(), idx)
@@ -779,7 +785,7 @@ def mir_terminator_kind_name(kind: &MirTerminatorKind) -> String
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then "MirAssert"
   when MirTerminatorKind::MirYield(_, _) then "MirYield"
   when MirTerminatorKind::MirAbort then "MirAbort"
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then "MirDeinit"
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then "MirDeinit"
   end
 end
 
@@ -870,7 +876,7 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
     end
   elsif kind_name == "MirDeinit" then
     match term.kind
-    when MirTerminatorKind::MirDeinit { place, target, unwind } then
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
       let duplicated_unwind = match unwind
       when Option::Some(block_id) then Option::Some(BlockId { id: block_id.id })
       when Option::None then Option::None
@@ -878,6 +884,7 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
       return MirTerminator {
         kind: MirTerminatorKind::MirDeinit {
           place: duplicate_place(place),
+          deinit_fn: deinit_fn.clone(),
           target: BlockId { id: target.id },
           unwind: duplicated_unwind
         },
@@ -950,7 +957,9 @@ struct MirBuilder
   type_defs: Vec[MirTypeDef]
   impl_type_map: Map[String, String]
   fn_ret_types: Map[String, Type]
-  fn_param_conventions: Map[String, Vec[AccessConvention]]
+  deinit_targets: Map[Int, String]
+  field_targets: Map[Int, FieldId]
+  expr_types: Map[Int, Type]
   static_names: Set[String]
   static_types: Map[String, Type]
   access_effects: Map[Int, AccessEffect]
@@ -989,7 +998,9 @@ def builder_new() -> MirBuilder
     type_defs: Vec::new(),
     impl_type_map: Map::new(),
     fn_ret_types: Map::new(),
-    fn_param_conventions: Map::new(),
+    deinit_targets: Map::new(),
+    field_targets: Map::new(),
+    expr_types: Map::new(),
     static_names: Set::new(),
     static_types: Map::new(),
     access_effects: Map::new(),
@@ -1138,18 +1149,6 @@ def builder_local_is_resource(b: &MirBuilder, local_id: &LocalId) -> Bool
   end
 end
 
-def builder_type_name_from_id(b: &MirBuilder, tid: &TypeId) -> String
-  let entries = b.type_name_to_id.entries()
-  mut i = 0
-  while i < entries.len() do
-    if entries[i].1 == tid.id then
-      return entries[i].0.clone()
-    end
-    i = i + 1
-  end
-  ""
-end
-
 def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
   match builder_local_typed_ty(b, local_id)
   when Option::Some(ty) then
@@ -1158,19 +1157,11 @@ def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
       match b.resource_kinds.get(tid.id)
       when Option::Some(k) then
         if k == TypeKind::Resource || k == TypeKind::Capability then
-          let builder_ty = lookup_local_type(b, local_id)
-          match builder_ty
+          match lookup_local_type(b, local_id)
           when Type::Named(btid, _) then
-            let type_name = builder_type_name_from_id(b, &btid)
-            if type_name != "" then
-              let deinit_fn = type_name + "__deinit"
-              if b.fn_ret_types.contains(&deinit_fn) then
-                deinit_fn
-              else
-                ""
-              end
-            else
-              ""
+            match b.deinit_targets.get(btid.id)
+            when Option::Some(n) then n.clone()
+            when Option::None then ""
             end
           when _ then ""
           end
@@ -1218,6 +1209,7 @@ def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Pla
     switch_to_block(b, bk)
     set_terminator(b, MirTerminatorKind::MirDeinit {
       place: places[i],
+      deinit_fn: local_deinit_fn_name(b, &places[i].local),
       target: succ,
       unwind: Option::None
     }, span)
@@ -1227,6 +1219,7 @@ def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Pla
   switch_to_block(b, block_id)
   set_terminator(b, MirTerminatorKind::MirDeinit {
     place: places[places.len() - 1],
+    deinit_fn: local_deinit_fn_name(b, &places[places.len() - 1].local),
     target: succ,
     unwind: Option::None
   }, span)
@@ -1676,6 +1669,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.access_effects = typed.access_effects.clone()
   b.resource_kinds = typed.type_kinds.clone()
   b.typed_local_bindings = typed.local_bindings.clone()
+  b.field_targets = typed.field_targets.clone()
+  b.expr_types = typed.expr_types.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -1740,7 +1735,6 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       when Option::None then Type::Unit
       end
       b.fn_ret_types.insert(f.name.clone(), ret_type)
-      b.fn_param_conventions.insert(f.name.clone(), param_conventions_of(&f.params))
     when ItemKind::ItemImpl(impl_decl) then
       let raw_impl_type = match impl_decl.for_type.kind
       when TypeExprKind::Named(name, _) then name.clone()
@@ -1762,7 +1756,12 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           method.name.clone()
         end
         b.fn_ret_types.insert(mangled_name, ret_type)
-        b.fn_param_conventions.insert(mangled_name, param_conventions_of(&method.params))
+        if method.name == "deinit" then
+          match b.type_name_to_id.get(impl_type_name.clone())
+          when Option::Some(tid) then b.deinit_targets.insert(tid, mangled_name.clone())
+          when Option::None then ()
+          end
+        end
       end
     when ItemKind::ItemStruct(s) then
       for method in s.methods do
@@ -1772,7 +1771,12 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
         end
         let mangled_name = s.name.clone() + "__" + method.name.clone()
         b.fn_ret_types.insert(mangled_name, ret_type)
-        b.fn_param_conventions.insert(mangled_name, param_conventions_of(&method.params))
+        if method.name == "deinit" then
+          match b.type_name_to_id.get(s.name.clone())
+          when Option::Some(tid) then b.deinit_targets.insert(tid, mangled_name.clone())
+          when Option::None then ()
+          end
+        end
       end
     when ItemKind::ItemExternBlock(ext) then
       for ext_item in ext.items do
@@ -1783,7 +1787,6 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           when Option::None then Type::Unit
           end
           b.fn_ret_types.insert(ef.name.clone(), ret_type)
-          b.fn_param_conventions.insert(ef.name.clone(), param_conventions_of(&ef.params))
         when _ then ()
         end
       end
@@ -2853,28 +2856,11 @@ def mir_lookup_fn_ret_type(b: &MirBuilder, fn_name: String) -> Type
   end
 end
 
-def param_conventions_of(params: &Vec[Param]) -> Vec[AccessConvention]
-  var conventions = Vec::new()
-  var param_idx = 0
-  while param_idx < params.len() do
-    let param = params[param_idx]
-    conventions.push(param.convention)
-    param_idx = param_idx + 1
-  end
-  conventions
-end
-
-def fn_param_types_of(b: &MirBuilder, fn_name: String, param_types: &Vec[Type]) -> Vec[ParamType]
-  var conventions = Vec::new()
-  match b.fn_param_conventions.get(&fn_name)
-  when Option::Some(convs) then conventions = convs.clone()
-  when Option::None then ()
-  end
+def fn_param_types_of(param_types: &Vec[Type]) -> Vec[ParamType]
   var result = Vec::new()
   var param_idx = 0
   while param_idx < param_types.len() do
-    let conv = if param_idx < conventions.len() then conventions[param_idx] else AccessConvention::Let end
-    result.push(ParamType { ty: param_types[param_idx].clone(), convention: conv })
+    result.push(ParamType { ty: param_types[param_idx].clone(), convention: AccessConvention::Let })
     param_idx = param_idx + 1
   end
   result
@@ -2889,47 +2875,32 @@ def convention_access_effect(convention: AccessConvention) -> AccessEffect
   end
 end
 
-def mir_call_arg_effects(b: &MirBuilder, callee_name: String, arg_count: Int) -> Vec[AccessEffect]
-  var effects = Vec::new()
-  match b.fn_param_conventions.get(&callee_name)
-  when Option::Some(conventions) then
-    var arg_idx = 0
-    while arg_idx < arg_count do
-      if arg_idx < conventions.len() then
-        effects.push(convention_access_effect(conventions[arg_idx]))
-      else
-        effects.push(AccessEffect::Read)
-      end
-      arg_idx = arg_idx + 1
-    end
-  when Option::None then
-    var arg_idx = 0
-    while arg_idx < arg_count do
-      effects.push(AccessEffect::Read)
-      arg_idx = arg_idx + 1
-    end
-  end
-  effects
-end
-
-def call_arg_effect(b: &MirBuilder, callee_name: String, arg_idx: Int, arg_expr: &Expr) -> AccessEffect
+def call_arg_effect(b: &MirBuilder, callee: Option[&Expr], arg_idx: Int, arg_expr: &Expr) -> AccessEffect
   match b.access_effects.get(arg_expr.node_id)
   when Option::Some(e) then e
   when Option::None then
-    match b.fn_param_conventions.get(&callee_name)
-    when Option::Some(conventions) then
-      if arg_idx < conventions.len() then
-        convention_access_effect(conventions[arg_idx])
-      else
-        AccessEffect::Read
+    match callee
+    when Option::Some(c) then
+      match b.expr_types.get(c.node_id)
+      when Option::Some(t) then
+        match t
+        when Type::Function(params, _) then
+          if arg_idx < params.len() then
+            convention_access_effect(params[arg_idx].convention)
+          else
+            AccessEffect::Read
+          end
+        when _ then AccessEffect::Read
+        end
+      when Option::None then AccessEffect::Read
       end
     when Option::None then AccessEffect::Read
     end
   end
 end
 
-def lower_call_arg(b: &mut MirBuilder, callee_name: String, arg_idx: Int, arg_expr: &Expr, span: Span) -> MirCallArg
-  let effect = call_arg_effect(b, callee_name, arg_idx, arg_expr)
+def lower_call_arg(b: &mut MirBuilder, callee: Option[&Expr], arg_idx: Int, arg_expr: &Expr, span: Span) -> MirCallArg
+  let effect = call_arg_effect(b, callee, arg_idx, arg_expr)
   let kind_name = expr_kind_name(&arg_expr.kind)
   var value = MirCallValue::Value(operand_unit())
   if kind_name == "ExprAccess" then
@@ -2947,37 +2918,6 @@ def lower_call_arg(b: &mut MirBuilder, callee_name: String, arg_idx: Int, arg_ex
     value = MirCallValue::Value(lower_expr(b, arg_expr, span))
   end
   MirCallArg { effect: effect, value: value }
-end
-
-def resolve_callee_name(b: &MirBuilder, callee_expr: &Expr) -> String
-  let ck = expr_kind_name(&callee_expr.kind)
-  if ck == "ExprIdent" then
-    match callee_expr.kind
-    when ExprKind::ExprIdent(name) then
-      match lookup_current_local_id_by_name(b, name)
-      when Option::Some(_) then ""
-      when Option::None then name.clone()
-      end
-    when _ then ""
-    end
-  elsif ck == "ExprFieldAccess" then
-    match callee_expr.kind
-    when ExprKind::ExprFieldAccess(recv, field) then qualify_field_callee_name(&recv, field.clone())
-    when _ then ""
-    end
-  elsif ck == "ExprEnumVariant" then
-    match callee_expr.kind
-    when ExprKind::ExprEnumVariant(path, _) then resolve_static_path_callee_name(b, &path)
-    when _ then ""
-    end
-  elsif ck == "ExprPath" then
-    match callee_expr.kind
-    when ExprKind::ExprPath(path) then resolve_static_path_callee_name(b, &path)
-    when _ then ""
-    end
-  else
-    ""
-  end
 end
 
 def mir_call_result_temp_type(ret_type: Type) -> Type
@@ -3295,6 +3235,32 @@ def mir_infer_field_access_type(b: &MirBuilder, ty: &Type, field_name: &String) 
   end
 end
 
+def mir_infer_field_type_at_index(b: &MirBuilder, ty: &Type, index: Int) -> Type
+  match ty
+  when Type::RefInternal(inner, _) then mir_infer_field_type_at_index(b, inner, index)
+  when Type::Ptr(inner) then mir_infer_field_type_at_index(b, inner, index)
+  when Type::PtrMut(inner) then mir_infer_field_type_at_index(b, inner, index)
+  when Type::Box(inner) then mir_infer_field_type_at_index(b, inner, index)
+  when Type::Rc(inner) then mir_infer_field_type_at_index(b, inner, index)
+  when Type::Tuple(elems) then
+    if index >= 0 && index < elems.len() then elems[index].clone() else Type::Unit end
+  when Type::Named(tid, _) then
+    for td in b.type_defs do
+      if td.id.id == tid.id then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          if index >= 0 && index < fields.len() then
+            return fields[index].ty.clone()
+          end
+        when _ then ()
+        end
+      end
+    end
+    Type::Unit
+  when _ then Type::Unit
+  end
+end
+
 def mir_infer_expr_type(b: &MirBuilder, expr: &Expr) -> Type
   # Use string-based dispatch via expr_kind_name() to avoid the Stage0 Swift
   # compiler bug with value matches on large (41-variant) enums like ExprKind,
@@ -3420,7 +3386,10 @@ def mir_infer_expr_type(b: &MirBuilder, expr: &Expr) -> Type
     match expr.kind
     when ExprKind::ExprFieldAccess(recv, field_name) then
       let recv_ty = mir_infer_expr_type(b, &recv)
-      return mir_infer_field_access_type(b, &recv_ty, &field_name)
+      match b.field_targets.get(expr.node_id)
+      when Option::Some(fid) then return mir_infer_field_type_at_index(b, &recv_ty, fid.index)
+      when Option::None then return mir_infer_field_access_type(b, &recv_ty, &field_name)
+      end
     when _ then ()
     end
 
@@ -4171,12 +4140,11 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
   let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
   let dest_place = place_local(ret_tmp)
   let success_blk = create_block(b)
-  let callee_fn_name = resolve_callee_name(b, callee_expr)
 
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < arg_exprs.len() do
-    mir_args.push(lower_call_arg(b, callee_fn_name, arg_idx, &arg_exprs[arg_idx], span))
+    mir_args.push(lower_call_arg(b, Option::Some(callee_expr), arg_idx, &arg_exprs[arg_idx], span))
     arg_idx = arg_idx + 1
   end
 
@@ -4232,7 +4200,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < args.len() do
-    mir_args.push(lower_call_arg(b, fn_name.clone(), arg_idx, &args[arg_idx], span))
+    mir_args.push(lower_call_arg(b, Option::None, arg_idx, &args[arg_idx], span))
     arg_idx = arg_idx + 1
   end
   let ret_type = infer_static_path_result_type(b, path)
@@ -4613,12 +4581,12 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       let callee_op = mir_fn_operand(b, resolved_method.clone())
 
       # Lower arguments: receiver first, then explicit args
-      let recv_effect = call_arg_effect(b, resolved_method.clone(), 0, &receiver)
+      let recv_effect = call_arg_effect(b, Option::None, 0, &receiver)
       var mir_args = Vec::new()
       mir_args.push(MirCallArg { effect: recv_effect, value: MirCallValue::Value(recv_op) })
       var arg_idx = 0
       while arg_idx < arg_exprs.len() do
-        mir_args.push(lower_call_arg(b, resolved_method.clone(), arg_idx + 1, &arg_exprs[arg_idx], span))
+        mir_args.push(lower_call_arg(b, Option::None, arg_idx + 1, &arg_exprs[arg_idx], span))
         arg_idx = arg_idx + 1
       end
 
@@ -4661,16 +4629,13 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       when Type::RefInternal(_, _) then true
       when _ then false
       end
-      # Resolve field index — try typed resolution first, then built-in fallback
-      let field_idx = match resolve_field_index_for_place(b, &base_place, field_name)
-      when Option::Some(idx) then idx
-      when Option::None then 0
-      end
+      # Resolve field projection — typed field index first, name fallback
+      let field_proj = typed_field_projection(b, expr.node_id, &field_name, &base_place)
       var new_projections = base_place.projections.clone()
       if needs_deref && base_place.projections.is_empty() then
         new_projections.push(Projection::ProjDeref)
       end
-      new_projections.push(Projection::ProjField(field_name, field_idx))
+      new_projections.push(field_proj)
       let projected = Place {
         local: base_place.local,
         projections: new_projections
@@ -4784,7 +4749,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       let fn_op = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirFnItem(closure_name.clone()),
-          ty: Type::Function(fn_param_types_of(b, closure_name.clone(), &param_types), Box::new(ret_type.clone()))
+          ty: Type::Function(fn_param_types_of(&param_types), Box::new(ret_type.clone()))
         })
       }
       
@@ -5067,15 +5032,12 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
     when Type::RefInternal(_, _) then true
     when _ then false
     end
-    let field_idx = match resolve_field_index_for_place(b, &base, field)
-    when Option::Some(idx) then idx
-    when Option::None then 0
-    end
+    let field_proj = typed_field_projection(b, expr.node_id, field, &base)
     var new_projections = base.projections.clone()
     if needs_deref && base.projections.is_empty() then
       new_projections.push(Projection::ProjDeref)
     end
-    new_projections.push(Projection::ProjField(field.clone(), field_idx))
+    new_projections.push(field_proj)
     return Place { local: base.local, projections: new_projections }
     when _ then ()
     end
@@ -5357,6 +5319,50 @@ def resolve_type_through_projections(b: &MirBuilder, start_type: Type, projectio
           end
         end
       end
+    when Projection::ProjFieldIndex(field_idx) then
+      if has_downcast then
+        let variant_field_ty = resolve_enum_variant_field_type(b, &current, &downcast_variant, field_idx)
+        if variant_field_ty != Type::Unit then
+          current = variant_field_ty
+          has_downcast = false
+        else
+          return current
+        end
+      else
+        match current
+        when Type::Tuple(elems) then
+          if field_idx >= 0 && field_idx < elems.len() then
+            current = elems[field_idx].clone()
+          else
+            return current
+          end
+        when _ then
+      # Look up the struct definition for the current type at the index
+          var resolved = false
+          match unwrap_to_named_tid(&current)
+          when Option::Some(tid) then
+            var td_idx = 0
+            while td_idx < b.type_defs.len() do
+              let td = b.type_defs[td_idx]
+              if td.id.id == tid.id then
+                match td.kind
+                when MirTypeDefKind::Struct(ref fields) then
+                  if field_idx >= 0 && field_idx < fields.len() then
+                    current = fields[field_idx].ty.clone()
+                    resolved = true
+                  end
+                when _ then ()
+                end
+              end
+              td_idx = td_idx + 1
+            end
+          when Option::None then ()
+          end
+          if !resolved then
+            return current
+          end
+        end
+      end
     when Projection::ProjIndex(_) then
       current = mir_project_index_type(b, &current)
       has_downcast = false
@@ -5529,6 +5535,22 @@ def resolve_field_index_for_place(b: &MirBuilder, place: &Place, name: &String) 
   end
   # Fall back to base local type resolution
   resolve_field_index_typed(b, &place.local, name)
+end
+
+# Emit the field projection for a field access: the typed field index
+# (from typed.field_targets) is authoritative when the checker recorded
+# the access node; otherwise fall back to the named projection resolved
+# against the builder's type definitions.
+def typed_field_projection(b: &MirBuilder, node_id: Int, fallback_name: &String, place: &Place) -> Projection
+  match b.field_targets.get(node_id)
+  when Option::Some(fid) then Projection::ProjFieldIndex(fid.index)
+  when Option::None then
+    let fallback_idx = match resolve_field_index_for_place(b, place, fallback_name)
+    when Option::Some(idx) then idx
+    when Option::None then 0
+    end
+    Projection::ProjField(fallback_name.clone(), fallback_idx)
+  end
 end
 
 def resolve_field_index_typed(b: &MirBuilder, local_id: &LocalId, name: &String) -> Option[Int]
@@ -6699,7 +6721,7 @@ def for_expr_uses_name(b: &MirBuilder, name: String, expr: &Expr) -> Bool
         if for_expr_uses_name(b, name, &callee) then
           true
         else
-          for_call_args_uses_name(b, name, &callee, &args)
+          for_call_args_uses_name(b, name, &args)
         end
       end
     when _ then false
@@ -6824,17 +6846,17 @@ def for_expr_uses_name(b: &MirBuilder, name: String, expr: &Expr) -> Bool
   end
 end
 
-def for_call_args_uses_name(b: &MirBuilder, name: String, callee: &Expr, args: &Vec[Expr]) -> Bool
+def for_call_args_uses_name(b: &MirBuilder, name: String, args: &Vec[Expr]) -> Bool
   var found = false
   var a_idx = 0
   while a_idx < args.len() do
-    if for_call_arg_uses_name(b, name, &args[a_idx], callee, a_idx) then found = true end
+    if for_call_arg_uses_name(b, name, &args[a_idx]) then found = true end
     a_idx = a_idx + 1
   end
   found
 end
 
-def for_call_arg_uses_name(b: &MirBuilder, name: String, arg: &Expr, callee: &Expr, arg_idx: Int) -> Bool
+def for_call_arg_uses_name(b: &MirBuilder, name: String, arg: &Expr) -> Bool
   let kind_name = expr_kind_name(&arg.kind)
   if kind_name == "ExprAccess" then
     match arg.kind
@@ -6843,7 +6865,7 @@ def for_call_arg_uses_name(b: &MirBuilder, name: String, arg: &Expr, callee: &Ex
         if for_expr_is_bare_name(name, &inner) then
           true
         else
-          !for_ref_param_is_let(b, callee, arg_idx)
+          !for_ref_param_is_let(b, &inner)
         end
       else
         for_expr_uses_name(b, name, &inner)
@@ -6855,39 +6877,10 @@ def for_call_arg_uses_name(b: &MirBuilder, name: String, arg: &Expr, callee: &Ex
   end
 end
 
-def for_ref_param_is_let(b: &MirBuilder, callee: &Expr, arg_idx: Int) -> Bool
-  match for_callee_name(b, callee)
-  when Option::Some(callee_name) then
-    match b.fn_param_conventions.get(&callee_name)
-    when Option::Some(conventions) then
-      if arg_idx < conventions.len() then
-        match conventions[arg_idx]
-        when AccessConvention::Let then true
-        when _ then false
-        end
-      else
-        false
-      end
-    when Option::None then false
-    end
-  when Option::None then false
-  end
-end
-
-def for_callee_name(b: &MirBuilder, callee: &Expr) -> Option[String]
-  let kind_name = expr_kind_name(&callee.kind)
-  if kind_name == "ExprIdent" then
-    match callee.kind
-    when ExprKind::ExprIdent(n) then Option::Some(n.clone())
-    when _ then Option::None
-    end
-  elsif kind_name == "ExprPath" then
-    match callee.kind
-    when ExprKind::ExprPath(path) then Option::Some(resolve_static_path_callee_name(b, &path))
-    when _ then Option::None
-    end
-  else
-    Option::None
+def for_ref_param_is_let(b: &MirBuilder, arg_expr: &Expr) -> Bool
+  match b.access_effects.get(arg_expr.node_id)
+  when Option::Some(AccessEffect::Read) then true
+  when _ then false
   end
 end
 
@@ -7317,8 +7310,7 @@ def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &B
   let len_ret = add_temp(b, Type::Int, span)
   let len_success = create_block(b)
   var len_args = Vec::new()
-  let len_effects = mir_call_arg_effects(b, len_callee.clone(), 1)
-  len_args.push(MirCallArg { effect: len_effects[0].clone(), value: MirCallValue::Value(recv_op) })
+  len_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(recv_op) })
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: place_local(len_ret),
     func: mir_fn_operand(b, len_callee.clone()),
@@ -8395,8 +8387,8 @@ def format_mir_terminator(term: &MirTerminator) -> String
     end
     out = out + "]"
     out
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
-    var out = "deinit(" + format_place(&place) + ") -> [bb" + target.id.to_string()
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    var out = "deinit(" + format_place(&place) + " via " + deinit_fn.clone() + ") -> [bb" + target.id.to_string()
     match unwind
     when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
     when Option::None then ()
@@ -8439,6 +8431,7 @@ def format_place(place: &Place) -> String
     match proj
     when Projection::ProjDeref then out = "(*" + out + ")"
     when Projection::ProjField(name, idx) then out = out + "." + name.clone()
+    when Projection::ProjFieldIndex(idx) then out = out + ".[" + idx.to_string() + "]"
     when Projection::ProjIndex(id) then out = out + "[_" + id.id.to_string() + "]"
     when Projection::ProjConstantIndex(i) then out = out + "[" + i.to_string() + "]"
     when Projection::ProjDowncast(name, _) then out = "(" + out + " as " + name.clone() + ")"
@@ -9208,7 +9201,7 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
       },
       span: term.span.clone()
     }
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     let new_target = block_map.get(target.id).unwrap_or(target.id)
     let new_unwind = match unwind
     when Option::Some(block_id) then
@@ -9219,6 +9212,7 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
     MirTerminator {
       kind: MirTerminatorKind::MirDeinit {
         place: remap_place(&place, local_map),
+        deinit_fn: deinit_fn.clone(),
         target: BlockId { id: new_target },
         unwind: new_unwind
       },
@@ -10656,7 +10650,7 @@ def count_terminator_uses(term: &MirTerminator, counts: &mut Map[Int, Int]) -> U
   when MirTerminatorKind::MirUnreachable then ()
   when MirTerminatorKind::MirDrop { place, target, unwind } then ()
   when MirTerminatorKind::MirAbort then ()
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then ()
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then ()
   end
 end
 
@@ -10731,7 +10725,7 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
     end
     let new_kind = MirTerminatorKind::MirDrop { place: place2, target: target, unwind: unwind }
     term.kind = new_kind
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     var place2 = place
     match map.get(place2.local.id)
     when Option::Some(src) then
@@ -10740,7 +10734,7 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
       end
     when Option::None then ()
     end
-    let new_kind = MirTerminatorKind::MirDeinit { place: place2, target: target, unwind: unwind }
+    let new_kind = MirTerminatorKind::MirDeinit { place: place2, deinit_fn: deinit_fn, target: target, unwind: unwind }
     term.kind = new_kind
   when _ then ()
   end
@@ -10798,7 +10792,7 @@ def terminator_successors(term: &MirTerminator) -> Vec[BlockId]
     when Option::Some(uw) then result.push(uw)
     when Option::None then ()
     end
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     result.push(target)
     match unwind
     when Option::Some(uw) then result.push(uw)
@@ -10839,7 +10833,7 @@ def terminator_successor_ids(term: &MirTerminator) -> Vec[Int]
     when Option::Some(uw) then result.push(uw.id)
     when Option::None then ()
     end
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     result.push(target.id)
     match unwind
     when Option::Some(uw) then result.push(uw.id)
@@ -12534,7 +12528,7 @@ def verify_function(func: &MirFunction, types: &Vec[MirTypeDef], errors: &mut Ve
               if !reachable.contains(&unwind_id) then worklist.push(unwind_id) end
             when Option::None then ()
             end
-          when MirTerminatorKind::MirDeinit { place, target, unwind } then
+          when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
             let succ_id = target.id
             if !reachable.contains(&succ_id) then worklist.push(succ_id) end
             match unwind
@@ -12782,7 +12776,7 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
       end
     when Option::None then ()
     end
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     let local_id = place.local.id
     if !valid_locals.contains(&local_id) then
       errors.push(ctx.clone() + ": deinit of undefined local _" + local_id.to_string())
@@ -13027,6 +13021,7 @@ def verifier_project_type(type_index: &Map[Int, MirTypeDef], cur: &Type, proj: P
     when Option::None then Option::None
     end
   when Projection::ProjField(_, index) then verifier_field_type(type_index, cur, index)
+  when Projection::ProjFieldIndex(index) then verifier_field_type(type_index, cur, index)
   when Projection::ProjDowncast(_, disc) then verifier_downcast_type(type_index, cur, disc)
   when Projection::ProjIndex(_) then verifier_elem_type(cur)
   when Projection::ProjConstantIndex(_) then verifier_elem_type(cur)
@@ -13403,7 +13398,7 @@ def verifier_check_terminator(type_index: &Map[Int, MirTypeDef], func: &MirFunct
       end
     when Option::None then ()
     end
-  when MirTerminatorKind::MirDeinit { place, target, unwind } then
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     if !verifier_block_exists(func, target.id) then
       errors.push(ctx.clone() + ": deinit target references invalid block bb" + target.id.to_string())
