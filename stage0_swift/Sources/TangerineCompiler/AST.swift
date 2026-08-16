@@ -288,17 +288,20 @@ public struct StructDecl {
     public var typeParams: [TypeParam]
     public var whereClause: [WherePredicate]
     public var fields: [FieldDecl]
+    public var methods: [FunctionDecl]
     public var kind: NominalKind
     public var span: Span
 
     public init(name: String, isPublic: Bool = false, typeParams: [TypeParam] = [],
                 whereClause: [WherePredicate] = [], fields: [FieldDecl] = [],
+                methods: [FunctionDecl] = [],
                 kind: NominalKind = .value, span: Span) {
         self.name = name
         self.isPublic = isPublic
         self.typeParams = typeParams
         self.whereClause = whereClause
         self.fields = fields
+        self.methods = methods
         self.kind = kind
         self.span = span
     }

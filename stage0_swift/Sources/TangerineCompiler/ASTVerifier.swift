@@ -36,6 +36,7 @@ public final class ASTVerifier {
                 verifySpan(field.span, context: "field \(field.name)")
                 verifyTypeExpr(field.type)
             }
+            for m in d.methods { verifyFunctionDecl(m) }
         case .enumDef(let d):
             verifySpan(d.span, context: "enum \(d.name)")
             for v in d.variants { verifySpan(v.span, context: "variant \(v.name)") }

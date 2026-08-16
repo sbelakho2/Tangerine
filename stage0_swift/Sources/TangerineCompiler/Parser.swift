@@ -1335,9 +1335,12 @@ public final class Parser {
         let whereClause = parseOptionalWhereClause()
 
         var fields: [FieldDecl] = []
+        var methods: [FunctionDecl] = []
         while !at(.kwEnd) && !atEof() {
             if looksLikeFunctionDeclAfterModifiers(from: cursor) {
-                _ = parseModifiedFunctionItem()
+                if case .function(let fn)? = parseModifiedFunctionItem() {
+                    methods.append(fn)
+                }
                 continue
             }
             let fStart = currentSpan
@@ -1353,7 +1356,7 @@ public final class Parser {
 
         return .structDef(StructDecl(name: name, isPublic: isPublic,
                                      typeParams: typeParams, whereClause: whereClause,
-                                     fields: fields, kind: .resource,
+                                     fields: fields, methods: methods, kind: .resource,
                                      span: start.merged(with: currentSpan)))
     }
 

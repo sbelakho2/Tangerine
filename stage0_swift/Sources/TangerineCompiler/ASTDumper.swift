@@ -77,6 +77,7 @@ public final class ASTDumper {
                 emit("Field \(f.name)")
                 push(); dumpTypeExpr(f.type); pop()
             }
+            for m in d.methods { dumpFunctionDecl(m) }
             pop()
         case .enumDef(let d):
             emit("Enum \(d.name)\(d.isPublic ? " [pub]" : "")\(typeParamsStr(d.typeParams))")

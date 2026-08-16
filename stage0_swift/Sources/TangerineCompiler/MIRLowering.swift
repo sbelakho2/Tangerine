@@ -220,6 +220,14 @@ public final class MIRLowering {
                     functionParamConventions["\(d.targetType)::\(method.sig.name)"] = method.sig.params.map { $0.convention }
                 }
                 currentSelfType = previousSelfType
+            case .structDef(let d):
+                if d.kind == .resource {
+                    let typeName = qualifiedTypeName(d.name)
+                    for method in d.methods {
+                        functionReturnTypes["\(typeName)::\(method.sig.name)"] = method.sig.returnType.map(lowerTypeExpr) ?? .unit
+                        functionParamConventions["\(typeName)::\(method.sig.name)"] = method.sig.params.map { $0.convention }
+                    }
+                }
             default:
                 break
             }
@@ -398,6 +406,12 @@ public final class MIRLowering {
             let td = MirTypeDef(name: qualifiedTypeName(d.name), kind: .structDef(fields: fields))
             typeDefs.append(td)
             typeDefByName[td.name] = td
+            if d.kind == .resource {
+                let typeName = qualifiedTypeName(d.name)
+                for method in d.methods {
+                    lowerImplMethod(method, targetType: typeName)
+                }
+            }
         case .enumDef(let d):
             let beforeCount = typeDefs.count
             appendEnumTypeDefs(d, to: &typeDefs)
