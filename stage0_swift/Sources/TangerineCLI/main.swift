@@ -1177,13 +1177,14 @@ struct TangerineCLI {
         fflush(stdout)
 
         // Step 4: Verify MIR has a main function
-        let hasDriverMain = mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" })
-        print("Entry point 'driver::driver_main': \(hasDriverMain ? "found" : "NOT FOUND")")
+        let entryName = resolveEntryFunction(mergedMIR)
+        let hasDriverMain = entryName != ""
+        print("Entry point '\(entryName)': \(hasDriverMain ? "found" : "NOT FOUND")")
         fflush(stdout)
 
         if dryRun {
             print("\n--- Dry Run Complete ---")
-            print("Would interpret merged MIR (\(mergedMIR.functions.count) functions) with entry 'driver::driver_main'")
+            print("Would interpret merged MIR (\(mergedMIR.functions.count) functions) with entry '\(entryName)'")
 
             let drySuccess = hasDriverMain
             let ts = iso8601Now()
@@ -1205,7 +1206,7 @@ struct TangerineCLI {
         }
 
         guard hasDriverMain else {
-            fputs("error: no 'driver::driver_main' function found in merged MIR\n", stderr)
+            fputs("error: no compiler entry point found in merged MIR\n", stderr)
             exit(1)
         }
 
@@ -1270,4 +1271,14 @@ struct TangerineCLI {
         fmt.timeZone = TimeZone(identifier: "UTC")
         return fmt.string(from: Date())
     }
+}
+
+
+func resolveEntryFunction(_ mir: MirProgram) -> String {
+    for candidate in ["driver::driver_main", "bootstrap_main::main", "main"] {
+        if mir.functions.contains(where: { $0.name == candidate }) {
+            return candidate
+        }
+    }
+    return ""
 }
