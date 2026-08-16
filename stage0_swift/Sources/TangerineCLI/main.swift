@@ -900,7 +900,7 @@ struct TangerineCLI {
         switch rvalue {
         case .use(let operand):
             return .use(rewrite(operand, moduleName: moduleName, catalog: catalog))
-        case .ref, .discriminant, .len:
+        case .mirRef, .mirRefMut, .discriminant, .len:
             return rvalue
         case .aggregate(let kind, let operands):
             return .aggregate(kind, operands.map { rewrite($0, moduleName: moduleName, catalog: catalog) })
@@ -915,10 +915,10 @@ struct TangerineCLI {
 
     private static func rewrite(_ operand: MirOperand, moduleName: String, catalog: FunctionCatalog) -> MirOperand {
         switch operand {
-        case .copy, .move, .read, .consume:
+        case .mirCopy, .mirMovePlace, .mirRead, .mirConsume:
             return operand
-        case .constant(let constant):
-            return .constant(rewrite(constant, moduleName: moduleName, catalog: catalog))
+        case .mirConstant(let constant):
+            return .mirConstant(rewrite(constant, moduleName: moduleName, catalog: catalog))
         }
     }
 

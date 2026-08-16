@@ -129,7 +129,7 @@ public struct MirPlace {
 }
 
 public enum MirProjection {
-    case deref
+    case projDeref
     case field(Int)
     case namedField(String)
     case index(LocalId)
@@ -140,11 +140,11 @@ public enum MirProjection {
 // MARK: - Operand
 
 public enum MirOperand {
-    case copy(MirPlace)
-    case move(MirPlace)
-    case read(MirPlace)
-    case consume(MirPlace)
-    case constant(MirConstant)
+    case mirCopy(MirPlace)
+    case mirMovePlace(MirPlace)
+    case mirRead(MirPlace)
+    case mirConsume(MirPlace)
+    case mirConstant(MirConstant)
 }
 
 // MARK: - Call Argument
@@ -180,7 +180,8 @@ public enum MirConstant {
 
 public enum MirRvalue {
     case use(MirOperand)
-    case ref(BorrowKind, MirPlace)
+    case mirRef(MirPlace)
+    case mirRefMut(MirPlace)
     case aggregate(AggregateKind, [MirOperand])
     case binaryOp(MirBinOp, MirOperand, MirOperand)
     case unaryOp(MirUnOp, MirOperand)
@@ -188,8 +189,6 @@ public enum MirRvalue {
     case len(MirPlace)
     case cast(MirOperand, MirType)
 }
-
-public enum BorrowKind { case shared, mutable }
 
 public enum AggregateKind {
     case tuple
@@ -220,7 +219,7 @@ public indirect enum MirType: Equatable {
     case char
     case string
     case named(String)
-    case ref(MirType, mutable: Bool)
+    case refInternal(MirType, Bool)
     case rawPtr(MirType)
     case array(MirType, Int?)
     case slice(MirType)

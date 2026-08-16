@@ -9,22 +9,16 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
+use std::alloc::{Layout}
 use std::fs::{write_file_bytes}
 use tg_compiler::types::{Type, TypeId}
 use tg_compiler::layout_engine::{
-  LayoutEngine, LayoutRecord, LayoutError, LayoutFailureClass,
-  TargetDescriptor, aarch64_target, x86_64_target,
+  LayoutEngine, TargetDescriptor,
+  aarch64_target, x86_64_target,
   layout_engine_new, layout_engine_register_types, compute_all_layouts,
-  size_of, align_of, stride_of,
-  field_offset, field_offset_by_name, field_size,
-  discriminant_offset, discriminant_size, payload_offset, variant_discriminant,
-  container_header_size, container_field_offset,
-  validate_layout, dump_layout_table, layout_align_up,
-  LayoutAssertion,
-  # New imports for direct layout engine queries
-  primitive_size, primitive_align,
-  # Single-ABI-authority queries
-  layout_of, enum_variant_field_offsets, enum_variant_field_sizes,
+  field_offset, field_size,
+  discriminant_offset, discriminant_size, payload_offset,
+  enum_variant_field_offsets, enum_variant_field_sizes,
   layout_of_concrete
 }
 use tg_compiler::mir::{
@@ -116,6 +110,7 @@ struct CodegenCtx
   type_field_offsets: Map[Int, Vec[Int]]  # TypeId.id -> per-field byte offsets
   type_field_sizes: Map[Int, Vec[Int]]    # TypeId.id -> per-field byte sizes
   enum_payload_offsets: Map[Int, Int]     # TypeId.id -> enum payload base offset
+  layout_engine: LayoutEngine             # Single ABI authority for all codegen layout queries
   type_defs: Vec[MirTypeDef]              # All type definitions for lookup
   type_def_index: Map[Int, Int]           # TypeId.id -> index in type_defs (O(1) lookup)
   extern_fns: Set[String]                 # Names of extern (FFI) functions
@@ -142,15 +137,6 @@ end
 # Type layout
 # ———————————————————————————————————————————————————————————————
 
-# LAYOUT ENGINE INTEGRATION: Use centralized layout queries (Req 2)
-# All type sizes/offsets come from layout_engine.tg - NO hardcoded values.
-# This ensures single source of truth for all memory layout.
-#
-# CRITICAL: codegen.tg MUST use layout_engine API exclusively.
-# The duplicate type_size/type_align functions below are ONLY for fallback
-# when layout_engine is not available (e.g., during early bootstrap).
-# Normal compilation MUST use layout_engine.size_of/align_of.
-
 # STRING ABI (FROZEN)
 # The by-value String ABI is FROZEN as an 8-byte raw pointer to a
 # null-terminated UTF-8 byte buffer. There is NO inline {ptr,len,cap}
@@ -159,88 +145,17 @@ end
 # {ptr,len,cap} shape is ONLY the internal char-Vec buffer produced by
 # str.chars(), never the String value ABI. Changing this is an ABI break.
 
-# Get type size - delegates to layout_engine when available
-def type_size(ty: &Type, layout: &Map[Int, Int]) -> Int
-  # String and Slice values use pointer ABI in the current runtime.
-  # container_header_size describes heap object headers, not by-value layout.
-  match ty
-  when Type::String  then return 8
-  when Type::Slice(_) then return 8
-  when Type::Function(_, _) then return 16  # F4: fn ptr + env
-  when _ then ()
-  end
-  
-  # For Named types: VALUE size is always 8 (heap-handle pointer or inline
-  # discriminant tag). The full box size lives in `layout` for malloc use
-  # (codegen_aggregate calls _tg_bump_alloc with that), but the by-value ABI
-  # is uniformly 8 bytes — see codegen_aggregate (heap-allocates) and
-  # normalize_enum_value_to_tag (handles small-tag vs heap-pointer).
-  match ty
-  when Type::Named(_, _) then return 8
-  when _ then ()
-  end
-  
-  # Fallback to primitive sizes (F1 frozen) - must match layout_engine.primitive_size
-  match ty
-  when Type::Unit    then 0
-  when Type::Bool    then 1
-  when Type::Char    then 4
-  when Type::Int     then 8
-  when Type::UInt    then 8
-  when Type::Float   then 8
-  when Type::F32     then 4
-  when Type::F64     then 8
-  when Type::I8      then 1
-  when Type::U8      then 1
-  when Type::I16     then 2
-  when Type::U16     then 2
-  when Type::I32     then 4
-  when Type::U32     then 4
-  when Type::I64     then 8
-  when Type::U64     then 8
-  when Type::I128    then 16
-  when Type::U128    then 16
-  when Type::ISize   then 8
-  when Type::USize   then 8
-  when Type::Never   then 0
-  when Type::RefInternal(_, _) then 8
-  when Type::Ptr(_)        then 8
-  when Type::PtrMut(_)     then 8
-  when Type::Tuple(fields) then
-    var total = 0
-    var max_align = 1
-    for f in fields do
-      let sz = type_size(f, layout)
-      let align = type_align(f)
-      if align > max_align then max_align = align end
-      let rem = total % align
-      if rem != 0 then total = total + (align - rem) end
-      total = total + sz
-    end
-    let rem = total % max_align
-    if rem != 0 then total = total + (max_align - rem) end
-    total
-  when Type::Array(_, _) then 8  # Heap handle (matches layout engine)
-  when Type::Named(_, _) then 8
-  when Type::Var(_) then panic("type_size: unresolved Type::Var reached codegen")
-  when Type::Error then panic("type_size: Type::Error reached codegen")
-  when _ then panic("type_size: unknown type reached codegen")
+def codegen_layout_target(arch: Arch) -> TargetDescriptor
+  match arch
+  when Arch::X86_64 then x86_64_target()
+  when Arch::AArch64 then aarch64_target()
   end
 end
 
-def type_align(ty: &Type) -> Int
-  match ty
-  when Type::Unit    then 1
-  when Type::Bool    then 1
-  when Type::Char    then 4
-  when Type::I8      then 1
-  when Type::U8      then 1
-  when Type::I16     then 2
-  when Type::U16     then 2
-  when Type::I32     then 4
-  when Type::U32     then 4
-  when Type::F32     then 4
-  when _             then 8
+def layout_of_strict(engine: &mut LayoutEngine, ty: &Type) -> Layout
+  match layout_of_concrete(engine, ty)
+  when Result::Ok(l) then l
+  when Result::Err(e) then panic("ICE: unresolved type reached codegen: " + e.type_name)
   end
 end
 
@@ -252,26 +167,19 @@ end
 # This ensures single source of truth for all type sizes.
 # Also computes field-level offsets and sizes in one pass to avoid
 # creating a second LayoutEngine.
-def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]], Map[Int, Int])
+def build_all_layouts(engine: &mut LayoutEngine, types: &Vec[MirTypeDef]) -> (Map[Int, Int], Map[Int, Vec[Int]], Map[Int, Vec[Int]], Map[Int, Int])
   var layout: Map[Int, Int] = Map::new()
   var offsets_map: Map[Int, Vec[Int]] = Map::new()
   var sizes_map: Map[Int, Vec[Int]] = Map::new()
   var payload_map: Map[Int, Int] = Map::new()
   
-  # Create a layout engine for the target — ONE engine for everything
-  let layout_target = match target.arch
-  when Arch::X86_64 then x86_64_target()
-  when Arch::AArch64 then aarch64_target()
-  end
-  
-  var engine = layout_engine_new(layout_target)
-  layout_engine_register_types(&mut engine, types)
-  compute_all_layouts(&mut engine)
+  layout_engine_register_types(engine, types)
+  compute_all_layouts(engine)
   
   # Extract sizes from the layout engine into the simple map
   for td in types do
     let ty = Type::Named(td.id.clone(), Vec::new())
-    match layout_of_concrete(&mut engine, &ty)
+    match layout_of_concrete(engine, &ty)
     when Result::Ok(l) then layout.insert(td.id.id, l.size)
     when Result::Err(e) then panic("ICE: unresolved type reached codegen: " + e.type_name)
     end
@@ -285,9 +193,9 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
       var field_sizes = Vec::new()
       var i = 0
       for f in fields do
-        let off = field_offset(&mut engine, td.id.id, i)
+        let off = field_offset(engine, td.id.id, i)
         field_offsets.push(off)
-        let sz = field_size(&mut engine, td.id.id, i)
+        let sz = field_size(engine, td.id.id, i)
         field_sizes.push(sz)
         i = i + 1
       end
@@ -296,18 +204,18 @@ def build_all_layouts(types: &Vec[MirTypeDef], target: &AsmTarget) -> (Map[Int, 
     when MirTypeDefKind::Enum(variants) then
       var field_offsets = Vec::new()
       var field_sizes = Vec::new()
-      field_offsets.push(discriminant_offset(&engine, td.id.id))
-      field_sizes.push(discriminant_size(&engine, td.id.id))
-      payload_map.insert(td.id.id, payload_offset(&engine, td.id.id))
+      field_offsets.push(discriminant_offset(engine, td.id.id))
+      field_sizes.push(discriminant_size(engine, td.id.id))
+      payload_map.insert(td.id.id, payload_offset(engine, td.id.id))
       var vi = 0
       for variant in variants do
-        let voffs = enum_variant_field_offsets(&engine, td.id.id, vi)
-        let vsizes = enum_variant_field_sizes(&engine, td.id.id, vi)
+        let voffs = enum_variant_field_offsets(engine, td.id.id, vi)
+        let vsizes = enum_variant_field_sizes(engine, td.id.id, vi)
         var j = 0
         for fty in variant.fields do
           # Offsets/sizes come exclusively from the layout engine; a missing
           # entry is an invariant violation, never a hardcoded 8.
-          let off = if j < voffs.len() then voffs[j] else payload_offset(&engine, td.id.id) end
+          let off = if j < voffs.len() then voffs[j] else payload_offset(engine, td.id.id) end
           let sz = if j < vsizes.len() then vsizes[j] else panic("build_all_layouts: missing field size for enum " + td.id.id.to_string()) end
           field_offsets.push(off)
           field_sizes.push(sz)
@@ -576,7 +484,7 @@ def saved_reg_bytes(saved: &Vec[PhysReg]) -> Int
   count * 8
 end
 
-def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (Map[Int, VarLoc], FrameInfo)
+def allocate_locals(func: &MirFunction, arch: Arch, engine: &mut LayoutEngine) -> (Map[Int, VarLoc], FrameInfo)
   var ra = reg_alloc_new(arch)
   var local_offsets: Map[Int, Int] = Map::new()
   var var_locs: Map[Int, VarLoc] = Map::new()
@@ -589,7 +497,7 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
   # other allocations so the offset is fixed.
   var sret_offset: i32 = 0
   if func.locals.len() > 0 then
-    let ret_sz = type_size(&func.locals[0].ty, layout)
+    let ret_sz = layout_of_strict(engine, &func.locals[0].ty).size
     if ret_sz > 8 then
       spill_off = spill_off - 8
       sret_offset = spill_off
@@ -628,7 +536,7 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
     if param_ids.contains(&local_id) then
       ()  # skip — will be allocated in the params loop
     else
-      let sz = type_size(&local.ty, layout)
+      let sz = layout_of_strict(engine, &local.ty).size
       let alloc_sz = if sz == 0 then 8 else sz end
 
       # Multi-word locals (>8 bytes) cannot fit in a single register; force them
@@ -658,7 +566,7 @@ def allocate_locals(func: &MirFunction, arch: Arch, layout: &Map[Int, Int]) -> (
   var arg_idx = 0
   for param in func.params do
     let param_id = param.id.id
-    let sz = type_size(&param.ty, layout)
+    let sz = layout_of_strict(engine, &param.ty).size
     let alloc_sz_p = if sz == 0 then 8 else sz end
     let force_stack_p = alloc_sz_p > 8
     if address_taken_locals.contains(&param_id) || force_stack_p then
@@ -762,6 +670,7 @@ def codegen_new(target: &AsmTarget) -> CodegenCtx
     type_field_offsets: Map::new(),
     type_field_sizes: Map::new(),
     enum_payload_offsets: Map::new(),
+    layout_engine: layout_engine_new(codegen_layout_target(target.arch)),
     type_defs: Vec::new(),
     type_def_index: Map::new(),
     extern_fns: Set::new(),
@@ -3491,7 +3400,7 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
         end
       when CastKind::IntToInt then
       # Narrowing integer casts need an explicit mask; widening is a register no-op here.
-      let target_bits = type_size(&target_ty, &ctx.type_layout) * 8
+      let target_bits = layout_of_strict(&mut ctx.layout_engine, &target_ty).size * 8
       if target_bits < 64 then
         let mask = (1 << target_bits) - 1
         emit_and_ri(ctx, dst, mask as i32)
@@ -4521,7 +4430,7 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
           emit_raw_u32(ctx, 0x9E780000 | (0 << 5) | a64_code(gpr))
         end
       when CastKind::IntToInt then
-        let target_bits = type_size(&target_ty, &ctx.type_layout) * 8
+        let target_bits = layout_of_strict(&mut ctx.layout_engine, target_ty).size * 8
         if target_bits < 64 then
           let mask = (1 << target_bits) - 1
           emit_and_ri(ctx, rr, mask as i32)
@@ -4710,7 +4619,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   # projections, dest local has a stable stack home. When eligible we will
   # pass &dest in x8 to the callee (which uses sret) and skip storing rr.
   let dest_ty = place_type(ctx, fctx, dest)
-  let dest_sz = type_size(&dest_ty, &ctx.type_layout)
+  let dest_sz = layout_of_strict(&mut ctx.layout_engine, &dest_ty).size
   var sret_dest_off: i32 = 0
   var sret_dest_ok = false
   if dest_sz > 8 && dest.projections.is_empty() then
@@ -5937,7 +5846,7 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
       # 8-byte chunks while remaining >= 8, then 4/2/1-byte tails, so a 12-byte
       # aggregate copies exactly 12 bytes (the old loop copied 16).
       var copied = 0
-      let ret_sz = type_size(&ret_local.ty, &ctx.type_layout)
+      let ret_sz = layout_of_strict(&mut ctx.layout_engine, &ret_local.ty).size
       while ret_sz - copied >= 8 do
         emit_load_mem(ctx, PhysReg::A64Reg(A64::X17), PhysReg::A64Reg(A64::FP), (src_off + copied as i32) as i32)
         emit_store_mem(ctx, PhysReg::A64Reg(A64::X16), copied as i32, PhysReg::A64Reg(A64::X17))
@@ -5964,8 +5873,6 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   end
 
   # Load return value into the return register (local 0 is return place).
-  # Always check var_locs for local 0 regardless of type_size, because
-  # type_size may report 0 for Named types whose layout has forward references.
   if !loaded_ret && fctx.func.locals.len() > 0 then
     let ret_local = fctx.func.locals[0]
     match fctx.var_locs.get(ret_local.id.id)
@@ -6131,7 +6038,7 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
   # Register allocation — allocate_locals now also pre-scans the MIR to
   # reserve space for dynamic spills (aggregates, address-of), so
   # frame.stack_size includes everything and is final.
-  let (var_locs, frame) = allocate_locals(func, ctx.target.arch, &ctx.type_layout)
+  let (var_locs, frame) = allocate_locals(func, ctx.target.arch, &mut ctx.layout_engine)
 
   # Block labels
   let block_labels = make_block_labels(func)
@@ -6237,7 +6144,7 @@ def emit_static_initializer_scalar(op: &MirOperand, buf: &mut CodeBuffer, st_ty:
 end
 
 def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
-  let sz = type_size(&st.ty, &ctx.type_layout)
+  let sz = layout_of_strict(&mut ctx.layout_engine, &st.ty).size
   let init_opt = clone_static_init_operand(st)
 
   # Detect Vec/Slice-typed statics — they need a pointer to a 24-byte struct
@@ -6349,7 +6256,7 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
       kind: SymKind::Data
     })
     # Align bss_size appropriately
-    let align = type_align(&st.ty)
+    let align = layout_of_strict(&mut ctx.layout_engine, &st.ty).align
     let rem = ctx.bss_size % align
     if rem != 0 then
       ctx.bss_size = ctx.bss_size + (align - rem)
@@ -9123,7 +9030,7 @@ end
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, String]
   # Build type layout map and field layouts from MIR type definitions (single LayoutEngine pass)
-  let (type_layout, field_offsets, field_sizes, payload_offsets) = build_all_layouts(&program.types, &ctx.target)
+  let (type_layout, field_offsets, field_sizes, payload_offsets) = build_all_layouts(&mut ctx.layout_engine, &program.types)
   ctx.type_layout = type_layout
   ctx.type_field_offsets = field_offsets
   ctx.type_field_sizes = field_sizes

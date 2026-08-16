@@ -493,9 +493,9 @@ public final class MIRLowering {
             let base = lowerTypeExpr(p.type)
             let ty: MirType
             if p.convention == .inoutAccess {
-                ty = .ref(base, mutable: true)
+                ty = .refInternal(base, true)
             } else if p.modifier == .ref {
-                ty = .ref(base, mutable: false)
+                ty = .refInternal(base, false)
             } else {
                 ty = base
             }
@@ -578,14 +578,14 @@ public final class MIRLowering {
         case .tuple(let pats, _):
             for (i, pat) in pats.enumerated() {
                 let tmp = freshTemp()
-                emit(.assign(.local(tmp), .use(.copy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
+                emit(.assign(.local(tmp), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
                 let elementType: MirType?
                 if case .tuple(let elems)? = typeHint, i < elems.count {
                     elementType = elems[i]
                 } else {
                     elementType = nil
                 }
-                lowerPatternBinding(pat, value: .copy(.local(tmp)), mutable: mutable, typeHint: elementType)
+                lowerPatternBinding(pat, value: .mirCopy(.local(tmp)), mutable: mutable, typeHint: elementType)
             }
         default:
             break // other patterns handled minimally
@@ -597,18 +597,18 @@ public final class MIRLowering {
     private func lowerExpr(_ expr: Expr) -> MirOperand {
         switch expr {
         case .intLit(let s, _):
-            return .constant(.int(MIRLowering.parseInt(s)))
+            return .mirConstant(.int(MIRLowering.parseInt(s)))
         case .floatLit(let s, _):
-            return .constant(.float(Double(s) ?? 0.0))
+            return .mirConstant(.float(Double(s) ?? 0.0))
         case .stringLit(let s, _):
-            return .constant(.str(s))
+            return .mirConstant(.str(s))
         case .charLit(let c, _):
-            return .constant(.char(c))
+            return .mirConstant(.char(c))
         case .boolLit(let b, _):
-            return .constant(.bool(b))
+            return .mirConstant(.bool(b))
         case .name(let n, _):
             if let id = lookupScope(n) {
-                return .copy(.local(id))
+                return .mirCopy(.local(id))
             }
             // Check for A::B style enum variants encoded as name
             if n.contains("::") {
@@ -619,35 +619,35 @@ public final class MIRLowering {
                     if let (td, idx) = resolveNamedVariant(enumName, variantName: variantName, expectedFieldCount: 0) {
                         if case .enumDef(let variants) = td.kind, variants[idx].1.isEmpty {
                             let tmp = freshTemp(type: .named(td.name))
-                            emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.constant(.unit)])))
-                            return .copy(.local(tmp))
+                            emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirConstant(.unit)])))
+                            return .mirCopy(.local(tmp))
                         }
-                        return .constant(.fnItem(n))
+                        return .mirConstant(.fnItem(n))
                     }
                 }
             }
             // Could be a function reference - try to resolve to fully qualified name
             let resolvedName = resolveFunctionName(n)
-            return .constant(.fnItem(resolvedName))
+            return .mirConstant(.fnItem(resolvedName))
         case .path(let a, let b, _):
             // Check if this is an enum variant (e.g., Option::None, Subcommand::Build)
             if let (td, idx) = resolveNamedVariant(a, variantName: b, expectedFieldCount: 0) {
                 if case .enumDef(let variants) = td.kind, variants[idx].1.isEmpty {
                     // Unit-like variant: produce enum value directly
                     let tmp = freshTemp(type: .named(td.name))
-                    emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.constant(.unit)])))
-                    return .copy(.local(tmp))
+                    emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirConstant(.unit)])))
+                    return .mirCopy(.local(tmp))
                 }
                 // Variant with fields: return as a constructor function
-                return .constant(.fnItem("\(a)::\(b)"))
+                return .mirConstant(.fnItem("\(a)::\(b)"))
             }
-            return .constant(.fnItem("\(a)::\(b)"))
+            return .mirConstant(.fnItem("\(a)::\(b)"))
         case .binary(let left, let op, let right, _):
             let l = lowerExpr(left)
             let r = lowerExpr(right)
             let tmp = freshTemp()
             emit(.assign(.local(tmp), .binaryOp(lowerBinOp(op), l, r)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .unary(let op, let inner, _):
             switch op {
@@ -655,41 +655,41 @@ public final class MIRLowering {
                 let val = lowerExpr(inner)
                 let tmp = freshTemp(type: operandType(val) ?? .unknown)
                 emit(.assign(.local(tmp), .unaryOp(.neg, val)))
-                return .copy(.local(tmp))
+                return .mirCopy(.local(tmp))
             case .not:
                 let val = lowerExpr(inner)
                 let tmp = freshTemp(type: operandType(val) ?? .unknown)
                 emit(.assign(.local(tmp), .unaryOp(.not, val)))
-                return .copy(.local(tmp))
+                return .mirCopy(.local(tmp))
             case .borrowMut:
                 if let place = exprToPlace(inner) {
-                    let borrowedType = operandType(.copy(place)) ?? .unknown
-                    let tmp = freshTemp(type: .ref(borrowedType, mutable: true))
-                    emit(.assign(.local(tmp), .ref(.mutable, place)))
-                    return .copy(.local(tmp))
+                    let borrowedType = operandType(.mirCopy(place)) ?? .unknown
+                    let tmp = freshTemp(type: .refInternal(borrowedType, true))
+                    emit(.assign(.local(tmp), .mirRefMut(place)))
+                    return .mirCopy(.local(tmp))
                 } else {
                     let val = lowerExpr(inner)
                     let tmp = freshTemp(type: operandType(val) ?? .unknown)
                     emit(.assign(.local(tmp), .use(val)))
-                    return .copy(.local(tmp))
+                    return .mirCopy(.local(tmp))
                 }
             case .borrow:
                 if let place = exprToPlace(inner) {
-                    let borrowedType = operandType(.copy(place)) ?? .unknown
-                    let tmp = freshTemp(type: .ref(borrowedType, mutable: false))
-                    emit(.assign(.local(tmp), .ref(.shared, place)))
-                    return .copy(.local(tmp))
+                    let borrowedType = operandType(.mirCopy(place)) ?? .unknown
+                    let tmp = freshTemp(type: .refInternal(borrowedType, false))
+                    emit(.assign(.local(tmp), .mirRef(place)))
+                    return .mirCopy(.local(tmp))
                 } else {
                     let val = lowerExpr(inner)
                     let tmp = freshTemp(type: operandType(val) ?? .unknown)
                     emit(.assign(.local(tmp), .use(val)))
-                    return .copy(.local(tmp))
+                    return .mirCopy(.local(tmp))
                 }
             default:
                 let val = lowerExpr(inner)
                 let tmp = freshTemp(type: operandType(val) ?? .unknown)
                 emit(.assign(.local(tmp), .use(val)))
-                return .copy(.local(tmp))
+                return .mirCopy(.local(tmp))
             }
 
         case .assign(let target, let value, _):
@@ -707,22 +707,22 @@ public final class MIRLowering {
                     emit(.assign(MirPlace(local: local, projections: projs), .use(val)))
                 }
             }
-            return .constant(.unit)
+            return .mirConstant(.unit)
 
         case .compoundAssign(let target, let op, let value, _):
             let val = lowerExpr(value)
             if case .name(let n, _) = target, let id = lookupScope(n) {
                 let tmp = freshTemp()
-                emit(.assign(.local(tmp), .binaryOp(lowerBinOp(op), .copy(.local(id)), val)))
-                emit(.assign(.local(id), .use(.copy(.local(tmp)))))
+                emit(.assign(.local(tmp), .binaryOp(lowerBinOp(op), .mirCopy(.local(id)), val)))
+                emit(.assign(.local(id), .use(.mirCopy(.local(tmp)))))
             }
-            return .constant(.unit)
+            return .mirConstant(.unit)
 
         case .call(let callee, _, let args, _):
             // Detect method calls: expr.method(args) → .method(expr, args...)
             if case .field(let base, let methodName, _) = callee {
                 let receiverPlace = exprToPlace(base)
-                let receiverType: MirType? = receiverPlace.flatMap { operandType(.copy($0)) }
+                let receiverType: MirType? = receiverPlace.flatMap { operandType(.mirCopy($0)) }
 
                 // Determine if the method's self parameter is by-value or by-reference.
                 // By default, borrow the receiver (&self/&mut self convention).
@@ -737,9 +737,9 @@ public final class MIRLowering {
 
                 let baseOp: MirOperand
                 if shouldBorrow, let place = receiverPlace {
-                    let refTmp = freshTemp(type: .ref(receiverType ?? .unknown, mutable: true))
-                    emit(.assign(.local(refTmp), .ref(.mutable, place)))
-                    baseOp = .copy(.local(refTmp))
+                    let refTmp = freshTemp(type: .refInternal(receiverType ?? .unknown, true))
+                    emit(.assign(.local(refTmp), .mirRefMut(place)))
+                    baseOp = .mirCopy(.local(refTmp))
                 } else {
                     baseOp = lowerExpr(base)
                 }
@@ -759,11 +759,11 @@ public final class MIRLowering {
                     callArgs.append(lowerCallArg(a.value, effectFallback: i + 1 < effects.count ? effects[i + 1] : .read))
                 }
                 terminateWith(.call(dest: .local(result),
-                                    callee: .constant(.fnItem(".\(methodName)")),
+                                    callee: .mirConstant(.fnItem(".\(methodName)")),
                                     args: callArgs,
                                     next: nextBB, unwind: nil))
                 currentBlock = nextBB
-                return .copy(.local(result))
+                return .mirCopy(.local(result))
             }
             if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
                 let argOps = args.map { lowerExpr($0.value) }
@@ -790,7 +790,7 @@ public final class MIRLowering {
                         let fieldNames = fields.map { $0.0 }
                         let payloadTmp = freshTemp(type: .named(payloadTD.name))
                         emit(.assign(.local(payloadTmp), .aggregate(.structCtor(payloadTD.name, fieldNames), argOps)))
-                        emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), [.copy(.local(payloadTmp))])))
+                        emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), [.mirCopy(.local(payloadTmp))])))
                     } else {
                         // Tuple-like variant: pass args directly
                         emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
@@ -798,7 +798,7 @@ public final class MIRLowering {
                 } else {
                     emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), argOps)))
                 }
-                return .copy(.local(result))
+                return .mirCopy(.local(result))
             }
             let calleeOp = lowerExpr(callee)
             let resultType = inferDirectCallResultType(callee, loweredCallee: calleeOp)
@@ -825,7 +825,7 @@ public final class MIRLowering {
             terminateWith(.call(dest: .local(result), callee: calleeOp, args: directCallArgs,
                                 next: nextBB, unwind: nil))
             currentBlock = nextBB
-            return .copy(.local(result))
+            return .mirCopy(.local(result))
 
         case .macroCall(let name, let args, _):
             let argOps = args.map {
@@ -833,17 +833,17 @@ public final class MIRLowering {
                 case .expr(let expr):
                     return lowerExpr(expr)
                 case .tokens(let text, _):
-                    return .constant(.str(text))
+                    return .mirConstant(.str(text))
                 }
             }
             let result = freshTemp()
             let nextBB = freshBlock()
             let macroCallArgs = argOps.map { MirCallArg(effect: .read, value: .value($0)) }
-            terminateWith(.call(dest: .local(result), callee: .constant(.fnItem("__macro_\(name)")),
+            terminateWith(.call(dest: .local(result), callee: .mirConstant(.fnItem("__macro_\(name)")),
                                 args: macroCallArgs,
                                 next: nextBB, unwind: nil))
             currentBlock = nextBB
-            return .copy(.local(result))
+            return .mirCopy(.local(result))
 
         case .ifExpr(let ifE):
             return lowerIfExpr(ifE)
@@ -865,14 +865,14 @@ public final class MIRLowering {
             pushScope()
             lowerBlock(body, resultInto: tmp)
             popScope()
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .unsafeBlock(_, let body, _):
             let tmp = freshTemp()
             pushScope()
             lowerBlock(body, resultInto: tmp)
             popScope()
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .returnExpr(let val, _):
             if let v = val {
@@ -882,30 +882,30 @@ public final class MIRLowering {
             terminateWith(.ret)
             // Dead code after return — start a new unreachable block
             currentBlock = freshBlock()
-            return .constant(.unit)
+            return .mirConstant(.unit)
 
         case .breakExpr:
             if let target = loopBreakTargets.last {
                 terminateWith(.goto(target))
                 currentBlock = freshBlock() // unreachable after break
             }
-            return .constant(.unit)
+            return .mirConstant(.unit)
 
         case .nextExpr:
             if let target = loopContinueTargets.last {
                 terminateWith(.goto(target))
                 currentBlock = freshBlock() // unreachable after next/continue
             }
-            return .constant(.unit)
+            return .mirConstant(.unit)
 
         case .field(let base, let field, _):
             let baseOp = lowerExpr(base)
             let baseLocal = placeOf(baseOp)
             let inferredType = operandType(baseOp).flatMap { self.projectedType($0, by: MirProjection.namedField(field)) } ?? MirType.unknown
             let tmp = freshTemp(type: inferredType)
-            emit(.assign(.local(tmp), .use(.copy(MirPlace(local: baseLocal,
+            emit(.assign(.local(tmp), .use(.mirCopy(MirPlace(local: baseLocal,
                                                             projections: [.namedField(field)])))))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .index(let base, let idx, _):
             let baseOp = lowerExpr(base)
@@ -914,23 +914,23 @@ public final class MIRLowering {
             let idxLocal = placeOf(idxOp)
             let inferredType = operandType(baseOp).flatMap { self.projectedType($0, by: MirProjection.index(idxLocal)) } ?? MirType.unknown
             let tmp = freshTemp(type: inferredType)
-            emit(.assign(.local(tmp), .use(.copy(MirPlace(local: baseLocal,
+            emit(.assign(.local(tmp), .use(.mirCopy(MirPlace(local: baseLocal,
                                                             projections: [.index(idxLocal)])))))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .array(let elems, _):
             let ops = elems.map { lowerExpr($0) }
             let elementType = ops.compactMap(operandType).first ?? .unknown
             let tmp = freshTemp(type: .array(elementType, ops.count))
             emit(.assign(.local(tmp), .aggregate(.array, ops)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .tuple(let elems, _):
             let ops = elems.map { lowerExpr($0) }
             let tupleTypes = ops.map { operandType($0) ?? .unknown }
             let tmp = freshTemp(type: .tuple(tupleTypes))
             emit(.assign(.local(tmp), .aggregate(.tuple, ops)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .structLit(let name, _, let fields, _, _):
             let fieldNames = fields.map { $0.0 }
@@ -947,14 +947,14 @@ public final class MIRLowering {
                         let payloadName = resolveTypeDef("\(td.name)::\(variantName)")?.name ?? name
                         let payloadTmp = freshTemp(type: .named(payloadName))
                         emit(.assign(.local(payloadTmp), .aggregate(.structCtor(payloadName, fieldNames), ops)))
-                        emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.copy(.local(payloadTmp))])))
-                        return .copy(.local(tmp))
+                        emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirCopy(.local(payloadTmp))])))
+                        return .mirCopy(.local(tmp))
                     }
                 }
             }
             let tmp = freshTemp(type: .named(name))
             emit(.assign(.local(tmp), .aggregate(.structCtor(name, fieldNames), ops)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .range(let start, let end, let inclusive, _):
             let s = lowerExpr(start)
@@ -962,7 +962,7 @@ public final class MIRLowering {
             let kindName = inclusive ? "RangeInclusive" : "Range"
             let tmp = freshTemp(type: .named(kindName))
             emit(.assign(.local(tmp), .aggregate(.structCtor(kindName, ["start", "end"]), [s, e])))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .closure(let closureE):
             return lowerClosure(closureE)
@@ -972,13 +972,13 @@ public final class MIRLowering {
             let targetMirType = lowerTypeExpr(targetType)
             let tmp = freshTemp(type: targetMirType)
             emit(.assign(.local(tmp), .cast(val, targetMirType)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
 
         case .tryOp(let inner, _):
             return lowerExpr(inner)
 
         default:
-            return .constant(.unit)
+            return .mirConstant(.unit)
         }
     }
 
@@ -1028,7 +1028,7 @@ public final class MIRLowering {
         terminateIfNeeded(.goto(mergeBB))
 
         currentBlock = mergeBB
-        return .copy(.local(result))
+        return .mirCopy(.local(result))
     }
 
     private func lowerMatch(_ matchE: MatchExpr) -> MirOperand {
@@ -1079,7 +1079,7 @@ public final class MIRLowering {
         terminateIfNeeded(.goto(mergeBB))
 
         currentBlock = mergeBB
-        return .copy(.local(result))
+        return .mirCopy(.local(result))
     }
 
     /// Extract the literal expression from a literal pattern (for range bounds).
@@ -1158,7 +1158,7 @@ public final class MIRLowering {
                 return nil
             }
             return td.name
-        case .ref(let inner, _):
+        case .refInternal(let inner, _):
             return enumHint(from: inner)
         case .rawPtr(let inner):
             return enumHint(from: inner)
@@ -1177,7 +1177,7 @@ public final class MIRLowering {
                 return String(name[name.startIndex..<idx])
             }
             return name
-        case .ref(let inner, _):
+        case .refInternal(let inner, _):
             return extractTypeName(inner)
         case .rawPtr(let inner):
             return extractTypeName(inner)
@@ -1194,7 +1194,7 @@ public final class MIRLowering {
 
     private func operandType(_ operand: MirOperand) -> MirType? {
         switch operand {
-        case .copy(let place), .move(let place), .read(let place), .consume(let place):
+        case .mirCopy(let place), .mirMovePlace(let place), .mirRead(let place), .mirConsume(let place):
             guard place.local < locals.count else {
                 return nil
             }
@@ -1206,7 +1206,7 @@ public final class MIRLowering {
                 currentType = projected
             }
             return currentType
-        case .constant(let constant):
+        case .mirConstant(let constant):
             switch constant {
             case .unit, .zeroSized:
                 return .unit
@@ -1228,9 +1228,9 @@ public final class MIRLowering {
 
     private func projectedType(_ baseType: MirType, by projection: MirProjection) -> MirType? {
         switch projection {
-        case .deref:
+        case .projDeref:
             switch baseType {
-            case .ref(let inner, _):
+            case .refInternal(let inner, _):
                 return inner
             case .rawPtr(let inner):
                 return inner
@@ -1298,7 +1298,7 @@ public final class MIRLowering {
 
     private func unwrapReferenceTypes(_ type: MirType) -> MirType {
         switch type {
-        case .ref(let inner, _):
+        case .refInternal(let inner, _):
             return unwrapReferenceTypes(inner)
         case .rawPtr(let inner):
             return unwrapReferenceTypes(inner)
@@ -1532,12 +1532,12 @@ public final class MIRLowering {
     private func lowerPatternTest(_ pattern: Pattern, value: MirOperand, enumHint: String? = nil) -> MirOperand {
         switch pattern {
         case .wildcard, .ident, .refPattern, .refMutPattern:
-            return .constant(.bool(true))
+            return .mirConstant(.bool(true))
         case .literal(let expr, _):
             let tmp = freshTemp()
             let litVal = lowerExpr(expr)
             emit(.assign(.local(tmp), .binaryOp(.eq, value, litVal)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
         case .variant(let typeName, let variantName, let subPats, let span):
             if typeName.isEmpty,
                subPats.isEmpty,
@@ -1546,50 +1546,50 @@ public final class MIRLowering {
                 let tmp = freshTemp()
                 let constValue = lowerExpr(.call(callee: .name(variantName, span), typeArgs: [], args: [], span))
                 emit(.assign(.local(tmp), .binaryOp(.eq, value, constValue)))
-                return .copy(.local(tmp))
+                return .mirCopy(.local(tmp))
             }
             guard let variantMatch = requireVariantMatch(typeName: typeName, variantName: variantName,
                                                          enumHint: enumHint, expectedFieldCount: subPats.count,
                                                          allowExtraFields: true, context: "pattern test") else {
-                return .constant(.bool(false))
+                return .mirConstant(.bool(false))
             }
             let idx = variantMatch.1
             let discTmp = freshTemp()
             emit(.assign(.local(discTmp), .discriminant(MirPlace(local: placeOf(value), projections: []))))
             let cmpTmp = freshTemp()
-            emit(.assign(.local(cmpTmp), .binaryOp(.eq, .copy(.local(discTmp)), .constant(.int(idx)))))
+            emit(.assign(.local(cmpTmp), .binaryOp(.eq, .mirCopy(.local(discTmp)), .mirConstant(.int(idx)))))
             // Also check sub-patterns (e.g. literal payloads like Some('#'))
             if subPats.isEmpty {
-                return .copy(.local(cmpTmp))
+                return .mirCopy(.local(cmpTmp))
             }
             let resultTmp = freshTemp()
-            emit(.assign(.local(resultTmp), .use(.constant(.bool(false)))))
+            emit(.assign(.local(resultTmp), .use(.mirConstant(.bool(false)))))
 
             let payloadBB = freshBlock()
             let doneBB = freshBlock()
-            terminateWith(.switchInt(.copy(.local(cmpTmp)), targets: [(1, payloadBB)], otherwise: doneBB))
+            terminateWith(.switchInt(.mirCopy(.local(cmpTmp)), targets: [(1, payloadBB)], otherwise: doneBB))
 
             currentBlock = payloadBB
             let inner = freshTemp()
-            emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(idx)])))))
-            var subResult: MirOperand = .constant(.bool(true))
+            emit(.assign(.local(inner), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.downcast(idx)])))))
+            var subResult: MirOperand = .mirConstant(.bool(true))
             if subPats.count == 1 {
-                subResult = lowerPatternTest(subPats[0], value: .copy(.local(inner)))
+                subResult = lowerPatternTest(subPats[0], value: .mirCopy(.local(inner)))
             } else {
                 for (i, pat) in subPats.enumerated() {
                     let elem = freshTemp()
-                    emit(.assign(.local(elem), .use(.copy(MirPlace(local: inner, projections: [.field(i)])))))
-                    let subTest = lowerPatternTest(pat, value: .copy(.local(elem)))
+                    emit(.assign(.local(elem), .use(.mirCopy(MirPlace(local: inner, projections: [.field(i)])))))
+                    let subTest = lowerPatternTest(pat, value: .mirCopy(.local(elem)))
                     let andTmp = freshTemp()
                     emit(.assign(.local(andTmp), .binaryOp(.and, subResult, subTest)))
-                    subResult = .copy(.local(andTmp))
+                    subResult = .mirCopy(.local(andTmp))
                 }
             }
             emit(.assign(.local(resultTmp), .use(subResult)))
             terminateWith(.goto(doneBB))
 
             currentBlock = doneBB
-            return .copy(.local(resultTmp))
+            return .mirCopy(.local(resultTmp))
         case .structPattern(let name, let sFields, _):
             // Struct-like enum variant: EnumType::Variant { field: pat, ... }
             if name.contains("::") {
@@ -1601,26 +1601,26 @@ public final class MIRLowering {
                                                         enumHint: nil, expectedFieldCount: sFields.count,
                                                         allowExtraFields: true,
                                                         context: "struct pattern test") else {
-                        return .constant(.bool(false))
+                        return .mirConstant(.bool(false))
                     }
                     let discTmp = freshTemp()
                     emit(.assign(.local(discTmp), .discriminant(MirPlace(local: placeOf(value), projections: []))))
                     let cmpTmp = freshTemp()
-                    emit(.assign(.local(cmpTmp), .binaryOp(.eq, .copy(.local(discTmp)), .constant(.int(idx)))))
-                    return .copy(.local(cmpTmp))
+                    emit(.assign(.local(cmpTmp), .binaryOp(.eq, .mirCopy(.local(discTmp)), .mirConstant(.int(idx)))))
+                    return .mirCopy(.local(cmpTmp))
                 }
             }
-            return .constant(.bool(true))
+            return .mirConstant(.bool(true))
         case .tuple(let pats, _):
             // All sub-patterns must match
-            var allMatch: MirOperand = .constant(.bool(true))
+            var allMatch: MirOperand = .mirConstant(.bool(true))
             for (i, pat) in pats.enumerated() {
                 let elem = freshTemp()
-                emit(.assign(.local(elem), .use(.copy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
-                let sub = lowerPatternTest(pat, value: .copy(.local(elem)))
+                emit(.assign(.local(elem), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
+                let sub = lowerPatternTest(pat, value: .mirCopy(.local(elem)))
                 let andTmp = freshTemp()
                 emit(.assign(.local(andTmp), .binaryOp(.and, allMatch, sub)))
-                allMatch = .copy(.local(andTmp))
+                allMatch = .mirCopy(.local(andTmp))
             }
             return allMatch
         case .orPattern(let lhs, let rhs, _):
@@ -1628,7 +1628,7 @@ public final class MIRLowering {
             let r = lowerPatternTest(rhs, value: value)
             let tmp = freshTemp()
             emit(.assign(.local(tmp), .binaryOp(.or, l, r)))
-            return .copy(.local(tmp))
+            return .mirCopy(.local(tmp))
         case .rangePattern(let lo, let hi, _):
             // Compute: value >= lo_lit && value <= hi_lit
             let loLit = lowerExpr(patternToExpr(lo))
@@ -1638,8 +1638,8 @@ public final class MIRLowering {
             let leTmp = freshTemp()
             emit(.assign(.local(leTmp), .binaryOp(.le, value, hiLit)))
             let andTmp = freshTemp()
-            emit(.assign(.local(andTmp), .binaryOp(.and, .copy(.local(geTmp)), .copy(.local(leTmp)))))
-            return .copy(.local(andTmp))
+            emit(.assign(.local(andTmp), .binaryOp(.and, .mirCopy(.local(geTmp)), .mirCopy(.local(leTmp)))))
+            return .mirCopy(.local(andTmp))
         }
     }
 
@@ -1654,12 +1654,12 @@ public final class MIRLowering {
             let bindType = operandType(value) ?? .unknown
             let id = freshLocal(name: name, type: bindType, mutable: false)
             defineInScope(name, id)
-            emit(.assign(.local(id), .ref(.shared, MirPlace(local: placeOf(value), projections: []))))
+            emit(.assign(.local(id), .mirRef(MirPlace(local: placeOf(value), projections: []))))
         case .refMutPattern(let name, _):
             let bindType = operandType(value) ?? .unknown
             let id = freshLocal(name: name, type: bindType, mutable: true)
             defineInScope(name, id)
-            emit(.assign(.local(id), .ref(.mutable, MirPlace(local: placeOf(value), projections: []))))
+            emit(.assign(.local(id), .mirRefMut(MirPlace(local: placeOf(value), projections: []))))
         case .variant(let typeName, let variantName, let fields, _):
             // Bind payload: downcast to get inner value, then bind field patterns
             if !fields.isEmpty {
@@ -1670,22 +1670,22 @@ public final class MIRLowering {
                 }
                 let variantIdx = variantMatch.1
                 let inner = freshTemp()
-                emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
+                emit(.assign(.local(inner), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
                 if fields.count == 1 {
-                    lowerPatternBind(fields[0], value: .copy(.local(inner)), enumHint: enumHint)
+                    lowerPatternBind(fields[0], value: .mirCopy(.local(inner)), enumHint: enumHint)
                 } else {
                     for (i, pat) in fields.enumerated() {
                         let elem = freshTemp()
-                        emit(.assign(.local(elem), .use(.copy(MirPlace(local: inner, projections: [.field(i)])))))
-                        lowerPatternBind(pat, value: .copy(.local(elem)), enumHint: enumHint)
+                        emit(.assign(.local(elem), .use(.mirCopy(MirPlace(local: inner, projections: [.field(i)])))))
+                        lowerPatternBind(pat, value: .mirCopy(.local(elem)), enumHint: enumHint)
                     }
                 }
             }
         case .tuple(let pats, _):
             for (i, pat) in pats.enumerated() {
                 let tmp = freshTemp()
-                emit(.assign(.local(tmp), .use(.copy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
-                lowerPatternBind(pat, value: .copy(.local(tmp)))
+                emit(.assign(.local(tmp), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
+                lowerPatternBind(pat, value: .mirCopy(.local(tmp)))
             }
         case .structPattern(let name, let sFields, _):
             // Struct-like pattern: either plain struct or enum variant with struct syntax
@@ -1703,16 +1703,16 @@ public final class MIRLowering {
                     }
                     // Downcast to get the variant payload struct
                     let inner = freshTemp()
-                    emit(.assign(.local(inner), .use(.copy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
+                    emit(.assign(.local(inner), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.downcast(variantIdx)])))))
                     baseLocal = inner
                 }
             }
             // Bind each named field
             for (fieldName, subPat) in sFields {
                 let fieldTmp = freshTemp()
-                emit(.assign(.local(fieldTmp), .use(.copy(MirPlace(local: baseLocal, projections: [.namedField(fieldName)])))))
+                emit(.assign(.local(fieldTmp), .use(.mirCopy(MirPlace(local: baseLocal, projections: [.namedField(fieldName)])))))
                 let pat = subPat ?? .ident(fieldName, mutable: false, Span.synthetic)
-                lowerPatternBind(pat, value: .copy(.local(fieldTmp)))
+                lowerPatternBind(pat, value: .mirCopy(.local(fieldTmp)))
             }
         default:
             break
@@ -1728,7 +1728,7 @@ public final class MIRLowering {
             return nil
         }
         lowerProjectedFor(forE, varName: varName, patMut: patMut, iterType: iterType, elemTy: elemTy)
-        return .constant(.unit)
+        return .mirConstant(.unit)
     }
 
     private func indexMentionsLoopVar(varName: String, expr: Expr) -> Bool {
@@ -1764,7 +1764,7 @@ public final class MIRLowering {
         switch type {
         case .slice(let inner), .array(let inner, _):
             return inner
-        case .ref(let inner, _), .rawPtr(let inner):
+        case .refInternal(let inner, _), .rawPtr(let inner):
             return projectedCollectionElementType(inner)
         case .named(let name):
             let bare = bareTypeName(name)
@@ -2152,11 +2152,11 @@ public final class MIRLowering {
                                    iterType: MirType, elemTy: MirType) {
         guard let iterPlace = exprToPlace(forE.iterable) else { return }
         let iterLocal = freshTemp(type: iterType)
-        emit(.assign(.local(iterLocal), .use(.copy(iterPlace))))
+        emit(.assign(.local(iterLocal), .use(.mirCopy(iterPlace))))
 
         // Index variable: _idx = 0
         let idxLocal = freshTemp()
-        emit(.assign(.local(idxLocal), .use(.constant(.int(0)))))
+        emit(.assign(.local(idxLocal), .use(.mirConstant(.int(0)))))
 
         // Length of collection, evaluated once at entry
         let lenLocal = freshTemp()
@@ -2172,17 +2172,17 @@ public final class MIRLowering {
         // Condition: idx < len
         currentBlock = condBB
         let cmpTmp = freshTemp()
-        emit(.assign(.local(cmpTmp), .binaryOp(.lt, .copy(.local(idxLocal)), .copy(.local(lenLocal)))))
-        terminateWith(.switchInt(.copy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
+        emit(.assign(.local(cmpTmp), .binaryOp(.lt, .mirCopy(.local(idxLocal)), .mirCopy(.local(lenLocal)))))
+        terminateWith(.switchInt(.mirCopy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
 
         // Body: let x = &iter[idx]; execute body
         currentBlock = bodyBB
         loopBreakTargets.append(exitBB)
         loopContinueTargets.append(incrBB)
         pushScope()
-        let xLocal = freshLocal(name: varName, type: .ref(elemTy, mutable: false), mutable: patMut)
+        let xLocal = freshLocal(name: varName, type: .refInternal(elemTy, false), mutable: patMut)
         defineInScope(varName, xLocal)
-        emit(.assign(.local(xLocal), .ref(.shared, MirPlace(local: iterLocal, projections: [.index(idxLocal)]))))
+        emit(.assign(.local(xLocal), .mirRef(MirPlace(local: iterLocal, projections: [.index(idxLocal)]))))
         let tmp = freshTemp()
         lowerBlock(forE.body, resultInto: tmp)
         popScope()
@@ -2193,8 +2193,8 @@ public final class MIRLowering {
         // Increment: idx = idx + 1, then back to condition
         currentBlock = incrBB
         let incTmp = freshTemp()
-        emit(.assign(.local(incTmp), .binaryOp(.add, .copy(.local(idxLocal)), .constant(.int(1)))))
-        emit(.assign(.local(idxLocal), .use(.copy(.local(incTmp)))))
+        emit(.assign(.local(incTmp), .binaryOp(.add, .mirCopy(.local(idxLocal)), .mirConstant(.int(1)))))
+        emit(.assign(.local(idxLocal), .use(.mirCopy(.local(incTmp)))))
         terminateWith(.goto(condBB))
 
         currentBlock = exitBB
@@ -2210,13 +2210,13 @@ public final class MIRLowering {
         // Copy the iterable directly into the iterator local (identity .iter()).
         // Using a direct assignment avoids a function-call stub that would lose
         // the multi-word Vec/Map header (only 8 bytes survive a register return).
-        let iterType = operandType(.copy(.local(iterableLocal))) ?? .unknown
+        let iterType = operandType(.mirCopy(.local(iterableLocal))) ?? .unknown
         let iterLocal = freshTemp(type: iterType)
-        emit(.assign(.local(iterLocal), .use(.copy(.local(iterableLocal)))))
+        emit(.assign(.local(iterLocal), .use(.mirCopy(.local(iterableLocal)))))
 
         // Index variable: mut _idx = 0
         let idxLocal = freshTemp()
-        emit(.assign(.local(idxLocal), .use(.constant(.int(0)))))
+        emit(.assign(.local(idxLocal), .use(.mirConstant(.int(0)))))
 
         // Length of collection — use MirLen rvalue so codegen reads the len
         // field directly from the collection header without an extra deref.
@@ -2233,8 +2233,8 @@ public final class MIRLowering {
         // Condition: idx < len
         currentBlock = condBB
         let cmpTmp = freshTemp()
-        emit(.assign(.local(cmpTmp), .binaryOp(.lt, .copy(.local(idxLocal)), .copy(.local(lenLocal)))))
-        terminateWith(.switchInt(.copy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
+        emit(.assign(.local(cmpTmp), .binaryOp(.lt, .mirCopy(.local(idxLocal)), .mirCopy(.local(lenLocal)))))
+        terminateWith(.switchInt(.mirCopy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
 
         // Body: let elem = iter[idx]; execute body
         currentBlock = bodyBB
@@ -2242,8 +2242,8 @@ public final class MIRLowering {
         loopContinueTargets.append(incrBB)
         pushScope()
         let elemLocal = freshTemp()
-        emit(.assign(.local(elemLocal), .use(.copy(MirPlace(local: iterLocal, projections: [.index(idxLocal)])))))
-        lowerPatternBind(forE.pattern, value: .copy(.local(elemLocal)))
+        emit(.assign(.local(elemLocal), .use(.mirCopy(MirPlace(local: iterLocal, projections: [.index(idxLocal)])))))
+        lowerPatternBind(forE.pattern, value: .mirCopy(.local(elemLocal)))
         let tmp = freshTemp()
         lowerBlock(forE.body, resultInto: tmp)
         popScope()
@@ -2254,12 +2254,12 @@ public final class MIRLowering {
         // Increment: idx = idx + 1, then back to condition
         currentBlock = incrBB
         let incTmp = freshTemp()
-        emit(.assign(.local(incTmp), .binaryOp(.add, .copy(.local(idxLocal)), .constant(.int(1)))))
-        emit(.assign(.local(idxLocal), .use(.copy(.local(incTmp)))))
+        emit(.assign(.local(incTmp), .binaryOp(.add, .mirCopy(.local(idxLocal)), .mirConstant(.int(1)))))
+        emit(.assign(.local(idxLocal), .use(.mirCopy(.local(incTmp)))))
         terminateWith(.goto(condBB))
 
         currentBlock = exitBB
-        return .constant(.unit)
+        return .mirConstant(.unit)
     }
 
     private func lowerWhile(_ whileE: WhileExpr) -> MirOperand {
@@ -2285,7 +2285,7 @@ public final class MIRLowering {
         terminateIfNeeded(.goto(condBB))
 
         currentBlock = exitBB
-        return .constant(.unit)
+        return .mirConstant(.unit)
     }
 
     private func lowerLoop(_ body: BlockBody) -> MirOperand {
@@ -2306,7 +2306,7 @@ public final class MIRLowering {
         terminateIfNeeded(.goto(loopBB))
 
         currentBlock = exitBB
-        return .constant(.unit)
+        return .mirConstant(.unit)
     }
 
     private func lowerClosure(_ closureE: ClosureExpr) -> MirOperand {
@@ -2383,16 +2383,16 @@ public final class MIRLowering {
 
         // ── 6. Emit closure value in parent function ──
         if captureOuterIds.isEmpty {
-            return .constant(.fnItem(closureName))
+            return .mirConstant(.fnItem(closureName))
         }
         // Build aggregate with captured values from outer scope
         var captureOps: [MirOperand] = []
         for outerId in captureOuterIds {
-            captureOps.append(.copy(.local(outerId)))
+            captureOps.append(.mirCopy(.local(outerId)))
         }
         let closureTmp = freshTemp()
         emit(.assign(.local(closureTmp), .aggregate(.closure(closureName), captureOps)))
-        return .copy(.local(closureTmp))
+        return .mirCopy(.local(closureTmp))
     }
 
     // MARK: - Type lowering
@@ -2418,7 +2418,7 @@ public final class MIRLowering {
         case .tuple(let elems, _):
             return .tuple(elems.map(lowerTypeExpr))
         case .ref(let inner, let mutable, _):
-            return .ref(lowerTypeExpr(inner), mutable: mutable)
+            return .refInternal(lowerTypeExpr(inner), mutable)
         case .rawPtr(let inner, _, _):
             return .rawPtr(lowerTypeExpr(inner))
         case .array(let inner, _, _):
@@ -2549,7 +2549,7 @@ public final class MIRLowering {
 
     private func placeOf(_ op: MirOperand) -> LocalId {
         switch op {
-        case .copy(let p), .move(let p), .read(let p), .consume(let p): return p.local
+        case .mirCopy(let p), .mirMovePlace(let p), .mirRead(let p), .mirConsume(let p): return p.local
         case .constant:
             let tmp = freshTemp()
             emit(.assign(.local(tmp), .use(op)))

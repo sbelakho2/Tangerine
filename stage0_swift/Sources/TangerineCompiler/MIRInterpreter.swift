@@ -349,7 +349,7 @@ public final class MIRInterpreter {
     private func evalCallArg(_ arg: MirCallArg) -> MirValue {
         switch arg.value {
         case .value(let op): return evalOperand(op)
-        case .place(let p): return evalOperand(.copy(p))
+        case .place(let p): return evalOperand(.mirCopy(p))
         }
     }
 
@@ -359,7 +359,7 @@ public final class MIRInterpreter {
         switch arg.value {
         case .value(let op):
             switch op {
-            case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
+            case .mirCopy(let p), .mirMovePlace(let p), .mirRead(let p), .mirConsume(let p): return p
             default: return nil
             }
         case .place(let p): return p
@@ -538,7 +538,7 @@ public final class MIRInterpreter {
         var frame = Frame(functionIdx: fnIdx, localsBase: localsBase, localsCount: maxLocal,
                           currentBlock: fn.entryBlock, stmtIndex: 0)
         for param in fn.params {
-            if case .ref(_, mutable: true) = param.type {
+            if case .refInternal(_, true) = param.type {
                 frame.mutBorrows[param.id] = MirPlace(local: param.id)
             }
         }
@@ -554,11 +554,11 @@ public final class MIRInterpreter {
         // Capture mut write-back params
         var hasMutRef = false
         for param in calleeFn.params {
-            if case .ref(_, mutable: true) = param.type { hasMutRef = true; break }
+            if case .refInternal(_, true) = param.type { hasMutRef = true; break }
         }
         if hasMutRef {
             lastCallMutRefMask = calleeFn.params.map { p in
-                if case .ref(_, mutable: true) = p.type { return true }
+                if case .refInternal(_, true) = p.type { return true }
                 return false
             }
             lastCallFinalParams = calleeFn.params.map { p in
@@ -787,7 +787,7 @@ public final class MIRInterpreter {
                 let result: MirValue
                 if case .fn(let name) = calleeVal {
                     let staticSiteKey: CallSiteKey?
-                    if case .constant(.fnItem(let staticName)) = callee, staticName == name {
+                    if case .mirConstant(.fnItem(let staticName)) = callee, staticName == name {
                         staticSiteKey = currentCallSiteKey()
                     } else {
                         staticSiteKey = nil
@@ -946,7 +946,7 @@ public final class MIRInterpreter {
             let val = evalRvalue(rvalue)
             if place.projections.isEmpty {
                 setLocal(place.local, val)
-                if case .ref(.mutable, let borrowedPlace) = rvalue {
+                if case .mirRefMut(let borrowedPlace) = rvalue {
                     let frameIdx = callStack.count - 1
                     callStack[frameIdx].mutBorrows[place.local] = borrowedPlace
                 }
@@ -954,7 +954,7 @@ public final class MIRInterpreter {
                 if case .use(let operand) = rvalue {
                     let srcPlace: MirPlace?
                     switch operand {
-                    case .copy(let p), .move(let p), .read(let p), .consume(let p): srcPlace = p
+                    case .mirCopy(let p), .mirMovePlace(let p), .mirRead(let p), .mirConsume(let p): srcPlace = p
                     default: srcPlace = nil
                     }
                     if let sp = srcPlace {
@@ -1139,7 +1139,7 @@ public final class MIRInterpreter {
                 }
             }
 
-        case .ref(_, let place):
+        case .mirRef(let place), .mirRefMut(let place):
             return loadPlaceValue(place)
 
         case .discriminant(let place):
@@ -1237,9 +1237,9 @@ public final class MIRInterpreter {
     @inline(__always)
     private func evalOperand(_ op: MirOperand) -> MirValue {
         switch op {
-        case .copy(let place), .move(let place), .read(let place), .consume(let place):
+        case .mirCopy(let place), .mirMovePlace(let place), .mirRead(let place), .mirConsume(let place):
             return loadPlaceValue(place)
-        case .constant(let c):
+        case .mirConstant(let c):
             return evalConstant(c)
         }
     }
@@ -1683,7 +1683,7 @@ public final class MIRInterpreter {
             }
             // Non-enum value: likely already unwrapped — return as-is instead of losing data
             return val
-        case .deref:
+        case .projDeref:
             // Dereference through single-ptr-field wrappers (Box, Owned, Rc, etc.)
             // and Ptr values to get the inner value.
             if case .structVal(_, let fields) = val, fields.count == 1, let inner = fields["ptr"] {
@@ -1765,7 +1765,7 @@ public final class MIRInterpreter {
                     return .array(elems)
                 }
                 return failProjection(first, on: base, detail: "constant index \(idx) out of range for write", fallback: base)
-            case .deref:
+            case .projDeref:
                 return value  // deref is identity in interpreter (no real pointers)
             default:
                 return base
@@ -6435,8 +6435,10 @@ public struct MIRPrettyPrinter {
             case .enumCtor(let n, let v): return "\(n)::\(v)(\(vals))"
             case .closure(let n): return "closure(\(n))"
             }
-        case .ref(let bk, let place):
-            return "&\(bk == .mutable ? "mut " : "")\(printPlace(place))"
+        case .mirRef(let place):
+            return "&\(printPlace(place))"
+        case .mirRefMut(let place):
+            return "&mut \(printPlace(place))"
         case .discriminant(let place):
             return "discriminant(\(printPlace(place)))"
         case .len(let place):
@@ -6448,11 +6450,11 @@ public struct MIRPrettyPrinter {
 
     private func printOperand(_ op: MirOperand) -> String {
         switch op {
-        case .copy(let p): return printPlace(p)
-        case .move(let p): return "move \(printPlace(p))"
-        case .read(let p): return "read \(printPlace(p))"
-        case .consume(let p): return "consume \(printPlace(p))"
-        case .constant(let c): return printConstant(c)
+        case .mirCopy(let p): return printPlace(p)
+        case .mirMovePlace(let p): return "move \(printPlace(p))"
+        case .mirRead(let p): return "read \(printPlace(p))"
+        case .mirConsume(let p): return "consume \(printPlace(p))"
+        case .mirConstant(let c): return printConstant(c)
         }
     }
 
@@ -6460,7 +6462,7 @@ public struct MIRPrettyPrinter {
         var s = "_\(place.local)"
         for proj in place.projections {
             switch proj {
-            case .deref: s = "(*\(s))"
+            case .projDeref: s = "(*\(s))"
             case .field(let i): s += ".\(i)"
             case .namedField(let n): s += ".\(n)"
             case .index(let id): s += "[_\(id)]"
@@ -6493,7 +6495,7 @@ public struct MIRPrettyPrinter {
         case .char: return "Char"
         case .string: return "String"
         case .named(let n): return n
-        case .ref(let inner, let mutable): return "&\(mutable ? "mut " : "")\(printType(inner))"
+        case .refInternal(let inner, let mutable): return "&\(mutable ? "mut " : "")\(printType(inner))"
         case .rawPtr(let inner): return "*\(printType(inner))"
         case .array(let inner, let size): return size.map { "[\(printType(inner)); \($0)]" } ?? "[\(printType(inner))]"
         case .slice(let inner): return "[\(printType(inner))]"
