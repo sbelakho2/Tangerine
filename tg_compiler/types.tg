@@ -190,7 +190,14 @@ struct TypeEnv
   typed_field_targets: Map[Int, FieldId]
   typed_local_bindings: Map[Int, LocalBinding]
   typed_ident_resolutions: Map[Int, Int]
-  typed_binding_resolutions: Map[Int, Int]
+  # Two SEPARATE binding-resolution maps: parameters and pattern bindings are
+  # keyed in entirely different domains (owner span + positional index vs
+  # pattern node id). Keeping them in one map allowed a parameter key to
+  # numerically collide with a pattern node id, letting a later pattern
+  # overwrite a parameter's mapping and corrupting resource/access analysis
+  # of the wrong local.
+  param_binding_resolutions: Map[Int, Vec[Int]]
+  pattern_binding_resolutions: Map[Int, Int]
   typed_access_effects: Map[Int, AccessEffect]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   access_marker_depth: Int
@@ -237,7 +244,11 @@ struct TypedProgram
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
-  binding_resolutions: Map[Int, Int]
+  # Parameter bindings are keyed by owner (function/method span start) with a
+  # positional Vec; pattern bindings are keyed by pattern node id. The two
+  # domains never collide (see TypeEnv.param_binding_resolutions).
+  param_binding_resolutions: Map[Int, Vec[Int]]
+  pattern_binding_resolutions: Map[Int, Int]
   type_kinds: Map[Int, TypeKind]
 end
 
@@ -271,7 +282,8 @@ def type_env_new() -> TypeEnv
     typed_field_targets: Map::new(),
     typed_local_bindings: Map::new(),
     typed_ident_resolutions: Map::new(),
-    typed_binding_resolutions: Map::new(),
+    param_binding_resolutions: Map::new(),
+    pattern_binding_resolutions: Map::new(),
     typed_access_effects: Map::new(),
     closure_captures: Map::new(),
     access_marker_depth: 0
@@ -1794,27 +1806,31 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           match get_type_by_id(env, &id1)
           when Option::Some(td) then
             if td.name == "Fn" then
-              # Fn types in Named form would have args matching the function params + ret
-              # If no type args, just return true (permissive)
+              # Fn types in Named form have args matching the function params + ret.
+              # The last type arg is the return type, so the parameter arity is
+              # args1.len() - 1, and it must match the function type's arity
+              # exactly (see the Function-vs-Function arm above).
               if args1.len() == 0 then true
+              elsif args1.len() - 1 != params2.len() then
+                type_add_error(env, "function arity mismatch: cannot unify Fn type with " +
+                  (args1.len() - 1).to_string() + " parameters and function type with " +
+                  params2.len().to_string() + " parameters", span)
+                false
               else
-                # Try to unify Named args with Function params and ret
                 var ok = true
                 var i = 0
-                let min_len = if args1.len() - 1 < params2.len() then args1.len() - 1 else params2.len() end
-                while i < min_len do
+                while i < params2.len() do
                   if !unify(env, args1[i], params2[i].ty, span) then
                     ok = false
                   end
                   i = i + 1
                 end
-                if args1.len() > 0 then
+                if ok then
                   let ret_idx = args1.len() - 1
-                  if !unify(env, args1[ret_idx], ret2, span) then
-                    ok = false
-                  end
+                  unify(env, args1[ret_idx], ret2, span)
+                else
+                  false
                 end
-                ok
               end
             else
               type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
@@ -1829,21 +1845,18 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       when Type::Function(params1, ret1) then
         match b
         when Type::Function(params2, ret2) then
+          # Arity must match EXACTLY: a callable with a different parameter
+          # count is a different type. Function types carry ownership
+          # conventions per parameter, and higher-order calls bind arguments
+          # positionally, so unifying only the common prefix would let a
+          # fn(Int) -> Int unify with fn(Int, String) -> Int and produce
+          # unsound callable substitution (too many / too few arguments
+          # silently accepted at the call site).
           if params1.len() != params2.len() then
-            # Permissive: unify common params, skip mismatch error
-            var ok = true
-            var i = 0
-            let min_len = if params1.len() < params2.len() then params1.len() else params2.len() end
-            while i < min_len do
-              if !(params1[i].convention == params2[i].convention) then
-                ok = false
-              end
-              if !unify(env, params1[i].ty, params2[i].ty, span) then
-                ok = false
-              end
-              i = i + 1
-            end
-            if ok then unify(env, ret1, ret2, span) else false end
+            type_add_error(env, "function arity mismatch: cannot unify " +
+              params1.len().to_string() + "-parameter and " +
+              params2.len().to_string() + "-parameter function types", span)
+            false
           else
             var ok = true
             var i = 0
@@ -2601,6 +2614,11 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   end
   
   # Bind parameters
+  # Parameter bindings are recorded per-owner (keyed by the function's span
+  # start) in declaration order, in the dedicated param_binding_resolutions
+  # map. This keeps parameter keys in a domain that can never collide with
+  # pattern node ids (see the TypeEnv field comment).
+  var param_local_ids = Vec::new()
   var i = 0
   while i < f.params.len() do
     let p = f.params[i]
@@ -2609,9 +2627,10 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
     when Option::None then fresh_type_var(env)
     end
     bind_var(env, p.name, ty)
-    env.typed_binding_resolutions.insert(f.span.start * 1000 + i, env.local_id_counter - 1)
+    param_local_ids.push(env.local_id_counter - 1)
     i = i + 1
   end
+  env.param_binding_resolutions.insert(f.span.start, param_local_ids)
   
   # Get expected return type
   let ret_type = match f.ret_type
@@ -2762,6 +2781,9 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
     end
 
     # Bind parameters — use self_type for any param named "self"
+    # Recorded per-owner in declaration order in the dedicated parameter map
+    # (see the TypeEnv field comment about key-domain separation).
+    var method_param_ids = Vec::new()
     var param_index = 0
     while param_index < m.params.len() do
       let p = m.params[param_index]
@@ -2774,9 +2796,10 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
         end
       end
       bind_var(env, p.name, ty)
-      env.typed_binding_resolutions.insert(m.span.start * 1000 + param_index, env.local_id_counter - 1)
+      method_param_ids.push(env.local_id_counter - 1)
       param_index = param_index + 1
     end
+    env.param_binding_resolutions.insert(m.span.start, method_param_ids)
 
     # Expected return type
     let ret_type = match m.ret_type
@@ -3165,7 +3188,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
     let before = env.local_id_counter
     bind_var(env, name, expected_base)
     if env.local_id_counter > before then
-      env.typed_binding_resolutions.insert(pat.node_id, before)
+      env.pattern_binding_resolutions.insert(pat.node_id, before)
     end
   when PatternKind::Literal(expr) then
     let lit_type = check_expr(env, &expr)
@@ -3498,6 +3521,71 @@ def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Optio
               let m = imp.methods[mi]
               if m.name == method then
                 return Option::Some(m.params.clone())
+              end
+              mi = mi + 1
+            end
+          end
+          ci = ci + 1
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  Option::None
+end
+
+# Extract the element type of a container (Array/Vec, Map, Option-like)
+# from a receiver type, in both canonical and Named forms. Used by the
+# resource-extraction rule below: a shared read of a resource element would
+# duplicate ownership out of a container that stays live.
+def container_element_type(env: &TypeEnv, ty: &Type) -> Option[Type]
+  match ty
+  when Type::Slice(elem) then Option::Some(elem.clone())
+  when Type::Array(elem, _) then Option::Some(elem.clone())
+  when Type::Map(_, v) then Option::Some(v.clone())
+  when Type::Named(tid, args) then
+    match get_type_by_id(env, tid)
+    when Option::Some(td) then
+      if td.name == "Map" && args.len() >= 2 then Option::Some(args[1].clone())
+      elsif (td.name == "Array" || td.name == "Vec") && args.len() >= 1 then Option::Some(args[0].clone())
+      else Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# Expected explicit-argument count for a method call: the declared params
+# with `self` (if present) excluded. Self-less "static-style" methods
+# (e.g. Array::from, Map::new called with method syntax) have no receiver
+# parameter, so the count is the full param list length.
+def find_method_expected_args(env: &TypeEnv, recv_type: &Type, method: String) -> Option[Int]
+  let resolved_base = resolved_receiver_base(env, recv_type)
+  match resolved_base
+  when Type::Error then return Option::None
+  when _ then ()
+  end
+  match resolved_base
+  when Type::Named(tid, _) then
+    match env.method_lookup.get(tid.id)
+    when Option::Some(mmap) then
+      match mmap.get(method)
+      when Option::Some(cands) then
+        var ci = 0
+        while ci < cands.len() do
+          let imp = env.impls[cands[ci]]
+          if impl_for_type_matches(&imp.for_type, &resolved_base) then
+            var mi = 0
+            while mi < imp.methods.len() do
+              let m = imp.methods[mi]
+              if m.name == method then
+                if m.params.len() >= 1 && m.params[0].name == "self" then
+                  return Option::Some(m.params.len() - 1)
+                end
+                return Option::Some(m.params.len())
               end
               mi = mi + 1
             end
@@ -4063,15 +4151,20 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     let ret_type = fresh_type_var(env)
     match func_type
     when Type::Function(params, ret) then
+      # Enforce exact arity for non-variadic callables: every declared
+      # parameter must have a supplied argument and every argument must
+      # map to a declared parameter. Silently accepting extra arguments
+      # (or missing ones) makes callable types unsound — a value of type
+      # fn(Int) -> Int could be invoked with two arguments and vice versa.
+      if args.len() != params.len() then
+        type_add_error(env, "wrong number of arguments: expected " +
+          params.len().to_string() + ", found " + args.len().to_string(), expr.span)
+      end
       var pi = 0
-      while pi < args.len() do
-        if pi < params.len() then
-          let pt = params[pi]
-          unify(env, arg_types[pi], pt.ty, args[pi].span)
-          record_arg_effect(env, &args[pi], pt.convention)
-        else
-          record_arg_effect(env, &args[pi], AccessConvention::Let)
-        end
+      while pi < args.len() && pi < params.len() do
+        let pt = params[pi]
+        unify(env, arg_types[pi], pt.ty, args[pi].span)
+        record_arg_effect(env, &args[pi], pt.convention)
         pi = pi + 1
       end
       unify(env, ret_type, ret, expr.span)
@@ -4129,13 +4222,37 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       else
         record_arg_effect(env, &recv, AccessConvention::Let)
       end
-      var ai = 0
-      while ai < args.len() do
-        if ai + 1 < params.len() then
-          record_arg_effect(env, &args[ai], params[ai + 1].convention)
-        else
-          record_arg_effect(env, &args[ai], AccessConvention::Let)
+      # Enforce exact arity for method calls: the expected argument count is
+      # the declared params minus the receiver (self), or the full param list
+      # for self-less static-style methods. Accepting extra arguments (or
+      # silently tolerating missing ones) makes method signatures unsound —
+      # the same hole as plain ExprCall above.
+      match find_method_expected_args(env, &recv_type, method)
+      when Option::Some(expected) then
+        if args.len() != expected then
+          type_add_error(env, "wrong number of arguments: expected " +
+            expected.to_string() + ", found " + args.len().to_string(), expr.span)
         end
+      when Option::None then ()
+      end
+      # Shared extraction of resource elements is prohibited: methods like
+      # get/iter/into_iter return owned elements (or iterators over them)
+      # from a SHARED container, duplicating ownership of a linear resource
+      # while the container stays live. Resource elements must be extracted
+      # via inout/consuming access (pop/remove/take and inout iterators).
+      if params.len() >= 1 && params[0].convention != AccessConvention::Inout then
+        match container_element_type(env, &recv_type)
+        when Option::Some(elem_ty) then
+          if type_has_resource_kind(env, &elem_ty) &&
+             (method == "get" || method == "iter" || method == "into_iter") then
+            type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+          end
+        when Option::None then ()
+        end
+      end
+      var ai = 0
+      while ai < args.len() && ai + 1 < params.len() do
+        record_arg_effect(env, &args[ai], params[ai + 1].convention)
         ai = ai + 1
       end
     when Option::None then
@@ -4170,17 +4287,31 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::ExprIndex(recv, index) then
     let recv_type = check_expr(env, &recv)
     let index_type = check_expr(env, &index)
+    # Indexing is an inherently SHARED read that returns the element by
+    # value; extracting a resource element this way would create a second
+    # owned resource while the container remains live. Resource elements
+    # must be extracted through inout/consuming access (e.g. pop/remove/
+    # take).
     match recv_type
     when Type::Array(elem, _) then
+      if type_has_resource_kind(env, &elem) then
+        type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+      end
       unify(env, index_type, Type::Int, index.span)
       elem
     when Type::Slice(elem) then
+      if type_has_resource_kind(env, &elem) then
+        type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+      end
       unify(env, index_type, Type::Int, index.span)
       elem
     when Type::String then
       unify(env, index_type, Type::Int, index.span)
       Type::Char
     when Type::Map(k, v) then
+      if type_has_resource_kind(env, &v) then
+        type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+      end
       # Map[K, V] indexing (normalized form): key type K, result V
       unify(env, index_type, k, index.span)
       v
@@ -4192,6 +4323,9 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       match get_type_by_id(env, tid)
       when Option::Some(td) then
         if td.name == "Map" && args.len() >= 2 then
+          if type_has_resource_kind(env, &args[1]) then
+            type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+          end
           unify(env, index_type, args[0].clone(), index.span)
           args[1].clone()
         else
@@ -5356,7 +5490,8 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   env.typed_field_targets.clear()
   env.typed_local_bindings.clear()
   env.typed_ident_resolutions.clear()
-  env.typed_binding_resolutions.clear()
+  env.param_binding_resolutions.clear()
+  env.pattern_binding_resolutions.clear()
   env.typed_access_effects.clear()
   env.closure_captures.clear()
   env.resolutions = Option::Some(resolutions.clone())
@@ -5377,7 +5512,8 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     closure_captures: env.closure_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
-    binding_resolutions: env.typed_binding_resolutions.clone(),
+    param_binding_resolutions: env.param_binding_resolutions.clone(),
+    pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
     type_kinds: kinds
   }
   env.resolutions = Option::None

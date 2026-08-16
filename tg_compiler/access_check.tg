@@ -460,20 +460,20 @@ def check_call_site(receiver: Option[&Expr], receiver_effect: AccessEffect, arg_
   mut spans = Vec::new()
   match receiver
   when Option::Some(r) then
-    record_access(typed, r, receiver_effect, &mut actives, &mut spans)
+    record_access(typed, r, receiver_effect, &mut actives, &mut spans, errors)
   when Option::None then ()
   end
   mut i = 0
   while i < args.len() do
     let eff = if i < arg_effects.len() then arg_effects[i] else AccessEffect::Read end
-    record_access(typed, &args[i], eff, &mut actives, &mut spans)
+    record_access(typed, &args[i], eff, &mut actives, &mut spans, errors)
     i = i + 1
   end
   check_overlaps(&actives, &spans, errors)
 end
 
-def record_access(typed: &TypedProgram, expr: &Expr, effect: AccessEffect, actives: &mut Vec[ActiveAccess], spans: &mut Vec[Span]) -> Unit
-  match derive_access_path(typed, expr)
+def record_access(typed: &TypedProgram, expr: &Expr, effect: AccessEffect, actives: &mut Vec[ActiveAccess], spans: &mut Vec[Span], errors: &mut Vec[AccessError]) -> Unit
+  match derive_access_path(typed, expr, errors)
   when Option::Some(path) then
     actives.push(ActiveAccess { path: path, effect: effect })
     spans.push(expr.span)
@@ -506,8 +506,12 @@ def accesses_conflict(a: &ActiveAccess, b: &ActiveAccess) -> Bool
 end
 
 def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
-  let same_root = if a.root == 0 || b.root == 0 then
-    a.root == 0 && b.root == 0 && a.root_name == b.root_name
+  # Roots are now always semantic: real local ids (>= 0) or the negative
+  # `self` root (-1). There is no "unresolved" sentinel (missing typed
+  # resolutions are internal errors reported during path derivation), so
+  # roots compare structurally, never by name.
+  let same_root = if a.root < 0 || b.root < 0 then
+    a.root == b.root && a.root_name == b.root_name
   else
     a.root == b.root
   end
@@ -522,14 +526,10 @@ def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
     when AccessProjection::Field(fa, na) then
       match pb
       when AccessProjection::Field(fb, nb) then
-        if fa.owner.id != 0 && fb.owner.id != 0 then
-          if fa.owner.id != fb.owner.id || fa.index != fb.index then
-            return false
-          end
-        else
-          if na != nb then
-            return false
-          end
+        # Field identities are typed (FieldId), never synthesized sentinels;
+        # compare owner type id + index.
+        if fa.owner.id != fb.owner.id || fa.index != fb.index then
+          return false
         end
       when AccessProjection::Index then
         return true
@@ -593,36 +593,53 @@ def method_receiver_effect(typed: &TypedProgram, receiver: &Expr) -> AccessEffec
   end
 end
 
-def derive_access_path(typed: &TypedProgram, expr: &Expr) -> Option[AccessPath]
+def derive_access_path(typed: &TypedProgram, expr: &Expr, errors: &mut Vec[AccessError]) -> Option[AccessPath]
   match expr.kind
   when ExprKind::ExprIdent(name) then
-    let lid = match typed.ident_resolutions.get(expr.node_id)
-    when Option::Some(l) then l
-    when Option::None then 0
+    # The typed pipeline must have resolved every identifier; a missing
+    # resolution here is a compiler-internal error, NOT a reason to fall
+    # back to a sentinel root (local id 0 is a real, valid local id and
+    # using it as "unresolved" corrupts overlap analysis).
+    match typed.ident_resolutions.get(expr.node_id)
+    when Option::Some(l) then
+      Option::Some(AccessPath { root: l, root_name: name.clone(), projections: Vec::new() })
+    when Option::None then
+      errors.push(AccessError {
+        message: "internal error: missing typed resolution for identifier `" + name + "`",
+        span: expr.span
+      })
+      Option::None
     end
-    Option::Some(AccessPath { root: lid, root_name: name.clone(), projections: Vec::new() })
   when ExprKind::ExprSelfRef then
-    Option::Some(AccessPath { root: 0, root_name: "self", projections: Vec::new() })
+    # Use a NEGATIVE root for `self`: local ids are always >= 0, so this
+    # can never collide with a real local id (previously root 0 was used,
+    # which is also the first local id and made overlap analysis ambiguous).
+    Option::Some(AccessPath { root: -1, root_name: "self", projections: Vec::new() })
   when ExprKind::ExprFieldAccess(base, field) then
-    match derive_access_path(typed, &base)
+    match derive_access_path(typed, &base, errors)
     when Option::Some(mut p) then
-      let fid = match typed.field_targets.get(expr.node_id)
-      when Option::Some(f) then f
-      when Option::None then FieldId { owner: TypeId { id: 0 }, index: 0 }
+      match typed.field_targets.get(expr.node_id)
+      when Option::Some(f) then
+        p.projections.push(AccessProjection::Field(f, field.clone()))
+        Option::Some(p)
+      when Option::None then
+        errors.push(AccessError {
+          message: "internal error: missing typed field target for field `" + field + "`",
+          span: expr.span
+        })
+        Option::None
       end
-      p.projections.push(AccessProjection::Field(fid, field.clone()))
-      Option::Some(p)
     when Option::None then Option::None
     end
   when ExprKind::ExprIndex(base, _) then
-    match derive_access_path(typed, &base)
+    match derive_access_path(typed, &base, errors)
     when Option::Some(mut p) then
       p.projections.push(AccessProjection::Index)
       Option::Some(p)
     when Option::None then Option::None
     end
-  when ExprKind::ExprRawDeref(inner) then derive_access_path(typed, &inner)
-  when ExprKind::ExprAccess(inner) then derive_access_path(typed, &inner)
+  when ExprKind::ExprRawDeref(inner) then derive_access_path(typed, &inner, errors)
+  when ExprKind::ExprAccess(inner) then derive_access_path(typed, &inner, errors)
   when _ then Option::None
   end
 end

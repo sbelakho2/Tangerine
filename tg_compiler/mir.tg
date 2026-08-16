@@ -149,12 +149,16 @@ def resolve_iter_expr_type(b: &MirBuilder, expr: &Expr) -> Type
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
     when ExprKind::ExprFieldAccess(ref base_box, ref field_name) then
-    # The typed program's field identity (index) is authoritative; fall back
-    # to the struct definition name lookup only when unrecorded.
+    # The typed program's field identity (index) is authoritative. Re-resolving
+    # the field by source name here would silently re-derive semantics after
+    # typing, which can drift from what the checker accepted — a missing typed
+    # FieldId is a compiler-internal error.
     let base_ty = resolve_iter_expr_type(b, base_box)
     match b.field_targets.get(expr.node_id)
     when Option::Some(fid) then mir_infer_field_type_at_index(b, &base_ty, fid.index)
-    when Option::None then resolve_field_type_from_struct(b, &base_ty, field_name.clone())
+    when Option::None then
+      b.errors.push("internal error: missing typed field target for field '" + field_name.clone() + "' during MIR lowering")
+      Type::Unit
     end
     when _ then Type::Unit
     end
@@ -186,37 +190,6 @@ def resolve_iter_expr_type(b: &MirBuilder, expr: &Expr) -> Type
     end
   else
     Type::Unit
-  end
-end
-
-# Given a struct type and a field name, look up the field's type.
-def resolve_field_type_from_struct(b: &MirBuilder, ty: &Type, field_name: String) -> Type
-  match ty
-  when Type::Named(type_id, _args) then
-    var td_idx = 0
-    while td_idx < b.type_defs.len() do
-      let td = b.type_defs[td_idx]
-      if td.id.id == type_id.id then
-        match td.kind
-        when MirTypeDefKind::Struct(ref fields) then
-          var field_idx = 0
-          while field_idx < fields.len() do
-            let field = fields[field_idx]
-            if field.name == field_name then
-              return field.ty.clone()
-            end
-            field_idx = field_idx + 1
-          end
-          return Type::Unit
-        when _ then return Type::Unit
-        end
-      end
-      td_idx = td_idx + 1
-    end
-    Type::Unit
-  when Type::RefInternal(inner, _) then
-    resolve_field_type_from_struct(b, &inner, field_name)
-  when _ then Type::Unit
   end
 end
 
@@ -957,6 +930,11 @@ struct MirBuilder
   type_defs: Vec[MirTypeDef]
   impl_type_map: Map[String, String]
   fn_ret_types: Map[String, Type]
+  # deinit_targets maps a type id to its deinit callable. Values are still
+  # mangled names for ABI emission; TODO: move to a typed DefId/CallableId
+  # so deinit identity is semantic rather than name-derived (a missing
+  # target for a resource type is an internal error, see
+  # local_deinit_fn_name).
   deinit_targets: Map[Int, String]
   field_targets: Map[Int, FieldId]
   expr_types: Map[Int, Type]
@@ -1149,7 +1127,7 @@ def builder_local_is_resource(b: &MirBuilder, local_id: &LocalId) -> Bool
   end
 end
 
-def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
+def local_deinit_fn_name(b: &mut MirBuilder, local_id: &LocalId) -> String
   match builder_local_typed_ty(b, local_id)
   when Option::Some(ty) then
     match ty
@@ -1161,7 +1139,14 @@ def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
           when Type::Named(btid, _) then
             match b.deinit_targets.get(btid.id)
             when Option::Some(n) then n.clone()
-            when Option::None then ""
+            when Option::None then
+              # A resource type MUST have a registered deinit finalizer;
+              # silently returning "" would drop the finalizer and let the
+              # resource escape without cleanup. (TODO: replace the
+              # mangled-string identity in deinit_targets with a typed
+              # DefId/CallableId.)
+              b.errors.push("internal error: resource type has no registered deinit target (type id " + btid.id.to_string() + ")")
+              ""
             end
           when _ then ""
           end
@@ -1176,7 +1161,7 @@ def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
   end
 end
 
-def deinit_candidates(b: &MirBuilder, consumed: &Set[Int]) -> Vec[Place]
+def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   var places: Vec[Place] = Vec::new()
   match b.current_fn
   when Option::Some(f) then
@@ -3221,32 +3206,6 @@ def infer_builtin_enum_aggregate_type(b: &MirBuilder, type_id: &TypeId, ops: &Ve
   Option::None
 end
 
-def mir_infer_field_access_type(b: &MirBuilder, ty: &Type, field_name: &String) -> Type
-  match ty
-  when Type::RefInternal(inner, _) then mir_infer_field_access_type(b, inner, field_name)
-  when Type::Ptr(inner) then mir_infer_field_access_type(b, inner, field_name)
-  when Type::PtrMut(inner) then mir_infer_field_access_type(b, inner, field_name)
-  when Type::Box(inner) then mir_infer_field_access_type(b, inner, field_name)
-  when Type::Rc(inner) then mir_infer_field_access_type(b, inner, field_name)
-  when Type::Named(tid, _) then
-    for td in b.type_defs do
-      if td.id.id == tid.id then
-        match td.kind
-        when MirTypeDefKind::Struct(fields) then
-          for field in fields do
-            if field.name == field_name then
-              return field.ty.clone()
-            end
-          end
-        when _ then ()
-        end
-      end
-    end
-    Type::Unit
-  when _ then Type::Unit
-  end
-end
-
 def mir_infer_field_type_at_index(b: &MirBuilder, ty: &Type, index: Int) -> Type
   match ty
   when Type::RefInternal(inner, _) then mir_infer_field_type_at_index(b, inner, index)
@@ -3398,9 +3357,14 @@ def mir_infer_expr_type(b: &MirBuilder, expr: &Expr) -> Type
     match expr.kind
     when ExprKind::ExprFieldAccess(recv, field_name) then
       let recv_ty = mir_infer_expr_type(b, &recv)
+      # Typed FieldId is authoritative; falling back to name-based field
+      # inference after typing would re-derive semantics and can silently
+      # diverge from the checker — a missing target is an internal error.
       match b.field_targets.get(expr.node_id)
       when Option::Some(fid) then return mir_infer_field_type_at_index(b, &recv_ty, fid.index)
-      when Option::None then return mir_infer_field_access_type(b, &recv_ty, &field_name)
+      when Option::None then
+        b.errors.push("internal error: missing typed field target for field '" + field_name.clone() + "' during MIR lowering")
+        return Type::Unit
       end
     when _ then ()
     end

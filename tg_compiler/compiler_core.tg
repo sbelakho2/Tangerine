@@ -692,10 +692,19 @@ pub def read_file_text_direct(path: String) -> String
   read_file_to_string_native(path)
 end
 
-pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
+# Canonical AST preparation: macro expansion + node-id assignment.
+# analyze_parsed uses this, and the bootstrap "skip semantic checks" path
+# uses it too, so preparation is defined exactly ONCE and every pipeline
+# (ordinary compile, `tg check`, bootstrap compile) flows through the same
+# preparation + analyze_parsed + lowering shape.
+pub def prepare_parsed(program: &mut Program) -> Unit
   let expanded = expand_macros(program.clone())
   *program = expanded
   assign_node_ids(program)
+end
+
+pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
+  prepare_parsed(program)
   match resolve_names(program)
   when Result::Ok(res) then
     if opts.strict_resolution then
@@ -829,7 +838,8 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
   if opts.verbose then
     println("[diag] before merge_imported_deps")
   end
-  let ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  # `var` so the canonical semantic pass below can take &mut ast.
+  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
   when Result::Ok(a) then a
   when Result::Err(e) then
     return Result::Err(e)
@@ -840,6 +850,10 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
 
   match opts.dump_phase
   when Option::Some("resolved-ast") then
+    # DEBUG-ONLY dump path: expands macros and assigns node ids locally for
+    # human inspection. It does NOT feed the real pipeline — the canonical
+    # semantic pass (analyze_parsed) performs its own expansion/id assignment
+    # on the shared `ast` below.
     var dump_ast = expand_macros(ast.clone())
     assign_node_ids(&mut dump_ast)
     println("Resolved AST:")
@@ -851,13 +865,13 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
   if opts.verbose then
   end
   
-  # Phase 2.5: Macro expansion
-  if opts.verbose then
-    println("  Expanding macros...")
-  end
-  var ast = expand_macros(ast)
-  assign_node_ids(&mut ast)
-
+  # Phase 2.5: Macro expansion and node-id assignment are NOT performed here.
+  # They are part of the single canonical semantic API analyze_parsed (called
+  # below via analyze_program). Performing them again beforehand expanded
+  # macros TWICE and assigned node ids twice — the second pass renumbers
+  # node ids, corrupting any identity derived from the first pass, and the
+  # divergent pre-pass made positive and negative canaries flow through
+  # different semantic pipelines.
   if opts.verbose then
   end
   
@@ -1167,117 +1181,59 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     let import_paths = extract_import_paths(&ast_with_prelude)
   end
 
-  let ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
+  # `var` so the canonical semantic pass below can take &mut ast.
+  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: is_bootstrap_driver)
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)
     return 1
   end
 
-  if opts.verbose then
-    println("  Expanding macros...")
-  end
-  var ast = expand_macros(ast)
-  assign_node_ids(&mut ast)
-
   let skip_bootstrap_semantic_checks = should_skip_bootstrap_semantic_checks(opts, path.clone())
   if opts.verbose then
     println("  Type checking...")
   end
+  # THE ONE canonical semantic path: analyze_parsed (via analyze_program)
+  # expands macros, assigns node ids, resolves names, type-checks,
+  # access-checks and resource-checks. compile_startup_entry must not contain
+  # any semantic stage of its own — a second hand-rolled pipeline here
+  # duplicated expansion and node-id assignment and could drift from what
+  # analyze_parsed does, so positive and negative canaries were checked
+  # through different routes.
   var typed_program: Option[TypedProgram] = Option::None
   if skip_bootstrap_semantic_checks then
     if opts.verbose then
       println("  Skipping semantic checks during compiler bootstrap")
     end
+    # The bootstrap path still needs a prepared AST (macros expanded, node
+    # ids assigned) so the shared MIR lowering below can run; preparation is
+    # the same canonical helper analyze_parsed uses.
+    prepare_parsed(&mut ast)
   else
-    let type_errors = match resolve_names(&ast)
-    when Result::Ok(res) then
-      var env = type_env_new()
-      if opts.strict_resolution then
-        env.strict_resolution = true
-      end
-      let type_result = type_check_typed(&mut env, &ast, &res)
-      typed_program = Option::Some(type_result.program)
-      type_result.errors
-    when Result::Err(res_errors) then
-      for re in res_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: re.message,
-          span: Option::Some(re.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::Some("E0405")
-        })
-      end
-      println("Type check failed")
-      return 1
+    var env = type_env_new()
+    if opts.strict_resolution then
+      env.strict_resolution = true
     end
-    for err in type_errors do
+    match analyze_program(&mut env, &mut ast, opts)
+    when Result::Ok(tp) then
+      typed_program = Option::Some(tp)
+    when Result::Err(e) then
       emit_diagnostic(&mut emitter, Diagnostic {
         level: DiagLevel::Error,
-        message: err.message,
-        span: Option::Some(err.span),
+        message: e,
+        span: Option::None,
         notes: Vec::new(),
         suggestions: Vec::new(),
-        code: Option::None
+        code: Option::Some("E0405")
       })
+      println("Type check failed")
+      return 1
     end
   end
 
   if !skip_bootstrap_semantic_checks && has_errors(&emitter) then
     println("Type check failed")
     return 1
-  end
-
-  if opts.verbose then
-    println("  Access checking...")
-  end
-  if !skip_bootstrap_semantic_checks then
-    match typed_program
-    when Option::Some(tp) then
-      let access_errors = access_check(&ast, &tp)
-      for err in access_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: err.message,
-          span: Option::Some(err.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::None
-        })
-      end
-      if has_errors(&emitter) then
-        println("Access check failed")
-        return 1
-      end
-    when Option::None then ()
-    end
-  end
-
-  if opts.verbose then
-    println("  Resource checking...")
-  end
-  if !skip_bootstrap_semantic_checks then
-    match typed_program
-    when Option::Some(tp) then
-      let resource_errors = resource_check(&ast, &tp)
-      for err in resource_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: err.message,
-          span: Option::Some(err.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::None
-        })
-      end
-      if has_errors(&emitter) then
-        println("Resource check failed")
-        return 1
-      end
-    when Option::None then ()
-    end
   end
 
   if opts.verbose then
@@ -2555,11 +2511,16 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   end
   let merged_ast = Program { items: all_items, span: all_items[0].span }
 
-  # ── pipeline from merge_imported_deps through codegen ─────────
+  # ── canonical pipeline: merge -> analyze_parsed -> lower -> emit ────────
+  # Semantic stages (macro expansion, node ids, resolution, type/access/
+  # resource checks) are performed exclusively by analyze_parsed (via
+  # analyze_program) so multi-file compilation goes through the SAME
+  # canonical path as every other entry point.
   if opts.verbose then
     println("  Merging imported dependencies...")
   end
-  let ast = match merge_imported_deps(merged_ast, include_compiler_lib: is_bootstrap_driver)
+  # `var` so the canonical semantic pass below can take &mut ast.
+  var ast = match merge_imported_deps(merged_ast, include_compiler_lib: is_bootstrap_driver)
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)
@@ -2567,104 +2528,36 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   end
 
   if opts.verbose then
-    println("  Expanding macros...")
-  end
-  var ast = expand_macros(ast)
-  assign_node_ids(&mut ast)
-
-  if opts.verbose then
     println("  Type checking...")
   end
   var typed_program: Option[TypedProgram] = Option::None
   if !skip_bootstrap_semantic_checks then
-    let type_errors = match resolve_names(&ast)
-    when Result::Ok(res) then
-      var env = type_env_new()
-      if opts.strict_resolution then
-        env.strict_resolution = true
-      end
-      let type_result = type_check_typed(&mut env, &ast, &res)
-      typed_program = Option::Some(type_result.program)
-      type_result.errors
-    when Result::Err(res_errors) then
-      for re in res_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: re.message,
-          span: Option::Some(re.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::Some("E0405")
-        })
-      end
+    var env = type_env_new()
+    if opts.strict_resolution then
+      env.strict_resolution = true
+    end
+    match analyze_program(&mut env, &mut ast, opts)
+    when Result::Ok(tp) then
+      typed_program = Option::Some(tp)
+    when Result::Err(e) then
+      emit_diagnostic(&mut emitter, Diagnostic {
+        level: DiagLevel::Error,
+        message: e,
+        span: Option::None,
+        notes: Vec::new(),
+        suggestions: Vec::new(),
+        code: Option::Some("E0405")
+      })
       println("Type check failed")
       return 1
     end
-    for err in type_errors do
-      emit_diagnostic(&mut emitter, Diagnostic {
-        level: DiagLevel::Error,
-        message: err.message,
-        span: Option::Some(err.span),
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::None
-      })
-    end
+  else
+    prepare_parsed(&mut ast)
   end
 
   if !skip_bootstrap_semantic_checks && has_errors(&emitter) then
     println("Type check failed")
     return 1
-  end
-
-  if opts.verbose then
-    println("  Access checking...")
-  end
-  if !skip_bootstrap_semantic_checks then
-    match typed_program
-    when Option::Some(tp) then
-      let access_errors = access_check(&ast, &tp)
-      for err in access_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: err.message,
-          span: Option::Some(err.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::None
-        })
-      end
-      if has_errors(&emitter) then
-        println("Access check failed")
-        return 1
-      end
-    when Option::None then ()
-    end
-  end
-
-  if opts.verbose then
-    println("  Resource checking...")
-  end
-  if !skip_bootstrap_semantic_checks then
-    match typed_program
-    when Option::Some(tp) then
-      let resource_errors = resource_check(&ast, &tp)
-      for err in resource_errors do
-        emit_diagnostic(&mut emitter, Diagnostic {
-          level: DiagLevel::Error,
-          message: err.message,
-          span: Option::Some(err.span),
-          notes: Vec::new(),
-          suggestions: Vec::new(),
-          code: Option::None
-        })
-      end
-      if has_errors(&emitter) then
-        println("Resource check failed")
-        return 1
-      end
-    when Option::None then ()
-    end
   end
 
   if opts.verbose then
