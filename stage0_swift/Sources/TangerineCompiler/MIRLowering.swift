@@ -447,9 +447,12 @@ public final class MIRLowering {
         }
 
         // Record whether self is by-value (no &/&mut on the type).
-        // Methods with &self/&mut self are NOT by-value; default to borrowing.
+        // Methods with &self/&mut self (or an inout receiver) are NOT by-value;
+        // default to borrowing.
         if let firstParam = fn.sig.params.first, firstParam.name == "self" {
-            if case .ref(_, _, _) = firstParam.type {
+            if firstParam.convention == .inoutAccess
+                || firstParam.modifier == .ref
+                || firstParam.modifier == .refMut {
                 // &self or &mut self → NOT by-value
             } else {
                 methodSelfByValue.insert(sig.name)
@@ -473,7 +476,16 @@ public final class MIRLowering {
         // Create param locals
         var paramLocals: [MirLocal] = []
         for p in fn.sig.params {
-            let id = freshLocal(name: p.name, type: lowerTypeExpr(p.type), mutable: p.isMutable)
+            let base = lowerTypeExpr(p.type)
+            let ty: MirType
+            if p.convention == .inoutAccess {
+                ty = .ref(base, mutable: true)
+            } else if p.modifier == .ref {
+                ty = .ref(base, mutable: false)
+            } else {
+                ty = base
+            }
+            let id = freshLocal(name: p.name, type: ty, mutable: p.isMutable)
             defineInScope(p.name, id)
             paramLocals.append(locals[id])
         }

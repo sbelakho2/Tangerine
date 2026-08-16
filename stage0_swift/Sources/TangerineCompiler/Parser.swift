@@ -832,8 +832,6 @@ public final class Parser {
 
             // Access convention (new syntax) and legacy modifiers, normalized immediately.
             var convention = AccessConvention.letAccess
-            var legacyRef = false
-            var legacyRefMut = false
             var modifier: ParamModifier? = nil
             if at(.kwInout), peekAhead(1) != .colon {
                 advance()
@@ -853,12 +851,9 @@ public final class Parser {
                 if at(.kwMut) {
                     advance()
                     convention = .inoutAccess
-                    legacyRef = true
-                    legacyRefMut = true
                     modifier = .refMut
                 } else {
                     convention = .letAccess
-                    legacyRef = true
                     modifier = .ref
                 }
             } else if case .ident("move") = peekKind(), peekAhead(1) != .colon {
@@ -878,17 +873,21 @@ public final class Parser {
             var type: TypeExpr
             if eat(.colon) {
                 type = parseTypeExpr()
+                switch type {
+                case .ref(let inner, let mutable, _):
+                    if modifier == nil {
+                        modifier = mutable ? .refMut : .ref
+                        convention = mutable ? .inoutAccess : .letAccess
+                    }
+                    type = inner
+                default:
+                    break
+                }
             } else if isSelf {
                 // bare self (implicit Self type)
                 type = .selfType(start.merged(with: currentSpan))
             } else {
                 type = .inferred(currentSpan)
-            }
-
-            // &self / &mut self keep the legacy ref type: MIR lowering relies on it
-            // to distinguish by-value self from borrowed self.
-            if isSelf && legacyRef {
-                type = .ref(type, mutable: legacyRefMut, type.span)
             }
 
             var defaultVal: Expr? = nil
