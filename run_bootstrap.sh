@@ -55,8 +55,8 @@ RUN_DETERMINISM=1
 RUN_NATIVE_TESTS=1
 TARGET_TRIPLE="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
 
-# Compiler driver source used as the bootstrap unit.
-DRIVER_SRC="tg_compiler/driver.tg"
+# Compiler bootstrap entry source used as the bootstrap unit.
+DRIVER_SRC="tg_compiler/bootstrap_main.tg"
 
 # ———————————————————————————————————————————————————————————————
 # Argument parsing

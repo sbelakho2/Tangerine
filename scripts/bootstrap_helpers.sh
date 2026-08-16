@@ -70,61 +70,18 @@ bh_dump_hash() {
   "$compiler" compile "$source_file" "$@" 2>/dev/null | bh_sha256_cmd
 }
 
-# The eight compiler pipeline phases fingerprinted per stage.
-# Each maps to a deterministic compiler emission or artifact:
-#   tokens         : sha256 of the token stream dump        (--dump-tokens)
-#   ast            : sha256 of the AST dump                 (--dump-ast)
-#   resolved-ast   : sha256 of the post-merge/macro AST     (--dump-resolved-ast)
-#   mir-lowered    : sha256 of the post-lowering MIR        (--dump-mir-lowered -O0)
-#   mir-mono       : sha256 of the post-monomorphization MIR (--dump-mir-mono -O0)
-#   mir-opt        : sha256 of the post-optimization MIR    (--dump-mir-opt -O1)
-#   object-metadata: sha256 of a freshly emitted Mach-O object file (-c)
+# The pipeline phases fingerprinted per stage. The bootstrap entry
+# (bootstrap_main.tg) supports only compile/check/--version/--target/-o/-O*/
+# --strict-resolution, so phase dumps (--dump-tokens, --dump-ast,
+# --dump-resolved-ast, --dump-mir-*, -c) are not fingerprintable; the stage
+# link-image hash is the deterministic fixed-point fingerprint.
 #   link-image     : sha256 of the final linked stage binary
-BOOTSTRAP_PHASES="tokens ast resolved-ast mir-lowered mir-mono mir-opt object-metadata link-image"
+BOOTSTRAP_PHASES="link-image"
 
-# Compute the eight phase fingerprints for a stage binary.
+# Compute the phase fingerprints for a stage binary.
 # Usage: bh_fingerprints <stage> <compiler> <source> <outdir>
 bh_fingerprints() {
   local stage="$1" compiler="$2" source_file="$3" outdir="$4"
-  local obj_fp_dir="$outdir/.fingerprints"
-  mkdir -p "$obj_fp_dir"
-
-  local tokens_hash ast_hash resolved_hash mir_lowered_hash mir_mono_hash
-  local mir_opt_hash obj_hash link_hash
-
-  bh_log "fingerprinting $stage: tokens"
-  tokens_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-tokens)"
-  bh_phase_line "$stage" tokens "$tokens_hash"
-
-  bh_log "fingerprinting $stage: ast"
-  ast_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-ast)"
-  bh_phase_line "$stage" ast "$ast_hash"
-
-  bh_log "fingerprinting $stage: resolved-ast"
-  resolved_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-resolved-ast)"
-  bh_phase_line "$stage" resolved-ast "$resolved_hash"
-
-  bh_log "fingerprinting $stage: mir-lowered"
-  mir_lowered_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-mir-lowered -O0)"
-  bh_phase_line "$stage" mir-lowered "$mir_lowered_hash"
-
-  bh_log "fingerprinting $stage: mir-mono"
-  mir_mono_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-mir-mono -O0)"
-  bh_phase_line "$stage" mir-mono "$mir_mono_hash"
-
-  bh_log "fingerprinting $stage: mir-opt"
-  mir_opt_hash="$(bh_dump_hash "$compiler" "$source_file" --dump-mir-opt -O1)"
-  bh_phase_line "$stage" mir-opt "$mir_opt_hash"
-
-  local obj_file="$obj_fp_dir/${stage}.o"
-  bh_log "fingerprinting $stage: object-metadata"
-  if "$compiler" compile --strict-resolution "$source_file" -o "$obj_file" -c --target aarch64-apple-darwin >/dev/null 2>&1; then
-    obj_hash="$(bh_sha256_file "$obj_file")"
-  else
-    bh_err "object emission failed for $stage; an object-fingerprint failure is fatal during bootstrap tracing"
-    return 1
-  fi
-  bh_phase_line "$stage" object-metadata "$obj_hash"
 
   bh_log "fingerprinting $stage: link-image"
   link_hash="$(bh_sha256_file "$outdir/$stage" 2>/dev/null || printf 'MISSING')"
@@ -159,7 +116,7 @@ bh_is_macho64() {
 #   6. when trace mode is on, emits the eight per-phase fingerprints
 # Returns nonzero (and prints an error) on any failed check.
 validate_stage() {
-  local stage="$1" binary="$2" source_file="${3:-tg_compiler/driver.tg}" outdir="${4:-build}"
+  local stage="$1" binary="$2" source_file="${3:-tg_compiler/bootstrap_main.tg}" outdir="${4:-build}"
 
   if [ ! -f "$binary" ]; then
     bh_err "$stage missing: $binary"
@@ -342,8 +299,9 @@ EOF
     return_code=0
   fi
 
-  # Strict name-resolution fixtures (--strict): unknown local, unknown type,
-  # unknown enum variant, nonexistent method, unknown field.
+  # Strict name-resolution fixtures (check always runs strict resolution):
+  # unknown local, unknown type, unknown enum variant, nonexistent method,
+  # unknown field.
   cat > "$scratch/ladder_unknown_local.tg" <<'EOF'
 def main() -> Int
   let x = compielr_options
@@ -387,7 +345,7 @@ EOF
   local fixture
   for fixture in ladder_unknown_local ladder_unknown_type ladder_unknown_variant \
                  ladder_unknown_method ladder_unknown_field; do
-    if "$compiler" check --strict "$scratch/$fixture.tg" >/dev/null 2>&1; then
+    if "$compiler" check "$scratch/$fixture.tg" >/dev/null 2>&1; then
       strict_failures=$((strict_failures + 1))
       bh_err "ladder: $fixture accepted (expected strict rejection)"
     fi
@@ -570,13 +528,13 @@ check_two_clean_dirs() {
   local out_a="$outdir/${stage}_a" out_b="$outdir/${stage}_b"
 
   bh_log "$stage determinism: building from clean tree A (root=$dir_a)"
-  if ! ( cd "$dir_a" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$out_a" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_a" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_a" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build A failed"
     return 1
   fi
 
   bh_log "$stage determinism: building from clean tree B (root=$dir_b)"
-  if ! ( cd "$dir_b" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$out_b" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_b" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_b" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build B failed"
     return 1
   fi
