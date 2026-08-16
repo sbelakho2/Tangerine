@@ -437,7 +437,45 @@ run_critical_canaries() {
     tests/canary/test_canary_objectfile_construction.tg \
     tests/canary/test_canary_many_args.tg \
     tests/canary/test_canary_callee_saved_survival.tg \
+    tests/canary/canary_access_read.tg \
+    tests/canary/canary_access_inout.tg \
+    tests/canary/canary_access_sink.tg \
+    tests/canary/canary_access_set.tg \
+    tests/canary/canary_resource.tg \
+    tests/canary/canary_capability.tg \
+    tests/canary/canary_closure_async.tg \
+    tests/canary/canary_ffi.tg \
     tests/arm64/test_arm64_abi.tg
+}
+
+# Semantic canary negatives: every file in tests/canary_neg/ is a negative
+# case of the access/resource/capability/async canary matrix and MUST be
+# rejected by `check` with a nonzero exit. A file that is accepted (exit 0)
+# is a checker regression or a broken canary and fails the harness.
+# Usage: run_semantic_canary_negatives <compiler>
+run_semantic_canary_negatives() {
+  local compiler="$1"
+  local dir="tests/canary_neg"
+  local failures=0 total=0
+  local file
+  for file in "$dir"/*.tg; do
+    [ -e "$file" ] || continue
+    total=$((total + 1))
+    local name
+    name="$(basename "$file" .tg)"
+    bh_log "semantic canary negative: $file"
+    if "$compiler" check "$file" >/dev/null 2>&1; then
+      bh_err "semantic canary negative $name ACCEPTED (expected rejection)"
+      failures=$((failures + 1))
+    fi
+  done
+  bh_log "semantic canary negatives: $((total - failures))/$total rejected as expected"
+  if [ "$failures" -ne 0 ]; then
+    bh_err "semantic canary negatives FAILED: $failures accepted"
+    return 1
+  fi
+  bh_log "semantic canary negatives OK"
+  return 0
 }
 
 # Compile and execute every native canary and ARM64 test with the given

@@ -176,6 +176,11 @@ if [ "$RUN_NATIVE_TESTS" = "1" ]; then
     bh_err "stage1 critical canaries failed"
     exit 1
   fi
+  bh_log "== Semantic canary negatives (via stage1) =="
+  if ! run_semantic_canary_negatives "$STAGE1"; then
+    bh_err "stage1 semantic canary negatives failed"
+    exit 1
+  fi
 fi
 
 # ———————————————————————————————————————————————————————————————
@@ -198,6 +203,11 @@ if [ "$RUN_NATIVE_TESTS" = "1" ]; then
   bh_log "== Critical canaries (via stage2) =="
   if ! run_critical_canaries "$STAGE2" "$BUILD_DIR/.native_stage2"; then
     bh_err "stage2 critical canaries failed"
+    exit 1
+  fi
+  bh_log "== Semantic canary negatives (via stage2) =="
+  if ! run_semantic_canary_negatives "$STAGE2"; then
+    bh_err "stage2 semantic canary negatives failed"
     exit 1
   fi
 fi
