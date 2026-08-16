@@ -945,9 +945,9 @@ struct MirBuilder
   fn_ret_types: Map[String, Type]
   # deinit_targets maps a type id to its deinit callable. Values are still
   # mangled names for ABI emission; TODO: move to a typed DefId/CallableId
-  # so deinit identity is semantic rather than name-derived (a missing
-  # target for a resource type is an internal error, see
-  # local_deinit_fn_name).
+  # so deinit identity is semantic rather than name-derived. Absence of a
+  # deinit means DeinitPlan::Trivial (resources may be trivially
+  # deinitialized — this is the language rule, not an error).
   deinit_targets: Map[Int, String]
   # Authoritative per-function finalize sets from the resource checker
   # (fn owner key -> local ids). MIR uses this as the PRIMARY cleanup source;
@@ -959,10 +959,6 @@ struct MirBuilder
   deinit_plans: Map[Int, DeinitPlan]
   # type id -> type name (needed to resolve Named types when walking plans).
   typed_type_names: Map[Int, String]
-  # Function name -> local ids of sink parameters (the callee owns them and
-  # must finalize them if still live at exit; let/inout params are caller
-  # owned and must never be finalized by the callee).
-  sink_params: Map[String, Vec[Int]]
   # The owner key (fn_owner_key of the item's DefId, or the positional
   # fallback) of the function currently being lowered — the SAME key the
   # resource checker used for finalize_plan and param bindings.
@@ -977,9 +973,19 @@ struct MirBuilder
   # fallback).
   ident_resolutions: Map[Int, Int]
   # Typed closure captures (closure expr node id -> captured local id ->
-  # effect): the SEMANTIC capture record. MIR validates its name-based
-  # free-variable scan against this (closure env layout ordering is ABI-level).
+  # effect): the SEMANTIC capture record — the ONLY capture source.
   closure_captures: Map[Int, Map[Int, AccessEffect]]
+  # Semantic local id (type-checker global counter) -> MIR local id. Semantic
+  # locals are allocated globally during type checking; MIR locals are
+  # per-function (0 = return place). Finalize-plan ids are SEMANTIC ids and
+  # must be mapped through this table before emission — using them directly
+  # as MIR ids would finalize the wrong (or nonexistent) local.
+  semantic_to_mir: Map[Int, Int]
+  # Typed pattern bindings (pat node id -> semantic local id) and parameter
+  # bindings (owner key -> semantic ids in order): the semantic identities of
+  # the locals MIR creates, used to populate semantic_to_mir.
+  pattern_binding_resolutions: Map[Int, Int]
+  param_binding_resolutions: Map[String, Vec[Int]]
   field_targets: Map[Int, FieldId]
   expr_types: Map[Int, Type]
   static_names: Set[String]
@@ -997,6 +1003,13 @@ struct PendingClosure
   capture_types: Vec[Type]
   body: Expr
   ret_type: Type
+  # The SEMANTIC local ids of the captures, in the same order as `captures`
+  # (from the typed capture record) — used to map semantic capture ids to the
+  # closure function's MIR capture params.
+  capture_ids: Vec[Int]
+  # The closure expression's node id — the key of its typed capture record
+  # AND its authoritative finalize plan entry ("closure::<node_id>").
+  node_id: Int
 end
 
 def builder_new() -> MirBuilder
@@ -1024,12 +1037,14 @@ def builder_new() -> MirBuilder
     finalize_plan: Map::new(),
     deinit_plans: Map::new(),
     typed_type_names: Map::new(),
-    sink_params: Map::new(),
     current_fn_key: "",
     item_defs: Map::new(),
     call_def_ids: Map::new(),
     ident_resolutions: Map::new(),
     closure_captures: Map::new(),
+    semantic_to_mir: Map::new(),
+    pattern_binding_resolutions: Map::new(),
+    param_binding_resolutions: Map::new(),
     field_targets: Map::new(),
     expr_types: Map::new(),
     static_names: Set::new(),
@@ -1109,17 +1124,6 @@ end
 # Whether a deinit callable with the given (mangled) name is registered for
 # any type — used to detect that the function being lowered IS a finalizer
 # (whose own self must never be re-finalized).
-def deinit_targets_contains(targets: &Map[Int, String], needle: &String) -> Bool
-  for (_, v) in targets do
-    if v == needle then
-      return true
-    end
-  end
-  false
-end
-
-# The owner key of a free function item (DefId, or the positional fallback
-# "item::<idx>::fn" matching the resource checker's derivation).
 def mir_fn_owner_key(b: &MirBuilder, item_idx: Int) -> String
   match b.item_defs.get(item_idx)
   when Option::Some(dids) then
@@ -1146,14 +1150,6 @@ def mir_item_owner_key(b: &MirBuilder, item_idx: Int, method_index: Int) -> Stri
   when Option::None then ()
   end
   "item::" + item_idx.to_string() + "::method::" + method_index.to_string()
-end
-
-# The name of the function currently being lowered ("" when none).
-def mir_current_fn_name(b: &MirBuilder) -> String
-  match b.current_fn
-  when Option::Some(f) then f.name.clone()
-  when Option::None then ""
-  end
 end
 
 def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> LocalId
@@ -1244,106 +1240,30 @@ def builder_local_is_resource(b: &MirBuilder, local_id: &LocalId) -> Bool
   end
 end
 
-def local_deinit_fn_name(b: &mut MirBuilder, local_id: &LocalId) -> String
-  match builder_local_typed_ty(b, local_id)
-  when Option::Some(ty) then
-    match ty
-    when Type::Named(tid, _) then
-      match b.resource_kinds.get(tid.id)
-      when Option::Some(k) then
-        if k == TypeKind::Resource || k == TypeKind::Capability then
-          match lookup_local_type(b, local_id)
-          when Type::Named(btid, _) then
-            match b.deinit_targets.get(btid.id)
-            when Option::Some(n) then n.clone()
-            when Option::None then
-              # Language rule: a resource WITHOUT a deinit method is
-              # TRIVIALLY deinitialized (no cleanup call needed) — absence
-              # of a deinit is NOT an error (canary_resource.tg relies on
-              # this). (TODO: replace the mangled-string identity in
-              # deinit_targets with a typed DefId/CallableId.)
-              ""
-            end
-          when _ then ""
-          end
-        else
-          ""
-        end
-      when Option::None then ""
-      end
-    when _ then ""
-    end
-  when Option::None then ""
-  end
-end
-
 def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   var places: Vec[Place] = Vec::new()
-  match b.current_fn
-  when Option::Some(f) then
-    # PRIMARY SOURCE: the authoritative finalize plan computed by the
-    # resource checker (per-function; includes sink params still live,
-    # excludes caller-owned let/inout params). MIR emits exactly what
-    # semantic analysis decided.
-    match b.finalize_plan.get(b.current_fn_key.clone())
-    when Option::Some(plan_ids) then
-      for pid in plan_ids do
-        if !consumed.contains(&pid) then
-          # No name-based filter here: the emission phase (emit_deinit_chain_at
-          # -> deinit_plan_for_type) decides per-place via the recursive typed
-          # DeinitPlan, including containers (Array[R], Option[R], tuples...).
-          # Filtering by local_deinit_fn_name would silently drop container
-          # cleanup (it only knows direct nominal resources).
-          places.push(place_local(LocalId { id: pid }))
-        end
-      end
-    when Option::None then
-      # FALLBACK (synthetic/untyped functions): declared locals minus
-      # consumed, with the ownership rules encoded: sink parameters are
-      # callee-owned and MUST be finalized if still live; let/inout
-      # parameters are caller-owned and never finalized; the deinit
-      # method's own self is never re-finalized (a finalizer must not
-      # deinit its own subject).
-      let fn_name = mir_current_fn_name(b)
-      let sink_ids = match b.sink_params.get(fn_name.clone())
-      when Option::Some(sids) then sids.clone()
-      when Option::None then Vec::new()
-      end
-      let is_deinit_fn = deinit_targets_contains(&b.deinit_targets, &fn_name)
-      mut is_param = false
-      for local in f.locals do
-        is_param = false
-        mut pi = 0
-        while pi < f.params.len() do
-          if f.params[pi].id.id == local.id.id then
-            is_param = true
-            break
-          end
-          pi = pi + 1
-        end
-        if local.id.id != 0 && !is_param then
-          if b.declared_locals.contains(&local.id.id) then
-            if !consumed.contains(&local.id.id) then
-              if local_deinit_fn_name(b, &local.id) != "" then
-                places.push(place_local(LocalId { id: local.id.id }))
-              end
-            end
-          end
-        else
-          # Parameter handling: sink params are finalized by the callee
-          # (ownership was transferred), except a deinit's own self.
-          if is_param then
-            let is_self = f.params.len() > 0 && f.params[0].id.id == local.id.id
-            if !(is_deinit_fn && is_self) then
-              if sink_ids.contains(&local.id.id) then
-                if !consumed.contains(&local.id.id) then
-                  if local_deinit_fn_name(b, &local.id) != "" then
-                    places.push(place_local(LocalId { id: local.id.id }))
-                  end
-                end
-              end
-            end
-          end
+  # THE ONLY cleanup source: the authoritative finalize plan computed by the
+  # resource checker (per function owner key; includes sink params still
+  # live and owned locals; excludes caller-owned let/inout params and the
+  # finalizer's own self). MIR emits exactly what semantic analysis decided —
+  # there is NO name-based fallback: re-deriving ownership in MIR would be a
+  # second, divergent ownership analysis.
+  match b.finalize_plan.get(b.current_fn_key.clone())
+  when Option::Some(plan_ids) then
+    for pid in plan_ids do
+      if !consumed.contains(&pid) then
+        # Plan ids are SEMANTIC local ids (allocated globally during type
+        # checking); map them to per-function MIR locals. A missing mapping
+        # is a compiler-internal error — using the semantic id directly as
+        # an MIR id would finalize the wrong (or nonexistent) local.
+        match b.semantic_to_mir.get(pid)
+        when Option::Some(mir_id) then
+          # No name-based filter here: the emission phase
+          # (emit_deinit_chain_at -> deinit_plan_for_type) decides per-place
+          # via the recursive typed DeinitPlan, including containers.
+          places.push(place_local(LocalId { id: mir_id }))
+        when Option::None then
+          b.errors.push("internal error: finalize plan references semantic local _" + pid.to_string() + " with no MIR local in " + b.current_fn_key.clone())
         end
       end
     end
@@ -1352,9 +1272,7 @@ def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   places
 end
 
-# Resolve the deinit plan for a local's type: named types use the typed
-# per-type plan; containers recurse structurally so Option[R], Array[R],
-# tuples etc. get recursive cleanup (viral resource containment).
+
 def deinit_plan_for_type(b: &MirBuilder, ty: &Type) -> DeinitPlan
   match ty
   when Type::Named(tid, _) then
@@ -1412,6 +1330,20 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
       s = emit_plan_deinit(b, &field_place, &field_plans[fi], s, span)
     end
     s
+  when DeinitPlan::Aggregate(field_plans) then
+    # Nominal aggregate WITHOUT an explicit deinit (viral containment):
+    # each field is deinitialized by its own plan, via the typed field
+    # indices (ProjFieldIndex).
+    var s2 = succ
+    var fi2 = field_plans.len()
+    while fi2 > 0 do
+      fi2 = fi2 - 1
+      var projs2 = place.projections.clone()
+      projs2.push(Projection::ProjFieldIndex(fi2))
+      let field_place2 = Place { local: place.local, projections: projs2 }
+      s2 = emit_plan_deinit(b, &field_place2, &field_plans[fi2], s2, span)
+    end
+    s2
   when DeinitPlan::Array(elem_plan) then
     # Runtime-length loop: idx = len-1 .. 0, deinit elem[idx] each iteration.
     let idx_local = add_local(b, "deinit_idx", Type::Int, false, span)
@@ -1462,10 +1394,76 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     switch_to_block(b, entry_blk)
     set_terminator(b, MirTerminatorKind::MirGoto(header_blk), span)
     entry_blk
-  when DeinitPlan::Map(_, _) then
-    # TODO: map-entry deinit emission (requires entry-array iteration in the
-    # deinit chain). The plan structure is complete; only emission is pending.
-    succ
+  when DeinitPlan::Map(key_plan, value_plan) then
+    # Materialize the entries array (entries() returns Vec[(K, V)]), then
+    # iterate indices and deinit the VALUE field (index 1) of each entry by
+    # its plan; keys are deinitialized by their plan when they need it.
+    let entries_tmp = add_temp(b, Type::Slice(Type::Tuple(Vec::new())), span)
+    # entries = __intrinsic_map_entries(place)
+    let ent_callee = MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem("__intrinsic_map_entries".to_string()),
+        ty: Type::Unit
+      })
+    }
+    let ent_blk = create_block(b)
+    var ent_args = Vec::new()
+    ent_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
+    set_terminator(b, MirTerminatorKind::MirCall {
+      dest: place_local(entries_tmp),
+      func: ent_callee,
+      args: ent_args,
+      success: ent_blk,
+      unwind: Option::None
+    }, span)
+    switch_to_block(b, ent_blk)
+    # Loop over entries: for idx in len-1 .. 0: deinit entries[idx].1
+    let ent_len = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(ent_len), MirRvalue { kind: MirRvalueKind::MirLen(place_local(entries_tmp)) }, span)
+    let ent_idx = add_local(b, "deinit_ent_idx", Type::Int, false, span)
+    push_assign(b, place_local(ent_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirCopy(place_local(ent_len))
+    }) }, span)
+    let ent_header = create_block(b)
+    let ent_exit = create_block(b)
+    let ent_body = create_block(b)
+    switch_to_block(b, ent_header)
+    let ent_zero = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(ent_zero), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int })
+    }) }, span)
+    let ent_cmp = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(ent_cmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+      MirBinOp::Gt,
+      operand_copy_local(ent_idx),
+      operand_copy_local(ent_zero)
+    ) }, span)
+    var ent_targets = Vec::new()
+    ent_targets.push(SwitchTarget { value: 0, target: ent_exit })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(ent_cmp), targets: ent_targets, default_target: ent_body }, span)
+    switch_to_block(b, ent_body)
+    let ent_dec = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(ent_dec), MirRvalue { kind: MirRvalueKind::MirBinOp(
+      MirBinOp::Sub,
+      operand_copy_local(ent_idx),
+      operand_int(1)
+    ) }, span)
+    push_assign(b, place_local(ent_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirCopy(place_local(ent_dec))
+    }) }, span)
+    var ent_projs = Vec::new()
+    ent_projs.push(Projection::ProjIndex(ent_idx))
+    ent_projs.push(Projection::ProjField("1".to_string(), 1))
+    let ent_value_place = Place { local: entries_tmp, projections: ent_projs }
+    let ent_chain = emit_plan_deinit(b, &ent_value_place, value_plan, ent_header, span)
+    switch_to_block(b, ent_body)
+    set_terminator(b, MirTerminatorKind::MirGoto(ent_chain), span)
+    switch_to_block(b, ent_exit)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    let ent_entry = create_block(b)
+    switch_to_block(b, ent_entry)
+    set_terminator(b, MirTerminatorKind::MirGoto(ent_header), span)
+    ent_entry
   when DeinitPlan::Option(inner_plan) then
     # Deinit the payload only when the variant is Some: discriminant block
     # switches to skip_blk (None) or body_blk (Some payload deinit).
@@ -1528,7 +1526,55 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     switch_to_block(b, entry_r)
     set_terminator(b, MirTerminatorKind::MirGoto(disc_blk2), span)
     entry_r
-  when DeinitPlan::Enum(_) then succ
+  when DeinitPlan::Enum(variant_plans) then
+    # Arbitrary resource-containing enums: switch on the discriminant and
+    # deinit the active variant's payload fields by their plans. Each variant
+    # is routed to its own chain; the fallthrough (unknown discriminant) is a
+    # defensive skip (should not occur for well-typed values).
+    let disc_blk_e = create_block(b)
+    let default_blk_e = create_block(b)
+    let entry_blk_e = create_block(b)
+    switch_to_block(b, disc_blk_e)
+    let disc_tmp_e = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp_e), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    var e_targets = Vec::new()
+    # One block per variant: its chain deinits the payload fields, then flows
+    # to succ.
+    var variant_entries = Map::new()
+    for (vdisc, vinfo) in variant_plans do
+      let vname = vinfo.0
+      let vplans = vinfo.1
+      var vchain = succ
+      var vfi = vplans.len()
+      while vfi > 0 do
+        vfi = vfi - 1
+        var vprojs = place.projections.clone()
+        vprojs.push(Projection::ProjDowncast(vname.clone(), vdisc))
+        vprojs.push(Projection::ProjFieldIndex(vfi))
+        let vplace = Place { local: place.local, projections: vprojs }
+        vchain = emit_plan_deinit(b, &vplace, &vplans[vfi], vchain, span)
+      end
+      variant_entries.insert(vdisc, vchain)
+    end
+    # Re-walk to emit the per-variant blocks' goto to their chains (the
+    # chains were emitted above while current_block is the last chain block).
+    for (vdisc2, vinfo2) in variant_plans do
+      let vblk = create_block(b)
+      switch_to_block(b, vblk)
+      match variant_entries.get(vdisc2)
+      when Option::Some(vchain2) then
+        set_terminator(b, MirTerminatorKind::MirGoto(vchain2), span)
+      when Option::None then ()
+      end
+      e_targets.push(SwitchTarget { value: vdisc2, target: vblk })
+    end
+    switch_to_block(b, disc_blk_e)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp_e), targets: e_targets, default_target: default_blk_e }, span)
+    switch_to_block(b, default_blk_e)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    switch_to_block(b, entry_blk_e)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk_e), span)
+    entry_blk_e
   end
 end
 
@@ -1784,6 +1830,19 @@ def emit_cfg_deinit_returns(b: &mut MirBuilder) -> Unit
   end
 end
 
+# Record the semantic id -> MIR id mapping for a pattern-bound local. The
+# semantic id comes from the typed pattern_binding_resolutions (pat node id ->
+# semantic local id). A missing typed binding for a real pattern local is a
+# compiler-internal error (the plan's ids are semantic and must resolve).
+def record_semantic_pattern_local(b: &mut MirBuilder, pat: &Pattern, mir_local: LocalId, what: String) -> Unit
+  match b.pattern_binding_resolutions.get(pat.node_id)
+  when Option::Some(sem_id) then
+    b.semantic_to_mir.insert(sem_id, mir_local.id)
+  when Option::None then
+    b.errors.push("internal error: missing typed pattern binding for " + what + " (pattern node " + pat.node_id.to_string() + ")")
+  end
+end
+
 def add_local(b: &mut MirBuilder, name: String, ty: Type, is_mut: Bool, span: Span) -> LocalId
   let id = LocalId { id: b.local_counter }
   b.local_counter = b.local_counter + 1
@@ -2017,6 +2076,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.ident_resolutions = typed.ident_resolutions.clone()
   b.item_defs = typed.resolutions.item_defs.clone()
   b.closure_captures = typed.closure_captures.clone()
+  b.pattern_binding_resolutions = typed.pattern_binding_resolutions.clone()
+  b.param_binding_resolutions = typed.param_binding_resolutions.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -2443,20 +2504,17 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
       end
     end
     let param_lid = add_param(b, p.name.clone(), ty, f.span)
-    # Sink parameters are OWNED by the callee: if still live at exit they
-    # must be finalized here (let/inout params are caller-owned). Track the
-    # sink param local ids per function for the cleanup fallback path.
-    if p.convention == AccessConvention::Sink then
-      let fn_name = mir_current_fn_name(b)
-      match b.sink_params.get(fn_name.clone())
-      when Option::Some(mut existing) then
-        existing.push(param_lid.id)
-        b.sink_params.insert(fn_name.clone(), existing)
-      when Option::None then
-        var fresh = Vec::new()
-        fresh.push(param_lid.id)
-        b.sink_params.insert(fn_name.clone(), fresh)
+    # Map the semantic parameter id (from the typed parameter bindings) to
+    # this MIR local: the finalize plan refers to semantic ids.
+    match b.param_binding_resolutions.get(b.current_fn_key.clone())
+    when Option::Some(sem_ids) then
+      if param_idx < sem_ids.len() then
+        b.semantic_to_mir.insert(sem_ids[param_idx], param_lid.id)
+      else
+        b.errors.push("internal error: parameter index " + param_idx.to_string() + " exceeds typed parameter bindings")
       end
+    when Option::None then
+      b.errors.push("internal error: missing typed parameter bindings for " + b.current_fn_key.clone())
     end
     param_idx = param_idx + 1
   end
@@ -3196,6 +3254,53 @@ end
 def lower_block(b: &mut MirBuilder, block: &Block) -> Unit
   for stmt in block.stmts do
     lower_stmt(b, &stmt)
+  end
+  # Materialize the SEMANTIC block-exit obligations: locals created inside
+  # this lexical block that must be finalized when the block ends (recorded
+  # by the resource checker, keyed by the block's first statement id). The
+  # current MIR block's terminator target becomes the end of the cleanup
+  # chain; blocks whose terminator is not a plain Goto (e.g. calls with
+  # success blocks) defer to the function-level return-path cleanup.
+  let block_key = if block.stmts.len() > 0 then block.stmts[0].node_id else 0 end
+  if block_key != 0 then
+    match b.finalize_plan.get("block::" + block_key.to_string())
+    when Option::Some(ids) then
+      if ids.len() > 0 then
+        match b.current_block
+        when Option::Some(cur_blk) then
+          let old_target = match b.blocks[cur_blk.id].terminator.kind
+          when MirTerminatorKind::MirGoto(target) then Option::Some(target)
+          when MirTerminatorKind::MirReturn then Option::None
+          when _ then Option::None
+          end
+          match old_target
+          when Option::Some(tgt) then
+            var chain_succ = tgt
+            var bi = ids.len()
+            while bi > 0 do
+              bi = bi - 1
+              let pid = ids[bi]
+              match b.semantic_to_mir.get(pid)
+              when Option::Some(mid) then
+                let ty = builder_local_typed_ty(b, &LocalId { id: mid })
+                let plan = match ty
+                when Option::Some(t) then deinit_plan_for_type(b, &t)
+                when Option::None then DeinitPlan::Trivial
+                end
+                chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: mid }), &plan, chain_succ, block.span)
+              when Option::None then
+                b.errors.push("internal error: block-exit plan references semantic local _" + pid.to_string() + " with no MIR local")
+              end
+            end
+            switch_to_block(b, cur_blk)
+            set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), block.span)
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+    when Option::None then ()
+    end
   end
 end
 
@@ -3976,6 +4081,7 @@ def lower_pattern_place_assignment(b: &mut MirBuilder, pat: &Pattern, source: Pl
   when PatternKind::Ident(name, is_mut) then
     let ty = mir_infer_place_type(&source, b)
     let local_id = add_local(b, name.clone(), ty, is_mut, span)
+    record_semantic_pattern_local(b, pat, local_id, "pattern binding")
     push_assign(b, place_local(local_id), move_rvalue(operand_copy(source)), span)
   when PatternKind::Tuple(pats) then
     var idx = 0
@@ -3995,6 +4101,7 @@ def lower_pattern_assignment(b: &mut MirBuilder, pat: &Pattern, rvalue: &MirRval
   when PatternKind::Ident(name, is_mut) then
     let ty = mir_infer_rvalue_type(rvalue, b)
     let local_id = add_local(b, name.clone(), ty, is_mut, span)
+    record_semantic_pattern_local(b, pat, local_id, "pattern binding")
     push_assign(b, place_local(local_id), duplicate_rvalue(rvalue), span)
   when PatternKind::Tuple(pats) then
     let tuple_ty = mir_infer_rvalue_type(rvalue, b)
@@ -4019,6 +4126,7 @@ def bind_match_arm_pattern_locals(b: &mut MirBuilder, scrut_local: LocalId, pat:
   match pat.kind
   when PatternKind::Ident(name, is_mut) then
     let local = add_local(b, name.clone(), scrut_ty, is_mut, span)
+    record_semantic_pattern_local(b, pat, local, "match binding")
     push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
   when PatternKind::Variant(path, sub_pats) then
     let variant_name = if path.segments.len() > 0 then
@@ -4040,6 +4148,7 @@ def bind_match_arm_pattern_locals(b: &mut MirBuilder, scrut_local: LocalId, pat:
         payload_place.projections.push(Projection::ProjField(field_idx.to_string(), field_idx))
         let local_ty = mir_infer_place_type(&payload_place, b)
         let local = add_local(b, name.clone(), local_ty, is_mut, span)
+        record_semantic_pattern_local(b, sp, local, "variant match binding")
         push_assign(b, place_local(local), move_rvalue(operand_copy(payload_place)), span)
       when _ then ()
       end
@@ -4140,6 +4249,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
           when Option::Some(ty_expr) then
             let declared_ty = resolve_type_with_builder(b, &ty_expr)
             let local_id = add_local(b, name.clone(), declared_ty, binding_mut, stmt.span)
+        record_semantic_pattern_local(b, &pattern, local_id, "let binding")
             push_assign(b, place_local(local_id), rvalue, stmt.span)
           when Option::None then
             let inferred_ty = mir_infer_expr_type(b, &value)
@@ -5085,50 +5195,33 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       let closure_name = "_closure" + b.temp_counter.to_string()
       b.temp_counter = b.temp_counter + 1
       
-      # Step 1: Capture analysis — find free variables in body
-      let captures = analyze_captures(&body, &params, &b.var_map)
-      # Validate the name-based scan against the TYPED closure capture record
-      # (the semantic edge): every captured variable must be recorded by the
-      # type checker with its local id — MIR must not rediscover captures the
-      # type checker did not see (and vice versa). The scan remains only for
-      # env-layout ordering (ABI-level); ownership semantics come from the
-      # typed record (consumed by the resource checker).
+      # Step 1+2: THE SEMANTIC CAPTURE RECORD is the only capture source.
+      # typed.closure_captures (closure node id -> captured local id ->
+      # effect) was produced by the type checker and consumed by the
+      # resource checker (ownership transfer into the closure); MIR builds
+      # the closure env and the closure function's implicit capture
+      # parameters from exactly that record. There is NO free-variable scan:
+      # re-deriving captures in MIR would be a second, divergent analysis.
+      var captures = Vec::new()
+      var capture_ops = Vec::new()
+      var capture_types = Vec::new()
+      var capture_ids = Vec::new()
       match b.closure_captures.get(expr.node_id)
       when Option::Some(typed_caps) then
-        for cap_name in captures do
-          match lookup_current_local_id_by_name(b, cap_name)
-          when Option::Some(lid) then
-            if !typed_caps.contains_key(lid.id) then
-              b.errors.push("internal error: closure captures variable `" + cap_name.clone() + "` not recorded by the type checker")
-            end
-          when Option::None then ()
+        for (cap_id, _cap_effect) in typed_caps do
+          match lookup_local_id(b, LocalId { id: cap_id })
+          when Option::Some(ml) then
+            captures.push(ml.name.clone())
+            capture_types.push(ml.ty.clone())
+            capture_ids.push(cap_id)
+            capture_ops.push(MirOperand {
+              kind: MirOperandKind::MirCopy(place_local(LocalId { id: cap_id }))
+            })
+          when Option::None then
+            b.errors.push("internal error: closure capture local _" + cap_id.to_string() + " has no MIR local")
           end
         end
       when Option::None then ()
-      end
-      
-      # Step 2: Build captured operands and resolve their types from the current scope
-      var capture_ops = Vec::new()
-      var capture_types = Vec::new()
-      for cap_name in captures do
-        match lookup_current_local_id_by_name(b, cap_name)
-        when Option::Some(local_id) then
-          let cap_ty = lookup_local_type(b, &local_id)
-          capture_types.push(cap_ty)
-          capture_ops.push(MirOperand {
-            kind: MirOperandKind::MirCopy(place_local(local_id))
-          })
-        when Option::None then
-          # Should not happen — analyze_captures filters by scope.
-          # Produce a copy of a synthetic local rather than silently using Unit.
-          capture_types.push(Type::Unit)
-          capture_ops.push(MirOperand {
-            kind: MirOperandKind::MirConstant(MirConstant {
-              kind: MirConstantKind::MirUnit,
-              ty: Type::Unit
-            })
-          })
-        end
       end
       
       # Step 3: Build the closure function's parameter types
@@ -5152,8 +5245,10 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         params: params.clone(),
         captures: captures.clone(),
         capture_types: capture_types.clone(),
+        capture_ids: capture_ids.clone(),
         body: body.clone(),
-        ret_type: ret_type.clone()
+        ret_type: ret_type.clone(),
+        node_id: expr.node_id
       })
       
       # Step 5: Create the closure aggregate — (fn_ptr, env)
@@ -6159,36 +6254,6 @@ def collect_names_from_pattern(pat: &Pattern) -> Set[String]
   names
 end
 
-def analyze_captures(body: &Expr, params: &Vec[ClosureParam], scope: &Map[String, LocalId]) -> Vec[String]
-  # Find all free variables in the closure body that are:
-  #   1. Not closure parameters
-  #   2. Available in the enclosing scope (var_map)
-  # Returns the list of captured variable names.
-  
-  var bound_vars: Set[String] = Set::new()
-  
-  # Closure parameters are bound in the body
-  for p in params do
-    let pattern_names = collect_names_from_pattern(&p.pat)
-    for name in pattern_names do
-      bound_vars.insert(name.clone())
-    end
-  end
-  
-  # Walk the expression tree to find free variable references
-  let free_vars = mir_collect_free_vars(body, &bound_vars)
-  
-  # Filter to only those that exist in the enclosing scope
-  var captures: Vec[String] = Vec::new()
-  for name in free_vars do
-    if scope.contains_key(name) then
-      captures.push(name.clone())
-    end
-  end
-  
-  captures
-end
-
 def mir_collect_free_vars(expr: &Expr, bound: &Set[String]) -> Set[String]
   var free: Set[String] = Set::new()
   match expr.kind
@@ -6378,6 +6443,9 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
 
     # Start a new function for the closure
     start_function(b, closure.name.clone(), closure.ret_type.clone(), closure_span)
+    # The closure's authoritative finalize plan is keyed by its node id
+    # (recorded by the resource checker as "closure::<node_id>").
+    b.current_fn_key = "closure::" + closure.node_id.to_string()
 
     # Add captured variables as implicit leading parameters with resolved types
     var cap_idx = 0
@@ -6387,7 +6455,14 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
       else
         Type::Unit
       end
-      add_param(b, cap_name.clone(), cap_ty, closure_span)
+      let cap_param = add_param(b, cap_name.clone(), cap_ty, closure_span)
+      # Map the SEMANTIC capture id to this MIR capture param (the closure's
+      # finalize plan refers to semantic ids).
+      if cap_idx < closure.capture_ids.len() then
+        b.semantic_to_mir.insert(closure.capture_ids[cap_idx], cap_param.id)
+      else
+        b.errors.push("internal error: closure capture index " + cap_idx.to_string() + " has no semantic id")
+      end
       cap_idx = cap_idx + 1
     end
 

@@ -142,7 +142,9 @@ enum DeinitPlan
   Trivial
   Call(String)      # deinit identity (mangled name; TODO: DefId/CallableId)
   Aggregate(Vec[DeinitPlan])
-  Enum(Map[Int, Vec[DeinitPlan]])  # variant discriminant -> field plans
+  # variant discriminant -> (variant name, per-field plans); names are needed
+  # for ProjDowncast emission.
+  Enum(Map[Int, (String, Vec[DeinitPlan])])
   Array(DeinitPlan)
   Map(DeinitPlan, DeinitPlan)      # key plan, value plan
   Tuple(Vec[DeinitPlan])
@@ -161,27 +163,37 @@ end
 # registered deinit targets. Mirrors the type checker's viral containment
 # rules: containers of resource types get recursive plans; a direct resource
 # type without a deinit method is Trivial (per the language rule).
-pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int) -> DeinitPlan
-  if depth > 32 then
+pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: &mut Set[Int], errors: &mut Vec[TypeError]) -> DeinitPlan
+  # Cycle-aware recursion: recursive type graphs (e.g. Box-like self
+  # references) legitimately revisit a type id; the revisit edge is Trivial.
+  # A depth beyond the safety bound is NOT silently Trivial — it is a
+  # compiler-internal error (cleanup analysis that "got too deep" must never
+  # become "nothing to clean").
+  if depth > 128 then
+    errors.push(TypeError {
+      message: "internal error: deinit plan recursion exceeded depth 128 for type",
+      span: Span { file: "", start: 0, end_pos: 0 },
+      code: Option::None
+    })
     return DeinitPlan::Trivial
   end
   match ty
   when Type::Option(inner) then
-    DeinitPlan::Option(build_deinit_plan(typed, &inner, depth + 1))
+    DeinitPlan::Option(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Result(ok, err) then
-    DeinitPlan::Result(build_deinit_plan(typed, &ok, depth + 1), build_deinit_plan(typed, &err, depth + 1))
+    DeinitPlan::Result(build_deinit_plan(typed, &ok, depth + 1, visited, errors), build_deinit_plan(typed, &err, depth + 1, visited, errors))
   when Type::Slice(inner) then
-    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Array(inner, _) then
-    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Map(k, v) then
-    DeinitPlan::Map(build_deinit_plan(typed, &k, depth + 1), build_deinit_plan(typed, &v, depth + 1))
+    DeinitPlan::Map(build_deinit_plan(typed, &k, depth + 1, visited, errors), build_deinit_plan(typed, &v, depth + 1, visited, errors))
   when Type::Set(inner) then
-    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
-      plans.push(build_deinit_plan(typed, &f, depth + 1))
+      plans.push(build_deinit_plan(typed, &f, depth + 1, visited, errors))
     end
     DeinitPlan::Tuple(plans)
   when Type::Named(tid, args) then
@@ -192,25 +204,35 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int) -> Deinit
     match typed.type_kinds.get(tid.id)
     when Option::Some(k) then
       if k == TypeKind::Resource || k == TypeKind::Capability then
-        # A resource WITHOUT a deinit method is trivially deinitialized
-        # (language rule — absence of deinit is NOT an error).
         match typed.deinit_targets.get(tid.id)
         when Option::Some(n) then DeinitPlan::Call(n.clone())
-        when Option::None then DeinitPlan::Trivial
+        when Option::None then
+          # No explicit deinit: VIRAL containment applies. A resource whose
+          # fields/variants contain resources still needs recursive cleanup —
+          # build an Aggregate/Enum plan over the nominal shape (a bare
+          # Trivial would silently leak field resources).
+          if visited.contains(&tid.id) then
+            DeinitPlan::Trivial  # cycle edge in a recursive type
+          else
+            visited.insert(tid.id)
+            let result = nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
+            visited.remove(&tid.id)
+            result
+          end
         end
       else
         # Named container types (Option/Result/Array/Map/Set) resolve to
         # their canonical forms via their type name + generic args.
         if type_name == "Option" && args.len() >= 1 then
-          DeinitPlan::Option(build_deinit_plan(typed, &args[0], depth + 1))
+          DeinitPlan::Option(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
         elsif type_name == "Result" && args.len() >= 2 then
-          DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1), build_deinit_plan(typed, &args[1], depth + 1))
+          DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
         elsif (type_name == "Array" || type_name == "Vec") && args.len() >= 1 then
-          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1))
+          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
         elsif type_name == "Map" && args.len() >= 2 then
-          DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1), build_deinit_plan(typed, &args[1], depth + 1))
+          DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
         elsif type_name == "Set" && args.len() >= 1 then
-          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1))
+          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
         else
           DeinitPlan::Trivial
         end
@@ -218,6 +240,90 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int) -> Deinit
     when Option::None then DeinitPlan::Trivial
     end
   when _ then DeinitPlan::Trivial
+  end
+end
+
+# Build the containment plan for a nominal resource/capability WITHOUT an
+# explicit deinit: struct fields become Aggregate plans, enum variants become
+# Enum plans. Fields with Param types are substituted with the concrete args.
+def nominal_containment_plan(typed: &TypedProgram, tid: &TypeId, args: &Vec[Type], depth: Int, visited: &mut Set[Int], errors: &mut Vec[TypeError]) -> DeinitPlan
+  match typed.type_fields.get(tid.id)
+  when Option::Some(fields) then
+    var plans = Vec::new()
+    var fi = 0
+    while fi < fields.len() do
+      let fld = fields[fi]
+      # Substitute generic params with the concrete args (Param("T") -> args[i]
+      # positionally).
+      let fld_ty = match substitute_plan_param(typed, tid, &fld.1, args)
+      when Option::Some(t) then t
+      when Option::None then fld.1.clone()
+      end
+      plans.push(build_deinit_plan(typed, &fld_ty, depth + 1, visited, errors))
+      fi = fi + 1
+    end
+    DeinitPlan::Aggregate(plans)
+  when Option::None then
+    match typed.type_variants.get(tid.id)
+    when Option::Some(variants) then
+      var vmap = Map::new()
+      for v in variants do
+        var vplans = Vec::new()
+        var vi = 0
+        while vi < v.1.len() do
+          let vty = match substitute_plan_param(typed, tid, &v.1[vi], args)
+          when Option::Some(t) then t
+          when Option::None then v.1[vi].clone()
+          end
+          vplans.push(build_deinit_plan(typed, &vty, depth + 1, visited, errors))
+          vi = vi + 1
+        end
+        vmap.insert(v.2, (v.0.clone(), vplans))
+      end
+      DeinitPlan::Enum(vmap)
+    when Option::None then DeinitPlan::Trivial
+    end
+  end
+end
+
+# Substitute Type::Param("T") placeholders with the concrete type args,
+# matched BY NAME against the type def's generic parameter list (the
+# TypedProgram carries type_params). Returns None when no substitution
+# applies (e.g. the name is not a generic param).
+def substitute_plan_param(typed: &TypedProgram, tid: &TypeId, ty: &Type, args: &Vec[Type]) -> Option[Type]
+  match ty
+  when Type::Param(name) then
+    let param_pos = match typed.type_params.get(tid.id)
+    when Option::Some(names) then
+      var pi = 0
+      var found = -1
+      while pi < names.len() do
+        if names[pi] == name then
+          found = pi
+          pi = names.len()
+        end
+        pi = pi + 1
+      end
+      found
+    when Option::None then -1
+    end
+    if param_pos >= 0 && param_pos < args.len() then Option::Some(args[param_pos].clone()) else Option::None end
+  when Type::Slice(inner) then
+    match substitute_plan_param(typed, tid, &inner, args)
+    when Option::Some(t) then Option::Some(Type::Slice(t))
+    when Option::None then Option::None
+    end
+  when Type::Named(tid2, arg2) then
+    var new_args = Vec::new()
+    var changed = false
+    for a in arg2 do
+      match substitute_plan_param(typed, tid, &a, args)
+      when Option::Some(t) then new_args.push(t); changed = true
+      when Option::None then new_args.push(a.clone())
+      end
+    end
+    if changed then Option::Some(Type::Named(tid2.clone(), new_args)) else Option::None end
+  when _ then Option::None
   end
 end
 
@@ -393,6 +499,15 @@ struct TypedProgram
   # build_deinit_plan to construct the recursive DeinitPlan per type.
   type_names: Map[Int, String]
   deinit_targets: Map[Int, String]
+  # Type id -> struct field shapes (name, type) and enum variant shapes
+  # (name, field types, discriminant): the nominal information DeinitPlan
+  # construction needs to walk struct fields and enum variants when a
+  # resource has no explicit deinit (viral containment).
+  type_fields: Map[Int, Vec[(String, Type)]]
+  type_variants: Map[Int, Vec[(String, Vec[Type], Int)]]
+  # Type id -> generic parameter names (for substituting concrete args into
+  # field/variant types when building containment plans).
+  type_params: Map[Int, Vec[String]]
   type_kinds: Map[Int, TypeKind]
 end
 
@@ -3695,6 +3810,48 @@ def method_def_for(env: &TypeEnv, recv_type: &Type, method: String) -> Option[De
   end
 end
 
+# The concrete type arguments of a receiver, in generic-parameter order
+# (used to check impl generic bounds at method selection).
+def receiver_type_args(env: &TypeEnv, recv_type: &Type) -> Vec[Type]
+  match recv_type
+  when Type::Named(_, args) then args.clone()
+  when Type::Slice(inner) then
+    var out = Vec::new()
+    out.push(inner.clone())
+    out
+  when Type::Map(k, v) then
+    var out2 = Vec::new()
+    out2.push(k.clone())
+    out2.push(v.clone())
+    out2
+  when _ then Vec::new()
+  end
+end
+
+# Whether an impl's generic bounds hold for the receiver's concrete args.
+# Ownership-relevant bounds (Copyable/Clone) are checked via resource
+# containment: a resource (or container of resources) cannot satisfy them.
+# Eq/Hash bounds have no obligation machinery yet (documented) — they do not
+# affect ownership, so they do not gate here.
+def impl_bounds_satisfied(env: &TypeEnv, imp: &ImplDecl, recv_args: &Vec[Type]) -> Bool
+  var gi = 0
+  while gi < imp.generic_params.len() do
+    let gp = imp.generic_params[gi]
+    for bound in gp.bounds do
+      let bound_name = type_expr_name_of(&bound)
+      if bound_name == "Copyable" || bound_name == "Clone" then
+        if gi < recv_args.len() then
+          if type_has_resource_kind(env, &recv_args[gi]) then
+            return false
+          end
+        end
+      end
+    end
+    gi = gi + 1
+  end
+  true
+end
+
 def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Option[Vec[ParamType]]
   let resolved_base = resolved_receiver_base(env, recv_type)
   match resolved_base
@@ -3711,13 +3868,20 @@ def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Optio
         while ci < cands.len() do
           let imp = env.impls[cands[ci]]
           if impl_for_type_matches(&imp.for_type, &resolved_base) then
-            var mi = 0
-            while mi < imp.methods.len() do
-              let m = imp.methods[mi]
-              if m.name == method then
-                return Option::Some(m.params.clone())
+            # Generic obligation gate: a bounded impl is only applicable when
+            # the concrete receiver args satisfy its bounds. This makes
+            # `impl[T: Copyable] Array[T]` a REAL constraint — a resource
+            # element cannot select methods from it.
+            let recv_args = receiver_type_args(env, &resolved_base)
+            if impl_bounds_satisfied(env, &imp, &recv_args) then
+              var mi = 0
+              while mi < imp.methods.len() do
+                let m = imp.methods[mi]
+                if m.name == method then
+                  return Option::Some(m.params.clone())
+                end
+                mi = mi + 1
               end
-              mi = mi + 1
             end
           end
           ci = ci + 1
@@ -3773,16 +3937,19 @@ def find_method_expected_args(env: &TypeEnv, recv_type: &Type, method: String) -
         while ci < cands.len() do
           let imp = env.impls[cands[ci]]
           if impl_for_type_matches(&imp.for_type, &resolved_base) then
-            var mi = 0
-            while mi < imp.methods.len() do
-              let m = imp.methods[mi]
-              if m.name == method then
-                if m.params.len() >= 1 && m.params[0].name == "self" then
-                  return Option::Some(m.params.len() - 1)
+            let recv_args2 = receiver_type_args(env, &resolved_base)
+            if impl_bounds_satisfied(env, &imp, &recv_args2) then
+              var mi = 0
+              while mi < imp.methods.len() do
+                let m = imp.methods[mi]
+                if m.name == method then
+                  if m.params.len() >= 1 && m.params[0].name == "self" then
+                    return Option::Some(m.params.len() - 1)
+                  end
+                  return Option::Some(m.params.len())
                 end
-                return Option::Some(m.params.len())
+                mi = mi + 1
               end
-              mi = mi + 1
             end
           end
           ci = ci + 1
@@ -4124,6 +4291,18 @@ def scan_expr(env: &TypeEnv, scan: &mut CaptureScan, expr: &Expr) -> Unit
       i = i + 1
     end
   when ExprKind::ExprMapLit(entries) then
+    # Record aggregate ownership (map literal keys AND values are owned
+    # transfers) so the resource checker's aggregate_child_owned lookup is
+    # always satisfied for typed aggregates.
+    var map_owned = Vec::new()
+    var mi0 = 0
+    while mi0 < entries.len() * 2 do
+      map_owned.push(true)
+      mi0 = mi0 + 1
+    end
+    if expr.node_id != 0 then
+      env.typed_aggregate_ownership.insert(expr.node_id, map_owned)
+    end
     var i = 0
     while i < entries.len() do
       scan_expr(env, scan, &entries[i].0)
@@ -4372,7 +4551,12 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # the container, so its element type decides).
       match callee_ident_name(&func)
       when Option::Some(cname) then
-        if cname == "__intrinsic_array_get" || cname == "__intrinsic_map_get" then
+        # Copy-producing intrinsics are compiler-internal building blocks; a
+        # DIRECT call on a resource-containing element type is rejected here
+        # (the std wrappers carry the same restriction via Copyable bounds).
+        if cname == "__intrinsic_array_get" || cname == "__intrinsic_map_get" ||
+           cname == "__intrinsic_array_slice" || cname == "__intrinsic_map_entries" ||
+           cname == "__intrinsic_set_entries" then
           if args.len() >= 1 then
             match container_element_type(env, &arg_types[0])
             when Option::Some(elem_ty) then
@@ -5147,11 +5331,13 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     if method == "err" then return Type::Option(err) end
     if method == "clone" then return Type::Result(ok, err) end
   when Type::Map(k, v) then
-    # Copyable-constraint enforcement for Map: get/keys/values/clone return
-    # owned values (or copied storage) and are only sound for Copyable value
-    # types; resource values must be extracted via the consuming remove API.
-    if method == "get" || method == "keys" || method == "values" || method == "clone" then
-      if type_has_resource_kind(env, &v) then
+    # Copyable-constraint enforcement for Map: get/keys/values/entries/clone
+    # return owned values (or copied (K, V) storage) and are only sound for
+    # Copyable KEY AND VALUE types (keys() materializes keys, entries()
+    # materializes both). Resource keys or values must be extracted via the
+    # consuming remove API.
+    if method == "get" || method == "keys" || method == "values" || method == "entries" || method == "clone" then
+      if type_has_resource_kind(env, &v) || type_has_resource_kind(env, &k) then
         type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", span)
       end
     end
@@ -5786,10 +5972,32 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   var kinds = Map::new()
   var type_names = Map::new()
   var deinit_targets = Map::new()
+  var type_fields = Map::new()
+  var type_variants = Map::new()
+  var type_params = Map::new()
   var ki = 0
   while ki < env.type_list.len() do
-    kinds.insert(env.type_list[ki].id.id, env.type_list[ki].kind)
-    type_names.insert(env.type_list[ki].id.id, env.type_list[ki].name.clone())
+    let td = env.type_list[ki]
+    kinds.insert(td.id.id, td.kind)
+    type_names.insert(td.id.id, td.name.clone())
+    type_params.insert(td.id.id, td.generic_params.clone())
+    # Record the nominal shapes (struct fields / enum variants) so the
+    # deinit-plan builder can walk them for viral containment.
+    match td.def_kind
+    when TypeDefKind::Struct(fields) then
+      var shape = Vec::new()
+      for f in fields do
+        shape.push((f.name.clone(), f.ty.clone()))
+      end
+      type_fields.insert(td.id.id, shape)
+    when TypeDefKind::Enum(variants) then
+      var vshape = Vec::new()
+      for v in variants do
+        vshape.push((v.name.clone(), v.fields.clone(), v.discriminant))
+      end
+      type_variants.insert(td.id.id, vshape)
+    when _ then ()
+    end
     ki = ki + 1
   end
   # Collect registered deinit methods (type name -> mangled callable) so the
@@ -5855,13 +6063,17 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     finalize_plan: Map::new(),
     type_names: type_names.clone(),
     deinit_targets: deinit_targets.clone(),
+    type_fields: type_fields.clone(),
+    type_variants: type_variants.clone(),
+    type_params: type_params.clone(),
     type_kinds: kinds.clone()
   }
   var pi = 0
   while pi < env.type_list.len() do
     let td = env.type_list[pi]
     let self_ty = Type::Named(td.id, Vec::new())
-    let plan = build_deinit_plan(&plan_typed, &self_ty, 0)
+    var plan_visited = Set::new()
+    let plan = build_deinit_plan(&plan_typed, &self_ty, 0, &mut plan_visited, &mut env.errors)
     deinit_plans.insert(td.id.id, plan)
     pi = pi + 1
   end
@@ -5882,6 +6094,9 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     finalize_plan: Map::new(),
     type_names: type_names,
     deinit_targets: deinit_targets,
+    type_fields: type_fields,
+    type_variants: type_variants,
+    type_params: type_params,
     type_kinds: kinds
   }
   env.resolutions = Option::None
