@@ -141,11 +141,15 @@ end
 enum DeinitPlan
   Trivial
   Call(String)      # deinit identity (mangled name; TODO: DefId/CallableId)
+  # Explicit user finalizer PLUS compiler-owned structural field cleanup
+  # (exactly-once rule: user finalizer runs first, then field cleanup).
+  UserFinalizer(String, DeinitPlan)
   Aggregate(Vec[DeinitPlan])
   # variant discriminant -> (variant name, per-field plans); names are needed
   # for ProjDowncast emission.
   Enum(Map[Int, (String, Vec[DeinitPlan])])
   Array(DeinitPlan)
+  Set(DeinitPlan)                  # hash-set element plan (NOT array storage)
   Map(DeinitPlan, DeinitPlan)      # key plan, value plan
   Tuple(Vec[DeinitPlan])
   Option(DeinitPlan)
@@ -189,7 +193,14 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
   when Type::Map(k, v) then
     DeinitPlan::Map(build_deinit_plan(typed, &k, depth + 1, visited, errors), build_deinit_plan(typed, &v, depth + 1, visited, errors))
   when Type::Set(inner) then
-    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
+    DeinitPlan::Set(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
+  when Type::Box(inner) then
+    # Box[T] OWNS T: the inner value participates in cleanup (allocation
+    # release is the Box storage itself). Rc[T] (shared) and raw Ptr[T]
+    # (non-owning) are NOT owning and stay out of containment.
+    var box_plans = Vec::new()
+    box_plans.push(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
+    DeinitPlan::Aggregate(box_plans)
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
@@ -205,7 +216,23 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
     when Option::Some(k) then
       if k == TypeKind::Resource || k == TypeKind::Capability then
         match typed.deinit_targets.get(tid.id)
-        when Option::Some(n) then DeinitPlan::Call(n.clone())
+        when Option::Some(n) then
+          # Explicit finalizer: the USER finalizer runs first, then the
+          # compiler-owned structural field cleanup (exactly-once rule).
+          # A custom finalizer alone would leak resource fields; composing
+          # both guarantees each field is cleaned exactly once.
+          if visited.contains(&tid.id) then
+            DeinitPlan::Call(n.clone())
+          else
+            visited.insert(tid.id)
+            let fields_plan = nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
+            visited.remove(&tid.id)
+            if deinit_plan_is_trivial(&fields_plan) then
+              DeinitPlan::Call(n.clone())
+            else
+              DeinitPlan::UserFinalizer(n.clone(), fields_plan)
+            end
+          end
         when Option::None then
           # No explicit deinit: VIRAL containment applies. A resource whose
           # fields/variants contain resources still needs recursive cleanup —
@@ -232,7 +259,7 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
         elsif type_name == "Map" && args.len() >= 2 then
           DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
         elsif type_name == "Set" && args.len() >= 1 then
-          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
+          DeinitPlan::Set(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
         else
           DeinitPlan::Trivial
         end
@@ -255,10 +282,11 @@ def nominal_containment_plan(typed: &TypedProgram, tid: &TypeId, args: &Vec[Type
       let fld = fields[fi]
       # Substitute generic params with the concrete args (Param("T") -> args[i]
       # positionally).
-      let fld_ty = match substitute_plan_param(typed, tid, &fld.1, args)
-      when Option::Some(t) then t
-      when Option::None then fld.1.clone()
+      let def_params = match typed.type_params.get(tid.id)
+      when Option::Some(ps) then ps.clone()
+      when Option::None then Vec::new()
       end
+      let fld_ty = subst_type_args(&fld.1, &def_params, args)
       plans.push(build_deinit_plan(typed, &fld_ty, depth + 1, visited, errors))
       fi = fi + 1
     end
@@ -271,10 +299,11 @@ def nominal_containment_plan(typed: &TypedProgram, tid: &TypeId, args: &Vec[Type
         var vplans = Vec::new()
         var vi = 0
         while vi < v.1.len() do
-          let vty = match substitute_plan_param(typed, tid, &v.1[vi], args)
-          when Option::Some(t) then t
-          when Option::None then v.1[vi].clone()
+          let def_params2 = match typed.type_params.get(tid.id)
+          when Option::Some(ps2) then ps2.clone()
+          when Option::None then Vec::new()
           end
+          let vty = subst_type_args(&v.1[vi], &def_params2, args)
           vplans.push(build_deinit_plan(typed, &vty, depth + 1, visited, errors))
           vi = vi + 1
         end
@@ -283,47 +312,6 @@ def nominal_containment_plan(typed: &TypedProgram, tid: &TypeId, args: &Vec[Type
       DeinitPlan::Enum(vmap)
     when Option::None then DeinitPlan::Trivial
     end
-  end
-end
-
-# Substitute Type::Param("T") placeholders with the concrete type args,
-# matched BY NAME against the type def's generic parameter list (the
-# TypedProgram carries type_params). Returns None when no substitution
-# applies (e.g. the name is not a generic param).
-def substitute_plan_param(typed: &TypedProgram, tid: &TypeId, ty: &Type, args: &Vec[Type]) -> Option[Type]
-  match ty
-  when Type::Param(name) then
-    let param_pos = match typed.type_params.get(tid.id)
-    when Option::Some(names) then
-      var pi = 0
-      var found = -1
-      while pi < names.len() do
-        if names[pi] == name then
-          found = pi
-          pi = names.len()
-        end
-        pi = pi + 1
-      end
-      found
-    when Option::None then -1
-    end
-    if param_pos >= 0 && param_pos < args.len() then Option::Some(args[param_pos].clone()) else Option::None end
-  when Type::Slice(inner) then
-    match substitute_plan_param(typed, tid, &inner, args)
-    when Option::Some(t) then Option::Some(Type::Slice(t))
-    when Option::None then Option::None
-    end
-  when Type::Named(tid2, arg2) then
-    var new_args = Vec::new()
-    var changed = false
-    for a in arg2 do
-      match substitute_plan_param(typed, tid, &a, args)
-      when Option::Some(t) then new_args.push(t); changed = true
-      when Option::None then new_args.push(a.clone())
-      end
-    end
-    if changed then Option::Some(Type::Named(tid2.clone(), new_args)) else Option::None end
-  when _ then Option::None
   end
 end
 
@@ -434,87 +422,23 @@ struct TypeEnv
   access_marker_depth: Int
 end
 
+# A normalized generic obligation: generic parameter `param_index` of the
+# impl must satisfy the trait named `trait_name` for the impl to apply to a
+# concrete instantiation. Registered from the AST ImplDecl once; method
+# lookup instantiates and solves obligations — it never jumps back to the AST.
+struct GenericObligation
+  param_index: Int
+  trait_name: String   # TODO: trait DefId once traits carry semantic ids
+end
+
 struct ImplInfo
   trait_name: String
   for_type: Type
+  obligations: Vec[GenericObligation]
   methods: Vec[MethodInfo]
 end
 
 struct MethodInfo
-  name: String
-  ret_type: Type
-  params: Vec[ParamType]
-  generic_params: Vec[String]  # Method-level generic param names (e.g., ["U"] for cast[U])
-end
-
-struct TypeError
-  message: String
-  span: Span
-  code: Option[String]
-end
-
-enum AccessEffect
-  Read
-  Modify
-  Consume
-  Initialize
-end
-
-struct LocalBinding
-  name: String
-  ty: Type
-end
-
-struct TypedProgram
-  ast: Program
-  resolutions: ResolvedNames
-  expr_types: Map[Int, Type]
-  call_targets: Map[Int, DefId]
-  field_targets: Map[Int, FieldId]
-  access_effects: Map[Int, AccessEffect]
-  closure_captures: Map[Int, Map[Int, AccessEffect]]
-  local_bindings: Map[Int, LocalBinding]
-  ident_resolutions: Map[Int, Int]
-  # Parameter bindings are keyed by owner (function/method DefId via
-  # fn_owner_key) with a positional Vec; pattern bindings are keyed by
-  # pattern node id. The two domains never collide (see
-  # TypeEnv.param_binding_resolutions), and DefId keys are unique across
-  # merged files (unlike span offsets).
-  param_binding_resolutions: Map[String, Vec[Int]]
-  pattern_binding_resolutions: Map[Int, Int]
-  # Authoritative deinitialization plan per type id (DeinitPlan). Computed in
-  # type_check_typed; MIR consumes it for recursive cleanup emission instead
-  # of guessing per-type finalization from names.
-  deinit_plans: Map[Int, DeinitPlan]
-  # Per aggregate-literal expression node id: whether each child value is
-  # OWNED (transferred into the aggregate). Consumed by the resource checker
-  # for uniform aggregate ownership transfer.
-  aggregate_ownership: Map[Int, Vec[Bool]]
-  # Authoritative per-function finalize set: fn owner key -> local ids to
-  # finalize at function end (computed by the resource checker from its final
-  # per-function frames). MIR consumes this instead of re-deriving cleanup
-  # from declared locals.
-  finalize_plan: Map[String, Vec[Int]]
-  # Type id -> type name and type id -> registered deinit callable, used by
-  # build_deinit_plan to construct the recursive DeinitPlan per type.
-  type_names: Map[Int, String]
-  deinit_targets: Map[Int, String]
-  # Type id -> struct field shapes (name, type) and enum variant shapes
-  # (name, field types, discriminant): the nominal information DeinitPlan
-  # construction needs to walk struct fields and enum variants when a
-  # resource has no explicit deinit (viral containment).
-  type_fields: Map[Int, Vec[(String, Type)]]
-  type_variants: Map[Int, Vec[(String, Vec[Type], Int)]]
-  # Type id -> generic parameter names (for substituting concrete args into
-  # field/variant types when building containment plans).
-  type_params: Map[Int, Vec[String]]
-  type_kinds: Map[Int, TypeKind]
-end
-
-struct TypeCheckResult
-  errors: Vec[TypeError]
-  program: TypedProgram
-end
 
 def type_env_new() -> TypeEnv
   var env = TypeEnv {
@@ -748,6 +672,7 @@ end
 
 def type_has_resource_kind(env: &TypeEnv, ty: &Type) -> Bool
   match ty
+  when Type::Box(inner) then type_has_resource_kind(env, &inner)
   when Type::Named(tid, args) then
     var found = false
     match get_type_by_id(env, tid)
@@ -792,6 +717,7 @@ end
 
 pub def type_kinds_contain_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
   match ty
+  when Type::Box(inner) then type_kinds_contain_resource(kinds, &inner)
   when Type::Named(id, args) then
     match kinds.get(id.id)
     when Option::Some(k) then
@@ -3040,10 +2966,27 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     method_index = method_index + 1
   end
 
+  # Normalize the impl's generic bounds into obligations (param index ->
+  # trait name) ONCE, from the AST ImplDecl. Method lookup instantiates and
+  # solves these — it never jumps back to the AST.
+  var impl_obligations = Vec::new()
+  var ob_idx = 0
+  while ob_idx < i.generic_params.len() do
+    let ob_gp = i.generic_params[ob_idx]
+    for ob_bound in ob_gp.bounds do
+      impl_obligations.push(GenericObligation {
+        param_index: ob_idx,
+        trait_name: type_expr_name_of(&ob_bound)
+      })
+    end
+    ob_idx = ob_idx + 1
+  end
+
   # Register the impl in env.impls so resolve_method_type can find methods
   env.impls.push(ImplInfo {
     trait_name: trait_name,
     for_type: self_type.clone(),
+    obligations: impl_obligations,
     methods: impl_methods
   })
 
@@ -3828,26 +3771,20 @@ def receiver_type_args(env: &TypeEnv, recv_type: &Type) -> Vec[Type]
   end
 end
 
-# Whether an impl's generic bounds hold for the receiver's concrete args.
-# Ownership-relevant bounds (Copyable/Clone) are checked via resource
-# containment: a resource (or container of resources) cannot satisfy them.
-# Eq/Hash bounds have no obligation machinery yet (documented) — they do not
-# affect ownership, so they do not gate here.
-def impl_bounds_satisfied(env: &TypeEnv, imp: &ImplDecl, recv_args: &Vec[Type]) -> Bool
-  var gi = 0
-  while gi < imp.generic_params.len() do
-    let gp = imp.generic_params[gi]
-    for bound in gp.bounds do
-      let bound_name = type_expr_name_of(&bound)
-      if bound_name == "Copyable" || bound_name == "Clone" then
-        if gi < recv_args.len() then
-          if type_has_resource_kind(env, &recv_args[gi]) then
-            return false
-          end
+# Solve the SEMANTIC obligations of a registered ImplInfo against the
+# receiver's concrete args. Ownership-relevant obligations (Copyable/Clone)
+# are checked via resource containment: a resource (or container of
+# resources) cannot satisfy them. Other trait obligations (Eq/Hash) have no
+# general solver yet (documented P0-14 limitation) — they do not gate.
+def impl_bounds_satisfied(env: &TypeEnv, info: &ImplInfo, recv_args: &Vec[Type]) -> Bool
+  for obligation in info.obligations do
+    if obligation.trait_name == "Copyable" || obligation.trait_name == "Clone" then
+      if obligation.param_index < recv_args.len() then
+        if type_has_resource_kind(env, &recv_args[obligation.param_index]) then
+          return false
         end
       end
     end
-    gi = gi + 1
   end
   true
 end
@@ -3866,17 +3803,17 @@ def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Optio
       when Option::Some(cands) then
         var ci = 0
         while ci < cands.len() do
-          let imp = env.impls[cands[ci]]
-          if impl_for_type_matches(&imp.for_type, &resolved_base) then
+          let info = env.impls[cands[ci]]
+          if impl_for_type_matches(&info.for_type, &resolved_base) then
             # Generic obligation gate: a bounded impl is only applicable when
-            # the concrete receiver args satisfy its bounds. This makes
+            # the concrete receiver args satisfy its obligations. This makes
             # `impl[T: Copyable] Array[T]` a REAL constraint — a resource
             # element cannot select methods from it.
             let recv_args = receiver_type_args(env, &resolved_base)
-            if impl_bounds_satisfied(env, &imp, &recv_args) then
+            if impl_bounds_satisfied(env, &info, &recv_args) then
               var mi = 0
-              while mi < imp.methods.len() do
-                let m = imp.methods[mi]
+              while mi < info.methods.len() do
+                let m = info.methods[mi]
                 if m.name == method then
                   return Option::Some(m.params.clone())
                 end
@@ -3935,13 +3872,13 @@ def find_method_expected_args(env: &TypeEnv, recv_type: &Type, method: String) -
       when Option::Some(cands) then
         var ci = 0
         while ci < cands.len() do
-          let imp = env.impls[cands[ci]]
-          if impl_for_type_matches(&imp.for_type, &resolved_base) then
+          let info2 = env.impls[cands[ci]]
+          if impl_for_type_matches(&info2.for_type, &resolved_base) then
             let recv_args2 = receiver_type_args(env, &resolved_base)
-            if impl_bounds_satisfied(env, &imp, &recv_args2) then
+            if impl_bounds_satisfied(env, &info2, &recv_args2) then
               var mi = 0
-              while mi < imp.methods.len() do
-                let m = imp.methods[mi]
+              while mi < info2.methods.len() do
+                let m = info2.methods[mi]
                 if m.name == method then
                   if m.params.len() >= 1 && m.params[0].name == "self" then
                     return Option::Some(m.params.len() - 1)

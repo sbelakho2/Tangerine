@@ -447,6 +447,11 @@ run_critical_canaries() {
     tests/canary/canary_pos_arity.tg \
     tests/canary/canary_pos_resource_array_take.tg \
     tests/canary/canary_pos_resource_sink_param.tg \
+    tests/canary/canary_pos_resource_early_return.tg \
+    tests/canary/canary_pos_resource_wrapper_generic.tg \
+    tests/canary/canary_pos_resource_user_finalizer_fields.tg \
+    tests/canary/canary_pos_resource_map_cleanup.tg \
+    tests/canary/canary_pos_resource_nested_scope.tg \
     tests/canary/canary_capability.tg \
     tests/canary/canary_closure_async.tg \
     tests/canary/canary_ffi.tg \
