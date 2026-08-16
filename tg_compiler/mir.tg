@@ -19,7 +19,7 @@ use tg_compiler::ast::{
 use tg_compiler::types::{
   Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding, TypeKind,
   type_kinds_contain_resource, DeinitPlan, build_deinit_plan, fn_owner_key,
-  subst_type_args
+  subst_type_args, deinit_plan_is_trivial
 }
 use tg_compiler::ids::{FieldId, DefId}
 
@@ -977,6 +977,10 @@ struct MirBuilder
   # source for lr_ident (name-based scope lookup is the transitional
   # fallback).
   ident_resolutions: Map[Int, Int]
+  # MirReturn blocks created by return-EDGE cleanup chains: their locals were
+  # already finalized on that edge, so the function-level finalization pass
+  # must not re-finalize them (double-deinit of sink params).
+  return_edge_blocks: Set[Int]
   # Typed closure captures (closure expr node id -> captured local id ->
   # effect): the SEMANTIC capture record — the ONLY capture source.
   closure_captures: Map[Int, Map[Int, AccessEffect]]
@@ -1047,6 +1051,7 @@ def builder_new() -> MirBuilder
     call_def_ids: Map::new(),
     ident_resolutions: Map::new(),
     closure_captures: Map::new(),
+    return_edge_blocks: Set::new(),
     semantic_to_mir: Map::new(),
     pattern_binding_resolutions: Map::new(),
     param_binding_resolutions: Map::new(),
@@ -1280,7 +1285,7 @@ def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
 end
 
 
-def deinit_plan_for_type(b: &MirBuilder, ty: &Type) -> DeinitPlan
+def deinit_plan_for_type(b: &MirBuilder, ty: &Type, visited: &mut Set[Int]) -> DeinitPlan
   match ty
   when Type::Named(tid, args) then
     # CONCRETE plan construction: resource containment can depend on the
@@ -1296,24 +1301,46 @@ def deinit_plan_for_type(b: &MirBuilder, ty: &Type) -> DeinitPlan
     end
     match def
     when Option::Some(td) then
-      match b.resource_kinds.get(tid.id)
-      when Option::Some(k) then
-        if k == TypeKind::Resource || k == TypeKind::Capability then
-          let structural = mir_structural_plan(b, &td, &args, 0)
-          match b.deinit_targets.get(tid.id)
-          when Option::Some(n) then
-            if deinit_plan_is_trivial(&structural) then
-              DeinitPlan::Call(n.clone())
-            else
-              # User finalizer first, then compiler-owned structural cleanup.
-              DeinitPlan::UserFinalizer(n.clone(), structural)
+      # Cycle detection: a recursive owning type (Node -> Option[Box[Node]])
+      # cannot be expanded into a finite plan tree without generated drop
+      # glue — fail CLOSED with PlanLimit (the emitter reports an internal
+      # error) rather than silently returning Trivial.
+      if visited.contains(&tid.id) then
+        DeinitPlan::PlanLimit
+      else
+        visited.insert(tid.id)
+        let result = match b.resource_kinds.get(tid.id)
+        when Option::Some(k) then
+          if k == TypeKind::Resource || k == TypeKind::Capability then
+            let structural = mir_structural_plan(b, &td, &args, visited)
+            match b.deinit_targets.get(tid.id)
+            when Option::Some(n) then
+              if deinit_plan_is_trivial(&structural) then
+                DeinitPlan::Call(n.clone())
+              else
+                # User finalizer first, then compiler-owned structural cleanup.
+                DeinitPlan::UserFinalizer(n.clone(), structural)
+              end
+            when Option::None then structural
             end
-          when Option::None then structural
+          else
+            # P0-10: viral containment through ORDINARY value types too —
+            # a plain `struct Wrapper[T] { item: T }` with Wrapper[Probe]
+            # must yield a structural plan even though its nominal kind is
+            # Value (resource-ness derives from the substituted concrete
+            # fields, not the nominal TypeKind). Container names get their
+            # canonical plans; everything else gets the structural plan.
+            let container_plan = mir_named_container_plan(b, &td, &args, visited)
+            if deinit_plan_is_trivial(&container_plan) then
+              mir_structural_plan(b, &td, &args, visited)
+            else
+              container_plan
+            end
           end
-        else
-          mir_named_container_plan(b, &td, &args)
+        when Option::None then DeinitPlan::Trivial
         end
-      when Option::None then DeinitPlan::Trivial
+        visited.remove(&tid.id)
+        result
       end
     when Option::None then
       match b.deinit_plans.get(tid.id)
@@ -1321,35 +1348,32 @@ def deinit_plan_for_type(b: &MirBuilder, ty: &Type) -> DeinitPlan
       when Option::None then DeinitPlan::Trivial
       end
     end
-  when Type::Slice(inner) then DeinitPlan::Array(deinit_plan_for_type(b, &inner))
-  when Type::Array(inner, _) then DeinitPlan::Array(deinit_plan_for_type(b, &inner))
-  when Type::Map(k, v) then DeinitPlan::Map(deinit_plan_for_type(b, &k), deinit_plan_for_type(b, &v))
-  when Type::Set(inner) then DeinitPlan::Set(deinit_plan_for_type(b, &inner))
-  when Type::Box(inner) then DeinitPlan::Aggregate(mir_single_plan(b, &inner))
+  when Type::Slice(inner) then DeinitPlan::Array(deinit_plan_for_type(b, &inner, visited))
+  when Type::Array(inner, _) then DeinitPlan::Array(deinit_plan_for_type(b, &inner, visited))
+  when Type::Map(k, v) then DeinitPlan::Map(deinit_plan_for_type(b, &k, visited), deinit_plan_for_type(b, &v, visited))
+  when Type::Set(inner) then DeinitPlan::Set(deinit_plan_for_type(b, &inner, visited))
+  when Type::Box(inner) then DeinitPlan::Box(deinit_plan_for_type(b, &inner, visited))
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
-      plans.push(deinit_plan_for_type(b, &f))
+      plans.push(deinit_plan_for_type(b, &f, visited))
     end
     DeinitPlan::Tuple(plans)
-  when Type::Option(inner) then DeinitPlan::Option(deinit_plan_for_type(b, &inner))
-  when Type::Result(ok, err) then DeinitPlan::Result(deinit_plan_for_type(b, &ok), deinit_plan_for_type(b, &err))
+  when Type::Option(inner) then DeinitPlan::Option(deinit_plan_for_type(b, &inner, visited))
+  when Type::Result(ok, err) then DeinitPlan::Result(deinit_plan_for_type(b, &ok, visited), deinit_plan_for_type(b, &err, visited))
   when _ then DeinitPlan::Trivial
   end
 end
 
 # Structural (field/variant) plan for a nominal type def, with the concrete
 # args substituted into field types.
-def mir_structural_plan(b: &MirBuilder, td: &MirTypeDef, args: &Vec[Type], depth: Int) -> DeinitPlan
-  if depth > 128 then
-    return DeinitPlan::Trivial
-  end
+def mir_structural_plan(b: &MirBuilder, td: &MirTypeDef, args: &Vec[Type], visited: &mut Set[Int]) -> DeinitPlan
   match td.kind
   when MirTypeDefKind::Struct(fields) then
     var plans = Vec::new()
     for f in fields do
       let fty = subst_type_args(&f.ty, &td.generic_params, args)
-      plans.push(deinit_plan_for_type(b, &fty))
+      plans.push(deinit_plan_for_type(b, &fty, visited))
     end
     DeinitPlan::Aggregate(plans)
   when MirTypeDefKind::Enum(variants) then
@@ -1359,7 +1383,7 @@ def mir_structural_plan(b: &MirBuilder, td: &MirTypeDef, args: &Vec[Type], depth
       var vi = 0
       while vi < v.fields.len() do
         let vty = subst_type_args(&v.fields[vi], &td.generic_params, args)
-        vplans.push(deinit_plan_for_type(b, &vty))
+        vplans.push(deinit_plan_for_type(b, &vty, visited))
         vi = vi + 1
       end
       vmap.insert(v.discriminant, (v.name.clone(), vplans))
@@ -1370,17 +1394,17 @@ end
 
 # Named container types (Option/Result/Array/Map/Set) resolve to canonical
 # plans via their type name + concrete args.
-def mir_named_container_plan(b: &MirBuilder, td: &MirTypeDef, args: &Vec[Type]) -> DeinitPlan
+def mir_named_container_plan(b: &MirBuilder, td: &MirTypeDef, args: &Vec[Type], visited: &mut Set[Int]) -> DeinitPlan
   if td.name == "Option" && args.len() >= 1 then
-    DeinitPlan::Option(deinit_plan_for_type(b, &args[0]))
+    DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
   elsif td.name == "Result" && args.len() >= 2 then
-    DeinitPlan::Result(deinit_plan_for_type(b, &args[0]), deinit_plan_for_type(b, &args[1]))
+    DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
   elsif (td.name == "Array" || td.name == "Vec") && args.len() >= 1 then
-    DeinitPlan::Array(deinit_plan_for_type(b, &args[0]))
+    DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
   elsif td.name == "Map" && args.len() >= 2 then
-    DeinitPlan::Map(deinit_plan_for_type(b, &args[0]), deinit_plan_for_type(b, &args[1]))
+    DeinitPlan::Map(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
   elsif td.name == "Set" && args.len() >= 1 then
-    DeinitPlan::Set(deinit_plan_for_type(b, &args[0]))
+    DeinitPlan::Set(deinit_plan_for_type(b, &args[0], visited))
   else
     DeinitPlan::Trivial
   end
@@ -1388,22 +1412,33 @@ end
 
 # Box(inner): the inner owns its value — recurse into its plan (allocation
 # release is the Box storage itself, not a resource deinit).
-def mir_single_plan(b: &MirBuilder, inner: &Type) -> Vec[DeinitPlan]
-  var plans = Vec::new()
-  plans.push(deinit_plan_for_type(b, inner))
-  plans
-end
-
-# Emit the recursive deinit chain for one place according to its plan,
-# building BACKWARD: each MirDeinit terminator targets the next cleanup
-# block; the function returns the ENTRY block of the emitted chain, which
-# the predecessor must target. `succ` is the block the chain must end at
-# (typically the final return block). Map plans are recognized; their
-# emission (entry iteration) is a documented TODO.
 def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ: BlockId, span: Span) -> BlockId
   match plan
   when DeinitPlan::Trivial then
     succ
+  when DeinitPlan::PlanLimit then
+    # Fail-closed: a recursive owning type without drop glue cannot be
+    # cleaned by a finite expansion. Report an internal error instead of
+    # silently dropping cleanup.
+    b.errors.push("internal error: recursive resource type cannot be represented by a finite cleanup plan (generated drop glue required)")
+    succ
+  when DeinitPlan::Box(inner_plan) then
+    # Owning-pointer cleanup: finalize the POINTEE (through the deref
+    # projection), then release the allocation (MirDeinit on the box with the
+    # runtime box-drop identity). Exactly once.
+    var deref_projs = place.projections.clone()
+    deref_projs.push(Projection::ProjDeref)
+    let pointee_place = Place { local: place.local, projections: deref_projs }
+    let after_pointee = emit_plan_deinit(b, &pointee_place, inner_plan, succ, span)
+    let box_bk = create_block(b)
+    switch_to_block(b, box_bk)
+    set_terminator(b, MirTerminatorKind::MirDeinit {
+      place: place.clone(),
+      deinit_fn: "__tg_box_free".to_string(),
+      target: after_pointee,
+      unwind: Option::None
+    }, span)
+    box_bk
   when DeinitPlan::Call(name) then
     let bk = create_block(b)
     switch_to_block(b, bk)
@@ -1656,7 +1691,11 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     key_projs.push(Projection::ProjField("0".to_string(), 0))
     let ent_key_place = Place { local: entries_tmp, projections: key_projs }
     # removed = __intrinsic_map_remove(m, &copied_key)
-    let rm_ret = add_temp(b, Type::Unit, span)
+    # map_remove returns Option[V]: the removed value is transferred OUT of
+    # the map into rm_ret, and cleanup destroys THAT returned value (never
+    # the snapshot copy — the snapshot exists only to provide iteration
+    # keys). The Option plan discriminates Some/None.
+    let rm_ret = add_temp(b, Type::Option(Type::Unit), span)
     let rm_blk = create_block(b)
     var rm_args = Vec::new()
     rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
@@ -1669,14 +1708,10 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
       unwind: Option::None
     }, span)
     switch_to_block(b, rm_blk)
-    # Deinit the copied value (the entry storage is gone; the value was
-    # returned by the map's removal — deinit the copy that represents it).
-    var val_projs = Vec::new()
-    val_projs.push(Projection::ProjIndex(ent_idx))
-    val_projs.push(Projection::ProjField("1".to_string(), 1))
-    let ent_value_place = Place { local: entries_tmp, projections: val_projs }
-    let after_value = emit_plan_deinit(b, &ent_value_place, value_plan, ent_header, span)
-    # Deinit the copied key, then loop back.
+    # Deinit the REMOVED value via the Option plan on the call result.
+    let after_value = emit_plan_deinit(b, &place_local(rm_ret), &DeinitPlan::Option(value_plan.clone()), ent_header, span)
+    # Deinit the snapshot key (the map's key storage is gone; the snapshot
+    # copy represents it — the aliasing boundary is documented), then loop.
     let after_key = emit_plan_deinit(b, &ent_key_place, key_plan, after_value, span)
     switch_to_block(b, rm_blk)
     set_terminator(b, MirTerminatorKind::MirGoto(after_key), span)
@@ -1812,7 +1847,9 @@ def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Pla
     i = i - 1
     let ty = builder_local_typed_ty(b, &places[i].local)
     let plan = match ty
-    when Option::Some(t) then deinit_plan_for_type(b, &t)
+    when Option::Some(t) then
+      var vis = Set::new()
+      deinit_plan_for_type(b, &t, &mut vis)
     when Option::None then DeinitPlan::Trivial
     end
     succ = emit_plan_deinit(b, &places[i], &plan, succ, span)
@@ -2020,6 +2057,13 @@ def emit_cfg_deinit_returns(b: &mut MirBuilder) -> Unit
     var ri = 0
     while ri < return_blocks.len() do
       let bid = return_blocks[ri]
+      # Return blocks created by return-EDGE cleanup chains already finalized
+      # their locals on that edge; the function-level plan must not run again
+      # (it would double-deinit sink params).
+      if b.return_edge_blocks.contains(&bid) then
+        ri = ri + 1
+        next
+      end
       let ret_span = b.blocks[bid].terminator.span
       let consumed = match definitely_consumed.get(bid)
       when Option::Some(s) then s.clone()
@@ -3516,7 +3560,9 @@ def lower_block(b: &mut MirBuilder, block: &Block) -> Unit
               when Option::Some(mid) then
                 let ty = builder_local_typed_ty(b, &LocalId { id: mid })
                 let plan = match ty
-                when Option::Some(t) then deinit_plan_for_type(b, &t)
+                when Option::Some(t) then
+      var vis = Set::new()
+      deinit_plan_for_type(b, &t, &mut vis)
                 when Option::None then DeinitPlan::Trivial
                 end
                 chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: mid }), &plan, chain_succ, block.span)
@@ -4390,6 +4436,51 @@ def bind_match_arm_pattern_locals(b: &mut MirBuilder, scrut_local: LocalId, pat:
   end
 end
 
+# Materialize loop-edge cleanup obligations (break/continue): the semantic
+# locals recorded for this edge are finalized before the jump to the loop
+# target. When no obligations exist, the plain goto is emitted.
+def emit_loop_edge_cleanup(b: &mut MirBuilder, key: String, target: Option[BlockId], span: Span) -> Unit
+  match target
+  when Option::Some(tgt) then
+    match b.finalize_plan.get(key)
+    when Option::Some(edge_ids) then
+      if edge_ids.len() > 0 then
+        match b.current_block
+        when Option::Some(edge_blk) then
+          var chain_succ = tgt
+          var ei = edge_ids.len()
+          while ei > 0 do
+            ei = ei - 1
+            let epid = edge_ids[ei]
+            match b.semantic_to_mir.get(epid)
+            when Option::Some(emid) then
+              let ety = builder_local_typed_ty(b, &LocalId { id: emid })
+              let eplan = match ety
+              when Option::Some(t) then
+      var vis = Set::new()
+      deinit_plan_for_type(b, &t, &mut vis)
+              when Option::None then DeinitPlan::Trivial
+              end
+              chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: emid }), &eplan, chain_succ, span)
+            when Option::None then
+              b.errors.push("internal error: loop-edge plan references semantic local _" + epid.to_string() + " with no MIR local")
+            end
+          end
+          switch_to_block(b, edge_blk)
+          set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), span)
+        when Option::None then ()
+        end
+      else
+        # No obligations: plain goto on the current block.
+        set_terminator(b, MirTerminatorKind::MirGoto(tgt), span)
+      end
+    when Option::None then
+      set_terminator(b, MirTerminatorKind::MirGoto(tgt), span)
+    end
+  when Option::None then ()
+  end
+end
+
 def stmt_kind_name(kind: &StmtKind) -> String
   match kind
   when StmtKind::StmtLet(_, _, _, _) then "StmtLet"
@@ -4597,6 +4688,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
               -1
             end
             let ret_chain = create_block(b)
+            b.return_edge_blocks.insert(ret_chain.id)
             switch_to_block(b, ret_chain)
             set_terminator(b, MirTerminatorKind::MirReturn, stmt.span)
             var chain_succ = ret_chain
@@ -4609,7 +4701,9 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
                 if rmid != self_mir_id then
                   let rty = builder_local_typed_ty(b, &LocalId { id: rmid })
                   let rplan = match rty
-                  when Option::Some(t) then deinit_plan_for_type(b, &t)
+                  when Option::Some(t) then
+      var vis = Set::new()
+      deinit_plan_for_type(b, &t, &mut vis)
                   when Option::None then DeinitPlan::Trivial
                   end
                   chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: rmid }), &rplan, chain_succ, stmt.span)
@@ -4643,18 +4737,10 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     when _ then ()
     end
   elsif kind_name == "StmtBreak" then
-    match b.break_target
-    when Option::Some(target) then
-      set_terminator(b, MirTerminatorKind::MirGoto(target), stmt.span)
-    when Option::None then ()
-    end
+    emit_loop_edge_cleanup(b, "break::" + stmt.node_id.to_string(), b.break_target, stmt.span)
     return
   elsif kind_name == "StmtContinue" then
-    match b.continue_target
-    when Option::Some(target) then
-      set_terminator(b, MirTerminatorKind::MirGoto(target), stmt.span)
-    when Option::None then ()
-    end
+    emit_loop_edge_cleanup(b, "continue::" + stmt.node_id.to_string(), b.continue_target, stmt.span)
     return
   elsif kind_name == "StmtLoop" then
     match stmt.kind
@@ -5413,6 +5499,29 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       }, span)
       
       b.current_block = Option::Some(success_blk)
+      
+      # P0-14: a MANUAL deinit() call runs only the user finalizer. The
+      # compiler-owned structural field cleanup must also run (exactly once):
+      # chain the receiver's structural plan (the fields part of a
+      # UserFinalizer plan, or a plain structural plan) into the success
+      # block, so manually-deinitialized resources do not leak their fields.
+      if normalized_method_name == "deinit" || normalized_method_name.ends_with("__deinit") then
+        match mir_infer_expr_type(b, &receiver)
+        when Option::Some(recv_ty) then
+          var vis2 = Set::new()
+          let recv_plan = deinit_plan_for_type(b, &recv_ty, &mut vis2)
+          let fields_plan = match recv_plan
+          when DeinitPlan::UserFinalizer(_, fields) then fields
+          when _ then recv_plan
+          end
+          if !deinit_plan_is_trivial(&fields_plan) then
+            let after_deinit = emit_plan_deinit(b, &recv_place, &fields_plan, success_blk, span)
+            switch_to_block(b, success_blk)
+            set_terminator(b, MirTerminatorKind::MirGoto(after_deinit), span)
+          end
+        when Option::None then ()
+        end
+      end
       
       return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
         kind: MirOperandKind::MirCopy(place_local(ret_tmp))

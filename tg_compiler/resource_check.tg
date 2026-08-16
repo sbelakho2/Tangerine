@@ -33,6 +33,10 @@ enum ParamOrigin
   Sink
   Set
   OwnedLocal
+  # The `self` of a deinit finalizer: compiler-owned (the wrapper finalizes
+  # the subject and its fields exactly once) — the user hook must not
+  # independently consume or re-finalize it.
+  DeinitSelf
 end
 
 struct ResFrame
@@ -130,6 +134,11 @@ def type_kind_contains_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
     type_fields_contain_resource(kinds, &fields)
   when Type::Function(_, _) then false
   when Type::RefInternal(inner, _) then type_kind_contains_resource(kinds, &inner)
+  when Type::Box(inner) then type_kind_contains_resource(kinds, &inner)
+  # Type::Param is intentionally NOT treated as resource-containing here:
+  # unconstrained generics need ownership-polymorphic re-checking after
+  # instantiation (P0-8, documented) — conservatively tracking every generic
+  # local as a resource would reject valid generic code.
   when _ then false
   end
 end
@@ -357,6 +366,12 @@ def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, ow
   while i < f.contracts.len() do
     check_expr(program, typed, &f.contracts[i].expr, &Vec::new(), &mut frame, errors, finalize_plan)
     i = i + 1
+  end
+  # A deinit's own `self` is COMPILER-OWNED: mark it so the body cannot
+  # consume/re-finalize the subject (the generated wrapper runs the user hook
+  # then the structural field cleanup exactly once).
+  if f.name == "deinit" && entry_ids.len() > 0 then
+    frame.origins.insert(entry_ids[0], ParamOrigin::DeinitSelf)
   end
   check_fn_body(program, typed, &f.body, &mut frame, errors, finalize_plan)
   # The authoritative finalize plan is computed from the frame BEFORE
@@ -771,13 +786,17 @@ def record_exit_edge_plan(typed: &TypedProgram, frame: &ResFrame, key: String, f
   end
 end
 
-def check_break_stmt(program: &Program, typed: &TypedProgram, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
+def check_break_stmt(program: &Program, typed: &TypedProgram, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], stmt_node_id: Int) -> Unit
   match val_opt
   when Option::Some(val) then
     check_expr(program, typed, &val, loop_outer, frame, errors, finalize_plan)
     transfer_consume(typed, &val, loop_outer, frame, errors, finalize_plan)
   when Option::None then ()
   end
+  # BREAK-EDGE cleanup obligation: locals live at this break leave the loop
+  # through a terminator, not normal block fallthrough — they must be
+  # finalized on this edge.
+  record_exit_edge_plan(typed, frame, "break::" + stmt_node_id.to_string(), finalize_plan)
 end
 
 def check_yield_stmt(program: &Program, typed: &TypedProgram, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
@@ -792,8 +811,10 @@ end
 def check_terminator_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   match stmt.kind
   when StmtKind::StmtReturn(val_opt) then check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
-  when StmtKind::StmtBreak(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
-  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtBreak(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
+  when StmtKind::StmtContinue then
+    # CONTINUE-EDGE cleanup obligation (backedge leaves through a terminator).
+    record_exit_edge_plan(typed, frame, "continue::" + stmt.node_id.to_string(), finalize_plan)
   when StmtKind::StmtYield(val_opt) then check_yield_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
   when _ then ()
   end
@@ -830,11 +851,41 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
   when StmtKind::StmtLoop(body) then
     check_loop(program, typed, Option::None, &body, loop_outer, frame, errors, finalize_plan)
   when StmtKind::StmtReturn(val_opt) then check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
-  when StmtKind::StmtBreak(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
-  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtBreak(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
+  when StmtKind::StmtContinue then
+    # CONTINUE-EDGE cleanup obligation (backedge leaves through a terminator).
+    record_exit_edge_plan(typed, frame, "continue::" + stmt.node_id.to_string(), finalize_plan)
   when StmtKind::StmtYield(val_opt) then check_yield_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
   when StmtKind::StmtExpr(e) then
     check_expr(program, typed, &e, loop_outer, frame, errors, finalize_plan)
+    # P0-15: an expression statement whose result is resource-containing and
+    # UNCONSUMED silently drops an owned temporary. The result must be
+    # consumed, bound, returned, or explicitly discarded through a consuming
+    # operation — otherwise the value vanishes without finalization.
+    match typed.expr_types.get(e.node_id)
+    when Option::Some(et) then
+      if type_kind_contains_resource(&typed.type_kinds, &et) then
+        match expr_root_id(typed, &e)
+        when Option::Some(root_id) then
+          match res_frame_get(frame, &root_id)
+          when Option::Some(ResourceState::Live) then
+            errors.push(ResourceError {
+              message: "owned resource result must be consumed, bound, returned, or explicitly discarded through a consuming operation",
+              span: e.span
+            })
+          when _ then ()
+          end
+        when Option::None then
+          # A resource-producing expression with no root (e.g. a call result)
+          # is an owned temporary that must not be discarded.
+          errors.push(ResourceError {
+            message: "owned resource result must be consumed, bound, returned, or explicitly discarded through a consuming operation",
+            span: e.span
+          })
+        end
+      end
+    when Option::None then ()
+    end
   when StmtKind::StmtUnsafe(_, body) then
     check_block(program, typed, &body, loop_outer, frame, errors, finalize_plan)
   when StmtKind::StmtDefer(body) then
@@ -842,10 +893,11 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
   when StmtKind::StmtGuard(cond, else_action) then
     check_expr(program, typed, &cond, loop_outer, frame, errors, finalize_plan)
     match else_action
-    when GuardElse::Return(val_opt) then check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
+    when GuardElse::Return(val_opt) then check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
     when GuardElse::Panic(_) then ()
-    when GuardElse::Break(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan)
-    when GuardElse::Continue then ()
+    when GuardElse::Break(val_opt) then check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
+    when GuardElse::Continue then
+      record_exit_edge_plan(typed, frame, "continue::" + stmt.node_id.to_string(), finalize_plan)
     end
   when StmtKind::StmtTry(body, catches, finally_block) then
     mut try_frame = res_frame_clone(frame)
@@ -1434,6 +1486,13 @@ def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[In
   # exactly the unsoundness `def inspect(x: R); destroy(x)` exercises.
   match frame.origins.get(id)
   when Option::Some(origin) then
+    if origin == ParamOrigin::DeinitSelf then
+      errors.push(ResourceError {
+        message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
+        span: span
+      })
+      return
+    end
     if origin == ParamOrigin::Let then
       errors.push(ResourceError {
         message: "cannot consume resource `" + binding_name(typed, id) + "`: let parameter is read-only",

@@ -150,13 +150,21 @@ enum DeinitPlan
   Enum(Map[Int, (String, Vec[DeinitPlan])])
   Array(DeinitPlan)
   Set(DeinitPlan)                  # hash-set element plan (NOT array storage)
+  # Box[T]: an OWNING pointer/allocation, not an inline aggregate. Lowering
+  # dereferences the box, finalizes the pointee, and releases the allocation
+  # (exactly once).
+  Box(DeinitPlan)
+  # Fail-closed marker: the cleanup plan could not be constructed finitely
+  # (recursive resource type without drop glue). The emitter reports an
+  # internal error instead of silently dropping cleanup.
+  PlanLimit
   Map(DeinitPlan, DeinitPlan)      # key plan, value plan
   Tuple(Vec[DeinitPlan])
   Option(DeinitPlan)
   Result(DeinitPlan, DeinitPlan)
 end
 
-def deinit_plan_is_trivial(plan: &DeinitPlan) -> Bool
+pub def deinit_plan_is_trivial(plan: &DeinitPlan) -> Bool
   match plan
   when DeinitPlan::Trivial then true
   when _ then false
@@ -195,12 +203,12 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
   when Type::Set(inner) then
     DeinitPlan::Set(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Box(inner) then
-    # Box[T] OWNS T: the inner value participates in cleanup (allocation
-    # release is the Box storage itself). Rc[T] (shared) and raw Ptr[T]
-    # (non-owning) are NOT owning and stay out of containment.
-    var box_plans = Vec::new()
-    box_plans.push(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
-    DeinitPlan::Aggregate(box_plans)
+    # Box[T] OWNS T through an allocation: a distinct Box plan (not an
+    # Aggregate — a Box is a pointer, not a field container). Rc[T] (shared
+    # ownership) and raw Ptr[T] (non-owning) are NOT owning and stay out of
+    # containment — Rc[Resource] is an explicitly unsupported combination
+    # (a linear resource cannot become shared ownership; documented decision).
+    DeinitPlan::Box(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
@@ -4489,11 +4497,12 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       match callee_ident_name(&func)
       when Option::Some(cname) then
         # Copy-producing intrinsics are compiler-internal building blocks; a
-        # DIRECT call on a resource-containing element type is rejected here
+        # DIRECT call on resource-containing element types is rejected here
         # (the std wrappers carry the same restriction via Copyable bounds).
-        if cname == "__intrinsic_array_get" || cname == "__intrinsic_map_get" ||
-           cname == "__intrinsic_array_slice" || cname == "__intrinsic_map_entries" ||
-           cname == "__intrinsic_set_entries" then
+        # Operation-specific contracts: map_get copies V; map_entries copies
+        # K AND V; map_keys would copy K; array_get/slice copy T.
+        if cname == "__intrinsic_array_get" || cname == "__intrinsic_array_slice" ||
+           cname == "__intrinsic_map_get" || cname == "__intrinsic_set_entries" then
           if args.len() >= 1 then
             match container_element_type(env, &arg_types[0])
             when Option::Some(elem_ty) then
@@ -4501,6 +4510,18 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
                 type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
               end
             when Option::None then ()
+            end
+          end
+        elsif cname == "__intrinsic_map_entries" then
+          # map_entries materializes (K, V) pairs: a resource KEY is just as
+          # duplicating as a resource value.
+          if args.len() >= 1 then
+            match arg_types[0]
+            when Type::Map(k, v) then
+              if type_has_resource_kind(env, &k) || type_has_resource_kind(env, &v) then
+                type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+              end
+            when _ then ()
             end
           end
         end
