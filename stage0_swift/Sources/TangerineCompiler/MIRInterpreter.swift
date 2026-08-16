@@ -1819,7 +1819,8 @@ public final class MIRInterpreter {
         "io::print", "io::println", "io::eprint", "io::eprintln",
         "std::io::print", "std::io::println", "std::io::eprint", "std::io::eprintln",
         "from_cstr", "String::from_cstr", "String__from_cstr", "string_from_cstr",
-        "read_file_text_direct", "driver::read_file_text_direct",
+        "read_file_text_direct", "driver::read_file_text_direct", "compiler_core::read_file_text_direct",
+        "read_file_to_string_native", "compiler_core::read_file_to_string_native",
         "read_to_vec", "read_file", "write_file", "write_file_bytes", "write_file_bytes_owned",
         "file_exists", "path_exists", "mkdir_p", "create_dir_all",
         "list_directory", "list_dir", "read_dir", "delete_file", "remove_file",
@@ -4578,7 +4579,8 @@ public final class MIRInterpreter {
                 }
             }
             return .enumVal("Result", 1, .string("read_to_vec: no path"))
-        case "read_file_text_direct", "driver::read_file_text_direct":
+        case "read_file_text_direct", "driver::read_file_text_direct", "compiler_core::read_file_text_direct",
+             "read_file_to_string_native", "compiler_core::read_file_to_string_native":
             if let path = args.first?.displayString {
                 do {
                     let text = try String(contentsOfFile: path, encoding: .utf8)
