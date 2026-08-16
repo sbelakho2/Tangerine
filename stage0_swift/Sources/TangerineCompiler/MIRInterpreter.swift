@@ -615,12 +615,27 @@ public final class MIRInterpreter {
         }
 
         // Handle &mut argument write-back
+        //
+        // Direct Place args already carry the real storage path (including
+        // field/index projections, e.g. `&mut p.diag` or `&mut elems[i]`), so
+        // the write-back must target that exact path. The mutBorrows map only
+        // provides the borrowed place for legacy temp-local indirection (a
+        // projection-less temp local that holds a mutable reference); using it
+        // to override a projected Place would clobber the ENTIRE base local
+        // with the callee's final parameter value, corrupting the caller's
+        // state (observed as the parser losing its struct and the walker
+        // losing its Box wrapper).
         if !lastCallFinalParams.isEmpty {
             for (i, arg) in callArgs.enumerated() {
                 guard i < lastCallFinalParams.count else { break }
                 guard callArgNeedsWriteBack(arg) else { continue }
                 if let ap = callArgPlace(arg) {
-                    let borrowedPlace = caller.mutBorrows[ap.local] ?? ap
+                    let borrowedPlace: MirPlace
+                    if ap.projections.isEmpty, let mb = caller.mutBorrows[ap.local] {
+                        borrowedPlace = mb
+                    } else {
+                        borrowedPlace = ap
+                    }
                     let modifiedVal = lastCallFinalParams[i]
                     if borrowedPlace.projections.isEmpty {
                         setLocal(borrowedPlace.local, modifiedVal)
@@ -1686,8 +1701,17 @@ public final class MIRInterpreter {
         case .projDeref:
             // Dereference through single-ptr-field wrappers (Box, Owned, Rc, etc.)
             // and Ptr values to get the inner value.
+            //
+            // Unwrap RECURSIVELY through nested single-ptr wrappers. The AST is
+            // allowed to hold Box(Box(Expr)) when a type-directed Box coercion
+            // is applied to a payload that is already a Box (e.g. the
+            // ExprAccess-family enum variants where the parser writes
+            // `ExprAccess(expr)` and the coercion machinery wraps it), and the
+            // walkers dereference with a single ProjDeref. A one-level unwrap
+            // would then expose the inner Box to a field projection such as
+            // `node_id` and crash with "struct Box has no field 'node_id'".
             if case .structVal(_, let fields) = val, fields.count == 1, let inner = fields["ptr"] {
-                return inner
+                return projectValue(inner, .projDeref)
             }
             return val // no-op for ref/rawPtr (transparent in interpreter)
         }
@@ -1766,6 +1790,16 @@ public final class MIRInterpreter {
                 }
                 return failProjection(first, on: base, detail: "constant index \(idx) out of range for write", fallback: base)
             case .projDeref:
+                // Write through a single-ptr wrapper (Box, Owned, Rc, etc.)
+                // instead of replacing the whole base value with the inner
+                // value. Replacing the base would drop the Box layer from the
+                // local, so a later projection (e.g. the AST walkers writing
+                // `expr.node_id` through a Box payload) would either crash or
+                // silently lose the wrapper and corrupt the AST structure.
+                if case .structVal(let sName, var fields) = base, fields.count == 1, fields["ptr"] != nil {
+                    fields["ptr"] = value
+                    return .structVal(sName, fields)
+                }
                 return value  // deref is identity in interpreter (no real pointers)
             default:
                 return base
@@ -2421,8 +2455,14 @@ public final class MIRInterpreter {
             return .bool(false)
         case "make_expr":
             // make_expr(kind: ExprKind, span: Span) -> Expr
+            // The Expr struct is `Expr { kind, span, node_id }` (see
+            // tg_compiler/ast.tg); the node_id field must be present so the
+            // AST walkers (e.g. ast::assign_node_ids, which writes
+            // `expr.node_id = next_id`) can mutate it through field
+            // projections. Without it, the interpreter reports
+            // "struct Expr has no field 'node_id' for write".
             if args.count >= 2 {
-                return .structVal("Expr", ["kind": args[0], "span": args[1]])
+                return .structVal("Expr", ["kind": args[0], "span": args[1], "node_id": .int(0)])
             }
         case "span_merge":
             // span_merge(a: Span, b: Span) -> Span = Span(file: a.file, start: a.start, end_pos: b.end_pos)

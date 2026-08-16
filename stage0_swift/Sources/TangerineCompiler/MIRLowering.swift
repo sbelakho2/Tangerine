@@ -696,12 +696,10 @@ public final class MIRLowering {
             let val = lowerExpr(value)
             if case .name(let n, _) = target, let id = lookupScope(n) {
                 emit(.assign(.local(id), .use(val)))
-            } else if case .field(let base, let field, _) = target {
-                let baseOp = lowerExpr(base)
-                let baseLocal = placeOf(baseOp)
-                emit(.assign(MirPlace(local: baseLocal, projections: [.namedField(field)]), .use(val)))
             } else {
-                // Handle indexed and nested assignment: base.field[idx] = val, base[idx] = val
+                // Handle field/indexed/nested assignment: base.field = val,
+                // base[idx] = val. lowerPlaceExpr inserts the ProjDeref when
+                // the base local is a reference type (refInternal params).
                 let (local, projs) = lowerPlaceExpr(target)
                 if !projs.isEmpty {
                     emit(.assign(MirPlace(local: local, projections: projs), .use(val)))
@@ -2603,16 +2601,32 @@ public final class MIRLowering {
             return (placeOf(op), [])
         case .field(let base, let field, _):
             let (local, projs) = lowerPlaceExpr(base)
-            return (local, projs + [.namedField(field)])
+            var fieldProjs = projs
+            // Auto-insert ProjDeref when the base local is a reference type and no
+            // projections have been applied yet (mirrors native mir.tg behavior).
+            if projs.isEmpty, isRefInternal(local) {
+                fieldProjs.append(.projDeref)
+            }
+            return (local, fieldProjs + [.namedField(field)])
         case .index(let base, let idx, _):
             let (local, projs) = lowerPlaceExpr(base)
+            var idxProjs = projs
+            if projs.isEmpty, isRefInternal(local) {
+                idxProjs.append(.projDeref)
+            }
             let idxOp = lowerExpr(idx)
             let idxLocal = placeOf(idxOp)
-            return (local, projs + [.index(idxLocal)])
+            return (local, idxProjs + [.index(idxLocal)])
         default:
             let op = lowerExpr(expr)
             return (placeOf(op), [])
         }
+    }
+
+    private func isRefInternal(_ local: LocalId) -> Bool {
+        guard let ty = locals.first(where: { $0.id == local })?.type else { return false }
+        if case .refInternal(_, _) = ty { return true }
+        return false
     }
 
     /// Resolve a bare function name to its fully qualified name.
