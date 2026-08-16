@@ -16,7 +16,7 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath,
   Param, AccessConvention
 }
-use tg_compiler::types::{Type, TypeId, AccessEffect, ParamType}
+use tg_compiler::types::{Type, TypeId, AccessEffect, ParamType, TypedProgram}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -964,6 +964,7 @@ struct MirBuilder
   fn_param_conventions: Map[String, Vec[AccessConvention]]
   static_names: Set[String]
   static_types: Map[String, Type]
+  access_effects: Map[Int, AccessEffect]
 end
 
 struct PendingClosure
@@ -998,7 +999,8 @@ def builder_new() -> MirBuilder
     fn_ret_types: Map::new(),
     fn_param_conventions: Map::new(),
     static_names: Set::new(),
-    static_types: Map::new()
+    static_types: Map::new(),
+    access_effects: Map::new()
   }
 end
 
@@ -1316,8 +1318,9 @@ end
 # AST to MIR Lowering
 # ———————————————————————————————————————————————————————————————
 
-def lower_program(program: &Program) -> Result[MirProgram, String]
+def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram, String]
   var b = builder_new()
+  b.access_effects = typed.access_effects.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -2491,18 +2494,53 @@ def mir_call_arg_effects(b: &MirBuilder, callee_name: String, arg_count: Int) ->
   effects
 end
 
-def mir_call_args(b: &MirBuilder, callee_name: String, operands: Vec[MirOperand]) -> Vec[MirCallArg]
-  let effects = mir_call_arg_effects(b, callee_name, operands.len())
-  var result = Vec::new()
-  var arg_idx = 0
-  while arg_idx < operands.len() do
-    result.push(MirCallArg {
-      effect: effects[arg_idx].clone(),
-      value: MirCallValue::Value(duplicate_operand(&operands[arg_idx]))
-    })
-    arg_idx = arg_idx + 1
+def call_arg_effect(b: &MirBuilder, callee_name: String, arg_idx: Int, arg_expr: &Expr) -> AccessEffect
+  match b.access_effects.get(arg_expr.node_id)
+  when Option::Some(e) then *e
+  when Option::None then
+    let kind_name = expr_kind_name(&arg_expr.kind)
+    if kind_name == "ExprRef" then
+      AccessEffect::Read
+    elsif kind_name == "ExprRefMut" then
+      AccessEffect::Modify
+    else
+      match b.fn_param_conventions.get(&callee_name)
+      when Option::Some(conventions) then
+        if arg_idx < conventions.len() then
+          convention_access_effect(conventions[arg_idx])
+        else
+          AccessEffect::Read
+        end
+      when Option::None then AccessEffect::Read
+      end
+    end
   end
-  result
+end
+
+def lower_call_arg(b: &mut MirBuilder, callee_name: String, arg_idx: Int, arg_expr: &Expr, span: Span) -> MirCallArg
+  let effect = call_arg_effect(b, callee_name, arg_idx, arg_expr)
+  let kind_name = expr_kind_name(&arg_expr.kind)
+  var value = MirCallValue::Value(operand_unit())
+  if kind_name == "ExprRef" then
+    match arg_expr.kind
+    when ExprKind::ExprRef(inner) then value = MirCallValue::Place(lower_place(b, &inner))
+    when _ then ()
+    end
+  elsif kind_name == "ExprRefMut" then
+    match arg_expr.kind
+    when ExprKind::ExprRefMut(inner) then value = MirCallValue::Place(lower_place(b, &inner))
+    when _ then ()
+    end
+  elsif effect == AccessEffect::Consume then
+    if expr_is_place_like(arg_expr) then
+      value = MirCallValue::Place(lower_place(b, arg_expr))
+    else
+      value = MirCallValue::Value(lower_expr(b, arg_expr, span))
+    end
+  else
+    value = MirCallValue::Value(lower_expr(b, arg_expr, span))
+  end
+  MirCallArg { effect: effect, value: value }
 end
 
 def resolve_callee_name(b: &MirBuilder, callee_expr: &Expr) -> String
@@ -3764,22 +3802,22 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
   let callee_op = lower_callee_expr(b, callee_expr, span)
   let ret_type = mir_infer_call_result_type(b, callee_expr)
 
-  var mir_args = Vec::new()
-  var arg_idx = 0
-  while arg_idx < arg_exprs.len() do
-    mir_args.push(lower_expr(b, &arg_exprs[arg_idx], span))
-    arg_idx = arg_idx + 1
-  end
-
   let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
   let dest_place = place_local(ret_tmp)
   let success_blk = create_block(b)
   let callee_fn_name = resolve_callee_name(b, callee_expr)
 
+  var mir_args = Vec::new()
+  var arg_idx = 0
+  while arg_idx < arg_exprs.len() do
+    mir_args.push(lower_call_arg(b, callee_fn_name, arg_idx, &arg_exprs[arg_idx], span))
+    arg_idx = arg_idx + 1
+  end
+
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: dest_place,
     func: callee_op,
-    args: mir_call_args(b, callee_fn_name, mir_args),
+    args: mir_args,
     success: success_blk,
     unwind: Option::None
   }, span)
@@ -3828,7 +3866,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < args.len() do
-    mir_args.push(lower_expr(b, &args[arg_idx], span))
+    mir_args.push(lower_call_arg(b, fn_name.clone(), arg_idx, &args[arg_idx], span))
     arg_idx = arg_idx + 1
   end
   let ret_type = infer_static_path_result_type(b, path)
@@ -3838,7 +3876,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: dest_place,
     func: callee_op,
-    args: mir_call_args(b, fn_name.clone(), mir_args),
+    args: mir_args,
     success: success_blk,
     unwind: Option::None
   }, span)
@@ -4223,11 +4261,12 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       let callee_op = mir_fn_operand(b, resolved_method.clone())
 
       # Lower arguments: receiver first, then explicit args
+      let recv_effect = call_arg_effect(b, resolved_method.clone(), 0, &receiver)
       var mir_args = Vec::new()
-      mir_args.push(recv_op)
+      mir_args.push(MirCallArg { effect: recv_effect, value: MirCallValue::Value(recv_op) })
       var arg_idx = 0
       while arg_idx < arg_exprs.len() do
-        mir_args.push(lower_expr(b, &arg_exprs[arg_idx], span))
+        mir_args.push(lower_call_arg(b, resolved_method.clone(), arg_idx + 1, &arg_exprs[arg_idx], span))
         arg_idx = arg_idx + 1
       end
 
@@ -4247,7 +4286,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       set_terminator(b, MirTerminatorKind::MirCall {
         dest: dest_place,
         func: callee_op,
-        args: mir_call_args(b, resolved_method.clone(), mir_args),
+        args: mir_args,
         success: success_blk,
         unwind: Option::None
       }, span)
@@ -6982,11 +7021,12 @@ def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &B
   let len_ret = add_temp(b, Type::Int, span)
   let len_success = create_block(b)
   var len_args = Vec::new()
-  len_args.push(recv_op)
+  let len_effects = mir_call_arg_effects(b, len_callee.clone(), 1)
+  len_args.push(MirCallArg { effect: len_effects[0].clone(), value: MirCallValue::Value(recv_op) })
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: place_local(len_ret),
     func: mir_fn_operand(b, len_callee.clone()),
-    args: mir_call_args(b, len_callee.clone(), len_args),
+    args: len_args,
     success: len_success,
     unwind: Option::None
   }, span)
@@ -8622,13 +8662,24 @@ def prepare_inline_body(callee: &MirFunction, start_local_id: Int, start_block_i
           when Option::Some(new_local) then
             var param_place = place_local(callee.params[i].id.clone())
             param_place.local.id = new_local
-            new_stmts.push(MirStatement {
-              kind: MirStatementKind::MirAssign(
-                param_place,
-                move_rvalue(mir_call_arg_operand(&args[i]))
-              ),
-              span: callee.span.clone()
-            })
+            match &args[i].value
+            when MirCallValue::Place(p) then
+              new_stmts.push(MirStatement {
+                kind: MirStatementKind::MirAssign(
+                  param_place,
+                  MirRvalue { kind: MirRvalueKind::MirRef(duplicate_place(p)) }
+                ),
+                span: callee.span.clone()
+              })
+            when MirCallValue::Value(_) then
+              new_stmts.push(MirStatement {
+                kind: MirStatementKind::MirAssign(
+                  param_place,
+                  move_rvalue(mir_call_arg_operand(&args[i]))
+                ),
+                span: callee.span.clone()
+              })
+            end
           when Option::None then ()
           end
         end
@@ -12020,8 +12071,8 @@ end
 # Public API
 # ———————————————————————————————————————————————————————————————
 
-def lower_to_mir(program: &Program) -> Result[MirProgram, String]
-  match lower_program(program)
+def lower_to_mir(program: &Program, typed: &TypedProgram) -> Result[MirProgram, String]
+  match lower_program(program, typed)
   when Result::Ok(var mir) then
     transform_async_functions(&mut mir)
     Result::Ok(mir)
@@ -12991,8 +13042,17 @@ def verifier_check_call(type_index: &Map[Int, MirTypeDef], func: &MirFunction, d
       var i = 0
       while i < args.len() && i < param_tys.len() do
         if i < arg_types.len() then
-          if !verifier_types_compatible(&param_tys[i].ty, &arg_types[i]) then
-            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(&param_tys[i].ty) + " got " + verifier_type_key(&arg_types[i]))
+          var expected_ty = param_tys[i].ty.clone()
+          match &args[i].value
+          when MirCallValue::Place(_) then
+            match verifier_strip_pointee(&expected_ty)
+            when Option::Some(stripped) then expected_ty = stripped
+            when Option::None then ()
+            end
+          when MirCallValue::Value(_) then ()
+          end
+          if !verifier_types_compatible(&expected_ty, &arg_types[i]) then
+            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(&expected_ty) + " got " + verifier_type_key(&arg_types[i]))
           end
         end
         i = i + 1

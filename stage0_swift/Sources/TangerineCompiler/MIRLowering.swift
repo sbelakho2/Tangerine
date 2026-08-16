@@ -315,6 +315,15 @@ public final class MIRLowering {
         return Array(repeating: .read, count: argCount)
     }
 
+    private func lowerCallArg(_ expr: Expr, effectFallback: AccessEffect) -> MirCallArg {
+        if case .unary(let op, let inner, _) = expr, op == .borrow || op == .borrowMut {
+            if let place = exprToPlace(inner) {
+                return MirCallArg(effect: op == .borrowMut ? .modify : .read, value: .place(place))
+            }
+        }
+        return MirCallArg(effect: effectFallback, value: .value(lowerExpr(expr)))
+    }
+
     private func inferDirectCallResultType(_ callee: Expr, loweredCallee: MirOperand? = nil) -> MirType {
         switch callee {
         case .name(let name, _):
@@ -709,7 +718,6 @@ public final class MIRLowering {
                     baseOp = lowerExpr(base)
                 }
 
-                let argOps = [baseOp] + args.map { lowerExpr($0.value) }
                 let resultType = inferMethodCallResultType(receiverType: operandType(baseOp), methodName: methodName)
                 let result = freshTemp(type: resultType)
                 let nextBB = freshBlock()
@@ -719,9 +727,10 @@ public final class MIRLowering {
                 } else {
                     methodCalleeName = ".\(methodName)"
                 }
-                let effects = argEffects(forCallee: methodCalleeName, argCount: argOps.count)
-                let callArgs = argOps.enumerated().map { i, op in
-                    MirCallArg(effect: i < effects.count ? effects[i] : .read, value: .value(op))
+                let effects = argEffects(forCallee: methodCalleeName, argCount: args.count + 1)
+                var callArgs: [MirCallArg] = [MirCallArg(effect: effects.first ?? .read, value: .value(baseOp))]
+                for (i, a) in args.enumerated() {
+                    callArgs.append(lowerCallArg(a.value, effectFallback: i + 1 < effects.count ? effects[i + 1] : .read))
                 }
                 terminateWith(.call(dest: .local(result),
                                     callee: .constant(.fnItem(".\(methodName)")),
@@ -766,7 +775,6 @@ public final class MIRLowering {
                 return .copy(.local(result))
             }
             let calleeOp = lowerExpr(callee)
-            let argOps = args.map { lowerExpr($0.value) }
             let resultType = inferDirectCallResultType(callee, loweredCallee: calleeOp)
             let result = freshTemp(type: resultType)
             let nextBB = freshBlock()
@@ -781,12 +789,12 @@ public final class MIRLowering {
             }
             let directArgEffects: [AccessEffect]
             if let directCalleeName {
-                directArgEffects = argEffects(forCallee: directCalleeName, argCount: argOps.count)
+                directArgEffects = argEffects(forCallee: directCalleeName, argCount: args.count)
             } else {
-                directArgEffects = Array(repeating: .read, count: argOps.count)
+                directArgEffects = Array(repeating: .read, count: args.count)
             }
-            let directCallArgs = argOps.enumerated().map { i, op in
-                MirCallArg(effect: i < directArgEffects.count ? directArgEffects[i] : .read, value: .value(op))
+            let directCallArgs = args.enumerated().map { i, a in
+                lowerCallArg(a.value, effectFallback: i < directArgEffects.count ? directArgEffects[i] : .read)
             }
             terminateWith(.call(dest: .local(result), callee: calleeOp, args: directCallArgs,
                                 next: nextBB, unwind: nil))
