@@ -1010,8 +1010,10 @@ struct TangerineCLI {
         print("Merged MIR: \(mergedMIR.functions.count) functions, \(mergedMIR.statics.count) statics, \(mergedMIR.typeDefs.count) types")
         fflush(stdout)
 
-        guard mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" }) else {
-            fputs("error: no 'driver::driver_main' entry point found in merged MIR\n", stderr)
+        guard mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" })
+              || mergedMIR.functions.contains(where: { $0.name == "bootstrap_main::main" })
+              || mergedMIR.functions.contains(where: { $0.name == "main" }) else {
+            fputs("error: no compiler entry point (driver::driver_main / bootstrap_main::main / main) found in merged MIR\n", stderr)
             exit(1)
         }
 
@@ -1049,7 +1051,7 @@ struct TangerineCLI {
         print("Args: \(compileArgs.joined(separator: " "))")
         fflush(stdout)
 
-        let result = interp.run(entryFunction: "driver::driver_main")
+        let result = interp.run(entryFunction: resolveEntryFunction(mergedMIR))
         let outputAttrsAfter = try? fm.attributesOfItem(atPath: outputPath)
         let outputSize = (outputAttrsAfter?[.size] as? NSNumber)?.int64Value ?? 0
         let hadPanic = result.output.contains(where: { $0.hasPrefix("PANIC:") })
@@ -1222,7 +1224,7 @@ struct TangerineCLI {
             }
         }
         interp.runtimeArgs = selfHostArgs
-        let result = interp.run(entryFunction: "driver::driver_main")
+        let result = interp.run(entryFunction: resolveEntryFunction(mergedMIR))
 
         for line in result.output {
             print(line)
