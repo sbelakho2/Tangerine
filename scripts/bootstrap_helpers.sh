@@ -449,13 +449,23 @@ run_critical_canaries() {
 }
 
 # Semantic canary negatives: every file in tests/canary_neg/ is a negative
-# case of the access/resource/capability/async canary matrix and MUST be
-# rejected by `check` with a nonzero exit. A file that is accepted (exit 0)
-# is a checker regression or a broken canary and fails the harness.
+# case of the access/resource/capability/async canary matrix. Each file MUST
+# be rejected by `check` AND the failure MUST be the diagnostic class listed
+# in tests/canary_neg/MANIFEST (tab-separated: filename.tg<TAB>expected
+# substring). Asserting only the exit code gave false confidence: an
+# unrelated later error could turn a canary green.
+# A file that is accepted (exit 0), or whose output lacks the expected
+# diagnostic substring, fails the harness. Files without a manifest entry
+# also fail (missing manifest coverage).
 # Usage: run_semantic_canary_negatives <compiler>
 run_semantic_canary_negatives() {
   local compiler="$1"
   local dir="tests/canary_neg"
+  local manifest="$dir/MANIFEST"
+  if [ ! -f "$manifest" ]; then
+    bh_err "canary manifest missing: $manifest"
+    return 1
+  fi
   local failures=0 total=0
   local file
   for file in "$dir"/*.tg; do
@@ -463,15 +473,28 @@ run_semantic_canary_negatives() {
     total=$((total + 1))
     local name
     name="$(basename "$file" .tg)"
-    bh_log "semantic canary negative: $file"
-    if "$compiler" check "$file" >/dev/null 2>&1; then
+    local expected
+    expected="$(grep -F "$(basename "$file")" "$manifest" | head -n1 | cut -f2)"
+    if [ -z "$expected" ]; then
+      bh_err "semantic canary negative $name has NO manifest entry (add filename.tg<TAB>expected-diagnostic-substring to $manifest)"
+      failures=$((failures + 1))
+      continue
+    fi
+    bh_log "semantic canary negative: $file (expecting: $expected)"
+    local output
+    output="$("$compiler" check "$file" 2>&1)"
+    local exitcode=$?
+    if [ "$exitcode" -eq 0 ]; then
       bh_err "semantic canary negative $name ACCEPTED (expected rejection)"
+      failures=$((failures + 1))
+    elif ! printf '%s' "$output" | grep -qF "$expected"; then
+      bh_err "semantic canary negative $name rejected but WITHOUT expected diagnostic '$expected' (output: $(printf '%s' "$output" | head -n2 | tr '\n' ' '))"
       failures=$((failures + 1))
     fi
   done
-  bh_log "semantic canary negatives: $((total - failures))/$total rejected as expected"
+  bh_log "semantic canary negatives: $((total - failures))/$total rejected with expected diagnostics"
   if [ "$failures" -ne 0 ]; then
-    bh_err "semantic canary negatives FAILED: $failures accepted"
+    bh_err "semantic canary negatives FAILED: $failures problems"
     return 1
   fi
   bh_log "semantic canary negatives OK"

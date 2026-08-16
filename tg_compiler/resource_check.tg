@@ -6,7 +6,7 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, fn_owner_key}
 
 enum ResourceState
   Uninitialized
@@ -20,11 +20,27 @@ struct ResourceError
   span: Span
 end
 
+# Availability states: whether a local currently holds a valid value.
+# Access permission / origin of a resource local: the convention that
+# granted it. `let` params are read-only (never consume, never finalize by
+# the callee); `inout` params may be modified but never consumed/escaped and
+# are caller-owned; `sink` params own their value (may be consumed, must be
+# finalized by the callee if still live); `set` params are initialized by the
+# callee; owned locals have normal ownership.
+enum ParamOrigin
+  Let
+  Inout
+  Sink
+  Set
+  OwnedLocal
+end
+
 struct ResFrame
   names: Vec[Int]
   states: Map[Int, ResourceState]
   caps: Vec[Int]
   spans: Map[Int, Span]
+  origins: Map[Int, ParamOrigin]
 end
 
 enum FlowKind
@@ -64,14 +80,28 @@ struct ResFlow
   blocks: Vec[ResBlock]
 end
 
-pub def resource_check(program: &Program, typed: &TypedProgram) -> Vec[ResourceError]
+# Result of resource checking: the diagnostics plus the authoritative
+# per-function finalize plan (fn owner key -> local ids that must be
+# finalized at function end because they are live with Sink/OwnedLocal
+# permission). MIR consumes finalize_plan for cleanup emission instead of
+# re-deriving ownership from declared locals.
+struct ResourceCheckResult
+  errors: Vec[ResourceError]
+  finalize_plan: Map[String, Vec[Int]]
+end
+
+pub def resource_check(program: &Program, typed: &TypedProgram) -> ResourceCheckResult
   mut errors = Vec::new()
+  var finalize_plan = Map::new()
   mut i = 0
   while i < program.items.len() do
-    check_item(program, typed, &program.items[i], &mut errors)
+    check_item(program, typed, &program.items[i], i, &mut errors, &mut finalize_plan)
     i = i + 1
   end
-  errors
+  ResourceCheckResult {
+    errors: errors,
+    finalize_plan: finalize_plan
+  }
 end
 
 def type_kind_contains_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
@@ -205,10 +235,29 @@ def binding_name(typed: &TypedProgram, id: Int) -> String
   end
 end
 
-def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mut Vec[ResourceError]) -> Unit
+# Derive the owner key for an item's function/method from the typed
+# program's resolver output (DefId-based; unique across merged files).
+# Methods without a recorded DefId fall back to a per-item positional key.
+def item_owner_key(typed: &TypedProgram, item_idx: Int, method_index: Int) -> String
+  match typed.resolutions.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if method_index < dids.len() then
+      let did = dids[method_index]
+      return fn_owner_key(did.module.clone(), did.index, did.kind)
+    end
+  when Option::None then ()
+  end
+  "item::" + item_idx.to_string() + "::method::" + method_index.to_string()
+end
+
+def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: Int, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   match item.kind
   when ItemKind::ItemFunction(f) then
-    check_function(program, typed, &f, errors)
+    # Module-inner items (item_idx -1) are not registered by the type checker
+    # (no param bindings); give them a name-based key purely to keep their
+    # finalize plans distinct.
+    let fn_key = if item_idx >= 0 then "item::" + item_idx.to_string() + "::fn" else "module::" + f.name.clone() end
+    check_function(program, typed, &f, fn_key, errors, finalize_plan)
   when ItemKind::ItemStruct(s) then
     mut frame = res_frame_new()
     mut i = 0
@@ -221,7 +270,7 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
     end
     i = 0
     while i < s.methods.len() do
-      check_function(program, typed, &s.methods[i], errors)
+      check_function(program, typed, &s.methods[i], item_owner_key(typed, item_idx, i), errors, finalize_plan)
       i = i + 1
     end
   when ItemKind::ItemEnum(e) then
@@ -237,19 +286,19 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
   when ItemKind::ItemTrait(t) then
     mut i = 0
     while i < t.methods.len() do
-      check_trait_method(program, typed, &t.methods[i], errors)
+      check_trait_method(program, typed, &t.methods[i], "trait::" + t.name.clone() + "::" + i.to_string(), errors, finalize_plan)
       i = i + 1
     end
   when ItemKind::ItemImpl(im) then
     mut i = 0
     while i < im.methods.len() do
-      check_function(program, typed, &im.methods[i], errors)
+      check_function(program, typed, &im.methods[i], item_owner_key(typed, item_idx, i), errors, finalize_plan)
       i = i + 1
     end
   when ItemKind::ItemModule(m) then
     mut i = 0
     while i < m.items.len() do
-      check_item(program, typed, &m.items[i], errors)
+      check_item(program, typed, &m.items[i], -1, errors, finalize_plan)
       i = i + 1
     end
   when ItemKind::ItemUse(_) then ()
@@ -273,7 +322,7 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
     while i < ext.items.len() do
       match ext.items[i]
       when ExternItem::Function(ef) then
-        check_params_defaults(program, typed, &ef.params, &mut frame, errors)
+        ()
       when ExternItem::Static(_) then ()
       end
       i = i + 1
@@ -281,10 +330,9 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
   end
 end
 
-def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, errors: &mut Vec[ResourceError]) -> Unit
+def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, owner_key: String, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   mut frame = res_frame_new()
-  let entry_ids = bind_params(typed, &f.params, &mut frame, f.span.start)
-  check_params_defaults(program, typed, &f.params, &mut frame, errors)
+  let entry_ids = bind_params(typed, &f.params, &mut frame, owner_key)
   mut i = 0
   while i < f.contracts.len() do
     check_expr(program, typed, &f.contracts[i].expr, &Vec::new(), &mut frame, errors)
@@ -293,25 +341,52 @@ def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, er
   check_fn_body(program, typed, &f.body, &mut frame, errors)
   exit_scope(&mut frame, &entry_ids, typed, errors)
   check_uninitialized_exit(&frame, typed, errors)
+  record_finalize_plan(typed, &frame, owner_key, finalize_plan)
 end
 
-def check_trait_method(program: &Program, typed: &TypedProgram, m: &TraitMethod, errors: &mut Vec[ResourceError]) -> Unit
+def check_trait_method(program: &Program, typed: &TypedProgram, m: &TraitMethod, owner_key: String, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   mut frame = res_frame_new()
-  let entry_ids = bind_params(typed, &m.sig.params, &mut frame, m.sig.span.start)
-  check_params_defaults(program, typed, &m.sig.params, &mut frame, errors)
+  let entry_ids = bind_params(typed, &m.sig.params, &mut frame, owner_key)
   check_fn_body(program, typed, &m.default_body, &mut frame, errors)
   exit_scope(&mut frame, &entry_ids, typed, errors)
   check_uninitialized_exit(&frame, typed, errors)
+  record_finalize_plan(typed, &frame, owner_key, finalize_plan)
 end
 
-def bind_params(typed: &TypedProgram, params: &Vec[Param], frame: &mut ResFrame, fn_key: Int) -> Vec[Int]
+# The authoritative finalize set for a function: locals still Live in the
+# final frame whose permission is Sink or OwnedLocal. Let/Inout params are
+# caller-owned (never finalized by the callee); the deinit method's own sink
+# self is excluded here because a deinit finalizes its subject by definition
+# (the MIR side handles that special case when emitting the finalizer).
+def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, owner_key: String, finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
+  var ids = Vec::new()
+  mut i = 0
+  while i < frame.names.len() do
+    let id = frame.names[i]
+    match res_frame_get(frame, &id)
+    when Option::Some(ResourceState::Live) then
+      match frame.origins.get(id)
+      when Option::Some(origin) then
+        if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+          ids.push(id)
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  finalize_plan.insert(owner_key, ids)
+end
+
+def bind_params(typed: &TypedProgram, params: &Vec[Param], frame: &mut ResFrame, owner_key: String) -> Vec[Int]
   mut out = Vec::new()
   mut i = 0
   while i < params.len() do
-    # fn_key is the owner's span start; the parameter local ids are looked up
-    # by (owner, index) in the typed parameter map — never by an arithmetic
-    # encoding that could collide with pattern node ids.
-    match bind_param(typed, &params[i], frame, fn_key, i)
+    # The parameter local ids are looked up by (DefId owner key, index) in
+    # the typed parameter map — never by a span offset or an arithmetic
+    # encoding that could collide with pattern node ids or across files.
+    match bind_param(typed, &params[i], frame, owner_key, i)
     when Option::Some(id) then out.push(id)
     when Option::None then ()
     end
@@ -320,16 +395,29 @@ def bind_params(typed: &TypedProgram, params: &Vec[Param], frame: &mut ResFrame,
   out
 end
 
-def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key: Int, index: Int) -> Option[Int]
-  if p.convention == AccessConvention::Inout then
-    return Option::None
+def param_origin_of(convention: AccessConvention) -> ParamOrigin
+  match convention
+  when AccessConvention::Let then ParamOrigin::Let
+  when AccessConvention::Inout then ParamOrigin::Inout
+  when AccessConvention::Sink then ParamOrigin::Sink
+  when AccessConvention::Set then ParamOrigin::Set
+  when _ then ParamOrigin::Let
   end
+end
+
+def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key: String, index: Int) -> Option[Int]
   match typed.param_binding_resolutions.get(owner_key)
   when Option::Some(ids) then
     if index < ids.len() then
       match typed.local_bindings.get(ids[index])
       when Option::Some(lb) then
         let id = ids[index]
+        # EVERY parameter is registered in the frame — including inout (which
+        # previously escaped resource-state checking entirely). The permission
+        # dimension (origin) is tracked separately from availability so that
+        # let/inout params can never be consumed or finalized by the callee,
+        # while sink params own their value.
+        let origin = param_origin_of(p.convention)
         if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
           let init_state = match p.convention
           when AccessConvention::Set then ResourceState::Uninitialized
@@ -337,6 +425,7 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
           end
           res_frame_set(frame, id, init_state)
           res_frame_set_span(frame, &id, p.span)
+          frame.origins.insert(id, origin)
         end
         if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
           res_frame_mark_cap(frame, &id)
@@ -348,17 +437,6 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
       Option::None
     end
   when Option::None then Option::None
-  end
-end
-
-def check_params_defaults(program: &Program, typed: &TypedProgram, params: &Vec[Param], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
-  mut i = 0
-  while i < params.len() do
-    match params[i].default
-    when Option::Some(e) then check_expr(program, typed, &e, &Vec::new(), frame, errors)
-    when Option::None then ()
-    end
-    i = i + 1
   end
 end
 
@@ -734,6 +812,24 @@ end
 
 def check_match(program: &Program, typed: &TypedProgram, m: &MatchExpr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
   check_expr(program, typed, &m.scrutinee, loop_outer, frame, errors)
+  # A resource-containing scrutinee is MOVED into the arm's resource
+  # bindings: matching a resource by value transfers ownership out of the
+  # scrutinee exactly once (Option[Resource]/Result[Resource,E] destructuring
+  # gets a complete linear interpretation this way).
+  let scrutinee_ty = match typed.expr_types.get(m.scrutinee.node_id)
+  when Option::Some(t) then t.clone()
+  when Option::None then Type::Unit
+  end
+  let scrutinee_contains_resource = type_kind_contains_resource(&typed.type_kinds, &scrutinee_ty)
+  if scrutinee_contains_resource then
+    match expr_root_id(typed, &m.scrutinee)
+    when Option::Some(root) then
+      if res_frame_has(frame, &root) then
+        apply_consume(typed, root, m.scrutinee.span, loop_outer, frame, errors)
+      end
+    when Option::None then ()
+    end
+  end
   mut arms = Vec::new()
   mut i = 0
   while i < m.arms.len() do
@@ -882,23 +978,54 @@ def check_pattern(program: &Program, typed: &TypedProgram, pat: &Pattern, loop_o
   end
 end
 
+# Register a single pattern-bound identifier in the frame (Live availability,
+# OwnedLocal permission — pattern bindings own their value).
+def bind_pattern_ident(typed: &TypedProgram, node_id: Int, span: Span, frame: &mut ResFrame) -> Unit
+  match typed.pattern_binding_resolutions.get(node_id)
+  when Option::Some(id) then
+    match typed.local_bindings.get(id)
+    when Option::Some(lb) then
+      if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+        res_frame_set(frame, id, ResourceState::Live)
+        res_frame_set_span(frame, &id, span)
+        frame.origins.insert(id, ParamOrigin::OwnedLocal)
+      end
+      if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+        res_frame_mark_cap(frame, &id)
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+end
+
+# bind_pattern recurses through the WHOLE pattern structure (tuple, array,
+# struct, enum-variant, or-patterns) so destructuring binds every inner
+# resource ident — previously only a top-level Ident was registered, so
+# `let (a, b) = pair` lost ownership of resource components.
 def bind_pattern(typed: &TypedProgram, pat: &Pattern, span: Span, frame: &mut ResFrame) -> Unit
   match pat.kind
   when PatternKind::Ident(_, _) then
-    match typed.pattern_binding_resolutions.get(pat.node_id)
-    when Option::Some(id) then
-      match typed.local_bindings.get(id)
-      when Option::Some(lb) then
-        if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
-          res_frame_set(frame, id, ResourceState::Live)
-          res_frame_set_span(frame, &id, span)
-        end
-        if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
-          res_frame_mark_cap(frame, &id)
-        end
-      when Option::None then ()
-      end
-    when Option::None then ()
+    bind_pattern_ident(typed, pat.node_id, span, frame)
+  when PatternKind::Tuple(pats) then
+    for p in pats do
+      bind_pattern(typed, &p, span, frame)
+    end
+  when PatternKind::Array(pats) then
+    for p in pats do
+      bind_pattern(typed, &p, span, frame)
+    end
+  when PatternKind::Struct(_, fields) then
+    for f in fields do
+      bind_pattern(typed, &f.1, span, frame)
+    end
+  when PatternKind::Variant(_, pats) then
+    for p in pats do
+      bind_pattern(typed, &p, span, frame)
+    end
+  when PatternKind::Or(alts) then
+    for p in alts do
+      bind_pattern(typed, &p, span, frame)
     end
   when _ then ()
   end
@@ -916,12 +1043,17 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
     mut i = 0
     while i < elems.len() do
       check_expr(program, typed, &elems[i], loop_outer, frame, errors)
+      # Every element is an owned transfer INTO the array: `let a = [r]`
+      # consumes r (previously r stayed Live and could be used after the
+      # move, duplicating ownership).
+      transfer_consume(typed, &elems[i], loop_outer, frame, errors)
       i = i + 1
     end
   when ExprKind::ExprTupleLit(elems) then
     mut i = 0
     while i < elems.len() do
       check_expr(program, typed, &elems[i], loop_outer, frame, errors)
+      transfer_consume(typed, &elems[i], loop_outer, frame, errors)
       i = i + 1
     end
   when ExprKind::ExprStructLit(_, fields) then
@@ -935,7 +1067,10 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
     mut i = 0
     while i < entries.len() do
       check_expr(program, typed, &entries[i].0, loop_outer, frame, errors)
+      # Map literal keys AND values are owned transfers into the map.
+      transfer_consume(typed, &entries[i].0, loop_outer, frame, errors)
       check_expr(program, typed, &entries[i].1, loop_outer, frame, errors)
+      transfer_consume(typed, &entries[i].1, loop_outer, frame, errors)
       i = i + 1
     end
   when ExprKind::ExprIdent(_) then
@@ -962,6 +1097,34 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
   when ExprKind::ExprClosure(params, _, body) then
     mut cframe = res_frame_new()
     let entry_ids = bind_closure_params(typed, &params, &mut cframe)
+    # Closure capture transfer: the typed closure_captures map (closure node
+    # id -> captured local id -> effect) is the SEMANTIC capture record. Each
+    # captured resource moves into the closure exactly once: the outer local
+    # is consumed and the closure's frame seeds the same local as Live +
+    # OwnedLocal so the body can use (and finalize) it. Previously captures
+    # were rediscovered independently and never transferred, so `let cl =
+    # do |_| consume_r(r)` left r live in the outer scope.
+    match typed.closure_captures.get(expr.node_id)
+    when Option::Some(caps) then
+      for (cap_id, _cap_effect) in caps do
+        match typed.local_bindings.get(cap_id)
+        when Option::Some(lb) then
+          if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+            if res_frame_has(frame, &cap_id) then
+              apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+            end
+            res_frame_set(&mut cframe, cap_id, ResourceState::Live)
+            res_frame_set_span(&mut cframe, &cap_id, expr.span)
+            cframe.origins.insert(cap_id, ParamOrigin::OwnedLocal)
+          end
+          if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+            res_frame_mark_cap(&mut cframe, &cap_id)
+          end
+        when Option::None then ()
+        end
+      end
+    when Option::None then ()
+    end
     check_expr(program, typed, &body, &Vec::new(), &mut cframe, errors)
     exit_scope(&mut cframe, &entry_ids, typed, errors)
     check_uninitialized_exit(&cframe, typed, errors)
@@ -1025,90 +1188,45 @@ end
 
 def check_expr_call(program: &Program, typed: &TypedProgram, callee: &Expr, args: &Vec[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
   check_expr(program, typed, callee, loop_outer, frame, errors)
-  match callee_name(callee)
-  when Option::Some(name) then
-    match find_function(program, &name)
-    when Option::Some(params) then
-      mut i = 0
-      while i < args.len() do
-        let eff = match typed.access_effects.get(args[i].node_id)
-        when Option::Some(e) then e
-        when Option::None then
-          if i < params.len() then convention_effect(params[i].convention) else AccessEffect::Read end
-        end
-        apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
-        i = i + 1
-      end
-    when Option::None then
-      mut i = 0
-      while i < args.len() do
-        let eff = match typed.access_effects.get(args[i].node_id)
-        when Option::Some(e) then e
-        when Option::None then AccessEffect::Read
-        end
-        apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
-        i = i + 1
-      end
+  # The receiver/argument effects are the TYPED access effects recorded by
+  # the type checker (typed.access_effects on each argument node) — never
+  # re-derived from source names (find_function/find_method were unsound:
+  # they returned the FIRST function/method with that name regardless of
+  # receiver type, misclassifying conventions).
+  mut i = 0
+  while i < args.len() do
+    let eff = match typed.access_effects.get(args[i].node_id)
+    when Option::Some(e) then e
+    when Option::None then AccessEffect::Read
     end
-  when Option::None then
-    mut i = 0
-    while i < args.len() do
-      let eff = match typed.access_effects.get(args[i].node_id)
-      when Option::Some(e) then e
-      when Option::None then AccessEffect::Read
-      end
-      apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
-      i = i + 1
-    end
+    apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
+    i = i + 1
   end
 end
 
 def check_expr_method_call(program: &Program, typed: &TypedProgram, receiver: &Expr, method: &String, args: &Vec[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
-  let is_deinit = method == "deinit"
-  match find_method(program, method)
-  when Option::Some(params) then
-    mut self_idx = -1
-    mut i = 0
-    while i < params.len() do
-      if params[i].name == "self" then
-        self_idx = i
-        break
-      end
-      i = i + 1
-    end
-    let recv_effect = if is_deinit then
-      AccessEffect::Consume
-    elsif self_idx >= 0 then
-      match params[self_idx].convention
-      when AccessConvention::Inout then AccessEffect::Modify
-      when AccessConvention::Sink then AccessEffect::Consume
-      when _ then AccessEffect::Read
-      end
-    else AccessEffect::Read end
+  # Receiver and argument effects come from the typed access effects recorded
+  # by the type checker (the type checker already resolved the method and its
+  # receiver convention — re-deriving it by walking impls by NAME was
+  # unsound: `A.close(self)` (let) vs `B.close(sink self)` could classify a
+  # receiver using the wrong method's convention).
+  let recv_effect = match typed.access_effects.get(receiver.node_id)
+  when Option::Some(e) then e
+  when Option::None then AccessEffect::Read
+  end
+  if method == "deinit" then
+    apply_arg_effect(program, typed, receiver, AccessEffect::Consume, loop_outer, frame, errors)
+  else
     apply_arg_effect(program, typed, receiver, recv_effect, loop_outer, frame, errors)
-    i = 0
-    while i < args.len() do
-      let param_idx = if self_idx >= 0 then self_idx + 1 + i else i end
-      let eff = match typed.access_effects.get(args[i].node_id)
-      when Option::Some(e) then e
-      when Option::None then
-        if param_idx < params.len() then convention_effect(params[param_idx].convention) else AccessEffect::Read end
-      end
-      apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
-      i = i + 1
+  end
+  mut i = 0
+  while i < args.len() do
+    let eff = match typed.access_effects.get(args[i].node_id)
+    when Option::Some(e) then e
+    when Option::None then AccessEffect::Read
     end
-  when Option::None then
-    let recv_effect = if is_deinit then AccessEffect::Consume else AccessEffect::Read end
-    apply_arg_effect(program, typed, receiver, recv_effect, loop_outer, frame, errors)
-    mut i = 0
-    while i < args.len() do
-      let eff = match typed.access_effects.get(args[i].node_id)
-      when Option::Some(e) then e
-      when Option::None then AccessEffect::Read
-      end
-      apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
-      i = i + 1
-    end
+    apply_arg_effect(program, typed, &args[i], eff, loop_outer, frame, errors)
+    i = i + 1
   end
 end
 
@@ -1152,6 +1270,28 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
 end
 
 def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  # Permission enforcement: only locals that OWN their value (sink params,
+  # owned locals) may be consumed. let params are read-only and inout params
+  # may be modified but never consumed/escaped — a sink operation on them is
+  # exactly the unsoundness `def inspect(x: R); destroy(x)` exercises.
+  match frame.origins.get(id)
+  when Option::Some(origin) then
+    if origin == ParamOrigin::Let then
+      errors.push(ResourceError {
+        message: "cannot consume resource `" + binding_name(typed, id) + "`: let parameter is read-only",
+        span: span
+      })
+      return
+    end
+    if origin == ParamOrigin::Inout then
+      errors.push(ResourceError {
+        message: "cannot consume resource `" + binding_name(typed, id) + "`: inout parameter may be modified but not consumed",
+        span: span
+      })
+      return
+    end
+  when Option::None then ()
+  end
   if loop_outer.contains(&id) then
     errors.push(ResourceError {
       message: "resource `" + binding_name(typed, id) + "` cannot be consumed inside a repeatable loop",
@@ -1264,7 +1404,8 @@ def res_frame_new() -> ResFrame
     names: Vec::new(),
     states: Map::new(),
     caps: Vec::new(),
-    spans: Map::new()
+    spans: Map::new(),
+    origins: Map::new()
   }
 end
 
@@ -1349,6 +1490,11 @@ def res_frame_clone(frame: &ResFrame) -> ResFrame
     out.caps.push(frame.caps[j])
     j = j + 1
   end
+  # Copy permission origins alongside availability (permission is part of
+  # the frame state; losing it would let a let/inout param be consumed).
+  for (oid, origin) in frame.origins do
+    out.origins.insert(oid, origin)
+  end
   out
 end
 
@@ -1373,6 +1519,16 @@ def res_frame_equal(a: &ResFrame, b: &ResFrame) -> Bool
   while j < a.caps.len() do
     if !b.caps.contains(&a.caps[j]) then return false end
     j = j + 1
+  end
+  # Origins are part of frame equality: a frame that gained/lost permission
+  # differs and must be re-merged by the worklist.
+  if a.origins.len() != b.origins.len() then return false end
+  for (oid, oa) in a.origins do
+    match b.origins.get(oid)
+    when Option::Some(ob) then
+      if !(oa == ob) then return false end
+    when Option::None then return false
+    end
   end
   true
 end
@@ -1510,6 +1666,7 @@ def bind_closure_param(typed: &TypedProgram, cp: &ClosureParam, frame: &mut ResF
         if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
           res_frame_set(frame, id, ResourceState::Live)
           res_frame_set_span(frame, &id, cp.span)
+          frame.origins.insert(id, ParamOrigin::OwnedLocal)
         end
         if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
           res_frame_mark_cap(frame, &id)
@@ -1565,91 +1722,6 @@ def transfer_consume(typed: &TypedProgram, expr: &Expr, loop_outer: &Vec[Int], f
     when Option::None then ()
     end
   end
-end
-
-def callee_name(expr: &Expr) -> Option[String]
-  match expr.kind
-  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
-  when ExprKind::ExprPath(p) then
-    if p.segments.len() > 0 then
-      Option::Some(p.segments[p.segments.len() - 1].clone())
-    else
-      Option::None
-    end
-  when _ then Option::None
-  end
-end
-
-def find_function(program: &Program, name: &String) -> Option[Vec[Param]]
-  find_function_in_items(&program.items, name)
-end
-
-def find_function_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
-  mut i = 0
-  while i < items.len() do
-    match items[i].kind
-    when ItemKind::ItemFunction(f) then
-      if f.name == name then
-        return Option::Some(f.params.clone())
-      end
-    when ItemKind::ItemExternBlock(ext) then
-      mut j = 0
-      while j < ext.items.len() do
-        match ext.items[j]
-        when ExternItem::Function(ef) then
-          if ef.name == name then
-            return Option::Some(ef.params.clone())
-          end
-        when ExternItem::Static(_) then ()
-        end
-        j = j + 1
-      end
-    when ItemKind::ItemModule(m) then
-      match find_function_in_items(&m.items, name)
-      when Option::Some(ps) then return Option::Some(ps)
-      when Option::None then ()
-      end
-    when _ then ()
-    end
-    i = i + 1
-  end
-  Option::None
-end
-
-def find_method(program: &Program, name: &String) -> Option[Vec[Param]]
-  find_method_in_items(&program.items, name)
-end
-
-def find_method_in_items(items: &Vec[Item], name: &String) -> Option[Vec[Param]]
-  mut i = 0
-  while i < items.len() do
-    match items[i].kind
-    when ItemKind::ItemImpl(im) then
-      mut j = 0
-      while j < im.methods.len() do
-        if im.methods[j].name == name then
-          return Option::Some(im.methods[j].params.clone())
-        end
-        j = j + 1
-      end
-    when ItemKind::ItemStruct(s) then
-      mut j = 0
-      while j < s.methods.len() do
-        if s.methods[j].name == name then
-          return Option::Some(s.methods[j].params.clone())
-        end
-        j = j + 1
-      end
-    when ItemKind::ItemModule(m) then
-      match find_method_in_items(&m.items, name)
-      when Option::Some(ps) then return Option::Some(ps)
-      when Option::None then ()
-      end
-    when _ then ()
-    end
-    i = i + 1
-  end
-  Option::None
 end
 
 def convention_effect(c: AccessConvention) -> AccessEffect

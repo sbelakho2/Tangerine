@@ -99,6 +99,128 @@ struct ParamType
   convention: AccessConvention
 end
 
+# Plain type name of a TypeExpr, mirroring mir.tg's impl_type_name
+# computation (Array is aliased to Vec) so deinit mangling matches MIR.
+def type_expr_name_of(ty: &TypeExpr) -> String
+  let raw = match ty.kind
+  when TypeExprKind::Named(name, _) then name.clone()
+  when TypeExprKind::Path(path) then path.segments.join("::")
+  when _ then ""
+  end
+  if raw == "Array" then "Vec".to_string() else raw end
+end
+
+# Render a DefId into a canonical String key for binding/finalize maps.
+# The module name makes the key unique across ALL files merged into one
+# compilation (two functions at the same byte offset in different files
+# produce different keys — unlike span.start-based keys).
+pub def fn_owner_key(module: String, index: UInt, kind: DefKind) -> String
+  let kind_name = match kind
+  when DefKind::Function then "fn"
+  when DefKind::Method then "method"
+  when DefKind::Static then "static"
+  when DefKind::Constant then "const"
+  when DefKind::EnumVariant then "variant"
+  when DefKind::StructField then "field"
+  when DefKind::Intrinsic then "intrinsic"
+  when DefKind::TypeName then "type"
+  when DefKind::Other then "other"
+  end
+  module + "::" + index.to_string() + "::" + kind_name
+end
+
+# ———————————————————————————————————————————————————————————————
+# Deinitialization plans
+#
+# The authoritative, recursive cleanup description for a type, computed at
+# type-check time (typed.deinit_plans) and consumed by MIR lowering. A type
+# without a registered deinit is Trivial (resources may be trivially
+# deinitialized — absence of a deinit method is NOT an error). Containers
+# recurse so Option[R], Array[R], Map[K,R], tuples etc. get real cleanup.
+# ———————————————————————————————————————————————————————————————
+enum DeinitPlan
+  Trivial
+  Call(String)      # deinit identity (mangled name; TODO: DefId/CallableId)
+  Aggregate(Vec[DeinitPlan])
+  Enum(Map[Int, Vec[DeinitPlan]])  # variant discriminant -> field plans
+  Array(DeinitPlan)
+  Map(DeinitPlan, DeinitPlan)      # key plan, value plan
+  Tuple(Vec[DeinitPlan])
+  Option(DeinitPlan)
+  Result(DeinitPlan, DeinitPlan)
+end
+
+def deinit_plan_is_trivial(plan: &DeinitPlan) -> Bool
+  match plan
+  when DeinitPlan::Trivial then true
+  when _ then false
+  end
+end
+
+# Build the deinit plan for a type from the typed program's type kinds and
+# registered deinit targets. Mirrors the type checker's viral containment
+# rules: containers of resource types get recursive plans; a direct resource
+# type without a deinit method is Trivial (per the language rule).
+pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int) -> DeinitPlan
+  if depth > 32 then
+    return DeinitPlan::Trivial
+  end
+  match ty
+  when Type::Option(inner) then
+    DeinitPlan::Option(build_deinit_plan(typed, &inner, depth + 1))
+  when Type::Result(ok, err) then
+    DeinitPlan::Result(build_deinit_plan(typed, &ok, depth + 1), build_deinit_plan(typed, &err, depth + 1))
+  when Type::Slice(inner) then
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+  when Type::Array(inner, _) then
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+  when Type::Map(k, v) then
+    DeinitPlan::Map(build_deinit_plan(typed, &k, depth + 1), build_deinit_plan(typed, &v, depth + 1))
+  when Type::Set(inner) then
+    DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1))
+  when Type::Tuple(fields) then
+    var plans = Vec::new()
+    for f in fields do
+      plans.push(build_deinit_plan(typed, &f, depth + 1))
+    end
+    DeinitPlan::Tuple(plans)
+  when Type::Named(tid, args) then
+    let type_name = match typed.type_names.get(tid.id)
+    when Option::Some(n) then n.clone()
+    when Option::None then ""
+    end
+    match typed.type_kinds.get(tid.id)
+    when Option::Some(k) then
+      if k == TypeKind::Resource || k == TypeKind::Capability then
+        # A resource WITHOUT a deinit method is trivially deinitialized
+        # (language rule — absence of deinit is NOT an error).
+        match typed.deinit_targets.get(tid.id)
+        when Option::Some(n) then DeinitPlan::Call(n.clone())
+        when Option::None then DeinitPlan::Trivial
+        end
+      else
+        # Named container types (Option/Result/Array/Map/Set) resolve to
+        # their canonical forms via their type name + generic args.
+        if type_name == "Option" && args.len() >= 1 then
+          DeinitPlan::Option(build_deinit_plan(typed, &args[0], depth + 1))
+        elsif type_name == "Result" && args.len() >= 2 then
+          DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1), build_deinit_plan(typed, &args[1], depth + 1))
+        elsif (type_name == "Array" || type_name == "Vec") && args.len() >= 1 then
+          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1))
+        elsif type_name == "Map" && args.len() >= 2 then
+          DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1), build_deinit_plan(typed, &args[1], depth + 1))
+        elsif type_name == "Set" && args.len() >= 1 then
+          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1))
+        else
+          DeinitPlan::Trivial
+        end
+      end
+    when Option::None then DeinitPlan::Trivial
+    end
+  when _ then DeinitPlan::Trivial
+  end
+end
+
 struct TypeVarId
   id: Int
 end
@@ -191,14 +313,17 @@ struct TypeEnv
   typed_local_bindings: Map[Int, LocalBinding]
   typed_ident_resolutions: Map[Int, Int]
   # Two SEPARATE binding-resolution maps: parameters and pattern bindings are
-  # keyed in entirely different domains (owner span + positional index vs
+  # keyed in entirely different domains (owner DefId + positional index vs
   # pattern node id). Keeping them in one map allowed a parameter key to
   # numerically collide with a pattern node id, letting a later pattern
   # overwrite a parameter's mapping and corrupting resource/access analysis
-  # of the wrong local.
-  param_binding_resolutions: Map[Int, Vec[Int]]
+  # of the wrong local. The parameter owner key is the function/method's
+  # DefId rendered by fn_owner_key — NOT a span offset, which would collide
+  # across files merged into one compilation.
+  param_binding_resolutions: Map[String, Vec[Int]]
   pattern_binding_resolutions: Map[Int, Int]
   typed_access_effects: Map[Int, AccessEffect]
+  typed_aggregate_ownership: Map[Int, Vec[Bool]]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   access_marker_depth: Int
 end
@@ -244,11 +369,30 @@ struct TypedProgram
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
-  # Parameter bindings are keyed by owner (function/method span start) with a
-  # positional Vec; pattern bindings are keyed by pattern node id. The two
-  # domains never collide (see TypeEnv.param_binding_resolutions).
-  param_binding_resolutions: Map[Int, Vec[Int]]
+  # Parameter bindings are keyed by owner (function/method DefId via
+  # fn_owner_key) with a positional Vec; pattern bindings are keyed by
+  # pattern node id. The two domains never collide (see
+  # TypeEnv.param_binding_resolutions), and DefId keys are unique across
+  # merged files (unlike span offsets).
+  param_binding_resolutions: Map[String, Vec[Int]]
   pattern_binding_resolutions: Map[Int, Int]
+  # Authoritative deinitialization plan per type id (DeinitPlan). Computed in
+  # type_check_typed; MIR consumes it for recursive cleanup emission instead
+  # of guessing per-type finalization from names.
+  deinit_plans: Map[Int, DeinitPlan]
+  # Per aggregate-literal expression node id: whether each child value is
+  # OWNED (transferred into the aggregate). Consumed by the resource checker
+  # for uniform aggregate ownership transfer.
+  aggregate_ownership: Map[Int, Vec[Bool]]
+  # Authoritative per-function finalize set: fn owner key -> local ids to
+  # finalize at function end (computed by the resource checker from its final
+  # per-function frames). MIR consumes this instead of re-deriving cleanup
+  # from declared locals.
+  finalize_plan: Map[String, Vec[Int]]
+  # Type id -> type name and type id -> registered deinit callable, used by
+  # build_deinit_plan to construct the recursive DeinitPlan per type.
+  type_names: Map[Int, String]
+  deinit_targets: Map[Int, String]
   type_kinds: Map[Int, TypeKind]
 end
 
@@ -285,6 +429,7 @@ def type_env_new() -> TypeEnv
     param_binding_resolutions: Map::new(),
     pattern_binding_resolutions: Map::new(),
     typed_access_effects: Map::new(),
+    typed_aggregate_ownership: Map::new(),
     closure_captures: Map::new(),
     access_marker_depth: 0
   }
@@ -831,6 +976,11 @@ def lookup_var(env: &TypeEnv, name: String) -> Option[Type]
   Option::None
 end
 
+# Sentinel for "no local": local ids are always >= 0, so a NEGATIVE sentinel
+# can never collide with a real local (previously 0 was used — 0 is also the
+# first real local id, making capture/scan checks ambiguous).
+const NO_LOCAL_ID: Int = -1
+
 def local_id_of(env: &TypeEnv, name: String) -> Int
   var i = env.local_ids.len()
   while i > 0 do
@@ -840,7 +990,7 @@ def local_id_of(env: &TypeEnv, name: String) -> Int
     when Option::None then ()
     end
   end
-  0
+  NO_LOCAL_ID
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2226,7 +2376,7 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
   i = 0
   while i < program.items.len() do
     let item = program.items[i]
-    check_item(env, item)
+    check_item(env, item, i)
     i = i + 1
   end
   
@@ -2553,12 +2703,40 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
   end
 end
 
-def check_item(env: &mut TypeEnv, item: &Item) -> Unit
+def check_item(env: &mut TypeEnv, item: &Item, item_idx: Int) -> Unit
+  # Derive the owner keys for this item's functions/methods from the
+  # resolver's item_defs (DefId-based; unique across merged files). Methods
+  # without a recorded DefId (struct-inherent methods) fall back to a
+  # per-item positional key "item::<item_idx>::method::<mi>" that is still
+  # collision-free across files (item_idx is unique in the merged program).
+  var fn_keys = Vec::new()
+  match env.resolutions
+  when Option::Some(res) then
+    match res.item_defs.get(item_idx)
+    when Option::Some(dids) then
+      for did in dids do
+        fn_keys.push(fn_owner_key(did.module.clone(), did.index, did.kind))
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
   match item.kind
   when ItemKind::ItemFunction(f) then
-    check_function(env, f)
+    let owner_key = if fn_keys.len() > 0 then fn_keys[0].clone() else "item::" + item_idx.to_string() + "::fn" end
+    check_function(env, f, owner_key)
   when ItemKind::ItemImpl(i) then
-    check_impl(env, i)
+    if fn_keys.len() == i.methods.len() then
+      check_impl(env, i, &fn_keys)
+    else
+      var keys = Vec::new()
+      var mi = 0
+      while mi < i.methods.len() do
+        keys.push("item::" + item_idx.to_string() + "::method::" + mi.to_string())
+        mi = mi + 1
+      end
+      check_impl(env, i, &keys)
+    end
   when ItemKind::ItemStruct(s) then
     if s.methods.len() > 0 then
       var type_args = Vec::new()
@@ -2568,6 +2746,16 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
         sgp_idx = sgp_idx + 1
       end
       let res_for_type = TypeExpr { kind: TypeExprKind::Named(s.name.clone(), type_args), span: s.span }
+      var s_keys = Vec::new()
+      if fn_keys.len() == s.methods.len() then
+        s_keys = fn_keys
+      else
+        var smi = 0
+        while smi < s.methods.len() do
+          s_keys.push("item::" + item_idx.to_string() + "::method::" + smi.to_string())
+          smi = smi + 1
+        end
+      end
       check_impl(env, &ImplDecl {
         vis: s.vis,
         generic_params: s.generic_params.clone(),
@@ -2578,7 +2766,7 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
         methods: s.methods.clone(),
         assoc_types: Vec::new(),
         span: s.span
-      })
+      }, &s_keys)
     end
   when ItemKind::ItemConst(c) then
     env.check_ctx = "const:" + c.name
@@ -2602,7 +2790,7 @@ def check_item(env: &mut TypeEnv, item: &Item) -> Unit
   end
 end
 
-def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
+def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String) -> Unit
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   
@@ -2614,8 +2802,9 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   end
   
   # Bind parameters
-  # Parameter bindings are recorded per-owner (keyed by the function's span
-  # start) in declaration order, in the dedicated param_binding_resolutions
+  # Parameter bindings are recorded per-owner (keyed by the function's DefId
+  # via fn_owner_key — never a span offset, which would collide across merged
+  # files) in declaration order, in the dedicated param_binding_resolutions
   # map. This keeps parameter keys in a domain that can never collide with
   # pattern node ids (see the TypeEnv field comment).
   var param_local_ids = Vec::new()
@@ -2630,7 +2819,7 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
     param_local_ids.push(env.local_id_counter - 1)
     i = i + 1
   end
-  env.param_binding_resolutions.insert(f.span.start, param_local_ids)
+  env.param_binding_resolutions.insert(owner_key, param_local_ids)
   
   # Get expected return type
   let ret_type = match f.ret_type
@@ -2658,7 +2847,7 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl) -> Unit
   pop_scope(env)
 end
 
-def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
+def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Unit
   # Register impl-level generic type parameters FIRST so they are in scope
   # when resolving i.for_type (e.g., Vec[T] needs T in scope)
   push_scope(env)
@@ -2771,6 +2960,12 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
   method_index = 0
   while method_index < i.methods.len() do
     let m = i.methods[method_index]
+    # The owner key for this method's parameter bindings: its DefId rendered
+    # via fn_owner_key (from the resolver's item_defs), or a per-item
+    # positional fallback for methods without DefIds. Never a span offset.
+    let m_owner_key = if method_index < method_keys.len() then method_keys[method_index].clone() else
+      "item::fallback::" + method_index.to_string()
+    end
     push_scope(env)
 
     # Register method-level generic type parameters in scope
@@ -2799,7 +2994,7 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl) -> Unit
       method_param_ids.push(env.local_id_counter - 1)
       param_index = param_index + 1
     end
-    env.param_binding_resolutions.insert(m.span.start, method_param_ids)
+    env.param_binding_resolutions.insert(m_owner_key, method_param_ids)
 
     # Expected return type
     let ret_type = match m.ret_type
@@ -3662,7 +3857,7 @@ end
 
 def scan_capture_record(env: &TypeEnv, scan: &mut CaptureScan, name: String, effect: AccessEffect) -> Unit
   let lid = local_id_of(env, name.clone())
-  if lid != 0 then
+  if lid >= 0 then
     if !scan.bound.contains(&lid) then
       match scan.uses.get(&lid)
       when Option::Some(cur) then
@@ -3707,7 +3902,7 @@ def scan_pattern_bind(env: &TypeEnv, scan: &mut CaptureScan, pat: &Pattern) -> U
   when PatternKind::Wildcard then ()
   when PatternKind::Ident(name, _) then
     let lid = local_id_of(env, name.clone())
-    if lid != 0 then scan.bound.push(lid) end
+    if lid >= 0 then scan.bound.push(lid) end
   when PatternKind::Literal(e) then scan_expr(env, scan, &e)
   when PatternKind::Tuple(pats) then
     var i = 0
@@ -3877,7 +4072,7 @@ def scan_stmt(env: &TypeEnv, scan: &mut CaptureScan, stmt: &Stmt) -> Unit
   when StmtKind::StmtWith(expr, name, body) then
     scan_expr(env, scan, &expr)
     let with_lid = local_id_of(env, name.clone())
-    if with_lid != 0 then scan.bound.push(with_lid) end
+    if with_lid >= 0 then scan.bound.push(with_lid) end
     scan_block(env, scan, &body)
   when StmtKind::StmtHandleWith(expr, handlers) then
     scan_expr(env, scan, &expr)
@@ -3888,7 +4083,7 @@ def scan_stmt(env: &TypeEnv, scan: &mut CaptureScan, stmt: &Stmt) -> Unit
         var k = 0
         while k < handlers[i].arms[j].params.len() do
           let arm_lid = local_id_of(env, handlers[i].arms[j].params[k].clone())
-          if arm_lid != 0 then scan.bound.push(arm_lid) end
+          if arm_lid >= 0 then scan.bound.push(arm_lid) end
           k = k + 1
         end
         scan_block(env, scan, &handlers[i].arms[j].body)
@@ -4156,6 +4351,8 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # map to a declared parameter. Silently accepting extra arguments
       # (or missing ones) makes callable types unsound — a value of type
       # fn(Int) -> Int could be invoked with two arguments and vice versa.
+      # (Default arguments are deprecated/unused in this codebase — no call
+      # site omits a defaulted parameter — so exact equality is correct.)
       if args.len() != params.len() then
         type_add_error(env, "wrong number of arguments: expected " +
           params.len().to_string() + ", found " + args.len().to_string(), expr.span)
@@ -4432,6 +4629,17 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       end
     end
   when ExprKind::ExprArrayLit(elems) then
+    # Record aggregate ownership: every element is an owned transfer into the
+    # array (consumed by the resource checker via typed.aggregate_ownership).
+    var arr_owned = Vec::new()
+    var ai0 = 0
+    while ai0 < elems.len() do
+      arr_owned.push(true)
+      ai0 = ai0 + 1
+    end
+    if expr.node_id != 0 then
+      env.typed_aggregate_ownership.insert(expr.node_id, arr_owned)
+    end
     if elems.is_empty() then
       Type::Array(fresh_type_var(env), 0)
     else
@@ -4445,6 +4653,15 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       Type::Array(elem_type, elems.len())
     end
   when ExprKind::ExprTupleLit(elems) then
+    var tup_owned = Vec::new()
+    var ti0 = 0
+    while ti0 < elems.len() do
+      tup_owned.push(true)
+      ti0 = ti0 + 1
+    end
+    if expr.node_id != 0 then
+      env.typed_aggregate_ownership.insert(expr.node_id, tup_owned)
+    end
     var types = Vec::new()
     var i = 0
     while i < elems.len() do
@@ -4453,6 +4670,18 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     end
     Type::Tuple(types)
   when ExprKind::ExprStructLit(path, fields) then
+    # Record aggregate ownership: struct literal field values are owned
+    # transfers into the struct (consumed by the resource checker via
+    # typed.aggregate_ownership).
+    var st_owned = Vec::new()
+    var so0 = 0
+    while so0 < fields.len() do
+      st_owned.push(true)
+      so0 = so0 + 1
+    end
+    if expr.node_id != 0 then
+      env.typed_aggregate_ownership.insert(expr.node_id, st_owned)
+    end
     let type_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     match get_type_def_by_name(env, type_name)
     when Option::Some(type_def) then
@@ -5525,14 +5754,91 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   env.param_binding_resolutions.clear()
   env.pattern_binding_resolutions.clear()
   env.typed_access_effects.clear()
+  env.typed_aggregate_ownership.clear()
   env.closure_captures.clear()
   env.resolutions = Option::Some(resolutions.clone())
   type_check_program_env(env, program)
   var kinds = Map::new()
+  var type_names = Map::new()
+  var deinit_targets = Map::new()
   var ki = 0
   while ki < env.type_list.len() do
     kinds.insert(env.type_list[ki].id.id, env.type_list[ki].kind)
+    type_names.insert(env.type_list[ki].id.id, env.type_list[ki].name.clone())
     ki = ki + 1
+  end
+  # Collect registered deinit methods (type name -> mangled callable) so the
+  # per-type DeinitPlan can reference them; a resource WITHOUT a deinit is
+  # trivially deinitialized (no entry here is fine).
+  var dmi = 0
+  while dmi < program.items.len() do
+    let item = program.items[dmi]
+    match item.kind
+    when ItemKind::ItemImpl(imp) then
+      var mj = 0
+      while mj < imp.methods.len() do
+        let m = imp.methods[mj]
+        if m.name == "deinit" then
+          let type_key = type_expr_name_of(&imp.for_type)
+          let mangled = type_key + "__" + m.name.clone()
+          var ti = 0
+          while ti < env.type_list.len() do
+            if env.type_list[ti].name == type_key then
+              deinit_targets.insert(env.type_list[ti].id.id, mangled.clone())
+            end
+            ti = ti + 1
+          end
+        end
+        mj = mj + 1
+      end
+    when ItemKind::ItemStruct(s) then
+      var mj2 = 0
+      while mj2 < s.methods.len() do
+        let m2 = s.methods[mj2]
+        if m2.name == "deinit" then
+          let mangled2 = s.name.clone() + "__" + m2.name.clone()
+          var ti2 = 0
+          while ti2 < env.type_list.len() do
+            if env.type_list[ti2].name == s.name.clone() then
+              deinit_targets.insert(env.type_list[ti2].id.id, mangled2.clone())
+            end
+            ti2 = ti2 + 1
+          end
+        end
+        mj2 = mj2 + 1
+      end
+    when _ then ()
+    end
+    dmi = dmi + 1
+  end
+  # Build the recursive deinit plan for every type id (consumed by MIR).
+  var deinit_plans = Map::new()
+  var plan_typed = TypedProgram {
+    ast: program.clone(),
+    resolutions: resolutions.clone(),
+    expr_types: env.typed_expr_types.clone(),
+    call_targets: env.typed_call_targets.clone(),
+    field_targets: env.typed_field_targets.clone(),
+    access_effects: env.typed_access_effects.clone(),
+    closure_captures: env.closure_captures.clone(),
+    local_bindings: env.typed_local_bindings.clone(),
+    ident_resolutions: env.typed_ident_resolutions.clone(),
+    param_binding_resolutions: env.param_binding_resolutions.clone(),
+    pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
+    deinit_plans: Map::new(),
+    aggregate_ownership: Map::new(),
+    finalize_plan: Map::new(),
+    type_names: type_names.clone(),
+    deinit_targets: deinit_targets.clone(),
+    type_kinds: kinds.clone()
+  }
+  var pi = 0
+  while pi < env.type_list.len() do
+    let td = env.type_list[pi]
+    let self_ty = Type::Named(td.id, Vec::new())
+    let plan = build_deinit_plan(&plan_typed, &self_ty, 0)
+    deinit_plans.insert(td.id.id, plan)
+    pi = pi + 1
   end
   let typed = TypedProgram {
     ast: program.clone(),
@@ -5546,6 +5852,11 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     ident_resolutions: env.typed_ident_resolutions.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
+    deinit_plans: deinit_plans,
+    aggregate_ownership: env.typed_aggregate_ownership.clone(),
+    finalize_plan: Map::new(),
+    type_names: type_names,
+    deinit_targets: deinit_targets,
     type_kinds: kinds
   }
   env.resolutions = Option::None

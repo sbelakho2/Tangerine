@@ -18,9 +18,9 @@ use tg_compiler::ast::{
 }
 use tg_compiler::types::{
   Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding, TypeKind,
-  type_kinds_contain_resource
+  type_kinds_contain_resource, DeinitPlan, build_deinit_plan, fn_owner_key
 }
-use tg_compiler::ids::{FieldId}
+use tg_compiler::ids::{FieldId, DefId}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -465,12 +465,18 @@ enum MirRvalueKind
   
   # References
   # MirRef/MirRefMut are INTERNAL ABI temporaries representing an inout
-  # place (P1#7 invariant). They must never escape the lowering contract:
-  #   - they are only ever assigned to a plain temp local (no projections);
-  #   - the temp is only ever READ (MirCopy) as a call argument — never
-  #     moved, stored into an aggregate, or returned;
-  #   - a function's return type is never RefInternal.
-  # The MIR verifier (verify_function_v2) enforces all three rules.
+  # place (P1#7 invariant). WHITELIST of legal uses (everything else is a
+  # verifier error):
+  #   (a) the rvalue is assigned to a plain temp local (no projections);
+  #   (b) the temp is READ (MirCopy) as a direct call argument — at ABI
+  #       boundaries the codegen deref-copies the pointee value, so no
+  #       reference escapes;
+  #   (c) reads through deref projections (place with ProjDeref) are plain
+  #       value reads.
+  # Forbidden: storing a ref into an aggregate, moving it, using it in
+  # binop/unop/cast/repeat operands, or returning it (a function's return
+  # type is never RefInternal). The MIR verifier (verify_function_v2)
+  # enforces the whitelist.
   MirRef(Place)    # &place
   MirRefMut(Place) # &mut place
   
@@ -943,6 +949,33 @@ struct MirBuilder
   # target for a resource type is an internal error, see
   # local_deinit_fn_name).
   deinit_targets: Map[Int, String]
+  # Authoritative per-function finalize sets from the resource checker
+  # (fn owner key -> local ids). MIR uses this as the PRIMARY cleanup source;
+  # the declared-locals analysis below is only a fallback for synthetic
+  # functions. Single-sourced ownership: semantic analysis decides, MIR emits.
+  finalize_plan: Map[String, Vec[Int]]
+  # Recursive deinit plans per type id (from the typed program): container
+  # types (Option[R], Array[R], Map[K,R], tuples...) get recursive cleanup.
+  deinit_plans: Map[Int, DeinitPlan]
+  # type id -> type name (needed to resolve Named types when walking plans).
+  typed_type_names: Map[Int, String]
+  # Function name -> local ids of sink parameters (the callee owns them and
+  # must finalize them if still live at exit; let/inout params are caller
+  # owned and must never be finalized by the callee).
+  sink_params: Map[String, Vec[Int]]
+  # The owner key (fn_owner_key of the item's DefId, or the positional
+  # fallback) of the function currently being lowered — the SAME key the
+  # resource checker used for finalize_plan and param bindings.
+  current_fn_key: String
+  # Resolver item_defs (item index -> DefIds) for owner-key derivation.
+  item_defs: Map[Int, Vec[DefId]]
+  # Call expression node id -> resolved DefId from the typed program, so MIR
+  # carries the semantic callable identity instead of re-resolving by name.
+  call_def_ids: Map[Int, DefId]
+  # Typed identifier resolutions (expr node id -> local id); the semantic
+  # source for lr_ident (name-based scope lookup is the transitional
+  # fallback).
+  ident_resolutions: Map[Int, Int]
   field_targets: Map[Int, FieldId]
   expr_types: Map[Int, Type]
   static_names: Set[String]
@@ -984,6 +1017,14 @@ def builder_new() -> MirBuilder
     impl_type_map: Map::new(),
     fn_ret_types: Map::new(),
     deinit_targets: Map::new(),
+    finalize_plan: Map::new(),
+    deinit_plans: Map::new(),
+    typed_type_names: Map::new(),
+    sink_params: Map::new(),
+    current_fn_key: "",
+    item_defs: Map::new(),
+    call_def_ids: Map::new(),
+    ident_resolutions: Map::new(),
     field_targets: Map::new(),
     expr_types: Map::new(),
     static_names: Set::new(),
@@ -1060,6 +1101,56 @@ def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span)
   end
 end
 
+# Whether a deinit callable with the given (mangled) name is registered for
+# any type — used to detect that the function being lowered IS a finalizer
+# (whose own self must never be re-finalized).
+def deinit_targets_contains(targets: &Map[Int, String], needle: &String) -> Bool
+  for (_, v) in targets do
+    if v == needle then
+      return true
+    end
+  end
+  false
+end
+
+# The owner key of a free function item (DefId, or the positional fallback
+# "item::<idx>::fn" matching the resource checker's derivation).
+def mir_fn_owner_key(b: &MirBuilder, item_idx: Int) -> String
+  match b.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if dids.len() > 0 then
+      let did = dids[0]
+      return fn_owner_key(did.module.clone(), did.index, did.kind)
+    end
+  when Option::None then ()
+  end
+  "item::" + item_idx.to_string() + "::fn"
+end
+
+# The owner key of the item's function/method at (item index, method index):
+# the DefId rendered via fn_owner_key when the resolver recorded one, else
+# the positional fallback — IDENTICAL to the resource checker's derivation
+# (item_owner_key), so finalize_plan and param-binding lookups align.
+def mir_item_owner_key(b: &MirBuilder, item_idx: Int, method_index: Int) -> String
+  match b.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if method_index < dids.len() then
+      let did = dids[method_index]
+      return fn_owner_key(did.module.clone(), did.index, did.kind)
+    end
+  when Option::None then ()
+  end
+  "item::" + item_idx.to_string() + "::method::" + method_index.to_string()
+end
+
+# The name of the function currently being lowered ("" when none).
+def mir_current_fn_name(b: &MirBuilder) -> String
+  match b.current_fn
+  when Option::Some(f) then f.name.clone()
+  when Option::None then ""
+  end
+end
+
 def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> LocalId
   let id = LocalId { id: b.local_counter }
   b.local_counter = b.local_counter + 1
@@ -1082,6 +1173,20 @@ def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> LocalId
   b.var_map.insert(name, id)
   b.declared_locals.insert(id.id)
   id
+end
+
+# Whether a local id exists in the current function.
+def lookup_local_id(b: &MirBuilder, local_id: LocalId) -> Option[MirLocal]
+  match b.current_fn
+  when Option::Some(f) then
+    for l in f.locals do
+      if l.id.id == local_id.id then
+        return Option::Some(l.clone())
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
 end
 
 def lookup_local_type(b: &MirBuilder, local_id: &LocalId) -> Type
@@ -1147,12 +1252,11 @@ def local_deinit_fn_name(b: &mut MirBuilder, local_id: &LocalId) -> String
             match b.deinit_targets.get(btid.id)
             when Option::Some(n) then n.clone()
             when Option::None then
-              # A resource type MUST have a registered deinit finalizer;
-              # silently returning "" would drop the finalizer and let the
-              # resource escape without cleanup. (TODO: replace the
-              # mangled-string identity in deinit_targets with a typed
-              # DefId/CallableId.)
-              b.errors.push("internal error: resource type has no registered deinit target (type id " + btid.id.to_string() + ")")
+              # Language rule: a resource WITHOUT a deinit method is
+              # TRIVIALLY deinitialized (no cleanup call needed) — absence
+              # of a deinit is NOT an error (canary_resource.tg relies on
+              # this). (TODO: replace the mangled-string identity in
+              # deinit_targets with a typed DefId/CallableId.)
               ""
             end
           when _ then ""
@@ -1172,24 +1276,64 @@ def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   var places: Vec[Place] = Vec::new()
   match b.current_fn
   when Option::Some(f) then
-    # Parameter locals are owned by the caller: the callee must never
-    # auto-finalize them (a finalizer must not deinit its own subject).
-    mut is_param = false
-    for local in f.locals do
-      is_param = false
-      mut pi = 0
-      while pi < f.params.len() do
-        if f.params[pi].id.id == local.id.id then
-          is_param = true
-          break
+    # PRIMARY SOURCE: the authoritative finalize plan computed by the
+    # resource checker (per-function; includes sink params still live,
+    # excludes caller-owned let/inout params). MIR emits exactly what
+    # semantic analysis decided.
+    match b.finalize_plan.get(b.current_fn_key.clone())
+    when Option::Some(plan_ids) then
+      for pid in plan_ids do
+        if !consumed.contains(&pid) then
+          if local_deinit_fn_name(b, &LocalId { id: pid }) != "" then
+            places.push(place_local(LocalId { id: pid }))
+          end
         end
-        pi = pi + 1
       end
-      if local.id.id != 0 && !is_param then
-        if b.declared_locals.contains(&local.id.id) then
-          if !consumed.contains(&local.id.id) then
-            if local_deinit_fn_name(b, &local.id) != "" then
-              places.push(place_local(LocalId { id: local.id.id }))
+    when Option::None then
+      # FALLBACK (synthetic/untyped functions): declared locals minus
+      # consumed, with the ownership rules encoded: sink parameters are
+      # callee-owned and MUST be finalized if still live; let/inout
+      # parameters are caller-owned and never finalized; the deinit
+      # method's own self is never re-finalized (a finalizer must not
+      # deinit its own subject).
+      let fn_name = mir_current_fn_name(b)
+      let sink_ids = match b.sink_params.get(fn_name.clone())
+      when Option::Some(sids) then sids.clone()
+      when Option::None then Vec::new()
+      end
+      let is_deinit_fn = deinit_targets_contains(&b.deinit_targets, &fn_name)
+      mut is_param = false
+      for local in f.locals do
+        is_param = false
+        mut pi = 0
+        while pi < f.params.len() do
+          if f.params[pi].id.id == local.id.id then
+            is_param = true
+            break
+          end
+          pi = pi + 1
+        end
+        if local.id.id != 0 && !is_param then
+          if b.declared_locals.contains(&local.id.id) then
+            if !consumed.contains(&local.id.id) then
+              if local_deinit_fn_name(b, &local.id) != "" then
+                places.push(place_local(LocalId { id: local.id.id }))
+              end
+            end
+          end
+        else
+          # Parameter handling: sink params are finalized by the callee
+          # (ownership was transferred), except a deinit's own self.
+          if is_param then
+            let is_self = f.params.len() > 0 && f.params[0].id.id == local.id.id
+            if !(is_deinit_fn && is_self) then
+              if sink_ids.contains(&local.id.id) then
+                if !consumed.contains(&local.id.id) then
+                  if local_deinit_fn_name(b, &local.id) != "" then
+                    places.push(place_local(LocalId { id: local.id.id }))
+                  end
+                end
+              end
             end
           end
         end
@@ -1200,6 +1344,192 @@ def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   places
 end
 
+# Resolve the deinit plan for a local's type: named types use the typed
+# per-type plan; containers recurse structurally so Option[R], Array[R],
+# tuples etc. get recursive cleanup (viral resource containment).
+def deinit_plan_for_type(b: &MirBuilder, ty: &Type) -> DeinitPlan
+  match ty
+  when Type::Named(tid, _) then
+    match b.deinit_plans.get(tid.id)
+    when Option::Some(plan) then plan.clone()
+    when Option::None then DeinitPlan::Trivial
+    end
+  when Type::Slice(inner) then DeinitPlan::Array(deinit_plan_for_type(b, &inner))
+  when Type::Array(inner, _) then DeinitPlan::Array(deinit_plan_for_type(b, &inner))
+  when Type::Map(k, v) then DeinitPlan::Map(deinit_plan_for_type(b, &k), deinit_plan_for_type(b, &v))
+  when Type::Tuple(fields) then
+    var plans = Vec::new()
+    for f in fields do
+      plans.push(deinit_plan_for_type(b, &f))
+    end
+    DeinitPlan::Tuple(plans)
+  when Type::Option(inner) then DeinitPlan::Option(deinit_plan_for_type(b, &inner))
+  when Type::Result(ok, err) then DeinitPlan::Result(deinit_plan_for_type(b, &ok), deinit_plan_for_type(b, &err))
+  when _ then DeinitPlan::Trivial
+  end
+end
+
+# Emit the recursive deinit chain for one place according to its plan.
+# Returns the block the caller should continue from (each MirDeinit
+# terminator chains to the next cleanup block; the final block returns).
+# Map plans are recognized but their emission (entry iteration) is a
+# documented TODO: the plan structure is complete; emitting map-entry
+# cleanup requires entry-array iteration support in the deinit chain.
+# Emit the recursive deinit chain for one place according to its plan,
+# building BACKWARD: each MirDeinit terminator targets the next cleanup
+# block; the function returns the ENTRY block of the emitted chain, which
+# the predecessor must target. `succ` is the block the chain must end at
+# (typically the final return block). Map plans are recognized; their
+# emission (entry iteration) is a documented TODO.
+def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ: BlockId, span: Span) -> BlockId
+  match plan
+  when DeinitPlan::Trivial then
+    succ
+  when DeinitPlan::Call(name) then
+    let bk = create_block(b)
+    switch_to_block(b, bk)
+    set_terminator(b, MirTerminatorKind::MirDeinit {
+      place: place.clone(),
+      deinit_fn: name.clone(),
+      target: succ,
+      unwind: Option::None
+    }, span)
+    bk
+  when DeinitPlan::Tuple(field_plans) then
+    var s = succ
+    var fi = field_plans.len()
+    while fi > 0 do
+      fi = fi - 1
+      let idx_tmp = add_temp(b, Type::Int, span)
+      push_assign(b, place_local(idx_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(fi), ty: Type::Int })
+      }) }, span)
+      var projs = place.projections.clone()
+      projs.push(Projection::ProjIndex(idx_tmp))
+      let field_place = Place { local: place.local, projections: projs }
+      s = emit_plan_deinit(b, &field_place, &field_plans[fi], s, span)
+    end
+    s
+  when DeinitPlan::Array(elem_plan) then
+    # Runtime-length loop: idx = len-1 .. 0, deinit elem[idx] each iteration.
+    let idx_local = add_local(b, "deinit_idx", Type::Int, false, span)
+    let len_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(len_tmp), MirRvalue { kind: MirRvalueKind::MirLen(place.clone()) }, span)
+    push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirCopy(place_local(len_tmp))
+    }) }, span)
+    let header_blk = create_block(b)
+    let exit_blk = create_block(b)
+    let body_blk = create_block(b)
+    switch_to_block(b, header_blk)
+    let zero_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(zero_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int })
+    }) }, span)
+    let cmp_tmp = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+      MirBinOp::Gt,
+      operand_copy_local(idx_local),
+      operand_copy_local(zero_tmp)
+    ) }, span)
+    var targets = Vec::new()
+    targets.push(SwitchTarget { value: 0, target: exit_blk })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(cmp_tmp), targets: targets, default_target: body_blk }, span)
+    # body block: decrement idx, deinit elem[idx], chain flows back to header
+    switch_to_block(b, body_blk)
+    let dec_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(dec_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+      MirBinOp::Sub,
+      operand_copy_local(idx_local),
+      operand_int(1)
+    ) }, span)
+    push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirCopy(place_local(dec_tmp))
+    }) }, span)
+    var projs2 = place.projections.clone()
+    projs2.push(Projection::ProjIndex(idx_local))
+    let elem_place = Place { local: place.local, projections: projs2 }
+    let chain_entry = emit_plan_deinit(b, &elem_place, elem_plan, header_blk, span)
+    switch_to_block(b, body_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry), span)
+    # exit block: continue after the loop
+    switch_to_block(b, exit_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    # entry: goto header
+    let entry_blk = create_block(b)
+    switch_to_block(b, entry_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(header_blk), span)
+    entry_blk
+  when DeinitPlan::Map(_, _) then
+    # TODO: map-entry deinit emission (requires entry-array iteration in the
+    # deinit chain). The plan structure is complete; only emission is pending.
+    succ
+  when DeinitPlan::Option(inner_plan) then
+    # Deinit the payload only when the variant is Some: discriminant block
+    # switches to skip_blk (None) or body_blk (Some payload deinit).
+    let disc_blk = create_block(b)
+    let body_blk = create_block(b)
+    let skip_blk = create_block(b)
+    switch_to_block(b, disc_blk)
+    let disc_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    # Option discriminants: Some = 0, None = 1. Some routes to the payload
+    # deinit; None routes to the skip block.
+    var targets_o = Vec::new()
+    targets_o.push(SwitchTarget { value: 0, target: body_blk })
+    targets_o.push(SwitchTarget { value: 1, target: skip_blk })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: targets_o, default_target: skip_blk }, span)
+    switch_to_block(b, skip_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    switch_to_block(b, body_blk)
+    var payload_projs = place.projections.clone()
+    payload_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    let payload_place = Place { local: place.local, projections: payload_projs }
+    let chain_entry_o = emit_plan_deinit(b, &payload_place, inner_plan, succ, span)
+    switch_to_block(b, body_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_o), span)
+    let entry_o = create_block(b)
+    switch_to_block(b, entry_o)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk), span)
+    entry_o
+  when DeinitPlan::Result(ok_plan, err_plan) then
+    # Deinit the payload of whichever variant is present.
+    let disc_blk2 = create_block(b)
+    let body_blk2 = create_block(b)
+    let skip_blk2 = create_block(b)
+    switch_to_block(b, disc_blk2)
+    let disc_tmp2 = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp2), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    # Result discriminants: Ok = 0, Err = 1. Ok routes to the Ok payload
+    # deinit; Err routes to the Err payload deinit.
+    var targets_r = Vec::new()
+    targets_r.push(SwitchTarget { value: 0, target: body_blk2 })
+    targets_r.push(SwitchTarget { value: 1, target: skip_blk2 })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp2), targets: targets_r, default_target: skip_blk2 }, span)
+    # Ok variant (default) deinits the Ok payload; the Err variant (tag 1)
+    # deinits the Err payload — both plans are honored.
+    switch_to_block(b, skip_blk2)
+    var err_projs = place.projections.clone()
+    err_projs.push(Projection::ProjDowncast("Err".to_string(), 1))
+    let err_place = Place { local: place.local, projections: err_projs }
+    let chain_entry_e = emit_plan_deinit(b, &err_place, err_plan, succ, span)
+    switch_to_block(b, skip_blk2)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_e), span)
+    switch_to_block(b, body_blk2)
+    var payload_projs2 = place.projections.clone()
+    payload_projs2.push(Projection::ProjDowncast("Ok".to_string(), 0))
+    let payload_place2 = Place { local: place.local, projections: payload_projs2 }
+    let chain_entry_r = emit_plan_deinit(b, &payload_place2, ok_plan, succ, span)
+    switch_to_block(b, body_blk2)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_r), span)
+    let entry_r = create_block(b)
+    switch_to_block(b, entry_r)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk2), span)
+    entry_r
+  when DeinitPlan::Enum(_) then succ
+  end
+end
+
 def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Place], span: Span) -> Unit
   let saved_block = b.current_block
   b.current_block = Option::Some(block_id)
@@ -1207,26 +1537,19 @@ def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Pla
   switch_to_block(b, final_blk)
   set_terminator(b, MirTerminatorKind::MirReturn, span)
   var succ = final_blk
-  mut i = 0
-  while i < places.len() - 1 do
-    let bk = create_block(b)
-    switch_to_block(b, bk)
-    set_terminator(b, MirTerminatorKind::MirDeinit {
-      place: places[i],
-      deinit_fn: local_deinit_fn_name(b, &places[i].local),
-      target: succ,
-      unwind: Option::None
-    }, span)
-    succ = bk
-    i = i + 1
+  var i = places.len()
+  while i > 0 do
+    i = i - 1
+    let ty = builder_local_typed_ty(b, &places[i].local)
+    let plan = match ty
+    when Option::Some(t) then deinit_plan_for_type(b, &t)
+    when Option::None then DeinitPlan::Trivial
+    end
+    succ = emit_plan_deinit(b, &places[i], &plan, succ, span)
   end
+  # Route the original block to the start of the cleanup chain.
   switch_to_block(b, block_id)
-  set_terminator(b, MirTerminatorKind::MirDeinit {
-    place: places[places.len() - 1],
-    deinit_fn: local_deinit_fn_name(b, &places[places.len() - 1].local),
-    target: succ,
-    unwind: Option::None
-  }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
   b.current_block = saved_block
 end
 
@@ -1633,6 +1956,14 @@ def block_is_terminated(b: &MirBuilder) -> Bool
   end
 end
 
+# The id of the block currently being built (0 when none).
+def mir_current_block_id(b: &MirBuilder) -> BlockId
+  match b.current_block
+  when Option::Some(blk) then blk.clone()
+  when Option::None then BlockId { id: 0 }
+  end
+end
+
 def switch_to_block(b: &mut MirBuilder, block: BlockId) -> Unit
   b.current_block = Option::Some(block)
 end
@@ -1675,6 +2006,14 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.typed_local_bindings = typed.local_bindings.clone()
   b.field_targets = typed.field_targets.clone()
   b.expr_types = typed.expr_types.clone()
+  # Wire the typed deinit/finalize/call identity data: MIR consumes the
+  # semantic plans instead of guessing cleanup or callees from names.
+  b.finalize_plan = typed.finalize_plan.clone()
+  b.deinit_plans = typed.deinit_plans.clone()
+  b.typed_type_names = typed.type_names.clone()
+  b.call_def_ids = typed.call_targets.clone()
+  b.ident_resolutions = typed.ident_resolutions.clone()
+  b.item_defs = typed.resolutions.item_defs.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -1853,14 +2192,20 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   # different files that happen to share the same name. If duplicates do
   # exist in the merged list (hash collisions in collect_dep_file), the MIR
   # will have duplicates, but no function is silently lost.
-  for item in program.items do
+  var item_idx2 = 0
+  while item_idx2 < program.items.len() do
+    let item = program.items[item_idx2]
     match item.kind
     when ItemKind::ItemFunction(f) then
+      # Set the SAME owner key the resource checker used (DefId-based), so
+      # finalize_plan and param bindings resolve to this function.
+      b.current_fn_key = mir_fn_owner_key(b, item_idx2)
       match lower_function(&mut b, &f)
       when Option::Some(mir_fn) then
         functions.push(mir_fn)
       when Option::None then dbg_none = dbg_none + 1
       end
+      b.current_fn_key = ""
     when ItemKind::ItemStatic(s) then
       statics.push(lower_static(&mut b, &s))
     when ItemKind::ItemConst(c) then
@@ -1882,7 +2227,9 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
 
       # Extract methods from impl blocks as standalone MIR functions
       # Mangle method names as TypeName__method_name to avoid collisions
-      for method in impl_decl.methods do
+      var method_idx = 0
+      while method_idx < impl_decl.methods.len() do
+        let method = impl_decl.methods[method_idx]
         let mangled_name = if impl_type_name != "" then
           impl_type_name.clone() + "__" + method.name.clone()
         else
@@ -1932,6 +2279,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           effects: method.effects.clone(),
           span: method.span
         }
+        b.current_fn_key = mir_item_owner_key(b, item_idx2, method_idx)
         match lower_function(&mut b, &renamed_method)
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
@@ -1939,6 +2287,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           b.impl_type_map.insert(mangled_name.clone(), impl_type_name.clone())
         when Option::None then ()
         end
+        b.current_fn_key = ""
+        method_idx = method_idx + 1
       end
     when ItemKind::ItemStruct(s) then
       var type_args = Vec::new()
@@ -1948,7 +2298,9 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
         sgp_idx = sgp_idx + 1
       end
       let res_for_type = TypeExpr { kind: TypeExprKind::Named(s.name.clone(), type_args), span: s.span }
-      for method in s.methods do
+      var sm_idx = 0
+      while sm_idx < s.methods.len() do
+        let method = s.methods[sm_idx]
         let mangled_name = s.name.clone() + "__" + method.name.clone()
         var new_params = Vec::new()
         for p in method.params do
@@ -1984,12 +2336,15 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           effects: method.effects.clone(),
           span: method.span
         }
+        b.current_fn_key = mir_item_owner_key(b, item_idx2, sm_idx)
         match lower_function(&mut b, &renamed_method)
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
           b.impl_type_map.insert(mangled_name.clone(), s.name.clone())
         when Option::None then ()
         end
+        b.current_fn_key = ""
+        sm_idx = sm_idx + 1
       end
     when ItemKind::ItemExternBlock(ext) then
       # Register extern function declarations.
@@ -2011,6 +2366,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       end
     when _ then ()
     end
+    item_idx2 = item_idx2 + 1
   end
   
   eprintln("[lprog] lowered_fns=" + functions.len() + " skipped=" + dbg_skipped + " none=" + dbg_none)
@@ -2083,7 +2439,22 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
       when Option::None then ()
       end
     end
-    add_param(b, p.name.clone(), ty, f.span)
+    let param_lid = add_param(b, p.name.clone(), ty, f.span)
+    # Sink parameters are OWNED by the callee: if still live at exit they
+    # must be finalized here (let/inout params are caller-owned). Track the
+    # sink param local ids per function for the cleanup fallback path.
+    if p.convention == AccessConvention::Sink then
+      let fn_name = mir_current_fn_name(b)
+      match b.sink_params.get(fn_name.clone())
+      when Option::Some(mut existing) then
+        existing.push(param_lid.id)
+        b.sink_params.insert(fn_name.clone(), existing)
+      when Option::None then
+        var fresh = Vec::new()
+        fresh.push(param_lid.id)
+        b.sink_params.insert(fn_name.clone(), fresh)
+      end
+    end
     param_idx = param_idx + 1
   end
   
@@ -3993,7 +4364,20 @@ def lr_self_ref(b: &mut MirBuilder) -> MirRvalue
   end
 end
 
-def lr_ident(b: &mut MirBuilder, name: String) -> MirRvalue
+# Lower an identifier to its place value. The typed ident_resolutions
+# (node id -> local id) are authoritative when available; the name-based
+# scope lookup is a transitional fallback for synthetic/source-less code.
+def lr_ident(b: &mut MirBuilder, name: String, node_id: Int) -> MirRvalue
+  if node_id != 0 then
+    match b.ident_resolutions.get(node_id)
+    when Option::Some(lid) then
+      match lookup_local_id(b, LocalId { id: lid })
+      when Option::Some(_) then return move_rvalue(operand_copy_local(LocalId { id: lid }))
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
   match lookup_current_local_id_by_name(b, name)
   when Option::Some(local_id) then move_rvalue(operand_copy_local(local_id))
   when Option::None then
@@ -4063,6 +4447,17 @@ end
 
 # Lower a callee expression to a function operand, using string dispatch
 # on ExprKind to avoid the large-enum Swift compiler match bug.
+# Whether a callee expression is a direct (name/path) callable rather than a
+# first-class value — direct callees MUST have a typed call target.
+def expr_is_direct_callee(expr: &Expr) -> Bool
+  match expr.kind
+  when ExprKind::ExprIdent(_) then true
+  when ExprKind::ExprPath(_) then true
+  when ExprKind::ExprFieldAccess(_, _) then true
+  when _ then false
+  end
+end
+
 def lower_callee_expr(b: &mut MirBuilder, callee_expr: &Expr, span: Span) -> MirOperand
   let ck = expr_kind_name(&callee_expr.kind)
   if ck == "ExprIdent" then
@@ -4098,7 +4493,7 @@ def lower_callee_expr(b: &mut MirBuilder, callee_expr: &Expr, span: Span) -> Mir
   lower_expr(b, &callee_expr, span)
 end
 
-def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span: Span) -> MirRvalue
+def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span: Span, call_node_id: Int) -> MirRvalue
   let callee_kind = expr_kind_name(&callee_expr.kind)
   if callee_kind == "ExprPath" then
     let callee_path = path_in_expr(callee_expr)
@@ -4118,6 +4513,17 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
   end
 
   let callee_op = lower_callee_expr(b, callee_expr, span)
+  # Typed call identity: the resolver/type checker computed call_targets for
+  # direct callees; MIR must not silently re-resolve by name. When the typed
+  # target is missing for a DIRECT callee (name/path), that is a compiler
+  # internal error — the name-based operand is kept only as the ABI symbol.
+  match b.call_def_ids.get(call_node_id)
+  when Option::Some(_) then ()
+  when Option::None then
+    if expr_is_direct_callee(callee_expr) && call_node_id != 0 then
+      b.errors.push("internal error: missing typed call target for direct callee")
+    end
+  end
   let ret_type = mir_infer_call_result_type(b, callee_expr)
 
   let ret_tmp = add_temp(b, mir_call_result_temp_type(ret_type), span)
@@ -4366,7 +4772,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
     
   elsif kind_name == "ExprIdent" then
     match expr.kind
-    when ExprKind::ExprIdent(name) then return Result::Ok(lr_ident(b, name))
+    when ExprKind::ExprIdent(name) then return Result::Ok(lr_ident(b, name, expr.node_id))
     when _ then ()
     end
     
@@ -4406,7 +4812,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee_expr, arg_exprs) then
-      return Result::Ok(lr_call(b, &callee_expr, &arg_exprs, span))
+      return Result::Ok(lr_call(b, &callee_expr, &arg_exprs, span, expr.node_id))
     when _ then ()
     end
 
