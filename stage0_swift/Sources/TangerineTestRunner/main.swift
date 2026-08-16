@@ -2365,7 +2365,7 @@ test("13.12: Execution layer independent test") {
     // Build a trivial MIR program by hand
     let retLocal = MirLocal(id: 0, name: "_return", type: .int, isMutable: true)
     let block = MirBlock(id: 0, statements: [
-        .assign(MirPlace(local: 0, projections: []), .use(.constant(.int(42))))
+        .assign(MirPlace(local: 0, projections: []), .use(.mirConstant(.int(42))))
     ], terminator: .ret)
     let fn = MirFunction(name: "main", params: [], returnType: .int,
                           locals: [retLocal], blocks: [block], entryBlock: 0)
@@ -3543,7 +3543,7 @@ test("19.1: Builder produces valid function") {
     let builder = MirFunctionBuilder(name: "test_fn", returnType: .int)
     let b0 = builder.addBlock()
     builder.emit(in: b0, .assign(MirPlace(local: 0, projections: []),
-                                  .use(.constant(.int(42)))))
+                                  .use(.mirConstant(.int(42)))))
     builder.terminate(b0, .ret)
     let result = builder.build()
     switch result {
@@ -3825,7 +3825,7 @@ test("19.13: Verified function data integrity") {
     _ = builder.addParam(name: "a", type: .int)
     let b0 = builder.addBlock()
     builder.emit(in: b0, .assign(MirPlace(local: 0, projections: []),
-                                  .use(.constant(.int(99)))))
+                                  .use(.mirConstant(.int(99)))))
     builder.terminate(b0, .ret)
     let result = builder.build()
     guard case .success(let unverified) = result else {
@@ -3860,7 +3860,7 @@ print("\n=== Suite 20: Silent Fallback Guard ===")
 test("20.1: Clean MIR is clean") {
     let retLocal = MirLocal(id: 0, name: "_return", type: .int, isMutable: true)
     let block = MirBlock(id: 0, statements: [
-        .assign(MirPlace(local: 0, projections: []), .use(.constant(.int(1))))
+        .assign(MirPlace(local: 0, projections: []), .use(.mirConstant(.int(1))))
     ], terminator: .ret)
     let fn = MirFunction(name: "clean", params: [], returnType: .int,
                           locals: [retLocal], blocks: [block], entryBlock: 0)
@@ -3915,7 +3915,7 @@ test("20.3: Placeholder IR detected") {
     try assertTrue(irViolations.count >= 1, "Must detect placeholder IR")
     // NEGATIVE: non-empty block must not trigger
     let realBlock = MirBlock(id: 1, statements: [
-        .assign(MirPlace(local: 0, projections: []), .use(.constant(.int(1))))
+        .assign(MirPlace(local: 0, projections: []), .use(.mirConstant(.int(1))))
     ], terminator: .ret)
     let fn2 = MirFunction(name: "real", params: [], returnType: .int,
                             locals: [retLocal], blocks: [MirBlock(id: 0, statements: [], terminator: .goto(1)), realBlock], entryBlock: 0)
