@@ -1572,6 +1572,7 @@ public final class MIRInterpreter {
                 return elems[idx]
             }
             namedFieldOnUnitCount += 1
+            fputs("DBG namedField('\(name)') on value kind: \(valueKindName(val))\n", stderr)
             return failProjection(proj, on: val, detail: "value has no named field '\(name)'", fallback: .unit)
         case .index(let localId):
             let idxVal = getLocal(localId)
