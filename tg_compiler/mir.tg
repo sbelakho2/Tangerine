@@ -464,6 +464,13 @@ enum MirRvalueKind
   MirMove(MirOperand)
   
   # References
+  # MirRef/MirRefMut are INTERNAL ABI temporaries representing an inout
+  # place (P1#7 invariant). They must never escape the lowering contract:
+  #   - they are only ever assigned to a plain temp local (no projections);
+  #   - the temp is only ever READ (MirCopy) as a call argument — never
+  #     moved, stored into an aggregate, or returned;
+  #   - a function's return type is never RefInternal.
+  # The MIR verifier (verify_function_v2) enforces all three rules.
   MirRef(Place)    # &place
   MirRefMut(Place) # &mut place
   
@@ -13078,6 +13085,37 @@ def verifier_check_place(type_index: &Map[Int, MirTypeDef], func: &MirFunction, 
   end
 end
 
+# Extract the place from a place-shaped operand (MirCopy/MirMovePlace);
+# constants and other kinds yield an empty placeholder.
+def operand_place(op: &MirOperand) -> Place
+  match op.kind
+  when MirOperandKind::MirCopy(place) then place.clone()
+  when MirOperandKind::MirMovePlace(place) then place.clone()
+  when _ then Place { local: LocalId { id: -1 }, projections: Vec::new() }
+  end
+end
+
+# Ref-ABI invariant (P1#7): flag a RefInternal-typed local used in a context
+# where the reference would escape (stored into an aggregate or participating
+# in an operation). Only BARE ref locals are flagged: an operand with
+# projections (e.g. p.pos = a deref'd field read through the ref) is a
+# legitimate value read, and plain call-argument reads are not flagged either
+# (at ABI boundaries the codegen deref-copies the pointee value, so a ref
+# argument does not escape).
+def verifier_check_ref_operand(func: &MirFunction, place: &Place, what: &String, ctx: &String, errors: &mut Vec[String]) -> Unit
+  if place.local.id < 0 then return end
+  if !place.projections.is_empty() then return end
+  match verifier_local_type(func, place.local.id)
+  when Option::Some(lt) then
+    match lt
+    when Type::RefInternal(_, _) then
+      errors.push(ctx.clone() + ": ref value used as " + what.clone() + " (refs are internal ABI temporaries and must not escape into aggregates or operations)")
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+end
+
 def verifier_check_operand(type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
   match operand.kind
   when MirOperandKind::MirCopy(place) then
@@ -13113,18 +13151,31 @@ def verifier_rvalue_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, 
     var ai = 0
     while ai < operands.len() do
       let _ = verifier_check_operand(type_index, func, &operands[ai], running, &mut moved, ctx, errors)
+      # Ref-ABI invariant (P1#7): a RefInternal value must never be stored
+      # INTO an aggregate (struct field / array element / tuple) — that is
+      # the one way a reference can genuinely escape as a stored value.
+      match operands[ai].kind
+      when MirOperandKind::MirCopy(place) then
+        verifier_check_ref_operand(func, &place, "aggregate operand", ctx, errors)
+      when MirOperandKind::MirMovePlace(place) then
+        verifier_check_ref_operand(func, &place, "aggregate operand", ctx, errors)
+      when _ then ()
+      end
       ai = ai + 1
     end
     verifier_aggregate_result_type(type_index, func, kind, &operands, ctx, errors)
   when MirRvalueKind::MirBinOp(_, lhs, rhs) then
     let lty = verifier_check_operand(type_index, func, &lhs, running, &mut moved, ctx, errors)
     let _ = verifier_check_operand(type_index, func, &rhs, running, &mut moved, ctx, errors)
+    verifier_check_ref_operand(func, &operand_place(&lhs), "binary op operand", ctx, errors)
+    verifier_check_ref_operand(func, &operand_place(&rhs), "binary op operand", ctx, errors)
     match lty
     when Option::Some(t) then Option::Some(t)
     when Option::None then Option::None
     end
   when MirRvalueKind::MirUnOp(_, operand) then
     verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
+    verifier_check_ref_operand(func, &operand_place(&operand), "unary op operand", ctx, errors)
   when MirRvalueKind::MirDiscriminant(place) then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     Option::Some(Type::Int)
@@ -13133,9 +13184,11 @@ def verifier_rvalue_type(type_index: &Map[Int, MirTypeDef], func: &MirFunction, 
     Option::Some(Type::Int)
   when MirRvalueKind::MirCast(_, operand, ty) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
+    verifier_check_ref_operand(func, &operand_place(&operand), "cast operand", ctx, errors)
     Option::Some(ty)
   when MirRvalueKind::MirRepeat(operand, _) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
+    verifier_check_ref_operand(func, &operand_place(&operand), "repeat operand", ctx, errors)
     Option::None
   when MirRvalueKind::MirPhi(entries) then
     var ei = 0
@@ -13794,6 +13847,23 @@ def verifier_check_block_stmts(type_index: &Map[Int, MirTypeDef], func: &MirFunc
     match st.kind
     when MirStatementKind::MirAssign(place, rvalue) then
       let pid = place.local.id
+      # Ref-ABI invariant (P1#7): MirRef/MirRefMut values are internal ABI
+      # temporaries representing an inout place. They must ONLY ever be
+      # assigned to a plain temp local (no projections) — storing a ref into
+      # an aggregate (struct field / array element / map) would let a
+      # reference escape as an arbitrary safe reference and break the
+      # write-back model.
+      match rvalue.kind
+      when MirRvalueKind::MirRef(_) then
+        if !place.projections.is_empty() then
+          errors.push(ctx.clone() + ": ref value stored into aggregate (refs must only be assigned to plain temps)")
+        end
+      when MirRvalueKind::MirRefMut(_) then
+        if !place.projections.is_empty() then
+          errors.push(ctx.clone() + ": ref-mut value stored into aggregate (refs must only be assigned to plain temps)")
+        end
+      when _ then ()
+      end
       match verifier_local_type(func, pid)
       when Option::Some(dst_ty) then
         verifier_check_place(type_index, func, &place, &running, ctx, errors)
@@ -13841,6 +13911,15 @@ end
 def verify_function_v2(type_index: &Map[Int, MirTypeDef], func: &MirFunction, errors: &mut Vec[String]) -> Unit
   if func.is_extern then return end
   let fn_ctx = "fn " + func.name.clone()
+
+  # Ref-ABI invariant (P1#7): refs are internal inout-place temporaries and
+  # must never escape through a return value (a returned ref would outlive
+  # its write-back tracking and expose user-visible reference semantics).
+  match func.ret_type
+  when Type::RefInternal(_, _) then
+    errors.push(fn_ctx.clone() + ": function returns a ref value (refs are internal ABI and must not escape)")
+  when _ then ()
+  end
 
   if func.blocks.is_empty() then
     errors.push(fn_ctx.clone() + ": function has no blocks")
