@@ -2550,7 +2550,7 @@ public final class MIRLowering {
     private func placeOf(_ op: MirOperand) -> LocalId {
         switch op {
         case .mirCopy(let p), .mirMovePlace(let p), .mirRead(let p), .mirConsume(let p): return p.local
-        case .constant:
+        case .mirConstant:
             let tmp = freshTemp()
             emit(.assign(.local(tmp), .use(op)))
             return tmp
