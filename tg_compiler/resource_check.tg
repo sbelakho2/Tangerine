@@ -27,6 +27,43 @@ struct ResFrame
   spans: Map[Int, Span]
 end
 
+enum FlowKind
+  Linear
+  IfSplit
+  Join
+  LoopHeader
+  LoopAfter
+  MatchSplit
+  MatchJoin
+  TrySplit
+  TryJoin
+  Terminator
+end
+
+struct FlowNode
+  kind: FlowKind
+  stmt: &Stmt
+end
+
+enum ResBlockKind
+  Entry
+  Body
+  Join
+  Terminator
+end
+
+struct ResBlock
+  kind: ResBlockKind
+  start: Int
+  end_index: Int
+  successors: Vec[Int]
+end
+
+struct ResFlow
+  nodes: Vec[FlowNode]
+  blocks: Vec[ResBlock]
+end
+
 pub def resource_check(program: &Program, typed: &TypedProgram) -> Vec[ResourceError]
   mut errors = Vec::new()
   mut i = 0
@@ -428,12 +465,122 @@ def check_fn_body(program: &Program, typed: &TypedProgram, body: &FnBody, frame:
   end
 end
 
-def check_block(program: &Program, typed: &TypedProgram, block: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
-  let entry_names = res_frame_names_clone(frame)
+def flatten_flow(stmt: &Stmt, out: &mut Vec[FlowNode]) -> Unit
+  # Structural statements (if/match/loops/try/with/guard/handle-with) are
+  # Linear nodes: their internal branch flow is analyzed by the corresponding
+  # check_* handler (branch clones + merge_frames). Only statements that
+  # terminate the current flow end a block.
+  match stmt.kind
+  when StmtKind::StmtReturn(_) then out.push(FlowNode { kind: FlowKind::Terminator, stmt: stmt })
+  when StmtKind::StmtBreak(_) then out.push(FlowNode { kind: FlowKind::Terminator, stmt: stmt })
+  when StmtKind::StmtContinue then out.push(FlowNode { kind: FlowKind::Terminator, stmt: stmt })
+  when StmtKind::StmtYield(_) then out.push(FlowNode { kind: FlowKind::Terminator, stmt: stmt })
+  when _ then out.push(FlowNode { kind: FlowKind::Linear, stmt: stmt })
+  end
+end
+
+def flatten_block(block: &Block, out: &mut Vec[FlowNode]) -> Unit
   mut i = 0
   while i < block.stmts.len() do
-    check_stmt(program, typed, &block.stmts[i], loop_outer, frame, errors)
+    flatten_flow(&block.stmts[i], out)
     i = i + 1
+  end
+end
+
+def build_res_blocks(block: &Block) -> Vec[ResBlock]
+  mut nodes = Vec::new()
+  flatten_block(block, &mut nodes)
+  let mut blocks = build_blocks_from_nodes(&nodes)
+  set_block_successors(&mut blocks)
+  blocks
+end
+
+def build_blocks_from_nodes(nodes: &Vec[FlowNode]) -> Vec[ResBlock]
+  mut blocks = Vec::new()
+  mut block_start = 0
+  mut has_term = false
+  mut i = 0
+  while i < nodes.len() do
+    match nodes[i].kind
+    when FlowKind::Linear then
+      i = i + 1
+    when FlowKind::Terminator then
+      has_term = true
+      i = i + 1
+    when _ then
+      if i > block_start then
+        blocks.push(res_block_for(nodes, block_start, i, has_term, blocks.len()))
+        has_term = false
+      end
+      blocks.push(res_block_for(nodes, i, i + 1, false, blocks.len()))
+      block_start = i + 1
+      i = i + 1
+    end
+  end
+  if nodes.len() > block_start then
+    blocks.push(res_block_for(nodes, block_start, nodes.len(), has_term, blocks.len()))
+  end
+  blocks
+end
+
+def res_block_for(nodes: &Vec[FlowNode], start: Int, end_index: Int, has_term: Bool, index: Int) -> ResBlock
+  let kind = if has_term then
+    ResBlockKind::Terminator
+  elsif index == 0 then
+    ResBlockKind::Entry
+  elsif end_index - start == 1 then
+    match nodes[start].kind
+    when FlowKind::Join then ResBlockKind::Join
+    when _ then ResBlockKind::Body
+    end
+  else
+    ResBlockKind::Body
+  end
+  ResBlock { kind: kind, start: start, end_index: end_index, successors: Vec::new() }
+end
+
+def set_block_successors(blocks: &mut Vec[ResBlock]) -> Unit
+  mut i = 0
+  while i < blocks.len() do
+    if i + 1 < blocks.len() then
+      match blocks[i].kind
+      when ResBlockKind::Terminator then ()
+      when _ then blocks[i].successors.push(i + 1)
+      end
+    end
+    i = i + 1
+  end
+end
+
+def build_res_flow(block: &Block) -> ResFlow
+  mut nodes = Vec::new()
+  flatten_block(block, &mut nodes)
+  let blocks = build_res_blocks(block)
+  ResFlow { nodes: nodes, blocks: blocks }
+end
+
+def check_block(program: &Program, typed: &TypedProgram, block: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+  let entry_names = res_frame_names_clone(frame)
+  let flow = build_res_flow(block)
+  mut bi = 0
+  while bi < flow.blocks.len() do
+    let rb = &flow.blocks[bi]
+    mut dead = false
+    mut ni = rb.start
+    while ni < rb.end_index do
+      let node = &flow.nodes[ni]
+      match node.kind
+      when FlowKind::Linear then
+        if !dead then
+          check_stmt(program, typed, node.stmt, loop_outer, frame, errors)
+        end
+      when FlowKind::Terminator then
+        dead = true
+      when _ then ()
+      end
+      ni = ni + 1
+    end
+    bi = bi + 1
   end
   exit_scope(frame, &entry_names, typed, errors)
 end
@@ -511,28 +658,42 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     when GuardElse::Continue then ()
     end
   when StmtKind::StmtTry(body, catches, finally_block) then
-    check_block(program, typed, &body, loop_outer, frame, errors)
+    mut try_frame = res_frame_clone(frame)
+    check_block(program, typed, &body, loop_outer, &mut try_frame, errors)
+    mut arms = Vec::new()
+    arms.push(res_frame_clone(&try_frame))
     mut i = 0
     while i < catches.len() do
-      check_block(program, typed, &catches[i].body, loop_outer, frame, errors)
+      mut cf = res_frame_clone(&try_frame)
+      check_block(program, typed, &catches[i].body, loop_outer, &mut cf, errors)
+      arms.push(cf)
       i = i + 1
     end
+    let merged = merge_frames(&arms)
+    frame_assign(frame, &merged)
     match finally_block
     when Option::Some(fb) then check_block(program, typed, &fb, loop_outer, frame, errors)
     when Option::None then ()
     end
-  when StmtKind::StmtWith(expr, _, body) then
+  when StmtKind::StmtWith(expr, name, body) then
     check_expr(program, typed, &expr, loop_outer, frame, errors)
+    let with_pat = Pattern { kind: PatternKind::Ident(name.clone(), false), span: stmt.span }
+    bind_pattern(typed, &with_pat, expr.node_id, stmt.span, frame)
     check_block(program, typed, &body, loop_outer, frame, errors)
   when StmtKind::StmtHandleWith(expr, handlers) then
     check_expr(program, typed, &expr, loop_outer, frame, errors)
     mut i = 0
     while i < handlers.len() do
+      mut arms = Vec::new()
       mut j = 0
       while j < handlers[i].arms.len() do
-        check_block(program, typed, &handlers[i].arms[j].body, loop_outer, frame, errors)
+        mut hf = res_frame_clone(frame)
+        check_block(program, typed, &handlers[i].arms[j].body, loop_outer, &mut hf, errors)
+        arms.push(hf)
         j = j + 1
       end
+      let merged = merge_frames(&arms)
+      frame_assign(frame, &merged)
       i = i + 1
     end
   end
@@ -569,13 +730,17 @@ def check_match(program: &Program, typed: &TypedProgram, m: &MatchExpr, loop_out
   mut arms = Vec::new()
   mut i = 0
   while i < m.arms.len() do
-    check_pattern(program, typed, &m.arms[i].pattern, loop_outer, frame, errors)
-    bind_pattern(typed, &m.arms[i].pattern, m.scrutinee.node_id, m.arms[i].pattern.span, frame)
+    # Each arm's pattern bindings and guard are evaluated on a private clone
+    # of the pre-match frame; the clone is discarded after the arm, so an
+    # effect in one arm's guard cannot leak into another arm or the join.
+    mut arm_pre = res_frame_clone(frame)
+    check_pattern(program, typed, &m.arms[i].pattern, loop_outer, &mut arm_pre, errors)
+    bind_pattern(typed, &m.arms[i].pattern, m.scrutinee.node_id, m.arms[i].pattern.span, &mut arm_pre)
     match m.arms[i].guard_expr
-    when Option::Some(g) then check_expr(program, typed, &g, loop_outer, frame, errors)
+    when Option::Some(g) then check_expr(program, typed, &g, loop_outer, &mut arm_pre, errors)
     when Option::None then ()
     end
-    mut arm = res_frame_clone(frame)
+    mut arm = res_frame_clone(&arm_pre)
     check_block(program, typed, &m.arms[i].body, loop_outer, &mut arm, errors)
     arms.push(arm)
     i = i + 1
