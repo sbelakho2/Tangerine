@@ -341,7 +341,10 @@ def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, ow
   check_fn_body(program, typed, &f.body, &mut frame, errors)
   exit_scope(&mut frame, &entry_ids, typed, errors)
   check_uninitialized_exit(&frame, typed, errors)
-  record_finalize_plan(typed, &frame, owner_key, finalize_plan)
+  # The finalizer's own sink `self` must never be re-finalized (that would
+  # recursively deinit the subject); exclude it from the plan.
+  let exclude_id = if f.name == "deinit" && entry_ids.len() > 0 then entry_ids[0] else -1 end
+  record_finalize_plan(typed, &frame, owner_key, finalize_plan, exclude_id)
 end
 
 def check_trait_method(program: &Program, typed: &TypedProgram, m: &TraitMethod, owner_key: String, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
@@ -350,7 +353,8 @@ def check_trait_method(program: &Program, typed: &TypedProgram, m: &TraitMethod,
   check_fn_body(program, typed, &m.default_body, &mut frame, errors)
   exit_scope(&mut frame, &entry_ids, typed, errors)
   check_uninitialized_exit(&frame, typed, errors)
-  record_finalize_plan(typed, &frame, owner_key, finalize_plan)
+  let exclude_id2 = if m.sig.name == "deinit" && entry_ids.len() > 0 then entry_ids[0] else -1 end
+  record_finalize_plan(typed, &frame, owner_key, finalize_plan, exclude_id2)
 end
 
 # The authoritative finalize set for a function: locals still Live in the
@@ -358,11 +362,15 @@ end
 # caller-owned (never finalized by the callee); the deinit method's own sink
 # self is excluded here because a deinit finalizes its subject by definition
 # (the MIR side handles that special case when emitting the finalizer).
-def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, owner_key: String, finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
+def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, owner_key: String, finalize_plan: &mut Map[String, Vec[Int]], exclude_id: Int) -> Unit
   var ids = Vec::new()
   mut i = 0
   while i < frame.names.len() do
     let id = frame.names[i]
+    if id == exclude_id then
+      i = i + 1
+      next
+    end
     match res_frame_get(frame, &id)
     when Option::Some(ResourceState::Live) then
       match frame.origins.get(id)
@@ -1031,6 +1039,17 @@ def bind_pattern(typed: &TypedProgram, pat: &Pattern, span: Span, frame: &mut Re
   end
 end
 
+# Whether the i-th child of an aggregate literal is an OWNED transfer into
+# the aggregate, per the typed ownership-effect record (the semantic source;
+# defaults to owned for every child).
+def aggregate_child_owned(typed: &TypedProgram, expr: &Expr, i: Int) -> Bool
+  match typed.aggregate_ownership.get(expr.node_id)
+  when Option::Some(owned) then
+    if i < owned.len() then owned[i] else true end
+  when Option::None then true
+  end
+end
+
 def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
   match expr.kind
   when ExprKind::ExprIntLit(_) then ()
@@ -1043,24 +1062,30 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
     mut i = 0
     while i < elems.len() do
       check_expr(program, typed, &elems[i], loop_outer, frame, errors)
-      # Every element is an owned transfer INTO the array: `let a = [r]`
-      # consumes r (previously r stayed Live and could be used after the
-      # move, duplicating ownership).
-      transfer_consume(typed, &elems[i], loop_outer, frame, errors)
+      # Owned children transfer INTO the array per the typed ownership record:
+      # `let a = [r]` consumes r (previously r stayed Live and could be used
+      # after the move, duplicating ownership).
+      if aggregate_child_owned(typed, expr, i) then
+        transfer_consume(typed, &elems[i], loop_outer, frame, errors)
+      end
       i = i + 1
     end
   when ExprKind::ExprTupleLit(elems) then
     mut i = 0
     while i < elems.len() do
       check_expr(program, typed, &elems[i], loop_outer, frame, errors)
-      transfer_consume(typed, &elems[i], loop_outer, frame, errors)
+      if aggregate_child_owned(typed, expr, i) then
+        transfer_consume(typed, &elems[i], loop_outer, frame, errors)
+      end
       i = i + 1
     end
   when ExprKind::ExprStructLit(_, fields) then
     mut i = 0
     while i < fields.len() do
       check_expr(program, typed, &fields[i].1, loop_outer, frame, errors)
-      transfer_consume(typed, &fields[i].1, loop_outer, frame, errors)
+      if aggregate_child_owned(typed, expr, i) then
+        transfer_consume(typed, &fields[i].1, loop_outer, frame, errors)
+      end
       i = i + 1
     end
   when ExprKind::ExprMapLit(entries) then
@@ -1068,9 +1093,13 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
     while i < entries.len() do
       check_expr(program, typed, &entries[i].0, loop_outer, frame, errors)
       # Map literal keys AND values are owned transfers into the map.
-      transfer_consume(typed, &entries[i].0, loop_outer, frame, errors)
+      if aggregate_child_owned(typed, expr, i * 2) then
+        transfer_consume(typed, &entries[i].0, loop_outer, frame, errors)
+      end
       check_expr(program, typed, &entries[i].1, loop_outer, frame, errors)
-      transfer_consume(typed, &entries[i].1, loop_outer, frame, errors)
+      if aggregate_child_owned(typed, expr, i * 2 + 1) then
+        transfer_consume(typed, &entries[i].1, loop_outer, frame, errors)
+      end
       i = i + 1
     end
   when ExprKind::ExprIdent(_) then
