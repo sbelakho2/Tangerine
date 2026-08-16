@@ -99,7 +99,7 @@ public enum MirTerminator {
     case goto(BlockId)
     case ret
     case switchInt(MirOperand, targets: [(Int, BlockId)], otherwise: BlockId)
-    case call(dest: MirPlace, callee: MirOperand, args: [MirOperand], argEffects: [AccessEffect], next: BlockId, unwind: BlockId?)
+    case call(dest: MirPlace, callee: MirOperand, args: [MirCallArg], next: BlockId, unwind: BlockId?)
     case drop(MirPlace, next: BlockId, unwind: BlockId?)
     case `deinit`(MirPlace, next: BlockId, unwind: BlockId?)
     case assert(MirOperand, expected: Bool, message: String, target: BlockId)
@@ -145,6 +145,22 @@ public enum MirOperand {
     case read(MirPlace)
     case consume(MirPlace)
     case constant(MirConstant)
+}
+
+// MARK: - Call Argument
+
+public enum MirCallValue {
+    case value(MirOperand)
+    case place(MirPlace)
+}
+
+public struct MirCallArg {
+    public var effect: AccessEffect
+    public var value: MirCallValue
+    public init(effect: AccessEffect, value: MirCallValue) {
+        self.effect = effect
+        self.value = value
+    }
 }
 
 // MARK: - Constant

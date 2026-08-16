@@ -63,7 +63,7 @@ public final class MIRInterpreter {
         var pendingDest: Int = -1
         var pendingNext: BlockId = -1
         var pendingCalleeName: String = ""
-        var pendingCallOperands: [MirOperand] = []
+        var pendingCallOperands: [MirCallArg] = []
         var pendingArgVals: [MirValue] = []
         var hasPending: Bool = false
     }
@@ -344,6 +344,53 @@ public final class MIRInterpreter {
         return validLocals.contains(.int(localId))
     }
 
+    /// Evaluate a call argument: a place argument behaves like a copy for now.
+    @inline(__always)
+    private func evalCallArg(_ arg: MirCallArg) -> MirValue {
+        switch arg.value {
+        case .value(let op): return evalOperand(op)
+        case .place(let p): return evalOperand(.copy(p))
+        }
+    }
+
+    /// Extract the source place of a call argument, if it has one.
+    @inline(__always)
+    private func callArgPlace(_ arg: MirCallArg) -> MirPlace? {
+        switch arg.value {
+        case .value(let op):
+            switch op {
+            case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
+            default: return nil
+            }
+        case .place(let p): return p
+        }
+    }
+
+    /// Write-back eligibility: Modify and Consume behave like Modify for now.
+    @inline(__always)
+    private func callArgNeedsWriteBack(_ arg: MirCallArg) -> Bool {
+        switch arg.effect {
+        case .modify, .consume: return true
+        case .read, .initialize: return false
+        }
+    }
+
+    /// Unwrap a serialized MirCallArg value (from native MIR) to its operand form.
+    /// A serialized Place behaves like a copy for now.
+    @inline(__always)
+    private static func callArgOperandValue(_ arg: MirValue) -> MirValue? {
+        guard case .structVal(_, let argFields) = arg,
+              case .enumVal(_, let valueIdx, let payload) = argFields["value"] else { return nil }
+        switch valueIdx {
+        case 0: // MirCallValue::Value(MirOperand)
+            return payload
+        case 1: // MirCallValue::Place(Place) — transitional copy equivalence
+            return .structVal("MirOperand", ["kind": .enumVal("MirOperandKind", 0, payload)])
+        default:
+            return nil
+        }
+    }
+
     /// Check if an MIR rvalue passes verification (all referenced locals are valid).
     private func rvalueValid(_ rvalue: MirValue, _ validLocals: MirNativeMap) -> Bool {
         guard case .structVal(_, let rvFields) = rvalue,
@@ -550,12 +597,7 @@ public final class MIRInterpreter {
                 case ".pop", ".remove": writeBackValue = argVals.first ?? .unit
                 default: writeBackValue = result
                 }
-                if let receiverPlace = { () -> MirPlace? in
-                    switch callArgs[0] {
-                    case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
-                    default: return nil
-                    }
-                }() {
+                if let receiverPlace = callArgPlace(callArgs[0]) {
                     if receiverPlace.projections.isEmpty {
                         setLocal(receiverPlace.local, writeBackValue)
                     } else {
@@ -576,13 +618,8 @@ public final class MIRInterpreter {
         if !lastCallFinalParams.isEmpty {
             for (i, arg) in callArgs.enumerated() {
                 guard i < lastCallFinalParams.count else { break }
-                guard i < lastCallMutRefMask.count, lastCallMutRefMask[i] else { continue }
-                let argPlace: MirPlace?
-                switch arg {
-                case .copy(let p), .move(let p), .read(let p), .consume(let p): argPlace = p
-                default: argPlace = nil
-                }
-                if let ap = argPlace {
+                guard callArgNeedsWriteBack(arg) else { continue }
+                if let ap = callArgPlace(arg) {
                     let borrowedPlace = caller.mutBorrows[ap.local] ?? ap
                     let modifiedVal = lastCallFinalParams[i]
                     if borrowedPlace.projections.isEmpty {
@@ -602,12 +639,7 @@ public final class MIRInterpreter {
 
         // Track .get_mut / .get results for Map mutation write-back
         if (calleeName == ".get_mut" || calleeName == ".get") && callArgs.count >= 2 {
-            let receiverPlace: MirPlace?
-            switch callArgs[0] {
-            case .copy(let p), .move(let p), .read(let p), .consume(let p): receiverPlace = p
-            default: receiverPlace = nil
-            }
-            if let receiverPlace {
+            if let receiverPlace = callArgPlace(callArgs[0]) {
                 caller.mapMutOptions[dest] = (mapPlace: receiverPlace, key: argVals[1])
             }
         }
@@ -748,9 +780,9 @@ public final class MIRInterpreter {
                     callStack[frameIdx].currentBlock = otherwise
                 }
 
-            case .call(let dest, let callee, let callArgs, _, let next, _):
+            case .call(let dest, let callee, let callArgs, let next, _):
                 let calleeVal = evalOperand(callee)
-                let argVals = callArgs.map { evalOperand($0) }
+                let argVals = callArgs.map { evalCallArg($0) }
 
                 let result: MirValue
                 if case .fn(let name) = calleeVal {
@@ -791,12 +823,7 @@ public final class MIRInterpreter {
                             // The first arg operand is the receiver — update its local.
                             // With borrow synthesis, callArgs[0] is a borrow ref temp;
                             // follow mutBorrows back to the original place.
-                            if let receiverPlace = { () -> MirPlace? in
-                                switch callArgs[0] {
-                                case .copy(let p), .move(let p), .read(let p), .consume(let p): return p
-                                default: return nil
-                                }
-                            }() {
+                            if let receiverPlace = callArgPlace(callArgs[0]) {
                                 let curFrame = callStack[callStack.count - 1]
                                 let borrowedPlace = curFrame.mutBorrows[receiverPlace.local] ?? receiverPlace
                                 if borrowedPlace.projections.isEmpty {
@@ -823,13 +850,8 @@ public final class MIRInterpreter {
                         let curFrame = callStack[callStack.count - 1]
                         for (i, arg) in callArgs.enumerated() {
                             guard i < lastCallFinalParams.count else { break }
-                            guard i < lastCallMutRefMask.count, lastCallMutRefMask[i] else { continue }
-                            let argPlace: MirPlace?
-                            switch arg {
-                            case .copy(let p), .move(let p), .read(let p), .consume(let p): argPlace = p
-                            default: argPlace = nil
-                            }
-                            if let ap = argPlace {
+                            guard callArgNeedsWriteBack(arg) else { continue }
+                            if let ap = callArgPlace(arg) {
                                 let borrowedPlace = curFrame.mutBorrows[ap.local] ?? ap
                                 let modifiedVal = lastCallFinalParams[i]
                                 if borrowedPlace.projections.isEmpty {
@@ -871,16 +893,9 @@ public final class MIRInterpreter {
                 
                 // Track .get_mut / .get results for map mutation write-back
                 if case .fn(let name) = calleeVal, name == ".get_mut" || name == ".get" {
-                    if callArgs.count >= 2 {
-                        let receiverPlace: MirPlace?
-                        switch callArgs[0] {
-                        case .copy(let p), .move(let p), .read(let p), .consume(let p): receiverPlace = p
-                        default: receiverPlace = nil
-                        }
-                        if let receiverPlace {
-                            let keyVal = argVals[1]
-                            callStack[callStack.count - 1].mapMutOptions[dest.local] = (mapPlace: receiverPlace, key: keyVal)
-                        }
+                    if callArgs.count >= 2, let receiverPlace = callArgPlace(callArgs[0]) {
+                        let keyVal = argVals[1]
+                        callStack[callStack.count - 1].mapMutOptions[dest.local] = (mapPlace: receiverPlace, key: keyVal)
                     }
                 }
 
@@ -3367,7 +3382,7 @@ public final class MIRInterpreter {
                         if let callee = cf["func"], !operandLocalValid(callee, validLocals) { break }
                         if case .array(let callArgs) = cf["args"] {
                             for a in callArgs {
-                                if !operandLocalValid(a, validLocals) { break }
+                                if let argOp = Self.callArgOperandValue(a), !operandLocalValid(argOp, validLocals) { break }
                             }
                         }
                         if case .structVal(_, let sf) = cf["success"],
@@ -6368,8 +6383,22 @@ public struct MIRPrettyPrinter {
         case .switchInt(let op, let targets, let otherwise):
             let arms = targets.map { "\($0.0): bb\($0.1)" }.joined(separator: ", ")
             return "switchInt(\(printOperand(op))) -> [\(arms), otherwise: bb\(otherwise)];"
-        case .call(let dest, let callee, let args, _, let next, let unwind):
-            let argStr = args.map(printOperand).joined(separator: ", ")
+        case .call(let dest, let callee, let args, let next, let unwind):
+            let argStr = args.map { arg -> String in
+                let eff: String
+                switch arg.effect {
+                case .read: eff = "read"
+                case .modify: eff = "modify"
+                case .consume: eff = "consume"
+                case .initialize: eff = "init"
+                }
+                let val: String
+                switch arg.value {
+                case .value(let op): val = printOperand(op)
+                case .place(let p): val = printPlace(p)
+                }
+                return "\(eff):\(val)"
+            }.joined(separator: ", ")
             let unwindStr = unwind.map { ", unwind: bb\($0)" } ?? ""
             return "\(printPlace(dest)) = \(printOperand(callee))(\(argStr)) -> [bb\(next)\(unwindStr)];"
         case .drop(let place, let next, _):

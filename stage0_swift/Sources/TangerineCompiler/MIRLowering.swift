@@ -719,10 +719,13 @@ public final class MIRLowering {
                 } else {
                     methodCalleeName = ".\(methodName)"
                 }
+                let effects = argEffects(forCallee: methodCalleeName, argCount: argOps.count)
+                let callArgs = argOps.enumerated().map { i, op in
+                    MirCallArg(effect: i < effects.count ? effects[i] : .read, value: .value(op))
+                }
                 terminateWith(.call(dest: .local(result),
                                     callee: .constant(.fnItem(".\(methodName)")),
-                                    args: argOps,
-                                    argEffects: argEffects(forCallee: methodCalleeName, argCount: argOps.count),
+                                    args: callArgs,
                                     next: nextBB, unwind: nil))
                 currentBlock = nextBB
                 return .copy(.local(result))
@@ -782,8 +785,11 @@ public final class MIRLowering {
             } else {
                 directArgEffects = Array(repeating: .read, count: argOps.count)
             }
-            terminateWith(.call(dest: .local(result), callee: calleeOp, args: argOps,
-                                argEffects: directArgEffects, next: nextBB, unwind: nil))
+            let directCallArgs = argOps.enumerated().map { i, op in
+                MirCallArg(effect: i < directArgEffects.count ? directArgEffects[i] : .read, value: .value(op))
+            }
+            terminateWith(.call(dest: .local(result), callee: calleeOp, args: directCallArgs,
+                                next: nextBB, unwind: nil))
             currentBlock = nextBB
             return .copy(.local(result))
 
@@ -798,9 +804,9 @@ public final class MIRLowering {
             }
             let result = freshTemp()
             let nextBB = freshBlock()
+            let macroCallArgs = argOps.map { MirCallArg(effect: .read, value: .value($0)) }
             terminateWith(.call(dest: .local(result), callee: .constant(.fnItem("__macro_\(name)")),
-                                args: argOps,
-                                argEffects: Array(repeating: .read, count: argOps.count),
+                                args: macroCallArgs,
                                 next: nextBB, unwind: nil))
             currentBlock = nextBB
             return .copy(.local(result))
