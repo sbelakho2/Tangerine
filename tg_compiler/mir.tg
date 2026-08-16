@@ -16,7 +16,10 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath,
   Param, AccessConvention
 }
-use tg_compiler::types::{Type, TypeId, AccessEffect, ParamType, TypedProgram}
+use tg_compiler::types::{
+  Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding, TypeKind,
+  type_kinds_contain_resource
+}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -965,6 +968,10 @@ struct MirBuilder
   static_names: Set[String]
   static_types: Map[String, Type]
   access_effects: Map[Int, AccessEffect]
+  resource_kinds: Map[Int, TypeKind]
+  typed_local_bindings: Map[Int, LocalBinding]
+  consumed_locals: Set[Int]
+  declared_locals: Set[Int]
 end
 
 struct PendingClosure
@@ -1000,7 +1007,11 @@ def builder_new() -> MirBuilder
     fn_param_conventions: Map::new(),
     static_names: Set::new(),
     static_types: Map::new(),
-    access_effects: Map::new()
+    access_effects: Map::new(),
+    resource_kinds: Map::new(),
+    typed_local_bindings: Map::new(),
+    consumed_locals: Set::new(),
+    declared_locals: Set::new()
   }
 end
 
@@ -1021,6 +1032,8 @@ def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span)
   b.block_counter = 0
   b.var_map = Map::new()
   b.blocks = Vec::new()
+  b.consumed_locals = Set::new()
+  b.declared_locals = Set::new()
   
   let entry = BlockId { id: 0 }
   b.block_counter = 1
@@ -1088,6 +1101,7 @@ def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> LocalId
   end
   
   b.var_map.insert(name, id)
+  b.declared_locals.insert(id.id)
   id
 end
 
@@ -1101,6 +1115,184 @@ def lookup_local_type(b: &MirBuilder, local_id: &LocalId) -> Type
     end
     Type::Unit
   when Option::None then Type::Unit
+  end
+end
+
+def typed_binding_type_by_name(b: &MirBuilder, name: &String) -> Option[Type]
+  var best: Option[Type] = Option::None
+  var best_id = -1
+  let entries = b.typed_local_bindings.entries()
+  mut i = 0
+  while i < entries.len() do
+    if entries[i].1.name == *name then
+      if entries[i].0 > best_id then
+        best = Option::Some(entries[i].1.ty.clone())
+        best_id = entries[i].0
+      end
+    end
+    i = i + 1
+  end
+  best
+end
+
+def builder_local_typed_ty(b: &MirBuilder, local_id: &LocalId) -> Option[Type]
+  match b.current_fn
+  when Option::Some(f) then
+    for local in f.locals do
+      if local.id.id == local_id.id then
+        return typed_binding_type_by_name(b, &local.name)
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def builder_local_is_resource(b: &MirBuilder, local_id: &LocalId) -> Bool
+  match builder_local_typed_ty(b, local_id)
+  when Option::Some(ty) then type_kinds_contain_resource(&b.resource_kinds, &ty)
+  when Option::None then false
+  end
+end
+
+def builder_type_name_from_id(b: &MirBuilder, tid: &TypeId) -> String
+  let entries = b.type_name_to_id.entries()
+  mut i = 0
+  while i < entries.len() do
+    if entries[i].1 == tid.id then
+      return entries[i].0.clone()
+    end
+    i = i + 1
+  end
+  ""
+end
+
+def local_deinit_fn_name(b: &MirBuilder, local_id: &LocalId) -> String
+  match builder_local_typed_ty(b, local_id)
+  when Option::Some(ty) then
+    match ty
+    when Type::Named(tid, _) then
+      match b.resource_kinds.get(tid.id)
+      when Option::Some(k) then
+        if *k == TypeKind::Resource || *k == TypeKind::Capability then
+          let builder_ty = lookup_local_type(b, local_id)
+          match builder_ty
+          when Type::Named(btid, _) then
+            let type_name = builder_type_name_from_id(b, &btid)
+            if type_name != "" then
+              let deinit_fn = type_name + "__deinit"
+              if b.fn_ret_types.contains(&deinit_fn) then
+                deinit_fn
+              else
+                ""
+              end
+            else
+              ""
+            end
+          when _ then ""
+          end
+        else
+          ""
+        end
+      when Option::None then ""
+      end
+    when _ then ""
+    end
+  when Option::None then ""
+  end
+end
+
+def expr_root_local(b: &MirBuilder, expr: &Expr) -> Option[LocalId]
+  let kind_name = expr_kind_name(&expr.kind)
+  if kind_name == "ExprIdent" then
+    match expr.kind
+    when ExprKind::ExprIdent(ref name) then lookup_current_local_id_by_name(b, name.clone())
+    when _ then Option::None
+    end
+  elsif kind_name == "ExprSelfRef" then
+    lookup_current_local_id_by_name(b, "self")
+  elsif kind_name == "ExprFieldAccess" then
+    match expr.kind
+    when ExprKind::ExprFieldAccess(ref recv, _) then expr_root_local(b, recv)
+    when _ then Option::None
+    end
+  elsif kind_name == "ExprDeref" then
+    match expr.kind
+    when ExprKind::ExprDeref(ref inner) then expr_root_local(b, inner)
+    when _ then Option::None
+    end
+  elsif kind_name == "ExprIndex" then
+    match expr.kind
+    when ExprKind::ExprIndex(ref base, _) then expr_root_local(b, base)
+    when _ then Option::None
+    end
+  else
+    Option::None
+  end
+end
+
+def mark_expr_consumed_if_resource(b: &mut MirBuilder, expr: &Expr) -> Unit
+  match expr_root_local(b, expr)
+  when Option::Some(local_id) then
+    if builder_local_is_resource(b, &local_id) then
+      b.consumed_locals.insert(local_id.id)
+    end
+  when Option::None then ()
+  end
+end
+
+def emit_deinit_return(b: &mut MirBuilder, span: Span) -> Unit
+  var deinit_places = Vec::new()
+  match b.current_fn
+  when Option::Some(f) then
+    for local in f.locals do
+      if local.id.id != 0 then
+        if b.declared_locals.contains(&local.id.id) then
+          if !b.consumed_locals.contains(&local.id.id) then
+            if local_deinit_fn_name(b, &local.id) != "" then
+              deinit_places.push(place_local(LocalId { id: local.id.id }))
+            end
+          end
+        end
+      end
+    end
+  when Option::None then ()
+  end
+  if deinit_places.is_empty() then
+    set_terminator(b, MirTerminatorKind::MirReturn, span)
+    return
+  end
+  match b.current_block
+  when Option::Some(cur_blk) then
+    let final_blk = create_block(b)
+    switch_to_block(b, final_blk)
+    set_terminator(b, MirTerminatorKind::MirReturn, span)
+    var succ = final_blk
+    mut i = 0
+    while i < deinit_places.len() - 1 do
+      let bk = create_block(b)
+      switch_to_block(b, bk)
+      set_terminator(b, MirTerminatorKind::MirDeinit {
+        place: deinit_places[i],
+        target: succ,
+        unwind: Option::None
+      }, span)
+      succ = bk
+      i = i + 1
+    end
+    switch_to_block(b, cur_blk)
+    set_terminator(b, MirTerminatorKind::MirDeinit {
+      place: deinit_places[deinit_places.len() - 1],
+      target: succ,
+      unwind: Option::None
+    }, span)
+  when Option::None then ()
+  end
+end
+
+def emit_function_end_return(b: &mut MirBuilder, span: Span) -> Unit
+  if !block_is_terminated(b) then
+    emit_deinit_return(b, span)
   end
 end
 
@@ -1123,6 +1315,7 @@ def add_local(b: &mut MirBuilder, name: String, ty: Type, is_mut: Bool, span: Sp
   end
   
   b.var_map.insert(name, id)
+  b.declared_locals.insert(id.id)
   id
 end
 
@@ -1321,6 +1514,8 @@ end
 def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram, String]
   var b = builder_new()
   b.access_effects = typed.access_effects.clone()
+  b.resource_kinds = typed.type_kinds.clone()
+  b.typed_local_bindings = typed.local_bindings.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -1686,7 +1881,7 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
       lower_block(b, &block)
     end
     # If no explicit return, add implicit return
-    set_terminator(b, MirTerminatorKind::MirReturn, f.span)
+    emit_function_end_return(b, f.span)
   when FnBody::FnExpr(ref expr) then
     # For if/else expressions as function bodies, assign directly to return place
     if ret_type != Type::Unit then
@@ -1702,9 +1897,9 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
     else
       let result = lower_expr(b, expr, f.span)
     end
-    set_terminator(b, MirTerminatorKind::MirReturn, f.span)
+    emit_function_end_return(b, f.span)
   when _ then
-    set_terminator(b, MirTerminatorKind::MirReturn, f.span)
+    emit_function_end_return(b, f.span)
   end
   
   finish_function(b)
@@ -2539,6 +2734,12 @@ def lower_call_arg(b: &mut MirBuilder, callee_name: String, arg_idx: Int, arg_ex
     end
   else
     value = MirCallValue::Value(lower_expr(b, arg_expr, span))
+  end
+  if effect == AccessEffect::Consume then
+    match &value
+    when MirCallValue::Place(p) then b.consumed_locals.insert(p.local.id)
+    when _ then ()
+    end
   end
   MirCallArg { effect: effect, value: value }
 end
@@ -3444,6 +3645,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
             let local_id = add_local(b, name.clone(), inferred_ty, binding_mut, stmt.span)
             push_assign(b, place_local(local_id), rvalue, stmt.span)
           end
+          mark_expr_consumed_if_resource(b, &value)
         when Result::Err(e) then
           b.errors.push(e)
         end
@@ -3465,6 +3667,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
           push_assign(b, place_local(typed_tmp), rvalue, stmt.span)
           lower_pattern_place_assignment(b, &pattern, place_local(typed_tmp), stmt.span)
         end
+        mark_expr_consumed_if_resource(b, &value)
       when Result::Err(e) then
         b.errors.push(e)
       end
@@ -3517,9 +3720,10 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
         push_stmt(b, MirStatementKind::MirAssign(place_local(LocalId { id: 0 }), MirRvalue {
           kind: MirRvalueKind::MirMove(operand)
         }), stmt.span)
+        mark_expr_consumed_if_resource(b, &val)
       when Option::None then ()
       end
-      set_terminator(b, MirTerminatorKind::MirReturn, stmt.span)
+      emit_deinit_return(b, stmt.span)
       return
     when _ then ()
     end
@@ -4262,6 +4466,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
 
       # Lower arguments: receiver first, then explicit args
       let recv_effect = call_arg_effect(b, resolved_method.clone(), 0, &receiver)
+      if normalized_method_name == "deinit" || recv_effect == AccessEffect::Consume then
+        b.consumed_locals.insert(recv_place.local.id)
+      end
       var mir_args = Vec::new()
       mir_args.push(MirCallArg { effect: recv_effect, value: MirCallValue::Value(recv_op) })
       var arg_idx = 0
@@ -5639,7 +5846,7 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
     when Result::Err(e) then
       b.errors.push(e)
     end
-    set_terminator(b, MirTerminatorKind::MirReturn, closure_span)
+    emit_function_end_return(b, closure_span)
 
     # Finish and add to program
     let closure_fn = finish_function(b)
