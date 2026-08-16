@@ -90,9 +90,7 @@ public final class SubsetChecker {
         if sig.isAsync {
             reject("E9007", "async functions are not available in the bootstrap subset", sig.span)
         }
-        if sig.isUnsafe {
-            reject("E9020", "unsafe function modifier is not available in the bootstrap subset", sig.span)
-        }
+        // unsafe functions are part of the kernel (std/ffi.tg raw pointer access)
         if sig.isConst {
             reject("E9021", "const function modifier is not available in the bootstrap subset", sig.span)
         }
