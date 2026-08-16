@@ -191,6 +191,7 @@ struct TypeEnv
   typed_local_bindings: Map[Int, LocalBinding]
   typed_ident_resolutions: Map[Int, Int]
   typed_access_effects: Map[Int, AccessEffect]
+  closure_captures: Map[Int, Map[String, AccessEffect]]
 end
 
 struct ImplInfo
@@ -231,6 +232,7 @@ struct TypedProgram
   call_targets: Map[Int, DefId]
   field_targets: Map[Int, FieldId]
   access_effects: Map[Int, AccessEffect]
+  closure_captures: Map[Int, Map[String, AccessEffect]]
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
   type_kinds: Map[Int, TypeKind]
@@ -266,7 +268,8 @@ def type_env_new() -> TypeEnv
     typed_field_targets: Map::new(),
     typed_local_bindings: Map::new(),
     typed_ident_resolutions: Map::new(),
-    typed_access_effects: Map::new()
+    typed_access_effects: Map::new(),
+    closure_captures: Map::new()
   }
   
   # Register types that are !Send / !Sync
@@ -3542,6 +3545,418 @@ def record_typed_call_target(env: &mut TypeEnv, span_start: Int, node_id: Int) -
   end
 end
 
+struct CaptureScan
+  bound: Vec[String]
+  uses: Map[String, AccessEffect]
+end
+
+def capture_effect_strength(e: AccessEffect) -> Int
+  match e
+  when AccessEffect::Consume then 3
+  when AccessEffect::Modify then 2
+  when AccessEffect::Initialize then 2
+  when _ then 1
+  end
+end
+
+def scan_capture_record(env: &TypeEnv, scan: &mut CaptureScan, name: String, effect: AccessEffect) -> Unit
+  if !scan.bound.contains(&name) then
+    if local_id_of(env, name.clone()) != 0 || name == "self" then
+      match scan.uses.get(&name)
+      when Option::Some(cur) then
+        if capture_effect_strength(effect) > capture_effect_strength(cur) then
+          scan.uses.insert(name, effect)
+        end
+      when Option::None then
+        scan.uses.insert(name, effect)
+      end
+    end
+  end
+end
+
+def scan_root_ident(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
+  when ExprKind::ExprAccess(inner) then scan_root_ident(&inner)
+  when ExprKind::ExprFieldAccess(base, _) then scan_root_ident(&base)
+  when ExprKind::ExprIndex(base, _) then scan_root_ident(&base)
+  when ExprKind::ExprRawDeref(inner) then scan_root_ident(&inner)
+  when ExprKind::ExprCast(inner, _) then scan_root_ident(&inner)
+  when _ then Option::None
+  end
+end
+
+def scan_operand(env: &TypeEnv, scan: &mut CaptureScan, operand: &Expr) -> Unit
+  match env.typed_access_effects.get(operand.node_id)
+  when Option::Some(eff) then
+    if eff == AccessEffect::Modify || eff == AccessEffect::Consume || eff == AccessEffect::Initialize then
+      match scan_root_ident(operand)
+      when Option::Some(name) then scan_capture_record(env, scan, name, eff)
+      when Option::None then ()
+      end
+    end
+  when Option::None then ()
+  end
+  scan_expr(env, scan, operand)
+end
+
+def scan_pattern_bind(env: &TypeEnv, scan: &mut CaptureScan, pat: &Pattern) -> Unit
+  match pat.kind
+  when PatternKind::Wildcard then ()
+  when PatternKind::Ident(name, _) then scan.bound.push(name.clone())
+  when PatternKind::Literal(e) then scan_expr(env, scan, &e)
+  when PatternKind::Tuple(pats) then
+    var i = 0
+    while i < pats.len() do
+      scan_pattern_bind(env, scan, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    var i = 0
+    while i < pats.len() do
+      scan_pattern_bind(env, scan, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Struct(_, field_pats) then
+    var i = 0
+    while i < field_pats.len() do
+      scan_pattern_bind(env, scan, &field_pats[i].1)
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    var i = 0
+    while i < pats.len() do
+      scan_pattern_bind(env, scan, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Or(alts) then
+    var i = 0
+    while i < alts.len() do
+      scan_pattern_bind(env, scan, &alts[i])
+      i = i + 1
+    end
+  when PatternKind::Range(lo, hi, _) then
+    match lo
+    when Option::Some(e) then scan_expr(env, scan, &e)
+    when Option::None then ()
+    end
+    match hi
+    when Option::Some(e) then scan_expr(env, scan, &e)
+    when Option::None then ()
+    end
+  end
+end
+
+def scan_block(env: &TypeEnv, scan: &mut CaptureScan, block: &Block) -> Unit
+  var i = 0
+  while i < block.stmts.len() do
+    scan_stmt(env, scan, &block.stmts[i])
+    i = i + 1
+  end
+end
+
+def scan_if_stmt(env: &TypeEnv, scan: &mut CaptureScan, if_stmt: &IfStmt) -> Unit
+  scan_expr(env, scan, &if_stmt.cond)
+  scan_block(env, scan, &if_stmt.then_block)
+  var i = 0
+  while i < if_stmt.elsif_branches.len() do
+    scan_expr(env, scan, &if_stmt.elsif_branches[i].0)
+    scan_block(env, scan, &if_stmt.elsif_branches[i].1)
+    i = i + 1
+  end
+  match if_stmt.else_block
+  when Option::Some(eb) then scan_block(env, scan, &eb)
+  when Option::None then ()
+  end
+end
+
+def scan_match_expr(env: &TypeEnv, scan: &mut CaptureScan, m: &MatchExpr) -> Unit
+  scan_expr(env, scan, &m.scrutinee)
+  var i = 0
+  while i < m.arms.len() do
+    scan_pattern_bind(env, scan, &m.arms[i].pattern)
+    match m.arms[i].guard_expr
+    when Option::Some(g) then scan_expr(env, scan, &g)
+    when Option::None then ()
+    end
+    scan_block(env, scan, &m.arms[i].body)
+    i = i + 1
+  end
+end
+
+def scan_stmt(env: &TypeEnv, scan: &mut CaptureScan, stmt: &Stmt) -> Unit
+  match stmt.kind
+  when StmtKind::StmtLet(pattern, _, value, _) then
+    scan_expr(env, scan, &value)
+    scan_pattern_bind(env, scan, &pattern)
+  when StmtKind::StmtAssign(target, value) then
+    match scan_root_ident(&target)
+    when Option::Some(name) then scan_capture_record(env, scan, name, AccessEffect::Modify)
+    when Option::None then ()
+    end
+    scan_expr(env, scan, &target)
+    scan_expr(env, scan, &value)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    match scan_root_ident(&target)
+    when Option::Some(name) then scan_capture_record(env, scan, name, AccessEffect::Modify)
+    when Option::None then ()
+    end
+    scan_expr(env, scan, &target)
+    scan_expr(env, scan, &value)
+  when StmtKind::StmtIf(if_stmt) then scan_if_stmt(env, scan, &if_stmt)
+  when StmtKind::StmtMatch(m) then scan_match_expr(env, scan, &m)
+  when StmtKind::StmtWhile(cond, body) then
+    scan_expr(env, scan, &cond)
+    scan_block(env, scan, &body)
+  when StmtKind::StmtFor(for_stmt) then
+    scan_expr(env, scan, &for_stmt.iter)
+    scan_pattern_bind(env, scan, &for_stmt.pattern)
+    scan_block(env, scan, &for_stmt.body)
+  when StmtKind::StmtLoop(body) then scan_block(env, scan, &body)
+  when StmtKind::StmtReturn(val_opt) then
+    match val_opt
+    when Option::Some(val) then
+      match scan_root_ident(&val)
+      when Option::Some(name) then scan_capture_record(env, scan, name, AccessEffect::Consume)
+      when Option::None then ()
+      end
+      scan_expr(env, scan, &val)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val_opt) then
+    match val_opt
+    when Option::Some(val) then scan_expr(env, scan, &val)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtYield(val_opt) then
+    match val_opt
+    when Option::Some(val) then scan_expr(env, scan, &val)
+    when Option::None then ()
+    end
+  when StmtKind::StmtExpr(e) then scan_expr(env, scan, &e)
+  when StmtKind::StmtUnsafe(_, body) then scan_block(env, scan, &body)
+  when StmtKind::StmtDefer(body) then scan_block(env, scan, &body)
+  when StmtKind::StmtGuard(cond, else_action) then
+    scan_expr(env, scan, &cond)
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(val) then
+        match scan_root_ident(&val)
+        when Option::Some(name) then scan_capture_record(env, scan, name, AccessEffect::Consume)
+        when Option::None then ()
+        end
+        scan_expr(env, scan, &val)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(val) then scan_expr(env, scan, &val)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_block) then
+    scan_block(env, scan, &body)
+    var i = 0
+    while i < catches.len() do
+      scan_pattern_bind(env, scan, &catches[i].pattern)
+      scan_block(env, scan, &catches[i].body)
+      i = i + 1
+    end
+    match finally_block
+    when Option::Some(fb) then scan_block(env, scan, &fb)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, name, body) then
+    scan_expr(env, scan, &expr)
+    scan.bound.push(name.clone())
+    scan_block(env, scan, &body)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    scan_expr(env, scan, &expr)
+    var i = 0
+    while i < handlers.len() do
+      var j = 0
+      while j < handlers[i].arms.len() do
+        var k = 0
+        while k < handlers[i].arms[j].params.len() do
+          scan.bound.push(handlers[i].arms[j].params[k].clone())
+          k = k + 1
+        end
+        scan_block(env, scan, &handlers[i].arms[j].body)
+        j = j + 1
+      end
+      i = i + 1
+    end
+  end
+end
+
+def scan_expr(env: &TypeEnv, scan: &mut CaptureScan, expr: &Expr) -> Unit
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+  when ExprKind::ExprIdent(name) then scan_capture_record(env, scan, name, AccessEffect::Read)
+  when ExprKind::ExprSelfRef then scan_capture_record(env, scan, "self".to_string(), AccessEffect::Read)
+  when ExprKind::ExprPath(_) then ()
+  when ExprKind::ExprArrayLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      scan_expr(env, scan, &elems[i])
+      i = i + 1
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      scan_expr(env, scan, &elems[i])
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    var i = 0
+    while i < fields.len() do
+      scan_expr(env, scan, &fields[i].1)
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    var i = 0
+    while i < entries.len() do
+      scan_expr(env, scan, &entries[i].0)
+      scan_expr(env, scan, &entries[i].1)
+      i = i + 1
+    end
+  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
+    scan_expr(env, scan, &lhs)
+    scan_expr(env, scan, &rhs)
+  when ExprKind::ExprUnaryOp(_, operand) then scan_expr(env, scan, &operand)
+  when ExprKind::ExprFieldAccess(base, _) then scan_expr(env, scan, &base)
+  when ExprKind::ExprMethodCall(recv, _, _, args) then
+    scan_operand(env, scan, &recv)
+    var i = 0
+    while i < args.len() do
+      scan_operand(env, scan, &args[i])
+      i = i + 1
+    end
+  when ExprKind::ExprIndex(base, index) then
+    scan_expr(env, scan, &base)
+    scan_expr(env, scan, &index)
+  when ExprKind::ExprCall(func, args) then
+    scan_expr(env, scan, &func)
+    var i = 0
+    while i < args.len() do
+      scan_operand(env, scan, &args[i])
+      i = i + 1
+    end
+  when ExprKind::ExprClosure(params, _, body) then
+    var i = 0
+    while i < params.len() do
+      scan_pattern_bind(env, scan, &params[i].pat)
+      i = i + 1
+    end
+    scan_expr(env, scan, &body)
+  when ExprKind::ExprAccess(inner) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprRawDeref(inner) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprIf(if_stmt) then scan_if_stmt(env, scan, &if_stmt)
+  when ExprKind::ExprMatch(m) then scan_match_expr(env, scan, &m)
+  when ExprKind::ExprBlock(block) then scan_block(env, scan, &block)
+  when ExprKind::ExprUnsafe(_, block) then scan_block(env, scan, &block)
+  when ExprKind::ExprAsync(block) then scan_block(env, scan, &block)
+  when ExprKind::ExprAwait(inner) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprTry(inner) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then scan_expr(env, scan, &s)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then scan_expr(env, scan, &e)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprTypeCheck(inner, _) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprComptime(block) then scan_block(env, scan, &block)
+  when ExprKind::ExprEnumVariant(_, args) then
+    var i = 0
+    while i < args.len() do
+      scan_expr(env, scan, &args[i])
+      i = i + 1
+    end
+  when ExprKind::ExprAssign(target, value) then
+    match scan_root_ident(&target)
+    when Option::Some(name) then scan_capture_record(env, scan, name, AccessEffect::Modify)
+    when Option::None then ()
+    end
+    scan_expr(env, scan, &target)
+    scan_expr(env, scan, &value)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    scan_expr(env, scan, &lhs)
+    scan_expr(env, scan, &rhs)
+  when ExprKind::ExprMacroCall(_, args) then
+    var i = 0
+    while i < args.len() do
+      scan_expr(env, scan, &args[i])
+      i = i + 1
+    end
+  when ExprKind::ExprError(_) then ()
+  end
+end
+
+def scan_closure_captures(env: &TypeEnv, params: &Vec[ClosureParam], body: &Expr) -> Map[String, AccessEffect]
+  var scan = CaptureScan { bound: Vec::new(), uses: Map::new() }
+  var i = 0
+  while i < params.len() do
+    scan_pattern_bind(env, &mut scan, &params[i].pat)
+    i = i + 1
+  end
+  scan_expr(env, &mut scan, body)
+  scan.uses
+end
+
+def captures_have_inout(caps: &Map[String, AccessEffect]) -> Bool
+  let entries = caps.entries()
+  var i = 0
+  while i < entries.len() do
+    match entries[i].1
+    when AccessEffect::Modify then return true
+    when _ then ()
+    end
+    i = i + 1
+  end
+  false
+end
+
+def closure_has_inout_capture(env: &TypeEnv, node_id: Int) -> Bool
+  match env.closure_captures.get(node_id)
+  when Option::Some(caps) then captures_have_inout(&caps)
+  when Option::None then false
+  end
+end
+
+def callee_ident_name(expr: &Expr) -> Option[String]
+  match expr.kind
+  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
+  when ExprKind::ExprPath(p) then
+    if p.segments.len() > 0 then
+      Option::Some(p.segments[p.segments.len() - 1].clone())
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def is_async_marker(name: &String) -> Bool
+  if name == "async" then return true end
+  if name.starts_with("spawn") then return true end
+  if name.starts_with("schedule") then return true end
+  if name.starts_with("poll") then return true end
+  false
+end
+
 def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   let result = match expr.kind
   when ExprKind::ExprIntLit(_) then Type::Int
@@ -3648,6 +4063,19 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       end
     end
     record_typed_call_target(env, expr.span.start, expr.node_id)
+    match callee_ident_name(&func)
+    when Option::Some(cname) then
+      if is_async_marker(&cname) then
+        var ai = 0
+        while ai < args.len() do
+          if closure_has_inout_capture(env, args[ai].node_id) then
+            type_add_error(env, "inout capture cannot cross await", args[ai].span)
+          end
+          ai = ai + 1
+        end
+      end
+    when Option::None then ()
+    end
     ret_type
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
     let recv_type = check_expr(env, &recv)
@@ -3695,6 +4123,18 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       while ai2 < args.len() do
         record_arg_effect(env, &args[ai2], AccessConvention::Let)
         ai2 = ai2 + 1
+      end
+    end
+    if is_async_marker(&method) then
+      if closure_has_inout_capture(env, recv.node_id) then
+        type_add_error(env, "inout capture cannot cross await", recv.span)
+      end
+      var mai = 0
+      while mai < args.len() do
+        if closure_has_inout_capture(env, args[mai].node_id) then
+          type_add_error(env, "inout capture cannot cross await", args[mai].span)
+        end
+        mai = mai + 1
       end
     end
     ret
@@ -3940,6 +4380,8 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       i = i + 1
     end
     let body_type = check_expr(env, &body)
+    let captures = scan_closure_captures(env, &params, &body)
+    env.closure_captures.insert(expr.node_id, captures)
     pop_scope(env)
     Type::Function(param_types, body_type)
   when ExprKind::ExprIf(if_stmt) then
@@ -3955,6 +4397,17 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     inner  # In full impl, would wrap in Future/Async
   when ExprKind::ExprAwait(inner) then
     let inner_type = check_expr(env, &inner)
+    if closure_has_inout_capture(env, inner.node_id) then
+      type_add_error(env, "inout capture cannot cross await", inner.span)
+    else
+      match inner.kind
+      when ExprKind::ExprAccess(inner2) then
+        if closure_has_inout_capture(env, inner2.node_id) then
+          type_add_error(env, "inout capture cannot cross await", inner2.span)
+        end
+      when _ then ()
+      end
+    end
     fresh_type_var(env)
   when ExprKind::ExprTry(inner) then
     let inner_type = check_expr(env, &inner)
@@ -4878,6 +5331,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   env.typed_local_bindings.clear()
   env.typed_ident_resolutions.clear()
   env.typed_access_effects.clear()
+  env.closure_captures.clear()
   env.resolutions = Option::Some(resolutions.clone())
   type_check_program_env(env, program)
   var kinds = Map::new()
@@ -4893,6 +5347,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     call_targets: env.typed_call_targets.clone(),
     field_targets: env.typed_field_targets.clone(),
     access_effects: env.typed_access_effects.clone(),
+    closure_captures: env.closure_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
     type_kinds: kinds
