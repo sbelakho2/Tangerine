@@ -474,6 +474,9 @@ run_critical_canaries() {
     tests/canary/canary_pos_resource_assign.tg \
     tests/canary/canary_pos_container_destroy.tg \
     tests/canary/canary_pos_resource_drain_collision.tg \
+    tests/canary/canary_pos_discarded_unique_ptr.tg \
+    tests/canary/canary_pos_closure_capture_owner.tg \
+    tests/canary/canary_pos_wrapper_viral_destroy.tg \
     tests/canary/canary_capability.tg \
     tests/canary/canary_closure_async.tg \
     tests/canary/canary_ffi.tg \

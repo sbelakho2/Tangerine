@@ -502,14 +502,62 @@ def is_owning_container(typed: &TypedProgram, ty: &Type) -> Bool
 end
 
 # THE ONE canonical ownership predicate: linear resources/capabilities,
-# owning smart pointers (canonical Box/Rc and the named forms), and owning
-# containers. Everything ownership-sensitive (binding, transfer/move
-# detection, Rc payload policy) uses THIS predicate, never a special case.
+# owning smart pointers (canonical Box/Rc and the named forms), owning
+# containers, and — VIRALLY — any ordinary aggregate whose substituted
+# FIELDS need destruction (Wrapper { values: Vec[Int] } owns even though
+# neither the nominal kind nor the name says so). Everything
+# ownership-sensitive (binding, transfer/move detection, Rc payload policy,
+# assignment) uses THIS predicate, never a special case.
 def is_owning_typed(typed: &TypedProgram, ty: &Type) -> Bool
-  if type_kind_contains_resource(&typed.type_kinds, ty) then
+  is_owning_typed_depth(typed, ty, 0)
+end
+
+def is_owning_typed_depth(typed: &TypedProgram, ty: &Type, depth: Int) -> Bool
+  if depth > 16 then
+    # depth guard for recursive nominal cycles (their cycle edges are not
+    # owning containers)
+    false
+  elsif type_kind_contains_resource(&typed.type_kinds, ty) then
     true
   else
-    is_owning_smart_pointer(typed, ty) || is_owning_container(typed, ty)
+    if is_owning_smart_pointer(typed, ty) || is_owning_container(typed, ty) then
+      true
+    else
+      match ty
+      when Type::Option(inner) then
+        # Option[UniquePtr[Int]] is ownership-bearing even though its
+        # nominal kinds are Value: the ownership of the payload transfers
+        # through the wrapper.
+        is_owning_typed_depth(typed, &inner, depth + 1)
+      when Type::Result(ok, err) then
+        is_owning_typed_depth(typed, &ok, depth + 1) || is_owning_typed_depth(typed, &err, depth + 1)
+      when Type::Named(tid, args) then
+        # VIRAL needs_drop: a plain Value aggregate inherits destruction
+        # requirements from its FIELDS, substituted with the concrete
+        # generic arguments (Wrapper[UniquePtr[Int]]'s field T becomes
+        # UniquePtr[Int]).
+        let def_params = match typed.type_params.get(tid.id)
+        when Option::Some(dp) then dp.clone()
+        when Option::None then Vec::new()
+        end
+        let mut field_found = false
+        match typed.type_fields.get(tid.id)
+        when Option::Some(fields) then
+          var fi = 0
+          while fi < fields.len() do
+            let concrete_field = subst_type_args(&fields[fi], &def_params, &args)
+            if is_owning_typed_depth(typed, &concrete_field, depth + 1) then
+              field_found = true
+              break
+            end
+            fi = fi + 1
+          end
+        when Option::None then ()
+        end
+        field_found
+      when _ then false
+      end
+    end
   end
 end
 
@@ -969,16 +1017,26 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     match expr_root_id(typed, &target)
     when Option::Some(id) then
       if res_frame_has(frame, &id) then
-        # P0-11: assigning over a LIVE owning place must drop the previous
-        # value first ("drop old -> store new"); overwriting it would leak.
+        # Assigning over a LIVE owning place drops the previous value first
+        # ("drop old -> store new"); overwriting it would leak. The
+        # assign-drop machinery drops the ROOT local, so an owning
+        # PROJECTED target (p.a = ...) cannot be represented exactly —
+        # reject it until exact-place replacement exists.
         match res_frame_get(frame, &id)
         when Option::Some(ResourceState::Live) then
           match frame.origins.get(id)
           when Option::Some(origin) then
             if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
-              var assign_ids = Vec::new()
-              assign_ids.push(id)
-              finalize_plan.insert("assign::" + stmt.node_id.to_string(), assign_ids)
+              if expr_is_plain(&target) then
+                var assign_ids = Vec::new()
+                assign_ids.push(id)
+                finalize_plan.insert("assign::" + stmt.node_id.to_string(), assign_ids)
+              else
+                errors.push(ResourceError {
+                  message: "cannot assign over an owning projected place: exact-place replacement is not yet supported",
+                  span: target.span
+                })
+              end
             end
           when Option::None then ()
           end
@@ -1020,7 +1078,10 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     # root is still Live are an error (a live binding silently dropped).
     match typed.expr_types.get(e.node_id)
     when Option::Some(et) then
-      if type_kind_contains_resource(&typed.type_kinds, &et) then
+      # The CANONICAL ownership predicate: a discarded UniquePtr[Int] or an
+      # owning container must be cleaned even though its nominal kind is
+      # Value (the old resource-containment test escaped them).
+      if is_owning_typed(typed, &et) then
         match expr_root_id(typed, &e)
         when Option::Some(root_id) then
           match res_frame_get(frame, &root_id)
@@ -1133,7 +1194,10 @@ def check_match(program: &Program, typed: &TypedProgram, m: &MatchExpr, loop_out
   when Option::Some(t) then t.clone()
   when Option::None then Type::Unit
   end
-  let scrutinee_contains_resource = type_kind_contains_resource(&typed.type_kinds, &scrutinee_ty)
+  # The CANONICAL ownership predicate: an Option[UniquePtr[Int]] scrutinee
+  # is ownership-bearing even though its nominal kinds are Value — the arm
+  # binding must consume the owner, never duplicate it.
+  let scrutinee_contains_resource = is_owning_typed(typed, &scrutinee_ty)
   if scrutinee_contains_resource then
     match expr_root_id(typed, &m.scrutinee)
     when Option::Some(root) then
@@ -1473,7 +1537,7 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
       for (cap_id, cap_effect) in caps do
         match typed.local_bindings.get(cap_id)
         when Option::Some(lb) then
-          if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+          if is_owning_typed(typed, &lb.ty) then
             # The typed capture EFFECT drives the semantics:
             #  - Consume: ownership MOVES into the closure — the outer local
             #    is consumed exactly once, and the closure frame owns it.
@@ -1552,12 +1616,36 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
       i = i + 1
     end
   when ExprKind::ExprAssign(target, value) then
+    # Assignment EXPRESSIONS share the statement-assignment replacement
+    # semantics: drop the previous owning value first, store the new one.
     check_assign_target(program, typed, &target, loop_outer, frame, errors, finalize_plan, current_loop_entry)
     check_expr(program, typed, &value, loop_outer, frame, errors, finalize_plan, current_loop_entry)
     transfer_consume(typed, &value, loop_outer, frame, errors, finalize_plan)
     match expr_root_id(typed, &target)
     when Option::Some(id) then
       if res_frame_has(frame, &id) then
+        match res_frame_get(frame, &id)
+        when Option::Some(ResourceState::Live) then
+          match frame.origins.get(id)
+          when Option::Some(origin) then
+            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+              if expr_is_plain(&target) then
+                var assign_ids = Vec::new()
+                assign_ids.push(id)
+                # The ExprAssign's MIR lowering keys on the EXPRESSION's
+                # node id (unlike StmtAssign which keys on the statement's).
+                finalize_plan.insert("assign::" + expr.node_id.to_string(), assign_ids)
+              else
+                errors.push(ResourceError {
+                  message: "cannot assign over an owning projected place: exact-place replacement is not yet supported",
+                  span: target.span
+                })
+              end
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
         apply_set(frame, id)
       end
     when Option::None then ()
@@ -2105,7 +2193,7 @@ def bind_closure_param(typed: &TypedProgram, cp: &ClosureParam, frame: &mut ResF
     when Option::Some(id) then
       match typed.local_bindings.get(id)
       when Option::Some(lb) then
-        if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+        if is_owning_typed(typed, &lb.ty) then
           res_frame_set(frame, id, ResourceState::Live)
           res_frame_set_span(frame, &id, cp.span)
           frame.origins.insert(id, ParamOrigin::OwnedLocal)

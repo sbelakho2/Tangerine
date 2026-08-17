@@ -4808,6 +4808,114 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   emit_jmp(ctx, label)
 end
 
+# The ONE drop-glue emitter: executes ANY semantic DeinitPlan for a place
+# (recursively). drop_in_place, lexical cleanup equivalents, assignment
+# replacement, and (eventually) full-expression temporaries all use it.
+# Linear plans emit inline; discriminant-bearing plans branch; Array walks
+# its elements then releases the backing buffer. Map/Set plans require the
+# drain loop and are rejected here (documented P1) rather than partially
+# destroying.
+def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: &DeinitPlan, place: &Place) -> Unit
+  match plan
+  when DeinitPlan::Trivial then ()
+  when DeinitPlan::PlanLimit then
+    panic("internal error: drop glue reached an unsupported recursive ownership cycle")
+  when DeinitPlan::Call(n) then
+    codegen_finalizer_call(ctx, fctx, place, n)
+  when DeinitPlan::UserFinalizer(n, fields) then
+    codegen_emit_drop_glue(ctx, fctx, fields, place)
+    codegen_finalizer_call(ctx, fctx, place, n)
+  when DeinitPlan::Box(inner) then
+    var bprojs = place.projections.clone()
+    bprojs.push(Projection::ProjDeref)
+    let bplace = Place { local: place.local, projections: bprojs }
+    codegen_emit_drop_glue(ctx, fctx, inner, &bplace)
+  when DeinitPlan::Tuple(field_plans) then
+    var fi = 0
+    while fi < field_plans.len() do
+      var fprojs = place.projections.clone()
+      fprojs.push(Projection::ProjFieldIndex(fi))
+      let fplace = Place { local: place.local, projections: fprojs }
+      codegen_emit_drop_glue(ctx, fctx, &field_plans[fi], &fplace)
+      fi = fi + 1
+    end
+  when DeinitPlan::Aggregate(field_plans) then
+    var ai = 0
+    while ai < field_plans.len() do
+      var aprojs = place.projections.clone()
+      aprojs.push(Projection::ProjFieldIndex(ai))
+      let aplace = Place { local: place.local, projections: aprojs }
+      codegen_emit_drop_glue(ctx, fctx, &field_plans[ai], &aplace)
+      ai = ai + 1
+    end
+  when DeinitPlan::Option(inner) then
+    # Option discriminants: Some = 0, None = 1.
+    let lbl_skip = next_codegen_label(ctx, ".Lglue_opt_skip.")
+    let disc_reg = match ctx.target.arch
+    when Arch::AArch64 then PhysReg::A64Reg(A64::X9)
+    when Arch::X86_64 then PhysReg::X64Reg(X64::RAX)
+    end
+    load_place(ctx, fctx, place, disc_reg)
+    normalize_enum_value_to_tag(ctx, disc_reg)
+    emit_cmp_ri(ctx, disc_reg, 1)
+    emit_jcc(ctx, CondKind::Eq, lbl_skip.clone())
+    var pprojs = place.projections.clone()
+    pprojs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    let pplace = Place { local: place.local, projections: pprojs }
+    codegen_emit_drop_glue(ctx, fctx, inner, &pplace)
+    def_label(&mut ctx.text, lbl_skip)
+  when DeinitPlan::Result(ok_plan, err_plan) then
+    # Result discriminants: Ok = 0, Err = 1. The Ok path jumps over the Err
+    # glue so exactly one variant's payload is destroyed.
+    let lbl_ok = next_codegen_label(ctx, ".Lglue_res_ok.")
+    let lbl_end = next_codegen_label(ctx, ".Lglue_res_end.")
+    let disc_reg2 = match ctx.target.arch
+    when Arch::AArch64 then PhysReg::A64Reg(A64::X9)
+    when Arch::X86_64 then PhysReg::X64Reg(X64::RAX)
+    end
+    load_place(ctx, fctx, place, disc_reg2)
+    normalize_enum_value_to_tag(ctx, disc_reg2)
+    emit_cmp_ri(ctx, disc_reg2, 0)
+    emit_jcc(ctx, CondKind::Eq, lbl_ok.clone())
+    var errprojs = place.projections.clone()
+    errprojs.push(Projection::ProjDowncast("Err".to_string(), 1))
+    let errplace = Place { local: place.local, projections: errprojs }
+    codegen_emit_drop_glue(ctx, fctx, err_plan, &errplace)
+    emit_jmp(ctx, lbl_end.clone())
+    def_label(&mut ctx.text, lbl_ok.clone())
+    var okprojs = place.projections.clone()
+    okprojs.push(Projection::ProjDowncast("Ok".to_string(), 0))
+    let okplace = Place { local: place.local, projections: okprojs }
+    codegen_emit_drop_glue(ctx, fctx, ok_plan, &okplace)
+    def_label(&mut ctx.text, lbl_end)
+  when DeinitPlan::Enum(variant_plans) then
+    # Per-variant discriminant glue requires variant-name resolution in the
+    # downcast projection; documented P1 (reject rather than partially
+    # destroy).
+    panic("internal error: drop glue does not yet support general Enum plans (documented P1)")
+  when DeinitPlan::Array(elem_plan) then
+    if deinit_plan_is_trivial(elem_plan) then
+      # The elements need no destruction: release the backing buffer.
+      match ctx.target.arch
+      when Arch::AArch64 then
+        let r0 = PhysReg::A64Reg(A64::X0)
+        emit_place_address(ctx, fctx, place, r0)
+        emit_call_label(ctx, "_tg_array_destroy")
+      when Arch::X86_64 then
+        panic("array destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
+      end
+    else
+      # Non-trivial element plans need the scaled-index element loop in the
+      # glue; documented P1 (reject rather than partially destroy).
+      panic("internal error: drop glue does not yet support non-trivial Array element plans (documented P1)")
+    end
+  when DeinitPlan::Map(_, _) then
+    panic("internal error: drop glue does not yet support Map plans (documented P1)")
+  when DeinitPlan::Set(_) then
+    panic("internal error: drop glue does not yet support Set plans (documented P1)")
+  end
+end
+
 def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, deinit_fn: &String) -> Unit
   # FAIL CLOSED: a nontrivial MirDeinit whose callable cannot be resolved is
   # an internal compiler error — silently skipping destruction would turn a
@@ -5412,16 +5520,12 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
         when Type::Named(tid, _) then
           match ctx.deinit_plans.get(tid.id)
           when Option::Some(plan) then
-            match plan
-            when DeinitPlan::Call(n) then
-              match args[0].kind
-              when MirOperandKind::MirCopy(p) then
-                var projs = p.projections.clone()
-                projs.push(Projection::ProjDeref)
-                let pointee = Place { local: p.local, projections: projs }
-                codegen_finalizer_call(ctx, fctx, &pointee, &n)
-              when _ then ()
-              end
+            match args[0].kind
+            when MirOperandKind::MirCopy(p) then
+              var projs = p.projections.clone()
+              projs.push(Projection::ProjDeref)
+              let pointee = Place { local: p.local, projections: projs }
+              codegen_emit_drop_glue(ctx, fctx, plan, &pointee)
             when _ then ()
             end
           when Option::None then ()
@@ -5436,25 +5540,19 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   else if name == "drop" then
     if args.len() >= 1 then
       # The argument may be a reference (Rc's last-release calls
-      # drop(&mut inner.value)): the DESTROYED value is the referent.
+      # drop(&mut inner.value)): the DESTROYED value is the referent. The
+      # plan is keyed by the CONCRETE substituted type (P0-2: TypeId-only
+      # plans would use the unsubstituted nominal shape).
       let drop_ty = strip_ref_like_type(&operand_type(ctx, fctx, &args[0]))
       match drop_ty
       when Type::Named(tid, _) then
         match ctx.deinit_plans.get(tid.id)
         when Option::Some(plan) then
-          match plan
-          when DeinitPlan::Call(n) then
-            match args[0].kind
-            when MirOperandKind::MirCopy(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
-            when MirOperandKind::MirMovePlace(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
-            when MirOperandKind::MirConsume(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
-            when _ then ()
-            end
-          when _ then
-            # Deeper plans (Aggregate/Option/...) require full glue emission;
-            # the registered-Drop callable path covers the smart-pointer and
-            # finalizer cases (documented P1: full plan-driven glue).
-            ()
+          match args[0].kind
+          when MirOperandKind::MirCopy(p) then codegen_emit_drop_glue(ctx, fctx, plan, &p)
+          when MirOperandKind::MirMovePlace(p) then codegen_emit_drop_glue(ctx, fctx, plan, &p)
+          when MirOperandKind::MirConsume(p) then codegen_emit_drop_glue(ctx, fctx, plan, &p)
+          when _ then ()
           end
         when Option::None then ()
         end

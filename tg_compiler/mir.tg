@@ -3555,6 +3555,47 @@ def lower_contract(b: &mut MirBuilder, c: &ContractClause) -> Unit
   ), c.span)
 end
 
+# Lower the drop-before-store chain for an assignment ("assign::<key>").
+# Returns the continuation block where the STORE must happen, or None when
+# no drop is needed (the store happens in the current block).
+def lower_assign_drop_chain(b: &mut MirBuilder, key: String, span: Span) -> Option[BlockId]
+  match b.finalize_plan.get(key)
+  when Option::Some(assign_ids) then
+    if assign_ids.len() > 0 then
+      match b.current_block
+      when Option::Some(assign_blk) then
+        let assign_cont = create_block(b)
+        var chain_succ = assign_cont
+        var ai = assign_ids.len()
+        while ai > 0 do
+          ai = ai - 1
+          let apid = assign_ids[ai]
+          match b.semantic_to_mir.get(apid)
+          when Option::Some(amid) then
+            let aty = builder_local_typed_ty(b, &LocalId { id: amid })
+            let aplan = match aty
+            when Option::Some(t) then
+              var vis = Set::new()
+              deinit_plan_for_type(b, &t, &mut vis)
+            when Option::None then DeinitPlan::Trivial
+            end
+            chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: amid }), &aplan, chain_succ, span)
+          when Option::None then
+            b.errors.push("internal error: assign-drop plan references semantic local _" + apid.to_string() + " with no MIR local")
+          end
+        end
+        switch_to_block(b, assign_blk)
+        set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), span)
+        Option::Some(assign_cont)
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
 def lower_block(b: &mut MirBuilder, block: &Block) -> Unit
   for stmt in block.stmts do
     lower_stmt(b, &stmt)
@@ -4714,56 +4755,18 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       let place = lower_place(b, &target)
       let value_ty = mir_infer_expr_type(b, &value)
       # P0-11: assigning over a live owning place drops the previous value
-      # first (the checker recorded "assign::<stmt id>"). The drop chain
-      # runs before the store; the store itself happens in a fresh block so
-      # the chain can flow into it.
-      match b.finalize_plan.get("assign::" + stmt.node_id.to_string())
-      when Option::Some(assign_ids) then
-        if assign_ids.len() > 0 then
-          match b.current_block
-          when Option::Some(assign_blk) then
-            let assign_cont = create_block(b)
-            var chain_succ = assign_cont
-            var ai = assign_ids.len()
-            while ai > 0 do
-              ai = ai - 1
-              let apid = assign_ids[ai]
-              match b.semantic_to_mir.get(apid)
-              when Option::Some(amid) then
-                let aty = builder_local_typed_ty(b, &LocalId { id: amid })
-                let aplan = match aty
-                when Option::Some(t) then
-                  var vis = Set::new()
-                  deinit_plan_for_type(b, &t, &mut vis)
-                when Option::None then DeinitPlan::Trivial
-                end
-                chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: amid }), &aplan, chain_succ, stmt.span)
-              when Option::None then
-                b.errors.push("internal error: assign-drop plan references semantic local _" + apid.to_string() + " with no MIR local")
-              end
-            end
-            switch_to_block(b, assign_blk)
-            set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), stmt.span)
-            switch_to_block(b, assign_cont)
-            match lower_expr_to_rvalue(b, &value, stmt.span)
-            when Result::Ok(rvalue) then
-              push_assign(b, place, rvalue, stmt.span)
-              refine_assignment_target_type(b, &place, &rvalue)
-              refine_assignment_target_type_from_type(b, &place, &value_ty)
-            when Result::Err(e) then
-              b.errors.push(e)
-            end
-          when Option::None then ()
-          end
-        else
-          match lower_expr_to_rvalue(b, &value, stmt.span)
-          when Result::Ok(rvalue) then
-            push_assign(b, place, rvalue, stmt.span)
-            refine_assignment_target_type(b, &place, &rvalue)
-            refine_assignment_target_type_from_type(b, &place, &value_ty)
-          when Result::Err(e) then
-            b.errors.push(e)
-          end
+      # first (drop old -> store new). The helper returns the continuation
+      # block for the store when a drop chain was needed.
+      match lower_assign_drop_chain(b, "assign::" + stmt.node_id.to_string(), stmt.span)
+      when Option::Some(cont) then
+        switch_to_block(b, cont)
+        match lower_expr_to_rvalue(b, &value, stmt.span)
+        when Result::Ok(rvalue) then
+          push_assign(b, place, rvalue, stmt.span)
+          refine_assignment_target_type(b, &place, &rvalue)
+          refine_assignment_target_type_from_type(b, &place, &value_ty)
+        when Result::Err(e) then
+          b.errors.push(e)
         end
       when Option::None then
         match lower_expr_to_rvalue(b, &value, stmt.span)
@@ -6024,6 +6027,46 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       else
         return Result::Err("unhandled macro invocation in lowering: " + name)
       end
+    when _ then ()
+    end
+
+  elsif kind_name == "ExprAssign" then
+    match expr.kind
+    when ExprKind::ExprAssign(target, value) then
+      # Assignment EXPRESSIONS share the statement-assignment replacement
+      # semantics (drop old -> store new), keyed on the EXPRESSION's node id
+      # ("assign::<expr id>" — the checker records the same key).
+      let place = lower_place(b, &target)
+      let value_ty = mir_infer_expr_type(b, &value)
+      match lower_assign_drop_chain(b, "assign::" + expr.node_id.to_string(), span)
+      when Option::Some(cont) then
+        switch_to_block(b, cont)
+        match lower_expr_to_rvalue(b, &value, span)
+        when Result::Ok(rvalue) then
+          push_assign(b, place, rvalue, span)
+          refine_assignment_target_type(b, &place, &rvalue)
+          refine_assignment_target_type_from_type(b, &place, &value_ty)
+        when Result::Err(e) then
+          b.errors.push(e)
+        end
+      when Option::None then
+        match lower_expr_to_rvalue(b, &value, span)
+        when Result::Ok(rvalue) then
+          push_assign(b, place, rvalue, span)
+          refine_assignment_target_type(b, &place, &rvalue)
+          refine_assignment_target_type_from_type(b, &place, &value_ty)
+        when Result::Err(e) then
+          b.errors.push(e)
+        end
+      end
+      # The expression's VALUE is the newly stored value.
+      let result_tmp = add_temp(b, value_ty, span)
+      push_assign(b, place_local(result_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place.clone())
+      }) }, span)
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+        kind: MirOperandKind::MirCopy(place_local(result_tmp))
+      }) })
     when _ then ()
     end
 
