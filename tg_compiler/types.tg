@@ -12,7 +12,7 @@ use std::fs::{read_file}
 use tg_compiler::token::{Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
-use tg_compiler::resolver::{ResolvedNames}
+use tg_compiler::resolver::{ResolvedNames, module_qualified_key, lookup_module_callable}
 use tg_compiler::ids::{DefId, DefKind, FieldId, TypeId}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
@@ -171,6 +171,62 @@ pub def deinit_plan_is_trivial(plan: &DeinitPlan) -> Bool
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# P0-C (final layer): DeinitPlan::Call construction-site verification.
+#
+# INVARIANT: a DeinitPlan::Call name is always a VERIFIED registered
+# drop-glue identity; the string is the final symbol-mangling boundary (the
+# CallableId migration is the target). Every Call name must be a value in
+# typed.deinit_targets for SOME type id (the std's impl Drop names
+# "Box__drop"/"Rc__drop"/"UniquePtr__drop" and the resource `deinit` names
+# are all registered values of that table). An unverifiable name records a
+# TypeError and fails CLOSED with PlanLimit — an invalid finalizer cannot
+# even be constructed.
+# ———————————————————————————————————————————————————————————————
+
+# True when `name` is a registered deinit_targets value for some type id.
+def deinit_name_is_registered(typed: &TypedProgram, name: &String) -> Bool
+  for (_, dv) in typed.deinit_targets do
+    if dv == name.clone() then
+      return true
+    end
+  end
+  false
+end
+
+# Construct DeinitPlan::Call(name) ONLY after verifying the name is a
+# registered drop-glue identity; an unverifiable name records a TypeError
+# and fails CLOSED with PlanLimit instead of an unverifiable Call.
+def verified_deinit_call(typed: &TypedProgram, name: &String, errors: &mut Vec[TypeError]) -> DeinitPlan
+  if deinit_name_is_registered(typed, name) then
+    DeinitPlan::Call(name.clone())
+  else
+    errors.push(TypeError {
+      message: "invalid finalizer identity `" + name.clone() + "`",
+      span: Span { file: "", start: 0, end_pos: 0 },
+      code: Option::None
+    })
+    DeinitPlan::PlanLimit
+  end
+end
+
+# Construct DeinitPlan::UserFinalizer(name, fields_plan) ONLY after verifying
+# the name is a registered drop-glue identity (the same invariant as Call:
+# the name is the finalizer identity that later emits as a Call); an
+# unverifiable name records a TypeError and fails CLOSED with PlanLimit.
+def verified_deinit_finalizer(typed: &TypedProgram, name: &String, fields_plan: DeinitPlan, errors: &mut Vec[TypeError]) -> DeinitPlan
+  if deinit_name_is_registered(typed, name) then
+    DeinitPlan::UserFinalizer(name.clone(), fields_plan)
+  else
+    errors.push(TypeError {
+      message: "invalid finalizer identity `" + name.clone() + "`",
+      span: Span { file: "", start: 0, end_pos: 0 },
+      code: Option::None
+    })
+    DeinitPlan::PlanLimit
+  end
+end
+
 # Canonical plans for the named container types (Option/Result/Array/Vec/
 # Map/Set), keyed by type NAME. Returns Trivial for anything else; the
 # caller falls back to the structural walk.
@@ -232,13 +288,20 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
     # deallocates): one real release path for both the pointee and the
     # allocation, instead of a placeholder finalizer. Rc[Resource] is an
     # explicitly unsupported combination (documented decision).
-    DeinitPlan::Call("Box__drop".to_string())
+    # P0-C (final layer): the canonical name is VERIFIED as a registered
+    # drop-glue identity before the Call is constructed (the std's impl Drop
+    # registers "Box" -> "Box__drop"); an unregistered name fails CLOSED
+    # with PlanLimit + TypeError, never an unverifiable Call.
+    let box_drop = "Box__drop".to_string()
+    verified_deinit_call(typed, &box_drop, errors)
   when Type::Rc(inner) then
     # Rc[T] owns a SHARED allocation: its registered Drop impl decrements
     # the strong count and destroys/deallocs at zero. Rc[Int] (no resource
     # inside) still needs the release, so the plan is the drop call, not
     # the inner type's plan.
-    DeinitPlan::Call("Rc__drop".to_string())
+    # P0-C (final layer): same construction-site verification as Box.
+    let rc_drop = "Rc__drop".to_string()
+    verified_deinit_call(typed, &rc_drop, errors)
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
@@ -259,16 +322,20 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
           # compiler-owned structural field cleanup (exactly-once rule).
           # A custom finalizer alone would leak resource fields; composing
           # both guarantees each field is cleaned exactly once.
+          # P0-C (final layer): construction-site verification — the name
+          # comes from the registered deinit_targets lookup, but the gate is
+          # explicit: an unverifiable name records a TypeError and fails
+          # CLOSED with PlanLimit instead of an unverifiable Call.
           if visited.contains(&tid.id) then
-            DeinitPlan::Call(n.clone())
+            verified_deinit_call(typed, &n, errors)
           else
             visited.insert(tid.id)
             let fields_plan = nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
             visited.remove(&tid.id)
             if deinit_plan_is_trivial(&fields_plan) then
-              DeinitPlan::Call(n.clone())
+              verified_deinit_call(typed, &n, errors)
             else
-              DeinitPlan::UserFinalizer(n.clone(), fields_plan)
+              verified_deinit_finalizer(typed, &n, fields_plan, errors)
             end
           end
         when Option::None then
@@ -314,8 +381,12 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
           # drop wins over the container/structural shape.
           let deinit_shape = match typed.deinit_targets.get(tid.id)
           when Option::Some(n) then
+            # P0-C (final layer): construction-site verification — same
+            # invariant as the resource-with-finalizer path: every Call name
+            # is a verified registered drop-glue identity; an unverifiable
+            # name fails CLOSED with PlanLimit + TypeError.
             if visited.contains(&tid.id) then
-              DeinitPlan::Call(n.clone())
+              verified_deinit_call(typed, &n, errors)
             else
               visited.insert(tid.id)
               let inner_container_plan = nominal_container_plan(typed, &tid, &type_name, &args, depth, visited, errors)
@@ -326,9 +397,9 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
               end
               visited.remove(&tid.id)
               if deinit_plan_is_trivial(&struct_shape) then
-                DeinitPlan::Call(n.clone())
+                verified_deinit_call(typed, &n, errors)
               else
-                DeinitPlan::UserFinalizer(n.clone(), struct_shape)
+                verified_deinit_finalizer(typed, &n, struct_shape, errors)
               end
             end
           when Option::None then
@@ -456,12 +527,66 @@ struct MethodSig
 end
 
 # ———————————————————————————————————————————————————————————————
+# Type-Property engine support (P0-I)
+# ———————————————————————————————————————————————————————————————
+#
+# The graph-algorithm visit states and the memoized property bundle for the
+# type-property engine (type_properties_of, defined with the solver below).
+# The declarations live here (before TypeEnv) because TypeEnv carries the
+# engine's memoization cache.
+
+# DFS visit states for the type-property graph walk. A key that is Visiting
+# when the walk reaches it again is a recursion through INLINE storage —
+# an infinitely sized recursive type, diagnosed by the engine instead of the
+# layout engine's panic. Indirections (Ptr/Box/Rc) terminate the walk, so
+# legal recursive types (e.g. Node { next: Option[Box[Node]] }) never cycle.
+enum TypePropVisitState
+  Unvisited
+  Visiting
+  Resolved
+end
+
+# The per-type property bundle computed by type_properties_of:
+#   needs_drop          — a value of this type requires cleanup at scope end
+#   is_linear           — move-only: must be consumed, never duplicated
+#   is_capability       — TypeKind::Capability (scoped, linear)
+#   is_trivially_copyable — raw bit-copy is valid, no retain/clone (P0-H)
+struct TypeProperties
+  needs_drop: Bool
+  is_linear: Bool
+  is_capability: Bool
+  is_trivially_copyable: Bool
+end
+
+# ———————————————————————————————————————————————————————————————
 # Type Environment
 # ———————————————————————————————————————————————————————————————
 
 struct TypeEnv
   type_list: Vec[TypeDef]              # Single source of truth, insertion order
   type_name_index: Map[String, Int]    # name -> index into type_list
+  # P0-A (next layer — module-qualified type identity): "path::name" ->
+  # type_list index for every type registered from a module path (the
+  # resolver's module_symbols DefKind::TypeName entries; see
+  # record_module_type_name). Bare first-wins resolution stays in
+  # type_name_index; this map is the qualified complement that lets
+  # path-qualified references (a::Config) and local-module shadowing
+  # resolve to the right TypeId when the same bare name exists in
+  # multiple modules. Purely additive for the bootstrap (no cross-module
+  # same-name collisions — qualified keys map to the same indices).
+  module_type_names: Map[String, Int]
+  # P0-A (final layer — module-qualified CALLABLE identity): "path::name" ->
+  # the Type the checker bound for that qualified function/const/static
+  # definition, mirrored at pass-3 registration guarded by the resolver's
+  # module_symbols DefKind entry (see record_module_callable), plus the
+  # bare-name FIRST registration's Type as the recoverable first-wins
+  # fallback for ambiguous bare callable references (mirrors the resolver's
+  # bare-name first-wins tables). Purely additive for the bootstrap: the
+  # kernel's module_symbols holds at most one qualified entry per bare
+  # callable name, so the >= 2 DISTINCT definition ambiguity check never
+  # fires (see resolve_bare_callable).
+  module_callable_types: Map[String, Type]
+  callable_first_wins: Map[String, Type]
   type_id_index: Map[Int, Int]         # TypeId.id -> index into type_list
   type_id_counter: Int
   
@@ -473,7 +598,37 @@ struct TypeEnv
   scopes: Vec[Map[String, Type]]
   
   check_ctx: String
+  # P0-A (next layer): the module path of the item currently being
+  # processed (owner ModuleInfo path from Program.modules, threaded per
+  # item in type_check_program_env — see module_path_of_item). Consumed by
+  # resolve_bare_type_name for local-module shadowing and ambiguity
+  # verification; empty for the root module and for permissive recovery
+  # (type_check / type_check_strict run without resolutions, in which case
+  # module_type_names stays empty and behavior is unchanged).
+  current_module_path: Vec[String]
+  # P1 (recovery separation): strict vs permissive resolution. Compilation —
+  # any entry that produces a TypedProgram for MIR/codegen — ALWAYS forces
+  # this true (type_check_typed sets it unconditionally, as do the
+  # compiler_core.tg invocation sites). The permissive mode exists only for
+  # editor recovery through type_check / type_check_strict, which return
+  # errors alone and never produce a codegenable TypedProgram. If a real
+  # compilation ever runs with strict_resolution = false, that is an
+  # internal error: the compilation path forces it on, so the permissive
+  # behavior is unreachable from compilation.
   strict_resolution: Bool
+  # P0-M: the declared return type of the function/method whose body is being
+  # checked. `return` statements unify against it unconditionally (set in
+  # check_function/check_impl around the body check, cleared afterwards).
+  expected_return: Option[Type]
+  
+  # P0-Q: per pattern node id — the BindingPlans collected while checking the
+  # pattern (each plan describes one bound identifier's action on its source
+  # place). Consumed by the block/match/for checking paths.
+  binding_plans: Map[Int, Vec[BindingPlan]]
+  # P0-Q: per pattern node id — the resolved variant identity (owner TypeId
+  # id, variant index) for enum-variant patterns, threaded from the pattern
+  # checker so downstream consumers resolve variants by identity, not name.
+  pattern_variant_resolutions: Map[Int, (Int, Int)]
   
   # Trait implementations
   impls: Vec[ImplInfo]
@@ -508,6 +663,11 @@ struct TypeEnv
   typed_aggregate_ownership: Map[Int, Vec[Bool]]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   access_marker_depth: Int
+  # Type-property engine (P0-I) memoization: canonical structural type key
+  # (see type_identity_key_resolved — includes concrete generic args, so
+  # Wrapper[Int] and Wrapper[File] are distinct entries) -> computed
+  # properties. Populated lazily by type_properties_of.
+  type_prop_cache: Map[String, TypeProperties]
 end
 
 # A normalized generic obligation: generic parameter `param_index` of the
@@ -517,6 +677,16 @@ end
 struct GenericObligation
   param_index: Int
   trait_name: String   # TODO: trait DefId once traits carry semantic ids
+end
+
+# A concrete obligation to be solved: `self_ty` must implement `trait_name`.
+# `args` carries trait-level type arguments (e.g. the T in Iterator[T]); the
+# type layer currently resolves trait identities by name, so args is kept for
+# forward compatibility and is not used in matching yet.
+struct Obligation
+  trait_name: String
+  self_ty: Type
+  args: Vec[Type]
 end
 
 struct ImplInfo
@@ -533,17 +703,175 @@ struct MethodInfo
   generic_params: Vec[String]  # Method-level generic param names (e.g., ["U"] for cast[U])
 end
 
+struct TypeError
+  message: String
+  span: Span
+  code: Option[String]
+end
+
+enum AccessEffect
+  Read
+  Modify
+  Consume
+  Initialize
+end
+
+# ———————————————————————————————————————————————————————————————
+# Control-Flow Result (P0-M)
+# ———————————————————————————————————————————————————————————————
+#
+# The flow summary of a checked block/statement: the type of the value it
+# produces when it FALLS THROUGH normally (Never when it provably cannot
+# fall through), plus which divergence edges are reachable. Threaded through
+# statement/block checking so loops, value-if's and matches can distinguish
+# "may terminate" from "diverges", and so unreachable tails stop
+# contributing to a block's value/flow.
+struct FlowResult
+  normal: Type
+  may_return: Bool
+  may_break: Bool
+  may_continue: Bool
+  may_throw: Bool
+end
+
+# A construct that always falls through normally (no divergence edge).
+def flow_normal(ty: Type) -> FlowResult
+  FlowResult {
+    normal: ty,
+    may_return: false,
+    may_break: false,
+    may_continue: false,
+    may_throw: false
+  }
+end
+
+# A construct that never falls through normally (a terminator): the normal
+# type is Never and the flags say which divergence edges are reachable.
+def flow_terminator(may_return: Bool, may_break: Bool, may_continue: Bool, may_throw: Bool) -> FlowResult
+  FlowResult {
+    normal: Type::Never,
+    may_return: may_return,
+    may_break: may_break,
+    may_continue: may_continue,
+    may_throw: may_throw
+  }
+end
+
+struct LocalBinding
+  name: String
+  ty: Type
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pattern Binding Plans (P0-Q)
+# ———————————————————————————————————————————————————————————————
+#
+# Pattern typing is an OWNERSHIP operation: every identifier a pattern binds
+# reads or moves its value out of the source place. For every pattern
+# binding the checker records a BindingPlan: the bound local id, a
+# description of the source place, and the binding action (Read for a plain
+# binding of a copyable value, Consume for a binding that MOVES an owning
+# value out of its source). check_pattern collects the entries; the
+# block/match/for checking paths consume them so the resource checker's
+# existing projected-move rules (whole-aggregate consumption for match
+# scrutinees, projected-place rejection for let-initializers) have the
+# per-binding action data.
+struct BindingPlan
+  local: Int             # semantic local id of the bound identifier
+  source_place: String   # place description ("let initializer", "match scrutinee", ...)
+  action: AccessEffect   # Read (plain binding) or Consume (moving binding)
+end
+
+# The semantic authority: every downstream phase (resource checker, access
+# checker, MIR, codegen) consumes THESE tables instead of re-deriving
+# semantics. One TypeId universe: type_kinds/type_names/type_fields/
+# type_variants/type_params/deinit_plans are keyed by the SAME semantic
+# TypeIds the type checker assigned.
+struct TypedProgram
+  ast: Program
+  resolutions: ResolvedNames
+  expr_types: Map[Int, Type]
+  call_targets: Map[Int, DefId]
+  field_targets: Map[Int, FieldId]
+  access_effects: Map[Int, AccessEffect]
+  closure_captures: Map[Int, Map[Int, AccessEffect]]
+  local_bindings: Map[Int, LocalBinding]
+  ident_resolutions: Map[Int, Int]
+  # Parameter bindings are keyed by owner (function/method DefId via
+  # fn_owner_key) with a positional Vec; pattern bindings are keyed by
+  # pattern node id. The two domains never collide.
+  param_binding_resolutions: Map[String, Vec[Int]]
+  pattern_binding_resolutions: Map[Int, Int]
+  # Authoritative deinitialization plan per type id (DeinitPlan). Computed in
+  # type_check_typed; MIR consumes it for recursive cleanup emission instead
+  # of guessing per-type finalization from names.
+  deinit_plans: Map[Int, DeinitPlan]
+  # Per aggregate-literal expression node id: whether each child value is
+  # OWNED (transferred into the aggregate). Consumed by the resource checker
+  # for uniform aggregate ownership transfer.
+  aggregate_ownership: Map[Int, Vec[Bool]]
+  # Authoritative per-function finalize set: fn owner key -> local ids to
+  # finalize at function end (computed by the resource checker from its final
+  # per-function frames). MIR consumes this instead of re-deriving cleanup
+  # from declared locals.
+  finalize_plan: Map[String, Vec[Int]]
+  # P0-C: per-edge cleanup obligations keyed by the STABLE SEMANTIC edge
+  # identity "edge::<CfgEdgeKind>::<source node id>" (e.g. "edge::Return::42",
+  # "edge::Backedge::7", "edge::Normal::12"). KEY SCHEME (deterministic,
+  # documented in resource_check.tg at ResourceCheckResult and
+  # record_edge_cleanup_plan): one entry per CfgEdge record with a non-empty
+  # cleanup obligation; <CfgEdgeKind> is the canonical kind render (Normal,
+  # True, False, Break, Continue, Return, Backedge, GuardElse); <source node
+  # id> is the edge's source semantic node id, globally unique, so the key is
+  # unambiguous program-wide — the same uniqueness the finalize_plan string
+  # keys rely on. The values are the local ids in reverse drop order,
+  # byte-identical to the values of the compatibility-layer string keys
+  # ("return::<id>"/"break::<id>"/"continue::<id>"/"backedge::<id>"/
+  # "block::<id>"). Populated by the resource checker (migrated from its
+  # result into this field by compiler_core); the MIR consults the edge map
+  # FIRST at every cleanup-lookup site and falls back to the string keys only
+  # for synthesized/IR-only nodes that never had a checker edge.
+  edge_cleanup: Map[String, Vec[Int]]
+  # Type id -> type name and type id -> registered deinit callable, used by
+  # build_deinit_plan to construct the recursive DeinitPlan per type.
+  type_names: Map[Int, String]
+  deinit_targets: Map[Int, String]
+  # Type id -> struct field shapes (name, type) and enum variant shapes
+  # (name, field types, discriminant): the nominal information DeinitPlan
+  # construction needs to walk struct fields and enum variants when a
+  # resource has no explicit deinit (viral containment).
+  type_fields: Map[Int, Vec[(String, Type)]]
+  type_variants: Map[Int, Vec[(String, Vec[Type], Int)]]
+  # Type id -> generic parameter names (for substituting concrete args into
+  # field/variant types when building containment plans).
+  type_params: Map[Int, Vec[String]]
+  type_kinds: Map[Int, TypeKind]
+end
+
+struct TypeCheckResult
+  errors: Vec[TypeError]
+  program: TypedProgram
+end
+
+
 def type_env_new() -> TypeEnv
   var env = TypeEnv {
     type_list: Vec::new(),
     type_name_index: Map::new(),
+    module_type_names: Map::new(),
+    module_callable_types: Map::new(),
+    callable_first_wins: Map::new(),
     type_id_index: Map::new(),
     type_id_counter: 100,
     subst: Map::new(),
     var_counter: 0,
     scopes: Vec::new(),
     check_ctx: "",
+    current_module_path: Vec::new(),
     strict_resolution: false,
+    expected_return: Option::None,
+    binding_plans: Map::new(),
+    pattern_variant_resolutions: Map::new(),
     impls: Vec::new(),
     method_lookup: Map::new(),
     non_send_types: Set::new(),
@@ -563,7 +891,8 @@ def type_env_new() -> TypeEnv
     typed_access_effects: Map::new(),
     typed_aggregate_ownership: Map::new(),
     closure_captures: Map::new(),
-    access_marker_depth: 0
+    access_marker_depth: 0,
+    type_prop_cache: Map::new()
   }
   
   # Register types that are !Send / !Sync
@@ -625,14 +954,22 @@ def type_env_new() -> TypeEnv
       FieldInfo { name: "len", ty: Type::Int, is_public: true },
       FieldInfo { name: "cap", ty: Type::Int, is_public: false }
     ]))
-  register_builtin_generic_named(&mut env, "Map", Vec::from(["K".to_string(), "V".to_string()]),
-    TypeDefKind::Struct(Vec::new()))
-  register_builtin_generic(&mut env, "Set", 1,
-    TypeDefKind::Struct(Vec::new()))
-  
-  # Register Array, Slice, Any as built-in generic types
-  register_builtin_generic(&mut env, "Array", 1, TypeDefKind::Opaque)
-  register_builtin_generic(&mut env, "Slice", 1, TypeDefKind::Opaque)
+  # P0-J (FIX 2): Map/Set/Array/Slice are NO LONGER registered as builtin
+  # Named types.  Their canonical Type variants (Type::Map/Type::Set/
+  # Type::Array/Type::Slice) are the identity — resolve_type_expr,
+  # type_def_to_canonical and trait_resolve all produce the canonical forms
+  # for these names, and normalize_named_to_canonical (below) is the SINGLE
+  # mapping authority that converts any stale Named occurrence to the
+  # canonical variant.  No consumer produces Type::Named(<these ids>, args)
+  # in a typed position (the std registers its own Map/Set stubs and the
+  # Array/Slice names are special-cased before any name lookup), so the
+  # parallel registrations were dead weight.  Vec stays registered (type
+  # annotations and Vec::new() genuinely resolve to Type::Named(Vec)), as
+  # do the opaque group Ptr/PtrMut/Box/Rc/Any (produced as Named by
+  # resolve_type_expr's fallback).
+  # Register Any as a built-in opaque type (resolved to a fresh type var in
+  # type position; the registration keeps name lookups such as trait impl
+  # resolution on `dyn Any` working).
   register_builtin_generic(&mut env, "Any", 0, TypeDefKind::Opaque)
   
   # Register built-in traits (Rust parity)
@@ -965,126 +1302,449 @@ def type_def_is_filled(td: &TypeDef) -> Bool
   end
 end
 
-def store_type_def(env: &mut TypeEnv, td: TypeDef) -> Unit
-  # Merge strategy: when multiple modules define the same type name,
-  # merge their definitions instead of skipping. This handles the
-  # flat namespace model where e.g. std/core.tg and std/atomic.tg
-  # both define enum Ordering with different variants.
+# A pre-registered placeholder from pre_register_type_name (pass 1): an
+# EMPTY Struct/Enum/Trait or an Alias(Unit) — the two-pass registration
+# pattern, NOT a duplicate. The first real definition replaces it.
+def type_def_is_forward_declaration(td: &TypeDef) -> Bool
+  match td.def_kind
+  when TypeDefKind::Struct(fields) then fields.len() == 0
+  when TypeDefKind::Enum(variants) then variants.len() == 0
+  when TypeDefKind::Trait(methods) then methods.len() == 0
+  when TypeDefKind::Alias(ty) then
+    match ty
+    when Type::Unit then true
+    when _ then false
+    end
+  when _ then false
+  end
+end
+
+# An EMPTY source-level declaration (e.g. `struct Vec[T]` / `struct Map[K, V]`
+# stubs in std/collections.tg for compiler intrinsics). It declares no fields
+# or variants of its own, so it is a no-op re-registration of the SAME type,
+# never a distinct definition.
+def type_def_is_empty_stub(td: &TypeDef) -> Bool
+  match td.def_kind
+  when TypeDefKind::Struct(fields) then fields.len() == 0
+  when TypeDefKind::Enum(variants) then variants.len() == 0
+  when TypeDefKind::Trait(methods) then methods.len() == 0
+  when _ then false
+  end
+end
+
+# Whether two type definitions are structurally IDENTICAL — a re-registration
+# of the same type (permitted), as opposed to two genuinely different types
+# that happen to share a name (a duplicate — TypeError). Compared on the
+# canonical identity keys so generic params and field/variant shapes decide.
+def type_defs_identical(env: &TypeEnv, a: &TypeDef, b: &TypeDef) -> Bool
+  if a.generic_params.len() != b.generic_params.len() then return false end
+  var gi = 0
+  while gi < a.generic_params.len() do
+    if a.generic_params[gi] != b.generic_params[gi] then return false end
+    gi = gi + 1
+  end
+  match a.def_kind
+  when TypeDefKind::Struct(fa) then
+    match b.def_kind
+    when TypeDefKind::Struct(fb) then
+      if fa.len() != fb.len() then return false end
+      var i = 0
+      while i < fa.len() do
+        if fa[i].name != fb[i].name then return false end
+        if type_identity_key(env, &fa[i].ty) != type_identity_key(env, &fb[i].ty) then return false end
+        i = i + 1
+      end
+      true
+    when _ then false
+    end
+  when TypeDefKind::Enum(va) then
+    match b.def_kind
+    when TypeDefKind::Enum(vb) then
+      if va.len() != vb.len() then return false end
+      var i = 0
+      while i < va.len() do
+        if va[i].name != vb[i].name then return false end
+        if va[i].discriminant != vb[i].discriminant then return false end
+        if va[i].fields.len() != vb[i].fields.len() then return false end
+        var j = 0
+        while j < va[i].fields.len() do
+          if type_identity_key(env, &va[i].fields[j]) != type_identity_key(env, &vb[i].fields[j]) then return false end
+          j = j + 1
+        end
+        i = i + 1
+      end
+      true
+    when _ then false
+    end
+  when TypeDefKind::Trait(ma) then
+    match b.def_kind
+    when TypeDefKind::Trait(mb) then
+      if ma.len() != mb.len() then return false end
+      var i = 0
+      while i < ma.len() do
+        if ma[i].name != mb[i].name then return false end
+        i = i + 1
+      end
+      true
+    when _ then false
+    end
+  when TypeDefKind::Alias(ta) then
+    match b.def_kind
+    when TypeDefKind::Alias(tb) then type_identity_key(env, &ta) == type_identity_key(env, &tb)
+    when _ then false
+    end
+  when TypeDefKind::Primitive then
+    match b.def_kind
+    when TypeDefKind::Primitive then true
+    when _ then false
+    end
+  when TypeDefKind::Opaque then
+    match b.def_kind
+    when TypeDefKind::Opaque then true
+    when _ then false
+    end
+  end
+end
+
+# P0-A (next layer): record the module-qualified type-name entry
+# "path::name" -> type_list index for a type registered from module_path.
+# The key is recorded only when the resolver's module_symbols snapshot
+# holds a DefKind::TypeName entry for exactly this (path, name) pair
+# (structs and enums carry TypeName entries; traits, aliases,
+# capabilities, builtins and legitimate re-registrations record nothing).
+# The bare first-wins entry in type_name_index is untouched. Idempotent:
+# pass-1 placeholders and pass-2 fills record the same index.
+def record_module_type_name(env: &mut TypeEnv, name: String, idx: Int, module_path: &Vec[String]) -> Unit
+  match env.resolutions
+  when Option::Some(res) then
+    let key = module_qualified_key(module_path, &name)
+    match res.module_symbols.get(&key)
+    when Option::Some(did) then
+      if did.kind == DefKind::TypeName then
+        env.module_type_names.insert(key, idx)
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+end
+
+# P0-A (final layer): at callable registration (pass 3), mirror the
+# resolver's module-qualified entry "path::name" -> Type, guarded by the
+# resolver's module_symbols DefKind entry for exactly this (path, name,
+# kind) triple (lookup_module_callable — so a type name and a function name
+# never collide through this path), and record the bare-name FIRST
+# registration's Type as the recoverable first-wins fallback for ambiguous
+# bare callable references (the first registration in program order, matching
+# the resolver's bare-name first-wins tables). Idempotent: one callable
+# registration happens per item in pass 3.
+def record_module_callable(env: &mut TypeEnv, name: String, ty: Type, module_path: &Vec[String], kind: DefKind) -> Unit
+  match env.resolutions
+  when Option::Some(res) then
+    match lookup_module_callable(&res, module_path, name.clone(), kind)
+    when Option::Some(_) then
+      env.module_callable_types.insert(module_qualified_key(module_path, &name), ty.clone())
+    when Option::None then ()
+    end
+    if !env.callable_first_wins.contains_key(&name) then
+      env.callable_first_wins.insert(name, ty.clone())
+    end
+  when Option::None then ()
+  end
+end
+
+# P0-A (next layer): is the bare first-wins definition of `name` the one
+# registered from `module_path`? True when the module-qualified entry for
+# this (path, name) pair points at the same type_list index as the bare
+# first-wins entry — i.e. this module IS the first-wins module, so a
+# second registration of the same name here is a same-module duplicate.
+def module_is_first_wins_owner(env: &TypeEnv, name: &String, module_path: &Vec[String]) -> Bool
+  let key = module_qualified_key(module_path, name)
+  match env.type_name_index.get(name.clone())
+  when Option::Some(bare_idx) then
+    match env.module_type_names.get(key)
+    when Option::Some(q_idx) then q_idx == bare_idx
+    when Option::None then false
+    end
+  when Option::None then false
+  end
+end
+
+# P0-A (next layer): does the type checker's module-qualified map hold any
+# entry for this bare name? False for builtin first-wins entries
+# (primitives, Option/Result/Vec, opaques, builtin traits), whose
+# re-registrations keep today's intrinsic-stub/identical semantics — a
+# second module's definition of such a name is NOT a module-local type.
+def has_qualified_type_entry(env: &TypeEnv, name: &String) -> Bool
+  for (key, _) in env.module_type_names.entries() do
+    if key == name.clone() then
+      return true
+    end
+    let suffix = "::" + name.clone()
+    if key.ends_with(suffix) then
+      return true
+    end
+  end
+  false
+end
+
+# P0-A (next layer): resolve a type name to its TypeId, preferring the
+# current module's own module-qualified identity over the bare first-wins
+# entry. Falls back to the bare entry when no qualified entry exists
+# (builtins, traits, aliases, capabilities — compatibility behavior).
+def get_type_id_by_qualified_name(env: &TypeEnv, name: String, module_path: &Vec[String]) -> Option[TypeId]
+  let key = module_qualified_key(module_path, &name)
+  match env.module_type_names.get(key)
+  when Option::Some(idx) then
+    Option::Some(env.type_list[idx].id)
+  when Option::None then
+    match env.type_name_index.get(name)
+    when Option::Some(idx) then
+      Option::Some(env.type_list[idx].id)
+    when Option::None then
+      Option::None
+    end
+  end
+end
+
+# P0-A (next layer): resolve a bare type name to a type_list index. When
+# the same bare name is registered from multiple module paths, the current
+# module's own definition shadows the others (local-module preference);
+# with no local definition and >= 2 DISTINCT foreign types under the name
+# the reference is genuinely ambiguous — the ambiguity TypeError fires and
+# the first-wins entry is returned as the recoverable fallback
+# (compatibility behavior). Identical re-declarations in several modules
+# are the SAME type (all qualified entries map to one index), so they
+# never count as ambiguous. With no qualified entries at all (builtin
+# first-wins, permissive recovery without resolutions), the first-wins
+# bare entry resolves unchanged. Conservative: never errors on a single
+# definition.
+def resolve_bare_type_name(env: &mut TypeEnv, name: String, span: Span) -> Option[Int]
+  var own_idx = Option::None
+  var foreign_distinct = 0
+  var foreign_seen = Map::new()
+  let own_key = module_qualified_key(&env.current_module_path, &name)
+  let entry_vec = env.module_type_names.entries()
+  for (key, idx) in entry_vec do
+    var matches = false
+    if key == name.clone() then
+      matches = true
+    else
+      let suffix = "::" + name.clone()
+      if key.ends_with(suffix) then
+        matches = true
+      end
+    end
+    if matches then
+      if key == own_key then
+        own_idx = Option::Some(idx)
+      elsif !foreign_seen.contains_key(&idx) then
+        foreign_seen.insert(idx, true)
+        foreign_distinct = foreign_distinct + 1
+      end
+    end
+  end
+  match own_idx
+  when Option::Some(idx) then
+    Option::Some(idx)
+  when Option::None then
+    if foreign_distinct >= 2 then
+      type_add_error(env, "ambiguous type name `" + name + "`: defined in multiple modules; qualify the path", span)
+    end
+    match env.type_name_index.get(name)
+    when Option::Some(idx) then Option::Some(idx)
+    when Option::None then Option::None
+    end
+  end
+end
+
+# P0-A (final layer): is `name` resolved from the pass-3 program-level
+# callable bindings (scope 0)? Locals/parameters/loop bindings live in inner
+# scopes (>= 1) and shadow program-level callables — they must bypass the
+# module-qualified identity check. Scope 0 holds ONLY the pass-3
+# function/const/static bindings (every pass-4 body scope is pushed and
+# popped), so a name whose outermost binding is scope 0 is a callable
+# reference.
+def var_is_global_callable(env: &TypeEnv, name: &String) -> Bool
+  if env.scopes.len() == 0 then return false end
+  if !env.scopes[0].contains_key(name) then return false end
+  var i = env.scopes.len()
+  while i > 1 do
+    i = i - 1
+    if env.scopes[i].contains_key(name) then return false end
+  end
+  true
+end
+
+# P0-A (final layer): resolve a bare callable name (function/constant/static
+# in expression position) to its Type. When the resolver's module_symbols
+# holds >= 2 DISTINCT qualified definitions of the bare name (counted by
+# DefId across the Function/Constant/Static kinds — the kind filter keeps a
+# type name and a function name from colliding through this path), the
+# CURRENT module's own definition shadows the others (local-module
+# preference); with no own definition the reference is genuinely ambiguous —
+# the TypeError fires and the FIRST-wins Type is the recoverable fallback
+# (compatibility behavior, matching the resolver's bare-name first-wins
+# tables). Fewer than 2 distinct qualified definitions — the bootstrap's
+# module_symbols holds at most one per bare callable name — resolve
+# unchanged. Conservative: never errors on a single definition.
+def resolve_bare_callable(env: &mut TypeEnv, name: String, span: Span, fallback: Type) -> Type
+  match env.resolutions
+  when Option::Some(res) then
+    var own_ty = Option::None
+    let own_key = module_qualified_key(&env.current_module_path, &name)
+    match env.module_callable_types.get(own_key)
+    when Option::Some(ty) then own_ty = Option::Some(ty.clone())
+    when Option::None then ()
+    end
+    var foreign_distinct = 0
+    var foreign_seen = Map::new()
+    let suffix = "::" + name.clone()
+    let entry_vec = res.module_symbols.entries()
+    for (key, did) in entry_vec do
+      if did.kind == DefKind::Function || did.kind == DefKind::Constant || did.kind == DefKind::Static then
+        var matches = false
+        if key == name.clone() then
+          matches = true
+        elsif key.ends_with(suffix) then
+          matches = true
+        end
+        if matches && key != own_key then
+          let dkey = fn_owner_key(did.module.clone(), did.index, did.kind)
+          if !foreign_seen.contains_key(&dkey) then
+            foreign_seen.insert(dkey, true)
+            foreign_distinct = foreign_distinct + 1
+          end
+        end
+      end
+    end
+    match own_ty
+    when Option::Some(ty) then
+      ty
+    when Option::None then
+      if foreign_distinct >= 2 then
+        type_add_error(env, "ambiguous name `" + name + "`: defined in multiple modules; qualify the path", span)
+        match env.callable_first_wins.get(name.clone())
+        when Option::Some(ty) then ty.clone()
+        when Option::None then fallback
+        end
+      else
+        fallback
+      end
+    end
+  when Option::None then
+    fallback
+  end
+end
+
+# P0-A (next layer): resolve the owner module path of a flat item index
+# from Program.modules — the same pointer walk the resolver's
+# build_resolver_symbol_table performs (contiguous [start, end) ranges per
+# module; empty ranges are skipped; a missing/empty table falls back to
+# the root path). Returns the path and the advanced module pointer. The
+# path is threaded into type registration and the ambiguity checks so the
+# type checker knows the current module.
+def module_path_of_item(program: &Program, module_ptr: Int, item_idx: Int) -> (Vec[String], Int)
+  var mp = module_ptr
+  var advanced = true
+  while advanced do
+    advanced = false
+    if mp < program.modules.len() then
+      let info = program.modules[mp]
+      if info.item_indices.len() >= 2 && item_idx >= info.item_indices[1] then
+        mp = mp + 1
+        advanced = true
+      end
+    end
+  end
+  var owner_path = Vec::new()
+  if mp < program.modules.len() then
+    let info = program.modules[mp]
+    for seg in info.path do
+      owner_path.push(seg.clone())
+    end
+  end
+  (owner_path, mp)
+end
+
+# P0-A: store a collected type definition, REJECTING duplicate definitions
+# instead of merging same-named distinct types. The flat merged Program makes
+# type identity name-global; two modules declaring the same name must be the
+# SAME type. Legitimate re-registrations are: a forward-declaration
+# placeholder being filled (pass 1 -> pass 2), an EMPTY source-level stub of
+# an already-registered type (std's intrinsic struct stubs), a builtin
+# Opaque placeholder (Box/Rc/Ptr...) receiving its source-level shape, and a
+# structurally IDENTICAL definition (e.g. std/core.tg re-declaring the
+# builtin Option/Result). Anything else is a "duplicate type definition"
+# TypeError — fields/variants are NEVER merged across distinct declarations.
+#
+# P0-A (next layer — module-qualified type identity): every registration
+# also records the module-qualified entry "path::name" (module_type_names).
+# An identical cross-module re-declaration (e.g. LocalId/Span declared in
+# two compiler modules) is the SAME type: its qualified key maps to the
+# first-wins index, so both module paths resolve to one TypeId and the
+# bare name never looks ambiguous. A genuinely DISTINCT definition
+# registered from a DIFFERENT module path is a separate module-local type:
+# it is accepted with its OWN fresh TypeId under its qualified key, while
+# the bare first-wins entry stays untouched. Same-module redefinition
+# remains the duplicate TypeError.
+def store_type_def(env: &mut TypeEnv, td: TypeDef, span: Span, module_path: &Vec[String]) -> Unit
   match get_type_def_by_name(env, td.name.clone())
   when Option::Some(existing) then
-    let existing_is_enum = match existing.def_kind when TypeDefKind::Enum(_) then true when _ then false end
-    let new_is_enum = match td.def_kind when TypeDefKind::Enum(_) then true when _ then false end
-    let existing_is_struct = match existing.def_kind when TypeDefKind::Struct(_) then true when _ then false end
-    let new_is_struct = match td.def_kind when TypeDefKind::Struct(_) then true when _ then false end
-
-    # Kind mismatch: enum vs struct — keep whichever was first (already stored)
-    if existing_is_enum && new_is_struct then return end
-    if existing_is_struct && new_is_enum then return end
-
-    # Both enums: merge variants (add new variants that don't already exist)
-    if existing_is_enum && new_is_enum then
+    # A filled existing definition: allow only legitimate re-registrations.
+    if type_def_is_forward_declaration(&existing) then
+      # Fall through to the replace path below (pass-2 fill).
+      ()
+    elsif type_def_is_empty_stub(&td) then
+      # Source-level stub of the same type (intrinsic struct stubs) — no-op.
+      return
+    elsif type_defs_identical(env, &existing, &td) then
+      # Re-registration of the SAME type — a same-module redefinition of an
+      # already-filled definition, a std re-declaration of a builtin
+      # (Option/Result), or an identical declaration in ANOTHER module
+      # (LocalId/Span). All are one type: the module-qualified entry for
+      # this module's path maps to the first-wins index, so qualified
+      # references resolve to the shared TypeId.
+      match env.type_name_index.get(td.name)
+      when Option::Some(bare_idx) then
+        record_module_type_name(env, td.name.clone(), bare_idx, module_path)
+      when Option::None then ()
+      end
+      return
+    else
       match existing.def_kind
-      when TypeDefKind::Enum(ev) then
-        match td.def_kind
-        when TypeDefKind::Enum(nv) then
-          var merged = Vec::new()
-          # Copy existing variants
-          var vi = 0
-          while vi < ev.len() do
-            merged.push(ev[vi])
-            vi = vi + 1
-          end
-          # Add new variants that don't already exist by name
-          var ni = 0
-          while ni < nv.len() do
-            var found = false
-            var mi = 0
-            while mi < merged.len() do
-              if merged[mi].name == nv[ni].name then
-                found = true
-              end
-              mi = mi + 1
-            end
-            if !found then
-              merged.push(nv[ni])
-            end
-            ni = ni + 1
-          end
-          let merged_kind = if existing.kind == TypeKind::Resource || td.kind == TypeKind::Resource then TypeKind::Resource else TypeKind::Value end
-          let merged_td = TypeDef { id: existing.id, name: existing.name.clone(), def_kind: TypeDefKind::Enum(merged), generic_params: existing.generic_params, kind: merged_kind }
-          match env.type_name_index.get(existing.name)
-          when Option::Some(li) then
-            env.type_list.set(li, merged_td)
-            env.type_name_index.insert(merged_td.name.clone(), li)
-            env.type_id_index.insert(existing.id.id, li)
-            return
-          when Option::None then
-            env.type_name_index.insert(merged_td.name.clone(), env.type_list.len())
-            env.type_id_index.insert(existing.id.id, env.type_list.len())
-            env.type_list.push(merged_td)
-            return
-          end
-        when _ then ()
-        end
+      when TypeDefKind::Opaque then
+        # A builtin Opaque placeholder (Box/Rc/Ptr/PtrMut/Array/Slice/Any)
+        # keeps its intrinsic semantics; the source-level shape of the SAME
+        # compiler intrinsic is a re-registration, not a distinct type.
+        return
       when _ then ()
       end
-    end
-
-    # Both structs: merge fields (add new fields that don't already exist)
-    if existing_is_struct && new_is_struct then
-      match existing.def_kind
-      when TypeDefKind::Struct(ef) then
-        match td.def_kind
-        when TypeDefKind::Struct(nf) then
-          var merged = Vec::new()
-          var fi = 0
-          while fi < ef.len() do
-            merged.push(ef[fi])
-            fi = fi + 1
-          end
-          fi = 0
-          while fi < nf.len() do
-            var found = false
-            var mi = 0
-            while mi < merged.len() do
-              if merged[mi].name == nf[fi].name then
-                found = true
-              end
-              mi = mi + 1
-            end
-            if !found then
-              merged.push(nf[fi])
-            end
-            fi = fi + 1
-          end
-          let merged_kind = if existing.kind == TypeKind::Resource || td.kind == TypeKind::Resource then TypeKind::Resource else TypeKind::Value end
-          let merged_td = TypeDef { id: existing.id, name: existing.name.clone(), def_kind: TypeDefKind::Struct(merged), generic_params: existing.generic_params, kind: merged_kind }
-          match env.type_name_index.get(existing.name)
-          when Option::Some(li) then
-            env.type_list.set(li, merged_td)
-            env.type_name_index.insert(merged_td.name.clone(), li)
-            env.type_id_index.insert(existing.id.id, li)
-            return
-          when Option::None then
-            env.type_name_index.insert(merged_td.name.clone(), env.type_list.len())
-            env.type_id_index.insert(existing.id.id, env.type_list.len())
-            env.type_list.push(merged_td)
-            return
-          end
-        when _ then ()
-        end
-      when _ then ()
+      # Two genuinely DISTINCT definitions of the same name. If the
+      # first-wins definition belongs to a DIFFERENT module (a qualified
+      # entry exists for the name and none of them is this module's own
+      # first-wins entry), this is a separate module-local type — accept
+      # it under its module-qualified key with a fresh TypeId (the
+      # collect path reused the bare first-wins id, which must not leak
+      # into a second type). Otherwise it is a same-module duplicate.
+      if has_qualified_type_entry(env, &td.name) && !module_is_first_wins_owner(env, &td.name, module_path) then
+        let fresh_id = TypeId { id: env.type_id_counter }
+        env.type_id_counter = env.type_id_counter + 1
+        let own_td = TypeDef {
+          id: fresh_id,
+          name: td.name.clone(),
+          def_kind: td.def_kind,
+          generic_params: td.generic_params.clone(),
+          kind: td.kind
+        }
+        let new_idx = env.type_list.len()
+        env.type_id_index.insert(fresh_id.id, new_idx)
+        env.type_list.push(own_td)
+        record_module_type_name(env, td.name.clone(), new_idx, module_path)
+        return
       end
-    end
-
-    # For other kinds (Trait, Alias, Opaque, etc.), keep existing — EXCEPT
-    # aliases: a pre-registered Alias(Unit) placeholder must be replaced by the
-    # real underlying type (typealias Signal = Int), otherwise every reference
-    # to the alias resolves to Unit.
-    match td.def_kind
-    when TypeDefKind::Alias(_) then ()
-    when _ then
-      if type_def_is_filled(&existing) then return end
+      type_add_error(env, "duplicate type definition `" + td.name + "`", span)
+      return
     end
   when Option::None then ()
   end
@@ -1093,11 +1753,13 @@ def store_type_def(env: &mut TypeEnv, td: TypeDef) -> Unit
     env.type_list.set(idx3, td)
     env.type_name_index.insert(td.name.clone(), idx3)
     env.type_id_index.insert(td.id.id, idx3)
+    record_module_type_name(env, td.name.clone(), idx3, module_path)
     return
   when Option::None then
     env.type_name_index.insert(td.name.clone(), env.type_list.len())
     env.type_id_index.insert(td.id.id, env.type_list.len())
     env.type_list.push(td)
+    record_module_type_name(env, td.name.clone(), env.type_list.len() - 1, module_path)
   end
 end
 
@@ -1725,9 +2387,6 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
   elsif is_never_type(&a) || is_never_type(&b) then
     # Never is the bottom type: it unifies with any type.
     true
-  elsif is_param_type(&a) || is_param_type(&b) then
-    # An unconstrained generic parameter unifies with any concrete type.
-    true
   elsif (is_empty_tuple(&a) && is_unit_type(&b)) || (is_empty_tuple(&b) && is_unit_type(&a)) then
     # An empty tuple `()` is the Unit type.
     true
@@ -1937,7 +2596,9 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Error then true
-        when Type::Param(_) then true  # Param unifies with any concrete type
+        when Type::Param(_) then
+          type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+          false
         # Handle Named(tid, args) unified with primitive types (Int, U64, String, etc.)
         # Occurs when resolve_type_expr or other code creates Named types for primitives.
         when Type::Unit then
@@ -2187,7 +2848,9 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             if ok then unify(env, ret1, ret2, span) else false end
           end
         when Type::Error then true
-        when Type::Param(_) then true  # Param unifies with any concrete type
+        when Type::Param(_) then
+          type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span)
+          false
         when _ then type_add_error(env, "type mismatch: " + type_tag(&a) + " vs " + type_tag(&b), span); false
         end
       when Type::Tuple(elems1) then
@@ -2310,7 +2973,30 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Error then true
-        when _ then true  # Param unifies with any concrete type
+        when Type::Var(id2) then
+          # A generic parameter unifies with an inference variable only by
+          # binding the variable to the parameter (the parameter's own
+          # instantiated InferVar): the two denote the same unresolved
+          # entity. An already-bound variable must re-unify with its
+          # binding, which under strict rules only accepts the same
+          # parameter.
+          match env.subst.get(id2)
+          when Option::Some(bound2) then unify(env, a, bound2, span)
+          when Option::None then
+            if occurs_check(env, id2, a, span.clone()) then
+              type_add_error(env, "infinite type", span)
+              false
+            else
+              env.subst.insert(id2, a)
+              true
+            end
+          end
+        when _ then
+          # STRICT: a generic parameter never matches an arbitrary concrete
+          # type — each occurrence of T must resolve to the SAME instantiated
+          # type, decided at the generic call site, never here.
+          type_add_error(env, "type parameter `" + name1 + "` cannot unify with " + type_tag(&b), span)
+          false
         end
       when Type::Error then true
       end
@@ -2443,26 +3129,42 @@ end
 def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
   push_scope(env)
 
+  # P0-A (next layer): each item is processed under its owner module path
+  # (Program.modules — see module_path_of_item), threaded into type
+  # registration and into the current-module context used by the
+  # bare-name ambiguity verification and local-module shadowing.
   env.check_ctx = "pass1-pre-register"
+  var module_ptr = 0
   var i = 0
   while i < program.items.len() do
     let item = program.items[i]
-    pre_register_type_name(env, item)
+    let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    env.current_module_path = owner_path.clone()
+    pre_register_type_name(env, item, &owner_path)
     i = i + 1
   end
   env.check_ctx = "pass2-collect"
+  module_ptr = 0
   i = 0
   while i < program.items.len() do
     let item = program.items[i]
-    collect_type_def(env, item)
+    let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    env.current_module_path = owner_path.clone()
+    collect_type_def(env, item, &owner_path)
     i = i + 1
   end
   propagate_resource_kinds(env)
 
   env.check_ctx = "pass3-register"
+  module_ptr = 0
   i = 0
   while i < program.items.len() do
     let item = program.items[i]
+    let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    env.current_module_path = owner_path.clone()
     match item.kind
     when ItemKind::ItemFunction(f) then
       # Register generic type parameters in scope for function signature resolution
@@ -2488,7 +3190,9 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
       when Option::None then Type::Unit
       end
       pop_scope(env)
-      bind_var(env, f.name.clone(), Type::Function(param_types, ret_ty))
+      let fn_ty = Type::Function(param_types, ret_ty)
+      bind_var(env, f.name.clone(), fn_ty.clone())
+      record_module_callable(env, f.name.clone(), fn_ty, &owner_path, DefKind::Function)
     when ItemKind::ItemExternBlock(ext) then
       var j = 0
       while j < ext.items.len() do
@@ -2518,7 +3222,9 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
           when Option::None then Type::Unit
           end
           pop_scope(env)
-          bind_var(env, ef.name.clone(), Type::Function(param_types, ret_ty))
+          let ext_fn_ty = Type::Function(param_types, ret_ty)
+          bind_var(env, ef.name.clone(), ext_fn_ty.clone())
+          record_module_callable(env, ef.name.clone(), ext_fn_ty, &owner_path, DefKind::Function)
         when _ then ()
         end
         j = j + 1
@@ -2529,18 +3235,30 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
       when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
       when Option::None then fresh_type_var(env)
       end
-      bind_var(env, c.name.clone(), const_ty)
+      bind_var(env, c.name.clone(), const_ty.clone())
+      record_module_callable(env, c.name.clone(), const_ty, &owner_path, DefKind::Constant)
     when ItemKind::ItemStatic(s) then
       # Register static (and mut) variable names so they can be looked up by ExprIdent
       let static_ty = resolve_type_expr(env, &s.ty)
-      bind_var(env, s.name.clone(), static_ty)
+      bind_var(env, s.name.clone(), static_ty.clone())
+      record_module_callable(env, s.name.clone(), static_ty, &owner_path, DefKind::Static)
     when _ then ()
     end
     i = i + 1
   end
   i = 0
+  env.check_ctx = "pass4-check"
+  module_ptr = 0
   while i < program.items.len() do
     let item = program.items[i]
+    let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    # P0-A (final layer): thread the current module path into body checking
+    # too (the previous layer threaded passes 1-3) so the bare-name callable
+    # identity check during pass 4 resolves the CURRENT module's own
+    # definition (the stale path left by pass 3 would break local-module
+    # shadowing for body references).
+    env.current_module_path = owner_path.clone()
     check_item(env, item, i)
     i = i + 1
   end
@@ -2548,7 +3266,7 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
   pop_scope(env)
 end
 
-def pre_register_type_name(env: &mut TypeEnv, item: &Item) -> Unit
+def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) -> Unit
   match item.kind
   when ItemKind::ItemStruct(s) then
     if !env.type_name_index.contains_key(s.name) then
@@ -2561,9 +3279,16 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item) -> Unit
         generic_params: Vec::new(),
         kind: TypeKind::Value
       }
-      env.type_name_index.insert(s.name, env.type_list.len())
+      env.type_name_index.insert(s.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
       env.type_list.push(td)
+      # P0-A (next layer): record the module-qualified entry alongside the
+      # bare first-wins placeholder so pass-1 forward references to
+      # "path::name" resolve before pass 2. Second-module definitions of an
+      # already-registered bare name are resolved entirely in pass 2 by
+      # store_type_def (identical re-declarations share the first-wins
+      # TypeId; genuinely distinct definitions get their own).
+      record_module_type_name(env, s.name.clone(), env.type_list.len() - 1, module_path)
     end
   when ItemKind::ItemEnum(e) then
     if !env.type_name_index.contains_key(e.name) then
@@ -2576,9 +3301,11 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item) -> Unit
         generic_params: Vec::new(),
         kind: TypeKind::Value
       }
-      env.type_name_index.insert(e.name, env.type_list.len())
+      env.type_name_index.insert(e.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
       env.type_list.push(td)
+      # P0-A (next layer): module-qualified entry for the first-wins enum.
+      record_module_type_name(env, e.name.clone(), env.type_list.len() - 1, module_path)
     end
   when ItemKind::ItemTrait(t) then
     if !env.type_name_index.contains_key(t.name) then
@@ -2629,7 +3356,7 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item) -> Unit
   end
 end
 
-def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl) -> Unit
+def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl, module_path: &Vec[String]) -> Unit
   push_scope(env)
   var gp_idx = 0
   while gp_idx < e.generic_params.len() do
@@ -2637,7 +3364,7 @@ def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl) -> Unit
     gp_idx = gp_idx + 1
   end
 
-  let id = match get_type_id_by_name(env, e.name)
+  let id = match get_type_id_by_qualified_name(env, e.name.clone(), module_path)
   when Option::Some(existing_id) then existing_id
   when Option::None then
     let new_id = TypeId { id: env.type_id_counter }
@@ -2687,10 +3414,10 @@ def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl) -> Unit
     generic_params: gen_params,
     kind: enum_kind
   }
-  store_type_def(env, td)
+  store_type_def(env, td, e.span, module_path)
 end
 
-def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
+def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) -> Unit
   let _scope_before_ctd = env.scopes.len()
   match item.kind
   when ItemKind::ItemStruct(s) then
@@ -2706,7 +3433,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
     end
 
     # Reuse pre-registered ID if available
-    let id = match get_type_id_by_name(env, s.name)
+    let id = match get_type_id_by_qualified_name(env, s.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
     when Option::None then
       let new_id = TypeId { id: env.type_id_counter }
@@ -2759,10 +3486,11 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       generic_params: gen_params,
       kind: struct_kind
     }
-    store_type_def(env, td)
+    store_type_def(env, td, s.span, module_path)
   when ItemKind::ItemEnum(e) then
-    # store_type_def handles merging variants from different modules
-    collect_enum_type_def(env, e)
+    # store_type_def rejects duplicate definitions; same-named DISTINCT types
+    # across modules are no longer merged (P0-A).
+    collect_enum_type_def(env, e, module_path)
   when ItemKind::ItemTrait(t) then
     # Register trait-level generic type parameters in scope so resolve_type_expr
     # can find them when processing method signatures (e.g., T in Into[T])
@@ -2773,7 +3501,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       gp_idx = gp_idx + 1
     end
 
-    let id = match get_type_id_by_name(env, t.name)
+    let id = match get_type_id_by_qualified_name(env, t.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
     when Option::None then
       let new_id = TypeId { id: env.type_id_counter }
@@ -2825,7 +3553,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       generic_params: gen_params,
       kind: TypeKind::Value
     }
-    store_type_def(env, td)
+    store_type_def(env, td, t.span, module_path)
   when ItemKind::ItemTypeAlias(ta) then
     # Register type alias generic params in scope so resolve_type_expr
     # can find them (e.g., T in type Vec[T] = Array[T])
@@ -2836,7 +3564,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
       gp_idx = gp_idx + 1
     end
 
-    let id = match get_type_id_by_name(env, ta.name)
+    let id = match get_type_id_by_qualified_name(env, ta.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
     when Option::None then
       let new_id = TypeId { id: env.type_id_counter }
@@ -2856,12 +3584,12 @@ def collect_type_def(env: &mut TypeEnv, item: &Item) -> Unit
 
     let td = TypeDef {
       id: id,
-      name: ta.name,
+      name: ta.name.clone(),
       def_kind: TypeDefKind::Alias(aliased_type),
       generic_params: gen_params,
       kind: TypeKind::Value
     }
-    store_type_def(env, td)
+    store_type_def(env, td, ta.span, module_path)
   when _ then ()
   end
 end
@@ -2990,22 +3718,27 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String) -> Un
   when Option::None then Type::Unit
   end
   
+  # P0-M: every `return expr` in the body unifies immediately with the
+  # declared return type (unconditional — not dependent on the last
+  # statement). Cleared after the body check.
+  env.expected_return = Option::Some(ret_type.clone())
   # Check body
   match f.body
   when FnBody::FnBlock(block) then
-    let body_type = check_block(env, &block, true)
+    let body_flow = check_block(env, &block, true)
     if is_unit_type(&ret_type) then
       # A Unit-returning function discards its trailing statement's value
       # (e.g. `if c then advance(p) end` where advance returns Token).
       ()
     else
-      unify(env, body_type, ret_type, f.span)
+      unify(env, body_flow.normal, ret_type, f.span)
     end
   when FnBody::FnExpr(expr) then
     let expr_type = check_expr(env, &expr)
     unify(env, expr_type, ret_type, expr.span)
   when _ then ()
   end
+  env.expected_return = Option::None
   
   pop_scope(env)
 end
@@ -3182,21 +3915,25 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     when Option::None then Type::Unit
     end
 
+    # P0-M: every `return expr` in the body unifies immediately with the
+    # declared return type (see check_function).
+    env.expected_return = Option::Some(ret_type.clone())
     # Check body
     match m.body
     when FnBody::FnBlock(block) then
       env.check_ctx = "method:" + m.name
-      let body_type = check_block(env, &block, true)
+      let body_flow = check_block(env, &block, true)
       if is_unit_type(&ret_type) then
         ()
       else
-        unify(env, body_type, ret_type, m.span)
+        unify(env, body_flow.normal, ret_type, m.span)
       end
     when FnBody::FnExpr(expr) then
       let expr_type = check_expr(env, &expr)
       unify(env, expr_type, ret_type, expr.span)
     when _ then ()
     end
+    env.expected_return = Option::None
 
     pop_scope(env)
     method_index = method_index + 1
@@ -3209,26 +3946,55 @@ end
 # Block and Statement Type Checking
 # ———————————————————————————————————————————————————————————————
 
-def check_block(env: &mut TypeEnv, block: &Block, is_value: Bool) -> Type
+def check_block(env: &mut TypeEnv, block: &Block, is_value: Bool) -> FlowResult
   push_scope(env)
   
-  var result_type = Type::Unit
+  # P0-M: the block's flow summary. `normal` is the value the block produces
+  # when it falls through; the flags say which divergence edges the block may
+  # take. A statement block (is_value=false) discards its value — normal is
+  # Unit when it may fall through (Never when it provably cannot).
+  var normal = Type::Unit
+  var may_return = false
+  var may_break = false
+  var may_continue = false
+  var may_throw = false
+  # P0-M (d): once a terminator (a statement that never falls through
+  # normally — return/break/continue/panic/divergent if-match-loop) has been
+  # seen, the remainder of the block is still checked for diagnostics but
+  # contributes NOTHING to the block's value or flow.
+  var unreachable = false
   var i = 0
   while i < block.stmts.len() do
     let stmt = block.stmts[i]
-    result_type = check_stmt(env, &stmt)
+    let flow = check_stmt(env, &stmt)
+    if !unreachable then
+      normal = flow.normal
+      if flow.may_return then may_return = true end
+      if flow.may_break then may_break = true end
+      if flow.may_continue then may_continue = true end
+      if flow.may_throw then may_throw = true end
+      if is_never_type(&flow.normal) then unreachable = true end
+    end
     i = i + 1
   end
   
   pop_scope(env)
   # A statement block (if-then, while body, ...) discards its value; only a
   # value block (function body, match arm, expression block) yields the last
-  # statement's type. Otherwise `if c then advance(p) end` (advance returning
-  # Token) would leak Token into a Unit function body.
-  if is_value then result_type else Type::Unit end
+  # contributing statement's type. Otherwise `if c then advance(p) end`
+  # (advance returning Token) would leak Token into a Unit function body.
+  let falls_through = !is_never_type(&normal)
+  let block_normal = if is_value then normal elsif falls_through then Type::Unit else Type::Never end
+  FlowResult {
+    normal: block_normal,
+    may_return: may_return,
+    may_break: may_break,
+    may_continue: may_continue,
+    may_throw: may_throw
+  }
 end
 
-def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
+def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> FlowResult
   let result = match stmt.kind
   when StmtKind::StmtLet(pattern, ty_opt, value, is_mut) then
     let value_type = check_expr(env, &value)
@@ -3240,20 +4006,35 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
     when Option::None then
       value_type
     end
-    check_pattern(env, &pattern, var_type)
-    Type::Unit
+    # P0-Q: the pattern's binding plan (per-binding Read/Move actions) is
+    # collected here; the block/match/for checking paths consume the plans.
+    check_pattern(env, &pattern, var_type, "let initializer")
+    consume_binding_plans(env, &pattern)
+    flow_normal(Type::Unit)
   when StmtKind::StmtAssign(target, value) then
     let target_type = check_expr(env, &target)
     let value_type = check_expr(env, &value)
     unify(env, target_type, value_type, stmt.span)
-    Type::Unit
+    flow_normal(Type::Unit)
   when StmtKind::StmtIf(if_stmt) then
     check_if_stmt(env, &if_stmt, true)
   when StmtKind::StmtWhile(cond, body) then
     let cond_type = check_expr(env, &cond)
     unify(env, cond_type, Type::Bool, cond.span)
-    check_block(env, &body, false)
-    Type::Never
+    let body_flow = check_block(env, &body, false)
+    # P0-M (c): a normal while may execute zero times, so its type is Unit,
+    # not Never. Only a while whose body has NO reachable break/return path
+    # can never terminate — only that loop may be Never.
+    let loop_type = if body_flow.may_break || body_flow.may_return then Type::Unit else Type::Never end
+    FlowResult {
+      normal: loop_type,
+      # A return inside the loop body exits the enclosing function; breaks
+      # and continues are consumed by the loop itself.
+      may_return: body_flow.may_return,
+      may_break: false,
+      may_continue: false,
+      may_throw: body_flow.may_throw
+    }
   when StmtKind::StmtFor(for_stmt) then
     push_scope(env)
     let iter_type = check_expr(env, &for_stmt.iter)
@@ -3290,74 +4071,133 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
       type_add_error(env, "cannot iterate value of type `" + type_tag(&iter_type) + "`", for_stmt.span)
       Type::Error
     end
-    check_pattern(env, &for_stmt.pattern, elem_type)
-    check_block(env, &for_stmt.body, false)
+    # P0-Q: the iteration pattern's binding plan is collected and consumed
+    # here (the for-loop's element source).
+    check_pattern(env, &for_stmt.pattern, elem_type, "for iterator element")
+    consume_binding_plans(env, &for_stmt.pattern)
+    let body_flow = check_block(env, &for_stmt.body, false)
     pop_scope(env)
-    Type::Unit
+    FlowResult {
+      normal: Type::Unit,
+      may_return: body_flow.may_return,
+      may_break: false,
+      may_continue: false,
+      may_throw: body_flow.may_throw
+    }
   when StmtKind::StmtReturn(val_opt) then
-    match val_opt
+    let val_type = match val_opt
     when Option::Some(val) then check_expr(env, &val)
     when Option::None then Type::Unit
     end
-    Type::Never
+    # P0-M (b): every `return expr` unifies immediately with the declared
+    # return type — unconditional, never dependent on the last statement.
+    match env.expected_return
+    when Option::Some(rt) then
+      unify(env, val_type, rt, stmt.span)
+    when Option::None then ()
+    end
+    flow_terminator(true, false, false, false)
   when StmtKind::StmtBreak(val_opt) then
     match val_opt
     when Option::Some(val) then check_expr(env, &val)
     when Option::None then Type::Unit
     end
-    Type::Never
+    flow_terminator(false, true, false, false)
   when StmtKind::StmtContinue then
-    Type::Never
+    flow_terminator(false, false, true, false)
   when StmtKind::StmtExpr(expr) then
-    check_expr(env, &expr)
+    flow_normal(check_expr(env, &expr))
   when StmtKind::StmtMatch(m) then
     check_match(env, &m, true)
   when StmtKind::StmtUnsafe(_, body) then
     check_block(env, &body, true)
   when StmtKind::StmtDefer(body) then
     check_block(env, &body, false)
-    Type::Unit
+    flow_normal(Type::Unit)
   when StmtKind::StmtTry(body, catches, finally_block) then
-    let body_type = check_block(env, &body, true)
+    let body_flow = check_block(env, &body, true)
+    var t_may_return = body_flow.may_return
+    var t_may_break = body_flow.may_break
+    var t_may_continue = body_flow.may_continue
+    var t_may_throw = body_flow.may_throw
     var i = 0
     while i < catches.len() do
       let c = catches[i]
       push_scope(env)
-      check_pattern(env, &c.pattern, Type::Error)
-      check_block(env, &c.body, false)
+      check_pattern(env, &c.pattern, Type::Error, "catch scrutinee")
+      let c_flow = check_block(env, &c.body, false)
       pop_scope(env)
+      if c_flow.may_return then t_may_return = true end
+      if c_flow.may_break then t_may_break = true end
+      if c_flow.may_continue then t_may_continue = true end
+      if c_flow.may_throw then t_may_throw = true end
       i = i + 1
     end
     match finally_block
     when Option::Some(fb) then check_block(env, &fb, false)
     when Option::None then ()
     end
-    body_type
+    FlowResult {
+      normal: body_flow.normal,
+      may_return: t_may_return,
+      may_break: t_may_break,
+      may_continue: t_may_continue,
+      may_throw: t_may_throw
+    }
   when StmtKind::StmtLoop(body) then
-    check_block(env, &body, false)
-    # A loop that diverges via `return`/`break` never falls through normally;
-    # Never (bottom) unifies with any declared return type.
-    Type::Never
+    let body_flow = check_block(env, &body, false)
+    # P0-M (c): a `loop` with a reachable break/return path may terminate —
+    # its type is Unit; only a loop without such a path never falls through
+    # and may be Never.
+    let loop_type = if body_flow.may_break || body_flow.may_return then Type::Unit else Type::Never end
+    FlowResult {
+      normal: loop_type,
+      may_return: body_flow.may_return,
+      may_break: false,
+      may_continue: false,
+      may_throw: body_flow.may_throw
+    }
   when StmtKind::StmtGuard(cond, else_action) then
     let cond_type = check_expr(env, &cond)
     unify(env, cond_type, Type::Bool, cond.span)
+    var g_may_return = false
+    var g_may_break = false
+    var g_may_continue = false
     match else_action
     when GuardElse::Return(ret_opt) then
+      g_may_return = true
       match ret_opt
       when Option::Some(ret_expr) then
-        check_expr(env, &ret_expr)
-      when Option::None then ()
+        let ret_ty = check_expr(env, &ret_expr)
+        match env.expected_return
+        when Option::Some(er) then unify(env, ret_ty, er, stmt.span)
+        when Option::None then ()
+        end
+      when Option::None then
+        # A bare `guard ... else return` returns Unit — check it against the
+        # declared return type like a bare `return`.
+        match env.expected_return
+        when Option::Some(er) then unify(env, Type::Unit, er, stmt.span)
+        when Option::None then ()
+        end
       end
     when GuardElse::Panic(_) then ()
     when GuardElse::Break(br_opt) then
+      g_may_break = true
       match br_opt
       when Option::Some(br_expr) then
         check_expr(env, &br_expr)
       when Option::None then ()
       end
-    when GuardElse::Continue then ()
+    when GuardElse::Continue then g_may_continue = true
     end
-    Type::Unit
+    FlowResult {
+      normal: Type::Unit,
+      may_return: g_may_return,
+      may_break: g_may_break,
+      may_continue: g_may_continue,
+      may_throw: false
+    }
   when StmtKind::StmtHandleWith(expr, handlers) then
     let _handled_ty = check_expr(env, &expr)
     var i = 0
@@ -3369,7 +4209,7 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
         push_scope(env)
         var k = 0
         while k < arm.params.len() do
-          check_pattern(env, &arm.params[k], fresh_type_var(env))
+          check_pattern(env, &arm.params[k], fresh_type_var(env), "handler parameter")
           k = k + 1
         end
         check_block(env, &arm.body, false)
@@ -3378,51 +4218,117 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> Type
       end
       i = i + 1
     end
-    Type::Unit
-  when _ then Type::Unit
+    flow_normal(Type::Unit)
+  when StmtKind::StmtYield(_) then
+    # P0-M (g): unsupported feature — an explicit diagnostic, never a silent
+    # Unit fallback (MIR has no yield lowering).
+    type_add_error(env, "yield is not supported", stmt.span)
+    flow_normal(Type::Error)
+  when StmtKind::StmtWith(_, _, _) then
+    # P0-M (g): unsupported feature — an explicit diagnostic, never a silent
+    # Unit fallback (MIR has no with lowering).
+    type_add_error(env, "with is not supported", stmt.span)
+    flow_normal(Type::Error)
+  when _ then
+    # P0-M (g): every remaining statement kind is an explicit diagnostic —
+    # there is no silent `Type::Unit` fallback for unhandled statements.
+    type_add_error(env, "unsupported statement kind", stmt.span)
+    flow_normal(Type::Error)
   end
   if stmt.node_id != 0 then
-    env.typed_expr_types.insert(stmt.node_id, result.clone())
+    env.typed_expr_types.insert(stmt.node_id, result.normal.clone())
   end
   result
 end
 
-def check_if_stmt(env: &mut TypeEnv, if_stmt: &IfStmt, is_stmt: Bool) -> Type
+def check_if_stmt(env: &mut TypeEnv, if_stmt: &IfStmt, is_stmt: Bool) -> FlowResult
   let cond_type = check_expr(env, &if_stmt.cond)
   unify(env, cond_type, Type::Bool, if_stmt.cond.span)
   
-  let then_type = check_block(env, &if_stmt.then_block, true)
+  let then_flow = check_block(env, &if_stmt.then_block, true)
   
-  var result_type = then_type
+  var result_type = then_flow.normal
+  var may_return = then_flow.may_return
+  var may_break = then_flow.may_break
+  var may_continue = then_flow.may_continue
+  var may_throw = then_flow.may_throw
+  var falls_through = !is_never_type(&then_flow.normal)
   
   var i = 0
   while i < if_stmt.elsif_branches.len() do
     let (econd, ebody) = if_stmt.elsif_branches[i]
     let ec_type = check_expr(env, &econd)
     unify(env, ec_type, Type::Bool, econd.span)
-    let eb_type = check_block(env, &ebody, true)
+    let eb_flow = check_block(env, &ebody, true)
+    if !is_never_type(&eb_flow.normal) then falls_through = true end
+    if eb_flow.may_return then may_return = true end
+    if eb_flow.may_break then may_break = true end
+    if eb_flow.may_continue then may_continue = true end
+    if eb_flow.may_throw then may_throw = true end
     # Branch values are discarded for statement ifs; only value-position ifs
     # require the branches to agree.
     if !is_stmt then
-      unify(env, result_type, eb_type, ebody.span)
+      unify(env, result_type, eb_flow.normal, ebody.span)
+    elsif is_never_type(&result_type) && !is_never_type(&eb_flow.normal) then
+      # Statement-if completion value: keep the first completing branch's
+      # type, but a branch that completes replaces an all-diverge prefix.
+      result_type = eb_flow.normal
     end
     i = i + 1
   end
   
   match if_stmt.else_block
   when Option::Some(else_block) then
-    let else_type = check_block(env, &else_block, true)
+    let else_flow = check_block(env, &else_block, true)
+    if !is_never_type(&else_flow.normal) then falls_through = true end
+    if else_flow.may_return then may_return = true end
+    if else_flow.may_break then may_break = true end
+    if else_flow.may_continue then may_continue = true end
+    if else_flow.may_throw then may_throw = true end
     if !is_stmt then
-      unify(env, result_type, else_type, else_block.span)
+      unify(env, result_type, else_flow.normal, else_block.span)
+    elsif is_never_type(&result_type) && !is_never_type(&else_flow.normal) then
+      result_type = else_flow.normal
     end
   when Option::None then
     # An `if` without `else` used as a statement does not force its branch type
     # to Unit — forcing it rejects valid code like `if c then fetch_and_add() end`
     # whose branch returns a value that is discarded.
-    ()
+    # P0-M (e): an `if` USED AS A VALUE without an else contributes Unit on
+    # the false path — every reachable branch must have compatible values.
+    if !is_stmt then
+      unify(env, result_type, Type::Unit, if_stmt.span)
+    end
+    falls_through = true
   end
   
-  result_type
+  # P0-M: an if whose every branch diverges never falls through (normal is
+  # Never). A statement if WITHOUT an else completes without a value on the
+  # false path, so its normal is Unit — a non-Unit function whose body ends
+  # with such an if can no longer silently fall off the end.
+  let normal = if falls_through then
+    if !is_stmt then result_type
+    elsif has_else_branch(&if_stmt) then result_type
+    else Type::Unit
+    end
+  else
+    Type::Never
+  end
+  FlowResult {
+    normal: normal,
+    may_return: may_return,
+    may_break: may_break,
+    may_continue: may_continue,
+    may_throw: may_throw
+  }
+end
+
+# Whether an if/elsif chain ends in an else (all paths produce a value).
+def has_else_branch(if_stmt: &IfStmt) -> Bool
+  match if_stmt.else_block
+  when Option::Some(_) then true
+  when Option::None then false
+  end
 end
 
 def vec_contains_string(items: &Vec[String], value: String) -> Bool
@@ -3436,21 +4342,36 @@ def vec_contains_string(items: &Vec[String], value: String) -> Bool
   false
 end
 
-def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> Type
+def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> FlowResult
   let scrutinee_type = check_expr(env, &m.scrutinee)
   
   var result_type = fresh_type_var(env)
   var has_wildcard = false
   var covered_variants = Vec::new()
+  var may_return = false
+  var may_break = false
+  var may_continue = false
+  var may_throw = false
+  var falls_through = false
   
   var i = 0
   while i < m.arms.len() do
     let arm = m.arms[i]
     push_scope(env)
-    check_pattern(env, &arm.pattern, scrutinee_type)
+    # P0-Q: the arm pattern's binding plan is collected here; its per-binding
+    # actions (Read vs Move) are the ownership data the resource checker's
+    # existing rules consume (a Move binding out of an owning aggregate is
+    # only valid when the whole scrutinee aggregate is consumed — the
+    # resource checker's check_match consumes the scrutinee root once).
+    check_pattern(env, &arm.pattern, scrutinee_type, "match scrutinee")
+    consume_binding_plans(env, &arm.pattern)
 
     match arm.pattern.kind
     when PatternKind::Wildcard then
+      has_wildcard = true
+    when PatternKind::Ident(_, _) then
+      # An identifier pattern is a catch-all: it matches ANY value, so it
+      # exhaustively covers a closed enum.
       has_wildcard = true
     when PatternKind::Variant(path, _) then
       if path.segments.len() > 0 then
@@ -3464,6 +4385,8 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> Type
       while j < alts.len() do
         match alts[j].kind
         when PatternKind::Wildcard then
+          has_wildcard = true
+        when PatternKind::Ident(_, _) then
           has_wildcard = true
         when PatternKind::Variant(path, _) then
           if path.segments.len() > 0 then
@@ -3486,18 +4409,30 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> Type
     when Option::None then ()
     end
     
-    let arm_type = check_block(env, &arm.body, true)
+    let arm_flow = check_block(env, &arm.body, true)
+    if !is_never_type(&arm_flow.normal) then falls_through = true end
+    if arm_flow.may_return then may_return = true end
+    if arm_flow.may_break then may_break = true end
+    if arm_flow.may_continue then may_continue = true end
+    if arm_flow.may_throw then may_throw = true end
     # A match used as a STATEMENT discards its value, so heterogeneous arm
     # types (e.g. an arm ending in `set.insert(...)` returning Bool next to a
     # Unit arm) are not errors. Value-position matches still unify strictly.
     if !is_stmt then
-      unify(env, result_type, arm_type, arm.span)
+      unify(env, result_type, arm_flow.normal, arm.span)
     end
     pop_scope(env)
     i = i + 1
   end
   
-  # Warn if match on an enum lacks a wildcard and may not be exhaustive
+  # P0-M (f) + P1 (FIX 3): a match over a closed enum must be exhaustive in
+  # BOTH value and statement position.  A non-exhaustive value match has no
+  # value on the uncovered path; a non-exhaustive statement match is an
+  # incomplete case analysis all the same — both are semantic errors.  The
+  # error applies only to closed-enum scrutinees (Type::Named resolving to
+  # an enum definition); matches over open or non-enum scrutinees are
+  # unaffected (a `when _`/ident arm or a trailing `else` catch-all is the
+  # explicit way to keep an intentionally partial statement match).
   if !has_wildcard then
     match scrutinee_type
     when Type::Named(tid, _) then
@@ -3515,8 +4450,8 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> Type
             j = j + 1
           end
           if !missing.is_empty() then
-            add_warning(env, "match may not be exhaustive; missing variants: " +
-              missing.join(", ") + " (consider adding a wildcard `_` arm)", m.span)
+            type_add_error(env, "non-exhaustive match: missing variants " +
+              missing.join(", ") + " (add a wildcard `_` arm or cover every variant)", m.span)
           end
         when _ then ()
         end
@@ -3526,7 +4461,14 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> Type
     end
   end
   
-  result_type
+  let normal = if falls_through then result_type else Type::Never end
+  FlowResult {
+    normal: normal,
+    may_return: may_return,
+    may_break: may_break,
+    may_continue: may_continue,
+    may_throw: may_throw
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3534,9 +4476,20 @@ end
 # contains a variant with the given name. Used by both expression
 # and pattern type checking to resolve bare variant names like
 # `Some`, `None`, `Ok`, `Err` without requiring `Option::` / `Result::`.
+# The INDEXED form also returns the variant's position in the owner
+# enum's variant list — the resolved variant IDENTITY that pattern
+# typing threads through (see check_pattern / pattern_variant_resolutions)
+# so downstream consumers resolve variants by identity, not by name.
 # ———————————————————————————————————————————————————————————————
 
 def find_enum_variant(env: &TypeEnv, name: String) -> Option[(TypeDef, VariantInfo)]
+  match find_enum_variant_indexed(env, name)
+  when Option::Some((td, v, _)) then Option::Some((td, v))
+  when Option::None then Option::None
+  end
+end
+
+def find_enum_variant_indexed(env: &TypeEnv, name: String) -> Option[(TypeDef, VariantInfo, Int)]
   var i = 0
   while i < env.type_list.len() do
     let td = env.type_list[i]
@@ -3545,7 +4498,7 @@ def find_enum_variant(env: &TypeEnv, name: String) -> Option[(TypeDef, VariantIn
       var j = 0
       while j < variants.len() do
         if variants[j].name == name then
-          return Option::Some((td, variants[j]))
+          return Option::Some((td, variants[j], j))
         end
         j = j + 1
       end
@@ -3557,10 +4510,68 @@ def find_enum_variant(env: &TypeEnv, name: String) -> Option[(TypeDef, VariantIn
 end
 
 # ———————————————————————————————————————————————————————————————
-# Pattern Type Checking
+# Pattern Type Checking (P0-Q)
+#
+# Pattern typing is an OWNERSHIP operation: besides unifying the pattern
+# against the expected type, check_pattern records — per bound identifier —
+# a BindingPlan { local, source_place, action } where action is Read for a
+# plain binding of a copyable value and Consume for a binding that MOVES an
+# owning value out of its source place. The plan is additive: binding
+# behavior for existing code is unchanged. Enum-variant patterns resolve by
+# variant IDENTITY (owner TypeId + variant index — see
+# find_enum_variant_indexed) and the resolved identity is recorded in
+# pattern_variant_resolutions keyed by the pattern node id, so downstream
+# consumers never re-scan variant names.
 # ———————————————————————————————————————————————————————————————
 
-def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
+# Consume the BindingPlans recorded for every binding under a pattern (the
+# block/match/for checking paths call this after check_pattern). The plans
+# are the per-binding Read/Move actions the ownership layer's existing rules
+# consume; reading them here is the type layer's consumption point.
+def consume_binding_plans(env: &TypeEnv, pat: &Pattern) -> Unit
+  let _plans = match env.binding_plans.get(pat.node_id)
+  when Option::Some(plans) then plans
+  when Option::None then Vec::new()
+  end
+  match pat.kind
+  when PatternKind::Ident(_, _) then ()
+  when PatternKind::Wildcard then ()
+  when PatternKind::Literal(_) then ()
+  when PatternKind::Tuple(pats) then
+    var i = 0
+    while i < pats.len() do
+      consume_binding_plans(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    var i = 0
+    while i < pats.len() do
+      consume_binding_plans(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Struct(_, field_pats) then
+    var i = 0
+    while i < field_pats.len() do
+      consume_binding_plans(env, &field_pats[i].1)
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    var i = 0
+    while i < pats.len() do
+      consume_binding_plans(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Or(alts) then
+    var i = 0
+    while i < alts.len() do
+      consume_binding_plans(env, &alts[i])
+      i = i + 1
+    end
+  when PatternKind::Range(_, _, _) then ()
+  end
+end
+
+def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place: String) -> Unit
   # Patterns match through references (e.g. `let (a, b) = &pair` where the
   # scrutinee is a reference to a tuple).
   let expected_base = match expected
@@ -3576,6 +4587,23 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
     bind_var(env, name, expected_base)
     if env.local_id_counter > before then
       env.pattern_binding_resolutions.insert(pat.node_id, before)
+      # P0-Q: record the binding action — a plain binding READS its source;
+      # a binding of an owning type MOVES the value out of the source place
+      # (the resource checker's projected-move rules consume this data).
+      # Binding through a reference/box (`let (a, b) = &pair`) is a READ —
+      # no ownership transfers out of the source.
+      let bind_is_ref = match expected
+      when Type::RefInternal(_, _) then true
+      when Type::Box(_) then true
+      when _ then false
+      end
+      let action = if !bind_is_ref && type_has_resource_kind(env, &expected_base) then AccessEffect::Consume else AccessEffect::Read end
+      var plans = match env.binding_plans.get(pat.node_id)
+      when Option::Some(p) then p.clone()
+      when Option::None then Vec::new()
+      end
+      plans.push(BindingPlan { local: before, source_place: source_place.clone(), action: action })
+      env.binding_plans.insert(pat.node_id, plans)
     end
   when PatternKind::Literal(expr) then
     let lit_type = check_expr(env, &expr)
@@ -3587,7 +4615,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
       if pats.len() == types.len() then
         var i = 0
         while i < pats.len() do
-          check_pattern(env, &pats[i], types[i].clone())
+          check_pattern(env, &pats[i], types[i].clone(), source_place.clone())
           i = i + 1
         end
       else
@@ -3598,7 +4626,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
       var i = 0
       while i < pats.len() do
         let t = fresh_type_var(env)
-        check_pattern(env, &pats[i], t)
+        check_pattern(env, &pats[i], t, source_place.clone())
         types.push(t)
         i = i + 1
       end
@@ -3610,7 +4638,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
       var i = 0
       while i < pats.len() do
         let t = fresh_type_var(env)
-        check_pattern(env, &pats[i], t)
+        check_pattern(env, &pats[i], t, source_place.clone())
         types.push(t)
         i = i + 1
       end
@@ -3623,7 +4651,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
     let elem_type = fresh_type_var(env)
     var i = 0
     while i < pats.len() do
-      check_pattern(env, &pats[i], elem_type)
+      check_pattern(env, &pats[i], elem_type, source_place.clone())
       i = i + 1
     end
   when PatternKind::Variant(path, pats) then
@@ -3641,6 +4669,9 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
           let v = variants[vi]
           if v.name == variant_name then
             found = true
+            # P0-Q: thread the resolved variant identity (owner TypeId +
+            # variant index) so consumers never re-resolve by name.
+            env.pattern_variant_resolutions.insert(pat.node_id, (td.id.id, vi))
             # Check sub-pattern count doesn't exceed variant field count
             # Allow fewer sub-patterns than fields (discriminant-only matching)
             if pats.len() > v.fields.len() then
@@ -3653,7 +4684,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
             var fi = 0
             while fi < pats.len() && fi < v.fields.len() do
               let field_ty = subst_type_args(&v.fields[fi], &td.generic_params, &enum_type_args)
-              check_pattern(env, &pats[fi], field_ty)
+              check_pattern(env, &pats[fi], field_ty, source_place.clone())
               fi = fi + 1
             end
           end
@@ -3667,9 +4698,13 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
       end
     when Option::None then
       # Try to resolve bare variant name (e.g., `Some` without `Option::`)
-      # by scanning all type defs for a matching variant.
-      match find_enum_variant(env, variant_name)
-      when Option::Some((enum_td, variant)) then
+      # by scanning all type defs for a matching variant. The INDEXED
+      # resolution carries the variant identity (owner + index).
+      match find_enum_variant_indexed(env, variant_name)
+      when Option::Some((enum_td, variant, vidx)) then
+        # P0-Q: thread the resolved variant identity (owner TypeId +
+        # variant index) so consumers never re-resolve by name.
+        env.pattern_variant_resolutions.insert(pat.node_id, (enum_td.id.id, vidx))
         # Check sub-pattern count doesn't exceed variant field count
         # Allow fewer sub-patterns than fields (discriminant-only matching)
         if pats.len() > variant.fields.len() then
@@ -3682,7 +4717,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
         var fi = 0
         while fi < pats.len() && fi < variant.fields.len() do
           let field_ty = subst_type_args(&variant.fields[fi], &enum_td.generic_params, &enum_type_args)
-          check_pattern(env, &pats[fi], field_ty)
+          check_pattern(env, &pats[fi], field_ty, source_place.clone())
           fi = fi + 1
         end
       when Option::None then
@@ -3692,14 +4727,14 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
           # Accept; unification already handled by the match scrutinee
           var fi = 0
           while fi < pats.len() do
-            check_pattern(env, &pats[fi], fresh_type_var(env))
+            check_pattern(env, &pats[fi], fresh_type_var(env), source_place.clone())
             fi = fi + 1
           end
         when _ then
           # Accept generic patterns without specific enum resolution
           var fi = 0
           while fi < pats.len() do
-            check_pattern(env, &pats[fi], fresh_type_var(env))
+            check_pattern(env, &pats[fi], fresh_type_var(env), source_place.clone())
             fi = fi + 1
           end
         end
@@ -3725,7 +4760,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
               field_found = true
               # Substitute generic type parameters when checking pattern field types
               let field_ty = subst_type_args(&f.ty, &td.generic_params, &struct_type_args)
-              check_pattern(env, &field_pat.1, field_ty)
+              check_pattern(env, &field_pat.1, field_ty, source_place.clone())
             end
             j = j + 1
           end
@@ -3752,10 +4787,12 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
             let variant = variants[vi]
             if variant.name == struct_name then
               found_variant = true
+              # P0-Q: thread the resolved variant identity.
+              env.pattern_variant_resolutions.insert(pat.node_id, (enum_td.id.id, vi))
               var fi = 0
               while fi < field_pats.len() && fi < variant.fields.len() do
                 let field_ty = subst_type_args(&variant.fields[fi], &enum_td.generic_params, &enum_type_args)
-                check_pattern(env, &field_pats[fi].1, field_ty)
+                check_pattern(env, &field_pats[fi].1, field_ty, source_place.clone())
                 fi = fi + 1
               end
             end
@@ -3790,7 +4827,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type) -> Unit
     # Or-pattern: p1 | p2 | p3
     var i = 0
     while i < alts.len() do
-      check_pattern(env, &alts[i], expected)
+      check_pattern(env, &alts[i], expected, source_place.clone())
       i = i + 1
     end
   when _ then ()
@@ -3887,50 +4924,736 @@ def method_def_for(env: &TypeEnv, recv_type: &Type, method: String) -> Option[De
   end
 end
 
-# The concrete type arguments of a receiver, in generic-parameter order
-# (used to check impl generic bounds at method selection).
-def receiver_type_args(env: &TypeEnv, recv_type: &Type) -> Vec[Type]
-  match recv_type
-  when Type::Named(_, args) then args.clone()
-  when Type::Slice(inner) then
-    var out = Vec::new()
-    out.push(inner.clone())
-    out
-  when Type::Map(k, v) then
-    var out2 = Vec::new()
-    out2.push(k.clone())
-    out2.push(v.clone())
-    out2
-  when _ then Vec::new()
+# ———————————————————————————————————————————————————————————————
+# Trivial copyability (P0-H)
+# ———————————————————————————————————————————————————————————————
+#
+# THREE distinct copy/move notions, decided once here:
+#   1. BIT-COPY (trivial copy): copying the value's bits is valid and
+#      requires NO retain/clone. The DECIDED set: primitives (Int/UInt/
+#      Float/Char/Bool and the fixed-width ints/floats), raw Ptr/PtrMut,
+#      Unit/Never, and composites (tuples, structs whose fields are all
+#      trivially copyable, enums whose payloads are all trivially copyable,
+#      Option/Result with trivially-copyable payloads). NOT in the set:
+#      String (heap-backed), Vec/Array/Map/Set/Slice (heap-backed), Box/Rc/
+#      UniquePtr/WeakRc/ArcStrong/WeakArc (owning), resources, capabilities,
+#      closures/functions with environments.
+#   2. CLONE (explicit, may allocate): `clone()`. The std declares
+#      `impl Copyable for Int/String` (String's copy() is clone(), which
+#      allocates). A Copyable obligation is satisfied by an explicit
+#      `impl Copyable for T` in the registry OR by bit-copyability — the
+#      solver checks the registry first, then falls back to the structural
+#      property below (see solve_obligation_depth).
+#   3. MOVE/SINK (transfer): transferring ownership does not copy; the
+#      resource checker's linearity rules govern moves.
+#
+# The memoized type-property engine (P0-I, type_properties_of) computes a
+# superset of this analysis over the whole type graph.
+
+pub def is_trivially_copyable(env: &TypeEnv, ty: &Type) -> Bool
+  var visited = Set::new()
+  is_trivially_copyable_walk(env, ty, &mut visited, 0)
+end
+
+# Depth-guarded structural walk over the env's type tables (get_type_by_id +
+# TypeDef fields/variants; the built-in names decide directly — canonical
+# Type variants are the fast path). The depth guard (32) is a defensive
+# bound for degenerate self-nesting; the memoized graph algorithm (P0-I,
+# type_properties_of) supersedes this guard with real cycle detection.
+def is_trivially_copyable_walk(env: &TypeEnv, ty: &Type, visited: &mut Set[Int], depth: Int) -> Bool
+  if depth > 32 then
+    return false
+  end
+  match ty
+  when Type::Unit then true
+  when Type::Bool then true
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::Float then true
+  when Type::Char then true
+  when Type::Never then true
+  when Type::I8 then true
+  when Type::I16 then true
+  when Type::I32 then true
+  when Type::I64 then true
+  when Type::I128 then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::U128 then true
+  when Type::ISize then true
+  when Type::USize then true
+  when Type::F32 then true
+  when Type::F64 then true
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when Type::Tuple(fields) then
+    var i = 0
+    while i < fields.len() do
+      if !is_trivially_copyable_walk(env, &fields[i], visited, depth + 1) then
+        return false
+      end
+      i = i + 1
+    end
+    true
+  when Type::Option(inner) then
+    is_trivially_copyable_walk(env, &inner, visited, depth + 1)
+  when Type::Result(ok, err) then
+    is_trivially_copyable_walk(env, &ok, visited, depth + 1) &&
+      is_trivially_copyable_walk(env, &err, visited, depth + 1)
+  when Type::Named(tid, args) then
+    is_named_trivially_copyable(env, tid, args, visited, depth)
+  # Heap-backed storage is never bit-copyable: a bit-copy would duplicate
+  # the buffer/ownership state without the retain/clone it requires.
+  when Type::String then false
+  when Type::Array(_, _) then false
+  when Type::Slice(_) then false
+  when Type::Map(_, _) then false
+  when Type::Set(_) then false
+  when Type::Box(_) then false
+  when Type::Rc(_) then false
+  # Closures/functions with environments carry state; refs are borrows with
+  # checker-managed semantics, not bit-copy values.
+  when Type::Function(_, _) then false
+  when Type::Dyn(_) then false
+  when Type::Effect(_, _) then false
+  when Type::RefInternal(_, _) then false
+  when Type::Var(_) then false
+  when Type::Param(_) then false
+  when Type::Error then false
   end
 end
 
-# Solve the SEMANTIC obligations of a registered ImplInfo against the
-# receiver's concrete args. Ownership-relevant obligations (Copyable/Clone)
-# are checked via resource containment: a resource (or container of
-# resources) cannot satisfy them. Other trait obligations (Eq/Hash) have no
-# general solver yet (documented P0-14 limitation) — they do not gate.
-# PARTIAL obligation solver (P0-documented): only Copyable/Clone get the
-# resource-containment approximation, and obligations are matched by
-# generic parameter INDEX rather than by impl-head unification/substitution
-# (reordered impl heads would misalign). Eq and Hash do not gate impl
-# applicability at all. The target is one general solver driven by
-# impl-head unification; until then, collection constraints such as
-# Map[K, V]: K: Hash + Eq are documented rather than enforced.
-def impl_bounds_satisfied(env: &TypeEnv, info: &ImplInfo, recv_args: &Vec[Type]) -> Bool
-  for obligation in info.obligations do
-    if obligation.trait_name == "Copyable" || obligation.trait_name == "Clone" then
-      if obligation.param_index < recv_args.len() then
-        if type_has_resource_kind(env, &recv_args[obligation.param_index]) then
+def is_named_trivially_copyable(env: &TypeEnv, tid: &TypeId, args: &Vec[Type], visited: &mut Set[Int], depth: Int) -> Bool
+  match get_type_by_id(env, tid)
+  when Option::Some(td) then
+    # Resources and capabilities are linear: never bit-copyable.
+    if td.kind == TypeKind::Resource || td.kind == TypeKind::Capability then
+      return false
+    end
+    # Named owning smart pointers are NEVER bit-copyable: a bit-copy would
+    # duplicate unique ownership or reference-count state. This mirrors the
+    # ResourceChecker's is_owning_smart_pointer classification.
+    if td.name == "Box" || td.name == "Rc" || td.name == "UniquePtr" ||
+       td.name == "WeakRc" || td.name == "ArcStrong" || td.name == "WeakArc" then
+      return false
+    end
+    # Heap-backed containers (including the registered Vec shape { ptr, len,
+    # cap } — the Ptr field must NOT be walked): never bit-copyable.
+    if td.name == "Vec" || td.name == "Array" || td.name == "Map" ||
+       td.name == "Set" || td.name == "Slice" then
+      return false
+    end
+    if td.name == "String" || td.name == "str" then
+      return false
+    end
+    # Raw pointers are bit-copyable regardless of pointee.
+    if td.name == "Ptr" || td.name == "PtrMut" then
+      return true
+    end
+    # Primitive spellings (canonical plus c-FFI aliases) decide directly.
+    if td.name == "Unit" || td.name == "Nil" || td.name == "Bool" ||
+       td.name == "Int" || td.name == "c_int" || td.name == "UInt" ||
+       td.name == "c_uint" || td.name == "Float" || td.name == "Char" ||
+       td.name == "Never" ||
+       td.name == "I8" || td.name == "Int8" || td.name == "i8" ||
+       td.name == "I16" || td.name == "Int16" || td.name == "i16" ||
+       td.name == "I32" || td.name == "Int32" || td.name == "i32" ||
+       td.name == "I64" || td.name == "Int64" || td.name == "i64" ||
+       td.name == "c_long" ||
+       td.name == "I128" || td.name == "Int128" || td.name == "i128" ||
+       td.name == "U8" || td.name == "UInt8" || td.name == "u8" ||
+       td.name == "c_char" ||
+       td.name == "U16" || td.name == "UInt16" || td.name == "u16" ||
+       td.name == "U32" || td.name == "UInt32" || td.name == "u32" ||
+       td.name == "U64" || td.name == "UInt64" || td.name == "u64" ||
+       td.name == "c_ulong" ||
+       td.name == "U128" || td.name == "UInt128" || td.name == "u128" ||
+       td.name == "ISize" || td.name == "isize" ||
+       td.name == "USize" || td.name == "usize" ||
+       td.name == "F32" || td.name == "f32" || td.name == "c_float" ||
+       td.name == "F64" || td.name == "f64" || td.name == "c_double" then
+      return true
+    end
+    # Option/Result named forms recurse into their concrete args.
+    if td.name == "Option" then
+      if args.len() < 1 then return false end
+      return is_trivially_copyable_walk(env, &args[0], visited, depth + 1)
+    end
+    if td.name == "Result" then
+      if args.len() < 2 then return false end
+      return is_trivially_copyable_walk(env, &args[0], visited, depth + 1) &&
+        is_trivially_copyable_walk(env, &args[1], visited, depth + 1)
+    end
+    # User aggregates: structs whose fields are all trivially copyable,
+    # enums whose payloads are all trivially copyable. The tid-visited set
+    # makes recursion through INLINE storage fail closed (a Visiting tid
+    # means the type is infinitely sized — never bit-copyable).
+    match td.def_kind
+    when TypeDefKind::Alias(inner) then
+      is_trivially_copyable_walk(env, &subst_type_args(&inner, &td.generic_params, args), visited, depth + 1)
+    when TypeDefKind::Struct(fields) then
+      if visited.contains(&tid.id) then return false end
+      visited.insert(tid.id)
+      var i = 0
+      while i < fields.len() do
+        let f_ty = subst_type_args(&fields[i].ty, &td.generic_params, args)
+        if !is_trivially_copyable_walk(env, &f_ty, visited, depth + 1) then
+          visited.remove(&tid.id)
           return false
         end
+        i = i + 1
       end
+      visited.remove(&tid.id)
+      true
+    when TypeDefKind::Enum(variants) then
+      if visited.contains(&tid.id) then return false end
+      visited.insert(tid.id)
+      var vi = 0
+      while vi < variants.len() do
+        var fi = 0
+        while fi < variants[vi].fields.len() do
+          let v_ty = subst_type_args(&variants[vi].fields[fi], &td.generic_params, args)
+          if !is_trivially_copyable_walk(env, &v_ty, visited, depth + 1) then
+            visited.remove(&tid.id)
+            return false
+          end
+          fi = fi + 1
+        end
+        vi = vi + 1
+      end
+      visited.remove(&tid.id)
+      true
+    when _ then false
+    end
+  when Option::None then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Trait/Obligation Solver (P0-G)
+# ———————————————————————————————————————————————————————————————
+#
+# ONE general obligation solver drives impl applicability for every trait
+# (Copyable, Clone, Eq, Hash, Iterator, Display, Drop, user traits). It uses
+# the same impl registry as method lookup (env.impls, populated by
+# check_impl / register_builtin_trait): an obligation (trait T, self S) is
+# solved iff exactly one candidate impl whose for_type HEAD unifies with S
+# also solves all of its own where-clause obligations under the substitution
+# obtained from THAT head unification — never from generic-parameter index,
+# never from the receiver's positional arguments. Recursion is cycle-guarded
+# by a visited set of (trait, type) pairs; a solved set larger than one
+# candidate is ambiguous and fails.
+
+# The names of the impl's generic parameters that actually appear in the
+# impl head, in head order. The substitution for the where-clauses is
+# derived from head unification against these names.
+def collect_param_names_from_type(env: &TypeEnv, ty: &Type, out: &mut Vec[String]) -> Unit
+  match ty
+  when Type::Param(name) then
+    var found = false
+    var i = 0
+    while i < out.len() do
+      if out[i] == name then found = true end
+      i = i + 1
+    end
+    if !found then out.push(name.clone()) end
+  when Type::Named(_, args) then
+    var i = 0
+    while i < args.len() do
+      collect_param_names_from_type(env, &args[i], out)
+      i = i + 1
+    end
+  when Type::RefInternal(inner, _) then collect_param_names_from_type(env, inner, out)
+  when Type::Ptr(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::PtrMut(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Box(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Rc(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Option(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Result(ok, err) then
+    collect_param_names_from_type(env, ok, out)
+    collect_param_names_from_type(env, err, out)
+  when Type::Map(k, v) then
+    collect_param_names_from_type(env, k, out)
+    collect_param_names_from_type(env, v, out)
+  when Type::Set(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Tuple(fields) then
+    var i = 0
+    while i < fields.len() do
+      collect_param_names_from_type(env, &fields[i], out)
+      i = i + 1
+    end
+  when Type::Function(params, ret) then
+    var i = 0
+    while i < params.len() do
+      collect_param_names_from_type(env, &params[i].ty, out)
+      i = i + 1
+    end
+    collect_param_names_from_type(env, ret, out)
+  when Type::Array(inner, _) then collect_param_names_from_type(env, inner, out)
+  when Type::Slice(inner) then collect_param_names_from_type(env, inner, out)
+  when Type::Effect(_, inner) then collect_param_names_from_type(env, inner, out)
+  when _ then ()
+  end
+end
+
+def impl_param_names(env: &TypeEnv, for_type: &Type) -> Vec[String]
+  var out = Vec::new()
+  collect_param_names_from_type(env, for_type, &mut out)
+  out
+end
+
+# Unify two types WITHOUT recording diagnostics: used by the obligation
+# solver to test candidate impl heads. A failed head match is an ordinary
+# non-match (e.g. `impl Hash for u8` vs an obligation on String), not an
+# error — the mismatch diagnostics emitted by unify are discarded. The
+# variable bindings made by the failed attempt are left in place (they only
+# involve fresh candidate variables).
+def try_head_unify(env: &mut TypeEnv, t1: Type, t2: Type) -> Bool
+  let errors_before = env.errors.len()
+  let ok = unify(env, t1, t2, Span { file: "", start: 0, end_pos: 0 })
+  if !ok then
+    while env.errors.len() > errors_before do
+      env.errors.pop()
+    end
+  end
+  ok
+end
+
+# A structural identity string for a (fully resolved) type, used as the
+# (trait, type) key in the obligation solver's cycle set. Unlike type_tag,
+# it recurses into type arguments, so `Hash` for `Vec[Int]` and `Hash` for
+# `Vec[String]` are distinct obligations.
+def type_identity_key(env: &TypeEnv, ty: &Type) -> String
+  type_identity_key_resolved(env, &resolve_type_var(env, ty.clone()))
+end
+
+def type_identity_key_resolved(env: &TypeEnv, ty: &Type) -> String
+  match ty
+  when Type::Named(tid, args) then
+    var s = "Named#" + tid.id.to_string()
+    var i = 0
+    while i < args.len() do
+      s = s + "[" + type_identity_key_resolved(env, &args[i]) + "]"
+      i = i + 1
+    end
+    s
+  when Type::Tuple(fields) then
+    var s = "Tuple("
+    var i = 0
+    while i < fields.len() do
+      if i > 0 then s = s + "," end
+      s = s + type_identity_key_resolved(env, &fields[i])
+      i = i + 1
+    end
+    s + ")"
+  when Type::Option(inner) then "Option[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Result(ok, err) then "Result[" + type_identity_key_resolved(env, ok) + "," + type_identity_key_resolved(env, err) + "]"
+  when Type::Map(k, v) then "Map[" + type_identity_key_resolved(env, k) + "," + type_identity_key_resolved(env, v) + "]"
+  when Type::Set(inner) then "Set[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Slice(inner) then "Slice[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Array(inner, n) then "Array[" + type_identity_key_resolved(env, inner) + "," + n.to_string() + "]"
+  when Type::Function(params, ret) then
+    var s = "Fn("
+    var i = 0
+    while i < params.len() do
+      if i > 0 then s = s + "," end
+      s = s + type_identity_key_resolved(env, &params[i].ty)
+      i = i + 1
+    end
+    s + ")->" + type_identity_key_resolved(env, ret)
+  when Type::Box(inner) then "Box[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Rc(inner) then "Rc[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Ptr(inner) then "Ptr[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::PtrMut(inner) then "PtrMut[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::RefInternal(inner, _) then "Ref[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Effect(_, inner) then "Effect[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Var(id) then "Var#" + id.id.to_string()
+  when Type::Param(name) then "Param(" + name + ")"
+  when Type::Dyn(id) then "Dyn#" + id.id.to_string()
+  when _ then type_tag(ty)
+  end
+end
+
+def solve_obligation(env: &mut TypeEnv, obligation: &Obligation) -> Bool
+  var visited: Set[String] = Set::new()
+  solve_obligation_depth(env, obligation, &mut visited, 0)
+end
+
+def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: &mut Set[String], depth: Int) -> Bool
+  if depth > MAX_TYPE_DEPTH() then
+    return false
+  end
+  let self_resolved = resolve_type_var(env, obligation.self_ty)
+  # An obligation whose self type is still an unbound inference variable is
+  # undecidable at this point: solving it would bind the variable to an
+  # arbitrary candidate impl head (e.g. `let v = Vec::new(); v.hash()`
+  # pinning the element type to the first Hash impl). Reject the obligation
+  # instead — the impl is not applicable until the receiver is resolved.
+  match self_resolved
+  when Type::Var(_) then return false
+  when _ then ()
+  end
+  let key = obligation.trait_name + "::" + type_identity_key(env, &self_resolved)
+  if visited.contains(&key) then
+    # Cycle: this (trait, type) obligation is already being solved on the
+    # current path (e.g. `impl[T: Hash] Hash for Vec[T]` recursively solving
+    # Hash for Vec[Vec[...]]). A cyclic obligation has no well-founded
+    # solution.
+    return false
+  end
+  visited.insert(key.clone())
+  var solved_candidates = 0
+  var i = 0
+  while i < env.impls.len() do
+    let imp = env.impls[i]
+    if imp.trait_name == obligation.trait_name then
+      # Candidate impl: instantiate the impl head with ONE fresh inference
+      # variable per impl generic parameter, then unify the head with the
+      # obligation's self type. The substitution used to instantiate the
+      # where-clauses comes from this head unification.
+      let names = impl_param_names(env, &imp.for_type)
+      var vars = Vec::new()
+      var j = 0
+      while j < names.len() do
+        vars.push(fresh_type_var(env))
+        j = j + 1
+      end
+      let head_inst = subst_type_args(&imp.for_type, &names, &vars)
+      if try_head_unify(env, head_inst, self_resolved.clone()) then
+        var all_ok = true
+        for wob in imp.obligations do
+          if wob.param_index < vars.len() then
+            let wob_self = resolve_type_var(env, vars[wob.param_index])
+            let wob_ob = Obligation { trait_name: wob.trait_name, self_ty: wob_self, args: Vec::new() }
+            if !solve_obligation_depth(env, &wob_ob, visited, depth + 1) then
+              all_ok = false
+            end
+          else
+            # The obligation names a generic parameter that does not appear
+            # in the impl head: its self type cannot be determined by head
+            # unification, so the impl cannot be validated — reject it.
+            all_ok = false
+          end
+        end
+        if all_ok then
+          solved_candidates = solved_candidates + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+  visited.remove(&key)
+  if solved_candidates == 1 then
+    # Exactly one fully-solving candidate: no candidate fails, and multiple
+    # candidates would be ambiguous.
+    true
+  elsif solved_candidates == 0 && obligation.trait_name == "Copyable" then
+    # P0-H structural fallback: an EXPLICIT `impl Copyable for T` in the
+    # registry is checked first (e.g. the std's `impl Copyable for Int/String`
+    # — String satisfies Copyable through the explicit impl even though it is
+    # not trivially copyable). When no candidate applies, fall back to the
+    # structural property: a raw bit-copy is valid and requires no
+    # retain/clone. This separates trivial copy (bit-copy semantics) from
+    # Clone (explicit, may allocate) and from move/sink (transfer) — the
+    # previous resource-containment approximation of Copyable is superseded
+    # by the decided set in is_trivially_copyable.
+    is_trivially_copyable(env, &self_resolved)
+  else
+    false
+  end
+end
+
+# Gate an impl's applicability for a concrete receiver by solving its
+# where-clause obligations with the real obligation solver. The self type of
+# each obligation is the receiver position bound by impl-HEAD unification —
+# never the receiver's positional argument at the obligation's index.
+def impl_bounds_satisfied(env: &mut TypeEnv, info: &ImplInfo, recv_type: &Type) -> Bool
+  if info.obligations.is_empty() then
+    return true
+  end
+  let names = impl_param_names(env, &info.for_type)
+  var vars = Vec::new()
+  var i = 0
+  while i < names.len() do
+    vars.push(fresh_type_var(env))
+    i = i + 1
+  end
+  let head_inst = subst_type_args(&info.for_type, &names, &vars)
+  if !try_head_unify(env, head_inst, recv_type.clone()) then
+    return false
+  end
+  for obligation in info.obligations do
+    if obligation.param_index < vars.len() then
+      let self_ty = resolve_type_var(env, vars[obligation.param_index])
+      let ob = Obligation { trait_name: obligation.trait_name, self_ty: self_ty, args: Vec::new() }
+      if !solve_obligation(env, &ob) then
+        return false
+      end
+    else
+      return false
     end
   end
   true
 end
 
-def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Option[Vec[ParamType]]
+# ———————————————————————————————————————————————————————————————
+# Type-Property Engine (P0-I)
+# ———————————————————————————————————————————————————————————————
+#
+# Memoized per-type property computation over the full concrete type graph.
+# type_properties_of walks a type structurally (fields/variants/args),
+# memoized in env.type_prop_cache by a canonical structural string key
+# (type_identity_key_resolved — it includes the concrete generic args, so
+# Wrapper[Int] and Wrapper[File] are distinct cache entries). The walk uses
+# the graph algorithm:
+#
+#   Unvisited -> mark Visiting -> compute from children -> mark Resolved
+#
+# A Visiting revisit is a recursion through INLINE storage — the layout
+# engine panics on such types; this engine reports a TypeError diagnostic
+# ("infinitely sized recursive type") instead and treats the revisit as
+# NON-owning-but-unsafe: needs_drop=false and is_trivially_copyable=false.
+# Indirections (Ptr/Box/Rc) terminate the walk: their properties are decided
+# by the pointer layer, not the pointee.
+#
+# Consumption by the other layers (resource checker, access checker, MIR) is
+# the follow-up migration; this engine is defined and unit-verifiable here.
+
+# Entry point: memoized properties for a fully resolved concrete type.
+pub def type_properties_of(env: &mut TypeEnv, ty: &Type) -> TypeProperties
+  var visiting: Map[String, TypePropVisitState] = Map::new()
+  let resolved = resolve_type_var(env, ty.clone())
+  type_props_walk(env, &resolved, &mut visiting, 0)
+end
+
+# The per-call visiting set is LOCAL (a fresh top-level call must not see a
+# stale Visiting state); the memo cache is persistent in the env, and entries
+# are only inserted once a key is fully Resolved — never while Visiting.
+def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, TypePropVisitState], depth: Int) -> TypeProperties
+  if depth > 64 then
+    return TypeProperties { needs_drop: false, is_linear: false, is_capability: false, is_trivially_copyable: false }
+  end
+  let key = type_identity_key_resolved(env, ty)
+  match env.type_prop_cache.get(key)
+  when Option::Some(cached) then
+    return cached.clone()
+  when Option::None then ()
+  end
+  match visiting.get(key)
+  when Option::Some(state) then
+    if state == TypePropVisitState::Visiting then
+      # Recursion through INLINE storage: infinitely sized recursive type.
+      # The layout engine panics on such types; the property engine reports
+      # the diagnostic instead. The revisit is NON-owning-but-unsafe:
+      # needs_drop=false (no ownership claimed) and is_trivially_copyable
+      # =false (an infinitely sized value can never be copied).
+      env.errors.push(TypeError {
+        message: "infinitely sized recursive type: inline storage cycle (use a pointer or Box to break the cycle)",
+        span: Span { file: "", start: 0, end_pos: 0 },
+        code: Option::None
+      })
+      return TypeProperties { needs_drop: false, is_linear: false, is_capability: false, is_trivially_copyable: false }
+    end
+  when Option::None then ()
+  end
+  visiting.insert(key.clone(), TypePropVisitState::Visiting)
+  var props = TypeProperties { needs_drop: false, is_linear: false, is_capability: false, is_trivially_copyable: false }
+  match ty
+  # Plain data: no drop, not linear, not a capability, bit-copyable.
+  when Type::Unit then ()
+  when Type::Bool then ()
+  when Type::Int then ()
+  when Type::UInt then ()
+  when Type::Float then ()
+  when Type::Char then ()
+  when Type::Never then ()
+  when Type::I8 then ()
+  when Type::I16 then ()
+  when Type::I32 then ()
+  when Type::I64 then ()
+  when Type::I128 then ()
+  when Type::U8 then ()
+  when Type::U16 then ()
+  when Type::U32 then ()
+  when Type::U64 then ()
+  when Type::U128 then ()
+  when Type::ISize then ()
+  when Type::USize then ()
+  when Type::F32 then ()
+  when Type::F64 then ()
+  # String is heap-backed but arena-managed: no per-value drop, and never
+  # bit-copyable (clone() is the explicit allocation).
+  when Type::String then ()
+  # Raw pointers terminate the walk: no ownership, no drop, bit-copyable.
+  when Type::Ptr(_) then ()
+  when Type::PtrMut(_) then ()
+  # Owning/smart pointer layer decides — the pointee is NOT walked.
+  when Type::Box(_) then
+    props.needs_drop = true
+    props.is_linear = true
+  when Type::Rc(_) then
+    props.needs_drop = true
+  # Inline containers: properties derive from the content.
+  when Type::Option(inner) then
+    let ip = type_props_walk(env, &inner, visiting, depth + 1)
+    props.needs_drop = ip.needs_drop
+    props.is_linear = ip.is_linear
+  when Type::Result(ok, err) then
+    let okp = type_props_walk(env, &ok, visiting, depth + 1)
+    let errp = type_props_walk(env, &err, visiting, depth + 1)
+    props.needs_drop = okp.needs_drop || errp.needs_drop
+    props.is_linear = okp.is_linear || errp.is_linear
+  when Type::Tuple(fields) then
+    var i = 0
+    while i < fields.len() do
+      let fp = type_props_walk(env, &fields[i], visiting, depth + 1)
+      if fp.needs_drop then props.needs_drop = true end
+      if fp.is_linear then props.is_linear = true end
+      i = i + 1
+    end
+  # Heap-backed containers: content properties are viral (drop/linearity),
+  # but the container itself is never bit-copyable.
+  when Type::Slice(inner) then
+    let ip = type_props_walk(env, &inner, visiting, depth + 1)
+    props.needs_drop = ip.needs_drop
+    props.is_linear = ip.is_linear
+  when Type::Array(inner, _) then
+    let ip = type_props_walk(env, &inner, visiting, depth + 1)
+    props.needs_drop = ip.needs_drop
+    props.is_linear = ip.is_linear
+  when Type::Map(k, v) then
+    let kp = type_props_walk(env, &k, visiting, depth + 1)
+    let vp = type_props_walk(env, &v, visiting, depth + 1)
+    props.needs_drop = kp.needs_drop || vp.needs_drop
+    props.is_linear = kp.is_linear || vp.is_linear
+  when Type::Set(inner) then
+    let ip = type_props_walk(env, &inner, visiting, depth + 1)
+    props.needs_drop = ip.needs_drop
+    props.is_linear = ip.is_linear
+  when Type::Named(tid, args) then
+    type_named_props(env, tid, args, visiting, depth, &mut props)
+  # Closures/functions with environments and dyn/effect/ref forms carry
+  # checker-managed state: nothing here owns or copies.
+  when Type::Function(_, _) then ()
+  when Type::Dyn(_) then ()
+  when Type::Effect(_, _) then ()
+  when Type::RefInternal(_, _) then ()
+  when Type::Var(_) then ()
+  when Type::Param(_) then ()
+  when Type::Error then ()
+  end
+  # is_trivially_copyable comes from FIX 1 (P0-H): the decided bit-copy set.
+  props.is_trivially_copyable = is_trivially_copyable(env, ty)
+  visiting.insert(key.clone(), TypePropVisitState::Resolved)
+  env.type_prop_cache.insert(key, props.clone())
+  props
+end
+
+# True when the type has a registered `impl Drop for T` in the impl registry
+# — the TypeEnv-side proxy for a "registered deinit target" (the authoritative
+# deinit targets/plans live in TypedProgram; this engine runs on the TypeEnv).
+def type_has_registered_drop(env: &TypeEnv, tid: &TypeId) -> Bool
+  var i = 0
+  while i < env.impls.len() do
+    let imp = env.impls[i]
+    if imp.trait_name == "Drop" then
+      match imp.for_type
+      when Type::Named(imp_tid, _) then
+        if imp_tid.id == tid.id then
+          return true
+        end
+      when _ then ()
+      end
+    end
+    i = i + 1
+  end
+  false
+end
+
+# Named-type property computation: built-in names decide directly (their
+# registered shapes must NOT be walked — Vec's shape is { ptr: Ptr[T], ... }
+# and would look non-owning and bit-copyable); user aggregates walk their
+# fields/variants with the concrete args substituted.
+def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting: &mut Map[String, TypePropVisitState], depth: Int, props: &mut TypeProperties) -> Unit
+  match get_type_by_id(env, tid)
+  when Option::Some(td) then
+    if td.kind == TypeKind::Resource || td.kind == TypeKind::Capability then
+      # Resources/capabilities are linear by kind; is_capability is the
+      # TypeKind::Capability marker.
+      props.is_linear = true
+      if td.kind == TypeKind::Capability then
+        props.is_capability = true
+      end
+    end
+    if type_has_registered_drop(env, tid) then
+      props.needs_drop = true
+    end
+    if td.name == "Box" || td.name == "Rc" || td.name == "UniquePtr" ||
+       td.name == "WeakRc" || td.name == "ArcStrong" || td.name == "WeakArc" then
+      # Named owning smart pointers (the std's struct forms): owns allocation
+      # or reference-count state. Rc is shared ownership — not linear.
+      props.needs_drop = true
+      if td.name != "Rc" then
+        props.is_linear = true
+      end
+    elsif td.name == "Vec" || td.name == "Array" || td.name == "Map" ||
+          td.name == "Set" || td.name == "Slice" ||
+          td.name == "Option" || td.name == "Result" then
+      # Named container forms: content properties are viral over the concrete
+      # args; the container layer never owns drop by itself.
+      var i = 0
+      while i < args.len() do
+        let ap = type_props_walk(env, &args[i], visiting, depth + 1)
+        if ap.needs_drop then props.needs_drop = true end
+        if ap.is_linear then props.is_linear = true end
+        i = i + 1
+      end
+    elsif td.name == "Ptr" || td.name == "PtrMut" then
+      # Raw pointers: no ownership; the pointer layer decides.
+      ()
+    elsif td.name == "String" || td.name == "str" then
+      # Heap-backed but arena-managed: no per-value drop; not bit-copyable.
+      ()
+    else
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        var i = 0
+        while i < fields.len() do
+          let f_ty = subst_type_args(&fields[i].ty, &td.generic_params, args)
+          let fp = type_props_walk(env, &f_ty, visiting, depth + 1)
+          if fp.needs_drop then props.needs_drop = true end
+          if fp.is_linear then props.is_linear = true end
+          i = i + 1
+        end
+      when TypeDefKind::Enum(variants) then
+        var vi = 0
+        while vi < variants.len() do
+          var fi = 0
+          while fi < variants[vi].fields.len() do
+            let v_ty = subst_type_args(&variants[vi].fields[fi], &td.generic_params, args)
+            let vp = type_props_walk(env, &v_ty, visiting, depth + 1)
+            if vp.needs_drop then props.needs_drop = true end
+            if vp.is_linear then props.is_linear = true end
+            fi = fi + 1
+          end
+          vi = vi + 1
+        end
+      when TypeDefKind::Alias(inner) then
+        let inner_ty = subst_type_args(&inner, &td.generic_params, args)
+        let ip = type_props_walk(env, &inner_ty, visiting, depth + 1)
+        if ip.needs_drop then props.needs_drop = true end
+        if ip.is_linear then props.is_linear = true end
+        if ip.is_capability then props.is_capability = true end
+      when _ then ()
+      end
+    end
+  when Option::None then ()
+  end
+end
+
+def find_method_params(env: &mut TypeEnv, recv_type: &Type, method: String) -> Option[Vec[ParamType]]
   let resolved_base = resolved_receiver_base(env, recv_type)
   match resolved_base
   when Type::Error then return Option::None
@@ -3947,11 +5670,12 @@ def find_method_params(env: &TypeEnv, recv_type: &Type, method: String) -> Optio
           let info = env.impls[cands[ci]]
           if impl_for_type_matches(&info.for_type, &resolved_base) then
             # Generic obligation gate: a bounded impl is only applicable when
-            # the concrete receiver args satisfy its obligations. This makes
-            # `impl[T: Copyable] Array[T]` a REAL constraint — a resource
-            # element cannot select methods from it.
-            let recv_args = receiver_type_args(env, &resolved_base)
-            if impl_bounds_satisfied(env, &info, &recv_args) then
+            # the concrete receiver satisfies its where-clause obligations
+            # (solved by the real obligation solver, driven by impl-HEAD
+            # unification). This makes `impl[T: Copyable] Array[T]` a REAL
+            # constraint — a resource element cannot select methods from it,
+            # and Eq/Hash gate exactly as the std's impls say.
+            if impl_bounds_satisfied(env, &info, &resolved_base) then
               var mi = 0
               while mi < info.methods.len() do
                 let m = info.methods[mi]
@@ -3999,7 +5723,7 @@ end
 # with `self` (if present) excluded. Self-less "static-style" methods
 # (e.g. Array::from, Map::new called with method syntax) have no receiver
 # parameter, so the count is the full param list length.
-def find_method_expected_args(env: &TypeEnv, recv_type: &Type, method: String) -> Option[Int]
+def find_method_expected_args(env: &mut TypeEnv, recv_type: &Type, method: String) -> Option[Int]
   let resolved_base = resolved_receiver_base(env, recv_type)
   match resolved_base
   when Type::Error then return Option::None
@@ -4015,8 +5739,7 @@ def find_method_expected_args(env: &TypeEnv, recv_type: &Type, method: String) -
         while ci < cands.len() do
           let info2 = env.impls[cands[ci]]
           if impl_for_type_matches(&info2.for_type, &resolved_base) then
-            let recv_args2 = receiver_type_args(env, &resolved_base)
-            if impl_bounds_satisfied(env, &info2, &recv_args2) then
+            if impl_bounds_satisfied(env, &info2, &resolved_base) then
               var mi = 0
               while mi < info2.methods.len() do
                 let m = info2.methods[mi]
@@ -4067,6 +5790,61 @@ def field_target_of(env: &TypeEnv, recv_type: &Type, field: String) -> Option[Fi
     when Option::None then Option::None
     end
   when _ then Option::None
+  end
+end
+
+# Resolve a struct field's TYPE from its FieldId (owner TypeId + index) —
+# the ID-based counterpart of field_target_of. The FieldId is the semantic
+# field identity (the same id recorded in typed_field_targets / field_targets);
+# the field NAME is used only for diagnostics.
+def field_type_by_id(env: &mut TypeEnv, recv_type: &Type, owner: TypeId, index: Int, field: String, span: Span) -> Type
+  let base = match recv_type
+  when Type::RefInternal(inner, _) then inner
+  when Type::Box(inner) then inner
+  when _ then recv_type
+  end
+  match base
+  when Type::Named(tid, _) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Alias(inner) then
+        # field_target_of resolved the alias chain, so the FieldId's owner is
+        # the FINAL struct; recurse with the alias target so the generic
+        # substitution below uses the struct's concrete instantiation args
+        # (e.g. `typealias Duration = Timespec`), not the alias's own.
+        return field_type_by_id(env, &inner, owner, index, field, span)
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  match base
+  when Type::Named(_, type_args) then
+    match get_type_by_id(env, &owner)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        if index >= 0 && index < fields.len() then
+          # Substitute generic type parameters with the receiver's concrete
+          # type arguments (e.g. Vec[Int].ptr is Ptr[Int], not Ptr[Param("T")]).
+          subst_type_args(&fields[index].ty, &td.generic_params, &type_args)
+        else
+          type_add_error(env, "no field `" + field + "` on type `" + td.name + "`", span)
+          Type::Error
+        end
+      when _ then
+        type_add_error(env, "no field `" + field + "` on type `" + td.name + "`", span)
+        Type::Error
+      end
+    when Option::None then
+      type_add_error(env, "no field `" + field + "`", span)
+      Type::Error
+    end
+  when _ then
+    type_add_error(env, "no field `" + field + "`", span)
+    Type::Error
   end
 end
 
@@ -4526,7 +6304,17 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     when Option::Some(ty) then
       let lid = local_id_of(env, name)
       env.typed_ident_resolutions.insert(expr.node_id, lid)
-      ty
+      # P0-A (final layer): a bare name resolved from the pass-3
+      # program-level callable bindings (scope 0) goes through the
+      # module-qualified identity check — the current module's own
+      # definition wins when several modules define the name; otherwise an
+      # ambiguous bare name is diagnosed and the first-wins entry is the
+      # fallback (see resolve_bare_callable).
+      if var_is_global_callable(env, &name) then
+        resolve_bare_callable(env, name.clone(), expr.span, ty.clone())
+      else
+        ty
+      end
     when Option::None then
       # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
       # u8 in u8::MAX, etc.) — when a type name appears in expression position
@@ -4596,8 +6384,35 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     end
     env.access_marker_depth = env.access_marker_depth - 1
     let ret_type = fresh_type_var(env)
+    var call_was_generic = false
     match func_type
     when Type::Function(params, ret) then
+      # FIX 1 (P0-F): explicit generic instantiation. Each generic parameter
+      # of the callee is instantiated ONCE for the whole call to a fresh
+      # inference variable (shared between parameters and return type), the
+      # arguments unify against the instantiated signature, and the result
+      # type is resolved through the solved substitution.
+      var gvar_map: Map[String, Type] = Map::new()
+      var inst_params = Vec::new()
+      var pi0 = 0
+      while pi0 < params.len() do
+        let pt = params[pi0]
+        inst_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, &mut gvar_map), convention: pt.convention })
+        pi0 = pi0 + 1
+      end
+      # Snapshot the generic parameters that appear in the callee's argument
+      # signature: only these must be solved by argument unification.
+      # Parameters appearing only in the return type are solved by the
+      # caller's context (`let v: Vec[Int] = Vec::new()` inference) — the
+      # std's `__intrinsic_array_new[T]() -> Array[T]` calls rely on this.
+      var arg_param_names = Vec::new()
+      let snapshot_entries = gvar_map.entries()
+      var sei = 0
+      while sei < snapshot_entries.len() do
+        arg_param_names.push(snapshot_entries[sei].0.clone())
+        sei = sei + 1
+      end
+      let inst_ret = instantiate_generic_type(env, &ret, &mut gvar_map)
       # Enforce exact arity for non-variadic callables: every declared
       # parameter must have a supplied argument and every argument must
       # map to a declared parameter. Silently accepting extra arguments
@@ -4605,18 +6420,38 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # fn(Int) -> Int could be invoked with two arguments and vice versa.
       # (Default arguments are deprecated/unused in this codebase — no call
       # site omits a defaulted parameter — so exact equality is correct.)
-      if args.len() != params.len() then
+      if args.len() != inst_params.len() then
         type_add_error(env, "wrong number of arguments: expected " +
-          params.len().to_string() + ", found " + args.len().to_string(), expr.span)
+          inst_params.len().to_string() + ", found " + args.len().to_string(), expr.span)
       end
       var pi = 0
-      while pi < args.len() && pi < params.len() do
-        let pt = params[pi]
+      while pi < args.len() && pi < inst_params.len() do
+        let pt = inst_params[pi]
         unify(env, arg_types[pi], pt.ty, args[pi].span)
         record_arg_effect(env, &args[pi], pt.convention)
         pi = pi + 1
       end
-      unify(env, ret_type, ret, expr.span)
+      unify(env, ret_type, inst_ret, expr.span)
+      # FIX 1 verification: every generic parameter of the callee that
+      # appears in the call's argument signature must be SOLVED after the
+      # argument unification; an unsolved parameter (e.g. one that cannot be
+      # inferred from the arguments) is a hard error.
+      var gi = 0
+      while gi < arg_param_names.len() do
+        match gvar_map.get(&arg_param_names[gi])
+        when Option::Some(v) then
+          match resolve_type_var(env, v)
+          when Type::Var(_) then
+            type_add_error(env, "cannot infer type parameter `" + arg_param_names[gi] + "`", expr.span)
+          when _ then ()
+          end
+        when Option::None then ()
+        end
+        gi = gi + 1
+      end
+      if !gvar_map.is_empty() then
+        call_was_generic = true
+      end
       # Shared intrinsic reads (__intrinsic_array_get / __intrinsic_map_get)
       # return OWNED elements from a SHARED container — the same
       # resource-duplication hole as the get() methods. Reject them for
@@ -4703,7 +6538,14 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       end
     when Option::None then ()
     end
-    ret_type
+    if call_was_generic then
+      # The result type uses the solved substitution: the fresh ret variable
+      # is bound to the instantiated return type, so resolving it yields the
+      # concrete instantiation.
+      resolve_type_var(env, ret_type)
+    else
+      ret_type
+    end
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
     env.access_marker_depth = env.access_marker_depth + 1
     let recv_type = check_expr(env, &recv)
@@ -4793,11 +6635,18 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::ExprFieldAccess(recv, field) then
     let recv_type = check_expr(env, &recv)
     let fdid = field_target_of(env, &recv_type, field)
+    # The FieldId (owner TypeId + index) is the semantic field identity: it is
+    # recorded in typed_field_targets (Map[Int, FieldId]) and the field's type
+    # is resolved BY ID from it. The name-based resolve_field_type remains
+    # only for access forms that carry no FieldId (tuple indices,
+    # String/Slice/Array len/cap) and for diagnostics.
     match fdid
-    when Option::Some(fid) then env.typed_field_targets.insert(expr.node_id, fid)
-    when Option::None then ()
+    when Option::Some(fid) then
+      env.typed_field_targets.insert(expr.node_id, fid.clone())
+      field_type_by_id(env, &recv_type, fid.owner.clone(), fid.index, field, expr.span)
+    when Option::None then
+      resolve_field_type(env, &recv_type, field, expr.span)
     end
-    resolve_field_type(env, &recv_type, field, expr.span)
   when ExprKind::ExprIndex(recv, index) then
     let recv_type = check_expr(env, &recv)
     let index_type = check_expr(env, &index)
@@ -5081,7 +6930,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       when Option::Some(te) then resolve_type_expr(env, &te)
       when Option::None then fresh_type_var(env)
       end
-      check_pattern(env, &p.pat, ty)
+      check_pattern(env, &p.pat, ty, "closure parameter")
       param_types.push(ParamType { ty: ty, convention: AccessConvention::Let })
       i = i + 1
     end
@@ -5091,15 +6940,20 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     pop_scope(env)
     Type::Function(param_types, body_type)
   when ExprKind::ExprIf(if_stmt) then
-    check_if_stmt(env, &if_stmt, false)
+    # P0-M: an if used as a value contributes its flow's normal type (with
+    # the Unit false-path rule for a missing else enforced inside).
+    check_if_stmt(env, &if_stmt, false).normal
   when ExprKind::ExprMatch(m) then
-    check_match(env, &m, false)
+    # P0-M: a value-producing match contributes its flow's normal type.
+    # P1 (FIX 3): non-exhaustive matches over closed enums are errors in
+    # statement position too (see check_match).
+    check_match(env, &m, false).normal
   when ExprKind::ExprBlock(block) then
-    check_block(env, &block, true)
+    check_block(env, &block, true).normal
   when ExprKind::ExprUnsafe(_, block) then
-    check_block(env, &block, true)
+    check_block(env, &block, true).normal
   when ExprKind::ExprAsync(block) then
-    let inner = check_block(env, &block, true)
+    let inner = check_block(env, &block, true).normal
     inner  # In full impl, would wrap in Future/Async
   when ExprKind::ExprAwait(inner) then
     let inner_type = check_expr(env, &inner)
@@ -5129,37 +6983,83 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     check_expr(env, &right)
   when ExprKind::ExprPath(path) then
     match lookup_var(env, path.segments[0])
-    when Option::Some(ty) then ty
-    when Option::None then fresh_type_var(env)
+    when Option::Some(ty) then
+      # P0-A (final layer): a path whose first segment is a program-level
+      # callable (scope 0) goes through the module-qualified identity check,
+      # same as bare ExprIdent (see resolve_bare_callable).
+      if var_is_global_callable(env, &path.segments[0]) then
+        resolve_bare_callable(env, path.segments[0].clone(), expr.span, ty.clone())
+      else
+        ty
+      end
+    when Option::None then
+      # Enum variant paths in value position (e.g. `Option::None`): type the
+      # expression from the OWNER enum's TypeId. The variant name is only the
+      # join key into the checker's tables; the semantic result is id-based
+      # (Type::Named(enum_td.id, ...)) or the canonical builtin forms.
+      if path.segments.len() >= 2 then
+        let variant_name = path.segments[path.segments.len() - 1]
+        let enum_name = path.segments[path.segments.len() - 2]
+        match find_enum_variant(env, variant_name.clone())
+        when Option::Some((enum_td, _)) then
+          if enum_td.name == enum_name then
+            let enum_type_args = fresh_type_args_for(env, &enum_td)
+            if enum_td.name == "Result" then
+              Type::Result(fresh_type_var(env), fresh_type_var(env))
+            elsif enum_td.name == "Option" then
+              Type::Option(fresh_type_var(env))
+            else
+              Type::Named(enum_td.id, enum_type_args)
+            end
+          else
+            fresh_type_var(env)
+          end
+        when Option::None then fresh_type_var(env)
+        end
+      else
+        fresh_type_var(env)
+      end
     end
   when ExprKind::ExprEnumVariant(path, args) then
-    # Resolve well-known variant constructors to their canonical container type
-    # so `Result::Ok(x)` / `Option::Some(x)` produce a Result/Option, not a
-    # fresh var (which otherwise lets an `if` branch silently type as Unit).
+    # ID-based variant typing: find_enum_variant locates the OWNER enum by
+    # variant name (the only join key between the source text and the
+    # checker's type tables), and the semantic result type is built from the
+    # owner's TypeId — Type::Named(td.id, ...) for user enums, the canonical
+    # Type::Option / Type::Result forms for the builtin enums. The variant
+    # name never decides the result type.
     let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
-    # Exact-arity rule for enum variant construction: the number of supplied
-    # payload arguments must equal the variant's declared field count (the
-    # same soundness requirement as function calls — a variant with N fields
-    # cannot be constructed with M != N payloads).
     match find_enum_variant(env, variant_name.clone())
-    when Option::Some((_, variant)) then
+    when Option::Some((enum_td, variant)) then
+      # Exact-arity rule for enum variant construction: the number of
+      # supplied payload arguments must equal the variant's declared field
+      # count (the same soundness requirement as function calls).
       if args.len() != variant.fields.len() then
         type_add_error(env, "wrong number of arguments: variant `" + variant_name + "` expects " +
           variant.fields.len().to_string() + " field(s), found " + args.len().to_string(), expr.span)
       end
-    when Option::None then ()
-    end
-    let v1 = fresh_type_var(env)
-    if variant_name == "Ok" || variant_name == "Err" then
-      Type::Result(v1, fresh_type_var(env))
-    elsif variant_name == "Some" || variant_name == "None" then
-      Type::Option(v1)
-    else
-      fresh_type_var(env)
+      let enum_type_args = fresh_type_args_for(env, &enum_td)
+      if enum_td.name == "Result" then
+        Type::Result(fresh_type_var(env), fresh_type_var(env))
+      elsif enum_td.name == "Option" then
+        Type::Option(fresh_type_var(env))
+      else
+        Type::Named(enum_td.id, enum_type_args)
+      end
+    when Option::None then
+      # The variant is not registered in any checker-known enum: fall back to
+      # the canonical builtin forms by name (diagnostic-grade fallback only).
+      let v1 = fresh_type_var(env)
+      if variant_name == "Ok" || variant_name == "Err" then
+        Type::Result(v1, fresh_type_var(env))
+      elsif variant_name == "Some" || variant_name == "None" then
+        Type::Option(v1)
+      else
+        fresh_type_var(env)
+      end
     end
   when ExprKind::ExprComptime(block) then
-    check_block(env, &block, true)
+    check_block(env, &block, true).normal
   when _ then Type::Error
   end
   if expr.node_id != 0 then
@@ -5296,6 +7196,192 @@ def impl_for_type_matches(impl_for_type: &Type, recv_named: &Type) -> Bool
   end
 end
 
+# FIX 1 (P0-F): instantiate a generic signature ONCE per call. Every
+# Type::Param(name) occurrence becomes the SAME fresh inference variable for
+# the whole call (parameters and return type share it), eliminating the
+# wildcard behavior where each occurrence of T could independently match
+# anything. `var_map` carries name -> inference variable across the
+# parameters and the return type of one call.
+def instantiate_generic_type(env: &mut TypeEnv, ty: &Type, var_map: &mut Map[String, Type]) -> Type
+  match ty
+  when Type::Param(name) then
+    match var_map.get(&name)
+    when Option::Some(v) then v.clone()
+    when Option::None then
+      let v = fresh_type_var(env)
+      var_map.insert(name.clone(), v.clone())
+      v
+    end
+  when Type::Named(tid, args) then
+    var new_args = Vec::new()
+    var i = 0
+    while i < args.len() do
+      new_args.push(instantiate_generic_type(env, &args[i], var_map))
+      i = i + 1
+    end
+    Type::Named(tid, new_args)
+  when Type::RefInternal(inner, mutable) then Type::RefInternal(instantiate_generic_type(env, inner, var_map), mutable)
+  when Type::Ptr(inner) then Type::Ptr(instantiate_generic_type(env, inner, var_map))
+  when Type::PtrMut(inner) then Type::PtrMut(instantiate_generic_type(env, inner, var_map))
+  when Type::Box(inner) then Type::Box(instantiate_generic_type(env, inner, var_map))
+  when Type::Rc(inner) then Type::Rc(instantiate_generic_type(env, inner, var_map))
+  when Type::Option(inner) then Type::Option(instantiate_generic_type(env, inner, var_map))
+  when Type::Result(ok, err) then Type::Result(instantiate_generic_type(env, ok, var_map), instantiate_generic_type(env, err, var_map))
+  when Type::Map(k, v) then Type::Map(instantiate_generic_type(env, k, var_map), instantiate_generic_type(env, v, var_map))
+  when Type::Set(inner) then Type::Set(instantiate_generic_type(env, inner, var_map))
+  when Type::Tuple(fields) then
+    var new_fields = Vec::new()
+    var i = 0
+    while i < fields.len() do
+      new_fields.push(instantiate_generic_type(env, &fields[i], var_map))
+      i = i + 1
+    end
+    Type::Tuple(new_fields)
+  when Type::Function(params, ret) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, var_map), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Function(new_params, instantiate_generic_type(env, ret, var_map))
+  when Type::Array(inner, n) then Type::Array(instantiate_generic_type(env, inner, var_map), n)
+  when Type::Slice(inner) then Type::Slice(instantiate_generic_type(env, inner, var_map))
+  when Type::Effect(_, inner) then Type::Effect(Vec::new(), instantiate_generic_type(env, inner, var_map))
+  when _ then ty.clone()
+  end
+end
+
+# FIX 1 (P0-F): instantiate an impl method's generic parameters ONCE per
+# call. Impl-level parameters are solved by unifying the instantiated impl
+# HEAD with the concrete receiver; method-level parameters by explicit type
+# arguments or by unifying the arguments against the instantiated signature.
+# The substitution always comes from head unification, never from
+# generic-parameter index. After solving, every generic parameter of the
+# callee must be bound; an unsolved one is reported as
+# "cannot infer type parameter `T`".
+def instantiate_method_type(env: &mut TypeEnv, imp: &ImplInfo, m: &MethodInfo, recv_type: &Type, arg_types: &Vec[Type], method_type_args: &Vec[Type], span: Span) -> Type
+  let names = impl_param_names(env, &imp.for_type)
+  var impl_vars = Vec::new()
+  var i = 0
+  while i < names.len() do
+    impl_vars.push(fresh_type_var(env))
+    i = i + 1
+  end
+  let head_inst = subst_type_args(&imp.for_type, &names, &impl_vars)
+  let head_ok = try_head_unify(env, head_inst, recv_type.clone())
+  var method_vars = Vec::new()
+  let explicit = method_type_args.len() > 0
+  var j = 0
+  while j < m.generic_params.len() do
+    if explicit && j < method_type_args.len() then
+      method_vars.push(method_type_args[j].clone())
+    else
+      method_vars.push(fresh_type_var(env))
+    end
+    j = j + 1
+  end
+  # Combined substitution: impl params first, then method-level params. A
+  # method param shadowing an impl param keeps the impl binding.
+  var all_names = Vec::new()
+  var all_vars = Vec::new()
+  var method_shadowed = Vec::new()
+  var k = 0
+  while k < names.len() do
+    all_names.push(names[k].clone())
+    all_vars.push(impl_vars[k].clone())
+    k = k + 1
+  end
+  var k2 = 0
+  while k2 < m.generic_params.len() do
+    var shadowed = false
+    var s = 0
+    while s < names.len() do
+      if names[s] == m.generic_params[k2] then shadowed = true end
+      s = s + 1
+    end
+    method_shadowed.push(shadowed)
+    if !shadowed then
+      all_names.push(m.generic_params[k2].clone())
+      all_vars.push(method_vars[k2].clone())
+    end
+    k2 = k2 + 1
+  end
+  # Instantiate the method signature with the SAME variables used for the
+  # head: one inference variable per generic parameter for the whole call.
+  var inst_params = Vec::new()
+  var pi = 0
+  while pi < m.params.len() do
+    let pt = m.params[pi]
+    inst_params.push(ParamType { ty: subst_type_args(&pt.ty, &all_names, &all_vars), convention: pt.convention })
+    pi = pi + 1
+  end
+  let inst_ret = subst_type_args(&m.ret_type, &all_names, &all_vars)
+  # Unify the arguments against the instantiated signature (the receiver
+  # self parameter excluded). This is what solves method-level inference
+  # variables such as U in `map[U]`.
+  let self_offset = if m.params.len() > 0 && m.params[0].name == "self" then 1 else 0 end
+  var ai = self_offset
+  while ai < inst_params.len() do
+    let arg_idx = ai - self_offset
+    if arg_idx < arg_types.len() then
+      unify(env, arg_types[arg_idx].clone(), inst_params[ai].ty.clone(), span)
+    end
+    ai = ai + 1
+  end
+  if head_ok then
+    # FIX 1 verification: every generic parameter of the callee must be
+    # SOLVED. Impl-level params are solved by the receiver (head)
+    # unification; method-level params (when not given explicitly) by the
+    # arguments. A method-level param appearing only in the return type is
+    # solved by the caller's context and is not reported here (same rule as
+    # plain ExprCall).
+    var method_param_names: Vec[String] = Vec::new()
+    var mpi = 0
+    while mpi < m.params.len() do
+      collect_param_names_from_type(env, &m.params[mpi].ty, &mut method_param_names)
+      mpi = mpi + 1
+    end
+    var vi = 0
+    while vi < impl_vars.len() do
+      match resolve_type_var(env, impl_vars[vi].clone())
+      when Type::Var(_) then
+        type_add_error(env, "cannot infer type parameter `" + names[vi] + "`", span)
+      when _ then ()
+      end
+      vi = vi + 1
+    end
+    if !explicit then
+      var vj = 0
+      while vj < method_vars.len() do
+        if !method_shadowed[vj] then
+          var in_params = false
+          var mp2 = 0
+          while mp2 < method_param_names.len() do
+            if method_param_names[mp2] == m.generic_params[vj] then in_params = true end
+            mp2 = mp2 + 1
+          end
+          if in_params then
+            match resolve_type_var(env, method_vars[vj].clone())
+            when Type::Var(_) then
+              type_add_error(env, "cannot infer type parameter `" + m.generic_params[vj] + "`", span)
+            when _ then ()
+            end
+          end
+        end
+        vj = vj + 1
+      end
+    end
+    resolve_type_var(env, inst_ret)
+  else
+    # The impl head does not unify with this receiver instantiation (e.g. a
+    # concrete-head impl selected by TypeId for a different instantiation);
+    # fall back to the declared return type.
+    m.ret_type
+  end
+end
+
 def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg_types: &Vec[Type], method_type_args: &Vec[Type], span: Span) -> Type
   # Auto-deref through references
   let base = match recv_type
@@ -5343,9 +7429,13 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
               while mi2 < imp.methods.len() do
                 let m = imp.methods[mi2]
                 if m.name == method then
-                  # Substitute method-level generic params with provided type args
-                  if m.generic_params.len() > 0 && method_type_args.len() > 0 then
-                    return subst_type_args(&m.ret_type, &m.generic_params, method_type_args)
+                  # FIX 1 (P0-F): explicit generic instantiation — one
+                  # inference variable per generic parameter for the whole
+                  # call, solved by impl-HEAD unification with the receiver
+                  # and by argument unification; the return type is the
+                  # solved substitution.
+                  if impl_param_names(env, &imp.for_type).len() > 0 || m.generic_params.len() > 0 then
+                    return instantiate_method_type(env, &imp, &m, &resolved_base, arg_types, method_type_args, span)
                   else
                     return m.ret_type
                   end
@@ -5552,8 +7642,11 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
               while mi3 < imp.methods.len() do
                 let m = imp.methods[mi3]
                 if m.name == method then
-                  if m.generic_params.len() > 0 && method_type_args.len() > 0 then
-                    return subst_type_args(&m.ret_type, &m.generic_params, method_type_args)
+                  # FIX 1 (P0-F): explicit generic instantiation (see
+                  # section 1) — same inference-variable discipline for
+                  # trait-impl methods.
+                  if impl_param_names(env, &imp.for_type).len() > 0 || m.generic_params.len() > 0 then
+                    return instantiate_method_type(env, &imp, &m, &resolved_base, arg_types, method_type_args, span)
                   else
                     return m.ret_type
                   end
@@ -5790,8 +7883,12 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
       match lookup_var(env, name.clone())
       when Option::Some(ty) then ty
       when Option::None then
-        match get_type_def_by_name(env, name.clone())
-        when Option::Some(type_def) then
+        # P0-A (next layer): bare-name resolution — local-module shadowing
+        # and cross-module ambiguity verification live here (see
+        # resolve_bare_type_name); the first-wins entry is the fallback.
+        match resolve_bare_type_name(env, name.clone(), te.span)
+        when Option::Some(idx) then
+          let type_def = env.type_list[idx]
           var resolved_args = Vec::new()
           var i = 0
           while i < args.len() do
@@ -5913,36 +8010,49 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
         full_name = full_name + segs[jk].clone()
         jk = jk + 1
       end
-      match get_type_def_by_name(env, full_name.clone())
-      when Option::Some(type_def) then
+      # P0-A (next layer): a path-qualified type reference resolves through
+      # the module-qualified type-name map first (module_type_names — the
+      # qualified identity recorded at type-registration time), then the
+      # existing flat full-name fallback (auto-registered opaque full
+      # names), then the bare-name fallback with ambiguity verification.
+      match env.module_type_names.get(full_name.clone())
+      when Option::Some(idx) then
+        let type_def = env.type_list[idx]
         # Use canonical Type representation so unification works correctly
         type_def_to_canonical(env, &type_def)
       when Option::None then
-        # Try the last segment alone
-        let last = segs[segs.len() - 1].clone()
-        match get_type_def_by_name(env, last)
+        match get_type_def_by_name(env, full_name.clone())
         when Option::Some(type_def) then
           # Use canonical Type representation so unification works correctly
           type_def_to_canonical(env, &type_def)
         when Option::None then
-          # Auto-register unknown qualified type paths as opaque to prevent
-          # cascading errors. This mirrors the opaque fallback in the Named
-          # handler above and ensures all references to the same unknown
-          # qualified type resolve to the same TypeId.
-          let id_num = env.type_id_counter
-          let opaque_id = TypeId { id: id_num }
-          env.type_id_counter = env.type_id_counter + 1
-          let opaque_td = TypeDef {
-            id: opaque_id,
-            name: full_name.clone(),
-            def_kind: TypeDefKind::Opaque,
-            generic_params: Vec::new(),
-            kind: TypeKind::Value
-          }
-          env.type_name_index.insert(full_name.clone(), env.type_list.len())
-          env.type_id_index.insert(id_num, env.type_list.len())
-          env.type_list.push(opaque_td)
-          Type::Named(opaque_id, Vec::new())
+          # Try the last segment alone
+          let last = segs[segs.len() - 1].clone()
+          match resolve_bare_type_name(env, last, te.span)
+          when Option::Some(idx) then
+            let type_def = env.type_list[idx]
+            # Use canonical Type representation so unification works correctly
+            type_def_to_canonical(env, &type_def)
+          when Option::None then
+            # Auto-register unknown qualified type paths as opaque to prevent
+            # cascading errors. This mirrors the opaque fallback in the Named
+            # handler above and ensures all references to the same unknown
+            # qualified type resolve to the same TypeId.
+            let id_num = env.type_id_counter
+            let opaque_id = TypeId { id: id_num }
+            env.type_id_counter = env.type_id_counter + 1
+            let opaque_td = TypeDef {
+              id: opaque_id,
+              name: full_name.clone(),
+              def_kind: TypeDefKind::Opaque,
+              generic_params: Vec::new(),
+              kind: TypeKind::Value
+            }
+            env.type_name_index.insert(full_name.clone(), env.type_list.len())
+            env.type_id_index.insert(id_num, env.type_list.len())
+            env.type_list.push(opaque_td)
+            Type::Named(opaque_id, Vec::new())
+          end
         end
       end
     else
@@ -6037,15 +8147,19 @@ def resolve_imports(env: &mut TypeEnv, program: &Program, loaded: &mut Set[Strin
         # Pass 1: Pre-register all type names (enables forward references)
         # Use indexed borrow (&items[i]) to avoid stage0 codegen bug that
         # corrupts enum payloads when an Item is copied out of a Vec.
+        # P0-A (next layer): this legacy permissive path runs without
+        # resolutions (module_type_names stays empty), so the root module
+        # path is passed — qualified registration is a no-op here.
         var i = 0
+        let root_path: Vec[String] = Vec::new()
         while i < dep_ast.items.len() do
-          pre_register_type_name(env, &dep_ast.items[i])
+          pre_register_type_name(env, &dep_ast.items[i], &root_path)
           i = i + 1
         end
         # Pass 2: Collect full type definitions (field types, variant types, etc.)
         i = 0
         while i < dep_ast.items.len() do
-          collect_type_def(env, &dep_ast.items[i])
+          collect_type_def(env, &dep_ast.items[i], &root_path)
           i = i + 1
         end
       when Result::Err(_) then
@@ -6055,6 +8169,95 @@ def resolve_imports(env: &mut TypeEnv, program: &Program, loaded: &mut Set[Strin
     end
   end
   propagate_resource_kinds(env)
+end
+
+# ———————————————————————————————————————————————————————————————
+# P1 (recovery separation): post-check verification
+# ———————————————————————————————————————————————————————————————
+#
+# The semantic pass must guarantee that a codegenable TypedProgram carries no
+# unresolved semantic state. This walk runs after the type check succeeds and
+# rejects:
+#   - Type::Error anywhere in expr_types (MIR's own P0-AN verifier does NOT
+#     check Type::Error, so the semantic pass is the enforcement point), and
+#   - Type::Var that the final substitution cannot resolve (a var with no
+#     substitution entry would reach MIR/codegen unresolved). Vars that the
+#     substitution DOES solve are genuinely pending inference that became
+#     concrete — acceptable.
+# Type::Param is ALLOWED: it is the bound generic parameter of a generic
+# template, the template's normal state which MIR lowers as a generic
+# function and codegen resolves at monomorphization. The MIR P0-AN verifier
+# already rejects Param leaking into non-generic functions.
+def verify_codegen_readiness(env: &mut TypeEnv) -> Unit
+  let entries = env.typed_expr_types.entries()
+  var i = 0
+  while i < entries.len() do
+    let node_id = entries[i].0
+    let ty = entries[i].1
+    var has_error = false
+    var has_var = false
+    scan_codegen_type(env, &ty, &mut has_error, &mut has_var)
+    if has_error then
+      type_add_error(env, "unresolved Type::Error in the type of expression node " + node_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if has_var then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the type of expression node " + node_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    i = i + 1
+  end
+end
+
+def scan_codegen_type(env: &TypeEnv, ty: &Type, has_error: &mut Bool, has_var: &mut Bool) -> Unit
+  match ty
+  when Type::Error then
+    has_error = true
+  when Type::Var(id) then
+    # A var with a substitution entry is pending inference that resolved to
+    # concrete state; chase it. A var with NO entry would stay unresolved in
+    # the codegenable program — rejected.
+    match env.subst.get(id)
+    when Option::Some(resolved) then
+      scan_codegen_type(env, &resolved, has_error, has_var)
+    when Option::None then
+      has_var = true
+    end
+  when Type::Named(_, args) then
+    var i = 0
+    while i < args.len() do
+      scan_codegen_type(env, &args[i], has_error, has_var)
+      i = i + 1
+    end
+  when Type::Function(params, ret) then
+    var i = 0
+    while i < params.len() do
+      scan_codegen_type(env, &params[i].ty, has_error, has_var)
+      i = i + 1
+    end
+    scan_codegen_type(env, &ret, has_error, has_var)
+  when Type::RefInternal(inner, _) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Ptr(inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::PtrMut(inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Box(inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Rc(inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Effect(_, inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Tuple(elems) then
+    var i = 0
+    while i < elems.len() do
+      scan_codegen_type(env, &elems[i], has_error, has_var)
+      i = i + 1
+    end
+  when Type::Array(elem, _) then scan_codegen_type(env, &elem, has_error, has_var)
+  when Type::Slice(elem) then scan_codegen_type(env, &elem, has_error, has_var)
+  when Type::Option(inner) then scan_codegen_type(env, &inner, has_error, has_var)
+  when Type::Result(ok, err) then
+    scan_codegen_type(env, &ok, has_error, has_var)
+    scan_codegen_type(env, &err, has_error, has_var)
+  when Type::Map(key, val) then
+    scan_codegen_type(env, &key, has_error, has_var)
+    scan_codegen_type(env, &val, has_error, has_var)
+  when Type::Set(elem) then scan_codegen_type(env, &elem, has_error, has_var)
+  when _ then ()
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -6084,8 +8287,24 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   env.typed_access_effects.clear()
   env.typed_aggregate_ownership.clear()
   env.closure_captures.clear()
+  env.binding_plans.clear()
+  env.pattern_variant_resolutions.clear()
   env.resolutions = Option::Some(resolutions.clone())
+  # P1 (recovery separation): type_check_typed is the only entry that
+  # produces a TypedProgram — the semantic authority MIR and codegen
+  # consume. Compilation semantics here are therefore ALWAYS strict. Guard:
+  # a real compilation running with strict_resolution = false is an internal
+  # error; the flag is forced on unconditionally so the permissive
+  # (editor-recovery) mode can never reach MIR/codegen — it is served only
+  # by type_check / type_check_strict, which return errors alone and never
+  # produce a codegenable TypedProgram.
+  env.strict_resolution = true
   type_check_program_env(env, program)
+  # P1 (recovery separation): post-check verification — the semantic pass
+  # must guarantee that no Type::Error and no unresolved inference variable
+  # survives in a codegenable TypedProgram. Each finding records a TypeError
+  # so compilation aborts before MIR lowering.
+  verify_codegen_readiness(env)
   var kinds = Map::new()
   var type_names = Map::new()
   var deinit_targets = Map::new()
@@ -6186,6 +8405,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     deinit_plans: Map::new(),
     aggregate_ownership: Map::new(),
     finalize_plan: Map::new(),
+    edge_cleanup: Map::new(),
     type_names: type_names.clone(),
     deinit_targets: deinit_targets.clone(),
     type_fields: type_fields.clone(),
@@ -6217,6 +8437,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     deinit_plans: deinit_plans,
     aggregate_ownership: env.typed_aggregate_ownership.clone(),
     finalize_plan: Map::new(),
+    edge_cleanup: Map::new(),
     type_names: type_names,
     deinit_targets: deinit_targets,
     type_fields: type_fields,

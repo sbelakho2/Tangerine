@@ -85,6 +85,249 @@ enum LayoutCategory
   FunctionType
 end
 
+# ———————————————————————————————————————————————————————————————
+# P0-AR: Runtime Value Representation — THE DECISION TABLE
+# ———————————————————————————————————————————————————————————————
+# ONE place states how every fundamental type's runtime value is stored.
+# Every layout query (size_of, align_of, layout_of, struct field placement,
+# enum payload placement, tuple element placement, container header sizes)
+# consults type_repr and NEVER re-decides the storage shape.
+#
+#   TYPE                                 | REPRESENTATION  | OWNS MEMORY | COPY OP
+#   —————————————————————————————————————+—————————————————+—————————————+——————————
+#   Int, UInt, Float, Char, Bool,         |                 |             |
+#     I8..I128, U8..U128, ISize, USize,   |                 |             |
+#     F32, F64, Unit, Never               | Immediate       | No          | bit
+#   Ptr[T], PtrMut[T], RefInternal        | RawPtr          | No          | bit
+#   Box[T], Rc[T]                         | RawPtr          | Yes         | move
+#   String                                | StringPtr       | Yes         | clone
+#   Vec[T], Array[T, 0]                   | HeapVecHeader   | Yes         | move + clone
+#   Array[T, N] (N > 0)                   | Inline          | N elements  | structural
+#   Slice[T]                              | HeapVecHeader   | No          | bit
+#   Map[K,V]                              | HeapMapHeader   | Yes         | move + clone
+#   Set[T]                                | HeapSetHeader   | Yes         | move + clone
+#   struct                                | Inline          | fields      | structural
+#   enum                                  | Inline (tagged) | variants    | structural
+#   Option[T], Result[T,E], Dyn[T],       |                 |             |
+#     Effect, Var, Param, unknown         | OpaquePtr       | payload     | move + clone
+#   Function                              | OpaquePtr       | env: Yes    | move
+#
+# Heap header sizes (F2 FROZEN — must agree with codegen/runtime; the value
+# itself is always ONE pointer-width handle, these are the sizes of the
+# heap objects the handle points at):
+#   StringPtr     -> 8   (raw pointer to null-terminated UTF-8; NO inline header)
+#   HeapVecHeader -> 24  ({ptr:0, len:8, cap:16})
+#   HeapMapHeader -> 48  ({buckets:0, len:8, cap:16, hash_fn:24})
+#   HeapSetHeader -> 32  ({map:0, len:8})
+#
+#   Storage size rules derived from this table (repr_storage_size):
+#   Immediate  -> the intrinsic primitive size (primitive_size)
+#   RawPtr, StringPtr, Heap*, TaggedPtr -> target.pointer_size (8)
+#   Inline     -> the full inline aggregate size (struct/enum/tuple/fixed array)
+#   OpaquePtr  -> target.fn_ptr_size for Function, else target.pointer_size
+#
+# FIXED ARRAYS (P0-P): the Type::Array(elem, count) count decides the
+# representation.  Array[T, N] with N > 0 is a fixed inline array; Array[T, 0]
+# is the heap vector handle (Vec).  A positive count means N elements stored
+# inline with the element's storage size and alignment
+# (size = N * elem_stride, aligned to the element's alignment); count 0/absent
+# (the heap-vector sentinel the codebase uses, e.g. the Vec alias) stays the
+# pointer to a heap {ptr,len,cap} header (HeapVecHeader).
+#
+# (TaggedPtr is reserved: codegen's inline-tag shortcut for payload-less
+# enums (< 256 discriminants stored as raw integers, >= 256 as heap
+# pointers to the tagged-inline image described by F3) is an encoding
+# optimization over the Inline (tagged) representation the engine computes.)
+
+enum Repr
+  Immediate      # value bits ARE the value (primitives, Unit, Never)
+  RawPtr         # raw pointer to memory (Ptr/PtrMut/Box/Rc/RefInternal)
+  StringPtr      # 8-byte raw pointer to null-terminated UTF-8 (FROZEN String ABI)
+  HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array/Slice)
+  HeapMapHeader  # pointer to a heap Map header
+  HeapSetHeader  # pointer to a heap Set header
+  Inline         # stored field-by-field inline (structs, tagged enums, tuples)
+  TaggedPtr      # reserved: pointer with tag bits (not used by the engine today)
+  OpaquePtr      # opaque pointer-sized handle (Option/Result/Dyn/Effect/Function/unknown)
+end
+
+# THE single decision function: the representation of a type's runtime
+# value, per the DECIDED model documented above.  Every storage-shape
+# decision in this engine reads from here.
+def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
+  match ty
+  when Type::Unit    then Repr::Immediate
+  when Type::Bool    then Repr::Immediate
+  when Type::Int     then Repr::Immediate
+  when Type::UInt    then Repr::Immediate
+  when Type::Float   then Repr::Immediate
+  when Type::Char    then Repr::Immediate
+  when Type::Never   then Repr::Immediate
+  when Type::I8      then Repr::Immediate
+  when Type::I16     then Repr::Immediate
+  when Type::I32     then Repr::Immediate
+  when Type::I64     then Repr::Immediate
+  when Type::I128    then Repr::Immediate
+  when Type::U8      then Repr::Immediate
+  when Type::U16     then Repr::Immediate
+  when Type::U32     then Repr::Immediate
+  when Type::U64     then Repr::Immediate
+  when Type::U128    then Repr::Immediate
+  when Type::ISize   then Repr::Immediate
+  when Type::USize   then Repr::Immediate
+  when Type::F32     then Repr::Immediate
+  when Type::F64     then Repr::Immediate
+  when Type::String  then Repr::StringPtr
+  when Type::RefInternal(_, _) then Repr::RawPtr
+  when Type::Ptr(_)        then Repr::RawPtr
+  when Type::PtrMut(_)     then Repr::RawPtr
+  when Type::Box(_)        then Repr::RawPtr
+  when Type::Rc(_)         then Repr::RawPtr
+  when Type::Slice(_)      then Repr::HeapVecHeader
+  # Array[T, N] with N > 0 is a fixed inline array; Array[T, 0] is the heap
+  # vector handle (Vec).  The count is the single discriminator: the fixed
+  # form stores N elements inline with the element's storage size/alignment,
+  # the heap form is a pointer to a {ptr,len,cap} header.
+  when Type::Array(_, count) then
+    if count > 0 then Repr::Inline else Repr::HeapVecHeader end
+  when Type::Map(_, _)     then Repr::HeapMapHeader
+  when Type::Set(_)        then Repr::HeapSetHeader
+  when Type::Option(_)     then Repr::OpaquePtr
+  when Type::Result(_, _)  then Repr::OpaquePtr
+  when Type::Function(_, _) then Repr::OpaquePtr
+  when Type::Dyn(_)        then Repr::OpaquePtr
+  when Type::Effect(_, _)  then Repr::OpaquePtr
+  when Type::Tuple(_)      then Repr::Inline
+  when Type::Named(tid, _) then named_type_repr(engine, tid.id)
+  when Type::Var(_)        then Repr::OpaquePtr
+  when Type::Param(_)      then Repr::OpaquePtr
+  when Type::Error         then Repr::OpaquePtr
+  when _                   then Repr::OpaquePtr
+  end
+end
+
+# F2 container name -> representation (mirror of container_header_size).
+# The engine never sees "Vec"/"Array"/"Map"/"Set"/"String" as registered
+# struct definitions (Vec[T] lowers to Type::Array, Map/Set are Type
+# variants), but the name keys are the frozen F2 ABI table and keep the
+# header sizes in the decision table.
+def container_repr_for_name(type_name: &String) -> Repr
+  if type_name == "String" then Repr::StringPtr
+  else if type_name == "Vec" || type_name == "Array" then Repr::HeapVecHeader
+  else if type_name == "Map" || type_name == "HashMap" then Repr::HeapMapHeader
+  else if type_name == "Set" || type_name == "HashSet" then Repr::HeapSetHeader
+  else Repr::OpaquePtr
+  end
+end
+
+# Representation of a registered named type (struct/enum).  Container names
+# win over the definition kind: a Named "Vec" is a compiler intrinsic whose
+# value is a heap header handle, never an inline aggregate.
+def named_type_repr(engine: &LayoutEngine, type_id: Int) -> Repr
+  let name = lookup_type_name(engine, type_id)
+  let container_repr = container_repr_for_name(&name)
+  if container_repr != Repr::OpaquePtr then
+    return container_repr
+  end
+
+  # Registered definitions: structs and enums are stored inline (F7/F3).
+  for td in engine.type_defs do
+    if td.id.id == type_id then
+      match td.kind
+      when MirTypeDefKind::Struct(_) then return Repr::Inline
+      when MirTypeDefKind::Enum(_)   then return Repr::Inline
+      end
+    end
+  end
+
+  # Unregistered (generic-parameter placeholder, unknown): opaque handle.
+  Repr::OpaquePtr
+end
+
+# Heap header size for a representation (F2 FROZEN; 0 = no heap header).
+def repr_header_size(repr: Repr) -> Int
+  match repr
+  when Repr::StringPtr     then 8
+  when Repr::HeapVecHeader then 24
+  when Repr::HeapMapHeader then 48
+  when Repr::HeapSetHeader then 32
+  when _                   then 0
+  end
+end
+
+# The byte size a value of `ty` occupies in a storage slot (struct field,
+# enum payload field, tuple element, or any slot that holds the value).
+# This is the ONE storage decision for every aggregate placement; it
+# consults type_repr and never re-decides the storage shape.
+def repr_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
+  match type_repr(engine, ty)
+  when Repr::Immediate then
+    # Intrinsic sizes (primitive_size).  String is NOT here: it is
+    # StringPtr, whose slot size is one pointer.
+    let ps = primitive_size(engine, ty)
+    if ps >= 0 then ps else 0 end
+  when Repr::Inline then
+    inline_storage_size(engine, ty)
+  when Repr::RawPtr      then engine.target.pointer_size
+  when Repr::StringPtr   then engine.target.pointer_size
+  when Repr::HeapVecHeader then engine.target.pointer_size
+  when Repr::HeapMapHeader then engine.target.pointer_size
+  when Repr::HeapSetHeader then engine.target.pointer_size
+  when Repr::TaggedPtr   then engine.target.pointer_size
+  when Repr::OpaquePtr   then
+    match ty
+    when Type::Function(_, _) then engine.target.fn_ptr_size
+    when _ then engine.target.pointer_size
+    end
+  end
+end
+
+# Alignment counterpart of repr_storage_size: the alignment a slot holding
+# a value of `ty` must have.
+def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
+  match type_repr(engine, ty)
+  when Repr::Immediate then primitive_align(engine, ty)
+  when Repr::Inline then
+    match ty
+    when Type::Named(tid, _) then compute_type_layout(engine, tid.id).align
+    when Type::Tuple(fields) then compute_tuple_layout(engine, fields).align
+    when Type::Array(elem, _) then repr_storage_align(engine, elem)
+    when _ then engine.target.pointer_align
+    end
+  when _ then engine.target.pointer_align
+  end
+end
+
+# Fixed inline array (P0-P): Array[T, N] with N > 0 stores N elements inline.
+# The element stride is the element's storage size rounded up to its
+# alignment; the array's total size is N * stride, aligned to the element's
+# alignment.  Count 0 is the heap-vector sentinel and never reaches here
+# (type_repr maps it to HeapVecHeader), but is defended anyway.
+def inline_array_storage_size(engine: &mut LayoutEngine, elem: &Type, count: Int) -> Int
+  if count <= 0 then 0
+  else
+    let elem_size = repr_storage_size(engine, elem)
+    let elem_align = repr_storage_align(engine, elem)
+    let elem_stride = layout_align_up(elem_size, elem_align)
+    layout_align_up(count * elem_stride, elem_align)
+  end
+end
+
+# Full inline size of an aggregate: the real layout of a named struct/enum
+# (computed on the spot, NEVER a placeholder record — placeholder reads
+# during compute_all_layouts would silently report size 0) or of a tuple.
+def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
+  match ty
+  when Type::Named(tid, _) then
+    compute_type_layout(engine, tid.id).size
+  when Type::Tuple(fields) then
+    compute_tuple_layout(engine, fields).size
+  when Type::Array(elem, count) then
+    inline_array_storage_size(engine, elem, count)
+  when _ then 0
+  end
+end
+
 # DFS visit state for the inline layout graph.  A type that reaches itself
 # through inline storage only (no pointer/Box indirection) has no finite
 # layout and is diagnosed as an infinitely sized recursive type.
@@ -106,6 +349,7 @@ struct LayoutRecord
   type_id: Int
   name: String
   category: LayoutCategory
+  repr: Repr                # Runtime value representation (P0-AR decision table)
   size: Int              # Total size in bytes
   align: Int             # Required alignment in bytes
   stride: Int            # Distance between consecutive elements (>= size, multiple of align)
@@ -238,6 +482,10 @@ end
 # ———————————————————————————————————————————————————————————————
 # Primitive Type Sizes (F1 - Frozen)
 # ———————————————————————————————————————————————————————————————
+# NOTE: String is deliberately NOT in this table. Its 8-byte size is the
+# StringPtr representation (see type_repr / container_repr_for_name), not
+# an Immediate primitive: a String value is an 8-byte raw pointer to a
+# null-terminated UTF-8 buffer (FROZEN String ABI).
 
 def primitive_size(engine: &LayoutEngine, ty: &Type) -> Int
   match ty
@@ -261,7 +509,6 @@ def primitive_size(engine: &LayoutEngine, ty: &Type) -> Int
   when Type::U128    then 16
   when Type::ISize   then engine.target.pointer_size
   when Type::USize   then engine.target.pointer_size
-  when Type::String  then engine.target.pointer_size  # heap header is queried via container_header_size
   when Type::Never   then 0
   when _             then -1   # Not a primitive
   end
@@ -321,70 +568,83 @@ def compute_layout_hash(name: &String, size: Int, align: Int, field_count: Int) 
 end
 
 # Get the size of a type (main entry point)
+# Every storage-shape decision is delegated to type_repr (the P0-AR
+# decision table); no branch re-decides the representation here.
 def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
-  # Check primitives first
-  let prim_size = primitive_size(engine, ty)
-  if prim_size >= 0 then
-    return prim_size
-  end
-  
+  # Error is a recovery sentinel with no runtime value (never materialized);
+  # the strict path (check_concrete_layout) rejects it before codegen.
   match ty
-  when Type::RefInternal(_, _) then engine.target.pointer_size
-  when Type::Ptr(_)        then engine.target.pointer_size
-  when Type::PtrMut(_)     then engine.target.pointer_size
-  when Type::Slice(_)      then engine.target.pointer_size  # current runtime lowers slices/Vec to heap-header pointers
-  when Type::Function(_, _) then engine.target.fn_ptr_size
-  when Type::Tuple(fields) then
-    let tl = compute_tuple_layout(engine, fields)
-    tl.size
-  when Type::Array(elem, count) then
-    # Type::Array is a heap-allocated dynamic vector (Vec-compatible handle:
-    # {data_ptr, len, cap} behind a pointer) in the current runtime, matching
-    # codegen's _tg_array_new/_tg_array_push machinery. Its storage size is the
-    # 8-byte handle, NOT an inline element*count image. Fixed inline arrays are
-    # a distinct language type that does not yet exist.
-    8
-  when Type::Named(tid, _) then
-    # Look up cached record
-    let tid_key = tid.id
-    match engine.records.get(&tid_key)
-    when Option::Some(rec) then
-      engine.cache_hits = engine.cache_hits + 1
-      rec.size
-    when Option::None then
-      engine.cache_misses = engine.cache_misses + 1
-      # Compute and cache
-      let rec = compute_type_layout(engine, tid_key)
-      rec.size
+  when Type::Error then
+    return 0
+  when _ then ()
+  end
+
+  match type_repr(engine, ty)
+  when Repr::Immediate then
+    let prim_size = primitive_size(engine, ty)
+    if prim_size >= 0 then
+      prim_size
+    else
+      0
     end
-  when Type::Var(_) then engine.target.pointer_size  # Unknown; default to pointer
-  when Type::Error then 0
-  when _ then engine.target.pointer_size
+  when Repr::Inline then
+    match ty
+    when Type::Named(tid, _) then
+      # Look up cached record
+      let tid_key = tid.id
+      match engine.records.get(&tid_key)
+      when Option::Some(rec) then
+        engine.cache_hits = engine.cache_hits + 1
+        rec.size
+      when Option::None then
+        engine.cache_misses = engine.cache_misses + 1
+        # Compute and cache
+        let rec = compute_type_layout(engine, tid_key)
+        rec.size
+      end
+    when Type::Tuple(fields) then
+      let tl = compute_tuple_layout(engine, fields)
+      tl.size
+    when Type::Array(elem, count) then
+      inline_array_storage_size(engine, elem, count)
+    when _ then 0
+    end
+  when Repr::RawPtr      then engine.target.pointer_size
+  when Repr::StringPtr   then engine.target.pointer_size
+  when Repr::HeapVecHeader then engine.target.pointer_size
+  when Repr::HeapMapHeader then engine.target.pointer_size
+  when Repr::HeapSetHeader then engine.target.pointer_size
+  when Repr::TaggedPtr   then engine.target.pointer_size
+  when Repr::OpaquePtr   then
+    match ty
+    when Type::Function(_, _) then engine.target.fn_ptr_size
+    when _ then engine.target.pointer_size
+    end
   end
 end
 
 # Get the alignment of a type
+# Delegates to type_repr (P0-AR decision table), never re-deciding.
 def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
-  let prim_align = primitive_align(engine, ty)
-  if prim_align > 0 then
-    return prim_align
-  end
-  
-  match ty
-  when Type::Unit    then 1
-  when Type::Never   then 1
-  when Type::RefInternal(_, _) then engine.target.pointer_align
-  when Type::Tuple(fields) then
-    let tl = compute_tuple_layout(engine, fields)
-    tl.align
-  when Type::Array(elem, _) then
-    # Heap handle (see size_of for Type::Array): pointer alignment.
-    engine.target.pointer_align
-  when Type::Named(tid, _) then
-    let tid_key = tid.id
-    match engine.records.get(&tid_key)
-    when Option::Some(rec) then rec.align
-    when Option::None then engine.target.pointer_align
+  match type_repr(engine, ty)
+  when Repr::Immediate then
+    # Primitive intrinsic alignments.  This intentionally returns
+    # pointer_align for Never (8), preserving the pre-existing value.
+    primitive_align(engine, ty)
+  when Repr::Inline then
+    match ty
+    when Type::Tuple(fields) then
+      let tl = compute_tuple_layout(engine, fields)
+      tl.align
+    when Type::Named(tid, _) then
+      let tid_key = tid.id
+      match engine.records.get(&tid_key)
+      when Option::Some(rec) then rec.align
+      when Option::None then engine.target.pointer_align
+      end
+    when Type::Array(elem, _) then
+      repr_storage_align(engine, elem)
+    when _ then engine.target.pointer_align
     end
   when _ then engine.target.pointer_align
   end
@@ -403,45 +663,54 @@ end
 
 # Return a complete Layout for a type.  This is the canonical ABI query:
 # consumers should use layout_of instead of reconstructing size/align/
-# stride/field offsets independently.
+# stride/field offsets independently.  Storage shapes come from type_repr
+# (P0-AR decision table); no branch re-decides the representation.
 def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
-  let prim_size = primitive_size(engine, ty)
-  if prim_size >= 0 then
-    let psize = prim_size
-    let palign = primitive_align(engine, ty)
-    Layout {
-      size: psize,
-      align: palign,
-      stride: layout_align_up(psize, palign),
-      fields: Vec::new(),
-      enum_layout: Option::None
-    }
-  else
-    match ty
-    when Type::Unit then
-      Layout { size: 0, align: 1, stride: 0, fields: Vec::new(), enum_layout: Option::None }
-    when Type::Never then
-      Layout { size: 0, align: 1, stride: 0, fields: Vec::new(), enum_layout: Option::None }
-    when Type::RefInternal(_, _) then pointer_layout(engine)
-    when Type::Ptr(_) then pointer_layout(engine)
-    when Type::PtrMut(_) then pointer_layout(engine)
-    when Type::Function(_, _) then fn_ptr_layout(engine)
-    when Type::Tuple(fields) then tuple_layout(engine, fields)
-    when Type::Array(elem, count) then
-      # Heap handle representation (see size_of for Type::Array): the value is a
-      # single pointer; element stride/width belong to the heap element layout
-      # used by indexing, not to the handle's own storage.
-      let ptr = engine.target.pointer_size
+  match type_repr(engine, ty)
+  when Repr::Immediate then
+    let prim_size = primitive_size(engine, ty)
+    if prim_size >= 0 then
+      let psize = prim_size
+      let palign = primitive_align(engine, ty)
       Layout {
-        size: ptr,
-        align: engine.target.pointer_align,
-        stride: ptr,
+        size: psize,
+        align: palign,
+        stride: layout_align_up(psize, palign),
         fields: Vec::new(),
         enum_layout: Option::None
       }
+    else
+      # No Immediate type is outside primitive_size (Unit/Never included);
+      # defensive fallback.
+      pointer_layout(engine)
+    end
+  when Repr::Inline then
+    match ty
+    when Type::Tuple(fields) then tuple_layout(engine, fields)
     when Type::Named(tid, _) then
       let rec = compute_type_layout(engine, tid.id)
       record_to_layout(&rec)
+    when Type::Array(elem, count) then
+      let sz = inline_array_storage_size(engine, elem, count)
+      let al = repr_storage_align(engine, elem)
+      Layout {
+        size: sz,
+        align: al,
+        stride: layout_align_up(sz, al),
+        fields: Vec::new(),
+        enum_layout: Option::None
+      }
+    when _ then pointer_layout(engine)
+    end
+  when Repr::RawPtr      then pointer_layout(engine)
+  when Repr::StringPtr   then pointer_layout(engine)
+  when Repr::HeapVecHeader then pointer_layout(engine)
+  when Repr::HeapMapHeader then pointer_layout(engine)
+  when Repr::HeapSetHeader then pointer_layout(engine)
+  when Repr::TaggedPtr   then pointer_layout(engine)
+  when Repr::OpaquePtr   then
+    match ty
+    when Type::Function(_, _) then fn_ptr_layout(engine)
     when _ then pointer_layout(engine)
     end
   end
@@ -557,6 +826,15 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
       end
     end
     Result::Ok(())
+  when Type::Array(elem, count) then
+    # Fixed inline array (count > 0): the element is stored inline N times,
+    # so it must be concrete.  Count 0 is the heap-vector handle (Vec): an
+    # opaque pointer-sized handle, concrete without inspecting the pointee.
+    if count > 0 then
+      check_concrete_layout(engine, elem)
+    else
+      Result::Ok(())
+    end
   when _ then
     # Primitives, pointers, Box/Rc, slices, heap containers, function types:
     # fixed-size or opaque handle — concrete without inspecting the pointee.
@@ -670,8 +948,10 @@ def tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Layout
   var field_layouts = Vec::new()
   var i = 0
   for fty in fields do
-    let fsize = size_of(engine, fty)
-    let falign = align_of(engine, fty)
+    # Field metadata mirrors the placement table (repr_storage_*), so the
+    # reported size/align always agree with the computed offsets.
+    let fsize = repr_storage_size(engine, fty)
+    let falign = repr_storage_align(engine, fty)
     let off = if i < tl.field_offsets.len() then tl.field_offsets[i] else 0 end
     field_layouts.push(FieldLayout {
       name: i.to_string(),
@@ -706,9 +986,13 @@ def compute_tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Tuple
   var current_offset = 0
   var max_align = 1
   
+  # Tuples are inline aggregates: element placement comes from the SAME
+  # decision table as struct/enum field placement (repr_storage_size/align).
+  # This is also placeholder-safe during compute_all_layouts: Inline named
+  # elements compute their real layout instead of reading a placeholder.
   for f in fields do
-    let f_align = align_of(engine, f)
-    let f_size = size_of(engine, f)
+    let f_align = repr_storage_align(engine, f)
+    let f_size = repr_storage_size(engine, f)
     
     if f_align > max_align then
       max_align = f_align
@@ -730,40 +1014,15 @@ def compute_tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Tuple
   }
 end
 
-def struct_field_storage_align(engine: &LayoutEngine, ty: &Type) -> Int
-  let prim_align = primitive_align(engine, ty)
-  if prim_align > 0 then
-    return prim_align
-  end
-
-  match ty
-  when Type::Slice(_) then engine.target.pointer_align
-  when Type::Map(_, _) then engine.target.pointer_align
-  when Type::Set(_) then engine.target.pointer_align
-  when Type::Option(_) then engine.target.pointer_align
-  when Type::Result(_, _) then engine.target.pointer_align
-  when _ then
-    engine.target.pointer_align
-  end
+# Struct/enum payload fields are slots sized by the SAME decision table as
+# every other placement (type_repr), never by an ad-hoc "everything
+# non-primitive is a pointer slot" rule.
+def struct_field_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
+  repr_storage_align(engine, ty)
 end
 
-def struct_field_storage_size(engine: &LayoutEngine, ty: &Type) -> Int
-  let prim_size = primitive_size(engine, ty)
-  if prim_size >= 0 then
-    return prim_size
-  end
-
-  match ty
-  when Type::Slice(_) then engine.target.pointer_size
-  when Type::Map(_, _) then engine.target.pointer_size
-  when Type::Set(_) then engine.target.pointer_size
-  when Type::Option(_) then engine.target.pointer_size
-  when Type::Result(_, _) then engine.target.pointer_size
-  when _ then
-    # Heap containers, named structs/enums, tuples, and other compound values
-    # flow through runtime handle slots when embedded in a struct field.
-    engine.target.pointer_size
-  end
+def struct_field_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
+  repr_storage_size(engine, ty)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -808,6 +1067,7 @@ def compute_struct_layout(engine: &mut LayoutEngine, type_id: Int, fields: &Vec[
     type_id: type_id,
     name: type_name,
     category: LayoutCategory::InlineStruct,
+    repr: Repr::Inline,
     size: total_size,
     align: max_align,
     stride: total_size,
@@ -841,13 +1101,15 @@ def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[
     var payload_field_idx = 0
     while payload_field_idx < v.fields.len() do
       let fty = v.fields[payload_field_idx]
-      # Use uniform pointer-sized slots for ALL enum payload fields,
-      # matching struct field handling.  This avoids dependency-order
-      # bugs where size_of returns 0 from placeholder records during
-      # compute_all_layouts, and is correct because Tangerine stores
-      # all values (including nested structs/enums) as pointer-sized.
-      let f_size = engine.target.pointer_size
-      let f_align = engine.target.pointer_align
+      # Enum payload slots are sized by the SAME decision table as every
+      # other placement (type_repr via repr_storage_size/align): primitives
+      # are Immediate, containers/pointers/String are pointer-width, nested
+      # structs/enums are Inline.  Inline children are computed directly
+      # (compute_type_layout), never read from a placeholder record, so the
+      # dependency-order bug of the old uniform-8-byte-slot rule cannot
+      # recur: a later type's layout is computed on the spot.
+      let f_size = repr_storage_size(engine, fty)
+      let f_align = repr_storage_align(engine, fty)
 
       if f_align > max_align then
         max_align = f_align
@@ -893,6 +1155,7 @@ def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[
     type_id: type_id,
     name: type_name,
     category: LayoutCategory::TaggedUnion,
+    repr: Repr::Inline,
     size: total_size,
     align: max_align,
     stride: total_size,
@@ -953,6 +1216,7 @@ def compute_type_layout(engine: &mut LayoutEngine, type_id: Int) -> LayoutRecord
       type_id: type_id,
       name: "unknown",
       category: LayoutCategory::Pointer,
+      repr: Repr::OpaquePtr,
       size: engine.target.pointer_size,
       align: engine.target.pointer_align,
       stride: engine.target.pointer_size,
@@ -1065,59 +1329,59 @@ end
 # ONLY to the internal char-vector buffer produced by `str.chars()` (a
 # Vec[Int]), never to String values. Changing `string_abi_size` or
 # `string_abi_is_raw_pointer` is a breaking ABI change.
-def string_abi_size() -> Int = 8
+#
+# The value comes from the P0-AR decision table: String is Repr::StringPtr
+# and its header size is repr_header_size(StringPtr).
+def string_abi_size() -> Int = repr_header_size(Repr::StringPtr)
 def string_abi_is_raw_pointer() -> Bool = true
 
 # Known container ABI sizes (F2 - FROZEN)
 # These values are frozen and MUST NOT change during stabilization.
-# For heap containers this is the full inline header size.
-# String uses the raw-pointer ABI (see string_abi_size), NOT a 24-byte
-# inline header; its {ptr,len,cap} shape is only the internal char-Vec
-# buffer produced by `str.chars()`, never the String value ABI.
+# They come from the P0-AR decision table (repr_header_size via
+# container_repr_for_name): the full inline heap header size behind the
+# 8-byte value handle. String uses the raw-pointer ABI (see
+# string_abi_size), NOT a 24-byte inline header; its {ptr,len,cap} shape is
+# only the internal char-Vec buffer produced by `str.chars()`, never the
+# String value ABI.
 def container_header_size(type_name: &String) -> Int
-  if type_name == "String" then string_abi_size()
-  else if type_name == "Vec" then 24
-  else if type_name == "Array" then 24
-  else if type_name == "Map" then 48
-  else if type_name == "HashMap" then 48
-  else if type_name == "Set" then 32
-  else if type_name == "HashSet" then 32
-  else 0
-  end
+  repr_header_size(container_repr_for_name(type_name))
 end
 
 # Container field offsets (F2)
+# Dispatched by the same name -> Repr table as container_header_size, so
+# the container shape knowledge lives in ONE place.
 # NOTE: String values have NO inline {ptr,len,cap} header (raw-pointer ABI,
 # see string_abi_size). The offsets below describe the internal char-Vec
 # buffer produced by `str.chars()`, which is laid out like Vec[u8]. They are
 # exposed via the "Vec" entry; the String branch is retained for byte-image
 # tooling only and does not apply to String values.
 def container_field_offset(type_name: &String, field_name: &String) -> Int
-  if type_name == "String" then
+  match container_repr_for_name(type_name)
+  when Repr::StringPtr then
     if field_name == "ptr" || field_name == "data" then 0
     else if field_name == "len" || field_name == "length" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
     else 0
     end
-  else if type_name == "Vec" || type_name == "Array" then
+  when Repr::HeapVecHeader then
     if field_name == "ptr" || field_name == "data" then 0
     else if field_name == "len" || field_name == "length" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
     else 0
     end
-  else if type_name == "Map" || type_name == "HashMap" then
+  when Repr::HeapMapHeader then
     if field_name == "buckets" then 0
     else if field_name == "len" || field_name == "length" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
     else if field_name == "hash_fn" then 24
     else 0
     end
-  else if type_name == "Set" || type_name == "HashSet" then
+  when Repr::HeapSetHeader then
     if field_name == "map" then 0
     else if field_name == "len" || field_name == "length" then 8
     else 0
     end
-  else
+  when _ then
     0
   end
 end
@@ -1225,6 +1489,7 @@ def dump_layout_table(engine: &LayoutEngine) -> Unit
     let rec = entry.1
     eprintln("  TYPE " + rec.name + " (id=" + rec.type_id.to_string() + ")")
     eprintln("    category: " + category_to_string(&rec.category))
+    eprintln("    repr: " + repr_to_string(&rec.repr))
     eprintln("    size: " + rec.size.to_string() + " align: " + rec.align.to_string() + " stride: " + rec.stride.to_string())
     
     if rec.fields.len() > 0 then
@@ -1256,6 +1521,20 @@ def category_to_string(cat: &LayoutCategory) -> String
   when LayoutCategory::DynContainer then "DynContainer"
   when LayoutCategory::ZeroSized then "ZeroSized"
   when LayoutCategory::FunctionType then "FunctionType"
+  end
+end
+
+def repr_to_string(repr: &Repr) -> String
+  match repr
+  when Repr::Immediate     then "Immediate"
+  when Repr::RawPtr        then "RawPtr"
+  when Repr::StringPtr     then "StringPtr"
+  when Repr::HeapVecHeader then "HeapVecHeader"
+  when Repr::HeapMapHeader then "HeapMapHeader"
+  when Repr::HeapSetHeader then "HeapSetHeader"
+  when Repr::Inline        then "Inline"
+  when Repr::TaggedPtr     then "TaggedPtr"
+  when Repr::OpaquePtr     then "OpaquePtr"
   end
 end
 
@@ -1384,8 +1663,10 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Collect TypeIds of named types reached through INLINE storage only: direct
-# Named fields and tuple elements.  Indirections (Ptr/PtrMut/Ref, Box/Rc,
-# Slice, Array, Option/Result/Map/Set, Function, String) are pointer-sized
+# Named fields and tuple elements, and fixed inline array elements
+# (Array[T, N] with N > 0 — the count-0 heap-vector handle is an
+# indirection and is never followed).  Other indirections (Ptr/PtrMut/Ref,
+# Box/Rc, Slice, Option/Result/Map/Set, Function, String) are pointer-sized
 # opaque handles and are never followed; unregistered named types have no
 # definition to recurse into.
 def collect_inline_named_children(ty: &Type, out: &mut Vec[Int]) -> Unit
@@ -1395,6 +1676,10 @@ def collect_inline_named_children(ty: &Type, out: &mut Vec[Int]) -> Unit
   when Type::Tuple(elems) then
     for e in elems do
       collect_inline_named_children(e, out)
+    end
+  when Type::Array(elem, count) then
+    if count > 0 then
+      collect_inline_named_children(elem, out)
     end
   when _ then ()
   end
@@ -1460,6 +1745,7 @@ def compute_all_layouts(engine: &mut LayoutEngine) -> Unit
       type_id: td.id.id,
       name: td.name.clone(),
       category: LayoutCategory::ZeroSized,
+      repr: Repr::OpaquePtr,
       size: 0,
       align: 1,
       stride: 0,

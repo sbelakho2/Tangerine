@@ -745,6 +745,8 @@ struct MonoCache
   entries: Vec[MonoEntry]
   # Specialized MIR function bodies keyed by mangled name
   specialized_bodies: Map[String, MirFunction]
+  # Inference failures recorded during monomorphization (deduplicated)
+  errors: Vec[String]
 end
 
 struct MonoEntry
@@ -753,7 +755,7 @@ struct MonoEntry
 end
 
 def mono_cache_new() -> MonoCache
-  MonoCache { entries: Vec::new(), specialized_bodies: Map::new() }
+  MonoCache { entries: Vec::new(), specialized_bodies: Map::new(), errors: Vec::new() }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -788,6 +790,12 @@ def type_has_params(ty: &Type) -> Bool
       if type_has_params(&a) then found = true; break end
     end
     found
+  when Type::RefInternal(inner, _) then type_has_params(inner)
+  when Type::Ptr(inner) then type_has_params(inner)
+  when Type::PtrMut(inner) then type_has_params(inner)
+  when Type::Box(inner) then type_has_params(inner)
+  when Type::Rc(inner) then type_has_params(inner)
+  when Type::Effect(_, inner) then type_has_params(inner)
   when _ then false
   end
 end
@@ -820,6 +828,12 @@ def type_uses_param_name(ty: &Type, name: &String) -> Bool
       if type_uses_param_name(&a, name) then found = true; break end
     end
     found
+  when Type::RefInternal(inner, _) then type_uses_param_name(inner, name)
+  when Type::Ptr(inner) then type_uses_param_name(inner, name)
+  when Type::PtrMut(inner) then type_uses_param_name(inner, name)
+  when Type::Box(inner) then type_uses_param_name(inner, name)
+  when Type::Rc(inner) then type_uses_param_name(inner, name)
+  when Type::Effect(_, inner) then type_uses_param_name(inner, name)
   when _ then false
   end
 end
@@ -858,45 +872,615 @@ def operand_type_from_func(func: &MirFunction, op: &MirOperand) -> Type
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# Structural generic-parameter inference
+# ———————————————————————————————————————————————————————————————
+# The inference walks each (callee parameter type, call argument type)
+# pair in lockstep.  A Type::Param(name) at a position binds name to the
+# argument's SUB-STRUCTURE at that position (param Option[T] vs arg
+# Option[Int] binds T = Int, never T = Option[Int]); container kinds
+# recurse positionally.  Every occurrence must agree: a second occurrence
+# that would bind the name to a different CONCRETE type records an
+# inconsistency error.  Bindings that still carry Params/Vars are deferred
+# (the caller is itself generic; a later specialization iteration
+# re-infers them with concrete types).
+
+struct TypeInferenceResult
+  type_args: Vec[Type]
+  errors: Vec[String]
+end
+
+# Structural equality used for inference agreement checks.  Covers every
+# Type variant; Param and Var leaves compare by identity.
+def infer_types_equal(a: &Type, b: &Type) -> Bool
+  match a
+  when Type::Unit then
+    match b
+    when Type::Unit then true
+    when _ then false
+    end
+  when Type::Bool then
+    match b
+    when Type::Bool then true
+    when _ then false
+    end
+  when Type::Int then
+    match b
+    when Type::Int then true
+    when _ then false
+    end
+  when Type::UInt then
+    match b
+    when Type::UInt then true
+    when _ then false
+    end
+  when Type::Float then
+    match b
+    when Type::Float then true
+    when _ then false
+    end
+  when Type::Char then
+    match b
+    when Type::Char then true
+    when _ then false
+    end
+  when Type::String then
+    match b
+    when Type::String then true
+    when _ then false
+    end
+  when Type::Never then
+    match b
+    when Type::Never then true
+    when _ then false
+    end
+  when Type::I8 then
+    match b
+    when Type::I8 then true
+    when _ then false
+    end
+  when Type::I16 then
+    match b
+    when Type::I16 then true
+    when _ then false
+    end
+  when Type::I32 then
+    match b
+    when Type::I32 then true
+    when _ then false
+    end
+  when Type::I64 then
+    match b
+    when Type::I64 then true
+    when _ then false
+    end
+  when Type::I128 then
+    match b
+    when Type::I128 then true
+    when _ then false
+    end
+  when Type::U8 then
+    match b
+    when Type::U8 then true
+    when _ then false
+    end
+  when Type::U16 then
+    match b
+    when Type::U16 then true
+    when _ then false
+    end
+  when Type::U32 then
+    match b
+    when Type::U32 then true
+    when _ then false
+    end
+  when Type::U64 then
+    match b
+    when Type::U64 then true
+    when _ then false
+    end
+  when Type::U128 then
+    match b
+    when Type::U128 then true
+    when _ then false
+    end
+  when Type::ISize then
+    match b
+    when Type::ISize then true
+    when _ then false
+    end
+  when Type::USize then
+    match b
+    when Type::USize then true
+    when _ then false
+    end
+  when Type::F32 then
+    match b
+    when Type::F32 then true
+    when _ then false
+    end
+  when Type::F64 then
+    match b
+    when Type::F64 then true
+    when _ then false
+    end
+  when Type::Param(n1) then
+    match b
+    when Type::Param(n2) then n1 == n2
+    when _ then false
+    end
+  when Type::Var(v1) then
+    match b
+    when Type::Var(v2) then v1.id == v2.id
+    when _ then false
+    end
+  when Type::Error then
+    match b
+    when Type::Error then true
+    when _ then false
+    end
+  when Type::Named(id1, args1) then
+    match b
+    when Type::Named(id2, args2) then
+      id1.id == id2.id && infer_type_lists_equal(args1, args2)
+    when _ then false
+    end
+  when Type::Option(t1) then
+    match b
+    when Type::Option(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Result(ok1, err1) then
+    match b
+    when Type::Result(ok2, err2) then
+      infer_types_equal(ok1, ok2) && infer_types_equal(err1, err2)
+    when _ then false
+    end
+  when Type::Map(k1, v1) then
+    match b
+    when Type::Map(k2, v2) then
+      infer_types_equal(k1, k2) && infer_types_equal(v1, v2)
+    when _ then false
+    end
+  when Type::Set(t1) then
+    match b
+    when Type::Set(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Slice(t1) then
+    match b
+    when Type::Slice(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Array(t1, n1) then
+    match b
+    when Type::Array(t2, n2) then n1 == n2 && infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Tuple(elems1) then
+    match b
+    when Type::Tuple(elems2) then infer_type_lists_equal(elems1, elems2)
+    when _ then false
+    end
+  when Type::Function(p1, r1) then
+    match b
+    when Type::Function(p2, r2) then
+      if p1.len() != p2.len() then
+        false
+      else
+        var ok = true
+        var i = 0
+        while i < p1.len() do
+          if !infer_types_equal(&p1[i].ty, &p2[i].ty) then
+            ok = false
+            break
+          end
+          if !(p1[i].convention == p2[i].convention) then
+            ok = false
+            break
+          end
+          i = i + 1
+        end
+        ok && infer_types_equal(r1, r2)
+      end
+    when _ then false
+    end
+  when Type::RefInternal(t1, m1) then
+    match b
+    when Type::RefInternal(t2, m2) then m1 == m2 && infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Ptr(t1) then
+    match b
+    when Type::Ptr(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::PtrMut(t1) then
+    match b
+    when Type::PtrMut(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Box(t1) then
+    match b
+    when Type::Box(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Rc(t1) then
+    match b
+    when Type::Rc(t2) then infer_types_equal(t1, t2)
+    when _ then false
+    end
+  when Type::Dyn(id1) then
+    match b
+    when Type::Dyn(id2) then id1.id == id2.id
+    when _ then false
+    end
+  when Type::Effect(effects1, t1) then
+    match b
+    when Type::Effect(effects2, t2) then
+      if effects1.len() != effects2.len() then
+        false
+      else
+        var ok = true
+        var i = 0
+        while i < effects1.len() do
+          if !(effects1[i] == effects2[i]) then
+            ok = false
+            break
+          end
+          i = i + 1
+        end
+        ok && infer_types_equal(t1, t2)
+      end
+    when _ then false
+    end
+  end
+end
+
+def infer_type_lists_equal(a: &Vec[Type], b: &Vec[Type]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if !infer_types_equal(&a[i], &b[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# Check whether a type contains any Type::Var reference (deferred inference
+# state that a later specialization iteration may still resolve).
+def type_has_var(ty: &Type) -> Bool
+  match ty
+  when Type::Var(_) then true
+  when Type::Option(inner) then type_has_var(inner)
+  when Type::Result(ok, err) then type_has_var(ok) || type_has_var(err)
+  when Type::Map(k, v) then type_has_var(k) || type_has_var(v)
+  when Type::Set(inner) then type_has_var(inner)
+  when Type::Slice(inner) then type_has_var(inner)
+  when Type::Array(inner, _) then type_has_var(inner)
+  when Type::Tuple(elems) then
+    var found = false
+    for e in elems do
+      if type_has_var(&e) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    var found = false
+    for p in params do
+      if type_has_var(&p.ty) then found = true; break end
+    end
+    found || type_has_var(ret)
+  when Type::Named(_, args) then
+    var found = false
+    for a in args do
+      if type_has_var(&a) then found = true; break end
+    end
+    found
+  when Type::RefInternal(inner, _) then type_has_var(inner)
+  when Type::Ptr(inner) then type_has_var(inner)
+  when Type::PtrMut(inner) then type_has_var(inner)
+  when Type::Box(inner) then type_has_var(inner)
+  when Type::Rc(inner) then type_has_var(inner)
+  when Type::Effect(_, inner) then type_has_var(inner)
+  when _ then false
+  end
+end
+
+# A type is concrete when it carries no Type::Param and no Type::Var.
+def type_is_concrete(ty: &Type) -> Bool
+  !type_has_params(ty) && !type_has_var(ty)
+end
+
+# Record a binding of a parameter name to the argument sub-structure at a
+# position.  A second occurrence must agree: two different CONCRETE types
+# for the same name are an inconsistency error; a binding that still
+# carries Params/Vars is a deferred generic-caller shape, kept as-is (a
+# concrete later occurrence replaces it).
+def bind_param_name(
+  name: String,
+  ty: &Type,
+  bindings: &mut Map[String, Type],
+  errors: &mut Vec[String]
+) -> Unit
+  match bindings.get(&name)
+  when Option::Some(existing) then
+    if !type_is_concrete(existing) || !type_is_concrete(ty) then
+      if !type_is_concrete(existing) && type_is_concrete(ty) then
+        bindings.insert(name.clone(), ty.clone())
+      end
+    else
+      if !infer_types_equal(existing, ty) then
+        let msg = "inconsistent type parameter inference for `" + name + "`"
+        if !errors.contains(&msg) then
+          errors.push(msg)
+        end
+      end
+    end
+  when Option::None then bindings.insert(name.clone(), ty.clone())
+  end
+end
+
+# Structural matcher: walk param_ty against arg_ty in lockstep, binding
+# Type::Param names to the argument's sub-structure.  Container kinds
+# recurse positionally into the matching arg kind.  Reference/smart-pointer
+# wrappers on either side are peeled before descending (MIR lowers method
+# receivers to RefInternal-wrapped params while call-site arguments carry
+# the bare local type).  Non-matching shapes bind nothing: the parameter is
+# left for a later (generic-caller) iteration or reported as uninferrable.
+def infer_match_types(
+  param_ty: &Type,
+  arg_ty: &Type,
+  bindings: &mut Map[String, Type],
+  errors: &mut Vec[String]
+) -> Unit
+  match param_ty
+  when Type::Param(name) then
+    bind_param_name(name.clone(), arg_ty, bindings, errors)
+  when Type::Option(inner) then
+    match arg_ty
+    when Type::Option(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then ()
+    end
+  when Type::Result(ok, err) then
+    match arg_ty
+    when Type::Result(a_ok, a_err) then
+      infer_match_types(ok, a_ok, bindings, errors)
+      infer_match_types(err, a_err, bindings, errors)
+    when _ then ()
+    end
+  when Type::Map(k, v) then
+    match arg_ty
+    when Type::Map(a_k, a_v) then
+      infer_match_types(k, a_k, bindings, errors)
+      infer_match_types(v, a_v, bindings, errors)
+    when _ then ()
+    end
+  when Type::Set(inner) then
+    match arg_ty
+    when Type::Set(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then ()
+    end
+  when Type::Slice(inner) then
+    match arg_ty
+    when Type::Slice(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then ()
+    end
+  when Type::Array(inner, n) then
+    match arg_ty
+    when Type::Array(a_inner, a_n) then
+      if n == a_n then infer_match_types(inner, a_inner, bindings, errors) end
+    when _ then ()
+    end
+  when Type::Tuple(elems) then
+    match arg_ty
+    when Type::Tuple(a_elems) then
+      if elems.len() == a_elems.len() then
+        var i = 0
+        while i < elems.len() do
+          infer_match_types(&elems[i], &a_elems[i], bindings, errors)
+          i = i + 1
+        end
+      end
+    when _ then ()
+    end
+  when Type::Function(params, ret) then
+    match arg_ty
+    when Type::Function(a_params, a_ret) then
+      if params.len() == a_params.len() then
+        var i = 0
+        while i < params.len() do
+          infer_match_types(&params[i].ty, &a_params[i].ty, bindings, errors)
+          i = i + 1
+        end
+      end
+      infer_match_types(ret, a_ret, bindings, errors)
+    when _ then ()
+    end
+  when Type::Named(id, args) then
+    match arg_ty
+    when Type::Named(a_id, a_args) then
+      if id.id == a_id.id && args.len() == a_args.len() then
+        var i = 0
+        while i < args.len() do
+          infer_match_types(&args[i], &a_args[i], bindings, errors)
+          i = i + 1
+        end
+      end
+    when _ then ()
+    end
+  when Type::RefInternal(inner, _) then
+    match arg_ty
+    when Type::RefInternal(a_inner, _) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Ptr(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::PtrMut(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Box(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Rc(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when Type::Ptr(inner) then
+    match arg_ty
+    when Type::Ptr(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::RefInternal(a_inner, _) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::PtrMut(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Box(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Rc(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when Type::PtrMut(inner) then
+    match arg_ty
+    when Type::PtrMut(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Ptr(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::RefInternal(a_inner, _) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Box(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Rc(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when Type::Box(inner) then
+    match arg_ty
+    when Type::Box(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Ptr(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::PtrMut(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::RefInternal(a_inner, _) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Rc(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when Type::Rc(inner) then
+    match arg_ty
+    when Type::Rc(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Ptr(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::PtrMut(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::Box(a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when Type::RefInternal(a_inner, _) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when Type::Effect(_, inner) then
+    match arg_ty
+    when Type::Effect(_, a_inner) then infer_match_types(inner, a_inner, bindings, errors)
+    when _ then infer_match_types(inner, arg_ty, bindings, errors)
+    end
+  when _ then ()
+  end
+end
+
+# The caller's context for the return-type-only case: the destination local
+# of the call.  For method calls the MIR builder types it with the typed
+# program's concrete call-result type (the "let-binding" inference), so the
+# callee's return type can be matched against it.
+def dest_place_type(caller_func: &MirFunction, dest: &Place) -> Option[Type]
+  let idx = dest.local.id
+  if idx >= 0 && idx < caller_func.locals.len() then
+    Option::Some(caller_func.locals[idx].ty.clone())
+  else
+    Option::None
+  end
+end
+
+# Legacy heuristic fallback retained ONLY for parameters that appear in no
+# parameter position and cannot be resolved from the caller's return-type
+# context (e.g. Vec::new-style constructors, whose MIR destination type
+# still carries the callee's own Param): infer from the first call argument
+# if any, else Unit — exactly the pre-fix behavior for these shapes.
+def legacy_fallback_type(caller_func: &MirFunction, call_args: &Vec[MirCallArg]) -> Type
+  if call_args.len() > 0 then
+    let arg_op0 = mir_call_arg_operand(&call_args[0])
+    operand_type_from_func(caller_func, &arg_op0)
+  else
+    Type::Unit
+  end
+end
+
+# Check whether any parameter position of the callee mentions the name.
+def param_positions_use_name(func: &MirFunction, name: &String) -> Bool
+  for p in func.params do
+    if type_uses_param_name(&p.ty, name) then
+      return true
+    end
+  end
+  false
+end
+
 # Infer concrete type arguments for a generic function from a call site.
-# For each type parameter name in the generic function, match it against
-# the corresponding call argument type.  Returns type_args in the same
-# order as type_param_names.
+# For each type parameter name of the generic function, structurally match
+# the callee's parameter types against the call's argument types; a name
+# bound in a parameter position is taken from the argument SUB-STRUCTURE.
+# Names that appear in no parameter position are resolved from the caller's
+# destination (return-type-only case) or fall back to the legacy heuristic.
+# Returns type_args in the same order as type_param_names, plus any
+# inference errors.
 def infer_type_args_for_call(
   generic_func: &MirFunction,
   type_param_names: &Vec[String],
   caller_func: &MirFunction,
-  call_args: &Vec[MirCallArg]
-) -> Vec[Type]
-  var type_args = Vec::new()
-  for param_name in type_param_names do
-    # Find the first param position in generic_func that uses this param_name
-    var inferred = Type::Unit
-    var found = false
-    var param_idx: Int = 0
-    while param_idx < generic_func.params.len() do
-      if type_uses_param_name(&generic_func.params[param_idx].ty, &param_name) then
-        # The concrete type is the call argument's type at the same position
-        if param_idx < call_args.len() then
-          let arg_op = mir_call_arg_operand(&call_args[param_idx])
-          inferred = operand_type_from_func(caller_func, &arg_op)
-          found = true
-        end
-        break
-      end
-      param_idx = param_idx + 1
-    end
-    # If not found in params, check return type (for phantom params)
-    if !found then
-      # Try to infer from the first arg whose type changed after substitution
-      if call_args.len() > 0 then
-        let arg_op0 = mir_call_arg_operand(&call_args[0])
-        inferred = operand_type_from_func(caller_func, &arg_op0)
-      end
-    end
-    type_args.push(inferred)
+  call_args: &Vec[MirCallArg],
+  dest: &Place
+) -> TypeInferenceResult
+  var bindings: Map[String, Type] = Map::new()
+  var errors = Vec::new()
+
+  # 1. Structural matching of every parameter position against its argument.
+  var param_idx: Int = 0
+  while param_idx < generic_func.params.len() && param_idx < call_args.len() do
+    let arg_op = mir_call_arg_operand(&call_args[param_idx])
+    let arg_ty = operand_type_from_func(caller_func, &arg_op)
+    infer_match_types(&generic_func.params[param_idx].ty, &arg_ty, &mut bindings, &mut errors)
+    param_idx = param_idx + 1
   end
-  type_args
+
+  # 2. Return-type-only parameters: resolve from the caller's context — the
+  #    destination local's type of the call (the "let-binding" inference).
+  var dest_bindings: Map[String, Type] = Map::new()
+  match dest_place_type(caller_func, dest)
+  when Option::Some(dest_ty) then
+    if dest_ty != Type::Unit && type_has_params(&generic_func.ret_type) then
+      var dest_errors = Vec::new()
+      infer_match_types(&generic_func.ret_type, &dest_ty, &mut dest_bindings, &mut dest_errors)
+    end
+  when Option::None then ()
+  end
+
+  # 3. Assemble type args in type_param_names order.
+  var type_args = Vec::new()
+  for name in type_param_names do
+    match bindings.get(&name)
+    when Option::Some(ty) then
+      type_args.push(ty.clone())
+    when Option::None then
+      if param_positions_use_name(generic_func, &name) then
+        # The name occurs in a parameter position but every occurrence was a
+        # deferred (Param/Var-typed or shape-mismatched) argument: leave the
+        # name unbound so the worklist's Param filter defers this call site
+        # to a later specialization iteration.
+        type_args.push(Type::Param(name.clone()))
+      elsif type_uses_param_name(&generic_func.ret_type, &name) then
+        # Return-type-only parameter: adopt the destination-derived binding
+        # when it is fully concrete (the caller's context resolved it);
+        # otherwise retain the legacy fallback (e.g. Vec::new-style
+        # constructors whose MIR destination still carries the callee's own
+        # Param, or a still-generic caller).
+        match dest_bindings.get(&name)
+        when Option::Some(dty) then
+          if type_is_concrete(dty) then
+            type_args.push(dty.clone())
+          else
+            type_args.push(legacy_fallback_type(caller_func, call_args))
+          end
+        when Option::None then
+          type_args.push(legacy_fallback_type(caller_func, call_args))
+        end
+      else
+        # Phantom parameter that appears in no parameter position and no
+        # return type: retained legacy fallback (first argument's type, else
+        # Unit) — matches the pre-fix behavior for these shapes.
+        type_args.push(legacy_fallback_type(caller_func, call_args))
+      end
+    end
+  end
+
+  TypeInferenceResult { type_args: type_args, errors: errors }
 end
 
 # Look up or create a monomorphized instance for a generic function call.
@@ -1010,9 +1594,42 @@ def specialize_function(
     })
   end
   
+  # Verification: after instantiation, no Type::Param from the callee's
+  # parameter list may remain in the instantiated types.  An uninferred
+  # parameter would poison the mangled name and the specialized body.
+  match residual_param_in_function(&specialized, type_param_names)
+  when Option::Some(pname) then
+    let msg = "type parameter `" + pname + "` remains in instantiated types of `" + original.name + "`"
+    if !cache.errors.contains(&msg) then
+      cache.errors.push(msg)
+    end
+  when Option::None then ()
+  end
+  
   # Cache the specialized body
   cache.specialized_bodies.insert(mangled, specialized.clone())
   specialized
+end
+
+# Find the first callee parameter name that still appears as a Type::Param
+# anywhere in the instantiated function (params, return type, or locals).
+def residual_param_in_function(f: &MirFunction, names: &Vec[String]) -> Option[String]
+  for name in names do
+    if type_uses_param_name(&f.ret_type, &name) then
+      return Option::Some(name.clone())
+    end
+    for p in f.params do
+      if type_uses_param_name(&p.ty, &name) then
+        return Option::Some(name.clone())
+      end
+    end
+    for l in f.locals do
+      if type_uses_param_name(&l.ty, &name) then
+        return Option::Some(name.clone())
+      end
+    end
+  end
+  Option::None
 end
 
 def substitute_type(subst: &TypeSubstMap, ty: &Type) -> Type
@@ -1031,6 +1648,11 @@ def substitute_type(subst: &TypeSubstMap, ty: &Type) -> Type
   when Type::Slice(inner) then Type::Slice(Box::new(substitute_type(subst, inner)))
   when Type::Array(inner, n) then Type::Array(Box::new(substitute_type(subst, inner)), n)
   when Type::RefInternal(inner, mutable) then Type::RefInternal(Box::new(substitute_type(subst, inner)), mutable)
+  when Type::Ptr(inner) then Type::Ptr(Box::new(substitute_type(subst, inner)))
+  when Type::PtrMut(inner) then Type::PtrMut(Box::new(substitute_type(subst, inner)))
+  when Type::Box(inner) then Type::Box(Box::new(substitute_type(subst, inner)))
+  when Type::Rc(inner) then Type::Rc(Box::new(substitute_type(subst, inner)))
+  when Type::Effect(effects, inner) then Type::Effect(effects.clone(), Box::new(substitute_type(subst, inner)))
   when Type::Tuple(elems) then
     var subs = Vec::new()
     for e in elems do
@@ -1200,7 +1822,7 @@ end
 
 # After monomorphization, rewrite all call sites that reference generic
 # functions so they point to the specialized (mangled) version instead.
-def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &MonoCache) -> Unit
+def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
   # Pre-build a set of generic function names for fast lookup
   var generic_names = Set::new()
   for f in mir.functions do
@@ -1224,9 +1846,15 @@ def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &MonoCache) -> Un
                 if candidate.name == callee_name then
                   # Infer concrete type args from this call site
                   let type_param_names = infer_type_param_names(candidate)
-                  let type_args = infer_type_args_for_call(
-                    candidate, &type_param_names, func, args
+                  let inference = infer_type_args_for_call(
+                    candidate, &type_param_names, func, args, &dest
                   )
+                  for err in inference.errors do
+                    if !cache.errors.contains(&err) then
+                      cache.errors.push(err)
+                    end
+                  end
+                  let type_args = inference.type_args
                   # Compute the mangled name and check the cache
                   let mangled = mangle_name(callee_name.clone(), &type_args)
                   if cache.specialized_bodies.contains_key(&mangled) then
@@ -1266,81 +1894,6 @@ def has_any_param_types(types: &Vec[Type]) -> Bool
   false
 end
 
-# Infer type args from a call site using the callee's function signature (params).
-# This is used when the callee type is Type::Function(params, ret) at the call site
-# — it matches concrete arg types against generic param types.
-def infer_type_args_for_call_by_params(
-  callee_params: &Vec[Type],
-  caller_func: &MirFunction,
-  call_args: &Vec[MirCallArg]
-) -> Vec[Type]
-  var type_args_set: Map[String, Type] = Map::new()
-  var ordered_names: Vec[String] = Vec::new()
-
-  # Walk each param position
-  var param_idx: Int = 0
-  while param_idx < callee_params.len() do
-    let param_ty = callee_params[param_idx]
-    # Collect all Type::Param names from this param type
-    var names_for_pos: Vec[String] = Vec::new()
-    collect_type_param_names(param_ty, &mut names_for_pos)
-    
-    # Map each name to the concrete arg type at this position
-    if param_idx < call_args.len() then
-      let arg_op = mir_call_arg_operand(&call_args[param_idx])
-      let arg_ty = operand_type_from_func(caller_func, &arg_op)
-      for name in names_for_pos do
-        if !type_args_set.contains_key(&name) then
-          type_args_set.insert(name.clone(), arg_ty.clone())
-          ordered_names.push(name.clone())
-        end
-      end
-    end
-    param_idx = param_idx + 1
-  end
-
-  # Return type args in the order they were discovered (positional)
-  var result = Vec::new()
-  for name in ordered_names do
-    match type_args_set.get(&name)
-    when Option::Some(ty) then result.push(ty.clone())
-    when Option::None then ()
-    end
-  end
-  result
-end
-
-# Collect all Type::Param names from a type into a list.
-def collect_type_param_names(ty: &Type, names: &mut Vec[String]) -> Unit
-  match ty
-  when Type::Param(name) then names.push(name.clone())
-  when Type::Option(inner) then collect_type_param_names(inner, names)
-  when Type::Result(ok, err) then
-    collect_type_param_names(ok, names)
-    collect_type_param_names(err, names)
-  when Type::Map(k, v) then
-    collect_type_param_names(k, names)
-    collect_type_param_names(v, names)
-  when Type::Set(inner) then collect_type_param_names(inner, names)
-  when Type::Slice(inner) then collect_type_param_names(inner, names)
-  when Type::Array(inner, _) then collect_type_param_names(inner, names)
-  when Type::Tuple(elems) then
-    for e in elems do
-      collect_type_param_names(&e, names)
-    end
-  when Type::Function(params, ret) then
-    for p in params do
-      collect_type_param_names(&p.ty, names)
-    end
-    collect_type_param_names(ret, names)
-  when Type::Named(_, args) then
-    for a in args do
-      collect_type_param_names(&a, names)
-    end
-  when _ then ()
-  end
-end
-
 # ———————————————————————————————————————————————————————————————
 # Monomorphize Program: worklist-based entry point
 # ———————————————————————————————————————————————————————————————
@@ -1365,7 +1918,7 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
     for func in mir.functions do
       for block in func.blocks do
         match block.terminator.kind
-        when MirTerminatorKind::MirCall(_, callee, args, _, _) then
+        when MirTerminatorKind::MirCall(dest, callee, args, _, _) then
           match callee.kind
           when MirOperandKind::MirConstant(cv) then
             match cv.kind
@@ -1377,9 +1930,15 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
                     let type_param_names = infer_type_param_names(candidate)
                     if !type_param_names.is_empty() then
                       # Infer concrete type args from the call site
-                      let type_args = infer_type_args_for_call(
-                        candidate, &type_param_names, func, args
+                      let inference = infer_type_args_for_call(
+                        candidate, &type_param_names, func, args, &dest
                       )
+                      for err in inference.errors do
+                        if !cache.errors.contains(&err) then
+                          cache.errors.push(err)
+                        end
+                      end
+                      let type_args = inference.type_args
                       # Skip entries where any inferred arg is itself a Param —
                       # those would create $any$any-mangled cycles when the
                       # caller is itself a specialization whose locals still
@@ -1440,6 +1999,18 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
       rewrite_call_sites_in_program(mir, cache)
     end
   end
+
+  # Report any inference failures recorded during monomorphization.
+  report_mono_errors(cache)
+end
+
+def report_mono_errors(cache: &MonoCache) -> Unit
+  if cache.errors.is_empty() then
+    return
+  end
+  for err in cache.errors do
+    eprintln("[mono] error: " + err)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1487,6 +2058,9 @@ pub def mono_specialize_function(
       # that should now point to the mangled name
       rewrite_call_sites_in_program(mir, cache)
     end
+
+    # Report any inference failures recorded during specialization.
+    report_mono_errors(cache)
 
     Option::Some(mangled)
   end
@@ -1536,6 +2110,12 @@ def collect_type_params(ty: &Type, names: &mut Vec[String], seen: &mut Set[Strin
     for a in args do
       collect_type_params(&a, names, seen)
     end
+  when Type::RefInternal(inner, _) then collect_type_params(inner, names, seen)
+  when Type::Ptr(inner) then collect_type_params(inner, names, seen)
+  when Type::PtrMut(inner) then collect_type_params(inner, names, seen)
+  when Type::Box(inner) then collect_type_params(inner, names, seen)
+  when Type::Rc(inner) then collect_type_params(inner, names, seen)
+  when Type::Effect(_, inner) then collect_type_params(inner, names, seen)
   when _ then ()
   end
 end

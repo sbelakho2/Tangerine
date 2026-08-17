@@ -92,6 +92,10 @@ struct FnCodegenCtx
   var_locs: Map[Int, VarLoc]     # LocalId.id -> VarLoc
   block_labels: Map[Int, String] # BlockId.id -> label name
   string_locals: Set[Int]        # LocalId.id values known to be string type
+  # Synthetic-local counter for drop-glue scratch places: each synthetic
+  # place gets a distinct (large negative) LocalId so its frame slot can
+  # never be confused with a real MIR local.
+  glue_synthetic_counter: Int
 end
 
 struct CodegenCtx
@@ -116,6 +120,11 @@ struct CodegenCtx
   extern_fns: Set[String]                 # Names of extern (FFI) functions
   reachable_fns: Set[String]               # Names of all reachable compiled functions
   fn_alias: Map[String, String]            # MIR reference name → actual compiled function label
+  # P0-AK: base names of `$`-suffixed monomorphized instance names
+  # ("Option__map$i64_str" → "Option__map"). Used by resolve_callee_label's
+  # instance-aware fail-closed check: a call site that still carries a base
+  # name is a monomorphization-identity leak, never a callable.
+  generic_instance_bases: Set[String]
   enum_eq_helper_requested: Set[Int]
   enum_eq_helper_emitted: Set[Int]
   enum_eq_helper_queue: Vec[Int]
@@ -631,6 +640,11 @@ def allocate_locals(func: &MirFunction, arch: Arch, engine: &mut LayoutEngine) -
   # Extend spill_off to cover the fallback dynamic needs. Save the original
   # spill_off as the starting point for codegen.
   let codegen_spill_start = spill_off
+  # Fixed reserve for drop-glue scratch (synthetic element/key/value slots and
+  # the drain sret slot). The glue is emitted at codegen time — it has no MIR
+  # statements, so the pre-scan above cannot count it; a fixed reserve keeps
+  # every frame valid no matter which plans the glue executes.
+  dynamic_extra = dynamic_extra + 128
   spill_off = spill_off - dynamic_extra as i32
 
   # Calculate total frame size (includes space for static spills +
@@ -677,6 +691,7 @@ def codegen_new(target: &AsmTarget) -> CodegenCtx
     extern_fns: Set::new(),
     reachable_fns: Set::new(),
     fn_alias: Map::new(),
+    generic_instance_bases: Set::new(),
     enum_eq_helper_requested: Set::new(),
     enum_eq_helper_emitted: Set::new(),
     enum_eq_helper_queue: Vec::new(),
@@ -4640,6 +4655,70 @@ def classify_return(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, ty:
   AbiReturn::Direct
 end
 
+# Position of the `$` that separates a monomorphized instance name's base
+# from its mangled type arguments ("Option__map$i64_str" → 12), or -1 when
+# the name carries no instance suffix.
+def find_instance_dollar(name: &String) -> Int
+  var i = 0
+  while i < name.len() do
+    if name.slice(i, i + 1) == "$" then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# ———————————————————————————————————————————————————————————————
+# CALLEE-LABEL RESOLUTION — the single authority (P0-AK)
+#
+# resolve_callee_label translates a callable NAME to the machine label to
+# emit at the call site, or it is an internal error. The callable identity
+# flows:
+#
+#   name (MirFnItem operand)
+#     -> typed call_targets DefId      (the typed program)
+#     -> monomorphized instance name   (the monomorphizer: generic callees
+#                                       are rewritten to `$`-suffixed
+#                                       instance names, e.g. "Option__map$i64_str")
+#     -> fn_alias label                (codegen_program: ".Lfn_entry.<index>")
+#
+# InstanceId { def, substs } is the target representation that REMOVES the
+# string stage: the name string is a rendering of that identity pair, and
+# fn_alias is its codegen-side index. Until the DefId/substs pair reaches
+# codegen, this function is the one authority for "this callable name
+# resolves to this machine label or it is an internal error" — every emitted
+# compiled call (codegen_call's compiled-function path, codegen_call's alias
+# fallback, codegen_finalizer_call's emission) funnels through it. The
+# intrinsic call path is the paired authority on the other side of
+# codegen_call's dispatch: resolve_intrinsic_id (the IntrinsicId enum)
+# owns intrinsic names and rejects unknown ones; resolve_callee_label owns
+# compiled callables. No callable name escapes both.
+#
+# Resolution order:
+#   1. fn_alias — the identity entry (".Lfn_entry.<index>") for every emitted
+#      function, plus the bare/canonical alias entries.
+#   2. reachable_fns / extern_fns — the function is emitted under its own
+#      symbol name (safety net; identity entries make this unreachable).
+#   3. FAIL CLOSED — panic. Instance-aware verification first: if the name is
+#      the BASE of a monomorphized generic (a `$`-suffixed instance of it
+#      exists), the call site was never rewritten to an instance name — a
+#      monomorphization-identity leak, reported as such.
+def resolve_callee_label(ctx: &CodegenCtx, name: &String) -> String
+  match ctx.fn_alias.get(name)
+  when Option::Some(label) then label.clone()
+  when Option::None then
+    if ctx.reachable_fns.contains(name) || ctx.extern_fns.contains(name) then
+      name.clone()
+    else
+      if ctx.generic_instance_bases.contains(name) then
+        panic("internal error: call to `" + name + "` is an unresolved generic BASE name; the monomorphizer must rewrite this call site to a `$`-suffixed instance name (InstanceId { def, substs } replaces this string stage) — no instance label exists")
+      end
+      panic("internal error: call to `" + name + "` is not a reachable function, an extern, or a known intrinsic (unresolved callee)")
+    end
+  end
+end
+
 def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: BlockId, unwind: &Option[BlockId]) -> Unit
   let arch   = ctx.target.arch
   let rr     = ret_reg(arch)
@@ -4740,6 +4819,15 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       let has_real_body =
         ctx.extern_fns.contains(&resolved_fn_name) ||
         ctx.reachable_fns.contains(&resolved_fn_name)
+      # P0-AK boundary between the two call-identity authorities: has_real_body
+      # is the intrinsic path's PRESENCE test against the compiled-callable
+      # namespace (reachable_fns/extern_fns). It deliberately does NOT resolve
+      # a label — intrinsic names (e.g. "len", "string_contains") are owned by
+      # resolve_intrinsic_id (the IntrinsicId enum) and must not panic here.
+      # Label resolution for compiled callables happens only in the compiled
+      # and alias branches below, via resolve_callee_label — the single
+      # authority. No name escapes both: intrinsic names fail resolve_intrinsic_id
+      # with a panic, compiled names fail resolve_callee_label with a panic.
       let fallback_clone_intrinsic =
         !has_real_body &&
         resolved_fn_name.len() >= 7 &&
@@ -4770,11 +4858,13 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       else if ctx.extern_fns.contains(&resolved_fn_name) then
         emit_call_extern(ctx, resolved_fn_name)
       else if ctx.reachable_fns.contains(&resolved_fn_name) then
-        # Function has a compiled body — call it directly
-        let resolved = match ctx.fn_alias.get(&resolved_fn_name)
-          when Option::Some(actual) then actual
-          when Option::None then resolved_fn_name.clone()
-          end
+        # Function has a compiled body — call it directly. P0-AK: the callee
+        # identity flow is verified here — for a generic callee this name is
+        # the MONOMORPHIZED instance name (the monomorphizer rewrote the call
+        # site to e.g. "Option__map$i64_str"), and fn_alias maps that exact
+        # instance name to the emitted body's label. The label itself comes
+        # from the single authority resolve_callee_label.
+        let resolved = resolve_callee_label(ctx, &resolved_fn_name)
         if sret_dest_ok then
           # Pass &dest in x8 for sret-returning callee
           emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
@@ -4788,11 +4878,18 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
         end
         codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name)
       else
-        # Resolve through fn_alias map for label mismatches
-        let resolved = match ctx.fn_alias.get(&resolved_fn_name)
-          when Option::Some(actual) then actual
-          when Option::None then resolved_fn_name.clone()
-          end
+        # P0-AK verification layer: at this point the callee is NOT an
+        # extern, NOT a lowered reachable function, and NOT a known
+        # intrinsic — all of those were handled above. The single authority
+        # resolve_callee_label handles the only legitimate remaining case
+        # (an fn_alias entry mapping this reference to an emitted function
+        # label — bare/canonical aliases of compiled functions) and panics
+        # fail-closed otherwise. An unknown callee is a compiler error, never
+        # a silent call to a possibly-nonexistent label; every emitted call
+        # therefore goes through the resolved-name check, and generic
+        # callees carry the instance names ("Option__map$i64_str") that the
+        # monomorphizer produced and fn_alias maps to labels.
+        let resolved = resolve_callee_label(ctx, &resolved_fn_name)
         if sret_dest_ok then
           emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
           did_sret = true
@@ -4842,13 +4939,37 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   emit_jmp(ctx, label)
 end
 
+# ———————————————————————————————————————————————————————————————
+# Drop-glue scratch places.
+#
+# The glue sometimes has to drop a value whose ADDRESS is only known at
+# runtime (array elements at data + i*stride, drain key/value slots). The
+# Place machinery addresses through a local + projections, so the computed
+# address is materialized into a fresh frame spill slot and wrapped in a
+# synthetic place {local: syn, [ProjDeref]}: emit_place_address loads the
+# slot (the stored address) and stops at the final ProjDeref without
+# dereferencing, so the resulting address is exactly the stored value — the
+# same convention the Box arm and the drop_in_place Ptr path use for
+# pointees. Nested field/downcast projections built on top of it address
+# through the stored value (load the pointee's first word, add the offset),
+# which is correct because aggregate values are heap pointers.
+# ———————————————————————————————————————————————————————————————
+def codegen_glue_place_at_slot(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, off: i32) -> Place
+  let syn = LocalId { id: -1000000000 - fctx.glue_synthetic_counter }
+  fctx.glue_synthetic_counter = fctx.glue_synthetic_counter + 1
+  fctx.var_locs.insert(syn.id, VarLoc::Spilled(off))
+  var projs = Vec::new()
+  projs.push(Projection::ProjDeref)
+  Place { local: syn, projections: projs }
+end
+
 # The ONE drop-glue emitter: executes ANY semantic DeinitPlan for a place
 # (recursively). drop_in_place, lexical cleanup equivalents, assignment
 # replacement, and (eventually) full-expression temporaries all use it.
 # Linear plans emit inline; discriminant-bearing plans branch; Array walks
-# its elements then releases the backing buffer. Map/Set plans require the
-# drain loop and are rejected here (documented P1) rather than partially
-# destroying.
+# its elements in reverse then releases the backing buffer; Map/Set drain
+# every entry through the ownership-transfer runtime drains before releasing
+# the table. Every plan the semantic layer can accept is executed.
 def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: &DeinitPlan, place: &Place) -> Unit
   match plan
   when DeinitPlan::Trivial then ()
@@ -4925,10 +5046,40 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
     codegen_emit_drop_glue(ctx, fctx, ok_plan, &okplace)
     def_label(&mut ctx.text, lbl_end)
   when DeinitPlan::Enum(variant_plans) then
-    # Per-variant discriminant glue requires variant-name resolution in the
-    # downcast projection; documented P1 (reject rather than partially
-    # destroy).
-    panic("internal error: drop glue does not yet support general Enum plans (documented P1)")
+    # Per-variant discriminant glue. The plan maps each variant discriminant
+    # to its NAME (used by ProjDowncast — the same downcast machinery the
+    # Option/Result arms use) and its per-field plans. Compare the
+    # normalized tag against each discriminant; the matching variant's glue
+    # drops the payload fields through the downcast payload place, then
+    # jumps to the end label. An unknown discriminant (should not occur for
+    # well-typed values) skips all glue.
+    let lbl_enum_end = next_codegen_label(ctx, ".Lglue_enum_end.")
+    let disc_reg3 = match ctx.target.arch
+    when Arch::AArch64 then PhysReg::A64Reg(A64::X9)
+    when Arch::X86_64 then PhysReg::X64Reg(X64::RAX)
+    end
+    load_place(ctx, fctx, place, disc_reg3)
+    normalize_enum_value_to_tag(ctx, disc_reg3)
+    for (vdisc, vinfo) in variant_plans do
+      let vname = vinfo.0
+      let vplans = vinfo.1
+      let lbl_variant = next_codegen_label(ctx, ".Lglue_enum_v.")
+      emit_cmp_ri(ctx, disc_reg3, vdisc as i32)
+      emit_jcc(ctx, CondKind::Eq, lbl_variant.clone())
+      emit_jmp(ctx, lbl_enum_end.clone())
+      def_label(&mut ctx.text, lbl_variant)
+      var vfi = 0
+      while vfi < vplans.len() do
+        var vprojs = place.projections.clone()
+        vprojs.push(Projection::ProjDowncast(vname.clone(), vdisc))
+        vprojs.push(Projection::ProjFieldIndex(vfi))
+        let vplace = Place { local: place.local, projections: vprojs }
+        codegen_emit_drop_glue(ctx, fctx, &vplans[vfi], &vplace)
+        vfi = vfi + 1
+      end
+      emit_jmp(ctx, lbl_enum_end.clone())
+    end
+    def_label(&mut ctx.text, lbl_enum_end)
   when DeinitPlan::Array(elem_plan) then
     if deinit_plan_is_trivial(elem_plan) then
       # The elements need no destruction: release the backing buffer.
@@ -4941,14 +5092,174 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
         panic("array destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
       end
     else
-      # Non-trivial element plans need the scaled-index element loop in the
-      # glue; documented P1 (reject rather than partially destroy).
-      panic("internal error: drop glue does not yet support non-trivial Array element plans (documented P1)")
+      # Non-trivial element plans: walk the elements in REVERSE (len-1 ..
+      # 0 — mirroring the MIR Array emitter), running each element's glue,
+      # then release the backing buffer through _tg_array_destroy.
+      match ctx.target.arch
+      when Arch::X86_64 then
+        panic("array destroy with non-trivial elements is not supported on x86-64 (container storage release has no x86 parity yet)")
+      when _ then ()
+      end
+      # Element stride: the same computation the ProjIndex emitter uses.
+      let arr_ty = place_type(ctx, fctx, place)
+      let elem_ty = project_index_type(ctx, &arr_ty)
+      let elem_stride = storage_size_bytes(&elem_ty)
+      let fp = fp_reg(ctx.target.arch)
+      let r10 = PhysReg::A64Reg(A64::X10)
+      let r11 = PhysReg::A64Reg(A64::X11)
+      let r12 = PhysReg::A64Reg(A64::X12)
+      # Loop state lives in frame slots: the recursive glue may emit calls
+      # (finalizers, runtime drains) that clobber every caller-saved register.
+      let hdr_off = fctx.frame.spill_offset - 8
+      fctx.frame.spill_offset = hdr_off
+      let idx_off = fctx.frame.spill_offset - 8
+      fctx.frame.spill_offset = idx_off
+      let data_off = fctx.frame.spill_offset - 8
+      fctx.frame.spill_offset = data_off
+      let elem_off = fctx.frame.spill_offset - 8
+      fctx.frame.spill_offset = elem_off
+      # The array VALUE is the heap handle to the 24-byte header
+      # {data, len, cap} (MirLen reads the same way).
+      load_place(ctx, fctx, place, r10)
+      emit_store_mem(ctx, fp, hdr_off, r10)
+      emit_load_mem(ctx, r11, r10, 8)   # len
+      emit_sub_ri(ctx, r11, 1)          # idx = len - 1
+      emit_store_mem(ctx, fp, idx_off, r11)
+      emit_load_mem(ctx, r12, r10, 0)   # data pointer
+      emit_store_mem(ctx, fp, data_off, r12)
+      let elem_place = codegen_glue_place_at_slot(ctx, fctx, elem_off)
+      let lbl_arr_loop = next_codegen_label(ctx, ".Lglue_arr_loop.")
+      let lbl_arr_done = next_codegen_label(ctx, ".Lglue_arr_done.")
+      def_label(&mut ctx.text, lbl_arr_loop.clone())
+      emit_load_mem(ctx, r11, fp, idx_off)
+      emit_cmp_ri(ctx, r11, 0)
+      emit_jcc(ctx, CondKind::Lt, lbl_arr_done.clone())
+      # Element address = data + idx * stride (scale like ProjIndex).
+      emit_load_mem(ctx, r12, fp, data_off)
+      match elem_stride
+      when 1 then ()
+      when 2 then
+        match r11
+        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 1)
+        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 1)
+        end
+      when 4 then
+        match r11
+        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 2)
+        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 2)
+        end
+      when _ then
+        match r11
+        when PhysReg::A64Reg(a) then a64_lsl(&mut ctx.text, a, a, 3)
+        when PhysReg::X64Reg(x) then x64_shl_ri(&mut ctx.text, x, 3)
+        end
+      end
+      emit_add_rrr(ctx, r11, r12, r11)
+      emit_store_mem(ctx, fp, elem_off, r11)
+      codegen_emit_drop_glue(ctx, fctx, elem_plan, &elem_place)
+      emit_load_mem(ctx, r11, fp, idx_off)
+      emit_sub_ri(ctx, r11, 1)
+      emit_store_mem(ctx, fp, idx_off, r11)
+      emit_jmp(ctx, lbl_arr_loop.clone())
+      def_label(&mut ctx.text, lbl_arr_done)
+      # Release the mmap'ed backing buffer. _tg_array_destroy's documented
+      # ABI takes the 24-byte header handle (x0), not the address of the
+      # slot holding it.
+      let r0b = PhysReg::A64Reg(A64::X0)
+      emit_load_mem(ctx, r0b, fp, hdr_off)
+      emit_call_label(ctx, "_tg_array_destroy")
     end
-  when DeinitPlan::Map(_, _) then
-    panic("internal error: drop glue does not yet support Map plans (documented P1)")
-  when DeinitPlan::Set(_) then
-    panic("internal error: drop glue does not yet support Set plans (documented P1)")
+  when DeinitPlan::Map(key_plan, value_plan) then
+    # DESTRUCTIVE drain cleanup (mirror of the MIR emitter): repeatedly call
+    # _tg_map_drain_one(m), which transfers one actual (K, V) entry through
+    # the sret slot (AArch64 x8; Option layout: [0] discriminant Some=0/
+    # None=1, [8] key, [16] value — ownership of the real pointers
+    # transfers, there is no snapshot copy), run the value glue on sret+16
+    # and the key glue on sret+8, then loop until the drain returns None.
+    # After the loop, release the bucket table via _tg_map_destroy.
+    match ctx.target.arch
+    when Arch::X86_64 then
+      panic("map destroy is not supported on x86-64 (ownership-transfer drain has no x86 parity yet)")
+    when _ then ()
+    end
+    let fp = fp_reg(ctx.target.arch)
+    let sret_off = fctx.frame.spill_offset - 24
+    fctx.frame.spill_offset = sret_off
+    let map_off = fctx.frame.spill_offset - 8
+    fctx.frame.spill_offset = map_off
+    let key_off = fctx.frame.spill_offset - 8
+    fctx.frame.spill_offset = key_off
+    let val_off = fctx.frame.spill_offset - 8
+    fctx.frame.spill_offset = val_off
+    let map_reg = PhysReg::A64Reg(A64::X10)
+    load_place(ctx, fctx, place, map_reg)
+    emit_store_mem(ctx, fp, map_off, map_reg)
+    let key_place = codegen_glue_place_at_slot(ctx, fctx, key_off)
+    let val_place = codegen_glue_place_at_slot(ctx, fctx, val_off)
+    let lbl_map_loop = next_codegen_label(ctx, ".Lglue_map_loop.")
+    let lbl_map_done = next_codegen_label(ctx, ".Lglue_map_done.")
+    let x0 = PhysReg::A64Reg(A64::X0)
+    let sret_reg = PhysReg::A64Reg(A64::X8)
+    let disc_reg = PhysReg::A64Reg(A64::X9)
+    let tmp_reg = PhysReg::A64Reg(A64::X10)
+    def_label(&mut ctx.text, lbl_map_loop.clone())
+    emit_load_mem(ctx, x0, fp, map_off)
+    emit_lea_fp(ctx, sret_reg, sret_off)
+    emit_call_label(ctx, "_tg_map_drain_one")
+    emit_load_mem(ctx, disc_reg, fp, sret_off)
+    emit_cmp_ri(ctx, disc_reg, 0)
+    emit_jcc(ctx, CondKind::Ne, lbl_map_done.clone())
+    emit_lea_fp(ctx, tmp_reg, sret_off + 16)
+    emit_store_mem(ctx, fp, val_off, tmp_reg)
+    codegen_emit_drop_glue(ctx, fctx, value_plan, &val_place)
+    emit_lea_fp(ctx, tmp_reg, sret_off + 8)
+    emit_store_mem(ctx, fp, key_off, tmp_reg)
+    codegen_emit_drop_glue(ctx, fctx, key_plan, &key_place)
+    emit_jmp(ctx, lbl_map_loop.clone())
+    def_label(&mut ctx.text, lbl_map_done)
+    emit_load_mem(ctx, x0, fp, map_off)
+    emit_call_label(ctx, "_tg_map_destroy")
+  when DeinitPlan::Set(elem_plan) then
+    # Same destructive drain loop as Map, with _tg_set_drain_one (a set is
+    # a map with Unit values): the element is transferred through sret+8
+    # and its glue runs there; the loop ends when the drain returns None,
+    # then _tg_set_destroy releases the backing storage.
+    match ctx.target.arch
+    when Arch::X86_64 then
+      panic("set destroy is not supported on x86-64 (ownership-transfer drain has no x86 parity yet)")
+    when _ then ()
+    end
+    let fp = fp_reg(ctx.target.arch)
+    let sret_off = fctx.frame.spill_offset - 24
+    fctx.frame.spill_offset = sret_off
+    let set_off = fctx.frame.spill_offset - 8
+    fctx.frame.spill_offset = set_off
+    let elem_off = fctx.frame.spill_offset - 8
+    fctx.frame.spill_offset = elem_off
+    let set_reg = PhysReg::A64Reg(A64::X10)
+    load_place(ctx, fctx, place, set_reg)
+    emit_store_mem(ctx, fp, set_off, set_reg)
+    let elem_place = codegen_glue_place_at_slot(ctx, fctx, elem_off)
+    let lbl_set_loop = next_codegen_label(ctx, ".Lglue_set_loop.")
+    let lbl_set_done = next_codegen_label(ctx, ".Lglue_set_done.")
+    let x0 = PhysReg::A64Reg(A64::X0)
+    let sret_reg = PhysReg::A64Reg(A64::X8)
+    let disc_reg = PhysReg::A64Reg(A64::X9)
+    let tmp_reg = PhysReg::A64Reg(A64::X10)
+    def_label(&mut ctx.text, lbl_set_loop.clone())
+    emit_load_mem(ctx, x0, fp, set_off)
+    emit_lea_fp(ctx, sret_reg, sret_off)
+    emit_call_label(ctx, "_tg_set_drain_one")
+    emit_load_mem(ctx, disc_reg, fp, sret_off)
+    emit_cmp_ri(ctx, disc_reg, 0)
+    emit_jcc(ctx, CondKind::Ne, lbl_set_done.clone())
+    emit_lea_fp(ctx, tmp_reg, sret_off + 8)
+    emit_store_mem(ctx, fp, elem_off, tmp_reg)
+    codegen_emit_drop_glue(ctx, fctx, elem_plan, &elem_place)
+    emit_jmp(ctx, lbl_set_loop.clone())
+    def_label(&mut ctx.text, lbl_set_done)
+    emit_load_mem(ctx, x0, fp, set_off)
+    emit_call_label(ctx, "_tg_set_destroy")
   end
 end
 
@@ -4962,29 +5273,177 @@ def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place:
   # (".Lfn_entry.<index>"). Reachability is tested on the function name;
   # the label translation happens only for emission. Checking the label
   # against reachable_fns would reject every valid finalizer.
-  if ctx.reachable_fns.contains(deinit_fn) || ctx.extern_fns.contains(deinit_fn) then
-    let resolved = match ctx.fn_alias.get(deinit_fn)
-    when Option::Some(actual) then actual.clone()
-    when Option::None then deinit_fn.clone()
-    end
-    match arg_reg(ctx.target.arch, 0)
-    when Option::Some(r0) then
-      emit_place_address(ctx, fctx, place, r0)
-      emit_call_label(ctx, resolved)
-    when Option::None then ()
-    end
-  else
-    panic("internal error: finalizer call `" + deinit_fn + "` is not a reachable or extern function (fail-closed: no silent skip of destruction)")
+  # P0-AK: the reachable/extern gate, the fn_alias lookup, and the
+  # fail-closed panic are the single authority resolve_callee_label — the
+  # same authority codegen_call's compiled-callee path uses. Monomorphized
+  # finalizers resolve by instance name ("Type__drop$...") exactly like any
+  # other callable.
+  let resolved = resolve_callee_label(ctx, deinit_fn)
+  match arg_reg(ctx.target.arch, 0)
+  when Option::Some(r0) then
+    emit_place_address(ctx, fctx, place, r0)
+    emit_call_label(ctx, resolved)
+  when Option::None then ()
   end
 end
 
 # ———————————————————————————————————————————————————————————————
 # Intrinsic code generation — emit inline code for built-in operations
+#
+# P0-AK: every intrinsic the router can dispatch has exactly ONE identity
+# (IntrinsicId). resolve_intrinsic_id is the single authority mapping every
+# name the router handles (canonical, aliased, bare, Type__-mangled) to that
+# identity; any name it does not recognize is rejected with a panic. The
+# dispatch below is a pure match on IntrinsicId — no string comparisons, no
+# re-normalization, no fallback.
 # ———————————————————————————————————————————————————————————————
 
-def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, args: &Vec[MirOperand], call_args: &Vec[MirCallArg], orig_fn_name: String) -> Unit
-  let arch = ctx.target.arch
-  let rr = ret_reg(arch)
+enum IntrinsicId
+  ArrayAsPtrAddress
+  ReadFileToStringNative
+  SetIsEmpty
+  MapPush
+  ArrayReplace
+  ArrayAsStr
+  ArrayPush
+  ArrayPop
+  ArrayNew
+  ArrayLen
+  ArrayGet
+  ArraySet
+  StrSlice
+  Syscall1
+  Syscall2
+  Syscall3
+  Syscall4
+  Syscall5
+  Syscall6
+  ArrayAsPtr
+  IntToString
+  FloatToString
+  BoolToString
+  CharToString
+  StrToString
+  StringFromBytes
+  ToString
+  AsBytes
+  AsPtr
+  AsStr
+  Clone
+  Len
+  StrConcat
+  StrLen
+  StrCmp
+  StrFind
+  StartsWith
+  EndsWith
+  StringContains
+  StrCopy
+  IntToStr
+  FloatToStr
+  StrToInt
+  StrToFloat
+  ArrayCap
+  ArrayRemove
+  ArrayInsert
+  ArrayClear
+  ArrayDestroy
+  ArrayContains
+  ArrayLast
+  ArrayFirst
+  ArrayIsEmpty
+  ArrayReverse
+  ArraySort
+  ArrayExtend
+  ArrayTruncate
+  ArrayResize
+  MapNew
+  MapInsert
+  MapGet
+  MapRemove
+  MapContains
+  MapLen
+  MapClone
+  MapClear
+  MapKeys
+  MapValues
+  MapEntries
+  MapDrainOne
+  MapDestroy
+  SetNew
+  SetInsert
+  SetContains
+  SetRemove
+  SetLen
+  SetClone
+  SetEntries
+  SetDrainOne
+  SetDestroy
+  SetClear
+  DropInPlace
+  Drop
+  MemAlloc
+  MemFree
+  MemCopy
+  MemSet
+  MemZero
+  HashInt
+  HashStr
+  HashCombine
+  Chars
+  CharAt
+  CStringNew
+  CStringAsPtr
+  Bytes
+  IsSome
+  IsNone
+  Unwrap
+  UnwrapOr
+  Status
+  Output
+  StdoutString
+  StderrString
+  FormatterNoOp
+  FormatterEmitNewline
+  WouldOverflow
+  Cmp
+  ToInt
+  LintFile
+  SysWrite
+  SysRead
+  SysOpen
+  SysClose
+  SysExit
+  OWriteOnly
+  ORdWr
+  OAppend
+  OCreate
+  OTrunc
+  OpenWindows
+  TrimMatches
+  SplitOnce
+  ToLowercase
+  MapJoinCollect
+  SplitLinesTrim
+  StringReplace
+  StringSplit
+  ArraySlice
+  ArrayFromList
+  ArrayWithCapacity
+  ArrayCapacity
+  ArrayJoin
+  StringIsEmptyChars
+  StringTrim
+  StringToLowercase
+  StringSplitLines
+end
+
+# Single authority for the intrinsic-name decision: maps every name the
+# intrinsic router handles to its IntrinsicId. The type-directed aliases
+# (entries, drain_one, contains, array_contains) are decided here from the
+# receiver/needle facts, exactly as the former normalization chain did.
+# Unknown names fail closed with a panic — never a silent fallback.
+def resolve_intrinsic_id(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: &String, args: &Vec[MirOperand], orig_fn_name: &String) -> IntrinsicId
   let receiver_ty = if args.len() > 0 then strip_ref_like_type(&operand_type(ctx, fctx, &args[0])) else Type::Unit end
   let receiver_is_string = if args.len() > 0 then is_string_operand(&args[0], fctx) else false end
   let receiver_is_string_like = if args.len() > 0 then is_string_like_type(&operand_type(ctx, fctx, &args[0])) else false end
@@ -5006,288 +5465,330 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     orig_fn_name == "__intrinsic_string_contains" ||
     orig_fn_name == "str_contains"
 
-  # FAST-PATH: Handle newly-added intrinsics BEFORE the long alias/dispatch chains.
-  # The stage0 interpreter has limits on deeply-nested if/else if chains,
-  # so these handlers use early returns to avoid being lost at chain ends.
-  if name == "array_as_ptr_address" then
-    emit_load_mem(ctx, rr, rr, 0)
-    emit_load_mem(ctx, rr, rr, 0)
-    return
+  # Type-directed aliases
+  if name == "entries" then
+    match receiver_ty
+    when Type::Set(_) then return IntrinsicId::SetEntries
+    when _ then return IntrinsicId::MapEntries
+    end
   end
-  if name == "read_file_to_string_native" then
+  if name == "drain_one" then
+    match receiver_ty
+    when Type::Set(_) then return IntrinsicId::SetDrainOne
+    when _ then return IntrinsicId::MapDrainOne
+    end
+  end
+  if name == "contains" then
+    match receiver_ty
+    when Type::String then return IntrinsicId::StringContains
+    when Type::Map(_, _) then return IntrinsicId::MapContains
+    when Type::Set(_) then return IntrinsicId::SetContains
+    when _ then ()
+    end
+    if orig_is_string_contains || receiver_is_string || receiver_is_string_like then
+      return IntrinsicId::StringContains
+    elsif needle_is_string || needle_is_string_like then
+      return IntrinsicId::StringContains
+    elsif !needle_is_ref && needle_value_ty == Type::String then
+      return IntrinsicId::StringContains
+    else
+      return IntrinsicId::ArrayContains
+    end
+  end
+  if name == "array_contains" then
+    if orig_is_string_contains || receiver_is_string || receiver_is_string_like then
+      return IntrinsicId::StringContains
+    elsif needle_is_string || needle_is_string_like then
+      return IntrinsicId::StringContains
+    elsif !needle_is_ref && needle_value_ty == Type::String then
+      return IntrinsicId::StringContains
+    else
+      return IntrinsicId::ArrayContains
+    end
+  end
+
+  # Array/Vec
+  if name == "array_as_ptr_address" || name == "as_ptr_address" then return IntrinsicId::ArrayAsPtrAddress end
+  if name == "read_file_to_string_native" then return IntrinsicId::ReadFileToStringNative end
+  if name == "set_is_empty" then return IntrinsicId::SetIsEmpty end
+  if name == "map_push" then return IntrinsicId::MapPush end
+  if name == "array_replace" then return IntrinsicId::ArrayReplace end
+  if name == "array_as_str" then return IntrinsicId::ArrayAsStr end
+  if name == "array_push" || name == "push" || name == "string_push" || name == "string_push_str" then return IntrinsicId::ArrayPush end
+  if name == "array_pop" || name == "pop" then return IntrinsicId::ArrayPop end
+  if name == "array_new" || name == "string_new" then return IntrinsicId::ArrayNew end
+  if name == "array_with_capacity" then return IntrinsicId::ArrayWithCapacity end
+  if name == "array_len" then return IntrinsicId::ArrayLen end
+  if name == "array_get" || name == "get" then return IntrinsicId::ArrayGet end
+  if name == "array_set" || name == "set" then return IntrinsicId::ArraySet end
+  if name == "array_cap" || name == "cap" then return IntrinsicId::ArrayCap end
+  if name == "array_remove" || name == "remove" then return IntrinsicId::ArrayRemove end
+  if name == "array_insert" || name == "insert" then return IntrinsicId::ArrayInsert end
+  if name == "array_clear" || name == "clear" then return IntrinsicId::ArrayClear end
+  if name == "array_first" || name == "first" then return IntrinsicId::ArrayFirst end
+  if name == "array_last" || name == "last" then return IntrinsicId::ArrayLast end
+  if name == "array_is_empty" || name == "is_empty" then return IntrinsicId::ArrayIsEmpty end
+  if name == "array_reverse" || name == "reverse" then return IntrinsicId::ArrayReverse end
+  if name == "array_sort" || name == "sort" then return IntrinsicId::ArraySort end
+  if name == "array_extend" || name == "extend" then return IntrinsicId::ArrayExtend end
+  if name == "array_truncate" then return IntrinsicId::ArrayTruncate end
+  if name == "array_resize" then return IntrinsicId::ArrayResize end
+  if name == "array_destroy" then return IntrinsicId::ArrayDestroy end
+  if name == "array_as_ptr" || name == "array_as_mut_ptr" then return IntrinsicId::ArrayAsPtr end
+  if name == "array_slice" then return IntrinsicId::ArraySlice end
+  if name == "array_from_list" then return IntrinsicId::ArrayFromList end
+  if name == "array_capacity" then return IntrinsicId::ArrayCapacity end
+  if name == "array_clone" || name == "Vec__clone" || name == "Array__clone" then return IntrinsicId::Clone end
+  if name == "array_starts_with" || name == "Vec__starts_with" then return IntrinsicId::StartsWith end
+  if name == "array_ends_with" || name == "Vec__ends_with" then return IntrinsicId::StrCmp end
+  if name == "array_to_string" || name == "Vec__to_string" || name == "Array__to_string" then return IntrinsicId::ToString end
+  if name == "array_read" || name == "Vec__read" || name == "Array__read" then return IntrinsicId::Clone end
+  if name == "array_join" || name == "Vec__join" || name == "Array__join" then return IntrinsicId::ArrayJoin end
+
+  # Map
+  if name == "map_new" then return IntrinsicId::MapNew end
+  if name == "map_insert" then return IntrinsicId::MapInsert end
+  if name == "map_get" || name == "map_get_mut" || name == "get_mut" then return IntrinsicId::MapGet end
+  if name == "map_remove" then return IntrinsicId::MapRemove end
+  if name == "map_contains" || name == "map_contains_key" || name == "contains_key" then return IntrinsicId::MapContains end
+  if name == "map_len" then return IntrinsicId::MapLen end
+  if name == "map_clone" || name == "Map__clone" then return IntrinsicId::MapClone end
+  if name == "map_clear" then return IntrinsicId::MapClear end
+  if name == "map_keys" || name == "keys" then return IntrinsicId::MapKeys end
+  if name == "map_values" || name == "values" then return IntrinsicId::MapValues end
+  if name == "map_entries" then return IntrinsicId::MapEntries end
+  if name == "map_drain_one" then return IntrinsicId::MapDrainOne end
+  if name == "map_destroy" then return IntrinsicId::MapDestroy end
+  if name == "map_unwrap" || name == "Map__unwrap" then return IntrinsicId::Unwrap end
+
+  # Set
+  if name == "set_new" then return IntrinsicId::SetNew end
+  if name == "set_insert" then return IntrinsicId::SetInsert end
+  if name == "set_contains" then return IntrinsicId::SetContains end
+  if name == "set_remove" then return IntrinsicId::SetRemove end
+  if name == "set_len" then return IntrinsicId::SetLen end
+  if name == "set_clone" || name == "Set__clone" then return IntrinsicId::SetClone end
+  if name == "set_entries" then return IntrinsicId::SetEntries end
+  if name == "set_drain_one" then return IntrinsicId::SetDrainOne end
+  if name == "set_destroy" then return IntrinsicId::SetDestroy end
+  if name == "set_clear" then return IntrinsicId::SetClear end
+  if name == "set_unwrap" || name == "Set__unwrap" then return IntrinsicId::Unwrap end
+
+  # String
+  if name == "string_char_at" then return IntrinsicId::CharAt end
+  if name == "string_slice" || name == "slice" then return IntrinsicId::StrSlice end
+  if name == "string_len" || name == "len" || name == "IfStmt__len" then return IntrinsicId::Len end
+  if name == "string_parse_int" || name == "parse_int" then return IntrinsicId::StrToInt end
+  if name == "str_parse_float" || name == "String__parse_float" || name == "__intrinsic_string_parse_float" then return IntrinsicId::StrToFloat end
+  if name == "string_clone" || name == "String__clone" then return IntrinsicId::Clone end
+  if name == "string_is_empty" || name == "string_chars" then return IntrinsicId::StringIsEmptyChars end
+  if name == "string_as_bytes" then return IntrinsicId::AsBytes end
+  if name == "string_as_ptr" then return IntrinsicId::AsPtr end
+  if name == "string_as_str" then return IntrinsicId::AsStr end
+  if name == "string_to_wide_string" || name == "string_to_string" then return IntrinsicId::ToString end
+  if name == "string_starts_with" then return IntrinsicId::StartsWith end
+  if name == "string_ends_with" then return IntrinsicId::EndsWith end
+  if name == "string_index_of" || name == "string_last_index_of" || name == "string_rfind" then return IntrinsicId::StrFind end
+  if name == "string_find" || name == "find" then return IntrinsicId::StrFind end
+  if name == "string_trim" || name == "string_trim_matches" then return IntrinsicId::StringTrim end
+  if name == "string_to_lowercase" || name == "string_to_uppercase" then return IntrinsicId::StringToLowercase end
+  if name == "string_contains" then return IntrinsicId::StringContains end
+  if name == "string_replace" || name == "replace" then return IntrinsicId::StringReplace end
+  if name == "string_split" then return IntrinsicId::StringSplit end
+  if name == "string_lines" || name == "string_split_once" then return IntrinsicId::StringSplitLines end
+  if name == "string_bytes" then return IntrinsicId::Bytes end
+  if name == "string_unwrap_or" || name == "String__unwrap_or" then return IntrinsicId::UnwrapOr end
+  if name == "bytes" then return IntrinsicId::AsBytes end
+
+  # Option/Result and iterator methods
+  if name == "is_some" || name == "is_ok" then return IntrinsicId::IsSome end
+  if name == "is_none" || name == "is_err" then return IntrinsicId::IsNone end
+  if name == "unwrap" then return IntrinsicId::Unwrap end
+  if name == "unwrap_or" then return IntrinsicId::UnwrapOr end
+  if name == "trim_matches" then return IntrinsicId::TrimMatches end
+  if name == "split_once" then return IntrinsicId::SplitOnce end
+  if name == "to_bits" then return IntrinsicId::Clone end
+  if name == "to_lowercase" then return IntrinsicId::ToLowercase end
+  if name == "arg" || name == "eval" then return IntrinsicId::Clone end
+  if name == "map" || name == "join" || name == "collect" then return IntrinsicId::MapJoinCollect end
+  if name == "split" || name == "lines" || name == "trim" then return IntrinsicId::SplitLinesTrim end
+  if name == "starts_with" then return IntrinsicId::StartsWith end
+  if name == "ends_with" then return IntrinsicId::EndsWith end
+
+  # Type__method variants for compiler-internal types
+  if name == "PanicInfo__clone" || name == "TypeExpr__clone" || name == "Span__clone" then return IntrinsicId::Clone end
+  if name == "MirProgram__to_string" || name == "Type__to_string" then return IntrinsicId::ToString end
+  if name == "Type__clone" || name == "Type__collect" || name == "Type__unwrap" then return IntrinsicId::Clone end
+  if name == "InlineResult__unwrap_or" || name == "MirStatement__unwrap_or" || name == "Place__unwrap_or" then return IntrinsicId::UnwrapOr end
+  if name == "MirRvalue__collect" || name == "MirRvalue__unwrap_or" || name == "MirTerminator__unwrap_or" then return IntrinsicId::Clone end
+  if name == "PgoProfile__unwrap_or" then return IntrinsicId::UnwrapOr end
+  if name == "LocalId__clone" || name == "BlockId__clone" || name == "MirFunction__clone" then return IntrinsicId::Clone end
+  if name == "MirStatement__clone" || name == "MirRvalue__clone" || name == "AggregateKind__clone" then return IntrinsicId::Clone end
+  if name == "MirTerminatorKind__clone" || name == "AsmTarget__clone" then return IntrinsicId::Clone end
+  if name == "Budget__unwrap_or" || name == "Budget__trim" then return IntrinsicId::UnwrapOr end
+
+  # CString intrinsics (String = raw C string at ABI level)
+  if name == "cstring_new" || name == "CString__new" then return IntrinsicId::CStringNew end
+  if name == "cstring_as_ptr" || name == "CString__as_ptr" then return IntrinsicId::CStringAsPtr end
+
+  # Canonical string ops
+  if name == "str_concat" then return IntrinsicId::StrConcat end
+  if name == "str_len" then return IntrinsicId::StrLen end
+  if name == "str_cmp" then return IntrinsicId::StrCmp end
+  if name == "str_find" then return IntrinsicId::StrFind end
+  if name == "str_slice" then return IntrinsicId::StrSlice end
+  if name == "str_copy" then return IntrinsicId::StrCopy end
+  if name == "str_to_int" then return IntrinsicId::StrToInt end
+  if name == "str_to_float" then return IntrinsicId::StrToFloat end
+  if name == "int_to_str" then return IntrinsicId::IntToStr end
+  if name == "float_to_str" then return IntrinsicId::FloatToStr end
+  if name == "int_to_string" || name == "int_to_string_intrinsic" then return IntrinsicId::IntToString end
+  if name == "float_to_string" || name == "float_to_string_intrinsic" then return IntrinsicId::FloatToString end
+  if name == "bool_to_string" then return IntrinsicId::BoolToString end
+  if name == "char_to_string" then return IntrinsicId::CharToString end
+  if name == "str_to_string" then return IntrinsicId::StrToString end
+  if name == "string_from_bytes" then return IntrinsicId::StringFromBytes end
+  if name == "to_string" then return IntrinsicId::ToString end
+  if name == "clone" then return IntrinsicId::Clone end
+  if name == "as_bytes" then return IntrinsicId::AsBytes end
+  if name == "as_ptr" then return IntrinsicId::AsPtr end
+  if name == "as_str" then return IntrinsicId::AsStr end
+  if name == "chars" then return IntrinsicId::Chars end
+  if name == "char_at" then return IntrinsicId::CharAt end
+
+  # Syscalls (1-6 arguments)
+  if name == "syscall1" then return IntrinsicId::Syscall1 end
+  if name == "syscall2" then return IntrinsicId::Syscall2 end
+  if name == "syscall3" then return IntrinsicId::Syscall3 end
+  if name == "syscall4" then return IntrinsicId::Syscall4 end
+  if name == "syscall5" then return IntrinsicId::Syscall5 end
+  if name == "syscall6" then return IntrinsicId::Syscall6 end
+
+  # Memory
+  if name == "mem_alloc" then return IntrinsicId::MemAlloc end
+  if name == "mem_free" then return IntrinsicId::MemFree end
+  if name == "mem_copy" then return IntrinsicId::MemCopy end
+  if name == "mem_set" then return IntrinsicId::MemSet end
+  if name == "mem_zero" then return IntrinsicId::MemZero end
+
+  # Hash
+  if name == "hash_int" then return IntrinsicId::HashInt end
+  if name == "hash_str" then return IntrinsicId::HashStr end
+  if name == "hash_combine" then return IntrinsicId::HashCombine end
+
+  # Typed drop glue
+  if name == "drop_in_place" then return IntrinsicId::DropInPlace end
+  if name == "drop" then return IntrinsicId::Drop end
+
+  # Process/Environment
+  if name == "status" then return IntrinsicId::Status end
+  if name == "output" then return IntrinsicId::Output end
+  if name == "stdout_string" then return IntrinsicId::StdoutString end
+  if name == "stderr_string" then return IntrinsicId::StderrString end
+
+  # Formatter intrinsics (compile-time constructs, no runtime code)
+  if name == "emit" || name == "space" || name == "indent" || name == "dedent" then return IntrinsicId::FormatterNoOp end
+  if name == "emit_newline" || name == "emit_blank_line" then return IntrinsicId::FormatterEmitNewline end
+  if name == "would_overflow" then return IntrinsicId::WouldOverflow end
+
+  # Utility
+  if name == "cmp" then return IntrinsicId::Cmp end
+  if name == "to_int" then return IntrinsicId::ToInt end
+  if name == "lint_file" then return IntrinsicId::LintFile end
+
+  # File constants
+  if name == "SYS_WRITE" then return IntrinsicId::SysWrite end
+  if name == "SYS_READ" then return IntrinsicId::SysRead end
+  if name == "SYS_OPEN" then return IntrinsicId::SysOpen end
+  if name == "SYS_CLOSE" then return IntrinsicId::SysClose end
+  if name == "SYS_EXIT" then return IntrinsicId::SysExit end
+  if name == "O_WRONLY" then return IntrinsicId::OWriteOnly end
+  if name == "O_RDWR" then return IntrinsicId::ORdWr end
+  if name == "O_APPEND" then return IntrinsicId::OAppend end
+  if name == "O_CREAT" then return IntrinsicId::OCreate end
+  if name == "O_TRUNC" then return IntrinsicId::OTrunc end
+  if name == "open_windows" then return IntrinsicId::OpenWindows end
+
+  # Fail closed: an intrinsic name with no identity is a compiler error,
+  # never a silent zero (a fake value would corrupt semantics).
+  panic("internal error: unknown or unsupported intrinsic `" + name + "`")
+end
+
+def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, args: &Vec[MirOperand], call_args: &Vec[MirCallArg], orig_fn_name: String) -> Unit
+  let arch = ctx.target.arch
+  let rr = ret_reg(arch)
+  let id = resolve_intrinsic_id(ctx, fctx, &name, args, &orig_fn_name)
+
+  # Pure enum dispatch — no string comparisons. The intrinsic arm functions
+  # (codegen_array_len, codegen_str_concat, ...) are unchanged; only the
+  # routing is enum-based. Unknown names never reach this match: they panic
+  # in resolve_intrinsic_id, and the `when _` arm below is the final guard.
+  match id
+  when IntrinsicId::ArrayAsPtrAddress then
+    emit_load_mem(ctx, rr, rr, 0)
+    emit_load_mem(ctx, rr, rr, 0)
+  when IntrinsicId::ReadFileToStringNative then
     deref_all_ref_like_args(ctx, fctx, args, rr)
-    # arg0 = path string pointer (already in rr from arg loading)
     emit_call_label(ctx, "_tg_read_file_to_string")
-    return
-  end
-  if name == "set_is_empty" then
+  when IntrinsicId::SetIsEmpty then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_is_empty(ctx)
-    return
-  end
-  if name == "map_push" then
+  when IntrinsicId::MapPush then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_insert(ctx)
-    return
-  end
-  if name == "array_replace" then
+  when IntrinsicId::ArrayReplace then
     # Fail closed: array_replace was routed to _tg_str_concat (silent
     # semantic corruption); reject instead.
     panic("internal error: intrinsic `" + name + "` not implemented")
-    return
-  end
-   if name == "array_as_str" then
-     emit_load_mem(ctx, rr, rr, 0)
-     return
-   end
-   if name == "array_push" then
-     deref_all_ref_like_args(ctx, fctx, args, rr)
-     a64_bl(&mut ctx.text, "_tg_array_push")
-     return
-   end
-   if name == "array_pop" then
-     deref_all_ref_like_args(ctx, fctx, args, rr)
-     a64_bl(&mut ctx.text, "_tg_array_pop")
-     return
-   end
-   if name == "array_new" then
-     a64_bl(&mut ctx.text, "_tg_array_new")
-     return
-   end
-   if name == "array_len" then
-     deref_all_ref_like_args(ctx, fctx, args, rr)
-     codegen_array_len(ctx)
-     return
-   end
-   if name == "array_get" then
-     deref_all_ref_like_args(ctx, fctx, args, rr)
-     codegen_array_get(ctx)
-     return
-   end
-   if name == "array_set" then
-     deref_all_ref_like_args(ctx, fctx, args, rr)
-     codegen_array_set(ctx)
-     return
-   end
-   if name == "str_slice" then
-     codegen_str_slice(ctx)
-     return
-   end
-
-  # Normalize aliases and bare method names to canonical intrinsic names.
-  # This handles: map_contains_key → map_contains, map_get_mut → map_get,
-  # and bare names like "push" → "array_push" (default to array_ prefix).
-  let name = if name == "map_contains_key" then "map_contains"
-    else if name == "map_get_mut" then "map_get"
-    else if name == "contains_key" then "map_contains"
-    else if name == "get_mut" then "map_get"
-    else if name == "push" then "array_push"
-    else if name == "pop" then "array_pop"
-    else if name == "get" then "array_get"
-    else if name == "set" then "array_set"
-    else if name == "insert" then "array_insert"
-    else if name == "remove" then "array_remove"
-    else if name == "clear" then "array_clear"
-    else if name == "first" then "array_first"
-    else if name == "last" then "array_last"
-    else if name == "reverse" then "array_reverse"
-    else if name == "sort" then "array_sort"
-    else if name == "extend" then "array_extend"
-    else if name == "entries" then match receiver_ty
-      when Type::Set(_) then "set_entries"
-      when _ then "map_entries"
-      end
-    else if name == "drain_one" then match receiver_ty
-      when Type::Set(_) then "set_drain_one"
-      when _ then "map_drain_one"
-      end
-    else if name == "keys" then "map_keys"
-    else if name == "values" then "map_values"
-    else if name == "is_empty" then "array_is_empty"
-    else if name == "cap" then "array_cap"
-    else if name == "contains" then match receiver_ty
-      when Type::String then "string_contains"
-      when Type::Map(_, _) then "map_contains"
-      when Type::Set(_) then "set_contains"
-      when _ then
-        if orig_is_string_contains || receiver_is_string || receiver_is_string_like then "string_contains"
-        elsif needle_is_string || needle_is_string_like then "string_contains"
-        elsif !needle_is_ref && needle_value_ty == Type::String then "string_contains"
-        else "array_contains"
-        end
-      end
-    else if name == "array_contains" then
-      if orig_is_string_contains || receiver_is_string || receiver_is_string_like then "string_contains"
-      elsif needle_is_string || needle_is_string_like then "string_contains"
-      elsif !needle_is_ref && needle_value_ty == Type::String then "string_contains"
-      else "array_contains"
-      end
-    # Bare-name aliases for NOP_FALLBACK intrinsics — fail closed instead of
-    # silently returning the receiver (identity) for unimplemented operations.
-    else if name == "trim_matches" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "split_once" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "to_bits" then "clone"
-    else if name == "to_lowercase" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "bytes" then "as_bytes"
-    else if name == "arg" then "clone"
-    else if name == "eval" then "clone"
-    else if name == "map" || name == "join" || name == "collect" then
-      # Iterator methods — identity pass-through (return arg0 deref)
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "slice" then "str_slice"
-    else if name == "split" || name == "lines" || name == "trim" then
-      # String methods — identity pass-through for now
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "parse_int" then "str_to_int"
-    else if name == "starts_with" then "starts_with"
-    else if name == "ends_with" then "ends_with"
-    else if name == "string_replace" || name == "replace" then
-      # str_concat does NOT implement replace semantics — reject instead.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_find" || name == "find" then "str_find"
-    else if name == "string_new" then "array_new"
-    else if name == "string_char_at" then "char_at"
-    else if name == "string_push" || name == "string_push_str" then "array_push"
-    else if name == "string_split" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_slice" then "str_slice"
-    else if name == "string_len" then "len"
-    else if name == "string_parse_int" then "str_to_int"
-    # __intrinsic_* aliases that map to existing handlers
-    else if name == "array_slice" then
-      # array_get reads ONE element; array_slice returns a subarray.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "array_from_list" then
-      # array_from_list copies a shared &[T] into a fresh array; clone is identity.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "array_with_capacity" then "array_new"
-    else if name == "array_capacity" then
-      # The runtime tracks a real capacity at header offset 16 (see
-      # codegen_array_cap); array_len reads offset 8 — silently wrong.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "set_entries" then "set_entries"
-    # Vec__/Array__ prefixed methods - map to canonical intrinsics
-    else if name == "Vec__clone" || name == "Array__clone" || name == "array_clone" then "clone"
-    else if name == "Vec__starts_with" || name == "array_starts_with" then "starts_with"
-    else if name == "Vec__ends_with" || name == "array_ends_with" then "str_cmp"
-    else if name == "Vec__to_string" || name == "Array__to_string" || name == "array_to_string" then "to_string"
-    else if name == "Vec__read" || name == "Array__read" || name == "array_read" then "clone"
-    else if name == "Vec__join" || name == "Array__join" || name == "array_join" then
-      # join concatenates elements with a separator; clone is identity.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    # Map__ prefixed methods
-    else if name == "Map__unwrap" || name == "map_unwrap" then "unwrap"
-    else if name == "Map__clone" || name == "map_clone" then "map_clone"
-    # Set__ prefixed methods  
-    else if name == "Set__clone" || name == "set_clone" then "set_clone"
-    else if name == "Set__unwrap" || name == "set_unwrap" then "unwrap"
-    # String__ prefixed methods
-    else if name == "String__parse_float" || name == "__intrinsic_string_parse_float" || name == "str_parse_float" then "str_to_float"
-    else if name == "String__clone" then "clone"
-    # Additional string_ prefixed variants (from bare_intrinsic_name transformation)
-    else if name == "string_clone" then "clone"
-    else if name == "string_is_empty" || name == "string_chars" then
-      # is_empty returns a Bool and chars an iterator; clone is identity.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_as_bytes" then "as_bytes"
-    else if name == "string_as_ptr" then "as_ptr"
-    else if name == "string_as_str" then "as_str"
-    else if name == "string_to_wide_string" || name == "string_to_string" then "to_string"
-    else if name == "string_starts_with" then "starts_with"
-    else if name == "string_ends_with" then "ends_with"
-    else if name == "string_index_of" then "str_find"
-    else if name == "string_last_index_of" || name == "string_rfind" then "str_find"
-    else if name == "string_find" then "str_find"
-    else if name == "string_len" then "len"
-    else if name == "string_trim" || name == "string_trim_matches" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_to_lowercase" || name == "string_to_uppercase" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_contains" then "string_contains"
-    else if name == "string_replace" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "string_slice" then "str_slice"
-    else if name == "string_split" || name == "string_lines" || name == "string_split_once" then
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    # Type__method variants for various std types - all map to clone or identity
-    else if name == "PanicInfo__clone" || name == "TypeExpr__clone" || name == "Span__clone" then "clone"
-    else if name == "MirProgram__to_string" || name == "Type__to_string" then "to_string"
-    else if name == "Type__clone" || name == "Type__collect" || name == "Type__unwrap" then "clone"
-    else if name == "InlineResult__unwrap_or" || name == "MirStatement__unwrap_or" || name == "Place__unwrap_or" then "unwrap_or"
-    else if name == "MirRvalue__collect" || name == "MirRvalue__unwrap_or" || name == "MirTerminator__unwrap_or" then "clone"
-    else if name == "PgoProfile__unwrap_or" then "unwrap_or"
-    else if name == "LocalId__clone" || name == "BlockId__clone" || name == "MirFunction__clone" then "clone"
-    else if name == "MirStatement__clone" || name == "MirRvalue__clone" || name == "AggregateKind__clone" then "clone"
-    else if name == "MirTerminatorKind__clone" || name == "AsmTarget__clone" then "clone"
-    else if name == "Budget__unwrap_or" || name == "Budget__trim" then "unwrap_or"
-    else if name == "IfStmt__len" then "len"
-    # Collection intrinsic aliases
-    else if name == "array_replace" then
-      # str_concat does NOT implement array_replace semantics — reject.
-      panic("internal error: intrinsic `" + name + "` not implemented")
-    else if name == "map_push" then "map_insert"
-    else if name == "set_is_empty" then "array_is_empty"
-    else if name == "array_as_str" then "as_str"
-    # NOP_FALLBACK rescue aliases
-    else if name == "string_bytes" then "bytes"
-    else if name == "string_unwrap_or" || name == "String__unwrap_or" then "unwrap_or"
-    else if name == "cstring_new" || name == "CString__new" then "cstring_new"
-    else if name == "cstring_as_ptr" || name == "CString__as_ptr" then "cstring_as_ptr"
-    else if name == "arg" then "clone"
-    else name
-    end
-
-  # Syscall intrinsics (1-6 arguments)
-  if name == "syscall6" then
-    codegen_syscall(ctx, 6)
-  else if name == "syscall5" then
-    codegen_syscall(ctx, 5)
-  else if name == "syscall4" then
-    codegen_syscall(ctx, 4)
-  else if name == "syscall3" then
-    codegen_syscall(ctx, 3)
-  else if name == "syscall2" then
-    codegen_syscall(ctx, 2)
-  else if name == "syscall1" then
-    codegen_syscall(ctx, 1)
-
-  # Array pointer intrinsics: arg0 is &self, so dereference once to get the
-  # Vec/Array header, then load the data pointer from field 0.
-  else if name == "array_as_ptr" || name == "array_as_mut_ptr" then
+  when IntrinsicId::ArrayAsStr then
+    emit_load_mem(ctx, rr, rr, 0)
+  when IntrinsicId::ArrayPush then
+    emit_load_mem(ctx, rr, rr, 0)
+    codegen_array_push(ctx)
+  when IntrinsicId::ArrayPop then
+    emit_load_mem(ctx, rr, rr, 0)
+    codegen_array_pop(ctx)
+  when IntrinsicId::ArrayNew then
+    codegen_array_new(ctx)
+  when IntrinsicId::ArrayWithCapacity then
+    codegen_array_new(ctx)
+  when IntrinsicId::ArrayLen then
+    emit_load_mem(ctx, rr, rr, 0)
+    codegen_array_len(ctx)
+  when IntrinsicId::ArrayGet then
+    emit_load_mem(ctx, rr, rr, 0)
+    codegen_array_get(ctx)
+  when IntrinsicId::ArraySet then
+    emit_load_mem(ctx, rr, rr, 0)
+    codegen_array_set(ctx)
+  when IntrinsicId::StrSlice then
+    codegen_str_slice(ctx)
+  when IntrinsicId::Syscall1 then codegen_syscall(ctx, 1)
+  when IntrinsicId::Syscall2 then codegen_syscall(ctx, 2)
+  when IntrinsicId::Syscall3 then codegen_syscall(ctx, 3)
+  when IntrinsicId::Syscall4 then codegen_syscall(ctx, 4)
+  when IntrinsicId::Syscall5 then codegen_syscall(ctx, 5)
+  when IntrinsicId::Syscall6 then codegen_syscall(ctx, 6)
+  when IntrinsicId::ArrayAsPtr then
     emit_load_mem(ctx, rr, rr, 0)
     emit_load_mem(ctx, rr, rr, 0)
-
-  # Vec.as_ptr_address() → return data pointer as Int (same bit pattern as pointer)
-  else if name == "array_as_ptr_address" || name == "as_ptr_address" then
-    emit_load_mem(ctx, rr, rr, 0)
-    emit_load_mem(ctx, rr, rr, 0)
-
-  else if name == "int_to_string" || name == "int_to_string_intrinsic" then
+  when IntrinsicId::IntToString then
     deref_all_ref_like_args(ctx, fctx, args, rr)
     codegen_int_to_str(ctx)
-
-  else if name == "float_to_string" || name == "float_to_string_intrinsic" then
+  when IntrinsicId::FloatToString then
     deref_all_ref_like_args(ctx, fctx, args, rr)
     codegen_float_to_str(ctx)
-
-  else if name == "bool_to_string" then
+  when IntrinsicId::BoolToString then
     deref_all_ref_like_args(ctx, fctx, args, rr)
     codegen_bool_to_str(ctx)
-
-  else if name == "char_to_string" then
+  when IntrinsicId::CharToString then
     deref_all_ref_like_args(ctx, fctx, args, rr)
     codegen_char_to_str(ctx)
-
-  else if name == "str_to_string" then
+  when IntrinsicId::StrToString then
     deref_all_ref_like_args(ctx, fctx, args, rr)
-
-  else if name == "string_from_bytes" then
+  when IntrinsicId::StringFromBytes then
     codegen_string_from_bytes(ctx)
-
-  else if name == "to_string" then
+  when IntrinsicId::ToString then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_ref_like_type(&arg_ty)
     deref_all_ref_like_args(ctx, fctx, args, rr)
@@ -5300,9 +5801,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     when Type::Char then codegen_char_to_str(ctx)
     when _ then ()
     end
-
-  # Method-receiver intrinsics: the argument is &self (a reference).
-  else if name == "as_bytes" then
+  when IntrinsicId::AsBytes then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     match value_ty
@@ -5311,7 +5810,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       codegen_string_bytes(ctx)
     when _ then deref_all_ref_like_args(ctx, fctx, args, rr)
     end
-  else if name == "as_ptr" || name == "as_str" then
+  when IntrinsicId::AsPtr | IntrinsicId::AsStr then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     let is_string_receiver =
@@ -5328,11 +5827,9 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else
       deref_all_ref_like_args(ctx, fctx, args, rr)
     end
-  else if name == "clone" then
+  when IntrinsicId::Clone then
     deref_all_ref_like_args(ctx, fctx, args, rr)
-
-  # String intrinsics
-  else if name == "len" then
+  when IntrinsicId::Len then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     let is_pure_string =
@@ -5355,22 +5852,22 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       # Vec/Map/Set/Slice — len is stored at offset 8 of the heap header
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       codegen_array_len(ctx)
-    else if is_pure_string then
+    elsif is_pure_string then
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       codegen_strlen(ctx)
     else
       deref_all_ref_like_args(ctx, fctx, args, rr)
       codegen_strlen(ctx)
     end
-  else if name == "str_concat" then
+  when IntrinsicId::StrConcat then
     emit_call_label(ctx, "_tg_str_concat")
-  else if name == "str_len" then
+  when IntrinsicId::StrLen then
     codegen_str_len(ctx)
-  else if name == "str_cmp" then
+  when IntrinsicId::StrCmp then
     codegen_str_cmp(ctx)
-  else if name == "str_find" then
+  when IntrinsicId::StrFind then
     codegen_str_find(ctx)
-  else if name == "starts_with" then
+  when IntrinsicId::StartsWith then
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
@@ -5379,7 +5876,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       end
     end
     codegen_starts_with(ctx)
-  else if name == "ends_with" then
+  when IntrinsicId::EndsWith then
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
@@ -5388,7 +5885,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       end
     end
     codegen_ends_with(ctx)
-  else if name == "string_contains" then
+  when IntrinsicId::StringContains then
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
@@ -5397,125 +5894,106 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       end
     end
     codegen_string_contains(ctx)
-  else if name == "str_copy" then
+  when IntrinsicId::StrCopy then
     codegen_str_copy(ctx)
-  else if name == "str_slice" then
-    codegen_str_slice(ctx)
-  else if name == "int_to_str" then
+  when IntrinsicId::IntToStr then
     codegen_int_to_str(ctx)
-  else if name == "float_to_str" then
+  when IntrinsicId::FloatToStr then
     codegen_float_to_str(ctx)
-  else if name == "str_to_int" then
+  when IntrinsicId::StrToInt then
     codegen_str_to_int(ctx)
-  else if name == "str_to_float" then
+  when IntrinsicId::StrToFloat then
     codegen_str_to_float(ctx)
 
-  # Array/Vec intrinsics
-  # Collection method receivers are references to locals that store the heap
-  # header pointer, so dereference once before invoking the runtime helper.
-  else if name == "array_new" then
-    codegen_array_new(ctx)
-  else if name == "array_push" then
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_push(ctx)
-  else if name == "array_pop" then
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_pop(ctx)
-  else if name == "array_get" then
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_get(ctx)
-  else if name == "array_set" then
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_set(ctx)
-  else if name == "array_len" then
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_len(ctx)
-  else if name == "array_cap" then
+  # Array/Vec — collection method receivers are references to locals that
+  # store the heap header pointer, so dereference once before invoking the
+  # runtime helper.
+  when IntrinsicId::ArrayCap then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_cap(ctx)
-  else if name == "array_remove" then
+  when IntrinsicId::ArrayRemove then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_remove(ctx)
-  else if name == "array_insert" then
+  when IntrinsicId::ArrayInsert then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_insert(ctx)
-  else if name == "array_clear" then
+  when IntrinsicId::ArrayClear then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_clear(ctx)
-  else if name == "array_destroy" then
+  when IntrinsicId::ArrayDestroy then
     match ctx.target.arch
     when Arch::X86_64 then panic("array_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
     when _ then ()
     end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_destroy(ctx)
-  else if name == "array_contains" then
+  when IntrinsicId::ArrayContains then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_array_contains(ctx)
-  else if name == "array_last" then
+  when IntrinsicId::ArrayLast then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_last(ctx)
-  else if name == "array_first" then
+  when IntrinsicId::ArrayFirst then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_first(ctx)
-  else if name == "array_is_empty" then
+  when IntrinsicId::ArrayIsEmpty then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_is_empty(ctx)
-  else if name == "array_reverse" then
+  when IntrinsicId::ArrayReverse then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_reverse(ctx)
-  else if name == "array_sort" then
+  when IntrinsicId::ArraySort then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_sort(ctx)
-  else if name == "array_extend" then
+  when IntrinsicId::ArrayExtend then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_array_extend(ctx)
-  else if name == "array_truncate" then
+  when IntrinsicId::ArrayTruncate then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_truncate(ctx)
-  else if name == "array_resize" then
+  when IntrinsicId::ArrayResize then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_resize(ctx)
 
   # Map intrinsics — dereference &self for all methods (not constructors)
-  else if name == "map_new" then
+  when IntrinsicId::MapNew then
     codegen_map_new(ctx)
-  else if name == "map_insert" then
+  when IntrinsicId::MapInsert then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_insert(ctx)
-  else if name == "map_get" then
+  when IntrinsicId::MapGet then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_map_get(ctx)
-  else if name == "map_remove" then
+  when IntrinsicId::MapRemove then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_map_remove(ctx)
-  else if name == "map_contains" then
+  when IntrinsicId::MapContains then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_map_contains(ctx)
-  else if name == "map_len" then
+  when IntrinsicId::MapLen then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_len(ctx)
-  else if name == "map_clone" then
+  when IntrinsicId::MapClone then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_clone(ctx)
-  else if name == "map_clear" then
+  when IntrinsicId::MapClear then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_clear(ctx)
-  else if name == "map_keys" then
+  when IntrinsicId::MapKeys then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_keys(ctx)
-  else if name == "map_values" then
+  when IntrinsicId::MapValues then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_values(ctx)
-  else if name == "map_entries" then
+  when IntrinsicId::MapEntries then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_entries(ctx)
-  else if name == "map_drain_one" then
+  when IntrinsicId::MapDrainOne then
     # x86 parity is not implemented for the ownership-transfer drain; reject
     # at COMPILE time instead of emitting a runtime trap.
     match ctx.target.arch
@@ -5524,7 +6002,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_drain_one(ctx)
-  else if name == "map_destroy" then
+  when IntrinsicId::MapDestroy then
     match ctx.target.arch
     when Arch::X86_64 then panic("map_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
     when _ then ()
@@ -5533,49 +6011,49 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_map_destroy(ctx)
 
   # Set intrinsics — dereference &self for all methods (not constructors)
-  else if name == "set_new" then
+  when IntrinsicId::SetNew then
     codegen_set_new(ctx)
-  else if name == "set_insert" then
+  when IntrinsicId::SetInsert then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_insert(ctx)
-  else if name == "set_contains" then
+  when IntrinsicId::SetContains then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_set_contains(ctx)
-  else if name == "set_remove" then
+  when IntrinsicId::SetRemove then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
     codegen_set_remove(ctx)
-  else if name == "set_len" then
+  when IntrinsicId::SetLen then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_len(ctx)
-  else if name == "set_clone" then
+  when IntrinsicId::SetClone then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_clone(ctx)
-  else if name == "set_entries" then
+  when IntrinsicId::SetEntries then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_entries(ctx)
-  else if name == "set_drain_one" then
+  when IntrinsicId::SetDrainOne then
     match ctx.target.arch
     when Arch::X86_64 then panic("set_drain_one is not supported on x86-64 (ownership-transfer drain has no x86 parity yet)")
     when _ then ()
     end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_drain_one(ctx)
-  else if name == "set_destroy" then
+  when IntrinsicId::SetDestroy then
     match ctx.target.arch
     when Arch::X86_64 then panic("set_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
     when _ then ()
     end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_destroy(ctx)
-  else if name == "set_clear" then
+  when IntrinsicId::SetClear then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_clear(ctx)
 
   # drop_in_place: typed destruction of the POINTEE of Ptr[T] using the
   # semantic authority's plan (the Ptr builtin method is NOT an empty shim).
-  else if name == "drop_in_place" then
+  when IntrinsicId::DropInPlace then
     if args.len() >= 1 then
       let ptr_ty = operand_type(ctx, fctx, &args[0])
       match ptr_ty
@@ -5601,7 +6079,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     end
   # Typed drop glue: the generic drop[T] library shim is EMPTY; the codegen
   # destroys the CONCRETE argument using the semantic authority's plan.
-  else if name == "drop" then
+  when IntrinsicId::Drop then
     if args.len() >= 1 then
       # The argument may be a reference (Rc's last-release calls
       # drop(&mut inner.value)): the DESTROYED value is the referent. The
@@ -5623,47 +6101,47 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       when _ then ()
       end
     end
+
   # Memory intrinsics
-  else if name == "mem_alloc" then
+  when IntrinsicId::MemAlloc then
     codegen_mem_alloc(ctx)
-  else if name == "mem_free" then
+  when IntrinsicId::MemFree then
     codegen_mem_free(ctx)
-  else if name == "mem_copy" then
+  when IntrinsicId::MemCopy then
     codegen_mem_copy(ctx)
-  else if name == "mem_set" then
+  when IntrinsicId::MemSet then
     codegen_mem_set(ctx)
-  else if name == "mem_zero" then
+  when IntrinsicId::MemZero then
     codegen_mem_zero(ctx)
 
   # Hash intrinsics
-  else if name == "hash_int" then
+  when IntrinsicId::HashInt then
     codegen_hash_int(ctx)
-  else if name == "hash_str" then
+  when IntrinsicId::HashStr then
     codegen_hash_str(ctx)
-  else if name == "hash_combine" then
+  when IntrinsicId::HashCombine then
     codegen_hash_combine(ctx)
 
   # String iteration
-  else if name == "chars" then
+  when IntrinsicId::Chars then
     emit_call_label(ctx, "_tg_str_chars")
 
   # String byte indexing
-  else if name == "char_at" then
+  when IntrinsicId::CharAt then
     codegen_char_at(ctx)
 
   # CString intrinsics (String = raw C string at ABI level)
-  # cstring_new(s: String) → CString: no-op pass-through since String is already char*
-    # cstring_as_ptr(&cs) then loads that raw pointer back out of the local/reference slot.
-  else if name == "cstring_new" then
-    # No-op: just return x0 as-is (the reference/pointer value)
-    # cstring_as_ptr(&cs: &CString) → Ptr[u8]: one deref to get the raw char*
-    # &c_path (stack) → char* (actual C string)
-  else if name == "cstring_as_ptr" then
+  # cstring_new(s: String) → CString: no-op pass-through since String is
+  # already char*; cstring_as_ptr(&cs) then loads that raw pointer back out
+  # of the local/reference slot.
+  when IntrinsicId::CStringNew then
+    ()
+  when IntrinsicId::CStringAsPtr then
     emit_load_mem(ctx, rr, rr, 0)
 
   # String.bytes() → Vec[Int]: create a Vec of the C string's bytes
   # Since this involves allocation and looping, delegate to runtime helper
-  else if name == "bytes" then
+  when IntrinsicId::Bytes then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     if is_string_like_type(&value_ty) then
@@ -5677,12 +6155,12 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   # Enum layout: raw value is either inline tag (0-255) or heap pointer (>=256).
   # Must normalize to discriminant tag before comparing.
   # Option::Some = variant 0, Option::None = variant 1
-  else if name == "is_some" || name == "is_ok" then
+  when IntrinsicId::IsSome then
     emit_load_mem(ctx, rr, rr, 0)
     normalize_enum_value_to_tag(ctx, rr)
     emit_cmp_ri(ctx, rr, 0)
     emit_setcc(ctx, CondKind::Eq, rr)
-  else if name == "is_none" || name == "is_err" then
+  when IntrinsicId::IsNone then
     emit_load_mem(ctx, rr, rr, 0)
     normalize_enum_value_to_tag(ctx, rr)
     emit_cmp_ri(ctx, rr, 0)
@@ -5694,7 +6172,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   #     small inline). Treat as None/Err.
   #   - raw value >= 256: heap pointer to {discriminant, payload}.
   #     discriminant 0 == Some/Ok, 1 == None/Err.
-  else if name == "unwrap" then
+  when IntrinsicId::Unwrap then
     let scratch = scratch_reg(arch)
     emit_load_mem(ctx, rr, rr, 0)
     emit_mov_rr(ctx, scratch, rr)
@@ -5714,7 +6192,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_load_mem(ctx, rr, scratch, 8)
 
   # Option/Result unwrap_or: arg0 = &self (ptr to enum), arg1 = default
-  else if name == "unwrap_or" then
+  when IntrinsicId::UnwrapOr then
     let scratch = scratch_reg(arch)
     emit_load_mem(ctx, rr, rr, 0)
     emit_mov_rr(ctx, scratch, rr)
@@ -5744,65 +6222,96 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     def_label(&mut ctx.text, done_label)
 
   # Process/Environment intrinsics - call runtime functions
-  else if name == "status" then
+  when IntrinsicId::Status then
     emit_call_label(ctx, "_tg_status")
-  else if name == "output" then
+  when IntrinsicId::Output then
     emit_call_label(ctx, "_tg_output")
-  else if name == "stdout_string" then
+  when IntrinsicId::StdoutString then
     emit_call_label(ctx, "_tg_stdout_string")
-  else if name == "stderr_string" then
+  when IntrinsicId::StderrString then
     emit_call_label(ctx, "_tg_stderr_string")
 
   # Formatter intrinsics - these are no-op/identity for code generation
   # The Formatter is a compile-time construct for pretty-printing
-  else if name == "emit" || name == "space" || name == "indent" || name == "dedent" then
+  when IntrinsicId::FormatterNoOp then
     ()  # No-op - formatter state changes don't generate runtime code
-  else if name == "emit_newline" || name == "emit_blank_line" then
+  when IntrinsicId::FormatterEmitNewline then
     ()  # No-op - newline emission is compile-time
-  else if name == "would_overflow" then
+  when IntrinsicId::WouldOverflow then
     # Return false (0) - no overflow check at runtime
     emit_zero_reg(ctx, rr)
 
   # Utility intrinsics
-  else if name == "cmp" then
+  when IntrinsicId::Cmp then
     # Compare two values - use str_cmp for strings, integer compare otherwise
     codegen_str_cmp(ctx)
-  else if name == "to_int" then
+  when IntrinsicId::ToInt then
     # Identity - value is already an int
     ()
-  else if name == "eval" then
-    # Runtime eval not supported - identity pass-through
-    ()
-  else if name == "lint_file" then
+  when IntrinsicId::LintFile then
     # Linting is a compile-time operation - no runtime code
     emit_zero_reg(ctx, rr)
 
   # File constants - return constant values
-  else if name == "SYS_WRITE" then
+  when IntrinsicId::SysWrite then
     emit_mov_ri(ctx, rr, 1)   # __NR_write on Linux
-  else if name == "SYS_READ" then
+  when IntrinsicId::SysRead then
     emit_mov_ri(ctx, rr, 0)   # __NR_read on Linux
-  else if name == "SYS_OPEN" then
+  when IntrinsicId::SysOpen then
     emit_mov_ri(ctx, rr, 2)   # __NR_open on Linux
-  else if name == "SYS_CLOSE" then
+  when IntrinsicId::SysClose then
     emit_mov_ri(ctx, rr, 3)   # __NR_close on Linux
-  else if name == "SYS_EXIT" then
+  when IntrinsicId::SysExit then
     emit_mov_ri(ctx, rr, 60)  # __NR_exit on Linux
-  else if name == "O_WRONLY" then
+  when IntrinsicId::OWriteOnly then
     emit_mov_ri(ctx, rr, 1)
-  else if name == "O_RDWR" then
+  when IntrinsicId::ORdWr then
     emit_mov_ri(ctx, rr, 2)
-  else if name == "O_APPEND" then
+  when IntrinsicId::OAppend then
     emit_mov_ri(ctx, rr, 1024)
-  else if name == "O_CREAT" then
+  when IntrinsicId::OCreate then
     emit_mov_ri(ctx, rr, 64)
-  else if name == "O_TRUNC" then
+  when IntrinsicId::OTrunc then
     emit_mov_ri(ctx, rr, 512)
-  else if name == "open_windows" then
+  when IntrinsicId::OpenWindows then
     # Windows not supported on macOS/Linux - return error
     emit_mov_ri(ctx, rr, -1)
 
-  else
+  # Placeholder intrinsics — fail closed at COMPILE time. These were routed
+  # to semantically wrong handlers (identity/clone/concat) in earlier work;
+  # each now panics instead of corrupting semantics.
+  when IntrinsicId::TrimMatches then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::SplitOnce then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::ToLowercase then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::MapJoinCollect then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::SplitLinesTrim then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringReplace then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringSplit then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::ArraySlice then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::ArrayFromList then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::ArrayCapacity then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::ArrayJoin then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringIsEmptyChars then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringTrim then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringToLowercase then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+  when IntrinsicId::StringSplitLines then
+    panic("internal error: intrinsic `" + name + "` not implemented")
+
+  when _ then
     # Fail closed: an intrinsic with no handler must be a compiler error,
     # never a silent zero (a fake value would corrupt semantics).
     panic("internal error: unknown or unsupported intrinsic `" + name + "`")
@@ -6335,7 +6844,8 @@ def codegen_function(ctx: &mut CodegenCtx, func: &MirFunction) -> Unit
     frame: frame,
     var_locs: var_locs,
     block_labels: block_labels,
-    string_locals: str_locals
+    string_locals: str_locals,
+    glue_synthetic_counter: 0
   }
 
   # Align function start to 4 bytes (required for ARM64 instruction alignment)
@@ -9441,6 +9951,25 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
     let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
     if should_emit then
       ctx.fn_alias.insert(func_name.clone(), ".Lfn_entry." + fi.to_string())
+    end
+    fi = fi + 1
+  end
+
+  # P0-AK: index the bases of `$`-suffixed monomorphized instance names
+  # ("Option__map$i64_str" → "Option__map"). resolve_callee_label's
+  # instance-aware check consults this set in the fail-closed panic path: a
+  # MirFnItem name that is not resolvable itself but IS the base of emitted
+  # instances means the monomorphizer never rewrote that call site — the
+  # instance-identity leak the InstanceId { def, substs } target eliminates.
+  # Built by iterating the functions Vec (deterministic order; the set is
+  # only queried by contains, never iterated).
+  ctx.generic_instance_bases = Set::new()
+  fi = 0
+  while fi < functions.len() do
+    let func_name = functions[fi].name.clone()
+    let dollar_pos = find_instance_dollar(&func_name)
+    if dollar_pos > 0 then
+      ctx.generic_instance_bases.insert(func_name.slice(0, dollar_pos))
     end
     fi = fi + 1
   end

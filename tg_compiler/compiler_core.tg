@@ -9,16 +9,16 @@ use std::process::{run_command}
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
-  Program, AstPath, TypeExpr, TypeExprKind,
+  Program, ModuleId, ModuleInfo, AstPath, TypeExpr, TypeExprKind,
   MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
   FnBody, FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, PatternKind, type_expr_name,
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
 }
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, TypedProgram, extract_import_paths, TypeEnv}
-use tg_compiler::resolver::{resolve_names}
-use tg_compiler::access_check::{access_check}
-use tg_compiler::resource_check::{resource_check}
+use tg_compiler::resolver::{resolve_names, ResolutionError}
+use tg_compiler::access_check::{access_check, AccessError}
+use tg_compiler::resource_check::{resource_check, ResourceError}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
@@ -703,25 +703,98 @@ pub def prepare_parsed(program: &mut Program) -> Unit
   assign_node_ids(program)
 end
 
+# P1 diagnostic aggregation: a failing phase reports its ENTIRE error set,
+# never just the first error. Each error becomes one line of the form
+#   error at <file>:<start>: <message>
+# and lines are joined with "\n". The pipeline's String interface is kept
+# unchanged, so every consumer (compile_file_core, driver, lib) sees the
+# full set without an interface break.
+def join_type_errors(errors: &Vec[TypeError]) -> String
+  var out = ""
+  var first = true
+  for e in errors do
+    if !first then out = out + "\n" end
+    first = false
+    let code_str = match e.code
+    when Option::Some(c) then "[" + c + "] "
+    when Option::None then ""
+    end
+    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + code_str + e.message
+  end
+  out
+end
+
+def join_access_errors(errors: &Vec[AccessError]) -> String
+  var out = ""
+  var first = true
+  for e in errors do
+    if !first then out = out + "\n" end
+    first = false
+    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+  end
+  out
+end
+
+def join_resource_errors(errors: &Vec[ResourceError]) -> String
+  var out = ""
+  var first = true
+  for e in errors do
+    if !first then out = out + "\n" end
+    first = false
+    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+  end
+  out
+end
+
+def join_resolution_errors(errors: &Vec[ResolutionError]) -> String
+  var out = ""
+  var first = true
+  for e in errors do
+    if !first then out = out + "\n" end
+    first = false
+    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+  end
+  out
+end
+
+def join_parse_diagnostics(diags: &Vec[Diagnostic]) -> String
+  var out = ""
+  var first = true
+  for d in diags do
+    if !first then out = out + "\n" end
+    first = false
+    let loc = match d.span
+    when Option::Some(sp) then "error at " + sp.file + ":" + sp.start.to_string() + ": "
+    when Option::None then "error: "
+    end
+    out = out + loc + d.message
+  end
+  out
+end
+
 pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
   prepare_parsed(program)
   match resolve_names(program)
   when Result::Ok(res) then
-    if opts.strict_resolution then
-      env.strict_resolution = true
-    end
+    # P1 (recovery separation): the compilation path ALWAYS runs strict.
+    # Guard: a real compilation with strict_resolution = false is an internal
+    # error, so the flag is forced on unconditionally here (type_check_typed
+    # enforces the same invariant); permissive resolution is unreachable from
+    # compilation and remains only for editor recovery via type_check /
+    # type_check_strict (errors only, never a codegenable TypedProgram).
+    env.strict_resolution = true
     let type_result = type_check_typed(env, program, &res)
     if !type_result.errors.is_empty() then
-      return Result::Err(type_result.errors[0].message)
+      return Result::Err(join_type_errors(&type_result.errors))
     end
     let typed = type_result.program
     let access_errors = access_check(program, &typed)
     if !access_errors.is_empty() then
-      return Result::Err(access_errors[0].message)
+      return Result::Err(join_access_errors(&access_errors))
     end
     let res_result = resource_check(program, &typed)
     if !res_result.errors.is_empty() then
-      return Result::Err(res_result.errors[0].message)
+      return Result::Err(join_resource_errors(&res_result.errors))
     end
     # The authoritative per-function finalize plan flows from the resource
     # checker into the typed program so MIR cleanup is single-sourced (MIR
@@ -741,6 +814,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
       deinit_plans: typed.deinit_plans,
       aggregate_ownership: typed.aggregate_ownership,
       finalize_plan: res_result.finalize_plan,
+      edge_cleanup: res_result.edge_cleanup,
       type_names: typed.type_names,
       deinit_targets: typed.deinit_targets,
       type_fields: typed.type_fields,
@@ -750,7 +824,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     })
   when Result::Err(res_errors) then
     if res_errors.len() > 0 then
-      Result::Err(res_errors[0].message)
+      Result::Err(join_resolution_errors(&res_errors))
     else
       Result::Err("name resolution failed")
     end
@@ -766,7 +840,7 @@ pub def analyze_source(source: String, file: String, opts: &CompilerOptions) -> 
   let parse_out = parse(lex_result)
   let parse_diags = parse_out.diagnostics
   if diag_has_errors(&parse_diags) then
-    return Result::Err("Parse error: " + parse_diags[0].message)
+    return Result::Err(join_parse_diagnostics(&parse_diags))
   end
   var ast = parse_out.program
   var env = type_env_new()
@@ -1235,9 +1309,11 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     prepare_parsed(&mut ast)
   else
     var env = type_env_new()
-    if opts.strict_resolution then
-      env.strict_resolution = true
-    end
+    # P1 (recovery separation): compilation always runs strict — the flag is
+    # forced on unconditionally at the invocation (a real compilation with
+    # strict_resolution = false is an internal error); permissive editor
+    # recovery never produces a TypedProgram.
+    env.strict_resolution = true
     match analyze_program(&mut env, &mut ast, opts)
     when Result::Ok(tp) then
       typed_program = Option::Some(tp)
@@ -1405,14 +1481,35 @@ end
 # ModuleId, modules: Map[ModuleId, Module] } with (ModuleId, name) -> DefId
 # resolution. Until then, same-named types across modules are merged by
 # store_type_def in types.tg.
+#
+# P0-A module table (structural foundation): while flattening, this function
+# (with collect_dep_file below) also builds Program.modules — one ModuleInfo
+# per distinct module, each indexing the contiguous [start, end) range of its
+# items in the flat Program.items. ModuleIds are assigned in processing
+# order: the root module (the main program's top-level items) is id 0, and
+# each distinct dependency gets the next id — the `loaded` set dedups, so
+# every module path is recorded exactly once. The flat Program stays the
+# interface; the modules map is what the Crate/Module identity migration
+# consumes.
 pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Result[Program, String]
   var loaded = Set::new()
   var merged_items = Vec::new()
+  var merged_modules = Vec::new()
   # Program items first  ensures the main program's definitions
   # (especially main) take priority over dependency definitions.
   for item in program.items do
     merged_items.push(item)
   end
+  # P0-A: the root module (id 0, empty path) covers the main program's
+  # top-level items; dependencies get ids 1, 2, ... in processing order.
+  var root_range = Vec::new()
+  root_range.push(0)
+  root_range.push(merged_items.len())
+  merged_modules.push(ModuleInfo {
+    id: ModuleId { id: 0 },
+    path: Vec::new(),
+    item_indices: root_range
+  })
   # Canonical bootstrap source list: when compiling the compiler itself
   # (include_compiler_lib), consume bootstrap/compiler_kernel.manifest exactly
   # like stage0 (sorted std files, then sorted compiler files). User programs
@@ -1426,7 +1523,7 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
     prelude_files()
   end
   for prelude in preludes do
-    match collect_dep_file(prelude, &mut merged_items, &mut loaded)
+    match collect_dep_file(prelude, &mut merged_items, &mut loaded, &mut merged_modules)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, prelude))
@@ -1437,18 +1534,18 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
     # the minimal self-hostable module set. The full lib.tg is reserved for
     # user embedding and pulls in non-bootstrap tooling modules. This keeps the
     # bootstrap compiler closure small (bootstrap/compiler_kernel.manifest).
-    match collect_dep_file("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded)
+    match collect_dep_file("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded, &mut merged_modules)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, "tg_compiler/lib_kernel.tg"))
     end
   end
-  match collect_dep_items(&program, &mut merged_items, &mut loaded)
+  match collect_dep_items(&program, &mut merged_items, &mut loaded, &mut merged_modules)
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err(dep_error_message(e, "<program>"))
   end
-  Result::Ok(Program { items: merged_items, span: program.span })
+  Result::Ok(Program { items: merged_items, modules: merged_modules, span: program.span })
 end
 
 pub def build_dep_file_path(segments: &Vec[String], count: Int) -> Option[String]
@@ -1514,13 +1611,13 @@ pub def dep_use_to_file(u: &UseDecl) -> Option[String]
   end
 end
 
-pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String]) -> Result[Unit, DependencyError]
+pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Vec[ModuleInfo]) -> Result[Unit, DependencyError]
   for item in program.items do
     match item.kind
     when ItemKind::ItemUse(u) then
       match dep_use_to_file(&u)
       when Option::Some(path) then
-        match collect_dep_file(path, out, loaded)
+        match collect_dep_file(path, out, loaded, modules)
         when Result::Ok(_) then ()
         when Result::Err(e) then
           return Result::Err(e)
@@ -1533,7 +1630,27 @@ pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut S
   Result::Ok(())
 end
 
-pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String]) -> Result[Unit, DependencyError]
+# P0-A: derive the module path segments of a dependency file for its
+# ModuleInfo ("std/core.tg" -> ["std", "core"], "tg_compiler/ast.tg" ->
+# ["tg_compiler", "ast"]). The main program is the root module ([]).
+def module_path_from_file(path: &String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Vec[ModuleInfo]) -> Result[Unit, DependencyError]
   if loaded.contains(&path) then
     return Result::Ok(())
   end
@@ -1567,7 +1684,7 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
 
   let dep_ast = dep_parse.program
   # Recurse into this dependency's own imports
-  match collect_dep_items(&dep_ast, out, loaded)
+  match collect_dep_items(&dep_ast, out, loaded, modules)
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err(e)
@@ -1578,9 +1695,22 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
   # each distinct module is processed exactly once; diamond and cyclic imports
   # neither duplicate items nor recurse forever. Items of a module stay
   # contiguous after its own imports, so per-module ordering is preserved.
+  # P0-A (module table): record this module's ModuleInfo here — the `loaded`
+  # dedup above guarantees exactly one entry per distinct module path, and
+  # the ModuleId is its processing order (root = 0, then 1, 2, ... in
+  # dependency-processing order). The item range [start, end) is taken around
+  # the push loop below, so it indexes the flat Program.items exactly.
+  var mod_range = Vec::new()
+  mod_range.push(out.len())
   for item in dep_ast.items do
     out.push(item)
   end
+  mod_range.push(out.len())
+  modules.push(ModuleInfo {
+    id: ModuleId { id: modules.len() },
+    path: module_path_from_file(&path),
+    item_indices: mod_range
+  })
   Result::Ok(())
 end
 
@@ -1616,6 +1746,13 @@ pub struct MacroEnv
   macros: Map[String, MacroDecl]
   # Recursion stack for hygiene (prevents infinite expansion)
   expansion_stack: Vec[String]
+  # P1 (macro hygiene): per-program expansion context counter. Every macro
+  # expansion consumes one context id (see instantiate_macro); the ids stamp
+  # the identifiers the expansion introduces so no two expansions and no
+  # expansion and its surrounding scope can collide. The counter is monotonic
+  # across the 64-pass fixpoint loop (the env outlives all passes), so the
+  # ids are unique per program.
+  expansion_counter: Int
 end
 
 pub struct ExpandedProgram
@@ -1660,7 +1797,7 @@ end
 
 pub def expand_macros(program: Program) -> Program
   # Phase 1: collect macro declarations
-  var env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new() }
+  var env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new(), expansion_counter: 0 }
   for item in program.items do
     match item.kind
     when ItemKind::ItemMacro(m) then
@@ -1695,7 +1832,37 @@ pub def expand_macros(program: Program) -> Program
     when _ then filtered_items.push(item.clone())
     end
   end
-  Program { items: filtered_items, span: current_span }
+  # P0-A (module table): the modules map indexes into the filtered items, so
+  # it is rebuilt here — each module's contiguous [start, end) range shrinks
+  # by the macro declarations dropped before/inside it. The flat Program
+  # stays the interface; the rebuilt table keeps the Crate/Module migration
+  # foundation valid past macro filtering.
+  var filtered_modules = Vec::new()
+  var removed_global = 0
+  var mi = 0
+  while mi < current.modules.len() do
+    let info = current.modules[mi]
+    var removed_in_module = 0
+    var ji = info.item_indices[0]
+    while ji < info.item_indices[1] do
+      match current.items[ji].kind
+      when ItemKind::ItemMacro(_) then removed_in_module = removed_in_module + 1
+      when _ then ()
+      end
+      ji = ji + 1
+    end
+    var new_indices = Vec::new()
+    new_indices.push(info.item_indices[0] - removed_global)
+    new_indices.push(info.item_indices[1] - removed_global - removed_in_module)
+    filtered_modules.push(ModuleInfo {
+      id: info.id,
+      path: info.path.clone(),
+      item_indices: new_indices
+    })
+    removed_global = removed_global + removed_in_module
+    mi = mi + 1
+  end
+  Program { items: filtered_items, modules: filtered_modules, span: current_span }
 end
 
 pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
@@ -1709,7 +1876,10 @@ pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
     if expanded_item.did_expand then did_expand = true end
     i = i + 1
   end
-  ExpandedProgram { program: Program { items: new_items, span: program_span }, did_expand }
+  # P0-A: items map 1:1 through expansion (no insertion/deletion), so the
+  # module table is carried through unchanged and still indexes the new
+  # flat items vector.
+  ExpandedProgram { program: Program { items: new_items, modules: program.modules.clone(), span: program_span }, did_expand }
 end
 
 pub def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
@@ -2030,7 +2200,10 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
           }
         else
           env.expansion_stack.push(name.clone())
-          let expanded = instantiate_macro(macro_decl, &args, &expr.span)
+          # P1 (macro hygiene): each expansion consumes one unique context id
+          # that stamps the identifiers the expansion introduces.
+          env.expansion_counter = env.expansion_counter + 1
+          let expanded = instantiate_macro(macro_decl, &args, &expr.span, env.expansion_counter)
           env.expansion_stack.pop()
           ExpandedExpr { expr: expanded, did_expand: true }
         end
@@ -2060,7 +2233,9 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
         }
       else
         env.expansion_stack.push(name.clone())
-        let expanded = instantiate_macro(macro_decl, &args, &expr.span)
+        # P1 (macro hygiene): unique expansion context id per instantiation.
+        env.expansion_counter = env.expansion_counter + 1
+        let expanded = instantiate_macro(macro_decl, &args, &expr.span, env.expansion_counter)
         env.expansion_stack.pop()
         ExpandedExpr { expr: expanded, did_expand: true }
       end
@@ -2286,7 +2461,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
   end
 end
 
-pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span) -> Expr
+pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span, hygiene_ctx: Int) -> Expr
   # Validate argument count matches parameter count
   if args.len() != macro_decl.params.len() then
     # Return an error expression - type checker will catch this
@@ -2294,6 +2469,40 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
       macro_decl.params.len().to_string() + " arguments, got " + args.len().to_string()),
       span: call_span.clone() }
   end
+
+  # ── P1 macro hygiene (expansion-context stamping) ─────────────────────
+  # Every expansion is assigned a unique numeric context (hygiene_ctx, drawn
+  # from MacroEnv.expansion_counter before this call). The substitution walk
+  # below then distinguishes the two kinds of names the expansion contains:
+  #
+  #   1. USER-VISIBLE tokens — the macro parameters are replaced by the
+  #      argument expressions the user wrote, which are cloned as-is and
+  #      NEVER re-stamped: the user's names stay exactly as spelled.
+  #   2. MACRO-BODY-OWN identifiers — names introduced BY THE MACRO
+  #      DEFINITION (its let-bound temporaries) are re-stamped to the
+  #      reserved form  `__hygiene_<ctx>_<name>`  — binding AND every use of
+  #      that binding inside the body. The resolver keys locals by name
+  #      string, so a stamped binding is a distinct local: it can neither
+  #      capture a surrounding `tmp` (its name no longer matches) nor be
+  #      captured by one (surrounding references to `tmp` no longer see it).
+  #      Free identifiers in expression positions are left untouched: they
+  #      legitimately resolve to names outside the macro.
+  #
+  # Marker scheme: the stamp is a valid identifier for the lexer's charset
+  # (lexer.tg is_ident_char = [A-Za-z0-9_]; `$` is NOT accepted, so `_` is
+  # the join char) and therefore round-trips through any re-lexing, while
+  # `__hygiene_` is a RESERVED prefix: user code must not spell it.
+  # Shadowing rule: names re-bound by constructs the stamp does NOT rename
+  # (closure params, match patterns) shadow the stamp at their references,
+  # so those references stay untouched and keep resolving to the shadow.
+  #
+  # Residual (documented, out of scope): the stamp covers exactly the region
+  # the substitution walk enters (StmtExpr/StmtLet statements; ExprBlock,
+  # ExprIf-cond/then, ExprMatch-arm-body, ExprClosure bodies). Constructs the
+  # walk clones verbatim (while/for/async/comptime statements, if-elsif/else
+  # branches) are outside the stamp — matching their pre-existing
+  # substitution behavior.
+  # ───────────────────────────────────────────────────────────────────────
 
   # Build substitution map: param_name  argument expression
   var subst_map: Map[String, Expr] = Map::new()
@@ -2303,130 +2512,263 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
     i = i + 1
   end
 
-  # Clone the macro body and substitute identifiers matching parameter names
-  let substituted_block = substitute_block(&subst_map, &macro_decl.body)
+  # Clone the macro body, substitute the argument tokens, and stamp the
+  # macro-body-own bindings with this expansion's hygiene context.
+  var empty_frames: Vec[Map[String, Bool]] = Vec::new()
+  let substituted_block = substitute_block(&subst_map, hygiene_ctx, &empty_frames, &macro_decl.body)
 
   # Wrap the block as a block expression
   Expr { kind: ExprKind::ExprBlock(substituted_block), span: call_span.clone(), node_id: 0 }
 end
 
-pub def substitute_block(subst: &Map[String, Expr], block: &Block) -> Block
+# ───────────────────────────────────────────────────────────────────────
+# P1 macro hygiene: expansion-context stamping (see instantiate_macro)
+# ───────────────────────────────────────────────────────────────────────
+# Hygiene frames: a Vec of scope frames, one per entered scope. Each frame
+# maps a name to the kind of its innermost binding: `true` marks a
+# macro-internal let binding (the binding was re-stamped, so its references
+# are re-stamped identically); `false` marks a NON-renamed shadow (closure
+# params and match patterns are NOT re-stamped, so references to them stay
+# as-is). Lookup walks the frames innermost-first; the innermost binding of
+# a name decides how its references are treated.
+
+def hygiene_mangled(ctx: Int, name: String) -> String
+  "__hygiene_" + ctx.to_string() + "_" + name
+end
+
+def hygiene_ident_lookup(frames: &Vec[Map[String, Bool]], name: &String) -> Option[Bool]
+  var fi = frames.len()
+  while fi > 0 do
+    fi = fi - 1
+    match frames[fi].get(name)
+    when Option::Some(b) then return Option::Some(b)
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+def hygiene_collect_pattern_names(pat: &Pattern, out: &mut Vec[String]) -> Unit
+  match pat.kind
+  when PatternKind::Ident(name, _) then out.push(name.clone())
+  when PatternKind::Tuple(ps) then
+    for p in ps do hygiene_collect_pattern_names(&p, out) end
+  when PatternKind::Array(ps) then
+    for p in ps do hygiene_collect_pattern_names(&p, out) end
+  when PatternKind::Struct(_, fields) then
+    for (_, p) in fields do hygiene_collect_pattern_names(&p, out) end
+  when PatternKind::Variant(_, ps) then
+    for p in ps do hygiene_collect_pattern_names(&p, out) end
+  when PatternKind::Or(ps) then
+    for p in ps do hygiene_collect_pattern_names(&p, out) end
+  when _ then ()
+  end
+end
+
+def hygiene_renamed_pattern(ctx: Int, subst: &Map[String, Expr], pat: &Pattern) -> Pattern
+  match pat.kind
+  when PatternKind::Ident(name, is_mut) then
+    # A let-bound name matching a macro parameter is the user's interface
+    # (its occurrences are replaced by the argument tokens, which are never
+    # re-stamped); it is left unrenamed.
+    if subst.contains_key(&name) then
+      Pattern { kind: PatternKind::Ident(name.clone(), is_mut), span: pat.span, node_id: 0 }
+    else
+      Pattern { kind: PatternKind::Ident(hygiene_mangled(ctx, name.clone()), is_mut), span: pat.span, node_id: 0 }
+    end
+  when PatternKind::Tuple(ps) then
+    var new_ps = Vec::new()
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    Pattern { kind: PatternKind::Tuple(new_ps), span: pat.span, node_id: 0 }
+  when PatternKind::Array(ps) then
+    var new_ps = Vec::new()
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    Pattern { kind: PatternKind::Array(new_ps), span: pat.span, node_id: 0 }
+  when PatternKind::Struct(path, fields) then
+    var new_fields = Vec::new()
+    for (fname, p) in fields do
+      new_fields.push((fname.clone(), hygiene_renamed_pattern(ctx, subst, &p)))
+    end
+    Pattern { kind: PatternKind::Struct(path.clone(), new_fields), span: pat.span, node_id: 0 }
+  when PatternKind::Variant(path, ps) then
+    var new_ps = Vec::new()
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    Pattern { kind: PatternKind::Variant(path.clone(), new_ps), span: pat.span, node_id: 0 }
+  when PatternKind::Or(ps) then
+    var new_ps = Vec::new()
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    Pattern { kind: PatternKind::Or(new_ps), span: pat.span, node_id: 0 }
+  when _ then pat.clone()
+  end
+end
+
+def hygiene_push_shadow_frame(frames: &Vec[Map[String, Bool]], names: &Vec[String]) -> Vec[Map[String, Bool]]
+  var new_frames = frames.clone()
+  new_frames.push(Map::new())
+  let last = new_frames.len() - 1
+  for n in names do
+    new_frames[last].insert(n.clone(), false)
+  end
+  new_frames
+end
+
+pub def substitute_block(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], block: &Block) -> Block
+  # Each block opens a hygiene scope: the block's own let bindings land in a
+  # fresh frame, so nested blocks shadow without leaking outward.
+  var inner_frames = frames.clone()
+  inner_frames.push(Map::new())
   var new_stmts = Vec::new()
   var i = 0
   while i < block.stmts.len() do
-    new_stmts.push(substitute_stmt(subst, &block.stmts[i]))
+    new_stmts.push(substitute_stmt(subst, ctx, &inner_frames, &block.stmts[i]))
     i = i + 1
   end
   Block { stmts: new_stmts, span: block.span }
 end
 
-pub def substitute_stmt(subst: &Map[String, Expr], stmt: &Stmt) -> Stmt
+pub def substitute_stmt(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], stmt: &Stmt) -> Stmt
   match stmt.kind
   when StmtKind::StmtExpr(expr) then
-    Stmt { kind: StmtKind::StmtExpr(substitute_expr(subst, &expr)), span: stmt.span, node_id: 0 }
+    Stmt { kind: StmtKind::StmtExpr(substitute_expr(subst, ctx, frames, &expr)), span: stmt.span, node_id: 0 }
   when StmtKind::StmtLet(pat, ty, init, is_mut) then
-    let new_init = substitute_expr(subst, &init)
-    Stmt { kind: StmtKind::StmtLet(pat.clone(), ty.clone(), new_init, is_mut), span: stmt.span, node_id: 0 }
+    # P1 (macro hygiene): the let-bound temporaries the macro body itself
+    # introduces are re-stamped with the expansion context. The init is
+    # substituted BEFORE the binding enters the hygiene frame, so an
+    # init-side reference to the same name still resolves to the enclosing
+    # scope (unchanged semantics).
+    let new_init = substitute_expr(subst, ctx, frames, &init)
+    let new_pat = hygiene_renamed_pattern(ctx, subst, &pat)
+    # The frame is keyed by the ORIGINAL spellings: a later reference (also
+    # spelled originally) is re-stamped with the same context, landing on
+    # the same `__hygiene_<ctx>_<name>` as the binding.
+    var names = Vec::new()
+    hygiene_collect_pattern_names(&pat, &mut names)
+    let last_frame = frames.len() - 1
+    for n in names do
+      frames[last_frame].insert(n.clone(), true)
+    end
+    Stmt { kind: StmtKind::StmtLet(new_pat, ty.clone(), new_init, is_mut), span: stmt.span, node_id: 0 }
   when _ then stmt.clone()
   end
 end
 
-pub def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
+pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], expr: &Expr) -> Expr
   match expr.kind
   when ExprKind::ExprPath(path) then
     let name = path_to_name(&path)
     match subst.get(&name)
     when Option::Some(replacement) then replacement.clone()
-    when Option::None then expr.clone()
+    when Option::None then
+      # P1 (macro hygiene): re-stamp only bare paths; qualified paths
+      # (e.g. Benchmark::new) can never name a local.
+      if path.segments.len() == 1 then
+        match hygiene_ident_lookup(frames, &name)
+        when Option::Some(true) then
+          var new_segs = Vec::new()
+          new_segs.push(hygiene_mangled(ctx, name.clone()))
+          Expr { kind: ExprKind::ExprPath(AstPath { segments: new_segs, span: path.span }), span: expr.span, node_id: 0 }
+        when _ then expr.clone()
+        end
+      else
+        expr.clone()
+      end
     end
   when ExprKind::ExprIdent(name) then
     match subst.get(&name)
     when Option::Some(replacement) then replacement.clone()
-    when Option::None then expr.clone()
+    when Option::None then
+      # P1 (macro hygiene): references to a re-stamped macro-internal let
+      # binding are re-stamped identically; references to a shadow (closure
+      # param / match pattern) or to a free name stay untouched.
+      match hygiene_ident_lookup(frames, &name)
+      when Option::Some(true) then
+        Expr { kind: ExprKind::ExprIdent(hygiene_mangled(ctx, name.clone())), span: expr.span, node_id: 0 }
+      when _ then expr.clone()
+      end
     end
   when ExprKind::ExprCall(callee, args) then
-    let new_callee = substitute_expr(subst, &callee)
+    let new_callee = substitute_expr(subst, ctx, frames, &callee)
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
-      new_args.push(substitute_expr(subst, &args[i]))
+      new_args.push(substitute_expr(subst, ctx, frames, &args[i]))
       i = i + 1
     end
     Expr { kind: ExprKind::ExprCall(Box::new(new_callee), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, ctx, frames, &lhs)), Box::new(substitute_expr(subst, ctx, frames, &rhs))), span: expr.span, node_id: 0 }
   when ExprKind::ExprUnaryOp(op, operand) then
-    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, &operand))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, ctx, frames, &operand))), span: expr.span, node_id: 0 }
   when ExprKind::ExprBlock(block) then
-    Expr { kind: ExprKind::ExprBlock(substitute_block(subst, &block)), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprBlock(substitute_block(subst, ctx, frames, &block)), span: expr.span, node_id: 0 }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let new_recv = substitute_expr(subst, &receiver)
+    let new_recv = substitute_expr(subst, ctx, frames, &receiver)
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
-      new_args.push(substitute_expr(subst, &args[i]))
+      new_args.push(substitute_expr(subst, ctx, frames, &args[i]))
       i = i + 1
     end
     Expr { kind: ExprKind::ExprMethodCall(Box::new(new_recv), method.clone(), targs.clone(), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprEnumVariant(path, args) then
     var new_args = Vec::new()
     for arg in args do
-      new_args.push(substitute_expr(subst, &arg))
+      new_args.push(substitute_expr(subst, ctx, frames, &arg))
     end
     Expr { kind: ExprKind::ExprEnumVariant(path.clone(), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprFieldAccess(obj, field) then
-    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, &obj)), field.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, ctx, frames, &obj)), field.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprIndex(obj, idx) then
-    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, &obj)), Box::new(substitute_expr(subst, &idx))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, ctx, frames, &obj)), Box::new(substitute_expr(subst, ctx, frames, &idx))), span: expr.span, node_id: 0 }
   when ExprKind::ExprArrayLit(elems) then
     var new_elems = Vec::new()
-    for e in elems do new_elems.push(substitute_expr(subst, &e)) end
+    for e in elems do new_elems.push(substitute_expr(subst, ctx, frames, &e)) end
     Expr { kind: ExprKind::ExprArrayLit(new_elems), span: expr.span, node_id: 0 }
   when ExprKind::ExprTupleLit(elems) then
     var new_elems = Vec::new()
-    for e in elems do new_elems.push(substitute_expr(subst, &e)) end
+    for e in elems do new_elems.push(substitute_expr(subst, ctx, frames, &e)) end
     Expr { kind: ExprKind::ExprTupleLit(new_elems), span: expr.span, node_id: 0 }
   when ExprKind::ExprStructLit(path, fields) then
     var new_fields = Vec::new()
     for (field_name, field_value) in fields do
-      new_fields.push((field_name.clone(), substitute_expr(subst, &field_value)))
+      new_fields.push((field_name.clone(), substitute_expr(subst, ctx, frames, &field_value)))
     end
     Expr { kind: ExprKind::ExprStructLit(path.clone(), new_fields), span: expr.span, node_id: 0 }
   when ExprKind::ExprMapLit(entries) then
     var new_entries = Vec::new()
     for (key_expr, value_expr) in entries do
-      new_entries.push((substitute_expr(subst, &key_expr), substitute_expr(subst, &value_expr)))
+      new_entries.push((substitute_expr(subst, ctx, frames, &key_expr), substitute_expr(subst, ctx, frames, &value_expr)))
     end
     Expr { kind: ExprKind::ExprMapLit(new_entries), span: expr.span, node_id: 0 }
   when ExprKind::ExprAccess(inner) then
-    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRawDeref(inner) then
-    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprAwait(inner) then
-    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprTry(inner) then
-    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
-    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, &start)))
+    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, ctx, frames, &start)))
     when Option::None then Option::None
     end
     let new_end = match end_expr
-    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, &end_expr_inner)))
+    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, ctx, frames, &end_expr_inner)))
     when Option::None then Option::None
     end
     Expr { kind: ExprKind::ExprRange(new_start, new_end, inclusive), span: expr.span, node_id: 0 }
   when ExprKind::ExprCast(inner, ty) then
-    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, ctx, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, ctx, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprAssign(target, value) then
-    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, &target)), Box::new(substitute_expr(subst, &value))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, ctx, frames, &target)), Box::new(substitute_expr(subst, ctx, frames, &value))), span: expr.span, node_id: 0 }
   when ExprKind::ExprPipe(lhs, rhs) then
-    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, &lhs)), Box::new(substitute_expr(subst, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, ctx, frames, &lhs)), Box::new(substitute_expr(subst, ctx, frames, &rhs))), span: expr.span, node_id: 0 }
   when ExprKind::ExprIf(if_expr) then
-    let new_cond = substitute_expr(subst, &if_expr.cond)
-    let new_then = substitute_block(subst, &if_expr.then_block)
+    let new_cond = substitute_expr(subst, ctx, frames, &if_expr.cond)
+    let new_then = substitute_block(subst, ctx, frames, &if_expr.then_block)
     let new_if = IfStmt {
       cond: new_cond,
       then_block: new_then,
@@ -2436,28 +2778,42 @@ pub def substitute_expr(subst: &Map[String, Expr], expr: &Expr) -> Expr
     }
     Expr { kind: ExprKind::ExprIf(new_if), span: expr.span, node_id: 0 }
   when ExprKind::ExprUnsafe(reason, block) then
-    Expr { kind: ExprKind::ExprUnsafe(reason.clone(), substitute_block(subst, &block)), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprUnsafe(reason.clone(), substitute_block(subst, ctx, frames, &block)), span: expr.span, node_id: 0 }
   when ExprKind::ExprMatch(match_expr) then
     var new_arms = Vec::new()
     for arm in match_expr.arms do
+      # Match patterns are NOT re-stamped: they shadow macro-internal names
+      # inside the arm (guard + body), and references to them stay as-is.
+      var arm_names = Vec::new()
+      hygiene_collect_pattern_names(&arm.pattern, &mut arm_names)
+      let arm_frames = hygiene_push_shadow_frame(frames, &arm_names)
       let new_guard = match arm.guard_expr
-      when Option::Some(guard_expr) then Option::Some(substitute_expr(subst, &guard_expr))
+      when Option::Some(guard_expr) then Option::Some(substitute_expr(subst, ctx, &arm_frames, &guard_expr))
       when Option::None then Option::None
       end
       new_arms.push(MatchArm {
         pattern: arm.pattern.clone(),
         guard_expr: new_guard,
-        body: substitute_block(subst, &arm.body),
+        body: substitute_block(subst, ctx, &arm_frames, &arm.body),
         span: arm.span
       })
     end
     Expr { node_id: 0, kind: ExprKind::ExprMatch(MatchExpr {
-      scrutinee: substitute_expr(subst, &match_expr.scrutinee),
+      scrutinee: substitute_expr(subst, ctx, frames, &match_expr.scrutinee),
       arms: new_arms,
       span: match_expr.span
     }), span: expr.span }
   when ExprKind::ExprClosure(params, ret_ty, body) then
-    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, &body))), span: expr.span, node_id: 0 }
+    # Closure params are NOT re-stamped: they shadow macro-internal names
+    # inside the closure body, and references to them stay as-is.
+    var param_names = Vec::new()
+    var pi = 0
+    while pi < params.len() do
+      hygiene_collect_pattern_names(&params[pi].pat, &mut param_names)
+      pi = pi + 1
+    end
+    let closure_frames = hygiene_push_shadow_frame(frames, &param_names)
+    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, ctx, &closure_frames, &body))), span: expr.span, node_id: 0 }
   when _ then expr.clone()
   end
 end
@@ -2545,7 +2901,19 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
     println("No valid items found in input files")
     return 1
   end
-  let merged_ast = Program { items: all_items, span: all_items[0].span }
+  # P0-A (module table): multiple files are concatenated into one flat items
+  # vector, so the root module (id 0, empty path) covers all of them; the
+  # per-file module table is rebuilt by merge_imported_deps below.
+  var merged_modules = Vec::new()
+  var merged_range = Vec::new()
+  merged_range.push(0)
+  merged_range.push(all_items.len())
+  merged_modules.push(ModuleInfo {
+    id: ModuleId { id: 0 },
+    path: Vec::new(),
+    item_indices: merged_range
+  })
+  let merged_ast = Program { items: all_items, modules: merged_modules, span: all_items[0].span }
 
   # ── canonical pipeline: merge -> analyze_parsed -> lower -> emit ────────
   # Semantic stages (macro expansion, node ids, resolution, type/access/
@@ -2569,9 +2937,11 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   var typed_program: Option[TypedProgram] = Option::None
   if !skip_bootstrap_semantic_checks then
     var env = type_env_new()
-    if opts.strict_resolution then
-      env.strict_resolution = true
-    end
+    # P1 (recovery separation): compilation always runs strict — the flag is
+    # forced on unconditionally at the invocation (a real compilation with
+    # strict_resolution = false is an internal error); permissive editor
+    # recovery never produces a TypedProgram.
+    env.strict_resolution = true
     match analyze_program(&mut env, &mut ast, opts)
     when Result::Ok(tp) then
       typed_program = Option::Some(tp)

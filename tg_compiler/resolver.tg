@@ -14,7 +14,7 @@ use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
                         Pattern, PatternKind, TypeExpr, TypeExprKind, UseDecl, ModuleDecl, Visibility, AstPath,
                         Param, TraitMethod, GenericParam, Function, ExternItem}
 use tg_compiler::token::{Span}
-use tg_compiler::ids::{DefId, DefKind}
+use tg_compiler::ids::{DefId, DefKind, FieldId, StableDefId}
 
 # ———————————————————————————————————————————————————————————————
 # Resolution Errors
@@ -35,6 +35,7 @@ enum ResolutionErrorKind
   VisibilityViolation
   CyclicImport
   AmbiguousName
+  StableIdCollision
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -47,6 +48,17 @@ struct SymbolTable
 
   # Current path for resolution
   current_module: Vec[String]
+
+  # P0-A (structural foundation — module identity): module-qualified symbol
+  # keys "path::name" (path = the owner ModuleInfo path from Program.modules,
+  # i.e. the module of the item being registered) -> DefId. Same-named items
+  # in different modules are distinguishable here, unlike the bare-name
+  # first-wins tables above which stay as the compatibility fallback. This is
+  # the foundation the Crate { root: ModuleId, modules: Map[ModuleId,
+  # Module] } migration consumes for (ModuleId, name) -> DefId resolution;
+  # the entries are purely additive — nothing reads them yet, so the
+  # bootstrap's resolution behavior is unchanged.
+  module_symbols: Map[String, DefId]
 
   # Errors collected during resolution
   errors: Vec[ResolutionError]
@@ -171,6 +183,18 @@ struct ResolvedNames
   # offset in different files never collide — unlike span.start-based keys).
   item_defs: Map[Int, Vec[DefId]]
 
+  # P0-A (next layer — module-qualified type identity): snapshot of the
+  # symbol table's module_symbols ("path::name" -> DefId, see
+  # SymbolTable.module_symbols), taken after symbol-table construction so
+  # the type checker can consult module-qualified symbol identity when the
+  # same bare name is registered from multiple module paths. The type
+  # checker's record_module_type_name mirrors the DefKind::TypeName entries
+  # into its own module_type_names map at type-registration time, and
+  # lookup_module_symbol / module_path_of operate over the live symbol
+  # table. Purely additive: nothing reads it for resolution decisions
+  # before the type checker consumes the mirror.
+  module_symbols: Map[String, DefId]
+
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
 end
@@ -179,13 +203,7 @@ end
 # Stable IDs for Incremental Compilation
 # ———————————————————————————————————————————————————————————————
 
-# A stable def ID is a content-based hash that survives across
-# compilations even when source positions change. It is computed
-# from the fully-qualified path + signature of the definition.
-struct StableDefId
-  hash: UInt       # 64-bit FNV-1a hash of the canonical path
-  path: String     # Human-readable path (e.g., "std::collections::Vec::push")
-end
+# StableDefId (the id record itself) lives in ids.tg.
 
 struct StableIdMap
   # Ephemeral node ID -> stable def ID
@@ -194,13 +212,21 @@ struct StableIdMap
   stable_to_node: Map[UInt, Int]
   # Cache fingerprints: stable ID -> hash of result
   fingerprints: Map[UInt, UInt]
+  # Registered id -> canonical key (id -> key), populated at assignment
+  # and verified at every stable-id lookup: finding a DIFFERENT key for an
+  # already-registered id is an internal error (hash collision).
+  stable_keys: Map[UInt, String]
+  # Sequential counter for collision-avoiding disambiguated ids
+  next_collision_id: UInt
 end
 
 def stable_id_map_new() -> StableIdMap
   StableIdMap {
     node_to_stable: Map::new(),
     stable_to_node: Map::new(),
-    fingerprints: Map::new()
+    fingerprints: Map::new(),
+    stable_keys: Map::new(),
+    next_collision_id: 0
   }
 end
 
@@ -214,11 +240,13 @@ def compute_stable_def_id(module_path: &Vec[String], name: &String, signature: &
   if !path.is_empty() then path = path + "::" end
   path = path + name
 
-  # FNV-1a hash of path + signature
+  # FNV-1a hash of the canonical key (path + "#" + signature). The stable
+  # id derives ONLY from this canonical string — no counters, no item
+  # indices — so it is independent of the order of merged program items.
   let full = path.clone() + "#" + signature
-  let hash = fnv1a_hash(full)
+  let hash = fnv1a_hash(full.clone())
 
-  StableDefId { hash: hash, path: path }
+  StableDefId { hash: hash, key: full, path: path, id: hash }
 end
 
 def fnv1a_hash(s: String) -> UInt
@@ -232,16 +260,64 @@ def fnv1a_hash(s: String) -> UInt
   hash
 end
 
-def register_stable_id(map: &mut StableIdMap, node_id: Int, stable_id: StableDefId) -> Unit
-  map.stable_to_node.insert(stable_id.hash, node_id)
-  map.node_to_stable.insert(node_id, stable_id)
+def register_stable_id(map: &mut StableIdMap, symbols: &mut SymbolTable, node_id: Int, stable_id: StableDefId) -> Unit
+  # Populate the id -> canonical key map at assignment. The registered id
+  # is the FNV hash by default; if a DIFFERENT canonical key already
+  # occupies that hash it is a collision: record a diagnostic and
+  # disambiguate the mapping with a sequential counter. The pure FNV hash
+  # stays a separate field of StableDefId, used only for incremental
+  # cache keys, and verify_stable_key checks the key on every lookup.
+  var id = stable_id.hash
+  match map.stable_keys.get(stable_id.hash)
+  when Option::Some(existing) then
+    if existing.clone() == stable_id.key then
+      # Same canonical key re-registered (e.g. a deduplicated item):
+      # keep the original hash mapping.
+      map.node_to_stable.insert(node_id, stable_id)
+      return
+    end
+    rs_add_error(symbols, ResolutionErrorKind::StableIdCollision,
+      "stable id collision between `" + existing + "` and `" + stable_id.key.clone() + "`",
+      Span { file: "", start: 0, end_pos: 0 })
+    map.next_collision_id = map.next_collision_id + 1
+    id = stable_id.hash + map.next_collision_id
+    while map.stable_to_node.contains_key(&id) do
+      map.next_collision_id = map.next_collision_id + 1
+      id = stable_id.hash + map.next_collision_id
+    end
+  when Option::None then
+    ()
+  end
+  map.stable_keys.insert(id, stable_id.key.clone())
+  map.stable_to_node.insert(id, node_id)
+  map.node_to_stable.insert(node_id, StableDefId {
+    hash: stable_id.hash,
+    key: stable_id.key,
+    path: stable_id.path,
+    id: id
+  })
 end
 
 def lookup_stable(map: &StableIdMap, node_id: Int) -> Option[&StableDefId]
   map.node_to_stable.get(node_id)
 end
 
-def lookup_by_stable_hash(map: &StableIdMap, hash: UInt) -> Option[Int]
+# Verify that the canonical key stored for an id is the one the caller
+# recomputed. A mismatch means two distinct keys were assigned the same
+# id — an internal error, not a user error.
+def verify_stable_key(map: &StableIdMap, id: UInt, expected_key: &String) -> Unit
+  match map.stable_keys.get(id)
+  when Option::Some(stored) then
+    if stored.clone() != expected_key.clone() then
+      panic("internal error: stable id " + id.to_string() + " was registered for `" + stored + "` but lookup expected `" + expected_key + "`")
+    end
+  when Option::None then
+    ()
+  end
+end
+
+def lookup_by_stable_hash(map: &StableIdMap, hash: UInt, expected_key: &String) -> Option[Int]
+  verify_stable_key(map, hash, expected_key)
   match map.stable_to_node.get(hash)
   when Option::Some(id) then Option::Some(id)
   when Option::None then Option::None
@@ -268,12 +344,12 @@ end
 enum ResolvedExprKind
   LocalVar(String)
   Parameter(String, Int)
-  Function(String)
-  Method(String, String)  # (type_name, method_name)
+  Function(DefId)  # the resolved function's DefId (module + symbol index)
+  Method(DefId)    # DefId from method_defs ("Type::method" -> DefId)
   Constant(String)
   Static(String)
-  EnumVariant(String, String)  # (enum_name, variant_name)
-  StructField(String, String)  # (struct_name, field_name)
+  Variant(DefId, UInt)  # (owner DefId, variant index) — ID-based identity
+  Field(FieldId)        # (owner TypeId, index)
 end
 
 struct ResolvedType
@@ -398,6 +474,12 @@ def resolve_names(program: &Program) -> Result[ResolvedNames, Vec[ResolutionErro
   # Phase 3: Resolve all name references
   resolve_program(&mut ctx, program)
 
+  # P0-A (next layer): snapshot the module-qualified symbol map
+  # ("path::name" -> DefId) for the type checker, which mirrors the
+  # TypeName entries into its own module_type_names at type-registration
+  # time (see record_module_type_name in types.tg).
+  ctx.resolved.module_symbols = ctx.symbols.module_symbols.clone()
+
   if ctx.symbols.errors.is_empty() then
     Result::Ok(ctx.resolved)
   else
@@ -416,6 +498,7 @@ def context_new() -> ResolutionContext
       call_targets: Map::new(),
       method_defs: Map::new(),
       item_defs: Map::new(),
+      module_symbols: Map::new(),
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"],
@@ -427,6 +510,7 @@ def symbol_table_new() -> SymbolTable
   SymbolTable {
     root: module_symbols_new("".to_string()),
     current_module: Vec::new(),
+    module_symbols: Map::new(),
     errors: Vec::new(),
     import_graph: Map::new()
   }
@@ -471,10 +555,39 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def build_resolver_symbol_table(ctx: &mut ResolutionContext, program: &Program) -> Unit
+  # P0-A (module context): program.modules partitions the flat items vector
+  # into contiguous [start, end) ranges, one per module, in flat order (built
+  # by merge_imported_deps in compiler_core.tg; ranges are kept valid through
+  # macro expansion/filtering). The pointer walk below resolves the owner
+  # ModuleInfo for every top-level item; add_item_to_symbols records each
+  # symbol under its module-qualified key "path::name" in addition to the
+  # bare-name first-wins tables, which stay untouched (purely additive).
+  var module_ptr = 0
   var item_idx = 0
   while item_idx < program.items.len() do
+    # Advance past module ranges already fully covered (empty modules have
+    # start == end and are skipped the same way; a missing/empty modules
+    # table falls back to the root path for every item).
+    var advanced = true
+    while advanced do
+      advanced = false
+      if module_ptr < program.modules.len() then
+        let info = program.modules[module_ptr]
+        if info.item_indices.len() >= 2 && item_idx >= info.item_indices[1] then
+          module_ptr = module_ptr + 1
+          advanced = true
+        end
+      end
+    end
+    var owner_path = Vec::new()
+    if module_ptr < program.modules.len() then
+      let info = program.modules[module_ptr]
+      for seg in info.path do
+        owner_path.push(seg.clone())
+      end
+    end
     let item = program.items[item_idx]
-    add_item_to_symbols(ctx, &item)
+    add_item_to_symbols(ctx, &item, &owner_path)
     record_item_def(ctx, &item, item_idx)
     item_idx = item_idx + 1
   end
@@ -546,7 +659,85 @@ def module_name_in_use(module: &ModuleSymbols, name: &String) -> Bool
   module.submodules.contains_key(name)
 end
 
-def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
+# P0-A: the module-qualified symbol key "path::name" for SymbolTable
+# .module_symbols. The path comes from the owner ModuleInfo (Program.modules);
+# root-module symbols (empty path) degenerate to the bare name, so the
+# qualified entries are exact supersets of the bare-name first-wins table.
+def module_qualified_key(qualified_path: &Vec[String], name: &String) -> String
+  let joined = qualified_path.join("::")
+  if joined.is_empty() then
+    name.clone()
+  else
+    joined + "::" + name
+  end
+end
+
+# P0-A (next layer): lookup a module-qualified symbol by its exact owner
+# path and bare name — the "path::name" key form module_symbols uses. The
+# path is the owner ModuleInfo path from Program.modules (plus any inline
+# module segments); the root module's empty path degenerates to the bare
+# name, matching module_qualified_key. Returns the DefId registered for
+# exactly this (path, name) pair, or None if no such symbol exists.
+def lookup_module_symbol(symbols: &SymbolTable, path: &Vec[String], name: String) -> Option[DefId]
+  let key = module_qualified_key(path, &name)
+  symbols.module_symbols.get(key)
+end
+
+# P0-A (final layer): module-qualified CALLABLE lookup — the module_symbols
+# entry for exactly this (path, name) pair, filtered to the requested DefKind
+# (Function/Constant/Static). The kind filter guarantees a type name and a
+# function name never collide through this path, even when the same bare
+# name serves both roles in different modules. The type checker consumes
+# this for its function/const/static bare-name identity: the current
+# module's own qualified definition shadows other modules' same-named
+# definitions, and a bare name with >= 2 DISTINCT qualified definitions is
+# ambiguous (see resolve_bare_callable in types.tg).
+def lookup_module_callable(symbols: &SymbolTable, path: &Vec[String], name: String, kind: DefKind) -> Option[DefId]
+  let key = module_qualified_key(path, &name)
+  match symbols.module_symbols.get(key)
+  when Option::Some(did) then
+    if did.kind == kind then
+      Option::Some(did)
+    else
+      Option::None
+    end
+  when Option::None then
+    Option::None
+  end
+end
+
+# P0-A (next layer): recover the module path segments recorded for a DefId
+# by parsing the module_symbols keys ("path::name"): find the key whose
+# value is the given DefId and strip the trailing "::name" (rfind = last
+# separator, so paths containing "::" are handled). The root module's
+# bare key (no separator) yields an empty path. Returns an empty path if
+# the DefId was never registered in module_symbols.
+def module_path_of(symbols: &SymbolTable, def_id: DefId) -> Vec[String]
+  for (key, did) in symbols.module_symbols.entries() do
+    if did.module == def_id.module && did.index == def_id.index && did.kind == def_id.kind then
+      match key.rfind("::")
+      when Option::Some(pos) then
+        return key.slice(0, pos).split("::")
+      when Option::None then
+        return Vec::new()
+      end
+    end
+  end
+  Vec::new()
+end
+
+def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &Vec[String]) -> Unit
+  # P0-A: the module-qualified path of this item's owner — the ModuleInfo
+  # path from Program.modules (file-level module identity) plus any inline
+  # module segments the resolver is currently inside. Each registered symbol
+  # is additionally recorded under "path::name" in symbols.module_symbols
+  # (flushed below, after the bare-name first-wins tables are updated), so
+  # same-named items in different modules are distinguishable.
+  var qualified_path = module_path.clone()
+  for seg in ctx.symbols.current_module do
+    qualified_path.push(seg.clone())
+  end
+  var qualified_regs = Vec::new()
   let module = get_current_module(&mut ctx.symbols)
 
   match item.kind
@@ -565,6 +756,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &f.name) then
       module.functions.insert(f.name.clone(), sym)
       assign_symbol_index(module, &f.name)
+      match symbol_index_of(module, &f.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &f.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::Function
+        }))
+      when Option::None then ()
+      end
     end
 
   when ItemKind::ItemStruct(s) then
@@ -579,6 +779,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &s.name) then
       module.types.insert(s.name.clone(), sym)
       assign_symbol_index(module, &s.name)
+      match symbol_index_of(module, &s.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::TypeName
+        }))
+      when Option::None then ()
+      end
     end
 
   when ItemKind::ItemEnum(e) then
@@ -593,6 +802,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &e.name) then
       module.types.insert(e.name.clone(), sym)
       assign_symbol_index(module, &e.name)
+      match symbol_index_of(module, &e.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &e.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::TypeName
+        }))
+      when Option::None then ()
+      end
     end
     # Record every variant name so bare references (`Some`, `None`, `Zero`)
     # in expression position resolve as enum variants.
@@ -600,6 +818,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
       if !module.variants.contains(&v.name) then
         module.variants.insert(v.name.clone())
         assign_variant_index(module, &v.name)
+        match variant_index_of(module, &v.name)
+        when Option::Some(vidx) then
+          qualified_regs.push((module_qualified_key(&qualified_path, &v.name), DefId {
+            module: qualified_path.join("::"),
+            index: vidx,
+            kind: DefKind::EnumVariant
+          }))
+        when Option::None then ()
+        end
       end
     end
 
@@ -617,6 +844,9 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
       module.traits.insert(t.name.clone(), sym)
       assign_symbol_index(module, &t.name)
     end
+    # P0-A: traits get no module-qualified entry yet — DefKind (ids.tg) has
+    # no Trait variant; their qualified keys arrive with the Crate migration
+    # when the kind set is extended.
 
   when ItemKind::ItemImpl(impl_block) then
     # Process impl items as methods
@@ -643,6 +873,11 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
             index: midx,
             kind: DefKind::Method
           })
+          qualified_regs.push((module_qualified_key(&qualified_path, &key), DefId {
+            module: qualified_path.join("::"),
+            index: midx,
+            kind: DefKind::Method
+          }))
         when Option::None then ()
         end
       end
@@ -667,6 +902,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &c.name) then
       module.constants.insert(c.name.clone(), csym)
       assign_symbol_index(module, &c.name)
+      match symbol_index_of(module, &c.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &c.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::Constant
+        }))
+      when Option::None then ()
+      end
     end
 
   when ItemKind::ItemModule(m) then
@@ -680,7 +924,7 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     end
     ctx.symbols.current_module.push(m.name.clone())
     for inner in m.items do
-      add_item_to_symbols(ctx, &inner)
+      add_item_to_symbols(ctx, &inner, module_path)
     end
     let _ = ctx.symbols.current_module.pop()
 
@@ -695,6 +939,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &s.name) then
       module.statics.insert(s.name.clone(), sym)
       assign_symbol_index(module, &s.name)
+      match symbol_index_of(module, &s.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::Static
+        }))
+      when Option::None then ()
+      end
     end
 
   when ItemKind::ItemTypeAlias(t) then
@@ -708,6 +961,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
     if !module_name_in_use(module, &t.name) then
       module.types.insert(t.name.clone(), sym)
       assign_symbol_index(module, &t.name)
+      match symbol_index_of(module, &t.name)
+      when Option::Some(idx) then
+        qualified_regs.push((module_qualified_key(&qualified_path, &t.name), DefId {
+          module: qualified_path.join("::"),
+          index: idx,
+          kind: DefKind::TypeName
+        }))
+      when Option::None then ()
+      end
     end
 
   when ItemKind::ItemExternBlock(ext) then
@@ -727,6 +989,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
         if !module_name_in_use(module, &f.name) then
           module.functions.insert(f.name.clone(), sym)
           assign_symbol_index(module, &f.name)
+          match symbol_index_of(module, &f.name)
+          when Option::Some(idx) then
+            qualified_regs.push((module_qualified_key(&qualified_path, &f.name), DefId {
+              module: qualified_path.join("::"),
+              index: idx,
+              kind: DefKind::Function
+            }))
+          when Option::None then ()
+          end
         end
       when ExternItem::Static(s) then
         let sym = StaticSymbol {
@@ -739,6 +1010,15 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
         if !module_name_in_use(module, &s.name) then
           module.statics.insert(s.name.clone(), sym)
           assign_symbol_index(module, &s.name)
+          match symbol_index_of(module, &s.name)
+          when Option::Some(idx) then
+            qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
+              module: qualified_path.join("::"),
+              index: idx,
+              kind: DefKind::Static
+            }))
+          when Option::None then ()
+          end
         end
       end
     end
@@ -753,8 +1033,21 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item) -> Unit
       module.capabilities.insert(cap.name.clone(), csym)
       assign_symbol_index(module, &cap.name)
     end
+    # P0-A: capabilities get no module-qualified entry yet — DefKind
+    # (ids.tg) has no Capability variant; they arrive with the Crate
+    # migration when the kind set is extended.
 
   when _ then ()
+  end
+
+  # P0-A: flush the module-qualified keys into the symbol table. Purely
+  # additive: the bare-name first-wins tables above are untouched, so
+  # resolution behavior is unchanged (the compiled set has no same-named
+  # cross-module collisions). Each key is "path::name" with the path of the
+  # owner ModuleInfo; the DefId carries that module-qualified path and the
+  # symbol index assigned above.
+  for reg in qualified_regs do
+    ctx.symbols.module_symbols.insert(reg.0.clone(), reg.1.clone())
   end
 end
 
@@ -1364,19 +1657,40 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
     let module = get_current_module_ref(&ctx.symbols)
     if module.types.contains_key(first) then
       let second = path[1]
-      # Could be enum variant or associated item
-      ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
-        kind: ResolvedExprKind::EnumVariant(first.clone(), second.clone()),
-        module_path: ctx.symbols.current_module.clone()
-      })
+      # Could be enum variant or associated item. The resolution carries the
+      # OWNER enum's DefId (module + type symbol index) plus the variant
+      # index from the resolver's variant table — ID-based identity instead
+      # of the enum/variant names.
+      let owner_idx = match symbol_index_of(module, &first)
+      when Option::Some(tidx) then tidx
+      when Option::None then 0 as UInt
+      end
       match variant_index_of(module, second)
       when Option::Some(vidx) then
+        ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
+          kind: ResolvedExprKind::Variant(DefId {
+            module: ctx.symbols.current_module.join("::"),
+            index: owner_idx,
+            kind: DefKind::TypeName
+          }, vidx),
+          module_path: ctx.symbols.current_module.clone()
+        })
         ctx.resolved.call_targets.insert(span.start, DefId {
           module: ctx.symbols.current_module.join("::"),
           index: vidx,
           kind: DefKind::EnumVariant
         })
-      when Option::None then ()
+      when Option::None then
+        # The qualified path still resolves as a variant reference; carry the
+        # owner id with a degenerate index (no variant-table entry).
+        ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
+          kind: ResolvedExprKind::Variant(DefId {
+            module: ctx.symbols.current_module.join("::"),
+            index: owner_idx,
+            kind: DefKind::TypeName
+          }, 0 as UInt),
+          module_path: ctx.symbols.current_module.clone()
+        })
       end
       return
     end
@@ -1471,25 +1785,41 @@ def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr)
       end
       let target_name = import.path[import.path.len() - 1].clone()
       let target_kind = import_target_kind(ctx, &module_path, &target_name)
-      let resolved_kind = match target_kind
-      when DefKind::Static then ResolvedExprKind::Static(target_name.clone())
-      when DefKind::Constant then ResolvedExprKind::Constant(target_name.clone())
-      when DefKind::EnumVariant then ResolvedExprKind::EnumVariant("".to_string(), target_name.clone())
-      when _ then ResolvedExprKind::Function(name.clone())
-      end
-      ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
-        kind: resolved_kind,
-        module_path: import.path.clone()
-      })
-      match symbol_index_for(ctx, &module_path, &target_name)
+      let target_idx = match symbol_index_for(ctx, &module_path, &target_name)
       when Option::Some(target_idx) then
         ctx.resolved.call_targets.insert(expr.span.start, DefId {
           module: module_path.join("::"),
           index: target_idx,
           kind: target_kind
         })
-      when Option::None then ()
+        target_idx
+      when Option::None then 0 as UInt
       end
+      # The resolved-expression kind carries the semantic DefId (never the
+      # source name); the id matches the call_targets entry exactly.
+      let resolved_kind = match target_kind
+      when DefKind::Static then ResolvedExprKind::Static(target_name.clone())
+      when DefKind::Constant then ResolvedExprKind::Constant(target_name.clone())
+      when DefKind::EnumVariant then
+        # The imported item is an enum variant: the carried DefId is the
+        # variant's own id (the owner enum is not resolvable from an import
+        # path); the index is the resolver's variant-table index.
+        ResolvedExprKind::Variant(DefId {
+          module: module_path.join("::"),
+          index: target_idx,
+          kind: DefKind::EnumVariant
+        }, target_idx)
+      when _ then
+        ResolvedExprKind::Function(DefId {
+          module: module_path.join("::"),
+          index: target_idx,
+          kind: target_kind
+        })
+      end
+      ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+        kind: resolved_kind,
+        module_path: import.path.clone()
+      })
       return true
     end
   end
@@ -1766,20 +2096,28 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   # Try to resolve as function or constant
   let module = get_current_module_ref(&ctx.symbols)
   if module.functions.contains_key(name) then
-    let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Function(name.clone()),
-      module_path: ctx.symbols.current_module.clone()
-    }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    match symbol_index_of(module, name)
+    # The resolved function carries the same DefId that call_targets records
+    # (module + per-module symbol index), so resolution and call identity
+    # are one ID-based fact.
+    let fidx = match symbol_index_of(module, name)
     when Option::Some(fidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
         module: ctx.symbols.current_module.join("::"),
         index: fidx,
         kind: DefKind::Function
       })
-    when Option::None then ()
+      fidx
+    when Option::None then 0 as UInt
     end
+    let resolved_expr = ResolvedExpr {
+      kind: ResolvedExprKind::Function(DefId {
+        module: ctx.symbols.current_module.join("::"),
+        index: fidx,
+        kind: DefKind::Function
+      }),
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     return
   end
 
@@ -1822,18 +2160,19 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   # Runtime intrinsics (__intrinsic_*) are provided by the runtime, not by
   # source definitions; they are always resolvable.
   if name.starts_with("__intrinsic") then
-    let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Function(name.clone()),
-      module_path: ctx.symbols.current_module.clone()
-    }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     let bidx = ctx.next_builtin_index
     ctx.next_builtin_index = ctx.next_builtin_index + 1
-    ctx.resolved.call_targets.insert(expr.span.start, DefId {
+    let bdid = DefId {
       module: "__builtin".to_string(),
       index: bidx as UInt,
       kind: DefKind::Intrinsic
-    })
+    }
+    let resolved_expr = ResolvedExpr {
+      kind: ResolvedExprKind::Function(bdid.clone()),
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.span.start, bdid)
     return
   end
 
@@ -1841,39 +2180,54 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   # `alloc[RcInner[T]]()`) resolve as type references, not errors.
   let module2 = get_current_module_ref(&ctx.symbols)
   if module2.types.contains_key(name.clone()) then
-    let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Function(name.clone()),
-      module_path: ctx.symbols.current_module.clone()
-    }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    match symbol_index_of(module2, name)
+    # The resolved expression carries the TYPE NAME's DefId (kind TypeName);
+    # call_targets gets the same id, so a `Type::new`-style call keeps one
+    # ID-based identity end to end.
+    let tidx = match symbol_index_of(module2, name)
     when Option::Some(tidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
         module: ctx.symbols.current_module.join("::"),
         index: tidx,
         kind: DefKind::TypeName
       })
-    when Option::None then ()
+      tidx
+    when Option::None then 0 as UInt
     end
+    let resolved_expr = ResolvedExpr {
+      kind: ResolvedExprKind::Function(DefId {
+        module: ctx.symbols.current_module.join("::"),
+        index: tidx,
+        kind: DefKind::TypeName
+      }),
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     return
   end
 
   # Bare enum variant references (`Some`, `None`, `Zero`) resolve as variants.
   if module2.variants.contains(name.clone()) then
-    let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::EnumVariant("".to_string(), name.clone()),
-      module_path: ctx.symbols.current_module.clone()
-    }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    match variant_index_of(module2, name)
+    # The carried id is the variant's own DefId (the owner enum is unknown
+    # for a bare reference); the index is the resolver's variant-table index.
+    let vidx = match variant_index_of(module2, name)
     when Option::Some(vidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
         module: ctx.symbols.current_module.join("::"),
         index: vidx,
         kind: DefKind::EnumVariant
       })
-    when Option::None then ()
+      vidx
+    when Option::None then 0 as UInt
     end
+    let resolved_expr = ResolvedExpr {
+      kind: ResolvedExprKind::Variant(DefId {
+        module: ctx.symbols.current_module.join("::"),
+        index: vidx,
+        kind: DefKind::EnumVariant
+      }, vidx),
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
     return
   end
 
