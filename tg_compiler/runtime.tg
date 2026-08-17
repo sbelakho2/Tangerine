@@ -958,6 +958,7 @@ def emit_array_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_array_new(ctx)
   emit_tg_array_push(ctx)
   emit_tg_array_grow(ctx)
+  emit_tg_array_destroy(ctx)
   emit_tg_array_pop(ctx)
   emit_tg_array_get(ctx)
   emit_tg_array_set(ctx)
@@ -1156,6 +1157,41 @@ end
 
 # _tg_array_grow: Internal helper to grow array capacity
 # Args: x0/rdi = vec ptr, x1/rsi = new_capacity
+# _tg_array_destroy: release the array's mmap'ed data buffer. Args: x0 =
+# vec (24-byte header: [0] data, [8] len, [16] cap). Elements were already
+# finalized by the cleanup loop; this frees the backing allocation.
+def emit_tg_array_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_array_destroy")
+  let lblSkip = fresh_label(ctx, ".Larr_destroy_skip")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # vec
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 0)  # data
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblSkip.clone())
+    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 16)  # cap
+    a64_lsl(&mut ctx.text, A64::X1, A64::X1, 3)     # cap * 8 (element slots are pointers)
+    match ctx.target.os
+    when OsAbi::MacOS then
+      a64_mov_ri(&mut ctx.text, A64::X16, 73)  # munmap
+      a64_svc(&mut ctx.text, 0x80)
+    when OsAbi::Linux then
+      a64_mov_ri(&mut ctx.text, A64::X8, 215)  # munmap
+      a64_svc(&mut ctx.text, 0)
+    when _ then ()
+    end
+    def_label(&mut ctx.text, lblSkip.clone())
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_ud2(&mut ctx.text)  # fail closed: x86 backing release not implemented
+  end
+end
+
 def emit_tg_array_grow(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_array_grow")
   
@@ -2217,6 +2253,7 @@ def emit_map_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_map_remove_full(ctx)
   emit_tg_map_drain_one(ctx)
   emit_tg_map_drain_one_full(ctx)
+  emit_tg_map_destroy(ctx)
   emit_tg_map_contains(ctx)
   emit_tg_map_clear(ctx)
   emit_tg_map_entries(ctx)
@@ -2911,6 +2948,92 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
+# _tg_map_destroy: release the map's mmap'ed bucket table AND every
+# mmap'ed overflow bucket in the collision chains. Args: x0 = map (24-byte
+# header: [0] buckets, [8] size, [16] cap). All entries were already drained
+# and finalized; this frees the table + overflow storage.
+def emit_tg_map_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_map_destroy")
+  let lblBucketLoop = fresh_label(ctx, ".Lmap_destroy_bucket_loop")
+  let lblChain = fresh_label(ctx, ".Lmap_destroy_chain")
+  let lblChainDone = fresh_label(ctx, ".Lmap_destroy_chain_done")
+  let lblSkip = fresh_label(ctx, ".Lmap_destroy_skip")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # map
+    a64_ldur(&mut ctx.text, A64::X20, A64::X19, 0)  # buckets
+    a64_cmp_ri(&mut ctx.text, A64::X20, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblSkip.clone())
+    # Free overflow chains first (they are separate mmap allocations).
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 16)  # cap
+    a64_lsl(&mut ctx.text, A64::X22, A64::X21, 5)    # cap * 32
+    a64_add_rrr(&mut ctx.text, A64::X22, A64::X20, A64::X22)  # end = buckets + cap*32
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X20)  # current bucket
+    def_label(&mut ctx.text, lblBucketLoop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblSkip.clone())
+    a64_ldr(&mut ctx.text, A64::X23, A64::X21, 24)  # next
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblChainDone.clone())
+    def_label(&mut ctx.text, lblChain.clone())
+    a64_ldr(&mut ctx.text, A64::X0, A64::X23, 24)  # next->next (save across munmap)
+    a64_stp_pre(&mut ctx.text, A64::X0, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
+    a64_mov_ri(&mut ctx.text, A64::X1, 32)
+    match ctx.target.os
+    when OsAbi::MacOS then
+      a64_mov_ri(&mut ctx.text, A64::X16, 73)  # munmap
+      a64_svc(&mut ctx.text, 0x80)
+    when OsAbi::Linux then
+      a64_mov_ri(&mut ctx.text, A64::X8, 215)  # munmap
+      a64_svc(&mut ctx.text, 0)
+    when _ then ()
+    end
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::XZR, A64::SP, 16)
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblChain.clone())
+    def_label(&mut ctx.text, lblChainDone.clone())
+    a64_add_rri(&mut ctx.text, A64::X21, A64::X21, 32)
+    a64_b(&mut ctx.text, lblBucketLoop.clone())
+    def_label(&mut ctx.text, lblSkip.clone())
+    # Free the main bucket table.
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 0)
+    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 16)
+    a64_lsl(&mut ctx.text, A64::X1, A64::X1, 5)  # cap * 32
+    match ctx.target.os
+    when OsAbi::MacOS then
+      a64_mov_ri(&mut ctx.text, A64::X16, 73)  # munmap
+      a64_svc(&mut ctx.text, 0x80)
+    when OsAbi::Linux then
+      a64_mov_ri(&mut ctx.text, A64::X8, 215)  # munmap
+      a64_svc(&mut ctx.text, 0)
+    when _ then ()
+    end
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_ud2(&mut ctx.text)  # fail closed: x86 backing release not implemented
+  end
+end
+
+# _tg_set_destroy: release the set's backing storage (a set IS a map with
+# Unit values).
+def emit_tg_set_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_set_destroy")
+  match ctx.target.arch
+  when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_map_destroy")
+  when Arch::X86_64  then x64_ud2(&mut ctx.text)
+  end
+end
+
 # _tg_map_drain_one: destructively remove the FIRST live entry and transfer
 # it out as Option[(K, V)] through the sret slot (AArch64: x8). No snapshot
 # copy exists — ownership of the actual key and value pointers transfers.
@@ -3316,6 +3439,7 @@ def emit_set_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_set_remove(ctx)
   emit_tg_set_drain_one(ctx)
   emit_tg_set_drain_one_full(ctx)
+  emit_tg_set_destroy(ctx)
   emit_tg_set_entries(ctx)
   emit_tg_set_clear(ctx)
 end

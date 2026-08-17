@@ -467,6 +467,9 @@ run_critical_canaries() {
     tests/canary/canary_pos_smart_unique_ptr.tg \
     tests/canary/canary_pos_resource_drain.tg \
     tests/canary/canary_pos_set_drain.tg \
+    tests/canary/canary_pos_resource_while_auto_clean.tg \
+    tests/canary/canary_pos_resource_while_zero_iter.tg \
+    tests/canary/canary_pos_resource_for_auto_clean.tg \
     tests/canary/canary_capability.tg \
     tests/canary/canary_closure_async.tg \
     tests/canary/canary_ffi.tg \
