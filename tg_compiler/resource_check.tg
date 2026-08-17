@@ -405,7 +405,7 @@ def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, ow
   # A deinit's own `self` is COMPILER-OWNED: mark it so the body cannot
   # consume/re-finalize the subject (the generated wrapper runs the user hook
   # then the structural field cleanup exactly once).
-  if f.name == "deinit" && entry_ids.len() > 0 then
+  if (f.name == "deinit" || f.name == "drop") && entry_ids.len() > 0 then
     frame.origins.insert(entry_ids[0], ParamOrigin::DeinitSelf)
   end
   check_fn_body(program, typed, &f.body, &mut frame, errors, finalize_plan, current_loop_entry)
@@ -480,14 +480,49 @@ def is_owning_smart_pointer(typed: &TypedProgram, ty: &Type) -> Bool
   end
 end
 
+# Owning containers hold heap backing storage (Vec/Array/Map/Set/Slice)
+# and need destruction regardless of their element types: Vec[Int] must
+# still release its buffer. Distinct from resource LINEARITY — the one
+# ownership classification below feeds binding, transfer, Copyable, and
+# the Rc payload policy.
+def is_owning_container(typed: &TypedProgram, ty: &Type) -> Bool
+  match ty
+  when Type::Array(_, _) then true
+  when Type::Slice(_) then true
+  when Type::Map(_, _) then true
+  when Type::Set(_) then true
+  when Type::Named(tid, _) then
+    match typed.type_names.get(tid.id)
+    when Option::Some(n) then
+      n == "Vec" || n == "Array" || n == "Map" || n == "Set" || n == "Slice"
+    when Option::None then false
+    end
+  when _ then false
+  end
+end
+
+# THE ONE canonical ownership predicate: linear resources/capabilities,
+# owning smart pointers (canonical Box/Rc and the named forms), and owning
+# containers. Everything ownership-sensitive (binding, transfer/move
+# detection, Rc payload policy) uses THIS predicate, never a special case.
+def is_owning_typed(typed: &TypedProgram, ty: &Type) -> Bool
+  if type_kind_contains_resource(&typed.type_kinds, ty) then
+    true
+  else
+    is_owning_smart_pointer(typed, ty) || is_owning_container(typed, ty)
+  end
+end
+
 # Rc[Resource] is explicitly unsupported: a linear resource cannot be shared
 # through reference counting (documented ownership policy). Reject the
 # combination at every binding point instead of silently treating the Rc
-# wrapper as non-resource and losing the contained resource's state.
+# wrapper as non-resource and losing the contained resource's state. The
+# payload policy uses is_owning_typed: Rc[UniquePtr[Int]] is rejected too —
+# a move-only owner behind shared ownership is the same unsoundness.
 def reject_rc_resource(typed: &TypedProgram, ty: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
   match ty
   when Type::Rc(inner) then
-    if type_kind_contains_resource(&typed.type_kinds, &inner) then
+    if is_owning_typed(typed, &inner) then
       errors.push(ResourceError {
         message: "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting",
         span: span
@@ -540,7 +575,7 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
         # let/inout params can never be consumed or finalized by the callee,
         # while sink params own their value.
         let origin = param_origin_of(p.convention)
-        if type_kind_contains_resource(&typed.type_kinds, &lb.ty) || is_owning_smart_pointer(typed, &lb.ty) then
+        if is_owning_typed(typed, &lb.ty) then
           let init_state = match p.convention
           when AccessConvention::Set then ResourceState::Uninitialized
           when _ then ResourceState::Live
@@ -934,6 +969,21 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     match expr_root_id(typed, &target)
     when Option::Some(id) then
       if res_frame_has(frame, &id) then
+        # P0-11: assigning over a LIVE owning place must drop the previous
+        # value first ("drop old -> store new"); overwriting it would leak.
+        match res_frame_get(frame, &id)
+        when Option::Some(ResourceState::Live) then
+          match frame.origins.get(id)
+          when Option::Some(origin) then
+            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+              var assign_ids = Vec::new()
+              assign_ids.push(id)
+              finalize_plan.insert("assign::" + stmt.node_id.to_string(), assign_ids)
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
         apply_set(frame, id)
       end
     when Option::None then ()
@@ -1271,7 +1321,7 @@ def bind_pattern_ident(typed: &TypedProgram, node_id: Int, span: Span, frame: &m
     match typed.local_bindings.get(id)
     when Option::Some(lb) then
       reject_rc_resource(typed, &lb.ty, span, errors)
-      if type_kind_contains_resource(&typed.type_kinds, &lb.ty) || is_owning_smart_pointer(typed, &lb.ty) then
+      if is_owning_typed(typed, &lb.ty) then
         res_frame_set(frame, id, ResourceState::Live)
         res_frame_set_span(frame, &id, span)
         frame.origins.insert(id, ParamOrigin::OwnedLocal)
@@ -1553,7 +1603,10 @@ def check_expr_method_call(program: &Program, typed: &TypedProgram, receiver: &E
   when Option::Some(e) then e
   when Option::None then AccessEffect::Read
   end
-  if method == "deinit" then
+  if method == "deinit" || method == "drop" then
+    # An EXPLICIT drop() call consumes the receiver exactly like deinit():
+    # otherwise `b.drop()` would run the Drop body while lexical cleanup
+    # later finalizes the still-live b a second time.
     apply_arg_effect(program, typed, receiver, AccessEffect::Consume, loop_outer, frame, errors, finalize_plan, current_loop_entry)
   else
     apply_arg_effect(program, typed, receiver, recv_effect, loop_outer, frame, errors, finalize_plan, current_loop_entry)
@@ -1600,11 +1653,13 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
         when _ then check_use(typed, id, arg.span, frame, errors)
         end
       else
-        # A projected consuming argument (e.g. consume_inner(self.inner)):
-        # MIR lowers the projection as a consuming place. Until partial-drop
-        # state exists, consuming ANY projection rooted at the finalizer's
-        # subject would let the compiler-owned structural field cleanup
-        # finalize the field a second time — reject it.
+        # A projected consuming argument (e.g. consume_inner(self.inner) or
+        # consume_probe(p.a)): MIR lowers the projection as a consuming
+        # place while semantic state keeps the ROOT live — the structural
+        # cleanup would finalize the moved field a second time. Until
+        # partial-move/place state exists, EVERY ownership-taking projection
+        # is rejected (the DeinitSelf case gets the finalizer-specific
+        # message; all other roots get the partial-move restriction).
         if effect == AccessEffect::Consume then
           match frame.origins.get(id)
           when Option::Some(ParamOrigin::DeinitSelf) then
@@ -1612,7 +1667,11 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
               message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
               span: arg.span
             })
-          when _ then check_use(typed, id, arg.span, frame, errors)
+          when _ then
+            errors.push(ResourceError {
+              message: "cannot consume a projected place: partial moves are not yet supported",
+              span: arg.span
+            })
           end
         else
           check_use(typed, id, arg.span, frame, errors)
@@ -2089,14 +2148,29 @@ def expr_is_plain(expr: &Expr) -> Bool
 end
 
 def expr_type_has_resource(typed: &TypedProgram, expr: &Expr) -> Bool
+  # The MOVE/transfer detection uses the SAME canonical ownership predicate
+  # as binding: UniquePtr[Int], Box[Int], Vec[Int], etc. are move-only even
+  # though their nominal kinds are Value — `let q = p` for an owner MUST
+  # consume p, or both bindings finalize the same allocation.
   match typed.expr_types.get(expr.node_id)
-  when Option::Some(t) then type_kind_contains_resource(&typed.type_kinds, t)
+  when Option::Some(t) then is_owning_typed(typed, &t)
   when Option::None then false
   end
 end
 
 def transfer_consume(typed: &TypedProgram, expr: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   if expr_type_has_resource(typed, expr) then
+    if !expr_is_plain(expr) then
+      # Moving out of a PROJECTED place (e.g. `let a = p.a`) cannot be
+      # represented: consuming the whole root leaks the sibling fields, and
+      # consuming just the field breaks structural cleanup. Reject until
+      # per-place partial-move state exists.
+      errors.push(ResourceError {
+        message: "cannot move out of a projected place: partial moves are not yet supported",
+        span: expr.span
+      })
+      return
+    end
     match expr_root_id(typed, expr)
     when Option::Some(id) then
       if res_frame_has(frame, &id) then

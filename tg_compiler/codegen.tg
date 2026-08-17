@@ -119,6 +119,7 @@ struct CodegenCtx
   enum_eq_helper_requested: Set[Int]
   enum_eq_helper_emitted: Set[Int]
   enum_eq_helper_queue: Vec[Int]
+  deinit_plans: Map[Int, DeinitPlan]   # semantic authority's concrete plans (from MirProgram)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -678,7 +679,8 @@ def codegen_new(target: &AsmTarget) -> CodegenCtx
     fn_alias: Map::new(),
     enum_eq_helper_requested: Set::new(),
     enum_eq_helper_emitted: Set::new(),
-    enum_eq_helper_queue: Vec::new()
+    enum_eq_helper_queue: Vec::new(),
+    deinit_plans: Map::new()
   }
 end
 
@@ -4693,7 +4695,8 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
         intr_name == "map_clone" || intr_name == "set_clone" ||
         intr_name == "map_get" || intr_name == "map_get_mut" ||
         intr_name == "map_contains" || intr_name == "map_contains_key" ||
-        intr_name == "set_contains" || intr_name == "set_remove"
+        intr_name == "set_contains" || intr_name == "set_remove" ||
+        intr_name == "drop"
        let force_intrinsic = is_explicit_intrinsic ||
          is_intrinsic(&intr_name) ||
          intr_name == "int_to_string" || intr_name == "uint_to_string" ||
@@ -4810,11 +4813,16 @@ def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place:
   # an internal compiler error — silently skipping destruction would turn a
   # cleanup-identity bug (e.g. a hardcoded "__deinit" name for a method
   # actually lowered as "__drop") into a silent memory leak.
-  let resolved = match ctx.fn_alias.get(deinit_fn)
-  when Option::Some(actual) then actual.clone()
-  when Option::None then deinit_fn.clone()
-  end
-  if ctx.reachable_fns.contains(&resolved) || ctx.extern_fns.contains(&resolved) then
+  # NAMESPACES: reachable_fns/extern_fns contain FUNCTION NAMES (e.g.
+  # "Box__drop"); fn_alias additionally maps names to EMISSION LABELS
+  # (".Lfn_entry.<index>"). Reachability is tested on the function name;
+  # the label translation happens only for emission. Checking the label
+  # against reachable_fns would reject every valid finalizer.
+  if ctx.reachable_fns.contains(deinit_fn) || ctx.extern_fns.contains(deinit_fn) then
+    let resolved = match ctx.fn_alias.get(deinit_fn)
+    when Option::Some(actual) then actual.clone()
+    when Option::None then deinit_fn.clone()
+    end
     match arg_reg(ctx.target.arch, 0)
     when Option::Some(r0) then
       emit_place_address(ctx, fctx, place, r0)
@@ -4822,7 +4830,7 @@ def codegen_finalizer_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place:
     when Option::None then ()
     end
   else
-    panic("internal error: finalizer call `" + resolved + "` is not a reachable or extern function (fail-closed: no silent skip of destruction)")
+    panic("internal error: finalizer call `" + deinit_fn + "` is not a reachable or extern function (fail-closed: no silent skip of destruction)")
   end
 end
 
@@ -5263,6 +5271,10 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_clear(ctx)
   else if name == "array_destroy" then
+    match ctx.target.arch
+    when Arch::X86_64 then panic("array_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
+    when _ then ()
+    end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_destroy(ctx)
   else if name == "array_contains" then
@@ -5332,9 +5344,19 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_entries(ctx)
   else if name == "map_drain_one" then
+    # x86 parity is not implemented for the ownership-transfer drain; reject
+    # at COMPILE time instead of emitting a runtime trap.
+    match ctx.target.arch
+    when Arch::X86_64 then panic("map_drain_one is not supported on x86-64 (ownership-transfer drain has no x86 parity yet)")
+    when _ then ()
+    end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_drain_one(ctx)
   else if name == "map_destroy" then
+    match ctx.target.arch
+    when Arch::X86_64 then panic("map_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
+    when _ then ()
+    end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_destroy(ctx)
 
@@ -5362,15 +5384,83 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_entries(ctx)
   else if name == "set_drain_one" then
+    match ctx.target.arch
+    when Arch::X86_64 then panic("set_drain_one is not supported on x86-64 (ownership-transfer drain has no x86 parity yet)")
+    when _ then ()
+    end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_drain_one(ctx)
   else if name == "set_destroy" then
+    match ctx.target.arch
+    when Arch::X86_64 then panic("set_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
+    when _ then ()
+    end
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_destroy(ctx)
   else if name == "set_clear" then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_clear(ctx)
 
+  # drop_in_place: typed destruction of the POINTEE of Ptr[T] using the
+  # semantic authority's plan (the Ptr builtin method is NOT an empty shim).
+  else if name == "drop_in_place" then
+    if args.len() >= 1 then
+      let ptr_ty = operand_type(ctx, fctx, &args[0])
+      match ptr_ty
+      when Type::Ptr(inner) then
+        match inner
+        when Type::Named(tid, _) then
+          match ctx.deinit_plans.get(tid.id)
+          when Option::Some(plan) then
+            match plan
+            when DeinitPlan::Call(n) then
+              match args[0].kind
+              when MirOperandKind::MirCopy(p) then
+                var projs = p.projections.clone()
+                projs.push(Projection::ProjDeref)
+                let pointee = Place { local: p.local, projections: projs }
+                codegen_finalizer_call(ctx, fctx, &pointee, &n)
+              when _ then ()
+              end
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  # Typed drop glue: the generic drop[T] library shim is EMPTY; the codegen
+  # destroys the CONCRETE argument using the semantic authority's plan.
+  else if name == "drop" then
+    if args.len() >= 1 then
+      # The argument may be a reference (Rc's last-release calls
+      # drop(&mut inner.value)): the DESTROYED value is the referent.
+      let drop_ty = strip_ref_like_type(&operand_type(ctx, fctx, &args[0]))
+      match drop_ty
+      when Type::Named(tid, _) then
+        match ctx.deinit_plans.get(tid.id)
+        when Option::Some(plan) then
+          match plan
+          when DeinitPlan::Call(n) then
+            match args[0].kind
+            when MirOperandKind::MirCopy(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
+            when MirOperandKind::MirMovePlace(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
+            when MirOperandKind::MirConsume(p) then codegen_finalizer_call(ctx, fctx, &p, &n)
+            when _ then ()
+            end
+          when _ then
+            # Deeper plans (Aggregate/Option/...) require full glue emission;
+            # the registered-Drop callable path covers the smart-pointer and
+            # finalizer cases (documented P1: full plan-driven glue).
+            ()
+          end
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+    end
   # Memory intrinsics
   else if name == "mem_alloc" then
     codegen_mem_alloc(ctx)
@@ -9093,6 +9183,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, String]
+  ctx.deinit_plans = program.deinit_plans.clone()
   # Build type layout map and field layouts from MIR type definitions (single LayoutEngine pass)
   let (type_layout, field_offsets, field_sizes, payload_offsets) = build_all_layouts(&mut ctx.layout_engine, &program.types)
   ctx.type_layout = type_layout

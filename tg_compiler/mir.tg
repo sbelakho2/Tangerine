@@ -31,6 +31,10 @@ struct MirProgram
   functions: Vec[MirFunction]
   statics: Vec[MirStatic]
   types: Vec[MirTypeDef]
+  # The semantic authority's concrete deinit plans (TypeId -> DeinitPlan),
+  # carried to codegen so typed drop glue (the generic drop[T] intrinsic)
+  # can destroy concrete values without re-deriving ownership in codegen.
+  deinit_plans: Map[Int, DeinitPlan]
 end
 
 struct MirFunction
@@ -1744,6 +1748,120 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     switch_to_block(b, dr_entry)
     set_terminator(b, MirTerminatorKind::MirGoto(dr_call_blk), span)
     dr_entry
+  when DeinitPlan::Option(inner_plan) then
+    # Deinit the payload only when the variant is Some: discriminant block
+    # switches to skip_blk (None) or body_blk (Some payload deinit).
+    let disc_blk = create_block(b)
+    let body_blk = create_block(b)
+    let skip_blk = create_block(b)
+    switch_to_block(b, disc_blk)
+    let disc_tmp = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    # Option discriminants: Some = 0, None = 1. Some routes to the payload
+    # deinit; None routes to the skip block.
+    var targets_o = Vec::new()
+    targets_o.push(SwitchTarget { value: 0, target: body_blk })
+    targets_o.push(SwitchTarget { value: 1, target: skip_blk })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: targets_o, default_target: skip_blk }, span)
+    switch_to_block(b, skip_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    switch_to_block(b, body_blk)
+    var payload_projs = place.projections.clone()
+    payload_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    let payload_place = Place { local: place.local, projections: payload_projs }
+    let chain_entry_o = emit_plan_deinit(b, &payload_place, inner_plan, succ, span)
+    switch_to_block(b, body_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_o), span)
+    let entry_o = create_block(b)
+    switch_to_block(b, entry_o)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk), span)
+    entry_o
+  when DeinitPlan::Result(ok_plan, err_plan) then
+    # Deinit the payload of whichever variant is present.
+    let disc_blk2 = create_block(b)
+    let body_blk2 = create_block(b)
+    let skip_blk2 = create_block(b)
+    switch_to_block(b, disc_blk2)
+    let disc_tmp2 = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp2), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    # Result discriminants: Ok = 0, Err = 1. Ok routes to the Ok payload
+    # deinit; Err routes to the Err payload deinit.
+    var targets_r = Vec::new()
+    targets_r.push(SwitchTarget { value: 0, target: body_blk2 })
+    targets_r.push(SwitchTarget { value: 1, target: skip_blk2 })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp2), targets: targets_r, default_target: skip_blk2 }, span)
+    # Ok variant (default) deinits the Ok payload; the Err variant (tag 1)
+    # deinits the Err payload — both plans are honored.
+    switch_to_block(b, skip_blk2)
+    var err_projs = place.projections.clone()
+    err_projs.push(Projection::ProjDowncast("Err".to_string(), 1))
+    let err_place = Place { local: place.local, projections: err_projs }
+    let chain_entry_e = emit_plan_deinit(b, &err_place, err_plan, succ, span)
+    switch_to_block(b, skip_blk2)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_e), span)
+    switch_to_block(b, body_blk2)
+    var payload_projs2 = place.projections.clone()
+    payload_projs2.push(Projection::ProjDowncast("Ok".to_string(), 0))
+    let payload_place2 = Place { local: place.local, projections: payload_projs2 }
+    let chain_entry_r = emit_plan_deinit(b, &payload_place2, ok_plan, succ, span)
+    switch_to_block(b, body_blk2)
+    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_r), span)
+    let entry_r = create_block(b)
+    switch_to_block(b, entry_r)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk2), span)
+    entry_r
+  when DeinitPlan::Enum(variant_plans) then
+    # Arbitrary resource-containing enums: switch on the discriminant and
+    # deinit the active variant's payload fields by their plans. Each variant
+    # is routed to its own chain; the fallthrough (unknown discriminant) is a
+    # defensive skip (should not occur for well-typed values).
+    let disc_blk_e = create_block(b)
+    let default_blk_e = create_block(b)
+    let entry_blk_e = create_block(b)
+    switch_to_block(b, disc_blk_e)
+    let disc_tmp_e = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(disc_tmp_e), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
+    var e_targets = Vec::new()
+    # One block per variant: its chain deinits the payload fields, then flows
+    # to succ.
+    var variant_entries = Map::new()
+    for (vdisc, vinfo) in variant_plans do
+      let vname = vinfo.0
+      let vplans = vinfo.1
+      var vchain = succ
+      var vfi = vplans.len()
+      while vfi > 0 do
+        vfi = vfi - 1
+        var vprojs = place.projections.clone()
+        vprojs.push(Projection::ProjDowncast(vname.clone(), vdisc))
+        vprojs.push(Projection::ProjFieldIndex(vfi))
+        let vplace = Place { local: place.local, projections: vprojs }
+        vchain = emit_plan_deinit(b, &vplace, &vplans[vfi], vchain, span)
+      end
+      variant_entries.insert(vdisc, vchain)
+    end
+    # Re-walk to emit the per-variant blocks' goto to their chains (the
+    # chains were emitted above while current_block is the last chain block).
+    for (vdisc2, vinfo2) in variant_plans do
+      let vblk = create_block(b)
+      switch_to_block(b, vblk)
+      match variant_entries.get(vdisc2)
+      when Option::Some(vchain2) then
+        set_terminator(b, MirTerminatorKind::MirGoto(vchain2), span)
+      when Option::None then ()
+      end
+      e_targets.push(SwitchTarget { value: vdisc2, target: vblk })
+    end
+    switch_to_block(b, disc_blk_e)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp_e), targets: e_targets, default_target: default_blk_e }, span)
+    switch_to_block(b, default_blk_e)
+    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+    switch_to_block(b, entry_blk_e)
+    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk_e), span)
+    entry_blk_e
+  end
+end
+
 
 def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Place], span: Span) -> Unit
   let saved_block = b.current_block
@@ -2612,7 +2730,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   eprintln("[lprog] lowered_fns=" + functions.len() + " skipped=" + dbg_skipped + " none=" + dbg_none)
 
   # Emit any closures that were queued during lowering
-  var result = MirProgram { functions: functions, statics: statics, types: types }
+  var result = MirProgram { functions: functions, statics: statics, types: types, deinit_plans: b.deinit_plans.clone() }
   lower_pending_closures(&mut b, &mut result)
 
   # Search MIR functions for cmd_compile
@@ -4595,13 +4713,67 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     when StmtKind::StmtAssign(target, value) then
       let place = lower_place(b, &target)
       let value_ty = mir_infer_expr_type(b, &value)
-      match lower_expr_to_rvalue(b, &value, stmt.span)
-      when Result::Ok(rvalue) then
-        push_assign(b, place, rvalue, stmt.span)
-        refine_assignment_target_type(b, &place, &rvalue)
-        refine_assignment_target_type_from_type(b, &place, &value_ty)
-      when Result::Err(e) then
-        b.errors.push(e)
+      # P0-11: assigning over a live owning place drops the previous value
+      # first (the checker recorded "assign::<stmt id>"). The drop chain
+      # runs before the store; the store itself happens in a fresh block so
+      # the chain can flow into it.
+      match b.finalize_plan.get("assign::" + stmt.node_id.to_string())
+      when Option::Some(assign_ids) then
+        if assign_ids.len() > 0 then
+          match b.current_block
+          when Option::Some(assign_blk) then
+            let assign_cont = create_block(b)
+            var chain_succ = assign_cont
+            var ai = assign_ids.len()
+            while ai > 0 do
+              ai = ai - 1
+              let apid = assign_ids[ai]
+              match b.semantic_to_mir.get(apid)
+              when Option::Some(amid) then
+                let aty = builder_local_typed_ty(b, &LocalId { id: amid })
+                let aplan = match aty
+                when Option::Some(t) then
+                  var vis = Set::new()
+                  deinit_plan_for_type(b, &t, &mut vis)
+                when Option::None then DeinitPlan::Trivial
+                end
+                chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: amid }), &aplan, chain_succ, stmt.span)
+              when Option::None then
+                b.errors.push("internal error: assign-drop plan references semantic local _" + apid.to_string() + " with no MIR local")
+              end
+            end
+            switch_to_block(b, assign_blk)
+            set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), stmt.span)
+            switch_to_block(b, assign_cont)
+            match lower_expr_to_rvalue(b, &value, stmt.span)
+            when Result::Ok(rvalue) then
+              push_assign(b, place, rvalue, stmt.span)
+              refine_assignment_target_type(b, &place, &rvalue)
+              refine_assignment_target_type_from_type(b, &place, &value_ty)
+            when Result::Err(e) then
+              b.errors.push(e)
+            end
+          when Option::None then ()
+          end
+        else
+          match lower_expr_to_rvalue(b, &value, stmt.span)
+          when Result::Ok(rvalue) then
+            push_assign(b, place, rvalue, stmt.span)
+            refine_assignment_target_type(b, &place, &rvalue)
+            refine_assignment_target_type_from_type(b, &place, &value_ty)
+          when Result::Err(e) then
+            b.errors.push(e)
+          end
+        end
+      when Option::None then
+        match lower_expr_to_rvalue(b, &value, stmt.span)
+        when Result::Ok(rvalue) then
+          push_assign(b, place, rvalue, stmt.span)
+          refine_assignment_target_type(b, &place, &rvalue)
+          refine_assignment_target_type_from_type(b, &place, &value_ty)
+        when Result::Err(e) then
+          b.errors.push(e)
+        end
       end
       return
     when _ then ()
