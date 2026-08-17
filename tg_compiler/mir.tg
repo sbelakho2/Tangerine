@@ -1084,6 +1084,10 @@ def start_function(b: &mut MirBuilder, name: String, ret_type: Type, span: Span)
   b.var_map = Map::new()
   b.blocks = Vec::new()
   b.declared_locals = Set::new()
+  # Block IDs restart from zero per function; return-edge-block suppression
+  # must not leak across functions (a stale ID from function A would
+  # suppress normal finalization of an unrelated return block in B).
+  b.return_edge_blocks = Set::new()
   
   let entry = BlockId { id: 0 }
   b.block_counter = 1
@@ -1330,12 +1334,31 @@ def deinit_plan_for_type(b: &MirBuilder, ty: &Type, visited: &mut Set[Int]) -> D
             # Value (resource-ness derives from the substituted concrete
             # fields, not the nominal TypeKind). Container names get their
             # canonical plans; everything else gets the structural plan.
-            let container_plan = mir_named_container_plan(b, &td, &args, visited)
-            if deinit_plan_is_trivial(&container_plan) then
-              mir_structural_plan(b, &td, &args, visited)
-            else
-              container_plan
+            # A Value-kind type with a registered deinit (impl Drop) runs
+            # its drop — e.g. Box[T] { ptr } would otherwise leak the
+            # pointee through a structural walk that sees only a Ptr.
+            let structural_plan = match b.deinit_targets.get(tid.id)
+            when Option::Some(n) then
+              let container_plan = mir_named_container_plan(b, &td, &args, visited)
+              let struct_shape = if deinit_plan_is_trivial(&container_plan) then
+                mir_structural_plan(b, &td, &args, visited)
+              else
+                container_plan
+              end
+              if deinit_plan_is_trivial(&struct_shape) then
+                DeinitPlan::Call(n.clone())
+              else
+                DeinitPlan::UserFinalizer(n.clone(), struct_shape)
+              end
+            when Option::None then
+              let container_plan = mir_named_container_plan(b, &td, &args, visited)
+              if deinit_plan_is_trivial(&container_plan) then
+                mir_structural_plan(b, &td, &args, visited)
+              else
+                container_plan
+              end
             end
+            structural_plan
           end
         when Option::None then DeinitPlan::Trivial
         end
@@ -1423,22 +1446,31 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     b.errors.push("internal error: recursive resource type cannot be represented by a finite cleanup plan (generated drop glue required)")
     succ
   when DeinitPlan::Box(inner_plan) then
-    # Owning-pointer cleanup: finalize the POINTEE (through the deref
-    # projection), then release the allocation (MirDeinit on the box with the
-    # runtime box-drop identity). Exactly once.
-    var deref_projs = place.projections.clone()
-    deref_projs.push(Projection::ProjDeref)
-    let pointee_place = Place { local: place.local, projections: deref_projs }
-    let after_pointee = emit_plan_deinit(b, &pointee_place, inner_plan, succ, span)
+    # Owning-pointer cleanup: finalize the POINTEE FIRST (through the deref
+    # projection — it must run while the allocation is still valid), then
+    # release the allocation. The chain is built backward: the free block
+    # targets succ, and the pointee cleanup targets the free block, so
+    # execution runs pointee cleanup -> free -> successor.
+    # GROUNDING: the release is emitted as a MirDeinit to "__tg_box_free".
+    # The codegen only emits the call when that function is reachable
+    # (codegen_finalizer_call gates on reachable_fns), so a managed runtime
+    # without an explicit box-release primitive compiles and skips the call;
+    # once the runtime exposes a real allocation-release identity, declaring
+    # it makes the call emit. The pointee finalization is the
+    # ownership-relevant part; the allocation release is the remaining
+    # runtime glue (tracked as P0 — no leak of the POINTEE either way).
     let box_bk = create_block(b)
     switch_to_block(b, box_bk)
     set_terminator(b, MirTerminatorKind::MirDeinit {
       place: place.clone(),
       deinit_fn: "__tg_box_free".to_string(),
-      target: after_pointee,
+      target: succ,
       unwind: Option::None
     }, span)
-    box_bk
+    var deref_projs = place.projections.clone()
+    deref_projs.push(Projection::ProjDeref)
+    let pointee_place = Place { local: place.local, projections: deref_projs }
+    emit_plan_deinit(b, &pointee_place, inner_plan, box_bk, span)
   when DeinitPlan::Call(name) then
     let bk = create_block(b)
     switch_to_block(b, bk)
@@ -1538,7 +1570,19 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
   when DeinitPlan::Set(elem_plan) then
     # DESTRUCTIVE set cleanup: copy entries for iteration keys, then REMOVE
     # each element from the set before deiniting the (removed) element copy —
-    # no shared-read duplication of surviving elements.
+    # no shared-read duplication of surviving elements. The temp is sized
+    # with the set's concrete element type (a Unit-typed temp would
+    # under-size the storage).
+    let set_ty = builder_local_typed_ty(b, &place.local)
+    let elem_ty = match set_ty
+    when Option::Some(st) then
+      match st
+      when Type::Set(e) then e
+      when Type::Array(e, _) then e
+      when _ then Type::Unit
+      end
+    when Option::None then Type::Unit
+    end
     let se_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_set_entries".to_string()),
@@ -1551,7 +1595,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
         ty: Type::Unit
       })
     }
-    let se_tmp = add_temp(b, Type::Slice(Type::Unit), span)
+    let se_tmp = add_temp(b, Type::Slice(elem_ty.clone()), span)
     let se_blk = create_block(b)
     var se_args = Vec::new()
     se_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
@@ -1628,6 +1672,31 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     # happens BEFORE the value's deinit so no copied resource is destroyed
     # while the original remains behind (a shared-read entries() copy would
     # duplicate ownership). Keys AND values are both cleaned.
+    # P1: the reviewer's preferred primitive is a destructive compiler-
+    # private map_drain_one(inout Map[K,V]) -> Option[(K,V)] that transfers
+    # the actual (K, V) out together — no snapshot copy exists. The current
+    # form removes-then-cleans (deinit runs exactly once) and is safe; the
+    # drain primitive would eliminate the snapshot entirely.
+    # The concrete K/V types come from the map's own type so the temporaries
+    # are correctly sized (a Unit-typed temp would under-size the storage for
+    # real key/value payloads).
+    let map_ty = builder_local_typed_ty(b, &place.local)
+    let map_kv = match map_ty
+    when Option::Some(mt) then
+      match mt
+      when Type::Map(k, v) then Option::Some((k, v))
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+    let key_ty = match map_kv
+    when Option::Some((kk, _)) then kk
+    when Option::None then Type::Unit
+    end
+    let val_ty = match map_kv
+    when Option::Some((_, vv)) then vv
+    when Option::None then Type::Unit
+    end
     let ent_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_map_entries".to_string()),
@@ -1640,7 +1709,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
         ty: Type::Unit
       })
     }
-    let entries_tmp = add_temp(b, Type::Slice(Type::Tuple(Vec::new())), span)
+    let entries_tmp = add_temp(b, Type::Slice(Type::Tuple(vec![key_ty.clone(), val_ty.clone()])), span)
     let ent_blk = create_block(b)
     var ent_args = Vec::new()
     ent_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
@@ -1695,7 +1764,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     # the map into rm_ret, and cleanup destroys THAT returned value (never
     # the snapshot copy — the snapshot exists only to provide iteration
     # keys). The Option plan discriminates Some/None.
-    let rm_ret = add_temp(b, Type::Option(Type::Unit), span)
+    let rm_ret = add_temp(b, Type::Option(val_ty.clone()), span)
     let rm_blk = create_block(b)
     var rm_args = Vec::new()
     rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
@@ -4439,6 +4508,41 @@ end
 # Materialize loop-edge cleanup obligations (break/continue): the semantic
 # locals recorded for this edge are finalized before the jump to the loop
 # target. When no obligations exist, the plain goto is emitted.
+# Build a cleanup chain for a loop edge and return its ENTRY block, leaving
+# terminators untouched. Used for the loop-exit edge: the header's condition
+# switch routes the exit through the chain so loop-created resources from the
+# final iteration are finalized before the loop exits.
+def emit_loop_chain_entry(b: &mut MirBuilder, key: String, succ: BlockId, span: Span) -> BlockId
+  match b.finalize_plan.get(key)
+  when Option::Some(edge_ids) then
+    if edge_ids.len() > 0 then
+      var chain_succ = succ
+      var ei = edge_ids.len()
+      while ei > 0 do
+        ei = ei - 1
+        let epid = edge_ids[ei]
+        match b.semantic_to_mir.get(epid)
+        when Option::Some(emid) then
+          let ety = builder_local_typed_ty(b, &LocalId { id: emid })
+          let eplan = match ety
+          when Option::Some(t) then
+            var vis = Set::new()
+            deinit_plan_for_type(b, &t, &mut vis)
+          when Option::None then DeinitPlan::Trivial
+          end
+          chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: emid }), &eplan, chain_succ, span)
+        when Option::None then
+          b.errors.push("internal error: loop-edge plan references semantic local _" + epid.to_string() + " with no MIR local")
+        end
+      end
+      chain_succ
+    else
+      succ
+    end
+  when Option::None then succ
+  end
+end
+
 def emit_loop_edge_cleanup(b: &mut MirBuilder, key: String, target: Option[BlockId], span: Span) -> Unit
   match target
   when Option::Some(tgt) then
@@ -4550,6 +4654,79 @@ def expr_kind_name(kind: &ExprKind) -> String
   end
 end
 
+def emit_return_edge_cleanup(b: &mut MirBuilder, stmt_node_id: Int, span: Span) -> Unit
+  # RETURN-EDGE cleanup: the semantic obligations recorded at this return
+  # point ("return::<stmt id>") are finalized BEFORE the return — an
+  # early return must not skip lexical-scope cleanup. Shared by explicit
+  # `return` statements and guard-else return paths.
+  match b.finalize_plan.get("return::" + stmt_node_id.to_string())
+  when Option::Some(ret_ids) then
+    if ret_ids.len() > 0 then
+      match b.current_block
+      when Option::Some(ret_blk) then
+        # Build the cleanup chain backward: each deinit targets the next;
+        # the chain's final block performs the return. The original
+        # block's terminator is replaced with a goto to the chain entry.
+        # A finalizer's own `self` is never re-finalized (recursive
+        # re-deinit of the subject).
+        let fn_name_here = match b.current_fn
+        when Option::Some(cf) then cf.name.clone()
+        when Option::None then ""
+        end
+        var is_deinit_fn_here = false
+        for (_, dv) in b.deinit_targets do
+          if dv == fn_name_here then
+            is_deinit_fn_here = true
+          end
+        end
+        let self_mir_id = if is_deinit_fn_here then
+          match b.current_fn
+          when Option::Some(cf) then
+            if cf.params.len() > 0 then cf.params[0].id.id else -1 end
+          when Option::None then -1
+          end
+        else
+          -1
+        end
+        let ret_chain = create_block(b)
+        b.return_edge_blocks.insert(ret_chain.id)
+        switch_to_block(b, ret_chain)
+        set_terminator(b, MirTerminatorKind::MirReturn, span)
+        var chain_succ = ret_chain
+        var ri = ret_ids.len()
+        while ri > 0 do
+          ri = ri - 1
+          let rpid = ret_ids[ri]
+          match b.semantic_to_mir.get(rpid)
+          when Option::Some(rmid) then
+            if rmid != self_mir_id then
+              let rty = builder_local_typed_ty(b, &LocalId { id: rmid })
+              let rplan = match rty
+              when Option::Some(t) then
+                var vis = Set::new()
+                deinit_plan_for_type(b, &t, &mut vis)
+              when Option::None then DeinitPlan::Trivial
+              end
+              chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: rmid }), &rplan, chain_succ, span)
+            end
+          when Option::None then
+            b.errors.push("internal error: return-edge plan references semantic local _" + rpid.to_string() + " with no MIR local")
+          end
+        end
+        switch_to_block(b, ret_blk)
+        set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), span)
+      when Option::None then ()
+      end
+    else
+      # No obligations at this return: the block still terminates with the
+      # return (an unterminated else-block would fall into the join path).
+      set_terminator(b, MirTerminatorKind::MirReturn, span)
+    end
+  when Option::None then
+    set_terminator(b, MirTerminatorKind::MirReturn, span)
+  end
+end
+
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   # Stage0 codegen miscompiles big `match` blocks on enums with many
   # variants: bindings (e.g. `value: Expr` inside `StmtLet`) come out
@@ -4633,14 +4810,14 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   elsif kind_name == "StmtWhile" then
     match stmt.kind
     when StmtKind::StmtWhile(cond, body) then
-      lower_while(b, &cond, &body, stmt.span)
+      lower_while(b, &cond, &body, stmt.span, stmt.node_id)
       return
     when _ then ()
     end
   elsif kind_name == "StmtFor" then
     match stmt.kind
     when StmtKind::StmtFor(for_stmt) then
-      lower_for(b, &for_stmt.pattern, &for_stmt.iter, &for_stmt.body, stmt.span)
+      lower_for(b, &for_stmt.pattern, &for_stmt.iter, &for_stmt.body, stmt.span, stmt.node_id)
       return
     when _ then ()
     end
@@ -4655,77 +4832,92 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
         }), stmt.span)
       when Option::None then ()
       end
-      # RETURN-EDGE cleanup: the semantic obligations recorded at this return
-      # point ("return::<stmt id>") are finalized BEFORE the return — an
-      # early return must not skip lexical-scope cleanup.
-      match b.finalize_plan.get("return::" + stmt.node_id.to_string())
-      when Option::Some(ret_ids) then
-        if ret_ids.len() > 0 then
-          match b.current_block
-          when Option::Some(ret_blk) then
-            # Build the cleanup chain backward: each deinit targets the next;
-            # the chain's final block performs the return. The original
-            # block's terminator is replaced with a goto to the chain entry.
-            # A finalizer's own `self` is never re-finalized (recursive
-            # re-deinit of the subject).
-            let fn_name_here = match b.current_fn
-            when Option::Some(cf) then cf.name.clone()
-            when Option::None then ""
-            end
-            var is_deinit_fn_here = false
-            for (_, dv) in b.deinit_targets do
-              if dv == fn_name_here then
-                is_deinit_fn_here = true
-              end
-            end
-            let self_mir_id = if is_deinit_fn_here then
-              match b.current_fn
-              when Option::Some(cf) then
-                if cf.params.len() > 0 then cf.params[0].id.id else -1 end
-              when Option::None then -1
-              end
-            else
-              -1
-            end
-            let ret_chain = create_block(b)
-            b.return_edge_blocks.insert(ret_chain.id)
-            switch_to_block(b, ret_chain)
-            set_terminator(b, MirTerminatorKind::MirReturn, stmt.span)
-            var chain_succ = ret_chain
-            var ri = ret_ids.len()
-            while ri > 0 do
-              ri = ri - 1
-              let rpid = ret_ids[ri]
-              match b.semantic_to_mir.get(rpid)
-              when Option::Some(rmid) then
-                if rmid != self_mir_id then
-                  let rty = builder_local_typed_ty(b, &LocalId { id: rmid })
-                  let rplan = match rty
-                  when Option::Some(t) then
-      var vis = Set::new()
-      deinit_plan_for_type(b, &t, &mut vis)
-                  when Option::None then DeinitPlan::Trivial
-                  end
-                  chain_succ = emit_plan_deinit(b, &place_local(LocalId { id: rmid }), &rplan, chain_succ, stmt.span)
-                end
-              when Option::None then
-                b.errors.push("internal error: return-edge plan references semantic local _" + rpid.to_string() + " with no MIR local")
-              end
-            end
-            switch_to_block(b, ret_blk)
-            set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), stmt.span)
-          when Option::None then ()
-          end
+      emit_return_edge_cleanup(b, stmt.node_id, stmt.span)
+      return
+    when _ then ()
+    end
+  elsif kind_name == "StmtGuard" then
+    match stmt.kind
+    when StmtKind::StmtGuard(cond, else_action) then
+      # guard cond else ACTION: when cond is true execution falls through;
+      # when cond is false the else action (return/break/continue/panic)
+      # runs on its own block, with the cleanup obligations the checker
+      # recorded for the guard's edge keys.
+      let cond_op = lower_expr(b, &cond, stmt.span)
+      let cont_blk = create_block(b)
+      let else_blk = create_block(b)
+      var targets = Vec::new()
+      targets.push(SwitchTarget { value: 0, target: else_blk })
+      set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cond_op, targets: targets, default_target: cont_blk }, stmt.span)
+      switch_to_block(b, else_blk)
+      match else_action
+      when GuardElse::Return(val_opt) then
+        match val_opt
+        when Option::Some(val) then
+          let operand = lower_expr(b, &val, stmt.span)
+          push_stmt(b, MirStatementKind::MirAssign(place_local(LocalId { id: 0 }), MirRvalue {
+            kind: MirRvalueKind::MirMove(operand)
+          }), stmt.span)
+        when Option::None then ()
         end
-      when Option::None then ()
+        emit_return_edge_cleanup(b, stmt.node_id, stmt.span)
+      when GuardElse::Panic(_) then
+        set_terminator(b, MirTerminatorKind::MirAbort, stmt.span)
+      when GuardElse::Break(val_opt) then
+        match val_opt
+        when Option::Some(val) then
+          let _bv = lower_expr(b, &val, stmt.span)
+        when Option::None then ()
+        end
+        emit_loop_edge_cleanup(b, "break::" + stmt.node_id.to_string(), b.break_target, stmt.span)
+      when GuardElse::Continue then
+        emit_loop_edge_cleanup(b, "continue::" + stmt.node_id.to_string(), b.continue_target, stmt.span)
       end
+      switch_to_block(b, cont_blk)
       return
     when _ then ()
     end
   elsif kind_name == "StmtExpr" then
     match stmt.kind
     when StmtKind::StmtExpr(expr) then
-      lower_expr(b, &expr, stmt.span)
+      let result_op = lower_expr(b, &expr, stmt.span)
+      # Full-expression temporary cleanup (P0-15): when the checker recorded
+      # an "expr::<stmt id>" obligation, the statement's result temporary is
+      # an owned resource that must be finalized at the end of the statement.
+      match b.finalize_plan.get("expr::" + stmt.node_id.to_string())
+      when Option::Some(_) then
+        let tmp_place = match result_op.kind
+        when MirOperandKind::MirCopy(p) then Option::Some(p)
+        when MirOperandKind::MirMovePlace(p) then Option::Some(p)
+        when MirOperandKind::MirConsume(p) then Option::Some(p)
+        when _ then Option::None
+        end
+        match tmp_place
+        when Option::Some(p) then
+            let tmp_ty = builder_local_typed_ty(b, &p.local)
+            let tmp_plan = match tmp_ty
+            when Option::Some(t) then
+              var vis3 = Set::new()
+              deinit_plan_for_type(b, &t, &mut vis3)
+            when Option::None then DeinitPlan::Trivial
+            end
+            if !deinit_plan_is_trivial(&tmp_plan) then
+              match b.current_block
+              when Option::Some(st_blk) then
+                let cont_blk = create_block(b)
+                let after_tmp = emit_plan_deinit(b, &p, &tmp_plan, cont_blk, stmt.span)
+                switch_to_block(b, st_blk)
+                set_terminator(b, MirTerminatorKind::MirGoto(after_tmp), stmt.span)
+                switch_to_block(b, cont_blk)
+              when Option::None then ()
+              end
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
       return
     when _ then ()
     end
@@ -4745,7 +4937,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   elsif kind_name == "StmtLoop" then
     match stmt.kind
     when StmtKind::StmtLoop(body) then
-      lower_loop(b, &body, stmt.span)
+      lower_loop(b, &body, stmt.span, stmt.node_id)
       return
     when _ then ()
     end
@@ -5506,20 +5698,17 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       # UserFinalizer plan, or a plain structural plan) into the success
       # block, so manually-deinitialized resources do not leak their fields.
       if normalized_method_name == "deinit" || normalized_method_name.ends_with("__deinit") then
-        match mir_infer_expr_type(b, &receiver)
-        when Option::Some(recv_ty) then
-          var vis2 = Set::new()
-          let recv_plan = deinit_plan_for_type(b, &recv_ty, &mut vis2)
-          let fields_plan = match recv_plan
-          when DeinitPlan::UserFinalizer(_, fields) then fields
-          when _ then recv_plan
-          end
-          if !deinit_plan_is_trivial(&fields_plan) then
-            let after_deinit = emit_plan_deinit(b, &recv_place, &fields_plan, success_blk, span)
-            switch_to_block(b, success_blk)
-            set_terminator(b, MirTerminatorKind::MirGoto(after_deinit), span)
-          end
-        when Option::None then ()
+        let recv_ty = mir_infer_expr_type(b, &receiver)
+        var vis2 = Set::new()
+        let recv_plan = deinit_plan_for_type(b, &recv_ty, &mut vis2)
+        let fields_plan = match recv_plan
+        when DeinitPlan::UserFinalizer(_, fields) then fields
+        when _ then recv_plan
+        end
+        if !deinit_plan_is_trivial(&fields_plan) then
+          let after_deinit = emit_plan_deinit(b, &recv_place, &fields_plan, success_blk, span)
+          switch_to_block(b, success_blk)
+          set_terminator(b, MirTerminatorKind::MirGoto(after_deinit), span)
         end
       end
       
@@ -5616,6 +5805,12 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       var capture_ids = Vec::new()
       match b.closure_captures.get(expr.node_id)
       when Option::Some(typed_caps) then
+        # P1: every capture is constructed with MirCopy below, even for
+        # Consume-effect captures — the move semantics live in the semantic
+        # layer, not in the MIR. A Consume capture should lower to a move of
+        # the source local (MirConsume) so the MIR itself represents the
+        # ownership transfer (documented P1; the checker already tracks the
+        # consumption).
         for (cap_id, _cap_effect) in typed_caps do
           # cap_id is a SEMANTIC local id; the capture operand reads the
           # OUTER function's MIR local — map through semantic_to_mir (the
@@ -7170,7 +7365,7 @@ def lower_if(b: &mut MirBuilder, if_stmt: &IfStmt, span: Span) -> Unit
   switch_to_block(b, join_block)
 end
 
-def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span) -> Unit
+def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span, loop_id: Int) -> Unit
   let header = create_block(b)
   let body_block = create_block(b)
   let exit_block = create_block(b)
@@ -7186,13 +7381,30 @@ def lower_while(b: &mut MirBuilder, cond: &Expr, body: &Block, span: Span) -> Un
   switch_to_block(b, header)
   let cond_op = lower_expr(b, cond, span)
   var targets = Vec::new()
-  targets.push(SwitchTarget { value: 0, target: exit_block })
+  # Loop-exit edge: resources created in the final iteration are finalized
+  # before the loop exits (the backedge that would clean them is not taken).
+  # emit_loop_chain_entry switches to the chain's tail block; the header
+  # switch must be attached to the HEADER, so switch back before set_terminator.
+  let exit_chain = emit_loop_chain_entry(b, "backedge::" + loop_id.to_string(), exit_block, span)
+  targets.push(SwitchTarget { value: 0, target: exit_chain })
+  switch_to_block(b, header)
   set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cond_op, targets: targets, default_target: body_block }, span)
 
   switch_to_block(b, body_block)
   lower_block(b, body)
   if !block_is_terminated(b) then
-    set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    match b.finalize_plan.get("backedge::" + loop_id.to_string())
+    when Option::Some(be_ids) then
+      if be_ids.len() > 0 then
+        # Per-iteration cleanup: loop-created resources are finalized at the
+        # end of each iteration, before the backedge re-enters the header.
+        emit_loop_edge_cleanup(b, "backedge::" + loop_id.to_string(), Option::Some(header), span)
+      else
+        set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      end
+    when Option::None then
+      set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    end
   end
   
   # Restore break/continue targets
@@ -8191,7 +8403,7 @@ def for_match_mentions_name(b: &MirBuilder, name: String, m: &MatchExpr) -> Bool
   found
 end
 
-def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span: Span, elem_ty: &Type) -> Unit
+def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span: Span, elem_ty: &Type, loop_id: Int) -> Unit
   let var_name = match pat.kind
   when PatternKind::Ident(name, _) then name.clone()
   when _ then "_for_var"
@@ -8242,7 +8454,9 @@ def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &B
     operand_copy_local(hi_local)
   ) }, span)
   var targets = Vec::new()
-  targets.push(SwitchTarget { value: 0, target: exit_blk })
+  let exit_chain = emit_loop_chain_entry(b, "backedge::" + loop_id.to_string(), exit_blk, span)
+  targets.push(SwitchTarget { value: 0, target: exit_chain })
+  switch_to_block(b, header)
   set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(cmp_tmp), targets: targets, default_target: body_blk }, span)
   switch_to_block(b, body_blk)
   let idx_tmp = add_temp(b, Type::Int, span)
@@ -8273,17 +8487,28 @@ def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &B
       operand_int(1)
     ) }, span)
     push_assign(b, place_local(idx_local), move_rvalue(operand_copy_local(inc_tmp)), span)
-    set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    # Per-iteration cleanup: loop-created resources are finalized at the end
+    # of each iteration, before the backedge re-enters the header.
+    match b.finalize_plan.get("backedge::" + loop_id.to_string())
+    when Option::Some(be_ids) then
+      if be_ids.len() > 0 then
+        emit_loop_edge_cleanup(b, "backedge::" + loop_id.to_string(), Option::Some(header), span)
+      else
+        set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      end
+    when Option::None then
+      set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    end
   end
   b.break_target = old_break
   b.continue_target = old_continue
   switch_to_block(b, exit_blk)
 end
 
-def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span: Span) -> Unit
+def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span: Span, loop_id: Int) -> Unit
   let for_safe_elem = for_projected_iter_elem_type(b, iter)
   if for_safe_elem != Type::Unit && for_body_is_projected_safe(b, pat, body) then
-    lower_for_projected(b, pat, iter, body, span, &for_safe_elem)
+    lower_for_projected(b, pat, iter, body, span, &for_safe_elem, loop_id)
     return
   end
   # Desugar for loops:
@@ -8344,7 +8569,11 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
     push_assign(b, cmp_place, cmp_rvalue, span)
     let cmp_op = operand_copy_local(LocalId { id: cmp_counter })
     var targets = Vec::new()
-    targets.push(SwitchTarget { value: 0, target: exit_blk })
+    # Loop-exit edge: resources created in the final iteration are finalized
+    # before the loop exits (the backedge that would clean them is not taken).
+    let exit_chain = emit_loop_chain_entry(b, "backedge::" + loop_id.to_string(), exit_blk, span)
+    targets.push(SwitchTarget { value: 0, target: exit_chain })
+    switch_to_block(b, header)
     set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cmp_op, targets: targets, default_target: body_blk }, span)
 
     switch_to_block(b, body_blk)
@@ -8361,7 +8590,17 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
       let var_place3 = place_local(LocalId { id: var_counter })
       let inc_result = operand_copy_local(LocalId { id: inc_counter })
       push_assign(b, var_place3, move_rvalue(inc_result), span)
-      set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      # Per-iteration cleanup of loop-created resources before the backedge.
+      match b.finalize_plan.get("backedge::" + loop_id.to_string())
+      when Option::Some(be_ids) then
+        if be_ids.len() > 0 then
+          emit_loop_edge_cleanup(b, "backedge::" + loop_id.to_string(), Option::Some(header), span)
+        else
+          set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+        end
+      when Option::None then
+        set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      end
     end
 
     b.break_target = old_break
@@ -8439,7 +8678,11 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
     ) }, span)
     let cmp_op = operand_copy_local(cmp_tmp)
     var targets = Vec::new()
-    targets.push(SwitchTarget { value: 0, target: exit_blk })
+    # Loop-exit edge: resources created in the final iteration are finalized
+    # before the loop exits (the backedge that would clean them is not taken).
+    let exit_chain = emit_loop_chain_entry(b, "backedge::" + loop_id.to_string(), exit_blk, span)
+    targets.push(SwitchTarget { value: 0, target: exit_chain })
+    switch_to_block(b, header)
     set_terminator(b, MirTerminatorKind::MirSwitchInt { op: cmp_op, targets: targets, default_target: body_blk }, span)
 
     switch_to_block(b, body_blk)
@@ -8479,6 +8722,17 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
       ) }, span)
       push_assign(b, place_local(idx_local), move_rvalue(operand_copy_local(inc_tmp)), span)
       set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      # Per-iteration cleanup of loop-created resources before the backedge.
+      match b.finalize_plan.get("backedge::" + loop_id.to_string())
+      when Option::Some(be_ids) then
+        if be_ids.len() > 0 then
+          emit_loop_edge_cleanup(b, "backedge::" + loop_id.to_string(), Option::Some(header), span)
+        else
+          set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+        end
+      when Option::None then
+        set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      end
     end
 
     b.break_target = old_break
@@ -8487,7 +8741,7 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
   end
 end
 
-def lower_loop(b: &mut MirBuilder, body: &Block, span: Span) -> Unit
+def lower_loop(b: &mut MirBuilder, body: &Block, span: Span, loop_id: Int) -> Unit
   let header = create_block(b)
   let exit_block = create_block(b)
   
@@ -8502,7 +8756,16 @@ def lower_loop(b: &mut MirBuilder, body: &Block, span: Span) -> Unit
   switch_to_block(b, header)
   lower_block(b, body)
   if !block_is_terminated(b) then
-    set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    match b.finalize_plan.get("backedge::" + loop_id.to_string())
+    when Option::Some(be_ids) then
+      if be_ids.len() > 0 then
+        emit_loop_edge_cleanup(b, "backedge::" + loop_id.to_string(), Option::Some(header), span)
+      else
+        set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+      end
+    when Option::None then
+      set_terminator(b, MirTerminatorKind::MirGoto(header), span)
+    end
   end
   
   # Restore break/continue targets

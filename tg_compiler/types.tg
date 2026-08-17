@@ -171,6 +171,25 @@ pub def deinit_plan_is_trivial(plan: &DeinitPlan) -> Bool
   end
 end
 
+# Canonical plans for the named container types (Option/Result/Array/Vec/
+# Map/Set), keyed by type NAME. Returns Trivial for anything else; the
+# caller falls back to the structural walk.
+def nominal_container_plan(typed: &TypedProgram, tid: &TypeId, type_name: &String, args: &Vec[Type], depth: Int, visited: &mut Set[Int], errors: &mut Vec[TypeError]) -> DeinitPlan
+  if type_name == "Option" && args.len() >= 1 then
+    DeinitPlan::Option(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
+  elsif type_name == "Result" && args.len() >= 2 then
+    DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
+  elsif (type_name == "Array" || type_name == "Vec") && args.len() >= 1 then
+    DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
+  elsif type_name == "Map" && args.len() >= 2 then
+    DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
+  elsif type_name == "Set" && args.len() >= 1 then
+    DeinitPlan::Set(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
+  else
+    DeinitPlan::Trivial
+  end
+end
+
 # Build the deinit plan for a type from the typed program's type kinds and
 # registered deinit targets. Mirrors the type checker's viral containment
 # rules: containers of resource types get recursive plans; a direct resource
@@ -187,7 +206,7 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
       span: Span { file: "", start: 0, end_pos: 0 },
       code: Option::None
     })
-    return DeinitPlan::Trivial
+    return DeinitPlan::PlanLimit
   end
   match ty
   when Type::Option(inner) then
@@ -247,7 +266,11 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
           # build an Aggregate/Enum plan over the nominal shape (a bare
           # Trivial would silently leak field resources).
           if visited.contains(&tid.id) then
-            DeinitPlan::Trivial  # cycle edge in a recursive type
+            # Recursive ownership (e.g. Node { next: Option[Box[Node]] })
+            # needs generated drop glue, not finite plan-tree expansion.
+            # PlanLimit is the fail-closed stand-in: refusing to compile is
+            # safer than silently dropping the recursive edge.
+            DeinitPlan::PlanLimit
           else
             visited.insert(tid.id)
             let result = nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
@@ -258,18 +281,54 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
       else
         # Named container types (Option/Result/Array/Map/Set) resolve to
         # their canonical forms via their type name + generic args.
-        if type_name == "Option" && args.len() >= 1 then
-          DeinitPlan::Option(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
-        elsif type_name == "Result" && args.len() >= 2 then
-          DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
-        elsif (type_name == "Array" || type_name == "Vec") && args.len() >= 1 then
-          DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
-        elsif type_name == "Map" && args.len() >= 2 then
-          DeinitPlan::Map(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
-        elsif type_name == "Set" && args.len() >= 1 then
-          DeinitPlan::Set(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
-        else
-          DeinitPlan::Trivial
+        let container_plan = nominal_container_plan(typed, &tid, &type_name, &args, depth, visited, errors)
+        if deinit_plan_is_trivial(&container_plan) then
+          # Ordinary nominal Value types: cleanup is structural. A struct
+          # Wrapper[T] { item: T } instantiated with a resource must clean
+          # its fields — the semantic layer and MIR must agree, so the
+          # semantic plan walks the nominal shape rather than returning
+          # Trivial for anything that is not a recognized container.
+          # A Value-kind type with a registered deinit (an `impl Drop for
+          # T`) runs its drop: the plan references the callable so the
+          # allocation/state release actually executes (a plain structural
+          # walk of e.g. Box[T] { ptr } would see only a non-owning Ptr and
+          # leak the pointee). Ordering matches the MIR: the registered
+          # drop wins over the container/structural shape.
+          let deinit_shape = match typed.deinit_targets.get(tid.id)
+          when Option::Some(n) then
+            if visited.contains(&tid.id) then
+              DeinitPlan::Call(n.clone())
+            else
+              visited.insert(tid.id)
+              let inner_container_plan = nominal_container_plan(typed, &tid, &type_name, &args, depth, visited, errors)
+              let struct_shape = if deinit_plan_is_trivial(&inner_container_plan) then
+                nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
+              else
+                inner_container_plan
+              end
+              visited.remove(&tid.id)
+              if deinit_plan_is_trivial(&struct_shape) then
+                DeinitPlan::Call(n.clone())
+              else
+                DeinitPlan::UserFinalizer(n.clone(), struct_shape)
+              end
+            end
+          when Option::None then
+            if visited.contains(&tid.id) then
+              DeinitPlan::PlanLimit
+            else
+              visited.insert(tid.id)
+              let inner_container_plan = nominal_container_plan(typed, &tid, &type_name, &args, depth, visited, errors)
+              let result = if deinit_plan_is_trivial(&inner_container_plan) then
+                nominal_containment_plan(typed, &tid, &args, depth, visited, errors)
+              else
+                inner_container_plan
+              end
+              visited.remove(&tid.id)
+              result
+            end
+          end
+          deinit_shape
         end
       end
     when Option::None then DeinitPlan::Trivial
@@ -447,6 +506,11 @@ struct ImplInfo
 end
 
 struct MethodInfo
+  name: String
+  ret_type: Type
+  params: Vec[ParamType]
+  generic_params: Vec[String]  # Method-level generic param names (e.g., ["U"] for cast[U])
+end
 
 def type_env_new() -> TypeEnv
   var env = TypeEnv {
@@ -1264,8 +1328,17 @@ def normalize_named_to_canonical(env: &mut TypeEnv, ty: Type) -> Type
         else return Type::Box(fresh_type_var(env))
         end
       elsif name == "Rc" then
-        
-        if named_args.len() >= 1 then return Type::Rc(named_args[0].clone())
+        # Rc[Resource] is an unsupported combination (documented ownership
+        # policy): a linear resource cannot become shared ownership through
+        # reference counting. Reject at the type annotation so the policy is
+        # enforced, not just documented (the resource checker re-rejects any
+        # bound Rc-of-resource at bind time). NOTE: normalize_named_to_canonical
+        # has no span parameter — use a zero span for the diagnostic.
+        if named_args.len() >= 1 then
+          if type_has_resource_kind(env, &named_args[0]) then
+            type_add_error(env, "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting", Span { file: "", start: 0, end_pos: 0 })
+          end
+          return Type::Rc(named_args[0].clone())
         else return Type::Rc(fresh_type_var(env))
         end
       else
@@ -4522,6 +4595,20 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
                 type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
               end
             when _ then ()
+            end
+          end
+        elsif cname == "__intrinsic_array_extend" then
+          # array_extend copies elements OUT of the SHARED source (args[1],
+          # the second argument — the first is the inout target): the
+          # duplication hole is the source's element type, exactly like
+          # the slice()/clone() guards.
+          if args.len() >= 2 then
+            match container_element_type(env, &arg_types[1])
+            when Option::Some(elem_ty) then
+              if type_has_resource_kind(env, &elem_ty) then
+                type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+              end
+            when Option::None then ()
             end
           end
         end
