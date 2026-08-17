@@ -39,12 +39,19 @@ enum ParamOrigin
   DeinitSelf
 end
 
+# P0-V: one logical local = ONE record. Availability, permission origin,
+# capability flag, and span live in a single map entry, so removing a local
+# (forget/exit_scope/frame_assign) removes the whole record — no parallel
+# collection can be left with stale spans/origins/caps for a forgotten id.
+struct LocalState
+  availability: ResourceState
+  origin: ParamOrigin
+  is_capability: Bool
+  span: Span
+end
+
 struct ResFrame
-  names: Vec[Int]
-  states: Map[Int, ResourceState]
-  caps: Vec[Int]
-  spans: Map[Int, Span]
-  origins: Map[Int, ParamOrigin]
+  locals: Map[Int, LocalState]
 end
 
 enum FlowKind
@@ -406,7 +413,7 @@ def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, ow
   # consume/re-finalize the subject (the generated wrapper runs the user hook
   # then the structural field cleanup exactly once).
   if (f.name == "deinit" || f.name == "drop") && entry_ids.len() > 0 then
-    frame.origins.insert(entry_ids[0], ParamOrigin::DeinitSelf)
+    res_frame_set_origin(&mut frame, &entry_ids[0], ParamOrigin::DeinitSelf)
   end
   check_fn_body(program, typed, &f.body, &mut frame, errors, finalize_plan, current_loop_entry)
   # The authoritative finalize plan is computed from the frame BEFORE
@@ -439,25 +446,14 @@ end
 # (the MIR side handles that special case when emitting the finalizer).
 def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, owner_key: String, finalize_plan: &mut Map[String, Vec[Int]], exclude_id: Int) -> Unit
   var ids = Vec::new()
-  mut i = 0
-  while i < frame.names.len() do
-    let id = frame.names[i]
-    if id == exclude_id then
-      i = i + 1
-      next
-    end
-    match res_frame_get(frame, &id)
-    when Option::Some(ResourceState::Live) then
-      match frame.origins.get(id)
-      when Option::Some(origin) then
-        if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+  for (id, ls) in frame.locals do
+    if id != exclude_id then
+      if ls.availability == ResourceState::Live then
+        if ls.origin == ParamOrigin::Sink || ls.origin == ParamOrigin::OwnedLocal then
           ids.push(id)
         end
-      when Option::None then ()
       end
-    when _ then ()
     end
-    i = i + 1
   end
   finalize_plan.insert(owner_key, ids)
 end
@@ -561,16 +557,47 @@ def is_owning_typed_depth(typed: &TypedProgram, ty: &Type, depth: Int) -> Bool
   end
 end
 
+# A type that cannot safely sit behind shared ownership (P0-BC): LINEAR
+# resources/capabilities and MOVE-ONLY smart pointers (canonical Box and the
+# named UniquePtr forms). This is deliberately NARROWER than is_owning_typed:
+# a destructible-but-shareable value such as Vec[Int] is perfectly coherent
+# as Rc[Vec[Int]] — the last release destroys the payload. Only
+# linear/non-shareable payloads are forbidden behind Rc.
+def is_non_shareable_type(typed: &TypedProgram, ty: &Type) -> Bool
+  match ty
+  when Type::Box(_) then true
+  when Type::Named(tid, args) then
+    match typed.type_names.get(tid.id)
+    when Option::Some(n) then
+      if n == "UniquePtr" || n == "WeakRc" || n == "ArcStrong" || n == "WeakArc" then
+        true
+      else
+        match typed.type_kinds.get(tid.id)
+        when Option::Some(k) then k == TypeKind::Resource || k == TypeKind::Capability
+        when Option::None then false
+        end
+      end
+    when Option::None then false
+    end
+  when _ then
+    # The canonical forms: linear resources/capabilities (via the kind walker
+    # for Option/Result-wrapped payloads); containers and shareable values
+    # are NOT non-shareable.
+    type_kind_contains_resource(&typed.type_kinds, ty)
+  end
+end
+
 # Rc[Resource] is explicitly unsupported: a linear resource cannot be shared
 # through reference counting (documented ownership policy). Reject the
 # combination at every binding point instead of silently treating the Rc
 # wrapper as non-resource and losing the contained resource's state. The
-# payload policy uses is_owning_typed: Rc[UniquePtr[Int]] is rejected too —
-# a move-only owner behind shared ownership is the same unsoundness.
+# payload policy uses is_non_shareable_type: Rc[UniquePtr[Int]] is rejected
+# (a move-only owner behind shared ownership), while Rc[Vec[Int]] is allowed
+# (destructible-but-shareable — the last release destroys the payload).
 def reject_rc_resource(typed: &TypedProgram, ty: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
   match ty
   when Type::Rc(inner) then
-    if is_owning_typed(typed, &inner) then
+    if is_non_shareable_type(typed, &inner) then
       errors.push(ResourceError {
         message: "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting",
         span: span
@@ -630,7 +657,7 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
           end
           res_frame_set(frame, id, init_state)
           res_frame_set_span(frame, &id, p.span)
-          frame.origins.insert(id, origin)
+          res_frame_set_origin(frame, &id, origin)
         end
         if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
           res_frame_mark_cap(frame, &id)
@@ -654,6 +681,14 @@ def check_fn_body(program: &Program, typed: &TypedProgram, body: &FnBody, frame:
   when FnBody::FnExtern(_) then ()
   when FnBody::FnNone then ()
   end
+  # IMPLICIT-return postconditions: set params must be exactly Live, and
+  # live capabilities must have been transferred/consumed (P0-T / P0-U).
+  let fn_end_span = match body
+  when FnBody::FnBlock(b) then if b.stmts.len() > 0 then b.stmts[b.stmts.len() - 1].span else Span { file: "", start: 0, end_pos: 0 } end
+  when _ then Span { file: "", start: 0, end_pos: 0 }
+  end
+  validate_set_postconditions(typed, frame, fn_end_span, errors)
+  validate_capability_exit(typed, frame, fn_end_span, errors)
 end
 
 def flatten_flow(stmt: &Stmt, out: &mut Vec[FlowNode]) -> Unit
@@ -806,23 +841,14 @@ def record_block_exit_plan(typed: &TypedProgram, frame: &ResFrame, entry_names: 
   let key = block_exit_key(block)
   if key == 0 then return end
   var ids = Vec::new()
-  mut i = 0
-  while i < frame.names.len() do
-    let id = frame.names[i]
+  for (id, ls) in frame.locals do
     if !entry_names.contains(&id) then
-      match res_frame_get(frame, &id)
-      when Option::Some(ResourceState::Live) then
-        match frame.origins.get(id)
-        when Option::Some(origin) then
-          if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
-            ids.push(id)
-          end
-        when Option::None then ()
+      if ls.availability == ResourceState::Live then
+        if ls.origin == ParamOrigin::Sink || ls.origin == ParamOrigin::OwnedLocal then
+          ids.push(id)
         end
-      when _ then ()
       end
     end
-    i = i + 1
   end
   if ids.len() > 0 then
     finalize_plan.insert("block::" + key.to_string(), ids)
@@ -920,6 +946,42 @@ def run_res_flow(program: &Program, typed: &TypedProgram, flow: &ResFlow, loop_o
   frame_assign(frame, &final_frame)
 end
 
+# P0-T: a set parameter's contract is entry Uninitialized, exit EXACTLY
+# Live — on every normal return edge it must have been initialized and not
+# consumed/left MaybeLive afterwards. A missing/divergent state is an error.
+def validate_set_postconditions(typed: &TypedProgram, frame: &ResFrame, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+  for (id, ls) in frame.locals do
+    if ls.origin == ParamOrigin::Set then
+      match ls.availability
+      when ResourceState::Live then ()
+      when _ then
+        errors.push(ResourceError {
+          message: "set parameter `" + binding_name(typed, id) + "` must be exactly Live on every return edge (entry Uninitialized, exit Live)",
+          span: span
+        })
+      end
+    end
+  end
+end
+
+# P0-U: a live capability reaching a function exit must have been returned,
+# transferred, delegated, or explicitly consumed by a capability operation —
+# an automatic deinitializer must NOT satisfy its linearity.
+def validate_capability_exit(typed: &TypedProgram, frame: &ResFrame, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+  for (cid, ls) in frame.locals do
+    if ls.is_capability then
+      match ls.availability
+      when ResourceState::Live then
+        errors.push(ResourceError {
+          message: "capability `" + binding_name(typed, cid) + "` must be returned, transferred, delegated, or explicitly consumed before function exit (authority cannot be silently discarded)",
+          span: span
+        })
+      when _ then ()
+      end
+    end
+  end
+end
+
 def check_return_stmt(program: &Program, typed: &TypedProgram, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], stmt_node_id: Int) -> Unit
   var return_entry = Vec::new()
   match val_opt
@@ -935,6 +997,10 @@ def check_return_stmt(program: &Program, typed: &TypedProgram, val_opt: Option[E
   # A return exits EVERY scope, so the excluded set is empty.
   var return_exclude = Vec::new()
   record_exit_edge_plan(typed, frame, "return::" + stmt_node_id.to_string(), &return_exclude, finalize_plan)
+  # Return-edge POSTCONDITIONS: set params must be exactly Live, and live
+  # capabilities must have been transferred/consumed.
+  validate_set_postconditions(typed, frame, span, errors)
+  validate_capability_exit(typed, frame, span, errors)
 end
 
 # Record the cleanup obligation for a control-flow exit edge: Live locals
@@ -943,23 +1009,14 @@ end
 # they must survive the edge, so they are not part of the plan.
 def record_exit_edge_plan(typed: &TypedProgram, frame: &ResFrame, key: String, exclude: &Vec[Int], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
   var ids = Vec::new()
-  mut i = 0
-  while i < frame.names.len() do
-    let id = frame.names[i]
+  for (id, ls) in frame.locals do
     if !exclude.contains(&id) then
-      match res_frame_get(frame, &id)
-      when Option::Some(ResourceState::Live) then
-        match frame.origins.get(id)
-        when Option::Some(origin) then
-          if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
-            ids.push(id)
-          end
-        when Option::None then ()
+      if ls.availability == ResourceState::Live then
+        if ls.origin == ParamOrigin::Sink || ls.origin == ParamOrigin::OwnedLocal then
+          ids.push(id)
         end
-      when _ then ()
       end
     end
-    i = i + 1
   end
   if ids.len() > 0 then
     finalize_plan.insert(key, ids)
@@ -1024,7 +1081,7 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
         # reject it until exact-place replacement exists.
         match res_frame_get(frame, &id)
         when Option::Some(ResourceState::Live) then
-          match frame.origins.get(id)
+          match res_frame_get_origin(frame, &id)
           when Option::Some(origin) then
             if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
               if expr_is_plain(&target) then
@@ -1134,10 +1191,9 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     when Option::Some(fb) then check_block(program, typed, &fb, loop_outer, frame, errors, finalize_plan, current_loop_entry)
     when Option::None then ()
     end
-  when StmtKind::StmtWith(expr, name, body) then
+  when StmtKind::StmtWith(expr, pat, body) then
     check_expr(program, typed, &expr, loop_outer, frame, errors, finalize_plan, current_loop_entry)
-    let with_pat = Pattern { kind: PatternKind::Ident(name.clone(), false), span: stmt.span, node_id: 0 }
-    bind_pattern(typed, &with_pat, stmt.span, frame, errors)
+    bind_pattern(typed, &pat, stmt.span, frame, errors)
     check_block(program, typed, &body, loop_outer, frame, errors, finalize_plan, current_loop_entry)
   when StmtKind::StmtHandleWith(expr, handlers) then
     check_expr(program, typed, &expr, loop_outer, frame, errors, finalize_plan, current_loop_entry)
@@ -1277,18 +1333,15 @@ end
 def check_loop_created(entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, typed: &TypedProgram, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], loop_stmt_id: Int) -> Vec[Int]
   mut to_forget = Vec::new()
   var backedge_ids = Vec::new()
-  mut i = 0
-  while i < bf.names.len() do
-    let id = bf.names[i]
-    match res_frame_get(bf, &id)
-    when Option::Some(ResourceState::Live) then
+  for (id, ls) in bf.locals do
+    match ls.availability
+    when ResourceState::Live then
       if is_loop_created(entry, entry_names, &id) then
-        let is_cap = bf.caps.contains(&id)
-        if is_cap then
+        if ls.is_capability then
           # A capability cannot be auto-finalized: it must be consumed.
           errors.push(ResourceError {
             message: "capability `" + binding_name(typed, id) + "` created in loop must be consumed each iteration",
-            span: frame_span(bf, &id)
+            span: ls.span
           })
         else
           # Owned resources are cleaned by the BACKEDGE: `loop { let p = Probe{}; }`
@@ -1297,13 +1350,12 @@ def check_loop_created(entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, 
         end
         to_forget.push(id)
       end
-    when Option::Some(ResourceState::MaybeLive) then
+    when ResourceState::MaybeLive then
       if is_loop_created(entry, entry_names, &id) then
-        let is_cap = bf.caps.contains(&id)
-        if is_cap then
+        if ls.is_capability then
           errors.push(ResourceError {
             message: "capability `" + binding_name(typed, id) + "` created in loop must be consumed each iteration",
-            span: frame_span(bf, &id)
+            span: ls.span
           })
         else
           backedge_ids.push(id)
@@ -1312,7 +1364,6 @@ def check_loop_created(entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, 
       end
     when _ then ()
     end
-    i = i + 1
   end
   if backedge_ids.len() > 0 then
     finalize_plan.insert("backedge::" + loop_stmt_id.to_string(), backedge_ids)
@@ -1388,7 +1439,7 @@ def bind_pattern_ident(typed: &TypedProgram, node_id: Int, span: Span, frame: &m
       if is_owning_typed(typed, &lb.ty) then
         res_frame_set(frame, id, ResourceState::Live)
         res_frame_set_span(frame, &id, span)
-        frame.origins.insert(id, ParamOrigin::OwnedLocal)
+        res_frame_set_origin(frame, &id, ParamOrigin::OwnedLocal)
       end
       if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
         res_frame_mark_cap(frame, &id)
@@ -1553,7 +1604,7 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
               end
               res_frame_set(&mut cframe, cap_id, ResourceState::Live)
               res_frame_set_span(&mut cframe, &cap_id, expr.span)
-              cframe.origins.insert(cap_id, ParamOrigin::OwnedLocal)
+              res_frame_set_origin(&mut cframe, &cap_id, ParamOrigin::OwnedLocal)
             when AccessEffect::Read then
               errors.push(ResourceError {
                 message: "resource `" + binding_name(typed, cap_id) + "` captured by read would duplicate ownership; capture by consume (sink)",
@@ -1626,7 +1677,7 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
       if res_frame_has(frame, &id) then
         match res_frame_get(frame, &id)
         when Option::Some(ResourceState::Live) then
-          match frame.origins.get(id)
+          match res_frame_get_origin(frame, &id)
           when Option::Some(origin) then
             if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
               if expr_is_plain(&target) then
@@ -1749,7 +1800,7 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
         # is rejected (the DeinitSelf case gets the finalizer-specific
         # message; all other roots get the partial-move restriction).
         if effect == AccessEffect::Consume then
-          match frame.origins.get(id)
+          match res_frame_get_origin(frame, &id)
           when Option::Some(ParamOrigin::DeinitSelf) then
             errors.push(ResourceError {
               message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
@@ -1776,7 +1827,7 @@ def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[In
   # owned locals) may be consumed. let params are read-only and inout params
   # may be modified but never consumed/escaped — a sink operation on them is
   # exactly the unsoundness `def inspect(x: R); destroy(x)` exercises.
-  match frame.origins.get(id)
+  match res_frame_get_origin(frame, &id)
   when Option::Some(origin) then
     if origin == ParamOrigin::DeinitSelf then
       errors.push(ResourceError {
@@ -1855,37 +1906,34 @@ end
 
 def exit_scope(frame: &mut ResFrame, entry_names: &Vec[Int], typed: &TypedProgram, errors: &mut Vec[ResourceError]) -> Unit
   mut to_forget = Vec::new()
-  mut i = 0
-  while i < frame.names.len() do
-    let id = frame.names[i]
+  for (id, ls) in frame.locals do
     if !entry_names.contains(&id) then
-      match res_frame_get(frame, &id)
-      when Option::Some(ResourceState::Live) then
-        if frame.caps.contains(&id) then
+      match ls.availability
+      when ResourceState::Live then
+        if ls.is_capability then
           errors.push(ResourceError {
             message: "capability `" + binding_name(typed, id) + "` silently discarded",
-            span: frame_span(frame, &id)
+            span: ls.span
           })
         end
-      when Option::Some(ResourceState::MaybeLive) then
-        if frame.caps.contains(&id) then
+      when ResourceState::MaybeLive then
+        if ls.is_capability then
           errors.push(ResourceError {
             message: "capability `" + binding_name(typed, id) + "` silently discarded",
-            span: frame_span(frame, &id)
+            span: ls.span
           })
         end
-      when Option::Some(ResourceState::Uninitialized) then
+      when ResourceState::Uninitialized then
         errors.push(ResourceError {
           message: "resource `" + binding_name(typed, id) + "` left uninitialized",
-          span: frame_span(frame, &id)
+          span: ls.span
         })
       when _ then ()
       end
       to_forget.push(id)
     end
-    i = i + 1
   end
-  i = 0
+  mut i = 0
   while i < to_forget.len() do
     res_frame_forget(frame, &to_forget[i])
     i = i + 1
@@ -1893,153 +1941,125 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[Int], typed: &TypedProgra
 end
 
 def check_uninitialized_exit(frame: &ResFrame, typed: &TypedProgram, errors: &mut Vec[ResourceError]) -> Unit
-  mut i = 0
-  while i < frame.names.len() do
-    let id = frame.names[i]
-    match res_frame_get(frame, &id)
-    when Option::Some(ResourceState::Uninitialized) then
+  for (id, ls) in frame.locals do
+    match ls.availability
+    when ResourceState::Uninitialized then
       errors.push(ResourceError {
         message: "resource `" + binding_name(typed, id) + "` left uninitialized",
-        span: frame_span(frame, &id)
+        span: ls.span
       })
     when _ then ()
     end
-    i = i + 1
   end
 end
 
 def res_frame_new() -> ResFrame
   ResFrame {
-    names: Vec::new(),
-    states: Map::new(),
-    caps: Vec::new(),
-    spans: Map::new(),
-    origins: Map::new()
+    locals: Map::new()
   }
 end
 
 def res_frame_has(frame: &ResFrame, id: &Int) -> Bool
-  frame.states.contains_key(id)
+  frame.locals.contains_key(id)
 end
 
 def res_frame_get_origin(frame: &ResFrame, id: &Int) -> Option[ParamOrigin]
-  frame.origins.get(id)
+  match frame.locals.get(id)
+  when Option::Some(ls) then Option::Some(ls.origin)
+  when Option::None then Option::None
+  end
 end
 
 def res_frame_get(frame: &ResFrame, id: &Int) -> Option[ResourceState]
-  match frame.states.get(id)
-  when Option::Some(s) then Option::Some(s)
+  match frame.locals.get(id)
+  when Option::Some(ls) then Option::Some(ls.availability)
   when Option::None then Option::None
   end
 end
 
 def res_frame_set(frame: &mut ResFrame, id: Int, state: ResourceState) -> Unit
-  if !frame.states.contains_key(&id) then
-    frame.names.push(id)
+  match frame.locals.get(&id)
+  when Option::Some(ls) then
+    # State transition only: the local's origin/capability/span are part of
+    # the same record and must survive the transition untouched.
+    frame.locals.insert(id, LocalState { availability: state, origin: ls.origin, is_capability: ls.is_capability, span: ls.span })
+  when Option::None then
+    # First registration: create the single per-local record.
+    frame.locals.insert(id, LocalState { availability: state, origin: ParamOrigin::Let, is_capability: false, span: Span { file: "", start: 0, end_pos: 0 } })
   end
-  frame.states.insert(id, state)
 end
 
 def res_frame_set_span(frame: &mut ResFrame, id: &Int, span: Span) -> Unit
-  frame.spans.insert(id, span)
+  match frame.locals.get(id)
+  when Option::Some(ls) then
+    frame.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: span })
+  when Option::None then ()
+  end
+end
+
+# The permission origin is stored in the single per-local record (P0-V):
+# updating it touches only that record, never a parallel map that a forget
+# could leave desynced.
+def res_frame_set_origin(frame: &mut ResFrame, id: &Int, origin: ParamOrigin) -> Unit
+  match frame.locals.get(id)
+  when Option::Some(ls) then
+    frame.locals.insert(id, LocalState { availability: ls.availability, origin: origin, is_capability: ls.is_capability, span: ls.span })
+  when Option::None then ()
+  end
 end
 
 def frame_span(frame: &ResFrame, id: &Int) -> Span
-  match frame.spans.get(id)
-  when Option::Some(s) then s
+  match frame.locals.get(id)
+  when Option::Some(ls) then ls.span
   when Option::None then Span { file: String::new(), start: 0, end_pos: 0 }
   end
 end
 
 def res_frame_mark_cap(frame: &mut ResFrame, id: &Int) -> Unit
-  frame.caps.push(id)
+  match frame.locals.get(id)
+  when Option::Some(ls) then
+    frame.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: true, span: ls.span })
+  when Option::None then ()
+  end
 end
 
 def res_frame_forget(frame: &mut ResFrame, id: &Int) -> Unit
-  frame.states.remove(id)
-  frame.spans.remove(id)
-  mut i = 0
-  while i < frame.names.len() do
-    if frame.names[i] == id then
-      frame.names.remove(i)
-      break
-    end
-    i = i + 1
-  end
-  mut j = 0
-  while j < frame.caps.len() do
-    if frame.caps[j] == id then
-      frame.caps.remove(j)
-      break
-    end
-    j = j + 1
-  end
+  # The whole per-local record is removed at once: availability, origin,
+  # capability flag, and span disappear together, so a forgotten local can
+  # never leave a stale span/origin behind in a parallel collection (P0-V).
+  frame.locals.remove(id)
 end
 
 def res_frame_names_clone(frame: &ResFrame) -> Vec[Int]
-  mut out = Vec::new()
-  mut i = 0
-  while i < frame.names.len() do
-    out.push(frame.names[i])
-    i = i + 1
+  var out = Vec::new()
+  for (id, _) in frame.locals do
+    out.push(id)
   end
   out
 end
 
 def res_frame_clone(frame: &ResFrame) -> ResFrame
   mut out = res_frame_new()
-  mut i = 0
-  while i < frame.names.len() do
-    match res_frame_get(frame, &frame.names[i])
-    when Option::Some(s) then
-      res_frame_set(&mut out, frame.names[i], s)
-      res_frame_set_span(&mut out, &frame.names[i], frame_span(frame, &frame.names[i]))
-    when Option::None then ()
-    end
-    i = i + 1
-  end
-  mut j = 0
-  while j < frame.caps.len() do
-    out.caps.push(frame.caps[j])
-    j = j + 1
-  end
-  # Copy permission origins alongside availability (permission is part of
-  # the frame state; losing it would let a let/inout param be consumed).
-  for (oid, origin) in frame.origins do
-    out.origins.insert(oid, origin)
+  # The record is copied wholesale: availability, origin, capability flag,
+  # and span all travel together.
+  for (id, ls) in frame.locals do
+    out.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: ls.span })
   end
   out
 end
 
 def res_frame_equal(a: &ResFrame, b: &ResFrame) -> Bool
-  if a.names.len() != b.names.len() then return false end
-  mut i = 0
-  while i < a.names.len() do
-    let id = a.names[i]
-    match res_frame_get(b, &id)
-    when Option::Some(sb) then
-      match res_frame_get(a, &id)
-      when Option::Some(sa) then
-        if !(sa == sb) then return false end
-      when Option::None then return false
-      end
-    when Option::None then return false
-    end
-    i = i + 1
-  end
-  if a.caps.len() != b.caps.len() then return false end
-  mut j = 0
-  while j < a.caps.len() do
-    if !b.caps.contains(&a.caps[j]) then return false end
-    j = j + 1
-  end
-  # Origins are part of frame equality: a frame that gained/lost permission
-  # differs and must be re-merged by the worklist.
-  if a.origins.len() != b.origins.len() then return false end
-  for (oid, oa) in a.origins do
-    match b.origins.get(oid)
-    when Option::Some(ob) then
-      if !(oa == ob) then return false end
+  if a.locals.len() != b.locals.len() then return false end
+  for (id, ls) in a.locals do
+    match b.locals.get(id)
+    when Option::Some(lsb) then
+      # Availability, capability flag, and permission origin are all part of
+      # frame equality: a frame that gained/lost either differs and must be
+      # re-merged by the worklist. Spans are NOT compared (they carry no
+      # semantic state; only diagnostics).
+      if !(ls.availability == lsb.availability) then return false end
+      if !(ls.is_capability == lsb.is_capability) then return false end
+      if !(ls.origin == lsb.origin) then return false end
     when Option::None then return false
     end
   end
@@ -2047,32 +2067,11 @@ def res_frame_equal(a: &ResFrame, b: &ResFrame) -> Bool
 end
 
 def frame_assign(dst: &mut ResFrame, src: &ResFrame) -> Unit
-  while dst.names.len() > 0 do
-    let id = dst.names[0]
-    res_frame_forget(dst, &id)
-  end
-  mut i = 0
-  while i < src.names.len() do
-    match res_frame_get(src, &src.names[i])
-    when Option::Some(s) then
-      res_frame_set(dst, src.names[i], s)
-      res_frame_set_span(dst, &src.names[i], frame_span(src, &src.names[i]))
-    when Option::None then ()
-    end
-    # Permission origins are IMMUTABLE per semantic local and MUST survive
-    # dataflow reconstruction: without them, apply_consume loses the
-    # let/inout protection after any branch/join and could consume a
-    # read-only parameter.
-    match src.origins.get(src.names[i])
-    when Option::Some(origin) then dst.origins.insert(src.names[i], origin)
-    when Option::None then ()
-    end
-    i = i + 1
-  end
-  mut j = 0
-  while j < src.caps.len() do
-    dst.caps.push(src.caps[j])
-    j = j + 1
+  # Replace the whole frame: the previous contents (including any record a
+  # stale parallel collection could have kept) vanish with the clear.
+  dst.locals.clear()
+  for (id, ls) in src.locals do
+    dst.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: ls.span })
   end
 end
 
@@ -2082,12 +2081,10 @@ def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
-    mut i = 0
-    while i < arm.names.len() do
-      if !union.contains(&arm.names[i]) then
-        union.push(arm.names[i])
+    for (id, _) in arm.locals do
+      if !union.contains(&id) then
+        union.push(id)
       end
-      i = i + 1
     end
     a = a + 1
   end
@@ -2114,15 +2111,15 @@ def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
       end
       res_frame_set_span(&mut out, &id, frame_span_any(arms, &id))
       if frame_caps_any(arms, &id) then
-        out.caps.push(id)
+        res_frame_mark_cap(&mut out, &id)
       end
       # Origin is immutable per semantic local: every CFG arm for the same
       # local carries the same declared origin, so the first arm's origin is
       # authoritative. Missing/divergent origins are internal errors — the
-      # permission map must never be lost by merging (that would silently
-      # drop let/inout protection).
-      match res_frame_get_origin(&arms[0], &id)
-      when Option::Some(origin) then out.origins.insert(id, origin)
+      # permission must never be lost by merging (that would silently drop
+      # let/inout protection).
+      match frame_origin_any(arms, &id)
+      when Option::Some(origin) then res_frame_set_origin(&mut out, &id, origin)
       when Option::None then ()
       end
     when Option::None then
@@ -2139,7 +2136,14 @@ def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
         res_frame_set(&mut out, id, ResourceState::MaybeLive)
         res_frame_set_span(&mut out, &id, frame_span_any(arms, &id))
         if frame_caps_any(arms, &id) then
-          out.caps.push(id)
+          res_frame_mark_cap(&mut out, &id)
+        end
+        # The record must carry its immutable permission origin from the arm
+        # that holds it (identical to the arms[0]-authoritative rule above in
+        # every reachable join, where every local predates the split).
+        match frame_origin_any(arms, &id)
+        when Option::Some(origin) then res_frame_set_origin(&mut out, &id, origin)
+        when Option::None then ()
         end
       end
     end
@@ -2152,20 +2156,37 @@ def frame_caps_any(arms: &Vec[ResFrame], id: &Int) -> Bool
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
-    if arm.caps.contains(id) then
-      return true
+    match arm.locals.get(id)
+    when Option::Some(ls) then
+      if ls.is_capability then
+        return true
+      end
+    when Option::None then ()
     end
     a = a + 1
   end
   false
 end
 
+def frame_origin_any(arms: &Vec[ResFrame], id: &Int) -> Option[ParamOrigin]
+  mut a = 0
+  while a < arms.len() do
+    let arm = arms[a]
+    match arm.locals.get(id)
+    when Option::Some(ls) then return Option::Some(ls.origin)
+    when Option::None then ()
+    end
+    a = a + 1
+  end
+  Option::None
+end
+
 def frame_span_any(arms: &Vec[ResFrame], id: &Int) -> Span
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
-    match arm.spans.get(id)
-    when Option::Some(s) then return s
+    match arm.locals.get(id)
+    when Option::Some(ls) then return ls.span
     when Option::None then ()
     end
     a = a + 1
@@ -2196,7 +2217,7 @@ def bind_closure_param(typed: &TypedProgram, cp: &ClosureParam, frame: &mut ResF
         if is_owning_typed(typed, &lb.ty) then
           res_frame_set(frame, id, ResourceState::Live)
           res_frame_set_span(frame, &id, cp.span)
-          frame.origins.insert(id, ParamOrigin::OwnedLocal)
+          res_frame_set_origin(frame, &id, ParamOrigin::OwnedLocal)
         end
         if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
           res_frame_mark_cap(frame, &id)

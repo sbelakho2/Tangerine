@@ -4574,10 +4574,6 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, term: &Mir
   when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
     codegen_call(ctx, fctx, dest, callee, args, success, unwind)
 
-  when MirTerminatorKind::MirDrop(place, target, unwind) then
-    let label = block_label_for(fctx, target.id)
-    emit_jmp(ctx, label)
-
   when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
     codegen_finalizer_call(ctx, fctx, &place, &deinit_fn)
     let label = block_label_for(fctx, target.id)
@@ -4603,6 +4599,47 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, term: &Mir
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# ABI classification — return values (P0-AU partial)
+# ———————————————————————————————————————————————————————————————
+
+# How a function result is delivered to the caller.
+enum AbiReturn
+  Direct         # returned in the value register (ret_reg)
+  IndirectSret   # returned indirectly: callee writes the result at &dest (x8)
+end
+
+# SINGLE authority for the sret policy on aggregate returns. A call result
+# goes through sret (indirect return) exactly when:
+#   - the destination type is larger than one register (> 8 bytes),
+#   - the target architecture is AArch64 (only AArch64 passes sret via x8),
+#   - the destination is a plain local with no projections, and
+#   - that local has a stable stack home the callee can write into.
+# This consolidates the former inline condition in codegen_call so there is
+# exactly ONE place where the sret policy is decided. Behavior is unchanged.
+# Register-argument classification is deliberately NOT part of this function;
+# aligning argument conventions with layout_engine's ValueAbi is a separate
+# follow-up (P0-AU, argument side).
+def classify_return(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, ty: &Type) -> AbiReturn
+  let dest_sz = layout_of_strict(&mut ctx.layout_engine, ty).size
+  if dest_sz > 8 && dest.projections.is_empty() then
+    match ctx.target.arch
+    when Arch::AArch64 then
+      match fctx.var_locs.get(dest.local.id)
+      when Option::Some(loc) then
+        match loc
+        when VarLoc::Stack(_) then return AbiReturn::IndirectSret
+        when VarLoc::Spilled(_) then return AbiReturn::IndirectSret
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  AbiReturn::Direct
+end
+
 def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: BlockId, unwind: &Option[BlockId]) -> Unit
   let arch   = ctx.target.arch
   let rr     = ret_reg(arch)
@@ -4617,30 +4654,27 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
     arg_idx_build = arg_idx_build + 1
   end
 
-  # sret eligibility: AArch64 only, dest type > 8 bytes, dest has no
-  # projections, dest local has a stable stack home. When eligible we will
-  # pass &dest in x8 to the callee (which uses sret) and skip storing rr.
+  # sret eligibility is decided by classify_return — the single authority on
+  # whether an aggregate return is passed indirectly (see AbiReturn above).
+  # When eligible we pass &dest in x8 to the callee (which uses sret) and
+  # skip storing rr. The stack-home offset below is a mechanical lookup, not
+  # a policy decision.
   let dest_ty = place_type(ctx, fctx, dest)
-  let dest_sz = layout_of_strict(&mut ctx.layout_engine, &dest_ty).size
   var sret_dest_off: i32 = 0
   var sret_dest_ok = false
-  if dest_sz > 8 && dest.projections.is_empty() then
-    match arch
-    when Arch::AArch64 then
-      match fctx.var_locs.get(dest.local.id)
-      when Option::Some(loc) then
-        match loc
-        when VarLoc::Stack(off) then
-          sret_dest_off = off
-          sret_dest_ok = true
-        when VarLoc::Spilled(off) then
-          sret_dest_off = off
-          sret_dest_ok = true
-        when _ then ()
-        end
+  if classify_return(ctx, fctx, dest, &dest_ty) == AbiReturn::IndirectSret then
+    match fctx.var_locs.get(dest.local.id)
+    when Option::Some(loc) then
+      match loc
+      when VarLoc::Stack(off) then
+        sret_dest_off = off
+        sret_dest_ok = true
+      when VarLoc::Spilled(off) then
+        sret_dest_off = off
+        sret_dest_ok = true
       when _ then ()
       end
-    when _ then ()
+    when Option::None then ()
     end
   end
   var did_sret = false
@@ -4823,8 +4857,10 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
   when DeinitPlan::Call(n) then
     codegen_finalizer_call(ctx, fctx, place, n)
   when DeinitPlan::UserFinalizer(n, fields) then
-    codegen_emit_drop_glue(ctx, fctx, fields, place)
+    # Exactly-once rule: the user finalizer runs FIRST, then the
+    # compiler-owned structural field cleanup (matches mir.tg's order).
     codegen_finalizer_call(ctx, fctx, place, n)
+    codegen_emit_drop_glue(ctx, fctx, fields, place)
   when DeinitPlan::Box(inner) then
     var bprojs = place.projections.clone()
     bprojs.push(Projection::ProjDeref)
@@ -4995,7 +5031,9 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     return
   end
   if name == "array_replace" then
-    emit_call_label(ctx, "_tg_str_concat")
+    # Fail closed: array_replace was routed to _tg_str_concat (silent
+    # semantic corruption); reject instead.
+    panic("internal error: intrinsic `" + name + "` not implemented")
     return
   end
    if name == "array_as_str" then
@@ -5084,38 +5122,52 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       elsif !needle_is_ref && needle_value_ty == Type::String then "string_contains"
       else "array_contains"
       end
-    # Bare-name aliases for NOP_FALLBACK intrinsics
-    else if name == "trim_matches" then "clone"
-    else if name == "split_once" then "clone"
+    # Bare-name aliases for NOP_FALLBACK intrinsics — fail closed instead of
+    # silently returning the receiver (identity) for unimplemented operations.
+    else if name == "trim_matches" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
+    else if name == "split_once" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "to_bits" then "clone"
-    else if name == "to_lowercase" then "clone"
+    else if name == "to_lowercase" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "bytes" then "as_bytes"
     else if name == "arg" then "clone"
     else if name == "eval" then "clone"
     else if name == "map" || name == "join" || name == "collect" then
       # Iterator methods — identity pass-through (return arg0 deref)
-      "clone"
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "slice" then "str_slice"
     else if name == "split" || name == "lines" || name == "trim" then
       # String methods — identity pass-through for now
-      "clone"
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "parse_int" then "str_to_int"
     else if name == "starts_with" then "starts_with"
     else if name == "ends_with" then "ends_with"
-    else if name == "string_replace" || name == "replace" then "str_concat"
+    else if name == "string_replace" || name == "replace" then
+      # str_concat does NOT implement replace semantics — reject instead.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "string_find" || name == "find" then "str_find"
     else if name == "string_new" then "array_new"
     else if name == "string_char_at" then "char_at"
     else if name == "string_push" || name == "string_push_str" then "array_push"
-    else if name == "string_split" then "clone"
+    else if name == "string_split" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "string_slice" then "str_slice"
     else if name == "string_len" then "len"
     else if name == "string_parse_int" then "str_to_int"
     # __intrinsic_* aliases that map to existing handlers
-    else if name == "array_slice" then "array_get"
-    else if name == "array_from_list" then "clone"
+    else if name == "array_slice" then
+      # array_get reads ONE element; array_slice returns a subarray.
+      panic("internal error: intrinsic `" + name + "` not implemented")
+    else if name == "array_from_list" then
+      # array_from_list copies a shared &[T] into a fresh array; clone is identity.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "array_with_capacity" then "array_new"
-    else if name == "array_capacity" then "array_len"
+    else if name == "array_capacity" then
+      # The runtime tracks a real capacity at header offset 16 (see
+      # codegen_array_cap); array_len reads offset 8 — silently wrong.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "set_entries" then "set_entries"
     # Vec__/Array__ prefixed methods - map to canonical intrinsics
     else if name == "Vec__clone" || name == "Array__clone" || name == "array_clone" then "clone"
@@ -5123,7 +5175,9 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "Vec__ends_with" || name == "array_ends_with" then "str_cmp"
     else if name == "Vec__to_string" || name == "Array__to_string" || name == "array_to_string" then "to_string"
     else if name == "Vec__read" || name == "Array__read" || name == "array_read" then "clone"
-    else if name == "Vec__join" || name == "Array__join" || name == "array_join" then "clone"
+    else if name == "Vec__join" || name == "Array__join" || name == "array_join" then
+      # join concatenates elements with a separator; clone is identity.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     # Map__ prefixed methods
     else if name == "Map__unwrap" || name == "map_unwrap" then "unwrap"
     else if name == "Map__clone" || name == "map_clone" then "map_clone"
@@ -5134,7 +5188,10 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "String__parse_float" || name == "__intrinsic_string_parse_float" || name == "str_parse_float" then "str_to_float"
     else if name == "String__clone" then "clone"
     # Additional string_ prefixed variants (from bare_intrinsic_name transformation)
-    else if name == "string_clone" || name == "string_is_empty" || name == "string_chars" then "clone"
+    else if name == "string_clone" then "clone"
+    else if name == "string_is_empty" || name == "string_chars" then
+      # is_empty returns a Bool and chars an iterator; clone is identity.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "string_as_bytes" then "as_bytes"
     else if name == "string_as_ptr" then "as_ptr"
     else if name == "string_as_str" then "as_str"
@@ -5145,11 +5202,16 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "string_last_index_of" || name == "string_rfind" then "str_find"
     else if name == "string_find" then "str_find"
     else if name == "string_len" then "len"
-    else if name == "string_trim" || name == "string_trim_matches" then "clone"
-    else if name == "string_to_lowercase" || name == "string_to_uppercase" then "clone"
+    else if name == "string_trim" || name == "string_trim_matches" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
+    else if name == "string_to_lowercase" || name == "string_to_uppercase" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "string_contains" then "string_contains"
-    else if name == "string_replace" then "str_concat"
-    else if name == "string_slice" || name == "string_split" || name == "string_lines" || name == "string_split_once" then "clone"
+    else if name == "string_replace" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
+    else if name == "string_slice" then "str_slice"
+    else if name == "string_split" || name == "string_lines" || name == "string_split_once" then
+      panic("internal error: intrinsic `" + name + "` not implemented")
     # Type__method variants for various std types - all map to clone or identity
     else if name == "PanicInfo__clone" || name == "TypeExpr__clone" || name == "Span__clone" then "clone"
     else if name == "MirProgram__to_string" || name == "Type__to_string" then "to_string"
@@ -5163,7 +5225,9 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     else if name == "Budget__unwrap_or" || name == "Budget__trim" then "unwrap_or"
     else if name == "IfStmt__len" then "len"
     # Collection intrinsic aliases
-    else if name == "array_replace" then "str_concat"
+    else if name == "array_replace" then
+      # str_concat does NOT implement array_replace semantics — reject.
+      panic("internal error: intrinsic `" + name + "` not implemented")
     else if name == "map_push" then "map_insert"
     else if name == "set_is_empty" then "array_is_empty"
     else if name == "array_as_str" then "as_str"
@@ -5739,9 +5803,9 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_mov_ri(ctx, rr, -1)
 
   else
-    # Unhandled intrinsic — zero out return value (identity passthrough).
-    # Using emit_zero to avoid unresolved label references.
-    emit_zero_reg(ctx, rr)
+    # Fail closed: an intrinsic with no handler must be a compiler error,
+    # never a silent zero (a fake value would corrupt semantics).
+    panic("internal error: unknown or unsupported intrinsic `" + name + "`")
   end
 end
 # Args already in ABI registers: arg0=num, arg1=a1, arg2=a2, arg3=a3
@@ -6187,8 +6251,6 @@ def get_successor_ids(term: &MirTerminator) -> Vec[Int]
     succs.push(default_target.id)
   when MirTerminatorKind::MirCall(dest, func_op, args, success, unwind) then
     succs.push(success.id)
-  when MirTerminatorKind::MirDrop(place, target, unwind) then
-    succs.push(target.id)
   when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
     succs.push(target.id)
   when MirTerminatorKind::MirAssert(cond, expected, msg, target, unwind) then

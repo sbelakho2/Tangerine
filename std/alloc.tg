@@ -81,12 +81,11 @@ def layout_new(size: UInt, align: UInt) -> Result[Layout, String]
     return Result::Err("Alignment must be a power of two".to_string())
   end
   
-  # Size must be a multiple of alignment (for arrays)
-  if size % align != 0 then
-    return Result::Err("Size must be a multiple of alignment".to_string())
-  end
+  # Stride is the size rounded up to the alignment boundary; the requested
+  # size need not itself be a multiple of the alignment.
+  let stride = (size + align - 1) & ~align_mask
   
-  Result::Ok(Layout { size: size as Int, align: align as Int, stride: 0, fields: Vec::new(), enum_layout: Option::None })
+  Result::Ok(Layout { size: size as Int, align: align as Int, stride: stride as Int, fields: Vec::new(), enum_layout: Option::None })
 end
 
 def layout_from_size_align_unchecked(size: UInt, align: UInt) -> Layout
@@ -107,10 +106,12 @@ end
 
 def layout_array[T](count: UInt) -> Result[Layout, String]
   let elem_layout = layout_for[T]()
-  let array_size = elem_layout.size as UInt * count
+  # Arrays stride by the element's ALIGNED size, not its raw size.
+  let elem_stride = (elem_layout.size as UInt + elem_layout.align as UInt - 1) & ~(elem_layout.align as UInt - 1)
+  let array_size = elem_stride * count
   
   # Check for overflow
-  if count != 0 && array_size / count != elem_layout.size as UInt then
+  if count != 0 && array_size / count != elem_stride then
     return Result::Err("Array size overflow".to_string())
   end
   
@@ -245,6 +246,19 @@ def arena_destroy(arena: &mut ArenaAllocator) -> Unit
   arena.buffer = Ptr::null()
   arena.capacity = 0
   arena.offset = 0
+end
+
+impl Drop for ArenaAllocator
+  def drop(self: &mut ArenaAllocator) -> Unit
+    # Release the backing buffer so a bit-copied arena cannot double-own
+    # (and double-free) the mmap region. Idempotent with arena_destroy.
+    if !self.buffer.is_null() && self.capacity != 0 then
+      self.backing.deallocate(self.buffer, self.capacity, 16)
+    end
+    self.buffer = Ptr::null()
+    self.capacity = 0
+    self.offset = 0
+  end
 end
 
 impl Allocator for ArenaAllocator
@@ -442,6 +456,19 @@ def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
   }
 end
 
+impl Drop for PoolAllocator
+  def drop(self: &mut PoolAllocator) -> Unit
+    # Release the backing buffer so a bit-copied pool cannot double-own
+    # (and double-free) the mmap region.
+    if !self.buffer.is_null() && self.block_count != 0 then
+      self.backing.deallocate(self.buffer, self.block_size * self.block_count, 16)
+    end
+    self.buffer = Ptr::null()
+    self.free_list = Ptr::null()
+    self.block_count = 0
+  end
+end
+
 impl Allocator for PoolAllocator
   def allocate(self: &mut PoolAllocator, size: UInt, align: UInt) -> Ptr[u8]
     if size > self.block_size then
@@ -624,7 +651,7 @@ struct Box[T]
   ptr: Ptr[T]
 end
 
-def box_new[T](value: T) -> Box[T]
+def box_new[T](sink value: T) -> Box[T]
   let ptr = alloc[T]()
   if ptr.is_null() then
     panic("Out of memory")
@@ -648,10 +675,15 @@ impl[T] Box[T]
     self.ptr.as_mut()
   end
   
-  def into_inner(self: Box[T]) -> T
-    let value = self.ptr.read()
-    dealloc(self.ptr)
-    value
+  def into_inner(sink self: Box[T]) -> T
+    # sink self is consumed by the match so the registered Box Drop never
+    # runs against the already-read, already-deallocated pointee.
+    match self
+    when Box { ptr: ptr } then
+      let value = ptr.read()
+      dealloc(ptr)
+      value
+    end
   end
 end
 
@@ -672,17 +704,23 @@ end
 
 struct UniquePtr[T]
   ptr: Ptr[T]
-  allocator: &dyn Allocator
+  # UniquePtr allocates through the GLOBAL allocator only. It previously
+  # stored `allocator: &dyn Allocator` — a hidden borrowed reference inside
+  # an owning pointer that could dangle. unique_ptr_new still accepts an
+  # allocator argument for call-site compatibility, but it is ignored.
 end
 
-def unique_ptr_new[T, A: Allocator](value: T, allocator: &A) -> UniquePtr[T]
+def unique_ptr_new[T, A: Allocator](sink value: T, allocator: &A) -> UniquePtr[T]
+  # `allocator` is accepted for call-site compatibility but ignored:
+  # UniquePtr allocates and deallocates through the global allocator, which
+  # has no lifetime to dangle.
   let layout = layout_for[T]()
-  let ptr = allocator.allocate(layout.size as UInt, layout.align as UInt).cast[T]()
+  let ptr = global_alloc(layout.size as UInt, layout.align as UInt).cast[T]()
   if ptr.is_null() then
     panic("Out of memory")
   end
   ptr.write(value)
-  UniquePtr { ptr: ptr, allocator: allocator as &dyn Allocator }
+  UniquePtr { ptr: ptr }
 end
 
 impl[T] Drop for UniquePtr[T]
@@ -690,7 +728,7 @@ impl[T] Drop for UniquePtr[T]
     if !self.ptr.is_null() then
       self.ptr.drop_in_place()
       let layout = layout_for[T]()
-      self.allocator.deallocate(self.ptr.cast[u8](), layout.size as UInt, layout.align as UInt)
+      global_dealloc(self.ptr.cast[u8](), layout.size as UInt, layout.align as UInt)
       self.ptr = Ptr::null()
     end
   end
@@ -710,7 +748,7 @@ struct Rc[T]
   ptr: Ptr[RcInner[T]]
 end
 
-def rc_new[T](value: T) -> Rc[T]
+def rc_new[T](sink value: T) -> Rc[T]
   let inner = alloc[RcInner[T]]()
   if inner.is_null() then
     panic("Rc::new: out of memory")
@@ -746,7 +784,7 @@ impl[T] Rc[T]
     WeakRc[T] { ptr: self.ptr }
   end
 
-  def try_unwrap(self: Rc[T]) -> Result[T, Rc[T]]
+  def try_unwrap(sink self: Rc[T]) -> Result[T, Rc[T]]
     let inner = self.ptr.as_ref()
     if inner.strong_count == 1 then
       let value = self.ptr.as_ref().value
@@ -755,7 +793,11 @@ impl[T] Rc[T]
       if inner_mut.weak_count == 0 then
         dealloc(self.ptr)
       end
-      Result::Ok(value)
+      # Consume self on the success path too, so the registered Rc Drop
+      # never runs against the already-deallocated inner block.
+      match self
+      when Rc { ptr: _ } then Result::Ok(value)
+      end
     else
       Result::Err(self)
     end

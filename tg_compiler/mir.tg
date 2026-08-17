@@ -77,7 +77,6 @@ end
 struct MirFieldDef
   name: String
   ty: Type
-  offset: Int
 end
 
 struct MirVariantDef
@@ -575,7 +574,6 @@ enum MirTerminatorKind
     success: BlockId,
     unwind: Option[BlockId]
   }
-  MirDrop { place: Place, target: BlockId, unwind: Option[BlockId] }
   MirAssert { cond: MirOperand, expected: Bool, msg: AssertMessage, target: BlockId, unwind: Option[BlockId] }
   MirYield(MirOperand, BlockId)
   MirAbort
@@ -776,7 +774,6 @@ def mir_terminator_kind_name(kind: &MirTerminatorKind) -> String
   when MirTerminatorKind::MirUnreachable then "MirUnreachable"
   when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then "MirSwitchInt"
   when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then "MirCall"
-  when MirTerminatorKind::MirDrop { place, target, unwind } then "MirDrop"
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then "MirAssert"
   when MirTerminatorKind::MirYield(_, _) then "MirYield"
   when MirTerminatorKind::MirAbort then "MirAbort"
@@ -846,23 +843,6 @@ def duplicate_terminator(term: &MirTerminator) -> MirTerminator
           func: duplicate_operand(func),
           args: duplicated_args,
           success: BlockId { id: success.id },
-          unwind: duplicated_unwind
-        },
-        span: duplicate_span(&term.span)
-      }
-    when _ then ()
-    end
-  elsif kind_name == "MirDrop" then
-    match term.kind
-    when MirTerminatorKind::MirDrop { place, target, unwind } then
-      let duplicated_unwind = match unwind
-      when Option::Some(block_id) then Option::Some(BlockId { id: block_id.id })
-      when Option::None then Option::None
-      end
-      return MirTerminator {
-        kind: MirTerminatorKind::MirDrop {
-          place: duplicate_place(place),
-          target: BlockId { id: target.id },
           unwind: duplicated_unwind
         },
         span: duplicate_span(&term.span)
@@ -1452,21 +1432,15 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
   when DeinitPlan::Trivial then
     succ
   when DeinitPlan::PlanLimit then
-    # Fail-closed: a recursive owning type without drop glue cannot be
-    # cleaned by a finite expansion. Report an internal error instead of
-    # silently dropping cleanup.
-    b.errors.push("internal error: recursive resource type cannot be represented by a finite cleanup plan (generated drop glue required)")
-    succ
+    # Fail-fast: a recursive owning type without drop glue cannot be cleaned
+    # by a finite expansion. Continuing to build the CFG after reporting the
+    # error would construct invalid MIR — stop immediately.
+    panic("internal error: recursive resource type cannot be represented by a finite cleanup plan (generated drop glue required)")
   when DeinitPlan::Box(inner_plan) then
     # Unreachable since the canonical Box plans delegate to the registered
-    # Drop impl ("Box__drop" — drop_in_place + dealloc). Kept
-    # defensively: emit the pointee cleanup and FAIL CLOSED on the missing
-    # allocation release instead of silently skipping it.
-    b.errors.push("internal error: DeinitPlan::Box reached; canonical Box plans delegate to the registered Drop impl")
-    var deref_projs = place.projections.clone()
-    deref_projs.push(Projection::ProjDeref)
-    let pointee_place = Place { local: place.local, projections: deref_projs }
-    emit_plan_deinit(b, &pointee_place, inner_plan, succ, span)
+    # Drop impl ("Box__drop" — drop_in_place + dealloc). Reaching this arm
+    # is an internal error: fail fast rather than emit partial cleanup.
+    panic("internal error: DeinitPlan::Box reached; canonical Box plans delegate to the registered Drop impl")
   when DeinitPlan::Call(name) then
     let bk = create_block(b)
     switch_to_block(b, bk)
@@ -1517,6 +1491,9 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     # Runtime-length loop: idx = len-1 .. 0, deinit elem[idx] each iteration.
     let idx_local = add_local(b, "deinit_idx", Type::Int, false, span)
     let len_tmp = add_temp(b, Type::Int, span)
+    # P0-AV: drop glue over a statically-known heap Array. MirLen's offset
+    # semantics are representation-dependent; codegen's MirLen emitter
+    # (emit_len_ref_derefs + heap-collection header deref) holds that knowledge.
     push_assign(b, place_local(len_tmp), MirRvalue { kind: MirRvalueKind::MirLen(place.clone()) }, span)
     push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
       kind: MirOperandKind::MirCopy(place_local(len_tmp))
@@ -2531,8 +2508,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
 
   # PASS 1: Lower all struct and enum type definitions first.
   # This ensures b.type_defs is fully populated before any function
-  # body is lowered, so resolve_field_index_for_place can find
-  # correct field indices for ALL types regardless of source order.
+  # body is lowered.
   for item in program.items do
     match item.kind
     when ItemKind::ItemStruct(s) then
@@ -3181,7 +3157,9 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
   #   - Enum variant paths like Option::None → discriminant integer
   #   - Integer/bool/string literals → direct constant
   #   - Vec::new(), Map::new(), Set::new() → zero (null pointer)
-  # For anything else, fall back (will be zero-filled by codegen).
+  # Anything else is an unsupported initializer and must fail fast: a static
+  # init is a supported constant, a supported runtime init, or an error —
+  # never a silently invented zero/None.
   match value.kind
   when ExprKind::ExprPath(path) then
     if path.segments.len() >= 2 then
@@ -3253,21 +3231,7 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
       })
     })
   when _ then
-    # For Option types, unrecognized init likely means Option::None (disc=1)
-    # This handles parser misparses like fn-typed Options where the init
-    # expression is garbled.
-    let fallback_disc = match resolved_ty
-    when Type::Option(_) then 1
-    when _ then 0
-    end
-    if fallback_disc > 0 then
-    end
-    Option::Some(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirInt(fallback_disc),
-        ty: Type::Int
-      })
-    })
+    panic("internal error: unsupported static initializer (expression kind " + expr_kind_name(&value.kind) + ") for type " + format_mir_type(&resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
   end
 end
 
@@ -3379,26 +3343,14 @@ def lower_struct_def(b: &mut MirBuilder, s: &StructDecl) -> MirTypeDef
   end
 
   var fields = Vec::new()
-  var offset = 0
   for f in s.fields do
-    # Compute field size based on the declared type.
-    # For primitive and pointer-width types, use their natural size.
-    # For compound types, use pointer-width (8) as the default.
-    let field_size = field_type_size(&f.ty)
-    let field_align = if field_size > 0 then field_size else 1 end
-    
-    # Align the offset to the field's natural alignment
-    if field_align > 0 then
-      offset = ((offset + field_align - 1) / field_align) * field_align
-    end
-    
+    # Physical layout (offsets/sizes) belongs exclusively to the layout
+    # engine; MIR records only field identity and type.
     let field_type = resolve_type_with_builder(b, &f.ty)
     fields.push(MirFieldDef {
       name: f.name,
-      ty: field_type,
-      offset: offset
+      ty: field_type
     })
-    offset = offset + field_size
   end
   var s_generics = Vec::new()
   for gp in s.generic_params do
@@ -3412,64 +3364,6 @@ def lower_struct_def(b: &mut MirBuilder, s: &StructDecl) -> MirTypeDef
   }
   b.type_defs.push(td.clone())
   td
-end
-
-# Compute the size of a field based on its declared type expression
-def field_type_size(ty: &TypeExpr) -> Int
-  match ty.kind
-  when TypeExprKind::Named(name, args) then
-    match name.as_str()
-    when "Bool"    then 1
-    when "u8"      then 1
-    when "i8"      then 1
-    when "Char"    then 4
-    when "u16"     then 2
-    when "i16"     then 2
-    when "u32"     then 4
-    when "i32"     then 4
-    when "Float"   then 8
-    when "f32"     then 4
-    when "f64"     then 8
-    when "Int"     then 8
-    when "UInt"    then 8
-    when "u64"     then 8
-    when "i64"     then 8
-    when "String"  then 8    # raw char* at ABI level
-    when "Vec"     then 24   # ptr + len + cap
-    when "Map"     then 48   # buckets_ptr + len + cap + hash_fn + ...
-    when "Set"     then 32   # inner_map + len
-    when "Option"  then 16   # tag + value
-    when "Result"  then 24   # tag + value + error
-    when "Box"     then 8    # single pointer
-    when "Ptr"     then 8    # raw pointer
-    when _ then
-      # LAYOUT WARNING: unknown type defaults to pointer-width (8 bytes).
-      # If this type is NOT pointer-sized, the layout will be wrong.
-      # This is a known limitation tracked as feature gate G7.
-      8
-    end
-  when TypeExprKind::Tuple(elems) then
-    # Sum of element sizes
-    var total = 0
-    for elem in elems do
-      total = total + 8  # Each tuple element at least pointer-width
-    end
-    if total == 0 then 0 else total end  # () = 0 bytes
-  when TypeExprKind::Array(_, size_opt) then
-    match size_opt
-    when Option::Some(size_expr) then
-      match size_expr.kind
-      when ExprKind::ExprIntLit(n) then 8 * (n as Int)
-      when _ then 8
-      end
-    when Option::None then 8
-    end
-  when TypeExprKind::Fn(_, _) then 16   # fn pointer + closure env pointer
-  when TypeExprKind::Unit then 0
-  when TypeExprKind::Never then 0
-  when _ then
-    8
-  end
 end
 
 def lower_enum_def(b: &mut MirBuilder, e: &EnumDecl) -> MirTypeDef
@@ -5636,6 +5530,14 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         end
       end
 
+      # P0-AV: collection length operations are NOT lowered to the generic
+      # MirLen rvalue here. `len`/`is_empty`/`capacity` resolve to the mangled
+      # std impl methods (Vec__len / Map__len / Set__len / ...), whose bodies
+      # call the runtime length intrinsics (__intrinsic_array_len /
+      # __intrinsic_map_len / __intrinsic_set_len / __intrinsic_array_capacity).
+      # The byte offset of the length field in the collection header is
+      # therefore decided by the intrinsic's implementation (codegen's `len`
+      # handler → codegen_array_len), never by a generic MIR instruction.
       let callee_op = mir_fn_operand(b, resolved_method.clone())
 
       # Lower arguments: receiver first, then explicit args
@@ -6625,205 +6527,17 @@ def resolve_projected_type_id(b: &MirBuilder, place: &Place) -> Option[TypeId]
   unwrap_to_named_tid(&projected_ty)
 end
 
-def resolve_field_index_in_type(b: &MirBuilder, ty: &Type, name: &String) -> Option[Int]
-  match ty
-  when Type::Tuple(elems) then
-    match name.parse_int()
-    when Result::Ok(idx) then
-      if idx >= 0 && idx < elems.len() then Option::Some(idx) else Option::None end
-    when Result::Err(_) then Option::None
-    end
-  when Type::Named(tid, _) then
-    for td in b.type_defs do
-      if td.id.id == tid.id then
-        match td.kind
-        when MirTypeDefKind::Struct(fields) then
-          var idx = 0
-          for field in fields do
-            if field.name == name then
-              return Option::Some(idx)
-            end
-            idx = idx + 1
-          end
-        when _ then ()
-        end
-      end
-    end
-    Option::None
-  when Type::RefInternal(inner, _) then resolve_field_index_in_type(b, inner, name)
-  when Type::Box(inner) then resolve_field_index_in_type(b, inner, name)
-  when Type::Ptr(inner) then resolve_field_index_in_type(b, inner, name)
-  when Type::PtrMut(inner) then resolve_field_index_in_type(b, inner, name)
-  when Type::Rc(inner) then resolve_field_index_in_type(b, inner, name)
-  when Type::Option(inner) then resolve_field_index_in_type(b, inner, name)
-  when _ then Option::None
-  end
-end
-
-# Resolve a field index using the type at the end of a place's projection chain.
-# This correctly handles chained field accesses like ctx.target.arch.
-def resolve_field_index_for_place(b: &MirBuilder, place: &Place, name: &String) -> Option[Int]
-  if place.projections.is_empty() then
-    match resolve_field_index_typed(b, &place.local, name)
-    when Option::Some(idx) then return Option::Some(idx)
-    when Option::None then ()
-    end
-  end
-  let base_ty = lookup_local_type(b, &place.local)
-  let projected_ty = resolve_type_through_projections(b, base_ty, &place.projections)
-  match resolve_field_index_in_type(b, &projected_ty, name)
-  when Option::Some(idx) then return Option::Some(idx)
-  when Option::None then ()
-  end
-  # Fall back to base local type resolution
-  resolve_field_index_typed(b, &place.local, name)
-end
-
 # Emit the field projection for a field access: the typed field index
-# (from typed.field_targets) is authoritative when the checker recorded
-# the access node; otherwise fall back to the named projection resolved
-# against the builder's type definitions.
+# (from typed.field_targets) is the ONLY authority — the checker records
+# it for every field access it accepts. A missing typed FieldId is an
+# internal error: re-deriving the index from the field name here would
+# silently diverge from the typed program.
 def typed_field_projection(b: &MirBuilder, node_id: Int, fallback_name: &String, place: &Place) -> Projection
   match b.field_targets.get(node_id)
   when Option::Some(fid) then Projection::ProjFieldIndex(fid.index)
   when Option::None then
-    let fallback_idx = match resolve_field_index_for_place(b, place, fallback_name)
-    when Option::Some(idx) then idx
-    when Option::None then 0
-    end
-    Projection::ProjField(fallback_name.clone(), fallback_idx)
+    panic("internal error: missing typed field target for field '" + fallback_name.clone() + "' during MIR lowering; field identity must come from the typed program, not name-based fallback")
   end
-end
-
-def resolve_field_index_typed(b: &MirBuilder, local_id: &LocalId, name: &String) -> Option[Int]
-  # Try to resolve via the actual struct type definition
-  match b.current_fn
-  when Option::Some(f) then
-    for local in f.locals do
-      if local.id.id == local_id.id then
-        match unwrap_to_named_tid(&local.ty)
-        when Option::Some(tid) then
-          for td in b.type_defs do
-            if td.id.id == tid.id then
-              match td.kind
-              when MirTypeDefKind::Struct(fields) then
-                var idx = 0
-                for field in fields do
-                  if field.name == name then
-                    return Option::Some(idx)
-                  end
-                  idx = idx + 1
-                end
-              when _ then ()
-              end
-            end
-          end
-        when Option::None then ()
-        end
-      end
-    end
-    for param in f.params do
-      if param.id.id == local_id.id then
-        match unwrap_to_named_tid(&param.ty)
-        when Option::Some(tid) then
-          for td in b.type_defs do
-            if td.id.id == tid.id then
-              match td.kind
-              when MirTypeDefKind::Struct(fields) then
-                var idx = 0
-                for field in fields do
-                  if field.name == name then
-                    return Option::Some(idx)
-                  end
-                  idx = idx + 1
-                end
-              when _ then ()
-              end
-            end
-          end
-        when Option::None then ()
-        end
-      end
-    end
-  when Option::None then ()
-  end
-  # Try by struct name — look through all type_defs for a field match.
-  # If exactly one struct matches, use its index. Otherwise fall through.
-  var found_idx: Option[Int] = Option::None
-  var match_count = 0
-  for td in b.type_defs do
-    match td.kind
-    when MirTypeDefKind::Struct(fields) then
-      var idx = 0
-      for field in fields do
-        if field.name == name then
-          found_idx = Option::Some(idx)
-          match_count = match_count + 1
-        end
-        idx = idx + 1
-      end
-    when _ then ()
-    end
-  end
-  if match_count == 1 then
-    return found_idx
-  end
-  # Multiple structs matched — ambiguous. Fall through to well-known fallback
-  # instead of majority voting (which picks wrong indices for common types
-  # like Token where span=1, but majority of structs have span at 2+).
-  # Fall back to well-known built-in types
-  resolve_field_index(name)
-end
-
-# Helper: resolve struct field name to its index within the struct layout.
-# Uses receiver type info from the builder to find the correct field position.
-# For well-known built-in types, this returns hardcoded offsets.
-# For user-defined types, we look through the lowered type definitions.
-def resolve_field_index(name: &String) -> Option[Int]
-  # Well-known struct fields with fixed layout:
-  
-  # Vec[T]: { ptr: 0, len: 1, cap: 2 }
-  if name == "ptr" then return Option::Some(0) end
-  if name == "len" || name == "length" then return Option::Some(1) end
-  if name == "cap" || name == "capacity" then return Option::Some(2) end
-  
-  # Map[K,V]: { buckets: 0, len: 1, cap: 2, hash_fn: 3= }
-  if name == "buckets" then return Option::Some(0) end
-  if name == "hash_fn" then return Option::Some(3) end
-
-  # Set[T]: { map: 0, len: 1 }
-  if name == "map" then return Option::Some(0) end
-
-  # Option[T]: { tag: 0, value: 1 }
-  # Result[T,E]: { tag: 0, value: 1, error: 2 }
-  if name == "tag" || name == "discriminant" then return Option::Some(0) end
-  if name == "value" || name == "val" then return Option::Some(1) end
-  if name == "error" || name == "err" then return Option::Some(2) end
-  
-  # Common struct fields (conventional ordering)
-  if name == "name" then return Option::Some(0) end
-  if name == "id" then return Option::Some(0) end
-  if name == "kind" then return Option::Some(0) end
-  if name == "data" then return Option::Some(0) end
-  if name == "ty" || name == "type" then return Option::Some(1) end
-  # NOTE: span position varies by struct. idx=1 is correct for the most
-  # common 2-field structs: Expr, Token, Stmt, Pattern, MirStatement, etc.
-  # Structs with more fields (MirLocal has span at idx=4) should be resolved
-  # through the typed path above, not this fallback.
-  if name == "span" then return Option::Some(1) end
-  if name == "is_mut" then return Option::Some(3) end
-  
-  # File: { fd: 0, path: 1, is_open: 2 }
-  if name == "fd" || name == "_fd" then return Option::Some(0) end
-  if name == "path" then return Option::Some(1) end
-  if name == "is_open" then return Option::Some(2) end
-  
-  # RubyValue / Ptr: { raw/address: 0 }
-  if name == "raw" then return Option::Some(0) end
-  if name == "address" then return Option::Some(0) end
-  
-  # Unknown field: return None so caller cannot treat it as a valid offset.
-  Option::None
 end
 
 # Helper: convert a Path to a String (dot-separated components)
@@ -8671,6 +8385,17 @@ def lower_for(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &Block, span
     end
     let len_place = Place { local: iter_local, projections: len_projs }
 
+    # P0-AV: this MirLen is the loop path's length read over the iterated
+    # collection. It is NOT a generic offset-8 assumption: the loop lowering
+    # cannot always know the collection kind (unresolved iterator types fall
+    # back to Type::Unit here, and the iterator local may be a reference that
+    # must be ProjDeref'd), so it cannot statically select the runtime length
+    # intrinsic (__intrinsic_{array,map,set}_len) the way the method-call path
+    # does. MirLen's offset semantics are representation-dependent and are
+    # resolved by the codegen's representation knowledge: the MirLen emitter in
+    # codegen.tg applies emit_len_ref_derefs and dereferences the heap-
+    # collection header via is_heap_collection_type, so the offset-8 knowledge
+    # lives in that one codegen place, not in the MIR instruction's semantics.
     let len_local = add_temp(b, Type::Int, span)
     push_assign(b, place_local(len_local), MirRvalue { kind: MirRvalueKind::MirLen(len_place) }, span)
 
@@ -9414,9 +9139,6 @@ def format_mir_typedef(td: &MirTypeDef) -> String
     out = out + " = struct {\n"
     for f in fields do
       out = out + "    " + f.name.clone() + ": " + format_mir_type(&f.ty)
-      if f.offset >= 0 then
-        out = out + "  // offset " + f.offset.to_string()
-      end
       out = out + "\n"
     end
     out = out + "}"
@@ -9556,14 +9278,6 @@ def format_mir_terminator(term: &MirTerminator) -> String
       first = false
     end
     out = out + ") -> [return: bb" + succ.id.to_string()
-    match unwind
-    when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
-    when Option::None then ()
-    end
-    out = out + "]"
-    out
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    var out = "drop(" + format_place(&place) + ") -> [bb" + target.id.to_string()
     match unwind
     when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
     when Option::None then ()
@@ -9988,6 +9702,33 @@ def should_inline(f: &MirFunction, recursive_fns: &Set[String]) -> Bool
   false
 end
 
+# Inlining safety guard (P0-AM): never inline a call that passes a place by
+# a non-Read AccessEffect. prepare_inline_body lowers a Place argument to an
+# immutable MirRef of the callee parameter regardless of the argument's
+# effect, so a Consume/Modify/Initialize place would silently become an
+# ordinary borrowed/copied parameter inside the inlined body. Skip inlining
+# for such calls and fall back to the normal (non-inlined) call. Read-place
+# and pure value arguments keep the existing inlining path.
+def call_has_non_read_place_arg(args: &Vec[MirCallArg]) -> Bool
+  for arg in args do
+    if arg.effect != AccessEffect::Read then
+      match arg.value
+      when MirCallValue::Place(_) then
+        return true
+      when MirCallValue::Value(op) then
+        match op.kind
+        when MirOperandKind::MirCopy(_) then return true
+        when MirOperandKind::MirMovePlace(_) then return true
+        when MirOperandKind::MirRead(_) then return true
+        when MirOperandKind::MirConsume(_) then return true
+        when _ then ()
+        end
+      end
+    end
+  end
+  false
+end
+
 def inline_calls_in_function(caller: &mut MirFunction, func_map: &Map[String, &MirFunction], 
                               inlinable: &Set[String]) -> Bool
   var changed = false
@@ -10009,7 +9750,10 @@ def inline_calls_in_function(caller: &mut MirFunction, func_map: &Map[String, &M
 
       match maybe_callee_name
       when Option::Some(callee_name) then
-        if inlinable.contains(&callee_name) then
+        # Entry decision: only inline when the callee is inlinable AND no
+        # argument carries a place by a non-Read effect (see
+        # call_has_non_read_place_arg — such calls fall back to a real call).
+        if inlinable.contains(&callee_name) && !call_has_non_read_place_arg(args) then
           match func_map.get(callee_name.clone())
         when Option::Some(callee) then
           # Inline this call
@@ -10364,22 +10108,6 @@ def remap_terminator(term: &MirTerminator, local_map: &Map[Int, Int], block_map:
         func: remap_operand(&func, local_map),
         args: remapped_args,
         success: BlockId { id: new_succ },
-        unwind: new_unwind
-      },
-      span: term.span.clone()
-    }
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    let new_target = block_map.get(target.id).unwrap_or(target.id)
-    let new_unwind = match unwind
-    when Option::Some(block_id) then
-      let mapped = block_map.get(block_id.id).unwrap_or(block_id.id)
-      Option::Some(BlockId { id: mapped })
-    when Option::None then Option::None
-    end
-    MirTerminator {
-      kind: MirTerminatorKind::MirDrop {
-        place: remap_place(&place, local_map),
-        target: BlockId { id: new_target },
         unwind: new_unwind
       },
       span: term.span.clone()
@@ -11831,7 +11559,6 @@ def count_terminator_uses(term: &MirTerminator, counts: &mut Map[Int, Int]) -> U
   when MirTerminatorKind::MirGoto(_) then ()
   when MirTerminatorKind::MirReturn then ()
   when MirTerminatorKind::MirUnreachable then ()
-  when MirTerminatorKind::MirDrop { place, target, unwind } then ()
   when MirTerminatorKind::MirAbort then ()
   when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then ()
   end
@@ -11897,17 +11624,6 @@ def substitute_temp_moves_terminator(term: &mut MirTerminator, map: &Map[Int, Pl
     substitute_move_operand(&mut op2, map)
     let new_kind = MirTerminatorKind::MirYield(op2, target)
     term.kind = new_kind
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    var place2 = place
-    match map.get(place2.local.id)
-    when Option::Some(src) then
-      if place2.projections.is_empty() then
-        place2 = src.clone()
-      end
-    when Option::None then ()
-    end
-    let new_kind = MirTerminatorKind::MirDrop { place: place2, target: target, unwind: unwind }
-    term.kind = new_kind
   when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     var place2 = place
     match map.get(place2.local.id)
@@ -11969,12 +11685,6 @@ def terminator_successors(term: &MirTerminator) -> Vec[BlockId]
     when Option::Some(uw) then result.push(uw)
     when Option::None then ()
     end
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    result.push(target)
-    match unwind
-    when Option::Some(uw) then result.push(uw)
-    when Option::None then ()
-    end
   when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     result.push(target)
     match unwind
@@ -12006,12 +11716,6 @@ def terminator_successor_ids(term: &MirTerminator) -> Vec[Int]
     result.push(default_target.id)
   when MirTerminatorKind::MirCall { dest, func, args, success, unwind } then
     result.push(success.id)
-    match unwind
-    when Option::Some(uw) then result.push(uw.id)
-    when Option::None then ()
-    end
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    result.push(target.id)
     match unwind
     when Option::Some(uw) then result.push(uw.id)
     when Option::None then ()
@@ -13702,15 +13406,6 @@ def verify_function(func: &MirFunction, types: &Vec[MirTypeDef], errors: &mut Ve
               if !reachable.contains(&unwind_id) then worklist.push(unwind_id) end
             when Option::None then ()
             end
-          when MirTerminatorKind::MirDrop { place, target, unwind } then
-            let succ_id = target.id
-            if !reachable.contains(&succ_id) then worklist.push(succ_id) end
-            match unwind
-            when Option::Some(uw) then
-              let unwind_id = uw.id
-              if !reachable.contains(&unwind_id) then worklist.push(unwind_id) end
-            when Option::None then ()
-            end
           when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
             let succ_id = target.id
             if !reachable.contains(&succ_id) then worklist.push(succ_id) end
@@ -13939,23 +13634,6 @@ def verify_terminator(term: &MirTerminator, valid_blocks: &Set[Int],
       let unwind_id = ub.id
       if !valid_blocks.contains(&unwind_id) then
         errors.push(ctx.clone() + ": call unwind references invalid block bb" + unwind_id.to_string())
-      end
-    when Option::None then ()
-    end
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    let local_id = place.local.id
-    if !valid_locals.contains(&local_id) then
-      errors.push(ctx.clone() + ": drop of undefined local _" + local_id.to_string())
-    end
-    let target_id = target.id
-    if !valid_blocks.contains(&target_id) then
-      errors.push(ctx.clone() + ": drop target references invalid block bb" + target_id.to_string())
-    end
-    match unwind
-    when Option::Some(ub) then
-      let unwind_id = ub.id
-      if !valid_blocks.contains(&unwind_id) then
-        errors.push(ctx.clone() + ": drop unwind references invalid block bb" + unwind_id.to_string())
       end
     when Option::None then ()
     end
@@ -14612,18 +14290,6 @@ def verifier_check_terminator(type_index: &Map[Int, MirTypeDef], func: &MirFunct
     when Option::Some(uw) then
       if !verifier_block_exists(func, uw.id) then
         errors.push(ctx.clone() + ": call unwind references invalid block bb" + uw.id.to_string())
-      end
-    when Option::None then ()
-    end
-  when MirTerminatorKind::MirDrop { place, target, unwind } then
-    verifier_check_place(type_index, func, &place, running, ctx, errors)
-    if !verifier_block_exists(func, target.id) then
-      errors.push(ctx.clone() + ": drop target references invalid block bb" + target.id.to_string())
-    end
-    match unwind
-    when Option::Some(uw) then
-      if !verifier_block_exists(func, uw.id) then
-        errors.push(ctx.clone() + ": drop unwind references invalid block bb" + uw.id.to_string())
       end
     when Option::None then ()
     end

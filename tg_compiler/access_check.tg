@@ -4,7 +4,7 @@ use tg_compiler::token::{Span}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
-  AccessConvention, GuardElse, MatchExpr
+  GuardElse, MatchExpr
 }
 use tg_compiler::types::{AccessEffect, TypedProgram, Type, ParamType, TypeId}
 use tg_compiler::ids::{FieldId}
@@ -12,6 +12,9 @@ use tg_compiler::ids::{FieldId}
 enum AccessProjection
   Field(FieldId, String)
   Index
+  # Raw-pointer dereference: provenance is unknown, so a path containing
+  # this projection must never be assumed disjoint from other paths.
+  RawDeref
 end
 
 struct AccessPath
@@ -465,7 +468,12 @@ def check_call_site(receiver: Option[&Expr], receiver_effect: AccessEffect, arg_
   end
   mut i = 0
   while i < args.len() do
-    let eff = if i < arg_effects.len() then arg_effects[i] else AccessEffect::Read end
+    # call_arg_effects pushes exactly one effect per argument, so a shorter
+    # vector is a compiler-internal error — never a silent Read.
+    if i >= arg_effects.len() then
+      panic("internal error: missing access effect vector entry for argument node " + args[i].node_id.to_string())
+    end
+    let eff = arg_effects[i]
     record_access(typed, &args[i], eff, &mut actives, &mut spans, errors)
     i = i + 1
   end
@@ -506,6 +514,28 @@ def accesses_conflict(a: &ActiveAccess, b: &ActiveAccess) -> Bool
 end
 
 def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
+  # Raw-pointer dereferences have unknown provenance: two dereferences of
+  # DIFFERENT pointer variables may address the same memory, and a raw
+  # deref may alias any other storage, so every path containing a raw
+  # deref is classified UnknownAlias — potentially overlapping with every
+  # other path. This runs BEFORE root comparison: a raw deref must never
+  # be proved disjoint by the variables holding the addresses.
+  mut ri = 0
+  while ri < a.projections.len() do
+    match a.projections[ri]
+    when AccessProjection::RawDeref then return true
+    when _ then ()
+    end
+    ri = ri + 1
+  end
+  mut rj = 0
+  while rj < b.projections.len() do
+    match b.projections[rj]
+    when AccessProjection::RawDeref then return true
+    when _ then ()
+    end
+    rj = rj + 1
+  end
   # Roots are now always semantic: real local ids (>= 0) or the negative
   # `self` root (-1). There is no "unresolved" sentinel (missing typed
   # resolutions are internal errors reported during path derivation), so
@@ -533,6 +563,8 @@ def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
         end
       when AccessProjection::Index then
         return true
+      when AccessProjection::RawDeref then
+        return true
       end
     when AccessProjection::Index then
       match pb
@@ -540,7 +572,11 @@ def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
         return true
       when AccessProjection::Index then
         ()
+      when AccessProjection::RawDeref then
+        return true
       end
+    when AccessProjection::RawDeref then
+      return true
     end
     i = i + 1
   end
@@ -573,23 +609,34 @@ def arg_effect(typed: &TypedProgram, fn_params: &Vec[ParamType], arg_index: Int,
   match typed.access_effects.get(arg.node_id)
   when Option::Some(e) then e
   when Option::None then
-    if arg_index < fn_params.len() then convention_effect(fn_params[arg_index].convention) else AccessEffect::Read end
+    # The semantic layer records an effect for every argument whose index
+    # is within the callee's declared parameter list (types.tg records
+    # args[0 .. params.len()) unconditionally), so a missing entry there
+    # is a compiler-internal error, NOT a reason to assume Read.
+    if arg_index < fn_params.len() then
+      panic("internal error: missing access effect for argument node " + arg.node_id.to_string())
+    else
+      # Genuinely optional: an argument beyond the declared parameter list
+      # only exists when the type checker has already rejected the call
+      # (wrong-number-of-arguments), and the semantic layer intentionally
+      # records no effect for it. Error-recovery Read; the program fails
+      # compilation regardless. Method-call arguments (fn_params empty)
+      # land here too: their effects are always recorded on well-formed
+      # calls, so a missing one implies a call error already reported.
+      AccessEffect::Read
+    end
   end
 end
 
 def method_receiver_effect(typed: &TypedProgram, receiver: &Expr) -> AccessEffect
+  # The semantic layer records a receiver effect on every method call
+  # (types.tg records the receiver for every mparams outcome), so a
+  # missing entry is a compiler-internal error — never fall back to Read
+  # or re-derive the effect from parameter conventions.
   match typed.access_effects.get(receiver.node_id)
   when Option::Some(e) then e
   when Option::None then
-    match typed.expr_types.get(receiver.node_id)
-    when Option::Some(t) then
-      match t
-      when Type::Function(params, _) then
-        if params.len() > 0 then convention_effect(params[0].convention) else AccessEffect::Read end
-      when _ then AccessEffect::Read
-      end
-    when Option::None then AccessEffect::Read
-    end
+    panic("internal error: missing access effect for method receiver node " + receiver.node_id.to_string())
   end
 end
 
@@ -638,18 +685,15 @@ def derive_access_path(typed: &TypedProgram, expr: &Expr, errors: &mut Vec[Acces
       Option::Some(p)
     when Option::None then Option::None
     end
-  when ExprKind::ExprRawDeref(inner) then derive_access_path(typed, &inner, errors)
+  when ExprKind::ExprRawDeref(inner) then
+    match derive_access_path(typed, &inner, errors)
+    when Option::Some(mut p) then
+      p.projections.push(AccessProjection::RawDeref)
+      Option::Some(p)
+    when Option::None then Option::None
+    end
   when ExprKind::ExprAccess(inner) then derive_access_path(typed, &inner, errors)
   when _ then Option::None
-  end
-end
-
-def convention_effect(c: AccessConvention) -> AccessEffect
-  match c
-  when AccessConvention::Let then AccessEffect::Read
-  when AccessConvention::Inout then AccessEffect::Modify
-  when AccessConvention::Sink then AccessEffect::Consume
-  when AccessConvention::Set then AccessEffect::Initialize
   end
 end
 
@@ -669,6 +713,7 @@ def path_to_string(p: &AccessPath) -> String
     match p.projections[i]
     when AccessProjection::Field(_, f) then s = s + "." + f
     when AccessProjection::Index then s = s + "[]"
+    when AccessProjection::RawDeref then s = s + "(*)"
     end
     i = i + 1
   end

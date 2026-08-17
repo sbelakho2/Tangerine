@@ -85,6 +85,15 @@ enum LayoutCategory
   FunctionType
 end
 
+# DFS visit state for the inline layout graph.  A type that reaches itself
+# through inline storage only (no pointer/Box indirection) has no finite
+# layout and is diagnosed as an infinitely sized recursive type.
+enum LayoutVisitState
+  Unvisited
+  Visiting
+  Resolved
+end
+
 # ———————————————————————————————————————————————————————————————
 # Layout Record (Step 3)
 # ———————————————————————————————————————————————————————————————
@@ -198,6 +207,8 @@ struct LayoutEngine
   records: Map[Int, LayoutRecord]      # type_id -> LayoutRecord
   name_index: Map[String, Int]          # type_name -> type_id
   type_defs: Vec[MirTypeDef]            # All type definitions
+  visit_states: Map[Int, LayoutVisitState]   # Inline-cycle DFS states (compute_all_layouts)
+  strict_states: Map[Int, LayoutVisitState]  # Recursive strict-verification cache (layout_of_concrete)
   cache_hits: Int
   cache_misses: Int
 end
@@ -209,6 +220,8 @@ def layout_engine_new(target: TargetDescriptor) -> LayoutEngine
     records: Map::new(),
     name_index: Map::new(),
     type_defs: Vec::new(),
+    visit_states: Map::new(),
+    strict_states: Map::new(),
     cache_hits: 0,
     cache_misses: 0
   }
@@ -434,8 +447,127 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# Recursive Strict Concrete-Layout Verification (P0-AS)
+# ———————————————————————————————————————————————————————————————
+# The general size_of keeps its fallbacks (Var -> pointer size, Error -> 0,
+# `when _` -> pointer size) for non-strict callers.  The strict path must
+# NEVER let an unresolved inline child fall back to a guess: it recursively
+# proves that a type and all of its inline children have concrete layouts.
+#
+# Inline children are named types stored by value (struct fields, enum
+# payloads, tuple elements).  Indirections — pointers (Ptr/PtrMut/Ref),
+# Box/Rc, slices, arrays and heap containers (Option/Result/Map/Set/
+# Function/String) — are opaque pointer-sized handles and do not require
+# their pointee to be resolved.  A named type with no registered definition
+# is likewise an opaque handle (lowering emits TypeId{id:0} for generic
+# parameters), so it does not fail the strict check.
+
+def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, LayoutError]
+  match ty
+  when Type::Var(_) then
+    Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Type variable has no concrete layout",
+      type_name: "Type::Var",
+      expected: 0,
+      actual: 0,
+      context: "check_concrete_layout"
+    })
+  when Type::Error then
+    Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Error type has no concrete layout",
+      type_name: "Type::Error",
+      expected: 0,
+      actual: 0,
+      context: "check_concrete_layout"
+    })
+  when Type::Param(name) then
+    Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Generic parameter has no concrete layout",
+      type_name: "Type::Param(" + name + ")",
+      expected: 0,
+      actual: 0,
+      context: "check_concrete_layout"
+    })
+  when Type::Named(tid, _) then
+    if engine_has_type_def(engine, tid.id) then
+      let state = match engine.strict_states.get(&tid.id)
+      when Option::Some(s) then s
+      when Option::None then LayoutVisitState::Unvisited
+      end
+      match state
+      when LayoutVisitState::Visiting then
+        # Reached through inline storage only: infinitely sized recursive type.
+        Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "Infinitely sized recursive type: reaches itself through inline storage without an indirection",
+          type_name: lookup_type_name(engine, tid.id),
+          expected: 0,
+          actual: 0,
+          context: "check_concrete_layout"
+        })
+      when LayoutVisitState::Resolved then
+        Result::Ok(())
+      when LayoutVisitState::Unvisited then
+        engine.strict_states.insert(tid.id, LayoutVisitState::Visiting)
+        # Prove every inline child of the definition recursively.
+        for td in engine.type_defs do
+          if td.id.id == tid.id then
+            match td.kind
+            when MirTypeDefKind::Struct(fields) then
+              for f in fields do
+                match check_concrete_layout(engine, &f.ty)
+                when Result::Err(e) then
+                  engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
+                  return Result::Err(e)
+                when Result::Ok(()) then ()
+                end
+              end
+            when MirTypeDefKind::Enum(variants) then
+              for v in variants do
+                for fty in v.fields do
+                  match check_concrete_layout(engine, fty)
+                  when Result::Err(e) then
+                    engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
+                    return Result::Err(e)
+                  when Result::Ok(()) then ()
+                  end
+                end
+              end
+            end
+          end
+        end
+        engine.strict_states.insert(tid.id, LayoutVisitState::Resolved)
+        Result::Ok(())
+      end
+    else
+      # Unregistered named type: opaque pointer-sized handle (generic
+      # parameter lowering emits TypeId{id:0}); its layout is the handle.
+      Result::Ok(())
+    end
+  when Type::Tuple(fields) then
+    # Inline aggregate: every element must be concrete.
+    for f in fields do
+      match check_concrete_layout(engine, f)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(()) then ()
+      end
+    end
+    Result::Ok(())
+  when _ then
+    # Primitives, pointers, Box/Rc, slices, heap containers, function types:
+    # fixed-size or opaque handle — concrete without inspecting the pointee.
+    Result::Ok(())
+  end
+end
+
 # Strict concrete layout query: returns Err instead of guessing pointer sizes
-# for unresolved types (Var, Error, generic params) and unknown named types.
+# for unresolved types (Var, Error, generic params), unknown named types, and
+# types with unresolved INLINE children.  The failure propagates to callers
+# (codegen's layout_of_strict panics with the LayoutError's type_name).
 def layout_of_concrete(engine: &mut LayoutEngine, ty: &Type) -> Result[Layout, LayoutError]
   match ty
   when Type::Var(_) then
@@ -467,7 +599,13 @@ def layout_of_concrete(engine: &mut LayoutEngine, ty: &Type) -> Result[Layout, L
     })
   when Type::Named(tid, _) then
     if engine_has_type_def(engine, tid.id) then
-      Result::Ok(layout_of(engine, ty))
+      # Recursively strict: an unresolved inline child (Var/Error/Param) or an
+      # inline storage cycle must fail here instead of falling back to a
+      # pointer-sized guess.
+      match check_concrete_layout(engine, ty)
+      when Result::Ok(()) then Result::Ok(layout_of(engine, ty))
+      when Result::Err(e) then Result::Err(e)
+      end
     else
       Result::Err(LayoutError {
         class: LayoutFailureClass::UNSUPPORTED_TYPE,
@@ -477,6 +615,11 @@ def layout_of_concrete(engine: &mut LayoutEngine, ty: &Type) -> Result[Layout, L
         actual: 0,
         context: "layout_of_concrete"
       })
+    end
+  when Type::Tuple(_) then
+    match check_concrete_layout(engine, ty)
+    when Result::Ok(()) then Result::Ok(layout_of(engine, ty))
+    when Result::Err(e) then Result::Err(e)
     end
   when _ then
     Result::Ok(layout_of(engine, ty))
@@ -769,6 +912,19 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def compute_type_layout(engine: &mut LayoutEngine, type_id: Int) -> LayoutRecord
+  # Inline-cycle guard (P0-AT): re-entering a type whose layout is still being
+  # computed means it reaches itself through inline storage only (no pointer/
+  # Box indirection) — an infinitely sized recursive type, diagnosed here.
+  let visit_state = match engine.visit_states.get(&type_id)
+  when Option::Some(s) then s
+  when Option::None then LayoutVisitState::Unvisited
+  end
+  match visit_state
+  when LayoutVisitState::Visiting then
+    panic("layout: infinitely sized recursive type '" + lookup_type_name(engine, type_id) + "': inline storage cycle (use a pointer or Box to break the cycle)")
+  when _ then ()
+  end
+
   # Find the type definition
   var type_def = Option::None
   for td in engine.type_defs do
@@ -779,6 +935,7 @@ def compute_type_layout(engine: &mut LayoutEngine, type_id: Int) -> LayoutRecord
   
   match type_def
   when Option::Some(td) then
+    engine.visit_states.insert(type_id, LayoutVisitState::Visiting)
     let rec = match td.kind
     when MirTypeDefKind::Struct(fields) then
       compute_struct_layout(engine, type_id, &fields)
@@ -788,6 +945,7 @@ def compute_type_layout(engine: &mut LayoutEngine, type_id: Int) -> LayoutRecord
     
     # Cache the result
     engine.records.insert(type_id, rec.clone())
+    engine.visit_states.insert(type_id, LayoutVisitState::Resolved)
     rec
   when Option::None then
     # Unknown type - return default pointer-sized layout
@@ -1225,8 +1383,78 @@ end
 # Pre-compute all layouts (call after registering types)
 # ———————————————————————————————————————————————————————————————
 
+# Collect TypeIds of named types reached through INLINE storage only: direct
+# Named fields and tuple elements.  Indirections (Ptr/PtrMut/Ref, Box/Rc,
+# Slice, Array, Option/Result/Map/Set, Function, String) are pointer-sized
+# opaque handles and are never followed; unregistered named types have no
+# definition to recurse into.
+def collect_inline_named_children(ty: &Type, out: &mut Vec[Int]) -> Unit
+  match ty
+  when Type::Named(tid, _) then
+    out.push(tid.id)
+  when Type::Tuple(elems) then
+    for e in elems do
+      collect_inline_named_children(e, out)
+    end
+  when _ then ()
+  end
+end
+
+# DFS over the inline layout graph (P0-AT).  Reaching a type that is still
+# Visiting means it reaches itself through inline storage only — no finite
+# inline layout exists (e.g. `struct Bad { child: Bad }`).  Types reached
+# through indirection (e.g. `struct Node { next: Box[Node] }`) are never
+# flagged.  The engine has no error list; the existing diagnostic channel
+# for unrecoverable layout problems is panic, so the cycle is reported there.
+def check_inline_layout_cycles(engine: &mut LayoutEngine, type_id: Int) -> Unit
+  let state = match engine.visit_states.get(&type_id)
+  when Option::Some(s) then s
+  when Option::None then LayoutVisitState::Unvisited
+  end
+  match state
+  when LayoutVisitState::Visiting then
+    panic("layout: infinitely sized recursive type '" + lookup_type_name(engine, type_id) + "': inline storage cycle (use a pointer or Box to break the cycle)")
+  when LayoutVisitState::Resolved then ()
+  when LayoutVisitState::Unvisited then
+    engine.visit_states.insert(type_id, LayoutVisitState::Visiting)
+    var children = Vec::new()
+    for td in engine.type_defs do
+      if td.id.id == type_id then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          for f in fields do
+            collect_inline_named_children(&f.ty, &mut children)
+          end
+        when MirTypeDefKind::Enum(variants) then
+          for v in variants do
+            for fty in v.fields do
+              collect_inline_named_children(&fty, &mut children)
+            end
+          end
+        end
+      end
+    end
+    for child in children do
+      check_inline_layout_cycles(engine, child)
+    end
+    engine.visit_states.insert(type_id, LayoutVisitState::Resolved)
+  end
+end
+
 def compute_all_layouts(engine: &mut LayoutEngine) -> Unit
-  # First pass: insert placeholder records to break cycles
+  # Diagnose infinitely sized recursive inline types FIRST: the DFS marks
+  # Unvisited/Visiting/Resolved per type, and re-visiting a Visiting type
+  # through inline storage is reported before placeholder seeding could mask
+  # the cycle.  Types behind indirection (Box, pointers, containers) are
+  # finite and never flagged.
+  engine.visit_states = Map::new()
+  engine.strict_states = Map::new()
+  for td in engine.type_defs do
+    check_inline_layout_cycles(engine, td.id.id)
+  end
+
+  # First pass: insert placeholder records (cycles are already diagnosed
+  # above, so a placeholder can never mask one).
   for td in engine.type_defs do
     engine.records.insert(td.id.id, LayoutRecord {
       type_id: td.id.id,
@@ -1246,7 +1474,9 @@ def compute_all_layouts(engine: &mut LayoutEngine) -> Unit
     })
   end
 
-  # Second pass: compute real layouts
+  # Second pass: compute real layouts from the definitions.  Every record is
+  # recomputed and overwrites its placeholder, so a placeholder's size 0 can
+  # never determine a field's eventual size.
   for td in engine.type_defs do
     let rec = compute_type_layout(engine, td.id.id)
     engine.records.insert(td.id.id, rec)

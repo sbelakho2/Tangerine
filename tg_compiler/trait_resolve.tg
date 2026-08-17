@@ -4,8 +4,8 @@
 # This module resolves method calls by searching inherent impls first
 # then trait impls, ranking candidates by specificity.
 
-use tg_compiler::ast::{ Program, Item, ItemKind, ImplDecl, TraitDecl, Span, TypeExpr, TypeExprKind }
-use tg_compiler::types::{ Type, TypeId, TypeEnv, TypeDef, TypeDefKind, MethodSig, ParamType }
+use tg_compiler::ast::{ Program, Item, ItemKind, ImplDecl, TraitDecl, Span, TypeExpr, TypeExprKind, AccessConvention }
+use tg_compiler::types::{ Type, TypeId, TypeEnv, TypeDef, TypeDefKind, MethodSig, ParamType, get_type_def_by_name }
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -81,48 +81,138 @@ def register_impl(resolver: &mut TraitResolver, entry: ImplEntry) -> Unit
   resolver.impls.push(entry)
 end
 
-def ast_type_to_type(ty: &TypeExpr) -> Type
+# Convert a type expression into a resolved Type through the typed program's
+# type tables (the same tables the type layer's resolve_type_expr uses).
+# A name that is a genuinely declared generic parameter of the impl/method
+# becomes Type::Param(name) — a real parameter reference that matches only
+# the same-named Param, never a wildcard. Every other named type resolves to
+# Type::Named(resolved TypeId, args) (or a canonical variant for builtin
+# compounds); a name that cannot be resolved is an explicit error, recorded
+# on the resolver and returned as Type::Error — never a Param wildcard.
+def ast_type_to_type(resolver: &mut TraitResolver, env: &TypeEnv, generic_params: &Vec[String], ty: &TypeExpr) -> Type
   match ty.kind
   when TypeExprKind::Unit then Type::Unit
   when TypeExprKind::Never then Type::Never
-  when TypeExprKind::Named(name, _args) then Type::Param(name)
-  when TypeExprKind::Slice(inner) then Type::Slice(ast_type_to_type(&inner))
+  when TypeExprKind::Named(name, args) then
+    if generic_params.contains(&name) then
+      # Declared impl/method generic parameter: genuine Param reference.
+      Type::Param(name)
+    elsif name == "Unit" || name == "Nil" then Type::Unit
+    elsif name == "Bool" then Type::Bool
+    elsif name == "Int" then Type::Int
+    elsif name == "i8" then Type::I8
+    elsif name == "i16" then Type::I16
+    elsif name == "i32" then Type::I32
+    elsif name == "i64" then Type::I64
+    elsif name == "i128" then Type::I128
+    elsif name == "UInt" then Type::UInt
+    elsif name == "u8" then Type::U8
+    elsif name == "u16" then Type::U16
+    elsif name == "u32" then Type::U32
+    elsif name == "u64" then Type::U64
+    elsif name == "u128" then Type::U128
+    elsif name == "isize" then Type::ISize
+    elsif name == "usize" then Type::USize
+    elsif name == "Float" then Type::Float
+    elsif name == "f32" then Type::F32
+    elsif name == "f64" then Type::F64
+    elsif name == "Char" then Type::Char
+    elsif name == "String" || name == "str" then Type::String
+    elsif name == "Never" then Type::Never
+    elsif name == "Fn" then
+      # Named Fn syntax mirrors the type layer's canonical Function type.
+      var param_types = Vec::new()
+      for arg in args do
+        param_types.push(ParamType { ty: ast_type_to_type(resolver, env, generic_params, &arg), convention: AccessConvention::Let })
+      end
+      Type::Function(param_types, Type::Unit)
+    elsif name == "Array" then
+      if args.len() >= 1 then
+        Type::Array(ast_type_to_type(resolver, env, generic_params, &args[0]), 0)
+      else
+        Type::Error
+      end
+    elsif name == "Slice" then
+      if args.len() >= 1 then
+        Type::Slice(ast_type_to_type(resolver, env, generic_params, &args[0]))
+      else
+        Type::Error
+      end
+    else
+      # Resolve through the typed program's type tables.
+      match get_type_def_by_name(env, name.clone())
+      when Option::Some(td) then
+        var resolved_args = Vec::new()
+        for arg in args do
+          resolved_args.push(ast_type_to_type(resolver, env, generic_params, &arg))
+        end
+        # Canonical variants for builtin compounds so matching agrees with
+        # the type layer's resolve_type_expr.
+        if td.name == "Option" then
+          if resolved_args.len() >= 1 then Type::Option(resolved_args[0]) else Type::Error end
+        elsif td.name == "Result" then
+          if resolved_args.len() >= 2 then Type::Result(resolved_args[0], resolved_args[1]) else Type::Error end
+        elsif td.name == "Map" then
+          if resolved_args.len() >= 2 then Type::Map(resolved_args[0], resolved_args[1]) else Type::Error end
+        elsif td.name == "Set" then
+          if resolved_args.len() >= 1 then Type::Set(resolved_args[0]) else Type::Error end
+        else
+          Type::Named(td.id, resolved_args)
+        end
+      when Option::None then
+        # Explicit failure: an unresolvable named type is an error, never a
+        # Param wildcard.
+        resolver.errors.push(TraitError {
+          message: "unresolved named type `" + name + "` in trait impl",
+          span: ty.span
+        })
+        Type::Error
+      end
+    end
+  when TypeExprKind::Slice(inner) then Type::Slice(ast_type_to_type(resolver, env, generic_params, &inner))
   when TypeExprKind::Tuple(elems) then
     let mapped = Vec::new()
     for e in elems do
-      mapped.push(ast_type_to_type(&e))
+      mapped.push(ast_type_to_type(resolver, env, generic_params, &e))
     end
     Type::Tuple(mapped)
   when _ then Type::Error
   end
 end
 
-def collect_impls(resolver: &mut TraitResolver, program: &Program) -> Unit
+def collect_impls(resolver: &mut TraitResolver, program: &Program, env: &TypeEnv) -> Unit
   for item in program.items do
     match item.kind
     when ItemKind::ItemImpl(impl_block) then
+      # Impl-level generic parameters are in scope for the impl's for_type
+      # and for every method signature (mirrors the type layer's check_impl).
+      var impl_generic_names = Vec::new()
+      for gp in impl_block.generic_params do
+        impl_generic_names.push(gp.name.clone())
+      end
       var methods = Vec::new()
       for method in impl_block.methods do
+        # Method-level generic parameters are additionally in scope for this
+        # method's signature.
+        var generic_names = impl_generic_names.clone()
+        for mgp in method.generic_params do
+          generic_names.push(mgp.name.clone())
+        end
         var param_types = Vec::new()
         for p in method.params do
           match p.ty
-          when Some(param_ty) then param_types.push(ParamType { ty: ast_type_to_type(&param_ty), convention: p.convention })
+          when Some(param_ty) then param_types.push(ParamType { ty: ast_type_to_type(resolver, env, &generic_names, &param_ty), convention: p.convention })
           when None then param_types.push(ParamType { ty: Type::Error, convention: p.convention })
           end
         end
         methods.push(MethodSig {
           name: method.name.clone(),
-          params: param_types.clone(),
+          params: param_types,
           ret_type: match method.ret_type
-            when Some(ret_ty) then ast_type_to_type(&ret_ty)
+            when Some(ret_ty) then ast_type_to_type(resolver, env, &generic_names, &ret_ty)
             when None then Type::Unit
           end,
-          is_method: true,
-          param_types: param_types,
-          return_type: match method.ret_type
-            when Some(ret_ty) then ast_type_to_type(&ret_ty)
-            when None then Type::Unit
-          end
+          is_method: true
         })
       end
       let is_inherent = impl_block.trait_name.is_none()
@@ -131,7 +221,7 @@ def collect_impls(resolver: &mut TraitResolver, program: &Program) -> Unit
           when Some(name) then name
           when None then "_"
         end,
-        for_type: ast_type_to_type(&impl_block.for_type),
+        for_type: ast_type_to_type(resolver, env, &impl_generic_names, &impl_block.for_type),
         methods: methods,
         is_inherent: is_inherent,
         span: impl_block.span
@@ -218,64 +308,57 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Check if a pattern type matches a concrete type.
-# Generic parameters match anything.
+# Type::Param matches only the SAME named generic parameter and Type::Var
+# only the identical pending inference variable; no type matches "anything".
 def type_matches(pattern: &Type, concrete: &Type) -> Bool
   match pattern
-  when Type::Param(_) then true
-  when Type::Var(_) then true
+  when Type::Param(p_name) then
+    match concrete
+    when Type::Param(c_name) then p_name == c_name
+    when _ then false
+    end
+  when Type::Var(p_var) then
+    match concrete
+    when Type::Var(c_var) then p_var.id == c_var.id
+    when _ then false
+    end
   when Type::Unit then
     match concrete
     when Type::Unit then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::Bool then
     match concrete
     when Type::Bool then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::Int then
     match concrete
     when Type::Int then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::UInt then
     match concrete
     when Type::UInt then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::Float then
     match concrete
     when Type::Float then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::Char then
     match concrete
     when Type::Char then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::String then
     match concrete
     when Type::String then true
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when _ then false
     end
   when Type::Named(n1, args1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Named(n2, args2) then
       if n1 != n2 then
         false
@@ -297,38 +380,28 @@ def type_matches(pattern: &Type, concrete: &Type) -> Bool
     end
   when Type::Option(t1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Option(t2) then type_matches(t1, t2)
     when _ then false
     end
   when Type::Result(ok1, err1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Result(ok2, err2) then
       type_matches(ok1, ok2) && type_matches(err1, err2)
     when _ then false
     end
   when Type::Map(k1, v1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Map(k2, v2) then
       type_matches(k1, k2) && type_matches(v1, v2)
     when _ then false
     end
   when Type::Set(t1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Set(t2) then type_matches(t1, t2)
     when _ then false
     end
   when Type::Tuple(elems1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Tuple(elems2) then
       if elems1.len() != elems2.len() then
         false
@@ -348,22 +421,16 @@ def type_matches(pattern: &Type, concrete: &Type) -> Bool
     end
   when Type::Array(t1, n1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Array(t2, n2) then n1 == n2 && type_matches(t1, t2)
     when _ then false
     end
   when Type::Slice(t1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Slice(t2) then type_matches(t1, t2)
     when _ then false
     end
   when Type::Function(p1, r1) then
     match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
     when Type::Function(p2, r2) then
       if p1.len() != p2.len() then
         false
@@ -385,12 +452,7 @@ def type_matches(pattern: &Type, concrete: &Type) -> Bool
       end
     when _ then false
     end
-  when _ then
-    match concrete
-    when Type::Param(_) then true
-    when Type::Var(_) then true
-    when _ then false
-    end
+  when _ then false
   end
 end
 
@@ -1081,9 +1143,6 @@ def substitute_terminator(subst: &TypeSubstMap, term: &MirTerminator) -> MirTerm
   when MirTerminatorKind::MirSwitchInt(discr, targets, default_target) then
     let new_discr = substitute_operand(subst, &discr)
     MirTerminatorKind::MirSwitchInt { op: new_discr, targets: targets.clone(), default_target: default_target.clone() }
-  when MirTerminatorKind::MirDrop(place, target, unwind) then
-    let new_place = substitute_place(subst, &place)
-    MirTerminatorKind::MirDrop { place: new_place, target: target.clone(), unwind: unwind.clone() }
   when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
     let new_place = substitute_place(subst, &place)
     MirTerminatorKind::MirDeinit { place: new_place, deinit_fn: deinit_fn.clone(), target: target.clone(), unwind: unwind.clone() }
@@ -1777,7 +1836,7 @@ def generate_vtable(
     when Option::Some(candidate) then
       candidate.method_sig.clone()
     when Option::None then
-      MethodSig { name: method_name.clone(), params: Vec::new(), ret_type: Type::Unit, is_method: true, param_types: Vec::new(), return_type: Type::Unit }
+      MethodSig { name: method_name.clone(), params: Vec::new(), ret_type: Type::Unit, is_method: true }
     end
     
     entries.push(VTableEntry {
