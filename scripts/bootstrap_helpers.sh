@@ -453,11 +453,20 @@ run_critical_canaries() {
     tests/canary/canary_pos_resource_map_cleanup.tg \
     tests/canary/canary_pos_resource_nested_scope.tg \
     tests/canary/canary_pos_resource_sink_explicit_return.tg \
+    tests/canary/canary_pos_resource_manual_deinit_call.tg \
     tests/canary/canary_pos_resource_loop_break_survives.tg \
     tests/canary/canary_pos_resource_loop_auto_clean.tg \
     tests/canary/canary_pos_resource_box.tg \
     tests/canary/canary_pos_resource_manual_deinit_fields.tg \
     tests/canary/canary_pos_resource_discarded_temp.tg \
+    tests/canary/canary_pos_resource_nested_return.tg \
+    tests/canary/canary_pos_resource_nested_break.tg \
+    tests/canary/canary_pos_resource_nested_continue.tg \
+    tests/canary/canary_pos_smart_box_int.tg \
+    tests/canary/canary_pos_smart_rc.tg \
+    tests/canary/canary_pos_smart_unique_ptr.tg \
+    tests/canary/canary_pos_resource_drain.tg \
+    tests/canary/canary_pos_set_drain.tg \
     tests/canary/canary_capability.tg \
     tests/canary/canary_closure_async.tg \
     tests/canary/canary_ffi.tg \

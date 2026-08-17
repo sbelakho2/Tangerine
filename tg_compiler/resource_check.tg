@@ -97,9 +97,10 @@ end
 pub def resource_check(program: &Program, typed: &TypedProgram) -> ResourceCheckResult
   mut errors = Vec::new()
   var finalize_plan = Map::new()
+  var no_module_path = Vec::new()
   mut i = 0
   while i < program.items.len() do
-    check_item(program, typed, &program.items[i], i, &mut errors, &mut finalize_plan)
+    check_item(program, typed, &program.items[i], i, &mut errors, &mut finalize_plan, &no_module_path)
     i = i + 1
   end
   ResourceCheckResult {
@@ -134,8 +135,16 @@ def type_kind_contains_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
     type_fields_contain_resource(kinds, &fields)
   when Type::Function(_, _) then false
   when Type::RefInternal(inner, _) then type_kind_contains_resource(kinds, &inner)
-  when Type::Box(inner) then type_kind_contains_resource(kinds, &inner)
+  # Canonical Box[T] OWNS an allocation regardless of T (Box[Int] must be
+  # released too), and Rc[T] owns a shared allocation whose drop decrements
+  # the strong count and deallocs at zero — both participate in finalization
+  # unconditionally (the registered Drop impls run their release).
+  when Type::Box(_) then true
+  when Type::Rc(_) then true
   # Type::Param is intentionally NOT treated as resource-containing here:
+  # (ownership-polymorphic rechecking is future work: an unconstrained T
+  # means "may contain a resource", so duplication of T requires a proven
+  # Copyable obligation — P0-documented)
   # unconstrained generics need ownership-polymorphic re-checking after
   # instantiation (P0-8, documented) — conservatively tracking every generic
   # local as a resource would reject valid generic code.
@@ -275,7 +284,7 @@ def item_owner_key(typed: &TypedProgram, item_idx: Int, method_index: Int) -> St
   "item::" + item_idx.to_string() + "::method::" + method_index.to_string()
 end
 
-def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: Int, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]]) -> Unit
+def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: Int, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], module_path: &Vec[String]) -> Unit
   var item_entry = Vec::new()
   match item.kind
   when ItemKind::ItemFunction(f) then
@@ -285,8 +294,15 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: I
     # the DefId key must match so parameter-binding and finalize-plan
     # lookups align (a divergent "item::<idx>::fn" key would break both).
     # Genuinely nested-module items (item_idx -1, unmerged programs) get a
-    # name-qualified key so they never collide with each other.
-    let fn_key = if item_idx >= 0 then fn_owner_key_of_item(typed, item_idx) else "module::" + f.name.clone() end
+    # MODULE-PATH-qualified key ("module::<path>::<name>") so same-named
+    # functions in different nested modules never collide.
+    var mod_key = "module::"
+    mut pi = 0
+    while pi < module_path.len() do
+      mod_key = mod_key + module_path[pi] + "::"
+      pi = pi + 1
+    end
+    let fn_key = if item_idx >= 0 then fn_owner_key_of_item(typed, item_idx) else mod_key + f.name.clone() end
     check_function(program, typed, &f, fn_key, errors, finalize_plan, &mut item_entry)
   when ItemKind::ItemStruct(s) then
     mut frame = res_frame_new()
@@ -326,9 +342,14 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: I
       i = i + 1
     end
   when ItemKind::ItemModule(m) then
+    # Thread the module path into the owner keys so same-named functions in
+    # DIFFERENT nested modules never collide ("module::a::helper" vs
+    # "module::b::helper").
+    var child_path = module_path.clone()
+    child_path.push(m.name.clone())
     mut i = 0
     while i < m.items.len() do
-      check_item(program, typed, &m.items[i], -1, errors, finalize_plan)
+      check_item(program, typed, &m.items[i], -1, errors, finalize_plan, &child_path)
       i = i + 1
     end
   when ItemKind::ItemUse(_) then ()
@@ -432,6 +453,24 @@ def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, owner_key: Stri
   finalize_plan.insert(owner_key, ids)
 end
 
+# Owning smart pointers declared as ordinary structs (UniquePtr/WeakRc/
+# ArcStrong/WeakArc and the struct forms of Box/Rc) own allocation state
+# through their registered Drop impls. They participate in finalization
+# unconditionally — the Value-kind registered-Drop support only runs when
+# the local is in a finalize plan, so these locals must be registered even
+# when their type arguments contain no resource (e.g. UniquePtr[Int]).
+def is_owning_smart_pointer(typed: &TypedProgram, ty: &Type) -> Bool
+  match ty
+  when Type::Named(tid, _) then
+    match typed.type_names.get(tid.id)
+    when Option::Some(n) then
+      n == "Box" || n == "Rc" || n == "UniquePtr" || n == "WeakRc" || n == "ArcStrong" || n == "WeakArc"
+    when Option::None then false
+    end
+  when _ then false
+  end
+end
+
 # Rc[Resource] is explicitly unsupported: a linear resource cannot be shared
 # through reference counting (documented ownership policy). Reject the
 # combination at every binding point instead of silently treating the Rc
@@ -492,7 +531,7 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
         # let/inout params can never be consumed or finalized by the callee,
         # while sink params own their value.
         let origin = param_origin_of(p.convention)
-        if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+        if type_kind_contains_resource(&typed.type_kinds, &lb.ty) || is_owning_smart_pointer(typed, &lb.ty) then
           let init_state = match p.convention
           when AccessConvention::Set then ResourceState::Uninitialized
           when _ then ResourceState::Live
@@ -641,7 +680,23 @@ def check_block(program: &Program, typed: &TypedProgram, block: &Block, loop_out
   # still Live at block exit with Sink/OwnedLocal permission must be
   # finalized when the block ends. Recorded BEFORE exit_scope erases them
   # (the semantic artifact; MIR materializes it at block-end emission).
-  record_block_exit_plan(typed, frame, &entry_names, block, finalize_plan)
+  # When the block ENDS with a terminating statement (return/break/
+  # continue), the terminating edge's own plan ("return::"/"break::"/
+  # "continue::") already covers every live block-local — recording a
+  # block:: obligation too would make MIR wrap the edge chain a second time
+  # (drop p -> drop p -> edge). The block:: plan is only needed for
+  # fallthrough exits.
+  let block_ends_with_terminator = if flow.nodes.len() > 0 then
+    match flow.nodes[flow.nodes.len() - 1].kind
+    when FlowKind::Terminator then true
+    when _ then false
+    end
+  else
+    false
+  end
+  if !block_ends_with_terminator then
+    record_block_exit_plan(typed, frame, &entry_names, block, finalize_plan)
+  end
   exit_scope(frame, &entry_names, typed, errors)
 end
 
@@ -884,7 +939,7 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
   when StmtKind::StmtWhile(cond, body) then
     check_loop(program, typed, Option::Some(&cond), &body, loop_outer, frame, errors, finalize_plan, stmt.node_id, current_loop_entry)
   when StmtKind::StmtFor(for_stmt) then
-    check_for(program, typed, &for_stmt, loop_outer, frame, errors, finalize_plan, current_loop_entry)
+    check_for(program, typed, &for_stmt, loop_outer, frame, errors, finalize_plan, stmt.node_id, current_loop_entry)
   when StmtKind::StmtLoop(body) then
     check_loop(program, typed, Option::None, &body, loop_outer, frame, errors, finalize_plan, stmt.node_id, current_loop_entry)
   when StmtKind::StmtReturn(val_opt) then check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, stmt.node_id)
@@ -1059,11 +1114,11 @@ def check_loop(program: &Program, typed: &TypedProgram, cond: Option[&Expr], bod
     check_expr(program, typed, c, &entry_names, frame, errors, finalize_plan, current_loop_entry)
   when Option::None then ()
   end
-  let after = check_loop_body(program, typed, body, &entry, &entry_names, errors, finalize_plan, stmt.node_id, current_loop_entry)
+  let after = check_loop_body(program, typed, body, &entry, &entry_names, errors, finalize_plan, stmt_node_id, current_loop_entry)
   frame_assign(frame, &after)
 end
 
-def check_for(program: &Program, typed: &TypedProgram, for_stmt: &ForStmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], current_loop_entry: &mut Vec[Int]) -> Unit
+def check_for(program: &Program, typed: &TypedProgram, for_stmt: &ForStmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], stmt_node_id: Int, current_loop_entry: &mut Vec[Int]) -> Unit
   let pre_entry = res_frame_clone(frame)
   let pre_entry_names = res_frame_names_clone(&pre_entry)
   check_pattern(program, typed, &for_stmt.pattern, &pre_entry_names, frame, errors, finalize_plan, current_loop_entry)
@@ -1071,7 +1126,7 @@ def check_for(program: &Program, typed: &TypedProgram, for_stmt: &ForStmt, loop_
   check_expr(program, typed, &for_stmt.iter, &pre_entry_names, frame, errors, finalize_plan, current_loop_entry)
   let entry = res_frame_clone(frame)
   let entry_names = res_frame_names_clone(&entry)
-  let after = check_loop_body(program, typed, &for_stmt.body, &entry, &entry_names, errors, finalize_plan, for_stmt.node_id, current_loop_entry)
+  let after = check_loop_body(program, typed, &for_stmt.body, &entry, &entry_names, errors, finalize_plan, stmt_node_id, current_loop_entry)
   frame_assign(frame, &after)
 end
 
@@ -1207,7 +1262,7 @@ def bind_pattern_ident(typed: &TypedProgram, node_id: Int, span: Span, frame: &m
     match typed.local_bindings.get(id)
     when Option::Some(lb) then
       reject_rc_resource(typed, &lb.ty, span, errors)
-      if type_kind_contains_resource(&typed.type_kinds, &lb.ty) then
+      if type_kind_contains_resource(&typed.type_kinds, &lb.ty) || is_owning_smart_pointer(typed, &lb.ty) then
         res_frame_set(frame, id, ResourceState::Live)
         res_frame_set_span(frame, &id, span)
         frame.origins.insert(id, ParamOrigin::OwnedLocal)
@@ -1536,7 +1591,23 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
         when _ then check_use(typed, id, arg.span, frame, errors)
         end
       else
-        check_use(typed, id, arg.span, frame, errors)
+        # A projected consuming argument (e.g. consume_inner(self.inner)):
+        # MIR lowers the projection as a consuming place. Until partial-drop
+        # state exists, consuming ANY projection rooted at the finalizer's
+        # subject would let the compiler-owned structural field cleanup
+        # finalize the field a second time — reject it.
+        if effect == AccessEffect::Consume then
+          match frame.origins.get(id)
+          when Option::Some(ParamOrigin::DeinitSelf) then
+            errors.push(ResourceError {
+              message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
+              span: arg.span
+            })
+          when _ then check_use(typed, id, arg.span, frame, errors)
+          end
+        else
+          check_use(typed, id, arg.span, frame, errors)
+        end
       end
     end
   when Option::None then

@@ -47,6 +47,18 @@ fi
 # shellcheck source=scripts/bootstrap_helpers.sh
 source "$HELPERS"
 
+# Cheap structural pre-gate BEFORE the expensive ladder: a malformed struct
+# declaration in the kernel (missing fields or missing `end`) silently
+# corrupts every self-hosted stage. This is a heuristic safety net — the
+# authoritative gate remains stage0 parsing the kernel — but it fails fast
+# and cheaply.
+if [ -x "$ROOT_DIR/scripts/check_struct_integrity.sh" ]; then
+  if ! "$ROOT_DIR/scripts/check_struct_integrity.sh"; then
+    echo "[bootstrap:error] kernel struct-integrity pre-gate failed" >&2
+    exit 1
+  fi
+fi
+
 BUILD_DIR="$ROOT_DIR/build"
 BOOT_LOG_DIR="$BUILD_DIR/bootstrap"
 STAGE0_BIN=""

@@ -214,6 +214,10 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
   when Type::Result(ok, err) then
     DeinitPlan::Result(build_deinit_plan(typed, &ok, depth + 1, visited, errors), build_deinit_plan(typed, &err, depth + 1, visited, errors))
   when Type::Slice(inner) then
+    # OWNERSHIP DECISION (explicit): Slice[T] is the language's own
+    # contiguous-BUFFER storage type (opaque builtin) and OWNS its buffer —
+    # cleanup is Array-like. Borrowed views are a different type
+    # (RefInternal), never Slice.
     DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Array(inner, _) then
     DeinitPlan::Array(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
@@ -222,12 +226,19 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
   when Type::Set(inner) then
     DeinitPlan::Set(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
   when Type::Box(inner) then
-    # Box[T] OWNS T through an allocation: a distinct Box plan (not an
-    # Aggregate — a Box is a pointer, not a field container). Rc[T] (shared
-    # ownership) and raw Ptr[T] (non-owning) are NOT owning and stay out of
-    # containment — Rc[Resource] is an explicitly unsupported combination
-    # (a linear resource cannot become shared ownership; documented decision).
-    DeinitPlan::Box(build_deinit_plan(typed, &inner, depth + 1, visited, errors))
+    # Box[T] OWNS T through an allocation. The canonical Box delegates to
+    # the registered Drop impl ("Box__deinit" — the standard library's
+    # impl[T] Drop for Box[T] runs drop_in_place() on the pointee and
+    # deallocates): one real release path for both the pointee and the
+    # allocation, instead of a placeholder finalizer. Rc[Resource] is an
+    # explicitly unsupported combination (documented decision).
+    DeinitPlan::Call("Box__deinit".to_string())
+  when Type::Rc(inner) then
+    # Rc[T] owns a SHARED allocation: its registered Drop impl decrements
+    # the strong count and destroys/deallocs at zero. Rc[Int] (no resource
+    # inside) still needs the release, so the plan is the drop call, not
+    # the inner type's plan.
+    DeinitPlan::Call("Rc__deinit".to_string())
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
@@ -269,7 +280,14 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
             # Recursive ownership (e.g. Node { next: Option[Box[Node]] })
             # needs generated drop glue, not finite plan-tree expansion.
             # PlanLimit is the fail-closed stand-in: refusing to compile is
-            # safer than silently dropping the recursive edge.
+            # safer than silently dropping the recursive edge. Report a
+            # NORMAL source diagnostic so the user sees the restriction
+            # instead of an internal error.
+            errors.push(TypeError {
+              message: "recursive owning type `" + type_name + "` requires generated drop glue (not yet supported): break the ownership cycle or add an explicit finalizer",
+              span: Span { file: "", start: 0, end_pos: 0 },
+              code: Option::None
+            })
             DeinitPlan::PlanLimit
           else
             visited.insert(tid.id)
@@ -315,6 +333,11 @@ pub def build_deinit_plan(typed: &TypedProgram, ty: &Type, depth: Int, visited: 
             end
           when Option::None then
             if visited.contains(&tid.id) then
+              errors.push(TypeError {
+                message: "recursive owning type `" + type_name + "` requires generated drop glue (not yet supported): break the ownership cycle or add an explicit finalizer",
+                span: Span { file: "", start: 0, end_pos: 0 },
+                code: Option::None
+              })
               DeinitPlan::PlanLimit
             else
               visited.insert(tid.id)
@@ -4576,6 +4599,19 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
         # K AND V; map_keys would copy K; array_get/slice copy T.
         if cname == "__intrinsic_array_get" || cname == "__intrinsic_array_slice" ||
            cname == "__intrinsic_map_get" || cname == "__intrinsic_set_entries" then
+          if args.len() >= 1 then
+            match container_element_type(env, &arg_types[0])
+            when Option::Some(elem_ty) then
+              if type_has_resource_kind(env, &elem_ty) then
+                type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+              end
+            when Option::None then ()
+            end
+          end
+        elsif cname == "__intrinsic_array_from_list" then
+          # array_from_list copies OUT of a SHARED &[T] into a fresh
+          # owning Array[T] — intrinsically copy-producing. The library
+          # wrapper's T: Copyable bound does not protect a direct user call.
           if args.len() >= 1 then
             match container_element_type(env, &arg_types[0])
             when Option::Some(elem_ty) then

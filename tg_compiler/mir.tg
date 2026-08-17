@@ -1375,7 +1375,16 @@ def deinit_plan_for_type(b: &MirBuilder, ty: &Type, visited: &mut Set[Int]) -> D
   when Type::Array(inner, _) then DeinitPlan::Array(deinit_plan_for_type(b, &inner, visited))
   when Type::Map(k, v) then DeinitPlan::Map(deinit_plan_for_type(b, &k, visited), deinit_plan_for_type(b, &v, visited))
   when Type::Set(inner) then DeinitPlan::Set(deinit_plan_for_type(b, &inner, visited))
-  when Type::Box(inner) then DeinitPlan::Box(deinit_plan_for_type(b, &inner, visited))
+  when Type::Box(inner) then
+    # Canonical Box[T] delegates to the registered Drop impl (drop_in_place
+    # on the pointee + dealloc) — the same release path as the std struct
+    # Box. The pointee plan is NOT expanded here: the drop handles it.
+    DeinitPlan::Call("Box__deinit".to_string())
+  when Type::Rc(inner) then
+    # Canonical Rc[T] delegates to its registered Drop impl (strong-count
+    # decrement, destroy + dealloc at zero). Rc[Int] needs the release even
+    # though Int is not a resource.
+    DeinitPlan::Call("Rc__deinit".to_string())
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
@@ -1446,31 +1455,15 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     b.errors.push("internal error: recursive resource type cannot be represented by a finite cleanup plan (generated drop glue required)")
     succ
   when DeinitPlan::Box(inner_plan) then
-    # Owning-pointer cleanup: finalize the POINTEE FIRST (through the deref
-    # projection — it must run while the allocation is still valid), then
-    # release the allocation. The chain is built backward: the free block
-    # targets succ, and the pointee cleanup targets the free block, so
-    # execution runs pointee cleanup -> free -> successor.
-    # GROUNDING: the release is emitted as a MirDeinit to "__tg_box_free".
-    # The codegen only emits the call when that function is reachable
-    # (codegen_finalizer_call gates on reachable_fns), so a managed runtime
-    # without an explicit box-release primitive compiles and skips the call;
-    # once the runtime exposes a real allocation-release identity, declaring
-    # it makes the call emit. The pointee finalization is the
-    # ownership-relevant part; the allocation release is the remaining
-    # runtime glue (tracked as P0 — no leak of the POINTEE either way).
-    let box_bk = create_block(b)
-    switch_to_block(b, box_bk)
-    set_terminator(b, MirTerminatorKind::MirDeinit {
-      place: place.clone(),
-      deinit_fn: "__tg_box_free".to_string(),
-      target: succ,
-      unwind: Option::None
-    }, span)
+    # Unreachable since the canonical Box plans delegate to the registered
+    # Drop impl ("Box__deinit" — drop_in_place + dealloc). Kept
+    # defensively: emit the pointee cleanup and FAIL CLOSED on the missing
+    # allocation release instead of silently skipping it.
+    b.errors.push("internal error: DeinitPlan::Box reached; canonical Box plans delegate to the registered Drop impl")
     var deref_projs = place.projections.clone()
     deref_projs.push(Projection::ProjDeref)
     let pointee_place = Place { local: place.local, projections: deref_projs }
-    emit_plan_deinit(b, &pointee_place, inner_plan, box_bk, span)
+    emit_plan_deinit(b, &pointee_place, inner_plan, succ, span)
   when DeinitPlan::Call(name) then
     let bk = create_block(b)
     switch_to_block(b, bk)
@@ -1568,11 +1561,10 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     set_terminator(b, MirTerminatorKind::MirGoto(header_blk), span)
     entry_blk
   when DeinitPlan::Set(elem_plan) then
-    # DESTRUCTIVE set cleanup: copy entries for iteration keys, then REMOVE
-    # each element from the set before deiniting the (removed) element copy —
-    # no shared-read duplication of surviving elements. The temp is sized
-    # with the set's concrete element type (a Unit-typed temp would
-    # under-size the storage).
+    # DESTRUCTIVE drain cleanup: repeatedly call set_drain_one(s), which
+    # destructively transfers the ACTUAL element out of the set (no shared
+    # snapshot copy), then deinit the element. The loop terminates when the
+    # drain returns None.
     let set_ty = builder_local_typed_ty(b, &place.local)
     let elem_ty = match set_ty
     when Option::Some(st) then
@@ -1583,103 +1575,53 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
       end
     when Option::None then Type::Unit
     end
-    let se_callee = MirOperand {
+    let sd_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem("__intrinsic_set_entries".to_string()),
+        kind: MirConstantKind::MirFnItem("__intrinsic_set_drain_one".to_string()),
         ty: Type::Unit
       })
     }
-    let sr_callee = MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem("__intrinsic_set_remove".to_string()),
-        ty: Type::Unit
-      })
-    }
-    let se_tmp = add_temp(b, Type::Slice(elem_ty.clone()), span)
-    let se_blk = create_block(b)
-    var se_args = Vec::new()
-    se_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
+    let sd_ret = add_temp(b, Type::Option(elem_ty.clone()), span)
+    let sd_call_blk = create_block(b)
+    let sd_disc_blk = create_block(b)
+    let sd_some_blk = create_block(b)
+    let sd_none_blk = create_block(b)
+    switch_to_block(b, sd_call_blk)
+    var sd_args = Vec::new()
+    sd_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
     set_terminator(b, MirTerminatorKind::MirCall {
-      dest: place_local(se_tmp),
-      func: se_callee,
-      args: se_args,
-      success: se_blk,
+      dest: place_local(sd_ret),
+      func: sd_callee,
+      args: sd_args,
+      success: sd_disc_blk,
       unwind: Option::None
     }, span)
-    switch_to_block(b, se_blk)
-    let se_len = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(se_len), MirRvalue { kind: MirRvalueKind::MirLen(place_local(se_tmp)) }, span)
-    let se_idx = add_local(b, "deinit_set_idx", Type::Int, false, span)
-    push_assign(b, place_local(se_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(se_len))
-    }) }, span)
-    let se_header = create_block(b)
-    let se_exit = create_block(b)
-    let se_body = create_block(b)
-    switch_to_block(b, se_header)
-    let se_zero = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(se_zero), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int })
-    }) }, span)
-    let se_cmp = add_temp(b, Type::Bool, span)
-    push_assign(b, place_local(se_cmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
-      MirBinOp::Gt,
-      operand_copy_local(se_idx),
-      operand_copy_local(se_zero)
-    ) }, span)
-    var se_targets = Vec::new()
-    se_targets.push(SwitchTarget { value: 0, target: se_exit })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(se_cmp), targets: se_targets, default_target: se_body }, span)
-    switch_to_block(b, se_body)
-    let se_dec = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(se_dec), MirRvalue { kind: MirRvalueKind::MirBinOp(
-      MirBinOp::Sub,
-      operand_copy_local(se_idx),
-      operand_int(1)
-    ) }, span)
-    push_assign(b, place_local(se_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(se_dec))
-    }) }, span)
-    var se_elem_projs = Vec::new()
-    se_elem_projs.push(Projection::ProjIndex(se_idx))
-    let se_elem_place = Place { local: se_tmp, projections: se_elem_projs }
-    let sr_ret = add_temp(b, Type::Unit, span)
-    let sr_blk = create_block(b)
-    var sr_args = Vec::new()
-    sr_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
-    sr_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(se_elem_place) }) })
-    set_terminator(b, MirTerminatorKind::MirCall {
-      dest: place_local(sr_ret),
-      func: sr_callee,
-      args: sr_args,
-      success: sr_blk,
-      unwind: Option::None
-    }, span)
-    switch_to_block(b, sr_blk)
-    let after_se = emit_plan_deinit(b, &se_elem_place, elem_plan, se_header, span)
-    switch_to_block(b, sr_blk)
-    set_terminator(b, MirTerminatorKind::MirGoto(after_se), span)
-    switch_to_block(b, se_exit)
+    switch_to_block(b, sd_disc_blk)
+    let sd_disc = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(sd_disc), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(sd_ret)) }, span)
+    var sd_targets = Vec::new()
+    sd_targets.push(SwitchTarget { value: 0, target: sd_some_blk })
+    sd_targets.push(SwitchTarget { value: 1, target: sd_none_blk })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(sd_disc), targets: sd_targets, default_target: sd_none_blk }, span)
+    switch_to_block(b, sd_none_blk)
     set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
-    let se_entry = create_block(b)
-    switch_to_block(b, se_entry)
-    set_terminator(b, MirTerminatorKind::MirGoto(se_header), span)
-    se_entry
+    switch_to_block(b, sd_some_blk)
+    var sd_projs = place_local(sd_ret).projections.clone()
+    sd_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    let sd_elem_place = Place { local: sd_ret, projections: sd_projs }
+    let sd_chain = emit_plan_deinit(b, &sd_elem_place, elem_plan, sd_call_blk, span)
+    switch_to_block(b, sd_some_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(sd_chain), span)
+    let sd_entry = create_block(b)
+    switch_to_block(b, sd_entry)
+    set_terminator(b, MirTerminatorKind::MirGoto(sd_call_blk), span)
+    sd_entry
   when DeinitPlan::Map(key_plan, value_plan) then
-    # DESTRUCTIVE map cleanup: for each entry (in reverse order), REMOVE it
-    # from the map (the removal destroys the map's entry storage), then
-    # deinit the removed VALUE and the copied KEY by their plans. The removal
-    # happens BEFORE the value's deinit so no copied resource is destroyed
-    # while the original remains behind (a shared-read entries() copy would
-    # duplicate ownership). Keys AND values are both cleaned.
-    # P1: the reviewer's preferred primitive is a destructive compiler-
-    # private map_drain_one(inout Map[K,V]) -> Option[(K,V)] that transfers
-    # the actual (K, V) out together — no snapshot copy exists. The current
-    # form removes-then-cleans (deinit runs exactly once) and is safe; the
-    # drain primitive would eliminate the snapshot entirely.
-    # The concrete K/V types come from the map's own type so the temporaries
-    # are correctly sized (a Unit-typed temp would under-size the storage for
-    # real key/value payloads).
+    # DESTRUCTIVE drain cleanup: repeatedly call map_drain_one(m), which
+    # destructively transfers the ACTUAL (K, V) entry out of the map (no
+    # snapshot copy exists — ownership of the real key and value pointers
+    # transfers), then deinit the value and the key. The loop terminates
+    # when the drain returns None.
     let map_ty = builder_local_typed_ty(b, &place.local)
     let map_kv = match map_ty
     when Option::Some(mt) then
@@ -1697,212 +1639,53 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     when Option::Some((_, vv)) then vv
     when Option::None then Type::Unit
     end
-    let ent_callee = MirOperand {
+    let dr_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem("__intrinsic_map_entries".to_string()),
+        kind: MirConstantKind::MirFnItem("__intrinsic_map_drain_one".to_string()),
         ty: Type::Unit
       })
     }
-    let rm_callee = MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirFnItem("__intrinsic_map_remove".to_string()),
-        ty: Type::Unit
-      })
-    }
-    let entries_tmp = add_temp(b, Type::Slice(Type::Tuple(vec![key_ty.clone(), val_ty.clone()])), span)
-    let ent_blk = create_block(b)
-    var ent_args = Vec::new()
-    ent_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
+    let dr_ret = add_temp(b, Type::Option(Type::Tuple(vec![key_ty.clone(), val_ty.clone()])), span)
+    let dr_call_blk = create_block(b)
+    let dr_disc_blk = create_block(b)
+    let dr_some_blk = create_block(b)
+    let dr_none_blk = create_block(b)
+    switch_to_block(b, dr_call_blk)
+    var dr_args = Vec::new()
+    dr_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
     set_terminator(b, MirTerminatorKind::MirCall {
-      dest: place_local(entries_tmp),
-      func: ent_callee,
-      args: ent_args,
-      success: ent_blk,
+      dest: place_local(dr_ret),
+      func: dr_callee,
+      args: dr_args,
+      success: dr_disc_blk,
       unwind: Option::None
     }, span)
-    switch_to_block(b, ent_blk)
-    let ent_len = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(ent_len), MirRvalue { kind: MirRvalueKind::MirLen(place_local(entries_tmp)) }, span)
-    let ent_idx = add_local(b, "deinit_ent_idx", Type::Int, false, span)
-    push_assign(b, place_local(ent_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(ent_len))
-    }) }, span)
-    let ent_header = create_block(b)
-    let ent_exit = create_block(b)
-    let ent_body = create_block(b)
-    switch_to_block(b, ent_header)
-    let ent_zero = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(ent_zero), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int })
-    }) }, span)
-    let ent_cmp = add_temp(b, Type::Bool, span)
-    push_assign(b, place_local(ent_cmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
-      MirBinOp::Gt,
-      operand_copy_local(ent_idx),
-      operand_copy_local(ent_zero)
-    ) }, span)
-    var ent_targets = Vec::new()
-    ent_targets.push(SwitchTarget { value: 0, target: ent_exit })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(ent_cmp), targets: ent_targets, default_target: ent_body }, span)
-    switch_to_block(b, ent_body)
-    let ent_dec = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(ent_dec), MirRvalue { kind: MirRvalueKind::MirBinOp(
-      MirBinOp::Sub,
-      operand_copy_local(ent_idx),
-      operand_int(1)
-    ) }, span)
-    push_assign(b, place_local(ent_idx), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirCopy(place_local(ent_dec))
-    }) }, span)
-    # The copied key of this entry (for the remove call and its own deinit).
-    var key_projs = Vec::new()
-    key_projs.push(Projection::ProjIndex(ent_idx))
-    key_projs.push(Projection::ProjField("0".to_string(), 0))
-    let ent_key_place = Place { local: entries_tmp, projections: key_projs }
-    # removed = __intrinsic_map_remove(m, &copied_key)
-    # map_remove returns Option[V]: the removed value is transferred OUT of
-    # the map into rm_ret, and cleanup destroys THAT returned value (never
-    # the snapshot copy — the snapshot exists only to provide iteration
-    # keys). The Option plan discriminates Some/None.
-    let rm_ret = add_temp(b, Type::Option(val_ty.clone()), span)
-    let rm_blk = create_block(b)
-    var rm_args = Vec::new()
-    rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place.clone()) }) })
-    rm_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(ent_key_place) }) })
-    set_terminator(b, MirTerminatorKind::MirCall {
-      dest: place_local(rm_ret),
-      func: rm_callee,
-      args: rm_args,
-      success: rm_blk,
-      unwind: Option::None
-    }, span)
-    switch_to_block(b, rm_blk)
-    # Deinit the REMOVED value via the Option plan on the call result.
-    let after_value = emit_plan_deinit(b, &place_local(rm_ret), &DeinitPlan::Option(value_plan.clone()), ent_header, span)
-    # Deinit the snapshot key (the map's key storage is gone; the snapshot
-    # copy represents it — the aliasing boundary is documented), then loop.
-    let after_key = emit_plan_deinit(b, &ent_key_place, key_plan, after_value, span)
-    switch_to_block(b, rm_blk)
-    set_terminator(b, MirTerminatorKind::MirGoto(after_key), span)
-    switch_to_block(b, ent_exit)
+    switch_to_block(b, dr_disc_blk)
+    let dr_disc = add_temp(b, Type::Int, span)
+    push_assign(b, place_local(dr_disc), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(dr_ret)) }, span)
+    var dr_targets = Vec::new()
+    dr_targets.push(SwitchTarget { value: 0, target: dr_some_blk })
+    dr_targets.push(SwitchTarget { value: 1, target: dr_none_blk })
+    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(dr_disc), targets: dr_targets, default_target: dr_none_blk }, span)
+    switch_to_block(b, dr_none_blk)
     set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
-    let ent_entry = create_block(b)
-    switch_to_block(b, ent_entry)
-    set_terminator(b, MirTerminatorKind::MirGoto(ent_header), span)
-    ent_entry
-  when DeinitPlan::Option(inner_plan) then
-    # Deinit the payload only when the variant is Some: discriminant block
-    # switches to skip_blk (None) or body_blk (Some payload deinit).
-    let disc_blk = create_block(b)
-    let body_blk = create_block(b)
-    let skip_blk = create_block(b)
-    switch_to_block(b, disc_blk)
-    let disc_tmp = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
-    # Option discriminants: Some = 0, None = 1. Some routes to the payload
-    # deinit; None routes to the skip block.
-    var targets_o = Vec::new()
-    targets_o.push(SwitchTarget { value: 0, target: body_blk })
-    targets_o.push(SwitchTarget { value: 1, target: skip_blk })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: targets_o, default_target: skip_blk }, span)
-    switch_to_block(b, skip_blk)
-    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
-    switch_to_block(b, body_blk)
-    var payload_projs = place.projections.clone()
-    payload_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
-    let payload_place = Place { local: place.local, projections: payload_projs }
-    let chain_entry_o = emit_plan_deinit(b, &payload_place, inner_plan, succ, span)
-    switch_to_block(b, body_blk)
-    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_o), span)
-    let entry_o = create_block(b)
-    switch_to_block(b, entry_o)
-    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk), span)
-    entry_o
-  when DeinitPlan::Result(ok_plan, err_plan) then
-    # Deinit the payload of whichever variant is present.
-    let disc_blk2 = create_block(b)
-    let body_blk2 = create_block(b)
-    let skip_blk2 = create_block(b)
-    switch_to_block(b, disc_blk2)
-    let disc_tmp2 = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(disc_tmp2), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
-    # Result discriminants: Ok = 0, Err = 1. Ok routes to the Ok payload
-    # deinit; Err routes to the Err payload deinit.
-    var targets_r = Vec::new()
-    targets_r.push(SwitchTarget { value: 0, target: body_blk2 })
-    targets_r.push(SwitchTarget { value: 1, target: skip_blk2 })
-    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp2), targets: targets_r, default_target: skip_blk2 }, span)
-    # Ok variant (default) deinits the Ok payload; the Err variant (tag 1)
-    # deinits the Err payload — both plans are honored.
-    switch_to_block(b, skip_blk2)
-    var err_projs = place.projections.clone()
-    err_projs.push(Projection::ProjDowncast("Err".to_string(), 1))
-    let err_place = Place { local: place.local, projections: err_projs }
-    let chain_entry_e = emit_plan_deinit(b, &err_place, err_plan, succ, span)
-    switch_to_block(b, skip_blk2)
-    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_e), span)
-    switch_to_block(b, body_blk2)
-    var payload_projs2 = place.projections.clone()
-    payload_projs2.push(Projection::ProjDowncast("Ok".to_string(), 0))
-    let payload_place2 = Place { local: place.local, projections: payload_projs2 }
-    let chain_entry_r = emit_plan_deinit(b, &payload_place2, ok_plan, succ, span)
-    switch_to_block(b, body_blk2)
-    set_terminator(b, MirTerminatorKind::MirGoto(chain_entry_r), span)
-    let entry_r = create_block(b)
-    switch_to_block(b, entry_r)
-    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk2), span)
-    entry_r
-  when DeinitPlan::Enum(variant_plans) then
-    # Arbitrary resource-containing enums: switch on the discriminant and
-    # deinit the active variant's payload fields by their plans. Each variant
-    # is routed to its own chain; the fallthrough (unknown discriminant) is a
-    # defensive skip (should not occur for well-typed values).
-    let disc_blk_e = create_block(b)
-    let default_blk_e = create_block(b)
-    let entry_blk_e = create_block(b)
-    switch_to_block(b, disc_blk_e)
-    let disc_tmp_e = add_temp(b, Type::Int, span)
-    push_assign(b, place_local(disc_tmp_e), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place.clone()) }, span)
-    var e_targets = Vec::new()
-    # One block per variant: its chain deinits the payload fields, then flows
-    # to succ.
-    var variant_entries = Map::new()
-    for (vdisc, vinfo) in variant_plans do
-      let vname = vinfo.0
-      let vplans = vinfo.1
-      var vchain = succ
-      var vfi = vplans.len()
-      while vfi > 0 do
-        vfi = vfi - 1
-        var vprojs = place.projections.clone()
-        vprojs.push(Projection::ProjDowncast(vname.clone(), vdisc))
-        vprojs.push(Projection::ProjFieldIndex(vfi))
-        let vplace = Place { local: place.local, projections: vprojs }
-        vchain = emit_plan_deinit(b, &vplace, &vplans[vfi], vchain, span)
-      end
-      variant_entries.insert(vdisc, vchain)
-    end
-    # Re-walk to emit the per-variant blocks' goto to their chains (the
-    # chains were emitted above while current_block is the last chain block).
-    for (vdisc2, vinfo2) in variant_plans do
-      let vblk = create_block(b)
-      switch_to_block(b, vblk)
-      match variant_entries.get(vdisc2)
-      when Option::Some(vchain2) then
-        set_terminator(b, MirTerminatorKind::MirGoto(vchain2), span)
-      when Option::None then ()
-      end
-      e_targets.push(SwitchTarget { value: vdisc2, target: vblk })
-    end
-    switch_to_block(b, disc_blk_e)
-    set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp_e), targets: e_targets, default_target: default_blk_e }, span)
-    switch_to_block(b, default_blk_e)
-    set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
-    switch_to_block(b, entry_blk_e)
-    set_terminator(b, MirTerminatorKind::MirGoto(disc_blk_e), span)
-    entry_blk_e
-  end
-end
+    switch_to_block(b, dr_some_blk)
+    var v_projs = place_local(dr_ret).projections.clone()
+    v_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    v_projs.push(Projection::ProjFieldIndex(1))
+    let v_place = Place { local: dr_ret, projections: v_projs }
+    var k_projs = place_local(dr_ret).projections.clone()
+    k_projs.push(Projection::ProjDowncast("Some".to_string(), 0))
+    k_projs.push(Projection::ProjFieldIndex(0))
+    let k_place = Place { local: dr_ret, projections: k_projs }
+    let after_v = emit_plan_deinit(b, &v_place, value_plan, dr_call_blk, span)
+    let after_k = emit_plan_deinit(b, &k_place, key_plan, after_v, span)
+    switch_to_block(b, dr_some_blk)
+    set_terminator(b, MirTerminatorKind::MirGoto(after_k), span)
+    let dr_entry = create_block(b)
+    switch_to_block(b, dr_entry)
+    set_terminator(b, MirTerminatorKind::MirGoto(dr_call_blk), span)
+    dr_entry
 
 def emit_deinit_chain_at(b: &mut MirBuilder, block_id: BlockId, places: &Vec[Place], span: Span) -> Unit
   let saved_block = b.current_block
@@ -4914,8 +4697,6 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
             end
           when Option::None then ()
           end
-        when _ then ()
-        end
       when Option::None then ()
       end
       return
@@ -5805,13 +5586,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       var capture_ids = Vec::new()
       match b.closure_captures.get(expr.node_id)
       when Option::Some(typed_caps) then
-        # P1: every capture is constructed with MirCopy below, even for
-        # Consume-effect captures — the move semantics live in the semantic
-        # layer, not in the MIR. A Consume capture should lower to a move of
-        # the source local (MirConsume) so the MIR itself represents the
-        # ownership transfer (documented P1; the checker already tracks the
-        # consumption).
-        for (cap_id, _cap_effect) in typed_caps do
+        for (cap_id, cap_effect) in typed_caps do
           # cap_id is a SEMANTIC local id; the capture operand reads the
           # OUTER function's MIR local — map through semantic_to_mir (the
           # counters diverge as soon as any earlier function allocated
@@ -5823,9 +5598,20 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
               captures.push(ml.name.clone())
               capture_types.push(ml.ty.clone())
               capture_ids.push(cap_id)
-              capture_ops.push(MirOperand {
-                kind: MirOperandKind::MirCopy(place_local(LocalId { id: mid }))
-              })
+              # A Consume capture MOVES the source local into the closure
+              # (MirConsume); everything else copies. The MIR itself now
+              # represents the ownership transfer — the semantic layer's
+              # consumption fact is no longer the only carrier.
+              match cap_effect
+              when AccessEffect::Consume then
+                capture_ops.push(MirOperand {
+                  kind: MirOperandKind::MirConsume(place_local(LocalId { id: mid }))
+                })
+              when _ then
+                capture_ops.push(MirOperand {
+                  kind: MirOperandKind::MirCopy(place_local(LocalId { id: mid }))
+                })
+              end
             when Option::None then
               b.errors.push("internal error: closure capture MIR local _" + mid.to_string() + " missing")
             end
