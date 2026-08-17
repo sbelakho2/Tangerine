@@ -198,7 +198,22 @@ def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
   when Type::Dyn(_)        then Repr::OpaquePtr
   when Type::Effect(_, _)  then Repr::OpaquePtr
   when Type::Tuple(_)      then Repr::Inline
-  when Type::Named(tid, _) then named_type_repr(engine, tid.id)
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of the builtin compound types (storage form).
+    # Mirrors the canonical arms above via the registered type name; the
+    # Adt form of Array carries no count, so its identity is the heap-vector
+    # (count 0) form. Anything else keeps the pre-existing named fallback.
+    let named_repr_name = lookup_type_name(engine, tid.id)
+    if named_repr_name == "Box" then Repr::RawPtr
+    elsif named_repr_name == "Rc" then Repr::RawPtr
+    elsif named_repr_name == "Slice" then Repr::HeapVecHeader
+    elsif named_repr_name == "Array" then Repr::HeapVecHeader
+    elsif named_repr_name == "Map" then Repr::HeapMapHeader
+    elsif named_repr_name == "Set" then Repr::HeapSetHeader
+    elsif named_repr_name == "Option" then Repr::OpaquePtr
+    elsif named_repr_name == "Result" then Repr::OpaquePtr
+    else named_type_repr(engine, tid.id)
+    end
   when Type::Var(_)        then Repr::OpaquePtr
   when Type::Param(_)      then Repr::OpaquePtr
   when Type::Error         then Repr::OpaquePtr
@@ -289,7 +304,15 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::Immediate then primitive_align(engine, ty)
   when Repr::Inline then
     match ty
-    when Type::Named(tid, _) then compute_type_layout(engine, tid.id).align
+    when Type::Named(tid, args) then
+      # P0-J2: Named Adt form of Array mirrors the canonical Array arm
+      # (element alignment); the count is unrepresentable in the Adt arg
+      # list, and the heap-vector identity never reaches the Inline case.
+      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+        repr_storage_align(engine, &args[0])
+      else
+        compute_type_layout(engine, tid.id).align
+      end
     when Type::Tuple(fields) then compute_tuple_layout(engine, fields).align
     when Type::Array(elem, _) then repr_storage_align(engine, elem)
     when _ then engine.target.pointer_align
@@ -318,8 +341,16 @@ end
 # during compute_all_layouts would silently report size 0) or of a tuple.
 def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
   match ty
-  when Type::Named(tid, _) then
-    compute_type_layout(engine, tid.id).size
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Array mirrors the canonical Array arm; the
+    # Adt form cannot carry the count, so the heap-vector (count 0) identity
+    # is the only possible mirror — size 0, which is unreachable in practice
+    # (type_repr maps the count-0 form to HeapVecHeader, never Inline).
+    if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+      inline_array_storage_size(engine, &args[0], 0)
+    else
+      compute_type_layout(engine, tid.id).size
+    end
   when Type::Tuple(fields) then
     compute_tuple_layout(engine, fields).size
   when Type::Array(elem, count) then
@@ -589,18 +620,24 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
     end
   when Repr::Inline then
     match ty
-    when Type::Named(tid, _) then
-      # Look up cached record
-      let tid_key = tid.id
-      match engine.records.get(&tid_key)
-      when Option::Some(rec) then
-        engine.cache_hits = engine.cache_hits + 1
-        rec.size
-      when Option::None then
-        engine.cache_misses = engine.cache_misses + 1
-        # Compute and cache
-        let rec = compute_type_layout(engine, tid_key)
-        rec.size
+    when Type::Named(tid, args) then
+      # P0-J2: Named Adt form of Array mirrors the canonical Array arm with
+      # the count unrepresentable (heap-vector count-0 identity only).
+      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+        inline_array_storage_size(engine, &args[0], 0)
+      else
+        # Look up cached record
+        let tid_key = tid.id
+        match engine.records.get(&tid_key)
+        when Option::Some(rec) then
+          engine.cache_hits = engine.cache_hits + 1
+          rec.size
+        when Option::None then
+          engine.cache_misses = engine.cache_misses + 1
+          # Compute and cache
+          let rec = compute_type_layout(engine, tid_key)
+          rec.size
+        end
       end
     when Type::Tuple(fields) then
       let tl = compute_tuple_layout(engine, fields)
@@ -636,11 +673,17 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
     when Type::Tuple(fields) then
       let tl = compute_tuple_layout(engine, fields)
       tl.align
-    when Type::Named(tid, _) then
-      let tid_key = tid.id
-      match engine.records.get(&tid_key)
-      when Option::Some(rec) then rec.align
-      when Option::None then engine.target.pointer_align
+    when Type::Named(tid, args) then
+      # P0-J2: Named Adt form of Array mirrors the canonical Array arm
+      # (element alignment); the count is unrepresentable in the Adt form.
+      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+        repr_storage_align(engine, &args[0])
+      else
+        let tid_key = tid.id
+        match engine.records.get(&tid_key)
+        when Option::Some(rec) then rec.align
+        when Option::None then engine.target.pointer_align
+        end
       end
     when Type::Array(elem, _) then
       repr_storage_align(engine, elem)
@@ -687,9 +730,24 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
   when Repr::Inline then
     match ty
     when Type::Tuple(fields) then tuple_layout(engine, fields)
-    when Type::Named(tid, _) then
-      let rec = compute_type_layout(engine, tid.id)
-      record_to_layout(&rec)
+    when Type::Named(tid, args) then
+      # P0-J2: Named Adt form of Array mirrors the canonical Array arm with
+      # the count unrepresentable (heap-vector count-0 identity only — the
+      # Inline case is unreachable for it, but the mirror stays exact).
+      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+        let sz = inline_array_storage_size(engine, &args[0], 0)
+        let al = repr_storage_align(engine, &args[0])
+        Layout {
+          size: sz,
+          align: al,
+          stride: layout_align_up(sz, al),
+          fields: Vec::new(),
+          enum_layout: Option::None
+        }
+      else
+        let rec = compute_type_layout(engine, tid.id)
+        record_to_layout(&rec)
+      end
     when Type::Array(elem, count) then
       let sz = inline_array_storage_size(engine, elem, count)
       let al = repr_storage_align(engine, elem)
@@ -761,61 +819,68 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
       actual: 0,
       context: "check_concrete_layout"
     })
-  when Type::Named(tid, _) then
-    if engine_has_type_def(engine, tid.id) then
-      let state = match engine.strict_states.get(&tid.id)
-      when Option::Some(s) then s
-      when Option::None then LayoutVisitState::Unvisited
-      end
-      match state
-      when LayoutVisitState::Visiting then
-        # Reached through inline storage only: infinitely sized recursive type.
-        Result::Err(LayoutError {
-          class: LayoutFailureClass::UNSUPPORTED_TYPE,
-          message: "Infinitely sized recursive type: reaches itself through inline storage without an indirection",
-          type_name: lookup_type_name(engine, tid.id),
-          expected: 0,
-          actual: 0,
-          context: "check_concrete_layout"
-        })
-      when LayoutVisitState::Resolved then
-        Result::Ok(())
-      when LayoutVisitState::Unvisited then
-        engine.strict_states.insert(tid.id, LayoutVisitState::Visiting)
-        # Prove every inline child of the definition recursively.
-        for td in engine.type_defs do
-          if td.id.id == tid.id then
-            match td.kind
-            when MirTypeDefKind::Struct(fields) then
-              for f in fields do
-                match check_concrete_layout(engine, &f.ty)
-                when Result::Err(e) then
-                  engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
-                  return Result::Err(e)
-                when Result::Ok(()) then ()
-                end
-              end
-            when MirTypeDefKind::Enum(variants) then
-              for v in variants do
-                for fty in v.fields do
-                  match check_concrete_layout(engine, fty)
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Array is the heap-vector identity (no count
+    # in the Adt arg list) — an opaque pointer-sized handle, concrete without
+    # inspecting the pointee, exactly like the canonical count-0 Array arm.
+    if lookup_type_name(engine, tid.id) == "Array" then
+      Result::Ok(())
+    else
+      if engine_has_type_def(engine, tid.id) then
+        let state = match engine.strict_states.get(&tid.id)
+        when Option::Some(s) then s
+        when Option::None then LayoutVisitState::Unvisited
+        end
+        match state
+        when LayoutVisitState::Visiting then
+          # Reached through inline storage only: infinitely sized recursive type.
+          Result::Err(LayoutError {
+            class: LayoutFailureClass::UNSUPPORTED_TYPE,
+            message: "Infinitely sized recursive type: reaches itself through inline storage without an indirection",
+            type_name: lookup_type_name(engine, tid.id),
+            expected: 0,
+            actual: 0,
+            context: "check_concrete_layout"
+          })
+        when LayoutVisitState::Resolved then
+          Result::Ok(())
+        when LayoutVisitState::Unvisited then
+          engine.strict_states.insert(tid.id, LayoutVisitState::Visiting)
+          # Prove every inline child of the definition recursively.
+          for td in engine.type_defs do
+            if td.id.id == tid.id then
+              match td.kind
+              when MirTypeDefKind::Struct(fields) then
+                for f in fields do
+                  match check_concrete_layout(engine, &f.ty)
                   when Result::Err(e) then
                     engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
                     return Result::Err(e)
                   when Result::Ok(()) then ()
                   end
                 end
+              when MirTypeDefKind::Enum(variants) then
+                for v in variants do
+                  for fty in v.fields do
+                    match check_concrete_layout(engine, fty)
+                    when Result::Err(e) then
+                      engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
+                      return Result::Err(e)
+                    when Result::Ok(()) then ()
+                    end
+                  end
+                end
               end
             end
           end
+          engine.strict_states.insert(tid.id, LayoutVisitState::Resolved)
+          Result::Ok(())
         end
-        engine.strict_states.insert(tid.id, LayoutVisitState::Resolved)
+      else
+        # Unregistered named type: opaque pointer-sized handle (generic
+        # parameter lowering emits TypeId{id:0}); its layout is the handle.
         Result::Ok(())
       end
-    else
-      # Unregistered named type: opaque pointer-sized handle (generic
-      # parameter lowering emits TypeId{id:0}); its layout is the handle.
-      Result::Ok(())
     end
   when Type::Tuple(fields) then
     # Inline aggregate: every element must be concrete.
@@ -1669,17 +1734,24 @@ end
 # Box/Rc, Slice, Option/Result/Map/Set, Function, String) are pointer-sized
 # opaque handles and are never followed; unregistered named types have no
 # definition to recurse into.
-def collect_inline_named_children(ty: &Type, out: &mut Vec[Int]) -> Unit
+def collect_inline_named_children(engine: &LayoutEngine, ty: &Type, out: &mut Vec[Int]) -> Unit
   match ty
-  when Type::Named(tid, _) then
-    out.push(tid.id)
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Array is the heap-vector identity (no count
+    # in the Adt arg list) — an indirection, never followed into inline
+    # children, exactly like the canonical count-0 Array arm.
+    if lookup_type_name(engine, tid.id) == "Array" then
+      ()
+    else
+      out.push(tid.id)
+    end
   when Type::Tuple(elems) then
     for e in elems do
-      collect_inline_named_children(e, out)
+      collect_inline_named_children(engine, e, out)
     end
   when Type::Array(elem, count) then
     if count > 0 then
-      collect_inline_named_children(elem, out)
+      collect_inline_named_children(engine, elem, out)
     end
   when _ then ()
   end
@@ -1708,12 +1780,12 @@ def check_inline_layout_cycles(engine: &mut LayoutEngine, type_id: Int) -> Unit
         match td.kind
         when MirTypeDefKind::Struct(fields) then
           for f in fields do
-            collect_inline_named_children(&f.ty, &mut children)
+            collect_inline_named_children(engine, &f.ty, &mut children)
           end
         when MirTypeDefKind::Enum(variants) then
           for v in variants do
             for fty in v.fields do
-              collect_inline_named_children(&fty, &mut children)
+              collect_inline_named_children(engine, &fty, &mut children)
             end
           end
         end

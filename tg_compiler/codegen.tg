@@ -19,7 +19,8 @@ use tg_compiler::layout_engine::{
   field_offset, field_size,
   discriminant_offset, discriminant_size, payload_offset,
   enum_variant_field_offsets, enum_variant_field_sizes,
-  layout_of_concrete
+  layout_of_concrete,
+  Repr, type_repr, repr_header_size, container_field_offset
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirBlock, MirLocal, MirStatic,
@@ -149,11 +150,13 @@ end
 
 # STRING ABI (FROZEN)
 # The by-value String ABI is FROZEN as an 8-byte raw pointer to a
-# null-terminated UTF-8 byte buffer. There is NO inline {ptr,len,cap}
-# header on String values. This MUST agree with layout_engine.string_abi_size()
-# and normalize_string_arg0_for_current_arch below. The 24-byte
-# {ptr,len,cap} shape is ONLY the internal char-Vec buffer produced by
-# str.chars(), never the String value ABI. Changing this is an ABI break.
+# null-terminated UTF-8 byte buffer — the Repr::StringPtr row of the engine's
+# P0-AR decision table (type_repr; repr_header_size(StringPtr) == 8). There
+# is NO inline {ptr,len,cap} header on String values. This MUST agree with
+# layout_engine.string_abi_size() and normalize_string_arg0_for_current_arch
+# below. The 24-byte {ptr,len,cap} shape is ONLY the internal char-Vec buffer
+# produced by str.chars(), never the String value ABI. Changing this is an
+# ABI break.
 
 def codegen_layout_target(arch: Arch) -> TargetDescriptor
   match arch
@@ -845,25 +848,35 @@ enum Extension
   None
 end
 
-# Storage width of a scalar type in memory (bytes).
-def storage_width_of(ty: &Type) -> MemWidth
-  match ty
-  when Type::Bool then MemWidth::W8
-  when Type::I8 then MemWidth::W8
-  when Type::U8 then MemWidth::W8
-  when Type::I16 then MemWidth::W16
-  when Type::U16 then MemWidth::W16
-  when Type::I32 then MemWidth::W32
-  when Type::U32 then MemWidth::W32
-  when Type::F32 then MemWidth::W32
-  when Type::Char then MemWidth::W32
-  when Type::I64 then MemWidth::W64
-  when Type::U64 then MemWidth::W64
-  when Type::Int then MemWidth::W64
-  when Type::UInt then MemWidth::W64
-  when Type::ISize then MemWidth::W64
-  when Type::USize then MemWidth::W64
-  when Type::F64 then MemWidth::W64
+# Storage width of a scalar type in memory (bytes).  The primitive widths are
+# intrinsic; EVERY non-immediate representation (StringPtr, heap headers,
+# inline aggregates, pointers, opaque handles) occupies a pointer-width slot —
+# exactly what the layout engine's repr_storage_size returns (pointer_size for
+# all of them). The former W64-for-compound fallback is now derived from the
+# Repr decision table through codegen_type_repr instead of being re-decided
+# here (P0-AR).
+def storage_width_of(ctx: &mut CodegenCtx, ty: &Type) -> MemWidth
+  match codegen_type_repr(ctx, ty)
+  when Repr::Immediate then
+    match ty
+    when Type::Bool then MemWidth::W8
+    when Type::I8 then MemWidth::W8
+    when Type::U8 then MemWidth::W8
+    when Type::I16 then MemWidth::W16
+    when Type::U16 then MemWidth::W16
+    when Type::I32 then MemWidth::W32
+    when Type::U32 then MemWidth::W32
+    when Type::F32 then MemWidth::W32
+    when Type::Char then MemWidth::W32
+    when Type::I64 then MemWidth::W64
+    when Type::U64 then MemWidth::W64
+    when Type::Int then MemWidth::W64
+    when Type::UInt then MemWidth::W64
+    when Type::ISize then MemWidth::W64
+    when Type::USize then MemWidth::W64
+    when Type::F64 then MemWidth::W64
+    when _ then MemWidth::W64
+    end
   when _ then MemWidth::W64
   end
 end
@@ -2099,14 +2112,22 @@ end
 
 # Get the TypeId from a local's type, returns -1 if not a Named type.
 # Extract the TypeId from a type, unwrapping through Ref/RefMut
-def extract_named_type_id(ty: &Type) -> Int
+def extract_named_type_id(ctx: &CodegenCtx, ty: &Type) -> Int
   match ty
-  when Type::Named(tid, _) then tid.id
-  when Type::RefInternal(inner, _) then extract_named_type_id(&inner)
-  when Type::Ptr(inner) then extract_named_type_id(&inner)
-  when Type::PtrMut(inner) then extract_named_type_id(&inner)
-  when Type::Box(inner) then extract_named_type_id(&inner)
-  when Type::Rc(inner) then extract_named_type_id(&inner)
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Rc mirrors the canonical unwrap arms
+    # (recurse through the Adt args); other Named types return their id.
+    let ent_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if (ent_named == "Box" || ent_named == "Rc") && !args.is_empty() then
+      extract_named_type_id(ctx, &args[0])
+    else
+      tid.id
+    end
+  when Type::RefInternal(inner, _) then extract_named_type_id(ctx, &inner)
+  when Type::Ptr(inner) then extract_named_type_id(ctx, &inner)
+  when Type::PtrMut(inner) then extract_named_type_id(ctx, &inner)
+  when Type::Box(inner) then extract_named_type_id(ctx, &inner)
+  when Type::Rc(inner) then extract_named_type_id(ctx, &inner)
   when _ then -1
   end
 end
@@ -2119,13 +2140,22 @@ def type_name_by_id(ctx: &CodegenCtx, type_id: Int) -> String
   end
 end
 
-def project_deref_type(ty: &Type) -> Type
+def project_deref_type(ctx: &CodegenCtx, ty: &Type) -> Type
   match ty
   when Type::RefInternal(inner, _) then inner.clone()
   when Type::Ptr(inner) then inner.clone()
   when Type::PtrMut(inner) then inner.clone()
   when Type::Box(inner) then inner.clone()
   when Type::Rc(inner) then inner.clone()
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Rc mirrors the canonical unwrap arms
+    # (pointee via the Adt args); anything else passes through unchanged.
+    let pdt_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if (pdt_named == "Box" || pdt_named == "Rc") && !args.is_empty() then
+      args[0].clone()
+    else
+      ty.clone()
+    end
   when other then other.clone()
   end
 end
@@ -2140,7 +2170,7 @@ end
 def emit_len_ref_derefs(ctx: &mut CodegenCtx, reg: PhysReg, ty: &Type) -> Unit
   var current_ty = ty.clone()
   while is_ref_like_type(&current_ty) do
-    let inner_ty = project_deref_type(&current_ty)
+    let inner_ty = project_deref_type(ctx, &current_ty)
     let value_ty = strip_receiver_ptr_like_type(&inner_ty)
     if is_heap_collection_type(ctx, &value_ty) || type_is_unit(&inner_ty) || type_is_unit(&value_ty) then
       emit_load_mem(ctx, reg, reg, 0)
@@ -2157,9 +2187,16 @@ def project_index_type(ctx: &CodegenCtx, ty: &Type) -> Type
   when Type::Slice(elem) then elem.clone()
   when Type::String then Type::Char
   when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Slice/Box/Rc mirrors the canonical arms
+    # (element via the Adt args / unwrap recurse); the pre-existing name
+    # chain keeps covering Vec/Array/Map/Set in their Named storage forms.
     let qualified = type_name_by_id(ctx, tid.id)
     let type_name = bare_name_from_qualified(qualified)
-    if (type_name == "Vec" || type_name == "Array") && !args.is_empty() then
+    if (type_name == "Slice") && !args.is_empty() then
+      args[0].clone()
+    else if (type_name == "Box" || type_name == "Rc") && !args.is_empty() then
+      project_index_type(ctx, &args[0])
+    else if (type_name == "Vec" || type_name == "Array") && !args.is_empty() then
       args[0].clone()
     else if (type_name == "Map" || type_name == "HashMap") && args.len() >= 2 then
       args[1].clone()
@@ -2181,24 +2218,31 @@ def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int
   match ty
   when Type::Tuple(elems) then
     if idx < elems.len() then elems[idx].clone() else Type::Unit end
-  when Type::Named(tid, _) then
-    match lookup_type_def(ctx, tid.id)
-    when Option::Some(td) then
-      match td.kind
-      when MirTypeDefKind::Struct(fields) then
-        if idx < fields.len() then
-          return fields[idx].ty.clone()
-        end
-      when MirTypeDefKind::Enum(variants) then
-        for variant in variants do
-          if variant.discriminant == downcast_disc && idx < variant.fields.len() then
-            return variant.fields[idx].clone()
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Rc mirrors the canonical unwrap arms
+    # (recurse through the Adt args); everything else keeps the def lookup.
+    let pft_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if (pft_named == "Box" || pft_named == "Rc") && !args.is_empty() then
+      project_field_type(ctx, &args[0], downcast_disc, idx)
+    else
+      match lookup_type_def(ctx, tid.id)
+      when Option::Some(td) then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          if idx < fields.len() then
+            return fields[idx].ty.clone()
+          end
+        when MirTypeDefKind::Enum(variants) then
+          for variant in variants do
+            if variant.discriminant == downcast_disc && idx < variant.fields.len() then
+              return variant.fields[idx].clone()
+            end
           end
         end
+      when Option::None then ()
       end
-    when Option::None then ()
+      Type::Unit
     end
-    Type::Unit
   when Type::RefInternal(inner, _) then project_field_type(ctx, inner, downcast_disc, idx)
   when Type::Ptr(inner) then project_field_type(ctx, inner, downcast_disc, idx)
   when Type::PtrMut(inner) then project_field_type(ctx, inner, downcast_disc, idx)
@@ -2209,7 +2253,7 @@ def project_field_type(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int
 end
 
 def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Int
-  let tid = extract_named_type_id(ty)
+  let tid = extract_named_type_id(ctx, ty)
   if tid >= 0 && downcast_disc >= 0 && is_enum_type_id(ctx, tid) then
     enum_field_offset_for_discriminant(ctx, tid, downcast_disc, idx)
   else if tid >= 0 then
@@ -2220,7 +2264,7 @@ def resolve_projected_field_offset(ctx: &CodegenCtx, ty: &Type, downcast_disc: I
 end
 
 def resolve_projected_field_size(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int, idx: Int) -> Int
-  let tid = extract_named_type_id(ty)
+  let tid = extract_named_type_id(ctx, ty)
   if tid >= 0 && downcast_disc >= 0 && is_enum_type_id(ctx, tid) then
     8
   else if tid >= 0 then
@@ -2230,15 +2274,15 @@ def resolve_projected_field_size(ctx: &CodegenCtx, ty: &Type, downcast_disc: Int
   end
 end
 
-def local_type_id(fctx: &FnCodegenCtx, local_id: Int) -> Int
+def local_type_id(ctx: &CodegenCtx, fctx: &FnCodegenCtx, local_id: Int) -> Int
   for local in fctx.func.locals do
     if local.id.id == local_id then
-      return extract_named_type_id(&local.ty)
+      return extract_named_type_id(ctx, &local.ty)
     end
   end
   for param in fctx.func.params do
     if param.id.id == local_id then
-      return extract_named_type_id(&param.ty)
+      return extract_named_type_id(ctx, &param.ty)
     end
   end
   -1
@@ -2264,7 +2308,7 @@ def place_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, place: &Place) -> Type
   for proj in place.projections do
     match proj
     when Projection::ProjDeref then
-      current_ty = project_deref_type(&current_ty)
+      current_ty = project_deref_type(ctx, &current_ty)
     when Projection::ProjDowncast(_, disc) then
       downcast_disc = disc
     when Projection::ProjField(_, idx) then
@@ -2282,11 +2326,11 @@ end
 
 def operand_type_id(ctx: &CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand) -> Int
   match op.kind
-  when MirOperandKind::MirCopy(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
-  when MirOperandKind::MirMovePlace(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
-  when MirOperandKind::MirRead(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
-  when MirOperandKind::MirConsume(place) then extract_named_type_id(&place_type(ctx, fctx, &place))
-  when MirOperandKind::MirConstant(cst) then extract_named_type_id(&cst.ty)
+  when MirOperandKind::MirCopy(place) then extract_named_type_id(ctx, &place_type(ctx, fctx, &place))
+  when MirOperandKind::MirMovePlace(place) then extract_named_type_id(ctx, &place_type(ctx, fctx, &place))
+  when MirOperandKind::MirRead(place) then extract_named_type_id(ctx, &place_type(ctx, fctx, &place))
+  when MirOperandKind::MirConsume(place) then extract_named_type_id(ctx, &place_type(ctx, fctx, &place))
+  when MirOperandKind::MirConstant(cst) then extract_named_type_id(ctx, &cst.ty)
   end
 end
 
@@ -2332,7 +2376,7 @@ def strip_receiver_ptr_like_type(ty: &Type) -> Type
   end
 end
 
-def is_string_like_type(ty: &Type) -> Bool
+def is_string_like_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::String then
     true
@@ -2343,29 +2387,99 @@ def is_string_like_type(ty: &Type) -> Bool
     when Type::U8 then true
     else false
     end
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Slice mirrors the canonical Slice arm
+    # (char/i8/u8 element via the Adt args).
+    let slt_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if slt_named == "Slice" && !args.is_empty() then
+      match strip_ref_like_type(&args[0])
+      when Type::Char then true
+      when Type::I8 then true
+      when Type::U8 then true
+      else false
+      end
+    else
+      false
+    end
   when _ then
     false
   end
 end
 
-def is_heap_collection_type(ctx: &CodegenCtx, ty: &Type) -> Bool
+# ———————————————————————————————————————————————————————————————
+# P0-AR consumption — the single representation accessor
+# ———————————————————————————————————————————————————————————————
+# The layout engine's Repr decision table (type_repr / repr_header_size /
+# container_field_offset) is the ONE authority on how a runtime value is
+# stored. Codegen NEVER re-decides a storage shape: every representation
+# question routes through codegen_type_repr, and heap-header knowledge comes
+# from repr_header_size / container_field_offset. The engine is a dependency
+# exactly like layout_of_strict: the calls below follow the same import
+# pattern (tg_compiler::layout_engine::{ ... }).
+def codegen_type_repr(ctx: &mut CodegenCtx, ty: &Type) -> Repr
+  type_repr(&ctx.layout_engine, ty)
+end
+
+# Heap-header sizes and field offsets, from the engine's F2 FROZEN table
+# (repr_header_size / container_field_offset). Only Vec/Map/Set headers are
+# ever touched here (StringPtr is a raw pointer with NO inline header — its
+# {ptr,len,cap} shape is only the internal char-Vec buffer of str.chars()).
+#
+# DISCREPANCY DOCUMENTED, NOT CHANGED (runtime-consistent values preserved):
+#   - repr_header_size says HeapMapHeader 48 ({buckets:0,len:8,cap:16,
+#     hash_fn:24}) and HeapSetHeader 32 ({map:0,len:8}).
+#   - The RUNTIME map/set header (runtime.tg, "Map layout") is a 24-byte
+#     {buckets:0, size:8, cap:16} for BOTH Map and Set (Set is map-backed).
+# Codegen never allocates or sizes map/set headers — it only reads the len
+# (and Vec cap) fields, whose offsets 8/16 AGREE between the frozen table
+# and the runtime — so the byte-identical behavior is preserved and the
+# disagreement is confined to the table. The `when _` fallback maps to the
+# Vec row so every legacy caller (which always read 8/16) keeps its exact
+# offset.
+def heap_header_field_offset(repr: Repr, field_name: &String) -> Int
+  let container_name = match repr
+  when Repr::HeapVecHeader then "Vec"
+  when Repr::HeapMapHeader then "Map"
+  when Repr::HeapSetHeader then "Set"
+  when Repr::StringPtr then "String"
+  when _ then "Vec"
+  end
+  container_field_offset(&container_name, field_name)
+end
+
+def is_heap_collection_type(ctx: &mut CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::Array(_, _) then
-    true
-  when Type::Slice(_) then
-    true
-  when Type::Map(_, _) then
-    true
-  when Type::Set(_) then
+    # Runtime-consistent override, preserved from the pre-Repr classifier:
+    # codegen and the runtime treat EVERY array value as a heap {ptr,len,cap}
+    # handle (array literals are built via _tg_array_new + pushes, and
+    # ProjIndex derefs the handle). The engine's table assigns fixed arrays
+    # Array[T, N>0] Repr::Inline — see the fixed-array note in layout_engine
+    # type_repr — but codegen's all-arrays-are-heap-handles behavior is kept
+    # (documented conflict, behavior unchanged).
     true
   when Type::Named(tid, _) then
-    let qualified = type_name_by_id(ctx, tid.id)
-    let type_name = bare_name_from_qualified(qualified)
-    type_name == "Vec" || type_name == "Array" ||
-    type_name == "Map" || type_name == "HashMap" ||
-    type_name == "Set" || type_name == "HashSet"
+    # P0-J2: Named Adt form of Array/Slice mirrors the canonical Array arm
+    # (every array/slice value is a heap {ptr,len,cap} handle); anything
+    # else keeps the pre-existing representation-based check.
+    let ihct_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if ihct_named == "Array" || ihct_named == "Slice" then
+      true
+    else
+      match codegen_type_repr(ctx, &strip_ref_like_type(ty))
+      when Repr::HeapVecHeader then true
+      when Repr::HeapMapHeader then true
+      when Repr::HeapSetHeader then true
+      when _ then false
+      end
+    end
   when _ then
-    false
+    match codegen_type_repr(ctx, &strip_ref_like_type(ty))
+    when Repr::HeapVecHeader then true
+    when Repr::HeapMapHeader then true
+    when Repr::HeapSetHeader then true
+    when _ then false
+    end
   end
 end
 
@@ -2377,7 +2491,7 @@ def deref_all_ref_like_args(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Ve
   var arg_ty = operand_type(ctx, fctx, &args[0])
   while is_ref_like_type(&arg_ty) do
     emit_load_mem(ctx, rr, rr, 0)
-    arg_ty = project_deref_type(&arg_ty)
+    arg_ty = project_deref_type(ctx, &arg_ty)
   end
 end
 
@@ -2504,8 +2618,9 @@ def maybe_load_string_data_ptr_disabled(ctx: &mut CodegenCtx, reg: PhysReg, data
 end
 
 def normalize_string_arg0_for_current_arch(ctx: &mut CodegenCtx) -> Unit
-  # String ABI (FROZEN) is raw pointer (8 bytes, null-terminated).
-  # No Vec header unwrapping needed — x0/rdi already holds the data pointer.
+  # String ABI (FROZEN) is a raw pointer (8 bytes, null-terminated) — the
+  # Repr::StringPtr row of the engine's decision table. No Vec header
+  # unwrapping needed — x0/rdi already holds the data pointer.
   # This must match layout_engine.string_abi_size()/string_abi_is_raw_pointer().
   ()
 end
@@ -2789,24 +2904,30 @@ def projection_is_field(proj: &Projection) -> Bool
 end
 
 # Storage size of a scalar type in bytes (1/2/4/8), matching storage_width_of.
-def storage_size_bytes(ty: &Type) -> Int
-  match ty
-  when Type::Bool then 1
-  when Type::I8 then 1
-  when Type::U8 then 1
-  when Type::I16 then 2
-  when Type::U16 then 2
-  when Type::I32 then 4
-  when Type::U32 then 4
-  when Type::F32 then 4
-  when Type::Char then 4
-  when Type::I64 then 8
-  when Type::U64 then 8
-  when Type::Int then 8
-  when Type::UInt then 8
-  when Type::ISize then 8
-  when Type::USize then 8
-  when Type::F64 then 8
+# Non-immediate representations are pointer-width (8), again via the Repr
+# decision table (P0-AR) — the byte-count mirror of storage_width_of.
+def storage_size_bytes(ctx: &mut CodegenCtx, ty: &Type) -> Int
+  match codegen_type_repr(ctx, ty)
+  when Repr::Immediate then
+    match ty
+    when Type::Bool then 1
+    when Type::I8 then 1
+    when Type::U8 then 1
+    when Type::I16 then 2
+    when Type::U16 then 2
+    when Type::I32 then 4
+    when Type::U32 then 4
+    when Type::F32 then 4
+    when Type::Char then 4
+    when Type::I64 then 8
+    when Type::U64 then 8
+    when Type::Int then 8
+    when Type::UInt then 8
+    when Type::ISize then 8
+    when Type::USize then 8
+    when Type::F64 then 8
+    when _ then 8
+    end
   when _ then 8
   end
 end
@@ -2830,18 +2951,18 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
     when _ then
       if is_ref_like_type(&current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
-        current_ty = project_deref_type(&current_ty)
+        current_ty = project_deref_type(ctx, &current_ty)
       end
     end
     match proj
     when Projection::ProjDeref then
       last_deref_unwrapped_ref = is_ref_like_type(&current_ty)
       emit_load_mem(ctx, reg, reg, 0)
-      current_ty = project_deref_type(&current_ty)
+      current_ty = project_deref_type(ctx, &current_ty)
     when Projection::ProjField(name, idx) then
       let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
       let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
-      let fwidth = storage_width_of(&field_ty)
+      let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
       emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
       current_ty = field_ty
@@ -2849,7 +2970,7 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
     when Projection::ProjFieldIndex(idx) then
       let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
       let field_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
-      let fwidth = storage_width_of(&field_ty)
+      let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
       emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
       current_ty = field_ty
@@ -2862,8 +2983,8 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
       # Determine element size from the collection type.
       let elem_ty = project_index_type(ctx, &current_ty)
-      let elem_size = storage_size_bytes(&elem_ty)
-      let is_byte_indexed = is_string_like_type(&current_ty)
+      let elem_size = storage_size_bytes(ctx, &elem_ty)
+      let is_byte_indexed = is_string_like_type(ctx, &current_ty)
       if !is_byte_indexed && elem_size != 8 then
         # Scale index by the actual element storage size.
         match elem_size
@@ -2898,7 +3019,7 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
         when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
         end
       else
-        let ewidth = storage_width_of(&elem_ty)
+        let ewidth = storage_width_of(ctx, &elem_ty)
         let eext = storage_signedness_of(&elem_ty)
         emit_load_mem_sized(ctx, reg, reg, 0, ewidth, eext)
       end
@@ -2908,9 +3029,9 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
       if is_heap_collection_type(ctx, &current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
       end
-      let is_byte_indexed = is_string_like_type(&current_ty)
+      let is_byte_indexed = is_string_like_type(ctx, &current_ty)
       let elem_ty2 = project_index_type(ctx, &current_ty)
-      let elem_size2 = storage_size_bytes(&elem_ty2)
+      let elem_size2 = storage_size_bytes(ctx, &elem_ty2)
       if is_byte_indexed then
         emit_add_ri(ctx, reg, ci as i32)
         match reg
@@ -2919,7 +3040,7 @@ def apply_projections(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, 
         end
       else
         let offset = ci * elem_size2
-        let ewidth2 = storage_width_of(&elem_ty2)
+        let ewidth2 = storage_width_of(ctx, &elem_ty2)
         let eext2 = storage_signedness_of(&elem_ty2)
         emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
       end
@@ -3050,13 +3171,13 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
         when _ then
           if is_ref_like_type(&current_ty) then
             emit_load_mem(ctx, base, base, 0)
-            current_ty = project_deref_type(&current_ty)
+            current_ty = project_deref_type(ctx, &current_ty)
           end
         end
         match proj
         when Projection::ProjDeref then
           emit_load_mem(ctx, base, base, 0)
-          current_ty = project_deref_type(&current_ty)
+          current_ty = project_deref_type(ctx, &current_ty)
         when Projection::ProjField(_, idx) then
           let field_off = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
           emit_add_ri(ctx, base, field_off as i32)
@@ -3091,7 +3212,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
           load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
           # Scale the index by the element's real storage stride.
           let sidx_elem_ty = project_index_type(ctx, &current_ty)
-          let sidx_stride = storage_size_bytes(&sidx_elem_ty)
+          let sidx_stride = storage_size_bytes(ctx, &sidx_elem_ty)
           match sidx_stride
           when 1 then ()
           when 2 then
@@ -3118,7 +3239,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
             emit_load_mem(ctx, base, base, 0)
           end
           let cidx_elem_ty = project_index_type(ctx, &current_ty)
-          let cidx_stride = storage_size_bytes(&cidx_elem_ty)
+          let cidx_stride = storage_size_bytes(ctx, &cidx_elem_ty)
           emit_add_ri(ctx, base, (ci * cidx_stride) as i32)
           emit_load_mem(ctx, base, base, 0)
           current_ty = project_index_type(ctx, &current_ty)
@@ -3136,7 +3257,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       when _ then
         if is_ref_like_type(&current_ty) then
           emit_load_mem(ctx, base, base, 0)
-          current_ty = project_deref_type(&current_ty)
+          current_ty = project_deref_type(ctx, &current_ty)
         end
       end
       match last
@@ -3154,7 +3275,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
         end
         load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, scratch)
         let idx_elem_ty = project_index_type(ctx, &current_ty)
-        let idx_elem_size = storage_size_bytes(&idx_elem_ty)
+        let idx_elem_size = storage_size_bytes(ctx, &idx_elem_ty)
         match idx_elem_size
         when 1 then ()
         when 2 then
@@ -3181,7 +3302,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
           emit_load_mem(ctx, base, base, 0)
         end
         let celem_ty = project_index_type(ctx, &current_ty)
-        store_off = (ci * storage_size_bytes(&celem_ty)) as i32
+        store_off = (ci * storage_size_bytes(ctx, &celem_ty)) as i32
         current_ty = celem_ty
       when Projection::ProjDowncast(_, _) then
         store_off = 8
@@ -3193,7 +3314,7 @@ def store_place(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, place: &Place, src: P
       emit_pop(ctx, src)  # restore value
       # Store exactly the final projected value's storage width so a narrow
       # field/element is never overwritten by an 8-byte write.
-      let final_store_width = storage_width_of(&current_ty)
+      let final_store_width = storage_width_of(ctx, &current_ty)
       emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
     end
   when Option::None then
@@ -3327,14 +3448,17 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
       let len_ty = place_type(ctx, fctx, place)
       emit_len_ref_derefs(ctx, dst, &len_ty)
       let len_value_ty = strip_receiver_ptr_like_type(&len_ty)
+      # The len field lives in the heap header — a valid header read only for
+      # HeapVecHeader/HeapMapHeader/HeapSetHeader representations (offset from
+      # the engine's container_field_offset). Behavior unchanged.
       if is_heap_collection_type(ctx, &len_value_ty) then
         let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
         emit_test_rr(ctx, dst, dst)
         emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
-        emit_load_mem(ctx, dst, dst, 8)
+        emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
         def_label(&mut ctx.text, lbl_len_done)
       else
-        emit_load_mem(ctx, dst, dst, 8)
+        emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
       end
 
     when MirRvalueKind::MirCast(cast_kind, operand, target_ty) then
@@ -3473,8 +3597,8 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
     end
     # Store element for each repetition at dst + i * element_size
     let repeat_ty = operand_type(ctx, fctx, &operand)
-    let repeat_width = storage_width_of(&repeat_ty)
-    let repeat_stride = storage_size_bytes(&repeat_ty)
+    let repeat_width = storage_width_of(ctx, &repeat_ty)
+    let repeat_stride = storage_size_bytes(ctx, &repeat_ty)
     var i: UInt = 0
     while i < count do
       emit_store_mem_sized(ctx, dst, (i as Int * repeat_stride) as i32, scratch, repeat_width)
@@ -3673,12 +3797,12 @@ def codegen_binop(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: MirBinOp, left:
   let right_ty = operand_type(ctx, fctx, right)
   let left_is_string =
     is_string_operand(left, fctx) ||
-    is_string_like_type(&left_ty) ||
-    is_string_like_type(&strip_ref_like_type(&left_ty))
+    is_string_like_type(ctx, &left_ty) ||
+    is_string_like_type(ctx, &strip_ref_like_type(&left_ty))
   let right_is_string =
     is_string_operand(right, fctx) ||
-    is_string_like_type(&right_ty) ||
-    is_string_like_type(&strip_ref_like_type(&right_ty))
+    is_string_like_type(ctx, &right_ty) ||
+    is_string_like_type(ctx, &strip_ref_like_type(&right_ty))
   let enum_type_id = enum_type_id_for_operands(ctx, fctx, left, right)
 
   if is_float then
@@ -3956,7 +4080,7 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
       when _ then
         if is_ref_like_type(&current_ty) then
           emit_load_mem(ctx, dst, dst, 0)
-          current_ty = project_deref_type(&current_ty)
+          current_ty = project_deref_type(ctx, &current_ty)
         end
       end
       match proj
@@ -3964,7 +4088,7 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         if !is_last then
           emit_load_mem(ctx, dst, dst, 0)
         end
-        current_ty = project_deref_type(&current_ty)
+        current_ty = project_deref_type(ctx, &current_ty)
       when Projection::ProjField(name, idx) then
         let offset = resolve_projected_field_offset(ctx, &current_ty, downcast_disc, idx)
         if is_last then
@@ -3986,7 +4110,7 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         end
         current_ty = project_field_type(ctx, &current_ty, downcast_disc, idx)
       when Projection::ProjIndex(local_id) then
-        let is_byte_indexed = is_string_like_type(&current_ty)
+        let is_byte_indexed = is_string_like_type(ctx, &current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
           emit_load_mem(ctx, dst, dst, 0)
         end
@@ -3995,7 +4119,7 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         if !is_byte_indexed then
           # Scale the index by the element's real storage stride (1/2/4/8).
           let elem_ty = project_index_type(ctx, &current_ty)
-          let elem_stride = storage_size_bytes(&elem_ty)
+          let elem_stride = storage_size_bytes(ctx, &elem_ty)
           match elem_stride
           when 1 then ()
           when 2 then
@@ -4028,12 +4152,12 @@ def emit_place_address(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Pl
         end
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::ProjConstantIndex(ci) then
-        let is_byte_indexed = is_string_like_type(&current_ty)
+        let is_byte_indexed = is_string_like_type(ctx, &current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
           emit_load_mem(ctx, dst, dst, 0)
         end
         let ci_elem_ty = project_index_type(ctx, &current_ty)
-        let ci_stride = storage_size_bytes(&ci_elem_ty)
+        let ci_stride = storage_size_bytes(ctx, &ci_elem_ty)
         let offset = if is_byte_indexed then ci else ci * ci_stride end
         if is_last then
           if offset != 0 then
@@ -4142,7 +4266,7 @@ def emit_load_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place
     emit_place_address(ctx, fctx, place, dst)
     # Load exactly the final projected value's storage width.
     let pty = place_type(ctx, fctx, place)
-    let pwidth = storage_width_of(&pty)
+    let pwidth = storage_width_of(ctx, &pty)
     let pext = storage_signedness_of(&pty)
     emit_load_mem_sized(ctx, dst, dst, 0, pwidth, pext)
   end
@@ -4177,7 +4301,7 @@ def emit_store_place(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Plac
     emit_pop(ctx, src)
     # Store exactly the place's final storage width.
     let pty = place_type(ctx, fctx, place)
-    let pwidth = storage_width_of(&pty)
+    let pwidth = storage_width_of(ctx, &pty)
     emit_store_mem_sized(ctx, base, 0, src, pwidth)
   end
 end
@@ -4347,7 +4471,7 @@ def codegen_aggregate(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, kind: &Aggr
     # Store exactly the field's storage width so adjacent narrow fields are not
     # corrupted by an 8-byte write.
     let field_ty = operand_type(ctx, fctx, &operands[i])
-    let field_width = storage_width_of(&field_ty)
+    let field_width = storage_width_of(ctx, &field_ty)
     emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
     i = i + 1
   end
@@ -4403,16 +4527,19 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
       let len_ty = place_type(ctx, fctx, len_place)
       emit_len_ref_derefs(ctx, rr, &len_ty)
       let len_value_ty = strip_receiver_ptr_like_type(&len_ty)
+      # The len field lives in the heap header — a valid header read only for
+      # HeapVecHeader/HeapMapHeader/HeapSetHeader representations (offset from
+      # the engine's container_field_offset). Behavior unchanged.
       if is_heap_collection_type(ctx, &len_value_ty) then
         # Null collection pointers represent empty values in native bootstrap
         # paths; avoid dereferencing [0 + 8] and keep zero length.
         let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
         emit_test_rr(ctx, rr, rr)
         emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
-        emit_load_mem(ctx, rr, rr, 8)
+        emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
         def_label(&mut ctx.text, lbl_len_done)
       else
-        emit_load_mem(ctx, rr, rr, 8)
+        emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
       end
 
     when MirRvalueKind::MirCast(cast_kind, ref operand, ref target_ty) then
@@ -4463,8 +4590,8 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
       let scratch = ret_reg(ctx.target.arch)
       load_operand_rvalue_item(ctx, fctx, operand, scratch)
       let rpty = operand_type(ctx, fctx, operand)
-      let rpwidth = storage_width_of(&rpty)
-      let rpstride = storage_size_bytes(&rpty)
+      let rpwidth = storage_width_of(ctx, &rpty)
+      let rpstride = storage_size_bytes(ctx, &rpty)
       var i: UInt = 0
       while i < count do
         emit_store_mem_sized(ctx, rr, (i as Int * rpstride) as i32, scratch, rpwidth)
@@ -4632,9 +4759,10 @@ end
 #   - that local has a stable stack home the callee can write into.
 # This consolidates the former inline condition in codegen_call so there is
 # exactly ONE place where the sret policy is decided. Behavior is unchanged.
-# Register-argument classification is deliberately NOT part of this function;
-# aligning argument conventions with layout_engine's ValueAbi is a separate
-# follow-up (P0-AU, argument side).
+# classify_argument (AbiArg) is the paired authority on the ARGUMENT side of
+# the ABI: the two functions together (classify_return + classify_argument)
+# are the single classify pair that decides how every value crosses the call
+# boundary.
 def classify_return(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, ty: &Type) -> AbiReturn
   let dest_sz = layout_of_strict(&mut ctx.layout_engine, ty).size
   if dest_sz > 8 && dest.projections.is_empty() then
@@ -4653,6 +4781,53 @@ def classify_return(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, dest: &Place, ty:
     end
   end
   AbiReturn::Direct
+end
+
+# ———————————————————————————————————————————————————————————————
+# ABI classification — arguments (P0-AU)
+# ———————————————————————————————————————————————————————————————
+# How a function ARGUMENT is delivered to the callee.
+enum AbiArg
+  Register(Int)  # in ABI argument register <index> (x0..x7 / rdi..r9)
+  Stack(Int)     # pushed on the caller's stack (index >= register count)
+  Indirect       # aggregate wider than one register — passed BY REFERENCE
+                 # (the caller loads the place ADDRESS, never the contents)
+end
+
+# SINGLE authority for the argument-passing convention, mirroring the
+# argument placement the call lowering and the prologue have always used:
+#   - an argument at index < max_reg_args(arch) travels in arg_reg(arch,
+#     index) (x0..x7 on AArch64, rdi..r9 on x86-64);
+#   - an argument at index >= max_reg_args(arch) is pushed on the stack
+#     (caller-pops cleanup in codegen_call);
+#   - an aggregate wider than one register (> 8 bytes) is classified
+#     Indirect: the MIR lowering emits aggregate args as MirCallValue::Place,
+#     so the existing code passes the place ADDRESS through the same
+#     register/stack slot a scalar of that index would use. classify_argument
+#     documents that by-reference convention; the slot itself still follows
+#     the index rule above, so behavior is byte-identical.
+# Together with classify_return (the sret side), this is the review's single
+# classify_argument/classify_return pair — the two ABI authorities. Every
+# argument-placement decision in codegen (call lowering, prologue binding)
+# consults this function; nobody re-decides register/stack/indirect inline.
+def classify_argument(ctx: &mut CodegenCtx, ty: &Type, index: Int) -> AbiArg
+  let dest_sz = layout_of_strict(&mut ctx.layout_engine, ty).size
+  if dest_sz > 8 then
+    AbiArg::Indirect
+  else if index < max_reg_args(ctx.target.arch) then
+    AbiArg::Register(index)
+  else
+    AbiArg::Stack(index)
+  end
+end
+
+# The static type of a call argument (Place args are passed by reference —
+# the ADDRESS is the value that crosses the boundary).
+def mir_call_arg_type(ctx: &CodegenCtx, fctx: &FnCodegenCtx, arg: &MirCallArg) -> Type
+  match arg.value
+  when MirCallValue::Value(op) then operand_type(ctx, fctx, &op)
+  when MirCallValue::Place(p) then place_type(ctx, fctx, &p)
+  end
 end
 
 # Position of the `$` that separates a monomorphized instance name's base
@@ -4704,6 +4879,12 @@ end
 #      the BASE of a monomorphized generic (a `$`-suffixed instance of it
 #      exists), the call site was never rewritten to an instance name — a
 #      monomorphization-identity leak, reported as such.
+# P0-AM: the call references arriving here are the DefId-derived emission
+# names (MirFnItem names from the call's InstanceId, matching the callee's
+# MirFunction.name), so the identity entry resolves them directly. The
+# name-based paths that remain are the linking boundary (extern symbols,
+# intrinsic names, the OS-entry "main"/"_start") and the "Type__method"
+# method names — all emitted under those exact names, all resolvable here.
 def resolve_callee_label(ctx: &CodegenCtx, name: &String) -> String
   match ctx.fn_alias.get(name)
   when Option::Some(label) then label.clone()
@@ -4760,18 +4941,34 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
 
   # Place arguments in reverse order. Loading a projected operand may use x0/rax
   # as scratch, so left-to-right loading can clobber an already prepared arg0.
+  # The register/stack/indirect decision for every argument is the single
+  # authority classify_argument (AbiArg) — the ABI half of the review's
+  # classify_argument/classify_return pair. An Indirect aggregate (> 8 bytes)
+  # is passed by reference: its ADDRESS travels in the same slot a scalar of
+  # this index would use (arg_reg is Some exactly while index < max_ra, so
+  # the Some/None test below IS the register-count rule).
   let total_args = args.len()
   var arg_idx = total_args
   while arg_idx > 0 do
     arg_idx = arg_idx - 1
     let arg = args[arg_idx]
-    if arg_idx < max_ra then
+    let arg_ty = mir_call_arg_type(ctx, fctx, &arg)
+    match classify_argument(ctx, &arg_ty, arg_idx)
+    when AbiArg::Register(_) then
       match arg_reg(arch, arg_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then ()
       end
-    else
+    when AbiArg::Indirect then
+      match arg_reg(arch, arg_idx)
+      when Option::Some(abi_r) then
+        load_call_arg_value(ctx, fctx, arg, abi_r)
+      when Option::None then
+        load_call_arg_value(ctx, fctx, arg, scratch)
+        emit_push(ctx, scratch)
+      end
+    when AbiArg::Stack(_) then
       load_call_arg_value(ctx, fctx, arg, scratch)
       emit_push(ctx, scratch)
     end
@@ -5103,7 +5300,7 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
       # Element stride: the same computation the ProjIndex emitter uses.
       let arr_ty = place_type(ctx, fctx, place)
       let elem_ty = project_index_type(ctx, &arr_ty)
-      let elem_stride = storage_size_bytes(&elem_ty)
+      let elem_stride = storage_size_bytes(ctx, &elem_ty)
       let fp = fp_reg(ctx.target.arch)
       let r10 = PhysReg::A64Reg(A64::X10)
       let r11 = PhysReg::A64Reg(A64::X11)
@@ -5118,14 +5315,17 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
       fctx.frame.spill_offset = data_off
       let elem_off = fctx.frame.spill_offset - 8
       fctx.frame.spill_offset = elem_off
-      # The array VALUE is the heap handle to the 24-byte header
-      # {data, len, cap} (MirLen reads the same way).
+      # The array VALUE is the heap handle to the HeapVecHeader (size from
+      # the engine's repr_header_size — 24 bytes — with {data,len,cap} field
+      # offsets from container_field_offset; MirLen reads the same way).
+      let hdr_data_off = heap_header_field_offset(Repr::HeapVecHeader, &"data".to_string()) as i32
+      let hdr_len_off = heap_header_field_offset(Repr::HeapVecHeader, &"len".to_string()) as i32
       load_place(ctx, fctx, place, r10)
       emit_store_mem(ctx, fp, hdr_off, r10)
-      emit_load_mem(ctx, r11, r10, 8)   # len
+      emit_load_mem(ctx, r11, r10, hdr_len_off)   # len
       emit_sub_ri(ctx, r11, 1)          # idx = len - 1
       emit_store_mem(ctx, fp, idx_off, r11)
-      emit_load_mem(ctx, r12, r10, 0)   # data pointer
+      emit_load_mem(ctx, r12, r10, hdr_data_off)   # data pointer
       emit_store_mem(ctx, fp, data_off, r12)
       let elem_place = codegen_glue_place_at_slot(ctx, fctx, elem_off)
       let lbl_arr_loop = next_codegen_label(ctx, ".Lglue_arr_loop.")
@@ -5446,7 +5646,7 @@ end
 def resolve_intrinsic_id(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: &String, args: &Vec[MirOperand], orig_fn_name: &String) -> IntrinsicId
   let receiver_ty = if args.len() > 0 then strip_ref_like_type(&operand_type(ctx, fctx, &args[0])) else Type::Unit end
   let receiver_is_string = if args.len() > 0 then is_string_operand(&args[0], fctx) else false end
-  let receiver_is_string_like = if args.len() > 0 then is_string_like_type(&operand_type(ctx, fctx, &args[0])) else false end
+  let receiver_is_string_like = if args.len() > 0 then is_string_like_type(ctx, &operand_type(ctx, fctx, &args[0])) else false end
   let needle_ty = if args.len() > 1 then operand_type(ctx, fctx, &args[1]) else Type::Unit end
   let needle_value_ty = strip_ref_like_type(&needle_ty)
   let needle_is_ref = match needle_ty
@@ -5455,7 +5655,7 @@ def resolve_intrinsic_id(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: &Strin
     end
   let needle_is_string = if args.len() > 1 then is_string_operand(&args[1], fctx) else false end
   let needle_is_string_like = if args.len() > 1 then
-    is_string_like_type(&needle_ty) || is_string_like_type(&needle_value_ty)
+    is_string_like_type(ctx, &needle_ty) || is_string_like_type(ctx, &needle_value_ty)
   else
     false
   end
@@ -5469,12 +5669,26 @@ def resolve_intrinsic_id(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: &Strin
   if name == "entries" then
     match receiver_ty
     when Type::Set(_) then return IntrinsicId::SetEntries
+    when Type::Named(ri_tid, _) then
+      # P0-J2: Named Adt form of Set mirrors the canonical Set arm; the
+      # fallback mirrors the canonical `when _` arm (Map entries).
+      let ri_named = bare_name_from_qualified(type_name_by_id(ctx, ri_tid.id))
+      if ri_named == "Set" then return IntrinsicId::SetEntries
+      else return IntrinsicId::MapEntries
+      end
     when _ then return IntrinsicId::MapEntries
     end
   end
   if name == "drain_one" then
     match receiver_ty
     when Type::Set(_) then return IntrinsicId::SetDrainOne
+    when Type::Named(ri_tid, _) then
+      # P0-J2: Named Adt form of Set mirrors the canonical Set arm; the
+      # fallback mirrors the canonical `when _` arm (Map drain).
+      let ri_named = bare_name_from_qualified(type_name_by_id(ctx, ri_tid.id))
+      if ri_named == "Set" then return IntrinsicId::SetDrainOne
+      else return IntrinsicId::MapDrainOne
+      end
     when _ then return IntrinsicId::MapDrainOne
     end
   end
@@ -5483,6 +5697,15 @@ def resolve_intrinsic_id(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: &Strin
     when Type::String then return IntrinsicId::StringContains
     when Type::Map(_, _) then return IntrinsicId::MapContains
     when Type::Set(_) then return IntrinsicId::SetContains
+    when Type::Named(ri_tid, _) then
+      # P0-J2: Named Adt form of Map/Set mirrors the canonical arms; the
+      # fallback mirrors the canonical `when _` arm (fall into the
+      # string/array-contains classification below).
+      let ri_named = bare_name_from_qualified(type_name_by_id(ctx, ri_tid.id))
+      if ri_named == "Map" then return IntrinsicId::MapContains
+      elsif ri_named == "Set" then return IntrinsicId::SetContains
+      else ()
+      end
     when _ then ()
     end
     if orig_is_string_contains || receiver_is_string || receiver_is_string_like then
@@ -5732,7 +5955,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_call_label(ctx, "_tg_read_file_to_string")
   when IntrinsicId::SetIsEmpty then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_is_empty(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_is_empty(ctx, &recv_ty)
   when IntrinsicId::MapPush then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_insert(ctx)
@@ -5754,7 +5978,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_array_new(ctx)
   when IntrinsicId::ArrayLen then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_len(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_len(ctx, &recv_ty)
   when IntrinsicId::ArrayGet then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_get(ctx)
@@ -5814,7 +6039,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
     let is_string_receiver =
-      is_string_like_type(&value_ty) ||
+      is_string_like_type(ctx, &value_ty) ||
       orig_fn_name == "String__as_ptr" ||
       orig_fn_name == "String__as_str" ||
       orig_fn_name == "__intrinsic_string_as_ptr" ||
@@ -5849,9 +6074,10 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       orig_fn_name == "__intrinsic_array_len" ||
       orig_fn_name == "array_len"
     if is_collection_receiver then
-      # Vec/Map/Set/Slice — len is stored at offset 8 of the heap header
+      # Vec/Map/Set/Slice — len is stored in the heap header (offset from the
+      # engine's container_field_offset, see codegen_array_len)
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
-      codegen_array_len(ctx)
+      codegen_array_len(ctx, &value_ty)
     elsif is_pure_string then
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       codegen_strlen(ctx)
@@ -5871,7 +6097,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
-      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(ctx, &arg0_value_ty) then
         deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       end
     end
@@ -5880,7 +6106,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
-      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(ctx, &arg0_value_ty) then
         deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       end
     end
@@ -5889,7 +6115,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     if args.len() > 0 then
       let arg0_ty = operand_type(ctx, fctx, &args[0])
       let arg0_value_ty = strip_receiver_ptr_like_type(&arg0_ty)
-      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(&arg0_value_ty) then
+      if is_receiver_ptr_like_type(&arg0_ty) && is_string_like_type(ctx, &arg0_value_ty) then
         deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       end
     end
@@ -5910,7 +6136,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   # runtime helper.
   when IntrinsicId::ArrayCap then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_cap(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_cap(ctx, &recv_ty)
   when IntrinsicId::ArrayRemove then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_remove(ctx)
@@ -5919,7 +6146,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_array_insert(ctx)
   when IntrinsicId::ArrayClear then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_clear(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_clear(ctx, &recv_ty)
   when IntrinsicId::ArrayDestroy then
     match ctx.target.arch
     when Arch::X86_64 then panic("array_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
@@ -5933,13 +6161,16 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_array_contains(ctx)
   when IntrinsicId::ArrayLast then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_last(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_last(ctx, &recv_ty)
   when IntrinsicId::ArrayFirst then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_first(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_first(ctx, &recv_ty)
   when IntrinsicId::ArrayIsEmpty then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_is_empty(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_is_empty(ctx, &recv_ty)
   when IntrinsicId::ArrayReverse then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_reverse(ctx)
@@ -5952,7 +6183,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_array_extend(ctx)
   when IntrinsicId::ArrayTruncate then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_truncate(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_truncate(ctx, &recv_ty)
   when IntrinsicId::ArrayResize then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_resize(ctx)
@@ -5977,7 +6209,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_map_contains(ctx)
   when IntrinsicId::MapLen then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_map_len(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_map_len(ctx, &recv_ty)
   when IntrinsicId::MapClone then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_map_clone(ctx)
@@ -6026,7 +6259,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     codegen_set_remove(ctx)
   when IntrinsicId::SetLen then
     emit_load_mem(ctx, rr, rr, 0)
-    codegen_set_len(ctx)
+    let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_set_len(ctx, &recv_ty)
   when IntrinsicId::SetClone then
     emit_load_mem(ctx, rr, rr, 0)
     codegen_set_clone(ctx)
@@ -6144,7 +6378,7 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
   when IntrinsicId::Bytes then
     let arg_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let value_ty = strip_receiver_ptr_like_type(&arg_ty)
-    if is_string_like_type(&value_ty) then
+    if is_string_like_type(ctx, &value_ty) then
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
     else
       deref_all_ref_like_args(ctx, fctx, args, rr)
@@ -6509,6 +6743,28 @@ def emit_stack_probe(ctx: &mut CodegenCtx, sp: PhysReg, frame_size: Int) -> Unit
   end
 end
 
+# Bind one parameter from its ABI argument register into its assigned home
+# (register, stack slot, or spill slot). Used by the prologue for both
+# AbiArg::Register params and AbiArg::Indirect by-reference aggregates (the
+# caller delivered the aggregate's ADDRESS in the ABI register; the param
+# home stores that address and the value is reached through projections).
+def prologue_bind_param_from_abi_reg(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, fp: PhysReg, param: &MirLocal, abi_r: PhysReg) -> Unit
+  match fctx.var_locs.get(param.id.id)
+  when Option::Some(loc) then
+    match loc
+    when VarLoc::Register(target_r) then
+      if phys_reg_id(abi_r) != phys_reg_id(target_r) then
+        emit_mov_rr(ctx, target_r, abi_r)
+      end
+    when VarLoc::Stack(off) then
+      emit_store_mem(ctx, fp, off, abi_r)
+    when VarLoc::Spilled(off) then
+      emit_store_mem(ctx, fp, off, abi_r)
+    end
+  when _ then ()
+  end
+end
+
 def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   let arch = ctx.target.arch
   let fp = fp_reg(arch)
@@ -6577,8 +6833,13 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
     end
   end
 
-  # Move register-assigned params from ABI regs to their assigned regs
-  let max_ra = max_reg_args(arch)
+  # Move register-assigned params from ABI regs to their assigned regs.
+  # Where each parameter arrives is decided by the single authority
+  # classify_argument (AbiArg): Register params and Indirect by-reference
+  # aggregates both arrive in arg_reg(arch, idx) (Some exactly while
+  # idx < max_ra) and are bound to their home; Stack params arrive on the
+  # caller's stack and need no prologue binding — the place machinery reads
+  # them from the frame.
   # sret ABI: save the caller-supplied indirect-return pointer (x8) into
   # the reserved frame slot before any callee work clobbers it.
   if fctx.frame.sret_offset != 0 then
@@ -6590,25 +6851,23 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
   end
   var idx = 0
   for param in fctx.func.params do
-    if idx < max_ra then
+    match classify_argument(ctx, &param.ty, idx)
+    when AbiArg::Register(_) then
       match arg_reg(arch, idx)
       when Option::Some(abi_r) then
-        match fctx.var_locs.get(param.id.id)
-        when Option::Some(loc) then
-          match loc
-          when VarLoc::Register(target_r) then
-            if phys_reg_id(abi_r) != phys_reg_id(target_r) then
-              emit_mov_rr(ctx, target_r, abi_r)
-            end
-          when VarLoc::Stack(off) then
-            emit_store_mem(ctx, fp, off, abi_r)
-          when VarLoc::Spilled(off) then
-            emit_store_mem(ctx, fp, off, abi_r)
-          end
-        when _ then ()
-        end
+        prologue_bind_param_from_abi_reg(ctx, fctx, fp, param, abi_r)
       when Option::None then ()
       end
+    when AbiArg::Indirect then
+      # Aggregate > 8 bytes passed BY REFERENCE: the address arrives in the
+      # same ABI slot a scalar of this index would use (see classify_argument).
+      match arg_reg(arch, idx)
+      when Option::Some(abi_r) then
+        prologue_bind_param_from_abi_reg(ctx, fctx, fp, param, abi_r)
+      when Option::None then ()
+      end
+    when AbiArg::Stack(_) then
+      ()
     end
     idx = idx + 1
   end
@@ -6927,12 +7186,12 @@ def emit_scalar_constant_for_storage(buf: &mut CodeBuffer, value: i64, width: In
   end
 end
 
-def emit_static_initializer_scalar(op: &MirOperand, buf: &mut CodeBuffer, st_ty: &Type) -> Unit
+def emit_static_initializer_scalar(ctx: &mut CodegenCtx, op: &MirOperand, buf: &mut CodeBuffer, st_ty: &Type) -> Unit
   match op.kind
   when MirOperandKind::MirConstant(cst) then
     match cst.kind
     when MirConstantKind::MirInt(v) then
-      let w = storage_size_bytes(st_ty)
+      let w = storage_size_bytes(ctx, st_ty)
       emit_scalar_constant_for_storage(buf, v, w)
     when _ then ()
     end
@@ -6945,9 +7204,15 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
   let init_opt = clone_static_init_operand(st)
 
   # Detect Vec/Slice-typed statics — they need a pointer to a 24-byte struct
+  # (the HeapVecHeader header size, repr_header_size(Repr::HeapVecHeader))
   let is_vec_type = match st.ty
   when Type::Array(_, _) then true
   when Type::Slice(_) then true
+  when Type::Named(tid, _) then
+    # P0-J2: Named Adt form of Array/Slice mirrors the canonical arms
+    # (heap {ptr,len,cap} handle statics).
+    let cst_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
+    if cst_named == "Array" || cst_named == "Slice" then true else false end
   when _ then false
   end
   
@@ -6958,7 +7223,8 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
       emit8(&mut ctx.data, 0)
     end
 
-    # For Vec statics: emit a 24-byte empty vec struct in data, then
+    # For Vec statics: emit a 24-byte empty vec struct in data (the
+    # HeapVecHeader size from the engine's repr_header_size), then
     # emit the static as a pointer to that struct
     if is_vec_type then
       let vec_data_label = ".Lvec_init_" + st.name.clone()
@@ -6966,7 +7232,7 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
         name: vec_data_label.clone(),
         section: Section::Data,
         offset: buf_pos(&ctx.data),
-        size: 24,
+        size: repr_header_size(Repr::HeapVecHeader),
         binding: SymBinding::Local,
         kind: SymKind::Data
       })
@@ -7002,9 +7268,9 @@ def codegen_static(ctx: &mut CodegenCtx, st: &MirStatic) -> Unit
     when MirOperandKind::MirConstant(cst) then
       match cst.kind
       when MirConstantKind::MirInt(v) then
-        emit_scalar_constant_for_storage(&mut ctx.data, v, storage_size_bytes(&st.ty))
+        emit_scalar_constant_for_storage(&mut ctx.data, v, storage_size_bytes(ctx, &st.ty))
         # Pad remaining bytes to fill the full type size
-        var emitted = storage_size_bytes(&st.ty)
+        var emitted = storage_size_bytes(ctx, &st.ty)
         while emitted < sz do
           emit8(&mut ctx.data, 0)
           emitted = emitted + 1
@@ -7165,6 +7431,13 @@ def rfind_double_colon(name: &String) -> Int
   -1
 end
 
+# P0-A (final layer): the ALIAS-key normalizer — used only to build extra
+# fn_alias lookup keys for unqualified references, never to rewrite an
+# emitted label. The semantic function identity is the module-qualified
+# DefId-derived key; emission names are the symbol-mangling boundary, and
+# this stripping keeps the mangled/qualified emission name intact (only the
+# last segment is exposed as an alias). "Type__method" -> "method",
+# "a::b::helper" -> "helper"; the emitted name itself is never shortened.
 def bare_name_from_qualified(name: String) -> String
   # Handle Type__method mangled names
   let mangled_pos = find_double_underscore(&name)
@@ -7179,6 +7452,39 @@ def bare_name_from_qualified(name: String) -> String
   end
 
   name.clone()
+end
+
+# P0-AM: whether a name is a DefId-derived emission name — the fn_owner_key
+# rendering "<module path>::<index>::<kind>" that top-level functions are
+# emitted under (see mir.tg's mir_fn_emission_name). A DefId-derived name
+# has NO bare form: bare_name_from_qualified strips only the LAST segment,
+# which would reduce every derived name to its kind token ("fn"), a
+# synthetic alias that only collides. Derived names are referenced by their
+# exact identity entry (fn_alias name -> ".Lfn_entry.<index>"); the
+# bare/canonical alias machinery is for the remaining name-based references
+# (methods, synthesized/IR-only calls) only.
+def is_defid_derived_name(name: &String) -> Bool
+  let segs = name.split("::")
+  if segs.len() < 2 then return false end
+  let kind_seg = segs[segs.len() - 1]
+  if kind_seg != "fn" && kind_seg != "method" && kind_seg != "static" &&
+     kind_seg != "const" && kind_seg != "variant" && kind_seg != "field" &&
+     kind_seg != "intrinsic" && kind_seg != "type" && kind_seg != "other" then
+    return false
+  end
+  let idx_seg = segs[segs.len() - 2]
+  if idx_seg.is_empty() then return false end
+  var i = 0
+  var numeric = true
+  while i < idx_seg.len() do
+    let ch = idx_seg.char_at(i)
+    if ch < '0' || ch > '9' then
+      numeric = false
+      break
+    end
+    i = i + 1
+  end
+  numeric
 end
 
 # Build a canonical lookup key for a function reference name.
@@ -7251,6 +7557,13 @@ def compute_reachable(program: &MirProgram) -> Set[String]
   # the MIR contents (which is fragile), we unconditionally emit all functions.
   # Dead-code elimination (DCE) can be reintroduced as an optimization pass once
   # the compiler is fully self-hosted and the bootstrap chain is complete.
+  # P0-AM: the set is keyed by MirFunction.name — the DefId-derived EMISSION
+  # name for top-level functions (fn_owner_key "<module path>::<index>::fn"),
+  # with "Type__method" method names, extern/intrinsic source names, and the
+  # OS-entry "main"/"_start" unchanged. reachable_fns is therefore keyed
+  # identically to the fn_alias identity entries and the MirFnItem call
+  # references, so resolve_callee_label's reachable/extern gate sees exactly
+  # the emitted names.
   var all_fns: Set[String] = Set::new()
   for func in program.functions do
     all_fns.insert(func.name.clone())
@@ -7389,11 +7702,22 @@ def resolve_dot_method(ctx: &CodegenCtx, fctx: &FnCodegenCtx, fn_name: &String, 
   when Type::Option(_) then "Option__" + method
   when Type::Result(_, _) then "Result__" + method
   when Type::Named(tid, _) then
+    # P0-J2: Named Adt form of the builtin compound collections mirrors the
+    # canonical arms above (Type__method mangling); everything else keeps
+    # the pre-existing name-based resolution.
     let type_name = type_name_by_id(ctx, tid.id)
-    if type_name != "" then
-      type_name + "__" + method
+    let bare_type_name = bare_name_from_qualified(type_name)
+    if bare_type_name == "Map" then "Map__" + method
+    elsif bare_type_name == "Set" then "Set__" + method
+    elsif bare_type_name == "Array" || bare_type_name == "Slice" then "Vec__" + method
+    elsif bare_type_name == "Option" then "Option__" + method
+    elsif bare_type_name == "Result" then "Result__" + method
     else
-      method
+      if type_name != "" then
+        type_name + "__" + method
+      else
+        method
+      end
     end
   when _ then method
   end
@@ -9081,6 +9405,12 @@ def emit_str_chars_aarch64(ctx: &mut CodegenCtx) -> Unit
   let lbl_copy_end = ".Lchars_copy_end." + ctx.fn_counter.to_string()
   ctx.fn_counter = ctx.fn_counter + 1
   let os = ctx.target.os
+  # The internal char-Vec buffer {ptr,len,cap} is the HeapVecHeader row of
+  # the engine's F2 table: repr_header_size 24, field offsets 0/8/16.
+  let hdr_size = repr_header_size(Repr::HeapVecHeader) as u32
+  let hdr_data_off = heap_header_field_offset(Repr::HeapVecHeader, &"data".to_string()) as u32
+  let hdr_len_off = heap_header_field_offset(Repr::HeapVecHeader, &"len".to_string()) as u32
+  let hdr_cap_off = heap_header_field_offset(Repr::HeapVecHeader, &"cap".to_string()) as u32
 
   # Prologue
   a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
@@ -9102,9 +9432,9 @@ def emit_str_chars_aarch64(ctx: &mut CodegenCtx) -> Unit
   a64_b(&mut ctx.text, lbl_strlen.clone())
   def_label(&mut ctx.text, lbl_done_len.clone())
 
-  # Allocate via inline mmap: 24 (header) + len * 8 (data)
+  # Allocate via inline mmap: hdr_size (header) + len * 8 (data)
   a64_lsl(&mut ctx.text, A64::X1, A64::X20, 3)
-  a64_add_rri(&mut ctx.text, A64::X1, A64::X1, 24)
+  a64_add_rri(&mut ctx.text, A64::X1, A64::X1, hdr_size)
   a64_mov_ri(&mut ctx.text, A64::X0, 0)
   a64_mov_ri(&mut ctx.text, A64::X2, 3)    # PROT_READ|PROT_WRITE
   match os
@@ -9125,11 +9455,11 @@ def emit_str_chars_aarch64(ctx: &mut CodegenCtx) -> Unit
   end
   a64_mov_rr(&mut ctx.text, A64::X21, A64::X0)
 
-  # Header: data_ptr = buf + 24, len, cap
-  a64_add_rri(&mut ctx.text, A64::X9, A64::X21, 24)
-  a64_str(&mut ctx.text, A64::X9, A64::X21, 0)
-  a64_str(&mut ctx.text, A64::X20, A64::X21, 8)
-  a64_str(&mut ctx.text, A64::X20, A64::X21, 16)
+  # Header: data_ptr = buf + hdr_size, len, cap (offsets from the engine)
+  a64_add_rri(&mut ctx.text, A64::X9, A64::X21, hdr_size)
+  a64_str(&mut ctx.text, A64::X9, A64::X21, hdr_data_off)
+  a64_str(&mut ctx.text, A64::X20, A64::X21, hdr_len_off)
+  a64_str(&mut ctx.text, A64::X20, A64::X21, hdr_cap_off)
 
   # Copy: for i in 0..len → data[i*8] = string[i]
   a64_mov_ri(&mut ctx.text, A64::X22, 0)
@@ -9162,6 +9492,11 @@ def emit_str_chars_x86_64(ctx: &mut CodegenCtx) -> Unit
   let lbl_copy_end = ".Lchars_copy_end." + ctx.fn_counter.to_string()
   ctx.fn_counter = ctx.fn_counter + 1
   let os = ctx.target.os
+  # The internal char-Vec buffer {ptr,len,cap} is the HeapVecHeader row of
+  # the engine's F2 table: repr_header_size 24, field offsets 0/8/16.
+  let hdr_size = repr_header_size(Repr::HeapVecHeader) as i32
+  let hdr_len_off = heap_header_field_offset(Repr::HeapVecHeader, &"len".to_string()) as i32
+  let hdr_cap_off = heap_header_field_offset(Repr::HeapVecHeader, &"cap".to_string()) as i32
 
   # Prologue
   x64_push(&mut ctx.text, X64::RBP)
@@ -9188,10 +9523,10 @@ def emit_str_chars_x86_64(ctx: &mut CodegenCtx) -> Unit
   x64_jmp(&mut ctx.text, lbl_strlen.clone())
   def_label(&mut ctx.text, lbl_done_len.clone())
 
-  # Allocate via inline mmap: 24 + r12*8
+  # Allocate via inline mmap: hdr_size + r12*8
   x64_mov_rr(&mut ctx.text, X64::RSI, X64::R12)
   x64_shl_ri(&mut ctx.text, X64::RSI, 3)
-  x64_add_ri(&mut ctx.text, X64::RSI, 24)
+  x64_add_ri(&mut ctx.text, X64::RSI, hdr_size)
   x64_mov_ri(&mut ctx.text, X64::RDI, 0)    # addr = 0
   x64_mov_ri(&mut ctx.text, X64::RDX, 3)    # PROT_RW
   match os
@@ -9206,11 +9541,11 @@ def emit_str_chars_x86_64(ctx: &mut CodegenCtx) -> Unit
   end
   x64_mov_rr(&mut ctx.text, X64::R13, X64::RAX)
 
-  # Header
-  x64_lea_mem(&mut ctx.text, X64::RCX, X64::R13, 24)
+  # Header (offsets from the engine)
+  x64_lea_mem(&mut ctx.text, X64::RCX, X64::R13, hdr_size)
   x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RCX)
-  x64_mov_mr(&mut ctx.text, X64::R13, 8, X64::R12)
-  x64_mov_mr(&mut ctx.text, X64::R13, 16, X64::R12)
+  x64_mov_mr(&mut ctx.text, X64::R13, hdr_len_off, X64::R12)
+  x64_mov_mr(&mut ctx.text, X64::R13, hdr_cap_off, X64::R12)
 
   # Copy
   x64_mov_ri(&mut ctx.text, X64::R14, 0)
@@ -9225,7 +9560,7 @@ def emit_str_chars_x86_64(ctx: &mut CodegenCtx) -> Unit
   x64_mov_rr(&mut ctx.text, X64::RCX, X64::R14)
   x64_shl_ri(&mut ctx.text, X64::RCX, 3)
   x64_add_rr(&mut ctx.text, X64::RCX, X64::R13)
-  x64_mov_mr(&mut ctx.text, X64::RCX, 24, X64::RAX)
+  x64_mov_mr(&mut ctx.text, X64::RCX, hdr_size, X64::RAX)
   x64_add_ri(&mut ctx.text, X64::R14, 1)
   x64_jmp(&mut ctx.text, lbl_copy.clone())
   def_label(&mut ctx.text, lbl_copy_end.clone())
@@ -9246,7 +9581,9 @@ end
 # Array/Vec Intrinsic Implementations
 # ———————————————————————————————————————————————————————————————
 #
-# Vec[T] memory layout (24 bytes):
+# Vec[T] memory layout (24 bytes — the HeapVecHeader row of the engine's F2
+# table, repr_header_size(Repr::HeapVecHeader); field offsets from
+# container_field_offset):
 #   offset 0: ptr    - pointer to data buffer
 #   offset 8: len    - current length (number of elements)
 #   offset 16: cap   - capacity (allocated elements)
@@ -9283,39 +9620,44 @@ def codegen_array_set(ctx: &mut CodegenCtx) -> Unit
 end
 
 # array_len: Get length of vec. Args: vec_ptr. Returns length.
-def codegen_array_len(ctx: &mut CodegenCtx) -> Unit
-  # Load len from offset 8. Null collection pointers represent empty values.
+# The receiver is a heap-header handle by dispatch (Vec/Array/Slice ->
+# HeapVecHeader); the len offset comes from the engine's container_field_offset.
+def codegen_array_len(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  # Load len from the header. Null collection pointers represent empty values.
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
     let lbl_done = next_codegen_label(ctx, ".Larray_len_done.")
     a64_cmp_ri(&mut ctx.text, A64::X0, 0)
     a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_done.clone())
-    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 8)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, len_off as i32)
     def_label(&mut ctx.text, lbl_done)
   when Arch::X86_64 then
     let lbl_done = next_codegen_label(ctx, ".Larray_len_done.")
     x64_test_rr(&mut ctx.text, X64::RDI, X64::RDI)
     x64_jcc(&mut ctx.text, CC::E, lbl_done.clone())
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)
     def_label(&mut ctx.text, lbl_done)
   end
 end
 
 # array_cap: Get capacity of vec. Args: vec_ptr. Returns capacity.
-def codegen_array_cap(ctx: &mut CodegenCtx) -> Unit
-  # Load cap from offset 16. Null collection pointers represent empty values.
+# Cap offset from the engine's container_field_offset (16 for Vec/Map).
+def codegen_array_cap(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let cap_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"cap".to_string())
+  # Load cap from the header. Null collection pointers represent empty values.
   match ctx.target.arch
   when Arch::AArch64 then
     let lbl_done = next_codegen_label(ctx, ".Larray_cap_done.")
     a64_cmp_ri(&mut ctx.text, A64::X0, 0)
     a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_done.clone())
-    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 16)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, cap_off as i32)
     def_label(&mut ctx.text, lbl_done)
   when Arch::X86_64 then
     let lbl_done = next_codegen_label(ctx, ".Larray_cap_done.")
     x64_test_rr(&mut ctx.text, X64::RDI, X64::RDI)
     x64_jcc(&mut ctx.text, CC::E, lbl_done.clone())
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 16)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, cap_off as i32)
     def_label(&mut ctx.text, lbl_done)
   end
 end
@@ -9331,15 +9673,16 @@ def codegen_array_insert(ctx: &mut CodegenCtx) -> Unit
 end
 
 # array_clear: Clear vec (set len to 0). Args: vec_ptr.
-def codegen_array_clear(ctx: &mut CodegenCtx) -> Unit
+def codegen_array_clear(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
-    # Store 0 at [x0 + 8] (len)
-    a64_stur(&mut ctx.text, A64::XZR, A64::X0, 8)
+    # Store 0 at [x0 + len_off] (len)
+    a64_stur(&mut ctx.text, A64::XZR, A64::X0, len_off as i32)
   when Arch::X86_64 then
-    # Store 0 at [rdi + 8] (len)
+    # Store 0 at [rdi + len_off] (len)
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    x64_mov_mr(&mut ctx.text, X64::RDI, 8, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RDI, len_off as i32, X64::RAX)
   end
 end
 
@@ -9354,12 +9697,13 @@ def codegen_array_contains(ctx: &mut CodegenCtx) -> Unit
 end
 
 # array_last: Returns last element (or 0 if empty). Args: vec_ptr.
-def codegen_array_last(ctx: &mut CodegenCtx) -> Unit
+def codegen_array_last(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   let lbl_empty = ".Larr_last_empty." + ctx.fn_counter.to_string()
   ctx.fn_counter = ctx.fn_counter + 1
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_ldur(&mut ctx.text, A64::X1, A64::X0, 8)   # len
+    a64_ldur(&mut ctx.text, A64::X1, A64::X0, len_off as i32)   # len
     a64_cmp_ri(&mut ctx.text, A64::X1, 0)
     a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_empty.clone())
     a64_ldur(&mut ctx.text, A64::X2, A64::X0, 0)   # data ptr
@@ -9368,7 +9712,7 @@ def codegen_array_last(ctx: &mut CodegenCtx) -> Unit
     a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)
     def_label(&mut ctx.text, lbl_empty.clone())
   when Arch::X86_64 then
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)  # len
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)  # len
     x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
     x64_jcc(&mut ctx.text, CC::E, lbl_empty.clone())
     x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDI, 0)  # data
@@ -9381,19 +9725,20 @@ def codegen_array_last(ctx: &mut CodegenCtx) -> Unit
 end
 
 # array_first: Returns first element (or 0 if empty). Args: vec_ptr.
-def codegen_array_first(ctx: &mut CodegenCtx) -> Unit
+def codegen_array_first(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   let lbl_empty = ".Larr_first_empty." + ctx.fn_counter.to_string()
   ctx.fn_counter = ctx.fn_counter + 1
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_ldur(&mut ctx.text, A64::X1, A64::X0, 8)   # len
+    a64_ldur(&mut ctx.text, A64::X1, A64::X0, len_off as i32)   # len
     a64_cmp_ri(&mut ctx.text, A64::X1, 0)
     a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_empty.clone())
     a64_ldur(&mut ctx.text, A64::X0, A64::X0, 0)   # data ptr
     a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)    # data[0]
     def_label(&mut ctx.text, lbl_empty.clone())
   when Arch::X86_64 then
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)
     x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
     x64_jcc(&mut ctx.text, CC::E, lbl_empty.clone())
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)  # data
@@ -9403,14 +9748,17 @@ def codegen_array_first(ctx: &mut CodegenCtx) -> Unit
 end
 
 # array_is_empty: Returns 1 if len == 0, else 0. Args: vec_ptr.
-def codegen_array_is_empty(ctx: &mut CodegenCtx) -> Unit
+# Also serves SetIsEmpty (a set is map-backed; len is at the same header
+# offset — HeapSetHeader row of container_field_offset).
+def codegen_array_is_empty(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 8)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, len_off as i32)
     a64_cmp_ri(&mut ctx.text, A64::X0, 0)
     emit_setcc(ctx, CondKind::Eq, PhysReg::A64Reg(A64::X0))
   when Arch::X86_64 then
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)
     x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
     emit_setcc(ctx, CondKind::Eq, PhysReg::X64Reg(X64::RAX))
   end
@@ -9428,13 +9776,14 @@ end
 def codegen_array_extend(ctx: &mut CodegenCtx) -> Unit
   emit_call_label(ctx, "_tg_array_extend")
 end
-def codegen_array_truncate(ctx: &mut CodegenCtx) -> Unit
+def codegen_array_truncate(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
   # Truncate to given length — just update len if new len < current len
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_stur(&mut ctx.text, A64::X1, A64::X0, 8)
+    a64_stur(&mut ctx.text, A64::X1, A64::X0, len_off as i32)
   when Arch::X86_64 then
-    x64_mov_mr(&mut ctx.text, X64::RDI, 8, X64::RSI)
+    x64_mov_mr(&mut ctx.text, X64::RDI, len_off as i32, X64::RSI)
   end
 end
 def codegen_array_resize(ctx: &mut CodegenCtx) -> Unit
@@ -9451,6 +9800,13 @@ end
 #   offset 16: cap     - bucket count (power of 2)
 #   offset 24: hash_fn - ptr to hash function
 #   offset 32: eq_fn   - ptr to equality function
+#
+# DISCREPANCY (documented, NOT changed): the offsets 24/32 describe the
+# engine's FROZEN HeapMapHeader row (repr_header_size 48). The RUNTIME map
+# (runtime.tg, "Map layout") is a 24-byte {buckets, size, cap} header —
+# hash_fn/eq_fn are not stored there — and Set is map-backed with the same
+# 24-byte header. Codegen keeps the runtime-consistent behavior: it only
+# reads len at offset 8 (which agrees with both), never the 24/32 fields.
 #
 # Each bucket entry:
 #   offset 0: hash  - cached hash value
@@ -9523,12 +9879,16 @@ def codegen_map_contains(ctx: &mut CodegenCtx) -> Unit
 end
 
 # map_len: Get number of entries. Args: map_ptr. Returns size.
-def codegen_map_len(ctx: &mut CodegenCtx) -> Unit
+# The len field of the map header: HeapMapHeader row of the engine's
+# container_field_offset (8 — agrees with the runtime's {buckets:0,size:8,
+# cap:16}; see the header-size discrepancy note on heap_header_field_offset).
+def codegen_map_len(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 8)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, len_off as i32)
   when Arch::X86_64 then
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)
   end
 end
 
@@ -9581,12 +9941,16 @@ def codegen_set_remove(ctx: &mut CodegenCtx) -> Unit
 end
 
 # set_len: Get number of elements. Args: set_ptr. Returns size.
-def codegen_set_len(ctx: &mut CodegenCtx) -> Unit
+# Sets are map-backed: the len field is the HeapSetHeader row of the engine's
+# container_field_offset (8 — agrees with the runtime's 24-byte map header;
+# see the header-size discrepancy note on heap_header_field_offset).
+def codegen_set_len(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 8)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, len_off as i32)
   when Arch::X86_64 then
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 8)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)
   end
 end
 
@@ -9894,6 +10258,36 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
   # This resolves label mismatches where MIR call refs use bare names (e.g., "read_all")
   # but function bodies are emitted with mangled names (e.g., "File__read_all").
   # First, collect all real function names so we never shadow them with aliases.
+  #
+  # P0-A (final layer): the naming flow is the symbol-mangling boundary. The
+  # SEMANTIC function identity is the module-qualified DefId-derived key
+  # (fn_owner_key "<module path>::<index>::fn" — see mir.tg's
+  # mir_fn_emission_name / types.tg's fn_owner_key_of_item); the MIR function
+  # NAME (MirFunction.name / MirFnItem operand) is the EMISSION name, and
+  # this map is where emission names become machine labels. The identity
+  # entry below maps the exact emission name -> ".Lfn_entry.<index>", so a
+  # module-qualified emission name ("a::b::helper") resolves directly and is
+  # never mis-stripped. The bare/canonical aliases are EXTRA lookup keys for
+  # unqualified references: bare_name_from_qualified strips only the
+  # LAST-segment qualification ("a::b::helper" -> "helper",
+  # "Type__method" -> "method") — the emitted function keeps its full
+  # qualified/mangled name; no alias ever rewrites an emitted label. A
+  # bare-name collision (same-named functions in different modules) is the
+  # documented name-based residual: the last emitted alias wins, so
+  # unqualified references are ambiguous — the DefId-derived identity
+  # (InstanceId on MirFnItem) is the semantic disambiguator that replaces
+  # this string stage.
+  # P0-AM (final): the full flow is now DefId-driven end to end:
+  #   MirFunction.name (fn_owner_key of the item's DefId, recorded by
+  #   lower_program) -> codegen_function's emitted symbol AND fn_alias
+  #   identity entry (".Lfn_entry.<index>") -> call references (MirFnItem
+  #   names derived from the call's InstanceId DefId) -> resolve_callee_label
+  #   (the single authority) -> the identity label.
+  # DefId-derived names get NO bare/canonical aliases (is_defid_derived_name
+  # guards the loop below): their only lookup key is the exact identity
+  # entry. Extern symbols, intrinsic names, the OS-entry "main"/"_start",
+  # and "Type__method" method names keep their source/mangled names
+  # unchanged (the linking boundary and the finalizer/Drop identities).
   var real_fn_names: Set[String] = Set::new()
   fi = 0
   while fi < functions.len() do
@@ -9906,13 +10300,21 @@ def codegen_program(ctx: &mut CodegenCtx, program: &MirProgram) -> Result[Unit, 
     let func = functions[fi]
     let func_name = func.name.clone()
     if reachable.contains(&func_name) || func.is_extern then
-      let bare = bare_name_from_qualified(func_name.clone())
-      if bare != func.name && !real_fn_names.contains(&bare) then
-        ctx.fn_alias.insert(bare.clone(), func_name.clone())
-      end
-      let canonical = canonical_fn_ref(func_name.clone())
-      if canonical != func.name && canonical != bare && !real_fn_names.contains(&canonical) then
-        ctx.fn_alias.insert(canonical.clone(), func_name.clone())
+      # P0-AM: a DefId-derived emission name ("<module path>::<index>::fn")
+      # has no bare form — bare_name_from_qualified would strip it to the
+      # kind token ("fn"), a synthetic alias that only collides. Derived
+      # names are referenced by their exact identity entry; the
+      # bare/canonical aliases below are only for the remaining name-based
+      # references (methods, synthesized/IR-only callees, extern stubs).
+      if !is_defid_derived_name(&func_name) then
+        let bare = bare_name_from_qualified(func_name.clone())
+        if bare != func.name && !real_fn_names.contains(&bare) then
+          ctx.fn_alias.insert(bare.clone(), func_name.clone())
+        end
+        let canonical = canonical_fn_ref(func_name.clone())
+        if canonical != func.name && canonical != bare && !real_fn_names.contains(&canonical) then
+          ctx.fn_alias.insert(canonical.clone(), func_name.clone())
+        end
       end
     end
     fi = fi + 1

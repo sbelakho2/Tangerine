@@ -440,6 +440,15 @@ struct ResolutionContext
   # Config
   prelude_imports: Vec[String]
 
+  # P0-AM: the owner module path (from Program.modules, threaded by
+  # resolve_program's flat-item walk) of the item whose body is currently
+  # being resolved. Free-function call-target DefIds use this path as their
+  # module component so they render IDENTICALLY to the item's own item_defs
+  # DefId (record_item_def's owner-path DefId) — the MIR emission-name
+  # migration keys call-site names (fn_owner_key of the InstanceId) against
+  # function names (fn_owner_key of item_defs), so the two must agree.
+  current_owner_path: Vec[String]
+
   # Dedicated counter for runtime intrinsic DefIds (module "__builtin")
   next_builtin_index: Int
 end
@@ -502,6 +511,7 @@ def context_new() -> ResolutionContext
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"],
+    current_owner_path: Vec::new(),
     next_builtin_index: 0
   }
 end
@@ -588,7 +598,7 @@ def build_resolver_symbol_table(ctx: &mut ResolutionContext, program: &Program) 
     end
     let item = program.items[item_idx]
     add_item_to_symbols(ctx, &item, &owner_path)
-    record_item_def(ctx, &item, item_idx)
+    record_item_def(ctx, &item, item_idx, &owner_path)
     item_idx = item_idx + 1
   end
 end
@@ -596,25 +606,46 @@ end
 # Record the DefId of every item that owns symbols (functions, methods,
 # statics, constants) keyed by its index in the merged Program.items. The
 # DefId's module + per-module symbol index make the key unique across all
-# files merged into one compilation (see ResolvedNames.item_defs).
-def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int) -> Unit
+# files merged into one compilation (see ResolvedNames.item_defs). P0-C: the
+# DefId's module is the item's FULL owner module path (the owner ModuleInfo
+# path from Program.modules, threaded by build_resolver_symbol_table) —
+# IDENTICAL to the module component of the same function's module_symbols
+# DefId (add_item_to_symbols's qualified_path), so the ownership-layer key
+# rendered from item_defs identifies the module-qualified function, not just
+# a per-module index.
+def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int, owner_path: &Vec[String]) -> Unit
   match item.kind
   when ItemKind::ItemFunction(f) then
     # Free function: a single-element DefId vector (the value type is
     # Vec[DefId]; inserting a bare DefId would be a type error).
     let module = get_current_module(&mut ctx.symbols)
-    let mod_name = ctx.symbols.current_module.join("::")
-    match symbol_index_of(module, &f.name)
-    when Option::Some(midx) then
-      var fn_defs = Vec::new()
-      fn_defs.push(DefId {
-        module: mod_name,
-        index: midx,
-        kind: DefKind::Function
-      })
-      ctx.resolved.item_defs.insert(item_idx, fn_defs)
-    when Option::None then ()
+    let mod_name = owner_path.join("::")
+    # P0-C: EVERY top-level function gets a DefId. The normal case is the
+    # name's registered symbol index; when the name is already in use
+    # (same-named function elsewhere in the merged program, or a
+    # cross-kind collision — the bare-name tables are first-wins), a fresh
+    # index is allocated from the module's counter. The index is
+    # metadata-only (never consulted by resolution, and the DefId never
+    # enters the bare-name tables), so first-wins semantics are untouched —
+    # but the OWNERSHIP layer needs the entry: the type checker, resource
+    # checker and MIR all key their owner-key derivations off item_defs,
+    # and a missing entry would force their name/positional fallbacks to
+    # diverge (MIR's positional fallback would miss the checker's
+    # name-based finalize-plan key and error out).
+    let f_idx = match symbol_index_of(module, &f.name)
+    when Option::Some(midx) then midx
+    when Option::None then
+      let fresh = module.next_symbol_index as UInt
+      module.next_symbol_index = module.next_symbol_index + 1
+      fresh
     end
+    var fn_defs = Vec::new()
+    fn_defs.push(DefId {
+      module: mod_name,
+      index: f_idx,
+      kind: DefKind::Function
+    })
+    ctx.resolved.item_defs.insert(item_idx, fn_defs)
   when ItemKind::ItemStruct(s) then
     # Collect ALL method DefIds into one vector, then insert once — inserting
     # per method would overwrite the preceding method's entry.
@@ -647,6 +678,56 @@ def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int) -> 
     ctx.resolved.item_defs.insert(item_idx, impl_defs)
   when _ then ()
   end
+end
+
+# P0-C: the ownership layer's per-item DefId lookup by flat item index. The
+# per-item DefId structure is ResolvedNames.item_defs (item index -> DefIds
+# in declaration order; a free function is a single-element vector, methods
+# follow in declaration order), recorded by record_item_def. Returns the
+# FIRST recorded DefId (a free function's own DefId) and Option::None for
+# items that recorded none — the same map the type checker, resource checker
+# and MIR consume, so the DefId-derived owner key never diverges across the
+# three consumers.
+def def_id_of_item(resolved: &ResolvedNames, item_idx: Int) -> Option[DefId]
+  match resolved.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if dids.len() > 0 then
+      Option::Some(dids[0].clone())
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# P0-C: the resolver-side mirror of the type checker's module_path_of_item
+# (types.tg) — the owner module path of a flat item index, walked from
+# Program.modules (contiguous [start, end) ranges per module in flat order;
+# empty ranges are skipped; a missing/empty table falls back to the root
+# path). Returns the path and the advanced module pointer so callers thread
+# the walk across consecutive items exactly like build_resolver_symbol_table
+# does during symbol-table construction.
+def module_path_of_item_resolver(program: &Program, module_ptr: Int, item_idx: Int) -> (Vec[String], Int)
+  var mp = module_ptr
+  var advanced = true
+  while advanced do
+    advanced = false
+    if mp < program.modules.len() then
+      let info = program.modules[mp]
+      if info.item_indices.len() >= 2 && item_idx >= info.item_indices[1] then
+        mp = mp + 1
+        advanced = true
+      end
+    end
+  end
+  var owner_path = Vec::new()
+  if mp < program.modules.len() then
+    let info = program.modules[mp]
+    for seg in info.path do
+      owner_path.push(seg.clone())
+    end
+  end
+  (owner_path, mp)
 end
 
 def module_name_in_use(module: &ModuleSymbols, name: &String) -> Bool
@@ -1359,8 +1440,22 @@ def resolve_program(ctx: &mut ResolutionContext, program: &Program) -> Unit
   # All declarations were registered once during symbol-table construction
   # (build_resolver_symbol_table). This phase only resolves bodies and impl
   # blocks, which may reference later-defined items.
-  for item in program.items do
+  # P0-AM: the flat-item walk threads each item's OWNER module path (the same
+  # module_path_of_item_resolver walk build_resolver_symbol_table uses) into
+  # ctx.current_owner_path, so free-function call-target DefIds recorded
+  # while resolving this item's body render with the item's module — the
+  # rendering item_defs' record_item_def uses, keeping call-site identity
+  # (InstanceId.def) byte-identical to the function's own DefId.
+  var module_ptr = 0
+  var item_idx = 0
+  while item_idx < program.items.len() do
+    let (owner_path, next_module_ptr) = module_path_of_item_resolver(program, module_ptr, item_idx)
+    module_ptr = next_module_ptr
+    ctx.current_owner_path = owner_path
+    let item = program.items[item_idx]
     resolve_item(ctx, &item)
+    ctx.current_owner_path = Vec::new()
+    item_idx = item_idx + 1
   end
 end
 
@@ -1697,6 +1792,11 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
   end
 
   # Try resolving as module path
+  # P0-AM: record the call target when the path names a registered top-level
+  # function (full-path or import-alias form) — purely additive; a path that
+  # names no registered function records nothing and keeps the name-based
+  # fallback, and no new error behavior is introduced.
+  record_path_call_target(ctx, path, span)
   if resolve_via_imports_path(ctx, path, span) then
     return
   end
@@ -1904,6 +2004,70 @@ def resolve_via_imports_path(ctx: &mut ResolutionContext, path: &Vec[String], sp
   false
 end
 
+# P0-AM: record the call target of a module-qualified path when it names a
+# KNOWN top-level function. The target DefId comes from the symbol table's
+# module_symbols entries ("<full owner module path>::<name>" -> DefId — the
+# entries add_item_to_symbols registered for EVERY top-level item, carrying
+# module = the item's full owner ModuleInfo path). The rendering therefore
+# matches the same item's item_defs DefId byte-for-byte (record_item_def
+# walks the same owner paths), which is exactly what the MIR emission-name
+# migration needs: a call-site name derived from the InstanceId's DefId must
+# equal the callee function's own DefId-derived emission name.
+#
+# Key attempts, in order:
+#   1. The path AS WRITTEN — covers fully-qualified calls that name the
+#      item's registered key directly ("std::env::get_env").
+#   2. Import-alias expansion — the first segment is an import alias
+#      ("driver" for `use tg_compiler::driver`): the full path is
+#      import.path + the remaining segments, so "driver::driver_main"
+#      resolves against the registered "tg_compiler::driver::driver_main".
+#
+# Only DefKind::Function targets are recorded (methods keep their
+# "Type__method" mangled names; intrinsic/extern symbols keep source names;
+# constants/statics/variants never participate in emission-name derivation).
+# No resolution errors are added here — a path that names no registered
+# function simply stays name-based (the MIR-side fallback for that shape).
+def record_path_call_target(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Unit
+  if path.len() < 2 then return end
+  var key_attempts: Vec[Vec[String]] = Vec::new()
+  key_attempts.push(path.clone())
+  let module = get_current_module_ref(&ctx.symbols)
+  for import in module.imports do
+    if import.path.is_empty() then next end
+    let import_alias = match import.alias_name
+    when Option::Some(alias_val) then alias_val.clone()
+    when Option::None then import.path[import.path.len() - 1].clone()
+    end
+    if import_alias == path[0] then
+      var cand = import.path.clone()
+      var pi = 1
+      while pi < path.len() do
+        cand.push(path[pi].clone())
+        pi = pi + 1
+      end
+      key_attempts.push(cand)
+    end
+  end
+  for cand in key_attempts do
+    if cand.len() < 2 then next end
+    var mod_segs = Vec::new()
+    var ci = 0
+    while ci < cand.len() - 1 do
+      mod_segs.push(cand[ci].clone())
+      ci = ci + 1
+    end
+    let key = module_qualified_key(&mod_segs, &cand[cand.len() - 1])
+    match ctx.symbols.module_symbols.get(key)
+    when Option::Some(did) then
+      if did.kind == DefKind::Function then
+        ctx.resolved.call_targets.insert(span.start, did.clone())
+        return
+      end
+    when Option::None then ()
+    end
+  end
+end
+
 # Verify that a symbol identified by `remaining` path segments exists
 # as an export of the module identified by `module_path`.
 def verify_symbol_in_module(ctx: &ResolutionContext, module_path: &Vec[String], remaining: &Vec[String]) -> Bool
@@ -2095,6 +2259,22 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
 
   # Try to resolve as function or constant
   let module = get_current_module_ref(&ctx.symbols)
+  # P0-AM: the DefId's module component is the CURRENT ITEM's owner module
+  # path (ctx.current_owner_path, threaded by resolve_program from
+  # Program.modules) — NOT the inline-module nesting — so the call-target
+  # DefId renders identically to the same function's item_defs DefId
+  # (record_item_def uses the identical owner-path walk). The MIR
+  # emission-name migration derives call-site names from the InstanceId's
+  # DefId and function names from item_defs; a module-less call target
+  # ("::<index>::fn") would diverge from the function's own
+  # ("<module path>::<index>::fn") and break the end-to-end resolution.
+  # Inline-module bodies keep the enclosing item's owner path (they record
+  # no item_defs entry; their calls stay name-based by design).
+  let mod_str = if ctx.current_owner_path.is_empty() then
+    ctx.symbols.current_module.join("::")
+  else
+    ctx.current_owner_path.join("::")
+  end
   if module.functions.contains_key(name) then
     # The resolved function carries the same DefId that call_targets records
     # (module + per-module symbol index), so resolution and call identity
@@ -2102,7 +2282,7 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     let fidx = match symbol_index_of(module, name)
     when Option::Some(fidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: ctx.symbols.current_module.join("::"),
+        module: mod_str,
         index: fidx,
         kind: DefKind::Function
       })
@@ -2111,7 +2291,7 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     end
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Function(DefId {
-        module: ctx.symbols.current_module.join("::"),
+        module: mod_str,
         index: fidx,
         kind: DefKind::Function
       }),
@@ -2130,7 +2310,7 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     match symbol_index_of(module, name)
     when Option::Some(cidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: ctx.symbols.current_module.join("::"),
+        module: mod_str,
         index: cidx,
         kind: DefKind::Constant
       })
@@ -2148,7 +2328,7 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     match symbol_index_of(module, name)
     when Option::Some(sidx) then
       ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: ctx.symbols.current_module.join("::"),
+        module: mod_str,
         index: sidx,
         kind: DefKind::Static
       })
@@ -2245,6 +2425,16 @@ def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
 
   when ExprKind::ExprPath(path) then
     resolve_path(ctx, &path.segments, expr.span.clone())
+
+  when ExprKind::ExprEnumVariant(path, _) then
+    # P0-AM: module-qualified CALL paths ("driver::driver_main(...)",
+    # "std::env::get_env(...)") parse as ExprEnumVariant. Record the call
+    # target when the path names a registered top-level function so the MIR
+    # call site carries the InstanceId and derives the callee's emission
+    # name from its DefId. No error is added for unresolvable paths (the
+    # pre-existing behavior for this expression form is silent; the MIR
+    # name-based fallback covers those shapes).
+    record_path_call_target(ctx, &path.segments, expr.span.clone())
 
   when ExprKind::ExprCall(callee, args) then
     resolve_expr(ctx, &callee)

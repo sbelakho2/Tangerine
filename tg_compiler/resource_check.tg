@@ -6,7 +6,8 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, fn_owner_key}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, fn_owner_key, fn_owner_key_of_item}
+use tg_compiler::resolver::{module_path_of_item_resolver}
 use tg_compiler::ids::{LocalId}
 
 enum ResourceState
@@ -258,10 +259,18 @@ pub def resource_check(program: &Program, typed: &TypedProgram) -> ResourceCheck
   # check_trait_method) from the CfgEdge records' cleanup_ids — the same
   # values the finalize_plan string keys carry.
   var edge_cleanup = Map::new()
-  var no_module_path = Vec::new()
+  # P0-C: each top-level item is checked under its OWNER module path — the
+  # same Program.modules pointer walk the type checker performs
+  # (module_path_of_item_resolver) — so the owner-key fallback of a
+  # no-DefId free function is qualified with the item's FULL module path,
+  # not the bare root path. The path also feeds the nested-module fallback
+  # threading (check_item's module_path param).
+  var module_ptr = 0
   mut i = 0
   while i < program.items.len() do
-    check_item(program, typed, &program.items[i], i, &mut errors, &mut finalize_plan, &mut edge_cleanup, &no_module_path)
+    let (owner_path, next_module_ptr) = module_path_of_item_resolver(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    check_item(program, typed, &program.items[i], i, &mut errors, &mut finalize_plan, &mut edge_cleanup, &owner_path)
     i = i + 1
   end
   ResourceCheckResult {
@@ -272,32 +281,49 @@ pub def resource_check(program: &Program, typed: &TypedProgram) -> ResourceCheck
   }
 end
 
-def type_kind_contains_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
+def type_kind_contains_resource(typed: &TypedProgram, ty: &Type) -> Bool
   match ty
   when Type::Named(id, args) then
-    match kinds.get(id.id)
-    when Option::Some(k) then
-      if k == TypeKind::Resource then
+    # P0-J phase-2C: the Named Adt form (Type::Named(<builtin id>, args)) is
+    # the storage twin of the canonical variants below — resolve the
+    # registered builtin id via typed.type_names and dispatch to the SAME
+    # payload walks as the canonical arms. Box/Rc own unconditionally (an
+    # allocation is released regardless of T); Option/Result/Map/Set/Slice/
+    # Array walk their payloads. Every non-builtin name falls back to the
+    # general kind-table walk (named_kind_contains_resource).
+    match typed.type_names.get(id.id)
+    when Option::Some(n) then
+      if n == "Box" || n == "Rc" then
         true
-      elsif k == TypeKind::Capability then
-        true
+      elsif n == "Option" && args.len() >= 1 then
+        type_kind_contains_resource(typed, &args[0])
+      elsif n == "Result" && args.len() >= 2 then
+        type_kind_contains_resource(typed, &args[0]) || type_kind_contains_resource(typed, &args[1])
+      elsif n == "Map" && args.len() >= 2 then
+        type_kind_contains_resource(typed, &args[0]) || type_kind_contains_resource(typed, &args[1])
+      elsif n == "Set" && args.len() >= 1 then
+        type_kind_contains_resource(typed, &args[0])
+      elsif n == "Slice" && args.len() >= 1 then
+        type_kind_contains_resource(typed, &args[0])
+      elsif n == "Array" && args.len() >= 1 then
+        type_kind_contains_resource(typed, &args[0])
       else
-        type_args_contain_resource(kinds, &args)
+        named_kind_contains_resource(typed, id, &args)
       end
-    when Option::None then type_args_contain_resource(kinds, &args)
+    when Option::None then named_kind_contains_resource(typed, id, &args)
     end
-  when Type::Option(inner) then type_kind_contains_resource(kinds, &inner)
+  when Type::Option(inner) then type_kind_contains_resource(typed, &inner)
   when Type::Result(ok, err) then
-    type_kind_contains_resource(kinds, &ok) || type_kind_contains_resource(kinds, &err)
+    type_kind_contains_resource(typed, &ok) || type_kind_contains_resource(typed, &err)
   when Type::Map(k, v) then
-    type_kind_contains_resource(kinds, &k) || type_kind_contains_resource(kinds, &v)
-  when Type::Set(inner) then type_kind_contains_resource(kinds, &inner)
-  when Type::Slice(inner) then type_kind_contains_resource(kinds, &inner)
-  when Type::Array(inner, _) then type_kind_contains_resource(kinds, &inner)
+    type_kind_contains_resource(typed, &k) || type_kind_contains_resource(typed, &v)
+  when Type::Set(inner) then type_kind_contains_resource(typed, &inner)
+  when Type::Slice(inner) then type_kind_contains_resource(typed, &inner)
+  when Type::Array(inner, _) then type_kind_contains_resource(typed, &inner)
   when Type::Tuple(fields) then
-    type_fields_contain_resource(kinds, &fields)
+    type_fields_contain_resource(typed, &fields)
   when Type::Function(_, _) then false
-  when Type::RefInternal(inner, _) then type_kind_contains_resource(kinds, &inner)
+  when Type::RefInternal(inner, _) then type_kind_contains_resource(typed, &inner)
   # Canonical Box[T] OWNS an allocation regardless of T (Box[Int] must be
   # released too), and Rc[T] owns a shared allocation whose drop decrements
   # the strong count and deallocs at zero — both participate in finalization
@@ -315,10 +341,29 @@ def type_kind_contains_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
   end
 end
 
-def type_args_contain_resource(kinds: &Map[Int, TypeKind], args: &Vec[Type]) -> Bool
+# P0-J phase-2C: the general Named-type resource walk (the pre-conversion
+# `Type::Named` arm body): the kind table (Resource/Capability) decides
+# directly; every other registered type walks its concrete args. The
+# builtin-name dispatch in type_kind_contains_resource falls back here for
+# non-builtin names (and for ids absent from the name table).
+def named_kind_contains_resource(typed: &TypedProgram, id: TypeId, args: &Vec[Type]) -> Bool
+  match typed.type_kinds.get(id.id)
+  when Option::Some(k) then
+    if k == TypeKind::Resource then
+      true
+    elsif k == TypeKind::Capability then
+      true
+    else
+      type_args_contain_resource(typed, args)
+    end
+  when Option::None then type_args_contain_resource(typed, args)
+  end
+end
+
+def type_args_contain_resource(typed: &TypedProgram, args: &Vec[Type]) -> Bool
   mut i = 0
   while i < args.len() do
-    if type_kind_contains_resource(kinds, &args[i]) then
+    if type_kind_contains_resource(typed, &args[i]) then
       return true
     end
     i = i + 1
@@ -326,10 +371,10 @@ def type_args_contain_resource(kinds: &Map[Int, TypeKind], args: &Vec[Type]) -> 
   false
 end
 
-def type_fields_contain_resource(kinds: &Map[Int, TypeKind], fields: &Vec[Type]) -> Bool
+def type_fields_contain_resource(typed: &TypedProgram, fields: &Vec[Type]) -> Bool
   mut i = 0
   while i < fields.len() do
-    if type_kind_contains_resource(kinds, &fields[i]) then
+    if type_kind_contains_resource(typed, &fields[i]) then
       return true
     end
     i = i + 1
@@ -337,10 +382,10 @@ def type_fields_contain_resource(kinds: &Map[Int, TypeKind], fields: &Vec[Type])
   false
 end
 
-def type_params_contain_resource(kinds: &Map[Int, TypeKind], params: &Vec[ParamType]) -> Bool
+def type_params_contain_resource(typed: &TypedProgram, params: &Vec[ParamType]) -> Bool
   mut i = 0
   while i < params.len() do
-    if type_kind_contains_resource(kinds, &params[i].ty) then
+    if type_kind_contains_resource(typed, &params[i].ty) then
       return true
     end
     i = i + 1
@@ -348,38 +393,73 @@ def type_params_contain_resource(kinds: &Map[Int, TypeKind], params: &Vec[ParamT
   false
 end
 
-def type_kind_contains_capability(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
+def type_kind_contains_capability(typed: &TypedProgram, ty: &Type) -> Bool
   match ty
   when Type::Named(id, args) then
-    match kinds.get(id.id)
-    when Option::Some(k) then
-      if k == TypeKind::Capability then
-        true
+    # P0-J phase-2C: the Named Adt (storage) twin of the canonical container
+    # variants — resolve the registered builtin id via typed.type_names and
+    # dispatch to the SAME payload walks as the canonical arms below. Box/Rc
+    # are explicitly NOT capabilities and their payload is NOT consulted
+    # (mirroring the canonical forms, which fall to `when _ then false`);
+    # every non-builtin name falls back to the general kind-table walk.
+    match typed.type_names.get(id.id)
+    when Option::Some(n) then
+      if n == "Box" || n == "Rc" then
+        false
+      elsif n == "Option" && args.len() >= 1 then
+        type_kind_contains_capability(typed, &args[0])
+      elsif n == "Result" && args.len() >= 2 then
+        type_kind_contains_capability(typed, &args[0]) || type_kind_contains_capability(typed, &args[1])
+      elsif n == "Map" && args.len() >= 2 then
+        type_kind_contains_capability(typed, &args[0]) || type_kind_contains_capability(typed, &args[1])
+      elsif n == "Set" && args.len() >= 1 then
+        type_kind_contains_capability(typed, &args[0])
+      elsif n == "Slice" && args.len() >= 1 then
+        type_kind_contains_capability(typed, &args[0])
+      elsif n == "Array" && args.len() >= 1 then
+        type_kind_contains_capability(typed, &args[0])
       else
-        type_args_contain_capability(kinds, &args)
+        named_kind_contains_capability(typed, id, &args)
       end
-    when Option::None then type_args_contain_capability(kinds, &args)
+    when Option::None then named_kind_contains_capability(typed, id, &args)
     end
-  when Type::Option(inner) then type_kind_contains_capability(kinds, &inner)
+  when Type::Option(inner) then type_kind_contains_capability(typed, &inner)
   when Type::Result(ok, err) then
-    type_kind_contains_capability(kinds, &ok) || type_kind_contains_capability(kinds, &err)
+    type_kind_contains_capability(typed, &ok) || type_kind_contains_capability(typed, &err)
   when Type::Map(k, v) then
-    type_kind_contains_capability(kinds, &k) || type_kind_contains_capability(kinds, &v)
-  when Type::Set(inner) then type_kind_contains_capability(kinds, &inner)
-  when Type::Slice(inner) then type_kind_contains_capability(kinds, &inner)
-  when Type::Array(inner, _) then type_kind_contains_capability(kinds, &inner)
+    type_kind_contains_capability(typed, &k) || type_kind_contains_capability(typed, &v)
+  when Type::Set(inner) then type_kind_contains_capability(typed, &inner)
+  when Type::Slice(inner) then type_kind_contains_capability(typed, &inner)
+  when Type::Array(inner, _) then type_kind_contains_capability(typed, &inner)
   when Type::Tuple(fields) then
-    type_fields_contain_capability(kinds, &fields)
+    type_fields_contain_capability(typed, &fields)
   when Type::Function(_, _) then false
-  when Type::RefInternal(inner, _) then type_kind_contains_capability(kinds, &inner)
+  when Type::RefInternal(inner, _) then type_kind_contains_capability(typed, &inner)
   when _ then false
   end
 end
 
-def type_args_contain_capability(kinds: &Map[Int, TypeKind], args: &Vec[Type]) -> Bool
+# P0-J phase-2C: the general Named-type capability walk (the pre-conversion
+# `Type::Named` arm body): the kind table (Capability) decides directly;
+# every other registered type walks its concrete args. The builtin-name
+# dispatch in type_kind_contains_capability falls back here for non-builtin
+# names (and for ids absent from the name table).
+def named_kind_contains_capability(typed: &TypedProgram, id: TypeId, args: &Vec[Type]) -> Bool
+  match typed.type_kinds.get(id.id)
+  when Option::Some(k) then
+    if k == TypeKind::Capability then
+      true
+    else
+      type_args_contain_capability(typed, args)
+    end
+  when Option::None then type_args_contain_capability(typed, args)
+  end
+end
+
+def type_args_contain_capability(typed: &TypedProgram, args: &Vec[Type]) -> Bool
   mut i = 0
   while i < args.len() do
-    if type_kind_contains_capability(kinds, &args[i]) then
+    if type_kind_contains_capability(typed, &args[i]) then
       return true
     end
     i = i + 1
@@ -387,10 +467,10 @@ def type_args_contain_capability(kinds: &Map[Int, TypeKind], args: &Vec[Type]) -
   false
 end
 
-def type_fields_contain_capability(kinds: &Map[Int, TypeKind], fields: &Vec[Type]) -> Bool
+def type_fields_contain_capability(typed: &TypedProgram, fields: &Vec[Type]) -> Bool
   mut i = 0
   while i < fields.len() do
-    if type_kind_contains_capability(kinds, &fields[i]) then
+    if type_kind_contains_capability(typed, &fields[i]) then
       return true
     end
     i = i + 1
@@ -398,10 +478,10 @@ def type_fields_contain_capability(kinds: &Map[Int, TypeKind], fields: &Vec[Type
   false
 end
 
-def type_params_contain_capability(kinds: &Map[Int, TypeKind], params: &Vec[ParamType]) -> Bool
+def type_params_contain_capability(typed: &TypedProgram, params: &Vec[ParamType]) -> Bool
   mut i = 0
   while i < params.len() do
-    if type_kind_contains_capability(kinds, &params[i].ty) then
+    if type_kind_contains_capability(typed, &params[i].ty) then
       return true
     end
     i = i + 1
@@ -416,21 +496,12 @@ def binding_name(typed: &TypedProgram, id: Int) -> String
   end
 end
 
-# The owner key of a FREE function item: its DefId via fn_owner_key (from
-# the resolver's item_defs), or the positional fallback "item::<idx>::fn" —
-# IDENTICAL to the type checker's and MIR's derivation (one semantic
-# callable -> one DefId -> one owner key in all three consumers).
-def fn_owner_key_of_item(typed: &TypedProgram, item_idx: Int) -> String
-  match typed.resolutions.item_defs.get(item_idx)
-  when Option::Some(dids) then
-    if dids.len() > 0 then
-      let did = dids[0]
-      return fn_owner_key(did.module.clone(), did.index, did.kind)
-    end
-  when Option::None then ()
-  end
-  "item::" + item_idx.to_string() + "::fn"
-end
+# The owner key of a FREE function item is derived by types.tg's
+# fn_owner_key_of_item — the SINGLE key derivation shared with the type
+# checker and MIR: the item's DefId via fn_owner_key (from the resolver's
+# item_defs / def_id_of_item), or the module-path-qualified name fallback
+# ("module::<full path>::<name>") for the no-DefId cases. One semantic
+# callable -> one DefId -> one owner key in all three consumers.
 
 # Derive the owner key for an item's function/method from the typed
 # program's resolver output (DefId-based; unique across merged files).
@@ -460,21 +531,19 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: I
   var item_defer_chain = Vec::new()
   match item.kind
   when ItemKind::ItemFunction(f) then
-    # THE SAME owner key derivation as the type checker and MIR: the item's
-    # DefId via fn_owner_key (or the positional fallback). One semantic
-    # callable -> one DefId -> one owner key across all three consumers;
-    # the DefId key must match so parameter-binding and finalize-plan
-    # lookups align (a divergent "item::<idx>::fn" key would break both).
-    # Genuinely nested-module items (item_idx -1, unmerged programs) get a
-    # MODULE-PATH-qualified key ("module::<path>::<name>") so same-named
-    # functions in different nested modules never collide.
-    var mod_key = "module::"
-    mut pi = 0
-    while pi < module_path.len() do
-      mod_key = mod_key + module_path[pi] + "::"
-      pi = pi + 1
-    end
-    let fn_key = if item_idx >= 0 then fn_owner_key_of_item(typed, item_idx) else mod_key + f.name.clone() end
+    # THE SAME owner key derivation as the type checker and MIR: types.tg's
+    # fn_owner_key_of_item — the item's DefId via fn_owner_key when the
+    # resolver recorded one (def_id_of_item), else the module-path-qualified
+    # name key "module::<full path>::<name>". One semantic callable -> one
+    # DefId -> one owner key across all three consumers (a divergent key
+    # would break parameter-binding and finalize-plan lookups). The fallback
+    # is module-qualified because module_path is the item's FULL owner path:
+    # threaded from resource_check's Program.modules walk for top-level
+    # items (item_idx >= 0) and appended level-by-level by the ItemModule
+    # arm below for genuinely nested-module items (item_idx -1, unmerged
+    # programs) — so same-named functions in different modules never
+    # collide ("module::a::b::helper" vs "module::a::c::helper").
+    let fn_key = fn_owner_key_of_item(&typed.resolutions, item_idx, module_path, f.name.clone())
     check_function(program, typed, &f, fn_key, errors, finalize_plan, edge_cleanup, &mut item_entry)
   when ItemKind::ItemStruct(s) then
     mut frame = res_frame_new()
@@ -514,9 +583,16 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, item_idx: I
       i = i + 1
     end
   when ItemKind::ItemModule(m) then
-    # Thread the module path into the owner keys so same-named functions in
-    # DIFFERENT nested modules never collide ("module::a::helper" vs
-    # "module::b::helper").
+    # P0-C (verified): the nested-module fallback key ("module::<path>::<name>"
+    # produced by fn_owner_key_of_item for item_idx -1) includes the FULL
+    # module path. The check_item module_path param threads it: each
+    # ItemModule level appends its OWN name to the path it received, so a
+    # function two levels deep under module a is keyed
+    # "module::a::b::helper" — never "module::a::helper" (one level short)
+    # or "module::helper" (path lost). Same-named functions in DIFFERENT
+    # nested modules therefore never collide. Item_idx -1 is safe: no
+    # ResolvedNames.item_defs entry exists for it, so def_id_of_item
+    # returns None and the module-path-qualified fallback is taken.
     var child_path = module_path.clone()
     child_path.push(m.name.clone())
     mut i = 0
@@ -699,6 +775,11 @@ end
 # when their type arguments contain no resource (e.g. UniquePtr[Int]).
 def is_owning_smart_pointer(typed: &TypedProgram, ty: &Type) -> Bool
   match ty
+  # P0-J phase-2C: the canonical Box/Rc own their allocation regardless of
+  # T — the same unconditional classification as the Named arm below (the
+  # named forms of Box/Rc and the other smart pointers).
+  when Type::Box(_) then true
+  when Type::Rc(_) then true
   when Type::Named(tid, _) then
     match typed.type_names.get(tid.id)
     when Option::Some(n) then
@@ -714,6 +795,12 @@ end
 # still release its buffer. Distinct from resource LINEARITY — the one
 # ownership classification below feeds binding, transfer, Copyable, and
 # the Rc payload policy.
+# P0-J phase-2C audit: this predicate is ALREADY dual-form — the canonical
+# container arms (Array/Slice/Map/Set) below sit next to the Named Adt arm
+# (which resolves Vec/Array/Map/Set/Slice by the registered name), so both
+# the canonical variants and their Named storage twins classify identically.
+# Canonical Box/Rc and their Named twins are NOT containers (smart-pointer
+# classification, see is_owning_smart_pointer) and fall through to false.
 def is_owning_container(typed: &TypedProgram, ty: &Type) -> Bool
   match ty
   when Type::Array(_, _) then true
@@ -746,7 +833,7 @@ def is_owning_typed_depth(typed: &TypedProgram, ty: &Type, depth: Int) -> Bool
     # depth guard for recursive nominal cycles (their cycle edges are not
     # owning containers)
     false
-  elsif type_kind_contains_resource(&typed.type_kinds, ty) then
+  elsif type_kind_contains_resource(typed, ty) then
     true
   else
     if is_owning_smart_pointer(typed, ty) || is_owning_container(typed, ty) then
@@ -761,33 +848,55 @@ def is_owning_typed_depth(typed: &TypedProgram, ty: &Type, depth: Int) -> Bool
       when Type::Result(ok, err) then
         is_owning_typed_depth(typed, &ok, depth + 1) || is_owning_typed_depth(typed, &err, depth + 1)
       when Type::Named(tid, args) then
-        # VIRAL needs_drop: a plain Value aggregate inherits destruction
-        # requirements from its FIELDS, substituted with the concrete
-        # generic arguments (Wrapper[UniquePtr[Int]]'s field T becomes
-        # UniquePtr[Int]).
-        let def_params = match typed.type_params.get(tid.id)
-        when Option::Some(dp) then dp.clone()
-        when Option::None then Vec::new()
-        end
-        let mut field_found = false
-        match typed.type_fields.get(tid.id)
-        when Option::Some(fields) then
-          var fi = 0
-          while fi < fields.len() do
-            let concrete_field = subst_type_args(&fields[fi], &def_params, &args)
-            if is_owning_typed_depth(typed, &concrete_field, depth + 1) then
-              field_found = true
-              break
-            end
-            fi = fi + 1
+        # P0-J phase-2C: the Named Adt (storage) twin of the Option/Result
+        # payload walks above — resolve the registered builtin id via
+        # typed.type_names and walk the payload with the same depth
+        # discipline. Every other name (and ids absent from the name table)
+        # falls back to the VIRAL field walk (named_viral_owns) unchanged.
+        match typed.type_names.get(tid.id)
+        when Option::Some(n) then
+          if n == "Option" && args.len() >= 1 then
+            is_owning_typed_depth(typed, &args[0], depth + 1)
+          elsif n == "Result" && args.len() >= 2 then
+            is_owning_typed_depth(typed, &args[0], depth + 1) || is_owning_typed_depth(typed, &args[1], depth + 1)
+          else
+            named_viral_owns(typed, tid, &args, depth)
           end
-        when Option::None then ()
+        when Option::None then named_viral_owns(typed, tid, &args, depth)
         end
-        field_found
       when _ then false
       end
     end
   end
+end
+
+# P0-J phase-2C: the general Named-type VIRAL needs_drop walk (the
+# pre-conversion `Type::Named` arm body of is_owning_typed_depth): a plain
+# Value aggregate inherits destruction requirements from its FIELDS,
+# substituted with the concrete generic arguments
+# (Wrapper[UniquePtr[Int]]'s field T becomes UniquePtr[Int]). The builtin
+# name dispatch in is_owning_typed_depth falls back here for every
+# non-Option/Result name.
+def named_viral_owns(typed: &TypedProgram, tid: TypeId, args: &Vec[Type], depth: Int) -> Bool
+  let def_params = match typed.type_params.get(tid.id)
+  when Option::Some(dp) then dp.clone()
+  when Option::None then Vec::new()
+  end
+  let mut field_found = false
+  match typed.type_fields.get(tid.id)
+  when Option::Some(fields) then
+    var fi = 0
+    while fi < fields.len() do
+      let concrete_field = subst_type_args(&fields[fi], &def_params, args)
+      if is_owning_typed_depth(typed, &concrete_field, depth + 1) then
+        field_found = true
+        break
+      end
+      fi = fi + 1
+    end
+  when Option::None then ()
+  end
+  field_found
 end
 
 # A type that cannot safely sit behind shared ownership (P0-BC): LINEAR
@@ -800,10 +909,21 @@ def is_non_shareable_type(typed: &TypedProgram, ty: &Type) -> Bool
   match ty
   when Type::Box(_) then true
   when Type::Named(tid, args) then
+    # P0-J phase-2C: the Named Adt (storage) twins of the canonical arms.
+    # Box/Rc are move-only owners like the named smart pointers (canonical
+    # Rc also classifies true through the `when _` fallback — the resource
+    # walker treats Rc's shared allocation as owning), and the container
+    # names (Option/Result/Map/Set/Slice/Array) delegate to the resource
+    # walker so their payloads keep the exact canonical `when _` fallback
+    # semantics (Option[Resource] is non-shareable through the payload walk;
+    # Rc[Vec[Int]]'s inner Vec stays shareable). Everything else keeps the
+    # kind-table classification.
     match typed.type_names.get(tid.id)
     when Option::Some(n) then
-      if n == "UniquePtr" || n == "WeakRc" || n == "ArcStrong" || n == "WeakArc" then
+      if n == "UniquePtr" || n == "WeakRc" || n == "ArcStrong" || n == "WeakArc" || n == "Box" || n == "Rc" then
         true
+      elsif n == "Option" || n == "Result" || n == "Map" || n == "Set" || n == "Slice" || n == "Array" then
+        type_kind_contains_resource(typed, ty)
       else
         match typed.type_kinds.get(tid.id)
         when Option::Some(k) then k == TypeKind::Resource || k == TypeKind::Capability
@@ -816,7 +936,7 @@ def is_non_shareable_type(typed: &TypedProgram, ty: &Type) -> Bool
     # The canonical forms: linear resources/capabilities (via the kind walker
     # for Option/Result-wrapped payloads); containers and shareable values
     # are NOT non-shareable.
-    type_kind_contains_resource(&typed.type_kinds, ty)
+    type_kind_contains_resource(typed, ty)
   end
 end
 
@@ -830,13 +950,30 @@ end
 def reject_rc_resource(typed: &TypedProgram, ty: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
   match ty
   when Type::Rc(inner) then
-    if is_non_shareable_type(typed, &inner) then
-      errors.push(ResourceError {
-        message: "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting",
-        span: span
-      })
+    reject_rc_payload(typed, &inner, span, errors)
+  when Type::Named(tid, args) then
+    # P0-J phase-2C: the Named Adt (storage) twin of the canonical Rc arm —
+    # resolve the registered builtin id via typed.type_names; the payload is
+    # the first (only) arg.
+    match typed.type_names.get(tid.id)
+    when Option::Some(n) then
+      if n == "Rc" && args.len() >= 1 then
+        reject_rc_payload(typed, &args[0], span, errors)
+      end
+    when Option::None then ()
     end
   when _ then ()
+  end
+end
+
+# P0-J phase-2C: the shared Rc-payload rejection (canonical and Named forms
+# of Rc both dispatch here): the payload must be shareable.
+def reject_rc_payload(typed: &TypedProgram, inner: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+  if is_non_shareable_type(typed, inner) then
+    errors.push(ResourceError {
+      message: "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting",
+      span: span
+    })
   end
 end
 
@@ -897,7 +1034,7 @@ def bind_param(typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key:
           res_frame_set_span(frame, &lid, p.span)
           res_frame_set_origin(frame, &lid, origin)
         end
-        if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+        if type_kind_contains_capability(typed, &lb.ty) then
           res_frame_mark_cap(frame, &lid)
         end
         Option::Some(lid)
@@ -2027,7 +2164,10 @@ def for_iter_type_kind(typed: &TypedProgram, ty: &Type) -> (Int, Type)
     when Option::None then ()
     end
     let bare = for_bare_type_name(&type_name)
-    if (bare == "Vec" || bare == "Array") && args.len() > 0 then
+    # P0-J phase-2C: the Named Adt (storage) form of Slice joins Vec/Array in
+    # the projected-iteration (source_kind 0) class — the canonical Slice arm
+    # above classifies it identically (payload = args[0]).
+    if (bare == "Vec" || bare == "Array" || bare == "Slice") && args.len() > 0 then
       (0, args[0].clone())
     elsif bare == "Map" && args.len() >= 2 then
       (1, args[1].clone())
@@ -2891,7 +3031,7 @@ def bind_pattern_ident(typed: &TypedProgram, node_id: Int, span: Span, frame: &m
         res_frame_set_span(frame, &lid, span)
         res_frame_set_origin(frame, &lid, ParamOrigin::OwnedLocal)
       end
-      if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+      if type_kind_contains_capability(typed, &lb.ty) then
         res_frame_mark_cap(frame, &lid)
       end
     when Option::None then ()
@@ -3106,7 +3246,7 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
             when _ then ()
             end
           end
-          if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+          if type_kind_contains_capability(typed, &lb.ty) then
             res_frame_mark_cap(&mut cframe, &cap_lid)
           end
         when Option::None then ()
@@ -3762,7 +3902,7 @@ def bind_closure_param(typed: &TypedProgram, cp: &ClosureParam, frame: &mut ResF
           res_frame_set_span(frame, &lid, cp.span)
           res_frame_set_origin(frame, &lid, ParamOrigin::OwnedLocal)
         end
-        if type_kind_contains_capability(&typed.type_kinds, &lb.ty) then
+        if type_kind_contains_capability(typed, &lb.ty) then
           res_frame_mark_cap(frame, &lid)
         end
         Option::Some(lid)

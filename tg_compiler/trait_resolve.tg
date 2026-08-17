@@ -5,7 +5,8 @@
 # then trait impls, ranking candidates by specificity.
 
 use tg_compiler::ast::{ Program, Item, ItemKind, ImplDecl, TraitDecl, Span, TypeExpr, TypeExprKind, AccessConvention }
-use tg_compiler::types::{ Type, TypeId, TypeEnv, TypeDef, TypeDefKind, MethodSig, ParamType, get_type_def_by_name }
+use tg_compiler::types::{ Type, TypeId, TypeEnv, TypeDef, TypeDefKind, MethodSig, ParamType, get_type_def_by_name, fn_owner_key }
+use tg_compiler::ids::DefId
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -759,6 +760,57 @@ def mono_cache_new() -> MonoCache
 end
 
 # ———————————————————————————————————————————————————————————————
+# Call-level Instance Identity (P0-AK)
+# ———————————————————————————————————————————————————————————————
+# The semantic identity of a monomorphized callee: the DEFINITION the call
+# resolves to (the typed program's call_targets DefId) plus the concrete
+# type substitutions. This is the target shape the string-only MirFnItem
+# names migrate to: a MirFnItem keeps its name as the mangled EMISSION key
+# (codegen's resolve_callee_label authority) and carries the InstanceId as
+# its semantic identity alongside. The substs are the concrete generic
+# arguments; the monomorphizer's call-site inference
+# (infer_type_args_for_call) fills them from each call site.
+
+pub struct InstanceId
+  def: DefId
+  substs: Vec[Type]
+end
+
+# The SINGLE instance -> mangled-name mapping. The base is the DefId
+# rendered by fn_owner_key (the canonical semantic rendering the resource
+# checker and MIR owner keys use — the DefId carries no source name, so
+# this rendering IS the def identity); the suffix is the existing
+# mangle_name applied to the concrete substitutions. Deterministic per
+# (def, substs), so the same instance always maps to the same name.
+#
+# THE EMISSION-NAME FLOW (P0-AM, final): this function is the mangling
+# AUTHORITY — symbol names are produced only at this boundary, never at the
+# source level. The full flow for every top-level function:
+#
+#   source name (diagnostics/display only)
+#     -> DefId (resolver: ResolvedNames.item_defs / call_targets — the
+#        module + per-module symbol index; record_item_def guarantees one
+#        for every top-level function)
+#     -> fn_owner_key (semantic identity: "<module path>::<index>::fn" —
+#        the P0-C key, rendered by fn_owner_key in types.tg)
+#     -> instance_key / mangle_name (the mangled EMISSION name: for a
+#        non-generic function, instance_key with empty substs IS the
+#        fn_owner_key base; for a generic instantiation, mangle_name
+#        appends the "$<concrete args>" suffix — the symbol-mangling
+#        boundary, where the MirFunction/MirFnItem name is produced)
+#     -> label (codegen's fn_alias identity entry ".Lfn_entry.<index>",
+#        resolved by resolve_callee_label)
+#
+# The source name survives ONLY at the linking boundary (extern symbols,
+# intrinsic names, the OS-entry "main"/"_start") and in diagnostics. Method
+# names ("Type__method") are exempt by design: the finalizer and registered
+# Drop identities depend on them unchanged.
+pub def instance_key(instance: &InstanceId) -> String
+  let base = fn_owner_key(instance.def.module.clone(), instance.def.index, instance.def.kind)
+  mangle_name(base, &instance.substs)
+end
+
+# ———————————————————————————————————————————————————————————————
 # Type-Param Helper Predicates
 # ———————————————————————————————————————————————————————————————
 
@@ -1403,12 +1455,18 @@ def param_positions_use_name(func: &MirFunction, name: &String) -> Bool
   false
 end
 
-# Infer concrete type arguments for a generic function from a call site.
-# For each type parameter name of the generic function, structurally match
-# the callee's parameter types against the call's argument types; a name
-# bound in a parameter position is taken from the argument SUB-STRUCTURE.
-# Names that appear in no parameter position are resolved from the caller's
-# destination (return-type-only case) or fall back to the legacy heuristic.
+# P0-AL (final): infer concrete type arguments for a generic function from
+# a call site — the FALLBACK ONLY for calls without a recorded solved
+# instance (IR-synthesized calls and the residual shapes no checker context
+# solved). Source calls consume their recorded instances with ZERO
+# inference; this structural argument-match is the "instantiate with the
+# caller's context" rule for the rest. For each type parameter name of the
+# generic function, structurally match the callee's parameter types against
+# the call's argument types; a name bound in a parameter position is taken
+# from the argument SUB-STRUCTURE. Names that appear in no parameter
+# position are resolved from the caller's destination
+# (return-type-only case — the MIR dest_place_type gives the caller's
+# expected type) or fall back to the legacy heuristic.
 # Returns type_args in the same order as type_param_names, plus any
 # inference errors.
 def infer_type_args_for_call(
@@ -1526,14 +1584,20 @@ def type_subst_new(type_param_names: &Vec[String], type_args: &Vec[Type]) -> Typ
   TypeSubstMap { params: params }
 end
 
-def specialize_function(
+# P0-AL: specialize a generic function under an EXPLICIT mangled name — the
+# solved-instance path's specialization. When a call's MirFnItem carries a
+# solved instance, the specialized body is named by the INSTANCE's key
+# (instance_key) so the emitted name and the cache key agree; the fallback
+# name-derived path (specialize_function below) delegates here after
+# computing mangle_name. The specialization always proceeds from the given
+# (solved or inferred) type args.
+def specialize_function_named(
   cache: &mut MonoCache,
   original: &MirFunction,
   type_param_names: &Vec[String],
-  type_args: &Vec[Type]
+  type_args: &Vec[Type],
+  mangled: String
 ) -> MirFunction
-  let mangled = monomorphize(cache, original.name.clone(), type_args.clone())
-  
   # If already specialized, return cached version
   match cache.specialized_bodies.get(&mangled)
   when Option::Some(existing) then return existing.clone()
@@ -1594,15 +1658,21 @@ def specialize_function(
     })
   end
   
-  # Verification: after instantiation, no Type::Param from the callee's
-  # parameter list may remain in the instantiated types.  An uninferred
-  # parameter would poison the mangled name and the specialized body.
+  # Verification: after instantiation, a CONCRETE codegen instance must
+  # carry no Type::Param and no unresolved Type::Var anywhere in the
+  # instantiated types (params, return type, locals). An uninferred
+  # parameter would poison the mangled name and the specialized body; a
+  # Var (produced when the substitution chased a still-generic caller's
+  # argument type) is equally non-codegenable. A violation records an
+  # error and fails the specialization (the body is not cached, so the
+  # call site is never rewritten to a poisoned name).
   match residual_param_in_function(&specialized, type_param_names)
-  when Option::Some(pname) then
-    let msg = "type parameter `" + pname + "` remains in instantiated types of `" + original.name + "`"
+  when Option::Some(what) then
+    let msg = what + " remains in instantiated types of `" + original.name + "`"
     if !cache.errors.contains(&msg) then
       cache.errors.push(msg)
     end
+    return specialized
   when Option::None then ()
   end
   
@@ -1611,27 +1681,189 @@ def specialize_function(
   specialized
 end
 
-# Find the first callee parameter name that still appears as a Type::Param
-# anywhere in the instantiated function (params, return type, or locals).
+def specialize_function(
+  cache: &mut MonoCache,
+  original: &MirFunction,
+  type_param_names: &Vec[String],
+  type_args: &Vec[Type]
+) -> MirFunction
+  # Name-derived path (unsolved shapes): the mangled name comes from the
+  # function name + type args. Solved-instance calls instead pass the
+  # instance's key (instance_key) directly to specialize_function_named.
+  let mangled = monomorphize(cache, original.name.clone(), type_args.clone())
+  specialize_function_named(cache, original, type_param_names, type_args, mangled)
+end
+
+# P0-AL (final): the post-instantiation verification. A specialized body is
+# a CONCRETE codegen instance: it must contain no Type::Param and no
+# unresolved Type::Var anywhere (params, return type, locals). The first
+# violation is described as:
+#   - "type parameter `<name>`" — the callee's own parameter the
+#     substitution failed to cover (a recorded instance whose substs are
+#     shorter than infer_type_param_names), or a stray Param from a
+#     still-generic caller's argument types;
+#   - "inference variable (Type::Var)" — a Var the substitution produced
+#     (the type args carried it; the subst resolution chases env.subst at
+#     specialization time and a Var has no mapping there).
 def residual_param_in_function(f: &MirFunction, names: &Vec[String]) -> Option[String]
   for name in names do
     if type_uses_param_name(&f.ret_type, &name) then
-      return Option::Some(name.clone())
+      return Option::Some("type parameter `" + name + "`")
     end
     for p in f.params do
       if type_uses_param_name(&p.ty, &name) then
-        return Option::Some(name.clone())
+        return Option::Some("type parameter `" + name + "`")
       end
     end
     for l in f.locals do
       if type_uses_param_name(&l.ty, &name) then
-        return Option::Some(name.clone())
+        return Option::Some("type parameter `" + name + "`")
       end
+    end
+  end
+  match first_param_name_in_function(f)
+  when Option::Some(pname) then return Option::Some("type parameter `" + pname + "`")
+  when Option::None then ()
+  end
+  if residual_var_in_function(f) then
+    return Option::Some("inference variable (Type::Var)")
+  end
+  Option::None
+end
+
+# Find the first Type::Param name anywhere in a function's instantiated
+# types (params, return type, locals).
+def first_param_name_in_function(f: &MirFunction) -> Option[String]
+  match first_param_name_in_type(&f.ret_type)
+  when Option::Some(n) then return Option::Some(n)
+  when Option::None then ()
+  end
+  for p in f.params do
+    match first_param_name_in_type(&p.ty)
+    when Option::Some(n) then return Option::Some(n)
+    when Option::None then ()
+    end
+  end
+  for l in f.locals do
+    match first_param_name_in_type(&l.ty)
+    when Option::Some(n) then return Option::Some(n)
+    when Option::None then ()
     end
   end
   Option::None
 end
 
+# Find the first Type::Param name in a type (mirrors type_has_params).
+def first_param_name_in_type(ty: &Type) -> Option[String]
+  match ty
+  when Type::Param(name) then Option::Some(name.clone())
+  when Type::Option(inner) then first_param_name_in_type(inner)
+  when Type::Result(ok, err) then
+    match first_param_name_in_type(ok)
+    when Option::Some(n) then Option::Some(n)
+    when Option::None then first_param_name_in_type(err)
+    end
+  when Type::Map(k, v) then
+    match first_param_name_in_type(k)
+    when Option::Some(n) then Option::Some(n)
+    when Option::None then first_param_name_in_type(v)
+    end
+  when Type::Set(inner) then first_param_name_in_type(inner)
+  when Type::Slice(inner) then first_param_name_in_type(inner)
+  when Type::Array(inner, _) then first_param_name_in_type(inner)
+  when Type::Tuple(elems) then
+    for e in elems do
+      match first_param_name_in_type(&e)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Type::Function(params, ret) then
+    for p in params do
+      match first_param_name_in_type(&p.ty)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    first_param_name_in_type(ret)
+  when Type::Named(_, args) then
+    for a in args do
+      match first_param_name_in_type(&a)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Type::RefInternal(inner, _) then first_param_name_in_type(inner)
+  when Type::Ptr(inner) then first_param_name_in_type(inner)
+  when Type::PtrMut(inner) then first_param_name_in_type(inner)
+  when Type::Box(inner) then first_param_name_in_type(inner)
+  when Type::Rc(inner) then first_param_name_in_type(inner)
+  when Type::Effect(_, inner) then first_param_name_in_type(inner)
+  when _ then Option::None
+  end
+end
+
+# Whether any unresolved Type::Var appears anywhere in a function's
+# instantiated types.
+def residual_var_in_function(f: &MirFunction) -> Bool
+  if type_has_unresolved_var(&f.ret_type) then return true end
+  for p in f.params do
+    if type_has_unresolved_var(&p.ty) then return true end
+  end
+  for l in f.locals do
+    if type_has_unresolved_var(&l.ty) then return true end
+  end
+  false
+end
+
+# Whether a type contains any Type::Var (mirrors type_has_params).
+def type_has_unresolved_var(ty: &Type) -> Bool
+  match ty
+  when Type::Var(_) then true
+  when Type::Option(inner) then type_has_unresolved_var(inner)
+  when Type::Result(ok, err) then type_has_unresolved_var(ok) || type_has_unresolved_var(err)
+  when Type::Map(k, v) then type_has_unresolved_var(k) || type_has_unresolved_var(v)
+  when Type::Set(inner) then type_has_unresolved_var(inner)
+  when Type::Slice(inner) then type_has_unresolved_var(inner)
+  when Type::Array(inner, _) then type_has_unresolved_var(inner)
+  when Type::Tuple(elems) then
+    var found = false
+    for e in elems do
+      if type_has_unresolved_var(&e) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    var found = false
+    for p in params do
+      if type_has_unresolved_var(&p.ty) then found = true; break end
+    end
+    found || type_has_unresolved_var(ret)
+  when Type::Named(_, args) then
+    var found = false
+    for a in args do
+      if type_has_unresolved_var(&a) then found = true; break end
+    end
+    found
+  when Type::RefInternal(inner, _) then type_has_unresolved_var(inner)
+  when Type::Ptr(inner) then type_has_unresolved_var(inner)
+  when Type::PtrMut(inner) then type_has_unresolved_var(inner)
+  when Type::Box(inner) then type_has_unresolved_var(inner)
+  when Type::Rc(inner) then type_has_unresolved_var(inner)
+  when Type::Effect(_, inner) then type_has_unresolved_var(inner)
+  when _ then false
+  end
+end
+
+# P0-AL (final): the ONE exhaustive substitution visitor — the sole
+# substitution path into a specialized body. Every structural Type variant
+# (Named/Tuple/Function/RefInternal/Ptr/PtrMut/Box/Rc/Option/Result/Map/
+# Set/Array/Slice/Effect) is rebuilt with its inner types substituted; the
+# non-structural variants (primitives, Var, Error, Dyn) are identity-cloned
+# by the fallback arm. The post-instantiation verification
+# (residual_param_in_function) rejects any Param/Var the visitor leaves
+# behind.
 def substitute_type(subst: &TypeSubstMap, ty: &Type) -> Type
   match ty
   when Type::Param(name) then
@@ -1720,7 +1952,8 @@ def substitute_operand(subst: &TypeSubstMap, op: &MirOperand) -> MirOperand
   when MirOperandKind::MirConstant(c) then
     MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
       kind: c.kind.clone(),
-      ty: substitute_type(subst, &c.ty)
+      ty: substitute_type(subst, &c.ty),
+      instance: c.instance.clone()
     })}
   end
 end
@@ -1844,27 +2077,49 @@ def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &mut MonoCache) -
               # Look up the function definition in the program
               for candidate in mir.functions do
                 if candidate.name == callee_name then
-                  # Infer concrete type args from this call site
-                  let type_param_names = infer_type_param_names(candidate)
-                  let inference = infer_type_args_for_call(
-                    candidate, &type_param_names, func, args, &dest
-                  )
-                  for err in inference.errors do
-                    if !cache.errors.contains(&err) then
-                      cache.errors.push(err)
+                  # P0-AL (final): a SOLVED INSTANCE is the AUTHORITY. When
+                  # the call operand's MirConstant carries an instance with
+                  # NON-EMPTY substs (the type checker solved this call's
+                  # generic arguments), use inst.substs as the type args
+                  # DIRECTLY — zero inference for this call; instance_key
+                  # produces the mangled name.
+                  # P0-AL doc: solved instances are the authority; infer_type_args_for_call is the fallback only for unsolved shapes (None/empty instances, or solved substs still carrying Params from a generic caller).
+                  var mangled = "".to_string()
+                  var used_instance = false
+                  match const_val.instance.clone()
+                  when Option::Some(inst) then
+                    if !inst.substs.is_empty() && !has_any_param_types(&inst.substs) then
+                      mangled = instance_key(&inst)
+                      used_instance = true
                     end
+                  when Option::None then ()
                   end
-                  let type_args = inference.type_args
-                  # Compute the mangled name and check the cache
-                  let mangled = mangle_name(callee_name.clone(), &type_args)
+                  if !used_instance then
+                    # Infer concrete type args from this call site (fallback)
+                    let type_param_names = infer_type_param_names(candidate)
+                    let inference = infer_type_args_for_call(
+                      candidate, &type_param_names, func, args, &dest
+                    )
+                    for err in inference.errors do
+                      if !cache.errors.contains(&err) then
+                        cache.errors.push(err)
+                      end
+                    end
+                    # Compute the mangled name and check the cache
+                    mangled = mangle_name(callee_name.clone(), &inference.type_args)
+                  end
                   if cache.specialized_bodies.contains_key(&mangled) then
-                    # Rewrite the call site to use the mangled name
+                    # Rewrite the call site to use the mangled name. The
+                    # rewritten MirFnItem KEEPS the constant's P0-AK instance
+                    # payload (the semantic callee identity survives the
+                    # emission-key rewrite).
                     block.terminator.kind = MirTerminatorKind::MirCall(
                       dest.clone(),
                       MirOperand {
                         kind: MirOperandKind::MirConstant(MirConstant {
                           kind: MirConstantKind::MirFnItem(mangled),
-                          ty: const_val.ty.clone()
+                          ty: const_val.ty.clone(),
+                          instance: const_val.instance.clone()
                         })
                       },
                       args.clone(),
@@ -1897,9 +2152,24 @@ end
 # ———————————————————————————————————————————————————————————————
 # Monomorphize Program: worklist-based entry point
 # ———————————————————————————————————————————————————————————————
-# Iterates until no new generic call sites remain.  After each
-# iteration, calls rewrite_call_sites_in_program so that existing
-# call sites are updated to point to the newly-mangled names.
+# P0-AL (final): the worklist is instance-driven. The entry instances are
+# the generic call sites of the program's functions; each call's callee
+# instance is the SOLVED substitution the type checker recorded for the
+# call node (typed_call_instances, threaded through the MirFnItem's
+# InstanceId payload). The worklist specializes each discovered instance
+# and then REWALKS the specialized bodies' calls, discovering the callee
+# instances TRANSITIVELY — the exhaustive walk. A call to an
+# already-specialized instance is a cache hit (specialized_bodies keyed by
+# instance_key). The checker solves EVERY source-call shape (impl-registry
+# methods, builtin-method generics, extension-impl methods, and
+# return-type-only parameters via the caller's annotation context), so the
+# fallback — infer_type_args_for_call, the structural argument-match — is
+# zero-inference for source calls: it fires only for IR-synthesized calls
+# and the residual shapes no context ever solved (a return-type-only
+# parameter without an annotation, solved by the MIR destination local's
+# type). Iterates until no new generic call sites remain; after each
+# iteration, calls rewrite_call_sites_in_program so that existing call
+# sites are updated to point to the newly-mangled names.
 
 def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
   var changed = true
@@ -1913,8 +2183,20 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
       return
     end
 
-    # Phase 1: collect generic call sites and infer type args
-    var worklist: Vec[(String, Vec[Type])] = Vec::new()
+    # Phase 1: collect generic call sites and infer type args. Worklist
+    # entries carry (callee name, type args, mangled name): a call whose
+    # MirFnItem constant carries a SOLVED instance (non-empty, fully
+    # concrete substs) enters under the INSTANCE's key.
+    # P0-AL (final): the recorded instances cover every shape the checker
+    # solves — the impl-registry generic methods, the builtin-method
+    # generics (Option::map / Result::and_then / ...), the extension-impl
+    # methods (`impl[T, I: Iterator[T]] I`), and the return-type-only
+    # parameters solved by the caller's annotation context. The fallback
+    # below (infer_type_args_for_call) therefore fires only for
+    # IR-synthesized calls (no InstanceId payload) and the residual
+    # unsolved shapes — its structural argument-match IS the
+    # "instantiate with the caller's context" rule for those calls.
+    var worklist: Vec[(String, Vec[Type], String)] = Vec::new()
     for func in mir.functions do
       for block in func.blocks do
         match block.terminator.kind
@@ -1929,22 +2211,46 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
                   if is_generic_function(candidate) then
                     let type_param_names = infer_type_param_names(candidate)
                     if !type_param_names.is_empty() then
-                      # Infer concrete type args from the call site
-                      let inference = infer_type_args_for_call(
-                        candidate, &type_param_names, func, args, &dest
-                      )
-                      for err in inference.errors do
-                        if !cache.errors.contains(&err) then
-                          cache.errors.push(err)
+                      # P0-AL (final): a SOLVED INSTANCE is the AUTHORITY.
+                      # When the MirFnItem constant carries an instance with
+                      # non-empty substs that are fully concrete (the type
+                      # checker solved them), use inst.substs DIRECTLY as the
+                      # type args — zero inference for this call — and take
+                      # the mangled name from instance_key.
+                      # P0-AL doc: solved instances are the authority; infer_type_args_for_call is the fallback only for unsolved shapes (solved substs still carrying Params from a still-generic caller are NOT usable yet: they defer exactly as the inferred-arg guard below defers Param-carrying args).
+                      var solved_mangled: Option[String] = Option::None
+                      var solved_args: Vec[Type] = Vec::new()
+                      match cv.instance.clone()
+                      when Option::Some(inst) then
+                        if !inst.substs.is_empty() && !has_any_param_types(&inst.substs) then
+                          solved_args = inst.substs.clone()
+                          solved_mangled = Option::Some(instance_key(&inst))
                         end
+                      when Option::None then ()
                       end
-                      let type_args = inference.type_args
-                      # Skip entries where any inferred arg is itself a Param —
-                      # those would create $any$any-mangled cycles when the
-                      # caller is itself a specialization whose locals still
-                      # carry Param types.  Only enqueue fully-concrete args.
-                      if !has_any_param_types(&type_args) then
-                        worklist.push((callee_name.clone(), type_args))
+                      match solved_mangled
+                      when Option::Some(mangled) then
+                        worklist.push((callee_name.clone(), solved_args, mangled))
+                      when Option::None then
+                        # Infer concrete type args from the call site
+                        # (infer_type_args_for_call is the documented
+                        # FALLBACK for unsolved shapes)
+                        let inference = infer_type_args_for_call(
+                          candidate, &type_param_names, func, args, &dest
+                        )
+                        for err in inference.errors do
+                          if !cache.errors.contains(&err) then
+                            cache.errors.push(err)
+                          end
+                        end
+                        let type_args = inference.type_args
+                        # Skip entries where any inferred arg is itself a Param —
+                        # those would create $any$any-mangled cycles when the
+                        # caller is itself a specialization whose locals still
+                        # carry Param types.  Only enqueue fully-concrete args.
+                        if !has_any_param_types(&type_args) then
+                          worklist.push((callee_name.clone(), type_args, mangle_name(callee_name.clone(), &type_args)))
+                        end
                       end
                     end
                   end
@@ -1960,11 +2266,13 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
       end
     end
 
-    # Phase 2: specialize each entry and add to program
+    # Phase 2: specialize each entry and add to program. The cache key is
+    # the entry's mangled name — for solved-instance entries that IS the
+    # instance's key (instance_key), so the cache key path uses the solved
+    # args consistently: the same name the rewrite pass will emit.
     var new_funcs: Vec[MirFunction] = Vec::new()
-    for (func_name, type_args) in worklist do
+    for (func_name, type_args, mangled) in worklist do
       # Check if already specialized (cache hit)
-      let mangled = mangle_name(func_name.clone(), &type_args)
       if cache.specialized_bodies.contains_key(&mangled) then
         next
       end
@@ -1981,7 +2289,7 @@ def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
       when Option::Some(original) then
         let type_param_names = infer_type_param_names(original)
         if !type_param_names.is_empty() then
-          let specialized = specialize_function(cache, original, &type_param_names, &type_args)
+          let specialized = specialize_function_named(cache, original, &type_param_names, &type_args, mangled)
           new_funcs.push(specialized)
           changed = true
         end
@@ -2063,6 +2371,62 @@ pub def mono_specialize_function(
     report_mono_errors(cache)
 
     Option::Some(mangled)
+  end
+end
+
+# Public API: monomorphize_instance — the specialize path keyed by a
+# semantic InstanceId instead of a name string. A caller that holds the
+# call site's (def, substs) requests the instance directly; the body is
+# produced through the SAME specialize_function path as the worklist
+# monomorphizer, so cache identity and mangling stay single-sourced.
+#
+# NOTE (P0-AK layer): the MIR call lowering records the DefId with EMPTY
+# substs — the typed program does not yet expose the checker's solved
+# substitutions — so an instance requested directly in this layer must
+# already carry concrete substitutions; empty substs are rejected with the
+# documented inference note. The worklist monomorphizer
+# (monomorphize_program) remains the authority that fills empty substs
+# from each call site via infer_type_args_for_call.
+# P0-AM (final): the base-name lookup below is the DefId rendering
+# (fn_owner_key) — and MirFunction names ARE that same rendering for
+# top-level functions (mir.tg's lower_program records mir_fn_emission_name
+# from item_defs), so the seam is closed: the instance's base name and the
+# lowered function's emission name agree byte-for-byte, and the
+# `f.name == base` search below finds the definition. Methods stay
+# name-based (the "Type__method" mangled identities), and the OS-entry
+# function keeps its source name (the linking boundary).
+pub def monomorphize_instance(
+  cache: &mut MonoCache,
+  mir: &mut MirProgram,
+  instance: &InstanceId
+) -> Result[Unit, String]
+  let base = fn_owner_key(instance.def.module.clone(), instance.def.index, instance.def.kind)
+  if instance.substs.is_empty() then
+    return Result::Err("instance " + base + " has empty substitutions — the call-site inference pass (infer_type_args_for_call) fills them during monomorphize_program")
+  end
+  let mangled = mangle_name(base.clone(), &instance.substs)
+  if cache.specialized_bodies.contains_key(&mangled) then
+    return Result::Ok(())
+  end
+  var found: Option[&MirFunction] = Option::None
+  for f in mir.functions do
+    if f.name == base then
+      found = Option::Some(f)
+      break
+    end
+  end
+  match found
+  when Option::Some(original) then
+    let type_param_names = infer_type_param_names(original)
+    if type_param_names.is_empty() then
+      return Result::Ok(())
+    end
+    let specialized = specialize_function_named(cache, original, &type_param_names, &instance.substs, mangled.clone())
+    mir.functions.push(specialized)
+    rewrite_call_sites_in_program(mir, cache)
+    Result::Ok(())
+  when Option::None then
+    Result::Err("instance base `" + base + "` not found in the MIR program")
   end
 end
 

@@ -19,10 +19,12 @@ use tg_compiler::ast::{
 use tg_compiler::types::{
   Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding, TypeKind,
   type_kinds_contain_resource, DeinitPlan, build_deinit_plan, fn_owner_key,
-  subst_type_args, deinit_plan_is_trivial
+  module_qualified_fn_key, subst_type_args, deinit_plan_is_trivial
 }
-use tg_compiler::ids::{FieldId, DefId}
+use tg_compiler::ids::{FieldId, DefId, DefKind}
+use tg_compiler::resolver::{module_path_of_item_resolver}
 use tg_compiler::resource_check::{resource_check, IterationPlan}
+use tg_compiler::trait_resolve::{InstanceId, instance_key, monomorphize_instance}
 
 # ———————————————————————————————————————————————————————————————
 # MIR Types
@@ -199,6 +201,22 @@ def resolve_iter_expr_type(b: &MirBuilder, expr: &Expr) -> Type
         else
           Type::Array(v_ty.clone(), 0)
         end
+      when Type::Named(tid, args) then
+        # P0-J2: Named Adt form of Map mirrors the canonical Map arm (key /
+        # value via the Adt args).
+        let iter_named = match b.typed_type_names.get(tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
+        end
+        if iter_named == "Map" && args.len() >= 2 then
+          if method_name == "keys" then
+            Type::Array(args[0].clone(), 0)
+          else
+            Type::Array(args[1].clone(), 0)
+          end
+        else
+          Type::Array(Type::String, 0)
+        end
       when _ then
         Type::Array(Type::String, 0)
       end
@@ -274,6 +292,13 @@ end
 struct MirConstant
   kind: MirConstantKind
   ty: Type
+  # P0-AK: the optional SEMANTIC callee identity carried by MirFnItem
+  # constants. The name inside MirFnItem remains the mangled EMISSION key
+  # (codegen's resolve_callee_label authority); this InstanceId is the
+  # semantic identity — the string stage is the boundary the reviewer's
+  # InstanceId migration removes. Option::None for every non-call constant
+  # and for synthesized IR-only callees (the name-only form).
+  instance: Option[InstanceId]
 end
 
 enum MirConstantKind
@@ -283,6 +308,10 @@ enum MirConstantKind
   MirFloat(Float)
   MirChar(Char)
   MirString(String)
+  # Named function item — carries the symbol name. The name is the mangled
+  # emission key; the DefId/InstanceId (MirConstant.instance) is the
+  # semantic identity carried alongside; the string stage is the boundary
+  # the InstanceId migration removes.
   MirFnItem(String)    # Named function item — carries the symbol name
   MirZeroSized
   MirStaticRef(String) # Read current value of a global/static variable
@@ -332,35 +361,42 @@ def duplicate_place(place: &Place) -> Place
 end
 
 def constant_unit() -> MirConstant
-  MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit }
+  MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit, instance: Option::None }
 end
 
 def constant_bool(value: Bool) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirBool(value), ty: Type::Bool }
+  MirConstant { kind: MirConstantKind::MirBool(value), ty: Type::Bool, instance: Option::None }
 end
 
 def constant_int(value: Int) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirInt(value), ty: Type::Int }
+  MirConstant { kind: MirConstantKind::MirInt(value), ty: Type::Int, instance: Option::None }
 end
 
 def constant_float(value: Float) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirFloat(value), ty: Type::Float }
+  MirConstant { kind: MirConstantKind::MirFloat(value), ty: Type::Float, instance: Option::None }
 end
 
 def constant_string(value: String) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirString(value), ty: Type::String }
+  MirConstant { kind: MirConstantKind::MirString(value), ty: Type::String, instance: Option::None }
 end
 
 def constant_char(value: Char) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirChar(value), ty: Type::Char }
+  MirConstant { kind: MirConstantKind::MirChar(value), ty: Type::Char, instance: Option::None }
 end
 
 def constant_fn_item(name: String, ty: Type) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirFnItem(name), ty: ty }
+  constant_fn_item_with_instance(name, ty, Option::None)
+end
+
+# P0-AK: MirFnItem with the optional semantic instance payload (the
+# DefId+substs identity recorded from the typed call target). Callers that
+# only have the name keep the name-only form via constant_fn_item.
+def constant_fn_item_with_instance(name: String, ty: Type, instance: Option[InstanceId]) -> MirConstant
+  MirConstant { kind: MirConstantKind::MirFnItem(name), ty: ty, instance: instance }
 end
 
 def constant_zero_sized(ty: Type) -> MirConstant
-  MirConstant { kind: MirConstantKind::MirZeroSized, ty: ty }
+  MirConstant { kind: MirConstantKind::MirZeroSized, ty: ty, instance: Option::None }
 end
 
 def operand_unit() -> MirOperand
@@ -391,12 +427,19 @@ def duplicate_constant(constant: &MirConstant) -> MirConstant
   when MirConstantKind::MirFloat(value) then constant_float(value)
   when MirConstantKind::MirChar(value) then constant_char(value)
   when MirConstantKind::MirString(value) then constant_string(value.clone())
-  when MirConstantKind::MirFnItem(name) then constant_fn_item(name.clone(), constant.ty.clone())
+  when MirConstantKind::MirFnItem(name) then
+    # P0-AK: the instance payload is part of the constant's identity and
+    # must survive duplication (deferred-emission clones, P0-Y templates).
+    MirConstant {
+      kind: MirConstantKind::MirFnItem(name.clone()),
+      ty: constant.ty.clone(),
+      instance: constant.instance.clone()
+    }
   when MirConstantKind::MirZeroSized then constant_zero_sized(constant.ty.clone())
   when MirConstantKind::MirStaticRef(name) then
-    MirConstant { kind: MirConstantKind::MirStaticRef(name.clone()), ty: constant.ty.clone() }
+    MirConstant { kind: MirConstantKind::MirStaticRef(name.clone()), ty: constant.ty.clone(), instance: Option::None }
   when MirConstantKind::MirStaticAddr(name) then
-    MirConstant { kind: MirConstantKind::MirStaticAddr(name.clone()), ty: constant.ty.clone() }
+    MirConstant { kind: MirConstantKind::MirStaticAddr(name.clone()), ty: constant.ty.clone(), instance: Option::None }
   end
 end
 
@@ -949,6 +992,15 @@ struct MirBuilder
   type_name_to_id: Map[String, Int]
   type_defs: Vec[MirTypeDef]
   impl_type_map: Map[String, String]
+  # P0-AL: bare method name -> the impl-registered mangled name, for the
+  # EXTENSION impls — impls whose for_type is a generic PARAMETER
+  # (`impl[T, I: Iterator[T]] I`, lowered as "I__map"/"I__any"/...). The
+  # call-site method resolution names a callee from the RECEIVER's type
+  # (TypeName__method), which cannot match an extension method; this table
+  # maps the bare method name to the extension impl's mangled function so
+  # such calls lower to the real callee. Only param-for_type impls register
+  # here, so a bare name never collides across extension impls.
+  param_impl_methods: Map[String, String]
   fn_ret_types: Map[String, Type]
   # deinit_targets maps a type id to its deinit callable. Values are still
   # mangled names for ABI emission; TODO: move to a typed DefId/CallableId
@@ -1002,6 +1054,13 @@ struct MirBuilder
   # Call expression node id -> resolved DefId from the typed program, so MIR
   # carries the semantic callable identity instead of re-resolving by name.
   call_def_ids: Map[Int, DefId]
+  # P0-AK (final): call expr node id -> the type checker's SOLVED generic
+  # substitution (the callee's generic args in the callee's parameter
+  # order), paired with call_def_ids. The solved substitutions from the
+  # type checker are the AUTHORITY; the monomorphizer's inference is the
+  # FALLBACK for synthesized/unsolved calls — mir_call_instance fills the
+  # instance's substs from this map; absent entries keep empty substs.
+  call_instances: Map[Int, Vec[Type]]
   # Typed identifier resolutions (expr node id -> local id); the semantic
   # source for lr_ident (name-based scope lookup is the transitional
   # fallback).
@@ -1089,6 +1148,7 @@ def builder_new() -> MirBuilder
     type_name_to_id: Map::new(),
     type_defs: Vec::new(),
     impl_type_map: Map::new(),
+    param_impl_methods: Map::new(),
     fn_ret_types: Map::new(),
     deinit_targets: Map::new(),
     finalize_plan: Map::new(),
@@ -1100,6 +1160,7 @@ def builder_new() -> MirBuilder
     current_fn_key: "",
     item_defs: Map::new(),
     call_def_ids: Map::new(),
+    call_instances: Map::new(),
     ident_resolutions: Map::new(),
     closure_captures: Map::new(),
     return_edge_blocks: Set::new(),
@@ -1196,7 +1257,20 @@ end
 # Whether a deinit callable with the given (mangled) name is registered for
 # any type — used to detect that the function being lowered IS a finalizer
 # (whose own self must never be re-finalized).
-def mir_fn_owner_key(b: &MirBuilder, item_idx: Int) -> String
+#
+# P0-A (final layer): the owner key of a FREE function item — the SAME key
+# the resource checker and the type checker derive (types.tg's
+# fn_owner_key_of_item): the item's DefId rendered via fn_owner_key
+# ("<module path>::<index>::fn") when the resolver recorded one, else the
+# module-path-qualified name fallback ("module::<full path>::<name>" via
+# module_qualified_fn_key). The identity flow is: the SEMANTIC function
+# identity is the module-qualified DefId-derived key (this is what the
+# finalize_plan / edge_cleanup / param-binding plans are keyed by); the
+# MirFunction/MirFnItem NAME is the symbol-mangling boundary (the emission
+# name), which codegen maps to labels. The fallback is only reachable for an
+# item the resolver never recorded a DefId for — it must produce a key
+# BYTE-IDENTICAL to the checker's, or the plan lookups below silently miss.
+def mir_fn_owner_key(b: &MirBuilder, item_idx: Int, module_path: &Vec[String], name: String) -> String
   match b.item_defs.get(item_idx)
   when Option::Some(dids) then
     if dids.len() > 0 then
@@ -1205,7 +1279,75 @@ def mir_fn_owner_key(b: &MirBuilder, item_idx: Int) -> String
     end
   when Option::None then ()
   end
-  "item::" + item_idx.to_string() + "::fn"
+  module_qualified_fn_key(module_path, name)
+end
+
+# P0-AM: the EMISSION name of a top-level function item — the name the
+# MirFunction carries and codegen emits as its symbol/label. The identity
+# flow is: source name -> DefId (resolver's item_defs, threaded by
+# lower_program's module-path walk) -> fn_owner_key (semantic identity,
+# "<module path>::<index>::fn") -> the emission name (symbol-mangling
+# boundary) -> codegen label. The source name survives ONLY as the
+# diagnostics/display name.
+#
+# The single name-based residual: the OS-ENTRY function (source name "main"
+# or "_start"). The linker's entry contract is unchangeable here (linker.tg
+# resolves the entry symbol "main"/"_start" literally and injects _start
+# calling "main"), so the entry function's emission name stays its source
+# name — the linking boundary, exactly like extern symbols. Every
+# REFERENCE to the entry keeps the source name too (see
+# mir_callee_emission_name).
+def mir_fn_emission_name(b: &MirBuilder, item_idx: Int, module_path: &Vec[String], name: String) -> String
+  if name == "main" || name == "_start" then
+    return name
+  end
+  match b.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if dids.len() > 0 then
+      let did = dids[0]
+      return fn_owner_key(did.module.clone(), did.index, did.kind)
+    end
+  when Option::None then ()
+  end
+  name
+end
+
+# P0-AM: the EMISSION name of a CALL SITE's MirFnItem. When the call carries
+# an InstanceId whose DefId is a TOP-LEVEL FUNCTION (DefKind::Function), the
+# callee name is the instance's fn_owner_key rendering — the SAME key the
+# callee function's own lowering recorded (mir_fn_emission_name over
+# item_defs), so the call reference and the emitted function name agree
+# byte-for-byte and codegen's resolve_callee_label resolves through the
+# identity entry. The fn_ret_types membership check is the structural
+# verification that the derived name exists in THIS program; when it misses
+# (a DefId whose module rendering diverges — e.g. a legacy module-less
+# target, or a path that resolved to a different module than the item's
+# owner), the source name is kept: the documented name-based fallback for
+# that exact shape.
+#
+# Everything else keeps its name, unchanged:
+#   - methods (DefKind::Method) keep the "Type__method" mangled names — the
+#     finalizer and registered-Drop identities depend on them;
+#   - intrinsics/externs keep source names (the linking boundary);
+#   - the OS-entry function keeps its source name ("main"/"_start"), and so
+#     does every reference to it;
+#   - synthesized/IR-only calls carry no instance and keep the name.
+def mir_callee_emission_name(b: &MirBuilder, base_name: String, instance: Option[InstanceId]) -> String
+  if base_name == "main" || base_name == "_start" then
+    return base_name
+  end
+  match instance
+  when Option::Some(inst) then
+    if inst.def.kind == DefKind::Function then
+      let derived = fn_owner_key(inst.def.module.clone(), inst.def.index, inst.def.kind)
+      match b.fn_ret_types.get(&derived)
+      when Option::Some(_) then return derived
+      when Option::None then ()
+      end
+    end
+  when Option::None then ()
+  end
+  base_name
 end
 
 # The owner key of the item's function/method at (item index, method index):
@@ -1397,91 +1539,129 @@ end
 def deinit_plan_for_type(b: &MirBuilder, ty: &Type, visited: &mut Set[Int]) -> DeinitPlan
   match ty
   when Type::Named(tid, args) then
-    # CONCRETE plan construction: resource containment can depend on the
-    # generic args (Wrapper[Int] vs Wrapper[File] share a TypeId but need
-    # different cleanup). Build from the type definition with the args
-    # substituted; the cached per-TypeId plan is only a fallback for types
-    # without a definition in this builder.
-    var def: Option[MirTypeDef] = Option::None
-    for td in b.type_defs do
-      if td.id.id == tid.id then
-        def = Option::Some(td.clone())
-      end
+    # P0-J2: Named Adt form of the builtin compound types (storage form).
+    # Resolve the registered type name and mirror the canonical arms below;
+    # the Adt form of Array carries no count, so its identity is the
+    # heap-vector (count 0) form. Anything else keeps the pre-existing
+    # Named handling (def lookup, then the typed deinit-plan fallback).
+    let plan_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    match def
-    when Option::Some(td) then
-      # Cycle detection: a recursive owning type (Node -> Option[Box[Node]])
-      # cannot be expanded into a finite plan tree without generated drop
-      # glue — fail CLOSED with PlanLimit (the emitter reports an internal
-      # error) rather than silently returning Trivial.
-      if visited.contains(&tid.id) then
-        DeinitPlan::PlanLimit
-      else
-        visited.insert(tid.id)
-        let result = match b.resource_kinds.get(tid.id)
-        when Option::Some(k) then
-          if k == TypeKind::Resource || k == TypeKind::Capability then
-            let structural = mir_structural_plan(b, &td, &args, visited)
-            match b.deinit_targets.get(tid.id)
-            when Option::Some(n) then
-              # P0-C (final layer): construction-site gate — the name comes
-              # from the registered deinit_targets lookup, but the check is
-              # explicit: an unverifiable name panics (fail-closed) instead
-              # of constructing an unverifiable Call.
-              if deinit_plan_is_trivial(&structural) then
-                mir_verified_deinit_call(b, &n)
-              else
-                # User finalizer first, then compiler-owned structural cleanup.
-                mir_verified_deinit_finalizer(b, &n, structural)
+    if plan_named == "Option" && args.len() >= 1 then
+      DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
+    elsif plan_named == "Result" && args.len() >= 2 then
+      DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+    elsif (plan_named == "Slice" || plan_named == "Array") && args.len() >= 1 then
+      DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
+    elsif plan_named == "Map" && args.len() >= 2 then
+      DeinitPlan::Map(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+    elsif plan_named == "Set" && args.len() >= 1 then
+      DeinitPlan::Set(deinit_plan_for_type(b, &args[0], visited))
+    elsif plan_named == "Box" && args.len() >= 1 then
+      # Canonical Box[T] delegates to the registered Drop impl (drop_in_place
+      # on the pointee + dealloc) — the same release path as the std struct
+      # Box. The pointee plan is NOT expanded here: the drop handles it.
+      # P0-C (final layer): the canonical name is VERIFIED as a registered
+      # drop-glue identity before the Call is constructed (the builder's
+      # registration maps "Box" -> "Box__drop" from the std's impl Drop); a
+      # mismatch panics (fail-closed at construction).
+      let box_drop = "Box__drop".to_string()
+      mir_verified_deinit_call(b, &box_drop)
+    elsif plan_named == "Rc" && args.len() >= 1 then
+      # Canonical Rc[T] delegates to its registered Drop impl (strong-count
+      # decrement, destroy + dealloc at zero). Rc[Int] needs the release even
+      # though Int is not a resource.
+      # P0-C (final layer): same construction-site verification as Box.
+      let rc_drop = "Rc__drop".to_string()
+      mir_verified_deinit_call(b, &rc_drop)
+    else
+      # CONCRETE plan construction: resource containment can depend on the
+      # generic args (Wrapper[Int] vs Wrapper[File] share a TypeId but need
+      # different cleanup). Build from the type definition with the args
+      # substituted; the cached per-TypeId plan is only a fallback for types
+      # without a definition in this builder.
+      var found_def: Option[MirTypeDef] = Option::None
+      for td in b.type_defs do
+        if td.id.id == tid.id then
+          found_def = Option::Some(td.clone())
+        end
+      end
+      match found_def
+      when Option::Some(td) then
+        # Cycle detection: a recursive owning type (Node -> Option[Box[Node]])
+        # cannot be expanded into a finite plan tree without generated drop
+        # glue — fail CLOSED with PlanLimit (the emitter reports an internal
+        # error) rather than silently returning Trivial.
+        if visited.contains(&tid.id) then
+          DeinitPlan::PlanLimit
+        else
+          visited.insert(tid.id)
+          let result = match b.resource_kinds.get(tid.id)
+          when Option::Some(k) then
+            if k == TypeKind::Resource || k == TypeKind::Capability then
+              let structural = mir_structural_plan(b, &td, &args, visited)
+              match b.deinit_targets.get(tid.id)
+              when Option::Some(n) then
+                # P0-C (final layer): construction-site gate — the name comes
+                # from the registered deinit_targets lookup, but the check is
+                # explicit: an unverifiable name panics (fail-closed) instead
+                # of constructing an unverifiable Call.
+                if deinit_plan_is_trivial(&structural) then
+                  mir_verified_deinit_call(b, &n)
+                else
+                  # User finalizer first, then compiler-owned structural cleanup.
+                  mir_verified_deinit_finalizer(b, &n, structural)
+                end
+              when Option::None then structural
               end
-            when Option::None then structural
+            else
+              # P0-10: viral containment through ORDINARY value types too —
+              # a plain `struct Wrapper[T] { item: T }` with Wrapper[Probe]
+              # must yield a structural plan even though its nominal kind is
+              # Value (resource-ness derives from the substituted concrete
+              # fields, not the nominal TypeKind). Container names get their
+              # canonical plans; everything else gets the structural plan.
+              # A Value-kind type with a registered deinit (impl Drop) runs
+              # its drop — e.g. Box[T] { ptr } would otherwise leak the
+              # pointee through a structural walk that sees only a Ptr.
+              let structural_plan = match b.deinit_targets.get(tid.id)
+              when Option::Some(n) then
+                # P0-C (final layer): construction-site gate — same invariant
+                # as the resource path: every Call name is a verified
+                # registered drop-glue identity; a mismatch panics (fail-closed
+                # at construction, the earlier gate than codegen emission).
+                let container_plan = mir_named_container_plan(b, &td, &args, visited)
+                let struct_shape = if deinit_plan_is_trivial(&container_plan) then
+                  mir_structural_plan(b, &td, &args, visited)
+                else
+                  container_plan
+                end
+                if deinit_plan_is_trivial(&struct_shape) then
+                  mir_verified_deinit_call(b, &n)
+                else
+                  mir_verified_deinit_finalizer(b, &n, struct_shape)
+                end
+              when Option::None then
+                let container_plan = mir_named_container_plan(b, &td, &args, visited)
+                if deinit_plan_is_trivial(&container_plan) then
+                  mir_structural_plan(b, &td, &args, visited)
+                else
+                  container_plan
+                end
+              end
+              structural_plan
             end
-          else
-            # P0-10: viral containment through ORDINARY value types too —
-            # a plain `struct Wrapper[T] { item: T }` with Wrapper[Probe]
-            # must yield a structural plan even though its nominal kind is
-            # Value (resource-ness derives from the substituted concrete
-            # fields, not the nominal TypeKind). Container names get their
-            # canonical plans; everything else gets the structural plan.
-            # A Value-kind type with a registered deinit (impl Drop) runs
-            # its drop — e.g. Box[T] { ptr } would otherwise leak the
-            # pointee through a structural walk that sees only a Ptr.
-            let structural_plan = match b.deinit_targets.get(tid.id)
-            when Option::Some(n) then
-              # P0-C (final layer): construction-site gate — same invariant
-              # as the resource path: every Call name is a verified
-              # registered drop-glue identity; a mismatch panics (fail-closed
-              # at construction, the earlier gate than codegen emission).
-              let container_plan = mir_named_container_plan(b, &td, &args, visited)
-              let struct_shape = if deinit_plan_is_trivial(&container_plan) then
-                mir_structural_plan(b, &td, &args, visited)
-              else
-                container_plan
-              end
-              if deinit_plan_is_trivial(&struct_shape) then
-                mir_verified_deinit_call(b, &n)
-              else
-                mir_verified_deinit_finalizer(b, &n, struct_shape)
-              end
-            when Option::None then
-              let container_plan = mir_named_container_plan(b, &td, &args, visited)
-              if deinit_plan_is_trivial(&container_plan) then
-                mir_structural_plan(b, &td, &args, visited)
-              else
-                container_plan
-              end
-            end
-            structural_plan
+          when Option::None then DeinitPlan::Trivial
           end
+          visited.remove(&tid.id)
+          result
+        end
+      when Option::None then
+        match b.deinit_plans.get(tid.id)
+        when Option::Some(plan) then plan.clone()
         when Option::None then DeinitPlan::Trivial
         end
-        visited.remove(&tid.id)
-        result
-      end
-    when Option::None then
-      match b.deinit_plans.get(tid.id)
-      when Option::Some(plan) then plan.clone()
-      when Option::None then DeinitPlan::Trivial
       end
     end
   when Type::Slice(inner) then DeinitPlan::Array(deinit_plan_for_type(b, &inner, visited))
@@ -1605,7 +1785,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
       fi = fi - 1
       let idx_tmp = add_temp(b, Type::Int, span)
       push_assign(b, place_local(idx_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(fi), ty: Type::Int })
+        kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(fi), ty: Type::Int, instance: Option::None })
       }) }, span)
       var projs = place.projections.clone()
       projs.push(Projection::ProjIndex(idx_tmp))
@@ -1644,7 +1824,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     switch_to_block(b, header_blk)
     let zero_tmp = add_temp(b, Type::Int, span)
     push_assign(b, place_local(zero_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int })
+      kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int, instance: Option::None })
     }) }, span)
     let cmp_tmp = add_temp(b, Type::Bool, span)
     push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
@@ -1678,7 +1858,8 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     let ad_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_array_destroy".to_string()),
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }
     let ad_ret = add_temp(b, Type::Unit, span)
@@ -1710,6 +1891,18 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
       match st
       when Type::Set(e) then e
       when Type::Array(e, _) then e
+      when Type::Named(tid, args) then
+        # P0-J2: Named Adt form of Set/Array mirrors the canonical arms
+        # (element via the Adt args).
+        let drain_named = match b.typed_type_names.get(tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
+        end
+        if (drain_named == "Set" || drain_named == "Array") && args.len() >= 1 then
+          args[0].clone()
+        else
+          Type::Unit
+        end
       when _ then Type::Unit
       end
     when Option::None then Type::Unit
@@ -1717,7 +1910,8 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     let sd_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_set_drain_one".to_string()),
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }
     let sd_ret = add_temp(b, Type::Option(elem_ty.clone()), span)
@@ -1748,7 +1942,8 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     let sdd_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_set_destroy".to_string()),
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }
     let sdd_ret = add_temp(b, Type::Unit, span)
@@ -1786,6 +1981,18 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     when Option::Some(mt) then
       match mt
       when Type::Map(k, v) then Option::Some((k, v))
+      when Type::Named(tid, args) then
+        # P0-J2: Named Adt form of Map mirrors the canonical Map arm (key /
+        # value via the Adt args).
+        let drain_named = match b.typed_type_names.get(tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
+        end
+        if drain_named == "Map" && args.len() >= 2 then
+          Option::Some((args[0].clone(), args[1].clone()))
+        else
+          Option::None
+        end
       when _ then Option::None
       end
     when Option::None then Option::None
@@ -1801,7 +2008,8 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     let dr_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_map_drain_one".to_string()),
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }
     let dr_ret = add_temp(b, Type::Option(Type::Tuple(vec![key_ty.clone(), val_ty.clone()])), span)
@@ -1832,7 +2040,8 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
     let md_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_map_destroy".to_string()),
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }
     let md_ret = add_temp(b, Type::Unit, span)
@@ -2331,10 +2540,39 @@ def refine_collection_local_type_from_push(b: &mut MirBuilder, recv_place: &Plac
   let refined_ty = match recv_ty
   when Type::Slice(_) then Option::Some(Type::Slice(elem_ty.clone()))
   when Type::Array(_, n) then Option::Some(Type::Array(elem_ty.clone(), n))
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Slice/Array mirrors the canonical arms. The
+    # Adt form of Array carries no count, so the refinement reproduces the
+    # heap-vector (count 0) canonical form.
+    let push_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+    if push_named == "Slice" then
+      Option::Some(Type::Slice(elem_ty.clone()))
+    elsif push_named == "Array" then
+      Option::Some(Type::Array(elem_ty.clone(), 0))
+    else
+      Option::None
+    end
   when Type::RefInternal(inner, mutable) then
     match inner
     when Type::Slice(_) then Option::Some(Type::RefInternal(Type::Slice(elem_ty.clone()), mutable))
     when Type::Array(_, n) then Option::Some(Type::RefInternal(Type::Array(elem_ty.clone(), n), mutable))
+    when Type::Named(tid, args) then
+      # P0-J2: Named Adt form of Slice/Array inside a reference — same
+      # mirror as the outer match.
+      let push_inner_named = match b.typed_type_names.get(tid.id)
+      when Option::Some(n) then mir_bare_type_name(&n)
+      when Option::None then ""
+      end
+      if push_inner_named == "Slice" then
+        Option::Some(Type::RefInternal(Type::Slice(elem_ty.clone()), mutable))
+      elsif push_inner_named == "Array" then
+        Option::Some(Type::RefInternal(Type::Array(elem_ty.clone(), 0), mutable))
+      else
+        Option::None
+      end
     when _ then Option::None
     end
   when _ then Option::None
@@ -2346,13 +2584,29 @@ def refine_collection_local_type_from_push(b: &mut MirBuilder, recv_place: &Plac
   end
 end
 
-def merge_assignment_type(current_ty: &Type, rhs_ty: &Type) -> Type
+def merge_assignment_type(b: &MirBuilder, current_ty: &Type, rhs_ty: &Type) -> Type
   match current_ty
   when Type::Option(current_inner) then
     match rhs_ty
     when Type::Option(rhs_inner) then
       if current_inner == Type::Unit && rhs_inner != Type::Unit then
         Type::Option(rhs_inner.clone())
+      else
+        current_ty.clone()
+      end
+    when Type::Named(rhs_tid, rhs_args) then
+      # P0-J2: Named Adt form of Option on the rhs — mirror of the canonical
+      # rhs Option arm with the Adt args.
+      let merge_rhs_named = match b.typed_type_names.get(rhs_tid.id)
+      when Option::Some(n) then mir_bare_type_name(&n)
+      when Option::None then ""
+      end
+      if merge_rhs_named == "Option" && rhs_args.len() >= 1 then
+        if current_inner == Type::Unit && rhs_args[0] != Type::Unit then
+          Type::Option(rhs_args[0].clone())
+        else
+          current_ty.clone()
+        end
       else
         current_ty.clone()
       end
@@ -2364,7 +2618,78 @@ def merge_assignment_type(current_ty: &Type, rhs_ty: &Type) -> Type
       let merged_ok = if current_ok == Type::Unit && rhs_ok != Type::Unit then rhs_ok.clone() else current_ok.clone() end
       let merged_err = if current_err == Type::Unit && rhs_err != Type::Unit then rhs_err.clone() else current_err.clone() end
       Type::Result(merged_ok, merged_err)
+    when Type::Named(rhs_tid, rhs_args) then
+      # P0-J2: Named Adt form of Result on the rhs — mirror of the canonical
+      # rhs Result arm with the Adt args.
+      let merge_rhs_named = match b.typed_type_names.get(rhs_tid.id)
+      when Option::Some(n) then mir_bare_type_name(&n)
+      when Option::None then ""
+      end
+      if merge_rhs_named == "Result" && rhs_args.len() >= 2 then
+        let merged_ok = if current_ok == Type::Unit && rhs_args[0] != Type::Unit then rhs_args[0].clone() else current_ok.clone() end
+        let merged_err = if current_err == Type::Unit && rhs_args[1] != Type::Unit then rhs_args[1].clone() else current_err.clone() end
+        Type::Result(merged_ok, merged_err)
+      else
+        current_ty.clone()
+      end
     when _ then current_ty.clone()
+    end
+  when Type::Named(tid, cur_args) then
+    # P0-J2: Named Adt form of Option/Result on the current side — mirrors
+    # of the canonical arms above with the Adt args.
+    let merge_cur_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+    if merge_cur_named == "Option" && cur_args.len() >= 1 then
+      let current_inner = cur_args[0].clone()
+      match rhs_ty
+      when Type::Option(rhs_inner) then
+        if current_inner == Type::Unit && rhs_inner != Type::Unit then
+          Type::Option(rhs_inner.clone())
+        else
+          current_ty.clone()
+        end
+      when Type::Named(rhs_tid, rhs_args) then
+        let merge_rhs_named = match b.typed_type_names.get(rhs_tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
+        end
+        if merge_rhs_named == "Option" && rhs_args.len() >= 1 then
+          if current_inner == Type::Unit && rhs_args[0] != Type::Unit then
+            Type::Option(rhs_args[0].clone())
+          else
+            current_ty.clone()
+          end
+        else
+          current_ty.clone()
+        end
+      when _ then current_ty.clone()
+      end
+    elsif merge_cur_named == "Result" && cur_args.len() >= 2 then
+      let current_ok = cur_args[0].clone()
+      let current_err = cur_args[1].clone()
+      match rhs_ty
+      when Type::Result(rhs_ok, rhs_err) then
+        let merged_ok = if current_ok == Type::Unit && rhs_ok != Type::Unit then rhs_ok.clone() else current_ok.clone() end
+        let merged_err = if current_err == Type::Unit && rhs_err != Type::Unit then rhs_err.clone() else current_err.clone() end
+        Type::Result(merged_ok, merged_err)
+      when Type::Named(rhs_tid, rhs_args) then
+        let merge_rhs_named = match b.typed_type_names.get(rhs_tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
+        end
+        if merge_rhs_named == "Result" && rhs_args.len() >= 2 then
+          let merged_ok = if current_ok == Type::Unit && rhs_args[0] != Type::Unit then rhs_args[0].clone() else current_ok.clone() end
+          let merged_err = if current_err == Type::Unit && rhs_args[1] != Type::Unit then rhs_args[1].clone() else current_err.clone() end
+          Type::Result(merged_ok, merged_err)
+        else
+          current_ty.clone()
+        end
+      when _ then current_ty.clone()
+      end
+    else
+      current_ty.clone()
     end
   when Type::Unit then
     if rhs_ty != Type::Unit then rhs_ty.clone() else current_ty.clone() end
@@ -2383,7 +2708,7 @@ def refine_assignment_target_type_from_type(b: &mut MirBuilder, target: &Place, 
   end
 
   let current_ty = lookup_local_type(b, &target.local)
-  let merged_ty = merge_assignment_type(&current_ty, rhs_ty)
+  let merged_ty = merge_assignment_type(b, &current_ty, rhs_ty)
   if merged_ty != current_ty then
     update_local_type(b, target.local, merged_ty)
   end
@@ -2523,6 +2848,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.typed_type_names = typed.type_names.clone()
   b.typed_type_variants = typed.type_variants.clone()
   b.call_def_ids = typed.call_targets.clone()
+  b.call_instances = typed.call_instances.clone()
   b.ident_resolutions = typed.ident_resolutions.clone()
   b.item_defs = typed.resolutions.item_defs.clone()
   b.closure_captures = typed.closure_captures.clone()
@@ -2593,13 +2919,34 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
 
   # Pre-register function return types so call lowering can type local
   # bindings before the target function is lowered.
-  for item in program.items do
+  # P0-AM: the loop walks items with the SAME module-path walk PASS 2 uses
+  # (module_path_of_item_resolver), so each top-level function's DefId-derived
+  # EMISSION name (mir_fn_emission_name) is available for the key. A top-level
+  # function is registered under BOTH keys:
+  #   - the emission name (fn_owner_key "<module path>::<index>::fn") — the
+  #     key every lowered call site uses once its MirFnItem carries the
+  #     Function-kind instance;
+  #   - the source name — the key the remaining NAME-BASED consumers use
+  #     (mir_infer_call_result_type / infer_static_path_result_type /
+  #     lr_static_path_call / fn-item value references on synthesized
+  #     paths), so result-type inference keeps working for those shapes.
+  # The entry function's keys coincide (its emission name IS the source
+  # name). Methods ("Type__method"), struct methods, and extern symbols keep
+  # their existing single source/mangled keys unchanged.
+  var ret_idx = 0
+  var ret_module_ptr = 0
+  while ret_idx < program.items.len() do
+    let (ret_owner_path, ret_next_ptr) = module_path_of_item_resolver(program, ret_module_ptr, ret_idx)
+    ret_module_ptr = ret_next_ptr
+    let item = program.items[ret_idx]
     match item.kind
     when ItemKind::ItemFunction(f) then
       let ret_type = match f.ret_type
       when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
       when Option::None then Type::Unit
       end
+      let emission_name = mir_fn_emission_name(&b, ret_idx, &ret_owner_path, f.name.clone())
+      b.fn_ret_types.insert(emission_name, ret_type.clone())
       b.fn_ret_types.insert(f.name.clone(), ret_type)
     when ItemKind::ItemImpl(impl_decl) then
       let raw_impl_type = match impl_decl.for_type.kind
@@ -2665,6 +3012,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       end
     when _ then ()
     end
+    ret_idx = ret_idx + 1
   end
 
   # Diagnostic: count and check items
@@ -2722,14 +3070,33 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   # exist in the merged list (hash collisions in collect_dep_file), the MIR
   # will have duplicates, but no function is silently lost.
   var item_idx2 = 0
+  # P0-A (final layer): the owner-module-path walk — the SAME walk the
+  # resource checker performs (resource_check's module_path_of_item_resolver
+  # threading). Each item's owner key is derived under its FULL module path,
+  # so the no-DefId fallback ("module::<full path>::<name>") is byte-identical
+  # to the checker's fn_owner_key_of_item — the plans (finalize_plan,
+  # edge_cleanup, param_binding_resolutions) are keyed by the checker's key,
+  # and MIR must look them up with the SAME key. The DefId path renders
+  # "<module path>::<index>::fn"; both formats are the module-qualified
+  # identity, never a bare name.
+  var module_ptr2 = 0
   while item_idx2 < program.items.len() do
     let item = program.items[item_idx2]
+    let (owner_path2, next_module_ptr2) = module_path_of_item_resolver(program, module_ptr2, item_idx2)
+    module_ptr2 = next_module_ptr2
     match item.kind
     when ItemKind::ItemFunction(f) then
       # Set the SAME owner key the resource checker used (DefId-based), so
       # finalize_plan and param bindings resolve to this function.
-      b.current_fn_key = mir_fn_owner_key(b, item_idx2)
-      match lower_function(&mut b, &f)
+      b.current_fn_key = mir_fn_owner_key(b, item_idx2, &owner_path2, f.name.clone())
+      # P0-AM: the MirFunction's emission name is the DefId-derived base
+      # (fn_owner_key "<module path>::<index>::fn") — the semantic identity
+      # the call sites derive from their InstanceId — with the source name
+      # reserved for the OS entry (linking boundary) and the no-DefId
+      # fallback. Codegen emits this name as the symbol and the fn_alias
+      # identity label.
+      let emission_name = mir_fn_emission_name(b, item_idx2, &owner_path2, f.name.clone())
+      match lower_function(&mut b, &f, emission_name)
       when Option::Some(mir_fn) then
         functions.push(mir_fn)
       when Option::None then dbg_none = dbg_none + 1
@@ -2788,11 +3155,27 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
             new_params.push(p.clone())
           end
         end
-        # Create a renamed copy of the method with mangled name
+        # Create a renamed copy of the method with mangled name. The
+        # generic parameter list merges the IMPL's generic parameters with
+        # the method's own: lower_function resolves type references through
+        # this list, and an impl method's signature references the impl
+        # parameters (self: Array[T], item: T — and for an extension impl
+        # `impl[T, I: Iterator[T]] I`, self: I). Without the merge those
+        # references would not resolve to Type::Param and the generic
+        # template would lose its parameters.
+        var merged_generics = Vec::new()
+        var mg = 0
+        while mg < impl_decl.generic_params.len() do
+          merged_generics.push(impl_decl.generic_params[mg].clone())
+          mg = mg + 1
+        end
+        for mgp in method.generic_params do
+          merged_generics.push(mgp.clone())
+        end
         let renamed_method = FunctionDecl {
           vis: method.vis.clone(),
           name: mangled_name.clone(),
-          generic_params: method.generic_params.clone(),
+          generic_params: merged_generics,
           params: new_params,
           ret_type: method.ret_type.clone(),
           where_clause: method.where_clause.clone(),
@@ -2809,11 +3192,25 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           span: method.span
         }
         b.current_fn_key = mir_item_owner_key(b, item_idx2, method_idx)
-        match lower_function(&mut b, &renamed_method)
+        match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
           # Register with mangled name for fallback resolution
           b.impl_type_map.insert(mangled_name.clone(), impl_type_name.clone())
+          # P0-AL: EXTENSION impls — an impl whose for_type is a generic
+          # PARAMETER (`impl[T, I: Iterator[T]] I`, whose for_type name "I"
+          # is not a registered type) has no receiver TypeId, so its methods
+          # cannot be named TypeName__method at the call site; the checker
+          # resolves them on any receiver that unifies the parameter, and
+          # the call-site lowering needs the impl-registered mangled name
+          # (I__map). Register the bare method name -> mangled name here.
+          match b.type_name_to_id.get(raw_impl_type)
+          when Option::None then
+            if raw_impl_type != "" then
+              b.param_impl_methods.insert(method.name.clone(), mangled_name.clone())
+            end
+          when Option::Some(_) then ()
+          end
         when Option::None then ()
         end
         b.current_fn_key = ""
@@ -2846,10 +3243,22 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
             new_params.push(p.clone())
           end
         end
+        # Create a renamed copy of the struct method. Same generic-parameter
+        # merge as impl methods: the struct's generic parameters are in
+        # scope in the method signatures (self: Box[T], `def get(self: &Box[T]) -> &T`).
+        var s_merged_generics = Vec::new()
+        var smg = 0
+        while smg < s.generic_params.len() do
+          s_merged_generics.push(s.generic_params[smg].clone())
+          smg = smg + 1
+        end
+        for smgp in method.generic_params do
+          s_merged_generics.push(smgp.clone())
+        end
         let renamed_method = FunctionDecl {
           vis: method.vis.clone(),
           name: mangled_name.clone(),
-          generic_params: method.generic_params.clone(),
+          generic_params: s_merged_generics,
           params: new_params,
           ret_type: method.ret_type.clone(),
           where_clause: method.where_clause.clone(),
@@ -2866,7 +3275,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           span: method.span
         }
         b.current_fn_key = mir_item_owner_key(b, item_idx2, sm_idx)
-        match lower_function(&mut b, &renamed_method)
+        match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
           b.impl_type_map.insert(mangled_name.clone(), s.name.clone())
@@ -2919,7 +3328,10 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   Result::Ok(result)
 end
 
-def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
+# P0-AM: `emission_name` is the MirFunction's emission name — for a
+# top-level function the DefId-derived base (mir_fn_emission_name); for impl
+# / struct methods the pre-mangled "Type__method" name of the renamed decl.
+def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) -> Option[MirFunction]
   # Collect generic parameter names (e.g., T, U) so that type resolution
   # can produce Type::Param("T") instead of Type::Named(TypeId{id:0}, []).
   # This preserves generic type information in the MIR, enabling
@@ -2946,7 +3358,7 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl) -> Option[MirFunction]
   when Option::None then ()
   end
 
-  start_function(b, f.name.clone(), ret_type.clone(), f.span)
+  start_function(b, emission_name, ret_type.clone(), f.span)
   
   var param_idx = 0
   while param_idx < f.params.len() do
@@ -3384,7 +3796,8 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
         Option::Some(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirInt(disc),
-            ty: Type::Int
+            ty: Type::Int,
+            instance: Option::None
           })
         })
       when Result::Err(e) then
@@ -3395,7 +3808,8 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
         Option::Some(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirUnit,
-            ty: Type::Unit
+            ty: Type::Unit,
+            instance: Option::None
           })
         })
       end
@@ -3403,7 +3817,8 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
       Option::Some(MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirUnit,
-          ty: Type::Unit
+          ty: Type::Unit,
+          instance: Option::None
         })
       })
     end
@@ -3411,35 +3826,40 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirInt(n),
-        ty: Type::Int
+        ty: Type::Int,
+        instance: Option::None
       })
     })
   when ExprKind::ExprBoolLit(v) then
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirBool(v),
-        ty: Type::Bool
+        ty: Type::Bool,
+        instance: Option::None
       })
     })
   when ExprKind::ExprFloatLit(v) then
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFloat(v),
-        ty: Type::Float
+        ty: Type::Float,
+        instance: Option::None
       })
     })
   when ExprKind::ExprCharLit(v) then
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirChar(v),
-        ty: Type::Char
+        ty: Type::Char,
+        instance: Option::None
       })
     })
   when ExprKind::ExprStringLit(s_val) then
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirString(s_val),
-        ty: Type::String
+        ty: Type::String,
+        instance: Option::None
       })
     })
   when ExprKind::ExprCall(callee, _) then
@@ -3447,7 +3867,8 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirInt(0),
-        ty: Type::Int
+        ty: Type::Int,
+        instance: Option::None
       })
     })
   when _ then
@@ -4039,11 +4460,25 @@ def mir_infer_method_result_type(b: &MirBuilder, receiver_type: Type, method_nam
 end
 
 def mir_fn_operand(b: &MirBuilder, fn_name: String) -> MirOperand
-  let ret_type = mir_lookup_fn_ret_type(b, fn_name.clone())
+  mir_fn_operand_with_instance(b, fn_name, Option::None)
+end
+
+# Build a MirFnItem operand with the optional semantic instance payload
+# (P0-AK). `instance` is the call's InstanceId (DefId + substs) when the
+# typed call_targets recorded one; Option::None keeps the name-only form
+# for synthesized IR-only callees.
+# P0-AM: the MirFnItem NAME is the emission name — the instance's
+# fn_owner_key base when the instance carries a top-level-function DefId
+# (mir_callee_emission_name), so the call reference matches the callee's
+# emitted name; the return type is looked up under the SAME emission name.
+def mir_fn_operand_with_instance(b: &MirBuilder, fn_name: String, instance: Option[InstanceId]) -> MirOperand
+  let emission_name = mir_callee_emission_name(b, fn_name.clone(), instance)
+  let ret_type = mir_lookup_fn_ret_type(b, emission_name.clone())
   MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
-      kind: MirConstantKind::MirFnItem(fn_name),
-      ty: Type::Function(Vec::new(), Box::new(ret_type))
+      kind: MirConstantKind::MirFnItem(emission_name),
+      ty: Type::Function(Vec::new(), Box::new(ret_type)),
+      instance: instance
     })
   }
 end
@@ -4242,19 +4677,29 @@ def mir_infer_field_type_at_index(b: &MirBuilder, ty: &Type, index: Int) -> Type
   when Type::Rc(inner) then mir_infer_field_type_at_index(b, inner, index)
   when Type::Tuple(elems) then
     if index >= 0 && index < elems.len() then elems[index].clone() else Type::Unit end
-  when Type::Named(tid, _) then
-    for td in b.type_defs do
-      if td.id.id == tid.id then
-        match td.kind
-        when MirTypeDefKind::Struct(fields) then
-          if index >= 0 && index < fields.len() then
-            return fields[index].ty.clone()
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Rc mirrors the canonical unwrap arms
+    # (recurse through the pointee); everything else keeps the def lookup.
+    let fty_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+    if (fty_named == "Box" || fty_named == "Rc") && args.len() >= 1 then
+      mir_infer_field_type_at_index(b, &args[0], index)
+    else
+      for td in b.type_defs do
+        if td.id.id == tid.id then
+          match td.kind
+          when MirTypeDefKind::Struct(fields) then
+            if index >= 0 && index < fields.len() then
+              return fields[index].ty.clone()
+            end
+          when _ then ()
           end
-        when _ then ()
         end
       end
+      Type::Unit
     end
-    Type::Unit
   when _ then Type::Unit
   end
 end
@@ -5592,7 +6037,8 @@ def lr_ident(b: &mut MirBuilder, name: String, node_id: Int) -> MirRvalue
       move_rvalue(MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirStaticRef(name),
-          ty: st_ty
+          ty: st_ty,
+          instance: Option::None
         })
       })
     else
@@ -5696,6 +6142,70 @@ def lower_callee_expr(b: &mut MirBuilder, callee_expr: &Expr, span: Span) -> Mir
   lower_expr(b, &callee_expr, span)
 end
 
+# P0-AK: the call site's semantic callee identity. When the typed program
+# recorded a call target (DefId) for this call node, wrap it as the
+# InstanceId payload of the MirFnItem. The instance's substs are the TYPE
+# CHECKER's SOLVED substitution when the typed call_instances carries an
+# entry for this call node (the callee's generic args in the callee's
+# parameter order): the solved substitutions from the type checker are the
+# AUTHORITY. When absent (a synthesized call — IR-only callees carry no
+# DefId; a residual unsolved shape stays unrecorded), the substs stay
+# EMPTY and the monomorphizer's call-site inference
+# (infer_type_args_for_call, see monomorphize_program) is the documented
+# FALLBACK that fills them from the call arguments and the destination
+# local's type.
+#
+# P0-AL (final): the monomorphizer consumes this instance payload. The
+# instance field survives every substitution/rewrite pass on the way to the
+# monomorphizer — substitute_operand in trait_resolve.tg carries c.instance
+# through specialization, and rewrite_call_sites_in_program carries
+# const_val.instance through the call-site rewrite — so a call with a solved
+# instance reaches monomorphize_program with NON-EMPTY substs, and the
+# monomorphizer uses them DIRECTLY (zero inference; instance_key mangling).
+# P0-AL (final): the checker records a solved instance for EVERY source-call
+# shape — impl-registry generic methods, builtin-method generics
+# (Option::map / Result::and_then / ...), extension-impl methods
+# (`impl[T, I: Iterator[T]] I`), and return-type-only parameters solved by
+# the caller's annotation context (resolve_pending_call_instances) — so the
+# infer_type_args_for_call fallback fires only for IR-synthesized calls and
+# the residual shapes no context ever solved.
+def mir_call_instance(b: &MirBuilder, call_node_id: Int) -> Option[InstanceId]
+  match b.call_def_ids.get(call_node_id)
+  when Option::Some(did) then
+    match b.call_instances.get(call_node_id)
+    when Option::Some(substs) then Option::Some(InstanceId { def: did, substs: substs.clone() })
+    when Option::None then Option::Some(InstanceId { def: did, substs: Vec::new() })
+    end
+  when Option::None then Option::None
+  end
+end
+
+# Attach the semantic instance to a name-built MirFnItem operand (P0-AK).
+# Only MirConstant/MirFnItem operands carry the instance payload; callees
+# lowered to values (first-class fn temporaries) and non-call constants are
+# returned unchanged — the documented name-only fallback for
+# synthesized/IR-only calls whose typed call target lookup misses.
+# P0-AM: when the instance carries a top-level-function DefId, the MirFnItem
+# NAME is rewritten to the instance's fn_owner_key base (the emission name
+# the callee was lowered under) — the call reference and the emitted
+# function label then agree, and resolve_callee_label resolves through the
+# fn_alias identity entry. Methods/intrinsics/externs/entry keep their names
+# (mir_callee_emission_name).
+def attach_call_instance(b: &MirBuilder, op: &MirOperand, instance: Option[InstanceId]) -> MirOperand
+  match op.kind
+  when MirOperandKind::MirConstant(constant) then
+    match constant.kind
+    when MirConstantKind::MirFnItem(name) then
+      let emission_name = mir_callee_emission_name(b, name.clone(), instance)
+      MirOperand {
+        kind: MirOperandKind::MirConstant(constant_fn_item_with_instance(emission_name, constant.ty.clone(), instance))
+      }
+    when _ then duplicate_operand(op)
+    end
+  when _ then duplicate_operand(op)
+  end
+end
+
 def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span: Span, call_node_id: Int) -> MirRvalue
   let callee_kind = expr_kind_name(&callee_expr.kind)
   if callee_kind == "ExprPath" then
@@ -5715,7 +6225,17 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
     end
   end
 
-  let callee_op = lower_callee_expr(b, callee_expr, span)
+  # P0-AK: the call's DefId identity from the typed call_targets is recorded
+  # on the MirFnItem (instance payload) — the call site carries the DefId
+  # identity, not just the string. A missing typed target (synthesized
+  # callee) keeps the name-only form.
+  # P0-AM: attach_call_instance also RENAMES the MirFnItem to the instance's
+  # DefId-derived emission name (fn_owner_key) for top-level-function
+  # callees, so the call reference matches the callee's emitted name — the
+  # name-based operand is kept only for synthesized/IR-only callees and the
+  # linking-boundary names (extern/intrinsic/method/entry).
+  var callee_op = lower_callee_expr(b, callee_expr, span)
+  callee_op = attach_call_instance(b, &callee_op, mir_call_instance(b, call_node_id))
   # Typed call identity: the resolver/type checker computed call_targets for
   # direct callees; MIR must not silently re-resolve by name. When the typed
   # target is missing for a DIRECT callee (name/path), that is a compiler
@@ -5767,7 +6287,7 @@ def is_registered_enum_path(b: &MirBuilder, path: &AstPath) -> Bool
   end
 end
 
-def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> MirRvalue
+def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span, node_id: Int) -> MirRvalue
   if is_vec_like_from_path(path) && args.len() == 1 then
     let args0_kind = expr_kind_name(&args[0].kind)
     if args0_kind == "ExprArrayLit" then
@@ -5783,12 +6303,21 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   end
 
   let fn_name = resolve_static_path_callee_name(b, path)
-  let callee_op = MirOperand {
+  # P0-AM: when a typed call target exists for this node (the resolver
+  # records module-qualified path targets and the checker threads them by
+  # node id), the MirFnItem's emission name is the instance's fn_owner_key
+  # base — first-class fn-item VALUES of top-level functions then reference
+  # the same derived label the function was emitted under. When the lookup
+  # misses (a synthesized/IR-only shape), the callee keeps the name-only
+  # form — the documented name-based fallback.
+  var callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(fn_name.clone()),
-      ty: Type::Function(Vec::new(), Box::new(Type::Unit))
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
     })
   }
+  callee_op = attach_call_instance(b, &callee_op, mir_call_instance(b, node_id))
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < args.len() do
@@ -5828,7 +6357,8 @@ def lr_enum_construct(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span
   ops.push(MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirInt(disc),
-      ty: Type::Int
+      ty: Type::Int,
+      instance: Option::None
     })
   })
   for i in 0..args.len() do
@@ -5863,7 +6393,8 @@ def lr_enum_record_construct(b: &mut MirBuilder, path: &AstPath, fields: &Vec[(S
   ops.push(MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirInt(disc),
-      ty: Type::Int
+      ty: Type::Int,
+      instance: Option::None
     })
   })
   var field_idx = 0
@@ -5881,11 +6412,11 @@ def lr_enum_record_construct(b: &mut MirBuilder, path: &AstPath, fields: &Vec[(S
   Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, field_names), ops) })
 end
 
-def lr_enum_variant(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span) -> Result[MirRvalue, String]
+def lr_enum_variant(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], span: Span, node_id: Int) -> Result[MirRvalue, String]
   if is_registered_enum_path(b, path) then
     return lr_enum_construct(b, path, args, span)
   end
-  Result::Ok(lr_static_path_call(b, path, args, span))
+  Result::Ok(lr_static_path_call(b, path, args, span, node_id))
 end
 
 # Lower a method-call receiver expression to a Place, using string dispatch
@@ -6118,31 +6649,73 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         if normalized_method_name == "to_string" || normalized_method_name == "fmt" then
           resolved_method = "__intrinsic_char_to_string"
         end
-      when Type::Named(tid, _) then
-        # Find the type name for this TypeId
-        var type_name = ""
-        for td in b.type_defs do
-          if td.id.id == tid.id then
-            type_name = td.name.clone()
-          end
+      when Type::Named(tid, args) then
+        # P0-J2: Named Adt form of the builtin compound collections mirrors
+        # the canonical arms below (method-name mangling by container);
+        # everything else keeps the pre-existing name-based resolution.
+        let method_named = match b.typed_type_names.get(tid.id)
+        when Option::Some(n) then mir_bare_type_name(&n)
+        when Option::None then ""
         end
-        if type_name != "" then
-          if normalized_method_name == "clone" then
-            if type_name == "Rc" || type_name == "WeakRc" || type_name == "ArcStrong" || type_name == "WeakArc" then
-              resolved_method = type_name + "__clone"
+        if method_named == "Slice" || method_named == "Array" then
+          resolved_method = "Vec__" + normalized_method_name.clone()
+        elsif method_named == "Option" then
+          resolved_method = "Option__" + normalized_method_name.clone()
+        elsif method_named == "Result" then
+          resolved_method = "Result__" + normalized_method_name.clone()
+        elsif method_named == "Map" then
+          resolved_method = "Map__" + normalized_method_name.clone()
+        elsif method_named == "Set" then
+          resolved_method = "Set__" + normalized_method_name.clone()
+        else
+          # Find the type name for this TypeId
+          var type_name = ""
+          for td in b.type_defs do
+            if td.id.id == tid.id then
+              type_name = td.name.clone()
+            end
+          end
+          if type_name != "" then
+            if normalized_method_name == "clone" then
+              if type_name == "Rc" || type_name == "WeakRc" || type_name == "ArcStrong" || type_name == "WeakArc" then
+                resolved_method = type_name + "__clone"
+              else
+                resolved_method = "clone"
+              end
             else
-              resolved_method = "clone"
+              resolved_method = type_name + "__" + normalized_method_name.clone()
+            end
+            # P0-AL: EXTENSION-impl methods — an impl whose for_type is a
+            # generic PARAMETER (`impl[T, I: Iterator[T]] I`) has no
+            # receiver-type name; its methods lower as the impl-registered
+            # mangled functions ("I__map", "I__any", "I__collect", ...).
+            # The receiver-type-based name (TypeName__method) is only valid
+            # when that mangled function is actually registered in the
+            # program (fn_ret_types); when it is not, the checker must have
+            # resolved the call on an extension impl — fall back to the
+            # bare method name registered for the param-for_type impls.
+            if !b.fn_ret_types.contains_key(&resolved_method) then
+              match b.param_impl_methods.get(normalized_method_name)
+              when Option::Some(ext_mangled) then resolved_method = ext_mangled.clone()
+              when Option::None then ()
+              end
             end
           else
-            resolved_method = type_name + "__" + normalized_method_name.clone()
-          end
-        else
-          if normalized_method_name == "clone" then
-            resolved_method = "clone"
-          else
-            match b.impl_type_map.get(normalized_method_name)
-            when Option::Some(tn) then resolved_method = tn + "__" + normalized_method_name.clone()
-            when Option::None then ()
+            if normalized_method_name == "clone" then
+              resolved_method = "clone"
+            else
+              match b.impl_type_map.get(normalized_method_name)
+              when Option::Some(tn) then resolved_method = tn + "__" + normalized_method_name.clone()
+              when Option::None then ()
+              end
+              # P0-AL: unknown receiver type — the extension-impl fallback
+              # (the receiver-type-based name above cannot apply at all).
+              if !b.fn_ret_types.contains_key(&resolved_method) then
+                match b.param_impl_methods.get(normalized_method_name)
+                when Option::Some(ext_mangled2) then resolved_method = ext_mangled2.clone()
+                when Option::None then ()
+                end
+              end
             end
           end
         end
@@ -6167,6 +6740,16 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
           when Option::Some(type_name) then resolved_method = type_name + "__" + normalized_method_name.clone()
           when Option::None then ()
           end
+          # P0-AL: non-Named receiver — the extension-impl fallback (the
+          # receiver-type-based name cannot apply at all; the checker
+          # resolved the call on a param-for_type impl by unifying the
+          # receiver with the head parameter).
+          if !b.fn_ret_types.contains_key(&resolved_method) then
+            match b.param_impl_methods.get(normalized_method_name)
+            when Option::Some(ext_mangled3) then resolved_method = ext_mangled3.clone()
+            when Option::None then ()
+            end
+          end
         end
       end
 
@@ -6178,7 +6761,15 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       # The byte offset of the length field in the collection header is
       # therefore decided by the intrinsic's implementation (codegen's `len`
       # handler → codegen_array_len), never by a generic MIR instruction.
-      let callee_op = mir_fn_operand(b, resolved_method.clone())
+      # P0-AK: the typed program records METHOD-call targets too (expr node id
+      # -> DefId); the callee's MirFnItem records the instance when present,
+      # and keeps the name-only form when the lookup misses.
+      # P0-AM: the instance's DefId kind is Method, so the "Type__method"
+      # mangled name stays UNCHANGED (mir_callee_emission_name renames only
+      # DefKind::Function) — the finalizer and registered-Drop identities
+      # depend on the method names; only top-level function names migrate to
+      # DefId-derived emission names.
+      let callee_op = mir_fn_operand_with_instance(b, resolved_method.clone(), mir_call_instance(b, expr.node_id))
 
       # Lower arguments: receiver first, then explicit args
       let recv_effect = call_arg_effect(b, Option::None, 0, &receiver)
@@ -6389,11 +6980,13 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         node_id: expr.node_id
       })
       
-      # Step 5: Create the closure aggregate — (fn_ptr, env)
+      # Step 5: Create the closure aggregate — (fn_ptr, env). The closure
+      # function item is a synthesized IR-only callee: name-only form.
       let fn_op = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirFnItem(closure_name.clone()),
-          ty: Type::Function(fn_param_types_of(&param_types), Box::new(ret_type.clone()))
+          ty: Type::Function(fn_param_types_of(&param_types), Box::new(ret_type.clone())),
+          instance: Option::None
         })
       }
       
@@ -6429,7 +7022,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirUnit,
-            ty: Type::Unit
+            ty: Type::Unit,
+            instance: Option::None
           })
         }) })
       end
@@ -6441,7 +7035,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
           return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirUnit,
-              ty: Type::Unit
+              ty: Type::Unit,
+              instance: Option::None
             })
           }) })
         end
@@ -6478,7 +7073,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
   elsif kind_name == "ExprEnumVariant" then
     match expr.kind
     when ExprKind::ExprEnumVariant(path, args) then
-      return lr_enum_variant(b, &path, &args, span)
+      return lr_enum_variant(b, &path, &args, span, expr.node_id)
     when _ then ()
     end
 
@@ -6519,7 +7114,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
             ops.push(MirOperand {
               kind: MirOperandKind::MirConstant(MirConstant {
                 kind: MirConstantKind::MirInt(disc),
-                ty: Type::Int
+                ty: Type::Int,
+                instance: Option::None
               })
             })
             return Result::Ok(MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Struct(enum_tid, fnames), ops) })
@@ -6528,7 +7124,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
             return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
               kind: MirOperandKind::MirConstant(MirConstant {
                 kind: MirConstantKind::MirInt(disc),
-                ty: Type::Int
+                ty: Type::Int,
+                instance: Option::None
               })
             }) })
           end
@@ -6538,7 +7135,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
           return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirString(path_to_string(&path)),
-              ty: Type::String
+              ty: Type::String,
+              instance: Option::None
             })
           }) })
         end
@@ -6546,7 +7144,8 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         return Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirString(path_to_string(&path)),
-            ty: Type::String
+            ty: Type::String,
+            instance: Option::None
           })
         }) })
       end
@@ -6642,7 +7241,8 @@ def lower_final_block_stmt_to_rvalue(b: &mut MirBuilder, stmt: &Stmt) -> Result[
   Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirUnit,
-      ty: Type::Unit
+      ty: Type::Unit,
+      instance: Option::None
     })
   }) })
 end
@@ -6671,7 +7271,8 @@ def lower_place(b: &mut MirBuilder, expr: &Expr) -> Place
           kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirStaticAddr(name.clone()),
-              ty: Type::Ptr(Type::Unit)
+              ty: Type::Ptr(Type::Unit),
+              instance: Option::None
             })
           })
         }, Span { file: "", start: 0, end_pos: 0 })
@@ -6915,23 +7516,41 @@ def resolve_enum_variant_field_type(b: &MirBuilder, enum_ty: &Type, variant_name
     else if variant_name == "Err" && field_idx == 0 then err.clone()
     else Type::Unit
     end
-  when Type::Named(tid, _) then
-    for td in b.type_defs do
-      if td.id.id == tid.id then
-        match td.kind
-        when MirTypeDefKind::Enum(variants) then
-          for variant in variants do
-            if enum_variant_name_matches(&variant.name, variant_name) then
-              if field_idx >= 0 && field_idx < variant.fields.len() then
-                return variant.fields[field_idx].clone()
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Option/Result mirrors the canonical arms
+    # above (unwrap / variant-payload extraction via the Adt args);
+    # everything else keeps the pre-existing def lookup.
+    let evt_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+    if evt_named == "Box" && args.len() >= 1 then
+      resolve_enum_variant_field_type(b, &args[0], variant_name, field_idx)
+    elsif evt_named == "Option" && args.len() >= 1 then
+      if variant_name == "Some" && field_idx == 0 then args[0].clone() else Type::Unit end
+    elsif evt_named == "Result" && args.len() >= 2 then
+      if variant_name == "Ok" && field_idx == 0 then args[0].clone()
+      else if variant_name == "Err" && field_idx == 0 then args[1].clone()
+      else Type::Unit
+      end
+    else
+        for td in b.type_defs do
+          if td.id.id == tid.id then
+            match td.kind
+            when MirTypeDefKind::Enum(variants) then
+              for variant in variants do
+                if enum_variant_name_matches(&variant.name, variant_name) then
+                  if field_idx >= 0 && field_idx < variant.fields.len() then
+                    return variant.fields[field_idx].clone()
+                  end
+                end
               end
+            when _ then ()
             end
           end
-        when _ then ()
         end
+        Type::Unit
       end
-    end
-    Type::Unit
   when _ then Type::Unit
   end
 end
@@ -6974,7 +7593,7 @@ def resolve_type_through_projections(b: &MirBuilder, start_type: Type, projectio
         when _ then
       # Look up the struct definition for the current type and find the field's type
           var resolved = false
-          match unwrap_to_named_tid(&current)
+          match unwrap_to_named_tid(b, &current)
           when Option::Some(tid) then
             var td_idx = 0
             while td_idx < b.type_defs.len() do
@@ -7031,7 +7650,7 @@ def resolve_type_through_projections(b: &MirBuilder, start_type: Type, projectio
         when _ then
       # Look up the struct definition for the current type at the index
           var resolved = false
-          match unwrap_to_named_tid(&current)
+          match unwrap_to_named_tid(b, &current)
           when Option::Some(tid) then
             var td_idx = 0
             while td_idx < b.type_defs.len() do
@@ -7084,25 +7703,40 @@ def mir_project_index_type(b: &MirBuilder, ty: &Type) -> Type
   when Type::Slice(elem) then elem.clone()
   when Type::String then Type::Char
   when Type::Named(tid, args) then
-    var type_name = ""
-    var td_idx = 0
-    while td_idx < b.type_defs.len() do
-      let td = b.type_defs[td_idx]
-      if td.id.id == tid.id then
-        type_name = td.name.clone()
-      end
-      td_idx = td_idx + 1
+    # P0-J2: Named Adt form of Slice/Box/Rc mirrors the canonical arms
+    # (element via the Adt args / unwrap recurse); the pre-existing name
+    # chain keeps covering Vec/Array/Map/Set in their Named storage forms.
+    let pit_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    let bare_type_name = mir_bare_type_name(&type_name)
-    if (bare_type_name == "Vec" || bare_type_name == "Array") && !args.is_empty() then
+    if pit_named == "Slice" && !args.is_empty() then
       args[0].clone()
-    else if (bare_type_name == "Map" || bare_type_name == "HashMap") && args.len() >= 2 then
-      args[1].clone()
-    else if (bare_type_name == "Set" || bare_type_name == "HashSet") && !args.is_empty() then
-      args[0].clone()
+    elsif pit_named == "Box" && !args.is_empty() then
+      mir_project_index_type(b, &args[0])
+    elsif pit_named == "Rc" && !args.is_empty() then
+      mir_project_index_type(b, &args[0])
     else
-      ty.clone()
-    end
+      var type_name = ""
+      var td_idx = 0
+      while td_idx < b.type_defs.len() do
+        let td = b.type_defs[td_idx]
+        if td.id.id == tid.id then
+          type_name = td.name.clone()
+        end
+        td_idx = td_idx + 1
+      end
+      let bare_type_name = mir_bare_type_name(&type_name)
+      if (bare_type_name == "Vec" || bare_type_name == "Array") && !args.is_empty() then
+        args[0].clone()
+      else if (bare_type_name == "Map" || bare_type_name == "HashMap") && args.len() >= 2 then
+        args[1].clone()
+      else if (bare_type_name == "Set" || bare_type_name == "HashSet") && !args.is_empty() then
+        args[0].clone()
+      else
+        ty.clone()
+      end
+      end
   when Type::RefInternal(inner, _) then mir_project_index_type(b, inner)
   when Type::Box(inner) then mir_project_index_type(b, inner)
   when Type::Rc(inner) then mir_project_index_type(b, inner)
@@ -7126,25 +7760,40 @@ def mir_collection_element_type(b: &MirBuilder, ty: &Type) -> Option[Type]
   when Type::Box(inner) then mir_collection_element_type(b, inner)
   when Type::Rc(inner) then mir_collection_element_type(b, inner)
   when Type::Named(tid, args) then
-    var type_name = ""
-    var td_idx = 0
-    while td_idx < b.type_defs.len() do
-      let td = b.type_defs[td_idx]
-      if td.id.id == tid.id then
-        type_name = td.name.clone()
-      end
-      td_idx = td_idx + 1
+    # P0-J2: Named Adt form of Slice/Box/Rc mirrors the canonical arms
+    # (element via the Adt args / unwrap recurse); the pre-existing name
+    # chain keeps covering Vec/Array/Map/Set in their Named storage forms.
+    let cet_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    let bare = mir_bare_type_name(&type_name)
-    if (bare == "Vec" || bare == "Array") && !args.is_empty() then
+    if cet_named == "Slice" && !args.is_empty() then
       Option::Some(args[0].clone())
-    else if (bare == "Map" || bare == "HashMap") && args.len() >= 2 then
-      Option::Some(args[1].clone())
-    else if (bare == "Set" || bare == "HashSet") && !args.is_empty() then
-      Option::Some(args[0].clone())
+    elsif cet_named == "Box" && !args.is_empty() then
+      mir_collection_element_type(b, &args[0])
+    elsif cet_named == "Rc" && !args.is_empty() then
+      mir_collection_element_type(b, &args[0])
     else
-      Option::None
-    end
+      var type_name = ""
+      var td_idx = 0
+      while td_idx < b.type_defs.len() do
+        let td = b.type_defs[td_idx]
+        if td.id.id == tid.id then
+          type_name = td.name.clone()
+        end
+        td_idx = td_idx + 1
+      end
+      let bare = mir_bare_type_name(&type_name)
+      if (bare == "Vec" || bare == "Array") && !args.is_empty() then
+        Option::Some(args[0].clone())
+      else if (bare == "Map" || bare == "HashMap") && args.len() >= 2 then
+        Option::Some(args[1].clone())
+      else if (bare == "Set" || bare == "HashSet") && !args.is_empty() then
+        Option::Some(args[0].clone())
+      else
+        Option::None
+      end
+      end
   when _ then Option::None
   end
 end
@@ -7152,15 +7801,26 @@ end
 # First tries to look up the actual struct definition from the builder's type_defs
 # using the receiver's type. Falls back to well-known built-in types.
 # Extract the underlying Named TypeId from a type, unwrapping through references
-def unwrap_to_named_tid(ty: &Type) -> Option[TypeId]
+def unwrap_to_named_tid(b: &MirBuilder, ty: &Type) -> Option[TypeId]
   match ty
-  when Type::Named(tid, _) then Option::Some(tid)
-  when Type::RefInternal(inner, _) then unwrap_to_named_tid(inner)
-  when Type::Box(inner) then unwrap_to_named_tid(inner)
-  when Type::Ptr(inner) then unwrap_to_named_tid(inner)
-  when Type::PtrMut(inner) then unwrap_to_named_tid(inner)
-  when Type::Rc(inner) then unwrap_to_named_tid(inner)
-  when Type::Option(inner) then unwrap_to_named_tid(inner)
+  when Type::Named(tid, args) then
+    # P0-J2: Named Adt form of Box/Rc/Option mirrors the canonical unwrap
+    # arms (recurse through the Adt args); other Named types return the id.
+    let unt_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+    if (unt_named == "Box" || unt_named == "Rc" || unt_named == "Option") && !args.is_empty() then
+      unwrap_to_named_tid(b, &args[0])
+    else
+      Option::Some(tid)
+    end
+  when Type::RefInternal(inner, _) then unwrap_to_named_tid(b, inner)
+  when Type::Box(inner) then unwrap_to_named_tid(b, inner)
+  when Type::Ptr(inner) then unwrap_to_named_tid(b, inner)
+  when Type::PtrMut(inner) then unwrap_to_named_tid(b, inner)
+  when Type::Rc(inner) then unwrap_to_named_tid(b, inner)
+  when Type::Option(inner) then unwrap_to_named_tid(b, inner)
   when _ then Option::None
   end
 end
@@ -7172,7 +7832,7 @@ end
 def resolve_projected_type_id(b: &MirBuilder, place: &Place) -> Option[TypeId]
   let base_ty = lookup_local_type(b, &place.local)
   let projected_ty = resolve_type_through_projections(b, base_ty, &place.projections)
-  unwrap_to_named_tid(&projected_ty)
+  unwrap_to_named_tid(b, &projected_ty)
 end
 
 # Emit the field projection for a field access: the typed field index
@@ -7660,7 +8320,8 @@ def lower_stmt_rvalue(b: &mut MirBuilder, stmt: &Stmt, span: Span) -> Result[Mir
     Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirUnit,
-        ty: Type::Unit
+        ty: Type::Unit,
+        instance: Option::None
       })
     }) })
   end
@@ -7818,21 +8479,32 @@ def mir_projected_iter_elem_type(b: &MirBuilder, ty: &Type) -> Type
   when Type::Array(elem, _) then elem.clone()
   when Type::RefInternal(inner, _) then mir_projected_iter_elem_type(b, inner)
   when Type::Named(tid, args) then
-    var type_name = ""
-    var td_idx = 0
-    while td_idx < b.type_defs.len() do
-      let td = b.type_defs[td_idx]
-      if td.id.id == tid.id then
-        type_name = td.name.clone()
-      end
-      td_idx = td_idx + 1
+    # P0-J2: Named Adt form of Slice mirrors the canonical Slice arm
+    # (element via the Adt args); the pre-existing name chain keeps
+    # covering Vec/Array in their Named storage forms.
+    let piet_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    let bare = mir_bare_type_name(&type_name)
-    if (bare == "Vec" || bare == "Array") && !args.is_empty() then
+    if piet_named == "Slice" && !args.is_empty() then
       args[0].clone()
     else
-      Type::Unit
-    end
+      var type_name = ""
+      var td_idx = 0
+      while td_idx < b.type_defs.len() do
+        let td = b.type_defs[td_idx]
+        if td.id.id == tid.id then
+          type_name = td.name.clone()
+        end
+        td_idx = td_idx + 1
+      end
+      let bare = mir_bare_type_name(&type_name)
+      if (bare == "Vec" || bare == "Array") && !args.is_empty() then
+        args[0].clone()
+      else
+        Type::Unit
+      end
+      end
   when _ then Type::Unit
   end
 end
@@ -7843,20 +8515,31 @@ def for_projected_len_callee(b: &MirBuilder, ty: &Type) -> String
   when Type::Array(_, _) then "Vec__len"
   when Type::RefInternal(inner, _) then for_projected_len_callee(b, inner)
   when Type::Named(tid, _) then
-    var type_name = ""
-    var td_idx = 0
-    while td_idx < b.type_defs.len() do
-      let td = b.type_defs[td_idx]
-      if td.id.id == tid.id then
-        type_name = td.name.clone()
-      end
-      td_idx = td_idx + 1
+    # P0-J2: Named Adt form of Slice mirrors the canonical Slice arm; the
+    # pre-existing name chain keeps covering Vec/Array in their Named
+    # storage forms.
+    let fplc_named = match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    let bare = mir_bare_type_name(&type_name)
-    if bare == "Vec" || bare == "Array" then
+    if fplc_named == "Slice" then
       "Vec__len"
     else
-      ""
+      var type_name = ""
+      var td_idx = 0
+      while td_idx < b.type_defs.len() do
+        let td = b.type_defs[td_idx]
+        if td.id.id == tid.id then
+          type_name = td.name.clone()
+        end
+        td_idx = td_idx + 1
+      end
+      let bare = mir_bare_type_name(&type_name)
+      if bare == "Vec" || bare == "Array" then
+        "Vec__len"
+      else
+        ""
+      end
     end
   when _ then ""
   end
@@ -11288,7 +11971,8 @@ def try_fold_binop(op: MirBinOp, lhs: &MirOperand, rhs: &MirOperand) -> Option[M
           kind: MirRvalueKind::MirMove(MirOperand {
             kind: MirOperandKind::MirConstant(MirConstant {
               kind: MirConstantKind::MirInt(val),
-              ty: Type::Int
+              ty: Type::Int,
+              instance: Option::None
             })
           })
         })
@@ -11315,7 +11999,8 @@ def try_fold_binop(op: MirBinOp, lhs: &MirOperand, rhs: &MirOperand) -> Option[M
             kind: MirRvalueKind::MirMove(MirOperand {
               kind: MirOperandKind::MirConstant(MirConstant {
                 kind: MirConstantKind::MirBool(val),
-                ty: Type::Bool
+                ty: Type::Bool,
+                instance: Option::None
               })
             })
           })
@@ -11337,7 +12022,8 @@ def try_fold_unop(op: MirUnOp, operand: &MirOperand) -> Option[MirRvalue]
         kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirInt(0 - val),
-            ty: Type::Int
+            ty: Type::Int,
+            instance: Option::None
           })
         })
       })
@@ -11350,7 +12036,8 @@ def try_fold_unop(op: MirUnOp, operand: &MirOperand) -> Option[MirRvalue]
         kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirBool(!val),
-            ty: Type::Bool
+            ty: Type::Bool,
+            instance: Option::None
           })
         })
       })
@@ -11363,7 +12050,8 @@ def try_fold_unop(op: MirUnOp, operand: &MirOperand) -> Option[MirRvalue]
         kind: MirRvalueKind::MirMove(MirOperand {
           kind: MirOperandKind::MirConstant(MirConstant {
             kind: MirConstantKind::MirInt(~val),
-            ty: Type::Int
+            ty: Type::Int,
+            instance: Option::None
           })
         })
       })
@@ -12879,7 +13567,8 @@ def instrument_for_pgo(program: &mut MirProgram) -> Unit
       let increment = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirInt(1),
-          ty: Type::Int
+          ty: Type::Int,
+          instance: Option::None
         })
       }
       let counter_stmt = MirStatement {
@@ -13227,7 +13916,8 @@ def transform_async_function(func: &MirFunction) -> MirFunction
             MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
               kind: MirOperandKind::MirConstant(MirConstant {
                 kind: MirConstantKind::MirInt(resume_state_id),
-                ty: Type::Int
+                ty: Type::Int,
+                instance: Option::None
               })
             }) }
           ),

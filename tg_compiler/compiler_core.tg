@@ -14,7 +14,7 @@ use tg_compiler::ast::{
   FnBody, FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, PatternKind, type_expr_name,
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
 }
-use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded}
 use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, TypedProgram, extract_import_paths, TypeEnv}
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
@@ -697,8 +697,13 @@ end
 # uses it too, so preparation is defined exactly ONCE and every pipeline
 # (ordinary compile, `tg check`, bootstrap compile) flows through the same
 # preparation + analyze_parsed + lowering shape.
-pub def prepare_parsed(program: &mut Program) -> Unit
-  let expanded = expand_macros(program.clone())
+# P1 (macro hygiene, expansion-depth contract): the diagnostic bag is the
+# parser's channel — when the 64-pass expansion fixpoint fails to converge,
+# expand_macros records E105 into it (diag_macro_expansion_depth_exceeded);
+# the caller checks diag_has_errors on it and returns the failed state before
+# any lowering happens.
+pub def prepare_parsed(program: &mut Program, diags: &mut Vec[Diagnostic]) -> Unit
+  let expanded = expand_macros(program.clone(), diags)
   *program = expanded
   assign_node_ids(program)
 end
@@ -773,7 +778,16 @@ def join_parse_diagnostics(diags: &Vec[Diagnostic]) -> String
 end
 
 pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
-  prepare_parsed(program)
+  # P1 (macro hygiene, expansion-depth contract): preparation records E105
+  # through the parser's diagnostic channel when the expansion fixpoint does
+  # not converge; diag_has_errors then returns the failed state BEFORE
+  # resolution/type-checking (and therefore before any lowering) — an
+  # incompletely expanded AST is never semantically processed.
+  var macro_diags: Vec[Diagnostic] = Vec::new()
+  prepare_parsed(program, &mut macro_diags)
+  if diag_has_errors(&macro_diags) then
+    return Result::Err(join_parse_diagnostics(&macro_diags))
+  end
   match resolve_names(program)
   when Result::Ok(res) then
     # P1 (recovery separation): the compilation path ALWAYS runs strict.
@@ -804,6 +818,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
       resolutions: typed.resolutions,
       expr_types: typed.expr_types,
       call_targets: typed.call_targets,
+      call_instances: typed.call_instances,
       field_targets: typed.field_targets,
       access_effects: typed.access_effects,
       closure_captures: typed.closure_captures,
@@ -951,8 +966,10 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
     # DEBUG-ONLY dump path: expands macros and assigns node ids locally for
     # human inspection. It does NOT feed the real pipeline — the canonical
     # semantic pass (analyze_parsed) performs its own expansion/id assignment
-    # on the shared `ast` below.
-    var dump_ast = expand_macros(ast.clone())
+    # on the shared `ast` below. The diagnostic bag is discarded: this path
+    # is not a compilation, so the E105 failed state is not applicable.
+    var dump_diags: Vec[Diagnostic] = Vec::new()
+    var dump_ast = expand_macros(ast.clone(), &mut dump_diags)
     assign_node_ids(&mut dump_ast)
     println("Resolved AST:")
     print_ast(&dump_ast)
@@ -1305,8 +1322,15 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     end
     # The bootstrap path still needs a prepared AST (macros expanded, node
     # ids assigned) so the shared MIR lowering below can run; preparation is
-    # the same canonical helper analyze_parsed uses.
-    prepare_parsed(&mut ast)
+    # the same canonical helper analyze_parsed uses. The E105 diagnostic
+    # channel is honored even here: a non-converging expansion must fail the
+    # bootstrap loudly, never silently continue with a partial expansion.
+    var bootstrap_diags: Vec[Diagnostic] = Vec::new()
+    prepare_parsed(&mut ast, &mut bootstrap_diags)
+    if diag_has_errors(&bootstrap_diags) then
+      println(join_parse_diagnostics(&bootstrap_diags))
+      return 1
+    end
   else
     var env = type_env_new()
     # P1 (recovery separation): compilation always runs strict — the flag is
@@ -1752,6 +1776,15 @@ pub struct MacroEnv
   # expansion and its surrounding scope can collide. The counter is monotonic
   # across the 64-pass fixpoint loop (the env outlives all passes), so the
   # ids are unique per program.
+  #
+  # Context COMPOSITION: an expansion is stamped with a context STACK (the
+  # per-expansion id plus the ids of every enclosing expansion whose body it
+  # is nested inside), so the marker becomes `__hygiene_<c1>_<c2>_name` when
+  # an inner expansion runs inside the outer expansion's body — the inner
+  # generated names can never collide with the outer's even when their
+  # spellings match (see the expand_expr macro arms: the substituted body of
+  # an expansion is re-expanded with the composed stack inherited from the
+  # outer context).
   expansion_counter: Int
 end
 
@@ -1795,7 +1828,16 @@ pub struct ExpandedExprVec
   did_expand: Bool
 end
 
-pub def expand_macros(program: Program) -> Program
+# P1 (macro hygiene, expansion-depth contract): `diags` is the parser's
+# diagnostic channel. The 64-pass fixpoint below is the DEPTH CAP: when it
+# does not converge (an expansion chain longer than 64 levels, e.g. a macro
+# whose body recursively embeds itself — one extra nesting level per pass),
+# the residual ExprMacroCall nodes are reported as E105 through
+# diag_macro_expansion_depth_exceeded instead of silently continuing with an
+# incompletely expanded AST. The pipeline (analyze_parsed and the bootstrap
+# skip-semantic-checks paths) checks diag_has_errors on the bag and returns
+# the failed state before lowering.
+pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
   # Phase 1: collect macro declarations
   var env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new(), expansion_counter: 0 }
   for item in program.items do
@@ -1813,7 +1855,15 @@ pub def expand_macros(program: Program) -> Program
     return program
   end
 
-  # Phase 2: iteratively expand until fixpoint (max 64 passes)
+  # Phase 2: iteratively expand until fixpoint (max 64 passes).
+  #
+  # P1 (macro hygiene, expansion-depth contract): 64 is the DEPTH CAP. The
+  # eager re-expansion of substituted bodies (see expand_expr's macro arms)
+  # normally converges in one or two passes; a macro that transitively
+  # embeds itself adds one nesting level per pass, so 64 passes bounds the
+  # nesting depth. If the fixpoint has not converged when the cap is hit,
+  # residual ExprMacroCall nodes remain — that is the E105 failure recorded
+  # below after the macro definitions are filtered out.
   var current = program
   var pass = 0
   while pass < 64 do
@@ -1862,7 +1912,239 @@ pub def expand_macros(program: Program) -> Program
     removed_global = removed_global + removed_in_module
     mi = mi + 1
   end
-  Program { items: filtered_items, modules: filtered_modules, span: current_span }
+  let filtered_program = Program { items: filtered_items, modules: filtered_modules, span: current_span }
+
+  # ── P1 (macro hygiene, expansion-depth contract): E105 on non-convergence ──
+  # After the 64-pass depth cap, any surviving ExprMacroCall means the
+  # fixpoint did not converge (or a call refers to an undefined macro):
+  # expansion never reached a fixpoint. Record E105 through the parser's
+  # diagnostic channel (diag_macro_expansion_depth_exceeded) at the first
+  # residual call's span; the caller's diag_has_errors check then returns the
+  # failed state and the pipeline never lowers the partial AST.
+  var residual_calls: Vec[Expr] = Vec::new()
+  for item in filtered_program.items do
+    residual_macro_calls_in_item(&item, &mut residual_calls)
+  end
+  if !residual_calls.is_empty() then
+    diag_macro_expansion_depth_exceeded(diags, residual_calls[0].span.clone())
+  end
+
+  filtered_program
+end
+
+# ───────────────────────────────────────────────────────────────────────
+# P1 (macro hygiene, expansion-depth contract): residual macro-call walker
+# ───────────────────────────────────────────────────────────────────────
+# Total AST walk used by expand_macros' E105 check: it must find ANY
+# ExprMacroCall the fixpoint left behind — including positions the expander
+# walks but also positions it clones verbatim (elsif/else branches, for
+# bodies) — so a surviving call always records the depth diagnostic.
+def residual_macro_calls_in_expr(expr: &Expr, out: &mut Vec[Expr]) -> Unit
+  match expr.kind
+  when ExprKind::ExprMacroCall(_, _) then out.push(expr.clone())
+  when ExprKind::ExprCall(callee, args) then
+    residual_macro_calls_in_expr(&callee, out)
+    for a in args do residual_macro_calls_in_expr(&a, out) end
+  when ExprKind::ExprBlock(block) then residual_macro_calls_in_block(block, out)
+  when ExprKind::ExprMethodCall(receiver, _, _, args) then
+    residual_macro_calls_in_expr(&receiver, out)
+    for a in args do residual_macro_calls_in_expr(&a, out) end
+  when ExprKind::ExprIf(if_expr) then
+    residual_macro_calls_in_expr(&if_expr.cond, out)
+    residual_macro_calls_in_block(&if_expr.then_block, out)
+    for (_, eb) in if_expr.elsif_branches do residual_macro_calls_in_block(&eb, out) end
+    match if_expr.else_block
+    when Option::Some(eb) then residual_macro_calls_in_block(&eb, out)
+    when Option::None then ()
+    end
+  when ExprKind::ExprMatch(match_expr) then
+    residual_macro_calls_in_expr(&match_expr.scrutinee, out)
+    for arm in match_expr.arms do
+      match arm.guard_expr
+      when Option::Some(g) then residual_macro_calls_in_expr(&g, out)
+      when Option::None then ()
+      end
+      residual_macro_calls_in_block(&arm.body, out)
+    end
+  when ExprKind::ExprClosure(_, _, body) then residual_macro_calls_in_expr(&body, out)
+  when ExprKind::ExprUnsafe(_, block) then residual_macro_calls_in_block(block, out)
+  when ExprKind::ExprAsync(block) then residual_macro_calls_in_block(block, out)
+  when ExprKind::ExprComptime(block) then residual_macro_calls_in_block(block, out)
+  when ExprKind::ExprEnumVariant(_, args) then
+    for a in args do residual_macro_calls_in_expr(&a, out) end
+  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
+    residual_macro_calls_in_expr(&lhs, out)
+    residual_macro_calls_in_expr(&rhs, out)
+  when ExprKind::ExprUnaryOp(_, operand) then residual_macro_calls_in_expr(&operand, out)
+  when ExprKind::ExprFieldAccess(obj, _) then residual_macro_calls_in_expr(&obj, out)
+  when ExprKind::ExprIndex(obj, idx) then
+    residual_macro_calls_in_expr(&obj, out)
+    residual_macro_calls_in_expr(&idx, out)
+  when ExprKind::ExprArrayLit(elems) then
+    for e in elems do residual_macro_calls_in_expr(&e, out) end
+  when ExprKind::ExprTupleLit(elems) then
+    for e in elems do residual_macro_calls_in_expr(&e, out) end
+  when ExprKind::ExprStructLit(_, fields) then
+    for (_, fv) in fields do residual_macro_calls_in_expr(&fv, out) end
+  when ExprKind::ExprMapLit(entries) then
+    for (k, v) in entries do
+      residual_macro_calls_in_expr(&k, out)
+      residual_macro_calls_in_expr(&v, out)
+    end
+  when ExprKind::ExprAccess(inner) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprRawDeref(inner) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprAwait(inner) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprTry(inner) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprRange(start_e, end_e, _) then
+    match start_e
+    when Option::Some(s) then residual_macro_calls_in_expr(&s, out)
+    when Option::None then ()
+    end
+    match end_e
+    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprTypeCheck(inner, _) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprAssign(target, value) then
+    residual_macro_calls_in_expr(&target, out)
+    residual_macro_calls_in_expr(&value, out)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    residual_macro_calls_in_expr(&lhs, out)
+    residual_macro_calls_in_expr(&rhs, out)
+  when _ then ()
+  end
+end
+
+def residual_macro_calls_in_block(block: &Block, out: &mut Vec[Expr]) -> Unit
+  for stmt in block.stmts do
+    residual_macro_calls_in_stmt(&stmt, out)
+  end
+end
+
+def residual_macro_calls_in_stmt(stmt: &Stmt, out: &mut Vec[Expr]) -> Unit
+  match stmt.kind
+  when StmtKind::StmtLet(_, _, init, _) then residual_macro_calls_in_expr(&init, out)
+  when StmtKind::StmtAssign(target, value) then
+    residual_macro_calls_in_expr(&target, out)
+    residual_macro_calls_in_expr(&value, out)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    residual_macro_calls_in_expr(&target, out)
+    residual_macro_calls_in_expr(&value, out)
+  when StmtKind::StmtIf(if_stmt) then
+    residual_macro_calls_in_expr(&if_stmt.cond, out)
+    residual_macro_calls_in_block(&if_stmt.then_block, out)
+    for (_, eb) in if_stmt.elsif_branches do residual_macro_calls_in_block(&eb, out) end
+    match if_stmt.else_block
+    when Option::Some(eb) then residual_macro_calls_in_block(&eb, out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtMatch(match_expr) then
+    residual_macro_calls_in_expr(&match_expr.scrutinee, out)
+    for arm in match_expr.arms do
+      match arm.guard_expr
+      when Option::Some(g) then residual_macro_calls_in_expr(&g, out)
+      when Option::None then ()
+      end
+      residual_macro_calls_in_block(&arm.body, out)
+    end
+  when StmtKind::StmtWhile(cond, body) then
+    residual_macro_calls_in_expr(&cond, out)
+    residual_macro_calls_in_block(&body, out)
+  when StmtKind::StmtFor(f) then
+    residual_macro_calls_in_expr(&f.iter, out)
+    residual_macro_calls_in_block(&f.body, out)
+  when StmtKind::StmtLoop(body) then residual_macro_calls_in_block(&body, out)
+  when StmtKind::StmtReturn(oe) then
+    match oe
+    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(oe) then
+    match oe
+    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtYield(oe) then
+    match oe
+    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtExpr(e) then residual_macro_calls_in_expr(&e, out)
+  when StmtKind::StmtUnsafe(_, body) then residual_macro_calls_in_block(&body, out)
+  when StmtKind::StmtDefer(body) then residual_macro_calls_in_block(&body, out)
+  when StmtKind::StmtGuard(cond, ge) then
+    residual_macro_calls_in_expr(&cond, out)
+    match ge
+    when GuardElse::Return(oe) then
+      match oe
+      when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(oe) then
+      match oe
+      when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, fin) then
+    residual_macro_calls_in_block(&body, out)
+    for c in catches do residual_macro_calls_in_block(&c.body, out) end
+    match fin
+    when Option::Some(fb) then residual_macro_calls_in_block(&fb, out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, _, body) then
+    residual_macro_calls_in_expr(&expr, out)
+    residual_macro_calls_in_block(&body, out)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    residual_macro_calls_in_expr(&expr, out)
+    for h in handlers do
+      for arm in h.arms do residual_macro_calls_in_block(&arm.body, out) end
+    end
+  when _ then ()
+  end
+end
+
+def residual_macro_calls_in_fn_body(body: &FnBody, out: &mut Vec[Expr]) -> Unit
+  match body
+  when FnBody::FnBlock(block) then residual_macro_calls_in_block(&block, out)
+  when FnBody::FnExpr(e) then residual_macro_calls_in_expr(&e, out)
+  when _ then ()
+  end
+end
+
+def residual_macro_calls_in_function(f: &FunctionDecl, out: &mut Vec[Expr]) -> Unit
+  residual_macro_calls_in_fn_body(&f.body, out)
+  for c in f.contracts do
+    residual_macro_calls_in_expr(&c.expr, out)
+  end
+end
+
+def residual_macro_calls_in_item(item: &Item, out: &mut Vec[Expr]) -> Unit
+  match item.kind
+  when ItemKind::ItemFunction(f) then residual_macro_calls_in_function(&f, out)
+  when ItemKind::ItemStruct(s) then
+    for m in s.methods do residual_macro_calls_in_function(&m, out) end
+    for fd in s.fields do
+      match fd.default
+      when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+      when Option::None then ()
+      end
+    end
+  when ItemKind::ItemTrait(t) then
+    for m in t.methods do residual_macro_calls_in_fn_body(&m.default_body, out) end
+  when ItemKind::ItemImpl(imp) then
+    for m in imp.methods do residual_macro_calls_in_function(&m, out) end
+  when ItemKind::ItemModule(m) then
+    for sub in m.items do residual_macro_calls_in_item(&sub, out) end
+  when ItemKind::ItemConst(c) then residual_macro_calls_in_expr(&c.value, out)
+  when ItemKind::ItemStatic(s) then residual_macro_calls_in_expr(&s.value, out)
+  when ItemKind::ItemMacro(m) then residual_macro_calls_in_block(&m.body, out)
+  when _ then ()
+  end
 end
 
 pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
@@ -1971,7 +2253,11 @@ pub def expand_function_decl(env: &MacroEnv, f: &FunctionDecl) -> ExpandedFuncti
   let f_span = f.span
   match f.body
   when FnBody::FnBlock(block) then
-    let expanded_block = expand_block(env, &block)
+    # P1 (macro hygiene, context composition): the root of the expansion walk
+    # starts with an EMPTY hygiene context stack — composition only applies
+    # to expansions nested inside a substituted macro body (see expand_expr).
+    var root_ctx: Vec[Int] = Vec::new()
+    let expanded_block = expand_block(env, &block, &root_ctx)
     ExpandedFunctionDecl {
       func: FunctionDecl {
         vis: f_vis,
@@ -2024,13 +2310,16 @@ pub def expand_trait_method(env: &MacroEnv, method: TraitMethod) -> ExpandedTrai
   ExpandedTraitMethod { method, did_expand: false }
 end
 
-pub def expand_block(env: &MacroEnv, block: &Block) -> ExpandedBlock
+# ctx_stack: the P1 hygiene context stack of the expansions whose body this
+# walk is inside (empty at the root of a pass; composed at nested macro
+# expansions — see expand_expr's macro arms).
+pub def expand_block(env: &MacroEnv, block: &Block, ctx_stack: &Vec[Int]) -> ExpandedBlock
   let block_span = block.span
   var new_stmts = Vec::new()
   var did_expand = false
   var i = 0
   while i < block.stmts.len() do
-    let expanded_stmt = expand_stmt(env, &block.stmts[i])
+    let expanded_stmt = expand_stmt(env, &block.stmts[i], ctx_stack)
     new_stmts.push(expanded_stmt.stmt)
     if expanded_stmt.did_expand then did_expand = true end
     i = i + 1
@@ -2038,37 +2327,37 @@ pub def expand_block(env: &MacroEnv, block: &Block) -> ExpandedBlock
   ExpandedBlock { block: Block { stmts: new_stmts, span: block_span }, did_expand }
 end
 
-pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
+pub def expand_stmt(env: &MacroEnv, stmt: &Stmt, ctx_stack: &Vec[Int]) -> ExpandedStmt
   match stmt.kind
   when StmtKind::StmtExpr(expr) then
-    let expanded_expr = expand_expr(env, &expr)
+    let expanded_expr = expand_expr(env, &expr, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtExpr(expanded_expr.expr), span: stmt.span, node_id: 0 },
       did_expand: expanded_expr.did_expand
     }
   when StmtKind::StmtLet(pat, ty, init, is_mut) then
-    let expanded_expr = expand_expr(env, &init)
+    let expanded_expr = expand_expr(env, &init, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtLet(pat.clone(), ty.clone(), expanded_expr.expr, is_mut), span: stmt.span, node_id: 0 },
       did_expand: expanded_expr.did_expand
     }
   when StmtKind::StmtAssign(target, value) then
-    let et = expand_expr(env, &target)
-    let ev = expand_expr(env, &value)
+    let et = expand_expr(env, &target, ctx_stack)
+    let ev = expand_expr(env, &value, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtAssign(et.expr, ev.expr), span: stmt.span, node_id: 0 },
       did_expand: et.did_expand || ev.did_expand
     }
   when StmtKind::StmtCompoundAssign(op, target, value) then
-    let et = expand_expr(env, &target)
-    let ev = expand_expr(env, &value)
+    let et = expand_expr(env, &target, ctx_stack)
+    let ev = expand_expr(env, &value, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtCompoundAssign(op, et.expr, ev.expr), span: stmt.span, node_id: 0 },
       did_expand: et.did_expand || ev.did_expand
     }
   when StmtKind::StmtIf(if_stmt) then
-    let ec = expand_expr(env, &if_stmt.cond)
-    let eb = expand_block(env, &if_stmt.then_block)
+    let ec = expand_expr(env, &if_stmt.cond, ctx_stack)
+    let eb = expand_block(env, &if_stmt.then_block, ctx_stack)
     let did = ec.did_expand || eb.did_expand
     let new_if = IfStmt {
       cond: ec.expr,
@@ -2079,8 +2368,8 @@ pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
     }
     ExpandedStmt { stmt: Stmt { kind: StmtKind::StmtIf(new_if), span: stmt.span, node_id: 0 }, did_expand: did }
   when StmtKind::StmtWhile(cond, body) then
-    let ec = expand_expr(env, &cond)
-    let eb = expand_block(env, &body)
+    let ec = expand_expr(env, &cond, ctx_stack)
+    let eb = expand_block(env, &body, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtWhile(ec.expr, eb.block), span: stmt.span, node_id: 0 },
       did_expand: ec.did_expand || eb.did_expand
@@ -2088,7 +2377,7 @@ pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
   when StmtKind::StmtFor(_) then
     ExpandedStmt { stmt: stmt.clone(), did_expand: false }
   when StmtKind::StmtLoop(body) then
-    let eb = expand_block(env, &body)
+    let eb = expand_block(env, &body, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtLoop(eb.block), span: stmt.span, node_id: 0 },
       did_expand: eb.did_expand
@@ -2096,7 +2385,7 @@ pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
   when StmtKind::StmtReturn(opt_expr) then
     match opt_expr
     when Option::Some(expr) then
-      let ee = expand_expr(env, &expr)
+      let ee = expand_expr(env, &expr, ctx_stack)
       ExpandedStmt {
         stmt: Stmt { kind: StmtKind::StmtReturn(Option::Some(ee.expr)), span: stmt.span, node_id: 0 },
         did_expand: ee.did_expand
@@ -2104,13 +2393,13 @@ pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
     when Option::None then ExpandedStmt { stmt: stmt.clone(), did_expand: false }
     end
   when StmtKind::StmtUnsafe(reason, body) then
-    let eb = expand_block(env, &body)
+    let eb = expand_block(env, &body, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtUnsafe(reason.clone(), eb.block), span: stmt.span, node_id: 0 },
       did_expand: eb.did_expand
     }
   when StmtKind::StmtDefer(body) then
-    let eb = expand_block(env, &body)
+    let eb = expand_block(env, &body, ctx_stack)
     ExpandedStmt {
       stmt: Stmt { kind: StmtKind::StmtDefer(eb.block), span: stmt.span, node_id: 0 },
       did_expand: eb.did_expand
@@ -2119,12 +2408,12 @@ pub def expand_stmt(env: &MacroEnv, stmt: &Stmt) -> ExpandedStmt
   end
 end
 
-pub def expand_exprs(env: &MacroEnv, args: &Vec[Expr]) -> ExpandedExprVec
+pub def expand_exprs(env: &MacroEnv, args: &Vec[Expr], ctx_stack: &Vec[Int]) -> ExpandedExprVec
   var new_args = Vec::new()
   var did_expand = false
   var i = 0
   while i < args.len() do
-    let expanded_arg = expand_expr(env, &args[i])
+    let expanded_arg = expand_expr(env, &args[i], ctx_stack)
     new_args.push(expanded_arg.expr)
     if expanded_arg.did_expand then did_expand = true end
     i = i + 1
@@ -2173,13 +2462,20 @@ pub def expand_vec_like_from_array(path: &AstPath, elems: &Vec[Expr], span: &Spa
   make_expr(ExprKind::ExprBlock(make_block(stmts, span.clone())), span.clone())
 end
 
-pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
+# ctx_stack: the P1 hygiene context stack inherited from the expansions whose
+# body this walk is inside (empty at the root of a pass). The macro arms
+# COMPOSE it: each instantiation appends its fresh context id, and the
+# substituted body is then re-expanded under the composed stack, so nested
+# macro calls inside that body inherit the outer expansion's context and
+# their generated names are marked with BOTH contexts
+# (`__hygiene_<c1>_<c2>_name` — see instantiate_macro).
+pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> ExpandedExpr
   match expr.kind
   when ExprKind::ExprCall(callee, args) then
     ## Check if callee is a path that matches a macro name
     match callee.kind
     when ExprKind::ExprPath(path) then
-      let ea = expand_exprs(env, &args)
+      let ea = expand_exprs(env, &args, ctx_stack)
       if is_vec_like_from_path(&path) && ea.args.len() == 1 then
         match ea.args[0].kind
         when ExprKind::ExprArrayLit(elems) then
@@ -2200,24 +2496,34 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
           }
         else
           env.expansion_stack.push(name.clone())
-          # P1 (macro hygiene): each expansion consumes one unique context id
-          # that stamps the identifiers the expansion introduces.
+          # P1 (macro hygiene, context composition): each expansion consumes
+          # one unique context id (per-expansion counter, unchanged), which is
+          # APPENDED to the inherited stack — the substituted body's nested
+          # macro calls then run with the composed context. The substituted
+          # body is re-expanded IMMEDIATELY under the composed stack (the
+          # nested ExprMacroCall inside it is expanded here, not on a later
+          # pass), so the inner expansion's generated names carry both the
+          # outer and the inner contexts and can never collide with the
+          # outer-marked names even when their spellings match.
           env.expansion_counter = env.expansion_counter + 1
-          let expanded = instantiate_macro(macro_decl, &args, &expr.span, env.expansion_counter)
+          var composed_ctx = ctx_stack.clone()
+          composed_ctx.push(env.expansion_counter)
+          let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
+          let re_expanded = expand_expr(env, &expanded, &composed_ctx)
           env.expansion_stack.pop()
-          ExpandedExpr { expr: expanded, did_expand: true }
+          ExpandedExpr { expr: re_expanded.expr, did_expand: true }
         end
       when Option::None then
         ## Not a macro  expand arguments recursively
-        let ec = expand_expr(env, &callee)
+        let ec = expand_expr(env, &callee, ctx_stack)
         ExpandedExpr {
           expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
           did_expand: ec.did_expand || ea.did_expand
         }
       end
     when _ then
-      let ea = expand_exprs(env, &args)
-      let ec = expand_expr(env, &callee)
+      let ea = expand_exprs(env, &args, ctx_stack)
+      let ec = expand_expr(env, &callee, ctx_stack)
       ExpandedExpr {
         expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
         did_expand: ec.did_expand || ea.did_expand
@@ -2233,28 +2539,34 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
         }
       else
         env.expansion_stack.push(name.clone())
-        # P1 (macro hygiene): unique expansion context id per instantiation.
+        # P1 (macro hygiene, context composition): see the ExprCall arm — the
+        # per-expansion counter is appended to the inherited context stack and
+        # the substituted body is re-expanded under the composed context so a
+        # nested macro call inside the body inherits the outer context.
         env.expansion_counter = env.expansion_counter + 1
-        let expanded = instantiate_macro(macro_decl, &args, &expr.span, env.expansion_counter)
+        var composed_ctx = ctx_stack.clone()
+        composed_ctx.push(env.expansion_counter)
+        let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
+        let re_expanded = expand_expr(env, &expanded, &composed_ctx)
         env.expansion_stack.pop()
-        ExpandedExpr { expr: expanded, did_expand: true }
+        ExpandedExpr { expr: re_expanded.expr, did_expand: true }
       end
     when Option::None then
-      let ea = expand_exprs(env, &args)
+      let ea = expand_exprs(env, &args, ctx_stack)
       ExpandedExpr {
         expr: Expr { kind: ExprKind::ExprMacroCall(name.clone(), ea.args), span: expr.span, node_id: 0 },
         did_expand: ea.did_expand
       }
     end
   when ExprKind::ExprBlock(block) then
-    let expanded_block = expand_block(env, &block)
+    let expanded_block = expand_block(env, &block, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprBlock(expanded_block.block), span: expr.span, node_id: 0 },
       did_expand: expanded_block.did_expand
     }
   when ExprKind::ExprIf(if_expr) then
-    let expanded_cond = expand_expr(env, &if_expr.cond)
-    let expanded_then = expand_block(env, &if_expr.then_block)
+    let expanded_cond = expand_expr(env, &if_expr.cond, ctx_stack)
+    let expanded_then = expand_block(env, &if_expr.then_block, ctx_stack)
     let expanded = expanded_cond.did_expand || expanded_then.did_expand
     let new_if = IfStmt {
       cond: expanded_cond.expr,
@@ -2265,46 +2577,46 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
     }
     ExpandedExpr { expr: Expr { kind: ExprKind::ExprIf(new_if), span: expr.span, node_id: 0 }, did_expand: expanded }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    let el = expand_expr(env, &lhs)
-    let er = expand_expr(env, &rhs)
+    let el = expand_expr(env, &lhs, ctx_stack)
+    let er = expand_expr(env, &rhs, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(el.expr), Box::new(er.expr)), span: expr.span, node_id: 0 },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprUnaryOp(op, operand) then
-    let eo = expand_expr(env, &operand)
+    let eo = expand_expr(env, &operand, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(eo.expr)), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let er = expand_expr(env, &receiver)
-    let ea = expand_exprs(env, &args)
+    let er = expand_expr(env, &receiver, ctx_stack)
+    let ea = expand_exprs(env, &args, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprMethodCall(Box::new(er.expr), method.clone(), targs.clone(), ea.args), span: expr.span, node_id: 0 },
       did_expand: er.did_expand || ea.did_expand
     }
   when ExprKind::ExprFieldAccess(obj, field) then
-    let eo = expand_expr(env, &obj)
+    let eo = expand_expr(env, &obj, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprFieldAccess(Box::new(eo.expr), field.clone()), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprIndex(obj, idx) then
-    let eo = expand_expr(env, &obj)
-    let ei = expand_expr(env, &idx)
+    let eo = expand_expr(env, &obj, ctx_stack)
+    let ei = expand_expr(env, &idx, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprIndex(Box::new(eo.expr), Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand || ei.did_expand
     }
   when ExprKind::ExprArrayLit(elems) then
-    let ea = expand_exprs(env, &elems)
+    let ea = expand_exprs(env, &elems, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprArrayLit(ea.args), span: expr.span, node_id: 0 },
       did_expand: ea.did_expand
     }
   when ExprKind::ExprTupleLit(elems) then
-    let ea = expand_exprs(env, &elems)
+    let ea = expand_exprs(env, &elems, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTupleLit(ea.args), span: expr.span, node_id: 0 },
       did_expand: ea.did_expand
@@ -2313,7 +2625,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
     var new_fields = Vec::new()
     var did_expand = false
     for (field_name, field_value) in fields do
-      let expanded_field = expand_expr(env, &field_value)
+      let expanded_field = expand_expr(env, &field_value, ctx_stack)
       new_fields.push((field_name.clone(), expanded_field.expr))
       if expanded_field.did_expand then did_expand = true end
     end
@@ -2325,8 +2637,8 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
     var new_entries = Vec::new()
     var did_expand = false
     for (key_expr, value_expr) in entries do
-      let ek = expand_expr(env, &key_expr)
-      let ev = expand_expr(env, &value_expr)
+      let ek = expand_expr(env, &key_expr, ctx_stack)
+      let ev = expand_expr(env, &value_expr, ctx_stack)
       new_entries.push((ek.expr, ev.expr))
       if ek.did_expand || ev.did_expand then did_expand = true end
     end
@@ -2335,37 +2647,37 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
       did_expand
     }
   when ExprKind::ExprAccess(inner) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAccess(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprRawDeref(inner) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprRawDeref(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprClosure(params, ret_ty, body) then
-    let eb = expand_expr(env, &body)
+    let eb = expand_expr(env, &body, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(eb.expr)), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprMatch(match_expr) then
-    let es = expand_expr(env, &match_expr.scrutinee)
+    let es = expand_expr(env, &match_expr.scrutinee, ctx_stack)
     var new_arms = Vec::new()
     var did_expand = es.did_expand
     for arm in match_expr.arms do
       let new_guard = match arm.guard_expr
       when Option::Some(guard_expr) then
-        let eg = expand_expr(env, &guard_expr)
+        let eg = expand_expr(env, &guard_expr, ctx_stack)
         if eg.did_expand then did_expand = true end
         Option::Some(eg.expr)
       when Option::None then
         Option::None
       end
-      let eb = expand_block(env, &arm.body)
+      let eb = expand_block(env, &arm.body, ctx_stack)
       if eb.did_expand then did_expand = true end
       new_arms.push(MatchArm {
         pattern: arm.pattern.clone(),
@@ -2383,19 +2695,19 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
       did_expand
     }
   when ExprKind::ExprUnsafe(reason, block) then
-    let eb = expand_block(env, &block)
+    let eb = expand_block(env, &block, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprUnsafe(reason.clone(), eb.block), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprAwait(inner) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAwait(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTry(inner) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTry(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
@@ -2403,14 +2715,14 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
     when Option::Some(start) then
-      let es = expand_expr(env, &start)
+      let es = expand_expr(env, &start, ctx_stack)
       Option::Some(Box::new(es.expr))
     when Option::None then
       Option::None
     end
     let new_end = match end_expr
     when Option::Some(end_expr_inner) then
-      let ee = expand_expr(env, &end_expr_inner)
+      let ee = expand_expr(env, &end_expr_inner, ctx_stack)
       Option::Some(Box::new(ee.expr))
     when Option::None then
       Option::None
@@ -2420,39 +2732,39 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
       did_expand: false
     }
   when ExprKind::ExprAssign(target, value) then
-    let et = expand_expr(env, &target)
-    let ev = expand_expr(env, &value)
+    let et = expand_expr(env, &target, ctx_stack)
+    let ev = expand_expr(env, &value, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAssign(Box::new(et.expr), Box::new(ev.expr)), span: expr.span, node_id: 0 },
       did_expand: et.did_expand || ev.did_expand
     }
   when ExprKind::ExprPipe(lhs, rhs) then
-    let el = expand_expr(env, &lhs)
-    let er = expand_expr(env, &rhs)
+    let el = expand_expr(env, &lhs, ctx_stack)
+    let er = expand_expr(env, &rhs, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprPipe(Box::new(el.expr), Box::new(er.expr)), span: expr.span, node_id: 0 },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprCast(inner, ty) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprCast(Box::new(ei.expr), ty.clone()), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    let ei = expand_expr(env, &inner)
+    let ei = expand_expr(env, &inner, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTypeCheck(Box::new(ei.expr), ty.clone()), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprAsync(block) then
-    let eb = expand_block(env, &block)
+    let eb = expand_block(env, &block, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAsync(eb.block), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
     }
   when ExprKind::ExprComptime(block) then
-    let eb = expand_block(env, &block)
+    let eb = expand_block(env, &block, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprComptime(eb.block), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
@@ -2461,7 +2773,11 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr) -> ExpandedExpr
   end
 end
 
-pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span, hygiene_ctx: Int) -> Expr
+# hygiene_ctx is the composed P1 context STACK for this expansion: the
+# per-expansion context id appended to the stack of every enclosing expansion
+# whose body this call is nested inside (see expand_expr's macro arms). The
+# stamping below uses the whole stack, so nested expansions compose.
+pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span, hygiene_ctx: &Vec[Int]) -> Expr
   # Validate argument count matches parameter count
   if args.len() != macro_decl.params.len() then
     # Return an error expression - type checker will catch this
@@ -2471,22 +2787,32 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
   end
 
   # ── P1 macro hygiene (expansion-context stamping) ─────────────────────
-  # Every expansion is assigned a unique numeric context (hygiene_ctx, drawn
-  # from MacroEnv.expansion_counter before this call). The substitution walk
-  # below then distinguishes the two kinds of names the expansion contains:
+  # Every expansion is assigned a unique numeric context id (drawn from
+  # MacroEnv.expansion_counter before this call), appended to the INHERITED
+  # context stack (hygiene_ctx — the expansion ids of the enclosing
+  # expansions whose body this call sits inside; empty for top-level calls).
+  # The substitution walk below then distinguishes the two kinds of names the
+  # expansion contains:
   #
   #   1. USER-VISIBLE tokens — the macro parameters are replaced by the
   #      argument expressions the user wrote, which are cloned as-is and
   #      NEVER re-stamped: the user's names stay exactly as spelled.
   #   2. MACRO-BODY-OWN identifiers — names introduced BY THE MACRO
   #      DEFINITION (its let-bound temporaries) are re-stamped to the
-  #      reserved form  `__hygiene_<ctx>_<name>`  — binding AND every use of
-  #      that binding inside the body. The resolver keys locals by name
-  #      string, so a stamped binding is a distinct local: it can neither
-  #      capture a surrounding `tmp` (its name no longer matches) nor be
-  #      captured by one (surrounding references to `tmp` no longer see it).
-  #      Free identifiers in expression positions are left untouched: they
-  #      legitimately resolve to names outside the macro.
+  #      reserved form  `__hygiene_<c1>_<c2>_..._name`  — binding AND every
+  #      use of that binding inside the body, where <c1>, <c2>, ... are the
+  #      composed context stack levels (the innermost expansion's id last).
+  #      The resolver keys locals by name string, so a stamped binding is a
+  #      distinct local: it can neither capture a surrounding `tmp` (its name
+  #      no longer matches) nor be captured by one (surrounding references
+  #      to `tmp` no longer see it). CONTEXT COMPOSITION: when this expansion
+  #      is nested inside another macro's body, the outer context id is part
+  #      of the stack, so this expansion's generated names carry BOTH
+  #      contexts (`__hygiene_<c1>_<c2>_name` for an inner expansion inside
+  #      the outer's body) and can never collide with the outer-marked names
+  #      even when their spellings match. Free identifiers in expression
+  #      positions are left untouched: they legitimately resolve to names
+  #      outside the macro.
   #
   # Marker scheme: the stamp is a valid identifier for the lexer's charset
   # (lexer.tg is_ident_char = [A-Za-z0-9_]; `$` is NOT accepted, so `_` is
@@ -2531,9 +2857,27 @@ end
 # params and match patterns are NOT re-stamped, so references to them stay
 # as-is). Lookup walks the frames innermost-first; the innermost binding of
 # a name decides how its references are treated.
+#
+# Context composition (P1): the frames are keyed by the ORIGINAL spellings
+# and the re-stamp is applied at lookup time with the composed context
+# STACK, so the composed keys extend the existing shadow-frame machinery
+# unchanged: a binding and its references always land on the same
+# `__hygiene_<c1>_<c2>_..._name` regardless of nesting depth.
 
-def hygiene_mangled(ctx: Int, name: String) -> String
-  "__hygiene_" + ctx.to_string() + "_" + name
+# P1 (macro hygiene, context composition): the marker joins ALL levels of
+# the composed context stack — `__hygiene_<c1>_<name>` for a top-level
+# expansion, `__hygiene_<c1>_<c2>_<name>` when the expansion is nested
+# inside another expansion's body (the innermost id last). Each level is a
+# distinct per-expansion id, so composed keys are globally unique per
+# program and the inner generated names can never collide with the outer's.
+def hygiene_mangled(ctx_stack: &Vec[Int], name: String) -> String
+  var prefix = "__hygiene_"
+  var ci = 0
+  while ci < ctx_stack.len() do
+    prefix = prefix + ctx_stack[ci].to_string() + "_"
+    ci = ci + 1
+  end
+  prefix + name
 end
 
 def hygiene_ident_lookup(frames: &Vec[Map[String, Bool]], name: &String) -> Option[Bool]
@@ -2565,7 +2909,7 @@ def hygiene_collect_pattern_names(pat: &Pattern, out: &mut Vec[String]) -> Unit
   end
 end
 
-def hygiene_renamed_pattern(ctx: Int, subst: &Map[String, Expr], pat: &Pattern) -> Pattern
+def hygiene_renamed_pattern(ctx_stack: &Vec[Int], subst: &Map[String, Expr], pat: &Pattern) -> Pattern
   match pat.kind
   when PatternKind::Ident(name, is_mut) then
     # A let-bound name matching a macro parameter is the user's interface
@@ -2574,29 +2918,29 @@ def hygiene_renamed_pattern(ctx: Int, subst: &Map[String, Expr], pat: &Pattern) 
     if subst.contains_key(&name) then
       Pattern { kind: PatternKind::Ident(name.clone(), is_mut), span: pat.span, node_id: 0 }
     else
-      Pattern { kind: PatternKind::Ident(hygiene_mangled(ctx, name.clone()), is_mut), span: pat.span, node_id: 0 }
+      Pattern { kind: PatternKind::Ident(hygiene_mangled(ctx_stack, name.clone()), is_mut), span: pat.span, node_id: 0 }
     end
   when PatternKind::Tuple(ps) then
     var new_ps = Vec::new()
-    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx_stack, subst, &p)) end
     Pattern { kind: PatternKind::Tuple(new_ps), span: pat.span, node_id: 0 }
   when PatternKind::Array(ps) then
     var new_ps = Vec::new()
-    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx_stack, subst, &p)) end
     Pattern { kind: PatternKind::Array(new_ps), span: pat.span, node_id: 0 }
   when PatternKind::Struct(path, fields) then
     var new_fields = Vec::new()
     for (fname, p) in fields do
-      new_fields.push((fname.clone(), hygiene_renamed_pattern(ctx, subst, &p)))
+      new_fields.push((fname.clone(), hygiene_renamed_pattern(ctx_stack, subst, &p)))
     end
     Pattern { kind: PatternKind::Struct(path.clone(), new_fields), span: pat.span, node_id: 0 }
   when PatternKind::Variant(path, ps) then
     var new_ps = Vec::new()
-    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx_stack, subst, &p)) end
     Pattern { kind: PatternKind::Variant(path.clone(), new_ps), span: pat.span, node_id: 0 }
   when PatternKind::Or(ps) then
     var new_ps = Vec::new()
-    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx, subst, &p)) end
+    for p in ps do new_ps.push(hygiene_renamed_pattern(ctx_stack, subst, &p)) end
     Pattern { kind: PatternKind::Or(new_ps), span: pat.span, node_id: 0 }
   when _ then pat.clone()
   end
@@ -2612,7 +2956,10 @@ def hygiene_push_shadow_frame(frames: &Vec[Map[String, Bool]], names: &Vec[Strin
   new_frames
 end
 
-pub def substitute_block(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], block: &Block) -> Block
+# ctx_stack: the composed P1 hygiene context stack of THIS expansion (see
+# instantiate_macro) — every binding the body introduces and every reference
+# to it is stamped with the composed key.
+pub def substitute_block(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames: &Vec[Map[String, Bool]], block: &Block) -> Block
   # Each block opens a hygiene scope: the block's own let bindings land in a
   # fresh frame, so nested blocks shadow without leaking outward.
   var inner_frames = frames.clone()
@@ -2620,27 +2967,27 @@ pub def substitute_block(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[S
   var new_stmts = Vec::new()
   var i = 0
   while i < block.stmts.len() do
-    new_stmts.push(substitute_stmt(subst, ctx, &inner_frames, &block.stmts[i]))
+    new_stmts.push(substitute_stmt(subst, ctx_stack, &inner_frames, &block.stmts[i]))
     i = i + 1
   end
   Block { stmts: new_stmts, span: block.span }
 end
 
-pub def substitute_stmt(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], stmt: &Stmt) -> Stmt
+pub def substitute_stmt(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames: &Vec[Map[String, Bool]], stmt: &Stmt) -> Stmt
   match stmt.kind
   when StmtKind::StmtExpr(expr) then
-    Stmt { kind: StmtKind::StmtExpr(substitute_expr(subst, ctx, frames, &expr)), span: stmt.span, node_id: 0 }
+    Stmt { kind: StmtKind::StmtExpr(substitute_expr(subst, ctx_stack, frames, &expr)), span: stmt.span, node_id: 0 }
   when StmtKind::StmtLet(pat, ty, init, is_mut) then
     # P1 (macro hygiene): the let-bound temporaries the macro body itself
-    # introduces are re-stamped with the expansion context. The init is
-    # substituted BEFORE the binding enters the hygiene frame, so an
-    # init-side reference to the same name still resolves to the enclosing
-    # scope (unchanged semantics).
-    let new_init = substitute_expr(subst, ctx, frames, &init)
-    let new_pat = hygiene_renamed_pattern(ctx, subst, &pat)
+    # introduces are re-stamped with the composed expansion context stack.
+    # The init is substituted BEFORE the binding enters the hygiene frame,
+    # so an init-side reference to the same name still resolves to the
+    # enclosing scope (unchanged semantics).
+    let new_init = substitute_expr(subst, ctx_stack, frames, &init)
+    let new_pat = hygiene_renamed_pattern(ctx_stack, subst, &pat)
     # The frame is keyed by the ORIGINAL spellings: a later reference (also
-    # spelled originally) is re-stamped with the same context, landing on
-    # the same `__hygiene_<ctx>_<name>` as the binding.
+    # spelled originally) is re-stamped with the same composed context stack,
+    # landing on the same `__hygiene_<c1>_<c2>_..._name` as the binding.
     var names = Vec::new()
     hygiene_collect_pattern_names(&pat, &mut names)
     let last_frame = frames.len() - 1
@@ -2652,7 +2999,7 @@ pub def substitute_stmt(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
   end
 end
 
-pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[String, Bool]], expr: &Expr) -> Expr
+pub def substitute_expr(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames: &Vec[Map[String, Bool]], expr: &Expr) -> Expr
   match expr.kind
   when ExprKind::ExprPath(path) then
     let name = path_to_name(&path)
@@ -2665,7 +3012,7 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
         match hygiene_ident_lookup(frames, &name)
         when Option::Some(true) then
           var new_segs = Vec::new()
-          new_segs.push(hygiene_mangled(ctx, name.clone()))
+          new_segs.push(hygiene_mangled(ctx_stack, name.clone()))
           Expr { kind: ExprKind::ExprPath(AstPath { segments: new_segs, span: path.span }), span: expr.span, node_id: 0 }
         when _ then expr.clone()
         end
@@ -2678,97 +3025,98 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
     when Option::Some(replacement) then replacement.clone()
     when Option::None then
       # P1 (macro hygiene): references to a re-stamped macro-internal let
-      # binding are re-stamped identically; references to a shadow (closure
-      # param / match pattern) or to a free name stay untouched.
+      # binding are re-stamped identically (same composed context stack);
+      # references to a shadow (closure param / match pattern) or to a free
+      # name stay untouched.
       match hygiene_ident_lookup(frames, &name)
       when Option::Some(true) then
-        Expr { kind: ExprKind::ExprIdent(hygiene_mangled(ctx, name.clone())), span: expr.span, node_id: 0 }
+        Expr { kind: ExprKind::ExprIdent(hygiene_mangled(ctx_stack, name.clone())), span: expr.span, node_id: 0 }
       when _ then expr.clone()
       end
     end
   when ExprKind::ExprCall(callee, args) then
-    let new_callee = substitute_expr(subst, ctx, frames, &callee)
+    let new_callee = substitute_expr(subst, ctx_stack, frames, &callee)
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
-      new_args.push(substitute_expr(subst, ctx, frames, &args[i]))
+      new_args.push(substitute_expr(subst, ctx_stack, frames, &args[i]))
       i = i + 1
     end
     Expr { kind: ExprKind::ExprCall(Box::new(new_callee), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, ctx, frames, &lhs)), Box::new(substitute_expr(subst, ctx, frames, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, &lhs)), Box::new(substitute_expr(subst, ctx_stack, frames, &rhs))), span: expr.span, node_id: 0 }
   when ExprKind::ExprUnaryOp(op, operand) then
-    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, ctx, frames, &operand))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, &operand))), span: expr.span, node_id: 0 }
   when ExprKind::ExprBlock(block) then
-    Expr { kind: ExprKind::ExprBlock(substitute_block(subst, ctx, frames, &block)), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprBlock(substitute_block(subst, ctx_stack, frames, &block)), span: expr.span, node_id: 0 }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let new_recv = substitute_expr(subst, ctx, frames, &receiver)
+    let new_recv = substitute_expr(subst, ctx_stack, frames, &receiver)
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
-      new_args.push(substitute_expr(subst, ctx, frames, &args[i]))
+      new_args.push(substitute_expr(subst, ctx_stack, frames, &args[i]))
       i = i + 1
     end
     Expr { kind: ExprKind::ExprMethodCall(Box::new(new_recv), method.clone(), targs.clone(), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprEnumVariant(path, args) then
     var new_args = Vec::new()
     for arg in args do
-      new_args.push(substitute_expr(subst, ctx, frames, &arg))
+      new_args.push(substitute_expr(subst, ctx_stack, frames, &arg))
     end
     Expr { kind: ExprKind::ExprEnumVariant(path.clone(), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprFieldAccess(obj, field) then
-    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, ctx, frames, &obj)), field.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, ctx_stack, frames, &obj)), field.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprIndex(obj, idx) then
-    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, ctx, frames, &obj)), Box::new(substitute_expr(subst, ctx, frames, &idx))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, ctx_stack, frames, &obj)), Box::new(substitute_expr(subst, ctx_stack, frames, &idx))), span: expr.span, node_id: 0 }
   when ExprKind::ExprArrayLit(elems) then
     var new_elems = Vec::new()
-    for e in elems do new_elems.push(substitute_expr(subst, ctx, frames, &e)) end
+    for e in elems do new_elems.push(substitute_expr(subst, ctx_stack, frames, &e)) end
     Expr { kind: ExprKind::ExprArrayLit(new_elems), span: expr.span, node_id: 0 }
   when ExprKind::ExprTupleLit(elems) then
     var new_elems = Vec::new()
-    for e in elems do new_elems.push(substitute_expr(subst, ctx, frames, &e)) end
+    for e in elems do new_elems.push(substitute_expr(subst, ctx_stack, frames, &e)) end
     Expr { kind: ExprKind::ExprTupleLit(new_elems), span: expr.span, node_id: 0 }
   when ExprKind::ExprStructLit(path, fields) then
     var new_fields = Vec::new()
     for (field_name, field_value) in fields do
-      new_fields.push((field_name.clone(), substitute_expr(subst, ctx, frames, &field_value)))
+      new_fields.push((field_name.clone(), substitute_expr(subst, ctx_stack, frames, &field_value)))
     end
     Expr { kind: ExprKind::ExprStructLit(path.clone(), new_fields), span: expr.span, node_id: 0 }
   when ExprKind::ExprMapLit(entries) then
     var new_entries = Vec::new()
     for (key_expr, value_expr) in entries do
-      new_entries.push((substitute_expr(subst, ctx, frames, &key_expr), substitute_expr(subst, ctx, frames, &value_expr)))
+      new_entries.push((substitute_expr(subst, ctx_stack, frames, &key_expr), substitute_expr(subst, ctx_stack, frames, &value_expr)))
     end
     Expr { kind: ExprKind::ExprMapLit(new_entries), span: expr.span, node_id: 0 }
   when ExprKind::ExprAccess(inner) then
-    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRawDeref(inner) then
-    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprAwait(inner) then
-    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprTry(inner) then
-    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, ctx, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
-    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, ctx, frames, &start)))
+    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, &start)))
     when Option::None then Option::None
     end
     let new_end = match end_expr
-    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, ctx, frames, &end_expr_inner)))
+    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, &end_expr_inner)))
     when Option::None then Option::None
     end
     Expr { kind: ExprKind::ExprRange(new_start, new_end, inclusive), span: expr.span, node_id: 0 }
   when ExprKind::ExprCast(inner, ty) then
-    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, ctx, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, ctx_stack, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, ctx, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, ctx_stack, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprAssign(target, value) then
-    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, ctx, frames, &target)), Box::new(substitute_expr(subst, ctx, frames, &value))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, ctx_stack, frames, &target)), Box::new(substitute_expr(subst, ctx_stack, frames, &value))), span: expr.span, node_id: 0 }
   when ExprKind::ExprPipe(lhs, rhs) then
-    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, ctx, frames, &lhs)), Box::new(substitute_expr(subst, ctx, frames, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, ctx_stack, frames, &lhs)), Box::new(substitute_expr(subst, ctx_stack, frames, &rhs))), span: expr.span, node_id: 0 }
   when ExprKind::ExprIf(if_expr) then
-    let new_cond = substitute_expr(subst, ctx, frames, &if_expr.cond)
-    let new_then = substitute_block(subst, ctx, frames, &if_expr.then_block)
+    let new_cond = substitute_expr(subst, ctx_stack, frames, &if_expr.cond)
+    let new_then = substitute_block(subst, ctx_stack, frames, &if_expr.then_block)
     let new_if = IfStmt {
       cond: new_cond,
       then_block: new_then,
@@ -2778,7 +3126,7 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
     }
     Expr { kind: ExprKind::ExprIf(new_if), span: expr.span, node_id: 0 }
   when ExprKind::ExprUnsafe(reason, block) then
-    Expr { kind: ExprKind::ExprUnsafe(reason.clone(), substitute_block(subst, ctx, frames, &block)), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprUnsafe(reason.clone(), substitute_block(subst, ctx_stack, frames, &block)), span: expr.span, node_id: 0 }
   when ExprKind::ExprMatch(match_expr) then
     var new_arms = Vec::new()
     for arm in match_expr.arms do
@@ -2788,18 +3136,18 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
       hygiene_collect_pattern_names(&arm.pattern, &mut arm_names)
       let arm_frames = hygiene_push_shadow_frame(frames, &arm_names)
       let new_guard = match arm.guard_expr
-      when Option::Some(guard_expr) then Option::Some(substitute_expr(subst, ctx, &arm_frames, &guard_expr))
+      when Option::Some(guard_expr) then Option::Some(substitute_expr(subst, ctx_stack, &arm_frames, &guard_expr))
       when Option::None then Option::None
       end
       new_arms.push(MatchArm {
         pattern: arm.pattern.clone(),
         guard_expr: new_guard,
-        body: substitute_block(subst, ctx, &arm_frames, &arm.body),
+        body: substitute_block(subst, ctx_stack, &arm_frames, &arm.body),
         span: arm.span
       })
     end
     Expr { node_id: 0, kind: ExprKind::ExprMatch(MatchExpr {
-      scrutinee: substitute_expr(subst, ctx, frames, &match_expr.scrutinee),
+      scrutinee: substitute_expr(subst, ctx_stack, frames, &match_expr.scrutinee),
       arms: new_arms,
       span: match_expr.span
     }), span: expr.span }
@@ -2813,7 +3161,7 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx: Int, frames: &Vec[Map[St
       pi = pi + 1
     end
     let closure_frames = hygiene_push_shadow_frame(frames, &param_names)
-    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, ctx, &closure_frames, &body))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, ctx_stack, &closure_frames, &body))), span: expr.span, node_id: 0 }
   when _ then expr.clone()
   end
 end
@@ -2958,7 +3306,15 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
       return 1
     end
   else
-    prepare_parsed(&mut ast)
+    # P1 (macro hygiene, expansion-depth contract): the skip-semantic-checks
+    # path still routes expansion failures (E105) through the parser's
+    # diagnostic channel and fails loudly instead of lowering a partial AST.
+    var skip_diags: Vec[Diagnostic] = Vec::new()
+    prepare_parsed(&mut ast, &mut skip_diags)
+    if diag_has_errors(&skip_diags) then
+      println(join_parse_diagnostics(&skip_diags))
+      return 1
+    end
   end
 
   if !skip_bootstrap_semantic_checks && has_errors(&emitter) then
