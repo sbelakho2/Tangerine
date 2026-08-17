@@ -2425,17 +2425,11 @@ end
 # ever touched here (StringPtr is a raw pointer with NO inline header — its
 # {ptr,len,cap} shape is only the internal char-Vec buffer of str.chars()).
 #
-# DISCREPANCY DOCUMENTED, NOT CHANGED (runtime-consistent values preserved):
-#   - repr_header_size says HeapMapHeader 48 ({buckets:0,len:8,cap:16,
-#     hash_fn:24}) and HeapSetHeader 32 ({map:0,len:8}).
-#   - The RUNTIME map/set header (runtime.tg, "Map layout") is a 24-byte
-#     {buckets:0, size:8, cap:16} for BOTH Map and Set (Set is map-backed).
-# Codegen never allocates or sizes map/set headers — it only reads the len
-# (and Vec cap) fields, whose offsets 8/16 AGREE between the frozen table
-# and the runtime — so the byte-identical behavior is preserved and the
-# disagreement is confined to the table. The `when _` fallback maps to the
-# Vec row so every legacy caller (which always read 8/16) keeps its exact
-# offset.
+# The table matches the runtime exactly: Vec {ptr:0,len:8,cap:16} (24), Map
+# and Set (map-backed) share the runtime's actual 24-byte map header
+# {buckets:0,len/size:8,cap:16} (runtime.tg "Map layout"). Codegen reads the
+# len (and Vec cap) fields at 8/16, agreeing with both the table and the
+# runtime.
 def heap_header_field_offset(repr: Repr, field_name: &String) -> Int
   let container_name = match repr
   when Repr::HeapVecHeader then "Vec"
@@ -2447,17 +2441,25 @@ def heap_header_field_offset(repr: Repr, field_name: &String) -> Int
   container_field_offset(&container_name, field_name)
 end
 
+# P0-P fixed arrays: Array[T, N] with N > 0 is the layout engine's Repr::Inline
+# — N elements stored inline at element-stride offsets, no heap header. The
+# heap-handle semantics (ProjIndex derefs the {ptr,len,cap} handle, MirLen
+# reads the header) apply ONLY to the variable-length form Array[T, 0]
+# (the Vec alias). The Named Adt form of Array carries no count (the
+# size-less convention) and keeps the heap-handle identity.
 def is_heap_collection_type(ctx: &mut CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
-  when Type::Array(_, _) then
-    # Runtime-consistent override, preserved from the pre-Repr classifier:
-    # codegen and the runtime treat EVERY array value as a heap {ptr,len,cap}
-    # handle (array literals are built via _tg_array_new + pushes, and
-    # ProjIndex derefs the handle). The engine's table assigns fixed arrays
-    # Array[T, N>0] Repr::Inline — see the fixed-array note in layout_engine
-    # type_repr — but codegen's all-arrays-are-heap-handles behavior is kept
-    # (documented conflict, behavior unchanged).
-    true
+  when Type::Array(_, count) then
+    if count > 0 then
+      # Fixed inline array (P0-P): the value IS the N-element inline storage
+      # (the layout engine's Repr::Inline); indexing addresses the inline
+      # base directly, len is the compile-time constant. Not a heap handle.
+      false
+    else
+      # Array[T, 0] is the variable-length heap vector handle (the Vec
+      # alias): the value is a pointer to the {ptr,len,cap} header.
+      true
+    end
   when Type::Named(tid, _) then
     # P0-J2: Named Adt form of Array/Slice mirrors the canonical Array arm
     # (every array/slice value is a heap {ptr,len,cap} handle); anything
@@ -3451,14 +3453,33 @@ def codegen_rvalue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, stmt: &MirStat
       # The len field lives in the heap header — a valid header read only for
       # HeapVecHeader/HeapMapHeader/HeapSetHeader representations (offset from
       # the engine's container_field_offset). Behavior unchanged.
-      if is_heap_collection_type(ctx, &len_value_ty) then
-        let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
-        emit_test_rr(ctx, dst, dst)
-        emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
-        emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
-        def_label(&mut ctx.text, lbl_len_done)
-      else
-        emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+      match len_value_ty
+      when Type::Array(_, n) then
+        if n > 0 then
+          # P0-P fixed array (Inline repr): the length is the compile-time
+          # constant N — no heap header exists to read.
+          emit_mov_ri(ctx, dst, n as i64)
+        else
+          if is_heap_collection_type(ctx, &len_value_ty) then
+            let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
+            emit_test_rr(ctx, dst, dst)
+            emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
+            emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+            def_label(&mut ctx.text, lbl_len_done)
+          else
+            emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+          end
+        end
+      when _ then
+        if is_heap_collection_type(ctx, &len_value_ty) then
+          let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
+          emit_test_rr(ctx, dst, dst)
+          emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
+          emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+          def_label(&mut ctx.text, lbl_len_done)
+        else
+          emit_load_mem(ctx, dst, dst, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+        end
       end
 
     when MirRvalueKind::MirCast(cast_kind, operand, target_ty) then
@@ -4516,7 +4537,40 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
       emit_ref_place(ctx, fctx, ref_place, rr)
 
     when MirRvalueKind::MirAggregate(ref kind, ref operands) then
-      codegen_aggregate(ctx, fctx, kind, operands, rr)
+      # P0-P fixed arrays (Array[T, N] with N > 0, the layout engine's
+      # Repr::Inline): the literal's storage is the destination slot itself —
+      # N elements at element-stride offsets — with NO _tg_array_new heap
+      # allocation and NO _tg_array_push. Variable-length Array[T, 0] keeps
+      # the heap-handle literal path (codegen_aggregate).
+      let agg_dst_ty = place_type(ctx, fctx, place)
+      let agg_is_fixed = match strip_ref_like_type(&agg_dst_ty)
+      when Type::Array(_, n) then n > 0
+      when _ then false
+      end
+      if agg_is_fixed then
+        let agg_elem_ty = match strip_ref_like_type(&agg_dst_ty)
+        when Type::Array(e, _) then e
+        when _ then Type::Int
+        end
+        let agg_elem_size = storage_size_bytes(ctx, &agg_elem_ty)
+        let agg_elem_width = storage_width_of(ctx, &agg_elem_ty)
+        let scratch = scratch2_reg(ctx.target.arch)
+        let sp = sp_reg(ctx.target.arch)
+        emit_place_address(ctx, fctx, place, rr)
+        emit_push(ctx, rr)
+        var aai = 0
+        while aai < operands.len() do
+          load_operand_aggregate_item(ctx, fctx, &operands[aai], scratch)
+          emit_load_mem(ctx, rr, sp, 0)
+          emit_store_mem_sized(ctx, rr, (aai * agg_elem_size) as i32, scratch, agg_elem_width)
+          aai = aai + 1
+        end
+        emit_load_mem(ctx, rr, sp, 0)
+        emit_pop(ctx, scratch)
+        should_store = false
+      else
+        codegen_aggregate(ctx, fctx, kind, operands, rr)
+      end
 
     when MirRvalueKind::MirDiscriminant(ref discr_place) then
       load_place(ctx, fctx, discr_place, rr)
@@ -4530,16 +4584,37 @@ def codegen_statement(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, block: &Mir
       # The len field lives in the heap header — a valid header read only for
       # HeapVecHeader/HeapMapHeader/HeapSetHeader representations (offset from
       # the engine's container_field_offset). Behavior unchanged.
-      if is_heap_collection_type(ctx, &len_value_ty) then
-        # Null collection pointers represent empty values in native bootstrap
-        # paths; avoid dereferencing [0 + 8] and keep zero length.
-        let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
-        emit_test_rr(ctx, rr, rr)
-        emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
-        emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
-        def_label(&mut ctx.text, lbl_len_done)
-      else
-        emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+      match len_value_ty
+      when Type::Array(_, n) then
+        if n > 0 then
+          # P0-P fixed array (Inline repr): the length is the compile-time
+          # constant N — no heap header exists to read.
+          emit_mov_ri(ctx, rr, n as i64)
+        else
+          if is_heap_collection_type(ctx, &len_value_ty) then
+            # Null collection pointers represent empty values in native bootstrap
+            # paths; avoid dereferencing [0 + 8] and keep zero length.
+            let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
+            emit_test_rr(ctx, rr, rr)
+            emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
+            emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+            def_label(&mut ctx.text, lbl_len_done)
+          else
+            emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+          end
+        end
+      when _ then
+        if is_heap_collection_type(ctx, &len_value_ty) then
+          # Null collection pointers represent empty values in native bootstrap
+          # paths; avoid dereferencing [0 + 8] and keep zero length.
+          let lbl_len_done = next_codegen_label(ctx, ".Lmir_len_done.")
+          emit_test_rr(ctx, rr, rr)
+          emit_jcc(ctx, CondKind::Eq, lbl_len_done.clone())
+          emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+          def_label(&mut ctx.text, lbl_len_done)
+        else
+          emit_load_mem(ctx, rr, rr, heap_header_field_offset(codegen_type_repr(ctx, &len_value_ty), &"len".to_string()))
+        end
       end
 
     when MirRvalueKind::MirCast(cast_kind, ref operand, ref target_ty) then
@@ -5278,7 +5353,70 @@ def codegen_emit_drop_glue(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, plan: 
     end
     def_label(&mut ctx.text, lbl_enum_end)
   when DeinitPlan::Array(elem_plan) then
-    if deinit_plan_is_trivial(elem_plan) then
+    # P0-P fixed arrays (Array[T, N] with N > 0, the layout engine's
+    # Repr::Inline): the storage is the place's own inline slot — there is NO
+    # heap {ptr,len,cap} buffer. _tg_array_destroy is a NO-OP for them;
+    # non-trivial elements are deinitialized in place (0 .. N-1).
+    let arr_glue_place_ty = place_type(ctx, fctx, place)
+    let arr_glue_ty = strip_ref_like_type(&arr_glue_place_ty)
+    let arr_glue_fixed_n = match arr_glue_ty
+    when Type::Array(_, n) then n
+    when _ then 0
+    end
+    if arr_glue_fixed_n > 0 then
+      if !deinit_plan_is_trivial(elem_plan) then
+        # Walk the N inline elements at element-stride offsets, running each
+        # element's glue; the loop state lives in frame slots because the
+        # recursive glue may emit calls (finalizers, runtime drains) that
+        # clobber every caller-saved register.
+        match ctx.target.arch
+        when Arch::X86_64 then
+          panic("fixed-array element destroy is not supported on x86-64 (element glue has no x86 parity yet)")
+        when _ then ()
+        end
+        let afp = fp_reg(ctx.target.arch)
+        let a10 = PhysReg::A64Reg(A64::X10)
+        let a11 = PhysReg::A64Reg(A64::X11)
+        let a12 = PhysReg::A64Reg(A64::X12)
+        let farr_elem_ty = project_index_type(ctx, &arr_glue_ty)
+        let farr_stride = storage_size_bytes(ctx, &farr_elem_ty)
+        let farr_elem_off = fctx.frame.spill_offset - 8
+        fctx.frame.spill_offset = farr_elem_off
+        let farr_idx_off = fctx.frame.spill_offset - 8
+        fctx.frame.spill_offset = farr_idx_off
+        let farr_base_off = fctx.frame.spill_offset - 8
+        fctx.frame.spill_offset = farr_base_off
+        emit_place_address(ctx, fctx, place, a10)
+        emit_store_mem(ctx, afp, farr_base_off, a10)
+        emit_mov_ri(ctx, a11, 0)
+        emit_store_mem(ctx, afp, farr_idx_off, a11)
+        let farr_elem_place = codegen_glue_place_at_slot(ctx, fctx, farr_elem_off)
+        let lbl_farr_loop = next_codegen_label(ctx, ".Lglue_farr_loop.")
+        let lbl_farr_done = next_codegen_label(ctx, ".Lglue_farr_done.")
+        def_label(&mut ctx.text, lbl_farr_loop.clone())
+        emit_load_mem(ctx, a11, afp, farr_idx_off)
+        emit_cmp_ri(ctx, a11, arr_glue_fixed_n as i32)
+        emit_jcc(ctx, CondKind::Ge, lbl_farr_done.clone())
+        # Element address = base + idx * stride (scale like ProjIndex).
+        emit_load_mem(ctx, a12, afp, farr_base_off)
+        match farr_stride
+        when 1 then ()
+        when 2 then a64_lsl(&mut ctx.text, a11, a11, 1)
+        when 4 then a64_lsl(&mut ctx.text, a11, a11, 2)
+        when _ then a64_lsl(&mut ctx.text, a11, a11, 3)
+        end
+        emit_add_rrr(ctx, a11, a12, a11)
+        emit_store_mem(ctx, afp, farr_elem_off, a11)
+        codegen_emit_drop_glue(ctx, fctx, elem_plan, &farr_elem_place)
+        emit_load_mem(ctx, a11, afp, farr_idx_off)
+        emit_add_ri(ctx, a11, 1)
+        emit_store_mem(ctx, afp, farr_idx_off, a11)
+        emit_jmp(ctx, lbl_farr_loop.clone())
+        def_label(&mut ctx.text, lbl_farr_done)
+      end
+      # Trivial elements: nothing to deinit AND no buffer to release — the
+      # fixed-array destroy is a NO-OP (no _tg_array_destroy call).
+    elsif deinit_plan_is_trivial(elem_plan) then
       # The elements need no destruction: release the backing buffer.
       match ctx.target.arch
       when Arch::AArch64 then
@@ -6065,8 +6203,16 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       orig_fn_name == "String__len" ||
       orig_fn_name == "__intrinsic_string_len" ||
       orig_fn_name == "string_len"
+    # P0-P: a fixed array (Array[T, N] with N > 0, Inline repr) is a
+    # collection receiver even though it is NOT a heap collection — its len
+    # is the compile-time constant N (see codegen_array_len).
+    let is_fixed_array = match value_ty
+    when Type::Array(_, n) then n > 0
+    when _ then false
+    end
     let is_collection_receiver =
       is_heap_collection_type(ctx, &value_ty) ||
+      is_fixed_array ||
       orig_fn_name == "Vec__len" ||
       orig_fn_name == "Array__len" ||
       orig_fn_name == "Map__len" ||
@@ -6075,7 +6221,8 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       orig_fn_name == "array_len"
     if is_collection_receiver then
       # Vec/Map/Set/Slice — len is stored in the heap header (offset from the
-      # engine's container_field_offset, see codegen_array_len)
+      # engine's container_field_offset, see codegen_array_len); a fixed
+      # array's len is the constant N.
       deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
       codegen_array_len(ctx, &value_ty)
     elsif is_pure_string then
@@ -6149,12 +6296,23 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     codegen_array_clear(ctx, &recv_ty)
   when IntrinsicId::ArrayDestroy then
-    match ctx.target.arch
-    when Arch::X86_64 then panic("array_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
-    when _ then ()
+    # P0-P fixed arrays (Array[T, N] with N > 0, the layout engine's Inline
+    # repr) own no heap buffer: the release is a no-op. Variable-length
+    # Array[T, 0] keeps the heap-handle release path.
+    let destroy_recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    let destroy_val_ty = strip_ref_like_type(&destroy_recv_ty)
+    let destroy_is_fixed = match destroy_val_ty
+    when Type::Array(_, n) then n > 0
+    when _ then false
     end
-    emit_load_mem(ctx, rr, rr, 0)
-    codegen_array_destroy(ctx)
+    if !destroy_is_fixed then
+      match ctx.target.arch
+      when Arch::X86_64 then panic("array_destroy is not supported on x86-64 (container storage release has no x86 parity yet)")
+      when _ then ()
+      end
+      emit_load_mem(ctx, rr, rr, 0)
+      codegen_array_destroy(ctx)
+    end
   when IntrinsicId::ArrayContains then
     emit_load_mem(ctx, rr, rr, 0)
     deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
@@ -9622,7 +9780,17 @@ end
 # array_len: Get length of vec. Args: vec_ptr. Returns length.
 # The receiver is a heap-header handle by dispatch (Vec/Array/Slice ->
 # HeapVecHeader); the len offset comes from the engine's container_field_offset.
+# P0-P fixed arrays (Array[T, N] with N > 0, the layout engine's Inline
+# repr) have no heap header: the length is the compile-time constant N.
 def codegen_array_len(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  match strip_ref_like_type(recv_ty)
+  when Type::Array(_, n) then
+    if n > 0 then
+      emit_mov_ri(ctx, ret_reg(ctx.target.arch), n as i64)
+      return
+    end
+  when _ then ()
+  end
   # Load len from the header. Null collection pointers represent empty values.
   let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
   match ctx.target.arch

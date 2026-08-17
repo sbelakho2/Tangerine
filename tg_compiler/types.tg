@@ -689,16 +689,29 @@ struct TypeEnv
   # them by method name after the direct lookup misses, unifying the impl's
   # head parameter with the concrete receiver.
   param_for_type_impls: Vec[Int]
+  # P0-AP: per generic-parameter trait bounds — param name -> the bound
+  # trait's name and resolved type arguments. Registered when a generic
+  # function's/impl's parameters enter scope (inline generic-parameter
+  # bounds plus the enclosing where-clause); consulted by resolve_method_type
+  # for bare Type::Param receivers inside generic bodies (`self.inner.advance()`
+  # on inner: I with `I: Iterator[T]` resolves through this bound). A param
+  # name shadowed by an inner generic re-registers (replaces) the entry; an
+  # unconstrained shadow erases the outer entry. Entries persist for the
+  # whole check — they are only consulted for Param receivers, which exist
+  # only inside the generic body whose registration is current.
+  param_bounds: Map[String, Vec[ParamTraitBound]]
   # P0-AL: call expr node id -> (the callee's generic-parameter names in
-  # the MIR signature-walk order, the corresponding inference variables).
-  # A generic call whose substitution is not fully solved AT the call site
-  # (e.g. a return-type-only parameter solved only by the caller's
-  # annotation, which unifies AFTER the call is checked) is parked here and
-  # re-resolved after the whole program is checked, when the caller-context
-  # unifications have landed (resolve_pending_call_instances in
-  # type_check_typed). Calls a context never solves stay unrecorded and the
-  # monomorphizer's call-site inference is the documented fallback.
-  pending_call_instances: Map[Int, (Vec[String], Vec[Type])]
+  # the MIR signature-walk order, the corresponding inference variables,
+  # the call's span for diagnostics). A generic call whose substitution is
+  # not fully solved AT the call site (e.g. a return-type-only parameter
+  # solved only by the caller's annotation, which unifies AFTER the call is
+  # checked) is parked here and re-resolved after the whole program is
+  # checked, when the caller-context unifications have landed
+  # (resolve_pending_call_instances in type_check_typed).
+  # ZERO-INFERENCE: a call a context never solves is a hard error at the
+  # end of checking ("cannot infer type parameter `T`: add an annotation")
+  # — the monomorphizer performs no call-site inference (fail-closed).
+  pending_call_instances: Map[Int, (Vec[String], Vec[Type], Span)]
   
   # P0-BG: DOCUMENTATION MIRROR of the std's concurrency exclusions
   # ("Rc" for Transferable; "Rc"/"Cell"/"RefCell"/"UnsafeCell" for
@@ -724,11 +737,11 @@ struct TypeEnv
   # callee's parameter order). Populated at the generic-call sites ONLY
   # when the callee is generic and EVERY generic parameter is solved; an
   # unsolved parameter (e.g. a return-type-only parameter the caller
-  # context never constrained) leaves the call unrecorded. The solved
-  # substitutions from the type checker are the AUTHORITY; the
-  # monomorphizer's inference (infer_type_args_for_call) is the FALLBACK
-  # for synthesized/unsolved calls. MIR pairs this with typed_call_targets
-  # to fill the call instance's substs.
+  # context never constrained) leaves the call unrecorded and is reported
+  # by resolve_pending_call_instances. The solved substitutions from the
+  # type checker are the AUTHORITY — ZERO-INFERENCE: the monomorphizer
+  # performs no call-site inference (fail-closed). MIR pairs this with
+  # typed_call_targets to fill the call instance's substs.
   typed_call_instances: Map[Int, Vec[Type]]
   typed_field_targets: Map[Int, FieldId]
   typed_local_bindings: Map[Int, LocalBinding]
@@ -761,6 +774,18 @@ end
 struct GenericObligation
   param_index: Int
   trait_name: String   # TODO: trait DefId once traits carry semantic ids
+end
+
+# P0-AP: one trait bound of a generic parameter (an inline generic-parameter
+# bound or a where-clause predicate, e.g. the `Iterator[T]` of
+# `impl[T, U, I: Iterator[T]] Iterator[U] for MapIter[T, U, I]`): the bound
+# trait's name and its RESOLVED type arguments (the T of `I: Iterator[T]`
+# resolves to Type::Param("T") of the enclosing generic scope — the
+# substitution target for trait-impl head unification on a bare Param
+# receiver).
+struct ParamTraitBound
+  trait_name: String
+  args: Vec[Type]
 end
 
 # A concrete obligation to be solved: `self_ty` must implement `trait_name`.
@@ -891,11 +916,11 @@ struct TypedProgram
   # substitution for that call (the callee's generic args in the callee's
   # parameter order). Populated at the generic-call sites ONLY when the
   # callee is generic and EVERY generic parameter is solved; absent for
-  # synthesized/unsolved calls. The solved substitutions from the type
-  # checker are the AUTHORITY; the monomorphizer's inference
-  # (infer_type_args_for_call) is the FALLBACK for synthesized/unsolved
-  # calls. MIR pairs this with call_targets to fill the call instance's
-  # substs.
+  # synthesized/unsolved calls (a call a context never solves is reported
+  # by resolve_pending_call_instances). The solved substitutions from the
+  # type checker are the AUTHORITY — ZERO-INFERENCE: the monomorphizer
+  # performs no call-site inference (fail-closed). MIR pairs this with
+  # call_targets to fill the call instance's substs.
   call_instances: Map[Int, Vec[Type]]
   field_targets: Map[Int, FieldId]
   access_effects: Map[Int, AccessEffect]
@@ -980,6 +1005,7 @@ def type_env_new() -> TypeEnv
     impls: Vec::new(),
     method_lookup: Map::new(),
     param_for_type_impls: Vec::new(),
+    param_bounds: Map::new(),
     pending_call_instances: Map::new(),
     non_send_types: Set::new(),
     non_sync_types: Set::new(),
@@ -1210,6 +1236,12 @@ end
 # returning a reference avoids the per-lookup TypeDef copy (the reviewer's
 # performance finding — copying in a self-hosted compiler). The by-value
 # versions above stay for the remaining callers.
+#
+# FIX 1 (P1, complete): every CONSUMER of the by-value lookups inside this
+# module now goes through the reference-returning forms (get_type_by_id_ref
+# / get_type_by_name_ref) — the two by-value definitions above are retained
+# only as the exported copy-returning API for non-kernel modules
+# (trait_resolve.tg) and must not be used for read-only lookups here.
 def get_type_by_id_ref(env: &TypeEnv, tid: &TypeId) -> Option[&TypeDef]
   match env.type_id_index.get(tid.id)
   when Option::Some(idx) then
@@ -1273,7 +1305,7 @@ def type_has_resource_kind(env: &TypeEnv, ty: &Type) -> Bool
     true
   when Type::Named(tid, args) then
     var found = false
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.kind == TypeKind::Resource || td.kind == TypeKind::Capability then
         found = true
@@ -1836,16 +1868,16 @@ end
 # the bare first-wins entry stays untouched. Same-module redefinition
 # remains the duplicate TypeError.
 def store_type_def(env: &mut TypeEnv, td: TypeDef, span: Span, module_path: &Vec[String]) -> Unit
-  match get_type_def_by_name(env, td.name.clone())
+  match get_type_by_name_ref(env, td.name.clone())
   when Option::Some(existing) then
     # A filled existing definition: allow only legitimate re-registrations.
-    if type_def_is_forward_declaration(&existing) then
+    if type_def_is_forward_declaration(existing) then
       # Fall through to the replace path below (pass-2 fill).
       ()
     elsif type_def_is_empty_stub(&td) then
       # Source-level stub of the same type (intrinsic struct stubs) — no-op.
       return
-    elsif type_defs_identical(env, &existing, &td) then
+    elsif type_defs_identical(env, existing, &td) then
       # Re-registration of the SAME type — a same-module redefinition of an
       # already-filled definition, a std re-declaration of a builtin
       # (Option/Result), or an identical declaration in ANOTHER module
@@ -2177,7 +2209,7 @@ def is_canonical_variant_of(env: &TypeEnv, ty: &Type, name: String) -> Bool
   end
   match ty
   when Type::Named(tid, _) then
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then td.name == name
     when Option::None then false
     end
@@ -2438,7 +2470,14 @@ def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
   # Recurse into compound types for full resolution
   when Type::RefInternal(inner, mutable) then Type::RefInternal(resolve_type_var(env, inner), mutable)
   when Type::Tuple(fields) then
-    Type::Tuple(fields.map(|f| resolve_type_var(env, f)))
+    # P0-AP: `fields.map(...)` on the bare Vec[Type] receiver resolves through
+    # the iterator EXTENSION impl (`impl[T, I: Iterator[T]] I`'s map) to a lazy
+    # MapIter — not a Vec — so the Tuple constructor would wrap the adapter
+    # instead of the resolved field list. Route through the Vec's iter()
+    # (Vec is the Array alias; the checker's builtin Vec arm yields Slice[Type])
+    # so the map operates on the intended receiver and collect() rebuilds the
+    # Vec of resolved fields (the established compiler idiom, e.g. refactor.tg).
+    Type::Tuple(fields.iter().map(|f| resolve_type_var(env, f)).collect())
   when Type::Function(params, ret) then
     var new_params = Vec::new()
     var i = 0
@@ -2449,7 +2488,9 @@ def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
     end
     Type::Function(new_params, resolve_type_var(env, ret))
   when Type::Named(tid, args) then
-    Type::Named(tid, args.map(|a| resolve_type_var(env, a)))
+    # P0-AP: same receiver fix as the Tuple arm — args is a Vec[Type] and the
+    # bare `.map` resolves to the lazy MapIter extension, never a Vec.
+    Type::Named(tid, args.iter().map(|a| resolve_type_var(env, a)).collect())
   when Type::Slice(inner) then Type::Slice(resolve_type_var(env, inner))  # P0-J1: both (reads and reproduces variant; phase-2 conversion point)
   when Type::Array(inner, n) then Type::Array(resolve_type_var(env, inner), n)  # P0-J1: both (reads and reproduces variant; phase-2 conversion point)
   when _ then ty
@@ -2504,7 +2545,7 @@ def type_tag(env: &TypeEnv, t: &Type) -> String
     # P0-J1 (phase 2A): the Named form of a builtin compound type tags as the
     # builtin name (the same tag as its canonical variant); user-defined and
     # non-builtin Named types keep the id-based tag.
-    match get_type_by_id(env, &id)
+    match get_type_by_id_ref(env, &id)
     when Option::Some(td) then
       if td.name == "Option" && args.len() >= 1 then "Option"
       elsif td.name == "Result" && args.len() >= 2 then "Result"
@@ -2573,7 +2614,7 @@ def is_box_type(env: &TypeEnv, ty: &Type) -> Bool
   match ty
   when Type::Box(_) then true  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then true else false end
     when Option::None then false
@@ -2586,7 +2627,7 @@ def box_inner_type(env: &TypeEnv, ty: &Type) -> Type
   match ty
   when Type::Box(e) then e  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else ty.clone() end
     when Option::None then ty.clone()
@@ -2644,7 +2685,7 @@ def is_slice_like(env: &TypeEnv, ty: &Type) -> Bool
   when Type::Named(tid, _) then
     # P0-J1 (phase 2A): the Named form of the slice-like builtins is
     # slice-like too; Vec stays a Named typedef and is matched by name.
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Vec" || td.name == "Slice" || td.name == "Array" then true else false end
     when Option::None then false
@@ -2662,7 +2703,7 @@ def slice_inner(env: &TypeEnv, ty: &Type) -> Type
     # their element; the canonical Option/Result/Map/Set/Box/Rc variants are
     # not slice-like either, so their Named forms keep their identity.
     # Other Named types keep the pre-existing arg-based fallback.
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Slice" || td.name == "Array" || td.name == "Vec" then
         if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
@@ -2863,7 +2904,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         # handler creates Named types for Option, Result, Slice, Map, Set, Array
         # instead of their canonical Type representations.
         when Type::Option(inner2) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Option" && args1.len() >= 1 then
               unify(env, args1[0], inner2, span)
@@ -2876,7 +2917,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Result(ok2, err2) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Result" && args1.len() >= 2 then
               unify(env, args1[0], ok2, span) && unify(env, args1[1], err2, span)
@@ -2889,7 +2930,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Map(k2, v2) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Map" && args1.len() >= 2 then
               unify(env, args1[0], k2, span) && unify(env, args1[1], v2, span)
@@ -2902,7 +2943,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Set(inner2) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Set" && args1.len() >= 1 then
               unify(env, args1[0], inner2, span)
@@ -2915,7 +2956,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Slice(inner2) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Slice" && args1.len() >= 1 then
               unify(env, args1[0], inner2, span)
@@ -2928,7 +2969,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Array(inner2, _) then  # P0-J1: consumer (reads variant; phase-2 conversion point)
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Array" && args1.len() >= 1 then
               unify(env, args1[0], inner2, span)
@@ -2947,7 +2988,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         # Handle Named(tid, args) unified with primitive types (Int, U64, String, etc.)
         # Occurs when resolve_type_expr or other code creates Named types for primitives.
         when Type::Unit then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Unit" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2955,7 +2996,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::Bool then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Bool" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2963,7 +3004,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::Int then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "Int" || td.name == "c_int") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2971,7 +3012,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::UInt then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "UInt" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2979,7 +3020,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::Float then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Float" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2987,7 +3028,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::Char then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Char" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -2995,7 +3036,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::String then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "String" || td.name == "str") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3003,7 +3044,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::Never then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Never" && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3011,7 +3052,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::I8 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I8" || td.name == "Int8" || td.name == "i8") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3019,7 +3060,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::I16 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I16" || td.name == "Int16" || td.name == "i16") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3027,7 +3068,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::I32 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I32" || td.name == "Int32" || td.name == "i32") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3035,7 +3076,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::I64 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I64" || td.name == "Int64" || td.name == "i64" || td.name == "c_long") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3043,7 +3084,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::I128 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I128" || td.name == "Int128" || td.name == "i128") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3051,7 +3092,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::U8 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U8" || td.name == "UInt8" || td.name == "u8" || td.name == "c_char") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3059,7 +3100,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::U16 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U16" || td.name == "UInt16" || td.name == "u16") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3067,7 +3108,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::U32 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U32" || td.name == "UInt32" || td.name == "u32") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3075,7 +3116,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::U64 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U64" || td.name == "UInt64" || td.name == "u64" || td.name == "c_ulong") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3083,7 +3124,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::U128 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U128" || td.name == "UInt128" || td.name == "u128") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3091,7 +3132,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::ISize then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "ISize" || td.name == "isize") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3099,7 +3140,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::USize then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "USize" || td.name == "usize") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3107,7 +3148,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::F32 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "F32" || td.name == "f32" || td.name == "c_float") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3115,7 +3156,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         when Type::F64 then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "F64" || td.name == "f64" || td.name == "c_double") && args1.len() == 0 then true
             else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
@@ -3124,7 +3165,7 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           end
         # Handle Named(tid, args) unified with Function type.
         when Type::Function(params2, ret2) then
-          match get_type_by_id(env, &id1)
+          match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Fn" then
               # Fn types in Named form have args matching the function params + ret.
@@ -3802,7 +3843,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) 
     while i < fields.len() do
       match fields[i].ty
       when Type::Named(tid, _) then
-        match get_type_by_id(env, &tid)
+        match get_type_by_id_ref(env, &tid)
         when Option::Some(field_td) then
           if field_td.kind == TypeKind::Resource || field_td.kind == TypeKind::Capability then
             struct_kind = TypeKind::Resource
@@ -4033,6 +4074,98 @@ def check_item(env: &mut TypeEnv, item: &Item, item_idx: Int) -> Unit
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# Generic-parameter trait bounds (P0-AP)
+# ———————————————————————————————————————————————————————————————
+#
+# A bare Type::Param receiver inside a generic body (`self.inner.advance()`
+# on inner: I with `I: Iterator[T]`) resolves through the parameter's trait
+# bounds. The bounds are registered HERE when the generic function's/impl's
+# parameters enter scope, and consumed by resolve_method_type's
+# Param-receiver section.
+
+# Resolve one trait-argument TypeExpr in the current generic scope: a bare
+# reference to an in-scope generic parameter (e.g. the T of `I: Iterator[T]`)
+# resolves through the scope binding to Type::Param — resolve_type_expr alone
+# would treat it as an unknown Named type.
+def resolve_param_bound_arg(env: &mut TypeEnv, te: &TypeExpr) -> Type
+  match te.kind
+  when TypeExprKind::Named(name, _) then
+    match lookup_var(env, name.clone())
+    when Option::Some(t) then t.clone()
+    when Option::None then resolve_type_expr(env, te)
+    end
+  when _ then resolve_type_expr(env, te)
+  end
+end
+
+# Record one trait bound (name + resolved type arguments) for a generic
+# parameter. Appends to the parameter's existing bounds.
+def record_param_trait_bound(env: &mut TypeEnv, param_name: String, bound_ty: &TypeExpr) -> Unit
+  let trait_name = type_expr_name_of(bound_ty)
+  if trait_name != "" then
+    var args = Vec::new()
+    match bound_ty.kind
+    when TypeExprKind::Named(_, tys) then
+      var i = 0
+      while i < tys.len() do
+        args.push(resolve_param_bound_arg(env, &tys[i]))
+        i = i + 1
+      end
+    when _ then ()
+    end
+    var cur = match env.param_bounds.get(&param_name)
+    when Option::Some(v) then v.clone()
+    when Option::None then Vec::new()
+    end
+    cur.push(ParamTraitBound { trait_name: trait_name, args: args })
+    env.param_bounds.insert(param_name, cur)
+  end
+end
+
+# Register the trait bounds of a generic-parameter list (the inline
+# `T: Trait[Arg]` bounds). A param name shadowed by an inner generic
+# re-registers its bounds; an unconstrained shadow ERASES the outer entry —
+# the outer scope's bound must never apply to the shadowing parameter.
+def record_param_bounds(env: &mut TypeEnv, generic_params: &Vec[GenericParam]) -> Unit
+  var i = 0
+  while i < generic_params.len() do
+    let gp = generic_params[i]
+    env.param_bounds.remove(&gp.name)
+    for b in gp.bounds do
+      record_param_trait_bound(env, gp.name.clone(), &b)
+    end
+    i = i + 1
+  end
+end
+
+# Register the trait bounds of a where-clause (`where T: Trait[Arg]`). Only
+# predicates over a generic parameter are recorded (the predicate subject
+# resolves through the scope to Type::Param); concrete subjects are ignored.
+def record_where_predicate_bounds(env: &mut TypeEnv, where_clause: &Vec[WherePredicate]) -> Unit
+  var i = 0
+  while i < where_clause.len() do
+    let pred = where_clause[i]
+    match pred.ty.kind
+    when TypeExprKind::Named(pname, _) then
+      match lookup_var(env, pname.clone())
+      when Option::Some(t) then
+        match t
+        when Type::Param(_) then
+          env.param_bounds.remove(&pname)
+          for b in pred.bounds do
+            record_param_trait_bound(env, pname.clone(), &b)
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+end
+
 def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String) -> Unit
   push_scope(env)
   env.check_ctx = "fn:" + f.name
@@ -4043,7 +4176,12 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String) -> Un
     bind_var(env, f.generic_params[gp_idx].name.clone(), Type::Param(f.generic_params[gp_idx].name.clone()))
     gp_idx = gp_idx + 1
   end
-  
+
+  # P0-AP: record the generic parameters' trait bounds (inline bounds +
+  # where-clause) so bare Param receivers in the body resolve through them.
+  record_param_bounds(env, &f.generic_params)
+  record_where_predicate_bounds(env, &f.where_clause)
+
   # Bind parameters
   # Parameter bindings are recorded per-owner (keyed by the function's DefId
   # via fn_owner_key — never a span offset, which would collide across merged
@@ -4104,6 +4242,13 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     bind_var(env, i.generic_params[gp_idx].name.clone(), Type::Param(i.generic_params[gp_idx].name.clone()))
     gp_idx = gp_idx + 1
   end
+
+  # P0-AP: record the impl's generic-parameter trait bounds (inline bounds +
+  # where-clause) so bare Param receivers in the method bodies resolve
+  # through them (`self.inner.advance()` with inner: I in
+  # `impl[T, U, I: Iterator[T]] Iterator[U] for MapIter[T, U, I]`).
+  record_param_bounds(env, &i.generic_params)
+  record_where_predicate_bounds(env, &i.where_clause)
 
   let self_type = resolve_type_expr(env, &i.for_type)
 
@@ -4451,7 +4596,7 @@ def check_stmt(env: &mut TypeEnv, stmt: &Stmt) -> FlowResult
       # Vec is a Named typedef (Vec[T]); its element is the first type arg.
       # Map is a Named typedef (Map[K, V]); iterating it yields (K, V) pairs.
       # P0-J1 (phase 2A): Named Slice/Array are slice-like too.
-      match get_type_by_id(env, tid)
+      match get_type_by_id_ref(env, tid)
       when Option::Some(td) then
         if td.name == "Vec" && args.len() >= 1 then args[0].clone()
         elsif td.name == "Map" && args.len() >= 2 then Type::Tuple([args[0].clone(), args[1].clone()])
@@ -4835,7 +4980,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> FlowResult
   if !has_wildcard then
     match scrutinee_type
     when Type::Named(tid, _) then
-      match get_type_by_id(env, &tid)
+      match get_type_by_id_ref(env, &tid)
       when Option::Some(td) then
         match td.def_kind
         when TypeDefKind::Enum(variants) then
@@ -4977,7 +5122,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else expected.clone() end
     when Option::None then expected.clone()
@@ -5001,7 +5146,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
       when Type::RefInternal(_, _) then true
       when Type::Box(_) then true  # P0-J1: consumer (reads variant; phase-2 conversion point)
       when Type::Named(tid, args) then
-        match get_type_by_id(env, tid)
+        match get_type_by_id_ref(env, tid)
         when Option::Some(td) then
           if td.name == "Box" && args.len() >= 1 then true else false end
         when Option::None then false
@@ -5070,7 +5215,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
     let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
     # Try to find the enum definition
-    match get_type_def_by_name(env, enum_name)
+    match get_type_by_name_ref(env, enum_name)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Enum(variants) then
@@ -5089,7 +5234,7 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
               type_add_error(env, "variant " + variant_name + " expects " + v.fields.len().to_string() + " fields, got " + pats.len().to_string(), pat.span)
             end
             # Unify expected with the enum type
-            let enum_type_args = fresh_type_args_for(env, &td)
+            let enum_type_args = fresh_type_args_for(env, td)
             unify(env, expected, Type::Named(td.id, enum_type_args), pat.span)
             # Check each sub-pattern against the variant's field types
             var fi = 0
@@ -5154,9 +5299,9 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
   when PatternKind::Struct(path, field_pats) then
     # Struct destructuring pattern: Foo { x, y: p }
     let struct_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
-    match get_type_def_by_name(env, struct_name)
+    match get_type_by_name_ref(env, struct_name)
     when Option::Some(td) then
-      let struct_type_args = fresh_type_args_for(env, &td)
+      let struct_type_args = fresh_type_args_for(env, td)
       unify(env, expected, Type::Named(td.id, struct_type_args), pat.span)
       match td.def_kind
       when TypeDefKind::Struct(fields) then
@@ -5186,9 +5331,9 @@ def check_pattern(env: &mut TypeEnv, pat: &Pattern, expected: Type, source_place
     when Option::None then
       # Struct-style enum variant pattern: Enum::Variant { field: pat }.
       let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
-      match get_type_def_by_name(env, enum_name)
+      match get_type_by_name_ref(env, enum_name)
       when Option::Some(enum_td) then
-        let enum_type_args = fresh_type_args_for(env, &enum_td)
+        let enum_type_args = fresh_type_args_for(env, enum_td)
         unify(env, expected, Type::Named(enum_td.id, enum_type_args), pat.span)
         var found_variant = false
         match enum_td.def_kind
@@ -5272,7 +5417,7 @@ def resolved_receiver_base(env: &TypeEnv, recv_type: &Type) -> Type
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else recv_type end
     when Option::None then recv_type
@@ -5281,7 +5426,7 @@ def resolved_receiver_base(env: &TypeEnv, recv_type: &Type) -> Type
   end
   match base
   when Type::Named(tid, _) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Alias(inner) then inner.clone()
@@ -5299,7 +5444,7 @@ def resolver_method_key(env: &TypeEnv, recv_type: &Type, method: String) -> Stri
   var generic = false
   match base
   when Type::Named(tid, _) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       name = td.name.clone()
       generic = td.generic_params.len() > 0
@@ -5672,7 +5817,7 @@ def type_identity_key_resolved(env: &TypeEnv, ty: &Type) -> String
       s = s + "[" + type_identity_key_resolved(env, &args[i]) + "]"
       i = i + 1
     end
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Option" && args.len() >= 1 then
         "Option[" + type_identity_key_resolved(env, &args[0]) + "]"
@@ -6176,7 +6321,7 @@ def container_element_type(env: &TypeEnv, ty: &Type) -> Option[Type]
   when Type::Named(tid, args) then
     # P0-J1 (phase 2A): Named Slice is element-bearing too (mirrors the
     # canonical Type::Slice arm).
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Map" && args.len() >= 2 then Option::Some(args[1].clone())
       elsif (td.name == "Array" || td.name == "Vec" || td.name == "Slice") && args.len() >= 1 then Option::Some(args[0].clone())
@@ -6250,7 +6395,7 @@ def field_target_of(env: &TypeEnv, recv_type: &Type, field: String) -> Option[Fi
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else recv_type end
     when Option::None then recv_type
@@ -6259,7 +6404,7 @@ def field_target_of(env: &TypeEnv, recv_type: &Type, field: String) -> Option[Fi
   end
   match base
   when Type::Named(tid, _) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Struct(fields) then
@@ -6289,7 +6434,7 @@ def field_type_by_id(env: &mut TypeEnv, recv_type: &Type, owner: TypeId, index: 
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else recv_type end
     when Option::None then recv_type
@@ -6298,7 +6443,7 @@ def field_type_by_id(env: &mut TypeEnv, recv_type: &Type, owner: TypeId, index: 
   end
   match base
   when Type::Named(tid, _) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Alias(inner) then
@@ -6315,7 +6460,7 @@ def field_type_by_id(env: &mut TypeEnv, recv_type: &Type, owner: TypeId, index: 
   end
   match base
   when Type::Named(_, type_args) then
-    match get_type_by_id(env, &owner)
+    match get_type_by_id_ref(env, &owner)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Struct(fields) then
@@ -6812,13 +6957,13 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
       # u8 in u8::MAX, etc.) — when a type name appears in expression position
       # as the receiver of a method call or path, treat it as a type reference.
-      match get_type_def_by_name(env, name)
+      match get_type_by_name_ref(env, name)
       when Option::Some(type_def) then
         # Use canonical Type representation for primitives and compound types
         # (Int, String, Option, Slice, etc.) so unification with literal types
         # (e.g., Type::Int from ExprIntLit) works correctly instead of producing
         # "Named#XXX vs Int" errors.
-        type_def_to_canonical(env, &type_def)
+        type_def_to_canonical(env, type_def)
       when Option::None then
         # Check if the name refers to an enum variant (e.g., Some, None, Ok, Err)
         # in expression position — treat bare variant names as constructor functions.
@@ -6961,10 +7106,10 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # unified with the let-binding annotation AFTER the call) is parked
       # in pending_call_instances and re-resolved after the whole program
       # is checked (resolve_pending_call_instances), when the annotation
-      # unifications have landed. A parameter no context ever solves leaves
-      # the call unrecorded and the monomorphizer's call-site inference
-      # (infer_type_args_for_call) is the documented FALLBACK for
-      # synthesized/unsolved calls.
+      # unifications have landed. ZERO-INFERENCE: a parameter no context
+      # ever solves is reported by resolve_pending_call_instances
+      # ("cannot infer type parameter `T`: add an annotation") — the
+      # monomorphizer performs no call-site inference (fail-closed).
       if call_was_generic then
         var all_solved = true
         var solved_args = Vec::new()
@@ -6986,7 +7131,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
         if all_solved then
           env.typed_call_instances.insert(expr.node_id, solved_args)
         elsif sig_vars.len() > 0 then
-          env.pending_call_instances.insert(expr.node_id, (sig_param_names.clone(), sig_vars))
+          env.pending_call_instances.insert(expr.node_id, (sig_param_names.clone(), sig_vars, expr.span))
         end
       end
       # Shared intrinsic reads (__intrinsic_array_get / __intrinsic_map_get)
@@ -7035,7 +7180,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
                 type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
               end
             when Type::Named(tid, args) then
-              match get_type_by_id(env, &tid)
+              match get_type_by_id_ref(env, &tid)
               when Option::Some(td) then
                 if td.name == "Map" && args.len() >= 2 then
                   if type_has_resource_kind(env, &args[0]) || type_has_resource_kind(env, &args[1]) then
@@ -7235,7 +7380,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       # P0-J1 (phase 2A): Named Array/Slice index like their canonical
       # variants (element result, Int index); Named Set membership returns
       # Bool.
-      match get_type_by_id(env, tid)
+      match get_type_by_id_ref(env, tid)
       when Option::Some(td) then
         if td.name == "Map" && args.len() >= 2 then
           if type_has_resource_kind(env, &args[1]) then
@@ -7281,7 +7426,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       when Type::RefInternal(t, _) then t
       when Type::Var(_) then fresh_type_var(env)
       when Type::Named(tid, args) then
-        match get_type_by_id(env, tid)
+        match get_type_by_id_ref(env, tid)
         when Option::Some(td) then
           if td.name == "Ptr" && args.len() >= 1 then
             args[0].clone()
@@ -7304,7 +7449,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       when Type::RefInternal(t, _) then t
       when Type::Var(_) then fresh_type_var(env)
       when Type::Named(tid, args) then
-        match get_type_by_id(env, tid)
+        match get_type_by_id_ref(env, tid)
         when Option::Some(td) then
           if td.name == "Ptr" && args.len() >= 1 then
             args[0].clone()
@@ -7327,7 +7472,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       when Type::RefInternal(t, _) then t
       when Type::Var(_) then fresh_type_var(env)
       when Type::Named(tid, args) then
-        match get_type_by_id(env, tid)
+        match get_type_by_id_ref(env, tid)
         when Option::Some(td) then
           if td.name == "Ptr" && args.len() >= 1 then args[0].clone() else inner_type end
         when Option::None then inner_type
@@ -7393,10 +7538,10 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       env.typed_aggregate_ownership.insert(expr.node_id, st_owned)
     end
     let type_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
-    match get_type_def_by_name(env, type_name)
+    match get_type_by_name_ref(env, type_name)
     when Option::Some(type_def) then
       # Use fresh type vars for generic params so unification works correctly
-      let type_args = fresh_type_args_for(env, &type_def)
+      let type_args = fresh_type_args_for(env, type_def)
       # Check struct literal field values against struct field types
       match type_def.def_kind
       when TypeDefKind::Struct(struct_fields) then
@@ -7445,9 +7590,9 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     when Option::None then
       # Struct-style enum variant construction: Enum::Variant { field: value }.
       let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
-      match get_type_def_by_name(env, enum_name)
+      match get_type_by_name_ref(env, enum_name)
       when Option::Some(enum_def) then
-        let enum_type_args = fresh_type_args_for(env, &enum_def)
+        let enum_type_args = fresh_type_args_for(env, enum_def)
         var found_variant = false
         match enum_def.def_kind
         when TypeDefKind::Enum(variants) then
@@ -7651,7 +7796,7 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else recv_type end
     when Option::None then recv_type
@@ -7668,7 +7813,7 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
   match base
   when Type::Named(tid, type_args) then
     # Direct lookup by TypeId via type_list vec
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       # P0-J1 (phase 2A): the Named Slice/Array field surface mirrors the
       # canonical Type::Slice/Type::Array arms (len/cap are Int).
@@ -7968,9 +8113,180 @@ def instantiate_param_for_type_method(
   if all_solved then
     env.typed_call_instances.insert(call_node_id, solved_args)
   elsif rec_vars.len() > 0 then
-    env.pending_call_instances.insert(call_node_id, (rec_names.clone(), rec_vars))
+    env.pending_call_instances.insert(call_node_id, (rec_names.clone(), rec_vars, span))
   end
   resolve_type_var(env, inst_ret)
+end
+
+# P0-AP: instantiate a TRAIT-impl method for a bare Param receiver inside a
+# generic body (see resolve_method_type section 5). The Param is an opaque
+# instance of its bound trait: the impl head is accepted by the PARAM BINDING
+# (strict unify rejects Param-vs-Named — the head shape matches and its
+# argument variables are bound to the bound trait's type arguments
+# positionally, the common shape where the trait's element argument is the
+# head's corresponding argument, e.g. Iterator[T] for ArrayIterator[T]), the
+# method-level parameters solve from the call arguments, and the solved
+# substitution is recorded in typed_call_instances exactly like the
+# impl-registry path; a substitution a parameter of which only the generic
+# BODY's later unifications can solve (e.g. the trait impl's element variable
+# unified through the match-arm payload) is parked in pending_call_instances
+# and re-resolved after the whole program is checked
+# (resolve_pending_call_instances). Returns Option::None when the receiver is
+# not a Param.
+def instantiate_param_bound_method(
+  env: &mut TypeEnv,
+  imp: &ImplInfo,
+  m: &MethodInfo,
+  recv_type: &Type,
+  bound_args: &Vec[Type],
+  arg_types: &Vec[Type],
+  method_type_args: &Vec[Type],
+  call_node_id: Int,
+  span: Span
+) -> Option[Type]
+  match recv_type
+  when Type::Param(_) then ()
+  when _ then return Option::None
+  end
+  # One fresh inference variable per impl-level generic parameter, in the
+  # impl's declaration order (same discipline as the extension-impl solver).
+  var impl_vars = Vec::new()
+  var i = 0
+  while i < imp.generic_params.len() do
+    impl_vars.push(fresh_type_var(env))
+    i = i + 1
+  end
+  let head_inst = subst_type_args(&imp.for_type, &imp.generic_params, &impl_vars)
+  # The param binding: the Param is an opaque instance of the bound trait, so
+  # the instantiated head matches by shape. Strict unify rejects
+  # Param-vs-Named (its diagnostic is discarded); the head's argument
+  # variables are then bound to the bound trait's type arguments
+  # positionally, which solves the method signature at the call site for the
+  # common shape.
+  let errors_before = env.errors.len()
+  let head_ok = unify(env, head_inst.clone(), recv_type.clone(), Span { file: "", start: 0, end_pos: 0 })
+  if !head_ok then
+    while env.errors.len() > errors_before do
+      env.errors.pop()
+    end
+    match head_inst
+    when Type::Named(_, head_args) then
+      var hi = 0
+      while hi < head_args.len() do
+        if hi < bound_args.len() then
+          match head_args[hi]
+          when Type::Var(_) then unify(env, head_args[hi].clone(), bound_args[hi].clone(), span)
+          when _ then ()
+          end
+        end
+        hi = hi + 1
+      end
+    when _ then ()
+    end
+  end
+  # Method-level parameters: explicit type arguments or fresh variables.
+  var method_vars = Vec::new()
+  let explicit = method_type_args.len() > 0
+  var j = 0
+  while j < m.generic_params.len() do
+    if explicit && j < method_type_args.len() then
+      method_vars.push(method_type_args[j].clone())
+    else
+      method_vars.push(fresh_type_var(env))
+    end
+    j = j + 1
+  end
+  # Combined substitution: impl params first, then method-level params (a
+  # method param shadowing an impl param keeps the impl binding).
+  var all_names = Vec::new()
+  var all_vars = Vec::new()
+  var method_shadowed = Vec::new()
+  var k = 0
+  while k < imp.generic_params.len() do
+    all_names.push(imp.generic_params[k].clone())
+    all_vars.push(impl_vars[k].clone())
+    k = k + 1
+  end
+  var k2 = 0
+  while k2 < m.generic_params.len() do
+    var shadowed = false
+    var s = 0
+    while s < imp.generic_params.len() do
+      if imp.generic_params[s] == m.generic_params[k2] then shadowed = true end
+      s = s + 1
+    end
+    method_shadowed.push(shadowed)
+    if !shadowed then
+      all_names.push(m.generic_params[k2].clone())
+      all_vars.push(method_vars[k2].clone())
+    end
+    k2 = k2 + 1
+  end
+  # Instantiate the method signature with the SAME variables.
+  var inst_params = Vec::new()
+  var pi = 0
+  while pi < m.params.len() do
+    let pt = m.params[pi]
+    inst_params.push(ParamType { ty: subst_type_args(&pt.ty, &all_names, &all_vars), convention: pt.convention })
+    pi = pi + 1
+  end
+  let inst_ret = subst_type_args(&m.ret_type, &all_names, &all_vars)
+  # Unify the arguments against the instantiated signature (the receiver
+  # self parameter excluded).
+  let self_offset = if m.params.len() > 0 && m.params[0].name == "self" then 1 else 0 end
+  var ai = self_offset
+  while ai < inst_params.len() do
+    let arg_idx = ai - self_offset
+    if arg_idx < arg_types.len() then
+      unify(env, arg_types[arg_idx].clone(), inst_params[ai].ty.clone(), span)
+    end
+    ai = ai + 1
+  end
+  # Record the substitution positionally aligned with the monomorphizer's
+  # infer_type_param_names walk over the callee's MIR signature (params
+  # first, then the return type).
+  var rec_names: Vec[String] = Vec::new()
+  var rpi = 0
+  while rpi < m.params.len() do
+    collect_param_names_from_type(env, &m.params[rpi].ty, &mut rec_names)
+    rpi = rpi + 1
+  end
+  collect_param_names_from_type(env, &m.ret_type, &mut rec_names)
+  var rec_vars = Vec::new()
+  var rni = 0
+  while rni < rec_names.len() do
+    var found = false
+    var ni = 0
+    while ni < all_names.len() do
+      if all_names[ni] == rec_names[rni] then
+        rec_vars.push(all_vars[ni].clone())
+        found = true
+        break
+      end
+      ni = ni + 1
+    end
+    if !found then
+      rec_vars.push(fresh_type_var(env))
+    end
+    rni = rni + 1
+  end
+  var all_solved = true
+  var solved_args = Vec::new()
+  var svi = 0
+  while svi < rec_vars.len() do
+    let rv = resolve_type_var(env, rec_vars[svi].clone())
+    match rv
+    when Type::Var(_) then all_solved = false
+    when _ then solved_args.push(rv)
+    end
+    svi = svi + 1
+  end
+  if all_solved then
+    env.typed_call_instances.insert(call_node_id, solved_args)
+  elsif rec_vars.len() > 0 then
+    env.pending_call_instances.insert(call_node_id, (rec_names.clone(), rec_vars, span))
+  end
+  Option::Some(resolve_type_var(env, inst_ret))
 end
 
 # FIX 1 (P0-F): instantiate a generic signature ONCE per call. Every
@@ -8159,10 +8475,11 @@ def instantiate_method_type(env: &mut TypeEnv, imp: &ImplInfo, m: &MethodInfo, r
     # immediately; a parameter solved only by the CALLER's context (e.g. a
     # return-type-only method parameter unified with the let-binding
     # annotation AFTER the call) is parked in pending_call_instances and
-    # re-resolved after the whole program is checked. A parameter no
-    # context ever solves leaves the call unrecorded and the
-    # monomorphizer's call-site inference (infer_type_args_for_call) is
-    # the documented FALLBACK for synthesized/unsolved calls.
+    # re-resolved after the whole program is checked. ZERO-INFERENCE: a
+    # parameter no context ever solves is reported by
+    # resolve_pending_call_instances ("cannot infer type parameter `T`:
+    # add an annotation") — the monomorphizer performs no call-site
+    # inference (fail-closed).
     var all_solved = true
     var solved_args = Vec::new()
     var rvi = 0
@@ -8177,7 +8494,7 @@ def instantiate_method_type(env: &mut TypeEnv, imp: &ImplInfo, m: &MethodInfo, r
     if all_solved then
       env.typed_call_instances.insert(call_node_id, solved_args)
     elsif all_vars.len() > 0 then
-      env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars))
+      env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
     end
     resolve_type_var(env, inst_ret)
   else
@@ -8196,8 +8513,10 @@ end
 # instantiate_method_type. The SOLVED U is returned AND recorded in
 # typed_call_instances (call node id -> [U]) when every generic parameter
 # solves; when the fn argument is unresolved (or absent) U remains an
-# InferVar, the recording is skipped, and the monomorphizer's call-site
-# inference is the documented FALLBACK.
+# InferVar and the recording is skipped — a U no context ever solves is a
+# genuinely unconstrained shape and is reported (the end-of-check pending
+# resolution, or the monomorphizer's fail-closed error for a call that
+# never parked); inference is not performed on the program's call graph.
 #
 # mode selects the fn-return -> U extraction:
 #   "ret"  — U = the fn return type itself         (map / map_or / map_err / fold)
@@ -8240,7 +8559,7 @@ def builtin_option_inner(env: &TypeEnv, ty: &Type) -> Option[Type]
   match ty
   when Type::Option(inner) then Option::Some(inner.clone())  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Option" && args.len() >= 1 then Option::Some(args[0].clone()) else Option::None end
     when Option::None then Option::None
@@ -8256,7 +8575,7 @@ def builtin_result_err(env: &TypeEnv, ty: &Type) -> Option[Type]
   match ty
   when Type::Result(_, err) then Option::Some(err.clone())  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, tid)
+    match get_type_by_id_ref(env, tid)
     when Option::Some(td) then
       if td.name == "Result" && args.len() >= 2 then Option::Some(args[1].clone()) else Option::None end
     when Option::None then Option::None
@@ -8271,7 +8590,7 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
   when Type::RefInternal(inner, _) then inner
   when Type::Box(inner) then inner  # P0-J1: consumer (reads variant; phase-2 conversion point)
   when Type::Named(tid, args) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Box" && args.len() >= 1 then args[0].clone() else recv_type end
     when Option::None then recv_type
@@ -8289,7 +8608,7 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
   # (e.g., Duration is a typealias for Timespec)
   let resolved_base = match base
   when Type::Named(tid, _) then
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       match td.def_kind
       when TypeDefKind::Alias(inner) then inner.clone()
@@ -8432,7 +8751,13 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
       let u = solve_builtin_method_u(env, arg_types, 0, "opt", method_type_args, call_node_id, span)
       return named_adt(env, "Option".to_string(), [u])
     end
-    if method == "or_else" then return fresh_type_var(env) end
+    # P0-AL (residual): Option::or_else[U] — U solved from the fn argument's
+    # return Option inner (the fn argument returns Option[T] — or_else's U is
+    # that Option's payload) and recorded, exactly like and_then.
+    if method == "or_else" then
+      let u = solve_builtin_method_u(env, arg_types, 0, "opt", method_type_args, call_node_id, span)
+      return named_adt(env, "Option".to_string(), [u])
+    end
     if method == "unwrap_or" then return inner end
     # P0-AL (residual): Option::map_or[U] — U solved from the fn argument's
     # return (the default argument carries the same U).
@@ -8545,7 +8870,7 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     # P0-J (phase 3): the registered builtins' method RESULTS are produced in
     # the Named Adt storage form (named_adt); the unregistered four keep the
     # canonical production (named_adt fails closed to the same variant).
-    let _nn = match get_type_by_id(env, tid)
+    let _nn = match get_type_by_id_ref(env, tid)
     when Option::Some(td) then td.name.clone()
     when Option::None then ""
     end
@@ -8621,7 +8946,13 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
         let u = solve_builtin_method_u(env, arg_types, 0, "opt", method_type_args, call_node_id, span)
         return named_adt(env, "Option".to_string(), [u])
       end
-      if method == "or_else" then return fresh_type_var(env) end
+      # P0-AL (residual): Named Option or_else — U solved from the fn
+      # argument's return Option inner and recorded (the canonical twin
+      # above; no fresh-var fallback).
+      if method == "or_else" then
+        let u = solve_builtin_method_u(env, arg_types, 0, "opt", method_type_args, call_node_id, span)
+        return named_adt(env, "Option".to_string(), [u])
+      end
       if method == "unwrap_or" then return inner end
       # P0-AL (residual): Named Option map_or — U solved from the fn
       # argument's return (the default argument carries the same U).
@@ -8758,6 +9089,50 @@ def resolve_method_type(env: &mut TypeEnv, recv_type: &Type, method: String, arg
     when Option::None then ()
     end
   when Option::None then ()
+  end
+
+  # 5. P0-AP: TRAIT-BOUND method resolution on bare Param receivers. Inside a
+  # generic body a method call on a receiver of type Type::Param(name) (e.g.
+  # `self.inner.advance()` with inner: I inside `impl[T, U, I: Iterator[T]]
+  # Iterator[U] for MapIter[T, U, I]`) resolves through the parameter's
+  # where-clause bound (recorded in env.param_bounds when the generic
+  # parameters entered scope): the bound trait's impls are the candidates,
+  # the impl head unifies with the Param by the PARAM BINDING (the Param is
+  # an opaque instance of the bound trait, so Param-vs-Named head
+  # unification is a match), the method is instantiated with fresh inference
+  # variables, the head's argument variables are bound to the bound trait's
+  # type arguments positionally, and the solved instance is recorded exactly
+  # like the impl-registry path (typed_call_instances / pending_call_instances).
+  match resolved_base
+  when Type::Param(pname) then
+    match env.param_bounds.get(&pname)
+    when Option::Some(pbounds) then
+      var pbi = 0
+      while pbi < pbounds.len() do
+        let pbound = pbounds[pbi]
+        var pii = 0
+        while pii < env.impls.len() do
+          let pimp = env.impls[pii]
+          if pimp.trait_name == pbound.trait_name then
+            var pmi = 0
+            while pmi < pimp.methods.len() do
+              let pm = pimp.methods[pmi]
+              if pm.name == method then
+                match instantiate_param_bound_method(env, &pimp, &pm, &resolved_base, &pbound.args, arg_types, method_type_args, call_node_id, span)
+                when Option::Some(ret_ty) then return ret_ty
+                when Option::None then ()
+                end
+              end
+              pmi = pmi + 1
+            end
+          end
+          pii = pii + 1
+        end
+        pbi = pbi + 1
+      end
+    when Option::None then ()
+    end
+  when _ then ()
   end
 
   # Method on user-defined type or trait — permissively infer.
@@ -9131,10 +9506,10 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
         # Use canonical Type representation so unification works correctly
         type_def_to_canonical(env, &type_def)
       when Option::None then
-        match get_type_def_by_name(env, full_name.clone())
+        match get_type_by_name_ref(env, full_name.clone())
         when Option::Some(type_def) then
           # Use canonical Type representation so unification works correctly
-          type_def_to_canonical(env, &type_def)
+          type_def_to_canonical(env, type_def)
         when Option::None then
           # Try the last segment alone
           let last = segs[segs.len() - 1].clone()
@@ -9385,24 +9760,35 @@ def type_check_strict(program: &Program, strict: Bool) -> Vec[TypeError]
   env.errors
 end
 
-# P0-AL: resolve the parked generic-call instances (pending_call_instances)
-# after the WHOLE program is checked. A generic parameter that only the
-# caller's context constrains (a return-type-only parameter, e.g. the T of
-# `Vec::new()` unified with the `let v: Vec[String] = Vec::new()`
-# annotation) is still an unbound inference variable at the call site; the
-# caller-context unifications land during the rest of the check, and this
-# pass re-resolves each parked call's variables. A call whose substitution
-# is now fully concrete is recorded in typed_call_instances (the SOLVED
-# substitution is the AUTHORITY — the monomorphizer consumes it with zero
-# inference); a call a context never solves stays unrecorded and the
-# monomorphizer's call-site inference is the documented FALLBACK.
+# P0-AL (final): resolve the parked generic-call instances
+# (pending_call_instances) after the WHOLE program is checked. A generic
+# parameter that only the caller's context constrains (a return-type-only
+# parameter, e.g. the T of `Vec::new()` unified with the
+# `let v: Vec[String] = Vec::new()` annotation) is still an unbound
+# inference variable at the call site; the caller-context unifications land
+# during the rest of the check, and this pass re-resolves each parked
+# call's variables.
+#
+# ZERO-INFERENCE (the end-of-check resolution):
+#   1. each parked variable is resolved (chasing env.subst);
+#   2. a call still incomplete is SOLVED FROM THE DEST — the call's
+#      recorded result type (typed_expr_types; the source of the MIR
+#      destination local's type for method calls) is chased to its final
+#      form, and when the chased dest is fully concrete the recorded entry
+#      is unified against it, binding every parked variable the call's
+#      result type contains to its dest position;
+#   3. a variable no context ever solves is a GENUINELY UNCONSTRAINED
+#      shape: it records "cannot infer type parameter `<name>`: add an
+#      annotation" — the monomorphizer performs no call-site inference
+#      (fail-closed; a call a context never solves never reaches it).
 def resolve_pending_call_instances(env: &mut TypeEnv) -> Unit
   let entries = env.pending_call_instances.entries()
   var i = 0
   while i < entries.len() do
-    let (node_id, rec_pair) = entries[i]
-    let rec_names = rec_pair.0
-    let rec_vars = rec_pair.1
+    let (node_id, rec_triple) = entries[i]
+    let rec_names = rec_triple.0
+    let rec_vars = rec_triple.1
+    let rec_span = rec_triple.2
     var all_solved = true
     var solved_args = Vec::new()
     var vi = 0
@@ -9414,8 +9800,49 @@ def resolve_pending_call_instances(env: &mut TypeEnv) -> Unit
       end
       vi = vi + 1
     end
+    if !all_solved then
+      # ZERO-INFERENCE (dest rule): the parked variables are the call's own
+      # instantiated-signature variables, so the recorded call-result type
+      # SHARES them; chasing the entry and unifying it against the chased
+      # (fully-resolved) dest solves every variable the call's result type
+      # contains from the caller's dest context.
+      match env.typed_expr_types.get(node_id)
+      when Option::Some(entry_ty) then
+        let chased = resolve_type_var(env, entry_ty.clone())
+        var chased_has_error = false
+        var chased_has_var = false
+        scan_codegen_type(env, &chased, &mut chased_has_error, &mut chased_has_var)
+        if !chased_has_error && !chased_has_var then
+          unify(env, entry_ty.clone(), chased, rec_span)
+          all_solved = true
+          solved_args = Vec::new()
+          var vi2 = 0
+          while vi2 < rec_vars.len() do
+            let resolved2 = resolve_type_var(env, rec_vars[vi2].clone())
+            match resolved2
+            when Type::Var(_) then all_solved = false
+            when _ then solved_args.push(resolved2)
+            end
+            vi2 = vi2 + 1
+          end
+        end
+      when Option::None then ()
+      end
+    end
     if all_solved then
       env.typed_call_instances.insert(node_id, solved_args)
+    else
+      # Genuinely unconstrained: no context (arguments, annotation, dest)
+      # ever solved the parameter — record the annotation error per name.
+      var ni = 0
+      while ni < rec_names.len() do
+        match resolve_type_var(env, rec_vars[ni].clone())
+        when Type::Var(_) then
+          type_add_error(env, "cannot infer type parameter `" + rec_names[ni] + "`: add an annotation", rec_span)
+        when _ then ()
+        end
+        ni = ni + 1
+      end
     end
     i = i + 1
   end
@@ -9921,7 +10348,7 @@ def type_display(env: &TypeEnv, ty: &Type) -> String
       end
       s = s + "]"
     end
-    match get_type_by_id(env, &tid)
+    match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       if td.name == "Option" && args.len() >= 1 then "Option[" + type_display(env, &args[0]) + "]"
       elsif td.name == "Result" && args.len() >= 2 then "Result[" + type_display(env, &args[0]) + ", " + type_display(env, &args[1]) + "]"
@@ -9938,6 +10365,12 @@ def type_display(env: &TypeEnv, ty: &Type) -> String
       end
     when Option::None then s
     end
+  when Type::Ptr(inner) then "Ptr[" + type_display(env, inner) + "]"
+  when Type::PtrMut(inner) then "PtrMut[" + type_display(env, inner) + "]"
+  when Type::Box(inner) then "Box[" + type_display(env, inner) + "]"
+  when Type::Rc(inner) then "Rc[" + type_display(env, inner) + "]"
+  when Type::Dyn(did) then "dyn Type#" + did.id.to_string()
+  when Type::Effect(effs, inner) then "Effect[" + effs.join(", ") + "] " + type_display(env, inner)
   when Type::Function(params, ret) then
     var s = "("
     var first = true

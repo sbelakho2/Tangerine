@@ -1001,6 +1001,15 @@ struct MirBuilder
   # such calls lower to the real callee. Only param-for_type impls register
   # here, so a bare name never collides across extension impls.
   param_impl_methods: Map[String, String]
+  # ZERO-INFERENCE: mangled method name ("Type__method") -> the resolver's
+  # method DefId, registered at lowering time from item_defs (the same
+  # DefId the type checker records in typed_call_targets for source method
+  # calls). IR-synthesized calls to a GENERIC method base (the projected
+  # for-loop length call to "Vec__len") attach their instance BY
+  # CONSTRUCTION from this table — the instance key is then byte-identical
+  # to the checker-solved instances of the same method, so the
+  # monomorphizer's cache stays single-sourced with ZERO inference.
+  method_def_ids: Map[String, DefId]
   fn_ret_types: Map[String, Type]
   # deinit_targets maps a type id to its deinit callable. Values are still
   # mangled names for ABI emission; TODO: move to a typed DefId/CallableId
@@ -1149,6 +1158,7 @@ def builder_new() -> MirBuilder
     type_defs: Vec::new(),
     impl_type_map: Map::new(),
     param_impl_methods: Map::new(),
+    method_def_ids: Map::new(),
     fn_ret_types: Map::new(),
     deinit_targets: Map::new(),
     finalize_plan: Map::new(),
@@ -2933,6 +2943,15 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   # The entry function's keys coincide (its emission name IS the source
   # name). Methods ("Type__method"), struct methods, and extern symbols keep
   # their existing single source/mangled keys unchanged.
+  #
+  # TYPING-ONLY (ZERO-INFERENCE, item 3): these double-keyed fn_ret_types
+  # lookups are PURE IR TYPING — they compute the MIR destination local's
+  # type for call lowering (mir_infer_call_result_type /
+  # infer_static_path_result_type) and never participate in the
+  # monomorphizer's decisions: the monomorphizer (trait_resolve.tg) reads
+  # only the MirFnItem's INSTANCE PAYLOAD and the MIR function signatures.
+  # The instance payload is the authority for type arguments; a call whose
+  # payload is absent/empty on a generic base fails closed there.
   var ret_idx = 0
   var ret_module_ptr = 0
   while ret_idx < program.items.len() do
@@ -3131,6 +3150,19 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
         else
           method.name.clone()
         end
+        # ZERO-INFERENCE: register the method's resolver DefId under its
+        # mangled name (item_defs carries the impl's method DefIds in
+        # declaration order — the SAME DefId the checker records in
+        # typed_call_targets for source method calls). IR-synthesized calls
+        # to this generic method base attach their instance by construction
+        # from method_def_ids (see lower_for_projected).
+        match b.item_defs.get(item_idx2)
+        when Option::Some(dids) then
+          if method_idx < dids.len() then
+            b.method_def_ids.insert(mangled_name.clone(), dids[method_idx].clone())
+          end
+        when Option::None then ()
+        end
         # NOTE: We do NOT skip impl methods with duplicate mangled names here
         # (same rationale as functions above — silent skipping can drop valid
         # methods from different files with the same name).
@@ -3228,6 +3260,17 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       while sm_idx < s.methods.len() do
         let method = s.methods[sm_idx]
         let mangled_name = s.name.clone() + "__" + method.name.clone()
+        # ZERO-INFERENCE: register the struct method's resolver DefId under
+        # its mangled name (item_defs carries the struct's method DefIds in
+        # declaration order) — the instance-by-construction table for
+        # IR-synthesized calls to generic method bases.
+        match b.item_defs.get(item_idx2)
+        when Option::Some(dids) then
+          if sm_idx < dids.len() then
+            b.method_def_ids.insert(mangled_name.clone(), dids[sm_idx].clone())
+          end
+        when Option::None then ()
+        end
         var new_params = Vec::new()
         for p in method.params do
           if p.name == "self" then
@@ -3872,7 +3915,7 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
       })
     })
   when _ then
-    panic("internal error: unsupported static initializer (expression kind " + expr_kind_name(&value.kind) + ") for type " + format_mir_type(&resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
+    panic("internal error: unsupported static initializer (expression kind " + expr_kind_name(&value.kind) + ") for type " + format_mir_type(&b.typed_type_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
   end
 end
 
@@ -6142,6 +6185,53 @@ def lower_callee_expr(b: &mut MirBuilder, callee_expr: &Expr, span: Span) -> Mir
   lower_expr(b, &callee_expr, span)
 end
 
+# ———————————————————————————————————————————————————————————————
+# IR-SYNTHESIZED MirFnItem CONSTRUCTION ENUMERATION (ZERO-INFERENCE)
+# ———————————————————————————————————————————————————————————————
+# Every MirFnItem construction that is IR-INTERNAL (carries no AST call
+# node and therefore no checker-recorded instance) is enumerated here and
+# classified against the monomorphizer's fail-closed rule (a generic base
+# with NO instance payload records an error — inference is never
+# performed). The complete inventory:
+#
+#  1. THE DEINIT/DRAIN/DESTROY GLUE (emit_plan_deinit and friends) —
+#     five intrinsic calls, all members of the `__intrinsic_*` family
+#     (monomorphic per call: the MIR passes the concrete argument types,
+#     and none of these names is a generic MIR function):
+#       __intrinsic_array_destroy  (Array backing release)
+#       __intrinsic_set_drain_one  (destructive Set drain)
+#       __intrinsic_set_destroy    (Set backing release)
+#       __intrinsic_map_drain_one  (destructive Map drain)
+#       __intrinsic_map_destroy    (Map backing release)
+#     The recursive drop GLUE CHAINS themselves are MirDeinit terminators
+#     (deinit_fn strings such as "Box__drop"), not MirCall operands — they
+#     never enter the monomorphizer's worklist.
+#  2. THE STATIC-INITIALIZATION "CALLS" — statics/consts are lowered to
+#     constant OPERANDS (lower_static_init_operand: a Vec::new()/Map::new()/
+#     Set::new() initializer becomes a zero constant), never to MirCall —
+#     no generic call reaches the monomorphizer from this path.
+#  3. THE CLOSURE LOWERING (lower_expr's ExprClosure arm) — the closure's
+#     fn-item operand is a synthesized name ("closure#N") consumed by the
+#     closure AGGREGATE, never a MirCall callee; closures are non-generic
+#     synthesized functions.
+#  4. THE PROJECTED FOR-LOOP LENGTH CALL (lower_for_projected) — the ONE
+#     genuinely-generic IR call: the callee is the generic method base
+#     "Vec__len" (self carries Param("T")). It attaches its instance BY
+#     CONSTRUCTION from method_def_ids (the resolver's method DefId + the
+#     iterable's element type — the MIR passes concrete arg types), so it
+#     carries a solved instance like every other generic call.
+#  5. All OTHER MirFnItem constructions (mir_fn_operand /
+#     mir_fn_operand_with_instance / attach_call_instance / lr_call /
+#     lr_static_path_call / the method-call lowering) belong to SOURCE
+#     call sites — their instances come from mir_call_instance (the typed
+#     call target + the checker's solved substitution). The intrinsic
+#     method-call targets (__intrinsic_int_to_string and friends) are
+#     `__intrinsic_*` family members and are not generic MIR functions.
+#
+# A generic base with NO instance payload therefore cannot be produced by
+# lowering; if one still reaches the monomorphizer, it FAILS CLOSED there.
+#
+# ———————————————————————————————————————————————————————————————
 # P0-AK: the call site's semantic callee identity. When the typed program
 # recorded a call target (DefId) for this call node, wrap it as the
 # InstanceId payload of the MirFnItem. The instance's substs are the TYPE
@@ -6150,14 +6240,13 @@ end
 # parameter order): the solved substitutions from the type checker are the
 # AUTHORITY. When absent (a synthesized call — IR-only callees carry no
 # DefId; a residual unsolved shape stays unrecorded), the substs stay
-# EMPTY and the monomorphizer's call-site inference
-# (infer_type_args_for_call, see monomorphize_program) is the documented
-# FALLBACK that fills them from the call arguments and the destination
-# local's type.
+# EMPTY — ZERO-INFERENCE (fail-closed): the monomorphizer records an error
+# for a generic callee with no usable instance instead of inferring.
 #
 # P0-AL (final): the monomorphizer consumes this instance payload. The
 # instance field survives every substitution/rewrite pass on the way to the
 # monomorphizer — substitute_operand in trait_resolve.tg carries c.instance
+# (and substitutes its substs under the caller's specialization map)
 # through specialization, and rewrite_call_sites_in_program carries
 # const_val.instance through the call-site rewrite — so a call with a solved
 # instance reaches monomorphize_program with NON-EMPTY substs, and the
@@ -6166,9 +6255,10 @@ end
 # shape — impl-registry generic methods, builtin-method generics
 # (Option::map / Result::and_then / ...), extension-impl methods
 # (`impl[T, I: Iterator[T]] I`), and return-type-only parameters solved by
-# the caller's annotation context (resolve_pending_call_instances) — so the
-# infer_type_args_for_call fallback fires only for IR-synthesized calls and
-# the residual shapes no context ever solved.
+# the caller's annotation context (resolve_pending_call_instances) — so no
+# call-site inference remains: the enumeration above covers every
+# IR-synthesized shape, and the monomorphizer fails closed on anything
+# else.
 def mir_call_instance(b: &MirBuilder, call_node_id: Int) -> Option[InstanceId]
   match b.call_def_ids.get(call_node_id)
   when Option::Some(did) then
@@ -6183,8 +6273,10 @@ end
 # Attach the semantic instance to a name-built MirFnItem operand (P0-AK).
 # Only MirConstant/MirFnItem operands carry the instance payload; callees
 # lowered to values (first-class fn temporaries) and non-call constants are
-# returned unchanged — the documented name-only fallback for
-# synthesized/IR-only calls whose typed call target lookup misses.
+# returned unchanged — the name-only form for synthesized/IR-only callees
+# whose typed call target lookup misses (per the IR-synthesized enumeration
+# above, none of those callees is a generic base; a generic base with no
+# payload fails closed at the monomorphizer).
 # P0-AM: when the instance carries a top-level-function DefId, the MirFnItem
 # NAME is rewritten to the instance's fn_owner_key base (the emission name
 # the callee was lowered under) — the call reference and the emitted
@@ -6309,7 +6401,9 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   # base — first-class fn-item VALUES of top-level functions then reference
   # the same derived label the function was emitted under. When the lookup
   # misses (a synthesized/IR-only shape), the callee keeps the name-only
-  # form — the documented name-based fallback.
+  # form (per the IR-synthesized enumeration, none of those callees is a
+  # generic base; a generic base with no payload fails closed at the
+  # monomorphizer).
   var callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(fn_name.clone()),
@@ -9501,13 +9595,29 @@ def lower_for_projected(b: &mut MirBuilder, pat: &Pattern, iter: &Expr, body: &B
     operand_copy_local(recv_ref_tmp)
   end
   let len_callee = for_projected_len_callee(b, &iter_expr_ty)
+  # ZERO-INFERENCE: the projected for-loop's length call is IR-SYNTHESIZED
+  # (no AST node, no checker instance), and its callee — "Vec__len" — is a
+  # GENERIC method base (the self param carries Param("T")). The instance
+  # is therefore attached BY CONSTRUCTION: the element type the MIR derived
+  # from the iterable (the MIR passes concrete arg types) becomes the
+  # substs, and the resolver's method DefId (method_def_ids — the same
+  # DefId the checker records for source len() calls) makes the instance
+  # key byte-identical to the checker-solved instances, so the
+  # monomorphizer cache stays single-sourced. A callee with no registered
+  # DefId keeps the name-only form (a non-generic or missing target — the
+  # monomorphizer's fail-closed check then reports it).
+  let len_instance = match b.method_def_ids.get(&len_callee)
+  when Option::Some(did) then
+    Option::Some(InstanceId { def: did.clone(), substs: vec![elem_ty.clone()] })
+  when Option::None then Option::None
+  end
   let len_ret = add_temp(b, Type::Int, span)
   let len_success = create_block(b)
   var len_args = Vec::new()
   len_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(recv_op) })
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: place_local(len_ret),
-    func: mir_fn_operand(b, len_callee.clone()),
+    func: mir_fn_operand_with_instance(b, len_callee.clone(), len_instance),
     args: len_args,
     success: len_success,
     unwind: Option::None
@@ -10491,12 +10601,18 @@ end
 
 def pretty_print_mir(program: &MirProgram) -> String
   var out = ""
+  # P0-AP: the type-id -> name table for the canonical Named-type display
+  # (the builtin compounds render like their canonical variants).
+  var names: Map[Int, String] = Map::new()
+  for td in program.types do
+    names.insert(td.id.id, td.name.clone())
+  end
 
   # Type definitions
   if !program.types.is_empty() then
     out = out + "// Type definitions\n"
     for td in program.types do
-      out = out + format_mir_typedef(&td) + "\n"
+      out = out + format_mir_typedef(&names, &td) + "\n"
     end
     out = out + "\n"
   end
@@ -10506,25 +10622,25 @@ def pretty_print_mir(program: &MirProgram) -> String
     out = out + "// Statics\n"
     for s in program.statics do
       let mutability = if s.is_mut then "mut " else "" end
-      out = out + "static " + mutability + s.name.clone() + ": " + format_mir_type(&s.ty) + ";\n"
+      out = out + "static " + mutability + s.name.clone() + ": " + format_mir_type(&names, &s.ty) + ";\n"
     end
     out = out + "\n"
   end
 
   # Functions
   for func in program.functions do
-    out = out + format_mir_function(&func) + "\n"
+    out = out + format_mir_function(&names, &func) + "\n"
   end
   out
 end
 
-def format_mir_typedef(td: &MirTypeDef) -> String
+def format_mir_typedef(names: &Map[Int, String], td: &MirTypeDef) -> String
   var out = "type " + td.name.clone()
   match td.kind
   when MirTypeDefKind::Struct(fields) then
     out = out + " = struct {\n"
     for f in fields do
-      out = out + "    " + f.name.clone() + ": " + format_mir_type(&f.ty)
+      out = out + "    " + f.name.clone() + ": " + format_mir_type(names, &f.ty)
       out = out + "\n"
     end
     out = out + "}"
@@ -10537,7 +10653,7 @@ def format_mir_typedef(td: &MirTypeDef) -> String
         var first = true
         for f in v.fields do
           if !first then out = out + ", " end
-          out = out + format_mir_type(&f)
+          out = out + format_mir_type(names, &f)
           first = false
         end
         out = out + ")"
@@ -10549,7 +10665,7 @@ def format_mir_typedef(td: &MirTypeDef) -> String
   out
 end
 
-def format_mir_function(func: &MirFunction) -> String
+def format_mir_function(names: &Map[Int, String], func: &MirFunction) -> String
   var out = ""
   # Annotations
   if func.is_unsafe then out = out + "unsafe " end
@@ -10561,10 +10677,10 @@ def format_mir_function(func: &MirFunction) -> String
   for p in func.params do
     if !first then out = out + ", " end
     let mutmark = if p.is_mut then "mut " else "" end
-    out = out + mutmark + p.name.clone() + ": " + format_mir_type(&p.ty)
+    out = out + mutmark + p.name.clone() + ": " + format_mir_type(names, &p.ty)
     first = false
   end
-  out = out + ") -> " + format_mir_type(&func.ret_type) + " {\n"
+  out = out + ") -> " + format_mir_type(names, &func.ret_type) + " {\n"
 
   # Local declarations
   for local in func.locals do
@@ -10573,7 +10689,7 @@ def format_mir_function(func: &MirFunction) -> String
     if !local.name.is_empty() then
       out = out + " /* " + local.name.clone() + " */"
     end
-    out = out + ": " + format_mir_type(&local.ty) + ";\n"
+    out = out + ": " + format_mir_type(names, &local.ty) + ";\n"
   end
   if !func.locals.is_empty() then out = out + "\n" end
 
@@ -10584,32 +10700,32 @@ def format_mir_function(func: &MirFunction) -> String
     when MirContractKind::Post then "post"
     when MirContractKind::Invariant then "invariant"
     end
-    out = out + "    @" + kind_str + " " + format_operand(&c.condition) + " \"" + c.message.clone() + "\"\n"
+    out = out + "    @" + kind_str + " " + format_operand(names, &c.condition) + " \"" + c.message.clone() + "\"\n"
   end
 
   # Basic blocks
   for block in func.blocks do
-    out = out + format_mir_block(&block)
+    out = out + format_mir_block(names, &block)
   end
 
   out = out + "}\n"
   out
 end
 
-def format_mir_block(block: &MirBlock) -> String
+def format_mir_block(names: &Map[Int, String], block: &MirBlock) -> String
   var out = "    bb" + block.id.id.to_string() + ": {\n"
   for stmt in block.statements do
-    out = out + "        " + format_mir_statement(&stmt) + ";\n"
+    out = out + "        " + format_mir_statement(names, &stmt) + ";\n"
   end
-  out = out + "        " + format_mir_terminator(&block.terminator) + ";\n"
+  out = out + "        " + format_mir_terminator(names, &block.terminator) + ";\n"
   out = out + "    }\n"
   out
 end
 
-def format_mir_statement(stmt: &MirStatement) -> String
+def format_mir_statement(names: &Map[Int, String], stmt: &MirStatement) -> String
   match stmt.kind
   when MirStatementKind::MirAssign(place, rvalue) then
-    format_place(&place) + " = " + format_rvalue(&rvalue)
+    format_place(&place) + " = " + format_rvalue(names, &rvalue)
   when MirStatementKind::MirStorageLive(id) then
     "StorageLive(_" + id.id.to_string() + ")"
   when MirStatementKind::MirStorageDead(id) then
@@ -10622,20 +10738,20 @@ def format_mir_statement(stmt: &MirStatement) -> String
     when MirContractKind::Post then "post"
     when MirContractKind::Invariant then "invariant"
     end
-    "contract_check(" + kind_str + ", " + format_operand(&op) + ")"
+    "contract_check(" + kind_str + ", " + format_operand(names, &op) + ")"
   when MirStatementKind::MirBudgetConsume(resource, amount) then
     "budget_consume(\"" + resource.clone() + "\", " + amount.to_string() + ")"
   when MirStatementKind::MirEffectRecord(name, op) then
-    "effect_record(\"" + name.clone() + "\", " + format_operand(&op) + ")"
+    "effect_record(\"" + name.clone() + "\", " + format_operand(names, &op) + ")"
   end
 end
 
-def format_mir_terminator(term: &MirTerminator) -> String
+def format_mir_terminator(names: &Map[Int, String], term: &MirTerminator) -> String
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     "goto -> bb" + target.id.to_string()
   when MirTerminatorKind::MirSwitchInt { op: discr, targets, default_target: otherwise } then
-    var out = "switchInt(" + format_operand(&discr) + ") -> ["
+    var out = "switchInt(" + format_operand(names, &discr) + ") -> ["
     for t in targets do
       out = out + t.value.to_string() + ": bb" + t.target.id.to_string() + ", "
     end
@@ -10646,7 +10762,7 @@ def format_mir_terminator(term: &MirTerminator) -> String
   when MirTerminatorKind::MirUnreachable then
     "unreachable"
   when MirTerminatorKind::MirCall { dest, func: func_op, args, success: succ, unwind } then
-    var out = format_place(&dest) + " = " + format_operand(&func_op) + "("
+    var out = format_place(&dest) + " = " + format_operand(names, &func_op) + "("
     var first = true
     for a in args do
       if !first then out = out + ", " end
@@ -10657,7 +10773,7 @@ def format_mir_terminator(term: &MirTerminator) -> String
       when AccessEffect::Initialize then "init"
       end
       let value_str = match a.value
-      when MirCallValue::Value(op) then format_operand(&op)
+      when MirCallValue::Value(op) then format_operand(names, &op)
       when MirCallValue::Place(p) then format_place(&p)
       end
       out = out + effect_str + ":" + value_str
@@ -10679,9 +10795,9 @@ def format_mir_terminator(term: &MirTerminator) -> String
     out = out + "]"
     out
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
-    var out = "assert(" + format_operand(&cond) + ", "
+    var out = "assert(" + format_operand(names, &cond) + ", "
     out = out + (if expected then "true" else "false" end) + ", "
-    out = out + format_assert_message(&msg) + ") -> [success: bb" + target.id.to_string()
+    out = out + format_assert_message(names, &msg) + ") -> [success: bb" + target.id.to_string()
     match unwind
     when Option::Some(ub) then out = out + ", unwind: bb" + ub.id.to_string()
     when Option::None then ()
@@ -10689,16 +10805,16 @@ def format_mir_terminator(term: &MirTerminator) -> String
     out = out + "]"
     out
   when MirTerminatorKind::MirYield(value, resume) then
-    "yield(" + format_operand(&value) + ") -> resume: bb" + resume.id.to_string()
+    "yield(" + format_operand(names, &value) + ") -> resume: bb" + resume.id.to_string()
   when MirTerminatorKind::MirAbort then
     "abort"
   end
 end
 
-def format_assert_message(msg: &AssertMessage) -> String
+def format_assert_message(names: &Map[Int, String], msg: &AssertMessage) -> String
   match msg
   when AssertMessage::BoundsCheck(idx, len) then
-    "\"index out of bounds: \" + index=" + format_operand(&idx) + " len=" + format_operand(&len)
+    "\"index out of bounds: \" + index=" + format_operand(names, &idx) + " len=" + format_operand(names, &len)
   when AssertMessage::Overflow(op) then
     "\"arithmetic overflow: " + format_binop(op) + "\""
   when AssertMessage::DivisionByZero then "\"division by zero\""
@@ -10723,22 +10839,22 @@ def format_place(place: &Place) -> String
   out
 end
 
-def format_operand(op: &MirOperand) -> String
+def format_operand(names: &Map[Int, String], op: &MirOperand) -> String
   match op.kind
   when MirOperandKind::MirCopy(place) then "copy " + format_place(&place)
   when MirOperandKind::MirMovePlace(place) then "move " + format_place(&place)
   when MirOperandKind::MirRead(place) then "read " + format_place(&place)
   when MirOperandKind::MirConsume(place) then "consume " + format_place(&place)
-  when MirOperandKind::MirConstant(c) then format_mir_constant(&c)
+  when MirOperandKind::MirConstant(c) then format_mir_constant(names, &c)
   end
 end
 
-def format_mir_constant(c: &MirConstant) -> String
+def format_mir_constant(names: &Map[Int, String], c: &MirConstant) -> String
   match c.kind
   when MirConstantKind::MirUnit then "()"
   when MirConstantKind::MirBool(b) then if b then "true" else "false" end
-  when MirConstantKind::MirInt(n) then n.to_string() + "_" + format_mir_type(&c.ty)
-  when MirConstantKind::MirFloat(f) then f.to_string() + "_" + format_mir_type(&c.ty)
+  when MirConstantKind::MirInt(n) then n.to_string() + "_" + format_mir_type(names, &c.ty)
+  when MirConstantKind::MirFloat(f) then f.to_string() + "_" + format_mir_type(names, &c.ty)
   when MirConstantKind::MirChar(ch) then "'" + ch.to_string() + "'"
   when MirConstantKind::MirString(s) then "\"" + s.clone() + "\""
   when MirConstantKind::MirFnItem(name) then name.clone()
@@ -10746,9 +10862,9 @@ def format_mir_constant(c: &MirConstant) -> String
   end
 end
 
-def format_rvalue(rv: &MirRvalue) -> String
+def format_rvalue(names: &Map[Int, String], rv: &MirRvalue) -> String
   match rv.kind
-  when MirRvalueKind::MirMove(op) then format_operand(&op)
+  when MirRvalueKind::MirMove(op) then format_operand(names, &op)
   when MirRvalueKind::MirRef(place) then "&" + format_place(&place)
   when MirRvalueKind::MirRefMut(place) then "&mut " + format_place(&place)
   when MirRvalueKind::MirAggregate(kind, ops) then
@@ -10763,7 +10879,7 @@ def format_rvalue(rv: &MirRvalue) -> String
     var first = true
     for o in ops do
       if !first then out = out + ", " end
-      out = out + format_operand(&o)
+      out = out + format_operand(names, &o)
       first = false
     end
     out = out + match kind
@@ -10775,17 +10891,17 @@ def format_rvalue(rv: &MirRvalue) -> String
     end
     out
   when MirRvalueKind::MirBinOp(op, lhs, rhs) then
-    format_operand(&lhs) + " " + format_binop(op) + " " + format_operand(&rhs)
+    format_operand(names, &lhs) + " " + format_binop(op) + " " + format_operand(names, &rhs)
   when MirRvalueKind::MirUnOp(op, operand) then
-    format_unop(op) + format_operand(&operand)
+    format_unop(op) + format_operand(names, &operand)
   when MirRvalueKind::MirDiscriminant(place) then
     "discriminant(" + format_place(&place) + ")"
   when MirRvalueKind::MirLen(place) then
     "len(" + format_place(&place) + ")"
   when MirRvalueKind::MirCast(kind, op, ty) then
-    format_operand(&op) + " as " + format_mir_type(&ty) + " (" + format_cast_kind(kind) + ")"
+    format_operand(names, &op) + " as " + format_mir_type(names, &ty) + " (" + format_cast_kind(kind) + ")"
   when MirRvalueKind::MirRepeat(op, count) then
-    "[" + format_operand(&op) + "; " + count.to_string() + "]"
+    "[" + format_operand(names, &op) + "; " + count.to_string() + "]"
   when MirRvalueKind::MirPhi(entries) then
     var out = "phi("
     var first = true
@@ -10840,7 +10956,12 @@ def format_cast_kind(kind: CastKind) -> String
   end
 end
 
-def format_mir_type(ty: &Type) -> String
+# P0-AP: the registered builtin compounds (Option/Result/Box/Rc/Map/Set/
+# Slice/Array/Vec) display like their canonical variants — the Named storage
+# form and the canonical form render IDENTICALLY. The name comes from the
+# program's type table (type id -> name, built from MirProgram.types / the
+# builder's typed_type_names); unknown ids keep the id-based rendering.
+def format_mir_type(names: &Map[Int, String], ty: &Type) -> String
   match ty
   when Type::Unit then "Unit"
   when Type::Bool then "Bool"
@@ -10863,27 +10984,27 @@ def format_mir_type(ty: &Type) -> String
   when Type::Error then "<error>"
   when Type::Var(v) then "_T" + v.id.to_string()
   when Type::Param(name) then name.clone()
-  when Type::Ptr(inner) then "*" + format_mir_type(inner)
-  when Type::PtrMut(inner) then "*mut " + format_mir_type(inner)
-  when Type::Box(inner) then "Box[" + format_mir_type(inner) + "]"
-  when Type::Rc(inner) then "Rc[" + format_mir_type(inner) + "]"
+  when Type::Ptr(inner) then "*" + format_mir_type(names, inner)
+  when Type::PtrMut(inner) then "*mut " + format_mir_type(names, inner)
+  when Type::Box(inner) then "Box[" + format_mir_type(names, inner) + "]"
+  when Type::Rc(inner) then "Rc[" + format_mir_type(names, inner) + "]"
   when Type::Dyn(id) then "dyn T" + id.id.to_string()
   when Type::Effect(effects, inner) then
-    "effect[" + effects.join(",") + "] " + format_mir_type(inner)
-  when Type::Option(inner) then "Option[" + format_mir_type(inner) + "]"
-  when Type::Result(ok, err) then "Result[" + format_mir_type(ok) + ", " + format_mir_type(err) + "]"
-  when Type::Map(k, v) then "Map[" + format_mir_type(k) + ", " + format_mir_type(v) + "]"
-  when Type::Set(inner) then "Set[" + format_mir_type(inner) + "]"
-  when Type::Slice(inner) then "[" + format_mir_type(inner) + "]"
-  when Type::Array(inner, n) then "[" + format_mir_type(inner) + "; " + n.to_string() + "]"
+    "effect[" + effects.join(",") + "] " + format_mir_type(names, inner)
+  when Type::Option(inner) then "Option[" + format_mir_type(names, inner) + "]"
+  when Type::Result(ok, err) then "Result[" + format_mir_type(names, ok) + ", " + format_mir_type(names, err) + "]"
+  when Type::Map(k, v) then "Map[" + format_mir_type(names, k) + ", " + format_mir_type(names, v) + "]"
+  when Type::Set(inner) then "Set[" + format_mir_type(names, inner) + "]"
+  when Type::Slice(inner) then "[" + format_mir_type(names, inner) + "]"
+  when Type::Array(inner, n) then "[" + format_mir_type(names, inner) + "; " + n.to_string() + "]"
   when Type::RefInternal(inner, mutable) then
-    if mutable then "&mut " + format_mir_type(inner) else "&" + format_mir_type(inner) end
+    if mutable then "&mut " + format_mir_type(names, inner) else "&" + format_mir_type(names, inner) end
   when Type::Tuple(elems) then
     var out = "("
     var first = true
     for e in elems do
       if !first then out = out + ", " end
-      out = out + format_mir_type(&e)
+      out = out + format_mir_type(names, &e)
       first = false
     end
     out + ")"
@@ -10892,23 +11013,48 @@ def format_mir_type(ty: &Type) -> String
     var first = true
     for p in params do
       if !first then out = out + ", " end
-      out = out + format_mir_type(&p.ty)
+      out = out + format_mir_type(names, &p.ty)
       first = false
     end
-    out + ") -> " + format_mir_type(ret)
+    out + ") -> " + format_mir_type(names, ret)
   when Type::Named(id, args) then
-    var out = "T" + id.id.to_string()
-    if !args.is_empty() then
-      out = out + "["
-      var first = true
-      for a in args do
-        if !first then out = out + ", " end
-        out = out + format_mir_type(&a)
-        first = false
-      end
-      out = out + "]"
+    let nname = match names.get(id.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
     end
-    out
+    if nname == "Option" && args.len() >= 1 then
+      "Option[" + format_mir_type(names, &args[0]) + "]"
+    elsif nname == "Result" && args.len() >= 2 then
+      "Result[" + format_mir_type(names, &args[0]) + ", " + format_mir_type(names, &args[1]) + "]"
+    elsif nname == "Box" && args.len() >= 1 then
+      "Box[" + format_mir_type(names, &args[0]) + "]"
+    elsif nname == "Rc" && args.len() >= 1 then
+      "Rc[" + format_mir_type(names, &args[0]) + "]"
+    elsif nname == "Map" && args.len() >= 2 then
+      "Map[" + format_mir_type(names, &args[0]) + ", " + format_mir_type(names, &args[1]) + "]"
+    elsif nname == "Set" && args.len() >= 1 then
+      "Set[" + format_mir_type(names, &args[0]) + "]"
+    elsif nname == "Slice" && args.len() >= 1 then
+      "[" + format_mir_type(names, &args[0]) + "]"
+    elsif (nname == "Array" || nname == "Vec") && args.len() >= 1 then
+      # The Adt form carries no count (the size-less convention): render
+      # like the canonical heap-vector form Array[T, 0] / the MIR Slice form
+      # of Vec.
+      "[" + format_mir_type(names, &args[0]) + "; 0]"
+    else
+      var out = "T" + id.id.to_string()
+      if !args.is_empty() then
+        out = out + "["
+        var first = true
+        for a in args do
+          if !first then out = out + ", " end
+          out = out + format_mir_type(names, &a)
+          first = false
+        end
+        out = out + "]"
+      end
+      out
+    end
   end
 end
 
@@ -15218,7 +15364,13 @@ end
 # Type-system helpers
 # ———————————————————————————————————————————————————————————————
 
-def verifier_type_key(ty: &Type) -> String
+# P0-AP: structural identity key for the verifier's type compatibility
+# checks. The Named storage forms of the registered builtin compounds key
+# IDENTICALLY to their canonical variants (the name comes from the program's
+# type table — MirTypeDef id -> name), so the verifier treats the Named and
+# canonical forms as the same type; user-defined Named types keep the
+# id-based key.
+def verifier_type_key(type_index: &Map[Int, MirTypeDef], ty: &Type) -> String
   match ty
   when Type::Unit then "unit"
   when Type::Bool then "bool"
@@ -15242,31 +15394,57 @@ def verifier_type_key(ty: &Type) -> String
   when Type::USize then "usize"
   when Type::F32 then "f32"
   when Type::F64 then "f64"
-  when Type::Named(tid, _) then "named:" + tid.id.to_string()
+  when Type::Named(tid, args) then
+    let nname = match type_index.get(tid.id)
+    when Option::Some(td) then mir_bare_type_name(&td.name)
+    when Option::None then ""
+    end
+    if nname == "Option" && args.len() >= 1 then
+      "option:" + verifier_type_key(type_index, &args[0])
+    elsif nname == "Result" && args.len() >= 2 then
+      "result:" + verifier_type_key(type_index, &args[0]) + ":" + verifier_type_key(type_index, &args[1])
+    elsif nname == "Box" && args.len() >= 1 then
+      "box:" + verifier_type_key(type_index, &args[0])
+    elsif nname == "Rc" && args.len() >= 1 then
+      "rc:" + verifier_type_key(type_index, &args[0])
+    elsif nname == "Map" && args.len() >= 2 then
+      "map:" + verifier_type_key(type_index, &args[0]) + ":" + verifier_type_key(type_index, &args[1])
+    elsif nname == "Set" && args.len() >= 1 then
+      "set:" + verifier_type_key(type_index, &args[0])
+    elsif nname == "Slice" && args.len() >= 1 then
+      "slice:" + verifier_type_key(type_index, &args[0])
+    elsif (nname == "Array" || nname == "Vec") && args.len() >= 1 then
+      # The Adt form carries no count (the size-less convention): key with
+      # count 0, mirroring the canonical Array arm and the identity-key
+      # convention.
+      "array(" + verifier_type_key(type_index, &args[0]) + ":0)"
+    else
+      "named:" + tid.id.to_string()
+    end
   when Type::Function(_, _) then "fn"
   when Type::RefInternal(inner, mutable) then
-    if mutable then "&mut " + verifier_type_key(&inner) else "&" + verifier_type_key(&inner) end
-  when Type::Ptr(inner) then "*" + verifier_type_key(&inner)
-  when Type::PtrMut(inner) then "*mut " + verifier_type_key(&inner)
-  when Type::Box(inner) then "box:" + verifier_type_key(&inner)
-  when Type::Rc(inner) then "rc:" + verifier_type_key(&inner)
+    if mutable then "&mut " + verifier_type_key(type_index, &inner) else "&" + verifier_type_key(type_index, &inner) end
+  when Type::Ptr(inner) then "*" + verifier_type_key(type_index, &inner)
+  when Type::PtrMut(inner) then "*mut " + verifier_type_key(type_index, &inner)
+  when Type::Box(inner) then "box:" + verifier_type_key(type_index, &inner)
+  when Type::Rc(inner) then "rc:" + verifier_type_key(type_index, &inner)
   when Type::Dyn(_) then "dyn"
-  when Type::Effect(_, inner) then verifier_type_key(&inner)
+  when Type::Effect(_, inner) then verifier_type_key(type_index, &inner)
   when Type::Tuple(fields) then
     var s = "tuple("
     var i = 0
     while i < fields.len() do
-      s = s + verifier_type_key(&fields[i])
+      s = s + verifier_type_key(type_index, &fields[i])
       if i < fields.len() - 1 then s = s + "," end
       i = i + 1
     end
     s + ")"
-  when Type::Array(elem, n) then "array(" + verifier_type_key(&elem) + ":" + n.to_string() + ")"
-  when Type::Slice(elem) then "slice:" + verifier_type_key(&elem)
-  when Type::Option(inner) then "option:" + verifier_type_key(&inner)
-  when Type::Result(a, b) then "result:" + verifier_type_key(&a) + ":" + verifier_type_key(&b)
-  when Type::Map(k, v) then "map:" + verifier_type_key(&k) + ":" + verifier_type_key(&v)
-  when Type::Set(e) then "set:" + verifier_type_key(&e)
+  when Type::Array(elem, n) then "array(" + verifier_type_key(type_index, &elem) + ":" + n.to_string() + ")"
+  when Type::Slice(elem) then "slice:" + verifier_type_key(type_index, &elem)
+  when Type::Option(inner) then "option:" + verifier_type_key(type_index, &inner)
+  when Type::Result(a, b) then "result:" + verifier_type_key(type_index, &a) + ":" + verifier_type_key(type_index, &b)
+  when Type::Map(k, v) then "map:" + verifier_type_key(type_index, &k) + ":" + verifier_type_key(type_index, &v)
+  when Type::Set(e) then "set:" + verifier_type_key(type_index, &e)
   when Type::Var(_) then "var"
   when Type::Param(n) then "param:" + n.clone()
   when Type::Error then "error"
@@ -15274,9 +15452,9 @@ def verifier_type_key(ty: &Type) -> String
   end
 end
 
-def verifier_types_compatible(expected: &Type, actual: &Type) -> Bool
-  let ek = verifier_type_key(expected)
-  let ak = verifier_type_key(actual)
+def verifier_types_compatible(type_index: &Map[Int, MirTypeDef], expected: &Type, actual: &Type) -> Bool
+  let ek = verifier_type_key(type_index, expected)
+  let ak = verifier_type_key(type_index, actual)
   if ek == ak then return true end
   # Unit/Never are interchangeable at value level.
   if (ek == "unit" && ak == "never") || (ek == "never" && ak == "unit") then return true end
@@ -15618,29 +15796,54 @@ end
 # on type names: Type::String's registered plan is Trivial (bitwise copies of
 # String occur in the compiler's own MIR and are permitted), while Box/Rc
 # and Named types whose plans run Call/UserFinalizer cleanup are owning.
-def verifier_type_owns(plans: &Map[Int, DeinitPlan], ty: &Type) -> Bool
+# P0-AP: the Named storage forms of the registered builtin compounds resolve
+# their ownership through the name table (type_index: MirTypeDef id -> name)
+# — a Named Box/Rc owns, a Named Option/Result/Map/Set/Slice/Array/Vec owns
+# exactly when its ARGUMENTS own — identically to the canonical variants;
+# user-defined Named types keep the plan-table ownership.
+def verifier_type_owns(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, MirTypeDef], ty: &Type) -> Bool
   match ty
-  when Type::Named(tid, _) then
-    match plans.get(tid.id)
-    when Option::Some(plan) then verifier_plan_contains_ownership(plan)
-    when Option::None then false
+  when Type::Named(tid, args) then
+    let nname = match type_index.get(tid.id)
+    when Option::Some(td) then mir_bare_type_name(&td.name)
+    when Option::None then ""
+    end
+    if nname == "Box" && args.len() >= 1 then
+      true
+    elsif nname == "Rc" && args.len() >= 1 then
+      true
+    elsif nname == "Option" && args.len() >= 1 then
+      verifier_type_owns(plans, type_index, &args[0])
+    elsif nname == "Result" && args.len() >= 2 then
+      verifier_type_owns(plans, type_index, &args[0]) || verifier_type_owns(plans, type_index, &args[1])
+    elsif nname == "Map" && args.len() >= 2 then
+      verifier_type_owns(plans, type_index, &args[0]) || verifier_type_owns(plans, type_index, &args[1])
+    elsif nname == "Set" && args.len() >= 1 then
+      verifier_type_owns(plans, type_index, &args[0])
+    elsif (nname == "Slice" || nname == "Array" || nname == "Vec") && args.len() >= 1 then
+      verifier_type_owns(plans, type_index, &args[0])
+    else
+      match plans.get(tid.id)
+      when Option::Some(plan) then verifier_plan_contains_ownership(plan)
+      when Option::None then false
+      end
     end
   when Type::Box(_) then true
   when Type::Rc(_) then true
-  when Type::Slice(inner) then verifier_type_owns(plans, &inner)
-  when Type::Array(inner, _) then verifier_type_owns(plans, &inner)
-  when Type::Map(k, v) then verifier_type_owns(plans, &k) || verifier_type_owns(plans, &v)
-  when Type::Set(elem) then verifier_type_owns(plans, &elem)
-  when Type::Option(inner) then verifier_type_owns(plans, &inner)
-  when Type::Result(a, b) then verifier_type_owns(plans, &a) || verifier_type_owns(plans, &b)
+  when Type::Slice(inner) then verifier_type_owns(plans, type_index, &inner)
+  when Type::Array(inner, _) then verifier_type_owns(plans, type_index, &inner)
+  when Type::Map(k, v) then verifier_type_owns(plans, type_index, &k) || verifier_type_owns(plans, type_index, &v)
+  when Type::Set(elem) then verifier_type_owns(plans, type_index, &elem)
+  when Type::Option(inner) then verifier_type_owns(plans, type_index, &inner)
+  when Type::Result(a, b) then verifier_type_owns(plans, type_index, &a) || verifier_type_owns(plans, type_index, &b)
   when Type::Tuple(fields) then
     var fi = 0
     while fi < fields.len() do
-      if verifier_type_owns(plans, &fields[fi]) then return true end
+      if verifier_type_owns(plans, type_index, &fields[fi]) then return true end
       fi = fi + 1
     end
     false
-  when Type::Effect(_, inner) then verifier_type_owns(plans, &inner)
+  when Type::Effect(_, inner) then verifier_type_owns(plans, type_index, &inner)
   when _ then false
   end
 end
@@ -15661,13 +15864,13 @@ end
 # This scope is the conservative approximation that keeps the verifier from
 # rejecting the compiler's own (valid) MIR while still flagging genuine
 # bitwise copies of owning values.
-def verifier_check_operand_ownership(plans: &Map[Int, DeinitPlan], func: &MirFunction, operand: &MirOperand, what: &String, ctx: &String, errors: &mut Vec[String]) -> Unit
+def verifier_check_operand_ownership(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, what: &String, ctx: &String, errors: &mut Vec[String]) -> Unit
   match operand.kind
   when MirOperandKind::MirCopy(place) then
     match verifier_place_result_type_opt(func, &place)
     when Option::Some(pty) then
-      if verifier_type_owns(plans, &pty) then
-        errors.push(ctx.clone() + ": MirCopy of owning type " + verifier_type_key(&pty) + " used as " + what.clone() + " (owning values must be moved, consumed, or passed by place, never bitwise-copied)")
+      if verifier_type_owns(plans, type_index, &pty) then
+        errors.push(ctx.clone() + ": MirCopy of owning type " + verifier_type_key(type_index, &pty) + " used as " + what.clone() + " (owning values must be moved, consumed, or passed by place, never bitwise-copied)")
       end
     when Option::None then ()
     end
@@ -15952,8 +16155,8 @@ def verifier_rvalue_type(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, Mir
     verifier_check_ref_operand(func, &operand_place(&rhs), "binary op operand", ctx, errors)
     # P0-AN: value computation must never bitwise-copy an owning value.
     let binop_what = "binary op operand"
-    verifier_check_operand_ownership(plans, func, &lhs, &binop_what, ctx, errors)
-    verifier_check_operand_ownership(plans, func, &rhs, &binop_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &lhs, &binop_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &rhs, &binop_what, ctx, errors)
     match lty
     when Option::Some(t) then Option::Some(t)
     when Option::None then Option::None
@@ -15963,7 +16166,7 @@ def verifier_rvalue_type(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, Mir
     verifier_check_ref_operand(func, &operand_place(&operand), "unary op operand", ctx, errors)
     # P0-AN: value computation must never bitwise-copy an owning value.
     let unop_what = "unary op operand"
-    verifier_check_operand_ownership(plans, func, &operand, &unop_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &operand, &unop_what, ctx, errors)
   when MirRvalueKind::MirDiscriminant(place) then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     Option::Some(Type::Int)
@@ -15975,14 +16178,14 @@ def verifier_rvalue_type(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, Mir
     verifier_check_ref_operand(func, &operand_place(&operand), "cast operand", ctx, errors)
     # P0-AN: value computation must never bitwise-copy an owning value.
     let cast_what = "cast operand"
-    verifier_check_operand_ownership(plans, func, &operand, &cast_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &operand, &cast_what, ctx, errors)
     Option::Some(ty)
   when MirRvalueKind::MirRepeat(operand, _) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&operand), "repeat operand", ctx, errors)
     # P0-AN: value computation must never bitwise-copy an owning value.
     let repeat_what = "repeat operand"
-    verifier_check_operand_ownership(plans, func, &operand, &repeat_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &operand, &repeat_what, ctx, errors)
     Option::None
   when MirRvalueKind::MirPhi(entries) then
     var ei = 0
@@ -16005,8 +16208,8 @@ def verifier_rvalue_type(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, Mir
         when Option::Some(ity) then
           match phi_ty
           when Option::Some(pt) then
-            if !verifier_types_compatible(&pt, &ity) then
-              errors.push(ctx.clone() + ": phi incoming value type mismatch: " + verifier_type_key(&pt) + " vs " + verifier_type_key(&ity))
+            if !verifier_types_compatible(type_index, &pt, &ity) then
+              errors.push(ctx.clone() + ": phi incoming value type mismatch: " + verifier_type_key(type_index, &pt) + " vs " + verifier_type_key(type_index, &ity))
             end
           when Option::None then phi_ty = Option::Some(ity)
           end
@@ -16052,8 +16255,8 @@ def verifier_aggregate_result_type(type_index: &Map[Int, MirTypeDef], func: &Mir
       when MirOperandKind::MirConstant(cst) then
         match verifier_constant_type(&cst)
         when Option::Some(ct) then
-          if !verifier_types_compatible(&elem_ty, &ct) then
-            errors.push(ctx.clone() + ": aggregate element type mismatch: expected " + verifier_type_key(&elem_ty) + " got " + verifier_type_key(&ct))
+          if !verifier_types_compatible(type_index, &elem_ty, &ct) then
+            errors.push(ctx.clone() + ": aggregate element type mismatch: expected " + verifier_type_key(type_index, &elem_ty) + " got " + verifier_type_key(type_index, &ct))
           end
         when Option::None then ()
         end
@@ -16096,8 +16299,8 @@ def verifier_aggregate_result_type(type_index: &Map[Int, MirTypeDef], func: &Mir
           when Option::Some(dty) then
             match verifier_operand_static_type(func, &operands[fi])
             when Option::Some(oty) then
-              if !verifier_types_compatible(&dty, &oty) then
-                errors.push(ctx.clone() + ": struct aggregate field '" + fname + "' type mismatch: expected " + verifier_type_key(&dty) + " got " + verifier_type_key(&oty))
+              if !verifier_types_compatible(type_index, &dty, &oty) then
+                errors.push(ctx.clone() + ": struct aggregate field '" + fname + "' type mismatch: expected " + verifier_type_key(type_index, &dty) + " got " + verifier_type_key(type_index, &oty))
               end
             when Option::None then ()
             end
@@ -16145,7 +16348,7 @@ def verifier_check_call(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, MirT
       match args[ai].value
       when MirCallValue::Value(op) then
         let arg_what = "call arg " + ai.to_string()
-        verifier_check_operand_ownership(plans, func, &op, &arg_what, ctx, errors)
+        verifier_check_operand_ownership(plans, type_index, func, &op, &arg_what, ctx, errors)
       when MirCallValue::Place(_) then ()
       end
     when _ then ()
@@ -16171,16 +16374,16 @@ def verifier_check_call(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, MirT
             end
           when MirCallValue::Value(_) then ()
           end
-          if !verifier_types_compatible(&expected_ty, &arg_types[i]) then
-            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(&expected_ty) + " got " + verifier_type_key(&arg_types[i]))
+          if !verifier_types_compatible(type_index, &expected_ty, &arg_types[i]) then
+            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(type_index, &expected_ty) + " got " + verifier_type_key(type_index, &arg_types[i]))
           end
         end
         i = i + 1
       end
       match verifier_local_type(func, dest.local.id)
       when Option::Some(dty) then
-        if !verifier_types_compatible(&ret_ty, &dty) then
-          errors.push(ctx.clone() + ": call dest type mismatch: expected " + verifier_type_key(&ret_ty) + " got " + verifier_type_key(&dty))
+        if !verifier_types_compatible(type_index, &ret_ty, &dty) then
+          errors.push(ctx.clone() + ": call dest type mismatch: expected " + verifier_type_key(type_index, &ret_ty) + " got " + verifier_type_key(type_index, &dty))
         end
       when Option::None then ()
       end
@@ -16188,7 +16391,7 @@ def verifier_check_call(plans: &Map[Int, DeinitPlan], type_index: &Map[Int, MirT
     when _ then
       # A concrete, resolved callee that is neither a function nor unit is a
       # non-callable callee — a verifier error, never silently accepted.
-      errors.push(ctx.clone() + ": call to non-callable callee of type " + verifier_type_key(&cty))
+      errors.push(ctx.clone() + ": call to non-callable callee of type " + verifier_type_key(type_index, &cty))
     end
   when Option::None then ()
   end
@@ -16207,7 +16410,7 @@ def verifier_check_terminator(plans: &Map[Int, DeinitPlan], type_index: &Map[Int
     let _ = verifier_check_operand(type_index, func, &op, running, &mut moved, ctx, errors)
     # P0-AN: switch discriminants are value computations — no owning copies.
     let switch_what = "switch discriminant"
-    verifier_check_operand_ownership(plans, func, &op, &switch_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &op, &switch_what, ctx, errors)
     var ti = 0
     while ti < targets.len() do
       if !verifier_block_exists(func, targets[ti].target.id) then
@@ -16246,7 +16449,7 @@ def verifier_check_terminator(plans: &Map[Int, DeinitPlan], type_index: &Map[Int
     let _ = verifier_check_operand(type_index, func, &cond, running, &mut moved, ctx, errors)
     # P0-AN: assert conditions are value computations — no owning copies.
     let assert_what = "assert condition"
-    verifier_check_operand_ownership(plans, func, &cond, &assert_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &cond, &assert_what, ctx, errors)
     if !verifier_block_exists(func, target.id) then
       errors.push(ctx.clone() + ": assert target references invalid block bb" + target.id.to_string())
     end
@@ -16261,7 +16464,7 @@ def verifier_check_terminator(plans: &Map[Int, DeinitPlan], type_index: &Map[Int
     let _ = verifier_check_operand(type_index, func, &op, running, &mut moved, ctx, errors)
     # P0-AN: yielded values are value computations — no owning copies.
     let yield_what = "yield value"
-    verifier_check_operand_ownership(plans, func, &op, &yield_what, ctx, errors)
+    verifier_check_operand_ownership(plans, type_index, func, &op, &yield_what, ctx, errors)
     if !verifier_block_exists(func, resume.id) then
       errors.push(ctx.clone() + ": yield resume references invalid block bb" + resume.id.to_string())
     end
@@ -16683,8 +16886,8 @@ def verifier_check_block_stmts(plans: &Map[Int, DeinitPlan], type_index: &Map[In
         let rv_ty = verifier_rvalue_type(plans, type_index, func, &rvalue, &running, &mut moved, ctx, errors)
         match rv_ty
         when Option::Some(t) then
-          if !verifier_types_compatible(&dst_ty, &t) then
-            errors.push(ctx.clone() + ": assign type mismatch: " + verifier_type_key(&t) + " into " + verifier_type_key(&dst_ty))
+          if !verifier_types_compatible(type_index, &dst_ty, &t) then
+            errors.push(ctx.clone() + ": assign type mismatch: " + verifier_type_key(type_index, &t) + " into " + verifier_type_key(type_index, &dst_ty))
           end
         when Option::None then ()
         end
