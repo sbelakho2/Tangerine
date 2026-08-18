@@ -107,7 +107,14 @@ public struct StdlibDependencyMap {
         var allReverseDeps: [String: Set<String>] = [:]
 
         for (name, program) in files {
-            let moduleName = String(name.dropLast(3)) // remove ".tg"
+            // Module-path-aware module identity: prefer the Program's
+            // file-derived module path (module_path_from_file mirror), so
+            // "std/alloc.tg" identifies as "std/alloc" rather than the
+            // basename "alloc"; falls back to the basename for callers that
+            // pass bare file names.
+            let moduleName = program.modulePath.isEmpty
+                ? String(name.dropLast(3))
+                : program.modulePath.joined(separator: "/")
 
             let imports = extractImports(from: program)
             let definedSymbols = extractDefinedSymbols(from: program)
@@ -126,9 +133,13 @@ public struct StdlibDependencyMap {
             }
 
             let category: FileCategory
-            if bootstrapCriticalModules.contains(moduleName) {
+            // Category sets are keyed by the module's basename identity (the
+            // seed's profile naming); the path-aware moduleName above is
+            // reported separately.
+            let categoryModuleName = program.modulePath.last ?? moduleName
+            if bootstrapCriticalModules.contains(categoryModuleName) {
                 category = .bootstrapCritical
-            } else if compilerSupportModules.contains(moduleName) {
+            } else if compilerSupportModules.contains(categoryModuleName) {
                 category = .compilerSupport
             } else {
                 category = .generalPurpose
@@ -193,18 +204,21 @@ public struct StdlibDependencyMap {
         }
     }
 
+    /// The (module, name) registration mirror: each defined symbol is
+    /// recorded under its module-qualified key ("path::name"; empty path →
+    /// bare name), the identity the Tangerine resolver registers.
     private static func extractDefinedSymbols(from program: Program) -> [String] {
         var symbols: [String] = []
         for item in program.items {
             switch item.kind {
-            case .function(let f):   symbols.append(f.sig.name)
-            case .structDef(let s):  symbols.append(s.name)
-            case .enumDef(let e):    symbols.append(e.name)
-            case .traitDef(let t):   symbols.append(t.name)
-            case .typeAlias(let t):  symbols.append(t.name)
-            case .constDecl(let c):  symbols.append(c.name)
-            case .staticDecl(let s): symbols.append(s.name)
-            case .macroDecl(let m):  symbols.append(m.name)
+            case .function(let f):   symbols.append(item.qualifiedKey(name: f.sig.name))
+            case .structDef(let s):  symbols.append(item.qualifiedKey(name: s.name))
+            case .enumDef(let e):    symbols.append(item.qualifiedKey(name: e.name))
+            case .traitDef(let t):   symbols.append(item.qualifiedKey(name: t.name))
+            case .typeAlias(let t):  symbols.append(item.qualifiedKey(name: t.name))
+            case .constDecl(let c):  symbols.append(item.qualifiedKey(name: c.name))
+            case .staticDecl(let s): symbols.append(item.qualifiedKey(name: s.name))
+            case .macroDecl(let m):  symbols.append(item.qualifiedKey(name: m.name))
             default: break
             }
         }

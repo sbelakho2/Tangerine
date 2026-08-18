@@ -41,10 +41,14 @@ public final class MIRLowering {
     /// Set of qualified function names whose `self` parameter is by-value (no &/&mut).
     private var methodSelfByValue: Set<String> = []
 
-    public init(moduleName: String? = nil) {
-        let initialPath = moduleName.map { [$0] } ?? []
-        self.rootModulePath = initialPath
-        self.modulePath = initialPath
+    /// Creates a lowering context for one module.
+    /// - Parameter modulePath: the owner module path (file-derived segments,
+    ///   mirror of module_path_from_file). nil/empty = the root module; the
+    ///   module-qualified identity for type/function names is the
+    ///   (module path, name) registration the Tangerine resolver uses.
+    public init(modulePath: [String]? = nil) {
+        self.rootModulePath = modulePath ?? []
+        self.modulePath = rootModulePath
     }
 
     /// Pre-load type definitions from other modules for cross-file enum resolution

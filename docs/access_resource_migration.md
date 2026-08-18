@@ -1,218 +1,165 @@
-# Access + Resource Model — Bootstrap Migration Plan
+# Access + Resource Model — Migration History
 
-Authoritative implementation plan for the Tangerine memory-model redesign.
-The compiler is self-hosting; the bootstrap chain (stage0 Swift interpreter →
-stage1 → stage2 → stage3, requiring stage2 == stage3 and clean-root
-determinism) must never break. Every change must keep the kernel parse-clean
-and type-clean at every commit.
+**Status:** historical — the migration described here is complete.
+**Normative model:** [`memory_model.md`](memory_model.md). This document
+is the archived record of the migration that produced it; it is not a
+living plan and nothing here should be read as a current design
+assumption. Where this document and `memory_model.md` disagree, the
+normative model wins.
 
-## Verification gate (mandatory for every change)
+**Last Updated:** August 2026.
+
+---
+
+## What this document records
+
+The redesign of the Tangerine memory model from the former
+borrow/lifetime model to the access/resource model: per-parameter access
+conventions (`let`/`inout`/`sink`/`set`), nominal kinds
+(value/resource/capability), the deletion of the borrow checker, and the
+typed access/resource checking pipeline that replaced it. All of it was
+carried out under the self-hosting bootstrap discipline (stage0 Swift
+interpreter → stage1 → stage2 → stage3, with the kernel parse-clean and
+type-clean at every commit).
+
+## Verification gate (historical)
+
+During the migration every change had to pass the parse gate and the type
+gate (see the archived commands below). These gates are no longer the
+migration discipline: the native pipeline (access_check →
+resource_check → MIR) now runs unconditionally, and the final ladder
+(stage0→stage1→stage2→stage3 with stage2 == stage3 and clean-root
+determinism) is the bootstrap release procedure, not a migration check.
 
 ```
-# Parse gate (fast, ~60-90s): kernel must parse 36/36 OK
+# Parse gate (historical): kernel must parse 36/36 OK
 timeout 110 ./stage0_swift/.build/release/tg_stage0 compile tg_compiler/<file>.tg -o /tmp/pt 2>&1 | grep -E "Parsed:|FAIL"
 
-# Type gate (~10-12 min): kernel must type-check clean.
-# Run in background, then poll. "Type check failed" = errors.
-# "Borrow checking..." printed = type check passed (do NOT wait for the
-# borrow check; it takes ~3 hours and is being deleted by this migration).
+# Type gate (historical): kernel must type-check clean.
 timeout 1500 ./stage0_swift/.build/release/tg_stage0 compile tg_compiler/driver.tg -o /tmp/verify_out > /tmp/verify.log 2>&1
 # then: grep -E "Type check failed|Borrow checking|error\[" /tmp/verify.log
+# (the "Borrow checking..." line no longer exists — that stage was deleted
+# by this migration)
 ```
 
-The machine has 18 cores; the interpreter is single-threaded. Parallel
-verification gates are fine. NEVER wait for the borrow check to complete.
+## Design (summary) — implemented
 
-## Design (summary)
+The two independent dimensions the migration introduced, both now
+implemented:
 
-Two independent dimensions:
 - **Access convention** per parameter/receiver: `let` (observe), `inout`
   (exclusive mutation), `sink` (transfer/consume), `set` (initialize dead
   storage). No safe first-class references: `&x` is syntax for an access
   marker on a place, never a reference value.
-- **Nominal kind**: `value` (default, copyable), `resource` (noncopyable,
+  → Normative: `memory_model.md` §2 (conventions), §3 (the access marker).
+- **Nominal kind**: `value` (default), `resource` (noncopyable,
   deterministic deinit at scope exit, viral through containment),
   `capability` (strict linear authority: exactly-once transfer, cannot be
   copied, fabricated, or silently abandoned).
+  → Normative: `memory_model.md` §4 (resources), §5 (capabilities),
+  §7 (TypeProperties).
 
-The borrow checker is DELETED; replaced by (a) an access-overlap checker
-(per-call access paths: read/inout/sink/set, reject overlapping incompatible
-accesses, static disjointness for fixed struct fields) and (b) a resource
-state checker (Uninitialized/Live/Consumed/MaybeLive dataflow over the CFG).
+The borrow checker was DELETED. It was replaced by (a) an access-overlap
+checker (per-call access paths: read/inout/sink/set, reject overlapping
+incompatible accesses, static disjointness for fixed struct fields) and
+(b) a resource state checker (Uninitialized/Live/Consumed/MaybeLive
+dataflow over the CFG).
+→ Normative: `memory_model.md` §2.2, §4.2.
 
-## Implementation order (waves)
+## Implementation order (waves) — status
 
-1. [P0 bugs] stable_ids init; struct-literal required-field completeness;
-   codegen O(1) type index; strict concrete layout API.
-2. [Additive structures] `AccessConvention` (ast.tg), `TypeKind`
-   (types.tg) — added WITHOUT changing any existing syntax or semantics.
-3. [Stage0 Swift syntax] `var`, `inout`, `sink`, `set`, `resource`,
-   `deinit` tokens; `Param.convention: AccessConvention`; parser accepts
-   both legacy (`&mut x`, `&T`, `move`) and new syntax, normalizing legacy
-   to the new internal representation. Stage0: Token.swift, Lexer.swift,
-   AST.swift, Parser.swift, ASTDumper.swift, ASTVerifier.swift,
-   MIR.swift, MIRLowering.swift, MIRInterpreter.swift, SubsetChecker,
-   StableIDs, CompilerCanary.
-4. [Native lexer/parser] same syntax in tg_compiler/token.tg, lexer.tg,
-   parser.tg; normalization `&mut T→inout T`, `&T→let T`, `move→sink`.
-5. [TypedProgram] `struct TypedProgram { ast, resolutions, expr_types:
-   Map[NodeId, Type], call_targets: Map[NodeId, DefId],
-   field_targets: Map[NodeId, FieldId], access_effects,
-   type_kinds }`; resolver+type checker produce it; MIR lowering consumes
-   it (no re-inference). DefId = (module, index) instead of String keys;
-   deterministic symbol interning.
-6. [Access checker] tg_compiler/access_check.tg: AccessPath
-   (root LocalId + projections), AccessEffect (Read/Modify/Consume/
-   Initialize), per-call overlap test, sink consumption marking.
-   Delete tg_compiler/borrow_check.tg; remove Phase 4 from driver.tg;
-   remove borrow_check.tg from bootstrap/compiler_kernel.manifest.
-7. [Resource checker] resource availability dataflow over CFG.
-8. [MIR] MirRead/MirConsume; MirCallArg{effect, value}; MirDeinit
-   (distinguish auto deinit / explicit consume / unsafe raw free);
-   remove MirRef/MirRefMut/MirDeref for safe places (ProjRawDeref only).
-9. [Collections] iteration becomes projected access (`for item in items`
-   = let projection, no clone; `for inout item in &items`; `for sink
-   item in items`); subscripts are projections; COW backing storage for
-   String/Array/Map/Set.
-10. [Core stdlib] rewrite std/core.tg: Copyable trait (`def copy -> Self`),
-    Eq with value params, deinit; String/Vec/Map inout APIs.
-11. [Compiler source migration] rewrite tg_compiler/*.tg to let/var/inout/
-    sink/set/resource syntax; allocators/FFI as resources; caps as linear
-    capabilities; async/thread/sync Transferable/Shareable.
-12. [Kernel shrink] compiler_core.tg + bootstrap_main.tg split; remove
-    docgen.tg/formatter.tg/linter.tg from the fixed-point manifest.
-13. [Strict] all bootstrap builds use strict semantics unconditionally
-    (unresolved name/type/method/access/layout = error).
-14. [Final] delete legacy borrow syntax from the parser; rewrite all docs;
-    full ladder: stage0→stage1→stage2→stage3 with stage2==stage3,
-    clean-root determinism, and the access/resource critical canary suite
-    under stage1 and stage2.
+| Wave | Content | Status | Where it landed |
+|------|---------|--------|-----------------|
+| 1 | P0 bugs: stable_ids init; struct-literal required-field completeness; codegen O(1) type index; strict concrete layout API | IMPLEMENTED | `ids.tg` StableDefId; `types.tg` `type_id_index`; `layout_engine.tg` `layout_of_concrete` (now called from `codegen.tg`) |
+| 2 | Additive structures: `AccessConvention` (ast.tg), `TypeKind` (types.tg) — added without changing existing syntax or semantics | IMPLEMENTED | `ast.tg` `AccessConvention`/`NominalKind`; `types.tg` `TypeKind` (Value/Resource/Capability) |
+| 3 | Stage0 Swift syntax: `var`, `inout`, `sink`, `set`, `resource`, `deinit` tokens; `Param.convention`; parser accepts both legacy and new syntax, normalizing legacy | IMPLEMENTED | `stage0_swift/Sources/TangerineCompiler/{Token,Parser,AST,MIRLowering,MIRInterpreter}.swift` |
+| 4 | Native lexer/parser: same syntax in `tg_compiler/`; normalization `&mut T→inout T`, `&T→let T`, `move→sink` | IMPLEMENTED | `token.tg` keyword table (`var`→`Mut` alias, `inout`/`sink`/`set`/`resource`/`deinit`); `parser.tg` `parse_param` |
+| 5 | TypedProgram: ast, resolutions, expr_types, call_targets, field_targets, access_effects, type_kinds; MIR consumes it (no re-inference); DefId = (module, index) | IMPLEMENTED | `types.tg` `TypedProgram`; `ids.tg` `DefId`/`ModuleId`; `mir.tg` MirBuilder (access_effects, field_targets, call_def_ids, call_instances, iteration_plans, edge_cleanup, ...) |
+| 6 | Access checker: AccessPath/AccessEffect per-call overlap; sink consumption marking. Delete `borrow_check.tg` | IMPLEMENTED | `access_check.tg`; `borrow_check.tg` deleted; driver/compiler_core run `access_check` unconditionally |
+| 7 | Resource checker: resource availability dataflow over the CFG | IMPLEMENTED | `resource_check.tg` (§4.2 of the normative model) |
+| 8 | MIR: MirRead/MirConsume; MirCallArg{effect, value}; MirDeinit (auto/explicit/unsafe-raw distinguished); ProjDeref removed for safe places | IMPLEMENTED | `mir.tg` (`MirRead`/`MirConsume` operands, `MirCallArg.effect`, `MirDeinit` terminators with verified deinit names; `ProjRawDeref` only) |
+| 9 | Collections: iteration becomes projected access; subscripts are projections; COW backing storage for String/Array/Map/Set | PARTIAL | Projected iteration IMPLEMENTED (`IterationPlan`, `memory_model.md` §10); consuming iteration and COW backing storage remain pending (see the audit table and `memory_model.md` §15) |
+| 10 | Core stdlib rewrite: Copyable trait replaced by the Copy/Clone/Move/Drop model; String/Vec/Map inout APIs | IMPLEMENTED | `std/core.tg` ownership-marker families (`memory_model.md` §6); `std/alloc.tg`, `std/collections.tg` convention-based APIs |
+| 11 | Compiler source migration: tg_compiler/*.tg to let/var/inout/sink/set/resource syntax; allocators/FFI as resources; caps as linear capabilities | IMPLEMENTED | the whole `tg_compiler/` tree |
+| 12 | Kernel shrink: `compiler_core.tg` + `bootstrap_main.tg` split; tooling out of the fixed-point manifest | IMPLEMENTED | `bootstrap/compiler_kernel.manifest`: `compiler: compiler_core.tg`; docgen/formatter/linter/driver/agentic/etc. excluded from the kernel |
+| 13 | Strict: bootstrap builds use strict semantics unconditionally | IMPLEMENTED | `type_check_typed` forces `strict_resolution` on every compilation path; permissive mode is editor-recovery only |
+| 14 | Final: delete legacy borrow syntax from the parser; rewrite all docs; full ladder | PARTIAL | Docs rewritten (this document + `memory_model.md`). Legacy parameter modifiers (`&T`/`&mut T`/`move`/`own`) are still normalized at parse (E106 is warning-level) — deletion is a pending target; the full stage0→stage3 ladder is the bootstrap release procedure, pending until the remaining open items below close |
 
-## Conventions
+## Exact specs (authoritative during migration) — implemented
 
-- Never remove the ability to parse the CURRENT syntax before the new
-  syntax is fully implemented and normalized. One semantic implementation:
-  legacy syntax is normalized into the new representation immediately after
-  parsing.
-- Every commit must leave the kernel parse-clean and type-clean (the two
-  gates above). If a change cannot pass, do not commit it; fix or revert.
-- No comments unless they explain a non-obvious semantic rule.
-- Determinism: no map-iteration-order dependence in any output.
+The grammar, AST v2, types.tg, TypedProgram, access_check.tg and MIR
+shapes specified in the original plan were implemented as specified,
+with the following final forms (all normative detail is in
+`memory_model.md`):
 
-## Exact specs (authoritative for all waves)
+- `AccessConvention { Let, Inout, Sink, Set }` — `ast.tg`; `ParamType`
+  carries conventions into function types (`memory_model.md` §2, §9).
+- `NominalKind { Value, Resource }` (`ast.tg`); `TypeKind { Value,
+  Resource, Capability }` (`types.tg`); `TypeExprKind` has no Ref/RefMut —
+  only `Ptr`/`PtrMut`; `ExprKind` has `ExprAccess` (the `&place` marker)
+  and unsafe `ExprRawDeref`; patterns have no Ref/RefMut
+  (`memory_model.md` §3, §11).
+- `TypedProgram` with `access_effects`/`type_kinds`/`field_targets`/
+  `call_targets`/`expr_types`; `DefId { module: ModuleId, index }`
+  (`memory_model.md` §2.1, §8).
+- `AccessEffect { Read, Modify, Consume, Initialize }`; multiple Reads
+  coexist; Modify/Consume/Initialize are exclusive; fixed struct fields
+  statically disjoint; dynamic index overlap conservatively rejected;
+  raw derefs are UnknownAlias (`memory_model.md` §2.2, §11).
+- MIR: `MirCallArg { effect, value }`; `MirRead`/`MirConsume` replace the
+  old copy/move/ref forms; `MirDrop → MirDeinit` (auto/explicit/unsafe-raw
+  distinguished); `ProjDeref` removed for safe places (`ProjRawDeref`
+  only, unsafe) (`memory_model.md` §14.3).
 
-### New grammar (native + stage0 must converge)
+## Audit results (post-wave-12) — status as of August 2026
 
-Keywords added: `var`, `inout`, `sink`, `set`, `resource`, `deinit`.
-`var` is the canonical mutable-binding keyword (existing `mut`/`let mut` remain migration aliases, normalized to `var`).
+The 2026-08-15 audit found the transition structurally sound through wave
+12 and listed the key latent items. Their status now:
 
-```
-param        = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ]
-             | legacy: [ 'mut' | '&' | '&mut' | 'move' | 'own' ] IDENT [ ':' type_expr ]
-resource_def = [ 'pub' ] 'resource' IDENT [ type_params ] { field_def | function_def } 'end'
-method_head  = def NAME ... 'inout'            # receiver convention after '-> ret' or params
-```
-Legacy normalization (immediately after parsing, one semantic implementation):
-`&mut T` → `inout T`; `&T` / `&self` → `let T`; `move T` → `sink T`;
-`own T` → `sink T`; `mut x`/`let mut x` → `var x`.
+| # | Audit finding (2026-08-15) | Status now |
+|---|----------------------------|------------|
+| 1 | TypedProgram produced but not consumed by MIR | **RESOLVED** — MirBuilder consumes access_effects, field_targets, call_def_ids, call_instances, ident_resolutions, typed_local_bindings, pattern/param_binding_resolutions, expr_types, closure_captures, resource_kinds, iteration_plans, edge_cleanup |
+| 2 | MirRead/MirConsume/MirDeinit never emitted; codegen drops arg_effects | **RESOLVED** — MirRead/MirConsume are the operand forms; MirDeinit terminators are emitted with verified deinit names; MirCallArg carries the typed effect (`memory_model.md` §4.3, §14.3) |
+| 3 | Expression-level `&` still parsed to ExprRef→MirRef; `let r = &x` not rejected | **RESOLVED** — `&`/`&mut` parse to `ExprAccess`; TypeExprKind Ref/RefMut are gone; E106 flags first-class `&T` type positions (`memory_model.md` §2.3, §3) |
+| 4 | Resource auto-deinit not wired | **RESOLVED** — deinit targets/plans registered; finalize plans + edge plans drive MirDeinit emission (`memory_model.md` §4.2–4.3) |
+| 5 | trait_resolve method identity convention-blind (Type only) | **SUPERSEDED** — the second trait engine was deleted and trait_resolve.tg is a facade over the one solver; signatures carry `ParamType` conventions (`memory_model.md` §8.5) |
+| 6 | Type::Ref/RefMut/Owned + Lifetime deletion pending; collections get→&T pending; COW pending | **PARTIAL** — Type::Ref/RefMut/Owned and Lifetime are gone (`RefInternal` remains, documented MIR-only); reference-returning API removal is a pending target (E106 is warning-level); COW remains pending |
+| 7 | Resolver declaration pass duplication | **ARCHIVED** — no longer a memory-model issue; see `resolver.tg` |
+| 8 | TypeEnv lookups return TypeDef by value | **ARCHIVED** — superseded by the identity refactor (`memory_model.md` §8) |
+| 9 | layout_of_concrete has no callers | **RESOLVED** — called from `codegen.tg` |
+| 10 | No access/resource canary suite yet | **RESOLVED** — `tests/canary` / `tests/canary_neg` cover access/resource negatives (resource index, map get, let-param consume, ...) |
+| 11 | compiler_core.tg split pending; tooling back in the manifest | **RESOLVED** — `compiler: compiler_core.tg` in `bootstrap/compiler_kernel.manifest`; docgen/formatter/linter/driver/pkg_manager/refactor/registry/agentic/etc. are outside the kernel |
+| 12 | Strictness flag-driven, not the default | **RESOLVED** — every compilation path forces `strict_resolution`; the permissive mode is editor-recovery only |
+| 13 | Docs rewrite pending | **RESOLVED** — this document is historical; `memory_model.md` is normative |
+| 14 | Closure capture-effect inference not started | **RESOLVED** — typed capture records (`closure_captures`: closure expr node → captured local id → effect) are the only capture source for MIR |
+| 15 | Final ladder pending until all of the above are complete | **OPEN** — the full stage0→stage1→stage2→stage3 ladder with stage2 == stage3 and clean-root determinism is the bootstrap release procedure; it stays open until the pending items below close |
 
-### AST v2 (tg_compiler/ast.tg)
+## Pending items (current, not assumptions)
 
-```
-enum AccessConvention { Let, Inout, Sink, Set }
-struct Param { name, convention: AccessConvention, modifier: ParamModifier /*transitional*/, ty, ... }
-enum NominalKind { Value, Resource }
-TypeExprKind: delete Ref, RefMut; keep Ptr/PtrMut (later renamed RawPtr/RawMutPtr).
-ExprKind: delete ExprRef, ExprRefMut, ExprMove, ExprCopy, ExprDeref;
-         add ExprAccess(Box[Expr]) /* &place access marker */; unsafe ExprRawDeref(Box[Expr]).
-Pattern: delete Ref, RefMut.
-```
-Transitional rule: legacy `&expr` parses to ExprAccess; `&`/`&mut`/`move`/`own` parameter
-modifiers normalize to conventions above; ParamModifier is retained during migration and
-deleted only after all semantic layers consume AccessConvention.
+The following remain open. They are documented as targets in
+`memory_model.md` §15 (the invariant catalog); nothing in this document
+should be taken as their specification beyond what that section says:
 
-### types.tg
+- **Partial moves** — projected-place consumes/moves/assigns are
+  rejected until per-place partial-move state exists.
+- **Consuming iteration** — sink-element iteration with per-iteration
+  (backedge) cleanup.
+- **Typed-HIR migration** — finalizer recognition is name-based
+  (`deinit`/`drop`) pending a typed `FinalizerKind`; `ParamModifier` is
+  transitional; the reference-returning APIs (which keep E106
+  warning-level) are pending removal.
+- **Fixed-array size constants** — `[T; N]` counts must be Int literals;
+  constant-expression sizes pending.
+- **StrView** — the String/StrView distinction is a target; `String` is
+  the single builtin string type today.
+- **LangItems for the name-selected pointers** — UniquePtr/WeakRc/
+  ArcStrong/WeakArc are still name-selected.
+- **CleanupEdge unification** — the edge_cleanup map + finalize-plan
+  string keys coexist pending a single `CleanupEdge` per real CFG edge.
+- **Legacy borrow syntax deletion** — `&T`/`&mut T`/`move`/`own`
+  parameter modifiers are still normalized at parse; E106 is still
+  warning-level.
+- **COW backing storage** for String/Array/Map/Set (wave 9 remainder).
 
-```
-enum TypeKind { Value, Resource, Capability }
-struct TypeDef { ..., kind: TypeKind }           # default Value; CapabilityDecl -> Capability
-struct ParamType { ty: Type, convention: AccessConvention }
-Function(Vec[ParamType], Type)                   # function types carry per-param conventions
-```
-Deferred deletions (after semantic layers are migrated): Type::Ref/RefMut/Owned, Lifetime,
-lifetime_* helpers, TypeEnv.lifetime_counter/current_lifetime.
-
-### TypedProgram (resolver + type checker produce; MIR consumes)
-
-```
-struct TypedProgram {
-  ast: Program
-  resolutions: ResolvedNames
-  expr_types: Map[NodeId, Type]
-  call_targets: Map[NodeId, DefId]
-  field_targets: Map[NodeId, FieldId]
-  access_effects: Map[NodeId, AccessEffect]
-  type_kinds: Map[TypeId, TypeKind]
-}
-struct DefId { module: ModuleId, index: UInt }
-```
-
-### access_check.tg (replaces borrow_check.tg)
-
-```
-enum AccessEffect { Read, Modify, Consume, Initialize }
-struct AccessPath { root: LocalId, projections: Vec[AccessProjection] }
-struct ActiveAccess { path: AccessPath, effect: AccessEffect }
-```
-Rules: multiple Reads coexist; Modify/Consume/Initialize are exclusive; fixed struct fields
-statically disjoint; dynamic index overlap conservatively rejected. Sink sources marked
-consumed. Resource dataflow: Uninitialized/Live/Consumed/MaybeLive over CFG; auto deinit at
-scope exit; branch merge inconsistency rejected; loop-created resources must be consumed per
-iteration.
-
-### MIR
-
-MirCallArg { effect: AccessEffect, value: MirCallValue }; MirCallValue = Value(MirOperand) | Place(Place).
-MirRead(Place)/MirConsume(Place) replace MirCopy/MirMovePlace and MirRef/MirRefMut;
-no general MirRef value; MirDrop → MirDeinit (auto/explicit/unsafe-raw distinguished);
-ProjDeref removed for safe places (ProjRawDeref only, unsafe).
-
-## Audit results (post-wave-12)
-
-Audit date: 2026-08-15.
-
-The transition is structurally sound through wave 12: the driver pipeline now
-runs lex → parse → expand → assign_node_ids → resolve → type_check_typed →
-access_check → resource_check → MIR → verify → monomorphize → optimize →
-codegen, and one critical item was fixed by this audit — the pipeline manifest
-closure (all borrow-check references replaced with the access/resource stages;
-docs/pipeline_manifest.md, docs/invariants.md, docs/canonical_ir_spec.md,
-tools/type_check_gate.tg). The key latent items below remain, in priority order:
-
-1. TypedProgram is produced but not consumed by MIR (call_targets/
-   field_targets/access_effects/type_kinds empty; DefId never constructed) —
-   the central architecture flip.
-2. MirRead/MirConsume/MirDeinit are never emitted by lowering; codegen drops
-   arg_effects; MirCallArg{effect,value} not implemented.
-3. Expression-level `&` still parses to ExprRef→MirRef (spec: ExprAccess) —
-   references survive end-to-end; `let r = &x` not rejected.
-4. Resource auto-deinit not wired (MirDeinit never emitted; deinit is only a
-   user method).
-5. trait_resolve method identity is convention-blind (Type only).
-6. Type::Ref/RefMut/Owned + Lifetime deletion pending; collections
-   get→&T/ArrayIterator pending; COW pending.
-7. Resolver declaration pass duplication (point 23).
-8. TypeEnv lookups return TypeDef by value (point 26).
-9. layout_of_concrete has no callers; permissive fallbacks still live in
-   codegen's path (point 25 partial).
-10. No access/resource canary suite yet (point 32).
-11. compiler_core.tg split pending; DRIVER_SRC still driver.tg
-    (transitional); tooling temporarily back in the manifest.
-12. Strictness is flag-driven, not the default compilation semantics
-    (point 29 partial).
-13. Docs rewrite (grammar/memory model/language) pending — this doc remains
-    the reference until then.
-14. Closure capture-effect inference (point 19) not started.
-15. Final ladder: stage0→stage1→stage2→stage3, stage2==stage3, clean-root
-    determinism, canary suite — pending until all of the above are complete
-    (per the migration rule: no bootstrap runs until the migration is done).
+The authoritative pending list is `memory_model.md` §15.2; it is updated
+when the compiler changes, this document is not.

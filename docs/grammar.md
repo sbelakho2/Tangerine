@@ -53,7 +53,7 @@ next   struct enum   trait  impl   module mod    use    as     pub
 private macro  where  true   false  nil    self   fn     Self   super
 crate  move   copy   drop   own    ref    inout  sink   set    resource
 deinit pre    post   invariant cap   unsafe rationale budget edition
-requires ensures effect pure   async  await  yield  defer  try    catch
+requires ensures effect pure   async  await  defer  try    catch
 finally guard  handle with   is     implies comptime const  static type
 typealias alias  extern inline
 ```
@@ -561,7 +561,7 @@ primary        = INT_LITERAL
                | for_expr | while_expr | until_expr | loop_expr
                | try_expr | guard_stmt | handle_with_expr
                | unsafe_block | defer_block | async_block | comptime_block
-               | return_expr | break_expr | yield_expr
+               | return_expr | break_expr
 
 struct_literal = IDENT '{' field_init_list '}'          // Name { f: v }
                | path '{' field_init_list '}'           // a::B { f: v }
@@ -626,7 +626,6 @@ comptime_block = 'comptime' block 'end'
 
 return_expr    = 'return' [ expr ]
 break_expr     = 'break' [ expr ]
-yield_expr     = 'yield' [ expr ]
 ```
 
 ### 4.7 Closures

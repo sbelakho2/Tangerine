@@ -14,7 +14,7 @@ use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
                         Pattern, PatternKind, TypeExpr, TypeExprKind, UseDecl, ModuleDecl, Visibility, AstPath,
                         Param, TraitMethod, GenericParam, Function, ExternItem}
 use tg_compiler::token::{Span}
-use tg_compiler::ids::{DefId, DefKind, FieldId, StableDefId}
+use tg_compiler::ids::{DefId, DefKind, FieldId, StableDefId, TypeId, ModuleId, VariantId}
 
 # ———————————————————————————————————————————————————————————————
 # Resolution Errors
@@ -36,6 +36,7 @@ enum ResolutionErrorKind
   CyclicImport
   AmbiguousName
   StableIdCollision
+  Unsupported
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -49,15 +50,38 @@ struct SymbolTable
   # Current path for resolution
   current_module: Vec[String]
 
+  # P0-A (per-module identity — registration authority): one ModuleSymbols
+  # per module, keyed by the module path join (the owner Module's path
+  # from Program.crate — the Crate merge_imported_deps builds — plus inline
+  # module segments). The FIRST-WINS REGISTRATION DECISION for every item
+  # consults THIS table — the (owner ModuleId, namespace, name) duplicate
+  # test — never the root bare-name occupancy, so a second same-named
+  # declaration in a DIFFERENT file module registers its own qualified entry
+  # instead of failing the root occupancy test. Each table owns its symbol
+  # indices; the DefIds built from them are the identity (module_symbols,
+  # item_defs, method_defs all carry the same per-module index). The
+  # bare-name tables (root tree) remain as the transition for the
+  # name-based consumers.
+  module_tables: Map[String, ModuleSymbols]
+
+  # P0-AM (DefKind metadata): DefId no longer carries a kind (ids.tg — the
+  # kind is definition METADATA, not identity). This map renders each
+  # registered DefId as "<module_id>::<index>" -> DefKind, so the kind of
+  # every resolver-produced DefId (module_symbols entries, item_defs,
+  # method_defs, call targets) stays recoverable — the resolver-side
+  # metadata map the ids.tg migration note points at (def_kind_of). The
+  # snapshot in ResolvedNames carries the same map for the type checker's
+  # module-qualified lookups.
+  def_kinds: Map[String, DefKind]
+
   # P0-A (structural foundation — module identity): module-qualified symbol
-  # keys "path::name" (path = the owner ModuleInfo path from Program.modules,
+  # keys "path::name" (path = the owner Module's path from Program.crate,
   # i.e. the module of the item being registered) -> DefId. Same-named items
   # in different modules are distinguishable here, unlike the bare-name
-  # first-wins tables above which stay as the compatibility fallback. This is
-  # the foundation the Crate { root: ModuleId, modules: Map[ModuleId,
-  # Module] } migration consumes for (ModuleId, name) -> DefId resolution;
-  # the entries are purely additive — nothing reads them yet, so the
-  # bootstrap's resolution behavior is unchanged.
+  # first-wins tables above which stay as the compatibility fallback. The
+  # entries are the qualified IDENTITY the per-module tables above register
+  # into; the type checker's module-qualified lookups and the resolver's own
+  # record_path_call_target consume them.
   module_symbols: Map[String, DefId]
 
   # Errors collected during resolution
@@ -69,6 +93,13 @@ end
 
 struct ModuleSymbols
   name: String
+
+  # P0-A (owner identity): the ModuleId.id of the FILE module this table
+  # belongs to (0 = root, from Program.crate; inline submodules inherit
+  # their enclosing file module's id). The per-module registration tables
+  # (SymbolTable.module_tables) carry it so the first-wins duplicate test is
+  # literally an (owner ModuleId, namespace, name) decision.
+  module_id: Int
 
   # Items defined in this module
   types: Map[String, TypeDefSymbol]
@@ -191,9 +222,16 @@ struct ResolvedNames
   # checker's record_module_type_name mirrors the DefKind::TypeName entries
   # into its own module_type_names map at type-registration time, and
   # lookup_module_symbol / module_path_of operate over the live symbol
-  # table. Purely additive: nothing reads it for resolution decisions
-  # before the type checker consumes the mirror.
+  # table. Purely additive: the snapshot never feeds resolution decisions —
+  # the per-module tables (SymbolTable.module_tables) hold the registration
+  # authority, and the qualified entries hold the identity.
   module_symbols: Map[String, DefId]
+
+  # P0-AM (DefKind metadata snapshot): the symbol table's def_kinds map —
+  # "module_id::index" -> DefKind for every resolver-produced DefId (the
+  # ids.tg migration note's resolver metadata map; DefId itself carries no
+  # kind). Consumers render kinds via def_kind_of, never from the DefId.
+  def_kinds: Map[String, DefKind]
 
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
@@ -346,8 +384,8 @@ enum ResolvedExprKind
   Parameter(String, Int)
   Function(DefId)  # the resolved function's DefId (module + symbol index)
   Method(DefId)    # DefId from method_defs ("Type::method" -> DefId)
-  Constant(String)
-  Static(String)
+  Constant(DefId)  # ID-based identity: the same DefId call_targets records
+  Static(DefId)    # ID-based identity: the same DefId call_targets records
   Variant(DefId, UInt)  # (owner DefId, variant index) — ID-based identity
   Field(FieldId)        # (owner TypeId, index)
 end
@@ -356,6 +394,10 @@ struct ResolvedType
   module_path: Vec[String]
   name: String
   is_builtin: Bool
+  # P0-A (transition): the resolved TypeId, filled by the type checker's
+  # LangItems batch; the path/name above stay for the checker's current
+  # name-based resolution until then.
+  type_id: Option[TypeId]
 end
 
 struct ResolvedPattern
@@ -364,8 +406,11 @@ end
 
 enum ResolvedPatternKind
   Variable(String)
-  Struct(String)
-  Enum(String, String)
+  Struct(TypeId)       # the owner struct's TypeId (checker-filled; resolver
+                       # records no TypeId-domain entry — it cannot fabricate
+                       # type-checker ids)
+  Variant(VariantId)   # ids.tg's VariantId { owner: TypeId, index: UInt } —
+                       # the TypeId-domain identity (checker-filled)
   Tuple(Vec[ResolvedPattern])
   Wildcard
 end
@@ -440,16 +485,23 @@ struct ResolutionContext
   # Config
   prelude_imports: Vec[String]
 
-  # P0-AM: the owner module path (from Program.modules, threaded by
+  # P0-AM: the owner module path (from Program.crate, threaded by
   # resolve_program's flat-item walk) of the item whose body is currently
   # being resolved. Free-function call-target DefIds use this path as their
   # module component so they render IDENTICALLY to the item's own item_defs
-  # DefId (record_item_def's owner-path DefId) — the MIR emission-name
+  # DefId (record_item_def's owner DefId) — the MIR emission-name
   # migration keys call-site names (fn_owner_key of the InstanceId) against
   # function names (fn_owner_key of item_defs), so the two must agree.
   current_owner_path: Vec[String]
 
-  # Dedicated counter for runtime intrinsic DefIds (module "__builtin")
+  # P0-AM: the OWNER MODULE of the item whose body is currently being
+  # resolved (the ModuleId from Program.crate, threaded by resolve_program
+  # alongside current_owner_path). Phase-3 call-target DefIds use this as
+  # their module component — the DefId's owner ModuleId, never a path
+  # String (ids.tg: DefId.module is a ModuleId).
+  current_owner_module: ModuleId
+
+  # Dedicated counter for runtime intrinsic DefIds (synthetic module -1)
   next_builtin_index: Int
 end
 
@@ -486,8 +538,10 @@ def resolve_names(program: &Program) -> Result[ResolvedNames, Vec[ResolutionErro
   # P0-A (next layer): snapshot the module-qualified symbol map
   # ("path::name" -> DefId) for the type checker, which mirrors the
   # TypeName entries into its own module_type_names at type-registration
-  # time (see record_module_type_name in types.tg).
+  # time (see record_module_type_name in types.tg), and the DefKind
+  # metadata map (DefId carries no kind — def_kind_of consults this).
   ctx.resolved.module_symbols = ctx.symbols.module_symbols.clone()
+  ctx.resolved.def_kinds = ctx.symbols.def_kinds.clone()
 
   if ctx.symbols.errors.is_empty() then
     Result::Ok(ctx.resolved)
@@ -508,27 +562,32 @@ def context_new() -> ResolutionContext
       method_defs: Map::new(),
       item_defs: Map::new(),
       module_symbols: Map::new(),
+      def_kinds: Map::new(),
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"],
     current_owner_path: Vec::new(),
+    current_owner_module: ModuleId { id: 0 },
     next_builtin_index: 0
   }
 end
 
 def symbol_table_new() -> SymbolTable
   SymbolTable {
-    root: module_symbols_new("".to_string()),
+    root: module_symbols_new("".to_string(), 0),
     current_module: Vec::new(),
+    module_tables: Map::new(),
     module_symbols: Map::new(),
+    def_kinds: Map::new(),
     errors: Vec::new(),
     import_graph: Map::new()
   }
 end
 
-def module_symbols_new(name: String) -> ModuleSymbols
+def module_symbols_new(name: String, module_id: Int) -> ModuleSymbols
   ModuleSymbols {
     name: name,
+    module_id: module_id,
     types: Map::new(),
     functions: Map::new(),
     constants: Map::new(),
@@ -546,6 +605,23 @@ def module_symbols_new(name: String) -> ModuleSymbols
   }
 end
 
+# P0-A (per-module registration): the per-module symbol table for a module
+# path — the owner Module's path from Program.crate (the module table
+# merge_imported_deps builds) joined by "::", plus any inline module
+# segments currently being processed. Every FIRST-WINS REGISTRATION
+# DECISION consults this table: the (owner ModuleId, namespace, name)
+# duplicate test. The table is created on first touch so every module gets
+# its own independent table — a second same-named declaration in a
+# DIFFERENT file module registers into ITS OWN table and its own qualified
+# entry instead of failing the root bare-name occupancy.
+def module_table_for(ctx: &mut ResolutionContext, qualified_path: &Vec[String], owner_module: ModuleId) -> &mut ModuleSymbols
+  let key = qualified_path.join("::")
+  if !ctx.symbols.module_tables.contains_key(&key) then
+    ctx.symbols.module_tables.insert(key.clone(), module_symbols_new(key.clone(), owner_module.id))
+  end
+  ctx.symbols.module_tables.get(&key).expect("per-module symbol table not found")
+end
+
 def assign_symbol_index(module: &mut ModuleSymbols, name: &String) -> Unit
   if !module.symbol_indices.contains_key(name) then
     module.symbol_indices.insert(name.clone(), module.next_symbol_index)
@@ -561,73 +637,83 @@ def assign_variant_index(module: &mut ModuleSymbols, name: &String) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# P0-AM: DefKind metadata (DefId carries no kind)
+# ———————————————————————————————————————————————————————————————
+
+# Render the metadata key of a DefId: "<module_id>::<index>". DefId
+# equality is (module, index); the DefKind is METADATA stored in the
+# resolver's def_kinds map (ids.tg: "the resolver's metadata map, consulted
+# by def_kind_of") — never a field of the DefId.
+def def_metadata_key(did: &DefId) -> String
+  did.module.id.to_string() + "::" + did.index.to_string()
+end
+
+# Record the kind of a resolver-produced DefId at its construction site so
+# every DefId's kind stays recoverable (module_symbols entries, item_defs,
+# method_defs, call targets).
+def record_def_kind(ctx: &mut ResolutionContext, did: &DefId, kind: DefKind) -> Unit
+  ctx.symbols.def_kinds.insert(def_metadata_key(did), kind)
+end
+
+# The kind of a resolver-produced DefId, from the DefKind metadata snapshot
+# (ResolvedNames.def_kinds). Consumers that need a DefId's kind — the type
+# checker's module-qualified lookups, the fn_owner_key rendering at the
+# mangling boundary — consult this; DefId itself carries no kind.
+def def_kind_of(res: &ResolvedNames, did: &DefId) -> Option[DefKind]
+  match res.def_kinds.get(def_metadata_key(did))
+  when Option::Some(k) then Option::Some(k)
+  when Option::None then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Phase 1: Build Symbol Table
 # ———————————————————————————————————————————————————————————————
 
 def build_resolver_symbol_table(ctx: &mut ResolutionContext, program: &Program) -> Unit
-  # P0-A (module context): program.modules partitions the flat items vector
-  # into contiguous [start, end) ranges, one per module, in flat order (built
-  # by merge_imported_deps in compiler_core.tg; ranges are kept valid through
-  # macro expansion/filtering). The pointer walk below resolves the owner
-  # ModuleInfo for every top-level item; add_item_to_symbols records each
-  # symbol under its module-qualified key "path::name" in addition to the
-  # bare-name first-wins tables, which stay untouched (purely additive).
-  var module_ptr = 0
+  # P0-AM (module context): program.crate.modules partitions the flat items
+  # vector into contiguous [start, end) ranges, one per module (built by
+  # merge_imported_deps in compiler_core.tg; ranges are kept valid through
+  # macro expansion/filtering). The walk below resolves the owner Module
+  # (path + ModuleId) for every top-level item; add_item_to_symbols records
+  # each symbol in its OWNER's per-module table (module_tables) and under its
+  # module-qualified key "path::name" in module_symbols; the bare-name
+  # first-wins tables stay as the transition for the name-based consumers.
   var item_idx = 0
   while item_idx < program.items.len() do
-    # Advance past module ranges already fully covered (empty modules have
-    # start == end and are skipped the same way; a missing/empty modules
-    # table falls back to the root path for every item).
-    var advanced = true
-    while advanced do
-      advanced = false
-      if module_ptr < program.modules.len() then
-        let info = program.modules[module_ptr]
-        if info.item_indices.len() >= 2 && item_idx >= info.item_indices[1] then
-          module_ptr = module_ptr + 1
-          advanced = true
-        end
-      end
-    end
-    var owner_path = Vec::new()
-    if module_ptr < program.modules.len() then
-      let info = program.modules[module_ptr]
-      for seg in info.path do
-        owner_path.push(seg.clone())
-      end
-    end
+    let (owner_path, owner_module) = module_path_of_item_resolver(program, item_idx)
     let item = program.items[item_idx]
-    add_item_to_symbols(ctx, &item, &owner_path)
-    record_item_def(ctx, &item, item_idx, &owner_path)
+    add_item_to_symbols(ctx, &item, &owner_path, owner_module)
+    record_item_def(ctx, &item, item_idx, &owner_path, owner_module)
     item_idx = item_idx + 1
   end
 end
 
 # Record the DefId of every item that owns symbols (functions, methods,
 # statics, constants) keyed by its index in the merged Program.items. The
-# DefId's module + per-module symbol index make the key unique across all
-# files merged into one compilation (see ResolvedNames.item_defs). P0-C: the
-# DefId's module is the item's FULL owner module path (the owner ModuleInfo
-# path from Program.modules, threaded by build_resolver_symbol_table) —
-# IDENTICAL to the module component of the same function's module_symbols
-# DefId (add_item_to_symbols's qualified_path), so the ownership-layer key
-# rendered from item_defs identifies the module-qualified function, not just
-# a per-module index.
-def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int, owner_path: &Vec[String]) -> Unit
+# DefId's module (the owner's ModuleId from Program.crate) + per-module
+# symbol index make the key unique across all files merged into one
+# compilation (see ResolvedNames.item_defs). P0-C: the DefId's module is
+# the item's OWNER ModuleId (threaded by build_resolver_symbol_table) and
+# the index comes from the OWNER's per-module table (module_tables) —
+# IDENTICAL to the module component and index of the same function's
+# module_symbols DefId (add_item_to_symbols's qualified entry), so the
+# ownership-layer key rendered from item_defs identifies the
+# module-qualified function, not just a per-module index. The DefKind is
+# recorded as metadata (def_kinds) — DefId carries no kind.
+def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int, owner_path: &Vec[String], owner_module: ModuleId) -> Unit
   match item.kind
   when ItemKind::ItemFunction(f) then
     # Free function: a single-element DefId vector (the value type is
     # Vec[DefId]; inserting a bare DefId would be a type error).
-    let module = get_current_module(&mut ctx.symbols)
-    let mod_name = owner_path.join("::")
+    let module = module_table_for(ctx, owner_path, owner_module)
     # P0-C: EVERY top-level function gets a DefId. The normal case is the
-    # name's registered symbol index; when the name is already in use
-    # (same-named function elsewhere in the merged program, or a
-    # cross-kind collision — the bare-name tables are first-wins), a fresh
-    # index is allocated from the module's counter. The index is
-    # metadata-only (never consulted by resolution, and the DefId never
-    # enters the bare-name tables), so first-wins semantics are untouched —
-    # but the OWNERSHIP layer needs the entry: the type checker, resource
+    # name's registered per-module symbol index; when the name is already in
+    # use within the SAME module (a same-module duplicate, or a cross-kind
+    # collision — the per-module tables are first-wins), a fresh index is
+    # allocated from the module's counter. The index is metadata-only (never
+    # consulted by resolution), so first-wins semantics are untouched — but
+    # the OWNERSHIP layer needs the entry: the type checker, resource
     # checker and MIR all key their owner-key derivations off item_defs,
     # and a missing entry would force their name/positional fallbacks to
     # diverge (MIR's positional fallback would miss the checker's
@@ -640,11 +726,12 @@ def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int, own
       fresh
     end
     var fn_defs = Vec::new()
-    fn_defs.push(DefId {
-      module: mod_name,
-      index: f_idx,
-      kind: DefKind::Function
-    })
+    let f_did = DefId {
+      module: owner_module,
+      index: f_idx
+    }
+    record_def_kind(ctx, &f_did, DefKind::Function)
+    fn_defs.push(f_did)
     ctx.resolved.item_defs.insert(item_idx, fn_defs)
   when ItemKind::ItemStruct(s) then
     # Collect ALL method DefIds into one vector, then insert once — inserting
@@ -700,34 +787,29 @@ def def_id_of_item(resolved: &ResolvedNames, item_idx: Int) -> Option[DefId]
   end
 end
 
-# P0-C: the resolver-side mirror of the type checker's module_path_of_item
-# (types.tg) — the owner module path of a flat item index, walked from
-# Program.modules (contiguous [start, end) ranges per module in flat order;
-# empty ranges are skipped; a missing/empty table falls back to the root
-# path). Returns the path and the advanced module pointer so callers thread
-# the walk across consecutive items exactly like build_resolver_symbol_table
-# does during symbol-table construction.
-def module_path_of_item_resolver(program: &Program, module_ptr: Int, item_idx: Int) -> (Vec[String], Int)
-  var mp = module_ptr
-  var advanced = true
-  while advanced do
-    advanced = false
-    if mp < program.modules.len() then
-      let info = program.modules[mp]
-      if info.item_indices.len() >= 2 && item_idx >= info.item_indices[1] then
-        mp = mp + 1
-        advanced = true
+# P0-AM (module graph consumption): the resolver-side mirror of the type
+# checker's module_path_of_item (types.tg) — the owner module identity of a
+# flat item index, looked up in Program.crate.modules (the Crate
+# merge_imported_deps builds: one Module per distinct module, each indexing
+# the contiguous [start, end) range of its items in Program.items; empty
+# ranges contain nothing; a missing module table falls back to the root
+# module, id 0, empty path). Returns the owner path and the owner ModuleId
+# — the (owner ModuleId, ...) component of the per-module duplicate test.
+# The Crate is a Map, so the walk is a containment scan, not a pointer
+# advance; the ranges are disjoint and cover every item exactly once.
+def module_path_of_item_resolver(program: &Program, item_idx: Int) -> (Vec[String], ModuleId)
+  for entry in program.crate.modules.entries() do
+    let mid = entry.0
+    let info = entry.1
+    if info.item_indices.len() >= 2 && item_idx >= info.item_indices[0] && item_idx < info.item_indices[1] then
+      var owner_path = Vec::new()
+      for seg in info.path do
+        owner_path.push(seg.clone())
       end
+      return (owner_path, mid)
     end
   end
-  var owner_path = Vec::new()
-  if mp < program.modules.len() then
-    let info = program.modules[mp]
-    for seg in info.path do
-      owner_path.push(seg.clone())
-    end
-  end
-  (owner_path, mp)
+  (Vec::new(), ModuleId { id: 0 })
 end
 
 def module_name_in_use(module: &ModuleSymbols, name: &String) -> Bool
@@ -741,7 +823,7 @@ def module_name_in_use(module: &ModuleSymbols, name: &String) -> Bool
 end
 
 # P0-A: the module-qualified symbol key "path::name" for SymbolTable
-# .module_symbols. The path comes from the owner ModuleInfo (Program.modules);
+# .module_symbols. The path comes from the owner Module (Program.crate);
 # root-module symbols (empty path) degenerate to the bare name, so the
 # qualified entries are exact supersets of the bare-name first-wins table.
 def module_qualified_key(qualified_path: &Vec[String], name: &String) -> String
@@ -755,7 +837,7 @@ end
 
 # P0-A (next layer): lookup a module-qualified symbol by its exact owner
 # path and bare name — the "path::name" key form module_symbols uses. The
-# path is the owner ModuleInfo path from Program.modules (plus any inline
+# path is the owner Module's path from Program.crate (plus any inline
 # module segments); the root module's empty path degenerates to the bare
 # name, matching module_qualified_key. Returns the DefId registered for
 # exactly this (path, name) pair, or None if no such symbol exists.
@@ -772,12 +854,19 @@ end
 # this for its function/const/static bare-name identity: the current
 # module's own qualified definition shadows other modules' same-named
 # definitions, and a bare name with >= 2 DISTINCT qualified definitions is
-# ambiguous (see resolve_bare_callable in types.tg).
+# ambiguous (see resolve_bare_callable in types.tg). P0-AM: the kind is
+# metadata (def_kinds — DefId carries no kind), and the first parameter is
+# the snapshot (ResolvedNames) or the live table (SymbolTable); both carry
+# module_symbols + def_kinds.
 def lookup_module_callable(symbols: &SymbolTable, path: &Vec[String], name: String, kind: DefKind) -> Option[DefId]
   let key = module_qualified_key(path, &name)
   match symbols.module_symbols.get(key)
   when Option::Some(did) then
-    if did.kind == kind then
+    let did_kind = match symbols.def_kinds.get(def_metadata_key(did))
+    when Option::Some(k) then k
+    when Option::None then DefKind::Other
+    end
+    if did_kind == kind then
       Option::Some(did)
     else
       Option::None
@@ -792,10 +881,12 @@ end
 # value is the given DefId and strip the trailing "::name" (rfind = last
 # separator, so paths containing "::" are handled). The root module's
 # bare key (no separator) yields an empty path. Returns an empty path if
-# the DefId was never registered in module_symbols.
+# the DefId was never registered in module_symbols. P0-AM: DefId equality
+# is (module, index) — module is a ModuleId (compared by id); the kind is
+# metadata and does not participate.
 def module_path_of(symbols: &SymbolTable, def_id: DefId) -> Vec[String]
   for (key, did) in symbols.module_symbols.entries() do
-    if did.module == def_id.module && did.index == def_id.index && did.kind == def_id.kind then
+    if did.module.id == def_id.module.id && did.index == def_id.index then
       match key.rfind("::")
       when Option::Some(pos) then
         return key.slice(0, pos).split("::")
@@ -807,19 +898,25 @@ def module_path_of(symbols: &SymbolTable, def_id: DefId) -> Vec[String]
   Vec::new()
 end
 
-def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &Vec[String]) -> Unit
-  # P0-A: the module-qualified path of this item's owner — the ModuleInfo
-  # path from Program.modules (file-level module identity) plus any inline
-  # module segments the resolver is currently inside. Each registered symbol
-  # is additionally recorded under "path::name" in symbols.module_symbols
-  # (flushed below, after the bare-name first-wins tables are updated), so
-  # same-named items in different modules are distinguishable.
+def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &Vec[String], owner_module: ModuleId) -> Unit
+# P0-A: the module-qualified path of this item's owner — the Module's
+  # path from Program.crate (file-level module identity) plus any inline
+  # module segments the resolver is currently inside. The FIRST-WINS
+  # REGISTRATION DECISION for the item consults the per-module table for
+  # this path (module_tables — the (owner ModuleId, namespace, name)
+  # duplicate test), NOT the root bare-name occupancy, so a second
+  # same-named declaration in a DIFFERENT file module registers its own
+  # qualified entry ("path::name" in symbols.module_symbols) instead of
+  # failing the root occupancy test first. The bare-name tables receive the
+  # symbol only when they are still free (their first-wins behavior for the
+  # name-based consumers is unchanged).
   var qualified_path = module_path.clone()
   for seg in ctx.symbols.current_module do
     qualified_path.push(seg.clone())
   end
   var qualified_regs = Vec::new()
   let module = get_current_module(&mut ctx.symbols)
+  let mtab = module_table_for(ctx, &qualified_path, owner_module)
 
   match item.kind
   when ItemKind::ItemFunction(f) then
@@ -834,17 +931,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       span: item.span.clone()
     }
 
-    if !module_name_in_use(module, &f.name) then
-      module.functions.insert(f.name.clone(), sym)
-      assign_symbol_index(module, &f.name)
-      match symbol_index_of(module, &f.name)
+    if !module_name_in_use(mtab, &f.name) then
+      mtab.functions.insert(f.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &f.name)
+      match symbol_index_of(mtab, &f.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &f.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::Function
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::Function)
+        qualified_regs.push((module_qualified_key(&qualified_path, &f.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &f.name) then
+        module.functions.insert(f.name.clone(), sym)
+        assign_symbol_index(module, &f.name)
       end
     end
 
@@ -857,17 +959,62 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       span: item.span.clone()
     }
 
-    if !module_name_in_use(module, &s.name) then
-      module.types.insert(s.name.clone(), sym)
-      assign_symbol_index(module, &s.name)
-      match symbol_index_of(module, &s.name)
+    if !module_name_in_use(mtab, &s.name) then
+      mtab.types.insert(s.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &s.name)
+      match symbol_index_of(mtab, &s.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::TypeName
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::TypeName)
+        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &s.name) then
+        module.types.insert(s.name.clone(), sym)
+        assign_symbol_index(module, &s.name)
+      end
+    end
+
+    # P0-A (item 2 audit — struct-defined methods): register every struct
+    # method under its "StructName::method" key with ONE DefId — the same
+    # id goes to method_defs, module_symbols, item_defs (record_item_def's
+    # ItemStruct arm re-reads method_defs) and the method metadata — so a
+    # struct-defined method never splits into two DefIds. Per-module
+    # first-wins; the bare-name tree mirrors the entry for the name-based
+    # consumers.
+    for m in s.methods do
+      let mkey = s.name.clone() + "::" + m.name.clone()
+      let msym = FunctionSymbol {
+        name: m.name.clone(),
+        params: extract_params(&m.params),
+        return_type: m.ret_type.clone(),
+        type_params: extract_type_params(&m.generic_params),
+        visibility: m.vis,
+        is_method: true,
+        receiver_type: Option::Some(s.name.clone()),
+        span: m.span.clone()
+      }
+      if !module_name_in_use(mtab, &mkey) then
+        mtab.functions.insert(mkey.clone(), msym.clone())
+        assign_symbol_index(mtab, &mkey)
+        match symbol_index_of(mtab, &mkey)
+        when Option::Some(midx) then
+          let mdid = DefId {
+            module: owner_module,
+            index: midx
+          }
+          record_def_kind(ctx, &mdid, DefKind::Method)
+          ctx.resolved.method_defs.insert(mkey.clone(), mdid.clone())
+          qualified_regs.push((module_qualified_key(&qualified_path, &mkey), mdid.clone()))
+        when Option::None then ()
+        end
+        if !module.functions.contains_key(&mkey) then
+          module.functions.insert(mkey.clone(), msym)
+          assign_symbol_index(module, &mkey)
+        end
       end
     end
 
@@ -880,33 +1027,46 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       span: item.span.clone()
     }
 
-    if !module_name_in_use(module, &e.name) then
-      module.types.insert(e.name.clone(), sym)
-      assign_symbol_index(module, &e.name)
-      match symbol_index_of(module, &e.name)
+    if !module_name_in_use(mtab, &e.name) then
+      mtab.types.insert(e.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &e.name)
+      match symbol_index_of(mtab, &e.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &e.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::TypeName
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::TypeName)
+        qualified_regs.push((module_qualified_key(&qualified_path, &e.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &e.name) then
+        module.types.insert(e.name.clone(), sym)
+        assign_symbol_index(module, &e.name)
       end
     end
     # Record every variant name so bare references (`Some`, `None`, `Zero`)
-    # in expression position resolve as enum variants.
+    # in expression position resolve as enum variants. The per-module
+    # variant table owns the decision and the variant index (the DefId
+    # identity); the bare-name tree mirrors first-wins for the name-based
+    # consumers.
     for v in e.variants do
-      if !module.variants.contains(&v.name) then
-        module.variants.insert(v.name.clone())
-        assign_variant_index(module, &v.name)
-        match variant_index_of(module, &v.name)
+      if !mtab.variants.contains(&v.name) then
+        mtab.variants.insert(v.name.clone())
+        assign_variant_index(mtab, &v.name)
+        match variant_index_of(mtab, &v.name)
         when Option::Some(vidx) then
-          qualified_regs.push((module_qualified_key(&qualified_path, &v.name), DefId {
-            module: qualified_path.join("::"),
-            index: vidx,
-            kind: DefKind::EnumVariant
-          }))
+          let vdid = DefId {
+            module: owner_module,
+            index: vidx
+          }
+          record_def_kind(ctx, &vdid, DefKind::EnumVariant)
+          qualified_regs.push((module_qualified_key(&qualified_path, &v.name), vdid))
         when Option::None then ()
+        end
+        if !module.variants.contains(&v.name) then
+          module.variants.insert(v.name.clone())
+          assign_variant_index(module, &v.name)
         end
       end
     end
@@ -921,9 +1081,13 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       span: item.span.clone()
     }
 
-    if !module_name_in_use(module, &t.name) then
-      module.traits.insert(t.name.clone(), sym)
-      assign_symbol_index(module, &t.name)
+    if !module_name_in_use(mtab, &t.name) then
+      mtab.traits.insert(t.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &t.name)
+      if !module_name_in_use(module, &t.name) then
+        module.traits.insert(t.name.clone(), sym)
+        assign_symbol_index(module, &t.name)
+      end
     end
     # P0-A: traits get no module-qualified entry yet — DefKind (ids.tg) has
     # no Trait variant; their qualified keys arrive with the Crate migration
@@ -942,24 +1106,34 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
         receiver_type: Option::Some(type_expr_to_string(&impl_block.for_type)),
         span: f.span.clone()
       }
-      # Store with qualified name: Type::method (first definition wins)
+      # Store with qualified name: Type::method (first definition wins per
+      # module — the per-module table owns the decision).
       let key = type_expr_to_string(&impl_block.for_type) + "::" + f.name
-      if !module.functions.contains_key(&key) then
-        module.functions.insert(key.clone(), sym)
-        assign_symbol_index(module, &key)
-        match symbol_index_of(module, &key)
+      if !module_name_in_use(mtab, &key) then
+        mtab.functions.insert(key.clone(), sym.clone())
+        assign_symbol_index(mtab, &key)
+        match symbol_index_of(mtab, &key)
         when Option::Some(midx) then
-          ctx.resolved.method_defs.insert(key.clone(), DefId {
-            module: ctx.symbols.current_module.join("::"),
-            index: midx,
-            kind: DefKind::Method
-          })
-          qualified_regs.push((module_qualified_key(&qualified_path, &key), DefId {
-            module: qualified_path.join("::"),
-            index: midx,
-            kind: DefKind::Method
-          }))
+          # P0-A (item 2 — the impl-method DefId split): construct the
+          # method DefId ONCE with the owner module's ModuleId and
+          # per-module index, and insert THE SAME did into method_defs,
+          # module_symbols (the qualified entry below), item_defs
+          # (record_item_def's ItemImpl arm re-reads method_defs by the
+          # same key) and the method metadata — a method never gets two
+          # different DefIds. The kind is recorded as metadata (DefId
+          # carries no kind).
+          let did = DefId {
+            module: owner_module,
+            index: midx
+          }
+          record_def_kind(ctx, &did, DefKind::Method)
+          ctx.resolved.method_defs.insert(key.clone(), did.clone())
+          qualified_regs.push((module_qualified_key(&qualified_path, &key), did.clone()))
         when Option::None then ()
+        end
+        if !module.functions.contains_key(&key) then
+          module.functions.insert(key.clone(), sym)
+          assign_symbol_index(module, &key)
         end
       end
     end
@@ -980,17 +1154,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       visibility: c.vis,
       span: item.span.clone()
     }
-    if !module_name_in_use(module, &c.name) then
-      module.constants.insert(c.name.clone(), csym)
-      assign_symbol_index(module, &c.name)
-      match symbol_index_of(module, &c.name)
+    if !module_name_in_use(mtab, &c.name) then
+      mtab.constants.insert(c.name.clone(), csym.clone())
+      assign_symbol_index(mtab, &c.name)
+      match symbol_index_of(mtab, &c.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &c.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::Constant
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::Constant)
+        qualified_regs.push((module_qualified_key(&qualified_path, &c.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &c.name) then
+        module.constants.insert(c.name.clone(), csym)
+        assign_symbol_index(module, &c.name)
       end
     end
 
@@ -998,14 +1177,20 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
     # Register a submodule (merged programs keep items flat, so this is
     # typically a no-op container), then register the module's nested
     # items so every declaration is registered exactly once in this
-    # first pass.
+    # first pass. The inline module inherits the enclosing FILE module's
+    # ModuleId (inline modules are not separate file modules); its NAME is
+    # still registered in the per-module table so a same-file declaration
+    # colliding with the module name is caught by the per-module test.
     if !module.submodules.contains_key(m.name.clone()) then
-      let sub = module_symbols_new(m.name.clone())
+      let sub = module_symbols_new(m.name.clone(), owner_module.id)
       module.submodules.insert(m.name.clone(), sub)
+    end
+    if !mtab.submodules.contains_key(m.name.clone()) then
+      mtab.submodules.insert(m.name.clone(), module_symbols_new(m.name.clone(), owner_module.id))
     end
     ctx.symbols.current_module.push(m.name.clone())
     for inner in m.items do
-      add_item_to_symbols(ctx, &inner, module_path)
+      add_item_to_symbols(ctx, &inner, module_path, owner_module)
     end
     let _ = ctx.symbols.current_module.pop()
 
@@ -1017,17 +1202,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       visibility: s.vis,
       span: item.span.clone()
     }
-    if !module_name_in_use(module, &s.name) then
-      module.statics.insert(s.name.clone(), sym)
-      assign_symbol_index(module, &s.name)
-      match symbol_index_of(module, &s.name)
+    if !module_name_in_use(mtab, &s.name) then
+      mtab.statics.insert(s.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &s.name)
+      match symbol_index_of(mtab, &s.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::Static
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::Static)
+        qualified_regs.push((module_qualified_key(&qualified_path, &s.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &s.name) then
+        module.statics.insert(s.name.clone(), sym)
+        assign_symbol_index(module, &s.name)
       end
     end
 
@@ -1039,17 +1229,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       visibility: t.vis,
       span: item.span.clone()
     }
-    if !module_name_in_use(module, &t.name) then
-      module.types.insert(t.name.clone(), sym)
-      assign_symbol_index(module, &t.name)
-      match symbol_index_of(module, &t.name)
+    if !module_name_in_use(mtab, &t.name) then
+      mtab.types.insert(t.name.clone(), sym.clone())
+      assign_symbol_index(mtab, &t.name)
+      match symbol_index_of(mtab, &t.name)
       when Option::Some(idx) then
-        qualified_regs.push((module_qualified_key(&qualified_path, &t.name), DefId {
-          module: qualified_path.join("::"),
-          index: idx,
-          kind: DefKind::TypeName
-        }))
+        let did = DefId {
+          module: owner_module,
+          index: idx
+        }
+        record_def_kind(ctx, &did, DefKind::TypeName)
+        qualified_regs.push((module_qualified_key(&qualified_path, &t.name), did))
       when Option::None then ()
+      end
+      if !module_name_in_use(module, &t.name) then
+        module.types.insert(t.name.clone(), sym)
+        assign_symbol_index(module, &t.name)
       end
     end
 
@@ -1067,17 +1262,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
           receiver_type: Option::None,
           span: f.span.clone()
         }
-        if !module_name_in_use(module, &f.name) then
-          module.functions.insert(f.name.clone(), sym)
-          assign_symbol_index(module, &f.name)
-          match symbol_index_of(module, &f.name)
+        if !module_name_in_use(mtab, &f.name) then
+          mtab.functions.insert(f.name.clone(), sym.clone())
+          assign_symbol_index(mtab, &f.name)
+          match symbol_index_of(mtab, &f.name)
           when Option::Some(idx) then
-            qualified_regs.push((module_qualified_key(&qualified_path, &f.name), DefId {
-              module: qualified_path.join("::"),
-              index: idx,
-              kind: DefKind::Function
-            }))
+            let did = DefId {
+              module: owner_module,
+              index: idx
+            }
+            record_def_kind(ctx, &did, DefKind::Function)
+            qualified_regs.push((module_qualified_key(&qualified_path, &f.name), did))
           when Option::None then ()
+          end
+          if !module_name_in_use(module, &f.name) then
+            module.functions.insert(f.name.clone(), sym)
+            assign_symbol_index(module, &f.name)
           end
         end
       when ExternItem::Static(s) then
@@ -1088,17 +1288,22 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
           visibility: Visibility::Public,
           span: s.span.clone()
         }
-        if !module_name_in_use(module, &s.name) then
-          module.statics.insert(s.name.clone(), sym)
-          assign_symbol_index(module, &s.name)
-          match symbol_index_of(module, &s.name)
+        if !module_name_in_use(mtab, &s.name) then
+          mtab.statics.insert(s.name.clone(), sym.clone())
+          assign_symbol_index(mtab, &s.name)
+          match symbol_index_of(mtab, &s.name)
           when Option::Some(idx) then
-            qualified_regs.push((module_qualified_key(&qualified_path, &s.name), DefId {
-              module: qualified_path.join("::"),
-              index: idx,
-              kind: DefKind::Static
-            }))
+            let did = DefId {
+              module: owner_module,
+              index: idx
+            }
+            record_def_kind(ctx, &did, DefKind::Static)
+            qualified_regs.push((module_qualified_key(&qualified_path, &s.name), did))
           when Option::None then ()
+          end
+          if !module_name_in_use(module, &s.name) then
+            module.statics.insert(s.name.clone(), sym)
+            assign_symbol_index(module, &s.name)
           end
         end
       end
@@ -1110,9 +1315,13 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
       visibility: cap.vis,
       span: item.span.clone()
     }
-    if !module_name_in_use(module, &cap.name) then
-      module.capabilities.insert(cap.name.clone(), csym)
-      assign_symbol_index(module, &cap.name)
+    if !module_name_in_use(mtab, &cap.name) then
+      mtab.capabilities.insert(cap.name.clone(), csym.clone())
+      assign_symbol_index(mtab, &cap.name)
+      if !module_name_in_use(module, &cap.name) then
+        module.capabilities.insert(cap.name.clone(), csym)
+        assign_symbol_index(module, &cap.name)
+      end
     end
     # P0-A: capabilities get no module-qualified entry yet — DefKind
     # (ids.tg) has no Capability variant; they arrive with the Crate
@@ -1121,12 +1330,12 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
   when _ then ()
   end
 
-  # P0-A: flush the module-qualified keys into the symbol table. Purely
-  # additive: the bare-name first-wins tables above are untouched, so
-  # resolution behavior is unchanged (the compiled set has no same-named
-  # cross-module collisions). Each key is "path::name" with the path of the
-  # owner ModuleInfo; the DefId carries that module-qualified path and the
-  # symbol index assigned above.
+  # P0-A: flush the module-qualified keys into the symbol table. The
+  # per-module tables above own the first-wins REGISTRATION decision; this
+# flush records the qualified IDENTITY — "path::name" with the path of
+  # the owner Module and the per-module symbol index — so same-named
+  # items in different modules are distinguishable. The bare-name
+  # first-wins tables are untouched by this flush.
   for reg in qualified_regs do
     ctx.symbols.module_symbols.insert(reg.0.clone(), reg.1.clone())
   end
@@ -1376,7 +1585,7 @@ def resolve_import_path(symbols: &SymbolTable, path: &Vec[String]) -> Bool
 
   let known_compiler = [
     "access_check", "ast", "ids", "token", "lexer", "parser", "types", "trait_resolve",
-    "resolver", "mir", "codegen", "asm", "object",
+    "resolver", "mir", "mono", "codegen", "asm", "object",
     "linker", "driver", "formatter", "linter", "docgen", "cqs",
     "coverage", "agentic", "symbol_graph", "context_pack",
     "refactor", "mode", "lib", "cap_baseline",
@@ -1446,15 +1655,15 @@ def resolve_program(ctx: &mut ResolutionContext, program: &Program) -> Unit
   # while resolving this item's body render with the item's module — the
   # rendering item_defs' record_item_def uses, keeping call-site identity
   # (InstanceId.def) byte-identical to the function's own DefId.
-  var module_ptr = 0
   var item_idx = 0
   while item_idx < program.items.len() do
-    let (owner_path, next_module_ptr) = module_path_of_item_resolver(program, module_ptr, item_idx)
-    module_ptr = next_module_ptr
+    let (owner_path, owner_module) = module_path_of_item_resolver(program, item_idx)
     ctx.current_owner_path = owner_path
+    ctx.current_owner_module = owner_module
     let item = program.items[item_idx]
     resolve_item(ctx, &item)
     ctx.current_owner_path = Vec::new()
+    ctx.current_owner_module = ModuleId { id: 0 }
     item_idx = item_idx + 1
   end
 end
@@ -1539,6 +1748,14 @@ end
 def resolve_stmt(ctx: &mut ResolutionContext, stmt: &Stmt) -> Unit
   match stmt.kind
   when StmtKind::StmtExpr(e) then resolve_expr(ctx, &e)
+  when StmtKind::StmtAssign(target, value) then
+    # Assignment (statement form): resolve both sides — the target's base
+    # expressions and the assigned value.
+    resolve_expr(ctx, &target)
+    resolve_expr(ctx, &value)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    resolve_expr(ctx, &target)
+    resolve_expr(ctx, &value)
   when StmtKind::StmtLet(pattern, ty, init, _) then
     resolve_expr(ctx, &init)
     resolve_pattern_definition(ctx, &pattern)
@@ -1622,11 +1839,6 @@ def resolve_stmt(ctx: &mut ResolutionContext, stmt: &Stmt) -> Unit
       resolve_stmt(ctx, &s)
     end
     rs_pop_scope(ctx)
-  when StmtKind::StmtYield(e_opt) then
-    match e_opt
-    when Option::Some(e) then resolve_expr(ctx, &e)
-    when Option::None then ()
-    end
   when StmtKind::StmtGuard(cond, else_action) then
     resolve_expr(ctx, &cond)
     match else_action
@@ -1666,7 +1878,32 @@ def resolve_stmt(ctx: &mut ResolutionContext, stmt: &Stmt) -> Unit
       rs_pop_scope(ctx)
     when Option::None then ()
     end
-  when _ then ()
+  when StmtKind::StmtWith(expr, pattern, body) then
+    # With (context manager): resolve the managed expression, then bind the
+    # pattern as a definition inside the body's scope.
+    resolve_expr(ctx, &expr)
+    rs_push_scope(ctx)
+    resolve_pattern_definition(ctx, &pattern)
+    for s in body.stmts do
+      resolve_stmt(ctx, &s)
+    end
+    rs_pop_scope(ctx)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    # Handle/with (effect handlers): resolve the handled expression and every
+    # handler arm's patterns and bodies.
+    resolve_expr(ctx, &expr)
+    for handler in handlers do
+      for arm in handler.arms do
+        rs_push_scope(ctx)
+        for p in arm.params do
+          resolve_pattern(ctx, &p)
+        end
+        for s in arm.body.stmts do
+          resolve_stmt(ctx, &s)
+        end
+        rs_pop_scope(ctx)
+      end
+    end
   end
 end
 
@@ -1704,7 +1941,6 @@ def resolve_pattern(ctx: &mut ResolutionContext, pattern: &Pattern) -> Unit
       resolve_pattern(ctx, &p)
     end
   when PatternKind::Range(_, _, _) then ()
-  when _ then ()
   end
 end
 
@@ -1738,11 +1974,13 @@ def resolve_pattern_definition(ctx: &mut ResolutionContext, pattern: &Pattern) -
     for p in patterns do
       resolve_pattern_definition(ctx, &p)
     end
-  when _ then ()
+  when PatternKind::Wildcard then ()
+  when PatternKind::Literal(_) then ()
+  when PatternKind::Range(_, _, _) then ()
   end
 end
 
-def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Unit
+def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], node_id: Int, span: Span) -> Unit
   if path.is_empty() then return end
 
   let first = path[0]
@@ -1755,35 +1993,40 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
       # Could be enum variant or associated item. The resolution carries the
       # OWNER enum's DefId (module + type symbol index) plus the variant
       # index from the resolver's variant table — ID-based identity instead
-      # of the enum/variant names.
+      # of the enum/variant names. The identity keys are the expression's
+      # NODE ids (never spans); DefId.module is the owner ModuleId and the
+      # kinds are recorded as metadata.
       let owner_idx = match symbol_index_of(module, &first)
       when Option::Some(tidx) then tidx
       when Option::None then 0 as UInt
       end
       match variant_index_of(module, second)
       when Option::Some(vidx) then
-        ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
-          kind: ResolvedExprKind::Variant(DefId {
-            module: ctx.symbols.current_module.join("::"),
-            index: owner_idx,
-            kind: DefKind::TypeName
-          }, vidx),
+        let owner_did = DefId {
+          module: ctx.current_owner_module,
+          index: owner_idx
+        }
+        record_def_kind(ctx, &owner_did, DefKind::TypeName)
+        ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
+          kind: ResolvedExprKind::Variant(owner_did, vidx),
           module_path: ctx.symbols.current_module.clone()
         })
-        ctx.resolved.call_targets.insert(span.start, DefId {
-          module: ctx.symbols.current_module.join("::"),
-          index: vidx,
-          kind: DefKind::EnumVariant
-        })
+        let var_did = DefId {
+          module: ctx.current_owner_module,
+          index: vidx
+        }
+        record_def_kind(ctx, &var_did, DefKind::EnumVariant)
+        ctx.resolved.call_targets.insert(node_id, var_did)
       when Option::None then
         # The qualified path still resolves as a variant reference; carry the
         # owner id with a degenerate index (no variant-table entry).
-        ctx.resolved.expr_resolutions.insert(span.start, ResolvedExpr {
-          kind: ResolvedExprKind::Variant(DefId {
-            module: ctx.symbols.current_module.join("::"),
-            index: owner_idx,
-            kind: DefKind::TypeName
-          }, 0 as UInt),
+        let owner_did = DefId {
+          module: ctx.current_owner_module,
+          index: owner_idx
+        }
+        record_def_kind(ctx, &owner_did, DefKind::TypeName)
+        ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
+          kind: ResolvedExprKind::Variant(owner_did, 0 as UInt),
           module_path: ctx.symbols.current_module.clone()
         })
       end
@@ -1796,7 +2039,7 @@ def resolve_path(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) ->
   # function (full-path or import-alias form) — purely additive; a path that
   # names no registered function records nothing and keeps the name-based
   # fallback, and no new error behavior is introduced.
-  record_path_call_target(ctx, path, span)
+  record_path_call_target(ctx, path, node_id)
   if resolve_via_imports_path(ctx, path, span) then
     return
   end
@@ -1842,7 +2085,17 @@ def rs_resolve_type_expr(ctx: &mut ResolutionContext, ty: &TypeExpr, span: Span)
       rs_resolve_type_expr(ctx, &p.ty, span.clone())
     end
     rs_resolve_type_expr(ctx, &ret, span.clone())
-  when _ then ()
+  when TypeExprKind::Unit then ()
+  when TypeExprKind::Never then ()
+  when TypeExprKind::Ptr(elem) then
+    rs_resolve_type_expr(ctx, &elem, span.clone())
+  when TypeExprKind::PtrMut(elem) then
+    rs_resolve_type_expr(ctx, &elem, span.clone())
+  when TypeExprKind::Async(inner) then
+    rs_resolve_type_expr(ctx, &inner, span.clone())
+  when TypeExprKind::Effect(_, inner) then
+    rs_resolve_type_expr(ctx, &inner, span.clone())
+  when TypeExprKind::Infer then ()
   end
 end
 
@@ -1874,8 +2127,9 @@ def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr)
     end
 
     if import_name == name.clone() then
-      # DefId.module is the importing module path WITHOUT the final item
-      # segment (e.g. "foo" for `use foo::bar`); the symbol index comes from
+      # DefId.module is the TARGET module's ModuleId (the per-module table
+      # of the import path carries it — module_tables are keyed by path join
+      # and stamped with the owner ModuleId); the symbol index comes from
       # the TARGET module's symbol table under the imported item's name.
       var module_path = Vec::new()
       var mpi = 0
@@ -1885,38 +2139,41 @@ def resolve_via_imports(ctx: &mut ResolutionContext, name: &String, expr: &Expr)
       end
       let target_name = import.path[import.path.len() - 1].clone()
       let target_kind = import_target_kind(ctx, &module_path, &target_name)
+      let target_mod = match ctx.symbols.module_tables.get(module_path.join("::"))
+      when Option::Some(tab) then ModuleId { id: tab.module_id }
+      when Option::None then ModuleId { id: 0 }
+      end
       let target_idx = match symbol_index_for(ctx, &module_path, &target_name)
       when Option::Some(target_idx) then
-        ctx.resolved.call_targets.insert(expr.span.start, DefId {
-          module: module_path.join("::"),
-          index: target_idx,
-          kind: target_kind
-        })
+        let target_did = DefId {
+          module: target_mod,
+          index: target_idx
+        }
+        record_def_kind(ctx, &target_did, target_kind)
+        ctx.resolved.call_targets.insert(expr.node_id, target_did)
         target_idx
       when Option::None then 0 as UInt
       end
       # The resolved-expression kind carries the semantic DefId (never the
-      # source name); the id matches the call_targets entry exactly.
+      # source name); the id matches the call_targets entry exactly. The
+      # identity key is the expression's NODE id.
+      let target_did = DefId {
+        module: target_mod,
+        index: target_idx
+      }
+      record_def_kind(ctx, &target_did, target_kind)
       let resolved_kind = match target_kind
-      when DefKind::Static then ResolvedExprKind::Static(target_name.clone())
-      when DefKind::Constant then ResolvedExprKind::Constant(target_name.clone())
+      when DefKind::Static then ResolvedExprKind::Static(target_did.clone())
+      when DefKind::Constant then ResolvedExprKind::Constant(target_did.clone())
       when DefKind::EnumVariant then
         # The imported item is an enum variant: the carried DefId is the
         # variant's own id (the owner enum is not resolvable from an import
         # path); the index is the resolver's variant-table index.
-        ResolvedExprKind::Variant(DefId {
-          module: module_path.join("::"),
-          index: target_idx,
-          kind: DefKind::EnumVariant
-        }, target_idx)
+        ResolvedExprKind::Variant(target_did.clone(), target_idx)
       when _ then
-        ResolvedExprKind::Function(DefId {
-          module: module_path.join("::"),
-          index: target_idx,
-          kind: target_kind
-        })
+        ResolvedExprKind::Function(target_did)
       end
-      ctx.resolved.expr_resolutions.insert(expr.span.start, ResolvedExpr {
+      ctx.resolved.expr_resolutions.insert(expr.node_id, ResolvedExpr {
         kind: resolved_kind,
         module_path: import.path.clone()
       })
@@ -2008,11 +2265,12 @@ end
 # KNOWN top-level function. The target DefId comes from the symbol table's
 # module_symbols entries ("<full owner module path>::<name>" -> DefId — the
 # entries add_item_to_symbols registered for EVERY top-level item, carrying
-# module = the item's full owner ModuleInfo path). The rendering therefore
+# module = the item's owner ModuleId). The rendering therefore
 # matches the same item's item_defs DefId byte-for-byte (record_item_def
-# walks the same owner paths), which is exactly what the MIR emission-name
-# migration needs: a call-site name derived from the InstanceId's DefId must
-# equal the callee function's own DefId-derived emission name.
+# walks the same owner modules and per-module indices),
+# the MIR emission-name migration needs: a call-site name derived from the
+# InstanceId's DefId must equal the callee function's own DefId-derived
+# emission name.
 #
 # Key attempts, in order:
 #   1. The path AS WRITTEN — covers fully-qualified calls that name the
@@ -2027,7 +2285,8 @@ end
 # constants/statics/variants never participate in emission-name derivation).
 # No resolution errors are added here — a path that names no registered
 # function simply stays name-based (the MIR-side fallback for that shape).
-def record_path_call_target(ctx: &mut ResolutionContext, path: &Vec[String], span: Span) -> Unit
+# The identity key is the call expression's NODE id.
+def record_path_call_target(ctx: &mut ResolutionContext, path: &Vec[String], node_id: Int) -> Unit
   if path.len() < 2 then return end
   var key_attempts: Vec[Vec[String]] = Vec::new()
   key_attempts.push(path.clone())
@@ -2059,8 +2318,14 @@ def record_path_call_target(ctx: &mut ResolutionContext, path: &Vec[String], spa
     let key = module_qualified_key(&mod_segs, &cand[cand.len() - 1])
     match ctx.symbols.module_symbols.get(key)
     when Option::Some(did) then
-      if did.kind == DefKind::Function then
-        ctx.resolved.call_targets.insert(span.start, did.clone())
+      # P0-AM: the DefKind is metadata (DefId carries no kind) — check the
+      # def_kinds map, not the DefId.
+      let did_kind = match ctx.symbols.def_kinds.get(def_metadata_key(did))
+      when Option::Some(k) then k
+      when Option::None then DefKind::Other
+      end
+      if did_kind == DefKind::Function then
+        ctx.resolved.call_targets.insert(node_id, did.clone())
         return
       end
     when Option::None then ()
@@ -2223,7 +2488,8 @@ def rs_add_error(symbols: &mut SymbolTable, kind: ResolutionErrorKind,
 end
 
 def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) -> Unit
-  # Look up in local scopes first
+  # Look up in local scopes first. The identity keys are the expression's
+  # NODE ids (never spans).
   match lookup_local(ctx, name)
   when Option::Some(binding) then
     match binding.kind
@@ -2232,25 +2498,25 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
         kind: ResolvedExprKind::LocalVar(name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
-      let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+      let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::Parameter(idx) then
       let resolved_expr = ResolvedExpr {
         kind: ResolvedExprKind::Parameter(name.clone(), idx),
         module_path: ctx.symbols.current_module.clone()
       }
-      let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+      let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::LoopVariable then
       let resolved_expr = ResolvedExpr {
         kind: ResolvedExprKind::LocalVar(name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
-      let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+      let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::MatchBinding then
       let resolved_expr = ResolvedExpr {
         kind: ResolvedExprKind::LocalVar(name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
-      let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+      let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     end
     return
   when Option::None then
@@ -2259,100 +2525,116 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
 
   # Try to resolve as function or constant
   let module = get_current_module_ref(&ctx.symbols)
-  # P0-AM: the DefId's module component is the CURRENT ITEM's owner module
-  # path (ctx.current_owner_path, threaded by resolve_program from
-  # Program.modules) — NOT the inline-module nesting — so the call-target
+  # P0-AM: the DefId's module component is the CURRENT ITEM's OWNER ModuleId
+  # (ctx.current_owner_module, threaded by resolve_program from
+  # Program.crate) — NOT the inline-module nesting — so the call-target
   # DefId renders identically to the same function's item_defs DefId
-  # (record_item_def uses the identical owner-path walk). The MIR
+  # (record_item_def uses the identical owner-module walk). The MIR
   # emission-name migration derives call-site names from the InstanceId's
   # DefId and function names from item_defs; a module-less call target
-  # ("::<index>::fn") would diverge from the function's own
-  # ("<module path>::<index>::fn") and break the end-to-end resolution.
-  # Inline-module bodies keep the enclosing item's owner path (they record
-  # no item_defs entry; their calls stay name-based by design).
-  let mod_str = if ctx.current_owner_path.is_empty() then
-    ctx.symbols.current_module.join("::")
-  else
-    ctx.current_owner_path.join("::")
-  end
+  # would diverge from the function's own DefId and break the end-to-end
+  # resolution. Inline-module bodies keep the enclosing item's owner module
+  # (they record no item_defs entry; their calls stay name-based by
+  # design). The kinds are recorded as metadata (def_kinds) — DefId
+  # carries no kind.
   if module.functions.contains_key(name) then
     # The resolved function carries the same DefId that call_targets records
     # (module + per-module symbol index), so resolution and call identity
     # are one ID-based fact.
     let fidx = match symbol_index_of(module, name)
     when Option::Some(fidx) then
-      ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: mod_str,
-        index: fidx,
-        kind: DefKind::Function
-      })
+      let fdid = DefId {
+        module: ctx.current_owner_module,
+        index: fidx
+      }
+      record_def_kind(ctx, &fdid, DefKind::Function)
+      ctx.resolved.call_targets.insert(expr.node_id, fdid)
       fidx
     when Option::None then 0 as UInt
     end
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Function(DefId {
-        module: mod_str,
-        index: fidx,
-        kind: DefKind::Function
+        module: ctx.current_owner_module,
+        index: fidx
       }),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     return
   end
 
   if module.constants.contains_key(name) then
+    # P0-A: the Constant kind carries the SAME DefId call_targets records —
+    # ID-based identity instead of the source name.
+    let cidx = match symbol_index_of(module, name)
+    when Option::Some(cidx) then
+      let cdid = DefId {
+        module: ctx.current_owner_module,
+        index: cidx
+      }
+      record_def_kind(ctx, &cdid, DefKind::Constant)
+      ctx.resolved.call_targets.insert(expr.node_id, cdid)
+      cidx
+    when Option::None then 0 as UInt
+    end
+    let cdid = DefId {
+      module: ctx.current_owner_module,
+      index: cidx
+    }
+    record_def_kind(ctx, &cdid, DefKind::Constant)
     let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Constant(name.clone()),
+      kind: ResolvedExprKind::Constant(cdid),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    match symbol_index_of(module, name)
-    when Option::Some(cidx) then
-      ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: mod_str,
-        index: cidx,
-        kind: DefKind::Constant
-      })
-    when Option::None then ()
-    end
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     return
   end
 
   if module.statics.contains_key(name) then
+    # P0-A: the Static kind carries the SAME DefId call_targets records —
+    # ID-based identity instead of the source name.
+    let sidx = match symbol_index_of(module, name)
+    when Option::Some(sidx) then
+      let sdid = DefId {
+        module: ctx.current_owner_module,
+        index: sidx
+      }
+      record_def_kind(ctx, &sdid, DefKind::Static)
+      ctx.resolved.call_targets.insert(expr.node_id, sdid)
+      sidx
+    when Option::None then 0 as UInt
+    end
+    let sdid = DefId {
+      module: ctx.current_owner_module,
+      index: sidx
+    }
+    record_def_kind(ctx, &sdid, DefKind::Static)
     let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Static(name.clone()),
+      kind: ResolvedExprKind::Static(sdid),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    match symbol_index_of(module, name)
-    when Option::Some(sidx) then
-      ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: mod_str,
-        index: sidx,
-        kind: DefKind::Static
-      })
-    when Option::None then ()
-    end
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     return
   end
 
   # Runtime intrinsics (__intrinsic_*) are provided by the runtime, not by
-  # source definitions; they are always resolvable.
+  # source definitions; they are always resolvable. Their DefId lives in a
+  # synthetic module (id -1 — no Module in the Crate); the kind is
+  # metadata.
   if name.starts_with("__intrinsic") then
     let bidx = ctx.next_builtin_index
     ctx.next_builtin_index = ctx.next_builtin_index + 1
     let bdid = DefId {
-      module: "__builtin".to_string(),
-      index: bidx as UInt,
-      kind: DefKind::Intrinsic
+      module: ModuleId { id: -1 },
+      index: bidx as UInt
     }
+    record_def_kind(ctx, &bdid, DefKind::Intrinsic)
     let resolved_expr = ResolvedExpr {
       kind: ResolvedExprKind::Function(bdid.clone()),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
-    ctx.resolved.call_targets.insert(expr.span.start, bdid)
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
+    ctx.resolved.call_targets.insert(expr.node_id, bdid)
     return
   end
 
@@ -2360,28 +2642,30 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   # `alloc[RcInner[T]]()`) resolve as type references, not errors.
   let module2 = get_current_module_ref(&ctx.symbols)
   if module2.types.contains_key(name.clone()) then
-    # The resolved expression carries the TYPE NAME's DefId (kind TypeName);
-    # call_targets gets the same id, so a `Type::new`-style call keeps one
-    # ID-based identity end to end.
+    # The resolved expression carries the TYPE NAME's DefId (kind TypeName,
+    # recorded as metadata); call_targets gets the same id, so a
+    # `Type::new`-style call keeps one ID-based identity end to end.
     let tidx = match symbol_index_of(module2, name)
     when Option::Some(tidx) then
-      ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: ctx.symbols.current_module.join("::"),
-        index: tidx,
-        kind: DefKind::TypeName
-      })
+      let tdid = DefId {
+        module: ctx.current_owner_module,
+        index: tidx
+      }
+      record_def_kind(ctx, &tdid, DefKind::TypeName)
+      ctx.resolved.call_targets.insert(expr.node_id, tdid)
       tidx
     when Option::None then 0 as UInt
     end
+    let tdid = DefId {
+      module: ctx.current_owner_module,
+      index: tidx
+    }
+    record_def_kind(ctx, &tdid, DefKind::TypeName)
     let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Function(DefId {
-        module: ctx.symbols.current_module.join("::"),
-        index: tidx,
-        kind: DefKind::TypeName
-      }),
+      kind: ResolvedExprKind::Function(tdid),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     return
   end
 
@@ -2391,23 +2675,25 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
     # for a bare reference); the index is the resolver's variant-table index.
     let vidx = match variant_index_of(module2, name)
     when Option::Some(vidx) then
-      ctx.resolved.call_targets.insert(expr.span.start, DefId {
-        module: ctx.symbols.current_module.join("::"),
-        index: vidx,
-        kind: DefKind::EnumVariant
-      })
+      let vdid = DefId {
+        module: ctx.current_owner_module,
+        index: vidx
+      }
+      record_def_kind(ctx, &vdid, DefKind::EnumVariant)
+      ctx.resolved.call_targets.insert(expr.node_id, vdid)
       vidx
     when Option::None then 0 as UInt
     end
+    let vdid = DefId {
+      module: ctx.current_owner_module,
+      index: vidx
+    }
+    record_def_kind(ctx, &vdid, DefKind::EnumVariant)
     let resolved_expr = ResolvedExpr {
-      kind: ResolvedExprKind::Variant(DefId {
-        module: ctx.symbols.current_module.join("::"),
-        index: vidx,
-        kind: DefKind::EnumVariant
-      }, vidx),
+      kind: ResolvedExprKind::Variant(vdid, vidx),
       module_path: ctx.symbols.current_module.clone()
     }
-    let _ = ctx.resolved.expr_resolutions.insert(expr.span.start, resolved_expr)
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     return
   end
 
@@ -2419,12 +2705,29 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
 end
 
 def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
+  # P0-A (exhaustive visitor): EVERY ExprKind variant has an explicit arm —
+  # no `when _` fallback — so an expression form the resolver does not
+  # handle is a compile-time error here, never a silent omission. Literal
+  # arms are no-ops (nothing to resolve); genuinely unsupported forms
+  # (residual macro calls) get an explicit diagnostic.
   match expr.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+
   when ExprKind::ExprIdent(name) then
     resolve_ident_expr(ctx, &name, expr)
 
   when ExprKind::ExprPath(path) then
-    resolve_path(ctx, &path.segments, expr.span.clone())
+    resolve_path(ctx, &path.segments, expr.node_id, expr.span.clone())
+
+  when ExprKind::ExprSelfRef then
+    # `self` binds to the enclosing function's receiver; the type checker
+    # resolves the binding. Nothing to record here.
+    ()
 
   when ExprKind::ExprEnumVariant(path, _) then
     # P0-AM: module-qualified CALL paths ("driver::driver_main(...)",
@@ -2434,7 +2737,15 @@ def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
     # name from its DefId. No error is added for unresolvable paths (the
     # pre-existing behavior for this expression form is silent; the MIR
     # name-based fallback covers those shapes).
-    record_path_call_target(ctx, &path.segments, expr.span.clone())
+    record_path_call_target(ctx, &path.segments, expr.node_id)
+
+  when ExprKind::ExprStructLit(path, fields) then
+    # Struct construction: resolve every field initializer. The type path
+    # resolves during type checking.
+    for entry in fields do
+      let fv = entry.1
+      resolve_expr(ctx, &fv)
+    end
 
   when ExprKind::ExprCall(callee, args) then
     resolve_expr(ctx, &callee)
@@ -2457,6 +2768,14 @@ def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
     resolve_expr(ctx, &operand)
 
   when ExprKind::ExprBlock(block) then
+    rs_push_scope(ctx)
+    for stmt in block.stmts do
+      resolve_stmt(ctx, &stmt)
+    end
+    rs_pop_scope(ctx)
+
+  when ExprKind::ExprUnsafe(_, block) then
+    # Unsafe blocks introduce a scope exactly like plain blocks.
     rs_push_scope(ctx)
     for stmt in block.stmts do
       resolve_stmt(ctx, &stmt)
@@ -2574,12 +2893,24 @@ def resolve_expr(ctx: &mut ResolutionContext, expr: &Expr) -> Unit
     resolve_expr(ctx, &body)
     rs_pop_scope(ctx)
 
-  when ExprKind::ExprError(_) then
-    # Skip error expressions
-    ()
+  when ExprKind::ExprAssign(target, value) then
+    # Assignment (expression form): resolve both sides.
+    resolve_expr(ctx, &target)
+    resolve_expr(ctx, &value)
 
-  when _ then
-    # Unknown expression kind — skip
+  when ExprKind::ExprMacroCall(name, args) then
+    # Macro invocations are expanded by prepare_parsed BEFORE resolution; a
+    # residual macro call is an unsupported construct here — report it
+    # explicitly instead of silently skipping it.
+    for arg in args do
+      resolve_expr(ctx, &arg)
+    end
+    rs_add_error(&mut ctx.symbols, ResolutionErrorKind::Unsupported,
+      "unsupported expression: residual macro call `" + name + "`", expr.span.clone())
+
+  when ExprKind::ExprError(_) then
+    # Skip error expressions (the parser's recovery sentinel; the parse
+    # error is already reported)
     ()
   end
 end

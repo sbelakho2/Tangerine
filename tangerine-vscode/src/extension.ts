@@ -127,7 +127,6 @@ function registerHoverFallback(context: vscode.ExtensionContext) {
         end: 'Closes an open block (`def`, `if`, `match`, `struct`, `enum`, `trait`, `impl`, etc.).',
         async: 'Marks a function as asynchronous, enabling `await` inside its body.',
         await: 'Suspends execution until the asynchronous expression completes.',
-        yield: 'Produces a value from a generator or coroutine.',
         defer: 'Schedules an expression to run when the enclosing scope exits.',
         move: 'Transfers ownership of a value, preventing further use of the original binding.',
         copy: 'Creates a bitwise copy of a value (requires the `Copy` trait).',

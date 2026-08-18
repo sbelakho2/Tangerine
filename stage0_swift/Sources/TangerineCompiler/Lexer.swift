@@ -509,6 +509,15 @@ public final class Lexer {
         }
         let ch = utf8[pos]
         pos += 1
+        // Line continuation: backslash followed by a newline joins the
+        // string across lines (the backslash and the newline are elided).
+        if ch == ascii("\n") {
+            return nil
+        }
+        if ch == ascii("\r") && pos < utf8.count && utf8[pos] == ascii("\n") {
+            pos += 1
+            return nil
+        }
         switch ch {
         case ascii("n"):  return "\n"
         case ascii("r"):  return "\r"
@@ -674,6 +683,9 @@ public final class Lexer {
                 pos += 2; return Token(kind: .ltEq, span: makeSpan(start, pos))
             }
             if peek(1) == ascii("<") {
+                if peek(2) == ascii("=") {
+                    pos += 3; return Token(kind: .shlEq, span: makeSpan(start, pos))
+                }
                 pos += 2; return Token(kind: .shl, span: makeSpan(start, pos))
             }
             pos += 1; return Token(kind: .lt, span: makeSpan(start, pos))
@@ -683,6 +695,9 @@ public final class Lexer {
                 pos += 2; return Token(kind: .gtEq, span: makeSpan(start, pos))
             }
             if peek(1) == ascii(">") {
+                if peek(2) == ascii("=") {
+                    pos += 3; return Token(kind: .shrEq, span: makeSpan(start, pos))
+                }
                 pos += 2; return Token(kind: .shr, span: makeSpan(start, pos))
             }
             pos += 1; return Token(kind: .gt, span: makeSpan(start, pos))
@@ -691,11 +706,17 @@ public final class Lexer {
             if peek(1) == ascii("&") {
                 pos += 2; return Token(kind: .ampAmp, span: makeSpan(start, pos))
             }
+            if peek(1) == ascii("=") {
+                pos += 2; return Token(kind: .ampEq, span: makeSpan(start, pos))
+            }
             pos += 1; return Token(kind: .amp, span: makeSpan(start, pos))
 
         case ascii("|"):
             if peek(1) == ascii("|") {
                 pos += 2; return Token(kind: .pipePipe, span: makeSpan(start, pos))
+            }
+            if peek(1) == ascii("=") {
+                pos += 2; return Token(kind: .pipeEq, span: makeSpan(start, pos))
             }
             pos += 1; return Token(kind: .pipe, span: makeSpan(start, pos))
 

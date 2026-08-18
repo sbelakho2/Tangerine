@@ -103,7 +103,6 @@ public enum MirTerminator {
     case drop(MirPlace, next: BlockId, unwind: BlockId?)
     case `deinit`(MirPlace, next: BlockId, unwind: BlockId?)
     case assert(MirOperand, expected: Bool, message: String, target: BlockId)
-    case yield(MirOperand, resume: BlockId)
     case unreachable
     case abort
 }

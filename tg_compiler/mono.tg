@@ -1,0 +1,2036 @@
+# Tangerine monomorphization — the ONE monomorphizer.
+# Split out of trait_resolve.tg (reviewer item 72): the entire
+# monomorphization machinery lives here — the mono cache, the instance
+# identity (InstanceId / instance_key), the exhaustive body specialization
+# (substitute_type / substitute_rvalue / substitute_operand /
+# substitute_place), the instance WORK QUEUE (monomorphize_program), and
+# the symbol mangling (mangle_name for the INTERNAL single-compilation
+# emission labels, and the Tangerine ABI mangling for the PUBLIC external
+# symbols — reviewer items 104-105).
+# trait_resolve.tg re-exports this module's public API for the existing
+# importers (mir.tg, lib.tg, lib_kernel.tg, driver.tg).
+
+use std::core::{Option, Result}
+use std::collections::{Vec, Map, Set, VecDeque}
+use tg_compiler::ids::{InstanceId, CallableId, DefId, ModuleId, DefKind}
+use tg_compiler::ast::{Program, Item, ItemKind, AccessConvention}
+use tg_compiler::resolver::{ResolvedNames}
+use tg_compiler::types::{Type, ParamType, fn_owner_key_of_def, crate_module_path_of}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
+  MirRvalue, MirRvalueKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirCallArg, MirCallValue, MirTerminator, MirTerminatorKind, AggregateKind,
+  AssertMessage, Place, BlockId, LocalId, MirContract
+}
+
+# The work-queue guard: the queue + seen-set terminate for every FINITE
+# instance set (each instance is popped and specialized at most once); only
+# a GENUINELY infinite expansion — recursive generic instantiation that
+# keeps minting fresh instances — can outrun this bound. Exceeding it is a
+# monomorphization-recursion diagnostic, not a silent give-up.
+const MAX_MONO_INSTANCES: Int = 8192
+
+# ———————————————————————————————————————————————————————————————
+# Data Structures
+# ———————————————————————————————————————————————————————————————
+
+struct MonoKey
+  func_name: String
+  type_args: Vec[Type]
+end
+
+struct MonoCache
+  entries: Vec[MonoEntry]
+  # Specialized MIR function bodies keyed by mangled name
+  specialized_bodies: Map[String, MirFunction]
+  # Inference failures recorded during monomorphization (deduplicated)
+  errors: Vec[String]
+  # P0-AM (post-migration): the typed program's Program and the resolver's
+  # ResolvedNames snapshot — the crate module table (Program.crate.modules)
+  # and the def_kinds metadata the DefId renders (fn_owner_key_of_def /
+  # crate_module_path_of / def_kind_of) scan. Wired at cache construction
+  # (mono_cache_new); the monomorphizer receives the program THROUGH the
+  # cache, so every instance-key render is byte-identical to the MIR
+  # builder's emission-name renders (mir.tg's b.program / b.resolutions —
+  # the same crate-scan + def_kinds authority).
+  program: Program
+  resolutions: ResolvedNames
+end
+
+struct MonoEntry
+  key: MonoKey
+  mangled_name: String
+end
+
+pub def mono_cache_new(program: &Program, res: &ResolvedNames) -> MonoCache
+  MonoCache {
+    entries: Vec::new(),
+    specialized_bodies: Map::new(),
+    errors: Vec::new(),
+    program: program.clone(),
+    resolutions: res.clone()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Call-level Instance Identity (P0-AK)
+# ———————————————————————————————————————————————————————————————
+# The semantic identity of a monomorphized callee: the DEFINITION the call
+# resolves to (the typed program's call_targets DefId) plus the concrete
+# type substitutions. This is the target shape the string-only MirFnItem
+# names migrate to: a MirFnItem keeps its name as the mangled EMISSION key
+# (codegen's resolve_callee_label authority) and carries the InstanceId as
+# its semantic identity alongside. The substs are the concrete generic
+# arguments; the instance payload is the ONLY authority for type arguments
+# at the monomorphizer — ZERO-INFERENCE: the monomorphizer never fills
+# them from a call site (see the fail-closed invariant at
+# monomorphize_program).
+
+# NOTE (P0-AM, post-migration): InstanceId is IMPORTED from ids.tg — the
+# target shape (def: CallableId wrapping the ModuleId-based DefId, plus the
+# concrete substitutions). The trait_resolve facade's re-export
+# (pub use tg_compiler::mono::{InstanceId, ...}) flows the ids.tg type
+# through unchanged, so mir.tg's payload construction
+# (InstanceId { def: CallableId { def: did }, substs }) and this module's
+# consumption agree on the same identity.
+
+# The SINGLE instance -> mangled-name mapping. The base is the DefId
+# rendered by fn_owner_key_of_def (the canonical semantic rendering the
+# resource checker and MIR owner keys use — the DefId carries no source
+# name and no module path, so this rendering — the crate containment scan
+# of the owner ModuleId plus the resolver's def_kinds metadata, from the
+# cache's program/resolutions snapshot — IS the def identity); the suffix
+# is the existing mangle_name applied to the concrete substitutions.
+# Deterministic per (def, substs), so the same instance always maps to the
+# same name.
+#
+# THE EMISSION-NAME FLOW (P0-AM, final): this function is the mangling
+# AUTHORITY — symbol names are produced only at this boundary, never at the
+# source level. The full flow for every top-level function:
+#
+#   source name (diagnostics/display only)
+#     -> DefId (resolver: ResolvedNames.item_defs / call_targets — the
+#        owner ModuleId + per-module symbol index; record_item_def
+#        guarantees one for every top-level function)
+#     -> fn_owner_key_of_def (semantic identity: "<module path>::<index>::
+#        <kind>" — the P0-C key, rendered by fn_owner_key_of_def in
+#        types.tg over the crate module table + def_kinds metadata)
+#     -> instance_key / mangle_name (the mangled EMISSION name: for a
+#        non-generic function, instance_key with empty substs IS the
+#        fn_owner_key_of_def base; for a generic instantiation, mangle_name
+#        appends the "$<concrete args>" suffix — the symbol-mangling
+#        boundary, where the MirFunction/MirFnItem name is produced)
+#     -> label (codegen's fn_alias identity entry ".Lfn_entry.<index>",
+#        resolved by resolve_callee_label)
+#
+# The source name survives ONLY at the linking boundary (extern symbols,
+# intrinsic names, the OS-entry "main"/"_start") and in diagnostics. Method
+# names ("Type__method") are exempt by design: the finalizer and registered
+# Drop identities depend on them unchanged.
+pub def instance_key(cache: &MonoCache, instance: &InstanceId) -> String
+  let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
+  mangle_name(base, &instance.substs)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Type-Param Helper Predicates
+# ———————————————————————————————————————————————————————————————
+
+# Check whether a type contains any Type::Param reference.
+def type_has_params(ty: &Type) -> Bool
+  match ty
+  when Type::Param(_) then true
+  when Type::Tuple(elems) then
+    var found = false
+    for e in elems do
+      if type_has_params(&e) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    var found = false
+    for p in params do
+      if type_has_params(&p.ty) then found = true; break end
+    end
+    found || type_has_params(ret)
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if type_has_params(&a) then found = true; break end
+    end
+    found
+  when Type::RefInternal(inner, _) then type_has_params(inner)
+  when Type::Ptr(inner) then type_has_params(inner)
+  when Type::PtrMut(inner) then type_has_params(inner)
+  when Type::Effect(_, inner) then type_has_params(inner)
+  when _ then false
+  end
+end
+
+# Check whether a specific Type::Param name appears in a type.
+def type_uses_param_name(ty: &Type, name: &String) -> Bool
+  match ty
+  when Type::Param(n) then n == name
+  when Type::Tuple(elems) then
+    var found = false
+    for e in elems do
+      if type_uses_param_name(&e, name) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    var found = false
+    for p in params do
+      if type_uses_param_name(&p.ty, name) then found = true; break end
+    end
+    found || type_uses_param_name(ret, name)
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if type_uses_param_name(&a, name) then found = true; break end
+    end
+    found
+  when Type::RefInternal(inner, _) then type_uses_param_name(inner, name)
+  when Type::Ptr(inner) then type_uses_param_name(inner, name)
+  when Type::PtrMut(inner) then type_uses_param_name(inner, name)
+  when Type::Effect(_, inner) then type_uses_param_name(inner, name)
+  when _ then false
+  end
+end
+
+# Check whether a function is generic (has Type::Param in its signature,
+# or carries declared generic parameters in MirFunction.generic_params).
+def is_generic_function(func: &MirFunction) -> Bool
+  if !func.generic_params.is_empty() then return true end
+  if type_has_params(&func.ret_type) then return true end
+  for param in func.params do
+    if type_has_params(&param.ty) then return true end
+  end
+  for local in func.locals do
+    if type_has_params(&local.ty) then return true end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# ZERO-INFERENCE INVARIANT
+# ———————————————————————————————————————————————————————————————
+# The monomorphizer performs NO call-site type-argument inference. Every
+# generic call that reaches monomorphize_program carries its SOLVED
+# instance (the MirFnItem's InstanceId payload):
+#   - source calls carry the type checker's solved substitution (the
+#     typed_call_instances authority, threaded through mir_call_instance);
+#   - return-type-only shapes (Vec::new()-style constructors) are parked
+#     (pending_call_instances) and re-resolved at the end of type checking,
+#     after the annotation/expected-type unifications land — a call the
+#     caller's context never constrains is a hard error ("cannot infer type
+#     parameter `T`: add an annotation"), never a Unit/legacy guess;
+#   - IR-synthesized calls (the deinit/drain/destroy glue, the intrinsic
+#     calls, the for-loop length calls) are either non-generic emission
+#     names, members of the monomorphic-per-call `__intrinsic_*` family, or
+#     carry an instance attached by construction (see the enumeration in
+#     mir.tg).
+# A call whose callee has a generic base and NO usable instance payload is
+# a compiler-internal gap: the monomorphizer FAILS CLOSED — it records an
+# error instead of inferring. The former structural argument-match
+# (infer_type_args_for_call and its helpers) has been REMOVED; inference is
+# not performed on the program's call graph.
+
+# Look up or create a monomorphized instance for a generic function call.
+# Returns the mangled name.
+def monomorphize(cache: &mut MonoCache, func_name: String, type_args: Vec[Type]) -> String
+  # Check if already monomorphized
+  for entry in cache.entries do
+    if entry.key.func_name == func_name && types_equal(&entry.key.type_args, &type_args) then
+      return entry.mangled_name.clone()
+    end
+  end
+
+  # Create new monomorphized instance
+  let mangled = mangle_name(func_name.clone(), &type_args)
+  cache.entries.push(MonoEntry {
+    key: MonoKey {
+      func_name: func_name,
+      type_args: type_args
+    },
+    mangled_name: mangled.clone()
+  })
+  mangled
+end
+
+# ———————————————————————————————————————————————————————————————
+# Monomorphization Body Specialization
+# ———————————————————————————————————————————————————————————————
+# Given a generic MIR function and concrete type arguments, produce
+# a specialized copy with all type parameters substituted.
+
+struct TypeSubstMap
+  # Maps type parameter names to concrete types
+  params: Map[String, Type]
+end
+
+def type_subst_new(type_param_names: &Vec[String], type_args: &Vec[Type]) -> TypeSubstMap
+  var params = Map::new()
+  var i = 0
+  while i < type_param_names.len() && i < type_args.len() do
+    params.insert(type_param_names[i].clone(), type_args[i].clone())
+    i = i + 1
+  end
+  TypeSubstMap { params: params }
+end
+
+# P0-AL: specialize a generic function under an EXPLICIT mangled name — the
+# solved-instance path's specialization. When a call's MirFnItem carries a
+# solved instance, the specialized body is named by the INSTANCE's key
+# (instance_key) so the emitted name and the cache key agree; the
+# name-derived path (specialize_function below, used only by
+# mono_specialize_function with EXPLICIT args) delegates here after
+# computing mangle_name. The specialization always proceeds from the given
+# solved type args — ZERO-INFERENCE: nothing is ever inferred here.
+#
+# FAIL-CLOSED RESULT INTERFACE: the specialization succeeds (Result::Ok)
+# and caches the body ONLY when the post-instantiation verification finds
+# no residual Type::Param / Type::Var anywhere in the instantiated types.
+# A violation returns Result::Err WITHOUT caching the body, so the call
+# site is never rewritten to a poisoned name; the caller propagates the
+# error and aborts the compilation.
+pub def specialize_function_named(
+  cache: &mut MonoCache,
+  original: &MirFunction,
+  type_param_names: &Vec[String],
+  type_args: &Vec[Type],
+  mangled: String
+) -> Result[Unit, String]
+  # If already specialized, return cached version
+  match cache.specialized_bodies.get(&mangled)
+  when Option::Some(_) then return Result::Ok(())
+  when Option::None then ()
+  end
+  
+  let subst = type_subst_new(type_param_names, type_args)
+  
+  # Create specialized function with substituted types. The instantiated
+  # body is a CONCRETE codegen instance: it carries no generic parameters
+  # (the declaration-order names are substituted out by construction).
+  var specialized = MirFunction {
+    name: mangled.clone(),
+    params: Vec::new(),
+    ret_type: substitute_type(&subst, &original.ret_type),
+    generic_params: Vec::new(),
+    locals: Vec::new(),
+    blocks: Vec::new(),
+    entry_block: BlockId { id: original.entry_block.id },
+    is_async: original.is_async,
+    is_unsafe: original.is_unsafe,
+    is_extern: original.is_extern,
+    extern_abi: original.extern_abi.clone(),
+    contracts: original.contracts.clone(),
+    span: original.span.clone()
+  }
+  
+  # Substitute parameter types
+  for param in original.params do
+    specialized.params.push(MirLocal {
+      id: LocalId { id: param.id.id },
+      name: param.name.clone(),
+      ty: substitute_type(&subst, &param.ty),
+      is_mut: param.is_mut,
+      span: param.span
+    })
+  end
+  
+  # Substitute local variable types
+  for local in original.locals do
+    specialized.locals.push(MirLocal {
+      id: LocalId { id: local.id.id },
+      name: local.name.clone(),
+      ty: substitute_type(&subst, &local.ty),
+      is_mut: local.is_mut,
+      span: local.span
+    })
+  end
+  
+  # Deep-copy and substitute all blocks
+  for block in original.blocks do
+    var new_stmts = Vec::new()
+    for stmt in block.statements do
+      new_stmts.push(substitute_statement(&subst, &stmt))
+    end
+    
+    specialized.blocks.push(MirBlock {
+      id: BlockId { id: block.id.id },
+      statements: new_stmts,
+      terminator: substitute_terminator(&subst, &block.terminator)
+    })
+  end
+  
+  # Verification: after instantiation, a CONCRETE codegen instance must
+  # carry no Type::Param and no unresolved Type::Var anywhere in the
+  # instantiated types (params, return type, locals). An uninferred
+  # parameter would poison the mangled name and the specialized body; a
+  # Var (produced when the substitution chased a still-generic caller's
+  # argument type) is equally non-codegenable. A violation records an
+  # error and fails the specialization (the body is not cached, so the
+  # call site is never rewritten to a poisoned name).
+  match residual_param_in_function(&specialized, type_param_names)
+  when Option::Some(what) then
+    Result::Err(what + " remains in instantiated types of `" + original.name + "`")
+  when Option::None then
+    # Cache the specialized body
+    cache.specialized_bodies.insert(mangled, specialized)
+    Result::Ok(())
+  end
+end
+
+def specialize_function(
+  cache: &mut MonoCache,
+  original: &MirFunction,
+  type_param_names: &Vec[String],
+  type_args: &Vec[Type]
+) -> Result[Unit, String]
+  # Name-derived path: the mangled name comes from the function name +
+  # the EXPLICIT type args (this entry is used only by
+  # mono_specialize_function, whose caller supplies the concrete args —
+  # ZERO-INFERENCE; the worklist monomorphizer passes the instance's key
+  # directly to specialize_function_named).
+  let mangled = monomorphize(cache, original.name.clone(), type_args.clone())
+  specialize_function_named(cache, original, type_param_names, type_args, mangled)
+end
+
+# P0-AL (final): the post-instantiation verification. A specialized body is
+# a CONCRETE codegen instance: it must contain no Type::Param and no
+# unresolved Type::Var anywhere (params, return type, locals). The first
+# violation is described as:
+#   - "type parameter `<name>`" — the callee's own parameter the
+#     substitution failed to cover (a recorded instance whose substs are
+#     shorter than infer_type_param_names), or a stray Param from a
+#     still-generic caller's argument types;
+#   - "inference variable (Type::Var)" — a Var the substitution produced
+#     (the type args carried it; the subst resolution chases env.subst at
+#     specialization time and a Var has no mapping there).
+def residual_param_in_function(f: &MirFunction, names: &Vec[String]) -> Option[String]
+  for name in names do
+    if type_uses_param_name(&f.ret_type, &name) then
+      return Option::Some("type parameter `" + name + "`")
+    end
+    for p in f.params do
+      if type_uses_param_name(&p.ty, &name) then
+        return Option::Some("type parameter `" + name + "`")
+      end
+    end
+    for l in f.locals do
+      if type_uses_param_name(&l.ty, &name) then
+        return Option::Some("type parameter `" + name + "`")
+      end
+    end
+  end
+  match first_param_name_in_function(f)
+  when Option::Some(pname) then return Option::Some("type parameter `" + pname + "`")
+  when Option::None then ()
+  end
+  if residual_var_in_function(f) then
+    return Option::Some("inference variable (Type::Var)")
+  end
+  Option::None
+end
+
+# Find the first Type::Param name anywhere in a function's instantiated
+# types (params, return type, locals).
+def first_param_name_in_function(f: &MirFunction) -> Option[String]
+  match first_param_name_in_type(&f.ret_type)
+  when Option::Some(n) then return Option::Some(n)
+  when Option::None then ()
+  end
+  for p in f.params do
+    match first_param_name_in_type(&p.ty)
+    when Option::Some(n) then return Option::Some(n)
+    when Option::None then ()
+    end
+  end
+  for l in f.locals do
+    match first_param_name_in_type(&l.ty)
+    when Option::Some(n) then return Option::Some(n)
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+# Find the first Type::Param name in a type (mirrors type_has_params).
+def first_param_name_in_type(ty: &Type) -> Option[String]
+  match ty
+  when Type::Param(name) then Option::Some(name.clone())
+  when Type::Tuple(elems) then
+    for e in elems do
+      match first_param_name_in_type(&e)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Type::Function(params, ret) then
+    for p in params do
+      match first_param_name_in_type(&p.ty)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    first_param_name_in_type(ret)
+  when Type::Adt(_, args) then
+    for a in args do
+      match first_param_name_in_type(&a)
+      when Option::Some(n) then return Option::Some(n)
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Type::RefInternal(inner, _) then first_param_name_in_type(inner)
+  when Type::Ptr(inner) then first_param_name_in_type(inner)
+  when Type::PtrMut(inner) then first_param_name_in_type(inner)
+  when Type::Effect(_, inner) then first_param_name_in_type(inner)
+  when _ then Option::None
+  end
+end
+
+# Whether any unresolved Type::Var appears anywhere in a function's
+# instantiated types.
+def residual_var_in_function(f: &MirFunction) -> Bool
+  if type_has_unresolved_var(&f.ret_type) then return true end
+  for p in f.params do
+    if type_has_unresolved_var(&p.ty) then return true end
+  end
+  for l in f.locals do
+    if type_has_unresolved_var(&l.ty) then return true end
+  end
+  false
+end
+
+# Whether a type contains any Type::Var (mirrors type_has_params).
+def type_has_unresolved_var(ty: &Type) -> Bool
+  match ty
+  when Type::Var(_) then true
+  when Type::Tuple(elems) then
+    var found = false
+    for e in elems do
+      if type_has_unresolved_var(&e) then found = true; break end
+    end
+    found
+  when Type::Function(params, ret) then
+    var found = false
+    for p in params do
+      if type_has_unresolved_var(&p.ty) then found = true; break end
+    end
+    found || type_has_unresolved_var(ret)
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if type_has_unresolved_var(&a) then found = true; break end
+    end
+    found
+  when Type::RefInternal(inner, _) then type_has_unresolved_var(inner)
+  when Type::Ptr(inner) then type_has_unresolved_var(inner)
+  when Type::PtrMut(inner) then type_has_unresolved_var(inner)
+  when Type::Effect(_, inner) then type_has_unresolved_var(inner)
+  when _ then false
+  end
+end
+
+# P0-AL (final): the ONE exhaustive substitution visitor — the sole
+# substitution path into a specialized body. Every structural Type variant
+# (Adt/Tuple/Function/RefInternal/Ptr/PtrMut/Effect) is rebuilt with its
+# inner types substituted; the builtin compound types are Adt forms (their
+# args carry the inner types — the canonical variants no longer exist); the
+# non-structural variants (primitives, Var, Error, Dyn) are identity-cloned
+# by the fallback arm. The post-instantiation verification
+# (residual_param_in_function) rejects any Param/Var the visitor leaves
+# behind.
+def substitute_type(subst: &TypeSubstMap, ty: &Type) -> Type
+  match ty
+  when Type::Param(name) then
+    match subst.params.get(&name)
+    when Option::Some(concrete) then concrete.clone()
+    when Option::None then ty.clone()
+    end
+  when Type::RefInternal(inner, mutable) then Type::RefInternal(Box::new(substitute_type(subst, inner)), mutable)
+  when Type::Ptr(inner) then Type::Ptr(Box::new(substitute_type(subst, inner)))
+  when Type::PtrMut(inner) then Type::PtrMut(Box::new(substitute_type(subst, inner)))
+  when Type::Effect(effects, inner) then Type::Effect(effects.clone(), Box::new(substitute_type(subst, inner)))
+  when Type::Tuple(elems) then
+    var subs = Vec::new()
+    for e in elems do
+      subs.push(substitute_type(subst, &e))
+    end
+    Type::Tuple(subs)
+  when Type::Function(params, ret) then
+    var sub_params = Vec::new()
+    for p in params do
+      sub_params.push(ParamType { ty: substitute_type(subst, &p.ty), convention: p.convention })
+    end
+    Type::Function(sub_params, Box::new(substitute_type(subst, ret)))
+  when Type::Adt(id, args) then
+    var sub_args = Vec::new()
+    for a in args do
+      sub_args.push(substitute_type(subst, &a))
+    end
+    Type::Adt(id, sub_args)
+  when _ then ty.clone()
+  end
+end
+
+# The EXHAUSTIVE statement substitution: every MirStatementKind variant is
+# rebuilt; every operand/place/rvalue inside is substituted.
+def substitute_statement(subst: &TypeSubstMap, stmt: &MirStatement) -> MirStatement
+  match stmt.kind
+  when MirStatementKind::MirAssign(place, rvalue) then
+    MirStatement {
+      kind: MirStatementKind::MirAssign(substitute_place(subst, &place), substitute_rvalue(subst, &rvalue)),
+      span: stmt.span.clone()
+    }
+  when MirStatementKind::MirStorageLive(local) then
+    MirStatement { kind: MirStatementKind::MirStorageLive(local.clone()), span: stmt.span.clone() }
+  when MirStatementKind::MirStorageDead(local) then
+    MirStatement { kind: MirStatementKind::MirStorageDead(local.clone()), span: stmt.span.clone() }
+  when MirStatementKind::MirNop then
+    MirStatement { kind: MirStatementKind::MirNop, span: stmt.span.clone() }
+  when MirStatementKind::MirContractCheck(contract, op) then
+    MirStatement {
+      kind: MirStatementKind::MirContractCheck(substitute_contract(subst, &contract), substitute_operand(subst, &op)),
+      span: stmt.span.clone()
+    }
+  when MirStatementKind::MirBudgetConsume(resource, amount) then
+    MirStatement { kind: MirStatementKind::MirBudgetConsume(resource.clone(), amount), span: stmt.span.clone() }
+  when MirStatementKind::MirEffectRecord(effect, op) then
+    MirStatement {
+      kind: MirStatementKind::MirEffectRecord(effect.clone(), substitute_operand(subst, &op)),
+      span: stmt.span.clone()
+    }
+  end
+end
+
+def substitute_contract(subst: &TypeSubstMap, contract: &MirContract) -> MirContract
+  MirContract {
+    kind: contract.kind.clone(),
+    condition: substitute_operand(subst, &contract.condition),
+    message: contract.message.clone(),
+    span: contract.span.clone()
+  }
+end
+
+# The EXHAUSTIVE rvalue substitution: EVERY MirRvalueKind variant is
+# rebuilt recursively via substitute_operand / substitute_place /
+# substitute_type — a generic type or instance payload hidden in any
+# rvalue shape (moves, references, aggregates, binops, casts, repeats)
+# is substituted, never left behind by a fallthrough clone.
+def substitute_rvalue(subst: &TypeSubstMap, rvalue: &MirRvalue) -> MirRvalue
+  match rvalue.kind
+  when MirRvalueKind::MirMove(op) then
+    MirRvalue { kind: MirRvalueKind::MirMove(substitute_operand(subst, &op)) }
+  when MirRvalueKind::MirRef(place) then
+    MirRvalue { kind: MirRvalueKind::MirRef(substitute_place(subst, &place)) }
+  when MirRvalueKind::MirAggregate(kind, ops) then
+    # Substitute type in aggregate kind if it references generics, and
+    # substitute every aggregate operand.
+    var new_ops = Vec::new()
+    for op in ops do
+      new_ops.push(substitute_operand(subst, &op))
+    end
+    MirRvalue { kind: MirRvalueKind::MirAggregate(substitute_aggregate_kind(subst, &kind), new_ops) }
+  when MirRvalueKind::MirBinOp(bop, lhs, rhs) then
+    MirRvalue {
+      kind: MirRvalueKind::MirBinOp(bop.clone(), substitute_operand(subst, &lhs), substitute_operand(subst, &rhs))
+    }
+  when MirRvalueKind::MirUnOp(uop, op) then
+    MirRvalue { kind: MirRvalueKind::MirUnOp(uop.clone(), substitute_operand(subst, &op)) }
+  when MirRvalueKind::MirDiscriminant(place) then
+    MirRvalue { kind: MirRvalueKind::MirDiscriminant(substitute_place(subst, &place)) }
+  when MirRvalueKind::MirLen(place) then
+    MirRvalue { kind: MirRvalueKind::MirLen(substitute_place(subst, &place)) }
+  when MirRvalueKind::MirCast(ckind, op, target_ty) then
+    MirRvalue {
+      kind: MirRvalueKind::MirCast(ckind.clone(), substitute_operand(subst, &op), substitute_type(subst, &target_ty))
+    }
+  when MirRvalueKind::MirRepeat(op, n) then
+    MirRvalue { kind: MirRvalueKind::MirRepeat(substitute_operand(subst, &op), n) }
+  when MirRvalueKind::MirPhi(pairs) then
+    MirRvalue { kind: MirRvalueKind::MirPhi(pairs.clone()) }
+  end
+end
+
+# The EXHAUSTIVE aggregate-kind substitution. MirArray(T) substitutes the
+# element type (the array aggregate's element type may carry a generic
+# parameter); the remaining kinds carry no type payload.
+def substitute_aggregate_kind(subst: &TypeSubstMap, kind: &AggregateKind) -> AggregateKind
+  match kind
+  when AggregateKind::Tuple then AggregateKind::Tuple
+  when AggregateKind::MirArray(ty) then AggregateKind::MirArray(substitute_type(subst, ty))
+  when AggregateKind::Struct(tid, fields) then AggregateKind::Struct(tid.clone(), fields.clone())
+  when AggregateKind::Closure(tid) then AggregateKind::Closure(tid.clone())
+  when AggregateKind::Generator(tid) then AggregateKind::Generator(tid.clone())
+  end
+end
+
+# Substitute types in an operand (recursively substitutes in places and
+# constants). ZERO-INFERENCE: the MirFnItem's INSTANCE payload substs are
+# substituted under the CALLER's specialization map too — a solved instance
+# that still carries the caller's generic parameters ([Param "T"] from a
+# still-generic caller, deferred by the monomorphizer's worklist) becomes
+# the CONCRETE instance ([Int]) inside the specialized caller's body, so
+# the re-walk enqueues it with zero inference. A subst entry the caller's
+# map does not cover stays Param-carrying and keeps deferring.
+def substitute_operand(subst: &TypeSubstMap, op: &MirOperand) -> MirOperand
+  match op.kind
+  when MirOperandKind::MirCopy(place) then
+    MirOperand { kind: MirOperandKind::MirCopy(substitute_place(subst, &place)) }
+  when MirOperandKind::MirMovePlace(place) then
+    MirOperand { kind: MirOperandKind::MirMovePlace(substitute_place(subst, &place)) }
+  when MirOperandKind::MirRead(place) then
+    MirOperand { kind: MirOperandKind::MirRead(substitute_place(subst, &place)) }
+  when MirOperandKind::MirConsume(place) then
+    MirOperand { kind: MirOperandKind::MirConsume(substitute_place(subst, &place)) }
+  when MirOperandKind::MirConstant(c) then
+    MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+      kind: c.kind.clone(),
+      ty: substitute_type(subst, &c.ty),
+      instance: match c.instance.clone()
+      when Option::Some(inst) then
+        var new_substs = Vec::new()
+        for s in inst.substs do
+          new_substs.push(substitute_type(subst, &s))
+        end
+        Option::Some(InstanceId { def: inst.def.clone(), substs: new_substs })
+      when Option::None then Option::None
+      end
+    })}
+  end
+end
+
+# Substitute types in a place (places are local + projections, types are in locals)
+def substitute_place(subst: &TypeSubstMap, place: &Place) -> Place
+  Place {
+    local: place.local.clone(),
+    projections: place.projections.clone()
+  }
+end
+
+def substitute_call_arg(subst: &TypeSubstMap, arg: &MirCallArg) -> MirCallArg
+  MirCallArg {
+    effect: arg.effect.clone(),
+    value: match arg.value
+    when MirCallValue::Value(op) then MirCallValue::Value(substitute_operand(subst, &op))
+    when MirCallValue::Place(p) then MirCallValue::Place(substitute_place(subst, &p))
+    end
+  }
+end
+
+# The EXHAUSTIVE terminator substitution: every MirTerminatorKind variant
+# is rebuilt; call/assert/switch/deinit payloads are substituted,
+# including the assertion message's operands.
+def substitute_terminator(subst: &TypeSubstMap, term: &MirTerminator) -> MirTerminator
+  let new_kind = match term.kind
+  when MirTerminatorKind::MirGoto(target) then MirTerminatorKind::MirGoto(target.clone())
+  when MirTerminatorKind::MirReturn then MirTerminatorKind::MirReturn
+  when MirTerminatorKind::MirUnreachable then MirTerminatorKind::MirUnreachable
+  when MirTerminatorKind::MirSwitchInt(discr, targets, default_target) then
+    let new_discr = substitute_operand(subst, &discr)
+    MirTerminatorKind::MirSwitchInt { op: new_discr, targets: targets.clone(), default_target: default_target.clone() }
+  when MirTerminatorKind::MirCall(dest, func_op, args, target, unwind) then
+    # Mangle callee name with substituted type arguments
+    let mangled_op = substitute_operand(subst, &func_op)
+    # Substitute types in arguments
+    var new_args = Vec::new()
+    for arg in args do
+      new_args.push(substitute_call_arg(subst, arg))
+    end
+    # Substitute return type in destination
+    let new_dest = substitute_place(subst, &dest)
+    MirTerminatorKind::MirCall {
+      dest: new_dest,
+      func: mangled_op,
+      args: new_args,
+      success: target.clone(),
+      unwind: unwind.clone()
+    }
+  when MirTerminatorKind::MirAssert(cond, expected, msg, target, unwind) then
+    let new_cond = substitute_operand(subst, &cond)
+    MirTerminatorKind::MirAssert {
+      cond: new_cond,
+      expected: expected.clone(),
+      msg: substitute_assert_message(subst, &msg),
+      target: target.clone(),
+      unwind: unwind.clone()
+    }
+  when MirTerminatorKind::MirAbort then MirTerminatorKind::MirAbort
+  when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
+    let new_place = substitute_place(subst, &place)
+    MirTerminatorKind::MirDeinit { place: new_place, deinit_fn: deinit_fn.clone(), target: target.clone(), unwind: unwind.clone() }
+  end
+  MirTerminator { kind: new_kind, span: term.span.clone() }
+end
+
+def substitute_assert_message(subst: &TypeSubstMap, msg: &AssertMessage) -> AssertMessage
+  match msg
+  when AssertMessage::BoundsCheck(op1, op2) then
+    AssertMessage::BoundsCheck(substitute_operand(subst, op1), substitute_operand(subst, op2))
+  when AssertMessage::Overflow(bop) then AssertMessage::Overflow(bop.clone())
+  when AssertMessage::DivisionByZero then AssertMessage::DivisionByZero
+  when AssertMessage::RemainderByZero then AssertMessage::RemainderByZero
+  when AssertMessage::NullPointer then AssertMessage::NullPointer
+  when AssertMessage::ContractViolation(message) then AssertMessage::ContractViolation(message.clone())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Call-Site Rewriting
+# ———————————————————————————————————————————————————————————————
+
+# After monomorphization, rewrite all call sites that reference generic
+# functions so they point to the specialized (mangled) version instead.
+def rewrite_call_sites_in_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Unit
+  # Pre-build a set of generic function names for fast lookup
+  var generic_names = Set::new()
+  for f in mir.functions do
+    if is_generic_function(f) then
+      generic_names.insert(f.name.clone())
+    end
+  end
+
+  for func in mir.functions do
+    for block in func.blocks do
+      match block.terminator.kind
+      when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
+        match callee.kind
+        when MirOperandKind::MirConstant(const_val) then
+          match const_val.kind
+          when MirConstantKind::MirFnItem(callee_name) then
+            # Only process calls to known generic functions
+            if generic_names.contains(&callee_name) then
+              # Look up the function definition in the program
+              for candidate in mir.functions do
+                if candidate.name == callee_name then
+                  # P0-AL (final): a SOLVED INSTANCE is the AUTHORITY. When
+                  # the call operand's MirConstant carries an instance with
+                  # NON-EMPTY substs (the type checker solved this call's
+                  # generic arguments), use inst.substs as the type args
+                  # DIRECTLY — zero inference for this call; instance_key
+                  # produces the mangled name.
+                  # ZERO-INFERENCE (fail-closed): there is NO fallback here.
+                  # A call whose instance is not usable yet (None/empty
+                  # substs, or solved substs still carrying Params from a
+                  # still-generic caller) is left pointing at its base name:
+                  # the caller's specialization substitutes the payload
+                  # (substitute_operand carries the instance through), and
+                  # the worklist Phase 1 enqueues it in a later iteration.
+                  # A genuinely instance-less generic call was already
+                  # reported by Phase 1; the rewrite pass never infers.
+                  var mangled = "".to_string()
+                  match const_val.instance.clone()
+                  when Option::Some(inst) then
+                    if !inst.substs.is_empty() && !has_any_param_types(&inst.substs) then
+                      mangled = instance_key(cache, &inst)
+                    end
+                  when Option::None then ()
+                  end
+                  if cache.specialized_bodies.contains_key(&mangled) then
+                    # Rewrite the call site to use the mangled name. The
+                    # rewritten MirFnItem KEEPS the constant's P0-AK instance
+                    # payload (the semantic callee identity survives the
+                    # emission-key rewrite).
+                    block.terminator.kind = MirTerminatorKind::MirCall(
+                      dest.clone(),
+                      MirOperand {
+                        kind: MirOperandKind::MirConstant(MirConstant {
+                          kind: MirConstantKind::MirFnItem(mangled),
+                          ty: const_val.ty.clone(),
+                          instance: const_val.instance.clone()
+                        })
+                      },
+                      args.clone(),
+                      success.clone(),
+                      unwind.clone()
+                    )
+                  end
+                  break
+                end
+              end
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+end
+
+# Check if any type in a vector contains Type::Param.
+def has_any_param_types(types: &Vec[Type]) -> Bool
+  for ty in types do
+    if type_has_params(ty) then return true end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Monomorphize Program: instance WORK QUEUE entry point
+# ———————————————————————————————————————————————————————————————
+# P0-AL (final): the worklist is instance-driven — a real work queue of
+# INSTANCES (`pending`, seeded with the generic call sites of the program)
+# plus a `seen` set, so each instance is specialized AT MOST ONCE. There is
+# no iteration ceiling: the queue drains for every FINITE instance set;
+# only a genuinely infinite generic expansion (recursive instantiation
+# that keeps minting fresh instances) can outrun MAX_MONO_INSTANCES, which
+# reports a monomorphization-recursion diagnostic instead of silently
+# giving up.
+#
+# Each call's callee instance is the SOLVED substitution the type checker
+# recorded for the call node (typed_call_instances, threaded through the
+# MirFnItem's InstanceId payload). The worklist specializes each discovered
+# instance and then REWALKS the specialized bodies' calls, discovering the
+# callee instances TRANSITIVELY — the exhaustive walk. The checker solves
+# EVERY source-call shape (impl-registry methods, builtin-method generics,
+# extension-impl methods, and return-type-only parameters via the caller's
+# annotation context, resolved by resolve_pending_call_instances at the end
+# of type checking).
+#
+# ZERO-INFERENCE INVARIANT (the monomorphizer entry): every generic call
+# reaching this pass carries its solved instance. The instance payload is
+# the ONLY authority for type arguments — there is no call-site inference
+# over the program's call graph. Three shapes are handled without
+# inference:
+#   1. a call whose instance is already concrete enters under instance_key;
+#   2. a call whose SOLVED substs still carry the caller's generic
+#      parameters (a still-generic caller) DEFERS: the caller's own
+#      specialization substitutes the payload (substitute_operand carries
+#      the instance through), and the re-walk enqueues the now-concrete
+#      instance — zero inference;
+#   3. a call with NO instance payload (or an empty one) on a GENERIC base
+#      FAILS CLOSED — an error is recorded; inference is never performed.
+#
+# RESULT INTERFACE: the errors collected by the queue (fail-closed gaps and
+# residual-param violations) ABORT the compilation — monomorphize_program
+# returns Result::Err(errors) and the caller (compiler_core's compile
+# pipeline) propagates. On Ok, every discovered instance is specialized and
+# ONE final rewrite pass points every generic call site at its mangled
+# instance name.
+pub def monomorphize_program(mir: &mut MirProgram, cache: &mut MonoCache) -> Result[Unit, Vec[String]]
+  var pending: VecDeque[(String, InstanceId)] = VecDeque::new()
+  var seen: Set[String] = Set::new()
+  var errors: Vec[String] = Vec::new()
+  var specialized_count = 0
+
+  # Phase 1 (seed): collect generic call sites. A work queue entry carries
+  # (callee emission name, instance): the NAME is the call site's emission
+  # identity — the key the generic definition is registered under in
+  # mir.functions (top-level functions: the fn_owner_key_of_def rendering,
+  # which IS the instance's base name; methods: the pre-mangled
+  # "Type__method" name, per the P0-AM exemption); the INSTANCE is the
+  # SOLVED (def, substs) payload — a call whose MirFnItem constant carries
+  # a solved, fully concrete instance enters under the INSTANCE's key
+  # (instance_key).
+  # P0-AL (final): the recorded instances cover every shape the checker
+  # solves — the impl-registry generic methods, the builtin-method
+  # generics (Option::map / Result::and_then / ...), the extension-impl
+  # methods (`impl[T, I: Iterator[T]] I`), and the return-type-only
+  # parameters solved by the caller's annotation context
+  # (resolve_pending_call_instances). ZERO-INFERENCE (fail-closed): a call
+  # with a generic base and NO usable instance payload records an error
+  # instead of inferring — every generic call reaching the monomorphizer
+  # carries its solved instance; inference is not performed on the
+  # program's call graph.
+  for func in mir.functions do
+    scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
+  end
+
+  # Phase 2: drain the queue. Each pop specializes ONE instance (cache key:
+  # the instance's key — the same name the rewrite pass will emit). The
+  # seen-set is checked at ENQUEUE time, so an instance is popped at most
+  # once; the specialized body's own call sites are re-walked immediately,
+  # discovering callee instances transitively (deferred instances become
+  # concrete under the caller's substitution and enter the queue here).
+  while !pending.is_empty() do
+    match pending.pop_front()
+    when Option::Some((callee_name, inst)) then
+      let key = instance_key(cache, &inst)
+      # Cache hit (specialized by an earlier pop or by the external APIs):
+      # nothing to do — the body is already in the program.
+      if !cache.specialized_bodies.contains_key(&key) then
+        var found: Option[&MirFunction] = Option::None
+        for f in mir.functions do
+          if f.name == callee_name then
+            found = Option::Some(f)
+            break
+          end
+        end
+        match found
+        when Option::Some(original) then
+          let type_param_names = function_generic_param_names(original)
+          if !type_param_names.is_empty() then
+            match specialize_function_named(cache, original, &type_param_names, &inst.substs, key.clone())
+            when Result::Ok(()) then
+              # The specialized body is cached now; append it to the
+              # program and re-walk its calls (the transitive discovery).
+              match cache.specialized_bodies.get(&key)
+              when Option::Some(body) then
+                mir.functions.push(body.clone())
+                scan_call_sites_in_function(body, mir, cache, &mut pending, &mut seen, &mut errors)
+              when Option::None then ()
+              end
+            when Result::Err(msg) then
+              # FAIL-CLOSED: the residual violation aborts the compilation
+              # (the body was not cached; the call site is never rewritten
+              # to a poisoned name).
+              if !errors.contains(&msg) then
+                errors.push(msg)
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    when Option::None then ()
+    end
+    specialized_count = specialized_count + 1
+    if specialized_count > MAX_MONO_INSTANCES then
+      let msg = "monomorphization recursion limit exceeded (" + MAX_MONO_INSTANCES.to_string() + " specialized instances) — possible infinite generic expansion; each instance specializes at most once (seen-set), so only a genuinely unbounded instance stream can reach this limit"
+      if !errors.contains(&msg) then
+        errors.push(msg)
+      end
+      return Result::Err(errors)
+    end
+  end
+
+  # Any zero-inference violation or residual-param error recorded during
+  # monomorphization aborts the compilation.
+  if !errors.is_empty() then
+    return Result::Err(errors)
+  end
+
+  # Phase 3: rewrite existing call sites to use mangled names. Every
+  # discovered instance is specialized by now, so ONE pass covers every
+  # generic call site.
+  rewrite_call_sites_in_program(mir, cache)
+  Result::Ok(())
+end
+
+# Scan one function's call sites and enqueue every generic callee that
+# carries a SOLVED, fully-concrete instance (the work-queue seed and the
+# transitive re-walk share this single enqueue path — zero inference).
+def scan_call_sites_in_function(
+  func: &MirFunction,
+  mir: &MirProgram,
+  cache: &MonoCache,
+  pending: &mut VecDeque[(String, InstanceId)],
+  seen: &mut Set[String],
+  errors: &mut Vec[String]
+) -> Unit
+  for block in func.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall(dest, callee, args, _, _) then
+      enqueue_call_instance(callee, mir, cache, pending, seen, errors)
+    when _ then ()
+    end
+  end
+end
+
+# Enqueue ONE call-site callee: when the MirFnItem constant carries a
+# SOLVED instance whose substs are fully concrete, the instance enters the
+# queue under its instance key (deduplicated by the seen-set). A payload
+# whose substs still carry Params (a still-generic caller) DEFERS — the
+# caller's specialization substitutes it and the re-walk enqueues the
+# concrete instance. A payload that is absent or empty on a generic base is
+# a compiler-internal gap: the error is recorded (fail-closed — inference
+# is never performed).
+def enqueue_call_instance(
+  callee: &MirOperand,
+  mir: &MirProgram,
+  cache: &MonoCache,
+  pending: &mut VecDeque[(String, InstanceId)],
+  seen: &mut Set[String],
+  errors: &mut Vec[String]
+) -> Unit
+  match callee.kind
+  when MirOperandKind::MirConstant(cv) then
+    match cv.kind
+    when MirConstantKind::MirFnItem(callee_name) then
+      # Look up the callee in the program — is it generic?
+      var is_generic = false
+      for candidate in mir.functions do
+        if candidate.name == callee_name then
+          is_generic = is_generic_function(candidate)
+          break
+        end
+      end
+      if is_generic then
+        match cv.instance.clone()
+        when Option::Some(inst) then
+          if !inst.substs.is_empty() then
+            # P0-AL (final): a SOLVED INSTANCE is the AUTHORITY. Only a
+            # fully-concrete payload (no Params) is enqueueable — the
+            # mangled name comes from instance_key. A payload still
+            # carrying the caller's generic parameters DEFERS (the
+            # caller's specialization substitutes it; the re-walk
+            # enqueues the concrete instance later) — zero inference.
+            if !has_any_param_types(&inst.substs) then
+              let key = instance_key(cache, &inst)
+              if !seen.contains(&key) then
+                seen.insert(key)
+                pending.push_back((callee_name.clone(), inst))
+              end
+            end
+          else
+            # ZERO-INFERENCE (fail-closed): no inference is ever performed
+            # here. An EMPTY payload on a generic base is a
+            # compiler-internal gap: record the error.
+            let msg = "generic call to `" + callee_name + "` reached the monomorphizer without a solved instance — every generic call carries its solved instance; inference is not performed on the program's call graph"
+            if !errors.contains(&msg) then
+              errors.push(msg)
+            end
+          end
+        when Option::None then
+          # ZERO-INFERENCE (fail-closed): an ABSENT payload on a generic
+          # base is a compiler-internal gap: record the error.
+          let msg = "generic call to `" + callee_name + "` reached the monomorphizer without a solved instance — every generic call carries its solved instance; inference is not performed on the program's call graph"
+          if !errors.contains(&msg) then
+            errors.push(msg)
+          end
+        end
+      end
+    when _ then ()
+    end
+  when _ then ()
+  end
+end
+
+def report_mono_errors(cache: &MonoCache) -> Unit
+  if cache.errors.is_empty() then
+    return
+  end
+  for err in cache.errors do
+    eprintln("[mono] error: " + err)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Public API: mono_specialize_function
+# ———————————————————————————————————————————————————————————————
+# Specialize a single generic function with concrete type arguments
+# and add the result to the MIR program.  Returns the mangled name
+# on success, or None if the function was not found / the specialization
+# failed the residual verification.
+pub def mono_specialize_function(
+  cache: &mut MonoCache,
+  mir: &mut MirProgram,
+  func_name: String,
+  type_args: Vec[Type]
+) -> Option[String]
+  # Find the generic function
+  var found: Option[&MirFunction] = Option::None
+  for f in mir.functions do
+    if f.name == func_name then
+      found = Option::Some(f)
+      break
+    end
+  end
+
+  match found
+  when Option::None then
+    return Option::None
+  when Option::Some(original) then
+    # If not generic, return the name as-is
+    if !is_generic_function(original) then
+      return Option::Some(func_name)
+    end
+
+    let type_param_names = function_generic_param_names(original)
+    if type_param_names.is_empty() then
+      return Option::Some(func_name)
+    end
+
+    # Specialize — specialize_function handles caching internally
+    let mangled = mangle_name(func_name.clone(), &type_args)
+    if !cache.specialized_bodies.contains_key(&mangled) then
+      match specialize_function(cache, original, &type_param_names, &type_args)
+      when Result::Ok(()) then
+        match cache.specialized_bodies.get(&mangled)
+        when Option::Some(specialized) then
+          mir.functions.push(specialized.clone())
+
+          # Rewrite call sites in the entire program to catch any calls
+          # that should now point to the mangled name
+          rewrite_call_sites_in_program(mir, cache)
+        when Option::None then ()
+        end
+      when Result::Err(msg) then
+        # FAIL-CLOSED: a residual violation means no body was cached; the
+        # specialization fails (None) and the error is reported.
+        if !cache.errors.contains(&msg) then
+          cache.errors.push(msg)
+        end
+        report_mono_errors(cache)
+        return Option::None
+      end
+    end
+
+    # Report any zero-inference violations recorded during specialization.
+    report_mono_errors(cache)
+
+    Option::Some(mangled)
+  end
+end
+
+# Public API: monomorphize_instance — the specialize path keyed by a
+# semantic InstanceId instead of a name string. A caller that holds the
+# call site's (def, substs) requests the instance directly; the body is
+# produced through the SAME specialize_function path as the worklist
+# monomorphizer, so cache identity and mangling stay single-sourced.
+#
+# NOTE (P0-AK layer): the MIR call lowering records the DefId with EMPTY
+# substs when the checker recorded no solved substitution — under the
+# ZERO-INFERENCE invariant such a call is a compiler-internal gap (the
+# worklist monomorphizer records an error for it, and the type checker
+# reports the genuinely unconstrained shape at end of checking); an
+# instance requested directly in this layer must therefore already carry
+# concrete substitutions, and empty substs are rejected here.
+# P0-AM (final): the base-name lookup below is the DefId rendering
+# (fn_owner_key_of_def over the cache's program/resolutions snapshot) —
+# and MirFunction names ARE that same rendering for top-level functions
+# (mir.tg's lower_program records mir_fn_emission_name from item_defs via
+# the same fn_owner_key_of_def render), so the seam is closed: the
+# instance's base name and the lowered function's emission name agree
+# byte-for-byte, and the `f.name == base` search below finds the
+# definition. Methods stay name-based (the "Type__method" mangled
+# identities), and the OS-entry function keeps its source name (the
+# linking boundary).
+pub def monomorphize_instance(
+  cache: &mut MonoCache,
+  mir: &mut MirProgram,
+  instance: &InstanceId
+) -> Result[Unit, String]
+  let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
+  if instance.substs.is_empty() then
+    return Result::Err("instance " + base + " has empty substitutions — every generic call carries its solved instance; inference is not performed on the program's call graph")
+  end
+  let mangled = mangle_name(base.clone(), &instance.substs)
+  if cache.specialized_bodies.contains_key(&mangled) then
+    return Result::Ok(())
+  end
+  var found: Option[&MirFunction] = Option::None
+  for f in mir.functions do
+    if f.name == base then
+      found = Option::Some(f)
+      break
+    end
+  end
+  match found
+  when Option::Some(original) then
+    let type_param_names = function_generic_param_names(original)
+    if type_param_names.is_empty() then
+      return Result::Ok(())
+    end
+    match specialize_function_named(cache, original, &type_param_names, &instance.substs, mangled.clone())
+    when Result::Ok(()) then
+      match cache.specialized_bodies.get(&mangled)
+      when Option::Some(specialized) then
+        mir.functions.push(specialized.clone())
+      when Option::None then ()
+      end
+      rewrite_call_sites_in_program(mir, cache)
+      Result::Ok(())
+    when Result::Err(msg) then
+      Result::Err(msg)
+    end
+  when Option::None then
+    Result::Err("instance base `" + base + "` not found in the MIR program")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Generic-Parameter Names (P0-BT / reviewer item 67)
+# ———————————————————————————————————————————————————————————————
+# The AUTHORITATIVE declaration-order generic parameter names of a
+# function. MirFunction.generic_params (mir.tg) is the typed-metadata
+# population point — the checker's generic-param list, filled by the MIR
+# builder when the typed metadata is available. When the field is empty
+# (not yet populated), the declaration-order names are DERIVED from the
+# function's signature types (params, then return type, then locals) —
+# first-appearance order, which is declaration order for the params that
+# appear in the signature.
+def function_generic_param_names(func: &MirFunction) -> Vec[String]
+  if !func.generic_params.is_empty() then
+    return func.generic_params.clone()
+  end
+  infer_type_param_names(func)
+end
+
+def infer_type_param_names(func: &MirFunction) -> Vec[String]
+  # Scan function locals/params for Param types and collect their names
+  var names = Vec::new()
+  var seen = Set::new()
+  
+  for param in func.params do
+    collect_type_params(&param.ty, &mut names, &mut seen)
+  end
+  collect_type_params(&func.ret_type, &mut names, &mut seen)
+  for local in func.locals do
+    collect_type_params(&local.ty, &mut names, &mut seen)
+  end
+  names
+end
+
+def collect_type_params(ty: &Type, names: &mut Vec[String], seen: &mut Set[String]) -> Unit
+  match ty
+  when Type::Param(name) then
+    if !seen.contains(&name) then
+      seen.insert(name.clone())
+      names.push(name.clone())
+    end
+  when Type::Tuple(elems) then
+    for e in elems do
+      collect_type_params(&e, names, seen)
+    end
+  when Type::Function(params, ret) then
+    for p in params do
+      collect_type_params(&p.ty, names, seen)
+    end
+    collect_type_params(ret, names, seen)
+  when Type::Adt(_, args) then
+    for a in args do
+      collect_type_params(&a, names, seen)
+    end
+  when Type::RefInternal(inner, _) then collect_type_params(inner, names, seen)
+  when Type::Ptr(inner) then collect_type_params(inner, names, seen)
+  when Type::PtrMut(inner) then collect_type_params(inner, names, seen)
+  when Type::Effect(_, inner) then collect_type_params(inner, names, seen)
+  when _ then ()
+  end
+end
+
+# Generate mangled name for a monomorphized function
+def mangle_name(base: String, type_args: &Vec[Type]) -> String
+  var name = base + "$"
+  var first = true
+  for ty in type_args do
+    if !first then
+      name = name + "_"
+    end
+    name = name + type_to_mangled(ty)
+    first = false
+  end
+  name
+end
+
+# ———————————————————————————————————————————————————————————————
+# Tangerine ABI Symbol Mangling (extern "tangerine")
+# ———————————————————————————————————————————————————————————————
+# Format: _TG{edition}_{revision}_{pkgHash}_{moduleLen}:{modulePath}_{nameLen}:{name}_{sigHash}_{substHash}
+#
+# The PUBLIC external symbol identity of an exported (pub) top-level
+# function of a library compilation — NEVER the ephemeral DefId/TypeId
+# indices (reviewer items 104-105: "Do not use ephemeral DefId indices as
+# the public Tangerine ABI"). The components ARE the public identity:
+#   edition    — language edition (TANGERINE_ABI_EDITION, e.g. "2026")
+#   revision   — ABI revision (TANGERINE_ABI_REVISION; bump on any change
+#                to the canonicalization below)
+#   pkgHash    — 64-bit hex of the package identity (the PackageId: name +
+#                version, FNV-1a)
+#   modulePath — length-prefixed module path (e.g. "std::collections")
+#   name       — length-prefixed PUBLIC SOURCE name of the function
+#   sigHash    — 64-bit hex of the CANONICAL signature (ONE type
+#                canonicalizer, tangerine_abi_canon_type, exhaustive over
+#                every Type variant: parameter access conventions, effects,
+#                fixed-array lengths, tuple structure, ADT stable paths)
+#   substHash  — 64-bit hex of the canonical generic substitutions in the
+#                DECLARED parameter order (the InstanceId.substs Vec order —
+#                the ABI mangling never iterates a Map); 0 for a
+#                non-generic export
+#
+# INTERNAL-vs-EXTERNAL (reviewer item 104): the internal emission names —
+# the fn_owner_key DefId renderings (instance_key / mangle_name) — remain
+# the single-compilation labels (codegen's resolve_callee_label authority
+# within one compilation); the TANGERINE_ABI mangling is the EXTERNAL
+# identity ONLY. tangerine_exported_symbol_name is the boundary: exported
+# (pub) functions of a library compilation get the ABI-mangled name; every
+# other function keeps its internal emission name. The ABI canonicalizer
+# is FAIL-CLOSED (reviewer item 105): a type that cannot be canonicalized
+# (Param / Var / Error / an Adt with no stable path) fails the mangling
+# with an error — there is NO "unknown"/"any" collapse in the ABI path.
+
+pub const TANGERINE_ABI_EDITION: String = "2026"
+pub const TANGERINE_ABI_REVISION: UInt = 1
+
+# THE one canonical type walk for the Tangerine ABI (reviewer item 105:
+# "One type canonicalizer. No 'unknown' fallback."). Exhaustive over every
+# Type variant with a distinct, deterministic rendering:
+#   primitives  — unit/bool/int/uint/float/char/str/never/i8..f64
+#   Adt         — T[<module path>::<source name>][<args in order>] — the
+#                 ADT STABLE PATH (module path + public source name), never
+#                 the ephemeral TypeId index
+#   FixedArray  — A[<elem>;<count>] — the fixed array LENGTH is part of the
+#                 identity
+#   Function    — F[<convention>:<ty>,...|<ret>] — the PARAMETER ACCESS
+#                 CONVENTIONS are part of the identity
+#   RefInternal — R[mut|ref|<inner>]
+#   Ptr/PtrMut  — P[<inner>] / Q[<inner>]
+#   Dyn         — D[<stable trait path>]
+#   Effect      — E[<effects>,...|<inner>] — the effect set is ABI-relevant
+#   Tuple       — (<elems in order>)
+#   Param/Var/Error — FAIL-CLOSED: they must NOT appear in a public ABI
+#                 symbol (an instance with unresolved parameters/inference
+#                 variables is not codegen-ready); the mangling errors
+#                 instead of collapsing to a placeholder.
+# The canonical string is the input to the signature hash, so the symbol
+# is self-consistent per (edition, revision) and deterministic across
+# compilations: module paths and source names come from the crate module
+# table and the semantic type table, never from per-compilation counters.
+def tangerine_abi_canon_type(stable_paths: &Map[Int, String], ty: &Type) -> Result[String, String]
+  match ty
+  when Type::Unit then Result::Ok("unit")
+  when Type::Bool then Result::Ok("bool")
+  when Type::Int then Result::Ok("int")
+  when Type::UInt then Result::Ok("uint")
+  when Type::Float then Result::Ok("float")
+  when Type::Char then Result::Ok("char")
+  when Type::String then Result::Ok("str")
+  when Type::Never then Result::Ok("never")
+  when Type::I8 then Result::Ok("i8")
+  when Type::I16 then Result::Ok("i16")
+  when Type::I32 then Result::Ok("i32")
+  when Type::I64 then Result::Ok("i64")
+  when Type::I128 then Result::Ok("i128")
+  when Type::U8 then Result::Ok("u8")
+  when Type::U16 then Result::Ok("u16")
+  when Type::U32 then Result::Ok("u32")
+  when Type::U64 then Result::Ok("u64")
+  when Type::U128 then Result::Ok("u128")
+  when Type::ISize then Result::Ok("isize")
+  when Type::USize then Result::Ok("usize")
+  when Type::F32 then Result::Ok("f32")
+  when Type::F64 then Result::Ok("f64")
+  when Type::Tuple(elems) then
+    var parts = Vec::new()
+    for e in elems do
+      match tangerine_abi_canon_type(stable_paths, &e)
+      when Result::Ok(c) then parts.push(c)
+      when Result::Err(msg) then return Result::Err(msg)
+      end
+    end
+    Result::Ok("(" + parts.join(",") + ")")
+  when Type::Function(params, ret) then
+    var parts = Vec::new()
+    for p in params do
+      match tangerine_abi_canon_type(stable_paths, &p.ty)
+      when Result::Ok(c) then parts.push(tangerine_abi_convention(&p.convention) + ":" + c)
+      when Result::Err(msg) then return Result::Err(msg)
+      end
+    end
+    match tangerine_abi_canon_type(stable_paths, ret)
+    when Result::Ok(rc) then Result::Ok("F[" + parts.join(",") + "|" + rc + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::Adt(tid, args) then
+    match stable_paths.get(tid.id)
+    when Option::Some(path) then
+      if args.is_empty() then
+        Result::Ok("T[" + path.clone() + "]")
+      else
+        var parts = Vec::new()
+        for a in args do
+          match tangerine_abi_canon_type(stable_paths, &a)
+          when Result::Ok(c) then parts.push(c)
+          when Result::Err(msg) then return Result::Err(msg)
+          end
+        end
+        Result::Ok("T[" + path.clone() + "][" + parts.join(",") + "]")
+      end
+    when Option::None then
+      Result::Err("tangerine ABI: TypeId " + tid.id.to_string() + " has no stable path (not a source struct/enum/trait/alias, or its name is ambiguous across modules) — cannot canonicalize this Adt for the public ABI")
+    end
+  when Type::FixedArray(elem, n) then
+    match tangerine_abi_canon_type(stable_paths, elem)
+    when Result::Ok(ec) then Result::Ok("A[" + ec + ";" + n.to_string() + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::RefInternal(inner, mutable) then
+    match tangerine_abi_canon_type(stable_paths, inner)
+    when Result::Ok(ic) then
+      let tag = if mutable then "mut" else "ref" end
+      Result::Ok("R[" + tag + "|" + ic + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::Ptr(inner) then
+    match tangerine_abi_canon_type(stable_paths, inner)
+    when Result::Ok(ic) then Result::Ok("P[" + ic + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::PtrMut(inner) then
+    match tangerine_abi_canon_type(stable_paths, inner)
+    when Result::Ok(ic) then Result::Ok("Q[" + ic + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::Dyn(tid) then
+    match stable_paths.get(tid.id)
+    when Option::Some(path) then Result::Ok("D[" + path.clone() + "]")
+    when Option::None then
+      Result::Err("tangerine ABI: trait object TypeId " + tid.id.to_string() + " has no stable path — cannot canonicalize this Dyn for the public ABI")
+    end
+  when Type::Effect(effects, inner) then
+    match tangerine_abi_canon_type(stable_paths, inner)
+    when Result::Ok(ic) then Result::Ok("E[" + effects.join(",") + "|" + ic + "]")
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Type::Param(name) then
+    Result::Err("tangerine ABI: type parameter `" + name.clone() + "` cannot appear in a public ABI symbol (canonicalize the instance first)")
+  when Type::Var(_) then
+    Result::Err("tangerine ABI: inference variable (Type::Var) cannot appear in a public ABI symbol (resolve before mangling)")
+  when Type::Error then
+    Result::Err("tangerine ABI: Type::Error cannot appear in a public ABI symbol")
+  end
+end
+
+# The parameter access convention of the canonical signature — part of the
+# public ABI identity (two functions differing only in the access
+# convention of a parameter must mangle differently).
+def tangerine_abi_convention(c: &AccessConvention) -> String
+  match c
+  when AccessConvention::Let then "let"
+  when AccessConvention::Inout then "inout"
+  when AccessConvention::Sink then "sink"
+  when AccessConvention::Set then "set"
+  end
+end
+
+# The stable path of an Adt/Dyn: "<module path>::<source name>" — the
+# module path from the crate containment scan (Program.crate.modules), the
+# source name from the semantic type table (the typed program's type_names:
+# TypeId -> name). A type whose name belongs to NO source item (a
+# compiler-synthesized id) or to MORE THAN ONE (a same-name collision
+# across modules) gets NO entry: the canonicalizer then fails closed with
+# an error instead of guessing — the ABI never falls back to the ephemeral
+# TypeId index.
+pub def tangerine_abi_stable_paths(cache: &MonoCache, type_names: &Map[Int, String]) -> Map[Int, String]
+  # Pass 1: count the source items per bare name (ambiguity detection).
+  var name_counts = Map::new()
+  for item in cache.program.items do
+    let item_name = source_item_name(item)
+    if !item_name.is_empty() then
+      match name_counts.get(&item_name)
+      when Option::Some(n) then name_counts.insert(item_name.clone(), n + 1)
+      when Option::None then name_counts.insert(item_name.clone(), 1)
+      end
+    end
+  end
+  # Pass 2: a type's stable path is "<module path>::<name>" when its name
+  # belongs to EXACTLY ONE source item; ambiguous or item-less names are
+  # excluded (fail-closed at use).
+  var paths = Map::new()
+  var idx = 0
+  for item in cache.program.items do
+    let item_name = source_item_name(item)
+    if !item_name.is_empty() then
+      match name_counts.get(&item_name)
+      when Option::Some(n) then
+        if n == 1 then
+          let module_path = item_module_path(cache, idx)
+          let stable = if module_path.is_empty() then item_name.clone() else module_path + "::" + item_name.clone() end
+          for (tid, tname) in type_names.entries() do
+            if tname == item_name then
+              paths.insert(tid, stable.clone())
+            end
+          end
+        end
+      when Option::None then ()
+      end
+    end
+    idx = idx + 1
+  end
+  paths
+end
+
+# The source name of a nominal item (struct/enum/trait/alias) — the
+# name-carrying item kinds of the stable-path scan; "" for every other
+# item kind.
+def source_item_name(item: &Item) -> String
+  match item.kind
+  when ItemKind::ItemStruct(s) then s.name.clone()
+  when ItemKind::ItemEnum(e) then e.name.clone()
+  when ItemKind::ItemTrait(t) then t.name.clone()
+  when ItemKind::ItemTypeAlias(a) then a.name.clone()
+  when _ then "".to_string()
+  end
+end
+
+# The module path containing an item index, from the crate module table's
+# contiguous [start, end) item ranges (the same containment scan
+# crate_module_path_of performs); the root module fallback is the empty
+# path.
+def item_module_path(cache: &MonoCache, item_idx: Int) -> String
+  for entry in cache.program.crate.modules.entries() do
+    let info = entry.1
+    if info.item_indices.len() >= 2 then
+      let start_idx = info.item_indices[0]
+      let end_idx = info.item_indices[1]
+      if item_idx >= start_idx && item_idx < end_idx then
+        return info.path.join("::")
+      end
+    end
+  end
+  "".to_string()
+end
+
+# The canonical generic-substitution suffix of an ABI symbol — the DECLARED
+# PARAMETER ORDER (reviewer item 105 / deterministic ordering): the
+# InstanceId.substs Vec is populated in declaration order, so the suffix
+# iterates the Vec BY INDEX; a Map is never iterated (map iteration order
+# is not canonical).
+def tangerine_abi_substs_suffix(stable_paths: &Map[Int, String], substs: &Vec[Type]) -> Result[String, String]
+  var parts = Vec::new()
+  var i = 0
+  while i < substs.len() do
+    match tangerine_abi_canon_type(stable_paths, &substs[i])
+    when Result::Ok(c) then parts.push(c)
+    when Result::Err(msg) then return Result::Err(msg)
+    end
+    i = i + 1
+  end
+  Result::Ok(parts.join("_"))
+end
+
+# Full Tangerine ABI symbol mangling. FAIL-CLOSED: the canonical signature
+# hash and the ordered substitution hash are computed through the ONE
+# canonicalizer; a non-canonicalizable signature (or substitution) returns
+# Result::Err instead of collapsing to "unknown".
+pub def mangle_tangerine_symbol(
+  pkg_name: String,
+  pkg_version: String,
+  module_path: String,
+  name: String,
+  signature: &Type,
+  stable_paths: &Map[Int, String],
+  substs: &Vec[Type]
+) -> Result[String, String]
+  let pkg_hash = compute_pkg_hash(&pkg_name, &pkg_version)
+  let module_len = module_path.len()
+  let name_len = name.len()
+  match compute_signature_hash(stable_paths, signature)
+  when Result::Ok(sig_hash) then
+    match compute_substs_hash(stable_paths, substs)
+    when Result::Ok(subst_hash) then
+      Result::Ok(
+        "_TG" + TANGERINE_ABI_EDITION + "_" +
+          TANGERINE_ABI_REVISION.to_string() + "_" +
+          hex_u64(pkg_hash) + "_" +
+          module_len.to_string() + ":" + module_path + "_" +
+          name_len.to_string() + ":" + name + "_" +
+          hex_u64(sig_hash) + "_" +
+          hex_u64(subst_hash)
+      )
+    when Result::Err(msg) then Result::Err(msg)
+    end
+  when Result::Err(msg) then Result::Err(msg)
+  end
+end
+
+# Best-effort demangler for symbols emitted by mangle_tangerine_symbol.
+# The fields are length-prefixed, so the parse is length-driven (a module
+# path or name containing "_" or ":" cannot confuse it).
+# Returns a readable summary: module_path::name [edition=..., abi_revision=..., pkg=..., sig=..., substs=...]
+pub def demangle_tangerine_symbol(symbol: &String) -> Option[String]
+  if !symbol.starts_with("_TG") then
+    return Option::None
+  end
+  let rest = symbol.slice(3, symbol.len())
+  match rest.split_once("_")
+  when Option::Some((edition, after_edition)) then
+    match after_edition.split_once("_")
+    when Option::Some((revision, after_revision)) then
+      match after_revision.split_once("_")
+      when Option::Some((pkg_hash, after_pkg)) then
+        match after_pkg.split_once(":")
+        when Option::Some((mlen_s, after_mlen)) then
+          match mlen_s.parse_int()
+          when Result::Ok(mlen) then
+            if mlen < 0 || mlen > after_mlen.len() then return Option::None end
+            let module_path = after_mlen.slice(0, mlen)
+            if mlen >= after_mlen.len() || after_mlen.slice(mlen, mlen + 1) != "_" then return Option::None end
+            let after_module = after_mlen.slice(mlen + 1, after_mlen.len())
+            match after_module.split_once(":")
+            when Option::Some((nlen_s, after_nlen)) then
+              match nlen_s.parse_int()
+              when Result::Ok(nlen) then
+                if nlen < 0 || nlen > after_nlen.len() then return Option::None end
+                let name = after_nlen.slice(0, nlen)
+                if nlen >= after_nlen.len() || after_nlen.slice(nlen, nlen + 1) != "_" then return Option::None end
+                let after_name = after_nlen.slice(nlen + 1, after_nlen.len())
+                match after_name.split_once("_")
+                when Option::Some((sig_hash, subst_hash)) then
+                  Option::Some(module_path + "::" + name + " [edition=" + edition + ", abi_revision=" + revision + ", pkg=" + pkg_hash + ", sig=" + sig_hash + ", substs=" + subst_hash + "]")
+                when Option::None then Option::None
+                end
+              when Result::Err(_) then Option::None
+              end
+            when Option::None then Option::None
+            end
+          when Result::Err(_) then Option::None
+          end
+        when Option::None then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# Compute package identity hash (name + version — the PackageId identity
+# of pkg_manager.tg; FNV-1a).
+def compute_pkg_hash(name: &String, version: &String) -> UInt
+  var h: UInt = 0xcbf29ce484222325  # FNV-1a offset basis
+  let name_bytes: Vec[Int] = name.bytes()
+  for c in name_bytes do
+    h = h ^ (c as UInt)
+    h = h * 0x100000001b3  # FNV-1a prime
+  end
+  h = h ^ 0xff  # separator
+  let version_bytes: Vec[Int] = version.bytes()
+  for c in version_bytes do
+    h = h ^ (c as UInt)
+    h = h * 0x100000001b3
+  end
+  h
+end
+
+# Compute the canonical signature hash through THE one ABI canonicalizer.
+# FAIL-CLOSED: a non-canonicalizable type returns Result::Err (the ABI
+# path never falls back to an "unknown" rendering).
+def compute_signature_hash(stable_paths: &Map[Int, String], ty: &Type) -> Result[UInt, String]
+  match tangerine_abi_canon_type(stable_paths, ty)
+  when Result::Ok(repr) then
+    var h: UInt = 0xcbf29ce484222325
+    let repr_bytes: Vec[Int] = repr.bytes()
+    for c in repr_bytes do
+      h = h ^ (c as UInt)
+      h = h * 0x100000001b3
+    end
+    Result::Ok(h)
+  when Result::Err(msg) then Result::Err(msg)
+  end
+end
+
+# Compute the ordered generic-substitution hash (declared parameter order;
+# 0 for a non-generic export). The canonical suffix iterates the substs Vec
+# by index — never a Map.
+def compute_substs_hash(stable_paths: &Map[Int, String], substs: &Vec[Type]) -> Result[UInt, String]
+  match tangerine_abi_substs_suffix(stable_paths, substs)
+  when Result::Ok(suffix) then
+    if suffix.is_empty() then
+      Result::Ok(0 as UInt)
+    else
+      var h: UInt = 0xcbf29ce484222325
+      let suffix_bytes: Vec[Int] = suffix.bytes()
+      for c in suffix_bytes do
+        h = h ^ (c as UInt)
+        h = h * 0x100000001b3
+      end
+      Result::Ok(h)
+    end
+  when Result::Err(msg) then Result::Err(msg)
+  end
+end
+
+# Convert u64 to 16-char hex string
+def hex_u64(val: UInt) -> String
+  let chars = "0123456789abcdef"
+  var result = ""
+  var v = val
+  var i = 0
+  while i < 16 do
+    let nibble = (v >> 60) & 0xf
+    result = result + chars.char_at(nibble as UInt).to_string()
+    v = v << 4
+    i = i + 1
+  end
+  result
+end
+
+# ———————————————————————————————————————————————————————————————
+# The Internal-vs-External Identity Boundary (reviewer item 104)
+# ———————————————————————————————————————————————————————————————
+# The INTERNAL emission names (instance_key / mangle_name — the
+# fn_owner_key DefId renderings) stay the single-compilation labels:
+# codegen's resolve_callee_label authority inside ONE compilation. The
+# PUBLIC external symbols — the exported (pub) functions of a library
+# compilation — are the TANGERINE_ABI-mangled names produced here:
+# (package identity, module path, public source name, canonical signature,
+# edition/ABI revision, generic substitutions).
+#
+# The export marking is Item.is_pub: the item scan over the merged program
+# (Program.items + ResolvedNames.item_defs, the DefId -> item index
+# authority) decides. Only top-level PUB functions export; the OS entry
+# ("main"/"_start"), methods, statics, constants and non-pub functions
+# keep their internal emission names.
+
+# Whether a DefId names an EXPORTED (pub) top-level function of the
+# compilation. The item scan is the authority: the DefId must belong to an
+# ItemFunction item (never a method/static/constant DefId, which live on
+# other item kinds) and that item must be pub. Deterministic (item order).
+def is_exported_function_def(cache: &MonoCache, did: &DefId) -> Bool
+  var idx = 0
+  for item in cache.program.items do
+    match item.kind
+    when ItemKind::ItemFunction(_) then
+      match cache.resolutions.item_defs.get(idx)
+      when Option::Some(dids) then
+        for d in dids do
+          if d.module.id == did.module.id && d.index == did.index then
+            return item.is_pub
+          end
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    idx = idx + 1
+  end
+  false
+end
+
+# The PUBLIC external symbol name of a top-level function DefId:
+#   Option::Some(abi_name) — the TANGERINE_ABI-mangled name, when the
+#     function is an exported (pub) function of a library compilation;
+#   Option::None          — the function keeps its internal emission name
+#     (non-pub, entry, or a method/static/constant DefId).
+# The caller supplies the function's canonical signature (for a generic
+# function, the SPECIALIZED post-substitution signature — a Param in the
+# signature fails the mangling, as it must) and the instance's generic
+# substitutions (the InstanceId.substs, in declared parameter order;
+# empty for a non-generic function).
+pub def tangerine_exported_symbol_name(
+  cache: &MonoCache,
+  type_names: &Map[Int, String],
+  pkg_name: String,
+  pkg_version: String,
+  did: &DefId,
+  source_name: &String,
+  signature: &Type,
+  instance: &InstanceId
+) -> Result[Option[String], String]
+  # Linking boundary: the OS entry keeps its source name.
+  if source_name == "main" || source_name == "_start" then
+    return Result::Ok(Option::None)
+  end
+  # The export marking: a top-level PUB function of the compilation. Not
+  # exported -> the internal emission name stays.
+  if !is_exported_function_def(cache, did) then
+    return Result::Ok(Option::None)
+  end
+  let stable_paths = tangerine_abi_stable_paths(cache, type_names)
+  let module_path = crate_module_path_of(&cache.program, &did.module).join("::")
+  match mangle_tangerine_symbol(pkg_name, pkg_version, module_path, source_name.clone(), signature, &stable_paths, &instance.substs)
+  when Result::Ok(sym) then Result::Ok(Option::Some(sym))
+  when Result::Err(msg) then Result::Err(msg)
+  end
+end
+
+# The canonical function type of a MIR function for ABI mangling. The MIR
+# parameter list carries the INOUT access convention structurally
+# (Type::RefInternal(inner, true) — mir.tg's lower_function convention
+# lowering); the convention is RECOVERED, never invented: RefInternal(true)
+# -> Inout, everything else -> Let. The typed-signature path
+# (tangerine_exported_symbol_name's signature argument) carries the full
+# ParamType conventions; this recovery covers the MIR-derived path.
+def mir_fn_abi_signature(fn: &MirFunction) -> Type
+  var params = Vec::new()
+  for p in fn.params do
+    match p.ty
+    when Type::RefInternal(inner, mutable) then
+      if mutable then
+        params.push(ParamType { ty: inner.clone(), convention: AccessConvention::Inout })
+      else
+        params.push(ParamType { ty: p.ty.clone(), convention: AccessConvention::Let })
+      end
+    when _ then
+      params.push(ParamType { ty: p.ty.clone(), convention: AccessConvention::Let })
+    end
+  end
+  Type::Function(params, Box::new(fn.ret_type.clone()))
+end
+
+# The library-compilation export table: (internal emission name, public
+# TANGERINE_ABI symbol) for every exported (pub) non-generic top-level
+# function, in program declaration order (deterministic — iterated by item
+# index, never by map order). A GENERIC base has no single ABI symbol:
+# each concrete instance is exported via tangerine_exported_symbol_name
+# with the instance's solved substs (declared parameter order), which is
+# the substHash component of the ABI name.
+pub def tangerine_export_symbol_table(
+  cache: &MonoCache,
+  type_names: &Map[Int, String],
+  pkg_name: String,
+  pkg_version: String,
+  mir: &MirProgram
+) -> Result[Vec[(String, String)], String]
+  let stable_paths = tangerine_abi_stable_paths(cache, type_names)
+  var out = Vec::new()
+  var idx = 0
+  for item in cache.program.items do
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      if item.is_pub && f.name != "main" && f.name != "_start" then
+        match cache.resolutions.item_defs.get(idx)
+        when Option::Some(dids) then
+          if dids.len() > 0 then
+            let did = dids[0]
+            let internal = fn_owner_key_of_def(&cache.program, &cache.resolutions, &did)
+            let module_path = crate_module_path_of(&cache.program, &did.module).join("::")
+            for mir_fn in mir.functions do
+              if mir_fn.name == internal then
+                if !is_generic_function(mir_fn) then
+                  let sig = mir_fn_abi_signature(mir_fn)
+                  var empty_substs: Vec[Type] = Vec::new()
+                  match mangle_tangerine_symbol(pkg_name.clone(), pkg_version.clone(), module_path.clone(), f.name.clone(), &sig, &stable_paths, &empty_substs)
+                  when Result::Ok(sym) then out.push((internal.clone(), sym))
+                  when Result::Err(msg) then return Result::Err(msg)
+                  end
+                end
+              end
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+    idx = idx + 1
+  end
+  Result::Ok(out)
+end
+
+# INTERNAL-LABEL type rendering — the per-compilation emission names ONLY
+# (the "$<args>" suffix of instance_key / mangle_name). This is NOT the
+# public ABI canonicalizer: tangerine_abi_canon_type is the ONE canonical
+# walk for the Tangerine ABI. Internal labels never cross a compilation
+# boundary, so their renderings are per-compilation — the Adt's ephemeral
+# "t<id>" is legal HERE (ephemeral TypeId indices are forbidden only in
+# the PUBLIC ABI). Exhaustive over every Type variant with DISTINCT
+# renderings — the former "any" collapse is gone (two distinct types must
+# never share an internal label). A Param/Var reaching an internal label is
+# a compiler-internal gap and renders distinctly, never silently.
+def type_to_mangled(ty: &Type) -> String
+  match ty
+  when Type::Unit then "unit"
+  when Type::Bool then "bool"
+  when Type::Int then "int"
+  when Type::UInt then "uint"
+  when Type::Float then "float"
+  when Type::Char then "char"
+  when Type::String then "str"
+  when Type::Never then "never"
+  when Type::I8 then "i8"
+  when Type::I16 then "i16"
+  when Type::I32 then "i32"
+  when Type::I64 then "i64"
+  when Type::I128 then "i128"
+  when Type::U8 then "u8"
+  when Type::U16 then "u16"
+  when Type::U32 then "u32"
+  when Type::U64 then "u64"
+  when Type::U128 then "u128"
+  when Type::ISize then "isize"
+  when Type::USize then "usize"
+  when Type::F32 then "f32"
+  when Type::F64 then "f64"
+  when Type::Adt(tid, args) then
+    if args.is_empty() then
+      "t" + tid.id.to_string()
+    else
+      var s = "t" + tid.id.to_string()
+      for arg in args do
+        s = s + "_" + type_to_mangled(&arg)
+      end
+      s
+    end
+  when Type::FixedArray(elem, n) then "fa" + type_to_mangled(elem) + "_" + n.to_string()
+  when Type::Function(params, ret) then
+    var s = "fn"
+    for p in params do
+      s = s + "_" + type_to_mangled(&p.ty)
+    end
+    s + "_ret_" + type_to_mangled(ret)
+  when Type::RefInternal(inner, mutable) then
+    if mutable then "refmut" + type_to_mangled(inner) else "ref" + type_to_mangled(inner) end
+  when Type::Ptr(inner) then "ptr" + type_to_mangled(inner)
+  when Type::PtrMut(inner) then "ptrmut" + type_to_mangled(inner)
+  when Type::Dyn(tid) then "dyn" + tid.id.to_string()
+  when Type::Effect(_, inner) then "eff" + type_to_mangled(inner)
+  when Type::Tuple(elems) then
+    var s = "tuple"
+    for e in elems do
+      s = s + "_" + type_to_mangled(&e)
+    end
+    s
+  when Type::Var(id) then "var" + id.id.to_string()
+  when Type::Param(name) then "param" + name.clone()
+  when Type::Error then "err"
+  end
+end
+
+def types_equal(a: &Vec[Type], b: &Vec[Type]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if !type_eq(&a[i], &b[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def type_eq(a: &Type, b: &Type) -> Bool
+  match a
+  when Type::Unit then
+    match b
+    when Type::Unit then true
+    when _ then false
+    end
+  when Type::Bool then
+    match b
+    when Type::Bool then true
+    when _ then false
+    end
+  when Type::Int then
+    match b
+    when Type::Int then true
+    when _ then false
+    end
+  when Type::UInt then
+    match b
+    when Type::UInt then true
+    when _ then false
+    end
+  when Type::Float then
+    match b
+    when Type::Float then true
+    when _ then false
+    end
+  when Type::Char then
+    match b
+    when Type::Char then true
+    when _ then false
+    end
+  when Type::String then
+    match b
+    when Type::String then true
+    when _ then false
+    end
+  when Type::Adt(n1, args1) then
+    match b
+    when Type::Adt(n2, args2) then
+      n1 == n2 && types_equal(args1, args2)
+    when _ then false
+    end
+  when _ then false
+  end
+end

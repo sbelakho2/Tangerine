@@ -77,6 +77,14 @@ public final class DiagnosticBag {
         diagnostics.filter { $0.severity == .error }.count
     }
 
+    public var hasWarnings: Bool {
+        diagnostics.contains { $0.severity == .warning }
+    }
+
+    public var warningCount: Int {
+        diagnostics.filter { $0.severity == .warning }.count
+    }
+
     /// Render all diagnostics to a human-readable string.
     public func render(sourceMap: SourceMap) -> String {
         var lines: [String] = []

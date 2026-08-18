@@ -2,6 +2,18 @@
 // Part of Tangerine Stage 0 Bootstrap Compiler
 //
 // Mirrors the Rust stage0 AST types.
+//
+// PRIVATE BOOTSTRAP DIALECT NOTE (reviewer item U parity batch):
+// The seed's SEMANTIC approximations — the interpreter's value/layout model,
+// the absence of real type checking, and the normalization of `&T`/`&mut T`
+// access markers down to their inner type — describe the stage0's PRIVATE
+// bootstrap dialect, NOT the stabilized user language semantics. The seed is
+// a minimal parser+lowerer for the SAME stabilized syntax (access
+// conventions, no first-class safe references, module-qualified identity,
+// fixed-array vs Vec distinction, public ABI/layout contracts); it does not
+// (yet) implement the Tangerine type checker's semantics. Structural parity
+// lives here; semantic parity is tracked separately and is out of scope for
+// the seed.
 
 // MARK: - Program
 
@@ -9,10 +21,60 @@
 public struct Program {
     public var items: [Item]
     public var span: Span
+    /// The file-derived owner module path of this program — the mirror of the
+    /// Tangerine compiler's `module_path_from_file` ("std/core.tg" →
+    /// ["std", "core"]; the main program / unnamed source → []).
+    public var modulePath: [String]
+    /// The module table — the mirror of the Tangerine side's `ModuleInfo`
+    /// transition (Program.crate.modules: one Module per distinct module,
+    /// each indexing the contiguous [start, end) range of its items in the
+    /// flat items vector). The seed parses one file per Program, so the
+    /// table holds exactly one entry per file module; inline `module`
+    /// blocks are represented by the items' stamped modulePath (the file
+    /// path plus inline segments), exactly as the Tangerine resolver's
+    /// `current_module` stack extends the owner Module's path.
+    public var modules: [ModuleInfo]
 
-    public init(items: [Item], span: Span) {
+    public init(items: [Item], span: Span, modulePath: [String] = [], modules: [ModuleInfo] = []) {
         self.items = items
         self.span = span
+        self.modulePath = modulePath
+        self.modules = modules
+    }
+
+    /// Mirror of the Tangerine resolver's `module_path_of_item_resolver`:
+    /// the owner module path of the flat item at `index`, looked up in the
+    /// module table. The root/empty fallback mirrors ModuleId { id: 0 }
+    /// (empty path).
+    public func modulePath(ofItem index: Int) -> [String] {
+        for info in modules where info.itemRange.contains(index) {
+            return info.path
+        }
+        return []
+    }
+
+    /// Mirror of the Tangerine resolver's `module_qualified_key`: the
+    /// module-qualified symbol key "path::name". An empty path degenerates
+    /// to the bare name, so qualified entries are exact supersets of the
+    /// bare-name registration.
+    public static func moduleQualifiedKey(path: [String], name: String) -> String {
+        let joined = path.joined(separator: "::")
+        if joined.isEmpty { return name }
+        return joined + "::" + name
+    }
+}
+
+/// A module entry in the Program's module table — the mirror of the
+/// Tangerine side's `Module { id, path, item_indices, imports }` (the seed
+/// keeps path + item range; id is implicit in array order, imports are the
+/// use declarations already carried by the items).
+public struct ModuleInfo {
+    public var path: [String]
+    public var itemRange: Range<Int>
+
+    public init(path: [String], itemRange: Range<Int>) {
+        self.path = path
+        self.itemRange = itemRange
     }
 }
 
@@ -22,11 +84,23 @@ public struct Item {
     public var kind: ItemKind
     public var attributes: [Attribute]
     public var span: Span
+    /// The owner module path stamp — the module-qualified identity of this
+    /// item (the (module, name) registration the Tangerine resolver now
+    /// uses): the file module's path plus any inline `module` segments.
+    /// Populated by the parser; empty for root-module items.
+    public var modulePath: [String]
 
-    public init(kind: ItemKind, attributes: [Attribute] = [], span: Span) {
+    public init(kind: ItemKind, attributes: [Attribute] = [], span: Span, modulePath: [String] = []) {
         self.kind = kind
         self.attributes = attributes
         self.span = span
+        self.modulePath = modulePath
+    }
+
+    /// The module-qualified key of this item under the given bare name —
+    /// the (module, name) registration key.
+    public func qualifiedKey(name: String) -> String {
+        Program.moduleQualifiedKey(path: modulePath, name: name)
     }
 }
 
@@ -311,12 +385,16 @@ public struct FieldDecl {
     public var name: String
     public var isPublic: Bool
     public var type: TypeExpr
+    /// Default value expression (`field: T = expr`) — mirror of the
+    /// Tangerine side's FieldDecl.default.
+    public var defaultValue: Expr?
     public var span: Span
 
-    public init(name: String, isPublic: Bool = false, type: TypeExpr, span: Span) {
+    public init(name: String, isPublic: Bool = false, type: TypeExpr, defaultValue: Expr? = nil, span: Span) {
         self.name = name
         self.isPublic = isPublic
         self.type = type
+        self.defaultValue = defaultValue
         self.span = span
     }
 }
@@ -635,6 +713,13 @@ public indirect enum TypeExpr {
     case never(Span)
     case tuple([TypeExpr], Span)
     case unit(Span)
+    // NOTE (no first-class safe references): the parser NEVER produces this
+    // case from general type positions anymore — `&T`/`&mut T` in parameter
+    // position normalizes to the access convention, and `&T` in any other
+    // type position fires the E106 migration diagnostic and recovers with
+    // the inner type (the Tangerine parse mirror). The case is retained as
+    // part of the seed's PRIVATE bootstrap dialect (the MIR refInternal
+    // lowering path), not as user-language type syntax.
     case ref(TypeExpr, mutable: Bool, Span)
     case rawPtr(TypeExpr, mutable: Bool, Span)
     case fnPtr(params: [TypeExpr], ret: TypeExpr, Span)

@@ -9,7 +9,7 @@ use std::process::{run_command}
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
-  Program, ModuleId, ModuleInfo, AstPath, TypeExpr, TypeExprKind,
+  Program, ModuleId, Module, Crate, AstPath, TypeExpr, TypeExprKind,
   MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
   FnBody, FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, PatternKind, type_expr_name,
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
@@ -22,13 +22,13 @@ use tg_compiler::resource_check::{resource_check, ResourceError}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
-use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
+use tg_compiler::mono::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 use tg_compiler::version::{VERSION}
 
-extern def libc_write(fd: Int, buf: &u8, count: UInt) -> Int
+extern def libc_write(fd: Int, buf: Ptr[u8], count: UInt) -> Int
 extern def read_file_to_string_native(path: String) -> String
-def syscall_write(fd: Int, buf: &u8, count: UInt) -> Int
+def syscall_write(fd: Int, buf: Ptr[u8], count: UInt) -> Int
   libc_write(fd, buf, count)
 end
 
@@ -817,6 +817,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
       ast: typed.ast,
       resolutions: typed.resolutions,
       expr_types: typed.expr_types,
+      typed_exprs: typed.typed_exprs,
       call_targets: typed.call_targets,
       call_instances: typed.call_instances,
       field_targets: typed.field_targets,
@@ -1059,8 +1060,18 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
   if opts.verbose then
     println("  Monomorphizing generics...")
   end
-  var mono_cache = mono_cache_new()
-  monomorphize_program(&mut mir, &mut mono_cache)
+  var mono_cache = match typed_program
+  when Option::Some(tp) then mono_cache_new(&ast, &tp.resolutions)
+  when Option::None then return Result::Err("monomorphization requires a typed program")
+  end
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Err(mono_errs) then
+    for e in mono_errs do
+      eprintln("monomorphization error: " + e)
+    end
+    return Result::Err("monomorphization failed with " + mono_errs.len().to_string() + " error(s)")
+  when Result::Ok(_) then ()
+  end
 
   if opts.verbose then
   end
@@ -1384,8 +1395,19 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
   if opts.verbose then
     println("  Monomorphizing generics...")
   end
-  var mono_cache = mono_cache_new()
-  monomorphize_program(&mut mir, &mut mono_cache)
+  var mono_cache = match typed_program
+  when Option::Some(tp) then mono_cache_new(&ast, &tp.resolutions)
+  when Option::None then return 1
+  end
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Err(mono_errs) then
+    for e in mono_errs do
+      eprintln("monomorphization error: " + e)
+    end
+    println("monomorphization failed with " + mono_errs.len().to_string() + " error(s)")
+    return 1
+  when Result::Ok(_) then ()
+  end
 
   let post_mono_errs = verify_mir(&mir)
   if !post_mono_errs.is_empty() then
@@ -1499,40 +1521,48 @@ end
 # with compiler internals. The full lib.tg is only for users embedding the
 # complete compiler.
 #
-# MODULE FLATTENING (P0-A): imported modules are recursively parsed and their
+# MODULE FLATTENING (P0-AM): imported modules are recursively parsed and their
 # items merged into one Program. This makes type identity name-global:
-# a::Config and b::Config share the same TypeId. Target: Crate { root:
-# ModuleId, modules: Map[ModuleId, Module] } with (ModuleId, name) -> DefId
-# resolution. Until then, same-named types across modules are merged by
+# a::Config and b::Config share the same TypeId. Until the Crate-based
+# store_type_def migration, same-named types across modules are merged by
 # store_type_def in types.tg.
 #
-# P0-A module table (structural foundation): while flattening, this function
-# (with collect_dep_file below) also builds Program.modules — one ModuleInfo
-# per distinct module, each indexing the contiguous [start, end) range of its
-# items in the flat Program.items. ModuleIds are assigned in processing
-# order: the root module (the main program's top-level items) is id 0, and
-# each distinct dependency gets the next id — the `loaded` set dedups, so
-# every module path is recorded exactly once. The flat Program stays the
-# interface; the modules map is what the Crate/Module identity migration
-# consumes.
+# P0-AM module table (construction site): while flattening, this function
+# (with collect_dep_file below) BUILDS the Program.crate Crate — the single
+# module table the reviewer's design specifies: Crate { root: ModuleId,
+# modules: Map[ModuleId, Module] }, one Module per distinct module, each
+# indexing the contiguous [start, end) range of its items in the flat
+# Program.items. ModuleIds are assigned in processing order: the root module
+# (the main program's top-level items) is id 0, and each distinct dependency
+# gets the next id — the `loaded` set dedups, so every module path is
+# recorded exactly once. The flat items vector stays the interface; the
+# Crate is CONSUMED by the resolver's per-module registration tables
+# (SymbolTable.module_tables, keyed by each Module's path joined by "::") —
+# the first-wins REGISTRATION decision for every item is
+# (owner ModuleId, namespace, name) against that per-module table, so a
+# same-named declaration in a DIFFERENT file module registers its own
+# qualified entry instead of failing the root bare-name occupancy.
 pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Result[Program, String]
   var loaded = Set::new()
   var merged_items = Vec::new()
-  var merged_modules = Vec::new()
+  var merged_modules = Map::new()
   # Program items first  ensures the main program's definitions
   # (especially main) take priority over dependency definitions.
   for item in program.items do
     merged_items.push(item)
   end
-  # P0-A: the root module (id 0, empty path) covers the main program's
-  # top-level items; dependencies get ids 1, 2, ... in processing order.
+  # P0-AM: the root module (id 0, empty path, no imports) covers the main
+  # program's top-level items; dependencies get ids 1, 2, ... in processing
+  # order.
   var root_range = Vec::new()
   root_range.push(0)
   root_range.push(merged_items.len())
-  merged_modules.push(ModuleInfo {
-    id: ModuleId { id: 0 },
+  let root_id = ModuleId { id: 0 }
+  merged_modules.insert(root_id, Module {
+    id: root_id,
     path: Vec::new(),
-    item_indices: root_range
+    item_indices: root_range,
+    imports: Vec::new()
   })
   # Canonical bootstrap source list: when compiling the compiler itself
   # (include_compiler_lib), consume bootstrap/compiler_kernel.manifest exactly
@@ -1569,7 +1599,11 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
   when Result::Err(e) then
     return Result::Err(dep_error_message(e, "<program>"))
   end
-  Result::Ok(Program { items: merged_items, modules: merged_modules, span: program.span })
+  Result::Ok(Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: program.span
+  })
 end
 
 pub def build_dep_file_path(segments: &Vec[String], count: Int) -> Option[String]
@@ -1635,7 +1669,12 @@ pub def dep_use_to_file(u: &UseDecl) -> Option[String]
   end
 end
 
-pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Vec[ModuleInfo]) -> Result[Unit, DependencyError]
+pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Map[ModuleId, Module]) -> Result[Unit, DependencyError]
+  # P0-AM (module table construction site): this drives the recursive
+  # dependency walk that merge_imported_deps's Crate consumes. Every distinct
+  # dependency file yields exactly one Module (see collect_dep_file); the
+  # `loaded` set keys the dedup, so ModuleIds stay 1:1 with module paths and
+  # the resolver's per-module registration tables key by those paths.
   for item in program.items do
     match item.kind
     when ItemKind::ItemUse(u) then
@@ -1654,8 +1693,8 @@ pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut S
   Result::Ok(())
 end
 
-# P0-A: derive the module path segments of a dependency file for its
-# ModuleInfo ("std/core.tg" -> ["std", "core"], "tg_compiler/ast.tg" ->
+# P0-AM: derive the module path segments of a dependency file for its
+# Module ("std/core.tg" -> ["std", "core"], "tg_compiler/ast.tg" ->
 # ["tg_compiler", "ast"]). The main program is the root module ([]).
 def module_path_from_file(path: &String) -> Vec[String]
   var segments = Vec::new()
@@ -1674,7 +1713,7 @@ def module_path_from_file(path: &String) -> Vec[String]
   segments
 end
 
-pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Vec[ModuleInfo]) -> Result[Unit, DependencyError]
+pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Map[ModuleId, Module]) -> Result[Unit, DependencyError]
   if loaded.contains(&path) then
     return Result::Ok(())
   end
@@ -1713,27 +1752,43 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
   when Result::Err(e) then
     return Result::Err(e)
   end
-  # MODULE FLATTENING (P0-A): add all items from this dependency into the
+  # MODULE FLATTENING (P0-AM): add all items from this dependency into the
   # single merged Program.items vector (see merge_imported_deps). Dedup: the
   # `loaded` set is keyed by module path and is inserted before recursion, so
   # each distinct module is processed exactly once; diamond and cyclic imports
   # neither duplicate items nor recurse forever. Items of a module stay
   # contiguous after its own imports, so per-module ordering is preserved.
-  # P0-A (module table): record this module's ModuleInfo here — the `loaded`
-  # dedup above guarantees exactly one entry per distinct module path, and
-  # the ModuleId is its processing order (root = 0, then 1, 2, ... in
-  # dependency-processing order). The item range [start, end) is taken around
-  # the push loop below, so it indexes the flat Program.items exactly.
+  # P0-AM (module table — construction site): record this module's Module in
+  # the Crate here — the `loaded` dedup above guarantees exactly one entry
+  # per distinct module path, and the ModuleId is its processing order
+  # (root = 0, then 1, 2, ... in dependency-processing order). The item range
+  # [start, end) is taken around the push loop below, so it indexes the flat
+  # Program.items exactly. The module's imports field carries its own use
+  # declarations (path joins) for the Crate's import-graph transition. The
+  # resolver's per-module registration tables (SymbolTable.module_tables)
+  # key by this path joined by "::" — the module path join is the per-module
+  # identity the (owner ModuleId, namespace, name) duplicate test runs
+  # against.
   var mod_range = Vec::new()
   mod_range.push(out.len())
   for item in dep_ast.items do
     out.push(item)
   end
   mod_range.push(out.len())
-  modules.push(ModuleInfo {
-    id: ModuleId { id: modules.len() },
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      mod_imports.push(u.path.segments.join("::"))
+    when _ then ()
+    end
+  end
+  let dep_id = ModuleId { id: modules.len() }
+  modules.insert(dep_id, Module {
+    id: dep_id,
     path: module_path_from_file(&path),
-    item_indices: mod_range
+    item_indices: mod_range,
+    imports: mod_imports
   })
   Result::Ok(())
 end
@@ -1885,13 +1940,13 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
   # P0-A (module table): the modules map indexes into the filtered items, so
   # it is rebuilt here — each module's contiguous [start, end) range shrinks
   # by the macro declarations dropped before/inside it. The flat Program
-  # stays the interface; the rebuilt table keeps the Crate/Module migration
-  # foundation valid past macro filtering.
-  var filtered_modules = Vec::new()
+  # stays the interface; the rebuilt table is what the resolver's per-module
+  # registration tables (module_tables, keyed by path join) consume, keeping
+  # the per-module first-wins foundation valid past macro filtering.
+  var filtered_modules = Map::new()
   var removed_global = 0
-  var mi = 0
-  while mi < current.modules.len() do
-    let info = current.modules[mi]
+  let module_entries = current.crate.modules.entries()
+  for (mid, info) in module_entries do
     var removed_in_module = 0
     var ji = info.item_indices[0]
     while ji < info.item_indices[1] do
@@ -1904,15 +1959,19 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
     var new_indices = Vec::new()
     new_indices.push(info.item_indices[0] - removed_global)
     new_indices.push(info.item_indices[1] - removed_global - removed_in_module)
-    filtered_modules.push(ModuleInfo {
-      id: info.id,
+    filtered_modules.insert(mid, Module {
+      id: mid,
       path: info.path.clone(),
-      item_indices: new_indices
+      item_indices: new_indices,
+      imports: info.imports.clone()
     })
     removed_global = removed_global + removed_in_module
-    mi = mi + 1
   end
-  let filtered_program = Program { items: filtered_items, modules: filtered_modules, span: current_span }
+  let filtered_program = Program {
+    items: filtered_items,
+    crate: Crate { root: current.crate.root, modules: filtered_modules },
+    span: current_span
+  }
 
   # ── P1 (macro hygiene, expansion-depth contract): E105 on non-convergence ──
   # After the 64-pass depth cap, any surviving ExprMacroCall means the
@@ -2065,11 +2124,6 @@ def residual_macro_calls_in_stmt(stmt: &Stmt, out: &mut Vec[Expr]) -> Unit
     when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
     when Option::None then ()
     end
-  when StmtKind::StmtYield(oe) then
-    match oe
-    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
-    when Option::None then ()
-    end
   when StmtKind::StmtExpr(e) then residual_macro_calls_in_expr(&e, out)
   when StmtKind::StmtUnsafe(_, body) then residual_macro_calls_in_block(&body, out)
   when StmtKind::StmtDefer(body) then residual_macro_calls_in_block(&body, out)
@@ -2158,10 +2212,10 @@ pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
     if expanded_item.did_expand then did_expand = true end
     i = i + 1
   end
-  # P0-A: items map 1:1 through expansion (no insertion/deletion), so the
-  # module table is carried through unchanged and still indexes the new
-  # flat items vector.
-  ExpandedProgram { program: Program { items: new_items, modules: program.modules.clone(), span: program_span }, did_expand }
+  # P0-AM: items map 1:1 through expansion (no insertion/deletion), so the
+  # Crate is carried through unchanged and still indexes the new flat items
+  # vector.
+  ExpandedProgram { program: Program { items: new_items, crate: program.crate.clone(), span: program_span }, did_expand }
 end
 
 pub def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
@@ -3249,19 +3303,25 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
     println("No valid items found in input files")
     return 1
   end
-  # P0-A (module table): multiple files are concatenated into one flat items
-  # vector, so the root module (id 0, empty path) covers all of them; the
-  # per-file module table is rebuilt by merge_imported_deps below.
-  var merged_modules = Vec::new()
+  # P0-AM (Crate construction): multiple files are concatenated into one flat
+  # items vector, so the root module (id 0, empty path) covers all of them;
+  # the full Crate is rebuilt by merge_imported_deps below.
+  var merged_modules = Map::new()
   var merged_range = Vec::new()
   merged_range.push(0)
   merged_range.push(all_items.len())
-  merged_modules.push(ModuleInfo {
-    id: ModuleId { id: 0 },
+  let root_id = ModuleId { id: 0 }
+  merged_modules.insert(root_id, Module {
+    id: root_id,
     path: Vec::new(),
-    item_indices: merged_range
+    item_indices: merged_range,
+    imports: Vec::new()
   })
-  let merged_ast = Program { items: all_items, modules: merged_modules, span: all_items[0].span }
+  let merged_ast = Program {
+    items: all_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: all_items[0].span
+  }
 
   # ── canonical pipeline: merge -> analyze_parsed -> lower -> emit ────────
   # Semantic stages (macro expansion, node ids, resolution, type/access/
@@ -3346,8 +3406,19 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   if opts.verbose then
     println("  Monomorphizing generics...")
   end
-  var mono_cache = mono_cache_new()
-  monomorphize_program(&mut mir, &mut mono_cache)
+  var mono_cache = match typed_program
+  when Option::Some(tp) then mono_cache_new(&ast, &tp.resolutions)
+  when Option::None then return 1
+  end
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Err(mono_errs) then
+    for e in mono_errs do
+      eprintln("monomorphization error: " + e)
+    end
+    println("monomorphization failed with " + mono_errs.len().to_string() + " error(s)")
+    return 1
+  when Result::Ok(_) then ()
+  end
 
   let post_mono_errs = verify_mir(&mir)
   if !post_mono_errs.is_empty() then

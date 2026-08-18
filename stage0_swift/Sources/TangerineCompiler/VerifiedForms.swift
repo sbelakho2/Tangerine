@@ -284,7 +284,6 @@ public enum FormVerifier {
             if let u = unwind { s.append(u) }
             return s
         case .assert(_, _, _, let target): return [target]
-        case .yield(_, let resume): return [resume]
         case .unreachable, .abort: return []
         }
     }

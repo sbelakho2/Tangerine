@@ -938,9 +938,6 @@ public final class MIRInterpreter {
             case .abort:
                 output.append("ABORT!")
                 return .unit
-
-            case .yield:
-                return .unit
             }
         }
 
@@ -3115,17 +3112,13 @@ public final class MIRInterpreter {
                         if let target = dropFields["target"] { result.append(target) }
                         if case .enumVal(_, 0, let uw) = dropFields["unwind"] { result.append(uw) }
                     }
-                case 6: // MirAssert { cond, expected, msg, target, unwind }
-                    if case .structVal(_, let assertFields) = kindPayload {
-                        if let target = assertFields["target"] { result.append(target) }
-                        if case .enumVal(_, 0, let uw) = assertFields["unwind"] { result.append(uw) }
-                    }
-                case 7: // MirYield(MirOperand, BlockId)
-                    if case .tuple(let parts) = kindPayload, parts.count >= 2 {
-                        result.append(parts[1])
-                    }
-                default:
-                    break
+                    case 6: // MirAssert { cond, expected, msg, target, unwind }
+                        if case .structVal(_, let assertFields) = kindPayload {
+                            if let target = assertFields["target"] { result.append(target) }
+                            if case .enumVal(_, 0, let uw) = assertFields["unwind"] { result.append(uw) }
+                        }
+                    default:
+                        break
                 }
                 return makeArray(result)
             }
@@ -3473,8 +3466,6 @@ public final class MIRInterpreter {
                             if validBlocks.contains(.int(uwid)) { return .unit }
                         } else { return .unit }
                     }
-                case 7: // MirYield — no validation needed
-                    return .unit
                 default: return .unit
                 }
             }
@@ -5721,7 +5712,6 @@ public final class MIRInterpreter {
         case .kwPure:      return (tkEnum(59), 1)
         case .kwAsync:     return (tkEnum(60), 1)
         case .kwAwait:     return (tkEnum(61), 1)
-        case .kwYield:     return (tkEnum(62), 1)
         case .kwTry:       return (tkEnum(64), 1)
         case .kwCatch:     return (tkEnum(65), 1)
         case .kwFinally:   return (tkEnum(66), 1)
@@ -5783,7 +5773,11 @@ public final class MIRInterpreter {
         case .starEq:      return (tkEnum(112), 1)
         case .slashEq:     return (tkEnum(113), 1)
         case .percentEq:   return (tkEnum(114), 1)
+        case .ampEq:       return (tkEnum(115), 1)
+        case .pipeEq:      return (tkEnum(116), 1)
         case .caretEq:     return (tkEnum(117), 1)
+        case .shlEq:       return (tkEnum(118), 1)
+        case .shrEq:       return (tkEnum(119), 1)
         // ── Delimiters ──
         case .lParen:      return (tkEnum(120), 1)
         case .rParen:      return (tkEnum(121), 1)
@@ -5865,7 +5859,6 @@ public final class MIRInterpreter {
         case "pure":    return tkEnum(59)
         case "async":   return tkEnum(60)
         case "await":   return tkEnum(61)
-        case "yield":   return tkEnum(62)
         case "defer":   return tkEnum(63)
         case "try":     return tkEnum(64)
         case "catch":   return tkEnum(65)
@@ -6449,8 +6442,6 @@ public struct MIRPrettyPrinter {
             return "deinit(\(printPlace(place))) -> bb\(next);"
         case .assert(let cond, let expected, let msg, let target):
             return "assert(\(printOperand(cond)), \(expected), \"\(msg)\") -> bb\(target);"
-        case .yield(let val, let resume):
-            return "yield(\(printOperand(val))) -> bb\(resume);"
         case .unreachable:
             return "unreachable;"
         case .abort:

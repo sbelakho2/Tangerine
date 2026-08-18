@@ -74,7 +74,6 @@ public enum TokenKind: Equatable, Hashable, Sendable {
     case kwUnsafe
     case kwAsync
     case kwAwait
-    case kwYield
     case kwCap
     case kwEffect
     case kwRequires
@@ -154,6 +153,10 @@ public enum TokenKind: Equatable, Hashable, Sendable {
     case slashEq       // /=
     case percentEq     // %=
     case caretEq       // ^=
+    case ampEq         // &=
+    case pipeEq        // |=
+    case shlEq         // <<=
+    case shrEq         // >>=
     case eq            // =
     case question      // ?
 
@@ -214,7 +217,6 @@ extension TokenKind {
         case "unsafe":    return .kwUnsafe
         case "async":     return .kwAsync
         case "await":     return .kwAwait
-        case "yield":     return .kwYield
         case "cap":       return .kwCap
         case "effect":    return .kwEffect
         case "requires":  return .kwRequires
@@ -300,7 +302,6 @@ extension TokenKind {
         case .kwUnsafe:        return "'unsafe'"
         case .kwAsync:         return "'async'"
         case .kwAwait:         return "'await'"
-        case .kwYield:         return "'yield'"
         case .kwCap:           return "'cap'"
         case .kwEffect:        return "'effect'"
         case .kwRequires:      return "'requires'"
@@ -376,6 +377,10 @@ extension TokenKind {
         case .slashEq:         return "'/='"
         case .percentEq:       return "'%='"
         case .caretEq:         return "'^='"
+        case .ampEq:           return "'&='"
+        case .pipeEq:          return "'|='"
+        case .shlEq:           return "'<<='"
+        case .shrEq:           return "'>>='"
         case .eq:              return "'='"
         case .question:        return "'?'"
         case .eof:             return "end of file"

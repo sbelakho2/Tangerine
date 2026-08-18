@@ -72,7 +72,7 @@ def tokenize(text):
 
 KEYWORDS = set("""for in do end if then else elsif while match when def fn struct enum trait
 impl static extern typealias mut let return break continue loop use import as pub private
-unsafe defer guard try catch finally with yield move copy await async comptime cast
+unsafe defer guard try catch finally with move copy await async comptime cast
 handle self Self init new where const var mod macro true false nil capability effect
 rationale edition window module""".split())
 

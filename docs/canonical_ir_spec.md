@@ -62,7 +62,6 @@ A basic block in the control-flow graph.
 | Call(Place, Operand, Vec[Operand], BlockId, Option[BlockId]) | Function call |
 | Drop(Place, BlockId, Option[BlockId]) | Drop value |
 | Assert(Operand, Bool, AssertMessage, BlockId) | Runtime assertion |
-| Yield(Operand, BlockId) | Yield (async/generator) |
 | Unreachable | Proven unreachable |
 | Abort | Abnormal termination |
 

@@ -14,9 +14,15 @@ public final class ASTDumper {
         lines = []
         indent = 0
         emit("Program")
+        // Module identity (ModuleInfo transition mirror): the file-derived
+        // owner module path ("std::core" for std/core.tg; absent for the
+        // root module).
+        if !program.modulePath.isEmpty {
+            emit("ModulePath \(program.modulePath.joined(separator: "::"))")
+        }
         push()
         for item in program.items {
-            dumpItem(item)
+            dumpItem(item, programModulePath: program.modulePath)
         }
         pop()
         return lines.joined(separator: "\n")
@@ -58,10 +64,21 @@ public final class ASTDumper {
 
     // MARK: - Items
 
-    private func dumpItem(_ item: Item) {
+    private func dumpItem(_ item: Item, programModulePath: [String]) {
         if !item.attributes.isEmpty {
             for attr in item.attributes {
                 emit("@\(attr.name)\(attr.args.isEmpty ? "" : "(...)")")
+            }
+        }
+        // Inline-module items carry an extended owner module path (the file
+        // path plus inline segments); emit it when it differs from the
+        // program's own path.
+        switch item.kind {
+        case .moduleDef:
+            break
+        default:
+            if item.modulePath != programModulePath && !item.modulePath.isEmpty {
+                emit("ItemModule \(item.modulePath.joined(separator: "::"))")
             }
         }
         switch item.kind {
@@ -116,13 +133,13 @@ public final class ASTDumper {
         case .externBlock(let d):
             emit("Extern\(d.abi.map { " \"\($0)\"" } ?? "")")
             push()
-            for item in d.items { dumpItem(item) }
+            for item in d.items { dumpItem(item, programModulePath: programModulePath) }
             pop()
         case .moduleDef(let d):
             emit("Module \(d.name)\(d.isPublic ? " [pub]" : "")")
             if let items = d.items {
                 push()
-                for sub in items { dumpItem(sub) }
+                for sub in items { dumpItem(sub, programModulePath: programModulePath) }
                 pop()
             }
         case .capabilityDecl(let d):
@@ -199,8 +216,8 @@ public final class ASTDumper {
         }
     }
 
-    private func dumpBlock(_ block: BlockBody) {
-        for stmt in block.stmts { dumpStmt(stmt) }
+    private func dumpBlock(_ block: BlockBody, programModulePath: [String] = []) {
+        for stmt in block.stmts { dumpStmt(stmt, programModulePath: programModulePath) }
         if let tail = block.tailExpr {
             emit("TailExpr:")
             push(); dumpExpr(tail); pop()
@@ -209,7 +226,7 @@ public final class ASTDumper {
 
     // MARK: - Statements
 
-    private func dumpStmt(_ stmt: Stmt) {
+    private func dumpStmt(_ stmt: Stmt, programModulePath: [String] = []) {
         switch stmt {
         case .letBinding(let pat, let mutable, let type, let value, _):
             emit("Let\(mutable ? " mut" : "")")
@@ -235,15 +252,15 @@ public final class ASTDumper {
             for attr in attrs {
                 emit("@\(attr.name)")
             }
-            dumpStmt(inner)
+            dumpStmt(inner, programModulePath: programModulePath)
             pop()
         case .deferStmt(let body, _):
             emit("Defer")
             push()
-            dumpBlock(body)
+            dumpBlock(body, programModulePath: programModulePath)
             pop()
         case .item(let item):
-            dumpItem(item)
+            dumpItem(item, programModulePath: programModulePath)
         }
     }
 

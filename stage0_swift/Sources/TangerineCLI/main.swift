@@ -172,7 +172,7 @@ struct TangerineCLI {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
         let tokens = lexer.lex()
-        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
         if !diags.hasErrors {
@@ -189,7 +189,12 @@ struct TangerineCLI {
             fputs("\n\(diags.render(sourceMap: sourceMap))\n", stderr)
             exit(1)
         }
-        print("\n0 errors")
+        if diags.hasWarnings {
+            // Surface warnings (e.g. the E106 safe-reference migration
+            // diagnostic) even when the parse succeeded.
+            print(diags.render(sourceMap: sourceMap))
+        }
+        print("\n0 errors, \(diags.warningCount) warnings")
     }
 
     static func cmdCheck(path: String) {
@@ -202,7 +207,7 @@ struct TangerineCLI {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
         let tokens = lexer.lex()
-        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
         if !diags.hasErrors {
@@ -224,7 +229,10 @@ struct TangerineCLI {
             fputs("\n\(diags.render(sourceMap: sourceMap))\n", stderr)
             exit(1)
         }
-        print("\n0 errors")
+        if diags.hasWarnings {
+            print(diags.render(sourceMap: sourceMap))
+        }
+        print("\n0 errors, \(diags.warningCount) warnings")
     }
 
     static func cmdScan(dirPath: String) {
@@ -255,7 +263,7 @@ struct TangerineCLI {
             let diags = DiagnosticBag()
             let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
             let tokens = lexer.lex()
-            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: file))
             let program = parser.parseProgram()
 
             if !diags.hasErrors {
@@ -273,7 +281,11 @@ struct TangerineCLI {
                 fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
                 totalErrors += diags.errorCount
             } else {
-                print("OK   \(file)")
+                if diags.hasWarnings {
+                    print("WARN \(file): \(diags.warningCount) warnings")
+                } else {
+                    print("OK   \(file)")
+                }
             }
         }
         print("\nScanned \(totalFiles) files, \(totalErrors) total errors")
@@ -292,7 +304,7 @@ struct TangerineCLI {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
         let tokens = lexer.lex()
-        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
         if diags.hasErrors {
@@ -314,7 +326,7 @@ struct TangerineCLI {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
         let tokens = lexer.lex()
-        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
         if diags.hasErrors {
@@ -337,7 +349,7 @@ struct TangerineCLI {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
         let tokens = lexer.lex()
-        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+        let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
         if diags.hasErrors {
@@ -345,7 +357,7 @@ struct TangerineCLI {
             exit(1)
         }
 
-        let lowering = MIRLowering(moduleName: moduleName(for: path))
+        let lowering = MIRLowering(modulePath: Parser.modulePath(fromFile: path))
         let mir = lowering.lower(program)
         if lowering.hasErrors {
             reportLoweringFailure(file: path, errors: lowering.errors)
@@ -368,7 +380,7 @@ struct TangerineCLI {
             let diags = DiagnosticBag()
             let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
             let tokens = lexer.lex()
-            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: file))
             let program = parser.parseProgram()
             if diags.hasErrors {
                 fputs("\n[interpret] parse failed: \(file)\n", stderr)
@@ -394,27 +406,27 @@ struct TangerineCLI {
             filesToLoad.append(path)
         }
 
-        var modules: [(name: String, program: Program)] = []
+        var modules: [(modulePath: [String], program: Program)] = []
         for file in filesToLoad {
             guard let program = parseProgram(file: file) else {
                 exit(1)
             }
-            modules.append((name: moduleName(for: file), program: program))
+            modules.append((modulePath: Parser.modulePath(fromFile: file), program: program))
         }
 
         var allTypes: [MirTypeDef] = []
         for module in modules {
-            let collector = MIRLowering(moduleName: module.name)
+            let collector = MIRLowering(modulePath: module.modulePath)
             allTypes.append(contentsOf: collector.collectTypes(module.program))
         }
 
         var merged = MirProgram()
         for module in modules {
-            let lowering = MIRLowering(moduleName: module.name)
+            let lowering = MIRLowering(modulePath: module.modulePath)
             lowering.preloadTypes(allTypes)
             let mir = lowering.lower(module.program)
             if lowering.hasErrors {
-                reportLoweringFailure(file: module.name, errors: lowering.errors,
+                reportLoweringFailure(file: module.modulePath.joined(separator: "::"), errors: lowering.errors,
                                       context: "error: interpret lowering failed")
                 exit(1)
             }
@@ -471,7 +483,7 @@ struct TangerineCLI {
             let diags = DiagnosticBag()
             let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
             let tokens = lexer.lex()
-            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: fullPath))
             let program = parser.parseProgram()
             parsed.append((name: file, program: program))
         }
@@ -487,7 +499,15 @@ struct TangerineCLI {
 
     private struct ParsedBootstrapModule {
         let path: String
-        let moduleName: String
+        /// The file-derived owner module path (module_path_from_file mirror).
+        let modulePath: [String]
+        /// The module-qualified registration key (the owner path's segments
+        /// joined with "::"; the root module's empty path degenerates to the
+        /// bare name) — the mirror of the Tangerine resolver's
+        /// module_qualified_key prefix.
+        var moduleKey: String {
+            modulePath.joined(separator: "::")
+        }
         let program: Program
         let stageHash: UInt64
     }
@@ -519,12 +539,6 @@ struct TangerineCLI {
         let allQualifiedNames: Set<String>
         let localQualifiedFreeFunctions: [String: [String: String]]
         let uniqueQualifiedFreeFunctions: [String: String]
-    }
-
-    private static func moduleName(for path: String) -> String {
-        let name = (path as NSString).lastPathComponent
-        guard name.hasSuffix(".tg") else { return name }
-        return String(name.dropLast(3))
     }
 
     private static func collectTgFiles(in dir: String, fileManager: FileManager = .default) -> [String] {
@@ -635,7 +649,7 @@ struct TangerineCLI {
             let diags = DiagnosticBag()
             let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
             let tokens = lexer.lex()
-            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags)
+            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: file))
             let program = parser.parseProgram()
 
             if !diags.hasErrors {
@@ -658,7 +672,7 @@ struct TangerineCLI {
             let stageHash = ASTDumper().hash(program)
             let parsed = ParsedBootstrapModule(
                 path: file,
-                moduleName: moduleName(for: file),
+                modulePath: Parser.modulePath(fromFile: file),
                 program: program,
                 stageHash: stageHash
             )
@@ -690,12 +704,11 @@ struct TangerineCLI {
             var localFreeCandidates: [String: [String]] = [:]
             collectFunctionSymbols(
                 items: module.program.items,
-                currentModule: module.moduleName,
                 localFreeCandidates: &localFreeCandidates,
                 globalFreeCandidates: &globalFreeCandidates,
                 allQualifiedNames: &allQualifiedNames
             )
-            localQualifiedFreeFunctions[module.moduleName] = localFreeCandidates.compactMapValues { candidates in
+            localQualifiedFreeFunctions[module.moduleKey] = localFreeCandidates.compactMapValues { candidates in
                 let deduped = Array(Set(candidates)).sorted()
                 return deduped.count == 1 ? deduped[0] : nil
             }
@@ -713,9 +726,13 @@ struct TangerineCLI {
         )
     }
 
+    /// Collects the module-qualified symbol registrations of a module's
+    /// items. The qualification comes from each item's OWNER MODULE PATH
+    /// stamp (the file path plus inline module segments) — the (module,
+    /// name) identity registration the Tangerine resolver now uses
+    /// (module_qualified_key "path::name"; empty path → bare name).
     private static func collectFunctionSymbols(
         items: [Item],
-        currentModule: String,
         localFreeCandidates: inout [String: [String]],
         globalFreeCandidates: inout [String: [String]],
         allQualifiedNames: inout Set<String>
@@ -723,7 +740,9 @@ struct TangerineCLI {
         for item in items {
             switch item.kind {
             case .function(let fn):
-                let qualified = fn.sig.name.contains("::") ? fn.sig.name : "\(currentModule)::\(fn.sig.name)"
+                let qualified = fn.sig.name.contains("::")
+                    ? fn.sig.name
+                    : item.qualifiedKey(name: fn.sig.name)
                 allQualifiedNames.insert(qualified)
                 localFreeCandidates[fn.sig.name, default: []].append(qualified)
                 globalFreeCandidates[fn.sig.name, default: []].append(qualified)
@@ -732,7 +751,6 @@ struct TangerineCLI {
                 if let children = d.items {
                     collectFunctionSymbols(
                         items: children,
-                        currentModule: "\(currentModule)::\(d.name)",
                         localFreeCandidates: &localFreeCandidates,
                         globalFreeCandidates: &globalFreeCandidates,
                         allQualifiedNames: &allQualifiedNames
@@ -741,7 +759,13 @@ struct TangerineCLI {
 
             case .implBlock(let d):
                 for method in d.methods {
-                    let qualified = method.sig.name.contains("::") ? method.sig.name : "\(d.targetType)::\(method.sig.name)"
+                    // The impl target type is qualified with the item's owner
+                    // module path — the same qualification MIRLowering
+                    // applies to the method's lowered name.
+                    let qualifiedTarget = item.qualifiedKey(name: d.targetType)
+                    let qualified = method.sig.name.contains("::")
+                        ? method.sig.name
+                        : "\(qualifiedTarget)::\(method.sig.name)"
                     allQualifiedNames.insert(qualified)
                 }
 
@@ -755,7 +779,7 @@ struct TangerineCLI {
         var allTypes: [MirTypeDef] = []
         var typeCounts: [String: Int] = [:]
         for module in modules {
-            let collector = MIRLowering(moduleName: module.moduleName)
+            let collector = MIRLowering(modulePath: module.modulePath)
             let localTypes = collector.collectTypes(module.program)
             allTypes.append(contentsOf: localTypes)
             typeCounts[module.path] = localTypes.count
@@ -768,13 +792,13 @@ struct TangerineCLI {
         for module in modules {
             print("  Lowering: \(module.path)...")
             fflush(stdout)
-            let lowering = MIRLowering(moduleName: module.moduleName)
+            let lowering = MIRLowering(modulePath: module.modulePath)
             lowering.preloadTypes(allTypes)
             let rawMIR = lowering.lower(module.program)
             if lowering.hasErrors {
                 throw LoweringFailure(file: module.path, errors: lowering.errors)
             }
-            let normalizedMIR = normalizeModuleMIR(rawMIR, moduleName: module.moduleName, catalog: functionCatalog)
+            let normalizedMIR = normalizeModuleMIR(rawMIR, moduleKey: module.moduleKey, catalog: functionCatalog)
             merged.functions.append(contentsOf: normalizedMIR.functions)
             merged.statics.append(contentsOf: normalizedMIR.statics)
             moduleStats.append(BootstrapLoweringStats(
@@ -788,10 +812,10 @@ struct TangerineCLI {
         return BootstrapLoweringResult(mir: merged, moduleStats: moduleStats)
     }
 
-    private static func normalizeModuleMIR(_ mir: MirProgram, moduleName: String, catalog: FunctionCatalog) -> MirProgram {
-        let localFreeMap = catalog.localQualifiedFreeFunctions[moduleName] ?? [:]
+    private static func normalizeModuleMIR(_ mir: MirProgram, moduleKey: String, catalog: FunctionCatalog) -> MirProgram {
+        let localFreeMap = catalog.localQualifiedFreeFunctions[moduleKey] ?? [:]
         let functions = mir.functions.map { function -> MirFunction in
-            let rewrittenBlocks = function.blocks.map { rewrite($0, moduleName: moduleName, catalog: catalog) }
+            let rewrittenBlocks = function.blocks.map { rewrite($0, moduleKey: moduleKey, catalog: catalog) }
             let rewrittenName = localFreeMap[function.name] ?? function.name
             return MirFunction(
                 name: rewrittenName,
@@ -805,7 +829,7 @@ struct TangerineCLI {
                 isExtern: function.isExtern
             )
         }
-        let statics = mir.statics.map { rewrite($0, moduleName: moduleName, catalog: catalog) }
+        let statics = mir.statics.map { rewrite($0, moduleKey: moduleKey, catalog: catalog) }
         return MirProgram(functions: functions, statics: statics, typeDefs: mir.typeDefs)
     }
 
@@ -834,7 +858,7 @@ struct TangerineCLI {
         }
     }
 
-    private static func resolveNormalizedFunctionName(_ name: String, moduleName: String, catalog: FunctionCatalog) -> String {
+    private static func resolveNormalizedFunctionName(_ name: String, moduleKey: String, catalog: FunctionCatalog) -> String {
         if name.contains("::") {
             if catalog.allQualifiedNames.contains(name) {
                 return name
@@ -845,7 +869,7 @@ struct TangerineCLI {
             return name
         }
 
-        if let local = catalog.localQualifiedFreeFunctions[moduleName]?[name] {
+        if let local = catalog.localQualifiedFreeFunctions[moduleKey]?[name] {
             return local
         }
         if let unique = catalog.uniqueQualifiedFreeFunctions[name] {
@@ -854,34 +878,34 @@ struct TangerineCLI {
         return name
     }
 
-    private static func rewrite(_ block: MirBlock, moduleName: String, catalog: FunctionCatalog) -> MirBlock {
+    private static func rewrite(_ block: MirBlock, moduleKey: String, catalog: FunctionCatalog) -> MirBlock {
         MirBlock(
             id: block.id,
-            statements: block.statements.map { rewrite($0, moduleName: moduleName, catalog: catalog) },
-            terminator: rewrite(block.terminator, moduleName: moduleName, catalog: catalog)
+            statements: block.statements.map { rewrite($0, moduleKey: moduleKey, catalog: catalog) },
+            terminator: rewrite(block.terminator, moduleKey: moduleKey, catalog: catalog)
         )
     }
 
-    private static func rewrite(_ statement: MirStatement, moduleName: String, catalog: FunctionCatalog) -> MirStatement {
+    private static func rewrite(_ statement: MirStatement, moduleKey: String, catalog: FunctionCatalog) -> MirStatement {
         switch statement {
         case .assign(let place, let rvalue):
-            return .assign(place, rewrite(rvalue, moduleName: moduleName, catalog: catalog))
+            return .assign(place, rewrite(rvalue, moduleKey: moduleKey, catalog: catalog))
         case .storageLive, .storageDead, .setDiscriminant, .nop:
             return statement
         }
     }
 
-    private static func rewrite(_ terminator: MirTerminator, moduleName: String, catalog: FunctionCatalog) -> MirTerminator {
+    private static func rewrite(_ terminator: MirTerminator, moduleKey: String, catalog: FunctionCatalog) -> MirTerminator {
         switch terminator {
         case .goto, .ret, .unreachable, .abort:
             return terminator
         case .switchInt(let operand, let targets, let otherwise):
-            return .switchInt(rewrite(operand, moduleName: moduleName, catalog: catalog), targets: targets, otherwise: otherwise)
+            return .switchInt(rewrite(operand, moduleKey: moduleKey, catalog: catalog), targets: targets, otherwise: otherwise)
         case .call(let dest, let callee, let args, let next, let unwind):
             return .call(
                 dest: dest,
-                callee: rewrite(callee, moduleName: moduleName, catalog: catalog),
-                args: args.map { rewrite($0, moduleName: moduleName, catalog: catalog) },
+                callee: rewrite(callee, moduleKey: moduleKey, catalog: catalog),
+                args: args.map { rewrite($0, moduleKey: moduleKey, catalog: catalog) },
                 next: next,
                 unwind: unwind
             )
@@ -890,61 +914,59 @@ struct TangerineCLI {
         case .`deinit`:
             return terminator
         case .assert(let operand, let expected, let message, let target):
-            return .assert(rewrite(operand, moduleName: moduleName, catalog: catalog), expected: expected, message: message, target: target)
-        case .yield(let operand, let resume):
-            return .yield(rewrite(operand, moduleName: moduleName, catalog: catalog), resume: resume)
+            return .assert(rewrite(operand, moduleKey: moduleKey, catalog: catalog), expected: expected, message: message, target: target)
         }
     }
 
-    private static func rewrite(_ rvalue: MirRvalue, moduleName: String, catalog: FunctionCatalog) -> MirRvalue {
+    private static func rewrite(_ rvalue: MirRvalue, moduleKey: String, catalog: FunctionCatalog) -> MirRvalue {
         switch rvalue {
         case .use(let operand):
-            return .use(rewrite(operand, moduleName: moduleName, catalog: catalog))
+            return .use(rewrite(operand, moduleKey: moduleKey, catalog: catalog))
         case .mirRef, .mirRefMut, .discriminant, .len:
             return rvalue
         case .aggregate(let kind, let operands):
-            return .aggregate(kind, operands.map { rewrite($0, moduleName: moduleName, catalog: catalog) })
+            return .aggregate(kind, operands.map { rewrite($0, moduleKey: moduleKey, catalog: catalog) })
         case .binaryOp(let op, let lhs, let rhs):
-            return .binaryOp(op, rewrite(lhs, moduleName: moduleName, catalog: catalog), rewrite(rhs, moduleName: moduleName, catalog: catalog))
+            return .binaryOp(op, rewrite(lhs, moduleKey: moduleKey, catalog: catalog), rewrite(rhs, moduleKey: moduleKey, catalog: catalog))
         case .unaryOp(let op, let operand):
-            return .unaryOp(op, rewrite(operand, moduleName: moduleName, catalog: catalog))
+            return .unaryOp(op, rewrite(operand, moduleKey: moduleKey, catalog: catalog))
         case .cast(let operand, let type):
-            return .cast(rewrite(operand, moduleName: moduleName, catalog: catalog), type)
+            return .cast(rewrite(operand, moduleKey: moduleKey, catalog: catalog), type)
         }
     }
 
-    private static func rewrite(_ operand: MirOperand, moduleName: String, catalog: FunctionCatalog) -> MirOperand {
+    private static func rewrite(_ operand: MirOperand, moduleKey: String, catalog: FunctionCatalog) -> MirOperand {
         switch operand {
         case .mirCopy, .mirMovePlace, .mirRead, .mirConsume:
             return operand
         case .mirConstant(let constant):
-            return .mirConstant(rewrite(constant, moduleName: moduleName, catalog: catalog))
+            return .mirConstant(rewrite(constant, moduleKey: moduleKey, catalog: catalog))
         }
     }
 
-    private static func rewrite(_ arg: MirCallArg, moduleName: String, catalog: FunctionCatalog) -> MirCallArg {
+    private static func rewrite(_ arg: MirCallArg, moduleKey: String, catalog: FunctionCatalog) -> MirCallArg {
         let value: MirCallValue
         switch arg.value {
         case .value(let op):
-            value = .value(rewrite(op, moduleName: moduleName, catalog: catalog))
+            value = .value(rewrite(op, moduleKey: moduleKey, catalog: catalog))
         case .place(let p):
             value = .place(p)
         }
         return MirCallArg(effect: arg.effect, value: value)
     }
 
-    private static func rewrite(_ constant: MirConstant, moduleName: String, catalog: FunctionCatalog) -> MirConstant {
+    private static func rewrite(_ constant: MirConstant, moduleKey: String, catalog: FunctionCatalog) -> MirConstant {
         switch constant {
         case .fnItem(let name):
-            return .fnItem(resolveNormalizedFunctionName(name, moduleName: moduleName, catalog: catalog))
+            return .fnItem(resolveNormalizedFunctionName(name, moduleKey: moduleKey, catalog: catalog))
         default:
             return constant
         }
     }
 
-    private static func rewrite(_ staticValue: MirStatic, moduleName: String, catalog: FunctionCatalog) -> MirStatic {
+    private static func rewrite(_ staticValue: MirStatic, moduleKey: String, catalog: FunctionCatalog) -> MirStatic {
         let initializer = staticValue.initializer.map {
-            rewrite($0, moduleName: moduleName, catalog: catalog)
+            rewrite($0, moduleKey: moduleKey, catalog: catalog)
         }
         return MirStatic(name: staticValue.name, type: staticValue.type, initializer: initializer, isMutable: staticValue.isMutable)
     }
@@ -1010,9 +1032,8 @@ struct TangerineCLI {
         print("Merged MIR: \(mergedMIR.functions.count) functions, \(mergedMIR.statics.count) statics, \(mergedMIR.typeDefs.count) types")
         fflush(stdout)
 
-        guard mergedMIR.functions.contains(where: { $0.name == "driver::driver_main" })
-              || mergedMIR.functions.contains(where: { $0.name == "bootstrap_main::main" })
-              || mergedMIR.functions.contains(where: { $0.name == "main" }) else {
+        let entryFunction = resolveEntryFunction(mergedMIR)
+        guard !entryFunction.isEmpty else {
             fputs("error: no compiler entry point (driver::driver_main / bootstrap_main::main / main) found in merged MIR\n", stderr)
             exit(1)
         }
@@ -1277,10 +1298,15 @@ struct TangerineCLI {
 
 
 func resolveEntryFunction(_ mir: MirProgram) -> String {
+    let names = Set(mir.functions.map(\.name))
+    // Exact matches first (root-module programs), then the path-qualified
+    // compiler module identities (tg_compiler/... → "tg_compiler::driver",
+    // "tg_compiler::bootstrap_main"), then deterministic suffix fallbacks.
     for candidate in ["driver::driver_main", "bootstrap_main::main", "main"] {
-        if mir.functions.contains(where: { $0.name == candidate }) {
-            return candidate
-        }
+        if names.contains(candidate) { return candidate }
+        if names.contains("tg_compiler::\(candidate)") { return "tg_compiler::\(candidate)" }
     }
+    for name in names.sorted() where name.hasSuffix("::driver_main") { return name }
+    for name in names.sorted() where name.hasSuffix("::main") { return name }
     return ""
 }
