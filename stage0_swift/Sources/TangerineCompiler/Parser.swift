@@ -5,16 +5,26 @@
 // All constructs are parsed; PARSED-BUT-REJECTED ones produce AST nodes that
 // are flagged by the SubsetChecker pass.
 //
-// Parse coverage scope: every tg_compiler/*.tg (49/49) and tools/*.tg (1/1)
-// parses clean, and every std/*.tg except two file-defect cases:
-//   - std/doc_gen.tg:641 — `s.replace("\"", """)` — an unclosed string
-//     literal (the third `"` has no escape). The kernel lexer rejects it
-//     too (unterminated string literal); the file needs `"\""` here.
-//   - std/gui.tg:1474-1489 — trailing markdown/HTML task-tracker text
-//     (`</parameter>`, `<task_progress>...`) pasted after the final `end`;
-//     not Tangerine content and rejected by the kernel as well.
-// Both files fail identically with the kernel parser; they are invalid
-// inputs, not missing grammar productions.
+// Parse coverage scope: every tg_compiler/*.tg (49/49), std/*.tg (133/133),
+// and tools/*.tg (1/1) parses clean — the two previously documented std file
+// defects (std/doc_gen.tg:641 unclosed string literal and std/gui.tg's
+// trailing markdown/HTML text) were fixed at the source by the std audit and
+// both files now parse. The remaining documented file-defect cases are in
+// the tests/ corpus, rejected identically by the kernel parser:
+//   - tests/consistency/test_consistency.tg and tests/fuzz/test_fuzz.tg use
+//     `fn(...) -> T` closure LITERALS in expression position
+//     (`let render = fn() -> Vec[u8] ... end`, `on_click: fn() {}`). The
+//     kernel lexer maps "fn" to the Def token and the kernel's parse_primary
+//     has no Def case (only parse_type accepts `fn(...) -> T`), so these
+//     files fail in the kernel as well; they are invalid inputs, not missing
+//     grammar productions.
+// And the examples/ corpus is aspirational kernel-invalid content (out of
+// the parse mandate but noted for completeness):
+//   - examples/embedded_blinky.tg — nested `hal::{...}` group import +
+//     `@[no_std]` attribute syntax + `0x4002_3830 as *mut u32` casts
+//   - examples/gpu_triangle.tg — triple-quoted raw string literal
+//     (`const SHADER: &str = """`) + `&str` first-class reference types
+//   - examples/web_service.tg — `pub` field declarations inside structs
 
 public final class Parser {
     private let tokens: [Token]
@@ -289,7 +299,6 @@ public final class Parser {
         }
 
         let kind: ItemKind?
-        if let loc = debugLineCol(currentSpan.start) { print("TRACE item at \(loc)") }
         switch peekKind() {
         case .kwDef, .kwFn, .kwAsync, .kwUnsafe, .kwPure, .kwInline:
             if looksLikeTypedGlobalDef() {
@@ -618,11 +627,9 @@ public final class Parser {
 
         // Parse function clauses
         let clauses = parseFunctionClauses()
-        if let loc = debugLineCol(currentSpan.start) { print("TRACE fn body at \(loc)") }
 
         // Parse body
         let body: FunctionBody
-        if let loc = debugLineCol(currentSpan.start) { print("TRACE fnbody2 at \(loc)") }
         if eat(.eq) {
             // Expression body: def f(x) = expr
             let expr = parseExpr()
@@ -4234,7 +4241,6 @@ public final class Parser {
     /// Parse a zero-parameter closure: || body
     private func parseZeroParamClosure() -> Expr {
         let start = currentSpan
-        if let loc = debugLineCol(start.start) { print("TRACE closure at \(loc)") }
         // Check for `move ||` syntax (move-ness not yet threaded into ClosureExpr)
         _ = eat(.kwMut)
         if case .ident("move") = peekKind() {
@@ -4373,7 +4379,6 @@ public final class Parser {
     }
 
     private func parseStructLiteral(name: String, typeArgs: [TypeExpr] = [], start: Span) -> Expr {
-        if let loc = debugLineCol(start.start) { print("TRACE structlit \(name) at \(loc)") }
         advance() // skip {
         var fields: [(String, Expr)] = []
         var rest: Expr? = nil

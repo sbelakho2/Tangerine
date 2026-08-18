@@ -561,10 +561,19 @@ struct TangerineCLI {
     /// Parse the compiler kernel manifest (bootstrap/compiler_kernel.manifest).
     /// Returns (stdFiles, compilerFiles) relative paths. Returns nil when the
     /// manifest is absent so callers can fall back to directory scanning.
+    /// The manifest path is resolved by walking up from the CWD to the repo
+    /// root (the directory containing bootstrap/), so the CLI works from any
+    /// working directory (e.g. stage0_swift/ as well as the repo root).
     private static func readKernelManifest(fileManager: FileManager = .default) -> (stdFiles: [String], compilerFiles: [String])? {
-        let manifestPath = "bootstrap/compiler_kernel.manifest"
-        guard fileManager.fileExists(atPath: manifestPath),
-              let text = try? String(contentsOfFile: manifestPath, encoding: .utf8) else {
+        var dir = fileManager.currentDirectoryPath
+        var manifestPath = "\(dir)/bootstrap/compiler_kernel.manifest"
+        while !fileManager.fileExists(atPath: manifestPath) {
+            let parent = (dir as NSString).deletingLastPathComponent
+            if parent == dir { return nil }
+            dir = parent
+            manifestPath = "\(dir)/bootstrap/compiler_kernel.manifest"
+        }
+        guard let text = try? String(contentsOfFile: manifestPath, encoding: .utf8) else {
             return nil
         }
 

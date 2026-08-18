@@ -6828,15 +6828,30 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
     emit_push(ctx, fp)
     emit_mov_rr(ctx, fp, sp)
 
-    # Save callee-saved registers
-    for r in fctx.frame.saved_regs do
-      emit_push(ctx, r)
-    end
-
-    # Allocate stack frame
+    # Allocate stack frame (stack_size = spill_bytes + save_bytes)
     if fctx.frame.stack_size > 0 then
       emit_sub_ri(ctx, sp, fctx.frame.stack_size as i32)
       emit_stack_probe(ctx, sp, fctx.frame.stack_size)
+    end
+
+    # Save callee-saved registers at the BOTTOM of the frame, exactly like
+    # the AArch64 prologue: saved[i] at [fp - stack_size + i*8]. The former
+    # pushes landed at [rbp-8], [rbp-16], ... — the SAME addresses the spill
+    # slots use (allocate_locals starts spill offsets at -8) — so any
+    # function that spilled a local and saved a register corrupted both the
+    # caller's register and the spill. The sub above also double-counted the
+    # save bytes (stack_size already includes them).
+    let saved = fctx.frame.saved_regs
+    var si = 0
+    while si < saved.len() do
+      # off = -(stack_size) + (si * 8) — bottom of frame, no spill overlap
+      let abs_off = fctx.frame.stack_size - (si * 8)
+      match saved[si]
+      when PhysReg::X64Reg(r) then
+        emit_store_mem(ctx, fp, -(abs_off as i32), PhysReg::X64Reg(r))
+      when _ then ()
+      end
+      si = si + 1
     end
 
   when Arch::AArch64 then
@@ -6916,13 +6931,34 @@ def codegen_prologue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
       match arg_reg(arch, idx)
       when Option::Some(abi_r) then
         prologue_bind_param_from_abi_reg(ctx, fctx, fp, param, abi_r)
-      when Option::None then ()
+      when Option::None then
+        # Aggregate address pushed on the caller's stack (idx >= max_ra).
+        prologue_bind_param_from_stack(ctx, fctx, fp, param, idx)
       end
     when AbiArg::Stack(_) then
-      ()
+      # Scalar pushed on the caller's stack (idx >= max_ra). The caller
+      # pushes stack args in reverse order, so arg[max_ra + k] lives at
+      # [fp + 16 + k*slot] (x86: 8-byte slots; AArch64: 16-byte pushes).
+      # Without this binding the param home was never written and every
+      # read of a stack-passed parameter returned garbage.
+      prologue_bind_param_from_stack(ctx, fctx, fp, param, idx)
     end
     idx = idx + 1
   end
+end
+
+# Bind a parameter that arrived on the caller's stack (idx >= max_reg_args):
+# load the pushed slot into the scratch register and bind from it.
+def prologue_bind_param_from_stack(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, fp: PhysReg, param: &MirLocal, idx: Int) -> Unit
+  let max_ra = max_reg_args(ctx.target.arch)
+  let k = idx - max_ra
+  let slot = match ctx.target.arch
+  when Arch::AArch64 then 16
+  when Arch::X86_64 then 8
+  end
+  let tmp = scratch_reg(ctx.target.arch)
+  emit_load_mem(ctx, tmp, fp, (16 + k * slot) as i32)
+  prologue_bind_param_from_abi_reg(ctx, fctx, fp, param, tmp)
 end
 
 def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
@@ -7009,15 +7045,22 @@ def codegen_epilogue(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx) -> Unit
 
   match arch
   when Arch::X86_64 then
+    # Restore callee-saved registers from the bottom of the frame
+    # (saved[i] at [fp - stack_size + i*8], matching the prologue stores)
+    let saved = fctx.frame.saved_regs
+    var si = 0
+    while si < saved.len() do
+      let abs_off = fctx.frame.stack_size - (si * 8)
+      match saved[si]
+      when PhysReg::X64Reg(r) then
+        emit_load_mem(ctx, PhysReg::X64Reg(r), fp, -(abs_off as i32))
+      when _ then ()
+      end
+      si = si + 1
+    end
     # Deallocate stack frame
     if fctx.frame.stack_size > 0 then
       emit_add_ri(ctx, sp, fctx.frame.stack_size as i32)
-    end
-    # Restore callee-saved registers (reverse order)
-    var i = fctx.frame.saved_regs.len() - 1
-    while i >= 0 do
-      emit_pop(ctx, fctx.frame.saved_regs[i])
-      i = i - 1
     end
     # pop rbp; ret
     emit_pop(ctx, fp)
@@ -9141,6 +9184,10 @@ def codegen_str_slice(ctx: &mut CodegenCtx) -> Unit
 
   when Arch::X86_64 then
     # rdi = &self, rsi = start, rdx = end
+    # Save the callee-saved regs this inline emitter uses — R12/R13 are the
+    # ENCLOSING function's registers (this runs inline, not as a callee).
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
     # Load actual string pointer: rdi = [rdi]
     x64_mov_rm(&mut ctx.text, X64::RDI, X64::RDI, 0)
     maybe_load_string_data_ptr(
@@ -9192,7 +9239,9 @@ def codegen_str_slice(ctx: &mut CodegenCtx) -> Unit
     emit8(&mut ctx.text, 0xC6)
     emit8(&mut ctx.text, 0x01)
     emit8(&mut ctx.text, 0x00)
-    # rax already has the buffer pointer (return value)
+    # Restore callee-saved regs (rax already holds the buffer pointer)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
   end
 end
 

@@ -142,7 +142,7 @@ tg abi check old.tg new.tg
 ```c
 // Allocation
 uint8_t* tg_alloc(size_t size, size_t align);
-uint8_t* tg_realloc(uint8_t* ptr, size_t size, size_t align);
+uint8_t* tg_realloc(uint8_t* ptr, size_t old_size, size_t new_size, size_t align);
 void tg_free(uint8_t* ptr, size_t size, size_t align);
 
 // Errors

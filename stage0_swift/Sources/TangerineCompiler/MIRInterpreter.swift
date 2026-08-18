@@ -219,7 +219,9 @@ public final class MIRInterpreter {
         ".push", ".pop", ".insert", ".remove", ".extend",
         ".clear", ".truncate", ".reverse", ".sort", ".resize", ".set"
     ]
-    private static let eofTokenKindValue: MirValue = .enumVal("TokenKind", 132, .unit)
+    // Kernel token.tg enum order: Newline = 135, Eof = 136 (the seed's
+    // mirrors are keyed to the kernel's TokenKind discriminants).
+    private static let eofTokenKindValue: MirValue = .enumVal("TokenKind", 136, .unit)
     private static let emptySpanValue: MirValue = .structVal("Span", ["file": .string(""), "start": .int(0), "end_pos": .int(0)])
     private static let eofTokenValue: MirValue = .structVal("Token", ["kind": eofTokenKindValue, "span": emptySpanValue])
     /// Create a Span value with the given file, start, and end positions
@@ -392,6 +394,9 @@ public final class MIRInterpreter {
     }
 
     /// Check if an MIR rvalue passes verification (all referenced locals are valid).
+    /// Discriminants follow the CURRENT kernel mir.tg MirRvalueKind order:
+    /// MirMove=0, MirRef=1, MirAggregate=2, MirBinOp=3, MirUnOp=4,
+    /// MirDiscriminant=5, MirLen=6, MirCast=7, MirRepeat=8, MirPhi=9.
     private func rvalueValid(_ rvalue: MirValue, _ validLocals: MirNativeMap) -> Bool {
         guard case .structVal(_, let rvFields) = rvalue,
               case .enumVal(_, let kindIdx, let payload) = rvFields["kind"] else { return false }
@@ -403,21 +408,21 @@ public final class MIRInterpreter {
                   case .structVal(_, let lf) = pf["local"],
                   let lid = lf["id"]?.asInt else { return false }
             return validLocals.contains(.int(lid))
-        case 3: // MirAggregate(kind, operands)
+        case 2: // MirAggregate(kind, operands)
             guard case .tuple(let parts) = payload, parts.count >= 2,
                   case .array(let ops) = parts[1] else { return false }
             for op in ops { if !operandLocalValid(op, validLocals) { return false } }
             return true
-        case 4: // MirBinOp(op, lhs, rhs)
+        case 3: // MirBinOp(op, lhs, rhs)
             guard case .tuple(let parts) = payload, parts.count >= 3 else { return false }
             return operandLocalValid(parts[1], validLocals) && operandLocalValid(parts[2], validLocals)
-        case 5: // MirUnOp(op, operand)
+        case 4: // MirUnOp(op, operand)
             guard case .tuple(let parts) = payload, parts.count >= 2 else { return false }
             return operandLocalValid(parts[1], validLocals)
-        case 8: // MirCast(kind, operand, type)
+        case 7: // MirCast(kind, operand, type)
             guard case .tuple(let parts) = payload, parts.count >= 2 else { return false }
             return operandLocalValid(parts[1], validLocals)
-        case 10: // MirPhi(entries)
+        case 9: // MirPhi(entries)
             guard case .array(let entries) = payload else { return false }
             for entry in entries {
                 guard case .tuple(let pair) = entry, pair.count >= 2,
@@ -426,7 +431,7 @@ public final class MIRInterpreter {
                 if !validLocals.contains(.int(lid)) { return false }
             }
             return true
-        default: // MirRefMut, MirDiscriminant, MirLen, MirRepeat — no validation
+        default: // MirDiscriminant, MirLen, MirRepeat — no validation
             return true
         }
     }
@@ -2360,7 +2365,7 @@ public final class MIRInterpreter {
                     if case .structVal(_, let tf) = tokens[pos],
                        let kind = tf["kind"],
                        case .enumVal("TokenKind", let idx, _) = kind,
-                       idx == 131 {  // Newline
+                       idx == 135 {  // Newline (kernel token.tg order)
                         pos += 1
                     } else {
                         break
@@ -2490,7 +2495,25 @@ public final class MIRInterpreter {
         // ── Native fast-path for codegen hot functions ─────────
         // These eliminate deep call chains (emit32_le calls emit8 4x each)
         // Use MirByteBuffer (reference type) to avoid O(n) COW copies on every emit.
-        switch fastPathName {
+        // Method fast paths (collection/GUI) must not shadow user-defined
+        // methods on non-native receivers — e.g. the GUI `.size` fast path
+        // returning the window size for a user `Counter::size` (the canary
+        // nested-map-receiver failure). Native collection and GUI receiver
+        // types keep the fast paths; everything else falls through to the
+        // user-method resolution in the switch's default branch.
+        let nativeMethodReceiverTypes: Set<String> = [
+            "Map", "HashMap", "Set", "HashSet", "Vec", "Array", "String",
+            "Range", "RangeInclusive", "Option", "Result",
+            "Window", "Canvas", "Surface", "FontDb", "FontId", "Paint", "Color",
+            "Rect", "Dpi", "WindowId", "GlyphRun", "TextLayout", "TextLine", "Path",
+        ]
+        let effectiveFastPathName: String
+        if isMethod, let rcv = receiverTypeName(args.first ?? .unit), !nativeMethodReceiverTypes.contains(rcv) {
+            effectiveFastPathName = "__native_method_fast_path__"
+        } else {
+            effectiveFastPathName = fastPathName
+        }
+        switch effectiveFastPathName {
         case "array_push", "__intrinsic_array_push":
             // Emit: ldr x0, [x0] + bl _tg_array_push
             fputs("[NATIVE] array_push handler called!\n", stderr)
@@ -3075,14 +3098,17 @@ public final class MIRInterpreter {
             }
             return .enumVal("Option", 1, .unit)
         case "terminator_successors":
-            // Extract successor block IDs from a terminator
+            // Extract successor block IDs from a terminator.
+            // Discriminants follow the CURRENT kernel mir.tg MirTerminatorKind
+            // order: MirGoto=0, MirReturn=1, MirUnreachable=2, MirSwitchInt=3,
+            // MirCall=4, MirAssert=5, MirAbort=6, MirDeinit=7.
             if case .structVal(_, let termFields) = args.first,
                case .enumVal(_, let kindIdx, let kindPayload) = termFields["kind"] {
                 var result: [MirValue] = []
                 switch kindIdx {
                 case 0: // MirGoto(BlockId)
                     result.append(kindPayload)
-                case 1, 2, 8: // MirReturn, MirUnreachable, MirAbort — no successors
+                case 1, 2, 6: // MirReturn, MirUnreachable, MirAbort — no successors
                     break
                 case 3: // MirSwitchInt { op, targets, default_target }
                     if case .structVal(_, let switchFields) = kindPayload {
@@ -3102,21 +3128,16 @@ public final class MIRInterpreter {
                         if let succ = callFields["success"] { result.append(succ) }
                         if case .enumVal(_, 0, let uw) = callFields["unwind"] { result.append(uw) }
                     }
-                case 5: // MirDrop { place, target, unwind }
-                    if case .structVal(_, let dropFields) = kindPayload {
-                        if let target = dropFields["target"] { result.append(target) }
-                        if case .enumVal(_, 0, let uw) = dropFields["unwind"] { result.append(uw) }
+                case 5: // MirAssert { cond, expected, msg, target, unwind }
+                    if case .structVal(_, let assertFields) = kindPayload {
+                        if let target = assertFields["target"] { result.append(target) }
+                        if case .enumVal(_, 0, let uw) = assertFields["unwind"] { result.append(uw) }
                     }
-                case 9: // MirDeinit { place, target, unwind }
-                    if case .structVal(_, let dropFields) = kindPayload {
-                        if let target = dropFields["target"] { result.append(target) }
-                        if case .enumVal(_, 0, let uw) = dropFields["unwind"] { result.append(uw) }
+                case 7: // MirDeinit { place, deinit_fn, target, unwind }
+                    if case .structVal(_, let deinitFields) = kindPayload {
+                        if let target = deinitFields["target"] { result.append(target) }
+                        if case .enumVal(_, 0, let uw) = deinitFields["unwind"] { result.append(uw) }
                     }
-                    case 6: // MirAssert { cond, expected, msg, target, unwind }
-                        if case .structVal(_, let assertFields) = kindPayload {
-                            if let target = assertFields["target"] { result.append(target) }
-                            if case .enumVal(_, 0, let uw) = assertFields["unwind"] { result.append(uw) }
-                        }
                     default:
                         break
                 }
@@ -3386,6 +3407,9 @@ public final class MIRInterpreter {
             }
         case "verify_terminator":
             // verify_terminator(term, valid_blocks, valid_locals, ctx, errors)
+            // Discriminants follow the CURRENT kernel mir.tg MirTerminatorKind
+            // order: MirGoto=0, MirReturn=1, MirUnreachable=2, MirSwitchInt=3,
+            // MirCall=4, MirAssert=5, MirAbort=6, MirDeinit=7.
             if case .structVal(_, let termFields) = args[0],
                case .enumVal(_, let kindIdx, let kindPayload) = termFields["kind"],
                let validBlocks = getNativeMap(args[1]),
@@ -3395,7 +3419,7 @@ public final class MIRInterpreter {
                     if case .structVal(_, let bf) = kindPayload,
                        let bid = bf["id"]?.asInt,
                        validBlocks.contains(.int(bid)) { return .unit }
-                case 1, 2, 8: return .unit // MirReturn, MirUnreachable, MirAbort
+                case 1, 2, 6: return .unit // MirReturn, MirUnreachable, MirAbort
                 case 3: // MirSwitchInt { op, targets, default_target }
                     if case .structVal(_, let sf) = kindPayload {
                         if let opVal = sf["op"], !operandLocalValid(opVal, validLocals) { break }
@@ -3429,38 +3453,25 @@ public final class MIRInterpreter {
                             else { return .unit }
                         }
                     }
-                case 5: // MirDrop { place, target, unwind }
-                    if case .structVal(_, let df) = kindPayload,
-                       case .structVal(_, let pf) = df["place"],
-                       case .structVal(_, let lf) = pf["local"],
-                       let lid = lf["id"]?.asInt, validLocals.contains(.int(lid)),
-                       case .structVal(_, let tf) = df["target"],
-                       let bid = tf["id"]?.asInt, validBlocks.contains(.int(bid)) {
-                        if case .enumVal(_, 0, let uwBlock) = df["unwind"],
-                           case .structVal(_, let uwf) = uwBlock,
-                           let uwid = uwf["id"]?.asInt {
-                            if validBlocks.contains(.int(uwid)) { return .unit }
-                        } else { return .unit }
-                    }
-                case 9: // MirDeinit { place, target, unwind }
-                    if case .structVal(_, let df) = kindPayload,
-                       case .structVal(_, let pf) = df["place"],
-                       case .structVal(_, let lf) = pf["local"],
-                       let lid = lf["id"]?.asInt, validLocals.contains(.int(lid)),
-                       case .structVal(_, let tf) = df["target"],
-                       let bid = tf["id"]?.asInt, validBlocks.contains(.int(bid)) {
-                        if case .enumVal(_, 0, let uwBlock) = df["unwind"],
-                           case .structVal(_, let uwf) = uwBlock,
-                           let uwid = uwf["id"]?.asInt {
-                            if validBlocks.contains(.int(uwid)) { return .unit }
-                        } else { return .unit }
-                    }
-                case 6: // MirAssert { cond, expected, msg, target, unwind }
+                case 5: // MirAssert { cond, expected, msg, target, unwind }
                     if case .structVal(_, let af) = kindPayload,
                        let cond = af["cond"], operandLocalValid(cond, validLocals),
                        case .structVal(_, let tf) = af["target"],
                        let bid = tf["id"]?.asInt, validBlocks.contains(.int(bid)) {
                         if case .enumVal(_, 0, let uwBlock) = af["unwind"],
+                           case .structVal(_, let uwf) = uwBlock,
+                           let uwid = uwf["id"]?.asInt {
+                            if validBlocks.contains(.int(uwid)) { return .unit }
+                        } else { return .unit }
+                    }
+                case 7: // MirDeinit { place, deinit_fn, target, unwind }
+                    if case .structVal(_, let df) = kindPayload,
+                       case .structVal(_, let pf) = df["place"],
+                       case .structVal(_, let lf) = pf["local"],
+                       let lid = lf["id"]?.asInt, validLocals.contains(.int(lid)),
+                       case .structVal(_, let tf) = df["target"],
+                       let bid = tf["id"]?.asInt, validBlocks.contains(.int(bid)) {
+                        if case .enumVal(_, 0, let uwBlock) = df["unwind"],
                            case .structVal(_, let uwf) = uwBlock,
                            let uwid = uwf["id"]?.asInt {
                             if validBlocks.contains(.int(uwid)) { return .unit }
@@ -3640,7 +3651,7 @@ public final class MIRInterpreter {
             break  // Fall through to main builtin switch
         }
 
-        switch name {
+        switch effectiveFastPathName {
 
         // ── Macros ──────────────────────────────────────────────
         case "__macro_println", "println", "io::println", "std::io::println":
@@ -3672,6 +3683,54 @@ public final class MIRInterpreter {
         case "__macro_vec":
             return makeArray(args)
         case "__macro_format", "format":
+            // Mirror of std/fmt.tg `format`: replace {} placeholders with
+            // arguments in order. Supports {} positional, {N} indexed,
+            // {{ and }} escaped braces, and pass-through of unknown specs.
+            if let fmtStr = args.first?.displayString {
+                let fmtArgs = args.dropFirst().map(\.displayString)
+                let chars = Array(fmtStr)
+                var result = ""
+                var argIdx = 0
+                var i = 0
+                while i < chars.count {
+                    let ch = chars[i]
+                    if ch == "{" {
+                        if i + 1 < chars.count && chars[i + 1] == "{" {
+                            result += "{"
+                            i += 2
+                        } else {
+                            var endIdx = i + 1
+                            while endIdx < chars.count && chars[endIdx] != "}" { endIdx += 1 }
+                            if endIdx >= chars.count {
+                                result += "{"
+                                i += 1
+                            } else {
+                                let inner = String(chars[(i + 1)..<endIdx])
+                                if inner.isEmpty {
+                                    if argIdx < fmtArgs.count {
+                                        result += fmtArgs[argIdx]
+                                        argIdx += 1
+                                    } else {
+                                        result += "{}"
+                                    }
+                                } else if let idx = Int(inner), idx >= 0 && idx < fmtArgs.count {
+                                    result += fmtArgs[idx]
+                                } else {
+                                    result += "{" + inner + "}"
+                                }
+                                i = endIdx + 1
+                            }
+                        }
+                    } else if ch == "}" && i + 1 < chars.count && chars[i + 1] == "}" {
+                        result += "}"
+                        i += 2
+                    } else {
+                        result.append(ch)
+                        i += 1
+                    }
+                }
+                return .string(result)
+            }
             return .string(args.map(\.displayString).joined())
         case "from_cstr", "String::from_cstr", "String__from_cstr", "string_from_cstr":
             return .string(cString(from: args.first ?? .int(0)) ?? "")
@@ -5638,17 +5697,20 @@ public final class MIRInterpreter {
         let tok = tokens[i]
 
         // Multi-token combinations (must be adjacent — no whitespace gap)
+        // Discriminants are the CURRENT kernel token.tg enum order:
+        // AmpMut = 99, PipeArrow = 101, DoubleStar = 111, AmpEq = 119,
+        // PipeEq = 120, ShlEq = 122, ShrEq = 123.
         if i + 1 < tokens.count {
             let next = tokens[i + 1]
             if tok.span.end == next.span.start {
                 switch (tok.kind, next.kind) {
-                case (.amp, .kwMut):  return (tkEnum(95), 2)   // &mut → AmpMut
-                case (.pipe, .gt):    return (tkEnum(97), 2)   // |>   → PipeArrow
-                case (.star, .star):  return (tkEnum(107), 2)  // **   → DoubleStar
-                case (.amp, .eq):     return (tkEnum(115), 2)  // &=   → AmpEq
-                case (.pipe, .eq):    return (tkEnum(116), 2)  // |=   → PipeEq
-                case (.shl, .eq):     return (tkEnum(118), 2)  // <<=  → ShlEq
-                case (.shr, .eq):     return (tkEnum(119), 2)  // >>=  → ShrEq
+                case (.amp, .kwMut):  return (tkEnum(99), 2)   // &mut → AmpMut
+                case (.pipe, .gt):    return (tkEnum(101), 2)  // |>   → PipeArrow
+                case (.star, .star):  return (tkEnum(111), 2)  // **   → DoubleStar
+                case (.amp, .eq):     return (tkEnum(119), 2)  // &=   → AmpEq
+                case (.pipe, .eq):    return (tkEnum(120), 2)  // |=   → PipeEq
+                case (.shl, .eq):     return (tkEnum(122), 2)  // <<=  → ShlEq
+                case (.shr, .eq):     return (tkEnum(123), 2)  // >>=  → ShrEq
                 default: break
                 }
             }
@@ -5664,7 +5726,7 @@ public final class MIRInterpreter {
         case .ident(let s):      return (identToTgKind(s), 1)
         // ── Doc comment ──
         case .docComment(let s): return (tkEnum(5, .string(s)), 1)
-        // ── Core keywords ──
+        // ── Core keywords (kernel token.tg order) ──
         case .kwDef:       return (tkEnum(6), 1)
         case .kwEnd:       return (tkEnum(7), 1)
         case .kwDo:        return (tkEnum(8), 1)
@@ -5699,107 +5761,112 @@ public final class MIRInterpreter {
         case .kwFalse:     return (tkEnum(38), 1)
         case .kwSelfValue: return (tkEnum(40), 1)   // self → Self_
         case .kwSelfTy:    return (tkEnum(41), 1)   // Self → SelfType
-        case .kwPre:       return (tkEnum(48), 1)
-        case .kwPost:      return (tkEnum(49), 1)
-        case .kwInvariant: return (tkEnum(50), 1)
-        case .kwCap:       return (tkEnum(51), 1)
-        case .kwUnsafe:    return (tkEnum(52), 1)
-        case .kwRationale: return (tkEnum(53), 1)
-        case .kwBudget:    return (tkEnum(54), 1)
-        case .kwEdition:   return (tkEnum(55), 1)
-        case .kwRequires:  return (tkEnum(56), 1)
-        case .kwEffect:    return (tkEnum(58), 1)
-        case .kwPure:      return (tkEnum(59), 1)
-        case .kwAsync:     return (tkEnum(60), 1)
-        case .kwAwait:     return (tkEnum(61), 1)
-        case .kwTry:       return (tkEnum(64), 1)
-        case .kwCatch:     return (tkEnum(65), 1)
-        case .kwFinally:   return (tkEnum(66), 1)
-        case .kwGuard:     return (tkEnum(67), 1)
-        case .kwDefer:     return (tkEnum(63), 1)
-        case .kwHandle:    return (tkEnum(68), 1)
-        case .kwWith:      return (tkEnum(69), 1)
-        case .kwImplies:   return (tkEnum(71), 1)
-        case .kwComptime:  return (tkEnum(72), 1)
-        case .kwConst:     return (tkEnum(73), 1)
-        case .kwStatic:    return (tkEnum(74), 1)
-        case .kwType:      return (tkEnum(75), 1)
-        case .kwTypealias: return (tkEnum(76), 1)
-        case .kwExtern:    return (tkEnum(77), 1)
-        case .kwInline:    return (tkEnum(78), 1)
+        // ── Memory-safety keywords (kernel order) ──
+        case .kwInout:     return (tkEnum(48), 1)
+        case .kwSink:      return (tkEnum(49), 1)
+        case .kwSet:       return (tkEnum(50), 1)
+        case .kwResource:  return (tkEnum(51), 1)
+        case .kwDeinit:    return (tkEnum(52), 1)
+        // ── Agentic keywords (kernel order) ──
+        case .kwPre:       return (tkEnum(53), 1)
+        case .kwPost:      return (tkEnum(54), 1)
+        case .kwInvariant: return (tkEnum(55), 1)
+        case .kwCap:       return (tkEnum(56), 1)
+        case .kwUnsafe:    return (tkEnum(57), 1)
+        case .kwRationale: return (tkEnum(58), 1)
+        case .kwBudget:    return (tkEnum(59), 1)
+        case .kwEdition:   return (tkEnum(60), 1)
+        case .kwRequires:  return (tkEnum(61), 1)
+        case .kwEffect:    return (tkEnum(63), 1)
+        case .kwPure:      return (tkEnum(64), 1)
+        // ── Modern keywords (kernel order) ──
+        case .kwAsync:     return (tkEnum(65), 1)
+        case .kwAwait:     return (tkEnum(66), 1)
+        case .kwTry:       return (tkEnum(68), 1)
+        case .kwCatch:     return (tkEnum(69), 1)
+        case .kwFinally:   return (tkEnum(70), 1)
+        case .kwGuard:     return (tkEnum(71), 1)
+        case .kwDefer:     return (tkEnum(67), 1)
+        case .kwHandle:    return (tkEnum(72), 1)
+        case .kwWith:      return (tkEnum(73), 1)
+        case .kwImplies:   return (tkEnum(75), 1)
+        case .kwComptime:  return (tkEnum(76), 1)
+        case .kwConst:     return (tkEnum(77), 1)
+        case .kwStatic:    return (tkEnum(78), 1)
+        case .kwType:      return (tkEnum(79), 1)
+        case .kwTypealias: return (tkEnum(79), 1)   // typealias → Type
+        case .kwExtern:    return (tkEnum(81), 1)
+        case .kwInline:    return (tkEnum(82), 1)
         // Swift-only keywords with no TG TokenKind → emit as Ident
-        case .kwFn:        return (tkEnum(4, .string("fn")), 1)
+        // ("fn" maps to Def(6) — the kernel keyword table maps fn → Def)
+        case .kwFn:        return (tkEnum(6), 1)
         case .kwSuper:     return (tkEnum(4, .string("super")), 1)
         case .kwCrate:     return (tkEnum(4, .string("crate")), 1)
         case .kwTest:      return (tkEnum(4, .string("test")), 1)
         case .kwDyn:       return (tkEnum(4, .string("dyn")), 1)
-        case .kwInout:     return (tkEnum(4, .string("inout")), 1)
-        case .kwSink:      return (tkEnum(4, .string("sink")), 1)
-        case .kwSet:       return (tkEnum(4, .string("set")), 1)
-        case .kwResource:  return (tkEnum(4, .string("resource")), 1)
-        case .kwDeinit:    return (tkEnum(4, .string("deinit")), 1)
-        // ── Operators ──
-        case .plus:        return (tkEnum(79), 1)
-        case .minus:       return (tkEnum(80), 1)
-        case .star:        return (tkEnum(81), 1)
-        case .slash:       return (tkEnum(82), 1)
-        case .percent:     return (tkEnum(83), 1)
-        case .eq:          return (tkEnum(84), 1)
-        case .eqEq:        return (tkEnum(85), 1)
-        case .bangEq:      return (tkEnum(86), 1)
-        case .lt:          return (tkEnum(87), 1)
-        case .gt:          return (tkEnum(88), 1)
-        case .ltEq:        return (tkEnum(89), 1)
-        case .gtEq:        return (tkEnum(90), 1)
-        case .ampAmp:      return (tkEnum(91), 1)   // && → And
-        case .pipePipe:    return (tkEnum(92), 1)   // || → Or
-        case .bang:        return (tkEnum(93), 1)
-        case .amp:         return (tkEnum(94), 1)
-        case .pipe:        return (tkEnum(96), 1)
-        case .arrow:       return (tkEnum(98), 1)
-        case .fatArrow:    return (tkEnum(99), 1)
-        case .question:    return (tkEnum(100), 1)
-        case .colonColon:  return (tkEnum(101), 1)
-        case .dot:         return (tkEnum(102), 1)
-        case .dotDot:      return (tkEnum(103), 1)
-        case .dotDotDot:   return (tkEnum(104), 1)  // TG has no DotDotDot token; keep legacy fallback
-        case .dotDotEq:    return (tkEnum(104), 1)
-        case .tilde:       return (tkEnum(105), 1)
-        case .caret:       return (tkEnum(106), 1)
-        case .shl:         return (tkEnum(108), 1)
-        case .shr:         return (tkEnum(109), 1)
-        case .plusEq:      return (tkEnum(110), 1)
-        case .minusEq:     return (tkEnum(111), 1)
-        case .starEq:      return (tkEnum(112), 1)
-        case .slashEq:     return (tkEnum(113), 1)
-        case .percentEq:   return (tkEnum(114), 1)
-        case .ampEq:       return (tkEnum(115), 1)
-        case .pipeEq:      return (tkEnum(116), 1)
-        case .caretEq:     return (tkEnum(117), 1)
-        case .shlEq:       return (tkEnum(118), 1)
-        case .shrEq:       return (tkEnum(119), 1)
+        // ── Operators (kernel order: Plus = 83) ──
+        case .plus:        return (tkEnum(83), 1)
+        case .minus:       return (tkEnum(84), 1)
+        case .star:        return (tkEnum(85), 1)
+        case .slash:       return (tkEnum(86), 1)
+        case .percent:     return (tkEnum(87), 1)
+        case .eq:          return (tkEnum(88), 1)
+        case .eqEq:        return (tkEnum(89), 1)
+        case .bangEq:      return (tkEnum(90), 1)
+        case .lt:          return (tkEnum(91), 1)
+        case .gt:          return (tkEnum(92), 1)
+        case .ltEq:        return (tkEnum(93), 1)
+        case .gtEq:        return (tkEnum(94), 1)
+        case .ampAmp:      return (tkEnum(95), 1)   // && → And
+        case .pipePipe:    return (tkEnum(96), 1)   // || → Or
+        case .bang:        return (tkEnum(97), 1)
+        case .amp:         return (tkEnum(98), 1)
+        case .pipe:        return (tkEnum(100), 1)
+        case .arrow:       return (tkEnum(102), 1)
+        case .fatArrow:    return (tkEnum(103), 1)
+        case .question:    return (tkEnum(104), 1)
+        case .colonColon:  return (tkEnum(105), 1)
+        case .dot:         return (tkEnum(106), 1)
+        case .dotDot:      return (tkEnum(107), 1)
+        case .dotDotDot:   return (tkEnum(108), 1)  // TG has no DotDotDot token; DotDotEq
+        case .dotDotEq:    return (tkEnum(108), 1)
+        case .tilde:       return (tkEnum(109), 1)
+        case .caret:       return (tkEnum(110), 1)
+        case .shl:         return (tkEnum(112), 1)
+        case .shr:         return (tkEnum(113), 1)
+        case .plusEq:      return (tkEnum(114), 1)
+        case .minusEq:     return (tkEnum(115), 1)
+        case .starEq:      return (tkEnum(116), 1)
+        case .slashEq:     return (tkEnum(117), 1)
+        case .percentEq:   return (tkEnum(118), 1)
+        case .ampEq:       return (tkEnum(119), 1)
+        case .pipeEq:      return (tkEnum(120), 1)
+        case .caretEq:     return (tkEnum(121), 1)
+        case .shlEq:       return (tkEnum(122), 1)
+        case .shrEq:       return (tkEnum(123), 1)
         // ── Delimiters ──
-        case .lParen:      return (tkEnum(120), 1)
-        case .rParen:      return (tkEnum(121), 1)
-        case .lBracket:    return (tkEnum(122), 1)
-        case .rBracket:    return (tkEnum(123), 1)
-        case .lBrace:      return (tkEnum(124), 1)
-        case .rBrace:      return (tkEnum(125), 1)
+        case .lParen:      return (tkEnum(124), 1)
+        case .rParen:      return (tkEnum(125), 1)
+        case .lBracket:    return (tkEnum(126), 1)
+        case .rBracket:    return (tkEnum(127), 1)
+        case .lBrace:      return (tkEnum(128), 1)
+        case .rBrace:      return (tkEnum(129), 1)
         // ── Punctuation ──
-        case .colon:       return (tkEnum(126), 1)
-        case .semi:        return (tkEnum(127), 1)
-        case .comma:       return (tkEnum(128), 1)
-        case .at:          return (tkEnum(129), 1)
+        case .colon:       return (tkEnum(130), 1)
+        case .semi:        return (tkEnum(131), 1)
+        case .comma:       return (tkEnum(132), 1)
+        case .at:          return (tkEnum(133), 1)
         // ── Special ──
-        case .newline:     return (tkEnum(131), 1)
-        case .eof:         return (tkEnum(132), 1)
+        case .newline:     return (tkEnum(135), 1)
+        case .eof:         return (tkEnum(136), 1)
         case .dollar:      return (tkEnum(4, .string("$")), 1)
         case .whitespace, .comment:
-            return (tkEnum(131), 1)  // shouldn't reach here; treat as newline
+            return (tkEnum(135), 1)  // shouldn't reach here; treat as newline
         }
     }
 
     /// Identifiers that are TG keywords but not Swift lexer keywords.
+    /// Discriminants follow the CURRENT kernel token.tg enum order.
     private func identToTgKind(_ s: String) -> MirValue {
         switch s {
         case "def":      return tkEnum(6)
@@ -5822,12 +5889,12 @@ public final class MIRInterpreter {
         case "return":  return tkEnum(23)
         case "break":   return tkEnum(24)
         case "next":    return tkEnum(25)
+        case "continue": return tkEnum(25)   // continue → Next (kernel keyword map)
         case "struct":  return tkEnum(26)
         case "enum":    return tkEnum(27)
         case "trait":   return tkEnum(28)
         case "impl":    return tkEnum(29)
         case "module":  return tkEnum(30)
-        case "mod":     return tkEnum(30)
         case "use":     return tkEnum(31)
         case "as":      return tkEnum(32)
         case "pub":     return tkEnum(33)
@@ -5845,36 +5912,43 @@ public final class MIRInterpreter {
         case "own":      return tkEnum(45)
         case "ref":      return tkEnum(46)
         case "ref_mut":  return tkEnum(47)
-        case "pre":     return tkEnum(48)
-        case "post":    return tkEnum(49)
-        case "invariant": return tkEnum(50)
-        case "cap":     return tkEnum(51)
-        case "unsafe":  return tkEnum(52)
-        case "rationale": return tkEnum(53)
-        case "budget":  return tkEnum(54)
-        case "edition": return tkEnum(55)
-        case "requires": return tkEnum(56)
-        case "ensures":  return tkEnum(57)
-        case "effect":  return tkEnum(58)
-        case "pure":    return tkEnum(59)
-        case "async":   return tkEnum(60)
-        case "await":   return tkEnum(61)
-        case "defer":   return tkEnum(63)
-        case "try":     return tkEnum(64)
-        case "catch":   return tkEnum(65)
-        case "finally": return tkEnum(66)
-        case "guard":   return tkEnum(67)
-        case "handle":  return tkEnum(68)
-        case "with":    return tkEnum(69)
-        case "is":       return tkEnum(70)
-        case "implies": return tkEnum(71)
-        case "comptime": return tkEnum(72)
-        case "const":   return tkEnum(73)
-        case "static":  return tkEnum(74)
-        case "type":    return tkEnum(75)
-        case "alias":    return tkEnum(76)
-        case "extern":  return tkEnum(77)
-        case "inline":  return tkEnum(78)
+        case "inout":   return tkEnum(48)
+        case "sink":    return tkEnum(49)
+        case "set":     return tkEnum(50)
+        case "resource": return tkEnum(51)
+        case "deinit":  return tkEnum(52)
+        case "pre":     return tkEnum(53)
+        case "post":    return tkEnum(54)
+        case "invariant": return tkEnum(55)
+        case "cap":     return tkEnum(56)
+        case "unsafe":  return tkEnum(57)
+        case "rationale": return tkEnum(58)
+        case "budget":  return tkEnum(59)
+        case "edition": return tkEnum(60)
+        case "requires": return tkEnum(61)
+        case "ensures":  return tkEnum(62)
+        case "effect":  return tkEnum(63)
+        case "pure":    return tkEnum(64)
+        case "async":   return tkEnum(65)
+        case "await":   return tkEnum(66)
+        case "defer":   return tkEnum(67)
+        case "try":     return tkEnum(68)
+        case "catch":   return tkEnum(69)
+        case "finally": return tkEnum(70)
+        case "guard":   return tkEnum(71)
+        case "handle":  return tkEnum(72)
+        case "with":    return tkEnum(73)
+        case "is":       return tkEnum(74)
+        case "implies": return tkEnum(75)
+        case "comptime": return tkEnum(76)
+        case "const":   return tkEnum(77)
+        case "static":  return tkEnum(78)
+        case "type":    return tkEnum(79)
+        case "alias":    return tkEnum(80)
+        case "extern":  return tkEnum(81)
+        case "inline":  return tkEnum(82)
+        case "fn":       return tkEnum(6)   // fn → Def (kernel keyword map)
+        case "var":      return tkEnum(22)  // var → Mut (kernel keyword map)
         default:         return tkEnum(4, .string(s))
         }
     }

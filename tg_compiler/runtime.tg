@@ -190,7 +190,9 @@ def emit_tg_intrinsic_longjmp(ctx: &mut RuntimeEmitCtx) -> Unit
     # Ensure val != 0 (longjmp(buf, 0) must return 1)
     a64_cmp_ri(&mut ctx.text, A64::X1, 0)
     # CSINC X1, X1, XZR, NE → if X1 == 0 then X1 = 1 else X1 = X1
-    emit32_le(&mut ctx.text, 0x5A9F1021)  # CSINC W1, W1, WZR, NE
+    # 0x5A9F1421: sf=0, opc=11010100, Rm=WZR, cond=NE, op2=01 (CSINC), Rn=W1, Rd=W1
+    # (0x5A9F1021 would be CSEL — an identity — and longjmp(buf, 0) must return 1)
+    emit32_le(&mut ctx.text, 0x5A9F1421)  # CSINC W1, W1, WZR, NE
     # Restore callee-saved registers
     a64_ldr(&mut ctx.text, A64::X19, A64::X0, 0)
     a64_ldr(&mut ctx.text, A64::X20, A64::X0, 8)
@@ -386,10 +388,27 @@ def emit_arg_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_arg_copy(ctx)
   emit_tg_env_entry(ctx)
   emit_tg_args_vec(ctx)
+  emit_tg_effect_record(ctx)
   emit_tg_status(ctx)
   emit_tg_output(ctx)
   emit_tg_stdout_string(ctx)
   emit_tg_stderr_string(ctx)
+end
+
+# __tg_effect_record: Record an effect (name, value) in the effect log.
+# UNSUPPORTED agentic hook: no effect-log implementation exists. MirEffectRecord
+# is never constructed by source lowering (agentic-only), so this is reached
+# only by a future agentic compile — fail closed with a trap instead of
+# fabricating a record. The MirBudgetConsume data symbols (__tg_budget_*)
+# likewise have no definitions and fail closed at link time if emitted.
+def emit_tg_effect_record(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__tg_effect_record")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_brk(&mut ctx.text, 1)
+  when Arch::X86_64 then
+    x64_ud2(&mut ctx.text)
+  end
 end
 
 # _tg_env_count: Count environment variable entries (envp array length).
@@ -565,7 +584,7 @@ end
 # _tg_env_entry: Get environment variable entry at index.
 # Args: x0/rdi = index
 # Returns: raw char* from envp (null if past end), e.g. "KEY=value"
-# _tg_str_skip(str: String, offset: Int) -> String
+# _tg_str_skip(str: Ptr[u8], offset: Int) -> Ptr[u8]
 # Returns str + offset (pointer arithmetic on C string)
 def emit_tg_str_skip(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_str_skip")
@@ -1301,18 +1320,19 @@ def emit_tg_array_grow(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_cmp_rr(&mut ctx.text, X64::RCX, X64::R15)
     x64_jcc(&mut ctx.text, CC::E, lblCopyDone.clone())
     
-    # rax = old_data[rcx]
-    emit8(&mut ctx.text, 0x48)
+    # rax = old_data[rcx]  (r14 = old_data — the load must not depend on a
+    # register set AFTER the load; rsi still holds new_cap on iteration 0)
+    emit8(&mut ctx.text, 0x49)
     emit8(&mut ctx.text, 0x8B)
     emit8(&mut ctx.text, 0x04)
-    emit8(&mut ctx.text, 0xCE)  # mov rax, [rsi + rcx*8]
-    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R14)
-    # new_data[rcx] = rax
-    emit8(&mut ctx.text, 0x48)
+    emit8(&mut ctx.text, 0xCE)  # mov rax, [r14 + rcx*8]
+    # new_data[rcx] = rax  (r13 = new_data; SIB base=100 + REX.B is r13,
+    # NOT rsp — the former 48 89 04 CD encoded [rcx*8+disp32] with rbp and
+    # consumed the next bytes as a missing displacement)
+    emit8(&mut ctx.text, 0x49)
     emit8(&mut ctx.text, 0x89)
     emit8(&mut ctx.text, 0x04)
-    emit8(&mut ctx.text, 0xCD)  # mov [rcx*8 + rdi], rax
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)
+    emit8(&mut ctx.text, 0xCD)  # mov [r13 + rcx*8], rax
     
     x64_add_ri(&mut ctx.text, X64::RCX, 1)
     x64_jmp(&mut ctx.text, lblCopyLoop)
@@ -1574,11 +1594,12 @@ def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
     
     # Get removed element
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 0)
-    # mov rax, [rax + r12*8]
-    emit8(&mut ctx.text, 0x48)
+    # mov rax, [rax + r12*8]  (REX.W+B: SIB base=000 + REX.B is r12; the
+    # former 48 8B 04 E4 encoded [rsp + disp32] with a missing displacement)
+    emit8(&mut ctx.text, 0x4A)
     emit8(&mut ctx.text, 0x8B)
     emit8(&mut ctx.text, 0x04)
-    emit8(&mut ctx.text, 0xE4)
+    emit8(&mut ctx.text, 0xE0)
     x64_push(&mut ctx.text, X64::RAX)  # Save removed
     
     # Shift loop
@@ -1860,8 +1881,10 @@ def emit_tg_array_contains(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_cmp_rr(&mut ctx.text, X64::R10, X64::R8)
     x64_jcc(&mut ctx.text, CC::E, lblNotFound.clone())
     
-    # cmp [r9 + r10*8], rdx
-    emit8(&mut ctx.text, 0x48)
+    # cmp [r9 + r10*8], rdx  (REX.W+X+B — the former 48 39 14 D1 lacked the
+    # REX.X/REX.B bits and compared [rcx + rdx*8] (vec header at element
+    # offset) against rdx)
+    emit8(&mut ctx.text, 0x4A)
     emit8(&mut ctx.text, 0x39)
     emit8(&mut ctx.text, 0x14)
     emit8(&mut ctx.text, 0xD1)
@@ -5113,10 +5136,9 @@ def emit_tg_str_chars_aarch64(ctx: &mut RuntimeEmitCtx) -> Unit
   # Return buffer pointer
   a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)
 
-     # Epilogue — restore all callee-saved regs
-     a64_ldp_post(&mut ctx.text, A64::X27, A64::X28, A64::SP, 16)
-     a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
-     a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+     # Epilogue — restore exactly the 3 pairs pushed in the prologue
+     # (FP/LR, X19/X20, X21/X22); popping X23-X28 here unbalanced the stack
+     # and returned through a garbage LR.
      a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
      a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
      a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
@@ -5491,6 +5513,10 @@ def emit_tg_read_vec_u8(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # &vec slot
     a64_ldur(&mut ctx.text, A64::X20, A64::X20, 0)  # vec ptr
     a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)  # count
+
+    # X23 holds the return value on every exit path — initialize it before
+    # the count==0 early return so that path returns 0, not the caller's X23.
+    a64_mov_ri(&mut ctx.text, A64::X23, 0)
 
     a64_mov_ri(&mut ctx.text, A64::X0, 0)
     a64_stur(&mut ctx.text, A64::X0, A64::X20, 8)  # vec.len = 0

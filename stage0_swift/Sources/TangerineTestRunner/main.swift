@@ -603,8 +603,11 @@ test("pipeline manifest exists and has versioned header") {
 test("pipeline manifest documents all stages and references real source files") {
     let path = "\(repoRoot)/docs/pipeline_manifest.md"
     let content = try String(contentsOfFile: path, encoding: .utf8)
-    let requiredStages = ["Lexing", "Parsing", "Type Checking", "Borrow Checking", "MIR Lowering",
-                          "Monomorphization", "Code Generation", "Object Generation", "Linking"]
+    let requiredStages = ["Lexing", "Parsing", "Dependency merge", "Macro expansion",
+                          "Node-ID assignment", "Name resolution", "Type checking",
+                          "Access checking", "Resource checking", "MIR lowering",
+                          "MIR verification", "Monomorphization", "MIR optimization",
+                          "Code generation"]
     for stage in requiredStages {
         try assertTrue(content.contains(stage), "Manifest missing stage: \(stage)")
     }
@@ -2865,8 +2868,13 @@ test("15.6: Profile documentation") {
         try assertTrue(entry.file.hasSuffix(".tg"), "Profile entry must be .tg: \(entry.file)")
     }
     // NEGATIVE: must have exactly the known count
-    try assertEqual(BootstrapProfile.profileEntries.count, 8,
-        "Must have exactly 8 bootstrap profile entries")
+    // (the kernel profile mirrors bootstrap/compiler_kernel.manifest — the
+    // kernel's single source of truth for the bootstrap closure: alloc,
+    // collections, core, ffi, fmt, fs, io, taint, args, env, bench, process,
+    // gfx_errors, time — 14 std files; resolver.tg lives in tg_compiler/ and
+    // is not part of the std profile)
+    try assertEqual(BootstrapProfile.profileEntries.count, 14,
+        "Must have exactly 14 bootstrap profile entries")
 }
 
 // 15.7: FAIL-FIRST — profileFileSet is a consistent set

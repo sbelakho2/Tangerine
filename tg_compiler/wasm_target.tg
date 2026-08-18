@@ -14,6 +14,7 @@ use tg_compiler::mir::{
   MirRvalue, MirRvalueKind,
   MirOperand, MirOperandKind,
   MirConstant, MirConstantKind,
+  MirCallArg, mir_call_arg_operand,
   MirBinOp, MirUnOp, CastKind,
   AggregateKind, Place, Projection, LocalId, BlockId
 }
@@ -62,7 +63,9 @@ pub struct ImportSection
 end
 
 pub struct WasmImport
-  pub module: String
+  ## "module" is a reserved keyword in Tangerine (TokenKind::Module) — the
+  ## field must not shadow it or the module cannot be parsed.
+  pub module_name: String
   pub name: String
   pub desc: ImportDesc
 end
@@ -292,7 +295,7 @@ impl WasmCompiler
 
     let limits = if self.config.import_memory then
       self.import_section.imports.push(WasmImport {
-        module: "env".to_string(),
+        module_name: "env".to_string(),
         name: "memory".to_string(),
         desc: ImportDesc::Memory(Limits {
           min: self.config.initial_memory_pages,
@@ -345,7 +348,7 @@ impl WasmCompiler
     for (name, params, results) in wasi_funcs do
       let type_idx = self.intern_type(FuncType { params: params, results: results })
       self.import_section.imports.push(WasmImport {
-        module: "wasi_snapshot_preview1".to_string(),
+        module_name: "wasi_snapshot_preview1".to_string(),
         name: name.to_string(),
         desc: ImportDesc::Func(type_idx),
       })
@@ -369,7 +372,11 @@ impl WasmCompiler
 
     ## Compile function body
     if func.is_extern then
-      ## Extern functions have no body — leave import-only placeholder
+      ## Extern functions have no body — emit a trapping stub so every
+      ## function-section entry has a matching code-section body (a wasm
+      ## validation rule: functions without bodies must be imports).
+      let stub = FunctionBody { locals: Array::new(), code: vec![0x00] }
+      self.code_section.bodies.push(stub)
       self.func_index = self.func_index + 1
       return Ok(())
     end
@@ -436,27 +443,37 @@ impl WasmCompiler
     code.push(0x02)  ## block
     code.push(0x40)  ## void
 
-    ## Dispatch: br_table based on target local
+    ## Dispatch: br_table based on target local.
+    ## The blocks are NESTED (loop > b0 > b1 > ... > b_{N-1} > dispatch), so
+    ## from the dispatch block label 0 is the dispatch block itself, label
+    ## 1 is b_{N-1} (block 0's code region), ..., label N is b0 (block N-1's
+    ## region), label N+1 is the loop. Target value v must branch to label
+    ## v+1 — the old v mapping targeted the dispatch block itself for v=0
+    ## (infinite loop) and shifted every block by one.
     code.push(0x20)  ## local.get
     _encode_leb128_u32(&mut code, target_local as UInt)
     code.push(0x0E)  ## br_table
     _encode_leb128_u32(&mut code, num_blocks as UInt)  ## number of targets
     for i in 0..num_blocks do
-      _encode_leb128_u32(&mut code, i as UInt)  ## label index i -> block i
+      _encode_leb128_u32(&mut code, (i + 1) as UInt)  ## label i+1 -> block i's region
     end
-    _encode_leb128_u32(&mut code, 0)  ## default -> block 0
+    _encode_leb128_u32(&mut code, 1)  ## default -> block 0 (label 1)
 
     code.push(0x0B)  ## end dispatch block
 
-    ## Emit code for each block (block 0 is outermost after dispatch)
+    ## Emit code for each block (block 0 is emitted first, inside the
+    ## innermost b_{N-1}; block i's code runs inside b_{N-1-i})
     for (block_idx, block) in func.blocks.iter().enumerate() do
       ## Emit statements
       for stmt in block.statements.iter() do
         self.emit_statement(&mut code, stmt, func)?
       end
 
-      ## Emit terminator
-      self.emit_terminator(&mut code, &block.terminator, target_local, num_blocks, func, func_map)?
+      ## Emit terminator. The br-to-loop depth depends on the block's
+      ## nesting level: block i sits inside b_{N-1-i}, so the loop is
+      ## num_blocks - block_idx levels up (the old fixed num_blocks depth
+      ## was only correct for block 0 and escaped the frame for i > 0).
+      self.emit_terminator(&mut code, &block.terminator, target_local, num_blocks, block_idx, func, func_map)?
 
       code.push(0x0B)  ## end block $b{block_idx}
     end
@@ -478,6 +495,8 @@ impl WasmCompiler
     when MirStatementKind::MirStorageLive(_) then ()  ## no-op in WASM
     when MirStatementKind::MirStorageDead(_) then ()  ## no-op in WASM
     when MirStatementKind::MirNop then ()
+    ## Agentic statements have no WASM lowering — no-op.
+    when _ then ()
     end
     Ok(())
   end
@@ -544,7 +563,8 @@ impl WasmCompiler
 
   def emit_operand(&self, code: &mut Array[u8], operand: &MirOperand) -> Result[Unit, WasmCompileError]
     match operand.kind
-    when MirOperandKind::MirCopy(place) | MirOperandKind::MirMovePlace(place) then
+    when MirOperandKind::MirCopy(place) | MirOperandKind::MirMovePlace(place) |
+         MirOperandKind::MirRead(place) | MirOperandKind::MirConsume(place) then
       code.push(0x20)  ## local.get
       _encode_leb128_u32(code, place.local.id as UInt)
       ## Handle projections (field access = memory load from offset)
@@ -570,13 +590,14 @@ impl WasmCompiler
         when _ then ()
         end
       end
-    when MirOperandKind::Constant(c) then
+    when MirOperandKind::MirConstant(c) then
       match c.kind
-      when MirConstantKind::Int(n) then emit_i64_const(code, *n)
-      when MirConstantKind::Float(f) then emit_f64_const(code, *f)
-      when MirConstantKind::Bool(b) then emit_i32_const(code, if *b then 1 else 0 end)
-      when MirConstantKind::Unit then ()  ## produces no value
-      when MirConstantKind::String(s) then
+      when MirConstantKind::MirInt(n) then emit_i64_const(code, *n)
+      when MirConstantKind::MirFloat(f) then emit_f64_const(code, *f)
+      when MirConstantKind::MirBool(b) then emit_i32_const(code, if *b then 1 else 0 end)
+      when MirConstantKind::MirChar(cv) then emit_i32_const(code, *cv as i32)
+      when MirConstantKind::MirUnit then ()  ## produces no value
+      when MirConstantKind::MirString(_) then
         ## String literals: push data offset (would be interned in data segment)
         emit_i32_const(code, 0)
       when _ then emit_i64_const(code, 0)
@@ -626,27 +647,33 @@ impl WasmCompiler
     Ok(())
   end
 
-  def emit_terminator(&self, code: &mut Array[u8], term: &MirTerminator, target_local: Int, num_blocks: Int, func: &MirFunction, func_map: &Map[String, UInt]) -> Result[Unit, WasmCompileError]
+  def emit_terminator(&self, code: &mut Array[u8], term: &MirTerminator, target_local: Int, num_blocks: Int, block_idx: Int, func: &MirFunction, func_map: &Map[String, UInt]) -> Result[Unit, WasmCompileError]
+    ## Block i's code runs inside b_{N-1-i} (see compile_body), so the loop
+    ## is exactly (num_blocks - block_idx) frames up; a br inside an `if`
+    ## adds one more level. The former fixed num_blocks(+1) depths were only
+    ## correct for block 0 and escaped the function frame for every other
+    ## block (validation error).
+    let loop_depth = (num_blocks - block_idx) as UInt
+    let loop_depth_in_if = (num_blocks - block_idx + 1) as UInt
     match term.kind
-    when MirTerminatorKind::Goto(block_id) then
+    when MirTerminatorKind::MirGoto(block_id) then
       emit_i32_const(code, block_id.id as i32)
       code.push(0x21)  ## local.set $target
       _encode_leb128_u32(code, target_local as UInt)
       ## br to enclosing loop
       code.push(0x0C)  ## br
-      let depth = (num_blocks - 0) as UInt  ## loop is num_blocks levels up
-      _encode_leb128_u32(code, depth)
-    when MirTerminatorKind::Return then
+      _encode_leb128_u32(code, loop_depth)
+    when MirTerminatorKind::MirReturn then
       ## Load return value from local 0 if function has a return type
       if !matches!(&func.ret_type, Type::Unit | Type::Never) then
         code.push(0x20)  ## local.get _0 (return place)
         _encode_leb128_u32(code, 0)
       end
       code.push(0x0F)  ## return
-    when MirTerminatorKind::SwitchInt(operand, targets) then
+    when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
       ## Emit operand, then if/else chain for each target
       for target in targets.iter() do
-        self.emit_operand(code, operand)?
+        self.emit_operand(code, op)?
         emit_i64_const(code, target.value)
         code.push(0x51)  ## i64.eq
         code.push(0x04)  ## if
@@ -655,65 +682,75 @@ impl WasmCompiler
         code.push(0x21)  ## local.set $target
         _encode_leb128_u32(code, target_local as UInt)
         code.push(0x0C)  ## br to loop
-        let depth = (num_blocks + 1) as UInt
-        _encode_leb128_u32(code, depth)
+        _encode_leb128_u32(code, loop_depth_in_if)
         code.push(0x0B)  ## end if
       end
-      ## Default: fall through to otherwise block
-      match targets.otherwise
-      when Option::Some(otherwise) then
-        emit_i32_const(code, otherwise.id as i32)
-        code.push(0x21)  ## local.set
-        _encode_leb128_u32(code, target_local as UInt)
-        code.push(0x0C)  ## br
-        let depth = (num_blocks) as UInt
-        _encode_leb128_u32(code, depth)
-      when Option::None then
-        code.push(0x00)  ## unreachable
-      end
-    when MirTerminatorKind::Call(callee_func, args, dest_place, next_block, _) then
+      ## Default: branch to the default block
+      emit_i32_const(code, default_target.id as i32)
+      code.push(0x21)  ## local.set
+      _encode_leb128_u32(code, target_local as UInt)
+      code.push(0x0C)  ## br
+      _encode_leb128_u32(code, loop_depth)
+    when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
       ## Push arguments
       for arg in args.iter() do
-        self.emit_operand(code, arg)?
+        let arg_op = mir_call_arg_operand(arg)
+        self.emit_operand(code, &arg_op)?
       end
       ## Call function
-      match func_map.get(&callee_func) 
+      let callee_name = _call_callee_name(callee)
+      match func_map.get(&callee_name)
       when Option::Some(idx) then
         code.push(0x10)  ## call
         _encode_leb128_u32(code, *idx)
       when Option::None then
-        ## Unknown function — drop args, push zero
-        code.push(0x00)  ## unreachable
+        ## Unknown function — unreachable (fail closed)
+        code.push(0x00)
       end
-      ## Store result
-      code.push(0x21)  ## local.set
-      _encode_leb128_u32(code, dest_place.local.id as UInt)
+      ## Store result if the destination local actually holds a value
+      ## (void-returning calls must not local.set — nothing is on the stack).
+      match _place_wasm_type(func, dest)
+      when Option::Some(_) then
+        code.push(0x21)  ## local.set
+        _encode_leb128_u32(code, dest.local.id as UInt)
+      when Option::None then ()
+      end
       ## Goto next block
-      emit_i32_const(code, next_block.id as i32)
+      emit_i32_const(code, success.id as i32)
       code.push(0x21)  ## local.set $target
       _encode_leb128_u32(code, target_local as UInt)
       code.push(0x0C)  ## br
-      _encode_leb128_u32(code, num_blocks as UInt)
-    when MirTerminatorKind::Unreachable then
+      _encode_leb128_u32(code, loop_depth)
+    when MirTerminatorKind::MirUnreachable then
       code.push(0x00)  ## unreachable
-    when MirTerminatorKind::Drop(_, next_block) then
-      emit_i32_const(code, next_block.id as i32)
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      ## WASM backend has no drop glue: destruction is a no-op, continue at
+      ## the target block.
+      emit_i32_const(code, target.id as i32)
       code.push(0x21)  ## local.set $target
       _encode_leb128_u32(code, target_local as UInt)
       code.push(0x0C)  ## br
-      _encode_leb128_u32(code, num_blocks as UInt)
-    when MirTerminatorKind::Assert(cond, _, target_block, _) then
+      _encode_leb128_u32(code, loop_depth)
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
       self.emit_operand(code, cond)?
-      code.push(0x45)  ## i32.eqz (check if false)
+      if expected then
+        code.push(0x45)  ## i32.eqz — trap when the condition is false
+      else
+        ## expected == false: trap when the condition is true
+        emit_i32_const(code, 0)
+        code.push(0x46)  ## i32.ne
+      end
       code.push(0x04)  ## if
       code.push(0x40)  ## void
       code.push(0x00)  ## unreachable (assertion failed)
       code.push(0x0B)  ## end if
-      emit_i32_const(code, target_block.id as i32)
+      emit_i32_const(code, target.id as i32)
       code.push(0x21)  ## local.set $target
       _encode_leb128_u32(code, target_local as UInt)
       code.push(0x0C)  ## br
-      _encode_leb128_u32(code, num_blocks as UInt)
+      _encode_leb128_u32(code, loop_depth)
+    when MirTerminatorKind::MirAbort then
+      code.push(0x00)  ## unreachable
     when _ then
       code.push(0x00)  ## unreachable for unknown terminators
     end
@@ -810,7 +847,8 @@ end
 ## Determine the WASM value type an operand will produce on the stack.
 def _operand_wasm_type(operand: &MirOperand, func: &MirFunction) -> WasmValType
   match operand.kind
-  when MirOperandKind::MirCopy(place) | MirOperandKind::MirMovePlace(place) then
+  when MirOperandKind::MirCopy(place) | MirOperandKind::MirMovePlace(place) |
+       MirOperandKind::MirRead(place) | MirOperandKind::MirConsume(place) then
     let id = place.local.id
     if id < func.params.len() then
       mir_type_to_wasm(&func.params[id].ty)
@@ -822,12 +860,49 @@ def _operand_wasm_type(operand: &MirOperand, func: &MirFunction) -> WasmValType
         WasmValType::I32
       end
     end
-  when MirOperandKind::Constant(c) then
+  when MirOperandKind::MirConstant(c) then
     match c.kind
-    when MirConstantKind::Int(_) then WasmValType::I64
-    when MirConstantKind::Float(_) then WasmValType::F64
+    when MirConstantKind::MirInt(_) then WasmValType::I64
+    when MirConstantKind::MirFloat(_) then WasmValType::F64
     when _ then WasmValType::I32
     end
+  end
+end
+
+## WASM value type of a place's local, or None for Unit/Never locals (which
+## occupy no wasm value slot — a call into one must not local.set).
+def _place_wasm_type(func: &MirFunction, place: &Place) -> Option[WasmValType]
+  let id = place.local.id
+  if id < func.params.len() then
+    let t = &func.params[id].ty
+    match t
+    when Type::Unit | Type::Never then Option::None
+    when _ then Option::Some(mir_type_to_wasm(t))
+    end
+  else
+    let local_idx = id - func.params.len()
+    if local_idx < func.locals.len() then
+      let t = &func.locals[local_idx].ty
+      match t
+      when Type::Unit | Type::Never then Option::None
+      when _ then Option::Some(mir_type_to_wasm(t))
+      end
+    else
+      Option::None
+    end
+  end
+end
+
+## Extract the callable's symbol name from a call's func operand
+## (MirFnItem constants carry the mangled emission name).
+def _call_callee_name(op: &MirOperand) -> String
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirFnItem(n) then n.clone()
+    when _ then "".to_string()
+    end
+  when _ then "".to_string()
   end
 end
 
@@ -987,7 +1062,7 @@ def _encode_import_section(imp_sec: &ImportSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, imp_sec.imports.len() as UInt)
   for imp in imp_sec.imports.iter() do
-    _encode_name(&mut buf, &imp.module)
+    _encode_name(&mut buf, &imp.module_name)
     _encode_name(&mut buf, &imp.name)
     match imp.desc
     when ImportDesc::Func(type_idx) then

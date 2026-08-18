@@ -190,6 +190,7 @@ enum Stdio
   case Null       # Redirect to /dev/null
   case Pipe       # Create a pipe
   case File(path: String, mode: OpenMode)
+  case StderrToStdout  # 2>&1: child stderr is a copy of its stdout
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -326,9 +327,8 @@ def Command::stderr_pipe(self: Command) -> Command
 end
 
 def Command::stderr_to_stdout(self: Command) -> Command
-  # Will be handled specially in spawn
   var result = self
-  result.stderr = Stdio::Inherit  # Placeholder, actual merge happens in spawn
+  result.stderr = Stdio::StderrToStdout
   result
 end
 
@@ -353,13 +353,16 @@ def to_c_string(s: String) -> Vec[u8]
   bytes
 end
 
-def string_vec_to_argv(strings: Vec[String]) -> Vec[Ptr[u8]]
+# Builds a NULL-terminated argv array. The owned C-string byte buffers are
+# appended to `c_strings` (a caller-owned out-parameter): the argv pointers
+# alias those buffers, so the caller must keep `c_strings` alive until the
+# exec call — returning only the pointer vector would dangle the argv
+# entries the moment the buffers were released.
+def string_vec_to_argv(strings: Vec[String], c_strings: &mut Vec[Vec[u8]]) -> Vec[Ptr[u8]]
   var argv: Vec[Ptr[u8]] = Vec::with_capacity(strings.len() + 1)
-  var c_strings: Vec[Vec[u8]] = Vec::with_capacity(strings.len())
   
   for s in strings do
-    let c_str = to_c_string(s)
-    c_strings.push(c_str)
+    c_strings.push(to_c_string(s))
   end
   
   var i = 0
@@ -495,6 +498,7 @@ def Command::spawn(self: Command) -> Result[Child, String]
     
     # Handle stdin
     match stdin_cfg
+    when Stdio::StderrToStdout then ()
     when Stdio::Inherit then ()
     when Stdio::Null then
       libc_close(STDIN_FD())
@@ -514,6 +518,7 @@ def Command::spawn(self: Command) -> Result[Child, String]
     
     # Handle stdout
     match stdout_cfg
+    when Stdio::StderrToStdout then ()
     when Stdio::Inherit then ()
     when Stdio::Null then
       libc_close(STDOUT_FD())
@@ -533,6 +538,8 @@ def Command::spawn(self: Command) -> Result[Child, String]
     
     # Handle stderr
     match stderr_cfg
+    when Stdio::StderrToStdout then
+      dup2(STDOUT_FD(), STDERR_FD())
     when Stdio::Inherit then ()
     when Stdio::Null then
       libc_close(STDERR_FD())
@@ -557,11 +564,13 @@ def Command::spawn(self: Command) -> Result[Child, String]
       full_args.push(a.clone())
     end
     
-    let argv_ptrs = string_vec_to_argv(full_args)
-    let program_cstr = to_c_string(program.clone())
+    # The C-string buffers must OUTLIVE the execvp call: they are pushed
+    # into c_strings (owned by this child scope) and argv aliases them.
+    var c_strings: Vec[Vec[u8]] = Vec::with_capacity(full_args.len())
+    let argv_ptrs = string_vec_to_argv(full_args, &mut c_strings)
     
     # Execute
-    execvp(program_cstr.as_ptr(), argv_ptrs.as_ptr())
+    execvp(c_strings[0].as_ptr(), argv_ptrs.as_ptr())
     
     # If exec returns, it failed
     _exit(127)
@@ -680,6 +689,30 @@ def Command::status(self: Command) -> Result[ExitCode, String]
   end
 end
 
+# Append one pollfd entry ({ int fd; short events; short revents; } = 8
+# bytes, little-endian) for `fd` watching POLLIN. The entry is built as raw
+# bytes so the 64-bit Tangerine Int never distorts the C `int` layout.
+def _poll_fd_append(fds: &mut Vec[u8], fd: Int) -> Unit
+  var b: Vec[u8] = Vec::with_capacity(8)
+  b.resize(8, 0)
+  b[0] = (fd & 0xFF) as u8
+  b[1] = ((fd >> 8) & 0xFF) as u8
+  b[2] = ((fd >> 16) & 0xFF) as u8
+  b[3] = ((fd >> 24) & 0xFF) as u8
+  b[4] = 0x01  # POLLIN
+  b[5] = 0
+  var k = 0
+  while k < 8 do
+    fds.push(b[k])
+    k = k + 1
+  end
+end
+
+def _poll_fd_revents(fds: &Vec[u8], index: Int) -> u16
+  let base = index * 8
+  (fds[base + 6] as u16) | ((fds[base + 7] as u16) << 8)
+end
+
 def Command::output(self: Command) -> Result[ProcessOutput, String]
   var cmd = self
   cmd.stdout = Stdio::Pipe
@@ -691,40 +724,75 @@ def Command::output(self: Command) -> Result[ProcessOutput, String]
     var stdout_bytes: Vec[u8] = Vec::new()
     var stderr_bytes: Vec[u8] = Vec::new()
     
-    # Read stdout
-    match child.stdout
-    when Option::Some(fd) then
-      var buf: Vec[u8] = Vec::with_capacity(4096)
-      buf.resize(4096, 0)
-      loop do
-        let n = libc_read(fd, buf.as_mut_ptr(), 4096)
-        if n <= 0 then break end
-        var i = 0
-        while i < n do
-          stdout_bytes.push(buf[i])
-          i = i + 1
-        end
-      end
-      libc_close(fd)
-    when Option::None then ()
+    var stdout_fd = match child.stdout
+    when Option::Some(fd) then fd
+    when Option::None then -1
+    end
+    var stderr_fd = match child.stderr
+    when Option::Some(fd) then fd
+    when Option::None then -1
     end
     
-    # Read stderr
-    match child.stderr
-    when Option::Some(fd) then
-      var buf: Vec[u8] = Vec::with_capacity(4096)
-      buf.resize(4096, 0)
-      loop do
-        let n = libc_read(fd, buf.as_mut_ptr(), 4096)
-        if n <= 0 then break end
-        var i = 0
-        while i < n do
-          stderr_bytes.push(buf[i])
-          i = i + 1
+    # Interleave both pipe reads through poll(2): draining stdout to EOF
+    # before touching stderr deadlocks once the child fills the stderr pipe
+    # buffer (~64 KiB) while the parent is still reading stdout.
+    while stdout_fd >= 0 || stderr_fd >= 0 do
+      var poll_fds: Vec[u8] = Vec::new()
+      var stdout_idx = -1
+      var stderr_idx = -1
+      if stdout_fd >= 0 then
+        stdout_idx = 0
+        _poll_fd_append(&mut poll_fds, stdout_fd)
+      end
+      if stderr_fd >= 0 then
+        stderr_idx = if stdout_fd >= 0 then 1 else 0 end
+        _poll_fd_append(&mut poll_fds, stderr_fd)
+      end
+      
+      let pr = poll(poll_fds.as_ptr(), poll_fds.len() as UInt / 8, -1)
+      if pr < 0 then
+        if stdout_fd >= 0 then libc_close(stdout_fd) end
+        if stderr_fd >= 0 then libc_close(stderr_fd) end
+        return Result::Err("poll failed while reading child output".to_string())
+      end
+      
+      if stdout_idx >= 0 then
+        let rev = _poll_fd_revents(&poll_fds, stdout_idx)
+        if (rev & 0x001) != 0 || (rev & 0x008) != 0 || (rev & 0x010) != 0 then
+          var buf: Vec[u8] = Vec::with_capacity(4096)
+          buf.resize(4096, 0)
+          let n = libc_read(stdout_fd, buf.as_mut_ptr(), 4096)
+          if n <= 0 then
+            libc_close(stdout_fd)
+            stdout_fd = -1
+          else
+            var i = 0
+            while i < n do
+              stdout_bytes.push(buf[i])
+              i = i + 1
+            end
+          end
         end
       end
-      libc_close(fd)
-    when Option::None then ()
+      
+      if stderr_idx >= 0 then
+        let rev = _poll_fd_revents(&poll_fds, stderr_idx)
+        if (rev & 0x001) != 0 || (rev & 0x008) != 0 || (rev & 0x010) != 0 then
+          var buf: Vec[u8] = Vec::with_capacity(4096)
+          buf.resize(4096, 0)
+          let n = libc_read(stderr_fd, buf.as_mut_ptr(), 4096)
+          if n <= 0 then
+            libc_close(stderr_fd)
+            stderr_fd = -1
+          else
+            var i = 0
+            while i < n do
+              stderr_bytes.push(buf[i])
+              i = i + 1
+            end
+          end
+        end
+      end
     end
     
     # Wait for process
@@ -759,11 +827,11 @@ def ProcessOutput::success(self: ProcessOutput) -> Bool
 end
 
 def ProcessOutput::stdout_string(self: ProcessOutput) -> String
-  String::from_utf8(self.stdout)
+  String::from_utf8(self.stdout).unwrap_or(String::new())
 end
 
 def ProcessOutput::stderr_string(self: ProcessOutput) -> String
-  String::from_utf8(self.stderr)
+  String::from_utf8(self.stderr).unwrap_or(String::new())
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -839,7 +907,7 @@ def current_dir() -> Result[String, String]
       len = len + 1
     end
     buf.truncate(len)
-    Result::Ok(String::from_utf8(buf))
+    Result::Ok(String::from_utf8(buf).unwrap_or(String::new()))
   end
 end
 
@@ -898,6 +966,10 @@ end
 # This libc_open is for internal process module use only
 @ffi("c")
 extern def libc_open(path: Ptr[u8], flags: Int) -> Int
+end
+
+@ffi("c")
+extern def poll(fds: Ptr[u8], nfds: UInt, timeout: Int) -> Int
 end
 
 # Convenience wrapper: run a command, capture stdout, return Result

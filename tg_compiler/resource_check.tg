@@ -459,6 +459,12 @@ def type_kind_contains_resource(typed: &TypedProgram, ty: &Type) -> Bool
     end
   when Type::Tuple(fields) then
     type_fields_contain_resource(typed, &fields)
+  when Type::FixedArray(elem, _) then
+    # The distinct [T; N] variant (the lang-item Array is the Vec-backed
+    # Adt form handled above): a fixed array of resource elements owns them
+    # (the MIR's deinit planning recurses into the element — mir.tg), so
+    # the resource classification must match.
+    type_kind_contains_resource(typed, &elem)
   when Type::Function(_, _) then false
   when Type::RefInternal(inner, _) then type_kind_contains_resource(typed, &inner)
   # The Adt Box form OWNS an allocation regardless of T (Box[Int] must be
@@ -561,6 +567,10 @@ def type_kind_contains_capability(typed: &TypedProgram, ty: &Type) -> Bool
     end
   when Type::Tuple(fields) then
     type_fields_contain_capability(typed, &fields)
+  when Type::FixedArray(elem, _) then
+    # Fixed-array capabilities: the [T; N] variant's element walk mirrors
+    # type_kind_contains_resource's FixedArray arm.
+    type_kind_contains_capability(typed, &elem)
   when Type::Function(_, _) then false
   when Type::RefInternal(inner, _) then type_kind_contains_capability(typed, &inner)
   when _ then false
@@ -1060,6 +1070,11 @@ def is_owning_typed_depth(typed: &TypedProgram, ty: &Type, depth: Int) -> Bool
           end
         when Option::None then named_viral_owns(typed, tid, &args, depth)
         end
+      when Type::FixedArray(elem, _) then
+        # The [T; N] variant owns when its element type owns (the
+        # canonical-predicate parity with type_kind_contains_resource's
+        # FixedArray arm): a fixed array of UniquePtrs is move-only.
+        is_owning_typed_depth(typed, &elem, depth + 1)
       when _ then false
       end
     end
@@ -2450,11 +2465,17 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
         # assign-drop machinery drops the ROOT local, so an owning
         # PROJECTED target (p.a = ...) cannot be represented exactly —
         # reject it until exact-place replacement exists.
+        # Set params are included in the drop filter ONCE they are Live:
+        # the value they hold was written by the callee (a previous
+        # assignment), so overwriting it without a drop leaks that value.
+        # The FIRST assignment (entry Uninitialized) stores into the
+        # caller's buffer and drops nothing (the Uninitialized state never
+        # reaches this Live branch).
         match res_frame_get(frame, &lid)
         when Option::Some(ResourceState::Live) then
           match res_frame_get_origin(frame, &lid)
           when Option::Some(origin) then
-            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
               if expr_is_plain(&target) then
                 var assign_ids = Vec::new()
                 assign_ids.push(id)
@@ -2575,19 +2596,29 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, loop_outer:
     register_defer(stmt.node_id, defer_chain, &defer_local_ids, finalize_plan)
   when StmtKind::StmtGuard(cond, else_action) then
     check_expr(program, typed, &cond, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    # The guard's failing-condition exit is a DIVERGENT path: the else
+    # action's value expression may MOVE an owning local out of the frame
+    # (`guard ok else return r` transfers r on the else path only). The
+    # else path is evaluated on a private clone of the frame, so the
+    # transfer/consume applies to the else path's state — the fallthrough
+    # (cond-true) frame keeps the local Live. The GuardElse edge's cleanup
+    # obligation is recorded from the same clone (identical content at the
+    # guard point), so the emitted edge plan is unchanged.
     match else_action
     when GuardElse::Return(val_opt) then
       # P0-W: GUARD-ELSE edge — the guard's failing-condition exit is ONE
       # transfer of kind GuardElse; its plan serialization is the
       # "return::<guard stmt id>" key recorded by check_return_stmt below
       # (the guard stmt's id, not an inner return's).
-      let g_actions = check_return_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
+      mut gframe = res_frame_clone(frame)
+      let g_actions = check_return_stmt(program, typed, val_opt, loop_outer, &mut gframe, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
       edges.push(CfgEdge { kind: CfgEdgeKind::GuardElse, source: stmt.node_id, destination: 0, actions: g_actions })
     when GuardElse::Panic(_) then ()
     when GuardElse::Break(val_opt) then
       # P0-W: GUARD-ELSE edge — plan serialization "break::<guard stmt id>"
       # (recorded by check_break_stmt below).
-      let g_actions = check_break_stmt(program, typed, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
+      mut gframe2 = res_frame_clone(frame)
+      let g_actions = check_break_stmt(program, typed, val_opt, loop_outer, &mut gframe2, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
       edges.push(CfgEdge { kind: CfgEdgeKind::GuardElse, source: stmt.node_id, destination: enclosing_loop_key(defer_chain), actions: g_actions })
     when GuardElse::Continue then
       # P0-W: GUARD-ELSE edge — plan serialization "continue::<guard stmt
@@ -3754,7 +3785,17 @@ def check_loop_created(entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, 
             span: ls.span
           })
         else
-          backedge_actions.push((0, id.id))
+          # A loop-created resource that is Live on one iteration path and
+          # Consumed on another CANNOT be cleaned by the backedge: the
+          # "backedge::<loop id>" plan lowers to an UNCONDITIONAL deinit,
+          # which would double-finalize the value on the consumed path
+          # (deinit on the consume path + deinit at the backedge). Until
+          # conditional per-iteration cleanup exists, the mixed state is an
+          # error — the consume must happen on every path or on none.
+          errors.push(ResourceError {
+            message: "resource `" + binding_name(typed, id.id) + "` created in loop may be consumed on one path; per-iteration cleanup cannot be conditional",
+            span: ls.span
+          })
         end
         to_forget.push(id)
       end
@@ -3786,15 +3827,17 @@ def check_loop_created(entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, 
 end
 
 def is_loop_created(entry: &ResFrame, entry_names: &Vec[Int], id: &tg_compiler::ids::LocalId) -> Bool
-  # entry_names is the raw-Int loop-context domain; the frame lookup takes
-  # the LocalId directly.
-  if !entry_names.contains(&id.id) then
-    return true
-  end
-  match res_frame_get(entry, id)
-  when Option::Some(ResourceState::Uninitialized) then true
-  when _ then false
-  end
+  # entry_names is the raw-Int loop-context domain; the LocalId is the
+  # frame-key domain. A local present in the loop's ENTRY frame is
+  # LOOP-PERSISTENT — it predates the loop and survives every iteration —
+  # regardless of its entry availability state. (A set parameter may be
+  # Uninitialized at entry and initialized inside the loop body: it is
+  # still caller-owned memory that the backedge must never finalize, so it
+  # is NOT loop-created. The pre-FIX clause treated entry-Uninitialized
+  # locals as loop-created, which put a caller-owned set parameter into the
+  # "backedge::<loop id>" drop plan — the callee finalizing the caller's
+  # buffer.)
+  !entry_names.contains(&id.id)
 end
 
 def check_pattern(program: &Program, typed: &TypedProgram, pat: &Pattern, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut Map[String, Vec[Int]], edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
@@ -4049,14 +4092,20 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
           # ids); the frame is LocalId-keyed.
           let cap_lid = tg_compiler::ids::LocalId { id: cap_id }
           if is_owning_typed(typed, &lb.ty) then
-            # The typed capture EFFECT drives the semantics:
-            #  - Consume: ownership MOVES into the closure — the outer local
-            #    is consumed exactly once, and the closure frame owns it.
-            #  - Read/Modify: the closure environment is a by-value struct;
-            #    capturing a resource by reference would duplicate ownership
-            #    (or manufacture a second owner). Until by-reference capture
-            #    storage exists, resource captures must be Consume — anything
-            #    else is rejected rather than silently duplicated.
+            # The typed capture EFFECT distinguishes how the closure body
+            # USES the capture, but the closure environment is a BY-VALUE
+            # struct: every capture of an owning local is a transfer of the
+            # value into the closure. The type checker's capture scan
+            # records Read for a bare name-read (`let c = || p`) and Modify
+            # for an assignment target (`do |_| p.x = ... end`); the MIR
+            # lowers Consume captures as MirConsume (move) and Read/Modify
+            # as MirCopy (copy of the value into the env) — either way the
+            # ENV is the sole owner afterwards, so the OUTER local is
+            # consumed exactly once and the closure frame owns the value.
+            # Rejecting Read/Modify captures (the pre-FIX behavior) wrongly
+            # rejected valid by-value captures (`canary_pos_closure_
+            # capture_owner`); the duplication concern does not arise
+            # because the outer local's state is consumed at the capture.
             match cap_effect
             when AccessEffect::Consume then
               if res_frame_has(frame, &cap_lid) then
@@ -4066,15 +4115,19 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
               res_frame_set_span(&mut cframe, &cap_lid, expr.span)
               res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when AccessEffect::Read then
-              errors.push(ResourceError {
-                message: "resource `" + binding_name(typed, cap_id) + "` captured by read would duplicate ownership; capture by consume (sink)",
-                span: expr.span
-              })
+              if res_frame_has(frame, &cap_lid) then
+                apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+              end
+              res_frame_set(&mut cframe, cap_lid, ResourceState::Live)
+              res_frame_set_span(&mut cframe, &cap_lid, expr.span)
+              res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when AccessEffect::Modify then
-              errors.push(ResourceError {
-                message: "resource `" + binding_name(typed, cap_id) + "` captured by modify would duplicate ownership; capture by consume (sink)",
-                span: expr.span
-              })
+              if res_frame_has(frame, &cap_lid) then
+                apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+              end
+              res_frame_set(&mut cframe, cap_lid, ResourceState::Live)
+              res_frame_set_span(&mut cframe, &cap_lid, expr.span)
+              res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when _ then ()
             end
           end
@@ -4142,11 +4195,16 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, loop_outer:
       # is LocalId-keyed (the "assign::<expr id>" plan below keeps the Int).
       let lid = tg_compiler::ids::LocalId { id: id }
       if res_frame_has(frame, &lid) then
+        # Assignment-EXPRESSION replacement shares the StmtAssign
+        # drop-before-store rule, including the Set-param case: a Live set
+        # parameter's current value was written by the callee and must be
+        # dropped on replacement (the first assignment stores into the
+        # caller's buffer; only the Live branch drops).
         match res_frame_get(frame, &lid)
         when Option::Some(ResourceState::Live) then
           match res_frame_get_origin(frame, &lid)
           when Option::Some(origin) then
-            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal then
+            if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
               if expr_is_plain(&target) then
                 var assign_ids = Vec::new()
                 assign_ids.push(id)
@@ -4301,6 +4359,20 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, arg: &Expr, effect
   end
 end
 
+# P1 boundary: the id is the raw Int semantic id; the frame is LocalId-keyed.
+# The ownership diagnostics distinguish capabilities from resources ("capability
+# `c` consumed twice" vs "resource `r` consumed twice") — the capability
+# dimension is part of the single per-local record, so the label reads it
+# directly. Absent records default to "resource" (an unregistered local cannot
+# be a capability: every capability is registered at its binding point).
+def ownership_label(frame: &ResFrame, id: Int) -> String
+  match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
+  when Option::Some(ls) then
+    if ls.is_capability then "capability" else "resource" end
+  when Option::None then "resource"
+  end
+end
+
 def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
   # P1 boundary: the id is the raw Int semantic id (loop_outer and
   # binding_name are Int-keyed); the frame is LocalId-keyed.
@@ -4320,14 +4392,14 @@ def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[In
     end
     if origin == ParamOrigin::Let then
       errors.push(ResourceError {
-        message: "cannot consume resource `" + binding_name(typed, id) + "`: let parameter is read-only",
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: let parameter is read-only",
         span: span
       })
       return
     end
     if origin == ParamOrigin::Inout then
       errors.push(ResourceError {
-        message: "cannot consume resource `" + binding_name(typed, id) + "`: inout parameter may be modified but not consumed",
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: inout parameter may be modified but not consumed",
         span: span
       })
       return
@@ -4336,24 +4408,24 @@ def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[In
   end
   if loop_outer.contains(&id) then
     errors.push(ResourceError {
-      message: "resource `" + binding_name(typed, id) + "` cannot be consumed inside a repeatable loop",
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` cannot be consumed inside a repeatable loop",
       span: span
     })
   end
   match res_frame_get(frame, &lid)
   when Option::Some(ResourceState::Consumed) then
     errors.push(ResourceError {
-      message: "resource `" + binding_name(typed, id) + "` consumed twice",
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` consumed twice",
       span: span
     })
   when Option::Some(ResourceState::Uninitialized) then
     errors.push(ResourceError {
-      message: "use of uninitialized resource `" + binding_name(typed, id) + "`",
+      message: "use of uninitialized " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`",
       span: span
     })
   when Option::Some(ResourceState::MaybeLive) then
     errors.push(ResourceError {
-      message: "resource `" + binding_name(typed, id) + "` may be consumed on one path",
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
       span: span
     })
   when _ then ()
@@ -4371,17 +4443,17 @@ def check_use(typed: &TypedProgram, id: Int, span: Span, frame: &ResFrame, error
   match res_frame_get(frame, &tg_compiler::ids::LocalId { id: id })
   when Option::Some(ResourceState::Consumed) then
     errors.push(ResourceError {
-      message: "use of consumed resource `" + binding_name(typed, id) + "`",
+      message: "use of consumed " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`",
       span: span
     })
   when Option::Some(ResourceState::Uninitialized) then
     errors.push(ResourceError {
-      message: "use of uninitialized resource `" + binding_name(typed, id) + "`",
+      message: "use of uninitialized " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`",
       span: span
     })
   when Option::Some(ResourceState::MaybeLive) then
     errors.push(ResourceError {
-      message: "resource `" + binding_name(typed, id) + "` may be consumed on one path",
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
       span: span
     })
   when _ then ()
@@ -4408,10 +4480,23 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[tg_compiler::ids::LocalId
             message: "capability `" + binding_name(typed, id.id) + "` silently discarded",
             span: ls.span
           })
+        else
+          # A non-capability OWNING local that is Live on one path and
+          # Consumed on another must be finalized only on the live path;
+          # the scope's cleanup obligations ("block::<key>" / fn-end plan /
+          # exit-edge plans) lower to UNCONDITIONAL deinits, so neither
+          # dropping it nor skipping it is sound. Previously the local was
+          # silently forgotten here and never recorded in any plan — the
+          # live path leaked the value. Reject the mixed state at the scope
+          # boundary instead.
+          errors.push(ResourceError {
+            message: "resource `" + binding_name(typed, id.id) + "` may be consumed on one path; scope-exit cleanup cannot be conditional",
+            span: ls.span
+          })
         end
       when ResourceState::Uninitialized then
         errors.push(ResourceError {
-          message: "resource `" + binding_name(typed, id.id) + "` left uninitialized",
+          message: ownership_label(frame, id.id) + " `" + binding_name(typed, id.id) + "` left uninitialized",
           span: ls.span
         })
       when _ then ()
@@ -4432,7 +4517,7 @@ def check_uninitialized_exit(frame: &ResFrame, typed: &TypedProgram, errors: &mu
     match ls.availability
     when ResourceState::Uninitialized then
       errors.push(ResourceError {
-        message: "resource `" + binding_name(typed, id.id) + "` left uninitialized",
+        message: ownership_label(frame, id.id) + " `" + binding_name(typed, id.id) + "` left uninitialized",
         span: ls.span
       })
     when _ then ()
