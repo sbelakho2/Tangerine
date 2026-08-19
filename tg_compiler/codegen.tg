@@ -21,7 +21,7 @@ use tg_compiler::layout_engine::{
   tuple_layout,
   discriminant_offset, discriminant_size, payload_offset,
   enum_variant_field_offsets, enum_variant_field_sizes,
-  layout_of_concrete,
+  layout_of_concrete, closure_object_record,
   Repr, type_repr, repr_header_size, container_field_offset,
   slice_view_field_offset,
   lookup_type_name, is_slice_view_tid,
@@ -391,6 +391,26 @@ def build_all_layouts(engine: &mut LayoutEngine, types: &Vec[MirTypeDef], concre
           panic("ICE: concrete instance '" + ckey + "' has no registered MIR type definition")
         end
       end
+    when Type::Closure(_, _, _, _) then
+      # P1 (the closure {code, env} ABI): the closure OBJECT's layout —
+      # { code: fn ptr @ 0, env: capture-tuple } — registered by the
+      # ClosureId-keyed concrete identity (closure_object_record computes
+      # and caches the engine record; the field tables below are what the
+      # aggregate emission (codegen_aggregate's general path) and the
+      # closure-call dispatch (codegen_indirect_callee) resolve).
+      let ckey = mir_type_identity_key(&inst)
+      let cl_rec = closure_object_record(engine, &inst)
+      layout.insert(ckey.clone(), cl_rec.size)
+      var field_offsets = Vec::new()
+      var field_sizes = Vec::new()
+      var fi = 0
+      while fi < cl_rec.fields.len() do
+        field_offsets.push(cl_rec.fields[fi].offset)
+        field_sizes.push(cl_rec.fields[fi].size)
+        fi = fi + 1
+      end
+      offsets_map.insert(ckey.clone(), field_offsets)
+      sizes_map.insert(ckey.clone(), field_sizes)
     when _ then ()
     end
   end
@@ -398,9 +418,23 @@ def build_all_layouts(engine: &mut LayoutEngine, types: &Vec[MirTypeDef], concre
   (layout, offsets_map, sizes_map, payload_map)
 end
 
+# The number of captured locals a closure type carries (the capture TUPLE's
+# element count) — the closure-call dispatch's leading-argument shift.
+def capture_tuple_len(captures: &Type) -> Int
+  match captures
+  when Type::Tuple(t) then t.len()
+  when _ then 0
+  end
+end
+
 # Collect every concrete Type::Adt instance reachable in a MIR type
 # (post-mono: function param/local/return types and static types are fully
 # substituted) — the population source for the concrete-keyed layout tables.
+# P1 (the closure {code, env} ABI): every Type::Closure instance is
+# collected TOO — the closure OBJECT's layout ({ code @ 0, env:
+# capture-tuple }) is registered by the ClosureId-keyed concrete identity in
+# build_all_layouts, so the aggregate emission and the closure-call dispatch
+# resolve the object's field offsets from the registered tables.
 def collect_concrete_adt_types(ty: &Type, out: &mut Vec[Type]) -> Unit
   match ty
   when Type::Adt(tid, args) then
@@ -414,17 +448,13 @@ def collect_concrete_adt_types(ty: &Type, out: &mut Vec[Type]) -> Unit
     end
   when Type::FixedArray(elem, _) then
     collect_concrete_adt_types(elem, out)
-  when Type::Function(params, ret) then
-    for p in params do
-      collect_concrete_adt_types(&p.ty, out)
-    end
-    collect_concrete_adt_types(ret, out)
   when Type::FnPtr(params, ret) then
     for p in params do
       collect_concrete_adt_types(&p.ty, out)
     end
     collect_concrete_adt_types(ret, out)
   when Type::Closure(_, params, ret, captures) then
+    out.push(ty.clone())
     for p in params do
       collect_concrete_adt_types(&p.ty, out)
     end
@@ -2604,6 +2634,12 @@ def is_string_like_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::String then
     true
+  # P0-STRING (the typed literal/view split): the MIR-internal static
+  # StrView of a string literal IS a string (the raw view of the interned
+  # bytes) — string binops/concats and the intrinsic classification treat
+  # it as string-typed.
+  when Type::StrView then
+    true
   when Type::Adt(tid, args) then
     # P0-J2: Adt form of Slice mirrors the deleted canonical Slice arm
     # (char/i8/u8 element via the Adt args).
@@ -2653,12 +2689,12 @@ end
 # str.chars()).
 #
 # The table matches the runtime exactly: Vec {data:0,len:8,cap:16,stride:24}
-# (32); Map and Set (map-backed) share the runtime's actual 88-byte layout
+# (32); Map and Set (map-backed) share the runtime's actual 96-byte layout
 # header {buckets:0, size:8, capacity:16, key_stride:24, key_align:32,
 # value_stride:40, value_align:48, key_off:56, value_off:64, next_off:72,
-# bucket_stride:80} (runtime.tg "Map header (88 bytes)"). Codegen reads the
-# len (and Vec cap) fields at 8/16 and the Vec stride at 24, agreeing with
-# both the table and the runtime.
+# bucket_stride:80, free_list:88} (runtime.tg "Map header (96 bytes)").
+# Codegen reads the len (and Vec cap) fields at 8/16 and the Vec stride at
+# 24, agreeing with both the table and the runtime.
 def heap_header_field_offset(repr: Repr, field_name: &String) -> Int
   let container_name = match repr
   when Repr::HeapVecHeader then "Vec"
@@ -3043,8 +3079,9 @@ def enum_variant_index_of_name(ctx: &CodegenCtx, type_id: Int, variant_name: &St
 end
 
 # The DECLARATION index of a variant by its discriminant — the DeinitPlan
-# Enum arm is discriminant-keyed (variant discriminant -> (name, plans)) and
-# needs the semantic VariantId index for the downcast it synthesizes.
+# Enum arm is discriminant-keyed (variant discriminant -> (VariantId,
+# plans)) and the VariantId is carried directly; this index resolution
+# serves the remaining discriminant-side consumers.
 # P0-CK: takes the CONCRETE enum type (the declaration order is a def
 # property, so the def is looked up through the type's TypeId).
 def enum_variant_index_of_discriminant(ctx: &CodegenCtx, ty: &Type, discriminant: Int) -> Int
@@ -5446,8 +5483,8 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, term: &Mir
   when MirTerminatorKind::MirUnreachable then
     emit_trap(ctx)
 
-  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
-    codegen_call(ctx, fctx, dest, callee, args, success, unwind)
+  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic) then
+    codegen_call(ctx, fctx, dest, callee, args, success, unwind, intrinsic)
 
   when MirTerminatorKind::MirDeinit(place, deinit_instance, target, unwind) then
     codegen_finalizer_call(ctx, fctx, &place, &deinit_instance)
@@ -5590,6 +5627,16 @@ end
 # FAIL-CLOSED: an unresolved type (Var/Param/Error) reaching the classifier
 # panics here — never a silently assumed word.
 def classify_argument(ctx: &mut CodegenCtx, ty: &Type, index: Int) -> AbiArg
+  # P0-STRING (the typed literal/view split): the MIR-internal static
+  # StrView of a string literal is an 8-byte raw pointer (the interned
+  # label) — the same ABI slot a str value crosses. It must NOT reach the
+  # layout engine (which fails closed on the MIR-internal view type): the
+  # view is a scalar pointer, exactly like the StringPtr representation.
+  match ty
+  when Type::StrView then
+    return AbiArg::Scalar(index, ctx.target.pointer_size)
+  when _ then ()
+  end
   match classify_value_category(&mut ctx.layout_engine, ty)
   when Result::Err(e) then
     panic("ICE: ABI argument classification failed closed for type '" + e.type_name + "' at index " + index.to_string() + ": " + layout_error_to_string(&e))
@@ -5683,7 +5730,7 @@ def resolve_callee_label(ctx: &CodegenCtx, name: &String) -> String
   end
 end
 
-def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: MirBlockId, unwind: &Option[MirBlockId]) -> Unit
+def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: MirBlockId, unwind: &Option[MirBlockId], intrinsic: Option[IntrinsicId]) -> Unit
   let arch   = ctx.target.arch
   let rr     = ret_reg(arch)
   let scratch = scratch2_reg(arch)
@@ -5745,6 +5792,11 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
     end
   end
   var did_sret = false
+  # The intrinsic arms that materialize the FULL result image into the
+  # destination place themselves (the ArrayGet/ArrayRemove ScalarPair/
+  # ByAddress paths) report it through codegen_intrinsic's Bool result;
+  # the post-call register store is then suppressed.
+  var intrinsic_did_materialize = false
 
   # Place arguments in reverse order. Loading a projected operand may use x0/rax
   # as scratch, so left-to-right loading can clobber an already prepared arg0.
@@ -5758,15 +5810,96 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   # below IS the register-count rule). Behavior is byte-identical to the
   # former Register/Stack/Indirect split.
   let total_args = args.len()
+  # P1 (the closure {code, env} ABI): a CLOSURE-VALUE callee (an indirect
+  # operand whose type is Type::Closure) dispatches through the closure
+  # OBJECT — the value is a pointer to the registered { code @ 0,
+  # env: capture-tuple } image. The generated closure function takes the
+  # CAPTURE VALUES as its leading parameters, so the explicit call args
+  # shift right by the capture count (every slot index below is offset by
+  # closure_shift when the callee is a closure value).
+  var closure_shift = 0
+  var closure_cap_tys: Vec[Type] = Vec::new()
+  var closure_callee_ty: Option[Type] = Option::None
+  match callee.kind
+  when MirOperandKind::MirCopy(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirMovePlace(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirRead(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirConsume(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when _ then ()
+  end
+  # P1 (the closure {code, env} ABI): for a CLOSURE-VALUE callee, the
+  # [ptr, code] pair is preserved on the stack BEFORE the explicit arg
+  # loop so the whole pushed area (pair, explicit stack args, capture
+  # stack args) stays in ascending slot order from the callee's frame.
+  var closure_ptr_depth = 1
+  match closure_callee_ty
+  when Option::Some(_) then
+    let cl_slot_size0 = match arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    end
+    match callee.kind
+    when MirOperandKind::MirCopy(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirMovePlace(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirRead(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirConsume(place) then load_place(ctx, fctx, &place, rr)
+    when _ then ()
+    end
+    emit_push(ctx, rr)
+    emit_load_mem(ctx, rr, rr, 0)
+    emit_push(ctx, rr)
+  when Option::None then ()
+  end
   var arg_idx = total_args
   while arg_idx > 0 do
     arg_idx = arg_idx - 1
     let arg = args[arg_idx]
     let arg_ty = mir_call_arg_type(ctx, fctx, &arg)
-    match classify_argument(ctx, &arg_ty, arg_idx)
+    let slot_idx = arg_idx + closure_shift
+    match classify_argument(ctx, &arg_ty, slot_idx)
     when AbiArg::Scalar(_, _) then
       # One <width>-byte value in the slot.
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -5776,7 +5909,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
     when AbiArg::ScalarPair(_, _) then
       # A 16-byte aggregate (a two-slot value) — crossed by reference: the
       # ADDRESS travels in the single slot.
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -5785,7 +5918,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       end
     when AbiArg::ByAddress(_, _) then
       # A >16-byte aggregate — the slot carries the ADDRESS (by reference).
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -5793,6 +5926,15 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
         emit_push(ctx, scratch)
       end
     end
+  end
+
+  # The closure dispatch's [ptr, code] pair was preserved BEFORE the
+  # explicit arg loop; the explicit STACK args were pushed on top of the
+  # pair, so the closure pointer now sits at depth 1 + the pushed explicit
+  # stack args. The cleanup below and the dispatch share this count.
+  let eff_total_args = total_args + closure_shift
+  if eff_total_args > max_ra then
+    closure_ptr_depth = 1 + (eff_total_args - max_ra)
   end
 
   # Call the function
@@ -5831,7 +5973,16 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       else
         false
       end
-      let intr_opt = intrinsic_id_of_call(&intr_name, &recv_ty0, &recv_named0, &needle_ty0, &needle_named0, &resolved_fn_name, recv_is_string0, needle_is_string0)
+      # P1 (IntrinsicId through MirCall): the STAMPED id — the lowering
+      # read the checker's typed_intrinsics at the SOURCE call sites and
+      # stamped the MirCall — is the authority. The semantic router
+      # (intrinsic_id_of_call over the typed operand facts) is the
+      # fallback ONLY for the compiler-SYNTHESIZED calls, which construct
+      # their own names and carry Option::None here.
+      let intr_opt = match intrinsic
+      when Option::Some(stamped_id) then Option::Some(stamped_id)
+      when Option::None then intrinsic_id_of_call(&intr_name, &recv_ty0, &recv_named0, &needle_ty0, &needle_named0, &resolved_fn_name, recv_is_string0, needle_is_string0)
+      end
       let has_real_body =
         ctx.extern_fns.contains(&resolved_fn_name) ||
         ctx.reachable_fns.contains(&resolved_fn_name)
@@ -5868,17 +6019,22 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
           # store.
           if iid == IntrinsicId::MapDrainOne || iid == IntrinsicId::SetDrainOne then
             # Drain runtime contract: the helper writes its result IMAGE at
-            # &dest in x8 (a runtime-ABI property, independent of the result
-            # type's value category — see drain_dest_ok above).
+            # &dest (AArch64: x8; x86-64: r8 — the drain sret register) — a
+            # runtime-ABI property, independent of the result type's value
+            # category (see drain_dest_ok above).
+            let drain_sret = match arch
+            when Arch::AArch64 then PhysReg::A64Reg(A64::X8)
+            when Arch::X86_64  then PhysReg::X64Reg(X64::R8)
+            end
             if sret_dest_ok then
-              emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
+              emit_lea_fp(ctx, drain_sret, sret_dest_off)
               did_sret = true
             else if drain_dest_ok then
-              emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), drain_dest_off)
+              emit_lea_fp(ctx, drain_sret, drain_dest_off)
               did_sret = true
             end
           end
-          codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty)
+          intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           # The drain helpers wrote the enum IMAGE at &dest; re-encode it as
           # the TaggedPtr VALUE word (codegen_drain_result_materialize) so
           # every consumer — MirDiscriminant, is_some, the Variant payload
@@ -5890,7 +6046,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
           end
         when Option::None then
           if fallback_clone_intrinsic then
-            codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty)
+            intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
             emit_call_extern(ctx, resolved_fn_name)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
@@ -5940,6 +6096,99 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       let label = resolve_static_label(ctx, did)
       emit_lea_label(ctx, dst, label.clone())
     end
+  when MirOperandKind::MirCopy(place) then
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
+  when MirOperandKind::MirMovePlace(place) then
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
+  when MirOperandKind::MirRead(place) then
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
+  when MirOperandKind::MirConsume(place) then
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
+  end
+
+  # Clean up stack args — the closure dispatch pushed the shifted stack
+  # args (total_args + closure_shift slots), so the pop count matches.
+  if eff_total_args > max_ra then
+    let stack_arg_slot = match arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    end
+    emit_add_ri(ctx, sp, ((eff_total_args - max_ra) * stack_arg_slot) as i32)
+  end
+
+  # Store return value — the post-call store. The intrinsic arms that
+  # materialized the FULL result image into dest themselves reported it
+  # (intrinsic_did_materialize) and skip this register store.
+  if !did_sret && !intrinsic_did_materialize then
+    store_place(ctx, fctx, dest, rr)
+  end
+end
+
+# P1 (the closure {code, env} ABI): the INDIRECT-callee dispatch for a
+# callee operand that is a place-like value. A CLOSURE-VALUE callee (the
+# operand's type is Type::Closure — the closure object, registered by its
+# ClosureId) dispatches through the closure OBJECT: the value is a pointer
+# to the registered { code @ 0, env: capture-tuple } image (the object's
+# field offsets live in ctx.type_field_offsets under the closure type's
+# concrete identity key). The code pointer is loaded from [ptr + 0]; the
+# capture VALUES are loaded from the env fields into the LEADING argument
+# slots (the generated closure function takes the capture values as its
+# leading params — the explicit call args were loaded at the shifted slots
+# by codegen_call's arg loop), and the code pointer is called. The [ptr,
+# code] pair is preserved on the stack while the capture loads clobber
+# registers. Every other place-like callee (a plain fn pointer) is loaded
+# and called directly.
+def codegen_indirect_callee(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, place: &Place, callee: &MirOperand, closure_shift: Int, closure_cap_tys: &Vec[Type], closure_callee_ty: &Option[Type]) -> Unit
+  let arch = ctx.target.arch
+  let rr = ret_reg(arch)
+  let scratch = scratch2_reg(arch)
+  let sp = sp_reg(arch)
+  match closure_callee_ty
+  when Option::Some(cl_ty) then
+    let cl_key = mir_type_identity_key(cl_ty)
+    let cl_offsets = match ctx.type_field_offsets.get(cl_key.clone())
+    when Option::Some(offs) then offs.clone()
+    when Option::None then panic("codegen_call: no closure-object layout recorded for " + cl_key)
+    end
+    let cl_slot_size = match arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    end
+    # The [ptr, code] pair was preserved by codegen_call BEFORE the
+    # explicit arg loop (the pair sits BELOW the pushed arg area); the
+    # closure pointer is reloaded per capture at the CURRENT depth ([sp +
+    # slot * ptr_depth] — each pushed capture shifts sp). The STACK
+    # captures (slots >= max_ra) push in DESCENDING slot order so the
+    # whole stack arg area (pair, explicit args, captures) is laid out in
+    # ascending slot order from the callee's frame — the same discipline
+    # the explicit loop follows.
+    var cap_i = closure_cap_tys.len()
+    var ptr_depth = closure_ptr_depth
+    while cap_i > 0 do
+      cap_i = cap_i - 1
+      let cap_off = if cap_i + 1 < cl_offsets.len() then cl_offsets[cap_i + 1] else 0 end
+      emit_load_mem(ctx, scratch, sp, (cl_slot_size * ptr_depth) as i32)
+      match classify_argument(ctx, &closure_cap_tys[cap_i], cap_i)
+      when AbiArg::Scalar(_, _) then
+        match arg_reg(arch, cap_i)
+        when Option::Some(reg) then emit_load_mem(ctx, reg, scratch, cap_off as i32)
+        when Option::None then emit_load_mem(ctx, scratch, scratch, cap_off as i32); emit_push(ctx, scratch); ptr_depth = ptr_depth + 1
+        end
+      when _ then
+        # ScalarPair/ByAddress captures cross by reference: the field ADDRESS.
+        emit_add_ri(ctx, scratch, cap_off as i32)
+        match arg_reg(arch, cap_i)
+        when Option::Some(reg) then emit_mov_rr(ctx, reg, scratch)
+        when Option::None then emit_push(ctx, scratch); ptr_depth = ptr_depth + 1
+        end
+      end
+    end
+    emit_pop(ctx, rr)
+    emit_pop(ctx, scratch)
+    emit_call_r(ctx, rr)
+  when Option::None then
+    load_place(ctx, fctx, place, rr)
+    emit_call_r(ctx, rr)
   end
 end
 
@@ -6523,6 +6772,12 @@ def is_string_like_type(ctx: &CodegenCtx, ty: &Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::String then
     true
+  # P0-STRING (the typed literal/view split): the MIR-internal static
+  # StrView of a string literal IS a string (the raw view of the interned
+  # bytes) — string binops/concats and the intrinsic classification treat
+  # it as string-typed.
+  when Type::StrView then
+    true
   when Type::Adt(tid, args) then
     # P0-J2: Adt form of Slice mirrors the deleted canonical Slice arm
     # (char/i8/u8 element via the Adt args).
@@ -6572,12 +6827,12 @@ end
 # str.chars()).
 #
 # The table matches the runtime exactly: Vec {data:0,len:8,cap:16,stride:24}
-# (32); Map and Set (map-backed) share the runtime's actual 88-byte layout
+# (32); Map and Set (map-backed) share the runtime's actual 96-byte layout
 # header {buckets:0, size:8, capacity:16, key_stride:24, key_align:32,
 # value_stride:40, value_align:48, key_off:56, value_off:64, next_off:72,
-# bucket_stride:80} (runtime.tg "Map header (88 bytes)"). Codegen reads the
-# len (and Vec cap) fields at 8/16 and the Vec stride at 24, agreeing with
-# both the table and the runtime.
+# bucket_stride:80, free_list:88} (runtime.tg "Map header (96 bytes)").
+# Codegen reads the len (and Vec cap) fields at 8/16 and the Vec stride at
+# 24, agreeing with both the table and the runtime.
 def heap_header_field_offset(repr: Repr, field_name: &String) -> Int
   let container_name = match repr
   when Repr::HeapVecHeader then "Vec"
@@ -6962,8 +7217,9 @@ def enum_variant_index_of_name(ctx: &CodegenCtx, type_id: Int, variant_name: &St
 end
 
 # The DECLARATION index of a variant by its discriminant — the DeinitPlan
-# Enum arm is discriminant-keyed (variant discriminant -> (name, plans)) and
-# needs the semantic VariantId index for the downcast it synthesizes.
+# Enum arm is discriminant-keyed (variant discriminant -> (VariantId,
+# plans)) and the VariantId is carried directly; this index resolution
+# serves the remaining discriminant-side consumers.
 # P0-CK: takes the CONCRETE enum type (the declaration order is a def
 # property, so the def is looked up through the type's TypeId).
 def enum_variant_index_of_discriminant(ctx: &CodegenCtx, ty: &Type, discriminant: Int) -> Int
@@ -9365,8 +9621,8 @@ def codegen_terminator(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, term: &Mir
   when MirTerminatorKind::MirUnreachable then
     emit_trap(ctx)
 
-  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind) then
-    codegen_call(ctx, fctx, dest, callee, args, success, unwind)
+  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic) then
+    codegen_call(ctx, fctx, dest, callee, args, success, unwind, intrinsic)
 
   when MirTerminatorKind::MirDeinit(place, deinit_instance, target, unwind) then
     codegen_finalizer_call(ctx, fctx, &place, &deinit_instance)
@@ -9509,6 +9765,16 @@ end
 # FAIL-CLOSED: an unresolved type (Var/Param/Error) reaching the classifier
 # panics here — never a silently assumed word.
 def classify_argument(ctx: &mut CodegenCtx, ty: &Type, index: Int) -> AbiArg
+  # P0-STRING (the typed literal/view split): the MIR-internal static
+  # StrView of a string literal is an 8-byte raw pointer (the interned
+  # label) — the same ABI slot a str value crosses. It must NOT reach the
+  # layout engine (which fails closed on the MIR-internal view type): the
+  # view is a scalar pointer, exactly like the StringPtr representation.
+  match ty
+  when Type::StrView then
+    return AbiArg::Scalar(index, ctx.target.pointer_size)
+  when _ then ()
+  end
   match classify_value_category(&mut ctx.layout_engine, ty)
   when Result::Err(e) then
     panic("ICE: ABI argument classification failed closed for type '" + e.type_name + "' at index " + index.to_string() + ": " + layout_error_to_string(&e))
@@ -9602,7 +9868,7 @@ def resolve_callee_label(ctx: &CodegenCtx, name: &String) -> String
   end
 end
 
-def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: MirBlockId, unwind: &Option[MirBlockId]) -> Unit
+def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], success: MirBlockId, unwind: &Option[MirBlockId], intrinsic: Option[IntrinsicId]) -> Unit
   let arch   = ctx.target.arch
   let rr     = ret_reg(arch)
   let scratch = scratch2_reg(arch)
@@ -9664,6 +9930,11 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
     end
   end
   var did_sret = false
+  # The intrinsic arms that materialize the FULL result image into the
+  # destination place themselves (the ArrayGet/ArrayRemove ScalarPair/
+  # ByAddress paths) report it through codegen_intrinsic's Bool result;
+  # the post-call register store is then suppressed.
+  var intrinsic_did_materialize = false
 
   # Place arguments in reverse order. Loading a projected operand may use x0/rax
   # as scratch, so left-to-right loading can clobber an already prepared arg0.
@@ -9677,15 +9948,96 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
   # below IS the register-count rule). Behavior is byte-identical to the
   # former Register/Stack/Indirect split.
   let total_args = args.len()
+  # P1 (the closure {code, env} ABI): a CLOSURE-VALUE callee (an indirect
+  # operand whose type is Type::Closure) dispatches through the closure
+  # OBJECT — the value is a pointer to the registered { code @ 0,
+  # env: capture-tuple } image. The generated closure function takes the
+  # CAPTURE VALUES as its leading parameters, so the explicit call args
+  # shift right by the capture count (every slot index below is offset by
+  # closure_shift when the callee is a closure value).
+  var closure_shift = 0
+  var closure_cap_tys: Vec[Type] = Vec::new()
+  var closure_callee_ty: Option[Type] = Option::None
+  match callee.kind
+  when MirOperandKind::MirCopy(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirMovePlace(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirRead(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when MirOperandKind::MirConsume(place) then
+    match operand_type(ctx, fctx, callee)
+    when Type::Closure(_, _, _, captures) then
+      closure_shift = capture_tuple_len(&captures)
+      match captures
+      when Type::Tuple(t) then closure_cap_tys = t.clone()
+      when _ then ()
+      end
+      closure_callee_ty = Option::Some(operand_type(ctx, fctx, callee))
+    when _ then ()
+    end
+  when _ then ()
+  end
+  # P1 (the closure {code, env} ABI): for a CLOSURE-VALUE callee, the
+  # [ptr, code] pair is preserved on the stack BEFORE the explicit arg
+  # loop so the whole pushed area (pair, explicit stack args, capture
+  # stack args) stays in ascending slot order from the callee's frame.
+  var closure_ptr_depth = 1
+  match closure_callee_ty
+  when Option::Some(_) then
+    let cl_slot_size0 = match arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    end
+    match callee.kind
+    when MirOperandKind::MirCopy(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirMovePlace(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirRead(place) then load_place(ctx, fctx, &place, rr)
+    when MirOperandKind::MirConsume(place) then load_place(ctx, fctx, &place, rr)
+    when _ then ()
+    end
+    emit_push(ctx, rr)
+    emit_load_mem(ctx, rr, rr, 0)
+    emit_push(ctx, rr)
+  when Option::None then ()
+  end
   var arg_idx = total_args
   while arg_idx > 0 do
     arg_idx = arg_idx - 1
     let arg = args[arg_idx]
     let arg_ty = mir_call_arg_type(ctx, fctx, &arg)
-    match classify_argument(ctx, &arg_ty, arg_idx)
+    let slot_idx = arg_idx + closure_shift
+    match classify_argument(ctx, &arg_ty, slot_idx)
     when AbiArg::Scalar(_, _) then
       # One <width>-byte value in the slot.
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -9695,7 +10047,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
     when AbiArg::ScalarPair(_, _) then
       # A 16-byte aggregate (a two-slot value) — crossed by reference: the
       # ADDRESS travels in the single slot.
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -9704,7 +10056,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       end
     when AbiArg::ByAddress(_, _) then
       # A >16-byte aggregate — the slot carries the ADDRESS (by reference).
-      match arg_reg(arch, arg_idx)
+      match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
       when Option::None then
@@ -9712,6 +10064,15 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
         emit_push(ctx, scratch)
       end
     end
+  end
+
+  # The closure dispatch's [ptr, code] pair was preserved BEFORE the
+  # explicit arg loop; the explicit STACK args were pushed on top of the
+  # pair, so the closure pointer now sits at depth 1 + the pushed explicit
+  # stack args. The cleanup below and the dispatch share this count.
+  let eff_total_args = total_args + closure_shift
+  if eff_total_args > max_ra then
+    closure_ptr_depth = 1 + (eff_total_args - max_ra)
   end
 
   # Call the function
@@ -9750,7 +10111,16 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       else
         false
       end
-      let intr_opt = intrinsic_id_of_call(&intr_name, &recv_ty0, &recv_named0, &needle_ty0, &needle_named0, &resolved_fn_name, recv_is_string0, needle_is_string0)
+      # P1 (IntrinsicId through MirCall): the STAMPED id — the lowering
+      # read the checker's typed_intrinsics at the SOURCE call sites and
+      # stamped the MirCall — is the authority. The semantic router
+      # (intrinsic_id_of_call over the typed operand facts) is the
+      # fallback ONLY for the compiler-SYNTHESIZED calls, which construct
+      # their own names and carry Option::None here.
+      let intr_opt = match intrinsic
+      when Option::Some(stamped_id) then Option::Some(stamped_id)
+      when Option::None then intrinsic_id_of_call(&intr_name, &recv_ty0, &recv_named0, &needle_ty0, &needle_named0, &resolved_fn_name, recv_is_string0, needle_is_string0)
+      end
       let has_real_body =
         ctx.extern_fns.contains(&resolved_fn_name) ||
         ctx.reachable_fns.contains(&resolved_fn_name)
@@ -9787,17 +10157,22 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
           # store.
           if iid == IntrinsicId::MapDrainOne || iid == IntrinsicId::SetDrainOne then
             # Drain runtime contract: the helper writes its result IMAGE at
-            # &dest in x8 (a runtime-ABI property, independent of the result
-            # type's value category — see drain_dest_ok above).
+            # &dest (AArch64: x8; x86-64: r8 — the drain sret register) — a
+            # runtime-ABI property, independent of the result type's value
+            # category (see drain_dest_ok above).
+            let drain_sret = match arch
+            when Arch::AArch64 then PhysReg::A64Reg(A64::X8)
+            when Arch::X86_64  then PhysReg::X64Reg(X64::R8)
+            end
             if sret_dest_ok then
-              emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
+              emit_lea_fp(ctx, drain_sret, sret_dest_off)
               did_sret = true
             else if drain_dest_ok then
-              emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), drain_dest_off)
+              emit_lea_fp(ctx, drain_sret, drain_dest_off)
               did_sret = true
             end
           end
-          codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty)
+          intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           # The drain helpers wrote the enum IMAGE at &dest; re-encode it as
           # the TaggedPtr VALUE word (codegen_drain_result_materialize) so
           # every consumer — MirDiscriminant, is_some, the Variant payload
@@ -9809,7 +10184,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
           end
         when Option::None then
           if fallback_clone_intrinsic then
-            codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty)
+            intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
             emit_call_extern(ctx, resolved_fn_name)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
@@ -9849,7 +10224,7 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       end
     when MirConstantKind::MirZeroSized then
       match cst.ty
-      when Type::Function(_, _) | Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then
+      when Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then
         emit_trap(ctx)
       when _ then
         emit_trap(ctx)
@@ -9858,30 +10233,27 @@ def codegen_call(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, ca
       emit_trap(ctx)
     end
   when MirOperandKind::MirCopy(place) then
-    load_place(ctx, fctx, &place, rr)
-    emit_call_r(ctx, rr)
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
   when MirOperandKind::MirMovePlace(place) then
-    load_place(ctx, fctx, &place, rr)
-    emit_call_r(ctx, rr)
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
   when MirOperandKind::MirRead(place) then
-    load_place(ctx, fctx, &place, rr)
-    emit_call_r(ctx, rr)
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
   when MirOperandKind::MirConsume(place) then
-    load_place(ctx, fctx, &place, rr)
-    emit_call_r(ctx, rr)
+    codegen_indirect_callee(ctx, fctx, &place, callee, closure_shift, &closure_cap_tys, &closure_callee_ty)
   end
 
-  # Clean up stack args
-  if total_args > max_ra then
+  # Clean up stack args — the closure dispatch pushed the shifted stack
+  # args (total_args + closure_shift slots), so the pop count matches.
+  if eff_total_args > max_ra then
     let stack_arg_slot = match arch
     when Arch::AArch64 then 16
     when Arch::X86_64 then 8
     end
-    emit_add_ri(ctx, sp, ((total_args - max_ra) * stack_arg_slot) as i32)
+    emit_add_ri(ctx, sp, ((eff_total_args - max_ra) * stack_arg_slot) as i32)
   end
 
   # Store return value
-  if !did_sret then
+  if !did_sret && !intrinsic_did_materialize then
     store_place(ctx, fctx, dest, rr)
   end
 
@@ -10008,6 +10380,13 @@ def codegen_string_str_arg_normalize(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, 
   if args.len() <= idx then
     return
   end
+  # P0-STRING (the typed literal/view split): an operand whose TYPE is the
+  # MIR-internal static StrView is the raw interned label already — pass
+  # through, never unwrapped as a String object.
+  match operand_type(ctx, fctx, &args[idx])
+  when Type::StrView then return
+  when _ then ()
+  end
   match args[idx].kind
   when MirOperandKind::MirConstant(cst) then
     match cst.kind
@@ -10030,13 +10409,20 @@ end
 # CONSTANT is the static StrView (pass through); any other String-typed
 # value is an owned String object whose data pointer is at [reg+0].
 def codegen_string_operand_to_raw(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, op: &MirOperand, reg: PhysReg) -> Unit
-  match op.kind
-  when MirOperandKind::MirConstant(cst) then
-    match cst.kind
-    when MirConstantKind::MirString(_) then ()
+  # P0-STRING (the typed literal/view split): an operand whose TYPE is the
+  # MIR-internal static StrView is the raw interned label already — pass
+  # through, never unwrapped as a String object.
+  match operand_type(ctx, fctx, op)
+  when Type::StrView then ()
+  when _ then
+    match op.kind
+    when MirOperandKind::MirConstant(cst) then
+      match cst.kind
+      when MirConstantKind::MirString(_) then ()
+      when _ then emit_load_mem(ctx, reg, reg, 0)
+      end
     when _ then emit_load_mem(ctx, reg, reg, 0)
     end
-  when _ then emit_load_mem(ctx, reg, reg, 0)
   end
 end
 
@@ -10057,7 +10443,50 @@ def codegen_string_wrap_result(ctx: &mut CodegenCtx) -> Unit
   end
 end
 
-def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, args: &Vec[MirOperand], call_args: &Vec[MirCallArg], orig_fn_name: String, dest_ty: &Type) -> Unit
+# Normalize the String-op receiver in arg0 to the OWNED String OBJECT for
+# the _tg_string_* object-based helpers (trim/lower/upper/replace/split):
+# a borrowed &String/&mut String receiver derefs once (the slot holds the
+# object handle); a STATIC StrView receiver (the MIR-internal literal
+# view — only when the method-call lowering did not materialize the
+# literal) converts through _tg_string_from_static (raw label -> owned
+# object). Returns true when the conversion ran (it may clobber the
+# caller-saved argument registers — the caller must re-load args 1..n
+# through codegen_string_intrinsic_reload_arg).
+def codegen_string_intrinsic_receiver_object(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Vec[MirOperand]) -> Bool
+  if args.len() == 0 then
+    return false
+  end
+  let arch = ctx.target.arch
+  let rr = ret_reg(arch)
+  let recv_ty = operand_type(ctx, fctx, &args[0])
+  let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
+  match recv_value_ty
+  when Type::StrView then
+    emit_call_label(ctx, "_tg_string_from_static")
+    true
+  when _ then
+    deref_all_ref_like_args(ctx, fctx, args, rr)
+    false
+  end
+end
+
+# Re-load one str/String argument into its ABI register after the
+# receiver conversion clobbered the caller-saved registers: load the
+# operand (constants -> the interned label; places -> the slot value) and
+# normalize a String-typed value to its raw data pointer.
+def codegen_string_intrinsic_reload_arg(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Vec[MirOperand], idx: Int) -> Unit
+  if args.len() <= idx then
+    return
+  end
+  match arg_reg(ctx.target.arch, idx)
+  when Option::Some(reg) then
+    load_operand_aggregate_item(ctx, fctx, &args[idx], reg)
+    codegen_string_str_arg_normalize(ctx, fctx, args, idx)
+  when Option::None then ()
+  end
+end
+
+def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, args: &Vec[MirOperand], call_args: &Vec[MirCallArg], orig_fn_name: String, dest_ty: &Type, dest: &Place) -> Bool
   let arch = ctx.target.arch
   let rr = ret_reg(arch)
   # P1 (IntrinsicId at check time): the classification comes from the ONE
@@ -10120,9 +10549,12 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     # Option[V] return wrap, exactly like MapInsert.
     codegen_map_insert(ctx, fctx, args, call_args, dest_ty)
   when IntrinsicId::ArrayReplace then
-    # Fail closed: array_replace was routed to _tg_str_concat (silent
-    # semantic corruption); reject instead.
-    panic("internal error: intrinsic `" + name + "` not implemented")
+    # Checker-diagnosed (defensive last line): array_replace was routed to
+    # _tg_str_concat in earlier work (silent semantic corruption) and has
+    # no std surface; the checker rejects it with "unsupported: use the
+    # std Array methods instead" before codegen. Reject instead of
+    # emitting a wrong handler.
+    panic("internal error: intrinsic `" + name + "` is unsupported (the checker rejects array_replace — use the std Array methods)")
   when IntrinsicId::ArrayAsStr then
     emit_load_mem(ctx, rr, rr, 0)
   when IntrinsicId::ArrayPush then
@@ -10170,8 +10602,14 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     # unchanged (NO deref: the runtime copies the bytes).
     emit_call_label(ctx, "_tg_string_from_static")
   when IntrinsicId::ArrayPop then
-    emit_load_mem(ctx, rr, rr, 0)
+    # VALUE-ABI (P0-VC): the runtime returns the popped element's IMAGE
+    # ADDRESS or 0 (empty); codegen_option_payload_wrap constructs the
+    # complete Option[T] TaggedPtr word — for a Scalar T the width-matched
+    # payload load turns the value word into the Some payload; for
+    # ScalarPair/ByAddress T the payload is the full-image address.
+    codegen_collection_receiver_deref(ctx, fctx, call_args)
     codegen_array_pop(ctx)
+    codegen_option_payload_wrap(ctx, dest_ty)
   when IntrinsicId::ArrayNew | IntrinsicId::ArrayWithCapacity then
     # The Vec header must carry the element stride from the CONCRETE
     # element type at this operation site (the destination type — a
@@ -10203,21 +10641,60 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
       let slice_elem_ty = project_index_type(ctx, &recv_value_ty)
       codegen_slice_get(ctx, &slice_elem_ty)
     else
-      emit_load_mem(ctx, rr, rr, 0)
-      codegen_array_get(ctx)
+      # The ordinary (non-Slice) ArrayGet path — the VALUE-ABI
+      # materialization. The CHECKED path: index < len is verified here and
+      # out-of-range TRAPS (the defined std OOB policy — panic on OOB)
+      # before the UNCHECKED address primitive _tg_array_get runs. The
+      # returned element ADDRESS is then materialized into the complete T
+      # per its ValueCategory:
+      #   ZeroSized         -> the zero word;
+      #   Scalar(width)     -> the width-matched value word is loaded from
+      #                        the address (the general call machinery
+      #                        stores it);
+      #   ScalarPair/ByAddr -> the FULL image is byte-copied into the
+      #                        destination place and the post-call
+      #                        register store is suppressed (return true).
+      codegen_collection_receiver_deref(ctx, fctx, call_args)
+      codegen_array_get_checked(ctx, &recv_value_ty)
+      match classify_value_category(&mut ctx.layout_engine, dest_ty)
+      when Result::Err(e) then
+        panic("ICE: ArrayGet materialization classification failed closed for type '" + e.type_name + "': " + layout_error_to_string(&e))
+      when Result::Ok(cat) then
+        match cat
+        when ValueCategory::ZeroSized then
+          emit_zero_reg(ctx, rr)
+        when ValueCategory::Scalar(_) then
+          let gw = storage_width_of(ctx, dest_ty)
+          let ge = storage_signedness_of(dest_ty)
+          emit_load_mem_sized(ctx, rr, rr, 0, gw, ge)
+        when ValueCategory::ScalarPair(_, _) then
+          codegen_array_image_to_dest(ctx, fctx, dest, 16)
+          return true
+        when ValueCategory::ByAddress(sz) then
+          codegen_array_image_to_dest(ctx, fctx, dest, sz)
+          return true
+        end
+      end
     end
   when IntrinsicId::ArraySet then
     codegen_array_set(ctx, fctx, args)
   when IntrinsicId::StrSlice then
-    # The String-ABI receiver unwrap (string_slice: the emitter derefs
-    # &self → String object, then maybe_load_string_data_ptr unwraps the
-    # header); the slice RESULT is an owned String object (_tg_string_wrap
-    # adopts the emitter's raw buffer). str_slice (raw receiver) also
-    # returns an owned String.
-    ctx.string_abi_unwrap = is_string_abi
-    codegen_str_slice(ctx)
-    ctx.string_abi_unwrap = false
-    codegen_string_wrap_result(ctx)
+    # P0-STRING (the owned slice): _tg_string_slice computes the substring
+    # and allocates the OWNED String object (header + buffer), copies the
+    # bytes, NUL-terminates, and returns the OBJECT HANDLE — a function
+    # returning String always returns the owned-object handle, never a raw
+    # byte buffer. The receiver is normalized to the raw data pointer: a
+    # String-object receiver (string_slice — the &String derefs to the
+    # object, then [obj+0] unwraps the data pointer); a raw str receiver
+    # (str_slice — the &str slot derefs once to the label). The result
+    # lands in the return register.
+    if is_string_abi then
+      deref_all_receiver_ptr_like_args(ctx, fctx, args, rr)
+      emit_load_mem(ctx, rr, rr, 0)
+    else
+      deref_all_ref_like_args(ctx, fctx, args, rr)
+    end
+    emit_call_label(ctx, "_tg_string_slice")
   when IntrinsicId::Syscall1 then codegen_syscall(ctx, 1)
   when IntrinsicId::Syscall2 then codegen_syscall(ctx, 2)
   when IntrinsicId::Syscall3 then codegen_syscall(ctx, 3)
@@ -10427,8 +10904,31 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     codegen_array_cap(ctx, &recv_ty)
   when IntrinsicId::ArrayRemove then
-    emit_load_mem(ctx, rr, rr, 0)
+    # VALUE-ABI (P0-VC): the runtime returns the complete T per the
+    # element's ValueCategory — the width-matched VALUE WORD for a Scalar
+    # element (the general call machinery stores it) or the ADDRESS of a
+    # fresh bump copy of the FULL removed image for ScalarPair/ByAddress
+    # (materialized into the destination place below; the post-call
+    # register store is suppressed).
+    codegen_collection_receiver_deref(ctx, fctx, call_args)
     codegen_array_remove(ctx)
+    match classify_value_category(&mut ctx.layout_engine, dest_ty)
+    when Result::Err(e) then
+      panic("ICE: ArrayRemove materialization classification failed closed for type '" + e.type_name + "': " + layout_error_to_string(&e))
+    when Result::Ok(cat) then
+      match cat
+      when ValueCategory::ZeroSized then
+        emit_zero_reg(ctx, rr)
+      when ValueCategory::Scalar(_) then
+        ()  # the complete scalar T is already in the return register
+      when ValueCategory::ScalarPair(_, _) then
+        codegen_array_image_to_dest(ctx, fctx, dest, 16)
+        return true
+      when ValueCategory::ByAddress(sz) then
+        codegen_array_image_to_dest(ctx, fctx, dest, sz)
+        return true
+      end
+    end
   when IntrinsicId::ArrayInsert then
     codegen_array_insert(ctx, fctx, args)
   when IntrinsicId::ArrayClear then
@@ -10447,9 +10947,15 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     emit_load_mem(ctx, rr, rr, 0)
     codegen_array_destroy(ctx)
   when IntrinsicId::ArrayContains then
-    emit_load_mem(ctx, rr, rr, 0)
-    deref_arg_once_if_ref_like(ctx, fctx, args, call_args, 1)
-    codegen_array_contains(ctx)
+    # VALUE-ABI (Eq dispatch): arg1 arrives as the &T reference VALUE (the
+    # item ADDRESS — NO deref: the runtime probes the element bytes by
+    # reference); the arm resolves the CONCRETE Eq::eq instance address
+    # (map_eq_dispatch_label — the same dispatch the map keys use: the
+    # compiled `impl Eq for T` instance, _tg_eq_str for String objects,
+    # _tg_eq_str_view for StrView, or the _tg_eq_mem structural fallback
+    # with the element stride) into arg2 and calls _tg_array_contains.
+    codegen_collection_receiver_deref(ctx, fctx, call_args)
+    codegen_array_contains(ctx, fctx, args)
   when IntrinsicId::ArrayLast then
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
@@ -10912,45 +11418,169 @@ def codegen_intrinsic(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, name: String, a
     # Windows not supported on macOS/Linux - return error
     emit_mov_ri(ctx, rr, -1)
 
-  # Placeholder intrinsics — fail closed at COMPILE time. These were routed
-  # to semantically wrong handlers (identity/clone/concat) in earlier work;
-  # each now panics instead of corrupting semantics.
-  when IntrinsicId::TrimMatches then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::SplitOnce then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::ToLowercase then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::MapJoinCollect then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::SplitLinesTrim then
-    panic("internal error: intrinsic `" + name + "` not implemented")
+  # P0-STRING / collection surfaces: the String-object operations
+  # (trim / trim_matches / to_lowercase / to_uppercase / replace / split /
+  # lines) and the owned-Vec operations (slice / from_list / capacity).
+  # The receivers are normalized to the OWNED String object / Vec handle
+  # and the work runs in the _tg_string_* / _tg_array_* runtime helpers on
+  # BOTH arches. The result lands in the return register (the object
+  # handle or the Vec handle — both are 8-byte values the general call
+  # machinery stores).
+  when IntrinsicId::StringTrim | IntrinsicId::TrimMatches then
+    # trim: (s) -> _tg_string_trim; trim_matches: (s, pattern) ->
+    # _tg_string_trim_matches. The pattern is normalized to raw bytes.
+    let trim_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+    if trim_converted then
+      codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+    else
+      codegen_string_str_arg_normalize(ctx, fctx, args, 1)
+    end
+    if args.len() > 1 then
+      emit_call_label(ctx, "_tg_string_trim_matches")
+    else
+      emit_call_label(ctx, "_tg_string_trim")
+    end
+  when IntrinsicId::StringToLowercase | IntrinsicId::ToLowercase then
+    # Both the lowercase and the uppercase mapping route here; the callee
+    # name discriminates the direction (the router classifies
+    # to_lowercase/to_uppercase/string_to_lowercase/string_to_uppercase
+    # to this id).
+    let case_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+    if case_converted then
+      codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+    end
+    if name == "to_uppercase" || name == "string_to_uppercase" then
+      emit_call_label(ctx, "_tg_string_toupper")
+    else
+      emit_call_label(ctx, "_tg_string_tolower")
+    end
   when IntrinsicId::StringReplace then
-    panic("internal error: intrinsic `" + name + "` not implemented")
+    # (s, from, to) -> _tg_string_replace; from/to normalize to raw bytes.
+    let rep_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+    if rep_converted then
+      codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+      codegen_string_intrinsic_reload_arg(ctx, fctx, args, 2)
+    else
+      codegen_string_str_arg_normalize(ctx, fctx, args, 1)
+      codegen_string_str_arg_normalize(ctx, fctx, args, 2)
+    end
+    emit_call_label(ctx, "_tg_string_replace")
   when IntrinsicId::StringSplit then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::ArraySlice then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::ArrayFromList then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::ArrayCapacity then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::ArrayJoin then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::StringIsEmptyChars then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::StringTrim then
-    panic("internal error: intrinsic `" + name + "` not implemented")
-  when IntrinsicId::StringToLowercase then
-    panic("internal error: intrinsic `" + name + "` not implemented")
+    # (s, sep) -> _tg_string_split: a Vec[String] of OWNED String objects
+    # (the helper slices each segment through _tg_string_slice and pushes
+    # the handles through the collection ABI).
+    let split_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+    if split_converted then
+      codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+    else
+      codegen_string_str_arg_normalize(ctx, fctx, args, 1)
+    end
+    emit_call_label(ctx, "_tg_string_split")
   when IntrinsicId::StringSplitLines then
-    panic("internal error: intrinsic `" + name + "` not implemented")
+    # lines: (s) -> _tg_string_split(s, "\n") — the static newline view.
+    let lines_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+    match arg_reg(ctx.target.arch, 1)
+    when Option::Some(sep_reg) then
+      let nl_label = intern_string(ctx, "\n")
+      emit_lea_label(ctx, sep_reg, nl_label)
+    when Option::None then ()
+    end
+    emit_call_label(ctx, "_tg_string_split")
+  when IntrinsicId::SplitLinesTrim then
+    # The bare split/lines/trim method names (the router dispatches them
+    # type-directed; this arm implements all three by callee name).
+    if name == "split" then
+      let sl_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+      if sl_converted then
+        codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+      else
+        codegen_string_str_arg_normalize(ctx, fctx, args, 1)
+      end
+      emit_call_label(ctx, "_tg_string_split")
+    elsif name == "lines" then
+      let ln_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+      match arg_reg(ctx.target.arch, 1)
+      when Option::Some(sep_reg) then
+        let nl_label = intern_string(ctx, "\n")
+        emit_lea_label(ctx, sep_reg, nl_label)
+      when Option::None then ()
+      end
+      emit_call_label(ctx, "_tg_string_split")
+    else
+      let tr_converted = codegen_string_intrinsic_receiver_object(ctx, fctx, args)
+      if tr_converted then
+        codegen_string_intrinsic_reload_arg(ctx, fctx, args, 1)
+      else
+        codegen_string_str_arg_normalize(ctx, fctx, args, 1)
+      end
+      if args.len() > 1 then
+        emit_call_label(ctx, "_tg_string_trim_matches")
+      else
+        emit_call_label(ctx, "_tg_string_trim")
+      end
+    end
+  when IntrinsicId::ArraySlice then
+    # (arr, start, end) -> _tg_array_slice: the owned Vec copy of the
+    # span (the helper reads the element stride from the SOURCE header —
+    # the collection ABI's stride authority).
+    emit_load_mem(ctx, rr, rr, 0)
+    emit_call_label(ctx, "_tg_array_slice")
+  when IntrinsicId::ArrayFromList then
+    # (items: &[T]) -> _tg_array_from_list: the arg is the &[T] borrow —
+    # the ADDRESS of the Slice view {ptr@0, len@8} (the array-literal
+    # argument is the heap-vector form whose header {data@0, len@8} is
+    # the same leading layout). The element stride comes from the CONCRETE
+    # destination element type at this operation site.
+    let fl_elem_ty = vec_elem_type_of(ctx, dest_ty)
+    let fl_stride = element_stride_bytes(ctx, &fl_elem_ty)
+    match ctx.target.arch
+    when Arch::AArch64 then
+      a64_ldur(&mut ctx.text, A64::X1, A64::X0, 8)   # len (before clobbering x0)
+      a64_ldur(&mut ctx.text, A64::X0, A64::X0, 0)   # data
+      a64_mov_ri(&mut ctx.text, A64::X2, fl_stride as i64)
+    when Arch::X86_64 then
+      x64_mov_rm(&mut ctx.text, X64::RSI, X64::RDI, 8)  # len
+      x64_mov_rm(&mut ctx.text, X64::RDI, X64::RDI, 0)  # data
+      x64_mov_ri(&mut ctx.text, X64::RDX, fl_stride as i64)
+    end
+    emit_call_label(ctx, "_tg_array_from_list")
+  when IntrinsicId::ArrayCapacity then
+    # capacity: the header read (cap@16 — the collection ABI's
+    # container_field_offset authority), exactly like ArrayCap.
+    emit_load_mem(ctx, rr, rr, 0)
+    let cap_recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+    codegen_array_cap(ctx, &cap_recv_ty)
+
+  # Checker-diagnosed surfaces — the type checker rejects the explicit
+  # intrinsic spellings with an "unsupported: use X instead" error at
+  # call-recording time (record_intrinsic_classification in types.tg), so
+  # compilation aborts before codegen. The bare method names these were
+  # once misrouted from are COMPILED methods with real std bodies
+  # (split_once via find+slice, map/join/collect via the std methods).
+  # These arms are the DEFENSIVE last line only: if a classification ever
+  # reaches them, the compiler fails closed with an internal error rather
+  # than emit a semantically wrong handler (the historical
+  # identity/clone/concat misroutes are deleted).
+  when IntrinsicId::SplitOnce then
+    panic("internal error: intrinsic `" + name + "` is unsupported (the checker rejects string_split_once with 'use find + slice instead'; the bare split_once method is the std body)")
+  when IntrinsicId::MapJoinCollect then
+    panic("internal error: intrinsic `" + name + "` is unsupported (the checker rejects map/join/collect — the std methods implement them)")
+  when IntrinsicId::StringIsEmptyChars then
+    panic("internal error: intrinsic `" + name + "` is unsupported (the checker rejects string_is_empty/string_chars — use is_empty / len() == 0)")
+  when IntrinsicId::ArrayJoin then
+    panic("internal error: intrinsic `" + name + "` is unsupported (the checker rejects array join — use the std Array::join method)")
 
   when _ then
     # Fail closed: an intrinsic with no handler must be a compiler error,
     # never a silent zero (a fake value would corrupt semantics).
     panic("internal error: unknown or unsupported intrinsic `" + name + "`")
   end
+  # The default result: the intrinsic arm materialized its result in the
+  # return register — the general call machinery stores it into dest. Arms
+  # that wrote the FULL result image into the destination place themselves
+  # (the ArrayGet/ArrayRemove ScalarPair/ByAddress materializations) return
+  # true so that store is suppressed.
+  false
 end
 # Args already in ABI registers: arg0=num, arg1=a1, arg2=a2, arg3=a3
 def codegen_syscall(ctx: &mut CodegenCtx, nargs: Int) -> Unit
@@ -11474,7 +12104,7 @@ def get_successor_ids(term: &MirTerminator) -> Vec[Int]
       succs.push(sw.target.id)
     end
     succs.push(default_target.id)
-  when MirTerminatorKind::MirCall(dest, func_op, args, success, unwind) then
+  when MirTerminatorKind::MirCall(dest, func_op, args, success, unwind, intrinsic) then
     succs.push(success.id)
   when MirTerminatorKind::MirDeinit(place, deinit_fn, target, unwind) then
     succs.push(target.id)
@@ -11704,7 +12334,7 @@ def collect_static_refs(func: &MirFunction) -> Vec[(DefId, Type)]
       end
     end
     match block.terminator.kind
-    when MirTerminatorKind::MirCall(_, callee, args, _, _) then
+    when MirTerminatorKind::MirCall(_, callee, args, _, _, _) then
       collect_static_refs_from_operand(callee, &mut refs)
       for arg in args do
         collect_static_refs_from_call_arg(arg, &mut refs)
@@ -12089,7 +12719,7 @@ def collect_fn_refs(func: &MirFunction) -> Vec[String]
     end
     # Scan terminator
     match block.terminator.kind
-    when MirTerminatorKind::MirCall(_, callee, args, _, _) then
+    when MirTerminatorKind::MirCall(_, callee, args, _, _, _) then
       collect_fn_refs_from_operand(callee, &mut refs)
       for arg in args do
         let arg_op = mir_call_arg_operand(arg)
@@ -13381,127 +14011,13 @@ def codegen_str_copy(ctx: &mut CodegenCtx) -> Unit
   end
 end
 
-# str_slice: Extract substring from start to end indices.
-# Args: x0/rdi = &self (ptr to string ptr), x1/rsi = start, x2/rdx = end
-# Returns: pointer to newly allocated null-terminated substring
-def codegen_str_slice(ctx: &mut CodegenCtx) -> Unit
-  let lbl_loop = ".Lstr_slice_loop." + ctx.fn_counter.to_string()
-  let lbl_done = ".Lstr_slice_done." + ctx.fn_counter.to_string()
-  let lbl_safe = ".Lstr_slice_safe." + ctx.fn_counter.to_string()
-  ctx.fn_counter = ctx.fn_counter + 1
-
-  match ctx.target.arch
-  when Arch::AArch64 then
-    # x0 = &self (ptr to string ptr), x1 = start, x2 = end
-    # Save callee-saved regs we use
-    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
-    # Load actual string pointer: x0 = [x0]
-    a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)
-    maybe_load_string_data_ptr(
-      ctx,
-      PhysReg::A64Reg(A64::X0),
-      PhysReg::A64Reg(A64::X14),
-      PhysReg::A64Reg(A64::X15),
-      PhysReg::A64Reg(A64::X16),
-      PhysReg::A64Reg(A64::X17)
-    )
-    # x3 = len = end - start, with bounds check
-    a64_sub_rrr(&mut ctx.text, A64::X3, A64::X2, A64::X1)
-    # If start > end, the subtraction wraps negative (bit 63 set). Clamp to 0.
-    a64_cmp_rr(&mut ctx.text, A64::X2, A64::X1)
-    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_safe.clone())
-    a64_mov_ri(&mut ctx.text, A64::X3, 0)
-    def_label(&mut ctx.text, lbl_safe)
-    # x4 = src = string_ptr + start
-    a64_add_rrr(&mut ctx.text, A64::X4, A64::X0, A64::X1)
-    # Save src and len across alloc call
-    a64_mov_rr(&mut ctx.text, A64::X19, A64::X4)
-    a64_mov_rr(&mut ctx.text, A64::X20, A64::X3)
-    # Allocate len+1 bytes: x0 = len + 1
-    a64_add_rri(&mut ctx.text, A64::X0, A64::X3, 1)
-    emit_call_label(ctx, "_tg_bump_alloc")
-    # x0 = allocated buffer, x19 = src, x20 = len
-    # Copy loop
-    a64_mov_rr(&mut ctx.text, A64::X9, A64::X0)
-    a64_mov_rr(&mut ctx.text, A64::X10, A64::X20)
-    def_label(&mut ctx.text, lbl_loop.clone())
-    a64_cmp_ri(&mut ctx.text, A64::X10, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_done.clone())
-    a64_ldrb(&mut ctx.text, A64::X11, A64::X19, 0)
-    a64_strb(&mut ctx.text, A64::X11, A64::X9, 0)
-    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
-    a64_add_rri(&mut ctx.text, A64::X9, A64::X9, 1)
-    a64_sub_rri(&mut ctx.text, A64::X10, A64::X10, 1)
-    a64_b(&mut ctx.text, lbl_loop)
-    def_label(&mut ctx.text, lbl_done)
-    # Null-terminate
-    a64_strb(&mut ctx.text, A64::XZR, A64::X9, 0)
-    # Restore callee-saved regs
-    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
-    # x0 already has the buffer pointer (return value)
-
-  when Arch::X86_64 then
-    # rdi = &self, rsi = start, rdx = end
-    # Save the callee-saved regs this inline emitter uses — R12/R13 are the
-    # ENCLOSING function's registers (this runs inline, not as a callee).
-    x64_push(&mut ctx.text, X64::R12)
-    x64_push(&mut ctx.text, X64::R13)
-    # Load actual string pointer: rdi = [rdi]
-    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RDI, 0)
-    maybe_load_string_data_ptr(
-      ctx,
-      PhysReg::X64Reg(X64::RDI),
-      PhysReg::X64Reg(X64::R8),
-      PhysReg::X64Reg(X64::R9),
-      PhysReg::X64Reg(X64::R10),
-      PhysReg::X64Reg(X64::R11)
-    )
-    # rcx = len = end - start, with bounds check
-    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RSI)
-    x64_jcc(&mut ctx.text, CC::GE, lbl_safe.clone())
-    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
-    x64_jmp(&mut ctx.text, ".Lstr_slice_clamp_done." + (ctx.fn_counter - 1).to_string())
-    def_label(&mut ctx.text, lbl_safe)
-    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RDX)
-    x64_sub_rr(&mut ctx.text, X64::RCX, X64::RSI)
-    def_label(&mut ctx.text, ".Lstr_slice_clamp_done." + (ctx.fn_counter - 1).to_string())
-    # r12 = src = string_ptr + start
-    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDI)
-    x64_add_rr(&mut ctx.text, X64::R12, X64::RSI)
-    # r13 = len
-    x64_mov_rr(&mut ctx.text, X64::R13, X64::RCX)
-    # Allocate len+1 bytes: rdi = len + 1
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RCX)
-    x64_add_ri(&mut ctx.text, X64::RDI, 1)
-    emit_call_label(ctx, "_tg_bump_alloc")
-    # rax = allocated buffer, r12 = src, r13 = len
-    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)
-    def_label(&mut ctx.text, lbl_loop.clone())
-    x64_test_rr(&mut ctx.text, X64::R13, X64::R13)
-    x64_jcc(&mut ctx.text, CC::E, lbl_done.clone())
-    # movzx eax, byte [r12]
-    emit8(&mut ctx.text, 0x41)
-    emit8(&mut ctx.text, 0x0F)
-    emit8(&mut ctx.text, 0xB6)
-    emit8(&mut ctx.text, 0x04)
-    emit8(&mut ctx.text, 0x24)
-    # mov [rcx], al
-    emit8(&mut ctx.text, 0x88)
-    emit8(&mut ctx.text, 0x01)
-    x64_add_ri(&mut ctx.text, X64::R12, 1)
-    x64_add_ri(&mut ctx.text, X64::RCX, 1)
-    x64_sub_ri(&mut ctx.text, X64::R13, 1)
-    x64_jmp(&mut ctx.text, lbl_loop)
-    def_label(&mut ctx.text, lbl_done)
-    # Null-terminate: mov byte [rcx], 0
-    emit8(&mut ctx.text, 0xC6)
-    emit8(&mut ctx.text, 0x01)
-    emit8(&mut ctx.text, 0x00)
-    # Restore callee-saved regs (rax already holds the buffer pointer)
-    x64_pop(&mut ctx.text, X64::R13)
-    x64_pop(&mut ctx.text, X64::R12)
-  end
-end
+# P0-STRING (the owned slice): the old inline `codegen_str_slice` raw-buffer
+# emitter (allocate len+1 bytes, copy, NUL-terminate, return the raw byte
+# pointer) is DELETED. String::slice / str::slice delegate to the runtime
+# helper _tg_string_slice (runtime.tg, both arches), which computes the
+# substring, allocates the OWNED String object (header + buffer), copies
+# the bytes, NUL-terminates, and returns the OBJECT HANDLE — a function
+# returning String always returns the owned-object handle.
 
 # int_to_str: Convert integer to string. Arg in x0/rdi, returns an OWNED
 # String object (the String ABI — the raw buffer is wrapped).
@@ -14072,13 +14588,20 @@ def codegen_collection_elem_transfer_operand(ctx: &mut CodegenCtx, fctx: &mut Fn
   end
 end
 
-# Re-derive the receiver's vec handle in arg0: the generic call-arg setup
-# left the &Vec ref word (Value receiver operands — the only receiver form
-# the MIR produces) in x0/rax; ONE deref reaches the 32-byte header.
+# Re-derive the receiver's vec handle in the ARG0 ABI register (x0 on
+# AArch64, RDI on x86-64 — the register the runtime helpers read): the
+# generic call-arg setup left the &Vec ref word in arg0 (Value receiver
+# operands — the only receiver form the MIR produces); ONE deref reaches
+# the 32-byte header. The deref must target arg0 — ret_reg would be RAX
+# on x86-64 while every _tg_array_* helper reads RDI.
 def codegen_collection_receiver_deref(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, args: &Vec[MirCallArg]) -> Unit
-  let rr = ret_reg(ctx.target.arch)
-  load_call_arg_value(ctx, fctx, &args[0], rr)
-  emit_load_mem(ctx, rr, rr, 0)
+  match arg_reg(ctx.target.arch, 0)
+  when Option::Some(r0) then
+    load_call_arg_value(ctx, fctx, &args[0], r0)
+    emit_load_mem(ctx, r0, r0, 0)
+  when Option::None then
+    panic("codegen_collection_receiver_deref: no arg0 ABI register")
+  end
 end
 
 # array_new: Create empty Vec with capacity 0. Returns ptr to vec struct.
@@ -14098,16 +14621,87 @@ def codegen_array_push(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, args: &Vec
   emit_call_label(ctx, "_tg_array_push")
 end
 
-# array_pop: Remove and return last element. Args: vec_ptr. Returns element or null.
+# array_pop: Remove and return the last element. Args: vec_ptr.
+# The runtime returns the popped element's IMAGE ADDRESS (0 when empty):
+#   - Scalar (stride <= 8): the in-buffer slot address — the width-aware
+#     codegen_option_payload_wrap loads the value word from it immediately;
+#   - ScalarPair/ByAddress (stride > 8): the address of a fresh bump copy
+#     of the FULL image — the wrap's payload is that address.
+# The arm constructs the complete Option[T] TaggedPtr word with
+# codegen_option_payload_wrap (the same wrap the map ops use) — the
+# runtime NEVER returns a raw element word for a non-empty pop.
 def codegen_array_pop(ctx: &mut CodegenCtx) -> Unit
-  # Call runtime _tg_array_pop(vec)
   emit_call_label(ctx, "_tg_array_pop")
 end
 
-# array_get: Get element at index. Args: vec_ptr, index. Returns element ptr.
-def codegen_array_get(ctx: &mut CodegenCtx) -> Unit
-  # Call runtime _tg_array_get(vec, idx)
+# The CHECKED ArrayGet path (the std's defined OOB policy — panic on
+# out-of-range): arg0 = the vec handle (x0/rdi), arg1 = index (x1/rsi).
+# index >= len traps BEFORE the runtime primitive runs; then the UNCHECKED
+# address accessor _tg_array_get computes data + index*stride and the arm
+# materializes the element per its ValueCategory:
+#   - ZeroSized: zero word;
+#   - Scalar(w): the width-matched value word is loaded from the address
+#     (the complete T in the return register — the general call machinery
+#     stores it);
+#   - ScalarPair/ByAddress: the FULL element image is byte-copied from the
+#     address into the destination place (codegen_array_image_to_dest —
+#     the arm reports the full store so the post-call register store is
+#     suppressed).
+def codegen_array_get_checked(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
+  let len_off = heap_header_field_offset(codegen_type_repr(ctx, &strip_ref_like_type(recv_ty)), &"len".to_string())
+  let lbl_ok = next_codegen_label(ctx, ".Larray_get_ok.")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_ldur(&mut ctx.text, A64::X2, A64::X0, len_off as i32)  # len
+    a64_cmp_rr(&mut ctx.text, A64::X1, A64::X2)                # index vs len
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_ok.clone())
+    emit_trap(ctx)  # OOB: panic (defined std policy)
+    def_label(&mut ctx.text, lbl_ok)
+  when Arch::X86_64 then
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, len_off as i32)  # len
+    x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RAX)                  # index vs len
+    x64_jcc(&mut ctx.text, CC::L, lbl_ok.clone())
+    emit_trap(ctx)  # OOB: panic (defined std policy)
+    def_label(&mut ctx.text, lbl_ok)
+  end
   emit_call_label(ctx, "_tg_array_get")
+end
+
+# Copy the FULL element image (size bytes) from the address in the return
+# register (rr) to the destination place. Mirrors emit_aggregate_value_copy
+# (8-byte chunks + 4/2/1-byte tails) but takes REGISTERS: rr = the image
+# source address, dst = the destination address. Uses scratch (x15/r11) as
+# the data register — never clobbers rr.
+def codegen_array_image_to_dest(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, dest: &Place, size: Int) -> Unit
+  let arch = ctx.target.arch
+  let rr = ret_reg(arch)
+  let t1 = scratch2_reg(arch)   # x14 / r10 — the destination address
+  let data = scratch_reg(arch)  # x15 / r11 — the byte temp
+  emit_place_address(ctx, fctx, dest, t1)
+  var copied = 0
+  while size - copied >= 8 do
+    emit_load_mem(ctx, data, rr, copied as i32)
+    emit_store_mem(ctx, t1, copied as i32, data)
+    copied = copied + 8
+  end
+  if size - copied >= 4 then
+    emit_load_mem_sized(ctx, data, rr, copied as i32, MemWidth::W32, Extension::Zero)
+    emit_add_ri(ctx, t1, copied as i32)
+    emit_store_mem_sized(ctx, t1, 0, data, MemWidth::W32)
+    copied = copied + 4
+  end
+  if size - copied >= 2 then
+    emit_load_mem_sized(ctx, data, rr, copied as i32, MemWidth::W16, Extension::Zero)
+    emit_add_ri(ctx, t1, copied as i32)
+    emit_store_mem_sized(ctx, t1, 0, data, MemWidth::W16)
+    copied = copied + 2
+  end
+  if size - copied >= 1 then
+    emit_load_mem_sized(ctx, data, rr, copied as i32, MemWidth::W8, Extension::Zero)
+    emit_add_ri(ctx, t1, copied as i32)
+    emit_store_mem_sized(ctx, t1, 0, data, MemWidth::W8)
+    copied = copied + 1
+  end
 end
 
 # array_set: Set element at index. Args: vec_ptr, index, element (per category).
@@ -14361,9 +14955,34 @@ def codegen_array_cap(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
   end
 end
 
-# array_remove: Remove element at index. Args: vec_ptr, index. Returns removed element.
+# array_remove: Remove element at index. Args: vec_ptr, index. The result
+# is the category-aware VALUE-ABI extraction:
+#   - Scalar: the runtime returns the complete T (the width-matched VALUE
+#     WORD) in the return register — the general call machinery stores it;
+#   - ScalarPair/ByAddress: the runtime returns the ADDRESS of a fresh
+#     bump copy of the FULL removed image; the arm byte-copies the image
+#     into the destination place (the materialization below) and reports
+#     the full store so the post-call register store is suppressed.
 def codegen_array_remove(ctx: &mut CodegenCtx) -> Unit
   emit_call_label(ctx, "_tg_array_remove")
+end
+
+# array_contains: Check if element exists. Args: vec_ptr (x0/rdi), item
+# ADDRESS (x1/rsi — the &T reference value, never deref'd), eq_fn
+# (x2/rdx — the concrete Eq::eq instance address resolved by
+# map_eq_dispatch_label — the same dispatch the map keys use). The runtime
+# probes each element with the Eq call.
+def codegen_array_contains(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Vec[MirOperand]) -> Unit
+  let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
+  let elem_ty = vec_elem_type_of(ctx, &strip_ref_like_type(&recv_ty))
+  let eq_label = map_eq_dispatch_label(ctx, &elem_ty)
+  match ctx.target.arch
+  when Arch::AArch64 then
+    emit_lea_label(ctx, PhysReg::A64Reg(A64::X2), eq_label)
+  when Arch::X86_64 then
+    emit_lea_label(ctx, PhysReg::X64Reg(X64::RDX), eq_label)
+  end
+  emit_call_label(ctx, "_tg_array_contains")
 end
 
 # array_insert: Insert element at index. Args: vec_ptr, index, element (per category).
@@ -14395,11 +15014,6 @@ end
 # array_destroy: release the vec's mmap'ed data buffer. Args: vec_ptr.
 def codegen_array_destroy(ctx: &mut CodegenCtx) -> Unit
   emit_call_label(ctx, "_tg_array_destroy")
-end
-
-# array_contains: Check if element exists. Args: vec_ptr, element_ptr. Returns bool.
-def codegen_array_contains(ctx: &mut CodegenCtx) -> Unit
-  emit_call_label(ctx, "_tg_array_contains")
 end
 
 # array_last: Returns last element (or 0 if empty). Args: vec_ptr.
@@ -14517,14 +15131,21 @@ end
 #
 # CONTRACT (mirrors runtime.tg's map/set contract; see there for the full
 # header/bucket/tuple layouts):
-#   - Map[K, V] is an 88-byte header: { buckets, size, capacity,
+#   - Map[K, V] is a 96-byte header: { buckets, size, capacity,
 #     key_stride, key_align, value_stride, value_align, key_off,
-#     value_off, next_off, bucket_stride }. The four DERIVED layout fields
-#     are computed here from the CONCRETE K/V via the layout engine and
-#     passed to the runtime at creation; the runtime derives nothing.
+#     value_off, next_off, bucket_stride, free_list }. The four DERIVED
+#     layout fields are computed here from the CONCRETE K/V via the layout
+#     engine and passed to the runtime at creation; the runtime derives
+#     nothing. free_list (header+88) is the runtime's overflow-node reuse
+#     list: clear collects every chain node there and insert pops it
+#     before mmap'ing a fresh node.
 #   - Bucket records are inline: { hash, key bytes @key_off,
 #     value bytes @value_off, next @next_off }. NO hardcoded 8-byte bucket
 #     arithmetic anywhere: every offset/stride comes from the header.
+#   - STORED-HASH ENCODING: the runtime normalizes every hash argument at
+#     entry (stored = hash == 0 ? 1 : hash) — the codegen passes the raw
+#     Hash::hash result and the normalization is the runtime's single
+#     place, so a user hash of 0 can never collide with the empty marker.
 #   - HASH/EQ DISPATCH: at each map-operation site the concrete K is
 #     known (post-monomorphization). The hash is computed by a DIRECT call
 #     to the CONCRETE Hash::hash instance (user-defined `impl Hash for
@@ -15019,9 +15640,14 @@ def codegen_option_payload_wrap(ctx: &mut CodegenCtx, dest_ty: &Type) -> Unit
   emit_jcc(ctx, CondKind::Eq, lbl_none.clone())
 
   # Found: the payload word is the VALUE for 0 < V <= 8 (load it from the
-  # returned address), else the address itself.
+  # returned address — WIDTH-MATCHED so a narrow payload (u8/u16/u32) is
+  # read exactly at its own width and never crosses the slot's allocation
+  # tail — the ArrayPop in-buffer slot path relies on this), else the
+  # address itself.
   if opt_v_size > 0 && opt_v_size <= 8 then
-    emit_load_mem(ctx, rr, rr, 0)
+    let pw = storage_width_of(ctx, &opt_payload_ty)
+    let pext = storage_signedness_of(&opt_payload_ty)
+    emit_load_mem_sized(ctx, rr, rr, 0, pw, pext)
   end
 
   match arch
@@ -15166,7 +15792,7 @@ end
 
 # map_len: Get number of entries. Args: map_ptr. Returns size.
 # The len field of the map header: HeapMapHeader row of the engine's
-# container_field_offset (8 — agrees with the runtime's 88-byte header
+# container_field_offset (8 — agrees with the runtime's 96-byte header
 # {buckets:0, size:8, capacity:16, key_stride:24, ...}; only offset 8 is
 # read here).
 def codegen_map_len(ctx: &mut CodegenCtx, recv_ty: &Type) -> Unit
@@ -15294,7 +15920,8 @@ def codegen_set_entries(ctx: &mut CodegenCtx, fctx: &mut FnCodegenCtx, args: &Ve
 end
 
 # map_drain_one: remove the FIRST live entry, returning Option[(K, V)].
-# Args: map. Returns via sret (AArch64: x8) with disc + the concrete
+# Args: map. Returns via sret (AArch64: x8; x86-64: r8 — the drain sret
+# register the shared drain block sets) with disc + the concrete
 # (K, V) tuple (key at payload+0, value at payload + t_v_off).
 def codegen_map_drain_one(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Vec[MirOperand]) -> Unit
   let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
@@ -15307,7 +15934,9 @@ def codegen_map_drain_one(ctx: &mut CodegenCtx, fctx: &FnCodegenCtx, args: &Vec[
       a64_mov_ri(&mut ctx.text, A64::X2, lay.t_size)
       emit_call_label(ctx, "_tg_map_drain_one")
     when Arch::X86_64 then
-      x64_ud2(&mut ctx.text)
+      x64_mov_ri(&mut ctx.text, X64::RSI, lay.t_v_off)
+      x64_mov_ri(&mut ctx.text, X64::RDX, lay.t_size)
+      emit_call_label(ctx, "_tg_map_drain_one")
     end
   when Option::None then
     emit_call_label(ctx, "_tg_map_drain_one")

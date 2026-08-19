@@ -62,15 +62,32 @@ end
 # Map[K: Hash + Eq, V] — compiler-intrinsic hash map (P0-MAP contract).
 #
 # STORAGE CONTRACT (see tg_compiler/runtime.tg "Map Runtime Implementation"):
-# the map is an 88-byte header { buckets, size, capacity, key_stride,
+# the map is a 96-byte header { buckets, size, capacity, key_stride,
 # key_align, value_stride, value_align, key_off, value_off, next_off,
-# bucket_stride } over a raw bucket arena. Buckets hold the CONCRETE K and
-# V INLINE: { hash @0, key bytes @key_off, value bytes @value_off, next
-# @next_off } — key_off/value_off/next_off/bucket_stride are computed ONCE
-# at map creation from the four layout parameters (the concrete K/V sizes
-# and alignments from the layout engine) and carried in the header; the
-# runtime never hardcodes bucket arithmetic. A Map[BigStruct, Another]
-# therefore stores the full struct bytes, not pointers.
+# bucket_stride, free_list } over a raw bucket arena. Buckets hold the
+# CONCRETE K and V INLINE: { hash @0, key bytes @key_off, value bytes
+# @value_off, next @next_off } — key_off/value_off/next_off/bucket_stride
+# are computed ONCE at map creation from the four layout parameters (the
+# concrete K/V sizes and alignments from the layout engine) and carried in
+# the header; the runtime never hardcodes bucket arithmetic. A
+# Map[BigStruct, Another] therefore stores the full struct bytes, not
+# pointers. free_list (header+88) is the overflow-node reuse list: the
+# clear path links every chain node into it and the insert chain path
+# pops it before mmap'ing a fresh node.
+#
+# STORED-HASH ENCODING (P0-H0): the bucket's cached hash is NEVER a raw
+# user hash. Every map/set runtime operation normalizes the hash argument
+# at entry — stored = hash == 0 ? 1 : hash — and the probe mask and the
+# cached-hash comparison always use the normalized value. A key whose
+# Hash::hash returns 0 is stored as the encoding 1 and is found by the
+# same encoding at lookup; 0 remains the empty marker.
+#
+# REMOVAL CONTRACT (P0-CHAIN): removing a record (remove / remove_key /
+# drain_one) REAL-unlinks it: a bucket head promotes its chain successor's
+# full record image into the head slot (the old successor node goes to the
+# free list), a chain node is re-linked out of its parent, and only a tail
+# record is marked empty — no live chain successor is ever hidden behind
+# a zeroed hash, so every lookup finds every entry after any removal.
 #
 # HASH/EQ DISPATCH CONTRACT: every map operation hashes the key through
 # the CONCRETE Hash::hash instance of K (a user-defined `impl Hash for
@@ -97,7 +114,22 @@ end
 
 extern def __intrinsic_array_len[T](arr: &Array[T]) -> Int
 extern def __intrinsic_array_push[T](arr: &mut Array[T], sink item: T) -> Unit
+# pop -> Option[T] (VALUE ABI): the runtime returns the popped element's
+# IMAGE ADDRESS (0 when empty — None). For a Scalar T the address is the
+# in-buffer slot (the codegen loads the width-matched value word and makes
+# it the Some payload); for ScalarPair/ByAddress T the runtime byte-copies
+# the FULL element image into a fresh bump allocation and the Some payload
+# is that image address. The codegen constructs the complete Option[T]
+# TaggedPtr word (the same wrap the map ops use). The runtime NEVER
+# returns a raw element word.
 extern def __intrinsic_array_pop[T](arr: &mut Array[T]) -> Option[T]
+# get -> T (VALUE ABI, CHECKED): the codegen's ArrayGet arm is the checked
+# path — index < len is verified and out-of-range TRAPS (the defined std
+# OOB policy: panic on OOB, matching the language's other panics); the
+# runtime primitive is the UNCHECKED address accessor (data + index*stride)
+# and the arm materializes the element per its ValueCategory (the
+# width-matched value word for Scalar, the FULL image copy to the
+# destination for ScalarPair/ByAddress).
 extern def __intrinsic_array_get[T](arr: &Array[T], index: Int) -> T
 extern def __intrinsic_array_new[T]() -> Array[T]
 
@@ -109,10 +141,25 @@ extern def __intrinsic_set_new[T]() -> Set[T]
 extern def __intrinsic_set_contains[T](s: &Set[T], item: &T) -> Bool
 extern def __intrinsic_set_insert[T](s: &mut Set[T], sink item: T) -> Bool
 
+# remove -> T (VALUE ABI): the runtime extracts the removed element per
+# its ValueCategory — the width-matched VALUE WORD for a Scalar T (the
+# complete T in the return register) or the ADDRESS of a fresh bump copy
+# of the FULL removed image for ScalarPair/ByAddress (the codegen
+# materializes the complete T into the destination). The shift and the len
+# shrink leave the removed slot dead to the array's drop glue — the
+# returned T is the sole owner of the removed value.
 extern def __intrinsic_array_remove[T](arr: &mut Array[T], index: Int) -> T
 extern def __intrinsic_array_insert[T](arr: &mut Array[T], index: Int, sink item: T) -> Unit
 extern def __intrinsic_array_clear[T](arr: &mut Array[T]) -> Unit
 extern def __intrinsic_array_from_list[T](items: &[T]) -> Array[T]
+# contains -> Bool (Eq DISPATCH): the codegen resolves the CONCRETE Eq::eq
+# instance of T (the same dispatch the map keys use — the compiled
+# `impl Eq for T` instance, _tg_eq_str for String objects, _tg_eq_str_view
+# for StrView, or the _tg_eq_mem structural fallback with the element
+# stride) and the runtime probes each element's FULL image through that Eq
+# call — never a width-load/direct-register bit comparison. `item` is the
+# &T reference VALUE (the element ADDRESS — the runtime probes by
+# reference).
 extern def __intrinsic_array_contains[T: Eq](arr: &Array[T], item: &T) -> Bool
 extern def __intrinsic_array_capacity[T](arr: &Array[T]) -> Int
 extern def __intrinsic_array_slice[T](arr: &Array[T], start: Int, end_idx: Int) -> Array[T]
@@ -217,7 +264,10 @@ end
 # intrinsic, a branch on the returned Option's discriminant, and — on Some
 # (the replacement path was taken) — the concrete K drop glue on the
 # caller's incoming-key slot. The incoming key is destroyed exactly when
-# the stored key was preserved.
+# the stored key was preserved. P0-SINK: the incoming key is ALWAYS
+# materialized into a real drop slot before the call (a non-place key
+# expression — a call result like `make_resource_key()` — becomes a fresh
+# temp), so the teardown activates for every insert shape.
 def map_insert[K, V](m: &mut Map[K, V], sink key: K, sink value: V) -> Option[V]
   # Compiler intrinsic
   __intrinsic_map_insert(m, key, value)
@@ -247,7 +297,10 @@ end
 # method as: the insert intrinsic, the returned-address test, and — on the
 # found path — the concrete T drop glue on the returned old element. The
 # incoming item's image owns itself (it became the stored element); the old
-# element is destroyed by the MIR exactly when it was replaced.
+# element is destroyed by the MIR exactly when it was replaced. P0-SINK:
+# the incoming item is ALWAYS materialized into a real drop slot before
+# the call (a non-place item expression becomes a fresh temp), so the
+# replacement drop activates for every insert shape.
 def set_insert[T](s: &mut Set[T], sink item: T) -> Bool
   __intrinsic_set_insert(s, item)
 end
@@ -403,10 +456,17 @@ impl[T] Array[T]
   end
 
   def pop(self: &mut Self) -> Option[T] inout
+    # VALUE ABI: the runtime returns the popped element's image address or
+    # 0 (None); the codegen constructs the complete Option[T] word — the
+    # Some payload is the width-matched value word for a Scalar T and the
+    # FULL-image address for ScalarPair/ByAddress T.
     __intrinsic_array_pop(self)
   end
 
   def remove(self: &mut Self, index: Int) -> T inout
+    # VALUE ABI: the removed element is extracted per its ValueCategory —
+    # the value word for a Scalar T, the FULL image (fresh copy) for
+    # ScalarPair/ByAddress T — and materialized into the complete T.
     __intrinsic_array_remove(self, index)
   end
 
@@ -447,6 +507,10 @@ impl[T: Copy] Array[T]
   end
 
   def get(self: &Self, index: Int) -> T
+    # VALUE ABI, CHECKED: out-of-range TRAPS (the defined std OOB policy —
+    # panic on OOB). The element is materialized per its ValueCategory:
+    # the width-matched value word for a Scalar T, the FULL image copy for
+    # ScalarPair/ByAddress T.
     __intrinsic_array_get(self, index)
   end
 
@@ -513,6 +577,8 @@ end
 
 impl[T: Eq] Array[T]
   def contains(self: &Self, item: &T) -> Bool
+    # Eq DISPATCH: the concrete Eq::eq instance of T probes every element
+    # (the map-key dispatch) — never a bit comparison.
     __intrinsic_array_contains(self, item)
   end
 end
@@ -534,11 +600,14 @@ impl[K, V] Map[K, V]
   # Ownership-taking remove: the removed VALUE is extracted as an owned
   # Option[V], and the stored KEY is DESTROYED (P0-OWN): the MIR lowers
   # this method as the ownership-transfer remove intrinsic (the runtime
-  # copies the value image out into the caller's slot and unlinks the
-  # record — the hash field is zeroed, the chain link stays intact — and
-  # returns the removed record's key address), the concrete K drop glue on
-  # the returned key address, then the Option[V] re-encode. The key bytes
-  # of a removed entry never leak.
+  # copies the value image out into the caller's slot and REAL-unlinks the
+  # record — P0-CHAIN: a bucket head promotes its chain successor's full
+  # record image into the head slot, a chain node is re-linked out of its
+  # parent, and the displaced overflow node goes to the free list; only a
+  # tail record is marked empty — and returns the removed key's image
+  # address), the concrete K drop glue on the returned key address, then
+  # the Option[V] re-encode. The key bytes of a removed entry never leak,
+  # and no chain successor is ever hidden behind a zeroed hash.
   def remove(self: &mut Self, key: &K) -> Option[V] inout
     __intrinsic_map_remove(self, key)
   end
@@ -560,12 +629,14 @@ impl[K, V] Map[K, V]
   end
 
   # Clear is an OWNERSHIP operation (P0-OWN): the MIR decides. For trivial
-  # (no needs_drop) K and V the fast intrinsic (_tg_map_clear — the hash
-  # fields zeroed, size = 0) stays. For owning K or V the MIR emits the
-  # DRAIN-AND-DROP loop: each live entry is unlinked through
-  # __intrinsic_map_drain_one (the drain's own cleanup) and its key and
-  # value are dropped through their concrete glues, until the drain returns
-  # None. Either way the bucket arena and capacity are retained.
+  # (no needs_drop) K and V the fast intrinsic (_tg_map_clear — every
+  # head's hash AND next are zeroed, every chain's overflow nodes are
+  # linked into the header's free list for later insertions to reuse,
+  # size = 0) stays. For owning K or V the MIR emits the DRAIN-AND-DROP
+  # loop: each live entry is unlinked through __intrinsic_map_drain_one
+  # (the drain's own cleanup) and its key and value are dropped through
+  # their concrete glues, until the drain returns None. Either way the
+  # bucket arena and capacity are retained and no overflow node leaks.
   def clear(self: &mut Self) -> Unit inout
     __intrinsic_map_clear(self)
   end
@@ -646,10 +717,12 @@ impl[T] Set[T]
 
   # Ownership-taking remove: the removed ELEMENT is DESTROYED (P0-OWN):
   # the MIR lowers this method as the ownership-transfer remove intrinsic
-  # (the runtime unlinks the record — the hash field is zeroed, the chain
-  # link stays intact — and returns the removed element's address), the
-  # concrete T drop glue on the returned address, then the Bool result.
-  # The removed element's bytes never leak.
+  # (the runtime REAL-unlinks the record — P0-CHAIN: head promotion /
+  # chain-node re-link / tail empty-mark, with the displaced overflow
+  # node going to the free list — and returns the removed element's image
+  # address), the concrete T drop glue on the returned address, then the
+  # Bool result. The removed element's bytes never leak, and no chain
+  # successor is ever hidden behind a zeroed hash.
   def remove(self: &mut Self, item: &T) -> Bool inout
     __intrinsic_set_remove(self, item)
   end
@@ -667,10 +740,13 @@ impl[T] Set[T]
   end
 
   # Clear is an OWNERSHIP operation (P0-OWN): for trivial (no needs_drop)
-  # elements the fast intrinsic stays; for owning elements the MIR emits
-  # the DRAIN-AND-DROP loop — each live element is unlinked through
+  # elements the fast intrinsic stays (every head's hash AND next are
+  # zeroed and every chain's overflow nodes are linked into the header's
+  # free list for later insertions to reuse); for owning elements the MIR
+  # emits the DRAIN-AND-DROP loop — each live element is unlinked through
   # __intrinsic_set_drain_one and dropped through its concrete glue, until
-  # the drain returns None. The bucket arena and capacity are retained.
+  # the drain returns None. The bucket arena and capacity are retained
+  # and no overflow node leaks.
   def clear(self: &mut Self) -> Unit inout
     __intrinsic_set_clear(self)
   end

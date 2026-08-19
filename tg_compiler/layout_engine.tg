@@ -118,7 +118,9 @@ end
 #      word described by their EnumLayout; no name-based OpaquePtr special
 #      case exists)
 #   Dyn[T], Effect                        | OpaquePtr       | payload    | move + clone
-#   Function                              | OpaquePtr       | env: Yes    | move
+#   FnPtr / Closure                       | OpaquePtr       | env: Yes    | move
+#     (the closure VALUE is one pointer to the closure OBJECT { code @ 0,
+#      env: capture-tuple } — the object layout is registered by ClosureId)
 #   Var, Param, Error, unknown            | Invalid         | —          | —
 #     (unresolved types have NO representation; every layout query on them
 #      must fail closed — never a guessed pointer word)
@@ -156,7 +158,7 @@ end
 #   Immediate  -> the intrinsic primitive size (primitive_size)
 #   RawPtr, StringPtr, Heap*, TaggedPtr -> target.pointer_size (8)
 #   Inline     -> the full inline aggregate size (struct/enum/tuple/fixed array)
-#   OpaquePtr  -> target.fn_ptr_size for Function, else target.pointer_size
+#   OpaquePtr  -> target.fn_ptr_size for FnPtr, else target.pointer_size
 #   Invalid    -> NO layout (unresolved/error type): every consumer must fail
 #                 closed — panicking ICE — never assume a word
 #
@@ -198,7 +200,7 @@ enum Repr
   HeapSetHeader  # pointer to a heap Set header
   Inline         # stored field-by-field inline (structs, tagged enums, tuples)
   TaggedPtr      # reserved: pointer with tag bits (not used by the engine today)
-  OpaquePtr      # opaque pointer-sized handle (Dyn/Effect/Function)
+  OpaquePtr      # opaque pointer-sized handle (Dyn/Effect/FnPtr/Closure)
   Invalid        # explicit INVALID representation: Var/Param/Error/unknown —
                  # unresolved types have no representation. Layout queries on
                  # Invalid MUST fail closed (panic ICE), never guess a word.
@@ -242,7 +244,6 @@ def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
   when Type::RefInternal(_, _) then Repr::RawPtr
   when Type::Ptr(_)        then Repr::RawPtr
   when Type::PtrMut(_)     then Repr::RawPtr
-  when Type::Function(_, _) then Repr::OpaquePtr
   when Type::FnPtr(_, _) then Repr::OpaquePtr
   when Type::Closure(_, _, _, _) then Repr::OpaquePtr
   when Type::Dyn(_)        then Repr::OpaquePtr
@@ -362,7 +363,6 @@ def repr_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::TaggedPtr   then engine.target.pointer_size
   when Repr::OpaquePtr   then
     match ty
-    when Type::Function(_, _) then engine.target.fn_ptr_size
   when Type::FnPtr(_, _) then engine.target.fn_ptr_size
   when Type::Closure(_, _, _, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
@@ -887,7 +887,6 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::TaggedPtr   then engine.target.pointer_size
   when Repr::OpaquePtr   then
     match ty
-    when Type::Function(_, _) then engine.target.fn_ptr_size
   when Type::FnPtr(_, _) then engine.target.fn_ptr_size
   when Type::Closure(_, _, _, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
@@ -1020,7 +1019,6 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
   when Repr::TaggedPtr   then pointer_layout(engine)
   when Repr::OpaquePtr   then
     match ty
-    when Type::Function(_, _) then fn_ptr_layout(engine)
   when Type::FnPtr(_, _) then fn_ptr_layout(engine)
   when Type::Closure(_, _, _, _) then fn_ptr_layout(engine)
     when _ then pointer_layout(engine)
@@ -1608,6 +1606,98 @@ def compute_struct_layout(engine: &mut LayoutEngine, ty: &Type, fields: &Vec[Mir
     payload_offset: 0,
     hash: hash
   }
+end
+
+# ———————————————————————————————————————————————————————————————
+# P1: the Closure-Object Layout — { code: fn ptr @ 0, env: capture-tuple }
+# ———————————————————————————————————————————————————————————————
+# The closure OBJECT's layout, REGISTERED BY the closure's identity (the
+# ClosureId-keyed concrete key of the Type::Closure — the SAME identity the
+# MIR's AggregateKind::Closure(ClosureId) and the closure-call dispatch
+# use): field 0 is the CODE pointer (one pointer-width slot), and the ENV
+# (the CAPTURE TUPLE — the closure type's 4th payload) is stored INLINE
+# after it, at the capture tuple's concrete layout offsets. Computed on
+# demand and cached in engine.records under the closure's key; codegen's
+# build_all_layouts registers the object's size/field tables from this
+# record, and the aggregate emission (codegen_aggregate's general path) and
+# the closure dispatch (codegen_indirect_callee) resolve the field offsets
+# through those tables. The closure VALUE itself stays a single pointer to
+# this object (classify_value_category's Closure arm — the pointer-width
+# slot); the object's record is never the value's own layout.
+def closure_object_record(engine: &mut LayoutEngine, ty: &Type) -> LayoutRecord
+  match ty
+  when Type::Closure(cid, _, _, captures) then
+    let ckey = mir_type_identity_key(ty)
+    match engine.records.get(ckey.clone())
+    when Option::Some(rec) then rec.clone()
+    when Option::None then
+      # The env: the capture tuple's element types, in tuple order.
+      var env_fields: Vec[Type] = Vec::new()
+      match captures
+      when Type::Tuple(caps) then
+        for c in caps do
+          env_fields.push(c.clone())
+        end
+      when _ then ()
+      end
+      let tl = compute_tuple_layout(engine, env_fields)
+      # Field 0: the code pointer.
+      var field_layouts = Vec::new()
+      var current_offset = 0
+      var max_align = engine.target.pointer_align
+      field_layouts.push(FieldLayout {
+        name: "code".to_string(),
+        offset: 0,
+        size: engine.target.pointer_size,
+        align: engine.target.pointer_align,
+        type_id: -1
+      })
+      current_offset = engine.target.pointer_size
+      # The env's base is aligned to the capture tuple's alignment; the
+      # env fields follow at the tuple's concrete offsets.
+      let env_base = layout_align_up(current_offset, tl.align)
+      if tl.align > max_align then max_align = tl.align end
+      var env_idx = 0
+      while env_idx < env_fields.len() do
+        let f_size = repr_storage_size(engine, env_fields[env_idx])
+        let f_align = repr_storage_align(engine, env_fields[env_idx])
+        if f_align > max_align then max_align = f_align end
+        let f_off = if env_idx < tl.field_offsets.len() then tl.field_offsets[env_idx] else 0 end
+        field_layouts.push(FieldLayout {
+          name: env_idx.to_string(),
+          offset: env_base + f_off,
+          size: f_size,
+          align: f_align,
+          type_id: extract_type_id(env_fields[env_idx])
+        })
+        env_idx = env_idx + 1
+      end
+      let total_size = layout_align_up(env_base + tl.size, max_align)
+      let rec_name = "closure#" + cid.id.to_string()
+      let rec_hash = compute_layout_hash(&rec_name, total_size, max_align, field_layouts.len())
+      let rec = LayoutRecord {
+        type_id: -1,
+        name: rec_name,
+        category: LayoutCategory::InlineStruct,
+        repr: Repr::Inline,
+        size: total_size,
+        align: max_align,
+        stride: total_size,
+        field_count: field_layouts.len(),
+        fields: field_layouts,
+        variants: Vec::new(),
+        tag_offset: 0,
+        tag_size: 0,
+        header_size: 0,
+        payload_offset: 0,
+        hash: rec_hash
+      }
+      engine.records.insert(ckey, rec.clone())
+      rec
+    end
+  when _ then
+    panic("layout: closure_object_record requires a Type::Closure")
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2371,9 +2461,12 @@ def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[Valu
     Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
   when Repr::OpaquePtr then
     match ty
-    when Type::Function(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
   when Type::FnPtr(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
-  when Type::Closure(_, _, _, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
+  # P1 (the closure {code, env} ABI): the closure VALUE is ONE pointer to
+  # the closure OBJECT ({ code: fn ptr @ 0, env: capture-tuple } — the
+  # object's layout is registered by the ClosureId), so the value crosses
+  # in one pointer-width slot.
+  when Type::Closure(_, _, _, _) then Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
     when _ then Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
     end
   when Repr::Inline then

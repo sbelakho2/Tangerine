@@ -995,12 +995,16 @@ end
 #   - str-typed operands (&str params, str_* intrinsics) are RAW pointers
 #     to NUL-terminated bytes — the static StrView form (interned
 #     literals), borrowed buffers, OS argv.
-# A string LITERAL is the static StrView (raw label); the conversion to an
-# owned String is the explicit owned clone: _tg_string_from_static (and
-# the std's from_str_view path). Literal consumers that demand an owned
-# String (by-value String params, String destinations, concat results,
-# to_string, clone) go through the owned conversion — never through the
-# Array runtime.
+# A string LITERAL is the static StrView (raw label — MIR carries the
+# constant with Type::StrView, the view type, never the owned String); the
+# conversion to an owned String is the explicit typed coercion:
+# _tg_string_from_static (and the std's from_str_view path). Literal
+# consumers that promise an owned String (by-value String params, String
+# destinations, aggregate fields whose destination type is the owned
+# String — struct/enum/tuple/array/vec! — concat results, to_string,
+# clone) go through the owned coercion — never through the Array runtime.
+# String::slice / str::slice delegate to _tg_string_slice, which returns an
+# OWNED String object (the raw-buffer slice emitter is deleted).
 #
 # Every String object is arena-managed (bump alloc; reclaimed with the
 # arena) — there is NO per-value free, and no runtime function below ever
@@ -1832,6 +1836,1275 @@ def emit_tg_string_wrap(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
+# _tg_string_slice: Extract a substring and return it as an OWNED String
+# object (P0-STRING — the owned slice). Computes sub_len = end - start
+# (clamped to 0 when end < start), allocates the 32-byte String object
+# header AND a sub_len+1 byte data buffer, copies the selected bytes from
+# the raw source, NUL-terminates, fills the header {data, len, cap, stride}
+# (cap = sub_len — the exact-fit buffer grows on demand), and returns the
+# OBJECT HANDLE. A function returning String must return the String-object
+# handle — the old raw-buffer (len+1 bytes + NUL, returned as a bare byte
+# pointer) path is deleted.
+# Args: x0/rdi = raw source byte pointer (the str view — an interned
+#       literal label or a String object's data pointer), x1/rsi = start,
+#       x2/rdx = end.
+# Returns: x0/rax = owned String object (the header pointer).
+def emit_tg_string_slice(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_string_slice")
+
+  let lbl_loop = fresh_label(ctx, ".Lstr_slice_loop")
+  let lbl_done = fresh_label(ctx, ".Lstr_slice_done")
+  let lbl_safe = fresh_label(ctx, ".Lstr_slice_safe")
+  let lbl_copy = fresh_label(ctx, ".Lstr_slice_copy")
+  let lbl_copydone = fresh_label(ctx, ".Lstr_slice_copy_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # src base (raw bytes)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)   # start
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)   # end
+    # x22 = sub_len = end - start; if start > end, clamp to 0.
+    a64_sub_rrr(&mut ctx.text, A64::X22, A64::X21, A64::X20)
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X20)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_safe.clone())
+    a64_mov_ri(&mut ctx.text, A64::X22, 0)
+    def_label(&mut ctx.text, lbl_safe.clone())
+    # src = data + start
+    a64_add_rrr(&mut ctx.text, A64::X19, A64::X19, A64::X20)
+
+    # Allocate the String object header (32 bytes) — X23 is callee-saved
+    # and survives the second alloc call.
+    a64_mov_ri(&mut ctx.text, A64::X0, 32)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X0)   # header
+
+    # Allocate the data buffer: sub_len + 1 bytes (NUL room)
+    a64_add_rri(&mut ctx.text, A64::X0, A64::X22, 1)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X24, A64::X0)   # new data base
+
+    # Copy sub_len bytes from src to the new buffer (x11 = offset)
+    a64_mov_ri(&mut ctx.text, A64::X11, 0)
+    def_label(&mut ctx.text, lbl_loop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X11, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_done.clone())
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X19, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X13, A64::X12, 0)
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X24, A64::X11)
+    a64_strb(&mut ctx.text, A64::X13, A64::X12, 0)
+    a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 1)
+    a64_b(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+    # NUL at data[sub_len]
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X24, A64::X22)
+    a64_strb(&mut ctx.text, A64::XZR, A64::X11, 0)
+
+    # Fill the header { data, len, cap, stride }
+    a64_stur(&mut ctx.text, A64::X24, A64::X23, 0)   # data
+    a64_stur(&mut ctx.text, A64::X22, A64::X23, 8)   # len
+    a64_stur(&mut ctx.text, A64::X22, A64::X23, 16)  # cap = len (exact fit)
+    a64_mov_ri(&mut ctx.text, A64::X11, 1)
+    a64_stur(&mut ctx.text, A64::X11, A64::X23, 24)  # stride = 1
+
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)     # return the object
+
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # src base (raw bytes)
+    # rcx = sub_len = end - start; if start > end, clamp to 0.
+    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RSI)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_safe.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_safe.clone())
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RDX)
+    x64_sub_rr(&mut ctx.text, X64::RCX, X64::RSI)
+    def_label(&mut ctx.text, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RCX)   # sub_len
+    x64_add_rr(&mut ctx.text, X64::RBX, X64::RSI)   # src = data + start
+
+    # Allocate the String object header (32 bytes)
+    x64_mov_ri(&mut ctx.text, X64::RDI, 32)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RAX)   # header
+
+    # Allocate the data buffer: sub_len + 1 bytes (NUL room)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)   # new data base
+
+    # Copy sub_len bytes from src to the new buffer (rcx = offset)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_copy.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::R12)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_copydone.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    x64_mov_m8_r8(&mut ctx.text, X64::RDX, 0, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_copy.clone())
+    def_label(&mut ctx.text, lbl_copydone.clone())
+    # NUL at data[sub_len]
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_m8_r8(&mut ctx.text, X64::RAX, 0, X64::RCX)
+
+    # Fill the header { data, len, cap, stride }
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::R14)   # data
+    x64_mov_mr(&mut ctx.text, X64::R13, 8, X64::R12)   # len
+    x64_mov_mr(&mut ctx.text, X64::R13, 16, X64::R12)  # cap = len (exact fit)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 1)
+    x64_mov_mr(&mut ctx.text, X64::R13, 24, X64::RCX)  # stride = 1
+
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)      # return the object
+
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_string_trim: Trim ASCII whitespace (space, tab, CR, LF) from both
+# ends of an OWNED String object and return a NEW owned String object with
+# the trimmed span (the input is borrowed — the result is a fresh object
+# whose buffer holds the trimmed bytes). The whitespace scan reads the
+# object header's data/len; the span is extracted through _tg_string_slice
+# (the same owned-slice path the std's slice uses).
+# Args: x0/rdi = owned String object.
+# Returns: x0/rax = owned String object (the trimmed result).
+def emit_tg_string_trim(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_string_trim")
+
+  let lbl_loop = fresh_label(ctx, ".Lstr_trim_loop")
+  let lbl_loop2 = fresh_label(ctx, ".Lstr_trim_loop2")
+  let lbl_wsend = fresh_label(ctx, ".Lstr_trim_wsend")
+  let lbl_done = fresh_label(ctx, ".Lstr_trim_done")
+  let lbl_done2 = fresh_label(ctx, ".Lstr_trim_done2")
+  let lbl_slice = fresh_label(ctx, ".Lstr_trim_slice")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # object
+    a64_ldur(&mut ctx.text, A64::X20, A64::X19, 0) # data
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8) # len
+    a64_mov_ri(&mut ctx.text, A64::X22, 0)         # start
+
+    # Advance start while data[start] is whitespace.
+    def_label(&mut ctx.text, lbl_loop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X22, A64::X21)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_done.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X22)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x20)  # ' '
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_slice.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x09)  # '\t'
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_slice.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x0D)  # '\r'
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_slice.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x0A)  # '\n'
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_slice.clone())
+    a64_b(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_slice.clone())
+    a64_add_rri(&mut ctx.text, A64::X22, A64::X22, 1)
+    a64_b(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+
+    # Retreat end while data[end-1] is whitespace (end stays >= start).
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8)
+    def_label(&mut ctx.text, lbl_loop2.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_done2.clone())
+    a64_sub_rri(&mut ctx.text, A64::X11, A64::X21, 1)
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x20)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_wsend.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x09)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_wsend.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x0D)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_wsend.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0x0A)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_wsend.clone())
+    a64_b(&mut ctx.text, lbl_done2.clone())
+    def_label(&mut ctx.text, lbl_wsend.clone())
+    a64_sub_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_b(&mut ctx.text, lbl_loop2.clone())
+    def_label(&mut ctx.text, lbl_done2.clone())
+
+    # Extract the span through the owned-slice path.
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X22)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X21)
+    a64_bl(&mut ctx.text, "_tg_string_slice")
+
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # object
+    x64_mov_rm(&mut ctx.text, X64::R12, X64::RBX, 0) # data
+    x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 8) # len
+    x64_mov_ri(&mut ctx.text, X64::R14, 0)           # start
+
+    def_label(&mut ctx.text, lbl_loop.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R14, X64::R13)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x20)
+    x64_jcc(&mut ctx.text, CC::E, lbl_slice.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x09)
+    x64_jcc(&mut ctx.text, CC::E, lbl_slice.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x0D)
+    x64_jcc(&mut ctx.text, CC::E, lbl_slice.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x0A)
+    x64_jcc(&mut ctx.text, CC::E, lbl_slice.clone())
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_slice.clone())
+    x64_add_ri(&mut ctx.text, X64::R14, 1)
+    x64_jmp(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+
+    x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 8)
+    def_label(&mut ctx.text, lbl_loop2.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R13, X64::R14)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_done2.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 1)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x20)
+    x64_jcc(&mut ctx.text, CC::E, lbl_wsend.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x09)
+    x64_jcc(&mut ctx.text, CC::E, lbl_wsend.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x0D)
+    x64_jcc(&mut ctx.text, CC::E, lbl_wsend.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0x0A)
+    x64_jcc(&mut ctx.text, CC::E, lbl_wsend.clone())
+    x64_jmp(&mut ctx.text, lbl_done2.clone())
+    def_label(&mut ctx.text, lbl_wsend.clone())
+    x64_sub_ri(&mut ctx.text, X64::R13, 1)
+    x64_jmp(&mut ctx.text, lbl_loop2.clone())
+    def_label(&mut ctx.text, lbl_done2.clone())
+
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R14)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R13)
+    x64_call_label(&mut ctx.text, "_tg_string_slice")
+
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_string_trim_matches: Trim every byte of the pattern string from both
+# ends of an OWNED String object and return a NEW owned String object with
+# the trimmed span (the same owned-slice extraction as _tg_string_trim; a
+# byte of the input is trimmed when it equals ANY pattern byte). An empty
+# pattern trims nothing (the full span is copied).
+# Args: x0/rdi = owned String object, x1/rsi = raw pattern bytes (the
+#       static StrView or a String object's data pointer — NUL-terminated).
+# Returns: x0/rax = owned String object (the trimmed result).
+def emit_tg_string_trim_matches(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_string_trim_matches")
+
+  let lbl_loop = fresh_label(ctx, ".Lstr_trimch_loop")
+  let lbl_loop2 = fresh_label(ctx, ".Lstr_trimch_loop2")
+  let lbl_pat = fresh_label(ctx, ".Lstr_trimch_pat")
+  let lbl_pat2 = fresh_label(ctx, ".Lstr_trimch_pat2")
+  let lbl_patend = fresh_label(ctx, ".Lstr_trimch_patend")
+  let lbl_patnext = fresh_label(ctx, ".Lstr_trimch_patnext")
+  let lbl_patnext2 = fresh_label(ctx, ".Lstr_trimch_patnext2")
+  let lbl_done = fresh_label(ctx, ".Lstr_trimch_done")
+  let lbl_done2 = fresh_label(ctx, ".Lstr_trimch_done2")
+  let lbl_slice = fresh_label(ctx, ".Lstr_trimch_slice")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # object
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X1)   # pattern
+    a64_ldur(&mut ctx.text, A64::X20, A64::X19, 0) # data
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8) # len
+    a64_mov_ri(&mut ctx.text, A64::X22, 0)         # start
+
+    # Advance start while data[start] is a pattern byte.
+    def_label(&mut ctx.text, lbl_loop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X22, A64::X21)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_done.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X22)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_mov_ri(&mut ctx.text, A64::X13, 0)
+    def_label(&mut ctx.text, lbl_pat.clone())
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X23, A64::X13)
+    a64_ldrb(&mut ctx.text, A64::X15, A64::X14, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X15, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_done.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X12)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_slice.clone())
+    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    a64_b(&mut ctx.text, lbl_pat.clone())
+    def_label(&mut ctx.text, lbl_slice.clone())
+    a64_add_rri(&mut ctx.text, A64::X22, A64::X22, 1)
+    a64_b(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+
+    # Retreat end while data[end-1] is a pattern byte (end stays >= start).
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8)
+    def_label(&mut ctx.text, lbl_loop2.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_done2.clone())
+    a64_sub_rri(&mut ctx.text, A64::X11, A64::X21, 1)
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_mov_ri(&mut ctx.text, A64::X13, 0)
+    def_label(&mut ctx.text, lbl_pat2.clone())
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X23, A64::X13)
+    a64_ldrb(&mut ctx.text, A64::X15, A64::X14, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X15, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_done2.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X12)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_patend.clone())
+    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    a64_b(&mut ctx.text, lbl_pat2.clone())
+    def_label(&mut ctx.text, lbl_patend.clone())
+    a64_sub_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_b(&mut ctx.text, lbl_loop2.clone())
+    def_label(&mut ctx.text, lbl_done2.clone())
+
+    # Extract the span through the owned-slice path.
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X22)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X21)
+    a64_bl(&mut ctx.text, "_tg_string_slice")
+
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # object
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RSI)   # pattern
+    x64_mov_rm(&mut ctx.text, X64::R12, X64::RBX, 0) # data
+    x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 8) # len
+    x64_mov_ri(&mut ctx.text, X64::R14, 0)           # start
+
+    def_label(&mut ctx.text, lbl_loop.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R14, X64::R13)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_pat.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R15)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RDX, X64::RDX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RDX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_done.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_slice.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_pat.clone())
+    def_label(&mut ctx.text, lbl_slice.clone())
+    x64_add_ri(&mut ctx.text, X64::R14, 1)
+    x64_jmp(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+
+    x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 8)
+    def_label(&mut ctx.text, lbl_loop2.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R13, X64::R14)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_done2.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 1)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_pat2.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R15)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RDX, X64::RDX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RDX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_done2.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_patend.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_pat2.clone())
+    def_label(&mut ctx.text, lbl_patend.clone())
+    x64_sub_ri(&mut ctx.text, X64::R13, 1)
+    x64_jmp(&mut ctx.text, lbl_loop2.clone())
+    def_label(&mut ctx.text, lbl_done2.clone())
+
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R14)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R13)
+    x64_call_label(&mut ctx.text, "_tg_string_slice")
+
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_string_tolower: Map the ASCII uppercase bytes (A-Z) of an OWNED
+# String object to their lowercase forms and return a NEW owned String
+# object with the mapped bytes (non-ASCII bytes pass through unchanged;
+# the input is borrowed). The result is a fresh object — the String ABI's
+# NUL-terminated buffer and {data, len, cap, stride} header.
+# Args: x0/rdi = owned String object.
+# Returns: x0/rax = owned String object (the mapped result).
+def emit_tg_string_tolower(ctx: &mut RuntimeEmitCtx) -> Unit
+  emit_tg_string_case_map(ctx, "_tg_string_tolower", 32)
+end
+
+# _tg_string_toupper: Map the ASCII lowercase bytes (a-z) of an OWNED
+# String object to their uppercase forms and return a NEW owned String
+# object with the mapped bytes (non-ASCII bytes pass through unchanged;
+# the input is borrowed).
+# Args: x0/rdi = owned String object.
+# Returns: x0/rax = owned String object (the mapped result).
+def emit_tg_string_toupper(ctx: &mut RuntimeEmitCtx) -> Unit
+  emit_tg_string_case_map(ctx, "_tg_string_toupper", -32)
+end
+
+# The shared ASCII case-map body (delta = +32 lowercases A-Z; -32
+# uppercases a-z): allocates the object header + a len+1 buffer, maps each
+# byte in the range, NUL-terminates, fills the header, returns the object.
+def emit_tg_string_case_map(ctx: &mut RuntimeEmitCtx, fn_name: String, delta: Int) -> Unit
+  def_runtime_fn(ctx, fn_name)
+
+  let lbl_loop = fresh_label(ctx, ".Lstr_case_loop")
+  let lbl_upper = fresh_label(ctx, ".Lstr_case_upper")
+  let lbl_lower = fresh_label(ctx, ".Lstr_case_lower")
+  let lbl_done = fresh_label(ctx, ".Lstr_case_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # object
+    a64_ldur(&mut ctx.text, A64::X20, A64::X19, 0) # data
+    a64_ldur(&mut ctx.text, A64::X21, A64::X19, 8) # len
+
+    a64_mov_ri(&mut ctx.text, A64::X0, 32)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X0)   # header
+
+    a64_add_rri(&mut ctx.text, A64::X0, A64::X21, 1)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X0)   # new data base
+
+    a64_mov_ri(&mut ctx.text, A64::X24, 0)         # i
+    def_label(&mut ctx.text, lbl_loop.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X24, A64::X21)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_done.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X24)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    if delta > 0 then
+      a64_cmp_ri(&mut ctx.text, A64::X12, 0x41)   # 'A'
+      a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_lower.clone())
+      a64_cmp_ri(&mut ctx.text, A64::X12, 0x5A)   # 'Z'
+      a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_lower.clone())
+      a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 0x20)
+    else
+      a64_cmp_ri(&mut ctx.text, A64::X12, 0x61)   # 'a'
+      a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_upper.clone())
+      a64_cmp_ri(&mut ctx.text, A64::X12, 0x7A)   # 'z'
+      a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_upper.clone())
+      a64_sub_rri(&mut ctx.text, A64::X12, A64::X12, 0x20)
+    end
+    def_label(&mut ctx.text, lbl_lower.clone())
+    def_label(&mut ctx.text, lbl_upper.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X23, A64::X24)
+    a64_strb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_add_rri(&mut ctx.text, A64::X24, A64::X24, 1)
+    a64_b(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X23, A64::X21)
+    a64_strb(&mut ctx.text, A64::XZR, A64::X11, 0)   # NUL
+
+    a64_stur(&mut ctx.text, A64::X23, A64::X22, 0)   # data
+    a64_stur(&mut ctx.text, A64::X21, A64::X22, 8)   # len
+    a64_stur(&mut ctx.text, A64::X21, A64::X22, 16)  # cap = len
+    a64_mov_ri(&mut ctx.text, A64::X11, 1)
+    a64_stur(&mut ctx.text, A64::X11, A64::X22, 24)  # stride = 1
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X22)
+
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # object
+    x64_mov_rm(&mut ctx.text, X64::R12, X64::RBX, 0) # data
+    x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 8) # len
+
+    x64_mov_ri(&mut ctx.text, X64::RDI, 32)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)   # header
+
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RAX)   # new data base (rbx free now)
+
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)          # i
+    def_label(&mut ctx.text, lbl_loop.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::R13)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    if delta > 0 then
+      x64_cmp_ri(&mut ctx.text, X64::RAX, 0x41)
+      x64_jcc(&mut ctx.text, CC::L, lbl_lower.clone())
+      x64_cmp_ri(&mut ctx.text, X64::RAX, 0x5A)
+      x64_jcc(&mut ctx.text, CC::G, lbl_lower.clone())
+      x64_add_ri(&mut ctx.text, X64::RAX, 0x20)
+    else
+      x64_cmp_ri(&mut ctx.text, X64::RAX, 0x61)
+      x64_jcc(&mut ctx.text, CC::L, lbl_upper.clone())
+      x64_cmp_ri(&mut ctx.text, X64::RAX, 0x7A)
+      x64_jcc(&mut ctx.text, CC::G, lbl_upper.clone())
+      x64_sub_ri(&mut ctx.text, X64::RAX, 0x20)
+    end
+    def_label(&mut ctx.text, lbl_lower.clone())
+    def_label(&mut ctx.text, lbl_upper.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    x64_mov_m8_r8(&mut ctx.text, X64::RDX, 0, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_loop.clone())
+    def_label(&mut ctx.text, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_m8_r8(&mut ctx.text, X64::RAX, 0, X64::RCX)   # NUL
+
+    x64_mov_mr(&mut ctx.text, X64::R14, 0, X64::RBX)      # data
+    x64_mov_mr(&mut ctx.text, X64::R14, 8, X64::R13)      # len
+    x64_mov_mr(&mut ctx.text, X64::R14, 16, X64::R13)     # cap = len
+    x64_mov_ri(&mut ctx.text, X64::RCX, 1)
+    x64_mov_mr(&mut ctx.text, X64::R14, 24, X64::RCX)     # stride = 1
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
+
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_string_replace: Byte-pattern replacement over an OWNED String object:
+# every non-overlapping occurrence of the `from` pattern (raw NUL-
+# terminated bytes) is replaced by the `to` bytes, and the result is a NEW
+# owned String object (the input is borrowed). An empty `from` pattern
+# replaces nothing (the object is cloned). The result buffer is sized
+# exactly (slen - n*flen + n*tlen) and NUL-terminated.
+# Args: x0/rdi = owned String object, x1/rsi = raw `from` bytes,
+#       x2/rdx = raw `to` bytes.
+# Returns: x0/rax = owned String object (the replaced result).
+def emit_tg_string_replace(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_string_replace")
+
+  let lbl_flen = fresh_label(ctx, ".Lstr_rep_flen")
+  let lbl_flen_next = fresh_label(ctx, ".Lstr_rep_flen_next")
+  let lbl_tlen = fresh_label(ctx, ".Lstr_rep_tlen")
+  let lbl_tlen_next = fresh_label(ctx, ".Lstr_rep_tlen_next")
+  let lbl_epilogue = fresh_label(ctx, ".Lstr_rep_epilogue")
+  let lbl_cnt = fresh_label(ctx, ".Lstr_rep_cnt")
+  let lbl_count_start = fresh_label(ctx, ".Lstr_rep_count_start")
+  let lbl_cnt_outer = fresh_label(ctx, ".Lstr_rep_cnt_outer")
+  let lbl_cnt_cmp = fresh_label(ctx, ".Lstr_rep_cnt_cmp")
+  let lbl_cnt_match = fresh_label(ctx, ".Lstr_rep_cnt_match")
+  let lbl_cnt_advance = fresh_label(ctx, ".Lstr_rep_cnt_advance")
+  let lbl_count_done = fresh_label(ctx, ".Lstr_rep_count_done")
+  let lbl_bld = fresh_label(ctx, ".Lstr_rep_bld")
+  let lbl_bld_cmp = fresh_label(ctx, ".Lstr_rep_bld_cmp")
+  let lbl_bld_match = fresh_label(ctx, ".Lstr_rep_bld_match")
+  let lbl_bld_cpto = fresh_label(ctx, ".Lstr_rep_bld_cpto")
+  let lbl_bld_md = fresh_label(ctx, ".Lstr_rep_bld_md")
+  let lbl_bld_byte = fresh_label(ctx, ".Lstr_rep_bld_byte")
+  let lbl_tail = fresh_label(ctx, ".Lstr_rep_tail")
+  let lbl_finish = fresh_label(ctx, ".Lstr_rep_finish")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+
+    a64_ldur(&mut ctx.text, A64::X19, A64::X0, 0)  # data
+    a64_ldur(&mut ctx.text, A64::X20, A64::X0, 8)  # slen
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X1)   # from
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X2)   # to
+
+    # flen = strlen(from) -> x23
+    a64_mov_ri(&mut ctx.text, A64::X23, 0)
+    def_label(&mut ctx.text, lbl_flen.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X21, A64::X23)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_tlen.clone())
+    a64_add_rri(&mut ctx.text, A64::X23, A64::X23, 1)
+    a64_b(&mut ctx.text, lbl_flen.clone())
+    # tlen = strlen(to) -> x24
+    def_label(&mut ctx.text, lbl_tlen.clone())
+    a64_mov_ri(&mut ctx.text, A64::X24, 0)
+    def_label(&mut ctx.text, lbl_tlen_next.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X22, A64::X24)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_cnt.clone())
+    a64_add_rri(&mut ctx.text, A64::X24, A64::X24, 1)
+    a64_b(&mut ctx.text, lbl_tlen_next.clone())
+    # Empty `from` pattern: nothing to replace — an owned clone of the
+    # object is the no-op result (x0 still holds the object).
+    def_label(&mut ctx.text, lbl_cnt.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_count_start.clone())
+    a64_bl(&mut ctx.text, "_tg_string_clone")
+    a64_b(&mut ctx.text, lbl_epilogue.clone())
+
+    # Count occurrences: n in x11; cursor in x12; limit = data+slen-flen.
+    def_label(&mut ctx.text, lbl_count_start.clone())
+    a64_mov_ri(&mut ctx.text, A64::X11, 0)
+    a64_mov_rr(&mut ctx.text, A64::X12, A64::X19)
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X19, A64::X20)
+    a64_sub_rrr(&mut ctx.text, A64::X13, A64::X13, A64::X23)
+    def_label(&mut ctx.text, lbl_cnt_outer.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X13)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_count_done.clone())
+    a64_mov_ri(&mut ctx.text, A64::X14, 0)   # j
+    def_label(&mut ctx.text, lbl_cnt_cmp.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X14, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_cnt_match.clone())
+    a64_add_rrr(&mut ctx.text, A64::X15, A64::X12, A64::X14)
+    a64_ldrb(&mut ctx.text, A64::X15, A64::X15, 0)
+    a64_add_rrr(&mut ctx.text, A64::X16, A64::X21, A64::X14)
+    a64_ldrb(&mut ctx.text, A64::X16, A64::X16, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X16)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_cnt_advance.clone())
+    a64_add_rri(&mut ctx.text, A64::X14, A64::X14, 1)
+    a64_b(&mut ctx.text, lbl_cnt_cmp.clone())
+    def_label(&mut ctx.text, lbl_cnt_match.clone())
+    a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 1)
+    a64_add_rr(&mut ctx.text, A64::X12, A64::X12, A64::X23)
+    a64_b(&mut ctx.text, lbl_cnt_outer.clone())
+    def_label(&mut ctx.text, lbl_cnt_advance.clone())
+    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
+    a64_b(&mut ctx.text, lbl_cnt_outer.clone())
+
+    # result_len = slen - n*flen + n*tlen (n saved in x18; result in x11)
+    def_label(&mut ctx.text, lbl_count_done.clone())
+    a64_mov_rr(&mut ctx.text, A64::X18, A64::X11)   # save n
+    a64_mul_rrr(&mut ctx.text, A64::X15, A64::X11, A64::X23)
+    a64_sub_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X15)
+    a64_mul_rrr(&mut ctx.text, A64::X15, A64::X18, A64::X24)
+    a64_add_rr(&mut ctx.text, A64::X11, A64::X11, A64::X15)
+
+    # Allocate the object header (x25) and the result buffer (x26).
+    a64_mov_ri(&mut ctx.text, A64::X0, 32)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X25, A64::X0)   # header
+    a64_add_rri(&mut ctx.text, A64::X0, A64::X11, 1)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X26, A64::X0)   # out base
+
+    # Build: src cursor in x12, dst cursor in x13, match limit in x14.
+    a64_mov_rr(&mut ctx.text, A64::X12, A64::X19)
+    a64_mov_rr(&mut ctx.text, A64::X13, A64::X26)
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X19, A64::X20)
+    a64_sub_rrr(&mut ctx.text, A64::X14, A64::X14, A64::X23)
+    def_label(&mut ctx.text, lbl_bld.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X14)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_tail.clone())
+    a64_mov_ri(&mut ctx.text, A64::X15, 0)   # j
+    def_label(&mut ctx.text, lbl_bld_cmp.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_bld_match.clone())
+    a64_add_rrr(&mut ctx.text, A64::X16, A64::X12, A64::X15)
+    a64_ldrb(&mut ctx.text, A64::X16, A64::X16, 0)
+    a64_add_rrr(&mut ctx.text, A64::X17, A64::X21, A64::X15)
+    a64_ldrb(&mut ctx.text, A64::X17, A64::X17, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X16, A64::X17)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_bld_byte.clone())
+    a64_add_rri(&mut ctx.text, A64::X15, A64::X15, 1)
+    a64_b(&mut ctx.text, lbl_bld_cmp.clone())
+    def_label(&mut ctx.text, lbl_bld_match.clone())
+    # copy tlen bytes from `to` to dst
+    a64_mov_ri(&mut ctx.text, A64::X15, 0)
+    def_label(&mut ctx.text, lbl_bld_cpto.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X24)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_bld_md.clone())
+    a64_add_rrr(&mut ctx.text, A64::X16, A64::X22, A64::X15)
+    a64_ldrb(&mut ctx.text, A64::X16, A64::X16, 0)
+    a64_add_rrr(&mut ctx.text, A64::X17, A64::X13, A64::X15)
+    a64_strb(&mut ctx.text, A64::X16, A64::X17, 0)
+    a64_add_rri(&mut ctx.text, A64::X15, A64::X15, 1)
+    a64_b(&mut ctx.text, lbl_bld_cpto.clone())
+    def_label(&mut ctx.text, lbl_bld_md.clone())
+    a64_add_rr(&mut ctx.text, A64::X13, A64::X13, A64::X24)
+    a64_add_rr(&mut ctx.text, A64::X12, A64::X12, A64::X23)
+    a64_b(&mut ctx.text, lbl_bld.clone())
+    def_label(&mut ctx.text, lbl_bld_byte.clone())
+    a64_ldrb(&mut ctx.text, A64::X16, A64::X12, 0)
+    a64_strb(&mut ctx.text, A64::X16, A64::X13, 0)
+    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
+    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    a64_b(&mut ctx.text, lbl_bld.clone())
+    # tail: copy the remaining (< flen) bytes
+    def_label(&mut ctx.text, lbl_tail.clone())
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X19, A64::X20)
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X14)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_finish.clone())
+    a64_ldrb(&mut ctx.text, A64::X16, A64::X12, 0)
+    a64_strb(&mut ctx.text, A64::X16, A64::X13, 0)
+    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
+    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    a64_b(&mut ctx.text, lbl_tail.clone())
+
+    # NUL-terminate, fill the header {data, len, cap, stride}, return.
+    def_label(&mut ctx.text, lbl_finish.clone())
+    a64_strb(&mut ctx.text, A64::XZR, A64::X13, 0)
+    a64_stur(&mut ctx.text, A64::X26, A64::X25, 0)
+    a64_stur(&mut ctx.text, A64::X11, A64::X25, 8)
+    a64_stur(&mut ctx.text, A64::X11, A64::X25, 16)
+    a64_mov_ri(&mut ctx.text, A64::X15, 1)
+    a64_stur(&mut ctx.text, A64::X15, A64::X25, 24)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X25)
+    def_label(&mut ctx.text, lbl_epilogue.clone())
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_sub_ri(&mut ctx.text, X64::RSP, 40)   # [rbp-8]=flen, [rbp-16]=tlen, [rbp-24]=out, [rbp-32]=obj, [rbp-40]=slen
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_mr(&mut ctx.text, X64::RBP, -32, X64::RDI) # object
+    x64_mov_rm(&mut ctx.text, X64::RBX, X64::RDI, 0)   # data
+    x64_mov_rm(&mut ctx.text, X64::R12, X64::RDI, 8)   # slen
+    x64_mov_mr(&mut ctx.text, X64::RBP, -40, X64::R12) # slen (saved)
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RSI)      # from
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RDX)      # to
+
+    # flen = strlen(from) -> [rbp-8]
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_flen.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_tlen.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_flen.clone())
+    def_label(&mut ctx.text, lbl_tlen.clone())
+    x64_mov_mr(&mut ctx.text, X64::RBP, -8, X64::RCX)   # flen
+    # tlen = strlen(to) -> [rbp-16]
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    def_label(&mut ctx.text, lbl_tlen_next.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_cnt.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_tlen_next.clone())
+    # Empty `from` pattern: nothing to replace — an owned clone of the
+    # object is the no-op result.
+    def_label(&mut ctx.text, lbl_cnt.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -8)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_count_start.clone())
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBP, -32)
+    x64_call_label(&mut ctx.text, "_tg_string_clone")
+    x64_jmp(&mut ctx.text, lbl_epilogue.clone())
+
+    # Count occurrences: n in r15; cursor in rsi; limit in rdx.
+    def_label(&mut ctx.text, lbl_count_start.clone())
+    x64_mov_ri(&mut ctx.text, X64::R15, 0)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
+    x64_sub_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    def_label(&mut ctx.text, lbl_cnt_outer.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::G, lbl_count_done.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)   # j
+    def_label(&mut ctx.text, lbl_cnt_cmp.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -8)
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_cnt_match.clone())
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::RSI)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::R13)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R9, X64::R9, 0)
+    x64_cmp_rr(&mut ctx.text, X64::R8, X64::R9)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_cnt_advance.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_cnt_cmp.clone())
+    def_label(&mut ctx.text, lbl_cnt_match.clone())
+    x64_add_ri(&mut ctx.text, X64::R15, 1)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RCX)
+    x64_jmp(&mut ctx.text, lbl_cnt_outer.clone())
+    def_label(&mut ctx.text, lbl_cnt_advance.clone())
+    x64_add_ri(&mut ctx.text, X64::RSI, 1)
+    x64_jmp(&mut ctx.text, lbl_cnt_outer.clone())
+
+    # result_len = slen - n*flen + n*tlen (r15 = n; result in r12)
+    def_label(&mut ctx.text, lbl_count_done.clone())
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R15)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)   # n*flen
+    x64_sub_rr(&mut ctx.text, X64::R12, X64::RAX)    # slen - n*flen
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -16)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R15)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)   # n*tlen
+    x64_add_rr(&mut ctx.text, X64::R12, X64::RAX)    # result_len
+
+    # Allocate the object header (r15) and the result buffer ([rbp-24]).
+    x64_mov_ri(&mut ctx.text, X64::RDI, 32)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RAX)       # header
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_mr(&mut ctx.text, X64::RBP, -24, X64::RAX)  # out base
+
+    # Build: src cursor in rsi, dst cursor in rdi, match limit in rdx.
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBX)
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBP, -24)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
+    x64_sub_rr(&mut ctx.text, X64::RDX, X64::RCX)
+    def_label(&mut ctx.text, lbl_bld.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::G, lbl_tail.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)   # j
+    def_label(&mut ctx.text, lbl_bld_cmp.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -8)
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_bld_match.clone())
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::RSI)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::R13)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R9, X64::R9, 0)
+    x64_cmp_rr(&mut ctx.text, X64::R8, X64::R9)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_bld_byte.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_bld_cmp.clone())
+    def_label(&mut ctx.text, lbl_bld_match.clone())
+    # copy tlen bytes from `to` to dst
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)  # tlen
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)              # j
+    def_label(&mut ctx.text, lbl_bld_cpto.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_bld_md.clone())
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::RDI)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_mov_m8_r8(&mut ctx.text, X64::R9, 0, X64::R8)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_bld_cpto.clone())
+    def_label(&mut ctx.text, lbl_bld_md.clone())
+    x64_add_rr(&mut ctx.text, X64::RDI, X64::RAX)   # dst += tlen
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RCX)   # src += flen
+    x64_jmp(&mut ctx.text, lbl_bld.clone())
+    def_label(&mut ctx.text, lbl_bld_byte.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RSI, 0)
+    x64_mov_m8_r8(&mut ctx.text, X64::RDI, 0, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RSI, 1)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_jmp(&mut ctx.text, lbl_bld.clone())
+    # tail: copy the remaining (< flen) bytes (bound = data + SLEN)
+    def_label(&mut ctx.text, lbl_tail.clone())
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::RBP, -40)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RBX)
+    x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_finish.clone())
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RSI, 0)
+    x64_mov_m8_r8(&mut ctx.text, X64::RDI, 0, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RSI, 1)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_jmp(&mut ctx.text, lbl_tail.clone())
+
+    # NUL-terminate, fill the header {data, len, cap, stride}, return.
+    def_label(&mut ctx.text, lbl_finish.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_m8_r8(&mut ctx.text, X64::RDI, 0, X64::RCX)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -24)
+    x64_mov_mr(&mut ctx.text, X64::R15, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::R15, 8, X64::R12)
+    x64_mov_mr(&mut ctx.text, X64::R15, 16, X64::R12)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 1)
+    x64_mov_mr(&mut ctx.text, X64::R15, 24, X64::RCX)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R15)
+
+    def_label(&mut ctx.text, lbl_epilogue.clone())
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_add_ri(&mut ctx.text, X64::RSP, 40)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_string_split: Split an OWNED String object on a separator (raw
+# NUL-terminated bytes) into a Vec[String] of OWNED String objects — the
+# collection ABI result: the returned value is the Vec header pointer
+# {data@0, len@8, cap@16, stride@24} with stride 8 (each element is the
+# 8-byte handle of an owned String object produced by _tg_string_slice —
+# the same owned-slice path the std's slice uses). An EMPTY separator
+# splits into single characters (the std's documented behavior). The
+# input object is borrowed; every segment is a fresh owned object.
+# Args: x0/rdi = owned String object, x1/rsi = raw separator bytes.
+# Returns: x0/rax = Vec[String] handle.
+def emit_tg_string_split(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_string_split")
+
+  let lbl_seplen = fresh_label(ctx, ".Lstr_split_seplen")
+  let lbl_seplen_next = fresh_label(ctx, ".Lstr_split_seplen_next")
+  let lbl_chars = fresh_label(ctx, ".Lstr_split_chars")
+  let lbl_scan = fresh_label(ctx, ".Lstr_split_scan")
+  let lbl_cmp = fresh_label(ctx, ".Lstr_split_cmp")
+  let lbl_match = fresh_label(ctx, ".Lstr_split_match")
+  let lbl_next = fresh_label(ctx, ".Lstr_split_next")
+  let lbl_final = fresh_label(ctx, ".Lstr_split_final")
+  let lbl_done = fresh_label(ctx, ".Lstr_split_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+
+    a64_mov_ri(&mut ctx.text, A64::X19, 0)        # start
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # sep
+    a64_ldur(&mut ctx.text, A64::X21, A64::X0, 0) # data
+    a64_ldur(&mut ctx.text, A64::X22, A64::X0, 8) # slen
+
+    # seplen = strlen(sep) -> x23
+    a64_mov_ri(&mut ctx.text, A64::X23, 0)
+    def_label(&mut ctx.text, lbl_seplen.clone())
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X23)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X11, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X12, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_chars.clone())
+    a64_add_rri(&mut ctx.text, A64::X23, A64::X23, 1)
+    a64_b(&mut ctx.text, lbl_seplen.clone())
+
+    # The result Vec[String]: element stride 8 (the String-object handle).
+    def_label(&mut ctx.text, lbl_chars.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 8)
+    a64_bl(&mut ctx.text, "_tg_array_new")
+    a64_mov_rr(&mut ctx.text, A64::X24, A64::X0)  # vec
+    a64_mov_ri(&mut ctx.text, A64::X25, 0)        # i
+    # Empty separator: split into single characters.
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_chars2.clone())
+    a64_b(&mut ctx.text, lbl_scan.clone())
+    def_label(&mut ctx.text, lbl_chars2.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X25, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_done.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X25)
+    a64_add_rri(&mut ctx.text, A64::X2, A64::X25, 1)
+    a64_bl(&mut ctx.text, "_tg_string_slice")
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X0)   # segment handle
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)  # vec
+    a64_bl(&mut ctx.text, "_tg_array_push")
+    a64_add_rri(&mut ctx.text, A64::X25, A64::X25, 1)
+    a64_b(&mut ctx.text, lbl_chars2.clone())
+
+    # Non-empty separator: scan for occurrences; limit = data+slen-seplen.
+    def_label(&mut ctx.text, lbl_scan.clone())
+    a64_add_rrr(&mut ctx.text, A64::X26, A64::X21, A64::X22)
+    a64_sub_rrr(&mut ctx.text, A64::X26, A64::X26, A64::X23)
+    a64_mov_ri(&mut ctx.text, A64::X25, 0)
+    def_label(&mut ctx.text, lbl_cmp.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X25, A64::X26)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_final.clone())
+    a64_mov_ri(&mut ctx.text, A64::X11, 0)   # j
+    def_label(&mut ctx.text, lbl_next.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X11, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_match.clone())
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X21, A64::X25)
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X12, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X12, 0)
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X20, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X13, A64::X13, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X13)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_match2.clone())
+    a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 1)
+    a64_b(&mut ctx.text, lbl_next.clone())
+    # Match at i: push slice(data, start, i); i += seplen; start = i.
+    def_label(&mut ctx.text, lbl_match.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X19)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X25)
+    a64_bl(&mut ctx.text, "_tg_string_slice")
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)
+    a64_bl(&mut ctx.text, "_tg_array_push")
+    a64_add_rr(&mut ctx.text, A64::X25, A64::X25, A64::X23)
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X25)
+    a64_b(&mut ctx.text, lbl_cmp.clone())
+    # No match at i: advance one byte.
+    def_label(&mut ctx.text, lbl_match2.clone())
+    a64_add_rri(&mut ctx.text, A64::X25, A64::X25, 1)
+    a64_b(&mut ctx.text, lbl_cmp.clone())
+
+    # Final segment: slice(data, start, slen).
+    def_label(&mut ctx.text, lbl_final.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X19)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X22)
+    a64_bl(&mut ctx.text, "_tg_string_slice")
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)
+    a64_bl(&mut ctx.text, "_tg_array_push")
+
+    def_label(&mut ctx.text, lbl_done.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)   # return the Vec handle
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_sub_ri(&mut ctx.text, X64::RSP, 16)   # [rbp-8]=start, [rbp-16]=i
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -8, X64::RAX)  # start = 0
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RSI)      # sep
+    x64_mov_rm(&mut ctx.text, X64::RBX, X64::RDI, 0)   # data
+    x64_mov_rm(&mut ctx.text, X64::R12, X64::RDI, 8)   # slen
+
+    # seplen = strlen(sep) -> r14
+    x64_mov_ri(&mut ctx.text, X64::R14, 0)
+    def_label(&mut ctx.text, lbl_seplen.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RAX, 0)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_chars.clone())
+    x64_add_ri(&mut ctx.text, X64::R14, 1)
+    x64_jmp(&mut ctx.text, lbl_seplen.clone())
+
+    # The result Vec[String]: element stride 8 (the String-object handle).
+    def_label(&mut ctx.text, lbl_chars.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDI, 8)
+    x64_call_label(&mut ctx.text, "_tg_array_new")
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RAX)      # vec
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX) # i = 0
+    # Empty separator: split into single characters.
+    x64_cmp_ri(&mut ctx.text, X64::R14, 0)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_scan.clone())
+    def_label(&mut ctx.text, lbl_chars2.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_cmp_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RBX)
+    x64_mov_rm(&mut ctx.text, X64::RSI, X64::RBP, -16)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::RBP, -16)
+    x64_add_ri(&mut ctx.text, X64::RDX, 1)
+    x64_call_label(&mut ctx.text, "_tg_string_slice")
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RAX)      # segment handle
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)      # vec
+    x64_call_label(&mut ctx.text, "_tg_array_push")
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_add_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX)
+    x64_jmp(&mut ctx.text, lbl_chars2.clone())
+
+    # Non-empty separator: scan for occurrences; limit = data+slen-seplen.
+    def_label(&mut ctx.text, lbl_scan.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBX)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
+    x64_sub_rr(&mut ctx.text, X64::RDX, X64::R14)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX) # i = 0
+    def_label(&mut ctx.text, lbl_cmp.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_cmp_rr(&mut ctx.text, X64::RAX, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::G, lbl_final.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)   # j
+    def_label(&mut ctx.text, lbl_next.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::R14)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_match.clone())
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::RBP, -16)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RBX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::R13)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R9, X64::R9, 0)
+    x64_cmp_rr(&mut ctx.text, X64::R8, X64::R9)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_match2.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_next.clone())
+    # Match at i: push slice(data, start, i); i += seplen; start = i.
+    def_label(&mut ctx.text, lbl_match.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RBX)
+    x64_mov_rm(&mut ctx.text, X64::RSI, X64::RBP, -8)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::RBP, -16)
+    x64_call_label(&mut ctx.text, "_tg_string_slice")
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RAX)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
+    x64_call_label(&mut ctx.text, "_tg_array_push")
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::R14)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -8, X64::RAX)
+    x64_jmp(&mut ctx.text, lbl_cmp.clone())
+    # No match at i: advance one byte.
+    def_label(&mut ctx.text, lbl_match2.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_add_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX)
+    x64_jmp(&mut ctx.text, lbl_cmp.clone())
+
+    # Final segment: slice(data, start, slen).
+    def_label(&mut ctx.text, lbl_final.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RBX)
+    x64_mov_rm(&mut ctx.text, X64::RSI, X64::RBP, -8)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R12)
+    x64_call_label(&mut ctx.text, "_tg_string_slice")
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RAX)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
+    x64_call_label(&mut ctx.text, "_tg_array_push")
+
+    def_label(&mut ctx.text, lbl_done.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R15)      # return the Vec handle
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_add_ri(&mut ctx.text, X64::RSP, 16)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
 def emit_string_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_string_new(ctx)
   emit_tg_string_reserve(ctx)
@@ -1843,6 +3116,13 @@ def emit_string_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_string_clone(ctx)
   emit_tg_string_from_static(ctx)
   emit_tg_string_wrap(ctx)
+  emit_tg_string_slice(ctx)
+  emit_tg_string_trim(ctx)
+  emit_tg_string_trim_matches(ctx)
+  emit_tg_string_tolower(ctx)
+  emit_tg_string_toupper(ctx)
+  emit_tg_string_replace(ctx)
+  emit_tg_string_split(ctx)
 end
 
 # _tg_status: Run a command and get exit status
@@ -2191,6 +3471,8 @@ def emit_array_runtime(ctx: &mut RuntimeEmitCtx) -> Unit
   emit_tg_array_reverse(ctx)
   emit_tg_array_extend(ctx)
   emit_tg_array_resize(ctx)
+  emit_tg_array_slice(ctx)
+  emit_tg_array_from_list(ctx)
 end
 
 # _tg_array_new: Allocate empty vec struct
@@ -2660,20 +3942,37 @@ def emit_tg_array_grow(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
-# _tg_array_pop: Remove and return last element
+# _tg_array_pop: Remove and return the LAST element's IMAGE ADDRESS
+# (the VALUE-ABI result: the codegen constructs the complete Option[T]
+# word from this address — codegen_option_payload_wrap — and the image
+# must outlive the pop).
 # Args: x0/rdi = vec ptr
-# Returns: element value word (width from the header stride) or 0 if empty
+# Returns: x0/rax = the popped element's image ADDRESS, or 0 when empty.
+# The image persistence rule is category-derived from the header stride
+# (the stride authority):
+#   - stride <= 8 (ValueCategory::Scalar — the value word fits one slot):
+#     the IN-BUFFER element address is returned. pop only decrements len;
+#     the popped slot's bytes stay intact, and the codegen's width-matched
+#     payload load reads exactly the slot (never across it).
+#   - stride > 8 (ScalarPair / ByAddress): the FULL element image is
+#     byte-copied into a FRESH bump allocation (the same arena the Option
+#     wrap itself uses for the Some image) BEFORE the buffer can be
+#     reused — the returned address is the persistent full-image payload.
+# NO width-load into one register is ever emitted here: the returned
+# address carries the complete element per its value category.
 def emit_tg_array_pop(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_array_pop")
   
   let lblEmpty = fresh_label(ctx, ".Larr_pop_empty")
+  let lblScalar = fresh_label(ctx, ".Larr_pop_scalar")
   let lblDone = fresh_label(ctx, ".Larr_pop_done")
   
   match ctx.target.arch
   when Arch::AArch64 then
     a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
     a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
-    a64_stp_pre(&mut ctx.text, A64::X19, A64::XZR, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::XZR, A64::SP, -16)
     
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # vec ptr
     
@@ -2686,19 +3985,40 @@ def emit_tg_array_pop(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_sub_rri(&mut ctx.text, A64::X1, A64::X1, 1)
     a64_stur(&mut ctx.text, A64::X1, A64::X19, 8)
     
-    # return data[len] — element address = data + (len-1) * stride
+    # elem address = data + (len-1) * stride
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 0)  # data
     a64_ldur(&mut ctx.text, A64::X2, A64::X19, 24) # stride (header authority)
     a64_mul_rrr(&mut ctx.text, A64::X1, A64::X1, A64::X2)
     a64_add_rrr(&mut ctx.text, A64::X0, A64::X0, A64::X1)
-    emit_a64_load_width(ctx, A64::X0, A64::X0, A64::X2)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X0)  # elem address (callee-saved)
+    
+    # Scalar category: return the in-buffer slot address (intact after
+    # len--; the codegen loads the width-matched value word immediately).
+    a64_cmp_ri(&mut ctx.text, A64::X2, 8)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lblScalar.clone())
+    
+    # ScalarPair / ByAddress: fresh bump image — the FULL element image
+    # (stride bytes) is byte-copied, never a scalar width.
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X2)   # size = stride
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")       # x0 = fresh image
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X0)  # fresh image (callee-saved)
+    a64_ldur(&mut ctx.text, A64::X2, A64::X19, 24)  # count = stride (reload)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X20)  # src = elem address
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X21)  # dst = fresh image
+    emit_a64_copy_loop(ctx, A64::X2, A64::X1, A64::X3)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)  # return the fresh image
+    a64_b(&mut ctx.text, lblDone)
+    
+    def_label(&mut ctx.text, lblScalar)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)  # in-buffer slot address
     a64_b(&mut ctx.text, lblDone)
     
     def_label(&mut ctx.text, lblEmpty)
     a64_mov_ri(&mut ctx.text, A64::X0, 0)
     
     def_label(&mut ctx.text, lblDone)
-    a64_ldp_post(&mut ctx.text, A64::X19, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
     
@@ -2706,8 +4026,10 @@ def emit_tg_array_pop(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_push(&mut ctx.text, X64::RBP)
     x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
     x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
     
-    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)  # vec ptr
     
     # if len == 0: return 0
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
@@ -2718,76 +4040,74 @@ def emit_tg_array_pop(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_sub_ri(&mut ctx.text, X64::RAX, 1)
     x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
     
-    # return data[len] — element address = data + (len-1) * stride
+    # elem address = data + (len-1) * stride
     x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 0)  # data
     x64_mov_rm(&mut ctx.text, X64::RDX, X64::RBX, 24) # stride (header authority)
     x64_imul_rr(&mut ctx.text, X64::RAX, X64::RDX)
     x64_add_rr(&mut ctx.text, X64::RCX, X64::RAX)
-    emit_x64_load_width(ctx, X64::RAX, X64::RCX, X64::RDX)
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RCX)  # elem address (callee-saved)
+    
+    # Scalar category: return the in-buffer slot address.
+    x64_cmp_ri(&mut ctx.text, X64::RDX, 8)
+    x64_jcc(&mut ctx.text, CC::LE, lblScalar.clone())
+    
+    # ScalarPair / ByAddress: fresh bump image — the FULL element image
+    # (stride bytes) is byte-copied, never a scalar width.
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RDX)  # size = stride
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")  # rax = fresh image
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RAX)  # fresh image (callee-saved)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 24)  # count = stride (reload)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R12)  # src = elem address
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::R13)   # dst = fresh image
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RDX, X64::R8)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)  # return the fresh image
+    x64_jmp(&mut ctx.text, lblDone)
+    
+    def_label(&mut ctx.text, lblScalar)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)  # in-buffer slot address
     x64_jmp(&mut ctx.text, lblDone)
     
     def_label(&mut ctx.text, lblEmpty)
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
     
     def_label(&mut ctx.text, lblDone)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
     x64_pop(&mut ctx.text, X64::RBX)
     x64_pop(&mut ctx.text, X64::RBP)
     x64_ret(&mut ctx.text)
   end
 end
 
-# _tg_array_get: Get element at index
+# _tg_array_get: the UNCHECKED element-address accessor (the VALUE-ABI
+# address primitive).
 # Args: x0/rdi = vec ptr, x1/rsi = index
-# Returns: element ptr (address = data + index*stride) or null if out of bounds
+# Returns: x0/rax = &data[index] = data + index * stride — the element
+# image ADDRESS, per the element's value category (Scalar -> the codegen
+# loads the width-matched value word from it; ScalarPair/ByAddress -> the
+# codegen byte-copies the full image to the destination place).
+# THE BOUNDS CHECK IS THE CODEGEN'S (the ArrayGet arm is the checked
+# path: index < len is verified and out-of-range traps BEFORE this
+# primitive runs — panic-on-OOB is the defined std policy). This helper
+# deliberately performs NO bounds test: it is the unchecked address
+# accessor by contract.
 def emit_tg_array_get(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_array_get")
   
-  let lblOob = fresh_label(ctx, ".Larr_get_oob")
-  let lblDone = fresh_label(ctx, ".Larr_get_done")
-  
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_mov_rr(&mut ctx.text, A64::X9, A64::X0)  # vec ptr
-    a64_mov_rr(&mut ctx.text, A64::X10, A64::X1) # index
-    
-    # if index >= len: return null
-    a64_ldur(&mut ctx.text, A64::X11, A64::X9, 8)
-    a64_cmp_rr(&mut ctx.text, A64::X10, A64::X11)
-    a64_bcond(&mut ctx.text, a64_cc_ge(), lblOob.clone())
-    
-    # return &data[index] — element address = data + index * stride
+    a64_mov_rr(&mut ctx.text, A64::X9, A64::X0)   # vec ptr (scratch)
     a64_ldur(&mut ctx.text, A64::X0, A64::X9, 0)   # data
-    a64_ldur(&mut ctx.text, A64::X11, A64::X9, 24) # stride (header authority)
-    a64_mul_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X11)
-    a64_add_rrr(&mut ctx.text, A64::X0, A64::X0, A64::X10)
-    a64_b(&mut ctx.text, lblDone)
-    
-    def_label(&mut ctx.text, lblOob)
-    a64_mov_ri(&mut ctx.text, A64::X0, 0)
-    
-    def_label(&mut ctx.text, lblDone)
+    a64_ldur(&mut ctx.text, A64::X2, A64::X9, 24)  # stride (header authority)
+    a64_mul_rrr(&mut ctx.text, A64::X1, A64::X1, A64::X2)
+    a64_add_rrr(&mut ctx.text, A64::X0, A64::X0, A64::X1)
     a64_ret(&mut ctx.text)
     
   when Arch::X86_64 then
-    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RDI)  # vec ptr
-    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RSI)  # index
-    
-    # if index >= len: return null
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 8)
-    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::GE, lblOob.clone())
-    
-    # return &data[index] — element address = data + index * stride
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 0)   # data
-    x64_mov_rm(&mut ctx.text, X64::R8, X64::RCX, 24)   # stride (header authority)
-    x64_imul_rr(&mut ctx.text, X64::RDX, X64::R8)
-    x64_add_rr(&mut ctx.text, X64::RAX, X64::RDX)
-    x64_jmp(&mut ctx.text, lblDone)
-    
-    def_label(&mut ctx.text, lblOob)
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    
-    def_label(&mut ctx.text, lblDone)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)   # data
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDI, 24)  # stride (header authority)
+    x64_imul_rr(&mut ctx.text, X64::RSI, X64::RCX)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RSI)
     x64_ret(&mut ctx.text)
   end
 end
@@ -2821,15 +4141,28 @@ def emit_tg_array_set(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
-# _tg_array_remove: Remove element at index, shift remaining
+# _tg_array_remove: Remove element at index, shift remaining. The result
+# is the VALUE-ABI extraction — category-derived from the header stride:
+#   - stride <= 8 (ValueCategory::Scalar): the removed VALUE WORD is
+#     returned in x0/rax (the complete scalar T — the codegen stores it
+#     through the general call machinery; no image extraction is ever
+#     width-loaded into a register).
+#   - stride > 8 (ScalarPair / ByAddress): the FULL element image is
+#     byte-copied into a FRESH bump allocation BEFORE the shift loop
+#     overwrites the removed slot, and the fresh image ADDRESS is
+#     returned (the codegen materializes the complete T by copying the
+#     image to the destination place).
+# The internal shift always moves the FULL element image (stride bytes),
+# never a scalar width.
 # Args: x0/rdi = vec ptr, x1/rsi = index
-# Returns: removed element (the value word — the pre-existing scalar
-# return ABI). The internal shift moves the FULL element image (stride
-# bytes — ScalarPair/ByAddress elements included), never a scalar width.
+# Returns: x0/rax = the removed element's value word (scalar) or image
+# address (ScalarPair/ByAddress).
 def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_array_remove")
   
   let lblLoop = fresh_label(ctx, ".Larr_remove_loop")
+  let lblScalar = fresh_label(ctx, ".Larr_remove_scalar")
+  let lblShift = fresh_label(ctx, ".Larr_remove_shift")
   let lblDone = fresh_label(ctx, ".Larr_remove_done")
   
   match ctx.target.arch
@@ -2838,18 +4171,46 @@ def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
     a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
     a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::XZR, A64::SP, -16)
     
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # vec ptr
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # index
     a64_ldur(&mut ctx.text, A64::X21, A64::X19, 24)  # stride (header authority)
     
-    # Save removed element: data + index*stride, width from stride
+    # Removed element address: data + index*stride
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 0)
     a64_mul_rrr(&mut ctx.text, A64::X1, A64::X20, A64::X21)
     a64_add_rrr(&mut ctx.text, A64::X0, A64::X0, A64::X1)
-    emit_a64_load_width(ctx, A64::X0, A64::X0, A64::X21)  # removed element in x0
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X0)  # elem address (callee-saved)
     
-    # Shift: for i from index to len-2: data[i] = data[i+1]
+    # Scalar category: the complete T is the width-matched VALUE WORD —
+    # kept in x0 (the shift loop below never clobbers x0).
+    a64_cmp_ri(&mut ctx.text, A64::X21, 8)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lblScalar.clone())
+    
+    # ScalarPair / ByAddress: fresh bump image, FULL byte-copy BEFORE the
+    # shift (the shift overwrites the removed slot).
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)  # size = stride
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")       # x0 = fresh image
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X0)  # fresh image (callee-saved)
+    a64_ldur(&mut ctx.text, A64::X2, A64::X19, 24)  # count = stride (reload)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X22)  # src = removed slot
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X23)  # dst = fresh image
+    emit_a64_copy_loop(ctx, A64::X2, A64::X1, A64::X3)
+    # The result (the fresh image ADDRESS) rides in x0 across the shift
+    # loop — the loop never clobbers x0.
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
+    a64_b(&mut ctx.text, lblShift)
+    
+    def_label(&mut ctx.text, lblScalar)
+    # The complete scalar T: the width-matched VALUE WORD (survives the
+    # shift loop — x0 is never clobbered below).
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X22)  # elem address
+    emit_a64_load_width(ctx, A64::X0, A64::X0, A64::X21)
+    
+    def_label(&mut ctx.text, lblShift)
+    # Shift: for i from index to len-2: data[i] = data[i+1] (BOTH paths —
+    # scalar and aggregate — enter here with the result in x0).
     a64_ldur(&mut ctx.text, A64::X1, A64::X19, 8)  # len
     a64_sub_rri(&mut ctx.text, A64::X1, A64::X1, 1)  # len-1
     a64_mov_rr(&mut ctx.text, A64::X2, A64::X20)  # i = index
@@ -2879,6 +4240,7 @@ def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_sub_rri(&mut ctx.text, A64::X1, A64::X1, 1)
     a64_stur(&mut ctx.text, A64::X1, A64::X19, 8)
     
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::XZR, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
@@ -2890,20 +4252,49 @@ def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_push(&mut ctx.text, X64::RBX)
     x64_push(&mut ctx.text, X64::R12)
     x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
     
     x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)  # vec ptr
     x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)  # index
     x64_mov_rm(&mut ctx.text, X64::R13, X64::RBX, 24)  # stride (header authority)
     
-    # Get removed element: data + index*stride, width from stride
+    # Removed element address: data + index*stride
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 0)
     x64_mov_rr(&mut ctx.text, X64::RDX, X64::R12)
     x64_imul_rr(&mut ctx.text, X64::RDX, X64::R13)
     x64_add_rr(&mut ctx.text, X64::RAX, X64::RDX)
-    emit_x64_load_width(ctx, X64::RAX, X64::RAX, X64::R13)
-    x64_push(&mut ctx.text, X64::RAX)  # Save removed
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)  # elem address (callee-saved)
     
-    # Shift loop
+    # Scalar category: the complete T is the width-matched VALUE WORD —
+    # saved across the shift (the shift clobbers RAX).
+    x64_cmp_ri(&mut ctx.text, X64::R13, 8)
+    x64_jcc(&mut ctx.text, CC::LE, lblScalar.clone())
+    
+    # ScalarPair / ByAddress: fresh bump image, FULL byte-copy BEFORE the
+    # shift (the shift overwrites the removed slot).
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)  # size = stride
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")  # rax = fresh image
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RAX)  # fresh image (callee-saved)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 24)  # count = stride (reload)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R14)  # src = removed slot
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::R15)   # dst = fresh image
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RDX, X64::R8)
+    # The result (the fresh image ADDRESS) is saved across the shift loop
+    # (RAX is the loop's byte temp; R15 is callee-saved).
+    x64_push(&mut ctx.text, X64::R15)  # Save removed (image address)
+    x64_jmp(&mut ctx.text, lblShift)
+    
+    def_label(&mut ctx.text, lblScalar)
+    # The complete scalar T: the width-matched VALUE WORD, saved across
+    # the shift loop.
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)  # elem address
+    emit_x64_load_width(ctx, X64::RAX, X64::RAX, X64::R13)
+    x64_push(&mut ctx.text, X64::RAX)  # Save removed (word)
+    
+    def_label(&mut ctx.text, lblShift)
+    # Shift loop (BOTH paths — scalar and aggregate — enter here with the
+    # removed value saved on the stack).
     x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 8)  # len
     x64_sub_ri(&mut ctx.text, X64::RCX, 1)
     x64_mov_rr(&mut ctx.text, X64::RSI, X64::R12)  # i = index
@@ -2938,7 +4329,9 @@ def emit_tg_array_remove(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_sub_ri(&mut ctx.text, X64::RCX, 1)
     x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RCX)
     
-    x64_pop(&mut ctx.text, X64::RAX)  # Restore removed element
+    x64_pop(&mut ctx.text, X64::RAX)  # Restore removed (word or image address)
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
     x64_pop(&mut ctx.text, X64::R13)
     x64_pop(&mut ctx.text, X64::R12)
     x64_pop(&mut ctx.text, X64::RBX)
@@ -3112,181 +4505,124 @@ def emit_tg_array_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
-# _tg_array_contains: Check if element exists (linear search)
-# Args: x0/rdi = vec ptr, x1/rsi = element
-# Returns: 1 if found, 0 if not
+# _tg_array_contains: Check if an element exists (linear search through the
+# CONCRETE Eq::eq instance — the same dispatch the map keys use; the old
+# width-load/direct-register bit comparison is GONE).
+# Args: x0/rdi = vec ptr, x1/rsi = item ADDRESS (the &T reference value —
+#       NO deref: the runtime probes the element bytes by reference),
+#       x2/rdx = eq_fn (the concrete Eq::eq instance address — resolved by
+#       the codegen through map_eq_dispatch_label: the compiled
+#       `impl Eq for T` instance, _tg_eq_str for String objects,
+#       _tg_eq_str_view for StrView, or the _tg_eq_mem structural fallback).
+# The probe per element i: eq_fn(&data[i*stride], item_addr, stride) — the
+# eq call convention (a_addr, b_addr, size) the map probes use; _tg_eq_str /
+# _tg_eq_str_view ignore the size argument (their structure carries it).
+# Returns: 1 if found, 0 if not.
 def emit_tg_array_contains(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_array_contains")
-  
+
   let lblLoop = fresh_label(ctx, ".Larr_contains_loop")
   let lblFound = fresh_label(ctx, ".Larr_contains_found")
   let lblNotFound = fresh_label(ctx, ".Larr_contains_notfound")
-  let lblStringMaybe = fresh_label(ctx, ".Larr_contains_string_maybe")
-  let lblStringLoop = fresh_label(ctx, ".Larr_contains_string_loop")
-  let lblStringInner = fresh_label(ctx, ".Larr_contains_string_inner")
-  let lblStringNext = fresh_label(ctx, ".Larr_contains_string_next")
   let lblDone = fresh_label(ctx, ".Larr_contains_done")
-  
+
   match ctx.target.arch
   when Arch::AArch64 then
-    a64_mov_rr(&mut ctx.text, A64::X9, A64::X0)   # vec ptr
-    a64_mov_rr(&mut ctx.text, A64::X10, A64::X1)  # element
-    
-    a64_ldur(&mut ctx.text, A64::X11, A64::X9, 8)  # len
-    a64_ldur(&mut ctx.text, A64::X12, A64::X9, 0)  # data
-    a64_ldur(&mut ctx.text, A64::X15, A64::X9, 16) # cap
-    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X11)
-    a64_bcond(&mut ctx.text, a64_cc_lt(), lblStringMaybe.clone())
-    a64_mov_ri(&mut ctx.text, A64::X14, 1073741824)
-    a64_cmp_rr(&mut ctx.text, A64::X15, A64::X14)
-    a64_bcond(&mut ctx.text, a64_cc_gt(), lblStringMaybe.clone())
-    a64_cmp_ri(&mut ctx.text, A64::X12, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblStringMaybe.clone())
-    a64_mov_ri(&mut ctx.text, A64::X14, 7)
-    a64_and_rrr(&mut ctx.text, A64::X14, A64::X12, A64::X14)
-    a64_cmp_ri(&mut ctx.text, A64::X14, 0)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblStringMaybe.clone())
-    a64_ldur(&mut ctx.text, A64::X15, A64::X9, 24)  # stride (header authority)
-    a64_mov_ri(&mut ctx.text, A64::X13, 0)         # i = 0
-    
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # vec ptr
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)   # item address
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)   # eq_fn (callee-saved)
+    a64_ldur(&mut ctx.text, A64::X22, A64::X19, 24)  # stride (header authority)
+    a64_ldur(&mut ctx.text, A64::X23, A64::X19, 8)   # len (callee-saved)
+    a64_mov_ri(&mut ctx.text, A64::X24, 0)            # i = 0 (callee-saved)
+
     def_label(&mut ctx.text, lblLoop.clone())
-    a64_cmp_rr(&mut ctx.text, A64::X13, A64::X11)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNotFound.clone())
-    
-    # if data[i] == element: found — element address = data + i*stride,
-    # compare the width-matched value word
-    a64_mul_rrr(&mut ctx.text, A64::X14, A64::X13, A64::X15)
-    a64_add_rrr(&mut ctx.text, A64::X14, A64::X12, A64::X14)
-    emit_a64_load_width(ctx, A64::X14, A64::X14, A64::X15)
-    a64_cmp_rr(&mut ctx.text, A64::X14, A64::X10)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblFound.clone())
-    
-    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    a64_cmp_rr(&mut ctx.text, A64::X24, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lblNotFound.clone())
+
+    # eq_fn(&data[i*stride], item_addr, stride) — the element image ADDRESS
+    # (the full stride bytes), never a width-loaded register.
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 0)   # data
+    a64_mul_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X22)
+    a64_add_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X10)  # &data[i]
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X20)    # item addr
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X22)    # stride (mem-eq size)
+    a64_blr(&mut ctx.text, A64::X21)                # eq_fn(a, b, size)
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblFound.clone())
+
+    a64_add_rri(&mut ctx.text, A64::X24, A64::X24, 1)
     a64_b(&mut ctx.text, lblLoop)
 
-    # Some mislowered String.contains calls still reach this helper with a raw
-    # C-string receiver. Detect obviously invalid Vec headers and fall back to
-    # substring search instead of walking string bytes as pointer slots.
-    def_label(&mut ctx.text, lblStringMaybe)
-    a64_cmp_ri(&mut ctx.text, A64::X10, 4096)
-    a64_bcond(&mut ctx.text, a64_cc_le(), lblNotFound.clone())
-    a64_mov_rr(&mut ctx.text, A64::X15, A64::X9)
-
-    def_label(&mut ctx.text, lblStringLoop.clone())
-    a64_ldrb(&mut ctx.text, A64::X11, A64::X15, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNotFound.clone())
-    a64_mov_rr(&mut ctx.text, A64::X12, A64::X15)
-    a64_mov_rr(&mut ctx.text, A64::X13, A64::X10)
-
-    def_label(&mut ctx.text, lblStringInner.clone())
-    a64_ldrb(&mut ctx.text, A64::X14, A64::X13, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X14, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblFound.clone())
-    a64_ldrb(&mut ctx.text, A64::X16, A64::X12, 0)
-    a64_cmp_rr(&mut ctx.text, A64::X16, A64::X14)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblStringNext.clone())
-    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
-    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
-    a64_b(&mut ctx.text, lblStringInner)
-
-    def_label(&mut ctx.text, lblStringNext)
-    a64_add_rri(&mut ctx.text, A64::X15, A64::X15, 1)
-    a64_b(&mut ctx.text, lblStringLoop)
-    
     def_label(&mut ctx.text, lblFound)
     a64_mov_ri(&mut ctx.text, A64::X0, 1)
     a64_b(&mut ctx.text, lblDone)
-    
+
     def_label(&mut ctx.text, lblNotFound)
     a64_mov_ri(&mut ctx.text, A64::X0, 0)
-    
+
     def_label(&mut ctx.text, lblDone)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
-    
+
   when Arch::X86_64 then
-    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RDI)  # vec ptr
-    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RSI)  # element
-    
-    x64_mov_rm(&mut ctx.text, X64::R8, X64::RCX, 8)   # len
-    x64_mov_rm(&mut ctx.text, X64::R9, X64::RCX, 0)   # data
-    x64_mov_rm(&mut ctx.text, X64::R11, X64::RCX, 16) # cap
-    x64_cmp_rr(&mut ctx.text, X64::R11, X64::R8)
-    x64_jcc(&mut ctx.text, CC::L, lblStringMaybe.clone())
-    x64_mov_ri(&mut ctx.text, X64::RAX, 1073741824)
-    x64_cmp_rr(&mut ctx.text, X64::R11, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::G, lblStringMaybe.clone())
-    x64_cmp_ri(&mut ctx.text, X64::R9, 0)
-    x64_jcc(&mut ctx.text, CC::E, lblStringMaybe.clone())
-    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R9)
-    x64_mov_ri(&mut ctx.text, X64::R11, 7)
-    x64_and_rr(&mut ctx.text, X64::RAX, X64::R11)
-    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
-    x64_jcc(&mut ctx.text, CC::NE, lblStringMaybe.clone())
-    x64_mov_rm(&mut ctx.text, X64::R11, X64::RCX, 24)  # stride (header authority)
-    x64_mov_ri(&mut ctx.text, X64::R10, 0)            # i = 0
-    
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # vec ptr
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)   # item address
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)   # eq_fn (callee-saved)
+    x64_mov_rm(&mut ctx.text, X64::R14, X64::RBX, 24)  # stride (header authority)
+    x64_mov_rm(&mut ctx.text, X64::R15, X64::RBX, 8)   # len (callee-saved)
+    x64_mov_ri(&mut ctx.text, X64::RBP, 0)              # i = 0 (callee-saved)
+
     def_label(&mut ctx.text, lblLoop.clone())
-    x64_cmp_rr(&mut ctx.text, X64::R10, X64::R8)
-    x64_jcc(&mut ctx.text, CC::E, lblNotFound.clone())
-    
-    # if data[i] == element: found — element address = data + i*stride,
-    # compare the width-matched value word
-    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R10)
-    x64_imul_rr(&mut ctx.text, X64::RAX, X64::R11)
-    x64_add_rr(&mut ctx.text, X64::RAX, X64::R9)
-    emit_x64_load_width(ctx, X64::RAX, X64::RAX, X64::R11)
-    x64_cmp_rr(&mut ctx.text, X64::RDX, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::E, lblFound.clone())
-    
-    x64_add_ri(&mut ctx.text, X64::R10, 1)
+    x64_cmp_rr(&mut ctx.text, X64::RBP, X64::R15)
+    x64_jcc(&mut ctx.text, CC::GE, lblNotFound.clone())
+
+    # eq_fn(&data[i*stride], item_addr, stride) — the element image ADDRESS
+    # (the full stride bytes), never a width-loaded register.
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 0)   # data
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RBP)
+    x64_imul_rr(&mut ctx.text, X64::RCX, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)      # &data[i]
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RAX)      # a
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R12)      # b
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R14)      # size
+    x64_call_r(&mut ctx.text, X64::R13)                # eq_fn(a, b, size)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lblFound.clone())
+
+    x64_add_ri(&mut ctx.text, X64::RBP, 1)
     x64_jmp(&mut ctx.text, lblLoop)
 
-    def_label(&mut ctx.text, lblStringMaybe)
-    x64_cmp_ri(&mut ctx.text, X64::RDX, 4096)
-    x64_jcc(&mut ctx.text, CC::LE, lblNotFound.clone())
-    x64_mov_rr(&mut ctx.text, X64::R10, X64::RDX)  # needle base
-
-    def_label(&mut ctx.text, lblStringLoop.clone())
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RCX)
-    emit8(&mut ctx.text, 0x0F)
-    emit8(&mut ctx.text, 0xB6)
-    emit8(&mut ctx.text, 0x07)
-    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::E, lblNotFound.clone())
-    x64_mov_rr(&mut ctx.text, X64::R8, X64::RCX)
-    x64_mov_rr(&mut ctx.text, X64::R9, X64::R10)
-
-    def_label(&mut ctx.text, lblStringInner.clone())
-    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R9)
-    emit8(&mut ctx.text, 0x0F)
-    emit8(&mut ctx.text, 0xB6)
-    emit8(&mut ctx.text, 0x02)
-    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::E, lblFound.clone())
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R8)
-    emit8(&mut ctx.text, 0x40)
-    emit8(&mut ctx.text, 0x0F)
-    emit8(&mut ctx.text, 0xB6)
-    emit8(&mut ctx.text, 0x37)
-    x64_cmp_rr(&mut ctx.text, X64::RSI, X64::RAX)
-    x64_jcc(&mut ctx.text, CC::NE, lblStringNext.clone())
-    x64_add_ri(&mut ctx.text, X64::R8, 1)
-    x64_add_ri(&mut ctx.text, X64::R9, 1)
-    x64_jmp(&mut ctx.text, lblStringInner)
-
-    def_label(&mut ctx.text, lblStringNext)
-    x64_add_ri(&mut ctx.text, X64::RCX, 1)
-    x64_jmp(&mut ctx.text, lblStringLoop)
-    
     def_label(&mut ctx.text, lblFound)
     x64_mov_ri(&mut ctx.text, X64::RAX, 1)
     x64_jmp(&mut ctx.text, lblDone)
-    
+
     def_label(&mut ctx.text, lblNotFound)
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    
+
     def_label(&mut ctx.text, lblDone)
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
     x64_ret(&mut ctx.text)
   end
 end
@@ -3653,13 +4989,344 @@ def emit_tg_array_resize(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
+# _tg_array_slice: Extract the element span [start, end) of a Vec/Array
+# (the heap header) into a NEW owned Vec — the collection ABI: the result
+# is the fresh 32-byte header {data@0, len@8, cap@16, stride@24} whose
+# data buffer is a byte copy of the span (the element stride is read from
+# the SOURCE header — the same authority every collection op uses). The
+# bounds are clamped to the source length (start>len -> start=len; end
+# below start -> end=start; end>len -> end=len) — the memory-safe span.
+# Args: x0/rdi = source Vec handle, x1/rsi = start, x2/rdx = end.
+# Returns: x0/rax = the new owned Vec handle.
+def emit_tg_array_slice(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_array_slice")
+
+  let lbl_clamp1 = fresh_label(ctx, ".Larr_slice_clamp1")
+  let lbl_clamp2 = fresh_label(ctx, ".Larr_slice_clamp2")
+  let lbl_clamp3 = fresh_label(ctx, ".Larr_slice_clamp3")
+  let lbl_empty = fresh_label(ctx, ".Larr_slice_empty")
+  let lbl_copy = fresh_label(ctx, ".Larr_slice_copy")
+  let lbl_fill = fresh_label(ctx, ".Larr_slice_fill")
+  let lbl_done = fresh_label(ctx, ".Larr_slice_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # arr
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)   # start
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)   # end
+    a64_ldur(&mut ctx.text, A64::X22, A64::X19, 0) # data
+    a64_ldur(&mut ctx.text, A64::X23, A64::X19, 8) # slen
+    a64_ldur(&mut ctx.text, A64::X24, A64::X19, 24) # stride
+
+    # clamp start to [0, slen]; clamp end to [start, slen]
+    a64_cmp_rr(&mut ctx.text, A64::X20, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_clamp1.clone())
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X23)
+    def_label(&mut ctx.text, lbl_clamp1.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X20)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_clamp2.clone())
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X20)
+    def_label(&mut ctx.text, lbl_clamp2.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X23)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_clamp3.clone())
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X23)
+    def_label(&mut ctx.text, lbl_clamp3.clone())
+    a64_sub_rrr(&mut ctx.text, A64::X25, A64::X21, A64::X20)  # sub_len
+
+    # The result Vec header: _tg_array_new(stride).
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)
+    a64_bl(&mut ctx.text, "_tg_array_new")
+    a64_mov_rr(&mut ctx.text, A64::X26, A64::X0)   # vec
+
+    a64_cmp_ri(&mut ctx.text, A64::X25, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_empty.clone())
+
+    # bytes = sub_len * stride; allocate the buffer; byte-copy the span.
+    a64_mul_rrr(&mut ctx.text, A64::X11, A64::X25, A64::X24)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X11)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X12, A64::X0)   # out base
+    # src base = data + start * stride
+    a64_mul_rrr(&mut ctx.text, A64::X13, A64::X20, A64::X24)
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X22, A64::X13)
+    a64_mov_ri(&mut ctx.text, A64::X14, 0)         # j
+    def_label(&mut ctx.text, lbl_copy.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X14, A64::X11)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_fill.clone())
+    a64_add_rrr(&mut ctx.text, A64::X15, A64::X13, A64::X14)
+    a64_ldrb(&mut ctx.text, A64::X15, A64::X15, 0)
+    a64_add_rrr(&mut ctx.text, A64::X16, A64::X12, A64::X14)
+    a64_strb(&mut ctx.text, A64::X15, A64::X16, 0)
+    a64_add_rri(&mut ctx.text, A64::X14, A64::X14, 1)
+    a64_b(&mut ctx.text, lbl_copy.clone())
+    def_label(&mut ctx.text, lbl_fill.clone())
+    a64_stur(&mut ctx.text, A64::X12, A64::X26, 0)   # data
+    a64_stur(&mut ctx.text, A64::X25, A64::X26, 8)   # len
+    a64_stur(&mut ctx.text, A64::X25, A64::X26, 16)  # cap = len
+    a64_stur(&mut ctx.text, A64::X24, A64::X26, 24)  # stride
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X26)
+    a64_b(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_empty.clone())
+    a64_stur(&mut ctx.text, A64::XZR, A64::X26, 0)
+    a64_stur(&mut ctx.text, A64::XZR, A64::X26, 8)
+    a64_stur(&mut ctx.text, A64::XZR, A64::X26, 16)
+    a64_stur(&mut ctx.text, A64::X24, A64::X26, 24)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X26)
+    def_label(&mut ctx.text, lbl_done.clone())
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_sub_ri(&mut ctx.text, X64::RSP, 32)   # [rbp-8]=data, [rbp-16]=src_base, [rbp-24]=out, [rbp-32]=sub_len
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)   # arr
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)   # start
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)   # end
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -8, X64::RAX)  # data
+    x64_mov_rm(&mut ctx.text, X64::R14, X64::RBX, 8)   # slen
+    x64_mov_rm(&mut ctx.text, X64::R15, X64::RBX, 24)  # stride
+
+    # clamp start to [0, slen]
+    x64_cmp_rr(&mut ctx.text, X64::R12, X64::R14)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_clamp1.clone())
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::R14)
+    def_label(&mut ctx.text, lbl_clamp1.clone())
+    # clamp end to [start, slen]
+    x64_cmp_rr(&mut ctx.text, X64::R13, X64::R12)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_clamp2.clone())
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::R12)
+    def_label(&mut ctx.text, lbl_clamp2.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R13, X64::R14)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_clamp3.clone())
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::R14)
+    def_label(&mut ctx.text, lbl_clamp3.clone())
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_sub_rr(&mut ctx.text, X64::RAX, X64::R12)     # sub_len
+    x64_mov_mr(&mut ctx.text, X64::RBP, -32, X64::RAX)
+
+    # The result Vec header: _tg_array_new(stride).
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
+    x64_call_label(&mut ctx.text, "_tg_array_new")
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RAX)     # vec
+
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -32)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_empty.clone())
+
+    # bytes = sub_len * stride (rdx); allocate; byte-copy the span.
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -32)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::R15)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RAX)     # bytes
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RAX)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_mr(&mut ctx.text, X64::RBP, -24, X64::RAX) # out base
+    # src base = data + start * stride
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::R15)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBP, -8)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX) # src base
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)             # j
+    def_label(&mut ctx.text, lbl_copy.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_fill.clone())
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::RBP, -16)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rm(&mut ctx.text, X64::R9, X64::RBP, -24)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_mov_m8_r8(&mut ctx.text, X64::R9, 0, X64::R8)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_copy.clone())
+    def_label(&mut ctx.text, lbl_fill.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -24)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 0, X64::RAX)   # data
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -32)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)   # len
+    x64_mov_mr(&mut ctx.text, X64::RBX, 16, X64::RAX)  # cap = len
+    x64_mov_mr(&mut ctx.text, X64::RBX, 24, X64::R15)  # stride
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RBX)
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_empty.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 0, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 16, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 24, X64::R15)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RBX)
+    def_label(&mut ctx.text, lbl_done.clone())
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_add_ri(&mut ctx.text, X64::RSP, 32)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# _tg_array_from_list: Construct a NEW owned Vec from a raw element
+# buffer (the &[T] slice view's data pointer) plus the element count and
+# the element stride — the owned Vec construction of the from-list path.
+# The element bytes are copied (the std's from-list surface is Copy-
+# gated); the result header is {data@0, len@8, cap@16, stride@24}.
+# Args: x0/rdi = source data pointer, x1/rsi = element count,
+#       x2/rdx = element stride.
+# Returns: x0/rax = the new owned Vec handle.
+def emit_tg_array_from_list(ctx: &mut RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_array_from_list")
+
+  let lbl_copy = fresh_label(ctx, ".Larr_from_list_copy")
+  let lbl_empty = fresh_label(ctx, ".Larr_from_list_empty")
+  let lbl_fill = fresh_label(ctx, ".Larr_from_list_fill")
+  let lbl_done = fresh_label(ctx, ".Larr_from_list_done")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # data
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)   # len
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)   # stride
+
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X21)
+    a64_bl(&mut ctx.text, "_tg_array_new")
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X0)   # vec
+
+    a64_cmp_ri(&mut ctx.text, A64::X20, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_empty.clone())
+
+    # bytes = len * stride; allocate; byte-copy.
+    a64_mul_rrr(&mut ctx.text, A64::X11, A64::X20, A64::X21)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X11)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X0)   # out base
+    a64_mov_ri(&mut ctx.text, A64::X12, 0)         # j
+    def_label(&mut ctx.text, lbl_copy.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X12, A64::X11)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_fill.clone())
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X19, A64::X12)
+    a64_ldrb(&mut ctx.text, A64::X13, A64::X13, 0)
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X23, A64::X12)
+    a64_strb(&mut ctx.text, A64::X13, A64::X14, 0)
+    a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 1)
+    a64_b(&mut ctx.text, lbl_copy.clone())
+    def_label(&mut ctx.text, lbl_fill.clone())
+    a64_stur(&mut ctx.text, A64::X23, A64::X22, 0)   # data
+    a64_stur(&mut ctx.text, A64::X20, A64::X22, 8)   # len
+    a64_stur(&mut ctx.text, A64::X20, A64::X22, 16)  # cap = len
+    a64_stur(&mut ctx.text, A64::X21, A64::X22, 24)  # stride
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X22)
+    a64_b(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_empty.clone())
+    a64_stur(&mut ctx.text, A64::XZR, A64::X22, 0)
+    a64_stur(&mut ctx.text, A64::XZR, A64::X22, 8)
+    a64_stur(&mut ctx.text, A64::XZR, A64::X22, 16)
+    a64_stur(&mut ctx.text, A64::X21, A64::X22, 24)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X22)
+    def_label(&mut ctx.text, lbl_done.clone())
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_sub_ri(&mut ctx.text, X64::RSP, 16)   # [rbp-8]=data, [rbp-16]=out
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+
+    x64_mov_mr(&mut ctx.text, X64::RBP, -8, X64::RDI)  # data
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RSI)      # len
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDX)      # stride
+
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_call_label(&mut ctx.text, "_tg_array_new")
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RAX)      # vec
+
+    x64_cmp_ri(&mut ctx.text, X64::RBX, 0)
+    x64_jcc(&mut ctx.text, CC::E, lbl_empty.clone())
+
+    # bytes = len * stride (rdx); allocate; byte-copy.
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RBX)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RAX)      # bytes
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RAX)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_mr(&mut ctx.text, X64::RBP, -16, X64::RAX) # out base
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)             # j
+    def_label(&mut ctx.text, lbl_copy.clone())
+    x64_cmp_rr(&mut ctx.text, X64::RCX, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_fill.clone())
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::RBP, -8)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RCX)
+    x64_movzx_r64_m8(&mut ctx.text, X64::R8, X64::R8, 0)
+    x64_mov_rm(&mut ctx.text, X64::R9, X64::RBP, -16)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RCX)
+    x64_mov_m8_r8(&mut ctx.text, X64::R9, 0, X64::R8)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_copy.clone())
+    def_label(&mut ctx.text, lbl_fill.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, -16)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RAX)   # data
+    x64_mov_mr(&mut ctx.text, X64::R13, 8, X64::RBX)   # len
+    x64_mov_mr(&mut ctx.text, X64::R13, 16, X64::RBX)  # cap = len
+    x64_mov_mr(&mut ctx.text, X64::R13, 24, X64::R12)  # stride
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_empty.clone())
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::R13, 8, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::R13, 16, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::R13, 24, X64::R12)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R13)
+    def_label(&mut ctx.text, lbl_done.clone())
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_add_ri(&mut ctx.text, X64::RSP, 16)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Map Runtime Implementation — INLINE-BUCKET HASH TABLE
 # ———————————————————————————————————————————————————————————————
 #
 # CONTRACT (the map/set storage + dispatch contract, P0-MAP):
 #
-# Map header (88 bytes — a raw byte arena plus the layout parameters):
+# Map header (96 bytes — a raw byte arena plus the layout parameters):
 #   [ptr+0]:   buckets       - pointer to the bucket ARENA (mmap'ed)
 #   [ptr+8]:   size          - live entry count
 #   [ptr+16]:  capacity      - bucket count (power of 2; 256 at creation)
@@ -3672,6 +5339,14 @@ end
 #   [ptr+64]:  value_off     - value inline offset inside a bucket record
 #   [ptr+72]:  next_off      - chain-pointer offset inside a bucket record
 #   [ptr+80]:  bucket_stride - one bucket record's byte size
+#   [ptr+88]:  free_list     - head of the overflow-node free list (0 =
+#                              empty); a free node's [0] word (the hash
+#                              slot of a live record) holds the next free
+#                              node's address. The clear path walks every
+#                              chain and links every overflow node into
+#                              this list; the insert chain path pops it
+#                              before mmap'ing a fresh node; destroy
+#                              munmaps the remaining nodes.
 #
 # The FOUR derived layout fields (key_off/value_off/next_off/bucket_stride)
 # are computed ONCE at map creation from the four layout parameters
@@ -3682,9 +5357,22 @@ end
 # (no fixed 32-byte records, no key@8/value@16/next@24) anywhere in the
 # map/set paths.
 #
+# STORED-HASH ENCODING (P0-H0): the bucket's cached hash field NEVER
+# stores a raw user hash. Every map/set operation normalizes the hash
+# argument at entry — stored = hash == 0 ? 1 : hash (the raw user hash
+# is replaced by the nonzero encoding 1 exactly when it is 0; every
+# nonzero hash is unchanged, so the distribution and the probe mask are
+# preserved) — and the probe mask computation and the cached-hash
+# comparison ALWAYS use the normalized value. A key whose Hash::hash
+# returns 0 is therefore stored as the encoding 1 and is found by the
+# same encoding at lookup; the empty marker stays 0. The encoding is
+# idempotent on stored values (they are always nonzero), so
+# _tg_map_clone's verbatim re-insertion needs no special case.
+#
 # Bucket record (inline storage — the reviewer's preferred contract once
 # monomorphized layout is available):
-#   [0]:                 hash   - cached hash (0 = empty slot)
+#   [0]:                 hash   - cached STORED hash (0 = empty slot; a
+#                                 live record's stored hash is never 0)
 #   [key_off]:           key    - key_stride inline bytes
 #   [value_off]:         value  - value_stride inline bytes
 #   [next_off]:          next   - chain pointer (0 = end of chain)
@@ -3695,6 +5383,17 @@ end
 #   value_off     = align_up(key_off + key_stride, value_align)
 #   next_off      = align_up(value_off + value_stride, 8)
 #   bucket_stride = next_off + 8
+#
+# REMOVAL CONTRACT (P0-CHAIN): removing a record REAL-unlinks it. When the
+# removed record is a bucket head with a chain successor, the successor's
+# FULL record image (hash/key/value/next — bucket_stride bytes) is copied
+# into the head slot (PROMOTION) and the old successor node is pushed onto
+# the free list; when the removed record is a chain node, the parent's
+# next pointer is re-linked to the removed record's successor and the
+# removed node itself is pushed onto the free list. A record is marked
+# empty (hash = 0) ONLY when it is the tail — no live chain successor is
+# ever hidden behind a zeroed hash, so every lookup finds every entry
+# after any removal (remove / remove_key / drain_one).
 #
 # Entry TUPLES (map_entries / drain_one payloads) use the concrete (K, V)
 # tuple layout, computed by the codegen from the same parameters and passed
@@ -3781,7 +5480,7 @@ end
 # Args: x0/rdi = key_stride, x1/rsi = key_align, x2/rdx = value_stride,
 #       x3/rcx = value_align  (computed by codegen from the CONCRETE K/V —
 #       the layout values NEVER come from a hardcoded constant).
-# Returns: x0/rax = map pointer (the 88-byte header above).
+# Returns: x0/rax = map pointer (the 96-byte header above).
 def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_new")
 
@@ -3838,8 +5537,8 @@ def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
     end
     a64_mov_rr(&mut ctx.text, A64::X23, A64::X0)  # buckets
 
-    # Allocate the 88-byte header from the bump arena.
-    a64_mov_ri(&mut ctx.text, A64::X0, 88)
+    # Allocate the 96-byte header from the bump arena.
+    a64_mov_ri(&mut ctx.text, A64::X0, 96)
     a64_bl(&mut ctx.text, "_tg_bump_alloc")
     a64_mov_rr(&mut ctx.text, A64::X24, A64::X0)  # header
 
@@ -3871,6 +5570,7 @@ def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_stur(&mut ctx.text, A64::X12, A64::X24, 64)  # value_off
     a64_stur(&mut ctx.text, A64::X11, A64::X24, 72)  # next_off
     a64_stur(&mut ctx.text, A64::X13, A64::X24, 80)  # bucket_stride
+    a64_stur(&mut ctx.text, A64::XZR, A64::X24, 88)  # free_list = 0
 
     a64_mov_rr(&mut ctx.text, A64::X0, A64::X24)
 
@@ -3938,8 +5638,8 @@ def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_syscall(&mut ctx.text)
     x64_mov_rr(&mut ctx.text, X64::R15, X64::RAX)  # buckets
 
-    # Allocate the 88-byte header from the bump arena.
-    x64_mov_ri(&mut ctx.text, X64::RDI, 88)
+    # Allocate the 96-byte header from the bump arena.
+    x64_mov_ri(&mut ctx.text, X64::RDI, 96)
     x64_call_label(&mut ctx.text, "_tg_bump_alloc")
     x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)  # header
 
@@ -3961,6 +5661,8 @@ def emit_tg_map_new(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_mr(&mut ctx.text, X64::RCX, 72, X64::RAX)   # next_off
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RSP, 0)
     x64_mov_mr(&mut ctx.text, X64::RCX, 80, X64::RAX)   # bucket_stride
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 88, X64::RAX)   # free_list = 0
 
     x64_add_ri(&mut ctx.text, X64::RSP, 32)
     x64_mov_rr(&mut ctx.text, X64::RAX, X64::RCX)
@@ -3999,6 +5701,15 @@ def emit_tg_map_get(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # key address
     a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)  # hash
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)  # eq_fn
+    # STORED-HASH ENCODING (P0-H0): the hash argument is normalized at
+    # entry — stored = hash == 0 ? 1 : hash — so a user hash of 0 can
+    # never be confused with the empty marker; the probe mask and the
+    # cached-hash comparison below use the normalized value.
+    let lblHashNz = fresh_label(ctx, ".Lmap_get_hash_nz")
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblHashNz.clone())
+    a64_mov_ri(&mut ctx.text, A64::X21, 1)
+    def_label(&mut ctx.text, lblHashNz)
 
     # probe (X24, callee-saved across the eq call) =
     # buckets + (hash & (capacity - 1)) * bucket_stride
@@ -4057,6 +5768,15 @@ def emit_tg_map_get(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)  # key address
     x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)  # hash
     x64_mov_rr(&mut ctx.text, X64::R14, X64::RCX)  # eq_fn
+    # STORED-HASH ENCODING (P0-H0): the hash argument is normalized at
+    # entry — stored = hash == 0 ? 1 : hash — so a user hash of 0 can
+    # never be confused with the empty marker; the probe mask and the
+    # cached-hash comparison below use the normalized value.
+    let lblHashNz = fresh_label(ctx, ".Lmap_get_hash_nz")
+    x64_test_rr(&mut ctx.text, X64::R13, X64::R13)
+    x64_jcc(&mut ctx.text, CC::NE, lblHashNz.clone())
+    x64_mov_ri(&mut ctx.text, X64::R13, 1)
+    def_label(&mut ctx.text, lblHashNz)
 
     # probe (rbp, callee-saved across the eq call) =
     # buckets + (hash & (capacity - 1)) * bucket_stride
@@ -4151,6 +5871,14 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)  # value address
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)  # hash
     a64_mov_rr(&mut ctx.text, A64::X23, A64::X4)  # eq_fn
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 is stored as the encoding 1, never
+    # as the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_insert_hash_nz")
+    a64_cmp_ri(&mut ctx.text, A64::X22, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblHashNz.clone())
+    a64_mov_ri(&mut ctx.text, A64::X22, 1)
+    def_label(&mut ctx.text, lblHashNz)
 
     # probe (X24) = buckets + (hash & (capacity - 1)) * bucket_stride
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 16)
@@ -4275,9 +6003,14 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_stur(&mut ctx.text, A64::X0, A64::X19, 8)
     a64_b(&mut ctx.text, lblDone)
 
-    # Collision: bucket occupied but next == 0 — allocate an overflow
-    # bucket (one bucket_stride-sized record, mmap'ed like the arena).
+    # Collision: bucket occupied but next == 0 — take an overflow node
+    # from the FREE LIST (P0-CLR: the clear path reclaims every overflow
+    # node there) or allocate a fresh one (one bucket_stride-sized record,
+    # mmap'ed like the arena).
     def_label(&mut ctx.text, lblChain.clone())
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)  # free_list
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), ".Lmap_insert_fl_pop")
     a64_stp_pre(&mut ctx.text, A64::X24, A64::XZR, A64::SP, -16)
     a64_mov_ri(&mut ctx.text, A64::X0, 0)
     a64_ldur(&mut ctx.text, A64::X1, A64::X19, 80)  # bucket_stride
@@ -4297,6 +6030,13 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     end
     a64_mov_rr(&mut ctx.text, A64::X24, A64::X0)  # node
     a64_ldp_post(&mut ctx.text, A64::X14, A64::XZR, A64::SP, 16)  # old probe
+    a64_b(&mut ctx.text, ".Lmap_insert_fl_done")
+    def_label(&mut ctx.text, ".Lmap_insert_fl_pop")
+    a64_ldr(&mut ctx.text, A64::X10, A64::X9, 0)   # node[0] = next free node
+    a64_stur(&mut ctx.text, A64::X10, A64::X19, 88)  # free_list = next
+    a64_mov_rr(&mut ctx.text, A64::X14, A64::X24)  # old probe = current probe
+    a64_mov_rr(&mut ctx.text, A64::X24, A64::X9)   # node
+    def_label(&mut ctx.text, ".Lmap_insert_fl_done")
     # link: old_probe->next = node
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
     a64_add_rrr(&mut ctx.text, A64::X10, A64::X14, A64::X9)
@@ -4350,6 +6090,14 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)  # value address
     x64_mov_rr(&mut ctx.text, X64::R14, X64::RCX)  # hash
     x64_mov_rr(&mut ctx.text, X64::R15, X64::R8)   # eq_fn
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 is stored as the encoding 1, never
+    # as the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_insert_hash_nz")
+    x64_test_rr(&mut ctx.text, X64::R14, X64::R14)
+    x64_jcc(&mut ctx.text, CC::NE, lblHashNz.clone())
+    x64_mov_ri(&mut ctx.text, X64::R14, 1)
+    def_label(&mut ctx.text, lblHashNz)
 
     # probe (rbp) = buckets + (hash & (capacity - 1)) * bucket_stride
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
@@ -4481,8 +6229,13 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
     x64_jmp(&mut ctx.text, lblDone)
 
-    # Collision: allocate one bucket_stride-sized overflow node.
+    # Collision: take an overflow node from the FREE LIST (P0-CLR: the
+    # clear path reclaims every overflow node there) or allocate a fresh
+    # one (one bucket_stride-sized record, mmap'ed like the arena).
     def_label(&mut ctx.text, lblChain.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)  # free_list
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, ".Lmap_insert_fl_pop")
     x64_push(&mut ctx.text, X64::RBP)
     x64_mov_ri(&mut ctx.text, X64::RDI, 0)
     x64_mov_rm(&mut ctx.text, X64::RSI, X64::RBX, 80)  # bucket_stride
@@ -4503,6 +6256,13 @@ def emit_tg_map_insert_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_syscall(&mut ctx.text)
     x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)  # node
     x64_pop(&mut ctx.text, X64::RBP)               # old probe
+    x64_jmp(&mut ctx.text, ".Lmap_insert_fl_done")
+    def_label(&mut ctx.text, ".Lmap_insert_fl_pop")
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)   # node
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 0)  # node[0] = next free node
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RAX)  # free_list = next
+    # RBP still holds the old probe (untouched in the pop path)
+    def_label(&mut ctx.text, ".Lmap_insert_fl_done")
     # link: old_probe->next = node
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
     x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
@@ -4580,11 +6340,25 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
     a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
     a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::XZR, A64::SP, -16)
 
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # map
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # key address
     a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)  # hash
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)  # eq_fn
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 probes the same bucket as the
+    # stored encoding and can never be confused with the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_remove_hash_nz")
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblHashNz.clone())
+    a64_mov_ri(&mut ctx.text, A64::X21, 1)
+    def_label(&mut ctx.text, lblHashNz)
+    # X25 = the chain PARENT of the current record (0 = the record is the
+    # bucket head) — the P0-CHAIN unlink authority: a head removal
+    # PROMOTES its successor into the head slot; a chain-node removal
+    # re-links the parent to the removed record's successor.
+    a64_mov_ri(&mut ctx.text, A64::X25, 0)
 
     # probe (X24) = buckets + (hash & (capacity - 1)) * bucket_stride
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 16)
@@ -4610,6 +6384,7 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_cmp_ri(&mut ctx.text, A64::X0, 0)
     a64_bcond(&mut ctx.text, a64_cc_ne(), lblFound.clone())
     def_label(&mut ctx.text, lblNext.clone())
+    a64_mov_rr(&mut ctx.text, A64::X25, A64::X24)  # the current record becomes the parent
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
     a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
     a64_ldr(&mut ctx.text, A64::X24, A64::X10, 0)
@@ -4620,6 +6395,14 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_mov_ri(&mut ctx.text, A64::X0, 0)
     a64_b(&mut ctx.text, ".Lmap_remove_ret")
 
+    # P0-CHAIN: the found record (X24, parent X25) is REAL-unlinked — the
+    # removed VALUE was already extracted (X23 = the fresh object); the
+    # head-with-successor case PROMOTES the successor's full record image
+    # into the removed slot (the chain's links stay fixed) and the old
+    # successor node is pushed onto the free list; the chain-node case
+    # re-links the parent to the successor and pushes the removed node
+    # itself onto the free list; a tail record is simply marked empty
+    # (hash = 0 — nothing follows it, so nothing is hidden).
     def_label(&mut ctx.text, lblFound.clone())
     a64_ldur(&mut ctx.text, A64::X23, A64::X19, 40)  # value_stride
     a64_cmp_ri(&mut ctx.text, A64::X23, 0)
@@ -4634,25 +6417,55 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_add_rrr(&mut ctx.text, A64::X1, A64::X24, A64::X9)  # src = bucket + value_off
     a64_mov_rr(&mut ctx.text, A64::X2, A64::X23)  # dst = fresh value object
     emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
-    # zero the hash field (empty marker); the chain link stays intact.
-    a64_str(&mut ctx.text, A64::XZR, A64::X24, 0)
+
+    def_label(&mut ctx.text, lblFoundOne.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X25, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), ".Lmap_remove_chain_unlink")
+    # head: promote the successor into the removed slot, or mark empty
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # successor
+    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), ".Lmap_remove_zero_hash")
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 80)  # count = bucket_stride
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X11)  # src = successor
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X24)  # dst = removed slot
+    emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    # push the old successor node onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X11, 0)
+    a64_stur(&mut ctx.text, A64::X11, A64::X19, 88)
+    a64_b(&mut ctx.text, ".Lmap_remove_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_chain_unlink")
+    # chain node: P->next = R->next; push R onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # R->next
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X25, A64::X9)
+    a64_str(&mut ctx.text, A64::X11, A64::X12, 0)  # P->next = R->next
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X24, 0)  # R[0] = free_list
+    a64_stur(&mut ctx.text, A64::X24, A64::X19, 88)  # free_list = R
+    a64_b(&mut ctx.text, ".Lmap_remove_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_zero_hash")
+    a64_str(&mut ctx.text, A64::XZR, A64::X24, 0)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_remove_size_dec")
     # size--
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 8)
     a64_sub_rri(&mut ctx.text, A64::X0, A64::X0, 1)
     a64_stur(&mut ctx.text, A64::X0, A64::X19, 8)
+    # return the fresh value object (or the Unit marker 1 for sets)
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 40)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), ".Lmap_remove_ret_fresh")
+    a64_mov_ri(&mut ctx.text, A64::X0, 1)
+    a64_b(&mut ctx.text, ".Lmap_remove_ret")
+    def_label(&mut ctx.text, ".Lmap_remove_ret_fresh")
     a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
     a64_b(&mut ctx.text, ".Lmap_remove_ret")
 
-    def_label(&mut ctx.text, lblFoundOne.clone())
-    # zero the hash field (empty marker); the chain link stays intact.
-    a64_str(&mut ctx.text, A64::XZR, A64::X24, 0)
-    # size--
-    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 8)
-    a64_sub_rri(&mut ctx.text, A64::X0, A64::X0, 1)
-    a64_stur(&mut ctx.text, A64::X0, A64::X19, 8)
-    a64_mov_ri(&mut ctx.text, A64::X0, 1)
-
     def_label(&mut ctx.text, ".Lmap_remove_ret")
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::XZR, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
@@ -4671,6 +6484,17 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)  # key address
     x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)  # hash
     x64_mov_rr(&mut ctx.text, X64::R14, X64::RCX)  # eq_fn
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 probes the same bucket as the
+    # stored encoding and can never be confused with the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_remove_hash_nz")
+    x64_test_rr(&mut ctx.text, X64::R13, X64::R13)
+    x64_jcc(&mut ctx.text, CC::NE, lblHashNz.clone())
+    x64_mov_ri(&mut ctx.text, X64::R13, 1)
+    def_label(&mut ctx.text, lblHashNz)
+    # R15 = the chain PARENT of the current record (0 = the record is the
+    # bucket head) — the P0-CHAIN unlink authority (see the a64 arm).
+    x64_mov_ri(&mut ctx.text, X64::R15, 0)
 
     # probe (rbp) = buckets + (hash & (capacity - 1)) * bucket_stride
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
@@ -4697,6 +6521,7 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
     x64_jcc(&mut ctx.text, CC::NE, lblFound.clone())
     def_label(&mut ctx.text, lblNext.clone())
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RBP)  # the current record becomes the parent
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
     x64_add_rr(&mut ctx.text, X64::RBP, X64::RAX)
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, 0)
@@ -4709,13 +6534,21 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
     x64_jmp(&mut ctx.text, ".Lmap_remove_ret")
 
+    # P0-CHAIN: the found record (RBP, parent R15) is REAL-unlinked — the
+    # removed VALUE was already extracted (the fresh object on the stack);
+    # the head-with-successor case PROMOTES the successor's full record
+    # image into the removed slot and pushes the old successor node onto
+    # the free list; the chain-node case re-links the parent to the
+    # successor and pushes the removed node itself; a tail record is
+    # simply marked empty (hash = 0 — nothing follows it, so nothing is
+    # hidden). R15 stays the parent through the extraction (callee-saved).
     def_label(&mut ctx.text, lblFound.clone())
-    x64_mov_rm(&mut ctx.text, X64::R15, X64::RBX, 40)  # value_stride
-    x64_test_rr(&mut ctx.text, X64::R15, X64::R15)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 40)  # value_stride
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
     x64_jcc(&mut ctx.text, CC::E, lblFoundOne.clone())
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RCX)
     x64_call_label(&mut ctx.text, "_tg_mem_alloc")
-    x64_mov_rr(&mut ctx.text, X64::R15, X64::RAX)  # fresh value object
+    x64_push(&mut ctx.text, X64::RAX)  # fresh value object
     # copy the old value out: bucket + value_off -> object (the copy-loop
     # call convention is (count, src, dst); the swap makes RSI=src,
     # RDI=dst).
@@ -4723,25 +6556,58 @@ def emit_tg_map_remove_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 64)
     x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBP)
     x64_add_rr(&mut ctx.text, X64::RSI, X64::RAX)  # src = bucket + value_off
-    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)  # dst = fresh value object
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RSP, 0)  # dst = fresh value object
     emit_x64_copy_loop(ctx, X64::RCX, X64::RSI, X64::RDI)
-    # zero the hash field (empty marker); the chain link stays intact.
+
+    def_label(&mut ctx.text, lblFoundOne.clone())
+    x64_test_rr(&mut ctx.text, X64::R15, X64::R15)
+    x64_jcc(&mut ctx.text, CC::NE, ".Lmap_remove_chain_unlink")
+    # head: promote the successor into the removed slot, or mark empty
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # successor
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, ".Lmap_remove_zero_hash")
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 80)  # count = bucket_stride
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RCX)  # src = successor
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)  # dst = removed slot
+    emit_x64_copy_loop(ctx, X64::RDI, X64::RSI, X64::RDX)
+    # push the old successor node onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RCX)
+    x64_jmp(&mut ctx.text, ".Lmap_remove_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_chain_unlink")
+    # chain node: P->next = R->next; push R onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # R->next
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::R15)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)  # P + next_off
+    x64_mov_mr(&mut ctx.text, X64::R9, 0, X64::RCX)  # P->next = R->next
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # R[0] = free_list
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RBP)  # free_list = R
+    x64_jmp(&mut ctx.text, ".Lmap_remove_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_zero_hash")
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_remove_size_dec")
     # size--
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
     x64_sub_ri(&mut ctx.text, X64::RAX, 1)
     x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
-    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R15)
+    # return the fresh value object (or the Unit marker 1 for sets)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 40)
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, ".Lmap_remove_ret_unit")
+    x64_pop(&mut ctx.text, X64::RAX)  # fresh value object
     x64_jmp(&mut ctx.text, ".Lmap_remove_ret")
-
-    def_label(&mut ctx.text, lblFoundOne.clone())
-    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # zero the hash field
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
-    x64_sub_ri(&mut ctx.text, X64::RAX, 1)
-    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)  # size--
+    def_label(&mut ctx.text, ".Lmap_remove_ret_unit")
     x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+    x64_jmp(&mut ctx.text, ".Lmap_remove_ret")
 
     def_label(&mut ctx.text, ".Lmap_remove_ret")
     x64_pop(&mut ctx.text, X64::R15)
@@ -4763,11 +6629,14 @@ end
 # concrete K drop glue on the stored key's bytes. Args:
 # x0/rdi = map, x1/rsi = key address, x2/rdx = hash, x3/rcx = eq_fn,
 # x4/r8 = v_out (0 for Unit-valued maps — sets — nothing is copied).
-# Returns: x0/rax = the removed record's key address (record + key_off)
-# or 0 when the key is absent. The record is unlinked exactly like
-# _tg_map_remove (the hash field is zeroed — the empty marker — and the
-# chain link stays intact); the key bytes remain in the record until the
-# MIR's drop glue runs on the returned address.
+# Returns: x0/rax = the address holding the removed KEY's image (a fresh
+# copy when the removal clobbers the record's key bytes — the head-
+# promotion case — or the record's key slot itself otherwise: the chain-
+# node unlink and the tail case leave the key bytes in place), or 0 when
+# the key is absent. P0-CHAIN: the record is REAL-unlinked exactly like
+# _tg_map_remove (head promotion / chain-node re-link / tail empty-mark);
+# the removed key's image survives until the MIR's drop glue runs on the
+# returned address.
 def emit_tg_map_remove_key(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_remove_key")
   match ctx.target.arch
@@ -4792,12 +6661,24 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
     a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
     a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::XZR, A64::SP, -16)
 
     a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)  # map
     a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)  # key address
     a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)  # hash
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)  # eq_fn
     a64_mov_rr(&mut ctx.text, A64::X23, A64::X4)  # v_out (0 for sets)
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 probes the same bucket as the
+    # stored encoding and can never be confused with the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_remove_key_hash_nz")
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblHashNz.clone())
+    a64_mov_ri(&mut ctx.text, A64::X21, 1)
+    def_label(&mut ctx.text, lblHashNz)
+    # X25 = the chain PARENT of the current record (0 = the bucket head) —
+    # the P0-CHAIN unlink authority (see _tg_map_remove).
+    a64_mov_ri(&mut ctx.text, A64::X25, 0)
 
     # probe (X24) = buckets + (hash & (capacity - 1)) * bucket_stride
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 16)
@@ -4823,6 +6704,7 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_cmp_ri(&mut ctx.text, A64::X0, 0)
     a64_bcond(&mut ctx.text, a64_cc_ne(), lblFound.clone())
     def_label(&mut ctx.text, lblNext.clone())
+    a64_mov_rr(&mut ctx.text, A64::X25, A64::X24)  # the current record becomes the parent
     a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
     a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
     a64_ldr(&mut ctx.text, A64::X24, A64::X10, 0)
@@ -4847,17 +6729,73 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
 
     def_label(&mut ctx.text, lblFoundUnit.clone())
-    # zero the hash field (empty marker); the chain link stays intact.
-    a64_str(&mut ctx.text, A64::XZR, A64::X24, 0)
+    # P0-CHAIN + P0-OWN-KEY: the removed KEY's image must survive the
+    # unlink until the MIR's drop glue runs on the returned address. The
+    # head-promotion case CLOBBERS the record's key bytes (the successor's
+    # image is copied over them), so the key is extracted into a fresh
+    # allocation first; the chain-node unlink and the tail case leave the
+    # key bytes in place and return the record's key slot itself.
+    a64_cmp_ri(&mut ctx.text, A64::X25, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), ".Lmap_remove_key_ret_record")
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # successor
+    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), ".Lmap_remove_key_ret_record")
+    # fresh key copy (X20 = the returned key image address)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 24)
+    a64_bl(&mut ctx.text, "_tg_mem_alloc")
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X0)
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 24)
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 56)
+    a64_add_rrr(&mut ctx.text, A64::X1, A64::X24, A64::X9)  # src = record + key_off
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X20)  # dst
+    emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    a64_b(&mut ctx.text, ".Lmap_remove_key_unlink")
+    def_label(&mut ctx.text, ".Lmap_remove_key_ret_record")
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 56)
+    a64_add_rrr(&mut ctx.text, A64::X20, A64::X24, A64::X9)  # record + key_off
+    def_label(&mut ctx.text, ".Lmap_remove_key_unlink")
+    a64_cmp_ri(&mut ctx.text, A64::X25, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), ".Lmap_remove_key_chain_unlink")
+    # head: promote the successor into the removed slot, or mark empty
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # successor
+    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), ".Lmap_remove_key_zero_hash")
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 80)  # count = bucket_stride
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X11)  # src = successor
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X24)  # dst = removed slot
+    emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    # push the old successor node onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X11, 0)
+    a64_stur(&mut ctx.text, A64::X11, A64::X19, 88)
+    a64_b(&mut ctx.text, ".Lmap_remove_key_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_key_chain_unlink")
+    # chain node: P->next = R->next; push R onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X24, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # R->next
+    a64_add_rrr(&mut ctx.text, A64::X12, A64::X25, A64::X9)
+    a64_str(&mut ctx.text, A64::X11, A64::X12, 0)  # P->next = R->next
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X24, 0)  # R[0] = free_list
+    a64_stur(&mut ctx.text, A64::X24, A64::X19, 88)  # free_list = R
+    a64_b(&mut ctx.text, ".Lmap_remove_key_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_key_zero_hash")
+    a64_str(&mut ctx.text, A64::XZR, A64::X24, 0)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_remove_key_size_dec")
     # size--
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 8)
     a64_sub_rri(&mut ctx.text, A64::X0, A64::X0, 1)
     a64_stur(&mut ctx.text, A64::X0, A64::X19, 8)
-    # return the removed record's KEY ADDRESS
-    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 56)
-    a64_add_rrr(&mut ctx.text, A64::X0, A64::X24, A64::X9)
+    # return the removed key's image address (fresh copy or record slot)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X20)
 
     def_label(&mut ctx.text, ".Lmap_remove_key_ret")
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::XZR, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
@@ -4876,7 +6814,18 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)  # key address
     x64_mov_rr(&mut ctx.text, X64::R13, X64::RDX)  # hash
     x64_mov_rr(&mut ctx.text, X64::R14, X64::RCX)  # eq_fn
-    x64_mov_rr(&mut ctx.text, X64::R15, X64::R8)   # v_out (0 for sets)
+    x64_push(&mut ctx.text, X64::R8)   # v_out preserved on the stack (0 for sets)
+    # STORED-HASH ENCODING (P0-H0): stored = hash == 0 ? 1 : hash (see the
+    # map contract) — a user hash of 0 probes the same bucket as the
+    # stored encoding and can never be confused with the empty marker.
+    let lblHashNz = fresh_label(ctx, ".Lmap_remove_key_hash_nz")
+    x64_test_rr(&mut ctx.text, X64::R13, X64::R13)
+    x64_jcc(&mut ctx.text, CC::NE, lblHashNz.clone())
+    x64_mov_ri(&mut ctx.text, X64::R13, 1)
+    def_label(&mut ctx.text, lblHashNz)
+    # R15 = the chain PARENT of the current record (0 = the bucket head) —
+    # the P0-CHAIN unlink authority (see the a64 arm).
+    x64_mov_ri(&mut ctx.text, X64::R15, 0)
 
     # probe (rbp) = buckets + (hash & (capacity - 1)) * bucket_stride
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
@@ -4903,6 +6852,7 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
     x64_jcc(&mut ctx.text, CC::NE, lblFound.clone())
     def_label(&mut ctx.text, lblNext.clone())
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RBP)  # the current record becomes the parent
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
     x64_add_rr(&mut ctx.text, X64::RBP, X64::RAX)
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBP, 0)
@@ -4919,30 +6869,94 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 40)  # value_stride
     x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
     x64_jcc(&mut ctx.text, CC::E, lblFoundUnit.clone())
-    x64_test_rr(&mut ctx.text, X64::R15, X64::R15)
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::RSP, 0)  # v_out
+    x64_test_rr(&mut ctx.text, X64::R8, X64::R8)
     x64_jcc(&mut ctx.text, CC::E, lblFoundUnit.clone())
     # copy the removed value's image into the caller's slot: v_out is the
-    # dst (rdi) and src = record + value_off (rsi); the copy-loop
+    # dst (r10) and src = record + value_off (r9); the copy-loop
     # convention is (count r8, src r9, dst r10 — RAX is the byte temp).
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 64)  # value_off
     x64_mov_rr(&mut ctx.text, X64::R9, X64::RBP)
     x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)  # src = record + value_off
-    x64_mov_rr(&mut ctx.text, X64::R10, X64::R15)  # dst = v_out
-    x64_mov_rr(&mut ctx.text, X64::R8, X64::RCX)  # count = value_stride
+    x64_mov_rm(&mut ctx.text, X64::R10, X64::RSP, 0)  # dst = v_out
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::RBX, 40)  # count = value_stride
     emit_x64_copy_loop(ctx, X64::R8, X64::R9, X64::R10)
 
     def_label(&mut ctx.text, lblFoundUnit.clone())
+    # P0-CHAIN + P0-OWN-KEY: the removed KEY's image must survive the
+    # unlink until the MIR's drop glue runs on the returned address (see
+    # the a64 arm): the head-promotion case extracts the key into a fresh
+    # allocation; the chain-node unlink and the tail case return the
+    # record's key slot itself. R12 (dead key-address arg) carries the
+    # returned key image address.
+    x64_test_rr(&mut ctx.text, X64::R15, X64::R15)
+    x64_jcc(&mut ctx.text, CC::NE, ".Lmap_remove_key_ret_record")
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # successor
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, ".Lmap_remove_key_ret_record")
+    # fresh key copy (R12 = the returned key image address)
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 24)
+    x64_call_label(&mut ctx.text, "_tg_mem_alloc")
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 24)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 56)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RAX)  # src = record + key_off
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)  # dst
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RSI, X64::RDI)
+    x64_jmp(&mut ctx.text, ".Lmap_remove_key_unlink")
+    def_label(&mut ctx.text, ".Lmap_remove_key_ret_record")
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 56)
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::R12, X64::RAX)  # record + key_off
+    def_label(&mut ctx.text, ".Lmap_remove_key_unlink")
+    x64_test_rr(&mut ctx.text, X64::R15, X64::R15)
+    x64_jcc(&mut ctx.text, CC::NE, ".Lmap_remove_key_chain_unlink")
+    # head: promote the successor into the removed slot, or mark empty
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # successor
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, ".Lmap_remove_key_zero_hash")
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 80)  # count = bucket_stride
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RCX)  # src = successor
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)  # dst = removed slot
+    emit_x64_copy_loop(ctx, X64::RDI, X64::RSI, X64::RDX)
+    # push the old successor node onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RCX)
+    x64_jmp(&mut ctx.text, ".Lmap_remove_key_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_key_chain_unlink")
+    # chain node: P->next = R->next; push R onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # R->next
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::R15)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)  # P + next_off
+    x64_mov_mr(&mut ctx.text, X64::R9, 0, X64::RCX)  # P->next = R->next
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # R[0] = free_list
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RBP)  # free_list = R
+    x64_jmp(&mut ctx.text, ".Lmap_remove_key_size_dec")
+    def_label(&mut ctx.text, ".Lmap_remove_key_zero_hash")
     x64_mov_ri(&mut ctx.text, X64::RAX, 0)
-    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # zero the hash field
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_remove_key_size_dec")
+    # size--
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
     x64_sub_ri(&mut ctx.text, X64::RAX, 1)
-    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)  # size--
-    # return the removed record's KEY ADDRESS
-    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 56)
-    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RBP)
-    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
+    # return the removed key's image address (fresh copy or record slot)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
 
     def_label(&mut ctx.text, ".Lmap_remove_key_ret")
+    x64_pop(&mut ctx.text, X64::R8)   # discard the saved v_out
     x64_pop(&mut ctx.text, X64::R15)
     x64_pop(&mut ctx.text, X64::R14)
     x64_pop(&mut ctx.text, X64::R13)
@@ -4954,13 +6968,16 @@ def emit_tg_map_remove_key_full(ctx: &mut RuntimeEmitCtx) -> Unit
 end
 
 # _tg_map_destroy: release the map's bucket arena AND every mmap'ed
-# overflow node. Args: x0/rdi = map.
+# overflow node (the live chains AND the free-list nodes reclaimed by the
+# clear/remove paths). Args: x0/rdi = map.
 def emit_tg_map_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_destroy")
   let lblBucketLoop = fresh_label(ctx, ".Lmap_destroy_bucket_loop")
   let lblChain = fresh_label(ctx, ".Lmap_destroy_chain")
   let lblChainDone = fresh_label(ctx, ".Lmap_destroy_chain_done")
   let lblSkip = fresh_label(ctx, ".Lmap_destroy_skip")
+  let lblFreeChain = fresh_label(ctx, ".Lmap_destroy_free_chain")
+  let lblFreeDone = fresh_label(ctx, ".Lmap_destroy_free_done")
   match ctx.target.arch
   when Arch::AArch64 then
     a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
@@ -5023,6 +7040,30 @@ def emit_tg_map_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
       a64_svc(&mut ctx.text, 0)
     when _ then ()
     end
+    # Free the FREE-LIST nodes (the overflow nodes reclaimed by clear /
+    # remove / drain — each is its own mmap allocation; a node's [0] word
+    # carries the next free node).
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblFreeDone.clone())
+    def_label(&mut ctx.text, lblFreeChain.clone())
+    a64_ldr(&mut ctx.text, A64::X10, A64::X9, 0)  # next (save across munmap)
+    a64_stp_pre(&mut ctx.text, A64::X10, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)
+    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 80)  # bucket_stride
+    match ctx.target.os
+    when OsAbi::MacOS then
+      a64_mov_ri(&mut ctx.text, A64::X16, 73)  # munmap
+      a64_svc(&mut ctx.text, 0x80)
+    when OsAbi::Linux then
+      a64_mov_ri(&mut ctx.text, A64::X8, 215)  # munmap
+      a64_svc(&mut ctx.text, 0)
+    when _ then ()
+    end
+    a64_ldp_post(&mut ctx.text, A64::X9, A64::XZR, A64::SP, 16)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblFreeChain.clone())
+    def_label(&mut ctx.text, lblFreeDone.clone())
     a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
     a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
@@ -5036,26 +7077,32 @@ def emit_tg_map_destroy(ctx: &mut RuntimeEmitCtx) -> Unit
 end
 
 # _tg_map_drain_one: destructively remove the FIRST live entry and transfer
-# it into the caller's sret Option[(K, V)] slot (AArch64: x8).
+# it into the caller's sret Option[(K, V)] slot (AArch64: x8; x86-64: r8 —
+# the drain sret register set by the codegen at the call site).
 # The sret payload is the concrete (K, V) tuple: key at payload+0, value at
 # payload + t_v_off (t_v_off passed by the codegen). Args:
-# x0 = map, x8 = sret, x1 = t_v_off, x2 = t_size.
+# a64: x0 = map, x8 = sret, x1 = t_v_off, x2 = t_size;
+# x86: rdi = map, r8 = sret, rsi = t_v_off, rdx = t_size.
+# The drained record is REAL-unlinked (P0-CHAIN): the successor's full
+# record image is promoted into the drained slot and the old successor
+# node is pushed onto the free list, or the tail is marked empty — no
+# live entry is ever hidden behind a zeroed hash. After the P0-CHAIN
+# fixes, an empty bucket head can never carry a chain, so the scan only
+# looks at the bucket heads.
 def emit_tg_map_drain_one(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_drain_one")
   match ctx.target.arch
   when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_map_drain_one_full")
-  when Arch::X86_64  then x64_ud2(&mut ctx.text)
+  when Arch::X86_64  then x64_jmp(&mut ctx.text, "_tg_map_drain_one_full")
   end
 end
 
 def emit_tg_map_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_map_drain_one_full")
   let lblScan = fresh_label(ctx, ".Lmap_drain_scan")
-  let lblChain = fresh_label(ctx, ".Lmap_drain_chain")
-  let lblChainEnd = fresh_label(ctx, ".Lmap_drain_chain_end")
   let lblFoundBucket = fresh_label(ctx, ".Lmap_drain_found_bucket")
-  let lblFoundChain = fresh_label(ctx, ".Lmap_drain_found_chain")
   let lblRemove = fresh_label(ctx, ".Lmap_drain_remove")
+  let lblZeroHash = fresh_label(ctx, ".Lmap_drain_zero_hash")
   let lblDone = fresh_label(ctx, ".Lmap_drain_done")
   match ctx.target.arch
   when Arch::AArch64 then
@@ -5084,34 +7131,15 @@ def emit_tg_map_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     def_label(&mut ctx.text, lblScan.clone())
     a64_cmp_rr(&mut ctx.text, A64::X23, A64::X3)
     a64_bcond(&mut ctx.text, a64_cc_ge(), lblDone.clone())
-    a64_ldr(&mut ctx.text, A64::X4, A64::X23, 0)  # hash
+    a64_ldr(&mut ctx.text, A64::X4, A64::X23, 0)  # stored hash
     a64_cmp_ri(&mut ctx.text, A64::X4, 0)
     a64_bcond(&mut ctx.text, a64_cc_ne(), lblFoundBucket.clone())
-    # Overflow chain scan (entries chained off an empty head must drain too).
-    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 72)
-    a64_add_rrr(&mut ctx.text, A64::X1, A64::X23, A64::X1)
-    a64_ldr(&mut ctx.text, A64::X24, A64::X1, 0)  # chain
-    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblChainEnd.clone())
-    def_label(&mut ctx.text, lblChain.clone())
-    a64_ldr(&mut ctx.text, A64::X4, A64::X24, 0)  # chain entry hash
-    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblFoundChain.clone())
-    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 72)
-    a64_add_rrr(&mut ctx.text, A64::X1, A64::X24, A64::X1)
-    a64_ldr(&mut ctx.text, A64::X24, A64::X1, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblChain.clone())
-    def_label(&mut ctx.text, lblChainEnd.clone())
     a64_ldur(&mut ctx.text, A64::X1, A64::X19, 80)
     a64_add_rrr(&mut ctx.text, A64::X23, A64::X23, A64::X1)
     a64_b(&mut ctx.text, lblScan.clone())
 
     def_label(&mut ctx.text, lblFoundBucket.clone())
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X23)
-    a64_b(&mut ctx.text, lblRemove.clone())
-    def_label(&mut ctx.text, lblFoundChain.clone())
-    a64_mov_rr(&mut ctx.text, A64::X22, A64::X24)
     def_label(&mut ctx.text, lblRemove.clone())
     # sret: Some (disc = 0)
     a64_str(&mut ctx.text, A64::XZR, A64::X20, 0)
@@ -5128,8 +7156,26 @@ def emit_tg_map_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_add_rri(&mut ctx.text, A64::X2, A64::X20, 8)  # dst
     a64_add_rrr(&mut ctx.text, A64::X2, A64::X2, A64::X21)
     emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
-    # mark the record empty (hash = 0); the chain link stays intact.
-    a64_str(&mut ctx.text, A64::XZR, A64::X22, 0)
+    # P0-CHAIN: promote the successor's full record image into the drained
+    # slot (the drained entry's image was already copied to the sret), or
+    # mark the tail empty.
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X22, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # successor
+    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblZeroHash.clone())
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 80)  # count = bucket_stride
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X11)  # src = successor
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X22)  # dst = drained slot
+    emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    # push the old successor node onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X11, 0)
+    a64_stur(&mut ctx.text, A64::X11, A64::X19, 88)
+    a64_b(&mut ctx.text, ".Lmap_drain_size_dec")
+    def_label(&mut ctx.text, lblZeroHash.clone())
+    a64_str(&mut ctx.text, A64::XZR, A64::X22, 0)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_drain_size_dec")
     # size--
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 8)
     a64_sub_rri(&mut ctx.text, A64::X0, A64::X0, 1)
@@ -5142,29 +7188,121 @@ def emit_tg_map_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
   when Arch::X86_64 then
-    x64_ud2(&mut ctx.text)
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)  # map
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RSI)  # t_v_off
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::R8)   # sret
+
+    # Default: None (disc = 1)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RAX)
+
+    # end = buckets + capacity * bucket_stride (R15); current = R14
+    x64_mov_rm(&mut ctx.text, X64::R14, X64::RBX, 0)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 80)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::R15, X64::RAX)
+
+    def_label(&mut ctx.text, lblScan.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R14, X64::R15)
+    x64_jcc(&mut ctx.text, CC::GE, lblDone.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::R14, 0)  # stored hash
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lblFoundBucket.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 80)
+    x64_add_rr(&mut ctx.text, X64::R14, X64::RAX)
+    x64_jmp(&mut ctx.text, lblScan)
+
+    def_label(&mut ctx.text, lblFoundBucket.clone())
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::R14)
+    def_label(&mut ctx.text, lblRemove.clone())
+    # sret: Some (disc = 0)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RAX)
+    # key bytes: rec + key_off -> sret + 8
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 24)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 56)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RAX)  # src
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)
+    x64_add_ri(&mut ctx.text, X64::RDI, 8)  # dst
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RSI, X64::RDI)
+    # value bytes: rec + value_off -> sret + 8 + t_v_off
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 40)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 64)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RAX)  # src
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)
+    x64_add_ri(&mut ctx.text, X64::RDI, 8)  # dst
+    x64_add_rr(&mut ctx.text, X64::RDI, X64::R12)
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RSI, X64::RDI)
+    # P0-CHAIN: promote the successor's full record image into the drained
+    # slot (the drained entry's image was already copied to the sret), or
+    # mark the tail empty.
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # successor
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, lblZeroHash.clone())
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 80)  # count = bucket_stride
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RCX)  # src = successor
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)  # dst = drained slot
+    emit_x64_copy_loop(ctx, X64::RDI, X64::RSI, X64::RDX)
+    # push the old successor node onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RCX)
+    x64_jmp(&mut ctx.text, ".Lmap_drain_size_dec")
+    def_label(&mut ctx.text, lblZeroHash.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)  # tail: empty marker
+    def_label(&mut ctx.text, ".Lmap_drain_size_dec")
+    # size--
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
+
+    def_label(&mut ctx.text, lblDone.clone())
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
   end
 end
 
 # _tg_set_drain_one: destructively remove the FIRST live element of a set
 # (a Map[T, Unit]) into the caller's sret Option[T] slot. Args:
-# x0 = set, x8 = sret.
+# a64: x0 = set, x8 = sret; x86: rdi = set, r8 = sret.
+# The drained record is REAL-unlinked (P0-CHAIN — the successor's full
+# record image is promoted into the drained slot and the old successor
+# node is pushed onto the free list, or the tail is marked empty), exactly
+# like _tg_map_drain_one.
 def emit_tg_set_drain_one(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_set_drain_one")
   match ctx.target.arch
   when Arch::AArch64 then a64_b(&mut ctx.text, "_tg_set_drain_one_full")
-  when Arch::X86_64  then x64_ud2(&mut ctx.text)
+  when Arch::X86_64  then x64_jmp(&mut ctx.text, "_tg_set_drain_one_full")
   end
 end
 
 def emit_tg_set_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_set_drain_one_full")
   let lblScan = fresh_label(ctx, ".Lset_drain_scan")
-  let lblChain = fresh_label(ctx, ".Lset_drain_chain")
-  let lblChainEnd = fresh_label(ctx, ".Lset_drain_chain_end")
   let lblFoundBucket = fresh_label(ctx, ".Lset_drain_found_bucket")
-  let lblFoundChain = fresh_label(ctx, ".Lset_drain_found_chain")
   let lblRemove = fresh_label(ctx, ".Lset_drain_remove")
+  let lblZeroHash = fresh_label(ctx, ".Lset_drain_zero_hash")
   let lblDone = fresh_label(ctx, ".Lset_drain_done")
   match ctx.target.arch
   when Arch::AArch64 then
@@ -5193,30 +7331,12 @@ def emit_tg_set_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ldr(&mut ctx.text, A64::X4, A64::X23, 0)
     a64_cmp_ri(&mut ctx.text, A64::X4, 0)
     a64_bcond(&mut ctx.text, a64_cc_ne(), lblFoundBucket.clone())
-    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 72)
-    a64_add_rrr(&mut ctx.text, A64::X1, A64::X23, A64::X1)
-    a64_ldr(&mut ctx.text, A64::X24, A64::X1, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
-    a64_bcond(&mut ctx.text, a64_cc_eq(), lblChainEnd.clone())
-    def_label(&mut ctx.text, lblChain.clone())
-    a64_ldr(&mut ctx.text, A64::X4, A64::X24, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblFoundChain.clone())
-    a64_ldur(&mut ctx.text, A64::X1, A64::X19, 72)
-    a64_add_rrr(&mut ctx.text, A64::X1, A64::X24, A64::X1)
-    a64_ldr(&mut ctx.text, A64::X24, A64::X1, 0)
-    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
-    a64_bcond(&mut ctx.text, a64_cc_ne(), lblChain.clone())
-    def_label(&mut ctx.text, lblChainEnd.clone())
     a64_ldur(&mut ctx.text, A64::X1, A64::X19, 80)
     a64_add_rrr(&mut ctx.text, A64::X23, A64::X23, A64::X1)
     a64_b(&mut ctx.text, lblScan.clone())
 
     def_label(&mut ctx.text, lblFoundBucket.clone())
     a64_mov_rr(&mut ctx.text, A64::X22, A64::X23)
-    a64_b(&mut ctx.text, lblRemove.clone())
-    def_label(&mut ctx.text, lblFoundChain.clone())
-    a64_mov_rr(&mut ctx.text, A64::X22, A64::X24)
     def_label(&mut ctx.text, lblRemove.clone())
     a64_str(&mut ctx.text, A64::XZR, A64::X20, 0)  # Some (disc = 0)
     # element bytes: rec + key_off -> sret + 8
@@ -5225,7 +7345,25 @@ def emit_tg_set_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_add_rrr(&mut ctx.text, A64::X1, A64::X22, A64::X1)  # src
     a64_add_rri(&mut ctx.text, A64::X2, A64::X20, 8)  # dst
     emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    # P0-CHAIN: promote the successor's full record image into the drained
+    # slot, or mark the tail empty.
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 72)
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X22, A64::X9)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 0)  # successor
+    a64_cmp_ri(&mut ctx.text, A64::X11, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblZeroHash.clone())
+    a64_ldur(&mut ctx.text, A64::X0, A64::X19, 80)  # count = bucket_stride
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X11)  # src = successor
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X22)  # dst = drained slot
+    emit_a64_copy_loop(ctx, A64::X0, A64::X1, A64::X2)
+    # push the old successor node onto the free list
+    a64_ldur(&mut ctx.text, A64::X9, A64::X19, 88)
+    a64_str(&mut ctx.text, A64::X9, A64::X11, 0)
+    a64_stur(&mut ctx.text, A64::X11, A64::X19, 88)
+    a64_b(&mut ctx.text, ".Lset_drain_size_dec")
+    def_label(&mut ctx.text, lblZeroHash.clone())
     a64_str(&mut ctx.text, A64::XZR, A64::X22, 0)
+    def_label(&mut ctx.text, ".Lset_drain_size_dec")
     a64_ldur(&mut ctx.text, A64::X0, A64::X19, 8)
     a64_sub_rri(&mut ctx.text, A64::X0, A64::X0, 1)
     a64_stur(&mut ctx.text, A64::X0, A64::X19, 8)
@@ -5237,7 +7375,82 @@ def emit_tg_set_drain_one_full(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
   when Arch::X86_64 then
-    x64_ud2(&mut ctx.text)
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RDI)  # set
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::R8)   # sret
+
+    x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RAX)
+
+    x64_mov_rm(&mut ctx.text, X64::R14, X64::RBX, 0)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 80)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::R14)
+    x64_add_rr(&mut ctx.text, X64::R15, X64::RAX)
+
+    def_label(&mut ctx.text, lblScan.clone())
+    x64_cmp_rr(&mut ctx.text, X64::R14, X64::R15)
+    x64_jcc(&mut ctx.text, CC::GE, lblDone.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::R14, 0)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lblFoundBucket.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 80)
+    x64_add_rr(&mut ctx.text, X64::R14, X64::RAX)
+    x64_jmp(&mut ctx.text, lblScan)
+
+    def_label(&mut ctx.text, lblFoundBucket.clone())
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::R14)
+    def_label(&mut ctx.text, lblRemove.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::R13, 0, X64::RAX)  # Some (disc = 0)
+    # element bytes: rec + key_off -> sret + 8
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 24)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 56)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RSI, X64::RAX)  # src
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R13)
+    x64_add_ri(&mut ctx.text, X64::RDI, 8)  # dst
+    emit_x64_copy_loop(ctx, X64::RCX, X64::RSI, X64::RDI)
+    # P0-CHAIN: promote the successor's full record image into the drained
+    # slot, or mark the tail empty.
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 72)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RDX, 0)  # successor
+    x64_test_rr(&mut ctx.text, X64::RCX, X64::RCX)
+    x64_jcc(&mut ctx.text, CC::E, lblZeroHash.clone())
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 80)  # count = bucket_stride
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RCX)  # src = successor
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RBP)  # dst = drained slot
+    emit_x64_copy_loop(ctx, X64::RDI, X64::RSI, X64::RDX)
+    # push the old successor node onto the free list
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 88)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 0, X64::RAX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 88, X64::RCX)
+    x64_jmp(&mut ctx.text, ".Lset_drain_size_dec")
+    def_label(&mut ctx.text, lblZeroHash.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RBP, 0, X64::RAX)
+    def_label(&mut ctx.text, ".Lset_drain_size_dec")
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 8)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 1)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
+
+    def_label(&mut ctx.text, lblDone.clone())
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
   end
 end
 
@@ -5267,10 +7480,13 @@ def emit_tg_map_contains(ctx: &mut RuntimeEmitCtx) -> Unit
   end
 end
 
-# _tg_map_clear: Zero the hash field of every table record (the empty
-# marker), stepping by the header's bucket_stride; size = 0. Args: x0/rdi.
+# _tg_map_clear: Clear the map (P0-CLR). Every bucket head's hash and
+# next are zeroed, every chain's overflow nodes are linked into the
+# header's FREE LIST (each node's [0] word becomes the free-list next
+# pointer) so later insertions REUSE them instead of mmap'ing fresh ones,
+# and size = 0. The chain link of every head is severed, so no lookup or
+# drain can ever walk into a reclaimed node. Args: x0/rdi.
 def emit_tg_map_clear(ctx: &mut RuntimeEmitCtx) -> Unit
-  def_runtime_fn(ctx, "_tg_map_clear")
 
   match ctx.target.arch
   when Arch::AArch64 then
@@ -5278,18 +7494,44 @@ def emit_tg_map_clear(ctx: &mut RuntimeEmitCtx) -> Unit
     a64_ldur(&mut ctx.text, A64::X10, A64::X9, 0)   # buckets
     a64_ldur(&mut ctx.text, A64::X11, A64::X9, 16)  # capacity
     a64_ldur(&mut ctx.text, A64::X12, A64::X9, 80)  # bucket_stride
+    a64_mul_rrr(&mut ctx.text, A64::X11, A64::X11, A64::X12)
+    a64_add_rrr(&mut ctx.text, A64::X11, A64::X10, A64::X11)  # end
 
     let lblLoop = fresh_label(ctx, ".Lmap_clear_loop")
     let lblDone = fresh_label(ctx, ".Lmap_clear_done")
+    let lblChain = fresh_label(ctx, ".Lmap_clear_chain")
+    let lblChainDone = fresh_label(ctx, ".Lmap_clear_chain_done")
 
-    a64_mov_ri(&mut ctx.text, A64::X13, 0)
+    # X10 (buckets — consumed by the end computation) is reused as the
+    # free-list temp inside the loop.
+    a64_mov_rr(&mut ctx.text, A64::X13, A64::X10)  # current record
     def_label(&mut ctx.text, lblLoop.clone())
     a64_cmp_rr(&mut ctx.text, A64::X13, A64::X11)
     a64_bcond(&mut ctx.text, a64_cc_eq(), lblDone.clone())
-    a64_mul_rrr(&mut ctx.text, A64::X14, A64::X13, A64::X12)
-    a64_add_rrr(&mut ctx.text, A64::X14, A64::X10, A64::X14)
-    a64_str(&mut ctx.text, A64::XZR, A64::X14, 0)  # hash = 0
-    a64_add_rri(&mut ctx.text, A64::X13, A64::X13, 1)
+    # Collect the chain: every node at head->next and beyond goes onto the
+    # free list (P0-CLR) — a free node's [0] word carries the free-list
+    # next pointer.
+    a64_ldur(&mut ctx.text, A64::X14, A64::X9, 72)  # next_off
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X13, A64::X14)
+    a64_ldr(&mut ctx.text, A64::X14, A64::X14, 0)  # node
+    def_label(&mut ctx.text, lblChain.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X14, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblChainDone.clone())
+    a64_ldur(&mut ctx.text, A64::X15, A64::X9, 72)
+    a64_add_rrr(&mut ctx.text, A64::X15, A64::X14, A64::X15)
+    a64_ldr(&mut ctx.text, A64::X15, A64::X15, 0)  # next
+    a64_ldur(&mut ctx.text, A64::X10, A64::X9, 88)  # free_list
+    a64_str(&mut ctx.text, A64::X10, A64::X14, 0)  # node[0] = free_list
+    a64_stur(&mut ctx.text, A64::X14, A64::X9, 88)  # free_list = node
+    a64_mov_rr(&mut ctx.text, A64::X14, A64::X15)
+    a64_b(&mut ctx.text, lblChain.clone())
+    def_label(&mut ctx.text, lblChainDone.clone())
+    # zero the head's hash AND its next link (the chain is severed).
+    a64_str(&mut ctx.text, A64::XZR, A64::X13, 0)  # hash = 0
+    a64_ldur(&mut ctx.text, A64::X14, A64::X9, 72)
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X13, A64::X14)
+    a64_str(&mut ctx.text, A64::XZR, A64::X14, 0)  # next = 0
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X13, A64::X12)
     a64_b(&mut ctx.text, lblLoop)
 
     def_label(&mut ctx.text, lblDone.clone())
@@ -5303,20 +7545,45 @@ def emit_tg_map_clear(ctx: &mut RuntimeEmitCtx) -> Unit
     x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 0)   # buckets
     x64_mov_rm(&mut ctx.text, X64::RDX, X64::RCX, 16)  # capacity
     x64_mov_rm(&mut ctx.text, X64::RSI, X64::RCX, 80)  # bucket_stride
+    x64_imul_rr(&mut ctx.text, X64::RDX, X64::RSI)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RAX)  # end
 
     let lblLoop = fresh_label(ctx, ".Lmap_clear_loop")
     let lblDone = fresh_label(ctx, ".Lmap_clear_done")
+    let lblChain = fresh_label(ctx, ".Lmap_clear_chain")
+    let lblChainDone = fresh_label(ctx, ".Lmap_clear_chain_done")
 
-    x64_mov_ri(&mut ctx.text, X64::R8, 0)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RAX)  # current record
     def_label(&mut ctx.text, lblLoop.clone())
-    x64_cmp_rr(&mut ctx.text, X64::R8, X64::RDX)
+    x64_cmp_rr(&mut ctx.text, X64::RDI, X64::RDX)
     x64_jcc(&mut ctx.text, CC::E, lblDone.clone())
+    # Collect the chain onto the free list (P0-CLR).
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 72)  # next_off
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::RDI)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RAX)
+    x64_mov_rm(&mut ctx.text, X64::R8, X64::R8, 0)  # node
+    def_label(&mut ctx.text, lblChain.clone())
+    x64_test_rr(&mut ctx.text, X64::R8, X64::R8)
+    x64_jcc(&mut ctx.text, CC::E, lblChainDone.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 72)  # next_off
     x64_mov_rr(&mut ctx.text, X64::R9, X64::R8)
-    x64_imul_rr(&mut ctx.text, X64::R9, X64::RSI)
     x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)
-    x64_mov_ri(&mut ctx.text, X64::R10, 0)
-    x64_mov_mr(&mut ctx.text, X64::R9, 0, X64::R10)  # hash = 0
-    x64_add_ri(&mut ctx.text, X64::R8, 1)
+    x64_mov_rm(&mut ctx.text, X64::R9, X64::R9, 0)  # next
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 88)  # free_list
+    x64_mov_mr(&mut ctx.text, X64::R8, 0, X64::RAX)  # node[0] = free_list
+    x64_mov_mr(&mut ctx.text, X64::RCX, 88, X64::R8)  # free_list = node
+    x64_mov_rr(&mut ctx.text, X64::R8, X64::R9)
+    x64_jmp(&mut ctx.text, lblChain)
+    def_label(&mut ctx.text, lblChainDone.clone())
+    # zero the head's hash AND its next link (the chain is severed).
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 0, X64::RAX)  # hash = 0
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RCX, 72)  # next_off
+    x64_mov_rr(&mut ctx.text, X64::R9, X64::RDI)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::R9, 0, X64::RAX)  # next = 0
+    x64_add_rr(&mut ctx.text, X64::RDI, X64::RSI)
     x64_jmp(&mut ctx.text, lblLoop)
 
     def_label(&mut ctx.text, lblDone.clone())
