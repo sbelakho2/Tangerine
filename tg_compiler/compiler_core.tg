@@ -10,11 +10,11 @@ use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
   Program, ModuleId, Module, Crate, AstPath, TypeExpr, TypeExprKind,
-  MacroDecl, Item, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
+  MacroDecl, ModuleDecl, Item, ItemId, ItemKind, Block, Stmt, StmtKind, Expr, ExprKind, UseDecl,
   FnBody, FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, PatternKind, type_expr_name,
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
 }
-use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded}
+use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded, diag_macro_ambiguity}
 use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, TypedProgram, extract_import_paths, TypeEnv}
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
@@ -339,7 +339,7 @@ end
 
 pub def print_source_location(e: &DiagnosticEmitter, span: Span) -> Unit
   # Find the source file containing this span using span.file
-  var found_file: Option[&SourceFile] = Option::None
+  var found_file: Option[SourceFile] = Option::None
   for f in e.source_map.files do
     if f.name == span.file then
       found_file = Option::Some(&f)
@@ -830,13 +830,20 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
       deinit_plans: typed.deinit_plans,
       aggregate_ownership: typed.aggregate_ownership,
       finalize_plan: res_result.finalize_plan,
-      edge_cleanup: res_result.edge_cleanup,
+      # P0-CE: the String-keyed edge_cleanup serialization is DELETED from
+      # the checker's result; the TypedProgram field (types.tg) is kept
+      # empty and unread — the MIR consumes the CleanupEdge table through
+      # the checker's own result channel (lower_program re-runs
+      # resource_check and reads plan_result.cfg).
+      edge_cleanup: Map::new(),
       type_names: typed.type_names,
       deinit_targets: typed.deinit_targets,
       type_fields: typed.type_fields,
       type_variants: typed.type_variants,
       type_params: typed.type_params,
-      type_kinds: typed.type_kinds
+      type_kinds: typed.type_kinds,
+      generic_param_ids: typed.generic_param_ids,
+      generic_param_names: typed.generic_param_names
     })
   when Result::Err(res_errors) then
     if res_errors.len() > 0 then
@@ -1521,26 +1528,28 @@ end
 # with compiler internals. The full lib.tg is only for users embedding the
 # complete compiler.
 #
-# MODULE FLATTENING (P0-AM): imported modules are recursively parsed and their
-# items merged into one Program. This makes type identity name-global:
-# a::Config and b::Config share the same TypeId. Until the Crate-based
-# store_type_def migration, same-named types across modules are merged by
-# store_type_def in types.tg.
+# MODULE FLATTENING (P0-AM): imported modules are recursively parsed and
+# their items merged into one Program, and the Crate module table is the
+# single module identity (see the P0-AM note below). store_type_def
+# (types.tg) registers each declaration under its module-qualified key, so
+# same-named DISTINCT types in different modules are distinct module-local
+# types — never merged.
 #
 # P0-AM module table (construction site): while flattening, this function
 # (with collect_dep_file below) BUILDS the Program.crate Crate — the single
 # module table the reviewer's design specifies: Crate { root: ModuleId,
 # modules: Map[ModuleId, Module] }, one Module per distinct module, each
-# indexing the contiguous [start, end) range of its items in the flat
-# Program.items. ModuleIds are assigned in processing order: the root module
-# (the main program's top-level items) is id 0, and each distinct dependency
-# gets the next id — the `loaded` set dedups, so every module path is
-# recorded exactly once. The flat items vector stays the interface; the
-# Crate is CONSUMED by the resolver's per-module registration tables
-# (SymbolTable.module_tables, keyed by each Module's path joined by "::") —
-# the first-wins REGISTRATION decision for every item is
-# (owner ModuleId, namespace, name) against that per-module table, so a
-# same-named declaration in a DIFFERENT file module registers its own
+# carrying its OWN item list (Module.items: Vec[ItemId] — an ItemId is the
+# item's index into the flat Program.items) and path, and every item its
+# owner ModuleId directly. ModuleIds are assigned in processing order: the
+# root module (the main program's top-level items) is id 0, and each
+# distinct dependency gets the next id — the `loaded` set dedups, so every
+# module path is recorded exactly once. The flat items vector stays the
+# interface; the Crate is CONSUMED by the resolver's per-module
+# registration tables (SymbolTable.module_tables, keyed by each Module's
+# path joined by "::") — the first-wins REGISTRATION decision for every
+# item is (owner ModuleId, namespace, name) against that per-module table,
+# so a same-named declaration in a DIFFERENT file module registers its own
 # qualified entry instead of failing the root bare-name occupancy.
 pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Result[Program, String]
   var loaded = Set::new()
@@ -1548,20 +1557,28 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
   var merged_modules = Map::new()
   # Program items first  ensures the main program's definitions
   # (especially main) take priority over dependency definitions.
+  # Shared iteration is projected (by reference): the element is cloned for
+  # the move into the merged list (consuming iteration is not supported yet).
   for item in program.items do
-    merged_items.push(item)
+    merged_items.push(item.clone())
   end
   # P0-AM: the root module (id 0, empty path, no imports) covers the main
   # program's top-level items; dependencies get ids 1, 2, ... in processing
-  # order.
-  var root_range = Vec::new()
-  root_range.push(0)
-  root_range.push(merged_items.len())
+  # order. P1: the root module's per-module item list (Module.items:
+  # Vec[ItemId]) is built here — each ItemId the flat index of one main
+  # program item (the items already carry the root owner ModuleId from the
+  # parser's make_item).
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
   let root_id = ModuleId { id: 0 }
   merged_modules.insert(root_id, Module {
     id: root_id,
     path: Vec::new(),
-    item_indices: root_range,
+    items: root_items,
     imports: Vec::new()
   })
   # Canonical bootstrap source list: when compiling the compiler itself
@@ -1758,23 +1775,35 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
   # each distinct module is processed exactly once; diamond and cyclic imports
   # neither duplicate items nor recurse forever. Items of a module stay
   # contiguous after its own imports, so per-module ordering is preserved.
-  # P0-AM (module table — construction site): record this module's Module in
+  # P1 (module table — construction site): record this module's Module in
   # the Crate here — the `loaded` dedup above guarantees exactly one entry
   # per distinct module path, and the ModuleId is its processing order
-  # (root = 0, then 1, 2, ... in dependency-processing order). The item range
-  # [start, end) is taken around the push loop below, so it indexes the flat
-  # Program.items exactly. The module's imports field carries its own use
-  # declarations (path joins) for the Crate's import-graph transition. The
-  # resolver's per-module registration tables (SymbolTable.module_tables)
-  # key by this path joined by "::" — the module path join is the per-module
-  # identity the (owner ModuleId, namespace, name) duplicate test runs
-  # against.
-  var mod_range = Vec::new()
-  mod_range.push(out.len())
+  # (root = 0, then 1, 2, ... in dependency-processing order). The per-module
+  # item list (Module.items: Vec[ItemId]) is built HERE, once, around the
+  # push loop below — each ItemId is the pushed item's index into the flat
+  # Program.items — and EVERY pushed item is stamped with its owning
+  # dep_id (Item.owner_module), so owner lookups are table reads, never
+  # range scans. The module's imports field carries its own use declarations
+  # (path joins) for the Crate's import-graph transition. The resolver's
+  # per-module registration tables (SymbolTable.module_tables) key by this
+  # path joined by "::" — the module path join is the per-module identity
+  # the (owner ModuleId, namespace, name) duplicate test runs against.
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  # Shared iteration is projected: clone the item for the move into `out`,
+  # stamping the dependency's ModuleId onto the clone (the parser's root
+  # default no longer applies — this item belongs to this file module).
   for item in dep_ast.items do
-    out.push(item)
+    var owned = item.clone()
+    owned.owner_module = dep_id
+    out.push(owned)
   end
-  mod_range.push(out.len())
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
   var mod_imports = Vec::new()
   for item in dep_ast.items do
     match item.kind
@@ -1783,11 +1812,10 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
     when _ then ()
     end
   end
-  let dep_id = ModuleId { id: modules.len() }
   modules.insert(dep_id, Module {
     id: dep_id,
     path: module_path_from_file(&path),
-    item_indices: mod_range,
+    items: mod_items,
     imports: mod_imports
   })
   Result::Ok(())
@@ -1822,25 +1850,161 @@ pub def print_mir(mir: &MirProgram) -> Unit
 end
 
 pub struct MacroEnv
+  # P1 (macro identity): the macro table is MODULE-SCOPED. Every macro is
+  # registered under its module-qualified identity — the (module path, name)
+  # pair rendered with the resolver's module-qualified key form
+  # ("path::name", the root module's empty path degenerates to the bare
+  # name, exactly like module_qualified_key in resolver.tg) — so macros obey
+  # the same module/import ambiguity rules as other declarations: a macro
+  # defined in module a is NOT visible as a bare name in module b, and two
+  # macros with the same name in the same module (or imported into the same
+  # scope) are an ambiguity ERROR (E107), never a last-wins shadow. The
+  # qualified keys are MacroId { module_path, name } rendered by macro_id_key.
   macros: Map[String, MacroDecl]
-  # Recursion stack for hygiene (prevents infinite expansion)
+  # P1 (macro identity): the module path (Program.crate module path) of the
+  # item currently being expanded. expand_program_pass sets it per item from
+  # the item's OWNER ModuleId (program.items[i].owner_module -> the crate
+  # table — see module_path_for_item); it is the resolution anchor for
+  # bare macro names and for relative qualified paths at call sites.
+  current_module: Vec[String]
+  # P1 (macro identity): per-module import tables for macro names — module
+  # path join -> the qualified keys of the macros its use declarations bring
+  # into scope. Bare-name lookup consults the current module's table after
+  # its own definitions; two imports naming the same local macro from
+  # different modules is an ambiguity error (E107).
+  macro_imports: Map[String, Vec[String]]
+  # P1 (macro identity): per-module import tables for MODULE aliases —
+  # module path join -> the imported module paths (from `use a::b;` /
+  # braced / glob declarations, mirroring the resolver's import machinery).
+  # Qualified path resolution expands a first segment that aliases an
+  # imported module path.
+  module_imports: Map[String, Vec[Vec[String]]]
+  # Recursion stack for macro identity (prevents infinite expansion)
   expansion_stack: Vec[String]
-  # P1 (macro hygiene): per-program expansion context counter. Every macro
-  # expansion consumes one context id (see instantiate_macro); the ids stamp
-  # the identifiers the expansion introduces so no two expansions and no
-  # expansion and its surrounding scope can collide. The counter is monotonic
-  # across the 64-pass fixpoint loop (the env outlives all passes), so the
-  # ids are unique per program.
+  # P1 (macro hygiene, structural): per-program expansion context counter.
+  # Every macro expansion interns one fresh syntax-context mark (see
+  # intern_syntax_context); the marks stamp the identifiers the expansion
+  # introduces so no two expansions and no expansion and its surrounding
+  # scope can collide. The counter is monotonic across the 64-pass fixpoint
+  # loop (the env outlives all passes), so the marks are unique per program.
   #
   # Context COMPOSITION: an expansion is stamped with a context STACK (the
-  # per-expansion id plus the ids of every enclosing expansion whose body it
-  # is nested inside), so the marker becomes `__hygiene_<c1>_<c2>_name` when
-  # an inner expansion runs inside the outer expansion's body — the inner
-  # generated names can never collide with the outer's even when their
-  # spellings match (see the expand_expr macro arms: the substituted body of
-  # an expansion is re-expanded with the composed stack inherited from the
-  # outer context).
+  # per-expansion mark plus the marks of every enclosing expansion whose
+  # body it is nested inside), so the identifier key carries the whole stack
+  # (see identifier_key_of) — an inner expansion's generated names can never
+  # collide with the outer's even when their symbols match (see the
+  # expand_expr macro arms: the substituted body of an expansion is
+  # re-expanded with the composed stack inherited from the outer context).
   expansion_counter: Int
+  # P1 (macro hygiene, structural): the SYNTAX-CONTEXT INTERN TABLE — every
+  # fresh mark records the composed context stack it represents (the parent
+  # stack plus the mark itself). The marks are the interned syntax contexts
+  # of the generated Identifier { symbol, syntax_context } values; the
+  # resolver keys locals by identifier string, and the stamped key is the
+  # (symbol, context) pair rendered in an identifier-impossible encoding
+  # (see identifier_key_of: `$` is outside the lexer's identifier charset,
+  # so no user-written identifier can ever equal a generated key).
+  syntax_contexts: Map[Int, Vec[Int]]
+  # P1 (macro identity): diagnostics recorded during expansion (macro
+  # ambiguity E107, recorded at the call/definition site). expand_macros
+  # drains this bag into the parser's diagnostic channel after the fixpoint
+  # loop (and before the early returns), so an ambiguity fails the
+  # compilation through diag_has_errors like every other parser diagnostic.
+  diagnostics: Vec[Diagnostic]
+end
+
+# P1 (macro hygiene, structural): the generated identifier — the SYMBOL
+# (the spelling the macro body used) plus the INTERNED SYNTAX-CONTEXT MARK
+# (the fresh expansion mark that owns the identifier). Two identifiers with
+# the same symbol but different contexts are DIFFERENT identifiers; a user
+# identifier (no mark) can never equal a generated one because the rendered
+# key carries the mark in an identifier-impossible encoding.
+pub struct Identifier
+  symbol: String
+  syntax_context: Int
+end
+
+# P1 (macro identity): the module-scoped identity of a macro definition —
+# the owner module path plus the bare name. Registered and looked up through
+# the module-qualified key form (macro_id_key), the same module-qualified
+# machinery the resolver uses for every other declaration.
+pub struct MacroId
+  module_path: Vec[String]
+  name: String
+end
+
+# The module-qualified key of a MacroId: "path::name" (the root module's
+# empty path degenerates to the bare name) — the exact key form the
+# resolver's module-qualified symbol tables use, so macro identity follows
+# the same module scoping as functions/types/traits.
+pub def macro_id_key(id: &MacroId) -> String
+  let joined = id.module_path.join("::")
+  if joined.is_empty() then
+    id.name.clone()
+  else
+    joined + "::" + id.name.clone()
+  end
+end
+
+# The structural key of a generated identifier under a composed context
+# stack: the (symbol, context) pair rendered as `symbol$c1$c2$...` — the
+# innermost (fresh) mark last. `$` is NOT in the lexer's identifier charset
+# (lexer.tg is_ident_char = [A-Za-z0-9_]), so the rendered key is
+# IMPOSSIBLE for user code to spell: a user writing any identifier, however
+# mangled, produces a different string, and a generated binding can never
+# be captured by (or capture) a user binding. The resolver keys locals by
+# identifier string, so a stamped binding resolves exactly against its own
+# stamped references — resolution IS by (symbol, context).
+pub def identifier_key_of(id: &Identifier, ctx_stack: &Vec[Int]) -> String
+  var out = id.symbol.clone()
+  var ci = 0
+  while ci < ctx_stack.len() do
+    out = out + "$" + ctx_stack[ci].to_string()
+    ci = ci + 1
+  end
+  out
+end
+
+# The Identifier of a macro-body-own name under the composed context stack:
+# the syntax_context is the FRESH mark of the expansion doing the stamping
+# (the innermost level of the composed stack).
+pub def hygiene_identifier(symbol: &String, ctx_stack: &Vec[Int]) -> Identifier
+  var mark = 0
+  if ctx_stack.len() > 0 then
+    mark = ctx_stack[ctx_stack.len() - 1]
+  end
+  Identifier { symbol: symbol.clone(), syntax_context: mark }
+end
+
+# Intern a fresh syntax-context mark for one macro expansion: the mark is
+# the monotonic per-program counter, and the intern table records the
+# composed stack it represents (the inherited parent stack plus the mark).
+# Returns the fresh mark. (Like the rest of the expansion machinery, the
+# env is borrowed through the compiler's single `&` reference form, which
+# permits the interior mutation of the counter and the intern table.)
+pub def intern_syntax_context(env: &MacroEnv, parent: &Vec[Int]) -> Int
+  env.expansion_counter = env.expansion_counter + 1
+  var stack = parent.clone()
+  stack.push(env.expansion_counter)
+  env.syntax_contexts.insert(env.expansion_counter, stack)
+  env.expansion_counter
+end
+
+# The module-qualified key of a macro (module path, name) — the MacroId
+# key form. The root module's empty path degenerates to the bare name.
+def macro_key_from(module_path: &Vec[String], name: &String) -> String
+  var id = MacroId { module_path: module_path.clone(), name: name.clone() }
+  macro_id_key(&id)
+end
+
+# Whether a module-qualified macro key names the given bare macro name (the
+# root-module degenerate form is the bare name itself).
+def macro_key_matches_name(key: &String, name: &String) -> Bool
+  if key == name then
+    return true
+  end
+  let suffix = "::" + name.clone()
+  key.len() > suffix.len() && key.slice(key.len() - suffix.len(), key.len()) == suffix
 end
 
 pub struct ExpandedProgram
@@ -1883,6 +2047,224 @@ pub struct ExpandedExprVec
   did_expand: Bool
 end
 
+# The module path owning the flat item at `item_idx` — a TABLE READ (P1):
+# the item's OWNER ModuleId (Item.owner_module, stamped at the module-
+# assembly construction sites) keys Program.crate.modules directly; the
+# owner Module's path is the item's module path (the root module's empty
+# path when the owner Module is missing from the table — the same root
+# fallback the resolver's module_path_of_item_resolver uses). No range
+# scanning: the item list of a module is per-module (Module.items), and the
+# owner lookup never walks it.
+def module_path_for_item(program: &Program, item_idx: Int) -> Vec[String]
+  let owner = program.items[item_idx].owner_module
+  match program.crate.modules.get(owner)
+  when Option::Some(info) then
+    var path = Vec::new()
+    for seg in info.path do
+      path.push(seg.clone())
+    end
+    path
+  when Option::None then
+    Vec::new()
+  end
+end
+
+# Register one macro under its module-qualified identity. A same-named
+# macro already registered in the SAME module is an ambiguity error (E107)
+# — the per-module occupancy rule of every other declaration, instead of
+# the old global last-wins shadowing.
+def register_macro(env: &mut MacroEnv, module_path: &Vec[String], name: &String, decl: &MacroDecl, span: Span) -> Unit
+  let key = macro_key_from(module_path, name)
+  if env.macros.contains_key(&key) then
+    diag_macro_ambiguity(&mut env.diagnostics, "macro '" + name.clone() + "' is defined more than once in module '" +
+      module_path.join("::") + "' (macro identity is module-scoped; rename one of the definitions)", span)
+  else
+    env.macros.insert(key, decl.clone())
+  end
+end
+
+# Register the macros of an inline module tree under the composed module
+# path (parent path + the inline module's segment).
+def register_module_tree_macros(env: &mut MacroEnv, module_path: &Vec[String], md: &ModuleDecl) -> Unit
+  var child_path = module_path.clone()
+  child_path.push(md.name.clone())
+  for item in md.items do
+    match item.kind
+    when ItemKind::ItemMacro(m) then
+      register_macro(env, &child_path, &m.name, &m, item.span)
+    when ItemKind::ItemModule(nested) then
+      register_module_tree_macros(env, &child_path, &nested)
+    when _ then ()
+    end
+  end
+end
+
+# Record the macros a use declaration brings into `module_path`'s scope:
+#   - braced imports (`use a::b::{m, n}`) import the named macros of the
+#     target module;
+#   - plain imports (`use a::b::m`) import the named macro of `a::b` (and,
+#     for a module import `use a::b`, the macros of `a::b` under the last
+#     segment's alias);
+#   - glob imports (`use a::b::*`) import every macro of `a::b`.
+# Only names that actually resolve to a REGISTERED macro are recorded, so
+# ordinary name imports never pollute the macro tables.
+def record_module_imports(env: &mut MacroEnv, module_path: &Vec[String], u: &UseDecl) -> Unit
+  let mod_key = module_path.join("::")
+  var module_imports: Vec[Vec[String]] = match env.module_imports.get(&mod_key)
+  when Option::Some(list) then list.clone()
+  when Option::None then Vec::new()
+  end
+  module_imports.push(u.path.segments.clone())
+  env.module_imports.insert(mod_key, module_imports)
+  match u.names
+  when Option::Some(names) then
+    for n in names do
+      let key = macro_key_from(&u.path.segments, &n)
+      if env.macros.contains_key(&key) then
+        record_imported_macro_key(env, module_path, &key)
+      end
+    end
+  when Option::None then
+    if u.glob then
+      let module_entries = env.macros.entries()
+      for (key, _) in module_entries do
+        if key.starts_with(u.path.segments.join("::") + "::") then
+          record_imported_macro_key(env, module_path, &key)
+        end
+      end
+    else
+      let seg_count = u.path.segments.len()
+      if seg_count > 0 then
+        let last = u.path.segments[seg_count - 1].clone()
+        var mod_segs = u.path.segments.clone()
+        mod_segs.pop()
+        var key = macro_key_from(&mod_segs, &last)
+        if env.macros.contains_key(&key) then
+          record_imported_macro_key(env, module_path, &key)
+        end
+        key = macro_key_from(&u.path.segments, &last)
+        if env.macros.contains_key(&key) then
+          record_imported_macro_key(env, module_path, &key)
+        end
+      end
+    end
+  end
+end
+
+def record_imported_macro_key(env: &mut MacroEnv, module_path: &Vec[String], key: &String) -> Unit
+  let mod_key = module_path.join("::")
+  var list: Vec[String] = match env.macro_imports.get(&mod_key)
+  when Option::Some(existing) then existing.clone()
+  when Option::None then Vec::new()
+  end
+  if !list.contains(key) then
+    list.push(key.clone())
+    env.macro_imports.insert(mod_key, list)
+  end
+end
+
+def record_module_tree_imports(env: &mut MacroEnv, module_path: &Vec[String], md: &ModuleDecl) -> Unit
+  var child_path = module_path.clone()
+  child_path.push(md.name.clone())
+  for item in md.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then record_module_imports(env, &child_path, &u)
+    when ItemKind::ItemModule(nested) then record_module_tree_imports(env, &child_path, &nested)
+    when _ then ()
+    end
+  end
+end
+
+# The qualified keys of the macros the module's imports bring into scope
+# under the given bare name (the current module's own definitions are
+# consulted separately by lookup_macro).
+def imported_macro_candidates(env: &MacroEnv, module_path: &Vec[String], name: &String) -> Vec[String]
+  var out = Vec::new()
+  let mod_key = module_path.join("::")
+  match env.macro_imports.get(&mod_key)
+  when Option::Some(keys) then
+    for key in keys do
+      if macro_key_matches_name(&key, name) then
+        out.push(key.clone())
+      end
+    end
+  when Option::None then ()
+  end
+  out
+end
+
+# Add a (module path, name) candidate to the candidate list, deduplicated
+# by qualified key.
+def push_macro_candidate(candidates: &mut Vec[String], env: &MacroEnv, module_path: &Vec[String], name: &String) -> Unit
+  let key = macro_key_from(module_path, name)
+  if env.macros.contains_key(&key) && !candidates.contains(&key) then
+    candidates.push(key)
+  end
+end
+
+# Resolve a macro invocation path at the CURRENT module (env.current_module)
+# to its module-qualified KEY:
+#   - bare paths (`m`) resolve in the current module first, then through its
+#     imports (use declarations);
+#   - qualified paths (`a::b::m`) resolve relative to the current module,
+#     then absolutely against the root, then through import aliases (the
+#     first segment aliasing an imported module path) — the resolver's
+#     module-qualified machinery;
+#   - MORE THAN ONE candidate is an ambiguity ERROR (E107) — the same
+#     ambiguity rule other declarations obey.
+# Returns Option::None when no macro matches (the call may be an ordinary
+# function call). Ambiguity is recorded in env.diagnostics (the parser's
+# channel), which expand_macros drains after the fixpoint loop.
+pub def lookup_macro(env: &MacroEnv, segments: &Vec[String], span: &Span) -> Option[String]
+  var candidates: Vec[String] = Vec::new()
+  if segments.len() == 1 then
+    let name = segments[0]
+    push_macro_candidate(&mut candidates, env, &env.current_module, &name)
+    for key in imported_macro_candidates(env, &env.current_module, &name) do
+      if !candidates.contains(&key) then
+        candidates.push(key)
+      end
+    end
+  else
+    let name = segments[segments.len() - 1].clone()
+    var mod_segs = segments.slice(0, segments.len() - 1)
+    # Relative: the module path of the call site plus the written segments.
+    var rel_path = env.current_module.clone()
+    for seg in mod_segs do
+      rel_path.push(seg.clone())
+    end
+    push_macro_candidate(&mut candidates, env, &rel_path, &name)
+    # Absolute: the written segments against the root.
+    push_macro_candidate(&mut candidates, env, &mod_segs, &name)
+    # Import aliases: the first segment aliases an imported module path
+    # (`use a::b;` then `b::c::m` -> `a::b::c::m`), mirroring the resolver's
+    # record_path_call_target alias expansion.
+    let mod_key = env.current_module.join("::")
+    match env.module_imports.get(&mod_key)
+    when Option::Some(imports) then
+      for imp in imports do
+        if imp.len() > 0 && imp[imp.len() - 1] == segments[0] then
+          var alias_path = imp.slice(0, imp.len() - 1)
+          for seg in mod_segs do
+            alias_path.push(seg.clone())
+          end
+          push_macro_candidate(&mut candidates, env, &alias_path, &name)
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  match candidates.len()
+  when 0 then Option::None
+  when 1 then Option::Some(candidates[0].clone())
+  when _ then
+    diag_macro_ambiguity(&mut env.diagnostics, "macro '" + segments[segments.len() - 1].clone() +
+      "' is ambiguous: it resolves to more than one module-qualified macro (" +
+      candidates.join(", ") + ")", span.clone())
+    Option::None
+  end
+end
+
 # P1 (macro hygiene, expansion-depth contract): `diags` is the parser's
 # diagnostic channel. The 64-pass fixpoint below is the DEPTH CAP: when it
 # does not converge (an expansion chain longer than 64 levels, e.g. a macro
@@ -1893,19 +2275,56 @@ end
 # skip-semantic-checks paths) checks diag_has_errors on the bag and returns
 # the failed state before lowering.
 pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
-  # Phase 1: collect macro declarations
-  var env = MacroEnv { macros: Map::new(), expansion_stack: Vec::new(), expansion_counter: 0 }
-  for item in program.items do
-    match item.kind
+  # Phase 1: collect macro declarations, MODULE-SCOPED. Every macro registers
+  # under the module path of its owning module (from Program.crate's module
+  # table, read via the item's OWNER ModuleId — module_path_for_item is a
+  # table read, no range scan; inline module trees append their segment).
+  # A same-named macro in the same module is an ambiguity ERROR
+  # (E107), not a last-wins shadow — the same per-module occupancy rule the
+  # resolver applies to every other declaration.
+  var env = MacroEnv {
+    macros: Map::new(),
+    current_module: Vec::new(),
+    macro_imports: Map::new(),
+    module_imports: Map::new(),
+    expansion_stack: Vec::new(),
+    expansion_counter: 0,
+    syntax_contexts: Map::new(),
+    diagnostics: Vec::new()
+  }
+  var mi = 0
+  while mi < program.items.len() do
+    let module_path = module_path_for_item(&program, mi)
+    match program.items[mi].kind
     when ItemKind::ItemMacro(m) then
-      let key = m.name.clone()
-      let val = m.clone()
-      env.macros.insert(key, val)
+      register_macro(&mut env, &module_path, &m.name, &m, program.items[mi].span)
+    when ItemKind::ItemModule(md) then
+      register_module_tree_macros(&mut env, &module_path, &md)
     when _ then ()
     end
+    mi = mi + 1
   end
 
-  # If no macros defined, return as-is
+  # Phase 1b: per-module macro import tables (the module-scoped counterpart
+  # of the resolver's import machinery — `use` declarations bring macro
+  # names into the importing module's scope).
+  mi = 0
+  while mi < program.items.len() do
+    let module_path = module_path_for_item(&program, mi)
+    match program.items[mi].kind
+    when ItemKind::ItemUse(u) then
+      record_module_imports(&mut env, &module_path, &u)
+    when ItemKind::ItemModule(md) then
+      record_module_tree_imports(&mut env, &module_path, &md)
+    when _ then ()
+    end
+    mi = mi + 1
+  end
+
+  # If no macros defined, return as-is (a registration-time ambiguity error
+  # implies at least one macro WAS registered, so no diagnostics can be
+  # pending when this early return is taken; the single drain below covers
+  # every recorded macro diagnostic).
   if env.macros.is_empty() then
     return program
   end
@@ -1928,6 +2347,12 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
     pass = pass + 1
   end
 
+  # The parser's diagnostic channel receives the env-recorded lookup
+  # diagnostics (call-site macro ambiguity, E107).
+  for d in env.diagnostics do
+    diags.push(d.clone())
+  end
+
   # Phase 3: remove macro declarations from the output AST
   let current_span = current.span.clone()
   var filtered_items = Vec::new()
@@ -1937,32 +2362,32 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
     when _ then filtered_items.push(item.clone())
     end
   end
-  # P0-A (module table): the modules map indexes into the filtered items, so
-  # it is rebuilt here — each module's contiguous [start, end) range shrinks
-  # by the macro declarations dropped before/inside it. The flat Program
-  # stays the interface; the rebuilt table is what the resolver's per-module
-  # registration tables (module_tables, keyed by path join) consume, keeping
-  # the per-module first-wins foundation valid past macro filtering.
+  # P1 (module table): the modules map indexes the filtered items, so it is
+  # rebuilt here — per module, its OWN item list (Module.items) is walked,
+  # macro declarations are dropped, and every surviving ItemId is remapped
+  # to its new flat index (the count of macros removed so far). The flat
+  # Program stays the interface; the rebuilt table is what the resolver's
+  # per-module registration tables (module_tables, keyed by path join)
+  # consume, keeping the per-module first-wins foundation valid past macro
+  # filtering. The filtered items keep their owner ModuleId (they are
+  # cloned with it), and the module ids are carried unchanged.
   var filtered_modules = Map::new()
   var removed_global = 0
   let module_entries = current.crate.modules.entries()
   for (mid, info) in module_entries do
     var removed_in_module = 0
-    var ji = info.item_indices[0]
-    while ji < info.item_indices[1] do
-      match current.items[ji].kind
+    var new_items = Vec::new()
+    for it_id in info.items do
+      match current.items[it_id.id].kind
       when ItemKind::ItemMacro(_) then removed_in_module = removed_in_module + 1
-      when _ then ()
+      when _ then
+        new_items.push(ItemId { id: it_id.id - removed_global - removed_in_module })
       end
-      ji = ji + 1
     end
-    var new_indices = Vec::new()
-    new_indices.push(info.item_indices[0] - removed_global)
-    new_indices.push(info.item_indices[1] - removed_global - removed_in_module)
     filtered_modules.insert(mid, Module {
       id: mid,
       path: info.path.clone(),
-      item_indices: new_indices,
+      items: new_items,
       imports: info.imports.clone()
     })
     removed_global = removed_global + removed_in_module
@@ -2207,8 +2632,14 @@ pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
   var did_expand = false
   var i = 0
   while i < program.items.len() do
+    # P1 (macro identity): anchor the resolution of this item's macro calls
+    # in its OWNING module (the item's owner ModuleId read through the crate
+    # table — module_path_for_item; no range scan). A bare macro
+    # name resolves in this module; a qualified path resolves relative to it
+    # (then absolutely, then through import aliases).
+    env.current_module = module_path_for_item(&program, i)
     let expanded_item = expand_item(env, program.items[i].clone())
-    new_items.push(expanded_item.item)
+    new_items.push(expanded_item.item.clone())
     if expanded_item.did_expand then did_expand = true end
     i = i + 1
   end
@@ -2239,7 +2670,7 @@ pub def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
     var did_expand = false
     for method in impl_block.methods do
       let expanded_method = expand_function_decl(env, &method)
-      new_methods.push(expanded_method.func)
+      new_methods.push(expanded_method.func.clone())
       if expanded_method.did_expand then did_expand = true end
     end
     let new_impl = ImplDecl {
@@ -2268,7 +2699,7 @@ pub def expand_item(env: &MacroEnv, item: Item) -> ExpandedItem
     var did_expand = false
     for ti in trait_decl.methods do
       let expanded = expand_trait_method(env, ti)
-      new_methods.push(expanded.method)
+      new_methods.push(expanded.method.clone())
       if expanded.did_expand then did_expand = true end
     end
     let new_trait = TraitDecl {
@@ -2374,7 +2805,7 @@ pub def expand_block(env: &MacroEnv, block: &Block, ctx_stack: &Vec[Int]) -> Exp
   var i = 0
   while i < block.stmts.len() do
     let expanded_stmt = expand_stmt(env, &block.stmts[i], ctx_stack)
-    new_stmts.push(expanded_stmt.stmt)
+    new_stmts.push(expanded_stmt.stmt.clone())
     if expanded_stmt.did_expand then did_expand = true end
     i = i + 1
   end
@@ -2468,7 +2899,7 @@ pub def expand_exprs(env: &MacroEnv, args: &Vec[Expr], ctx_stack: &Vec[Int]) -> 
   var i = 0
   while i < args.len() do
     let expanded_arg = expand_expr(env, &args[i], ctx_stack)
-    new_args.push(expanded_arg.expr)
+    new_args.push(expanded_arg.expr.clone())
     if expanded_arg.did_expand then did_expand = true end
     i = i + 1
   end
@@ -2518,11 +2949,12 @@ end
 
 # ctx_stack: the P1 hygiene context stack inherited from the expansions whose
 # body this walk is inside (empty at the root of a pass). The macro arms
-# COMPOSE it: each instantiation appends its fresh context id, and the
-# substituted body is then re-expanded under the composed stack, so nested
-# macro calls inside that body inherit the outer expansion's context and
-# their generated names are marked with BOTH contexts
-# (`__hygiene_<c1>_<c2>_name` — see instantiate_macro).
+# COMPOSE it: each instantiation interns a fresh syntax-context mark (see
+# intern_syntax_context) appended to the inherited stack, and the substituted
+# body is then re-expanded under the composed stack, so nested macro calls
+# inside that body inherit the outer expansion's context and their generated
+# identifiers carry BOTH contexts (their keys render the whole composed
+# stack — see identifier_key_of).
 pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> ExpandedExpr
   match expr.kind
   when ExprKind::ExprCall(callee, args) then
@@ -2540,32 +2972,46 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
         when _ then ()
         end
       end
-      let name = path_to_name(&path)
-      match env.macros.get(&name)
-      when Option::Some(macro_decl) then
-        if env.expansion_stack.contains(&name) then
+      # P1 (macro identity): macro lookup is module-qualified — the path's
+      # segments resolve against the call site's module (bare names in the
+      # current module and its imports; qualified paths relatively,
+      # absolutely, and through import aliases); ambiguity is an error.
+      match lookup_macro(env, &path.segments, &expr.span)
+      when Option::Some(qualified_key) then
+        match env.macros.get(&qualified_key)
+        when Option::Some(macro_decl) then
+          if env.expansion_stack.contains(&qualified_key) then
+            ExpandedExpr {
+              expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + macro_decl.name.clone() + "'"), span: expr.span, node_id: 0 },
+              did_expand: false
+            }
+          else
+            env.expansion_stack.push(qualified_key.clone())
+            # P1 (macro hygiene, context composition): each expansion interns
+            # one unique syntax-context mark (intern_syntax_context records it
+            # in the intern table), which is APPENDED to the inherited stack —
+            # the substituted body's nested macro calls then run with the
+            # composed context. The substituted body is re-expanded IMMEDIATELY
+            # under the composed stack (the nested ExprMacroCall inside it is
+            # expanded here, not on a later pass), so the inner expansion's
+            # generated identifiers carry both the outer and the inner
+            # contexts and can never collide with the outer-marked names even
+            # when their symbols match.
+            let fresh_mark = intern_syntax_context(env, ctx_stack)
+            var composed_ctx = ctx_stack.clone()
+            composed_ctx.push(fresh_mark)
+            let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
+            let re_expanded = expand_expr(env, &expanded, &composed_ctx)
+            env.expansion_stack.pop()
+            ExpandedExpr { expr: re_expanded.expr, did_expand: true }
+          end
+        when Option::None then
+          ## Not a macro  expand arguments recursively
+          let ec = expand_expr(env, &callee, ctx_stack)
           ExpandedExpr {
-            expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + name.clone() + "'"), span: expr.span, node_id: 0 },
-            did_expand: false
+            expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
+            did_expand: ec.did_expand || ea.did_expand
           }
-        else
-          env.expansion_stack.push(name.clone())
-          # P1 (macro hygiene, context composition): each expansion consumes
-          # one unique context id (per-expansion counter, unchanged), which is
-          # APPENDED to the inherited stack — the substituted body's nested
-          # macro calls then run with the composed context. The substituted
-          # body is re-expanded IMMEDIATELY under the composed stack (the
-          # nested ExprMacroCall inside it is expanded here, not on a later
-          # pass), so the inner expansion's generated names carry both the
-          # outer and the inner contexts and can never collide with the
-          # outer-marked names even when their spellings match.
-          env.expansion_counter = env.expansion_counter + 1
-          var composed_ctx = ctx_stack.clone()
-          composed_ctx.push(env.expansion_counter)
-          let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
-          let re_expanded = expand_expr(env, &expanded, &composed_ctx)
-          env.expansion_stack.pop()
-          ExpandedExpr { expr: re_expanded.expr, did_expand: true }
         end
       when Option::None then
         ## Not a macro  expand arguments recursively
@@ -2584,26 +3030,40 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
       }
     end
   when ExprKind::ExprMacroCall(name, args) then
-    match env.macros.get(&name)
-    when Option::Some(macro_decl) then
-      if env.expansion_stack.contains(&name) then
+    # P1 (macro identity): the bare name resolves in the call site's module
+    # (current module first, then its imports); ambiguity is an error.
+    var bare_segments = Vec::new()
+    bare_segments.push(name.clone())
+    match lookup_macro(env, &bare_segments, &expr.span)
+    when Option::Some(qualified_key) then
+      match env.macros.get(&qualified_key)
+      when Option::Some(macro_decl) then
+        if env.expansion_stack.contains(&qualified_key) then
+          ExpandedExpr {
+            expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + name.clone() + "'"), span: expr.span, node_id: 0 },
+            did_expand: false
+          }
+        else
+          env.expansion_stack.push(qualified_key.clone())
+          # P1 (macro hygiene, context composition): see the ExprCall arm —
+          # the fresh context mark is interned and appended to the inherited
+          # context stack and the substituted body is re-expanded under the
+          # composed context so a nested macro call inside the body inherits
+          # the outer context.
+          let fresh_mark = intern_syntax_context(env, ctx_stack)
+          var composed_ctx = ctx_stack.clone()
+          composed_ctx.push(fresh_mark)
+          let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
+          let re_expanded = expand_expr(env, &expanded, &composed_ctx)
+          env.expansion_stack.pop()
+          ExpandedExpr { expr: re_expanded.expr, did_expand: true }
+        end
+      when Option::None then
+        let ea = expand_exprs(env, &args, ctx_stack)
         ExpandedExpr {
-          expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + name.clone() + "'"), span: expr.span, node_id: 0 },
-          did_expand: false
+          expr: Expr { kind: ExprKind::ExprMacroCall(name.clone(), ea.args), span: expr.span, node_id: 0 },
+          did_expand: ea.did_expand
         }
-      else
-        env.expansion_stack.push(name.clone())
-        # P1 (macro hygiene, context composition): see the ExprCall arm — the
-        # per-expansion counter is appended to the inherited context stack and
-        # the substituted body is re-expanded under the composed context so a
-        # nested macro call inside the body inherits the outer context.
-        env.expansion_counter = env.expansion_counter + 1
-        var composed_ctx = ctx_stack.clone()
-        composed_ctx.push(env.expansion_counter)
-        let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
-        let re_expanded = expand_expr(env, &expanded, &composed_ctx)
-        env.expansion_stack.pop()
-        ExpandedExpr { expr: re_expanded.expr, did_expand: true }
       end
     when Option::None then
       let ea = expand_exprs(env, &args, ctx_stack)
@@ -2823,14 +3283,54 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
       expr: Expr { kind: ExprKind::ExprComptime(eb.block), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
     }
+  when ExprKind::ExprEnumVariant(path, args) then
+    # P1 (macro identity): module-qualified calls ("a::m!(x)" — the parser
+    # produces ExprEnumVariant for qualified call paths) may name a macro in
+    # another module. Resolve the path module-qualified first; when it names
+    # a macro, expand it; otherwise keep the variant construction (with the
+    # arguments expanded).
+    match lookup_macro(env, &path.segments, &expr.span)
+    when Option::Some(qualified_key) then
+      match env.macros.get(&qualified_key)
+      when Option::Some(macro_decl) then
+        if env.expansion_stack.contains(&qualified_key) then
+          ExpandedExpr {
+            expr: Expr { kind: ExprKind::ExprError("recursive macro invocation: '" + macro_decl.name.clone() + "'"), span: expr.span, node_id: 0 },
+            did_expand: false
+          }
+        else
+          env.expansion_stack.push(qualified_key.clone())
+          let fresh_mark = intern_syntax_context(env, ctx_stack)
+          var composed_ctx = ctx_stack.clone()
+          composed_ctx.push(fresh_mark)
+          let expanded = instantiate_macro(macro_decl, &args, &expr.span, &composed_ctx)
+          let re_expanded = expand_expr(env, &expanded, &composed_ctx)
+          env.expansion_stack.pop()
+          ExpandedExpr { expr: re_expanded.expr, did_expand: true }
+        end
+      when Option::None then
+        let ea = expand_exprs(env, &args, ctx_stack)
+        ExpandedExpr {
+          expr: Expr { kind: ExprKind::ExprEnumVariant(path.clone(), ea.args), span: expr.span, node_id: 0 },
+          did_expand: ea.did_expand
+        }
+      end
+    when Option::None then
+      let ea = expand_exprs(env, &args, ctx_stack)
+      ExpandedExpr {
+        expr: Expr { kind: ExprKind::ExprEnumVariant(path.clone(), ea.args), span: expr.span, node_id: 0 },
+        did_expand: ea.did_expand
+      }
+    end
   when _ then ExpandedExpr { expr: expr.clone(), did_expand: false }
   end
 end
 
 # hygiene_ctx is the composed P1 context STACK for this expansion: the
-# per-expansion context id appended to the stack of every enclosing expansion
-# whose body this call is nested inside (see expand_expr's macro arms). The
-# stamping below uses the whole stack, so nested expansions compose.
+# per-expansion syntax-context mark appended to the stack of every enclosing
+# expansion whose body this call is nested inside (see expand_expr's macro
+# arms — intern_syntax_context). The stamping below uses the whole stack, so
+# nested expansions compose.
 pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &Span, hygiene_ctx: &Vec[Int]) -> Expr
   # Validate argument count matches parameter count
   if args.len() != macro_decl.params.len() then
@@ -2840,38 +3340,44 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
       span: call_span.clone() }
   end
 
-  # ── P1 macro hygiene (expansion-context stamping) ─────────────────────
-  # Every expansion is assigned a unique numeric context id (drawn from
-  # MacroEnv.expansion_counter before this call), appended to the INHERITED
-  # context stack (hygiene_ctx — the expansion ids of the enclosing
-  # expansions whose body this call sits inside; empty for top-level calls).
-  # The substitution walk below then distinguishes the two kinds of names the
-  # expansion contains:
+  # ── P1 macro hygiene (structural, context-based stamping) ──────────────
+  # Every expansion is assigned a unique SYNTAX-CONTEXT MARK (interned by
+  # intern_syntax_context before this call — the mark is the innermost level
+  # of the INHERITED context stack hygiene_ctx, whose outer levels are the
+  # marks of the enclosing expansions whose body this call sits inside;
+  # empty for top-level calls). The substitution walk below then
+  # distinguishes the two kinds of names the expansion contains:
   #
   #   1. USER-VISIBLE tokens — the macro parameters are replaced by the
   #      argument expressions the user wrote, which are cloned as-is and
   #      NEVER re-stamped: the user's names stay exactly as spelled.
   #   2. MACRO-BODY-OWN identifiers — names introduced BY THE MACRO
-  #      DEFINITION (its let-bound temporaries) are re-stamped to the
-  #      reserved form  `__hygiene_<c1>_<c2>_..._name`  — binding AND every
-  #      use of that binding inside the body, where <c1>, <c2>, ... are the
-  #      composed context stack levels (the innermost expansion's id last).
-  #      The resolver keys locals by name string, so a stamped binding is a
-  #      distinct local: it can neither capture a surrounding `tmp` (its name
-  #      no longer matches) nor be captured by one (surrounding references
-  #      to `tmp` no longer see it). CONTEXT COMPOSITION: when this expansion
-  #      is nested inside another macro's body, the outer context id is part
-  #      of the stack, so this expansion's generated names carry BOTH
-  #      contexts (`__hygiene_<c1>_<c2>_name` for an inner expansion inside
-  #      the outer's body) and can never collide with the outer-marked names
-  #      even when their spellings match. Free identifiers in expression
-  #      positions are left untouched: they legitimately resolve to names
-  #      outside the macro.
+  #      DEFINITION (its let-bound temporaries) become generated
+  #      Identifier { symbol, syntax_context } values (hygiene_identifier):
+  #      binding AND every use of that binding inside the body are stamped
+  #      with the composed context stack, and the identifier KEY rendered
+  #      from (symbol, context) is what the AST carries (identifier_key_of
+  #      — `symbol$c1$c2$...`, the innermost expansion's mark last). The
+  #      resolver keys locals by identifier string, so a stamped binding is
+  #      a distinct local: it can neither capture a surrounding `tmp` (its
+  #      key no longer matches) nor be captured by one (surrounding
+  #      references to `tmp` no longer see it). CONTEXT COMPOSITION: when
+  #      this expansion is nested inside another macro's body, the outer
+  #      mark is part of the stack, so this expansion's generated
+  #      identifiers carry BOTH contexts and can never collide with the
+  #      outer-marked names even when their symbols match. Free identifiers
+  #      in expression positions are left untouched: they legitimately
+  #      resolve to names outside the macro.
   #
-  # Marker scheme: the stamp is a valid identifier for the lexer's charset
-  # (lexer.tg is_ident_char = [A-Za-z0-9_]; `$` is NOT accepted, so `_` is
-  # the join char) and therefore round-trips through any re-lexing, while
-  # `__hygiene_` is a RESERVED prefix: user code must not spell it.
+  # Marker scheme (STRUCTURAL, not spelling-based): the key is rendered with
+  # `$` as the separator — `$` is NOT in the lexer's identifier charset
+  # (lexer.tg is_ident_char = [A-Za-z0-9_]), so the rendered key is an
+  # identifier NO user-written source text can produce. Hygiene therefore
+  # does not depend on a reserved prefix a user must avoid: a user writing
+  # any spelling, including the old reserved-prefix mangle form, cannot
+  # capture a generated binding, because their identifier lexes to a
+  # different string (the `$` mark can never be part of it). The intern
+  # table (MacroEnv.syntax_contexts) records each mark's composed stack.
   # Shadowing rule: names re-bound by constructs the stamp does NOT rename
   # (closure params, match patterns) shadow the stamp at their references,
   # so those references stay untouched and keep resolving to the shadow.
@@ -2893,7 +3399,7 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
   end
 
   # Clone the macro body, substitute the argument tokens, and stamp the
-  # macro-body-own bindings with this expansion's hygiene context.
+  # macro-body-own bindings with this expansion's syntax context.
   var empty_frames: Vec[Map[String, Bool]] = Vec::new()
   let substituted_block = substitute_block(&subst_map, hygiene_ctx, &empty_frames, &macro_decl.body)
 
@@ -2916,23 +3422,7 @@ end
 # and the re-stamp is applied at lookup time with the composed context
 # STACK, so the composed keys extend the existing shadow-frame machinery
 # unchanged: a binding and its references always land on the same
-# `__hygiene_<c1>_<c2>_..._name` regardless of nesting depth.
-
-# P1 (macro hygiene, context composition): the marker joins ALL levels of
-# the composed context stack — `__hygiene_<c1>_<name>` for a top-level
-# expansion, `__hygiene_<c1>_<c2>_<name>` when the expansion is nested
-# inside another expansion's body (the innermost id last). Each level is a
-# distinct per-expansion id, so composed keys are globally unique per
-# program and the inner generated names can never collide with the outer's.
-def hygiene_mangled(ctx_stack: &Vec[Int], name: String) -> String
-  var prefix = "__hygiene_"
-  var ci = 0
-  while ci < ctx_stack.len() do
-    prefix = prefix + ctx_stack[ci].to_string() + "_"
-    ci = ci + 1
-  end
-  prefix + name
-end
+# (symbol, context)-derived key regardless of nesting depth.
 
 def hygiene_ident_lookup(frames: &Vec[Map[String, Bool]], name: &String) -> Option[Bool]
   var fi = frames.len()
@@ -2972,7 +3462,11 @@ def hygiene_renamed_pattern(ctx_stack: &Vec[Int], subst: &Map[String, Expr], pat
     if subst.contains_key(&name) then
       Pattern { kind: PatternKind::Ident(name.clone(), is_mut), span: pat.span, node_id: 0 }
     else
-      Pattern { kind: PatternKind::Ident(hygiene_mangled(ctx_stack, name.clone()), is_mut), span: pat.span, node_id: 0 }
+      # P1 (structural hygiene): the binding becomes a generated identifier
+      # carrying this expansion's syntax context — its rendered key is the
+      # (symbol, context) pair in the identifier-impossible `$` encoding.
+      let id = hygiene_identifier(&name, ctx_stack)
+      Pattern { kind: PatternKind::Ident(identifier_key_of(&id, ctx_stack), is_mut), span: pat.span, node_id: 0 }
     end
   when PatternKind::Tuple(ps) then
     var new_ps = Vec::new()
@@ -3041,7 +3535,7 @@ pub def substitute_stmt(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
     let new_pat = hygiene_renamed_pattern(ctx_stack, subst, &pat)
     # The frame is keyed by the ORIGINAL spellings: a later reference (also
     # spelled originally) is re-stamped with the same composed context stack,
-    # landing on the same `__hygiene_<c1>_<c2>_..._name` as the binding.
+    # landing on the same (symbol, context)-derived key as the binding.
     var names = Vec::new()
     hygiene_collect_pattern_names(&pat, &mut names)
     let last_frame = frames.len() - 1
@@ -3066,7 +3560,8 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
         match hygiene_ident_lookup(frames, &name)
         when Option::Some(true) then
           var new_segs = Vec::new()
-          new_segs.push(hygiene_mangled(ctx_stack, name.clone()))
+          let id = hygiene_identifier(&name, ctx_stack)
+          new_segs.push(identifier_key_of(&id, ctx_stack))
           Expr { kind: ExprKind::ExprPath(AstPath { segments: new_segs, span: path.span }), span: expr.span, node_id: 0 }
         when _ then expr.clone()
         end
@@ -3079,12 +3574,13 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
     when Option::Some(replacement) then replacement.clone()
     when Option::None then
       # P1 (macro hygiene): references to a re-stamped macro-internal let
-      # binding are re-stamped identically (same composed context stack);
-      # references to a shadow (closure param / match pattern) or to a free
-      # name stay untouched.
+      # binding are re-stamped identically (same composed context stack —
+      # the (symbol, context)-derived key); references to a shadow (closure
+      # param / match pattern) or to a free name stay untouched.
       match hygiene_ident_lookup(frames, &name)
       when Option::Some(true) then
-        Expr { kind: ExprKind::ExprIdent(hygiene_mangled(ctx_stack, name.clone())), span: expr.span, node_id: 0 }
+        let id = hygiene_identifier(&name, ctx_stack)
+        Expr { kind: ExprKind::ExprIdent(identifier_key_of(&id, ctx_stack)), span: expr.span, node_id: 0 }
       when _ then expr.clone()
       end
     end
@@ -3305,16 +3801,21 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   end
   # P0-AM (Crate construction): multiple files are concatenated into one flat
   # items vector, so the root module (id 0, empty path) covers all of them;
-  # the full Crate is rebuilt by merge_imported_deps below.
+  # the full Crate is rebuilt by merge_imported_deps below. P1: the root
+  # module's per-module item list (Module.items: Vec[ItemId]) is built here
+  # over the concatenated items.
   var merged_modules = Map::new()
-  var merged_range = Vec::new()
-  merged_range.push(0)
-  merged_range.push(all_items.len())
+  var merged_items = Vec::new()
+  var mi3 = 0
+  while mi3 < all_items.len() do
+    merged_items.push(ItemId { id: mi3 })
+    mi3 = mi3 + 1
+  end
   let root_id = ModuleId { id: 0 }
   merged_modules.insert(root_id, Module {
     id: root_id,
     path: Vec::new(),
-    item_indices: merged_range,
+    items: merged_items,
     imports: Vec::new()
   })
   let merged_ast = Program {

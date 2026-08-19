@@ -4,7 +4,11 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
-use std::alloc::{Layout, FieldLayout, VariantLayout, EnumLayout}
+# NOTE: the std EnumLayout is NOT imported — the ONE EnumLayout authority is
+# defined in this module (see the EnumLayout section below). The std
+# Layout.enum_layout field is a flat projection that no consumer reads; the
+# rich EnumLayout lives here.
+use std::alloc::{Layout, FieldLayout, VariantLayout}
 use tg_compiler::types::{Type, TypeId}
 use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
 
@@ -103,31 +107,58 @@ end
 #   String                                | StringPtr       | Yes         | clone
 #   Vec[T], Array[T]                      | HeapVecHeader   | Yes         | move + clone
 #   FixedArray[T, N] (any N >= 0)         | Inline          | N elements  | structural
-#   Slice[T]                              | HeapVecHeader   | No          | bit
+#   Slice[T]                              | Inline view     | No          | bit
+#     ({ptr: Ptr[T] @0, len: UInt @8})
 #   Map[K,V]                              | HeapMapHeader   | Yes         | move + clone
 #   Set[T]                                | HeapSetHeader   | Yes         | move + clone
 #   struct                                | Inline          | fields      | structural
 #   enum                                  | Inline (tagged) | variants    | structural
-#   Option[T], Result[T,E], Dyn[T],       |                 |             |
-#     Effect, Var, Param, unknown         | OpaquePtr       | payload     | move + clone
+#   Option[T], Result[T,E]                | Inline (tagged) | variants    | structural
+#     (registered enums like any other — the runtime VALUE is the TaggedPtr
+#      word described by their EnumLayout; no name-based OpaquePtr special
+#      case exists)
+#   Dyn[T], Effect                        | OpaquePtr       | payload    | move + clone
 #   Function                              | OpaquePtr       | env: Yes    | move
+#   Var, Param, Error, unknown            | Invalid         | —          | —
+#     (unresolved types have NO representation; every layout query on them
+#      must fail closed — never a guessed pointer word)
 #
 # Heap header sizes (F2 FROZEN — must agree with codegen/runtime; the value
 # itself is always ONE pointer-width handle, these are the sizes of the
 # heap objects the handle points at):
 #   StringPtr     -> 8   (raw pointer to null-terminated UTF-8; NO inline header)
-#   HeapVecHeader -> 24  ({ptr:0, len:8, cap:16})
-#   HeapMapHeader -> 24  ({buckets:0, len:8, cap:16} — the runtime's actual
-#                         Map header, runtime.tg "Map layout")
-#   HeapSetHeader -> 24  (Set is MAP-BACKED — the runtime's _tg_set_* helpers
-#                         tail-call the map helpers, so the Set header is the
-#                         SAME 24-byte {buckets:0, len:8, cap:16} map header)
+#   HeapVecHeader -> 32  ({data:0, len:8, cap:16, stride:24} — the heap
+#                         object behind Vec/Array values. The stride field
+#                         (element stride in bytes, set from the CONCRETE
+#                         element type at creation: 1/2/4/8 for immediate
+#                         scalars, 8 for pointer-represented values, the
+#                         aligned fixed-array size for [T; N] elements) is
+#                         the runtime's element-addressing authority — every
+#                         _tg_array_* helper computes data + i*stride and
+#                         releases cap*stride bytes. Slice is NOT in this
+#                         class: a Slice value is a 16-byte inline {ptr,len}
+#                         VIEW)
+#   HeapMapHeader -> 88  (the runtime's actual Map header — an 88-byte raw
+#                         byte arena plus the CONCRETE layout parameters:
+#                         {buckets:0, size:8, capacity:16, key_stride:24,
+#                         key_align:32, value_stride:40, value_align:48,
+#                         key_off:56, value_off:64, next_off:72,
+#                         bucket_stride:80} — runtime.tg "Map header (88
+#                         bytes)". The four derived layout fields
+#                         (key_off/value_off/next_off/bucket_stride) are
+#                         computed once at map creation from the four layout
+#                         parameters; the runtime derives nothing)
+#   HeapSetHeader -> 88  (Set is MAP-BACKED — the runtime's _tg_set_* helpers
+#                         tail-call the map helpers, so the Set header IS the
+#                         same 88-byte map header)
 #
 #   Storage size rules derived from this table (repr_storage_size):
 #   Immediate  -> the intrinsic primitive size (primitive_size)
 #   RawPtr, StringPtr, Heap*, TaggedPtr -> target.pointer_size (8)
 #   Inline     -> the full inline aggregate size (struct/enum/tuple/fixed array)
 #   OpaquePtr  -> target.fn_ptr_size for Function, else target.pointer_size
+#   Invalid    -> NO layout (unresolved/error type): every consumer must fail
+#                 closed — panicking ICE — never assume a word
 #
 # FIXED ARRAYS: the [T; N] annotation is the DISTINCT Type::FixedArray(elem,
 # n) variant (the reviewer's FixedArray[T, N] — the count lives IN the type;
@@ -139,26 +170,51 @@ end
 # the LangItems array id and stays HeapVecHeader — a pointer-sized handle,
 # never inline.
 #
-# (TaggedPtr is reserved: codegen's inline-tag shortcut for payload-less
-# enums (< 256 discriminants stored as raw integers, >= 256 as heap
-# pointers to the tagged-inline image described by F3) is an encoding
-# optimization over the Inline (tagged) representation the engine computes.)
+# SLICE (the reviewer's no-general-borrow view model — adopted): Slice[T] is
+# a COMPILER-SCOPED VIEW, the plain two-field aggregate
+#     Slice[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8 }
+# (a 16-byte inline value, Repr::Inline — the same shape as the std's
+# StrView / FfiSlice). It owns NO memory (owns=false), needs NO drop, and
+# is bit-copyable. It is NOT a pointer to a heap {ptr,len,cap} Vec header:
+# Slice values carry no capacity, and no consumer may read a Slice through a
+# HeapVecHeader offset. Escape (storing a view beyond the lifetime of its
+# backing buffer) is constrained by the safe access model — the
+# projected-access enforcement of the resource checker's IterationPlan is
+# the eventual mechanism (see the Slice contract in std/collections.tg).
+#
+# (TaggedPtr is the enum VALUE encoding — one pointer-width word holding a
+# raw discriminant below the inline-tag threshold or a heap pointer (at/above
+# the threshold) to the inline tagged image the engine computes (F3). The
+# encoding decision lives in EnumLayout — the single enum-representation
+# authority (see the EnumLayout section); codegen asks it questions and never
+# contains the boundary policy.)
 
 enum Repr
   Immediate      # value bits ARE the value (primitives, Unit, Never)
   RawPtr         # raw pointer to memory (Ptr/PtrMut/Box/Rc/RefInternal)
   StringPtr      # 8-byte raw pointer to null-terminated UTF-8 (FROZEN String ABI)
-  HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array/Slice)
+  HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array — NOT Slice)
   HeapMapHeader  # pointer to a heap Map header
   HeapSetHeader  # pointer to a heap Set header
   Inline         # stored field-by-field inline (structs, tagged enums, tuples)
   TaggedPtr      # reserved: pointer with tag bits (not used by the engine today)
-  OpaquePtr      # opaque pointer-sized handle (Option/Result/Dyn/Effect/Function/unknown)
+  OpaquePtr      # opaque pointer-sized handle (Dyn/Effect/Function)
+  Invalid        # explicit INVALID representation: Var/Param/Error/unknown —
+                 # unresolved types have no representation. Layout queries on
+                 # Invalid MUST fail closed (panic ICE), never guess a word.
 end
 
 # THE single decision function: the representation of a type's runtime
 # value, per the DECIDED model documented above.  Every storage-shape
 # decision in this engine reads from here.
+#
+# FAIL-CLOSED (P0-UR): unresolved types — Type::Var, Type::Param,
+# Type::Error and anything the match does not name — return Repr::Invalid,
+# NEVER a plausible OpaquePtr. A layout query on an unresolved type is a
+# compiler bug (the strict path layout_of_concrete rejects those types with
+# a LayoutError before codegen); returning a guessed word here would let the
+# bug pass silently as an 8-byte value. Consumers of Repr must treat
+# Invalid as an internal error.
 def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
   match ty
   when Type::Unit    then Repr::Immediate
@@ -196,22 +252,25 @@ def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
     # Mirrors the deleted canonical arms via the registered type name; the
     # Adt form of Array is the heap-vector (named Array[T] — the fixed
     # arrays are the distinct Type::FixedArray variant, which never reaches
-    # this arm). Anything else keeps the pre-existing named fallback.
+    # this arm). Option/Result are registered enums — they get the SAME
+    # representation as every other registered enum (Inline via
+    # named_type_repr): there is NO name-based OpaquePtr special case for
+    # them. Anything else keeps the pre-existing named fallback.
     let named_repr_name = lookup_type_name(engine, tid.id)
     if named_repr_name == "Box" then Repr::RawPtr
     elsif named_repr_name == "Rc" then Repr::RawPtr
-    elsif named_repr_name == "Slice" then Repr::HeapVecHeader
+    # Slice[T] is the two-field {ptr: Ptr[T], len: UInt} VIEW (16-byte inline
+    # aggregate — see the SLICE note above); it is NOT a HeapVecHeader handle.
+    elsif named_repr_name == "Slice" then Repr::Inline
     elsif named_repr_name == "Array" then Repr::HeapVecHeader
     elsif named_repr_name == "Map" then Repr::HeapMapHeader
     elsif named_repr_name == "Set" then Repr::HeapSetHeader
-    elsif named_repr_name == "Option" then Repr::OpaquePtr
-    elsif named_repr_name == "Result" then Repr::OpaquePtr
     else named_type_repr(engine, tid.id)
     end
-  when Type::Var(_)        then Repr::OpaquePtr
-  when Type::Param(_)      then Repr::OpaquePtr
-  when Type::Error         then Repr::OpaquePtr
-  when _                   then Repr::OpaquePtr
+  when Type::Var(_)        then Repr::Invalid
+  when Type::Param(_)      then Repr::Invalid
+  when Type::Error         then Repr::Invalid
+  when _                   then Repr::Invalid
   end
 end
 
@@ -249,19 +308,35 @@ def named_type_repr(engine: &LayoutEngine, type_id: Int) -> Repr
     end
   end
 
-  # Unregistered (generic-parameter placeholder, unknown): opaque handle.
+  # Unregistered named types: the GENERIC-PARAMETER SLOT convention. Lowering
+  # emits TypeId{id:0} for a generic parameter reference inside a generic
+  # definition (e.g. the payload field of `enum Option[T] { Some(T) }`), so a
+  # def-driven layout computation legitimately sees an unregistered Adt. Its
+  # SLOT is pointer-width — the placeholder convention for the parameter's
+  # slot at def-layout time (the strict path layout_of_concrete rejects
+  # unregistered named types at VALUE sites; this fallback exists only for
+  # the def-driven slot placement). It is documented as such — never a
+  # silent guess for a VALUE query.
   Repr::OpaquePtr
 end
 
 # Heap header size for a representation (F2 FROZEN; 0 = no heap header).
-# Map and Set share the runtime's actual 24-byte map header
-# ({buckets:0, size:8, cap:16} — Set is map-backed, see runtime.tg).
+# Map and Set share the runtime's actual 88-byte map header
+# ({buckets:0, size:8, capacity:16, key_stride:24, key_align:32,
+# value_stride:40, value_align:48, key_off:56, value_off:64, next_off:72,
+# bucket_stride:80} — Set is map-backed, see runtime.tg).
+# The Vec header carries the element stride at offset 24 (32 bytes total) —
+# the runtime's element-addressing authority; the layout values stored there
+# come from the CONCRETE element type at each creation site (codegen passes
+# element_stride_bytes(T), the same authority ProjIndex uses).
 def repr_header_size(repr: Repr) -> Int
   match repr
   when Repr::StringPtr     then 8
-  when Repr::HeapVecHeader then 24
-  when Repr::HeapMapHeader then 24
-  when Repr::HeapSetHeader then 24
+  when Repr::HeapVecHeader then 32
+  when Repr::HeapMapHeader then 88
+  when Repr::HeapSetHeader then 88
+  when Repr::Invalid       then
+    panic("layout: header-size query on Repr::Invalid (unresolved type) — must fail closed, never a guess")
   when _                   then 0
   end
 end
@@ -290,6 +365,8 @@ def repr_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
     when Type::Function(_, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
     end
+  when Repr::Invalid     then
+    panic("layout: storage-size query on an unresolved type (Repr::Invalid) — must fail closed, never a guessed pointer word")
   end
 end
 
@@ -305,7 +382,11 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
       # (element alignment); the named Array[T] form is the heap-vector and
       # never reaches the Inline case — the fixed arrays are the distinct
       # Type::FixedArray variant below.
-      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+      if is_slice_view_tid(engine, tid.id) then
+        # Slice[T] is the two-field {ptr,len} view: alignment is the pointer
+        # alignment (both fields are pointer-width).
+        engine.target.pointer_align
+      elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
         compute_type_layout(engine, tid.id).align
@@ -314,6 +395,8 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
     when Type::FixedArray(elem, _) then repr_storage_align(engine, &elem)
     when _ then engine.target.pointer_align
     end
+  when Repr::Invalid     then
+    panic("layout: storage-align query on an unresolved type (Repr::Invalid) — must fail closed, never a guessed pointer alignment")
   when _ then engine.target.pointer_align
   end
 end
@@ -342,7 +425,10 @@ def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
     # named Array[T] form is the heap-vector and never reaches the Inline
     # case (type_repr maps it to HeapVecHeader) — the fixed arrays are the
     # distinct Type::FixedArray variant below.
-    if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+    if is_slice_view_tid(engine, tid.id) then
+      # Slice[T] view: 2 pointer-width fields {ptr @ 0, len @ 8}.
+      slice_view_layout(engine).size
+    elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
       inline_array_storage_size(engine, &args[0], 0)
     else
       compute_type_layout(engine, tid.id).size
@@ -466,6 +552,26 @@ def x86_64_target() -> TargetDescriptor
     double_size: 8,
     endianness: "little",
     stack_align: 16
+  }
+end
+
+# Pre-defined target descriptor for the WASM backend (wasm32: 4-byte
+# pointers, 4-byte words — the classifier derives every width from the
+# target, so wasm value categories come out pointer-sized (4) automatically).
+def wasm32_target() -> TargetDescriptor
+  TargetDescriptor {
+    arch_name: "wasm32",
+    pointer_size: 4,
+    pointer_align: 4,
+    max_align: 8,
+    int_size: 4,
+    bool_size: 1,
+    char_size: 4,
+    fn_ptr_size: 4,
+    float_size: 4,
+    double_size: 8,
+    endianness: "little",
+    stack_align: 4
   }
 end
 
@@ -597,15 +703,10 @@ end
 # Get the size of a type (main entry point)
 # Every storage-shape decision is delegated to type_repr (the P0-AR
 # decision table); no branch re-decides the representation here.
+# FAIL-CLOSED: unresolved/error types (Var/Param/Error/unknown) have no
+# layout — this query panics (ICE); the strict path (layout_of_concrete)
+# returns Result::Err for them before any value query reaches codegen.
 def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
-  # Error is a recovery sentinel with no runtime value (never materialized);
-  # the strict path (check_concrete_layout) rejects it before codegen.
-  match ty
-  when Type::Error then
-    return 0
-  when _ then ()
-  end
-
   match type_repr(engine, ty)
   when Repr::Immediate then
     let prim_size = primitive_size(engine, ty)
@@ -620,7 +721,10 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       # P0-J2: Adt form of Array mirrors the deleted canonical Array arm with
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant).
-      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+      if is_slice_view_tid(engine, tid.id) then
+        # Slice[T] view: the 16-byte {ptr, len} aggregate.
+        slice_view_layout(engine).size
+      elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         inline_array_storage_size(engine, &args[0], 0)
       else
         # Look up cached record
@@ -654,11 +758,15 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
     when Type::Function(_, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
     end
+  when Repr::Invalid     then
+    panic("layout: size_of on an unresolved type (Repr::Invalid) — must fail closed, never a guessed pointer word")
   end
 end
 
 # Get the alignment of a type
 # Delegates to type_repr (P0-AR decision table), never re-deciding.
+# FAIL-CLOSED: unresolved types (Repr::Invalid) panic instead of falling
+# back to a pointer alignment guess.
 def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   match type_repr(engine, ty)
   when Repr::Immediate then
@@ -674,7 +782,10 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       # P0-J2: Adt form of Array mirrors the deleted canonical Array arm
       # (element alignment); the fixed arrays are the distinct Type::FixedArray
       # variant below.
-      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+      if is_slice_view_tid(engine, tid.id) then
+        # Slice[T] view: pointer alignment (both fields are pointer-width).
+        engine.target.pointer_align
+      elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
         let tid_key = tid.id
@@ -686,6 +797,8 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
     when Type::FixedArray(elem, _) then repr_storage_align(engine, &elem)
     when _ then engine.target.pointer_align
     end
+  when Repr::Invalid     then
+    panic("layout: align_of on an unresolved type (Repr::Invalid) — must fail closed, never a guessed pointer alignment")
   when _ then engine.target.pointer_align
   end
 end
@@ -705,6 +818,8 @@ end
 # consumers should use layout_of instead of reconstructing size/align/
 # stride/field offsets independently.  Storage shapes come from type_repr
 # (P0-AR decision table); no branch re-decides the representation.
+# FAIL-CLOSED: unresolved/error types (Repr::Invalid) panic — never a
+# pointer-sized guess (use layout_of_concrete for the Result form).
 def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
   match type_repr(engine, ty)
   when Repr::Immediate then
@@ -731,7 +846,10 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
       # P0-J2: Adt form of Array mirrors the deleted canonical Array arm with
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant below).
-      if lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
+      if is_slice_view_tid(engine, tid.id) then
+        # Slice[T] is the two-field {ptr,len} view — the 16-byte aggregate.
+        slice_view_layout(engine)
+      elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         let sz = inline_array_storage_size(engine, &args[0], 0)
         let al = repr_storage_align(engine, &args[0])
         Layout {
@@ -768,21 +886,24 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
     when Type::Function(_, _) then fn_ptr_layout(engine)
     when _ then pointer_layout(engine)
     end
+  when Repr::Invalid     then
+    panic("layout: layout_of on an unresolved type (Repr::Invalid) — must fail closed, never a guessed pointer-sized Layout")
   end
 end
 
 # ———————————————————————————————————————————————————————————————
 # Recursive Strict Concrete-Layout Verification (P0-AS)
 # ———————————————————————————————————————————————————————————————
-# The general size_of keeps its fallbacks (Var -> pointer size, Error -> 0,
-# `when _` -> pointer size) for non-strict callers.  The strict path must
-# NEVER let an unresolved inline child fall back to a guess: it recursively
-# proves that a type and all of its inline children have concrete layouts.
+# The lenient size_of/layout_of now FAIL CLOSED on unresolved types
+# (Repr::Invalid panics — see type_repr), so no caller can silently read a
+# guessed word. The strict path is the Result-based form of the same rule:
+# it recursively proves that a type and all of its inline children have
+# concrete layouts, returning Result::Err instead of panicking.
 #
 # Inline children are named types stored by value (struct fields, enum
 # payloads, tuple elements).  Indirections — pointers (Ptr/PtrMut/Ref),
-# Box/Rc, slices, arrays and heap containers (Option/Result/Map/Set/
-# Function/String) — are opaque pointer-sized handles and do not require
+# Box/Rc, slices (the {ptr,len} view holds a raw pointer), arrays and heap
+# containers (Map/Set/Function/String) — do not require
 # their pointee to be resolved.  A named type with no registered definition
 # is likewise an opaque handle (lowering emits TypeId{id:0} for generic
 # parameters), so it does not fail the strict check.
@@ -811,7 +932,7 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
     Result::Err(LayoutError {
       class: LayoutFailureClass::UNRESOLVED_TYPE,
       message: "Generic parameter has no concrete layout",
-      type_name: "Type::Param(" + name + ")",
+      type_name: "Type::Param(#" + name.index.to_string() + ")",
       expected: 0,
       actual: 0,
       context: "check_concrete_layout"
@@ -820,8 +941,10 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
     # P0-J2: Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an opaque pointer-sized handle, concrete without
     # inspecting the pointee (fixed inline arrays are the distinct
-    # Type::FixedArray variant).
-    if lookup_type_name(engine, tid.id) == "Array" then
+    # Type::FixedArray variant). Slice[T] is the two-field view builtin —
+    # also concrete without inspecting the element (the view holds a raw
+    # pointer; the element's own layout lives behind the indirection).
+    if lookup_type_name(engine, tid.id) == "Array" || is_slice_view_tid(engine, tid.id) then
       Result::Ok(())
     else
       if engine_has_type_def(engine, tid.id) then
@@ -936,13 +1059,18 @@ def layout_of_concrete(engine: &mut LayoutEngine, ty: &Type) -> Result[Layout, L
     Result::Err(LayoutError {
       class: LayoutFailureClass::UNRESOLVED_TYPE,
       message: "Generic parameter has no concrete layout",
-      type_name: "Type::Param(" + name + ")",
+      type_name: "Type::Param(#" + name.index.to_string() + ")",
       expected: 0,
       actual: 0,
       context: "layout_of_concrete"
     })
   when Type::Adt(tid, _) then
-    if engine_has_type_def(engine, tid.id) then
+    if is_slice_view_tid(engine, tid.id) then
+      # Slice[T] is the registered-but-Opaque view builtin: it has NO
+      # MirTypeDef, but its layout is fully concrete — the 16-byte {ptr,len}
+      # aggregate (the view never depends on the element type).
+      Result::Ok(slice_view_layout(engine))
+    elsif engine_has_type_def(engine, tid.id) then
       # Recursively strict: an unresolved inline child (Var/Error/Param) or an
       # inline storage cycle must fail here instead of falling back to a
       # pointer-sized guess.
@@ -996,24 +1124,164 @@ def fn_ptr_layout(engine: &LayoutEngine) -> Layout
   Layout { size: s, align: engine.target.pointer_align, stride: s, fields: Vec::new(), enum_layout: Option::None }
 end
 
+# True when a TypeId is the registered Slice builtin (LangItems id). The
+# Slice is a compiler-scoped VIEW — a 16-byte two-field aggregate, never a
+# heap container.
+def is_slice_view_tid(engine: &LayoutEngine, type_id: Int) -> Bool
+  lookup_type_name(engine, type_id) == "Slice"
+end
+
+# The Slice[T] view layout: { ptr: Ptr[T] @ 0, len: UInt @ 8 } — a 16-byte
+# inline value (size 2 * pointer_size, align pointer_align). Slice is a
+# registered Opaque builtin with NO MirTypeDef, so every inline layout path
+# special-cases it here instead of falling into compute_type_layout (which
+# would report the unknown-type pointer-sized record).
+def slice_view_layout(engine: &LayoutEngine) -> Layout
+  let ptr_size = engine.target.pointer_size
+  let palign = engine.target.pointer_align
+  var field_layouts = Vec::new()
+  field_layouts.push(FieldLayout {
+    name: "ptr",
+    offset: 0,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  field_layouts.push(FieldLayout {
+    name: "len",
+    offset: ptr_size,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  Layout {
+    size: 2 * ptr_size,
+    align: palign,
+    stride: 2 * ptr_size,
+    fields: field_layouts,
+    enum_layout: Option::None
+  }
+end
+
 def record_to_layout(rec: &LayoutRecord) -> Layout
-  let enum_info = if rec.category == LayoutCategory::TaggedUnion then
-    Option::Some(EnumLayout {
-      tag_offset: rec.tag_offset,
-      tag_size: rec.tag_size,
-      payload_offset: rec.payload_offset,
-      variants: rec.variants.clone()
-    })
-  else
-    Option::None
-  end
+  # The flat std::alloc::EnumLayout projection is intentionally NOT filled:
+  # the ONE enum authority is this module's rich EnumLayout (see
+  # enum_layout_for_type_id — representation + tag_layout + payload_offset +
+  # variant_layouts + niches), which codegen queries. No consumer reads
+  # Layout.enum_layout (it is never dereferenced anywhere in the compiler);
+  # the record's tag/variant fields remain available through the engine.
   Layout {
     size: rec.size,
     align: rec.align,
     stride: rec.stride,
     fields: rec.fields.clone(),
-    enum_layout: enum_info
+    enum_layout: Option::None
   }
+end
+
+# ———————————————————————————————————————————————————————————————
+# EnumLayout — THE single enum-representation authority (P0-ER)
+# ———————————————————————————————————————————————————————————————
+# Every question about how an enum's runtime VALUE is encoded — the
+# register-resident word, the heap image, the tag, the payload, the
+# variants, the niches — is answered HERE. Codegen asks the EnumLayout and
+# never contains the encoding policy (no inline-discriminant thresholds,
+# no heap-pointer tests, no payload offsets are decided in codegen).
+#
+# The representation describes the REGISTER-RESIDENT value encoding:
+#   TaggedPtr(threshold): the value is ONE pointer-width word. Below the
+#     threshold it IS the raw discriminant (payload-less values stay inline
+#     in the word); at/above the threshold it is a heap pointer to the
+#     inline tagged image { tag @ tag_layout.offset, payload @
+#     payload_offset }. This is the encoding every registered enum uses
+#     today (the aggregate/heap-image convention).
+#   InlineTagged: the value IS the inline tagged image (tag + payload
+#     fields in the value's storage). Reserved — no registered enum uses it
+#     today; the model supports it.
+#   Opaque: no resolvable enum layout (unregistered/unresolved). Consumers
+#     must fail closed instead of guessing.
+#
+# The memory IMAGE is always the inline tagged aggregate the engine
+# computes (compute_enum_layout / LayoutCategory::TaggedUnion): tag at
+# tag_layout.offset (0), payload at payload_offset (8). Niche optimization,
+# when it exists, lives in `niches` — never in codegen.
+
+enum EnumValueRepresentation
+  TaggedPtr(Int)    # register word: raw disc < threshold, heap ptr >= threshold
+  InlineTagged      # the value is the inline tagged image itself
+  Opaque            # unresolved: no representation (fail closed)
+end
+
+struct EnumTagLayout
+  offset: Int       # byte offset of the discriminant tag in the image
+  size: Int         # byte width of the tag
+end
+
+struct EnumNiche
+  variant_index: Int
+  value: Int
+end
+
+struct EnumLayout
+  representation: EnumValueRepresentation
+  tag_layout: EnumTagLayout
+  payload_offset: Int
+  variant_layouts: Vec[VariantLayout]
+  niches: Vec[EnumNiche]
+end
+
+# The inline-tag threshold of the TaggedPtr encoding: register values below
+# this are raw discriminants; values at/above are heap pointers. 256 = the
+# lowest plausible heap address — bump-arena/mmap allocations never land
+# below it, while discriminants of payload-less enums fit well under it.
+# This is the SINGLE place the boundary value exists; codegen reads it from
+# the EnumLayout and never contains it.
+def enum_inline_tag_threshold() -> Int = 256
+
+# The EnumLayout of a registered enum TypeId, from the computed records.
+# Option::None when the type is not a registered enum (not TaggedUnion).
+def enum_layout_for_type_id(engine: &LayoutEngine, type_id: Int) -> Option[EnumLayout]
+  match engine.records.get(&type_id)
+  when Option::Some(rec) then
+    if rec.category == LayoutCategory::TaggedUnion then
+      Option::Some(EnumLayout {
+        representation: EnumValueRepresentation::TaggedPtr(enum_inline_tag_threshold()),
+        tag_layout: EnumTagLayout {
+          offset: rec.tag_offset,
+          size: rec.tag_size
+        },
+        payload_offset: rec.payload_offset,
+        variant_layouts: rec.variants.clone(),
+        niches: Vec::new()
+      })
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# The EnumLayout of a registered enum Type (Adt form), else Option::None.
+def enum_layout_for_type(engine: &LayoutEngine, ty: &Type) -> Option[EnumLayout]
+  match ty
+  when Type::Adt(tid, _) then enum_layout_for_type_id(engine, tid.id)
+  when _ then Option::None
+  end
+end
+
+# True when the TypeId is a REGISTERED enum definition (the engine's
+# type_defs — the same authority is_enum_type_id in codegen consults).
+def is_enum_type_def(engine: &LayoutEngine, type_id: Int) -> Bool
+  if type_id < 0 then return false end
+  for td in engine.type_defs do
+    if td.id.id == type_id then
+      match td.kind
+      when MirTypeDefKind::Enum(_) then return true
+      when _ then return false
+      end
+    end
+  end
+  false
 end
 
 def tuple_layout(engine: &mut LayoutEngine, fields: &Vec[Type]) -> Layout
@@ -1221,6 +1489,29 @@ def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[
   let payload_total = layout_align_up(max_payload_size, max_align)
   let total_size = layout_align_up(8 + payload_total, max_align)
   
+  # The FLAT field list — the layout engine's own flat projection of the
+  # enum image: [tag @ 0, variant 0's payload fields, variant 1's payload
+  # fields, ...] in DECLARATION order (each payload field offset is the
+  # ABSOLUTE image offset — tag at 0, payload fields at 8 + alignment).
+  # Codegen's enum_field_offset_for_variant_index computes the flat index
+  # as 1 + Σ(prior-variant field counts) + field_idx and resolves it
+  # through this list (field_offset on the enum's TypeId) — the two must
+  # agree exactly. Without this list the record's `fields` was empty and
+  # every enum-payload offset query failed closed with a panic.
+  var flat_fields = Vec::new()
+  flat_fields.push(FieldLayout {
+    name: "tag",
+    offset: 0,
+    size: 8,
+    align: 8,
+    type_id: -1
+  })
+  for fv in variant_layouts do
+    for ff in fv.fields do
+      flat_fields.push(ff.clone())
+    end
+  end
+  
   let type_name = lookup_type_name(engine, type_id)
   let hash = compute_layout_hash(&type_name, total_size, max_align, variants.len())
   
@@ -1233,7 +1524,7 @@ def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[
     align: max_align,
     stride: total_size,
     field_count: variants.len(),
-    fields: Vec::new(),
+    fields: flat_fields,
     variants: variant_layouts,
     tag_offset: 0,      # F3: tag at offset 0
     tag_size: 8,        # F3: tag is 8 bytes
@@ -1398,10 +1689,11 @@ end
 # header on String values; the runtime helpers (strlen-based) and
 # `normalize_string_arg0_for_current_arch` in codegen both rely on this.
 #
-# The 24-byte {ptr:0, len:8, cap:16} shape described elsewhere belongs
-# ONLY to the internal char-vector buffer produced by `str.chars()` (a
-# Vec[Int]), never to String values. Changing `string_abi_size` or
-# `string_abi_is_raw_pointer` is a breaking ABI change.
+# The 32-byte {data:0, len:8, cap:16, stride:24} Vec-header shape described
+# elsewhere belongs ONLY to Vec/Array values and the internal char-vector
+# buffer produced by `str.chars()` (a Vec[Char], stride 4), never to String
+# values. Changing `string_abi_size` or `string_abi_is_raw_pointer` is a
+# breaking ABI change.
 #
 # The value comes from the P0-AR decision table: String is Repr::StringPtr
 # and its header size is repr_header_size(StringPtr).
@@ -1413,9 +1705,9 @@ def string_abi_is_raw_pointer() -> Bool = true
 # They come from the P0-AR decision table (repr_header_size via
 # container_repr_for_name): the full inline heap header size behind the
 # 8-byte value handle. String uses the raw-pointer ABI (see
-# string_abi_size), NOT a 24-byte inline header; its {ptr,len,cap} shape is
-# only the internal char-Vec buffer produced by `str.chars()`, never the
-# String value ABI.
+# string_abi_size), NOT a 32-byte inline Vec header; its {data,len,cap,
+# stride} shape is only the internal char-Vec buffer produced by
+# `str.chars()`, never the String value ABI.
 def container_header_size(type_name: &String) -> Int
   repr_header_size(container_repr_for_name(type_name))
 end
@@ -1423,40 +1715,85 @@ end
 # Container field offsets (F2)
 # Dispatched by the same name -> Repr table as container_header_size, so
 # the container shape knowledge lives in ONE place.
+# The HeapVecHeader stride field (offset 24) is the runtime's element
+# addressing authority: every _tg_array_* helper reads it for element
+# addresses (data + i*stride) and allocation sizes (cap*stride). Codegen's
+# heap_header_field_offset reads it the same way; the value is written by
+# _tg_array_new from the stride argument codegen passes (computed from the
+# CONCRETE element type via element_stride_bytes).
+# Map and Set share the runtime's 88-byte layout header ({buckets:0,
+# size:8, capacity:16, key_stride:24, key_align:32, value_stride:40,
+# value_align:48, key_off:56, value_off:64, next_off:72, bucket_stride:80} —
+# the layout parameters are stored at creation from the concrete K/V and the
+# runtime derives nothing; see runtime.tg "Map header (88 bytes)").
 # NOTE: String values have NO inline {ptr,len,cap} header (raw-pointer ABI,
 # see string_abi_size). The offsets below describe the internal char-Vec
 # buffer produced by `str.chars()`, which is laid out like Vec[u8]. They are
 # exposed via the "Vec" entry; the String branch is retained for byte-image
 # tooling only and does not apply to String values.
+#
+# Slice is deliberately NOT in container_repr_for_name: a Slice value is the
+# inline two-field view { ptr: Ptr[T] @ 0, len: UInt @ pointer_size }
+# (slice_view_layout) — never a heap header. Consumers of Slice values use
+# slice_view_field_offset, never container_field_offset / HeapVecHeader.
+def slice_view_field_offset(engine: &LayoutEngine, field_name: &String) -> Int
+  let ptr_size = engine.target.pointer_size
+  if field_name == "ptr" || field_name == "data" then 0
+  else if field_name == "len" || field_name == "length" then ptr_size
+  else 0
+  end
+end
+
 def container_field_offset(type_name: &String, field_name: &String) -> Int
   match container_repr_for_name(type_name)
   when Repr::StringPtr then
     if field_name == "ptr" || field_name == "data" then 0
     else if field_name == "len" || field_name == "length" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
+    else if field_name == "stride" then 24
     else 0
     end
   when Repr::HeapVecHeader then
     if field_name == "ptr" || field_name == "data" then 0
     else if field_name == "len" || field_name == "length" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
+    else if field_name == "stride" then 24
     else 0
     end
   when Repr::HeapMapHeader then
-    # Runtime Map header ({buckets:0, len/size:8, cap:16} — runtime.tg
-    # "Map layout"; no hash_fn field in the actual header).
+    # Runtime Map header (88 bytes — {buckets:0, size:8, capacity:16,
+    # key_stride:24, key_align:32, value_stride:40, value_align:48,
+    # key_off:56, value_off:64, next_off:72, bucket_stride:80} — runtime.tg
+    # "Map header (88 bytes)"). The "len"/"length"/"size" aliases all read
+    # the live-entry count at 8; "cap"/"capacity" read 16.
     if field_name == "buckets" then 0
     else if field_name == "len" || field_name == "length" || field_name == "size" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
+    else if field_name == "key_stride" then 24
+    else if field_name == "key_align" then 32
+    else if field_name == "value_stride" then 40
+    else if field_name == "value_align" then 48
+    else if field_name == "key_off" then 56
+    else if field_name == "value_off" then 64
+    else if field_name == "next_off" then 72
+    else if field_name == "bucket_stride" then 80
     else 0
     end
   when Repr::HeapSetHeader then
-    # Set is map-backed: the Set header IS the Map header
-    # ({buckets:0, len/size:8, cap:16} — _tg_set_* tail-calls the map
-    # helpers, see runtime.tg).
+    # Set is map-backed: the Set header IS the 88-byte Map header
+    # ({buckets:0, size:8, capacity:16, key_stride:24, ...} — _tg_set_*
+    # tail-calls the map helpers, see runtime.tg).
     if field_name == "buckets" || field_name == "map" then 0
     else if field_name == "len" || field_name == "length" || field_name == "size" then 8
     else if field_name == "cap" || field_name == "capacity" then 16
+    else if field_name == "key_stride" then 24
+    else if field_name == "key_align" then 32
+    else if field_name == "value_stride" then 40
+    else if field_name == "value_align" then 48
+    else if field_name == "key_off" then 56
+    else if field_name == "value_off" then 64
+    else if field_name == "next_off" then 72
+    else if field_name == "bucket_stride" then 80
     else 0
     end
   when _ then
@@ -1613,6 +1950,7 @@ def repr_to_string(repr: &Repr) -> String
   when Repr::Inline        then "Inline"
   when Repr::TaggedPtr     then "TaggedPtr"
   when Repr::OpaquePtr     then "OpaquePtr"
+  when Repr::Invalid       then "Invalid"
   end
 end
 
@@ -1638,70 +1976,180 @@ def lookup_type_name(engine: &LayoutEngine, type_id: Int) -> String
 end
 
 # ———————————————————————————————————————————————————————————————
-# ABI/Calling Convention Queries
+# Value ABI classification — the value-category model (P0-VC)
 # ———————————————————————————————————————————————————————————————
-
-# Should a type be passed directly in registers, or indirectly via pointer?
-# Direct: primitives, pointers, small structs (<= 16 bytes, power-of-2)
-# Indirect: large structs, some enums
-# ———————————————————————————————————————————————————————————————
-# Value ABI classification
-# ———————————————————————————————————————————————————————————————
-# StorageLayout (the Layout struct) answers "how is this type laid out in
-# memory". ValueAbi answers "how is a value of this type passed/returned" —
-# direct in registers vs indirect via a pointer. Every size used here comes
-# from the canonical size_of/layout_of, never from an independent estimate.
-struct ValueAbi
-  passing: Bool          # true = direct (registers), false = indirect (sret/ptr)
-  register_class: String # "int" or "float"
-  register_width: Int    # bytes per register slot
-  register_count: Int    # number of registers used (direct) or 1 pointer (indirect)
-  stack_size: Int        # bytes consumed on the stack when indirect
-  extension: String      # "zero", "sign", "none"
+# The single authority that answers "how does a value of this type cross an
+# ABI boundary (argument / result / move / copy)?" — built on the
+# centralized layout engine (layout_of_concrete — every size comes from the
+# canonical query, never an independent estimate). This REPLACES the old
+# ad-hoc register/8-byte-word logic (value_abi / should_pass_directly /
+# should_return_directly / arg_register_count), which classified by nothing
+# but the raw size.
+#
+# Categories (the first-class distinction the backends consume):
+#   ZeroSized           — no payload (Unit, Never, empty aggregates)
+#   Scalar(width)       — ONE ABI slot of `width` bytes (1/2/4/8): the value
+#                         itself travels in the slot
+#   ScalarPair(w1, w2)  — exactly TWO words (16-byte aggregates: pairs,
+#                         16-byte tuples/structs, the Slice view, I128):
+#                         a two-slot value
+#   ByAddress(size)     — more than 16 bytes: the value crosses BY ADDRESS
+#                         (the slot carries the address; returns use sret)
+#
+# Type-structure rules (each shape keeps emitting the code it emits today):
+#   primitives      -> Scalar(primitive size); I128/U128 (16) -> ScalarPair
+#   pointers/handles-> Scalar(pointer width) (Ptr/PtrMut/Ref, String, heap
+#                      containers, Box/Rc, Function/Dyn/Effect)
+#   enums (tagged)  -> asked of the EnumLayout: TaggedPtr-represented enums
+#                      cross as their ONE pointer-width TaggedPtr word
+#                      (Scalar(pointer_size)) — the image size is NOT the
+#                      crossing size; InlineTagged enums use the size rule
+#   tuples/structs/fixed arrays (Inline) -> by layout size: 0 -> ZeroSized,
+#                      1/2/4/8 -> Scalar(size), 16 -> ScalarPair(8, 8),
+#                      >16 -> ByAddress(size)
+#   Slice (the 16-byte view) -> ScalarPair(8, 8) via the size rule
+# FAIL-CLOSED: Var/Param/Error/unknown -> Result::Err(LayoutError) — the
+# caller (codegen's classify pair, sret decisions) must ICE, never assume a
+# word.
+enum ValueCategory
+  ZeroSized
+  Scalar(Int)          # one ABI slot; slot width in bytes (1/2/4/8)
+  ScalarPair(Int, Int) # two ABI slots (16-byte aggregate: two words)
+  ByAddress(Int)       # by reference (address in the slot); payload byte size
 end
 
-def value_abi(engine: &LayoutEngine, ty: &Type) -> ValueAbi
-  let sz = size_of(engine, ty)
-  let direct = sz == 0 || (sz <= 16 && (sz == 1 || sz == 2 || sz == 4 || sz == 8 || sz == 16))
-  let cls = match ty
-  when Type::Float then "float"
-  when Type::F32 then "float"
-  when Type::F64 then "float"
-  when _ then "int"
+# Size-based category for INLINE aggregates (tuples, structs, fixed arrays,
+# the Slice view, InlineTagged-represented enums): the layout size decides.
+def inline_aggregate_category(engine: &mut LayoutEngine, ty: &Type) -> Result[ValueCategory, LayoutError]
+  match layout_of_concrete(engine, ty)
+  when Result::Ok(l) then
+    if l.size == 0 then
+      Result::Ok(ValueCategory::ZeroSized)
+    elsif l.size <= 8 then
+      Result::Ok(ValueCategory::Scalar(l.size))
+    elsif l.size == 16 then
+      Result::Ok(ValueCategory::ScalarPair(8, 8))
+    else
+      Result::Ok(ValueCategory::ByAddress(l.size))
+    end
+  when Result::Err(e) then Result::Err(e)
   end
-  ValueAbi {
-    passing: direct,
-    register_class: cls,
-    register_width: if direct then (if sz == 0 then 8 else sz end) else 8 end,
-    register_count: if direct then (if sz == 0 then 0 else (if sz <= 8 then 1 else 2 end) end) else 1 end,
-    stack_size: sz,
-    extension: "none"
-  }
 end
 
-def should_pass_directly(engine: &LayoutEngine, ty: &Type) -> Bool
-  # Derived entirely from the canonical storage size.
-  let sz = size_of(engine, ty)
-  if sz == 0 then return true end
-  if sz > 16 then return false end
-  sz == 1 || sz == 2 || sz == 4 || sz == 8 || sz == 16
-end
-
-# Should a type be returned directly in registers, or via output pointer?
-def should_return_directly(engine: &LayoutEngine, ty: &Type) -> Bool
-  # Same rules as passing for now
-  should_pass_directly(engine, ty)
-end
-
-# Get the number of argument registers needed for a type
-def arg_register_count(engine: &LayoutEngine, ty: &Type) -> Int
-  let sz = match ty
-  when Type::Unit then 0
-  when Type::Tuple(fields) then fields.len()  # Each field in separate register
-  when _ then
-    if should_pass_directly(engine, ty) then 1 else 1 end  # Indirect = 1 pointer
+# THE value-category classifier. Every ABI decision (arguments, results,
+# moves/copies) is derived from this single function.
+def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[ValueCategory, LayoutError]
+  # FAIL-CLOSED: unresolved types have no category.
+  match ty
+  when Type::Var(_) then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Type variable has no ABI value category",
+      type_name: "Type::Var",
+      expected: 0,
+      actual: 0,
+      context: "classify_value_category"
+    })
+  when Type::Param(name) then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Generic parameter has no ABI value category",
+      type_name: "Type::Param(#" + name.index.to_string() + ")",
+      expected: 0,
+      actual: 0,
+      context: "classify_value_category"
+    })
+  when Type::Error then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Error type has no ABI value category",
+      type_name: "Type::Error",
+      expected: 0,
+      actual: 0,
+      context: "classify_value_category"
+    })
+  when _ then ()
   end
-  sz
+
+  match type_repr(engine, ty)
+  when Repr::Invalid then
+    Result::Err(LayoutError {
+      class: LayoutFailureClass::UNRESOLVED_TYPE,
+      message: "Unresolved type reached the ABI classifier (type_repr = Invalid)",
+      type_name: "unknown",
+      expected: 0,
+      actual: 0,
+      context: "classify_value_category"
+    })
+  when Repr::Immediate then
+    # Primitives: the primitive width decides (Unit/Never -> ZeroSized;
+    # 1/2/4/8 -> Scalar; I128/U128 (16) -> ScalarPair).
+    let ps = primitive_size(engine, ty)
+    if ps == 0 then Result::Ok(ValueCategory::ZeroSized)
+    elsif ps <= 8 then Result::Ok(ValueCategory::Scalar(ps))
+    else Result::Ok(ValueCategory::ScalarPair(8, 8))
+    end
+  when Repr::RawPtr then
+    # Pointers (Ptr/PtrMut/RefInternal) and pointer-represented smart
+    # pointers: one pointer-width slot.
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::StringPtr then
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::HeapVecHeader then
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::HeapMapHeader then
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::HeapSetHeader then
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::TaggedPtr then
+    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+  when Repr::OpaquePtr then
+    match ty
+    when Type::Function(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
+    when _ then Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+    end
+  when Repr::Inline then
+    match ty
+    when Type::Adt(tid, _) then
+      if is_enum_type_def(engine, tid.id) then
+        # Enums are classified by their EnumLayout — the single
+        # enum-representation authority. A TaggedPtr-represented enum's
+        # VALUE is one pointer-width word (raw discriminant or heap
+        # pointer), so it crosses in ONE slot regardless of its image size.
+        match enum_layout_for_type_id(engine, tid.id)
+        when Option::Some(el) then
+          match el.representation
+          when EnumValueRepresentation::TaggedPtr(_) then
+            Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+          when EnumValueRepresentation::InlineTagged then
+            inline_aggregate_category(engine, ty)
+          when EnumValueRepresentation::Opaque then
+            Result::Err(LayoutError {
+              class: LayoutFailureClass::UNSUPPORTED_TYPE,
+              message: "Enum has an opaque (unresolved) EnumLayout — no ABI category",
+              type_name: "type#" + tid.id.to_string(),
+              expected: 0,
+              actual: 0,
+              context: "classify_value_category"
+            })
+          end
+        when Option::None then
+          Result::Err(LayoutError {
+            class: LayoutFailureClass::UNSUPPORTED_TYPE,
+            message: "Registered enum has no EnumLayout record — no ABI category",
+            type_name: "type#" + tid.id.to_string(),
+            expected: 0,
+            actual: 0,
+            context: "classify_value_category"
+          })
+        end
+      else
+        inline_aggregate_category(engine, ty)
+      end
+    when _ then
+      inline_aggregate_category(engine, ty)
+    end
+  end
 end
 
 # Absolute byte offsets of each payload field for an enum variant, taken from
@@ -1743,16 +2191,18 @@ end
 # Collect TypeIds of named types reached through INLINE storage only: direct
 # Adt fields, tuple elements, and fixed-array elements. The named Array[T]
 # Adt form is the heap-vector handle — an indirection never followed. Other
-# indirections (Ptr/PtrMut/Ref, Box/Rc, Slice, Option/Result/Map/Set,
-# Function, String) are pointer-sized opaque handles and are never followed;
+# indirections (Ptr/PtrMut/Ref, Box/Rc, Slice — the {ptr,len} view holds a
+# raw pointer, Option/Result/Map/Set, Function, String) are never followed;
 # unregistered named types have no definition to recurse into.
 def collect_inline_named_children(engine: &LayoutEngine, ty: &Type, out: &mut Vec[Int]) -> Unit
   match ty
   when Type::Adt(tid, args) then
     # P0-J2: Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an indirection, never followed into inline children. The
-    # fixed arrays are the distinct Type::FixedArray variant below.
-    if lookup_type_name(engine, tid.id) == "Array" then
+    # Slice view is likewise an indirection (its only field is a raw Ptr),
+    # so it is never an inline child. The fixed arrays are the distinct
+    # Type::FixedArray variant below.
+    if lookup_type_name(engine, tid.id) == "Array" || is_slice_view_tid(engine, tid.id) then
       ()
     else
       out.push(tid.id)

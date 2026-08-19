@@ -41,14 +41,28 @@
 # definition.
 #
 # P0-AM migration note: consumers still constructing the old DefId shape
-# { module: <path String>, index, kind: DefKind } — resolver.tg, types.tg,
-# mir.tg, trait_resolve.tg, resource_check.tg — are migrated by the next
-# batch to resolve the ModuleId via the module graph; the definitions here
-# are the target shapes.
+# { module: <path String>, index, kind: DefKind } — types.tg, mir.tg,
+# trait_resolve.tg, resource_check.tg — are migrated by the next batch to
+# resolve the ModuleId via the module graph; resolver.tg is on the new
+# shape (DefId { module: ModuleId, index } + def_kinds metadata) and
+# registers every declaration module-qualified. P1: the resolver's
+# stable-id machinery is wired to the DIGEST MODEL below — its stable
+# identities are stable_def_id_digested records (the canonical key stored
+# alongside; an actual digest collision is stable_digest_verify's panic —
+# the old FNV-64 + sequential-counter disambiguation in resolver.tg is
+# deleted), and its bare-name resolution feeds on the module_symbols /
+# def_kinds entries (the bare-name first-wins tables are deleted).
 
-use std::collections::{Vec}
+use std::collections::{Vec, Map}
 use tg_compiler::types::{Type}
 
+# The definition-kind METADATA set (DefId carries no kind — the kind is
+# the resolver's metadata map, consulted by def_kind_of). Trait is the
+# module-semantic trait-declaration kind: the resolver registers every
+# trait declaration under its module-qualified "path::name" key with this
+# kind, so traits resolve through the SAME module-qualified machinery as
+# types/callables (an import brings the trait into scope; two traits with
+# the same name in different modules are distinct).
 enum DefKind
   Function
   Method
@@ -58,6 +72,7 @@ enum DefKind
   StructField
   Intrinsic
   TypeName
+  Trait
   Other
 end
 
@@ -94,10 +109,12 @@ end
 #              ids: the keys of typed.local_bindings, the VALUES of
 #              typed.param_binding_resolutions / typed.pattern_binding_
 #              resolutions, the values of typed.ident_resolutions. Distinct
-#              from AST node ids AND from the MIR's own LocalId (mir.tg —
-#              the codegen-side local-slot domain). The resource checker's
-#              ResFrame is keyed by THIS type, so a pattern node id can no
-#              longer index the frame by accident.
+#              from AST node ids AND from the MIR's own lowered-function
+#              local-slot domain (MirLocalId — mir.tg, renamed from the
+#              ambiguous LocalId so two incompatible ID domains can never
+#              share a spelling). The resource checker's ResFrame is keyed
+#              by THIS type, so a pattern node id can no longer index the
+#              frame by accident.
 # The field name stays `id` so `.id` access keeps working at the domain
 # boundaries (e.g. the finalize_plan values the MIR consumes are still
 # plain Int).
@@ -131,10 +148,131 @@ struct VariantId
 end
 
 # A generic parameter's identity: the owner definition's DefId + the
-# parameter index.
+# parameter index. The index IS the parameter's DECLARATION ORDER within
+# the owner — the interning table below (P0-GPI) allocates indices in
+# declaration order at registration, so GenericParamId order and the
+# substs-order contract (the InstanceId.substs Vec aligns positionally with
+# the declaration order) are the same thing by construction.
 struct GenericParamId
   owner: DefId
   index: UInt
+end
+
+# ———————————————————————————————————————————————————————————————
+# P0-GPI: the generic-parameter interning table (the registration the
+# GenericParamId domain needs)
+# ———————————————————————————————————————————————————————————————
+#
+# Every declaration (function / impl / method / type / builtin) interns its
+# generic parameters IN DECLARATION ORDER at registration:
+#   - the interning allocates each parameter's index as the owner's current
+#     interned count (counts), so the GenericParamId order IS the
+#     declaration order — the substs-order contract holds by construction;
+#   - the parameter NAME is stored SEPARATELY, keyed by GenericParamId
+#     (names) — the param-name table: diagnostics look up a name by id;
+#     identity is the id, never the name.
+#
+# Owners: a declaration with a resolver DefId (functions via item_defs,
+# methods via method_defs, types via the module_symbols DefKind::TypeName
+# entries) interns under that DefId — the declaration context. Declarations
+# without one (the builtin type/trait registrations, the impl-level
+# parameter lists, IR-synthesized functions) intern under a SYNTHETIC owner
+# from fresh_synthetic_owner — module id -1, a dedicated counter — which can
+# never collide with the non-negative source ModuleIds. The synthetic owner
+# is allocated ONCE per declaration, so the owner's interned indices are
+# still the declaration order.
+struct GenericParamTable
+  names: Map[Int, String]   # numeric GenericParamId -> parameter name
+  counts: Map[Int, UInt]    # numeric owner DefId -> interned param count
+  synthetic_counter: UInt   # index source of the synthetic owner DefIds
+end
+
+def generic_param_table_new() -> GenericParamTable
+  GenericParamTable { names: Map::new(), counts: Map::new(), synthetic_counter: 0 }
+end
+
+# The numeric flattening of a DefId — the (module.id << 32) + index
+# convention callable_id_numeric (types.tg) established. Synthetic owners
+# use module id -1, which shifts negative and can never collide with the
+# non-negative source module ids.
+def def_id_numeric(did: &DefId) -> Int
+  (did.module.id << 32) + (did.index as Int)
+end
+
+# The numeric flattening of a GenericParamId: the owner's flattening in the
+# high bits, the parameter index in the low byte — a declaration's
+# parameter list is tiny, so the index always fits in the low 8 bits.
+def generic_param_id_numeric(gpid: &GenericParamId) -> Int
+  (def_id_numeric(&gpid.owner) << 8) + (gpid.index as Int)
+end
+
+# GenericParamId equality: (owner ModuleId, owner index, param index) —
+# the id IS the identity; the name never participates.
+def generic_param_id_eq(a: &GenericParamId, b: &GenericParamId) -> Bool
+  a.owner.module.id == b.owner.module.id && a.owner.index == b.owner.index && a.index == b.index
+end
+
+# A fresh synthetic owner DefId for a declaration the resolver never gave a
+# DefId (builtin type/trait registrations, impl-level parameter lists,
+# IR-synthesized functions). Module id -1; the index comes from the table's
+# dedicated counter, so two synthetic owners never collide with each other
+# or with the source DefIds.
+def fresh_synthetic_owner(table: &mut GenericParamTable) -> DefId
+  let owner = DefId { module: ModuleId { id: -1 }, index: table.synthetic_counter }
+  table.synthetic_counter = table.synthetic_counter + 1
+  owner
+end
+
+# Intern ONE generic parameter of `owner` in declaration order: the
+# parameter's index is the owner's current interned count, so the
+# GenericParamId order IS the declaration order. Records the name in the
+# param-name table (diagnostics only). Idempotent per (owner, name):
+# re-interning an already-recorded name returns its existing id, so a
+# declaration interned twice (an env re-run) never shifts the
+# declaration-order indices. Returns the id.
+def intern_generic_param(table: &mut GenericParamTable, owner: &DefId, name: String) -> GenericParamId
+  let owner_key = def_id_numeric(owner)
+  let index = match table.counts.get(owner_key)
+  when Option::Some(c) then c
+  when Option::None then 0
+  end
+  var j = 0
+  while j < index do
+    let existing_id = GenericParamId { owner: owner.clone(), index: j }
+    let existing_key = generic_param_id_numeric(&existing_id)
+    match table.names.get(existing_key)
+    when Option::Some(n) then
+      if n == name then
+        return existing_id
+      end
+    when Option::None then ()
+    end
+    j = j + 1
+  end
+  let gpid = GenericParamId { owner: owner.clone(), index: index }
+  table.names.insert(generic_param_id_numeric(&gpid), name)
+  table.counts.insert(owner_key, index + 1)
+  gpid
+end
+
+# The registered name of a generic parameter, for diagnostics: the
+# param-name table lookup keyed by GenericParamId; "<param#<numeric>>" for
+# an id the table never interned (a synthesized IR-only parameter).
+def generic_param_name_of(table: &GenericParamTable, gpid: &GenericParamId) -> String
+  match table.names.get(generic_param_id_numeric(gpid))
+  when Option::Some(n) then n.clone()
+  when Option::None then "<param#" + generic_param_id_numeric(gpid).to_string() + ">"
+  end
+end
+
+# The name of a generic parameter from a bare names snapshot (the
+# MonoCache / MirProgram tables — the serialized form of the table's
+# names map); "<param#<numeric>>" when the snapshot never recorded it.
+def generic_param_name_from(names: &Map[Int, String], gpid: &GenericParamId) -> String
+  match names.get(generic_param_id_numeric(gpid))
+  when Option::Some(n) then n.clone()
+  when Option::None then "<param#" + generic_param_id_numeric(gpid).to_string() + ">"
+  end
 end
 
 # Newtype over DefId: every callable's identity (functions, methods,
@@ -153,6 +291,34 @@ struct CfgEdgeId
   id: Int
 end
 
+# The semantic ACCESS identity: one per access (borrow/use of a place) the
+# access checker records on a CFG edge. CleanupAction::EndAccess names it —
+# the resource checker's edge cleanup ends the accesses the edge's transfer
+# performed. The access checker allocates fresh ids per access_check run
+# (the ACCESS_REGISTRY accumulator in resource_check.tg); the id is the
+# numeric identity, never a name.
+struct AccessId
+  id: Int
+end
+
+# The semantic ROOT of an access path (the access checker's TypedPlace):
+#   - Local(LocalId)  a local binding (the type checker's local-binding id —
+#                     the typed.ident_resolutions value);
+#   - SelfValue       the `self` receiver (previously the magic negative
+#                     integer root);
+#   - Static(DefId)   a static/const value (the resolver's DefId);
+#   - RawUnknown      a root whose provenance cannot be known (a raw-pointer
+#                     root, or an unresolvable root) — never provably
+#                     disjoint from any other root.
+# Roots are semantic identities; overlap analysis compares them
+# structurally (never by name or by a naked integer).
+enum AccessRoot
+  Local(LocalId)
+  SelfValue
+  Static(DefId)
+  RawUnknown
+end
+
 # A closure's identity.
 struct ClosureId
   id: Int
@@ -161,15 +327,102 @@ end
 # A stable def ID is a content-based identity that survives across
 # compilations even when source positions change. It is computed from the
 # fully-qualified path + signature of the definition. The canonical key
-# that produced the hash is stored alongside it so a hash collision
+# that produced the digest is stored alongside it so a digest collision
 # between two distinct keys is detectable instead of silently mapping
 # both definitions to the same id.
+#
+# DIGEST MODEL (P0-AM): the identity is the 128-bit STABLE DIGEST
+# (StableDigest — two independent FNV-1a passes over the length-prefixed
+# canonical key, stable_digest_of) of the canonical key — NOT a 64-bit FNV
+# hash plus an order-sensitive collision disambiguation. `hash` and `id`
+# are the LOW 64-bit word of the digest: the projection the UInt-keyed
+# incremental cache maps key by; the FULL digest (digest_hi / digest_lo)
+# IS the identity. COLLISION POLICY: an actual 128-bit digest collision
+# (two distinct canonical keys whose hi AND lo both agree) is an INTERNAL
+# FAILURE (stable_digest_verify panics) — an order-dependent alternate
+# identity (a sequential-counter disambiguation) is NEVER created; the
+# canonical key stored alongside makes every lower-width projection
+# collision equally detectable at lookup (the stored key is compared, not
+# assumed).
+struct StableDigest
+  hi: UInt   # high 64-bit word of the 128-bit digest
+  lo: UInt   # low 64-bit word of the 128-bit digest
+end
+
+# The 128-bit stable digest of a canonical key: two independent FNV-1a
+# passes (distinct offset bases) over the length-prefixed key bytes, with
+# a domain tag — a 128-bit collision space, deterministic across
+# compilations. The identity of a StableDefId.
+def stable_digest_of(key: &String) -> StableDigest
+  var hi: UInt = 0xcbf29ce484222325  # FNV-1a offset basis (pass A)
+  var lo: UInt = 0x84222325cbf29ce4  # rotated second basis (pass B)
+  hi = hi ^ 0x11  # domain tag: the stable-def-id digest domain
+  lo = lo ^ 0x22
+  let len_bytes: Vec[Int] = key.len().to_string().bytes()
+  for c in len_bytes do
+    hi = hi ^ (c as UInt)
+    hi = hi * 0x100000001b3  # FNV-1a prime
+    lo = lo ^ (c as UInt)
+    lo = lo * 0x100000001b3
+  end
+  let key_bytes: Vec[Int] = key.bytes()
+  for c in key_bytes do
+    hi = hi ^ (c as UInt)
+    hi = hi * 0x100000001b3
+    lo = lo ^ (c as UInt)
+    lo = lo * 0x100000001b3
+  end
+  StableDigest { hi: hi, lo: lo }
+end
+
+# StableDigest equality — the full 128-bit identity comparison.
+def stable_digest_eq(a: &StableDigest, b: &StableDigest) -> Bool
+  a.hi == b.hi && a.lo == b.lo
+end
+
+# The digest of a StableDefId — its identity.
+def stable_def_id_digest(sid: &StableDefId) -> StableDigest
+  StableDigest { hi: sid.digest_hi, lo: sid.digest_lo }
+end
+
+# The COLLISION POLICY enforcement point: an actual 128-bit digest
+# collision (two distinct canonical keys with equal digests) is an
+# INTERNAL FAILURE — panic — never an order-dependent alternate identity.
+# Registration and lookup compare the canonical key against the stored key
+# through this check; a mismatch aborts the compilation.
+def stable_digest_verify(sid: &StableDefId, expected_key: &String) -> Unit
+  if sid.key != expected_key.clone() then
+    panic("internal error: stable id digest collision — the canonical keys `" + sid.key + "` and `" + expected_key.clone() + "` share a stable id (a 128-bit digest collision is an internal failure; no counter-disambiguated identity is created)")
+  end
+end
+
+# The digest-model builder for a stable def id: digest the canonical key,
+# store the key alongside, and derive the registered id from the digest's
+# low word (the projection the incremental cache maps key by). The digest
+# itself (hi/lo) is the identity. P1: the resolver's stable-id machinery
+# (compute_stable_def_id / register_stable_id) is wired to this builder —
+# the canonical key is built as "path::name" + "#" + signature.
+def stable_def_id_digested(key: String, path: String) -> StableDefId
+  let d = stable_digest_of(&key)
+  StableDefId { hash: d.lo, key: key, path: path, id: d.lo, digest_hi: d.hi, digest_lo: d.lo }
+end
+
+# StableDefId fields: `hash` and `id` are the LOW 64-bit word of the
+# 128-bit digest of the canonical key (the projection the UInt-keyed
+# incremental maps use); the full digest (digest_hi / digest_lo) is the
+# identity. `id` is NEVER a counter-disambiguated alternate identity —
+# see the collision policy above.
 struct StableDefId
-  hash: UInt       # 64-bit FNV-1a hash of the canonical key
-  key: String      # Canonical key that was hashed (path + "#" + signature)
+  hash: UInt       # low 64-bit word of the 128-bit digest of the
+                   # canonical key (the UInt-keyed cache projection)
+  key: String      # Canonical key that was digested (path + "#" + signature)
   path: String     # Human-readable path (e.g., "std::collections::Vec::push")
-  id: UInt         # Registered stable id: the hash, or a disambiguated
-                   # hash + counter id when a collision was detected
+  id: UInt         # Registered stable id: the digest's low word — never a
+                   # hash + counter disambiguation (an actual digest
+                   # collision is an internal failure, not an alternate
+                   # identity)
+  digest_hi: UInt = 0  # the 128-bit digest of the canonical key: high word
+  digest_lo: UInt = 0  # the 128-bit digest of the canonical key: low word
 end
 
 # P0-AK: a monomorphized callee's identity — the callable's DefId (via

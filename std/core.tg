@@ -52,11 +52,45 @@ trait Shareable
 end
 
 # ———————————————————————————————————————————————————————————————
+# Raw-pointer thread-safety GATE (P1, DECIDED)
+# ———————————————————————————————————————————————————————————————
+# A raw pointer is a plain bit pattern, but bit-copyability says NOTHING
+# about whether the ADDRESS remains meaningful and race-safe on another
+# thread: the pointee may live in the creating thread's stack, in a buffer
+# that is freed or mutated concurrently, or in a region with a different
+# lifetime on the target thread. `T: Transferable` guarantees the VALUE can
+# move between threads — it does not guarantee that an arbitrary address
+# into T's storage stays valid or race-free there.
+#
+# Therefore Ptr[T] / PtrMut[T] are NOT automatically Transferable or
+# Shareable. Pointer thread-safety is OPT-IN and UNSAFE: implement the
+# gate marker for the POINTEE type to assert (under the documented safety
+# contract of the code that produced the pointer) that a Ptr[T] may be
+# transferred to (UnsafeTransferable) or shared across (UnsafeShareable)
+# another thread. Without an explicit gate impl the obligation solver
+# rejects the pointer — the conservative, safe default.
+trait UnsafeTransferable
+end
+
+trait UnsafeShareable
+end
+
+# ———————————————————————————————————————————————————————————————
 # Concurrency property traits (Transferable = Send, Shareable = Sync)
 #
-# MIGRATION NOTE: the compiler's string-name exclusions
-# (non_send_types / non_sync_types in tg_compiler/types.tg, e.g. "Rc" / "Cell")
-# are scheduled for replacement by these traits through the obligation solver.
+# SINGLE RULE (P1, DECIDED — auto traits, ONE authority): Transferable and
+# Shareable are AUTO TRAITS whose STRUCTURAL DERIVATION IS the canonical
+# solver rule. "T: Transferable" holds iff the structural derivation
+# proves it — the type's fields/variants/contents are all Transferable —
+# and the obligation solver IS the derivation: the bounded impls below
+# (primitives, containers, the gated raw-pointer impls) materialize the
+# structural rule through the impl registry. There is NO second, unrelated
+# fallback algorithm: when the registry cannot decide a type, the SAME
+# structural rule is applied (types.tg derives it directly), never a
+# different authority, so the two paths cannot disagree by construction.
+# The compiler's string-name exclusion sets (non_send_types /
+# non_sync_types in tg_compiler/types.tg, e.g. "Rc" / "Cell") are a
+# documentation mirror only — never read in the decision path.
 # ———————————————————————————————————————————————————————————————
 
 trait Eq
@@ -103,8 +137,15 @@ trait Display
 end
 
 # Vec[T] is the compiler-registered heap vector (the Adt form of Array[T] —
-# the growable dynamic array). Fixed-size arrays are the distinct
-# FixedArray[T, N] annotation ([T; N]); there is no Vec alias here.
+# the growable dynamic array). The runtime value is one pointer to the
+# 32-byte header { data@0, len@8, cap@16, stride@24 }: the `stride` field
+# (element stride in bytes, computed from the CONCRETE element type at the
+# creation site — 1/2/4/8 for immediate scalars, 8 for pointer-represented
+# values, align_up(size,align) for fixed-array elements) is the runtime's
+# element-addressing authority: every _tg_array_* helper computes element
+# addresses as data + index*stride and releases cap*stride bytes. Fixed-size
+# arrays are the distinct FixedArray[T, N] annotation ([T; N]); there is no
+# Vec alias here.
 
 # List[T] is an alias for Array[T] (used by various std modules).
 type List[T] = Array[T]
@@ -149,7 +190,7 @@ extern def __intrinsic_syscall5(num: Int, arg1: Int, arg2: Int, arg3: Int, arg4:
 extern def __intrinsic_syscall6(num: Int, arg1: Int, arg2: Int, arg3: Int, arg4: Int, arg5: Int, arg6: Int) -> Int
 
 # Array and Map intrinsics (generic)
-extern def __intrinsic_array_set[T](self: &mut Array[T], index: Int, value: T) -> Unit
+extern def __intrinsic_array_set[T](self: &mut Array[T], index: Int, sink value: T) -> Unit
 extern def __intrinsic_array_as_ptr[T](self: &Array[T]) -> Ptr[T]
 extern def __intrinsic_array_as_mut_ptr[T](self: &mut Array[T]) -> PtrMut[T]
 
@@ -181,23 +222,29 @@ impl Display for String
   end
 end
 
-# String — ownership contract (DECIDED): String = owned immutable buffer
-# (moves transfer, clone allocates, never bitwise-copyable).
-# Ownership: unique owning buffer. Moves transfer ownership; clone() allocates;
-# never bitwise-copyable (String is Clone, NOT Copy).
+# String — ownership contract (DECIDED): String is an OWNED String — a
+# unique owning buffer with semantic nonaliasing: moves transfer the buffer,
+# clone() allocates a new one, and the value is never bitwise-copyable
+# (String is Clone, NOT Copy). "Owned" is a semantic/ownership statement,
+# NOT immutability: push()/push_str() grow the owned buffer in place on the
+# owned value (inout receiver). Every constructor — from OS buffers
+# (from_str_view), raw pointers (from_cstr / from_utf8_unchecked), or
+# string literals — produces the SAME owned String: an owned value that
+# can be moved, cloned, mutated, and destroyed, with no aliasing of the
+# buffer.
 # Release: the backing buffer is arena-managed by the runtime
-# (tg_compiler/runtime.tg `_tg_bump_alloc`) and reclaimed with the arena. There
-# is NO per-string deallocation path in the std or the runtime, and NO
-# impl Drop for String exists: freeing the raw pointer here would corrupt
-# interned string literals, arena allocations without a free header, and
-# borrowed buffers produced by from_utf8_unchecked.
+# (tg_compiler/runtime.tg `_tg_bump_alloc`) and reclaimed with the arena.
+# Arena reclaim is a RUNTIME DETAIL, not a per-value Drop: there is NO
+# per-string deallocation path in the std or the runtime, and NO impl Drop
+# for String exists — freeing the raw pointer here would corrupt interned
+# string literals, arena allocations without a free header, and borrowed
+# buffers produced by from_utf8_unchecked.
 # The String value is one 8-byte raw pointer to null-terminated UTF-8 (the
 # FROZEN String ABI: Repr::StringPtr in tg_compiler/layout_engine.tg, no
 # inline header). The argv/environment strings handed to the program by the
-# OS are BORROWED (never freed, never mutated); the OS-argv consumption path
-# — the process/env code, the CStringView type name — exposes them as
-# StrView, and String::from_cstr / String::from_str_view produce the OWNED
-# clone when an owning copy is required.
+# OS are BORROWED (never freed, never mutated) and are exposed as StrView;
+# String::from_cstr / String::from_str_view produce the OWNED String (an
+# owning copy) when an owned value is required.
 # ———————————————————————————————————————————————————————————————
 # StrView — ownership contract (DECIDED, reviewer item 106):
 # StrView = non-owning UTF-8 view (trivially copyable, must not outlive its
@@ -243,9 +290,18 @@ impl Transferable for F64 {}
 # String owns a unique buffer: moving the value moves the buffer.
 impl Transferable for String {}
 
-# Raw pointers are plain bit patterns; they may be moved between threads.
-impl[T: Transferable] Transferable for Ptr[T] {}
-impl[T: Transferable] Transferable for PtrMut[T] {}
+# Raw pointers are bit-copyable — but bit-copyability says NOTHING about
+# whether the ADDRESS stays meaningful and race-safe on another thread (the
+# pointee may be a stack address of the creating thread, a concurrently
+# freed/mutated buffer, or a region with a different lifetime there).
+# Pointer thread-safety is therefore OPT-IN and UNSAFE: Ptr[T] / PtrMut[T]
+# are Transferable / Shareable ONLY when the pointee T explicitly
+# implements the gate marker (UnsafeTransferable / UnsafeShareable — see
+# the gate section above). Never inferred from T: Transferable.
+impl[T: UnsafeTransferable] Transferable for Ptr[T] {}
+impl[T: UnsafeTransferable] Transferable for PtrMut[T] {}
+impl[T: UnsafeShareable] Shareable for Ptr[T] {}
+impl[T: UnsafeShareable] Shareable for PtrMut[T] {}
 
 # Wrappers and containers: transferable exactly when their contents are.
 impl[T: Transferable] Transferable for Option[T] {}
@@ -289,10 +345,15 @@ impl String
     self.len() == 0
   end
 
+  # Buffer growth on the OWNED value: the inout receiver is the owned
+  # String; the character is appended to its buffer (mutating the owned
+  # value — String is owned, not immutable).
   def push(self: &mut Self, ch: Char) -> Unit
     __intrinsic_string_push(self, ch)
   end
 
+  # Buffer growth on the OWNED value: appends the view's bytes to the
+  # owned String's buffer (the view is borrowed read-only for the call).
   def push_str(self: &mut Self, s: &str) -> Unit
     __intrinsic_string_push_str(self, s)
   end
@@ -819,8 +880,10 @@ impl[T, E] Result[T, E]
     end
   end
 
-  ## Attach a context message to the error (wraps in ContextError).
-  def context(self, msg: String) -> Result[T, ContextError]
+  ## Attach a context message to the error (wraps in ContextError). The
+  ## Result and the message are consumed (sink) — the same ownership rule
+  ## as unwrap/map: a let-self read would duplicate a resource payload.
+  def context(sink self: Self, sink msg: String) -> Result[T, ContextError]
     match self
     when Result::Ok(v) then Result::Ok(v)
     when Result::Err(e) then
@@ -831,8 +894,9 @@ impl[T, E] Result[T, E]
     end
   end
 
-  ## Attach lazy context (only evaluated on error).
-  def with_context(self, f: fn() -> String) -> Result[T, ContextError]
+  ## Attach lazy context (only evaluated on error). The Result and the
+  ## closure are consumed (sink).
+  def with_context(sink self: Self, sink f: fn() -> String) -> Result[T, ContextError]
     match self
     when Result::Ok(v) then Result::Ok(v)
     when Result::Err(e) then
@@ -1024,7 +1088,10 @@ impl String
     result
   end
 
-  # Build a String from a null-terminated C pointer.
+  # Build a NEW OWNED String from a null-terminated C pointer (the same
+  # ownership contract as every String constructor: the result owns its
+  # buffer — moves transfer, clone allocates, push grows it). The pointer
+  # must remain valid for the duration of the copy.
   def from_cstr(ptr: Ptr[u8]) -> String
     var result = String::new()
     var i = 0
@@ -1037,10 +1104,11 @@ impl String
     result
   end
 
-  # Clone a StrView's bytes into an OWNED String buffer (the view borrows;
-  # the result owns). The OS-argv/environment views (the CStringView path)
-  # convert through here when an owning copy is required; the view must stay
-  # alive for the duration of the copy.
+  # Clone a StrView's bytes into a NEW OWNED String buffer (the view
+  # borrows; the result owns — same ownership contract as every String
+  # constructor). The OS-argv/environment views (the CStringView path)
+  # convert through here when an owning value is required; the view must
+  # stay alive for the duration of the copy.
   def from_str_view(self: &StrView) -> String
     var result = String::new()
     var i = 0
@@ -1052,10 +1120,11 @@ impl String
     result
   end
 
-  # Convert an owned byte buffer into a String, validating UTF-8. Err carries
-  # a message on invalid input. (Call sites that need the bytes regardless
-  # use String::from_bytes, the infallible intrinsic.)
-  def from_utf8(data: Vec[u8]) -> Result[String, String]
+  # Convert an owned byte buffer into a String, validating UTF-8. The
+  # buffer is consumed (sink — the owned Vec moves into the conversion);
+  # Err carries a message on invalid input. (Call sites that need the
+  # bytes regardless use String::from_bytes, the infallible intrinsic.)
+  def from_utf8(sink data: Vec[u8]) -> Result[String, String]
     if is_valid_utf8(&data) then
       Result::Ok(String::from_bytes(data))
     else
@@ -1102,8 +1171,9 @@ impl String
     String::from_bytes(data.slice(start, start + len))
   end
 
-  # Copy len raw bytes from a pointer into a String. The caller vouches for
-  # the pointer and the byte count (same contract as from_cstr).
+  # Copy len raw bytes from a pointer into a NEW OWNED String (same
+  # ownership contract as from_cstr). The caller vouches for the pointer
+  # and the byte count.
   def from_utf8_unchecked(ptr: Ptr[u8], len: UInt) -> String
     var result = String::new()
     var i = 0

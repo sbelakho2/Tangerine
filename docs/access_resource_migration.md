@@ -83,7 +83,7 @@ dataflow over the CFG).
 | 11 | Compiler source migration: tg_compiler/*.tg to let/var/inout/sink/set/resource syntax; allocators/FFI as resources; caps as linear capabilities | IMPLEMENTED | the whole `tg_compiler/` tree |
 | 12 | Kernel shrink: `compiler_core.tg` + `bootstrap_main.tg` split; tooling out of the fixed-point manifest | IMPLEMENTED | `bootstrap/compiler_kernel.manifest`: `compiler: compiler_core.tg`; docgen/formatter/linter/driver/agentic/etc. excluded from the kernel |
 | 13 | Strict: bootstrap builds use strict semantics unconditionally | IMPLEMENTED | `type_check_typed` forces `strict_resolution` on every compilation path; permissive mode is editor-recovery only |
-| 14 | Final: delete legacy borrow syntax from the parser; rewrite all docs; full ladder | PARTIAL | Docs rewritten (this document + `memory_model.md`). Legacy parameter modifiers (`&T`/`&mut T`/`move`/`own`) are still normalized at parse (E106 is warning-level) — deletion is a pending target; the full stage0→stage3 ladder is the bootstrap release procedure, pending until the remaining open items below close |
+| 14 | Final: delete legacy borrow syntax from the parser; rewrite all docs; full ladder | PARTIAL | Docs rewritten (this document + `memory_model.md`). Legacy parameter modifiers (`&T`/`&mut T`/`move`/`own`) are still normalized at parse — `&T`/`&mut T` in general type position is a hard error (E106); parser deletion is a pending target; the full stage0→stage3 ladder is the bootstrap release procedure, pending until the remaining open items below close |
 
 ## Exact specs (authoritative during migration) — implemented
 
@@ -118,12 +118,12 @@ The 2026-08-15 audit found the transition structurally sound through wave
 
 | # | Audit finding (2026-08-15) | Status now |
 |---|----------------------------|------------|
-| 1 | TypedProgram produced but not consumed by MIR | **RESOLVED** — MirBuilder consumes access_effects, field_targets, call_def_ids, call_instances, ident_resolutions, typed_local_bindings, pattern/param_binding_resolutions, expr_types, closure_captures, resource_kinds, iteration_plans, edge_cleanup |
+| 1 | TypedProgram produced but not consumed by MIR | **RESOLVED** — MirBuilder consumes access_effects, field_targets, call_def_ids, call_instances, ident_resolutions, typed_local_bindings, pattern/param_binding_resolutions, expr_types, closure_captures, iteration_plans, and the checker's TypedCFG (the CleanupEdge table) |
 | 2 | MirRead/MirConsume/MirDeinit never emitted; codegen drops arg_effects | **RESOLVED** — MirRead/MirConsume are the operand forms; MirDeinit terminators are emitted with verified deinit names; MirCallArg carries the typed effect (`memory_model.md` §4.3, §14.3) |
 | 3 | Expression-level `&` still parsed to ExprRef→MirRef; `let r = &x` not rejected | **RESOLVED** — `&`/`&mut` parse to `ExprAccess`; TypeExprKind Ref/RefMut are gone; E106 flags first-class `&T` type positions (`memory_model.md` §2.3, §3) |
 | 4 | Resource auto-deinit not wired | **RESOLVED** — deinit targets/plans registered; finalize plans + edge plans drive MirDeinit emission (`memory_model.md` §4.2–4.3) |
 | 5 | trait_resolve method identity convention-blind (Type only) | **SUPERSEDED** — the second trait engine was deleted and trait_resolve.tg is a facade over the one solver; signatures carry `ParamType` conventions (`memory_model.md` §8.5) |
-| 6 | Type::Ref/RefMut/Owned + Lifetime deletion pending; collections get→&T pending; COW pending | **PARTIAL** — Type::Ref/RefMut/Owned and Lifetime are gone (`RefInternal` remains, documented MIR-only); reference-returning API removal is a pending target (E106 is warning-level); COW remains pending |
+| 6 | Type::Ref/RefMut/Owned + Lifetime deletion pending; collections get→&T pending; COW pending | **PARTIAL** — Type::Ref/RefMut/Owned and Lifetime are gone (`RefInternal` remains, documented MIR-only); reference-returning type positions are gone too (the kernel's transitional `-> &T` / `Option[&T]` / `Vec[&T]` forms were converted to their erased-value forms and E106 is a hard error); COW remains pending |
 | 7 | Resolver declaration pass duplication | **ARCHIVED** — no longer a memory-model issue; see `resolver.tg` |
 | 8 | TypeEnv lookups return TypeDef by value | **ARCHIVED** — superseded by the identity refactor (`memory_model.md` §8) |
 | 9 | layout_of_concrete has no callers | **RESOLVED** — called from `codegen.tg` |
@@ -146,19 +146,20 @@ should be taken as their specification beyond what that section says:
   (backedge) cleanup.
 - **Typed-HIR migration** — finalizer recognition is name-based
   (`deinit`/`drop`) pending a typed `FinalizerKind`; `ParamModifier` is
-  transitional; the reference-returning APIs (which keep E106
-  warning-level) are pending removal.
+  transitional. (The reference-returning type positions were converted
+  to their erased-value forms; E106 is a hard error.)
 - **Fixed-array size constants** — `[T; N]` counts must be Int literals;
   constant-expression sizes pending.
-- **StrView** — the String/StrView distinction is a target; `String` is
-  the single builtin string type today.
+- **Generated drop glue** — recursive owning types fail closed with
+  `PlanLimit` until generated per-TypeDef drop glue exists.
+- **StrView registration** — `StrView` is a std struct selected by name
+  (hash/eq dispatch in codegen.tg / mono.tg); LangItems-level
+  registration pending.
 - **LangItems for the name-selected pointers** — UniquePtr/WeakRc/
   ArcStrong/WeakArc are still name-selected.
-- **CleanupEdge unification** — the edge_cleanup map + finalize-plan
-  string keys coexist pending a single `CleanupEdge` per real CFG edge.
 - **Legacy borrow syntax deletion** — `&T`/`&mut T`/`move`/`own`
-  parameter modifiers are still normalized at parse; E106 is still
-  warning-level.
+  parameter modifiers are still normalized at parse (E106 is a hard
+  error in general type position).
 - **COW backing storage** for String/Array/Map/Set (wave 9 remainder).
 
 The authoritative pending list is `memory_model.md` §15.2; it is updated

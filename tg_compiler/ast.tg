@@ -51,22 +51,33 @@ end
 
 # P0-AM (real module graph): Program.crate is the SINGLE module table — the
 # Crate { root: ModuleId, modules: Map[ModuleId, Module] } authority the
-# reviewer's design specifies. Each Module's item_indices indexes the
-# contiguous [start, end) item range of one module inside Program.items (the
-# root module, id 0, covers the top-level items). The items stay indices
-# into the flat Program.items for the transition — the reviewer's target
-# `items: Vec[ItemId]` — because items are still the source Item nodes; the
-# index range into Program.items is the transition representation of the
-# ItemId list, and the Crate becomes the module table the next batch's
-# construction sites (merge_imported_deps in compiler_core.tg) rebuild when
-# dependencies are flattened in. ModuleId itself lives in ids.tg — the
-# central semantic identity domain — so DefId.module (also ids.tg) points
-# into this graph by identity, never by path String.
+# reviewer's design specifies. Each Module's items is the per-module ItemId
+# list (Vec[ItemId] — an ItemId is the owning item's index into the flat
+# Program.items; the flat vector stays the intermediate storage, the
+# SEMANTIC OWNERSHIP lives in the module tables). The root module, id 0,
+# covers the main program's top-level items; every dependency file gets one
+# Module (see merge_imported_deps / collect_dep_file in compiler_core.tg).
+# P1: EVERY item carries its owning ModuleId directly (Item.owner_module),
+# assigned at the construction sites — the parser's make_item defaults to
+# the root module, compiler_core's dependency assembly stamps each
+# dependency item with its ModuleId — so owner lookups are table reads
+# (program.items[i].owner_module -> crate.modules), never range scans.
+# ModuleId itself lives in ids.tg — the central semantic identity domain —
+# so DefId.module (also ids.tg) points into this graph by identity, never
+# by path String.
+
+# The flat-item index as a strong identity: Module.items holds ItemIds into
+# Program.items. Defined here beside its Module table — the ids.tg
+# consolidation (next to ModuleId) is a later batch; this batch only edits
+# ast.tg/parser.tg/compiler_core.tg/resolver.tg.
+struct ItemId
+  id: Int
+end
 
 struct Module
   id: ModuleId
   path: Vec[String]
-  item_indices: Vec[Int]
+  items: Vec[ItemId]
   imports: Vec[String]
 end
 
@@ -100,6 +111,14 @@ struct Item
   attrs: Vec[Attribute]
   span: Span
   is_pub: Bool
+  # P1 (semantic ownership): the ModuleId of the module owning this item —
+  # the Program.crate.modules key of its owner (the root module id 0 for
+  # the main program's items). Assigned at the construction sites: the
+  # parser's make_item defaults to root; compiler_core's dependency
+  # assembly (collect_dep_file) stamps each merged dependency item with its
+  # file module's ModuleId. Consumers read the owner's path/items via the
+  # crate table — no range scans.
+  owner_module: ModuleId
 end
 
 enum ItemKind
@@ -365,6 +384,15 @@ end
 # Macros
 # ———————————————————————————————————————————————————————————————
 
+# P1 (macro identity): MacroDecl carries only the bare `name`; the
+# MODULE-SCOPED identity (owner module path + name, rendered by the
+# resolver's module-qualified key form) is assigned at registration time by
+# the expansion env in compiler_core.tg (expand_macros Phase 1 — the owner
+# module comes from Program.crate's module table item ranges, inline module
+# trees append their segment). A macro is never visible outside its module
+# except through module-qualified paths, `use` imports, or import aliases —
+# the same module/import ambiguity rules other declarations obey (a
+# same-module duplicate or an import collision is an E107 ambiguity error).
 struct MacroDecl
   vis: Visibility
   name: String
@@ -577,6 +605,14 @@ enum StmtKind
   # Guard (early exit)
   StmtGuard(Expr, GuardElse)
   
+  # P0-EX: the three forms below (try/catch/finally, with, handle/with) are
+  # exceptional / teardown-guarding constructs. They PARSE — the AST keeps
+  # them and the parser still accepts them — but they are REJECTED at the
+  # type checker with the diagnostic "exceptions are not supported — no
+  # throwing path may bypass teardown": the backend has no exception
+  # runtime and the resource CFG has no Throw/Unwind/Handler edges, so a
+  # throwing path could bypass Drop/defer/access teardown. Rejected code
+  # never reaches the resource checker or MIR (which also fail closed).
   # Try/catch
   StmtTry(Block, Vec[CatchArm], Option[Block])
   
@@ -661,6 +697,22 @@ struct Expr
   node_id: Int
 end
 
+# The canonical place-likeness predicate: whether an expression denotes a
+# MEMORY PLACE (an identifier / self reference / field access / index /
+# raw deref) whose address can be taken, as opposed to a computed VALUE.
+# Single source of truth for the typed-HIR consumers (mir.tg's
+# expr_is_place_like and the checker-side place derivations).
+pub def expr_is_place_like(expr: &Expr) -> Bool
+  match expr.kind
+  when ExprKind::ExprIdent(_) then true
+  when ExprKind::ExprSelfRef then true
+  when ExprKind::ExprFieldAccess(_, _) then true
+  when ExprKind::ExprRawDeref(_) then true
+  when ExprKind::ExprIndex(_, _) then true
+  when _ then false
+  end
+end
+
 enum ExprKind
   # Literals
   ExprIntLit(Int)
@@ -712,6 +764,12 @@ enum ExprKind
   ExprAsync(Block)
   ExprAwait(Box[Expr])
   
+  # P0-EX: the postfix `?` operator (try/propagate). NOT an exceptional
+  # construct in this language: no throw/raise expression exists and no
+  # error propagation is modeled at any level — its semantics are ERASURE
+  # (the operand's value). It is NOT rejected (the compiler kernel uses
+  # it; the block exceptional forms above are the ones rejected at check
+  # time).
   # Try operator
   ExprTry(Box[Expr])
   
@@ -734,7 +792,12 @@ enum ExprKind
   # Pipe operator
   ExprPipe(Box[Expr], Box[Expr])
 
-  # Macro invocation: vec![1, 2, 3]
+  # Macro invocation: vec![1, 2, 3]. P1 (macro identity): the bare name is
+  # resolved MODULE-SCOPED at expansion time (compiler_core.tg
+  # lookup_macro — the call site's module first, then its imports;
+  # ambiguity is an E107 error). Module-qualified invocations in CALL form
+  # (`a::m(x)` — the parser produces ExprEnumVariant for qualified call
+  # paths) resolve through the same module-qualified machinery.
   ExprMacroCall(String, Vec[Expr])
 
   # Error sentinel (produced during macro expansion)
@@ -787,31 +850,37 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # P0-AM: every freshly parsed program records its root module (id 0, empty
-# path, empty imports) covering all top-level items in its Crate.
-# merge_imported_deps (compiler_core.tg) rebuilds the module table when
-# dependencies are flattened in; the flat items vector stays the interface.
+# path, empty imports) covering all top-level items in its Crate. The root
+# module's item list is built HERE (P1 — Module.items: Vec[ItemId], each
+# ItemId the flat index of one item); the parser's make_item already stamped
+# every item with the root owner ModuleId. merge_imported_deps
+# (compiler_core.tg) rebuilds the module table when dependencies are
+# flattened in; the flat items vector stays the interface.
 def make_program(items: Vec[Item], span: Span) -> Program
-  var root_indices = Vec::new()
-  root_indices.push(0)
-  root_indices.push(items.len())
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
   var root_imports = Vec::new()
   var root_id = ModuleId { id: 0 }
   var modules = Map::new()
   modules.insert(root_id, Module {
     id: root_id,
     path: Vec::new(),
-    item_indices: root_indices,
+    items: root_items,
     imports: root_imports
   })
   Program { items: items, crate: Crate { root: root_id, modules: modules }, span: span }
 end
 
 def make_item(kind: ItemKind, span: Span) -> Item
-  Item { kind: kind, attrs: Vec::new(), span: span, is_pub: false }
+  Item { kind: kind, attrs: Vec::new(), span: span, is_pub: false, owner_module: ModuleId { id: 0 } }
 end
 
 def make_item_with_attrs(kind: ItemKind, attrs: Vec[Attribute], span: Span) -> Item
-  Item { kind: kind, attrs: attrs, span: span, is_pub: false }
+  Item { kind: kind, attrs: attrs, span: span, is_pub: false, owner_module: ModuleId { id: 0 } }
 end
 
 def make_block(stmts: Vec[Stmt], span: Span) -> Block

@@ -4,9 +4,13 @@
 
 module tg_compiler::wasm_target
 
-use std::core::{Option, Result, Display}
+use std::core::{Option, Result, Display, panic}
 use std::collections::{Map, Array}
 use tg_compiler::types::{Type, TypeId}
+use tg_compiler::layout_engine::{
+  LayoutEngine, LayoutError, LayoutFailureClass,
+  ValueCategory, classify_value_category
+}
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirBlock, MirLocal,
   MirStatement, MirStatementKind,
@@ -16,7 +20,7 @@ use tg_compiler::mir::{
   MirConstant, MirConstantKind,
   MirCallArg, mir_call_arg_operand,
   MirBinOp, MirUnOp, CastKind,
-  AggregateKind, Place, Projection, LocalId, BlockId
+  AggregateKind, Place, Projection, MirLocalId, MirBlockId
 }
 use tg_compiler::cross_compile::{TargetTriple, OptLevel}
 
@@ -266,7 +270,7 @@ impl WasmCompiler
 
     ## Build function name -> index mapping for calls
     mut func_map: Map[String, UInt] = Map::new()
-    for func in mir.functions.iter() do
+    for func in mir.functions do
       func_map.insert(func.name.clone(), self.func_index)
       self.func_index = self.func_index + 1
     end
@@ -274,7 +278,7 @@ impl WasmCompiler
     self.func_index = self.func_index - mir.functions.len() as UInt
 
     ## Compile each function
-    for func in mir.functions.iter() do
+    for func in mir.functions do
       self.compile_function(func, &func_map)?
     end
 
@@ -400,7 +404,7 @@ impl WasmCompiler
     var code = Array::new()
 
     ## Declare WASM locals for each MIR local
-    for local in func.locals.iter() do
+    for local in func.locals do
       locals.push((1, mir_type_to_wasm(&local.ty)))
     end
 
@@ -463,9 +467,11 @@ impl WasmCompiler
 
     ## Emit code for each block (block 0 is emitted first, inside the
     ## innermost b_{N-1}; block i's code runs inside b_{N-1-i})
-    for (block_idx, block) in func.blocks.iter().enumerate() do
+    var block_idx = 0
+    while block_idx < func.blocks.len() do
+      let block = func.blocks[block_idx]
       ## Emit statements
-      for stmt in block.statements.iter() do
+      for stmt in block.statements do
         self.emit_statement(&mut code, stmt, func)?
       end
 
@@ -476,6 +482,7 @@ impl WasmCompiler
       self.emit_terminator(&mut code, &block.terminator, target_local, num_blocks, block_idx, func, func_map)?
 
       code.push(0x0B)  ## end block $b{block_idx}
+      block_idx = block_idx + 1
     end
 
     code.push(0x0C)  ## br
@@ -488,10 +495,21 @@ impl WasmCompiler
   def emit_statement(&self, code: &mut Array[u8], stmt: &MirStatement, func: &MirFunction) -> Result[Unit, WasmCompileError]
     match stmt.kind
     when MirStatementKind::MirAssign(place, rvalue) then
-      self.emit_rvalue(code, rvalue, func)?
-      ## Store result into local
-      code.push(0x21)  ## local.set
-      _encode_leb128_u32(code, place.local.id as UInt)
+      if place.projections.is_empty() then
+        self.emit_rvalue(code, rvalue, func)?
+        ## Store result into local
+        code.push(0x21)  ## local.set
+        _encode_leb128_u32(code, place.local.id as UInt)
+      else
+        ## Projected assign: push the slot ADDRESS first, then the value,
+        ## then i32.store — the store lands in the projected slot instead
+        ## of overwriting the whole local.
+        _emit_place_address_wasm(code, place)
+        self.emit_rvalue(code, rvalue, func)?
+        code.push(0x36)  ## i32.store
+        code.push(0x02)  ## align=4
+        _encode_leb128_u32(code, 0)  ## offset=0
+      end
     when MirStatementKind::MirStorageLive(_) then ()  ## no-op in WASM
     when MirStatementKind::MirStorageDead(_) then ()  ## no-op in WASM
     when MirStatementKind::MirNop then ()
@@ -515,9 +533,30 @@ impl WasmCompiler
     when MirRvalueKind::MirCast(_, operand, _) then
       self.emit_operand(code, operand)?
     when MirRvalueKind::MirRef(place) then
-      ## Take address — in wasm32 this is the local's stack slot
-      code.push(0x20)  ## local.get
-      _encode_leb128_u32(code, place.local.id as UInt)
+      ## Take address — in wasm32 the aggregate's handle is its local value;
+      ## a projected place walks the canonical address chain.
+      if place.projections.is_empty() then
+        code.push(0x20)  ## local.get
+        _encode_leb128_u32(code, place.local.id as UInt)
+      else
+        _emit_place_address_wasm(code, place)
+      end
+    when MirRvalueKind::MirDiscriminant(place) then
+      ## Read the enum VALUE word (the image handle), then the tag at the
+      ## image base ([word + 0] — the wasm image stores the discriminant as
+      ## slot 0, exactly like the native image's tag at offset 0).
+      if place.projections.is_empty() then
+        code.push(0x20)  ## local.get
+        _encode_leb128_u32(code, place.local.id as UInt)
+      else
+        _emit_place_address_wasm(code, place)
+        code.push(0x28)  ## i32.load — the enum value word
+        code.push(0x02)
+        code.push(0x00)
+      end
+      code.push(0x28)  ## i32.load — the tag word at the image base
+      code.push(0x02)
+      code.push(0x00)
     when MirRvalueKind::MirAggregate(_, operands) then
       ## Allocate memory on the stack for the aggregate.
       let num_fields = operands.len()
@@ -534,7 +573,9 @@ impl WasmCompiler
         _encode_leb128_u32(code, self.stack_ptr_global)
 
         ## Store each field at base + i*4
-        for (i, op) in operands.iter().enumerate() do
+        var op_i = 0
+        while op_i < operands.len() do
+          let op = operands[op_i]
           code.push(0x23)  ## global.get (base address)
           _encode_leb128_u32(code, self.stack_ptr_global)
           self.emit_operand(code, op)?
@@ -548,7 +589,8 @@ impl WasmCompiler
           end
           code.push(0x36)  ## i32.store
           code.push(0x02)  ## align=4
-          _encode_leb128_u32(code, (i * 4) as UInt)  ## offset
+          _encode_leb128_u32(code, (op_i * 4) as UInt)  ## offset
+          op_i = op_i + 1
         end
 
         ## Leave the pointer (base address) on the stack
@@ -565,30 +607,16 @@ impl WasmCompiler
     match operand.kind
     when MirOperandKind::MirCopy(place) | MirOperandKind::MirMovePlace(place) |
          MirOperandKind::MirRead(place) | MirOperandKind::MirConsume(place) then
-      code.push(0x20)  ## local.get
-      _encode_leb128_u32(code, place.local.id as UInt)
-      ## Handle projections (field access = memory load from offset)
-      for proj in place.projections.iter() do
-        match proj
-        when Projection::ProjField(_, idx) then
-          _emit_field_load(code, *idx)
-        when Projection::ProjFieldIndex(idx) then
-          _emit_field_load(code, *idx)
-        when Projection::ProjDeref then
-          code.push(0x28)  ## i32.load (deref pointer)
-          code.push(0x02)
-          code.push(0x00)
-        when Projection::ProjIndex(idx_local) then
-          code.push(0x20)  ## local.get index
-          _encode_leb128_u32(code, idx_local.id as UInt)
-          emit_i32_const(code, 4)  ## element size (4 bytes per slot)
-          code.push(0x6C)  ## i32.mul
-          code.push(0x6A)  ## i32.add
-          code.push(0x28)  ## i32.load
-          code.push(0x02)  ## align=4
-          code.push(0x00)  ## offset=0
-        when _ then ()
-        end
+      if place.projections.is_empty() then
+        code.push(0x20)  ## local.get
+        _encode_leb128_u32(code, place.local.id as UInt)
+      else
+        ## Projected place: compute the slot address through the canonical
+        ## walker (the enum-payload tag shift included), then load the slot.
+        _emit_place_address_wasm(code, place)
+        code.push(0x28)  ## i32.load
+        code.push(0x02)
+        code.push(0x00)
       end
     when MirOperandKind::MirConstant(c) then
       match c.kind
@@ -672,7 +700,7 @@ impl WasmCompiler
       code.push(0x0F)  ## return
     when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
       ## Emit operand, then if/else chain for each target
-      for target in targets.iter() do
+      for target in targets do
         self.emit_operand(code, op)?
         emit_i64_const(code, target.value)
         code.push(0x51)  ## i64.eq
@@ -693,7 +721,7 @@ impl WasmCompiler
       _encode_leb128_u32(code, loop_depth)
     when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
       ## Push arguments
-      for arg in args.iter() do
+      for arg in args do
         let arg_op = mir_call_arg_operand(arg)
         self.emit_operand(code, &arg_op)?
       end
@@ -757,7 +785,7 @@ impl WasmCompiler
     Ok(())
   end
 
-  def intern_type(&mut self, ft: FuncType) -> UInt
+  def intern_type(&mut self, sink ft: FuncType) -> UInt
     let key = _func_type_key(&ft)
     match self.type_cache.get(&key)
     when Some(idx) then *idx
@@ -844,6 +872,88 @@ end
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
+# ─── WASM value categories (P0-VC) ──────────────────────────────
+# The wasm32 backend's ABI classification, mirroring the layout engine's
+# value-category model (classify_value_category — the single authority;
+# every size comes from the centralized layout engine, never an independent
+# estimate). wasm32 words are 4 bytes, so the categories map as:
+#   ZeroSized     -> no wasm value (Unit, Never, empty aggregates)
+#   Scalar(width) -> ONE wasm value: 1/2/4 bytes -> i32, 8 bytes -> i64,
+#                    floats -> f32/f64
+#   ScalarPair    -> BY ADDRESS: every aggregate value — 16-byte pairs
+#                    (the Slice view { ptr, len }), larger structs, tuples,
+#                    enums — is materialized as a pointer to its linear-
+#                    memory image (MirAggregate allocates n*4-byte slots
+#                    and pushes the base), and the caller/callee emission
+#                    in this backend uses exactly ONE slot (an i32) per
+#                    parameter/result. The classifier therefore maps both
+#                    ScalarPair and ByAddress to the single-slot address
+#                    convention — a two-value wasm pair is NOT the wasm32
+#                    ABI here.
+#   ByAddress     -> the linear-memory ADDRESS of the >16-byte aggregate
+#                    (i32)
+# FAIL-CLOSED: unresolved types (Var/Param/Error) are Result::Err — the
+# caller must fail, never assume a guessed word.
+enum WasmValueCategory
+  WasmZeroSized
+  WasmScalar(WasmValType)
+  WasmByAddress
+end
+
+# The wasm value type for a byte width (1/2/4 -> i32, 8 -> i64); 16-byte
+# values are pairs, not single slots.
+def wasm_valtype_for_width(width: Int) -> Option[WasmValType]
+  match width
+  when 1 then Option::Some(WasmValType::I32)
+  when 2 then Option::Some(WasmValType::I32)
+  when 4 then Option::Some(WasmValType::I32)
+  when 8 then Option::Some(WasmValType::I64)
+  when _ then Option::None
+  end
+end
+
+# THE wasm value-category classifier: asks the layout engine's single
+# authority and maps the category to wasm32 value slots. Result::Err
+# propagates fail-closed for unresolved/unsupported types.
+def classify_wasm_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[WasmValueCategory, LayoutError]
+  match classify_value_category(engine, ty)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(ValueCategory::ZeroSized) then
+    Result::Ok(WasmValueCategory::WasmZeroSized)
+  when Result::Ok(ValueCategory::Scalar(w)) then
+    # Float scalars map to the float value types; everything else maps by
+    # width (1/2/4 -> i32, 8 -> i64).
+    match ty
+    when Type::Float | Type::F32 then Result::Ok(WasmValueCategory::WasmScalar(WasmValType::F32))
+    when Type::F64 then Result::Ok(WasmValueCategory::WasmScalar(WasmValType::F64))
+    when _ then
+      match wasm_valtype_for_width(w)
+      when Option::Some(vt) then Result::Ok(WasmValueCategory::WasmScalar(vt))
+      when Option::None then
+        Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "Scalar width has no wasm32 value type",
+          type_name: "unknown",
+          expected: 0,
+          actual: w,
+          context: "classify_wasm_value_category"
+        })
+      end
+    end
+  when Result::Ok(ValueCategory::ScalarPair(_, _)) then
+    # A 16-byte aggregate (the Slice view { ptr, len } and other 16-byte
+    # values) crosses the wasm32 ABI as its LINEAR-MEMORY ADDRESS: every
+    # aggregate value is a single i32 handle (MirAggregate materializes it
+    # as a pointer), and the caller/callee emission in this backend uses
+    # one slot per parameter/result. The two-value pair form is NOT the
+    # wasm32 convention here — a 16-byte value must never occupy two slots.
+    Result::Ok(WasmValueCategory::WasmByAddress)
+  when Result::Ok(ValueCategory::ByAddress(_)) then
+    # >16-byte aggregates cross by their linear-memory address.
+    Result::Ok(WasmValueCategory::WasmByAddress)
+  end
+end
+
 ## Determine the WASM value type an operand will produce on the stack.
 def _operand_wasm_type(operand: &MirOperand, func: &MirFunction) -> WasmValType
   match operand.kind
@@ -906,13 +1016,103 @@ def _call_callee_name(op: &MirOperand) -> String
   end
 end
 
-def _emit_field_load(code: &mut Array[u8], idx: Int) -> Unit
-  code.push(0x28)
-  code.push(0x02)
-  _encode_leb128_u32(code, (idx * 4) as UInt)
+# Push the BYTE ADDRESS of `place` onto the wasm stack: the base is the
+# local's value (in wasm32 every aggregate/enum value is one i32 handle —
+# the pointer to its linear-memory image of 4-byte slots), and each
+# projection adjusts it. The projection walk mirrors the native backend's
+# canonical place-addressing primitive:
+#   - Variant(vid)      an enum downcast: subsequent payload fields sit ONE
+#                       slot past the image's tag slot (the wasm image is
+#                       [tag @ 0, payload @ 1, ...] — MirAggregate stores
+#                       the discriminant as operand 0), so the payload
+#                       shift is set to 1 and applied to every following
+#                       Field/TupleIndex offset; the shift resets after a
+#                       loaded projection (the base then points at the
+#                       field's own value, which has no tag);
+#   - Field(fid)        + (fid.index + shift) * 4; loaded when not last
+#                       (the field's value becomes the new base);
+#   - TupleIndex(idx)   + (idx + shift) * 4; loaded when not last;
+#   - ProjIndex / ProjConstantIndex — + index * 4 (+ the shift);
+#   - ProjDeref         load the pointed-to word (a deref's address IS the
+#                       loaded value; as the LAST projection a deref is a
+#                       no-op — the final load resolves it).
+# A last projection only adds its offset — the caller loads the slot.
+def _emit_place_address_wasm(code: &mut Array[u8], place: &Place) -> Unit
+  code.push(0x20)  ## local.get
+  _encode_leb128_u32(code, place.local.id as UInt)
+  var payload_shift = 0
+  var proj_i = 0
+  while proj_i < place.projections.len() do
+    let proj = place.projections[proj_i]
+    let is_last = proj_i == place.projections.len() - 1
+    match proj
+    when Projection::Field(fid) then
+      emit_i32_const(code, ((fid.index + payload_shift) * 4) as i32)
+      code.push(0x6A)  ## i32.add
+      if !is_last then
+        code.push(0x28)  ## i32.load
+        code.push(0x02)
+        code.push(0x00)
+        payload_shift = 0
+      end
+    when Projection::TupleIndex(idx) then
+      emit_i32_const(code, ((*idx + payload_shift) * 4) as i32)
+      code.push(0x6A)  ## i32.add
+      if !is_last then
+        code.push(0x28)  ## i32.load
+        code.push(0x02)
+        code.push(0x00)
+        payload_shift = 0
+      end
+    when Projection::ProjIndex(idx_local) then
+      code.push(0x20)  ## local.get index
+      _encode_leb128_u32(code, idx_local.id as UInt)
+      emit_i32_const(code, 4)  ## element slot size
+      code.push(0x6C)  ## i32.mul
+      if payload_shift != 0 then
+        emit_i32_const(code, (payload_shift * 4) as i32)  ## tag slot shift
+        code.push(0x6A)  ## i32.add
+      end
+      code.push(0x6A)  ## i32.add
+      if !is_last then
+        code.push(0x28)  ## i32.load
+        code.push(0x02)
+        code.push(0x00)
+        payload_shift = 0
+      end
+    when Projection::ProjConstantIndex(ci) then
+      emit_i32_const(code, ((*ci + payload_shift) * 4) as i32)
+      code.push(0x6A)  ## i32.add
+      if !is_last then
+        code.push(0x28)  ## i32.load
+        code.push(0x02)
+        code.push(0x00)
+        payload_shift = 0
+      end
+    when Projection::ProjDeref then
+      if !is_last then
+        code.push(0x28)  ## i32.load (deref pointer)
+        code.push(0x02)
+        code.push(0x00)
+      end
+    when Projection::Variant(_) then
+      payload_shift = 1
+    end
+    proj_i = proj_i + 1
+  end
 end
 
 def mir_type_to_wasm(ty: &Type) -> WasmValType
+  # FAIL-CLOSED: an unresolved type (Var/Param/Error) has NO wasm value type
+  # — never a guessed word. The engine-based classifier
+  # (classify_wasm_value_category) is the single authority for value
+  # categories; this single-slot mapper serves the stub's local/param
+  # declarations and refuses unresolved types.
+  match ty
+  when Type::Var(_) | Type::Param(_) | Type::Error then
+    panic("wasm: mir_type_to_wasm on an unresolved type (Var/Param/Error) — layout queries fail closed, never a guessed word")
+  when _ then ()
+  end
   match ty
   when Type::Bool | Type::Char then WasmValType::I32
   when Type::Int then WasmValType::I64
@@ -971,14 +1171,18 @@ end
 
 def _func_type_key(ft: &FuncType) -> String
   var s = "(".to_string()
-  for (i, p) in ft.params.iter().enumerate() do
-    if i > 0 then s = s + "," end
-    s = s + _valtype_str(p)
+  var pi = 0
+  while pi < ft.params.len() do
+    if pi > 0 then s = s + "," end
+    s = s + _valtype_str(ft.params[pi])
+    pi = pi + 1
   end
   s = s + ")->("
-  for (i, r) in ft.results.iter().enumerate() do
-    if i > 0 then s = s + "," end
-    s = s + _valtype_str(r)
+  var ri = 0
+  while ri < ft.results.len() do
+    if ri > 0 then s = s + "," end
+    s = s + _valtype_str(ft.results[ri])
+    ri = ri + 1
   end
   s + ")"
 end
@@ -1044,14 +1248,14 @@ end
 def _encode_type_section(ts: &TypeSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, ts.types.len() as UInt)
-  for ft in ts.types.iter() do
+  for ft in ts.types do
     buf.push(0x60)  ## functype marker
     _encode_leb128_u32(&mut buf, ft.params.len() as UInt)
-    for p in ft.params.iter() do
+    for p in ft.params do
       _encode_valtype(&mut buf, p)
     end
     _encode_leb128_u32(&mut buf, ft.results.len() as UInt)
-    for r in ft.results.iter() do
+    for r in ft.results do
       _encode_valtype(&mut buf, r)
     end
   end
@@ -1061,7 +1265,7 @@ end
 def _encode_import_section(imp_sec: &ImportSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, imp_sec.imports.len() as UInt)
-  for imp in imp_sec.imports.iter() do
+  for imp in imp_sec.imports do
     _encode_name(&mut buf, &imp.module_name)
     _encode_name(&mut buf, &imp.name)
     match imp.desc
@@ -1087,7 +1291,7 @@ end
 def _encode_function_section(fs: &FunctionSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, fs.type_indices.len() as UInt)
-  for idx in fs.type_indices.iter() do
+  for idx in fs.type_indices do
     _encode_leb128_u32(&mut buf, *idx)
   end
   buf
@@ -1096,7 +1300,7 @@ end
 def _encode_memory_section(ms: &MemorySection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, ms.memories.len() as UInt)
-  for mem in ms.memories.iter() do
+  for mem in ms.memories do
     _encode_limits(&mut buf, mem)
   end
   buf
@@ -1105,7 +1309,7 @@ end
 def _encode_global_section(gs: &GlobalSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, gs.globals.len() as UInt)
-  for (global_type, init_expr) in gs.globals.iter() do
+  for (global_type, init_expr) in gs.globals do
     _encode_valtype(&mut buf, &global_type.val_type)
     if global_type.mutable then buf.push(0x01) else buf.push(0x00) end
     buf.extend_from_slice(init_expr)
@@ -1117,7 +1321,7 @@ end
 def _encode_export_section(es: &ExportSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, es.exports.len() as UInt)
-  for exp in es.exports.iter() do
+  for exp in es.exports do
     _encode_name(&mut buf, &exp.name)
     match exp.desc
     when ExportDesc::Func(idx) then
@@ -1140,11 +1344,11 @@ end
 def _encode_code_section(cs: &CodeSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, cs.bodies.len() as UInt)
-  for body in cs.bodies.iter() do
+  for body in cs.bodies do
     ## Encode the function body into a temporary buffer to get its length
     var func_buf = Array::new()
     _encode_leb128_u32(&mut func_buf, body.locals.len() as UInt)
-    for (count, valtype) in body.locals.iter() do
+    for (count, valtype) in body.locals do
       _encode_leb128_u32(&mut func_buf, *count)
       _encode_valtype(&mut func_buf, valtype)
     end
@@ -1160,7 +1364,7 @@ end
 def _encode_data_section(ds: &DataSection) -> Array[u8]
   var buf = Array::new()
   _encode_leb128_u32(&mut buf, ds.segments.len() as UInt)
-  for seg in ds.segments.iter() do
+  for seg in ds.segments do
     _encode_leb128_u32(&mut buf, seg.memory_index)
     buf.extend_from_slice(&seg.offset)
     buf.push(0x0B)  ## end opcode for offset init expr

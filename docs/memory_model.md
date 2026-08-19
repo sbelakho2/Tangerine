@@ -58,9 +58,11 @@ inference and no ownership analysis (§13); codegen (stage 12,
 
 There is no borrow checker. There are no safe reference types and no
 lifetimes; those concepts are not supported by the language. The only
-`&` forms are the access marker (§3) and the legacy parameter-modifier
+`&` forms are the access marker (§3) and the legacy parameter-convention
 syntax that the parser normalizes away (§2). First-class `&T` / `&mut T`
-types are a migration target for deletion (§15).
+in a general type position is rejected with the hard error E106 (§2.3);
+the legacy parameter-convention spellings remain only as normalized
+syntax (§2), pending their parser deletion (§15).
 
 ---
 
@@ -122,23 +124,26 @@ accesses within one call:
   indexing conservatively overlaps; `RawDeref` — unknown alias (§11).
 - `self` uses a negative root so it can never collide with a real local id.
 
-### 2.3 E106: first-class `&T` is a migration diagnostic
+### 2.3 E106: first-class `&T` is a hard error
 
 `&T`, `&mut T` (and `&&T`) in a **general type position** — return types,
-struct fields, generic type arguments — is **not a first-class type**. The
-parser (`parse_type` in `parser.tg`) emits a warning-level diagnostic:
+struct fields, variable annotations, tuple members, generic arguments,
+container elements — is **not a first-class type** and is **rejected**. The
+parser (`parse_type` in `parser.tg`) records an error-level diagnostic:
 
 ```
 E106: safe reference types are not first-class; use a parameter access
       convention / access operation
 ```
 
-and recovers by returning the inner type, so the pipeline keeps working
-while the transitional reference-returning APIs (`Box.get -> &T`,
-`Option[&T]`, `Vec[&T]`, ...) migrate. It is warning-level so the
-self-hosted build is not aborted by those APIs; the migration target is
-their removal (§15). Parameter annotations are normalized before
-`parse_type` is reached, so legacy `&T` parameters never fire E106.
+and fails the parse: `parse_type` consumes the `&` constructor and returns
+`Option::None` — it **never** erases the reference to its inner type, so a
+program cannot write `def bad(...) -> &Thing` and have it silently become
+`Thing`. The call site must migrate to a **parameter access convention**
+(`x: &T` / `x: &mut T` parameter annotations, `self: &Self` /
+`self: &mut Self`) or an explicit **access operation** (`&place`). Parameter
+annotations are normalized before `parse_type` is reached, so the legacy
+`&T` parameter access conventions never fire E106.
 
 ---
 
@@ -295,8 +300,8 @@ move/sink (transfer).
   array is trivially copyable), `Option`/`Result` over trivially-copyable
   arguments, user structs/enums whose fields/payloads are all
   trivially copyable.
-- **No:** `String` and `str` (heap-backed — a bit-copy would duplicate the
-  buffer state without the retain/clone it requires), the builtin
+- **No:** `String` and `str` (the owned String — a bit-copy would
+  duplicate the owned buffer without the required clone), the builtin
   containers (Vec/Array/Map/Set/Slice — including Vec's registered shape
   `{ ptr: Ptr[T], len, cap }`, whose Ptr field must not be walked),
   the owning smart pointers (Box/Rc by LangItems id; UniquePtr/WeakRc/
@@ -311,25 +316,34 @@ move/sink (transfer).
 ## 7. TypeProperties
 
 `TypeProperties { needs_drop, is_linear, is_capability,
-is_trivially_copyable }` is the memoized per-type property bundle
-computed by `type_properties_of` (`types.tg`).
+is_trivially_copyable, is_deferred }` is the memoized per-type property
+bundle computed by `type_properties_of` (`types.tg`). It is the ONE
+ownership authority: the resource checker and MIR query it on the
+concrete (TypeId, substitutions) identity (`engine_snapshot_env` /
+`deinit_plan_for_type`), and no ownership decision re-derives from the
+nominal declaration.
 
 **`needs_drop` is separate from linearity.** A type can need cleanup
 without being linear (e.g. `Rc[T]` — shared ownership) and can be linear
 without per-value drop.
 
 - `needs_drop`: true for a type with a registered `impl Drop` (matched by
-  the LangItems `drop_trait` TraitId, never by name), for the owning
+  the LangItems `drop_trait` TraitId, never by name) and for the owning
   smart pointers (Box/Rc by LangItems TypeId; UniquePtr/WeakRc/ArcStrong/
-  WeakArc by name — LangItems entries for them are a migration target),
-  and for containers whose **concrete arguments** need drop.
-- Container `needs_drop` is **content-viral over the concrete args**:
-  `Vec[Int]` needs no drop, `Vec[File]` does; the container layer itself
-  never owns drop (Vec's registered shape is never walked as owning
-  storage).
+  WeakArc by name — LangItems entries for them are a migration target);
+  containers own their backing storage (next bullet).
+- Containers (Vec/Array/Map/Set) **own their backing storage**:
+  `needs_drop` is true regardless of the element types (`Vec[Int]` still
+  releases its buffer; `Map[Int, Int]` still releases its bucket arena);
+  the element walk propagates linearity and deferral over the concrete
+  args.
 - `is_linear`: resources/capabilities by nominal kind, and content-linearity
   through fields/variants/args/containers.
 - `is_capability`: the `TypeKind::Capability` marker.
+- `is_deferred`: an unsubstituted generic parameter (or unresolved type
+  variable) in the type graph — while deferred, the four semantic fields
+  are non-authoritative (false = "not proven true"); the concrete answer
+  appears after substitution.
 - `is_trivially_copyable`: §6.1.
 
 **The graph algorithm:** the walk is memoized in `type_prop_cache` keyed
@@ -433,8 +447,14 @@ are **gone**. The shape is:
 
 - **Primitives** — `Unit Bool Int UInt Float Char String Never`, the
   sized integer/float set for FFI parity (`I8..I128, U8..U128, ISize,
-  USize, F32, F64`). `String` is a primitive: heap-backed but
-  arena-managed — no per-value drop, never bit-copyable.
+  USize, F32, F64`). `String` is a primitive and an **owned String**: it
+  owns a unique heap buffer (one raw pointer to null-terminated UTF-8,
+  the frozen `StringPtr` ABI) with semantic nonaliasing — moves transfer,
+  `clone()` allocates, and the inout methods (`push`/`push_str`) grow the
+  owned buffer. It is never bit-copyable. The buffer is arena-managed by
+  the runtime: arena reclaim is a runtime detail, not a per-value Drop
+  (there is no `impl Drop for String`; the MIR drop plan for `String` is
+  Trivial).
 - **`Adt(TypeId, Vec[Type])`** — the ONE nominal form, builtin or
   user-defined. `builtin_adt` is the single construction helper for the
   builtins (fail-closed: an unverifiable name yields `Type::Error`,
@@ -454,19 +474,25 @@ are **gone**. The shape is:
 - **`Function(Vec[ParamType], Type)`** — function types carry the
   per-parameter access conventions (§2).
 - **`RefInternal(Type, Bool)`** — MIR-only (parameter re-wrap and
-  MirRef/MirRefMut typing); not a source-level type.
+  MirRef typing); not a source-level type.
 - **`Ptr(Type)` / `PtrMut(Type)`** — raw pointers (§11). Box/Rc are Adt
   forms of the registered Box/Rc ids, not pointer variants.
 - **`Dyn(TypeId)`** — trait objects; **`Effect(Vec[String], Type)`**;
   **`Tuple(Vec[Type])`**; **`Var(TypeVarId)`**; **`Param(String)`**;
   **`Error`**.
 - **`Slice`** is a registered builtin Opaque generic Adt (the LangItems
-  `slice` id is the special-behavior selector) — the target for
-  slice-views of heap data; `str` is registered for the string escape
-  (`__intrinsic_string_as_str`). The **String / StrView distinction is a
-  target**: today `String` is the single builtin string type; a
-  non-owning `StrView` view type over string data is not yet
-  implemented (§15).
+  `slice` id is the special-behavior selector) — the non-owning 16-byte
+  `{ ptr: Ptr[T], len: UInt }` view over heap data (`slice_view_layout`
+  in layout_engine.tg; the contract in std/collections.tg). `str` is the
+  registered string escape spelling (`__intrinsic_string_as_str`),
+  mapping to the `String` primitive. **The String/StrView distinction is
+  implemented**: `StrView` (std/core.tg) is the non-owning
+  `{ ptr: Ptr[u8], len: UInt }` view — bit-copyable, no drop, no clone —
+  that borrows string data (owned `String` buffers, interned literals, OS
+  argv); `String::as_str_view` borrows, `String::from_str_view` clones
+  into an owned `String`. `str` and `StrView` are both selected by name
+  in the hash/eq dispatch (codegen.tg / mono.tg), not by LangItems id
+  (§15.2).
 
 Normalization at unification: aliases resolve to their underlying type,
 the Named primitive spellings map to the canonical variants, Ref/RefMut/
@@ -644,28 +670,30 @@ that transfer:
 | `Backedge` | the loop body → header backedge |
 | `GuardElse` | a guard's else exit (return/break/continue under the guard stmt's id) |
 
-`CfgEdge { kind, source, destination, cleanup_ids }`: `source` is the
+`CfgEdge { kind, source, destination, actions }`: `source` is the
 semantic node id of the transfer's originator; `destination` is the
-static target when one exists (0 for dynamic targets); `cleanup_ids` are
-the semantic local ids in reverse drop order that must be finalized on
-this edge.
+static target when one exists (0 for dynamic targets); `actions` is the
+edge's cleanup obligation as an **action sequence in execution order**
+(`CleanupAction`): RunDefer actions (the exited scopes' defers, LIFO —
+innermost scope first, within a scope reverse registration order), then
+Drop actions (the live Sink/OwnedLocal locals of the exit, in reverse
+drop order), grounded on the source block's exit frame
+(`block_grounded_drop_ids` is the authority for what an edge drops).
 
-The obligations serialize into the **`edge_cleanup` map** keyed
-`edge::<kind>::<source node id>` (e.g. `edge::Return::42`), with values
-byte-identical to the compatibility-layer finalize-plan string keys
-(`return::<id>`, `break::<id>`, `continue::<id>`, `backedge::<id>`,
-`block::<id>`). `validate_cfg_edges` (end of `check_fn_body`) verifies
-the model. MIR consults the edge map first and falls back to the string
-keys for synthesized/IR-only nodes.
-
-**`CleanupEdge` target.** The finalize-plan string keys are a second, ad
-hoc CFG. The documented target is a single semantic
-`CleanupEdge { source_cfg_edge, exited_scopes,
-locals_in_reverse_drop_order, destination }` attached to each real CFG
-edge, so an edge can never accidentally reuse another edge's plan (the
-loop-exit double-clean and the nested block::/edge:: double-drop bug
-class). MIR would then merely materialize the resolved edge cleanup.
-This unification is pending (§15).
+**The CleanupEdge table (migration complete).** The String-keyed
+serializations — the `edge_cleanup` map (`edge::<kind>::<source>`) and
+the finalize-plan edge string keys (`return::<id>`, `break::<id>`,
+`continue::<id>`, `backedge::<id>`, `block::<id>`) — are **deleted**.
+The resource checker serializes one semantic
+`CleanupEdge { edge: CfgEdgeId, actions }` per real CFG edge into the
+parallel table `TypedCFG.cleanup` (`cleanup[i]` is edge `i`'s record;
+the edge's index IS its `CfgEdgeId`), so an edge can never accidentally
+reuse another edge's plan (the loop-exit double-clean and the nested
+block::/edge:: double-drop bug class). `validate_cfg_edges` verifies the
+model, and MIR merely materializes the resolved edge cleanup through the
+single lookup (`lookup_cleanup_edge`); the builder-side defer
+registrations remain only as the fallback for synthesized/IR-only edges
+that never had a checker record.
 
 ### 14.2 defer as an action
 
@@ -694,9 +722,10 @@ Deinit plans are computed per **concrete** type (`deinit_plan_for_type`
 in `mir.tg`): resource containment can depend on the generic args
 (`Wrapper[Int]` vs `Wrapper[File]`), so plans are built from the type
 definition with the args substituted. Recursive owning types fail closed
-with `PlanLimit` (until generated drop glue exists) rather than silently
-expanding. Emission order on every exit: defer actions (LIFO), then the
-deinit chain in reverse drop order; the user finalizer first, then the
+with `PlanLimit` rather than silently expanding — generated drop glue
+for recursive owning types is **target architecture** (pending, §15.2).
+Emission order on every exit: defer actions (LIFO), then the deinit
+chain in reverse drop order; the user finalizer first, then the
 compiler-owned structural field cleanup — exactly once.
 
 ---
@@ -730,12 +759,12 @@ compiler-owned structural field cleanup — exactly once.
 |------|------------------|--------|
 | **Partial moves** | projected-place consumes/moves/assigns rejected ("partial moves are not yet supported", "exact-place replacement is not yet supported") | per-place partial-move state in the resource checker |
 | **Consuming iteration** | snapshot iteration exists; sink-element iteration rejected | consuming iteration with per-iteration (backedge) cleanup |
-| **Typed-HIR migration** | finalizer recognition is name-based (`deinit`/`drop`); `ParamModifier` retained transitionally; transitional reference-returning APIs still fire E106 | a typed `FinalizerKind` on method metadata (the deinit-plans/user-finalizer layer); `ParamModifier` deletion; reference-returning API removal (then E106 becomes an error) |
+| **Typed-HIR migration** | finalizer recognition is name-based (`deinit`/`drop`); `ParamModifier` retained transitionally; the kernel's transitional reference-returning type positions (`-> &T`, `Option[&T]`, `Vec[&T]`) were converted to their erased-value forms (E106 is a hard error) | a typed `FinalizerKind` on method metadata (the deinit-plans/user-finalizer layer); `ParamModifier` deletion |
 | **Fixed-array size constants** | `[T; N]` requires an IntLit count ("fixed array size must be a constant") | constant-expression sizes in the type identity |
-| **StrView** | `String` is the single builtin string type; `str` is the registered escape | the String/StrView distinction (a non-owning view type) |
+| **Generated drop glue** | recursive owning types fail closed with `PlanLimit` ("generated drop glue required", §14.3); `String`'s drop plan stays Trivial (arena reclaim is a runtime detail) | generated per-TypeDef drop glue (then PlanLimit is removed) |
+| **StrView registration** | `StrView` is a std struct selected by name in the hash/eq dispatch (codegen.tg / mono.tg); `str` is the registered escape spelling of the `String` primitive | LangItems-level registration of the view type |
 | **LangItems for the name-selected pointers** | UniquePtr/WeakRc/ArcStrong/WeakArc are name-selected in the property engine and copy analysis | registered LangItems entries |
-| **CleanupEdge unification** | finalize-plan string keys + the edge_cleanup map coexist | a single `CleanupEdge` per real CFG edge (§14.1) |
-| **Legacy borrow syntax deletion** | `&T`/`&mut T`/`move`/`own` parameter modifiers are normalized at parse; E106 is warning-level | remove the legacy syntax from the parser entirely |
+| **Legacy borrow syntax deletion** | `&T`/`&mut T`/`move`/`own` parameter access conventions are normalized at parse; `&T` in general type position is a hard error (E106) | remove the legacy parameter-convention syntax from the parser entirely |
 
 The pending list above is the authoritative one; `access_resource_migration.md`
 records the historical status of these items at audit time.

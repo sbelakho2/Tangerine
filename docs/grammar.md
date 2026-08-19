@@ -245,10 +245,13 @@ and normalizes** legacy Rust-style spellings (`parser.tg` `parse_param`,
 
 The type-position forms `&T` / `&mut T` are consumed by the parameter parser
 before `parse_type` runs, so the reference is *not* part of the type; it is
-converted into the parameter's modifier/convention (`parser.tg:1556-1569`).
-Within a plain type expression `&T`, `&mut T`, and `&&T` are likewise
-accepted and parse as just `T` (the reference marker is stripped,
-`parser.tg:2778-2798`) — see §3.
+converted into the parameter's modifier/convention (`parser.tg:1560-1628`) —
+this is the **parameter access convention** the E106 message recommends.
+Within a plain type expression `&T`, `&mut T`, and `&&T` are a **hard error**
+(E106): `parse_type` never erases the reference to its inner type — it
+records the error and fails the parse (see §3). The legacy acceptance of
+`self: &Self` / `self: &mut Self` (normalized to `let` / `inout`) is part of
+the same parameter normalization.
 
 ### 2.4 Structs
 
@@ -384,10 +387,16 @@ rationale_field = IDENT ':' ( STRING_LITERAL | expr )
 
 ## 3. Type Expressions
 
-There are **no safe reference types**. `&T` / `&mut T` are accepted in type
-position only as legacy spellings that normalize to the bare inner type
-(`parser.tg:2778-2798`). Raw pointer types `*T` and `*mut T` are the
-unsafe-pointer forms.
+There are **no safe reference types**. `&T` / `&mut T` / `&&T` in a general
+type position — return types, struct fields, variable annotations, tuple
+members, generic arguments, container elements — are a **hard error** (E106,
+`parser.tg` `diag_safe_ref_not_first_class`): `parse_type` consumes the `&`
+constructor, records the error, and fails the parse (it never returns the
+inner type). The only accepted `&` spellings are the **parameter access
+conventions** `x: &T` / `x: &mut T` (and `self: &Self` / `self: &mut Self`),
+which are normalized at the parameter site before `parse_type` runs, and the
+fn-type convention prefixes `fn(&T)` / `fn(&mut T)`. Raw pointer types `*T`
+and `*mut T` are the unsafe-pointer forms.
 
 ```ebnf
 type_expr      = type_primary [ '?' ]      // T? desugars to Option[T]
@@ -399,9 +408,9 @@ type_primary   = IDENT [ type_args ]                    // Named type / generic
                | '(' type_expr { ',' type_expr } ')'    // Tuple (1 elem = group)
                | '[' type_expr ';' expr ']'             // Fixed-size array
                | '[' type_expr ']'                      // Slice
-               | '&' type_primary                       // LEGACY: parses as inner
-               | '&mut' type_primary                    // LEGACY: parses as inner
-               | '&&' type_primary                      // LEGACY: parses as inner
+               | '&' type_primary                       // HARD ERROR (E106); accepted only as a parameter access convention
+               | '&mut' type_primary                    // HARD ERROR (E106); accepted only as a parameter access convention
+               | '&&' type_primary                      // HARD ERROR (E106)
                | '*' [ 'mut' ] type_primary             // *T / *mut T raw pointer
                | 'async' type_primary                   // Async wrapper
                | 'impl' type_primary                    // desugars to the trait
@@ -435,7 +444,16 @@ type_args      = '[' type_expr { ',' type_expr } ']'
   `fn_type_arrow_ahead`, `parser.tg:2748-2772`).
 - **Canonical builtins** (`types.tg`): primitives `Unit`, `Bool`, `Int`,
   `UInt`, `Float`, `Char`, `String`; builtin generics `Option[T]`,
-  `Result[T, E]`, `Vec[T]`, `Map[K, V]`, `Box[T]`, `Ptr[T]`, `PtrMut[T]`.
+  `Result[T, E]`, `Vec[T]` (= `Array[T]`, the heap vector — a handle to
+  the stride-carrying 32-byte heap header `{data, len, cap, stride}`),
+  `Map[K: Hash + Eq, V]` and `Set[T: Hash + Eq]` (= `Map[T, Unit]`; the
+  88-byte header carrying the concrete layout plus concrete Hash/Eq
+  dispatch), `Slice[T]` (the non-owning 16-byte `{ptr, len}` view),
+  `Box[T]`, `Rc[T]`, `Ptr[T]`, `PtrMut[T]`. Collection insertion
+  (`push`/`insert`/`set_insert`) takes the inserted value **by sink** —
+  ownership transfers into the container; the containers own their
+  backing storage (`needs_drop`). The storage/layout contracts live in
+  `std/collections.tg` and `tg_compiler/layout_engine.tg`.
 
 ## 4. Expressions
 
@@ -731,15 +749,16 @@ Common attributes: `@derive(...)`, `@test`, `@bench`, `@inline`,
 | `let` parameter                  | `&x`, `x: &T`   | `x`                       |
 | Reference parameter type         | `x: &T`         | `x: T` with `let`         |
 | Mutable reference parameter type | `x: &mut T`     | `x: T` with `inout`       |
-| Safe reference type              | `&T`, `&mut T`  | **removed** — bare `T` (marker stripped) |
+| Safe reference type              | `&T`, `&mut T`  | **hard error E106** — rejected in type position; only the parameter access conventions (`x: &T`, `self: &Self`) are accepted |
 | Mutable receiver                 | `&mut self`     | trailing `inout` (or `inout self`) |
 | Function keyword                 | `fn`            | `def`                     |
 | Module keyword                   | `mod`           | `module`                  |
 | Continue keyword                 | `continue`      | `next` (both accepted)    |
 | Type alias keyword               | `typealias`, `alias` | `type`              |
 
-There are no safe reference types in the language; `&T` / `&mut T` survive
-only as legacy spellings that normalize as described in §2.3 and §3.
+There are no safe reference types in the language; `&T` / `&mut T` in type
+position are rejected with E106 and survive only as the parameter access
+conventions described in §2.3 and §3.
 
 ## See Also
 

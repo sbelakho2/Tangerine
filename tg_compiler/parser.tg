@@ -37,6 +37,8 @@ enum ErrorCode
   E103ExpectedIdent
   E104ExpectedPattern
   E105MacroExpansionDepthExceeded
+  E106SafeRefNotFirstClass
+  E107MacroAmbiguity
 end
 
 enum DiagLevel
@@ -90,15 +92,15 @@ def error_code_to_string(code: ErrorCode) -> String
   when ErrorCode::E103ExpectedIdent then "E103"
   when ErrorCode::E104ExpectedPattern then "E104"
   when ErrorCode::E105MacroExpansionDepthExceeded then "E105"
+  when ErrorCode::E106SafeRefNotFirstClass then "E106"
+  when ErrorCode::E107MacroAmbiguity then "E107"
   end
 end
 
 def diag_has_errors(bag: &Vec[Diagnostic]) -> Bool
-  # Only Error-level diagnostics abort the pipeline. Warning-level migration
-  # diagnostics (e.g. E106 safe-reference rejection) fire into the same bag
-  # but must not stop the self-hosted build while the transitional
-  # reference-returning APIs migrate (reviewer items 34/35). All pre-existing
-  # parser diagnostics are Error-level, so this filter is behavior-preserving.
+  # Only Error-level diagnostics abort the pipeline. All parser diagnostics
+  # are Error-level (E106 included since the safe-reference rejection became a
+  # hard error), so this filter is behavior-preserving.
   for d in bag do
     if d.level == DiagLevel::Error then
       return true
@@ -116,25 +118,31 @@ def diag_macro_expansion_depth_exceeded(bag: &mut Vec[Diagnostic], span: Span) -
   diag_error(bag, ErrorCode::E105MacroExpansionDepthExceeded, "macro expansion exceeded maximum depth", span)
 end
 
-# Migration diagnostic (reviewer item 34): &T / &mut T (and &&T) in a general
-# type position — return types, struct fields, generic type arguments — is NOT
-# a first-class type; the borrow previously erased silently to its inner type.
-# The parse still recovers (returns the inner type) so the pipeline keeps
-# working, but the call site must migrate to a parameter access convention or
-# an explicit access operation. Warning-level so the transitional
-# reference-returning APIs (Box.get -> &T, Option[&T], Vec[&T], ...) fire the
-# diagnostic without aborting the self-hosted build (item 35 replaces them).
-# The parse_param path keeps its normalization: the legacy ampersand on
-# parameter annotations is consumed there BEFORE parse_type is reached.
+# Records a P1 macro-identity failure through the parser's diagnostic
+# channel: a macro name that resolves to more than one module-qualified
+# definition (duplicate in the same module, or the same local name imported
+# from two modules) is an AMBIGUITY error — the same module/import ambiguity
+# rule other declarations obey. The macro expander in compiler_core.tg
+# (register_macro / lookup_macro) calls this; diag_has_errors then fails the
+# compilation like every other parser diagnostic.
+def diag_macro_ambiguity(bag: &mut Vec[Diagnostic], message: String, span: Span) -> Unit
+  diag_error(bag, ErrorCode::E107MacroAmbiguity, message, span)
+end
+
+# Hard error (reviewer item 34): &T / &mut T (and &&T) in a general type
+# position — return types, struct fields, generic type arguments, variable
+# annotations, tuple members, container elements — is NOT a first-class type
+# and is REJECTED: parse_type consumes the `&` constructor and returns
+# Option::None (it never returns the inner type after consuming `&`), so a
+# program can no longer write `def bad(...) -> &Thing` and have it silently
+# become Thing. The call site must migrate to a parameter access convention
+# or an explicit access operation. The parse_param path keeps its
+# normalization: the legacy ampersand on parameter annotations is consumed
+# there BEFORE parse_type is reached, so `x: &T` parameter annotations (the
+# parameter access convention) and `self: &Self` / `self: &mut Self` still
+# compile.
 def diag_safe_ref_not_first_class(bag: &mut Vec[Diagnostic], span: Span) -> Unit
-  bag.push(Diagnostic {
-    level: DiagLevel::Warning,
-    message: "safe reference types are not first-class; use a parameter access convention / access operation",
-    span: Option::Some(span),
-    notes: Vec::new(),
-    suggestions: Vec::new(),
-    code: Option::Some("E106")
-  })
+  diag_error(bag, ErrorCode::E106SafeRefNotFirstClass, "safe reference types are not first-class; use a parameter access convention / access operation", span)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1479,8 +1487,10 @@ def parse_where_clause(p: &mut TgcParser, params: &mut Vec[GenericParam]) -> Uni
         mut found = false
         for param in params do
           if param.name == type_name then
+            # Shared iteration is projected: clone each bound into the
+            # param (consuming iteration is not supported yet).
             for b in bounds do
-              param.bounds.push(b)
+              param.bounds.push(b.clone())
             end
             found = true
           end
@@ -1667,33 +1677,39 @@ end
 # Macro
 # ———————————————————————————————————————————————————————————————
 
-# Macro identity / module scoping (P1 audit):
-# MacroDecl carries only a bare `name: String` (ast.tg). The expansion env in
-# compiler_core.tg (expand_macros, Phase 1) collects macros into a global map
-# keyed by that bare name AFTER the merged-source construction
-# (merge_imported_deps) — keys carry NO module qualification. Map::insert is
-# LAST-WINS (std/collections.tg): a same-named macro from two modules in the
-# merged program silently shadows the earlier definition, the later item
-# winning. Target: once modules are preserved, qualify the macro keys by
-# module so identity becomes module-scoped.
-# Bootstrap-set audit (tg_compiler + std): the only macro definitions are
-# vec!, profile!, bench!, checkpoint!, checkpoint_with_data! — all distinct
-# names, so no same-named collision exists in the compiler's own sources and
-# no mechanical collision fix is required.
+# Macro identity / module scoping (P1, DECIDED):
+# MacroDecl carries the bare `name: String` (ast.tg); the expansion env in
+# compiler_core.tg (expand_macros, Phase 1) registers every macro under its
+# MODULE-SCOPED identity — the (owner module path, name) pair keyed by the
+# resolver's module-qualified key form (MacroId { module_path, name } ->
+# macro_id_key: "path::name", root degenerates to the bare name). The owner
+# module comes from Program.crate's module table, read via the item's OWNER
+# ModuleId (Item.owner_module — stamped by make_item as the root module at
+# parse time; compiler_core's dependency assembly stamps dependency items);
+# inline module trees append their segment. Lookup is equally
+# module-qualified (lookup_macro): bare names resolve in the CALL SITE's
+# module first, then through its use declarations; qualified paths resolve
+# relatively, absolutely, and through import aliases; a name with more than
+# one candidate is an AMBIGUITY error (E107), never a silent last-wins
+# shadow. Bootstrap-set audit (tg_compiler + std): the only macro
+# definitions are vec!, profile!, bench!, checkpoint!,
+# checkpoint_with_data!, js_inline! — all distinct names in distinct
+# modules (std::collections, std::profile, std::snapshot, std::wasm_js), so
+# no same-module collision exists in the compiler's own sources.
 #
-# Macro hygiene (P1, scoped — see instantiate_macro in compiler_core.tg):
-# every expansion consumes a unique numeric context from
-# MacroEnv.expansion_counter, and the identifiers the expansion INTRODUCES
-# (the macro body's own let-bound temporaries, not the user's argument
-# tokens) are re-stamped to the reserved form  `__hygiene_<ctx>_<name>`.
-# The marker must stay a plain identifier for the lexer's charset
-# (is_ident_char in lexer.tg = [A-Za-z0-9_]; `$` is NOT accepted, so `_` is
-# the join char) so re-lexing round-trips the stamp; the resolver keys
-# locals by name string, so a stamped binding is a distinct local and can
-# neither capture nor be captured by a surrounding name. The `__hygiene_`
-# prefix is RESERVED: the parser/lexer treat it as an ordinary identifier,
-# but user code must not spell it (this comment is the contract point for
-# any future parser/lexer work touching identifiers).
+# Macro hygiene (P1, DECIDED — STRUCTURAL, not spelling-based — see
+# instantiate_macro in compiler_core.tg): every expansion interns a fresh
+# syntax-context mark (MacroEnv.syntax_contexts — the intern table), and the
+# identifiers the expansion INTRODUCES (the macro body's own let-bound
+# temporaries, not the user's argument tokens) become generated Identifier
+# { symbol, syntax_context } values. The AST carries the identifier KEY
+# rendered from (symbol, context) as `symbol$c1$c2$...`. `$` is NOT in the
+# lexer's identifier charset (is_ident_char in lexer.tg = [A-Za-z0-9_]), so
+# the key is an identifier NO user-written source text can produce: hygiene
+# needs no reserved prefix. A user spelling any other identifier — including
+# the old reserved-prefix mangle form — can never capture a generated
+# binding, because their identifier lexes to a different string than the
+# generated key.
 
 def parse_macro_decl(p: &mut TgcParser, vis: Visibility, start: Span) -> Option[MacroDecl]
   match expect_ident(p)
@@ -2919,32 +2935,36 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
   
   match peek(p)
   when TokenKind::Amp then
+    # Hard E106: &T in a general type position is not a first-class type.
+    # parse_type NEVER erases the reference to its inner type: the `&` is
+    # consumed, the E106 error is recorded, the inner type is skipped for
+    # error recovery, and the parse fails (Option::None).
     let amp_span = peek_span(p)
     advance(p)
+    diag_safe_ref_not_first_class(&mut p.diag, amp_span)
     match parse_type(p)
-    when Option::Some(inner) then
-      diag_safe_ref_not_first_class(&mut p.diag, amp_span)
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::And then
     let amp_span = peek_span(p)
     advance(p)
+    diag_safe_ref_not_first_class(&mut p.diag, amp_span)
     match parse_type(p)
-    when Option::Some(inner) then
-      diag_safe_ref_not_first_class(&mut p.diag, amp_span)
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::AmpMut then
     let amp_span = peek_span(p)
     advance(p)
+    diag_safe_ref_not_first_class(&mut p.diag, amp_span)
     match parse_type(p)
-    when Option::Some(inner) then
-      diag_safe_ref_not_first_class(&mut p.diag, amp_span)
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::Star then
     # Raw pointer types (*T and *mut T)
     advance(p)

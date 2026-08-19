@@ -1,13 +1,17 @@
-use std::core::{Option}
+use std::core::{Option, panic}
 use std::collections::{Vec}
 use tg_compiler::token::{Span}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
-  GuardElse, MatchExpr
+  GuardElse, MatchExpr, IfStmt, ForStmt, AstPath
 }
-use tg_compiler::types::{AccessEffect, TypedProgram, Type, ParamType, TypeId}
-use tg_compiler::ids::{FieldId}
+use tg_compiler::types::{AccessEffect, TypedProgram, Type, ParamType, TypedExprKind}
+use tg_compiler::ids::{FieldId, AccessId, AccessRoot, LocalId, DefId}
+use tg_compiler::resource_check::{
+  build_typed_cfg, TypedCFG, CfgEdgeKind, ResFlow, FlowKind, build_res_flow,
+  access_registry_reset, access_registry_fresh_id, access_registry_register
+}
 
 enum AccessProjection
   Field(FieldId, String)
@@ -17,14 +21,19 @@ enum AccessProjection
   RawDeref
 end
 
-struct AccessPath
-  root: Int
-  root_name: String
+# P0-CA: the TYPED PLACE of an access — the semantic root (AccessRoot:
+# Local(LocalId)/SelfValue/Static(DefId)/RawUnknown — ids.tg) plus the
+# projection chain. This replaces the former integer-root AccessPath
+# (the "local integer or magic self/raw value" sentinels — root: Int
+# with -1 for `self` and unresolved fallbacks — are GONE). Roots compare
+# structurally, never by a naked integer or by name.
+struct TypedPlace
+  root: AccessRoot
   projections: Vec[AccessProjection]
 end
 
 struct ActiveAccess
-  path: AccessPath
+  path: TypedPlace
   effect: AccessEffect
 end
 
@@ -33,39 +42,58 @@ struct AccessError
   span: Span
 end
 
+# P0-CA: the access checker consumes THE SAME TYPED CFG as the resource
+# checker (build_typed_cfg — the shared structural pass that records every
+# control-flow decision as CfgEdge/CfgBlock records BEFORE any analysis
+# state runs). The recursive source-tree analysis is replaced by a
+# CFG-DRIVEN walk: each statement/condition is visited through the CFG's
+# blocks, and every access path is attached to the CFG edge its call site
+# originates (registered in the shared ACCESS_REGISTRY keyed by the edge's
+# source node id — the resource checker's CleanupAction::EndAccess names
+# the registered AccessIds when the edge's cleanup runs). The overlap
+# analysis (paths_overlap) operates on the semantic AccessRoot paths.
 pub def access_check(program: &Program, typed: &TypedProgram) -> Vec[AccessError]
+  # P0-CA: the shared access registry is checker-scoped state — reset per
+  # run (the ITERATION_PLANS convention). PIPELINE PAIRING: the pipeline
+  # runs access_check BEFORE resource_check for the same program
+  # (compiler_core / driver), so the registry the resource checker reads is
+  # always THIS program's.
+  access_registry_reset()
+  let cfg = build_typed_cfg(program, typed)
   mut errors = Vec::new()
   mut i = 0
   while i < program.items.len() do
-    check_item(program, typed, &program.items[i], &mut errors)
+    check_item_cfg(program, typed, &cfg, &program.items[i], &mut errors)
     i = i + 1
   end
   errors
 end
 
-def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mut Vec[AccessError]) -> Unit
+# P0-CA: the item-level CFG walk (the check_item mirror — same coverage,
+# CFG-driven).
+def check_item_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, item: &Item, errors: &mut Vec[AccessError]) -> Unit
   match item.kind
   when ItemKind::ItemFunction(f) then
-    check_function(program, typed, &f, errors)
+    check_function_cfg(program, typed, cfg, &f, errors)
   when ItemKind::ItemStruct(s) then
     mut i = 0
     while i < s.fields.len() do
       match s.fields[i].default
-      when Option::Some(e) then check_expr(program, typed, &e, errors)
+      when Option::Some(e) then check_expr_cfg(program, typed, cfg, &e, e.node_id, errors)
       when Option::None then ()
       end
       i = i + 1
     end
     i = 0
     while i < s.methods.len() do
-      check_function(program, typed, &s.methods[i], errors)
+      check_function_cfg(program, typed, cfg, &s.methods[i], errors)
       i = i + 1
     end
   when ItemKind::ItemEnum(e) then
     mut i = 0
     while i < e.variants.len() do
       match e.variants[i].discriminant
-      when Option::Some(d) then check_expr(program, typed, &d, errors)
+      when Option::Some(d) then check_expr_cfg(program, typed, cfg, &d, d.node_id, errors)
       when Option::None then ()
       end
       i = i + 1
@@ -73,29 +101,29 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
   when ItemKind::ItemTrait(t) then
     mut i = 0
     while i < t.methods.len() do
-      check_trait_method(program, typed, &t.methods[i], errors)
+      check_trait_method_cfg(program, typed, cfg, &t.methods[i], errors)
       i = i + 1
     end
   when ItemKind::ItemImpl(im) then
     mut i = 0
     while i < im.methods.len() do
-      check_function(program, typed, &im.methods[i], errors)
+      check_function_cfg(program, typed, cfg, &im.methods[i], errors)
       i = i + 1
     end
   when ItemKind::ItemModule(m) then
     mut i = 0
     while i < m.items.len() do
-      check_item(program, typed, &m.items[i], errors)
+      check_item_cfg(program, typed, cfg, &m.items[i], errors)
       i = i + 1
     end
   when ItemKind::ItemUse(_) then ()
   when ItemKind::ItemMacro(mac) then
-    check_block(program, typed, &mac.body, errors)
+    check_block_cfg(program, typed, cfg, &mac.body, errors)
   when ItemKind::ItemTypeAlias(_) then ()
   when ItemKind::ItemConst(c) then
-    check_expr(program, typed, &c.value, errors)
+    check_expr_cfg(program, typed, cfg, &c.value, c.value.node_id, errors)
   when ItemKind::ItemStatic(s) then
-    check_expr(program, typed, &s.value, errors)
+    check_expr_cfg(program, typed, cfg, &s.value, s.value.node_id, errors)
   when ItemKind::ItemCapabilityDecl(_) then ()
   when ItemKind::ItemEffectDecl(_) then ()
   when ItemKind::ItemRationaleBlock(_) then ()
@@ -105,7 +133,7 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
     while i < ext.items.len() do
       match ext.items[i]
       when ExternItem::Function(ef) then
-        check_params_defaults(program, typed, &ef.params, errors)
+        check_params_defaults_cfg(program, typed, cfg, &ef.params, errors)
       when ExternItem::Static(_) then ()
       end
       i = i + 1
@@ -113,139 +141,169 @@ def check_item(program: &Program, typed: &TypedProgram, item: &Item, errors: &mu
   end
 end
 
-def check_function(program: &Program, typed: &TypedProgram, f: &FunctionDecl, errors: &mut Vec[AccessError]) -> Unit
-  check_params_defaults(program, typed, &f.params, errors)
+def check_function_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, f: &FunctionDecl, errors: &mut Vec[AccessError]) -> Unit
+  check_params_defaults_cfg(program, typed, cfg, &f.params, errors)
   mut i = 0
   while i < f.contracts.len() do
-    check_expr(program, typed, &f.contracts[i].expr, errors)
+    check_expr_cfg(program, typed, cfg, &f.contracts[i].expr, f.contracts[i].expr.node_id, errors)
     i = i + 1
   end
-  check_fn_body(program, typed, &f.body, errors)
+  check_fn_body_cfg(program, typed, cfg, &f.body, errors)
 end
 
-def check_trait_method(program: &Program, typed: &TypedProgram, m: &TraitMethod, errors: &mut Vec[AccessError]) -> Unit
-  check_params_defaults(program, typed, &m.sig.params, errors)
-  check_fn_body(program, typed, &m.default_body, errors)
+def check_trait_method_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, m: &TraitMethod, errors: &mut Vec[AccessError]) -> Unit
+  check_params_defaults_cfg(program, typed, cfg, &m.sig.params, errors)
+  check_fn_body_cfg(program, typed, cfg, &m.default_body, errors)
 end
 
-def check_params_defaults(program: &Program, typed: &TypedProgram, params: &Vec[Param], errors: &mut Vec[AccessError]) -> Unit
+def check_params_defaults_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, params: &Vec[Param], errors: &mut Vec[AccessError]) -> Unit
   mut i = 0
   while i < params.len() do
     match params[i].default
-    when Option::Some(e) then check_expr(program, typed, &e, errors)
+    when Option::Some(e) then check_expr_cfg(program, typed, cfg, &e, e.node_id, errors)
     when Option::None then ()
     end
     i = i + 1
   end
 end
 
-def check_fn_body(program: &Program, typed: &TypedProgram, body: &FnBody, errors: &mut Vec[AccessError]) -> Unit
+def check_fn_body_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, body: &FnBody, errors: &mut Vec[AccessError]) -> Unit
   match body
-  when FnBody::FnBlock(b) then check_block(program, typed, &b, errors)
-  when FnBody::FnExpr(e) then check_expr(program, typed, &e, errors)
+  when FnBody::FnBlock(b) then check_block_cfg(program, typed, cfg, &b, errors)
+  when FnBody::FnExpr(e) then check_expr_cfg(program, typed, cfg, &e, e.node_id, errors)
   when FnBody::FnExtern(_) then ()
   when FnBody::FnNone then ()
   end
 end
 
-def check_block(program: &Program, typed: &TypedProgram, block: &Block, errors: &mut Vec[AccessError]) -> Unit
+# P0-CA: THE CFG WALK of one lexical block — the statements are visited
+# through the block's flow (build_res_flow — the SAME structure the CFG
+# builder recorded as this block's CfgBlock records). Each flow node's
+# accesses are attached to the CFG edge the node originates:
+#   - a Terminator node's statement attaches to its terminator edge
+#     (Return/Break/Continue — the edge's source IS the statement's node
+#     id);
+#   - a Linear node's statement attaches to the block's Normal edge (the
+#     fallthrough — the edge's source is the block's first-statement id).
+# If/elsif conditions attach to their True/False split edges and guard
+# conditions to the GuardElse edge (their sources are the respective node
+# ids) — the check_stmt_cfg dispatch below.
+def check_block_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, block: &Block, errors: &mut Vec[AccessError]) -> Unit
+  let flow = build_res_flow(block)
+  let blk_key = if block.stmts.len() > 0 then block.stmts[0].node_id else 0 end
   mut i = 0
-  while i < block.stmts.len() do
-    check_stmt(program, typed, &block.stmts[i], errors)
+  while i < flow.nodes.len() do
+    let node = flow.nodes[i]
+    let edge_source = match node.kind
+    when FlowKind::Terminator then node.stmt.node_id
+    when _ then blk_key
+    end
+    check_stmt_cfg(program, typed, cfg, &node.stmt, edge_source, errors)
     i = i + 1
   end
 end
 
-def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, errors: &mut Vec[AccessError]) -> Unit
+# P0-CA: the statement-level CFG walk — the check_stmt mirror with the
+# access paths attached to the statement's CFG edge (`edge_source` — the
+# edge's source node id, the ACCESS_REGISTRY key). Nested blocks recurse
+# into their own flow walks; conditions attach to their own split/guard
+# edges.
+def check_stmt_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, stmt: &Stmt, edge_source: Int, errors: &mut Vec[AccessError]) -> Unit
   match stmt.kind
   when StmtKind::StmtLet(pattern, _, value, _) then
-    check_pattern(program, typed, &pattern, errors)
-    check_expr(program, typed, &value, errors)
+    check_pattern_cfg(program, typed, cfg, &pattern, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &value, edge_source, errors)
   when StmtKind::StmtAssign(target, value) then
-    check_expr(program, typed, &target, errors)
-    check_expr(program, typed, &value, errors)
+    check_expr_cfg(program, typed, cfg, &target, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &value, edge_source, errors)
   when StmtKind::StmtCompoundAssign(_, target, value) then
-    check_expr(program, typed, &target, errors)
-    check_expr(program, typed, &value, errors)
+    check_expr_cfg(program, typed, cfg, &target, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &value, edge_source, errors)
   when StmtKind::StmtIf(if_stmt) then
-    check_expr(program, typed, &if_stmt.cond, errors)
-    check_block(program, typed, &if_stmt.then_block, errors)
+    # The condition's accesses attach to the True/False split edges (the
+    # condition's node id is their source).
+    check_expr_cfg(program, typed, cfg, &if_stmt.cond, if_stmt.cond.node_id, errors)
+    check_block_cfg(program, typed, cfg, &if_stmt.then_block, errors)
     mut i = 0
     while i < if_stmt.elsif_branches.len() do
-      check_expr(program, typed, &if_stmt.elsif_branches[i].0, errors)
-      check_block(program, typed, &if_stmt.elsif_branches[i].1, errors)
+      check_expr_cfg(program, typed, cfg, &if_stmt.elsif_branches[i].0, if_stmt.elsif_branches[i].0.node_id, errors)
+      check_block_cfg(program, typed, cfg, &if_stmt.elsif_branches[i].1, errors)
       i = i + 1
     end
     match if_stmt.else_block
-    when Option::Some(eb) then check_block(program, typed, &eb, errors)
+    when Option::Some(eb) then check_block_cfg(program, typed, cfg, &eb, errors)
     when Option::None then ()
     end
   when StmtKind::StmtMatch(m) then
-    check_match(program, typed, &m, errors)
+    check_match_cfg(program, typed, cfg, &m, edge_source, errors)
   when StmtKind::StmtWhile(cond, body) then
-    check_expr(program, typed, &cond, errors)
-    check_block(program, typed, &body, errors)
+    # The condition's accesses attach to the loop's Backedge edge (the
+    # loop statement's node id is its source).
+    check_expr_cfg(program, typed, cfg, &cond, stmt.node_id, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
   when StmtKind::StmtFor(for_stmt) then
-    check_pattern(program, typed, &for_stmt.pattern, errors)
-    check_expr(program, typed, &for_stmt.iter, errors)
-    check_block(program, typed, &for_stmt.body, errors)
+    check_pattern_cfg(program, typed, cfg, &for_stmt.pattern, stmt.node_id, errors)
+    check_expr_cfg(program, typed, cfg, &for_stmt.iter, stmt.node_id, errors)
+    check_block_cfg(program, typed, cfg, &for_stmt.body, errors)
   when StmtKind::StmtLoop(body) then
-    check_block(program, typed, &body, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
   when StmtKind::StmtReturn(val_opt) then
     match val_opt
-    when Option::Some(val) then check_expr(program, typed, &val, errors)
+    when Option::Some(val) then check_expr_cfg(program, typed, cfg, &val, edge_source, errors)
     when Option::None then ()
     end
   when StmtKind::StmtBreak(val_opt) then
     match val_opt
-    when Option::Some(val) then check_expr(program, typed, &val, errors)
+    when Option::Some(val) then check_expr_cfg(program, typed, cfg, &val, edge_source, errors)
     when Option::None then ()
     end
   when StmtKind::StmtContinue then ()
   when StmtKind::StmtExpr(e) then
-    check_expr(program, typed, &e, errors)
+    check_expr_cfg(program, typed, cfg, &e, edge_source, errors)
   when StmtKind::StmtUnsafe(_, body) then
-    check_block(program, typed, &body, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
   when StmtKind::StmtDefer(body) then
-    check_block(program, typed, &body, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
   when StmtKind::StmtGuard(cond, else_action) then
-    check_expr(program, typed, &cond, errors)
+    # The guard's condition and else-action accesses attach to the
+    # GuardElse edge (the guard statement's node id is its source).
+    check_expr_cfg(program, typed, cfg, &cond, stmt.node_id, errors)
     match else_action
     when GuardElse::Return(val_opt) then
       match val_opt
-      when Option::Some(val) then check_expr(program, typed, &val, errors)
+      when Option::Some(val) then check_expr_cfg(program, typed, cfg, &val, stmt.node_id, errors)
       when Option::None then ()
       end
     when GuardElse::Panic(_) then ()
     when GuardElse::Break(val_opt) then
       match val_opt
-      when Option::Some(val) then check_expr(program, typed, &val, errors)
+      when Option::Some(val) then check_expr_cfg(program, typed, cfg, &val, stmt.node_id, errors)
       when Option::None then ()
       end
     when GuardElse::Continue then ()
     end
   when StmtKind::StmtTry(body, catches, finally_block) then
-    check_block(program, typed, &body, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
     mut i = 0
     while i < catches.len() do
-      check_pattern(program, typed, &catches[i].pattern, errors)
-      check_block(program, typed, &catches[i].body, errors)
+      check_pattern_cfg(program, typed, cfg, &catches[i].pattern, edge_source, errors)
+      check_block_cfg(program, typed, cfg, &catches[i].body, errors)
       i = i + 1
     end
     match finally_block
-    when Option::Some(fb) then check_block(program, typed, &fb, errors)
+    when Option::Some(fb) then check_block_cfg(program, typed, cfg, &fb, errors)
     when Option::None then ()
     end
   when StmtKind::StmtWith(expr, _, body) then
-    check_expr(program, typed, &expr, errors)
-    check_block(program, typed, &body, errors)
+    check_expr_cfg(program, typed, cfg, &expr, edge_source, errors)
+    check_block_cfg(program, typed, cfg, &body, errors)
   when StmtKind::StmtHandleWith(expr, handlers) then
-    check_expr(program, typed, &expr, errors)
+    check_expr_cfg(program, typed, cfg, &expr, edge_source, errors)
     mut i = 0
     while i < handlers.len() do
       mut j = 0
       while j < handlers[i].arms.len() do
-        check_block(program, typed, &handlers[i].arms[j].body, errors)
+        check_block_cfg(program, typed, cfg, &handlers[i].arms[j].body, errors)
         j = j + 1
       end
       i = i + 1
@@ -253,68 +311,68 @@ def check_stmt(program: &Program, typed: &TypedProgram, stmt: &Stmt, errors: &mu
   end
 end
 
-def check_match(program: &Program, typed: &TypedProgram, m: &MatchExpr, errors: &mut Vec[AccessError]) -> Unit
-  check_expr(program, typed, &m.scrutinee, errors)
+def check_match_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, m: &MatchExpr, edge_source: Int, errors: &mut Vec[AccessError]) -> Unit
+  check_expr_cfg(program, typed, cfg, &m.scrutinee, edge_source, errors)
   mut i = 0
   while i < m.arms.len() do
-    check_pattern(program, typed, &m.arms[i].pattern, errors)
+    check_pattern_cfg(program, typed, cfg, &m.arms[i].pattern, edge_source, errors)
     match m.arms[i].guard_expr
-    when Option::Some(g) then check_expr(program, typed, &g, errors)
+    when Option::Some(g) then check_expr_cfg(program, typed, cfg, &g, edge_source, errors)
     when Option::None then ()
     end
-    check_block(program, typed, &m.arms[i].body, errors)
+    check_block_cfg(program, typed, cfg, &m.arms[i].body, errors)
     i = i + 1
   end
 end
 
-def check_pattern(program: &Program, typed: &TypedProgram, pat: &Pattern, errors: &mut Vec[AccessError]) -> Unit
+def check_pattern_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, pat: &Pattern, edge_source: Int, errors: &mut Vec[AccessError]) -> Unit
   match pat.kind
   when PatternKind::Wildcard then ()
   when PatternKind::Ident(_, _) then ()
-  when PatternKind::Literal(e) then check_expr(program, typed, &e, errors)
+  when PatternKind::Literal(e) then check_expr_cfg(program, typed, cfg, &e, edge_source, errors)
   when PatternKind::Tuple(pats) then
     mut i = 0
     while i < pats.len() do
-      check_pattern(program, typed, &pats[i], errors)
+      check_pattern_cfg(program, typed, cfg, &pats[i], edge_source, errors)
       i = i + 1
     end
   when PatternKind::Array(pats) then
     mut i = 0
     while i < pats.len() do
-      check_pattern(program, typed, &pats[i], errors)
+      check_pattern_cfg(program, typed, cfg, &pats[i], edge_source, errors)
       i = i + 1
     end
   when PatternKind::Struct(_, field_pats) then
     mut i = 0
     while i < field_pats.len() do
-      check_pattern(program, typed, &field_pats[i].1, errors)
+      check_pattern_cfg(program, typed, cfg, &field_pats[i].1, edge_source, errors)
       i = i + 1
     end
   when PatternKind::Variant(_, pats) then
     mut i = 0
     while i < pats.len() do
-      check_pattern(program, typed, &pats[i], errors)
+      check_pattern_cfg(program, typed, cfg, &pats[i], edge_source, errors)
       i = i + 1
     end
   when PatternKind::Or(alts) then
     mut i = 0
     while i < alts.len() do
-      check_pattern(program, typed, &alts[i], errors)
+      check_pattern_cfg(program, typed, cfg, &alts[i], edge_source, errors)
       i = i + 1
     end
   when PatternKind::Range(lo, hi, _) then
     match lo
-    when Option::Some(e) then check_expr(program, typed, &e, errors)
+    when Option::Some(e) then check_expr_cfg(program, typed, cfg, &e, edge_source, errors)
     when Option::None then ()
     end
     match hi
-    when Option::Some(e) then check_expr(program, typed, &e, errors)
+    when Option::Some(e) then check_expr_cfg(program, typed, cfg, &e, edge_source, errors)
     when Option::None then ()
     end
   end
 end
 
-def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, errors: &mut Vec[AccessError]) -> Unit
+def check_expr_cfg(program: &Program, typed: &TypedProgram, cfg: &TypedCFG, expr: &Expr, edge_source: Int, errors: &mut Vec[AccessError]) -> Unit
   match expr.kind
   when ExprKind::ExprIntLit(_) then ()
   when ExprKind::ExprFloatLit(_) then ()
@@ -325,140 +383,142 @@ def check_expr(program: &Program, typed: &TypedProgram, expr: &Expr, errors: &mu
   when ExprKind::ExprArrayLit(elems) then
     mut i = 0
     while i < elems.len() do
-      check_expr(program, typed, &elems[i], errors)
+      check_expr_cfg(program, typed, cfg, &elems[i], edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprTupleLit(elems) then
     mut i = 0
     while i < elems.len() do
-      check_expr(program, typed, &elems[i], errors)
+      check_expr_cfg(program, typed, cfg, &elems[i], edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprStructLit(_, fields) then
     mut i = 0
     while i < fields.len() do
-      check_expr(program, typed, &fields[i].1, errors)
+      check_expr_cfg(program, typed, cfg, &fields[i].1, edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprMapLit(entries) then
     mut i = 0
     while i < entries.len() do
-      check_expr(program, typed, &entries[i].0, errors)
-      check_expr(program, typed, &entries[i].1, errors)
+      check_expr_cfg(program, typed, cfg, &entries[i].0, edge_source, errors)
+      check_expr_cfg(program, typed, cfg, &entries[i].1, edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprIdent(_) then ()
   when ExprKind::ExprPath(_) then ()
   when ExprKind::ExprSelfRef then ()
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    check_expr(program, typed, &lhs, errors)
-    check_expr(program, typed, &rhs, errors)
+    check_expr_cfg(program, typed, cfg, &lhs, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &rhs, edge_source, errors)
   when ExprKind::ExprUnaryOp(_, operand) then
-    check_expr(program, typed, &operand, errors)
+    check_expr_cfg(program, typed, cfg, &operand, edge_source, errors)
   when ExprKind::ExprFieldAccess(base, _) then
-    check_expr(program, typed, &base, errors)
+    check_expr_cfg(program, typed, cfg, &base, edge_source, errors)
   when ExprKind::ExprMethodCall(recv, _, _, args) then
-    check_expr(program, typed, &recv, errors)
+    check_expr_cfg(program, typed, cfg, &recv, edge_source, errors)
     mut mi = 0
     while mi < args.len() do
-      check_expr(program, typed, &args[mi], errors)
+      check_expr_cfg(program, typed, cfg, &args[mi], edge_source, errors)
       mi = mi + 1
     end
-    check_expr_method_call(typed, &recv, &args, errors)
+    check_expr_method_call_cfg(typed, &recv, &args, expr.node_id, errors, edge_source)
   when ExprKind::ExprIndex(base, index) then
-    check_expr(program, typed, &base, errors)
-    check_expr(program, typed, &index, errors)
+    check_expr_cfg(program, typed, cfg, &base, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &index, edge_source, errors)
   when ExprKind::ExprCall(callee, args) then
-    check_expr(program, typed, &callee, errors)
+    check_expr_cfg(program, typed, cfg, &callee, edge_source, errors)
     mut ci = 0
     while ci < args.len() do
-      check_expr(program, typed, &args[ci], errors)
+      check_expr_cfg(program, typed, cfg, &args[ci], edge_source, errors)
       ci = ci + 1
     end
-    check_expr_call(typed, &callee, &args, errors)
+    check_expr_call_cfg(typed, &callee, &args, expr.node_id, errors, edge_source)
   when ExprKind::ExprClosure(params, _, body) then
     mut i = 0
     while i < params.len() do
-      check_pattern(program, typed, &params[i].pat, errors)
+      check_pattern_cfg(program, typed, cfg, &params[i].pat, edge_source, errors)
       i = i + 1
     end
-    check_expr(program, typed, &body, errors)
-  when ExprKind::ExprAccess(inner) then check_expr(program, typed, &inner, errors)
-  when ExprKind::ExprRawDeref(inner) then check_expr(program, typed, &inner, errors)
+    check_expr_cfg(program, typed, cfg, &body, expr.node_id, errors)
+  when ExprKind::ExprAccess(inner) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
+  when ExprKind::ExprRawDeref(inner) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
   when ExprKind::ExprIf(if_stmt) then
-    check_expr(program, typed, &if_stmt.cond, errors)
-    check_block(program, typed, &if_stmt.then_block, errors)
+    # The condition's accesses attach to the expression-split True/False
+    # edges (the condition's node id is their source).
+    check_expr_cfg(program, typed, cfg, &if_stmt.cond, if_stmt.cond.node_id, errors)
+    check_block_cfg(program, typed, cfg, &if_stmt.then_block, errors)
     mut i = 0
     while i < if_stmt.elsif_branches.len() do
-      check_expr(program, typed, &if_stmt.elsif_branches[i].0, errors)
-      check_block(program, typed, &if_stmt.elsif_branches[i].1, errors)
+      check_expr_cfg(program, typed, cfg, &if_stmt.elsif_branches[i].0, if_stmt.elsif_branches[i].0.node_id, errors)
+      check_block_cfg(program, typed, cfg, &if_stmt.elsif_branches[i].1, errors)
       i = i + 1
     end
     match if_stmt.else_block
-    when Option::Some(eb) then check_block(program, typed, &eb, errors)
+    when Option::Some(eb) then check_block_cfg(program, typed, cfg, &eb, errors)
     when Option::None then ()
     end
   when ExprKind::ExprMatch(m) then
-    check_match(program, typed, &m, errors)
+    check_match_cfg(program, typed, cfg, &m, edge_source, errors)
   when ExprKind::ExprBlock(block) then
-    check_block(program, typed, &block, errors)
+    check_block_cfg(program, typed, cfg, &block, errors)
   when ExprKind::ExprUnsafe(_, block) then
-    check_block(program, typed, &block, errors)
+    check_block_cfg(program, typed, cfg, &block, errors)
   when ExprKind::ExprAsync(block) then
-    check_block(program, typed, &block, errors)
-  when ExprKind::ExprAwait(inner) then check_expr(program, typed, &inner, errors)
-  when ExprKind::ExprTry(inner) then check_expr(program, typed, &inner, errors)
+    check_block_cfg(program, typed, cfg, &block, errors)
+  when ExprKind::ExprAwait(inner) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
+  when ExprKind::ExprTry(inner) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
   when ExprKind::ExprRange(start, end_, _) then
     match start
-    when Option::Some(s) then check_expr(program, typed, &s, errors)
+    when Option::Some(s) then check_expr_cfg(program, typed, cfg, &s, edge_source, errors)
     when Option::None then ()
     end
     match end_
-    when Option::Some(e) then check_expr(program, typed, &e, errors)
+    when Option::Some(e) then check_expr_cfg(program, typed, cfg, &e, edge_source, errors)
     when Option::None then ()
     end
-  when ExprKind::ExprCast(inner, _) then check_expr(program, typed, &inner, errors)
-  when ExprKind::ExprTypeCheck(inner, _) then check_expr(program, typed, &inner, errors)
-  when ExprKind::ExprComptime(block) then check_block(program, typed, &block, errors)
+  when ExprKind::ExprCast(inner, _) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
+  when ExprKind::ExprTypeCheck(inner, _) then check_expr_cfg(program, typed, cfg, &inner, edge_source, errors)
+  when ExprKind::ExprComptime(block) then check_block_cfg(program, typed, cfg, &block, errors)
   when ExprKind::ExprEnumVariant(_, args) then
     mut i = 0
     while i < args.len() do
-      check_expr(program, typed, &args[i], errors)
+      check_expr_cfg(program, typed, cfg, &args[i], edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprAssign(target, value) then
-    check_expr(program, typed, &target, errors)
-    check_expr(program, typed, &value, errors)
+    check_expr_cfg(program, typed, cfg, &target, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &value, edge_source, errors)
   when ExprKind::ExprPipe(lhs, rhs) then
-    check_expr(program, typed, &lhs, errors)
-    check_expr(program, typed, &rhs, errors)
+    check_expr_cfg(program, typed, cfg, &lhs, edge_source, errors)
+    check_expr_cfg(program, typed, cfg, &rhs, edge_source, errors)
   when ExprKind::ExprMacroCall(_, args) then
     mut i = 0
     while i < args.len() do
-      check_expr(program, typed, &args[i], errors)
+      check_expr_cfg(program, typed, cfg, &args[i], edge_source, errors)
       i = i + 1
     end
   when ExprKind::ExprError(_) then ()
   end
 end
 
-def check_expr_call(typed: &TypedProgram, callee: &Expr, args: &Vec[Expr], errors: &mut Vec[AccessError]) -> Unit
-  let effects = call_arg_effects(typed, Option::Some(callee), args)
-  check_call_site(Option::None, AccessEffect::Read, &effects, args, typed, errors)
+def check_expr_call_cfg(typed: &TypedProgram, callee: &Expr, args: &Vec[Expr], call_node_id: Int, errors: &mut Vec[AccessError], edge_source: Int) -> Unit
+  let effects = call_arg_effects(typed, call_node_id, Option::Some(callee), args)
+  check_call_site_cfg(Option::None, AccessEffect::Read, &effects, args, typed, errors, edge_source)
 end
 
-def check_expr_method_call(typed: &TypedProgram, receiver: &Expr, args: &Vec[Expr], errors: &mut Vec[AccessError]) -> Unit
-  let recv_effect = method_receiver_effect(typed, &receiver)
-  let effects = call_arg_effects(typed, Option::None, args)
-  check_call_site(Option::Some(receiver), recv_effect, &effects, args, typed, errors)
+def check_expr_method_call_cfg(typed: &TypedProgram, receiver: &Expr, args: &Vec[Expr], call_node_id: Int, errors: &mut Vec[AccessError], edge_source: Int) -> Unit
+  let recv_effect = method_receiver_effect(typed, &receiver, call_node_id)
+  let effects = call_arg_effects(typed, call_node_id, Option::None, args)
+  check_call_site_cfg(Option::Some(receiver), recv_effect, &effects, args, typed, errors, edge_source)
 end
 
-def check_call_site(receiver: Option[&Expr], receiver_effect: AccessEffect, arg_effects: &Vec[AccessEffect], args: &Vec[Expr], typed: &TypedProgram, errors: &mut Vec[AccessError]) -> Unit
+def check_call_site_cfg(receiver: Option[Expr], receiver_effect: AccessEffect, arg_effects: &Vec[AccessEffect], args: &Vec[Expr], typed: &TypedProgram, errors: &mut Vec[AccessError], edge_source: Int) -> Unit
   mut actives = Vec::new()
   mut spans = Vec::new()
   match receiver
   when Option::Some(r) then
-    record_access(typed, r, receiver_effect, &mut actives, &mut spans, errors)
+    record_access(typed, r, receiver_effect, &mut actives, &mut spans, errors, edge_source)
   when Option::None then ()
   end
   mut i = 0
@@ -469,29 +529,36 @@ def check_call_site(receiver: Option[&Expr], receiver_effect: AccessEffect, arg_
       panic("internal error: missing access effect vector entry for argument node " + args[i].node_id.to_string())
     end
     let eff = arg_effects[i]
-    record_access(typed, &args[i], eff, &mut actives, &mut spans, errors)
+    record_access(typed, &args[i], eff, &mut actives, &mut spans, errors, edge_source)
     i = i + 1
   end
-  check_overlaps(&actives, &spans, errors)
+  check_overlaps(typed, &actives, &spans, errors)
 end
 
-def record_access(typed: &TypedProgram, expr: &Expr, effect: AccessEffect, actives: &mut Vec[ActiveAccess], spans: &mut Vec[Span], errors: &mut Vec[AccessError]) -> Unit
+# P0-CA: record one access on the CFG edge (`edge_source` — the edge's
+# source node id, the ACCESS_REGISTRY key): the path is a TYPED PLACE with
+# a semantic AccessRoot, and the access gets a fresh AccessId registered on
+# the edge — the resource checker's CleanupAction::EndAccess names it when
+# the edge's cleanup runs.
+def record_access(typed: &TypedProgram, expr: &Expr, effect: AccessEffect, actives: &mut Vec[ActiveAccess], spans: &mut Vec[Span], errors: &mut Vec[AccessError], edge_source: Int) -> Unit
   match derive_access_path(typed, expr, errors)
   when Option::Some(path) then
     actives.push(ActiveAccess { path: path, effect: effect })
     spans.push(expr.span)
+    let aid = access_registry_fresh_id()
+    access_registry_register(edge_source, aid)
   when Option::None then ()
   end
 end
 
-def check_overlaps(actives: &Vec[ActiveAccess], spans: &Vec[Span], errors: &mut Vec[AccessError]) -> Unit
+def check_overlaps(typed: &TypedProgram, actives: &Vec[ActiveAccess], spans: &Vec[Span], errors: &mut Vec[AccessError]) -> Unit
   mut i = 0
   while i < actives.len() do
     mut j = i + 1
     while j < actives.len() do
       if accesses_conflict(&actives[i], &actives[j]) then
         errors.push(AccessError {
-          message: "conflicting accesses to `" + path_to_string(&actives[j].path) + "` (" + effect_name(actives[i].effect) + " vs " + effect_name(actives[j].effect) + ")",
+          message: "conflicting accesses to `" + path_to_string(typed, &actives[j].path) + "` (" + effect_name(actives[i].effect) + " vs " + effect_name(actives[j].effect) + ")",
           span: spans[j]
         })
       end
@@ -508,7 +575,11 @@ def accesses_conflict(a: &ActiveAccess, b: &ActiveAccess) -> Bool
   paths_overlap(&a.path, &b.path)
 end
 
-def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
+# P0-CA: the overlap analysis operates on the SEMANTIC ROOTS
+# (AccessRoot::Local(LocalId)/SelfValue/Static(DefId)/RawUnknown) — the
+# former integer-root comparison (real local ids vs the magic -1 self
+# sentinel) is GONE.
+def paths_overlap(a: &TypedPlace, b: &TypedPlace) -> Bool
   # Raw-pointer dereferences have unknown provenance: two dereferences of
   # DIFFERENT pointer variables may address the same memory, and a raw
   # deref may alias any other storage, so every path containing a raw
@@ -531,16 +602,10 @@ def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
     end
     rj = rj + 1
   end
-  # Roots are now always semantic: real local ids (>= 0) or the negative
-  # `self` root (-1). There is no "unresolved" sentinel (missing typed
-  # resolutions are internal errors reported during path derivation), so
-  # roots compare structurally, never by name.
-  let same_root = if a.root < 0 || b.root < 0 then
-    a.root == b.root && a.root_name == b.root_name
-  else
-    a.root == b.root
-  end
-  if !same_root then
+  # Roots are semantic AccessRoots: Local ids compare by identity,
+  # SelfValue/Static compare structurally, RawUnknown is never provably
+  # disjoint (its provenance is unknown).
+  if !access_roots_overlap(&a.root, &b.root) then
     return false
   end
   mut i = 0
@@ -578,7 +643,35 @@ def paths_overlap(a: &AccessPath, b: &AccessPath) -> Bool
   true
 end
 
-def call_arg_effects(typed: &TypedProgram, callee: Option[&Expr], args: &Vec[Expr]) -> Vec[AccessEffect]
+# P0-CA: do two semantic roots denote the same storage class? Local ids
+# compare by identity; SelfValue compares with itself; Static DefIds
+# compare by (module id, index); RawUnknown overlaps EVERYTHING (unknown
+# provenance is never provably disjoint).
+def access_roots_overlap(a: &AccessRoot, b: &AccessRoot) -> Bool
+  match a
+  when AccessRoot::RawUnknown then true
+  when AccessRoot::Local(la) then
+    match b
+    when AccessRoot::RawUnknown then true
+    when AccessRoot::Local(lb) then la.id == lb.id
+    when _ then false
+    end
+  when AccessRoot::SelfValue then
+    match b
+    when AccessRoot::RawUnknown then true
+    when AccessRoot::SelfValue then true
+    when _ then false
+    end
+  when AccessRoot::Static(sa) then
+    match b
+    when AccessRoot::RawUnknown then true
+    when AccessRoot::Static(sb) then sa.module.id == sb.module.id && sa.index == sb.index
+    when _ then false
+    end
+  end
+end
+
+def call_arg_effects(typed: &TypedProgram, call_node_id: Int, callee: Option[Expr], args: &Vec[Expr]) -> Vec[AccessEffect]
   let fn_params = match callee
   when Option::Some(c) then
     match typed.expr_types.get(c.node_id)
@@ -594,13 +687,32 @@ def call_arg_effects(typed: &TypedProgram, callee: Option[&Expr], args: &Vec[Exp
   mut effects = Vec::new()
   mut i = 0
   while i < args.len() do
-    effects.push(arg_effect(typed, &fn_params, i, &args[i]))
+    effects.push(arg_effect(typed, call_node_id, &fn_params, i, &args[i]))
     i = i + 1
   end
   effects
 end
 
-def arg_effect(typed: &TypedProgram, fn_params: &Vec[ParamType], arg_index: Int, arg: &Expr) -> AccessEffect
+# P0-TH (phase 2): the recursive tree is the PRIMARY authority for a
+# recorded source call's argument effects — the call node's TypedCall
+# (TypedExprKind::Call) carries the TypedCallArg effects with their typed
+# values; the flat access_effects is the fallback for the nodes the
+# checker recorded only in the flat map (the typed-call assembly failure
+# class) and for synthesized nodes.
+def arg_effect(typed: &TypedProgram, call_node_id: Int, fn_params: &Vec[ParamType], arg_index: Int, arg: &Expr) -> AccessEffect
+  if call_node_id != 0 then
+    match typed.typed_exprs.get(call_node_id)
+    when Option::Some(te) then
+      match te.kind
+      when TypedExprKind::Call(tc) then
+        if arg_index < tc.args.len() then
+          return tc.args[arg_index].effect
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  end
   match typed.access_effects.get(arg.node_id)
   when Option::Some(e) then e
   when Option::None then
@@ -623,7 +735,25 @@ def arg_effect(typed: &TypedProgram, fn_params: &Vec[ParamType], arg_index: Int,
   end
 end
 
-def method_receiver_effect(typed: &TypedProgram, receiver: &Expr) -> AccessEffect
+# P0-TH (phase 2): the recursive tree is the PRIMARY authority for a
+# recorded source method call's receiver effect — the call node's
+# TypedCall.receiver_effect; the flat access_effects is the fallback for
+# the nodes the checker recorded only in the flat map.
+def method_receiver_effect(typed: &TypedProgram, receiver: &Expr, call_node_id: Int) -> AccessEffect
+  if call_node_id != 0 then
+    match typed.typed_exprs.get(call_node_id)
+    when Option::Some(te) then
+      match te.kind
+      when TypedExprKind::Call(tc) then
+        match tc.receiver_effect
+        when Option::Some(eff) then return eff
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  end
   # The semantic layer records a receiver effect on every method call
   # (types.tg records the receiver for every mparams outcome), so a
   # missing entry is a compiler-internal error — never fall back to Read
@@ -635,31 +765,64 @@ def method_receiver_effect(typed: &TypedProgram, receiver: &Expr) -> AccessEffec
   end
 end
 
-def derive_access_path(typed: &TypedProgram, expr: &Expr, errors: &mut Vec[AccessError]) -> Option[AccessPath]
+# P0-CA: derive the TYPED PLACE of an access expression — the semantic
+# AccessRoot (Local(LocalId) for identifiers, SelfValue for `self`,
+# Static(DefId) for static/const paths, RawUnknown for unknown-provenance
+# roots) plus the projection chain. The former integer-root sentinels
+# (the raw local id, the magic -1 `self` root) are GONE.
+def derive_access_path(typed: &TypedProgram, expr: &Expr, errors: &mut Vec[AccessError]) -> Option[TypedPlace]
   match expr.kind
   when ExprKind::ExprIdent(name) then
     # The typed pipeline must have resolved every identifier; a missing
-    # resolution here is a compiler-internal error, NOT a reason to fall
-    # back to a sentinel root (local id 0 is a real, valid local id and
-    # using it as "unresolved" corrupts overlap analysis).
+    # resolution here is a compiler-internal error — the path degrades to
+    # a RawUnknown root (never a sentinel integer: a fabricated local id
+    # would corrupt overlap analysis).
     match typed.ident_resolutions.get(expr.node_id)
     when Option::Some(l) then
-      Option::Some(AccessPath { root: l, root_name: name.clone(), projections: Vec::new() })
+      Option::Some(TypedPlace { root: AccessRoot::Local(LocalId { id: l }), projections: Vec::new() })
     when Option::None then
       errors.push(AccessError {
         message: "internal error: missing typed resolution for identifier `" + name + "`",
         span: expr.span
       })
-      Option::None
+      Option::Some(TypedPlace { root: AccessRoot::RawUnknown, projections: Vec::new() })
     end
   when ExprKind::ExprSelfRef then
-    # Use a NEGATIVE root for `self`: local ids are always >= 0, so this
-    # can never collide with a real local id (previously root 0 was used,
-    # which is also the first local id and made overlap analysis ambiguous).
-    Option::Some(AccessPath { root: -1, root_name: "self", projections: Vec::new() })
+    # P0-CA: the semantic SelfValue root — the former negative integer
+    # root (-1) is GONE.
+    Option::Some(TypedPlace { root: AccessRoot::SelfValue, projections: Vec::new() })
+  when ExprKind::ExprPath(path) then
+    # P0-CA: a static/const reference is a Static(DefId) root when the
+    # resolver recorded the module-qualified def; unresolvable paths are
+    # RawUnknown (never provably disjoint).
+    match static_def_of(typed, &path)
+    when Option::Some(did) then
+      Option::Some(TypedPlace { root: AccessRoot::Static(did), projections: Vec::new() })
+    when Option::None then
+      Option::Some(TypedPlace { root: AccessRoot::RawUnknown, projections: Vec::new() })
+    end
   when ExprKind::ExprFieldAccess(base, field) then
     match derive_access_path(typed, &base, errors)
     when Option::Some(mut p) then
+      # P0-TH (phase 2): the recursive tree is the PRIMARY authority for
+      # the field identity — the node's TypedExprKind::Field (the strong
+      # TypedField FieldId) or the TupleIndex form (the non-FieldId tuple
+      # index access — an Index projection, conservatively aliasing the
+      # whole aggregate); the flat field_targets is the fallback for the
+      # nodes the checker recorded only in the flat map.
+      match typed.typed_exprs.get(expr.node_id)
+      when Option::Some(te) then
+        match te.kind
+        when TypedExprKind::Field(tf) then
+          p.projections.push(AccessProjection::Field(tf.field, field.clone()))
+          return Option::Some(p)
+        when TypedExprKind::TupleIndex(_) then
+          p.projections.push(AccessProjection::Index)
+          return Option::Some(p)
+        when _ then ()
+        end
+      when Option::None then ()
+      end
       match typed.field_targets.get(expr.node_id)
       when Option::Some(f) then
         p.projections.push(AccessProjection::Field(f, field.clone()))
@@ -692,6 +855,24 @@ def derive_access_path(typed: &TypedProgram, expr: &Expr, errors: &mut Vec[Acces
   end
 end
 
+# P0-CA: resolve a static/const path to its DefId — the resolver's
+# module_symbols snapshot ("path::name" -> DefId); a miss (or a
+# type-position path) yields Option::None (the caller degrades to
+# RawUnknown).
+def static_def_of(typed: &TypedProgram, path: &AstPath) -> Option[DefId]
+  var key = ""
+  var first = true
+  for seg in path.segments do
+    if !first then key = key + "::" end
+    first = false
+    key = key + seg
+  end
+  match typed.resolutions.module_symbols.get(&key)
+  when Option::Some(did) then Option::Some(did)
+  when Option::None then Option::None
+  end
+end
+
 def effect_name(e: AccessEffect) -> String
   match e
   when AccessEffect::Read then "read"
@@ -701,8 +882,12 @@ def effect_name(e: AccessEffect) -> String
   end
 end
 
-def path_to_string(p: &AccessPath) -> String
-  mut s = p.root_name.clone()
+# P0-CA: the diagnostic render of a TypedPlace — the root renders from the
+# semantic AccessRoot (the local's registered name for Local roots, "self"
+# for SelfValue, the def for Static, "unknown" for RawUnknown), then the
+# projection chain.
+def path_to_string(typed: &TypedProgram, p: &TypedPlace) -> String
+  var s = root_name(typed, &p.root)
   mut i = 0
   while i < p.projections.len() do
     match p.projections[i]
@@ -713,4 +898,17 @@ def path_to_string(p: &AccessPath) -> String
     i = i + 1
   end
   s
+end
+
+def root_name(typed: &TypedProgram, root: &AccessRoot) -> String
+  match root
+  when AccessRoot::Local(lid) then
+    match typed.local_bindings.get(lid.id)
+    when Option::Some(lb) then lb.name.clone()
+    when Option::None then "<local#" + lid.id.to_string() + ">"
+    end
+  when AccessRoot::SelfValue then "self"
+  when AccessRoot::Static(did) then "static<" + did.module.id.to_string() + "::" + did.index.to_string() + ">"
+  when AccessRoot::RawUnknown then "unknown"
+  end
 end
