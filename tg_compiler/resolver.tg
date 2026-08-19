@@ -14,7 +14,8 @@ use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
                         Pattern, PatternKind, TypeExpr, TypeExprKind, UseDecl, ModuleDecl, Visibility, AstPath,
                         Param, TraitMethod, GenericParam, Function, ExternItem}
 use tg_compiler::token::{Span}
-use tg_compiler::ids::{DefId, DefKind, FieldId, StableDefId, TypeId, ModuleId, VariantId}
+use tg_compiler::ids::{DefId, DefKind, FieldId, StableDefId, TypeId, ModuleId, VariantId, LocalId,
+                       synthetic_module_id, SYNTHETIC_MODULE_INTRINSIC, IntrinsicId}
 
 # ———————————————————————————————————————————————————————————————
 # Resolution Errors
@@ -58,7 +59,7 @@ struct SymbolTable
   # declaration in a DIFFERENT file module registers its own qualified entry
   # instead of failing the root occupancy test. Each table owns its symbol
   # indices; the DefIds built from them are the identity (module_symbols,
-  # item_defs, method_defs all carry the same per-module index). P1: the
+  # item_defs, call targets all carry the same per-module index). P1: the
   # root bare-name tables are DELETED — the root tree carries no name maps;
   # this per-module table and the module_symbols entries below are the only
   # authorities.
@@ -68,7 +69,7 @@ struct SymbolTable
   # kind is definition METADATA, not identity). This map renders each
   # registered DefId as "<module_id>::<index>" -> DefKind, so the kind of
   # every resolver-produced DefId (module_symbols entries, item_defs,
-  # method_defs, call targets) stays recoverable — the resolver-side
+  # call targets) stays recoverable — the resolver-side
   # metadata map the ids.tg migration note points at (def_kind_of). The
   # snapshot in ResolvedNames carries the same map for the type checker's
   # module-qualified lookups.
@@ -202,14 +203,23 @@ struct ResolvedNames
   pattern_resolutions: Map[Int, ResolvedPattern]
   call_targets: Map[Int, DefId]
 
-  # Qualified method keys ("Type::method") -> DefId, recorded at impl-method
-  # registration so the type checker can emit method DefIds. P1: SURVIVES
-  # the bare-name table deletion — the type checker's generic-parameter
-  # owner derivation (impl_method_owner_def, types.tg) still reads it; the
-  # module-qualified twin ("path::Type::method" in module_symbols) exists,
-  # so this map is the last bare-keyed string table in the resolver and
-  # its deletion lands with the types.tg batch.
-  method_defs: Map[String, DefId]
+  # P1: the TypeId -> DefId association — the DIRECT type-to-declaration
+  # identity, filled by the type checker's registration (store_type_def in
+  # types.tg records each nominal TypeId's defining DefId — the
+  # module_symbols DefKind::TypeName/Trait entry of its (module path,
+  # name) — here at the end of type checking). The public ABI's
+  # type-to-declaration association reads this table (no name/order
+  # correlation). The resolver leaves it empty; the MIR builder's
+  # ResolvedNames snapshot construction initializes it empty.
+  type_def_ids: Map[Int, DefId]
+
+  # P1: the INTRINSIC-KIND classification per call — call node id -> the
+  # semantic IntrinsicId the type checker attached at call-recording time
+  # (the frontend classifies the intrinsic calls; the MIR serializes this
+  # table so codegen dispatches on the typed classification instead of
+  # name-matching). The resolver leaves it empty; the checker fills the
+  # snapshot at the end of type checking (type_check_typed).
+  intrinsic_ids: Map[Int, IntrinsicId]
 
   # Item index (position in the merged Program.items) -> DefIds in
   # declaration order, recorded for every function/method item during
@@ -388,10 +398,14 @@ struct ResolvedExpr
 end
 
 enum ResolvedExprKind
-  LocalVar(String)
-  Parameter(String, Int)
+  # P1: the LOCAL/parameter forms carry the binding's LocalId (the
+  # resolver-side local identity allocated at define_local); the NAME is
+  # retained for diagnostics only — identity is the id, never the name.
+  LocalVar(LocalId, String)
+  Parameter(LocalId, String, Int)
   Function(DefId)  # the resolved function's DefId (module + symbol index)
-  Method(DefId)    # DefId from method_defs ("Type::method" -> DefId)
+  Method(DefId)    # DefId from the semantic registration
+                   # (module_symbols "path::Type::method" -> DefId)
   Constant(DefId)  # ID-based identity: the same DefId call_targets records
   Static(DefId)    # ID-based identity: the same DefId call_targets records
   Variant(VariantId)  # P1: ids.tg's VariantId { owner: TypeId, index: UInt }
@@ -519,6 +533,11 @@ struct ResolutionContext
 
   # Dedicated counter for runtime intrinsic DefIds (synthetic module -1)
   next_builtin_index: Int
+
+  # P1: the resolver-side LOCAL identity counter — define_local stamps each
+  # binding with a fresh LocalId (the ids.tg LocalId domain; the type
+  # checker allocates its OWN LocalIds in its own domain).
+  next_local_id: Int
 end
 
 struct ResolverLocalBinding
@@ -526,6 +545,15 @@ struct ResolverLocalBinding
   kind: LocalBindingKind
   is_mut: Bool
   span: Span
+  # P1: the LOCAL identity of this binding — a fresh LocalId allocated by
+  # define_local (the resolver's own counter, ctx.next_local_id). The
+  # resolver's local forms (ResolvedExprKind::LocalVar / Parameter) carry
+  # THIS id; the NAME is retained for diagnostics only. The type checker
+  # allocates its OWN LocalIds (bind_var's counter) in its own domain —
+  # the two never cross (the checker's ident resolution is
+  # typed_ident_resolutions; nobody consumes the resolver's local forms
+  # beyond resolution).
+  local_id: LocalId
 end
 
 enum LocalBindingKind
@@ -575,7 +603,8 @@ def context_new() -> ResolutionContext
       type_resolutions: Map::new(),
       pattern_resolutions: Map::new(),
       call_targets: Map::new(),
-      method_defs: Map::new(),
+      type_def_ids: Map::new(),
+      intrinsic_ids: Map::new(),
       item_defs: Map::new(),
       module_symbols: Map::new(),
       def_kinds: Map::new(),
@@ -584,7 +613,8 @@ def context_new() -> ResolutionContext
     prelude_imports: vec!["std", "core"],
     current_owner_path: Vec::new(),
     current_owner_module: ModuleId { id: 0 },
-    next_builtin_index: 0
+    next_builtin_index: 0,
+    next_local_id: 0
   }
 end
 
@@ -666,7 +696,7 @@ end
 
 # Record the kind of a resolver-produced DefId at its construction site so
 # every DefId's kind stays recoverable (module_symbols entries, item_defs,
-# method_defs, call targets).
+# call targets).
 def record_def_kind(ctx: &mut ResolutionContext, did: &DefId, kind: DefKind) -> Unit
   ctx.symbols.def_kinds.insert(def_metadata_key(did), kind)
 end
@@ -754,27 +784,33 @@ def record_item_def(ctx: &mut ResolutionContext, item: &Item, item_idx: Int, own
     ctx.resolved.item_defs.insert(item_idx, fn_defs)
   when ItemKind::ItemStruct(s) then
     # Collect ALL method DefIds into one vector, then insert once — inserting
-    # per method would overwrite the preceding method's entry.
-    var method_defs_vec = Vec::new()
+    # per method would overwrite the preceding method's entry. P1: the
+    # method DefIds come from the SEMANTIC registration — the module_symbols
+    # entries add_item_to_symbols registered for the struct methods
+    # ("path::StructName::method", MODULE-QUALIFIED by the item's owner
+    # path) — the transitional bare-keyed method table is deleted.
+    var method_ids_vec = Vec::new()
     var mi = 0
     while mi < s.methods.len() do
       let m = s.methods[mi]
       let key = s.name.clone() + "::" + m.name.clone()
-      match ctx.resolved.method_defs.get(key.clone())
+      let qualified = module_qualified_key(owner_path, &key)
+      match ctx.symbols.module_symbols.get(qualified)
       when Option::Some(did) then
-        method_defs_vec.push(did.clone())
+        method_ids_vec.push(did.clone())
       when Option::None then ()
       end
       mi = mi + 1
     end
-    ctx.resolved.item_defs.insert(item_idx, method_defs_vec)
+    ctx.resolved.item_defs.insert(item_idx, method_ids_vec)
   when ItemKind::ItemImpl(imp) then
     var impl_defs = Vec::new()
     var mi2 = 0
     while mi2 < imp.methods.len() do
       let m2 = imp.methods[mi2]
       let key2 = type_expr_to_string(&imp.for_type) + "::" + m2.name.clone()
-      match ctx.resolved.method_defs.get(key2.clone())
+      let qualified2 = module_qualified_key(owner_path, &key2)
+      match ctx.symbols.module_symbols.get(qualified2)
       when Option::Some(did2) then
         impl_defs.push(did2.clone())
       when Option::None then ()
@@ -1096,10 +1132,11 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
 
     # P0-A (item 2 audit — struct-defined methods): register every struct
     # method under its "StructName::method" key with ONE DefId — the same
-    # id goes to method_defs, module_symbols, item_defs (record_item_def's
-    # ItemStruct arm re-reads method_defs) and the method metadata — so a
-    # struct-defined method never splits into two DefIds. Per-module
-    # first-wins.
+    # id goes to module_symbols (the qualified entry below — the SEMANTIC
+    # registration record_item_def's ItemStruct arm reads) and the method
+    # metadata — so a struct-defined method never splits into two DefIds.
+    # Per-module first-wins. P1: the transitional bare-keyed method table
+    # is deleted; the module_symbols qualified entries are the authority.
     for m in s.methods do
       let mkey = s.name.clone() + "::" + m.name.clone()
       let msym = FunctionSymbol {
@@ -1122,7 +1159,6 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
             index: midx
           }
           record_def_kind(ctx, &mdid, DefKind::Method)
-          ctx.resolved.method_defs.insert(mkey.clone(), mdid.clone())
           qualified_regs.push((module_qualified_key(&qualified_path, &mkey), mdid.clone()))
         when Option::None then ()
         end
@@ -1231,18 +1267,18 @@ def add_item_to_symbols(ctx: &mut ResolutionContext, item: &Item, module_path: &
         when Option::Some(midx) then
           # P0-A (item 2 — the impl-method DefId split): construct the
           # method DefId ONCE with the owner module's ModuleId and
-          # per-module index, and insert THE SAME did into method_defs,
-          # module_symbols (the qualified entry below), item_defs
-          # (record_item_def's ItemImpl arm re-reads method_defs by the
-          # same key) and the method metadata — a method never gets two
-          # different DefIds. The kind is recorded as metadata (DefId
-          # carries no kind).
+          # per-module index, and insert THE SAME did into module_symbols
+          # (the qualified entry below — the SEMANTIC registration
+          # record_item_def's ItemImpl arm reads) and the method metadata
+          # — a method never gets two different DefIds. P1: the
+          # transitional bare-keyed method table is deleted; the qualified
+          # entries are the authority. The kind is recorded as metadata
+          # (DefId carries no kind).
           let did = DefId {
             module: owner_module,
             index: midx
           }
           record_def_kind(ctx, &did, DefKind::Method)
-          ctx.resolved.method_defs.insert(key.clone(), did.clone())
           qualified_regs.push((module_qualified_key(&qualified_path, &key), did.clone()))
         when Option::None then ()
         end
@@ -2500,7 +2536,13 @@ def rs_pop_scope(ctx: &mut ResolutionContext) -> Unit
   let _ = ctx.local_scopes.pop()
 end
 
-def define_local(ctx: &mut ResolutionContext, sink name: String, sink binding: ResolverLocalBinding) -> Unit
+# P1: define a local binding in the current scope. Every binding is
+# stamped with a FRESH LocalId (ctx.next_local_id — the resolver-side
+# local identity; the name stays for diagnostics); the binding's kind
+# (Variable/Parameter/LoopVariable/MatchBinding) is carried through.
+def define_local(ctx: &mut ResolutionContext, name: String, mut binding: ResolverLocalBinding) -> Unit
+  binding.local_id = LocalId { id: ctx.next_local_id }
+  ctx.next_local_id = ctx.next_local_id + 1
   if !ctx.local_scopes.is_empty() then
     let idx = ctx.local_scopes.len() - 1
     ctx.local_scopes[idx].insert(name, binding)
@@ -2573,31 +2615,34 @@ end
 
 def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) -> Unit
   # Look up in local scopes first. The identity keys are the expression's
-  # NODE ids (never spans).
+  # NODE ids (never spans). P1: the resolved local forms carry the
+  # binding's LocalId (the resolver-side local identity); the name is
+  # retained for diagnostics only.
   match lookup_local(ctx, name)
   when Option::Some(binding) then
+    let lid = binding.local_id
     match binding.kind
     when LocalBindingKind::Variable then
       let resolved_expr = ResolvedExpr {
-        kind: ResolvedExprKind::LocalVar(name.clone()),
+        kind: ResolvedExprKind::LocalVar(lid, name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
       let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::Parameter(idx) then
       let resolved_expr = ResolvedExpr {
-        kind: ResolvedExprKind::Parameter(name.clone(), idx),
+        kind: ResolvedExprKind::Parameter(lid, name.clone(), idx),
         module_path: ctx.symbols.current_module.clone()
       }
       let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::LoopVariable then
       let resolved_expr = ResolvedExpr {
-        kind: ResolvedExprKind::LocalVar(name.clone()),
+        kind: ResolvedExprKind::LocalVar(lid, name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
       let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
     when LocalBindingKind::MatchBinding then
       let resolved_expr = ResolvedExpr {
-        kind: ResolvedExprKind::LocalVar(name.clone()),
+        kind: ResolvedExprKind::LocalVar(lid, name.clone()),
         module_path: ctx.symbols.current_module.clone()
       }
       let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
@@ -2644,14 +2689,15 @@ def resolve_ident_expr(ctx: &mut ResolutionContext, name: &String, expr: &Expr) 
   end
 
   # Runtime intrinsics (__intrinsic_*) are provided by the runtime, not by
-  # source definitions; they are always resolvable. Their DefId lives in a
-  # synthetic module (id -1 — no Module in the Crate); the kind is
-  # metadata.
+  # source definitions; they are always resolvable. Their DefId lives in
+  # the compiler-synthetic definition domain (SYNTHETIC_MODULE_INTRINSIC —
+  # module id -1 — the negative synthetic band, never a Program.crate
+  # module); the kind is metadata.
   if name.starts_with("__intrinsic") then
     let bidx = ctx.next_builtin_index
     ctx.next_builtin_index = ctx.next_builtin_index + 1
     let bdid = DefId {
-      module: ModuleId { id: -1 },
+      module: synthetic_module_id(SYNTHETIC_MODULE_INTRINSIC),
       index: bidx as UInt
     }
     record_def_kind(ctx, &bdid, DefKind::Intrinsic)

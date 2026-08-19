@@ -17,13 +17,13 @@
 #   bit copy= yes     — copying the {ptr,len} words is structurally valid;
 #                       the type-copyability engine treats Slice as
 #                       bit-copyable regardless of T.
-#   escape  = constrained by the safe access model: safe code MUST NOT store
-#             a Slice beyond the lifetime of its backing buffer (the buffer
-#             may be reallocated by push/insert/clear on the owning
-#             container, or freed when the owner goes out of scope). The
-#             eventual enforcement is the projected-access model of the
-#             resource checker's IterationPlan; until then the contract is
-#             a programming discipline.
+#   escape  = enforced by the safe access model: safe Slice values are
+#             access-scoped and non-escaping — the checker rejects a Slice
+#             returned from a function, stored into longer-lived state
+#             (fields/containers/statics), or captured into an escaping
+#             closure, and rejects mutating/reallocating the backing buffer
+#             while a view of it is live (the P0-SL registry + the
+#             IterationPlan mutation scan).
 #
 # A Slice is NEVER a pointer to a heap {ptr,len,cap} Vec header: it carries
 # no capacity, and no compiler path reads a Slice through HeapVecHeader
@@ -209,6 +209,15 @@ end
 # and moved into the slot, the old value's bytes are extracted BEFORE the
 # new bytes are written, and the returned Option owns the old value (the
 # caller destroys it or rebinds it). A None result means the key was absent.
+#
+# SINK-KEY TEARDOWN (P0-OWN): the runtime PRESERVES the stored key on the
+# replacement path (the map keeps its key identity); the incoming key's
+# image was moved into the call but its bytes are NOT consumed by the
+# runtime. For an owning K the MIR lowers this method as: the insert
+# intrinsic, a branch on the returned Option's discriminant, and — on Some
+# (the replacement path was taken) — the concrete K drop glue on the
+# caller's incoming-key slot. The incoming key is destroyed exactly when
+# the stored key was preserved.
 def map_insert[K, V](m: &mut Map[K, V], sink key: K, sink value: V) -> Option[V]
   # Compiler intrinsic
   __intrinsic_map_insert(m, key, value)
@@ -224,13 +233,21 @@ def set_contains[T](s: &Set[T], item: &T) -> Bool
 end
 
 # Ownership-taking insert: the item is consumed INTO the set. Inserting a
-# key that already exists REPLACES the stored key with the new one — the set
-# keeps its no-payload semantics (a set entry is a Map[T, Unit] key slot, so
-# a replacement carries nothing to return beyond the presence result): the
-# Bool result is `true` when the key ALREADY existed (its slot was replaced)
-# and `false` when the key was ABSENT (a fresh slot was created). This is
-# the runtime's presence marker (the Map[T, Unit] insert returns the
-# replacement marker 1 / the new-key marker 0) passed through unchanged.
+# key that already exists REPLACES the stored key with the new one — the
+# set keeps its no-payload semantics (a set entry is a Map[T, Unit] key
+# slot, so a replacement carries nothing to return beyond the presence
+# result): the Bool result is `true` when the key ALREADY existed (its slot
+# was replaced) and `false` when the key was ABSENT (a fresh slot was
+# created).
+#
+# REPLACEMENT CONTRACT (P0-OWN): the runtime's found path rewrites the
+# STORED element with the incoming image (extract-then-write on the key,
+# symmetric with the map value replacement) and returns the fresh owned
+# allocation of the OLD stored element; for an owning T the MIR lowers this
+# method as: the insert intrinsic, the returned-address test, and — on the
+# found path — the concrete T drop glue on the returned old element. The
+# incoming item's image owns itself (it became the stored element); the old
+# element is destroyed by the MIR exactly when it was replaced.
 def set_insert[T](s: &mut Set[T], sink item: T) -> Bool
   __intrinsic_set_insert(s, item)
 end
@@ -397,6 +414,11 @@ impl[T] Array[T]
     __intrinsic_array_insert(self, index, item)
   end
 
+  # Clear is an OWNERSHIP operation (P0-OWN): for trivial (no needs_drop)
+  # elements the fast intrinsic stays (len = 0); for owning elements the
+  # MIR emits the per-element drop loop — the concrete element glue at
+  # data + i*stride for i in 0..len — and THEN len = 0 (capacity
+  # retained).
   def clear(self: &mut Self) -> Unit inout
     __intrinsic_array_clear(self)
   end
@@ -407,8 +429,9 @@ end
 # elements are extracted with the consuming inout APIs above (pop/remove).
 # String is NOT Copy (std::core: String is OWNED — moves transfer, clone()
 # allocates): a shared read of a Vec[String]/Map[.., String]/Set[String]
-# element must NEVER bitwise-copy the 8-byte pointer — that would duplicate
-# the owned buffer into a second owner without the required clone.
+# element must NEVER bitwise-copy the 8-byte String-object pointer — that
+# would duplicate the owned buffer into a second owner without the required
+# clone.
 # Element reads must produce an explicit clone; owned elements are extracted
 # with the consuming inout APIs.
 #
@@ -501,11 +524,21 @@ impl[K, V] Map[K, V]
 
   # Ownership-taking insert: key and value are consumed INTO the map; the
   # returned Option[V] carries the REPLACED old value (owned) when the key
-  # already existed — see the map_insert ownership contract above.
+  # already existed — see the map_insert ownership contract above (the
+  # sink-key teardown is MIR-side: the incoming key's drop runs on the
+  # replacement path).
   def insert(self: &mut Self, sink key: K, sink value: V) -> Option[V] inout
     __intrinsic_map_insert(self, key, value)
   end
 
+  # Ownership-taking remove: the removed VALUE is extracted as an owned
+  # Option[V], and the stored KEY is DESTROYED (P0-OWN): the MIR lowers
+  # this method as the ownership-transfer remove intrinsic (the runtime
+  # copies the value image out into the caller's slot and unlinks the
+  # record — the hash field is zeroed, the chain link stays intact — and
+  # returns the removed record's key address), the concrete K drop glue on
+  # the returned key address, then the Option[V] re-encode. The key bytes
+  # of a removed entry never leak.
   def remove(self: &mut Self, key: &K) -> Option[V] inout
     __intrinsic_map_remove(self, key)
   end
@@ -526,6 +559,13 @@ impl[K, V] Map[K, V]
     self.len() == 0
   end
 
+  # Clear is an OWNERSHIP operation (P0-OWN): the MIR decides. For trivial
+  # (no needs_drop) K and V the fast intrinsic (_tg_map_clear — the hash
+  # fields zeroed, size = 0) stays. For owning K or V the MIR emits the
+  # DRAIN-AND-DROP loop: each live entry is unlinked through
+  # __intrinsic_map_drain_one (the drain's own cleanup) and its key and
+  # value are dropped through their concrete glues, until the drain returns
+  # None. Either way the bucket arena and capacity are retained.
   def clear(self: &mut Self) -> Unit inout
     __intrinsic_map_clear(self)
   end
@@ -556,6 +596,11 @@ end
 # Clone-bound map surfaces: entries_cloned materializes a copied entries
 # array in which EVERY key and value is an explicit clone() — the pairs it
 # yields are genuinely owned and never share a pointer with the live map.
+# The raw materialization (__intrinsic_map_entries) builds a TRUE IMAGE
+# vec: the header stride is the (K, V) tuple's category-derived element
+# stride and each slot holds the tuple IMAGE inline (key at 0, value at
+# t_v_off) — the consumer addresses element i at i*stride with NO pointer
+# deref (the __intrinsic_array_get below reads the inline image).
 # The keys()/values()/iter() snapshot iterators are built on it (their
 # advance() clones each element out of the snapshot as well), so the
 # materializing iteration surface is consistently Clone-based.
@@ -592,11 +637,19 @@ impl[T] Set[T]
 
   # Ownership-taking insert: the item is consumed INTO the set. Replacing an
   # existing key keeps the set's no-payload semantics — nothing is returned
-  # beyond the presence result (see the set_insert contract above).
+  # beyond the presence result (see the set_insert replacement contract
+  # above: the stored element is rewritten and the OLD element is dropped
+  # MIR-side through its concrete glue).
   def insert(self: &mut Self, sink item: T) -> Bool inout
     __intrinsic_set_insert(self, item)
   end
 
+  # Ownership-taking remove: the removed ELEMENT is DESTROYED (P0-OWN):
+  # the MIR lowers this method as the ownership-transfer remove intrinsic
+  # (the runtime unlinks the record — the hash field is zeroed, the chain
+  # link stays intact — and returns the removed element's address), the
+  # concrete T drop glue on the returned address, then the Bool result.
+  # The removed element's bytes never leak.
   def remove(self: &mut Self, item: &T) -> Bool inout
     __intrinsic_set_remove(self, item)
   end
@@ -613,6 +666,11 @@ impl[T] Set[T]
     self.len() == 0
   end
 
+  # Clear is an OWNERSHIP operation (P0-OWN): for trivial (no needs_drop)
+  # elements the fast intrinsic stays; for owning elements the MIR emits
+  # the DRAIN-AND-DROP loop — each live element is unlinked through
+  # __intrinsic_set_drain_one and dropped through its concrete glue, until
+  # the drain returns None. The bucket arena and capacity are retained.
   def clear(self: &mut Self) -> Unit inout
     __intrinsic_set_clear(self)
   end

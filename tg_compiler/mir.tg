@@ -14,20 +14,21 @@ use tg_compiler::token::{Span, span_dummy}
 use tg_compiler::ast::{
   Program, Crate, Item, ItemKind, FunctionDecl, FnBody, ConstDecl,
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath,
-  Param, AccessConvention, expr_is_place_like
+  Param, AccessConvention, expr_is_place_like, TypeExpr, TypeExprKind
 }
 use tg_compiler::types::{
-  Type, TypeId, AccessEffect, ParamType, TypedProgram, LocalBinding,
+  Type, TypeId, AccessEffect, ParamType, FnSignature, LangItems, TypedProgram, LocalBinding,
   TypedExpr, TypedExprKind, TypedCall, TypedCallArg, TypedCallee, TypedField, TypedVariant,
   DeinitPlan, build_deinit_plan, fn_owner_key_of_def,
   module_qualified_fn_key, subst_type_args, deinit_plan_is_trivial,
-  TypeEnv, TypeDefKind, type_properties_of
+  TypeEnv, TypeDefKind, type_properties_of,
+  FunctionCleanupTable, ScopeId, function_cleanup_table_new
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
   GenericParamId, GenericParamTable, generic_param_table_new, fresh_synthetic_owner,
   intern_generic_param, generic_param_id_numeric, generic_param_name_of,
-  generic_param_name_from, def_id_numeric
+  generic_param_name_from, def_id_numeric, LocalId, NodeId
 }
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames, stable_id_map_new, module_qualified_key}
 use tg_compiler::resource_check::{resource_check, IterationPlan, TypedIteration, TypedCFG, CleanupEdge, CleanupAction, CfgEdgeKind, engine_snapshot_env, engine_env_empty}
@@ -76,6 +77,17 @@ struct MirProgram
   # emission label through this table — the DefId is the identity, the name
   # is only the symbol-mangling boundary.
   method_names_by_def: Map[Int, String] = Map::new()
+  # P0 (the needs_drop split): the engine snapshot TypeEnv (the typed
+  # program's serialized engine tables — engine_snapshot_env, built once
+  # per lowering and repaired for aliases) carried on the PROGRAM so the
+  # MIR Copy verifier queries the canonical TypeProperties answer —
+  # type_properties_of(env, ty).is_trivially_copyable on the CONCRETE
+  # (TypeId, substs) identity — instead of re-deriving copy legality from
+  # the DeinitPlan. The DeinitPlan (deinit_plans above) remains the
+  # drop-glue authority (gated on requires_drop_glue); is_trivially_copyable
+  # is the copy authority. The monomorphizer mutates MirProgram in place,
+  # so the snapshot survives post-mono verification unchanged.
+  engine_env: TypeEnv = engine_env_empty()
 end
 
 struct MirFunction
@@ -206,19 +218,16 @@ def strip_ref_for_keys(ty: Type) -> Type
   end
 end
 
-# P0-K (Type collapse): the LangItems TypeId of a builtin compound type by
-# name, from the builder's type_name_to_id inverse (the typed program's
-# type_names table — the semantic TypeId universe). The canonical Type
-# variants (Type::Option/Result/Map/Set/Box/Rc/Array/Slice) no longer exist;
-# every Adt construction for the builtins resolves the id HERE. -1 = name
-# not registered (never for the nine builtin names — they are registered in
-# type_env_new before any lowering).
-def mir_lang_item_id(b: &MirBuilder, name: String) -> Int
-  match b.type_name_to_id.get(name)
-  when Option::Some(id) then id
-  when Option::None then -1
-  end
-end
+# P0-K (Type collapse): the LangItems TypeId of a builtin compound type —
+# read from the CANONICAL LangItems snapshot (TypedProgram.lang_items — the
+# checker's env.lang_items id-indexed table, carried on the builder as
+# b.lang_items). The old name-inversion (a type_name_to_id lookup by
+# builtin name) is DELETED: the MIR receives the builtin ids directly from
+# the checker's table. Every Adt construction for the builtins reads the
+# snapshot field (b.lang_items.option / .slice / ...) at the construction
+# site; the nine builtin type names are all registered at env
+# initialization (type_env_new → build_lang_items), so the ids are valid
+# whenever lowering runs.
 
 # Resolve the type of a for-loop iterator expression so that
 # codegen can correctly identify heap collections. PHASE-2: the typed
@@ -398,6 +407,12 @@ def constant_float(value: Float) -> MirConstant
 end
 
 def constant_string(value: String) -> MirConstant
+  # P0-STRING: a string CONSTANT is the STATIC STRVIEW form — codegen
+  # interns the bytes and emits the shared static label (a raw pointer to
+  # the null-terminated static bytes). It is NOT an owned String object:
+  # every place that demands an owned String (by-value String params,
+  # String destinations, concat, to_string, clone) converts through
+  # string_from_static — the owned clone of the static view.
   MirConstant { kind: MirConstantKind::MirString(value), ty: Type::String, instance: Option::None }
 end
 
@@ -1076,6 +1091,14 @@ struct MirBuilder
   # and codegen's per-site label resolution.
   dispatch_methods: Map[String, (DefId, String, Int)]
   fn_ret_types: Map[String, Type]
+  # P0-STRING: mangled callee name -> the DECLARED parameter types (the
+  # same modifier resolution as the function lowering: Ref/Inout params are
+  # RefInternal). Built in the same pre-pass as fn_ret_types. Consumed by
+  # lower_call_arg's owned-String demand rule: a string LITERAL argument
+  # converts to an OWNED String (string_from_static) exactly when the
+  # callee's declared parameter at that position is a BY-VALUE String —
+  # a &str (RefInternal) parameter keeps the literal's static StrView form.
+  fn_param_types: Map[String, Vec[Type]]
   # deinit_targets maps a type id to its registered finalizer CALLABLE —
   # the checker's Drop-impl / deinit-method registration (the resolver's
   # DefId, the same identity typed.deinit_targets carries — P0-D: identity,
@@ -1107,11 +1130,26 @@ struct MirBuilder
   drop_glue_pending: Set[String]
   drop_glue_types: Vec[Type]
   drop_glue_functions: Vec[MirFunction]
-  # Authoritative per-function finalize sets from the resource checker
-  # (fn owner key -> local ids). MIR uses this as the PRIMARY cleanup source;
-  # the declared-locals analysis below is only a fallback for synthetic
-  # functions. Single-sourced ownership: semantic analysis decides, MIR emits.
-  finalize_plan: Map[String, Vec[Int]]
+  # P0-CF: the SEMANTIC cleanup tables from the resource checker (see
+  # types.tg FunctionCleanupTable) — CallableId -> FunctionCleanup per
+  # callable, the ScopeId-keyed defer registrations, the NodeId-keyed
+  # closure sets, and the expr/assign statement-local plans. MIR uses this
+  # as the PRIMARY cleanup source; the declared-locals analysis below is
+  # only a fallback for synthetic functions. Single-sourced ownership:
+  # semantic analysis decides, MIR emits. No cleanup semantics depend on
+  # parsing a String prefix.
+  finalize_plan: FunctionCleanupTable
+  # P0-CF: the SEMANTIC identity of the function/method currently being
+  # lowered — the resolver DefId wrapped (item_defs[item_idx][0] for free
+  # functions, item_defs[item_idx][method_idx] for methods — the SAME
+  # derivation the checker's item_callable / item_method_callable use).
+  # deinit_candidates looks the function-end plan up by THIS identity.
+  # Option::None at the closure/static/IR-only sites.
+  current_callable: Option[CallableId]
+  # P0-CF: the closure expression's NodeId while a closure body is being
+  # lowered — the closure_cleanup table key (the "closure::<node id>"
+  # String-key protocol deleted).
+  current_closure_node: Option[NodeId]
   # P0-CE (CleanupEdge migration COMPLETE): the ONE Typed CFG of the
   # program — the resource checker's pre-built CfgEdge/CfgBlock records
   # plus the parallel CleanupEdge table (cfg.cleanup[i] is edge i's
@@ -1245,7 +1283,7 @@ struct MirBuilder
   # emission the template is CLONED into that site's chain — one scope's
   # defers can run on several distinct exits (fallthrough, return, break/
   # continue, backedge), and each exit has its own cleanup successor, which
-  # a single block cannot express. The checker's "defer::<block key>" plan
+  # a single block cannot express. The checker's ScopeId-keyed defer registration
   # (defer STMT ids in registration order) is the scope association; the
   # builder-side registrations below are the source-level authority when the
   # checker recorded no plan for a scope.
@@ -1257,7 +1295,7 @@ struct MirBuilder
   defer_scope_chain: Vec[Int]
   # P0-Y: per-scope registration of defer STMT ids (in registration order),
   # maintained at StmtDefer lowering under the current scope key. The
-  # fallback source when "defer::<block key>" is absent from finalize_plan.
+  # fallback source when the semantic scope_defers table is absent.
   defer_scope_defers: Map[Int, Vec[Int]]
   # P0-AM (post-migration): the typed program's Program — the crate module
   # table (Program.crate.modules) the DefId renders scan — and the resolver
@@ -1284,11 +1322,36 @@ struct MirBuilder
   # name) — the MIR's diagnostics render names from this snapshot; carried
   # on MirProgram for the monomorphizer.
   generic_param_names: Map[Int, String]
+  # P0: the canonical LangItems snapshot (TypedProgram.lang_items — the
+  # checker's env.lang_items id-indexed table). Every synthesized Adt
+  # construction for a builtin compound type (Option/Result/Vec/Map/Set/
+  # Box/Rc/Array/Slice) reads its id HERE — the name-inversion is deleted.
+  lang_items: LangItems
+  # P0: the typed declaration records — fn owner key -> the checker's
+  # resolved FnSignature (parameter ParamTypes + return type) and
+  # module-qualified key -> the checker's resolved static/const/extern-static
+  # declared type. The MIR reads EVERY declaration type from these tables
+  # (a missing entry is an internal error — fail-closed); TypeExpr is never
+  # interpreted after type checking. Copied from the typed program in
+  # lower_program.
+  typed_fn_signatures: Map[String, FnSignature]
+  typed_static_types: Map[String, Type]
+  # P0: the typed program's nominal tables read at declaration lowering —
+  # semantic TypeId -> struct field shapes (name, type) and TypeId -> the
+  # declaration's generic parameter ids (the checker's declaration-order
+  # record; the field types' Type::Param forms reference exactly these ids).
+  typed_type_fields: Map[Int, Vec[(String, Type)]]
+  typed_type_params: Map[Int, Vec[GenericParamId]]
 end
 
 struct PendingClosure
   name: String
   params: Vec[ClosureParam]
+  # P0: the closure's DECLARED parameter types in declaration order — the
+  # typed tree's Type::Function split at the construction site (the
+  # checker's resolved types; never TypeExpr). The closure function's MIR
+  # parameters are built from this record.
+  param_types: Vec[Type]
   captures: Vec[String]
   capture_types: Vec[Type]
   body: Expr
@@ -1327,6 +1390,7 @@ def builder_new() -> MirBuilder
     method_param_counts: Map::new(),
     dispatch_methods: Map::new(),
     fn_ret_types: Map::new(),
+    fn_param_types: Map::new(),
     deinit_targets: Map::new(),
     finalizer_emission_names: Set::new(),
     method_names_by_def: Map::new(),
@@ -1337,7 +1401,9 @@ def builder_new() -> MirBuilder
     drop_glue_pending: Set::new(),
     drop_glue_types: Vec::new(),
     drop_glue_functions: Vec::new(),
-    finalize_plan: Map::new(),
+    finalize_plan: function_cleanup_table_new(),
+    current_callable: Option::None,
+    current_closure_node: Option::None,
     cfg: TypedCFG { edges: Vec::new(), blocks: Vec::new(), cleanup: Vec::new() },
     typed_iterations: Map::new(),
     deinit_plans: Map::new(),
@@ -1363,6 +1429,28 @@ def builder_new() -> MirBuilder
     generic_param_table: generic_param_table_new(),
     generic_param_ids: Map::new(),
     generic_param_names: Map::new(),
+    lang_items: LangItems {
+      option: -1,
+      result: -1,
+      vec: -1,
+      map: -1,
+      set: -1,
+      box_: -1,
+      rc: -1,
+      array: -1,
+      slice: -1,
+      drop_trait: -1,
+      clone_trait: -1,
+      copy_trait: -1,
+      eq_trait: -1,
+      hash_trait: -1,
+      transferable_trait: -1,
+      shareable_trait: -1
+    },
+    typed_fn_signatures: Map::new(),
+    typed_static_types: Map::new(),
+    typed_type_fields: Map::new(),
+    typed_type_params: Map::new(),
     access_effects: Map::new(),
     typed_local_bindings: Map::new(),
     declared_locals: Set::new(),
@@ -1379,7 +1467,8 @@ def builder_new() -> MirBuilder
       type_resolutions: Map::new(),
       pattern_resolutions: Map::new(),
       call_targets: Map::new(),
-      method_defs: Map::new(),
+      type_def_ids: Map::new(),
+      intrinsic_ids: Map::new(),
       item_defs: Map::new(),
       module_symbols: Map::new(),
       def_kinds: Map::new(),
@@ -1585,6 +1674,38 @@ def mir_item_owner_key(b: &MirBuilder, item_idx: Int, method_index: Int) -> Stri
   "item::" + item_idx.to_string() + "::method::" + method_index.to_string()
 end
 
+# P0-CF: the SEMANTIC CallableId of the item's free function — the
+# resolver DefId (item_defs[item_idx][0]) wrapped, the SAME derivation the
+# resource checker's item_callable uses, so the by_callable cleanup-table
+# lookups align. Option::None when the resolver recorded none.
+def mir_fn_callable(b: &MirBuilder, item_idx: Int) -> Option[CallableId]
+  match b.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if dids.len() > 0 then
+      Option::Some(CallableId { def: dids[0].clone() })
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# P0-CF: the SEMANTIC CallableId of the item's method at (item index,
+# method index) — item_defs[item_idx][method_idx] wrapped (the checker's
+# item_method_callable mirror). Option::None when the resolver recorded
+# none.
+def mir_item_callable(b: &MirBuilder, item_idx: Int, method_index: Int) -> Option[CallableId]
+  match b.item_defs.get(item_idx)
+  when Option::Some(dids) then
+    if method_index < dids.len() then
+      Option::Some(CallableId { def: dids[method_index].clone() })
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
 def add_param(b: &mut MirBuilder, name: String, ty: Type, span: Span) -> MirLocalId
   let id = MirLocalId { id: b.local_counter }
   b.local_counter = b.local_counter + 1
@@ -1670,8 +1791,9 @@ end
 
 def builder_local_is_resource(b: &mut MirBuilder, local_id: &MirLocalId) -> Bool
   # P0: the engine-backed ownership answer — the CONCRETE deinit plan for
-  # the local's type (the plan tree is the engine's needs_drop shape; see
-  # the ENGINE-QUERY note at deinit_plan_for_type). The old nominal-kind
+  # the local's type (the plan tree is the drop-GLUE shape — the engine's
+  # requires_drop_glue axis, NOT the resource-checking axis; see the
+  # ENGINE-QUERY note at deinit_plan_for_type). The old nominal-kind
   # walk (type_kinds_contain_resource) missed concrete-args ownership
   # (Wrapper[File], Box[Int]) and classified by the nominal table only;
   # the plan query answers from the concrete (TypeId, substs) identity.
@@ -1689,20 +1811,40 @@ end
 def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
   var places: Vec[Place] = Vec::new()
   # THE ONLY cleanup source: the authoritative finalize plan computed by the
-  # resource checker (per function owner key; includes sink params still
-  # live and owned locals; excludes caller-owned let/inout params and the
-  # finalizer's own self). MIR emits exactly what semantic analysis decided —
-  # there is NO name-based fallback: re-deriving ownership in MIR would be a
-  # second, divergent ownership analysis.
-  match b.finalize_plan.get(b.current_fn_key.clone())
-  when Option::Some(plan_ids) then
-    for pid in plan_ids do
+  # resource checker — the SEMANTIC FunctionCleanupTable (P0-CF): the
+  # per-callable FunctionCleanup.drops (Live Sink/OwnedLocal locals at
+  # function end, excluding caller-owned let/inout params and the
+  # finalizer's own self), or the closure_cleanup record under the closure
+  # expression's NodeId while a closure body is lowered. MIR emits exactly
+  # what semantic analysis decided — there is NO name-based fallback:
+  # re-deriving ownership in MIR would be a second, divergent ownership
+  # analysis. The String owner-key lookups are DELETED.
+  var plan_drops: Option[Vec[LocalId]] = Option::None
+  match b.current_callable
+  when Option::Some(cid) then
+    match b.finalize_plan.by_callable.get(cid)
+    when Option::Some(fc) then plan_drops = Option::Some(fc.drops.clone())
+    when Option::None then ()
+    end
+  when Option::None then
+    match b.current_closure_node
+    when Option::Some(cnode) then
+      match b.finalize_plan.closure_cleanup.get(cnode)
+      when Option::Some(fc) then plan_drops = Option::Some(fc.drops.clone())
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+  match plan_drops
+  when Option::Some(drops) then
+    for pid in drops do
       # Plan ids are SEMANTIC local ids (allocated globally during type
       # checking); map them to per-function MIR locals FIRST. The consumed
       # set holds MIR local ids (recorded from MirMovePlace/MirConsume
       # operands) — testing it with a semantic id would compare across
       # namespaces and could auto-finalize a moved value.
-      match b.semantic_to_mir.get(pid)
+      match b.semantic_to_mir.get(pid.id)
       when Option::Some(mir_id) then
         if !consumed.contains(&mir_id) then
           # No name-based filter here: the emission phase
@@ -1711,7 +1853,7 @@ def deinit_candidates(b: &mut MirBuilder, consumed: &Set[Int]) -> Vec[Place]
           places.push(place_local(MirLocalId { id: mir_id }))
         end
       when Option::None then
-          b.errors.push("internal error: finalize plan references semantic local _" + pid.to_string() + " with no MIR local in " + b.current_fn_key.clone())
+          b.errors.push("internal error: finalize plan references semantic local _" + pid.id.to_string() + " with no MIR local in " + b.current_fn_key.clone())
       end
     end
   when Option::None then ()
@@ -1836,6 +1978,24 @@ def mir_type_identity_key(ty: &Type) -> String
       i = i + 1
     end
     s + ")->" + mir_type_identity_key(ret)
+  when Type::FnPtr(params, ret) then
+    var s2 = "FnPtr("
+    var i2 = 0
+    while i2 < params.len() do
+      if i2 > 0 then s2 = s2 + "," end
+      s2 = s2 + mir_type_identity_key(&params[i2].ty)
+      i2 = i2 + 1
+    end
+    s2 + ")->" + mir_type_identity_key(ret)
+  when Type::Closure(cid, params, ret, captures) then
+    var s3 = "Closure(" + cid.node_id.to_string() + ":"
+    var i3 = 0
+    while i3 < params.len() do
+      if i3 > 0 then s3 = s3 + "," end
+      s3 = s3 + mir_type_identity_key(&params[i3].ty)
+      i3 = i3 + 1
+    end
+    s3 + ")->" + mir_type_identity_key(ret) + "|" + mir_type_identity_key(captures)
   when Type::Ptr(inner) then "Ptr[" + mir_type_identity_key(inner) + "]"
   when Type::PtrMut(inner) then "PtrMut[" + mir_type_identity_key(inner) + "]"
   when Type::RefInternal(inner, _) then "Ref[" + mir_type_identity_key(inner) + "]"
@@ -2087,14 +2247,16 @@ end
 # P0: the CONCRETE-type-keyed deinit-plan entry point. The plan for a type
 # is built ONCE per concrete (TypeId, substs) identity (mir_type_identity_key)
 # and memoized in b.concrete_deinit_plans; MirProgram carries that cache to
-# codegen. The engine authority: the plan tree is the concrete ownership
-# shape the types.tg engine's needs_drop answers in boolean form — this
-# cache is its MIR-side memoization (mirror of type_properties_of's
-# env.type_prop_cache, keyed like type_identity_key_resolved). The
-# recursion-visit (Set[Int]) is threaded through the uncached construction
-# below; a cached hit is a fully-computed plan, so it is safe to return
-# early (the visited-dependent PlanLimit for an inline cycle is invariant:
-# a fresh walk of the same concrete type revisits the same cycle).
+# codegen. The engine authority: the plan tree is the concrete drop-GLUE
+# shape — the types.tg engine's requires_drop_glue answers in boolean form
+# (the needs_drop split: the drop-glue axis, NOT the resource-checking
+# axis — String owns state but requires no glue) — this cache is its
+# MIR-side memoization (mirror of type_properties_of's env.type_prop_cache,
+# keyed like type_identity_key_resolved). The recursion-visit (Set[Int]) is
+# threaded through the uncached construction below; a cached hit is a
+# fully-computed plan, so it is safe to return early (the visited-dependent
+# PlanLimit for an inline cycle is invariant: a fresh walk of the same
+# concrete type revisits the same cycle).
 def deinit_plan_for_type(b: &mut MirBuilder, ty: &Type, visited: &mut Set[Int]) -> DeinitPlan
   let key = mir_type_identity_key(ty)
   match b.concrete_deinit_plans.get(key)
@@ -2115,20 +2277,25 @@ def deinit_plan_for_type(b: &mut MirBuilder, ty: &Type, visited: &mut Set[Int]) 
 end
 
 def deinit_plan_for_type_uncached(b: &mut MirBuilder, ty: &Type, visited: &mut Set[Int]) -> DeinitPlan
-  # P0 (engine consumption): the needs_drop DECISION comes from the types.tg
-  # engine on the CONCRETE type — type_properties_of over the builder's
-  # snapshot env (b.engine_env, the typed program's serialized engine
-  # tables). A type the engine answers NOT needing drop yields Trivial here
-  # (Option[Int], Tuple(Int, Int), FixedArray[Int; N] — the plan table and
-  # the checker's finalize decisions answer from the SAME authority). A
-  # DEFERRED type (is_deferred — an unsubstituted Type::Param/Var in the
-  # graph) is NOT gated: its plan is the generic template's deferred shape,
-  # the four semantic fields are non-authoritative, and the concrete drop
-  # glue after substitution governs (the Param arm below answers Trivial
-  # for the deferred position; the monomorphizer's instances carry their
-  # own concrete entries).
+  # P0 (engine consumption — the needs_drop SPLIT): the drop-glue DECISION
+  # comes from the types.tg engine on the CONCRETE type — type_properties_of
+  # over the builder's snapshot env (b.engine_env, the typed program's
+  # serialized engine tables). The gate is the REQUIRES_DROP_GLUE axis (the
+  # physical-destructor axis): a type the engine answers not-requiring-glue
+  # yields Trivial here (Option[Int], Tuple(Int, Int), FixedArray[Int; N],
+  # String and String-containing aggregates — the arena reclaims, there is
+  # no per-value destructor; the plan table and the checker's finalize
+  # decisions answer from the SAME authority, on their own axes). The
+  # engine's owns_state axis deliberately does NOT gate the plan: String
+  # owns state (never bit-copyable) yet has no drop glue. A DEFERRED type
+  # (is_deferred — an unsubstituted Type::Param/Var in the graph) is NOT
+  # gated: its plan is the generic template's deferred shape, the six
+  # semantic fields are non-authoritative, and the concrete drop glue after
+  # substitution governs (the Param arm below answers Trivial for the
+  # deferred position; the monomorphizer's instances carry their own
+  # concrete entries).
   let engine_props = type_properties_of(&mut b.engine_env, ty)
-  if !engine_props.is_deferred && !engine_props.needs_drop then
+  if !engine_props.is_deferred && !engine_props.requires_drop_glue then
     return DeinitPlan::Trivial
   end
   match ty
@@ -2256,10 +2423,10 @@ def deinit_plan_for_type_uncached(b: &mut MirBuilder, ty: &Type, visited: &mut S
           # deinit_targets + container/structural shape (the resource arm
           # skipped the container check, but every container name is
           # intercepted above by plan_named), so the gate was a re-
-          # classification with no decision power. The needs_drop DECISION
-          # (whether a local is finalized at all) is the ENGINE's answer
-          # (type_properties_of at the top of this function); the plan tree
-          # is the drop shape.
+          # classification with no decision power. The
+          # requires_drop_glue DECISION (whether a local has a physical
+          # destructor at all) is the ENGINE's answer (type_properties_of
+          # at the top of this function); the plan tree is the drop shape.
           # P0-10: viral containment through ORDINARY value types too — a
           # plain `struct Wrapper[T] { item: T }` with Wrapper[Probe] must
           # yield a structural plan even though its nominal kind is Value
@@ -2323,9 +2490,10 @@ def deinit_plan_for_type_uncached(b: &mut MirBuilder, ty: &Type, visited: &mut S
   when Type::Param(_) then
     # GENERIC-PARAMETER CONTRACT (P0): a plan for a Type::Param position is
     # the DEFERRED answer — the engine (type_properties_of's Param arm)
-    # answers is_deferred=true with the four semantic fields
-    # non-authoritative (the needs_drop gate at the top of this function
-    # skips deferred types), and the checker excludes Param-position locals
+    # answers is_deferred=true with the six semantic fields
+    # non-authoritative (the requires_drop_glue gate at the top of this
+    # function skips deferred types), and the checker excludes
+    # Param-position locals
     # from finalize plans, so destruction NEVER reaches this arm for
     # emission. If it ever did, Trivial here would be fail-open (a
     # substituted resource would silently leak); the correct emission is
@@ -2755,7 +2923,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
         instance: Option::None
       })
     }
-    let sd_ret = add_temp(b, Type::Adt(TypeId { id: mir_lang_item_id(b, "Option") }, Vec::from([elem_ty.clone()])), span)
+    let sd_ret = add_temp(b, Type::Adt(TypeId { id: b.lang_items.option }, Vec::from([elem_ty.clone()])), span)
     let sd_call_blk = create_block(b)
     let sd_disc_blk = create_block(b)
     let sd_some_blk = create_block(b)
@@ -2852,7 +3020,7 @@ def emit_plan_deinit(b: &mut MirBuilder, place: &Place, plan: &DeinitPlan, succ:
         instance: Option::None
       })
     }
-    let dr_ret = add_temp(b, Type::Adt(TypeId { id: mir_lang_item_id(b, "Option") }, Vec::from([Type::Tuple(vec![key_ty.clone(), val_ty.clone()])])), span)
+    let dr_ret = add_temp(b, Type::Adt(TypeId { id: b.lang_items.option }, Vec::from([Type::Tuple(vec![key_ty.clone(), val_ty.clone()])])), span)
     let dr_call_blk = create_block(b)
     let dr_disc_blk = create_block(b)
     let dr_some_blk = create_block(b)
@@ -3406,9 +3574,9 @@ def refine_collection_local_type_from_push(b: &mut MirBuilder, recv_place: &Plac
     when Option::None then ""
     end
     if push_named == "Slice" then
-      Option::Some(Type::Adt(TypeId { id: mir_lang_item_id(b, "Slice") }, Vec::from([elem_ty.clone()])))
+      Option::Some(Type::Adt(TypeId { id: b.lang_items.slice }, Vec::from([elem_ty.clone()])))
     elsif push_named == "Array" then
-      Option::Some(Type::Adt(TypeId { id: mir_lang_item_id(b, "Array") }, Vec::from([elem_ty.clone()])))
+      Option::Some(Type::Adt(TypeId { id: b.lang_items.array }, Vec::from([elem_ty.clone()])))
     else
       Option::None
     end
@@ -3422,9 +3590,9 @@ def refine_collection_local_type_from_push(b: &mut MirBuilder, recv_place: &Plac
       when Option::None then ""
       end
       if push_inner_named == "Slice" then
-        Option::Some(Type::RefInternal(Type::Adt(TypeId { id: mir_lang_item_id(b, "Slice") }, Vec::from([elem_ty.clone()])), mutable))
+        Option::Some(Type::RefInternal(Type::Adt(TypeId { id: b.lang_items.slice }, Vec::from([elem_ty.clone()])), mutable))
       elsif push_inner_named == "Array" then
-        Option::Some(Type::RefInternal(Type::Adt(TypeId { id: mir_lang_item_id(b, "Array") }, Vec::from([elem_ty.clone()])), mutable))
+        Option::Some(Type::RefInternal(Type::Adt(TypeId { id: b.lang_items.array }, Vec::from([elem_ty.clone()])), mutable))
       else
         Option::None
       end
@@ -3628,8 +3796,8 @@ end
 # (engine_snapshot_env, resource_check.tg — it serializes only the
 # field/variant tables). The engine's type_named_props / 
 # is_named_trivially_copyable then walk the Alias inner exactly like the
-# checker's env: an alias of an owning type answers needs_drop=true on both
-# sides of the checker↔MIR seam.
+# checker's env: an alias of an owning type answers owns_state=true /
+# requires_drop_glue=true on both sides of the checker↔MIR seam.
 def engine_snapshot_repair_aliases(env: &mut TypeEnv, typed: &TypedProgram) -> Unit
   for (alias_tid, alias_inner) in typed.type_aliases do
     match env.type_id_index.get(alias_tid)
@@ -3658,8 +3826,9 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.access_effects = typed.access_effects.clone()
   # P0 (engine consumption): the snapshot TypeEnv from the typed program's
   # serialized engine tables — the engine query bridge for the plan
-  # generation (deinit_plan_for_type's needs_drop gate and LangItems
-  # selection) and every ownership decision in this builder. The nominal
+  # generation (deinit_plan_for_type's requires_drop_glue gate and
+  # LangItems selection), the Copy verifier's is_trivially_copyable query,
+  # and every ownership decision in this builder. The nominal
   # type_kinds snapshot is no longer carried (it is declared-kind display
   # only; ownership never reads it — see the resource_kinds removal note).
   b.engine_env = engine_snapshot_env(typed)
@@ -3667,10 +3836,12 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   # TypeDefKind from the serialized field/variant tables — a type ALIAS
   # (TypeDefKind::Alias — the checker's resolved inner type) has no
   # serialized shape and lands Opaque, which would make the engine answer
-  # needs_drop=false for an alias of an owning type while the checker's own
-  # env walks the Alias inner (type_named_props' Alias arm). Re-apply the
-  # checker's resolved inner types so the MIR's ownership gate
-  # (deinit_plan_for_type's type_properties_of query) answers from the
+  # owns_state=false/requires_drop_glue=false for an alias of an owning
+  # type while the checker's own env walks the Alias inner
+  # (type_named_props' Alias arm). Re-apply the checker's resolved inner
+  # types so the MIR's engine queries (deinit_plan_for_type's
+  # type_properties_of gate and the Copy verifier's is_trivially_copyable
+  # answer) come from the
   # SAME authority as the checker.
   engine_snapshot_repair_aliases(&mut b.engine_env, typed)
   b.typed_local_bindings = typed.local_bindings.clone()
@@ -3716,6 +3887,15 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   b.generic_param_table = generic_param_table_new()
   b.generic_param_ids = typed.generic_param_ids.clone()
   b.generic_param_names = typed.generic_param_names.clone()
+  # P0: the typed declaration records and the canonical LangItems snapshot —
+  # the MIR reads every declaration type from these tables (a missing entry
+  # is an internal error, fail-closed) and every builtin Adt id from the
+  # LangItems table (the checker's id-indexed env.lang_items serialization).
+  b.lang_items = typed.lang_items.clone()
+  b.typed_fn_signatures = typed.typed_fn_signatures.clone()
+  b.typed_static_types = typed.typed_static_types.clone()
+  b.typed_type_fields = typed.type_fields.clone()
+  b.typed_type_params = typed.type_params.clone()
   var functions = Vec::new()
   var statics = Vec::new()
   var types = Vec::new()
@@ -3777,19 +3957,30 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       b.enum_has_payload.insert(e.name.clone(), has_payload)
     when ItemKind::ItemStatic(s) then
       b.static_names.insert(s.name.clone())
-      let st_ty = resolve_lowering_type(&b, &s.ty)
-      b.static_types.insert(s.name.clone(), st_ty)
       let (prep_path, _prep_module) = module_path_of_item_resolver(program, prep_idx)
       let prep_key = module_qualified_key(&prep_path, &s.name)
+      # P0: the static's DECLARED type comes from the typed table (the
+      # checker's resolved declaration record — never TypeExpr again); a
+      # missing entry is an internal error (fail-closed).
+      match b.typed_static_types.get(prep_key.clone())
+      when Option::Some(st_ty) then b.static_types.insert(s.name.clone(), st_ty)
+      when Option::None then b.errors.push("internal error: missing typed static type for '" + prep_key + "' during MIR lowering")
+      end
       match b.resolutions.module_symbols.get(prep_key)
       when Option::Some(sdid) then b.static_def_ids.insert(s.name.clone(), sdid)
       when Option::None then ()
       end
     when ItemKind::ItemConst(c) then
       b.static_names.insert(c.name.clone())
-      b.static_types.insert(c.name.clone(), const_decl_type(&b, &c))
       let (prep_path2, _prep_module2) = module_path_of_item_resolver(program, prep_idx)
       let prep_key2 = module_qualified_key(&prep_path2, &c.name)
+      # P0: the const's DECLARED type comes from the typed table (the
+      # checker's resolved declaration record — never TypeExpr again); a
+      # missing entry is an internal error (fail-closed).
+      match b.typed_static_types.get(prep_key2.clone())
+      when Option::Some(ct_ty) then b.static_types.insert(c.name.clone(), ct_ty)
+      when Option::None then b.errors.push("internal error: missing typed const type for '" + prep_key2 + "' during MIR lowering")
+      end
       match b.resolutions.module_symbols.get(prep_key2)
       when Option::Some(cdid) then b.static_def_ids.insert(c.name.clone(), cdid)
       when Option::None then ()
@@ -3838,19 +4029,73 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   for (reg_tid, reg_callable) in typed.deinit_targets do
     b.deinit_targets.insert(reg_tid, reg_callable.clone())
   end
+  # P0: the typed signature lookup — the fn owner key -> the checker's
+  # resolved FnSignature record. A declaration missing from the typed table
+  # is an internal error (fail-closed); the returned Unit-bearing record is
+  # only the defensive value after the ICE is recorded (lowering aborts at
+  # the error drain).
+  def mir_typed_signature_of(b: &mut MirBuilder, owner_key: String, what: String) -> FnSignature
+    match b.typed_fn_signatures.get(owner_key.clone())
+    when Option::Some(sig) then sig.clone()
+    when Option::None then
+      b.errors.push("internal error: missing typed signature for " + what + " (key '" + owner_key + "') during MIR lowering")
+      FnSignature { params: Vec::new(), ret_type: Type::Unit }
+    end
+  end
+
+  # P0-STRING: the DECLARED parameter types of a function/impl/extern
+  # declaration — the BASE types read from the typed signature record (the
+  # checker's resolved ParamTypes; never TypeExpr again), wrapped with the
+  # same modifier convention as the function lowering (Inout and Ref params
+  # become RefInternal; the Ref modifier is an AST-only attribute the
+  # checker does not record, so it is read from the declaration). Consumed
+  # by the owned-String demand rule in lower_call_arg (a by-value String
+  # param demands the owned conversion of a literal argument).
+  def mir_signature_param_types(b: &mut MirBuilder, what: String, sig: &FnSignature, params: &Vec[Param]) -> Vec[Type]
+    var tys = Vec::new()
+    var pi = 0
+    while pi < params.len() do
+      let base_ty = if pi < sig.params.len() then sig.params[pi].ty.clone() else
+        b.errors.push("internal error: typed signature of " + what + " has fewer parameters than its declaration during MIR lowering")
+        Type::Unit
+      end
+      let convention = if pi < sig.params.len() then sig.params[pi].convention else params[pi].convention end
+      var ty = base_ty.clone()
+      if convention == AccessConvention::Inout then
+        ty = Type::RefInternal(base_ty.clone(), true)
+      else
+        match params[pi].modifier
+        when Option::Some(mod) then
+          match mod
+          when ParamModifier::Ref then ty = Type::RefInternal(base_ty.clone(), false)
+          when _ then ()
+          end
+        when Option::None then ()
+        end
+      end
+      tys.push(ty)
+      pi = pi + 1
+    end
+    tys
+  end
+
   var ret_idx = 0
   while ret_idx < program.items.len() do
     let (ret_owner_path, _ret_module) = module_path_of_item_resolver(program, ret_idx)
     let item = program.items[ret_idx]
     match item.kind
     when ItemKind::ItemFunction(f) then
-      let ret_type = match f.ret_type
-      when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
-      when Option::None then Type::Unit
-      end
+      # P0: the declared return/parameter types come from the typed
+      # signature record (fn owner key — the same key the checker recorded
+      # under in check_function).
+      let fn_sig = mir_typed_signature_of(&mut b, mir_item_owner_key(&b, ret_idx, 0), "function '" + f.name + "'")
+      let ret_type = fn_sig.ret_type.clone()
       let emission_name = mir_fn_emission_name(&b, ret_idx, &ret_owner_path, f.name.clone())
       b.fn_ret_types.insert(emission_name, ret_type.clone())
       b.fn_ret_types.insert(f.name.clone(), ret_type)
+      let f_param_tys = mir_signature_param_types(&mut b, "function '" + f.name + "'", &fn_sig, &f.params)
+      b.fn_param_types.insert(emission_name, f_param_tys.clone())
+      b.fn_param_types.insert(f.name.clone(), f_param_tys)
     when ItemKind::ItemImpl(impl_decl) then
       let raw_impl_type = match impl_decl.for_type.kind
       when TypeExprKind::Named(name, _) then name.clone()
@@ -3868,16 +4113,18 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       var method_idx = 0
       while method_idx < impl_decl.methods.len() do
         let method = impl_decl.methods[method_idx]
-        let ret_type = match method.ret_type
-        when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
-        when Option::None then Type::Unit
-        end
+        # P0: the method's declared return/parameter types come from the
+        # typed signature record (method owner key — the same key the
+        # checker recorded under in check_impl).
+        let m_sig = mir_typed_signature_of(&mut b, mir_item_owner_key(&b, ret_idx, method_idx), "method '" + method.name + "' of the impl for '" + impl_type_name + "'")
+        let ret_type = m_sig.ret_type.clone()
         let mangled_name = if impl_type_name != "" then
           impl_type_name.clone() + "__" + method.name.clone()
         else
           method.name.clone()
         end
         b.fn_ret_types.insert(mangled_name.clone(), ret_type)
+        b.fn_param_types.insert(mangled_name.clone(), mir_signature_param_types(&mut b, "method '" + method.name + "' of the impl for '" + impl_type_name + "'", &m_sig, &method.params))
         let method_did = if method_idx < impl_dids.len() then
           Option::Some(impl_dids[method_idx].clone())
         else
@@ -3919,12 +4166,14 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       var sm_idx = 0
       while sm_idx < s.methods.len() do
         let method = s.methods[sm_idx]
-        let ret_type = match method.ret_type
-        when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
-        when Option::None then Type::Unit
-        end
+        # P0: the method's declared return/parameter types come from the
+        # typed signature record (method owner key — the same key the
+        # checker recorded under in check_impl's struct-method arm).
+        let sm_sig = mir_typed_signature_of(&mut b, mir_item_owner_key(&b, ret_idx, sm_idx), "method '" + method.name + "' of struct '" + s.name + "'")
+        let ret_type = sm_sig.ret_type.clone()
         let mangled_name = s.name.clone() + "__" + method.name.clone()
         b.fn_ret_types.insert(mangled_name.clone(), ret_type)
+        b.fn_param_types.insert(mangled_name.clone(), mir_signature_param_types(&mut b, "method '" + method.name + "' of struct '" + s.name + "'", &sm_sig, &method.params))
         let sm_did = if sm_idx < struct_dids.len() then
           Option::Some(struct_dids[sm_idx].clone())
         else
@@ -3954,11 +4203,15 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       for ext_item in ext.items do
         match ext_item
         when ExternItem::Function(ef) then
-          let ret_type = match ef.ret_type
-          when Option::Some(ty_expr) then resolve_type_with_builder(&b, &ty_expr)
-          when Option::None then Type::Unit
-          end
+          # P0: the extern's declared return/parameter types come from the
+          # typed signature record (the module-qualified fn key — the same
+          # key the checker recorded externs under in pass 3; extern blocks
+          # record no item_defs, so the DefId render is unreachable on both
+          # sides).
+          let ext_sig = mir_typed_signature_of(&mut b, module_qualified_fn_key(&ret_owner_path, ef.name.clone()), "extern function '" + ef.name + "'")
+          let ret_type = ext_sig.ret_type.clone()
           b.fn_ret_types.insert(ef.name.clone(), ret_type)
+          b.fn_param_types.insert(ef.name.clone(), mir_signature_param_types(&mut b, "extern function '" + ef.name + "'", &ext_sig, &ef.params))
         when _ then ()
         end
       end
@@ -4040,6 +4293,10 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       # Set the SAME owner key the resource checker used (DefId-based), so
       # finalize_plan and param bindings resolve to this function.
       b.current_fn_key = mir_fn_owner_key(b, item_idx2, &owner_path2, f.name.clone())
+      # P0-CF: the SEMANTIC callable identity for the function-end cleanup
+      # lookup (the checker's item_callable mirror).
+      b.current_callable = mir_fn_callable(b, item_idx2)
+      b.current_closure_node = Option::None
       # P0-AM: the MirFunction's emission name is the DefId-derived base
       # (fn_owner_key_of_def "<module path>::<index>::<kind>") — the
       # semantic identity
@@ -4054,6 +4311,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
       when Option::None then dbg_none = dbg_none + 1
       end
       b.current_fn_key = ""
+      b.current_callable = Option::None
+      b.current_closure_node = Option::None
     when ItemKind::ItemStatic(s) then
       statics.push(lower_static(&mut b, &s))
     when ItemKind::ItemConst(c) then
@@ -4159,6 +4418,10 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           span: method.span
         }
         b.current_fn_key = mir_item_owner_key(b, item_idx2, method_idx)
+        # P0-CF: the SEMANTIC callable identity for the function-end cleanup
+        # lookup (the checker's item_method_callable mirror).
+        b.current_callable = mir_item_callable(b, item_idx2, method_idx)
+        b.current_closure_node = Option::None
         match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
@@ -4181,6 +4444,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
         when Option::None then ()
         end
         b.current_fn_key = ""
+        b.current_callable = Option::None
+        b.current_closure_node = Option::None
         method_idx = method_idx + 1
       end
     when ItemKind::ItemStruct(s) then
@@ -4255,6 +4520,10 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           span: method.span
         }
         b.current_fn_key = mir_item_owner_key(b, item_idx2, sm_idx)
+        # P0-CF: the SEMANTIC callable identity for the function-end cleanup
+        # lookup (the checker's item_method_callable mirror).
+        b.current_callable = mir_item_callable(b, item_idx2, sm_idx)
+        b.current_closure_node = Option::None
         match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
           functions.push(mir_fn)
@@ -4262,6 +4531,8 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
         when Option::None then ()
         end
         b.current_fn_key = ""
+        b.current_callable = Option::None
+        b.current_closure_node = Option::None
         sm_idx = sm_idx + 1
       end
     when ItemKind::ItemExternBlock(ext) then
@@ -4278,12 +4549,21 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
           let extern_fn = lower_extern_fn(&mut b, &ef, abi_tag)
           functions.push(extern_fn)
         when ExternItem::Static(es) then
+          # P0: the extern static's DECLARED type comes from the typed
+          # table (the checker's resolved declaration record — never
+          # TypeExpr again); a missing entry is an internal error
+          # (fail-closed). The read-through registry feeds
+          # lower_extern_static below.
+          let es_key = module_qualified_key(&owner_path2, &es.name)
+          match b.typed_static_types.get(es_key.clone())
+          when Option::Some(est_ty) then b.static_types.insert(es.name.clone(), est_ty)
+          when Option::None then b.errors.push("internal error: missing typed static type for extern static '" + es_key + "' during MIR lowering")
+          end
           statics.push(lower_extern_static(&b, &es))
           b.static_names.insert(es.name.clone())
           # P0-SD: the extern static's DefId (the resolver registered
           # ExternItem::Static under DefKind::Static in module_symbols) —
           # the reference forms carry it.
-          let es_key = module_qualified_key(&owner_path2, &es.name)
           match b.resolutions.module_symbols.get(es_key)
           when Option::Some(es_did) then b.static_def_ids.insert(es.name.clone(), es_did)
           when Option::None then ()
@@ -4315,7 +4595,7 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
     when Option::None then ()
     end
   end
-  var result = MirProgram { functions: functions, statics: statics, types: types, deinit_plans: b.deinit_plans.clone(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone() }
+  var result = MirProgram { functions: functions, statics: statics, types: types, deinit_plans: b.deinit_plans.clone(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone(), engine_env: b.engine_env.clone() }
   lower_pending_closures(&mut b, &mut result)
 
   # P0 (plan-key fix): pre-populate the CONCRETE (TypeId, substs)-keyed
@@ -4343,13 +4623,13 @@ def lower_program(program: &Program, typed: &TypedProgram) -> Result[MirProgram,
   var slice_def_present = false
   var sd_idx = 0
   while sd_idx < result.types.len() do
-    if result.types[sd_idx].id.id == mir_lang_item_id(b, "Slice") then
+    if result.types[sd_idx].id.id == b.lang_items.slice then
       slice_def_present = true
     end
     sd_idx = sd_idx + 1
   end
   if !slice_def_present then
-    let slice_tid = mir_lang_item_id(b, "Slice")
+    let slice_tid = b.lang_items.slice
     if slice_tid >= 0 then
       # P0-GPI: the synthesized Slice[T] def interns its T into the
       # builder's shared table; the field type references the interned id.
@@ -4394,18 +4674,25 @@ end
 # top-level function the DefId-derived base (mir_fn_emission_name); for impl
 # / struct methods the pre-mangled "Type__method" name of the renamed decl.
 def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) -> Option[MirFunction]
-  # Collect generic parameter name -> GenericParamId so that type resolution
-  # can produce Type::Param(id) instead of Type::Adt(TypeId{id:0}, []).
-  # This preserves generic type information in the MIR, enabling
-  # monomorphization to detect and specialize generic functions.
-  # P0-GPI: the ids come from the checker's record (the fn owner key ->
-  # ids in the merged declaration order, paired positionally with this
-  # declaration's generic list); a declaration the checker never recorded
-  # (IR-synthesized) interns its own ids into the builder's shared table —
-  # self-consistent within the builder, names recorded for diagnostics.
-  # The SAME declaration-order ids are written into the MirFunction's
-  # generic_params below (P0-AM: the monomorphizer's EXCLUSIVE authority).
-  var param_id_map: Map[String, GenericParamId] = Map::new()
+  # P0: the declaration's typed signature — the checker's resolved
+  # parameter ParamTypes and return type, read from the typed record under
+  # the fn owner key (the typed table is the authority; TypeExpr is never
+  # interpreted after checking). A declaration missing from the typed table
+  # is an internal error (fail-closed).
+  var fn_sig = FnSignature { params: Vec::new(), ret_type: Type::Unit }
+  match b.typed_fn_signatures.get(b.current_fn_key.clone())
+  when Option::Some(sig) then fn_sig = sig.clone()
+  when Option::None then
+    b.errors.push("internal error: missing typed signature for '" + b.current_fn_key.clone() + "' during MIR lowering")
+  end
+  # P0-GPI: the generic parameter ids come from the checker's record (the
+  # fn owner key -> ids in the merged declaration order, paired positionally
+  # with this declaration's generic list); a declaration the checker never
+  # recorded (IR-synthesized) interns its own ids into the builder's shared
+  # table — self-consistent within the builder, names recorded for
+  # diagnostics. The SAME declaration-order ids are written into the
+  # MirFunction's generic_params below (P0-AM: the monomorphizer's
+  # EXCLUSIVE authority).
   var typed_param_ids = Vec::new()
   match b.generic_param_ids.get(b.current_fn_key.clone())
   when Option::Some(ids) then typed_param_ids = ids.clone()
@@ -4416,7 +4703,6 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) 
   while gi < f.generic_params.len() do
     let gp = f.generic_params[gi]
     if gi < typed_param_ids.len() then
-      param_id_map.insert(gp.name.clone(), typed_param_ids[gi].clone())
       decl_generic_ids.push(typed_param_ids[gi].clone())
     else
       let fallback_owner = fresh_synthetic_owner(&mut b.generic_param_table)
@@ -4424,7 +4710,6 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) 
       while fj < f.generic_params.len() do
         let fgp = f.generic_params[fj]
         let fid = intern_generic_param(&mut b.generic_param_table, &fallback_owner, fgp.name.clone())
-        param_id_map.insert(fgp.name.clone(), fid.clone())
         decl_generic_ids.push(fid.clone())
         fj = fj + 1
       end
@@ -4433,19 +4718,8 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) 
     gi = gi + 1
   end
 
-  # Resolve return type from AST.
-  # NOTE: use a `mut` local + statement match (not `let x = match ... end`).
-  # Stage0/native codegen mis-slots the address-of / clone of a let-binding
-  # whose initializer is a match expression: the match arms store the result
-  # in a temp slot, but ret_type.clone()/&ret_type read a separate,
-  # never-written slot (uninitialized garbage). This corrupted default_options'
-  # ret_type (and locals[0].ty) -> crash in type_size. A mut local assigned
-  # inside the match arms forces a real, written slot.
-  var ret_type = Type::Unit
-  match f.ret_type
-  when Option::Some(ref ty_expr) then ret_type = resolve_lowering_type_in_fn(b, ty_expr, &param_id_map)
-  when Option::None then ()
-  end
+  # P0: the return type is the typed signature's record.
+  var ret_type = fn_sig.ret_type.clone()
 
   start_function(b, emission_name, ret_type.clone(), f.span)
 
@@ -4465,12 +4739,19 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) 
   var param_idx = 0
   while param_idx < f.params.len() do
     let p = f.params[param_idx]
-    let base_ty = match p.ty
-    when Option::Some(ref ty_expr) then resolve_lowering_type_in_fn(b, ty_expr, &param_id_map)
-    when Option::None then Type::Unit
+    # P0: the parameter's BASE type is the typed signature's ParamType
+    # record (the checker's resolved declaration type — never TypeExpr
+    # again); the Ref/Inout RefInternal wrapping is the MIR's own
+    # parameter-passing shape (the Ref modifier is an AST-only attribute
+    # the checker does not record). A typed record with fewer parameters
+    # than the declaration is an internal error (fail-closed).
+    let base_ty = if param_idx < fn_sig.params.len() then fn_sig.params[param_idx].ty.clone() else
+      b.errors.push("internal error: typed signature of '" + b.current_fn_key.clone() + "' has fewer parameters than its declaration during MIR lowering")
+      Type::Unit
     end
+    let convention = if param_idx < fn_sig.params.len() then fn_sig.params[param_idx].convention else p.convention end
     var ty = base_ty.clone()
-    if p.convention == AccessConvention::Inout then
+    if convention == AccessConvention::Inout then
       ty = Type::RefInternal(base_ty.clone(), true)
     else
       match p.modifier
@@ -4552,10 +4833,14 @@ def lower_function(b: &mut MirBuilder, f: &FunctionDecl, emission_name: String) 
       when ExprKind::ExprIf(ref if_expr) then
         lower_if_to_place(b, if_expr, place_local(MirLocalId { id: 0 }), f.span)
       when _ then
-        let result = lower_expr(b, expr, f.span)
-        push_stmt(b, MirStatementKind::MirAssign(place_local(MirLocalId { id: 0 }), MirRvalue {
-          kind: MirRvalueKind::MirMove(result)
-        }), f.span)
+        # P0-STRING: dest-aware lowering — a literal body of a String
+        # function converts through string_from_static into the owned form.
+        match lower_expr_rvalue_to_dest(b, expr, &ret_type, f.span)
+        when Result::Ok(rv) then
+          push_stmt(b, MirStatementKind::MirAssign(place_local(MirLocalId { id: 0 }), rv), f.span)
+        when Result::Err(e) then
+          b.errors.push(e)
+        end
       end
     else
       let result = lower_expr(b, expr, f.span)
@@ -4614,290 +4899,6 @@ def lower_final_stmt_to_return_place(b: &mut MirBuilder, stmt: &Stmt, span: Span
   end
 end
 
-# Resolve a TypeExpr to a Type during MIR lowering. The builder carries the
-# semantic TypeId universe (type_name_to_id, the inverse of the typed
-# program's type_names); the builtin compound names resolve to their Adt
-# forms with the LangItems ids (the canonical Type variants no longer exist).
-# Unknown names keep the id-0 placeholder convention (the typed program is
-# the semantic authority; this resolver is the mechanical fallback).
-# NOTE (Slice view model): the Vec/Array annotations below resolve to their
-# OWN registered builtin ids (the heap-vector forms). Slice[T] — the 16-byte
-# {ptr,len} view — is a distinct id and a distinct runtime representation;
-# the two are never conflated in the MIR type universe.
-def resolve_lowering_type(b: &MirBuilder, ty_expr: &TypeExpr) -> Type
-  match ty_expr.kind
-  when TypeExprKind::Named(name, args) then
-    if name == "Int" then Type::Int
-    elsif name == "I8" then Type::I8
-    elsif name == "I16" then Type::I16
-    elsif name == "I32" then Type::I32
-    elsif name == "I64" then Type::I64
-    elsif name == "UInt" then Type::UInt
-    elsif name == "U8" then Type::U8
-    elsif name == "U16" then Type::U16
-    elsif name == "U32" then Type::U32
-    elsif name == "U64" then Type::U64
-    elsif name == "Float" then Type::Float
-    elsif name == "F32" then Type::F32
-    elsif name == "F64" then Type::F64
-    elsif name == "Bool" then Type::Bool
-    elsif name == "Char" then Type::Char
-    elsif name == "String" then Type::String
-    elsif name == "Unit" then Type::Unit
-    elsif name == "Never" then Type::Never
-    elsif name == "Option" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Option") }, Vec::from([resolve_lowering_type(b, &args[0])]))
-    elsif name == "Result" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Result") }, Vec::from([resolve_lowering_type(b, &args[0]), resolve_lowering_type(b, &args[1])]))
-    elsif (name == "Vec" || name == "Array") && args.len() == 1 then
-      # Vec[T] / Array[T] annotations lower to their OWN registered builtin
-      # ids (the heap-vector forms). They do NOT share the Slice id: Slice[T]
-      # is the 16-byte {ptr,len} VIEW (layout_engine slice_view_layout),
-      # while Vec/Array values are HeapVecHeader handles — distinct runtime
-      # representations that must never be conflated in the type universe.
-      Type::Adt(TypeId { id: mir_lang_item_id(b, name) }, Vec::from([resolve_lowering_type(b, &args[0])]))
-    elsif name == "Map" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Map") }, Vec::from([resolve_lowering_type(b, &args[0]), resolve_lowering_type(b, &args[1])]))
-    elsif name == "Set" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Set") }, Vec::from([resolve_lowering_type(b, &args[0])]))
-    else
-      var resolved_args = Vec::new()
-      for a in args do
-        resolved_args.push(resolve_lowering_type(b, &a))
-      end
-      match b.type_name_to_id.get(name)
-      when Option::Some(tid) then Type::Adt(TypeId { id: tid }, resolved_args)
-      when Option::None then Type::Adt(TypeId { id: 0 }, resolved_args)
-      end
-    end
-  when TypeExprKind::Unit then Type::Unit
-  when TypeExprKind::Never then Type::Never
-  when TypeExprKind::Tuple(elems) then
-    var types = Vec::new()
-    for e in elems do
-      types.push(resolve_lowering_type(b, &e))
-    end
-    Type::Tuple(types)
-  when TypeExprKind::Array(elem, size_opt) then
-    # The [T; N] annotation is the DISTINCT fixed-array variant
-    # Type::FixedArray(elem, n) — the count is carried in the TYPE (the
-    # named Array[T] syntax is the heap-vector Adt form above). The size
-    # expression must evaluate to a constant; a non-constant size records a
-    # lowering error (the fixed array size is part of the type identity).
-    let fa_elem = resolve_lowering_type(b, &elem)
-    let fa_size = match size_opt
-    when Option::Some(size_expr) then
-      match size_expr.kind
-      when ExprKind::ExprIntLit(n) then n
-      when _ then
-        b.errors.push("fixed array size must be a constant")
-        0
-      end
-    when Option::None then
-      b.errors.push("fixed array size must be a constant")
-      0
-    end
-    Type::FixedArray(fa_elem, fa_size)
-  when TypeExprKind::Slice(elem) then
-    Type::Adt(TypeId { id: mir_lang_item_id(b, "Slice") }, Vec::from([resolve_lowering_type(b, &elem)]))
-  when TypeExprKind::Ptr(inner) then
-    Type::Ptr(resolve_lowering_type(b, &inner))
-  when TypeExprKind::PtrMut(inner) then
-    Type::PtrMut(resolve_lowering_type(b, &inner))
-  when TypeExprKind::Fn(params, ret) then
-    var param_types = Vec::new()
-    for p in params do
-      param_types.push(ParamType { ty: resolve_lowering_type(b, &p.ty), convention: p.convention })
-    end
-    Type::Function(param_types, resolve_lowering_type(b, &ret))
-  when TypeExprKind::Async(inner) then
-    Type::Adt(TypeId { id: 0 }, Vec::from([resolve_lowering_type(b, &inner)]))
-  when TypeExprKind::Effect(effect_name, inner) then
-    Type::Effect(Vec::from([effect_name]), resolve_lowering_type(b, &inner))
-  when TypeExprKind::Path(path) then
-    Type::Adt(TypeId { id: 0 }, Vec::new())
-  when TypeExprKind::Infer then Type::Unit
-  when _ then Type::Unit
-  end
-end
-
-# Like resolve_lowering_type but uses the MirBuilder to resolve user-defined types
-# to their proper TypeIds (instead of always assigning TypeId{id:0}).
-def resolve_type_with_builder(b: &MirBuilder, ty_expr: &TypeExpr) -> Type
-  match ty_expr.kind
-  when TypeExprKind::Named(name, args) then
-    # Try built-in primitives first (same as resolve_lowering_type)
-    if name == "Int" then Type::Int
-    elsif name == "I8" then Type::I8
-    elsif name == "I16" then Type::I16
-    elsif name == "I32" then Type::I32
-    elsif name == "I64" then Type::I64
-    elsif name == "UInt" then Type::UInt
-    elsif name == "U8" then Type::U8
-    elsif name == "U16" then Type::U16
-    elsif name == "U32" then Type::U32
-    elsif name == "U64" then Type::U64
-    elsif name == "Float" then Type::Float
-    elsif name == "F32" then Type::F32
-    elsif name == "F64" then Type::F64
-    elsif name == "Bool" then Type::Bool
-    elsif name == "Char" then Type::Char
-    elsif name == "String" then Type::String
-    elsif name == "Unit" then Type::Unit
-    elsif name == "Never" then Type::Never
-    elsif name == "Option" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Option") }, Vec::from([resolve_type_with_builder(b, &args[0])]))
-    elsif name == "Result" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Result") }, Vec::from([resolve_type_with_builder(b, &args[0]), resolve_type_with_builder(b, &args[1])]))
-    elsif (name == "Vec" || name == "Array") && args.len() == 1 then
-      # Vec[T] / Array[T] lower to their OWN registered builtin ids (the
-      # heap-vector forms) — never the Slice view id (see resolve_lowering_type).
-      Type::Adt(TypeId { id: mir_lang_item_id(b, name) }, Vec::from([resolve_type_with_builder(b, &args[0])]))
-    elsif name == "Map" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Map") }, Vec::from([resolve_type_with_builder(b, &args[0]), resolve_type_with_builder(b, &args[1])]))
-    elsif name == "Set" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Set") }, Vec::from([resolve_type_with_builder(b, &args[0])]))
-    else
-      var resolved_args = Vec::new()
-      for a in args do
-        resolved_args.push(resolve_type_with_builder(b, &a))
-      end
-      # Look up user-defined type in builder's registry
-      let tid = match b.type_name_to_id.get(name)
-      when Option::Some(id) then id
-      when Option::None then 0
-      end
-      Type::Adt(TypeId { id: tid }, resolved_args)
-    end
-  when TypeExprKind::Ptr(inner) then
-    Type::Ptr(resolve_type_with_builder(b, &inner))
-  when TypeExprKind::PtrMut(inner) then
-    Type::PtrMut(resolve_type_with_builder(b, &inner))
-  when _ then
-    # Fall back to the static resolution for all other cases
-    resolve_lowering_type(b, ty_expr)
-  end
-end
-
-# Resolve a TypeExpr in the context of a function declaration whose generic
-# parameter name -> GenericParamId map is given in param_id_map. Returns
-# Type::Param(id) for type parameter references (P0-GPI: the id — identity
-# is the id, never the name; the param-name table holds the display names),
-# preserving generic type information in the MIR so that monomorphization
-# can detect and specialize generic functions.
-def resolve_lowering_type_in_fn(b: &mut MirBuilder, ty_expr: &TypeExpr, param_id_map: &Map[String, GenericParamId]) -> Type
-  match ty_expr.kind
-  when TypeExprKind::Named(name, args) then
-    if param_id_map.contains_key(&name) then
-      # Generic type parameter — use Type::Param(id) instead of resolving
-      # via builder
-      var resolved_args = Vec::new()
-      for a in args do
-        resolved_args.push(resolve_lowering_type_in_fn(b, &a, param_id_map))
-      end
-      match param_id_map.get(&name)
-      when Option::Some(gpid) then Type::Param(gpid.clone())
-      when Option::None then Type::Error
-      end
-    elsif name == "Int" then Type::Int
-    elsif name == "I8" then Type::I8
-    elsif name == "I16" then Type::I16
-    elsif name == "I32" then Type::I32
-    elsif name == "I64" then Type::I64
-    elsif name == "UInt" then Type::UInt
-    elsif name == "U8" then Type::U8
-    elsif name == "U16" then Type::U16
-    elsif name == "U32" then Type::U32
-    elsif name == "U64" then Type::U64
-    elsif name == "Float" then Type::Float
-    elsif name == "F32" then Type::F32
-    elsif name == "F64" then Type::F64
-    elsif name == "Bool" then Type::Bool
-    elsif name == "Char" then Type::Char
-    elsif name == "String" then Type::String
-    elsif name == "Unit" then Type::Unit
-    elsif name == "Never" then Type::Never
-    elsif name == "Option" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Option") }, Vec::from([resolve_lowering_type_in_fn(b, &args[0], param_id_map)]))
-    elsif name == "Result" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Result") }, Vec::from([resolve_lowering_type_in_fn(b, &args[0], param_id_map),
-                   resolve_lowering_type_in_fn(b, &args[1], param_id_map)]))
-    elsif (name == "Vec" || name == "Array") && args.len() == 1 then
-      # Vec[T] / Array[T] lower to their OWN registered builtin ids (the
-      # heap-vector forms) — never the Slice view id (see resolve_lowering_type).
-      Type::Adt(TypeId { id: mir_lang_item_id(b, name) }, Vec::from([resolve_lowering_type_in_fn(b, &args[0], param_id_map)]))
-    elsif name == "Map" && args.len() == 2 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Map") }, Vec::from([resolve_lowering_type_in_fn(b, &args[0], param_id_map),
-                resolve_lowering_type_in_fn(b, &args[1], param_id_map)]))
-    elsif name == "Set" && args.len() == 1 then
-      Type::Adt(TypeId { id: mir_lang_item_id(b, "Set") }, Vec::from([resolve_lowering_type_in_fn(b, &args[0], param_id_map)]))
-    else
-      # User-defined type — resolve via builder for proper TypeId,
-      # but still propagate generic names for any nested type args
-      var resolved_args = Vec::new()
-      for a in args do
-        resolved_args.push(resolve_lowering_type_in_fn(b, &a, param_id_map))
-      end
-      let tid = match b.type_name_to_id.get(name)
-      when Option::Some(id) then
-        Type::Adt(TypeId { id: id }, resolved_args)
-      when Option::None then
-        # Not-found: surface a lowering error instead of silently emitting a
-        # bogus TypeId{id:0}, and use the Error type so later passes reject it.
-        b.errors.push("cannot resolve type name '" + name + "' during lowering")
-        Type::Error
-      end
-    end
-  when TypeExprKind::Unit then Type::Unit
-  when TypeExprKind::Never then Type::Never
-  when TypeExprKind::Tuple(elems) then
-    var types = Vec::new()
-    for e in elems do
-      types.push(resolve_lowering_type_in_fn(b, &e, param_id_map))
-    end
-    Type::Tuple(types)
-  when TypeExprKind::Array(elem, size_opt) then
-    # The [T; N] annotation is the DISTINCT fixed-array variant
-    # Type::FixedArray(elem, n) — the count is carried in the TYPE (the
-    # named Array[T] syntax is the heap-vector Adt form above). The size
-    # expression must evaluate to a constant; a non-constant size records a
-    # lowering error.
-    let fa_elem = resolve_lowering_type_in_fn(b, &elem, param_id_map)
-    let fa_size = match size_opt
-    when Option::Some(size_expr) then
-      match size_expr.kind
-      when ExprKind::ExprIntLit(n) then n
-      when _ then
-        b.errors.push("fixed array size must be a constant")
-        0
-      end
-    when Option::None then
-      b.errors.push("fixed array size must be a constant")
-      0
-    end
-    Type::FixedArray(fa_elem, fa_size)
-  when TypeExprKind::Slice(elem) then
-    Type::Adt(TypeId { id: mir_lang_item_id(b, "Slice") }, Vec::from([resolve_lowering_type_in_fn(b, &elem, param_id_map)]))
-  when TypeExprKind::Ptr(inner) then
-    Type::Ptr(resolve_lowering_type_in_fn(b, &inner, param_id_map))
-  when TypeExprKind::PtrMut(inner) then
-    Type::PtrMut(resolve_lowering_type_in_fn(b, &inner, param_id_map))
-  when TypeExprKind::Fn(params, ret) then
-    var param_types = Vec::new()
-    for p in params do
-      param_types.push(ParamType { ty: resolve_lowering_type_in_fn(b, &p.ty, param_id_map), convention: p.convention })
-    end
-    Type::Function(param_types, resolve_lowering_type_in_fn(b, &ret, param_id_map))
-  when TypeExprKind::Async(inner) then
-    Type::Adt(TypeId { id: 0 }, Vec::from([resolve_lowering_type_in_fn(b, &inner, param_id_map)]))
-  when TypeExprKind::Effect(effect_name, inner) then
-    Type::Effect(Vec::from([effect_name]), resolve_lowering_type_in_fn(b, &inner, param_id_map))
-  when TypeExprKind::Path(path) then
-    Type::Adt(TypeId { id: 0 }, Vec::new())
-  when TypeExprKind::Infer then Type::Unit
-  when _ then Type::Unit
-  end
-end
 
 def expr_kind_tag(k: &ExprKind) -> String
   match k
@@ -4909,24 +4910,6 @@ def expr_kind_tag(k: &ExprKind) -> String
   when ExprKind::ExprIdent(name) then "ExprIdent(" + name + ")"
   when ExprKind::ExprEnumVariant(_, _) then "ExprEnumVariant"
   when _ then "Other"
-  end
-end
-
-def infer_const_expr_type(expr: &Expr) -> Type
-  match expr.kind
-  when ExprKind::ExprIntLit(_) then Type::Int
-  when ExprKind::ExprFloatLit(_) then Type::Float
-  when ExprKind::ExprBoolLit(_) then Type::Bool
-  when ExprKind::ExprCharLit(_) then Type::Char
-  when ExprKind::ExprStringLit(_) then Type::String
-  when _ then Type::Unit
-  end
-end
-
-def const_decl_type(b: &MirBuilder, c: &ConstDecl) -> Type
-  match c.ty
-  when Option::Some(ty_expr) then resolve_lowering_type(b, &ty_expr)
-  when Option::None then infer_const_expr_type(&c.value)
   end
 end
 
@@ -5005,6 +4988,9 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
       })
     })
   when ExprKind::ExprStringLit(s_val) then
+    # P0-STRING: the literal lowers to the STATIC STRVIEW form (the
+    # interned static label). Static initializers of String type convert
+    # through string_from_static at the demand site (lower_expr_rvalue_to_dest).
     Option::Some(MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirString(s_val),
@@ -5027,7 +5013,16 @@ def lower_static_init_operand(b: &mut MirBuilder, value: &Expr, resolved_ty: Typ
 end
 
 def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
-  let resolved_ty = resolve_lowering_type(b, &s.ty)
+  # P0: the static's declared type comes from the pre-pass registry, which
+  # was populated from the typed table (the checker's resolved declaration
+  # type — never TypeExpr again). A missing entry is an internal error
+  # (fail-closed).
+  let resolved_ty = match b.static_types.get(s.name.clone())
+  when Option::Some(ty) then ty
+  when Option::None then
+    b.errors.push("internal error: missing typed static type for static '" + s.name.clone() + "' during MIR lowering")
+    Type::Unit
+  end
   let init_val = lower_static_init_operand(b, &s.value, resolved_ty.clone())
 
   MirStatic {
@@ -5039,7 +5034,16 @@ def lower_static(b: &mut MirBuilder, s: &StaticDecl) -> MirStatic
 end
 
 def lower_const(b: &mut MirBuilder, c: &ConstDecl) -> MirStatic
-  let resolved_ty = const_decl_type(b, c)
+  # P0: the const's declared type comes from the pre-pass registry, which
+  # was populated from the typed table (the checker's resolved declaration
+  # type — never TypeExpr again). A missing entry is an internal error
+  # (fail-closed).
+  let resolved_ty = match b.static_types.get(c.name.clone())
+  when Option::Some(ty) then ty
+  when Option::None then
+    b.errors.push("internal error: missing typed const type for const '" + c.name.clone() + "' during MIR lowering")
+    Type::Unit
+  end
   let init_val = lower_static_init_operand(b, &c.value, resolved_ty.clone())
 
   MirStatic {
@@ -5053,41 +5057,45 @@ end
 def lower_extern_fn(b: &mut MirBuilder, ef: &ExternFn, abi: String) -> MirFunction
   # Create an extern function declaration.
   # This has no body — codegen will emit a relocation against the symbol name.
+  # P0: the extern's declared parameter/return types come from the pre-pass
+  # registries, which were populated from the typed signature table (the
+  # checker's resolved declaration record — never TypeExpr again); a
+  # missing entry is an internal error (fail-closed).
   let entry = MirBlockId { id: 0 }
   
   var params = Vec::new()
   var local_id = 0
+  var param_tys = match b.fn_param_types.get(ef.name.clone())
+  when Option::Some(tys) then tys.clone()
+  when Option::None then
+    b.errors.push("internal error: missing typed parameter types for extern function '" + ef.name.clone() + "' during MIR lowering")
+    Vec::new()
+  end
   for p in ef.params do
-    let base_ty = match p.ty
-    when Option::Some(ty_expr) then resolve_lowering_type(b, &ty_expr)
-    when Option::None then Type::Unit
-    end
-    var ty = base_ty.clone()
-    if p.convention == AccessConvention::Inout then
-      ty = Type::RefInternal(base_ty.clone(), true)
+    let base_ty = if local_id < param_tys.len() then
+      # The registry carries the RefInternal-wrapped shape (the same
+      # modifier convention as the function lowering); the MirLocal takes
+      # it as-is.
+      param_tys[local_id].clone()
     else
-      match p.modifier
-      when Option::Some(ref mod) then
-        match mod
-        when ParamModifier::Ref then ty = Type::RefInternal(base_ty.clone(), false)
-        when _ then ()
-        end
-      when Option::None then ()
-      end
+      b.errors.push("internal error: typed parameter count mismatch for extern function '" + ef.name.clone() + "' during MIR lowering")
+      Type::Unit
     end
     params.push(MirLocal {
       id: MirLocalId { id: local_id },
       name: p.name.clone(),
-      ty: ty,
+      ty: base_ty,
       is_mut: false,
       span: ef.span
     })
     local_id = local_id + 1
   end
   
-  let ret_type = match ef.ret_type
-  when Option::Some(rt) then resolve_lowering_type(b, &rt)
-  when Option::None then Type::Unit
+  let ret_type = match b.fn_ret_types.get(ef.name.clone())
+  when Option::Some(rt) then rt.clone()
+  when Option::None then
+    b.errors.push("internal error: missing typed return type for extern function '" + ef.name.clone() + "' during MIR lowering")
+    Type::Unit
   end
   
   # Mangle the name for Ruby ABI: prefix with _tg_rb_ for the thunk
@@ -5115,9 +5123,19 @@ def lower_extern_fn(b: &mut MirBuilder, ef: &ExternFn, abi: String) -> MirFuncti
 end
 
 def lower_extern_static(b: &MirBuilder, es: &ExternStatic) -> MirStatic
+  # P0: the extern static's declared type comes from the pre-pass registry,
+  # which was populated from the typed table (the checker's resolved
+  # declaration type — never TypeExpr again). A missing entry is an
+  # internal error (fail-closed).
+  let st_ty = match b.static_types.get(es.name.clone())
+  when Option::Some(ty) then ty
+  when Option::None then
+    b.errors.push("internal error: missing typed static type for extern static '" + es.name.clone() + "' during MIR lowering")
+    Type::Unit
+  end
   MirStatic {
     name: es.name.clone(),
-    ty: resolve_lowering_type(b, &es.ty),
+    ty: st_ty,
     init: Option::None,
     is_mut: es.is_mut
   }
@@ -5135,25 +5153,31 @@ def lower_struct_def(b: &mut MirBuilder, s: &StructDecl) -> MirTypeDef
     0
   end
 
-  var fields = Vec::new()
-  for f in s.fields do
-    # Physical layout (offsets/sizes) belongs exclusively to the layout
-    # engine; MIR records only field identity and type.
-    let field_type = resolve_type_with_builder(b, &f.ty)
-    fields.push(MirFieldDef {
-      name: f.name,
-      ty: field_type
-    })
-  end
+  # P0: the declaration's generic parameter ids come from the typed table
+  # (typed_type_params — the checker's declaration-order record; the SAME
+  # ids the field types' Type::Param forms reference). No builder-side
+  # interning for source types: the MIR universe IS the checker's universe
+  # (a Param left unsubstituted fails closed in the layout engine, never a
+  # pointer word).
   var s_generics = Vec::new()
-  # P0-GPI: the struct's generic parameters intern into the builder's
-  # shared table (a fresh synthetic owner — the MIR-side declaration
-  # domain; the lowered field types carry no Params, so the ids are
-  # self-consistent within this builder; names are recorded for
-  # diagnostics).
-  let s_owner = fresh_synthetic_owner(&mut b.generic_param_table)
-  for gp in s.generic_params do
-    s_generics.push(intern_generic_param(&mut b.generic_param_table, &s_owner, gp.name.clone()))
+  match b.typed_type_params.get(tid)
+  when Option::Some(gids) then s_generics = gids.clone()
+  when Option::None then b.errors.push("internal error: no typed generic parameters for struct '" + s.name + "' during MIR lowering")
+  end
+
+  # P0: the field types come from the typed table (typed_type_fields — the
+  # checker's resolved declaration record; TypeExpr is never interpreted
+  # after checking). A missing entry is an internal error (fail-closed).
+  var fields = Vec::new()
+  match b.typed_type_fields.get(tid)
+  when Option::Some(typed_fields) then
+    for (fname, fty) in typed_fields do
+      fields.push(MirFieldDef {
+        name: fname.clone(),
+        ty: fty.clone()
+      })
+    end
+  when Option::None then b.errors.push("internal error: no typed field table entry for struct '" + s.name + "' during MIR lowering")
   end
   let td = MirTypeDef {
     id: TypeId { id: tid },
@@ -5176,10 +5200,24 @@ def lower_enum_def(b: &mut MirBuilder, e: &EnumDecl) -> MirTypeDef
     0
   end
 
+  # P0: the declaration's generic parameter ids come from the typed table
+  # (typed_type_params — the checker's declaration-order record; the SAME
+  # ids the variant payload types' Type::Param forms reference) — no
+  # builder-side interning for source types.
+  var e_generics = Vec::new()
+  match b.typed_type_params.get(tid)
+  when Option::Some(gids) then e_generics = gids.clone()
+  when Option::None then b.errors.push("internal error: no typed generic parameters for enum '" + e.name + "' during MIR lowering")
+  end
+
   var variants = Vec::new()
   var disc = 0
+  var v_index = 0
   for v in e.variants do
-    # Use explicit discriminant from AST if provided (supports negative values)
+    # Use explicit discriminant from AST if provided (supports negative
+    # values — the checker's typed variant table records sequential
+    # discriminants only, so the AST declaration remains the discriminant
+    # authority; this is a constant, never a type reconstruction).
     match v.discriminant
     when Option::Some(expr) then
       match expr.kind
@@ -5193,10 +5231,19 @@ def lower_enum_def(b: &mut MirBuilder, e: &EnumDecl) -> MirTypeDef
       end
     when Option::None then ()
     end
-    # Lower variant payload type expressions to Types
+    # P0: the variant payload types come from the typed table
+    # (typed_type_variants — the checker's resolved declaration record;
+    # TypeExpr is never interpreted after checking). A missing entry is an
+    # internal error (fail-closed).
     var lowered_fields = Vec::new()
-    for field_ty_expr in v.fields do
-      lowered_fields.push(resolve_type_with_builder(b, &field_ty_expr))
+    match b.typed_type_variants.get(tid)
+    when Option::Some(typed_variants) then
+      if v_index < typed_variants.len() then
+        lowered_fields = typed_variants[v_index].1.clone()
+      else
+        b.errors.push("internal error: enum '" + e.name + "' variant index " + v_index.to_string() + " exceeds the typed variant table during MIR lowering")
+      end
+    when Option::None then b.errors.push("internal error: no typed variant table entry for enum '" + e.name + "' during MIR lowering")
     end
     variants.push(MirVariantDef {
       name: v.name,
@@ -5205,13 +5252,7 @@ def lower_enum_def(b: &mut MirBuilder, e: &EnumDecl) -> MirTypeDef
     })
     b.enum_variant_discriminants.insert(enum_variant_discriminant_key(&e.name, &v.name), disc)
     disc = disc + 1
-  end
-  var e_generics = Vec::new()
-  # P0-GPI: same interning as lower_struct_def — the enum's generic
-  # parameters intern into the builder's shared table.
-  let e_owner = fresh_synthetic_owner(&mut b.generic_param_table)
-  for gp2 in e.generic_params do
-    e_generics.push(intern_generic_param(&mut b.generic_param_table, &e_owner, gp2.name.clone()))
+    v_index = v_index + 1
   end
   let td = MirTypeDef {
     id: TypeId { id: tid },
@@ -5251,11 +5292,13 @@ def lower_contract(b: &mut MirBuilder, c: &ContractClause) -> Unit
   ), c.span)
 end
 
-# Lower the drop-before-store chain for an assignment ("assign::<key>").
-# Returns the continuation block where the STORE must happen, or None when
-# no drop is needed (the store happens in the current block).
-def lower_assign_drop_chain(b: &mut MirBuilder, key: String, span: Span) -> Option[MirBlockId]
-  match b.finalize_plan.get(key)
+# Lower the drop-before-store chain for an assignment — the SEMANTIC
+# assign_drops table (node id -> local ids; the "assign::<key>" String-key
+# protocol deleted). Returns the continuation block where the STORE must
+# happen, or None when no drop is needed (the store happens in the current
+# block).
+def lower_assign_drop_chain(b: &mut MirBuilder, node_id: Int, span: Span) -> Option[MirBlockId]
+  match b.finalize_plan.assign_drops.get(node_id)
   when Option::Some(assign_ids) then
     if assign_ids.len() > 0 then
       match b.current_block
@@ -5502,11 +5545,70 @@ def call_arg_effect(b: &mut MirBuilder, callee: Option[Expr], arg_idx: Int, arg_
   end
 end
 
-def lower_call_arg(b: &mut MirBuilder, callee: Option[Expr], arg_idx: Int, arg_expr: &Expr, span: Span, call_node_id: Int, typed_arg_idx: Int) -> MirCallArg
+# P0-STRING: the owned conversion of a string LITERAL argument — the
+# static StrView (the interned label) becomes an OWNED String object via
+# the string_from_static intrinsic. Emitted as a call into a fresh temp;
+# the current block is terminated by the call and the builder resumes in
+# the success block, so the caller's arg list continues in the new block.
+def lower_string_literal_to_owned(b: &mut MirBuilder, arg_expr: &Expr, span: Span) -> MirOperand
+  let tmp = add_temp(b, Type::String, span)
+  let success_blk = create_block(b)
+  let callee_op = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("string_from_static".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::String)),
+      instance: Option::None
+    })
+  }
+  let lit_op = lower_expr(b, arg_expr, span)
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(tmp),
+    func: callee_op,
+    args: vec![MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(lit_op) }],
+    success: success_blk,
+    unwind: Option::None
+  }, span)
+  b.current_block = Option::Some(success_blk)
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(tmp)) }
+end
+
+# P0-STRING: the owned-String demand rule. A string LITERAL argument is the
+# static StrView (raw label). It converts to an OWNED String object
+# (string_from_static — the owned clone) exactly when the callee's declared
+# parameter at this position is a BY-VALUE String: the callee's body will
+# treat the value as a String object (clone/push/len/...), so the raw label
+# must never cross into the object ABI. A &str (RefInternal) parameter keeps
+# the literal's raw form. Enumerated consumers: the diagnostics (panic /
+# assert / error messages), the format strings (eprintln concat operands),
+# the path strings (read_file_to_string_native, cstring_new), and every
+# other by-value String parameter.
+def mir_call_arg_needs_owned_string(b: &MirBuilder, callee_name: Option[String], arg_idx: Int, arg_expr: &Expr) -> Bool
+  if expr_kind_name(&arg_expr.kind) != "ExprStringLit" then
+    return false
+  end
+  match callee_name
+  when Option::Some(cn) then
+    match b.fn_param_types.get(&cn)
+    when Option::Some(ptys) then
+      if arg_idx < ptys.len() && ptys[arg_idx] == Type::String then
+        return true
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  false
+end
+
+def lower_call_arg(b: &mut MirBuilder, callee: Option[Expr], callee_name: Option[String], arg_idx: Int, arg_expr: &Expr, span: Span, call_node_id: Int, typed_arg_idx: Int) -> MirCallArg
   let effect = call_arg_effect(b, callee, arg_idx, arg_expr, call_node_id, typed_arg_idx)
   let kind_name = expr_kind_name(&arg_expr.kind)
   var value = MirCallValue::Value(operand_unit())
-  if kind_name == "ExprAccess" then
+  if mir_call_arg_needs_owned_string(b, callee_name, arg_idx, arg_expr) then
+    # P0-STRING: the literal is demanded as an OWNED String — the static
+    # StrView goes through the owned conversion.
+    value = MirCallValue::Value(lower_string_literal_to_owned(b, arg_expr, span))
+  elsif kind_name == "ExprAccess" then
     match arg_expr.kind
     when ExprKind::ExprAccess(inner) then value = MirCallValue::Place(lower_place(b, &inner))
     when _ then ()
@@ -6195,7 +6297,7 @@ end
 # EXITING EDGE's kind-1 run-defer actions name (append_defer_actions in
 # resource_check.tg records each exited scope's defers as (1, <defer stmt
 # id>) actions in the same innermost-first order). The kind-1 ids serialize
-# as the "defer::<scope key>" plans; the chain emission below consumes them
+# as the ScopeId-keyed scope_defers table; the chain emission below consumes them
 # LIFO — the edge's defer actions drive the emission.
 def defer_scopes_for_exit(b: &MirBuilder, stop_at_loop: Bool) -> Vec[Int]
   var out = Vec::new()
@@ -6211,27 +6313,33 @@ def defer_scopes_for_exit(b: &MirBuilder, stop_at_loop: Bool) -> Vec[Int]
   out
 end
 
-# P0-Y: the defer STMT ids for one scope — the checker's "defer::<block key>"
-# plan when present (checker authority, registration order); otherwise the
-# builder-side registration (the source-level authority for scopes the
-# checker did not model — e.g. a defer with no owning locals whose scope was
-# never recorded).
-# P0-CE: the "defer::<scope key>" plan IS the kind-1 RUN-DEFER action
+# P0-CF: the defer STMT ids for one scope — the SEMANTIC ScopeId-keyed
+# scope_defers table when present (checker authority, registration order);
+# otherwise the builder-side registration (the source-level authority for
+# scopes the checker did not model — e.g. a defer with no owning locals
+# whose scope was never recorded). The defer String-key
+# protocol is DELETED.
+# P0-CE: the scope_defers table IS the kind-1 RUN-DEFER action
 # serialization of CfgEdge.actions (append_defer_actions records the
-# scope's defers as (1, <defer stmt id>) actions from exactly this plan).
+# scope's defers as (1, <defer stmt id>) actions from exactly this table).
 # The defer-block chaining therefore consumes the edge's defer ids — the
 # kind-1 half of the CleanupEdge { edge, actions } — LIFO via
 # emit_defer_chain. The builder-side registrations remain the documented
 # fallback for scopes the checker never recorded.
 def defer_stmt_ids_for_scope(b: &MirBuilder, scope_key: Int) -> Vec[Int]
-  match b.finalize_plan.get("defer::" + scope_key.to_string())
-  when Option::Some(ids) then ids.clone()
+  var out = Vec::new()
+  match b.finalize_plan.scope_defers.get(ScopeId { id: scope_key })
+  when Option::Some(ids) then
+    for d in ids do
+      out.push(d.id)
+    end
   when Option::None then
     match b.defer_scope_defers.get(scope_key)
-    when Option::Some(ids) then ids.clone()
-    when Option::None then Vec::new()
+    when Option::Some(ids) then out = ids.clone()
+    when Option::None then ()
     end
   end
+  out
 end
 
 def scope_has_defers(b: &MirBuilder, scopes: &Vec[Int]) -> Bool
@@ -6282,7 +6390,7 @@ end
 # gets its own clone of every defer template (a single block cannot chain
 # into several distinct cleanup successors).
 # P0-CE: this IS the consumption of the edge's kind-1 run-defer actions:
-# the stmt ids come from the "defer::<scope key>" plans (the kind-1 action
+# the stmt ids come from the ScopeId-keyed scope_defers table (the kind-1 action
 # serialization) in the edge's exit order (defer_scopes_for_exit), LIFO.
 def emit_defer_chain(b: &mut MirBuilder, scopes: &Vec[Int], succ: MirBlockId, span: Span) -> MirBlockId
   var chain_entry = succ
@@ -6531,6 +6639,26 @@ def emit_return_edge_cleanup(b: &mut MirBuilder, stmt_node_id: Int, kind: CfgEdg
   end
 end
 
+# P0: the typed declared type of a `let` binding — the checker's
+# local_bindings record (semantic local id -> LocalBinding { name, ty }).
+# The pattern's semantic local id comes from the typed
+# pattern_binding_resolutions (pat node id -> semantic local id); the
+# binding's ty is the checker's resolved var_type (the annotation resolved,
+# or the value type when un-annotated — the typed table is the authority;
+# TypeExpr is never interpreted after checking). Option::None only for a
+# binding the checker never recorded — the caller records the internal
+# error (fail-closed).
+def typed_let_binding_type(b: &MirBuilder, pat: &Pattern) -> Option[Type]
+  match b.pattern_binding_resolutions.get(pat.node_id)
+  when Option::Some(sem_id) then
+    match b.typed_local_bindings.get(sem_id)
+    when Option::Some(lb) then Option::Some(lb.ty.clone())
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
 def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
   # Stage0 codegen miscompiles big `match` blocks on enums with many
   # variants: bindings (e.g. `value: Expr` inside `StmtLet`) come out
@@ -6547,12 +6675,21 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       match pattern.kind
       when PatternKind::Ident(name, pattern_mut) then
         let binding_mut = is_mut || pattern_mut
-        # Resolve the declared type FIRST (a FixedArray annotation drives the
-        # dest-aware array-literal lowering below), but keep the original
-        # ordering: the initializer rvalue is lowered BEFORE the binding
-        # local is allocated.
+        # P0: the declared type comes from the typed binding record (a
+        # FixedArray annotation drives the dest-aware array-literal lowering
+        # below); the typed table is the authority — TypeExpr is never
+        # interpreted after checking, and a missing typed binding for an
+        # annotated let is an internal error (fail-closed). The initializer
+        # rvalue is lowered BEFORE the binding local is allocated (kept
+        # ordering).
         let declared_ty = match ty_opt
-        when Option::Some(ty_expr) then Option::Some(resolve_type_with_builder(b, &ty_expr))
+        when Option::Some(_) then
+          match typed_let_binding_type(b, &pattern)
+          when Option::Some(t) then Option::Some(t)
+          when Option::None then
+            b.errors.push("internal error: missing typed local binding for let pattern node " + pattern.node_id.to_string() + " during MIR lowering")
+            Option::None
+          end
         when Option::None then Option::None
         end
         match declared_ty
@@ -6580,9 +6717,17 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       when _ then ()
       end
 
+      # P0: the declared type of the annotated let comes from the typed
+      # binding record (see the Ident arm above); a missing typed binding is
+      # an internal error (fail-closed).
       match ty_opt
-      when Option::Some(ty_expr) then
-        let declared_ty = resolve_type_with_builder(b, &ty_expr)
+      when Option::Some(_) then
+        let declared_ty = match typed_let_binding_type(b, &pattern)
+        when Option::Some(t) then t
+        when Option::None then
+          b.errors.push("internal error: missing typed local binding for let pattern node " + pattern.node_id.to_string() + " during MIR lowering")
+          Type::Unit
+        end
         let typed_tmp = add_temp(b, declared_ty.clone(), stmt.span)
         match lower_expr_rvalue_to_dest(b, &value, &declared_ty, stmt.span)
         when Result::Ok(rvalue) then
@@ -6614,7 +6759,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       # P0-11: assigning over a live owning place drops the previous value
       # first (drop old -> store new). The helper returns the continuation
       # block for the store when a drop chain was needed.
-      match lower_assign_drop_chain(b, "assign::" + stmt.node_id.to_string(), stmt.span)
+      match lower_assign_drop_chain(b, stmt.node_id, stmt.span)
       when Option::Some(cont) then
         switch_to_block(b, cont)
         match lower_expr_rvalue_to_dest(b, &value, &place_ty, stmt.span)
@@ -6626,13 +6771,47 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
           b.errors.push(e)
         end
       when Option::None then
-        match lower_expr_rvalue_to_dest(b, &value, &place_ty, stmt.span)
-        when Result::Ok(rvalue) then
-          push_assign(b, place, rvalue, stmt.span)
-          refine_assignment_target_type(b, &place, &value_ty)
-          refine_assignment_target_type_from_type(b, &place, &value_ty)
-        when Result::Err(e) then
-          b.errors.push(e)
+        # P0-OWN: the INDEXED-assignment old element. The checker records
+        # no assign-drop plan for projected targets (its machinery is
+        # root-local-plain only), yet the store OVERWRITES the element at
+        # data + index*stride — an owning element type leaks. The MIR
+        # drops the old element through the concrete element glue BEFORE
+        # the store (the OrderedMap::insert overwrite is this shape).
+        match mir_try_indexed_assign_drop(b, &target, &place)
+        when Option::Some(ig) then
+          let cont_blk = create_block(b)
+          let drop_blk = create_block(b)
+          match b.current_block
+          when Option::Some(cur_blk) then
+            switch_to_block(b, drop_blk)
+            set_terminator(b, MirTerminatorKind::MirDeinit {
+              place: place.clone(),
+              deinit_fn: ig,
+              target: cont_blk,
+              unwind: Option::None
+            }, stmt.span)
+            switch_to_block(b, cur_blk)
+            set_terminator(b, MirTerminatorKind::MirGoto(drop_blk), stmt.span)
+          when Option::None then ()
+          end
+          switch_to_block(b, cont_blk)
+          match lower_expr_rvalue_to_dest(b, &value, &place_ty, stmt.span)
+          when Result::Ok(rvalue) then
+            push_assign(b, place, rvalue, stmt.span)
+            refine_assignment_target_type(b, &place, &value_ty)
+            refine_assignment_target_type_from_type(b, &place, &value_ty)
+          when Result::Err(e) then
+            b.errors.push(e)
+          end
+        when Option::None then
+          match lower_expr_rvalue_to_dest(b, &value, &place_ty, stmt.span)
+          when Result::Ok(rvalue) then
+            push_assign(b, place, rvalue, stmt.span)
+            refine_assignment_target_type(b, &place, &value_ty)
+            refine_assignment_target_type_from_type(b, &place, &value_ty)
+          when Result::Err(e) then
+            b.errors.push(e)
+          end
         end
       end
       return
@@ -6726,9 +6905,11 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
     when StmtKind::StmtExpr(expr) then
       let result_op = lower_expr(b, &expr, stmt.span)
       # Full-expression temporary cleanup (P0-15): when the checker recorded
-      # an "expr::<stmt id>" obligation, the statement's result temporary is
-      # an owned resource that must be finalized at the end of the statement.
-      match b.finalize_plan.get("expr::" + stmt.node_id.to_string())
+      # an expr_temps obligation (the SEMANTIC table keyed by the stmt node
+      # id — the "expr::<stmt id>" String-key protocol deleted), the
+      # statement's result temporary is an owned resource that must be
+      # finalized at the end of the statement.
+      match b.finalize_plan.expr_temps.get(stmt.node_id)
       when Option::Some(_) then
         let tmp_place = match result_op.kind
         when MirOperandKind::MirCopy(p) then Option::Some(p)
@@ -6833,7 +7014,7 @@ def lower_stmt(b: &mut MirBuilder, stmt: &Stmt) -> Unit
       end
       b.defer_blocks.insert(stmt.node_id, defer_blk)
       # Register under the current scope key (builder-side authority; the
-      # checker's "defer::<key>" plan is the scope association at emission).
+      # checker's ScopeId-keyed defer registration is the scope association at emission).
       if b.defer_scope_chain.len() > 0 then
         let raw_scope_key = b.defer_scope_chain[b.defer_scope_chain.len() - 1]
         let scope_key = if raw_scope_key < 0 then 0 - raw_scope_key else raw_scope_key end
@@ -6920,7 +7101,7 @@ def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &V
   let owner = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2].clone() else "Vec" end
   let norm_owner = if owner == "Array" then "Vec" else owner end
 
-  let vec_ty = Type::Adt(TypeId { id: mir_lang_item_id(b, "Vec") }, Vec::from([elem_ty.clone()]))
+  let vec_ty = Type::Adt(TypeId { id: b.lang_items.vec }, Vec::from([elem_ty.clone()]))
 
   # Vec::new instance by construction (resolver DefId + concrete element
   # type); the name-only form is kept only when the DefId is absent.
@@ -6964,6 +7145,11 @@ def lower_vec_like_from_array_call(b: &mut MirBuilder, path: &AstPath, elems: &V
     var elem_value = MirCallValue::Value(lower_expr(b, &elems[elem_idx], span))
     if expr_is_place_like(&elems[elem_idx]) then
       elem_value = MirCallValue::Place(lower_place(b, &elems[elem_idx]))
+    else if elem_ty == Type::String && expr_kind_name(&elems[elem_idx].kind) == "ExprStringLit" then
+      # P0-STRING: a Vec[String] element that is a string LITERAL must be
+      # an OWNED String object — the static StrView goes through the owned
+      # conversion before the sink push.
+      elem_value = MirCallValue::Value(lower_string_literal_to_owned(b, &elems[elem_idx], span))
     end
     push_args.push(MirCallArg { effect: AccessEffect::Consume, value: elem_value })
     set_terminator(b, MirTerminatorKind::MirCall {
@@ -7141,6 +7327,17 @@ def lower_expr_rvalue_to_dest(b: &mut MirBuilder, expr: &Expr, dest_ty: &Type, s
     match dest_ty
     when Type::FixedArray(_, _) then
       Result::Ok(lr_array_lit_typed(b, dest_ty, &elems, span))
+    when _ then lower_expr_to_rvalue(b, expr, span)
+    end
+  when ExprKind::ExprStringLit(s) then
+    # P0-STRING: a literal assigned into a BY-VALUE String destination is
+    # demanded as an OWNED String — the static StrView goes through the
+    # owned conversion (string_from_static), never stored raw into the
+    # String-typed slot. &str/ref destinations keep the raw static form.
+    match dest_ty
+    when Type::String then
+      let owned = lower_string_literal_to_owned(b, expr, span)
+      Result::Ok(MirRvalue { kind: MirRvalueKind::MirMove(owned) })
     when _ then lower_expr_to_rvalue(b, expr, span)
     end
   when _ then lower_expr_to_rvalue(b, expr, span)
@@ -7480,10 +7677,20 @@ def lr_call(b: &mut MirBuilder, callee_expr: &Expr, arg_exprs: &Vec[Expr], span:
   let dest_place = place_local(ret_tmp)
   let success_blk = create_block(b)
 
+  # P0-STRING: the callee NAME for the owned-String demand rule (by-value
+  # String params convert literal arguments to owned String objects).
+  let fc_name = match callee_expr.kind
+  when ExprKind::ExprIdent(name) then Option::Some(name.clone())
+  when ExprKind::ExprFieldAccess(_, field_name) then Option::Some(qualify_field_callee_name(&callee_expr, field_name.clone()))
+  when ExprKind::ExprEnumVariant(path, _) then Option::Some(resolve_static_path_callee_name(b, &path))
+  when ExprKind::ExprPath(path) then Option::Some(resolve_static_path_callee_name(b, &path))
+  when _ then Option::None
+  end
+
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < arg_exprs.len() do
-    mir_args.push(lower_call_arg(b, Option::Some(callee_expr), arg_idx, &arg_exprs[arg_idx], span, call_node_id, arg_idx))
+    mir_args.push(lower_call_arg(b, Option::Some(callee_expr), fc_name, arg_idx, &arg_exprs[arg_idx], span, call_node_id, arg_idx))
     arg_idx = arg_idx + 1
   end
 
@@ -7550,7 +7757,7 @@ def lr_static_path_call(b: &mut MirBuilder, path: &AstPath, args: &Vec[Expr], sp
   var mir_args = Vec::new()
   var arg_idx = 0
   while arg_idx < args.len() do
-    mir_args.push(lower_call_arg(b, Option::None, arg_idx, &args[arg_idx], span, node_id, arg_idx))
+    mir_args.push(lower_call_arg(b, Option::None, Option::Some(fn_name.clone()), arg_idx, &args[arg_idx], span, node_id, arg_idx))
     arg_idx = arg_idx + 1
   end
   # P0-ZI: a SOURCE static-path call's result type is the typed tree's
@@ -7725,6 +7932,739 @@ def lower_receiver_place(b: &mut MirBuilder, receiver: &Expr, span: Span) -> Pla
   recv_place
 end
 
+# ———————————————————————————————————————————————————————————————
+# P0-OWN: MIR-visible collection ownership operations
+# ———————————————————————————————————————————————————————————————
+# The collection ownership operations are lowered HERE, at the concrete
+# METHOD-CALL sites, as ordinary MIR:
+#   - the element-replacement drops (the array-set old element, the
+#     indexed-assignment old element) — MirDeinit terminators carrying the
+#     concrete element glue at data + index*stride, BEFORE the store;
+#   - the stored-KEY drop on Map::remove and the stored-ELEMENT drop on
+#     Set::remove — the runtime copies the value/element out and unlinks
+#     the record; the MIR drops the returned key/element address through
+#     the concrete glue;
+#   - the sink-KEY teardown on Map::insert and the old-element drop on
+#     Set::insert (the replacement contract) — the runtime preserves the
+#     stored key / rewrites the stored element; the MIR destroys the
+#     incoming key / the replaced old element when the key was found;
+#   - the ownership CLEARS — per-element drop loops for arrays, drain-and-
+#     drop loops for maps/sets — while trivial (no needs_drop) element
+#     types keep the fast intrinsic.
+# The runtime never knows about ownership: transfer_store / _tg_array_set
+# just write the image; the remove/drain helpers transfer bytes and unlink
+# records. A DEFERRED receiver (a generic body's Param/Var element types)
+# cannot resolve the concrete glue at lowering and keeps the plain wrapper
+# call — the monomorphized std wrappers are the documented residual
+# boundary (the same boundary the P0-D array-set insertion has).
+# ———————————————————————————————————————————————————————————————
+
+# The bare collection name of a receiver type ("" when not a collection).
+def mir_collection_bare_name(b: &MirBuilder, ty: &Type) -> String
+  match ty
+  when Type::Adt(tid, _) then
+    match b.typed_type_names.get(tid.id)
+    when Option::Some(n) then mir_bare_type_name(&n)
+    when Option::None then ""
+    end
+  when _ then ""
+  end
+end
+
+# The receiver operand for a synthesized intrinsic call: a borrowed
+# receiver place (its type at the place is a reference/pointer) crosses
+# as its reference value — the codegen's intrinsic dispatch derefs it
+# once to the collection header; an owned receiver crosses through a
+# synthetic re-borrow temp (mirroring the method-call lowering's
+# recv_op construction).
+def mir_recv_operand(b: &mut MirBuilder, recv_place: &Place, recv_place_type: &Type, recv_type: &Type, span: Span) -> MirOperand
+  match recv_place_type
+  when Type::RefInternal(_, _) then MirOperand { kind: MirOperandKind::MirCopy(recv_place.clone()) }
+  when Type::Ptr(_) then MirOperand { kind: MirOperandKind::MirCopy(recv_place.clone()) }
+  when Type::PtrMut(_) then MirOperand { kind: MirOperandKind::MirCopy(recv_place.clone()) }
+  when _ then
+    let recv_ref_tmp = add_temp(b, Type::RefInternal(recv_type.clone(), false), span)
+    push_stmt(b, MirStatementKind::MirAssign(place_local(recv_ref_tmp), MirRvalue {
+      kind: MirRvalueKind::MirRef(recv_place.clone())
+    }), span)
+    MirOperand { kind: MirOperandKind::MirCopy(place_local(recv_ref_tmp)) }
+  end
+end
+
+# The Option[V] type of a synthesized ownership-call destination.
+def mir_option_type(b: &MirBuilder, inner: &Type) -> Type
+  Type::Adt(TypeId { id: b.lang_items.option }, Vec::from([inner.clone()]))
+end
+
+# The discriminant of a std Option variant, fail-closed on absence.
+def mir_option_discriminant(b: &mut MirBuilder, variant_name: &String, fallback: Int) -> Int
+  resolve_enum_variant_discriminant_or(b, AstPath {
+    segments: Vec::from(["Option".to_string(), variant_name.clone()]),
+    span: span_dummy()
+  }, fallback)
+end
+
+# The indexed-assignment old-element drop: when the assignment target is
+# an ExprIndex (or FixedArray constant index) whose element type owns
+# resources, the concrete element glue instance is returned so the caller
+# can emit the old element's MirDeinit BEFORE the store overwrites the
+# slot (the checker records no assign-drop plan for projected targets —
+# its machinery is root-local-plain only — so the MIR is the sole drop
+# authority here). Option::None for trivial elements, non-index targets,
+# and deferred (generic-body) element types — the monomorphized std
+# wrappers are the documented residual boundary.
+def mir_try_indexed_assign_drop(b: &mut MirBuilder, target: &Expr, place: &Place) -> Option[InstanceId]
+  let tkind = expr_kind_name(&target.kind)
+  if tkind != "ExprIndex" && tkind != "ExprAccess" then
+    return Option::None
+  end
+  let last_proj = if place.projections.len() > 0 then Option::Some(place.projections[place.projections.len() - 1]) else Option::None end
+  match last_proj
+  when Option::Some(Projection::ProjIndex(_)) then ()
+  when Option::Some(Projection::ProjConstantIndex(_)) then ()
+  when _ then return Option::None
+  end
+  let elem_ty = mir_place_type(place, b)
+  mir_try_glue_instance(b, &elem_ty)
+end
+
+# Map::remove over an owning K: the runtime _tg_map_remove_key copies the
+# removed VALUE image into the caller's v_tmp slot and returns the removed
+# record's KEY ADDRESS (0 when absent — the record is already unlinked);
+# the MIR drops the stored key through the concrete K glue on the returned
+# address, then re-encodes the V slot as the Option[V] value (the
+# codegen's option_wrap — the same layout decisions the map ops use).
+def mir_emit_map_remove_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  k_glue: InstanceId,
+  v_ty: &Type,
+  arg_exprs: &Vec[Expr],
+  span: Span,
+  call_node_id: Int,
+  fc_name: &String
+) -> MirRvalue
+  let v_tmp = add_temp(b, v_ty.clone(), span)
+  let v_addr_tmp = add_temp(b, Type::Ptr(Type::Unit), span)
+  push_assign(b, place_local(v_addr_tmp), MirRvalue { kind: MirRvalueKind::MirRef(place_local(v_tmp)) }, span)
+  let key_arg = lower_call_arg(b, Option::None, Option::Some(fc_name.clone()), 1, &arg_exprs[0], span, call_node_id, 0)
+  let key_addr_tmp = add_temp(b, Type::Ptr(Type::Unit), span)
+  let rm_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_map_remove_key".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var rm_args = Vec::new()
+  rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  rm_args.push(key_arg)
+  rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place_local(v_addr_tmp)) }) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(key_addr_tmp),
+    func: rm_callee,
+    args: rm_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  # Found (address != 0): drop the stored key at the returned address;
+  # absent (0): skip the drop — both merge into the Option wrap.
+  switch_to_block(b, disc_blk)
+  let drop_blk = create_block(b)
+  let wrap_blk = create_block(b)
+  var targets = Vec::new()
+  targets.push(SwitchTarget { value: 0, target: wrap_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: MirOperand { kind: MirOperandKind::MirCopy(place_local(key_addr_tmp)) }, targets: targets, default_target: drop_blk }, span)
+  switch_to_block(b, drop_blk)
+  set_terminator(b, MirTerminatorKind::MirDeinit {
+    place: place_deref(place_local(key_addr_tmp)),
+    deinit_fn: k_glue,
+    target: wrap_blk,
+    unwind: Option::None
+  }, span)
+  # The Option[V] re-encode: option_wrap(v_addr) — the codegen reads the
+  # V image from the slot (V <= 8: the value word; V > 8: the address).
+  switch_to_block(b, wrap_blk)
+  let wrap_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_option_wrap".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let opt_tmp = add_temp(b, mir_option_type(b, v_ty), span)
+  let wrap_succ = create_block(b)
+  var wrap_args = Vec::new()
+  wrap_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(place_local(v_addr_tmp)) }) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(opt_tmp),
+    func: wrap_callee,
+    args: wrap_args,
+    success: wrap_succ,
+    unwind: Option::None
+  }, span)
+  b.current_block = Option::Some(wrap_succ)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirCopy(place_local(opt_tmp))
+  }) }
+end
+
+# Set::remove over an owning T: the runtime returns the removed element's
+# ADDRESS (the record's key slot — 0 when absent); the MIR drops the
+# stored element through the concrete T glue and turns the address test
+# into the Bool result.
+def mir_emit_set_remove_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  t_glue: InstanceId,
+  arg_exprs: &Vec[Expr],
+  span: Span,
+  call_node_id: Int,
+  fc_name: &String
+) -> MirRvalue
+  let item_arg = lower_call_arg(b, Option::None, Option::Some(fc_name.clone()), 1, &arg_exprs[0], span, call_node_id, 0)
+  let elem_addr_tmp = add_temp(b, Type::Ptr(Type::Unit), span)
+  let rm_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_set_remove_key".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var rm_args = Vec::new()
+  rm_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  rm_args.push(item_arg)
+  rm_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(operand_int(0)) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(elem_addr_tmp),
+    func: rm_callee,
+    args: rm_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  # Found: drop the stored element; absent: false.
+  switch_to_block(b, disc_blk)
+  let drop_blk = create_block(b)
+  let true_blk = create_block(b)
+  let false_blk = create_block(b)
+  let merge_blk = create_block(b)
+  var targets = Vec::new()
+  targets.push(SwitchTarget { value: 0, target: false_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: MirOperand { kind: MirOperandKind::MirCopy(place_local(elem_addr_tmp)) }, targets: targets, default_target: drop_blk }, span)
+  switch_to_block(b, drop_blk)
+  set_terminator(b, MirTerminatorKind::MirDeinit {
+    place: place_deref(place_local(elem_addr_tmp)),
+    deinit_fn: t_glue,
+    target: true_blk,
+    unwind: Option::None
+  }, span)
+  let res_tmp = add_temp(b, Type::Bool, span)
+  switch_to_block(b, true_blk)
+  push_assign(b, place_local(res_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirBool(true), ty: Type::Bool, instance: Option::None })
+  }) }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
+  switch_to_block(b, false_blk)
+  push_assign(b, place_local(res_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirBool(false), ty: Type::Bool, instance: Option::None })
+  }) }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
+  b.current_block = Option::Some(merge_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirCopy(place_local(res_tmp))
+  }) }
+end
+
+# Map::insert over an owning K — the SINK-KEY TEARDOWN: the runtime
+# preserves the stored key on the found path (the replacement contract —
+# the old VALUE is extracted and returned as the Option[V]); the incoming
+# key's image was moved into the call but is NOT consumed by the runtime,
+# so the MIR drops it through the concrete K glue at the caller's key slot
+# exactly when the returned Option is Some.
+def mir_emit_map_insert_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  key_slot: Place,
+  k_glue: InstanceId,
+  v_ty: &Type,
+  arg_exprs: &Vec[Expr],
+  span: Span,
+  call_node_id: Int,
+  fc_name: &String
+) -> MirRvalue
+  let key_arg = lower_call_arg(b, Option::None, Option::Some(fc_name.clone()), 1, &arg_exprs[0], span, call_node_id, 0)
+  let val_arg = lower_call_arg(b, Option::None, Option::Some(fc_name.clone()), 2, &arg_exprs[1], span, call_node_id, 1)
+  let opt_tmp = add_temp(b, mir_option_type(b, v_ty), span)
+  let ins_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_map_insert".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var ins_args = Vec::new()
+  ins_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  ins_args.push(key_arg)
+  ins_args.push(val_arg)
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(opt_tmp),
+    func: ins_callee,
+    args: ins_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  # The Option discriminant decides the incoming key's fate: Some (found)
+  # -> the incoming key image at the caller's slot is destroyed; None
+  # (fresh slot) -> the image was moved into the map, nothing to drop.
+  switch_to_block(b, disc_blk)
+  let disc_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(opt_tmp)) }, span)
+  let some_disc = mir_option_discriminant(b, &"Some".to_string(), 0)
+  let none_disc = mir_option_discriminant(b, &"None".to_string(), 1)
+  let drop_blk = create_block(b)
+  let merge_blk = create_block(b)
+  var targets = Vec::new()
+  targets.push(SwitchTarget { value: some_disc, target: drop_blk })
+  targets.push(SwitchTarget { value: none_disc, target: merge_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: targets, default_target: merge_blk }, span)
+  switch_to_block(b, drop_blk)
+  set_terminator(b, MirTerminatorKind::MirDeinit {
+    place: key_slot,
+    deinit_fn: k_glue,
+    target: merge_blk,
+    unwind: Option::None
+  }, span)
+  b.current_block = Option::Some(merge_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirCopy(place_local(opt_tmp))
+  }) }
+end
+
+# Set::insert over an owning T — the REPLACEMENT drop: the runtime's
+# found path rewrites the stored element with the incoming image and
+# returns the fresh allocation holding the OLD element (extract-then-
+# write, symmetric with the map value replacement); the MIR drops the old
+# element through the concrete T glue when the result is nonzero, and the
+# address test is the Bool result (false = a fresh slot was created).
+def mir_emit_set_insert_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  t_glue: InstanceId,
+  arg_exprs: &Vec[Expr],
+  span: Span,
+  call_node_id: Int,
+  fc_name: &String
+) -> MirRvalue
+  let item_arg = lower_call_arg(b, Option::None, Option::Some(fc_name.clone()), 1, &arg_exprs[0], span, call_node_id, 0)
+  let old_addr_tmp = add_temp(b, Type::Ptr(Type::Unit), span)
+  let ins_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_set_insert".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var ins_args = Vec::new()
+  ins_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  ins_args.push(item_arg)
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(old_addr_tmp),
+    func: ins_callee,
+    args: ins_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  switch_to_block(b, disc_blk)
+  let drop_blk = create_block(b)
+  let true_blk = create_block(b)
+  let false_blk = create_block(b)
+  let merge_blk = create_block(b)
+  var targets = Vec::new()
+  targets.push(SwitchTarget { value: 0, target: false_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: MirOperand { kind: MirOperandKind::MirCopy(place_local(old_addr_tmp)) }, targets: targets, default_target: drop_blk }, span)
+  switch_to_block(b, drop_blk)
+  set_terminator(b, MirTerminatorKind::MirDeinit {
+    place: place_deref(place_local(old_addr_tmp)),
+    deinit_fn: t_glue,
+    target: true_blk,
+    unwind: Option::None
+  }, span)
+  let res_tmp = add_temp(b, Type::Bool, span)
+  switch_to_block(b, true_blk)
+  push_assign(b, place_local(res_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirBool(true), ty: Type::Bool, instance: Option::None })
+  }) }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
+  switch_to_block(b, false_blk)
+  push_assign(b, place_local(res_tmp), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirBool(false), ty: Type::Bool, instance: Option::None })
+  }) }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(merge_blk), span)
+  b.current_block = Option::Some(merge_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirCopy(place_local(res_tmp))
+  }) }
+end
+
+# Array/Vec::clear over an owning T: the per-element drop loop (the
+# concrete element glue at data + i*stride for i in 0..len) runs first,
+# then the fast intrinsic sets len = 0 (capacity retained). Trivial
+# element types keep the plain intrinsic call.
+def mir_emit_array_clear_owned(
+  b: &mut MirBuilder,
+  recv_place: &Place,
+  recv_op: MirOperand,
+  elem_glue: InstanceId,
+  span: Span
+) -> MirRvalue
+  let idx_local = add_local(b, "clear_idx", Type::Int, false, span)
+  let len_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(len_tmp), MirRvalue { kind: MirRvalueKind::MirLen(recv_place.clone()) }, span)
+  push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int, instance: Option::None })
+  }) }, span)
+  let header_blk = create_block(b)
+  let body_blk = create_block(b)
+  let inc_blk = create_block(b)
+  let exit_blk = create_block(b)
+  switch_to_block(b, header_blk)
+  let cmp_tmp = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(cmp_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+    MirBinOp::Lt,
+    operand_copy_local(idx_local),
+    operand_copy_local(len_tmp)
+  ) }, span)
+  var targets = Vec::new()
+  targets.push(SwitchTarget { value: 0, target: exit_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(cmp_tmp), targets: targets, default_target: body_blk }, span)
+  # body: drop the element at data + i*stride (the concrete glue), then
+  # increment — the element order is 0..len-1, always in bounds.
+  switch_to_block(b, body_blk)
+  var elem_projs = recv_place.projections.clone()
+  elem_projs.push(Projection::ProjIndex(idx_local))
+  let elem_place = Place { local: recv_place.local, projections: elem_projs }
+  set_terminator(b, MirTerminatorKind::MirDeinit {
+    place: elem_place,
+    deinit_fn: elem_glue,
+    target: inc_blk,
+    unwind: Option::None
+  }, span)
+  switch_to_block(b, inc_blk)
+  let inc_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(inc_tmp), MirRvalue { kind: MirRvalueKind::MirBinOp(
+    MirBinOp::Add,
+    operand_copy_local(idx_local),
+    operand_int(1)
+  ) }, span)
+  push_assign(b, place_local(idx_local), MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirCopy(place_local(inc_tmp))
+  }) }, span)
+  set_terminator(b, MirTerminatorKind::MirGoto(header_blk), span)
+  # len = 0 (the fast intrinsic — capacity retained).
+  switch_to_block(b, exit_blk)
+  let cl_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_array_clear".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let cl_ret = add_temp(b, Type::Int, span)
+  let cl_succ_blk = create_block(b)
+  var cl_args = Vec::new()
+  cl_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(cl_ret),
+    func: cl_callee,
+    args: cl_args,
+    success: cl_succ_blk,
+    unwind: Option::None
+  }, span)
+  b.current_block = Option::Some(cl_succ_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit, instance: Option::None })
+  }) }
+end
+
+# Map::clear over owning K/V: the DRAIN-AND-DROP loop — the runtime
+# unlinks each live entry and returns its image (__intrinsic_map_drain_one
+# — "the drain's own cleanup"), the MIR drops the key and the value
+# through their concrete glues, until the drain returns None. The buckets
+# arena and capacity are retained (no destroy). Trivial K and V keep the
+# fast intrinsic (_tg_map_clear).
+def mir_emit_map_clear_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  k_ty: &Type,
+  v_ty: &Type,
+  k_glue: Option[InstanceId],
+  v_glue: Option[InstanceId],
+  span: Span
+) -> MirRvalue
+  let dr_ret = add_temp(b, mir_option_type(b, &Type::Tuple(vec![k_ty.clone(), v_ty.clone()])), span)
+  let dr_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_map_drain_one".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  let some_blk = create_block(b)
+  let none_blk = create_block(b)
+  let succ_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var dr_args = Vec::new()
+  dr_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(dr_ret),
+    func: dr_callee,
+    args: dr_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  switch_to_block(b, disc_blk)
+  let disc_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(dr_ret)) }, span)
+  let some_disc = mir_option_discriminant(b, &"Some".to_string(), 0)
+  let none_disc = mir_option_discriminant(b, &"None".to_string(), 1)
+  var dr_targets = Vec::new()
+  dr_targets.push(SwitchTarget { value: some_disc, target: some_blk })
+  dr_targets.push(SwitchTarget { value: none_disc, target: none_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: dr_targets, default_target: none_blk }, span)
+  # Some: drop the value and the key of the drained entry (the concrete
+  # glues at the Option[Some] payload projections), then drain again.
+  switch_to_block(b, some_blk)
+  let some_vid = mir_synth_variant(b, &place_local(dr_ret), &"Some".to_string(), "map-clear drain")
+  var v_projs = place_local(dr_ret).projections.clone()
+  v_projs.push(Projection::Variant(some_vid))
+  v_projs.push(Projection::TupleIndex(1))
+  let v_place = Place { local: dr_ret, projections: v_projs }
+  var k_projs = place_local(dr_ret).projections.clone()
+  k_projs.push(Projection::Variant(some_vid))
+  k_projs.push(Projection::TupleIndex(0))
+  let k_place = Place { local: dr_ret, projections: k_projs }
+  var chain_target = call_blk
+  match k_glue
+  when Option::Some(kg) then
+    let k_blk = create_block(b)
+    switch_to_block(b, k_blk)
+    set_terminator(b, MirTerminatorKind::MirDeinit { place: k_place, deinit_fn: kg, target: chain_target, unwind: Option::None }, span)
+    chain_target = k_blk
+  when Option::None then ()
+  end
+  match v_glue
+  when Option::Some(vg) then
+    let v_blk = create_block(b)
+    switch_to_block(b, v_blk)
+    set_terminator(b, MirTerminatorKind::MirDeinit { place: v_place, deinit_fn: vg, target: chain_target, unwind: Option::None }, span)
+    chain_target = v_blk
+  when Option::None then ()
+  end
+  switch_to_block(b, some_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(chain_target), span)
+  # None: drained — the map is empty, capacity retained.
+  switch_to_block(b, none_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(succ_blk), span)
+  let entry_blk = create_block(b)
+  switch_to_block(b, entry_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(call_blk), span)
+  b.current_block = Option::Some(succ_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit, instance: Option::None })
+  }) }
+end
+
+# Set::clear over an owning T: the drain-and-drop loop (set_drain_one
+# unlinks + returns each element image; the MIR drops it through the
+# concrete T glue) until None. Trivial T keeps the fast intrinsic.
+def mir_emit_set_clear_owned(
+  b: &mut MirBuilder,
+  recv_op: MirOperand,
+  t_ty: &Type,
+  t_glue: InstanceId,
+  span: Span
+) -> MirRvalue
+  let sd_ret = add_temp(b, mir_option_type(b, t_ty), span)
+  let sd_callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem("__intrinsic_set_drain_one".to_string()),
+      ty: Type::Function(Vec::new(), Box::new(Type::Unit)),
+      instance: Option::None
+    })
+  }
+  let call_blk = create_block(b)
+  let disc_blk = create_block(b)
+  let some_blk = create_block(b)
+  let none_blk = create_block(b)
+  let succ_blk = create_block(b)
+  switch_to_block(b, call_blk)
+  var sd_args = Vec::new()
+  sd_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+  set_terminator(b, MirTerminatorKind::MirCall {
+    dest: place_local(sd_ret),
+    func: sd_callee,
+    args: sd_args,
+    success: disc_blk,
+    unwind: Option::None
+  }, span)
+  switch_to_block(b, disc_blk)
+  let disc_tmp = add_temp(b, Type::Int, span)
+  push_assign(b, place_local(disc_tmp), MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(sd_ret)) }, span)
+  let some_disc = mir_option_discriminant(b, &"Some".to_string(), 0)
+  let none_disc = mir_option_discriminant(b, &"None".to_string(), 1)
+  var sd_targets = Vec::new()
+  sd_targets.push(SwitchTarget { value: some_disc, target: some_blk })
+  sd_targets.push(SwitchTarget { value: none_disc, target: none_blk })
+  set_terminator(b, MirTerminatorKind::MirSwitchInt { op: operand_copy_local(disc_tmp), targets: sd_targets, default_target: none_blk }, span)
+  switch_to_block(b, some_blk)
+  let some_vid = mir_synth_variant(b, &place_local(sd_ret), &"Some".to_string(), "set-clear drain")
+  var elem_projs = place_local(sd_ret).projections.clone()
+  elem_projs.push(Projection::Variant(some_vid))
+  let elem_place = Place { local: sd_ret, projections: elem_projs }
+  let elem_drop_blk = create_block(b)
+  switch_to_block(b, elem_drop_blk)
+  set_terminator(b, MirTerminatorKind::MirDeinit { place: elem_place, deinit_fn: t_glue, target: call_blk, unwind: Option::None }, span)
+  switch_to_block(b, some_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(elem_drop_blk), span)
+  switch_to_block(b, none_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(succ_blk), span)
+  let entry_blk = create_block(b)
+  switch_to_block(b, entry_blk)
+  set_terminator(b, MirTerminatorKind::MirGoto(call_blk), span)
+  b.current_block = Option::Some(succ_blk)
+  MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit, instance: Option::None })
+  }) }
+end
+
+# The ownership interception: the concrete method-call site entry.
+# Returns Some(lowered rvalue) when the ownership sequence replaced the
+# plain wrapper call; None keeps the pre-existing path.
+def mir_try_collection_ownership_lowering(
+  b: &mut MirBuilder,
+  method_name: &String,
+  recv_place: &Place,
+  recv_type: &Type,
+  arg_exprs: &Vec[Expr],
+  span: Span,
+  call_node_id: Int
+) -> Option[MirRvalue]
+  let recv_named = mir_collection_bare_name(b, recv_type)
+  if recv_named == "" then
+    return Option::None
+  end
+  let fc_name = recv_named.clone() + "__" + method_name.clone()
+  let recv_place_ty = mir_place_type(recv_place, b)
+  let recv_op = mir_recv_operand(b, recv_place, &recv_place_ty, recv_type, span)
+  match recv_type
+  when Type::Adt(_, rargs) then
+    if method_name == "remove" && arg_exprs.len() >= 1 then
+      if recv_named == "Map" && rargs.len() >= 2 then
+        let k_ty = rargs[0].clone()
+        let v_ty = rargs[1].clone()
+        match mir_try_glue_instance(b, &k_ty)
+        when Option::Some(k_glue) then
+          return Option::Some(mir_emit_map_remove_owned(b, recv_op, k_glue, &v_ty, arg_exprs, span, call_node_id, &fc_name))
+        when Option::None then ()
+        end
+      elsif recv_named == "Set" && rargs.len() >= 1 then
+        let t_ty = rargs[0].clone()
+        match mir_try_glue_instance(b, &t_ty)
+        when Option::Some(t_glue) then
+          return Option::Some(mir_emit_set_remove_owned(b, recv_op, t_glue, arg_exprs, span, call_node_id, &fc_name))
+        when Option::None then ()
+        end
+      end
+    elsif method_name == "insert" then
+      if recv_named == "Map" && rargs.len() >= 2 && arg_exprs.len() >= 2 then
+        let k_ty = rargs[0].clone()
+        let v_ty = rargs[1].clone()
+        match mir_try_glue_instance(b, &k_ty)
+        when Option::Some(k_glue) then
+          # The incoming key slot must be a recoverable place (the caller's
+          # frame slot holding the consumed key image).
+          let key_slot = match arg_exprs[0].kind
+          when ExprKind::ExprAccess(inner) then
+            if expr_is_place_like(&inner) then Option::Some(lower_place(b, &inner)) else Option::None end
+          when _ then
+            if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
+          end
+          match key_slot
+          when Option::Some(ks) then
+            return Option::Some(mir_emit_map_insert_owned(b, recv_op, ks, k_glue, &v_ty, arg_exprs, span, call_node_id, &fc_name))
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      elsif recv_named == "Set" && rargs.len() >= 1 && arg_exprs.len() >= 1 then
+        let t_ty = rargs[0].clone()
+        match mir_try_glue_instance(b, &t_ty)
+        when Option::Some(t_glue) then
+          let item_slot = match arg_exprs[0].kind
+          when ExprKind::ExprAccess(inner) then
+            if expr_is_place_like(&inner) then Option::Some(lower_place(b, &inner)) else Option::None end
+          when _ then
+            if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
+          end
+          match item_slot
+          when Option::Some(_) then
+            return Option::Some(mir_emit_set_insert_owned(b, recv_op, t_glue, arg_exprs, span, call_node_id, &fc_name))
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+    elsif method_name == "clear" && arg_exprs.len() == 0 then
+      if recv_named == "Map" && rargs.len() >= 2 then
+        let k_ty = rargs[0].clone()
+        let v_ty = rargs[1].clone()
+        let k_glue = mir_try_glue_instance(b, &k_ty)
+        let v_glue = mir_try_glue_instance(b, &v_ty)
+        match k_glue
+        when Option::Some(_) then
+          return Option::Some(mir_emit_map_clear_owned(b, recv_op, &k_ty, &v_ty, k_glue, v_glue, span))
+        when Option::None then
+          match v_glue
+          when Option::Some(_) then
+            return Option::Some(mir_emit_map_clear_owned(b, recv_op, &k_ty, &v_ty, k_glue, v_glue, span))
+          when Option::None then ()
+          end
+        end
+      elsif recv_named == "Set" && rargs.len() >= 1 then
+        let t_ty = rargs[0].clone()
+        match mir_try_glue_instance(b, &t_ty)
+        when Option::Some(t_glue) then
+          return Option::Some(mir_emit_set_clear_owned(b, recv_op, &t_ty, t_glue, span))
+        when Option::None then ()
+        end
+      elsif (recv_named == "Array" || recv_named == "Vec") && rargs.len() >= 1 then
+        let elem_ty = rargs[0].clone()
+        match mir_try_glue_instance(b, &elem_ty)
+        when Option::Some(elem_glue) then
+          return Option::Some(mir_emit_array_clear_owned(b, recv_place, recv_op, elem_glue, span))
+        when Option::None then ()
+        end
+      end
+    end
+  when _ then ()
+  end
+  Option::None
+end
+
 def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[MirRvalue, String]
   
   # Use string-based dispatch via expr_kind_name() to avoid Stage0 Swift
@@ -7760,7 +8700,11 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
     
   elsif kind_name == "ExprStringLit" then
     match expr.kind
-    when ExprKind::ExprStringLit(s) then return Result::Ok(move_rvalue(operand_string(s)))
+    when ExprKind::ExprStringLit(s) then
+      # P0-STRING: the literal is the STATIC STRVIEW form (raw label);
+      # owned-String demand sites convert via string_from_static
+      # (lower_expr_rvalue_to_dest / lower_call_arg).
+      return Result::Ok(move_rvalue(operand_string(s)))
     when _ then ()
     end
     
@@ -7871,6 +8815,18 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
         when Type::Ptr(inner) then recv_type = inner
         when Type::PtrMut(inner) then recv_type = inner
         when _ then ()
+        end
+
+        # P0-OWN: the collection ownership operations (the stored-key /
+        # stored-element drops on remove, the sink-key teardown on insert,
+        # the ownership clears) lower HERE, at the concrete method-call
+        # site, replacing the plain wrapper call when the receiver's
+        # element types are concrete and own resources. The runtime never
+        # knows about ownership — every drop is this MIR.
+        match mir_try_collection_ownership_lowering(b, &normalized_method_name, &recv_place, &recv_type, &arg_exprs, span, expr.node_id)
+        when Option::Some(own_rv) then
+          return Result::Ok(own_rv)
+        when Option::None then ()
         end
 
       var recv_op = MirOperand { kind: MirOperandKind::MirCopy(recv_place) }
@@ -8055,7 +9011,9 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       mir_args.push(MirCallArg { effect: recv_effect, value: MirCallValue::Value(recv_op) })
       var arg_idx = 0
       while arg_idx < arg_exprs.len() do
-        mir_args.push(lower_call_arg(b, Option::None, arg_idx + 1, &arg_exprs[arg_idx], span, expr.node_id, arg_idx))
+        # P0-STRING: the resolved method name feeds the owned-String demand
+        # rule (by-value String params convert literal arguments).
+        mir_args.push(lower_call_arg(b, Option::None, Option::Some(resolved_method.clone()), arg_idx + 1, &arg_exprs[arg_idx], span, expr.node_id, arg_idx))
         arg_idx = arg_idx + 1
       end
 
@@ -8329,18 +9287,27 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       when Option::None then ()
       end
       
-      # Step 3: Build the closure function's parameter types
-      var param_types = Vec::new()
-      for p in params do
-        match p.ty
-        when Option::Some(ty) then param_types.push(resolve_lowering_type(b, &ty))
-        when Option::None then param_types.push(Type::Unit)
-        end
+      # Step 3: Build the closure function's parameter/return types — from
+      # the closure's TYPED tree record (the checker's resolved
+      # Type::Function — the typed table is the authority; TypeExpr is
+      # never interpreted after checking). A source closure without a typed
+      # record is an internal error (fail-closed).
+      var closure_fn_ty = Type::Unit
+      match b.typed_exprs.get(expr.node_id)
+      when Option::Some(cte) then closure_fn_ty = cte.ty.clone()
+      when Option::None then
+        b.errors.push("internal error: missing typed expression for closure node " + expr.node_id.to_string() + " during MIR lowering")
       end
-      
-      let ret_type = match ret_ty
-      when Option::Some(ty) then resolve_lowering_type(b, &ty)
-      when Option::None then Type::Unit
+      var param_types = Vec::new()
+      var ret_type = Type::Unit
+      match closure_fn_ty
+      when Type::Function(sig_params, sig_ret) then
+        for sp in sig_params do
+          param_types.push(sp.ty.clone())
+        end
+        ret_type = sig_ret.clone()
+      when _ then
+        b.errors.push("internal error: typed type of closure node " + expr.node_id.to_string() + " is not a function type during MIR lowering")
       end
       
       # Step 4: Record the closure body to be lowered as a separate MirFunction
@@ -8348,6 +9315,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       b.pending_closures.push(PendingClosure {
         name: closure_name.clone(),
         params: params.clone(),
+        param_types: param_types.clone(),
         captures: captures.clone(),
         capture_types: capture_types.clone(),
         capture_ids: capture_ids.clone(),
@@ -8461,7 +9429,10 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
     match expr.kind
     when ExprKind::ExprCast(inner, target_ty) then
       let inner_op = lower_expr(b, &inner, span)
-      let target = resolve_lowering_type(b, &target_ty)
+      # P0: the cast's TARGET type is the cast expression's typed-tree
+      # record (the checker's resolved cast result type — the typed table
+      # is the authority; TypeExpr is never interpreted after checking).
+      let target = mir_source_expr_ty(b, expr)
       # Use Transmute as the generic cast kind - specific casts would require type inference
       return Result::Ok(MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) })
     when _ then ()
@@ -8567,7 +9538,7 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
       # ("assign::<expr id>" — the checker records the same key).
       let place = lower_place(b, &target)
       let value_ty = mir_source_expr_ty(b, &value)
-      match lower_assign_drop_chain(b, "assign::" + expr.node_id.to_string(), span)
+      match lower_assign_drop_chain(b, expr.node_id, span)
       when Option::Some(cont) then
         switch_to_block(b, cont)
         match lower_expr_to_rvalue(b, &value, span)
@@ -8579,13 +9550,44 @@ def lower_expr_to_rvalue(b: &mut MirBuilder, expr: &Expr, span: Span) -> Result[
           b.errors.push(e)
         end
       when Option::None then
-        match lower_expr_to_rvalue(b, &value, span)
-        when Result::Ok(rvalue) then
-          push_assign(b, place, rvalue, span)
-          refine_assignment_target_type(b, &place, &value_ty)
-          refine_assignment_target_type_from_type(b, &place, &value_ty)
-        when Result::Err(e) then
-          b.errors.push(e)
+        # P0-OWN: the indexed-assignment old element (same as the
+        # statement form — the store overwrites data + index*stride, so an
+        # owning element type is dropped through its concrete glue first).
+        match mir_try_indexed_assign_drop(b, &target, &place)
+        when Option::Some(ig) then
+          let cont_blk = create_block(b)
+          let drop_blk = create_block(b)
+          match b.current_block
+          when Option::Some(cur_blk) then
+            switch_to_block(b, drop_blk)
+            set_terminator(b, MirTerminatorKind::MirDeinit {
+              place: place.clone(),
+              deinit_fn: ig,
+              target: cont_blk,
+              unwind: Option::None
+            }, span)
+            switch_to_block(b, cur_blk)
+            set_terminator(b, MirTerminatorKind::MirGoto(drop_blk), span)
+          when Option::None then ()
+          end
+          switch_to_block(b, cont_blk)
+          match lower_expr_to_rvalue(b, &value, span)
+          when Result::Ok(rvalue) then
+            push_assign(b, place, rvalue, span)
+            refine_assignment_target_type(b, &place, &value_ty)
+            refine_assignment_target_type_from_type(b, &place, &value_ty)
+          when Result::Err(e) then
+            b.errors.push(e)
+          end
+        when Option::None then
+          match lower_expr_to_rvalue(b, &value, span)
+          when Result::Ok(rvalue) then
+            push_assign(b, place, rvalue, span)
+            refine_assignment_target_type(b, &place, &value_ty)
+            refine_assignment_target_type_from_type(b, &place, &value_ty)
+          when Result::Err(e) then
+            b.errors.push(e)
+          end
         end
       end
       # The expression's VALUE is the newly stored value.
@@ -9383,9 +10385,13 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
 
     # Start a new function for the closure
     start_function(b, closure.name.clone(), closure.ret_type.clone(), closure_span)
-    # The closure's authoritative finalize plan is keyed by its node id
-    # (recorded by the resource checker as "closure::<node_id>").
+    # P0-CF: the closure's authoritative finalize set is the SEMANTIC
+    # closure_cleanup record keyed by the closure expression's NodeId (the
+    # "closure::<node_id>" String-key protocol deleted) — deinit_candidates
+    # looks it up through current_closure_node.
     b.current_fn_key = "closure::" + closure.node_id.to_string()
+    b.current_callable = Option::None
+    b.current_closure_node = Option::Some(NodeId { id: closure.node_id })
 
     # Add captured variables as implicit leading parameters with resolved types
     var cap_idx = 0
@@ -9406,12 +10412,17 @@ def lower_pending_closures(b: &mut MirBuilder, program: &mut MirProgram) -> Unit
       cap_idx = cap_idx + 1
     end
 
-    # Add explicit closure parameters
+    # Add explicit closure parameters — their types come from the pending
+    # closure's typed param_types record (the checker's resolved types
+    # split from the typed tree at the construction site; never TypeExpr).
+    # A count mismatch is an internal error (fail-closed).
     var closure_param_index = 0
     for p in closure.params do
-      let ty = match p.ty
-      when Option::Some(ty_expr) then resolve_lowering_type(b, &ty_expr)
-      when Option::None then Type::Unit
+      let ty = if closure_param_index < closure.param_types.len() then
+        closure.param_types[closure_param_index].clone()
+      else
+        b.errors.push("internal error: closure node " + closure.node_id.to_string() + " typed parameter count mismatch during MIR lowering")
+        Type::Unit
       end
       match p.pat.kind
       when PatternKind::Ident(name, _) then
@@ -12200,6 +13211,17 @@ def format_mir_type(names: &Map[Int, String], param_names: &Map[Int, String], ty
       first = false
     end
     out + ") -> " + format_mir_type(names, param_names, ret)
+  when Type::FnPtr(params, ret) then
+    var out2 = "fnptr("
+    var first2 = true
+    for p2 in params do
+      if !first2 then out2 = out2 + ", " end
+      out2 = out2 + format_mir_type(names, param_names, &p2.ty)
+      first2 = false
+    end
+    out2 + ") -> " + format_mir_type(names, param_names, ret)
+  when Type::Closure(cid, params, ret, captures) then
+    "closure<" + cid.node_id.to_string() + ">(" + format_mir_type(names, param_names, captures) + ") -> " + format_mir_type(names, param_names, ret)
   when Type::Adt(id, args) then
     let nname = match names.get(id.id)
     when Option::Some(n) then mir_bare_type_name(&n)
@@ -15625,10 +16647,20 @@ def verify_mir(mir: &MirProgram) -> Vec[String]
     type_index.insert(td.id.id, td.clone())
   end
   # The CONCRETE deinit plans (concrete type identity -> DeinitPlan, see
-  # mir_type_identity_key) carried on MirProgram: the ownership/copyability
-  # authority (P0-AN) — every Named type in concrete MIR must key a plan
-  # (by its concrete identity) or a MirTypeDef.
+  # mir_type_identity_key) carried on MirProgram: the DROP-GLUE authority
+  # (P0-AN) — every Named type in concrete MIR must key a plan (by its
+  # concrete identity) or a MirTypeDef. Copy legality is NOT derived from
+  # the plans: the verifier queries the engine snapshot below
+  # (type_properties_of on MirProgram.engine_env — the is_trivially_copyable
+  # axis, the COPY authority).
   var plans = mir.deinit_plans.clone()
+  # P0 (the needs_drop split): the engine snapshot env carried on the
+  # program — the Copy verifier's canonical TypeProperties queries
+  # (type_properties_of over the snapshot, memoized per concrete identity).
+  # The snapshot is taken by value once here and threaded as &mut through
+  # the per-function verification (its type_prop_cache warms across the
+  # whole program).
+  var engine_env = mir.engine_env.clone()
   # Function table for the callee-resolution invariant: every MirFnItem
   # callee must name a lowered function or a known intrinsic.
   var fn_names: Set[String] = Set::new()
@@ -15684,7 +16716,7 @@ def verify_mir(mir: &MirProgram) -> Vec[String]
   var func_idx = 0
   while func_idx < mir.functions.len() do
     let func = mir.functions[func_idx]
-    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &mut errors)
+    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &mut engine_env, &mut errors)
     func_idx = func_idx + 1
   end
   errors
@@ -16200,6 +17232,8 @@ def verifier_type_key(type_index: &Map[Int, MirTypeDef], ty: &Type) -> String
   when Type::FixedArray(elem, n) then
     "fixedarray(" + verifier_type_key(type_index, &elem) + ":" + n.to_string() + ")"
   when Type::Function(_, _) then "fn"
+  when Type::FnPtr(_, _) then "fnptr"
+  when Type::Closure(cid, _, _, _) then "closure<" + cid.node_id.to_string() + ">"
   when Type::RefInternal(inner, mutable) then
     if mutable then "&mut " + verifier_type_key(type_index, &inner) else "&" + verifier_type_key(type_index, &inner) end
   when Type::Ptr(inner) then "*" + verifier_type_key(type_index, &inner)
@@ -16643,9 +17677,16 @@ end
 def verifier_check_operand(type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
   match operand.kind
   when MirOperandKind::MirCopy(place) then
+    # P0-AN (the BITCOPY form): a MirCopy is a bitwise copy — its LEGALITY
+    # (the copy-permission sites — value operands, Read call args) is
+    # checked separately by verifier_check_operand_ownership against the
+    # engine's is_trivially_copyable axis.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     verifier_place_result_type(type_index, func, &place, ctx, errors)
   when MirOperandKind::MirMovePlace(place) then
+    # P0-AN (the TRANSFER form): MirMovePlace moves the value out of the
+    # source place — legal for ANY type (owning or not); the moved-tracking
+    # below enforces single use, so no copy-legality check applies.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     verifier_place_result_type(type_index, func, &place, ctx, errors)
     # A moved value transitions out of initialized into moved; moving a value
@@ -16657,9 +17698,11 @@ def verifier_check_operand(type_index: &Map[Int, MirTypeDef], func: &MirFunction
       moved.insert(base)
     end
   when MirOperandKind::MirRead(place) then
-    # A read borrows/copies through the place without transferring ownership:
-    # it must be defined, and it must not read a previously consumed local
-    # (P0-AN consumed-place tracking — reads of consumed locals are errors).
+    # P0-AN (the READ form): a read accesses the place WITHOUT transferring
+    # ownership and WITHOUT forming a bitcopy permission — the sharing
+    # semantics are the checker's safe-access model; the verifier enforces
+    # definiteness and consumed-place tracking (reads of consumed locals
+    # are errors), never copy legality.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     let rbase = place.local.id
     if moved.contains(&rbase) then
@@ -16667,14 +17710,16 @@ def verifier_check_operand(type_index: &Map[Int, MirTypeDef], func: &MirFunction
     end
     verifier_place_result_type(type_index, func, &place, ctx, errors)
   when MirOperandKind::MirConsume(place) then
-    # P0-AN: MirConsume sources cannot be previously consumed. MirConsume is
-    # the ownership-transfer form (closure Consume captures, sink glue): the
-    # source place transitions out of initialized into consumed, and any
-    # LATER use of the same local in this block (or in blocks reached through
-    # the may-moved dataflow below) is an error. Approximation: the tracking
-    # is per ROOT local (projections under a consumed local count as uses of
-    # the same place) and intra-block + may-moved-across-blocks; it is not a
-    # full path-sensitive analysis.
+    # P0-AN (the TRANSFER form): MirConsume transfers ownership exactly like
+    # MirMovePlace (closure Consume captures, sink glue) — legal for ANY
+    # type; the consumed-tracking below enforces single use, no copy-
+    # legality check applies. MirConsume sources cannot be previously
+    # consumed. The source place transitions out of initialized into
+    # consumed, and any LATER use of the same local in this block (or in
+    # blocks reached through the may-moved dataflow below) is an error.
+    # Approximation: the tracking is per ROOT local (projections under a
+    # consumed local count as uses of the same place) and intra-block +
+    # may-moved-across-blocks; it is not a full path-sensitive analysis.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     verifier_place_result_type(type_index, func, &place, ctx, errors)
     let cbase = place.local.id
@@ -16703,12 +17748,15 @@ def verifier_operand_carries_place(op: &MirOperand) -> Bool
   end
 end
 
-# Whether a deinit plan contains owning state that runs real cleanup
-# (registered finalizers, allocation releases) or that fails closed
-# (PlanLimit). Structural containers (Aggregate/Tuple/Enum/Option/Result/
-# Array/Set/Map) are owning exactly when a CHILD plan is owning — this is the
-# "containers with non-trivial elements" rule: Vec[Int] (Array(Trivial)) is
-# bitwise-copyable, Vec[File] (Array(Call)) is not.
+# Whether a deinit plan contains real cleanup (registered finalizers,
+# allocation releases) or fails closed (PlanLimit). Structural containers
+# (Aggregate/Tuple/Enum/Option/Result/Array/Set/Map) contain cleanup exactly
+# when a CHILD plan does — this is the plan-tree containment test for the
+# drop-GLUE axis (builder_local_is_resource's consumed-local tracking).
+# It is NOT a copy-legality rule: the Copy verifier queries the engine's
+# is_trivially_copyable instead (a Trivial plan says nothing about
+# bit-copy safety — String's plan is Trivial yet String is not
+# trivially copyable).
 def verifier_plan_contains_ownership(plan: &DeinitPlan) -> Bool
   match plan
   when DeinitPlan::Trivial then false
@@ -16748,73 +17796,62 @@ def verifier_plan_contains_ownership(plan: &DeinitPlan) -> Bool
   end
 end
 
-# P0-AN copyability authority: a type is OWNING (not trivially copyable) iff
-# its CONCRETE deinit plan says so — the plan tree is the engine's
-# needs_drop ownership shape (the checker's ownership predicates consume
-# the same engine answer in boolean form). Keyed on NON-TRIVIAL DEINIT
-# PLANS by the concrete (TypeId, substs) identity (mir_type_identity_key),
-# NOT on type names: Type::String's plan is Trivial (bitwise copies of
-# String occur in the compiler's own MIR and are permitted), Box/Rc and Adt
-# types whose plans run Call/UserFinalizer cleanup are owning, and
-# Wrapper[File] (concrete Aggregate with a Call child) owns while
-# Wrapper[Int] (Trivial children) does not — the TypeId-keyed nominal plan
-# cannot express the substitution. A type with NO concrete entry (a
-# generic-template shape) is DEFERRED: its ownership is decided by the
-# concrete drop glue after substitution, so the verifier answers not-owning
-# (mirroring the checker's Param deferral contract).
-def verifier_type_owns(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], ty: &Type) -> Bool
-  match ty
-  when Type::Adt(_, _) then
-    match plans.get(mir_type_identity_key(ty))
-    when Option::Some(plan) then verifier_plan_contains_ownership(plan)
-    when Option::None then false
-    end
-  when Type::Tuple(fields) then
-    var fi = 0
-    while fi < fields.len() do
-      if verifier_type_owns(plans, type_index, &fields[fi]) then return true end
-      fi = fi + 1
-    end
-    false
-  when Type::FixedArray(elem, _) then verifier_type_owns(plans, type_index, elem)
-  when Type::Effect(_, inner) then verifier_type_owns(plans, type_index, &inner)
-  when _ then false
-  end
+# P0-AN (THE COPY AUTHORITY): the Copy-legality rule is the ENGINE's
+# canonical is_trivially_copyable answer — type_properties_of over the MIR's
+# engine snapshot env (MirProgram.engine_env — the typed program's
+# serialized engine tables, the same snapshot deinit_plan_for_type queries),
+# on the CONCRETE (TypeId, substs) identity (the engine memoizes per
+# type_identity_key_resolved, so Wrapper[String] and Wrapper[Int] are
+# distinct entries). The DeinitPlan is NEVER consulted for copyability: a
+# type can require no physical destructor AND not be safely bit-copyable.
+# Type::String is the canonical case — its drop plan is Trivial (the arena
+# reclaims; requires_drop_glue=false) yet it owns a unique buffer and is
+# Clone, NOT Copy: is_trivially_copyable(String)=false, and a bitwise copy
+# of String (or a String-containing aggregate, or an aggregate containing
+# such fields recursively — the engine walks the substituted fields) is a
+# verifier error. Box/Rc, the heap containers, resources/capabilities and
+# registered-drop types are never trivially copyable either, per the same
+# engine answer. A DEFERRED type (is_deferred — an unsubstituted
+# Type::Param/Var in the graph) carries NO concrete answer: the verifier
+# answers copyable (mirroring the checker's Param deferral contract — the
+# concrete copy legality is decided by the engine after substitution, on
+# the monomorphized instance).
+def verifier_type_trivially_copyable(engine_env: &mut TypeEnv, ty: &Type) -> Bool
+  let props = type_properties_of(engine_env, ty)
+  if props.is_deferred then true else props.is_trivially_copyable end
 end
 
-# Reviewer item 99 — MirCopy only for Copy: the trivial-copyability test is
-# the DEINIT-PLAN semantics (is_trivially_copyable = the type's plan
-# contains no ownership — the negation of verifier_type_owns). The MirCopy
-# check below accepts a copy exactly when this holds.
-def verifier_type_trivially_copyable(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], ty: &Type) -> Bool
-  !verifier_type_owns(plans, type_index, ty)
-end
-
-# P0-AN: MirCopy of an OWNING type in a VALUE position is a verifier error.
-# Value positions are where a bitwise copy would alias owning state WITHOUT
-# transferring ownership: binary/unary/cast/repeat operands, switch/assert/
-# yield operands, and Read-effect call-argument values. EXEMPT (documented):
+# P0-AN: MirCopy of a non-trivially-copyable type in a VALUE position is a
+# verifier error. Value positions are where a bitwise copy would alias
+# owning state WITHOUT transferring ownership: binary/unary/cast/repeat
+# operands, switch/assert operands, and Read-effect call-argument values.
+# EXEMPT (documented):
 #   - MirMove(MirCopy(p)) — the lowering's MOVE representation (ownership
 #     transfer; the source is dead, and the moved-tracking below enforces
 #     single use). Exempting it is REQUIRED: the compiler's own MIR moves
-#     Vec/Box values through this form.
+#     Vec/Box/String values through this form.
 #   - MirCallArg values with Modify/Initialize/Consume effects — the ABI
 #     inout/sink forms (the compiler's own deinit glue passes owning
 #     containers as Modify + Value(MirCopy(place))).
-#   - MirAggregate operands — aggregate construction is the sanctioned
-#     ownership-transfer point for field/variant payloads.
+#   - MirAggregate operands — aggregate construction (array literals,
+#     struct/variant construction, closure captures) is the sanctioned
+#     ownership-transfer point: the operand's MirCopy form is the
+#     by-value temp/capture transfer (the source temp was move-initialized
+#     and the CHECKER consumed the semantic source — the frame-level
+#     consumption tracking is the duplication guard), so the copies inside
+#     an aggregate are transfers, never duplicate ownership.
 # This scope is the conservative approximation that keeps the verifier from
 # rejecting the compiler's own (valid) MIR while still flagging genuine
-# bitwise copies of owning values. The copy-acceptance test is
+# bitwise copies of non-copyable values. The copy-acceptance test is
 # verifier_type_trivially_copyable (reviewer item 99 — MirCopy only for
-# Copy).
-def verifier_check_operand_ownership(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, what: &String, ctx: &String, errors: &mut Vec[String]) -> Unit
+# Copy): the ENGINE's is_trivially_copyable axis — never the DeinitPlan.
+def verifier_check_operand_ownership(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, operand: &MirOperand, what: &String, ctx: &String, errors: &mut Vec[String]) -> Unit
   match operand.kind
   when MirOperandKind::MirCopy(place) then
     match verifier_place_result_type_opt(func, &place)
     when Option::Some(pty) then
-      if !verifier_type_trivially_copyable(plans, type_index, &pty) then
-        errors.push(ctx.clone() + ": MirCopy of owning type " + verifier_type_key(type_index, &pty) + " used as " + what.clone() + " (owning values must be moved, consumed, or passed by place, never bitwise-copied)")
+      if !verifier_type_trivially_copyable(engine_env, &pty) then
+        errors.push(ctx.clone() + ": MirCopy of non-trivially-copyable type " + verifier_type_key(type_index, &pty) + " used as " + what.clone() + " (a bitwise copy of an owning type — String, a String-containing aggregate, or an aggregate containing such fields recursively — must be moved, consumed, or passed by place, never bit-copied)")
       end
     when Option::None then ()
     end
@@ -16917,6 +17954,21 @@ def verifier_check_type_concreteness(plans: &Map[String, DeinitPlan], type_index
       pi = pi + 1
     end
     verifier_check_type_concreteness(plans, type_index, param_names, what, &ret, allow_param, errors)
+  when Type::FnPtr(params, ret) then
+    var pi2 = 0
+    while pi2 < params.len() do
+      verifier_check_type_concreteness(plans, type_index, param_names, what, &params[pi2].ty, allow_param, errors)
+      pi2 = pi2 + 1
+    end
+    verifier_check_type_concreteness(plans, type_index, param_names, what, &ret, allow_param, errors)
+  when Type::Closure(_, params, ret, captures) then
+    var pi3 = 0
+    while pi3 < params.len() do
+      verifier_check_type_concreteness(plans, type_index, param_names, what, &params[pi3].ty, allow_param, errors)
+      pi3 = pi3 + 1
+    end
+    verifier_check_type_concreteness(plans, type_index, param_names, what, &ret, allow_param, errors)
+    verifier_check_type_concreteness(plans, type_index, param_names, what, &captures, allow_param, errors)
   when Type::RefInternal(inner, _) then verifier_check_type_concreteness(plans, type_index, param_names, what, &inner, allow_param, errors)
   when Type::Ptr(inner) then verifier_check_type_concreteness(plans, type_index, param_names, what, &inner, allow_param, errors)
   when Type::PtrMut(inner) then verifier_check_type_concreteness(plans, type_index, param_names, what, &inner, allow_param, errors)
@@ -17131,6 +18183,11 @@ def verifier_is_intrinsic_name(name: &String) -> Bool
      name == "bool_to_string" || name == "char_to_string" || name == "str_to_string" ||
      name == "string_from_bytes" || name == "string_new" || name == "string_clone" ||
      name == "read_file_to_string_native" || name == "cstring_new" || name == "cstring_as_ptr" ||
+     # P0-STRING: the owned String-object intrinsics (the String ABI —
+     # string_* names dispatch to the String runtime, never the Array ABI)
+     name == "string_push" || name == "string_push_str" || name == "string_reserve" ||
+     name == "string_len" || name == "string_as_ptr" || name == "string_as_str" ||
+     name == "string_from_static" ||
      name == "as_ptr" || name == "as_mut_ptr" || name == "as_str" || name == "as_bytes" || name == "bytes" ||
      name == "is_some" || name == "is_none" || name == "is_ok" || name == "is_err" ||
      name == "unwrap" || name == "unwrap_or" ||
@@ -17259,14 +18316,29 @@ def verifier_check_fnitem_operand(operand: &MirOperand, fn_names: &Set[String], 
   end
 end
 
-def verifier_rvalue_type(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, rvalue: &MirRvalue, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
+def verifier_rvalue_type(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, rvalue: &MirRvalue, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Option[Type]
   match rvalue.kind
   when MirRvalueKind::MirMove(operand) then
+    # P0-AN (assignment lowering / return-by-value): MirMove is the
+    # ownership-TRANSFER form — the operand (MirCopy(p) — the lowering's
+    # move representation — or MirMovePlace/MirConsume) flows INTO fresh
+    # storage (a local, the return place, an aggregate slot) and the
+    # source is dead; the moved/consumed tracking enforces single use. No
+    # copy-legality check applies: a move of a non-trivially-copyable
+    # value (String, Vec[..], ...) is exactly the sanctioned transfer.
     verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
   when MirRvalueKind::MirRef(place) then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     Option::None
   when MirRvalueKind::MirAggregate(kind, operands) then
+    # P0-AN (aggregate construction — the MirArray literal / struct /
+    # variant / closure-env copies): aggregate operands are the sanctioned
+    # ownership-transfer point (EXEMPT from the copy-legality check, per
+    # the documented scope in verifier_check_operand_ownership): the
+    # MirCopy operand form here is the by-value temp/capture transfer (the
+    # operand temp was move-initialized; the CHECKER consumed the semantic
+    # source — frame-level consumption tracking is the duplication guard).
+    # MirMovePlace/MirConsume operands are explicit transfers.
     var ai = 0
     while ai < operands.len() do
       let _ = verifier_check_operand(type_index, func, &operands[ai], running, &mut moved, ctx, errors)
@@ -17288,10 +18360,11 @@ def verifier_rvalue_type(plans: &Map[String, DeinitPlan], type_index: &Map[Int, 
     let _ = verifier_check_operand(type_index, func, &rhs, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&lhs), "binary op operand", ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&rhs), "binary op operand", ctx, errors)
-    # P0-AN: value computation must never bitwise-copy an owning value.
+    # P0-AN: value computation must never bitwise-copy a non-trivially-
+    # copyable value (the engine's is_trivially_copyable axis).
     let binop_what = "binary op operand"
-    verifier_check_operand_ownership(plans, type_index, func, &lhs, &binop_what, ctx, errors)
-    verifier_check_operand_ownership(plans, type_index, func, &rhs, &binop_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &lhs, &binop_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &rhs, &binop_what, ctx, errors)
     match lty
     when Option::Some(t) then Option::Some(t)
     when Option::None then Option::None
@@ -17299,9 +18372,10 @@ def verifier_rvalue_type(plans: &Map[String, DeinitPlan], type_index: &Map[Int, 
   when MirRvalueKind::MirUnOp(_, operand) then
     verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&operand), "unary op operand", ctx, errors)
-    # P0-AN: value computation must never bitwise-copy an owning value.
+    # P0-AN: value computation must never bitwise-copy a non-trivially-
+    # copyable value (the engine's is_trivially_copyable axis).
     let unop_what = "unary op operand"
-    verifier_check_operand_ownership(plans, type_index, func, &operand, &unop_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &operand, &unop_what, ctx, errors)
   when MirRvalueKind::MirDiscriminant(place) then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     Option::Some(Type::Int)
@@ -17311,16 +18385,18 @@ def verifier_rvalue_type(plans: &Map[String, DeinitPlan], type_index: &Map[Int, 
   when MirRvalueKind::MirCast(_, operand, ty) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&operand), "cast operand", ctx, errors)
-    # P0-AN: value computation must never bitwise-copy an owning value.
+    # P0-AN: value computation must never bitwise-copy a non-trivially-
+    # copyable value (the engine's is_trivially_copyable axis).
     let cast_what = "cast operand"
-    verifier_check_operand_ownership(plans, type_index, func, &operand, &cast_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &operand, &cast_what, ctx, errors)
     Option::Some(ty)
   when MirRvalueKind::MirRepeat(operand, _) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&operand), "repeat operand", ctx, errors)
-    # P0-AN: value computation must never bitwise-copy an owning value.
+    # P0-AN: value computation must never bitwise-copy a non-trivially-
+    # copyable value (the engine's is_trivially_copyable axis).
     let repeat_what = "repeat operand"
-    verifier_check_operand_ownership(plans, type_index, func, &operand, &repeat_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &operand, &repeat_what, ctx, errors)
     Option::None
   when MirRvalueKind::MirPhi(entries) then
     var ei = 0
@@ -17513,7 +18589,7 @@ end
 # Call invariants
 # ———————————————————————————————————————————————————————————————
 
-def verifier_check_call(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+def verifier_check_call(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, dest: &Place, callee: &MirOperand, args: &Vec[MirCallArg], running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
   let callee_ty = verifier_check_operand(type_index, func, callee, running, &mut moved, ctx, errors)
   verifier_check_place(type_index, func, dest, running, ctx, errors)
   # P0-AN: the effect/operand-form agreement is checked on the RAW call args
@@ -17529,16 +18605,17 @@ def verifier_check_call(plans: &Map[String, DeinitPlan], type_index: &Map[Int, M
     when Option::Some(t) then arg_types.push(t)
     when Option::None then ()
     end
-    # P0-AN: a Read-effect argument passed as a bitwise copy of an owning
-    # value is a verifier error (the callee does not own the value; copying
-    # its bits would alias owning state). Modify/Initialize/Consume args are
-    # exempt: they are the ABI inout/sink forms the deinit glue itself uses.
+    # P0-AN: a Read-effect argument passed as a bitwise copy of a
+    # non-trivially-copyable value is a verifier error (the callee does not
+    # own the value; copying its bits would alias owning state).
+    # Modify/Initialize/Consume args are exempt: they are the ABI
+    # inout/sink forms the deinit glue itself uses.
     match args[ai].effect
     when AccessEffect::Read then
       match args[ai].value
       when MirCallValue::Value(op) then
         let arg_what = "call arg " + ai.to_string()
-        verifier_check_operand_ownership(plans, type_index, func, &op, &arg_what, ctx, errors)
+        verifier_check_operand_ownership(engine_env, type_index, func, &op, &arg_what, ctx, errors)
       when MirCallValue::Place(_) then ()
       end
     when _ then ()
@@ -17549,6 +18626,14 @@ def verifier_check_call(plans: &Map[String, DeinitPlan], type_index: &Map[Int, M
   when Option::Some(cty) then
     match cty
     when Type::Function(param_tys, ret_ty) then
+      if param_tys.len() != args.len() then
+        errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
+      end
+    when Type::FnPtr(param_tys, _) then
+      if param_tys.len() != args.len() then
+        errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
+      end
+    when Type::Closure(_, param_tys, _, _) then
       if param_tys.len() != args.len() then
         errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
       end
@@ -17587,7 +18672,7 @@ def verifier_check_call(plans: &Map[String, DeinitPlan], type_index: &Map[Int, M
   end
 end
 
-def verifier_check_terminator(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, term: &MirTerminator, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+def verifier_check_terminator(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, term: &MirTerminator, running: &Set[Int], moved: &mut Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     if !verifier_block_exists(func, target.id) then
@@ -17598,9 +18683,10 @@ def verifier_check_terminator(plans: &Map[String, DeinitPlan], type_index: &Map[
   when MirTerminatorKind::MirAbort then ()
   when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
     let _ = verifier_check_operand(type_index, func, &op, running, &mut moved, ctx, errors)
-    # P0-AN: switch discriminants are value computations — no owning copies.
+    # P0-AN: switch discriminants are value computations — no non-copyable
+    # copies.
     let switch_what = "switch discriminant"
-    verifier_check_operand_ownership(plans, type_index, func, &op, &switch_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &op, &switch_what, ctx, errors)
     var ti = 0
     while ti < targets.len() do
       if !verifier_block_exists(func, targets[ti].target.id) then
@@ -17612,7 +18698,7 @@ def verifier_check_terminator(plans: &Map[String, DeinitPlan], type_index: &Map[
       errors.push(ctx.clone() + ": switch fallback references invalid block bb" + default_target.id.to_string())
     end
   when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind } then
-    verifier_check_call(plans, type_index, func, &dest, &callee, &args, running, &mut moved, ctx, errors)
+    verifier_check_call(engine_env, type_index, func, &dest, &callee, &args, running, &mut moved, ctx, errors)
     if !verifier_block_exists(func, success.id) then
       errors.push(ctx.clone() + ": call success references invalid block bb" + success.id.to_string())
     end
@@ -17637,9 +18723,10 @@ def verifier_check_terminator(plans: &Map[String, DeinitPlan], type_index: &Map[
     end
   when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
     let _ = verifier_check_operand(type_index, func, &cond, running, &mut moved, ctx, errors)
-    # P0-AN: assert conditions are value computations — no owning copies.
+    # P0-AN: assert conditions are value computations — no non-copyable
+    # copies.
     let assert_what = "assert condition"
-    verifier_check_operand_ownership(plans, type_index, func, &cond, &assert_what, ctx, errors)
+    verifier_check_operand_ownership(engine_env, type_index, func, &cond, &assert_what, ctx, errors)
     if !verifier_block_exists(func, target.id) then
       errors.push(ctx.clone() + ": assert target references invalid block bb" + target.id.to_string())
     end
@@ -17702,7 +18789,7 @@ end
 # on entry to every block, then a per-block linear pass that checks uses of
 # possibly-uninitialized locals, projection typing, rvalue typing, and call
 # invariants in program order.
-def verifier_dataflow_init(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, errors: &mut Vec[String]) -> Unit
+def verifier_dataflow_init(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, errors: &mut Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   let entry_id = func.entry_block.id
 
@@ -17910,7 +18997,7 @@ def verifier_dataflow_init(plans: &Map[String, DeinitPlan], type_index: &Map[Int
     when Option::Some(s) then s.clone()
     when Option::None then Set::new()
     end
-    verifier_check_block_stmts(plans, type_index, func, b, &bin, &bmoved, &bb_ctx, errors)
+    verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &bb_ctx, errors)
     bi = bi + 1
   end
 end
@@ -18024,7 +19111,7 @@ def verifier_compute_moved_dataflow(func: &MirFunction, block_map: &Map[Int, Mir
   moved_in
 end
 
-def verifier_check_block_stmts(plans: &Map[String, DeinitPlan], type_index: &Map[Int, MirTypeDef], func: &MirFunction, block: &MirBlock, block_in: &Set[Int], moved_in: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
+def verifier_check_block_stmts(engine_env: &mut TypeEnv, type_index: &Map[Int, MirTypeDef], func: &MirFunction, block: &MirBlock, block_in: &Set[Int], moved_in: &Set[Int], ctx: &String, errors: &mut Vec[String]) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (StorageLive'd or parameters). These are
   # deliberately separate: storage existing does NOT imply a valid value.
@@ -18061,7 +19148,7 @@ def verifier_check_block_stmts(plans: &Map[String, DeinitPlan], type_index: &Map
       match verifier_local_type(func, pid)
       when Option::Some(dst_ty) then
         verifier_check_place(type_index, func, &place, &running, ctx, errors)
-        let rv_ty = verifier_rvalue_type(plans, type_index, func, &rvalue, &running, &mut moved, ctx, errors)
+        let rv_ty = verifier_rvalue_type(engine_env, type_index, func, &rvalue, &running, &mut moved, ctx, errors)
         match rv_ty
         when Option::Some(t) then
           if !verifier_types_compatible(type_index, &dst_ty, &t) then
@@ -18098,11 +19185,11 @@ def verifier_check_block_stmts(plans: &Map[String, DeinitPlan], type_index: &Map
     end
   end
 
-  verifier_check_terminator(plans, type_index, func, &block.terminator, &running, &mut moved, ctx, errors)
+  verifier_check_terminator(engine_env, type_index, func, &block.terminator, &running, &mut moved, ctx, errors)
 end
 
 # Top-level per-function verification driver.
-def verify_function_v2(type_index: &Map[Int, MirTypeDef], plans: &Map[String, DeinitPlan], fn_names: &Set[String], deinit_instances: &Set[Int], drop_glue_fns: &Map[Int, String], param_names: &Map[Int, String], func: &MirFunction, errors: &mut Vec[String]) -> Unit
+def verify_function_v2(type_index: &Map[Int, MirTypeDef], plans: &Map[String, DeinitPlan], fn_names: &Set[String], deinit_instances: &Set[Int], drop_glue_fns: &Map[Int, String], param_names: &Map[Int, String], func: &MirFunction, engine_env: &mut TypeEnv, errors: &mut Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
 
   # P1 (ABI classifications): the extern-ABI tag is part of the function's
@@ -18185,7 +19272,7 @@ def verify_function_v2(type_index: &Map[Int, MirTypeDef], plans: &Map[String, De
   # identity or a generated drop-glue function.
   verifier_check_callees(func, fn_names, deinit_instances, drop_glue_fns, &fn_ctx, errors)
 
-  verifier_dataflow_init(plans, type_index, func, errors)
+  verifier_dataflow_init(engine_env, type_index, func, errors)
 end
 
 # Whether a Type contains Type::Param anywhere (used to classify a function
@@ -18207,6 +19294,21 @@ def verifier_type_has_param(ty: &Type) -> Bool
       pi = pi + 1
     end
     verifier_type_has_param(&ret)
+  when Type::FnPtr(params, ret) then
+    var pi2 = 0
+    while pi2 < params.len() do
+      if verifier_type_has_param(&params[pi2].ty) then return true end
+      pi2 = pi2 + 1
+    end
+    verifier_type_has_param(&ret)
+  when Type::Closure(_, params, ret, captures) then
+    var pi3 = 0
+    while pi3 < params.len() do
+      if verifier_type_has_param(&params[pi3].ty) then return true end
+      pi3 = pi3 + 1
+    end
+    if verifier_type_has_param(&ret) then return true end
+    verifier_type_has_param(&captures)
   when Type::RefInternal(inner, _) then verifier_type_has_param(&inner)
   when Type::Ptr(inner) then verifier_type_has_param(&inner)
   when Type::PtrMut(inner) then verifier_type_has_param(&inner)

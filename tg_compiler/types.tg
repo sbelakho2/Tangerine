@@ -15,9 +15,14 @@ use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key, lookup_module_callable}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
-  CallableId, InstanceId, VariantId, LocalId, AccessRoot,
+  CallableId, InstanceId, VariantId, LocalId, AccessRoot, ClosureId, EffectId, EffectRegistry,
+  IntrinsicId,
   generic_param_table_new, generic_param_id_numeric, generic_param_id_eq,
-  fresh_synthetic_owner, intern_generic_param, generic_param_name_of
+  fresh_synthetic_owner, intern_generic_param, generic_param_name_of,
+  generic_param_name_from,
+  effect_registry_new, intern_module_effect, effect_id_of_name,
+  intrinsic_id_numeric,
+  SYNTHETIC_MODULE_ITEM_FALLBACK, SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK
 }
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
@@ -72,8 +77,33 @@ enum Type
   # Array[T] Adt.
   FixedArray(Type, Int)
   
-  # Function type
+  # Function type — P1 (FnPtr/Closure split): this legacy variant is the
+  # TRANSITIONAL conflation form. The semantic forms are the distinct
+  # FnPtr (a function pointer — no environment) and Closure (a closure
+  # value: ClosureId + signature + the capture tuple type) variants below;
+  # new construction sites use those. This variant is retained while the
+  # Batch-3 migration converts the remaining Type::Function constructions
+  # and matches (mir.tg's closure-call gating — callee_is_closure_value —
+  # and the fn-typed local sites, layout_engine's repr/size walks,
+  # access_check, lib, wasm_target) and then deletes it.
   Function(Vec[ParamType], Type)
+
+  # P1 (FnPtr/Closure split): a FUNCTION POINTER — the signature (the
+  # parameter list with access conventions, the return type) and NO
+  # environment. Layout: a single code pointer (fn_ptr_size). Bit-copyable,
+  # Transferable/Shareable per the decided pointer policy.
+  FnPtr(Vec[ParamType], Type)
+
+  # P1 (FnPtr/Closure split): a CLOSURE VALUE — the closure's identity
+  # (ClosureId), its signature (params + return), and the CAPTURE TUPLE
+  # type (Type::Tuple of the captured locals' types, in local-id order).
+  # The closure object's layout/ABI derives from the captures (the
+  # aggregate of the capture tuple plus the code pointer); the closure's
+  # TypeProperties (owns_state / requires_drop_glue / linearity) derive
+  # from the capture tuple — a closure capturing an owning value owns it.
+  # The closure dispatch through the MIR closure aggregate keys on this
+  # form (the checker types closure EXPRESSIONS as this variant).
+  Closure(ClosureId, Vec[ParamType], Type, Type)
   
   # Internal reference (MIR-only: parameter re-wrap and MirRef typing)
   RefInternal(Type, Bool)
@@ -109,6 +139,18 @@ end
 struct ParamType
   ty: Type
   convention: AccessConvention
+end
+
+# The typed signature record of a function/method/extern declaration — the
+# checker's resolved parameter types (ParamType — the base type plus the
+# convention; the MIR applies its own Ref/Inout RefInternal wrapping) and
+# the resolved return type. Recorded at the checker's signature-computation
+# sites (check_function, check_impl's signature pass, pass-3 externs) under
+# the fn owner key and serialized into TypedProgram.typed_fn_signatures; the
+# MIR reads declaration types from this table — never from TypeExpr again.
+struct FnSignature
+  params: Vec[ParamType]
+  ret_type: Type
 end
 
 # Plain type name of a TypeExpr, mirroring mir.tg's impl_type_name
@@ -632,6 +674,16 @@ struct TypeDef
   # live in the param-name table (diagnostics only).
   generic_params: Vec[GenericParamId]
   kind: TypeKind
+  # P1 (TypeId -> DefId at registration): the DEFINING DECLARATION's
+  # resolver DefId — the module_symbols DefKind::TypeName/Trait entry for
+  # this (module path, name) pair, recorded by store_type_def (the type
+  # registration). Option::None for builtin/compiler-synthesized types
+  # (they have no resolver declaration). The public ABI's
+  # type-to-declaration association is DIRECT through this identity — no
+  # name/order correlation. The checker also mirrors the association into
+  # ResolvedNames.type_def_ids (the serialized carrier the ABI consumer
+  # reads).
+  def: Option[DefId]
 end
 
 enum TypeDefKind
@@ -682,34 +734,62 @@ enum TypePropVisitState
   Resolved
 end
 
-# The per-type property bundle computed by type_properties_of:
-#   needs_drop          — a value of this type requires cleanup at scope end
+# The per-type property bundle computed by type_properties_of. The two
+# ownership axes are SPLIT (P0): a type can own state AND require no
+# physical destructor (String — owns_state=true, requires_drop_glue=false:
+# the arena reclaims), and a type can require no destructor yet still be
+# unsafe to bit-copy. Copy legality is a THIRD axis.
+#   owns_state          — the value carries semantic ownership: it must be
+#                         moved/consumed, never duplicated, and the
+#                         resource checker tracks it. TRUE for String
+#                         (owns a unique heap buffer — Clone, NOT Copy —
+#                         even with no per-value destructor), Vec/Map/Set/
+#                         Box/Rc, registered-drop types; FALSE for Int.
+#   requires_drop_glue  — the value needs a physical destructor (drop
+#                         glue): the buffer release (Vec/Map/Set/Box/Rc),
+#                         a registered Drop impl (File), a registered
+#                         deinit. FALSE for String and String-containing
+#                         aggregates — the arena reclaims, no per-value
+#                         Drop. The DeinitPlan (drop-glue shape) is gated
+#                         on THIS axis.
 #   is_linear           — move-only: must be consumed, never duplicated
 #   is_capability       — TypeKind::Capability (scoped, linear)
-#   is_trivially_copyable — raw bit-copy is valid, no retain/clone (P0-H)
+#   contains_capability — the value (or any substituted field/element/
+#                         payload) is or contains a capability: capability
+#                         containment through composites — an aggregate
+#                         with a capability field, a container with
+#                         capability elements, Option/Result containing
+#                         capabilities (the checker's capability-exit
+#                         machinery consumes this axis).
+#   is_trivially_copyable — raw bit-copy is valid, no retain/clone (P0-H —
+#                         THE copy authority; the MIR Copy verifier
+#                         queries THIS axis, never the DeinitPlan).
 #   is_deferred         — the type graph contains an unsubstituted generic
 #                         parameter (Type::Param) or an unresolved inference
-#                         variable (Type::Var): the four semantic fields are
+#                         variable (Type::Var): the six semantic fields are
 #                         NOT authoritative — "unknown/deferred", never a
 #                         concrete semantic answer. A generic local may
 #                         require CONDITIONAL drop after substitution, so a
 #                         consumer must check is_deferred FIRST: while
-#                         deferred, a false needs_drop/is_linear/
-#                         is_capability/is_trivially_copyable means "not
-#                         proven true", NOT "definitely false". The concrete
-#                         answers appear only after substitution (the
-#                         MIR/mono consumer wave substitutes the Param and
-#                         re-queries the engine on the concrete
-#                         instantiation). Container layers that decide a
-#                         property unconditionally (Vec[T]/Map[..]/Box[T]
-#                         needs_drop, Slice[T] bit-copyability, ...) keep
-#                         those fields concrete — the flag marks the
+#                         deferred, a false owns_state/requires_drop_glue/
+#                         is_linear/is_capability/contains_capability/
+#                         is_trivially_copyable means "not proven true",
+#                         NOT "definitely false". The concrete answers
+#                         appear only after substitution (the MIR/mono
+#                         consumer wave substitutes the Param and re-queries
+#                         the engine on the concrete instantiation).
+#                         Container layers that decide a property
+#                         unconditionally (Vec[T]/Map[..]/Box[T]
+#                         requires_drop_glue, Slice[T] bit-copyability, ...)
+#                         keep those fields concrete — the flag marks the
 #                         properties that depend on the unsubstituted
 #                         parameter (e.g. Vec[T].is_linear = T.is_linear).
 struct TypeProperties
-  needs_drop: Bool
+  owns_state: Bool
+  requires_drop_glue: Bool
   is_linear: Bool
   is_capability: Bool
+  contains_capability: Bool
   is_trivially_copyable: Bool
   is_deferred: Bool
 end
@@ -963,11 +1043,43 @@ struct TypeEnv
   # the MIR builder pairs with the renamed declaration's merged generic
   # list). The MIR reconstruction of Type::Param ids reads this record.
   generic_param_ids: Map[String, Vec[GenericParamId]]
+  # P0: fn owner key -> the checker's RESOLVED declaration signature (the
+  # parameter ParamTypes — base types plus conventions — and the resolved
+  # return type). Recorded at the checker's signature-computation sites
+  # (check_function under the item owner key, check_impl's signature pass
+  # under the method owner key, pass-3 extern functions under the
+  # module-qualified fn key) and serialized into
+  # TypedProgram.typed_fn_signatures. The MIR reads every declaration type
+  # from this table — TypeExpr is never interpreted after checking.
+  typed_fn_signatures: Map[String, FnSignature]
+  # P0: module-qualified key ("path::name" — module_qualified_key) -> the
+  # checker's resolved declared type of a static / const / extern-static
+  # declaration. Recorded in pass 3 (the same registration pass that binds
+  # the names) and serialized into TypedProgram.typed_static_types; the MIR
+  # reads the declared static/const types from this table.
+  typed_static_types: Map[String, Type]
   # Type-property engine (P0-I) memoization: canonical structural type key
   # (see type_identity_key_resolved — includes concrete generic args, so
   # Wrapper[Int] and Wrapper[File] are distinct entries) -> computed
   # properties. Populated lazily by type_properties_of.
   type_prop_cache: Map[String, TypeProperties]
+  # P1 (EffectId domain): the effect interning registry — the builtin
+  # effects registered with their FIXED ids at construction, user effects
+  # interned module-qualified at declaration/use. The canonical type
+  # identity renders the canonical ordered effect-ID set from this
+  # registry (type_identity_key_resolved's Effect arm); the public ABI
+  # renders effect NAMES (the registry's id -> name table) in the same
+  # canonical order.
+  effects: EffectRegistry
+  # P1 (IntrinsicId at check time): call expr node id -> the semantic
+  # IntrinsicId the checker attaches at call-recording time (the
+  # intrinsic calls — the resolver registered their __intrinsic_* DefIds
+  # with DefKind::Intrinsic, and the collection method calls classify
+  # through the same semantic router). Serialized into the resolutions
+  # snapshot (ResolvedNames.intrinsic_ids) at type_check_typed's tail —
+  # the typed program carries the classification per call for the
+  # MIR/codegen consumers.
+  typed_intrinsics: Map[Int, IntrinsicId]
 end
 
 # P0-TM (module-semantic trait identity): the TraitId domain — the semantic
@@ -1033,6 +1145,26 @@ struct TraitRef
   args: Vec[Type]
 end
 
+# P0-CA (authoritative impl trait arguments): the impl's DECLARED trait
+# reference — the trait's identity and its type arguments exactly as the
+# impl declaration states them (the `Iterator[(K, V)]` of `impl[K, V]
+# Iterator[(K, V)] for MapIterator[K, V]`). Captured ONCE from the AST at
+# registration (check_impl) into ImplInfo.trait_ref; the solver never
+# re-derives it. The args are the trait's type arguments in the impl's
+# generic scope, RESOLVED to their Type::Param forms in the impl's
+# DECLARATION ORDER — the parser's own derivation (the impl's generic
+# parameters come from the trait's type arguments in the `impl Iterator[T]
+# for Type` form; the leading-generics form declares the same parameters
+# explicitly). The solver instantiates these EXACT arguments with the
+# candidate's fresh variables (subst_type_args over ImplInfo.generic_params)
+# and unifies them against the obligation's args: an arity mismatch between
+# the impl's declaration and the obligation is a unification failure — the
+# head-only degradation is deleted.
+struct TraitRefTemplate
+  trait_id: TraitId
+  args: Vec[Type]
+end
+
 # A concrete obligation to be solved: the substituted subject
 # `trait_ref.self_ty` must implement the trait identified by
 # `trait_ref.trait_id` with the trait-level arguments `trait_ref.args`.
@@ -1054,12 +1186,20 @@ struct ImplInfo
   # P0-GPI: GenericParamIds (declaration order == id index); names are in
   # the param-name table (diagnostics only).
   generic_params: Vec[GenericParamId]
-  # P0-AL: method name -> the DefId the resolver registered for it under
-  # the impl's for_type key (e.g. "I[...]::map" for the extension impl's
-  # map). A call site cannot derive that key from the concrete receiver, so
-  # method_def_for falls back to this table after the receiver-based lookup
-  # misses.
-  method_defs: Map[String, DefId]
+  # P1: the method DefIds are NOT recorded per-impl anymore — the
+  # transitional bare-keyed method table is deleted; a call site
+  # resolves a method's DefId through the SEMANTIC registration
+  # (module_symbols' qualified "path::Type::method" entries — see
+  # method_def_for / qualified_method_def).
+  # P0-CA (authoritative impl trait arguments): the impl's DECLARED trait
+  # reference — the trait identity and its type arguments DIRECTLY from the
+  # AST's impl declaration (check_impl) — the EXCLUSIVE authority for
+  # candidate trait-argument matching. The solver instantiates these exact
+  # arguments with the candidate's substitution and unifies them against
+  # the obligation's args; it never approximates them from the impl's
+  # generic-parameter count, and a trait-arg arity mismatch with the
+  # obligation is a unification failure, never a head-only fallback.
+  trait_ref: TraitRefTemplate
 end
 
 struct MethodInfo
@@ -1169,7 +1309,10 @@ end
 # typed_field_targets / typed_access_effects), which remain the DERIVED
 # INDEXES over the tree for the consumers that have not migrated to the
 # tree (the MIR's flat fallbacks, the resource checker, the access
-# checker). Every TypedExpr carries the expression's node id, its RESOLVED
+# checker). TRANSITIONAL (Batch-3): the typed HIR is NOT yet the exclusive
+# lowering input — the MIR still reads the flat maps as its primary
+# fallback channel; the exclusive-input claim lands with the batch that
+# migrates the MIR's flat consumers to the tree (mir.tg). Every TypedExpr carries the expression's node id, its RESOLVED
 # type, and a kind built from the recorded semantic metadata — never
 # re-derived from the AST shape. The kinds carry their TYPED CHILDREN
 # (per-variant):
@@ -1720,7 +1863,7 @@ def closure_call_shape(env: &TypeEnv, callee: &Expr, args: &Vec[Expr], receiver_
   match env.typed_expr_types.get(callee.node_id)
   when Option::Some(callee_ty) then
     match callee_ty
-    when Type::Function(_, _) then typed_closure_call_for(env, args, receiver_node)
+    when Type::Function(_, _) | Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then typed_closure_call_for(env, args, receiver_node)
     when _ then Option::None
     end
   when Option::None then Option::None
@@ -2337,6 +2480,66 @@ end
 # semantics. One TypeId universe: type_kinds/type_names/type_fields/
 # type_variants/type_params/deinit_plans are keyed by the SAME semantic
 # TypeIds the type checker assigned.
+# ———————————————————————————————————————————————————————————————
+# P0-CF: the SEMANTIC CLEANUP TABLES — the finalize_plan replacement
+# ———————————————————————————————————————————————————————————————
+# The finalize_plan String protocols (the defer scope-key and
+# "defer_locals::<scope key>" scope registrations and the String owner-key
+# function-end plan) are DELETED: no cleanup semantics depend on parsing a
+# String prefix. Three semantic id-keyed tables replace them:
+#   by_callable       — CallableId -> FunctionCleanup: the function-end
+#                       finalize sets the MIR consumes (deinit_candidates);
+#                       drops are the Live Sink/OwnedLocal locals at the
+#                       function end, defers are the function body scope's
+#                       registered defers (registration order).
+#   closure_cleanup   — closure expr NodeId -> FunctionCleanup: the
+#                       closure-body finalize set ("closure::<node id>" key
+#                       protocol deleted).
+#   scope_defers      — ScopeId -> the scope's registered defer STMT ids
+#                       (DeferId), registration order (the defer-key
+#                       protocol).
+#   scope_defer_locals — ScopeId -> the defer bodies' OWN local ids
+#                       (LocalId), registration order — finalized exactly
+#                       when the deferred code RUNS (the
+#                       "defer_locals::<key>" protocol).
+#   expr_temps        — stmt node id -> discarded full-expression temporary
+#                       markers (the "expr::<stmt id>" protocol).
+#   assign_drops      — stmt/expr node id -> drop-before-store local ids
+#                       (the "assign::<stmt id>" / "assign::<expr id>"
+#                       protocols).
+struct ScopeId
+  id: Int
+end
+
+struct DeferId
+  id: Int
+end
+
+struct FunctionCleanup
+  defers: Vec[DeferId]
+  drops: Vec[LocalId]
+end
+
+struct FunctionCleanupTable
+  by_callable: Map[CallableId, FunctionCleanup]
+  closure_cleanup: Map[NodeId, FunctionCleanup]
+  scope_defers: Map[ScopeId, Vec[DeferId]]
+  scope_defer_locals: Map[ScopeId, Vec[LocalId]]
+  expr_temps: Map[Int, Vec[Int]]
+  assign_drops: Map[Int, Vec[Int]]
+end
+
+pub def function_cleanup_table_new() -> FunctionCleanupTable
+  FunctionCleanupTable {
+    by_callable: Map::new(),
+    closure_cleanup: Map::new(),
+    scope_defers: Map::new(),
+    scope_defer_locals: Map::new(),
+    expr_temps: Map::new(),
+    assign_drops: Map::new()
+  }
+end
+
 struct TypedProgram
   ast: Program
   resolutions: ResolvedNames
@@ -2361,7 +2564,9 @@ struct TypedProgram
   # effects, the field identity and the variant identity from the tree.
   # The flat maps above remain the DERIVED INDEXES over the tree for the
   # consumers that have not migrated to the tree (the MIR's flat
-  # fallbacks, the resource checker, the access checker).
+  # fallbacks, the resource checker, the access checker). TRANSITIONAL
+  # (Batch-3): the tree is not yet the exclusive lowering input — see the
+  # Typed HIR section note.
   typed_exprs: Map[Int, TypedExpr]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   local_bindings: Map[Int, LocalBinding]
@@ -2379,11 +2584,14 @@ struct TypedProgram
   # OWNED (transferred into the aggregate). Consumed by the resource checker
   # for uniform aggregate ownership transfer.
   aggregate_ownership: Map[Int, Vec[Bool]]
-  # Authoritative per-function finalize set: fn owner key -> local ids to
-  # finalize at function end (computed by the resource checker from its final
-  # per-function frames). MIR consumes this instead of re-deriving cleanup
-  # from declared locals.
-  finalize_plan: Map[String, Vec[Int]]
+  # Authoritative per-function finalize set: the SEMANTIC cleanup tables
+  # (P0-CF — CallableId -> FunctionCleanup per callable, the ScopeId-keyed
+  # defer registrations, the NodeId-keyed closure sets, the expr/assign
+  # statement-local plans) — computed by the resource checker from its
+  # final per-function frames. MIR consumes this instead of re-deriving
+  # cleanup from declared locals; no cleanup semantics depend on parsing a
+  # String prefix.
+  finalize_plan: FunctionCleanupTable
   # P0-C: per-edge cleanup obligations keyed by the STABLE SEMANTIC edge
   # identity "edge::<CfgEdgeKind>::<source node id>" (e.g. "edge::Return::42",
   # "edge::Backedge::7", "edge::Normal::12"). KEY SCHEME (deterministic,
@@ -2427,11 +2635,30 @@ struct TypedProgram
   # declaration). The engine snapshot (engine_snapshot_env, resource_check.tg)
   # reconstructs TypeDefKind from the serialized field/variant tables and
   # cannot see aliases (they land Opaque — the engine would answer
-  # needs_drop=false for an alias of an owning type, diverging from the
+  # owns_state=false for an alias of an owning type, diverging from the
   # checker's env, which walks the Alias inner). The MIR re-applies these
   # entries onto the snapshot env so both sides of the seam answer from the
   # same authority.
   type_aliases: Map[Int, Type]
+  # P0: fn owner key -> the checker's RESOLVED declaration signature (the
+  # parameter ParamTypes — base types plus conventions — and the resolved
+  # return type) of every function/method/extern declaration. Recorded at
+  # the checker's signature-computation sites and serialized here; the MIR
+  # reads every declaration type from this table — TypeExpr is never
+  # interpreted after checking (a missing entry is an ICE at the MIR read).
+  typed_fn_signatures: Map[String, FnSignature]
+  # P0: module-qualified key ("path::name" — module_qualified_key) -> the
+  # checker's resolved declared type of every static / const / extern-static
+  # declaration. The MIR reads the declared static/const types from this
+  # table (a missing entry is an ICE at the MIR read).
+  typed_static_types: Map[String, Type]
+  # P0: the canonical LangItems table — the checker's env.lang_items
+  # id-indexed snapshot (the builtin compound type ids and the well-known
+  # trait ids, built once at env initialization by build_lang_items). The
+  # MIR receives the builtin ids DIRECTLY from this table (the old
+  # name-inversion is deleted); the synthesized Adt constructions for the
+  # builtins read the snapshot fields.
+  lang_items: LangItems
   # P0-GPI: fn owner key -> the generic parameter ids of that function/
   # method in the MIR's merged declaration order (the MIR builder's
   # Type::Param reconstruction record) and the serialized param-name table
@@ -2516,7 +2743,11 @@ def type_env_new() -> TypeEnv
     access_marker_depth: 0,
     generic_param_table: generic_param_table_new(),
     generic_param_ids: Map::new(),
-    type_prop_cache: Map::new()
+    typed_fn_signatures: Map::new(),
+    typed_static_types: Map::new(),
+    type_prop_cache: Map::new(),
+    effects: effect_registry_new(),
+    typed_intrinsics: Map::new()
   }
   
   # P0-BG: documentation mirror of the std's concurrency exclusions —
@@ -2681,6 +2912,7 @@ def register_primitive(env: &mut TypeEnv, name: String) -> Unit
     def_kind: TypeDefKind::Primitive,
     generic_params: Vec::new(),
     kind: TypeKind::Value
+    def: Option::None
   }
   env.type_name_index.insert(name, env.type_list.len())
   env.type_id_index.insert(id_num, env.type_list.len())
@@ -2722,6 +2954,7 @@ def register_builtin_generic_named(env: &mut TypeEnv, name: String, gen_params: 
     def_kind: kind,
     generic_params: gen_params,
     kind: TypeKind::Value
+    def: Option::None
   }
   env.type_name_index.insert(name, env.type_list.len())
   env.type_id_index.insert(id_num, env.type_list.len())
@@ -2743,6 +2976,7 @@ def register_builtin_trait(env: &mut TypeEnv, sink name: String, sink methods: V
     def_kind: TypeDefKind::Trait(methods),
     generic_params: Vec::new(),
     kind: TypeKind::Value
+    def: Option::None
   }
   env.type_name_index.insert(name.clone(), env.type_list.len())
   env.type_id_index.insert(id_num, env.type_list.len())
@@ -2912,15 +3146,16 @@ end
 # substitutions), NOT to mutation of the nominal declaration's global
 # TypeKind (the legacy kind-propagation pass is deleted; TypeDef.kind is the
 # DECLARED kind only). A concrete type is resource-bearing for access
-# purposes when its instantiation requires destruction, is linear, or is a
-# capability. A type whose graph still contains an unsubstituted generic
-# parameter (is_deferred) is treated as resource-bearing — FAIL-CLOSED: a
-# generic local may require conditional drop after substitution, so an
-# unknown answer must never degrade to "not owning" (the concrete answer
-# appears after the MIR/mono substitution wave).
+# purposes when it owns state (owns_state — the RESOURCE-CHECKING axis:
+# String is owning even though it has no physical destructor), is linear,
+# or is a capability. A type whose graph still contains an unsubstituted
+# generic parameter (is_deferred) is treated as resource-bearing —
+# FAIL-CLOSED: a generic local may require conditional drop after
+# substitution, so an unknown answer must never degrade to "not owning"
+# (the concrete answer appears after the MIR/mono substitution wave).
 def type_has_resource_kind(env: &mut TypeEnv, ty: &Type) -> Bool
   let p = type_properties_of(env, ty)
-  p.is_deferred || p.needs_drop || p.is_linear || p.is_capability
+  p.is_deferred || p.owns_state || p.is_linear || p.is_capability
 end
 
 pub def type_kinds_contain_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bool
@@ -2941,6 +3176,9 @@ pub def type_kinds_contain_resource(kinds: &Map[Int, TypeKind], ty: &Type) -> Bo
     type_fields_contain_resource(kinds, &fields)
   when Type::FixedArray(elem, _) then type_kinds_contain_resource(kinds, &elem)
   when Type::Function(_, _) then false
+  when Type::FnPtr(_, _) then false
+  # P1: a closure's kind containment derives from its capture tuple.
+  when Type::Closure(_, _, _, captures) then type_kinds_contain_resource(kinds, &captures)
   when Type::RefInternal(inner, _) then type_kinds_contain_resource(kinds, &inner)
   when _ then false
   end
@@ -3422,7 +3660,35 @@ end
 # first-wins entry stays untouched. Same-module redefinition remains the
 # duplicate TypeError (the identical-acceptance applies ONLY within the
 # same module).
-def store_type_def(env: &mut TypeEnv, td: TypeDef, span: Span, module_path: &Vec[String]) -> Unit
+#
+# P1 (TypeId -> DefId at registration): the registration RECORDS the
+# declaration's resolver DefId — the module_symbols DefKind::TypeName /
+# DefKind::Trait entry for exactly this (module_path, name) pair — on the
+# TypeDef (TypeDef.def; the value is owned here and pushed into
+# env.type_list, so the fill lands with the record). The serialized
+# association (ResolvedNames.type_def_ids: TypeId.id -> DefId) is built
+# from the filled TypeDefs once at type_check_typed's tail (the snapshot
+# the MIR/ABI consumers read). The public ABI's type-to-declaration
+# association is DIRECT through that identity (no name/order correlation);
+# a type the resolver never registered (a builtin, a compiler-synthesized
+# type) carries Option::None / no entry.
+def store_type_def(env: &mut TypeEnv, mut td: TypeDef, span: Span, module_path: &Vec[String]) -> Unit
+  match env.resolutions
+  when Option::Some(res) then
+    let key = module_qualified_key(module_path, &td.name)
+    match res.module_symbols.get(&key)
+    when Option::Some(did) then
+      match def_kind_of(&res, &did)
+      when Option::Some(k) then
+        if k == DefKind::TypeName || k == DefKind::Trait then
+          td.def = Option::Some(did.clone())
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
   match get_type_by_name_ref(env, td.name.clone())
   when Option::Some(existing) then
     if type_def_is_forward_declaration(existing) then
@@ -3482,6 +3748,7 @@ def store_type_def(env: &mut TypeEnv, td: TypeDef, span: Span, module_path: &Vec
           def_kind: td.def_kind,
           generic_params: td.generic_params.clone(),
           kind: td.kind
+          def: td.def.clone()
         }
         let new_idx = env.type_list.len()
         env.type_id_index.insert(fresh_id.id, new_idx)
@@ -3826,7 +4093,12 @@ end
 # the parameters are GenericParamIds — the substitution matches by id
 # (generic_param_id_numeric), positionally aligned with the declaration
 # order of the callee's parameter list.
-def subst_type_args(ty: &Type, generic_params: &Vec[GenericParamId], type_args: &Vec[Type]) -> Type
+# P0-CK: this is THE substituted-field computation consumed by the layout
+# engine's concrete-key path — a generic definition's fields/variants are
+# substituted under the ConcreteTypeKey's args (def.generic_params <->
+# substs) BEFORE any offset/size is computed (see layout_engine.tg's
+# substituted_type_def / substitute_mir_fields / substitute_mir_variants).
+pub def subst_type_args(ty: &Type, generic_params: &Vec[GenericParamId], type_args: &Vec[Type]) -> Type
   match ty
   when Type::Param(gpid) then
     var i = 0
@@ -3866,6 +4138,24 @@ def subst_type_args(ty: &Type, generic_params: &Vec[GenericParamId], type_args: 
       i = i + 1
     end
     Type::Function(new_params, subst_type_args(ret, generic_params, type_args))
+  when Type::FnPtr(params, ret) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: subst_type_args(&pt.ty, generic_params, type_args), convention: pt.convention })
+      i = i + 1
+    end
+    Type::FnPtr(new_params, subst_type_args(ret, generic_params, type_args))
+  when Type::Closure(cid, params, ret, captures) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: subst_type_args(&pt.ty, generic_params, type_args), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Closure(cid.clone(), new_params, subst_type_args(ret, generic_params, type_args), subst_type_args(&captures, generic_params, type_args))
   when Type::Effect(_, inner) then Type::Effect(Vec::new(), subst_type_args(inner, generic_params, type_args))
   when _ then ty.clone()
   end
@@ -3900,6 +4190,24 @@ def resolve_type_var(env: &TypeEnv, ty: Type) -> Type
       i = i + 1
     end
     Type::Function(new_params, resolve_type_var(env, ret))
+  when Type::FnPtr(params, ret) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: resolve_type_var(env, pt.ty), convention: pt.convention })
+      i = i + 1
+    end
+    Type::FnPtr(new_params, resolve_type_var(env, ret))
+  when Type::Closure(cid, params, ret, captures) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: resolve_type_var(env, pt.ty), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Closure(cid.clone(), new_params, resolve_type_var(env, ret), resolve_type_var(env, captures))
   when Type::Adt(tid, args) then
     # P0-IT: the by-value array iterator is Copy-only and explicitly unsafe;
     # the projected for-loop is the primary collection iteration. Resolve
@@ -3974,6 +4282,8 @@ def type_tag(env: &TypeEnv, t: &Type) -> String
     end
   when Type::FixedArray(elem, n) then "FixedArray[" + type_tag(env, &elem) + ";" + n.to_string() + "]"
   when Type::Function(_, _) then "Function"
+  when Type::FnPtr(_, _) then "FnPtr"
+  when Type::Closure(_, _, _, _) then "Closure"
   when Type::RefInternal(_, _) then "RefInternal"
   when Type::Ptr(_) then "Ptr"
   when Type::PtrMut(_) then "PtrMut"
@@ -4128,6 +4438,77 @@ def ref_inner_type(ty: &Type) -> Type
   match ty
   when Type::RefInternal(inner, _) then inner
   when _ then ty.clone()
+  end
+end
+
+# The Named "Fn" form unified with a callable (the legacy Function form,
+# a FnPtr or a Closure — P1): the Fn type's args match the callable's
+# params + ret; the last type arg is the return type, so the parameter
+# arity is args.len() - 1, and it must match the callable's arity exactly.
+def unify_named_fn_callable(env: &mut TypeEnv, id1: &TypeId, args1: &Vec[Type], params2: &Vec[ParamType], ret2: &Type, span: Span) -> Bool
+  match get_type_by_id_ref(env, id1)
+  when Option::Some(td) then
+    if td.name == "Fn" then
+      if args1.len() == 0 then true
+      elsif args1.len() - 1 != params2.len() then
+        type_add_error(env, "function arity mismatch: cannot unify Fn type with " +
+          (args1.len() - 1).to_string() + " parameters and function type with " +
+          params2.len().to_string() + " parameters", span)
+        false
+      else
+        var ok = true
+        var i = 0
+        while i < params2.len() do
+          if !unify(env, args1[i], params2[i].ty, span) then
+            ok = false
+          end
+          i = i + 1
+        end
+        if ok then
+          let ret_idx = args1.len() - 1
+          unify(env, args1[ret_idx], ret2.clone(), span)
+        else
+          false
+        end
+      end
+    else
+      type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::Function(params2.clone(), Box::new(ret2.clone()))), span)
+      false
+    end
+  when Option::None then
+    type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::Function(params2.clone(), Box::new(ret2.clone()))), span)
+    false
+  end
+end
+
+# The callable-vs-callable unification — the SHARED signature comparison of
+# the legacy Function form, the FnPtr form and the Closure form (P1,
+# FnPtr/Closure split): the arity must match EXACTLY (a callable with a
+# different parameter count is a different type; callable types carry
+# ownership conventions per parameter, and higher-order calls bind
+# arguments positionally, so unifying only the common prefix would let a
+# fn(Int) -> Int unify with fn(Int, String) -> Int and produce unsound
+# callable substitution), every parameter's convention and type unify, and
+# the returns unify.
+def unify_callable_sigs(env: &mut TypeEnv, params1: &Vec[ParamType], ret1: &Type, params2: &Vec[ParamType], ret2: &Type, span: Span) -> Bool
+  if params1.len() != params2.len() then
+    type_add_error(env, "function arity mismatch: cannot unify " +
+      params1.len().to_string() + "-parameter and " +
+      params2.len().to_string() + "-parameter function types", span)
+    false
+  else
+    var ok = true
+    var i = 0
+    while i < params1.len() do
+      if !(params1[i].convention == params2[i].convention) then
+        ok = false
+      end
+      if !unify(env, params1[i].ty, params2[i].ty, span) then
+        ok = false
+      end
+      i = i + 1
+    end
+    if ok then unify(env, ret1.clone(), ret2.clone(), span) else false end
   end
 end
 
@@ -4443,74 +4824,55 @@ def unify(env: &mut TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           end
         # Handle Named(tid, args) unified with Function type.
         when Type::Function(params2, ret2) then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Fn" then
-              # Fn types in Named form have args matching the function params + ret.
-              # The last type arg is the return type, so the parameter arity is
-              # args1.len() - 1, and it must match the function type's arity
-              # exactly (see the Function-vs-Function arm above).
-              if args1.len() == 0 then true
-              elsif args1.len() - 1 != params2.len() then
-                type_add_error(env, "function arity mismatch: cannot unify Fn type with " +
-                  (args1.len() - 1).to_string() + " parameters and function type with " +
-                  params2.len().to_string() + " parameters", span)
-                false
-              else
-                var ok = true
-                var i = 0
-                while i < params2.len() do
-                  if !unify(env, args1[i], params2[i].ty, span) then
-                    ok = false
-                  end
-                  i = i + 1
-                end
-                if ok then
-                  let ret_idx = args1.len() - 1
-                  unify(env, args1[ret_idx], ret2, span)
-                else
-                  false
-                end
-              end
-            else
-              type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
-              false
-            end
-          when Option::None then
-            type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
-            false
-          end
+          unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
+        when Type::FnPtr(params2, ret2) then
+          unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
+        when Type::Closure(_, params2, ret2, _) then
+          unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
         when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
         end
       when Type::Function(params1, ret1) then
         match b
         when Type::Function(params2, ret2) then
-          # Arity must match EXACTLY: a callable with a different parameter
-          # count is a different type. Function types carry ownership
-          # conventions per parameter, and higher-order calls bind arguments
-          # positionally, so unifying only the common prefix would let a
-          # fn(Int) -> Int unify with fn(Int, String) -> Int and produce
-          # unsound callable substitution (too many / too few arguments
-          # silently accepted at the call site).
-          if params1.len() != params2.len() then
-            type_add_error(env, "function arity mismatch: cannot unify " +
-              params1.len().to_string() + "-parameter and " +
-              params2.len().to_string() + "-parameter function types", span)
-            false
-          else
-            var ok = true
-            var i = 0
-            while i < params1.len() do
-              if !(params1[i].convention == params2[i].convention) then
-                ok = false
-              end
-              if !unify(env, params1[i].ty, params2[i].ty, span) then
-                ok = false
-              end
-              i = i + 1
-            end
-            if ok then unify(env, ret1, ret2, span) else false end
-          end
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::FnPtr(params2, ret2) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::Closure(_, params2, ret2, _) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::Error then true
+        when Type::Param(_) then
+          type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+          false
+        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        end
+      when Type::FnPtr(params1, ret1) then
+        # P1 (FnPtr/Closure split): a function POINTER unifies with the
+        # callable signatures (a fn pointer, a closure value, or the
+        # legacy Function form) through the shared signature comparison.
+        match b
+        when Type::Function(params2, ret2) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::FnPtr(params2, ret2) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::Closure(_, params2, ret2, _) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::Error then true
+        when Type::Param(_) then
+          type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+          false
+        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        end
+      when Type::Closure(_, params1, ret1, _) then
+        # P1: a closure VALUE unifies with the callable signatures through
+        # the shared signature comparison (the closure's capture type does
+        # not participate in signature unification).
+        match b
+        when Type::Function(params2, ret2) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::FnPtr(params2, ret2) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
+        when Type::Closure(_, params2, ret2, _) then
+          unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
         when Type::Error then true
         when Type::Param(_) then
           type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
@@ -4713,6 +5075,33 @@ def occurs_check_with_depth(env: &mut TypeEnv, id: TypeVarId, ty: Type, depth: I
       found = occurs_check_with_depth(env, id, ret, depth + 1, span)
     end
     found
+  when Type::FnPtr(params, ret) then
+    var found = false
+    for p in params do
+      if occurs_check_with_depth(env, id, p.ty, depth + 1, span.clone()) then
+        found = true
+        break
+      end
+    end
+    if !found then
+      found = occurs_check_with_depth(env, id, ret, depth + 1, span)
+    end
+    found
+  when Type::Closure(_, params, ret, captures) then
+    var found = false
+    for p in params do
+      if occurs_check_with_depth(env, id, p.ty, depth + 1, span.clone()) then
+        found = true
+        break
+      end
+    end
+    if !found then
+      found = occurs_check_with_depth(env, id, ret, depth + 1, span.clone())
+    end
+    if !found then
+      found = occurs_check_with_depth(env, id, captures, depth + 1, span)
+    end
+    found
   when Type::RefInternal(inner, _) then occurs_check_with_depth(env, id, inner, depth + 1, span)
   when Type::Tuple(elems) then
     var found = false
@@ -4811,7 +5200,7 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
   end
   # Concrete ownership is NOT propagated into the nominal TypeKind: the
   # TypeProperties engine (type_properties_of, keyed by (TypeId,
-  # substitutions)) computes per-instantiation needs_drop/linearity on
+  # substitutions)) computes per-instantiation owns_state/linearity on
   # demand. TypeDef.kind remains the DECLARED kind (Resource/Capability
   # markers only).
 
@@ -4855,7 +5244,9 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
       when Option::None then Type::Unit
       end
       pop_scope(env)
-      let fn_ty = Type::Function(param_types, ret_ty)
+      # P1 (FnPtr/Closure split): a declared function VALUE is a function
+      # POINTER (no environment) — the FnPtr form.
+      let fn_ty = Type::FnPtr(param_types, ret_ty)
       bind_var(env, f.name.clone(), fn_ty.clone())
       record_module_callable(env, f.name.clone(), fn_ty, &owner_path, DefKind::Function)
     when ItemKind::ItemExternBlock(ext) then
@@ -4892,10 +5283,28 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
           when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
           when Option::None then Type::Unit
           end
+          # P0-SL (channel a): an extern declaration whose return type is
+          # (or contains) the Slice view would let the view escape across
+          # the FFI boundary — rejected at the signature registration.
+          check_no_escaping_slice(env, &ret_ty, ef.span, "returned from an extern function")
           pop_scope(env)
-          let ext_fn_ty = Type::Function(param_types, ret_ty)
+          # P0: record the extern declaration's typed signature under the
+          # module-qualified fn key (module_qualified_fn_key — the SAME key
+          # the MIR's pre-pass derives for extern functions: extern blocks
+          # record no item_defs, so the DefId render is unreachable and both
+          # sides use this name fallback). Externs are signature-only (never
+          # pass-4 checked), so this pass-3 record is their only entry.
+          env.typed_fn_signatures.insert(module_qualified_fn_key(&owner_path, ef.name.clone()),
+            FnSignature { params: param_types.clone(), ret_type: ret_ty.clone() })
+          let ext_fn_ty = Type::FnPtr(param_types, ret_ty)
           bind_var(env, ef.name.clone(), ext_fn_ty.clone())
           record_module_callable(env, ef.name.clone(), ext_fn_ty, &owner_path, DefKind::Function)
+        when ExternItem::Static(es) then
+          # P0: record the extern static's resolved declared type under the
+          # module-qualified key (the SAME key the MIR's pre-pass derives for
+          # extern statics) — extern statics are signature-only, so this
+          # pass-3 record is their only typed entry.
+          env.typed_static_types.insert(module_qualified_key(&owner_path, &es.name), resolve_type_expr(env, &es.ty))
         when _ then ()
         end
         j = j + 1
@@ -4907,12 +5316,19 @@ def type_check_program_env(env: &mut TypeEnv, program: &Program) -> Unit
       when Option::None then fresh_type_var(env)
       end
       bind_var(env, c.name.clone(), const_ty.clone())
-      record_module_callable(env, c.name.clone(), const_ty, &owner_path, DefKind::Constant)
+      record_module_callable(env, c.name.clone(), const_ty.clone(), &owner_path, DefKind::Constant)
+      # P0: record the const's declared type under the module-qualified key
+      # (the same key the MIR's pre-pass derives); the pass-4 unification
+      # chases any inference variable at serialization.
+      env.typed_static_types.insert(module_qualified_key(&owner_path, &c.name), const_ty)
     when ItemKind::ItemStatic(s) then
       # Register static (and mut) variable names so they can be looked up by ExprIdent
       let static_ty = resolve_type_expr(env, &s.ty)
       bind_var(env, s.name.clone(), static_ty.clone())
-      record_module_callable(env, s.name.clone(), static_ty, &owner_path, DefKind::Static)
+      record_module_callable(env, s.name.clone(), static_ty.clone(), &owner_path, DefKind::Static)
+      # P0: record the static's declared type under the module-qualified key
+      # (the same key the MIR's pre-pass derives).
+      env.typed_static_types.insert(module_qualified_key(&owner_path, &s.name), static_ty)
     when _ then ()
     end
     i = i + 1
@@ -4949,6 +5365,7 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[Str
         def_kind: TypeDefKind::Struct(Vec::new()),
         generic_params: Vec::new(),
         kind: TypeKind::Value
+        def: Option::None
       }
       env.type_name_index.insert(s.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
@@ -4973,6 +5390,7 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[Str
         def_kind: TypeDefKind::Enum(Vec::new()),
         generic_params: Vec::new(),
         kind: TypeKind::Value
+        def: Option::None
       }
       env.type_name_index.insert(e.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
@@ -4990,6 +5408,7 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[Str
         def_kind: TypeDefKind::Trait(Vec::new()),
         generic_params: Vec::new(),
         kind: TypeKind::Value
+        def: Option::None
       }
       env.type_name_index.insert(t.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
@@ -5017,6 +5436,7 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[Str
         def_kind: TypeDefKind::Alias(Type::Unit),
         generic_params: Vec::new(),
         kind: TypeKind::Value
+        def: Option::None
       }
       env.type_name_index.insert(a.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
@@ -5032,11 +5452,21 @@ def pre_register_type_name(env: &mut TypeEnv, item: &Item, module_path: &Vec[Str
         def_kind: TypeDefKind::Opaque,
         generic_params: Vec::new(),
         kind: TypeKind::Capability
+        def: Option::None
       }
       env.type_name_index.insert(c.name.clone(), env.type_list.len())
       env.type_id_index.insert(id.id, env.type_list.len())
       env.type_list.push(td)
     end
+  when ItemKind::ItemEffectDecl(e) then
+    # P1 (EffectId domain): an `effect Name` DECLARATION interns the
+    # declared effect under the current module's qualified key ("path::name"
+    # — the root module's effects under the bare name), so the effect has
+    # a semantic EffectId (module-qualified user effects never collide
+    # across modules) and the canonical type identity renders the
+    # canonical ordered effect-ID set. A builtin name resolves to its
+    # fixed id.
+    let _ = intern_module_effect(&mut env.effects, &env.current_module_path, &e.name)
   when _ then ()
   end
 end
@@ -5068,7 +5498,12 @@ def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl, module_path: &Vec[Str
     var ftypes = Vec::new()
     var j = 0
     while j < e.variants[i].fields.len() do
-      ftypes.push(resolve_type_expr(env, &e.variants[i].fields[j]))
+      let vfield_ty = resolve_type_expr(env, &e.variants[i].fields[j])
+      # P0-SL (channel b): an enum variant field whose type is (or
+      # contains) the Slice view is longer-lived state holding a view —
+      # rejected.
+      check_no_escaping_slice(env, &vfield_ty, e.variants[i].fields[j].span, "stored in an enum variant field")
+      ftypes.push(vfield_ty)
       j = j + 1
     end
     variants.push(VariantInfo { name: e.variants[i].name, fields: ftypes, discriminant: disc })
@@ -5095,6 +5530,7 @@ def collect_enum_type_def(env: &mut TypeEnv, e: &EnumDecl, module_path: &Vec[Str
     def_kind: TypeDefKind::Enum(variants),
     generic_params: gen_params,
     kind: TypeKind::Value
+    def: Option::None
   }
   store_type_def(env, td, e.span, module_path)
 end
@@ -5133,6 +5569,9 @@ def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) 
       # Indexed access avoids stage0 codegen bug where copying a FieldDecl
       # out of the Vec produces a corrupted TypeExpr payload.
       let ty = resolve_type_expr(env, &s.fields[i].ty)
+      # P0-SL (channel b): a struct field whose type is (or contains) the
+      # Slice view is longer-lived state holding a view — rejected.
+      check_no_escaping_slice(env, &ty, s.fields[i].span, "stored in a struct field")
       fields.push(FieldInfo { name: s.fields[i].name, ty: ty, is_public: true })
       i = i + 1
     end
@@ -5161,6 +5600,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) 
       def_kind: TypeDefKind::Struct(fields),
       generic_params: gen_params,
       kind: struct_kind
+      def: Option::None
     }
     store_type_def(env, td, s.span, module_path)
   when ItemKind::ItemEnum(e) then
@@ -5232,6 +5672,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) 
       def_kind: TypeDefKind::Trait(methods),
       generic_params: gen_params,
       kind: TypeKind::Value
+      def: Option::None
     }
     store_type_def(env, td, t.span, module_path)
     # P0-TM (module-semantic trait identity): the trait's TraitId is its
@@ -5290,6 +5731,7 @@ def collect_type_def(env: &mut TypeEnv, item: &Item, module_path: &Vec[String]) 
       def_kind: TypeDefKind::Alias(aliased_type),
       generic_params: gen_params,
       kind: TypeKind::Value
+      def: Option::None
     }
     store_type_def(env, td, ta.span, module_path)
   when _ then ()
@@ -5379,6 +5821,9 @@ def check_item(env: &mut TypeEnv, program: &Program, item: &Item, item_idx: Int)
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
     when Option::None then fresh_type_var(env)
     end
+    # P0-SL (channel b): a const whose type is (or contains) the Slice
+    # view is program-lifetime state holding a view — rejected.
+    check_no_escaping_slice(env, &const_ty, c.span, "stored in a const")
     let value_ty = check_expr(env, &c.value)
     unify(env, value_ty, const_ty, c.span)
     pop_scope(env)
@@ -5387,6 +5832,9 @@ def check_item(env: &mut TypeEnv, program: &Program, item: &Item, item_idx: Int)
     env.check_ctx = "static:" + s.name
     push_scope(env)
     let static_ty = resolve_type_expr(env, &s.ty)
+    # P0-SL (channel b): a static whose type is (or contains) the Slice
+    # view is program-lifetime state holding a view — rejected.
+    check_no_escaping_slice(env, &static_ty, s.span, "stored in a static")
     let value_ty = check_expr(env, &s.value)
     unify(env, value_ty, static_ty, s.span)
     pop_scope(env)
@@ -5406,7 +5854,7 @@ end
 #     (item_owner_def — def_id_of_item, or the deterministic module -2
 #     fallback);
 #   - impl-level and method-level parameters (check_impl): impls under a
-#     fresh synthetic owner; methods under their resolver method_defs DefId
+#     fresh synthetic owner; methods under their resolver registered method DefId
 #     (or the deterministic module -3 fallback, impl_method_owner_def).
 # The body-checking passes RECONSTRUCT the same ids from the owner DefId +
 # declaration index (generic_param_id_at) and never re-intern.
@@ -5421,9 +5869,9 @@ def item_owner_def(env: &TypeEnv, item_idx: Int) -> DefId
   when Option::Some(res) then
     match def_id_of_item(res, item_idx)
     when Option::Some(did) then did
-    when Option::None then DefId { module: ModuleId { id: -2 }, index: item_idx as UInt }
+    when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_ITEM_FALLBACK }, index: item_idx as UInt }
     end
-  when Option::None then DefId { module: ModuleId { id: -2 }, index: item_idx as UInt }
+  when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_ITEM_FALLBACK }, index: item_idx as UInt }
   end
 end
 
@@ -5459,8 +5907,10 @@ def type_decl_owner_def(env: &mut TypeEnv, name: &String, module_path: &Vec[Stri
 end
 
 # The owner DefId of an impl method's generic parameters: the resolver's
-# method_defs entry under the impl's for_type key ("Type::method") when
-# recorded; else the deterministic synthetic fallback (module id -3:
+# module_symbols entry under the impl's for_type key, MODULE-QUALIFIED
+# ("path::Type::method" — the impl's owner path, env.current_module_path
+# at check_impl time) when recorded; else the deterministic synthetic
+# fallback (the SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK band, module id -3:
 # impl index in the high bits + method index) — computed identically in
 # the signature pass and the body pass of check_impl, so the interning
 # and the id reconstruction agree.
@@ -5468,11 +5918,21 @@ def impl_method_owner_def(env: &TypeEnv, for_type: &TypeExpr, method: &FunctionD
   match env.resolutions
   when Option::Some(res) then
     let mkey = impl_registry_method_key(for_type, &method.name)
-    match res.method_defs.get(mkey)
-    when Option::Some(did) then did
-    when Option::None then DefId { module: ModuleId { id: -3 }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+    let qkey = module_qualified_key(&env.current_module_path, &mkey)
+    match res.module_symbols.get(&qkey)
+    when Option::Some(did) then
+      match def_kind_of(&res, &did)
+      when Option::Some(k) then
+        if k == DefKind::Method then
+          did
+        else
+          DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+        end
+      when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+      end
+    when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
     end
-  when Option::None then DefId { module: ModuleId { id: -3 }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+  when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
   end
 end
 
@@ -5665,6 +6125,89 @@ def record_where_predicate_bounds(env: &mut TypeEnv, where_clause: &Vec[WherePre
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# P0-SL: SLICE SAFETY — the access-scoped / non-escapable view enforcement
+# ———————————————————————————————————————————————————————————————
+# Slice[T] is the compiler-scoped VIEW { ptr: Ptr[T], len: UInt } (std
+# ownership contract — std/collections.tg): a safe Slice must NOT outlive
+# its backing buffer. Tangerine avoids lifetime parameters — the
+# enforcement makes safe Slice VALUES access-scoped / non-escapable at the
+# four escape channels:
+#   (a) RETURN   — a Slice-typed value must not be returned from a
+#                  function: the declared return type is checked at every
+#                  callable declaration (free functions, impl/struct
+#                  methods, extern functions, closure annotations);
+#   (b) STORE    — a Slice must not be stored into longer-lived state:
+#                  struct fields, enum variant fields, statics, consts,
+#                  and the aggregate literals (array/tuple elements) that
+#                  would hold the view;
+#   (c) CAPTURE  — a Slice must not be captured into an escaping closure:
+#                  the closure capture record is checked at the capture
+#                  site;
+#   (d) MUTATION — a Slice-typed local's backing (the owner place the
+#                  slice was derived from) cannot be mutated/reallocated
+#                  while the view local is live: enforced in the resource
+#                  checker (P0-SL there) via the IterationPlan mutation
+#                  machinery (plan_stmt_mutates_place) over the live-view
+#                  registry.
+# The std's Slice APIs keep working: the view-producing forms
+# (chars/bytes/split/iter/... — builtin method results) and the view
+# PARAMETERS are access-scoped (the view lives only for the enclosing
+# expression/call); the slice-view results that MUST escape are routed
+# through the OWNED forms in the kernel (std's as_bytes/bytes/split
+# declare the owned Vec results; as_str_view results stay call-scoped
+# arguments; for-loop iterables are consumed by the loop).
+# The containment walk is the single type_contains_slice_view predicate —
+# the Slice BUILTIN (LangItems id) in any stored position (Adt arguments,
+# tuples, fixed arrays, references, effects). Type::Param / Type::Var fail
+# OPEN (false): a generic instantiation is checked at the concrete use
+# sites.
+pub def is_slice_view_type_of(env: &TypeEnv, ty: &Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then tid.id == env.lang_items.slice
+  when _ then false
+  end
+end
+
+def type_contains_slice_view(env: &TypeEnv, ty: &Type) -> Bool
+  match ty
+  when Type::Adt(tid, args) then
+    if tid.id == env.lang_items.slice then
+      true
+    else
+      var found = false
+      var ai = 0
+      while ai < args.len() do
+        if type_contains_slice_view(env, &args[ai]) then found = true end
+        ai = ai + 1
+      end
+      found
+    end
+  when Type::FixedArray(elem, _) then type_contains_slice_view(env, elem)
+  when Type::Tuple(elems) then
+    var found = false
+    var ei = 0
+    while ei < elems.len() do
+      if type_contains_slice_view(env, &elems[ei]) then found = true end
+      ei = ei + 1
+    end
+    found
+  when Type::RefInternal(inner, _) then type_contains_slice_view(env, inner)
+  when Type::Effect(_, inner) then type_contains_slice_view(env, inner)
+  when _ then false
+  end
+end
+
+# P0-SL: reject a type that holds a Slice view in stored / longer-lived
+# state at the channel's declaration site. `what` renders the channel in
+# the diagnostic ("returned from a function", "stored in a struct field",
+# ...).
+def check_no_escaping_slice(env: &mut TypeEnv, ty: &Type, span: Span, what: String) -> Unit
+  if type_contains_slice_view(env, ty) then
+    type_add_error(env, "safe Slice cannot be " + what + ": the view borrows its backing buffer and must not outlive it (convert to the owned form: Vec/Array/String)", span)
+  end
+end
+
 def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String, f_owner: &DefId) -> Unit
   push_scope(env)
   env.check_ctx = "fn:" + f.name
@@ -5698,6 +6241,7 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String, f_own
   # map. This keeps parameter keys in a domain that can never collide with
   # pattern node ids (see the TypeEnv field comment).
   var param_local_ids = Vec::new()
+  var fn_param_types = Vec::new()
   var i = 0
   while i < f.params.len() do
     let p = f.params[i]
@@ -5707,6 +6251,7 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String, f_own
     end
     bind_var(env, p.name, ty)
     param_local_ids.push(env.local_id_counter - 1)
+    fn_param_types.push(ParamType { ty: ty, convention: p.convention })
     i = i + 1
   end
   env.param_binding_resolutions.insert(owner_key, param_local_ids)
@@ -5721,6 +6266,16 @@ def check_function(env: &mut TypeEnv, f: &FunctionDecl, owner_key: String, f_own
   when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
   when Option::None then Type::Unit
   end
+  # P0-SL (channel a): a safe Slice must not be RETURNED from a function —
+  # the declared return type is rejected when it is (or contains) the
+  # Slice view.
+  check_no_escaping_slice(env, &ret_type, f.span, "returned from a function")
+  # P0: record the function's typed signature under the SAME owner key (the
+  # MIR reads the declaration's parameter/return types from this record —
+  # the typed table is the authority; TypeExpr is never interpreted after
+  # checking). A pass-4 body-check unification chases any inference
+  # variable at serialization (type_check_typed).
+  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone() })
   
   # P0-M: every `return expr` in the body unifies immediately with the
   # declared return type (unconditional — not dependent on the last
@@ -5784,9 +6339,48 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
   # (TraitId(-1) for inherent impls — no registered trait under the name).
   let trait_id = trait_id_for(env, &trait_name)
 
+  # P0-CA (authoritative impl trait arguments): the impl's DECLARED trait
+  # reference — the trait's identity and its type arguments DIRECTLY from
+  # the AST's impl declaration — is captured ONCE here into
+  # ImplInfo.trait_ref and never re-derived at solve time. The identity is
+  # the declaration-derived TraitId (trait_id_for). The arguments are the
+  # trait's type arguments in the impl's generic scope, resolved to their
+  # Type::Param forms in DECLARATION ORDER — the parser's own derivation
+  # (the impl's generic parameters come from the trait's type arguments in
+  # the `impl Iterator[T] for Type` form; the leading-generics form
+  # declares the same parameters explicitly). The solver instantiates these
+  # exact arguments with the candidate's fresh variables and unifies them
+  # against the obligation's args — the impl trait arguments are the
+  # authority, never an approximation from the generic-parameter count.
+  var imp_trait_args = Vec::new()
+  if trait_id.id != -1 then
+    # P0-CA: the AST's trait type arguments are the authority — resolve them
+    # in the impl's generic scope (the exact declared reference, e.g. the
+    # (K, V) tuple of `impl[K, V] Iterator[(K, V)] for MapIterator[K, V]`).
+    # The empty-vector fallback is the declaration-order derivation (an
+    # inherent impl, or a declaration whose arguments were not parsed).
+    if i.trait_type_args.len() > 0 then
+      var ta_expr = 0
+      while ta_expr < i.trait_type_args.len() do
+        imp_trait_args.push(resolve_type_expr(env, &i.trait_type_args[ta_expr]))
+        ta_expr = ta_expr + 1
+      end
+    else
+      var ta_idx = 0
+      while ta_idx < impl_param_ids.len() do
+        imp_trait_args.push(Type::Param(impl_param_ids[ta_idx].clone()))
+        ta_idx = ta_idx + 1
+      end
+    end
+  end
+
   # FIRST PASS: Resolve all method signatures and register in env.impls
   # This is done before checking bodies so methods can call each other
   var impl_methods = Vec::new()
+  # P0: the typed signature records collected per method in this pass,
+  # recorded into env.typed_fn_signatures in the second pass under each
+  # method's owner key.
+  var impl_sig_records = Vec::new()
   var method_index = 0
   while method_index < i.methods.len() do
     let m = i.methods[method_index]
@@ -5796,7 +6390,7 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     # (impl-level params are already visible from the outer scope).
     # P0-GPI: each method interns its generic parameters in declaration
     # order under its own owner (impl_method_owner_def — the resolver's
-    # method_defs DefId or the deterministic module -3 fallback); the
+    # registered method DefId or the deterministic module -3 fallback); the
     # body pass reconstructs the same ids from (owner, index).
     let m_owner = impl_method_owner_def(env, &i.for_type, &m, impl_idx, method_index)
     let method_param_ids = intern_generic_params(env, &m_owner, &m.generic_params)
@@ -5830,6 +6424,12 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     end
 
     pop_scope(env)
+
+    # P0: capture the method's typed signature (declaration order — the
+    # receiver `self` is the first parameter exactly as declared); recorded
+    # into env.typed_fn_signatures in the second pass under the method's
+    # owner key (the MIR reads declaration types from that record).
+    impl_sig_records.push(FnSignature { params: param_types.clone(), ret_type: ret_type.clone() })
 
     # Collect method-level generic parameter ids for later substitution
     # (P0-GPI: the ids in declaration order — the param-name table holds
@@ -5900,25 +6500,12 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     igp = igp + 1
   end
 
-  # P0-AL: the method DefIds the resolver registered under the impl's
-  # for_type key. For an extension impl (`impl[T, I: Iterator[T]] I`) that
-  # key ("I[...]::map") is NOT derivable from a concrete receiver at the
-  # call site, so the resolution records it here and method_def_for falls
-  # back to it after the receiver-based lookup misses.
-  var imp_method_defs = Map::new()
-  match env.resolutions
-  when Option::Some(res) then
-    var mdi = 0
-    while mdi < i.methods.len() do
-      let mkey = impl_registry_method_key(&i.for_type, &i.methods[mdi].name)
-      match res.method_defs.get(mkey)
-      when Option::Some(did) then imp_method_defs.insert(i.methods[mdi].name.clone(), did)
-      when Option::None then ()
-      end
-      mdi = mdi + 1
-    end
-  when Option::None then ()
-  end
+  # P1: the per-impl method DefId table is DELETED (the transitional
+  # bare-keyed method table). A call site resolves a method's DefId through
+  # the SEMANTIC registration — module_symbols' qualified
+  # "path::Type::method" entries (method_def_for / qualified_method_def /
+  # scan_qualified_method_def — the module-qualified machinery below), with
+  # the extension-impl key reconstructed from the impl's for_type.
 
   # E0214 coherence: reject a duplicate impl of the same trait for the same
   # self type. Two candidates silently break every obligation (the solver
@@ -5970,7 +6557,10 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
     obligations: impl_obligations,
     methods: impl_methods,
     generic_params: imp_gp_ids,
-    method_defs: imp_method_defs
+    trait_ref: TraitRefTemplate {
+      trait_id: trait_id,
+      args: imp_trait_args
+    }
   })
 
   # Index impl methods for O(1) resolution: receiver TypeId -> method name -> impl indices.
@@ -6064,12 +6654,26 @@ def check_impl(env: &mut TypeEnv, i: &ImplDecl, method_keys: &Vec[String]) -> Un
       mgp_idx = mgp_idx + 1
     end
     env.generic_param_ids.insert(m_owner_key, merged_ids)
+    # P0: record the method's typed signature under the SAME owner key (the
+    # MIR reads the method's parameter/return types from this record — the
+    # typed table is the authority; TypeExpr is never interpreted after
+    # checking). The record is the first pass's computed signature (same
+    # owner-key agreement as generic_param_ids above).
+    if method_index < impl_sig_records.len() then
+      env.typed_fn_signatures.insert(m_owner_key, impl_sig_records[method_index].clone())
+    else
+      type_add_error(env, "internal error: impl signature records diverged from the method list (method `" + m.name + "`)", i.span)
+    end
 
     # Expected return type
     let ret_type = match m.ret_type
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
     when Option::None then Type::Unit
     end
+    # P0-SL (channel a): a safe Slice must not be RETURNED from a method —
+    # the declared return type is rejected when it is (or contains) the
+    # Slice view.
+    check_no_escaping_slice(env, &ret_type, m.span, "returned from a function")
 
     # P0-M: every `return expr` in the body unifies immediately with the
     # declared return type (see check_function).
@@ -6681,7 +7285,7 @@ def check_match(env: &mut TypeEnv, m: &MatchExpr, is_stmt: Bool) -> FlowResult
     when Type::F64 then ()
     when Type::Ptr(_) then ()
     when Type::PtrMut(_) then ()
-    when Type::Function(_, _) then ()
+    when Type::Function(_, _) | Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then ()
     when Type::Dyn(_) then ()
     when Type::Effect(_, _) then ()
     when Type::Tuple(_) then ()
@@ -7503,30 +8107,535 @@ def resolver_method_key(env: &TypeEnv, recv_type: &Type, method: String) -> Stri
   key + "::" + method
 end
 
+# ———————————————————————————————————————————————————————————————
+# P1: the SEMANTIC method-def lookup (the bare-keyed method table deletion)
+# ———————————————————————————————————————————————————————————————
+# The transitional bare-keyed method table is DELETED. A method's
+# DefId comes from the SEMANTIC registration — module_symbols' qualified
+# "path::Type::method" entries (the resolver's impl-method / struct-method
+# registration) — through the three helpers below:
+#   type_registration_module_path — the module path a receiver TypeId was
+#     registered from (the checker's module_type_names join: qualified key
+#     -> type_list index; the key's module part IS the registration path);
+#   qualified_method_def — the EXACT qualified lookup (path + the
+#     "Type::method" key, DefKind::Method filter);
+#   scan_qualified_method_def — the QUALIFIED-SCAN fallback: the entries
+#     whose key IS the bare "Type::method" (root) or ends with
+#     "::Type::method", filtered to DefKind::Method and deduplicated by
+#     DefId — the 0/1/>1 rule (0 -> None, exactly 1 -> the DefId,
+#     >= 2 -> None: ambiguous, no silent pick). Covers the builtin
+#     receivers (String/Int/... and the LangItems compounds) whose method
+#     impls live in a std module (std::core / std::collections).
+
+def type_registration_module_path(env: &TypeEnv, tid: &TypeId) -> Vec[String]
+  match env.type_id_index.get(tid.id)
+  when Option::Some(idx) then
+    var candidates = Vec::new()
+    for (key, kidx) in env.module_type_names.entries() do
+      if kidx == idx then
+        candidates.push(key.clone())
+      end
+    end
+    candidates.sort()
+    if candidates.is_empty() then
+      Vec::new()
+    else
+      # The qualified registration key ("path::name" — the bare root key
+      # has no separator); the module part is everything before the last
+      # "::".
+      match candidates[0].rfind("::")
+      when Option::Some(pos) then candidates[0].slice(0, pos).split("::")
+      when Option::None then Vec::new()
+      end
+    end
+  when Option::None then Vec::new()
+  end
+end
+
+# The exact module-qualified method lookup: the module_symbols entry for
+# "path::Type::method", filtered to DefKind::Method (a same-spelled
+# non-method registration never answers through this path).
+def qualified_method_def(env: &TypeEnv, path: &Vec[String], key: &String) -> Option[DefId]
+  match env.resolutions
+  when Option::Some(res) then
+    let qkey = module_qualified_key(path, key)
+    match res.module_symbols.get(&qkey)
+    when Option::Some(did) then
+      match def_kind_of(&res, &did)
+      when Option::Some(k) then
+        if k == DefKind::Method then Option::Some(did) else Option::None end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# The qualified-scan fallback: the 0/1/>1 rule over the module_symbols
+# entries whose key IS the bare "Type::method" (the root module's
+# registration) or ends with "::Type::method", filtered to DefKind::Method
+# and deduplicated by DefId. 0 -> None, exactly 1 -> that DefId, >= 2 ->
+# None (ambiguous — a silent first-wins pick is never made).
+def scan_qualified_method_def(env: &TypeEnv, key: &String) -> Option[DefId]
+  match env.resolutions
+  when Option::Some(res) then
+    var found: Option[DefId] = Option::None
+    var count = 0
+    let suffix = "::" + key.clone()
+    for (ms_key, ms_did) in res.module_symbols.entries() do
+      var matches = false
+      if ms_key == key.clone() then
+        matches = true
+      elsif ms_key.ends_with(suffix) then
+        matches = true
+      end
+      if matches then
+        match def_kind_of(&res, &ms_did)
+        when Option::Some(k) then
+          if k == DefKind::Method then
+            var dup = false
+            match found
+            when Option::Some(fd) then
+              if fd.module.id == ms_did.module.id && fd.index == ms_did.index then dup = true end
+            when Option::None then ()
+            end
+            if !dup then
+              count = count + 1
+              found = Option::Some(ms_did.clone())
+            end
+          end
+        when Option::None then ()
+        end
+      end
+    end
+    if count == 1 then found else Option::None end
+  when Option::None then Option::None
+  end
+end
+
+# The resolver's registered key of an impl method, from the IMPL's
+# CONCRETE for_type — mirroring the resolver's type_expr_to_string
+# rendering ("TypeName" or "TypeName[...]" for a generic for_type, plus
+# "::method"; a Param for_type keys by its parameter name — the
+# extension-impl shape "I::map").
+def impl_method_key_from_type(env: &TypeEnv, for_type: &Type, method: &String) -> String
+  match for_type
+  when Type::Adt(tid, _) then
+    match get_type_by_id_ref(env, tid)
+    when Option::Some(td) then
+      let base = if td.generic_params.len() > 0 then td.name.clone() + "[...]" else td.name.clone() end
+      base + "::" + method.clone()
+    when Option::None then "".to_string()
+    end
+  when Type::Param(gpid) then
+    generic_param_name_of(&env.generic_param_table, gpid) + "::" + method.clone()
+  when _ then "".to_string()
+  end
+end
+
 def method_def_for(env: &TypeEnv, recv_type: &Type, method: String) -> Option[DefId]
   let key = resolver_method_key(env, recv_type, method)
   if key != "" then
-    match env.resolutions
-    when Option::Some(res) then
-      match res.method_defs.get(key)
+    # 1. exact: the receiver type's OWNER registration path + the
+    # "Type::method" key.
+    match recv_type
+    when Type::Adt(tid, _) then
+      let path = type_registration_module_path(env, tid)
+      match qualified_method_def(env, &path, &key)
       when Option::Some(did) then return Option::Some(did)
       when Option::None then ()
       end
+    when _ then ()
+    end
+    # 2. the qualified-scan fallback (builtin receivers whose method impls
+    # live in a std module — String/Int/... and the LangItems compounds —
+    # and cross-module impls): the 0/1/>1 rule, never a silent pick.
+    match scan_qualified_method_def(env, &key)
+    when Option::Some(did) then return Option::Some(did)
     when Option::None then ()
     end
   end
   # P0-AL: extension-impl methods — the receiver-based key cannot match an
   # impl whose for_type is a generic parameter (the resolver registered the
-  # method under the parameter's own key, e.g. "I[...]::map"). Fall back to
-  # the DefIds recorded at check_impl time for the param-for_type impls.
+  # method under the parameter's own key, e.g. "I[...]::map"). Reconstruct
+  # the key from the param-for_type impl and resolve it through the same
+  # semantic registration (the impl's owner path first, then the scan).
   match find_param_for_type_method(env, method)
   when Option::Some((pimp_idx, _)) then
     let pimp = env.impls[pimp_idx]
-    match pimp.method_defs.get(method)
-    when Option::Some(did) then Option::Some(did)
-    when Option::None then Option::None
+    let pkey = impl_method_key_from_type(env, &pimp.for_type, &method)
+    if pkey == "" then
+      Option::None
+    else
+      match qualified_method_def(env, &env.current_module_path, &pkey)
+      when Option::Some(did) then Option::Some(did)
+      when Option::None then scan_qualified_method_def(env, &pkey)
+      end
     end
   when Option::None then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# P1: the SEMANTIC INTRINSIC ROUTER (IntrinsicId at check time)
+# ———————————————————————————————————————————————————————————————
+# The ONE name -> IntrinsicId classification (moved out of codegen.tg —
+# the frontend attaches the semantic IntrinsicId at call-recording time;
+# the typed program carries the per-call classification, and codegen's
+# dispatch reads the same router instead of holding its own name table).
+# The classifier is keyed on the callee name plus the TYPED receiver and
+# needle facts (the type-directed aliases — entries/drain_one/contains —
+# are decided from the receiver's registered name and the string-ness of
+# the receiver/needle). Option::None = the name is NOT an intrinsic name
+# (a compiled callable); the checker records only the classified calls,
+# and codegen's dispatch treats None as the non-intrinsic path.
+pub def intrinsic_id_of_call(
+  name: &String,
+  receiver_ty: &Type,
+  receiver_named: &String,
+  needle_ty: &Type,
+  needle_named: &String,
+  orig_fn_name: &String,
+  receiver_is_string: Bool,
+  needle_is_string: Bool
+) -> Option[IntrinsicId]
+  let orig_is_string_contains =
+    orig_fn_name == "String__contains" ||
+    orig_fn_name == "string_contains" ||
+    orig_fn_name == "__intrinsic_string_contains" ||
+    orig_fn_name == "str_contains"
+
+  # Type-directed aliases
+  if name == "entries" then
+    if receiver_named == "Set" then return Option::Some(IntrinsicId::SetEntries)
+    else return Option::Some(IntrinsicId::MapEntries)
+    end
+  end
+  if name == "drain_one" then
+    if receiver_named == "Set" then return Option::Some(IntrinsicId::SetDrainOne)
+    else return Option::Some(IntrinsicId::MapDrainOne)
+    end
+  end
+  if name == "contains" then
+    match receiver_ty
+    when Type::String then return Option::Some(IntrinsicId::StringContains)
+    when _ then ()
+    end
+    if receiver_named == "Map" then return Option::Some(IntrinsicId::MapContains)
+    elsif receiver_named == "Set" then return Option::Some(IntrinsicId::SetContains)
+    else ()
+    end
+    if orig_is_string_contains || receiver_is_string || needle_is_string then
+      return Option::Some(IntrinsicId::StringContains)
+    else
+      return Option::Some(IntrinsicId::ArrayContains)
+    end
+  end
+  if name == "array_contains" then
+    if orig_is_string_contains || receiver_is_string || needle_is_string then
+      return Option::Some(IntrinsicId::StringContains)
+    else
+      return Option::Some(IntrinsicId::ArrayContains)
+    end
+  end
+
+  # Array/Vec
+  if name == "array_as_ptr_address" || name == "as_ptr_address" then return Option::Some(IntrinsicId::ArrayAsPtrAddress) end
+  if name == "read_file_to_string_native" then return Option::Some(IntrinsicId::ReadFileToStringNative) end
+  if name == "set_is_empty" then return Option::Some(IntrinsicId::SetIsEmpty) end
+  if name == "map_push" then return Option::Some(IntrinsicId::MapPush) end
+  if name == "array_replace" then return Option::Some(IntrinsicId::ArrayReplace) end
+  if name == "array_as_str" then return Option::Some(IntrinsicId::ArrayAsStr) end
+  if name == "array_push" || name == "push" then return Option::Some(IntrinsicId::ArrayPush) end
+  if name == "string_push" then return Option::Some(IntrinsicId::StringPush) end
+  if name == "string_push_str" then return Option::Some(IntrinsicId::StringPushStr) end
+  if name == "array_pop" || name == "pop" then return Option::Some(IntrinsicId::ArrayPop) end
+  if name == "array_new" then return Option::Some(IntrinsicId::ArrayNew) end
+  if name == "string_new" || name == "String__new" then return Option::Some(IntrinsicId::StringNew) end
+  if name == "array_with_capacity" then return Option::Some(IntrinsicId::ArrayWithCapacity) end
+  if name == "array_len" then return Option::Some(IntrinsicId::ArrayLen) end
+  if name == "array_get" || name == "get" then return Option::Some(IntrinsicId::ArrayGet) end
+  if name == "array_set" || name == "set" then return Option::Some(IntrinsicId::ArraySet) end
+  if name == "array_cap" || name == "cap" then return Option::Some(IntrinsicId::ArrayCap) end
+  if name == "array_remove" || name == "remove" then return Option::Some(IntrinsicId::ArrayRemove) end
+  if name == "array_insert" || name == "insert" then return Option::Some(IntrinsicId::ArrayInsert) end
+  if name == "array_clear" || name == "clear" then return Option::Some(IntrinsicId::ArrayClear) end
+  if name == "array_first" || name == "first" then return Option::Some(IntrinsicId::ArrayFirst) end
+  if name == "array_last" || name == "last" then return Option::Some(IntrinsicId::ArrayLast) end
+  if name == "array_is_empty" || name == "is_empty" then return Option::Some(IntrinsicId::ArrayIsEmpty) end
+  if name == "array_reverse" || name == "reverse" then return Option::Some(IntrinsicId::ArrayReverse) end
+  if name == "array_sort" || name == "sort" then return Option::Some(IntrinsicId::ArraySort) end
+  if name == "array_extend" || name == "extend" then return Option::Some(IntrinsicId::ArrayExtend) end
+  if name == "array_truncate" then return Option::Some(IntrinsicId::ArrayTruncate) end
+  if name == "array_resize" then return Option::Some(IntrinsicId::ArrayResize) end
+  if name == "array_destroy" then return Option::Some(IntrinsicId::ArrayDestroy) end
+  if name == "array_as_ptr" || name == "array_as_mut_ptr" then return Option::Some(IntrinsicId::ArrayAsPtr) end
+  if name == "array_slice" then return Option::Some(IntrinsicId::ArraySlice) end
+  if name == "array_from_list" then return Option::Some(IntrinsicId::ArrayFromList) end
+  if name == "array_capacity" then return Option::Some(IntrinsicId::ArrayCapacity) end
+  if name == "array_clone" || name == "Vec__clone" || name == "Array__clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "array_starts_with" || name == "Vec__starts_with" then return Option::Some(IntrinsicId::StartsWith) end
+  if name == "array_ends_with" || name == "Vec__ends_with" then return Option::Some(IntrinsicId::StrCmp) end
+  if name == "array_to_string" || name == "Vec__to_string" || name == "Array__to_string" then return Option::Some(IntrinsicId::ToString) end
+  if name == "array_read" || name == "Vec__read" || name == "Array__read" then return Option::Some(IntrinsicId::Clone) end
+  if name == "array_join" || name == "Vec__join" || name == "Array__join" then return Option::Some(IntrinsicId::ArrayJoin) end
+
+  # Map
+  if name == "map_new" then return Option::Some(IntrinsicId::MapNew) end
+  if name == "map_insert" then return Option::Some(IntrinsicId::MapInsert) end
+  if name == "map_get" || name == "map_get_mut" || name == "get_mut" then return Option::Some(IntrinsicId::MapGet) end
+  if name == "map_remove" then return Option::Some(IntrinsicId::MapRemove) end
+  if name == "map_remove_key" then return Option::Some(IntrinsicId::MapRemoveKey) end
+  if name == "option_wrap" then return Option::Some(IntrinsicId::OptionWrap) end
+  if name == "map_contains" || name == "map_contains_key" || name == "contains_key" then return Option::Some(IntrinsicId::MapContains) end
+  if name == "map_len" then return Option::Some(IntrinsicId::MapLen) end
+  if name == "map_clone" || name == "Map__clone" then return Option::Some(IntrinsicId::MapClone) end
+  if name == "map_clear" then return Option::Some(IntrinsicId::MapClear) end
+  if name == "map_keys" || name == "keys" then return Option::Some(IntrinsicId::MapKeys) end
+  if name == "map_values" || name == "values" then return Option::Some(IntrinsicId::MapValues) end
+  if name == "map_entries" then return Option::Some(IntrinsicId::MapEntries) end
+  if name == "map_drain_one" then return Option::Some(IntrinsicId::MapDrainOne) end
+  if name == "map_destroy" then return Option::Some(IntrinsicId::MapDestroy) end
+  if name == "map_unwrap" || name == "Map__unwrap" then return Option::Some(IntrinsicId::Unwrap) end
+
+  # Set
+  if name == "set_new" then return Option::Some(IntrinsicId::SetNew) end
+  if name == "set_insert" then return Option::Some(IntrinsicId::SetInsert) end
+  if name == "set_contains" then return Option::Some(IntrinsicId::SetContains) end
+  if name == "set_remove" then return Option::Some(IntrinsicId::SetRemove) end
+  if name == "set_remove_key" then return Option::Some(IntrinsicId::SetRemoveKey) end
+  if name == "set_len" then return Option::Some(IntrinsicId::SetLen) end
+  if name == "set_clone" || name == "Set__clone" then return Option::Some(IntrinsicId::SetClone) end
+  if name == "set_entries" then return Option::Some(IntrinsicId::SetEntries) end
+  if name == "set_drain_one" then return Option::Some(IntrinsicId::SetDrainOne) end
+  if name == "set_destroy" then return Option::Some(IntrinsicId::SetDestroy) end
+  if name == "set_clear" then return Option::Some(IntrinsicId::SetClear) end
+  if name == "set_unwrap" || name == "Set__unwrap" then return Option::Some(IntrinsicId::Unwrap) end
+
+  # String
+  if name == "string_char_at" then return Option::Some(IntrinsicId::CharAt) end
+  if name == "string_slice" || name == "slice" then return Option::Some(IntrinsicId::StrSlice) end
+  if name == "string_len" then return Option::Some(IntrinsicId::StringLen) end
+  if name == "len" || name == "IfStmt__len" then return Option::Some(IntrinsicId::Len) end
+  if name == "string_parse_int" || name == "parse_int" then return Option::Some(IntrinsicId::StrToInt) end
+  if name == "str_parse_float" || name == "String__parse_float" || name == "__intrinsic_string_parse_float" then return Option::Some(IntrinsicId::StrToFloat) end
+  if name == "string_clone" || name == "String__clone" then return Option::Some(IntrinsicId::StringClone) end
+  if name == "string_is_empty" || name == "string_chars" then return Option::Some(IntrinsicId::StringIsEmptyChars) end
+  if name == "string_as_bytes" then return Option::Some(IntrinsicId::AsBytes) end
+  if name == "string_as_ptr" || name == "String__as_ptr" then return Option::Some(IntrinsicId::StringAsPtr) end
+  if name == "string_as_str" || name == "String__as_str" then return Option::Some(IntrinsicId::StringAsStr) end
+  if name == "string_from_static" || name == "__intrinsic_string_from_static" || name == "String__from_static" then return Option::Some(IntrinsicId::StringFromStatic) end
+  if name == "string_reserve" || name == "__intrinsic_string_reserve" then return Option::Some(IntrinsicId::StringReserve) end
+  if name == "string_to_wide_string" || name == "string_to_string" then return Option::Some(IntrinsicId::ToString) end
+  if name == "string_starts_with" then return Option::Some(IntrinsicId::StartsWith) end
+  if name == "string_ends_with" then return Option::Some(IntrinsicId::EndsWith) end
+  if name == "string_index_of" || name == "string_last_index_of" || name == "string_rfind" then return Option::Some(IntrinsicId::StrFind) end
+  if name == "string_find" || name == "find" then return Option::Some(IntrinsicId::StrFind) end
+  if name == "string_trim" || name == "string_trim_matches" then return Option::Some(IntrinsicId::StringTrim) end
+  if name == "string_to_lowercase" || name == "string_to_uppercase" then return Option::Some(IntrinsicId::StringToLowercase) end
+  if name == "string_contains" then return Option::Some(IntrinsicId::StringContains) end
+  if name == "string_replace" || name == "replace" then return Option::Some(IntrinsicId::StringReplace) end
+  if name == "string_split" then return Option::Some(IntrinsicId::StringSplit) end
+  if name == "string_lines" || name == "string_split_once" then return Option::Some(IntrinsicId::StringSplitLines) end
+  if name == "string_bytes" then return Option::Some(IntrinsicId::Bytes) end
+  if name == "string_unwrap_or" || name == "String__unwrap_or" then return Option::Some(IntrinsicId::UnwrapOr) end
+  if name == "bytes" then return Option::Some(IntrinsicId::AsBytes) end
+
+  # Option/Result and iterator methods
+  if name == "is_some" || name == "is_ok" then return Option::Some(IntrinsicId::IsSome) end
+  if name == "is_none" || name == "is_err" then return Option::Some(IntrinsicId::IsNone) end
+  if name == "unwrap" then return Option::Some(IntrinsicId::Unwrap) end
+  if name == "unwrap_or" then return Option::Some(IntrinsicId::UnwrapOr) end
+  if name == "trim_matches" then return Option::Some(IntrinsicId::TrimMatches) end
+  if name == "split_once" then return Option::Some(IntrinsicId::SplitOnce) end
+  if name == "to_bits" then return Option::Some(IntrinsicId::Clone) end
+  if name == "to_lowercase" then return Option::Some(IntrinsicId::ToLowercase) end
+  if name == "arg" || name == "eval" then return Option::Some(IntrinsicId::Clone) end
+  if name == "map" || name == "join" || name == "collect" then return Option::Some(IntrinsicId::MapJoinCollect) end
+  if name == "split" || name == "lines" || name == "trim" then return Option::Some(IntrinsicId::SplitLinesTrim) end
+  if name == "starts_with" then return Option::Some(IntrinsicId::StartsWith) end
+  if name == "ends_with" then return Option::Some(IntrinsicId::EndsWith) end
+
+  # Type__method variants for compiler-internal types
+  if name == "PanicInfo__clone" || name == "TypeExpr__clone" || name == "Span__clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "MirProgram__to_string" || name == "Type__to_string" then return Option::Some(IntrinsicId::ToString) end
+  if name == "Type__clone" || name == "Type__collect" || name == "Type__unwrap" then return Option::Some(IntrinsicId::Clone) end
+  if name == "InlineResult__unwrap_or" || name == "MirStatement__unwrap_or" || name == "Place__unwrap_or" then return Option::Some(IntrinsicId::UnwrapOr) end
+  if name == "MirRvalue__collect" || name == "MirRvalue__unwrap_or" || name == "MirTerminator__unwrap_or" then return Option::Some(IntrinsicId::Clone) end
+  if name == "PgoProfile__unwrap_or" then return Option::Some(IntrinsicId::UnwrapOr) end
+  if name == "MirLocalId__clone" || name == "MirBlockId__clone" || name == "MirFunction__clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "MirStatement__clone" || name == "MirRvalue__clone" || name == "AggregateKind__clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "MirTerminatorKind__clone" || name == "AsmTarget__clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "Budget__unwrap_or" || name == "Budget__trim" then return Option::Some(IntrinsicId::UnwrapOr) end
+
+  # CString intrinsics (String = raw C string at ABI level)
+  if name == "cstring_new" || name == "CString__new" then return Option::Some(IntrinsicId::CStringNew) end
+  if name == "cstring_as_ptr" || name == "CString__as_ptr" then return Option::Some(IntrinsicId::CStringAsPtr) end
+
+  # Canonical string ops
+  if name == "str_concat" then return Option::Some(IntrinsicId::StrConcat) end
+  if name == "str_len" then return Option::Some(IntrinsicId::StrLen) end
+  if name == "str_cmp" then return Option::Some(IntrinsicId::StrCmp) end
+  if name == "str_find" then return Option::Some(IntrinsicId::StrFind) end
+  if name == "str_slice" then return Option::Some(IntrinsicId::StrSlice) end
+  if name == "str_copy" then return Option::Some(IntrinsicId::StrCopy) end
+  if name == "str_to_int" then return Option::Some(IntrinsicId::StrToInt) end
+  if name == "str_to_float" then return Option::Some(IntrinsicId::StrToFloat) end
+  if name == "int_to_str" then return Option::Some(IntrinsicId::IntToStr) end
+  if name == "float_to_str" then return Option::Some(IntrinsicId::FloatToStr) end
+  if name == "int_to_string" || name == "int_to_string_intrinsic" then return Option::Some(IntrinsicId::IntToString) end
+  if name == "float_to_string" || name == "float_to_string_intrinsic" then return Option::Some(IntrinsicId::FloatToString) end
+  if name == "bool_to_string" then return Option::Some(IntrinsicId::BoolToString) end
+  if name == "char_to_string" then return Option::Some(IntrinsicId::CharToString) end
+  if name == "str_to_string" then return Option::Some(IntrinsicId::StrToString) end
+  if name == "string_from_bytes" then return Option::Some(IntrinsicId::StringFromBytes) end
+  if name == "to_string" then return Option::Some(IntrinsicId::ToString) end
+  if name == "clone" then return Option::Some(IntrinsicId::Clone) end
+  if name == "as_bytes" then return Option::Some(IntrinsicId::AsBytes) end
+  if name == "as_ptr" then return Option::Some(IntrinsicId::AsPtr) end
+  if name == "as_str" then return Option::Some(IntrinsicId::AsStr) end
+  if name == "chars" then return Option::Some(IntrinsicId::Chars) end
+  if name == "char_at" then return Option::Some(IntrinsicId::CharAt) end
+
+  # Syscalls (1-6 arguments)
+  if name == "syscall1" then return Option::Some(IntrinsicId::Syscall1) end
+  if name == "syscall2" then return Option::Some(IntrinsicId::Syscall2) end
+  if name == "syscall3" then return Option::Some(IntrinsicId::Syscall3) end
+  if name == "syscall4" then return Option::Some(IntrinsicId::Syscall4) end
+  if name == "syscall5" then return Option::Some(IntrinsicId::Syscall5) end
+  if name == "syscall6" then return Option::Some(IntrinsicId::Syscall6) end
+
+  # Memory
+  if name == "mem_alloc" then return Option::Some(IntrinsicId::MemAlloc) end
+  if name == "mem_free" then return Option::Some(IntrinsicId::MemFree) end
+  if name == "mem_copy" then return Option::Some(IntrinsicId::MemCopy) end
+  if name == "mem_set" then return Option::Some(IntrinsicId::MemSet) end
+  if name == "mem_zero" then return Option::Some(IntrinsicId::MemZero) end
+
+  # Hash
+  if name == "hash_int" then return Option::Some(IntrinsicId::HashInt) end
+  if name == "hash_str" then return Option::Some(IntrinsicId::HashStr) end
+  if name == "hash_combine" then return Option::Some(IntrinsicId::HashCombine) end
+
+  # Typed drop glue
+  if name == "drop_in_place" then return Option::Some(IntrinsicId::DropInPlace) end
+  if name == "drop" then return Option::Some(IntrinsicId::Drop) end
+
+  # Process/Environment
+  if name == "status" then return Option::Some(IntrinsicId::Status) end
+  if name == "output" then return Option::Some(IntrinsicId::Output) end
+  if name == "stdout_string" then return Option::Some(IntrinsicId::StdoutString) end
+  if name == "stderr_string" then return Option::Some(IntrinsicId::StderrString) end
+
+  # Formatter intrinsics (compile-time constructs, no runtime code)
+  if name == "emit" || name == "space" || name == "indent" || name == "dedent" then return Option::Some(IntrinsicId::FormatterNoOp) end
+  if name == "emit_newline" || name == "emit_blank_line" then return Option::Some(IntrinsicId::FormatterEmitNewline) end
+  if name == "would_overflow" then return Option::Some(IntrinsicId::WouldOverflow) end
+
+  # Utility
+  if name == "cmp" then return Option::Some(IntrinsicId::Cmp) end
+  if name == "to_int" then return Option::Some(IntrinsicId::ToInt) end
+  if name == "lint_file" then return Option::Some(IntrinsicId::LintFile) end
+
+  # File constants
+  if name == "SYS_WRITE" then return Option::Some(IntrinsicId::SysWrite) end
+  if name == "SYS_READ" then return Option::Some(IntrinsicId::SysRead) end
+  if name == "SYS_OPEN" then return Option::Some(IntrinsicId::SysOpen) end
+  if name == "SYS_CLOSE" then return Option::Some(IntrinsicId::SysClose) end
+  if name == "SYS_EXIT" then return Option::Some(IntrinsicId::SysExit) end
+  if name == "O_WRONLY" then return Option::Some(IntrinsicId::OWriteOnly) end
+  if name == "O_RDWR" then return Option::Some(IntrinsicId::ORdWr) end
+  if name == "O_APPEND" then return Option::Some(IntrinsicId::OAppend) end
+  if name == "O_CREAT" then return Option::Some(IntrinsicId::OCreate) end
+  if name == "O_TRUNC" then return Option::Some(IntrinsicId::OTrunc) end
+  if name == "open_windows" then return Option::Some(IntrinsicId::OpenWindows) end
+
+  Option::None
+end
+
+# The fail-closed classification (the checker's attachment and codegen's
+# final dispatch): a name the semantic router does not recognize is an
+# internal error — never a silent fallback.
+pub def classify_intrinsic_call(
+  name: &String,
+  receiver_ty: &Type,
+  receiver_named: &String,
+  needle_ty: &Type,
+  needle_named: &String,
+  orig_fn_name: &String,
+  receiver_is_string: Bool,
+  needle_is_string: Bool
+) -> IntrinsicId
+  match intrinsic_id_of_call(name, receiver_ty, receiver_named, needle_ty, needle_named, orig_fn_name, receiver_is_string, needle_is_string)
+  when Option::Some(iid) then iid
+  when Option::None then panic("internal error: unknown or unsupported intrinsic `" + name + "`")
+  end
+end
+
+# The bare registered name of a receiver Adt (the type-directed alias
+# decisions — Set/Map — key on the REGISTERED name, e.g. the std's "Array"
+# for the heap vector).
+def type_bare_name_of(env: &TypeEnv, ty: &Type) -> String
+  match ty
+  when Type::Adt(tid, _) then
+    match get_type_by_id_ref(env, tid)
+    when Option::Some(td) then td.name.clone()
+    when Option::None then "".to_string()
+    end
+  when _ then "".to_string()
+  end
+end
+
+# Whether the receiver of a method call is a BUILTIN container (the
+# primitive String or a LangItems compound) — the receiver gate for the
+# checker's intrinsic attachment (a user method on a user type never
+# classifies as an intrinsic).
+def receiver_is_builtin_container(env: &TypeEnv, ty: &Type) -> Bool
+  match ty
+  when Type::String then true
+  when Type::Adt(tid, _) then
+    tid.id == env.lang_items.array || tid.id == env.lang_items.map ||
+    tid.id == env.lang_items.set || tid.id == env.lang_items.option ||
+    tid.id == env.lang_items.result || tid.id == env.lang_items.slice ||
+    tid.id == env.lang_items.box_ || tid.id == env.lang_items.rc
+  when _ then false
+  end
+end
+
+# The checker's call-recording attachment: classify the callee through the
+# semantic router and record the IntrinsicId per call node in the typed
+# program (typed_intrinsics; serialized into the resolutions snapshot at
+# type_check_typed's tail). Only the intrinsic candidates attach: the
+# explicit __intrinsic_* family and the builtin-container method calls.
+def record_intrinsic_classification(
+  env: &mut TypeEnv,
+  call_node_id: Int,
+  callee_name: &String,
+  receiver_ty: &Type,
+  needle_ty: &Type,
+  orig_fn_name: &String
+) -> Unit
+  if call_node_id == 0 then return end
+  let receiver_is_string = match receiver_ty
+  when Type::String then true
+  when _ then false
+  end
+  let needle_is_string = match needle_ty
+  when Type::String then true
+  when Type::RefInternal(inner, _) then
+    match inner
+    when Type::String then true
+    when _ then false
+    end
+  when _ then false
+  end
+  let is_explicit = callee_name.starts_with("__intrinsic")
+  if is_explicit || receiver_is_builtin_container(env, receiver_ty) then
+    match intrinsic_id_of_call(callee_name, receiver_ty, &type_bare_name_of(env, receiver_ty), needle_ty, &type_bare_name_of(env, needle_ty), orig_fn_name, receiver_is_string, needle_is_string)
+    when Option::Some(iid) then env.typed_intrinsics.insert(call_node_id, iid)
+    when Option::None then ()
+    end
   end
 end
 
@@ -7616,10 +8725,19 @@ def is_trivially_copyable_walk(env: &TypeEnv, ty: &Type, visited: &mut Set[Strin
   # the buffer/ownership state without the retain/clone it requires
   # (the Adt forms of the builtin compounds are classified in
   # is_named_trivially_copyable by their LangItems ids).
+  # String (P0-STRING): the OWNED String object — the value is a pointer to
+  # the owned {data,len,cap,stride} object; bit-copying it would duplicate
+  # the owned buffer. String is Clone, NOT Copy — stays false.
   when Type::String then false
   # Closures/functions with environments carry state; refs are borrows with
   # checker-managed semantics, not bit-copy values.
   when Type::Function(_, _) then false
+  # P1 (FnPtr/Closure split): a FUNCTION POINTER has no environment — it is
+  # a plain code pointer, bit-copyable; a CLOSURE's copy legality derives
+  # from its CAPTURE TUPLE (a closure capturing a non-copyable value is not
+  # bit-copyable).
+  when Type::FnPtr(_, _) then true
+  when Type::Closure(_, _, _, captures) then is_trivially_copyable_walk(env, &captures, visited)
   when Type::Dyn(_) then false
   when Type::Effect(_, _) then false
   when Type::RefInternal(_, _) then false
@@ -7829,6 +8947,21 @@ def collect_param_names_from_type(env: &TypeEnv, ty: &Type, out: &mut Vec[Generi
       i = i + 1
     end
     collect_param_names_from_type(env, ret, out)
+  when Type::FnPtr(params, ret) then
+    var i = 0
+    while i < params.len() do
+      collect_param_names_from_type(env, &params[i].ty, out)
+      i = i + 1
+    end
+    collect_param_names_from_type(env, ret, out)
+  when Type::Closure(_, params, ret, captures) then
+    var i = 0
+    while i < params.len() do
+      collect_param_names_from_type(env, &params[i].ty, out)
+      i = i + 1
+    end
+    collect_param_names_from_type(env, ret, out)
+    collect_param_names_from_type(env, &captures, out)
   when Type::Effect(_, inner) then collect_param_names_from_type(env, inner, out)
   when _ then ()
   end
@@ -7896,22 +9029,90 @@ def convention_identity_tag(c: AccessConvention) -> String
   end
 end
 
-# The canonical render of an effect set for type identity: the effect names
-# sorted (a set's canonical order — two syntactically different orders of
-# the same effect names are the same set) and joined.
-def canonical_effect_set(names: &Vec[String]) -> String
+# ———————————————————————————————————————————————————————————————
+# P1: THE ONE canonical type encoding (the consolidation)
+# ———————————————————————————————————————————————————————————————
+# The frontend type identity (type_identity_key_resolved — conventions +
+# effects), the mono internal emission mangling (type_to_mangled), and the
+# public ABI canonicalization (tangerine_abi_canon_type) are ONE canonical
+# semantic type encoding — type_canon_render — parameterized ONLY by the
+# EXTERNAL SYMBOL FRAMING (TypeCanonFrame):
+#   CanonSemantic — the frontend type-identity frame: nominal Adts key by
+#     the LangItems special forms (Option/Result/Map/Set/Slice/Array/Box/
+#     Rc) or "Named#<id>"; effect sets render as the canonical ordered
+#     EFFECT-ID set (the M9 EffectId domain — names -> ids through the
+#     EffectRegistry); Param/Var/Error render distinctly (never fail).
+#   CanonInternal — the per-compilation emission-label frame (mono's
+#     type_to_mangled): nominal Adts render by the EPHEMERAL TypeId
+#     ("t<id>") — legal HERE because internal labels never cross a
+#     compilation boundary (ephemeral ids are forbidden only in the public
+#     ABI); effect sets render as the canonical ordered NAME set;
+#     Param/Var/Error render distinctly.
+#   CanonExternal — the PUBLIC ABI frame (mono's tangerine_abi_canon_type):
+#     nominal Adts render by their STABLE PATHS ("T[<module path>::<name>]"
+#     from the type_names table — the TypeId -> declaration association is
+#     DIRECT, never name/order-correlated); FAIL-CLOSED on Param/Var/Error
+#     and on Closure (a Closure carries the per-compilation ClosureId — it
+#     has NO stable public identity and never appears in an exported
+#     signature); effect sets render as the canonical ordered NAME set.
+# The framing difference is EXACTLY that: the nominal identity source and
+# the unresolved-type policy. The structural walk (primitives, tuple,
+# callable signatures with conventions, refs/pointers, fixed arrays,
+# effects, recursion) is shared byte-for-byte across the frames.
+enum TypeCanonFrame
+  CanonSemantic
+  CanonInternal
+  CanonExternal
+end
+
+# The rendering context: the frame plus the per-frame name tables (the
+# External stable paths by TypeId, the param-name table for diagnostics),
+# the LangItems ids (the Semantic builtin selection), and the effect
+# registry (the effect-id mapping for the identity's effect-ID set).
+struct TypeCanonCtx
+  frame: TypeCanonFrame
+  type_names: Map[Int, String]
+  param_names: Map[Int, String]
+  lang_option: Int
+  lang_result: Int
+  lang_map: Int
+  lang_set: Int
+  lang_slice: Int
+  lang_array: Int
+  lang_box: Int
+  lang_rc: Int
+  effects: EffectRegistry
+end
+
+# The canonical ordered effect-set render shared by the frames. The
+# canonical ORDER is the sorted element list (a set's canonical order —
+# two syntactically different orders of the same effects are the same
+# set). With ids=true (the CanonSemantic frame) every effect renders by
+# its interned EffectId ("e<id>"; "n<name>" for a never-interned name) —
+# the canonical ordered effect-ID set of the type identity; with ids=false
+# the names render in the same canonical order (the Internal
+# per-compilation label and the ABI-stable External rendering).
+def canonical_effect_set_render(ctx: &TypeCanonCtx, names: &Vec[String], ids: Bool) -> String
   var sorted = Vec::new()
   var i = 0
   while i < names.len() do
     let name = names[i].clone()
+    let elem = if ids then
+      match effect_id_of_name(&ctx.effects, &name)
+      when Option::Some(eid) then "e" + eid.id.to_string()
+      when Option::None then "n" + name.clone()
+      end
+    else
+      name.clone()
+    end
     var pos = 0
     while pos < sorted.len() do
-      if name < sorted[pos] then
+      if elem < sorted[pos] then
         break
       end
       pos = pos + 1
     end
-    sorted.insert(pos, name)
+    sorted.insert(pos, elem)
     i = i + 1
   end
   var s = "{"
@@ -7924,86 +9125,368 @@ def canonical_effect_set(names: &Vec[String]) -> String
   s + "}"
 end
 
-def type_identity_key_resolved(env: &TypeEnv, ty: &Type) -> String
+# The canonical parameter-convention tag (shared by the frames): fn(let T)
+# / fn(inout T) / fn(sink T) / fn(set T) are different callable types with
+# different ownership contracts, so their canonical renderings must differ.
+def canon_convention_tag(c: AccessConvention) -> String
+  match c
+  when AccessConvention::Let then "let"
+  when AccessConvention::Inout then "inout"
+  when AccessConvention::Sink then "sink"
+  when AccessConvention::Set then "set"
+  end
+end
+
+# The ONE canonical semantic type walk. Result::Err is produced ONLY by
+# the CanonExternal frame (the fail-closed policy: Param/Var/Error and a
+# Closure — a per-compilation identity — never appear in a public ABI
+# symbol; an Adt without a stable path errors instead of collapsing); the
+# CanonSemantic/CanonInternal frames never fail (every form renders
+# distinctly).
+pub def type_canon_render(ctx: &TypeCanonCtx, ty: &Type) -> Result[String, String]
   match ty
+  when Type::Unit then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Unit") else Result::Ok("unit") end
+  when Type::Bool then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Bool") else Result::Ok("bool") end
+  when Type::Int then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Int") else Result::Ok("int") end
+  when Type::UInt then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("UInt") else Result::Ok("uint") end
+  when Type::Float then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Float") else Result::Ok("float") end
+  when Type::Char then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Char") else Result::Ok("char") end
+  when Type::String then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("String") else Result::Ok("str") end
+  when Type::Never then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("Never") else Result::Ok("never") end
+  when Type::I8 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("I8") else Result::Ok("i8") end
+  when Type::I16 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("I16") else Result::Ok("i16") end
+  when Type::I32 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("I32") else Result::Ok("i32") end
+  when Type::I64 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("I64") else Result::Ok("i64") end
+  when Type::I128 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("I128") else Result::Ok("i128") end
+  when Type::U8 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("U8") else Result::Ok("u8") end
+  when Type::U16 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("U16") else Result::Ok("u16") end
+  when Type::U32 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("U32") else Result::Ok("u32") end
+  when Type::U64 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("U64") else Result::Ok("u64") end
+  when Type::U128 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("U128") else Result::Ok("u128") end
+  when Type::ISize then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("ISize") else Result::Ok("isize") end
+  when Type::USize then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("USize") else Result::Ok("usize") end
+  when Type::F32 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("F32") else Result::Ok("f32") end
+  when Type::F64 then
+    if ctx.frame == TypeCanonFrame::CanonSemantic then Result::Ok("F64") else Result::Ok("f64") end
   when Type::Adt(tid, args) then
-    # The Adt form of a builtin compound keys by its LangItems TypeId;
-    # user-defined and non-builtin Adt types keep the id-based key.
-    var s = "Named#" + tid.id.to_string()
-    var i = 0
-    while i < args.len() do
-      s = s + "[" + type_identity_key_resolved(env, &args[i]) + "]"
-      i = i + 1
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      # The Adt form of a builtin compound keys by its LangItems TypeId; the
+      # identity is id-selected, never name-selected (a module-local type
+      # with a builtin's name must not key as the builtin).
+      var s = "Named#" + tid.id.to_string()
+      var i = 0
+      while i < args.len() do
+        s = s + "[" + canon_render_unwrap(ctx, &args[i]) + "]"
+        i = i + 1
+      end
+      if tid.id == ctx.lang_option && args.len() >= 1 then
+        Result::Ok("Option[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      elsif tid.id == ctx.lang_result && args.len() >= 2 then
+        Result::Ok("Result[" + canon_render_unwrap(ctx, &args[0]) + "," + canon_render_unwrap(ctx, &args[1]) + "]")
+      elsif tid.id == ctx.lang_map && args.len() >= 2 then
+        Result::Ok("Map[" + canon_render_unwrap(ctx, &args[0]) + "," + canon_render_unwrap(ctx, &args[1]) + "]")
+      elsif tid.id == ctx.lang_set && args.len() >= 1 then
+        Result::Ok("Set[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      elsif tid.id == ctx.lang_slice && args.len() >= 1 then
+        Result::Ok("Slice[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      elsif tid.id == ctx.lang_array && args.len() >= 1 then
+        Result::Ok("Array[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      elsif tid.id == ctx.lang_box && args.len() >= 1 then
+        Result::Ok("Box[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      elsif tid.id == ctx.lang_rc && args.len() >= 1 then
+        Result::Ok("Rc[" + canon_render_unwrap(ctx, &args[0]) + "]")
+      else
+        Result::Ok(s)
+      end
+    when TypeCanonFrame::CanonInternal then
+      if args.is_empty() then
+        Result::Ok("t" + tid.id.to_string())
+      else
+        var s = "t" + tid.id.to_string() + "["
+        var first_arg = true
+        for arg in args do
+          if !first_arg then
+            s = s + ","
+          end
+          s = s + canon_render_unwrap(ctx, &arg)
+          first_arg = false
+        end
+        Result::Ok(s + "]")
+      end
+    when TypeCanonFrame::CanonExternal then
+      match ctx.type_names.get(tid.id)
+      when Option::Some(path) then
+        if args.is_empty() then
+          Result::Ok("T[" + path.clone() + "]")
+        else
+          var parts = Vec::new()
+          for a in args do
+            match type_canon_render(ctx, &a)
+            when Result::Ok(c) then parts.push(c)
+            when Result::Err(msg) then return Result::Err(msg)
+            end
+          end
+          Result::Ok("T[" + path.clone() + "][" + parts.join(",") + "]")
+        end
+      when Option::None then
+        Result::Err("tangerine ABI: TypeId " + tid.id.to_string() + " has no stable path (not a registered source struct/enum/trait/alias declaration — compiler-synthesized or shadowed types never mangle) — cannot canonicalize this Adt for the public ABI")
+      end
     end
-    # The Adt form of a builtin compound keys by its LangItems TypeId; the
-    # identity is id-selected, never name-selected (a module-local type with
-    # a builtin's name must not key as the builtin).
-    if tid.id == env.lang_items.option && args.len() >= 1 then
-      "Option[" + type_identity_key_resolved(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.result && args.len() >= 2 then
-      "Result[" + type_identity_key_resolved(env, &args[0]) + "," + type_identity_key_resolved(env, &args[1]) + "]"
-    elsif tid.id == env.lang_items.map && args.len() >= 2 then
-      "Map[" + type_identity_key_resolved(env, &args[0]) + "," + type_identity_key_resolved(env, &args[1]) + "]"
-    elsif tid.id == env.lang_items.set && args.len() >= 1 then
-      "Set[" + type_identity_key_resolved(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.slice && args.len() >= 1 then
-      "Slice[" + type_identity_key_resolved(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.array && args.len() >= 1 then
-      # The heap-vector Adt form carries no count (the size lives in the
-      # distinct FixedArray variant); key by the element alone.
-      "Array[" + type_identity_key_resolved(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.box_ && args.len() >= 1 then
-      "Box[" + type_identity_key_resolved(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.rc && args.len() >= 1 then
-      "Rc[" + type_identity_key_resolved(env, &args[0]) + "]"
-    else
-      s
+  when Type::FixedArray(elem, n) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("FixedArray[" + canon_render_unwrap(ctx, elem) + ";" + n.to_string() + "]")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("fa[" + canon_render_unwrap(ctx, elem) + ";" + n.to_string() + "]")
+    when TypeCanonFrame::CanonExternal then
+      match type_canon_render(ctx, elem)
+      when Result::Ok(ec) then Result::Ok("A[" + ec + ";" + n.to_string() + "]")
+      when Result::Err(msg) then Result::Err(msg)
+      end
     end
-  when Type::FixedArray(elem, n) then "FixedArray[" + type_identity_key_resolved(env, &elem) + ";" + n.to_string() + "]"
   when Type::Tuple(fields) then
-    var s = "Tuple("
-    var i = 0
-    while i < fields.len() do
-      if i > 0 then s = s + "," end
-      s = s + type_identity_key_resolved(env, &fields[i])
-      i = i + 1
+    var parts = Vec::new()
+    for f in fields do
+      match type_canon_render(ctx, &f)
+      when Result::Ok(c) then parts.push(c)
+      when Result::Err(msg) then return Result::Err(msg)
+      end
     end
-    s + ")"
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Tuple(" + parts.join(",") + ")")
+    when TypeCanonFrame::CanonInternal then Result::Ok("tuple(" + parts.join(",") + ")")
+    when TypeCanonFrame::CanonExternal then Result::Ok("(" + parts.join(",") + ")")
+    end
   when Type::Function(params, ret) then
-    # P0-Q (defect fix): the identity carries EVERY parameter's access
-    # convention — fn(let T) / fn(inout T) / fn(sink T) / fn(set T) are
-    # distinct callable types whose canonical keys must differ (the
-    # conventions describe the callable's ownership contract).
-    var s = "Fn("
-    var i = 0
-    while i < params.len() do
-      if i > 0 then s = s + "," end
-      s = s + convention_identity_tag(params[i].convention) + ":" + type_identity_key_resolved(env, &params[i].ty)
-      i = i + 1
+    # The legacy conflation form (transitional — see the Type enum): it
+    # renders as the callable signature in every frame.
+    canon_render_callable(ctx, "Fn", params, ret)
+  when Type::FnPtr(params, ret) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then canon_render_callable(ctx, "FnPtr", params, ret)
+    when TypeCanonFrame::CanonInternal then canon_render_callable(ctx, "fnptr", params, ret)
+    when TypeCanonFrame::CanonExternal then canon_render_callable(ctx, "F", params, ret)
     end
-    s + ")->" + type_identity_key_resolved(env, ret)
-  when Type::Ptr(inner) then "Ptr[" + type_identity_key_resolved(env, inner) + "]"
-  when Type::PtrMut(inner) then "PtrMut[" + type_identity_key_resolved(env, inner) + "]"
-  when Type::RefInternal(inner, _) then "Ref[" + type_identity_key_resolved(env, inner) + "]"
+  when Type::Closure(cid, params, ret, _) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      match canon_render_callable(ctx, "Closure#" + cid.id.to_string(), params, ret)
+      when Result::Ok(c) then Result::Ok("Closure(" + c + ")")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    when TypeCanonFrame::CanonInternal then
+      match canon_render_callable(ctx, "closure#" + cid.id.to_string(), params, ret)
+      when Result::Ok(c) then Result::Ok("closure(" + c + ")")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    when TypeCanonFrame::CanonExternal then
+      # FAIL-CLOSED: the ClosureId is a per-compilation identity — a
+      # closure value has no stable public identity and never appears in
+      # an exported signature.
+      Result::Err("tangerine ABI: a closure value (ClosureId " + cid.id.to_string() + ") cannot appear in a public ABI symbol")
+    end
+  when Type::RefInternal(inner, mutable) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Ref[" + canon_render_unwrap(ctx, inner) + "]")
+    when TypeCanonFrame::CanonInternal then
+      if mutable then Result::Ok("refmut(" + canon_render_unwrap(ctx, inner) + ")") else Result::Ok("ref(" + canon_render_unwrap(ctx, inner) + ")") end
+    when TypeCanonFrame::CanonExternal then
+      match type_canon_render(ctx, inner)
+      when Result::Ok(ic) then
+        let tag = if mutable then "mut" else "ref" end
+        Result::Ok("R[" + tag + "|" + ic + "]")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    end
+  when Type::Ptr(inner) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Ptr[" + canon_render_unwrap(ctx, inner) + "]")
+    when TypeCanonFrame::CanonInternal then Result::Ok("ptr(" + canon_render_unwrap(ctx, inner) + ")")
+    when TypeCanonFrame::CanonExternal then
+      match type_canon_render(ctx, inner)
+      when Result::Ok(ic) then Result::Ok("P[" + ic + "]")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    end
+  when Type::PtrMut(inner) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("PtrMut[" + canon_render_unwrap(ctx, inner) + "]")
+    when TypeCanonFrame::CanonInternal then Result::Ok("ptrmut(" + canon_render_unwrap(ctx, inner) + ")")
+    when TypeCanonFrame::CanonExternal then
+      match type_canon_render(ctx, inner)
+      when Result::Ok(ic) then Result::Ok("Q[" + ic + "]")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    end
+  when Type::Dyn(tid) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Dyn#" + tid.id.to_string())
+    when TypeCanonFrame::CanonInternal then Result::Ok("dyn" + tid.id.to_string())
+    when TypeCanonFrame::CanonExternal then
+      match ctx.type_names.get(tid.id)
+      when Option::Some(path) then Result::Ok("D[" + path.clone() + "]")
+      when Option::None then
+        Result::Err("tangerine ABI: trait object TypeId " + tid.id.to_string() + " has no stable path — cannot canonicalize this Dyn for the public ABI")
+      end
+    end
   when Type::Effect(effects, inner) then
-    # P0-Q (defect fix): the identity includes the ACTUAL effect set — the
-    # canonical ordered render of the effect names — never just the inner
-    # type (effect[Io] T and effect[Net] T are different types).
-    "Effect[" + canonical_effect_set(&effects) + ";" + type_identity_key_resolved(env, inner) + "]"
-  when Type::Var(id) then "Var#" + id.id.to_string()
-  when Type::Param(gpid) then "Param(" + generic_param_name_of(&env.generic_param_table, &gpid) + ")"
-  when Type::Dyn(id) then "Dyn#" + id.id.to_string()
-  when _ then type_tag(env, ty)
+    # P0-Q (defect fix, carried through the consolidation): the identity
+    # includes the ACTUAL effect set — never just the inner type
+    # (effect[Io] T and effect[Net] T are different types). The
+    # CanonSemantic frame renders the canonical ordered EFFECT-ID set
+    # (M9); the Internal/External frames render the names in the same
+    # canonical order.
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("Effect[" + canonical_effect_set_render(ctx, &effects, true) + ";" + canon_render_unwrap(ctx, inner) + "]")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("eff(" + canonical_effect_set_render(ctx, &effects, false) + "|" + canon_render_unwrap(ctx, inner) + ")")
+    when TypeCanonFrame::CanonExternal then
+      match type_canon_render(ctx, inner)
+      when Result::Ok(ic) then Result::Ok("E[" + canonical_effect_set_render(ctx, &effects, false) + "|" + ic + "]")
+      when Result::Err(msg) then Result::Err(msg)
+      end
+    end
+  when Type::Var(id) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Var#" + id.id.to_string())
+    when TypeCanonFrame::CanonInternal then Result::Ok("var" + id.id.to_string())
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: inference variable (Type::Var) cannot appear in a public ABI symbol (resolve before mangling)")
+    end
+  when Type::Param(gpid) then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("Param(" + generic_param_name_from(&ctx.param_names, &gpid) + ")")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("param" + generic_param_id_numeric(&gpid).to_string())
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: type parameter `" + generic_param_name_from(&ctx.param_names, &gpid) + "` cannot appear in a public ABI symbol (canonicalize the instance first)")
+    end
+  when Type::Error then
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Error")
+    when TypeCanonFrame::CanonInternal then Result::Ok("err")
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: Type::Error cannot appear in a public ABI symbol")
+    end
+  end
+end
+
+# The callable-signature rendering shared by the frames: the parameter
+# access conventions are part of the canonical encoding (fn(let T) /
+# fn(inout T) / fn(sink T) / fn(set T) are different callable types).
+# head is the frame's callable tag ("Fn" / "FnPtr" / "fnptr" / "F" /
+# "Closure#<id>" / "closure#<id>"); the External frame renders the
+# bracket form "F[conv:ty,...|ret]".
+def canon_render_callable(ctx: &TypeCanonCtx, head: String, params: &Vec[ParamType], ret: &Type) -> Result[String, String]
+  var parts = Vec::new()
+  for p in params do
+    match type_canon_render(ctx, &p.ty)
+    when Result::Ok(c) then parts.push(canon_convention_tag(p.convention) + ":" + c)
+    when Result::Err(msg) then return Result::Err(msg)
+    end
+  end
+  match type_canon_render(ctx, ret)
+  when Result::Ok(rc) then
+    if ctx.frame == TypeCanonFrame::CanonExternal then
+      Result::Ok(head + "[" + parts.join(",") + "|" + rc + "]")
+    else
+      Result::Ok(head + "(" + parts.join(",") + ")->" + rc)
+    end
+  when Result::Err(msg) then Result::Err(msg)
+  end
+end
+
+# Unwrap the canonical render of an inner type (the Semantic/Internal
+# frames never fail — Result::Err is the External frame's fail-closed
+# policy only).
+def canon_render_unwrap(ctx: &TypeCanonCtx, ty: &Type) -> String
+  match type_canon_render(ctx, ty)
+  when Result::Ok(s) then s
+  when Result::Err(_) then "<err>"
+  end
+end
+
+# The Semantic frame's context, built from the checker's env (the
+# LangItems ids, the param-name table, the effect registry).
+def semantic_canon_ctx(env: &TypeEnv) -> TypeCanonCtx
+  TypeCanonCtx {
+    frame: TypeCanonFrame::CanonSemantic,
+    type_names: Map::new(),
+    param_names: env.generic_param_table.names.clone(),
+    lang_option: env.lang_items.option,
+    lang_result: env.lang_items.result,
+    lang_map: env.lang_items.map,
+    lang_set: env.lang_items.set,
+    lang_slice: env.lang_items.slice,
+    lang_array: env.lang_items.array,
+    lang_box: env.lang_items.box_,
+    lang_rc: env.lang_items.rc,
+    effects: env.effects
+  }
+end
+
+# The frontend type-identity frame: a structural identity string for a
+# (fully resolved) type — the canonical semantic type encoding with
+# conventions and effects — used as the (trait, type) key in the
+# obligation solver's cycle set, the type-property engine's memo key, and
+# the resource checker's identity table. The wrapper builds the Semantic
+# frame context and unwraps the render (never fails).
+def type_identity_key_resolved(env: &TypeEnv, ty: &Type) -> String
+  let ctx = semantic_canon_ctx(env)
+  match type_canon_render(&ctx, ty)
+  when Result::Ok(s) then s
+  when Result::Err(_) then "<identity>"
   end
 end
 
 def solve_obligation(env: &mut TypeEnv, obligation: &Obligation) -> Bool
   var visited: Set[String] = Set::new()
-  solve_obligation_depth(env, obligation, &mut visited, 0)
+  # P0-RL (resource limit): the recursion-limit flag is threaded through the
+  # entire solve. The depth guard sets it and fails the obligation; the
+  # OUTERMOST frame turns it into an explicit compiler-resource diagnostic
+  # on the error channel. Exceeding a resource limit is NEVER a semantic
+  # answer ("trait not implemented") — it is a compiler-resource error.
+  var resource_exceeded = false
+  let result = solve_obligation_depth(env, obligation, &mut visited, 0, &mut resource_exceeded)
+  if resource_exceeded && !result then
+    type_add_error(env, "trait solver recursion limit exceeded (trait `" + obligation.trait_name + "`)", Span { file: "", start: 0, end_pos: 0 })
+  end
+  result
 end
 
-def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: &mut Set[String], depth: Int) -> Bool
+def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: &mut Set[String], depth: Int, resource_exceeded: &mut Bool) -> Bool
+  # P0-RL (resource limit): the depth guard is a COMPILER RESOURCE limit,
+  # not a semantic answer. Exceeding it sets the resource-exceeded flag —
+  # threaded state, not a diagnostic that a candidate-probe rollback could
+  # truncate — and fails the obligation; the outermost solve_obligation
+  # frame reports the explicit resource diagnostic. It is NEVER a silent
+  # "trait not implemented".
   if depth > MAX_TYPE_DEPTH() then
+    resource_exceeded = true
     return false
   end
   let self_resolved = resolve_type_var(env, obligation.trait_ref.self_ty)
@@ -8036,18 +9519,25 @@ def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: 
     return false
   end
   visited.insert(key.clone())
+  # P0-CA (probe-all-then-commit-unique): the baseline is snapshotted ONCE
+  # before the candidate loop. EVERY candidate probes from that SAME
+  # baseline — a successful candidate SAVES its resulting substitution and
+  # the baseline is restored immediately, so no candidate ever probes
+  # against the mutated state of an earlier success, and an ambiguous
+  # result can never leave an earlier candidate's substitution committed.
+  # After the loop, exactly ONE success commits its SAVED substitution;
+  # zero or two-or-more successes leave the baseline unchanged.
+  let baseline = subst_snapshot(env)
+  let errs_baseline = env.errors.len()
   var solved_candidates = 0
+  var committed_subst: Option[Map[TypeVarId, Type]] = Option::None
   var i = 0
   while i < env.impls.len() do
     let imp = env.impls[i]
     if imp.trait_id.id == obligation.trait_ref.trait_id.id then
-      # P0-T (transactional probing): snapshot the subst state before the
-      # candidate attempt. On rejection the attempt is rolled back — a
-      # failed candidate must leave NO substitution residue in the global
-      # inference state (try_head_unify alone only discards diagnostics).
-      # On acceptance the candidate's substitutions commit.
-      let snap = subst_snapshot(env)
-      let errs_before = env.errors.len()
+      # The candidate probes from the SAME baseline as every other.
+      subst_restore(env, &baseline)
+      errors_truncate(env, errs_baseline)
       # P0-GPI (impl generic instantiation): one fresh inference variable
       # per impl generic parameter, in DECLARATION ORDER — ImplInfo.
       # generic_params is the EXCLUSIVE authority (never a head-derived
@@ -8064,32 +9554,28 @@ def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: 
       let head_inst = subst_type_args(&imp.for_type, &imp.generic_params, &vars)
       var cand_ok = try_head_unify(env, head_inst, self_resolved.clone())
       if cand_ok then
-        # P0-1 (trait-argument matching): the impl's trait arguments — the
-        # impl declaration's generic arguments (the parser derives the
-        # impl's generic parameters from the trait's type arguments in the
-        # `impl Iterator[T] for Type` form; in the leading-generics form
-        # they are the impl's generic parameters in declaration order) —
-        # instantiate to exactly this fresh-variable vector, positionally.
-        # A candidate must unify them against the obligation's args: two
-        # impls with the same self type but different trait arguments
-        # (From[A] vs From[B], Into[Out], Iterator[Item = X] vs
-        # Iterator[Item = Y]) are distinguished here. An args-less
-        # obligation (e.g. satisfies_trait by bare name) imposes no
-        # argument constraint.
+        # P0-CA (authoritative trait-argument matching): the impl's trait
+        # arguments are ImplInfo.trait_ref — the DECLARED trait reference
+        # captured from the AST's impl declaration at registration — NEVER
+        # an approximation from the impl's generic-parameter count. They
+        # are instantiated with the candidate's fresh variables and unified
+        # against the obligation's args, positionally: two impls with the
+        # same self type but different trait arguments (From[A] vs From[B],
+        # Into[Out], Iterator[Item = X] vs Iterator[Item = Y]) are
+        # distinguished here. An args-less obligation (e.g. satisfies_trait
+        # by bare name) imposes no argument constraint. A trait-arg ARITY
+        # mismatch between the impl's declaration and the obligation is a
+        # UNIFICATION FAILURE (the candidate is rejected) — the head-only
+        # degradation is DELETED.
         if ob_args.len() > 0 then
-          # Arity-equal obligations enforce the trait arguments positionally.
-          # An arity-MISMATCHED pair degrades to head-only matching: the
-          # impl declaration's trait arguments are the impl's generic
-          # arguments in declaration order, and the parser-derived vector
-          # can be arity-incoherent for the leading-generics form (e.g.
-          # `impl[K, V] Iterator[(K, V)] for MapIterator[K, V]` carries the
-          # tuple arg only in the trait reference the AST drops) — the
-          # impl still matches by head, exactly as before.
-          if ob_args.len() == imp.generic_params.len() then
+          if ob_args.len() != imp.trait_ref.args.len() then
+            cand_ok = false
+          else
             var ai = 0
-            while ai < ob_args.len() do
+            while cand_ok && ai < ob_args.len() do
+              let imp_arg = resolve_type_var(env, subst_type_args(&imp.trait_ref.args[ai], &imp.generic_params, &vars))
               let resolved_arg = resolve_type_var(env, ob_args[ai].clone())
-              if !try_head_unify(env, vars[ai].clone(), resolved_arg) then
+              if !try_head_unify(env, imp_arg, resolved_arg) then
                 cand_ok = false
               end
               ai = ai + 1
@@ -8113,28 +9599,36 @@ def solve_obligation_depth(env: &mut TypeEnv, obligation: &Obligation, visited: 
             wob_args.push(resolve_type_var(env, subst_type_args(&wob_arg, &imp.generic_params, &vars)))
           end
           let wob_ob = Obligation { trait_ref: TraitRef { trait_id: wob.trait_id, self_ty: wob_self, args: wob_args }, trait_name: wob.trait_name }
-          if !solve_obligation_depth(env, &wob_ob, visited, depth + 1) then
+          if !solve_obligation_depth(env, &wob_ob, visited, depth + 1, resource_exceeded) then
             all_ok = false
           end
         end
         if all_ok then
-          # Commit: the candidate's substitutions stay in the subst state.
+          # Probe succeeded: SAVE the candidate's resulting substitution
+          # (the full subst state at the success moment) and restore the
+          # baseline — the next candidate probes the SAME state, and the
+          # commit decision below replays the saved substitution.
           solved_candidates = solved_candidates + 1
-        else
-          # Reject: roll the subst state back — no residue.
-          subst_restore(env, &snap)
-          errors_truncate(env, errs_before)
+          committed_subst = Option::Some(subst_snapshot(env))
         end
-      else
-        # The head or the trait arguments did not match: roll back.
-        subst_restore(env, &snap)
-        errors_truncate(env, errs_before)
       end
+      # The candidate's probe state is discarded — the next iteration
+      # restores the baseline, and the commit decision restores it too.
     end
     i = i + 1
   end
   visited.remove(&key)
+  # Commit decision: restore the baseline, then replay the UNIQUE
+  # successful candidate's SAVED substitution. An ambiguous result (0 or
+  # 2+ successes) leaves the baseline unchanged — NO substitution is
+  # committed, exactly as if the solve had never run.
+  subst_restore(env, &baseline)
+  errors_truncate(env, errs_baseline)
   if solved_candidates == 1 then
+    match committed_subst
+    when Option::Some(saved) then subst_restore(env, &saved)
+    when Option::None then ()
+    end
     # Exactly one fully-solving candidate: no candidate fails, and multiple
     # candidates would be ambiguous.
     true
@@ -8162,11 +9656,17 @@ def impl_bounds_satisfied(env: &mut TypeEnv, info: &ImplInfo, recv_type: &Type) 
   if info.obligations.is_empty() then
     return true
   end
-  # P0-T: the whole gate is a TRANSACTIONAL probe — the head unification
-  # and the nested obligation solving must leave no substitution residue
-  # and no diagnostics on failure.
-  let snap = subst_snapshot(env)
-  let errs_before = env.errors.len()
+  # P0-CA (probe-all-then-commit-unique): the whole gate is ONE probe. The
+  # baseline is snapshotted up front; the head unification and every
+  # where-clause obligation are solved against that SAME baseline; the gate
+  # commits ONLY the witness of a fully successful probe — on failure the
+  # baseline is restored unchanged (no committed substitution, no
+  # diagnostics). Each nested solve is itself probe-all-then-commit-unique,
+  # so an ambiguous multi-candidate obligation returns false with ITS
+  # baseline unchanged and no substitution can survive into the next
+  # obligation.
+  let baseline = subst_snapshot(env)
+  let errs_baseline = env.errors.len()
   # P0-GPI: one fresh inference variable per impl generic parameter, in
   # DECLARATION ORDER — ImplInfo.generic_params is the EXCLUSIVE authority
   # (never a head-derived scan). The self type of each obligation is the
@@ -8194,13 +9694,20 @@ def impl_bounds_satisfied(env: &mut TypeEnv, info: &ImplInfo, recv_type: &Type) 
       end
       let ob = Obligation { trait_ref: TraitRef { trait_id: obligation.trait_id, self_ty: self_ty, args: ob_args }, trait_name: obligation.trait_name }
       if !solve_obligation(env, &ob) then
+        # A failed obligation invalidates the whole gate: restore the
+        # baseline immediately (no substitution from a partially-probed
+        # gate can survive) and stop — the remaining obligations must not
+        # probe against a polluted state.
         all_ok = false
+        subst_restore(env, &baseline)
+        errors_truncate(env, errs_baseline)
+        break
       end
     end
   end
   if !all_ok then
-    subst_restore(env, &snap)
-    errors_truncate(env, errs_before)
+    subst_restore(env, &baseline)
+    errors_truncate(env, errs_baseline)
   end
   all_ok
 end
@@ -8221,7 +9728,8 @@ end
 # A Visiting revisit is a recursion through INLINE storage — the layout
 # engine panics on such types; this engine reports a TypeError diagnostic
 # ("infinitely sized recursive type") instead and treats the revisit as
-# NON-owning-but-unsafe: needs_drop=false and is_trivially_copyable=false.
+# NON-owning-but-unsafe: owns_state=false/requires_drop_glue=false and
+# is_trivially_copyable=false.
 # Indirections (Ptr/Box/Rc) terminate the walk: their properties are decided
 # by the pointer layer, not the pointee.
 #
@@ -8229,9 +9737,9 @@ end
 # algorithm is the complete cycle solution, so a deep-but-finite chain
 # (Wrapper[Wrapper[...File...]]) is walked to its concrete leaves and
 # classified by them — it can never be "too deep to know" and fall back to
-# needs_drop=false/is_linear=false. Any compiler resource limit that is ever
-# reintroduced must be a compilation diagnostic (an error), never a semantic
-# answer.
+# owns_state=false/requires_drop_glue=false/is_linear=false. Any compiler
+# resource limit that is ever reintroduced must be a compilation diagnostic
+# (an error), never a semantic answer.
 #
 # CONCRETE OWNERSHIP vs NOMINAL TypeKind: this engine computes ownership for
 # the concrete type identity (TypeId, substitutions). The nominal
@@ -8243,21 +9751,28 @@ end
 # an unresolved Type::Var) in the type graph yields is_deferred=true — the
 # answer is "unknown/deferred", NEVER a concrete semantic answer. A generic
 # local may require CONDITIONAL drop after substitution, so while deferred
-# the four semantic fields are non-authoritative (false = "not proven
+# the six semantic fields are non-authoritative (false = "not proven
 # true"). The concrete answers appear only after substitution: the MIR/mono
 # consumer wave substitutes the Param and re-queries this engine on the
 # concrete instantiation. Container layers that decide a property
-# unconditionally keep it concrete (e.g. Vec[T] needs_drop=true regardless
-# of T; Slice[T] is a non-owning view regardless of T).
+# unconditionally keep it concrete (e.g. Vec[T] requires_drop_glue=true
+# regardless of T; Slice[T] is a non-owning view regardless of T).
 #
-# STRING CONTRACT: String owns a UNIQUE heap buffer (the FROZEN StringPtr
-# ABI — one 8-byte pointer to null-terminated UTF-8), so needs_drop=true is
-# its ownership contract (moves transfer the buffer; it is never
-# bit-copyable). The runtime reclaims buffers with its arena (no per-string
-# deallocation path — std/core.tg "String ownership contract"); arena
-# reclaim is a RUNTIME DETAIL, not a per-value Drop, so the MIR drop plan
-# for String is Trivial. PENDING: generated drop glue for recursive owning
-# types (docs/memory_model.md §15.2).
+# STRING CONTRACT (P0-STRING — the owned String object): String owns a
+# UNIQUE heap buffer. The String VALUE is ONE 8-byte pointer to the
+# 32-byte String OBJECT header {data@0, len@8, cap@16, stride@24} (data
+# points to the null-terminated UTF-8 bytes; the header is what mutation
+# needs — push/push_str grow the owned buffer in place). owns_state=true
+# is the ownership contract (moves transfer the buffer; it is never
+# bit-copyable — String is Clone, NOT Copy). The runtime reclaims objects
+# with its arena (no per-string deallocation path — runtime.tg "String
+# Object Runtime"); arena reclaim is a RUNTIME DETAIL, not a per-value
+# Drop, so the MIR drop plan for String is Trivial and requires_drop_glue
+# stays false for String (the arena/owned split). A String-containing
+# aggregate inherits BOTH answers: owns_state=true, requires_drop_glue=false
+# — it must never be bit-copied, yet needs no destructor. PENDING:
+# generated drop glue for recursive owning types (docs/memory_model.md
+# §15.2).
 #
 # This engine is THE ownership authority: the resource checker and MIR
 # consume it on the concrete type identity (engine_snapshot_env /
@@ -8287,21 +9802,21 @@ def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, Typ
       # Recursion through INLINE storage: infinitely sized recursive type.
       # The layout engine panics on such types; the property engine reports
       # the diagnostic instead. The revisit is NON-owning-but-unsafe:
-      # needs_drop=false (no ownership claimed) and is_trivially_copyable
-      # =false (an infinitely sized value can never be copied). The
-      # diagnostic (an error) is the semantic answer — never a silent
-      # fail-open value.
+      # owns_state=false/requires_drop_glue=false (no ownership claimed) and
+      # is_trivially_copyable=false (an infinitely sized value can never be
+      # copied). The diagnostic (an error) is the semantic answer — never a
+      # silent fail-open value.
       env.errors.push(TypeError {
         message: "infinitely sized recursive type: inline storage cycle (use a pointer or Box to break the cycle)",
         span: Span { file: "", start: 0, end_pos: 0 },
         code: Option::None
       })
-      return TypeProperties { needs_drop: false, is_linear: false, is_capability: false, is_trivially_copyable: false, is_deferred: false }
+      return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
     end
   when Option::None then ()
   end
   visiting.insert(key.clone(), TypePropVisitState::Visiting)
-  var props = TypeProperties { needs_drop: false, is_linear: false, is_capability: false, is_trivially_copyable: false, is_deferred: false }
+  var props = TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
   match ty
   # Plain data: no drop, not linear, not a capability, bit-copyable.
   when Type::Unit then ()
@@ -8325,12 +9840,16 @@ def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, Typ
   when Type::USize then ()
   when Type::F32 then ()
   when Type::F64 then ()
-  # String owns a unique heap buffer (FROZEN StringPtr ABI): needs_drop=true
-  # is the ownership contract; never bit-copyable (clone() is the explicit
-  # allocation). Arena reclaim is a runtime detail — see the STRING CONTRACT
-  # note in the engine header.
+  # String owns a unique heap buffer — the OWNED String object (P0-STRING:
+  # the value is one pointer to the 32-byte {data,len,cap,stride} String
+  # object; see the contract in std/core.tg and runtime.tg "String Object
+  # Runtime"): owns_state=true is the ownership contract (the checker's
+  # resource axis — never bit-copyable: clone() is the explicit
+  # allocation). The MIR drop plan for String stays Trivial — arena
+  # reclaim is a runtime detail, not a per-value Drop — so
+  # requires_drop_glue stays false for the String split.
   when Type::String then
-    props.needs_drop = true
+    props.owns_state = true
   # Raw pointers terminate the walk: no ownership, no drop, bit-copyable.
   when Type::Ptr(_) then ()
   when Type::PtrMut(_) then ()
@@ -8338,8 +9857,10 @@ def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, Typ
     var i = 0
     while i < fields.len() do
       let fp = type_props_walk(env, &fields[i], visiting)
-      if fp.needs_drop then props.needs_drop = true end
+      if fp.owns_state then props.owns_state = true end
+      if fp.requires_drop_glue then props.requires_drop_glue = true end
       if fp.is_linear then props.is_linear = true end
+      if fp.contains_capability then props.contains_capability = true end
       if fp.is_deferred then props.is_deferred = true end
       i = i + 1
     end
@@ -8348,18 +9869,39 @@ def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, Typ
   when Type::Adt(tid, args) then
     type_named_props(env, tid, args, visiting, &mut props)
   # Fixed arrays are inline element storage: the element's ownership
-  # propagates (needs_drop / linearity walk the element).
+  # propagates (owns_state / requires_drop_glue / linearity / capability
+  # containment walk the element).
   when Type::FixedArray(elem, _) then
     let fp = type_props_walk(env, &elem, visiting)
-    if fp.needs_drop then props.needs_drop = true end
+    if fp.owns_state then props.owns_state = true end
+    if fp.requires_drop_glue then props.requires_drop_glue = true end
     if fp.is_linear then props.is_linear = true end
+    if fp.contains_capability then props.contains_capability = true end
     if fp.is_deferred then props.is_deferred = true end
-  # Closures/functions with environments and dyn/effect/ref forms carry
+  # Closures/functions with environments and dyn/effect forms carry
   # checker-managed state: nothing here owns or copies.
   when Type::Function(_, _) then ()
+  # P1 (FnPtr/Closure split): a function POINTER carries no environment;
+  # a CLOSURE's properties derive from its CAPTURE TUPLE (a closure
+  # capturing an owning value owns it; the capture tuple's
+  # requires_drop_glue / linearity / capability containment propagate).
+  when Type::FnPtr(_, _) then ()
+  when Type::Closure(_, _, _, captures) then
+    let cp = type_props_walk(env, &captures, visiting)
+    if cp.owns_state then props.owns_state = true end
+    if cp.requires_drop_glue then props.requires_drop_glue = true end
+    if cp.is_linear then props.is_linear = true end
+    if cp.contains_capability then props.contains_capability = true end
+    if cp.is_deferred then props.is_deferred = true end
   when Type::Dyn(_) then ()
   when Type::Effect(_, _) then ()
-  when Type::RefInternal(_, _) then ()
+  # A ref to a capability contains a capability (the borrow does not
+  # transfer it) — capability containment propagates through the ref,
+  # mirroring the checker's containment walk; no other property crosses
+  # the ref boundary.
+  when Type::RefInternal(inner, _) then
+    let rp = type_props_walk(env, inner, visiting)
+    if rp.contains_capability then props.contains_capability = true end
   when Type::Var(_) then
     # An unresolved inference variable is DEFERRED (fail-closed):
     # resolve_type_var resolves at the entry point; a Var that survives has
@@ -8368,7 +9910,7 @@ def type_props_walk(env: &mut TypeEnv, ty: &Type, visiting: &mut Map[String, Typ
   when Type::Param(_) then
     # Generic ownership polymorphism: an unsubstituted generic parameter is
     # UNKNOWN/DEFERRED, never a concrete semantic answer — a generic local
-    # may require conditional drop after substitution. The four semantic
+    # may require conditional drop after substitution. The six semantic
     # fields stay false but are NON-authoritative (is_deferred is set);
     # concrete answers appear only after substitution (the MIR/mono wave).
     props.is_deferred = true
@@ -8414,36 +9956,47 @@ end
 #
 # THE CONTAINER LAYER IS THE OWNERSHIP AUTHORITY (per its real contract):
 #   Vec[T] / Array[T]  — heap-vector HANDLE owning its buffer:
-#                        needs_drop = true REGARDLESS of T; is_linear = the
-#                        chosen move model of T (T.is_linear)
-#   Map[K,V] / Set[T]  — heap map/set handle: needs_drop = true regardless
-#                        of K/V; element linearity stays viral
-#   Option[T]          — inline tagged storage: needs_drop = T.needs_drop
-#   Result[T,E]        — inline tagged storage: needs_drop = T || E
+#                        owns_state = requires_drop_glue = true REGARDLESS
+#                        of T; is_linear = the chosen move model of T
+#                        (T.is_linear)
+#   Map[K,V] / Set[T]  — heap map/set handle: owns_state =
+#                        requires_drop_glue = true regardless of K/V;
+#                        element linearity stays viral
+#   Option[T]          — inline tagged storage: the T bundle propagates
+#                        (owns_state/requires_drop_glue = T's)
+#   Result[T,E]        — inline tagged storage: T || E propagation
 #   FixedArray[T,N]    — inline element storage (the Type::FixedArray arm):
 #                        element propagation only
-#   String             — owns a unique buffer: needs_drop = true (see the
-#                        STRING CONTRACT note in the engine header)
-#   Slice[T]           — non-owning {ptr,len} view: owns nothing
+#   String             — owns a unique buffer: owns_state = true (see the
+#                        STRING CONTRACT note above — the owned String
+#                        object), requires_drop_glue = false (the arena
+#                        reclaims — no per-value Drop)
+#   Slice[T]           — non-owning {ptr,len} view: owns nothing, drop=none
 #
 # SMART-POINTER LINEARITY (the shared handles are NOT linear — their clone
 # is the retain/increment, the normal duplication operation; only the unique
 # owners are move-only):
-#   Box / UniquePtr    — needs_drop = true, is_linear = true
-#   Rc / ArcStrong / WeakRc / WeakArc — needs_drop = true, is_linear = false
+#   Box / UniquePtr    — owns_state = requires_drop_glue = true, is_linear = true
+#   Rc / ArcStrong / WeakRc / WeakArc — owns_state = requires_drop_glue =
+#                        true, is_linear = false
 def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting: &mut Map[String, TypePropVisitState], props: &mut TypeProperties) -> Unit
   match get_type_by_id_ref(env, tid)
   when Option::Some(td) then
     if td.kind == TypeKind::Resource || td.kind == TypeKind::Capability then
       # Resources/capabilities are linear by kind; is_capability is the
-      # TypeKind::Capability marker.
+      # TypeKind::Capability marker, and a capability type contains a
+      # capability (itself).
       props.is_linear = true
       if td.kind == TypeKind::Capability then
         props.is_capability = true
+        props.contains_capability = true
       end
     end
     if type_has_registered_drop(env, tid) then
-      props.needs_drop = true
+      # A registered Drop impl (File's fd-close, ...) is BOTH an ownership
+      # claim and a physical destructor: the drop glue must run.
+      props.owns_state = true
+      props.requires_drop_glue = true
     end
     # Named owning smart pointers: owns an allocation or reference-count
     # state. The UNIQUE owners (Box, UniquePtr) are linear — a bitwise copy
@@ -8454,33 +10007,40 @@ def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting
     # name-selected.
     if tid.id == env.lang_items.box_ || tid.id == env.lang_items.rc || td.name == "UniquePtr" ||
        td.name == "WeakRc" || td.name == "ArcStrong" || td.name == "WeakArc" then
-      props.needs_drop = true
+      props.owns_state = true
+      props.requires_drop_glue = true
       if tid.id == env.lang_items.box_ || td.name == "UniquePtr" then
         props.is_linear = true
       end
     elsif tid.id == env.lang_items.vec || tid.id == env.lang_items.array || tid.id == env.lang_items.map ||
           tid.id == env.lang_items.set then
-      # Heap-backed container HANDLES OWN their allocation: needs_drop is
-      # TRUE regardless of the element types (Vec[Int] still frees its
-      # buffer; Map[Int,Int] still frees its bucket arena). Element
-      # linearity is viral over the concrete args (the chosen move model of
-      # T); element deferral propagates (Vec[T] with T unsubstituted has an
-      # undecided is_linear — is_deferred).
-      props.needs_drop = true
+      # Heap-backed container HANDLES OWN their allocation: owns_state =
+      # requires_drop_glue = TRUE regardless of the element types (Vec[Int]
+      # still frees its buffer; Map[Int,Int] still frees its bucket arena).
+      # Element linearity is viral over the concrete args (the chosen move
+      # model of T); element deferral propagates (Vec[T] with T
+      # unsubstituted has an undecided is_linear — is_deferred); element
+      # capability containment is viral (a Vec of capabilities holds
+      # capabilities).
+      props.owns_state = true
+      props.requires_drop_glue = true
       var i = 0
       while i < args.len() do
         let ap = type_props_walk(env, &args[i], visiting)
         if ap.is_linear then props.is_linear = true end
+        if ap.contains_capability then props.contains_capability = true end
         if ap.is_deferred then props.is_deferred = true end
         i = i + 1
       end
     elsif tid.id == env.lang_items.option then
       # Option[T] is inline tagged storage: element propagation only (a
-      # None carries nothing, a Some carries T — T's ownership decides).
+      # None carries nothing, a Some carries T — T's bundle decides).
       if args.len() >= 1 then
         let ap = type_props_walk(env, &args[0], visiting)
-        if ap.needs_drop then props.needs_drop = true end
+        if ap.owns_state then props.owns_state = true end
+        if ap.requires_drop_glue then props.requires_drop_glue = true end
         if ap.is_linear then props.is_linear = true end
+        if ap.contains_capability then props.contains_capability = true end
         if ap.is_deferred then props.is_deferred = true end
       end
     elsif tid.id == env.lang_items.result then
@@ -8488,25 +10048,32 @@ def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting
       if args.len() >= 2 then
         let tp = type_props_walk(env, &args[0], visiting)
         let ep = type_props_walk(env, &args[1], visiting)
-        if tp.needs_drop || ep.needs_drop then props.needs_drop = true end
+        if tp.owns_state || ep.owns_state then props.owns_state = true end
+        if tp.requires_drop_glue || ep.requires_drop_glue then props.requires_drop_glue = true end
         if tp.is_linear || ep.is_linear then props.is_linear = true end
+        if tp.contains_capability || ep.contains_capability then props.contains_capability = true end
         if tp.is_deferred || ep.is_deferred then props.is_deferred = true end
       end
     elsif tid.id == env.lang_items.slice then
       # Slice[T] — the compiler-scoped VIEW { ptr: Ptr[T], len: UInt }:
-      # owns=false, drop=none, not linear. The element type's ownership
-      # lives in the backing container, never in the view; nothing here
-      # walks the args (mirror of the Ptr/StrView classification).
+      # owns=false, drop=none, not linear, contains no capability (the view
+      # holds no payload — the capability lives in the backing container).
+      # The element type's ownership lives in the backing container, never
+      # in the view; nothing here walks the args (mirror of the
+      # Ptr/StrView classification).
       ()
     elsif td.name == "Ptr" || td.name == "PtrMut" then
       # Raw pointers: no ownership; the pointer layer decides.
       ()
     elsif td.name == "String" then
-      # String owns a unique heap buffer (StringPtr ABI): needs_drop=true
-      # per the real ownership contract; the arena-reclaim runtime contract
-      # (no per-string deallocation path) is documented in std/core.tg and
-      # the engine header.
-      props.needs_drop = true
+      # String owns a unique heap buffer — the OWNED String object
+      # (P0-STRING: the value is one pointer to the 32-byte
+      # {data,len,cap,stride} object): owns_state=true per the real
+      # ownership contract; the arena-reclaim runtime contract (no
+      # per-string deallocation path, Trivial drop plan) is documented in
+      # std/core.tg and the runtime.tg "String Object Runtime" section —
+      # requires_drop_glue stays false for the String split.
+      props.owns_state = true
     elsif td.name == "str" then
       # `str` is the non-owning borrowed UTF-8 view: owns nothing.
       ()
@@ -8517,8 +10084,13 @@ def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting
         while i < fields.len() do
           let f_ty = subst_type_args(&fields[i].ty, &td.generic_params, args)
           let fp = type_props_walk(env, &f_ty, visiting)
-          if fp.needs_drop then props.needs_drop = true end
+          if fp.owns_state then props.owns_state = true end
+          if fp.requires_drop_glue then props.requires_drop_glue = true end
           if fp.is_linear then props.is_linear = true end
+          # P0 (capability containment): an aggregate containing a
+          # capability FIELD contains a capability (the substituted field
+          # walk above is the propagation).
+          if fp.contains_capability then props.contains_capability = true end
           if fp.is_deferred then props.is_deferred = true end
           i = i + 1
         end
@@ -8529,8 +10101,10 @@ def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting
           while fi < variants[vi].fields.len() do
             let v_ty = subst_type_args(&variants[vi].fields[fi], &td.generic_params, args)
             let vp = type_props_walk(env, &v_ty, visiting)
-            if vp.needs_drop then props.needs_drop = true end
+            if vp.owns_state then props.owns_state = true end
+            if vp.requires_drop_glue then props.requires_drop_glue = true end
             if vp.is_linear then props.is_linear = true end
+            if vp.contains_capability then props.contains_capability = true end
             if vp.is_deferred then props.is_deferred = true end
             fi = fi + 1
           end
@@ -8539,9 +10113,11 @@ def type_named_props(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visiting
       when TypeDefKind::Alias(inner) then
         let inner_ty = subst_type_args(&inner, &td.generic_params, args)
         let ip = type_props_walk(env, &inner_ty, visiting)
-        if ip.needs_drop then props.needs_drop = true end
+        if ip.owns_state then props.owns_state = true end
+        if ip.requires_drop_glue then props.requires_drop_glue = true end
         if ip.is_linear then props.is_linear = true end
         if ip.is_capability then props.is_capability = true end
+        if ip.contains_capability then props.contains_capability = true end
         if ip.is_deferred then props.is_deferred = true end
       when _ then ()
       end
@@ -9314,7 +10890,7 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
               fn_params.push(ParamType { ty: field_types[fi2], convention: AccessConvention::Let })
               fi2 = fi2 + 1
             end
-            Type::Function(fn_params, enum_type)
+            Type::FnPtr(fn_params, enum_type)
           end
         when Option::None then
           # Unknown identifier: a name that survives type-name, enum-variant
@@ -9337,7 +10913,16 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
   when ExprKind::ExprUnaryOp(op, inner) then
     check_unary_op(env, op, &inner, expr.span)
   when ExprKind::ExprCall(func, args) then
-    let func_type = check_expr(env, &func)
+    var func_type = check_expr(env, &func)
+    # P1 (FnPtr/Closure split): the call-shape analysis below keys on the
+    # legacy Function form; a FnPtr or Closure callee NORMALIZES to it
+    # (the signature is identical — the call-shape semantics are the same
+    # for a function pointer and a closure value).
+    match func_type
+    when Type::FnPtr(ps, rt) then func_type = Type::Function(ps, rt)
+    when Type::Closure(_, ps, rt, _) then func_type = Type::Function(ps, rt)
+    when _ then ()
+    end
     env.access_marker_depth = env.access_marker_depth + 1
     var arg_types = Vec::new()
     var i = 0
@@ -9346,6 +10931,16 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       i = i + 1
     end
     env.access_marker_depth = env.access_marker_depth - 1
+    # P1 (IntrinsicId at check time): attach the semantic classification of
+    # an intrinsic call (the __intrinsic_* family — the resolver registered
+    # their DefIds — and the builtin-container method names) per call node.
+    match callee_ident_name(&func)
+    when Option::Some(cname) then
+      let call_recv = if arg_types.len() > 0 then arg_types[0].clone() else Type::Unit end
+      let call_needle = if arg_types.len() > 1 then arg_types[1].clone() else Type::Unit end
+      record_intrinsic_classification(env, expr.node_id, &cname, &call_recv, &call_needle, &cname)
+    when Option::None then ()
+    end
     let ret_type = fresh_type_var(env)
     var call_was_generic = false
     match func_type
@@ -9631,6 +11226,12 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     # node id threads the solved-substitution record into the generic
     # instantiation, see instantiate_method_type).
     let ret = resolve_method_type(env, &recv_type, method, &arg_types, &method_type_args, expr.node_id, expr.span)
+    # P1 (IntrinsicId at check time): attach the semantic classification of
+    # the builtin-container method intrinsics (push/pop/get/set/len/... on
+    # String/Array/Map/Set — the receiver gate keeps a user method on a
+    # user type from ever classifying).
+    let meth_needle = if arg_types.len() > 1 then arg_types[1].clone() else Type::Unit end
+    record_intrinsic_classification(env, expr.node_id, &method, &recv_type, &meth_needle, &method)
     let mdid = method_def_for(env, &recv_type, method)
     match mdid
     when Option::Some(did) then env.typed_call_targets.insert(expr.node_id, did)
@@ -9855,6 +11456,9 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
         unify(env, elem_type, t, elems[i].span)
         i = i + 1
       end
+      # P0-SL (channel b): an array/vec literal whose element type is (or
+      # contains) the Slice view stores the view in a container — rejected.
+      check_no_escaping_slice(env, &elem_type, expr.span, "stored in a container (array/vec literal element)")
       # The generic array literal is the heap-vector Adt form (the named
       # Array[T]); a FixedArray-typed literal is produced when the literal
       # unifies with a [T; N] annotation (the distinct Type::FixedArray
@@ -9874,7 +11478,11 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     var types = Vec::new()
     var i = 0
     while i < elems.len() do
-      types.push(check_expr(env, &elems[i]))
+      let elem_ty = check_expr(env, &elems[i])
+      # P0-SL (channel b): a tuple literal whose element type is (or
+      # contains) the Slice view stores the view in a container — rejected.
+      check_no_escaping_slice(env, &elem_ty, elems[i].span, "stored in a container (tuple literal element)")
+      types.push(elem_ty)
       i = i + 1
     end
     Type::Tuple(types)
@@ -10019,6 +11627,9 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     when Option::None then fresh_type_var(env)
     end
     env.expected_return = Option::Some(closure_ret.clone())
+    # P0-SL (channel a): a closure annotated with (or returning) a Slice
+    # view would let the view escape with the closure value — rejected.
+    check_no_escaping_slice(env, &closure_ret, body.span, "returned from a closure")
     let body_type = check_expr(env, &body)
     unify(env, body_type, closure_ret.clone(), body.span)
     env.expected_return = saved_expected_return
@@ -10027,6 +11638,22 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
     # capture records (scan_operand). uses = captured local id -> effect
     # (the closure_captures record); nodes = capture-node id -> effect.
     let scan = scan_closure_captures(env, &params, &body)
+    # P0-SL (channel c): a captured local whose type is (or contains) the
+    # Slice view must not be captured into the closure — the closure env
+    # would hold the view past its backing buffer's lifetime (the capture
+    # would also escape under channel b as stored state).
+    let cap_entries = scan.uses.entries()
+    var cei = 0
+    while cei < cap_entries.len() do
+      match env.typed_local_bindings.get(cap_entries[cei].0)
+      when Option::Some(cap_lb) then
+        if type_contains_slice_view(env, &cap_lb.ty) then
+          type_add_error(env, "cannot capture a safe Slice into a closure: the view borrows its backing buffer and must not outlive it (capture the owned clone instead)", body.span)
+        end
+      when Option::None then ()
+      end
+      cei = cei + 1
+    end
     env.closure_captures.insert(expr.node_id, scan.uses)
     # Missing-metadata rule: every capture node's effect is recorded in
     # typed_access_effects (insert-only — a node that is ALSO a call
@@ -10041,7 +11668,44 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
       ni = ni + 1
     end
     pop_scope(env)
-    Type::Function(param_types, closure_ret)
+    # P1 (FnPtr/Closure split): the closure EXPRESSION types as the
+    # Closure form — ClosureId (the closure node's identity — node ids are
+    # globally unique within one compilation), the signature, and the
+    # CAPTURE TUPLE type (Type::Tuple of the captured locals' types, in
+    # local-id order). The closure object's layout/ABI derives from the
+    # captures; the closure's TypeProperties derive from the capture tuple
+    # (a closure capturing an owning value owns it). The legacy
+    # Type::Function form is no longer produced here.
+    let cap_entries = scan.uses.entries()
+    var cap_list: Vec[(Int, Type)] = Vec::new()
+    var ci = 0
+    while ci < cap_entries.len() do
+      let cap_local_id = cap_entries[ci].0
+      let cap_ty = match env.typed_local_bindings.get(cap_local_id)
+      when Option::Some(lb) then lb.ty.clone()
+      when Option::None then Type::Unit
+      end
+      cap_list.push((cap_local_id, cap_ty))
+      ci = ci + 1
+    end
+    # Deterministic capture order: the capture tuple's element order is the
+    # captured locals' id order (Map iteration order is not canonical).
+    var csi = 1
+    while csi < cap_list.len() do
+      var csj = csi
+      while csj > 0 && cap_list[csj].0 < cap_list[csj - 1].0 do
+        let tmp = cap_list[csj]
+        cap_list[csj] = cap_list[csj - 1]
+        cap_list[csj - 1] = tmp
+        csj = csj - 1
+      end
+      csi = csi + 1
+    end
+    var cap_tys = Vec::new()
+    for (_, ct) in cap_list do
+      cap_tys.push(ct)
+    end
+    Type::Closure(ClosureId { id: expr.node_id }, param_types, closure_ret, Type::Tuple(cap_tys))
   when ExprKind::ExprIf(if_stmt) then
     # P0-M: an if used as a value contributes its flow's normal type (with
     # the Unit false-path rule for a missing else enforced inside).
@@ -10369,11 +12033,32 @@ def check_expr(env: &mut TypeEnv, expr: &Expr) -> Type
                       if sp_arg_ok then
                         # The call target: the method's resolver DefId (the
                         # identity the MIR's method_def_ids / call-site
-                        # instances carry).
-                        match imp.method_defs.get(variant_name.clone())
-                        when Option::Some(sp_mdid) then
-                          env.typed_call_targets.insert(expr.node_id, sp_mdid.clone())
-                        when Option::None then ()
+                        # instances carry) — through the SEMANTIC
+                        # registration (module_symbols' qualified
+                        # "path::Type::method" entries): the impl's
+                        # for_type key (reconstructed from the concrete
+                        # for_type) resolved at the owner type's
+                        # registration path, then the qualified scan.
+                        let imp_key = impl_method_key_from_type(env, &imp.for_type, &variant_name)
+                        if imp_key != "" then
+                          match imp.for_type
+                          when Type::Adt(imp_tid, _) then
+                            let imp_path = type_registration_module_path(env, &imp_tid)
+                            match qualified_method_def(env, &imp_path, &imp_key)
+                            when Option::Some(sp_mdid) then
+                              env.typed_call_targets.insert(expr.node_id, sp_mdid.clone())
+                            when Option::None then
+                              match scan_qualified_method_def(env, &imp_key)
+                              when Option::Some(sp_mdid2) then env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
+                              when Option::None then ()
+                              end
+                            end
+                          when _ then
+                            match scan_qualified_method_def(env, &imp_key)
+                            when Option::Some(sp_mdid3) then env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
+                            when Option::None then ()
+                            end
+                          end
                         end
                         # The solved substitution in the merged declaration
                         # order; an unsolved parameter (a return-type-only
@@ -10539,7 +12224,7 @@ def resolve_field_type(env: &mut TypeEnv, recv_type: &Type, field: String, span:
       Type::Error
     end
   when Type::Var(_) then fresh_type_var(env)
-  when Type::Function(_, _) then fresh_type_var(env)
+  when Type::Function(_, _) | Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then fresh_type_var(env)
   when Type::Bool then Type::Bool
   when Type::Int then Type::Int
   when Type::U8 then Type::U8
@@ -10946,6 +12631,24 @@ def instantiate_generic_type(env: &mut TypeEnv, ty: &Type, var_map: &mut Map[Int
       i = i + 1
     end
     Type::Function(new_params, instantiate_generic_type(env, ret, var_map))
+  when Type::FnPtr(params, ret) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, var_map), convention: pt.convention })
+      i = i + 1
+    end
+    Type::FnPtr(new_params, instantiate_generic_type(env, ret, var_map))
+  when Type::Closure(cid, params, ret, captures) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, var_map), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Closure(cid.clone(), new_params, instantiate_generic_type(env, ret, var_map), instantiate_generic_type(env, &captures, var_map))
   when Type::Effect(_, inner) then Type::Effect(Vec::new(), instantiate_generic_type(env, inner, var_map))
   when _ then ty.clone()
   end
@@ -11145,7 +12848,7 @@ def solve_builtin_method_u(env: &mut TypeEnv, recv_args: &Vec[Type], arg_types: 
   if fn_idx < arg_types.len() then
     let arg_ty = resolve_type_var(env, arg_types[fn_idx].clone())
     match arg_ty
-    when Type::Function(_, ret) then
+    when Type::Function(_, ret) | Type::FnPtr(_, ret) | Type::Closure(_, _, ret, _) then
       if mode == "opt" then
         match builtin_option_inner(env, &ret)
         when Option::Some(inner) then unify(env, u.clone(), inner, span)
@@ -11779,7 +13482,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
         param_types.push(ParamType { ty: resolve_type_expr(env, &args[i]), convention: AccessConvention::Let })
         i = i + 1
       end
-      Type::Function(param_types, Type::Unit)
+      Type::FnPtr(param_types, Type::Unit)
     elsif name == "Array" then
       # Handle Array[T] named syntax — the heap vector. The result is the
       # Adt form of the registered Array builtin (LangItems id); the fixed
@@ -11883,6 +13586,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
             def_kind: TypeDefKind::Opaque,
             generic_params: Vec::new(),
             kind: TypeKind::Value
+            def: Option::None
           }
           env.type_name_index.insert(name.clone(), env.type_list.len())
           env.type_id_index.insert(id_num, env.type_list.len())
@@ -11939,7 +13643,9 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
       i = i + 1
     end
     let ret_type = resolve_type_expr(env, &ret)
-    Type::Function(param_types, ret_type)
+    # P1 (FnPtr/Closure split): the fn(Args) -> Ret TYPE EXPRESSION denotes
+    # a function POINTER (no environment) — the FnPtr form.
+    Type::FnPtr(param_types, ret_type)
   when TypeExprKind::Infer then
     fresh_type_var(env)
   when TypeExprKind::Ptr(inner) then
@@ -11953,6 +13659,13 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
     resolve_type_expr(env, &inner)
   when TypeExprKind::Effect(name, inner) then
     let inner_type = resolve_type_expr(env, &inner)
+    # P1 (EffectId domain): the effect name is INTERNED at use — a builtin
+    # name resolves to its fixed id, a user effect interns under the
+    # CURRENT module's qualified key ("path::name") — so the canonical
+    # type identity can render the canonical ordered effect-ID set. The
+    # Type::Effect payload stays the name collection (the M9 migration
+    # keeps the type representation); the registry is the id mapping.
+    let _ = intern_module_effect(&mut env.effects, &env.current_module_path, &name)
     Type::Effect(Vec::from([name.clone()]), inner_type)
   when TypeExprKind::Path(path) then
     # Qualified path like module::Type — resolve the last segment.
@@ -12006,6 +13719,7 @@ def resolve_type_expr(env: &mut TypeEnv, te: &TypeExpr) -> Type
               def_kind: TypeDefKind::Opaque,
               generic_params: Vec::new(),
               kind: TypeKind::Value
+              def: Option::None
             }
             env.type_name_index.insert(full_name.clone(), env.type_list.len())
             env.type_id_index.insert(id_num, env.type_list.len())
@@ -12192,6 +13906,21 @@ def scan_codegen_type(env: &TypeEnv, ty: &Type, has_error: &mut Bool, has_var: &
       i = i + 1
     end
     scan_codegen_type(env, &ret, has_error, has_var)
+  when Type::FnPtr(params, ret) then
+    var i = 0
+    while i < params.len() do
+      scan_codegen_type(env, &params[i].ty, has_error, has_var)
+      i = i + 1
+    end
+    scan_codegen_type(env, &ret, has_error, has_var)
+  when Type::Closure(_, params, ret, captures) then
+    var i = 0
+    while i < params.len() do
+      scan_codegen_type(env, &params[i].ty, has_error, has_var)
+      i = i + 1
+    end
+    scan_codegen_type(env, &ret, has_error, has_var)
+    scan_codegen_type(env, &captures, has_error, has_var)
   when Type::RefInternal(inner, _) then scan_codegen_type(env, &inner, has_error, has_var)
   when Type::Ptr(inner) then scan_codegen_type(env, &inner, has_error, has_var)
   when Type::PtrMut(inner) then scan_codegen_type(env, &inner, has_error, has_var)
@@ -12400,16 +14129,19 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   # Collect registered deinit methods (type -> the finalizer's SEMANTIC
   # CallableId) so the per-type DeinitPlan can reference them; a resource
   # WITHOUT a deinit is trivially deinitialized (no entry here is fine).
-  # P0-D (final layer): the registration value is the RESOLVER's DefId
-  # (resolutions.method_defs — keyed "Type::method") — the SAME identity
-  # the MIR records for the mangled emission names ("Type__drop" /
-  # "Type__deinit"). A finalizer the resolver never registered a DefId for
-  # is a registration failure: a TypeError is recorded and the type gets NO
-  # entry (its plans fail closed at the verified_* construction sites) —
-  # a name-only finalizer can never become a plan callable.
+  # P0-D (final layer): the registration value is the RESOLVER's DefId —
+  # the module_symbols QUALIFIED entry ("path::Type::method" — the item's
+  # OWNER path from Program.crate; the P1 replacement for the deleted
+  # bare-keyed method table) — the SAME identity the MIR records for the
+  # mangled emission names ("Type__drop" / "Type__deinit"). A finalizer
+  # the resolver never registered a DefId for is a registration failure: a
+  # TypeError is recorded and the type gets NO entry (its plans fail
+  # closed at the verified_* construction sites) — a name-only finalizer
+  # can never become a plan callable.
   var dmi = 0
   while dmi < program.items.len() do
     let item = program.items[dmi]
+    let item_path = crate_module_path_of(program, &item.owner_module)
     match item.kind
     when ItemKind::ItemImpl(imp) then
       var mj = 0
@@ -12431,19 +14163,39 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
         when Option::None then false
         end
         if m.name == "deinit" || (m.name == "drop" && is_drop_impl) then
-          # P0-D (registration-key fix): the method_defs lookup key is the
-          # RESOLVER's rendering (impl_registry_method_key — "Box[...]::drop"
-          # for a generic for_type, matching resolver.tg's type_expr_to_string
-          # keys), never a bare-name key ("Box::drop" — which misses every
-          # generic Drop impl). The TYPE lookup is the tid_by_name inverse
-          # above (the same inverse the MIR builds).
+          # P0-D (registration-key fix): the lookup key is the RESOLVER's
+          # rendering (impl_registry_method_key — "Box[...]::drop" for a
+          # generic for_type, matching resolver.tg's type_expr_to_string
+          # keys), MODULE-QUALIFIED by the item's OWNER path (the semantic
+          # registration — module_symbols), never a bare-name key
+          # ("Box::drop" — which misses every generic Drop impl). The TYPE
+          # lookup is the tid_by_name inverse above (the same inverse the
+          # MIR builds).
           let type_key = type_expr_name_of(&imp.for_type)
           let method_key = impl_registry_method_key(&imp.for_type, &m.name)
+          let qualified_key = module_qualified_key(&item_path, &method_key)
           match tid_by_name.get(type_key)
           when Option::Some(reg_tid) then
-            match resolutions.method_defs.get(method_key)
+            match resolutions.module_symbols.get(&qualified_key)
             when Option::Some(mdid) then
-              deinit_targets.insert(reg_tid, CallableId { def: mdid.clone() })
+              match def_kind_of(&resolutions, &mdid)
+              when Option::Some(mk) then
+                if mk == DefKind::Method then
+                  deinit_targets.insert(reg_tid, CallableId { def: mdid.clone() })
+                else
+                  env.errors.push(TypeError {
+                    message: "internal error: finalizer `" + method_key + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
+                    span: m.span,
+                    code: Option::None
+                  })
+                end
+              when Option::None then
+                env.errors.push(TypeError {
+                  message: "internal error: finalizer `" + method_key + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
+                  span: m.span,
+                  code: Option::None
+                })
+              end
             when Option::None then
               env.errors.push(TypeError {
                 message: "internal error: finalizer `" + method_key + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
@@ -12462,11 +14214,29 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
         let m2 = s.methods[mj2]
         if m2.name == "deinit" then
           let method_key2 = s.name.clone() + "::" + m2.name.clone()
+          let qualified_key2 = module_qualified_key(&item_path, &method_key2)
           match tid_by_name.get(s.name.clone())
           when Option::Some(reg_tid2) then
-            match resolutions.method_defs.get(method_key2)
+            match resolutions.module_symbols.get(&qualified_key2)
             when Option::Some(mdid2) then
-              deinit_targets.insert(reg_tid2, CallableId { def: mdid2.clone() })
+              match def_kind_of(&resolutions, &mdid2)
+              when Option::Some(mk2) then
+                if mk2 == DefKind::Method then
+                  deinit_targets.insert(reg_tid2, CallableId { def: mdid2.clone() })
+                else
+                  env.errors.push(TypeError {
+                    message: "internal error: finalizer `" + method_key2 + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
+                    span: m2.span,
+                    code: Option::None
+                  })
+                end
+              when Option::None then
+                env.errors.push(TypeError {
+                  message: "internal error: finalizer `" + method_key2 + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
+                  span: m2.span,
+                  code: Option::None
+                })
+              end
             when Option::None then
               env.errors.push(TypeError {
                 message: "internal error: finalizer `" + method_key2 + "` has no resolver DefId (finalizer registration is the DefId identity, never the name)",
@@ -12485,9 +14255,57 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   end
   # Build the recursive deinit plan for every type id (consumed by MIR).
   var deinit_plans = Map::new()
+  # P0: serialize the per-declaration typed records — the fn-signature
+  # table (fn owner key -> FnSignature) and the static/const/extern-static
+  # declared-type table (module-qualified key -> Type). Every recorded type
+  # is CHASED through the final substitution (resolve_type_var): a
+  # declaration whose annotation was an inference variable (an un-annotated
+  # const/param) lands its post-checking solved form; a genuinely
+  # unconstrained variable is a checker error already recorded by
+  # verify_codegen_readiness, so compilation aborts before MIR lowering.
+  var typed_fn_sigs = Map::new()
+  for (sig_key, sig_rec) in env.typed_fn_signatures do
+    var chased_params = Vec::new()
+    for sp in sig_rec.params do
+      chased_params.push(ParamType { ty: resolve_type_var(env, sp.ty), convention: sp.convention })
+    end
+    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type) })
+  end
+  var typed_static_tys = Map::new()
+  for (st_key, st_ty) in env.typed_static_types do
+    typed_static_tys.insert(st_key, resolve_type_var(env, st_ty))
+  end
+  # P1 (TypeId -> DefId at registration): serialize the DIRECT
+  # type-to-declaration association — every filled TypeDef.def (the
+  # resolver DefId recorded at store_type_def) into the resolutions
+  # snapshot's type_def_ids (TypeId.id -> DefId). The snapshot is the
+  # carrier the MIR/ABI consumers read (the public ABI's stable-path
+  # derivation joins TypeId -> DefId -> module_symbols directly — no
+  # name/order correlation).
+  var final_resolutions = resolutions.clone()
+  for td_f in env.type_list do
+    match td_f.def
+    when Option::Some(def_did) then final_resolutions.type_def_ids.insert(td_f.id.id, def_did)
+    when Option::None then ()
+    end
+  end
+  # P1 (IntrinsicId at check time): serialize the per-call intrinsic
+  # classification (typed_intrinsics — the checker's attachment at the
+  # call-recording sites) into the snapshot — the typed program carries
+  # the classification per call for the MIR/codegen consumers.
+  for (intr_node, intr_id) in env.typed_intrinsics.entries() do
+    final_resolutions.intrinsic_ids.insert(intr_node, intr_id)
+  end
+  env.resolutions = Option::Some(final_resolutions)
+  # The TypedProgram snapshots carry the FINAL resolutions (the
+  # type_def_ids association included), never the pre-registration input.
+  let typed_resolutions = match env.resolutions
+  when Option::Some(res_final) then res_final.clone()
+  when Option::None then resolutions.clone()
+  end
   var plan_typed = TypedProgram {
     ast: program.clone(),
-    resolutions: resolutions.clone(),
+    resolutions: typed_resolutions.clone(),
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
@@ -12501,7 +14319,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
     deinit_plans: Map::new(),
     aggregate_ownership: Map::new(),
-    finalize_plan: Map::new(),
+    finalize_plan: function_cleanup_table_new(),
     edge_cleanup: Map::new(),
     type_names: type_names.clone(),
     deinit_targets: deinit_targets.clone(),
@@ -12510,6 +14328,9 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     type_params: type_params.clone(),
     type_kinds: kinds.clone(),
     type_aliases: type_aliases.clone(),
+    typed_fn_signatures: typed_fn_sigs.clone(),
+    typed_static_types: typed_static_tys.clone(),
+    lang_items: env.lang_items.clone(),
     generic_param_ids: env.generic_param_ids.clone(),
     generic_param_names: env.generic_param_table.names.clone()
   }
@@ -12524,7 +14345,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
   end
   let typed = TypedProgram {
     ast: program.clone(),
-    resolutions: resolutions.clone(),
+    resolutions: typed_resolutions.clone(),
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
@@ -12538,7 +14359,7 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
     deinit_plans: deinit_plans,
     aggregate_ownership: env.typed_aggregate_ownership.clone(),
-    finalize_plan: Map::new(),
+    finalize_plan: function_cleanup_table_new(),
     edge_cleanup: Map::new(),
     type_names: type_names,
     deinit_targets: deinit_targets,
@@ -12547,6 +14368,9 @@ def type_check_typed(env: &mut TypeEnv, program: &Program, resolutions: &Resolve
     type_params: type_params,
     type_kinds: kinds,
     type_aliases: type_aliases,
+    typed_fn_signatures: typed_fn_sigs,
+    typed_static_types: typed_static_tys,
+    lang_items: env.lang_items.clone(),
     generic_param_ids: env.generic_param_ids.clone(),
     generic_param_names: env.generic_param_table.names.clone()
   }
@@ -12642,6 +14466,9 @@ def derive_transferable(env: &mut TypeEnv, ty: &Type, visited: &mut Set[Int]) ->
     end
     true
   when Type::Function(_, _) then true  # Function pointers are Transferable
+  when Type::FnPtr(_, _) then true  # P1: function pointers are Transferable
+  # P1: a closure's transferability derives from its capture tuple.
+  when Type::Closure(_, _, _, captures) then derive_transferable(env, &captures, visited)
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
   when Type::Dyn(_) then false  # Trait objects: conservative !Transferable
@@ -12667,7 +14494,7 @@ end
 
 # Named-type structural derivation (Transferable): walk fields/variants with
 # the concrete generic args substituted (the same walk the type-properties
-# engine performs for needs_drop/linearity) plus the concrete args. Rc is
+# engine performs for owns_state/linearity) plus the concrete args. Rc is
 # the only provable inherent exclusion (mirror of the non_send_types
 # documentation set).
 def is_named_transferable(env: &mut TypeEnv, tid: &TypeId, args: &Vec[Type], visited: &mut Set[Int]) -> Bool
@@ -12762,6 +14589,9 @@ def derive_syncable(env: &mut TypeEnv, ty: &Type, visited: &mut Set[Int]) -> Boo
     end
     true
   when Type::Function(_, _) then true
+  when Type::FnPtr(_, _) then true
+  # P1: a closure's shareability derives from its capture tuple.
+  when Type::Closure(_, _, _, captures) then derive_syncable(env, &captures, visited)
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
   when Type::Dyn(_) then false  # Trait objects: conservative !Shareable
@@ -12903,6 +14733,27 @@ def type_display(env: &TypeEnv, ty: &Type) -> String
       first = false
     end
     s = s + ") -> " + type_display(env, ret)
+    s
+  when Type::FnPtr(params, ret) then
+    var s = "fn("
+    var first = true
+    for p in params do
+      if !first then s = s + ", " end
+      s = s + type_display(env, &p.ty)
+      first = false
+    end
+    s = s + ") -> " + type_display(env, ret)
+    s
+  when Type::Closure(cid, params, ret, captures) then
+    var s = "closure#" + cid.id.to_string() + "("
+    var first = true
+    for p in params do
+      if !first then s = s + ", " end
+      s = s + type_display(env, &p.ty)
+      first = false
+    end
+    s = s + ") -> " + type_display(env, ret)
+    s = s + " captures: " + type_display(env, &captures)
     s
   when Type::RefInternal(inner, mutable) then
     if mutable then "&mut " + type_display(env, inner) else "&" + type_display(env, inner) end

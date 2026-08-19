@@ -9,8 +9,8 @@ use std::collections::{Vec, Map, Set}
 # Layout.enum_layout field is a flat projection that no consumer reads; the
 # rich EnumLayout lives here.
 use std::alloc::{Layout, FieldLayout, VariantLayout}
-use tg_compiler::types::{Type, TypeId}
-use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
+use tg_compiler::types::{Type, TypeId, subst_type_args}
+use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef, mir_type_identity_key}
 
 # ———————————————————————————————————————————————————————————————
 # Failure Class Categorization
@@ -243,6 +243,8 @@ def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
   when Type::Ptr(_)        then Repr::RawPtr
   when Type::PtrMut(_)     then Repr::RawPtr
   when Type::Function(_, _) then Repr::OpaquePtr
+  when Type::FnPtr(_, _) then Repr::OpaquePtr
+  when Type::Closure(_, _, _, _) then Repr::OpaquePtr
   when Type::Dyn(_)        then Repr::OpaquePtr
   when Type::Effect(_, _)  then Repr::OpaquePtr
   when Type::Tuple(_)      then Repr::Inline
@@ -308,16 +310,14 @@ def named_type_repr(engine: &LayoutEngine, type_id: Int) -> Repr
     end
   end
 
-  # Unregistered named types: the GENERIC-PARAMETER SLOT convention. Lowering
-  # emits TypeId{id:0} for a generic parameter reference inside a generic
-  # definition (e.g. the payload field of `enum Option[T] { Some(T) }`), so a
-  # def-driven layout computation legitimately sees an unregistered Adt. Its
-  # SLOT is pointer-width — the placeholder convention for the parameter's
-  # slot at def-layout time (the strict path layout_of_concrete rejects
-  # unregistered named types at VALUE sites; this fallback exists only for
-  # the def-driven slot placement). It is documented as such — never a
-  # silent guess for a VALUE query.
-  Repr::OpaquePtr
+  # Unregistered named type: FAIL CLOSED — the generic-parameter SLOT
+  # convention is DELETED (P0-CK). A generic definition is never laid out
+  # nominally: every layout is computed under a ConcreteTypeKey with the
+  # def's fields SUBSTITUTED (see compute_type_layout / substituted_type_def),
+  # so a Type::Param never reaches a field placement. An unregistered Adt at
+  # a VALUE site is a lowering/verifier defect — Repr::Invalid makes every
+  # storage query panic instead of guessing a pointer word.
+  Repr::Invalid
 end
 
 # Heap header size for a representation (F2 FROZEN; 0 = no heap header).
@@ -363,6 +363,8 @@ def repr_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::OpaquePtr   then
     match ty
     when Type::Function(_, _) then engine.target.fn_ptr_size
+  when Type::FnPtr(_, _) then engine.target.fn_ptr_size
+  when Type::Closure(_, _, _, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
     end
   when Repr::Invalid     then
@@ -389,7 +391,9 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
-        compute_type_layout(engine, tid.id).align
+        # P0-CK: concrete-keyed — the substituted def's layout under THIS
+        # Adt's args (Wrapper[u8] align 1, Wrapper[Int] align 8, ...).
+        compute_type_layout(engine, ty).align
       end
     when Type::Tuple(fields) then compute_tuple_layout(engine, fields).align
     when Type::FixedArray(elem, _) then repr_storage_align(engine, &elem)
@@ -431,7 +435,9 @@ def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
     elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
       inline_array_storage_size(engine, &args[0], 0)
     else
-      compute_type_layout(engine, tid.id).size
+      # P0-CK: concrete-keyed — the substituted def's layout under THIS
+      # Adt's args (never a nominal record, never a pointer slot).
+      compute_type_layout(engine, ty).size
     end
   when Type::Tuple(fields) then
     compute_tuple_layout(engine, fields).size
@@ -581,11 +587,18 @@ end
 
 struct LayoutEngine
   target: TargetDescriptor
-  records: Map[Int, LayoutRecord]      # type_id -> LayoutRecord
+  # P0-CK: the layout cache is CONCRETE-KEYED — records/visit states are
+  # keyed by the canonical render of the concrete Type::Adt(tid, args)
+  # (mir_type_identity_key — the SAME (TypeId, substs) identity domain as the
+  # MIR's concrete deinit-plan and drop-glue tables). Wrapper[u8],
+  # Wrapper[Int], Wrapper[(Int,Int)] and Wrapper[[u8;64]] are DISTINCT keys
+  # with DISTINCT records; the nominal TypeId-keyed table is gone (a generic
+  # definition has no nominal layout — only concrete instantiations do).
+  records: Map[String, LayoutRecord]      # concrete key -> LayoutRecord
   name_index: Map[String, Int]          # type_name -> type_id
   type_defs: Vec[MirTypeDef]            # All type definitions
-  visit_states: Map[Int, LayoutVisitState]   # Inline-cycle DFS states (compute_all_layouts)
-  strict_states: Map[Int, LayoutVisitState]  # Recursive strict-verification cache (layout_of_concrete)
+  visit_states: Map[String, LayoutVisitState]   # Inline-cycle DFS states (concrete-keyed)
+  strict_states: Map[String, LayoutVisitState]  # Recursive strict-verification cache (concrete-keyed)
   cache_hits: Int
   cache_misses: Int
 end
@@ -602,6 +615,123 @@ def layout_engine_new(target: TargetDescriptor) -> LayoutEngine
     cache_hits: 0,
     cache_misses: 0
   }
+end
+
+# ———————————————————————————————————————————————————————————————
+# ConcreteTypeKey — THE concrete type identity (P0-CK)
+# ———————————————————————————————————————————————————————————————
+# The structural key of a concrete Type::Adt(tid, args) instantiation:
+#   { def: TypeId, substs: Vec[Type] }.
+# This is the LAYOUT AUTHORITY. Every layout query (compute_type_layout,
+# the record cache, the inline-cycle recursion detection, the strict
+# verification states, size_of/align_of/layout_of, the field-offset queries
+# and the enum queries) resolves through the concrete key — a generic
+# definition's layout is computed PER SUBSTITUTION, never from a nominal
+# TypeId-keyed record and never through a pointer-width placeholder slot.
+#
+# The canonical render (concrete_type_key_render) reuses
+# mir_type_identity_key — the MIR's concrete (TypeId, substs) key for the
+# deinit-plan cache and the drop-glue instance table — so the layout cache,
+# the plan table and the drop glue share ONE identity domain:
+# Wrapper[u8] -> "Named#<wrapper>[U8]" vs Wrapper[Int] ->
+# "Named#<wrapper>[Int]" are distinct keys with distinct records.
+struct ConcreteTypeKey
+  def: TypeId
+  substs: Vec[Type]
+end
+
+# The ConcreteTypeKey of a type: Option::Some for the Adt form (the only
+# nominal layout carrier), Option::None for everything else.
+def concrete_type_key_of(ty: &Type) -> Option[ConcreteTypeKey]
+  match ty
+  when Type::Adt(tid, args) then Option::Some(ConcreteTypeKey { def: tid.clone(), substs: args.clone() })
+  when _ then Option::None
+  end
+end
+
+# Canonical render of a concrete key — the mir_type_identity_key Adt
+# rendering ("Named#<def id>[<arg renders>...]"), byte-identical to the
+# MIR's concrete plan/drop-glue keys.
+def concrete_type_key_render(key: &ConcreteTypeKey) -> String
+  let ty = Type::Adt(key.def.clone(), key.substs.clone())
+  mir_type_identity_key(&ty)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The Substituted-Field Computation (P0-CK)
+# ———————————————————————————————————————————————————————————————
+# A generic definition's FIELDS are substituted under the concrete key
+# BEFORE any offset/size is computed: the def's generic_params (declaration
+# order — P0-GPI GenericParamIds) are replaced by the key's concrete args
+# via subst_type_args. Wrapper[u8]'s field is u8 (size 1/align 1),
+# Wrapper[Int]'s is Int (8/8) — the pointer-width generic-slot placeholder
+# no longer exists. A parameter the args do not cover stays Type::Param,
+# which fails CLOSED at placement (Repr::Invalid — never a guessed word).
+
+# The MirTypeDef of a concrete Adt with its fields/variants substituted
+# under the concrete args; Option::None when the def is not registered.
+def substituted_type_def(engine: &LayoutEngine, ty: &Type) -> Option[MirTypeDef]
+  match ty
+  when Type::Adt(tid, args) then
+    for td in engine.type_defs do
+      if td.id.id == tid.id then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          var new_fields = Vec::new()
+          for f in fields do
+            new_fields.push(MirFieldDef {
+              name: f.name.clone(),
+              ty: subst_type_args(&f.ty, &td.generic_params, args)
+            })
+          end
+          return Option::Some(MirTypeDef {
+            id: td.id.clone(),
+            name: td.name.clone(),
+            kind: MirTypeDefKind::Struct(new_fields),
+            generic_params: td.generic_params.clone()
+          })
+        when MirTypeDefKind::Enum(variants) then
+          var new_variants = Vec::new()
+          for v in variants do
+            var new_fields = Vec::new()
+            for fty in v.fields do
+              new_fields.push(subst_type_args(fty, &td.generic_params, args))
+            end
+            new_variants.push(MirVariantDef {
+              name: v.name.clone(),
+              discriminant: v.discriminant,
+              fields: new_fields
+            })
+          end
+          return Option::Some(MirTypeDef {
+            id: td.id.clone(),
+            name: td.name.clone(),
+            kind: MirTypeDefKind::Enum(new_variants),
+            generic_params: td.generic_params.clone()
+          })
+        end
+      end
+    end
+    Option::None
+  when _ then Option::None
+  end
+end
+
+# Substitute a type occurring INSIDE the definition of a concrete Adt (a
+# def-level field/variant type) under that Adt's concrete args. Consumers
+# that read a MirTypeDef field type (codegen's projected_field_type, the
+# enum-eq helper) ask for the CONCRETE type this way.
+def substitute_in_concrete_adt(engine: &LayoutEngine, adt_ty: &Type, inner: &Type) -> Type
+  match adt_ty
+  when Type::Adt(tid, args) then
+    for td in engine.type_defs do
+      if td.id.id == tid.id then
+        return subst_type_args(inner, &td.generic_params, args)
+      end
+    end
+    inner.clone()
+  when _ then inner.clone()
+  end
 end
 
 # Register type definitions (call before computing layouts)
@@ -727,16 +857,18 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         inline_array_storage_size(engine, &args[0], 0)
       else
-        # Look up cached record
-        let tid_key = tid.id
-        match engine.records.get(&tid_key)
+        # Look up the cached CONCRETE record (P0-CK): keyed by the canonical
+        # (TypeId, substs) render of THIS Adt — Wrapper[u8] and Wrapper[Int]
+        # are distinct entries. A miss computes the substituted layout.
+        let ckey = mir_type_identity_key(ty)
+        match engine.records.get(&ckey)
         when Option::Some(rec) then
           engine.cache_hits = engine.cache_hits + 1
           rec.size
         when Option::None then
           engine.cache_misses = engine.cache_misses + 1
-          # Compute and cache
-          let rec = compute_type_layout(engine, tid_key)
+          # Compute and cache (the def's fields substituted under this key)
+          let rec = compute_type_layout(engine, ty)
           rec.size
         end
       end
@@ -756,6 +888,8 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::OpaquePtr   then
     match ty
     when Type::Function(_, _) then engine.target.fn_ptr_size
+  when Type::FnPtr(_, _) then engine.target.fn_ptr_size
+  when Type::Closure(_, _, _, _) then engine.target.fn_ptr_size
     when _ then engine.target.pointer_size
     end
   when Repr::Invalid     then
@@ -788,10 +922,12 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
-        let tid_key = tid.id
-        match engine.records.get(&tid_key)
+        # P0-CK: concrete-keyed — compute the substituted layout on a miss
+        # (never a pointer-alignment guess).
+        let ckey = mir_type_identity_key(ty)
+        match engine.records.get(&ckey)
         when Option::Some(rec) then rec.align
-        when Option::None then engine.target.pointer_align
+        when Option::None then compute_type_layout(engine, ty).align
         end
       end
     when Type::FixedArray(elem, _) then repr_storage_align(engine, &elem)
@@ -860,7 +996,8 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
           enum_layout: Option::None
         }
       else
-        let rec = compute_type_layout(engine, tid.id)
+        # P0-CK: the substituted def's layout under THIS Adt's args.
+        let rec = compute_type_layout(engine, ty)
         record_to_layout(&rec)
       end
     when Type::FixedArray(elem, n) then
@@ -884,6 +1021,8 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
   when Repr::OpaquePtr   then
     match ty
     when Type::Function(_, _) then fn_ptr_layout(engine)
+  when Type::FnPtr(_, _) then fn_ptr_layout(engine)
+  when Type::Closure(_, _, _, _) then fn_ptr_layout(engine)
     when _ then pointer_layout(engine)
     end
   when Repr::Invalid     then
@@ -904,9 +1043,13 @@ end
 # payloads, tuple elements).  Indirections — pointers (Ptr/PtrMut/Ref),
 # Box/Rc, slices (the {ptr,len} view holds a raw pointer), arrays and heap
 # containers (Map/Set/Function/String) — do not require
-# their pointee to be resolved.  A named type with no registered definition
-# is likewise an opaque handle (lowering emits TypeId{id:0} for generic
-# parameters), so it does not fail the strict check.
+# their pointee to be resolved.
+# P0-CK: the strict walk is CONCRETE-keyed — a generic definition's fields
+# are SUBSTITUTED under the queried Adt's args before the children are
+# proven (check_concrete_layout on Type::Adt(tid, args) proves the
+# substituted fields, never the template's params, and never a
+# pointer-width placeholder). A named type with no registered definition
+# FAILS the strict check (the generic-slot convention is deleted).
 
 def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, LayoutError]
   match ty
@@ -948,7 +1091,13 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
       Result::Ok(())
     else
       if engine_has_type_def(engine, tid.id) then
-        let state = match engine.strict_states.get(&tid.id)
+        # P0-CK: the recursion state and the inline-children walk are
+        # CONCRETE-keyed — the def's fields are SUBSTITUTED under this
+        # Adt's args before the children are proven (Option[File] proves
+        # File; Option[Int] proves Int; a generic template with empty args
+        # keeps its Params and fails closed below).
+        let ckey = mir_type_identity_key(ty)
+        let state = match engine.strict_states.get(&ckey)
         when Option::Some(s) then s
         when Option::None then LayoutVisitState::Unvisited
         end
@@ -966,41 +1115,59 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
         when LayoutVisitState::Resolved then
           Result::Ok(())
         when LayoutVisitState::Unvisited then
-          engine.strict_states.insert(tid.id, LayoutVisitState::Visiting)
-          # Prove every inline child of the definition recursively.
-          for td in engine.type_defs do
-            if td.id.id == tid.id then
-              match td.kind
-              when MirTypeDefKind::Struct(fields) then
-                for f in fields do
-                  match check_concrete_layout(engine, &f.ty)
+          engine.strict_states.insert(ckey.clone(), LayoutVisitState::Visiting)
+          # Prove every inline child of the definition recursively, with the
+          # concrete args substituted into the field/variant types.
+          match substituted_type_def(engine, ty)
+          when Option::Some(std) then
+            match std.kind
+            when MirTypeDefKind::Struct(fields) then
+              for f in fields do
+                match check_concrete_layout(engine, &f.ty)
+                when Result::Err(e) then
+                  engine.strict_states.insert(ckey.clone(), LayoutVisitState::Unvisited)
+                  return Result::Err(e)
+                when Result::Ok(()) then ()
+                end
+              end
+            when MirTypeDefKind::Enum(variants) then
+              for v in variants do
+                for fty in v.fields do
+                  match check_concrete_layout(engine, fty)
                   when Result::Err(e) then
-                    engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
+                    engine.strict_states.insert(ckey.clone(), LayoutVisitState::Unvisited)
                     return Result::Err(e)
                   when Result::Ok(()) then ()
                   end
                 end
-              when MirTypeDefKind::Enum(variants) then
-                for v in variants do
-                  for fty in v.fields do
-                    match check_concrete_layout(engine, fty)
-                    when Result::Err(e) then
-                      engine.strict_states.insert(tid.id, LayoutVisitState::Unvisited)
-                      return Result::Err(e)
-                    when Result::Ok(()) then ()
-                    end
-                  end
-                end
               end
             end
+          when Option::None then
+            # Registered per engine_has_type_def but not found in the walk:
+            # internal inconsistency — fail closed.
+            return Result::Err(LayoutError {
+              class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+              message: "Registered type definition missing from the engine's def table during the strict walk",
+              type_name: lookup_type_name(engine, tid.id),
+              expected: 0,
+              actual: 0,
+              context: "check_concrete_layout"
+            })
           end
-          engine.strict_states.insert(tid.id, LayoutVisitState::Resolved)
+          engine.strict_states.insert(ckey, LayoutVisitState::Resolved)
           Result::Ok(())
         end
       else
-        # Unregistered named type: opaque pointer-sized handle (generic
-        # parameter lowering emits TypeId{id:0}); its layout is the handle.
-        Result::Ok(())
+        # Unregistered named type: FAIL CLOSED — the generic-parameter slot
+        # placeholder is deleted (P0-CK); an unregistered Adt has no layout.
+        Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "No type definition registered for type id",
+          type_name: "type#" + tid.id.to_string(),
+          expected: 0,
+          actual: 0,
+          context: "check_concrete_layout"
+        })
       end
     end
   when Type::Tuple(fields) then
@@ -1166,7 +1333,7 @@ end
 def record_to_layout(rec: &LayoutRecord) -> Layout
   # The flat std::alloc::EnumLayout projection is intentionally NOT filled:
   # the ONE enum authority is this module's rich EnumLayout (see
-  # enum_layout_for_type_id — representation + tag_layout + payload_offset +
+  # enum_layout_for_type — representation + tag_layout + payload_offset +
   # variant_layouts + niches), which codegen queries. No consumer reads
   # Layout.enum_layout (it is never dereferenced anywhere in the compiler);
   # the record's tag/variant fields remain available through the engine.
@@ -1238,33 +1405,43 @@ end
 # the EnumLayout and never contains it.
 def enum_inline_tag_threshold() -> Int = 256
 
-# The EnumLayout of a registered enum TypeId, from the computed records.
-# Option::None when the type is not a registered enum (not TaggedUnion).
-def enum_layout_for_type_id(engine: &LayoutEngine, type_id: Int) -> Option[EnumLayout]
-  match engine.records.get(&type_id)
-  when Option::Some(rec) then
-    if rec.category == LayoutCategory::TaggedUnion then
-      Option::Some(EnumLayout {
-        representation: EnumValueRepresentation::TaggedPtr(enum_inline_tag_threshold()),
-        tag_layout: EnumTagLayout {
-          offset: rec.tag_offset,
-          size: rec.tag_size
-        },
-        payload_offset: rec.payload_offset,
-        variant_layouts: rec.variants.clone(),
-        niches: Vec::new()
-      })
-    else
-      Option::None
-    end
-  when Option::None then Option::None
+# The EnumLayout projection of a TaggedUnion record (Option::None for
+# non-enum records).
+def enum_layout_from_record(rec: &LayoutRecord) -> Option[EnumLayout]
+  if rec.category == LayoutCategory::TaggedUnion then
+    Option::Some(EnumLayout {
+      representation: EnumValueRepresentation::TaggedPtr(enum_inline_tag_threshold()),
+      tag_layout: EnumTagLayout {
+        offset: rec.tag_offset,
+        size: rec.tag_size
+      },
+      payload_offset: rec.payload_offset,
+      variant_layouts: rec.variants.clone(),
+      niches: Vec::new()
+    })
+  else
+    Option::None
   end
 end
 
-# The EnumLayout of a registered enum Type (Adt form), else Option::None.
-def enum_layout_for_type(engine: &LayoutEngine, ty: &Type) -> Option[EnumLayout]
+# The EnumLayout of a registered enum TYPE (the concrete Adt form), from
+# the computed records — P0-CK: resolved through the CONCRETE key (the
+# (TypeId, substs) render), so Option[u8] and Option[(Int, Int)] are
+# distinct EnumLayouts. A cache miss COMPUTES the substituted enum layout
+# on demand (the engine is the authority; a registered enum queried without
+# a precomputed record is never a guess). Option::None when the type is not
+# a registered enum (not TaggedUnion).
+def enum_layout_for_type(engine: &mut LayoutEngine, ty: &Type) -> Option[EnumLayout]
   match ty
-  when Type::Adt(tid, _) then enum_layout_for_type_id(engine, tid.id)
+  when Type::Adt(_, _) then
+    let ckey = mir_type_identity_key(ty)
+    match engine.records.get(&ckey)
+    when Option::Some(rec) then enum_layout_from_record(rec)
+    when Option::None then
+      # Compute-on-miss: the concrete (substituted) enum layout under this
+      # key (cached by compute_type_layout).
+      enum_layout_from_record(&compute_type_layout(engine, ty))
+    end
   when _ then Option::None
   end
 end
@@ -1370,7 +1547,17 @@ end
 # Struct Layout Computation (F7 - declaration order, no reordering)
 # ———————————————————————————————————————————————————————————————
 
-def compute_struct_layout(engine: &mut LayoutEngine, type_id: Int, fields: &Vec[MirFieldDef]) -> LayoutRecord
+# P0-CK: the record's identity is the CONCRETE Adt (def id + args render in
+# the record name when substituted — Wrapper[u8] vs Wrapper[Int] stay
+# distinguishable in dumps). `fields` arrive ALREADY SUBSTITUTED (see
+# compute_type_layout / substituted_type_def) — no Param can reach a
+# placement here.
+def compute_struct_layout(engine: &mut LayoutEngine, ty: &Type, fields: &Vec[MirFieldDef]) -> LayoutRecord
+  var type_id = -1
+  match ty
+  when Type::Adt(tid, _) then type_id = tid.id
+  when _ then panic("layout: compute_struct_layout requires a concrete Adt type")
+  end
   var field_layouts = Vec::new()
   var current_offset = 0
   var max_align = 1
@@ -1427,7 +1614,17 @@ end
 # Enum Layout Computation (F3 - tag at 0, payload at 8)
 # ———————————————————————————————————————————————————————————————
 
-def compute_enum_layout(engine: &mut LayoutEngine, type_id: Int, variants: &Vec[MirVariantDef]) -> LayoutRecord
+# P0-CK: the record's identity is the CONCRETE Adt (def id + args render);
+# `variants` arrive ALREADY SUBSTITUTED under the concrete key (see
+# compute_type_layout / substituted_type_def) — Option[u8]'s Some carries
+# the u8 payload, Option[(Int, Int)]'s the 16-byte tuple, never a
+# pointer-width slot.
+def compute_enum_layout(engine: &mut LayoutEngine, ty: &Type, variants: &Vec[MirVariantDef]) -> LayoutRecord
+  var type_id = -1
+  match ty
+  when Type::Adt(tid, _) then type_id = tid.id
+  when _ then panic("layout: compute_enum_layout requires a concrete Adt type")
+  end
   var variant_layouts = Vec::new()
   var max_payload_size = 0
   var max_align = 8  # Tag alignment
@@ -1538,61 +1735,112 @@ end
 # Type Layout Computation Dispatcher
 # ———————————————————————————————————————————————————————————————
 
-def compute_type_layout(engine: &mut LayoutEngine, type_id: Int) -> LayoutRecord
-  # Inline-cycle guard (P0-AT): re-entering a type whose layout is still being
-  # computed means it reaches itself through inline storage only (no pointer/
-  # Box indirection) — an infinitely sized recursive type, diagnosed here.
-  let visit_state = match engine.visit_states.get(&type_id)
-  when Option::Some(s) then s
-  when Option::None then LayoutVisitState::Unvisited
-  end
-  match visit_state
-  when LayoutVisitState::Visiting then
-    panic("layout: infinitely sized recursive type '" + lookup_type_name(engine, type_id) + "': inline storage cycle (use a pointer or Box to break the cycle)")
-  when _ then ()
-  end
+# THE concrete layout computation (P0-CK): computes the layout of a
+# Type::Adt(tid, args) under its ConcreteTypeKey — the def's fields are
+# SUBSTITUTED with `args` before any offset/size is computed, the result is
+# cached under the key's canonical render, and the inline-cycle guard runs
+# per concrete key. A generic definition has NO nominal layout: computing
+# the def with empty args leaves the Param fields in place, which fail
+# closed (Repr::Invalid) at placement — never a pointer-width slot.
+def compute_type_layout(engine: &mut LayoutEngine, ty: &Type) -> LayoutRecord
+  match ty
+  when Type::Adt(tid, args) then
+    let ckey = mir_type_identity_key(ty)
+    # Inline-cycle guard (P0-AT): re-entering a type whose layout is still
+    # being computed means it reaches itself through inline storage only (no
+    # pointer/Box indirection) — an infinitely sized recursive type,
+    # diagnosed here. The state is CONCRETE-keyed: Wrapper[u8] and
+    # Wrapper[Wrapper[u8]] are different states.
+    let visit_state = match engine.visit_states.get(&ckey)
+    when Option::Some(s) then s
+    when Option::None then LayoutVisitState::Unvisited
+    end
+    match visit_state
+    when LayoutVisitState::Visiting then
+      panic("layout: infinitely sized recursive type '" + lookup_type_name(engine, tid.id) + "': inline storage cycle (use a pointer or Box to break the cycle)")
+    when _ then ()
+    end
 
-  # Find the type definition
-  var type_def = Option::None
-  for td in engine.type_defs do
-    if td.id.id == type_id then
-      type_def = Option::Some(td)
+    # Find the type definition
+    var type_def = Option::None
+    for td in engine.type_defs do
+      if td.id.id == tid.id then
+        type_def = Option::Some(td)
+      end
     end
+
+    match type_def
+    when Option::Some(td) then
+      engine.visit_states.insert(ckey.clone(), LayoutVisitState::Visiting)
+      let rec = match td.kind
+      when MirTypeDefKind::Struct(fields) then
+        # The substituted-field computation: the def's fields under THIS
+        # concrete key (generic_params <- args).
+        compute_struct_layout(engine, ty, &substitute_mir_fields(engine, ty, &fields))
+      when MirTypeDefKind::Enum(variants) then
+        compute_enum_layout(engine, ty, &substitute_mir_variants(engine, ty, &variants))
+      end
+
+      # Cache the result under the CONCRETE key
+      engine.records.insert(ckey.clone(), rec.clone())
+      engine.visit_states.insert(ckey, LayoutVisitState::Resolved)
+      rec
+    when Option::None then
+      # Unregistered def: FAIL CLOSED — never a pointer-sized guess. The
+      # lenient query paths reject unregistered Adts (Repr::Invalid) before
+      # this is reachable; this branch is the last-resort ICE.
+      panic("layout: no type definition registered for type '" + lookup_type_name(engine, tid.id) + "' (id " + tid.id.to_string() + ") — layout queries fail closed, never a guessed pointer word")
+    end
+  when _ then
+    panic("layout: compute_type_layout requires a concrete Type::Adt (the layout authority is the ConcreteTypeKey { def: TypeId, substs: Vec[Type] })")
   end
-  
-  match type_def
-  when Option::Some(td) then
-    engine.visit_states.insert(type_id, LayoutVisitState::Visiting)
-    let rec = match td.kind
-    when MirTypeDefKind::Struct(fields) then
-      compute_struct_layout(engine, type_id, &fields)
-    when MirTypeDefKind::Enum(variants) then
-      compute_enum_layout(engine, type_id, &variants)
+end
+
+# Substitute a struct def's field types under a concrete Adt key (the
+# substituted-field computation — see the ConcreteTypeKey section).
+def substitute_mir_fields(engine: &LayoutEngine, ty: &Type, fields: &Vec[MirFieldDef]) -> Vec[MirFieldDef]
+  var out = Vec::new()
+  match ty
+  when Type::Adt(tid, args) then
+    for td in engine.type_defs do
+      if td.id.id == tid.id then
+        for f in fields do
+          out.push(MirFieldDef {
+            name: f.name.clone(),
+            ty: subst_type_args(&f.ty, &td.generic_params, args)
+          })
+        end
+        return out
+      end
     end
-    
-    # Cache the result
-    engine.records.insert(type_id, rec.clone())
-    engine.visit_states.insert(type_id, LayoutVisitState::Resolved)
-    rec
-  when Option::None then
-    # Unknown type - return default pointer-sized layout
-    LayoutRecord {
-      type_id: type_id,
-      name: "unknown",
-      category: LayoutCategory::Pointer,
-      repr: Repr::OpaquePtr,
-      size: engine.target.pointer_size,
-      align: engine.target.pointer_align,
-      stride: engine.target.pointer_size,
-      field_count: 0,
-      fields: Vec::new(),
-      variants: Vec::new(),
-      tag_offset: 0,
-      tag_size: 0,
-      header_size: 0,
-      payload_offset: 0,
-      hash: 0
-    }
+    fields.clone()
+  when _ then fields.clone()
+  end
+end
+
+# Substitute an enum def's variant payload types under a concrete Adt key.
+def substitute_mir_variants(engine: &LayoutEngine, ty: &Type, variants: &Vec[MirVariantDef]) -> Vec[MirVariantDef]
+  var out = Vec::new()
+  match ty
+  when Type::Adt(tid, args) then
+    for td in engine.type_defs do
+      if td.id.id == tid.id then
+        for v in variants do
+          var new_fields = Vec::new()
+          for fty in v.fields do
+            new_fields.push(subst_type_args(fty, &td.generic_params, args))
+          end
+          out.push(MirVariantDef {
+            name: v.name.clone(),
+            discriminant: v.discriminant,
+            fields: new_fields
+          })
+        end
+        return out
+      end
+    end
+    variants.clone()
+  when _ then variants.clone()
   end
 end
 
@@ -1600,39 +1848,36 @@ end
 # Field Offset Query (Requirement 2 - no ad-hoc offsets)
 # ———————————————————————————————————————————————————————————————
 
-# Get the byte offset of a field by index
-def field_offset(engine: &mut LayoutEngine, type_id: Int, field_index: Int) -> Int
-  let ty = Type::Adt(TypeId { id: type_id }, Vec::new())
-  let layout = layout_of(engine, &ty)
+# Get the byte offset of a field by index — P0-CK: the query takes the
+# CONCRETE Type (the field layout of Wrapper[u8] is resolved under the
+# Wrapper[u8] key, never a nominal record).
+def field_offset(engine: &mut LayoutEngine, ty: &Type, field_index: Int) -> Int
+  let layout = layout_of(engine, ty)
   if field_index >= 0 && field_index < layout.fields.len() then
     layout.fields[field_index].offset
   else
-    panic("field_offset: field index " + field_index.to_string() + " out of range for type id " + type_id.to_string())
+    panic("field_offset: field index " + field_index.to_string() + " out of range for type '" + mir_type_identity_key(ty) + "'")
   end
 end
 
-# Get the byte offset of a field by name
-def field_offset_by_name(engine: &mut LayoutEngine, type_id: Int, field_name: &String) -> Option[Int]
-  let ty = Type::Adt(TypeId { id: type_id }, Vec::new())
-  let layout = layout_of(engine, &ty)
-  var i = 0
+# Get the byte offset of a field by name (concrete-keyed).
+def field_offset_by_name(engine: &mut LayoutEngine, ty: &Type, field_name: &String) -> Option[Int]
+  let layout = layout_of(engine, ty)
   for f in layout.fields do
     if f.name == field_name then
       return Option::Some(f.offset)
     end
-    i = i + 1
   end
   Option::None
 end
 
-# Get field size by index
-def field_size(engine: &mut LayoutEngine, type_id: Int, field_index: Int) -> Int
-  let ty = Type::Adt(TypeId { id: type_id }, Vec::new())
-  let layout = layout_of(engine, &ty)
+# Get field size by index (concrete-keyed).
+def field_size(engine: &mut LayoutEngine, ty: &Type, field_index: Int) -> Int
+  let layout = layout_of(engine, ty)
   if field_index >= 0 && field_index < layout.fields.len() then
     layout.fields[field_index].size
   else
-    panic("field_size: field index " + field_index.to_string() + " out of range for type id " + type_id.to_string())
+    panic("field_size: field index " + field_index.to_string() + " out of range for type '" + mir_type_identity_key(ty) + "'")
   end
 end
 
@@ -1640,33 +1885,45 @@ end
 # Enum/Tagged Union Queries
 # ———————————————————————————————————————————————————————————————
 
-# Get discriminant offset (always 0 per F3)
-def discriminant_offset(engine: &LayoutEngine, type_id: Int) -> Int
-  match engine.records.get(&type_id)
+# Get discriminant offset (always 0 per F3) — concrete-keyed with
+# compute-on-miss (the record of a registered enum under the query's
+# concrete key; a miss computes and caches the substituted layout).
+def discriminant_offset(engine: &mut LayoutEngine, ty: &Type) -> Int
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then rec.tag_offset
-  when Option::None then 0
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    computed.tag_offset
   end
 end
 
-# Get discriminant size (always 8 per F3)
-def discriminant_size(engine: &LayoutEngine, type_id: Int) -> Int
-  match engine.records.get(&type_id)
+# Get discriminant size (always 8 per F3) — concrete-keyed.
+def discriminant_size(engine: &mut LayoutEngine, ty: &Type) -> Int
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then rec.tag_size
-  when Option::None then 8
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    computed.tag_size
   end
 end
 
-# Get payload offset (always 8 per F3)
-def payload_offset(engine: &LayoutEngine, type_id: Int) -> Int
-  match engine.records.get(&type_id)
+# Get payload offset (always 8 per F3) — concrete-keyed.
+def payload_offset(engine: &mut LayoutEngine, ty: &Type) -> Int
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then rec.payload_offset
-  when Option::None then 8
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    computed.payload_offset
   end
 end
 
-# Get variant discriminant value
-def variant_discriminant(engine: &LayoutEngine, type_id: Int, variant_name: &String) -> Option[Int]
-  match engine.records.get(&type_id)
+# Get variant discriminant value (concrete-keyed, compute-on-miss).
+def variant_discriminant(engine: &mut LayoutEngine, ty: &Type, variant_name: &String) -> Option[Int]
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then
     for v in rec.variants do
       if v.name == variant_name then
@@ -1674,7 +1931,14 @@ def variant_discriminant(engine: &LayoutEngine, type_id: Int, variant_name: &Str
       end
     end
     Option::None
-  when Option::None then Option::None
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    for v in computed.variants do
+      if v.name == variant_name then
+        return Option::Some(v.discriminant)
+      end
+    end
+    Option::None
   end
 end
 
@@ -1827,9 +2091,11 @@ def validate_layout(engine: &mut LayoutEngine, assertion: &LayoutAssertion) -> R
     })
   end
   
-  let rec = match engine.records.get(&type_id)
+  let cty = Type::Adt(TypeId { id: type_id }, Vec::new())
+  let ckey = mir_type_identity_key(&cty)
+  let rec = match engine.records.get(&ckey)
   when Option::Some(r) then r.clone()
-  when Option::None then compute_type_layout(engine, type_id)
+  when Option::None then compute_type_layout(engine, &cty)
   end
   
   # Validate size
@@ -1902,7 +2168,7 @@ def dump_layout_table(engine: &LayoutEngine) -> Unit
   
   for entry in engine.records do
     let rec = entry.1
-    eprintln("  TYPE " + rec.name + " (id=" + rec.type_id.to_string() + ")")
+    eprintln("  KEY " + entry.0 + "  TYPE " + rec.name + " (id=" + rec.type_id.to_string() + ")")
     eprintln("    category: " + category_to_string(&rec.category))
     eprintln("    repr: " + repr_to_string(&rec.repr))
     eprintln("    size: " + rec.size.to_string() + " align: " + rec.align.to_string() + " stride: " + rec.stride.to_string())
@@ -2106,6 +2372,8 @@ def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[Valu
   when Repr::OpaquePtr then
     match ty
     when Type::Function(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
+  when Type::FnPtr(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
+  when Type::Closure(_, _, _, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
     when _ then Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
     end
   when Repr::Inline then
@@ -2116,7 +2384,7 @@ def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[Valu
         # enum-representation authority. A TaggedPtr-represented enum's
         # VALUE is one pointer-width word (raw discriminant or heap
         # pointer), so it crosses in ONE slot regardless of its image size.
-        match enum_layout_for_type_id(engine, tid.id)
+        match enum_layout_for_type(engine, ty)
         when Option::Some(el) then
           match el.representation
           when EnumValueRepresentation::TaggedPtr(_) then
@@ -2155,31 +2423,49 @@ end
 # Absolute byte offsets of each payload field for an enum variant, taken from
 # the single layout authority.  Offsets are relative to the enum base (tag at
 # 0, payload at tag_size).  Replaces any ad-hoc `payload_offset + i * 8`.
-def enum_variant_field_offsets(engine: &LayoutEngine, type_id: Int, variant_index: Int) -> Vec[Int]
+# P0-CK: concrete-keyed with compute-on-miss — the variant offsets come from
+# the SUBSTITUTED enum layout under the query's concrete key (Option[u8]'s
+# Some payload sits at 8; Option[(Int,Int)]'s at 8 with a 16-byte size).
+def enum_variant_field_offsets(engine: &mut LayoutEngine, ty: &Type, variant_index: Int) -> Vec[Int]
   var offs = Vec::new()
-  match engine.records.get(&type_id)
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then
     if variant_index >= 0 && variant_index < rec.variants.len() then
       for f in rec.variants[variant_index].fields do
         offs.push(f.offset)
       end
     end
-  when Option::None then ()
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    if variant_index >= 0 && variant_index < computed.variants.len() then
+      for f in computed.variants[variant_index].fields do
+        offs.push(f.offset)
+      end
+    end
   end
   offs
 end
 
-# Variant payload sizes, from the layout authority.
-def enum_variant_field_sizes(engine: &LayoutEngine, type_id: Int, variant_index: Int) -> Vec[Int]
+# Variant payload sizes, from the layout authority (concrete-keyed,
+# compute-on-miss).
+def enum_variant_field_sizes(engine: &mut LayoutEngine, ty: &Type, variant_index: Int) -> Vec[Int]
   var sizes = Vec::new()
-  match engine.records.get(&type_id)
+  let ckey = mir_type_identity_key(ty)
+  match engine.records.get(&ckey)
   when Option::Some(rec) then
     if variant_index >= 0 && variant_index < rec.variants.len() then
       for f in rec.variants[variant_index].fields do
         sizes.push(f.size)
       end
     end
-  when Option::None then ()
+  when Option::None then
+    let computed = compute_type_layout(engine, ty)
+    if variant_index >= 0 && variant_index < computed.variants.len() then
+      for f in computed.variants[variant_index].fields do
+        sizes.push(f.size)
+      end
+    end
   end
   sizes
 end
@@ -2226,8 +2512,13 @@ end
 # through indirection (e.g. `struct Node { next: Box[Node] }`) are never
 # flagged.  The engine has no error list; the existing diagnostic channel
 # for unrecoverable layout problems is panic, so the cycle is reported there.
+# P0-CK: the DFS states are keyed by the def's NOMINAL concrete key (the
+# empty-args Adt render — the def-level graph); the per-instantiation
+# compute path re-checks recursion under each CONCRETE key in
+# compute_type_layout.
 def check_inline_layout_cycles(engine: &mut LayoutEngine, type_id: Int) -> Unit
-  let state = match engine.visit_states.get(&type_id)
+  let ckey = mir_type_identity_key(&Type::Adt(TypeId { id: type_id }, Vec::new()))
+  let state = match engine.visit_states.get(&ckey)
   when Option::Some(s) then s
   when Option::None then LayoutVisitState::Unvisited
   end
@@ -2236,7 +2527,7 @@ def check_inline_layout_cycles(engine: &mut LayoutEngine, type_id: Int) -> Unit
     panic("layout: infinitely sized recursive type '" + lookup_type_name(engine, type_id) + "': inline storage cycle (use a pointer or Box to break the cycle)")
   when LayoutVisitState::Resolved then ()
   when LayoutVisitState::Unvisited then
-    engine.visit_states.insert(type_id, LayoutVisitState::Visiting)
+    engine.visit_states.insert(ckey.clone(), LayoutVisitState::Visiting)
     var children = Vec::new()
     for td in engine.type_defs do
       if td.id.id == type_id then
@@ -2257,7 +2548,7 @@ def check_inline_layout_cycles(engine: &mut LayoutEngine, type_id: Int) -> Unit
     for child in children do
       check_inline_layout_cycles(engine, child)
     end
-    engine.visit_states.insert(type_id, LayoutVisitState::Resolved)
+    engine.visit_states.insert(ckey, LayoutVisitState::Resolved)
   end
 end
 
@@ -2273,33 +2564,45 @@ def compute_all_layouts(engine: &mut LayoutEngine) -> Unit
     check_inline_layout_cycles(engine, td.id.id)
   end
 
-  # First pass: insert placeholder records (cycles are already diagnosed
-  # above, so a placeholder can never mask one).
+  # P0-CK: placeholders and computed records exist for NON-GENERIC defs
+  # only (their fields are already concrete, so the nominal key IS the
+  # concrete key). A GENERIC def has NO nominal layout: its records are
+  # computed per concrete instantiation on demand (compute_type_layout
+  # under each ConcreteTypeKey) — the pointer-width generic slot is gone.
   for td in engine.type_defs do
-    engine.records.insert(td.id.id, LayoutRecord {
-      type_id: td.id.id,
-      name: td.name.clone(),
-      category: LayoutCategory::ZeroSized,
-      repr: Repr::OpaquePtr,
-      size: 0,
-      align: 1,
-      stride: 0,
-      field_count: 0,
-      fields: Vec::new(),
-      variants: Vec::new(),
-      tag_offset: 0,
-      tag_size: 0,
-      header_size: 0,
-      payload_offset: 0,
-      hash: 0
-    })
+    if td.generic_params.is_empty() then
+      let nominal_ty = Type::Adt(td.id.clone(), Vec::new())
+      let ckey = mir_type_identity_key(&nominal_ty)
+      # First pass: insert placeholder records (cycles are already diagnosed
+      # above, so a placeholder can never mask one).
+      engine.records.insert(ckey, LayoutRecord {
+        type_id: td.id.id,
+        name: td.name.clone(),
+        category: LayoutCategory::ZeroSized,
+        repr: Repr::OpaquePtr,
+        size: 0,
+        align: 1,
+        stride: 0,
+        field_count: 0,
+        fields: Vec::new(),
+        variants: Vec::new(),
+        tag_offset: 0,
+        tag_size: 0,
+        header_size: 0,
+        payload_offset: 0,
+        hash: 0
+      })
+    end
   end
 
   # Second pass: compute real layouts from the definitions.  Every record is
   # recomputed and overwrites its placeholder, so a placeholder's size 0 can
   # never determine a field's eventual size.
   for td in engine.type_defs do
-    let rec = compute_type_layout(engine, td.id.id)
-    engine.records.insert(td.id.id, rec)
+    if td.generic_params.is_empty() then
+      let cty = Type::Adt(td.id.clone(), Vec::new())
+      let rec = compute_type_layout(engine, &cty)
+      engine.records.insert(mir_type_identity_key(&cty), rec)
+    end
   end
 end

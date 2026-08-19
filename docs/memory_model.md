@@ -315,36 +315,43 @@ move/sink (transfer).
 
 ## 7. TypeProperties
 
-`TypeProperties { needs_drop, is_linear, is_capability,
-is_trivially_copyable, is_deferred }` is the memoized per-type property
-bundle computed by `type_properties_of` (`types.tg`). It is the ONE
-ownership authority: the resource checker and MIR query it on the
-concrete (TypeId, substitutions) identity (`engine_snapshot_env` /
+`TypeProperties { owns_state, requires_drop_glue, is_linear, is_capability,
+contains_capability, is_trivially_copyable, is_deferred }` is the memoized
+per-type property bundle computed by `type_properties_of` (`types.tg`). It
+is the ONE ownership authority: the resource checker and MIR query it on
+the concrete (TypeId, substitutions) identity (`engine_snapshot_env` /
 `deinit_plan_for_type`), and no ownership decision re-derives from the
 nominal declaration.
 
-**`needs_drop` is separate from linearity.** A type can need cleanup
-without being linear (e.g. `Rc[T]` — shared ownership) and can be linear
-without per-value drop.
+**The two ownership axes are SPLIT (P0).** `owns_state` (the value carries
+semantic ownership: it must be moved/consumed, never duplicated, and the
+resource checker tracks it) and `requires_drop_glue` (the value needs a
+physical destructor — the buffer release, a registered Drop, a registered
+deinit) are independent:
 
-- `needs_drop`: true for a type with a registered `impl Drop` (matched by
-  the LangItems `drop_trait` TraitId, never by name) and for the owning
-  smart pointers (Box/Rc by LangItems TypeId; UniquePtr/WeakRc/ArcStrong/
-  WeakArc by name — LangItems entries for them are a migration target);
-  containers own their backing storage (next bullet).
-- Containers (Vec/Array/Map/Set) **own their backing storage**:
-  `needs_drop` is true regardless of the element types (`Vec[Int]` still
-  releases its buffer; `Map[Int, Int]` still releases its bucket arena);
-  the element walk propagates linearity and deferral over the concrete
-  args.
-- `is_linear`: resources/capabilities by nominal kind, and content-linearity
-  through fields/variants/args/containers.
-- `is_capability`: the `TypeKind::Capability` marker.
+- **String** is `owns_state=true, requires_drop_glue=false`: the arena
+  reclaims its buffer, so there is no per-value destructor, but a bit-copy
+  would duplicate the owned buffer — String is Clone, NOT Copy.
+- `requires_drop_glue` gates the DeinitPlan (drop-glue shape);
+  `is_trivially_copyable` is the copy authority (the MIR Copy verifier
+  queries this axis, never the DeinitPlan).
+
+The remaining axes:
+
+- `is_linear`: move-only — must be consumed, never duplicated.
+- `is_capability` / `contains_capability`: `TypeKind::Capability` markers
+  and capability containment through composites (an aggregate with a
+  capability field, a container with capability elements).
 - `is_deferred`: an unsubstituted generic parameter (or unresolved type
-  variable) in the type graph — while deferred, the four semantic fields
-  are non-authoritative (false = "not proven true"); the concrete answer
+  variable) in the type graph — while deferred, the semantic fields are
+  non-authoritative (false = "not proven true"); the concrete answer
   appears after substitution.
 - `is_trivially_copyable`: §6.1.
+- **P1 (FnPtr/Closure split):** a closure's properties derive from its
+  CAPTURE TUPLE (a closure capturing an owning value owns it — the capture
+  tuple's owns_state / requires_drop_glue / linearity / capability
+  containment propagate); a function pointer (FnPtr — no environment)
+  carries none.
 
 **The graph algorithm:** the walk is memoized in `type_prop_cache` keyed
 by a canonical structural key that includes the concrete generic args
@@ -354,7 +361,7 @@ through **inline storage** — an infinitely sized recursive type. The
 layout engine panics on such types; the property engine reports the
 diagnostic instead ("infinitely sized recursive type: inline storage
 cycle (use a pointer or Box to break the cycle)") and treats the revisit
-as non-owning-but-unsafe (`needs_drop=false`,
+as non-owning-but-unsafe (`requires_drop_glue=false`,
 `is_trivially_copyable=false`). Indirections (Ptr/Box/Rc) terminate the
 walk: their properties are decided by the pointer layer, not the pointee.
 The visiting set is local per top-level call (a fresh call must not see a
@@ -388,7 +395,9 @@ cross-domain confusion is hard to express:
 | `GenericParamId` | owner DefId + param index |
 | `CallableId` | newtype over DefId (every invocable) |
 | `InstanceId` | CallableId + the concrete type substitutions (§13) |
-| `ClosureId` | closure identity |
+| `ClosureId` | closure identity (P1: the closure TYPE carries it — `Type::Closure(ClosureId, signature, capture tuple)`; the per-compilation identity that makes closures fail closed in the public ABI) |
+| `EffectId` | a declared effect's identity (P1: builtins registered with fixed ids; user effects interned module-qualified; the canonical type identity renders the canonical ordered effect-ID set) |
+| `IntrinsicId` | the semantic intrinsic-KIND classification (P1: attached by the type checker per intrinsic call; an intrinsic DEFINITION's identity remains its DefKind::Intrinsic DefId) |
 | `CfgBlockId` / `CfgEdgeId` | CFG vertex/edge identities |
 | `NodeId` | AST node identity |
 | `LocalId` | semantic local identity — the resource checker's frame key; distinct from the MIR's own local-slot domain |
@@ -447,14 +456,30 @@ are **gone**. The shape is:
 
 - **Primitives** — `Unit Bool Int UInt Float Char String Never`, the
   sized integer/float set for FFI parity (`I8..I128, U8..U128, ISize,
-  USize, F32, F64`). `String` is a primitive and an **owned String**: it
-  owns a unique heap buffer (one raw pointer to null-terminated UTF-8,
-  the frozen `StringPtr` ABI) with semantic nonaliasing — moves transfer,
-  `clone()` allocates, and the inout methods (`push`/`push_str`) grow the
-  owned buffer. It is never bit-copyable. The buffer is arena-managed by
-  the runtime: arena reclaim is a runtime detail, not a per-value Drop
-  (there is no `impl Drop for String`; the MIR drop plan for `String` is
-  Trivial).
+  USize, F32, F64`). `String` is a primitive and an **owned, mutable
+  String object** (P0-STRING): the String VALUE is one 8-byte pointer
+  (the engine's `StringPtr` value width) to a 32-byte String object
+  header — the same shape as the Vec header:
+  `{ data: Ptr[u8] @ 0, len: Int @ 8, cap: Int @ 16, stride: Int @ 24 }`,
+  where `data` points to the null-terminated UTF-8 byte buffer (bump
+  arena; `len` = byte length, `cap` = byte capacity ≥ 8, `stride` = 1).
+  The header is what mutation needs: `push`/`push_str` grow the owned
+  buffer in place (the String-object operations are the `_tg_string_*`
+  runtime functions on both arches). Semantics: moves transfer the
+  buffer, `clone()` allocates a new one, the value is never
+  bit-copyable. The buffer and header are arena-managed by the runtime:
+  arena reclaim is a runtime detail, not a per-value Drop (there is no
+  `impl Drop for String`; the MIR drop plan for `String` is Trivial and
+  `requires_drop_glue` stays false for the String split).
+  **Literals are the static StrView**: a string literal expression lowers
+  to the interned static bytes behind a raw label; the conversion to an
+  owned String is the explicit owned clone (`String::from_static`, the
+  `string_from_static` intrinsic) and the compiler inserts it at every
+  owned-String demand site (by-value String parameters — the
+  diagnostics, format strings, path strings — String destinations,
+  `Vec[String]` literals, concat results, `to_string()`, `clone()`). The
+  `str` type denotes the borrowed view: `&str` parameters receive the raw
+  static/borrowed bytes without conversion.
 - **`Adt(TypeId, Vec[Type])`** — the ONE nominal form, builtin or
   user-defined. `builtin_adt` is the single construction helper for the
   builtins (fail-closed: an unverifiable name yields `Type::Error`,
@@ -471,8 +496,21 @@ are **gone**. The shape is:
   must be a constant: `fixed array size must be a constant` is a
   TypeError for a non-IntLit size; constant-expression sizes are a
   pending item (§15).
-- **`Function(Vec[ParamType], Type)`** — function types carry the
-  per-parameter access conventions (§2).
+- **`Function(Vec[ParamType], Type)`** — the TRANSITIONAL legacy form
+  (P1: the FnPtr/Closure split). New construction sites use the distinct
+  semantic forms:
+  - **`FnPtr(Vec[ParamType], Type)`** — a function POINTER: the signature
+    (parameter access conventions + return) and no environment; layout is
+    a single code pointer, bit-copyable, Transferable/Shareable per the
+    pointer policy;
+  - **`Closure(ClosureId, Vec[ParamType], Type, Type)`** — a closure
+    VALUE: the closure's identity, its signature, and the CAPTURE TUPLE
+    type. The closure object's layout/ABI derives from the captures (the
+    capture aggregate plus the code pointer); the closure's TypeProperties
+    derive from the capture tuple (§7); the checker types closure
+    expressions as this form and the MIR closure aggregate dispatches
+    through it. The legacy `Function` variant is retained transitionally
+    for the Batch-3 consumers and then deleted.
 - **`RefInternal(Type, Bool)`** — MIR-only (parameter re-wrap and
   MirRef typing); not a source-level type.
 - **`Ptr(Type)` / `PtrMut(Type)`** — raw pointers (§11). Box/Rc are Adt
@@ -648,7 +686,30 @@ The instance → mangled-name mapping (`instance_key` /
 plus the resolver's def_kinds metadata, from the cache's
 program/resolutions snapshot, so every render is byte-identical to the
 MIR builder's emission-name renders) plus the concrete-substitution
-suffix. Deterministic per (def, substs).
+suffix — rendered by the ONE canonical type encoding (the
+`CanonInternal` frame of `type_canon_render`, types.tg — the same walk
+the frontend type identity and the public ABI canonicalization use,
+parameterized only by the external symbol framing). Deterministic per
+(def, substs).
+
+**P1 (MonoKey deletion): specialization identity is the InstanceId —
+never a source/emission name.** The former `MonoKey { func_name,
+type_args }` record and the name-derived dedup entry are deleted; the
+cache's `instances` map is keyed by the instance key (the canonical
+render of the InstanceId — the key IS the emission symbol), so the cache
+hit, the emission name and the call-site rewrite all agree on the
+instance identity. The work queue's (callee name, InstanceId) pairs use
+the name only as the template-lookup key into `mir.functions`; the
+specialization itself is keyed exclusively by the instance.
+
+The public ABI's type-to-declaration association is DIRECT (P1): the
+checker's registration records every nominal TypeId's defining DefId
+(`TypeDef.def`, serialized in `resolutions.type_def_ids`), and the
+ABI stable-path derivation joins TypeId → DefId → the qualified
+module_symbols registration key — no name/order correlation. The
+frontend identity, the internal emission mangling and the public ABI
+canonicalization are ONE canonical type encoding
+(`type_canon_render`, types.tg).
 
 ---
 
@@ -748,8 +809,11 @@ compiler-owned structural field cleanup — exactly once.
 | Projected iteration bindings cannot escape the loop body | resource_check.tg §10 |
 | Zero-inference fail-closed: unsolved generic parameters are hard errors; the monomorphizer performs no inference | types.tg / mono.tg §13 |
 | LangItems built once, structurally unique; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
+| String is the OWNED String object (P0-STRING): one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract |
 | Type-property graph algorithm with inline-recursion diagnostics; memoized per concrete args | types.tg §7 |
 | Monomorphization: seen-set, MAX_MONO_INSTANCES, residual-param aborts | mono.tg §13 |
+| Map/set ownership ops: every key-operating map/set intrinsic site injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI gates by declared param count; kernel key types dispatch to the runtime helpers) — the impls are reached and specialized with zero inference | mono.tg `inject_map_dispatch_calls` / `apply_dispatch_injection`; codegen.tg `map_hash_dispatch_label` / `map_eq_dispatch_label` |
+| Layout tables are CONCRETE-keyed: the layout/offsets/sizes tables are populated per concrete (TypeId, substs) identity (`collect_concrete_adt_types` + `mir_type_identity_key`), so `Wrapper[Int]` and `Wrapper[File]` never share a layout entry | codegen.tg layout tables; mir.tg `mir_type_identity_key` |
 | CFG edge model recorded and validated per function | resource_check.tg §14 |
 | Destruction names verified against registered deinit targets (fail-closed) | mir.tg §4.3 |
 

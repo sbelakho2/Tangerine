@@ -134,6 +134,63 @@ The 2026-08-15 audit found the transition structurally sound through wave
 | 14 | Closure capture-effect inference not started | **RESOLVED** — typed capture records (`closure_captures`: closure expr node → captured local id → effect) are the only capture source for MIR |
 | 15 | Final ladder pending until all of the above are complete | **OPEN** — the full stage0→stage1→stage2→stage3 ladder with stage2 == stage3 and clean-root determinism is the bootstrap release procedure; it stays open until the pending items below close |
 
+## P1 addendum (August 2026) — identity/ABI/mono consolidation
+
+Recorded here for completeness (normative detail lives in
+`memory_model.md`, which supersedes this document):
+
+- **The String object ABI** (P0-STRING): the owned String object
+  (`memory_model.md` §9) — one pointer to the 32-byte
+  `{data,len,cap,stride}` header; the `string_*` intrinsics dispatch to
+  the String ABI (`_tg_string_*`), never the Array runtime; literals are
+  the static StrView and convert via `string_from_static` at every
+  owned-String demand site. **COMPLETED** (documented in the normative
+  model).
+- **The concrete-keyed layout**: layout/offsets/sizes tables are keyed by
+  the concrete (TypeId, substs) identity — `Wrapper[Int]` and
+  `Wrapper[File]` never share a layout entry (codegen's
+  `collect_concrete_adt_types` + `mir_type_identity_key`). **COMPLETED**.
+- **Collection ownership ops**: every key-operating map/set intrinsic site
+  injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI
+  gates by declared param count; kernel key types dispatch to the runtime
+  helpers) — zero-inference reachability for the generic impls.
+  **COMPLETED** (mono.tg `inject_map_dispatch_calls`).
+- **The property split**: `TypeProperties` carries the two independent
+  ownership axes (`owns_state` vs `requires_drop_glue`) plus
+  `contains_capability` (`memory_model.md` §7); `is_trivially_copyable`
+  is the copy authority, `requires_drop_glue` gates the DeinitPlan.
+  **COMPLETED**.
+- **FnPtr/Closure split**: `Type::Function` is the transitional legacy
+  form; the semantic forms are `Type::FnPtr(signature)` (a function
+  pointer, no environment) and `Type::Closure(ClosureId, signature,
+  capture tuple)` — the checker types closure expressions as the Closure
+  form and the closure's TypeProperties/layout derive from the capture
+  tuple (`memory_model.md` §7, §9). The legacy variant's remaining
+  consumers (mir.tg's closure-call gating, layout_engine, access_check,
+  lib, wasm_target) are the Batch-3 deletion target.
+- **The method table deletion**: the resolver's bare-keyed method table is
+  deleted; method DefIds come from the semantic registration
+  (module_symbols' qualified "path::Type::method" entries). **COMPLETED**
+  (the MIR's ResolvedNames snapshot construction in mir.tg is the
+  mechanical follow-up).
+- **MonoKey deletion**: specialization identity is the InstanceId — the
+  name-derived dedup record is deleted and the cache is keyed by the
+  instance key (`memory_model.md` §13). **COMPLETED**.
+- **One canonical type serializer**: the frontend identity, the mono
+  internal mangling and the public ABI canonicalization are ONE canonical
+  semantic type encoding (`type_canon_render`, types.tg) parameterized
+  only by the external symbol framing; the ABI's type-to-declaration
+  association is direct (TypeId → DefId via the checker's registration,
+  no name/order correlation). **COMPLETED**.
+- **EffectIds / IntrinsicId**: the effect interning registry (builtins
+  fixed, user effects module-qualified; the identity renders the
+  canonical ordered effect-ID set) and the semantic intrinsic-kind
+  classification attached at check time. **COMPLETED**.
+- **Slice enforcement**: COMPLETED — the safe-Slice escape channels are
+  enforced at the checker (return / store / closure-capture rejection via
+  the Slice-view containment rule, and backing-mutation-while-view-live
+  rejection through the P0-SL registry + the IterationPlan machinery).
+
 ## Pending items (current, not assumptions)
 
 The following remain open. They are documented as targets in
