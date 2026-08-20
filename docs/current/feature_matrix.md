@@ -44,7 +44,7 @@ that the stage0→stage1 ladder compiles. Everything outside the closure is
 | Error handling (Result/Option) | implemented+tested | ✅ | `std/core`; error codes E0xxx through the diagnostic registry |
 | Algebraic effects | API-only | ❌ | `std/effects.tg` declares the types; `MirEffectRecord` is never lowered from source and the runtime body is a trap stub (runtime.tg) |
 | Capability-based security | implemented+tested | ❌ | capability linearity enforced in resource_check.tg; `tests/canary/canary_capability.tg` |
-| 4-mode progressive system | partial (configuration data) | ❌ | `ModeConfig` bits are not consumed by the semantic pipeline except contracts/capabilities (see `language.md` §Progressive Strictness) |
+| 4-mode progressive system | partial (config carries only the enforced bits) | ❌ | `ModeConfig` holds the two unconditional enforcements only — contracts (`lower_contract`, mir.tg) and capabilities (`validate_capability_exit`, resource_check.tg); every other gate is pending, no config bit claims it (see `language.md` §Progressive Strictness) |
 | SIMD intrinsics | API-only | ✅ | `std/simd.tg` declares vector types (87 defs); no SIMD instruction support in asm.tg/codegen.tg; not in the bootstrap closure |
 | Inline assembly | unsupported | ✅ | no `asm` directive in token/ast/parser |
 
@@ -132,7 +132,7 @@ pending list).
 
 | Feature | Tangerine | Rust | Status basis |
 |---------|-----------|------|-------------|
-| LSP server | partial | ✅ | `tg lsp` subcommand exists (`lsp.tg`); editor recovery path is permissive resolution only |
+| LSP server | partial | ✅ | `tg lsp` subcommand exists (the LSP server lives in `tg_compiler/driver.tg`); editor recovery path is permissive resolution only |
 | VS Code extension | implemented-unverified | ✅ | `tangerine-vscode/` tree present; no test evidence |
 | Syntax highlighting | implemented-unverified | ✅ | TextMate grammar present |
 | Code formatting | implemented+tested | ✅ | `tg fmt` (formatter.tg) |
@@ -159,5 +159,5 @@ pending list).
 
 ---
 
-*Last updated: 2026-08 · working tree commit 5f6e56f (docs reconciled with
-the executable state)*
+*Last updated: 2026-08 · working tree commit 65dfe07 + the ref/allocator/
+verifier work (docs reconciled with the executable state)*

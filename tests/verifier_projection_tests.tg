@@ -1,0 +1,335 @@
+# ———————————————————————————————————————————————————————————————
+# MIR verifier unit tests — projected-place typing (the copy-safety
+# backstop).
+#
+# The copy-safety backstop (verifier_check_operand_ownership) decides whether
+# a MirCopy(place) is legal from the type of the PLACE BEING COPIED. For a
+# projected place (`container.field[index].owned_member`) the type of the
+# copy is the PROJECTED value's type — the root local's type is only the
+# start of the projection walk (Field(FieldId) -> the owner def's field type
+# under the concrete args, Variant(VariantId) -> the variant's payload,
+# TupleIndex -> the tuple element, ProjIndex/ProjConstantIndex -> the
+# fixed-array / Vec element, ProjDeref -> the pointee). The P0 bug this file
+# guards: the ownership check used the ROOT type alone, so a copy of a Copy
+# field inside a non-Copy container was rejected (false positive) and a copy
+# THROUGH a Copy root onto a non-Copy projected value was accepted (false
+# negative).
+#
+# Every test builds a minimal MirProgram by hand (a one-block function whose
+# binop operand is MirCopy(_0.<projection>) — a copy-permission site) and
+# asserts on verify_mir's error vector. Copyability answers come from the
+# engine's structural is_trivially_copyable (the snapshot env is empty; the
+# primitives/String/tuples/fixed arrays are decided structurally, an
+# unregistered Adt fails closed as non-copyable — exactly the fail-closed
+# rule the verifier documents for unknown/deferred types).
+#
+# The reviewer's table, and where each case lives below:
+#   copy root -> non-Copy field                    REJECTED  (test 1: struct
+#                                                    field; test 13: the
+#                                                    genuine Copy-root shape
+#                                                    Ptr[String] deref)
+#   non-Copy root -> Copy field                    ACCEPTED  (test 2 — the
+#                                                    projection's copyability
+#                                                    decides)
+#   tuple projection                               ACCEPTED/REJECTED (tests
+#                                                    3, 4)
+#   enum payload projection                        ACCEPTED/REJECTED (tests
+#                                                    5, 6)
+#   fixed-array/index projection                   ACCEPTED/REJECTED (tests
+#                                                    7-10, incl. the Vec
+#                                                    element)
+#   generic field becoming String after substitution  REJECTED (test 11 —
+#                                                    the post-mono verifier
+#                                                    sees the concrete String)
+#   ProjDeref                                      ACCEPTED/REJECTED (tests
+#                                                    12, 13)
+#
+# Choice: a DEDICATED verifier test file (the @test shape, run via
+# `tg test tests/verifier_projection_tests.tg`, the same shape as
+# golden/compiler_module_tests.tg), not canary_neg: the projected-place
+# MirCopy shapes this backstop guards are produced by compiler-generated MIR
+# (glue/mono), and source-level lowering materializes checked operands into
+# temps, so no source canary can reliably reach these shapes through
+# `tg check` (which also stops before the post-mono verifier — the generic
+# case above).
+# ———————————————————————————————————————————————————————————————
+
+use std::core::{Option, Result}
+use std::collections::Vec
+use std::test::assert
+
+use tg_compiler::mir::{
+  verify_mir, MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
+  MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp, MirOperand,
+  MirConstant, MirConstantKind, MirTypeDef, MirTypeDefKind, MirFieldDef,
+  MirVariantDef, MirTerminator, MirTerminatorKind, place_local, operand_copy,
+  operand_constant
+}
+use tg_compiler::ids::{FieldId, VariantId, TypeId}
+use tg_compiler::types::Type
+use tg_compiler::token::span_dummy
+
+# Build a one-block function whose single statement is
+#   _1 = MirCopy(_0.<projections>) == rhs
+# — the MirCopy appears as a BINOP operand, a copy-permission site the
+# ownership verifier inspects. Both _0 and _1 are PARAMS (initialized and
+# storage-live on entry, so the definite-init and storage-liveness checks
+# cannot produce noise); _1's declared type is the destination the binop
+# result is assigned into.
+def verifier_copy_fn(name: String, root_ty: Type, projections: Vec[Projection], dest_ty: Type, rhs: MirOperand) -> MirFunction
+  let param0 = MirLocal { id: MirLocalId { id: 0 }, name: "_0", ty: root_ty, is_mut: false, span: span_dummy() }
+  let param1 = MirLocal { id: MirLocalId { id: 1 }, name: "_1", ty: dest_ty, is_mut: false, span: span_dummy() }
+  var lhs_place = place_local(MirLocalId { id: 0 })
+  for p in projections do
+    lhs_place.projections.push(p)
+  end
+  let rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Eq, operand_copy(lhs_place), rhs) }
+  let assign = MirStatement { kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 1 }), rvalue), span: span_dummy() }
+  let block0 = MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::from([assign]),
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  }
+  MirFunction {
+    name: name,
+    params: Vec::from([param0, param1]),
+    ret_type: Type::Unit,
+    locals: Vec::new(),
+    blocks: Vec::from([block0]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def verifier_verify(f: MirFunction, defs: Vec[MirTypeDef]) -> Vec[String]
+  let program = MirProgram { functions: Vec::from([f]), statics: Vec::new(), types: defs }
+  verify_mir(&program)
+end
+
+def int_const() -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int, instance: Option::None })
+end
+
+def string_const() -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirString("x".to_string()), ty: Type::String, instance: Option::None })
+end
+
+# Test 1 — struct field projection, non-Copy field: MirCopy(_0.b) where
+# _0: S { a: Int, b: String } copies the STRING field — a bitwise copy of an
+# owning value, REJECTED (the projection's type decides, not the root).
+@test
+def test_neg_struct_field_string() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 100 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::String }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 100 }, index: 1 })])
+  let f = verifier_copy_fn("neg_struct_field_string".to_string(), Type::Adt(TypeId { id: 100 }, Vec::new()), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_struct_field_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_struct_field_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 2 — non-Copy root -> Copy field: MirCopy(_0.a) where _0: S { a: Int,
+# b: String } copies the INT field of a String-containing struct. The
+# projection's copyability decides — ACCEPTED. (The P0 bug rejected this:
+# it tested the copyability of the root S.)
+@test
+def test_pos_struct_field_int_noncopy_root() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 100 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::String }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 100 }, index: 0 })])
+  let f = verifier_copy_fn("pos_struct_field_int_noncopy_root".to_string(), Type::Adt(TypeId { id: 100 }, Vec::new()), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_struct_field_int_noncopy_root: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 3 — tuple projection, Copy element: MirCopy(_0.0) where
+# _0: (Int, String) — the projected Int is bit-copyable — ACCEPTED.
+@test
+def test_pos_tuple_index_int() -> Unit
+  let root_ty = Type::Tuple(Vec::from([Type::Int, Type::String]))
+  let proj = Vec::from([Projection::TupleIndex(0)])
+  let f = verifier_copy_fn("pos_tuple_index_int".to_string(), root_ty, proj, Type::Int, int_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 0, "test_pos_tuple_index_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 4 — tuple projection, owning element: MirCopy(_0.1) where
+# _0: (Int, String) — the projected String is NOT bit-copyable — REJECTED.
+@test
+def test_neg_tuple_index_string() -> Unit
+  let root_ty = Type::Tuple(Vec::from([Type::Int, Type::String]))
+  let proj = Vec::from([Projection::TupleIndex(1)])
+  let f = verifier_copy_fn("neg_tuple_index_string".to_string(), root_ty, proj, Type::String, string_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 1, "test_neg_tuple_index_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_tuple_index_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 5 — enum payload projection, Copy payload: MirCopy(_0.V0.0) where the
+# enum's V0 payload is Int (Variant downcast -> payload tuple, then the
+# positional field) — ACCEPTED.
+@test
+def test_pos_enum_payload_int() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 101 },
+    name: "E1".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "V0".to_string(), discriminant: 0, fields: Vec::from([Type::Int]) }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([
+    Projection::Variant(VariantId { owner: TypeId { id: 101 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 101 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("pos_enum_payload_int".to_string(), Type::Adt(TypeId { id: 101 }, Vec::new()), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_enum_payload_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 6 — enum payload projection, owning payload: the enum's V0 payload is
+# String — the copied projected value is NOT bit-copyable — REJECTED.
+@test
+def test_neg_enum_payload_string() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 102 },
+    name: "E2".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "V0".to_string(), discriminant: 0, fields: Vec::from([Type::String]) }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([
+    Projection::Variant(VariantId { owner: TypeId { id: 102 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 102 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("neg_enum_payload_string".to_string(), Type::Adt(TypeId { id: 102 }, Vec::new()), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_enum_payload_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_enum_payload_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 7 — fixed-array constant index, Copy element: MirCopy(_0[0]) where
+# _0: [Int; 4] — ACCEPTED.
+@test
+def test_pos_fixed_array_index_int() -> Unit
+  let root_ty = Type::FixedArray(Type::Int, 4)
+  let proj = Vec::from([Projection::ProjConstantIndex(0)])
+  let f = verifier_copy_fn("pos_fixed_array_index_int".to_string(), root_ty, proj, Type::Int, int_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 0, "test_pos_fixed_array_index_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 8 — fixed-array constant index, owning element: MirCopy(_0[0]) where
+# _0: [String; 4] — REJECTED.
+@test
+def test_neg_fixed_array_index_string() -> Unit
+  let root_ty = Type::FixedArray(Type::String, 4)
+  let proj = Vec::from([Projection::ProjConstantIndex(0)])
+  let f = verifier_copy_fn("neg_fixed_array_index_string".to_string(), root_ty, proj, Type::String, string_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 1, "test_neg_fixed_array_index_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_fixed_array_index_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 9 — Vec index projection, Copy element: MirCopy(_0[i]) where
+# _0: Vec[Int] — the ProjIndex element type is the Vec's concrete arg —
+# ACCEPTED.
+@test
+def test_pos_vec_index_int() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 120 },
+    name: "Vec".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::new()),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([Projection::ProjIndex(MirLocalId { id: 9 })])
+  let f = verifier_copy_fn("pos_vec_index_int".to_string(), Type::Adt(TypeId { id: 120 }, Vec::from([Type::Int])), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_vec_index_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 10 — Vec index projection, owning element: MirCopy(_0[i]) where
+# _0: Vec[String] — REJECTED.
+@test
+def test_neg_vec_index_string() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 120 },
+    name: "Vec".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::new()),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([Projection::ProjIndex(MirLocalId { id: 9 })])
+  let f = verifier_copy_fn("neg_vec_index_string".to_string(), Type::Adt(TypeId { id: 120 }, Vec::from([Type::String])), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_vec_index_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_vec_index_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 11 — generic field becoming String after substitution: the wrapper
+# def here is the POST-MONO concrete view (the layout engine's
+# substitute_mir_fields output — the field is the CONCRETE String), and the
+# local's type is the concrete instantiation Wrapper[String]. The post-mono
+# verifier sees the concrete String in the projected field and rejects the
+# bitwise copy.
+@test
+def test_neg_generic_field_string_after_substitution() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 130 },
+    name: "Wrapper".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "item".to_string(), ty: Type::String }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 130 }, index: 0 })])
+  let f = verifier_copy_fn("neg_generic_field_string_after_substitution".to_string(), Type::Adt(TypeId { id: 130 }, Vec::from([Type::String])), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_generic_field_string_after_substitution: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_generic_field_string_after_substitution: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 12 — ProjDeref projection, Copy pointee: MirCopy(*_0) where
+# _0: Ptr[Int] — ACCEPTED.
+@test
+def test_pos_deref_ptr_int() -> Unit
+  let root_ty = Type::Ptr(Type::Int)
+  let proj = Vec::from([Projection::ProjDeref])
+  let f = verifier_copy_fn("pos_deref_ptr_int".to_string(), root_ty, proj, Type::Int, int_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 0, "test_pos_deref_ptr_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 13 — ProjDeref through a COPYABLE root onto a non-Copy pointee:
+# MirCopy(*_0) where _0: Ptr[String]. The ROOT (Ptr[String]) is bit-copyable
+# (a raw pointer), but the projected VALUE is the String — REJECTED. This is
+# the exact false-negative shape the root-only typing produced (the old
+# check accepted the copy because the root is copyable).
+@test
+def test_neg_deref_ptr_string() -> Unit
+  let root_ty = Type::Ptr(Type::String)
+  let proj = Vec::from([Projection::ProjDeref])
+  let f = verifier_copy_fn("neg_deref_ptr_string".to_string(), root_ty, proj, Type::String, string_const())
+  let errors = verifier_verify(f, Vec::new())
+  assert(errors.len() == 1, "test_neg_deref_ptr_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_deref_ptr_string: expected the MirCopy error, got: " + errors[0])
+end

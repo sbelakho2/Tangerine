@@ -119,12 +119,13 @@ bh_dump_hash() {
 #   symbols    : sorted symbol table (nm)
 #   relocs     : normalized relocation table (otool -r)
 #
-# Front-end phases (tokens, ast/hir, mir, mir-mono) need the kernel entry to
-# thread the driver's --dump-* phase hooks (tg_compiler/driver.tg parse_args
-# already supports them; tg_compiler/bootstrap_main.tg does NOT yet). The
-# harness probes each stage binary; while the kernel entry rejects the flags
-# the phases are recorded as UNAVAILABLE. The moment bootstrap_main.tg
-# threads them these phases fingerprint automatically — no harness change.
+# Front-end phases (tokens, ast/hir, mir, mir-mono) use the driver's --dump-*
+# phase hooks (tg_compiler/driver.tg parse_args AND the kernel entry
+# tg_compiler/bootstrap_main.tg both accept them; the kernel compile entry
+# routes them through compile_startup_entry, which writes the normalized phase
+# dumps). The harness probes each stage binary; a probe that fails or produces
+# no output is recorded as UNAVAILABLE, and the RELEASE gate (bh_phase_equality
+# with a 4th argument "release") treats UNAVAILABLE as a hard failure.
 BOOTSTRAP_PHASES="link-image text sections symbols relocs tokens ast hir mir mir-mono"
 
 # Compute the phase fingerprints for a stage binary.
@@ -231,9 +232,15 @@ bh_fingerprints() {
 # just the final link image. A phase UNAVAILABLE in both stages is a recorded
 # gap and does not fail; a phase available in one stage only, or differing
 # between the stages, fails the gate.
-# Usage: bh_phase_equality <stage-a> <stage-b> <outdir>
+#
+# RELEASE GATE (4th argument "release"): the CI/bootstrap gate (run_bootstrap
+# Step 6) treats ANY UNAVAILABLE fingerprint as a HARD FAILURE — the semantic
+# phases must all produce real fingerprints, and a "not comparable" phase is
+# never acceptable in a release build. The UNAVAILABLE tolerance remains only
+# for non-release/debug probes (no 4th argument).
+# Usage: bh_phase_equality <stage-a> <stage-b> <outdir> [release]
 bh_phase_equality() {
-  local stage_a="$1" stage_b="$2" outdir="$3"
+  local stage_a="$1" stage_b="$2" outdir="$3" release_gate="${4:-}"
   local fa="$outdir/.fingerprints/$stage_a.fingerprints"
   local fb="$outdir/.fingerprints/$stage_b.fingerprints"
   if [ ! -f "$fa" ] || [ ! -f "$fb" ]; then
@@ -254,11 +261,21 @@ bh_phase_equality() {
       continue
     fi
     if [ "$ha" = "UNAVAILABLE" ] && [ "$hb" = "UNAVAILABLE" ]; then
+      if [ "$release_gate" = "release" ]; then
+        bh_err "phase equality (RELEASE GATE): $phase UNAVAILABLE in both stages — every semantic phase must produce a fingerprint; a UNAVAILABLE phase is a hard failure in release mode"
+        failures=$((failures + 1))
+        continue
+      fi
       bh_log "phase equality: $phase UNAVAILABLE in both stages (documented gap; kernel entry must thread --dump-*)"
       unavailable=$((unavailable + 1))
       continue
     fi
     if [ "$ha" = "UNAVAILABLE" ] || [ "$hb" = "UNAVAILABLE" ]; then
+      if [ "$release_gate" = "release" ]; then
+        bh_err "phase equality (RELEASE GATE): $phase UNAVAILABLE — every semantic phase must produce a fingerprint ($stage_a=$ha $stage_b=$hb)"
+        failures=$((failures + 1))
+        continue
+      fi
       bh_err "phase equality: $phase available in one stage only ($stage_a=$ha $stage_b=$hb)"
       failures=$((failures + 1))
       continue
@@ -275,7 +292,11 @@ bh_phase_equality() {
       failures=$((failures + 1))
     fi
   done < "$fb"
-  bh_log "phase equality: $compared phase(s) compared, $unavailable unavailable in both"
+  if [ "$release_gate" = "release" ]; then
+    bh_log "phase equality (release gate): $compared phase(s) compared, $unavailable unavailable — release mode: UNAVAILABLE is fatal"
+  else
+    bh_log "phase equality: $compared phase(s) compared, $unavailable unavailable in both"
+  fi
   if [ "$compared" -eq 0 ] && [ "$unavailable" -eq 0 ]; then
     bh_err "phase equality: zero phases compared or recorded — refusing to pass an empty comparison ($fa / $fb)"
     return 1
@@ -591,7 +612,7 @@ EOF
 # on the supported host.
 
 CANARY_SUITE_POSITIVE_COUNT=75
-CANARY_SUITE_NEGATIVE_COUNT=53
+CANARY_SUITE_NEGATIVE_COUNT=56
 CANARY_SUITE_ARM64_COUNT=2
 CANARY_SUITE_TOTAL=$((CANARY_SUITE_POSITIVE_COUNT + CANARY_SUITE_NEGATIVE_COUNT + CANARY_SUITE_ARM64_COUNT))
 
@@ -992,18 +1013,87 @@ run_native_tests() {
 # ———————————————————————————————————————————————————————————————
 
 # Assert that an emitted canary object contains NO trap stubs beyond the
-# runtime's single documented defensive trap. Trap stubs are the backend's
+# runtime's documented deliberate traps. Trap stubs are the backend's
 # "unimplemented op" markers: the old x86 codegen emitted x64_ud2 (0F 0B) for
 # unsupported ops and fabricated defaults — those holes are closed and the
-# gate must never let them regress. Every other trap instruction in a canary
-# object (unreachable/unwrap traps, contract/budget traps, asserts, aborts,
-# foreign brk immediates) is a failure.
+# gate must never let them regress.
 #
-# Allowed exception (arm64 only): the runtime's vec-push sanity trap
-# `brk #0xbeef` (runtime.tg __tg_vec_push) — a deliberate defensive trap for
-# corrupt vec pointers that every Vec-using canary includes. x86-64 allows
-# NO trap instructions at all.
+# The gate is SYMBOL-AWARE: every trap instruction (ud2 on x86-64; udf/brk on
+# arm64) is attributed to the function symbol that contains it (the nearest
+# preceding non-local label in the otool -tv disassembly) and is then either
+# ALLOWED (the symbol is in the deliberate abort/panic whitelist) or BANNED.
+# A banned trap — a trap-only implementation or OS-fallback trap in the
+# supported map/set/string/array runtime families, or any trap in user code —
+# fails the gate. A binary whose ONLY traps sit in the whitelisted abort/
+# panic/unreachable machinery passes.
+#
+# The whitelist (enumerated from the runtime's documented traps):
+#   __intrinsic_abort     "Abort execution with trap" (runtime.tg) — the
+#                         deliberate abort implementation
+#   panic, panic_unwind,  std::core panic/unreachable machinery (std/core.tg):
+#   begin_unwind,         panic entry, the unwind entry that performs the
+#   resume_unwind,        abort, re-panic, unreachable(msg) -> panic(msg),
+#   unreachable, assert   and assert -> panic
+# Allowed exception (arm64 only, independent of the whitelist): the runtime's
+# vec-push sanity trap `brk #0xbeef` (runtime.tg __tg_vec_push) — a
+# deliberate defensive trap for corrupt vec pointers.
 # Usage: bh_assert_no_trap_stubs <binary> <triple>
+TRAP_GATE_WHITELIST=" __intrinsic_abort panic panic_unwind begin_unwind resume_unwind unreachable assert "
+
+# Symbol-aware trap scan: attribute each trap instruction of a disassembly to
+# the containing function symbol (otool -tv label lines; local labels start
+# with `_.L` / `.L` and stay attributed to the enclosing function) and count
+# allowed (whitelisted abort/panic/unreachable machinery) vs banned (every
+# other trap) instructions.
+# Usage: bh_scan_traps <disassembly> <arch> -> "allowed banned"
+bh_scan_traps() {
+  local dis="$1" arch="$2"
+  local cur_sym="" line lbl bare
+  local allowed=0 banned=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *:)
+        # Label line: a function/global symbol or a local label. Local
+        # labels (_.Lxxx / .Lxxx) keep the current function attribution.
+        lbl="${line%:}"
+        case "$lbl" in
+          _.L*|.L*) ;;
+          *) cur_sym="${lbl#_}" ;;
+        esac
+        ;;
+      *)
+        case "$arch" in
+          x86_64)
+            if [[ "$line" == *ud2* ]]; then
+              if [[ "$TRAP_GATE_WHITELIST" == *" $cur_sym "* ]]; then
+                allowed=$((allowed + 1))
+              else
+                banned=$((banned + 1))
+              fi
+            fi
+            ;;
+          arm64)
+            if [[ "$line" == *udf* ]]; then
+              banned=$((banned + 1))
+            elif [[ "$line" == *brk* ]]; then
+              if [[ "$line" == *brk*0xbeef* ]]; then
+                # Documented vec-push sanity trap (immediate-identifiable).
+                allowed=$((allowed + 1))
+              elif [[ "$TRAP_GATE_WHITELIST" == *" $cur_sym "* ]]; then
+                # Deliberate abort inside the abort/panic machinery.
+                allowed=$((allowed + 1))
+              else
+                banned=$((banned + 1))
+              fi
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done <<< "$dis"
+  printf '%s %s\n' "$allowed" "$banned"
+}
+
 bh_assert_no_trap_stubs() {
   local binary="$1" triple="$2"
   if [ ! -f "$binary" ]; then
@@ -1022,37 +1112,15 @@ bh_assert_no_trap_stubs() {
     bh_err "trap-stub gate: cannot disassemble $binary for $arch"
     return 1
   fi
-  local hits=0
-  case "$arch" in
-    x86_64)
-      hits="$(printf '%s\n' "$dis" | grep -cE '\bud2\b' || true)"
-      ;;
-    arm64)
-      local udf_hits brk_hits brk_beef_hits
-      udf_hits="$(printf '%s\n' "$dis" | grep -cE '\budf\b' || true)"
-      brk_hits="$(printf '%s\n' "$dis" | grep -cE '\bbrk\b' || true)"
-      brk_beef_hits="$(printf '%s\n' "$dis" | grep -cE '\bbrk[[:space:]]+#0xbeef\b' || true)"
-      if [ "${udf_hits:-0}" -ne 0 ]; then
-        bh_err "trap-stub gate FAILED: $binary contains $udf_hits udf trap(s) ($arch — unreachable/unwrap trap stubs)"
-        return 1
-      fi
-      if [ "${brk_hits:-0}" -ne "${brk_beef_hits:-0}" ]; then
-        bh_err "trap-stub gate FAILED: $binary contains $((brk_hits - brk_beef_hits)) non-sanity brk trap(s) ($arch — only the documented 'brk #0xbeef' vec-push sanity trap is allowed)"
-        return 1
-      fi
-      bh_log "trap-stub gate OK: no trap stubs in $binary ($arch; $brk_beef_hits documented vec-push sanity trap(s) allowed)"
-      return 0
-      ;;
-    *)
-      bh_err "trap-stub gate: unsupported arch $arch"
-      return 1
-      ;;
-  esac
-  if [ "${hits:-0}" -ne 0 ]; then
-    bh_err "trap-stub gate FAILED: $binary contains $hits trap instruction(s) ($arch disassembly)"
+  local scan allowed banned
+  scan="$(bh_scan_traps "$dis" "$arch")"
+  allowed="${scan%% *}"
+  banned="${scan##* }"
+  if [ "${banned:-0}" -ne 0 ]; then
+    bh_err "trap-stub gate FAILED: $binary contains $banned banned trap instruction(s) outside the documented abort/panic whitelist ($arch — trap-only implementations / OS-fallback traps in the map/set/string/array runtime families are banned; only the whitelisted abort/panic/unreachable machinery is allowed)"
     return 1
   fi
-  bh_log "trap-stub gate OK: no trap instructions in $binary ($arch)"
+  bh_log "trap-stub gate OK: no banned trap instructions in $binary ($arch; $allowed documented abort/panic trap(s) in whitelisted symbols allowed)"
   return 0
 }
 
@@ -1163,12 +1231,21 @@ run_target_lane_canaries() {
 #     differ by construction, so any path leakage produces different hashes.
 #
 # Build the bootstrap closure for a clean tree from the kernel manifest.
-# Usage: build_clean_tree <dest-root> <repo-root>
+# Usage: build_clean_tree <dest-root> <repo-root> [--without-manifest]
 # Copies the exact compiler_kernel.manifest closure into $dest-root preserving
 # relative paths (std/ and tg_compiler/), so dependency resolution behaves
-# identically to the real bootstrap while the absolute root differs.
+# identically to the real bootstrap while the absolute root differs. The
+# manifest ITSELF is part of the closure: the self-host bootstrap is
+# manifest-closed (compiler_core bootstrap_manifest_sources), so a clean tree
+# without bootstrap/compiler_kernel.manifest would NOT reproduce the real
+# bootstrap. --without-manifest builds the closure minus the manifest for the
+# NEGATIVE self-host manifest gate (the compile must fail).
 build_clean_tree() {
   local dest="$1" repo="$2"
+  local with_manifest=1
+  if [ "${3:-}" = "--without-manifest" ]; then
+    with_manifest=0
+  fi
   local manifest="$repo/bootstrap/compiler_kernel.manifest"
   if [ ! -f "$manifest" ]; then
     bh_err "determinism: missing manifest $manifest"
@@ -1190,6 +1267,10 @@ build_clean_tree() {
         ;;
     esac
   done < "$manifest"
+  if [ "$with_manifest" = "1" ]; then
+    mkdir -p "$dest/bootstrap"
+    cp "$manifest" "$dest/bootstrap/compiler_kernel.manifest"
+  fi
   return 0
 }
 
@@ -1239,6 +1320,27 @@ check_two_clean_dirs() {
     bh_err "$stage determinism FAILED: clean-dir builds differ (absolute-path leak?)"
     return 1
   fi
+
+  # NEGATIVE self-host manifest gate: the same self-host compile WITHOUT
+  # bootstrap/compiler_kernel.manifest must FAIL. Self-host mode
+  # (include_compiler_lib=true — the driver path) is manifest-closed: there
+  # is NO prelude_files() fallback, so the compile must die with the manifest
+  # error instead of silently compiling a different dependency closure.
+  local dir_c="$outdir/determinism/C"
+  rm -rf "$dir_c"
+  mkdir -p "$dir_c/tg_compiler"
+  cp "$repo/tg_compiler/driver.tg" "$dir_c/tg_compiler/driver.tg"
+  bh_log "$stage determinism: negative self-host manifest gate (root=$dir_c, no bootstrap/compiler_kernel.manifest)"
+  local manifest_gate_out
+  if manifest_gate_out="$( cd "$dir_c" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$outdir/${stage}_c" --target "$(bh_boot_target)" 2>&1 )"; then
+    bh_err "$stage determinism: self-host compile WITHOUT bootstrap/compiler_kernel.manifest SUCCEEDED — the self-host path (include_compiler_lib=true) must fail without the manifest (no prelude_files fallback in self-host mode)"
+    return 1
+  fi
+  if ! printf '%s' "$manifest_gate_out" | grep -q "compiler_kernel.manifest"; then
+    bh_err "$stage determinism: self-host compile without the manifest failed for the WRONG reason (expected the compiler_kernel.manifest gate): $manifest_gate_out"
+    return 1
+  fi
+  bh_log "$stage determinism: self-host manifest gate OK (compile without the manifest failed with the manifest error)"
 
   bh_log "$stage determinism OK (byte-identical across two clean trees)"
   return 0

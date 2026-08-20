@@ -2355,7 +2355,7 @@ end
 
 def check_fn_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, body: &FnBody, frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
   match body
-  when FnBody::FnBlock(b) then check_block(program, typed, env, ctx, &b, &Vec::new(), frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when FnBody::FnBlock(b) then run_fn_block_worklist(program, typed, env, ctx, &b, &Vec::new(), frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when FnBody::FnExpr(e) then
     check_expr(program, typed, env, ctx, &e, &Vec::new(), frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &e, &Vec::new(), frame, errors, finalize_plan)
@@ -2375,6 +2375,123 @@ def check_fn_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ct
   # grounding) runs ONCE per program over the whole pre-built CFG at the
   # end of resource_check (validate_cfg_edges) — the per-function
   # invocation is gone with the per-function edge lists.
+end
+
+# the FUNCTION-BODY ENTRY through the BLOCK WORKLIST — the
+# function-level block flow over the PRE-BUILT CfgBlock records. The
+# function's top-level block list is computed from the records the
+# structural pass built for this function body (the body's own CfgBlock
+# record, id = the body's first-statement node id — the SAME key check_block
+# executes the body under); a block whose ENTRY state changed is processed
+# (the full per-block machinery: run_cfg_block over the block's statements
+# under the block's entry frame — the (entry, exit) block frames recorded
+# under the block's id as before, the Normal-edge obligation, the scope
+# exit), and its SUCCESSORS' entry states join its exit state. The join is
+# merge_frames — the existing branch-join logic REUSED as-is (the
+# per-local availability meet: Live ∩ Live = Live, divergent availabilities
+# collapse to MaybeLive); res_frame_equal is the change detector, and a
+# successor whose entry changed is re-processed.
+# The per-statement/per-expression recursion (check_stmt -> check_expr /
+# check_if / check_match / check_loop / check_loop_body / check_for) is
+# UNCHANGED: it executes every NESTED block (branch blocks, match arms,
+# loop bodies, defer bodies) under its own key with the pre-branch entry
+# frame. Those records are NOT part of the top-level universe — the
+# successor join is guarded to the universe — so the worklist never
+# double-executes a nested block (a second run would re-consume its
+# resources and duplicate its diagnostics).
+# The structural pass records exactly one CfgBlock per lexical block, so
+# the top-level universe is the body record ALONE: the worklist degenerates
+# to the single body run — the entry block executes exactly once against
+# the function-entry frame, byte-identical to the former check_block path —
+# and no successor join fires (the body record's edges leave the universe:
+# the True/False splits into the branch records, the Normal/terminator
+# edges to the function exit). Pending is seeded with the body key and is
+# only ever re-seeded from the join with a universe member — provably the
+# body key — so the worklist terminates after one iteration. If the
+# structural pass ever split the function body into several top-level
+# records, the records would need statement-list access (CfgBlock records
+# carry only id + edge indices; the function-level driver holds only the
+# body's statements) — that is the integration point that would need the
+# structural pass to expose per-record statements.
+def run_fn_block_worklist(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, block: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+  let blk_key = block_exit_key(block)
+  var fn_blocks = Vec::new()
+  var bi = 0
+  while bi < blocks.len() do
+    if blocks[bi].id == blk_key then
+      fn_blocks.push(bi)
+    end
+    bi = bi + 1
+  end
+  if fn_blocks.len() == 0 then
+    # empty body (key 0): the structural pass recorded no block — the
+    # worklist has nothing to drive (the empty-block no-op path).
+    return
+  end
+  # the worklist state: the per-block ENTRY frames (block id -> entry
+  # frame). The entry block's entry frame is the function-entry frame.
+  var entry_states: Map[Int, ResFrame] = Map::new()
+  var pending = Vec::new()
+  entry_states.insert(blk_key, res_frame_clone(frame))
+  pending.push(blk_key)
+  while pending.len() > 0 do
+    match pending.pop()
+    when Option::Some(key) then
+      # process the block: the full per-block machinery (check_block —
+      # the defer-scope push, run_cfg_block over the block's statements
+      # under its entry frame, the (entry, exit) block frames recorded
+      # under the block's id, the Normal-edge obligation, the scope
+      # exit). For the top-level universe this is the body record — the
+      # body's statement list, the only statement list the function-level
+      # driver holds.
+      check_block(program, typed, env, ctx, block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+      # the JOIN: the processed block's successors' entry states join its
+      # EXIT state — the post-processing frame (the scope-exit frontier a
+      # successor would enter under). Only successors inside the top-level
+      # universe are joined and re-driven; the nested records' entries are
+      # the statement recursion's domain (established from the pre-branch
+      # frame, unchanged).
+      let exit_state = res_frame_clone(frame)
+      var ri = 0
+      while ri < fn_blocks.len() do
+        if blocks[fn_blocks[ri]].id == key then
+          var ei = 0
+          while ei < blocks[fn_blocks[ri]].edges.len() do
+            let dest = edges[blocks[fn_blocks[ri]].edges[ei]].destination
+            if dest != 0 then
+              var in_universe = false
+              var ui = 0
+              while ui < fn_blocks.len() do
+                if blocks[fn_blocks[ui]].id == dest then
+                  in_universe = true
+                end
+                ui = ui + 1
+              end
+              if in_universe then
+                match entry_states.get(&dest)
+                when Option::Some(cur) then
+                  var two = Vec::new()
+                  two.push(res_frame_clone(&cur))
+                  two.push(res_frame_clone(&exit_state))
+                  let joined = merge_frames(&two)
+                  if !res_frame_equal(&cur, &joined) then
+                    entry_states.insert(dest, joined)
+                    pending.push(dest)
+                  end
+                when Option::None then
+                  entry_states.insert(dest, res_frame_clone(&exit_state))
+                  pending.push(dest)
+                end
+              end
+            end
+            ei = ei + 1
+          end
+        end
+        ri = ri + 1
+      end
+    when Option::None then ()
+    end
+  end
 end
 
 # / structural validation of the pre-built CFG edge model.

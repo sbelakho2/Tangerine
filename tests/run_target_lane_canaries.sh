@@ -7,11 +7,13 @@
 #   - cross lane (x86_64 on the aarch64 host): executed under Rosetta
 #     (arch -x86_64) when available, else under qemu-x86_64, else the
 #     disassembly gate alone
-# In EVERY case the emitted object must contain ZERO trap stubs: the gate
-# disassembles each binary (otool) and asserts no ud2 (x86-64) / no udf and
-# no foreign brk (arm64; the runtime's documented 'brk #0xbeef' vec-push
-# sanity trap is the only allowed exception). The x86 ud2 holes are closed —
-# the gate exists to make sure they stay closed.
+# In EVERY case the emitted object is checked by the SYMBOL-AWARE trap-stub
+# gate: every trap instruction is attributed to its containing function
+# symbol, and only the deliberate abort/panic/unreachable machinery
+# (__intrinsic_abort + the std::core panic helpers) is whitelisted. A trap
+# in any other symbol — in particular a trap-only implementation or
+# OS-fallback trap in the map/set/string/array runtime families — fails the
+# gate. The arm64 vec-push sanity trap 'brk #0xbeef' remains allowed.
 #
 # Usage: tests/run_target_lane_canaries.sh <compiler> <outdir> [triple|arch-alias]
 #   triple omitted            -> bh_boot_target (native lane)

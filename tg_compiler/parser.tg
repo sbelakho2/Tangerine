@@ -10,6 +10,7 @@ use std::core::{Option, Result, panic}
 use std::collections::{Vec}
 use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, is_expr_start, is_stmt_start, is_item_start, is_doc_comment}
 use tg_compiler::lexer::LexResult
+use tg_compiler::ids::{is_intrinsic_extern_name}
 use tg_compiler::ast::{
   Program, Item, ItemKind, Visibility,
   FunctionDecl, GenericParam, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
@@ -143,6 +144,19 @@ end
 # compile.
 def diag_safe_ref_not_first_class(bag: &mut Vec[Diagnostic], span: Span) -> Unit
   diag_error(bag, ErrorCode::E106SafeRefNotFirstClass, "safe reference types are not first-class; use a parameter access convention / access operation", span)
+end
+
+# HARD migration error: `ref` / `ref mut` (and `&` / `&mut`) pattern binders
+# are consumed here and were previously SILENTLY ERASED into the ordinary
+# inner pattern — a semantic no-op that manufactures ownership from a shared
+# projection (the RingBuffer[T]::peek_front class: `match self.buf[self.head]
+# when Option::Some(ref v) then Option::Some(v)` yields an owned T by
+# projection for every T, including String/Box/resources). Tangerine has no
+# first-class references: pattern bindings are BY VALUE, a shared read is a
+# Copy-bound accessor or an explicit clone. The parser records the error and
+# the parse FAILS (Option::None) — the syntax is never erased.
+def diag_ref_pattern_not_supported(bag: &mut Vec[Diagnostic], span: Span) -> Unit
+  diag_error(bag, ErrorCode::E106SafeRefNotFirstClass, "ref patterns are not supported: Tangerine has no first-class references; bind by value or use the access model", span)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2818,24 +2832,35 @@ def parse_extern_block(p: &mut TgcParser, start: Span) -> Option[ExternBlock]
 end
 
 # The extern ABI type parser: an extern declaration is the INTERNAL/FFI
-# boundary — `&T` / `&mut T` in an extern's type positions (INCLUDING
-# nested positions such as `Option[&K]`) denote the internal address/
-# reference ABI (the checker types them as RefInternal) and are the ONLY
-# general type positions where the reference forms parse (the E106
-# first-class-reference rejection applies everywhere else). The flag makes
-# parse_type itself produce the Ref form for the whole extern type subtree.
+# boundary — `&T` / `&mut T` in an intrinsic extern's type positions
+# (INCLUDING nested positions such as `Option[&K]`) denote the internal
+# address/reference ABI (the checker types them as RefInternal) and are
+# the ONLY general type positions where the reference forms parse (the
+# E106 first-class-reference rejection applies everywhere else). The
+# extern_abi_context flag (set by parse_extern_fn / parse_extern_static —
+# SCOPED to the compiler-known intrinsic declarations, is_intrinsic_
+# extern_name) makes parse_type itself produce the Ref form for the whole
+# extern type subtree; an ordinary user extern never sets the flag, so its
+# `&T` / `Option[&T]` type positions hit the E106 rejection.
 def parse_extern_abi_type(p: &mut TgcParser) -> Option[TypeExpr]
-  let saved = p.extern_abi_context
-  p.extern_abi_context = true
-  let result = parse_type(p)
-  p.extern_abi_context = saved
-  result
+  parse_type(p)
 end
 
 def parse_extern_fn(p: &mut TgcParser) -> Option[ExternFn]
   let start = peek_span(p)
   match expect_ident(p)
   when Option::Some(name) then
+    # The extern-ABI reference context is scoped to the compiler-known
+    # intrinsic declarations — the `__intrinsic_` name prefix (the
+    # bootstrap collections' internal visitor signatures and the
+    # intrinsic family; is_intrinsic_extern_name). ONLY those may use the
+    # reference forms in their type positions. An ordinary user extern is
+    # the strict FFI boundary: its `&T` / `Option[&T]` type positions are
+    # rejected (E106) and the interop guidance is raw pointers / view
+    # structs. The name is read before any type position, so the flag is
+    # set for the whole signature (params AND return) and restored after.
+    let saved = p.extern_abi_context
+    p.extern_abi_context = is_intrinsic_extern_name(&name)
     let generic_params = parse_generic_params(p)
     expect(p, TokenKind::LParen)
     let params = parse_param_list(p)
@@ -2847,6 +2872,7 @@ def parse_extern_fn(p: &mut TgcParser) -> Option[ExternFn]
     end
     consume_trailing_receiver_convention(p, &mut params)
     eat_optional_semi(p)
+    p.extern_abi_context = saved
     return Option::Some(ExternFn {
       name: name,
       generic_params: generic_params,
@@ -2869,16 +2895,25 @@ def parse_extern_static(p: &mut TgcParser) -> Option[ExternStatic]
   match expect_ident(p)
   when Option::Some(name) then
     expect(p, TokenKind::Colon)
+    # The extern-ABI reference context for extern statics is scoped the
+    # same way as extern functions: only the compiler-known intrinsic
+    # declarations (the `__intrinsic_` name prefix) may use the reference
+    # forms in their declared type.
+    let saved = p.extern_abi_context
+    p.extern_abi_context = is_intrinsic_extern_name(&name)
     match parse_extern_abi_type(p)
     when Option::Some(ty) then
       eat_optional_semi(p)
+      p.extern_abi_context = saved
       return Option::Some(ExternStatic {
         name: name,
         ty: ty,
         is_mut: is_mut,
         span: span_merge(start, peek_span(p))
       })
-    when Option::None then return Option::None
+    when Option::None then
+      p.extern_abi_context = saved
+      return Option::None
     end
   when Option::None then return Option::None
   end
@@ -4336,26 +4371,41 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
   
   match peek(p)
   when TokenKind::Amp then
+    # Hard migration error: `&pat` in a pattern is not a first-class
+    # reference binding — the old parser erased it into the inner pattern
+    # (a semantic no-op). The pattern is rejected, never silently erased.
+    let ref_span = peek_span(p)
     advance(p)
+    diag_ref_pattern_not_supported(&mut p.diag, ref_span)
     match parse_single_pattern(p)
-    when Option::Some(inner) then
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::AmpMut then
+    let ref_span = peek_span(p)
     advance(p)
+    diag_ref_pattern_not_supported(&mut p.diag, ref_span)
     match parse_single_pattern(p)
-    when Option::Some(inner) then
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::TkRef then
+    # Hard migration error: `ref` / `ref mut` patterns are consumed by the
+    # parser and were previously SILENTLY ERASED into the ordinary inner
+    # pattern — `when Option::Some(ref v) then Option::Some(v)` returned an
+    # owned T by projection, manufacturing ownership for every T (the P0
+    # RingBuffer[T]::peek_front class). Reject the syntax outright; the
+    # inner pattern is parsed only for error recovery and the parse fails.
+    let ref_span = peek_span(p)
     advance(p)
+    diag_ref_pattern_not_supported(&mut p.diag, ref_span)
     match parse_single_pattern(p)
-    when Option::Some(inner) then
-      return Option::Some(inner)
-    when Option::None then return Option::None
+    when Option::Some(_) then ()
+    when Option::None then ()
     end
+    return Option::None
   when TokenKind::Handle then
     advance(p)
     return Option::Some(make_pattern(PatternKind::Ident("handle".to_string(), false), start))

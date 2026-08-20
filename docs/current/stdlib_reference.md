@@ -18,55 +18,61 @@ This document provides a comprehensive reference for all modules in the Tangerin
    `collections`, `core`, `env`, `ffi`, `fmt`, `fs`, `gfx_errors`, `io`,
    `process`, `taint`, `time`) are compiled by every stage of the bootstrap
    ladder. They have no per-module native test suites.
-2. **E106 migration in progress:** the non-kernel modules still contain
-   first-class reference type positions (`-> &T`, `-> &mut T`,
-   `-> Option[&T]`, `-> Vec[&T]`, ...) that are E106 hard errors under the
-   current native parser. They do not parse under the current compiler and
-   are therefore **API-only** until migrated. The module reference sections
-   below describe declared surfaces, not verified behavior.
-3. **Kernel remainder:** `std/collections.tg` (in the closure) has 5
+2. **E106 migration COMPLETE (parse-clean):** every shipped std module
+   (the 14 kernel modules plus all 119 non-kernel `std/*.tg` files) is
+   free of first-class reference type positions — zero `-> &T`,
+   `-> &mut T`, `Option[&T]`, `Vec[&T]`, nested `&` in generic args, fn-type
+   return `&` positions, `&T`-typed fields/consts/let-annotations, `as &T`
+   casts, and `ref` patterns remain in the non-kernel modules (the sweep
+   gate `tests/run_stdlib_e106_sweep.sh` asserts every module checks clean
+   and E106-free). The module reference sections below still describe
+   declared surfaces, not verified behavior — the modules remain
+   **API-only** until they pass per-module native test suites.
+3. **Kernel remainder:** `std/collections.tg` (in the closure) keeps 5
    record-visit extern signatures (`__intrinsic_map_visit_*`,
    `__intrinsic_set_visit_*`) with `Option[&K]`/`&V` returns. They parse
    only through the extern-declaration exception
    (`parse_extern_abi_type`, parser.tg — `&T`/`&mut T` in an `extern`
-   declaration denotes the internal address/reference ABI); anywhere else
-   the native parser records the E106 hard error
-   (`parse_type`). These signatures are the in-progress remainder of the
-   kernel migration — the kernel's last reference type positions.
+   declaration whose name carries the `__intrinsic_` prefix denotes the
+   internal address/reference ABI); anywhere else the native parser
+   records the E106 hard error (`parse_type`). These signatures are the
+   kernel's ONLY remaining reference type positions — the documented
+   extern-ABI exception, not a migration remainder.
 
-### Modules not yet migrated (E106-pending, current working tree)
+### Migration status (E106-pending table — MIGRATED 2026-08-20)
 
-Reference type positions found in code (return types / generic type args —
-a definition whose return type contains `&`, including `&mut` and `&`
-inside generic arguments such as `Option[&T]`, `Vec[&T]`, and
-`impl Iterator[Item = &T]`; one per definition), count per module.
-Recounted 2026-08-20 against the working tree; 71 modules total
-(70 with code sites + `alloc`, comment-only):
+The former pending table (71 modules / 374 sites: return types and
+generic type args containing `&`, including `&mut` and `&` inside generic
+arguments such as `Option[&T]`, `Vec[&T]`, and `impl Iterator[Item = &T]`;
+one per definition) is EMPTY: all non-kernel modules were converted to the
+access model. The conversion classes:
 
-| Count | Module |
-|-------|--------|
-| 49 | `cli` |
-| 29 | `web` |
-| 27 | `log`, `db` |
-| 23 | `http` |
-| 20 | `thread` |
-| 17 | `term` |
-| 15 | `url` |
-| 13 | `audio` |
-| 12 | `sync` |
-| 11 | `crypto` |
-| 9 | `atomic` |
-| 8 | `input`, `config` |
-| 7 | `http2` |
-| 5 | `serde`, `async`, `collections` (kernel remainder) |
-| 4 | `windows`, `websocket`, `toml`, `gpu_vulkan`, `mmap`, `embedded` |
-| 3 | `wasm`, `ui`, `secure_types`, `random`, `compress` |
-| 2 | `path`, `opentelemetry`, `debug`, `csv` |
-| 1 | `web_server`, `wasm_js`, `validation`, `test`, `tensor`, `sql`, `snapshot`, `semver`, `regex`, `profile`, `postgres`, `platform`, `patch`, `obligations`, `migrate`, `metrics`, `math`, `lsp`, `kernel`, `json`, `image`, `hal`, `graph`, `gpu_metal`, `gfx_gpu`, `geom`, `fuzz`, `fft`, `encoding`, `embed_trace`, `diagnostics`, `device`, `ctx`, `contracts`, `autotune`, `auth`, `audit`, `alloc` (comment only) |
+- (a) FFI extern surfaces → raw pointer forms: `&T`/`&mut T` byte-pointer
+  params and reference returns became `Ptr[T]`/`PtrMut[T]` (thread's
+  pthread externs, mmap's syscall externs, windows' Win32 API
+  `Ptr[CHAR]`/`PtrMut[CHAR]`, gpu's Vulkan/CUDA/OpenCL bindings,
+  signal/rand syscall externs), with struct-typed conventions
+  (`&PthreadT`, `&termios`, `&HANDLE`, ...) kept as parameter conventions.
+- (b) Internal view accessors → owned erased-value forms (the kernel
+  pattern: `-> &String` → `-> String` with `.clone()`/`&place` bodies,
+  `Option[&T]` → `Option[T]`, `Vec[&T]` → `Vec[T]`, `&str` returns →
+  `String`, `&[T]`/`&[u8]` views → `Vec[T]`/`FfiSlice[T]`).
+- (c) Builder setters (`-> &mut Self`) → owned sink receivers returning
+  the owned value (`sink self: X ... -> X`), preserving call chains.
+- (d) Generic accessors (`-> &T` / `-> &mut T` on unbound `T`) → the raw
+  non-owning pointer surface (`-> Ptr[T]` / `-> PtrMut[T]`, the
+  `Box::get` kernel pattern); guard/lock fields holding references became
+  `Ptr`/`PtrMut` fields with `&place as Ptr[T]` construction.
+- (e) `const X: &str` → `const X: String`; `let x: Vec[&str]` annotations
+  → owned element forms; `as &T` casts → `as Ptr[T]`; `impl X for &T` →
+  the owned/view type; `for &x in ...` ref patterns → by-value bindings.
 
-The migration converts each `&T`/`&mut T` type position to an access
-convention or an explicit access operation, mirroring the completed kernel
-migration (see `../history/access_resource_migration.md`).
+Remaining reference-typed positions in the non-kernel std: **zero** (the
+legal parameter-convention spellings `x: &T` / `self: &mut Self` and
+fn-type param conventions `fn(&T)` remain — they are stripped at parse
+time before `parse_type` and never reach the E106 rejection). The sweep
+gate `tests/run_stdlib_e106_sweep.sh` now asserts every shipped module
+checks clean and E106-free.
 
 ---
 

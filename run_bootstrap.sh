@@ -24,7 +24,8 @@
 #   text, sections, symbols, relocs and — under trace — the probed tokens,
 #   ast/hir, mir, mir-mono front-end dumps). The stage2 == stage3
 #   reproducibility gate compares EVERY fingerprinted phase, not just the
-#   final link image.
+#   final link image, and in the trace (release) configuration treats any
+#   UNAVAILABLE phase fingerprint as a hard failure.
 #
 # Usage:
 #   ./run_bootstrap.sh [--trace|--trace-phases] [--skip-determinism] [--skip-ladder]
@@ -110,6 +111,12 @@ Options:
   --skip-determinism         skip the two-root reproducibility check
   --skip-native-tests        skip compiling+running native canaries / arch tests
   -h | --help                show this help
+
+Release gate:
+  With trace active (the CI configuration) the phase-equality gate is the
+  RELEASE GATE: any UNAVAILABLE fingerprint is a hard failure — every
+  semantic phase must produce a real fingerprint. Without trace the
+  UNAVAILABLE tolerance remains (non-release/debug probes).
 
 Environment:
   TG_BOOTSTRAP_TRACE=1       enable phase fingerprints
@@ -307,8 +314,18 @@ bh_log "stage2 == stage3 (reproducible fixed point, 'cmp' OK)"
 # Phase-level fixed-point gate: stage2 == stage3 at EVERY fingerprinted
 # phase (link-image, text, sections, symbols, relocs, and the probed
 # front-end dumps under trace), not only at the final link image.
-if ! bh_phase_equality tg_stage2 tg_stage3 "$BUILD_DIR"; then
-  bh_err "stage2/stage3 per-phase equality failed — phase fingerprints diverged"
+# RELEASE GATE: in the trace configuration (CI sets TG_BOOTSTRAP_TRACE=1 —
+# the configuration that actually probes the semantic phases) ANY UNAVAILABLE
+# fingerprint is a HARD FAILURE: the semantic phases must all produce
+# fingerprints. The UNAVAILABLE tolerance remains only for non-release/debug
+# runs (no trace, no probes).
+phase_gate_args=""
+if [ "${BOOTSTRAP_TRACE_ACTIVE:-0}" = "1" ]; then
+  phase_gate_args="release"
+  bh_log "phase-equality RELEASE GATE active (trace mode: any UNAVAILABLE fingerprint is fatal)"
+fi
+if ! bh_phase_equality tg_stage2 tg_stage3 "$BUILD_DIR" $phase_gate_args; then
+  bh_err "stage2/stage3 per-phase equality failed — phase fingerprints diverged (or a phase is UNAVAILABLE under the release gate)"
   exit 2
 fi
 

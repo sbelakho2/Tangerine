@@ -447,7 +447,7 @@ type_args      = '[' type_expr { ',' type_expr } ']'
   `Result[T, E]`, `Vec[T]` (= `Array[T]`, the heap vector — a handle to
   the stride-carrying 32-byte heap header `{data, len, cap, stride}`),
   `Map[K: Hash + Eq, V]` and `Set[T: Hash + Eq]` (= `Map[T, Unit]`; the
-  88-byte header carrying the concrete layout plus concrete Hash/Eq
+  96-byte header carrying the concrete layout plus concrete Hash/Eq
   dispatch), `Slice[T]` (the non-owning 16-byte `{ptr, len}` view),
   `Box[T]`, `Rc[T]`, `Ptr[T]`, `PtrMut[T]`. Collection insertion
   (`push`/`insert`/`set_insert`) takes the inserted value **by sink** —

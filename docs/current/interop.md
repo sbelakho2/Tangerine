@@ -46,7 +46,7 @@ Tangerine v0.1 provides stable ABI guarantees on these 64-bit little-endian targ
 |--------------|-----|-------|
 | `x86_64-unknown-linux-gnu` | SysV AMD64 | Primary Linux target |
 | `x86_64-apple-darwin` | SysV-like | macOS |
-| `x86_64-pc-windows-msvc` | Win64 | Windows with MSVC |
+| `x86_64-pc-windows-msvc` | Win64 | Windows with MSVC (allocator pairing: HeapAlloc/HeapFree) |
 | `aarch64-apple-darwin` | ARM64 | Apple Silicon |
 
 Other targets are supported but not ABI-stable in v0.1.
@@ -198,15 +198,18 @@ end
 
 ### Primitive Type Sizes
 
-All sizes are for 64-bit targets:
+All sizes are for 64-bit targets. There are no first-class reference
+types (`&T` in a type position is the E106 hard error — see
+[memory_model.md](memory_model.md) §2.3); the only reference-like
+crossing is the explicit `Ptr[T]` / `PtrMut[T]` raw-pointer pair.
 
 | Tangerine Type | Size (bytes) | Alignment | Notes |
 |----------------|--------------|-----------|-------|
 | `Int` | 8 | 8 | Signed 64-bit |
 | `Bool` | 1 | 1 | Must be 0 or 1 |
 | `Float` | 8 | 8 | IEEE 754 f64 |
-| `Ref[T]` | 8 | 8 | Pointer |
-| `String` | 24 | 8 | ptr + len + cap |
+| `String` | 8 | 8 | ONE `StringPtr` handle to a 32-byte owned header `{data, len, cap, stride}` (the String VALUE width is the pointer; see memory_model.md §9) |
+| `StrView` | 8 | 8 | Raw pointer to the interned/borrowed static bytes (no drop, no clone) |
 | `Slice[T]` | 16 | 8 | ptr + len |
 
 ### `@repr(C)` Struct Layout
@@ -348,6 +351,49 @@ void example() {
     tg_free(buffer, 1024, 8);
 }
 ```
+
+### Runtime Heap Allocator (`_tg_mem_alloc` / `_tg_mem_free`)
+
+The runtime's internal heap — the allocator every owned String object and
+data buffer, every Vec buffer, and every map tuple comes from — is a
+size-class free-list allocator with an mmap large path:
+
+- **Size classes**: 16/32/64/128/256/512/1024/2048/4096/8192/16384/32768/
+  65536. A request whose 8-byte-aligned payload is `<= 65536` is a SMALL
+  allocation served from the per-class LIFO free list; anything larger is
+  a LARGE allocation served by `mmap`.
+- **Block header** (16 bytes before the returned pointer): `header[0]` is
+  the marker — `1` = large block, `0` = small block (live or on the free
+  list); `header[8]` is the size — the total aligned bytes for large
+  blocks (the `munmap` length) and the class payload size for small
+  blocks. `_tg_mem_free` recovers everything from the header; its `size`
+  argument is ignored.
+- **Free-list linkage**: a freed small block stores its next-free pointer
+  in its payload's first 8 bytes; the 13 per-class heads live in
+  `_tg_alloc_free_heads` in `.data`. The bump arena is used ONLY as the
+  free-list seed — steady-state churn never touches it.
+- **Large path**: `mmap` with the marker/size header written only AFTER
+  the `MAP_FAILED` check (the sign bit); on failure the allocator returns
+  0 — it never writes through a failed mapping and never returns a bogus
+  pointer.
+- **OOM policy**: `_tg_mem_alloc` returns `0` on failure; the runtime
+  String/Vec/Map emitters check the result and trap with the runtime's
+  OOM trap (`brk`/`ud2`). `_tg_alloc_fail_next()` arms a single-shot
+  fault-injection flag that makes the next large-path request return 0
+  without calling `mmap` (deterministic OOM simulation for tests).
+- **Allocator state**: `_tg_allocator_outstanding_bytes()` returns the
+  live payload bytes (allocated minus freed; free-list blocks count as
+  freed at the moment they are linked in). Tests assert on this counter
+  (`tests/allocator_churn_test.tg`, `tests/allocator_reuse_test.tg`,
+  `tests/allocator_large_test.tg`, `tests/allocator_oom_test.tg`).
+- **Windows targets**: the allocator pairing is REAL on both Windows
+  targets — `x86_64-pc-windows-msvc` allocates through
+  `GetProcessHeap`/`HeapAlloc` and frees through `HeapFree`; the ARM64
+  Windows path allocates through `VirtualAlloc` and frees through
+  `VirtualFree(base, 0, MEM_RELEASE)`. Both write the same
+  `{marker = 1, total}` header and null-check the allocation result
+  before writing it. The tests above are native on macOS/Linux and
+  cross-compile for the Windows targets (no Windows host lane in CI yet).
 
 ---
 
@@ -717,7 +763,10 @@ end
 
 ### String Passing Convention
 
-Strings are passed as `(ptr, len)` pairs:
+The owned `String` VALUE is one `StringPtr` handle (an 8-byte pointer to
+the runtime's 32-byte `{data, len, cap, stride}` object) and does not
+cross the C ABI. At FFI boundaries, pass the explicit view instead —
+either `FfiStr` (borrowed, `{ptr, len}`) or the raw pair:
 
 ```tangerine
 # Tangerine side
@@ -998,12 +1047,12 @@ ABI Test Suite - Edition 2026, Revision 1
 ==========================================
 
 Primitive Types:
-  Int:    size=8, align=8  ✓
-  Bool:   size=1, align=1  ✓
-  Float:  size=8, align=8  ✓
-  Ref[T]: size=8, align=8  ✓
-  String: size=24, align=8 ✓
-  Slice:  size=16, align=8 ✓
+  Int:     size=8, align=8  ✓
+  Bool:    size=1, align=1  ✓
+  Float:   size=8, align=8  ✓
+  String:  size=8, align=8  ✓   (StringPtr handle to the 32-byte header)
+  StrView: size=8, align=8  ✓
+  Slice:   size=16, align=8 ✓
 
 All ABI tests passed.
 ```

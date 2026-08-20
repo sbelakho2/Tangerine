@@ -62,7 +62,8 @@ lifetimes; those concepts are not supported by the language. The only
 syntax that the parser normalizes away (§2). First-class `&T` / `&mut T`
 in a general type position is rejected with the hard error E106 (§2.3);
 the legacy parameter-convention spellings remain only as normalized
-syntax (§2), pending their parser deletion (§15).
+syntax (§2), and ref patterns are likewise rejected with E106
+("ref patterns are not supported").
 
 ---
 
@@ -92,8 +93,10 @@ Sources of a convention:
   (one semantic implementation): `&mut T` → `inout T`, `&T` / `&self` →
   `let T`, `move T` / `own T` → `sink T`, `mut x` / `let mut x` → `var x`
   (`var` is an alias of `mut` in the keyword table). The transitional
-  `ParamModifier` field is retained during migration and is a deletion
-  target (§15).
+  `ParamModifier` field is **deleted**: `Param` carries the
+  `AccessConvention` directly (`convention` field, ast.tg), so the
+  let/inout/sink/set map is the one parameter model — no modifier field
+  survives on the AST.
 
 ### 2.1 The typed access effects are authoritative
 
@@ -226,22 +229,49 @@ terminators carrying the place, the **verified** registered deinit name
 (fail-closed: an unverifiable name panics at plan construction), and
 target/unwind.
 
-### 4.4 Projected-place rejections until partial moves
+### 4.4 Partial moves: the place-level registry and the masked glue
 
-There is no per-place partial-move state yet. Moving a resource **out of a
-projected place** is rejected:
+There **is** per-place partial-move state. The checker's pattern-binding
+sites (`record_place_moves` in types.tg, called at the let-initializer
+sites after `check_pattern`) record every Consume binding whose source
+place is a projection of a local root: the joined field path (struct
+field names / tuple `"t<i>"` segments; nested paths join with `.`) is
+marked `Consumed` under the root local in `place_move_states`
+(root semantic `LocalId` → path → `PlaceMoveState`), and a binding
+through a non-field projection (variant/index/deref) marks the root's
+whole value `"*"` Consumed — the bounded lattice: enum payload and index
+moves are whole-value. The registry is serialized into the
+`TypedProgram` and mirrored by the MIR builder (`b.place_move_states`).
+
+The MIR consumes the registry at the drop sites (the Drop actions of
+`emit_cleanup_chain`): a root with per-field records emits the
+**partial-drop chain** (`mir_emit_partial_drop_chain`) — each LIVE field
+is dropped through its own concrete drop-glue with a constant all-ones
+mask (nested consumption recurses over the field's own shape), the
+CONSUMED fields emit nothing, and a whole-value (`"*"`) record emits no
+drop at all. The drop of the partially-moved value drops exactly the
+live fields; the glue's `mask` parameter + the mask-conditioned plan
+walk (`emit_plan_deinit`'s mask-local mode) is the DIRECT-call form of
+the same conditioning. Match destructuring of resources (an
+`Option[Resource]` scrutinee is consumed exactly once) and closure
+capture of resources (the outer local is consumed exactly once into the
+closure frame) flow through this machinery.
+
+**Direct expression-level consumption of a projected resource place is
+still rejected** — the root-level frame cannot prove the field's
+storage is dead, so the consume/initialize rules fail closed at
+root-granularity:
 
 ```
 cannot consume a projected place: partial moves are not yet supported
 cannot move out of a projected place: partial moves are not yet supported
 cannot assign over an owning projected place: exact-place replacement is
 not yet supported
+cannot initialize a projected place: exact-place state is not yet supported
 ```
 
-Whole-place moves, match destructuring of resources (an `Option[Resource]`
-scrutinee is consumed exactly once), and closure capture of resources
-(the outer local is consumed exactly once into the closure frame) all
-work. Partial moves are a documented pending item (§15).
+The registry + masked glue are the implemented base; the expression-level
+projected-place operations are the remaining pending item (§15.2).
 
 ---
 
@@ -329,9 +359,16 @@ resource checker tracks it) and `requires_drop_glue` (the value needs a
 physical destructor — the buffer release, a registered Drop, a registered
 deinit) are independent:
 
-- **String** is `owns_state=true, requires_drop_glue=false`: the arena
-  reclaims its buffer, so there is no per-value destructor, but a bit-copy
-  would duplicate the owned buffer — String is Clone, NOT Copy.
+- **String** is `owns_state=true, requires_drop_glue=true`: the String
+  object and its data buffer are REAL heap allocations (the
+  `_tg_mem_alloc` / `_tg_mem_free` pair — the same allocator the Vec
+  buffers use, never the bump arena), and the MIR's
+  `DeinitPlan::String` destructor (`_tg_string_drop`, emitted at the
+  value's semantic lifetime boundary) frees BOTH the object and the
+  buffer — small blocks re-enter the allocator's per-class free list. A
+  bit-copy would duplicate the owned buffer — String is Clone, NOT Copy
+  (the `impl Clone/Eq/Hash for String` trait impls in std/core.tg make
+  the `[T: Clone]` / `[T: Eq]` / `[T: Hash]` bounds satisfiable).
 - `requires_drop_glue` gates the DeinitPlan (drop-glue shape);
   `is_trivially_copyable` is the copy authority (the MIR Copy verifier
   queries this axis, never the DeinitPlan).
@@ -423,8 +460,13 @@ Builtin behaviors are selected by **LangItems ids, never names**.
 `LangItems` (`types.tg`) is the bundle of well-known intrinsic
 type/trait ids, built **once** at environment initialization after every
 builtin registration (`build_lang_items`), with structural uniqueness
-assertion (a duplicate id is an ICE). Fields: the nine type ids
-`option/result/vec/map/set/box_/rc/array/slice` and the trait ids
+assertion (a duplicate id is an ICE). Fields: the type ids
+`option/result/vec/map/set/box_/rc/array/slice` plus `string`,
+`str_view` (the literal view type), `unique_ptr`, `arc_strong`,
+`weak_rc`, `weak_arc`, `ptr`, `ptr_mut` (the name-selected smart
+pointers and the raw-pointer forms are registered, so the property
+engine and the hash/eq dispatch select by id with a name fallback only
+for snapshots without a registration), and the trait ids
 `drop_trait/clone_trait/copy_trait/eq_trait/hash_trait/
 transferable_trait/shareable_trait`; `-1` marks a name unregistered at
 init (Transferable/Shareable are std-declared traits whose TraitIds
@@ -461,16 +503,23 @@ are **gone**. The shape is:
   (the engine's `StringPtr` value width) to a 32-byte String object
   header — the same shape as the Vec header:
   `{ data: Ptr[u8] @ 0, len: Int @ 8, cap: Int @ 16, stride: Int @ 24 }`,
-  where `data` points to the null-terminated UTF-8 byte buffer (bump
-  arena; `len` = byte length, `cap` = byte capacity ≥ 8, `stride` = 1).
+  where `data` points to the null-terminated UTF-8 byte buffer (`len` =
+  byte length, `cap` = byte capacity ≥ 8, `stride` = 1).
   The header is what mutation needs: `push`/`push_str` grow the owned
   buffer in place (the String-object operations are the `_tg_string_*`
   runtime functions on both arches). Semantics: moves transfer the
   buffer, `clone()` allocates a new one, the value is never
-  bit-copyable. The buffer and header are arena-managed by the runtime:
-  arena reclaim is a runtime detail, not a per-value Drop (there is no
-  `impl Drop for String`; the MIR drop plan for `String` is Trivial and
-  `requires_drop_glue` stays false for the String split).
+  bit-copyable. **Real allocation/deallocation semantics**: the String
+  object and its buffer are allocated from the REAL heap allocator
+  (`_tg_mem_alloc` — the malloc-style pair with `_tg_mem_free`, the same
+  allocator the Vec data buffers use), never the raw bump arena;
+  `_tg_string_reserve` releases the OLD buffer at the growth boundary;
+  and the String destructor — the MIR's `DeinitPlan::String`, emitted at
+  the value's semantic lifetime boundary — calls `_tg_string_drop`,
+  which frees BOTH the object and the buffer (small blocks link into the
+  allocator's per-class free list). `requires_drop_glue=true` for the
+  String split; there is no unbounded arena growth for long-running
+  apps.
   **Literals are the static StrView**: a string literal expression lowers
   to the interned static bytes behind a raw label; the conversion to an
   owned String is the explicit owned clone (`String::from_static`, the
@@ -492,10 +541,17 @@ are **gone**. The shape is:
 - **`FixedArray(Type, Int)`** — the `[T; N]` annotation, distinct from
   the heap vector. The count is carried **in the type** (0 is a legal
   zero-length fixed array) and is part of the type identity (the
-  identity key renders `FixedArray[<elem>;<n>]`). The size expression
-  must be a constant: `fixed array size must be a constant` is a
-  TypeError for a non-IntLit size; constant-expression sizes are a
-  pending item (§15).
+  identity key renders `FixedArray[<elem>;<n>]`). The size expression is
+  evaluated by the compiler's **constant-size evaluator**
+  (`eval_const_size_expr` in types.tg) BEFORE the `FixedArray(Type, N)`
+  identity forms: integer literals, const references (resolved through
+  the collected const-value table `env.const_values` under the module's
+  qualified key — `[T; CONST]` and the literal spelling produce the
+  SAME identity), and the integer arithmetic operators over constant
+  operands (`[T; CONST * 2]`). A non-constant size fails closed:
+  `fixed array size must be a constant (an integer literal, a const
+  reference, or constant arithmetic)` is a TypeError (exercised by
+  `tests/canary/canary_pos_fixed_array_const_size.tg`).
 - **`Function(Vec[ParamType], Type)`** — the TRANSITIONAL legacy form
   (P1: the FnPtr/Closure split). New construction sites use the distinct
   semantic forms:
@@ -528,9 +584,10 @@ are **gone**. The shape is:
   `{ ptr: Ptr[u8], len: UInt }` view — bit-copyable, no drop, no clone —
   that borrows string data (owned `String` buffers, interned literals, OS
   argv); `String::as_str_view` borrows, `String::from_str_view` clones
-  into an owned `String`. `str` and `StrView` are both selected by name
-  in the hash/eq dispatch (codegen.tg / mono.tg), not by LangItems id
-  (§15.2).
+  into an owned `String`. The hash/eq dispatch selects the view through
+  the LangItems `str_view` TypeId (mono.tg's key selection), with a
+  name-selection fallback only for a snapshot that lacks the
+  registration; `str` maps to the `String` primitive.
 
 Normalization at unification: aliases resolve to their underlying type,
 the Named primitive spellings map to the canonical variants, Ref/RefMut/
@@ -633,9 +690,12 @@ Construction and destruction:
   `try_unwrap(sink self)` performs the raw payload move out of the
   control block and releases the block when no weaks remain.
 
-Type properties (§7): Box/Rc (LangItems ids) and UniquePtr/WeakRc/
-ArcStrong/WeakArc (name-selected — LangItems entries are a migration
-target) are `needs_drop`; Rc is the sole non-linear owning pointer.
+Type properties (§7): Box/Rc and UniquePtr/WeakRc/
+ArcStrong/WeakArc are selected by their LangItems ids
+(`box_`/`rc`/`unique_ptr`/`weak_rc`/`arc_strong`/`weak_arc` —
+registered in `build_lang_items`, with a name fallback only for
+snapshots without the registration) and are `needs_drop`; Rc is the
+sole non-linear owning pointer.
 
 ---
 
@@ -782,9 +842,25 @@ scope:
 Deinit plans are computed per **concrete** type (`deinit_plan_for_type`
 in `mir.tg`): resource containment can depend on the generic args
 (`Wrapper[Int]` vs `Wrapper[File]`), so plans are built from the type
-definition with the args substituted. Recursive owning types fail closed
-with `PlanLimit` rather than silently expanding — generated drop glue
-for recursive owning types is **target architecture** (pending, §15.2).
+definition with the args substituted. Every concrete non-trivial plan
+owns a **generated drop-glue function** (`mir_glue_instance_for_type` /
+`mir_build_all_drop_glues`): an ordinary `MirFunction`
+(`__tg_drop_glue$<concrete-key>(ptr: Ptr[T], mask: Int) -> Unit`,
+pushed to `MirProgram.functions` with its emission label registered in
+`drop_glue_fns`), so the backend knows nothing about "how to destroy a
+Map" — every whole-value destruction site is a MirDeinit carrying the
+glue's InstanceId, and codegen resolves the label through
+`drop_glue_fns`. The glue's `mask` parameter is the initialized-fields
+bitmask: whole-value sites pass all-ones, the partial-drop sites
+(§4.4) pass the live-field masks. Recursive owning types (Tree →
+Vec[Tree], a Box/Rc-linked list) are broken **by symbol**: the
+recursion edge is a `DeinitPlan::Call` to the type's own MEMOIZED glue
+— the glue calls itself and the recursion terminates at runtime when
+the container is empty, instead of expanding the plan tree.
+`PlanLimit` remains only as the fail-closed answer for a missing
+REGISTERED deinit target (a Box/Rc without a registered Drop impl);
+`mir_verified_deinit_call` panics at plan construction on an
+unverifiable name.
 Emission order on every exit: defer actions (LIFO), then the deinit
 chain in reverse drop order; the user finalizer first, then the
 compiler-owned structural field cleanup — exactly once.
@@ -809,26 +885,26 @@ compiler-owned structural field cleanup — exactly once.
 | Projected iteration bindings cannot escape the loop body | resource_check.tg §10 |
 | Zero-inference fail-closed: unsolved generic parameters are hard errors; the monomorphizer performs no inference | types.tg / mono.tg §13 |
 | LangItems built once, structurally unique; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
-| String is the OWNED String object: one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract |
+| String is the OWNED String object: one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone); the destructor `_tg_string_drop` frees object + buffer through `_tg_mem_free` (per-class free-list reclaim) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract + `impl Clone/Eq/Hash for String` |
 | Type-property graph algorithm with inline-recursion diagnostics; memoized per concrete args | types.tg §7 |
 | Monomorphization: seen-set, MAX_MONO_INSTANCES, residual-param aborts | mono.tg §13 |
 | Map/set ownership ops: every key-operating map/set intrinsic site injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI gates by declared param count; kernel key types dispatch to the runtime helpers) — the impls are reached and specialized with zero inference | mono.tg `inject_map_dispatch_calls` / `apply_dispatch_injection`; codegen.tg `map_hash_dispatch_label` / `map_eq_dispatch_label` |
 | Layout tables are CONCRETE-keyed: the layout/offsets/sizes tables are populated per concrete (TypeId, substs) identity (`collect_concrete_adt_types` + `mir_type_identity_key`), so `Wrapper[Int]` and `Wrapper[File]` never share a layout entry | codegen.tg layout tables; mir.tg `mir_type_identity_key` |
 | CFG edge model recorded and validated per function | resource_check.tg §14 |
 | Destruction names verified against registered deinit targets (fail-closed) | mir.tg §4.3 |
+| Partial moves: pattern-binding consumes record per-field state in the place registry; MIR emits the partial-drop chain — live fields dropped through their own masked glues, consumed fields skipped, whole-value ("*") records drop nothing | types.tg `record_place_moves` / `place_move_states` §4.4; mir.tg `mir_emit_partial_drop_chain` / `emit_cleanup_chain` (mask-carrying MirCall glue sites) |
+| Generated drop glue: every concrete non-trivial plan owns a memoized drop-glue function; recursive owning types are broken by symbol (the glue calls itself); PlanLimit remains only for missing registered deinit targets | mir.tg `mir_glue_instance_for_type` / `mir_build_all_drop_glues` / `DeinitPlan::Call` §14.3 |
+| Fixed-array const sizes: literal / const-reference / constant-arithmetic sizes evaluate before the FixedArray identity forms | types.tg `eval_const_size_expr` / `const_values` §9; `tests/canary/canary_pos_fixed_array_const_size.tg` |
+| LangItems built once, structurally unique; the bundle covers option/result/vec/map/set/box/rc/array/slice + string/str_view/unique_ptr/arc_strong/weak_rc/weak_arc/ptr/ptr_mut + the trait ids; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
 
 ### 15.2 Pending (documented targets, not assumptions)
 
 | Item | Current behavior | Target |
 |------|------------------|--------|
-| **Partial moves** | projected-place consumes/moves/assigns rejected ("partial moves are not yet supported", "exact-place replacement is not yet supported") | per-place partial-move state in the resource checker |
+| **Expression-level projected-place operations** | the place-level registry + masked glue exist (§4.4: pattern-binding partial moves, match destructuring, closure capture); DIRECT expression-level consume/move/assign/initialize of a projected resource place is still rejected at root-granularity ("cannot consume a projected place: partial moves are not yet supported" etc.) | per-place state at the expression-level operations (consume/assign through a projection) |
 | **Consuming iteration** | snapshot iteration exists; sink-element iteration rejected | consuming iteration with per-iteration (backedge) cleanup |
-| **Typed-HIR migration** | finalizer recognition is name-based (`deinit`/`drop`); `ParamModifier` retained transitionally; the kernel's transitional reference-returning type positions (`-> &T`, `Option[&T]`, `Vec[&T]`) were converted to their erased-value forms (E106 is a hard error) | a typed `FinalizerKind` on method metadata (the deinit-plans/user-finalizer layer); `ParamModifier` deletion |
-| **Fixed-array size constants** | `[T; N]` requires an IntLit count ("fixed array size must be a constant") | constant-expression sizes in the type identity |
-| **Generated drop glue** | recursive owning types fail closed with `PlanLimit` ("generated drop glue required", §14.3); `String`'s drop plan stays Trivial (arena reclaim is a runtime detail) | generated per-TypeDef drop glue (then PlanLimit is removed) |
-| **StrView registration** | `StrView` is a std struct selected by name in the hash/eq dispatch (codegen.tg / mono.tg); `str` is the registered escape spelling of the `String` primitive | LangItems-level registration of the view type |
-| **LangItems for the name-selected pointers** | UniquePtr/WeakRc/ArcStrong/WeakArc are name-selected in the property engine and copy analysis | registered LangItems entries |
-| **Legacy borrow syntax deletion** | `&T`/`&mut T`/`move`/`own` parameter access conventions are normalized at parse; `&T` in general type position is a hard error (E106) | remove the legacy parameter-convention syntax from the parser entirely |
+| **StrView name fallback** | the hash/eq dispatch selects StrView by the LangItems `str_view` TypeId; the name-selection fallback remains only for snapshots without the registration | drop the name fallback once every snapshot registers the id |
+| **Legacy borrow syntax deletion** | `&T`/`&mut T`/`move`/`own` parameter access conventions are normalized at parse (`ParamModifier` deleted — the parser maps directly to `AccessConvention`); `&T` in general type position and ref patterns are hard errors (E106) | remove the legacy parameter-convention syntax from the parser entirely |
 
 The pending list above is the authoritative one; `access_resource_migration.md`
 records the historical status of these items at audit time.

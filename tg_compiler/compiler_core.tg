@@ -806,9 +806,12 @@ def resolution_errors_to_diags(errors: &Vec[ResolutionError]) -> Vec[Diagnostic]
 end
 
 # The ONE stringifier of the front end. Joins a structured diagnostic set
-# into the "error at <file>:<start>: [code] message" form every
-# Result[_, String] boundary (analyze_parsed, analyze_source,
-# compile_file_core, driver::parse_file) carries.
+# into the "error at <file>:<start>: [code] message" form used ONLY at the
+# CLI/human presentation boundary (the driver's error rendering). The
+# semantic API boundary (analyze_parsed, analyze_program, analyze_source)
+# returns the STRUCTURED Vec[Diagnostic] — each diagnostic keeps its span
+# and code, so JSON tooling and the LSP never re-derive structure from a
+# string.
 pub def join_diagnostics(diags: &Vec[Diagnostic]) -> String
   var out = ""
   var first = true
@@ -828,7 +831,7 @@ pub def join_diagnostics(diags: &Vec[Diagnostic]) -> String
   out
 end
 
-pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
+pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, Vec[Diagnostic]]
  # (macro hygiene, expansion-depth contract): preparation records E105
   # through the parser's diagnostic channel when the expansion fixpoint does
   # not converge; diag_has_errors then returns the failed state BEFORE
@@ -837,7 +840,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
   var macro_diags: Vec[Diagnostic] = Vec::new()
   prepare_parsed(program, &mut macro_diags)
   if diag_has_errors(&macro_diags) then
-    return Result::Err(join_diagnostics(&macro_diags))
+    return Result::Err(macro_diags)
   end
   match resolve_names(program)
   when Result::Ok(res) then
@@ -850,7 +853,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     env.strict_resolution = true
     let type_result = type_check_typed(env, program, &res)
     if !type_result.errors.is_empty() then
-      return Result::Err(join_diagnostics(&type_errors_to_diags(&type_result.errors)))
+      return Result::Err(type_errors_to_diags(&type_result.errors))
     end
     let typed = type_result.program.typed
  # (ONE TypedCFG): the CFG is built HERE, ONCE, before any
@@ -868,7 +871,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     var ctx = analysis_context_new()
     let access_errors = access_check(program, &typed, &cfg, &mut ctx)
     if !access_errors.is_empty() then
-      return Result::Err(join_diagnostics(&access_errors_to_diags(&access_errors)))
+      return Result::Err(access_errors_to_diags(&access_errors))
     end
  # the engine snapshot TypeEnv of the typed tables — built ONCE by
     # type_check_typed (the placeholder artifact's engine_snapshot) and
@@ -878,7 +881,7 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     var engine_snapshot = type_result.program.engine_snapshot
     let res_result = resource_check(program, &typed, &cfg, &mut ctx, &mut engine_snapshot)
     if !res_result.errors.is_empty() then
-      return Result::Err(join_diagnostics(&resource_errors_to_diags(&res_result.errors)))
+      return Result::Err(resource_errors_to_diags(&res_result.errors))
     end
  # (ONE AnalyzedProgram): the single immutable analysis artifact —
     # the typed HIR, the ONE TypedCFG (with the serialized CleanupEdge
@@ -903,14 +906,23 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     })
   when Result::Err(res_errors) then
     if res_errors.len() > 0 then
-      Result::Err(join_diagnostics(&resolution_errors_to_diags(&res_errors)))
+      Result::Err(resolution_errors_to_diags(&res_errors))
     else
-      Result::Err("name resolution failed")
+      var empty_res: Vec[Diagnostic] = Vec::new()
+      empty_res.push(Diagnostic {
+        level: DiagLevel::Error,
+        message: "name resolution failed",
+        span: Option::None,
+        notes: Vec::new(),
+        suggestions: Vec::new(),
+        code: Option::None
+      })
+      Result::Err(empty_res)
     end
   end
 end
 
-pub def analyze_program(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
+pub def analyze_program(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, Vec[Diagnostic]]
   analyze_parsed(env, program, opts)
 end
 
@@ -929,11 +941,11 @@ pub def parse_source_program(source: String, file: String) -> Result[Program, Ve
   end
 end
 
-pub def analyze_source(source: String, file: String, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
+pub def analyze_source(source: String, file: String, opts: &CompilerOptions) -> Result[AnalyzedProgram, Vec[Diagnostic]]
   var ast = match parse_source_program(source, file)
   when Result::Ok(program) then program
   when Result::Err(diags) then
-    return Result::Err(join_diagnostics(&diags))
+    return Result::Err(diags)
   end
   var env = type_env_new()
   analyze_parsed(&mut env, &mut ast, opts)
@@ -1088,16 +1100,16 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
   match analyze_program(&mut env, &mut ast, opts)
   when Result::Ok(tp) then
     typed_program = Option::Some(tp)
-  when Result::Err(e) then
-    emit_diagnostic(emitter, Diagnostic {
-      level: DiagLevel::Error,
-      message: e,
-      span: Option::None,
-      notes: Vec::new(),
-      suggestions: Vec::new(),
-      code: Option::Some("E0405")
-    })
-    return Result::Err("Type check failed")
+  when Result::Err(diags) then
+    # The phase-error aggregation keeps the STRUCTURED diagnostics with
+    # their spans: every diagnostic is emitted through the emitter
+    # (presentation — the human renderer and the JSON emitter) and the
+    # returned string is only the CLI's final summary, never the sole
+    # carrier of the error set.
+    for d in diags do
+      emit_diagnostic(emitter, d)
+    end
+    return Result::Err(join_diagnostics(&diags))
   end
   
   if opts.stop_after == StopAfter::Semantic then
@@ -1361,6 +1373,14 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     end
   end
 
+  # Driver phase hook (--dump-tokens): the kernel compile entry writes the
+  # normalized token dump exactly like compile_file_core and stops before any
+  # further pipeline work.
+  match opts.dump_phase
+  when Option::Some("tokens") then return 0
+  when _ then ()
+  end
+
   if opts.verbose then
     println("  Parsing...")
   end
@@ -1381,6 +1401,16 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     print_ast(&ast)
   end
 
+  # Driver phase hook (--dump-ast): the kernel compile entry writes the
+  # normalized parse-phase dump exactly like compile_file_core and stops.
+  match opts.dump_phase
+  when Option::Some("ast") then
+    println("AST:")
+    print_ast(&ast)
+    return 0
+  when _ then ()
+  end
+
   if opts.stop_after == StopAfter::Parse then
     return 0
   end
@@ -1396,6 +1426,22 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
   when Result::Err(e) then
     println(e)
     return 1
+  end
+
+  # Driver phase hook (--dump-resolved-ast): the kernel compile entry writes
+  # the normalized resolved-phase dump exactly like compile_file_core (macro
+  # expansion + node-id assignment for human inspection) and stops. It does
+  # NOT feed the real pipeline — the canonical semantic pass performs its own
+  # expansion/id assignment on the shared `ast` below.
+  match opts.dump_phase
+  when Option::Some("resolved-ast") then
+    var dump_diags: Vec[Diagnostic] = Vec::new()
+    var dump_ast = expand_macros(ast.clone(), &mut dump_diags)
+    assign_node_ids(&mut dump_ast)
+    println("Resolved AST:")
+    print_ast(&dump_ast)
+    return 0
+  when _ then ()
   end
 
   let skip_bootstrap_semantic_checks = should_skip_bootstrap_semantic_checks(opts, path.clone())
@@ -1435,15 +1481,12 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     match analyze_program(&mut env, &mut ast, opts)
     when Result::Ok(tp) then
       typed_program = Option::Some(tp)
-    when Result::Err(e) then
-      emit_diagnostic(&mut emitter, Diagnostic {
-        level: DiagLevel::Error,
-        message: e,
-        span: Option::None,
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::Some("E0405")
-      })
+    when Result::Err(diags) then
+      # Structured aggregation: every diagnostic keeps its span through
+      # the emitter; the summary line is the CLI's human presentation.
+      for d in diags do
+        emit_diagnostic(&mut emitter, d)
+      end
       println("Type check failed")
       return 1
     end
@@ -1475,6 +1518,15 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     return 1
   end
 
+  # Driver phase hook (--dump-mir-lowered): the kernel compile entry writes
+  # the normalized lowered-MIR dump exactly like compile_file_core and stops.
+  match opts.dump_phase
+  when Option::Some("mir-lowered") then
+    print_mir(&mir)
+    return 0
+  when _ then ()
+  end
+
   if opts.verbose then
     println("  Monomorphizing generics...")
   end
@@ -1499,6 +1551,15 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     end
     println("MIR verification failed after monomorphization")
     return 1
+  end
+
+  # Driver phase hook (--dump-mir-mono): the kernel compile entry writes the
+  # normalized monomorphized-MIR dump exactly like compile_file_core and stops.
+  match opts.dump_phase
+  when Option::Some("mir-mono") then
+    print_mir(&mir)
+    return 0
+  when _ then ()
   end
 
   if opts.verbose then
@@ -1654,10 +1715,16 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
   # (include_compiler_lib), consume bootstrap/compiler_kernel.manifest exactly
   # like stage0 (sorted std files, then sorted compiler files). User programs
   # keep the normal prelude + recursive import discovery.
+  # SELF-HOST MANIFEST GATE: self-host mode is MANIFEST-CLOSED — the bootstrap
+  # closure is defined ONLY by bootstrap/compiler_kernel.manifest. There is NO
+  # prelude_files() fallback here: a self-host compile without the manifest
+  # must fail loudly instead of silently compiling a different dependency
+  # closure than the real bootstrap.
   let preludes = if include_compiler_lib then
     match bootstrap_manifest_sources()
     when Option::Some(files) then files
-    when Option::None then prelude_files()
+    when Option::None then
+      return Result::Err("self-host mode (include_compiler_lib) requires bootstrap/compiler_kernel.manifest — the bootstrap closure is manifest-defined and the prelude fallback is disabled in self-host mode")
     end
   else
     prelude_files()
@@ -3918,15 +3985,12 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
     match analyze_program(&mut env, &mut ast, opts)
     when Result::Ok(tp) then
       typed_program = Option::Some(tp)
-    when Result::Err(e) then
-      emit_diagnostic(&mut emitter, Diagnostic {
-        level: DiagLevel::Error,
-        message: e,
-        span: Option::None,
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::Some("E0405")
-      })
+    when Result::Err(diags) then
+      # Structured aggregation: every diagnostic keeps its span through
+      # the emitter; the summary line is the CLI's human presentation.
+      for d in diags do
+        emit_diagnostic(&mut emitter, d)
+      end
       println("Type check failed")
       return 1
     end
