@@ -1987,10 +1987,15 @@ end
 # argument registers — x0/rdi = ptr, x1/rsi = value (or order for load),
 # x2/rdx = order/desired, x3/rcx = weak, x4/r8 = success_order, x5/r9 =
 # failure_order. Order codes (ordering_to_c in std::atomic): 0 = Relaxed
-# ... 5 = SeqCst. The emitters use the strongest form unconditionally
-# (acquire-release / LOCKed) — correct for every ordering. The
-# compare_exchange `expected` argument is the ADDRESS of the expected
-# slot (in/out: the current value is written back on failure).
+# ... 5 = SeqCst. AArch64 emits the strongest form unconditionally
+# (LDAR/STLR/LSE-al — correct for every ordering). x86-64 reads the
+# ordering where it matters: the SeqCst STORE is the xchg-based store
+# (the implicitly-locked exchange) while the weaker stores are plain
+# MOVs (TSO gives a plain store the release semantics); the SeqCst LOAD
+# stays the plain MOV — the total order is TSO + the xchg-store
+# discipline. The compare_exchange `expected` argument is the ADDRESS of
+# the expected slot (in/out: the current value is written back on
+# failure).
 def emit_atomic_intrinsic(inout ctx: CodegenCtx, name: String) -> Bool
   let (op, width) = atomic_intrinsic_op_and_width(name)
   match ctx.target.arch
@@ -2127,7 +2132,11 @@ def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> 
     # stronger, never weaker).
     emit32_le(&mut ctx.text, a64_ldar_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X0))
   when "store" then
-    # STLR (release) with the value in x1.
+    # STLR (release) with the value in x1 — the SeqCst store on
+    # AArch64: the LDAR/STLR pair is SC on ARMv8 (a SeqCst store is
+    # STLR + the acquire/release pair discipline, exactly what the
+    # LDAR/STLR implementation provides), so the ordering argument
+    # needs no branch here.
     emit32_le(&mut ctx.text, a64_stlr_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X1))
   when "exchange" then
     # SWPAL w1, w9, [x0] — old value in w9.
@@ -2219,9 +2228,15 @@ def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> 
 end
 
 def emit_atomic_intrinsic_x64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
-  # x86-64: arg regs rdi..r9. Loads/stores are plain MOVs (TSO: loads
-  # are acquire, stores are release); the RMW/CAS family uses the LOCKed
-  # forms (seq-cst strength); the fence is MFENCE.
+  # x86-64: arg regs rdi..r9. Loads are plain MOVs (TSO: loads are
+  # acquire). The SeqCst STORE is the xchg-based store (`xchg [rdi],
+  # rsi` — the implicitly-locked exchange); the weaker stores
+  # (Relaxed/Release/AcqRel) are plain MOVs — TSO gives a plain store
+  # the release semantics, so only SeqCst needs the full-strength form
+  # (a plain MOV is not a sequentially-consistent store by itself). The
+  # SeqCst LOAD stays the plain MOV: TSO + the xchg-store discipline
+  # provides the total order. The RMW/CAS family uses the LOCKed forms
+  # (seq-cst strength); the fence is MFENCE.
   match op
   when "fence" then
     emit8(&mut ctx.text, 0x0F)
@@ -2235,14 +2250,40 @@ def emit_atomic_intrinsic_x64(inout ctx: CodegenCtx, op: String, width: Int) -> 
     when 8 then x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)
     end
   when "store" then
-    # xchg [rdi], rsi — the implicitly-locked exchange: a seq-cst store
-    # with a full barrier (the discarded old value lands in rsi).
+    # rdi = ptr, rsi = value, rdx = order (the AtomicOrdering c code
+    # the std passes — ordering_to_c in std::atomic: 5 = SeqCst). The
+    # SeqCst store is the xchg-based store — `xchg [rdi], rsi`, the
+    # implicitly-locked exchange (the usual C++/Rust SeqCst-store
+    # implementation; the discarded old value lands in rsi). The weaker
+    # orderings (Relaxed/Release/AcqRel) are plain MOVs: on x86 TSO a
+    # plain store already has the release semantics, so ONLY the SeqCst
+    # store needs the full-strength form — a plain MOV alone is not a
+    # sequentially-consistent store. The SeqCst LOAD stays the plain
+    # MOV (loads are acquire on TSO): the total order comes from TSO +
+    # the xchg-store discipline (a SeqCst store is a full barrier that
+    # no later load/store can overtake).
+    let lbl_weak = ".Latomic_store_weak." + ctx.fn_counter.to_string()
+    let lbl_done = ".Latomic_store_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    emit8(&mut ctx.text, 0x83)
+    emit8(&mut ctx.text, 0xFA)
+    emit8(&mut ctx.text, 0x05)   # cmp edx, 5 (SeqCst)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_weak.clone())
     match width
     when 1 then emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x86); emit8(&mut ctx.text, 0x37)  # xchg byte [rdi], sil
     when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
     when 4 then emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
     when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
     end
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_weak.clone())
+    match width
+    when 1 then emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x88); emit8(&mut ctx.text, 0x37)  # mov byte [rdi], sil
+    when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x37)
+    when 4 then emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x37)
+    when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x37)
+    end
+    def_label(&mut ctx.text, lbl_done.clone())
   when "exchange" then
     match width
     when 1 then emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x86); emit8(&mut ctx.text, 0x37)

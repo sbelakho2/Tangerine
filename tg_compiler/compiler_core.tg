@@ -875,7 +875,12 @@ end
 # items: an item whose @cfg attributes contradict the COMPILE TARGET (the
 # canonical TargetSpec — the SAME resolve_codegen_target the codegen
 # phases use; the target OS/arch fields) is eliminated before registration.
-# The kernel closure has no @cfg-gated items (verified); the std modules'
+# The elimination is FINAL: an eliminated item does not exist for this
+# target and is never resurrected by references (a kept item referencing an
+# eliminated name fails the standard unresolved-name resolution). The
+# kernel closure has no @cfg-gated items (verified — the compiler sources
+# carry no target-conditional declarations; the only gated declarations in
+# the closure are std/fs.tg's platform families); the std modules'
 # platform-gated declarations are the target of the elimination.
 
 def cfg_target_os_name(target: AsmTarget) -> String
@@ -961,590 +966,8 @@ def cfg_attribute_holds(target: AsmTarget, attr: Attribute) -> Bool
   end
 end
 
-# The names an item DEFINES, split by the resolver's namespaces: the
-# function/constant/static/method domain, the type domain (structs, enums,
-# traits, aliases), and the enum-variant domain. Used by the retention
-# test: an eliminated item's defined name only triggers retention when no
-# KEPT item defines the same name in the same domain.
-def cfg_collect_defined_names(item: Item, inout fn_names: Set[String], inout ty_names: Set[String], inout variant_names: Set[String]) -> Unit
-  match item.kind
-  when ItemKind::ItemFunction(f) then
-    fn_names.insert(f.name.clone())
-  when ItemKind::ItemStruct(s) then
-    ty_names.insert(s.name.clone())
-    for m in s.methods do
-      fn_names.insert(m.name.clone())
-    end
-  when ItemKind::ItemEnum(e) then
-    ty_names.insert(e.name.clone())
-    for v in e.variants do
-      variant_names.insert(v.name.clone())
-    end
-  when ItemKind::ItemTrait(t) then
-    ty_names.insert(t.name.clone())
-  when ItemKind::ItemImpl(i) then
-    for m in i.methods do
-      fn_names.insert(m.name.clone())
-    end
-  when ItemKind::ItemModule(md) then
-    for it in md.items do
-      cfg_collect_defined_names(it, fn_names, ty_names, variant_names)
-    end
-  when ItemKind::ItemTypeAlias(ta) then ty_names.insert(ta.name.clone())
-  when ItemKind::ItemConst(c) then fn_names.insert(c.name.clone())
-  when ItemKind::ItemStatic(s) then fn_names.insert(s.name.clone())
-  when ItemKind::ItemMacro(m) then fn_names.insert(m.name.clone())
-  when ItemKind::ItemCapabilityDecl(c) then fn_names.insert(c.name.clone())
-  when ItemKind::ItemEffectDecl(e) then fn_names.insert(e.name.clone())
-  when ItemKind::ItemExternBlock(ext) then
-    for ei in ext.items do
-      match ei
-      when ExternItem::Function(ef) then fn_names.insert(ef.name.clone())
-      when ExternItem::Static(es) then fn_names.insert(es.name.clone())
-      end
-    end
-  when _ then ()
-  end
-end
-
-# The LAST path segment of a type expression (the referenced type name), or
-# None for non-nominal forms — the impl-retention read.
-def cfg_type_expr_last_name(ty: TypeExpr) -> Option[String]
-  match ty.kind
-  when TypeExprKind::Named(name, _) then
-    let parts = name.split("::")
-    Option::Some(parts[parts.len() - 1].clone())
-  when TypeExprKind::Path(path) then
-    if path.segments.len() > 0 then
-      Option::Some(path.segments[path.segments.len() - 1].clone())
-    else
-      Option::None
-    end
-  when _ then Option::None
-  end
-end
-
 def span_equal(a: Span, b: Span) -> Bool
   a.file == b.file && a.start == b.start && a.end_pos == b.end_pos
-end
-
-# ———————————————————————————————————————————————————————————————
-# The reference walkers (the retention fixpoint)
-# ———————————————————————————————————————————————————————————————
-# Collect the NAMES an item references, split by namespace: expression
-# identifiers / callee / method names (the fn domain), type-expression
-# names (the type domain), and enum-variant construction / pattern names
-# (the variant domain). The walk is deliberately over-collecting (locals
-# and field names are included — a retention false-positive only keeps a
-# gated item alive, which is the safe direction for the build).
-
-def cfg_collect_references(item: Item, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  match item.kind
-  when ItemKind::ItemFunction(f) then
-    cfg_collect_fn_decl_refs(f, fn_refs, ty_refs, variant_refs)
-  when ItemKind::ItemStruct(s) then
-    cfg_collect_generic_refs(&s.generic_params, ty_refs)
-    for fd in s.fields do
-      cfg_collect_type_refs(&fd.ty, ty_refs)
-      match fd.default
-      when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-      when Option::None then ()
-      end
-    end
-    for m in s.methods do
-      cfg_collect_fn_decl_refs(m, fn_refs, ty_refs, variant_refs)
-    end
-    for d in s.derives do
-      ty_refs.insert(d.clone())
-    end
-  when ItemKind::ItemEnum(e) then
-    cfg_collect_generic_refs(&e.generic_params, ty_refs)
-    for v in e.variants do
-      for ft in v.fields do
-        cfg_collect_type_refs(&ft, ty_refs)
-      end
-      match v.discriminant
-      when Option::Some(d) then cfg_collect_expr_refs(&d, fn_refs, ty_refs, variant_refs)
-      when Option::None then ()
-      end
-    end
-    for d in e.derives do
-      ty_refs.insert(d.clone())
-    end
-  when ItemKind::ItemTrait(t) then
-    cfg_collect_generic_refs(&t.generic_params, ty_refs)
-    for st in t.super_traits do
-      cfg_collect_type_refs(&st, ty_refs)
-    end
-    for tm in t.methods do
-      cfg_collect_fn_sig_refs(&tm.sig, fn_refs, ty_refs, variant_refs)
-      match tm.default_body
-      when FnBody::FnBlock(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-      when FnBody::FnExpr(expr) then cfg_collect_expr_refs(&expr, fn_refs, ty_refs, variant_refs)
-      when _ then ()
-      end
-    end
-    for at in t.assoc_types do
-      for b in at.bounds do
-        cfg_collect_type_refs(&b, ty_refs)
-      end
-      match at.default
-      when Option::Some(d) then cfg_collect_type_refs(&d, ty_refs)
-      when Option::None then ()
-      end
-    end
-  when ItemKind::ItemImpl(i) then
-    cfg_collect_generic_refs(&i.generic_params, ty_refs)
-    match i.trait_name
-    when Option::Some(tn) then fn_refs.insert(tn.clone())
-    when Option::None then ()
-    end
-    cfg_collect_type_refs(&i.for_type, ty_refs)
-    cfg_collect_type_refs(&i.self_type, ty_refs)
-    for t in i.trait_type_args do
-      cfg_collect_type_refs(&t, ty_refs)
-    end
-    for wp in i.where_clause do
-      cfg_collect_type_refs(&wp.ty, ty_refs)
-      for b in wp.bounds do
-        cfg_collect_type_refs(&b, ty_refs)
-      end
-    end
-    for m in i.methods do
-      cfg_collect_fn_decl_refs(m, fn_refs, ty_refs, variant_refs)
-    end
-    for at in i.assoc_types do
-      cfg_collect_type_refs(&at.ty, ty_refs)
-    end
-  when ItemKind::ItemModule(md) then
-    for it in md.items do
-      cfg_collect_references(it, fn_refs, ty_refs, variant_refs)
-    end
-  when ItemKind::ItemUse(u) then
-    let segs = u.path.segments
-    if segs.len() > 0 then
-      fn_refs.insert(segs[segs.len() - 1].clone())
-    end
-    match u.names
-    when Option::Some(names) then
-      for n in names do
-        fn_refs.insert(n.clone())
-      end
-    when Option::None then ()
-    end
-  when ItemKind::ItemTypeAlias(ta) then
-    cfg_collect_generic_refs(&ta.generic_params, ty_refs)
-    cfg_collect_type_refs(&ta.ty, ty_refs)
-  when ItemKind::ItemConst(c) then
-    match c.ty
-    when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-    when Option::None then ()
-    end
-    cfg_collect_expr_refs(&c.value, fn_refs, ty_refs, variant_refs)
-  when ItemKind::ItemStatic(s) then
-    cfg_collect_type_refs(&s.ty, ty_refs)
-    cfg_collect_expr_refs(&s.value, fn_refs, ty_refs, variant_refs)
-  when ItemKind::ItemExternBlock(ext) then
-    for ei in ext.items do
-      match ei
-      when ExternItem::Function(ef) then
-        cfg_collect_generic_refs(&ef.generic_params, ty_refs)
-        for p in ef.params do
-          cfg_collect_param_refs(&p, fn_refs, ty_refs, variant_refs)
-        end
-        match ef.ret_type
-        when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-        when Option::None then ()
-        end
-      when ExternItem::Static(es) then
-        cfg_collect_type_refs(&es.ty, ty_refs)
-      end
-    end
-  when ItemKind::ItemMacro(m) then
-    for p in m.params do
-      cfg_collect_param_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-    cfg_collect_block_refs(&m.body, fn_refs, ty_refs, variant_refs)
-  when ItemKind::ItemCapabilityDecl(c) then
-    match c.parent
-    when Option::Some(pn) then fn_refs.insert(pn.clone())
-    when Option::None then ()
-    end
-  when ItemKind::ItemEffectDecl(e) then
-    match e.parent
-    when Option::Some(pn) then fn_refs.insert(pn.clone())
-    when Option::None then ()
-    end
-  when _ then ()
-  end
-end
-
-def cfg_collect_fn_decl_refs(f: FunctionDecl, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  cfg_collect_generic_refs(&f.generic_params, ty_refs)
-  for p in f.params do
-    cfg_collect_param_refs(&p, fn_refs, ty_refs, variant_refs)
-  end
-  match f.ret_type
-  when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-  when Option::None then ()
-  end
-  for c in f.contracts do
-    cfg_collect_expr_refs(&c.expr, fn_refs, ty_refs, variant_refs)
-  end
-  match f.body
-  when FnBody::FnBlock(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when FnBody::FnExpr(expr) then cfg_collect_expr_refs(&expr, fn_refs, ty_refs, variant_refs)
-  when _ then ()
-  end
-end
-
-def cfg_collect_generic_refs(generics: Vec[GenericParam], inout ty_refs: Set[String]) -> Unit
-  for gp in generics do
-    for b in gp.bounds do
-      cfg_collect_type_refs(&b, ty_refs)
-    end
-    match gp.default
-    when Option::Some(d) then cfg_collect_type_refs(&d, ty_refs)
-    when Option::None then ()
-    end
-  end
-end
-
-def cfg_collect_fn_sig_refs(sig: FunctionSig, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  cfg_collect_generic_refs(&sig.generic_params, ty_refs)
-  for p in sig.params do
-    cfg_collect_param_refs(&p, fn_refs, ty_refs, variant_refs)
-  end
-  match sig.ret_type
-  when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-  when Option::None then ()
-  end
-end
-
-def cfg_collect_param_refs(p: Param, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  match p.ty
-  when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-  when Option::None then ()
-  end
-  match p.default
-  when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-  when Option::None then ()
-  end
-end
-
-def cfg_collect_type_refs(ty: TypeExpr, inout ty_refs: Set[String]) -> Unit
-  match ty.kind
-  when TypeExprKind::Named(name, args) then
-    # A Named may carry a qualified spelling; the referenced name is the
-    # LAST segment (the module-qualified parts are module paths, not
-    # item names).
-    let parts = name.split("::")
-    ty_refs.insert(parts[parts.len() - 1].clone())
-    for a in args do
-      cfg_collect_type_refs(&a, ty_refs)
-    end
-  when TypeExprKind::Tuple(ts) then
-    for t in ts do
-      cfg_collect_type_refs(&t, ty_refs)
-    end
-  when TypeExprKind::Array(t, _) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Slice(t) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Ptr(t) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::PtrMut(t) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Ref(t, _) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Fn(params, ret) then
-    for pt in params do
-      cfg_collect_type_refs(&pt.ty, ty_refs)
-    end
-    cfg_collect_type_refs(&ret, ty_refs)
-  when TypeExprKind::Async(t) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Effect(_, t) then cfg_collect_type_refs(&t, ty_refs)
-  when TypeExprKind::Path(path) then
-    if path.segments.len() > 0 then
-      ty_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-  when _ then ()
-  end
-end
-
-def cfg_collect_block_refs(block: Block, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  for st in block.stmts do
-    cfg_collect_stmt_refs(&st, fn_refs, ty_refs, variant_refs)
-  end
-end
-
-def cfg_collect_stmt_refs(stmt: Stmt, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  match stmt.kind
-  when StmtKind::StmtLet(pat, ty_opt, value, _) then
-    cfg_collect_pattern_refs(&pat, fn_refs, ty_refs, variant_refs)
-    match ty_opt
-    when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-    when Option::None then ()
-    end
-    cfg_collect_expr_refs(&value, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtAssign(target, value) then
-    cfg_collect_expr_refs(&target, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&value, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtCompoundAssign(_, target, value) then
-    cfg_collect_expr_refs(&target, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&value, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtIf(if_stmt) then cfg_collect_if_refs(&if_stmt, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtMatch(m) then cfg_collect_match_refs(&m, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtWhile(cond, body) then
-    cfg_collect_expr_refs(&cond, fn_refs, ty_refs, variant_refs)
-    cfg_collect_block_refs(&body, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtFor(for_stmt) then
-    cfg_collect_pattern_refs(&for_stmt.pattern, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&for_stmt.iter, fn_refs, ty_refs, variant_refs)
-    cfg_collect_block_refs(&for_stmt.body, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtLoop(body) then cfg_collect_block_refs(&body, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtReturn(val_opt) then
-    match val_opt
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-  when StmtKind::StmtBreak(val_opt) then
-    match val_opt
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-  when StmtKind::StmtExpr(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtUnsafe(_, block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtDefer(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtGuard(cond, guard_else) then
-    cfg_collect_expr_refs(&cond, fn_refs, ty_refs, variant_refs)
-    match guard_else
-    when GuardElse::Return(e_opt) then
-      match e_opt
-      when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-      when Option::None then ()
-      end
-    when GuardElse::Break(e_opt) then
-      match e_opt
-      when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-      when Option::None then ()
-      end
-    when _ then ()
-    end
-  when StmtKind::StmtTry(block, arms, final) then
-    cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-    for ca in arms do
-      cfg_collect_pattern_refs(&ca.pattern, fn_refs, ty_refs, variant_refs)
-      cfg_collect_block_refs(&ca.body, fn_refs, ty_refs, variant_refs)
-    end
-    match final
-    when Option::Some(b) then cfg_collect_block_refs(&b, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-  when StmtKind::StmtWith(recv, pat, block) then
-    cfg_collect_expr_refs(&recv, fn_refs, ty_refs, variant_refs)
-    cfg_collect_pattern_refs(&pat, fn_refs, ty_refs, variant_refs)
-    cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when StmtKind::StmtHandleWith(recv, handlers) then
-    cfg_collect_expr_refs(&recv, fn_refs, ty_refs, variant_refs)
-    for h in handlers do
-      cfg_collect_handler_refs(&h, fn_refs, ty_refs, variant_refs)
-    end
-  when _ then ()
-  end
-end
-
-def cfg_collect_handler_refs(h: EffectHandler, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  for arm in h.arms do
-    for p in arm.params do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-    cfg_collect_block_refs(&arm.body, fn_refs, ty_refs, variant_refs)
-  end
-end
-
-def cfg_collect_if_refs(if_stmt: IfStmt, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  cfg_collect_expr_refs(&if_stmt.cond, fn_refs, ty_refs, variant_refs)
-  cfg_collect_block_refs(&if_stmt.then_block, fn_refs, ty_refs, variant_refs)
-  for (cond, block) in if_stmt.elsif_branches do
-    cfg_collect_expr_refs(&cond, fn_refs, ty_refs, variant_refs)
-    cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  end
-  match if_stmt.else_block
-  when Option::Some(b) then cfg_collect_block_refs(&b, fn_refs, ty_refs, variant_refs)
-  when Option::None then ()
-  end
-end
-
-def cfg_collect_match_refs(m: MatchExpr, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  cfg_collect_expr_refs(&m.scrutinee, fn_refs, ty_refs, variant_refs)
-  for arm in m.arms do
-    cfg_collect_pattern_refs(&arm.pattern, fn_refs, ty_refs, variant_refs)
-    match arm.guard_expr
-    when Option::Some(g) then cfg_collect_expr_refs(&g, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-    cfg_collect_block_refs(&arm.body, fn_refs, ty_refs, variant_refs)
-  end
-end
-
-def cfg_collect_pattern_refs(pat: Pattern, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  match pat.kind
-  when PatternKind::Ident(_, _) then ()
-  when PatternKind::Literal(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-  when PatternKind::Tuple(pats) then
-    for p in pats do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-  when PatternKind::Array(pats) then
-    for p in pats do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-  when PatternKind::Struct(path, fields) then
-    if path.segments.len() > 0 then
-      ty_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-    for (_, p) in fields do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-  when PatternKind::Variant(path, pats) then
-    if path.segments.len() > 0 then
-      variant_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-    for p in pats do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-  when PatternKind::Or(pats) then
-    for p in pats do
-      cfg_collect_pattern_refs(&p, fn_refs, ty_refs, variant_refs)
-    end
-  when PatternKind::Range(start, end_pos, _) then
-    match start
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-    match end_pos
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-  when _ then ()
-  end
-end
-
-def cfg_collect_expr_refs(expr: Expr, inout fn_refs: Set[String], inout ty_refs: Set[String], inout variant_refs: Set[String]) -> Unit
-  match expr.kind
-  when ExprKind::ExprIntLit(_) then ()
-  when ExprKind::ExprFloatLit(_) then ()
-  when ExprKind::ExprStringLit(_) then ()
-  when ExprKind::ExprCharLit(_) then ()
-  when ExprKind::ExprBoolLit(_) then ()
-  when ExprKind::ExprNilLit then ()
-  when ExprKind::ExprArrayLit(elems) then
-    for e in elems do
-      cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprTupleLit(elems) then
-    for e in elems do
-      cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprStructLit(path, fields) then
-    if path.segments.len() > 0 then
-      ty_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-    for (_, e) in fields do
-      cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprMapLit(entries) then
-    for (k, v) in entries do
-      cfg_collect_expr_refs(&k, fn_refs, ty_refs, variant_refs)
-      cfg_collect_expr_refs(&v, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprIdent(name) then fn_refs.insert(name.clone())
-  when ExprKind::ExprPath(path) then
-    if path.segments.len() > 0 then
-      fn_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-  when ExprKind::ExprSelfRef then ()
-  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    cfg_collect_expr_refs(&lhs, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&rhs, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprUnaryOp(_, operand) then
-    cfg_collect_expr_refs(&operand, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprFieldAccess(recv, _) then
-    cfg_collect_expr_refs(&recv, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprMethodCall(recv, method, type_args, args) then
-    fn_refs.insert(method.clone())
-    cfg_collect_expr_refs(&recv, fn_refs, ty_refs, variant_refs)
-    for t in type_args do
-      cfg_collect_type_refs(&t, ty_refs)
-    end
-    for a in args do
-      cfg_collect_expr_refs(&a, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprIndex(recv, index) then
-    cfg_collect_expr_refs(&recv, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&index, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprCall(callee, args) then
-    cfg_collect_expr_refs(&callee, fn_refs, ty_refs, variant_refs)
-    for a in args do
-      cfg_collect_expr_refs(&a, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprClosure(params, ret_ty, body) then
-    for cp in params do
-      cfg_collect_pattern_refs(&cp.pat, fn_refs, ty_refs, variant_refs)
-      match cp.ty
-      when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-      when Option::None then ()
-      end
-    end
-    match ret_ty
-    when Option::Some(t) then cfg_collect_type_refs(&t, ty_refs)
-    when Option::None then ()
-    end
-    cfg_collect_expr_refs(&body, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprAccess(inner) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprRawDeref(inner) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprIf(if_stmt) then cfg_collect_if_refs(&if_stmt, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprMatch(m) then cfg_collect_match_refs(&m, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprBlock(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprUnsafe(_, block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprAsync(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprAwait(inner) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprTry(inner) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprRange(start, end_pos, _) then
-    match start
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-    match end_pos
-    when Option::Some(e) then cfg_collect_expr_refs(&e, fn_refs, ty_refs, variant_refs)
-    when Option::None then ()
-    end
-  when ExprKind::ExprCast(inner, ty) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-    cfg_collect_type_refs(&ty, ty_refs)
-  when ExprKind::ExprTypeCheck(inner, ty) then
-    cfg_collect_expr_refs(&inner, fn_refs, ty_refs, variant_refs)
-    cfg_collect_type_refs(&ty, ty_refs)
-  when ExprKind::ExprComptime(block) then cfg_collect_block_refs(&block, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprEnumVariant(path, args) then
-    if path.segments.len() > 0 then
-      variant_refs.insert(path.segments[path.segments.len() - 1].clone())
-    end
-    for a in args do
-      cfg_collect_expr_refs(&a, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprAssign(target, value) then
-    cfg_collect_expr_refs(&target, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&value, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprPipe(lhs, rhs) then
-    cfg_collect_expr_refs(&lhs, fn_refs, ty_refs, variant_refs)
-    cfg_collect_expr_refs(&rhs, fn_refs, ty_refs, variant_refs)
-  when ExprKind::ExprMacroCall(_, args) then
-    for a in args do
-      cfg_collect_expr_refs(&a, fn_refs, ty_refs, variant_refs)
-    end
-  when ExprKind::ExprError(_) then ()
-  end
 end
 
 # The elimination pass itself: filter the merged program's items, dropping
@@ -1553,18 +976,18 @@ end
 # new flat indices — the same module-table rebuild the macro-filtering
 # pass performs).
 #
-# REFERENCE RETENTION (the runtime-dispatched variants): the std's shared
-# functions dispatch to platform variants at runtime (`if is_windows()
-# then return open_windows(...) end` — the gated variant is only reachable
-# under a target-mismatched branch). A gated item is therefore retained
-# when a KEPT item references one of its names and NO kept item defines
-# that name (the mutually exclusive FAMILIES — is_macos/is_linux/
-# is_windows — always have the target-matching kept definition, so the
-# contradicting duplicates are eliminated; the uniquely-named runtime
-# variants — open_windows, the Win32 externs — are retained transitively
-# to the reference fixpoint). The retention is name-namespace-faithful:
-# function/constant/static/method names, type names, and enum-variant
-# names are tracked in separate domains (the resolver's namespaces).
+# STRICT SEMANTICS (no resurrection): an item whose @cfg contradicts the
+# target DOES NOT EXIST for that target — the elimination is final and NO
+# reference from a kept item can bring an eliminated item back. A kept
+# item that references an eliminated name therefore fails the resolver's
+# standard unresolved-name error: an unavailable-platform declaration (OS
+# syscalls, platform constants, pthread layouts, Windows APIs, the
+# epoll/kqueue or GPU backends) must never become legal merely because
+# something references it. The std's platform groups are gated EXPLICITLY
+# on every member (each target-conditional declaration carries its own
+# @cfg — the is_macos/is_linux/is_windows families, the open_windows/win32
+# chains, the platform extern blocks), so for any target exactly one
+# member of each mutually exclusive family survives.
 pub def cfg_item_contradicts(target: AsmTarget, item: Item) -> Bool
   var eliminate = false
   for attr in item.attrs do
@@ -1610,8 +1033,9 @@ def cfg_partition_items(items: Vec[Item], target: AsmTarget, inout kept_out: Vec
 end
 
 # Rebuild an item list from the ORIGINAL items: keep the spans in the
-# kept/retained sets, recursing into inline modules.
-def cfg_rebuild_items(items: Vec[Item], kept_spans: Vec[Span], retained_spans: Vec[Span], inout out: Vec[Item]) -> Unit
+# kept set (an eliminated item never returns — no reference can resurrect
+# it), recursing into inline modules.
+def cfg_rebuild_items(items: Vec[Item], kept_spans: Vec[Span], inout out: Vec[Item]) -> Unit
   for item in items do
     var is_kept = false
     for k in kept_spans do
@@ -1619,18 +1043,11 @@ def cfg_rebuild_items(items: Vec[Item], kept_spans: Vec[Span], retained_spans: V
         is_kept = true
       end
     end
-    if !is_kept then
-      for k in retained_spans do
-        if span_equal(&k, &item.span) then
-          is_kept = true
-        end
-      end
-    end
     if is_kept then
       match item.kind
       when ItemKind::ItemModule(md) then
         var nested = Vec::new()
-        cfg_rebuild_items(md.items, kept_spans, retained_spans, &mut nested)
+        cfg_rebuild_items(md.items, kept_spans, &mut nested)
         out.push(Item {
           kind: ItemKind::ItemModule(ModuleDecl {
             vis: md.vis,
@@ -1663,89 +1080,18 @@ pub def apply_cfg_elimination(inout program: Program, opts: CompilerOptions) -> 
     return
   end
 
-  # The retention fixpoint: collect the kept items' defined names and
-  # referenced names (per namespace); an eliminated item is retained when
-  # a referenced name matches one of its defined names in the same
-  # namespace and no kept item defines that name (an impl is additionally
-  # retained when its for_type is referenced — the gated impls of a gated
-  # retained type stay with it). Each round's decisions are computed
-  # against the round-start snapshot of the kept sets, then applied
-  # together — a gated type and its gated impls are retained in the SAME
-  # round regardless of their program order.
-  var kept_defs_fn: Set[String] = Set::new()
-  var kept_defs_ty: Set[String] = Set::new()
-  var kept_defs_variant: Set[String] = Set::new()
-  var kept_refs_fn: Set[String] = Set::new()
-  var kept_refs_ty: Set[String] = Set::new()
-  var kept_refs_variant: Set[String] = Set::new()
-  for item in kept_items do
-    cfg_collect_defined_names(item, &mut kept_defs_fn, &mut kept_defs_ty, &mut kept_defs_variant)
-    cfg_collect_references(item, &mut kept_refs_fn, &mut kept_refs_ty, &mut kept_refs_variant)
-  end
-
-  var retained_spans = Vec::new()
-  var changed = true
-  while changed do
-    changed = false
-    var round_keep = Vec::new()
-    var still_elim = Vec::new()
-    for item in eliminated_items do
-      var defs_fn: Set[String] = Set::new()
-      var defs_ty: Set[String] = Set::new()
-      var defs_variant: Set[String] = Set::new()
-      cfg_collect_defined_names(item, &mut defs_fn, &mut defs_ty, &mut defs_variant)
-      var keep = false
-      for n in defs_fn do
-        if !kept_defs_fn.contains(n) && kept_refs_fn.contains(n) then
-          keep = true
-        end
-      end
-      for n in defs_ty do
-        if !kept_defs_ty.contains(n) && kept_refs_ty.contains(n) then
-          keep = true
-        end
-      end
-      for n in defs_variant do
-        if !kept_defs_variant.contains(n) && kept_refs_variant.contains(n) then
-          keep = true
-        end
-      end
-      # The gated impl of a referenced gated type stays with its type.
-      match item.kind
-      when ItemKind::ItemImpl(imp) then
-        match cfg_type_expr_last_name(&imp.for_type)
-        when Option::Some(tn) then
-          if !kept_defs_ty.contains(tn) && kept_refs_ty.contains(tn) then
-            keep = true
-          end
-        when Option::None then ()
-        end
-      when _ then ()
-      end
-      if keep then
-        round_keep.push(item.clone())
-        changed = true
-      else
-        still_elim.push(item.clone())
-      end
-    end
-    for item in round_keep do
-      cfg_collect_defined_names(item, &mut kept_defs_fn, &mut kept_defs_ty, &mut kept_defs_variant)
-      cfg_collect_references(item, &mut kept_refs_fn, &mut kept_refs_ty, &mut kept_refs_variant)
-      retained_spans.push(item.span)
-    end
-    eliminated_items = still_elim
-  end
-
-  # Rebuild the program in the ORIGINAL order: the span-based identity
-  # test (one item per span) restores the kept items and the retained
-  # gated items at their original positions, and the crate's module item
-  # lists are remapped to the new flat indices (the same module-table
-  # rebuild the macro-filtering pass performs).
+  # NO retention fixpoint: the eliminated items stay eliminated — an item
+  # contradicting the target does not exist for this target, and a kept
+  # item that references an eliminated name fails the resolver's standard
+  # unresolved-name error. Rebuild the program in the ORIGINAL order: the
+  # span-based identity test (one item per span) restores the kept items
+  # at their original positions, and the crate's module item lists are
+  # remapped to the new flat indices (the same module-table rebuild the
+  # macro-filtering pass performs).
   var kept = Vec::new()
   var old_to_new: Map[Int, Int] = Map::new()
   var new_idx = 0
-  cfg_rebuild_items(program.items, kept_spans, retained_spans, &mut kept)
+  cfg_rebuild_items(program.items, kept_spans, &mut kept)
   var ri = 0
   while ri < program.items.len() do
     let item = program.items[ri].clone()
@@ -1753,13 +1099,6 @@ pub def apply_cfg_elimination(inout program: Program, opts: CompilerOptions) -> 
     for k in kept_spans do
       if span_equal(&k, &item.span) then
         is_kept = true
-      end
-    end
-    if !is_kept then
-      for k in retained_spans do
-        if span_equal(&k, &item.span) then
-          is_kept = true
-        end
       end
     end
     if is_kept then

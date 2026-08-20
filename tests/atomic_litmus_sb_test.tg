@@ -1,0 +1,143 @@
+# tests/atomic_litmus_sb_test.tg — Store Buffering (SB) litmus.
+#
+# The classic SB pattern, run over ITERATIONS independent slots:
+#   Thread 1: x[i] = 1 (SeqCst);  r1[i] = y[i] (SeqCst)
+#   Thread 2: y[i] = 1 (SeqCst);  r2[i] = x[i] (SeqCst)
+# Under sequentially consistent semantics the forbidden outcome
+# r1[i] == 0 && r2[i] == 0 (both loads reading the pre-store value)
+# can never occur: the two SeqCst stores are totally ordered, so one of
+# the loads must observe the other thread's store. A SeqCst store that
+# is only a plain MOV on x86-64 (the old codegen) permits exactly this
+# outcome (both stores sit in the store buffer), so the test would fail
+# on such a build; the xchg-based SeqCst store (lock xchg) forbids it.
+#
+# Each slot i is an independent execution: no cross-iteration reset is
+# needed, and no barrier is required between the store and the load
+# (the ordering comes from the atomic operations themselves).
+
+use std::core
+use std::atomic::{AtomicInt, Ordering}
+use std::thread::{spawn}
+
+extern def _tg_mem_alloc(size: UInt) -> Ptr[u8]
+extern def _tg_mem_free(ptr: Ptr[u8], size: UInt) -> Unit
+
+const ITERATIONS: Int = 20000
+
+# A single atomic slot (the field hop matches the std's proven
+# `ptr.as_ref().field.method(...)` receiver shape).
+struct Slot
+  v: AtomicInt
+end
+
+def sb_t1(x: Ptr[Slot], y: Ptr[Slot], r1: Ptr[Int]) -> Int
+  var i = 0
+  while i < ITERATIONS do
+    let xp = x.offset(i)
+    xp.as_ref().v.store(1, Ordering::SeqCst)
+    let yp = y.offset(i)
+    let v = yp.as_ref().v.load(Ordering::SeqCst)
+    let rp = r1.offset(i)
+    rp.write(v)
+    i = i + 1
+  end
+  0
+end
+
+def sb_t2(x: Ptr[Slot], y: Ptr[Slot], r2: Ptr[Int]) -> Int
+  var i = 0
+  while i < ITERATIONS do
+    let yp = y.offset(i)
+    yp.as_ref().v.store(1, Ordering::SeqCst)
+    let xp = x.offset(i)
+    let v = xp.as_ref().v.load(Ordering::SeqCst)
+    let rp = r2.offset(i)
+    rp.write(v)
+    i = i + 1
+  end
+  0
+end
+
+# The @test attribute registers this executable under the strict `tg test`
+# runner (canary convention: the file is compiled as-is and run once; the
+# process exit code is the test outcome — see tg_compiler/driver.tg
+# compile_and_run_file_main).
+@test
+def main() -> Int
+  let bytes = (ITERATIONS * 8) as UInt
+  let xb = _tg_mem_alloc(bytes)
+  let yb = _tg_mem_alloc(bytes)
+  let r1b = _tg_mem_alloc(bytes)
+  let r2b = _tg_mem_alloc(bytes)
+  if xb.is_null() || yb.is_null() || r1b.is_null() || r2b.is_null() then
+    println("atomic_litmus_sb: allocation failed")
+    return 1
+  end
+  let x = xb.cast[Slot]()
+  let y = yb.cast[Slot]()
+  let r1 = r1b.cast[Int]()
+  let r2 = r2b.cast[Int]()
+
+  var i = 0
+  while i < ITERATIONS do
+    x.offset(i).write(Slot { v: AtomicInt::new(0) })
+    y.offset(i).write(Slot { v: AtomicInt::new(0) })
+    i = i + 1
+  end
+
+  # Each thread takes its OWN copies of the pointers (the closures move
+  # their captured copies; the main copies stay valid).
+  let x1 = x
+  let y1 = y
+  let r1p = r1
+  let x2 = x
+  let y2 = y
+  let r2p = r2
+  let h0 = spawn(move || sb_t1(x1, y1, r1p))
+  let h1 = spawn(move || sb_t2(x2, y2, r2p))
+
+  match h0.join()
+  when Result::Ok(code) then
+    if code != 0 then
+      println("atomic_litmus_sb: worker 0 failed with code " + code.to_string())
+      return 10
+    end
+  when Result::Err(e) then
+    println("atomic_litmus_sb: join 0 failed: " + e)
+    return 11
+  end
+
+  match h1.join()
+  when Result::Ok(code) then
+    if code != 0 then
+      println("atomic_litmus_sb: worker 1 failed with code " + code.to_string())
+      return 12
+    end
+  when Result::Err(e) then
+    println("atomic_litmus_sb: join 1 failed: " + e)
+    return 13
+  end
+
+  # The forbidden SB outcome: BOTH loads observed the pre-store value.
+  var forbidden = 0
+  i = 0
+  while i < ITERATIONS do
+    let a = r1.offset(i).read()
+    let b = r2.offset(i).read()
+    if a == 0 && b == 0 then
+      forbidden = forbidden + 1
+    end
+    i = i + 1
+  end
+
+  _tg_mem_free(xb, bytes)
+  _tg_mem_free(yb, bytes)
+  _tg_mem_free(r1b, bytes)
+  _tg_mem_free(r2b, bytes)
+
+  if forbidden != 0 then
+    println("atomic_litmus_sb: forbidden r1==0 && r2==0 observed " + forbidden.to_string() + " times of " + ITERATIONS.to_string())
+    return 2
+  end
+  0
+end

@@ -47,7 +47,7 @@ DIGIT          = '0'..'9'
 
 The lexer recognizes the following keywords (`token.tg` `init_keyword_map`):
 
-```
+```text
 def    end    do     if     elsif  else   while  for    in     loop
 match  when   then   unless until  let    mut    var    return break
 next   struct enum   trait  impl   module mod    use    as     pub
@@ -190,9 +190,9 @@ fn_clause      = 'pre' expr [ ',' STRING_LITERAL ]
                | 'invariant' expr [ ',' STRING_LITERAL ]
                | 'requires' IDENT { ',' IDENT }
                | 'effect' IDENT { ',' IDENT }
-               | '@budget' IDENT ':' budget_amount { ',' IDENT ':' budget_amount }
+               | ( 'budget' | '@budget' ) IDENT ':' budget_amount { ',' IDENT ':' budget_amount }
 
-budget_amount  = INT_LITERAL [ IDENT ] | STRING_LITERAL
+budget_amount  = STRING_LITERAL
 
 type_params    = '[' type_param { ',' type_param } ']'
 type_param     = IDENT [ ':' type_bound ] [ '=' type_expr ]
@@ -220,6 +220,12 @@ param          = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ] [ '=' expr
   spellings are REJECTED (E100) — write `self` (default `let`), `inout
   self`, or use the trailing `inout` receiver convention.
 - `fn` may be used in place of `def` as a defensive fallback.
+- Budget clauses accept the bare `budget` keyword or the `@budget`
+  attribute (`parser.tg:1363-1377`, `parse_budget_annotation`
+  `parser.tg:2505`); the bound is a STRING_LITERAL — a non-string bound is
+  silently dropped from the constraint list, not an error. The
+  `__tg_budget_*` data symbols have no definitions: enforcement is pending
+  (see language.md §Budgets).
 
 ### 2.3 Parameter Conventions and Legacy Rejection
 
@@ -229,7 +235,9 @@ The canonical parameter grammar is:
 param = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ] [ '=' expr ]
 ```
 
-with default convention `let` (by-value move). The legacy Rust-style
+with default convention `let` (observe — read-only access to the
+caller's value: no move, no consume; the by-value move is the `sink`
+convention). The legacy Rust-style
 spellings are **NOT normalized — they are REJECTED** (`parser.tg`
 `parse_param`, `parser.tg:1614-1700`): the E100 diagnostic
 ("legacy parameter spelling `X` is removed; use the explicit access

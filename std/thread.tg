@@ -18,7 +18,20 @@ use std::gfx_errors::{Error, ErrorCode, SyncError}
 use std::core::{Option, Result, panic}
 use std::collections::{Vec}
 use std::alloc::{alloc, dealloc, Box}
-use std::time::{TimeSpec, CLOCK_MONOTONIC, CLOCK_REALTIME}
+use std::time::{TimeSpec}
+
+# ———————————————————————————————————————————————————————————————
+# Synchronization primitives — the std::sync unification
+# ———————————————————————————————————————————————————————————————
+# std::thread's Mutex/RwLock/guards/Condvar ARE std::sync's types (the ONE
+# design — the heap-stable Arc-clone guards, never a raw pointer into a
+# caller-owned mutex). std::thread re-exports them so existing
+# `std::thread::Mutex` users keep a thread-module name; the pthread-backed
+# implementation (Thread/JoinHandle, the pthread opaque types, the channel)
+# lives HERE — the single pthread type universe.
+use std::sync::{Mutex, RwLock, Arc}
+
+type Condvar = std::sync::Condvar
 
 # ———————————————————————————————————————————————————————————————
 # Thread Safety Markers
@@ -83,14 +96,8 @@ impl Sync for u64 {}
 @ffi("c") extern def pthread_cond_signal(cond: PtrMut[PthreadCondT]) -> Int end
 @ffi("c") extern def pthread_cond_broadcast(cond: PtrMut[PthreadCondT]) -> Int end
 
-# Read-write locks
-@ffi("c") extern def pthread_rwlock_init(rwlock: PtrMut[PthreadRwlockT], attr: Ptr[u8]) -> Int end
-@ffi("c") extern def pthread_rwlock_destroy(rwlock: PtrMut[PthreadRwlockT]) -> Int end
-@ffi("c") extern def pthread_rwlock_rdlock(rwlock: PtrMut[PthreadRwlockT]) -> Int end
-@ffi("c") extern def pthread_rwlock_tryrdlock(rwlock: PtrMut[PthreadRwlockT]) -> Int end
-@ffi("c") extern def pthread_rwlock_wrlock(rwlock: PtrMut[PthreadRwlockT]) -> Int end
-@ffi("c") extern def pthread_rwlock_trywrlock(rwlock: PtrMut[PthreadRwlockT]) -> Int end
-@ffi("c") extern def pthread_rwlock_unlock(rwlock: PtrMut[PthreadRwlockT]) -> Int end
+# Read-write locks — the RwLock implementation lives in std::sync on the
+# atomic + Arc layer; no pthread read-write lock type universe here.
 
 # Barriers
 @ffi("c") extern def pthread_barrier_init(barrier: PtrMut[PthreadBarrierT], attr: Ptr[u8], count: UInt) -> Int end
@@ -111,7 +118,10 @@ impl Sync for u64 {}
 # Time functions
 @ffi("c") extern def clock_gettime(clockid: Int, tp: PtrMut[TimeSpec]) -> Int end
 
-# Opaque pthread types — platform-specific sizes.
+# Opaque pthread types — platform-specific sizes. This block is the ONE
+# pthread ABI table: std::sync (the atomic/Arc redesign) carries no
+# pthread types; the pthread-backed implementations (Thread/JoinHandle,
+# Barrier, the channel) all live here.
 @cfg(target_os = "linux")
 struct PthreadT
   opaque: [u8; 8]
@@ -153,18 +163,14 @@ struct PthreadCondT
 end
 
 @cfg(target_os = "linux")
-struct PthreadRwlockT
-  opaque: [u8; 56]
-end
-
-@cfg(target_os = "macos")
-struct PthreadRwlockT
-  opaque: [u8; 200]
-end
-
-@cfg(target_os = "linux")
 struct PthreadBarrierT
   opaque: [u8; 32]
+end
+
+# Darwin's pthread_barrier_t: long __sig + __opaque[56] = 64 bytes.
+@cfg(target_os = "macos")
+struct PthreadBarrierT
+  opaque: [u8; 64]
 end
 
 struct PthreadKeyT
@@ -191,18 +197,18 @@ def pthread_mutex_zero() -> PthreadMutexT
   PthreadMutexT { opaque: [0; 64] }
 end
 
+def pthread_cond_zero() -> PthreadCondT
+  PthreadCondT { opaque: [0; 48] }
+end
+
 @cfg(target_os = "linux")
-def pthread_rwlock_zero() -> PthreadRwlockT
-  PthreadRwlockT { opaque: [0; 56] }
+def pthread_barrier_zero() -> PthreadBarrierT
+  PthreadBarrierT { opaque: [0; 32] }
 end
 
 @cfg(target_os = "macos")
-def pthread_rwlock_zero() -> PthreadRwlockT
-  PthreadRwlockT { opaque: [0; 200] }
-end
-
-def pthread_cond_zero() -> PthreadCondT
-  PthreadCondT { opaque: [0; 48] }
+def pthread_barrier_zero() -> PthreadBarrierT
+  PthreadBarrierT { opaque: [0; 64] }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -286,7 +292,7 @@ impl ThreadBuilder
     # Create thread
     mut handle = PthreadT { opaque: [0; 8] }
     let ret = pthread_create(&handle as PtrMut[PthreadT], &attr as Ptr[u8], 
-                              thread_entry_point as Ptr[u8], 
+                              thread_entry_point, 
                               ctx_ptr as Ptr[u8])
     
     pthread_attr_destroy(&attr as PtrMut[PthreadAttrT])
@@ -338,7 +344,7 @@ def spawn[F, T](f: F) -> JoinHandle[T]
 end
 
 impl[T] JoinHandle[T]
-  def join(self: JoinHandle[T]) -> Result[T, String]
+  def join(inout self: JoinHandle[T]) -> Result[T, String]
     if self.joined then
       return Result::Err("Thread already joined".to_string())
     end
@@ -360,7 +366,7 @@ impl[T] JoinHandle[T]
     Result::Ok(result)
   end
   
-  def thread(self: JoinHandle[T]) -> Ptr[Thread]
+  def thread(inout self: JoinHandle[T]) -> Ptr[Thread]
     address_of(&mut self.thread) as Ptr[Thread]
   end
 end
@@ -427,219 +433,21 @@ def thread_sleep(secs: i64, nanos: i64) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
-# Mutex
+# Mutex / RwLock
 # ———————————————————————————————————————————————————————————————
-
-struct Mutex[T]
-  inner: PthreadMutexT
-  data: T
-end
-
-def mutex_new[T](data: T) -> Mutex[T]
-  mut inner = pthread_mutex_zero()
-  let _ = pthread_mutex_init(&inner as PtrMut[PthreadMutexT], Ptr::null())
-  Mutex { inner: inner, data: data }
-end
-
-struct MutexGuard[T]
-  mutex: Ptr[Mutex[T]]
-end
-
-impl[T] Mutex[T]
-  def lock(self: Mutex[T]) -> MutexGuard[T]
-    pthread_mutex_lock(&self.inner as PtrMut[PthreadMutexT])
-    MutexGuard { mutex: self as Ptr[Mutex[T]] }
-  end
-  
-  def try_lock(self: Mutex[T]) -> Option[MutexGuard[T]]
-    if pthread_mutex_trylock(&self.inner as PtrMut[PthreadMutexT]) == 0 then
-      Option::Some(MutexGuard { mutex: self })
-    else
-      Option::None
-    end
-  end
-  
-  def get_mut(inout self: Mutex[T]) -> PtrMut[T]
-    # Safe only when we have exclusive access
-    address_of_mut(&mut self.data)
-  end
-end
-
-impl[T] MutexGuard[T]
-  def get(self: MutexGuard[T]) -> Ptr[T]
-    address_of(&mut self.mutex.as_ref().data) as Ptr[T]
-  end
-  
-  def get_mut(inout self: MutexGuard[T]) -> PtrMut[T]
-    unsafe { address_of_mut(&mut (*self.mutex).data) }
-  end
-end
-
-impl[T] Drop for MutexGuard[T]
-  def drop(inout self: MutexGuard[T]) -> Unit
-    let _ = pthread_mutex_unlock(&self.mutex.as_ref().inner as PtrMut[PthreadMutexT])
-  end
-end
-
-impl[T] Drop for Mutex[T]
-  def drop(inout self: Mutex[T]) -> Unit
-    let _ = pthread_mutex_destroy(&self.inner as PtrMut[PthreadMutexT])
-  end
-end
-
-impl[T: Send] Send for Mutex[T] {}
-impl[T: Send] Sync for Mutex[T] {}
-
-# ———————————————————————————————————————————————————————————————
-# RwLock (Read-Write Lock)
-# ———————————————————————————————————————————————————————————————
-
-struct RwLock[T]
-  inner: PthreadRwlockT
-  data: T
-end
-
-def rwlock_new[T](data: T) -> RwLock[T]
-  mut inner = pthread_rwlock_zero()
-  let _ = pthread_rwlock_init(&inner as PtrMut[PthreadRwlockT], Ptr::null())
-  RwLock { inner: inner, data: data }
-end
-
-struct RwLockReadGuard[T]
-  lock: Ptr[RwLock[T]]
-end
-
-struct RwLockWriteGuard[T]
-  lock: Ptr[RwLock[T]]
-end
-
-impl[T] RwLock[T]
-  def read(self: RwLock[T]) -> RwLockReadGuard[T]
-    pthread_rwlock_rdlock(&self.inner as PtrMut[PthreadRwlockT])
-    RwLockReadGuard { lock: self as Ptr[RwLock[T]] }
-  end
-  
-  def try_read(self: RwLock[T]) -> Option[RwLockReadGuard[T]]
-    if pthread_rwlock_tryrdlock(&self.inner as PtrMut[PthreadRwlockT]) == 0 then
-      Option::Some(RwLockReadGuard { lock: self })
-    else
-      Option::None
-    end
-  end
-  
-  def write(self: RwLock[T]) -> RwLockWriteGuard[T]
-    pthread_rwlock_wrlock(&self.inner as PtrMut[PthreadRwlockT])
-    RwLockWriteGuard { lock: self as Ptr[RwLock[T]] }
-  end
-  
-  def try_write(self: RwLock[T]) -> Option[RwLockWriteGuard[T]]
-    if pthread_rwlock_trywrlock(&self.inner as PtrMut[PthreadRwlockT]) == 0 then
-      Option::Some(RwLockWriteGuard { lock: self })
-    else
-      Option::None
-    end
-  end
-end
-
-impl[T] RwLockReadGuard[T]
-  def get(self: RwLockReadGuard[T]) -> Ptr[T]
-    address_of(&mut self.lock.as_ref().data) as Ptr[T]
-  end
-end
-
-impl[T] RwLockWriteGuard[T]
-  # get() removed - write guards should only provide mutable access
-  # Use get_mut() instead to maintain exclusive write semantics
-  
-  def get_mut(inout self: RwLockWriteGuard[T]) -> PtrMut[T]
-    unsafe { address_of_mut(&mut (*self.lock).data) }
-  end
-end
-
-impl[T] Drop for RwLockReadGuard[T]
-  def drop(inout self: RwLockReadGuard[T]) -> Unit
-    let _ = pthread_rwlock_unlock(&self.lock.as_ref().inner as PtrMut[PthreadRwlockT])
-  end
-end
-
-impl[T] Drop for RwLockWriteGuard[T]
-  def drop(inout self: RwLockWriteGuard[T]) -> Unit
-    let _ = pthread_rwlock_unlock(&self.lock.as_ref().inner as PtrMut[PthreadRwlockT])
-  end
-end
-
-impl[T] Drop for RwLock[T]
-  def drop(inout self: RwLock[T]) -> Unit
-    let _ = pthread_rwlock_destroy(&self.inner as PtrMut[PthreadRwlockT])
-  end
-end
-
-impl[T: Send] Send for RwLock[T] {}
-impl[T: Send + Sync] Sync for RwLock[T] {}
+# Mutex, MutexGuard, RwLock, RwLockReadGuard and RwLockWriteGuard are the
+# std::sync types (see the unification block above) — the heap-stable
+# Arc-clone guard design with the atomic lock state in the Arc's allocation.
+# std::thread adds NO duplicate pthread universe for them: the guards are
+# produced by `use std::sync::{Mutex, RwLock}`.
 
 # ———————————————————————————————————————————————————————————————
 # Condition Variable
 # ———————————————————————————————————————————————————————————————
-
-struct Condvar
-  inner: PthreadCondT
-end
-
-def condvar_new() -> Condvar
-  mut inner = PthreadCondT { opaque: [0; 48] }
-  let _ = pthread_cond_init(&inner as PtrMut[PthreadCondT], Ptr::null())
-  Condvar { inner: inner }
-end
-
-impl Condvar
-  def wait[T](self: Condvar, guard: MutexGuard[T]) -> MutexGuard[T]
-    let wait_rc = pthread_cond_wait(&self.inner as PtrMut[PthreadCondT], &guard.mutex.inner as PtrMut[PthreadMutexT])
-    let _ = wait_rc
-    return guard
-  end
-  
-  def wait_timeout[T](self: Condvar, guard: MutexGuard[T], timeout_ms: UInt) -> (MutexGuard[T], Bool)
-    # pthread_cond_timedwait requires ABSOLUTE time, not relative
-    mut now = TimeSpec { tv_sec: 0, tv_nsec: 0 }
-    clock_gettime(CLOCK_REALTIME(), &mut now as PtrMut[TimeSpec])
-    
-    let timeout_secs = (timeout_ms / 1000) as i64
-    let timeout_nanos = ((timeout_ms % 1000) * 1000000) as i64
-    
-    # Add timeout to current time
-    mut abstime = TimeSpec {
-      tv_sec: now.tv_sec + timeout_secs,
-      tv_nsec: now.tv_nsec + timeout_nanos
-    }
-    
-    # Handle nanosecond overflow
-    if abstime.tv_nsec >= 1000000000 then
-      abstime.tv_sec = abstime.tv_sec + 1
-      abstime.tv_nsec = abstime.tv_nsec - 1000000000
-    end
-    
-    let ret = pthread_cond_timedwait(&self.inner as PtrMut[PthreadCondT], &guard.mutex.inner as PtrMut[PthreadMutexT], &abstime as Ptr[TimeSpec])
-    let timed_out = ret != 0
-    (guard, timed_out)
-  end
-  
-  def notify_one(self: Condvar) -> Unit
-    let _ = pthread_cond_signal(&self.inner as PtrMut[PthreadCondT])
-  end
-  
-  def notify_all(self: Condvar) -> Unit
-    let _ = pthread_cond_broadcast(&self.inner as PtrMut[PthreadCondT])
-  end
-end
-
-impl Drop for Condvar
-  def drop(inout self: Condvar) -> Unit
-    let _ = pthread_cond_destroy(&self.inner as PtrMut[PthreadCondT])
-  end
-end
-
-impl Send for Condvar {}
-impl Sync for Condvar {}
+# Condvar is std::sync::Condvar (the `type Condvar = std::sync::Condvar`
+# alias above) — the notification counter behind an Arc; wait() drops the
+# MutexGuard (the lock release + the Arc release) and re-locks through the
+# Arc the guard kept alive.
 
 # ———————————————————————————————————————————————————————————————
 # Barrier
@@ -650,7 +458,7 @@ struct Barrier
 end
 
 def barrier_new(count: UInt) -> Barrier
-  mut inner = PthreadBarrierT { opaque: [0; 0] }
+  mut inner = pthread_barrier_zero()
   let _ = pthread_barrier_init(&inner as PtrMut[PthreadBarrierT], Ptr::null(), count)
   Barrier { inner: inner }
 end
@@ -1059,7 +867,7 @@ def thread_pool_new(num_threads: UInt) -> ThreadPool
   let pool = ThreadPool {
     workers: Vec::new(),
     job_queue: Mutex::new(VecDeque::new()),
-    condvar: condvar_new(),
+    condvar: Condvar::new(),
     shutdown: atomic_bool_new(false),
     active_jobs: atomic_int_new(0),
   }
@@ -1262,17 +1070,17 @@ impl ThreadRegistry
   end
 
   def register(self: ThreadRegistry, tid: u64, state: Ptr[ThreadParkState]) -> Unit
-    let mut guard = self.states.lock().unwrap()
+    let mut guard = self.states.lock()
     guard.get_mut().insert(tid, state)
   end
 
   def unregister(self: ThreadRegistry, tid: u64) -> Unit
-    let mut guard = self.states.lock().unwrap()
+    let mut guard = self.states.lock()
     let _ = guard.get_mut().remove(&tid)
   end
 
   def get_state(self: ThreadRegistry, tid: u64) -> Option[Ptr[ThreadParkState]]
-    let guard = self.states.lock().unwrap()
+    let guard = self.states.lock()
     match guard.get().get(&tid)
     when Option::Some(state) then Option::Some(state)
     when Option::None then Option::None
@@ -1290,7 +1098,7 @@ end
 def init_thread_park_state() -> ThreadParkState
   let state = ThreadParkState {
     mutex: Mutex::new(()),
-    cond: condvar_new(),
+    cond: Condvar::new(),
     unparked: atomic_bool_new(false)
   }
   state
@@ -1348,15 +1156,6 @@ end
 # ———————————————————————————————————————————————————————————————
 # Transferable / Shareable marker impls (access + resource model)
 # ———————————————————————————————————————————————————————————————
-
-impl[T: Send] Transferable for Mutex[T] {}
-impl[T: Send] Shareable for Mutex[T] {}
-
-impl[T: Send] Transferable for RwLock[T] {}
-impl[T: Send + Sync] Shareable for RwLock[T] {}
-
-impl Transferable for Condvar {}
-impl Shareable for Condvar {}
 
 impl Transferable for Barrier {}
 impl Shareable for Barrier {}

@@ -1,0 +1,176 @@
+# tests/atomic_litmus_cas_fail_test.tg — CAS failure-order restrictions.
+#
+# A FAILED compare_exchange must not consume the acquire ordering: the
+# failure order is the one that governs the failed load (here Relaxed),
+# so a failed acquire-CAS behaves as a RELAXED load of the location —
+# it must not create a release/acquire synchronizes-with edge that a
+# successful acquire-CAS would create.
+#
+# Run over ITERATIONS independent slots:
+#   main (before spawning): y[i] = 1 (plain, sequenced-before the
+#                            threads — guaranteed visible)
+#   Thread 1: x[i] = 1 (Relaxed)
+#   Thread 2: exp = 0; ok[i] = CAS(y[i], exp -> 2, Acquire, Relaxed);
+#             r[i] = x[i] (Relaxed)
+# The CAS can never succeed (y[i] == 1 != 0), so every iteration
+# exercises the FAILURE path: the failure contract requires (a) the CAS
+# returns false, (b) the expected slot is written back with the CURRENT
+# value (1) — the emitter's failure branch — and (c) the follow-up
+# relaxed read of x MAY be stale (r[i] == 0): no acquire was consumed
+# by the failure, so nothing orders that read after thread 1's store.
+# The stale count is reported; both outcomes are legal.
+#
+# The ordering restriction itself is enforced structurally in the
+# emitter: the compare_exchange failure branch (the expected-slot
+# write-back and the return-0) contains no acquire operation (AArch64:
+# a plain STR; x86-64: a plain MOV) — see codegen's
+# emit_atomic_intrinsic_x64/a64 compare_exchange arms.
+
+use std::core
+use std::atomic::{AtomicInt, Ordering}
+use std::thread::{spawn}
+
+extern def _tg_mem_alloc(size: UInt) -> Ptr[u8]
+extern def _tg_mem_free(ptr: Ptr[u8], size: UInt) -> Unit
+
+const ITERATIONS: Int = 20000
+
+struct Slot
+  v: AtomicInt
+end
+
+def cf_writer(x: Ptr[Slot]) -> Int
+  var i = 0
+  while i < ITERATIONS do
+    let xp = x.offset(i)
+    xp.as_ref().v.store(1, Ordering::Relaxed)
+    i = i + 1
+  end
+  0
+end
+
+def cf_reader(y: Ptr[Slot], x: Ptr[Slot], ok: Ptr[Int], exp_out: Ptr[Int], r: Ptr[Int]) -> Int
+  var i = 0
+  while i < ITERATIONS do
+    let yp = y.offset(i)
+    var exp = 0
+    let won = yp.as_ref().v.compare_exchange(&mut exp, 2, Ordering::Acquire, Ordering::Relaxed)
+    let op = ok.offset(i)
+    op.write(if won then 1 else 0 end)
+    let ep = exp_out.offset(i)
+    ep.write(exp)
+    let xp = x.offset(i)
+    let v = xp.as_ref().v.load(Ordering::Relaxed)
+    let rp = r.offset(i)
+    rp.write(v)
+    i = i + 1
+  end
+  0
+end
+
+# The @test attribute registers this executable under the strict `tg test`
+# runner (canary convention: the file is compiled as-is and run once; the
+# process exit code is the test outcome — see tg_compiler/driver.tg
+# compile_and_run_file_main).
+@test
+def main() -> Int
+  let bytes = (ITERATIONS * 8) as UInt
+  let xb = _tg_mem_alloc(bytes)
+  let yb = _tg_mem_alloc(bytes)
+  let ob = _tg_mem_alloc(bytes)
+  let eb = _tg_mem_alloc(bytes)
+  let rb = _tg_mem_alloc(bytes)
+  if xb.is_null() || yb.is_null() || ob.is_null() || eb.is_null() || rb.is_null() then
+    println("atomic_litmus_cas_fail: allocation failed")
+    return 1
+  end
+  let x = xb.cast[Slot]()
+  let y = yb.cast[Slot]()
+  let ok = ob.cast[Int]()
+  let exp_out = eb.cast[Int]()
+  let r = rb.cast[Int]()
+
+  var i = 0
+  while i < ITERATIONS do
+    x.offset(i).write(Slot { v: AtomicInt::new(0) })
+    # y = 1 is a plain store sequenced-before the spawns below: the
+    # reader's CAS (expected 0) can never succeed.
+    y.offset(i).write(Slot { v: AtomicInt::new(1) })
+    i = i + 1
+  end
+
+  let x1 = x
+  let x2 = x
+  let y2 = y
+  let o2 = ok
+  let e2 = exp_out
+  let r2 = r
+  let h0 = spawn(move || cf_writer(x1))
+  let h1 = spawn(move || cf_reader(y2, x2, o2, e2, r2))
+
+  match h0.join()
+  when Result::Ok(code) then
+    if code != 0 then
+      println("atomic_litmus_cas_fail: writer failed with code " + code.to_string())
+      return 10
+    end
+  when Result::Err(e) then
+    println("atomic_litmus_cas_fail: writer join failed: " + e)
+    return 11
+  end
+
+  match h1.join()
+  when Result::Ok(code) then
+    if code != 0 then
+      println("atomic_litmus_cas_fail: reader failed with code " + code.to_string())
+      return 12
+    end
+  when Result::Err(e) then
+    println("atomic_litmus_cas_fail: reader join failed: " + e)
+    return 13
+  end
+
+  # The failure contract: the CAS never succeeded, and the expected
+  # slot was written back with the current value (1) on EVERY failure.
+  var false_success = 0
+  var bad_exp = 0
+  var stale = 0
+  var fresh = 0
+  i = 0
+  while i < ITERATIONS do
+    let o = ok.offset(i).read()
+    if o == 1 then
+      false_success = false_success + 1
+    end
+    let e = exp_out.offset(i).read()
+    if e != 1 then
+      bad_exp = bad_exp + 1
+    end
+    let v = r.offset(i).read()
+    if v == 0 then
+      stale = stale + 1
+    else
+      fresh = fresh + 1
+    end
+    i = i + 1
+  end
+
+  _tg_mem_free(xb, bytes)
+  _tg_mem_free(yb, bytes)
+  _tg_mem_free(ob, bytes)
+  _tg_mem_free(eb, bytes)
+  _tg_mem_free(rb, bytes)
+
+  if false_success != 0 then
+    println("atomic_litmus_cas_fail: CAS succeeded " + false_success.to_string() + " times (y was 1, expected 0)")
+    return 2
+  end
+  if bad_exp != 0 then
+    println("atomic_litmus_cas_fail: expected slot not written back on " + bad_exp.to_string() + " failures")
+    return 3
+  end
+  # The follow-up relaxed read may legally be stale (the failed CAS
+  # consumed no acquire): report the split, assert only the invariants.
+  println("atomic_litmus_cas_fail: stale=" + stale.to_string() + " fresh=" + fresh.to_string())
+  0
+end

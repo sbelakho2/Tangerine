@@ -17,53 +17,14 @@
 #   let data_clone = data.clone()
 #   
 #   spawn_thread(move || {
-#     match data_clone.lock()
-#     when Option::Some(mut guard) then
-#       *guard = *guard + 1
-#     when Option::None then ()
-#     end
+#     let mut guard = data_clone.lock()
+#     *(guard.get_mut()) = *(guard.get()) + 1
 #   })
 
 use std::core::{Option, Result, String, Bool, Int, UInt, Unit}
 use std::collections::{Vec, Queue}
-use std::thread::{Thread, current_thread}
 use std::time::{Duration, Instant}
 use std::ffi::{c_int}
-
-# ═══════════════════════════════════════════════════════════════
-# FFI to pthreads for synchronization primitives
-# ═══════════════════════════════════════════════════════════════
-
-extern "C"
-  # pthread mutex
-  def pthread_mutex_init(inout mutex: PthreadMutex, attr: Ptr[u8]) -> Int
-  def pthread_mutex_destroy(inout mutex: PthreadMutex) -> Int
-  def pthread_mutex_lock(inout mutex: PthreadMutex) -> Int
-  def pthread_mutex_trylock(inout mutex: PthreadMutex) -> Int
-  def pthread_mutex_unlock(inout mutex: PthreadMutex) -> Int
-  
-  # pthread condition variable
-  def pthread_cond_init(inout cond: PthreadCond, attr: Ptr[u8]) -> Int
-  def pthread_cond_destroy(inout cond: PthreadCond) -> Int
-  def pthread_cond_signal(inout cond: PthreadCond) -> Int
-  def pthread_cond_broadcast(inout cond: PthreadCond) -> Int
-  def pthread_cond_wait(inout cond: PthreadCond, inout mutex: PthreadMutex) -> Int
-  def pthread_cond_timedwait(inout cond: PthreadCond, inout mutex: PthreadMutex, abstime: Ptr[Timespec]) -> Int
-  
-  # pthread read-write lock
-  def pthread_rwlock_init(inout rwlock: PthreadRwlock, attr: Ptr[u8]) -> Int
-  def pthread_rwlock_destroy(inout rwlock: PthreadRwlock) -> Int
-  def pthread_rwlock_rdlock(inout rwlock: PthreadRwlock) -> Int
-  def pthread_rwlock_tryrdlock(inout rwlock: PthreadRwlock) -> Int
-  def pthread_rwlock_wrlock(inout rwlock: PthreadRwlock) -> Int
-  def pthread_rwlock_trywrlock(inout rwlock: PthreadRwlock) -> Int
-  def pthread_rwlock_unlock(inout rwlock: PthreadRwlock) -> Int
-  
-  # pthread barrier
-  def pthread_barrier_init(inout barrier: PthreadBarrier, attr: Ptr[u8], count: UInt) -> Int
-  def pthread_barrier_destroy(inout barrier: PthreadBarrier) -> Int
-  def pthread_barrier_wait(inout barrier: PthreadBarrier) -> Int
-end
 
 # ═══════════════════════════════════════════════════════════════
 # The atomic intrinsics — the ONE atomic primitive layer
@@ -99,34 +60,6 @@ extern def __intrinsic_atomic_exchange_u64(ptr: PtrMut[u64], value: u64, order: 
 extern def __intrinsic_atomic_compare_exchange_u64(ptr: PtrMut[u64], expected: PtrMut[u64], desired: u64, weak: Bool, success_order: c_int, failure_order: c_int) -> Bool
 extern def __intrinsic_atomic_fetch_add_u64(ptr: PtrMut[u64], value: u64, order: c_int) -> u64
 extern def __intrinsic_atomic_fetch_sub_u64(ptr: PtrMut[u64], value: u64, order: c_int) -> u64
-
-# Platform-specific structures
-@repr(C)
-struct PthreadMutex
-  # Opaque - size varies by platform
-  data: [u8; 40]
-end
-
-@repr(C)
-struct PthreadCond
-  data: [u8; 48]
-end
-
-@repr(C)
-struct PthreadRwlock
-  data: [u8; 56]
-end
-
-@repr(C)
-struct PthreadBarrier
-  data: [u8; 32]
-end
-
-@repr(C)
-struct Timespec
-  tv_sec: i64
-  tv_nsec: i64
-end
 
 # ═══════════════════════════════════════════════════════════════
 # Atomic Types
@@ -258,94 +191,85 @@ end
 # ═══════════════════════════════════════════════════════════════
 
 ## A mutual exclusion lock for protecting shared data
+##
+## The lock state lives in a heap allocation owned by an Arc (the real
+## allocator). Mutex::lock clones the Arc into the guard, so the guard KEEPS
+## THE STATE ALIVE: the Mutex can be dropped or moved while the guard lives.
+## The lock acquisition is an atomic swap on the inner's AtomicBool; the
+## guard's Drop releases the lock with an atomic store and the compiler's
+## deinit plan drops the guard's Arc clone (the last clone releases the
+## allocation). No guard ever holds a raw pointer into a caller-owned Mutex.
 struct Mutex[T]
-  inner: PthreadMutex
-  data: T
+  inner: Arc[MutexInner[T]]
+end
+
+struct MutexInner[T]
   locked: AtomicBool
+  value: T
 end
 
-## Guard returned by Mutex::lock() that releases the lock on drop
+## Guard returned by Mutex::lock() that releases the lock on drop.
+## The guard holds its own Arc clone of the inner state.
 struct MutexGuard[T]
-  mutex: PtrMut[Mutex[T]]
+  inner: Arc[MutexInner[T]]
 end
 
-def Mutex::new[T](value: T) -> Result[Mutex[T], String]
-  mut mutex = Mutex {
-    inner: PthreadMutex { data: [0u8; 40] },
-    data: value,
-    locked: AtomicBool::new(false)
+def Mutex::new[T](value: T) -> Mutex[T]
+  Mutex {
+    inner: Arc::new(MutexInner {
+      locked: AtomicBool::new(false),
+      value: value
+    })
   }
-  
-  let ret = pthread_mutex_init(&mut mutex.inner, Ptr::null() as Ptr[u8])
-  if ret != 0 then
-    return Result::Err("Failed to initialize mutex".to_string())
-  end
-  
-  Result::Ok(mutex)
 end
 
-def Mutex::lock[T](inout self: Mutex[T]) -> Option[MutexGuard[T]]
-  let ret = pthread_mutex_lock(&mut self.inner)
-  if ret != 0 then
+def Mutex::lock[T](self: Mutex[T]) -> MutexGuard[T]
+  let inner = self.inner.clone()
+  while inner.ptr.as_ref().locked.swap(true) do
+    std::thread::yield_now()
+  end
+  MutexGuard { inner: inner }
+end
+
+def Mutex::try_lock[T](self: Mutex[T]) -> Option[MutexGuard[T]]
+  let inner = self.inner.clone()
+  if inner.ptr.as_ref().locked.swap(true) then
     return Option::None
   end
-  
-  self.locked.store(true)
-  
-  Option::Some(MutexGuard { mutex: self as PtrMut[Mutex[T]] })
-end
-
-def Mutex::try_lock[T](inout self: Mutex[T]) -> Option[MutexGuard[T]]
-  let ret = pthread_mutex_trylock(&mut self.inner)
-  if ret != 0 then
-    return Option::None
-  end
-  
-  self.locked.store(true)
-  
-  Option::Some(MutexGuard { mutex: self as PtrMut[Mutex[T]] })
-end
-
-def Mutex::unlock[T](inout self: Mutex[T]) -> Unit
-  self.locked.store(false)
-  pthread_mutex_unlock(&mut self.inner)
+  Option::Some(MutexGuard { inner: inner })
 end
 
 def Mutex::is_locked[T](self: Mutex[T]) -> Bool
-  self.locked.load()
-end
-
-def Mutex::get_mut[T](inout self: Mutex[T]) -> PtrMut[T]
-  # Only safe if we have exclusive access (no other references)
-  address_of_mut(&mut self.data)
-end
-
-def Mutex::into_inner[T](self: Mutex[T]) -> T
-  pthread_mutex_destroy(&mut self.inner)
-  self.data
+  self.inner.ptr.as_ref().locked.load()
 end
 
 # MutexGuard operations
 impl[T] MutexGuard[T]
+  def get(self: MutexGuard[T]) -> Ptr[T]
+    # The value access goes through the Arc the guard keeps alive — the
+    # Arc's deref (the inner's value lives in the Arc's allocation).
+    address_of(&mut self.inner.ptr.as_ref().value) as Ptr[T]
+  end
+  
+  def get_mut(inout self: MutexGuard[T]) -> PtrMut[T]
+    unsafe { address_of_mut(&mut (*self.inner.ptr).value) }
+  end
+  
   def deref(self: MutexGuard[T]) -> Ptr[T]
-    address_of(&mut self.mutex.as_ref().data) as Ptr[T]
+    self.get()
   end
   
   def deref_mut(inout self: MutexGuard[T]) -> PtrMut[T]
-    unsafe { address_of_mut(&mut (*self.mutex).data) }
+    self.get_mut()
   end
 end
 
 impl[T] Drop for MutexGuard[T]
   def drop(inout self: MutexGuard[T]) -> Unit
-    self.mutex.locked.store(false)
-    pthread_mutex_unlock(&mut self.mutex.inner)
-  end
-end
-
-impl[T] Drop for Mutex[T]
-  def drop(inout self: Mutex[T]) -> Unit
-    pthread_mutex_destroy(&mut self.inner)
+    # Release the lock (the atomic store). The guard's Arc clone is then
+    # dropped by the deinit plan — the inner allocation stays alive as long
+    # as ANY Arc clone (the Mutex's or a guard's) still references it.
+    self.inner.ptr.as_ref().locked.store(false)
   end
 end
 
@@ -353,42 +277,59 @@ end
 # Condvar (Condition Variable)
 # ═══════════════════════════════════════════════════════════════
 
-## A condition variable for signaling between threads
+## A condition variable for signaling between threads.
+##
+## The notification state lives behind an Arc. Condvar::wait drops the
+## MutexGuard (its Drop runs — the atomic store releases the lock and the
+## guard's Arc clone is released), polls the notification counter until a
+## notify advances it, then re-acquires the lock through the Arc the guard
+## kept alive — the mutex state can never dangle while the wait is in
+## flight. notify_one/notify_all advance the counter (a notify that races
+## the poll is never lost — the counter monotonicity makes the wait
+## re-check before blocking).
 struct Condvar
-  inner: PthreadCond
+  inner: Arc[CondvarInner]
 end
 
-def Condvar::new() -> Result[Condvar, String]
-  mut cond = Condvar {
-    inner: PthreadCond { data: [0u8; 48] }
-  }
-  
-  let ret = pthread_cond_init(&mut cond.inner, Ptr::null() as Ptr[u8])
-  if ret != 0 then
-    return Result::Err("Failed to initialize condition variable".to_string())
-  end
-  
-  Result::Ok(cond)
+struct CondvarInner
+  notified: AtomicU32
+end
+
+def Condvar::new() -> Condvar
+  Condvar { inner: Arc::new(CondvarInner { notified: AtomicU32::new(0) }) }
 end
 
 def Condvar::wait[T](self: Condvar, guard: MutexGuard[T]) -> MutexGuard[T]
-  # The guard's mutex is unlocked during wait, then re-locked before returning
-  pthread_cond_wait(&self.inner, guard.mutex.as_ref().inner)
-  guard
+  let seen = self.inner.ptr.as_ref().notified.load()
+  let inner = guard.inner.clone()
+  drop(guard)
+  while self.inner.ptr.as_ref().notified.load() == seen do
+    std::thread::yield_now()
+  end
+  let mutex = Mutex { inner: inner }
+  let result = mutex.lock()
+  drop(mutex)
+  result
 end
 
 def Condvar::wait_timeout[T](self: Condvar, guard: MutexGuard[T], timeout: Duration) -> MutexGuard[T]
-  # Calculate absolute timeout
-  let now = Instant::now()
-  let deadline = now + timeout
-  
-  mut ts = Timespec {
-    tv_sec: deadline.secs(),
-    tv_nsec: deadline.subsec_nanos() as i64
-  }
-  
-  pthread_cond_timedwait(&self.inner, guard.mutex.as_ref().inner, &ts as Ptr[Timespec])
-  guard
+  let start = Instant::now()
+  let seen = self.inner.ptr.as_ref().notified.load()
+  let inner = guard.inner.clone()
+  drop(guard)
+  loop do
+    if self.inner.ptr.as_ref().notified.load() != seen then
+      break
+    end
+    if start.elapsed() >= timeout then
+      break
+    end
+    std::thread::yield_now()
+  end
+  let mutex = Mutex { inner: inner }
+  let result = mutex.lock()
+  drop(mutex)
+  result
 end
 
 def Condvar::wait_timeout_ms[T](self: Condvar, guard: MutexGuard[T], ms: Int) -> MutexGuard[T]
@@ -396,158 +337,146 @@ def Condvar::wait_timeout_ms[T](self: Condvar, guard: MutexGuard[T], ms: Int) ->
 end
 
 def Condvar::notify_one(self: Condvar) -> Unit
-  pthread_cond_signal(&self.inner)
+  self.inner.ptr.as_ref().notified.fetch_add(1)
 end
 
 def Condvar::notify_all(self: Condvar) -> Unit
-  pthread_cond_broadcast(&self.inner)
-end
-
-impl Drop for Condvar
-  def drop(inout self: Condvar) -> Unit
-    pthread_cond_destroy(&mut self.inner)
-  end
+  self.inner.ptr.as_ref().notified.fetch_add(1)
 end
 
 # ═══════════════════════════════════════════════════════════════
 # RwLock (Reader-Writer Lock)
 # ═══════════════════════════════════════════════════════════════
 
-## A reader-writer lock allowing multiple readers or one writer
+## A reader-writer lock allowing multiple readers or one writer.
+##
+## The lock state (the reader count + the writer flag) lives in a heap
+## allocation owned by an Arc. The guards hold their own Arc clones — the
+## state stays alive even if the RwLock is dropped or moved while a guard
+## lives. read() increments the reader count; write() sets the writer flag
+## with an atomic swap; each guard's Drop undoes its side of the state and
+## the deinit plan releases the guard's Arc clone.
 struct RwLock[T]
-  inner: PthreadRwlock
-  data: T
+  inner: Arc[RwLockInner[T]]
+end
+
+struct RwLockInner[T]
+  readers: AtomicU32
+  writer: AtomicBool
+  value: T
 end
 
 struct RwLockReadGuard[T]
-  lock: Ptr[RwLock[T]]
+  inner: Arc[RwLockInner[T]]
 end
 
 struct RwLockWriteGuard[T]
-  lock: PtrMut[RwLock[T]]
+  inner: Arc[RwLockInner[T]]
 end
 
-def RwLock::new[T](value: T) -> Result[RwLock[T], String]
-  mut rwlock = RwLock {
-    inner: PthreadRwlock { data: [0u8; 56] },
-    data: value
+def RwLock::new[T](value: T) -> RwLock[T]
+  RwLock {
+    inner: Arc::new(RwLockInner {
+      readers: AtomicU32::new(0),
+      writer: AtomicBool::new(false),
+      value: value
+    })
   }
-  
-  let ret = pthread_rwlock_init(&mut rwlock.inner, Ptr::null() as Ptr[u8])
-  if ret != 0 then
-    return Result::Err("Failed to initialize rwlock".to_string())
-  end
-  
-  Result::Ok(rwlock)
 end
 
-def RwLock::read[T](self: RwLock[T]) -> Option[RwLockReadGuard[T]]
-  let ret = pthread_rwlock_rdlock(&self.inner)
-  if ret != 0 then
-    return Option::None
+def RwLock::read[T](self: RwLock[T]) -> RwLockReadGuard[T]
+  let inner = self.inner.clone()
+  loop do
+    if !inner.ptr.as_ref().writer.load() then
+      inner.ptr.as_ref().readers.fetch_add(1)
+      if !inner.ptr.as_ref().writer.load() then
+        break
+      end
+      # A writer won between the check and the increment — back off
+      inner.ptr.as_ref().readers.fetch_sub(1)
+    end
+    std::thread::yield_now()
   end
-  
-  Option::Some(RwLockReadGuard { lock: self as Ptr[RwLock[T]] })
+  RwLockReadGuard { inner: inner }
 end
 
 def RwLock::try_read[T](self: RwLock[T]) -> Option[RwLockReadGuard[T]]
-  let ret = pthread_rwlock_tryrdlock(&self.inner)
-  if ret != 0 then
+  let inner = self.inner.clone()
+  if inner.ptr.as_ref().writer.load() then
     return Option::None
   end
-  
-  Option::Some(RwLockReadGuard { lock: self as Ptr[RwLock[T]] })
+  inner.ptr.as_ref().readers.fetch_add(1)
+  if inner.ptr.as_ref().writer.load() then
+    inner.ptr.as_ref().readers.fetch_sub(1)
+    return Option::None
+  end
+  Option::Some(RwLockReadGuard { inner: inner })
 end
 
-def RwLock::write[T](inout self: RwLock[T]) -> Option[RwLockWriteGuard[T]]
-  let ret = pthread_rwlock_wrlock(&mut self.inner)
-  if ret != 0 then
-    return Option::None
+def RwLock::write[T](self: RwLock[T]) -> RwLockWriteGuard[T]
+  let inner = self.inner.clone()
+  loop do
+    if !inner.ptr.as_ref().writer.swap(true) then
+      if inner.ptr.as_ref().readers.load() == 0 then
+        break
+      end
+      # Readers are still active — release the writer flag and retry
+      inner.ptr.as_ref().writer.store(false)
+    end
+    std::thread::yield_now()
   end
-  
-  Option::Some(RwLockWriteGuard { lock: self as PtrMut[RwLock[T]] })
+  RwLockWriteGuard { inner: inner }
 end
 
-def RwLock::try_write[T](inout self: RwLock[T]) -> Option[RwLockWriteGuard[T]]
-  let ret = pthread_rwlock_trywrlock(&mut self.inner)
-  if ret != 0 then
+def RwLock::try_write[T](self: RwLock[T]) -> Option[RwLockWriteGuard[T]]
+  let inner = self.inner.clone()
+  if inner.ptr.as_ref().writer.swap(true) then
     return Option::None
   end
-  
-  Option::Some(RwLockWriteGuard { lock: self as PtrMut[RwLock[T]] })
+  if inner.ptr.as_ref().readers.load() != 0 then
+    inner.ptr.as_ref().writer.store(false)
+    return Option::None
+  end
+  Option::Some(RwLockWriteGuard { inner: inner })
 end
 
 impl[T] RwLockReadGuard[T]
+  def get(self: RwLockReadGuard[T]) -> Ptr[T]
+    address_of(&mut self.inner.ptr.as_ref().value) as Ptr[T]
+  end
+  
   def deref(self: RwLockReadGuard[T]) -> Ptr[T]
-    address_of(&mut self.lock.as_ref().data) as Ptr[T]
+    self.get()
   end
 end
 
 impl[T] Drop for RwLockReadGuard[T]
   def drop(inout self: RwLockReadGuard[T]) -> Unit
-    pthread_rwlock_unlock(self.lock.as_ref().inner)
+    self.inner.ptr.as_ref().readers.fetch_sub(1)
   end
 end
 
 impl[T] RwLockWriteGuard[T]
+  def get(self: RwLockWriteGuard[T]) -> Ptr[T]
+    address_of(&mut self.inner.ptr.as_ref().value) as Ptr[T]
+  end
+  
+  def get_mut(inout self: RwLockWriteGuard[T]) -> PtrMut[T]
+    unsafe { address_of_mut(&mut (*self.inner.ptr).value) }
+  end
+  
   def deref(self: RwLockWriteGuard[T]) -> Ptr[T]
-    address_of(&mut self.lock.as_ref().data) as Ptr[T]
+    self.get()
   end
   
   def deref_mut(inout self: RwLockWriteGuard[T]) -> PtrMut[T]
-    unsafe { address_of_mut(&mut (*self.lock).data) }
+    self.get_mut()
   end
 end
 
 impl[T] Drop for RwLockWriteGuard[T]
   def drop(inout self: RwLockWriteGuard[T]) -> Unit
-    pthread_rwlock_unlock(self.lock.as_ref().inner)
-  end
-end
-
-impl[T] Drop for RwLock[T]
-  def drop(inout self: RwLock[T]) -> Unit
-    pthread_rwlock_destroy(&mut self.inner)
-  end
-end
-
-# ═══════════════════════════════════════════════════════════════
-# Barrier
-# ═══════════════════════════════════════════════════════════════
-
-## A synchronization point where multiple threads must all arrive before proceeding
-struct Barrier
-  inner: PthreadBarrier
-  count: Int
-end
-
-struct BarrierWaitResult
-  is_leader: Bool
-end
-
-def Barrier::new(count: Int) -> Result[Barrier, String]
-  mut barrier = Barrier {
-    inner: PthreadBarrier { data: [0u8; 32] },
-    count: count
-  }
-  
-  let ret = pthread_barrier_init(&mut barrier.inner, Ptr::null() as Ptr[u8], count as UInt)
-  if ret != 0 then
-    return Result::Err("Failed to initialize barrier".to_string())
-  end
-  
-  Result::Ok(barrier)
-end
-
-def Barrier::wait(self: Barrier) -> BarrierWaitResult
-  let ret = pthread_barrier_wait(&self.inner)
-  # PTHREAD_BARRIER_SERIAL_THREAD is a special return value for the "leader" thread
-  BarrierWaitResult { is_leader: ret == -1 }  # -1 is PTHREAD_BARRIER_SERIAL_THREAD on some systems
-end
-
-impl Drop for Barrier
-  def drop(inout self: Barrier) -> Unit
-    pthread_barrier_destroy(&mut self.inner)
+    self.inner.ptr.as_ref().writer.store(false)
   end
 end
 
@@ -664,8 +593,8 @@ end
 ## Create a new channel
 def channel[T]() -> (Sender[T], Receiver[T])
   let inner = Arc::new(ChannelInner {
-    queue: Mutex::new(Queue::new()).unwrap(),
-    condvar: Condvar::new().unwrap(),
+    queue: Mutex::new(Queue::new()),
+    condvar: Condvar::new(),
     closed: AtomicBool::new(false)
   })
   
@@ -681,14 +610,10 @@ impl[T] Sender[T]
       return Result::Err("Channel is closed".to_string())
     end
     
-    match self.inner.queue.lock()
-    when Option::Some(mut guard) then
-      guard.enqueue(value)
-      self.inner.condvar.notify_one()
-      Result::Ok(())
-    when Option::None then
-      Result::Err("Failed to lock channel queue".to_string())
-    end
+    let mut guard = self.inner.queue.lock()
+    guard.enqueue(value)
+    self.inner.condvar.notify_one()
+    Result::Ok(())
   end
   
   def close(self: Sender[T]) -> Unit
@@ -709,59 +634,48 @@ end
 
 impl[T] Receiver[T]
   def recv(self: Receiver[T]) -> Option[T]
-    match self.inner.queue.lock()
-    when Option::Some(mut guard) then
-      loop do
-        match guard.dequeue()
-        when Option::Some(v) then return Option::Some(v)
-        when Option::None then
-          if self.inner.closed.load() then
-            return Option::None
-          end
-          guard = self.inner.condvar.wait(guard)
+    let mut guard = self.inner.queue.lock()
+    loop do
+      match guard.dequeue()
+      when Option::Some(v) then return Option::Some(v)
+      when Option::None then
+        if self.inner.closed.load() then
+          return Option::None
         end
+        guard = self.inner.condvar.wait(guard)
       end
-    when Option::None then Option::None
     end
   end
   
   def try_recv(self: Receiver[T]) -> Option[T]
-    match self.inner.queue.lock()
-    when Option::Some(mut guard) then
-      guard.dequeue()
-    when Option::None then Option::None
-    end
+    let mut guard = self.inner.queue.lock()
+    guard.dequeue()
   end
   
   def recv_timeout(self: Receiver[T], timeout: Duration) -> Option[T]
-    match self.inner.queue.lock()
-    when Option::Some(mut guard) then
-      let start = Instant::now()
-      loop do
-        match guard.dequeue()
-        when Option::Some(v) then return Option::Some(v)
-        when Option::None then
-          if self.inner.closed.load() then
-            return Option::None
-          end
-          
-          let elapsed = start.elapsed()
-          if elapsed >= timeout then
-            return Option::None
-          end
-          
-          guard = self.inner.condvar.wait_timeout(guard, timeout - elapsed)
+    let mut guard = self.inner.queue.lock()
+    let start = Instant::now()
+    loop do
+      match guard.dequeue()
+      when Option::Some(v) then return Option::Some(v)
+      when Option::None then
+        if self.inner.closed.load() then
+          return Option::None
         end
+        
+        let elapsed = start.elapsed()
+        if elapsed >= timeout then
+          return Option::None
+        end
+        
+        guard = self.inner.condvar.wait_timeout(guard, timeout - elapsed)
       end
-    when Option::None then Option::None
     end
   end
   
   def is_empty(self: Receiver[T]) -> Bool
-    match self.inner.queue.lock()
-    when Option::Some(guard) then guard.is_empty()
-    when Option::None then true
-    end
+    let guard = self.inner.queue.lock()
+    guard.is_empty()
   end
 end
 
@@ -830,27 +744,20 @@ end
 def Lazy::new[T](init: fn() -> T) -> Lazy[T]
   Lazy {
     once: Once::new(),
-    value: Mutex::new(Option::None).unwrap(),
+    value: Mutex::new(Option::None),
     init: init
   }
 end
 
 def Lazy::get[T](self: Lazy[T]) -> Ptr[T]
   self.once.call_once(|| {
-    match self.value.lock()
-    when Option::Some(mut guard) then
-      *(guard.deref_mut()) = Option::Some((self.init)())
-    when Option::None then ()
-    end
+    let mut guard = self.value.lock()
+    *(guard.deref_mut()) = Option::Some((self.init)())
   })
   
-  match self.value.lock()
-  when Option::Some(guard) then
-    # Safe because we know the value is Some after initialization
-    guard.deref() as Ptr[T]
-  when Option::None then
-    panic("Lazy value lock failed")
-  end
+  let guard = self.value.lock()
+  # Safe because we know the value is Some after initialization
+  guard.deref() as Ptr[T]
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -931,6 +838,12 @@ end
 
 impl[T] Transferable for Mutex[T] {}
 impl[T] Shareable for Mutex[T] {}
+
+impl[T] Transferable for RwLock[T] {}
+impl[T] Shareable for RwLock[T] {}
+
+impl Transferable for Condvar {}
+impl Shareable for Condvar {}
 
 impl[T] Transferable for Sender[T] {}
 impl[T] Shareable for Sender[T] {}

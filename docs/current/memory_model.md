@@ -89,7 +89,7 @@ so a function's type records how it accesses each argument.
 Sources of a convention:
 
 - Explicit keywords on parameters and receivers: `def f(inout x: T)`, a
-  trailing `inout` receiver marker (`def m(self: Self) ... inout`), `sink`,
+  trailing `inout` receiver marker (`def m(self: Self) -> Unit inout`), `sink`,
   `set`. `let` is the default for parameters without a modifier.
 - Legacy parameter modifiers are **REJECTED, never normalized** (round-9):
   `mut x:` / `&x:` / `&mut x:` / `move x:` / `own x:` prefixes and the
@@ -139,7 +139,7 @@ struct fields, variable annotations, tuple members, generic arguments,
 container elements — is **not a first-class type** and is **rejected**. The
 parser (`parse_type` in `parser.tg`) records an error-level diagnostic:
 
-```
+```text
 E106: safe reference types are not first-class; use a parameter access
       convention / access operation
 ```
@@ -225,7 +225,7 @@ Consumed | MaybeLive`. Frames are keyed by the semantic `LocalId`
 Destruction follows **one protocol, exactly once**:
 
 1. **User hook first**: the `deinit(sink self)` method (or the trait
-   `Drop::drop(self: &mut Self)`) may inspect and mutate the subject, but
+   `Drop::drop(inout self: Self)`) may inspect and mutate the subject, but
    never consume it or its owned fields.
 2. **Structural cleanup after**: the compiler destroys still-live owned
    fields, exactly once, in the order the MIR deinit planner computed
@@ -235,7 +235,7 @@ The finalizer's subject is **compiler-owned**: `mark_finalizer_self`
 registers it with the `DeinitSelf` permission origin, so the hook body is
 checked with permissions that make consumption impossible:
 
-```
+```text
 cannot consume resource `x`: a finalizer must not consume its own subject
 (compiler-owned structural cleanup)
 ```
@@ -281,7 +281,7 @@ still rejected** — the root-level frame cannot prove the field's
 storage is dead, so the consume/initialize rules fail closed at
 root-granularity:
 
-```
+```text
 cannot consume a projected place: partial moves are not yet supported
 cannot move out of a projected place: partial moves are not yet supported
 cannot assign over an owning projected place: exact-place replacement is
@@ -307,7 +307,7 @@ transferred, delegated, or explicitly consumed by a capability operation.
 auto-deinit at scope exit is not an acceptable way to dispose of
 authority:
 
-```
+```text
 capability `x` must be returned, transferred, delegated, or explicitly
 consumed before function exit (authority cannot be silently discarded)
 ```
@@ -637,7 +637,7 @@ clone. The projected-iteration guard (`check_iter_binding_escape`) is the
 authority that the binding cannot move out of the loop body, cannot be
 captured by a closure escaping the iteration, etc.:
 
-```
+```text
 cannot move the iteration binding out of the loop body under projected
 iteration (consuming iteration is not supported yet)
 ```

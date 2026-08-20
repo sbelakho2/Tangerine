@@ -36,7 +36,7 @@ use tg_compiler::asm::{
   a64_svc, a64_udf, a64_nop, a64_lsl, a64_lsl_rrr,
   a64_sdiv_rrr, a64_udiv, a64_msub, a64_csel, a64_add_rrr_lsl, a64_lsr,
   a64_cc_eq, a64_cc_ne, a64_cc_lt, a64_cc_le, a64_cc_gt, a64_cc_ge, a64_cc_cs, a64_cc_cc,
-  a64_neg, a64_code, CC
+  a64_neg, a64_code, x64_code, CC
 }
 # The canonical Map/Set header table (MAP_HEADER_FIELDS in layout_engine.tg)
 # is the single machine-readable layout authority: the runtime emits its
@@ -9179,6 +9179,55 @@ end
 # Memory Runtime Implementation
 # ———————————————————————————————————————————————————————————————
 
+# ———————————————————————————————————————————————————————————————
+# _tg_alloc_outstanding accounting — the ONE atomic authority
+# ———————————————————————————————————————————————————————————————
+# The live-byte counter is updated ONLY through the atomic fetch-add
+# forms of the atomic layer — the SAME instructions codegen emits for
+# __intrinsic_atomic_fetch_add_u64 (aarch64 LDADDAL, x86 lock XADD).
+# The per-size-class locks serialize the free-list heads, NOT the
+# counter (the large path is lock-free, and two classes' locks never
+# protect a single global), so a plain load/add/store would lose
+# updates under concurrent allocations; the RMW below is atomic on
+# every path.
+
+# AArch64: ldaddal delta, xzr, [addr] — the result is discarded (XZR
+# destination); delta and addr survive.
+def rt_outstanding_add_a64(inout ctx: RuntimeEmitCtx, addr: A64, delta: A64) -> Unit
+  emit32_le(&mut ctx.text, 0xF8E00000 | (a64_code(delta) << 16) | (a64_code(addr) << 5) | a64_code(A64::XZR))
+end
+
+# AArch64: the subtraction is the atomic add of -delta (negated into
+# the caller's scratch register; the result is discarded).
+def rt_outstanding_sub_a64(inout ctx: RuntimeEmitCtx, addr: A64, delta: A64, scratch: A64) -> Unit
+  a64_neg(&mut ctx.text, scratch, delta)
+  emit32_le(&mut ctx.text, 0xF8E00000 | (a64_code(scratch) << 16) | (a64_code(addr) << 5) | a64_code(A64::XZR))
+end
+
+# x86-64: lock xadd [addr], delta (64-bit; REX.R for the r8-r15 delta
+# registers). The delta register receives the OLD value (discarded) —
+# the delta must be dead after the call. addr is a plain [addr]
+# register form (never RSP/RBP-relative).
+def rt_outstanding_add_x64(inout ctx: RuntimeEmitCtx, addr: X64, delta: X64) -> Unit
+  # REX.W + REX.R for the r8-r15 delta registers.
+  if x64_code(delta) >= 8 then
+    emit8(&mut ctx.text, 0x49)
+  else
+    emit8(&mut ctx.text, 0x48)
+  end
+  emit8(&mut ctx.text, 0x0F)
+  emit8(&mut ctx.text, 0xC1)
+  emit8(&mut ctx.text, ((x64_code(delta) & 0x07) << 3) | (x64_code(addr) & 0x07))
+end
+
+# x86-64: negate the delta into the caller's scratch register, then
+# lock xadd (the delta register survives; the scratch is consumed).
+def rt_outstanding_sub_x64(inout ctx: RuntimeEmitCtx, addr: X64, delta: X64, scratch: X64) -> Unit
+  x64_mov_rr(&mut ctx.text, scratch, delta)
+  x64_neg_r(&mut ctx.text, scratch)
+  rt_outstanding_add_x64(ctx, addr, scratch)
+end
+
 def emit_memory_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_tg_mem_alloc(ctx)
   emit_tg_mem_free(ctx)
@@ -9227,7 +9276,11 @@ end
 #   returns 0 without calling mmap (deterministic OOM simulation for
 #   tests). The _tg_alloc_outstanding counter tracks live payload bytes
 #   (alloc += size; free -= size — free-list blocks count as freed at the
-#   moment they are linked in); _tg_allocator_outstanding_bytes() reads it.
+#   moment they are linked in). The counter is updated ONLY through the
+#   atomic fetch-add/sub (rt_outstanding_add/sub_* — LDADDAL / lock
+#   XADD), so the accounting is correct under concurrent allocations
+#   from different size classes; _tg_allocator_outstanding_bytes() reads
+#   it.
 def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_mem_alloc")
 
@@ -9267,14 +9320,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_mov_ri(&mut ctx.text, A64::X9, 1)
       a64_str(&mut ctx.text, A64::X9, A64::X0, 0)   # marker = 1
       a64_str(&mut ctx.text, A64::X20, A64::X0, 8)  # total
-      # outstanding += total
+      # outstanding += total (X20) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X20)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X20)
       a64_add_rri(&mut ctx.text, A64::X0, A64::X0, 16)
       a64_b(&mut ctx.text, win_done.clone())
 
@@ -9329,8 +9380,10 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_b(&mut ctx.text, class_loop_label.clone())
       def_label(&mut ctx.text, class_done_label.clone())
 
-      # Per-size-class lock: serialize the free-list head pop/push (and
-      # the outstanding accounting) of this class across threads. X23
+      # Per-size-class lock: serialize the free-list head pop/push of
+      # this class across threads (the outstanding counter is updated
+      # atomically — see rt_outstanding_add_a64 — the lock protects only
+      # the head RMW). X23
       # (idx) is callee-saved and survives the call.
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_lock")
@@ -9361,14 +9414,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_sub_rri(&mut ctx.text, A64::X10, A64::X10, 8)
       a64_b(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
-      # outstanding += class (X24)
+      # outstanding += class (X24) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X24)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X24)
       a64_lsr(&mut ctx.text, A64::X23, A64::X23, 3)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_unlock")
@@ -9393,13 +9444,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_sub_rri(&mut ctx.text, A64::X10, A64::X10, 8)
       a64_b(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
+      # outstanding += class (X24) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X24)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X24)
       a64_lsr(&mut ctx.text, A64::X23, A64::X23, 3)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_unlock")
@@ -9439,14 +9489,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_mov_ri(&mut ctx.text, A64::X9, 1)
       a64_str(&mut ctx.text, A64::X9, A64::X0, 0)   # marker = 1
       a64_str(&mut ctx.text, A64::X21, A64::X0, 8)  # total
-      # outstanding += total (X21)
+      # outstanding += total (X21) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X21)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X21)
       a64_add_rri(&mut ctx.text, A64::X0, A64::X0, 16)
       a64_b(&mut ctx.text, done_label.clone())
 
@@ -9504,8 +9552,10 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_b(&mut ctx.text, class_loop_label.clone())
       def_label(&mut ctx.text, class_done_label.clone())
 
-      # Per-size-class lock: serialize the free-list head pop/push (and
-      # the outstanding accounting) of this class across threads. X23
+      # Per-size-class lock: serialize the free-list head pop/push of
+      # this class across threads (the outstanding counter is updated
+      # atomically — see rt_outstanding_add_a64 — the lock protects only
+      # the head RMW). X23
       # (idx) is callee-saved and survives the call.
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_lock")
@@ -9536,14 +9586,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_sub_rri(&mut ctx.text, A64::X10, A64::X10, 8)
       a64_b(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
-      # outstanding += class (X24)
+      # outstanding += class (X24) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X24)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X24)
       a64_lsr(&mut ctx.text, A64::X23, A64::X23, 3)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_unlock")
@@ -9568,13 +9616,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_sub_rri(&mut ctx.text, A64::X10, A64::X10, 8)
       a64_b(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
+      # outstanding += class (X24) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X24)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X24)
       a64_lsr(&mut ctx.text, A64::X23, A64::X23, 3)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X23)
       a64_bl(&mut ctx.text, "_tg_alloc_unlock")
@@ -9614,14 +9661,12 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       a64_mov_ri(&mut ctx.text, A64::X9, 1)
       a64_str(&mut ctx.text, A64::X9, A64::X0, 0)   # marker = 1
       a64_str(&mut ctx.text, A64::X21, A64::X0, 8)  # total
-      # outstanding += total (X21)
+      # outstanding += total (X21) — the atomic fetch-add (LDADDAL).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X10, A64::X11, 0)
-      a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X21)
-      a64_str(&mut ctx.text, A64::X10, A64::X11, 0)
+      rt_outstanding_add_a64(ctx, A64::X11, A64::X21)
       a64_add_rri(&mut ctx.text, A64::X0, A64::X0, 16)
       a64_b(&mut ctx.text, done_label.clone())
 
@@ -9671,15 +9716,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_mov_ri(&mut ctx.text, X64::RCX, 1)
       x64_mov_mr(&mut ctx.text, X64::R12, 0, X64::RCX)   # marker = 1
       x64_mov_mr(&mut ctx.text, X64::R12, 8, X64::RBX)   # total
-      # outstanding += total (RBX)
+      # outstanding += total (RBX) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::RBX)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::RBX)
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R12)
       x64_add_ri(&mut ctx.text, X64::RAX, 16)
       x64_jmp(&mut ctx.text, win_done.clone())
@@ -9737,8 +9780,10 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_jmp(&mut ctx.text, class_loop_label.clone())
       def_label(&mut ctx.text, class_done_label.clone())
       x64_mov_rr(&mut ctx.text, X64::R12, X64::RDX)  # class size
-      # Per-size-class lock: serialize the free-list head pop/push (and
-      # the outstanding accounting) of this class across threads. The
+      # Per-size-class lock: serialize the free-list head pop/push of
+      # this class across threads (the outstanding counter is updated
+      # atomically — see rt_outstanding_add_x64 — the lock protects only
+      # the head RMW). The
       # idx is preserved in R15 (callee-saved) across the call.
       x64_mov_rr(&mut ctx.text, X64::R15, X64::RCX)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::RCX)
@@ -9775,15 +9820,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_sub_ri(&mut ctx.text, X64::RBX, 8)
       x64_jmp(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
-      # outstanding += class (R12)
+      # outstanding += class (R12) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::R12)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
       x64_call_label(&mut ctx.text, "_tg_alloc_unlock")
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
@@ -9811,14 +9854,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_sub_ri(&mut ctx.text, X64::RBX, 8)
       x64_jmp(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
+      # outstanding += class (R12) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::R12)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
       x64_call_label(&mut ctx.text, "_tg_alloc_unlock")
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
@@ -9860,15 +9902,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)   # marker = 1
       x64_mov_mr(&mut ctx.text, X64::RAX, 8, X64::RSI)   # total
       x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)  # base
-      # outstanding += total (RSI)
+      # outstanding += total (RSI) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::RSI)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::RSI)
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
       x64_add_ri(&mut ctx.text, X64::RAX, 16)
       x64_jmp(&mut ctx.text, done_label.clone())
@@ -9930,8 +9970,10 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_jmp(&mut ctx.text, class_loop_label.clone())
       def_label(&mut ctx.text, class_done_label.clone())
       x64_mov_rr(&mut ctx.text, X64::R12, X64::RDX)  # class size
-      # Per-size-class lock: serialize the free-list head pop/push (and
-      # the outstanding accounting) of this class across threads. The
+      # Per-size-class lock: serialize the free-list head pop/push of
+      # this class across threads (the outstanding counter is updated
+      # atomically — see rt_outstanding_add_x64 — the lock protects only
+      # the head RMW). The
       # idx is preserved in R15 (callee-saved) across the call.
       x64_mov_rr(&mut ctx.text, X64::R15, X64::RCX)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::RCX)
@@ -9968,15 +10010,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_sub_ri(&mut ctx.text, X64::RBX, 8)
       x64_jmp(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
-      # outstanding += class (R12)
+      # outstanding += class (R12) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::R12)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
       x64_call_label(&mut ctx.text, "_tg_alloc_unlock")
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
@@ -10004,14 +10044,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_sub_ri(&mut ctx.text, X64::RBX, 8)
       x64_jmp(&mut ctx.text, zero_loop_label.clone())
       def_label(&mut ctx.text, zero_done_label.clone())
+      # outstanding += class (R12) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::R12)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::R12)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R15)
       x64_call_label(&mut ctx.text, "_tg_alloc_unlock")
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
@@ -10053,15 +10092,13 @@ def emit_tg_mem_alloc(inout ctx: RuntimeEmitCtx) -> Unit
       x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)   # marker = 1
       x64_mov_mr(&mut ctx.text, X64::RAX, 8, X64::RSI)   # total
       x64_mov_rr(&mut ctx.text, X64::R14, X64::RAX)  # base
-      # outstanding += total (RSI)
+      # outstanding += total (RSI) — the atomic fetch-add (lock xadd).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RDX, X64::RAX, 0)
-      x64_add_rr(&mut ctx.text, X64::RDX, X64::RSI)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+      rt_outstanding_add_x64(ctx, X64::RAX, X64::RSI)
       x64_mov_rr(&mut ctx.text, X64::RAX, X64::R14)
       x64_add_ri(&mut ctx.text, X64::RAX, 16)
       x64_jmp(&mut ctx.text, done_label.clone())
@@ -10087,7 +10124,8 @@ end
 # VirtualFree/HeapFree with the total from header[8]); marker 0 = small
 # block (link into the per-class LIFO free list, class from header[8]).
 # The free list's blocks count as freed for the outstanding-bytes
-# accounting (outstanding -= class/total at the moment of the link).
+# accounting (outstanding -= class/total at the moment of the link,
+# through the atomic fetch-sub — rt_outstanding_sub_*).
 # Blocks that do not carry a valid allocator header (foreign buffers the
 # String wrapper adopted, or foreign allocations) are skipped — the
 # historical no-op — and are NEVER linked into a free list.
@@ -10109,14 +10147,12 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       # path always writes the {1, total} header, so marker 0 here is an
       # unrecognized block and is skipped (never linked into a free list).
       a64_ldr(&mut ctx.text, A64::X11, A64::X9, 8)       # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (LDADDAL of -total).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X12))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X12, A64::X12, 0)
-      a64_ldr(&mut ctx.text, A64::X13, A64::X12, 0)
-      a64_sub_rrr(&mut ctx.text, A64::X13, A64::X13, A64::X11)
-      a64_str(&mut ctx.text, A64::X13, A64::X12, 0)
+      rt_outstanding_sub_a64(ctx, A64::X12, A64::X11, A64::X13)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)
       a64_mov_ri(&mut ctx.text, A64::X1, 0)              # dwSize = 0 (MEM_RELEASE)
       a64_mov_ri(&mut ctx.text, A64::X2, 0x8000)         # MEM_RELEASE
@@ -10136,14 +10172,12 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       a64_bcond(&mut ctx.text, a64_cc_ne(), small_label.clone())
       # Large: munmap(base, total) — the pair of the large alloc above.
       a64_ldr(&mut ctx.text, A64::X1, A64::X9, 8)        # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (LDADDAL of -total).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X12, A64::X11, 0)
-      a64_sub_rrr(&mut ctx.text, A64::X12, A64::X12, A64::X1)
-      a64_str(&mut ctx.text, A64::X12, A64::X11, 0)
+      rt_outstanding_sub_a64(ctx, A64::X11, A64::X1, A64::X12)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)
       a64_mov_ri(&mut ctx.text, A64::X16, 73)            # munmap
       a64_svc(&mut ctx.text, 0x80)
@@ -10174,22 +10208,21 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       a64_b(&mut ctx.text, cl_label.clone())
       def_label(&mut ctx.text, cr_label.clone())
       # Per-size-class lock: preserve idx/class in the callee-saved pair
-      # and take the class lock BEFORE the outstanding accounting and the
-      # head push (the lock serializes the head RMW across threads).
+      # and take the class lock BEFORE the head push (the lock
+      # serializes the head RMW across threads; the outstanding counter
+      # is updated atomically — rt_outstanding_sub_a64).
       a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
       a64_mov_rr(&mut ctx.text, A64::X19, A64::X13)      # idx
       a64_mov_rr(&mut ctx.text, A64::X20, A64::X12)      # class
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X13)
       a64_bl(&mut ctx.text, "_tg_alloc_lock")
-      # outstanding -= class (under the lock)
+      # outstanding -= class — the atomic fetch-sub (LDADDAL of -class).
       a64_mov_rr(&mut ctx.text, A64::X12, A64::X20)
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X13, A64::X11, 0)
-      a64_sub_rrr(&mut ctx.text, A64::X13, A64::X13, A64::X12)
-      a64_str(&mut ctx.text, A64::X13, A64::X11, 0)
+      rt_outstanding_sub_a64(ctx, A64::X11, A64::X12, A64::X13)
       # X15 = &_tg_alloc_free_heads[idx]
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_free_heads".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X15))
@@ -10224,14 +10257,12 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       a64_bcond(&mut ctx.text, a64_cc_ne(), small_label.clone())
       # Large: munmap(base, total) — the pair of the large alloc above.
       a64_ldr(&mut ctx.text, A64::X1, A64::X9, 8)        # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (LDADDAL of -total).
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X12, A64::X11, 0)
-      a64_sub_rrr(&mut ctx.text, A64::X12, A64::X12, A64::X1)
-      a64_str(&mut ctx.text, A64::X12, A64::X11, 0)
+      rt_outstanding_sub_a64(ctx, A64::X11, A64::X1, A64::X12)
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X9)
       a64_mov_ri(&mut ctx.text, A64::X8, 215)            # munmap
       a64_svc(&mut ctx.text, 0)
@@ -10262,22 +10293,21 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       a64_b(&mut ctx.text, cl_label.clone())
       def_label(&mut ctx.text, cr_label.clone())
       # Per-size-class lock: preserve idx/class in the callee-saved pair
-      # and take the class lock BEFORE the outstanding accounting and the
-      # head push (the lock serializes the head RMW across threads).
+      # and take the class lock BEFORE the head push (the lock
+      # serializes the head RMW across threads; the outstanding counter
+      # is updated atomically — rt_outstanding_sub_a64).
       a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
       a64_mov_rr(&mut ctx.text, A64::X19, A64::X13)      # idx
       a64_mov_rr(&mut ctx.text, A64::X20, A64::X12)      # class
       a64_mov_rr(&mut ctx.text, A64::X0, A64::X13)
       a64_bl(&mut ctx.text, "_tg_alloc_lock")
-      # outstanding -= class (under the lock)
+      # outstanding -= class — the atomic fetch-sub (LDADDAL of -class).
       a64_mov_rr(&mut ctx.text, A64::X12, A64::X20)
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_outstanding".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X11))
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_alloc_outstanding".to_string(), 0)
       a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 0)
-      a64_ldr(&mut ctx.text, A64::X13, A64::X11, 0)
-      a64_sub_rrr(&mut ctx.text, A64::X13, A64::X13, A64::X12)
-      a64_str(&mut ctx.text, A64::X13, A64::X11, 0)
+      rt_outstanding_sub_a64(ctx, A64::X11, A64::X12, A64::X13)
       # X15 = &_tg_alloc_free_heads[idx]
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_alloc_free_heads".to_string(), 0)
       emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X15))
@@ -10318,15 +10348,13 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       # alloc path always writes the {1, total} header, so marker 0 here
       # is an unrecognized block and is skipped.
       x64_mov_rm(&mut ctx.text, X64::RSI, X64::RBX, 8)   # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (lock xadd of -total).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
-      x64_sub_rr(&mut ctx.text, X64::RCX, X64::RSI)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+      rt_outstanding_sub_x64(ctx, X64::RAX, X64::RSI, X64::RCX)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::RBX)
       x64_call_extern(&mut ctx.text, "GetProcessHeap")
       x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)      # heap
@@ -10351,15 +10379,13 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       x64_jcc(&mut ctx.text, CC::NE, small_label.clone())
       # Large: munmap(base, total) — the pair of the large alloc above.
       x64_mov_rm(&mut ctx.text, X64::RSI, X64::R9, 8)    # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (lock xadd of -total).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
-      x64_sub_rr(&mut ctx.text, X64::RCX, X64::RSI)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+      rt_outstanding_sub_x64(ctx, X64::RAX, X64::RSI, X64::RCX)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R9)
       x64_mov_ri(&mut ctx.text, X64::RAX, 0x2000049)
       x64_syscall(&mut ctx.text)
@@ -10398,15 +10424,13 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       x64_call_label(&mut ctx.text, "_tg_alloc_lock")
       x64_pop(&mut ctx.text, X64::R8)
       x64_pop(&mut ctx.text, X64::RCX)
-      # outstanding -= class (under the lock)
+      # outstanding -= class — the atomic fetch-sub (lock xadd of -class).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
-      x64_sub_rr(&mut ctx.text, X64::RCX, X64::R8)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+      rt_outstanding_sub_x64(ctx, X64::RAX, X64::R8, X64::RDX)
       # RAX = &_tg_alloc_free_heads[idx]
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
@@ -10444,15 +10468,13 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       x64_jcc(&mut ctx.text, CC::NE, small_label.clone())
       # Large: munmap(base, total) — the pair of the large alloc above.
       x64_mov_rm(&mut ctx.text, X64::RSI, X64::R9, 8)    # total
-      # outstanding -= total
+      # outstanding -= total — the atomic fetch-sub (lock xadd of -total).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
-      x64_sub_rr(&mut ctx.text, X64::RCX, X64::RSI)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+      rt_outstanding_sub_x64(ctx, X64::RAX, X64::RSI, X64::RCX)
       x64_mov_rr(&mut ctx.text, X64::RDI, X64::R9)
       x64_mov_ri(&mut ctx.text, X64::RAX, 11)
       x64_syscall(&mut ctx.text)
@@ -10491,15 +10513,13 @@ def emit_tg_mem_free(inout ctx: RuntimeEmitCtx) -> Unit
       x64_call_label(&mut ctx.text, "_tg_alloc_lock")
       x64_pop(&mut ctx.text, X64::R8)
       x64_pop(&mut ctx.text, X64::RCX)
-      # outstanding -= class (under the lock)
+      # outstanding -= class — the atomic fetch-sub (lock xadd of -class).
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)
       emit8(&mut ctx.text, 0x05)
       add_reloc(&mut ctx.text, RelocKind::R_X86_64_PC32, "_tg_alloc_outstanding".to_string(), -4)
       emit32_le(&mut ctx.text, 0)
-      x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
-      x64_sub_rr(&mut ctx.text, X64::RCX, X64::R8)
-      x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+      rt_outstanding_sub_x64(ctx, X64::RAX, X64::R8, X64::RDX)
       # RAX = &_tg_alloc_free_heads[idx]
       emit8(&mut ctx.text, 0x48)
       emit8(&mut ctx.text, 0x8D)

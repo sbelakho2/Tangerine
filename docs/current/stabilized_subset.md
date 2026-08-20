@@ -48,7 +48,7 @@ it. HashMap/HashSet are name-level aliases of Map/Set (same Repr, same header).
 - **Alignment**: max of tag (8) and max payload field
 - **Total size**: aligned to max alignment
 
-```
+```text
 +------------------+------------------+
 | Tag (8 bytes)    | Payload...       |
 +------------------+------------------+
@@ -71,7 +71,7 @@ there is no `*const T` / `*mut T` spelling in the dialect.
 ## F5: Fat-Value Layout (FROZEN)
 
 The fat-value forms (a 16-byte `{ptr, len}` pair — StrView, Slice):
-```
+```text
 +------------------+------------------+
 | Data Pointer (8) | Length (8)       |
 +------------------+------------------+
@@ -191,7 +191,7 @@ All frozen values are defined in:
 ```tangerine
 use tg_compiler::layout_engine::{
   container_header_size, container_field_offset,
-  discriminant_offset, discriminant_size, payload_offset
+  discriminant_offset, discriminant_size, payload_offset, string_abi_size
 }
 
 # Get String ABI size (F2 - FROZEN)
@@ -199,10 +199,10 @@ use tg_compiler::layout_engine::{
 let str_size = string_abi_size()  # 8
 
 # Get Vec.len offset (F2 - FROZEN)
-let len_off = container_field_offset(&"Vec".to_string(), &"length".to_string())  # 8
+let len_off = container_field_offset("Vec".to_string(), "length".to_string())  # 8
 
 # Get enum tag offset (F3 - FROZEN)
-let tag_off = discriminant_offset(&engine, type_id)  # 0
+let tag_off = discriminant_offset(engine, type_id)  # 0
 ```
 
 ### Bug Classification

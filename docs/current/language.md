@@ -10,6 +10,17 @@ Tangerine is a systems programming language that combines:
 
 ## Basic Syntax
 
+> **Doctest discipline.** Every ` ```tangerine ` (and unlabeled) fenced block
+> in the six doctested documents (`language.md`, `grammar.md`,
+> `memory_model.md`, `stabilized_subset.md`, `feature_matrix.md`,
+> `feature_registry.md`) is checked by `scripts/check_doctests.sh`: an
+> unannotated block must be free of every forbidden legacy form (E100/E106)
+> and, when a current compiler binary exists, must compile; a block that
+> intentionally demonstrates a rejection is annotated `compile_fail: <the
+> expected diagnostic substring>` on its first line, and the script verifies
+> that substring against the compiler's diagnostic text. See
+> `scripts/check_doctests.sh` for the exact convention.
+
 ### Comments
 
 ```tangerine
@@ -277,18 +288,24 @@ println(x)  # OK: x is still valid
 ### Access Conventions
 
 Every parameter and receiver carries an explicit access convention. The
-default (no prefix) is `let` — the argument is observed by value; `inout`,
-`sink`, and `set` are declared with a keyword prefix:
+default (no prefix) is `let` — the argument is **observed** (read-only
+access, no move); `inout`, `sink`, and `set` are declared with a keyword
+prefix:
 
 | Convention | Meaning |
 |------------|---------|
-| `let` (default) | observe the value (by-value move; reads are Copy-bound accessors) |
-| `inout` | exclusive mutation — the callee may read and write the caller's place |
-| `sink` | transfer/consume — ownership moves into the callee |
-| `set` | initialize dead storage — the callee writes into an uninitialized place |
+| `let` (default) | **observe** — read-only access to the caller's value: no move, no consume, never finalized by the callee (Read) |
+| `inout` | exclusive mutation — the callee may read and write the caller's place (Modify) |
+| `sink` | **by-value move** — ownership transfers into the callee (Consume); the callee finalizes it if still live |
+| `set` | initialize dead storage — the callee writes into an uninitialized place (Initialize) |
+
+The distinction is critical: **`let` observes; `sink` moves.** A `let`
+parameter sees the caller's value without taking it (reads of a String
+parameter are Copy-bound accessors or views), so the caller keeps its
+value. Only `sink` transfers ownership — the caller's binding is consumed.
 
 ```tangerine
-def observe(x: Int) -> Int        # let (default): by value
+def observe(x: Int) -> Int        # let (default): observe — no move
   x * 2
 end
 
@@ -340,7 +357,18 @@ let s2 = s1   # moved
 # `move` / `copy` unary prefixes are accepted as legacy no-ops
 # (grammar §4.1); parameter-prefix `move`/`own` are REJECTED (E100)
 # — write `sink` instead.
-def take_ownership(s: sink String) -> Unit
+def take_ownership(sink s: String) -> Unit
+  # s is consumed here
+end
+```
+
+An example that intentionally demonstrates a rejection is annotated on
+its first line with `compile_fail: <the expected diagnostic substring>`
+and machine-checked by `scripts/check_doctests.sh`:
+
+```tangerine
+# compile_fail: legacy parameter spelling
+def take_ownership_legacy(move s: String) -> Unit
   # s is consumed here
 end
 ```
@@ -602,11 +630,14 @@ def sqrt(x: Float) -> Float
   # implementation
 end
 
-# Invariants (for structs)
+# Invariants — contract clauses live on functions (the parser has no
+# struct-level invariant clause; declare a checking method instead)
 struct BankAccount
   balance: Float
-  
-  invariant self.balance >= 0.0, "balance must be non-negative"
+
+  def check_invariant(self) -> Unit
+    invariant self.balance >= 0.0, "balance must be non-negative"
+  end
 end
 ```
 
@@ -728,10 +759,13 @@ def process_with_logging(data: String) -> String
   result
 end
 
-# Handle effects
-handle process_with_logging("input")
-with Logger
-  log(level, msg) => println("[{}] {}", level, msg)
+# Handle effects (handle is a keyword; the expression is legal in
+# statement position inside a function body)
+def run_handled() -> Unit
+  handle process_with_logging("input")
+  with Logger
+    log(level, msg) => println("[{}] {}", level, msg)
+  end
 end
 ```
 
@@ -746,9 +780,10 @@ pending (see the ModeConfig table in §"Progressive Strictness"). The
 declared surface:
 
 ```tangerine
-# Budget clause
+# Budget clause (bounds are string literals; enforcement is NOT
+# implemented — see the note above)
 def expensive_operation() -> Result[Data, Error]
-  budget time_ms: 5000, alloc_bytes: 104857600
+  budget time_ms: "5000", alloc_bytes: "104857600"
   
   # implementation with resource tracking
 end
@@ -822,9 +857,11 @@ extern "C" def read_input() -> Tainted[String]
 # let name = read_input()   # ERROR: expected String, got Tainted[String]
 
 # Must validate first:
-let raw = read_input()
-let validator = MaxLengthValidator { max_len: 255 }
-let clean_name = validate(raw, validator)?   # Ok(String) or Err(ValidationError)
+def read_user_input() -> Result[String, ValidationError]
+  let raw = read_input()
+  let validator = MaxLengthValidator { max_len: 255 }
+  validate(raw, validator)  # Ok(String) or Err(ValidationError)
+end
 ```
 
 ### Taint Labels
@@ -942,9 +979,12 @@ let ver = semver_parse("1.2.3-beta.1")?
 let lockfile = lockfile_parse(contents)?
 lockfile_verify(&lockfile)?
 
-# Reproducible build verification
-let manifest = BuildManifest { source_hash: "abc...", ... }
-verify_reproducible(&manifest)?
+# Reproducible build verification (fields are illustrative)
+let manifest = BuildManifest {
+  build_id: "abc...",
+  compiler_version: "0.1.0",
+}
+verify_reproducible(&manifest, "expected-output-hash")
 
 # Trust score computation
 let graph = build_trust_graph(packages)?
@@ -1051,14 +1091,14 @@ See `tg_compiler/symbol_graph.tg` for the graph engine,
 ```tangerine
 # Async function
 async def fetch_data(url: String) -> Result[String, Error]
-  let response = http_get(url).await?
-  let body = response.text().await?
+  let response = (await http_get(url))?
+  let body = (await response.text())?
   Result::Ok(body)
 end
 
 # Running async code
 async def main() -> Unit
-  let data = fetch_data("https://example.com").await
+  let data = await fetch_data("https://example.com")
   match data
   when Result::Ok(s) then println(s)
   when Result::Err(e) then println("Error: {}", e)
@@ -1068,7 +1108,7 @@ end
 # Concurrent execution
 async def fetch_all(urls: [String]) -> Vec[String]
   let futures = urls.iter().map(|url| fetch_data(url))
-  join_all(futures).await
+  await join_all(futures)
 end
 ```
 
@@ -1128,7 +1168,7 @@ unsafe "raw pointer manipulation"
 end
 
 # Unsafe function
-unsafe def raw_copy(src: RawPtr, dst: RawPtr, len: Int) -> Unit
+unsafe def raw_copy(src: PtrMut[u8], dst: PtrMut[u8], len: Int) -> Unit
   # ...
 end
 ```
@@ -1140,9 +1180,10 @@ Tangerine provides comprehensive FFI support for C, Rust, and Ruby interoperabil
 ### C Interop
 
 ```tangerine
-# Export function to C
+# Export function to C (an exported function is an ordinary def; an
+# `extern` declaration never carries a body)
 @export("my_add")
-extern "C" def add(a: i32, b: i32) -> i32
+def add(a: i32, b: i32) -> i32
   a + b
 end
 
@@ -1214,15 +1255,16 @@ For complete FFI documentation, see:
 const MAX_SIZE: Int = 1024
 const PI: Float = 3.14159265359
 
-# Compile-time computation
-comptime
-  let table = build_lookup_table()
+# Compile-time computation (a comptime block is an expression — it goes
+# inside a function body, not at item level)
+def build_table() -> Unit
+  comptime
+    let table = build_lookup_table()
+  end
 end
 
-# Conditional compilation
-edition 2026
-  # Use new syntax
-end
+# Conditional compilation / edition pinning (the edition is a string)
+edition "2026"
 ```
 
 ## Generics
@@ -1350,11 +1392,12 @@ struct Config
   port: Int
 end
 
-let config = Config { host: "localhost".to_string(), port: 8080 }
-let json_str = Json::stringify(&config)
-let parsed: Config = Json::parse(&json_str)?
-
-let toml_str = Toml::stringify(&config)
+def demo() -> Unit
+  let config = Config { host: "localhost".to_string(), port: 8080 }
+  let json_str = Json::stringify(&config)
+  let parsed: Config = Json::parse(&json_str)?
+  let toml_str = Toml::stringify(&config)
+end
 ```
 
 ### HTTP & Networking (`std/http`, `std/url`, `std/net`)
@@ -1385,12 +1428,12 @@ let app = App::new()
 app.middleware(middleware::logger)
 app.middleware(middleware::cors)
 
-app.get("/", |ctx: inout Context| ctx.text("Hello, World!"))
-app.get("/users/:id", do |ctx: inout Context|
+app.get("/", |ctx: Context| ctx.text("Hello, World!"))
+app.get("/users/:id", do |ctx: Context|
   let id = ctx.param("id")?
   ctx.json_response(get_user(id)?)
 end)
-app.post("/users", do |ctx: inout Context|
+app.post("/users", do |ctx: Context|
   let user: User = ctx.json()?
   ctx.status(StatusCode::Created).json_response(create_user(user)?)
 end)
@@ -1427,8 +1470,9 @@ let conn = pool.get()?
 ```tangerine
 use std::crypto::{sha256, hmac_sha256, aes, random_bytes, base64, hex}
 
-# Hashing
-let hash = sha256(b"message")
+# Hashing (sha256 takes a byte slice)
+let msg: [u8] = [0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65]  # "message"
+let hash = sha256(msg)
 let mac = hmac_sha256(key, message)
 
 # Encryption
@@ -1454,7 +1498,7 @@ let app = App::new("myapp", "My CLI application")
   .subcommand(Command::new("build").about("Build the project"))
 
 let matches = app.parse()?
-if matches.get_flag("verbose") then ... end
+if matches.get_flag("verbose") then println("verbose") end
 
 # Terminal output
 terminal::print_colored("Success!", Color::Green)
@@ -1490,9 +1534,9 @@ Metrics::histogram("request_duration").observe(elapsed)
 ```tangerine
 use std::regex::{Regex, Parser, many, choice}
 
-# Regex
-let re = Regex::new(r"\d{3}-\d{4}")?
-if re.is_match("555-1234") then ... end
+# Regex (the dialect has no raw-string literal — escape the pattern)
+let re = Regex::new("\\d{3}-\\d{4}")?
+if re.is_match("555-1234") then println("matched") end
 let captures = re.captures("Phone: 555-1234")?
 
 # Parser combinators
@@ -1517,7 +1561,7 @@ builder.finish()?
 
 # Zip archives
 let reader = zip::ZipReader::open("archive.zip")?
-for entry in reader.entries()? do ... end
+for entry in reader.entries()? do println(entry.name()) end
 ```
 
 ### Date, Time & Duration (`std/time`)
@@ -1543,10 +1587,10 @@ let elapsed = start.elapsed()
 use std::async::{spawn, join_all, sleep}
 use std::thread::{Thread, Mutex, Channel, AtomicInt}
 
-# Async
+# Async (await is a prefix operator)
 async def fetch_all(urls: [String]) -> Vec[Response]
   let tasks = urls.iter().map(|u| spawn(fetch(u)))
-  join_all(tasks).await
+  await join_all(tasks)
 end
 
 # Threads
@@ -1574,10 +1618,10 @@ write("output.txt", &data)?
 
 let file = File::open("large.bin")?
 let reader = BufReader::new(file)
-for line in reader.lines() do ... end
+for line in reader.lines() do println(line) end
 
 for entry in walk_dir("src")? do
-  if entry.is_file() && entry.extension() == "tg" then ... end
+  if entry.is_file() && entry.extension() == "tg" then println(entry.path()) end
 end
 ```
 
@@ -1625,7 +1669,7 @@ let anim = Animation::new(0.0, 1.0, Duration::from_secs(1))
 ### Contracts & Capabilities (`std/contracts`, `std/capabilities`)
 
 ```tangerine
-use std::contracts::{pre, post, invariant, make_guard, GuardElseAction}
+use std::contracts::{make_guard, GuardElseAction, check_invariant}
 
 def sqrt(x: Float) -> Float
   pre x >= 0.0, "sqrt requires non-negative input"
@@ -1687,8 +1731,10 @@ player.play()
 ### Effects & Budgets (`std/effects`, `std/budget`)
 
 ```tangerine
-use std::effects::{effect, handle}
-use std::budget::{budget, budget_remaining}
+# `effect`, `handle` and `budget` are KEYWORDS (grammar §2.11 / §4.6);
+# the std analysis surfaces carry different names:
+use std::effects::{Effect, EffectKind}
+use std::budget::{Budget, time_budget}
 
 effect Logger
   log(level: Level, msg: String) -> Unit
@@ -1700,13 +1746,15 @@ def process_with_log(data: String) -> String
   transform(data)
 end
 
-handle process_with_log(input)
-with Logger
-  log(level, msg) => println("[{}] {}", level, msg)
+def run_handled() -> Unit
+  handle process_with_log(input)
+  with Logger
+    log(level, msg) => println("[{}] {}", level, msg)
+  end
 end
 
 def expensive_op() -> Result[Data, Error]
-  budget time: 5s, memory: 100MB
+  budget time: "5s", memory: "100MB"
   # implementation
 end
 ```
@@ -1755,10 +1803,10 @@ puts("with newline")
 ### Environment (`std/env`)
 
 ```tangerine
-use std::env::{args, var, set_var, current_dir}
+use std::env::{get_env, set_env, current_dir}
 
-let arguments = args()
-let home = var("HOME")
+let home = get_env("HOME")
+set_env("HOME", home)?
 let cwd = current_dir()?
 ```
 

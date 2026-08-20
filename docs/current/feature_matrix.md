@@ -156,11 +156,12 @@ modules remain **API-only** until they pass per-module native test suites
 
 | Document | Status | Path |
 |----------|--------|------|
+| Doctest-checked set (the six enumerated documents) | checked by `scripts/check_doctests.sh` (structural; compiler mode when a probe-validated binary exists); every unannotated fenced example is canonical-form, rejections carry `compile_fail: <expected diagnostic>` | `docs/current/*.md` — see the doctest rows in the [registry](feature_registry.md) |
 | Feature registry | current — the single status authority | `docs/current/feature_registry.md` |
-| Language reference | current | `docs/current/language.md` |
+| Language reference | current — doctest-checked | `docs/current/language.md` |
 | Style guide | current | `docs/current/style_guide.md` |
-| Memory model | current | `docs/current/memory_model.md` |
-| Grammar | current | `docs/current/grammar.md` |
+| Memory model | current — doctest-checked | `docs/current/memory_model.md` |
+| Grammar | current — doctest-checked | `docs/current/grammar.md` |
 | Pipeline manifest | current | `docs/current/pipeline_manifest.md` |
 | Stdlib reference | current | `docs/current/stdlib_reference.md` |
 | Stabilized layout subset | current | `docs/current/stabilized_subset.md` |
@@ -170,7 +171,10 @@ modules remain **API-only** until they pass per-module native test suites
 
 ---
 
-*Last updated: 2026-08 · working tree commit a14eeca + the round-9 work
+*Last updated: 2026-08 · working tree commit 455797e + the round-10 work
 (closure migration complete, self-host grammar gate, two-layer stdlib gate
-in required CI, FFI audit, atomics/allocator, verifier lattice, @cfg pass;
-docs reconciled with the executable state)*
+in required CI, FFI audit, atomics/allocator, verifier lattice, @cfg pass +
+matrix, Arc-guard redesign, TLS/io/db/thread fixes, atomic widths/SeqCst
+store, atomic accounting, alignment contract, @test canonicalization +
+restored lanes, crypto KAT job, doctest discipline; docs reconciled with
+the executable state)*
