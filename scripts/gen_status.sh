@@ -391,6 +391,33 @@ fact "spawn failure path runs the placed closure's drop glue" \
 fact "thread spawn failure-path suite committed" \
   'thread_spawn_failure' "$ROOT/tests/thread_spawn_failure_test.tg"
 
+# ── round-12 facts: the @budget runtime enforcement ───────────────────
+# The typed budget records (TypedBudget on the FnSignature) now have REAL
+# enforcement: the __tg_budget_* counter table is DEFINED in the data
+# section (the fail-closed-at-link state is gone), the MIR lowering of the
+# annotated functions constructs the MirBudgetConsume statements (the
+# allocation metric after each intrinsic allocation; the time metric's
+# entry stamp + per-return exit checks), the codegen arms are the real
+# checks (increment/compare, trap on exceed; the clock via __tg_clock_ns),
+# the fail-closed static-exceed rejection is the canary_neg surface, and
+# the two canaries are manifest-registered.
+fact "budget counter table defined (__tg_budget_alloc)" \
+  '__tg_budget_alloc' "$ROOT/tg_compiler/codegen.tg"
+fact "budget counter table defined (__tg_budget_time)" \
+  '__tg_budget_time' "$ROOT/tg_compiler/codegen.tg"
+fact "budget lowering constructs the allocation consumes" \
+  'MirBudgetConsume\("alloc"' "$ROOT/tg_compiler/mir.tg"
+fact "budget time entry marker (__tg_budget_time_start)" \
+  '__tg_budget_time_start' "$ROOT/tg_compiler/codegen.tg"
+fact "budget clock runtime (__tg_clock_ns)" \
+  'def emit_tg_clock_ns' "$ROOT/tg_compiler/runtime.tg"
+fact "budget static-exceed rejection (check_budget_static_exceed)" \
+  'check_budget_static_exceed' "$ROOT/tg_compiler/mir.tg"
+fact "budget positive canary (within the limit)" \
+  'canary_pos_budget_alloc_within' "$ROOT/tests/canary/MANIFEST"
+fact "budget negative canary (exceeded -> budget exceeded)" \
+  'canary_neg_budget_alloc_exceeded' "$ROOT/tests/canary_neg/MANIFEST"
+
 # ── working-tree file list ─────────────────────────────────────────────────
 WT="$(git -C "$ROOT" status --porcelain)"
 
@@ -588,6 +615,26 @@ CURRENT STATE (structural, verified against the tested tree):
   override (ffi_opaque_native_align); the thread spawn failure-path glue
   with the injected EAGAIN hook. No ladder/CI run has occurred on this
   tree — none of this is run-verified at this SHA.
+- Round-12 state (the budget runtime enforcement; HEAD is e65914f): the
+  typed budget records (TypedBudget on the typed FnSignature) gained
+  REAL enforcement — the __tg_budget_alloc / __tg_budget_time counter
+  table is DEFINED in the data section (codegen.tg
+  emit_budget_runtime_data; the fail-closed-at-link state is gone), the
+  MIR lowering of @budget-annotated functions constructs the
+  MirBudgetConsume statements (the ALLOCATION metric: one consume after
+  each intrinsic allocation in the annotated body — the classified
+  builtin-container allocators; the TIME metric: the
+  __tg_budget_time_start entry stamp + a per-MirReturn exit check), the
+  codegen arms became the REAL checks (counter increment/compare and
+  trap on exceed; the elapsed clock via the new __tg_clock_ns
+  clock_gettime runtime), the fail-closed static-exceed rejection
+  (check_budget_static_exceed — a body whose static allocation-site
+  count exceeds the declared limit is rejected at check time) is the
+  canary_neg surface, and the two canaries are manifest-registered
+  (canary_pos_budget_alloc_within, canary_neg_budget_alloc_exceeded).
+  Enforced metrics: alloc (count-based) + time (elapsed); memory /
+  iterations / calls / custom metric names parse but emit no checks.
+  No ladder/CI run has occurred on this tree.
 - Status vocabulary (docs/current/feature_registry.md — the CI-artifact
   evidence model): a COMMITTED test artifact (manifest-registered canary,
   invariant group, required CI gate, @test file, or the self-host kernel

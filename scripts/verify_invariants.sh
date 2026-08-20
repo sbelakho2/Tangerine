@@ -129,7 +129,7 @@ t G2.4b "DeinitPlan::String arm in mir.tg drop planning" \
 t G2.5 "String Clone/Eq/Hash impls in std/core.tg" \
   'grep -q "^impl Clone for String$" std/core.tg && grep -q "^impl Eq for String$" std/core.tg && grep -q "^impl Hash for String$" std/core.tg'
 t G2.6 "_tg_string_reserve frees the old buffer (a64 + x64 free call sites)" \
-  'awk "/^def emit_tg_string_reserve/{f=1} f && /_tg_mem_free/{n++} f && NR>1147 && /^def /{exit} END{exit !(n>=2)}" tg_compiler/runtime.tg'
+  'awk "/^def emit_tg_string_reserve/{f=1; d=0} f && /^def /{d++} d==1 && /_tg_mem_free/{n++} d>1{exit} END{exit !(n>=2)}" tg_compiler/runtime.tg'
 
 # ———————————————————————————————————————————————————————————————
 # G3  Reference model

@@ -22,7 +22,10 @@ use tg_compiler::types::{
   DeinitPlan, PlaceMoveState, build_deinit_plan, fn_owner_key_of_def,
   module_qualified_fn_key, subst_type_args, deinit_plan_is_trivial,
   TypeEnv, TypeDefKind, type_properties_of,
-  FunctionCleanupTable, ScopeId, function_cleanup_table_new
+  FunctionCleanupTable, ScopeId, function_cleanup_table_new,
+  TypedBudget, TypedBudgetConstraint,
+  budget_metric_resource, budget_metric_enforced, budget_bound_value,
+  budget_time_limit_ns, typed_budget_limit, intrinsic_allocates
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
@@ -125,6 +128,14 @@ struct MirFunction
   # rule as the checker's, at the MIR level). IR-synthesized functions
   # (drop glue, closures) carry none.
   declared_effects: Vec[EffectId] = Vec::new()
+  # The function's DECLARED BUDGET — the checker's typed FnSignature
+  # record (the @budget annotation's metric + limit pairs, spans
+  # stripped), copied at lowering (lower_function reads the typed table —
+  # the typed records are the authority). The runtime enforcement reads
+  # the limits from here (via MirBudgetConsume's amount payload) and the
+  # driver's budget analysis enumerates the consumes. IR-synthesized
+  # functions carry none.
+  declared_budget: Option[TypedBudget] = Option::None
   span: Span
 end
 
@@ -296,6 +307,13 @@ enum MirStatementKind
   
   # Agentic statements
   MirContractCheck(MirContract, MirOperand)  # Pre/post/invariant check
+  # Budget ENFORCEMENT: consume ONE unit of the resource (the @budget
+  # metric's canonical key — "alloc" for the allocation metric, "time" for
+  # the elapsed metric). The Int payload is the annotated function's
+  # DECLARED LIMIT for the resource (the typed record's bound): codegen
+  # increments the __tg_budget_<resource> counter by one (the allocation
+  # metric) or measures the elapsed clock against the entry stamp (the
+  # time metric) and TRAPS when the limit is exceeded.
   MirBudgetConsume(String, Int)              # Consume budget resources
   MirEffectRecord(String, MirOperand)        # Record an effect
 end
@@ -568,6 +586,7 @@ def duplicate_function(func: MirFunction) -> MirFunction
     extern_abi: func.extern_abi.clone(),
     contracts: func.contracts.clone(),
     declared_effects: func.declared_effects.clone(),
+    declared_budget: func.declared_budget.clone(),
     span: func.span.clone()
   }
 end
@@ -1069,6 +1088,11 @@ struct MirBuilder
   errors: Vec[String]
   current_fn: Option[MirFunction]
   current_block: Option[MirBlockId]
+  # the CURRENT function's declared budget — the typed FnSignature's
+  # record, set at lower_function's budget-state write and cleared by
+  # finish_function's current_fn reset (the budget lowering reads the
+  # per-function limits from here while lowering the body).
+  current_fn_budget: Option[TypedBudget] = Option::None
   local_counter: Int
   block_counter: Int
   temp_counter: Int
@@ -1603,7 +1627,6 @@ def start_function(inout b: MirBuilder, name: String, ret_type: Type, span: Span
   })
   
   b.current_block = Option::Some(MirBlockId { id: entry.id })
-
   # Create return place as local 0 (convention: locals[0] is the return place)
   let ret_local = MirLocal {
     id: MirLocalId { id: b.local_counter },
@@ -4135,6 +4158,7 @@ def finish_function(inout b: MirBuilder) -> Option[MirFunction]
     f.blocks = collected_blocks
     let result = Option::Some(f)
     b.current_fn = Option::None
+    b.current_fn_budget = Option::None
     b.current_block = Option::None
     b.blocks = Vec::new()
     result
@@ -5256,6 +5280,34 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
     fn_ref2.declared_effects = fn_sig.declared_effects.clone()
   when Option::None then ()
   end
+ # (the MirFunction.declared_budget WRITE SITE): carry the checker's
+  # typed DECLARED BUDGET (the @budget annotation's metric + limit pairs)
+  # onto the lowered function — the typed FnSignature record is the
+  # authority (typed_budget_of strips the spans); the runtime enforcement
+  # reads the limits from here, and the builder tracks the current
+  # function's budget for the allocation/time consume lowering below.
+  match b.current_fn
+  when Option::Some(fn_ref3) then
+    fn_ref3.declared_budget = fn_sig.declared_budget.clone()
+  when Option::None then ()
+  end
+  b.current_fn_budget = fn_sig.declared_budget.clone()
+ # the TIME metric's ENTRY stamp — the first statement of the entry
+  # block (block 0, current at this point — before the contracts and the
+  # body lower): MirEffectRecord("__tg_budget_time_start") — codegen
+  # stamps the __tg_budget_time data slot with the monotonic clock; the
+  # exit checks (emit_budget_time_exit_checks) compare the elapsed clock
+  # against the declared limit at every MirReturn.
+  if mir_budget_has_resource(b, "time") then
+    let unit_op = MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirUnit,
+        ty: Type::Unit,
+        instance: Option::None
+      })
+    }
+    push_stmt(b, MirStatementKind::MirEffectRecord("__tg_budget_time_start".to_string(), unit_op), f.span)
+  end
   
   var param_idx = 0
   while param_idx < f.params.len() do
@@ -5363,7 +5415,87 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
     emit_cfg_deinit_returns(b)
   end
   
+ # the @budget enforcement tail: the TIME metric's EXIT checks (every
+  # MirReturn block gains the elapsed-vs-limit MirBudgetConsume) and the
+  # ALLOCATION metric's fail-closed STATIC-EXCEED rejection (a body whose
+  # STATIC allocation-site count already exceeds the declared limit is a
+  # compile error — the runtime trap it would hit on entry is
+  # deterministic, so the check-time rejection is the canary_neg surface).
+  emit_budget_time_exit_checks(b, f.span)
+  check_budget_static_exceed(b)
+  
   finish_function(b)
+end
+
+# Whether the current function's declared budget carries the resource
+# (the canonical metric key — "alloc"/"time" — via budget_metric_resource).
+def mir_budget_has_resource(b: MirBuilder, resource: String) -> Bool
+  match b.current_fn_budget
+  when Option::Some(tb) then
+    for c in tb.constraints do
+      if budget_metric_resource(&c.metric) == resource then return true end
+    end
+    false
+  when Option::None then false
+  end
+end
+
+# The current function's declared limit for the resource (0 when absent —
+# the time metric's bound is unit-scaled to nanoseconds, the allocation
+# metric's is the raw count).
+def mir_budget_limit_of(b: MirBuilder, resource: String) -> Int
+  match b.current_fn_budget
+  when Option::Some(tb) then typed_budget_limit(&tb, resource)
+  when Option::None then 0
+  end
+end
+
+# The TIME metric's exit checks: append a MirBudgetConsume("time", limit)
+# to every block whose terminator is MirReturn — every exit path of a
+# time-budgeted function compares the elapsed clock against the limit
+# (codegen traps when the limit is exceeded).
+def emit_budget_time_exit_checks(inout b: MirBuilder, span: Span) -> Unit
+  if mir_budget_has_resource(b, "time") then
+    let limit = mir_budget_limit_of(b, "time")
+    var bi = 0
+    while bi < b.blocks.len() do
+      let blk = b.blocks[bi]
+      match blk.terminator.kind
+      when MirTerminatorKind::MirReturn then
+        b.blocks[bi].statements.push(MirStatement {
+          kind: MirStatementKind::MirBudgetConsume("time".to_string(), limit),
+          span: span
+        })
+      when _ then ()
+      end
+      bi = bi + 1
+    end
+  end
+end
+
+# The ALLOCATION metric's fail-closed static-exceed check: a body whose
+# STATIC allocation-site count (the MirBudgetConsume("alloc", _)
+# statements the lowering emitted) already exceeds the declared limit is
+# a compile error — the runtime trap it would hit on entry is
+# deterministic. Runtime exceed (a loop over a within-limit site count)
+# still traps at execution.
+def check_budget_static_exceed(inout b: MirBuilder) -> Unit
+  if mir_budget_has_resource(b, "alloc") then
+    let limit = mir_budget_limit_of(b, "alloc")
+    var count = 0
+    for blk in b.blocks do
+      for stmt in blk.statements do
+        match stmt.kind
+        when MirStatementKind::MirBudgetConsume(resource, _) then
+          if resource == "alloc" then count = count + 1 end
+        when _ then ()
+        end
+      end
+    end
+    if count > limit then
+      b.errors.push("budget exceeded: alloc limit " + limit.to_string() + " with " + count.to_string() + " allocation site(s) — the annotated function's allocations exceed the declared budget")
+    end
+  end
 end
 
 def lower_final_stmt_to_return_place(inout b: MirBuilder, stmt: Stmt, span: Span) -> Unit
@@ -8557,6 +8689,20 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
 
   b.current_block = Option::Some(success_blk)
 
+ # the @budget ALLOCATION metric's consume: an intrinsic allocation in
+  # the annotated function consumes ONE unit (the counter
+  # __tg_budget_alloc increments; codegen traps when it exceeds the
+  # declared limit carried as the statement's amount).
+  if mir_budget_has_resource(b, "alloc") then
+    match mir_call_intrinsic_of(b, call_node_id)
+    when Option::Some(iid) then
+      if intrinsic_allocates(&iid) then
+        push_stmt(b, MirStatementKind::MirBudgetConsume("alloc".to_string(), mir_budget_limit_of(b, "alloc")), span)
+      end
+    when Option::None then ()
+    end
+  end
+
   MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
     kind: MirOperandKind::MirCopy(place_local(ret_tmp))
   }) }
@@ -8648,6 +8794,17 @@ def lr_static_path_call(inout b: MirBuilder, path: AstPath, args: Vec[Expr], spa
     unwind: Option::None
   }, span)
   b.current_block = Option::Some(success_blk)
+ # the @budget ALLOCATION metric's consume (see lr_call — an intrinsic
+  # allocation in the annotated function consumes one unit).
+  if mir_budget_has_resource(b, "alloc") then
+    match mir_call_intrinsic_of(b, node_id)
+    when Option::Some(iid) then
+      if intrinsic_allocates(&iid) then
+        push_stmt(b, MirStatementKind::MirBudgetConsume("alloc".to_string(), mir_budget_limit_of(b, "alloc")), span)
+      end
+    when Option::None then ()
+    end
+  end
   MirRvalue { kind: MirRvalueKind::MirMove(MirOperand {
     kind: MirOperandKind::MirCopy(place_local(ret_tmp))
   }) }
@@ -10010,6 +10167,20 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       end
       
       b.current_block = Option::Some(success_blk)
+      
+ # the @budget ALLOCATION metric's consume (see lr_call — an
+      # intrinsic allocation in the annotated function consumes one unit;
+      # the classified builtin-container methods — push/insert/extend/
+      # reserve/... — and the __intrinsic_* allocators are the sites).
+      if mir_budget_has_resource(b, "alloc") then
+        match mir_call_intrinsic_of(b, expr.node_id)
+        when Option::Some(iid) then
+          if intrinsic_allocates(&iid) then
+            push_stmt(b, MirStatementKind::MirBudgetConsume("alloc".to_string(), mir_budget_limit_of(b, "alloc")), span)
+          end
+        when Option::None then ()
+        end
+      end
       
  # a MANUAL deinit() call runs only the user finalizer. The
       # compiler-owned structural field cleanup must also run (exactly once):

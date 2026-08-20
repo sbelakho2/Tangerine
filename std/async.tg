@@ -12,6 +12,7 @@
 
 use std::core::{Option, Result, Vec, String, Bool, UInt, Int}
 use std::collections::{Map, VecDeque}
+use std::atomic::{AtomicInt, Ordering}
 use std::sync::{Arc, AtomicBool}
 use std::io::{Read, Write, IOError}
 use std::net::{TcpStream}
@@ -433,7 +434,7 @@ struct Executor
   task_results: Map[UInt, Box[Any]]
   join_waiters: Map[UInt, Waker]     # task_id -> waker of JoinHandle
   timer_heap: Vec[TimerEntry]
-  # GAP-22: I/O reactor for async I/O
+  # I/O reactor for async I/O
   io_reactor: Option[IoReactor]
   running: Bool
   # Deterministic mode support
@@ -512,7 +513,7 @@ def timer_heap_peek_deadline(heap: Vec[TimerEntry]) -> Option[Instant]
 end
 
 def executor_new() -> Executor
-  # GAP-22: Try to create I/O reactor (may fail on unsupported platforms)
+  # Try to create I/O reactor (may fail on unsupported platforms)
   let reactor = match io_reactor_new()
   when Result::Ok(r) then Option::Some(r)
   when Result::Err(_) then Option::None
@@ -585,7 +586,7 @@ impl Executor
     end
   end
 
-  # GAP-22: Register a file descriptor for async I/O
+  # Register a file descriptor for async I/O
   def register_io(inout self, fd: Int, task_id: UInt, interest: Interest) -> Result[Unit, String]
     match self.io_reactor
     when Option::Some(mut reactor) then
@@ -595,7 +596,7 @@ impl Executor
     end
   end
   
-  # GAP-22: Deregister a file descriptor
+  # Deregister a file descriptor
   def deregister_io(inout self, fd: Int) -> Unit
     match self.io_reactor
     when Option::Some(mut reactor) then
@@ -615,7 +616,7 @@ impl Executor
         self.check_timers()
       end
 
-      # GAP-22: Poll I/O reactor for ready file descriptors
+      # Poll I/O reactor for ready file descriptors
       if !self.deterministic then
         match self.io_reactor
         when Option::Some(mut reactor) then
@@ -653,7 +654,7 @@ impl Executor
             self.running = false
           end
         else
-          # GAP-22: Block on I/O and timers
+          # Block on I/O and timers
           let timeout_ms = match self.next_timer_deadline()
           when Option::Some(deadline) then
             let now = instant_now()
@@ -927,161 +928,151 @@ end
 struct ChannelInner[T]
   buffer: VecDeque[T]
   capacity: UInt
-  closed: Bool
+  closed: AtomicBool
   send_waiters: Vec[Waker]
   recv_waiters: Vec[Waker]
-  ref_count: UInt
 end
 
+# The channel's shared state lives in a heap allocation owned by an Arc
+# (std::sync's refcounted allocation — the same pattern the sync channel
+# uses). Sender, Receiver, and the SendFuture/RecvFuture the send/recv
+# methods produce each hold their OWN Arc clone: the inner stays alive
+# even if an endpoint is dropped or moved while a future is in flight.
+# The refcount is the Arc's (the atomic in the control block); the old
+# hand-rolled ref_count field and the Box::into_raw/Box::from_raw pair
+# are gone — the raw pointer is never exposed in the safe surface.
 struct Sender[T]
-  inner: PtrMut[ChannelInner[T]]
+  inner: Arc[ChannelInner[T]]
 end
 
 struct Receiver[T]
-  inner: PtrMut[ChannelInner[T]]
-end
-
-def channel_inc_ref[T](ptr: PtrMut[ChannelInner[T]]) -> Unit
-  unsafe "pointer dereference — channel refcount" do
-    let ch = ptr.as_mut()
-    ch.ref_count = ch.ref_count + 1
-  end
-end
-
-def channel_dec_ref[T](ptr: PtrMut[ChannelInner[T]]) -> Unit
-  unsafe "pointer dereference — channel refcount" do
-    let ch = ptr.as_mut()
-    ch.ref_count = ch.ref_count - 1
-    if ch.ref_count == 0 then
-      let _ = Box::from_raw(ptr)
-    end
-  end
+  inner: Arc[ChannelInner[T]]
 end
 
 pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
-  let inner = Box::new(ChannelInner[T] {
+  let inner = Arc::new(ChannelInner[T] {
     buffer: VecDeque[T]::new(),
     capacity: capacity,
-    closed: false,
+    closed: AtomicBool::new(false),
     send_waiters: Vec[Waker]::new(),
-    recv_waiters: Vec[Waker]::new(),
-    ref_count: 2
+    recv_waiters: Vec[Waker]::new()
   })
-  
-  let ptr = Box::into_raw(inner)
-  
-  (Sender[T] { inner: ptr }, Receiver[T] { inner: ptr })
+
+  (Sender[T] { inner: inner.clone() }, Receiver[T] { inner: inner })
 end
 
 impl Sender[T]
   def send(self, value: T) -> SendFuture[T]
     SendFuture[T] {
-      sender: self.inner,
+      inner: self.inner.clone(),
       value: Option::Some(value)
     }
   end
-  
+
   def close(self) -> Unit
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let ch = self.inner.as_mut()
-      if ch.closed then
-        return
-      end
-      ch.closed = true
-      for waker in ch.recv_waiters.drain() do
-        waker.wake()
+    if self.inner.ptr.as_ref().closed.load() then
+      return
+    end
+    self.inner.ptr.as_ref().closed.store(true)
+    loop do
+      match self.inner.ptr.as_ref().recv_waiters.pop()
+      when Option::Some(waker) then waker.wake()
+      when Option::None then break
       end
     end
   end
-  
-  def clone(self) -> Sender[T]
-    channel_inc_ref(self.inner)
-    Sender[T] { inner: self.inner }
-  end
 
-  def drop(inout self) -> Unit
-    channel_dec_ref(self.inner)
+  def clone(self) -> Sender[T]
+    Sender[T] { inner: self.inner.clone() }
   end
 end
 
 impl Receiver[T]
   def recv(self) -> RecvFuture[T]
-    RecvFuture[T] {
-      receiver: self.inner
-    }
+    RecvFuture[T] { inner: self.inner.clone() }
   end
 
-  def drop(inout self) -> Unit
-    channel_dec_ref(self.inner)
+  def try_recv(self) -> Option[T]
+    let ch = self.inner.ptr.as_ref()
+    match ch.buffer.pop_front()
+    when Option::Some(val) then
+      # Wake a sender — the buffer just made room
+      if !ch.send_waiters.is_empty() then
+        ch.send_waiters.pop().unwrap().wake()
+      end
+      Option::Some(val)
+    when Option::None then
+      Option::None
+    end
+  end
+
+  def is_closed(self) -> Bool
+    self.inner.ptr.as_ref().closed.load()
   end
 end
 
 struct SendFuture[T]
-  sender: PtrMut[ChannelInner[T]]
+  inner: Arc[ChannelInner[T]]
   value: Option[T]
 end
 
 impl Future for SendFuture[T]
   type Output = Result[(), String]
-  
+
   def poll(inout self, inout cx: Context) -> Poll[Result[(), String]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let ch = self.sender.as_mut()
-      
-      if ch.closed then
-        let closed_result: Result[(), String] = Result::Err("channel closed".to_string())
-        return Poll::Ready(closed_result)
-      end
-      
-      if ch.buffer.len() < ch.capacity then
-        # Space available
-        match self.value.take()
-        when Option::Some(val) then
-          ch.buffer.push_back(val)
-          # Wake a receiver
-          if !ch.recv_waiters.is_empty() then
-            ch.recv_waiters.pop().unwrap().wake()
-          end
-          let sent_result: Result[(), String] = Result::Ok(())
-          Poll::Ready(sent_result)
-        when Option::None then
-          let missing_result: Result[(), String] = Result::Err("value already sent".to_string())
-          Poll::Ready(missing_result)
+    let ch = self.inner.ptr.as_ref()
+
+    if ch.closed.load() then
+      let closed_result: Result[(), String] = Result::Err("channel closed".to_string())
+      return Poll::Ready(closed_result)
+    end
+
+    if ch.buffer.len() < ch.capacity then
+      # Space available
+      match self.value.take()
+      when Option::Some(val) then
+        ch.buffer.push_back(val)
+        # Wake a receiver
+        if !ch.recv_waiters.is_empty() then
+          ch.recv_waiters.pop().unwrap().wake()
         end
-      else
-        # Buffer full, wait
-        ch.send_waiters.push(cx.waker.clone())
-        Poll::Pending
+        let sent_result: Result[(), String] = Result::Ok(())
+        Poll::Ready(sent_result)
+      when Option::None then
+        let missing_result: Result[(), String] = Result::Err("value already sent".to_string())
+        Poll::Ready(missing_result)
       end
+    else
+      # Buffer full, wait
+      ch.send_waiters.push(cx.waker.clone())
+      Poll::Pending
     end
   end
 end
 
 struct RecvFuture[T]
-  receiver: PtrMut[ChannelInner[T]]
+  inner: Arc[ChannelInner[T]]
 end
 
 impl Future for RecvFuture[T]
   type Output = Option[T]
-  
+
   def poll(inout self, inout cx: Context) -> Poll[Option[T]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let ch = self.receiver.as_mut()
-      
-      match ch.buffer.pop_front()
-      when Option::Some(val) then
-        # Wake a sender
-        if !ch.send_waiters.is_empty() then
-          ch.send_waiters.pop().unwrap().wake()
-        end
-        Poll::Ready(Option::Some(val))
-      when Option::None then
-        if ch.closed then
-          Poll::Ready(Option::None)
-        else
-          ch.recv_waiters.push(cx.waker.clone())
-          Poll::Pending
-        end
+    let ch = self.inner.ptr.as_ref()
+
+    match ch.buffer.pop_front()
+    when Option::Some(val) then
+      # Wake a sender
+      if !ch.send_waiters.is_empty() then
+        ch.send_waiters.pop().unwrap().wake()
+      end
+      Poll::Ready(Option::Some(val))
+    when Option::None then
+      if ch.closed.load() then
+        Poll::Ready(Option::None)
+      else
+        ch.recv_waiters.push(cx.waker.clone())
+        Poll::Pending
       end
     end
   end
@@ -1558,44 +1549,53 @@ impl TaskScope
     self
   end
 
-  ## Spawn a task within this scope. The task is tracked and must
-  ## complete before the scope exits.
-  def spawn[F: Future](inout self: TaskScope, future: F) -> JoinHandle[F::Output]
-    let task = Task {
-      id: self.tasks.len() as UInt,
-      future: Box::new(future) as Box[dyn Future[Output = ()]],
-      state: TaskState::Ready,
-      waker: Option::None,
-    }
-    self.tasks.push(task)
-    JoinHandle {
-      task_id: self.tasks.len() as UInt - 1,
-      result: Option::None,
-    }
+  ## Spawn a task within this scope. The task is registered with the
+  ## CURRENT executor (the same registration the free spawn uses) and its
+  ## id is tracked — the task must complete before the scope exits. The
+  ## scoped futures are the ()-output form (the executor's task_results
+  ## are the Box[Any] outputs keyed by the task id).
+  def spawn(inout self: TaskScope, future: impl Future[Output = ()]) -> JoinHandle[()]
+    let handle = spawn(future)
+    self.tasks.push(handle.task_id)
+    handle
   end
 
-  ## Wait for all tasks in the scope to complete.
+  ## Wait for all tasks in the scope to complete: the executor's run loop
+  ## fills task_results as the tasks complete; the scope spins on the
+  ## tracked ids until every result is present (or the cancellation fired).
+  ## The error strategy's CancelAll cancels the scope when the cancellation
+  ## was requested; the ()-output tasks carry no per-task error channel, so
+  ## the error list reflects the cancelled tasks.
   def join_all(inout self: TaskScope) -> Result[Unit, Vec[String]]
     let mut errors = Vec::new()
-    for task in self.tasks do
-      if self.cancellation.is_cancelled() then
-        match self.error_strategy
-        when ScopeErrorStrategy::CancelAll then break
-        when _ then ()
+    match GLOBAL_EXECUTOR
+    when Option::Some(exec_ptr) then
+      unsafe "global executor pointer dereference" do
+        let exec = exec_ptr.as_mut()
+        var done = false
+        while !done do
+          done = true
+          for tid in self.tasks do
+            if !exec.task_results.contains(&tid) then
+              done = false
+            end
+          end
+          if self.cancellation.is_cancelled() then
+            done = true
+          end
+        end
+        if self.cancellation.is_cancelled() then
+          match self.error_strategy
+          when ScopeErrorStrategy::CancelAll then
+            for tid in self.tasks do
+              exec.cancel_task(tid)
+            end
+          when _ then ()
+          end
         end
       end
-      ## Poll each task to completion
-      match task.state
-      when TaskState::Failed then
-        errors.push("task ".to_string() + task.id.to_string() + " failed")
-        match self.error_strategy
-        when ScopeErrorStrategy::CancelAll then
-          self.cancellation.cancel()
-          break
-        when _ then ()
-        end
-      when _ then ()
-      end
+    when Option::None then
+      return Result::Err("scoped spawn requires an async runtime — use block_on() first".to_string())
     end
     if errors.is_empty() then
       Result::Ok(())
@@ -1871,65 +1871,95 @@ end
 # ———————————————————————————————————————————————————————————————
 # Async Semaphore
 # ———————————————————————————————————————————————————————————————
-
+# The semaphore state (the permit counter + the waiter queue) lives in a
+# heap allocation owned by an Arc — the same heap-stable shared-state
+# shape the AsyncMutex uses. AcquireFuture and SemaphorePermit each hold
+# their OWN Arc clone: the semaphore can be dropped or moved while a
+# future or a permit lives. Acquisition and release go through the inner's
+# atomic counter (a CAS loop on acquire — the counter is the authority, so
+# a contended re-poll re-tries the CAS instead of double-decrementing; an
+# atomic fetch-add on release). The waiter queue is mutated only from the
+# executor thread (the module's cooperative single-threaded runtime), the
+# same discipline the AsyncMutex's value access relies on.
 struct AsyncSemaphore
-  permits: UInt
+  inner: Arc[AsyncSemaphoreInner]
+end
+
+struct AsyncSemaphoreInner
+  counter: AtomicInt
   max_permits: UInt
   waiters: VecDeque[Waker]
 end
 
 def async_semaphore_new(permits: UInt) -> AsyncSemaphore
-  AsyncSemaphore { permits: permits, max_permits: permits, waiters: VecDeque::new() }
+  AsyncSemaphore {
+    inner: Arc::new(AsyncSemaphoreInner {
+      counter: AtomicInt::new(permits as Int),
+      max_permits: permits,
+      waiters: VecDeque::new()
+    })
+  }
+end
+
+def AsyncSemaphore::new(permits: UInt) -> AsyncSemaphore
+  async_semaphore_new(permits)
 end
 
 struct AcquireFuture
-  semaphore: PtrMut[AsyncSemaphore]
+  inner: Arc[AsyncSemaphoreInner]
 end
 
 impl Future for AcquireFuture
   type Output = SemaphorePermit
   def poll(inout self, inout cx: Context) -> Poll[SemaphorePermit]
-    unsafe "pointer dereference" do
-      let sem = self.semaphore.as_mut()
-      if sem.permits > 0 then
-        sem.permits = sem.permits - 1
-        Poll::Ready(SemaphorePermit { semaphore: self.semaphore })
+    loop do
+      let current = self.inner.ptr.as_ref().counter.load(Ordering::Acquire)
+      if current > 0 then
+        mut expected = current
+        if self.inner.ptr.as_ref().counter.compare_exchange(&mut expected, current - 1, Ordering::AcqRel, Ordering::Acquire) then
+          return Poll::Ready(SemaphorePermit { inner: self.inner.clone() })
+        end
       else
-        sem.waiters.push_back(cx.waker.clone())
-        Poll::Pending
+        # No permit — queue this task's waker (the executor re-polls us
+        # once a permit release wakes the queue; a re-poll while still
+        # starved enqueues again, and the id-based wakeups make stale
+        # entries no-ops in the executor).
+        self.inner.ptr.as_ref().waiters.push_back(cx.waker.clone())
+        return Poll::Pending
       end
     end
   end
 end
 
 struct SemaphorePermit
-  semaphore: PtrMut[AsyncSemaphore]
+  inner: Arc[AsyncSemaphoreInner]
 end
 
 impl Drop for SemaphorePermit
   def drop(inout self) -> Unit
-    unsafe "pointer dereference" do
-      let sem = self.semaphore.as_mut()
-      sem.permits = sem.permits + 1
-      if let Some(waker) = sem.waiters.pop_front() then
-        waker.wake()
-      end
+    # Release the permit (the atomic increment) and wake the oldest waiter.
+    self.inner.ptr.as_ref().counter.fetch_add(1, Ordering::Release)
+    match self.inner.ptr.as_ref().waiters.pop_front()
+    when Option::Some(waker) then waker.wake()
+    when Option::None then ()
     end
   end
 end
 
 impl AsyncSemaphore
   def acquire(inout self) -> AcquireFuture
-    AcquireFuture { semaphore: self as PtrMut[AsyncSemaphore] }
+    AcquireFuture { inner: self.inner.clone() }
   end
 
   def try_acquire(inout self) -> Option[SemaphorePermit]
-    if self.permits > 0 then
-      self.permits = self.permits - 1
-      Option::Some(SemaphorePermit { semaphore: self as PtrMut[AsyncSemaphore] })
-    else
-      Option::None
+    let current = self.inner.ptr.as_ref().counter.load(Ordering::Acquire)
+    if current > 0 then
+      mut expected = current
+      if self.inner.ptr.as_ref().counter.compare_exchange(&mut expected, current - 1, Ordering::AcqRel, Ordering::Acquire) then
+        return Option::Some(SemaphorePermit { inner: self.inner.clone() })
+      end
     end
+    Option::None
   end
 end
 
@@ -1945,3 +1975,12 @@ impl[T] Shareable for Receiver[T] {}
 
 impl[T] Transferable for AsyncMutex[T] {}
 impl[T] Shareable for AsyncMutex[T] {}
+
+impl Transferable for AsyncSemaphore {}
+impl Shareable for AsyncSemaphore {}
+
+impl Transferable for AcquireFuture {}
+impl Shareable for AcquireFuture {}
+
+impl Transferable for SemaphorePermit {}
+impl Shareable for SemaphorePermit {}

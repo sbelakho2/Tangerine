@@ -212,6 +212,18 @@ end
 #     Normal (fallthrough) edges target the join, and the no-else path's
 #     trailing False edge targets it directly; the state walk records the
 #     merged branch exits as the join block's (entry, exit) frames.
+#   - Matches get their MATCH-JOIN block record (id = the scrutinee's
+#     node id — the scrutinee's expression id is never a statement id,
+#     hence never a top-level partition block key, the same disjointness
+#     as the if-join): the continuation block the arm exits merge into;
+#     the arm blocks' Normal (fallthrough) edges target it; the state
+#     walk records the merged arm exits as the join's (entry, exit)
+#     frames.
+#   - Loops get their LOOP-JOIN block records (the loop's continuation —
+#     the while's cond node id / the cond-less loop's statement node id):
+#     the while's False (exit) edge targets the join; the state walk
+#     records the loop's after-frame (the fixed point) as the join's
+#     (entry, exit) frames.
 # The CFG is built BEFORE the resource state runs (build_typed_cfg, the
 # structural pass); the state computation (run_cfg_block and the check_*
 # recording sites) walks the pre-built blocks and attaches the cleanup
@@ -1209,10 +1221,10 @@ end
 # the branch block's own Normal (fallthrough) edge — the edge cfg_block
 # recorded for the branch (kind Normal, source = the branch's block key),
 # or -1 when the branch ends in a terminator (no fallthrough — that branch
-# exit never reaches the if-join). Scanned over the branch's own edge
-# range [base, edges.len()): the branch's statements' edges carry nested
-# sources, and the branch's fallthrough Normal edge is the LAST edge with
-# the branch key as its source.
+# exit never reaches the if-join / match-join). Scanned over the branch's
+# own edge range [base, edges.len()): the branch's statements' edges carry
+# nested sources, and the branch's fallthrough Normal edge is the LAST edge
+# with the branch key as its source.
 def cfg_branch_fallthrough_edge(edges: Vec[CfgEdge], base: Int, branch_key: Int) -> Int
   var e = base
   var found = -1
@@ -1305,19 +1317,49 @@ def cfg_stmt(stmt: Stmt, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
     # through when the condition fails. The single-shot loop cleanup
     # (check_loop_created) attaches the loop-created obligations to it
     # when the loop executes at most once (the backedge is unreachable
-    # then); the edge carries no obligation of its own otherwise.
-    edges.push(CfgEdge { kind: CfgEdgeKind::False, source: cond.node_id, destination: 0, actions: Vec::new() })
+    # then); the edge carries no obligation of its own otherwise. The
+    # edge's target is the WHILE-JOIN (the loop's continuation — the
+    # cond's node id): the cond's expression id is never a statement id,
+    # hence never a top-level partition block key — the same disjointness
+    # reasoning as the if-join (the loop statement's OWN node id can key
+    # the enclosing flow block).
+    let while_join_id = cond.node_id
+    edges.push(CfgEdge { kind: CfgEdgeKind::False, source: cond.node_id, destination: while_join_id, actions: Vec::new() })
+    let while_exit_edge = edges.len() - 1
     cfg_expr(&cond, edges, blocks, chain)
     cfg_loop_body(&body, edges, blocks, chain)
     cfg_loop_backedge(stmt.node_id, &body, edges)
+    # / THE WHILE-JOIN — the loop's continuation block record (the
+    # state walk records the after-frame — the loop's exit state — as
+    # the join's (entry, exit) under this same id). The join executes no
+    # statements; its record carries the INCOMING edge (the loop's EXIT
+    # edge — the False edge, the loop's transfer into the continuation).
+    var while_join_edges = Vec::new()
+    while_join_edges.push(while_exit_edge)
+    blocks.push(CfgBlock { id: while_join_id, edges: while_join_edges })
   when StmtKind::StmtFor(for_stmt) then
     cfg_pattern(&for_stmt.pattern, edges, blocks, chain)
     cfg_expr(&for_stmt.iter, edges, blocks, chain)
     cfg_loop_body(&for_stmt.body, edges, blocks, chain)
     cfg_loop_backedge(stmt.node_id, &for_stmt.body, edges)
+    # / THE FOR-JOIN — the for loop's continuation block record (id =
+    # the for stmt's node id — the cond-less loop rule). The state walk
+    # records the after-frame as the join's (entry, exit). The for has no
+    # natural exit edge (its exits are the body's Break/Return edges,
+    # which target the body's key), so the record carries no incoming
+    # edges.
+    var for_join_edges = Vec::new()
+    blocks.push(CfgBlock { id: stmt.node_id, edges: for_join_edges })
   when StmtKind::StmtLoop(body) then
     cfg_loop_body(&body, edges, blocks, chain)
     cfg_loop_backedge(stmt.node_id, &body, edges)
+    # / THE LOOP-JOIN — the cond-less `loop`'s continuation block
+    # record (id = the loop stmt's node id — the cond-less loop rule).
+    # The state walk records the after-frame as the join's (entry, exit);
+    # the cond-less loop's exits are the body's Break/Return edges, so
+    # the record carries no incoming edges.
+    var loop_join_edges = Vec::new()
+    blocks.push(CfgBlock { id: stmt.node_id, edges: loop_join_edges })
   when StmtKind::StmtReturn(val_opt) then
     match val_opt
     when Option::Some(val) then cfg_expr(&val, edges, blocks, chain)
@@ -1396,6 +1438,11 @@ end
 # the arm bodies' blocks).
 def cfg_match(m: MatchExpr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   cfg_expr(&m.scrutinee, edges, blocks, chain)
+  # per-arm (block key, edge base) — the arm bodies' own fallthrough
+  # Normal edges are found in their own ranges below (the pattern-guard
+  # edges precede each arm body; the base is taken at the arm body, so
+  # the range covers the body's own edges only).
+  var branches: Vec[(Int, Int)] = Vec::new()
   mut i = 0
   while i < m.arms.len() do
     cfg_pattern(&m.arms[i].pattern, edges, blocks, chain)
@@ -1403,9 +1450,29 @@ def cfg_match(m: MatchExpr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBloc
     when Option::Some(g) then cfg_expr(&g, edges, blocks, chain)
     when Option::None then ()
     end
+    branches.push((block_exit_key(&m.arms[i].body), edges.len()))
     cfg_block(&m.arms[i].body, edges, blocks, chain)
     i = i + 1
   end
+  # / THE MATCH-JOIN — the continuation block the arm exits merge
+  # into (the state walk records the join block's ENTRY frame — the
+  # merged arm exits — under this same id). The arm blocks' Normal
+  # (fallthrough) edges target the join. The join record's id is the
+  # SCRUTINEE's node id — the same disjointness reasoning as the if-join:
+  # the scrutinee's expression id is never a statement id, so it is never
+  # a top-level partition block key (the match stmt's own node id can key
+  # the enclosing flow block). The join executes no statements — its
+  # CfgBlock record carries the INCOMING edges.
+  let join_id = m.scrutinee.node_id
+  var join_edges = Vec::new()
+  for (bk, base) in branches do
+    let nidx = cfg_branch_fallthrough_edge(edges, base, bk)
+    if nidx >= 0 then
+      edges[nidx].destination = join_id
+      join_edges.push(nidx)
+    end
+  end
+  blocks.push(CfgBlock { id: join_id, edges: join_edges })
 end
 
 # the pattern structural walk (the check_pattern mirror — only
@@ -4177,6 +4244,15 @@ def check_match(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
   end
   let merged = merge_frames(&arms)
   frame_assign(frame, &merged)
+  # / THE MATCH-JOIN — the join block's ENTRY state: the merged
+  # arm exits (the arms' recorded exit frames — check_block's
+  # run_cfg_block recorded the (entry, exit) pairs under the arm body
+  # block ids). The join executes no statements — its exit frame is the
+  # entry. Recorded under the join block's id (the structural pass's
+  # match-join record — the scrutinee's node id — the same disjointness
+  # as the if-join) — the single-pass merge (the match region is
+  # acyclic: one merge, no re-execution).
+  record_block_frame(ctx, m.scrutinee.node_id, res_frame_clone(&merged), res_frame_clone(&merged))
 end
 
 def check_loop(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, cond: Option[Expr], body: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], stmt_node_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
@@ -4204,6 +4280,19 @@ def check_loop(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   end
   let after = check_loop_body(program, typed, env, ctx, body, &entry, &entry_names, &no_iter_binding, -1, &no_projected_fields, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, cond_source)
   frame_assign(frame, &after)
+  # / THE LOOP-JOIN — the loop's continuation block's (entry, exit)
+  # frames: the after-frame (the fixed point check_loop_body computed —
+  # the loop's exit state) recorded under the join block's id (the
+  # structural pass's loop-join record). The join id is the while's cond
+  # node id — an expression id, never a statement id, hence never a
+  # top-level partition block key, the same disjointness reasoning as the
+  # if-join — and the loop statement's own node id for the cond-less
+  # loop. The join executes no statements — its exit frame is the entry.
+  let join_id = match cond
+  when Option::Some(c2) then c2.node_id
+  when Option::None then stmt_node_id
+  end
+  record_block_frame(ctx, join_id, res_frame_clone(&after), res_frame_clone(&after))
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -5280,6 +5369,11 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
   end
   let after = check_loop_body(program, typed, env, ctx, &for_stmt.body, &entry, &entry_names, &iter_binding_ids, projected_root, &projected_fields, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, -1)
   frame_assign(frame, &after)
+  # / THE FOR-JOIN — the for loop's continuation block's (entry,
+  # exit) frames: the after-frame (the fixed point check_loop_body
+  # computed) recorded under the join block's id (the structural pass's
+  # for-join record — the for stmt's node id, the cond-less loop rule).
+  record_block_frame(ctx, stmt_node_id, res_frame_clone(&after), res_frame_clone(&after))
 end
 
 # under the CURRENT projected iteration the MIR binds each element by
