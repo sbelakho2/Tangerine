@@ -1,7 +1,15 @@
 # Access + Resource Model — Migration History
 
+> **NON-NORMATIVE — HISTORICAL.** This is the archived record of the
+> migration from the former borrow/lifetime model to the access/resource
+> model. It narrates the migration chronology and the 2026-08 audit
+> findings; it is not a living plan and nothing here is a current design
+> assumption. The normative model is `../current/memory_model.md`; where
+> this document and the normative model disagree, the normative model
+> wins.
+
 **Status:** historical — the migration described here is complete.
-**Normative model:** [`memory_model.md`](memory_model.md). This document
+**Normative model:** [`../current/memory_model.md`](../current/memory_model.md). This document
 is the archived record of the migration that produced it; it is not a
 living plan and nothing here should be read as a current design
 assumption. Where this document and `memory_model.md` disagree, the

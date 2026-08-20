@@ -13,12 +13,18 @@
 #   - Fixed, repo-relative output paths (no mktemp randomness).
 #   - Sorted, stable argument ordering.
 #   - No reliance on wall-clock output; only content hashes are compared.
-#   - The two-clean-directory check builds from two pristine copies and
+#   - The two-root reproducibility check builds the identical manifest
+#     closure from two pristine trees (common seed + common host) and
 #     asserts byte-identical binaries.
+#   - Canary suite manifests are validated for parity in both directions
+#     (manifest == discovered-set) with recorded counts, before the ladder.
 #
 # Phase fingerprints:
-#   Set TG_BOOTSTRAP_TRACE=1 (or pass --trace / --trace-phases) to emit
-#   per-phase sha256 fingerprints (token/ast/mir/object/link) for each stage.
+#   Per-phase sha256 fingerprints are emitted for every stage (link-image,
+#   text, sections, symbols, relocs and — under trace — the probed tokens,
+#   ast/hir, mir, mir-mono front-end dumps). The stage2 == stage3
+#   reproducibility gate compares EVERY fingerprinted phase, not just the
+#   final link image.
 #
 # Usage:
 #   ./run_bootstrap.sh [--trace|--trace-phases] [--skip-determinism] [--skip-ladder]
@@ -27,7 +33,7 @@
 # Exit codes:
 #   0  all stages built and validated
 #   1  any stage failed to build or validate
-#   2  stage2 != stage3 determinism check failed
+#   2  stage2 != stage3 (per-phase reproducibility gate) or two-root check failed
 #   3  stage2 diagnostic ladder failed
 
 set -euo pipefail
@@ -65,7 +71,12 @@ STAGE0_BIN=""
 RUN_LADDER=1
 RUN_DETERMINISM=1
 RUN_NATIVE_TESTS=1
-TARGET_TRIPLE="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
+# The single resolved target object: resolved ONCE through the bootstrap
+# target authority (bh_boot_target) and exported so every subprocess
+# (gen_bootstrap_input.sh, stage compiles, canary lanes) observes the SAME
+# target. Nothing below re-derives or hard-codes a triple.
+TARGET_TRIPLE="$(bh_boot_target)"
+export TARGET_TRIPLE
 
 # Compiler bootstrap entry source used as the bootstrap unit.
 DRIVER_SRC="tg_compiler/bootstrap_main.tg"
@@ -94,15 +105,15 @@ for arg in "$@"; do
 run_bootstrap.sh — deterministic Tangerine bootstrap validation harness
 
 Options:
-  --trace | --trace-phases   emit per-phase sha256 fingerprints (token/ast/mir/object/link)
+  --trace | --trace-phases   emit per-phase sha256 fingerprints (link/text/sections/symbols/relocs + probed front-end dumps)
   --skip-ladder              skip the stage2 diagnostic ladder
-  --skip-determinism         skip the two-clean-directory determinism check
-  --skip-native-tests        skip compiling+running native canaries / ARM64 tests
+  --skip-determinism         skip the two-root reproducibility check
+  --skip-native-tests        skip compiling+running native canaries / arch tests
   -h | --help                show this help
 
 Environment:
   TG_BOOTSTRAP_TRACE=1       enable phase fingerprints
-  TG_BOOTSTRAP_TARGET=...    target triple (default aarch64-apple-darwin)
+  TG_BOOTSTRAP_TARGET=...    target triple (default: the bootstrap target authority in scripts/bootstrap_helpers.sh)
 HELP
       exit 0
       ;;
@@ -147,6 +158,20 @@ run_logged() {
 bh_log "== Bootstrap unit (compiler_kernel.manifest) =="
 if ! run_logged gen_bootstrap_input bash "$ROOT_DIR/scripts/gen_bootstrap_input.sh"; then
   bh_err "bootstrap kernel manifest closure is invalid"
+  exit 1
+fi
+
+# ———————————————————————————————————————————————————————————————
+# Step 0.5 — canary suite manifest parity pre-gate
+# ———————————————————————————————————————————————————————————————
+
+# Cheap structural gate BEFORE the expensive ladder: every canary suite
+# advertised as a bootstrap acceptance gate must be present, manifest-listed
+# in both directions, and exactly match its recorded count. A missing test,
+# an unlisted test, or a zero suite fails the harness immediately.
+bh_log "== Canary suite manifest parity =="
+if ! bh_require_canary_suites; then
+  bh_err "canary suite manifest parity failed (missing/unlisted tests or count drift)"
   exit 1
 fi
 
@@ -264,7 +289,7 @@ if [ "$RUN_NATIVE_TESTS" = "1" ]; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 6 — stage2 == stage3 reproducibility gate
+# Step 6 — stage2 == stage3 reproducibility gate (every phase)
 # ———————————————————————————————————————————————————————————————
 
 bh_log "== Reproducibility: stage2 vs stage3 =="
@@ -279,14 +304,22 @@ if ! cmp -s "$STAGE2" "$STAGE3"; then
 fi
 bh_log "stage2 == stage3 (reproducible fixed point, 'cmp' OK)"
 
+# Phase-level fixed-point gate: stage2 == stage3 at EVERY fingerprinted
+# phase (link-image, text, sections, symbols, relocs, and the probed
+# front-end dumps under trace), not only at the final link image.
+if ! bh_phase_equality tg_stage2 tg_stage3 "$BUILD_DIR"; then
+  bh_err "stage2/stage3 per-phase equality failed — phase fingerprints diverged"
+  exit 2
+fi
+
 # ———————————————————————————————————————————————————————————————
-# Step 7 — two-clean-directory determinism check
+# Step 7 — two-root reproducibility check
 # ———————————————————————————————————————————————————————————————
 
 if [ "$RUN_DETERMINISM" = "1" ]; then
-  bh_log "== Two-clean-directory determinism check =="
+  bh_log "== Two-root reproducibility check (common seed + common host) =="
   if ! check_two_clean_dirs tg_det "$STAGE2" "$BUILD_DIR" "$ROOT_DIR"; then
-    bh_err "two-clean-directory determinism check failed"
+    bh_err "two-root reproducibility check failed"
     exit 2
   fi
 fi

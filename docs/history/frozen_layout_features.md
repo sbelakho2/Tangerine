@@ -1,4 +1,15 @@
 # Tangerine Layout Engine — Frozen Feature Gates
+
+> **NON-NORMATIVE — HISTORICAL.** This document is superseded: its container
+> layouts describe the pre-consolidation Map/Set headers (the 48-byte Map
+> with `hash_fn`/`eq_fn` and the 32-byte Set) that the runtime no longer
+> implements, and its `&T`/`&mut T` pointer rows predate the access/resource
+> model (no first-class reference types; E106). The current layout
+> authority is `../current/stabilized_subset.md` (F2 container ABI) plus
+> `tg_compiler/layout_engine.tg` (MAP_HEADER_FIELDS, `type_repr`,
+> `repr_header_size`). Do not treat anything in this file as current
+> layout data.
+
 # ================================================================
 # This document defines which layout representation features are
 # FROZEN (stable, must not change without a major version bump)

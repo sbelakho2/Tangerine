@@ -28,8 +28,8 @@
 
 ## Status Board
 
-The single source of truth status board is this checklist file:
-[`tangerine_graphics_ui_development_checklist.md`](../tangerine_graphics_ui_development_checklist.md)
+The single source of truth status board is the repository-root checklist
+file: [`checklist.md`](../checklist.md).
 
 Each section maps to a milestone. Items marked `[x]` are complete with evidence links.
 Items marked `[ ]` are open work.

@@ -1,7 +1,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::args::{raw_arg_count, raw_arg_unchecked, raw_arg_copy}
-use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists, is_dir, raw_open, raw_read, raw_close, O_RDONLY, S_DEFAULT}
+use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists, is_dir, raw_open, raw_read, raw_close, O_RDONLY, S_DEFAULT, IoError}
 use std::env::{args}
 use std::bench::{BenchCase, bench_case_new}
 use std::process::{run_command}
@@ -15,19 +15,18 @@ use tg_compiler::ast::{
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
 }
 use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded, diag_macro_ambiguity}
-use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, TypedProgram, extract_import_paths, TypeEnv}
+use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, extract_import_paths, TypeEnv}
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
-use tg_compiler::resource_check::{resource_check, build_typed_cfg, ResourceError}
+use tg_compiler::resource_check::{resource_check, build_typed_cfg, ResourceError, AnalyzedProgram, analysis_context_new}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
-use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
+use tg_compiler::asm::{AsmTarget}
 use tg_compiler::mono::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 use tg_compiler::version::{VERSION}
 
 extern def libc_write(fd: Int, buf: Ptr[u8], count: UInt) -> Int
-extern def read_file_to_string_native(path: String) -> String
 def syscall_write(fd: Int, buf: Ptr[u8], count: UInt) -> Int
   libc_write(fd, buf, count)
 end
@@ -176,14 +175,22 @@ pub def should_skip_bootstrap_semantic_checks(opts: &CompilerOptions, path: Stri
   false
 end
 
-pub def bootstrap_codegen_target() -> AsmTarget
-  asm_target(Arch::AArch64, OsAbi::MacOS)
+# THE one target resolution authority for the compile pipeline: an explicit
+# --target triple wins, otherwise the host target is detected. Every
+# front-end entry (compile_file_core, compile_startup_entry,
+# compile_multiple_files) threads the SAME TargetSpec into codegen — no
+# phase or entry resolves a target on its own.
+pub def resolve_codegen_target(opts: &CompilerOptions) -> AsmTarget
+  match opts.target_triple
+  when Option::Some(triple) then parse_target_triple(triple)
+  when Option::None then detect_host_target()
+  end
 end
 
-pub def driver_lower_to_mir(ast: &Program, typed: &Option[TypedProgram]) -> Result[MirProgram, String]
-  match typed
-  when Option::Some(tp) then lower_to_mir(ast, tp)
-  when Option::None then Result::Err("MIR lowering requires a typed program")
+pub def driver_lower_to_mir(ast: &Program, analyzed: &Option[AnalyzedProgram]) -> Result[MirProgram, String]
+  match analyzed
+  when Option::Some(ap) then lower_to_mir(ast, ap)
+  when Option::None then Result::Err("MIR lowering requires an analyzed program")
   end
 end
 
@@ -688,8 +695,12 @@ pub struct CompilationUnit
   mir: Option[MirProgram]
 end
 
-pub def read_file_text_direct(path: String) -> String
-  read_file_to_string_native(path)
+# The single source-reading API of the pipeline. An empty successful read is
+# a VALID empty String (an empty translation unit is a legal Tangerine
+# program), never an I/O failure: the std fs read returns
+# Result[String, IoError] and only a real I/O error is an Err.
+pub def read_source_file(path: String) -> Result[String, IoError]
+  read_file(path)
 end
 
 # Canonical AST preparation: macro expansion + node-id assignment.
@@ -697,7 +708,7 @@ end
 # uses it too, so preparation is defined exactly ONCE and every pipeline
 # (ordinary compile, `tg check`, bootstrap compile) flows through the same
 # preparation + analyze_parsed + lowering shape.
-# P1 (macro hygiene, expansion-depth contract): the diagnostic bag is the
+# (macro hygiene, expansion-depth contract): the diagnostic bag is the
 # parser's channel — when the 64-pass expansion fixpoint fails to converge,
 # expand_macros records E105 into it (diag_macro_expansion_depth_exceeded);
 # the caller checks diag_has_errors on it and returns the failed state before
@@ -708,61 +719,97 @@ pub def prepare_parsed(program: &mut Program, diags: &mut Vec[Diagnostic]) -> Un
   assign_node_ids(program)
 end
 
-# P1 diagnostic aggregation: a failing phase reports its ENTIRE error set,
-# never just the first error. Each error becomes one line of the form
-#   error at <file>:<start>: <message>
-# and lines are joined with "\n". The pipeline's String interface is kept
-# unchanged, so every consumer (compile_file_core, driver, lib) sees the
-# full set without an interface break.
-def join_type_errors(errors: &Vec[TypeError]) -> String
-  var out = ""
-  var first = true
+# ———————————————————————————————————————————————————————————————
+# Common diagnostic channel
+# ———————————————————————————————————————————————————————————————
+# Diagnostic (parser.tg) is the ONE structured diagnostic type through the
+# passes. Every phase error (parse, resolution, type, access, resource)
+# converts into it at the phase boundary, so the passes share a single
+# channel instead of phase-specific joiners. Stringification happens ONLY
+# at the two presentation boundaries: the DiagnosticEmitter (CLI rendering,
+# human or JSON) and join_diagnostics (the Result[_, String] API boundary).
+
+def type_error_to_diag(e: &TypeError) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: e.message,
+    span: Option::Some(e.span),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: e.code
+  }
+end
+
+def access_error_to_diag(e: &AccessError) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: e.message,
+    span: Option::Some(e.span),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::None
+  }
+end
+
+def resource_error_to_diag(e: &ResourceError) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: e.message,
+    span: Option::Some(e.span),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::None
+  }
+end
+
+def resolution_error_to_diag(e: &ResolutionError) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: e.message,
+    span: Option::Some(e.span),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::None
+  }
+end
+
+def type_errors_to_diags(errors: &Vec[TypeError]) -> Vec[Diagnostic]
+  var out = Vec::new()
   for e in errors do
-    if !first then out = out + "\n" end
-    first = false
-    let code_str = match e.code
-    when Option::Some(c) then "[" + c + "] "
-    when Option::None then ""
-    end
-    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + code_str + e.message
+    out.push(type_error_to_diag(&e))
   end
   out
 end
 
-def join_access_errors(errors: &Vec[AccessError]) -> String
-  var out = ""
-  var first = true
+def access_errors_to_diags(errors: &Vec[AccessError]) -> Vec[Diagnostic]
+  var out = Vec::new()
   for e in errors do
-    if !first then out = out + "\n" end
-    first = false
-    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+    out.push(access_error_to_diag(&e))
   end
   out
 end
 
-def join_resource_errors(errors: &Vec[ResourceError]) -> String
-  var out = ""
-  var first = true
+def resource_errors_to_diags(errors: &Vec[ResourceError]) -> Vec[Diagnostic]
+  var out = Vec::new()
   for e in errors do
-    if !first then out = out + "\n" end
-    first = false
-    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+    out.push(resource_error_to_diag(&e))
   end
   out
 end
 
-def join_resolution_errors(errors: &Vec[ResolutionError]) -> String
-  var out = ""
-  var first = true
+def resolution_errors_to_diags(errors: &Vec[ResolutionError]) -> Vec[Diagnostic]
+  var out = Vec::new()
   for e in errors do
-    if !first then out = out + "\n" end
-    first = false
-    out = out + "error at " + e.span.file + ":" + e.span.start.to_string() + ": " + e.message
+    out.push(resolution_error_to_diag(&e))
   end
   out
 end
 
-def join_parse_diagnostics(diags: &Vec[Diagnostic]) -> String
+# The ONE stringifier of the front end. Joins a structured diagnostic set
+# into the "error at <file>:<start>: [code] message" form every
+# Result[_, String] boundary (analyze_parsed, analyze_source,
+# compile_file_core, driver::parse_file) carries.
+pub def join_diagnostics(diags: &Vec[Diagnostic]) -> String
   var out = ""
   var first = true
   for d in diags do
@@ -772,13 +819,17 @@ def join_parse_diagnostics(diags: &Vec[Diagnostic]) -> String
     when Option::Some(sp) then "error at " + sp.file + ":" + sp.start.to_string() + ": "
     when Option::None then "error: "
     end
-    out = out + loc + d.message
+    let code_str = match d.code
+    when Option::Some(c) then "[" + c + "] "
+    when Option::None then ""
+    end
+    out = out + loc + code_str + d.message
   end
   out
 end
 
-pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
-  # P1 (macro hygiene, expansion-depth contract): preparation records E105
+pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
+ # (macro hygiene, expansion-depth contract): preparation records E105
   # through the parser's diagnostic channel when the expansion fixpoint does
   # not converge; diag_has_errors then returns the failed state BEFORE
   # resolution/type-checking (and therefore before any lowering) — an
@@ -786,11 +837,11 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
   var macro_diags: Vec[Diagnostic] = Vec::new()
   prepare_parsed(program, &mut macro_diags)
   if diag_has_errors(&macro_diags) then
-    return Result::Err(join_parse_diagnostics(&macro_diags))
+    return Result::Err(join_diagnostics(&macro_diags))
   end
   match resolve_names(program)
   when Result::Ok(res) then
-    # P1 (recovery separation): the compilation path ALWAYS runs strict.
+ # (recovery separation): the compilation path ALWAYS runs strict.
     # Guard: a real compilation with strict_resolution = false is an internal
     # error, so the flag is forced on unconditionally here (type_check_typed
     # enforces the same invariant); permissive resolution is unreachable from
@@ -799,91 +850,91 @@ pub def analyze_parsed(env: &mut TypeEnv, program: &mut Program, opts: &Compiler
     env.strict_resolution = true
     let type_result = type_check_typed(env, program, &res)
     if !type_result.errors.is_empty() then
-      return Result::Err(join_type_errors(&type_result.errors))
+      return Result::Err(join_diagnostics(&type_errors_to_diags(&type_result.errors)))
     end
-    let typed = type_result.program
-    # P0-CF2 (ONE TypedCFG): the CFG is built HERE, ONCE, before any
+    let typed = type_result.program.typed
+ # (ONE TypedCFG): the CFG is built HERE, ONCE, before any
     # analysis state runs — build_typed_cfg is never called again anywhere
     # in the pipeline. The SAME instance is passed through access checking
-    # and resource checking and carried on the TypedProgram (cfg) for the
-    # MIR's cleanup generation (lower_program's resource-check re-run reads
-    # it back) — the edge identity equality is structural by construction.
+    # and resource checking and carried in the AnalyzedProgram (cfg) for the
+    # MIR's cleanup generation — the edge identity equality is structural by
+    # construction.
     let cfg = build_typed_cfg(program, &typed)
-    let access_errors = access_check(program, &typed, &cfg)
+ # ONE AnalysisContext per compilation — the accumulators (the
+    # iteration plans, the typed iterations, the block frames, the slice-view
+    # registry) and the CfgEdgeId-keyed access registry. access_check
+    # populates the registry; resource_check consumes it through the SAME
+    # context; the finished context is carried in the AnalyzedProgram.
+    var ctx = analysis_context_new()
+    let access_errors = access_check(program, &typed, &cfg, &mut ctx)
     if !access_errors.is_empty() then
-      return Result::Err(join_access_errors(&access_errors))
+      return Result::Err(join_diagnostics(&access_errors_to_diags(&access_errors)))
     end
-    let res_result = resource_check(program, &typed, &cfg)
+ # the engine snapshot TypeEnv of the typed tables — built ONCE by
+    # type_check_typed (the placeholder artifact's engine_snapshot) and
+    # reused here: resource_check consumes it (env_snapshot) and the
+    # finished snapshot is carried in the AnalyzedProgram so the MIR's
+    # lowering never rebuilds it.
+    var engine_snapshot = type_result.program.engine_snapshot
+    let res_result = resource_check(program, &typed, &cfg, &mut ctx, &mut engine_snapshot)
     if !res_result.errors.is_empty() then
-      return Result::Err(join_resource_errors(&res_result.errors))
+      return Result::Err(join_diagnostics(&resource_errors_to_diags(&res_result.errors)))
     end
-    # The authoritative per-function finalize plan flows from the resource
-    # checker into the typed program so MIR cleanup is single-sourced (MIR
-    # consumes typed.finalize_plan instead of re-deriving ownership).
-    Result::Ok(TypedProgram {
-      ast: typed.ast,
-      resolutions: typed.resolutions,
-      expr_types: typed.expr_types,
-      typed_exprs: typed.typed_exprs,
-      call_targets: typed.call_targets,
-      call_instances: typed.call_instances,
-      field_targets: typed.field_targets,
-      access_effects: typed.access_effects,
-      closure_captures: typed.closure_captures,
-      local_bindings: typed.local_bindings,
-      ident_resolutions: typed.ident_resolutions,
-      param_binding_resolutions: typed.param_binding_resolutions,
-      pattern_binding_resolutions: typed.pattern_binding_resolutions,
-      deinit_plans: typed.deinit_plans,
-      aggregate_ownership: typed.aggregate_ownership,
+ # (ONE AnalyzedProgram): the single immutable analysis artifact —
+    # the typed HIR, the ONE TypedCFG (with the serialized CleanupEdge
+    # table in cfg.cleanup), the semantic finalize plan, the whole
+    # AnalysisContext (the iteration plans, the block frames, the slice-view
+    # registry, the CfgEdgeId-keyed access registry), the engine snapshot,
+    # and the two checkers' error lists. MIR consumes THIS artifact
+    # (lower_program takes it) — resource_check is never re-run during
+    # lowering.
+    Result::Ok(AnalyzedProgram {
+      typed: typed,
+      # the library API (lib.tg / lib_kernel.tg) reads ast / resolutions
+      # directly off the analyze result (compile/check).
+      ast: typed.ast.clone(),
+      resolutions: typed.resolutions.clone(),
+      cfg: res_result.cfg,
       finalize_plan: res_result.finalize_plan,
-      # P0-CE: the String-keyed edge_cleanup serialization is DELETED from
-      # the checker's result; the TypedProgram field (types.tg) is kept
-      # empty and unread — the MIR consumes the CleanupEdge table through
-      # the checker's own result channel (lower_program re-runs
-      # resource_check on THE SAME CFG INSTANCE — typed.cfg, the ONE
-      # TypedCFG built above — and reads plan_result.cfg).
-      edge_cleanup: Map::new(),
-      cfg: cfg,
-      type_names: typed.type_names,
-      deinit_targets: typed.deinit_targets,
-      type_fields: typed.type_fields,
-      type_variants: typed.type_variants,
-      type_params: typed.type_params,
-      type_kinds: typed.type_kinds,
-      type_aliases: typed.type_aliases,
-      # P0: the typed declaration records — the fn-signature table, the
-      # static/const declared-type table, and the canonical LangItems
-      # snapshot — flow from the checker's result into the typed program
-      # the MIR consumes (the MIR reads declaration types from these
-      # tables; it never interprets TypeExpr after checking).
-      typed_fn_signatures: typed.typed_fn_signatures,
-      typed_static_types: typed.typed_static_types,
-      lang_items: typed.lang_items,
-      generic_param_ids: typed.generic_param_ids,
-      generic_param_names: typed.generic_param_names
+      context: ctx,
+      engine_snapshot: engine_snapshot,
+      access_errors: access_errors,
+      resource_errors: res_result.errors
     })
   when Result::Err(res_errors) then
     if res_errors.len() > 0 then
-      Result::Err(join_resolution_errors(&res_errors))
+      Result::Err(join_diagnostics(&resolution_errors_to_diags(&res_errors)))
     else
       Result::Err("name resolution failed")
     end
   end
 end
 
-pub def analyze_program(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[TypedProgram, String]
+pub def analyze_program(env: &mut TypeEnv, program: &mut Program, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
   analyze_parsed(env, program, opts)
 end
 
-pub def analyze_source(source: String, file: String, opts: &CompilerOptions) -> Result[TypedProgram, String]
+# THE one parse entry of the front end. Every front-end path — the CLI
+# (compile_file_core, compile_startup_entry, compile_multiple_files), the
+# library API (analyze_source) and the driver's parse_file — routes its
+# parse through this function, which always returns the COMPLETE structured
+# diagnostic set on failure. A bare "Parse error" summary is never produced.
+pub def parse_source_program(source: String, file: String) -> Result[Program, Vec[Diagnostic]]
   let lex_result = tokenize(source, file)
   let parse_out = parse(lex_result)
-  let parse_diags = parse_out.diagnostics
-  if diag_has_errors(&parse_diags) then
-    return Result::Err(join_parse_diagnostics(&parse_diags))
+  if diag_has_errors(&parse_out.diagnostics) then
+    Result::Err(parse_out.diagnostics)
+  else
+    Result::Ok(parse_out.program)
   end
-  var ast = parse_out.program
+end
+
+pub def analyze_source(source: String, file: String, opts: &CompilerOptions) -> Result[AnalyzedProgram, String]
+  var ast = match parse_source_program(source, file)
+  when Result::Ok(program) then program
+  when Result::Err(diags) then
+    return Result::Err(join_diagnostics(&diags))
+  end
   var env = type_env_new()
   analyze_parsed(&mut env, &mut ast, opts)
 end
@@ -893,9 +944,10 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
     println("[diag] compile_file_core entered, path=" + path.clone())
   end
 
-  let source = read_file_text_direct(path.clone())
-  if source.len() == 0 then
-    return Result::Err("Failed to read file: " + path.clone())
+  let source = match read_source_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    return Result::Err("Failed to read file: " + path.clone() + ": " + e)
   end
 
   if opts.verbose then
@@ -917,31 +969,42 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
     println("  Lexing...")
   end
   
-  # Create lexer and tokenize
-  var lex = lexer_new(source, path.clone())
-  let lex_result = tokenize_impl(&mut lex)
-  if opts.print_tokens then
-    println("Tokens:")
-    for tok in lex_result.tokens do
-      println("  " + token_debug(tok))
-    end
-  end
+  # Token dump/print support only — the canonical parse entry below
+  # tokenizes once itself.
+  var dump_tokens = false
   match opts.dump_phase
-  when Option::Some("tokens") then
-    return Result::Ok(())
+  when Option::Some("tokens") then dump_tokens = true
   when _ then ()
   end
-  
-  # Phase 2: Parsing
+  if opts.print_tokens || dump_tokens then
+    var lex = lexer_new(source, path.clone())
+    let lex_result = tokenize_impl(&mut lex)
+    if opts.print_tokens then
+      println("Tokens:")
+      for tok in lex_result.tokens do
+        println("  " + token_debug(tok))
+      end
+    end
+    if dump_tokens then
+      return Result::Ok(())
+    end
+  end
+
+  # Phase 2: Parsing — the ONE parse entry (parse_source_program) returns
+  # the COMPLETE structured diagnostic set; every diagnostic is emitted
+  # through the emitter (presentation) and the same full set flows out of
+  # the Result API boundary.
   if opts.verbose then
     println("  Parsing...")
   end
-  
-  let parse_out = parse(lex_result)
-  let ast = parse_out.program
-  let parse_diags = parse_out.diagnostics
-  if diag_has_errors(&parse_diags) then
-    return Result::Err("Parse error")
+
+  let ast = match parse_source_program(source, path.clone())
+  when Result::Ok(program) then program
+  when Result::Err(diags) then
+    for d in diags do
+      emit_diagnostic(emitter, d)
+    end
+    return Result::Err(join_diagnostics(&diags))
   end
 
   if opts.verbose then
@@ -1020,7 +1083,7 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
   if opts.verbose then
     println("  Type checking...")
   end
-  var typed_program: Option[TypedProgram] = Option::None
+  var typed_program: Option[AnalyzedProgram] = Option::None
   var env = type_env_new()
   match analyze_program(&mut env, &mut ast, opts)
   when Result::Ok(tp) then
@@ -1177,18 +1240,14 @@ pub def compile_file_core(path: String, opts: &CompilerOptions, emitter: &mut Di
     println("  Generating native code...")
   end
   
-  let target = match opts.target_triple
-  when Option::Some(triple) then parse_target_triple(triple)
-  when Option::None then detect_host_target()
-  end
+  let target = resolve_codegen_target(opts)
   
   match opts.emit
   when EmitMode::Object then
     let obj_bytes = match generate_object_file(&mir, &target)
     when Result::Ok(b) then b
     when Result::Err(e) then
-      println(e)
-      return 1
+      return Result::Err("Object generation failed: " + e)
     end
     let obj_path = get_output_path(opts, path.clone(), ".o")
     match write_file_bytes(obj_path.clone(), &obj_bytes)
@@ -1272,9 +1331,10 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     e
   end
 
-  let source = read_file_text_direct(path.clone())
-  if source.len() == 0 then
-    println("Failed to read file: " + path.clone())
+  let source = match read_source_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    println("Failed to read file: " + path.clone() + ": " + e)
     return 1
   end
 
@@ -1292,9 +1352,9 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     println("  Lexing...")
   end
 
-  var lex = lexer_new(source, path.clone())
-  let lex_result = tokenize_impl(&mut lex)
   if opts.print_tokens then
+    var lex = lexer_new(source, path.clone())
+    let lex_result = tokenize_impl(&mut lex)
     println("Tokens:")
     for tok in lex_result.tokens do
       println("  " + token_debug(tok))
@@ -1305,15 +1365,13 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     println("  Parsing...")
   end
 
-  let parse_out = parse(lex_result)
-  let ast = parse_out.program
-  let parse_diags = parse_out.diagnostics
-  if diag_has_errors(&parse_diags) then
-    var i = 0
-    while i < parse_diags.len() do
-      let d = parse_diags[i]
-      println("Parse error: " + d.message)
-      i = i + 1
+  # The ONE parse entry: the complete structured diagnostic set is emitted
+  # through the emitter — never the old per-line "Parse error:..." prints.
+  let ast = match parse_source_program(source, path.clone())
+  when Result::Ok(program) then program
+  when Result::Err(diags) then
+    for d in diags do
+      emit_diagnostic(&mut emitter, d)
     end
     return 1
   end
@@ -1351,7 +1409,7 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
   # duplicated expansion and node-id assignment and could drift from what
   # analyze_parsed does, so positive and negative canaries were checked
   # through different routes.
-  var typed_program: Option[TypedProgram] = Option::None
+  var typed_program: Option[AnalyzedProgram] = Option::None
   if skip_bootstrap_semantic_checks then
     if opts.verbose then
       println("  Skipping semantic checks during compiler bootstrap")
@@ -1364,12 +1422,12 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
     var bootstrap_diags: Vec[Diagnostic] = Vec::new()
     prepare_parsed(&mut ast, &mut bootstrap_diags)
     if diag_has_errors(&bootstrap_diags) then
-      println(join_parse_diagnostics(&bootstrap_diags))
+      println(join_diagnostics(&bootstrap_diags))
       return 1
     end
   else
     var env = type_env_new()
-    # P1 (recovery separation): compilation always runs strict — the flag is
+ # (recovery separation): compilation always runs strict — the flag is
     # forced on unconditionally at the invocation (a real compilation with
     # strict_resolution = false is an internal error); permissive editor
     # recovery never produces a TypedProgram.
@@ -1483,14 +1541,7 @@ pub def compile_startup_entry(opts: &CompilerOptions, path: String, output_path:
   if opts.verbose then
     println("  Generating native code...")
   end
-  let target = if skip_bootstrap_semantic_checks then
-    bootstrap_codegen_target()
-  else
-    match opts.target_triple
-    when Option::Some(triple) then parse_target_triple(triple)
-    when Option::None then detect_host_target()
-    end
-  end
+  let target = resolve_codegen_target(opts)
 
   match opts.emit
   when EmitMode::Object then
@@ -1546,16 +1597,16 @@ end
 # with compiler internals. The full lib.tg is only for users embedding the
 # complete compiler.
 #
-# MODULE FLATTENING (P0-AM): imported modules are recursively parsed and
+# MODULE FLATTENING: imported modules are recursively parsed and
 # their items merged into one Program, and the Crate module table is the
-# single module identity (see the P0-AM note below). store_type_def
+# single module identity (see the note below). store_type_def
 # (types.tg) registers each declaration under its module-qualified key, so
 # same-named DISTINCT types in different modules are distinct module-local
 # types — never merged.
 #
-# P0-AM module table (construction site): while flattening, this function
+# module table (construction site): while flattening, this function
 # (with collect_dep_file below) BUILDS the Program.crate Crate — the single
-# module table the reviewer's design specifies: Crate { root: ModuleId,
+# module table the design specifies: Crate { root: ModuleId,
 # modules: Map[ModuleId, Module] }, one Module per distinct module, each
 # carrying its OWN item list (Module.items: Vec[ItemId] — an ItemId is the
 # item's index into the flat Program.items) and path, and every item its
@@ -1580,9 +1631,9 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
   for item in program.items do
     merged_items.push(item.clone())
   end
-  # P0-AM: the root module (id 0, empty path, no imports) covers the main
-  # program's top-level items; dependencies get ids 1, 2, ... in processing
-  # order. P1: the root module's per-module item list (Module.items:
+ # the root module (id 0, empty path, no imports) covers the main
+  # program's top-level items; dependencies get ids 1, 2,... in processing
+ # order.: the root module's per-module item list (Module.items:
   # Vec[ItemId]) is built here — each ItemId the flat index of one main
   # program item (the items already carry the root owner ModuleId from the
   # parser's make_item).
@@ -1705,7 +1756,7 @@ pub def dep_use_to_file(u: &UseDecl) -> Option[String]
 end
 
 pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut Set[String], modules: &mut Map[ModuleId, Module]) -> Result[Unit, DependencyError]
-  # P0-AM (module table construction site): this drives the recursive
+ # (module table construction site): this drives the recursive
   # dependency walk that merge_imported_deps's Crate consumes. Every distinct
   # dependency file yields exactly one Module (see collect_dep_file); the
   # `loaded` set keys the dedup, so ModuleIds stay 1:1 with module paths and
@@ -1728,7 +1779,7 @@ pub def collect_dep_items(program: &Program, out: &mut Vec[Item], loaded: &mut S
   Result::Ok(())
 end
 
-# P0-AM: derive the module path segments of a dependency file for its
+# derive the module path segments of a dependency file for its
 # Module ("std/core.tg" -> ["std", "core"], "tg_compiler/ast.tg" ->
 # ["tg_compiler", "ast"]). The main program is the root module ([]).
 def module_path_from_file(path: &String) -> Vec[String]
@@ -1759,7 +1810,11 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
   if !file_exists(path.clone()) then
     return Result::Err(DependencyError::Read)
   end
-  let source = read_file_text_direct(path)
+  let source = match read_source_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    return Result::Err(DependencyError::Read)
+  end
 
   let tokens = tokenize(source, path.clone())
   let dep_parse = parse(tokens)
@@ -1787,16 +1842,16 @@ pub def collect_dep_file(path: String, out: &mut Vec[Item], loaded: &mut Set[Str
   when Result::Err(e) then
     return Result::Err(e)
   end
-  # MODULE FLATTENING (P0-AM): add all items from this dependency into the
+ # MODULE FLATTENING: add all items from this dependency into the
   # single merged Program.items vector (see merge_imported_deps). Dedup: the
   # `loaded` set is keyed by module path and is inserted before recursion, so
   # each distinct module is processed exactly once; diamond and cyclic imports
   # neither duplicate items nor recurse forever. Items of a module stay
   # contiguous after its own imports, so per-module ordering is preserved.
-  # P1 (module table — construction site): record this module's Module in
+ # (module table — construction site): record this module's Module in
   # the Crate here — the `loaded` dedup above guarantees exactly one entry
   # per distinct module path, and the ModuleId is its processing order
-  # (root = 0, then 1, 2, ... in dependency-processing order). The per-module
+  # (root = 0, then 1, 2,... in dependency-processing order). The per-module
   # item list (Module.items: Vec[ItemId]) is built HERE, once, around the
   # push loop below — each ItemId is the pushed item's index into the flat
   # Program.items — and EVERY pushed item is stamped with its owning
@@ -1843,7 +1898,7 @@ pub def get_output_path(opts: &CompilerOptions, input: String, ext: String) -> S
   match opts.output_file
   when Option::Some(out) then out
   when Option::None then
-    # Replace .tg with ext
+    # Replace.tg with ext
     if input.ends_with(".tg") then
       input.slice(0, input.len() - 3) + ext
     else
@@ -1868,7 +1923,7 @@ pub def print_mir(mir: &MirProgram) -> Unit
 end
 
 pub struct MacroEnv
-  # P1 (macro identity): the macro table is MODULE-SCOPED. Every macro is
+ # (macro identity): the macro table is MODULE-SCOPED. Every macro is
   # registered under its module-qualified identity — the (module path, name)
   # pair rendered with the resolver's module-qualified key form
   # ("path::name", the root module's empty path degenerates to the bare
@@ -1879,19 +1934,19 @@ pub struct MacroEnv
   # scope) are an ambiguity ERROR (E107), never a last-wins shadow. The
   # qualified keys are MacroId { module_path, name } rendered by macro_id_key.
   macros: Map[String, MacroDecl]
-  # P1 (macro identity): the module path (Program.crate module path) of the
+ # (macro identity): the module path (Program.crate module path) of the
   # item currently being expanded. expand_program_pass sets it per item from
   # the item's OWNER ModuleId (program.items[i].owner_module -> the crate
   # table — see module_path_for_item); it is the resolution anchor for
   # bare macro names and for relative qualified paths at call sites.
   current_module: Vec[String]
-  # P1 (macro identity): per-module import tables for macro names — module
+ # (macro identity): per-module import tables for macro names — module
   # path join -> the qualified keys of the macros its use declarations bring
   # into scope. Bare-name lookup consults the current module's table after
   # its own definitions; two imports naming the same local macro from
   # different modules is an ambiguity error (E107).
   macro_imports: Map[String, Vec[String]]
-  # P1 (macro identity): per-module import tables for MODULE aliases —
+ # (macro identity): per-module import tables for MODULE aliases —
   # module path join -> the imported module paths (from `use a::b;` /
   # braced / glob declarations, mirroring the resolver's import machinery).
   # Qualified path resolution expands a first segment that aliases an
@@ -1899,7 +1954,7 @@ pub struct MacroEnv
   module_imports: Map[String, Vec[Vec[String]]]
   # Recursion stack for macro identity (prevents infinite expansion)
   expansion_stack: Vec[String]
-  # P1 (macro hygiene, structural): per-program expansion context counter.
+ # (macro hygiene, structural): per-program expansion context counter.
   # Every macro expansion interns one fresh syntax-context mark (see
   # intern_syntax_context); the marks stamp the identifiers the expansion
   # introduces so no two expansions and no expansion and its surrounding
@@ -1914,7 +1969,7 @@ pub struct MacroEnv
   # expand_expr macro arms: the substituted body of an expansion is
   # re-expanded with the composed stack inherited from the outer context).
   expansion_counter: Int
-  # P1 (macro hygiene, structural): the SYNTAX-CONTEXT INTERN TABLE — every
+ # (macro hygiene, structural): the SYNTAX-CONTEXT INTERN TABLE — every
   # fresh mark records the composed context stack it represents (the parent
   # stack plus the mark itself). The marks are the interned syntax contexts
   # of the generated Identifier { symbol, syntax_context } values; the
@@ -1923,7 +1978,7 @@ pub struct MacroEnv
   # (see identifier_key_of: `$` is outside the lexer's identifier charset,
   # so no user-written identifier can ever equal a generated key).
   syntax_contexts: Map[Int, Vec[Int]]
-  # P1 (macro identity): diagnostics recorded during expansion (macro
+ # (macro identity): diagnostics recorded during expansion (macro
   # ambiguity E107, recorded at the call/definition site). expand_macros
   # drains this bag into the parser's diagnostic channel after the fixpoint
   # loop (and before the early returns), so an ambiguity fails the
@@ -1931,7 +1986,7 @@ pub struct MacroEnv
   diagnostics: Vec[Diagnostic]
 end
 
-# P1 (macro hygiene, structural): the generated identifier — the SYMBOL
+# (macro hygiene, structural): the generated identifier — the SYMBOL
 # (the spelling the macro body used) plus the INTERNED SYNTAX-CONTEXT MARK
 # (the fresh expansion mark that owns the identifier). Two identifiers with
 # the same symbol but different contexts are DIFFERENT identifiers; a user
@@ -1942,7 +1997,7 @@ pub struct Identifier
   syntax_context: Int
 end
 
-# P1 (macro identity): the module-scoped identity of a macro definition —
+# (macro identity): the module-scoped identity of a macro definition —
 # the owner module path plus the bare name. Registered and looked up through
 # the module-qualified key form (macro_id_key), the same module-qualified
 # machinery the resolver uses for every other declaration.
@@ -2065,7 +2120,7 @@ pub struct ExpandedExprVec
   did_expand: Bool
 end
 
-# The module path owning the flat item at `item_idx` — a TABLE READ (P1):
+# The module path owning the flat item at `item_idx` — a TABLE READ ():
 # the item's OWNER ModuleId (Item.owner_module, stamped at the module-
 # assembly construction sites) keys Program.crate.modules directly; the
 # owner Module's path is the item's module path (the root module's empty
@@ -2283,7 +2338,7 @@ pub def lookup_macro(env: &MacroEnv, segments: &Vec[String], span: &Span) -> Opt
   end
 end
 
-# P1 (macro hygiene, expansion-depth contract): `diags` is the parser's
+# (macro hygiene, expansion-depth contract): `diags` is the parser's
 # diagnostic channel. The 64-pass fixpoint below is the DEPTH CAP: when it
 # does not converge (an expansion chain longer than 64 levels, e.g. a macro
 # whose body recursively embeds itself — one extra nesting level per pass),
@@ -2349,7 +2404,7 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
 
   # Phase 2: iteratively expand until fixpoint (max 64 passes).
   #
-  # P1 (macro hygiene, expansion-depth contract): 64 is the DEPTH CAP. The
+ # (macro hygiene, expansion-depth contract): 64 is the DEPTH CAP. The
   # eager re-expansion of substituted bodies (see expand_expr's macro arms)
   # normally converges in one or two passes; a macro that transitively
   # embeds itself adds one nesting level per pass, so 64 passes bounds the
@@ -2380,7 +2435,7 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
     when _ then filtered_items.push(item.clone())
     end
   end
-  # P1 (module table): the modules map indexes the filtered items, so it is
+ # (module table): the modules map indexes the filtered items, so it is
   # rebuilt here — per module, its OWN item list (Module.items) is walked,
   # macro declarations are dropped, and every surviving ItemId is remapped
   # to its new flat index (the count of macros removed so far). The flat
@@ -2416,7 +2471,7 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
     span: current_span
   }
 
-  # ── P1 (macro hygiene, expansion-depth contract): E105 on non-convergence ──
+ # ── (macro hygiene, expansion-depth contract): E105 on non-convergence ──
   # After the 64-pass depth cap, any surviving ExprMacroCall means the
   # fixpoint did not converge (or a call refers to an undefined macro):
   # expansion never reached a fixpoint. Record E105 through the parser's
@@ -2435,7 +2490,7 @@ pub def expand_macros(program: Program, diags: &mut Vec[Diagnostic]) -> Program
 end
 
 # ───────────────────────────────────────────────────────────────────────
-# P1 (macro hygiene, expansion-depth contract): residual macro-call walker
+# (macro hygiene, expansion-depth contract): residual macro-call walker
 # ───────────────────────────────────────────────────────────────────────
 # Total AST walk used by expand_macros' E105 check: it must find ANY
 # ExprMacroCall the fixpoint left behind — including positions the expander
@@ -2650,7 +2705,7 @@ pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
   var did_expand = false
   var i = 0
   while i < program.items.len() do
-    # P1 (macro identity): anchor the resolution of this item's macro calls
+ # (macro identity): anchor the resolution of this item's macro calls
     # in its OWNING module (the item's owner ModuleId read through the crate
     # table — module_path_for_item; no range scan). A bare macro
     # name resolves in this module; a qualified path resolves relative to it
@@ -2661,7 +2716,7 @@ pub def expand_program_pass(env: &MacroEnv, program: Program) -> ExpandedProgram
     if expanded_item.did_expand then did_expand = true end
     i = i + 1
   end
-  # P0-AM: items map 1:1 through expansion (no insertion/deletion), so the
+ # items map 1:1 through expansion (no insertion/deletion), so the
   # Crate is carried through unchanged and still indexes the new flat items
   # vector.
   ExpandedProgram { program: Program { items: new_items, crate: program.crate.clone(), span: program_span }, did_expand }
@@ -2756,7 +2811,7 @@ pub def expand_function_decl(env: &MacroEnv, f: &FunctionDecl) -> ExpandedFuncti
   let f_span = f.span
   match f.body
   when FnBody::FnBlock(block) then
-    # P1 (macro hygiene, context composition): the root of the expansion walk
+ # (macro hygiene, context composition): the root of the expansion walk
     # starts with an EMPTY hygiene context stack — composition only applies
     # to expansions nested inside a substituted macro body (see expand_expr).
     var root_ctx: Vec[Int] = Vec::new()
@@ -2813,7 +2868,7 @@ pub def expand_trait_method(env: &MacroEnv, method: TraitMethod) -> ExpandedTrai
   ExpandedTraitMethod { method, did_expand: false }
 end
 
-# ctx_stack: the P1 hygiene context stack of the expansions whose body this
+# ctx_stack: the hygiene context stack of the expansions whose body this
 # walk is inside (empty at the root of a pass; composed at nested macro
 # expansions — see expand_expr's macro arms).
 pub def expand_block(env: &MacroEnv, block: &Block, ctx_stack: &Vec[Int]) -> ExpandedBlock
@@ -2965,7 +3020,7 @@ pub def expand_vec_like_from_array(path: &AstPath, elems: &Vec[Expr], span: &Spa
   make_expr(ExprKind::ExprBlock(make_block(stmts, span.clone())), span.clone())
 end
 
-# ctx_stack: the P1 hygiene context stack inherited from the expansions whose
+# ctx_stack: the hygiene context stack inherited from the expansions whose
 # body this walk is inside (empty at the root of a pass). The macro arms
 # COMPOSE it: each instantiation interns a fresh syntax-context mark (see
 # intern_syntax_context) appended to the inherited stack, and the substituted
@@ -2990,7 +3045,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
         when _ then ()
         end
       end
-      # P1 (macro identity): macro lookup is module-qualified — the path's
+ # (macro identity): macro lookup is module-qualified — the path's
       # segments resolve against the call site's module (bare names in the
       # current module and its imports; qualified paths relatively,
       # absolutely, and through import aliases); ambiguity is an error.
@@ -3005,7 +3060,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
             }
           else
             env.expansion_stack.push(qualified_key.clone())
-            # P1 (macro hygiene, context composition): each expansion interns
+ # (macro hygiene, context composition): each expansion interns
             # one unique syntax-context mark (intern_syntax_context records it
             # in the intern table), which is APPENDED to the inherited stack —
             # the substituted body's nested macro calls then run with the
@@ -3048,7 +3103,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
       }
     end
   when ExprKind::ExprMacroCall(name, args) then
-    # P1 (macro identity): the bare name resolves in the call site's module
+ # (macro identity): the bare name resolves in the call site's module
     # (current module first, then its imports); ambiguity is an error.
     var bare_segments = Vec::new()
     bare_segments.push(name.clone())
@@ -3063,7 +3118,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
           }
         else
           env.expansion_stack.push(qualified_key.clone())
-          # P1 (macro hygiene, context composition): see the ExprCall arm —
+ # (macro hygiene, context composition): see the ExprCall arm —
           # the fresh context mark is interned and appended to the inherited
           # context stack and the substituted body is re-expanded under the
           # composed context so a nested macro call inside the body inherits
@@ -3302,7 +3357,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
       did_expand: eb.did_expand
     }
   when ExprKind::ExprEnumVariant(path, args) then
-    # P1 (macro identity): module-qualified calls ("a::m!(x)" — the parser
+ # (macro identity): module-qualified calls ("a::m!(x)" — the parser
     # produces ExprEnumVariant for qualified call paths) may name a macro in
     # another module. Resolve the path module-qualified first; when it names
     # a macro, expand it; otherwise keep the variant construction (with the
@@ -3344,7 +3399,7 @@ pub def expand_expr(env: &MacroEnv, expr: &Expr, ctx_stack: &Vec[Int]) -> Expand
   end
 end
 
-# hygiene_ctx is the composed P1 context STACK for this expansion: the
+# hygiene_ctx is the composed context STACK for this expansion: the
 # per-expansion syntax-context mark appended to the stack of every enclosing
 # expansion whose body this call is nested inside (see expand_expr's macro
 # arms — intern_syntax_context). The stamping below uses the whole stack, so
@@ -3358,7 +3413,7 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
       span: call_span.clone() }
   end
 
-  # ── P1 macro hygiene (structural, context-based stamping) ──────────────
+ # ── macro hygiene (structural, context-based stamping) ──────────────
   # Every expansion is assigned a unique SYNTAX-CONTEXT MARK (interned by
   # intern_syntax_context before this call — the mark is the innermost level
   # of the INHERITED context stack hygiene_ctx, whose outer levels are the
@@ -3426,7 +3481,7 @@ pub def instantiate_macro(macro_decl: &MacroDecl, args: &Vec[Expr], call_span: &
 end
 
 # ───────────────────────────────────────────────────────────────────────
-# P1 macro hygiene: expansion-context stamping (see instantiate_macro)
+# macro hygiene: expansion-context stamping (see instantiate_macro)
 # ───────────────────────────────────────────────────────────────────────
 # Hygiene frames: a Vec of scope frames, one per entered scope. Each frame
 # maps a name to the kind of its innermost binding: `true` marks a
@@ -3436,7 +3491,7 @@ end
 # as-is). Lookup walks the frames innermost-first; the innermost binding of
 # a name decides how its references are treated.
 #
-# Context composition (P1): the frames are keyed by the ORIGINAL spellings
+# Context composition (): the frames are keyed by the ORIGINAL spellings
 # and the re-stamp is applied at lookup time with the composed context
 # STACK, so the composed keys extend the existing shadow-frame machinery
 # unchanged: a binding and its references always land on the same
@@ -3480,7 +3535,7 @@ def hygiene_renamed_pattern(ctx_stack: &Vec[Int], subst: &Map[String, Expr], pat
     if subst.contains_key(&name) then
       Pattern { kind: PatternKind::Ident(name.clone(), is_mut), span: pat.span, node_id: 0 }
     else
-      # P1 (structural hygiene): the binding becomes a generated identifier
+ # (structural hygiene): the binding becomes a generated identifier
       # carrying this expansion's syntax context — its rendered key is the
       # (symbol, context) pair in the identifier-impossible `$` encoding.
       let id = hygiene_identifier(&name, ctx_stack)
@@ -3522,7 +3577,7 @@ def hygiene_push_shadow_frame(frames: &Vec[Map[String, Bool]], names: &Vec[Strin
   new_frames
 end
 
-# ctx_stack: the composed P1 hygiene context stack of THIS expansion (see
+# ctx_stack: the composed hygiene context stack of THIS expansion (see
 # instantiate_macro) — every binding the body introduces and every reference
 # to it is stamped with the composed key.
 pub def substitute_block(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames: &Vec[Map[String, Bool]], block: &Block) -> Block
@@ -3544,7 +3599,7 @@ pub def substitute_stmt(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
   when StmtKind::StmtExpr(expr) then
     Stmt { kind: StmtKind::StmtExpr(substitute_expr(subst, ctx_stack, frames, &expr)), span: stmt.span, node_id: 0 }
   when StmtKind::StmtLet(pat, ty, init, is_mut) then
-    # P1 (macro hygiene): the let-bound temporaries the macro body itself
+ # (macro hygiene): the let-bound temporaries the macro body itself
     # introduces are re-stamped with the composed expansion context stack.
     # The init is substituted BEFORE the binding enters the hygiene frame,
     # so an init-side reference to the same name still resolves to the
@@ -3572,7 +3627,7 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
     match subst.get(&name)
     when Option::Some(replacement) then replacement.clone()
     when Option::None then
-      # P1 (macro hygiene): re-stamp only bare paths; qualified paths
+ # (macro hygiene): re-stamp only bare paths; qualified paths
       # (e.g. Benchmark::new) can never name a local.
       if path.segments.len() == 1 then
         match hygiene_ident_lookup(frames, &name)
@@ -3591,7 +3646,7 @@ pub def substitute_expr(subst: &Map[String, Expr], ctx_stack: &Vec[Int], frames:
     match subst.get(&name)
     when Option::Some(replacement) then replacement.clone()
     when Option::None then
-      # P1 (macro hygiene): references to a re-stamped macro-internal let
+ # (macro hygiene): references to a re-stamped macro-internal let
       # binding are re-stamped identically (same composed context stack —
       # the (symbol, context)-derived key); references to a shadow (closure
       # param / match pattern) or to a free name stay untouched.
@@ -3773,32 +3828,23 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
       println("  Reading: " + path.clone())
     end
 
-    let source = read_file_text_direct(path.clone())
-    if source.len() == 0 then
-      println("Failed to read file: " + path.clone())
+    let source = match read_source_file(path.clone())
+    when Result::Ok(s) then s
+    when Result::Err(e) then
+      println("Failed to read file: " + path.clone() + ": " + e)
       return 1
     end
 
     if opts.verbose then
-      println("  Lexing: " + path.clone())
-    end
-    var lex = lexer_new(source, path.clone())
-    let lex_result = tokenize_impl(&mut lex)
-
-    if opts.verbose then
       println("  Parsing: " + path.clone())
     end
-    let parse_out = parse(lex_result)
-    let ast = parse_out.program
-    let parse_diags = parse_out.diagnostics
-    if diag_has_errors(&parse_diags) then
-      println("Parse error in " + path.clone())
-      for d in parse_diags do
-        let pos_info = match d.span
-        when Option::Some(s) then " at offset " + s.start.to_string()
-        when Option::None then ""
-        end
-        println("  " + d.message + pos_info)
+    # The ONE parse entry: the complete structured diagnostic set is emitted
+    # through the emitter — never a bare "Parse error in..." summary.
+    let ast = match parse_source_program(source, path.clone())
+    when Result::Ok(program) then program
+    when Result::Err(diags) then
+      for d in diags do
+        emit_diagnostic(&mut emitter, d)
       end
       return 1
     end
@@ -3817,9 +3863,9 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
     println("No valid items found in input files")
     return 1
   end
-  # P0-AM (Crate construction): multiple files are concatenated into one flat
+ # (Crate construction): multiple files are concatenated into one flat
   # items vector, so the root module (id 0, empty path) covers all of them;
-  # the full Crate is rebuilt by merge_imported_deps below. P1: the root
+ # the full Crate is rebuilt by merge_imported_deps below.: the root
   # module's per-module item list (Module.items: Vec[ItemId]) is built here
   # over the concatenated items.
   var merged_modules = Map::new()
@@ -3861,10 +3907,10 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   if opts.verbose then
     println("  Type checking...")
   end
-  var typed_program: Option[TypedProgram] = Option::None
+  var typed_program: Option[AnalyzedProgram] = Option::None
   if !skip_bootstrap_semantic_checks then
     var env = type_env_new()
-    # P1 (recovery separation): compilation always runs strict — the flag is
+ # (recovery separation): compilation always runs strict — the flag is
     # forced on unconditionally at the invocation (a real compilation with
     # strict_resolution = false is an internal error); permissive editor
     # recovery never produces a TypedProgram.
@@ -3885,13 +3931,13 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
       return 1
     end
   else
-    # P1 (macro hygiene, expansion-depth contract): the skip-semantic-checks
+ # (macro hygiene, expansion-depth contract): the skip-semantic-checks
     # path still routes expansion failures (E105) through the parser's
     # diagnostic channel and fails loudly instead of lowering a partial AST.
     var skip_diags: Vec[Diagnostic] = Vec::new()
     prepare_parsed(&mut ast, &mut skip_diags)
     if diag_has_errors(&skip_diags) then
-      println(join_parse_diagnostics(&skip_diags))
+      println(join_diagnostics(&skip_diags))
       return 1
     end
   end
@@ -3984,14 +4030,7 @@ pub def compile_multiple_files(opts: &CompilerOptions, files: Vec[String], outpu
   if opts.verbose then
     println("  Generating native code...")
   end
-  let target = if skip_bootstrap_semantic_checks then
-    bootstrap_codegen_target()
-  else
-    match opts.target_triple
-    when Option::Some(triple) then parse_target_triple(triple)
-    when Option::None then detect_host_target()
-    end
-  end
+  let target = resolve_codegen_target(opts)
 
   match opts.emit
   when EmitMode::Object then
@@ -4044,7 +4083,11 @@ pub def bootstrap_manifest_sources() -> Option[Vec[String]]
   if !file_exists("bootstrap/compiler_kernel.manifest") then
     return Option::None
   end
-  let text = read_file_text_direct("bootstrap/compiler_kernel.manifest")
+  let text = match read_source_file("bootstrap/compiler_kernel.manifest".to_string())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    return Option::None
+  end
   let lines = text.split("\n")
   var std_files = Vec::new()
   var compiler_files = Vec::new()

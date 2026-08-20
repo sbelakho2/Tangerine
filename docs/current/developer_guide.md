@@ -13,7 +13,7 @@ Each guide maps to spec sections 4–14 and references the implementation file d
 - **Goal:** Define a unified, typed error hierarchy for all GFX/UI subsystems.
 - **Key types:** `ErrorCode` (8 variants), `Error` struct, plus per-module error enums (`GfxError`, `TextError`, `ImageError`, `GpuError`, `PlatformError`, `AbiError`).
 - **Pattern:** Every fallible function returns `Result[T, E]` where `E` is the module-specific error.
-- **Cross-reference:** `docs/gfx_ui_invariants.md` — Error propagation invariant.
+- **Cross-reference:** docs/current/gfx_ui_invariants.md — Error propagation invariant.
 
 ### 1.2 Geometry (§5 → `std/geom.tg`)
 
@@ -251,7 +251,7 @@ The CI pipeline is defined in `.github/workflows/ci.yml`. Key jobs:
 
 ### 6.3 Release Engineering
 
-See `docs/build_system.md` for build profiles, artifact naming, and reproducibilty checks.
+See docs/current/build_system.md for build profiles, artifact naming, and reproducibilty checks.
 
 ---
 

@@ -54,4 +54,4 @@ Compilers may additionally support exact aliases (for example `net.read`, `db.wr
 
 - `tg_compiler/agentic.tg`
 - `tg_compiler/cap_baseline.tg`
-- `docs/registry_policy.md`
+- docs/current/registry_policy.md

@@ -53,7 +53,7 @@ Release notes are generated from:
 1. Merged PR titles and descriptions (tagged with checklist sections).
 2. Closed issues linked to the release milestone.
 3. Checklist completion delta since previous release.
-4. Known issues and limitations from `docs/backend_strategy.md`.
+4. Known issues and limitations from docs/current/backend_strategy.md.
 
 ### 3.2 Format
 
@@ -71,7 +71,7 @@ Release notes are generated from:
 - (auto-generated from issues)
 
 ## Breaking Changes
-- See docs/migration.md for full migration guide
+- See docs/current/migration.md for full migration guide
 
 ## Known Issues
 - (from backend_strategy.md §Known Limitations)

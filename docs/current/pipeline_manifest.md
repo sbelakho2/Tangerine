@@ -130,7 +130,7 @@ Break/Continue/Return/Backedge/GuardElse. Source is the semantic node id of the
 transfer's originator; destination is the static target (0 when dynamic).
 `actions` are the cleanup obligations as ACTION SEQUENCES in execution order:
 `(0, local id)` = drop the local, `(1, defer stmt id)` = run the registered
-defer. The block-grounded derivation (P0-BF/P0-BG) is the authority for what an
+defer. The block-grounded derivation is the authority for what an
 edge drops; `validate_cfg_edges` checks recorded actions against block frames.
 The MIR-visible string keys (`"return::<id>"`, `"edge::Return::<id>"`, ...)
 carry the same sets — MIR consults `edge_cleanup` first, falling back to string

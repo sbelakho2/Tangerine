@@ -342,7 +342,7 @@ tg target linker aarch64-unknown-linux-gnu
 
 ## See Also
 
-- [docs/deployment_targets.md](deployment_targets.md) — Full target tier definitions
-- [docs/embedded_guide.md](embedded_guide.md) — Embedded development guide
-- [docs/build_system.md](build_system.md) — Build system reference
-- [docs/packaging.md](packaging.md) — Package distribution
+- [docs/current/deployment_targets.md](deployment_targets.md) — Full target tier definitions
+- [docs/current/embedded_guide.md](embedded_guide.md) — Embedded development guide
+- [docs/current/build_system.md](build_system.md) — Build system reference
+- [docs/current/packaging.md](packaging.md) — Package distribution

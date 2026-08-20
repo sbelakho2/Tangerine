@@ -1,9 +1,72 @@
 # Tangerine Standard Library Reference
 
 **Version:** 0.1.0  
-**Last Updated:** March 1, 2026
+**Last Updated:** 2026-08-20
 
 This document provides a comprehensive reference for all modules in the Tangerine standard library.
+
+---
+
+## Completeness Status (current, 2026-08)
+
+> **"Stdlib complete" is NOT yet claimable.** That claim requires every
+> public module to parse, type-check, compile, link, and pass native tests
+> on every advertised Tier-1 target. The current state:
+
+1. **Bootstrap closure (implemented-unverified):** the 14 std modules in
+   `bootstrap/compiler_kernel.manifest` (`alloc`, `args`, `bench`,
+   `collections`, `core`, `env`, `ffi`, `fmt`, `fs`, `gfx_errors`, `io`,
+   `process`, `taint`, `time`) are compiled by every stage of the bootstrap
+   ladder. They have no per-module native test suites.
+2. **E106 migration in progress:** the non-kernel modules still contain
+   first-class reference type positions (`-> &T`, `-> &mut T`,
+   `-> Option[&T]`, `-> Vec[&T]`, ...) that are E106 hard errors under the
+   current native parser. They do not parse under the current compiler and
+   are therefore **API-only** until migrated. The module reference sections
+   below describe declared surfaces, not verified behavior.
+3. **Kernel remainder:** `std/collections.tg` (in the closure) has 5
+   record-visit extern signatures (`__intrinsic_map_visit_*`,
+   `__intrinsic_set_visit_*`) with `Option[&K]`/`&V` returns. They parse
+   only through the extern-declaration exception
+   (`parse_extern_abi_type`, parser.tg — `&T`/`&mut T` in an `extern`
+   declaration denotes the internal address/reference ABI); anywhere else
+   the native parser records the E106 hard error
+   (`parse_type`). These signatures are the in-progress remainder of the
+   kernel migration — the kernel's last reference type positions.
+
+### Modules not yet migrated (E106-pending, current working tree)
+
+Reference type positions found in code (return types / generic type args —
+a definition whose return type contains `&`, including `&mut` and `&`
+inside generic arguments such as `Option[&T]`, `Vec[&T]`, and
+`impl Iterator[Item = &T]`; one per definition), count per module.
+Recounted 2026-08-20 against the working tree; 71 modules total
+(70 with code sites + `alloc`, comment-only):
+
+| Count | Module |
+|-------|--------|
+| 49 | `cli` |
+| 29 | `web` |
+| 27 | `log`, `db` |
+| 23 | `http` |
+| 20 | `thread` |
+| 17 | `term` |
+| 15 | `url` |
+| 13 | `audio` |
+| 12 | `sync` |
+| 11 | `crypto` |
+| 9 | `atomic` |
+| 8 | `input`, `config` |
+| 7 | `http2` |
+| 5 | `serde`, `async`, `collections` (kernel remainder) |
+| 4 | `windows`, `websocket`, `toml`, `gpu_vulkan`, `mmap`, `embedded` |
+| 3 | `wasm`, `ui`, `secure_types`, `random`, `compress` |
+| 2 | `path`, `opentelemetry`, `debug`, `csv` |
+| 1 | `web_server`, `wasm_js`, `validation`, `test`, `tensor`, `sql`, `snapshot`, `semver`, `regex`, `profile`, `postgres`, `platform`, `patch`, `obligations`, `migrate`, `metrics`, `math`, `lsp`, `kernel`, `json`, `image`, `hal`, `graph`, `gpu_metal`, `gfx_gpu`, `geom`, `fuzz`, `fft`, `encoding`, `embed_trace`, `diagnostics`, `device`, `ctx`, `contracts`, `autotune`, `auth`, `audit`, `alloc` (comment only) |
+
+The migration converts each `&T`/`&mut T` type position to an access
+convention or an explicit access operation, mirroring the completed kernel
+migration (see `../history/access_resource_migration.md`).
 
 ---
 
@@ -2537,11 +2600,11 @@ use std::unicode::{normalize_nfc, grapheme_clusters, display_width}
 
 - [Language Reference](language.md) - Complete language specification
 - [Interoperability Guide](interop.md) - FFI and foreign language integration
-- [Memory Model](memory_model.md) - Ownership, borrowing, and lifetimes
+- [Memory Model](memory_model.md) - Access conventions, resources, and capabilities
 - [Error Handling Guide](error_handling.md) - Error handling patterns and best practices
 - [Concurrency Guide](concurrency.md) - Threading and async programming
 - [Packaging Guide](packaging.md) - Package management and publishing
 - [Deployment Targets](deployment_targets.md) - Cross-compilation and deployment
-- [Completeness Report](stdlib_completeness.md) - Full module inventory and checklist
+- [Completeness Status](#completeness-status-current-2026-08) - Full module inventory and checklist
 - [Style Guide](style_guide.md) - Code formatting and conventions
 - [FFI Cheat Sheet](ffi_cheatsheet.md) - Quick FFI reference

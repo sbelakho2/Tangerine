@@ -27,10 +27,10 @@ use tg_compiler::ast::{
   make_block, make_stmt, make_expr, make_pattern, make_path, assign_node_ids
 }
 use tg_compiler::parser::{parse, diag_has_errors}
-use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, builtin_adt, TypeError, TypedProgram, extract_import_paths}
+use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, builtin_adt, TypeError, extract_import_paths}
 use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
-use tg_compiler::resource_check::{resource_check, build_typed_cfg}
+use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
@@ -56,8 +56,8 @@ use tg_compiler::compiler_core::{
   CompilerOptions, EmitMode, StopAfter, default_options,
   compile_file, compile_startup_entry, compile_multiple_files, compile_file_core,
   get_output_path, explain_error_code, error_code_example,
-  emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir,
-  Diagnostic, DiagLevel, json_escape
+  emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir, analyze_program,
+  Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics
 }
 
 pub use tg_compiler::compiler_core::{
@@ -78,6 +78,33 @@ def cmd_explain(code: String) -> Unit
     println("Example:")
     println(example)
   end
+end
+
+# (target-capability gate): the compile-time rejection site for
+# operations the target's runtime has no body for. The map/set surface —
+# destroy, entries, keys, clone, drain_one, the record-visit traversal —
+# now has x86-64 parity in the runtime (the a64 bodies mirrored
+# register-for-register), so for those operations the gate reports
+# nothing; a FUTURE arch-gated stub is rejected here as a capability
+# diagnostic (a normal compile error listing the operation) instead of
+# emitting a runtime trap (ud2) or a fabricated default. The target triple
+# is read from the options (the --target selection; the host target when
+# absent — the same triple the codegen resolves).
+def check_target_capabilities(opts: &CompilerOptions) -> Vec[String]
+  var rejections = Vec::new()
+  let triple = match opts.target_triple
+  when Option::Some(t) then t.clone()
+  when Option::None then detect_host_target()
+  end
+  # The x86-64 map/set parity surface (the bodies live in runtime.tg):
+  #   _tg_map_destroy / _tg_set_destroy (the arena + chains + free-list
+  #     munmaps), _tg_map_entries, _tg_map_keys, _tg_map_clone,
+  #     _tg_map_drain_one(_full) / _tg_set_drain_one(_full), and the
+  #     record-visit traversal (__intrinsic_map/set_visit_begin/next/value).
+  # All implemented — the rejection list stays empty for every arch. An
+  # unimplemented op would be listed here, e.g.:
+  #   rejections.push("target `" + triple + "`: <op> has no runtime body (compiler capability limit)")
+  rejections
 end
 
 # 
@@ -902,7 +929,7 @@ def cmd_fmt(argv: Vec[String]) -> Int
     i = i + 1
   end
   
-  # If no files, format all .tg files in project
+  # If no files, format all.tg files in project
   if files.is_empty() then
     files = find_tg_files(".")
   end
@@ -1292,6 +1319,19 @@ def cmd_compile(argv: Vec[String]) -> Int
     return 1
   end
 
+ # (target-capability gate): the compile-time rejection site for any
+  # operation the target's runtime has no body for. Every map/set operation
+  # (destroy / entries / keys / clone / drain / visit) now has x86-64
+  # parity, so the gate reports nothing; a future arch-gated stub would be
+  # rejected HERE as a capability diagnostic instead of emitting a trap.
+  let cap_rejections = check_target_capabilities(&opts)
+  if cap_rejections.len() > 0 then
+    for rej in cap_rejections do
+      eprintln(rej)
+    end
+    return 1
+  end
+
   let argc = raw_arg_count()
   var files: Vec[String] = Vec::new()
   var arg_i = 2
@@ -1412,6 +1452,17 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     return 1
   end
 
+ # (target-capability gate): same policy as cmd_compile — the
+  # compile-time rejection site for arch-gated operations (all map/set
+  # operations now have x86-64 parity; the gate reports nothing).
+  let cap_rejections_raw = check_target_capabilities(&opts)
+  if cap_rejections_raw.len() > 0 then
+    for rej in cap_rejections_raw do
+      eprintln(rej)
+    end
+    return 1
+  end
+
   let file = primary_input.clone()
   let output_path = match opts.emit
   when EmitMode::Object then get_output_path(&opts, file.clone(), ".o")
@@ -1444,7 +1495,7 @@ def cmd_compile_raw(skip_subcommand: Bool) -> Int
   cmd_compile_direct(skip_subcommand)
 end
 
-# Helper: find all .tg files recursively
+# Helper: find all.tg files recursively
 def find_tg_files(dir: String) -> Vec[String]
   var files = Vec::new()
   let entries = match std::fs::read_dir(dir)
@@ -1913,7 +1964,7 @@ end
 
 def discover_sources(dir: &String) -> Result[Vec[String], String]
   # Look for Tangerine.toml in the dependency directory to find its sources.
-  # If not found, glob for all .tg files under src/.
+  # If not found, glob for all.tg files under src/.
   let manifest = dir.clone() + "/Tangerine.toml"
   match load_project(manifest)
   when Result::Ok(proj) then
@@ -1923,7 +1974,7 @@ def discover_sources(dir: &String) -> Result[Vec[String], String]
     end
     Result::Ok(sources)
   when Result::Err(_) then
-    # Fallback: find all .tg files under src/
+    # Fallback: find all.tg files under src/
     let src_dir = dir.clone() + "/src"
     match list_directory(src_dir.clone())
     when Result::Ok(files) then
@@ -2077,7 +2128,7 @@ def write_lockfile(path: &str, resolved: &ResolvedDeps) -> Unit
 end
 
 def hash_directory(dir: &String) -> String
-  # Compute a content hash of all .tg files in a directory for reproducibility.
+  # Compute a content hash of all.tg files in a directory for reproducibility.
   var h: UInt = 14695981039346656037  # FNV-1a offset basis
   let prime: UInt = 1099511628211
   
@@ -2859,22 +2910,22 @@ def agent_budget(argv: Vec[String]) -> Int
   if diag_has_errors(&parse_diags) then
     return 1
   end
-  assign_node_ids(&mut ast)
 
-  # Lower to MIR and analyse budget consumption
-  var typed_program: Option[TypedProgram] = Option::None
-  match resolve_names(&ast)
-  when Result::Ok(res) then
-    var env = type_env_new()
-    let type_result = type_check_typed(&mut env, &ast, &res)
-    if !type_result.errors.is_empty() then
-      return 1
-    end
-    typed_program = Option::Some(type_result.program)
-  when Result::Err(res_errors) then
-    for re in res_errors do
-      eprintln(re.message)
-    end
+  # Lower to MIR and analyse budget consumption. THE ONE canonical semantic
+  # path (analyze_program) — expansion, node ids, resolution, type/access/
+  # resource checks — produces the AnalyzedProgram artifact the lowering
+  # consumes (no checker re-run). The former manual pre-pass
+ # (assign_node_ids + resolve + type_check_typed) is not part of the model — performing
+  # node-id assignment here would renumber the ids the canonical pass
+  # assigns.
+  var typed_program: Option[AnalyzedProgram] = Option::None
+  var opts = default_options()
+  var env = type_env_new()
+  match analyze_program(&mut env, &mut ast, &opts)
+  when Result::Ok(ap) then
+    typed_program = Option::Some(ap)
+  when Result::Err(e) then
+    eprintln(e)
     return 1
   end
 
@@ -3006,7 +3057,7 @@ def agent_audit(argv: Vec[String]) -> Int
   println("Agentic audit of " + dir + ":")
   println("========================================")
 
-  # Discover all .tg files
+  # Discover all.tg files
   let files = discover_sources(&dir)
 
   var total_contracts = 0
@@ -3911,14 +3962,11 @@ def parse_file(path: String) -> Result[Program, String]
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err("Cannot read " + path + ": " + e)
   end
-  let tokens = tokenize(source, "")
-  let parse_out = parse(tokens)
-  let ast = parse_out.program
-  let parse_diags = parse_out.diagnostics
-  if diag_has_errors(&parse_diags) then
-    Result::Err("Parse error in " + path)
-  else
-    Result::Ok(ast)
+  # The ONE parse entry: the complete structured diagnostic set, never a
+  # bare "Parse error in..." summary.
+  match parse_source_program(source, path.clone())
+  when Result::Ok(ast) then Result::Ok(ast)
+  when Result::Err(diags) then Result::Err(join_diagnostics(&diags))
   end
 end
 
@@ -4171,11 +4219,15 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
           })
         end
         
-        # P0-CF2 (ONE TypedCFG): this LSP diagnostic path builds the CFG
+ # (ONE TypedCFG): this LSP diagnostic path builds the CFG
         # ONCE here (the pipeline's analyze_parsed does the same for real
         # compilations) and passes the same instance to both checkers.
-        let diag_cfg = build_typed_cfg(&ast, &type_result.program)
-        let access_errors = access_check(&ast, &type_result.program, &diag_cfg)
+ # ONE AnalysisContext per document compilation — the access
+        # registry and the accumulators live in it, so concurrent/parallel
+        # LSP documents never share process-global checker state.
+        let diag_cfg = build_typed_cfg(&ast, &type_result.program.typed)
+        var diag_ctx = analysis_context_new()
+        let access_errors = access_check(&ast, &type_result.program.typed, &diag_cfg, &mut diag_ctx)
         for err in access_errors do
           diags.push(Diagnostic {
             level: DiagLevel::Error,
@@ -4187,7 +4239,8 @@ def lsp_check_document(server: &mut LspServer, uri: String) -> Unit
           })
         end
 
-        let res_result = resource_check(&ast, &type_result.program, &diag_cfg)
+        var diag_engine = type_result.program.engine_snapshot
+        let res_result = resource_check(&ast, &type_result.program.typed, &diag_cfg, &mut diag_ctx, &mut diag_engine)
         for err in res_result.errors do
           diags.push(Diagnostic {
             level: DiagLevel::Error,

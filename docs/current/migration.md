@@ -68,7 +68,7 @@ All shims are **time-bounded**: they will be removed no later than v0.3.
 
 ### 4.1 Policy
 
-See `docs/architecture_decisions.md` — Compatibility Policy.
+See docs/current/architecture_decisions.md — Compatibility Policy.
 
 ### 4.2 Verification Process
 

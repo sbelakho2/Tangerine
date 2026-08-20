@@ -90,7 +90,7 @@ enum LayoutCategory
 end
 
 # ———————————————————————————————————————————————————————————————
-# P0-AR: Runtime Value Representation — THE DECISION TABLE
+# Runtime Value Representation — THE DECISION TABLE
 # ———————————————————————————————————————————————————————————————
 # ONE place states how every fundamental type's runtime value is stored.
 # Every layout query (size_of, align_of, layout_of, struct field placement,
@@ -105,6 +105,8 @@ end
 #   Ptr[T], PtrMut[T], RefInternal        | RawPtr          | No          | bit
 #   Box[T], Rc[T]                         | RawPtr          | Yes         | move
 #   String                                | StringPtr       | Yes         | clone
+#     (the value is the StringHandleLayout — ONE pointer to the
+#     32-byte OwnedStringObjectLayout { data, len, cap, stride })
 #   Vec[T], Array[T]                      | HeapVecHeader   | Yes         | move + clone
 #   FixedArray[T, N] (any N >= 0)         | Inline          | N elements  | structural
 #   Slice[T]                              | Inline view     | No          | bit
@@ -127,9 +129,21 @@ end
 #
 # Heap header sizes (F2 FROZEN — must agree with codegen/runtime; the value
 # itself is always ONE pointer-width handle, these are the sizes of the
-# heap objects the handle points at):
-#   StringPtr     -> 8   (raw pointer to null-terminated UTF-8; NO inline header)
-#   HeapVecHeader -> 32  ({data:0, len:8, cap:16, stride:24} — the heap
+# heap objects the handle points at). The String layout concepts are
+# SEPARATED — four distinct things, never conflated:
+#   StringHandleLayout      -> 8   (the VALUE width: the by-value String is
+#                                   ONE pointer-width handle to the owned
+#                                   String object — string_handle_layout_size)
+#   OwnedStringObjectLayout -> 32  (the heap OBJECT behind the handle —
+#                                   {data:0, len:8, cap:16, stride:24} —
+#                                   owned_string_object_size; the drop frees
+#                                   the object AND its data buffer)
+#   StrView                 -> 16  (the non-owning view {ptr: Ptr[u8] @0,
+#                                   len: UInt @8} — the static literal form
+#                                   and the borrowed form; no object)
+#   CStringPtr              -> 8   (the RAW pointer to NUL-terminated bytes
+#                                   — the borrowed c-string form, no object)
+# HeapVecHeader -> 32  ({data:0, len:8, cap:16, stride:24} — the heap
 #                         object behind Vec/Array values. The stride field
 #                         (element stride in bytes, set from the CONCRETE
 #                         element type at creation: 1/2/4/8 for immediate
@@ -140,19 +154,23 @@ end
 #                         releases cap*stride bytes. Slice is NOT in this
 #                         class: a Slice value is a 16-byte inline {ptr,len}
 #                         VIEW)
-#   HeapMapHeader -> 88  (the runtime's actual Map header — an 88-byte raw
-#                         byte arena plus the CONCRETE layout parameters:
-#                         {buckets:0, size:8, capacity:16, key_stride:24,
-#                         key_align:32, value_stride:40, value_align:48,
-#                         key_off:56, value_off:64, next_off:72,
-#                         bucket_stride:80} — runtime.tg "Map header (88
+#   HeapMapHeader -> 96  (the runtime's actual Map header — a 96-byte raw
+#                         byte arena plus the CONCRETE layout parameters.
+#                         The canonical machine-readable authority is the
+#                         MAP_HEADER_FIELDS table below — map_header_field_offset
+#                         / map_header_total_size — the ONLY place that states
+#                         a Map/Set header offset: {buckets:0, size:8,
+#                         capacity:16, key_stride:24, key_align:32,
+#                         value_stride:40, value_align:48, key_off:56,
+#                         value_off:64, next_off:72, bucket_stride:80,
+#                         free_list:88}, total 96 — runtime.tg "Map header (96
 #                         bytes)". The four derived layout fields
 #                         (key_off/value_off/next_off/bucket_stride) are
 #                         computed once at map creation from the four layout
 #                         parameters; the runtime derives nothing)
-#   HeapSetHeader -> 88  (Set is MAP-BACKED — the runtime's _tg_set_* helpers
+#   HeapSetHeader -> 96  (Set is MAP-BACKED — the runtime's _tg_set_* helpers
 #                         tail-call the map helpers, so the Set header IS the
-#                         same 88-byte map header)
+#                         same 96-byte map header — the same canonical table)
 #
 #   Storage size rules derived from this table (repr_storage_size):
 #   Immediate  -> the intrinsic primitive size (primitive_size)
@@ -194,7 +212,11 @@ end
 enum Repr
   Immediate      # value bits ARE the value (primitives, Unit, Never)
   RawPtr         # raw pointer to memory (Ptr/PtrMut/Box/Rc/RefInternal)
-  StringPtr      # 8-byte raw pointer to null-terminated UTF-8 (FROZEN String ABI)
+  StringPtr      # 8-byte handle (StringHandleLayout) to the 32-byte OWNED
+                 # String OBJECT (OwnedStringObjectLayout — {data,len,cap,
+                 # stride}); the object and its buffer are heap-allocated
+                 # and freed by the String drop — never a raw C-string
+                 # pointer (the raw borrowed forms are StrView / CStringPtr)
   HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array — NOT Slice)
   HeapMapHeader  # pointer to a heap Map header
   HeapSetHeader  # pointer to a heap Set header
@@ -210,7 +232,7 @@ end
 # value, per the DECIDED model documented above.  Every storage-shape
 # decision in this engine reads from here.
 #
-# FAIL-CLOSED (P0-UR): unresolved types — Type::Var, Type::Param,
+# FAIL-CLOSED: unresolved types — Type::Var, Type::Param,
 # Type::Error and anything the match does not name — return Repr::Invalid,
 # NEVER a plausible OpaquePtr. A layout query on an unresolved type is a
 # compiler bug (the strict path layout_of_concrete rejects those types with
@@ -251,8 +273,8 @@ def type_repr(engine: &LayoutEngine, ty: &Type) -> Repr
   when Type::Tuple(_)      then Repr::Inline
   when Type::FixedArray(_, _) then Repr::Inline
   when Type::Adt(tid, args) then
-    # P0-J2: Adt form of the builtin compound types (storage form).
-    # Mirrors the deleted canonical arms via the registered type name; the
+ # Adt form of the builtin compound types (storage form).
+    # Mirrors the canonical arms via the registered type name; the
     # Adt form of Array is the heap-vector (named Array[T] — the fixed
     # arrays are the distinct Type::FixedArray variant, which never reaches
     # this arm). Option/Result are registered enums — they get the SAME
@@ -312,7 +334,7 @@ def named_type_repr(engine: &LayoutEngine, type_id: Int) -> Repr
   end
 
   # Unregistered named type: FAIL CLOSED — the generic-parameter SLOT
-  # convention is DELETED (P0-CK). A generic definition is never laid out
+ # convention is not part of the model. A generic definition is never laid out
   # nominally: every layout is computed under a ConcreteTypeKey with the
   # def's fields SUBSTITUTED (see compute_type_layout / substituted_type_def),
   # so a Type::Param never reaches a field placement. An unregistered Adt at
@@ -321,21 +343,134 @@ def named_type_repr(engine: &LayoutEngine, type_id: Int) -> Repr
   Repr::Invalid
 end
 
+# ———————————————————————————————————————————————————————————————
+# MAP_HEADER_FIELDS — THE CANONICAL Map/Set HEADER TABLE (single authority)
+# ———————————————————————————————————————————————————————————————
+# ONE machine-readable definition of the Map[K, V] / Set[T] heap header
+# (total 96 bytes). This table is the ONLY place that states a Map/Set header
+# field offset; every consumer reads from it:
+#   - the runtime emitter emits its header offsets via these functions
+#     (map_new's header init uses map_header_field_offset(...) — never
+#     literals) and asserts every remaining literal against the table at
+#     emit time (map_header_assert_contract);
+#   - codegen's heap-header queries route here via container_field_offset /
+#     heap_header_field_offset;
+#   - the std Map contract constants document the same table;
+#   - the layout tests assert every field against it.
+#
+#   field           offset
+#   ——————————————  ———————
+#   buckets         0
+#   size            8
+#   capacity        16
+#   key_stride      24
+#   key_align       32
+#   value_stride    40
+#   value_align     48
+#   key_off         56
+#   value_off       64
+#   next_off        72
+#   bucket_stride   80
+#   free_list       88
+#   total           96
+#
+# The four DERIVED layout fields (key_off/value_off/next_off/bucket_stride)
+# are computed ONCE at map creation from the four layout parameters
+# (key_stride/key_align/value_stride/value_align — concrete K/V values, never
+# hardcoded constants) and stored in the header; the runtime derives nothing.
+# free_list (header+88) is the runtime's overflow-node reuse list. Set[T] is
+# map-backed: the Set header IS this same header.
+def map_header_field_offset(field_name: &String) -> Int
+  # Canonical field names (the table above). The len/length and cap/capacity
+  # aliases read the same words (size at 8, capacity at 16) for the
+  # container_field_offset surface. Unknown names return 0, matching the
+  # container_field_offset contract.
+  if field_name == "buckets" then 0
+  else if field_name == "size" || field_name == "len" || field_name == "length" then 8
+  else if field_name == "capacity" || field_name == "cap" then 16
+  else if field_name == "key_stride" then 24
+  else if field_name == "key_align" then 32
+  else if field_name == "value_stride" then 40
+  else if field_name == "value_align" then 48
+  else if field_name == "key_off" then 56
+  else if field_name == "value_off" then 64
+  else if field_name == "next_off" then 72
+  else if field_name == "bucket_stride" then 80
+  else if field_name == "free_list" then 88
+  else 0
+  end
+end
+
+def map_header_total_size() -> Int = 96
+
+# Compile-time/emit-time assertion pass over the canonical table: every field
+# offset and the total size are checked against the FROZEN runtime header.
+# The runtime emitter calls this before emitting any map/set code, and the
+# layout tests call it, so a drift between a consumer's literal offset and the
+# canonical table fails loudly instead of corrupting memory silently.
+def map_header_assert_contract() -> Unit
+  let total = map_header_total_size()
+  if total != 96 then
+    panic("MAP_HEADER_FIELDS: total size must be 96, got " + total.to_string())
+  end
+  if map_header_field_offset(&"buckets".to_string()) != 0 then
+    panic("MAP_HEADER_FIELDS: buckets must be 0, got " + map_header_field_offset(&"buckets".to_string()).to_string())
+  end
+  if map_header_field_offset(&"size".to_string()) != 8 then
+    panic("MAP_HEADER_FIELDS: size must be 8, got " + map_header_field_offset(&"size".to_string()).to_string())
+  end
+  if map_header_field_offset(&"capacity".to_string()) != 16 then
+    panic("MAP_HEADER_FIELDS: capacity must be 16, got " + map_header_field_offset(&"capacity".to_string()).to_string())
+  end
+  if map_header_field_offset(&"key_stride".to_string()) != 24 then
+    panic("MAP_HEADER_FIELDS: key_stride must be 24, got " + map_header_field_offset(&"key_stride".to_string()).to_string())
+  end
+  if map_header_field_offset(&"key_align".to_string()) != 32 then
+    panic("MAP_HEADER_FIELDS: key_align must be 32, got " + map_header_field_offset(&"key_align".to_string()).to_string())
+  end
+  if map_header_field_offset(&"value_stride".to_string()) != 40 then
+    panic("MAP_HEADER_FIELDS: value_stride must be 40, got " + map_header_field_offset(&"value_stride".to_string()).to_string())
+  end
+  if map_header_field_offset(&"value_align".to_string()) != 48 then
+    panic("MAP_HEADER_FIELDS: value_align must be 48, got " + map_header_field_offset(&"value_align".to_string()).to_string())
+  end
+  if map_header_field_offset(&"key_off".to_string()) != 56 then
+    panic("MAP_HEADER_FIELDS: key_off must be 56, got " + map_header_field_offset(&"key_off".to_string()).to_string())
+  end
+  if map_header_field_offset(&"value_off".to_string()) != 64 then
+    panic("MAP_HEADER_FIELDS: value_off must be 64, got " + map_header_field_offset(&"value_off".to_string()).to_string())
+  end
+  if map_header_field_offset(&"next_off".to_string()) != 72 then
+    panic("MAP_HEADER_FIELDS: next_off must be 72, got " + map_header_field_offset(&"next_off".to_string()).to_string())
+  end
+  if map_header_field_offset(&"bucket_stride".to_string()) != 80 then
+    panic("MAP_HEADER_FIELDS: bucket_stride must be 80, got " + map_header_field_offset(&"bucket_stride".to_string()).to_string())
+  end
+  if map_header_field_offset(&"free_list".to_string()) != 88 then
+    panic("MAP_HEADER_FIELDS: free_list must be 88, got " + map_header_field_offset(&"free_list".to_string()).to_string())
+  end
+end
+
 # Heap header size for a representation (F2 FROZEN; 0 = no heap header).
-# Map and Set share the runtime's actual 88-byte map header
-# ({buckets:0, size:8, capacity:16, key_stride:24, key_align:32,
-# value_stride:40, value_align:48, key_off:56, value_off:64, next_off:72,
-# bucket_stride:80} — Set is map-backed, see runtime.tg).
+# Map and Set share the runtime's actual 96-byte map header — the canonical
+# MAP_HEADER_FIELDS table above (map_header_field_offset / map_header_total_size)
+# is the single machine-readable authority ({buckets:0, size:8, capacity:16,
+# key_stride:24, key_align:32, value_stride:40, value_align:48, key_off:56,
+# value_off:64, next_off:72, bucket_stride:80, free_list:88}, total 96 — Set
+# is map-backed, see runtime.tg).
 # The Vec header carries the element stride at offset 24 (32 bytes total) —
 # the runtime's element-addressing authority; the layout values stored there
 # come from the CONCRETE element type at each creation site (codegen passes
 # element_stride_bytes(T), the same authority ProjIndex uses).
+# StringPtr's "header size" is the OwnedStringObjectLayout (32) — the heap
+# OBJECT behind the String handle (the VALUE width is the separate
+# StringHandleLayout, 8 — see string_abi_size).
 def repr_header_size(repr: Repr) -> Int
   match repr
-  when Repr::StringPtr     then 8
+  when Repr::StringPtr     then owned_string_object_size()
   when Repr::HeapVecHeader then 32
-  when Repr::HeapMapHeader then 88
-  when Repr::HeapSetHeader then 88
+  when Repr::HeapMapHeader then map_header_total_size()
+  when Repr::HeapSetHeader then map_header_total_size()
   when Repr::Invalid       then
     panic("layout: header-size query on Repr::Invalid (unresolved type) — must fail closed, never a guess")
   when _                   then 0
@@ -356,7 +491,7 @@ def repr_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::Inline then
     inline_storage_size(engine, ty)
   when Repr::RawPtr      then engine.target.pointer_size
-  when Repr::StringPtr   then engine.target.pointer_size
+  when Repr::StringPtr   then string_handle_layout_size()  # the String VALUE width (8)
   when Repr::HeapVecHeader then engine.target.pointer_size
   when Repr::HeapMapHeader then engine.target.pointer_size
   when Repr::HeapSetHeader then engine.target.pointer_size
@@ -380,7 +515,7 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::Inline then
     match ty
     when Type::Adt(tid, args) then
-      # P0-J2: Adt form of Array mirrors the deleted canonical Array arm
+ # Adt form of Array mirrors the canonical Array arm
       # (element alignment); the named Array[T] form is the heap-vector and
       # never reaches the Inline case — the fixed arrays are the distinct
       # Type::FixedArray variant below.
@@ -391,8 +526,8 @@ def repr_storage_align(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
-        # P0-CK: concrete-keyed — the substituted def's layout under THIS
-        # Adt's args (Wrapper[u8] align 1, Wrapper[Int] align 8, ...).
+ # concrete-keyed — the substituted def's layout under THIS
+        # Adt's args (Wrapper[u8] align 1, Wrapper[Int] align 8,...).
         compute_type_layout(engine, ty).align
       end
     when Type::Tuple(fields) then compute_tuple_layout(engine, fields).align
@@ -425,7 +560,7 @@ end
 def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
   match ty
   when Type::Adt(tid, args) then
-    # P0-J2: Adt form of Array mirrors the deleted canonical Array arm; the
+ # Adt form of Array mirrors the canonical Array arm; the
     # named Array[T] form is the heap-vector and never reaches the Inline
     # case (type_repr maps it to HeapVecHeader) — the fixed arrays are the
     # distinct Type::FixedArray variant below.
@@ -435,7 +570,7 @@ def inline_storage_size(engine: &mut LayoutEngine, ty: &Type) -> Int
     elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
       inline_array_storage_size(engine, &args[0], 0)
     else
-      # P0-CK: concrete-keyed — the substituted def's layout under THIS
+ # concrete-keyed — the substituted def's layout under THIS
       # Adt's args (never a nominal record, never a pointer slot).
       compute_type_layout(engine, ty).size
     end
@@ -468,7 +603,7 @@ struct LayoutRecord
   type_id: Int
   name: String
   category: LayoutCategory
-  repr: Repr                # Runtime value representation (P0-AR decision table)
+  repr: Repr                # Runtime value representation (decision table)
   size: Int              # Total size in bytes
   align: Int             # Required alignment in bytes
   stride: Int            # Distance between consecutive elements (>= size, multiple of align)
@@ -587,7 +722,7 @@ end
 
 struct LayoutEngine
   target: TargetDescriptor
-  # P0-CK: the layout cache is CONCRETE-KEYED — records/visit states are
+ # the layout cache is CONCRETE-KEYED — records/visit states are
   # keyed by the canonical render of the concrete Type::Adt(tid, args)
   # (mir_type_identity_key — the SAME (TypeId, substs) identity domain as the
   # MIR's concrete deinit-plan and drop-glue tables). Wrapper[u8],
@@ -618,7 +753,7 @@ def layout_engine_new(target: TargetDescriptor) -> LayoutEngine
 end
 
 # ———————————————————————————————————————————————————————————————
-# ConcreteTypeKey — THE concrete type identity (P0-CK)
+# ConcreteTypeKey — THE concrete type identity 
 # ———————————————————————————————————————————————————————————————
 # The structural key of a concrete Type::Adt(tid, args) instantiation:
 #   { def: TypeId, substs: Vec[Type] }.
@@ -658,11 +793,11 @@ def concrete_type_key_render(key: &ConcreteTypeKey) -> String
 end
 
 # ———————————————————————————————————————————————————————————————
-# The Substituted-Field Computation (P0-CK)
+# The Substituted-Field Computation 
 # ———————————————————————————————————————————————————————————————
 # A generic definition's FIELDS are substituted under the concrete key
 # BEFORE any offset/size is computed: the def's generic_params (declaration
-# order — P0-GPI GenericParamIds) are replaced by the key's concrete args
+# order — GenericParamIds) are replaced by the key's concrete args
 # via subst_type_args. Wrapper[u8]'s field is u8 (size 1/align 1),
 # Wrapper[Int]'s is Int (8/8) — the pointer-width generic-slot placeholder
 # no longer exists. A parameter the args do not cover stays Type::Param,
@@ -745,10 +880,11 @@ end
 # ———————————————————————————————————————————————————————————————
 # Primitive Type Sizes (F1 - Frozen)
 # ———————————————————————————————————————————————————————————————
-# NOTE: String is deliberately NOT in this table. Its 8-byte size is the
-# StringPtr representation (see type_repr / container_repr_for_name), not
-# an Immediate primitive: a String value is an 8-byte raw pointer to a
-# null-terminated UTF-8 buffer (FROZEN String ABI).
+# NOTE: String is deliberately NOT in this table. Its by-value width is the
+# separate StringHandleLayout (8 — one pointer to the owned String OBJECT,
+# see type_repr / container_repr_for_name), never an Immediate primitive
+# and never a raw C-string pointer: the value is a handle to the 32-byte
+# OwnedStringObjectLayout { data, len, cap, stride } the drop frees.
 
 def primitive_size(engine: &LayoutEngine, ty: &Type) -> Int
   match ty
@@ -831,7 +967,7 @@ def compute_layout_hash(name: &String, size: Int, align: Int, field_count: Int) 
 end
 
 # Get the size of a type (main entry point)
-# Every storage-shape decision is delegated to type_repr (the P0-AR
+# Every storage-shape decision is delegated to type_repr (the
 # decision table); no branch re-decides the representation here.
 # FAIL-CLOSED: unresolved/error types (Var/Param/Error/unknown) have no
 # layout — this query panics (ICE); the strict path (layout_of_concrete)
@@ -848,7 +984,7 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
   when Repr::Inline then
     match ty
     when Type::Adt(tid, args) then
-      # P0-J2: Adt form of Array mirrors the deleted canonical Array arm with
+ # Adt form of Array mirrors the canonical Array arm with
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant).
       if is_slice_view_tid(engine, tid.id) then
@@ -857,7 +993,7 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         inline_array_storage_size(engine, &args[0], 0)
       else
-        # Look up the cached CONCRETE record (P0-CK): keyed by the canonical
+ # Look up the cached CONCRETE record: keyed by the canonical
         # (TypeId, substs) render of THIS Adt — Wrapper[u8] and Wrapper[Int]
         # are distinct entries. A miss computes the substituted layout.
         let ckey = mir_type_identity_key(ty)
@@ -880,7 +1016,7 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
     when _ then 0
     end
   when Repr::RawPtr      then engine.target.pointer_size
-  when Repr::StringPtr   then engine.target.pointer_size
+  when Repr::StringPtr   then string_handle_layout_size()  # the String VALUE width (8)
   when Repr::HeapVecHeader then engine.target.pointer_size
   when Repr::HeapMapHeader then engine.target.pointer_size
   when Repr::HeapSetHeader then engine.target.pointer_size
@@ -897,7 +1033,7 @@ def size_of(engine: &mut LayoutEngine, ty: &Type) -> Int
 end
 
 # Get the alignment of a type
-# Delegates to type_repr (P0-AR decision table), never re-deciding.
+# Delegates to type_repr (decision table), never re-deciding.
 # FAIL-CLOSED: unresolved types (Repr::Invalid) panic instead of falling
 # back to a pointer alignment guess.
 def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
@@ -912,7 +1048,7 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       let tl = compute_tuple_layout(engine, fields)
       tl.align
     when Type::Adt(tid, args) then
-      # P0-J2: Adt form of Array mirrors the deleted canonical Array arm
+ # Adt form of Array mirrors the canonical Array arm
       # (element alignment); the fixed arrays are the distinct Type::FixedArray
       # variant below.
       if is_slice_view_tid(engine, tid.id) then
@@ -921,7 +1057,7 @@ def align_of(engine: &mut LayoutEngine, ty: &Type) -> Int
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
       else
-        # P0-CK: concrete-keyed — compute the substituted layout on a miss
+ # concrete-keyed — compute the substituted layout on a miss
         # (never a pointer-alignment guess).
         let ckey = mir_type_identity_key(ty)
         match engine.records.get(&ckey)
@@ -952,7 +1088,7 @@ end
 # Return a complete Layout for a type.  This is the canonical ABI query:
 # consumers should use layout_of instead of reconstructing size/align/
 # stride/field offsets independently.  Storage shapes come from type_repr
-# (P0-AR decision table); no branch re-decides the representation.
+# (decision table); no branch re-decides the representation.
 # FAIL-CLOSED: unresolved/error types (Repr::Invalid) panic — never a
 # pointer-sized guess (use layout_of_concrete for the Result form).
 def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
@@ -978,7 +1114,7 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
     match ty
     when Type::Tuple(fields) then tuple_layout(engine, fields)
     when Type::Adt(tid, args) then
-      # P0-J2: Adt form of Array mirrors the deleted canonical Array arm with
+ # Adt form of Array mirrors the canonical Array arm with
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant below).
       if is_slice_view_tid(engine, tid.id) then
@@ -995,7 +1131,7 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
           enum_layout: Option::None
         }
       else
-        # P0-CK: the substituted def's layout under THIS Adt's args.
+ # the substituted def's layout under THIS Adt's args.
         let rec = compute_type_layout(engine, ty)
         record_to_layout(&rec)
       end
@@ -1029,7 +1165,7 @@ def layout_of(engine: &mut LayoutEngine, ty: &Type) -> Layout
 end
 
 # ———————————————————————————————————————————————————————————————
-# Recursive Strict Concrete-Layout Verification (P0-AS)
+# Recursive Strict Concrete-Layout Verification 
 # ———————————————————————————————————————————————————————————————
 # The lenient size_of/layout_of now FAIL CLOSED on unresolved types
 # (Repr::Invalid panics — see type_repr), so no caller can silently read a
@@ -1042,12 +1178,12 @@ end
 # Box/Rc, slices (the {ptr,len} view holds a raw pointer), arrays and heap
 # containers (Map/Set/Function/String) — do not require
 # their pointee to be resolved.
-# P0-CK: the strict walk is CONCRETE-keyed — a generic definition's fields
+# the strict walk is CONCRETE-keyed — a generic definition's fields
 # are SUBSTITUTED under the queried Adt's args before the children are
 # proven (check_concrete_layout on Type::Adt(tid, args) proves the
 # substituted fields, never the template's params, and never a
 # pointer-width placeholder). A named type with no registered definition
-# FAILS the strict check (the generic-slot convention is deleted).
+# FAILS the strict check (the generic-slot convention is are not part of the model).
 
 def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, LayoutError]
   match ty
@@ -1079,7 +1215,7 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
       context: "check_concrete_layout"
     })
   when Type::Adt(tid, args) then
-    # P0-J2: Adt form of Array is the heap-vector identity (the named
+ # Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an opaque pointer-sized handle, concrete without
     # inspecting the pointee (fixed inline arrays are the distinct
     # Type::FixedArray variant). Slice[T] is the two-field view builtin —
@@ -1089,7 +1225,7 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
       Result::Ok(())
     else
       if engine_has_type_def(engine, tid.id) then
-        # P0-CK: the recursion state and the inline-children walk are
+ # the recursion state and the inline-children walk are
         # CONCRETE-keyed — the def's fields are SUBSTITUTED under this
         # Adt's args before the children are proven (Option[File] proves
         # File; Option[Int] proves Int; a generic template with empty args
@@ -1157,7 +1293,7 @@ def check_concrete_layout(engine: &mut LayoutEngine, ty: &Type) -> Result[Unit, 
         end
       else
         # Unregistered named type: FAIL CLOSED — the generic-parameter slot
-        # placeholder is deleted (P0-CK); an unregistered Adt has no layout.
+ # placeholder is are not part of the model; an unregistered Adt has no layout.
         Result::Err(LayoutError {
           class: LayoutFailureClass::UNSUPPORTED_TYPE,
           message: "No type definition registered for type id",
@@ -1345,7 +1481,7 @@ def record_to_layout(rec: &LayoutRecord) -> Layout
 end
 
 # ———————————————————————————————————————————————————————————————
-# EnumLayout — THE single enum-representation authority (P0-ER)
+# EnumLayout — THE single enum-representation authority 
 # ———————————————————————————————————————————————————————————————
 # Every question about how an enum's runtime VALUE is encoded — the
 # register-resident word, the heap image, the tag, the payload, the
@@ -1423,7 +1559,7 @@ def enum_layout_from_record(rec: &LayoutRecord) -> Option[EnumLayout]
 end
 
 # The EnumLayout of a registered enum TYPE (the concrete Adt form), from
-# the computed records — P0-CK: resolved through the CONCRETE key (the
+# the computed records — resolved through the CONCRETE key (the
 # (TypeId, substs) render), so Option[u8] and Option[(Int, Int)] are
 # distinct EnumLayouts. A cache miss COMPUTES the substituted enum layout
 # on demand (the engine is the authority; a registered enum queried without
@@ -1545,7 +1681,7 @@ end
 # Struct Layout Computation (F7 - declaration order, no reordering)
 # ———————————————————————————————————————————————————————————————
 
-# P0-CK: the record's identity is the CONCRETE Adt (def id + args render in
+# the record's identity is the CONCRETE Adt (def id + args render in
 # the record name when substituted — Wrapper[u8] vs Wrapper[Int] stay
 # distinguishable in dumps). `fields` arrive ALREADY SUBSTITUTED (see
 # compute_type_layout / substituted_type_def) — no Param can reach a
@@ -1609,7 +1745,7 @@ def compute_struct_layout(engine: &mut LayoutEngine, ty: &Type, fields: &Vec[Mir
 end
 
 # ———————————————————————————————————————————————————————————————
-# P1: the Closure-Object Layout — { code: fn ptr @ 0, env: capture-tuple }
+# the Closure-Object Layout — { code: fn ptr @ 0, env: capture-tuple }
 # ———————————————————————————————————————————————————————————————
 # The closure OBJECT's layout, REGISTERED BY the closure's identity (the
 # ClosureId-keyed concrete key of the Type::Closure — the SAME identity the
@@ -1704,7 +1840,7 @@ end
 # Enum Layout Computation (F3 - tag at 0, payload at 8)
 # ———————————————————————————————————————————————————————————————
 
-# P0-CK: the record's identity is the CONCRETE Adt (def id + args render);
+# the record's identity is the CONCRETE Adt (def id + args render);
 # `variants` arrive ALREADY SUBSTITUTED under the concrete key (see
 # compute_type_layout / substituted_type_def) — Option[u8]'s Some carries
 # the u8 payload, Option[(Int, Int)]'s the 16-byte tuple, never a
@@ -1778,7 +1914,7 @@ def compute_enum_layout(engine: &mut LayoutEngine, ty: &Type, variants: &Vec[Mir
   
   # The FLAT field list — the layout engine's own flat projection of the
   # enum image: [tag @ 0, variant 0's payload fields, variant 1's payload
-  # fields, ...] in DECLARATION order (each payload field offset is the
+  # fields,...] in DECLARATION order (each payload field offset is the
   # ABSOLUTE image offset — tag at 0, payload fields at 8 + alignment).
   # Codegen's enum_field_offset_for_variant_index computes the flat index
   # as 1 + Σ(prior-variant field counts) + field_idx and resolves it
@@ -1825,7 +1961,7 @@ end
 # Type Layout Computation Dispatcher
 # ———————————————————————————————————————————————————————————————
 
-# THE concrete layout computation (P0-CK): computes the layout of a
+# THE concrete layout computation: computes the layout of a
 # Type::Adt(tid, args) under its ConcreteTypeKey — the def's fields are
 # SUBSTITUTED with `args` before any offset/size is computed, the result is
 # cached under the key's canonical render, and the inline-cycle guard runs
@@ -1836,7 +1972,7 @@ def compute_type_layout(engine: &mut LayoutEngine, ty: &Type) -> LayoutRecord
   match ty
   when Type::Adt(tid, args) then
     let ckey = mir_type_identity_key(ty)
-    # Inline-cycle guard (P0-AT): re-entering a type whose layout is still
+ # Inline-cycle guard: re-entering a type whose layout is still
     # being computed means it reaches itself through inline storage only (no
     # pointer/Box indirection) — an infinitely sized recursive type,
     # diagnosed here. The state is CONCRETE-keyed: Wrapper[u8] and
@@ -1938,7 +2074,7 @@ end
 # Field Offset Query (Requirement 2 - no ad-hoc offsets)
 # ———————————————————————————————————————————————————————————————
 
-# Get the byte offset of a field by index — P0-CK: the query takes the
+# Get the byte offset of a field by index — the query takes the
 # CONCRETE Type (the field layout of Wrapper[u8] is resolved under the
 # Wrapper[u8] key, never a nominal record).
 def field_offset(engine: &mut LayoutEngine, ty: &Type, field_index: Int) -> Int
@@ -2036,32 +2172,38 @@ end
 # Header Layout Queries (for heap objects)
 # ———————————————————————————————————————————————————————————————
 
-# STRING ABI (FROZEN)
+# STRING ABI (FROZEN — the layout concepts are SEPARATED)
 # ———————————————————————————————————————————————————————————————
-# The by-value String ABI is FROZEN as an 8-byte raw pointer to a
-# null-terminated UTF-8 byte buffer. There is NO inline {ptr,len,cap}
-# header on String values; the runtime helpers (strlen-based) and
-# `normalize_string_arg0_for_current_arch` in codegen both rely on this.
+# The by-value String ABI is FROZEN as a StringHandleLayout (8): ONE
+# pointer-width handle to the 32-byte OWNED String OBJECT
+# (OwnedStringObjectLayout — {data:0, len:8, cap:16, stride:24}), the
+# heap object behind the handle. The object and its data buffer are
+# heap-allocated (the _tg_mem_alloc-style allocator) and freed by the
+# String drop (_tg_string_drop — the object header AND the buffer);
+# the old "StringPtr is a raw pointer to null-terminated UTF-8" reading
+# is superseded (the raw borrowed forms are the 16-byte StrView view and
+# the 8-byte CStringPtr raw pointer — neither is an owned String).
 #
-# The 32-byte {data:0, len:8, cap:16, stride:24} Vec-header shape described
-# elsewhere belongs ONLY to Vec/Array values and the internal char-vector
-# buffer produced by `str.chars()` (a Vec[Char], stride 4), never to String
-# values. Changing `string_abi_size` or `string_abi_is_raw_pointer` is a
-# breaking ABI change.
+# Changing `string_abi_size` (the VALUE width — StringHandleLayout) or
+# `owned_string_object_size` (the heap object behind the handle) is a
+# breaking ABI change. `normalize_string_arg0_for_current_arch` in codegen
+# and the _tg_string_* runtime helpers both rely on this shape.
 #
-# The value comes from the P0-AR decision table: String is Repr::StringPtr
-# and its header size is repr_header_size(StringPtr).
-def string_abi_size() -> Int = repr_header_size(Repr::StringPtr)
+# The value comes from the decision table: String is Repr::StringPtr;
+# the VALUE width is the StringHandleLayout constant below, and the heap
+# OBJECT's size is repr_header_size(StringPtr) = owned_string_object_size().
+def string_handle_layout_size() -> Int = 8
+def owned_string_object_size() -> Int = 32
+def string_abi_size() -> Int = string_handle_layout_size()
 def string_abi_is_raw_pointer() -> Bool = true
 
 # Known container ABI sizes (F2 - FROZEN)
 # These values are frozen and MUST NOT change during stabilization.
-# They come from the P0-AR decision table (repr_header_size via
-# container_repr_for_name): the full inline heap header size behind the
-# 8-byte value handle. String uses the raw-pointer ABI (see
-# string_abi_size), NOT a 32-byte inline Vec header; its {data,len,cap,
-# stride} shape is only the internal char-Vec buffer produced by
-# `str.chars()`, never the String value ABI.
+# They come from the decision table (repr_header_size via
+# container_repr_for_name): the full inline heap object size behind the
+# 8-byte value handle. String's entry is the OwnedStringObjectLayout (32 —
+# the heap object behind the StringHandleLayout value; see string_abi_size
+# for the separated value/object constants).
 def container_header_size(type_name: &String) -> Int
   repr_header_size(container_repr_for_name(type_name))
 end
@@ -2075,16 +2217,19 @@ end
 # heap_header_field_offset reads it the same way; the value is written by
 # _tg_array_new from the stride argument codegen passes (computed from the
 # CONCRETE element type via element_stride_bytes).
-# Map and Set share the runtime's 88-byte layout header ({buckets:0,
-# size:8, capacity:16, key_stride:24, key_align:32, value_stride:40,
-# value_align:48, key_off:56, value_off:64, next_off:72, bucket_stride:80} —
-# the layout parameters are stored at creation from the concrete K/V and the
-# runtime derives nothing; see runtime.tg "Map header (88 bytes)").
-# NOTE: String values have NO inline {ptr,len,cap} header (raw-pointer ABI,
-# see string_abi_size). The offsets below describe the internal char-Vec
-# buffer produced by `str.chars()`, which is laid out like Vec[u8]. They are
-# exposed via the "Vec" entry; the String branch is retained for byte-image
-# tooling only and does not apply to String values.
+# Map and Set share the runtime's 96-byte layout header — the canonical
+# MAP_HEADER_FIELDS table (map_header_field_offset / map_header_total_size)
+# is the single machine-readable authority: {buckets:0, size:8, capacity:16,
+# key_stride:24, key_align:32, value_stride:40, value_align:48, key_off:56,
+# value_off:64, next_off:72, bucket_stride:80, free_list:88} — the layout
+# parameters are stored at creation from the concrete K/V and the runtime
+# derives nothing; see runtime.tg "Map header (96 bytes)".
+# The StringPtr row below describes the OWNED STRING OBJECT's fields
+# (OwnedStringObjectLayout — the 32-byte {data:0, len:8, cap:16, stride:24}
+# object the StringHandleLayout value points at; the object and its buffer
+# are heap-allocated and freed by the String drop). It does NOT describe
+# the raw borrowed forms (the 16-byte StrView view and the CStringPtr raw
+# pointer — neither has these fields).
 #
 # Slice is deliberately NOT in container_repr_for_name: a Slice value is the
 # inline two-field view { ptr: Ptr[T] @ 0, len: UInt @ pointer_size }
@@ -2115,40 +2260,17 @@ def container_field_offset(type_name: &String, field_name: &String) -> Int
     else 0
     end
   when Repr::HeapMapHeader then
-    # Runtime Map header (88 bytes — {buckets:0, size:8, capacity:16,
-    # key_stride:24, key_align:32, value_stride:40, value_align:48,
-    # key_off:56, value_off:64, next_off:72, bucket_stride:80} — runtime.tg
-    # "Map header (88 bytes)"). The "len"/"length"/"size" aliases all read
-    # the live-entry count at 8; "cap"/"capacity" read 16.
-    if field_name == "buckets" then 0
-    else if field_name == "len" || field_name == "length" || field_name == "size" then 8
-    else if field_name == "cap" || field_name == "capacity" then 16
-    else if field_name == "key_stride" then 24
-    else if field_name == "key_align" then 32
-    else if field_name == "value_stride" then 40
-    else if field_name == "value_align" then 48
-    else if field_name == "key_off" then 56
-    else if field_name == "value_off" then 64
-    else if field_name == "next_off" then 72
-    else if field_name == "bucket_stride" then 80
-    else 0
-    end
+    # The canonical MAP_HEADER_FIELDS table (map_header_field_offset) is the
+    # single machine-readable authority for this layout — the 96-byte runtime
+    # header (free_list at 88). The "len"/"length"/"size" aliases all read the
+    # live-entry count at 8; "cap"/"capacity" read 16.
+    map_header_field_offset(field_name)
   when Repr::HeapSetHeader then
-    # Set is map-backed: the Set header IS the 88-byte Map header
-    # ({buckets:0, size:8, capacity:16, key_stride:24, ...} — _tg_set_*
-    # tail-calls the map helpers, see runtime.tg).
-    if field_name == "buckets" || field_name == "map" then 0
-    else if field_name == "len" || field_name == "length" || field_name == "size" then 8
-    else if field_name == "cap" || field_name == "capacity" then 16
-    else if field_name == "key_stride" then 24
-    else if field_name == "key_align" then 32
-    else if field_name == "value_stride" then 40
-    else if field_name == "value_align" then 48
-    else if field_name == "key_off" then 56
-    else if field_name == "value_off" then 64
-    else if field_name == "next_off" then 72
-    else if field_name == "bucket_stride" then 80
-    else 0
+    # Set is map-backed: the Set header IS the canonical 96-byte Map header
+    # (MAP_HEADER_FIELDS — _tg_set_* tail-calls the map helpers, see
+    # runtime.tg). "map" aliases the buckets word at 0.
+    if field_name == "map" then 0
+    else map_header_field_offset(field_name)
     end
   when _ then
     0
@@ -2332,7 +2454,7 @@ def lookup_type_name(engine: &LayoutEngine, type_id: Int) -> String
 end
 
 # ———————————————————————————————————————————————————————————————
-# Value ABI classification — the value-category model (P0-VC)
+# Value ABI classification — the value-category model 
 # ———————————————————————————————————————————————————————————————
 # The single authority that answers "how does a value of this type cross an
 # ABI boundary (argument / result / move / copy)?" — built on the
@@ -2450,7 +2572,9 @@ def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[Valu
     # pointers: one pointer-width slot.
     Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
   when Repr::StringPtr then
-    Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+    # The String VALUE is the StringHandleLayout (one pointer-width handle
+    # to the 32-byte OwnedStringObjectLayout) — it crosses in one slot.
+    Result::Ok(ValueCategory::Scalar(string_handle_layout_size()))
   when Repr::HeapVecHeader then
     Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
   when Repr::HeapMapHeader then
@@ -2462,7 +2586,7 @@ def classify_value_category(engine: &mut LayoutEngine, ty: &Type) -> Result[Valu
   when Repr::OpaquePtr then
     match ty
   when Type::FnPtr(_, _) then Result::Ok(ValueCategory::Scalar(engine.target.fn_ptr_size))
-  # P1 (the closure {code, env} ABI): the closure VALUE is ONE pointer to
+ # (the closure {code, env} ABI): the closure VALUE is ONE pointer to
   # the closure OBJECT ({ code: fn ptr @ 0, env: capture-tuple } — the
   # object's layout is registered by the ClosureId), so the value crosses
   # in one pointer-width slot.
@@ -2516,7 +2640,7 @@ end
 # Absolute byte offsets of each payload field for an enum variant, taken from
 # the single layout authority.  Offsets are relative to the enum base (tag at
 # 0, payload at tag_size).  Replaces any ad-hoc `payload_offset + i * 8`.
-# P0-CK: concrete-keyed with compute-on-miss — the variant offsets come from
+# concrete-keyed with compute-on-miss — the variant offsets come from
 # the SUBSTITUTED enum layout under the query's concrete key (Option[u8]'s
 # Some payload sits at 8; Option[(Int,Int)]'s at 8 with a 16-byte size).
 def enum_variant_field_offsets(engine: &mut LayoutEngine, ty: &Type, variant_index: Int) -> Vec[Int]
@@ -2576,7 +2700,7 @@ end
 def collect_inline_named_children(engine: &LayoutEngine, ty: &Type, out: &mut Vec[Int]) -> Unit
   match ty
   when Type::Adt(tid, args) then
-    # P0-J2: Adt form of Array is the heap-vector identity (the named
+ # Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an indirection, never followed into inline children. The
     # Slice view is likewise an indirection (its only field is a raw Ptr),
     # so it is never an inline child. The fixed arrays are the distinct
@@ -2599,13 +2723,13 @@ def collect_inline_named_children(engine: &LayoutEngine, ty: &Type, out: &mut Ve
   end
 end
 
-# DFS over the inline layout graph (P0-AT).  Reaching a type that is still
+# DFS over the inline layout graph. Reaching a type that is still
 # Visiting means it reaches itself through inline storage only — no finite
 # inline layout exists (e.g. `struct Bad { child: Bad }`).  Types reached
 # through indirection (e.g. `struct Node { next: Box[Node] }`) are never
 # flagged.  The engine has no error list; the existing diagnostic channel
 # for unrecoverable layout problems is panic, so the cycle is reported there.
-# P0-CK: the DFS states are keyed by the def's NOMINAL concrete key (the
+# the DFS states are keyed by the def's NOMINAL concrete key (the
 # empty-args Adt render — the def-level graph); the per-instantiation
 # compute path re-checks recursion under each CONCRETE key in
 # compute_type_layout.
@@ -2657,7 +2781,7 @@ def compute_all_layouts(engine: &mut LayoutEngine) -> Unit
     check_inline_layout_cycles(engine, td.id.id)
   end
 
-  # P0-CK: placeholders and computed records exist for NON-GENERIC defs
+ # placeholders and computed records exist for NON-GENERIC defs
   # only (their fields are already concrete, so the nominal key IS the
   # concrete key). A GENERIC def has NO nominal layout: its records are
   # computed per concrete instantiation on demand (compute_type_layout

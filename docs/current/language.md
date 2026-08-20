@@ -444,9 +444,42 @@ end
 
 ## Progressive Strictness (Mode System)
 
-Tangerine features a **progressive strictness** model: projects start in easy
-`Dev` mode and automatically escalate to stricter modes as the codebase matures.
-The mode controls which enforcement passes are active.
+Tangerine features a **progressive strictness** model: projects start in
+`Dev` mode and can escalate to stricter modes as the codebase matures
+(`--mode strict|production|hardened`, or the `[project] mode` key in
+Tangerine.toml). Each mode maps to a `ModeConfig` bit set
+(`tg_compiler/mode.tg`).
+
+> **Enforcement status.** The `ModeConfig` bits are **configuration data**,
+> not yet a semantic contract: the compile pipeline (`analyze_parsed` in
+> compiler_core.tg) does not read most of them. The table below gives, for
+> every bit, the concrete enforcing pass — or, where no pass exists, the
+> downgraded claim. An unenforced security-relevant claim is worse than
+> none, so the unenforced bits are stated as pending, not as features.
+
+### ModeConfig bits — enforcing pass or pending
+
+| ModeConfig bit | Set true in | Enforcing pass (file/function) | Status |
+|----------------|-------------|---------------------------------|--------|
+| `enforce_contracts` | Strict+ | MIR lowering `lower_contract` (mir.tg) emits `MirContractCheck`; codegen.tg emits a runtime trap on a false condition — **unconditionally, not gated by the flag** | enforced |
+| `enforce_capabilities` | all modes | resource_check.tg capability machinery (`validate_capability_exit`, capability consumption tracking, `contains_capability` via types.tg `type_properties_of`) — **unconditional** | enforced |
+| `enforce_effects` | Strict+ | none — `MirEffectRecord` is never constructed from source; the `__tg_effect_record` runtime body is a trap stub (runtime.tg) | configuration data — the enforcing pass (effect lowering + effect-log runtime) is pending |
+| `enforce_budgets` | Prod+ | none — `MirBudgetConsume` is never constructed from source; the `__tg_budget_*` data symbols have no definitions (runtime.tg) and fail closed at link if emitted | configuration data — the enforcing pass (budget lowering + budget-table runtime) is pending |
+| `enforce_coverage` | Strict+ | none — `coverage.tg` exists but is not invoked by any compile/check path | configuration data — the enforcing pass (coverage gate in the pipeline) is pending |
+| `gate_on_score` | Prod+ | none — `run_cqs_analysis` (cqs.tg) has no caller in the driver or pipeline | configuration data — the enforcing pass (CQS gate in the pipeline) is pending |
+| `require_docs_for_pub` | Strict+ | none — `generate_suggestions` (mode.tg) only suggests; no checker rejects | configuration data — the enforcing pass (pub-API doc check) is pending |
+| `require_tests_for_pub` | Strict+ | none — no pass verifies tests for public items | configuration data — the enforcing pass (pub-API test check) is pending |
+| `forbid_unsafe_no_reason` | all modes | none in the compile pipeline — the `unsafe_usage` lint (linter.tg) warns only under `tg lint` | configuration data — the enforcing pass (compile-path unsafe-reason check) is pending |
+| `forbid_all_unsafe` | Hardened | none — no pass rejects all unsafe in Hardened mode | configuration data — the enforcing pass (compile-path unsafe ban) is pending |
+| `enforce_memory_safety` | Prod+/Hardened | none — no pass adds extra bounds checks per mode | configuration data — the enforcing pass (Hardened bounds-check instrumentation) is pending |
+| `audit_dependencies` | Hardened | none — dependency collection (`merge_imported_deps`) validates imports but performs no security audit | configuration data — the enforcing pass (dependency audit gate) is pending |
+| `require_code_review` | Hardened | none — no pass can enforce a process requirement | configuration data — the enforcing pass (review-gate integration) is pending |
+| `allow_stubs` | Dev only | none — `stub_config_for_mode` (mode.tg) is never consumed; the `tg lint` stub rules are a separate subcommand | configuration data — the enforcing pass (stub rejection in the pipeline) is pending |
+| `auto_escalate` | Dev/Strict | none — the flag is never read; mode is fixed per invocation | configuration data — the enforcing pass (maturity escalation) is pending |
+
+The two enforced bits above are unconditional: they do not consult their
+flag, so `--no-contracts` / `--no-capabilities` (see the option table
+below) do not disable them today.
 
 ```tangerine
 # Set in Tangerine.toml:
@@ -454,24 +487,37 @@ The mode controls which enforcement passes are active.
 #   mode = "Production"
 
 # Four modes (least to most strict):
-#   Dev        — contracts checked at runtime, no gating
-#   Strict     — effects enforced, stubs rejected
-#   Production — CQS score gating, docs required for pub
-#   Hardened   — capabilities denylist, all budgets enforced
+#   Dev        — relaxed enforcement, stubs allowed
+#   Strict     — contracts + capabilities enforced; other gates pending
+#   Production — adds budget/coverage/CQS/doc/test gates (all pending)
+#   Hardened   — adds unsafe ban, memory-safety, dependency audit (all pending)
 ```
 
-| Feature | Dev | Strict | Production | Hardened |
-|---------|-----|--------|------------|----------|
-| Runtime contracts | ✓ | ✓ | ✓ | ✓ |
-| Effect enforcement | — | ✓ | ✓ | ✓ |
-| Stub rejection | — | ✓ | ✓ | ✓ |
-| CQS score gating | — | — | ✓ | ✓ |
-| Pub API docs/tests | — | — | ✓ | ✓ |
-| Capability denylist | — | — | — | ✓ |
-| Budget enforcement | — | — | — | ✓ |
-| Unsafe requires reason | — | — | ✓ | ✓ |
-
 See `tg_compiler/mode.tg` for the full `Mode` enum and `ModeConfig` struct.
+
+### Compiler option flags — responsible pass or deprecation
+
+The CLI accepts capability/contract/effects/budget/warning-policy flags.
+Each flag below is wired to exactly one responsible pass — or is marked
+deprecated when no pass consumes it.
+
+| Flag | Field | Responsible pass or deprecation |
+|------|-------|--------------------------------|
+| `--strict` | `strict_resolution` | enforced — forced `true` on every compile path (`analyze_parsed`, types.tg `type_check_typed`); permissive resolution is editor-recovery only |
+| `--no-contracts` | `enable_contracts` | **deprecated, inert** — no pass reads it; contract checks are unconditional (`lower_contract`, mir.tg) |
+| `--no-capabilities` | `enable_capabilities` | **deprecated, inert** — no pass reads it; capability enforcement is unconditional (resource_check.tg) |
+| `--no-effects` | `enable_effects` | **deprecated, inert** — no pass reads it; effects are not enforced at all (see the mode table) |
+| `--no-budgets` | `enable_budgets` | **deprecated, inert** — no pass reads it; budgets are not enforced at all (see the mode table) |
+| `-W` / `--warn-all` | `warn_all` | **deprecated, inert** — no pass reads it; `tg lint` uses its own `LintConfig` |
+| `-Werror` | `deny_warnings` | **deprecated, inert** — no pass reads it; the linter's `--deny` rules are the warning-policy application point |
+| `-g` | `debug_info` | **deprecated, inert** — no pass reads it |
+| `--check` | `check_only` | **deprecated, inert** — `--check` is kept for CLI compatibility; `tg check` / `StopAfter::Semantic` is the real gate |
+| `warn_unused` (default `true`) | — | **deprecated, inert** — no pass reads it |
+
+The flags that do have a responsible pass are the pipeline controls
+(`--mode`, `--target`, `-O0`…`-O3`, `--pgo-gen`, `--pgo-use`, `--emit-obj`,
+`--emit-mir`, `--print-ast`, `--print-tokens`, `--dump-*`, `--json`,
+`--no-color`, `-o`, `-c`, `-v`, `-q`).
 
 ## Agentic Features
 
@@ -583,9 +629,12 @@ Set via `profile = "backend"` in `Tangerine.toml`.
 # audit_required = ["DB"]
 ```
 
-The compiler runs `validate_against_profile()` during CQS analysis and rejects
-capability usage that violates the active profile. See `std/capabilities.tg` for
-the `SecurityProfile` enum and `profile_check()` function.
+The compiler does **not** yet run `validate_against_profile()`: the
+function is declared in `std/capabilities.tg` (API-only, outside the
+bootstrap closure) and no compile/CQS path calls it. The `SecurityProfile`
+enum and `profile_check()` are declared surfaces, not enforced behavior
+(the CQS gate itself is configuration data — see the ModeConfig table in
+§"Progressive Strictness").
 
 ### Effects
 
@@ -620,7 +669,12 @@ end
 ### Budgets
 
 Budget constraints are declared as function clauses using `budget` entries.
-The compiler and runtime enforce these limits.
+**Enforcement is not implemented:** `MirBudgetConsume` is never constructed
+from source, the `__tg_budget_*` data symbols have no definitions
+(runtime.tg), and the mode table's `enforce_budgets` bit is configuration
+data — the enforcing pass (budget lowering + budget-table runtime) is
+pending (see the ModeConfig table in §"Progressive Strictness"). The
+declared surface:
 
 ```tangerine
 # Budget clause
@@ -1756,18 +1810,21 @@ tg main.tg -q
 # Include debug info
 tg main.tg -g -o main
 
-# Warning controls
-tg main.tg -W       # Enable warnings
-tg main.tg -Werror  # Treat warnings as errors
+# Warning controls (DEPRECATED — inert: no pass reads these flags; use
+# `tg lint --deny/--warn/--allow <LINT>` for the warning policy)
+tg main.tg -W       # Enable warnings — accepted, no effect
+tg main.tg -Werror  # Treat warnings as errors — accepted, no effect
 
-# Disable agentic features selectively
+# Disable agentic features selectively (DEPRECATED — inert: no pass reads
+# these flags; contract/capability enforcement is unconditional)
 tg main.tg --no-contracts
 tg main.tg --no-capabilities
 tg main.tg --no-effects
 tg main.tg --no-budgets
 
-# Set mode explicitly (overrides Tangerine.toml)
-tg main.tg --mode=Production
+# Set mode explicitly (overrides Tangerine.toml; the mode config is
+# configuration data — see the ModeConfig table in §"Progressive Strictness")
+tg main.tg --mode Production
 
 # Quality analysis (CQS)
 tg quality src/

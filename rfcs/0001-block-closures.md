@@ -98,7 +98,7 @@ None — this RFC codifies existing practice.
 
 ## References
 
-- Tangerine grammar: `docs/grammar.md`
-- Style guide: `docs/style_guide.md`
+- Tangerine grammar: docs/current/grammar.md
+- Style guide: docs/current/style_guide.md
 - Match arm syntax unification: `rfcs/0002-match-arm-syntax-unification.md`
 - Block syntax unification

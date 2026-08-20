@@ -426,4 +426,4 @@ let discrete = adapters.iter()
 - [std/mmap.tg](../std/mmap.tg) — Memory-mapped I/O reference
 - [std/simd.tg](../std/simd.tg) — SIMD intrinsics reference
 - [examples/gpu_triangle.tg](../examples/gpu_triangle.tg) — Triangle example
-- [docs/gfx_ui_conformance.md](gfx_ui_conformance.md) — Conformance testing
+- [docs/current/gfx_ui_conformance.md](gfx_ui_conformance.md) — Conformance testing

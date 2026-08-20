@@ -40,5 +40,5 @@ Existing mode names are preserved. This RFC codifies semantics and precedence.
 ## References
 
 - `tg_compiler/mode.tg`
-- `docs/language.md`
-- `docs/security.md`
+- docs/current/language.md
+- docs/current/security.md

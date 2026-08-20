@@ -55,4 +55,4 @@ Open questions to be resolved during implementation.
 ## References
 
 - Related RFCs, papers, or language features in other languages.
-- RFC process and lifecycle: `docs/rfc_process.md`
+- RFC process and lifecycle: docs/current/rfc_process.md

@@ -114,7 +114,7 @@ any gap as a compiler bug (ICE), not a silent offset.
 
 ---
 
-## Current Stabilized Facts (reviewer item 120)
+## Current Stabilized Facts
 
 ### Adt / FixedArray forms
 
@@ -131,8 +131,8 @@ any gap as a compiler bug (ICE), not a silent offset.
 All raw memory access goes through `Ptr[T]` (read) and `PtrMut[T]`
 (read-write): 8 bytes, no ownership, trivially copyable, no drop. `String`
 exposes `as_ptr()` for its owned buffer; `StrView` carries `{ptr, len}` as the
-non-owning view. Borrows (`&T` / `&mut T`) are checker-managed and never appear
-in layout tables.
+non-owning view. Access markers (`&x` places) are checker-managed access operations and never appear
+in layout tables; `&T`/`&mut T` in type position is the E106 hard error.
 
 ### LangItems
 

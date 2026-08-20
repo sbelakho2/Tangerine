@@ -65,5 +65,5 @@ None.
 
 ## References
 
-- Grammar: `docs/grammar.md` (`match_arm` production)
-- Style guide: `docs/style_guide.md`
+- Grammar: docs/current/grammar.md (`match_arm` production)
+- Style guide: docs/current/style_guide.md

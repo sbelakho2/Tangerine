@@ -9,8 +9,8 @@
 ### 1.1 Prerequisites
 
 - Familiarity with Tangerine language syntax (Ruby/Rust-inspired).
-- Read the spec overview: `tangerine_graphics_ui_development_checklist.md` §0–3.
-- Read the developer guide: `docs/developer_guide.md`.
+- Read the spec overview: the repository-root `checklist.md` §0–3.
+- Read the developer guide: docs/current/developer_guide.md.
 
 ### 1.2 Getting Started
 
@@ -32,7 +32,7 @@
    make test-gfx-ui
    ```
 
-4. **Read the module-by-module guide:** `docs/developer_guide.md` §1.
+4. **Read the module-by-module guide:** docs/current/developer_guide.md §1.
 
 ### 1.3 Key Concepts
 
@@ -107,7 +107,7 @@
 
 ### 4.1 Ownership
 
-- Each `std/*.tg` module has a designated owner (see `docs/governance.md`).
+- Each `std/*.tg` module has a designated owner (see docs/current/governance.md).
 - PRs modifying a module require approval from the module owner.
 - Cross-module PRs require approval from all affected owners.
 
@@ -124,7 +124,7 @@
 ### 5.1 Cadence
 
 - Checklist is refreshed at the start of each release cycle.
-- See `docs/post_release.md` §5 for the refresh process.
+- See docs/current/post_release.md §5 for the refresh process.
 
 ### 5.2 Triggers for Off-Cycle Refresh
 
@@ -142,8 +142,8 @@
 |----------------------|-----------------------------------|-----------------|
 | Test run results     | CI artifacts                      | 1 year          |
 | Performance reports  | CI benchmark artifacts             | 1 year          |
-| Security reviews     | `docs/security.md` + issue tracker | Permanent       |
-| Certification reports| `docs/plugin_certification.md`     | Per version     |
+| Security reviews     | docs/current/security.md + issue tracker | Permanent       |
+| Certification reports| docs/current/plugin_certification.md     | Per version     |
 | Checklist snapshots  | Git tags (per release)             | Permanent       |
 | SBOM                 | Release artifacts                  | Per version     |
 

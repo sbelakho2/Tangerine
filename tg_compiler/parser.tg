@@ -12,7 +12,7 @@ use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, is_expr_s
 use tg_compiler::lexer::LexResult
 use tg_compiler::ast::{
   Program, Item, ItemKind, Visibility,
-  FunctionDecl, GenericParam, Param, ParamModifier, AccessConvention, NominalKind, FnBody, FunctionSig,
+  FunctionDecl, GenericParam, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
   StructDecl, FieldDecl, EnumDecl, VariantDecl,
   TraitDecl, TraitMethod, AssocType, ImplDecl, WherePredicate, AssocTypeImpl,
   ModuleDecl, UseDecl, AstPath, TypeAliasDecl, ConstDecl, StaticDecl,
@@ -109,7 +109,7 @@ def diag_has_errors(bag: &Vec[Diagnostic]) -> Bool
   false
 end
 
-# Records the P1 macro-expansion guard failure through the parser's diagnostic
+# Records the macro-expansion guard failure through the parser's diagnostic
 # channel. The expansion loop in compiler_core.tg (expand_macros, the 64-pass
 # fixpoint cap) must call this instead of silently continuing with an
 # incompletely expanded AST; the recorded error then drives the deliberate
@@ -118,7 +118,7 @@ def diag_macro_expansion_depth_exceeded(bag: &mut Vec[Diagnostic], span: Span) -
   diag_error(bag, ErrorCode::E105MacroExpansionDepthExceeded, "macro expansion exceeded maximum depth", span)
 end
 
-# Records a P1 macro-identity failure through the parser's diagnostic
+# Records a macro-identity failure through the parser's diagnostic
 # channel: a macro name that resolves to more than one module-qualified
 # definition (duplicate in the same module, or the same local name imported
 # from two modules) is an AMBIGUITY error — the same module/import ambiguity
@@ -129,7 +129,7 @@ def diag_macro_ambiguity(bag: &mut Vec[Diagnostic], message: String, span: Span)
   diag_error(bag, ErrorCode::E107MacroAmbiguity, message, span)
 end
 
-# Hard error (reviewer item 34): &T / &mut T (and &&T) in a general type
+# Hard error: &T / &mut T (and &&T) in a general type
 # position — return types, struct fields, generic type arguments, variable
 # annotations, tuple members, container elements — is NOT a first-class type
 # and is REJECTED: parse_type consumes the `&` constructor and returns
@@ -154,6 +154,7 @@ struct TgcParser
   pos: Int
   diag: Vec[Diagnostic]
   disallow_bitwise_pipe: Bool
+  extern_abi_context: Bool
 end
 
 def set_pos(p: &mut TgcParser, new_pos: Int) -> Unit
@@ -165,7 +166,8 @@ def tgc_parser_new(tokens: Vec[Token]) -> TgcParser
     tokens: tokens,
     pos: 0,
     diag: diag_new(),
-    disallow_bitwise_pipe: false
+    disallow_bitwise_pipe: false,
+    extern_abi_context: false
   }
 end
 
@@ -823,7 +825,7 @@ def parse_item(p: &mut TgcParser) -> Option[Item]
     when Option::None then ()
     end
   else
-    # Check for test block: test "name" do ... end
+    # Check for test block: test "name" do... end
     match peek(p)
     when TokenKind::Ident(name) then
       if name == "test" then
@@ -1579,39 +1581,51 @@ def consume_trailing_receiver_convention(p: &mut TgcParser, params: &mut Vec[Par
   end
 end
 
+# Parse one parameter. The access convention is the ONLY semantic record:
+# the legacy spellings (mut / &mut / & / move / own) are SYNTAX-ONLY and are
+# converted HERE to one AccessConvention — mut/&mut -> Inout, & -> Let,
+# move/own -> Sink — exactly like the explicit convention keywords. A
+# parameter that combines an access keyword (inout/sink/set/mut/&mut/&/
+# move/own) with a reference spelling after the colon (x: &T / x: &mut T)
+# is a CONTRADICTORY combination and is rejected with a diagnostic (the
+# convention was already fixed by the keyword).
 def parse_param(p: &mut TgcParser) -> Option[Param]
   let start = peek_span(p)
   
-  mut modifier = Option::None
   mut convention = AccessConvention::Let
+  mut had_keyword = false
   if at(p, TokenKind::Inout) && lookahead_kind(p, 1) != TokenKind::Colon then
     advance(p)
     convention = AccessConvention::Inout
+    had_keyword = true
   elsif at(p, TokenKind::Sink) && lookahead_kind(p, 1) != TokenKind::Colon then
     advance(p)
     convention = AccessConvention::Sink
+    had_keyword = true
   elsif at(p, TokenKind::Set) && lookahead_kind(p, 1) != TokenKind::Colon then
     advance(p)
     convention = AccessConvention::Set
+    had_keyword = true
   elsif at(p, TokenKind::Mut) then
     advance(p)
-    modifier = Option::Some(ParamModifier::Mut)
     convention = AccessConvention::Inout
+    had_keyword = true
   elsif at(p, TokenKind::AmpMut) then
     advance(p)
-    modifier = Option::Some(ParamModifier::RefMut)
     convention = AccessConvention::Inout
+    had_keyword = true
   elsif at(p, TokenKind::Amp) then
     advance(p)
-    modifier = Option::Some(ParamModifier::Ref)
+    convention = AccessConvention::Let
+    had_keyword = true
   elsif at(p, TokenKind::TkMove) && lookahead_kind(p, 1) != TokenKind::Colon then
     advance(p)
-    modifier = Option::Some(ParamModifier::Move)
     convention = AccessConvention::Sink
+    had_keyword = true
   elsif at(p, TokenKind::TkOwn) && lookahead_kind(p, 1) != TokenKind::Colon then
     advance(p)
-    modifier = Option::Some(ParamModifier::Own)
     convention = AccessConvention::Sink
+    had_keyword = true
   end
   
   match expect_ident(p)
@@ -1620,18 +1634,18 @@ def parse_param(p: &mut TgcParser) -> Option[Param]
     if at(p, TokenKind::Colon) then
       advance(p)
       if at(p, TokenKind::AmpMut) then
-        advance(p)
-        if modifier == Option::None then
-          modifier = Option::Some(ParamModifier::RefMut)
-          convention = AccessConvention::Inout
+        if had_keyword then
+          diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "conflicting access conventions: '&mut' after an access keyword (" + convention_name(convention) + ") — the legacy reference spelling is converted at parse time; use exactly one convention", peek_span(p))
         end
+        advance(p)
+        convention = AccessConvention::Inout
         ty = parse_type(p)
       elsif at(p, TokenKind::Amp) then
-        advance(p)
-        if modifier == Option::None then
-          modifier = Option::Some(ParamModifier::Ref)
-          convention = AccessConvention::Let
+        if had_keyword then
+          diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "conflicting access conventions: '&' after an access keyword (" + convention_name(convention) + ") — the legacy reference spelling is converted at parse time; use exactly one convention", peek_span(p))
         end
+        advance(p)
+        convention = AccessConvention::Let
         ty = parse_type(p)
       else
         ty = parse_type(p)
@@ -1640,16 +1654,11 @@ def parse_param(p: &mut TgcParser) -> Option[Param]
     
     match ty
     when Option::None then
-      if name == "self" then
-        match modifier
-        when Option::Some(ParamModifier::RefMut) then
-          convention = AccessConvention::Inout
-          ty = Option::Some(make_type_expr(TypeExprKind::Named("Self".to_string(), Vec::new()), start))
-        when Option::Some(ParamModifier::Ref) then
-          convention = AccessConvention::Let
-          ty = Option::Some(make_type_expr(TypeExprKind::Named("Self".to_string(), Vec::new()), start))
-        when _ then ()
-        end
+      if name == "self" && had_keyword then
+        # The legacy `&self` / `&mut self` receiver spellings carry the
+        # implicit Self type; a plain `self` receiver keeps ty=None (the
+        # impl/struct rewrite supplies the owner type downstream).
+        ty = Option::Some(make_type_expr(TypeExprKind::Named("Self".to_string(), Vec::new()), start))
       end
     when _ then ()
     end
@@ -1661,7 +1670,6 @@ def parse_param(p: &mut TgcParser) -> Option[Param]
     end
     
     return Option::Some(Param {
-      modifier: modifier,
       convention: convention,
       name: name,
       ty: ty,
@@ -1673,11 +1681,22 @@ def parse_param(p: &mut TgcParser) -> Option[Param]
   end
 end
 
+# The convention keyword spelling for diagnostics (the legacy spellings
+# convert to the same conventions, so the message names the CONVENTION).
+def convention_name(c: AccessConvention) -> String
+  match c
+  when AccessConvention::Inout then "inout"
+  when AccessConvention::Sink then "sink"
+  when AccessConvention::Set then "set"
+  when AccessConvention::Let then "let"
+  end
+end
+
 # ———————————————————————————————————————————————————————————————
 # Macro
 # ———————————————————————————————————————————————————————————————
 
-# Macro identity / module scoping (P1, DECIDED):
+# Macro identity / module scoping (, DECIDED):
 # MacroDecl carries the bare `name: String` (ast.tg); the expansion env in
 # compiler_core.tg (expand_macros, Phase 1) registers every macro under its
 # MODULE-SCOPED identity — the (owner module path, name) pair keyed by the
@@ -1697,7 +1716,7 @@ end
 # modules (std::collections, std::profile, std::snapshot, std::wasm_js), so
 # no same-module collision exists in the compiler's own sources.
 #
-# Macro hygiene (P1, DECIDED — STRUCTURAL, not spelling-based — see
+# Macro hygiene (, DECIDED — STRUCTURAL, not spelling-based — see
 # instantiate_macro in compiler_core.tg): every expansion interns a fresh
 # syntax-context mark (MacroEnv.syntax_contexts — the intern table), and the
 # identifiers the expansion INTRODUCES (the macro body's own let-bound
@@ -1933,7 +1952,7 @@ def parse_variant_decl(p: &mut TgcParser) -> Option[VariantDecl]
       end
       expect(p, TokenKind::RParen)
     elsif at(p, TokenKind::LBrace) then
-      # Named fields with curly braces: Variant { field: Type, ... }
+      # Named fields with curly braces: Variant { field: Type,... }
       advance(p)
       skip_newlines(p)
       skip_doc_comments(p)
@@ -2470,7 +2489,7 @@ def parse_budget_annotation(p: &mut TgcParser, start: Span) -> Option[BudgetAnno
     let cstart = peek_span(p)
     match expect_ident(p)
     when Option::Some(metric) then
-      # Accept : or < or <= as separator
+      # Accept: or < or <= as separator
       if at(p, TokenKind::Colon) then advance(p)
       elsif at(p, TokenKind::LtEq) then advance(p)
       elsif at(p, TokenKind::Lt) then advance(p)
@@ -2510,7 +2529,7 @@ def parse_rationale_block(p: &mut TgcParser, start: Span) -> Option[RationaleBlo
   ##     tag: "label"
   ##   end
 
-  ## If the first token is a bare string literal (old syntax: rationale "title" ... end)
+  ## If the first token is a bare string literal (old syntax: rationale "title"... end)
   match peek(p)
   when TokenKind::StringLit(title) then
     advance(p)
@@ -2626,7 +2645,7 @@ def parse_edition_decl(p: &mut TgcParser, start: Span) -> Option[EditionDecl]
 end
 
 def parse_extern_dispatch(p: &mut TgcParser, start: Span) -> Option[Item]
-  # Check for optional ABI string: extern "C" def ...
+  # Check for optional ABI string: extern "C" def...
   mut extern_abi = Option::None
   match peek(p)
   when TokenKind::StringLit(s) then
@@ -2637,14 +2656,14 @@ def parse_extern_dispatch(p: &mut TgcParser, start: Span) -> Option[Item]
   end
   # Standalone extern def: extern [abi] def foo() -> T (no end block)
   # When an ABI string is present, also handle extern blocks:
-  #   extern "ABI" def a() ... def b() ... end
+  #   extern "ABI" def a()... def b()... end
   if at(p, TokenKind::Def) then
     advance(p)
     match parse_extern_fn(p)
     when Option::Some(f) then
       mut items = [ExternItem::Function(f)]
       # Only continue parsing more defs when an explicit ABI was given
-      # (indicating block syntax like extern "Tangerine" ... end).
+      # (indicating block syntax like extern "Tangerine"... end).
       # Without ABI, this is a standalone extern def - don't eat more defs.
       if extern_abi != Option::None then
         skip_newlines(p)
@@ -2669,7 +2688,7 @@ def parse_extern_dispatch(p: &mut TgcParser, start: Span) -> Option[Item]
       return Option::Some(make_item(ItemKind::ItemExternBlock(ext), span_merge(start, peek_span(p))))
     when Option::None then return Option::None
     end
-  # Standalone extern static: extern [abi] static ...
+  # Standalone extern static: extern [abi] static...
   elsif at(p, TokenKind::Static) then
     advance(p)
     match parse_extern_static(p)
@@ -2683,7 +2702,7 @@ def parse_extern_dispatch(p: &mut TgcParser, start: Span) -> Option[Item]
     when Option::None then return Option::None
     end
   else
-    # Full extern block: extern [abi] ... end
+    # Full extern block: extern [abi]... end
     match parse_extern_block_with_abi(p, start, extern_abi)
     when Option::Some(e) then
       return Option::Some(make_item(ItemKind::ItemExternBlock(e), span_merge(start, peek_span(p))))
@@ -2798,6 +2817,21 @@ def parse_extern_block(p: &mut TgcParser, start: Span) -> Option[ExternBlock]
   })
 end
 
+# The extern ABI type parser: an extern declaration is the INTERNAL/FFI
+# boundary — `&T` / `&mut T` in an extern's type positions (INCLUDING
+# nested positions such as `Option[&K]`) denote the internal address/
+# reference ABI (the checker types them as RefInternal) and are the ONLY
+# general type positions where the reference forms parse (the E106
+# first-class-reference rejection applies everywhere else). The flag makes
+# parse_type itself produce the Ref form for the whole extern type subtree.
+def parse_extern_abi_type(p: &mut TgcParser) -> Option[TypeExpr]
+  let saved = p.extern_abi_context
+  p.extern_abi_context = true
+  let result = parse_type(p)
+  p.extern_abi_context = saved
+  result
+end
+
 def parse_extern_fn(p: &mut TgcParser) -> Option[ExternFn]
   let start = peek_span(p)
   match expect_ident(p)
@@ -2809,7 +2843,7 @@ def parse_extern_fn(p: &mut TgcParser) -> Option[ExternFn]
     mut ret_type = Option::None
     if at(p, TokenKind::Arrow) then
       advance(p)
-      ret_type = parse_type(p)
+      ret_type = parse_extern_abi_type(p)
     end
     consume_trailing_receiver_convention(p, &mut params)
     eat_optional_semi(p)
@@ -2835,7 +2869,7 @@ def parse_extern_static(p: &mut TgcParser) -> Option[ExternStatic]
   match expect_ident(p)
   when Option::Some(name) then
     expect(p, TokenKind::Colon)
-    match parse_type(p)
+    match parse_extern_abi_type(p)
     when Option::Some(ty) then
       eat_optional_semi(p)
       return Option::Some(ExternStatic {
@@ -2937,12 +2971,20 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
   
   match peek(p)
   when TokenKind::Amp then
-    # Hard E106: &T in a general type position is not a first-class type.
-    # parse_type NEVER erases the reference to its inner type: the `&` is
-    # consumed, the E106 error is recorded, the inner type is skipped for
-    # error recovery, and the parse fails (Option::None).
+    # Hard E106: &T in a general type position is not a first-class type —
+    # EXCEPT inside an extern declaration's type positions (extern_abi_
+    # context): there the reference denotes the internal address/reference
+    # ABI and parses as TypeExprKind::Ref (the checker types it
+    # RefInternal). parse_type NEVER erases the reference: outside the
+    # extern context the E106 error is recorded and the parse fails.
     let amp_span = peek_span(p)
     advance(p)
+    if p.extern_abi_context then
+      match parse_type(p)
+      when Option::Some(inner) then return Option::Some(TypeExpr { kind: TypeExprKind::Ref(inner, false), span: span_merge(amp_span, inner.span) })
+      when Option::None then return Option::None
+      end
+    end
     diag_safe_ref_not_first_class(&mut p.diag, amp_span)
     match parse_type(p)
     when Option::Some(_) then ()
@@ -2952,6 +2994,17 @@ def parse_type(p: &mut TgcParser) -> Option[TypeExpr]
   when TokenKind::And then
     let amp_span = peek_span(p)
     advance(p)
+    if p.extern_abi_context then
+      mut ref_mut = false
+      if at(p, TokenKind::Mut) then
+        advance(p)
+        ref_mut = true
+      end
+      match parse_type(p)
+      when Option::Some(inner) then return Option::Some(TypeExpr { kind: TypeExprKind::Ref(inner, ref_mut), span: span_merge(amp_span, inner.span) })
+      when Option::None then return Option::None
+      end
+    end
     diag_safe_ref_not_first_class(&mut p.diag, amp_span)
     match parse_type(p)
     when Option::Some(_) then ()
@@ -4020,7 +4073,7 @@ def parse_match_expr(p: &mut TgcParser) -> Option[MatchExpr]
       end
     end
 
-    # Support else as catch-all arm: match x ... else body end
+    # Support else as catch-all arm: match x... else body end
     if at(p, TokenKind::Else) then
       advance(p)
       skip_newlines(p)
@@ -4221,7 +4274,7 @@ def parse_handle_with_stmt(p: &mut TgcParser, start: Span) -> Option[Stmt]
 end
 
 # Body of a handle-with arm (`op(params) => body`). The body terminates at the
-# next arm line (`op2(...) => ...`), at the next `with` handler, or at `end` —
+# next arm line (`op2(...) =>...`), at the next `with` handler, or at `end` —
 # a plain parse_block_body would swallow the following arms as statements.
 def parse_handle_arm_body(p: &mut TgcParser) -> Option[Block]
   let start = peek_span(p)
@@ -4308,7 +4361,7 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
     return Option::Some(make_pattern(PatternKind::Ident("handle".to_string(), false), start))
   when TokenKind::Guard then
     # Contextual: `guard` is used as a pattern binding name in the kernel
-    # (e.g. `when Option::Some(guard) then ...`).
+    # (e.g. `when Option::Some(guard) then...`).
     advance(p)
     return Option::Some(make_pattern(PatternKind::Ident("guard".to_string(), false), start))
   when TokenKind::Ident(name) then
@@ -4337,7 +4390,7 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
         expect(p, TokenKind::RParen)
         let path = make_path([name], start)
         return Option::Some(make_pattern(PatternKind::Variant(path, pats), span_merge(start, peek_span(p))))
-      # Check for struct pattern: Name { field: pat, ... }
+      # Check for struct pattern: Name { field: pat,... }
       elsif at(p, TokenKind::LBrace) then
         advance(p)
         mut fields: Vec[(String, Pattern)] = Vec::new()
@@ -4379,7 +4432,7 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
         expect(p, TokenKind::RBrace)
         let path = make_path([name], start)
         return Option::Some(make_pattern(PatternKind::Struct(path, fields), span_merge(start, peek_span(p))))
-      # Check for path pattern: Name::Variant(pats...) or Name::Name::...::Variant { ... }
+      # Check for path pattern: Name::Variant(pats...) or Name::Name::...::Variant {... }
       elsif at(p, TokenKind::ColonColon) then
         mut segments = Vec::new()
         segments.push(name)
@@ -4604,7 +4657,7 @@ def parse_single_pattern(p: &mut TgcParser) -> Option[Pattern]
     return Option::Some(make_pattern(PatternKind::Ident("edition", false), start))
   when TokenKind::Resource then
     # Contextual: `resource` is a pattern binding name in the kernel
-    # (e.g. `when MirBudgetConsume(resource, amount) then ...`).
+    # (e.g. `when MirBudgetConsume(resource, amount) then...`).
     advance(p)
     return Option::Some(make_pattern(PatternKind::Ident("resource", false), start))
   when TokenKind::Deinit then
@@ -5201,7 +5254,7 @@ def parse_postfix(p: &mut TgcParser) -> Option[Expr]
       when TokenKind::Dot then
         let start = result.span
         advance(p)
-        # Support both named field access and tuple index access (.0, .1)
+        # Support both named field access and tuple index access (.0,.1)
         mut field_opt = Option::None
         match peek(p)
         when TokenKind::IntLit(n) then
@@ -5375,7 +5428,7 @@ def parse_closure_return_type(p: &mut TgcParser) -> Option[TypeExpr]
   end
 end
 
-# Parse a trailing block: { |params| body } or do |params| ... end
+# Parse a trailing block: { |params| body } or do |params|... end
 # Used for Ruby-style method calls: list.map { |x| x * 2 }
 def parse_trailing_block(p: &mut TgcParser) -> Option[Expr]
   let saved = p.pos
@@ -5593,7 +5646,7 @@ def parse_primary(p: &mut TgcParser) -> Option[Expr]
       let path = make_path([name], start)
       return Option::Some(make_expr(ExprKind::ExprStructLit(path, fields), span_merge(start, peek_span(p))))
     elsif at(p, TokenKind::LBracket) then
-      # Possibly `Foo[T] { ... }` — a struct literal with explicit generic args.
+      # Possibly `Foo[T] {... }` — a struct literal with explicit generic args.
       # Speculatively parse `[ Type (, Type)* ]` and require it be immediately
       # followed by `{ Ident :` to commit. Otherwise back off so that postfix
       # parsing can treat `[...]` as indexing.
@@ -5788,7 +5841,7 @@ def parse_primary(p: &mut TgcParser) -> Option[Expr]
       end
     end
   when TokenKind::Unless then
-    # Desugar: unless cond then ... else ... end  →  if !(cond) then ... else ... end
+    # Desugar: unless cond then... else... end  →  if !(cond) then... else... end
     advance(p)
     match parse_expr(p)
     when Option::Some(cond) then
@@ -5829,7 +5882,7 @@ def parse_primary(p: &mut TgcParser) -> Option[Expr]
     advance(p)
     skip_newlines(p)
 
-    # Ruby-like block params: do |x, y| ... end
+    # Ruby-like block params: do |x, y|... end
     mut block_params = Vec::new()
     mut block_ret_type = Option::None
     if at(p, TokenKind::Pipe) then

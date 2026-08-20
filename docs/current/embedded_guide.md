@@ -379,4 +379,4 @@ tg debug --probe openocd --chip stm32f407
 - [std/embedded.tg](../std/embedded.tg) — Full API reference
 - [std/simd.tg](../std/simd.tg) — SIMD for DSP on embedded
 - [examples/embedded_blinky.tg](../examples/embedded_blinky.tg) — Minimal example
-- [docs/memory_model.md](memory_model.md) — Ownership in no_std contexts
+- [docs/current/memory_model.md](memory_model.md) — Ownership in no_std contexts

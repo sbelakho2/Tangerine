@@ -3,11 +3,19 @@
 # Shared validation library for the Tangerine bootstrap harness.
 # Sourced by run_bootstrap.sh. Provides:
 #   - sha256 helpers (macOS + Linux portable)
-#   - phase fingerprints under TG_BOOTSTRAP_TRACE=1
-#     (token / ast / mir / object / link sha256 per stage)
+#   - the single bootstrap target authority (bh_boot_target) threaded through
+#     every stage/test/canary invocation
+#   - per-phase fingerprints under TG_BOOTSTRAP_TRACE=1
+#     (link-image / text / sections / symbols / relocs + probed
+#     tokens / ast / hir / mir / mir-mono dumps) and the stage2==stage3
+#     phase-equality gate
+#   - canary suite manifest parity (positive/negative/arch suites; missing
+#     tests, unlisted tests, count drift and zero suites are all fatal)
 #   - validate_stage: hard gate that a produced stage binary is usable
 #   - run_stage2_diag_ladder: stage2 diagnostic severity ladder
-#   - check_two_clean_dirs: build-from-two-clean-directories determinism check
+#   - trap-stub gate + per-target canary lane (cross-compilation CI)
+#   - check_two_clean_dirs: two-root reproducibility check (common seed +
+#     common host, with documented limitations)
 #
 # Conventions:
 #   - Everything is deterministic: no random temp names, sorted listings,
@@ -51,11 +59,39 @@ bh_sha256_cmd() {
 }
 
 # ———————————————————————————————————————————————————————————————
+# Target authority
+# ———————————————————————————————————————————————————————————————
+
+# The single bootstrap target resolution. Every compile/link invocation in
+# this harness threads the SAME TargetSpec; a hard-coded triple in any one
+# helper would let builds silently target different platforms. Prefers the
+# harness-resolved TARGET_TRIPLE (run_bootstrap.sh), then TG_BOOTSTRAP_TARGET,
+# and defaults to the canonical aarch64-apple-darwin.
+bh_boot_target() {
+  printf '%s' "${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}}"
+}
+
+# Map a target triple (or arch alias) to its canonical architecture token
+# used by otool -arch and the per-arch native test suites.
+bh_arch_of() {
+  case "$1" in
+    aarch64*|arm64*) printf 'arm64' ;;
+    x86_64*|amd64*)  printf 'x86_64' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ———————————————————————————————————————————————————————————————
 # Phase fingerprints (TG_BOOTSTRAP_TRACE=1)
 # ———————————————————————————————————————————————————————————————
 
 # Emit a stable, machine-readable phase fingerprint line for one stage.
 # Usage: bh_phase_line <stage> <phase> <hash>
+# A phase with value UNAVAILABLE is a documented gap: the phase exists in the
+# pipeline but the stage binary cannot currently dump it (see the report in
+# bh_fingerprints). UNAVAILABLE never silently drops a phase — it is recorded
+# so the stage2==stage3 equality gate can distinguish "not comparable" from
+# "comparable and equal".
 bh_phase_line() {
   printf 'FINGERPRINT %s %s %s\n' "$1" "$2" "$3"
 }
@@ -70,22 +106,186 @@ bh_dump_hash() {
   "$compiler" compile "$source_file" "$@" 2>/dev/null | bh_sha256_cmd
 }
 
-# The pipeline phases fingerprinted per stage. The bootstrap entry
-# (bootstrap_main.tg) supports only compile/check/--version/--target/-o/-O*/
-# --strict-resolution, so phase dumps (--dump-tokens, --dump-ast,
-# --dump-resolved-ast, --dump-mir-*, -c) are not fingerprintable; the stage
-# link-image hash is the deterministic fixed-point fingerprint.
-#   link-image     : sha256 of the final linked stage binary
-BOOTSTRAP_PHASES="link-image"
+# The pipeline phases fingerprinted per stage. Every phase is recorded with a
+# sha256 and the stage2==stage3 reproducibility gate (bh_phase_equality)
+# compares ALL of them, so equality is asserted at every phase, not only at
+# the final link image.
+#
+# Observable today from the stage binaries (Mach-O on the bootstrap host):
+#   link-image : sha256 of the final linked stage binary (exists)
+#   text       : normalized __TEXT disassembly (otool -tv) — the emitted
+#                machine code of the codegen phase
+#   sections   : normalized Mach-O section metadata (otool -l)
+#   symbols    : sorted symbol table (nm)
+#   relocs     : normalized relocation table (otool -r)
+#
+# Front-end phases (tokens, ast/hir, mir, mir-mono) need the kernel entry to
+# thread the driver's --dump-* phase hooks (tg_compiler/driver.tg parse_args
+# already supports them; tg_compiler/bootstrap_main.tg does NOT yet). The
+# harness probes each stage binary; while the kernel entry rejects the flags
+# the phases are recorded as UNAVAILABLE. The moment bootstrap_main.tg
+# threads them these phases fingerprint automatically — no harness change.
+BOOTSTRAP_PHASES="link-image text sections symbols relocs tokens ast hir mir mir-mono"
 
 # Compute the phase fingerprints for a stage binary.
 # Usage: bh_fingerprints <stage> <compiler> <source> <outdir>
+# Always writes $outdir/.fingerprints/<stage>.fingerprints (consumed by
+# bh_phase_equality and uploaded by CI); FINGERPRINT lines are printed to
+# stdout only under TG_BOOTSTRAP_TRACE=1.
 bh_fingerprints() {
   local stage="$1" compiler="$2" source_file="$3" outdir="$4"
+  local fp_dir="$outdir/.fingerprints"
+  mkdir -p "$fp_dir"
+  local fp_file="$fp_dir/$stage.fingerprints"
 
-  bh_log "fingerprinting $stage: link-image"
-  link_hash="$(bh_sha256_file "$outdir/$stage" 2>/dev/null || printf 'MISSING')"
-  bh_phase_line "$stage" link-image "$link_hash"
+  local binary="$outdir/$stage"
+  if [ ! -f "$binary" ]; then
+    bh_err "fingerprinting $stage: missing binary $binary"
+    return 1
+  fi
+
+  # Truncate ONLY after the binary is proven present: a failed run must never
+  # leave an empty fingerprint file behind — bh_phase_equality treats empty
+  # files as a hard failure, never as a vacuous pass.
+  : > "$fp_file"
+
+  bh_fp() {
+    local phase="$1" hash="$2"
+    bh_phase_line "$stage" "$phase" "$hash" >> "$fp_file"
+    if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
+      bh_phase_line "$stage" "$phase" "$hash"
+    fi
+  }
+
+  # Phase 1: the final link image.
+  bh_fp link-image "$(bh_sha256_file "$binary")"
+
+  # Phases 2-5: object/codegen phases derived from the Mach-O image. These are
+  # the observable artifacts of the codegen phase (sections/symbols/relocs/
+  # text). All normalization strips only the file-path header and canonicalizes
+  # ordering (sort) so the hashes are stable across runs and machines.
+  if command -v otool >/dev/null 2>&1 && command -v nm >/dev/null 2>&1; then
+    local arch
+    arch="$(bh_arch_of "$(bh_boot_target)")"
+
+    local text_dump
+    text_dump="$(otool -tv -arch "$arch" "$binary" 2>/dev/null | sed '1d' || true)"
+    bh_fp text "$(printf '%s' "$text_dump" | bh_sha256_cmd)"
+
+    local sec_dump
+    sec_dump="$(otool -l "$binary" 2>/dev/null | sed '1d' \
+      | grep -E '^\s+(sectname|segname|addr|size|offset|align|reloff|nreloc|flags)\s' || true)"
+    bh_fp sections "$(printf '%s' "$sec_dump" | bh_sha256_cmd)"
+
+    local sym_dump
+    sym_dump="$(nm "$binary" 2>/dev/null | sort || true)"
+    bh_fp symbols "$(printf '%s' "$sym_dump" | bh_sha256_cmd)"
+
+    local reloc_dump
+    reloc_dump="$(otool -r "$binary" 2>/dev/null | sed '1d' || true)"
+    bh_fp relocs "$(printf '%s' "$reloc_dump" | bh_sha256_cmd)"
+  else
+    bh_fp sections UNAVAILABLE
+    bh_fp symbols UNAVAILABLE
+    bh_fp relocs UNAVAILABLE
+    bh_fp text UNAVAILABLE
+  fi
+
+  # Phases 6-10: front-end phases via the driver's --dump-* phase hooks.
+  # Probed only under trace mode (each probe runs a compile); the probes are
+  # what the kernel entry will support once bootstrap_main.tg threads the
+  # driver flags — today they record UNAVAILABLE.
+  if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
+    local dump_src="${source_file:-tg_compiler/bootstrap_main.tg}"
+    bh_dump_phase() {
+      local phase="$1" flag="$2"
+      local out
+      if out="$( "$compiler" compile "$dump_src" --strict-resolution "$flag" --target "$(bh_boot_target)" 2>/dev/null )"; then
+        if [ -n "$out" ]; then
+          bh_fp "$phase" "$(printf '%s' "$out" | bh_sha256_cmd)"
+        else
+          bh_fp "$phase" UNAVAILABLE
+        fi
+      else
+        bh_fp "$phase" UNAVAILABLE
+      fi
+    }
+    bh_dump_phase tokens     --dump-tokens
+    bh_dump_phase ast        --dump-ast
+    bh_dump_phase hir        --dump-resolved-ast
+    bh_dump_phase mir        --dump-mir-lowered
+    bh_dump_phase mir-mono   --dump-mir-mono
+  else
+    bh_fp tokens UNAVAILABLE
+    bh_fp ast UNAVAILABLE
+    bh_fp hir UNAVAILABLE
+    bh_fp mir UNAVAILABLE
+    bh_fp mir-mono UNAVAILABLE
+  fi
+
+  bh_log "fingerprints for $stage written to $fp_file"
+  return 0
+}
+
+# Hard-gate: stage2 and stage3 must agree on EVERY fingerprinted phase, not
+# just the final link image. A phase UNAVAILABLE in both stages is a recorded
+# gap and does not fail; a phase available in one stage only, or differing
+# between the stages, fails the gate.
+# Usage: bh_phase_equality <stage-a> <stage-b> <outdir>
+bh_phase_equality() {
+  local stage_a="$1" stage_b="$2" outdir="$3"
+  local fa="$outdir/.fingerprints/$stage_a.fingerprints"
+  local fb="$outdir/.fingerprints/$stage_b.fingerprints"
+  if [ ! -f "$fa" ] || [ ! -f "$fb" ]; then
+    bh_err "phase equality: missing fingerprint files ($fa / $fb)"
+    return 1
+  fi
+  if [ ! -s "$fa" ] || [ ! -s "$fb" ]; then
+    bh_err "phase equality: empty fingerprint file ($fa / $fb) — fingerprint emission failed; a gate comparing zero phases must fail, never pass"
+    return 1
+  fi
+  local failures=0 compared=0 unavailable=0
+  local tag st phase ha hb
+  while read -r tag st phase ha; do
+    hb="$(awk -v p="$phase" '$3==p {print $4}' "$fb" | head -n1)"
+    if [ -z "$hb" ]; then
+      bh_err "phase equality: '$phase' present in $stage_a but missing in $stage_b"
+      failures=$((failures + 1))
+      continue
+    fi
+    if [ "$ha" = "UNAVAILABLE" ] && [ "$hb" = "UNAVAILABLE" ]; then
+      bh_log "phase equality: $phase UNAVAILABLE in both stages (documented gap; kernel entry must thread --dump-*)"
+      unavailable=$((unavailable + 1))
+      continue
+    fi
+    if [ "$ha" = "UNAVAILABLE" ] || [ "$hb" = "UNAVAILABLE" ]; then
+      bh_err "phase equality: $phase available in one stage only ($stage_a=$ha $stage_b=$hb)"
+      failures=$((failures + 1))
+      continue
+    fi
+    compared=$((compared + 1))
+    if [ "$ha" != "$hb" ]; then
+      bh_err "phase equality: $phase differs — $stage_a=$ha $stage_b=$hb"
+      failures=$((failures + 1))
+    fi
+  done < "$fa"
+  while read -r tag st phase hb; do
+    if ! grep -qE "^FINGERPRINT [^ ]+ $phase " "$fa"; then
+      bh_err "phase equality: '$phase' present in $stage_b but missing in $stage_a"
+      failures=$((failures + 1))
+    fi
+  done < "$fb"
+  bh_log "phase equality: $compared phase(s) compared, $unavailable unavailable in both"
+  if [ "$compared" -eq 0 ] && [ "$unavailable" -eq 0 ]; then
+    bh_err "phase equality: zero phases compared or recorded — refusing to pass an empty comparison ($fa / $fb)"
+    return 1
+  fi
+  if [ "$failures" -ne 0 ]; then
+    bh_err "phase equality FAILED ($failures problem(s))"
+    return 1
+  fi
+  bh_log "phase equality OK ($stage_a == $stage_b at every fingerprinted phase)"
+  return 0
 }
 
 # Mach-O 64-bit magic bytes: CF FA ED FE.
@@ -113,7 +313,8 @@ bh_is_macho64() {
 #        - is a valid Mach-O image
 #        - executes with exit 0
 #        - produces a nonzero expected-length output
-#   6. when trace mode is on, emits the eight per-phase fingerprints
+#   6. emits the per-phase fingerprints (always; see bh_fingerprints) and
+#      under trace mode additionally probes the --dump-* front-end phases
 # Returns nonzero (and prints an error) on any failed check.
 validate_stage() {
   local stage="$1" binary="$2" source_file="${3:-tg_compiler/bootstrap_main.tg}" outdir="${4:-build}"
@@ -164,7 +365,7 @@ def main() -> Int
   0
 end
 EOF
-  if ! "$binary" compile "$canary_src" -o "$canary_bin" --target aarch64-apple-darwin >/dev/null 2>&1; then
+  if ! "$binary" compile "$canary_src" -o "$canary_bin" --target "$(bh_boot_target)" >/dev/null 2>&1; then
     bh_err "$stage failed to compile the execution canary"
     return 1
   fi
@@ -196,8 +397,9 @@ EOF
   fi
   bh_log "$stage execution canary OK (rc=0, ${out_len} bytes output)"
 
-  if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
-    bh_fingerprints "$stage" "$binary" "$source_file" "$outdir"
+  if ! bh_fingerprints "$stage" "$binary" "$source_file" "$outdir"; then
+    bh_err "$stage fingerprint emission failed"
+    return 1
   fi
 
   bh_log "$stage VALID"
@@ -366,11 +568,150 @@ EOF
 }
 
 # ———————————————————————————————————————————————————————————————
+# Canary suite manifest parity (P1/P2 hardening)
+# ———————————————————————————————————————————————————————————————
+#
+# The canary suites are bootstrap acceptance gates. Each suite directory has a
+# MANIFEST that is the authority for the suite, and the KNOWN counts below are
+# the recorded expected totals (positive + negative + arch totals). Parity is
+# enforced in BOTH directions:
+#   - every manifest-listed test must exist on disk        (absence is fatal)
+#   - every discovered test must be manifest-listed        (no unlisted tests)
+#   - the discovered set == the manifest set == the count  (exact, no drift)
+#   - a zero/missing suite or a missing manifest is fatal  (never "0/0 passed")
+#
+# Native test organization (the "native-*" suites):
+#   tests/canary/        positive native canaries (manifest: tests/canary/MANIFEST)
+#   tests/canary_neg/    negative semantic canaries (manifest: tests/canary_neg/MANIFEST)
+#   tests/arm64/         ARM64 encoder/ABI tests (manifest: tests/arm64/MANIFEST)
+#   tests/x86_64/        x86-64 encoder/ABI tests (mandatory on x86_64 hosts)
+# The arch-specific suite (tests/arm64 on aarch64 hosts, tests/x86_64 on
+# x86_64 hosts) is mandatory: a missing directory is a hard failure, never a
+# warning — a suite advertised as a bootstrap acceptance gate must be present
+# on the supported host.
+
+CANARY_SUITE_POSITIVE_COUNT=75
+CANARY_SUITE_NEGATIVE_COUNT=53
+CANARY_SUITE_ARM64_COUNT=2
+CANARY_SUITE_TOTAL=$((CANARY_SUITE_POSITIVE_COUNT + CANARY_SUITE_NEGATIVE_COUNT + CANARY_SUITE_ARM64_COUNT))
+
+# Validate one canary suite directory against its manifest.
+# Usage: bh_canary_suite_validate <suite-dir> <manifest> <expected-count>
+# Fails when: the suite dir is missing, the manifest is missing, a listed test
+# is missing, a discovered test is unlisted, or any of the counts disagree.
+bh_canary_suite_validate() {
+  local dir="$1" manifest="$2" expected="$3"
+
+  if [ ! -d "$dir" ]; then
+    bh_err "canary suite dir missing: $dir (mandatory bootstrap acceptance gate)"
+    return 1
+  fi
+  if [ ! -f "$manifest" ]; then
+    bh_err "canary suite manifest missing: $manifest (a zero/missing suite is fatal)"
+    return 1
+  fi
+
+  local declared
+  declared="$(grep -E '^# count: [0-9]+' "$manifest" | sed -E 's/^# count: //' | head -n1)"
+  if [ -z "$declared" ]; then
+    bh_err "canary manifest $manifest has no '# count: N' declaration"
+    return 1
+  fi
+
+  local listed=0
+  local line entry
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    entry="${line%%$'\t'*}"
+    if [ ! -f "$dir/$entry" ]; then
+      bh_err "canary manifest entry missing file: $dir/$entry (listed in $manifest)"
+      return 1
+    fi
+    listed=$((listed + 1))
+  done < "$manifest"
+
+  local discovered=0
+  local f
+  for f in "$dir"/*.tg; do
+    [ -e "$f" ] || continue
+    discovered=$((discovered + 1))
+    entry="$(basename "$f")"
+    if ! grep -qxF "$entry" < <(grep -vE '^#|^$' "$manifest" | cut -f1); then
+      bh_err "unlisted canary file: $dir/$entry (every discovered test must be listed in $manifest)"
+      return 1
+    fi
+  done
+
+  if [ "$listed" -ne "$discovered" ]; then
+    bh_err "canary parity mismatch in $dir: $listed manifest entries vs $discovered discovered tests (manifest == discovered-set required)"
+    return 1
+  fi
+  if [ "$listed" -ne "$declared" ]; then
+    bh_err "canary count mismatch in $manifest: declared count $declared != listed entries $listed"
+    return 1
+  fi
+  if [ "$declared" -ne "$expected" ]; then
+    bh_err "canary count drift in $manifest: declared $declared != recorded expected count $expected (update the manifest AND the harness constant together)"
+    return 1
+  fi
+  if [ "$listed" -eq 0 ]; then
+    bh_err "canary suite $dir is empty (a zero suite is fatal)"
+    return 1
+  fi
+
+  bh_log "canary suite $dir OK: $listed tests, manifest parity exact (listed == discovered == declared == $expected)"
+  return 0
+}
+
+# Validate every bootstrap-acceptance canary suite for the resolved target.
+# Usage: bh_require_canary_suites
+bh_require_canary_suites() {
+  local target arch
+  target="$(bh_boot_target)"
+  arch="$(bh_arch_of "$target")"
+  local failures=0
+
+  bh_canary_suite_validate tests/canary     tests/canary/MANIFEST     "$CANARY_SUITE_POSITIVE_COUNT" || failures=$((failures + 1))
+  bh_canary_suite_validate tests/canary_neg tests/canary_neg/MANIFEST "$CANARY_SUITE_NEGATIVE_COUNT" || failures=$((failures + 1))
+
+  case "$arch" in
+    arm64)
+      bh_canary_suite_validate tests/arm64 tests/arm64/MANIFEST "$CANARY_SUITE_ARM64_COUNT" || failures=$((failures + 1))
+      ;;
+    x86_64)
+      if [ ! -d tests/x86_64 ]; then
+        bh_err "missing arch-specific native suite tests/x86_64 (mandatory on x86_64 hosts; a missing native-* directory is a hard failure)"
+        failures=$((failures + 1))
+      elif [ ! -f tests/x86_64/MANIFEST ]; then
+        bh_err "missing tests/x86_64/MANIFEST (arch-specific suite authority)"
+        failures=$((failures + 1))
+      fi
+      ;;
+    *)
+      bh_err "unsupported bootstrap target arch: $arch ($target)"
+      failures=$((failures + 1))
+      ;;
+  esac
+
+  if [ "$failures" -ne 0 ]; then
+    bh_err "canary suite validation FAILED for target $target"
+    return 1
+  fi
+  bh_log "canary suites OK for $target: positive=$CANARY_SUITE_POSITIVE_COUNT negative=$CANARY_SUITE_NEGATIVE_COUNT arm64=$CANARY_SUITE_ARM64_COUNT total=$CANARY_SUITE_TOTAL"
+  return 0
+}
+
+# ———————————————————————————————————————————————————————————————
 # Native canary + ARM64 test runner
 # ———————————————————————————————————————————————————————————————
 
 # Compile and execute a given list of canary files with the given compiler.
 # Each file must have `main() -> Int` returning its failure count (0 = pass).
+# A missing file is FATAL (manifest parity is checked by the callers; this is
+# the enforcement net), and an empty file list is fatal — a zero suite can
+# never "pass".
 # Usage: run_canary_files <compiler> <outdir> <file>...
 run_canary_files() {
   local compiler="$1" outdir="$2"
@@ -378,14 +719,21 @@ run_canary_files() {
   mkdir -p "$outdir"
   local failures=0 total=0
   local file
+  if [ "$#" -eq 0 ]; then
+    bh_err "run_canary_files: no canary files given (zero suite is fatal)"
+    return 1
+  fi
   for file in "$@"; do
-    [ -e "$file" ] || continue
+    if [ ! -f "$file" ]; then
+      bh_err "native canary file missing: $file (absence is fatal; manifest parity broken)"
+      return 1
+    fi
     total=$((total + 1))
     local name
     name="$(basename "$file" .tg)"
     local bin="$outdir/.native_${name}"
     bh_log "native canary: $file"
-    if ! "$compiler" compile "$file" -o "$bin" --target aarch64-apple-darwin >/dev/null 2>&1; then
+    if ! "$compiler" compile "$file" -o "$bin" --target "$(bh_boot_target)" >/dev/null 2>&1; then
       bh_err "native canary $name failed to compile"
       failures=$((failures + 1))
       continue
@@ -421,9 +769,17 @@ run_canary_files() {
 # Pre-self-host critical suite: exercises the runtime/ABI surfaces that the
 # compiler itself depends on, so a stage's runtime is proven capable before
 # compiling the compiler again. Run under stage1 and stage2.
+# Every critical canary must exist AND be a member of the authoritative
+# tests/canary/MANIFEST (absence or an unlisted file is fatal).
 # Usage: run_critical_canaries <compiler> <outdir>
 run_critical_canaries() {
-  run_canary_files "$1" "$2" \
+  local compiler="$1" outdir="$2"
+  local arch
+  arch="$(bh_arch_of "$(bh_boot_target)")"
+
+  # The critical subset is a SUBSET of the positive canary manifest; the
+  # manifest remains the authority (run_native_tests runs the full set).
+  local list=(
     tests/canary/test_canary_borrowed_enum.tg \
     tests/canary/test_canary_representation.tg \
     tests/canary/test_canary_narrow_storage.tg \
@@ -449,6 +805,9 @@ run_critical_canaries() {
     tests/canary/canary_pos_resource_sink_param.tg \
     tests/canary/canary_pos_resource_early_return.tg \
     tests/canary/canary_pos_resource_wrapper_generic.tg \
+    tests/canary/canary_pos_generic_policy_instances.tg \
+    tests/canary/canary_pos_generic_body_concrete_owning.tg \
+    tests/canary/canary_pos_fixed_array_const_size.tg \
     tests/canary/canary_pos_resource_user_finalizer_fields.tg \
     tests/canary/canary_pos_resource_map_cleanup.tg \
     tests/canary/canary_pos_resource_nested_scope.tg \
@@ -479,8 +838,43 @@ run_critical_canaries() {
     tests/canary/canary_pos_wrapper_viral_destroy.tg \
     tests/canary/canary_capability.tg \
     tests/canary/canary_closure_async.tg \
-    tests/canary/canary_ffi.tg \
-    tests/arm64/test_arm64_abi.tg
+    tests/canary/canary_ffi.tg
+  )
+  # The ARM64 ABI test is arch-specific: only the aarch64 lane runs it.
+  if [ "$arch" = "arm64" ]; then
+    list+=(tests/arm64/test_arm64_abi.tg)
+  fi
+
+  local critical_failures=0
+  local f base
+  for f in "${list[@]}"; do
+    if [ ! -f "$f" ]; then
+      bh_err "critical canary missing: $f (absence is fatal)"
+      critical_failures=$((critical_failures + 1))
+      continue
+    fi
+    base="$(basename "$f")"
+    case "$f" in
+      tests/canary/*)
+        if ! grep -qxF "$base" < <(grep -vE '^#|^$' tests/canary/MANIFEST); then
+          bh_err "critical canary not listed in tests/canary/MANIFEST: $base"
+          critical_failures=$((critical_failures + 1))
+        fi
+        ;;
+      tests/arm64/*)
+        if ! grep -qxF "$base" < <(grep -vE '^#|^$' tests/arm64/MANIFEST); then
+          bh_err "critical canary not listed in tests/arm64/MANIFEST: $base"
+          critical_failures=$((critical_failures + 1))
+        fi
+        ;;
+    esac
+  done
+  if [ "$critical_failures" -ne 0 ]; then
+    bh_err "critical canary list failed validation ($critical_failures problem(s))"
+    return 1
+  fi
+
+  run_canary_files "$compiler" "$outdir" "${list[@]}"
 }
 
 # Semantic canary negatives: every file in tests/canary_neg/ is a negative
@@ -491,7 +885,9 @@ run_critical_canaries() {
 # unrelated later error could turn a canary green.
 # A file that is accepted (exit 0), or whose output lacks the expected
 # diagnostic substring, fails the harness. Files without a manifest entry
-# also fail (missing manifest coverage).
+# also fail (missing manifest coverage), and manifest entries without files
+# fail too — the manifest is checked against the filesystem in BOTH
+# directions (manifest == discovered-set, never just one direction).
 # Usage: run_semantic_canary_negatives <compiler>
 run_semantic_canary_negatives() {
   local compiler="$1"
@@ -499,6 +895,11 @@ run_semantic_canary_negatives() {
   local manifest="$dir/MANIFEST"
   if [ ! -f "$manifest" ]; then
     bh_err "canary manifest missing: $manifest"
+    return 1
+  fi
+  # Bidirectional parity + the recorded negative count: a deleted canary, an
+  # unlisted canary, or a drifted count fails here.
+  if ! bh_canary_suite_validate "$dir" "$manifest" "$CANARY_SUITE_NEGATIVE_COUNT"; then
     return 1
   fi
   local failures=0 total=0
@@ -527,6 +928,10 @@ run_semantic_canary_negatives() {
       failures=$((failures + 1))
     fi
   done
+  if [ "$total" -eq 0 ]; then
+    bh_err "semantic canary negatives: zero tests discovered (zero suite is fatal)"
+    return 1
+  fi
   bh_log "semantic canary negatives: $((total - failures))/$total rejected with expected diagnostics"
   if [ "$failures" -ne 0 ]; then
     bh_err "semantic canary negatives FAILED: $failures problems"
@@ -536,37 +941,227 @@ run_semantic_canary_negatives() {
   return 0
 }
 
-# Compile and execute every native canary and ARM64 test with the given
+# Compile and execute every native canary and arch test with the given
 # compiler binary. Each test file has a `main() -> Int` that returns its
 # failure count; the harness requires exit code 0.
+#
+# The suite is MANIFEST-DRIVEN: the file list comes from the manifest, not
+# from a directory glob, and every suite advertised as a bootstrap acceptance
+# gate is mandatory on the resolved host — a missing tests/canary,
+# tests/canary_neg or tests/arm64 (aarch64 hosts) / tests/x86_64 (x86_64
+# hosts) directory is a hard failure, never a warning.
 #
 # Usage: run_native_tests <compiler> <outdir>
 run_native_tests() {
   local compiler="$1" outdir="$2"
   mkdir -p "$outdir"
 
-  local dirs=(tests/canary tests/arm64)
-  local all_files=()
-  local dir file
-  for dir in "${dirs[@]}"; do
-    if [ ! -d "$dir" ]; then
-      bh_warn "native test dir missing: $dir"
-      continue
-    fi
-    for file in "$dir"/*.tg; do
-      [ -e "$file" ] || continue
-      all_files+=("$file")
-    done
-  done
-  run_canary_files "$compiler" "$outdir" "${all_files[@]}"
+  if ! bh_require_canary_suites; then
+    return 1
+  fi
+
+  local files=()
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    files+=("tests/canary/$line")
+  done < tests/canary/MANIFEST
+
+  local arch
+  arch="$(bh_arch_of "$(bh_boot_target)")"
+  if [ "$arch" = "arm64" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ''|\#*) continue ;;
+      esac
+      files+=("tests/arm64/$line")
+    done < tests/arm64/MANIFEST
+  fi
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    bh_err "native test suite is empty (zero suite is fatal)"
+    return 1
+  fi
+  run_canary_files "$compiler" "$outdir" "${files[@]}"
 }
 
 # ———————————————————————————————————————————————————————————————
-# Two-clean-directory determinism check
+# Trap-stub gate + per-target canary lane
+# ———————————————————————————————————————————————————————————————
+
+# Assert that an emitted canary object contains NO trap stubs beyond the
+# runtime's single documented defensive trap. Trap stubs are the backend's
+# "unimplemented op" markers: the old x86 codegen emitted x64_ud2 (0F 0B) for
+# unsupported ops and fabricated defaults — those holes are closed and the
+# gate must never let them regress. Every other trap instruction in a canary
+# object (unreachable/unwrap traps, contract/budget traps, asserts, aborts,
+# foreign brk immediates) is a failure.
+#
+# Allowed exception (arm64 only): the runtime's vec-push sanity trap
+# `brk #0xbeef` (runtime.tg __tg_vec_push) — a deliberate defensive trap for
+# corrupt vec pointers that every Vec-using canary includes. x86-64 allows
+# NO trap instructions at all.
+# Usage: bh_assert_no_trap_stubs <binary> <triple>
+bh_assert_no_trap_stubs() {
+  local binary="$1" triple="$2"
+  if [ ! -f "$binary" ]; then
+    bh_err "trap-stub gate: missing binary $binary"
+    return 1
+  fi
+  if ! command -v otool >/dev/null 2>&1; then
+    bh_err "trap-stub gate: otool is not available (cannot disassemble $binary)"
+    return 1
+  fi
+  local arch
+  arch="$(bh_arch_of "$triple")"
+  local dis
+  dis="$(otool -tv -arch "$arch" "$binary" 2>/dev/null || true)"
+  if [ -z "$dis" ]; then
+    bh_err "trap-stub gate: cannot disassemble $binary for $arch"
+    return 1
+  fi
+  local hits=0
+  case "$arch" in
+    x86_64)
+      hits="$(printf '%s\n' "$dis" | grep -cE '\bud2\b' || true)"
+      ;;
+    arm64)
+      local udf_hits brk_hits brk_beef_hits
+      udf_hits="$(printf '%s\n' "$dis" | grep -cE '\budf\b' || true)"
+      brk_hits="$(printf '%s\n' "$dis" | grep -cE '\bbrk\b' || true)"
+      brk_beef_hits="$(printf '%s\n' "$dis" | grep -cE '\bbrk[[:space:]]+#0xbeef\b' || true)"
+      if [ "${udf_hits:-0}" -ne 0 ]; then
+        bh_err "trap-stub gate FAILED: $binary contains $udf_hits udf trap(s) ($arch — unreachable/unwrap trap stubs)"
+        return 1
+      fi
+      if [ "${brk_hits:-0}" -ne "${brk_beef_hits:-0}" ]; then
+        bh_err "trap-stub gate FAILED: $binary contains $((brk_hits - brk_beef_hits)) non-sanity brk trap(s) ($arch — only the documented 'brk #0xbeef' vec-push sanity trap is allowed)"
+        return 1
+      fi
+      bh_log "trap-stub gate OK: no trap stubs in $binary ($arch; $brk_beef_hits documented vec-push sanity trap(s) allowed)"
+      return 0
+      ;;
+    *)
+      bh_err "trap-stub gate: unsupported arch $arch"
+      return 1
+      ;;
+  esac
+  if [ "${hits:-0}" -ne 0 ]; then
+    bh_err "trap-stub gate FAILED: $binary contains $hits trap instruction(s) ($arch disassembly)"
+    return 1
+  fi
+  bh_log "trap-stub gate OK: no trap instructions in $binary ($arch)"
+  return 0
+}
+
+# Compile + execute the positive canary manifest for an arbitrary target
+# triple ("target lane"). Native lane: execute directly. Cross lanes: execute
+# under Rosetta (arch -x86_64) or an emulator (qemu-<arch>) when available;
+# when no executor exists the mandatory minimum is the trap-stub gate — the
+# emitted object must contain zero trap stubs. Used by the CI cross lane.
+#
+# Usage: run_target_lane_canaries <compiler> <outdir> [triple|arch-alias]
+#   triple omitted            -> bh_boot_target (native lane)
+#   "x86_64" / "amd64" alias  -> x86_64-apple-darwin (the cross lane)
+#   "aarch64" / "arm64" alias -> bh_boot_target (native lane on the bootstrap host)
+run_target_lane_canaries() {
+  local compiler="$1" outdir="$2"
+  local triple="${3:-$(bh_boot_target)}"
+  case "$triple" in
+    x86_64|amd64)  triple="x86_64-apple-darwin" ;;
+    aarch64|arm64) triple="$(bh_boot_target)" ;;
+  esac
+  mkdir -p "$outdir"
+
+  if ! bh_require_canary_suites; then
+    return 1
+  fi
+
+  local host_arch target_arch
+  host_arch="$(uname -m)"
+  target_arch="$(bh_arch_of "$triple")"
+
+  local can_exec=0
+  local runner=()
+  if [ "$host_arch" = "$target_arch" ]; then
+    can_exec=1
+  elif [ "$target_arch" = "x86_64" ] && command -v arch >/dev/null 2>&1 \
+       && arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+    # Rosetta 2 present: x86-64 binaries execute on the arm64 host.
+    can_exec=1
+    runner=(arch -x86_64)
+  elif command -v "qemu-$target_arch" >/dev/null 2>&1; then
+    can_exec=1
+    runner=("qemu-$target_arch")
+  fi
+
+  local failures=0 total=0
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    local src="tests/canary/$line"
+    total=$((total + 1))
+    local name
+    name="${line%.tg}"
+    local bin="$outdir/.lane_${target_arch}_${name}"
+    bh_log "target lane canary ($triple): $src"
+    if ! "$compiler" compile "$src" -o "$bin" --target "$triple" >/dev/null 2>&1; then
+      bh_err "target lane canary $name failed to compile for $triple"
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! bh_assert_no_trap_stubs "$bin" "$triple"; then
+      failures=$((failures + 1))
+      continue
+    fi
+    if [ "$can_exec" -eq 1 ]; then
+      chmod +x "$bin"
+      if ! "${runner[@]}" "$bin" >/dev/null 2>&1; then
+        bh_err "target lane canary $name exited nonzero under $target_arch ($triple)"
+        failures=$((failures + 1))
+      fi
+    else
+      bh_log "target lane canary $name: no executor for $triple on $host_arch; disassembly/trap-stub gate only"
+    fi
+  done < tests/canary/MANIFEST
+
+  bh_log "target lane ($triple): $((total - failures))/$total passed (execution: $(if [ "$can_exec" -eq 1 ]; then printf 'yes'; else printf 'no — disassembly gate only'; fi))"
+  if [ "$failures" -ne 0 ]; then
+    bh_err "target lane ($triple) FAILED: $failures problem(s)"
+    return 1
+  fi
+  bh_log "target lane ($triple) OK"
+  return 0
+}
+
+# ———————————————————————————————————————————————————————————————
+# Two-root reproducibility check
 # ———————————————————————————————————————————————————————————————
 
 # Build a stage binary twice from two pristine (clean) source copies and
-# assert that both runs produce byte-identical artifacts. This proves the
+# assert that both runs produce byte-identical artifacts. The check is
+# "two-root reproducibility": two copied trees with a COMMON SEED (identical
+# source closure, identical manifest) and a COMMON HOST (same toolchain,
+# same machine). It proves the build is insensitive to the absolute root
+# path — any absolute-path leakage in codegen/linker changes the artifacts.
+#
+# Documented limitations (the check is NOT a hermetic-build proof):
+#   - environment variables: TARGET_TRIPLE / TG_BOOTSTRAP_TARGET /
+#     TG_HOST_TARGET / TG_TARGET_ARCH / locale variables are inherited
+#     from the harness process; two runs with different env can differ.
+#   - timestamps: the compiler embeds no wall-clock output by construction,
+#     but a future timestamping feature would break the check by design.
+#   - locale: codegen string handling is locale-independent today; the check
+#     does not normalize locale.
+#   - file ordering: directory scans are sorted deterministically; the check
+#     would flag any unsorted scan introduced later.
+#   - absolute paths: this is exactly what the check detects — the two roots
+#     differ by construction, so any path leakage produces different hashes.
+#
 # Build the bootstrap closure for a clean tree from the kernel manifest.
 # Usage: build_clean_tree <dest-root> <repo-root>
 # Copies the exact compiler_kernel.manifest closure into $dest-root preserving
@@ -598,10 +1193,10 @@ build_clean_tree() {
   return 0
 }
 
-# The two-clean-directory determinism check builds the identical manifest
-# closure from two pristine trees whose absolute roots differ but whose
-# relative layout is identical. Any absolute-path leakage in codegen/linker
-# produces different binaries.
+# The two-root reproducibility check builds the identical manifest closure
+# from two pristine trees whose absolute roots differ but whose relative
+# layout is identical. Common seed + common host; see the limitations block
+# at the top of this section.
 #
 # Usage: check_two_clean_dirs <stage-name> <compiler> <outdir> <repo-root>
 check_two_clean_dirs() {
@@ -624,13 +1219,13 @@ check_two_clean_dirs() {
   local out_a="$outdir/${stage}_a" out_b="$outdir/${stage}_b"
 
   bh_log "$stage determinism: building from clean tree A (root=$dir_a)"
-  if ! ( cd "$dir_a" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_a" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_a" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_a" --target "$(bh_boot_target)" >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build A failed"
     return 1
   fi
 
   bh_log "$stage determinism: building from clean tree B (root=$dir_b)"
-  if ! ( cd "$dir_b" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_b" --target aarch64-apple-darwin >/dev/null 2>&1 ); then
+  if ! ( cd "$dir_b" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$out_b" --target "$(bh_boot_target)" >/dev/null 2>&1 ); then
     bh_err "$stage determinism: build B failed"
     return 1
   fi

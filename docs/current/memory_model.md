@@ -10,7 +10,7 @@ It describes the model the self-hosted compiler implements today
 file disagree, the compiler source file wins and this document is wrong.
 
 The migration that produced this model is recorded as history in
-[`access_resource_migration.md`](access_resource_migration.md); this
+[`access_resource_migration.md`](../history/access_resource_migration.md); this
 document supersedes that plan. Companion documents: the pipeline stage
 order is [`pipeline_manifest.md`](pipeline_manifest.md), the invariant
 catalog of the wider compiler is [`invariants.md`](invariants.md), the
@@ -43,7 +43,7 @@ guidance is [`interop.md`](interop.md).
 ## 1. Scope and Pipeline Position
 
 Memory safety in Tangerine is enforced by four compiler stages, in this
-order (see `docs/pipeline_manifest.md`):
+order (see docs/current/pipeline_manifest.md):
 
 | # | Stage | Source | What it enforces |
 |---|-------|--------|------------------|
@@ -450,14 +450,14 @@ collection, and the vtable machinery — is deleted.
 
 ## 9. The Type Representation
 
-`Type` (`types.tg`) after the representation collapse (P0-K): the dual
+`Type` (`types.tg`): the dual
 canonical variants (`Type::Option/Result/Map/Set/Box/Rc/Array/Slice`)
 are **gone**. The shape is:
 
 - **Primitives** — `Unit Bool Int UInt Float Char String Never`, the
   sized integer/float set for FFI parity (`I8..I128, U8..U128, ISize,
   USize, F32, F64`). `String` is a primitive and an **owned, mutable
-  String object** (P0-STRING): the String VALUE is one 8-byte pointer
+  String object**: the String VALUE is one 8-byte pointer
   (the engine's `StringPtr` value width) to a 32-byte String object
   header — the same shape as the Vec header:
   `{ data: Ptr[u8] @ 0, len: Int @ 8, cap: Int @ 16, stride: Int @ 24 }`,
@@ -768,7 +768,7 @@ scope:
   boundary (which is included); return edges exit every scope and run
   the whole chain. The `defer::<block key>` plan carries the defer stmt
   ids in registration order.
-- MIR lowering (`mir.tg`, P0-Y) lowers each defer body to a **template
+- MIR lowering (`mir.tg`) lowers each defer body to a **template
   block** and **clones** it into every exit chain that runs it — one
   scope's defers can run on several distinct exits (fallthrough,
   return, break/continue, backedge), and each exit has its own cleanup
@@ -809,7 +809,7 @@ compiler-owned structural field cleanup — exactly once.
 | Projected iteration bindings cannot escape the loop body | resource_check.tg §10 |
 | Zero-inference fail-closed: unsolved generic parameters are hard errors; the monomorphizer performs no inference | types.tg / mono.tg §13 |
 | LangItems built once, structurally unique; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
-| String is the OWNED String object (P0-STRING): one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract |
+| String is the OWNED String object: one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract |
 | Type-property graph algorithm with inline-recursion diagnostics; memoized per concrete args | types.tg §7 |
 | Monomorphization: seen-set, MAX_MONO_INSTANCES, residual-param aborts | mono.tg §13 |
 | Map/set ownership ops: every key-operating map/set intrinsic site injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI gates by declared param count; kernel key types dispatch to the runtime helpers) — the impls are reached and specialized with zero inference | mono.tg `inject_map_dispatch_calls` / `apply_dispatch_injection`; codegen.tg `map_hash_dispatch_label` / `map_eq_dispatch_label` |

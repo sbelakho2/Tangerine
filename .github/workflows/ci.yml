@@ -16,10 +16,16 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-    branches: [main]
+    # release/** PR bases must trigger the workflow or the release-freeze job
+    # (if: startsWith(github.base_ref, 'release/')) can never run — a freeze
+    # gate that cannot trigger is dead code.
+    branches: [main, release/**]
 
 env:
   TG_VERSION: "0.1.0"
+  # Pinned known-good benchmark baseline release tag. The bench job fails when
+  # the artifact is absent (no self-baselining).
+  TG_BENCH_BASELINE_TAG: "tg-bench-baseline-v1"
 
 jobs:
   # ———————————————————————————————————————
@@ -146,16 +152,24 @@ jobs:
           cp build/tg_stage3 build/tg
           chmod +x build/tg
 
+      - name: Fetch pinned benchmark baseline (no self-baselining)
+        run: |
+          set -euo pipefail
+          if ! gh release download "$TG_BENCH_BASELINE_TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --pattern bench_baseline.json \
+               --dir . --clobber 2>/dev/null; then
+            echo "::error::benchmark baseline missing from pinned release '$TG_BENCH_BASELINE_TAG'; absence of a pinned known-good baseline is a CI configuration failure — publish bench_baseline.json to that release before benchmarking"
+            exit 1
+          fi
+          echo "Pinned baseline fetched from release '$TG_BENCH_BASELINE_TAG'"
+
       - name: Run benchmarks
         run: |
           ./build/tg bench --json > bench_results.json
 
-      - name: Compare with baseline
+      - name: Compare with pinned baseline
         run: |
-          if [ ! -f bench_baseline.json ]; then
-            echo "bench_baseline.json not found; creating baseline from current run"
-            cp bench_results.json bench_baseline.json
-          fi
           ./build/tg bench --baseline bench_baseline.json > bench_comparison.txt
           cat bench_comparison.txt
 
@@ -236,13 +250,18 @@ jobs:
           done
           echo "✓ Type-check conformance passed"
 
-      - name: Run access/resource conformance
+      - name: Run access/resource/set/sink/deinit/capability/generic conformance (manifest-driven headline)
+        run: |
+          bash tests/run_conformance_canaries.sh ./build/tg
+          echo "✓ Ownership/access conformance headline passed (manifest-driven)"
+
+      - name: Run historical borrow-era golden tests (kept for history; not the headline)
         run: |
           for f in golden/borrow_01.tg golden/borrow_02.tg; do
             echo "Testing $f..."
             ./build/tg check "$f" || exit 1
           done
-          echo "✓ Access/resource conformance passed"
+          echo "✓ Historical borrow-era tests passed"
 
       - name: Run MIR/SSA conformance
         run: |
@@ -398,20 +417,43 @@ jobs:
         run: ./build/tg test std/wasm_js.tg --verbose
 
   # ———————————————————————————————————————
-  # Cross-compilation targets
-  # Deferred: once the macOS/AArch64 fixed point is green, stage3's
-  # cross-compiler produces the next platform bootstrap, which is then validated
-  # independently. No pretend Linux self-host matrix until a real Linux
-  # bootstrap artifact exists.
+  # Cross-compilation target lane
+  # Builds and executes native canaries for BOTH the arm64 native lane and the
+  # x86-64 cross lane. Every emitted object must be free of trap stubs
+  # (disassembled via otool: no ud2 on x86-64, no udf/foreign brk on arm64);
+  # the x86 ud2 holes are closed and this gate asserts they stay closed.
+  # x86-64 execution uses Rosetta (arch -x86_64) when present, else qemu,
+  # else the disassembly/trap-stub gate alone.
   # ———————————————————————————————————————
   cross-compile:
-    name: Cross (not yet supported)
+    name: Cross-target canary lanes (arm64 + x86_64)
     needs: bootstrap
     runs-on: macos-14
     steps:
-      - name: Cross-compilation matrix not yet enabled
+      - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
         run: |
-          echo "Skipped: cross-compilation matrix requires a validated non-macOS bootstrap artifact."
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+      - name: Native lane (arm64) — compile, execute, trap-stub gate
+        run: |
+          bash tests/run_target_lane_canaries.sh ./build/tg build/.cross_lane_arm64 aarch64
+      - name: Cross lane (x86_64) — compile, Rosetta/emulator execute, mandatory trap-stub gate
+        run: |
+          bash tests/run_target_lane_canaries.sh ./build/tg build/.cross_lane_x86_64 x86_64
+      - name: Upload cross-lane artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-lane-binaries
+          path: |
+            build/.cross_lane_arm64/
+            build/.cross_lane_x86_64/
 
   # ———————————————————————————————————————
   # SAST (CodeQL)
@@ -438,11 +480,72 @@ jobs:
     name: Release Branch Freeze
     if: startsWith(github.base_ref, 'release/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
-      - name: Verify release-branch PR type
+      - name: Enforce permitted path set (fail on unpermitted changes; waivers require a reviewed entry)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          echo "Release branch PR — only consistency/stub-removal/conformance PRs allowed unless waived"
+          set -euo pipefail
+          # Bootstrap/test-infrastructure paths permitted on release branches.
+          # Everything else fails unless BOTH a tests/release_waivers.json
+          # entry and an explicit 'release-waiver:' line in the PR body exist.
+          PERMITTED=(
+            "run_bootstrap.sh"
+            "scripts/bootstrap_helpers.sh"
+            "scripts/gen_bootstrap_input.sh"
+            "bootstrap/compiler_kernel.manifest"
+            "tests/"
+            "docs/"
+            ".github/workflows/ci.yml"
+          )
+          BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
+          HAS_MARKER=0
+          if printf '%s' "$BODY" | grep -qE '^release-waiver:'; then
+            HAS_MARKER=1
+          fi
+          CHANGED="$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only 2>/dev/null || true)"
+          if [ -z "$CHANGED" ]; then
+            echo "::error::release-freeze: could not enumerate changed files for PR $PR_NUMBER"
+            exit 1
+          fi
+          FAILED=0
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            if python3 - "$path" "$HAS_MARKER" "${PERMITTED[@]}" <<'PY'
+            import json, sys
+            path = sys.argv[1]
+            marker = sys.argv[2] == "1"
+            permitted = sys.argv[3:]
+            if any(path == p or path.startswith(p) for p in permitted):
+                sys.exit(0)
+            waived = False
+            try:
+                data = json.load(open("tests/release_waivers.json"))
+                waived = path in data.get("waived", {})
+            except Exception:
+                waived = False
+            if waived and marker:
+                print(f"::notice::release-freeze: {path} waived by reviewed waiver entry")
+                sys.exit(0)
+            print(f"::error::release-freeze: {path} is outside the permitted path set; a change requires a tests/release_waivers.json entry AND a 'release-waiver:' line in the PR body")
+            sys.exit(1)
+            PY
+            then
+              :
+            else
+              FAILED=$((FAILED + 1))
+            fi
+          done <<< "$CHANGED"
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::release-freeze: $FAILED path(s) outside the permitted set (no reviewed waiver)"
+            exit 1
+          fi
+          echo "✓ Release-branch path set enforced: all changed paths permitted or waived"
 
   # ———————————————————————————————————————
   # Workflow lint
