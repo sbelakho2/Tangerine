@@ -12,6 +12,7 @@
 
 use std::core::{Option, Result, Vec, String, Bool, UInt, Int}
 use std::collections::{Map, VecDeque}
+use std::sync::{Arc, AtomicBool}
 use std::io::{Read, Write, IOError}
 use std::net::{TcpStream}
 use std::time::{Instant, Duration, instant_now, duration_millis, duration_nanos}
@@ -1395,76 +1396,104 @@ end
 # ———————————————————————————————————————————————————————————————
 # Async Mutex (for shared state in async code)
 # ———————————————————————————————————————————————————————————————
-
+# The lock state lives in a heap allocation owned by an Arc (the real
+# allocator, std::sync). AsyncMutex::lock clones the Arc into the
+# LockFuture, and the future clones it again into the guard on
+# acquisition — the lock state stays alive even if the AsyncMutex is
+# dropped or moved while the future or the guard lives. Acquisition is an
+# atomic swap on the inner's AtomicBool; a contended poll re-queues itself
+# through the waker (the self-wake re-poll YieldNow uses) and re-tries the
+# swap on the next poll — the executor re-polls the task until the lock
+# frees. The guard's Drop releases the lock with an atomic store and the
+# deinit plan drops the guard's Arc clone (the last clone releases the
+# allocation).
 struct AsyncMutex[T]
+  inner: Arc[AsyncMutexInner[T]]
+end
+
+struct AsyncMutexInner[T]
+  locked: AtomicBool
   value: T
-  locked: Bool
-  waiters: Vec[Waker]
 end
 
 pub def async_mutex_new[T](value: T) -> AsyncMutex[T]
   AsyncMutex {
-    value: value,
-    locked: false,
-    waiters: Vec::new()
+    inner: Arc::new(AsyncMutexInner {
+      locked: AtomicBool::new(false),
+      value: value
+    })
   }
 end
 
-struct MutexGuard[T]
-  mutex: PtrMut[AsyncMutex[T]]
+# Guard returned by the LockFuture that releases the lock on drop.
+# The guard holds its own Arc clone of the inner state.
+struct AsyncMutexGuard[T]
+  inner: Arc[AsyncMutexInner[T]]
 end
 
-impl MutexGuard[T]
-  def get(self) -> Ptr[T]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      address_of(&mut (*self.mutex).value) as Ptr[T]
-    end
-  end
-  
-  def get_mut(inout self) -> PtrMut[T]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      address_of_mut(&mut (*self.mutex).value)
-    end
-  end
-end
-
-impl Drop for MutexGuard[T]
-  def drop(inout self) -> Unit
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let mtx = self.mutex.as_mut()
-      mtx.locked = false
-      # Wake next waiter
-      if !mtx.waiters.is_empty() then
-        mtx.waiters.remove(0).wake()
-      end
-    end
-  end
-end
-
+# The future holds an Arc clone of the inner — the mutex can drop while
+# the future (or the guard it produces) lives.
 struct LockFuture[T]
-  mutex: PtrMut[AsyncMutex[T]]
+  inner: Arc[AsyncMutexInner[T]]
 end
 
 impl Future for LockFuture[T]
-  type Output = MutexGuard[T]
+  type Output = AsyncMutexGuard[T]
   
-  def poll(inout self, inout cx: Context) -> Poll[MutexGuard[T]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let mtx = self.mutex.as_mut()
-      if !mtx.locked then
-        mtx.locked = true
-        Poll::Ready(MutexGuard { mutex: self.mutex })
-      else
-        mtx.waiters.push(cx.waker.clone())
-        Poll::Pending
-      end
+  def poll(inout self, inout cx: Context) -> Poll[AsyncMutexGuard[T]]
+    if self.inner.ptr.as_ref().locked.swap(true) then
+      # Lock is held — re-queue ourselves through the waker: the executor
+      # re-polls us and the poll re-tries the swap until the lock frees.
+      cx.waker.wake()
+      Poll::Pending
+    else
+      Poll::Ready(AsyncMutexGuard { inner: self.inner.clone() })
     end
   end
 end
 
 impl AsyncMutex[T]
-  def lock(inout self) -> LockFuture[T]
-    LockFuture { mutex: self as PtrMut[AsyncMutex[T]] }
+  def lock(self) -> LockFuture[T]
+    LockFuture { inner: self.inner.clone() }
+  end
+end
+
+impl AsyncMutexGuard[T]
+  def get(self) -> Ptr[T]
+    # The value access goes through the Arc the guard keeps alive — the
+    # inner's value lives in the Arc's allocation.
+    address_of(&mut self.inner.ptr.as_ref().value) as Ptr[T]
+  end
+  
+  def get_mut(inout self) -> PtrMut[T]
+    # The unconditional PtrMut through the Arc is intentional HERE: the
+    # guard holds the lock (no other task can touch the inner
+    # concurrently) — uniqueness comes from the LOCK PROTOCOL, not the
+    # refcount (the guard's Arc clone is never unique: the mutex itself
+    # holds a second clone, so Arc::get_mut would always be None). This
+    # raw path is the explicitly-unsafe primitive the Arc surface no
+    # longer exposes unconditionally.
+    unsafe "lock-exclusive raw access — the guard holds the lock" do
+      address_of_mut(&mut (*self.inner.ptr).value)
+    end
+  end
+  
+  def deref(self) -> Ptr[T]
+    self.get()
+  end
+  
+  def deref_mut(inout self) -> PtrMut[T]
+    self.get_mut()
+  end
+end
+
+impl Drop for AsyncMutexGuard[T]
+  def drop(inout self) -> Unit
+    # Release the lock (the atomic store). The guard's Arc clone is then
+    # dropped by the deinit plan — the inner allocation stays alive as
+    # long as ANY Arc clone (the mutex's, a future's, or a guard's) still
+    # references it.
+    self.inner.ptr.as_ref().locked.store(false)
   end
 end
 

@@ -9,7 +9,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::fs::{read_file}
-use tg_compiler::token::{Span}
+use tg_compiler::token::{Span, span_dummy}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key, lookup_module_callable}
@@ -22,6 +22,7 @@ use tg_compiler::ids::{
   generic_param_name_from,
   effect_registry_new, intern_module_effect, effect_id_of_name,
   effect_id_eq, effect_name_of_id, effect_vec_eq,
+  EFFECT_IO, EFFECT_FILE, EFFECT_ASYNC,
   intrinsic_id_numeric,
   SYNTHETIC_MODULE_ITEM_FALLBACK, SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK
 }
@@ -29,7 +30,8 @@ use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
   TypeExpr, TypeExprKind, Param, GenericParam,
-  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind
+  Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
+  BudgetAnnotation, BudgetConstraint
 }
 # (ONE AnalyzedProgram): the ONE TypedCFG the pipeline builds
 # (compiler_core's analyze_parsed — build_typed_cfg ONCE) is passed through
@@ -187,9 +189,29 @@ end
 # sites (check_function, check_impl's signature pass, pass-3 externs) under
 # the fn owner key and serialized into TypedProgram.typed_fn_signatures; the
 # MIR reads declaration types from this table — never from TypeExpr again.
+# The record ALSO carries the DECLARED EFFECT SET (the parsed
+# `effect[...]`-style annotation names interned through the EffectRegistry —
+# the EffectIds, or the std effectful-function seeds) and the DECLARED
+# BUDGET (the @budget annotation's limit — the typed record) so the
+# effect/budget semantics survive checking into the MIR.
 struct FnSignature
   params: Vec[ParamType]
   ret_type: Type
+  declared_effects: Vec[EffectId] = Vec::new()
+  declared_budget: Option[TypedBudget] = Option::None
+end
+
+# The TYPED budget record of a function/method declaration — the
+# @budget annotation's parsed constraints (metric + limit pairs, spans
+# stripped): the BudgetAnnotation's limit in the typed domain. Carried on
+# the typed FnSignature for the runtime enforcement consumers.
+struct TypedBudget
+  constraints: Vec[TypedBudgetConstraint]
+end
+
+struct TypedBudgetConstraint
+  metric: String
+  limit: String
 end
 
 # Plain type name of a TypeExpr, mirroring mir.tg's impl_type_name
@@ -337,6 +359,130 @@ def module_qualified_fn_key(module_path: Vec[String], name: String) -> String
     mod_key = mod_key + seg + "::"
   end
   mod_key + name
+end
+
+# ———————————————————————————————————————————————————————————————
+# the declared-effect domain — the effect discipline's keying, seeds,
+# and set operations (the typed effect/budget representation)
+# ———————————————————————————————————————————————————————————————
+# The effect-tracking identity key of a function/method declaration — the
+# DefId render "def::<module id>::<index>::<kind>" (fn_owner_key's shape
+# with the MODULE ID in place of the module path). Registration
+# (check_function / check_impl's signature pass) and the call-site lookups
+# derive the SAME key from the SAME DefId — the call sites have no Program
+# access, so the module-path render (fn_owner_key_of_def) is unreachable
+# there. The synthetic fallback owners (module -2/-3 bands) carry no
+# def-kind metadata, so the RECOVERY kind (DefKind::Other) renders them —
+# identity is the (module id, index) pair, never the kind label.
+def fn_effect_def_key(env: TypeEnv, did: DefId) -> String
+  let kind = match env.resolutions
+  when Option::Some(res) then def_id_kind_of_recovery(res, did)
+  when Option::None then DefKind::Other
+  end
+  fn_owner_key("def::" + did.module.id.to_string(), did.index, kind)
+end
+
+# The declared-effect seeding table for the KNOWN effectful standard
+# functions — the std's declared effects, the seeds the transitive
+# checking propagates. The std library's effectful operations (the
+# io/print/read/write/panic/await-effectful families) declare their
+# effects HERE — the source-text analyzer in std::effects is tooling; the
+# semantic seeds live in the checker (the fixed-id builtin band from
+# ids.tg: Io / File / Async). Gated to the std module by the caller
+# (declared_effects_of — a user function named `print` is never seeded).
+def std_effectful_fn_seed(reg: EffectRegistry, name: String) -> Vec[EffectId]
+  var out = Vec::new()
+  if name == "print" || name == "println" || name == "eprint" || name == "eprintln" ||
+     name == "read_line" || name == "read" || name == "panic" then
+    out.push(EffectId { id: EFFECT_IO })
+  elsif name == "write" || name == "write_all" || name == "open" then
+    out.push(EffectId { id: EFFECT_FILE })
+  elsif name == "spawn" || name == "sleep" || name == "await" then
+    out.push(EffectId { id: EFFECT_ASYNC })
+  end
+  out
+end
+
+# The declared effect set of a function/method declaration: the parsed
+# `effect[...]` annotation names interned through the registry
+# (module-qualified — two same-named effects in different modules are
+# distinct EffectIds), falling back to the std effectful-function seeds
+# when the declaration carries no annotation (the io/print/read/write/
+# panic/await-effectful std functions — the transitive checking's seeds).
+# inout: the interning persists into the caller's registry (the interned
+# id is the canonical identity).
+def declared_effects_of(inout env: TypeEnv, f_effects: Vec[String], f_name: String) -> Vec[EffectId]
+  var out = Vec::new()
+  if f_effects.len() > 0 then
+    for e_name in f_effects do
+      out.push(intern_module_effect(&mut env.effects, &env.current_module_path, &e_name))
+    end
+  else
+    let in_std = env.current_module_path.len() > 0 && env.current_module_path[0] == "std"
+    if in_std then
+      out = std_effectful_fn_seed(&env.effects, &f_name)
+    end
+  end
+  out
+end
+
+# The typed budget record of a declaration's @budget annotation — the
+# BudgetAnnotation's parsed limits (metric + bound pairs, spans stripped)
+# — the typed record the runtime enforcement consumes.
+def typed_budget_of(b: Option[BudgetAnnotation]) -> Option[TypedBudget]
+  match b
+  when Option::Some(ba) then
+    var cons = Vec::new()
+    for c in ba.constraints do
+      cons.push(TypedBudgetConstraint { metric: c.metric.clone(), limit: c.bound.clone() })
+    end
+    Option::Some(TypedBudget { constraints: cons })
+  when Option::None then Option::None
+  end
+end
+
+# Effect-set containment (identity is the id — effect_id_eq).
+def effect_set_contains(effs: Vec[EffectId], e: EffectId) -> Bool
+  var i = 0
+  while i < effs.len() do
+    if effect_id_eq(&effs[i], &e) then return true end
+    i = i + 1
+  end
+  false
+end
+
+# Append every effect of `extra` missing from `effs`; true when the set
+# grew (the transitive closure's fixpoint signal).
+def effect_set_append(inout effs: Vec[EffectId], extra: Vec[EffectId]) -> Bool
+  var changed = false
+  for e in extra do
+    if !effect_set_contains(&effs, &e) then
+      effs.push(e.clone())
+      changed = true
+    end
+  end
+  changed
+end
+
+# The effect name for diagnostics (the registry's id -> name table; the
+# fallback render for an id the registry never interned).
+def effect_display_name(env: TypeEnv, e: EffectId) -> String
+  match effect_name_of_id(&env.effects, &e)
+  when Option::Some(n) then n.clone()
+  when Option::None then "e" + e.id.to_string()
+  end
+end
+
+# Whether the function under a def-key is a std module function — the
+# trusted implementation base exempt from the compare diagnostics (its
+# declared effects are the API contract for USER callers; its internal
+# calls are the implementation of those declared effects).
+def fn_effect_is_std(env: TypeEnv, key: String) -> Bool
+  match env.fn_effect_modules.get(key)
+  when Option::Some(mpath) then
+    mpath.len() > 0 && mpath[0] == "std"
+  when Option::None then false
+  end
 end
 
 # the ownership-layer owner key of an item's free function — the
@@ -1271,6 +1417,37 @@ struct TypeEnv
   # snapshot env's literal legal under the struct-literal required-field
   # rule (the MirProgram defaulted-fields pattern).
   typed_fn_signatures: Map[String, FnSignature] = Map::new()
+ # the declared effect sets of the function/method declarations —
+  # keyed by the def-key (fn_effect_def_key — the DefId render
+  # "def::<module id>::<index>::<kind>", the key BOTH the registration
+  # sites and the call-site lookups derive from the SAME DefId without
+  # Program access). Registered at check_function / check_impl's signature
+  # pass from the parsed `effect[...]` annotation names (interned through
+  # the EffectRegistry; the std effectful-function seeds fill the
+  # un-annotated std functions). The computed-set table
+  # (fn_computed_effects) is the per-function union of the callees'
+  # declared effects, accumulated at the call-recording sites and closed
+  # transitively over the recorded call graph (fn_call_graph) by
+  # check_effect_sets; the end-of-check compare of computed vs declared is
+  # THE transitive effect discipline (the source-text analyzer in
+  # std::effects is tooling, never the semantics).
+  fn_declared_effects: Map[String, Vec[EffectId]] = Map::new()
+  fn_computed_effects: Map[String, Vec[EffectId]] = Map::new()
+  fn_call_graph: Map[String, Vec[String]] = Map::new()
+  fn_declared_effect_names: Map[String, String] = Map::new()
+  fn_declared_effect_spans: Map[String, Span] = Map::new()
+ # def-key -> the declaration's owner module path at registration.
+  # The compare pass exempts the std module's own functions from the
+  # violation/lint diagnostics: the std's DECLARED effects are its API
+  # contract for user callers (the seeds the transitive checking
+  # propagates), and the std implementation is the trusted base — its
+  # internal calls are the implementation of those declared effects,
+  # never checked against its own declarations.
+  fn_effect_modules: Map[String, Vec[String]] = Map::new()
+ # the def-key of the function/method whose body is being checked —
+  # the call-recording sites accumulate into its computed set. "" outside
+  # any function body (const/static initializers record no edges).
+  current_fn_key: String = ""
  # module-qualified key ("path::name" — module_qualified_key) -> the
   # checker's resolved declared type of a static / const / extern-static
   # declaration. Recorded in pass 3 (the same registration pass that binds
@@ -6013,6 +6190,14 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
     i = i + 1
   end
   
+ # (effect discipline): after every function body is checked, close
+  # the computed effect sets transitively over the recorded call graph and
+  # compare them against the declared sets — the checker's transitive
+  # effect/budget checking (the language semantics; the source-text
+  # analyzer in std::effects is tooling).
+  env.check_ctx = "effect-set-check"
+  check_effect_sets(env)
+  
   pop_scope(env)
 end
 
@@ -6506,9 +6691,115 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
 end
 
 # ———————————————————————————————————————————————————————————————
+# Effect / budget checking — the transitive effect discipline
+# ———————————————————————————————————————————————————————————————
+# The end-of-check effect pass (run once after every function body is
+# checked, from type_check_program_env): the per-function COMPUTED effect
+# sets (the union of the callees' declared effects, accumulated at the
+# call-recording sites) are closed TRANSITIVELY over the recorded call
+# graph (computed[F] ends up the union of the declared effects of every
+# function reachable from F), then each function's computed set is
+# compared against its DECLARED set:
+#   - a function calling an effectful function WITHOUT declaring the
+#     effect — an effect in the computed set the declared set never
+#     declared — is an ERROR: "function calls an effectful function but
+#     declares no effect: <effect name>" (the transitive case fires at
+#     every function on the path into the effect, exactly as the direct
+#     case);
+#   - a declared effect the function never uses is a LINT (a warning,
+#     reported through the checker's warnings channel) — an unused
+#     declaration is informational, never a rejection.
+def check_effect_sets(inout env: TypeEnv) -> Unit
+  # 1. transitive closure: computed[caller] += declared[callee] ∪
+  #    computed[callee] over every recorded call-graph edge, to fixpoint.
+  var graph_keys = env.fn_call_graph.entries()
+  var changed = true
+  while changed do
+    changed = false
+    var ki = 0
+    while ki < graph_keys.len() do
+      let (caller, callees) = graph_keys[ki]
+      var comp = Vec::new()
+      match env.fn_computed_effects.get(caller.clone())
+      when Option::Some(c) then comp = c.clone()
+      when Option::None then ()
+      end
+      for ckey in callees do
+        var full = Vec::new()
+        match env.fn_declared_effects.get(ckey.clone())
+        when Option::Some(d) then full = d.clone()
+        when Option::None then ()
+        end
+        match env.fn_computed_effects.get(ckey.clone())
+        when Option::Some(c2) then
+          let _ = effect_set_append(&mut full, c2.clone())
+        when Option::None then ()
+        end
+        if effect_set_append(&mut comp, full) then changed = true end
+      end
+      env.fn_computed_effects.insert(caller.clone(), comp)
+      ki = ki + 1
+    end
+  end
+  # 2. computed vs declared — an effect the function performs without
+  #    declaring it is the checker's transitive violation. The std module's
+  #    own functions are exempt (the std implementation is the trusted
+  #    base; its declared effects are the API contract for user callers).
+  var comp_entries = env.fn_computed_effects.entries()
+  var ci = 0
+  while ci < comp_entries.len() do
+    let (key, comp) = comp_entries[ci]
+    if !fn_effect_is_std(env, &key) then
+      match env.fn_declared_effects.get(key.clone())
+      when Option::Some(decl) then
+        for e in comp do
+          if !effect_set_contains(&decl, &e) then
+            let span = match env.fn_declared_effect_spans.get(key.clone())
+            when Option::Some(s) then s.clone()
+            when Option::None then span_dummy()
+            end
+            type_add_error(env, "function calls an effectful function but declares no effect: " + effect_display_name(env, &e), span)
+          end
+        end
+      when Option::None then ()
+      end
+    end
+    ci = ci + 1
+  end
+  # 3. a declared effect the function never uses — a lint (warning);
+  #    the std module's own functions are exempt (their declared effects
+  #    are declarations for their USER callers, not self-usage claims).
+  var decl_entries = env.fn_declared_effects.entries()
+  var di = 0
+  while di < decl_entries.len() do
+    let (key, decl) = decl_entries[di]
+    if !fn_effect_is_std(env, &key) then
+      var comp2 = Vec::new()
+      match env.fn_computed_effects.get(key.clone())
+      when Option::Some(c) then comp2 = c.clone()
+      when Option::None then ()
+      end
+      for e in decl do
+        if !effect_set_contains(&comp2, &e) then
+          let span = match env.fn_declared_effect_spans.get(key.clone())
+          when Option::Some(s) then s.clone()
+          when Option::None then span_dummy()
+          end
+          let fname = match env.fn_declared_effect_names.get(key.clone())
+          when Option::Some(n) then n.clone()
+          when Option::None then key.clone()
+          end
+          add_warning(env, "declared effect " + effect_display_name(env, &e) + " is never used by function " + fname, span)
+        end
+      end
+    end
+    di = di + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Generic-parameter interning 
 # ———————————————————————————————————————————————————————————————
-#
 # Every declaration interns its generic parameters in declaration order at
 # registration (the GenericParamId index IS the declaration position):
 #   - type declarations (pass 2): under the type's DefKind::TypeName DefId
@@ -6948,14 +7239,27 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # MIR reads the declaration's parameter/return types from this record —
   # the typed table is the authority; TypeExpr is never interpreted after
   # checking). A pass-4 body-check unification chases any inference
-  # variable at serialization (type_check_typed).
-  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone() })
+  # variable at serialization (type_check_typed). The record carries the
+  # DECLARED EFFECT SET (the parsed `effect[...]` names interned through
+  # the registry, or the std effectful-function seeds) and the DECLARED
+  # BUDGET (the @budget annotation's typed record) — the effect discipline
+  # and the MIR's carry both read them from here.
+  let declared_effects = declared_effects_of(env, &f.effects, &f.name)
+  let decl_key = fn_effect_def_key(env, &f_owner)
+  env.fn_declared_effects.insert(decl_key.clone(), declared_effects.clone())
+  env.fn_declared_effect_names.insert(decl_key.clone(), f.name.clone())
+  env.fn_declared_effect_spans.insert(decl_key.clone(), f.span)
+  env.fn_effect_modules.insert(decl_key.clone(), env.current_module_path.clone())
+  let declared_budget = typed_budget_of(&f.budget_val)
+  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone(), declared_effects: declared_effects, declared_budget: declared_budget })
   
  # every `return expr` in the body unifies immediately with the
   # declared return type (unconditional — not dependent on the last
   # statement). Cleared after the body check.
   env.expected_return = Option::Some(ret_type.clone())
-  # Check body
+  # Check body (the body's call sites record into this function's computed
+  # effect set — current_fn_key is the def-key registration used above).
+  env.current_fn_key = decl_key
   match f.body
   when FnBody::FnBlock(block) then
     let body_flow = check_block(env, &block, true)
@@ -6975,6 +7279,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     record_projected_consume(env, &expr)
   when _ then ()
   end
+  env.current_fn_key = ""
   env.expected_return = Option::None
   
   pop_scope(env)
@@ -7106,8 +7411,20 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
  # capture the method's typed signature (declaration order — the
     # receiver `self` is the first parameter exactly as declared); recorded
     # into env.typed_fn_signatures in the second pass under the method's
-    # owner key (the MIR reads declaration types from that record).
-    impl_sig_records.push(FnSignature { params: param_types.clone(), ret_type: ret_type.clone() })
+    # owner key (the MIR reads declaration types from that record). The
+    # record carries the method's DECLARED EFFECT SET (the parsed
+    # `effect[...]` names interned through the registry, or the std
+    # effectful-function seeds — registered HERE in the signature pass, so
+    # every method body (this impl's and later impls') resolves the
+    # declared set at its call sites) and the DECLARED BUDGET (the
+    # @budget annotation's typed record).
+    let m_declared_effects = declared_effects_of(env, &m.effects, &m.name)
+    let m_decl_key = fn_effect_def_key(env, &m_owner)
+    env.fn_declared_effects.insert(m_decl_key.clone(), m_declared_effects.clone())
+    env.fn_declared_effect_names.insert(m_decl_key.clone(), m.name.clone())
+    env.fn_declared_effect_spans.insert(m_decl_key.clone(), m.span)
+    env.fn_effect_modules.insert(m_decl_key.clone(), env.current_module_path.clone())
+    impl_sig_records.push(FnSignature { params: param_types.clone(), ret_type: ret_type.clone(), declared_effects: m_declared_effects, declared_budget: typed_budget_of(&m.budget_val) })
 
     # Collect method-level generic parameter ids for later substitution
  # (the ids in declaration order — the param-name table holds
@@ -7356,6 +7673,10 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
  # every `return expr` in the body unifies immediately with the
     # declared return type (see check_function).
     env.expected_return = Option::Some(ret_type.clone())
+    # Check body (the body's call sites record into this method's computed
+    # effect set — the SAME def-key the signature pass registered the
+    # declared set under).
+    env.current_fn_key = fn_effect_def_key(env, &m_owner)
     # Check body
     match m.body
     when FnBody::FnBlock(block) then
@@ -7374,6 +7695,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
       record_projected_consume(env, &expr)
     when _ then ()
     end
+    env.current_fn_key = ""
     env.expected_return = Option::None
 
     pop_scope(env)
@@ -11340,7 +11662,9 @@ end
 # the key typed_call_for and the MIR's call_def_ids consume. A callee with
 # no resolver entry (a closure value, a function-pointer field access)
 # records nothing — the missing-metadata rule: the construction never
-# silently defaults the callee.
+# silently defaults the callee. The DIRECT-CALL effect recording rides the
+# same site: when the callee has DECLARED effects, the enclosing function's
+# computed effect set accumulates them (record_effect_call).
 def record_typed_call_target(inout env: TypeEnv, callee: Expr, node_id: Int) -> Unit
   let target_node = typed_callee_target_node(callee)
   if target_node < 0 then return end
@@ -11356,7 +11680,54 @@ def record_typed_call_target(inout env: TypeEnv, callee: Expr, node_id: Int) -> 
   when Option::None then ()
   end
   match did_opt
-  when Option::Some(did) then env.typed_call_targets.insert(node_id, did)
+  when Option::Some(did) then
+    env.typed_call_targets.insert(node_id, did.clone())
+    record_effect_call(env, Option::Some(did))
+  when Option::None then ()
+  end
+end
+
+# The DIRECT-CALL effect recording — the checker's call sites: when the
+# callee has DECLARED effects (the def-key table the registration sites
+# filled), the caller's COMPUTED effect set accumulates them (the
+# per-function computed set — the union of the callees' declared effects,
+# closed transitively over the recorded call graph by check_effect_sets at
+# the end of the program check). The call-graph edge is recorded for every
+# resolved direct call, whether or not the callee carries effects (the
+# transitive closure reads the graph). An unresolved callee (a closure
+# value, a computed callee) records nothing — effect-unknown is
+# effect-free at the call site (the closure's own body calls recorded
+# under the enclosing function's key carry its transitive effects).
+def record_effect_call(inout env: TypeEnv, callee: Option[DefId]) -> Unit
+  if env.current_fn_key == "" then return end
+  match callee
+  when Option::Some(did) then
+    let callee_key = fn_effect_def_key(env, &did)
+    var callee_effs = Vec::new()
+    match env.fn_declared_effects.get(callee_key.clone())
+    when Option::Some(effs) then callee_effs = effs.clone()
+    when Option::None then ()
+    end
+    if callee_effs.len() > 0 then
+      match env.fn_computed_effects.get(env.current_fn_key.clone())
+      when Option::Some(comp) then
+        var new_comp = comp.clone()
+        let _ = effect_set_append(&mut new_comp, callee_effs)
+        env.fn_computed_effects.insert(env.current_fn_key.clone(), new_comp)
+      when Option::None then
+        env.fn_computed_effects.insert(env.current_fn_key.clone(), callee_effs)
+      end
+    end
+    match env.fn_call_graph.get(env.current_fn_key.clone())
+    when Option::Some(callees) then
+      var new_callees = callees.clone()
+      if !new_callees.contains(&callee_key) then
+        new_callees.push(callee_key.clone())
+        env.fn_call_graph.insert(env.current_fn_key.clone(), new_callees)
+      end
+    when Option::None then
+      env.fn_call_graph.insert(env.current_fn_key.clone(), Vec::from([callee_key]))
+    end
   when Option::None then ()
   end
 end
@@ -12212,10 +12583,14 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     let meth_needle = if arg_types.len() > 1 then arg_types[1].clone() else Type::Unit end
     record_intrinsic_classification(env, expr.node_id, &method, &recv_type, &meth_needle, &method, expr.span)
     let mdid = method_def_for(env, &recv_type, method)
-    match mdid
+    match mdid.clone()
     when Option::Some(did) then env.typed_call_targets.insert(expr.node_id, did)
     when Option::None then ()
     end
+    # (direct-call effect recording): a method call to a callee with
+    # DECLARED effects accumulates them into the enclosing function's
+    # computed effect set (the checker's transitive effect discipline).
+    record_effect_call(env, mdid)
     # RingBuffer's shared by-value peek accessors (peek_front) live under
     # `impl[T: Copy] RingBuffer[T]`; method resolution consults the impl's
     # bounds (resolve_method_type's inherent-impl gate), so a non-Copy
@@ -13074,15 +13449,20 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
                             match qualified_method_def(env, &imp_path, &imp_key)
                             when Option::Some(sp_mdid) then
                               env.typed_call_targets.insert(expr.node_id, sp_mdid.clone())
+                              record_effect_call(env, Option::Some(sp_mdid))
                             when Option::None then
                               match scan_qualified_method_def(env, &imp_key)
-                              when Option::Some(sp_mdid2) then env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
+                              when Option::Some(sp_mdid2) then
+                                env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
+                                record_effect_call(env, Option::Some(sp_mdid2))
                               when Option::None then ()
                               end
                             end
                           when _ then
                             match scan_qualified_method_def(env, &imp_key)
-                            when Option::Some(sp_mdid3) then env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
+                            when Option::Some(sp_mdid3) then
+                              env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
+                              record_effect_call(env, Option::Some(sp_mdid3))
                             when Option::None then ()
                             end
                           end
@@ -15076,7 +15456,7 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
     for p in sig.params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type) })
+    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone() })
   end
   env.typed_fn_signatures = new_sigs
   var new_statics = Map::new()
@@ -15533,7 +15913,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     for sp in sig_rec.params do
       chased_params.push(ParamType { ty: resolve_type_var(env, sp.ty), convention: sp.convention })
     end
-    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type) })
+    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone() })
   end
   var typed_static_tys = Map::new()
   for (st_key, st_ty) in env.typed_static_types do

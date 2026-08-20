@@ -206,6 +206,12 @@ end
 #     walked with flow machinery by the structural CFG pass (the
 #     build_typed_cfg walk), so the body's blocks are distinguished exactly
 #     like any other lexical block's.
+#   - Statement-level ifs get their IF-JOIN block record (id = the
+#     condition's node id — the if-statement's own node identity): the
+#     continuation block the branch exits merge into. The branch blocks'
+#     Normal (fallthrough) edges target the join, and the no-else path's
+#     trailing False edge targets it directly; the state walk records the
+#     merged branch exits as the join block's (entry, exit) frames.
 # The CFG is built BEFORE the resource state runs (build_typed_cfg, the
 # structural pass); the state computation (run_cfg_block and the check_*
 # recording sites) walks the pre-built blocks and attaches the cleanup
@@ -773,6 +779,11 @@ end
 #   - every lexical block's flow blocks get CfgBlock records (the
 #     the block records, walked by the state computation);
 #   - if/elsif conditions get True/False split edges;
+#   - STATEMENT-level ifs get their IF-JOIN block record (id = the
+#     condition's node id): the branch blocks' Normal (fallthrough) edges
+#     target it (the no-else trailing False edge targets it directly), and
+#     the join's CfgBlock record carries those incoming edges — the
+#     continuation the state walk records the merged branch exits under;
 #   - EXPRESSION-level splits (ExprIf) get their own expression-split
 #     CfgBlock records (id = the condition's node id) — the documented gap
 #     CLOSED (previously recorded in the edge list but attributed to no
@@ -1195,6 +1206,25 @@ def cfg_defer_body(body: Block, inout edges: Vec[CfgEdge], inout blocks: Vec[Cfg
   end
 end
 
+# the branch block's own Normal (fallthrough) edge — the edge cfg_block
+# recorded for the branch (kind Normal, source = the branch's block key),
+# or -1 when the branch ends in a terminator (no fallthrough — that branch
+# exit never reaches the if-join). Scanned over the branch's own edge
+# range [base, edges.len()): the branch's statements' edges carry nested
+# sources, and the branch's fallthrough Normal edge is the LAST edge with
+# the branch key as its source.
+def cfg_branch_fallthrough_edge(edges: Vec[CfgEdge], base: Int, branch_key: Int) -> Int
+  var e = base
+  var found = -1
+  while e < edges.len() do
+    if edges[e].kind == CfgEdgeKind::Normal && edges[e].source == branch_key then
+      found = e
+    end
+    e = e + 1
+  end
+  found
+end
+
 # the statement-level structural dispatch — the check_stmt mirror
 # (every transfer the state walk attaches to is recorded HERE, empty).
 def cfg_stmt(stmt: Stmt, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
@@ -1213,25 +1243,62 @@ def cfg_stmt(stmt: Stmt, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
     # their own — the branch cleanups serialize through the branch blocks'
     # own Normal edges and the enclosing scopes' edge plans. destination
     # is the branch block's first-statement id (0 when the branch is
-    # empty). The statement-level split's edges are attributed to the
-    # enclosing flow block's record (the cond's node id is one of the
-    # flow block's originating ids).
+    # empty; the no-else TRAILING False edge's destination is the if-join
+    # — see the join block below). The statement-level split's edges are
+    # attributed to the enclosing flow block's record (the cond's node id
+    # is one of the flow block's originating ids).
     edges.push(CfgEdge { kind: CfgEdgeKind::True, source: if_stmt.cond.node_id, destination: block_exit_key(&if_stmt.then_block), actions: Vec::new() })
     edges.push(CfgEdge { kind: CfgEdgeKind::False, source: if_stmt.cond.node_id, destination: 0, actions: Vec::new() })
+    var trail_false = edges.len() - 1
     cfg_expr(&if_stmt.cond, edges, blocks, chain)
+    # per-branch (block key, edge base) — the branch blocks' own
+    # fallthrough Normal edges are found in their own ranges below.
+    var branches: Vec[(Int, Int)] = Vec::new()
+    branches.push((block_exit_key(&if_stmt.then_block), edges.len()))
     cfg_block(&if_stmt.then_block, edges, blocks, chain)
     mut i = 0
     while i < if_stmt.elsif_branches.len() do
       edges.push(CfgEdge { kind: CfgEdgeKind::True, source: if_stmt.elsif_branches[i].0.node_id, destination: block_exit_key(&if_stmt.elsif_branches[i].1), actions: Vec::new() })
       edges.push(CfgEdge { kind: CfgEdgeKind::False, source: if_stmt.elsif_branches[i].0.node_id, destination: 0, actions: Vec::new() })
+      trail_false = edges.len() - 1
       cfg_expr(&if_stmt.elsif_branches[i].0, edges, blocks, chain)
+      branches.push((block_exit_key(&if_stmt.elsif_branches[i].1), edges.len()))
       cfg_block(&if_stmt.elsif_branches[i].1, edges, blocks, chain)
       i = i + 1
     end
     match if_stmt.else_block
-    when Option::Some(eb) then cfg_block(&eb, edges, blocks, chain)
+    when Option::Some(eb) then
+      branches.push((block_exit_key(&eb), edges.len()))
+      cfg_block(&eb, edges, blocks, chain)
     when Option::None then ()
     end
+  # / THE IF-JOIN — the continuation block the if's branch exits
+    # merge into (the state walk records the join block's ENTRY frame —
+    # the merged branch exits — under this same id). The branch blocks'
+    # Normal (fallthrough) edges target the join; the no-else path's
+    # trailing False edge (the false continuation) targets it directly.
+    # The join record's id is the CONDITION's node id — the
+    # if-statement's own globally-unique node identity. (The if-stmt's
+    # OWN node id is the top-level partition's block key when the if
+    # opens a top-level block, so it cannot also key the join — the join
+    # is the if's continuation, a distinct block.) The join executes no
+    # statements — its CfgBlock record carries the INCOMING edges.
+    let join_id = if_stmt.cond.node_id
+    var join_edges = Vec::new()
+    for (bk, base) in branches do
+      let nidx = cfg_branch_fallthrough_edge(edges, base, bk)
+      if nidx >= 0 then
+        edges[nidx].destination = join_id
+        join_edges.push(nidx)
+      end
+    end
+    match if_stmt.else_block
+    when Option::Some(_) then ()
+    when Option::None then
+      edges[trail_false].destination = join_id
+      join_edges.push(trail_false)
+    end
+    blocks.push(CfgBlock { id: join_id, edges: join_edges })
   when StmtKind::StmtMatch(m) then cfg_match(&m, edges, blocks, chain)
   when StmtKind::StmtWhile(cond, body) then
     # the while-condition's EXIT edge — the False edge the loop exits
@@ -2528,7 +2595,9 @@ end
 # successor join is guarded to the universe — so the worklist never
 # double-executes a nested block (a second run would re-consume its
 # resources and duplicate its diagnostics).
-# The structural pass records exactly one CfgBlock per lexical block, so
+# The structural pass records exactly one CfgBlock per lexical block (plus
+# the statement-level IF-JOIN records — one per if, id = the condition's
+# node id, an EXPRESSION id that is never a top-level block key), so
 # the top-level universe is the body record ALONE: the worklist degenerates
 # to the single body run — the entry block executes exactly once against
 # the function-entry frame, byte-identical to the former check_block path —
@@ -4052,6 +4121,15 @@ def check_if(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ct
   end
   let merged = merge_frames(&arms)
   frame_assign(frame, &merged)
+  # / THE IF-JOIN — the join block's ENTRY state: the merged
+  # branch exits (the same merge; the branch exits ARE the branch
+  # blocks' recorded exit frames — check_block's run_cfg_block recorded
+  # the (entry, exit) pairs under the branch block ids). The join
+  # executes no statements — its exit frame is the entry. Recorded under
+  # the join block's id (the structural pass's join record — the
+  # condition's node id) — the single-pass merge (the if region is
+  # acyclic: one merge, no re-execution).
+  record_block_frame(ctx, if_stmt.cond.node_id, res_frame_clone(&merged), res_frame_clone(&merged))
 end
 
 def check_match(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, m: MatchExpr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit

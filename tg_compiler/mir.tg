@@ -29,7 +29,7 @@ use tg_compiler::ids::{
   GenericParamId, GenericParamTable, generic_param_table_new, fresh_synthetic_owner,
   intern_generic_param, generic_param_id_numeric, generic_param_name_of,
   generic_param_name_from, def_id_numeric, LocalId, NodeId, ClosureId, IntrinsicId,
-  FinalizerKind
+  FinalizerKind, EffectId
 }
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames, stable_id_map_new, module_qualified_key}
 use tg_compiler::resource_check::{AnalyzedProgram, IterationPlan, TypedIteration, TypedCFG, CleanupEdge, CleanupAction, CfgEdgeKind, engine_env_empty}
@@ -115,6 +115,16 @@ struct MirFunction
   is_extern: Bool
   extern_abi: String          # "C", "Ruby", "System", etc.
   contracts: Vec[MirContract]
+  # The function's DECLARED EFFECT SET — the checker's typed
+  # FnSignature record (the parsed `effect[...]` annotation names interned
+  # through the EffectRegistry, or the std effectful-function seeds),
+  # copied at lowering (lower_function reads the typed table — the typed
+  # records are the authority). The MIR verifier's effect rule checks the
+  # function's calls against this set (a call to an effectful callee in a
+  # function without the declared effect is a verifier error — the same
+  # rule as the checker's, at the MIR level). IR-synthesized functions
+  # (drop glue, closures) carry none.
+  declared_effects: Vec[EffectId] = Vec::new()
   span: Span
 end
 
@@ -557,6 +567,7 @@ def duplicate_function(func: MirFunction) -> MirFunction
     is_extern: func.is_extern,
     extern_abi: func.extern_abi.clone(),
     contracts: func.contracts.clone(),
+    declared_effects: func.declared_effects.clone(),
     span: func.span.clone()
   }
 end
@@ -5232,6 +5243,17 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
   match b.current_fn
   when Option::Some(fn_ref) then
     fn_ref.generic_params = decl_generic_ids
+  when Option::None then ()
+  end
+ # (the MirFunction.declared_effects WRITE SITE): carry the
+  # checker's typed DECLARED EFFECT SET onto the lowered function — the
+  # typed FnSignature record is the authority (the parsed `effect[...]`
+  # annotations interned through the EffectRegistry, or the std
+  # effectful-function seeds); the MIR verifier's effect rule checks the
+  # function's calls against this set.
+  match b.current_fn
+  when Option::Some(fn_ref2) then
+    fn_ref2.declared_effects = fn_sig.declared_effects.clone()
   when Option::None then ()
   end
   
@@ -17697,6 +17719,20 @@ def verify_mir(mir: MirProgram) -> Vec[String]
   for f in mir.functions do
     fn_names.insert(f.name.clone())
   end
+ # the declared-effect table for the effect rule: MirFunction emission
+  # name -> the function's DECLARED EFFECT SET (the typed FnSignature
+  # records carried at lowering). The verifier checks every MirCall's
+  # callee against this table — a call to an effectful callee in a
+  # function without the declared effect is a verifier error (the same
+  # rule as the checker's, at the MIR level). A callee missing from the
+  # table (an intrinsic, a synthesized callee) carries no declared
+  # effects and never fires.
+  var fn_effects: Map[String, Vec[EffectId]] = Map::new()
+  for f in mir.functions do
+    if f.declared_effects.len() > 0 then
+      fn_effects.insert(f.name.clone(), f.declared_effects.clone())
+    end
+  end
  # every MirTypeDef must be concrete — no Type::Param / Type::Var in
   # field or variant types (generic struct fields resolve to the Named(0)
   # placeholder, which is checked separately), and every Named type inside a
@@ -17746,7 +17782,7 @@ def verify_mir(mir: MirProgram) -> Vec[String]
   var func_idx = 0
   while func_idx < mir.functions.len() do
     let func = mir.functions[func_idx]
-    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &mut engine_env, &mut errors)
+    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &mut engine_env, &mut errors)
     func_idx = func_idx + 1
   end
   errors
@@ -19777,7 +19813,7 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   end
 end
 
-def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     if !verifier_block_exists(func, target.id) then
@@ -19813,6 +19849,41 @@ def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, Mi
         errors.push(ctx.clone() + ": call unwind references invalid block bb" + uw.id.to_string())
       end
     when Option::None then ()
+    end
+    # (effect rule): a call to an effectful callee in a function without
+    # the declared effect is a verifier error — the same rule as the
+    # checker's, at the MIR level. The callee's declared effects come from
+    # the callee's own MirFunction record (the lowering copied them from
+    # the typed FnSignature records); an unknown callee (an intrinsic, a
+    # closure value, a synthesized callee) carries none and never fires.
+    var callee_name = ""
+    match callee.kind
+    when MirOperandKind::MirConstant(c) then
+      match c.kind
+      when MirConstantKind::MirFnItem(name) then callee_name = name.clone()
+      when _ then ()
+      end
+    when _ then ()
+    end
+    if callee_name != "" then
+      match fn_effects.get(callee_name.clone())
+      when Option::Some(effs) then
+        var ei = 0
+        while ei < effs.len() do
+          let eff = effs[ei]
+          var declared_has = false
+          var di2 = 0
+          while di2 < func.declared_effects.len() do
+            if func.declared_effects[di2].id == eff.id then declared_has = true end
+            di2 = di2 + 1
+          end
+          if !declared_has then
+            errors.push(ctx.clone() + ": call to effectful function " + callee_name.clone() + " requires a declared effect (the function declares none)")
+          end
+          ei = ei + 1
+        end
+      when Option::None then ()
+      end
     end
   when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
@@ -20084,7 +20155,7 @@ end
 # on entry to every block, then a per-block linear pass that checks uses of
 # possibly-uninitialized locals, projection typing, rvalue typing, and call
 # invariants in program order.
-def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout errors: Vec[String]) -> Unit
+def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, fn_effects: Map[String, Vec[EffectId]], inout errors: Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   let entry_id = func.entry_block.id
 
@@ -20293,7 +20364,7 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
     when Option::Some(s) then s.clone()
     when Option::None then Map::new()
     end
-    verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &bb_ctx, errors)
+    verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &fn_effects, &bb_ctx, errors)
     bi = bi + 1
   end
 end
@@ -20456,7 +20527,7 @@ def verifier_moved_state_equal(a: Map[Int, Set[String]], b: Map[Int, Set[String]
   true
 end
 
-def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (StorageLive'd or parameters). These are
   # deliberately separate: storage existing does NOT imply a valid value.
@@ -20547,11 +20618,11 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
     end
   end
 
-  verifier_check_terminator(engine_env, type_index, func, &block.terminator, &running, &mut moved, ctx, errors)
+  verifier_check_terminator(engine_env, type_index, func, &block.terminator, &running, &mut moved, &fn_effects, ctx, errors)
 end
 
 # Top-level per-function verification driver.
-def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func: MirFunction, inout engine_env: TypeEnv, inout errors: Vec[String]) -> Unit
+def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func: MirFunction, fn_effects: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
 
  # (ABI classifications): the extern-ABI tag is part of the function's
@@ -20634,7 +20705,7 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
   # identity or a generated drop-glue function.
   verifier_check_callees(func, fn_names, deinit_instances, drop_glue_fns, &fn_ctx, errors)
 
-  verifier_dataflow_init(engine_env, type_index, func, errors)
+  verifier_dataflow_init(engine_env, type_index, func, &fn_effects, errors)
 end
 
 # Whether a Type contains Type::Param anywhere (used to classify a function
