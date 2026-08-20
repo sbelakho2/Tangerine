@@ -3,7 +3,7 @@
 ## Overview
 
 Tangerine is a systems programming language that combines:
-- **Memory Safety** without garbage collection (Rust-like ownership model)
+- **Memory Safety** without garbage collection (access/resource ownership model)
 - **High Performance** (compiles directly to native machine code — no C dependency)
 - **Agentic AI Support** (contracts, capabilities, effects, budgets)
 - **Modern Syntax** (clean, expressive, Ruby-influenced)
@@ -47,7 +47,7 @@ mut w: Float = 3.14
 - `UInt` - 64-bit unsigned integer
 - `Float` - 64-bit floating point
 - `Char` - Unicode scalar value
-- `String` - owned, mutable UTF-8 string (use `mut` binding/reference for in-place edits)
+- `String` - owned, mutable UTF-8 string (mutable via `var` bindings or `inout` access)
 
 #### Composite Types
 ```tangerine
@@ -96,14 +96,26 @@ Tangerine distinguishes three array-like types:
 - **`[T]`** — Slice. A view into contiguous memory (pointer + length).
 - **`Array[T]` / `Vec[T]`** — Growable dynamic array (heap-allocated, ptr + len + cap). `Vec[T]` is a type alias for `Array[T]`.
 
-#### Pointer Types
+#### Pointer and View Types
 
-- **`&T`** — Shared reference (immutable borrow).
-- **`&mut T`** — Mutable reference (exclusive borrow).
-- **`Ref[T]`** — Compatibility alias for `&T` in FFI/interop documentation.
-- **`*T`** / **`Ptr[T]`** — Raw pointer. `*T` is syntax sugar for `Ptr[T]`.
-  Use only in `unsafe` blocks or FFI boundaries.
-- **`*mut T`** — Mutable raw pointer.
+There are **no first-class safe reference types**: `&T` / `&mut T` in a
+type position are a **hard error** (E106 — see §"Ownership and Access").
+Access is expressed with parameter conventions and access markers; the
+non-owning forms are raw pointers and views:
+
+- **`Ptr[T]`** — non-owning raw pointer to `T` (FFI/unsafe boundary).
+- **`PtrMut[T]`** — non-owning mutable raw pointer to `T`.
+- **`*T`** / **`*mut T`** — the raw-pointer syntax spellings of
+  `Ptr[T]` / `PtrMut[T]`, used in `unsafe` blocks and FFI boundaries.
+- **`StrView`** — non-owning UTF-8 string view (`{ptr, len}`); the owned
+  form is `String`.
+- **`FfiStr`** / **`FfiSlice[T]`** — C-compatible borrowed views
+  (`{ptr, len}`) for FFI signatures.
+- **`Slice[T]`** — the non-owning 16-byte `{ptr, len}` view into
+  contiguous memory (the `[T]` slice type).
+
+Views never own their backing storage: keep the owner alive for the
+duration of the view and clone when storing.
 
 ### Functions
 
@@ -231,9 +243,17 @@ let result = do
 end
 ```
 
-## Ownership and Borrowing
+## Ownership and Access
 
-Tangerine uses Rust-like ownership semantics for memory safety without garbage collection.
+Tangerine uses an **access/resource ownership model** for memory safety
+without garbage collection. There are **no first-class safe reference
+types**: `&T` / `&mut T` / `&&T` in a type position are a hard error
+(E106, `parser.tg` `diag_safe_ref_not_first_class`), and the legacy
+Rust-style parameter spellings are hard errors too (E100 — see the
+rejection table below). Shared/borrowed access is expressed through
+**parameter conventions** and **access markers** instead. The removed
+`&T` / `&mut T` dialect is archived (non-normatively) in
+[`../history/safe_reference_types_deprecated.md`](../history/safe_reference_types_deprecated.md).
 
 ### Ownership Rules
 
@@ -254,56 +274,94 @@ let y = x  # x is copied to y
 println(x)  # OK: x is still valid
 ```
 
-### References
+### Access Conventions
+
+Every parameter and receiver carries an explicit access convention. The
+default (no prefix) is `let` — the argument is observed by value; `inout`,
+`sink`, and `set` are declared with a keyword prefix:
+
+| Convention | Meaning |
+|------------|---------|
+| `let` (default) | observe the value (by-value move; reads are Copy-bound accessors) |
+| `inout` | exclusive mutation — the callee may read and write the caller's place |
+| `sink` | transfer/consume — ownership moves into the callee |
+| `set` | initialize dead storage — the callee writes into an uninitialized place |
 
 ```tangerine
-# Immutable reference (shared borrow)
-let s = String::from("hello")
-let r = &s  # borrow s
-println(r)  # OK
+def observe(x: Int) -> Int        # let (default): by value
+  x * 2
+end
 
-# Mutable reference (exclusive borrow)
-mut s = String::from("hello")
-let r = &mut s  # mutable borrow
-r.push_str(" world")
+def scale(inout v: Vec[Float], k: Float) -> Unit   # exclusive mutation
+  for i in 0..v.len() do
+    v[i] = v[i] * k
+  end
+end
+
+def consume(sink buf: String) -> Unit   # ownership transfers in
+  write_log(buf)
+end
+
+def fill(set slot: Option[Int], value: Int) -> Unit  # write dead storage
+  slot = Option::Some(value)
+end
 ```
 
-### Borrowing Rules
-
-1. You can have either:
-   - Any number of immutable references, OR
-   - Exactly one mutable reference
-2. References must always be valid (no dangling pointers)
+Mutating methods use the **trailing `inout` receiver convention**:
 
 ```tangerine
-mut s = String::from("hello")
+def set_name(self, name: String) -> Unit inout
+  self.name = name
+end
+```
 
-let r1 = &s     # OK: immutable borrow
-let r2 = &s     # OK: multiple immutable borrows
+### Access Markers at Call Sites
 
-# let r3 = &mut s  # Error: cannot borrow mutably while borrowed immutably
+At a call site, `&place` / `&mut place` selects the callee-side
+convention and lowers to a MIR `Place` argument. The marker is **only
+valid as a call argument** — the type checker rejects it anywhere else
+(`access marker '&' is only valid as a call argument`). The mutability of
+the marker is not tracked; the callee's parameter convention governs the
+effect.
 
-println(r1, r2)  # Borrows end here
-
-let r3 = &mut s  # OK now: previous borrows have ended
+```tangerine
+mut buffer = String::new()
+append(&mut buffer, "hello")   # &mut place marker → inout/sink callee
+println(&buffer)               # & place marker → let callee
 ```
 
 ### Move and Copy
 
 ```tangerine
-# Explicit move
+# Ownership moves by assignment
 let s1 = String::from("hello")
-let s2 = move s1
+let s2 = s1   # moved
 
-# Explicit copy (for Copy types)
-let x = 42
-let y = copy x
-
-# own - take ownership from reference
-def take_ownership(s: own String) -> Unit
+# `move` / `copy` unary prefixes are accepted as legacy no-ops
+# (grammar §4.1); parameter-prefix `move`/`own` are REJECTED (E100)
+# — write `sink` instead.
+def take_ownership(s: sink String) -> Unit
   # s is consumed here
 end
 ```
+
+### Rejected Legacy Forms (E100 / E106)
+
+| Written | Diagnostics | Use instead |
+|---------|-------------|-------------|
+| `&T` / `&mut T` / `&&T` in a type position (returns, fields, annotations, generic args) | **E106** | views (`StrView`, `Slice[T]`), `Ptr[T]` / `PtrMut[T]`, or a convention |
+| `ref value` / `&value` pattern binders | **E106** | bind by value; Copy-bound accessors or explicit `.clone()` |
+| `mut x:`, `&x:`, `&mut x:`, `move x:`, `own x:` parameter prefixes | **E100** | `inout x`, `sink x`, `set x`, or `x` (`let`) |
+| `x: &T` / `x: &mut T` parameter type markers | **E100** | the convention prefix, e.g. `inout x: T` |
+| `fn(&T)`, `fn(mut T)`, `fn(move T)` fn-type conventions | **E100** | `fn(inout T)` / `fn(sink T)` / `fn(set T)` / default `let` |
+| `&self` / `&mut self` receivers | **E100** | `self` (`let`), `inout self`, or the trailing `inout` |
+
+The one exception: `&T` / `Option[&T]` type positions inside an `extern`
+declaration whose name carries the `__intrinsic_` prefix denote the
+internal address/reference ABI (typed `RefInternal`) and parse only there
+(`parser.tg` `parse_extern_fn` / `parse_extern_static`, scoped by
+`is_intrinsic_extern_name`). The five record-visit extern signatures in
+`std/collections.tg` are the kernel's only reference positions.
 
 ## Structs and Enums
 
@@ -357,13 +415,13 @@ impl Point
     Point { x: x, y: y }
   end
   
-  def distance(&self, other: &Point) -> Float
+  def distance(self, other: Point) -> Float
     let dx = self.x - other.x
     let dy = self.y - other.y
     (dx * dx + dy * dy).sqrt()
   end
   
-  def translate(&mut self, dx: Float, dy: Float) -> Unit
+  def translate(inout self, dx: Float, dy: Float) -> Unit
     self.x = self.x + dx
     self.y = self.y + dy
   end
@@ -371,28 +429,34 @@ end
 
 let p1 = Point::new(0.0, 0.0)
 let p2 = Point::new(3.0, 4.0)
-let d = p1.distance(&p2)  # 5.0
+let d = p1.distance(p2)  # 5.0
 ```
+
+Receivers carry the access conventions: `self` is `let` by default,
+`inout self` (or the trailing `inout` receiver convention) mutates, and a
+call site passes a place with the `&place` access marker where the
+callee needs the caller's storage (`p1.translate(&p1)` is a marker use;
+the receiver slot is filled from the call's receiver place).
 
 ## Traits
 
 ```tangerine
 trait Display
-  def display(&self) -> String
+  def display(self) -> String
 end
 
 trait Clone
-  def clone(&self) -> Self
+  def clone(self) -> Self
 end
 
 impl Display for Point
-  def display(&self) -> String
+  def display(self) -> String
     format("({}, {})", self.x, self.y)
   end
 end
 
 # Trait bounds
-def print_all[T: Display](items: &[T]) -> Unit
+def print_all[T: Display](items: [T]) -> Unit
   for item in items do
     println(item.display())
   end
@@ -786,7 +850,7 @@ use std::taint::{Validator, Tainted, ValidationError}
 struct EmailValidator end
 
 impl Validator[String, String] for EmailValidator
-  def validate(tainted: &Tainted[String]) -> Result[String, ValidationError]
+  def validate(tainted: Tainted[String]) -> Result[String, ValidationError]
     let val = tainted.value
     if val.contains("@") && val.contains(".") then
       Result::Ok(val.clone())
@@ -1002,7 +1066,7 @@ async def main() -> Unit
 end
 
 # Concurrent execution
-async def fetch_all(urls: &[String]) -> Vec[String]
+async def fetch_all(urls: [String]) -> Vec[String]
   let futures = urls.iter().map(|url| fetch_data(url))
   join_all(futures).await
 end
@@ -1019,7 +1083,7 @@ pub struct Vec2
   pub y: Float
 end
 
-pub def dot(a: &Vec2, b: &Vec2) -> Float
+pub def dot(a: Vec2, b: Vec2) -> Float
   a.x * b.x + a.y * b.y
 end
 
@@ -1045,7 +1109,7 @@ use very::long::path::Name as Short
 def main() -> Unit
   let v1 = Vec2 { x: 1.0, y: 0.0 }
   let v2 = Vec2 { x: 0.0, y: 1.0 }
-  println("Dot product: {}", dot(&v1, &v2))
+  println("Dot product: {}", dot(v1, v2))
 end
 ```
 
@@ -1170,10 +1234,10 @@ struct Box[T]
 end
 
 # Generic function
-def swap[T](a: &mut T, b: &mut T) -> Unit
-  let tmp = move *a
-  *a = move *b
-  *b = move tmp
+def swap[T](a: inout T, b: inout T) -> Unit
+  let tmp = a
+  a = b
+  b = tmp
 end
 
 # Multiple type parameters with bounds
@@ -1184,7 +1248,7 @@ end
 # Associated types in traits
 trait Iterator
   type Item
-  def next(&mut self) -> Option[Self::Item]
+  def next(inout self) -> Option[Self::Item]
 end
 ```
 
@@ -1210,12 +1274,9 @@ when 'a' | 'e' | 'i' | 'o' | 'u' then "vowel"
 when _ then "consonant"
 end
 
-# Ref patterns
-match option
-when Option::Some(ref value) then use_ref(value)
-when Option::Some(&mut value) then modify(&mut value)
-when Option::None then ()
-end
+# Pattern binders are BY VALUE — `ref value` / `&value` binders are a
+# hard error (E106): a shared read is a Copy-bound accessor or an
+# explicit clone.
 
 # Struct patterns
 match point
@@ -1324,14 +1385,14 @@ let app = App::new()
 app.middleware(middleware::logger)
 app.middleware(middleware::cors)
 
-app.get("/", |ctx: &mut Context| ctx.text("Hello, World!"))
-app.get("/users/:id", do |ctx: &mut Context|
+app.get("/", |ctx: inout Context| ctx.text("Hello, World!"))
+app.get("/users/:id", do |ctx: inout Context|
   let id = ctx.param("id")?
-  ctx.json_response(&get_user(id)?)
+  ctx.json_response(get_user(id)?)
 end)
-app.post("/users", do |ctx: &mut Context|
+app.post("/users", do |ctx: inout Context|
   let user: User = ctx.json()?
-  ctx.status(StatusCode::Created).json_response(&create_user(user)?)
+  ctx.status(StatusCode::Created).json_response(create_user(user)?)
 end)
 
 app.listen("0.0.0.0:8080")?
@@ -1483,7 +1544,7 @@ use std::async::{spawn, join_all, sleep}
 use std::thread::{Thread, Mutex, Channel, AtomicInt}
 
 # Async
-async def fetch_all(urls: &[String]) -> Vec[Response]
+async def fetch_all(urls: [String]) -> Vec[Response]
   let tasks = urls.iter().map(|u| spawn(fetch(u)))
   join_all(tasks).await
 end
@@ -1775,7 +1836,7 @@ array_push(&mut arr, 42)
 mut map = map_new[String, Int]()
 map_insert(&mut map, "key", 1)
 
-let val = map_get(&map, "key")  # Option[&Int]
+let val = map_get(&map, "key")  # Option[Int] — Copy-gated accessor
 ```
 
 ## Compiler Invocation
@@ -1884,6 +1945,7 @@ tg abi check v1/lib.tg v2/lib.tg
 
 ## See Also
 
+- [Feature Registry](feature_registry.md) - **Single source of truth for feature status**
 - [Standard Library Reference](stdlib_reference.md) - **Comprehensive API documentation**
 - [Grammar Reference](grammar.md) - Formal grammar specification
 - [Style Guide](style_guide.md) - Code style conventions
@@ -1893,3 +1955,4 @@ tg abi check v1/lib.tg v2/lib.tg
 - [Versioning Policy](versioning.md) - Version numbering
 - [RFC Process](rfc_process.md) - How to propose changes
 - [Registry Policy](registry_policy.md) - Package registry rules
+- [Safe Reference Types — deprecated syntax](../history/safe_reference_types_deprecated.md) - NON-NORMATIVE archive of the removed `&T` / `&mut T` dialect

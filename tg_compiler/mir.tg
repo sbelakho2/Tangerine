@@ -5785,10 +5785,69 @@ end
 
 # Lower the drop-before-store chain for an assignment — the SEMANTIC
 # assign_drops table (node id -> local ids; the "assign::<key>" String-key
-# protocol is are not part of the model). Returns the continuation block where the STORE must
+# protocol is are not part of the model) and the assign_exact_drops table
+# (the nested owning projected replacement — the exact-place drop of the
+# chain's own state). Returns the continuation block where the STORE must
 # happen, or None when no drop is needed (the store happens in the current
-# block).
-def lower_assign_drop_chain(inout b: MirBuilder, node_id: Int, span: Span) -> Option[MirBlockId]
+# block). `target_place` is the lowered target place of the assignment —
+# the exact-place drop destroys the OLD value at that very place before
+# the store.
+def lower_assign_drop_chain(inout b: MirBuilder, node_id: Int, span: Span, target_place: Place) -> Option[MirBlockId]
+  # (partial moves — the nested owning projected replacement): the
+  # exact-place drop entries. The drop destroys the CHAIN's own state (the
+  # exact target place), NOT the whole root: ONE MirDeinit of the place
+  # carrying the concrete type's drop-GLUE instance (never an inline plan
+  # walk here) — or, when the checker recorded consumed extensions under
+  # the chain (entry.paths — the serialized relative paths in the shared
+  # place_move_path_of key form), the MASKED partial-drop chain
+  # (mir_emit_partial_drop_chain) that drops exactly the chain's live
+  # subfields and skips the dead extensions.
+  match b.finalize_plan.assign_exact_drops.get(node_id)
+  when Option::Some(exact) then
+    if exact.len() > 0 then
+      match b.current_block
+      when Option::Some(assign_blk) then
+        let assign_cont = create_block(b)
+        var chain_succ = assign_cont
+        var ei = 0
+        while ei < exact.len() do
+          let entry = exact[ei]
+          match b.semantic_to_mir.get(entry.local)
+          when Option::Some(amid) then
+            if entry.paths.len() > 0 then
+              let ety = mir_place_type(&target_place, b)
+              chain_succ = mir_emit_partial_drop_chain(b, &target_place, &ety, &entry.paths, chain_succ, span)
+            else
+              let ety2 = mir_place_type(&target_place, b)
+              let glue_inst = mir_try_glue_instance(b, &ety2)
+              match glue_inst
+              when Option::Some(inst) then
+                let bk = create_block(b)
+                switch_to_block(b, bk)
+                set_terminator(b, MirTerminatorKind::MirDeinit {
+                  place: target_place.clone(),
+                  deinit_fn: inst,
+                  target: chain_succ,
+                  unwind: Option::None
+                }, span)
+                chain_succ = bk
+              when Option::None then ()
+              end
+            end
+          when Option::None then
+            b.errors.push("internal error: assign exact-drop plan references semantic local _" + entry.local.to_string() + " with no MIR local")
+          end
+          ei = ei + 1
+        end
+        switch_to_block(b, assign_blk)
+        set_terminator(b, MirTerminatorKind::MirGoto(chain_succ), span)
+        Option::Some(assign_cont)
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+  when Option::None then
   match b.finalize_plan.assign_drops.get(node_id)
   when Option::Some(assign_ids) then
     if assign_ids.len() > 0 then
@@ -5836,6 +5895,7 @@ def lower_assign_drop_chain(inout b: MirBuilder, node_id: Int, span: Span) -> Op
       Option::None
     end
   when Option::None then Option::None
+  end
   end
 end
 
@@ -7505,7 +7565,7 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
  # assigning over a live owning place drops the previous value
       # first (drop old -> store new). The helper returns the continuation
       # block for the store when a drop chain was needed.
-      match lower_assign_drop_chain(b, stmt.node_id, stmt.span)
+      match lower_assign_drop_chain(b, stmt.node_id, stmt.span, place.clone())
       when Option::Some(cont) then
         switch_to_block(b, cont)
         match lower_expr_rvalue_to_dest(b, &value, &place_ty, stmt.span)
@@ -10359,7 +10419,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # ("assign::<expr id>" — the checker records the same key).
       let place = lower_place(b, &target)
       let value_ty = mir_source_expr_ty(b, &value)
-      match lower_assign_drop_chain(b, expr.node_id, span)
+      match lower_assign_drop_chain(b, expr.node_id, span, place.clone())
       when Option::Some(cont) then
         switch_to_block(b, cont)
         match lower_expr_to_rvalue(b, &value, span)
@@ -18676,15 +18736,21 @@ def verifier_check_ref_operand(func: MirFunction, place: Place, what: String, ct
   end
 end
 
-def verifier_check_operand(type_index: Map[Int, MirTypeDef], func: MirFunction, operand: MirOperand, running: Set[Int], inout moved: Set[Int], ctx: String, inout errors: Vec[String]) -> Option[Type]
+def verifier_check_operand(type_index: Map[Int, MirTypeDef], func: MirFunction, operand: MirOperand, running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Option[Type]
   match operand.kind
   when MirOperandKind::MirCopy(place) then
  # (the BITCOPY form): a MirCopy is a bitwise copy — its LEGALITY
     # (the copy-permission sites — value operands, Read call args) is
     # checked separately by verifier_check_operand_ownership against the
-    # engine's is_trivially_copyable axis.
+    # engine's is_trivially_copyable axis. The moved-state check is the
+    # projection-aware place-key rule: a copy of a moved place (exact,
+    # prefix, whole-root, or whole-value boundary) is a use-after-move.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     let _ = verifier_place_result_type_opt(type_index, func, &place)
+    let ckey = verifier_place_key(type_index, &place)
+    if verifier_key_moved(moved, place.local.id, &ckey) then
+      errors.push(ctx.clone() + ": copy of previously moved place " + verifier_moved_place_desc(&place, &ckey))
+    end
   when MirOperandKind::MirMovePlace(place) then
  # (the TRANSFER form): MirMovePlace moves the value out of the
     # source place — legal for ANY type (owning or not); the moved-tracking
@@ -18692,23 +18758,30 @@ def verifier_check_operand(type_index: Map[Int, MirTypeDef], func: MirFunction, 
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     let _ = verifier_place_result_type_opt(type_index, func, &place)
     # A moved value transitions out of initialized into moved; moving a value
-    # that was already moved is a use-after-move.
+    # that was already moved is a use-after-move. The moved-state is the
+    # projection-aware place-key lattice: a move of x.a marks (x, "a")
+    # moved (x.b and the whole root stay the checker's live-partial rules),
+    # a move of the whole root x shadows every chain.
     let base = place.local.id
-    if moved.contains(&base) then
-      errors.push(ctx.clone() + ": use-after-move of local _" + base.to_string())
+    let mkey = verifier_place_key(type_index, &place)
+    if verifier_key_moved(moved, base, &mkey) then
+      errors.push(ctx.clone() + ": use-after-move of local _" + base.to_string() + verifier_moved_key_desc(&mkey))
     else
-      moved.insert(base)
+      verifier_key_insert(&mut moved, base, &mkey)
     end
   when MirOperandKind::MirRead(place) then
  # (the READ form): a read accesses the place WITHOUT transferring
     # ownership and WITHOUT forming a bitcopy permission — the sharing
     # semantics are the checker's safe-access model; the verifier enforces
-    # definiteness and consumed-place tracking (reads of consumed locals
-    # are errors), never copy legality.
+    # definiteness and consumed-place tracking (reads of consumed places
+    # are errors), never copy legality. The consumed check is the
+    # projection-aware place-key rule: a read of x.b after x.a was moved is
+    # legal; a read of the whole root after a partial move is an error.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     let rbase = place.local.id
-    if moved.contains(&rbase) then
-      errors.push(ctx.clone() + ": read of previously consumed local _" + rbase.to_string())
+    let rkey = verifier_place_key(type_index, &place)
+    if verifier_key_moved(moved, rbase, &rkey) then
+      errors.push(ctx.clone() + ": read of previously consumed local _" + rbase.to_string() + verifier_moved_key_desc(&rkey))
     end
     let _ = verifier_place_result_type_opt(type_index, func, &place)
   when MirOperandKind::MirConsume(place) then
@@ -18717,22 +18790,33 @@ def verifier_check_operand(type_index: Map[Int, MirTypeDef], func: MirFunction, 
     # type; the consumed-tracking below enforces single use, no copy-
     # legality check applies. MirConsume sources cannot be previously
     # consumed. The source place transitions out of initialized into
-    # consumed, and any LATER use of the same local in this block (or in
-    # blocks reached through the may-moved dataflow below) is an error.
-    # Approximation: the tracking is per ROOT local (projections under a
-    # consumed local count as uses of the same place) and intra-block +
-    # may-moved-across-blocks; it is not a full path-sensitive analysis.
+    # consumed, and any LATER use of the same place-key (or a chain it
+    # shadows — the projection-aware lattice below) in this block (or in
+    # blocks reached through the may-moved dataflow) is an error.
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     let _ = verifier_place_result_type_opt(type_index, func, &place)
     let cbase = place.local.id
-    if moved.contains(&cbase) then
-      errors.push(ctx.clone() + ": consume of previously consumed local _" + cbase.to_string())
+    let ckey2 = verifier_place_key(type_index, &place)
+    if verifier_key_moved(moved, cbase, &ckey2) then
+      errors.push(ctx.clone() + ": consume of previously consumed local _" + cbase.to_string() + verifier_moved_key_desc(&ckey2))
     else
-      moved.insert(cbase)
+      verifier_key_insert(&mut moved, cbase, &ckey2)
     end
   when MirOperandKind::MirConstant(cst) then
     verifier_constant_type(&cst)
   end
+end
+
+# The place description for the moved-state diagnostics: the serialized
+# key (whole root / whole-value boundary / the field path).
+def verifier_moved_key_desc(key: String) -> String
+  if key == "" then return " (whole value)" end
+  if key == "*" then return " (whole-value place)" end
+  " (field \"" + key + "\")"
+end
+
+def verifier_moved_place_desc(place: Place, key: String) -> String
+  "local _" + place.local.id.to_string() + verifier_moved_key_desc(key)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -19342,7 +19426,7 @@ def verifier_check_fnitem_operand(operand: MirOperand, fn_names: Set[String], ct
   end
 end
 
-def verifier_rvalue_type(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, rvalue: MirRvalue, running: Set[Int], inout moved: Set[Int], ctx: String, inout errors: Vec[String]) -> Option[Type]
+def verifier_rvalue_type(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, rvalue: MirRvalue, running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Option[Type]
   match rvalue.kind
   when MirRvalueKind::MirMove(operand) then
  # (assignment lowering / return-by-value): MirMove is the
@@ -19614,7 +19698,7 @@ end
 # Call invariants
 # ———————————————————————————————————————————————————————————————
 
-def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, dest: Place, callee: MirOperand, args: Vec[MirCallArg], running: Set[Int], inout moved: Set[Int], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, dest: Place, callee: MirOperand, args: Vec[MirCallArg], running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
   let callee_ty = verifier_check_operand(type_index, func, callee, running, &mut moved, ctx, errors)
   verifier_check_place(type_index, func, dest, running, ctx, errors)
  # the effect/operand-form agreement is checked on the RAW call args
@@ -19693,7 +19777,7 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   end
 end
 
-def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Set[Int], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     if !verifier_block_exists(func, target.id) then
@@ -19771,6 +19855,196 @@ def verifier_set_equal(a: Set[Int], b: Set[Int]) -> Bool
     if !b.contains(v) then return false end
   end
   true
+end
+
+def verifier_string_set_equal(a: Set[String], b: Set[String]) -> Bool
+  if a.len() != b.len() then return false end
+  for v in a do
+    if !b.contains(v) then return false end
+  end
+  true
+end
+
+# ———————————————————————————————————————————————————————————————
+# (partial moves — the projection-aware moved-state lattice)
+# ———————————————————————————————————————————————————————————————
+# The verifier's consumed/moved state is Map[Int, Set[String]] — root MIR
+# local id -> the moved PLACE KEYS. A key is the SERIALIZED projection
+# chain of a place: the checker's ProjectionChain serialization
+# (place_move_path_of in types.tg — the shared key form) — the "."-joined
+# declaration-order field names ("a.b"), tuple positions as "t<i>", the
+# fixed-array constant indices as "<i>" (the checker's per-index
+# ProjectionKey::Index lattice); the whole root is the empty key ""; a
+# whole-value-boundary chain (a place whose chain contains a deref or a
+# DYNAMIC index projection — the checker's bounded lattice) is the "*"
+# key. The verifier's MIR-side place chains derive the same keys
+# (verifier_place_key walks the MirProjection Field/Variant/TupleIndex/
+# ProjConstantIndex forms exactly like the checker's ProjectionKey walk;
+# Variant contributes no segment — the checker's place_move_path_of skips
+# it).
+#
+# The overlap/prefix rules (a moved place shadows its prefixes and its
+# extensions):
+#   - a MirMovePlace(x.a) marks (x, "a") moved; a read of (x, "a") after
+#     is the use-after-move error; a read of (x, "b") is legal (x.a !=
+#     x.b while both overlap x); a read of (x, "a.b") (an extension) is an
+#     error — the storage moved out with x.a; a read of (x, "") (the whole
+#     root) after ANY partial move is an error — the partial root is not
+#     fully live;
+#   - a MirMovePlace(x) (the whole root) shadows ALL the chains: the ""
+#     key is moved and every later read of any chain of x errors;
+#   - a "*" move (a whole-value-boundary consume) shadows every read (the
+#     checker's root-MaybeLive boundary — the per-index state is
+#     indeterminate) but a "*" read is only an error when the root itself
+#     or the boundary was moved (a sibling field move does not poison an
+#     indexed read — the container elements are the checker's ownership
+#     unit);
+#   - a store into a place re-lives the place's chain and every extension
+#     of it (verifier_key_clear), and a store into a FIELD chain of a
+#     wholly-moved root ("" moved) is an error (the checker's Consumed-root
+#     projected-assign rejection); the whole-root store itself re-lives
+#     the whole root (the checker's reinitialization of a moved-out slot).
+
+# Whether the chain `key` of the root is moved (the use-after-move /
+# overlap rule above).
+def verifier_key_moved(moved: Map[Int, Set[String]], root: Int, key: String) -> Bool
+  match moved.get(root)
+  when Option::Some(set) then
+    if set.len() == 0 then return false end
+    if key == "" then
+      # The whole root: any moved chain under the root makes the whole
+      # value use an error (the partial root is not fully live).
+      return true
+    end
+    if key == "*" then
+      # The whole-value boundary: only a whole-root move or a prior
+      # whole-boundary move shadows it (the checker's check_use fallback —
+      # the container elements are the ownership unit; a sibling
+      # field/per-index move does not poison a boundary read).
+      for m in set do
+        if m == "" || m == "*" then return true end
+      end
+      return false
+    end
+    for m in set do
+      if m == "" then return true end
+      if m == "*" then return true end
+      if m == key then return true end
+      # A moved strict prefix shadows the extension (x.a moved makes the
+      # x.a.b storage dead).
+      if key.starts_with(m + ".") then return true end
+    end
+    false
+  when Option::None then false
+  end
+end
+
+# Insert a moved chain under the root (after the use-after-move check):
+# the whole-root / whole-boundary move subsumes every prior chain; a field
+# move subsumes its extensions (they are dead with it — the prefix rule
+# keeps the lattice canonical).
+def verifier_key_insert(inout moved: Map[Int, Set[String]], root: Int, key: String) -> Unit
+  var set = match moved.get(root)
+  when Option::Some(s) then s.clone()
+  when Option::None then Set::new()
+  end
+  if key == "" || key == "*" then
+    set = Set::new()
+  else
+    var keep = Set::new()
+    for m in set do
+      if !m.starts_with(key + ".") then
+        keep.insert(m.clone())
+      end
+    end
+    set = keep
+  end
+  set.insert(key)
+  moved.insert(root, set)
+end
+
+# Clear a chain and every extension of it (a store into the place re-lives
+# the chain; the whole-root / whole-boundary store clears the root's whole
+# moved state).
+def verifier_key_clear(inout moved: Map[Int, Set[String]], root: Int, key: String) -> Unit
+  match moved.get(root)
+  when Option::Some(set) then
+    var keep = Set::new()
+    if key == "" || key == "*" then
+      if key == "" then
+        # The whole-root store re-lives every chain.
+        moved.remove(&root)
+        return
+      end
+      for m in set do
+        if m != "*" then
+          keep.insert(m.clone())
+        end
+      end
+    else
+      for m in set do
+        if m != key && !m.starts_with(key + ".") then
+          keep.insert(m.clone())
+        end
+      end
+    end
+    if keep.len() > 0 then
+      moved.insert(root, keep)
+    else
+      moved.remove(&root)
+    end
+  when Option::None then ()
+  end
+end
+
+# Whether the root has ANY moved chain (the whole-root use rule — the
+# partial root is not fully live).
+def verifier_root_has_moves(moved: Map[Int, Set[String]], root: Int) -> Bool
+  match moved.get(root)
+  when Option::Some(set) then set.len() > 0
+  when Option::None then false
+  end
+end
+
+# The serialized PLACE KEY of a MIR place — the shared key form of the
+# checker's ProjectionChain serialization (place_move_path_of). Field ->
+# the FieldId's owner declaration-order field name (the MirTypeDef's
+# Struct decl — the same declaration-order authority), TupleIndex -> "t<i>",
+# Variant -> no segment (the checker's place_move_path_of skips variants),
+# ProjConstantIndex -> "<i>" (the checker's per-index ProjectionKey::Index
+# serialization — the fixed-array per-index lattice); a chain containing a
+# deref or a DYNAMIC index projection is the whole-value-boundary key "*"
+# (the checker's bounded lattice).
+def verifier_place_key(type_index: Map[Int, MirTypeDef], place: Place) -> String
+  if place.projections.len() == 0 then return "" end
+  var segs = Vec::new()
+  for proj in place.projections do
+    match proj
+    when Projection::Field(fid) then
+      var fname = ""
+      match verifier_type_def(type_index, fid.owner.id)
+      when Option::Some(td) then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          if fid.index >= 0 && fid.index < fields.len() then
+            fname = fields[fid.index].name.clone()
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      if fname.len() == 0 then
+        fname = "f" + fid.index.to_string()
+      end
+      segs.push(fname)
+    when Projection::Variant(_) then ()
+    when Projection::TupleIndex(ti) then segs.push("t" + ti.to_string())
+    when Projection::ProjConstantIndex(ci) then segs.push(ci.to_string())
+    when _ then return "*"
+    end
+  end
+  if segs.len() == 0 then return "*" end
+  segs.join(".")
 end
 
 def block_map_lookup(func: MirFunction, bid: Int) -> Option[MirBlock]
@@ -19944,8 +20218,9 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
   # checked structurally with all locals treated as initialized to avoid
   # spurious definite-init errors; reachable blocks use the computed in-set.
   let reachable = verifier_reachable_blocks(func)
-  # Cross-block moved-state dataflow (may-moved per block IN set).
-  let moved_in_map = verifier_compute_moved_dataflow(func, &block_map, &preds, entry_id)
+  # Cross-block moved-state dataflow (may-moved per block IN set — the
+  # projection-aware Map[Int, Set[String]] place-key lattice).
+  let moved_in_map = verifier_compute_moved_dataflow(&type_index, func, &block_map, &preds, entry_id)
 
   # Phi edge validation: each Phi must have exactly one incoming value per CFG
   # predecessor (no duplicate/foreign predecessor ids), and the incoming local
@@ -20016,49 +20291,67 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
     end
     let bmoved = match moved_in_map.get(bid)
     when Option::Some(s) then s.clone()
-    when Option::None then Set::new()
+    when Option::None then Map::new()
     end
     verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &bb_ctx, errors)
     bi = bi + 1
   end
 end
 
-# Collect the locals moved (consumed by value) by an rvalue's operands.
-def verifier_operand_moved_target(op: MirOperand, inout out: Set[Int]) -> Unit
+# Collect the place KEYS moved (consumed by value) by an rvalue's operands —
+# the projection-aware form: a MirMovePlace/MirConsume of (x, [a]) records
+# the key "a" under the root x (sibling chains stay live).
+def verifier_operand_moved_target(type_index: Map[Int, MirTypeDef], op: MirOperand, inout out: Map[Int, Set[String]]) -> Unit
   match op.kind
-  when MirOperandKind::MirMovePlace(place) then out.insert(place.local.id)
+  when MirOperandKind::MirMovePlace(place) then
+    let key = verifier_place_key(type_index, &place)
+    var set = match out.get(place.local.id)
+    when Option::Some(s) then s.clone()
+    when Option::None then Set::new()
+    end
+    set.insert(key)
+    out.insert(place.local.id, set)
  # MirConsume transfers ownership exactly like MirMovePlace — a
-  # consumed local must be tracked by the same may-moved dataflow so later
+  # consumed place must be tracked by the same may-moved dataflow so later
   # uses (in this block or a successor) are reported as consumed uses.
-  when MirOperandKind::MirConsume(place) then out.insert(place.local.id)
+  when MirOperandKind::MirConsume(place) then
+    let key2 = verifier_place_key(type_index, &place)
+    var set2 = match out.get(place.local.id)
+    when Option::Some(s) then s.clone()
+    when Option::None then Set::new()
+    end
+    set2.insert(key2)
+    out.insert(place.local.id, set2)
   when _ then ()
   end
 end
 
-def verifier_rvalue_moved_targets(rvalue: MirRvalue, inout out: Set[Int]) -> Unit
+def verifier_rvalue_moved_targets(type_index: Map[Int, MirTypeDef], rvalue: MirRvalue, inout out: Map[Int, Set[String]]) -> Unit
   match rvalue.kind
-  when MirRvalueKind::MirMove(operand) then verifier_operand_moved_target(operand, out)
+  when MirRvalueKind::MirMove(operand) then verifier_operand_moved_target(type_index, &operand, out)
   when MirRvalueKind::MirAggregate(_, operands) then
     for op in operands do
-      verifier_operand_moved_target(op, out)
+      verifier_operand_moved_target(type_index, &op, out)
     end
   when MirRvalueKind::MirBinOp(_, lhs, rhs) then
-    verifier_operand_moved_target(lhs, out)
-    verifier_operand_moved_target(rhs, out)
-  when MirRvalueKind::MirUnOp(_, operand) then verifier_operand_moved_target(operand, out)
-  when MirRvalueKind::MirCast(_, operand, _) then verifier_operand_moved_target(operand, out)
-  when MirRvalueKind::MirRepeat(operand, _) then verifier_operand_moved_target(operand, out)
+    verifier_operand_moved_target(type_index, &lhs, out)
+    verifier_operand_moved_target(type_index, &rhs, out)
+  when MirRvalueKind::MirUnOp(_, operand) then verifier_operand_moved_target(type_index, &operand, out)
+  when MirRvalueKind::MirCast(_, operand, _) then verifier_operand_moved_target(type_index, &operand, out)
+  when MirRvalueKind::MirRepeat(operand, _) then verifier_operand_moved_target(type_index, &operand, out)
   when _ then ()
   end
 end
 
-# Forward may-moved dataflow: a local is "moved-in" to a block if ANY
+# Forward may-moved dataflow: a place key is "moved-in" to a block if ANY
 # predecessor moved it and the block did not reinitialize it. This catches
-# cross-block use-after-move (move in pred; use in successor).
-def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[Int]]
-  var moved_in: Map[Int, Set[Int]] = Map::new()
-  var moved_out: Map[Int, Set[Int]] = Map::new()
-  var entry_set: Set[Int] = Set::new()
+# cross-block use-after-move (move in pred; use in successor). The state is
+# the projection-aware Map[Int, Set[String]] lattice (root local -> moved
+# place keys — the overlap/prefix rules of the lattice section above).
+def verifier_compute_moved_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[String]]
+  var moved_in: Map[Int, Set[String]] = Map::new()
+  var moved_out: Map[Int, Set[String]] = Map::new()
+  var entry_set: Set[String] = Set::new()
   moved_in.insert(entry_id, entry_set.clone())
 
   var worklist = Vec::new()
@@ -20073,7 +20366,7 @@ def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBl
     end
     in_worklist.remove(&bid)
 
-    var new_in: Set[Int] = Set::new()
+    var new_in: Map[Int, Set[String]] = Map::new()
     if bid != entry_id then
       let pred_list = match preds.get(bid)
       when Option::Some(l) then l.clone()
@@ -20082,9 +20375,16 @@ def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBl
       var pi = 0
       while pi < pred_list.len() do
         match moved_out.get(pred_list[pi])
-        when Option::Some(pset) then
-          for v in pset do
-            new_in.insert(v.clone())
+        when Option::Some(pm) then
+          for (pid, pset) in pm do
+            var set = match new_in.get(pid)
+            when Option::Some(s) then s.clone()
+            when Option::None then Set::new()
+            end
+            for k in pset do
+              set.insert(k.clone())
+            end
+            new_in.insert(pid, set)
           end
         when Option::None then ()
         end
@@ -20097,13 +20397,20 @@ def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBl
     when Option::None then break
     end
 
-    var out: Set[Int] = Set::new()
-    for v in new_in do out.insert(v.clone()) end
+    var out: Map[Int, Set[String]] = Map::new()
+    for (pid, pset) in new_in do
+      var set2 = Set::new()
+      for k in pset do
+        set2.insert(k.clone())
+      end
+      out.insert(pid, set2)
+    end
     for st in block.statements do
       match st.kind
       when MirStatementKind::MirAssign(place, rvalue) then
-        verifier_rvalue_moved_targets(rvalue, &mut out)
-        out.remove(&place.local.id)
+        verifier_rvalue_moved_targets(type_index, &rvalue, &mut out)
+        # The store into the place re-lives the chain and its extensions.
+        verifier_key_clear(&mut out, place.local.id, verifier_place_key(type_index, &place))
       when _ then ()
       end
     end
@@ -20112,7 +20419,11 @@ def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBl
     when Option::Some(_) then true
     when Option::None then false
     end
-    let changed = !had || !verifier_set_equal(match moved_in.get(bid) when Option::Some(s) then s when Option::None then &entry_set end, &new_in)
+    let old_in = match moved_in.get(bid)
+    when Option::Some(s) then s.clone()
+    when Option::None then Map::new()
+    end
+    let changed = !had || !verifier_moved_state_equal(&old_in, &new_in)
     moved_in.insert(bid, new_in.clone())
     moved_out.insert(bid, out)
 
@@ -20132,7 +20443,20 @@ def verifier_compute_moved_dataflow(func: MirFunction, block_map: Map[Int, MirBl
   moved_in
 end
 
-def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Set[Int], ctx: String, inout errors: Vec[String]) -> Unit
+# Map-level equality of the moved-state lattice (per-root set equality).
+def verifier_moved_state_equal(a: Map[Int, Set[String]], b: Map[Int, Set[String]]) -> Bool
+  if a.len() != b.len() then return false end
+  for (root, aset) in a do
+    match b.get(root)
+    when Option::Some(bset) then
+      if !verifier_string_set_equal(&aset, &bset) then return false end
+    when Option::None then return false
+    end
+  end
+  true
+end
+
+def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (StorageLive'd or parameters). These are
   # deliberately separate: storage existing does NOT imply a valid value.
@@ -20144,9 +20468,15 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
   for v in block_in do
     live.insert(v.clone())
   end
-  var moved: Set[Int] = Set::new()
-  for v in moved_in do
-    moved.insert(v.clone())
+  # `moved` = the projection-aware moved-state lattice (root local ->
+  # moved place keys; see the lattice section above).
+  var moved: Map[Int, Set[String]] = Map::new()
+  for (root, mset) in moved_in do
+    var set = Set::new()
+    for k in mset do
+      set.insert(k.clone())
+    end
+    moved.insert(root, set)
   end
 
   for st in block.statements do
@@ -20181,7 +20511,18 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
           errors.push(ctx.clone() + ": assign to local _" + pid.to_string() + " whose storage is not live")
         end
         running.insert(pid)
-        moved.remove(&pid)
+        # (partial moves — the place-result check): the store into the
+        # place re-lives the place's chain and every extension of it; a
+        # store into a FIELD chain of a wholly-moved root is the
+        # checker's Consumed-root projected-assign rejection (the store
+        # would re-live a field of a root whose value was moved out). The
+        # whole-root store itself re-lives the root (the checker's
+        # reinitialization of a moved-out slot).
+        let akey = verifier_place_key(type_index, &place)
+        if !place.projections.is_empty() && akey != "*" && verifier_key_moved(moved, pid, "") then
+          errors.push(ctx.clone() + ": assign into a field of consumed local _" + pid.to_string() + " (the whole root was moved out)")
+        end
+        verifier_key_clear(&mut moved, pid, &akey)
       when Option::None then
         errors.push(ctx.clone() + ": assignment to undefined local _" + pid.to_string())
       end

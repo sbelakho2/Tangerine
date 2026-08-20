@@ -45,7 +45,7 @@ extern def strdup(s: Ptr[u8]) -> String
 extern def libc_getenv(name: Ptr[u8]) -> Ptr[u8]
 # Vec[String] clone under the T: Clone surface — the element-wise loop form
 # (Array::clone is Copy-gated; String is Clone-not-Copy).
-def clone_vec_strings(src: &Vec[String]) -> Vec[String]
+def clone_vec_strings(src: Vec[String]) -> Vec[String]
   var out = Vec::new()
   var i = 0
   while i < src.len() do
@@ -750,16 +750,34 @@ end
 # 
 
 def cmd_test(argv: Vec[String]) -> Int
-  # Discover test sources: from project or CLI args.
-  let test_files = match parse_args(argv)
+  # Discover test sources: from project or CLI args. Explicitly named FILES
+  # are verified strictly; project discovery and directory scans are implicit
+  # (skip-tolerant).
+  var explicit_files: Vec[String] = Vec::new()
+  var implicit_files: Vec[String] = Vec::new()
+
+  match parse_args(argv)
   when Result::Ok(o) then
     if o.input_files.is_empty() then
+      # Implicit discovery (project sources or directory scan): broken files
+      # are skipped and testless files contribute nothing.
       match load_project(".")
-      when Result::Ok(project) then clone_vec_strings(&project.sources)
-      when Result::Err(_) then find_tg_files(".")
+      when Result::Ok(project) then
+        let srcs = clone_vec_strings(&project.sources)
+        for s in srcs do implicit_files.push(s) end
+      when Result::Err(_) then
+        let found = find_tg_files(".")
+        for f in found do implicit_files.push(f) end
       end
     else
-      o.input_files.clone()
+      for f in o.input_files do
+        if is_dir(f.clone()) then
+          let sub = find_tg_files(f.clone())
+          for s in sub do implicit_files.push(s) end
+        else
+          explicit_files.push(f.clone())
+        end
+      end
     end
   when Result::Err(e) then
     if e == "help" then
@@ -768,33 +786,111 @@ def cmd_test(argv: Vec[String]) -> Int
       return 0
     elsif e == "No input files" then
       match load_project(".")
-      when Result::Ok(project) then clone_vec_strings(&project.sources)
-      when Result::Err(_) then find_tg_files(".")
+      when Result::Ok(project) then
+        let srcs = clone_vec_strings(&project.sources)
+        for s in srcs do implicit_files.push(s) end
+      when Result::Err(_) then
+        let found = find_tg_files(".")
+        for f in found do implicit_files.push(f) end
       end
     else
       return 1
     end
   end
 
+  let opts = default_options()
+
+  var summary = run_test_files(&opts, explicit_files, true)
+  let scan_summary = run_test_files(&opts, implicit_files, false)
+  summary.total = summary.total + scan_summary.total
+  summary.passed = summary.passed + scan_summary.passed
+  summary.failed = summary.failed + scan_summary.failed
+  for n in scan_summary.fail_names do
+    summary.fail_names.push(n)
+  end
+
+  println("")
+  println("test result: " + if summary.failed == 0 then "ok" else "FAILED" end
+    + ". " + summary.passed.to_string() + " passed; " + summary.failed.to_string()
+    + " failed; " + summary.total.to_string() + " total")
+
+  if !summary.fail_names.is_empty() then
+    println("")
+    println("failures:")
+    for name in summary.fail_names do
+      println("    " + name)
+    end
+  end
+
+  if summary.failed > 0 then 1 else 0 end
+end
+
+struct TestRunSummary
+  total: Int
+  passed: Int
+  failed: Int
+  fail_names: Vec[String]
+end
+
+struct TestResult
+  name: String
+  passed: Bool
+  message: String
+end
+
+# Run one batch of test files.
+#   strict   — explicitly named files: a read/lex/parse/resolve/type/
+#              ownership/MIR/codegen/link failure FAILS the batch (the
+#              diagnostics are emitted and the failure is counted, never
+#              skipped); a file with zero @test functions FAILS it with the
+#              "no tests found in <file>" diagnostic. Only a file whose tests
+#              all pass succeeds.
+#   implicit — discovered suites (directory scans, project sources): broken
+#              files are skipped and testless files contribute nothing
+#              (the historical skip-tolerant behavior).
+def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> TestRunSummary
   var total = 0
   var passed = 0
   var failed = 0
   var fail_names: Vec[String] = Vec::new()
 
-  let opts = default_options()
-
-  for file in test_files do
+  for file in files do
     let source = match read_file(file.clone())
     when Result::Ok(content) then content
-    when Result::Err(_) then next
+    when Result::Err(_) then
+      if strict then
+        eprintln("error: failed to read test file: " + file)
+        failed = failed + 1
+        fail_names.push(file.clone())
+        println("  FAIL  " + file + ": failed to read file")
+      end
+      next
     end
-    let lex_result = tokenize(source, file.clone())
+    let lex_result = tokenize(source.clone(), file.clone())
     let parse_out = parse(lex_result)
     let ast = parse_out.program
     let parse_diags = parse_out.diagnostics
-    if diag_has_errors(&parse_diags) then next end
+    if diag_has_errors(&parse_diags) then
+      if strict then
+        # Emit the parse diagnostics and count the file as failed: an
+        # explicitly named test file is never skipped.
+        for d in parse_diags do
+          let dmsg = d.message
+          match d.code
+          when Option::Some(c) then eprintln(file + ": error[" + c + "]: " + dmsg)
+          when Option::None then eprintln(file + ": error: " + dmsg)
+          end
+        end
+        failed = failed + 1
+        fail_names.push(file.clone())
+        println("  FAIL  " + file + ": parse errors (see diagnostics)")
+      end
+      next
+    end
 
     # Find @test functions
+    var tests: Vec[FunctionDecl] = Vec::new()
+    var has_main = false
     for item in ast.items do
       var is_test = false
       for attr in item.attrs do
@@ -802,58 +898,166 @@ def cmd_test(argv: Vec[String]) -> Int
           is_test = true
         end
       end
-      if is_test then
-        match item.kind
-        when ItemKind::ItemFunction(func_decl) then
-          total = total + 1
-          let test_name = file.clone() + "::" + func_decl.name.clone()
-          # Compile and run the test function
-          match compile_and_run_test(&opts, file.clone(), &func_decl)
-          when Result::Ok(_) then
-            passed = passed + 1
-            println("  PASS  " + test_name)
-          when Result::Err(e) then
-            failed = failed + 1
-            fail_names.push(test_name.clone())
-            println("  FAIL  " + test_name + ": " + e)
-          end
-        when _ then ()
+      match item.kind
+      when ItemKind::ItemFunction(func_decl) then
+        if is_test then
+          tests.push(func_decl.clone())
+        elsif func_decl.name == "main" then
+          has_main = true
         end
+      when _ then ()
+      end
+    end
+
+    if tests.is_empty() then
+      if strict then
+        # An explicitly named test file must contain @test functions. Gate it
+        # through the full `tg check` pipeline first so a resolve/type/
+        # ownership/MIR error cannot pass `tg test` vacuously, then fail:
+        # such a module should be verified with `tg check` instead.
+        var check_opts = opts
+        check_opts.check_only = true
+        check_opts.stop_after = StopAfter::Mir
+        match compile_file(&check_opts, file.clone())
+        when Result::Ok(_) then ()
+        when Result::Err(e) then
+          eprintln(e)
+        end
+        println("  FAIL  " + file + ": no @test functions found (verify with `tg check` instead)")
+        eprintln("error: no tests found in " + file)
+        failed = failed + 1
+        fail_names.push(file.clone())
+      end
+      next
+    end
+
+    # Compile the file once (with a generated main that dispatches to each
+    # @test function by name) and run each test as its own process. A file
+    # that defines its own main is compiled as-is and run once (canary
+    # convention).
+    let outcome = if has_main then
+      compile_and_run_file_main(opts, file.clone())
+    else
+      compile_and_run_tests(opts, file.clone(), source, tests.clone())
+    end
+
+    match outcome
+    when Result::Ok(results) then
+      for r in results do
+        total = total + 1
+        if r.passed then
+          passed = passed + 1
+          println("  PASS  " + file + "::" + r.name)
+        else
+          failed = failed + 1
+          fail_names.push(file.clone() + "::" + r.name)
+          println("  FAIL  " + file + "::" + r.name + ": " + r.message)
+        end
+      end
+    when Result::Err(e) then
+      # The file failed to compile (resolve/type/ownership/MIR/codegen/link):
+      # every test in it fails with the compile error — never skipped.
+      for t in tests do
+        total = total + 1
+        failed = failed + 1
+        fail_names.push(file.clone() + "::" + t.name)
+        println("  FAIL  " + file + "::" + t.name + ": " + e)
       end
     end
   end
 
-  println("")
-  println("test result: " + if failed == 0 then "ok" else "FAILED" end
-    + ". " + passed.to_string() + " passed; " + failed.to_string()
-    + " failed; " + total.to_string() + " total")
-
-  if !fail_names.is_empty() then
-    println("")
-    println("failures:")
-    for name in fail_names do
-      println("    " + name)
-    end
-  end
-
-  if failed > 0 then 1 else 0 end
+  TestRunSummary { total: total, passed: passed, failed: failed, fail_names: fail_names }
 end
 
-def compile_and_run_test(opts: CompilerOptions, path: String, func: FunctionDecl) -> Result[Unit, String]
-  # Compile the test file, then invoke the test function.
-  match compile_file(opts, path)
-  when Result::Ok(output_path) then
-    # Execute the compiled test binary with the test function name.
-    let cmd = output_path + " --run-test " + func.name.clone()
-    let exit_code = bootstrap_call_system(cmd)
-    if exit_code == 0 then
-      Result::Ok(())
-    else
-      Result::Err("test exited with code " + exit_code.to_string())
-    end
+# Compile the test file once with a generated dispatch main, then run each
+# @test function by name as its own process.
+def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, tests: Vec[FunctionDecl]) -> Result[Vec[TestResult], String]
+  let harness_base = file.replace("/", "_").replace(".tg", "") + "_harness"
+  let harness_path = "build/.tg_test_harness/" + harness_base + ".tg"
+  match mkdir_p("build/.tg_test_harness".to_string())
+  when Result::Ok(_) then ()
   when Result::Err(e) then
-    Result::Err("compilation failed: " + e)
+    return Result::Err("failed to create test harness directory: " + e.to_string())
   end
+
+  var harness_src = source.clone()
+  harness_src = harness_src + "\n\n# [generated by `tg test`] per-test dispatch main\n"
+  harness_src = harness_src + "use std::args\n\n"
+  harness_src = harness_src + "def main() -> Int\n"
+  harness_src = harness_src + "  let argv = args::args()\n"
+  harness_src = harness_src + "  if argv.len() < 2 then\n"
+  harness_src = harness_src + "    return 1\n"
+  harness_src = harness_src + "  end\n"
+  harness_src = harness_src + "  let name = argv[1]\n"
+  var ti = 0
+  var first = true
+  while ti < tests.len() do
+    let t = tests[ti]
+    if first then
+      harness_src = harness_src + "  if name == \"" + t.name + "\" then\n"
+      first = false
+    else
+      harness_src = harness_src + "  elsif name == \"" + t.name + "\" then\n"
+    end
+    harness_src = harness_src + "    " + t.name + "()\n"
+    ti = ti + 1
+  end
+  harness_src = harness_src + "  else\n"
+  harness_src = harness_src + "    panic(\"unknown test: \" + name)\n"
+  harness_src = harness_src + "  end\n"
+  harness_src = harness_src + "  0\n"
+  harness_src = harness_src + "end\n"
+
+  match write_file(harness_path.clone(), harness_src)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("failed to write test harness: " + e.to_string())
+  end
+
+  match compile_file(opts, harness_path.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("compilation failed: " + e)
+  end
+
+  let exe_path = get_output_path(&opts, harness_path.clone(), "")
+  var results = Vec::new()
+  var ri = 0
+  while ri < tests.len() do
+    let t = tests[ri]
+    let cmd = exe_path.clone() + " " + t.name.clone()
+    let exit_code = bootstrap_call_system(cmd)
+    let passed = exit_code == 0
+    let message = if passed then "" else "test exited with code " + exit_code.to_string() end
+    results.push(TestResult {
+      name: t.name.clone(),
+      passed: passed,
+      message: message
+    })
+    ri = ri + 1
+  end
+  Result::Ok(results)
+end
+
+# Files that define their own main (canary convention) are compiled as-is and
+# run once; the process exit code is the test outcome.
+def compile_and_run_file_main(opts: CompilerOptions, file: String) -> Result[Vec[TestResult], String]
+  match compile_file(opts, file.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("compilation failed: " + e)
+  end
+  let exe_path = get_output_path(&opts, file.clone(), "")
+  let exit_code = bootstrap_call_system(exe_path.clone())
+  var results = Vec::new()
+  let passed = exit_code == 0
+  let message = if passed then "" else "test exited with code " + exit_code.to_string() end
+  results.push(TestResult {
+    name: "main".to_string(),
+    passed: passed,
+    message: message
+  })
+  Result::Ok(results)
 end
 
 # 

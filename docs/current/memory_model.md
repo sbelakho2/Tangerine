@@ -58,12 +58,14 @@ inference and no ownership analysis (§13); codegen (stage 12,
 
 There is no borrow checker. There are no safe reference types and no
 lifetimes; those concepts are not supported by the language. The only
-`&` forms are the access marker (§3) and the legacy parameter-convention
-syntax that the parser normalizes away (§2). First-class `&T` / `&mut T`
-in a general type position is rejected with the hard error E106 (§2.3);
-the legacy parameter-convention spellings remain only as normalized
-syntax (§2), and ref patterns are likewise rejected with E106
-("ref patterns are not supported").
+`&` forms are the call-argument access marker (§3) and the
+`__intrinsic_`-scoped extern-ABI type positions (§2.3). First-class
+`&T` / `&mut T` in a general type position is rejected with the hard
+error E106 (§2.3); the legacy parameter-convention spellings (`mut x:` /
+`&x:` / `&mut x:` / `move x:` / `own x:` prefixes, `x: &T` / `x: &mut T`
+markers, `fn(&T)` conventions, `&self` receivers) are hard **E100**
+errors — never normalized (§2); ref patterns are likewise rejected with
+E106 ("ref patterns are not supported").
 
 ---
 
@@ -89,11 +91,14 @@ Sources of a convention:
 - Explicit keywords on parameters and receivers: `def f(inout x: T)`, a
   trailing `inout` receiver marker (`def m(self: Self) ... inout`), `sink`,
   `set`. `let` is the default for parameters without a modifier.
-- Legacy modifiers are normalized by the parser immediately after parsing
-  (one semantic implementation): `&mut T` → `inout T`, `&T` / `&self` →
-  `let T`, `move T` / `own T` → `sink T`, `mut x` / `let mut x` → `var x`
-  (`var` is an alias of `mut` in the keyword table). The transitional
-  `ParamModifier` field is **deleted**: `Param` carries the
+- Legacy parameter modifiers are **REJECTED, never normalized** (round-9):
+  `mut x:` / `&x:` / `&mut x:` / `move x:` / `own x:` prefixes and the
+  `x: &T` / `x: &mut T` type markers fail with the E100 "legacy parameter
+  spelling … is removed" diagnostic (`parser.tg` `parse_param` /
+  `parse_fn_type_param`); the legacy token is consumed only for error
+  recovery and the compile fails. In LOCAL position `mut x = e` remains an
+  accepted legacy alias of `var x = e` (`let mut x = e` also parses). The
+  transitional `ParamModifier` field is **deleted**: `Param` carries the
   `AccessConvention` directly (`convention` field, ast.tg), so the
   let/inout/sink/set map is the one parameter model — no modifier field
   survives on the AST.
@@ -142,11 +147,25 @@ E106: safe reference types are not first-class; use a parameter access
 and fails the parse: `parse_type` consumes the `&` constructor and returns
 `Option::None` — it **never** erases the reference to its inner type, so a
 program cannot write `def bad(...) -> &Thing` and have it silently become
-`Thing`. The call site must migrate to a **parameter access convention**
-(`x: &T` / `x: &mut T` parameter annotations, `self: &Self` /
-`self: &mut Self`) or an explicit **access operation** (`&place`). Parameter
-annotations are normalized before `parse_type` is reached, so the legacy
-`&T` parameter access conventions never fire E106.
+`Thing`. The call site must migrate to a **parameter access convention** —
+the explicit keyword forms (`inout x: T` / `sink x: T` / `set x: T`, or
+the default `let`) — or an explicit **access operation** (`&place`). The
+legacy parameter annotations (`x: &T` / `x: &mut T`, `&self` /
+`&mut self`) are consumed by the parameter parser and fail with the E100
+legacy-spelling diagnostic before `parse_type` is reached; they never
+fire E106 and they are never normalized.
+
+The single exception to the E106 rejection: `&T` / `&mut T` (including
+nested positions such as `Option[&K]`) inside an `extern` declaration
+whose name carries the `__intrinsic_` prefix parse as the internal
+address/reference ABI (typed `RefInternal`). The extern-ABI context is
+scoped by name (`parser.tg` `parse_extern_fn` / `parse_extern_static`:
+`p.extern_abi_context = is_intrinsic_extern_name(&name)`; `ids.tg`
+`is_intrinsic_extern_name` = the `__intrinsic_` prefix). An ordinary
+user extern is the strict FFI boundary — its `&` type positions are
+E106, and the interop guidance is raw pointers / view structs. The
+kernel's five record-visit extern signatures in `std/collections.tg`
+are the only such positions in the tree.
 
 ---
 
@@ -904,7 +923,6 @@ compiler-owned structural field cleanup — exactly once.
 | **Expression-level projected-place operations** | the place-level registry + masked glue exist (§4.4: pattern-binding partial moves, match destructuring, closure capture); DIRECT expression-level consume/move/assign/initialize of a projected resource place is still rejected at root-granularity ("cannot consume a projected place: partial moves are not yet supported" etc.) | per-place state at the expression-level operations (consume/assign through a projection) |
 | **Consuming iteration** | snapshot iteration exists; sink-element iteration rejected | consuming iteration with per-iteration (backedge) cleanup |
 | **StrView name fallback** | the hash/eq dispatch selects StrView by the LangItems `str_view` TypeId; the name-selection fallback remains only for snapshots without the registration | drop the name fallback once every snapshot registers the id |
-| **Legacy borrow syntax deletion** | `&T`/`&mut T`/`move`/`own` parameter access conventions are normalized at parse (`ParamModifier` deleted — the parser maps directly to `AccessConvention`); `&T` in general type position and ref patterns are hard errors (E106) | remove the legacy parameter-convention syntax from the parser entirely |
 
 The pending list above is the authoritative one; `access_resource_migration.md`
 records the historical status of these items at audit time.

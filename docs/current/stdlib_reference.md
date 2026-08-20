@@ -18,16 +18,31 @@ This document provides a comprehensive reference for all modules in the Tangerin
    `collections`, `core`, `env`, `ffi`, `fmt`, `fs`, `gfx_errors`, `io`,
    `process`, `taint`, `time`) are compiled by every stage of the bootstrap
    ladder. They have no per-module native test suites.
-2. **E106 migration COMPLETE (parse-clean):** every shipped std module
-   (the 14 kernel modules plus all 119 non-kernel `std/*.tg` files) is
-   free of first-class reference type positions — zero `-> &T`,
-   `-> &mut T`, `Option[&T]`, `Vec[&T]`, nested `&` in generic args, fn-type
-   return `&` positions, `&T`-typed fields/consts/let-annotations, `as &T`
-   casts, and `ref` patterns remain in the non-kernel modules (the sweep
-   gate `tests/run_stdlib_e106_sweep.sh` asserts every module checks clean
-   and E106-free). The module reference sections below still describe
-   declared surfaces, not verified behavior — the modules remain
-   **API-only** until they pass per-module native test suites.
+2. **E106 migration COMPLETE (parse-clean, CI-verified):** every shipped
+   std module (all 133 `std/*.tg` files — the 14 kernel modules in
+   `bootstrap/compiler_kernel.manifest` plus the 119 non-kernel modules) is
+   free of every forbidden syntax class: zero `-> &T` / `-> &mut T`
+   returns, zero nested `&` in generic args (`Option[&T]`, `Vec[&T]`,
+   `Option<&T>`), zero `&T`-typed fields/consts/let-annotations, zero
+   legacy parameter spellings (`x: &T`, `&self`, `&mut self`, fn-type
+   conventions `Fn(&T)` — all hard E100 errors in the current dialect),
+   zero `as &T` casts, zero `ref`/`for &` patterns, zero lifetime tokens
+   (`'static` — the language has no lifetimes), zero `when`-in-enum
+   older-dialect variants, zero angle-bracket generic forms
+   (`Option<u32>`, `Option[u32>` — the grammar's generics are `[...]`
+   only), and zero `Box[dyn Any]` erased results. The gate
+   `tests/run_stdlib_e106_sweep.sh` is a **required CI job**
+   (`stdlib-e106-sweep` in `.github/workflows/ci.yml`) and enforces this
+   in two layers: (1) `tg check` on every std/*.tg module must succeed
+   with zero diagnostics (E106/E100/E1100 and any syntax error fail the
+   module), and (2) a grep backstop re-scans every module for the
+   forbidden syntax classes above, so a module that slips through a
+   parsing gap (an angle-bracket form or lifetime token that happens to
+   lex as junk) fails even if the check passes. The claim is only as
+   strong as the gate: it is CI-required and backstopped. The module
+   reference sections below still describe declared surfaces, not
+   verified behavior — the modules remain **API-only** until they pass
+   per-module native test suites.
 3. **Kernel remainder:** `std/collections.tg` (in the closure) keeps 5
    record-visit extern signatures (`__intrinsic_map_visit_*`,
    `__intrinsic_set_visit_*`) with `Option[&K]`/`&V` returns. They parse
@@ -37,9 +52,10 @@ This document provides a comprehensive reference for all modules in the Tangerin
    internal address/reference ABI); anywhere else the native parser
    records the E106 hard error (`parse_type`). These signatures are the
    kernel's ONLY remaining reference type positions — the documented
-   extern-ABI exception, not a migration remainder.
+   extern-ABI exception, not a migration remainder, and the sweep's
+   backstop exempts only the `__intrinsic_`-named extern lines.
 
-### Migration status (E106-pending table — MIGRATED 2026-08-20)
+### Migration status (former E106-pending table — MIGRATED 2026-08-20)
 
 The former pending table (71 modules / 374 sites: return types and
 generic type args containing `&`, including `&mut` and `&` inside generic
@@ -66,13 +82,22 @@ access model. The conversion classes:
 - (e) `const X: &str` → `const X: String`; `let x: Vec[&str]` annotations
   → owned element forms; `as &T` casts → `as Ptr[T]`; `impl X for &T` →
   the owned/view type; `for &x in ...` ref patterns → by-value bindings.
+- (f) Legacy parameter spellings (`x: &T`, `x: &mut T`, `&self`,
+  `&mut self`, fn-type param conventions `Fn(&T)`, closure params
+  `|x: &T|`) → the explicit access conventions (`let`/`inout`/`sink`/
+  `set`) and owned fn-type conventions (`Fn(inout T)`); these spellings
+  are hard E100 errors in the current dialect.
+- (g) Older-dialect forms in the same modules: `when`-in-enum variant
+  prefixes removed (673 variant lines across 11 modules), `+ 'static`
+  lifetime suffixes dropped (8 sites in 4 modules), angle-bracket
+  generics converted to `[...]` (50 sites on 25 lines across 7 modules,
+  including mixed `Option[u32>` brackets), `Box[dyn Any]` → `Box[Any]`.
 
-Remaining reference-typed positions in the non-kernel std: **zero** (the
-legal parameter-convention spellings `x: &T` / `self: &mut Self` and
-fn-type param conventions `fn(&T)` remain — they are stripped at parse
-time before `parse_type` and never reach the E106 rejection). The sweep
-gate `tests/run_stdlib_e106_sweep.sh` now asserts every shipped module
-checks clean and E106-free.
+Remaining reference-typed positions in std: **zero** outside the
+documented `__intrinsic_` extern-ABI exception. The sweep gate
+`tests/run_stdlib_e106_sweep.sh` asserts every shipped module (all 133)
+checks clean AND passes the forbidden-syntax grep backstop; the gate is a
+**required CI job** (`stdlib-e106-sweep` in `.github/workflows/ci.yml`).
 
 ---
 

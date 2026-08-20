@@ -1,0 +1,115 @@
+# Tangerine Feature Registry
+
+> **Single source of truth for feature status.** Every feature appears in
+> the table below **exactly once with exactly one status**. No feature is
+> simultaneously "unsupported", "normalized", and "demonstrated as current
+> syntax" — a status is derived from the executable state of the
+> self-hosted compiler and its gates, never from a declared module
+> surface. The `feature_matrix.md` document compares Tangerine with Rust
+> and derives its statuses from this registry; where the two disagree,
+> this registry wins.
+
+## How a status is decided
+
+Each row cites the **enforcing code** (`file:function` — the pass that
+implements the feature or rejects it) and the **test/assertion** (the
+canary, invariant, or gate that exercises the claim). Statuses are
+grep-verified against the working tree at commit `a14eeca` plus the
+round-9 work; the assertion column names a machine-checkable artifact
+(manifest-registered canary, required CI gate, or
+`scripts/verify_invariants.sh` group), not a claim in prose.
+
+> **Execution honesty.** "implemented+tested" means the repo ships a
+> committed test artifact that exercises the feature (a manifest-registered
+> canary, a required gate, or the self-hosted compiler kernel itself as the
+> workload). Per `STATUS.txt`, **no compiler run was executed while
+> producing the current snapshot**: the canaries are registered with
+> three-way manifest parity and the gates are CI-required, but their
+> execution numbers belong to a real run, not to this snapshot.
+
+## Legend
+
+| Status | Meaning |
+|--------|---------|
+| **implemented+tested** | The compiler/runtime implements the feature and a committed artifact (canary, gate, self-host workload) exercises it |
+| **implemented-unverified** | The compiler/runtime implements the feature; the covering artifact is registered but not executed in this snapshot |
+| **partial** | A working subset exists; the full feature is not present |
+| **API-only** | The std module / interface is declared, but the compiler does not wire it into the pipeline and it is not in the bootstrap closure |
+| **design** | Specified in docs/RFCs only; no implementation |
+| **unsupported** | Explicitly removed or rejected by the compiler (E100/E106 hard errors) |
+
+## Registry
+
+| Feature | Status | Enforcing code (`file:function`) | Test / assertion |
+|---------|--------|----------------------------------|------------------|
+| Access conventions (`let` / `inout` / `sink` / `set`; `let` is the default by-value convention) | implemented+tested | `tg_compiler/parser.tg` `parse_param` (the ONLY parameter spellings); `types.tg` access check | self-host kernel (37-source bootstrap closure); `tests/canary` access-convention canaries; grammar gate (canonical forms never flagged) |
+| `&place` / `&mut place` call-argument access markers | implemented+tested | `tg_compiler/parser.tg` `parse_unary` (`ExprAccess`); `types.tg` rejects the marker outside a call argument list | `tests/canary_neg` marker-misuse negatives; grammar gate (markers exempt from the scan) |
+| First-class safe references (`&T` / `&mut T` / `&&T` in type position) | unsupported | `tg_compiler/parser.tg` `parse_type` → `diag_safe_ref_not_first_class` (**E106**); the `&` constructor is consumed and the parse fails | `tests/canary_neg/canary_neg_ref_pattern.tg`; grammar gate scan; sweep backstop (a); invariant G3.1a |
+| Legacy parameter spellings (`mut`/`&`/`&mut`/`move`/`own` prefixes, `x: &T` / `x: &mut T` type markers, `fn(&T)` fn-type conventions, `&self` / `&mut self` receivers) | unsupported | `tg_compiler/parser.tg` `parse_param` / `parse_fn_type_param` (**E100** — "legacy parameter spelling … is removed"; token consumed only for error recovery, the compile fails) | grammar gate scan + legacy-probe rejection; sweep backstop (a); invariant G3.4 |
+| Lifetimes (`'static`, `'a`) | unsupported | lexer/parser — no lifetime tokens exist in the dialect | sweep backstop (b) |
+| Ref patterns (`ref x`, `&x` binders) | unsupported | `tg_compiler/parser.tg` `diag_ref_pattern_not_supported` (**E106**); binders are never erased | `tests/canary_neg/canary_neg_ref_pattern.tg`; invariant G3.1b/G3.2 |
+| Extern-ABI reference exception (`__intrinsic_*`-named externs only) | implemented-unverified | `tg_compiler/parser.tg` `parse_extern_fn` / `parse_extern_static` (`extern_abi_context = is_intrinsic_extern_name(&name)`); `tg_compiler/ids.tg` `is_intrinsic_extern_name` (the `__intrinsic_` prefix) | the kernel's 5 record-visit extern signatures in `std/collections.tg` (`Option[&K]` / `&V` returns — the ONLY reference type positions left); sweep/grammar-gate exemptions; invariant G3.3 |
+| Raw pointers `*T` / `*mut T`, `Ptr[T]`, `PtrMut[T]` | implemented+tested | `tg_compiler/parser.tg` `parse_type` (`*` pointer forms); `types.tg` typing | FFI extern surface of the kernel (`std/ffi.tg`, `std/collections.tg`) and the 133-module FFI audit conversions (extern surfaces → `Ptr[T]`/`PtrMut[T]`); sweep backstop (refs ≠ Ptr) |
+| View types `StrView`, `FfiStr`, `FfiSlice[T]`, `Slice[T]` | implemented+tested | `std/core.tg` `StrView` (`{ptr, len}` non-owning UTF-8 view); `std/ffi.tg` `FfiStr` / `FfiSlice[T]`; `Slice[T]` (16-byte `{ptr, len}`) | kernel usage (`std/args.tg`, `std/env.tg`, `std/ffi.tg`); sweep parse-clean coverage of every shipping module |
+| Move/consume semantics (`sink`, resource ownership, capability linearity) | implemented+tested | `tg_compiler/resource_check.tg` `validate_capability_exit` + resource dataflow; `types.tg` | `tests/canary_neg` move/consume negatives, resource partial-move canaries, `canary_capability.tg` |
+| Partial moves (projection-aware place-key lattice) | implemented-unverified | `tg_compiler/types.tg` `record_place_moves` / `place_move_states`; `tg_compiler/mir.tg` `mir_emit_partial_drop_chain` | `tests/verifier_projection_tests.tg`; `tests/canary_neg` `canary_neg_resource_partial_*` (registered, not executed) |
+| Drop glue (per-concrete-plan, recursion broken by symbol) | implemented-unverified | `tg_compiler/mir.tg` `mir_build_all_drop_glues`; `DeinitPlan::String` → `tg_compiler/runtime.tg` `_tg_string_drop` | canary drop canaries; invariant G2.3/G2.4 |
+| Fixed-array const sizes | implemented+tested | `tg_compiler/types.tg` `eval_const_size_expr` (literals, const refs, constant arithmetic) | `tests/canary/canary_pos_fixed_array_const_size.tg` (manifest-registered) |
+| Allocator: per-class free lists + per-size-class locks | implemented-unverified | `tg_compiler/codegen.tg` `emit_tg_alloc_lock` / `emit_tg_alloc_unlock` (serialize the free-list head pop/push) + `_tg_alloc_free_heads`; `tg_compiler/runtime.tg` `_tg_mem_alloc` / `_tg_mem_free` | `tests/allocator_{churn,large,oom,reuse,threaded}_test.tg` (registered, not executed); invariant G7 |
+| Atomics — `__intrinsic_atomic_*` family is the ONE atomic authority | implemented-unverified | `tg_compiler/codegen.tg` `emit_atomic_intrinsic` (inline LDAR/STLR/LSE on AArch64, LOCKed xchg/xadd/cmpxchg on x86-64); `std/atomic.tg` + `std/sync.tg` route every atomic op through the family | `std/atomic.tg` / `std/sync.tg` extern surfaces (no `__atomic_*` GCC builtins remain); no dedicated run in this snapshot |
+| Contracts (`pre` / `post` / `invariant` — unconditional runtime trap) | implemented+tested | `tg_compiler/mir.tg` `lower_contract` → `MirContractCheck`; `tg_compiler/codegen.tg` trap emission (never flag-gated) | `tests/run_mode_behavior_tests.sh`; contract canaries |
+| Capabilities — unconditional linearity enforcement | implemented+tested | `tg_compiler/resource_check.tg` capability machinery (consumption tracking, `contains_capability` via `types.tg` `type_properties_of`) | `tests/canary/canary_capability.tg`; mode behavior tests |
+| Progressive strictness (4-mode config) | partial | `tg_compiler/mode.tg` `ModeConfig` — carries ONLY `mode` + the two unconditional enforcements; all former bits (effects/budgets/coverage/CQS/docs/tests/unsafe/review/memory-safety/audit/stubs/escalation) deleted | invariant G8.1/G8.2; `tests/run_mode_behavior_tests.sh` |
+| Structured diagnostics at the API boundary | implemented+tested | `tg_compiler/compiler_core.tg` `analyze_program` / `analyze_parsed` / `analyze_source` → `Result[AnalyzedProgram, Vec[Diagnostic]]`; stringification only at the CLI boundary | invariant G9 |
+| MIR verifier (CFG/dataflow + projection-aware lattice) | implemented-unverified | `tg_compiler/mir.tg` `verify_function_v2` (CFG well-formedness, definite-init meet, storage lifetimes, projection/rvalue/call typing); run post-lower / post-mono / post-opt | `tests/verifier_projection_tests.tg` (registered, not executed) |
+| `@cfg` target-conditioned declaration elimination | implemented-unverified | `tg_compiler/compiler_core.tg` `apply_cfg_elimination` (retention fixpoint over kept/referenced names); empty `@cfg()` fails closed with **E108** (`tg_compiler/parser.tg` `parse_attributes`) | structural grep only; no dedicated test registered |
+| Zero-inference monomorphization | implemented+tested | `tg_compiler/mono.tg` | the self-host kernel itself (every generic instantiation of the 37-source closure) |
+| Closures (value-ABI lowering + self-host validation) | implemented+tested | closure lowering in `tg_compiler/mir.tg` / `tg_compiler/codegen.tg`; self-host closure validation (a14eeca) | `tests/canary` closure canaries; the compiler kernel |
+| Macros (`macro` keyword, E105 expansion fixpoint) | implemented+tested | `tg_compiler/parser.tg` macro machinery (64-pass expansion fixpoint, E105 hard stop) | `tests/canary` macro canaries |
+| Traits, generics, bounds | implemented+tested | `tg_compiler/trait_resolve.tg`; `types.tg` bounds checking | the self-host kernel; `tests/canary` trait/generic canaries |
+| ADTs + pattern matching (by-value binders only) | implemented+tested | `tg_compiler/parser.tg` `enum` / `match` | `tests/canary_neg/canary_neg_ref_pattern.tg` (ref-binder rejection) |
+| Error handling (`Result[T, E]` / `Option[T]`, `?`, `try/catch`) | implemented+tested | `std/core.tg` `Result` / `Option`; error-code registry (E0xxx, `parser.tg` `error_code_to_string`) | the self-host kernel; `tests/canary` error-handling canaries |
+| Zero-cost abstractions (trait dispatch, generics, monomorphization) | implemented-unverified | `tg_compiler/mono.tg` (zero-inference specialization) | the self-host kernel; no benchmark evidence registered |
+| Modules & visibility (module table = identity authority) | implemented+tested | `tg_compiler/ast.tg` `Crate` module table; `types.tg` `crate_module_path_of` | invariant G11; self-host kernel |
+| Algebraic effects | API-only | `std/effects.tg` declares the surface; `MirEffectRecord` is never constructed from source; the `__tg_effect_record` runtime body is a trap stub | no pipeline caller; not in the bootstrap closure |
+| Budgets | API-only | `std/budget.tg` declares the surface; `MirBudgetConsume` is never constructed; `__tg_budget_*` data symbols have no definitions | no pipeline caller; not in the bootstrap closure |
+| CQS (quality scoring) | API-only | `tg_compiler/cqs.tg` exists; `run_cqs_analysis` has no pipeline caller | no compile/check path invokes it |
+| Async/await | partial (alpha) | `std/async.tg` carries `status: alpha`; executor module exists outside the bootstrap closure | sweep parse-clean only |
+| SIMD intrinsics | API-only | `std/simd.tg` declares vector types (87 defs); no SIMD support in `tg_compiler/asm.tg` / `codegen.tg` | not in the bootstrap closure |
+| Inline assembly | unsupported | no `asm` directive in token/ast/parser | — |
+| `@[no_std]` attribute | unsupported | no such attribute in `tg_compiler/ast.tg` / `parser.tg` | — |
+| `@[packed]` / `@[align]` attributes | design | documented only (`../history/frozen_layout_features.md` lists them GATED); not implemented | — |
+| `@[real_time(wcet_us=N)]` | design | documented only | — |
+| WASM compile target | API-only | `tg_compiler/wasm_target.tg` builds WASM sections, but nothing calls it — no `--target wasm32*` route in driver.tg/codegen.tg | no tests |
+| WASI support | unsupported | no WASI runtime | — |
+| Embedded targets (Cortex-M `thumbv7em`/`thumbv6m`, RISC-V) | unsupported | no such targets in `tg_compiler/cross_compile.tg` / `asm.tg`; no RISC-V backend | — |
+| Bootstrap closure (14 std + 23 compiler sources) | implemented-unverified | `bootstrap/compiler_kernel.manifest`; ladder `run_bootstrap.sh` (stage0→stage3, stage2 == stage3 byte-identical) | four-way harness parity (`scripts/bootstrap_helpers.sh`); ladder not executed this snapshot |
+| Stdlib parse-clean state (all 133 `std/*.tg` modules) | implemented-unverified | the two-layer sweep — layer 1: `tg check` zero diagnostics per module; layer 2: forbidden-syntax grep backstop (`tests/run_stdlib_e106_sweep.sh`) | **required CI job** `stdlib-e106-sweep` (`.github/workflows/ci.yml`); not executed this snapshot |
+| Non-kernel stdlib behavior | API-only | outside the bootstrap closure; the sweep verifies parse-clean only, never behavior | sweep gate |
+| Self-host grammar gate | implemented+tested | `scripts/run_selfhost_grammar_gate.sh` — enumerate the manifest closure, structural scan for forbidden legacy forms, compiler check over the closure (usable binary only, probe-validated) | wired into `run_bootstrap.sh` next to the struct-integrity pre-gate; the gate's own good-probe + legacy-probe checks |
+| `tg test` outcome integrity (pass/fail/zero-tests/parse-error/implicit-skip) | implemented-unverified | `tg_compiler/driver.tg` `tg test` (cmd_test); P0 gate `tests/run_test_runner_integrity.sh` (five probe files) | gate script registered; not executed this snapshot |
+| LSP server | partial | `tg_compiler/driver.tg` `tg lsp`; editor-recovery path is permissive resolution only | — |
+| VS Code extension | implemented-unverified | `tangerine-vscode/` tree present | no test evidence |
+| Syntax highlighting | implemented-unverified | TextMate grammar present | no test evidence |
+| Code formatting (`tg fmt`) | implemented+tested | `tg_compiler/formatter.tg` | canary format checks |
+| Linting (`tg lint`) | partial | `tg_compiler/linter.tg` is a separate subcommand; lint rules are not part of the compile pipeline | — |
+| Package manager (`tg dep` / `tg install`) | partial | `tg_compiler/pkg_manager.tg`; registry operations are local | — |
+| REPL (`tg repl`) | design | listed; no implementation | — |
+| Documentation generator (`tg doc`) | implemented-unverified | `tg_compiler/docgen.tg` | no test evidence |
+| Benchmark framework (`std/bench`) | API-only | not in the bootstrap closure; CI uses a pinned baseline release | — |
+| aarch64-apple-darwin target (host) | implemented+tested | aarch64 emitter in `tg_compiler/asm.tg` / `codegen.tg` | `tests/arm64` encoder/ABI suite + bootstrap ladder (registered) |
+| x86-64 target (System V / Windows x64) | implemented-unverified | x64 emitter in `tg_compiler/asm.tg` / `codegen.tg` | `tests/run_target_lane_canaries.sh` (Rosetta/qemu when available, else a disassembly gate); no dedicated x86 host tests |
+| Kernel-closure std behavior (14 modules) | implemented-unverified | `bootstrap/compiler_kernel.manifest`; compiled by every stage of the ladder | no per-module native test suites |
+
+## Cross-references
+
+- [Feature Matrix](feature_matrix.md) — Tangerine vs Rust; statuses derive from this registry.
+- [Grammar](grammar.md) — the implemented grammar, including the E100/E106 rejection surfaces.
+- [Language Reference](language.md) — the current dialect (access conventions, views, FFI pointers).
+- [Standard Library Reference](stdlib_reference.md) — module surfaces and the migration-complete gate.
+- [Memory Model](memory_model.md) — the normative ownership/access model.
+- `scripts/verify_invariants.sh` — the machine-checkable invariant groups (G1–G12) cited above.
+
+---
+
+*Last updated: 2026-08 · statuses grep-verified against the working tree at commit a14eeca + the round-9 work.*

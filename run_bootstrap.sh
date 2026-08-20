@@ -66,6 +66,19 @@ if [ -x "$ROOT_DIR/scripts/check_struct_integrity.sh" ]; then
   fi
 fi
 
+# Self-host grammar pre-gate: the current parser HARD-REJECTS the legacy
+# parameter spellings (mut/&/&mut/move/own prefixes, `x: &T` / `x: &mut T`
+# markers, `fn(&T)` fn-type params, `&self` / `&mut self` receivers — the
+# E100/E106 diagnostics), so the manifest closure MUST be free of them: HEAD
+# has to compile its own kernel under its own grammar. Any forbidden form in
+# ANY manifest closure file fails the harness before any stage is built.
+if [ -x "$ROOT_DIR/scripts/run_selfhost_grammar_gate.sh" ]; then
+  if ! "$ROOT_DIR/scripts/run_selfhost_grammar_gate.sh"; then
+    echo "[bootstrap:error] self-host grammar pre-gate failed (legacy parameter forms in the manifest closure)" >&2
+    exit 1
+  fi
+fi
+
 BUILD_DIR="$ROOT_DIR/build"
 BOOT_LOG_DIR="$BUILD_DIR/bootstrap"
 STAGE0_BIN=""

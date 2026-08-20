@@ -6,7 +6,7 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, TypedExprKind, chain_contains_key}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, chain_contains_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
 use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, FieldId}
@@ -903,7 +903,7 @@ end
 # The top-level basic-block partition: the body's statement list is split
 # at each control-flow statement. Returns the per-block (starts, ends)
 # statement-index ranges in order (each block: [starts[i], ends[i])).
-def top_block_ranges(stmts: &Vec[Stmt]) -> (Vec[Int], Vec[Int])
+def top_block_ranges(stmts: Vec[Stmt]) -> (Vec[Int], Vec[Int])
   var starts = Vec::new()
   var ends = Vec::new()
   var s = 0
@@ -924,7 +924,7 @@ end
 
 # The statement-range node-id attribution (the block_stmt_ids mirror for a
 # top-level block range [st, en)).
-def block_stmt_ids_range(block: &Block, st: Int, en: Int) -> Vec[Int]
+def block_stmt_ids_range(block: Block, st: Int, en: Int) -> Vec[Int]
   var ids = Vec::new()
   var i = st
   while i < en do
@@ -945,7 +945,7 @@ def block_stmt_ids_range(block: &Block, st: Int, en: Int) -> Vec[Int]
 end
 
 # does the statement RANGE [st, en) end in a terminator?
-def block_ends_with_terminator_range(block: &Block, st: Int, en: Int) -> Bool
+def block_ends_with_terminator_range(block: Block, st: Int, en: Int) -> Bool
   if en <= st then
     return false
   end
@@ -967,7 +967,7 @@ end
 # function's fallthrough Normal edge (source = the block's key — the
 # attach convention). The block key is pushed on the structural defer
 # chain while its statements are walked (the check_block mirror).
-def cfg_top_blocks(block: &Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
+def cfg_top_blocks(block: Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   let (starts, ends) = top_block_ranges(&block.stmts)
   var bi = 0
   while bi < starts.len() do
@@ -3611,12 +3611,47 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       # the callee (a previous assignment), so overwriting it without a
       # drop leaks that value.
       if t.drops_old then
-        # (partial moves): the whole-root drop-before-store must not share
-        # storage with the value's source — the RHS rooting at the SAME
-        # local (a direct whole-root or projected move) would destroy the
-        # value's source (the drop-before-store and the source move cannot
-        # share the storage) — rejected.
-        if !expr_is_plain(target) && root_has_moves(frame, t.lid) then
+        # (partial moves): the drop-before-store form — the WHOLE-root drop
+        # (depth-1) must not share storage with the value's source: the RHS
+        # rooting at the SAME local (a direct whole-root or projected move)
+        # would destroy the value's source (the drop-before-store and the
+        # source move cannot share the storage) — rejected. The NESTED
+        # exact-place drop destroys only the target chain's own state, so
+        # the same-root chain-move guard applies, but the root's OTHER
+        # chains (consumed or live) are untouched — the root_has_moves
+        # whole-root guard does not apply to the exact-place form.
+        var target_chain = Vec::new()
+        let target_is_field = if !expr_is_plain(target) then
+          place_projection_keys(typed, &target, &mut target_chain)
+        else
+          false
+        end
+        if !expr_is_plain(target) && target_is_field && target_chain.len() > 1 then
+          if expr_roots_at(typed, &value, t.lid.id) then
+            errors.push(ResourceError {
+              message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+              span: value.span
+            })
+          else
+            # The nested exact-place drop: the chain's own state is
+            # destroyed before the store (masked to the chain's consumed
+            # extensions — the assign_exact_drops plan the MIR's
+            # assign-drop chain consumes). the assign-drop chain is NOT a
+            # CFG edge — it is the drop-before-store chain inside one
+            # statement, with no CfgEdgeKind in the edge model (no
+            # transfer originates it). the chain is the SEMANTIC
+            # assign_exact_drops table (node id -> the exact-place drop
+            # records) — the "assign::<stmt id>" String-key protocol is
+            # not part of the model.
+            var exact = Vec::new()
+            exact.push(AssignExactDrop {
+              local: t.lid.id,
+              chain: target_chain.clone(),
+              paths: assign_exact_drop_paths(typed, env, frame, t.lid, &target_chain)
+            })
+            finalize_plan.assign_exact_drops.insert(stmt.node_id, exact)
+          end
+        elsif !expr_is_plain(target) && root_has_moves(frame, t.lid) then
           errors.push(ResourceError {
             message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
             span: value.span
@@ -3651,7 +3686,14 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
         let field_chain = place_projection_keys(typed, &target, &mut chain)
         if field_chain then
           if t.drops_old then
-            mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+            # The whole-root drop (the depth-1 owning target) destroys the
+            # sibling DIRECT fields — they are marked Consumed so the
+            # scope-exit drop skips them. The NESTED exact-place drop
+            # destroys only the chain's own state — the siblings stay
+            # live, no marking.
+            if chain.len() == 1 then
+              mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+            end
           end
           frame_place_clear(frame, t.lid, &chain)
           frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
@@ -5766,10 +5808,37 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       # (Uninitialized — the first store into a set parameter's caller
       # buffer; Consumed — a reinitialized moved-out slot) never drops.
       if t.drops_old then
-        # (partial moves): the same-root RHS guard (see StmtAssign — the
-        # whole-root drop-before-store must not share storage with the
-        # value's source).
-        if !expr_is_plain(target) && root_has_moves(frame, t.lid) then
+        # (partial moves): the same-root RHS guard (see StmtAssign). The
+        # NESTED exact-place drop destroys only the target chain's own
+        # state — the root_has_moves whole-root guard does not apply to the
+        # exact-place form.
+        var target_chain = Vec::new()
+        let target_is_field = if !expr_is_plain(target) then
+          place_projection_keys(typed, &target, &mut target_chain)
+        else
+          false
+        end
+        if !expr_is_plain(target) && target_is_field && target_chain.len() > 1 then
+          if expr_roots_at(typed, &value, t.lid.id) then
+            errors.push(ResourceError {
+              message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+              span: value.span
+            })
+          else
+            # The nested exact-place drop (see StmtAssign): the chain's own
+            # state is destroyed before the store, masked to the chain's
+            # consumed extensions. The ExprAssign's MIR lowering keys on
+            # the EXPRESSION's node id (unlike StmtAssign which keys on the
+            # statement's).
+            var exact = Vec::new()
+            exact.push(AssignExactDrop {
+              local: t.lid.id,
+              chain: target_chain.clone(),
+              paths: assign_exact_drop_paths(typed, env, frame, t.lid, &target_chain)
+            })
+            finalize_plan.assign_exact_drops.insert(expr.node_id, exact)
+          end
+        elsif !expr_is_plain(target) && root_has_moves(frame, t.lid) then
           errors.push(ResourceError {
             message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
             span: value.span
@@ -5802,7 +5871,14 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
         let field_chain = place_projection_keys(typed, &target, &mut chain)
         if field_chain then
           if t.drops_old then
-            mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+            # The whole-root drop (the depth-1 owning target) destroys the
+            # sibling DIRECT fields — they are marked Consumed so the
+            # scope-exit drop skips them. The NESTED exact-place drop
+            # destroys only the chain's own state — the siblings stay
+            # live, no marking.
+            if chain.len() == 1 then
+              mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+            end
           end
           frame_place_clear(frame, t.lid, &chain)
           frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
@@ -5988,15 +6064,18 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
           #   - dead storage (a moved-out chain): the store re-lives the
           #     chain without a drop;
           #   - a Live OWNING chain: the old value's drop-before-store. The
-          #     MIR's assign-drop chain can only destroy the WHOLE root, so
-          #     this is representable only when the root is FULLY live (no
-          #     consumed chains — the drop would re-drop them), the target
-          #     is DEPTH-1 (a nested target would leave the target's sibling
-          #     subfields dead — the drop chain cannot mask them), and the
-          #     root's direct-field shape is known (the destroyed sibling
-          #     fields must be marked for the scope-exit drop). The caller
-          #     additionally rejects an RHS rooted at the same local (the
-          #     drop would destroy the value's source);
+          #     chain-effective-state PREFIX RULE decides the form:
+          #     * a DEPTH-1 target — the MIR's assign-drop chain can only
+          #       destroy the WHOLE root, so the whole-root drop is
+          #       representable only when the root is FULLY live (no
+          #       consumed chains — the drop would re-drop them), and the
+          #       root's direct-field shape is known (the destroyed sibling
+          #       fields must be marked for the scope-exit drop);
+          #     * a NESTED target (depth >= 2) whose chain's own state is
+          #       Live — the EXACT-PLACE replacement: the drop-before-store
+          #       destroys the chain's own state (x.a.b) only, masked to
+          #       skip the chain's consumed extensions — the root's other
+          #       chains (live or consumed) are untouched;
           #   - a Live non-owning chain: a plain store, no drop;
           #   - an INDEXED target (the whole-value boundary): the MIR's
           #     indexed-assign drop is the old-element drop authority (the
@@ -6034,16 +6113,24 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
                   if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
                     # The old owning value's drop-before-store — the target
                     # FIELD's type must own (a Copy-field store overwrites
-                    # without a drop), and only the fully-live depth-1
-                    # shape is representable (see the note above).
+                    # without a drop). The representability is decided by
+                    # the chain-effective-state PREFIX RULE:
+                    #   - a DEPTH-1 target with the fully-live depth-1
+                    #     shape (see the note above) is the whole-root drop;
+                    #   - a NESTED target (depth >= 2) whose chain's own
+                    #     state is Live (the prefix rule — every prefix of
+                    #     the chain is live) is the EXACT-PLACE
+                    #     replacement: the drop-before-store destroys the
+                    #     chain's OWN state (the assign_exact_drops plan —
+                    #     the exact place x.a.b, masked to skip the
+                    #     chain's consumed extensions). The exact-place
+                    #     drop does not touch the root's other chains, so
+                    #     the depth-1 whole-root gates (root_has_moves /
+                    #     root_direct_shape_known) do not apply.
                     if !expr_type_has_resource(env, typed, target) then
                       Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
-                    elsif chain.len() != 1 then
-                      errors.push(ResourceError {
-                        message: "cannot assign over an owning projected place: nested exact-place replacement is not representable",
-                        span: target.span
-                      })
-                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                    elsif chain.len() > 1 then
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: true })
                     elsif root_has_moves(frame, lid) then
                       errors.push(ResourceError {
                         message: "cannot assign over an owning projected place: the root is partially moved out (the masked drop-before-store is not representable)",
@@ -6705,6 +6792,44 @@ def chain_effective_state(frame: ResFrame, lid: tg_compiler::ids::LocalId, chain
   when Option::None then ()
   end
   ResourceState::Live
+end
+
+# (partial moves — the nested owning projected replacement): the CONSUMED
+# EXTENSIONS of the target chain — the serialized relative paths (the
+# place_move_path_of key form — the shared key form of the checker's
+# ProjectionChain serialization) whose storage the MIR's exact-place
+# drop-before-store must SKIP (the masked exact-place drop: the chain's own
+# state is dropped, the dead extensions are not re-dropped). A consumed
+# chain whose key list strictly extends the target chain contributes its
+# relative tail; everything else is untouched by the exact-place drop.
+def assign_exact_drop_paths(typed: TypedProgram, env: TypeEnv, frame: ResFrame, lid: tg_compiler::ids::LocalId, chain: Vec[ProjectionKey]) -> Vec[String]
+  var out = Vec::new()
+  match frame.place_moves.get(lid)
+  when Option::Some(chains) then
+    for (pc, st) in chains do
+      if st == ResourceState::Consumed && pc.keys.len() > chain.len() then
+        var is_ext = true
+        var ki = 0
+        while ki < chain.len() do
+          if !projection_key_eq(&pc.keys[ki], &chain[ki]) then
+            is_ext = false
+          end
+          ki = ki + 1
+        end
+        if is_ext then
+          var rel = Vec::new()
+          var ri = chain.len()
+          while ri < pc.keys.len() do
+            rel.push(pc.keys[ri].clone())
+            ri = ri + 1
+          end
+          out.push(place_move_path_of(env, &rel))
+        end
+      end
+    end
+  when Option::None then ()
+  end
+  out
 end
 
 # Mark a chain's state in the lattice.

@@ -1,5 +1,6 @@
 # Tangerine Formal Grammar Specification
-# Version: 2.0.0 (Edition 2026)
+
+**Version:** 2.0.0 (Edition 2026)
 
 This document describes the grammar as **implemented** by the self-hosting
 compiler (`tg_compiler/parser.tg`, `tg_compiler/lexer.tg`,
@@ -61,16 +62,18 @@ typealias alias  extern inline
 **Canonical spellings and aliases:**
 
 - `var` is the canonical mutable-local keyword; `mut` in local position is a
-  legacy alias and both lex to the same token. `mut` also appears as a
-  legacy parameter prefix and as the `*mut T` marker.
+  legacy alias and both lex to the same token. In PARAMETER position `mut`
+  is a legacy spelling that is REJECTED (E100, see §2.3); `mut` also
+  appears in the `*mut T` marker.
 - `fn` is accepted as an alias for `def` (both lex to `Def`). `def` is the
   canonical function keyword; `fn` additionally appears in function-pointer
   type spellings.
 - `module` is canonical; `mod` is accepted as a compatibility alias.
 - `typealias` and `alias` are accepted aliases of `type` (item position).
 - `next` and `continue` are aliases (both lex to `Next`).
-- `move` and `own` are **legacy aliases** for the `sink` convention
-  (accepted, normalized; see §2.3).
+- `move` and `own` were legacy aliases for the `sink` convention; in
+  parameter position they are REJECTED (E100, see §2.3) — the `sink`
+  keyword is the only canonical form.
 - `super` and `crate` are contextual identifiers usable inside paths.
 - `self` is the receiver identifier; `Self` is the receiver type.
 
@@ -209,15 +212,16 @@ param          = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ] [ '=' expr
   (`parser.tg:1142-1150`).
 - The trailing `inout` after the return type (and where clause) sets the
   convention of the `self` parameter to `Inout`
-  (`parser.tg:1173`, `consume_trailing_receiver_convention` `parser.tg:1504-1514`).
+  (`parser.tg:1261`, `consume_trailing_receiver_convention` `parser.tg:1594-1604`).
   This is the canonical way to write mutating methods:
   `def set_name(self, name: String) -> Unit inout`.
 - A parameter whose name is `self` and which has no type is given the type
-  `Self` (`parser.tg:1576-1587`); with `&`/`&mut` prefixes this is the
-  legacy `&self` / `&mut self` spelling.
+  `Self` (`parser.tg:1687-1692`). The former `&self` / `&mut self`
+  spellings are REJECTED (E100) — write `self` (default `let`), `inout
+  self`, or use the trailing `inout` receiver convention.
 - `fn` may be used in place of `def` as a defensive fallback.
 
-### 2.3 Parameter Conventions and Legacy Normalization
+### 2.3 Parameter Conventions and Legacy Rejection
 
 The canonical parameter grammar is:
 
@@ -225,33 +229,35 @@ The canonical parameter grammar is:
 param = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ] [ '=' expr ]
 ```
 
-with default convention `let` (by-value move). The compiler also **accepts
-and normalizes** legacy Rust-style spellings (`parser.tg` `parse_param`,
-`parser.tg:1516-1608`):
+with default convention `let` (by-value move). The legacy Rust-style
+spellings are **NOT normalized — they are REJECTED** (`parser.tg`
+`parse_param`, `parser.tg:1614-1700`): the E100 diagnostic
+("legacy parameter spelling `X` is removed; use the explicit access
+convention `let`/`inout`/`sink`/`set`") is recorded, the legacy token is
+consumed **only for error recovery** (the convention it denoted is used
+so the surrounding parameter list keeps parsing), and the compilation
+fails. There is no acceptance path.
 
-| Written                                   | Normalized to                    | Convention |
-|-------------------------------------------|----------------------------------|------------|
-| `inout name`                              | `inout`                          | Inout      |
-| `sink name`                               | `sink`                           | Sink       |
-| `set name`                                | `set`                            | Set        |
-| `mut name`                                | `inout`                          | Inout      |
-| `& name` (prefix)                         | `&name` marker                   | Let (Ref)  |
-| `&mut name` (prefix)                      | `&mut name` marker               | Inout      |
-| `move name` (legacy alias)                | `sink`                           | Sink       |
-| `own name` (legacy alias)                 | `sink`                           | Sink       |
-| `name: &T` (type position)                | `name: T` with Ref modifier      | Let        |
-| `name: &mut T` (type position)            | `name: T` with RefMut modifier   | Inout      |
-| `self` (no type)                          | `self: Self`                     | —          |
+| Written                                  | Result                                  |
+|------------------------------------------|-----------------------------------------|
+| `inout name`                             | legal — `Inout`                         |
+| `sink name`                              | legal — `Sink`                          |
+| `set name`                               | legal — `Set`                           |
+| `name` (no prefix)                       | legal — `Let` (default)                 |
+| `mut name` (prefix)                      | **E100**, recovered as `Inout`          |
+| `& name` / `&mut name` (prefix)          | **E100**, recovered as `Let` / `Inout`  |
+| `move name` / `own name` (prefix)        | **E100**, recovered as `Sink`           |
+| `name: &T` / `name: &mut T` (marker)     | **E100**, recovered as `Let` / `Inout`  |
+| `&self` / `&mut self` (receiver prefix)  | **E100**, recovered with implicit `Self`|
+| `self` (no type)                         | legal — typed `Self`; `let` by default  |
 
-The type-position forms `&T` / `&mut T` are consumed by the parameter parser
-before `parse_type` runs, so the reference is *not* part of the type; it is
-converted into the parameter's modifier/convention (`parser.tg:1560-1628`) —
-this is the **parameter access convention** the E106 message recommends.
-Within a plain type expression `&T`, `&mut T`, and `&&T` are a **hard error**
-(E106): `parse_type` never erases the reference to its inner type — it
-records the error and fails the parse (see §3). The legacy acceptance of
-`self: &Self` / `self: &mut Self` (normalized to `let` / `inout`) is part of
-the same parameter normalization.
+The type-position markers `&T` / `&mut T` in a parameter are consumed by
+`parse_param` BEFORE `parse_type` runs, so they are the E100 legacy
+spelling family, not the E106 first-class-reference error (which applies
+to every other type position — see §3). `&self` / `&mut self` receivers
+are part of the same rejection. The five `__intrinsic_`-named extern
+signatures in `std/collections.tg`—the kernel's only remaining reference
+positions—are the documented extern-ABI exception (see §3).
 
 ### 2.4 Structs
 
@@ -392,11 +398,27 @@ type position — return types, struct fields, variable annotations, tuple
 members, generic arguments, container elements — are a **hard error** (E106,
 `parser.tg` `diag_safe_ref_not_first_class`): `parse_type` consumes the `&`
 constructor, records the error, and fails the parse (it never returns the
-inner type). The only accepted `&` spellings are the **parameter access
-conventions** `x: &T` / `x: &mut T` (and `self: &Self` / `self: &mut Self`),
-which are normalized at the parameter site before `parse_type` runs, and the
-fn-type convention prefixes `fn(&T)` / `fn(&mut T)`. Raw pointer types `*T`
-and `*mut T` are the unsafe-pointer forms.
+inner type). The ONLY `&` spellings that parse in type positions are:
+
+- **`&T` / `&mut T` inside an `extern` declaration whose name carries the
+  `__intrinsic_` prefix** (including nested positions such as
+  `Option[&K]`) — the internal address/reference ABI (typed `RefInternal`).
+  The extern-ABI context is scoped by name (`parser.tg` `parse_extern_fn` /
+  `parse_extern_static`: `p.extern_abi_context = is_intrinsic_extern_name(&name)`,
+  `tg_compiler/ids.tg` `is_intrinsic_extern_name` = the `__intrinsic_`
+  prefix). An ordinary user extern is the strict FFI boundary: its `&` type
+  positions hit the E106 rejection, and the interop guidance is raw
+  pointers / view structs. The kernel's five record-visit signatures in
+  `std/collections.tg` are the only such positions in the tree.
+- The **`&place` / `&mut place` expression access markers** — call-argument
+  only, not types (see §4.2).
+
+Everything else ampersand-like in a type is rejected: the parameter
+spelling family (`x: &T` / `x: &mut T` markers, `&self` / `&mut self`
+receivers, `fn(&T)` / `fn(mut T)` / `fn(move T)` fn-type conventions) is
+consumed before `parse_type` runs and fails with **E100** (see §2.3); the
+general type positions fail with **E106**. Raw pointer types `*T` and
+`*mut T` are the legal unsafe-pointer forms.
 
 ```ebnf
 type_expr      = type_primary [ '?' ]      // T? desugars to Option[T]
@@ -408,8 +430,8 @@ type_primary   = IDENT [ type_args ]                    // Named type / generic
                | '(' type_expr { ',' type_expr } ')'    // Tuple (1 elem = group)
                | '[' type_expr ';' expr ']'             // Fixed-size array
                | '[' type_expr ']'                      // Slice
-               | '&' type_primary                       // HARD ERROR (E106); accepted only as a parameter access convention
-               | '&mut' type_primary                    // HARD ERROR (E106); accepted only as a parameter access convention
+               | '&' type_primary                       // HARD ERROR (E106); the only accepted `&` type forms are the __intrinsic_-scoped extern ABI positions (see the note above)
+               | '&mut' type_primary                    // HARD ERROR (E106); same __intrinsic_-scoped extern exception
                | '&&' type_primary                      // HARD ERROR (E106)
                | '*' [ 'mut' ] type_primary             // *T / *mut T raw pointer
                | 'async' type_primary                   // Async wrapper
@@ -424,7 +446,7 @@ fn_type        = 'fn' '(' [ fn_type_param { ',' fn_type_param } ] ')' [ '->' typ
                | 'Fn' '(' [ fn_type_param { ',' fn_type_param } ] ')' [ '->' type_expr ]
 
 fn_type_param  = [ convention ] type_expr
-convention     = 'inout' | 'sink' | 'set' | 'mut' | '&mut' | '&' | 'move' | 'own'
+convention     = 'inout' | 'sink' | 'set'   // default 'let'; the legacy prefixes (mut/&mut/&/move/own) are E100
 
 type_args      = '[' type_expr { ',' type_expr } ']'
 ```
@@ -432,10 +454,12 @@ type_args      = '[' type_expr { ',' type_expr } ']'
 **Notes:**
 
 - Function types carry a per-parameter access convention
-  (`parse_fn_type_param`, `parser.tg:2714-2746`): `inout`, `sink`, `set`,
-  `mut` and `&mut` map to `Inout`; `&` maps to `Let`; `move` and `own` map to
-  `Sink`. A plain `(A, B) -> R` is a function type whose parameters all have
-  the default `let` convention (`parser.tg:2898-2911`).
+  (`parse_fn_type_param`, `parser.tg:2950-2992`): `inout`, `sink`, `set`,
+  and the default `let` are legal; the legacy prefixes `mut` / `&mut` /
+  `&` / `move` / `own` are **E100 hard errors** ("legacy parameter spelling
+  … is removed") — they are consumed only for error recovery, never
+  converted. A plain `(A, B) -> R` is a function type whose parameters all
+  have the default `let` convention.
 - The `fn` keyword and the `Fn`/`FnOnce`/`FnMut` identifier spellings are all
   accepted (`parser.tg:2816-2843`, `parser.tg:2966-2995`); `fn`/`def` fall
   back to identifiers when keyword lookup fails during bootstrap.
@@ -678,7 +702,7 @@ single_pattern = '_'                                        // wildcard
                | '(' [ pattern { ',' pattern } ] ')'       // tuple
                | '[' [ pattern { ',' pattern } ] ']'       // array
                | range_pattern
-               | ( '&' | '&mut' | 'ref' ) single_pattern   // LEGACY: stripped
+               | ( '&' | '&mut' | 'ref' ) single_pattern   // REJECTED: E106 "ref patterns are not supported"
 
 range_pattern  = ( INT_LITERAL | CHAR_LITERAL ) [ ( '..' | '..=' ) ( INT_LITERAL | CHAR_LITERAL ) ]
 
@@ -689,8 +713,12 @@ field_pattern_list = field_pattern { ',' field_pattern }
 field_pattern  = IDENT [ ':' pattern ]
 ```
 
-The `&` / `&mut` / `ref` pattern prefixes are accepted and discarded
-(`parser.tg:4079-4099`); a mutable binding is written `mut name`.
+The `&` / `&mut` / `ref` pattern binders are **rejected** — the parser
+consumes them and records the E106 diagnostic
+(`parser.tg` `diag_ref_pattern_not_supported`, three sites in
+`parse_single_pattern`); the parse fails, the binder is never silently
+stripped. Pattern bindings are **by value**; a mutable binding is written
+`mut name`.
 
 ## 6. Statements
 
@@ -739,26 +767,36 @@ literals are retained; other tokens are skipped) — `parser.tg` `parse_attribut
 Common attributes: `@derive(...)`, `@test`, `@bench`, `@inline`,
 `@budget(...)`, `@intrinsic(...)`, etc.
 
-## 8. Legacy Normalization Summary
+## 8. Legacy Forms Summary
+
+### Accepted aliases (normalized)
 
 | Feature                          | Legacy spelling | Implemented canonical form |
 |----------------------------------|-----------------|----------------------------|
 | Mutable local                    | `mut x = e`     | `var x = e` (or `let mut x = e`) |
-| `sink` parameter                 | `move x`, `own x` | `sink x`                 |
-| `inout` parameter                | `mut x`, `&mut x` | `inout x`                |
-| `let` parameter                  | `&x`, `x: &T`   | `x`                       |
-| Reference parameter type         | `x: &T`         | `x: T` with `let`         |
-| Mutable reference parameter type | `x: &mut T`     | `x: T` with `inout`       |
-| Safe reference type              | `&T`, `&mut T`  | **hard error E106** — rejected in type position; only the parameter access conventions (`x: &T`, `self: &Self`) are accepted |
-| Mutable receiver                 | `&mut self`     | trailing `inout` (or `inout self`) |
 | Function keyword                 | `fn`            | `def`                     |
 | Module keyword                   | `mod`           | `module`                  |
 | Continue keyword                 | `continue`      | `next` (both accepted)    |
 | Type alias keyword               | `typealias`, `alias` | `type`              |
 
-There are no safe reference types in the language; `&T` / `&mut T` in type
-position are rejected with E106 and survive only as the parameter access
-conventions described in §2.3 and §3.
+### Rejected legacy forms (hard errors — no normalization)
+
+| Feature                          | Legacy spelling | Result |
+|----------------------------------|-----------------|--------|
+| `sink` parameter                 | `move x`, `own x` | **E100** — "legacy parameter spelling … is removed"; write `sink x` |
+| `inout` parameter                | `mut x`, `&mut x` | **E100**; write `inout x` |
+| `let` parameter                  | `&x`, `x: &T`   | **E100**; write `x` (default `let`) |
+| Mutable reference parameter type | `x: &mut T`     | **E100**; write `inout x: T` |
+| Reference receiver               | `&self`, `&mut self` | **E100**; write `self`, `inout self`, or trailing `inout` |
+| fn-type convention               | `fn(&T)`, `fn(mut T)`, `fn(move T)` | **E100**; write `fn(inout T)` / `fn(sink T)` / `fn(set T)` |
+| Safe reference type              | `&T`, `&mut T`, `&&T` in general type positions | **E106** — rejected by `parse_type`; the only `&` type forms are the `__intrinsic_`-scoped extern ABI positions (typed `RefInternal`) and the `&place` call-argument markers |
+| Ref pattern binder               | `ref x`, `&x` in a pattern | **E106** — "ref patterns are not supported"; bind by value |
+
+There are no safe reference types in the language. `&T` / `&mut T` in type
+position are rejected (E106 in general positions, E100 at the parameter
+spelling sites described in §2.3 and §3) and survive only as the
+`__intrinsic_`-scoped extern-ABI exception and the `&place` call-argument
+access markers.
 
 ## See Also
 

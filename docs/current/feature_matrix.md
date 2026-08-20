@@ -2,6 +2,9 @@
 
 > Honest feature comparison: Tangerine vs Rust, derived from the executable
 > state of the self-hosted compiler, not from declared module surfaces.
+> Statuses are those of the [**Feature Registry**](feature_registry.md) —
+> the single source of truth for one-status-per-feature. Where this
+> document and the registry disagree, the registry wins.
 
 ## Legend — status definitions
 
@@ -19,9 +22,14 @@
 "Bootstrap closure" below means the 37 files in
 `bootstrap/compiler_kernel.manifest` (14 std modules + the compiler kernel)
 that the stage0→stage1 ladder compiles. Everything outside the closure is
-**API-only** until it parses and type-checks under the current compiler
-(the E106 migration of the non-kernel stdlib is in progress — see
-[`stdlib_reference.md`](stdlib_reference.md) §Completeness).
+**API-only** until it passes per-module native test suites. The E106
+migration of the non-kernel stdlib is **COMPLETE** (2026-08-20): every
+shipped `std/*.tg` module (all 133) is parse-clean under the current
+grammar, enforced by the two-layer gate
+(`tests/run_stdlib_e106_sweep.sh` — `tg check` zero-diagnostics + the
+forbidden-syntax grep backstop), a **required CI job** (`stdlib-e106-sweep`
+in `.github/workflows/ci.yml`); see
+[`stdlib_reference.md`](stdlib_reference.md) §Completeness.
 
 ---
 
@@ -30,8 +38,8 @@ that the stage0→stage1 ladder compiles. Everything outside the closure is
 | Feature | Tangerine | Rust | Status basis |
 |---------|-----------|------|-------------|
 | Ownership (access conventions, resources, capabilities) | implemented+tested | ✅ | resource_check.tg dataflow + capability machinery; `tests/canary_neg`, `canary_capability.tg`; the self-hosted compiler |
-| Borrowing (`&T` first-class references) | unsupported | ✅ | no first-class reference types; `&T`/`&mut T` in type position is the E106 hard error (parser.tg `parse_type`) |
-| Lifetimes | unsupported | ✅ | no lifetime system exists; the borrow/lifetime model was removed by design (see `../history/access_resource_migration.md`) |
+| Borrowing (`&T` first-class references) | unsupported | ✅ | no first-class reference types: `&T`/`&mut T` in a general type position is the E106 hard error (parser.tg `parse_type`); the legacy parameter spellings (`mut x:`/`&x:`/`&mut x:`/`move x:`/`own x:` prefixes, `x: &T` markers, `fn(&T)` conventions, `&self` receivers) are E100 (parser.tg `parse_param`/`parse_fn_type_param`); enforced by the grammar gate and the sweep backstop |
+| Lifetimes | unsupported | ✅ | no lifetime system exists; the borrow/lifetime model was removed by design (see `../history/access_resource_migration.md` and `../history/safe_reference_types_deprecated.md`) |
 | Move semantics (`sink`, `move`) | implemented+tested | ✅ | access/resource model; `tests/canary_neg` move/consume negatives |
 | Zero-cost abstractions | implemented-unverified | ✅ | trait system + generics + monomorphization exist; no benchmark evidence for the claim |
 | Algebraic data types | implemented+tested | ✅ | `enum` + pattern matching; exercised by the compiler itself |
@@ -64,7 +72,7 @@ that the stage0→stage1 ladder compiles. Everything outside the closure is
 
 | Feature | Tangerine | Rust | Status basis |
 |---------|-----------|------|-------------|
-| `std/web`, `std/web_ext`, `std/http`, `std/http2`, `std/websocket`, `std/url`, `std/net` | API-only | ✅ | declared; none in the bootstrap closure; web.tg/http.tg still carry `-> &T`-style type positions (E106-pending) |
+| `std/web`, `std/web_ext`, `std/http`, `std/http2`, `std/websocket`, `std/url`, `std/net` | API-only | ✅ | declared; none in the bootstrap closure; all E106-migrated (parse-clean per the two-layer sweep) |
 | `std/json`, `std/toml`, `std/cbor`, `std/msgpack`, `std/yaml`, `std/csv`, `std/serde` | API-only | ✅ | declared; not in the bootstrap closure |
 | `std/db`, `std/sql`, `std/postgres`, `std/sqlite` | API-only | ✅ | declared; not in the bootstrap closure |
 | `std/opentelemetry` | API-only | ✅ | declared; not in the bootstrap closure |
@@ -76,7 +84,7 @@ that the stage0→stage1 ladder compiles. Everything outside the closure is
 |---------|-----------|------|-------------|
 | WASM compile target | API-only | ✅ | `wasm_target.tg` builds WASM sections, but nothing calls it: no `--target wasm32*` route in driver.tg/codegen.tg, no tests |
 | WASI support | unsupported | ✅ | no WASI runtime |
-| `std/wasm`, `std/wasm_js` | API-only | ✅ | declared; not in the bootstrap closure; wasm.tg still carries `-> &T`-style positions (E106-pending) |
+| `std/wasm`, `std/wasm_js` | API-only | ✅ | declared; not in the bootstrap closure; E106-migrated (parse-clean per the two-layer sweep) |
 
 ## IV. Graphics & GPU
 
@@ -91,14 +99,15 @@ that the stage0→stage1 ladder compiles. Everything outside the closure is
 
 "Complete" requires every public module to parse, type-check, compile, link
 and pass native tests on every advertised Tier-1 target. That is NOT the
-current state: the E106 migration of the non-kernel modules is in progress
-(see [`stdlib_reference.md`](stdlib_reference.md) §Completeness for the
-pending list).
+current state: the E106 migration is COMPLETE (every shipped module is
+parse-clean — the two-layer sweep is a required CI job), but the non-kernel
+modules remain **API-only** until they pass per-module native test suites
+(see [`stdlib_reference.md`](stdlib_reference.md) §Completeness).
 
 | Category | Modules | Status |
 |----------|---------|--------|
 | Core types | `core`, `ops`-level primitives | implemented+tested — `core` is in the bootstrap closure and the compiler is self-hosted on it |
-| Collections | `collections` | implemented-unverified — in the bootstrap closure; the record-visit `Option[&K]` extern signatures (working tree) are the kernel's last reference type positions (extern-ABI exception only; see `stdlib_reference.md` §Completeness) |
+| Collections | `collections` | implemented-unverified — in the bootstrap closure; the record-visit `Option[&K]` extern signatures are the kernel's only reference type positions (the documented `__intrinsic_` extern-ABI exception, not a migration remainder; see `stdlib_reference.md` §Completeness) |
 | Kernel closure std | `alloc`, `args`, `bench`, `core`, `env`, `ffi`, `fmt`, `fs`, `gfx_errors`, `io`, `process`, `taint`, `time`, `collections` | implemented-unverified — compile in every bootstrap stage; no per-module native test evidence |
 | String handling | `string` (core), `regex` | partial — owned-String ABI implemented+tested; `regex` is API-only (not in the bootstrap closure) |
 | I/O | `io`, `fs`, `path`, `net` | partial — `io`/`fs` in the closure; `path`/`net` API-only |
@@ -117,7 +126,7 @@ pending list).
 | Logging | `log` | API-only |
 | Testing | `test` | API-only — the native test runner is the bootstrap harness, not `std::test` |
 | FFI | `ffi` | implemented-unverified — in the bootstrap closure |
-| Contracts/capabilities/effects/budgets | `contracts`, `capabilities`, `effects`, `budget` | partial — `capabilities` enforced by resource_check.tg; `effects`/`budget` are API-only (never lowered); none in the bootstrap closure |
+| Contracts/capabilities/effects/budgets | `contracts`, `capabilities`, `effects`, `budget` | partial — registry rows: contracts and capabilities are implemented+tested (unconditional); `effects`/`budget` are API-only (never lowered); none in the bootstrap closure |
 
 ## VI. Backend / Target Status
 
@@ -137,7 +146,7 @@ pending list).
 | Syntax highlighting | implemented-unverified | ✅ | TextMate grammar present |
 | Code formatting | implemented+tested | ✅ | `tg fmt` (formatter.tg) |
 | Linting | partial | ✅ | `tg lint` (linter.tg) is a separate subcommand; lint rules are not part of the compile pipeline |
-| Test runner | partial | ✅ | `tg test` (cmd_test); the authoritative gate is the bootstrap harness |
+| Test runner | implemented-unverified | ✅ | `tg test` (cmd_test) distinguishes pass/fail/zero-tests/parse-error/implicit-skip; the P0 gate `tests/run_test_runner_integrity.sh` encodes that contract (registered, not executed); the authoritative gate is the bootstrap harness |
 | Package manager | partial | ✅ | `tg dep` / `tg install` (pkg_manager.tg); registry operations are local |
 | REPL | design | ❌ | `tg repl` listed; no implementation |
 | Documentation generator | implemented-unverified | ✅ | `tg doc` (docgen.tg) |
@@ -147,6 +156,7 @@ pending list).
 
 | Document | Status | Path |
 |----------|--------|------|
+| Feature registry | current — the single status authority | `docs/current/feature_registry.md` |
 | Language reference | current | `docs/current/language.md` |
 | Style guide | current | `docs/current/style_guide.md` |
 | Memory model | current | `docs/current/memory_model.md` |
@@ -155,9 +165,12 @@ pending list).
 | Stdlib reference | current | `docs/current/stdlib_reference.md` |
 | Stabilized layout subset | current | `docs/current/stabilized_subset.md` |
 | Access/resource migration | NON-NORMATIVE history | `docs/history/access_resource_migration.md` |
+| Safe reference types (`&T`/`&mut T`) — removed dialect | NON-NORMATIVE history | `docs/history/safe_reference_types_deprecated.md` |
 | Frozen layout features (old Map header data) | NON-NORMATIVE history | `docs/history/frozen_layout_features.md` |
 
 ---
 
-*Last updated: 2026-08 · working tree commit 65dfe07 + the ref/allocator/
-verifier work (docs reconciled with the executable state)*
+*Last updated: 2026-08 · working tree commit a14eeca + the round-9 work
+(closure migration complete, self-host grammar gate, two-layer stdlib gate
+in required CI, FFI audit, atomics/allocator, verifier lattice, @cfg pass;
+docs reconciled with the executable state)*

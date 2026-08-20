@@ -1800,6 +1800,15 @@ end
 #
 # Returns true if the call was intercepted and emitted inline; false otherwise.
 def try_emit_atomic_builtin(inout ctx: CodegenCtx, name: String) -> Bool
+  # The compiler/runtime atomic intrinsics — the ONE atomic authority.
+  # std::atomic AND std::sync route every atomic operation through the
+  # __intrinsic_atomic_* family (emit_atomic_intrinsic below — the inline
+  # LDAR/STLR/LSE atomics on AArch64, the LOCKed xchg/xadd/cmpxchg on
+  # x86). A fence does NOT turn a non-atomic access into an atomic one,
+  # so the fence-around-ordinary-access pattern is never the authority.
+  if name.starts_with("__intrinsic_atomic_") then
+    return emit_atomic_intrinsic(ctx, &name)
+  end
   match ctx.target.arch
   when Arch::AArch64 then
     if name == "__sync_synchronize" then
@@ -1852,9 +1861,494 @@ def try_emit_atomic_builtin(inout ctx: CodegenCtx, name: String) -> Bool
     else
       false
     end
+  when Arch::X86_64 then
+    # x86-64 __sync_* builtins: TSO makes plain MOVs acquire/release; the
+    # RMW/CAS family uses the LOCKed forms (xadd/xchg/cmpxchg) and the
+    # fence is MFENCE. AArch64 and x86 now share the same __sync_*
+    # surface, so the allocator/Rc/Arc code compiles on both arches.
+    if name == "__sync_synchronize" then
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xAE)
+      emit8(&mut ctx.text, 0xF0)   # mfence
+      true
+    else if name == "__sync_bool_compare_and_swap_1" then
+      # rdi = ptr, rsi = expected (by value), rdx = desired
+      let lbl_fail = ".Lsync_cas1_fail." + ctx.fn_counter.to_string()
+      let lbl_done = ".Lsync_cas1_done." + ctx.fn_counter.to_string()
+      ctx.fn_counter = ctx.fn_counter + 1
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov eax, esi
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xB0)
+      emit8(&mut ctx.text, 0x17)   # lock cmpxchg byte [rdi], dl
+      x64_jcc(&mut ctx.text, CC::NE, lbl_fail.clone())
+      x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+      x64_jmp(&mut ctx.text, lbl_done.clone())
+      def_label(&mut ctx.text, lbl_fail.clone())
+      x64_xor_rr(&mut ctx.text, X64::RAX, X64::RAX)
+      def_label(&mut ctx.text, lbl_done.clone())
+      true
+    else if name == "__sync_val_compare_and_swap_4" || name == "__sync_val_compare_and_swap_uint" then
+      # 32-bit CAS: rax = expected; lock cmpxchg leaves the old value in rax.
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov eax, esi
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xB1)
+      emit8(&mut ctx.text, 0x17)   # lock cmpxchg [rdi], edx
+      true
+    else if name == "__sync_val_compare_and_swap_8" then
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov rax, rsi
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xB1)
+      emit8(&mut ctx.text, 0x17)   # lock cmpxchg [rdi], rdx
+      true
+    else if name == "__sync_fetch_and_add_4" then
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xC1)
+      emit8(&mut ctx.text, 0x37)   # lock xadd [rdi], esi
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov eax, esi (old)
+      true
+    else if name == "__sync_fetch_and_add_8" || name == "__sync_fetch_and_add" then
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xC1)
+      emit8(&mut ctx.text, 0x37)   # lock xadd [rdi], rsi
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov rax, rsi (old)
+      true
+    else if name == "__sync_fetch_and_sub_4" then
+      x64_neg_r(&mut ctx.text, X64::RSI)
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xC1)
+      emit8(&mut ctx.text, 0x37)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)
+      true
+    else if name == "__sync_fetch_and_sub_8" || name == "__sync_fetch_and_sub" then
+      x64_neg_r(&mut ctx.text, X64::RSI)
+      emit8(&mut ctx.text, 0xF0)
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0xC1)
+      emit8(&mut ctx.text, 0x37)
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)
+      true
+    else if name == "__sync_lock_test_and_set_4" then
+      emit8(&mut ctx.text, 0x87)
+      emit8(&mut ctx.text, 0x37)   # xchg [rdi], esi (implicitly locked)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)   # mov eax, esi (old)
+      true
+    else if name == "__sync_lock_test_and_set_8" then
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x87)
+      emit8(&mut ctx.text, 0x37)
+      emit8(&mut ctx.text, 0x48)
+      emit8(&mut ctx.text, 0x89)
+      emit8(&mut ctx.text, 0xF0)
+      true
+    else
+      false
+    end
   when _ then
     false
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The compiler/runtime atomic intrinsics — the ONE atomic authority
+# ———————————————————————————————————————————————————————————————
+# Every atomic operation in the std (std::atomic's AtomicBool/Int/UInt/
+# U8/U64/Ptr AND std::sync's AtomicBool/U32/U64/Ptr) routes through the
+# __intrinsic_atomic_* family emitted here — the load/store/RMW/CAS/
+# fence per width 1/2/4/8 on both arches. These inline instructions ARE
+# the atomicity; a fence around an ordinary access is never used.
+#
+# Name shape: __intrinsic_atomic_<op>_u<width> with width 8/16/32/64
+# (bits) and op in { load, store, exchange, compare_exchange, fetch_add,
+# fetch_sub, fetch_and, fetch_or, fetch_xor, add_fetch, sub_fetch,
+# and_fetch, or_fetch, xor_fetch }; __intrinsic_atomic_fence is the
+# memory fence.
+#
+# ABI: the general call machinery has already loaded the args into the
+# argument registers — x0/rdi = ptr, x1/rsi = value (or order for load),
+# x2/rdx = order/desired, x3/rcx = weak, x4/r8 = success_order, x5/r9 =
+# failure_order. Order codes (ordering_to_c in std::atomic): 0 = Relaxed
+# ... 5 = SeqCst. The emitters use the strongest form unconditionally
+# (acquire-release / LOCKed) — correct for every ordering. The
+# compare_exchange `expected` argument is the ADDRESS of the expected
+# slot (in/out: the current value is written back on failure).
+def emit_atomic_intrinsic(inout ctx: CodegenCtx, name: String) -> Bool
+  let (op, width) = atomic_intrinsic_op_and_width(name)
+  match ctx.target.arch
+  when Arch::AArch64 then emit_atomic_intrinsic_a64(ctx, &op, width)
+  when Arch::X86_64  then emit_atomic_intrinsic_x64(ctx, &op, width)
+  when _ then ()
+  end
+  true
+end
+
+# Parse "__intrinsic_atomic_<op>_u<width>" -> (op, width-bytes); the
+# fence (no width suffix) returns width 0.
+def atomic_intrinsic_op_and_width(name: String) -> (String, Int)
+  let prefix = "__intrinsic_atomic_"
+  if !name.starts_with(prefix) then
+    return ("", 0)
+  end
+  var rest = name.slice(prefix.len(), name.len())
+  match rest.find("_u")
+  when Option::Some(pos) then
+    let op = rest.slice(0, pos)
+    let wstr = rest.slice(pos + 2, rest.len())
+    let width = match wstr
+    when "8" then 1
+    when "16" then 2
+    when "32" then 4
+    when "64" then 8
+    when _ then 0
+    end
+    (op, width)
+  when Option::None then
+    (rest, 0)
+  end
+end
+
+# Size-scaled AArch64 atomic encodings (size in bits [31:30]).
+def a64_ldar_enc(width: Int) -> u32
+  match width
+  when 1 then 0x08DFFC00
+  when 2 then 0x48DFFC00
+  when 4 then 0x88DFFC00
+  when 8 then 0xC8DFFC00
+  when _ then 0x00000000
+  end
+end
+
+def a64_stlr_enc(width: Int) -> u32
+  match width
+  when 1 then 0x001F7C00
+  when 2 then 0x401F7C00
+  when 4 then 0x801F7C00
+  when 8 then 0xC01F7C00
+  when _ then 0x00000000
+  end
+end
+
+def a64_ldaddal_enc(width: Int) -> u32
+  match width
+  when 1 then 0x38E00000
+  when 2 then 0x78E00000
+  when 4 then 0xB8E00000
+  when 8 then 0xF8E00000
+  when _ then 0x00000000
+  end
+end
+
+def a64_ldclral_enc(width: Int) -> u32
+  match width
+  when 1 then 0x38E01000
+  when 2 then 0x78E01000
+  when 4 then 0xB8E01000
+  when 8 then 0xF8E01000
+  when _ then 0x00000000
+  end
+end
+
+def a64_ldeoral_enc(width: Int) -> u32
+  match width
+  when 1 then 0x38E02000
+  when 2 then 0x78E02000
+  when 4 then 0xB8E02000
+  when 8 then 0xF8E02000
+  when _ then 0x00000000
+  end
+end
+
+def a64_ldsetal_enc(width: Int) -> u32
+  match width
+  when 1 then 0x38E03000
+  when 2 then 0x78E03000
+  when 4 then 0xB8E03000
+  when 8 then 0xF8E03000
+  when _ then 0x00000000
+  end
+end
+
+def a64_swpal_enc(width: Int) -> u32
+  match width
+  when 1 then 0x38E08000
+  when 2 then 0x78E08000
+  when 4 then 0xB8E08000
+  when 8 then 0xF8E08000
+  when _ then 0x00000000
+  end
+end
+
+def a64_casal_enc(width: Int) -> u32
+  match width
+  when 1 then 0x08E0FC00
+  when 2 then 0x48E0FC00
+  when 4 then 0x88E0FC00
+  when 8 then 0xC8E0FC00
+  when _ then 0x00000000
+  end
+end
+
+# Move the RMW result out of the scratch register (64-bit for width 8,
+# 32-bit zero-extending move otherwise — the LSE ops zero-extend bytes/
+# halfwords/words into the W register).
+def a64_emit_mov_result(inout ctx: CodegenCtx, width: Int, src: A64) -> Unit
+  if width == 8 then
+    a64_mov_rr(&mut ctx.text, A64::X0, src)
+  else
+    a64_mov_w_rr(&mut ctx.text, A64::X0, src)
+  end
+end
+
+def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
+  match op
+  when "fence" then
+    a64_dmb_ish(&mut ctx.text)
+  when "load" then
+    # LDAR (acquire) — correct for every ordering (Relaxed is served
+    # stronger, never weaker).
+    emit32_le(&mut ctx.text, a64_ldar_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X0))
+  when "store" then
+    # STLR (release) with the value in x1.
+    emit32_le(&mut ctx.text, a64_stlr_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X1))
+  when "exchange" then
+    # SWPAL w1, w9, [x0] — old value in w9.
+    emit32_le(&mut ctx.text, a64_swpal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "fetch_add" then
+    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "fetch_sub" then
+    # The subtraction is the atomic add of -v.
+    if width == 8 then
+      a64_neg(&mut ctx.text, A64::X8, A64::X1)
+    else
+      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)
+    end
+    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "fetch_and" then
+    emit32_le(&mut ctx.text, a64_ldclral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "fetch_or" then
+    emit32_le(&mut ctx.text, a64_ldsetal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "fetch_xor" then
+    emit32_le(&mut ctx.text, a64_ldeoral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "add_fetch" then
+    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    # new = old + val (the dest store truncates to the width).
+    a64_add_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "sub_fetch" then
+    if width == 8 then
+      a64_neg(&mut ctx.text, A64::X8, A64::X1)
+    else
+      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)
+    end
+    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_sub_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "and_fetch" then
+    emit32_le(&mut ctx.text, a64_ldclral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_and_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "or_fetch" then
+    emit32_le(&mut ctx.text, a64_ldsetal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_orr_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "xor_fetch" then
+    emit32_le(&mut ctx.text, a64_ldeoral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    a64_eor_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "compare_exchange" then
+    # x0 = ptr, x1 = &expected, x2 = desired. The expected VALUE is
+    # loaded from [x1]; on failure the current value is written back.
+    let lbl_fail = ".Latomic_cas_fail." + ctx.fn_counter.to_string()
+    let lbl_done = ".Latomic_cas_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    match width
+    when 1 then a64_ldrb(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 2 then a64_ldrh(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 4 then a64_ldr_w(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 8 then a64_ldr(&mut ctx.text, A64::X8, A64::X1, 0)
+    end
+    if width == 8 then
+      a64_mov_rr(&mut ctx.text, A64::X10, A64::X8)
+      a64_mov_rr(&mut ctx.text, A64::X9, A64::X2)
+    else
+      a64_mov_w_rr(&mut ctx.text, A64::X10, A64::X8)
+      a64_mov_w_rr(&mut ctx.text, A64::X9, A64::X2)
+    end
+    # casal Xs(w8 = expected), Xt(w9 = desired), [x0]; X8 <- original.
+    emit32_le(&mut ctx.text, a64_casal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    if width == 8 then
+      a64_cmp_rr(&mut ctx.text, A64::X8, A64::X10)
+    else
+      a64_cmp_w(&mut ctx.text, A64::X8, A64::X10)
+    end
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_fail.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 1)
+    a64_b(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_fail.clone())
+    match width
+    when 1 then a64_strb(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 2 then a64_strh(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 4 then a64_str_w(&mut ctx.text, A64::X8, A64::X1, 0)
+    when 8 then a64_str(&mut ctx.text, A64::X8, A64::X1, 0)
+    end
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+    def_label(&mut ctx.text, lbl_done.clone())
+  when _ then
+    ()
+  end
+end
+
+def emit_atomic_intrinsic_x64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
+  # x86-64: arg regs rdi..r9. Loads/stores are plain MOVs (TSO: loads
+  # are acquire, stores are release); the RMW/CAS family uses the LOCKed
+  # forms (seq-cst strength); the fence is MFENCE.
+  match op
+  when "fence" then
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xAE)
+    emit8(&mut ctx.text, 0xF0)   # mfence
+  when "load" then
+    match width
+    when 1 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB6); emit8(&mut ctx.text, 0x07)  # movzx eax, byte [rdi]
+    when 2 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB7); emit8(&mut ctx.text, 0x07)  # movzx eax, word [rdi]
+    when 4 then emit8(&mut ctx.text, 0x8B); emit8(&mut ctx.text, 0x07)                              # mov eax, [rdi]
+    when 8 then x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)
+    end
+  when "store" then
+    # xchg [rdi], rsi — the implicitly-locked exchange: a seq-cst store
+    # with a full barrier (the discarded old value lands in rsi).
+    match width
+    when 1 then emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x86); emit8(&mut ctx.text, 0x37)  # xchg byte [rdi], sil
+    when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    when 4 then emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    end
+  when "exchange" then
+    match width
+    when 1 then emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x86); emit8(&mut ctx.text, 0x37)
+    when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    when 4 then emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x87); emit8(&mut ctx.text, 0x37)
+    end
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RSI)   # old value
+  when "fetch_add" then
+    emit_x64_lock_xadd(ctx, width)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RSI)   # old value
+  when "fetch_sub" then
+    x64_neg_r(&mut ctx.text, X64::RSI)
+    emit_x64_lock_xadd(ctx, width)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RSI)
+  when "fetch_and" | "fetch_or" | "fetch_xor" then
+    # CAS retry loop: cur = [rdi]; new = cur OP val; lock cmpxchg.
+    # On exit rax = the old value (the compare operand).
+    emit_x64_rmw_cas_loop(ctx, width, &op)
+  when "add_fetch" then
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RSI)   # keep val
+    emit_x64_lock_xadd(ctx, width)                  # rsi = old
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RSI)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RCX)   # new = old + val
+  when "sub_fetch" then
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RSI)   # keep val
+    x64_neg_r(&mut ctx.text, X64::RSI)
+    emit_x64_lock_xadd(ctx, width)                  # rsi = old
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RSI)
+    x64_sub_rr(&mut ctx.text, X64::RAX, X64::RCX)   # new = old - val
+  when "and_fetch" | "or_fetch" | "xor_fetch" then
+    # The CAS loop leaves the NEW value in rcx.
+    emit_x64_rmw_cas_loop(ctx, width, &op)
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RCX)
+  when "compare_exchange" then
+    # rdi = ptr, rsi = &expected, rdx = desired. The expected VALUE is
+    # loaded from [rsi]; on failure the current value is written back.
+    let lbl_fail = ".Latomic_cas_fail." + ctx.fn_counter.to_string()
+    let lbl_done = ".Latomic_cas_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    match width
+    when 1 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB6); emit8(&mut ctx.text, 0x06)  # movzx eax, byte [rsi]
+    when 2 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB7); emit8(&mut ctx.text, 0x06)  # movzx eax, word [rsi]
+    when 4 then emit8(&mut ctx.text, 0x8B); emit8(&mut ctx.text, 0x06)                              # mov eax, [rsi]
+    when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x8B); emit8(&mut ctx.text, 0x06)  # mov rax, [rsi]
+    end
+    match width
+    when 1 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB0); emit8(&mut ctx.text, 0x17)  # lock cmpxchg byte [rdi], dl
+    when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x17)
+    when 4 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x17)
+    when 8 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x17)
+    end
+    x64_jcc(&mut ctx.text, CC::NE, lbl_fail.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+    x64_jmp(&mut ctx.text, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_fail.clone())
+    match width
+    when 1 then emit8(&mut ctx.text, 0x88); emit8(&mut ctx.text, 0x06)  # mov byte [rsi], al
+    when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x06)
+    when 4 then emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x06)
+    when 8 then emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x89); emit8(&mut ctx.text, 0x06)
+    end
+    x64_xor_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    def_label(&mut ctx.text, lbl_done.clone())
+  when _ then
+    ()
+  end
+end
+
+# lock xadd [rdi], rsi — rsi receives the old value.
+def emit_x64_lock_xadd(inout ctx: CodegenCtx, width: Int) -> Unit
+  match width
+  when 1 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x40); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xC0); emit8(&mut ctx.text, 0x37)  # lock xadd byte [rdi], sil
+  when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xC1); emit8(&mut ctx.text, 0x37)
+  when 4 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xC1); emit8(&mut ctx.text, 0x37)
+  when 8 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xC1); emit8(&mut ctx.text, 0x37)
+  end
+end
+
+# CAS retry loop for the logical RMWs (and/or/xor). rax holds the old
+# value on exit; rcx holds the new value (for the *_fetch forms).
+def emit_x64_rmw_cas_loop(inout ctx: CodegenCtx, width: Int, op: String) -> Unit
+  let lbl_loop = ".Latomic_rmw_loop." + ctx.fn_counter.to_string()
+  ctx.fn_counter = ctx.fn_counter + 1
+  def_label(&mut ctx.text, lbl_loop.clone())
+  match width
+  when 1 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB6); emit8(&mut ctx.text, 0x07)  # movzx eax, byte [rdi]
+  when 2 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB7); emit8(&mut ctx.text, 0x07)
+  when 4 then emit8(&mut ctx.text, 0x8B); emit8(&mut ctx.text, 0x07)
+  when 8 then x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)
+  end
+  x64_mov_rr(&mut ctx.text, X64::RCX, X64::RAX)
+  if op == "fetch_and" || op == "and_fetch" then
+    x64_and_rr(&mut ctx.text, X64::RCX, X64::RSI)
+  elsif op == "fetch_or" || op == "or_fetch" then
+    x64_or_rr(&mut ctx.text, X64::RCX, X64::RSI)
+  else
+    x64_xor_rr(&mut ctx.text, X64::RCX, X64::RSI)
+  end
+  match width
+  when 1 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB0); emit8(&mut ctx.text, 0x0F)  # lock cmpxchg byte [rdi], cl
+  when 2 then emit8(&mut ctx.text, 0x66); emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x0F)
+  when 4 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x0F)
+  when 8 then emit8(&mut ctx.text, 0xF0); emit8(&mut ctx.text, 0x48); emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB1); emit8(&mut ctx.text, 0x0F)
+  end
+  x64_jcc(&mut ctx.text, CC::NE, lbl_loop.clone())
 end
 
 # CALL reg (indirect)
@@ -16696,6 +17190,26 @@ def emit_allocator_runtime_data(inout ctx: CodegenCtx) -> Unit
   })
   def_label(&mut ctx.data, "_tg_alloc_fail_next".to_string())
   emit64_le(&mut ctx.data, 0)
+
+  # _tg_alloc_locks (13 × 1 byte — one spin-lock per size class,
+  # initialized to 0 = unlocked). _tg_alloc_lock/_tg_alloc_unlock (the
+  # runtime pair) serialize the per-class free-list head pop/push so two
+  # threads churning the same class never race the same head slot.
+  let locks_off = buf_pos(&ctx.data)
+  add_symbol(&mut ctx.data, AsmSymbol {
+    name: "_tg_alloc_locks".to_string(),
+    section: Section::Data,
+    offset: locks_off,
+    size: 13,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut ctx.data, "_tg_alloc_locks".to_string())
+  var lock_i = 0
+  while lock_i < 13 do
+    emit8(&mut ctx.data, 0)
+    lock_i = lock_i + 1
+  end
 end
 
 # Emit code at the start of main() to save the ABI-provided argc/argv

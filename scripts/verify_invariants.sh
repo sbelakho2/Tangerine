@@ -380,8 +380,8 @@ else
   report G11.2a "zero crate.modules.entries() scans in lookup modules (found in:$scan_bad)" FAIL
 fi
 
-t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter rebuild and the module-graph dump (compiler_core.tg)" \
-  'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 2'
+t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter rebuild, the module-graph dump, and the @cfg module remap (compiler_core.tg)" \
+  'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 3'
 
 # ———————————————————————————————————————————————————————————————
 # G12 Summary report
