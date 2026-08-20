@@ -1791,12 +1791,62 @@ def emit_call_extern(inout ctx: CodegenCtx, sym: String) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# Extern ABI return normalization (the 32-bit boundary)
+# ———————————————————————————————————————————————————————————————
+# A C function returns `int`/`unsigned int` in the LOW 32 bits of the
+# return register (eax on x86-64, w0 on AArch64). The upper 32 bits are
+# unspecified: x86-64 guarantees only eax, and AArch64 zero-extends
+# w0 -> x0. A C -1 (0xFFFFFFFF in eax/w0) must therefore be explicitly
+# SIGN-extended (I32) — or zero-extended (U32) — before the post-call
+# store, or the caller's `< 0` check / `as Int` widening sees
+# +4294967295 instead of -1. Full-width returns (Int/I64/U64/pointers)
+# are already exact and pass through unchanged; the extension is
+# idempotent for properly-formed values.
+def normalize_extern_return(inout ctx: CodegenCtx, rr: PhysReg, dest_ty: Type) -> Unit
+  match dest_ty
+  when Type::I32 then
+    match ctx.target.arch
+    when Arch::X86_64 then
+      match rr
+      when PhysReg::X64Reg(r) then x64_movsxd(&mut ctx.text, r, r)
+      when _ then ()
+      end
+    when Arch::AArch64 then
+      match rr
+      when PhysReg::A64Reg(r) then a64_sxtw(&mut ctx.text, r, r)
+      when _ then ()
+      end
+    end
+  when Type::U32 then
+    match ctx.target.arch
+    when Arch::X86_64 then
+      match rr
+      when PhysReg::X64Reg(r) then x64_mov_r32(&mut ctx.text, r, r)
+      when _ then ()
+      end
+    when Arch::AArch64 then
+      # Writing w0 zero-extends into x0 on AArch64 — already normalized.
+      ()
+    end
+  when _ then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # GCC __sync_* atomic builtins → inline ARMv8.1 LSE atomics
 # ———————————————————————————————————————————————————————————————
 # These names look like external functions but are actually compiler builtins
 # that must be emitted inline. There is no `__sync_*` symbol in libSystem
 # or any system library. Without inlining, the linker would reject every
 # allocator/Rc/Arc operation.
+#
+# LSE CONTRACT (explicit — see asm.tg's target feature table): the AArch64
+# RMWs emitted below — the LDADDAL/CASAL/SWPAL family — require the ARMv8.1
+# LSE extension. The aarch64 target's contract is LSE-REQUIRED (Apple
+# Silicon, Neoverse, Cortex-A75+ — the modern baseline); a bare ARMv8.0
+# core without LSE is not a supported target. The ldaxr/stlxr LL/SC loops
+# are the FUTURE portable mode (a runtime/target-flag dispatch), not the
+# current emission. x86-64 needs no note: the LOCKed prefix is baseline.
 #
 # Returns true if the call was intercepted and emitted inline; false otherwise.
 def try_emit_atomic_builtin(inout ctx: CodegenCtx, name: String) -> Bool
@@ -1996,6 +2046,12 @@ end
 # discipline. The compare_exchange `expected` argument is the ADDRESS of
 # the expected slot (in/out: the current value is written back on
 # failure).
+#
+# LSE CONTRACT: the AArch64 RMWs (LDADDAL/CASAL/SWPAL — the LSE-al family
+# below) require the ARMv8.1 LSE extension; the aarch64 target's contract
+# is LSE-REQUIRED (see asm.tg's target feature table — the driver's
+# --target documentation). The LL/SC (ldaxr/stlxr) fallback is the future
+# portable mode, not the current emission.
 def emit_atomic_intrinsic(inout ctx: CodegenCtx, name: String) -> Bool
   let (op, width) = atomic_intrinsic_op_and_width(name)
   match ctx.target.arch
@@ -6591,6 +6647,12 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
             emit_call_extern(ctx, resolved_fn_name)
+            # The extern ABI boundary: a C `int` return arrives in the low
+            # 32 bits of the return register (eax/w0) with unspecified
+            # upper bits — normalize (sign/zero-extend) before the
+            # post-call store so a C -1 reads as -1 (see
+            # normalize_extern_return).
+            normalize_extern_return(ctx, rr, &dest_ty)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
  # Function has a compiled body — call it directly. the callee
             # identity flow is verified here — for a generic callee this name is
@@ -10735,6 +10797,12 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
             emit_call_extern(ctx, resolved_fn_name)
+            # The extern ABI boundary: a C `int` return arrives in the low
+            # 32 bits of the return register (eax/w0) with unspecified
+            # upper bits — normalize (sign/zero-extend) before the
+            # post-call store so a C -1 reads as -1 (see
+            # normalize_extern_return).
+            normalize_extern_return(ctx, rr, &dest_ty)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
  # Function has a compiled body — call it directly. the callee
             # identity flow is verified here — for a generic callee this name is
@@ -12174,6 +12242,213 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
   # true so that store is suppressed.
   false
 end
+# ———————————————————————————————————————————————————————————————
+# The per-target syscall identity table (the ONE translation authority)
+# ———————————————————————————————————————————————————————————————
+# The std's syscall wrappers (std/io's sys_read/sys_write and std/fs's
+# raw_*) pass the TG CANONICAL numbers — the Linux x86-64 values
+# (read=0, write=1, open=2, close=3, ...). macOS receives the canonical
+# numbers too (the macOS branches add the BSD offset: +3 for AArch64,
+# +0x2000003 for x86-64, with the pre-adjusted SYS_*_MAC constants).
+#
+# Linux AArch64 uses the asm-generic syscall table whose numbers DIFFER
+# (read=63, write=64, openat=56, close=57, ...) AND whose path-syscall
+# surface is the *at family: a path syscall takes the dirfd FIRST. The
+# canonical identities therefore map to the AArch64 numbers below, and
+# the *at rewrites INSERT the AT_FDCWD (-100) dirfd — plus the extra
+# argument the AArch64 call needs where the x86-64 call has none
+# (fstatat's flags, unlinkat's AT_REMOVEDIR for rmdir). The identity
+# set is the std's used set, enumerated from the std syscall calls
+# (std/io.tg, std/fs.tg) plus mmap/munmap/exit for direct intrinsic
+# callers. UNKNOWN numbers pass through raw — the caller supplies a
+# target-native number directly.
+
+# The canonical → AArch64 argument layout for the *at rewrites:
+#   Direct            — args pass through as-is (the number-only mappings)
+#   PrependFdcwd      — the syscall takes dirfd FIRST (openat, mkdirat,
+#                       unlinkat, readlinkat, fchmodat)
+#   PrependFdcwdFlags0— fstatat also takes the flags argument (= 0 for stat)
+#   RmdirToUnlinkat   — AArch64 has no rmdir: unlinkat(path, AT_REMOVEDIR)
+#   RenameToRenameat  — renameat takes TWO dirfds: (AT_FDCWD, from, AT_FDCWD, to)
+#   SymlinkToSymlinkat— symlinkat takes (target, dirfd, linkpath)
+enum A64SyscallArgLayout
+  Direct
+  PrependFdcwd
+  PrependFdcwdFlags0
+  RmdirToUnlinkat
+  RenameToRenameat
+  SymlinkToSymlinkat
+end
+
+# The canonical (x86-64) identities covered by the aarch64 translation —
+# the std's used set (read, write, open, close, stat, fstat, lseek,
+# getcwd, chdir, rename, mkdir, rmdir, unlink, symlink, readlink, chmod,
+# getdents64, dup, dup2) plus mmap/munmap/exit for direct callers.
+def linux_aarch64_syscall_canonicals() -> Vec[Int]
+  var v = Vec::new()
+  v.push(0)
+  v.push(1)
+  v.push(2)
+  v.push(3)
+  v.push(4)
+  v.push(5)
+  v.push(8)
+  v.push(9)
+  v.push(11)
+  v.push(32)
+  v.push(33)
+  v.push(60)
+  v.push(79)
+  v.push(80)
+  v.push(82)
+  v.push(83)
+  v.push(84)
+  v.push(87)
+  v.push(88)
+  v.push(89)
+  v.push(90)
+  v.push(217)
+  v
+end
+
+# The canonical number → Linux AArch64 syscall number.
+def linux_aarch64_syscall_number(canonical: Int) -> Int
+  match canonical
+  when 0 then 63    # read
+  when 1 then 64    # write
+  when 2 then 56    # open → openat
+  when 3 then 57    # close
+  when 4 then 79    # stat → fstatat
+  when 5 then 80    # fstat
+  when 8 then 62    # lseek
+  when 9 then 222   # mmap
+  when 11 then 215  # munmap
+  when 32 then 23   # dup
+  when 33 then 24   # dup2
+  when 60 then 93   # exit
+  when 79 then 17   # getcwd
+  when 80 then 49   # chdir
+  when 82 then 38   # rename → renameat
+  when 83 then 34   # mkdir → mkdirat
+  when 84 then 35   # rmdir → unlinkat
+  when 87 then 35   # unlink → unlinkat
+  when 88 then 36   # symlink → symlinkat
+  when 89 then 37   # readlink → readlinkat
+  when 90 then 53   # chmod → fchmodat
+  when 217 then 61  # getdents64
+  when _ then canonical  # unknown: pass through raw
+  end
+end
+
+# The canonical number → AArch64 argument layout (the *at rewrites).
+def linux_aarch64_syscall_layout(canonical: Int) -> A64SyscallArgLayout
+  match canonical
+  when 2 then A64SyscallArgLayout::PrependFdcwd        # open → openat
+  when 4 then A64SyscallArgLayout::PrependFdcwdFlags0  # stat → fstatat
+  when 82 then A64SyscallArgLayout::RenameToRenameat
+  when 83 then A64SyscallArgLayout::PrependFdcwd       # mkdir → mkdirat
+  when 84 then A64SyscallArgLayout::RmdirToUnlinkat
+  when 87 then A64SyscallArgLayout::PrependFdcwd       # unlink → unlinkat
+  when 88 then A64SyscallArgLayout::SymlinkToSymlinkat
+  when 89 then A64SyscallArgLayout::PrependFdcwd       # readlink → readlinkat
+  when 90 then A64SyscallArgLayout::PrependFdcwd       # chmod → fchmodat
+  when _ then A64SyscallArgLayout::Direct
+  end
+end
+
+# Emit the Linux AArch64 syscall: x0 holds the canonical number, x1..x6
+# the args. Each known identity compares x0 and branches to its block
+# (x8 = the AArch64 number, then the identity's argument layout); the
+# unknown numbers fall through to the raw passthrough (x8 = x0, args
+# as-is). The *at layouts need NO arg shifting: the args already sit in
+# x1.., so inserting the dirfd is only `mov x0, AT_FDCWD` — except the
+# layouts that also repurpose an existing register (renameat's second
+# dirfd, symlinkat's middle dirfd).
+def codegen_syscall_a64_linux(inout ctx: CodegenCtx, nargs: Int) -> Unit
+  let base = ".Lsyscall_a64l." + ctx.fn_counter.to_string()
+  ctx.fn_counter = ctx.fn_counter + 1
+
+  # The dispatch chain: compare x0 against each canonical number.
+  let canonicals = linux_aarch64_syscall_canonicals()
+  let i = 0
+  while i < canonicals.len() do
+    let c = canonicals[i]
+    a64_cmp_ri(&mut ctx.text, A64::X0, c as u32)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), base + "_id_" + c.to_string())
+    i = i + 1
+  end
+  # Unknown numbers: pass through raw.
+  a64_mov_rr(&mut ctx.text, A64::X8, A64::X0)
+  a64_b(&mut ctx.text, base + "_direct")
+
+  # The identity blocks: load the AArch64 number, branch to the layout.
+  let j = 0
+  while j < canonicals.len() do
+    let c = canonicals[j]
+    def_label(&mut ctx.text, base + "_id_" + c.to_string())
+    a64_mov_ri(&mut ctx.text, A64::X8, linux_aarch64_syscall_number(c) as i64)
+    match linux_aarch64_syscall_layout(c)
+    when A64SyscallArgLayout::Direct then a64_b(&mut ctx.text, base + "_direct")
+    when A64SyscallArgLayout::PrependFdcwd then a64_b(&mut ctx.text, base + "_prepend")
+    when A64SyscallArgLayout::PrependFdcwdFlags0 then a64_b(&mut ctx.text, base + "_flags0")
+    when A64SyscallArgLayout::RmdirToUnlinkat then a64_b(&mut ctx.text, base + "_rmdir")
+    when A64SyscallArgLayout::RenameToRenameat then a64_b(&mut ctx.text, base + "_rename")
+    when A64SyscallArgLayout::SymlinkToSymlinkat then a64_b(&mut ctx.text, base + "_symlink")
+    end
+    j = j + 1
+  end
+
+  # Direct: shift the args down into x0.. (a1→x0, a2→x1, ...).
+  def_label(&mut ctx.text, base + "_direct")
+  a64_mov_rr(&mut ctx.text, A64::X0, A64::X1)
+  a64_mov_rr(&mut ctx.text, A64::X1, A64::X2)
+  a64_mov_rr(&mut ctx.text, A64::X2, A64::X3)
+  if nargs >= 4 then
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X4)
+  end
+  if nargs >= 5 then
+    a64_mov_rr(&mut ctx.text, A64::X4, A64::X5)
+  end
+  if nargs >= 6 then
+    a64_mov_rr(&mut ctx.text, A64::X5, A64::X6)
+  end
+  a64_b(&mut ctx.text, base + "_svc")
+
+  # Prepend the AT_FDCWD dirfd (the *at rewrites): the args already sit
+  # in x1.., so the dirfd lands exactly where the kernel reads it.
+  def_label(&mut ctx.text, base + "_prepend")
+  a64_mov_ri(&mut ctx.text, A64::X0, -100)  # AT_FDCWD
+  a64_b(&mut ctx.text, base + "_svc")
+
+  # fstatat(AT_FDCWD, path, buf, flags=0) — stat's flags argument.
+  def_label(&mut ctx.text, base + "_flags0")
+  a64_mov_ri(&mut ctx.text, A64::X0, -100)  # AT_FDCWD
+  a64_mov_ri(&mut ctx.text, A64::X3, 0)
+  a64_b(&mut ctx.text, base + "_svc")
+
+  # unlinkat(AT_FDCWD, path, AT_REMOVEDIR) — the AArch64 rmdir.
+  def_label(&mut ctx.text, base + "_rmdir")
+  a64_mov_ri(&mut ctx.text, A64::X0, -100)  # AT_FDCWD
+  a64_mov_ri(&mut ctx.text, A64::X2, 0x200) # AT_REMOVEDIR
+  a64_b(&mut ctx.text, base + "_svc")
+
+  # renameat(AT_FDCWD, from, AT_FDCWD, to) — two dirfds.
+  def_label(&mut ctx.text, base + "_rename")
+  a64_mov_ri(&mut ctx.text, A64::X0, -100)  # AT_FDCWD
+  a64_mov_rr(&mut ctx.text, A64::X3, A64::X2)
+  a64_mov_ri(&mut ctx.text, A64::X2, -100)  # AT_FDCWD
+  a64_b(&mut ctx.text, base + "_svc")
+
+  # symlinkat(target, AT_FDCWD, linkpath) — the dirfd sits in the middle.
+  def_label(&mut ctx.text, base + "_symlink")
+  a64_mov_rr(&mut ctx.text, A64::X0, A64::X1)
+  a64_mov_ri(&mut ctx.text, A64::X1, -100)  # AT_FDCWD
+  a64_b(&mut ctx.text, base + "_svc")
+
+  def_label(&mut ctx.text, base + "_svc")
+  a64_svc(&mut ctx.text, 0)
+end
+
 # Args already in ABI registers: arg0=num, arg1=a1, arg2=a2, arg3=a3
 def codegen_syscall(inout ctx: CodegenCtx, nargs: Int) -> Unit
   match ctx.target.arch
@@ -12197,18 +12472,13 @@ def codegen_syscall(inout ctx: CodegenCtx, nargs: Int) -> Unit
       a64_neg(&mut ctx.text, A64::X15, A64::X0)
       a64_csel(&mut ctx.text, A64::X0, A64::X15, A64::X0, a64_cc_cs())
     when OsAbi::Linux then
-      # Linux AArch64: x8=syscall_num, x0=a1, x1=a2, x2=a3, SVC #0
-      # TG canonical numbers match Linux x86_64 but NOT aarch64
-      # For now: emit raw (user must provide correct aarch64 numbers)
-      a64_mov_rr(&mut ctx.text, A64::X8, A64::X0)
-      a64_mov_rr(&mut ctx.text, A64::X0, A64::X1)
-      if nargs >= 2 then
-        a64_mov_rr(&mut ctx.text, A64::X1, A64::X2)
-      end
-      if nargs >= 3 then
-        a64_mov_rr(&mut ctx.text, A64::X2, A64::X3)
-      end
-      a64_svc(&mut ctx.text, 0)
+      # Linux AArch64: x8=syscall_num, x0=a1, x1=a2, x2=a3, ..., SVC #0.
+      # The std passes the TG canonical (x86-64) numbers: the per-target
+      # identity table (linux_aarch64_syscall_number / _layout) translates
+      # them here — the *at rewrites insert the AT_FDCWD dirfd (and the
+      # flags argument where the AArch64 call needs one) — and unknown
+      # numbers pass through raw.
+      codegen_syscall_a64_linux(ctx, nargs)
     when _ then
       a64_brk(&mut ctx.text, 1)
     end

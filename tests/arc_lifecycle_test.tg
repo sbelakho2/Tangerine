@@ -1,0 +1,227 @@
+# tests/arc_lifecycle_test.tg — Arc memory-safety lifecycle suite.
+#
+# The three P0 Arc defects this suite pins:
+#   (1) the unconditional Arc::deref_mut (aliased mutation through a shared
+#       Arc) — replaced by the unique-only get_mut;
+#   (2) the non-consuming try_unwrap that freed the block while the caller's
+#       Arc still owned it (a dangling owner / double-free) — replaced by
+#       the sink-consuming try_unwrap whose success path moves the data out
+#       and NULLS the consumed Arc's ptr;
+#   (3) the last-release path that dealloc'ed the ArcInner WITHOUT running
+#       T's drop glue (Arc[Canary]/Arc[Mutex[Canary]]/Arc[Vec[Canary]] would
+#       leak their contained destructors) — replaced by the typed
+#       destruction (drop_in_place) before the storage release.
+#
+# Every assertion is DELTA-based (drops_since(base)), so the test order
+# never matters. The allocator's live-byte counter (_tg_alloc_outstanding
+# via tg_allocator_outstanding_bytes) is the independent authority for the
+# no-leak / no-double-free checks: Arc allocates through the SAME
+# _tg_mem_alloc/_tg_mem_free runtime the String/Vec buffers use.
+
+use std::core::{Int, String, Unit, Option, Result, Vec, UInt}
+use std::test::*
+use std::sync::{Arc, Mutex}
+
+extern def _tg_mem_alloc(size: UInt) -> Ptr[u8]
+extern def _tg_mem_free(ptr: Ptr[u8], size: UInt) -> Unit
+extern def tg_allocator_outstanding_bytes() -> Int
+
+# The observable destructor counter: Canary's Drop increments this global,
+# so a test can assert EXACTLY how many times the contained destructor ran
+# (zero = leaked, two = double-dropped, one = correct).
+mut CANARY_DROPS: Int = 0
+
+struct Canary
+  id: Int
+end
+
+impl Drop for Canary
+  def drop(inout self: Canary) -> Unit
+    CANARY_DROPS = CANARY_DROPS + 1
+  end
+end
+
+def drops_since(base: Int) -> Int
+  CANARY_DROPS - base
+end
+
+# (a) Last clone drop: the destructor fires exactly once when the final
+# clone is dropped.
+@test
+def test_arc_last_clone_drop_fires_once() -> Unit
+  let base = CANARY_DROPS
+  {
+    let a = Arc::new(Canary { id: 1 })
+    let b = a.clone()
+    drop(a)
+    # One clone remains — nothing is destroyed yet.
+    assert_eq(drops_since(base), 0)
+  }
+  # The scope exit dropped the last clone: the typed destruction ran once.
+  assert_eq(drops_since(base), 1)
+end
+
+# (b) Many clones: still exactly one destruction at the end.
+@test
+def test_arc_many_clones_fire_once() -> Unit
+  let base = CANARY_DROPS
+  let a = Arc::new(Canary { id: 2 })
+  let b = a.clone()
+  let c = a.clone()
+  let d = b.clone()
+  assert_eq(drops_since(base), 0)
+  drop(a)
+  drop(b)
+  assert_eq(drops_since(base), 0)
+  drop(c)
+  drop(d)
+  assert_eq(drops_since(base), 1)
+end
+
+# (c) try_unwrap success: the data is MOVED out — the destructor does NOT
+# run during the unwrap — and fires exactly once when the caller drops the
+# moved-out value.
+@test
+def test_try_unwrap_success_moves_without_destroying() -> Unit
+  let base = CANARY_DROPS
+  let a = Arc::new(Canary { id: 3 })
+  let res = a.try_unwrap()
+  match res
+  when Result::Ok(c) then
+    # The value is intact and was NOT destructed by the unwrap.
+    assert_eq(c.id, 3)
+    assert_eq(drops_since(base), 0)
+    drop(c)
+    assert_eq(drops_since(base), 1)
+  when Result::Err(_) then
+    assert_false(true)
+  end
+end
+
+# (d) try_unwrap failure: the caller's own reference comes back in Err —
+# the refcount is untouched by the failure path — and the destructor fires
+# exactly once when both handles drop.
+@test
+def test_try_unwrap_failure_returns_arc() -> Unit
+  let base = CANARY_DROPS
+  let a = Arc::new(Canary { id: 4 })
+  let b = a.clone()
+  let res = a.try_unwrap()
+  match res
+  when Result::Err(arc) then
+    assert_eq(drops_since(base), 0)
+    drop(arc)
+    drop(b)
+    assert_eq(drops_since(base), 1)
+  when Result::Ok(_) then
+    assert_false(true)
+  end
+end
+
+# (e) Nested destruction: Arc[Mutex[Canary]] — the last Arc release runs
+# the Mutex's own Arc release, whose last release runs Canary's destructor.
+@test
+def test_arc_mutex_nested_destruction_once() -> Unit
+  let base = CANARY_DROPS
+  {
+    let a = Arc::new(Mutex::new(Canary { id: 5 }))
+    let b = a.clone()
+    drop(b)
+    assert_eq(drops_since(base), 0)
+  }
+  assert_eq(drops_since(base), 1)
+end
+
+# (f) Nested generic resources: Arc[Arc[Canary]] destroys the inner Arc's
+# payload once; Arc[Vec[Canary]] destroys each element.
+@test
+def test_arc_of_arc_drops_payload_once() -> Unit
+  let base = CANARY_DROPS
+  {
+    let inner = Arc::new(Canary { id: 6 })
+    let outer = Arc::new(inner)
+    let clone = outer.clone()
+    drop(clone)
+    assert_eq(drops_since(base), 0)
+  }
+  assert_eq(drops_since(base), 1)
+end
+
+@test
+def test_arc_of_vec_drops_each_element() -> Unit
+  let base = CANARY_DROPS
+  {
+    let v = Vec::new()
+    v.push(Canary { id: 7 })
+    v.push(Canary { id: 8 })
+    v.push(Canary { id: 9 })
+    let a = Arc::new(v)
+    let b = a.clone()
+    drop(b)
+    assert_eq(drops_since(base), 0)
+  }
+  assert_eq(drops_since(base), 3)
+end
+
+# (g) get_mut: Some exactly while the Arc is unique, None while any clone
+# lives, Some again after the clone drops. The write-through proves the
+# PtrMut aliases the real inner (the overwritten value's destructor fires).
+@test
+def test_get_mut_unique_only() -> Unit
+  let base = CANARY_DROPS
+  let mut a = Arc::new(Canary { id: 10 })
+  # Unique owner: Some, and the write lands on the inner.
+  match a.get_mut()
+  when Option::Some(p) then
+    *p = Canary { id: 11 }
+  when Option::None then
+    assert_false(true)
+  end
+  # The overwrite dropped the replaced value; the new value is observable
+  # through the shared deref.
+  assert_eq(drops_since(base), 1)
+  assert_eq((*a.deref()).id, 11)
+  # A second clone destroys the uniqueness: both get_mut calls are None.
+  let mut b = a.clone()
+  match a.get_mut()
+  when Option::Some(_) then assert_false(true)
+  when Option::None then ()
+  end
+  match b.get_mut()
+  when Option::Some(_) then assert_false(true)
+  when Option::None then ()
+  end
+  # Uniqueness is restored once the clone drops.
+  drop(b)
+  match a.get_mut()
+  when Option::Some(_) then ()
+  when Option::None then assert_false(true)
+  end
+  drop(a)
+  assert_eq(drops_since(base), 2)
+end
+
+# (h) The UAF guard: a successful try_unwrap consumes the caller's Arc and
+# NULLS its ptr, so the consumed Arc's destructor is a no-op — the freed
+# block is touched exactly once (alloc -> free). The allocator's
+# outstanding-byte counter must return to the baseline: a double-free would
+# subtract the block twice (land below `before`), a leak would stay above.
+@test
+def test_try_unwrap_consumed_arc_no_double_free() -> Unit
+  let base = CANARY_DROPS
+  let before = tg_allocator_outstanding_bytes()
+  let a = Arc::new(Canary { id: 12 })
+  let mid = tg_allocator_outstanding_bytes()
+  assert_true(mid > before)
+  let res = a.try_unwrap()
+  match res
+  when Result::Ok(c) then
+    assert_eq(c.id, 12)
+    assert_eq(drops_since(base), 0)
+    drop(c)
+    assert_eq(drops_since(base), 1)
+  when Result::Err(_) then
+    assert_false(true)
+  end
+  assert_eq(tg_allocator_outstanding_bytes(), before)
+end

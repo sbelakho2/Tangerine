@@ -310,6 +310,7 @@ end
 enum DriverKind
   Sqlite
   Postgres
+  Mysql
 end
 
 impl Statement
@@ -317,6 +318,7 @@ impl Statement
     match self.driver
     when DriverKind::Sqlite then sqlite_stmt_execute(self, params)
     when DriverKind::Postgres then postgres_stmt_execute(self, params)
+    when DriverKind::Mysql then mysql_stmt_run(self, params)
     end
   end
   
@@ -324,6 +326,7 @@ impl Statement
     match self.driver
     when DriverKind::Sqlite then sqlite_stmt_query(self, params)
     when DriverKind::Postgres then postgres_stmt_query(self, params)
+    when DriverKind::Mysql then mysql_stmt_query(self, params)
     end
   end
   
@@ -331,6 +334,7 @@ impl Statement
     match self.driver
     when DriverKind::Sqlite then sqlite_stmt_finalize(self)
     when DriverKind::Postgres then postgres_stmt_finalize(self)
+    when DriverKind::Mysql then mysql_stmt_finalize(self)
     end
   end
 end
@@ -371,6 +375,7 @@ impl Transaction
     match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, sql, params)
     when DriverKind::Postgres then postgres_execute_raw(self.conn_handle, sql, params)
+    when DriverKind::Mysql then mysql_execute_raw(self.conn_handle, sql, params)
     end
   end
   
@@ -382,6 +387,7 @@ impl Transaction
     match self.driver
     when DriverKind::Sqlite then sqlite_query_raw(self.conn_handle, sql, params)
     when DriverKind::Postgres then postgres_query_raw(self.conn_handle, sql, params)
+    when DriverKind::Mysql then mysql_query_raw(self.conn_handle, sql, params)
     end
   end
   
@@ -393,6 +399,7 @@ impl Transaction
     let result = match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, "COMMIT", &[])
     when DriverKind::Postgres then postgres_execute_raw(self.conn_handle, "COMMIT", &[])
+    when DriverKind::Mysql then mysql_execute_raw(self.conn_handle, "COMMIT", &[])
     end
     
     match result
@@ -411,6 +418,7 @@ impl Transaction
     let result = match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, "ROLLBACK", &[])
     when DriverKind::Postgres then postgres_execute_raw(self.conn_handle, "ROLLBACK", &[])
+    when DriverKind::Mysql then mysql_execute_raw(self.conn_handle, "ROLLBACK", &[])
     end
     
     match result
@@ -1896,44 +1904,11 @@ impl Connection for Mysql
     end
     let result = unsafe "FFI boundary" do mysql_store_result(self.handle) end
     if result.is_null() then
-      return Result::Ok(Rows { columns: Vec::new(), rows: Vec::new(), position: 0 })
+      return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
     end
-
-    let num_fields = unsafe "FFI boundary" do mysql_num_fields(result) end as UInt
-    let num_rows = unsafe "FFI boundary" do mysql_num_rows(result) end as UInt
-
-    ## Read column names
-    var columns = Vec::new()
-    for i in 0..num_fields do
-      let field = unsafe "FFI boundary" do mysql_fetch_field(result) end
-      if !field.is_null() then
-        let name = unsafe "FFI boundary" do cstring_to_string(field.name) end
-        columns.push(name)
-      end
-    end
-
-    ## Read rows
-    var rows = Vec::new()
-    for _ in 0..num_rows do
-      let row_ptr = unsafe "FFI boundary" do mysql_fetch_row(result) end as Ptr[Ptr[u8]]
-      if row_ptr.is_null() then break end
-      let lengths = unsafe "FFI boundary" do mysql_fetch_lengths(result) end as Ptr[UInt]
-      var row_values = Vec::new()
-      for j in 0..num_fields do
-        let field_ptr = unsafe "FFI boundary" do *row_ptr.offset(j as isize) end
-        if field_ptr.is_null() then
-          row_values.push(SqlValue::Null)
-        else
-          let len = unsafe "FFI boundary" do *lengths.offset(j as isize) end
-          let s = unsafe "FFI boundary" do string_from_ptr(field_ptr, len) end
-          row_values.push(SqlValue::Text(s))
-        end
-      end
-      rows.push(row_values)
-    end
-
+    let rows = mysql_result_to_rows(result)
     unsafe "FFI boundary" do mysql_free_result(result) end
-    Result::Ok(Rows { columns: columns, rows: rows, position: 0 })
+    Result::Ok(rows)
   end
 
   def begin_transaction(inout self: Mysql) -> Result[Transaction, DbError]
@@ -1941,7 +1916,12 @@ impl Connection for Mysql
     if ret != 0 then
       return Result::Err(DbError::TransactionError("failed to disable autocommit".to_string()))
     end
-    Result::Ok(Transaction { active: true })
+    mysql_execute_raw(self.handle, "BEGIN", &[])?
+    Result::Ok(Transaction {
+      conn_handle: self.handle,
+      driver: DriverKind::Mysql,
+      finished: false
+    })
   end
 
   def prepare(inout self: Mysql, sql: str) -> Result[Statement, DbError]
@@ -1957,7 +1937,11 @@ impl Connection for Mysql
       unsafe "FFI boundary" do mysql_stmt_close(stmt) end
       return Result::Err(DbError::QueryFailed(err))
     end
-    Result::Ok(Statement { handle: stmt as Ptr[u8], sql: sql.to_string(), driver: DriverKind::Mysql })
+    Result::Ok(Statement {
+      handle: stmt,
+      sql: sql.to_string(),
+      driver: DriverKind::Mysql
+    })
   end
 
   def close(inout self: Mysql) -> Result[Unit, DbError]
@@ -1975,7 +1959,114 @@ impl Drop for Mysql
   end
 end
 
-def mysql_interpolate_params(inout conn: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
+def mysql_execute_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  let query_str = if params.is_empty() then
+    sql.to_string()
+  else
+    mysql_interpolate(sql, params)?
+  end
+  let ret = if params.is_empty() then
+    unsafe "FFI boundary" do mysql_query(handle, query_str.to_cstring().as_ptr()) end
+  else
+    unsafe "FFI boundary" do mysql_real_query(handle, query_str.to_cstring().as_ptr(), query_str.len()) end
+  end
+  if ret != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  let affected = unsafe "FFI boundary" do mysql_affected_rows(handle) end
+  Result::Ok(affected as UInt)
+end
+
+def mysql_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  let query_str = if params.is_empty() then
+    sql.to_string()
+  else
+    mysql_interpolate(sql, params)?
+  end
+  let ret = unsafe "FFI boundary" do mysql_real_query(handle, query_str.to_cstring().as_ptr(), query_str.len()) end
+  if ret != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  let result = unsafe "FFI boundary" do mysql_store_result(handle) end
+  if result.is_null() then
+    return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+  end
+  let rows = mysql_result_to_rows(result)
+  unsafe "FFI boundary" do mysql_free_result(result) end
+  Result::Ok(rows)
+end
+
+def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
+  let num_fields = unsafe "FFI boundary" do mysql_num_fields(result) end as UInt
+  let num_rows = unsafe "FFI boundary" do mysql_num_rows(result) end as UInt
+
+  var columns = Vec::new()
+  for i in 0..num_fields do
+    let field = unsafe "FFI boundary" do mysql_fetch_field(result) end
+    if !field.is_null() then
+      let name = unsafe "FFI boundary" do cstring_to_string(field.name) end
+      columns.push(name)
+    end
+  end
+
+  var data = Vec::new()
+  for _ in 0..num_rows do
+    let row_ptr = unsafe "FFI boundary" do mysql_fetch_row(result) end as Ptr[Ptr[u8]]
+    if row_ptr.is_null() then break end
+    let lengths = unsafe "FFI boundary" do mysql_fetch_lengths(result) end as Ptr[UInt]
+    var row_values = Vec::new()
+    for j in 0..num_fields do
+      let field_ptr = unsafe "FFI boundary" do *row_ptr.offset(j as isize) end
+      if field_ptr.is_null() then
+        row_values.push(SqlValue::Null)
+      else
+        let len = unsafe "FFI boundary" do *lengths.offset(j as isize) end
+        let s = unsafe "FFI boundary" do string_from_ptr(field_ptr, len) end
+        row_values.push(SqlValue::Text(s))
+      end
+    end
+    data.push(row_values)
+  end
+
+  Rows { columns: columns, data: data, pos: 0 }
+end
+
+def mysql_stmt_run(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  if stmt.handle.is_null() then
+    return Result::Err(DbError::QueryFailed("statement already finalized"))
+  end
+  let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt.handle) end
+  if ret != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt.handle)) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  let affected = unsafe "FFI boundary" do mysql_stmt_affected_rows(stmt.handle) end
+  Result::Ok(affected as UInt)
+end
+
+def mysql_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  if stmt.handle.is_null() then
+    return Result::Err(DbError::QueryFailed("statement already finalized"))
+  end
+  let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt.handle) end
+  if ret != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt.handle)) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+end
+
+def mysql_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
+  if !stmt.handle.is_null() then
+    unsafe "FFI boundary" do mysql_stmt_close(stmt.handle) end
+    stmt.handle = null_ptr()
+  end
+  Result::Ok(())
+end
+
+def mysql_interpolate(sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
   var result = String::new()
   var param_idx = 0
   for ch in sql.chars() do
@@ -1993,22 +2084,12 @@ def mysql_interpolate_params(inout conn: Mysql, sql: str, params: [Box[dyn ToSql
   Result::Ok(result)
 end
 
+def mysql_interpolate_params(inout conn: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
+  mysql_interpolate(sql, params)
+end
+
 def mysql_interpolate_params_ref(conn: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
-  var result = String::new()
-  var param_idx = 0
-  for ch in sql.chars() do
-    if ch == '?' then
-      if param_idx >= params.len() then
-        return Result::Err(DbError::BindError(param_idx as UInt, "too few parameters".to_string()))
-      end
-      let val = params[param_idx].to_sql_param()
-      result.push_str(&sql_value_to_mysql_literal(&val))
-      param_idx = param_idx + 1
-    else
-      result.push(ch)
-    end
-  end
-  Result::Ok(result)
+  mysql_interpolate(sql, params)
 end
 
 def sql_value_to_mysql_literal(val: SqlValue) -> String

@@ -1,5 +1,18 @@
 ## Tangerine Standard Library — std::io
 ## Reader/Writer traits, buffered I/O
+##
+## READ CONTRACT (the explicit mutable byte view): a systems Read takes an
+## explicit SliceMut[u8] span whose `len` UNAMBIGUOUSLY means the WRITABLE
+## EXTENT — the number of bytes the reader may fill. Every implementor
+## requests exactly buf.len bytes, so a buffered read can never request
+## zero bytes: BufReader::fill_buf clears its buffer and reads through the
+## view onto the buffer's CAPACITY (the spare capacity is the writable
+## extent). The old `inout buf: Vec[u8]` shape is gone — it made len mean
+## "bytes already in the buffer" for the stdin accumulator and "writable
+## capacity" for fill_buf simultaneously. The growth logic (appending into
+## a Vec, line splitting) lives in the reader helpers read_to_end /
+## read_line / read_exact, which own the Vec's growth via the view onto
+## the exposed capacity and the resize commit.
 
 enum IOError
   NotFound(String)
@@ -32,7 +45,13 @@ impl Error for IOError
 end
 
 trait Read
-  def read(inout self: Self, inout buf: Vec[u8]) -> Result[Int, IOError]
+  # buf is the explicit mutable byte view: buf.len is the writable
+  # extent — the number of bytes this call may write into buf.ptr.
+  # Returns the number of bytes written (0 = EOF; < 0 errors are
+  # Result::Err). Implementors never see an ambiguous length: a view
+  # onto a Vec's spare capacity has len = the capacity, so a cleared
+  # buffer still requests its full capacity.
+  def read(inout self: Self, buf: SliceMut[u8]) -> Result[Int, IOError]
 end
 
 trait Write
@@ -74,31 +93,92 @@ def SYS_READ() -> Int = 0
 # POSIX open syscall
 def SYS_OPEN() -> Int = 2
 
-def read_line() -> Result[String, IOError]
-  var bytes = Vec::new()
-  var b = Vec::with_capacity(1)
-  b.push(0)
-  
-  while true do
-    let n = sys_read(0, b.as_mut_ptr(), 1)
-    if n <= 0 then
-      if bytes.is_empty() then return Result::Err(IOError::EOF) else break end
+# ———————————————————————————————————————————————————————————————
+# Read adapters — the growth logic, centralized
+# ———————————————————————————————————————————————————————————————
+# These helpers own ALL appending: a Read fills exactly the view's
+# writable extent; the helpers grow the destination Vec by exposing
+# capacity (resize exposes len onto the spare — the zero-fill is
+# written over by the read), read through the sub-view onto the exposed
+# region, and commit with a truncating resize (a pure len store — the
+# bytes read are never re-touched). A view is never constructed with a
+# zero writable extent after a clear.
+
+# Read until EOF into `out`, appending. On Err the Vec's length is
+# restored to its pre-call length; on Ok the appended bytes are
+# committed. Returns the total bytes appended.
+def read_to_end[R: Read](inout r: R, inout out: Vec[u8]) -> Result[Int, IOError]
+  var total = 0
+  loop
+    let start = out.len()
+    if start == out.capacity() then
+      out.resize(start + 4096, 0)
     end
-    let byte = b[0]
-    if byte == 10 then break end # \n
-    if byte == 13 then # \r
-      # Peek next to see if it's \n
-      let n2 = sys_read(0, b.as_mut_ptr(), 1)
-      if n2 > 0 && b[0] != 10 then
-        # Not \n, push \r and the new byte (this is simplified)
-        bytes.push(byte)
-        bytes.push(b[0])
+    let exposed = out.len() - start
+    var view = out.as_mut_slice().sub(start, exposed as UInt)
+    match r.read(view)
+    when Result::Ok(n) then
+      if n <= 0 then
+        out.resize(start, 0)
+        return Result::Ok(total)
       end
-      break 
+      total = total + n
+      out.resize(start + n, 0)
+    when Result::Err(e) then
+      out.resize(start, 0)
+      return Result::Err(e)
     end
-    bytes.push(byte)
   end
-  Result::Ok(String::from_bytes(bytes))
+end
+
+# Read one line (up to and including '\n'; a trailing '\r' is dropped)
+# into an owned String. The line growth uses the same expose-read-commit
+# pattern as read_to_end.
+def read_line[R: Read](inout r: R) -> Result[String, IOError]
+  var bytes = Vec[u8]::new()
+  loop
+    let start = bytes.len()
+    if start == bytes.capacity() then
+      bytes.resize(start + 256, 0)
+    end
+    let exposed = bytes.len() - start
+    var view = bytes.as_mut_slice().sub(start, exposed as UInt)
+    let n = r.read(view)?
+    if n <= 0 then
+      bytes.resize(start, 0)
+      if bytes.is_empty() then
+        return Result::Err(IOError::EOF)
+      end
+      return Result::Ok(String::from_bytes(bytes))
+    end
+    bytes.resize(start + n, 0)
+    var i = 0
+    while i < n do
+      let byte = bytes[start + i]
+      if byte == 10u8 then # '\n'
+        if bytes[bytes.len() - 1] == 13u8 then # drop trailing '\r'
+          let _ = bytes.pop()
+        end
+        return Result::Ok(String::from_bytes(bytes))
+      end
+      i = i + 1
+    end
+  end
+end
+
+# Read exactly `out.len` bytes into the view; EOF before the extent is
+# filled is Result::Err(IOError::EOF).
+def read_exact[R: Read](inout r: R, out: SliceMut[u8]) -> Result[Unit, IOError]
+  var done = 0
+  while done < out.len as Int do
+    var view = out.sub(done, (out.len as Int - done) as UInt)
+    let n = r.read(view)?
+    if n <= 0 then
+      return Result::Err(IOError::EOF)
+    end
+    done = done + n
+  end
+  Result::Ok(())
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -208,24 +288,16 @@ impl Write for Stderr
 end
 
 impl Read for Stdin
-  def read(inout self: Self, inout buf: Vec[u8]) -> Result[Int, IOError]
-    # Read one byte at a time until newline (line-buffered stdin)
-    var total = 0
-    var b = Vec[u8]::new()
-    b.push(0u8)
-    loop
-      let n = sys_read(self._fd, b.as_mut_ptr(), 1)
-      if n <= 0 then
-        break
-      end
-      let byte = b[0]
-      buf.push(byte)
-      total = total + 1
-      if byte == 10u8 then  # '\n'
-        break
-      end
+  def read(inout self: Self, buf: SliceMut[u8]) -> Result[Int, IOError]
+    # The view's len IS the writable extent: request exactly that many
+    # bytes. The line-buffered growth of the old accumulator lives in the
+    # read_line / read_to_end helpers, which own the Vec growth.
+    let n = sys_read(self._fd, buf.ptr, buf.len as Int)
+    if n < 0 then
+      Result::Err(IOError::Other("read from stdin failed".to_string()))
+    else
+      Result::Ok(n)
     end
-    Result::Ok(total)
   end
 end
 
@@ -250,33 +322,49 @@ def buf_reader_new[R: Read](inner: R) -> BufReader[R]
 end
 
 impl[R: Read] BufReader[R]
+  # Refill the internal buffer when exhausted: clear, then expose the
+  # buffer's CAPACITY as the writable extent (the resize grows the
+  # logical length onto the spare; the zero-fill is written over by the
+  # read), read through the view, and commit with a truncating resize
+  # (a pure len store — never a zero-length read after the clear).
+  def refill(inout self: Self) -> Result[Unit, IOError]
+    self.buf.clear()
+    self.pos = 0
+    self.cap = 0
+    let capacity = self.buf.capacity()
+    if capacity > 0 then
+      self.buf.resize(capacity, 0)
+      let n = self.inner.read(self.buf.as_mut_slice())?
+      self.buf.resize(n, 0)
+      self.cap = n
+    end
+    Result::Ok(())
+  end
+
   def fill_buf(inout self: Self) -> Result[Vec[u8], IOError]
     if self.pos >= self.cap then
-      self.buf.clear()
-      self.pos = 0
-      let _ = self.inner.read(&mut self.buf)?
-      self.cap = self.buf.len()
+      self.refill()?
     end
     Result::Ok(self.buf.clone())
   end
 
   def read_line(inout self: Self) -> Result[String, IOError]
-    var line = String::new()
+    var line = Vec[u8]::new()
     loop
       self.fill_buf()?
       if self.cap == 0 then
         if line.is_empty() then
           return Result::Err(IOError::EOF)
         end
-        return Result::Ok(line)
+        return Result::Ok(String::from_bytes(line))
       end
       while self.pos < self.cap do
-        let ch = self.buf[self.pos] as Char
+        let byte = self.buf[self.pos]
         self.pos = self.pos + 1
-        if ch == '\n' then
-          return Result::Ok(line)
+        if byte == 10u8 then # '\n'
+          return Result::Ok(String::from_bytes(line))
         end
-        line = line + ch.to_string()
+        line.push(byte)
       end
     end
   end
@@ -287,39 +375,37 @@ impl[R: Read] BufReader[R]
 end
 
 impl[R: Read] Read for BufReader[R]
-  def read(inout self: Self, inout buf: Vec[u8]) -> Result[Int, IOError]
+  def read(inout self: Self, buf: SliceMut[u8]) -> Result[Int, IOError]
     # If buffer has unread data, serve from buffer first
     if self.pos < self.cap then
       var copied = 0
-      while self.pos < self.cap && copied < buf.len() do
-        buf[copied] = self.buf[self.pos]
+      while self.pos < self.cap && copied < buf.len as Int do
+        unsafe "buffered byte copy into the caller's view" do
+          buf.write(copied, self.buf[self.pos])
+        end
         self.pos = self.pos + 1
         copied = copied + 1
       end
       return Result::Ok(copied)
     end
-    
-    # Buffer exhausted — if request is larger than buffer, pass through directly
-    if buf.len() >= self.buf.len() then
+
+    # Buffer exhausted — if the request is at least the buffer's
+    # capacity, pass through directly (the view carries its own extent).
+    if buf.len as Int >= self.buf.capacity() then
       return self.inner.read(buf)
     end
-    
-    # Otherwise, refill the internal buffer and serve from it
-    self.pos = 0
-    self.cap = 0
-    let read_result = self.inner.read(&mut self.buf)
-    match read_result
-    when Result::Ok(n) then
-      self.cap = n
-      var copied = 0
-      while self.pos < self.cap && copied < buf.len() do
-        buf[copied] = self.buf[self.pos]
-        self.pos = self.pos + 1
-        copied = copied + 1
+
+    # Otherwise refill the internal buffer and serve from it
+    self.refill()?
+    var copied = 0
+    while self.pos < self.cap && copied < buf.len as Int do
+      unsafe "buffered byte copy into the caller's view" do
+        buf.write(copied, self.buf[self.pos])
       end
-      Result::Ok(copied)
-    when Result::Err(e) then Result::Err(e)
+      self.pos = self.pos + 1
+      copied = copied + 1
     end
+    Result::Ok(copied)
   end
 end
 

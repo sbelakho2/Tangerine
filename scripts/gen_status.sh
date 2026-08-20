@@ -281,6 +281,116 @@ fact "crypto KAT suite (known-answer vectors)" \
 fact "crypto KAT CI job" \
   'crypto-kat' "$ROOT/.github/workflows/ci.yml"
 
+# ── round-11 facts ─────────────────────────────────────────────────────────
+# Arc rework (std/sync.tg): the UNIQUE-ONLY mutable access (get_mut returns
+# Option[PtrMut[T]], Some exactly while the strong count is one — the
+# load == 1 check), the SINK-CONSUMING try_unwrap (the caller's Arc is
+# consumed on both outcomes; the success path moves the data out, frees
+# the block, and NULLS the consumed Arc's ptr so its finalize is a no-op —
+# no double-free), the drop_in_place last release (the typed destruction
+# glue runs T's destructor exactly once BEFORE the storage is released),
+# and the refcount OVERFLOW guard (a CAS retry loop; an increment must
+# never wrap the count to zero, which would create a dangling owner).
+fact "Arc::get_mut is unique-only (Option[PtrMut[T]], load==1 check)" \
+  'def Arc::get_mut' "$ROOT/std/sync.tg"
+fact "Arc::try_unwrap is sink-consuming (consumed on both outcomes)" \
+  'def Arc::try_unwrap\[T\]\(sink self: Arc\[T\]\)' "$ROOT/std/sync.tg"
+fact "Arc last release runs drop_in_place before the dealloc" \
+  'drop_in_place\(\)' "$ROOT/std/sync.tg"
+fact "Arc::clone refcount overflow guard (traps at u32::MAX)" \
+  'reference count overflow' "$ROOT/std/sync.tg"
+fact "Arc lifecycle suite committed" \
+  'arc_lifecycle_test' "$ROOT/tests/arc_lifecycle_test.tg"
+
+# DriverKind::Mysql: the MySQL driver joins the Sqlite/Postgres match arms
+# of the statement/transaction dispatch (mysql_stmt_run/query/finalize,
+# mysql_execute_raw/query_raw).
+fact "DriverKind::Mysql in the driver dispatch" \
+  'DriverKind::Mysql' "$ROOT/std/db.tg"
+fact "mysql statement run path (mysql_stmt_run)" \
+  'mysql_stmt_run' "$ROOT/std/db.tg"
+
+# TLS consuming builders + the native shim lane: with_alpn /
+# with_certificate / with_verify_peer take `sink self` — no Clone of the
+# Certificate/PrivateKey wrappers or their native X509/EVP_PKEY handles
+# (a bit-level clone would double-free); CI builds native/tls_shims.c
+# into build/libtg_tls_shims.dylib, gates every declared tls_* extern as
+# an exported Mach-O symbol, and preloads the shim into the tg-compiled
+# TLS test processes.
+fact "TLS consuming builders (sink self: TlsConfig)" \
+  'sink self: TlsConfig' "$ROOT/std/tls.tg"
+fact "TLS shim source committed (native/tls_shims.c)" \
+  'tls_shims' "$ROOT/.github/workflows/ci.yml"
+fact "TLS shim lane builds libtg_tls_shims.dylib" \
+  'libtg_tls_shims.dylib' "$ROOT/.github/workflows/ci.yml"
+fact "TLS shim preloaded into the test processes" \
+  'DYLD_INSERT_LIBRARIES' "$ROOT/.github/workflows/ci.yml"
+
+# Extern ABI return normalization: a C `int` return arrives in the LOW 32
+# bits of the return register (eax/w0) with unspecified upper bits —
+# normalize_extern_return sign/zero-extends it (I32/U32) before the
+# post-call store, so a C -1 reads as -1 (x86-64 movsxd/mov_r32; AArch64
+# sxtw; the w0 zero-extension is already exact).
+fact "extern return normalization (normalize_extern_return)" \
+  'normalize_extern_return' "$ROOT/tg_compiler/codegen.tg"
+fact "net negative-ABI suite (sign-extension at the FFI boundary)" \
+  'net_negative_abi' "$ROOT/tests/net_negative_abi_test.tg"
+
+# The SliceMut Read contract: the Read trait takes the explicit mutable
+# byte view — buf.len is the WRITABLE EXTENT (the number of bytes the
+# reader may fill); the old `inout buf: Vec[u8]` shape (len meant both
+# "bytes already buffered" and "writable capacity") is gone.
+fact "Read trait takes the SliceMut[u8] writable-extent view" \
+  'def read\(inout self: Self, buf: SliceMut\[u8\]\)' "$ROOT/std/io.tg"
+fact "SliceMut view type exists (std/collections.tg)" \
+  'struct SliceMut' "$ROOT/std/collections.tg"
+
+# The per-target syscall identity table: the std's syscall wrappers pass
+# the TG CANONICAL (Linux x86-64) numbers; the Linux-AArch64 translation
+# maps them to the asm-generic table (read=63, write=64, ...) and the *at
+# rewrites INSERT the AT_FDCWD (-100) dirfd (plus the extra argument the
+# AArch64 call needs — fstatat's flags, unlinkat's AT_REMOVEDIR for
+# rmdir); UNKNOWN numbers pass through raw.
+fact "syscall canonical -> AArch64 number table" \
+  'linux_aarch64_syscall_number' "$ROOT/tg_compiler/codegen.tg"
+fact "syscall AArch64 argument layouts (*at rewrites + AT_FDCWD)" \
+  'linux_aarch64_syscall_layout' "$ROOT/tg_compiler/codegen.tg"
+fact "syscall translation suite committed" \
+  'syscall_translation_test' "$ROOT/tests/syscall_translation_test.tg"
+
+# The LSE contract: asm.tg's target feature table declares the aarch64
+# target LSE-REQUIRED (the LDADDAL/CASAL/SWPAL RMW family is ARMv8.1 LSE,
+# not the ARMv8.0 baseline — Apple Silicon, Neoverse and Cortex-A75+
+# carry it; a bare ARMv8.0 core is not a supported target; the
+# ldaxr/stlxr LL/SC fallback is the FUTURE portable mode).
+fact "target feature table carries the LSE requirement" \
+  'requires_lse' "$ROOT/tg_compiler/asm.tg"
+fact "LSE contract suite committed" \
+  'target_lse_contract' "$ROOT/tests/target_lse_contract_test.tg"
+
+# Pthread opaque alignment: the layout authority OVERRIDES the [u8; N]
+# byte-array alignment to the native pointer alignment for the known
+# FFI-opaque names (ffi_opaque_native_align — PthreadT/AttrT/MutexT/
+# CondT/BarrierT), so a PthreadMutexT local can never land at a
+# misaligned stack offset (misaligned stores are UB in the C contract the
+# pthread functions write through).
+fact "FFI-opaque native alignment override (ffi_opaque_native_align)" \
+  'ffi_opaque_native_align' "$ROOT/tg_compiler/layout_engine.tg"
+fact "pthread ABI suite committed (sizes + alignment propagation)" \
+  'pthread_abi_test' "$ROOT/tests/pthread_abi_test.tg"
+
+# Thread spawn failure-path glue: the fault-injection hook
+# (__tg_spawn_fail_create) makes pthread_create report EAGAIN (11)
+# deterministically, and EVERY failure exit runs the placed closure's
+# drop glue (closure_ptr.drop_in_place) before releasing the storage — a
+# bare dealloc would leak the captured resources.
+fact "spawn failure-path hook (injected EAGAIN)" \
+  '__tg_spawn_fail_create' "$ROOT/std/thread.tg"
+fact "spawn failure path runs the placed closure's drop glue" \
+  'closure_ptr.drop_in_place' "$ROOT/std/thread.tg"
+fact "thread spawn failure-path suite committed" \
+  'thread_spawn_failure' "$ROOT/tests/thread_spawn_failure_test.tg"
+
 # ── working-tree file list ─────────────────────────────────────────────────
 WT="$(git -C "$ROOT" status --porcelain)"
 
@@ -457,9 +567,36 @@ CURRENT STATE (structural, verified against the tested tree):
   three-way parity (declared count == listed == discovered) with
   $POS, $NEG and $ARM files respectively; the acceptance-test additions
   (allocator_churn/large/oom/reuse/threaded, verifier_projection_tests,
-  the three canary_neg additions, the alignment and atomic-litmus tests)
-  are manifest-registered; their execution numbers live in the CI jobs
-  that ran this SHA, not in this file.
+  the three canary_neg additions, the alignment and atomic-litmus tests,
+  and the round-11 suites: arc_lifecycle, syscall_translation,
+  target_lse_contract, pthread_abi, net_negative_abi,
+  thread_spawn_failure) are manifest-registered; their execution numbers
+  live in the CI jobs that ran this SHA, not in this file.
+- Round-11 state (working tree at $SHA + the uncommitted round-11 work
+  in the WORKING TREE list above; HEAD is 6f1005a): the Arc rework
+  (std/sync.tg) — unique-only get_mut, sink-consuming try_unwrap,
+  drop_in_place on the last-release path, refcount overflow guard;
+  DriverKind::Mysql joins the std/db.tg statement/transaction dispatch;
+  std::tls moved to consuming sink builders and the CI lane builds
+  native/tls_shims.c into libtg_tls_shims.dylib (every declared tls_*
+  extern gated as an exported Mach-O symbol); normalize_extern_return
+  sign/zero-extends C int returns at the extern ABI boundary; the Read
+  trait takes the SliceMut[u8] writable-extent view; the Linux-AArch64
+  syscall translation table (canonical numbers + the *at rewrites with
+  AT_FDCWD); asm.tg's target feature table declares the explicit LSE
+  requirement (aarch64 is LSE-REQUIRED); the pthread opaque alignment
+  override (ffi_opaque_native_align); the thread spawn failure-path glue
+  with the injected EAGAIN hook. No ladder/CI run has occurred on this
+  tree — none of this is run-verified at this SHA.
+- Status vocabulary (docs/current/feature_registry.md — the CI-artifact
+  evidence model): a COMMITTED test artifact (manifest-registered canary,
+  invariant group, required CI gate, @test file, or the self-host kernel
+  as workload) establishes implemented+test-covered; only an OBSERVED
+  execution at THIS tested SHA — proven by the CI job results and this
+  snapshot's artifact hashes — establishes implemented+run-verified at
+  SHA. This file IS the CI-artifact evidence: a snapshot generated by
+  this script from a tested SHA is what elevates a feature to
+  run-verified; a source tree alone never can.
 
 STRUCTURAL FACTS (greps run by scripts/gen_status.sh against this tree):
 EOF

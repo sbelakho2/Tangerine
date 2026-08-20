@@ -387,19 +387,30 @@ jobs:
   # ———————————————————————————————————————
   status:
     name: Status snapshot (tested SHA + artifact hashes)
-    needs: [bootstrap, conformance, cross-compile, stdlib-e106-sweep, stdlib-new-modules, stdlib-integration, verifier-projection, allocator, atomic-litmus, crypto-kat, doctests, gfx-ui, gfx-ui-visual]
+    needs: [abi-platform, allocator, atomic-litmus, bootstrap, cfg-matrix, conformance, cross-compile, crypto-kat, db-integration-postgres, doctests, gfx-ui, gfx-ui-visual, stdlib-e106-sweep, stdlib-new-modules, stdlib-integration, verifier-projection]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download test artifacts (fingerprints, native canaries, cross lanes)
+      # download-artifact@v4 takes ONE pattern per step: a multiline
+      # `pattern:` is a single glob string (with embedded newlines), not
+      # three patterns. One download per artifact name, all into the
+      # hashing dir, so gen_status.sh's --artifacts hash section sees the
+      # same file set as before.
+      - name: Download bootstrap fingerprint artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: |
-            bootstrap-fingerprints
-            bootstrap-native-tests
-            cross-lane-binaries
-          merge-multiple: true
+          name: bootstrap-fingerprints
+          path: build/.status_artifacts/
+      - name: Download bootstrap native canary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-native-tests
+          path: build/.status_artifacts/
+      - name: Download cross-lane binaries artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-lane-binaries
           path: build/.status_artifacts/
 
       - name: Generate the status snapshot from the tested SHA
@@ -490,10 +501,41 @@ jobs:
         run: |
           cp build/tg_stage3 build/tg
           chmod +x build/tg
-      - name: Run allocator suites
+      - name: Run allocator suites (incl. Arc lifecycle)
         run: |
-          ./build/tg test tests/allocator_churn_test.tg tests/allocator_reuse_test.tg tests/allocator_large_test.tg tests/allocator_oom_test.tg tests/allocator_threaded_test.tg tests/allocator_alignment_test.tg
-          echo "✓ Allocator suites passed"
+          ./build/tg test tests/allocator_churn_test.tg tests/allocator_reuse_test.tg tests/allocator_large_test.tg tests/allocator_oom_test.tg tests/allocator_threaded_test.tg tests/allocator_alignment_test.tg tests/arc_lifecycle_test.tg
+          echo "✓ Allocator + Arc lifecycle suites passed"
+
+  # ———————————————————————————————————————
+  # ABI / Platform Contract Suites (REQUIRED)
+  # The adversarial platform-contract layer: the pthread opaque ABI
+  # (size AND native alignment) pinned per target, the per-target
+  # syscall identity table (linux-aarch64 translation rows + *at
+  # argument layouts), the AArch64 LSE requirement as explicit target
+  # metadata, and the thread-spawn failure path (fault-injection flag;
+  # the placed closure's drop glue must fire exactly once on the
+  # failure path). Each file is an executable canary (@test-marked
+  # main / @test suite), run once.
+  # ———————————————————————————————————————
+  abi-platform:
+    name: ABI / Platform Contract Suites
+    needs: bootstrap
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+      - name: Run ABI / platform contract suites
+        run: |
+          ./build/tg test tests/pthread_abi_test.tg tests/syscall_translation_test.tg tests/target_lse_contract_test.tg tests/thread_spawn_failure_test.tg
+          echo "✓ ABI / platform contract suites passed"
 
   # ———————————————————————————————————————
   # Atomic Litmus Suites (REQUIRED)
@@ -526,8 +568,15 @@ jobs:
   # Minimal end-to-end suites for the network, database, TLS, and sync
   # modules: the TCP loopback (listener + client echo), the SQLite
   # in-memory open/create/insert/select, the TLS certificate parse
-  # round-trip (fixed embedded PEM), and the mutex-guard contention churn
-  # across threads.
+  # round-trip + config-ownership suites (fixed embedded PEMs), and the
+  # mutex-guard contention churn across threads.
+  #
+  # TLS lane self-containment: std::tls declares the custom extern shim
+  # family (tls_x509_* / tls_ssl_* / tls_pkey_* / tls_load_file); this job
+  # builds the in-repository implementation (native/tls_shims.c, small C
+  # wrappers over the system OpenSSL) into build/libtg_tls_shims.dylib,
+  # gates every declared extern as an exported Mach-O symbol, and supplies
+  # the shim to the tg-compiled TLS test processes.
   # ———————————————————————————————————————
   stdlib-integration:
     name: Stdlib Integration (net/db/tls/sync)
@@ -544,10 +593,113 @@ jobs:
         run: |
           cp build/tg_stage3 build/tg
           chmod +x build/tg
-      - name: Run net loopback / db / tls / sync integration suites
+      - name: Build the TLS shim (native/tls_shims.c -> build/libtg_tls_shims.dylib)
         run: |
-          ./build/tg test tests/net_loopback_test.tg tests/db_integration_test.tg tests/tls_interop_test.tg tests/sync_contention_test.tg
-          echo "✓ Stdlib integration suites passed"
+          set -euo pipefail
+          mkdir -p build
+          # OpenSSL headers/libs: Homebrew openssl@3 is preinstalled on the
+          # macos-14 runners; fall back to the system /usr/lib libssl/libcrypto.
+          if [ -d "$(brew --prefix openssl@3 2>/dev/null || true)/include/openssl" ]; then
+            OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+            cc -fPIC -shared -o build/libtg_tls_shims.dylib native/tls_shims.c \
+              -I"$OPENSSL_PREFIX/include" -L"$OPENSSL_PREFIX/lib" -lssl -lcrypto
+          else
+            cc -fPIC -shared -o build/libtg_tls_shims.dylib native/tls_shims.c -lssl -lcrypto
+          fi
+          # Structural gate: every tls_* extern declared by std::tls must be
+          # exported by the shim (underscore-prefixed Mach-O symbols).
+          for sym in \
+            tls_ssl_new tls_ssl_free tls_ssl_set_min_version tls_ssl_set_max_version \
+            tls_ssl_set_hostname tls_ssl_set_certificate tls_ssl_set_private_key \
+            tls_ssl_set_verify tls_ssl_connect tls_ssl_accept tls_ssl_read \
+            tls_ssl_write tls_ssl_shutdown \
+            tls_x509_from_pem tls_x509_free tls_x509_to_der \
+            tls_x509_get_subject_cn tls_x509_is_expired \
+            tls_pkey_from_pem tls_pkey_free tls_pkey_to_der tls_load_file; do
+            nm -gU build/libtg_tls_shims.dylib | grep -q " _$sym$" \
+              || { echo "::error::TLS shim missing export: $sym"; exit 1; }
+          done
+          echo "✓ libtg_tls_shims.dylib built with all 22 std::tls extern exports"
+
+      - name: Run net loopback / negative-return ABI / db / sync integration suites
+        run: |
+          ./build/tg test tests/net_loopback_test.tg tests/net_negative_abi_test.tg tests/db_integration_test.tg tests/sync_contention_test.tg
+          echo "✓ Net loopback / negative-return ABI / db / sync integration suites passed"
+
+      - name: Run TLS interop suite (shim preloaded into the test processes)
+        run: |
+          set -euo pipefail
+          # The tg toolchain's link step is the in-house Mach-O linker
+          # (tg_compiler/linker.tg link_macho64): it emits exactly one
+          # LC_LOAD_DYLIB (/usr/lib/libSystem.B.dylib) and records every
+          # undefined extern — the tls_x509_* / tls_ssl_* / tls_pkey_*
+          # calls among them — as a dyld import. The driver has no
+          # link-flags / module-link-config mechanism to add the shim as a
+          # second LC_LOAD_DYLIB dependency, so the lane supplies the shim
+          # by preloading it into every tg-compiled test process
+          # (DYLD_INSERT_LIBRARIES): libtg_tls_shims.dylib is then in the
+          # process image list before main, and DYLD_FORCE_FLAT_NAMESPACE
+          # routes the imports through flat lookup, which searches every
+          # loaded image including the inserted shim.
+          DYLD_INSERT_LIBRARIES="$PWD/build/libtg_tls_shims.dylib" \
+          DYLD_FORCE_FLAT_NAMESPACE=1 \
+            ./build/tg test tests/tls_interop_test.tg
+          echo "✓ TLS interop suite passed"
+
+  # ———————————————————————————————————————
+  # DB Postgres lane (REQUIRED)
+  # The std::db non-SQLite lane: the Postgres driver (libpq externs
+  # PQconnectdb/PQexec/PQexecParams/PQgetvalue/...) against the GitHub
+  # Actions postgres service container (localhost:5432). The tg
+  # toolchain's in-house Mach-O linker emits exactly one LC_LOAD_DYLIB
+  # and records the PQ* calls as dyld imports, so — exactly like the TLS
+  # shim lane — the lane preloads libpq (and its brew OpenSSL deps) into
+  # the test process (DYLD_INSERT_LIBRARIES + DYLD_FORCE_FLAT_NAMESPACE).
+  # The lane is gated behind the service container: the test only runs
+  # where the server exists.
+  # ———————————————————————————————————————
+  db-integration-postgres:
+    name: DB Postgres Lane (service container)
+    needs: bootstrap
+    runs-on: macos-14
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+      - name: Install libpq (runtime provider for the std::db Postgres driver)
+        run: |
+          set -euo pipefail
+          brew install libpq openssl@3
+          echo "libpq: $(brew --prefix libpq)/lib/libpq.dylib"
+          echo "openssl: $(brew --prefix openssl@3)"
+      - name: Run the Postgres driver lane (libpq preloaded, service container)
+        run: |
+          set -euo pipefail
+          DYLD_INSERT_LIBRARIES="$(brew --prefix libpq)/lib/libpq.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
+          DYLD_FORCE_FLAT_NAMESPACE=1 \
+            ./build/tg test tests/db_postgres_integration_test.tg
+          echo "✓ DB Postgres lane passed (service container)"
 
   # ———————————————————————————————————————
   # New stdlib module tests
@@ -637,6 +789,35 @@ jobs:
           path: |
             build/.cross_lane_arm64/
             build/.cross_lane_x86_64/
+
+  # ———————————————————————————————————————
+  # CFG cross-target matrix (REQUIRED)
+  # The @cfg compile-time elimination pass driven across the explicit
+  # target triples (tests/run_cfg_matrix_tests.sh): the linux member
+  # kept on x86_64-linux-gnu, the macos member kept on
+  # aarch64-apple-darwin, the un-gated cross references REJECTED with
+  # the exact unresolved-name diagnostic, and the host-agnostic family
+  # canary compiled AND run. All 6 canaries must pass.
+  # ———————————————————————————————————————
+  cfg-matrix:
+    name: CFG Cross-Target Matrix
+    needs: bootstrap
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download stage3 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-stages-macos-arm64
+          path: build/
+      - name: Materialize tg
+        run: |
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+      - name: Run the @cfg cross-target matrix (6 canaries)
+        run: |
+          bash tests/run_cfg_matrix_tests.sh ./build/tg
+          echo "✓ CFG cross-target matrix passed (all 6 canaries)"
 
   # ———————————————————————————————————————
   # Stdlib E106 migration sweep (REQUIRED)

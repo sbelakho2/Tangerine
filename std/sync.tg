@@ -252,6 +252,13 @@ impl[T] MutexGuard[T]
   end
   
   def get_mut(inout self: MutexGuard[T]) -> PtrMut[T]
+    # The unconditional PtrMut through the Arc is intentional HERE: the
+    # guard holds the lock (no reader or writer can touch the inner
+    # concurrently) — uniqueness comes from the LOCK PROTOCOL, not the
+    # refcount (the guard's Arc clone is never unique: the Mutex itself
+    # holds a second clone, so Arc::get_mut would always be None). This
+    # raw path is the explicitly-unsafe primitive the Arc surface no
+    # longer exposes unconditionally.
     unsafe { address_of_mut(&mut (*self.inner.ptr).value) }
   end
   
@@ -462,6 +469,12 @@ impl[T] RwLockWriteGuard[T]
   end
   
   def get_mut(inout self: RwLockWriteGuard[T]) -> PtrMut[T]
+    # Same lock-exclusive justification as MutexGuard::get_mut: a write
+    # guard holds the writer flag (readers cannot be concurrent), so the
+    # inner is unique BY THE LOCK — the guard's Arc clone is never
+    # refcount-unique (the RwLock holds a second clone) and Arc::get_mut
+    # cannot be used here. The raw path is the explicitly-unsafe
+    # primitive.
     unsafe { address_of_mut(&mut (*self.inner.ptr).value) }
   end
   
@@ -520,17 +533,30 @@ end
 
 def Arc::clone[T](self: Arc[T]) -> Arc[T]
   if !self.ptr.is_null() then
-    self.ptr.as_ref().ref_count.fetch_add(1)
+    # The refcount OVERFLOW GUARD: an increment must never wrap the count
+    # to zero (a wrapped count would let a fresh clone share a block whose
+    # last-release is already past — a dangling owner). The increment
+    # checks the current count first and TRAPS when it is at u32::MAX; the
+    # compare-and-swap retry loop makes the check-and-increment atomic
+    # (two racing clones re-read the count after a failed CAS instead of
+    # both passing the pre-check) — the same loop shape WeakArc::upgrade
+    # uses for its refcount increment.
+    loop do
+      let current = self.ptr.as_ref().ref_count.load()
+      if current == 0xFFFFFFFF then
+        panic("Arc::clone: reference count overflow")
+      end
+      let old = self.ptr.as_ref().ref_count.compare_and_swap(current, current + 1)
+      if old == current then
+        break
+      end
+    end
   end
   Arc { ptr: self.ptr }
 end
 
 def Arc::deref[T](self: Arc[T]) -> Ptr[T]
   address_of(&mut self.ptr.as_ref().data) as Ptr[T]
-end
-
-def Arc::deref_mut[T](inout self: Arc[T]) -> PtrMut[T]
-  unsafe { address_of_mut(&mut (*self.ptr).data) }
 end
 
 def Arc::strong_count[T](self: Arc[T]) -> u32
@@ -540,6 +566,13 @@ def Arc::strong_count[T](self: Arc[T]) -> u32
   self.ptr.as_ref().ref_count.load()
 end
 
+## The UNIQUE-ONLY mutable access: Some exactly while this Arc is the sole
+## owner (the strong count is one — the load == 1 check). At that point no
+## other clone, and therefore no other thread, can observe the inner, so
+## the returned PtrMut is a race-free exclusive view. The unconditional
+## mutation through a shared Arc is UNAVAILABLE: callers that need the raw
+## path take it explicitly inside `unsafe` (the guards' lock-exclusive raw
+## access elsewhere in this module is that primitive).
 def Arc::get_mut[T](inout self: Arc[T]) -> Option[PtrMut[T]]
   if self.ptr.as_ref().ref_count.load() == 1 then
     Option::Some(unsafe { address_of_mut(&mut (*self.ptr).data) })
@@ -548,11 +581,22 @@ def Arc::get_mut[T](inout self: Arc[T]) -> Option[PtrMut[T]]
   end
 end
 
-def Arc::try_unwrap[T](self: Arc[T]) -> Result[T, Arc[T]]
-  if self.ptr.as_ref().ref_count.load() == 1 then
-    let data = unsafe { (*self.ptr).data }
+## The CONSUMING try_unwrap: sink self is MOVED — the caller's Arc is
+## consumed on BOTH outcomes. Success (the count is exactly one): the data
+## is moved OUT of the control block (the raw place read transfers the
+## bytes; the stale block copy is never destructed — the block is freed
+## WITHOUT drop glue on purpose, the same raw move Rc::try_unwrap uses),
+## the block is freed, and the consumed Arc's ptr is NULLED so its
+## destructor (the sink param's finalize at scope end) is a no-op — the
+## freed allocation is never touched again (no double-free). Failure: the
+## caller's own reference comes back (Err(self)); the refcount is
+## untouched — try_unwrap never releases, and the caller drops it once.
+def Arc::try_unwrap[T](sink self: Arc[T]) -> Result[T, Arc[T]]
+  if !self.ptr.is_null() && self.ptr.as_ref().ref_count.load() == 1 then
+    let value = unsafe { (*self.ptr).data }
     dealloc[ArcInner[T]](self.ptr)
-    Result::Ok(data)
+    self.ptr = Ptr::null()
+    Result::Ok(value)
   else
     Result::Err(self)
   end
@@ -567,7 +611,16 @@ impl[T] Drop for Arc[T]
     let old_count = self.ptr.as_ref().ref_count.fetch_sub(1)
     
     if old_count == 1 then
-      # Last reference, deallocate
+      # Last reference: the atomic fetch_sub just established the zero
+      # count (old_count == 1 — THIS thread is the last releaser). Destroy
+      # the inner's data FIRST — drop_in_place is the compiler's typed
+      # destruction glue (the deinit plan for the concrete ArcInner[T]:
+      # the refcount is a trivial atomic, the data is the only owning
+      # field, so the glue runs T's destructor exactly once) — THEN
+      # release the storage. A bare dealloc would leak the contained
+      # destructor (Arc[String]/Arc[Mutex[Resource]] would never free
+      # their owned state).
+      self.ptr.drop_in_place()
       dealloc[ArcInner[T]](self.ptr)
       self.ptr = Ptr::null()
     end

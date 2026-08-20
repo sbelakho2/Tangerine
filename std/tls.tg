@@ -8,7 +8,7 @@
 ## - Session resumption
 ## - ALPN negotiation
 
-use std::collections::{Vec, Map}
+use std::collections::{Vec, Map, SliceMut}
 use std::ffi::{Ptr, CString}
 use std::core::{Option, Result}
 use std::io::{Read, Write}
@@ -117,49 +117,31 @@ impl TlsConfig
     }
   end
   
-  pub fn with_alpn(self: Self, protocols: Vec[String]) -> TlsConfig
-    TlsConfig {
-      min_version: self.min_version,
-      max_version: self.max_version,
-      cipher_suites: self.cipher_suites.clone(),
-      verify_peer: self.verify_peer,
-      verify_hostname: self.verify_hostname,
-      use_sni: self.use_sni,
-      alpn_protocols: protocols,
-      certificate: self.certificate.clone(),
-      private_key: self.private_key.clone(),
-      ca_certs: self.ca_certs.clone()
-    }
+  # Consuming builders: `sink self` MOVES the config into the setter and the
+  # setter returns it; `sink cert` / `sink key` / `sink protocols` MOVE the
+  # values into the config. No Clone is ever taken of the Certificate /
+  # PrivateKey wrappers, their native X509 / EVP_PKEY handles, or the
+  # ca_certs vector: a bit-level clone would leave two owning wrappers over
+  # the same native handle and the Drop impls would free it twice. The
+  # consuming form is the correct ownership model — the config is moved into
+  # the connection (TlsClient::new / TlsServer::new take it by value) and no
+  # shared-config Clone path exists. If sharing a config across connections
+  # is ever needed, the Clone must duplicate the native handles properly
+  # (X509_dup / EVP_PKEY_dup, not a bit copy).
+  pub fn with_alpn(sink self: TlsConfig, sink protocols: Vec[String]) -> TlsConfig
+    self.alpn_protocols = protocols
+    self
   end
   
-  pub fn with_certificate(self: Self, cert: Certificate, key: PrivateKey) -> TlsConfig
-    TlsConfig {
-      min_version: self.min_version,
-      max_version: self.max_version,
-      cipher_suites: self.cipher_suites.clone(),
-      verify_peer: self.verify_peer,
-      verify_hostname: self.verify_hostname,
-      use_sni: self.use_sni,
-      alpn_protocols: self.alpn_protocols.clone(),
-      certificate: Option::Some(cert),
-      private_key: Option::Some(key),
-      ca_certs: self.ca_certs.clone()
-    }
+  pub fn with_certificate(sink self: TlsConfig, sink cert: Certificate, sink key: PrivateKey) -> TlsConfig
+    self.certificate = Option::Some(cert)
+    self.private_key = Option::Some(key)
+    self
   end
   
-  pub fn with_verify_peer(self: Self, verify: Bool) -> TlsConfig
-    TlsConfig {
-      min_version: self.min_version,
-      max_version: self.max_version,
-      cipher_suites: self.cipher_suites.clone(),
-      verify_peer: verify,
-      verify_hostname: self.verify_hostname,
-      use_sni: self.use_sni,
-      alpn_protocols: self.alpn_protocols.clone(),
-      certificate: self.certificate.clone(),
-      private_key: self.private_key.clone(),
-      ca_certs: self.ca_certs.clone()
-    }
+  pub fn with_verify_peer(sink self: TlsConfig, verify: Bool) -> TlsConfig
+    self.verify_peer = verify
+    self
   end
 end
 
@@ -184,9 +166,14 @@ impl Certificate
       end
       let der_len = tls_x509_to_der(handle, der_data.as_mut_ptr(), 8192)
       if der_len < 0 then
+        # The X509 handle was created above but the Certificate wrapper is
+        # never returned, so its Drop cannot cover the handle — free it
+        # here or the native X509 leaks.
+        tls_x509_free(handle)
         return Result::Err("Failed to serialize certificate to DER")
       end
       if der_len > der_data.capacity() as i32 then
+        tls_x509_free(handle)
         return Result::Err("Certificate DER exceeds output buffer capacity")
       end
       der_data.set_len(der_len)
@@ -261,9 +248,14 @@ impl PrivateKey
       if handle.is_null() then return Result::Err("Failed to parse PEM private key") end
       let der_len = tls_pkey_to_der(handle, der_data.as_mut_ptr(), 4096)
       if der_len < 0 then
+        # The EVP_PKEY handle was created above but the PrivateKey wrapper
+        # is never returned, so its Drop cannot cover the handle — free it
+        # here or the native EVP_PKEY leaks.
+        tls_pkey_free(handle)
         return Result::Err("Failed to serialize private key to DER")
       end
       if der_len > der_data.capacity() as i32 then
+        tls_pkey_free(handle)
         return Result::Err("Private key DER exceeds output buffer capacity")
       end
       der_data.set_len(der_len)
@@ -411,12 +403,14 @@ impl TlsConnection
 end
 
 impl Read for TlsConnection
-  pub def read(inout self: Self, inout buf: [u8]) -> Result[usize, TlsError]
+  pub def read(inout self: Self, buf: SliceMut[u8]) -> Result[usize, TlsError]
     if !self.is_connected() then return Result::Err(TlsError::ConnectionClosed) end
     unsafe "tls read" do
-      let result = tls_ssl_read(self.handle, buf.as_mut_ptr(), buf.len())
+      # buf.len is the writable extent — the SSL read count is the
+      # view's len, never a zero-length request after a clear.
+      let result = tls_ssl_read(self.handle, buf.ptr, buf.len as usize)
       if result < 0 then return Result::Err(TlsError::ConnectionClosed) end
-      if result as usize > buf.len() then return Result::Err(TlsError::InvalidRecord) end
+      if (result as UInt) > buf.len then return Result::Err(TlsError::InvalidRecord) end
       Result::Ok(result as usize)
     end
   end
@@ -476,7 +470,7 @@ impl TlsClient
     TlsClient::new(TlsConfig::default_client())
   end
   
-  pub fn with_alpn(protocols: Vec[String]) -> TlsClient
+  pub fn with_alpn(sink protocols: Vec[String]) -> TlsClient
     TlsClient::new(TlsConfig::default_client().with_alpn(protocols))
   end
   
@@ -504,7 +498,7 @@ impl TlsServer
     TlsServer { config: config, listener: Option::None }
   end
   
-  pub fn with_certificate(cert: Certificate, key: PrivateKey) -> TlsServer
+  pub fn with_certificate(sink cert: Certificate, sink key: PrivateKey) -> TlsServer
     TlsServer::new(TlsConfig::default_server().with_certificate(cert, key))
   end
   
