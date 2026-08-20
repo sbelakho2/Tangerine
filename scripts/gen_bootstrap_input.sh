@@ -176,6 +176,36 @@ if [ "$closure_error" -ne 0 ]; then
   exit 1
 fi
 
+# COMPILER-DRIVEN CLOSURE VERIFICATION: when a compiler binary is available,
+# the kernel compilation's module graph (the driver's --dump-module-graph) is
+# the authority — the dumped module set must equal the manifest set exactly
+# (the compiler's own module graph replaces the shell import scan; the scan
+# above remains the fallback for machines without a usable binary).
+compiler_bin=""
+for cand in build/tg_stage2 build/tg_stage3 build/tg tg; do
+  if [ -x "$cand" ]; then
+    compiler_bin="$cand"
+    break
+  fi
+done
+if [ -n "$compiler_bin" ]; then
+  graph_out="$("$compiler_bin" --dump-module-graph tg_compiler/bootstrap_main.tg 2>/dev/null || true)"
+  if [ -n "$graph_out" ]; then
+    dump_modules="$(printf '%s\n' "$graph_out" | sed -n 's/^module \([^ ]*\) items=.*$/\1/p' | sed 's/::/\//g')"
+    manifest_set_sorted="$(printf '%s\n' "${MANIFEST_SET[@]}" | sort)"
+    dump_sorted="$(printf '%s\n' "$dump_modules" | sort)"
+    if [ "$manifest_set_sorted" != "$dump_sorted" ]; then
+      echo "[bootstrap-unit:error] compiler module graph does not match the manifest:"
+      echo "  manifest-only: $(comm -23 <(printf '%s\n' "$manifest_set_sorted") <(printf '%s\n' "$dump_sorted"))"
+      echo "  graph-only:    $(comm -13 <(printf '%s\n' "$manifest_set_sorted") <(printf '%s\n' "$dump_sorted"))"
+      exit 1
+    fi
+    echo "[bootstrap-unit] compiler module-graph closure verified ($(printf '%s\n' "$dump_sorted" | wc -l | tr -d ' ') modules)"
+  else
+    echo "[bootstrap-unit:info] compiler binary present but module-graph dump unavailable (stale binary); shell scan remains the closure authority"
+  fi
+fi
+
 # Sort entries canonically for a stable aggregate hash (sort by kind then path).
 SORTED_REL=( $(printf '%s\n' "${REL_PATHS[@]}" | sort) )
 

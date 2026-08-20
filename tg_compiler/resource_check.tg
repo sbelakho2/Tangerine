@@ -6,10 +6,10 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, function_cleanup_table_new, crate_module_path_of, def_id_kind_of}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, TypedExprKind, chain_contains_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
-use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId}
+use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, FieldId}
 
 enum ResourceState
   Uninitialized
@@ -78,6 +78,18 @@ struct ResFrame
   # frame by accident. The semantic ids still cross into the frame at the
   # bind_* boundaries as tg_compiler::ids::LocalId { id: <int> }.
   locals: Map[tg_compiler::ids::LocalId, LocalState]
+  # (partial moves — the frame's per-field lattice): root semantic local ->
+  # per SEMANTIC projection chain (Vec[ProjectionKey] — the FieldId/
+  # VariantId/TupleIndex identities, NEVER string-shaped paths) -> the
+  # chain's move state. A chain recorded Consumed was moved out
+  # (extracted) while the root stays Live — the root's drop glue excludes
+  # it (the registry's partial-drop conditioning) and the chain's storage
+  # is dead (a store re-lives it). A chain recorded MaybeLive was consumed
+  # on one path only (a control-flow join) — rejected at the scope
+  # boundaries (the cleanup cannot be conditional). An absent chain is
+  # Live (the field holds its value) — the lattice records only the
+  # deviations. The root's OWN availability stays in `locals`.
+  place_moves: Map[tg_compiler::ids::LocalId, Map[ProjectionChain, ResourceState]]
 end
 
 # The ONE TypedCFG: build_typed_cfg pre-builds every CfgBlock record
@@ -468,22 +480,22 @@ end
 # module-level mut ITERATION_PLANS and its per-run reset) and a
 # long-lived compiler process never sees another program's plans.
 
-def record_iteration_plan(ctx: &mut AnalysisContext, for_node_id: Int, plan: IterationPlan) -> Unit
+def record_iteration_plan(inout ctx: AnalysisContext, for_node_id: Int, plan: IterationPlan) -> Unit
   ctx.iteration_plans.insert(for_node_id, plan)
 end
 
-def iteration_plans_snapshot(ctx: &AnalysisContext) -> Map[Int, IterationPlan]
+def iteration_plans_snapshot(ctx: AnalysisContext) -> Map[Int, IterationPlan]
   ctx.iteration_plans.clone()
 end
 
 # (phase 2): the TYPED iteration records (TypedIteration) live in the
 # context with the plans (context.typed_iterations — the ITERATION_PLANS
 # convention; no reset protocol).
-def record_typed_iteration(ctx: &mut AnalysisContext, for_node_id: Int, plan: IterationPlan) -> Unit
+def record_typed_iteration(inout ctx: AnalysisContext, for_node_id: Int, plan: IterationPlan) -> Unit
   ctx.typed_iterations.insert(for_node_id, TypedIteration { plan: plan })
 end
 
-def typed_iterations_snapshot(ctx: &AnalysisContext) -> Map[Int, TypedIteration]
+def typed_iterations_snapshot(ctx: AnalysisContext) -> Map[Int, TypedIteration]
   ctx.typed_iterations.clone()
 end
 
@@ -491,11 +503,11 @@ end
 # (context.block_frames — the authoritative (entry, exit) per-block states
 # of the flow analysis, keyed by CfgBlock id; the ITERATION_PLANS
 # convention — no reset protocol).
-def record_block_frame(ctx: &mut AnalysisContext, block_id: Int, entry: ResFrame, exit: ResFrame) -> Unit
+def record_block_frame(inout ctx: AnalysisContext, block_id: Int, entry: ResFrame, exit: ResFrame) -> Unit
   ctx.block_frames.insert(block_id, (entry, exit))
 end
 
-def block_frames_snapshot(ctx: &AnalysisContext) -> Map[Int, (ResFrame, ResFrame)]
+def block_frames_snapshot(ctx: AnalysisContext) -> Map[Int, (ResFrame, ResFrame)]
   ctx.block_frames.clone()
 end
 
@@ -505,7 +517,7 @@ end
 # derivation) or produce byte-identical sets from the equivalent exit frame
 # (record_exit_edge_plan; the post-block reconciliation in run_cfg_block
 # verifies the recorded obligations against these recorded frames).
-def block_frames_get(ctx: &AnalysisContext, block_id: Int) -> Option[(ResFrame, ResFrame)]
+def block_frames_get(ctx: AnalysisContext, block_id: Int) -> Option[(ResFrame, ResFrame)]
   match ctx.block_frames.get(&block_id)
   when Option::Some(pair) then Option::Some(pair)
   when Option::None then Option::None
@@ -521,7 +533,7 @@ struct SliceViewInfo
   backing_fields: Vec[String]
 end
 
-def slice_views_snapshot_keys(ctx: &AnalysisContext) -> Vec[Int]
+def slice_views_snapshot_keys(ctx: AnalysisContext) -> Vec[Int]
   var keys = Vec::new()
   for (k, _) in ctx.slice_views do
     keys.push(k)
@@ -529,11 +541,11 @@ def slice_views_snapshot_keys(ctx: &AnalysisContext) -> Vec[Int]
   keys
 end
 
-def slice_views_register(ctx: &mut AnalysisContext, view_id: Int, backing_root: Int, backing_fields: &Vec[String]) -> Unit
+def slice_views_register(inout ctx: AnalysisContext, view_id: Int, backing_root: Int, backing_fields: Vec[String]) -> Unit
   ctx.slice_views.insert(view_id, SliceViewInfo { backing_root: backing_root, backing_fields: backing_fields.clone() })
 end
 
-def slice_views_lookup(ctx: &AnalysisContext, view_id: Int) -> Option[SliceViewInfo]
+def slice_views_lookup(ctx: AnalysisContext, view_id: Int) -> Option[SliceViewInfo]
   match ctx.slice_views.get(view_id)
   when Option::Some(info) then Option::Some(info)
   when Option::None then Option::None
@@ -546,7 +558,7 @@ end
 # closure bodies) as well as by check_block itself (the loop-created view
 # locals are non-owning, so exit_scope's to_forget never covers them — the
 # snapshot protocol is the liveness authority).
-def slice_views_remove_after(ctx: &mut AnalysisContext, entry_keys: &Vec[Int]) -> Unit
+def slice_views_remove_after(inout ctx: AnalysisContext, entry_keys: Vec[Int]) -> Unit
   var to_remove = Vec::new()
   for (k, _) in ctx.slice_views do
     if !entry_keys.contains(&k) then
@@ -564,7 +576,7 @@ end
 # local chains to that local's registered backing (the original owner
 # place). Option::None when no place-like root exists (a method-call
 # result with no receiver place — no backing to protect).
-def slice_view_backing(ctx: &AnalysisContext, typed: &TypedProgram, value: &Expr) -> Option[(Int, Vec[String])]
+def slice_view_backing(ctx: AnalysisContext, typed: TypedProgram, value: Expr) -> Option[(Int, Vec[String])]
   let base = match value.kind
   when ExprKind::ExprMethodCall(recv, _, _, _) then recv
   when _ then value
@@ -594,7 +606,7 @@ end
 # its backing place, so the mutation-while-live rule can protect the
 # backing while the view local is live. Skip registrations without a
 # place-like root (a temporary view has no backing to protect).
-def register_slice_view_local(ctx: &mut AnalysisContext, env: &mut TypeEnv, typed: &TypedProgram, pattern: &Pattern, value: &Expr) -> Unit
+def register_slice_view_local(inout ctx: AnalysisContext, inout env: TypeEnv, typed: TypedProgram, pattern: Pattern, value: Expr) -> Unit
   match typed.expr_types.get(value.node_id)
   when Option::Some(vt) then
     if is_slice_view_type_of(env, &vt) then
@@ -618,7 +630,7 @@ end
 # projected-iteration conflict rule); a match means the statement mutates/
 # reallocates a buffer a live Slice local views. Reported ONCE per
 # statement (the first offending view's name).
-def check_slice_view_backing_mutation(ctx: &AnalysisContext, typed: &TypedProgram, stmt: &Stmt, errors: &mut Vec[ResourceError]) -> Unit
+def check_slice_view_backing_mutation(ctx: AnalysisContext, typed: TypedProgram, stmt: Stmt, inout errors: Vec[ResourceError]) -> Unit
   var reported = false
   for (view_id, info) in ctx.slice_views do
     if !reported then
@@ -650,13 +662,13 @@ end
 # through the SAME context the resource checker reads
 # (attach_edge_actions prepends EndAccess actions per edge; the MIR's
 # lowering never re-runs the checkers — the artifact carries the registry).
-def access_registry_fresh_id(ctx: &mut AnalysisContext) -> AccessId
+def access_registry_fresh_id(inout ctx: AnalysisContext) -> AccessId
   let n = ctx.access_counter
   ctx.access_counter = n + 1
   AccessId { id: n }
 end
 
-def access_registry_register(ctx: &mut AnalysisContext, edge_id: Int, aid: AccessId) -> Unit
+def access_registry_register(inout ctx: AnalysisContext, edge_id: Int, aid: AccessId) -> Unit
   match ctx.access_registry.get(edge_id)
   when Option::Some(existing) then
     var ext = existing.clone()
@@ -672,7 +684,7 @@ end
 # the access ids registered on ONE CFG edge (its CfgEdgeId), in
 # registration order (the resource checker prepends them to the edge's
 # cleanup as EndAccess actions in REVERSE order — borrows end LIFO).
-def access_registry_for_edge(ctx: &AnalysisContext, edge_id: Int) -> Vec[AccessId]
+def access_registry_for_edge(ctx: AnalysisContext, edge_id: Int) -> Vec[AccessId]
   match ctx.access_registry.get(edge_id)
   when Option::Some(ids) then ids.clone()
   when Option::None then Vec::new()
@@ -681,7 +693,7 @@ end
 
 # is the id a registered access (any edge)? validate_cfg_edges
 # checks every EndAccess action against the run's registry.
-def access_registry_has(ctx: &AnalysisContext, aid: &AccessId) -> Bool
+def access_registry_has(ctx: AnalysisContext, aid: AccessId) -> Bool
   var found = false
   for (_, ids) in ctx.access_registry do
     if !found then
@@ -691,7 +703,7 @@ def access_registry_has(ctx: &AnalysisContext, aid: &AccessId) -> Bool
   found
 end
 
-pub def resource_check(program: &Program, typed: &TypedProgram, cfg_in: &TypedCFG, ctx: &mut AnalysisContext, env_snapshot: &mut TypeEnv) -> ResourceCheckResult
+pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, inout ctx: AnalysisContext, inout env_snapshot: TypeEnv) -> ResourceCheckResult
  # the accumulators (iteration plans, typed iterations, block
   # frames, slice views, the access registry) live in the AnalysisContext —
   # fresh per compilation, so NO reset protocol exists here.
@@ -782,7 +794,7 @@ end
 # consumes the SAME TypedCFG (build_typed_cfg is its entry too) and
 # registers its accesses on the edges (the shared ACCESS_REGISTRY).
 
-pub def build_typed_cfg(program: &Program, typed: &TypedProgram) -> TypedCFG
+pub def build_typed_cfg(program: Program, typed: TypedProgram) -> TypedCFG
   var edges = Vec::new()
   var blocks = Vec::new()
   mut i = 0
@@ -797,7 +809,7 @@ end
 # Struct field defaults, enum discriminants, const/static values, and
 # macro bodies are expression-level walks with a fresh, item-local defer
 # chain (the state walk's item_defer_chain mirror).
-def cfg_item(item: &Item, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock]) -> Unit
+def cfg_item(item: Item, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock]) -> Unit
   var item_chain = Vec::new()
   match item.kind
   when ItemKind::ItemFunction(f) then cfg_function(&f, edges, blocks)
@@ -857,7 +869,7 @@ end
 
 # a function's structural walk — contracts + body (the
 # check_function mirror). The function's own defer chain.
-def cfg_function(f: &FunctionDecl, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock]) -> Unit
+def cfg_function(f: FunctionDecl, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock]) -> Unit
   var chain = Vec::new()
   mut i = 0
   while i < f.contracts.len() do
@@ -867,14 +879,131 @@ def cfg_function(f: &FunctionDecl, edges: &mut Vec[CfgEdge], blocks: &mut Vec[Cf
   cfg_fn_body(&f.body, edges, blocks, &mut chain)
 end
 
-def cfg_trait_method(m: &TraitMethod, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock]) -> Unit
+def cfg_trait_method(m: TraitMethod, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock]) -> Unit
   var chain = Vec::new()
   cfg_fn_body(&m.default_body, edges, blocks, &mut chain)
 end
 
-def cfg_fn_body(body: &FnBody, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+# is the statement a top-level CONTROL-FLOW split — the partition points
+# of the function body's basic-block lowering? A top-level block is a
+# maximal run of linear statements followed by at most one control-flow
+# statement (the split's INTERNAL branches remain the statement recursion's
+# domain — the top-level graph's edges are the linear continuations).
+def stmt_is_control_flow(stmt: Stmt) -> Bool
+  match stmt.kind
+  when StmtKind::StmtIf(_) then true
+  when StmtKind::StmtMatch(_) then true
+  when StmtKind::StmtWhile(_, _) then true
+  when StmtKind::StmtFor(_) then true
+  when StmtKind::StmtLoop(_) then true
+  when _ then false
+  end
+end
+
+# The top-level basic-block partition: the body's statement list is split
+# at each control-flow statement. Returns the per-block (starts, ends)
+# statement-index ranges in order (each block: [starts[i], ends[i])).
+def top_block_ranges(stmts: &Vec[Stmt]) -> (Vec[Int], Vec[Int])
+  var starts = Vec::new()
+  var ends = Vec::new()
+  var s = 0
+  while s < stmts.len() do
+    starts.push(s)
+    var e = s
+    while e < stmts.len() do
+      e = e + 1
+      if e < stmts.len() && stmt_is_control_flow(&stmts[e - 1]) then
+        break
+      end
+    end
+    ends.push(e)
+    s = e
+  end
+  (starts, ends)
+end
+
+# The statement-range node-id attribution (the block_stmt_ids mirror for a
+# top-level block range [st, en)).
+def block_stmt_ids_range(block: &Block, st: Int, en: Int) -> Vec[Int]
+  var ids = Vec::new()
+  var i = st
+  while i < en do
+    ids.push(block.stmts[i].node_id)
+    match block.stmts[i].kind
+    when StmtKind::StmtIf(if_stmt) then
+      ids.push(if_stmt.cond.node_id)
+      var b = 0
+      while b < if_stmt.elsif_branches.len() do
+        ids.push(if_stmt.elsif_branches[b].0.node_id)
+        b = b + 1
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  ids
+end
+
+# does the statement RANGE [st, en) end in a terminator?
+def block_ends_with_terminator_range(block: &Block, st: Int, en: Int) -> Bool
+  if en <= st then
+    return false
+  end
+  match block.stmts[en - 1].kind
+  when StmtKind::StmtReturn(_) then true
+  when StmtKind::StmtBreak(_) then true
+  when StmtKind::StmtContinue then true
+  when _ then false
+  end
+end
+
+# The structural walk over the TOP-LEVEL basic blocks (the function body's
+# partition): each block's statements' edges are recorded (cfg_stmt), the
+# block's CfgBlock record is appended over the block's edge range (id =
+# the block's first-statement node id), and the LINEAR continuation edge
+# (the block's fallthrough to the next top-level block — Normal, source =
+# the block's last statement, destination = the next block's key) is
+# recorded for every block except the last. The last block keeps the
+# function's fallthrough Normal edge (source = the block's key — the
+# attach convention). The block key is pushed on the structural defer
+# chain while its statements are walked (the check_block mirror).
+def cfg_top_blocks(block: &Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
+  let (starts, ends) = top_block_ranges(&block.stmts)
+  var bi = 0
+  while bi < starts.len() do
+    let st = starts[bi]
+    let en = ends[bi]
+    let blk_key = block.stmts[st].node_id
+    let edge_base = edges.len()
+    if blk_key != 0 then
+      chain.push(blk_key)
+    end
+    var si = st
+    while si < en do
+      cfg_stmt(&block.stmts[si], edges, blocks, chain)
+      si = si + 1
+    end
+    if blk_key != 0 then
+      chain.pop()
+    end
+    if bi < starts.len() - 1 then
+      let next_key = block.stmts[starts[bi + 1]].node_id
+      edges.push(CfgEdge { kind: CfgEdgeKind::Normal, source: block.stmts[en - 1].node_id, destination: next_key, actions: Vec::new() })
+    else
+      if !block_ends_with_terminator_range(block, st, en) then
+        edges.push(CfgEdge { kind: CfgEdgeKind::Normal, source: blk_key, destination: 0, actions: Vec::new() })
+      end
+    end
+    let rec = blocks.len()
+    blocks.push(CfgBlock { id: blk_key, edges: Vec::new() })
+    attach_block_cfg_record(edges, blocks, rec, &block_stmt_ids_range(block, st, en), edge_base)
+    bi = bi + 1
+  end
+end
+
+def cfg_fn_body(body: FnBody, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   match body
-  when FnBody::FnBlock(b) then cfg_block(&b, edges, blocks, chain)
+  when FnBody::FnBlock(b) then cfg_top_blocks(&b, edges, blocks, chain)
   when FnBody::FnExpr(e) then cfg_expr(&e, edges, blocks, chain)
   when FnBody::FnExtern(_) then ()
   when FnBody::FnNone then ()
@@ -892,7 +1021,7 @@ end
 # one-block-per-lexical-block attribution the flow machinery
 # (the originating-ids scan over the single flattened statement list)
 # performed; the flat list is now derived directly from the statements.
-def block_stmt_ids(block: &Block) -> Vec[Int]
+def block_stmt_ids(block: Block) -> Vec[Int]
   var ids = Vec::new()
   mut i = 0
   while i < block.stmts.len() do
@@ -916,7 +1045,7 @@ end
 # flattening classified StmtReturn/StmtBreak/StmtContinue as flow terminators
 # nodes — a block whose last statement is one of them terminates, so it
 # records no Normal fallthrough edge.
-def block_ends_with_terminator(block: &Block) -> Bool
+def block_ends_with_terminator(block: Block) -> Bool
   if block.stmts.len() == 0 then
     return false
   end
@@ -931,7 +1060,7 @@ end
 
 # is the statement a flow terminator (the statement-flattening
 # Linear/Terminator split — the ONLY split that ever fired)?
-pub def stmt_is_terminator(stmt: &Stmt) -> Bool
+pub def stmt_is_terminator(stmt: Stmt) -> Bool
   match stmt.kind
   when StmtKind::StmtReturn(_) then true
   when StmtKind::StmtBreak(_) then true
@@ -949,7 +1078,7 @@ end
 # derived attribution replaces the flow-block record builder (the
 # flow-block splitting produced exactly one record per lexical block with
 # this same id and edge set).
-def attach_block_cfg_record(edges: &Vec[CfgEdge], blocks: &mut Vec[CfgBlock], rec: Int, orig_ids: &Vec[Int], e_start: Int) -> Unit
+def attach_block_cfg_record(edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], rec: Int, orig_ids: Vec[Int], e_start: Int) -> Unit
   var e = e_start
   while e < edges.len() do
     if orig_ids.contains(&edges[e].source) then
@@ -969,7 +1098,7 @@ end
 # defer chain while its statements are walked (the check_block mirror) so
 # nested Break/Continue/GuardElse edges' destinations (enclosing_loop_key)
 # resolve identically.
-def cfg_block(block: &Block, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_block(block: Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   let edge_base = edges.len()
   let blk_key = block_exit_key(block)
   if blk_key != 0 then
@@ -1009,7 +1138,7 @@ end
 # stop at the loop boundary. the body's block record is the SAME
 # record the state walk's check_loop_body executes against — the loop
 # body's (entry, exit) frames are recorded under this record's id.
-def cfg_loop_body(body: &Block, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_loop_body(body: Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   let body_key = block_exit_key(body)
   if body_key != 0 then
     chain.push(0 - body_key)
@@ -1038,7 +1167,7 @@ end
 # the SAME loop-context identity the Break/Continue edges of this loop
 # carry (enclosing_loop_key), so validate_cfg_edges can verify the loop
 # edges name a real loop.
-def cfg_loop_backedge(loop_stmt_id: Int, body: &Block, edges: &mut Vec[CfgEdge]) -> Unit
+def cfg_loop_backedge(loop_stmt_id: Int, body: Block, inout edges: Vec[CfgEdge]) -> Unit
   let body_key = block_exit_key(body)
   if body_key != 0 then
     edges.push(CfgEdge { kind: CfgEdgeKind::Backedge, source: loop_stmt_id, destination: body_key, actions: Vec::new() })
@@ -1050,7 +1179,7 @@ end
 # obligation — the check_defer_body mirror). The defer body's CfgBlock
 # record (id = the body's first statement node id) is the record the state
 # walk's check_defer_body executes against.
-def cfg_defer_body(body: &Block, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_defer_body(body: Block, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   let body_base = edges.len()
   mut i = 0
   while i < body.stmts.len() do
@@ -1068,7 +1197,7 @@ end
 
 # the statement-level structural dispatch — the check_stmt mirror
 # (every transfer the state walk attaches to is recorded HERE, empty).
-def cfg_stmt(stmt: &Stmt, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_stmt(stmt: Stmt, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   match stmt.kind
   when StmtKind::StmtLet(_, _, value, _) then
     cfg_expr(&value, edges, blocks, chain)
@@ -1191,14 +1320,14 @@ end
 # target's expression-level splits are recorded here too (extra True/False
 # split edges with empty actions are harmless — the state computation
 # never attaches cleanup to split edges).
-def cfg_assign_target(target: &Expr, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_assign_target(target: Expr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   cfg_expr(target, edges, blocks, chain)
 end
 
 # the match structural walk (the check_match mirror — the
 # scrutinee's and the arm patterns'/guards' expression-level splits plus
 # the arm bodies' blocks).
-def cfg_match(m: &MatchExpr, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_match(m: MatchExpr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   cfg_expr(&m.scrutinee, edges, blocks, chain)
   mut i = 0
   while i < m.arms.len() do
@@ -1214,7 +1343,7 @@ end
 
 # the pattern structural walk (the check_pattern mirror — only
 # literal/range-bound expressions can carry expression-level splits).
-def cfg_pattern(pat: &Pattern, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_pattern(pat: Pattern, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   match pat.kind
   when PatternKind::Wildcard then ()
   when PatternKind::Ident(_, _) then ()
@@ -1265,7 +1394,7 @@ end
 # mirror. Expression-level splits (ExprIf) get their True/False edges AND
 # their own expression-split CfgBlock record (the documented gap CLOSED).
 # Closures get a fresh defer chain (the check_expr mirror).
-def cfg_expr(expr: &Expr, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], chain: &mut Vec[Int]) -> Unit
+def cfg_expr(expr: Expr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout chain: Vec[Int]) -> Unit
   match expr.kind
   when ExprKind::ExprIntLit(_) then ()
   when ExprKind::ExprFloatLit(_) then ()
@@ -1391,7 +1520,7 @@ end
 # identity, or -1. The structural CFG pass records every transfer the
 # state computation attaches to, so a miss at an attach site is an
 # internal error (reported by attach_edge_actions).
-pub def find_edge_index(edges: &Vec[CfgEdge], kind: CfgEdgeKind, source: Int) -> Int
+pub def find_edge_index(edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int) -> Int
   mut i = 0
   while i < edges.len() do
     if edges[i].kind == kind && edges[i].source == source then
@@ -1411,7 +1540,7 @@ end
 # PREPENDED in reverse registration order (borrows end LIFO — before any
 # deferred code runs or memory is freed), then the recording site's actions
 # (RunDefer LIFO, then Drop in reverse drop order).
-pub def attach_edge_actions(ctx: &AnalysisContext, edges: &mut Vec[CfgEdge], kind: CfgEdgeKind, source: Int, actions: Vec[CleanupAction], errors: &mut Vec[ResourceError]) -> Unit
+pub def attach_edge_actions(ctx: AnalysisContext, inout edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int, actions: Vec[CleanupAction], inout errors: Vec[ResourceError]) -> Unit
   let idx = find_edge_index(edges, kind, source)
   if idx >= 0 then
     var full_actions = Vec::new()
@@ -1438,7 +1567,7 @@ end
 # One record per edge (empty actions included — a record exists for every
 # real CFG transfer; the MIR's "no record" case is only a synthesized/
 # IR-only edge that never passed through the checker).
-pub def cleanup_edges_serialize(edges: &Vec[CfgEdge]) -> Vec[CleanupEdge]
+pub def cleanup_edges_serialize(edges: Vec[CfgEdge]) -> Vec[CleanupEdge]
   var out = Vec::new()
   mut i = 0
   while i < edges.len() do
@@ -1615,7 +1744,7 @@ end
 # mir_lang_item_id resolves) and the Drop registration (deinit_targets is
 # the serialization of the Drop-impl table type_has_registered_drop scans).
 # The engine memoizes in env.type_prop_cache, which starts empty here.
-pub def engine_snapshot_env(typed: &TypedProgram) -> TypeEnv
+pub def engine_snapshot_env(typed: TypedProgram) -> TypeEnv
   var env = engine_env_empty()
   var type_list = Vec::new()
   var name_index: Map[String, Int] = Map::new()
@@ -1810,11 +1939,11 @@ end
 # contains_capability axis — queried on the CONCRETE type identity like
 # every other ownership question in this file. The former parallel walk
 # over the typed tables is are not part of the model: no second containment analysis.
-def type_kind_contains_capability(env: &mut TypeEnv, ty: &Type) -> Bool
+def type_kind_contains_capability(inout env: TypeEnv, ty: Type) -> Bool
   type_properties_of(env, ty).contains_capability
 end
 
-def binding_name(typed: &TypedProgram, id: Int) -> String
+def binding_name(typed: TypedProgram, id: Int) -> String
   match typed.local_bindings.get(id)
   when Option::Some(lb) then lb.name.clone()
   when Option::None then ""
@@ -1831,7 +1960,7 @@ end
 # Derive the owner key for an item's function/method from the typed
 # program's resolver output (DefId-based; unique across merged files).
 # Methods without a recorded DefId fall back to a per-item positional key.
-def item_owner_key(typed: &TypedProgram, item_idx: Int, method_index: Int) -> String
+def item_owner_key(typed: TypedProgram, item_idx: Int, method_index: Int) -> String
   match typed.resolutions.item_defs.get(item_idx)
   when Option::Some(dids) then
     if method_index < dids.len() then
@@ -1863,7 +1992,7 @@ end
 # ModuleId key, never a containment scan). STRICT (the compile path): a
 # missing module is an internal compiler error (ICE) — it never
 # degenerates to the root-module render "".
-def module_path_of_did(typed: &TypedProgram, did: &DefId) -> String
+def module_path_of_did(typed: TypedProgram, did: DefId) -> String
   crate_module_path_of(&typed.ast, &did.module).join("::")
 end
 
@@ -1874,7 +2003,7 @@ end
 # keyed by CallableId, so no entry is recorded; the MIR never lowers those
 # items). One semantic callable -> one DefId -> one CallableId across the
 # checker and the MIR.
-def item_callable(typed: &TypedProgram, item_idx: Int) -> Option[CallableId]
+def item_callable(typed: TypedProgram, item_idx: Int) -> Option[CallableId]
   match typed.resolutions.item_defs.get(item_idx)
   when Option::Some(dids) then
     if dids.len() > 0 then
@@ -1890,7 +2019,7 @@ end
 # (item index, method index) — the resolver's item_defs entry (the SAME
 # map item_owner_key / mir_item_owner_key derive the String owner key
 # from). Option::None when the resolver recorded none.
-def item_method_callable(typed: &TypedProgram, item_idx: Int, method_index: Int) -> Option[CallableId]
+def item_method_callable(typed: TypedProgram, item_idx: Int, method_index: Int) -> Option[CallableId]
   match typed.resolutions.item_defs.get(item_idx)
   when Option::Some(dids) then
     if method_index < dids.len() then
@@ -1902,7 +2031,7 @@ def item_method_callable(typed: &TypedProgram, item_idx: Int, method_index: Int)
   end
 end
 
-def check_item(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, item: &Item, item_idx: Int, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], module_path: &Vec[String]) -> Unit
+def check_item(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, item: Item, item_idx: Int, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], module_path: Vec[String]) -> Unit
   var item_entry = Vec::new()
  # the item-level expression checks (struct field defaults,
   # const/static values, macro bodies) run against the PRE-BUILT global CFG
@@ -2027,7 +2156,7 @@ def check_item(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: 
   end
 end
 
-def check_function(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, f: &FunctionDecl, owner_key: String, callable: Option[CallableId], errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int]) -> Unit
+def check_function(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, f: FunctionDecl, owner_key: String, callable: Option[CallableId], inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int]) -> Unit
   mut frame = res_frame_new()
   # The function's own defer-scope chain: empty at the function boundary, the
   # function body block pushes its key when check_block enters it.
@@ -2099,7 +2228,7 @@ def check_function(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, c
   check_uninitialized_exit(&frame, typed, errors)
 end
 
-def check_trait_method(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, m: &TraitMethod, owner_key: String, callable: Option[CallableId], trait_is_drop: Bool, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int]) -> Unit
+def check_trait_method(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, m: TraitMethod, owner_key: String, callable: Option[CallableId], trait_is_drop: Bool, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int]) -> Unit
   mut frame = res_frame_new()
   var defer_chain = Vec::new()
   let entry_ids = bind_params(env, typed, &m.sig.params, &mut frame, owner_key, errors)
@@ -2150,7 +2279,7 @@ end
 # function's own outermost scope's registered DeferIds — the function body
 # block scope, read from the scope table at record time). Option::None
 # callable (a no-DefId item) records nothing.
-def record_finalize_plan(typed: &TypedProgram, frame: &ResFrame, callable: Option[CallableId], finalize_plan: &mut FunctionCleanupTable, exclude_id: Int, fn_body_scope: Int) -> Unit
+def record_finalize_plan(typed: TypedProgram, frame: ResFrame, callable: Option[CallableId], inout finalize_plan: FunctionCleanupTable, exclude_id: Int, fn_body_scope: Int) -> Unit
   match callable
   when Option::Some(cid) then
     var ids = Vec::new()
@@ -2183,7 +2312,7 @@ end
 # the closure-body finalize set — the SEMANTIC record under the
 # closure expression's NodeId (the "closure::<node id>" String-key protocol). The closure body is a function-like scope; its end-frame drops
 # are recorded the same way (the closure env/params are the entry locals).
-def record_closure_cleanup(typed: &TypedProgram, frame: &ResFrame, closure_node_id: Int, finalize_plan: &mut FunctionCleanupTable) -> Unit
+def record_closure_cleanup(typed: TypedProgram, frame: ResFrame, closure_node_id: Int, inout finalize_plan: FunctionCleanupTable) -> Unit
   var ids = Vec::new()
   for (id, ls) in frame.locals do
     if ls.availability == ResourceState::Live then
@@ -2229,7 +2358,7 @@ end
 # exempt). The DECISION points never fail open: the MIR Copy verifier
 # answers deferred = NOT copyable, and the drop-glue axis answers
 # DeinitPlan::Deferred — never Trivial.
-def is_owning_typed(env: &mut TypeEnv, ty: &Type) -> Bool
+def is_owning_typed(inout env: TypeEnv, ty: Type) -> Bool
   let p = type_properties_of(env, ty)
   p.owns_state || p.is_linear
 end
@@ -2243,7 +2372,7 @@ end
 # (the corrected engine's smart-pointer arm: Box/UniquePtr the only linear
 # owners). The Rc-payload policy below still rejects Rc[File] and
 # Rc[UniquePtr[..]] through the PAYLOAD's own linear answer.
-def is_non_shareable_type(env: &mut TypeEnv, ty: &Type) -> Bool
+def is_non_shareable_type(inout env: TypeEnv, ty: Type) -> Bool
   let p = type_properties_of(env, ty)
   p.is_linear
 end
@@ -2261,7 +2390,7 @@ end
 # former registered-name fallback is are not part of the model: a snapshot missing the
 # rc id (-1 — never for the registered builtin) fails CLOSED — no
 # name comparison ever selects the Rc ownership policy.
-def reject_rc_resource(env: &mut TypeEnv, typed: &TypedProgram, ty: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def reject_rc_resource(inout env: TypeEnv, typed: TypedProgram, ty: Type, span: Span, inout errors: Vec[ResourceError]) -> Unit
   match ty
   when Type::Adt(tid, args) then
     let rc_id = env.lang_items.rc
@@ -2274,7 +2403,7 @@ end
 
 # phase-2C: the shared Rc-payload rejection (the Adt form of Rc
 # dispatches here): the payload must be shareable.
-def reject_rc_payload(env: &mut TypeEnv, typed: &TypedProgram, inner: &Type, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def reject_rc_payload(inout env: TypeEnv, typed: TypedProgram, inner: Type, span: Span, inout errors: Vec[ResourceError]) -> Unit
   if is_non_shareable_type(env, inner) then
     errors.push(ResourceError {
       message: "Rc[Resource] is unsupported: a linear resource cannot be shared through reference counting",
@@ -2283,7 +2412,7 @@ def reject_rc_payload(env: &mut TypeEnv, typed: &TypedProgram, inner: &Type, spa
   end
 end
 
-def bind_params(env: &mut TypeEnv, typed: &TypedProgram, params: &Vec[Param], frame: &mut ResFrame, owner_key: String, errors: &mut Vec[ResourceError]) -> Vec[tg_compiler::ids::LocalId]
+def bind_params(inout env: TypeEnv, typed: TypedProgram, params: Vec[Param], inout frame: ResFrame, owner_key: String, inout errors: Vec[ResourceError]) -> Vec[tg_compiler::ids::LocalId]
   mut out = Vec::new()
   mut i = 0
   while i < params.len() do
@@ -2309,7 +2438,7 @@ def param_origin_of(convention: AccessConvention) -> ParamOrigin
   end
 end
 
-def bind_param(env: &mut TypeEnv, typed: &TypedProgram, p: &Param, frame: &mut ResFrame, owner_key: String, index: Int, errors: &mut Vec[ResourceError]) -> Option[tg_compiler::ids::LocalId]
+def bind_param(inout env: TypeEnv, typed: TypedProgram, p: Param, inout frame: ResFrame, owner_key: String, index: Int, inout errors: Vec[ResourceError]) -> Option[tg_compiler::ids::LocalId]
   match typed.param_binding_resolutions.get(owner_key)
   when Option::Some(ids) then
     if index < ids.len() then
@@ -2353,7 +2482,7 @@ def bind_param(env: &mut TypeEnv, typed: &TypedProgram, p: &Param, frame: &mut R
   end
 end
 
-def check_fn_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, body: &FnBody, frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_fn_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: FnBody, inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match body
   when FnBody::FnBlock(b) then run_fn_block_worklist(program, typed, env, ctx, &b, &Vec::new(), frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when FnBody::FnExpr(e) then
@@ -2413,137 +2542,143 @@ end
 # carry only id + edge indices; the function-level driver holds only the
 # body's statements) — that is the integration point that would need the
 # structural pass to expose per-record statements.
-def run_fn_block_worklist(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, block: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
-  let blk_key = block_exit_key(block)
-  var fn_blocks = Vec::new()
-  var bi = 0
-  while bi < blocks.len() do
-    if blocks[bi].id == blk_key then
-      fn_blocks.push(bi)
-    end
-    bi = bi + 1
-  end
-  if fn_blocks.len() == 0 then
-    # empty body (key 0): the structural pass recorded no block — the
-    # worklist has nothing to drive (the empty-block no-op path).
+def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, block: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
+  # The top-level basic-block driver: the function body's statements are
+  # partitioned into top-level blocks at the control-flow statements (the
+  # SAME partition the structural pass cfg_top_blocks used — the block ids
+  # align); each block executes through the per-block machinery
+  # (run_cfg_block over the block's statement slice against its ENTRY frame
+  # — the join of the predecessor blocks' exits); the top-level blocks
+  # SHARE the function's lexical scope (the defer scope push/pop and the
+  # scope-exit obligations apply once, at the function level); the
+  # continuation edges (the linear Normal edges the structural pass
+  # recorded between the top-level blocks) drive the successor joins.
+  let (starts, ends) = top_block_ranges(&block.stmts)
+  if starts.len() == 0 then
+    # empty body: the structural pass recorded no blocks — nothing to drive.
     return
   end
-  # the worklist state: the per-block ENTRY frames (block id -> entry
-  # frame). The entry block's entry frame is the function-entry frame.
+  let blk_key = block_exit_key(block)
+  # the function-level lexical scope
+  let entry_names = res_frame_names_clone(frame)
+  let view_keys_at_entry = slice_views_snapshot_keys(ctx)
+  if blk_key != 0 then
+    defer_chain.push(blk_key)
+  end
+  # the worklist state: per-block ENTRY frames (block id -> entry frame).
+  # The entry block's entry frame is the function-entry frame.
   var entry_states: Map[Int, ResFrame] = Map::new()
   var pending = Vec::new()
-  entry_states.insert(blk_key, res_frame_clone(frame))
-  pending.push(blk_key)
+  let first_key = block.stmts[starts[0]].node_id
+  entry_states.insert(first_key, res_frame_clone(frame))
+  pending.push(first_key)
   while pending.len() > 0 do
     match pending.pop()
     when Option::Some(key) then
-      # process the block: the full per-block machinery (check_block —
-      # the defer-scope push, run_cfg_block over the block's statements
-      # under its entry frame, the (entry, exit) block frames recorded
-      # under the block's id, the Normal-edge obligation, the scope
-      # exit). For the top-level universe this is the body record — the
-      # body's statement list, the only statement list the function-level
-      # driver holds.
-      check_block(program, typed, env, ctx, block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-      # the JOIN: the processed block's successors' entry states join its
-      # EXIT state — the post-processing frame (the scope-exit frontier a
-      # successor would enter under). Only successors inside the top-level
-      # universe are joined and re-driven; the nested records' entries are
-      # the statement recursion's domain (established from the pre-branch
-      # frame, unchanged).
-      let exit_state = res_frame_clone(frame)
-      var ri = 0
-      while ri < fn_blocks.len() do
-        if blocks[fn_blocks[ri]].id == key then
-          var ei = 0
-          while ei < blocks[fn_blocks[ri]].edges.len() do
-            let dest = edges[blocks[fn_blocks[ri]].edges[ei]].destination
-            if dest != 0 then
-              var in_universe = false
-              var ui = 0
-              while ui < fn_blocks.len() do
-                if blocks[fn_blocks[ui]].id == dest then
-                  in_universe = true
-                end
-                ui = ui + 1
-              end
-              if in_universe then
-                match entry_states.get(&dest)
-                when Option::Some(cur) then
-                  var two = Vec::new()
-                  two.push(res_frame_clone(&cur))
-                  two.push(res_frame_clone(&exit_state))
-                  let joined = merge_frames(&two)
-                  if !res_frame_equal(&cur, &joined) then
-                    entry_states.insert(dest, joined)
-                    pending.push(dest)
+      var bi = 0
+      var found = false
+      while bi < starts.len() do
+        if block.stmts[starts[bi]].node_id == key then
+          found = true
+          break
+        end
+        bi = bi + 1
+      end
+      if found then
+        match entry_states.get(key)
+        when Option::Some(entry_f) then
+          frame_assign(frame, &entry_f)
+          # the block's statement slice
+          var slice = Vec::new()
+          var si = starts[bi]
+          while si < ends[bi] do
+            slice.push(block.stmts[si].clone())
+            si = si + 1
+          end
+          let entry_frame = res_frame_clone(frame)
+          let (exit_frame, _) = run_cfg_block(program, typed, env, ctx, &slice, loop_outer, &entry_frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, key, Option::None)
+          frame_assign(frame, &exit_frame)
+          # the JOIN: the processed block's successors' entry states join
+          # its EXIT state — the successors are the top-level blocks whose
+          # ids are the destinations of the block's record's edges (the
+          # linear continuation edges the structural pass recorded). The
+          # nested records' entries are the statement recursion's domain.
+          let exit_state = res_frame_clone(frame)
+          var ri = 0
+          while ri < blocks.len() do
+            if blocks[ri].id == key then
+              var ei = 0
+              while ei < blocks[ri].edges.len() do
+                let eidx = blocks[ri].edges[ei]
+                if eidx < edges.len() then
+                  let dest = edges[eidx].destination
+                  if dest != 0 then
+                    var in_universe = false
+                    var ui = 0
+                    while ui < starts.len() do
+                      if block.stmts[starts[ui]].node_id == dest then
+                        in_universe = true
+                      end
+                      ui = ui + 1
+                    end
+                    if in_universe then
+                      match entry_states.get(dest)
+                      when Option::Some(cur) then
+                        var two = Vec::new()
+                        two.push(res_frame_clone(&cur))
+                        two.push(res_frame_clone(&exit_state))
+                        let joined = merge_frames(&two)
+                        if !res_frame_equal(&cur, &joined) then
+                          entry_states.insert(dest, joined)
+                          pending.push(dest)
+                        end
+                      when Option::None then
+                        entry_states.insert(dest, res_frame_clone(&exit_state))
+                        pending.push(dest)
+                      end
+                    end
                   end
-                when Option::None then
-                  entry_states.insert(dest, res_frame_clone(&exit_state))
-                  pending.push(dest)
                 end
+                ei = ei + 1
               end
             end
-            ei = ei + 1
+            ri = ri + 1
           end
+        when Option::None then ()
         end
-        ri = ri + 1
       end
     when Option::None then ()
     end
   end
+  # the final top-level block's fallthrough obligations (the function's
+  # Normal edge — the structural pass recorded it with source = the final
+  # block's key; the plan uses the final block's own slice, whose recorded
+  # frames are under the final block's key).
+  let last_st = starts[starts.len() - 1]
+  let last_en = ends[ends.len() - 1]
+  let last_key = block.stmts[last_st].node_id
+  if !block_ends_with_terminator_range(&block, last_st, last_en) then
+    var last_slice = Vec::new()
+    var li = last_st
+    while li < last_en do
+      last_slice.push(block.stmts[li].clone())
+      li = li + 1
+    end
+    let final_block = Block { stmts: last_slice, span: block.span }
+    let block_actions = record_block_exit_plan(ctx, typed, frame, &entry_names, &final_block, finalize_plan)
+    if blk_key != 0 then
+      attach_edge_actions(ctx, edges, CfgEdgeKind::Normal, last_key, block_actions, errors)
+    end
+  end
+  if blk_key != 0 then
+    defer_chain.pop()
+  end
+  exit_scope(frame, &entry_names, typed, errors)
+  slice_views_remove_after(ctx, &view_keys_at_entry)
 end
 
-# / structural validation of the pre-built CFG edge model.
-# Runs ONCE per program (end of resource_check, over the whole CFG) and
-# reports a checker internal error when the model is inconsistent:
-#   - every edge has a valid (non-negative) source and destination
-#     (destination 0 is the valid dynamic target: function exit, merge, or
-#     absent branch);
-#   - a block has at most one Normal (fallthrough) successor — Normal edges
-#     are keyed by their source (the block's first-statement node id) and
-#     one is recorded per lexical fallthrough block (none for
-#     terminator-ending blocks);
-#   - Break/Continue/Backedge edges only originate inside a loop context:
-#     they must name their loop (destination = the loop body's block key —
-#     see enclosing_loop_key), so a destination of 0 means the edge was
-#     recorded outside any loop.
-# / (extended): the CFG is the analysis authority, so the
-# validation covers the full model:
-#   - every edge's ACTIONS are well-formed CleanupActions: Drop ids must
-#     reference valid locals (typed local bindings — the semantic universe
-#     every frame local comes from), RunDefer ids must reference registered
-#     defers (the ScopeId-keyed scope_defers table holds the
-#     defer STMT ids), and EndAccess ids must reference registered accesses
-#     (the shared ACCESS_REGISTRY, populated by the access checker's walk);
-#   - every block's edge references are in range, and the referenced edges
-#     are consistent with the block's role: a block that references a
-#     Return edge is TERMINAL (it never also references a Normal
-#     fallthrough edge), a block that references a Normal edge is a
-#     FALLTHROUGH (it never also references a Return/Break/Continue
-#     terminator edge), and a referenced Backedge originates in a loop body
-#     (its destination names the loop body's block key — never 0).
-# (extended): the drop actions are grounded on the BLOCK EXIT FRAMES
-# — for every block-originating edge (Normal/Return/Break/Continue, found
-# via edge_source_block_index) the Drop local ids must be a subset of the
-# block-grounded derivation from its source block's exit frame
-# (block_grounded_drop_ids): a drop of a local not live at the source
-# block's exit is an inconsistency. GuardElse edges are excluded (their
-# obligations derive from the GUARD point — not the block exit — because
-# the guard is a Linear statement and later statements can consume the
-# guard-point live set), True/False edges carry no obligations of their own
-# (the branch cleanups serialize through the branch blocks' Normal edges).
-# loop-body-originated edges are FULLY grounded — the loop body
-# executes through the same run_cfg_block traversal (check_loop_body), so
-# the body's block record HAS a recorded (entry, exit) frame and the
-# grounded check applies to every break/continue/return edge that
-# originates inside the body (the recording-site loop-entry exclude is
-# documented above; the derivation without it is a superset of the
-# recorded actions, so the subset check below still holds).
-# Defer bodies' OWN locals (is_defer_local — the scope_defer_locals
-# records) are the documented exception: they are finalized when the
-# deferred code RUNS, outside the exiting block's frame.
-def validate_cfg_edges(ctx: &AnalysisContext, typed: &TypedProgram, finalize_plan: &FunctionCleanupTable, edges: &Vec[CfgEdge], blocks: &Vec[CfgBlock], block_frames: &Map[Int, (ResFrame, ResFrame)], errors: &mut Vec[ResourceError]) -> Unit
+
+def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan: FunctionCleanupTable, edges: Vec[CfgEdge], blocks: Vec[CfgBlock], block_frames: Map[Int, (ResFrame, ResFrame)], inout errors: Vec[ResourceError]) -> Unit
   mut i = 0
   while i < edges.len() do
     let e = edges[i]
@@ -2779,7 +2914,7 @@ end
 # it (register_defer records defer STMT ids as DeferId values under the
 # scope's ScopeId; the scope_defer_locals entries carry LOCAL ids and are
 # never consulted here). The prefix-parsing defer-key protocol is are not part of the model.
-def is_registered_defer(finalize_plan: &FunctionCleanupTable, defer_id: Int) -> Bool
+def is_registered_defer(finalize_plan: FunctionCleanupTable, defer_id: Int) -> Bool
   var found = false
   for (_, v) in finalize_plan.scope_defers do
     if !found then
@@ -2838,7 +2973,7 @@ end
 # the terminator point), and verify_terminator_edge_grounding reconciles
 # every block-originating Return/Break/Continue edge against the recorded
 # (entry, exit) — the values stay byte-identical.
-def block_grounded_drop_ids(entry: &ResFrame, exit: &ResFrame, exclude_entry: Bool, loop_exclude: &Vec[Int]) -> Vec[Int]
+def block_grounded_drop_ids(entry: ResFrame, exit: ResFrame, exclude_entry: Bool, loop_exclude: Vec[Int]) -> Vec[Int]
   var ids = Vec::new()
   for (id, ls) in exit.locals do
     if ls.availability == ResourceState::Live then
@@ -2869,7 +3004,7 @@ end
 # exactly one flow block's originating-ids range — statement ranges are
 # disjoint and node ids are globally unique), so the first hit is
 # unambiguous.
-def edge_source_block_index(blocks: &Vec[CfgBlock], edge_index: Int) -> Int
+def edge_source_block_index(blocks: Vec[CfgBlock], edge_index: Int) -> Int
   mut bi = 0
   while bi < blocks.len() do
     if blocks[bi].edges.contains(&edge_index) then
@@ -2887,7 +3022,7 @@ end
 # RUNS (outside the exiting block's frame), so they legitimately drop on
 # the scope's exiting edges without ever being in the exiting block's
 # frame. The "defer_locals::<scope key>" prefix-parsing protocol is are not part of the model — the table scan is the semantic membership test.
-def is_defer_local(finalize_plan: &FunctionCleanupTable, local_id: Int) -> Bool
+def is_defer_local(finalize_plan: FunctionCleanupTable, local_id: Int) -> Bool
   var found = false
   for (_, v) in finalize_plan.scope_defer_locals do
     if !found then
@@ -2932,7 +3067,7 @@ struct LoopBodyScan
   reported_stmt_id: Int
 end
 
-def run_cfg_block(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, stmts: &Vec[Stmt], loop_outer: &Vec[Int], frame_in: &ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int], block_key: Int, scan: Option[LoopBodyScan]) -> (ResFrame, Option[LoopBodyScan])
+def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmts: Vec[Stmt], loop_outer: Vec[Int], frame_in: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], block_key: Int, scan: Option[LoopBodyScan]) -> (ResFrame, Option[LoopBodyScan])
   mut bf = res_frame_clone(frame_in)
   mut dead = false
   mut carried_scan = scan
@@ -3017,7 +3152,7 @@ def run_cfg_block(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ct
 end
 
 
-def check_block(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, block: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, block: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   let entry_names = res_frame_names_clone(frame)
  # (channel d): the slice-view liveness snapshot of this lexical
   # block — the views registered DURING the block (including shadowed
@@ -3092,11 +3227,11 @@ end
 # Blocks have no node id of their own; the block's FIRST STATEMENT node id
 # is unique per block (every stmt has a unique id), so it keys the block-exit
 # obligations. Empty blocks can have no obligations.
-def block_exit_key(block: &Block) -> Int
+def block_exit_key(block: Block) -> Int
   if block.stmts.len() > 0 then block.stmts[0].node_id else 0 end
 end
 
-def record_block_exit_plan(ctx: &AnalysisContext, typed: &TypedProgram, frame: &ResFrame, entry_names: &Vec[tg_compiler::ids::LocalId], block: &Block, finalize_plan: &mut FunctionCleanupTable) -> Vec[CleanupAction]
+def record_block_exit_plan(ctx: AnalysisContext, typed: TypedProgram, frame: ResFrame, entry_names: Vec[tg_compiler::ids::LocalId], block: Block, inout finalize_plan: FunctionCleanupTable) -> Vec[CleanupAction]
   let key = block_exit_key(block)
   if key == 0 then return Vec::new() end
   var actions = Vec::new()
@@ -3188,7 +3323,7 @@ end
 # body executes through the same run_cfg_block machinery (check_loop_body),
 # its (entry, exit) frames ARE recorded under the body's block record id,
 # and this reconciliation covers them like every other block.
-def verify_terminator_edge_grounding(typed: &TypedProgram, finalize_plan: &FunctionCleanupTable, edges: &Vec[CfgEdge], orig_ids: &Vec[Int], entry: &ResFrame, exit: &ResFrame, current_loop_entry: &Vec[Int], errors: &mut Vec[ResourceError]) -> Unit
+def verify_terminator_edge_grounding(typed: TypedProgram, finalize_plan: FunctionCleanupTable, edges: Vec[CfgEdge], orig_ids: Vec[Int], entry: ResFrame, exit: ResFrame, current_loop_entry: Vec[Int], inout errors: Vec[ResourceError]) -> Unit
   mut e = 0
   while e < edges.len() do
     let ed = edges[e]
@@ -3248,7 +3383,7 @@ end
 # a set parameter's contract is entry Uninitialized, exit EXACTLY
 # Live — on every normal return edge it must have been initialized and not
 # consumed/left MaybeLive afterwards. A missing/divergent state is an error.
-def validate_set_postconditions(typed: &TypedProgram, frame: &ResFrame, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def validate_set_postconditions(typed: TypedProgram, frame: ResFrame, span: Span, inout errors: Vec[ResourceError]) -> Unit
   # Frame keys are LocalId; binding_name is keyed by the raw Int semantic id.
   for (id, ls) in frame.locals do
     if ls.origin == ParamOrigin::Set then
@@ -3267,7 +3402,7 @@ end
 # a live capability reaching a function exit must have been returned,
 # transferred, delegated, or explicitly consumed by a capability operation —
 # an automatic deinitializer must NOT satisfy its linearity.
-def validate_capability_exit(typed: &TypedProgram, frame: &ResFrame, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def validate_capability_exit(typed: TypedProgram, frame: ResFrame, span: Span, inout errors: Vec[ResourceError]) -> Unit
   # Frame keys are LocalId; binding_name is keyed by the raw Int semantic id.
   for (cid, ls) in frame.locals do
     if ls.is_capability then
@@ -3283,7 +3418,7 @@ def validate_capability_exit(typed: &TypedProgram, frame: &ResFrame, span: Span,
   end
 end
 
-def check_return_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], stmt_node_id: Int, defer_chain: &mut Vec[Int]) -> Vec[CleanupAction]
+def check_return_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, val_opt: Option[Expr], loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], stmt_node_id: Int, inout defer_chain: Vec[Int]) -> Vec[CleanupAction]
   var return_entry = Vec::new()
   match val_opt
   when Option::Some(val) then
@@ -3337,7 +3472,7 @@ end
 # actions, reverse drop order). The caller attaches them to the
 # corresponding pre-built CfgEdge record; the CleanupEdge serialization
 # happens once per program at the end of resource_check.
-def record_exit_edge_plan(typed: &TypedProgram, frame: &ResFrame, exclude: &Vec[Int], finalize_plan: &mut FunctionCleanupTable, defer_chain: &Vec[Int], stop_at_loop: Bool) -> Vec[CleanupAction]
+def record_exit_edge_plan(typed: TypedProgram, frame: ResFrame, exclude: Vec[Int], inout finalize_plan: FunctionCleanupTable, defer_chain: Vec[Int], stop_at_loop: Bool) -> Vec[CleanupAction]
   var actions = Vec::new()
   var ci = defer_chain.len()
   while ci > 0 do
@@ -3378,7 +3513,7 @@ end
 # first negated entry scanned from the innermost end names the loop the edge
 # exits. 0 when no loop encloses the edge (no negated entry): Break/Continue
 # edges may not originate there — validate_cfg_edges flags destination 0.
-def enclosing_loop_key(defer_chain: &Vec[Int]) -> Int
+def enclosing_loop_key(defer_chain: Vec[Int]) -> Int
   var ci = defer_chain.len()
   while ci > 0 do
     ci = ci - 1
@@ -3390,7 +3525,7 @@ def enclosing_loop_key(defer_chain: &Vec[Int]) -> Int
   0
 end
 
-def check_break_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, val_opt: Option[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], stmt_node_id: Int, current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Vec[CleanupAction]
+def check_break_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, val_opt: Option[Expr], loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], stmt_node_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Vec[CleanupAction]
   match val_opt
   when Option::Some(val) then
     check_expr(program, typed, env, ctx, &val, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
@@ -3414,7 +3549,7 @@ def check_break_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv,
   plan_actions
 end
 
-def check_terminator_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, stmt: &Stmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_terminator_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmt: Stmt, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match stmt.kind
   when StmtKind::StmtReturn(val_opt) then
  # / RETURN edge — the pre-built CfgEdge { kind: Return,
@@ -3441,7 +3576,7 @@ def check_terminator_stmt(program: &Program, typed: &TypedProgram, env: &mut Typ
   end
 end
 
-def check_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, stmt: &Stmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmt: Stmt, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
  # (channel d): the mutation-while-view-live check runs per
   # statement — a live Slice local's backing buffer cannot be
   # mutated/reallocated by this statement (the IterationPlan mutation
@@ -3476,20 +3611,52 @@ def check_stmt(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: 
       # the callee (a previous assignment), so overwriting it without a
       # drop leaks that value.
       if t.drops_old then
- # boundary: the assign_drops plan keeps the raw Int semantic id
-        # (the MIR's semantic_to_mir bridge maps it).
-        var assign_ids = Vec::new()
-        assign_ids.push(t.lid.id)
- # the assign-drop chain is NOT a CFG edge — it is the
-        # drop-before-store chain inside one statement, with no CfgEdgeKind
- # in the edge model (no transfer originates it). the chain is
-        # the SEMANTIC assign_drops table (node id -> local ids) — the
- # "assign::<stmt id>" String-key protocol is not part of the model.
-        finalize_plan.assign_drops.insert(stmt.node_id, assign_ids)
+        # (partial moves): the whole-root drop-before-store must not share
+        # storage with the value's source — the RHS rooting at the SAME
+        # local (a direct whole-root or projected move) would destroy the
+        # value's source (the drop-before-store and the source move cannot
+        # share the storage) — rejected.
+        if !expr_is_plain(target) && root_has_moves(frame, t.lid) then
+          errors.push(ResourceError {
+            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+            span: value.span
+          })
+        elsif !expr_is_plain(target) && expr_roots_at(typed, &value, t.lid.id) then
+          errors.push(ResourceError {
+            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+            span: value.span
+          })
+        else
+          # boundary: the assign_drops plan keeps the raw Int semantic id
+          # (the MIR's semantic_to_mir bridge maps it).
+          var assign_ids = Vec::new()
+          assign_ids.push(t.lid.id)
+          # the assign-drop chain is NOT a CFG edge — it is the
+          # drop-before-store chain inside one statement, with no CfgEdgeKind
+          # in the edge model (no transfer originates it). the chain is
+          # the SEMANTIC assign_drops table (node id -> local ids) — the
+          # "assign::<stmt id>" String-key protocol is not part of the model.
+          finalize_plan.assign_drops.insert(stmt.node_id, assign_ids)
+        end
       end
       # The store commits AFTER the drop decision: next_state comes from
       # prior_state, never from a validation-time mutation.
       res_frame_set(frame, t.lid, t.next)
+      # (partial moves — the projected-target commit): the chain-level
+      # transition — the sibling DIRECT fields die with the whole-root
+      # drop chain (marked Consumed, so the scope-exit drop drops only the
+      # re-stored target), and the target chain re-lives (clear + Live).
+      if !expr_is_plain(target) then
+        var chain = Vec::new()
+        let field_chain = place_projection_keys(typed, &target, &mut chain)
+        if field_chain then
+          if t.drops_old then
+            mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+          end
+          frame_place_clear(frame, t.lid, &chain)
+          frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
+        end
+      end
     when Option::None then ()
     end
   when StmtKind::StmtCompoundAssign(_, target, value) then
@@ -3665,7 +3832,7 @@ end
 # NOT recorded here and its locals are NOT forgotten: they are returned so
 # the caller can attach them to the scope's exiting edges (they are
 # finalized exactly when the deferred code RUNS, never at registration).
-def check_defer_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, body: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Vec[Int]
+def check_defer_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Vec[Int]
  # (channel d): the defer body is a scope boundary for slice views
   # (its statements are checked once at registration; views bound inside
   # are registration-time artifacts — removed after the check).
@@ -3692,7 +3859,7 @@ end
 # was moved inside the deferred code — nothing to finalize. (Locals bound in
 # NESTED blocks inside the defer body are covered by those nested blocks' own
 # plans when the MIR side lowers the deferred code.)
-def collect_defer_body_locals(typed: &TypedProgram, body: &Block, frame: &ResFrame, out: &mut Vec[Int]) -> Unit
+def collect_defer_body_locals(typed: TypedProgram, body: Block, frame: ResFrame, inout out: Vec[Int]) -> Unit
   mut i = 0
   while i < body.stmts.len() do
     match body.stmts[i].kind
@@ -3742,7 +3909,7 @@ end
 #                       runs, LIFO.
 # The defer / defer-locals String-key protocols
 # are not part of the model: no cleanup semantics depend on parsing a String prefix.
-def register_defer(defer_stmt_id: Int, defer_chain: &Vec[Int], defer_local_ids: &Vec[Int], finalize_plan: &mut FunctionCleanupTable) -> Unit
+def register_defer(defer_stmt_id: Int, defer_chain: Vec[Int], defer_local_ids: Vec[Int], inout finalize_plan: FunctionCleanupTable) -> Unit
   if defer_chain.len() == 0 then
     return
   end
@@ -3790,7 +3957,7 @@ end
 # the deferred code runs. The MIR consumes the RunDefer actions directly
 # (the defer STMT ids flow through the CleanupEdge actions — no string-key
 # channel needed).
-def append_defer_actions(finalize_plan: &FunctionCleanupTable, scope_key: Int, out: &mut Vec[CleanupAction]) -> Unit
+def append_defer_actions(finalize_plan: FunctionCleanupTable, scope_key: Int, inout out: Vec[CleanupAction]) -> Unit
   match finalize_plan.scope_defers.get(ScopeId { id: scope_key })
   when Option::Some(defer_ids) then
     var di = defer_ids.len()
@@ -3811,7 +3978,7 @@ def append_defer_actions(finalize_plan: &FunctionCleanupTable, scope_key: Int, o
   end
 end
 
-def check_if(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, if_stmt: &IfStmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_if(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, if_stmt: IfStmt, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   check_expr(program, typed, env, ctx, &if_stmt.cond, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
  # the if-split's two branch edges (True: cond -> then arm; False:
   # cond -> the false continuation) were recorded by the STRUCTURAL PASS
@@ -3845,7 +4012,7 @@ def check_if(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &m
   frame_assign(frame, &merged)
 end
 
-def check_match(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, m: &MatchExpr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_match(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, m: MatchExpr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   check_expr(program, typed, env, ctx, &m.scrutinee, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   # A resource-containing scrutinee is MOVED into the arm's resource
   # bindings: matching a resource by value transfers ownership out of the
@@ -3892,7 +4059,7 @@ def check_match(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx:
   frame_assign(frame, &merged)
 end
 
-def check_loop(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, cond: Option[Expr], body: &Block, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], stmt_node_id: Int, current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_loop(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, cond: Option[Expr], body: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], stmt_node_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   let entry = res_frame_clone(frame)
  # boundary: the frame's entry keys are LocalId; the loop-context
   # domains (loop_outer, current_loop_entry) and the backedge plan carry
@@ -3948,7 +4115,7 @@ end
 #     there).
 # ———————————————————————————————————————————————————————————————
 
-def for_iter_place_like(iter: &Expr) -> Bool
+def for_iter_place_like(iter: Expr) -> Bool
   match iter.kind
   when ExprKind::ExprIdent(_) then true
   when ExprKind::ExprSelfRef then true
@@ -3961,7 +4128,7 @@ end
 
 # Bare type name: strip any "::" module qualifier (mirror of the MIR's
 # mir_bare_type_name), so "std::collections::Vec" classifies as "Vec".
-def for_bare_type_name(name: &String) -> String
+def for_bare_type_name(name: String) -> String
   match name.rfind("::")
   when Option::Some(pos) then name.slice(pos + 2, name.len())
   when Option::None then name.clone()
@@ -3984,7 +4151,7 @@ end
 # (MirLen's slice-view path and ProjIndex's slice data-pointer path in
 # codegen.tg — verified), so String iteration is covered by the Slice/array
 # classes, never by a direct String class.
-def for_iter_type_kind(typed: &TypedProgram, ty: &Type) -> (Int, Type)
+def for_iter_type_kind(typed: TypedProgram, ty: Type) -> (Int, Type)
   match ty
   when Type::RefInternal(inner, _) then for_iter_type_kind(typed, inner)
   when Type::Adt(tid, args) then
@@ -4007,7 +4174,7 @@ def for_iter_type_kind(typed: &TypedProgram, ty: &Type) -> (Int, Type)
   end
 end
 
-def for_iterable_kind(typed: &TypedProgram, iter: &Expr) -> (Int, Type)
+def for_iterable_kind(typed: TypedProgram, iter: Expr) -> (Int, Type)
   match iter.kind
   when ExprKind::ExprRange(_, _, _) then (3, Type::Int)
   when _ then
@@ -4026,14 +4193,14 @@ def for_iterable_kind(typed: &TypedProgram, iter: &Expr) -> (Int, Type)
   end
 end
 
-def plan_expr_is_bare_binding(name: String, expr: &Expr) -> Bool
+def plan_expr_is_bare_binding(name: String, expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(n) then n == name
   when _ then false
   end
 end
 
-def plan_expr_rooted_at_binding(name: String, expr: &Expr) -> Bool
+def plan_expr_rooted_at_binding(name: String, expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(n) then n == name
   when ExprKind::ExprFieldAccess(base, _) then plan_expr_rooted_at_binding(name, &base)
@@ -4042,14 +4209,14 @@ def plan_expr_rooted_at_binding(name: String, expr: &Expr) -> Bool
   end
 end
 
-def plan_ref_param_is_read(typed: &TypedProgram, arg_expr: &Expr) -> Bool
+def plan_ref_param_is_read(typed: TypedProgram, arg_expr: Expr) -> Bool
   match typed.access_effects.get(arg_expr.node_id)
   when Option::Some(AccessEffect::Read) then true
   when _ then false
   end
 end
 
-def plan_exprs_uses_binding(typed: &TypedProgram, name: String, exprs: &Vec[Expr]) -> Bool
+def plan_exprs_uses_binding(typed: TypedProgram, name: String, exprs: Vec[Expr]) -> Bool
   var found = false
   var e_idx = 0
   while e_idx < exprs.len() do
@@ -4059,7 +4226,7 @@ def plan_exprs_uses_binding(typed: &TypedProgram, name: String, exprs: &Vec[Expr
   found
 end
 
-def plan_fields_uses_binding(typed: &TypedProgram, name: String, fields: &Vec[(String, Expr)]) -> Bool
+def plan_fields_uses_binding(typed: TypedProgram, name: String, fields: Vec[(String, Expr)]) -> Bool
   var found = false
   var f_idx = 0
   while f_idx < fields.len() do
@@ -4069,7 +4236,7 @@ def plan_fields_uses_binding(typed: &TypedProgram, name: String, fields: &Vec[(S
   found
 end
 
-def plan_entries_uses_binding(typed: &TypedProgram, name: String, entries: &Vec[(Expr, Expr)]) -> Bool
+def plan_entries_uses_binding(typed: TypedProgram, name: String, entries: Vec[(Expr, Expr)]) -> Bool
   var found = false
   var e_idx = 0
   while e_idx < entries.len() do
@@ -4080,14 +4247,14 @@ def plan_entries_uses_binding(typed: &TypedProgram, name: String, entries: &Vec[
   found
 end
 
-def plan_opt_expr_uses_binding(typed: &TypedProgram, name: String, val_opt: &Option[Expr]) -> Bool
+def plan_opt_expr_uses_binding(typed: TypedProgram, name: String, val_opt: Option[Expr]) -> Bool
   match val_opt
   when Option::Some(val) then plan_expr_uses_binding(typed, name, &val)
   when Option::None then false
   end
 end
 
-def plan_call_args_uses_binding(typed: &TypedProgram, name: String, args: &Vec[Expr]) -> Bool
+def plan_call_args_uses_binding(typed: TypedProgram, name: String, args: Vec[Expr]) -> Bool
   var found = false
   var a_idx = 0
   while a_idx < args.len() do
@@ -4097,7 +4264,7 @@ def plan_call_args_uses_binding(typed: &TypedProgram, name: String, args: &Vec[E
   found
 end
 
-def plan_call_arg_uses_binding(typed: &TypedProgram, name: String, arg: &Expr) -> Bool
+def plan_call_arg_uses_binding(typed: TypedProgram, name: String, arg: Expr) -> Bool
   match arg.kind
   when ExprKind::ExprAccess(inner) then
     if plan_expr_rooted_at_binding(name, &inner) then
@@ -4113,7 +4280,7 @@ def plan_call_arg_uses_binding(typed: &TypedProgram, name: String, arg: &Expr) -
   end
 end
 
-def plan_expr_uses_binding(typed: &TypedProgram, name: String, expr: &Expr) -> Bool
+def plan_expr_uses_binding(typed: TypedProgram, name: String, expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(n) then n == name
   when ExprKind::ExprIntLit(_) then false
@@ -4212,7 +4379,7 @@ def plan_expr_uses_binding(typed: &TypedProgram, name: String, expr: &Expr) -> B
   end
 end
 
-def plan_block_uses_binding(typed: &TypedProgram, name: String, block: &Block) -> Bool
+def plan_block_uses_binding(typed: TypedProgram, name: String, block: Block) -> Bool
   var found = false
   var stmt_idx = 0
   while stmt_idx < block.stmts.len() do
@@ -4224,7 +4391,7 @@ def plan_block_uses_binding(typed: &TypedProgram, name: String, block: &Block) -
   found
 end
 
-def plan_if_uses_binding(typed: &TypedProgram, name: String, if_stmt: &IfStmt) -> Bool
+def plan_if_uses_binding(typed: TypedProgram, name: String, if_stmt: IfStmt) -> Bool
   var found = plan_expr_uses_binding(typed, name, &if_stmt.cond)
   if plan_block_uses_binding(typed, name, &if_stmt.then_block) then found = true end
   var e_idx = 0
@@ -4240,7 +4407,7 @@ def plan_if_uses_binding(typed: &TypedProgram, name: String, if_stmt: &IfStmt) -
   found
 end
 
-def plan_match_uses_binding(typed: &TypedProgram, name: String, m: &MatchExpr) -> Bool
+def plan_match_uses_binding(typed: TypedProgram, name: String, m: MatchExpr) -> Bool
   var found = plan_expr_uses_binding(typed, name, &m.scrutinee)
   var a_idx = 0
   while a_idx < m.arms.len() do
@@ -4255,7 +4422,7 @@ def plan_match_uses_binding(typed: &TypedProgram, name: String, m: &MatchExpr) -
   found
 end
 
-def plan_stmt_uses_binding(typed: &TypedProgram, name: String, stmt: &Stmt) -> Bool
+def plan_stmt_uses_binding(typed: TypedProgram, name: String, stmt: Stmt) -> Bool
   match stmt.kind
   when StmtKind::StmtLet(_, _, value, _) then plan_expr_uses_binding(typed, name, &value)
   when StmtKind::StmtAssign(target, value) then
@@ -4329,7 +4496,7 @@ def plan_stmt_uses_binding(typed: &TypedProgram, name: String, stmt: &Stmt) -> B
   end
 end
 
-def plan_exprs_mention_binding(typed: &TypedProgram, name: String, exprs: &Vec[Expr]) -> Bool
+def plan_exprs_mention_binding(typed: TypedProgram, name: String, exprs: Vec[Expr]) -> Bool
   var found = false
   var e_idx = 0
   while e_idx < exprs.len() do
@@ -4339,14 +4506,14 @@ def plan_exprs_mention_binding(typed: &TypedProgram, name: String, exprs: &Vec[E
   found
 end
 
-def plan_opt_expr_mentions_binding(typed: &TypedProgram, name: String, val_opt: &Option[Expr]) -> Bool
+def plan_opt_expr_mentions_binding(typed: TypedProgram, name: String, val_opt: Option[Expr]) -> Bool
   match val_opt
   when Option::Some(val) then plan_expr_mentions_binding(typed, name, &val)
   when Option::None then false
   end
 end
 
-def plan_block_mentions_binding(typed: &TypedProgram, name: String, block: &Block) -> Bool
+def plan_block_mentions_binding(typed: TypedProgram, name: String, block: Block) -> Bool
   var found = false
   var stmt_idx = 0
   while stmt_idx < block.stmts.len() do
@@ -4356,7 +4523,7 @@ def plan_block_mentions_binding(typed: &TypedProgram, name: String, block: &Bloc
   found
 end
 
-def plan_if_mentions_binding(typed: &TypedProgram, name: String, if_stmt: &IfStmt) -> Bool
+def plan_if_mentions_binding(typed: TypedProgram, name: String, if_stmt: IfStmt) -> Bool
   var found = plan_expr_mentions_binding(typed, name, &if_stmt.cond)
   if plan_block_mentions_binding(typed, name, &if_stmt.then_block) then found = true end
   var e_idx = 0
@@ -4372,7 +4539,7 @@ def plan_if_mentions_binding(typed: &TypedProgram, name: String, if_stmt: &IfStm
   found
 end
 
-def plan_match_mentions_binding(typed: &TypedProgram, name: String, m: &MatchExpr) -> Bool
+def plan_match_mentions_binding(typed: TypedProgram, name: String, m: MatchExpr) -> Bool
   var found = plan_expr_mentions_binding(typed, name, &m.scrutinee)
   var a_idx = 0
   while a_idx < m.arms.len() do
@@ -4387,7 +4554,7 @@ def plan_match_mentions_binding(typed: &TypedProgram, name: String, m: &MatchExp
   found
 end
 
-def plan_expr_mentions_binding(typed: &TypedProgram, name: String, expr: &Expr) -> Bool
+def plan_expr_mentions_binding(typed: TypedProgram, name: String, expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(n) then n == name
   when ExprKind::ExprIntLit(_) then false
@@ -4454,7 +4621,7 @@ def plan_expr_mentions_binding(typed: &TypedProgram, name: String, expr: &Expr) 
   end
 end
 
-def plan_fields_mentions_binding(typed: &TypedProgram, name: String, fields: &Vec[(String, Expr)]) -> Bool
+def plan_fields_mentions_binding(typed: TypedProgram, name: String, fields: Vec[(String, Expr)]) -> Bool
   var found = false
   var f_idx = 0
   while f_idx < fields.len() do
@@ -4464,7 +4631,7 @@ def plan_fields_mentions_binding(typed: &TypedProgram, name: String, fields: &Ve
   found
 end
 
-def plan_entries_mentions_binding(typed: &TypedProgram, name: String, entries: &Vec[(Expr, Expr)]) -> Bool
+def plan_entries_mentions_binding(typed: TypedProgram, name: String, entries: Vec[(Expr, Expr)]) -> Bool
   var found = false
   var e_idx = 0
   while e_idx < entries.len() do
@@ -4475,7 +4642,7 @@ def plan_entries_mentions_binding(typed: &TypedProgram, name: String, entries: &
   found
 end
 
-def plan_stmt_mentions_binding(typed: &TypedProgram, name: String, stmt: &Stmt) -> Bool
+def plan_stmt_mentions_binding(typed: TypedProgram, name: String, stmt: Stmt) -> Bool
   match stmt.kind
   when StmtKind::StmtLet(_, _, value, _) then plan_expr_mentions_binding(typed, name, &value)
   when StmtKind::StmtAssign(target, value) then
@@ -4547,7 +4714,7 @@ end
 # port of the MIR's for_body_is_projected_safe (pattern must be a plain
 # non-"_" Ident whose name is not used by the body) — the semantic decision
 # the MIR used to make for itself.
-def plan_body_is_projected_safe(typed: &TypedProgram, pat: &Pattern, body: &Block) -> Bool
+def plan_body_is_projected_safe(typed: TypedProgram, pat: Pattern, body: Block) -> Bool
   match pat.kind
   when PatternKind::Ident(name, _) then
     if name == "_" then
@@ -4581,7 +4748,7 @@ end
 # The iterated collection's ROOT local id is recorded for the projected-
 # mutation rule (rejecting mutation of the iterated collection inside the
 # loop body where the access is projected).
-def for_iteration_plan(typed: &TypedProgram, env: &TypeEnv, for_stmt: &ForStmt, iter_binding_ids: &Vec[Int]) -> Option[IterationPlan]
+def for_iteration_plan(typed: TypedProgram, env: TypeEnv, for_stmt: ForStmt, iter_binding_ids: Vec[Int]) -> Option[IterationPlan]
   let (kind, elem_ty) = for_iterable_kind(typed, &for_stmt.iter)
   if kind < 0 then
     return Option::None
@@ -4631,7 +4798,7 @@ end
 # transparent — `coll[i]` and `coll[i].field` are places of `coll`) — the
 # same key the loop's projected access reads, so a mutation with an equal
 # key is a mutation of the iterated collection's storage.
-def collect_place_field_chain(typed: &TypedProgram, expr: &Expr, out: &mut Vec[String]) -> Unit
+def collect_place_field_chain(typed: TypedProgram, expr: Expr, inout out: Vec[String]) -> Unit
   match expr.kind
   when ExprKind::ExprFieldAccess(base, name) then
     collect_place_field_chain(typed, &base, out)
@@ -4648,7 +4815,7 @@ end
 # same root local id AND the same field chain from the root? A method-call
 # receiver, a call argument, or an assignment target with this key touches
 # the exact storage the projected for-loop reads.
-def plan_place_key_matches(typed: &TypedProgram, expr: &Expr, root: Int, fields: &Vec[String]) -> Bool
+def plan_place_key_matches(typed: TypedProgram, expr: Expr, root: Int, fields: Vec[String]) -> Bool
   match expr_root_id(typed, expr)
   when Option::Some(rid) then
     if rid != root then
@@ -4674,7 +4841,7 @@ end
 # The typed access effect of a receiver/argument node — the type checker's
 # recorded convention (never re-derived by name); missing records default to
 # Read.
-def plan_expr_access_effect(typed: &TypedProgram, expr: &Expr) -> AccessEffect
+def plan_expr_access_effect(typed: TypedProgram, expr: Expr) -> AccessEffect
   match typed.access_effects.get(expr.node_id)
   when Option::Some(e) then e
   when Option::None then AccessEffect::Read
@@ -4688,7 +4855,7 @@ end
 # reads, method calls with Read receivers) are fine under projected
 # iteration and are not flagged. Recurses through the whole expression
 # structure (if/match/closures included).
-def plan_expr_mutates_place(typed: &TypedProgram, expr: &Expr, root: Int, fields: &Vec[String]) -> Bool
+def plan_expr_mutates_place(typed: TypedProgram, expr: Expr, root: Int, fields: Vec[String]) -> Bool
   match expr.kind
   when ExprKind::ExprIntLit(_) then false
   when ExprKind::ExprFloatLit(_) then false
@@ -4780,7 +4947,7 @@ def plan_expr_mutates_place(typed: &TypedProgram, expr: &Expr, root: Int, fields
   end
 end
 
-def plan_exprs_mutate_place(typed: &TypedProgram, exprs: &Vec[Expr], root: Int, fields: &Vec[String]) -> Bool
+def plan_exprs_mutate_place(typed: TypedProgram, exprs: Vec[Expr], root: Int, fields: Vec[String]) -> Bool
   var found = false
   var e_idx = 0
   while e_idx < exprs.len() do
@@ -4790,7 +4957,7 @@ def plan_exprs_mutate_place(typed: &TypedProgram, exprs: &Vec[Expr], root: Int, 
   found
 end
 
-def plan_block_mutates_place(typed: &TypedProgram, block: &Block, root: Int, fields: &Vec[String]) -> Bool
+def plan_block_mutates_place(typed: TypedProgram, block: Block, root: Int, fields: Vec[String]) -> Bool
   var found = false
   var stmt_idx = 0
   while stmt_idx < block.stmts.len() do
@@ -4802,7 +4969,7 @@ def plan_block_mutates_place(typed: &TypedProgram, block: &Block, root: Int, fie
   found
 end
 
-def plan_if_mutates_place(typed: &TypedProgram, if_stmt: &IfStmt, root: Int, fields: &Vec[String]) -> Bool
+def plan_if_mutates_place(typed: TypedProgram, if_stmt: IfStmt, root: Int, fields: Vec[String]) -> Bool
   var found = plan_expr_mutates_place(typed, &if_stmt.cond, root, fields)
   if plan_block_mutates_place(typed, &if_stmt.then_block, root, fields) then found = true end
   var e_idx = 0
@@ -4818,7 +4985,7 @@ def plan_if_mutates_place(typed: &TypedProgram, if_stmt: &IfStmt, root: Int, fie
   found
 end
 
-def plan_match_mutates_place(typed: &TypedProgram, m: &MatchExpr, root: Int, fields: &Vec[String]) -> Bool
+def plan_match_mutates_place(typed: TypedProgram, m: MatchExpr, root: Int, fields: Vec[String]) -> Bool
   var found = plan_expr_mutates_place(typed, &m.scrutinee, root, fields)
   var a_idx = 0
   while a_idx < m.arms.len() do
@@ -4838,7 +5005,7 @@ end
 # the place, and every expression (calls, method calls, nested control
 # flow) — see plan_expr_mutates_place. The loop body's per-statement scan in
 # check_loop_body reports a conflict once per statement.
-def plan_stmt_mutates_place(typed: &TypedProgram, stmt: &Stmt, root: Int, fields: &Vec[String]) -> Bool
+def plan_stmt_mutates_place(typed: TypedProgram, stmt: Stmt, root: Int, fields: Vec[String]) -> Bool
   match stmt.kind
   when StmtKind::StmtLet(_, _, value, _) then plan_expr_mutates_place(typed, &value, root, fields)
   when StmtKind::StmtAssign(target, value) then
@@ -4919,7 +5086,7 @@ def plan_stmt_mutates_place(typed: &TypedProgram, stmt: &Stmt, root: Int, fields
   end
 end
 
-def check_for(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, for_stmt: &ForStmt, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], stmt_node_id: Int, current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, for_stmt: ForStmt, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], stmt_node_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   let pre_entry = res_frame_clone(frame)
  # boundary: the frame's entry keys are LocalId; the loop-context
   # domains (loop_outer, current_loop_entry) carry the raw Int semantic ids
@@ -5001,7 +5168,7 @@ end
 # apply_consume on the binding's id) would move out of that reference.
 # Called after EVERY loop-body statement: reports once per binding, the
 # first statement after which the binding's state became Consumed.
-def check_iter_binding_escape(typed: &TypedProgram, iter_binding_ids: &Vec[Int], reported: &mut Vec[Bool], frame: &ResFrame, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def check_iter_binding_escape(typed: TypedProgram, iter_binding_ids: Vec[Int], inout reported: Vec[Bool], frame: ResFrame, span: Span, inout errors: Vec[ResourceError]) -> Unit
   mut i = 0
   while i < iter_binding_ids.len() do
     if !reported[i] then
@@ -5022,7 +5189,7 @@ def check_iter_binding_escape(typed: &TypedProgram, iter_binding_ids: &Vec[Int],
   end
 end
 
-def check_loop_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, body: &Block, entry: &ResFrame, entry_names: &Vec[Int], iter_binding_ids: &Vec[Int], projected_root: Int, projected_fields: &Vec[String], errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], loop_stmt_id: Int, current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int], exit_source: Int) -> ResFrame
+def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, entry: ResFrame, entry_names: Vec[Int], iter_binding_ids: Vec[Int], projected_root: Int, projected_fields: Vec[String], inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], loop_stmt_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], exit_source: Int) -> ResFrame
  # (single-shot loops): when the body's FIRST DIRECT terminator is a
   # Break or Return (not a Continue), the fallthrough to the backedge is
   # UNREACHABLE — the loop executes at most once. The backedge then
@@ -5133,7 +5300,7 @@ def check_loop_body(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, 
   end
 end
 
-def check_loop_created(ctx: &mut AnalysisContext, entry: &ResFrame, entry_names: &Vec[Int], bf: &ResFrame, typed: &TypedProgram, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], loop_stmt_id: Int, loop_body_key: Int, single_shot: Bool, exit_source: Int) -> Vec[tg_compiler::ids::LocalId]
+def check_loop_created(inout ctx: AnalysisContext, entry: ResFrame, entry_names: Vec[Int], bf: ResFrame, typed: TypedProgram, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], loop_stmt_id: Int, loop_body_key: Int, single_shot: Bool, exit_source: Int) -> Vec[tg_compiler::ids::LocalId]
   mut to_forget = Vec::new()
  # the BACKEDGE edge's CleanupAction sequence — the loop body
   # scope's defers as RunDefer actions (LIFO) and the loop-created owning
@@ -5206,7 +5373,7 @@ def check_loop_created(ctx: &mut AnalysisContext, entry: &ResFrame, entry_names:
   to_forget
 end
 
-def is_loop_created(entry: &ResFrame, entry_names: &Vec[Int], id: &tg_compiler::ids::LocalId) -> Bool
+def is_loop_created(entry: ResFrame, entry_names: Vec[Int], id: tg_compiler::ids::LocalId) -> Bool
   # entry_names is the raw-Int loop-context domain; the LocalId is the
   # frame-key domain. A local present in the loop's ENTRY frame is
   # LOOP-PERSISTENT — it predates the loop and survives every iteration —
@@ -5220,7 +5387,7 @@ def is_loop_created(entry: &ResFrame, entry_names: &Vec[Int], id: &tg_compiler::
   !entry_names.contains(&id.id)
 end
 
-def check_pattern(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, pat: &Pattern, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_pattern(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, pat: Pattern, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match pat.kind
   when PatternKind::Wildcard then ()
   when PatternKind::Ident(_, _) then ()
@@ -5269,7 +5436,7 @@ end
 
 # Register a single pattern-bound identifier in the frame (Live availability,
 # OwnedLocal permission — pattern bindings own their value).
-def bind_pattern_ident(env: &mut TypeEnv, typed: &TypedProgram, node_id: Int, span: Span, frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+def bind_pattern_ident(inout env: TypeEnv, typed: TypedProgram, node_id: Int, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   match typed.pattern_binding_resolutions.get(node_id)
   when Option::Some(id) then
     match typed.local_bindings.get(id)
@@ -5299,7 +5466,7 @@ end
 # struct, enum-variant, or-patterns) so destructuring binds every inner
 # resource ident — previously only a top-level Ident was registered, so
 # `let (a, b) = pair` lost ownership of resource components.
-def bind_pattern(env: &mut TypeEnv, typed: &TypedProgram, pat: &Pattern, span: Span, frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+def bind_pattern(inout env: TypeEnv, typed: TypedProgram, pat: Pattern, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   match pat.kind
   when PatternKind::Ident(_, _) then
     bind_pattern_ident(env, typed, pat.node_id, span, frame, errors)
@@ -5331,7 +5498,7 @@ end
 # recursion WITHOUT touching a frame. Used by the defer registration (the
 # defer body's own locals, attached to the scope's exiting edges) and by the
 # for-loop projected-iteration guard (the iteration binding's id(s)).
-def collect_pattern_binding_ids(typed: &TypedProgram, pat: &Pattern, out: &mut Vec[Int]) -> Unit
+def collect_pattern_binding_ids(typed: TypedProgram, pat: Pattern, inout out: Vec[Int]) -> Unit
   match pat.kind
   when PatternKind::Ident(_, _) then
     match typed.pattern_binding_resolutions.get(pat.node_id)
@@ -5367,7 +5534,7 @@ end
 # a typed aggregate is a compiler-internal error — ownership must not be
 # re-derived by guessing (the record is mandatory; see the checker's
 # aggregate-literal arms).
-def aggregate_child_owned(typed: &TypedProgram, expr: &Expr, i: Int, errors: &mut Vec[ResourceError]) -> Bool
+def aggregate_child_owned(typed: TypedProgram, expr: Expr, i: Int, inout errors: Vec[ResourceError]) -> Bool
   match typed.aggregate_ownership.get(expr.node_id)
   when Option::Some(owned) then
     if i < owned.len() then owned[i] else true end
@@ -5380,7 +5547,7 @@ def aggregate_child_owned(typed: &TypedProgram, expr: &Expr, i: Int, errors: &mu
   end
 end
 
-def check_expr(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, expr: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, expr: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match expr.kind
   when ExprKind::ExprIntLit(_) then ()
   when ExprKind::ExprFloatLit(_) then ()
@@ -5446,11 +5613,18 @@ def check_expr(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: 
     check_expr(program, typed, env, ctx, &operand, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprFieldAccess(base, _) then
     check_expr(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    # (partial moves): the field READ is a CHAIN read — the root stays
+    # live under a partial move, and a consumed chain is a use-after-move.
+    check_place_chain_read(typed, &expr, frame, errors)
   when ExprKind::ExprMethodCall(recv, method, _, args) then
     check_expr_method_call(program, typed, env, ctx, &recv, &method, &args, expr.node_id, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprIndex(base, index) then
     check_expr(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     check_expr(program, typed, env, ctx, &index, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    # (partial moves): the indexed READ is a chain read over the whole
+    # value (the elements are the aggregate — the root-level check above
+    # is the only per-index granularity the lattice has).
+    check_place_chain_read(typed, &expr, frame, errors)
   when ExprKind::ExprCall(callee, args) then
     check_expr_call(program, typed, env, ctx, &callee, &args, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprClosure(params, _, body) then
@@ -5592,21 +5766,48 @@ def check_expr(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: 
       # (Uninitialized — the first store into a set parameter's caller
       # buffer; Consumed — a reinitialized moved-out slot) never drops.
       if t.drops_old then
-        var assign_ids = Vec::new()
-        assign_ids.push(t.lid.id)
-        # The ExprAssign's MIR lowering keys on the EXPRESSION's
-        # node id (unlike StmtAssign which keys on the statement's).
- # the assign-drop chain is NOT a CFG edge — it is the
-        # drop-before-store chain inside one expression, with no
-        # CfgEdgeKind in the edge model (no transfer originates it).
- # the chain is the SEMANTIC assign_drops table (node id ->
-        # local ids) — the "assign::<expr id>" String-key protocol is
- # are not part of the model
-        finalize_plan.assign_drops.insert(expr.node_id, assign_ids)
+        # (partial moves): the same-root RHS guard (see StmtAssign — the
+        # whole-root drop-before-store must not share storage with the
+        # value's source).
+        if !expr_is_plain(target) && root_has_moves(frame, t.lid) then
+          errors.push(ResourceError {
+            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+            span: value.span
+          })
+        elsif !expr_is_plain(target) && expr_roots_at(typed, &value, t.lid.id) then
+          errors.push(ResourceError {
+            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+            span: value.span
+          })
+        else
+          var assign_ids = Vec::new()
+          assign_ids.push(t.lid.id)
+          # The ExprAssign's MIR lowering keys on the EXPRESSION's
+          # node id (unlike StmtAssign which keys on the statement's).
+          # the assign-drop chain is NOT a CFG edge — it is the
+          # drop-before-store chain inside one expression, with no
+          # CfgEdgeKind in the edge model (no transfer originates it).
+          # the chain is the SEMANTIC assign_drops table (node id ->
+          # local ids) — the "assign::<expr id>" String-key protocol is
+          # are not part of the model
+          finalize_plan.assign_drops.insert(expr.node_id, assign_ids)
+        end
       end
       # The store commits AFTER the drop decision: next_state comes from
       # prior_state, never from a validation-time mutation.
       res_frame_set(frame, t.lid, t.next)
+      # (partial moves — the projected-target commit, see StmtAssign).
+      if !expr_is_plain(target) then
+        var chain = Vec::new()
+        let field_chain = place_projection_keys(typed, &target, &mut chain)
+        if field_chain then
+          if t.drops_old then
+            mark_frame_sibling_fields(typed, frame, t.lid, &chain)
+          end
+          frame_place_clear(frame, t.lid, &chain)
+          frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
+        end
+      end
     when Option::None then ()
     end
   when ExprKind::ExprPipe(lhs, rhs) then
@@ -5622,7 +5823,7 @@ def check_expr(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: 
   end
 end
 
-def check_expr_call(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, callee: &Expr, args: &Vec[Expr], loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_expr_call(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, callee: Expr, args: Vec[Expr], loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   check_expr(program, typed, env, ctx, callee, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   # The receiver/argument effects are the TYPED access effects recorded by
   # the type checker (typed.access_effects on each argument node) — never
@@ -5640,7 +5841,7 @@ def check_expr_call(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, 
   end
 end
 
-def check_expr_method_call(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, receiver: &Expr, method: &String, args: &Vec[Expr], call_node_id: Int, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_expr_method_call(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, receiver: Expr, method: String, args: Vec[Expr], call_node_id: Int, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   # Receiver and argument effects come from the typed access effects recorded
   # by the type checker (the type checker already resolved the method and its
   # receiver convention — re-deriving it by walking impls by NAME was
@@ -5667,7 +5868,21 @@ def check_expr_method_call(program: &Program, typed: &TypedProgram, env: &mut Ty
   when Option::None then ()
   end
   if is_finalizer_call then
-    apply_arg_effect(program, typed, env, receiver, AccessEffect::Consume, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    # (partial moves — the projected-finalizer-receiver boundary): a
+    # finalizer call over a PROJECTED receiver would consume the field
+    # chain, but the type checker records the receiver's declared
+    # convention (Let — the finalizer's self) — the per-field record the
+    # drop sites need is never produced, so the field's drop would run
+    # twice. The conservative rule: a finalizer call consumes its WHOLE
+    # subject — the projected receiver form is rejected.
+    if expr_is_plain(receiver) then
+      apply_arg_effect(program, typed, env, receiver, AccessEffect::Consume, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    else
+      errors.push(ResourceError {
+        message: "cannot call a finalizer on a projected place: the finalizer consumes its whole subject",
+        span: receiver.span
+      })
+    end
   else
     apply_arg_effect(program, typed, env, receiver, recv_effect, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   end
@@ -5689,7 +5904,7 @@ end
 # root's record — check_assign_target's purity contract (prior_state ->
 # drop decision -> caller commit) is preserved, and a first store into an
 # Uninitialized set-parameter buffer never looks like a use of the root.
-def check_assign_target_subexprs(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, target: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def check_assign_target_subexprs(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, target: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match target.kind
   when ExprKind::ExprIndex(base, idx) then
     check_assign_target_subexprs(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
@@ -5713,7 +5928,7 @@ end
 # — no drop) and the next_state the caller commits after the RHS is
 # validated and the store happens. The caller commits; this function never
 # writes the target's record.
-def check_assign_target(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, ctx: &mut AnalysisContext, target: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Option[AssignmentTransition]
+def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, target: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Option[AssignmentTransition]
   match expr_root_id(typed, target)
   when Option::Some(id) then
  # boundary: the frame is LocalId-keyed; expr_root_id yields the raw
@@ -5765,27 +5980,100 @@ def check_assign_target(program: &Program, typed: &TypedProgram, env: &mut TypeE
             end
           end
         else
-          # A projected target's store is into the root's storage; the
-          # root's own state does not change (next = prior). The root must
-          # be usable (check_use), and an owning-typed projection cannot be
-          # replaced: the drop chain drops the WHOLE root (exact-place
-          # replacement is not representable) — rejected at the Live case.
-          check_use(typed, id, target.span, frame, errors)
+          # (partial moves — the projected target): the store is into the
+          # root's storage; the root's OWN state does not change (next =
+          # prior for the root) but the TARGET CHAIN's prior state decides
+          # the drop-before-store and the chain's next state (the
+          # AssignmentTransition carries the chain-level transition):
+          #   - dead storage (a moved-out chain): the store re-lives the
+          #     chain without a drop;
+          #   - a Live OWNING chain: the old value's drop-before-store. The
+          #     MIR's assign-drop chain can only destroy the WHOLE root, so
+          #     this is representable only when the root is FULLY live (no
+          #     consumed chains — the drop would re-drop them), the target
+          #     is DEPTH-1 (a nested target would leave the target's sibling
+          #     subfields dead — the drop chain cannot mask them), and the
+          #     root's direct-field shape is known (the destroyed sibling
+          #     fields must be marked for the scope-exit drop). The caller
+          #     additionally rejects an RHS rooted at the same local (the
+          #     drop would destroy the value's source);
+          #   - a Live non-owning chain: a plain store, no drop;
+          #   - an INDEXED target (the whole-value boundary): the MIR's
+          #     indexed-assign drop is the old-element drop authority (the
+          #     existing container-element semantics) — the checker records
+          #     no assign-drop and no chain transition.
           match prior_state
+          when ResourceState::Consumed then
+            check_use(typed, id, target.span, frame, errors)
+            Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+          when ResourceState::Uninitialized then
+            check_use(typed, id, target.span, frame, errors)
+            Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+          when ResourceState::MaybeLive then
+            check_use(typed, id, target.span, frame, errors)
+            Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
           when ResourceState::Live then
-            match res_frame_get_origin(frame, &lid)
-            when Option::Some(origin) then
-              if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
+            var chain = Vec::new()
+            let field_chain = place_projection_keys(typed, &target, &mut chain)
+            if field_chain then
+              let eff = chain_effective_state(frame, lid, &chain)
+              match eff
+              when ResourceState::Consumed then
+                # Dead field storage: the store re-lives the field without
+                # a drop (the re-assignment of a moved-out field).
+                Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+              when ResourceState::MaybeLive then
                 errors.push(ResourceError {
-                  message: "cannot assign over an owning projected place: exact-place replacement is not yet supported",
+                  message: "field `" + chain_display(typed, &chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
                   span: target.span
                 })
+                Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+              when ResourceState::Live then
+                match res_frame_get_origin(frame, &lid)
+                when Option::Some(origin) then
+                  if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
+                    # The old owning value's drop-before-store — the target
+                    # FIELD's type must own (a Copy-field store overwrites
+                    # without a drop), and only the fully-live depth-1
+                    # shape is representable (see the note above).
+                    if !expr_type_has_resource(env, typed, target) then
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                    elsif chain.len() != 1 then
+                      errors.push(ResourceError {
+                        message: "cannot assign over an owning projected place: nested exact-place replacement is not representable",
+                        span: target.span
+                      })
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                    elsif root_has_moves(frame, lid) then
+                      errors.push(ResourceError {
+                        message: "cannot assign over an owning projected place: the root is partially moved out (the masked drop-before-store is not representable)",
+                        span: target.span
+                      })
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                    elsif !root_direct_shape_known(typed, lid) then
+                      errors.push(ResourceError {
+                        message: "cannot assign over an owning projected place: the root's field shape is unknown (the sibling fields cannot be masked)",
+                        span: target.span
+                      })
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                    else
+                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: true })
+                    end
+                  else
+                    Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                  end
+                when Option::None then
+                  Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                end
               end
-            when Option::None then ()
+            else
+              # The whole-value boundary (an indexed target): the MIR's
+              # indexed-assign drop destroys the old element itself (the
+              # existing container-element semantics) — no assign-drop
+              # record, no chain transition.
+              Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
             end
-          when _ then ()
           end
-          Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
         end
       when Option::None then Option::None
       end
@@ -5798,7 +6086,7 @@ def check_assign_target(program: &Program, typed: &TypedProgram, env: &mut TypeE
   end
 end
 
-def apply_arg_effect(program: &Program, typed: &TypedProgram, env: &mut TypeEnv, arg: &Expr, effect: AccessEffect, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable, edges: &mut Vec[CfgEdge], blocks: &mut Vec[CfgBlock], current_loop_entry: &mut Vec[Int], defer_chain: &mut Vec[Int]) -> Unit
+def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, arg: Expr, effect: AccessEffect, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match expr_root_id(typed, arg)
   when Option::Some(id) then
  # boundary: the frame is LocalId-keyed; expr_root_id yields the raw
@@ -5809,25 +6097,30 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, env: &mut TypeEnv,
         match effect
         when AccessEffect::Consume then apply_consume(typed, id, arg.span, loop_outer, frame, errors)
         when AccessEffect::Initialize then apply_set(typed, frame, lid, arg.span, errors)
-        when _ then check_use(typed, id, arg.span, frame, errors)
+        when _ then
+          # (partial moves — the whole-value boundary): a whole-value READ
+          # of a partially-moved root copies the dead chains' storage — the
+          # conservative rule (a whole-value use requires the full Live
+          # value, the closure-capture rule extended to every whole read).
+          if root_has_moves(frame, lid) then
+            errors.push(ResourceError {
+              message: "cannot use " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` as a whole: fields of the resource were moved out",
+              span: arg.span
+            })
+          else
+            check_use(typed, id, arg.span, frame, errors)
+          end
         end
       else
-        # A projected consuming argument (e.g. consume_inner(self.inner) or
-        # consume_probe(p.a)): MIR lowers the projection as a consuming
-        # place while semantic state keeps the ROOT live — the structural
-        # cleanup would finalize the moved field a second time. Until
-        # partial-move/place state exists, every OWNERSHIP-TAKING projection
-        # is rejected (the DeinitSelf case gets the finalizer-specific
-        # message; all other roots get the partial-move restriction).
-        # The rejection is an OWNERSHIP rule: a projection whose VALUE type
-        # is NOT owning (e.g. m.insert(td.id.id, v) — a Copy read out of an
-        # owning root) transfers no ownership — the collection consumes a
-        # COPY — so it is a plain read of the root (check_use). Only an
-        # owning-typed projection (e.g. m.insert(node.id, node) with a
-        # String id field) is the partial-move hazard and is rejected. The
-        # sink signatures (std/collections.tg) carry the collection
-        # semantics; this type-based rule replaces the shape-based
-        # over-rejection that would flag every Copy field read.
+        # A projected argument: the per-field state tracking. MIR lowers
+        # the projection as a consuming/initializing place while the ROOT
+        # stays live — the per-chain lattice is the state authority. The
+        # OWNERSHIP gate stays: a projection whose VALUE type is NOT owning
+        # (e.g. m.insert(td.id.id, v) — a Copy read out of an owning root)
+        # transfers no ownership — the collection consumes a COPY — so it
+        # is a plain read of the root (check_use). Only an owning-typed
+        # projection (e.g. m.insert(node.id, node) with a String id field)
+        # exercises the per-field consume/initialize paths.
         if effect == AccessEffect::Consume then
           match res_frame_get_origin(frame, &lid)
           when Option::Some(ParamOrigin::DeinitSelf) then
@@ -5837,30 +6130,82 @@ def apply_arg_effect(program: &Program, typed: &TypedProgram, env: &mut TypeEnv,
             })
           when _ then
             if expr_type_has_resource(env, typed, arg) then
-              errors.push(ResourceError {
-                message: "cannot consume a projected place: partial moves are not yet supported",
-                span: arg.span
-              })
+              var chain = Vec::new()
+              let field_chain = place_projection_keys(typed, &arg, &mut chain)
+              if field_chain then
+                apply_projected_consume(env, typed, id, &chain, arg.span, loop_outer, frame, errors)
+              else
+                # The whole-value boundary (an indexed/deref place): the
+                # aggregate marking (see transfer_consume).
+                apply_whole_boundary_consume(env, typed, id, arg.span, loop_outer, frame, errors)
+              end
             else
               check_use(typed, id, arg.span, frame, errors)
             end
           end
         elsif effect == AccessEffect::Initialize then
           # A projected set argument (f(set p.a)) writes into the root's
-          # storage: root-level state cannot prove the field's storage is
-          # dead, so an OWNING-typed projection is rejected (mirror of the
-          # partial-move rule above — the same root-state granularity gap);
-          # a Copy-typed projection is a plain root-usable check.
+          # storage: the CHAIN's state decides — dead storage (a moved-out
+          # field) is re-initialized; a Live field is already initialized
+          # (writing over it without destroying the old value would leak)
+          # and is rejected; the commit re-lives the chain. A Copy-typed
+          # projection is a plain root-usable check.
           if expr_type_has_resource(env, typed, arg) then
-            errors.push(ResourceError {
-              message: "cannot initialize a projected place: exact-place state is not yet supported",
-              span: arg.span
-            })
+            var chain = Vec::new()
+            let field_chain = place_projection_keys(typed, &arg, &mut chain)
+            if field_chain then
+              let eff = chain_effective_state(frame, lid, &chain)
+              match eff
+              when ResourceState::Live then
+                errors.push(ResourceError {
+                  message: "cannot initialize already-live storage: field `" + chain_display(typed, &chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` is already live",
+                  span: arg.span
+                })
+              when ResourceState::MaybeLive then
+                errors.push(ResourceError {
+                  message: "cannot initialize already-live storage: field `" + chain_display(typed, &chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` is live on one path",
+                  span: arg.span
+                })
+              when _ then ()
+              end
+              frame_place_mark(frame, lid, &chain, ResourceState::Live)
+            else
+              # The whole-value boundary (an indexed place): the container
+              # elements are the aggregate — the per-index storage state is
+              # not tracked, so an owning-typed indexed set argument stays
+              # rejected (conservative).
+              errors.push(ResourceError {
+                message: "cannot initialize a projected place: element-level state is not tracked (the container's elements are the ownership unit)",
+                span: arg.span
+              })
+            end
           else
             check_use(typed, id, arg.span, frame, errors)
           end
         else
-          check_use(typed, id, arg.span, frame, errors)
+          # A projected READ: the chain's state decides (the root stays
+          # live under a partial move; a consumed chain is a
+          # use-after-move).
+          var chain = Vec::new()
+          let field_chain = place_projection_keys(typed, &arg, &mut chain)
+          if field_chain then
+            let eff = chain_effective_state(frame, lid, &chain)
+            match eff
+            when ResourceState::Consumed then
+              errors.push(ResourceError {
+                message: "use of consumed " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` (field `" + chain_display(typed, &chain) + "` was moved out)",
+                span: arg.span
+              })
+            when ResourceState::MaybeLive then
+              errors.push(ResourceError {
+                message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
+                span: arg.span
+              })
+            when _ then ()
+            end
+          else
+            check_use(typed, id, arg.span, frame, errors)
+          end
         end
       end
     end
@@ -5875,7 +6220,7 @@ end
 # dimension is part of the single per-local record, so the label reads it
 # directly. Absent records default to "resource" (an unregistered local cannot
 # be a capability: every capability is registered at its binding point).
-def ownership_label(frame: &ResFrame, id: Int) -> String
+def ownership_label(frame: ResFrame, id: Int) -> String
   match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
   when Option::Some(ls) then
     if ls.is_capability then "capability" else "resource" end
@@ -5883,7 +6228,7 @@ def ownership_label(frame: &ResFrame, id: Int) -> String
   end
 end
 
-def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError]) -> Unit
+def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
  # boundary: the id is the raw Int semantic id (loop_outer and
   # binding_name are Int-keyed); the frame is LocalId-keyed.
   let lid = tg_compiler::ids::LocalId { id: id }
@@ -5915,6 +6260,19 @@ def apply_consume(typed: &TypedProgram, id: Int, span: Span, loop_outer: &Vec[In
       return
     end
   when Option::None then ()
+  end
+  # (partial moves — the whole-value boundary): a whole-root consume of a
+  # partially-moved root cannot mask the dead chains — the destination (a
+  # move, a closure capture, an explicit finalizer call) would re-drop the
+  # moved-out fields' storage. The conservative rule: a whole-value consume
+  # requires the FULL Live value (the closure-capture rule extends to every
+  # whole-root consume).
+  if root_has_moves(frame, lid) then
+    errors.push(ResourceError {
+      message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` as a whole: fields of the resource were moved out",
+      span: span
+    })
+    return
   end
   if loop_outer.contains(&id) then
     errors.push(ResourceError {
@@ -5954,7 +6312,18 @@ end
 # assignment machinery's drop-before-store chain); Initialize never
 # replaces. The state still commits Live after an error (the analysis
 # continues with the store the program asked for), mirroring apply_consume.
-def apply_set(typed: &TypedProgram, frame: &mut ResFrame, id: tg_compiler::ids::LocalId, span: Span, errors: &mut Vec[ResourceError]) -> Unit
+def apply_set(typed: TypedProgram, inout frame: ResFrame, id: tg_compiler::ids::LocalId, span: Span, inout errors: Vec[ResourceError]) -> Unit
+  # (partial moves — the whole-value boundary): a whole-root Initialize of
+  # a partially-moved root would overwrite the live fields without
+  # destroying their values (and the dead chains' storage) — conservative
+  # rejection.
+  if root_has_moves(frame, id) then
+    errors.push(ResourceError {
+      message: "cannot initialize " + ownership_label(frame, id.id) + " `" + binding_name(typed, id.id) + "` as a whole: fields of the resource were moved out",
+      span: span
+    })
+    return
+  end
   match res_frame_get(frame, &id)
   when Option::Some(ResourceState::Live) then
     errors.push(ResourceError {
@@ -5971,8 +6340,8 @@ def apply_set(typed: &TypedProgram, frame: &mut ResFrame, id: tg_compiler::ids::
   res_frame_set(frame, id, ResourceState::Live)
 end
 
-def check_use(typed: &TypedProgram, id: Int, span: Span, frame: &ResFrame, errors: &mut Vec[ResourceError]) -> Unit
- # boundary: check_use keeps the raw Int semantic id (callers derive it
+def check_use(typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+  # boundary: check_use keeps the raw Int semantic id (callers derive it
   # from expr_root_id / ident_resolutions); the frame is LocalId-keyed.
   match res_frame_get(frame, &tg_compiler::ids::LocalId { id: id })
   when Option::Some(ResourceState::Consumed) then
@@ -5994,7 +6363,40 @@ def check_use(typed: &TypedProgram, id: Int, span: Span, frame: &ResFrame, error
   end
 end
 
-def exit_scope(frame: &mut ResFrame, entry_names: &Vec[tg_compiler::ids::LocalId], typed: &TypedProgram, errors: &mut Vec[ResourceError]) -> Unit
+# (partial moves — the chain-aware place read): a field/index READ is a
+# read of the CHAIN, not of the root as a whole. The root stays live under
+# a partial move (the remaining fields are readable); a consumed chain (or
+# a consumed prefix) is a use-after-move. The root's own availability is
+# already validated by the base recursion (check_expr on the base).
+def check_place_chain_read(typed: TypedProgram, expr: Expr, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+  match expr_root_id(typed, expr)
+  when Option::Some(id) then
+    let lid = tg_compiler::ids::LocalId { id: id }
+    if res_frame_has(frame, &lid) then
+      var chain = Vec::new()
+      let field_chain = place_projection_keys(typed, expr, &mut chain)
+      if field_chain then
+        let eff = chain_effective_state(frame, lid, &chain)
+        match eff
+        when ResourceState::Consumed then
+          errors.push(ResourceError {
+            message: "use of consumed " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` (field `" + chain_display(typed, &chain) + "` was moved out)",
+            span: expr.span
+          })
+        when ResourceState::MaybeLive then
+          errors.push(ResourceError {
+            message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
+            span: expr.span
+          })
+        when _ then ()
+        end
+      end
+    end
+  when Option::None then ()
+  end
+end
+
+def exit_scope(inout frame: ResFrame, entry_names: Vec[tg_compiler::ids::LocalId], typed: TypedProgram, inout errors: Vec[ResourceError]) -> Unit
   mut to_forget = Vec::new()
   # Frame keys and entry_names are both LocalId (the frame-key domain);
   # binding_name is keyed by the raw Int semantic id.
@@ -6038,6 +6440,58 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[tg_compiler::ids::LocalId
       to_forget.push(id)
     end
   end
+  # (partial moves — the per-chain scope-boundary checks): a chain that is
+  # MaybeLive at the scope boundary (consumed on one path only) cannot be
+  # masked by the unconditional cleanup — reject, mirroring the root-level
+  # rule. The registry-divergence net also fires here: a chain the
+  # type-checker recorded Consumed (the serialized registry the drop sites
+  # consult) whose frame lattice has NO matching Consumed/MaybeLive chain
+  # means the cleanup would skip a live field on some path (the
+  # guard-else-return / defer-body fallthrough shape) — the record must be
+  # masked on every path or the program is rejected.
+  for (id, ls) in frame.locals do
+    if !entry_names.contains(&id) then
+      match ls.availability
+      when ResourceState::Consumed then ()
+      when ResourceState::Uninitialized then ()
+      when _ then
+        match frame.place_moves.get(id)
+        when Option::Some(chains) then
+          for (pc, st) in chains do
+            if st == ResourceState::MaybeLive then
+              errors.push(ResourceError {
+                message: "resource `" + binding_name(typed, id.id) + "` field `" + chain_display(typed, &pc.keys) + "` may be consumed on one path; scope-exit cleanup cannot be conditional",
+                span: ls.span
+              })
+            end
+          end
+          match typed.place_move_states.get(id.id)
+          when Option::Some(recorded) then
+            for (rec_path, rec_st) in recorded do
+              if rec_path != "*" && rec_st == PlaceMoveState::Consumed then
+                var rec_ok = false
+                for (fpc, fst) in chains do
+                  if place_move_path_matches_chain(typed, &rec_path, &fpc.keys) then
+                    if fst == ResourceState::Consumed || fst == ResourceState::MaybeLive then
+                      rec_ok = true
+                    end
+                  end
+                end
+                if !rec_ok then
+                  errors.push(ResourceError {
+                    message: "resource `" + binding_name(typed, id.id) + "` field `" + rec_path + "` was moved out on one path only; scope-exit cleanup cannot be conditional",
+                    span: ls.span
+                  })
+                end
+              end
+            end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+    end
+  end
   mut i = 0
   while i < to_forget.len() do
     res_frame_forget(frame, &to_forget[i])
@@ -6045,7 +6499,7 @@ def exit_scope(frame: &mut ResFrame, entry_names: &Vec[tg_compiler::ids::LocalId
   end
 end
 
-def check_uninitialized_exit(frame: &ResFrame, typed: &TypedProgram, errors: &mut Vec[ResourceError]) -> Unit
+def check_uninitialized_exit(frame: ResFrame, typed: TypedProgram, inout errors: Vec[ResourceError]) -> Unit
   # Frame keys are LocalId; binding_name is keyed by the raw Int semantic id.
   for (id, ls) in frame.locals do
     match ls.availability
@@ -6061,29 +6515,30 @@ end
 
 def res_frame_new() -> ResFrame
   ResFrame {
-    locals: Map::new()
+    locals: Map::new(),
+    place_moves: Map::new()
   }
 end
 
-def res_frame_has(frame: &ResFrame, id: &tg_compiler::ids::LocalId) -> Bool
+def res_frame_has(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Bool
   frame.locals.contains_key(id)
 end
 
-def res_frame_get_origin(frame: &ResFrame, id: &tg_compiler::ids::LocalId) -> Option[ParamOrigin]
+def res_frame_get_origin(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Option[ParamOrigin]
   match frame.locals.get(id)
   when Option::Some(ls) then Option::Some(ls.origin)
   when Option::None then Option::None
   end
 end
 
-def res_frame_get(frame: &ResFrame, id: &tg_compiler::ids::LocalId) -> Option[ResourceState]
+def res_frame_get(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Option[ResourceState]
   match frame.locals.get(id)
   when Option::Some(ls) then Option::Some(ls.availability)
   when Option::None then Option::None
   end
 end
 
-def res_frame_set(frame: &mut ResFrame, id: tg_compiler::ids::LocalId, state: ResourceState) -> Unit
+def res_frame_set(inout frame: ResFrame, id: tg_compiler::ids::LocalId, state: ResourceState) -> Unit
   match frame.locals.get(&id)
   when Option::Some(ls) then
     # State transition only: the local's origin/capability/span are part of
@@ -6095,7 +6550,7 @@ def res_frame_set(frame: &mut ResFrame, id: tg_compiler::ids::LocalId, state: Re
   end
 end
 
-def res_frame_set_span(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId, span: Span) -> Unit
+def res_frame_set_span(inout frame: ResFrame, id: tg_compiler::ids::LocalId, span: Span) -> Unit
   match frame.locals.get(id)
   when Option::Some(ls) then
     frame.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: span })
@@ -6106,11 +6561,305 @@ end
 # The permission origin is stored in the single per-local record :
 # updating it touches only that record, never a parallel map that a forget
 # could leave desynced.
-def res_frame_set_origin(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId, origin: ParamOrigin) -> Unit
+def res_frame_set_origin(inout frame: ResFrame, id: tg_compiler::ids::LocalId, origin: ParamOrigin) -> Unit
   match frame.locals.get(id)
   when Option::Some(ls) then
     frame.locals.insert(id, LocalState { availability: ls.availability, origin: origin, is_capability: ls.is_capability, span: ls.span })
   when Option::None then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (partial moves — the frame's per-field lattice)
+# ———————————————————————————————————————————————————————————————
+# The lattice (ResFrame.place_moves) tracks the per-CHAIN move state of
+# every root: a chain recorded Consumed was moved out (extracted) while
+# the root stays Live; MaybeLive chains were consumed on one path only
+# (rejected at the scope boundaries). An absent chain is Live. The
+# EFFECTIVE state of a chain also consults the chain's PREFIXES: a
+# consumed prefix (or a consumed/unknown root) makes everything under it
+# dead — `take(p.a)` then `take(p.a.b)` is a use of consumed storage.
+
+# The SEMANTIC chain of a place expression: the FieldId/TupleIndex
+# projections in access order (typed.field_targets / typed.typed_exprs —
+# the typed HIR's strong identities). Returns false when the chain passes
+# through a non-field/tuple projection (Index/Deref — the whole-value
+# lattice boundary).
+# The constant integer index of an expression (the AST integer literal).
+def typed_const_index(typed: TypedProgram, expr: Expr) -> Option[Int]
+  match expr.kind
+  when ExprKind::ExprIntLit(v) then Option::Some(v)
+  when _ then Option::None
+  end
+end
+
+# The typed type of an expression (the typed HIR's type record).
+def typed_expr_ty(typed: TypedProgram, expr: Expr) -> Option[Type]
+  match typed.expr_types.get(expr.node_id)
+  when Option::Some(ty) then Option::Some(ty.clone())
+  when Option::None then Option::None
+  end
+end
+
+def place_projection_keys(typed: TypedProgram, expr: Expr, inout out: Vec[ProjectionKey]) -> Bool
+  match expr.kind
+  when ExprKind::ExprIdent(_) then true
+  when ExprKind::ExprFieldAccess(base, _) then
+    if !place_projection_keys(typed, &base, out) then
+      return false
+    end
+    match typed.field_targets.get(expr.node_id)
+    when Option::Some(fid) then
+      out.push(ProjectionKey::Field(fid))
+      true
+    when Option::None then
+      match typed.typed_exprs.get(expr.node_id)
+      when Option::Some(te) then
+        match te.kind
+        when TypedExprKind::TupleIndex(ti) then
+          out.push(ProjectionKey::TupleIndex(ti.index))
+          true
+        when _ then false
+        end
+      when Option::None then false
+      end
+    end
+  when ExprKind::ExprIndex(base, idx) then
+    if !place_projection_keys(typed, &base, out) then
+      return false
+    end
+    # The per-index lattice: a CONSTANT index over a FIXED-ARRAY base
+    # tracks the element individually (the finite indices); a dynamic
+    # index (or a non-fixed-array base) stays the whole-value lattice.
+    match typed_const_index(typed, &idx)
+    when Option::Some(ci) then
+      match typed_expr_ty(typed, &base)
+      when Option::Some(bt) then
+        match bt
+        when Type::FixedArray(_, n) then
+          if ci >= 0 && ci < n then
+            out.push(ProjectionKey::Index(ci))
+            true
+          else
+            out.push(ProjectionKey::Index(ci))
+            false
+          end
+        when _ then
+          out.push(ProjectionKey::Index(ci))
+          false
+        end
+      when Option::None then
+        out.push(ProjectionKey::Index(ci))
+        false
+      end
+    when Option::None then
+      out.push(ProjectionKey::Index(-1))
+      false
+    end
+  when ExprKind::ExprRawDeref(inner) then
+    if !place_projection_keys(typed, &inner, out) then
+      return false
+    end
+    false
+  when ExprKind::ExprAccess(inner) then place_projection_keys(typed, &inner, out)
+  when ExprKind::ExprCast(inner, _) then place_projection_keys(typed, &inner, out)
+  when _ then false
+  end
+end
+
+# The effective state of a chain: the root's own availability decides the
+# whole (a Consumed/Uninitialized root makes every chain dead); then the
+# chain's prefixes in order — the first recorded Consumed prefix makes the
+# rest dead (Consumed), the first MaybeLive prefix makes the rest
+# indeterminate. Absent = Live.
+def chain_effective_state(frame: ResFrame, lid: tg_compiler::ids::LocalId, chain: Vec[ProjectionKey]) -> ResourceState
+  match res_frame_get(frame, &lid)
+  when Option::Some(ResourceState::Consumed) then return ResourceState::Consumed
+  when Option::Some(ResourceState::Uninitialized) then return ResourceState::Consumed
+  when Option::Some(ResourceState::MaybeLive) then return ResourceState::MaybeLive
+  when _ then ()
+  end
+  match frame.place_moves.get(lid)
+  when Option::Some(chains) then
+    var len_i = 0
+    while len_i < chain.len() do
+      var prefix = Vec::new()
+      var pi = 0
+      while pi <= len_i do
+        prefix.push(chain[pi].clone())
+        pi = pi + 1
+      end
+      let pc = projection_chain_of(&prefix)
+      match chains.get(pc)
+      when Option::Some(st) then
+        if st == ResourceState::Consumed then
+          return ResourceState::Consumed
+        end
+        if st == ResourceState::MaybeLive then
+          return ResourceState::MaybeLive
+        end
+      when Option::None then ()
+      end
+      len_i = len_i + 1
+    end
+  when Option::None then ()
+  end
+  ResourceState::Live
+end
+
+# Mark a chain's state in the lattice.
+def frame_place_mark(inout frame: ResFrame, lid: tg_compiler::ids::LocalId, chain: Vec[ProjectionKey], state: ResourceState) -> Unit
+  let pc = projection_chain_of(chain)
+  match frame.place_moves.get(lid)
+  when Option::Some(existing) then
+    var ext = existing.clone()
+    ext.insert(pc, state)
+    frame.place_moves.insert(lid, ext)
+  when Option::None then
+    var fresh = Map::new()
+    fresh.insert(pc, state)
+    frame.place_moves.insert(lid, fresh)
+  end
+end
+
+# Remove a chain and every extension of it (a store re-lives the target;
+# the nested consumptions under it die with the re-initialization).
+def frame_place_clear(inout frame: ResFrame, lid: tg_compiler::ids::LocalId, chain: Vec[ProjectionKey]) -> Unit
+  match frame.place_moves.get(lid)
+  when Option::Some(existing) then
+    var kept = Map::new()
+    for (pc, st) in existing do
+      if pc.keys.len() < chain.len() then
+        kept.insert(ProjectionChain { keys: pc.keys.clone() }, st)
+      else
+        var is_prefix = true
+        var ki = 0
+        while ki < chain.len() do
+          if !projection_key_eq(&pc.keys[ki], &chain[ki]) then
+            is_prefix = false
+          end
+          ki = ki + 1
+        end
+        if !is_prefix then
+          kept.insert(ProjectionChain { keys: pc.keys.clone() }, st)
+        end
+      end
+    end
+    if kept.len() > 0 then
+      frame.place_moves.insert(lid, kept)
+    else
+      frame.place_moves.remove(lid)
+    end
+  when Option::None then ()
+  end
+end
+
+# Does the root carry ANY recorded chain (a partial move, definite or
+# path-conditional)? The whole-value operations (whole-root consume/read/
+# assign/capture) consult this: a whole-value move of a partially-moved
+# root cannot mask the dead chains.
+def root_has_moves(frame: ResFrame, lid: tg_compiler::ids::LocalId) -> Bool
+  match frame.place_moves.get(lid)
+  when Option::Some(chains) then chains.len() > 0
+  when Option::None then false
+  end
+end
+
+# Render a chain for diagnostics: the "."-joined field names (FieldId ->
+# the owner's declaration-order name — typed.type_fields), "t<i>" for
+# tuple positions.
+def chain_display(typed: TypedProgram, chain: Vec[ProjectionKey]) -> String
+  var segs = Vec::new()
+  for k in chain do
+    match k
+    when ProjectionKey::Field(fid) then
+      var fname = ""
+      match typed.type_fields.get(fid.owner.id)
+      when Option::Some(fields) then
+        if fid.index >= 0 && fid.index < fields.len() then
+          fname = fields[fid.index].0.clone()
+        end
+      when Option::None then ()
+      end
+      if fname.len() == 0 then
+        fname = "f" + fid.index.to_string()
+      end
+      segs.push(fname)
+    when ProjectionKey::Variant(_) then ()
+    when ProjectionKey::TupleIndex(ti) then segs.push("t" + ti.to_string())
+    when ProjectionKey::Index then ()
+    end
+  end
+  segs.join(".")
+end
+
+# Does the serialized (recorded) path denote the same chain? The
+# declaration-order rendering (chain_display) is the SAME authority the
+# type-checker's record sites serialize through (place_move_path_of —
+# FieldId -> the owner's declaration-order name), so the registry-divergence
+# net can match the recorded strings against the frame's semantic chains.
+def place_move_path_matches_chain(typed: TypedProgram, path: String, chain: Vec[ProjectionKey]) -> Bool
+  chain_display(typed, chain) == path
+end
+
+# The root's direct-field shape (the sibling-masking of the whole-root
+# assign-drop case needs the declaration-order field list).
+def root_direct_shape_known(typed: TypedProgram, lid: tg_compiler::ids::LocalId) -> Bool
+  match typed.local_bindings.get(lid.id)
+  when Option::Some(lb) then
+    match lb.ty
+    when Type::Adt(tid, _) then
+      match typed.type_fields.get(tid.id)
+      when Option::Some(fields) then fields.len() > 0
+      when Option::None then false
+      end
+    when Type::Tuple(fields) then fields.len() > 0
+    when _ then false
+    end
+  when Option::None then false
+  end
+end
+
+# (partial moves): mark the root's DIRECT fields other than the target
+# chain Consumed in the frame lattice — the whole-root assign-drop chain
+# destroys them; the scope-exit drop then drops only the re-stored target.
+def mark_frame_sibling_fields(typed: TypedProgram, inout frame: ResFrame, lid: tg_compiler::ids::LocalId, target: Vec[ProjectionKey]) -> Unit
+  match typed.local_bindings.get(lid.id)
+  when Option::Some(lb) then
+    match lb.ty
+    when Type::Adt(tid, _) then
+      match typed.type_fields.get(tid.id)
+      when Option::Some(fields) then
+        var fi = 0
+        while fi < fields.len() do
+          let sk = ProjectionKey::Field(FieldId { owner: tid, index: fi })
+          if !chain_contains_key(target, &sk) then
+            frame_place_mark(frame, lid, &Vec::from([sk]), ResourceState::Consumed)
+          end
+          fi = fi + 1
+        end
+      when Option::None then ()
+      end
+    when Type::Tuple(fields) then
+      var ti = 0
+      while ti < fields.len() do
+        let sk = ProjectionKey::TupleIndex(ti)
+        if !chain_contains_key(target, &sk) then
+          frame_place_mark(frame, lid, &Vec::from([sk]), ResourceState::Consumed)
+        end
+        ti = ti + 1
+      end
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+end
+
+# Does the expression root at the given semantic local?
+def expr_roots_at(typed: TypedProgram, expr: Expr, id: Int) -> Bool
+  match expr_root_id(typed, expr)
+  when Option::Some(rid) then rid == id
+  when Option::None then false
   end
 end
 
@@ -6128,7 +6877,7 @@ end
 # named `self` — a real finalizer hook, not a free function that happens to
 # be called deinit/drop), the local is registered Live + DeinitSelf so the
 # drop body is checked with IDENTICAL permissions to a deinit body.
-def mark_finalizer_self(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId, span: Span, is_self_param: Bool) -> Unit
+def mark_finalizer_self(inout frame: ResFrame, id: tg_compiler::ids::LocalId, span: Span, is_self_param: Bool) -> Unit
   match frame.locals.get(id)
   when Option::Some(ls) then
     frame.locals.insert(id, LocalState { availability: ls.availability, origin: ParamOrigin::DeinitSelf, is_capability: ls.is_capability, span: ls.span })
@@ -6139,14 +6888,14 @@ def mark_finalizer_self(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId, sp
   end
 end
 
-def frame_span(frame: &ResFrame, id: &tg_compiler::ids::LocalId) -> Span
+def frame_span(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Span
   match frame.locals.get(id)
   when Option::Some(ls) then ls.span
   when Option::None then Span { file: String::new(), start: 0, end_pos: 0 }
   end
 end
 
-def res_frame_mark_cap(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId) -> Unit
+def res_frame_mark_cap(inout frame: ResFrame, id: tg_compiler::ids::LocalId) -> Unit
   match frame.locals.get(id)
   when Option::Some(ls) then
     frame.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: true, span: ls.span })
@@ -6154,14 +6903,17 @@ def res_frame_mark_cap(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId) -> 
   end
 end
 
-def res_frame_forget(frame: &mut ResFrame, id: &tg_compiler::ids::LocalId) -> Unit
+def res_frame_forget(inout frame: ResFrame, id: tg_compiler::ids::LocalId) -> Unit
   # The whole per-local record is removed at once: availability, origin,
   # capability flag, and span disappear together, so a forgotten local can
- # never leave a stale span/origin behind in a parallel collection.
+  # never leave a stale span/origin behind in a parallel collection.
   frame.locals.remove(id)
+  # The per-field lattice entry dies with the local (a forgotten root has
+  # no drop site that could consult its chains).
+  frame.place_moves.remove(id)
 end
 
-def res_frame_names_clone(frame: &ResFrame) -> Vec[tg_compiler::ids::LocalId]
+def res_frame_names_clone(frame: ResFrame) -> Vec[tg_compiler::ids::LocalId]
   # The frame's keys (semantic LocalIds) are cloned as LocalId; consumers
   # that need the raw Int ids (the loop-context domain, the MIR-facing
   # plans) extract `.id` at their own boundary.
@@ -6172,17 +6924,26 @@ def res_frame_names_clone(frame: &ResFrame) -> Vec[tg_compiler::ids::LocalId]
   out
 end
 
-def res_frame_clone(frame: &ResFrame) -> ResFrame
+def res_frame_clone(frame: ResFrame) -> ResFrame
   mut out = res_frame_new()
   # The record is copied wholesale: availability, origin, capability flag,
   # and span all travel together.
   for (id, ls) in frame.locals do
     out.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: ls.span })
   end
+  # The per-field lattice travels with the frame (the branch clones and
+  # the worklist's entry snapshots must see the same partial-move state).
+  for (rid, chains) in frame.place_moves do
+    var ext = Map::new()
+    for (ch, st) in chains do
+      ext.insert(ProjectionChain { keys: ch.keys.clone() }, st)
+    end
+    out.place_moves.insert(rid, ext)
+  end
   out
 end
 
-def res_frame_equal(a: &ResFrame, b: &ResFrame) -> Bool
+def res_frame_equal(a: ResFrame, b: ResFrame) -> Bool
   if a.locals.len() != b.locals.len() then return false end
   for (id, ls) in a.locals do
     match b.locals.get(id)
@@ -6197,19 +6958,44 @@ def res_frame_equal(a: &ResFrame, b: &ResFrame) -> Bool
     when Option::None then return false
     end
   end
+  # The per-field lattice participates in frame equality: a partial-move
+  # divergence must re-merge like any other state divergence.
+  if a.place_moves.len() != b.place_moves.len() then return false end
+  for (rid, chains) in a.place_moves do
+    match b.place_moves.get(rid)
+    when Option::Some(chains_b) then
+      if chains.len() != chains_b.len() then return false end
+      for (ch, st) in chains do
+        match chains_b.get(ch)
+        when Option::Some(st_b) then
+          if !(st == st_b) then return false end
+        when Option::None then return false
+        end
+      end
+    when Option::None then return false
+    end
+  end
   true
 end
 
-def frame_assign(dst: &mut ResFrame, src: &ResFrame) -> Unit
+def frame_assign(inout dst: ResFrame, src: ResFrame) -> Unit
   # Replace the whole frame: the previous contents (including any record a
   # stale parallel collection could have kept) vanish with the clear.
   dst.locals.clear()
   for (id, ls) in src.locals do
     dst.locals.insert(id, LocalState { availability: ls.availability, origin: ls.origin, is_capability: ls.is_capability, span: ls.span })
   end
+  dst.place_moves.clear()
+  for (rid, chains) in src.place_moves do
+    var ext = Map::new()
+    for (ch, st) in chains do
+      ext.insert(ProjectionChain { keys: ch.keys.clone() }, st)
+    end
+    dst.place_moves.insert(rid, ext)
+  end
 end
 
-def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
+def merge_frames(arms: Vec[ResFrame]) -> ResFrame
   mut out = res_frame_new()
   mut union = Vec::new()
   mut a = 0
@@ -6283,10 +7069,85 @@ def merge_frames(arms: &Vec[ResFrame]) -> ResFrame
     end
     i = i + 1
   end
+  # (partial moves): the per-field lattice join — a chain's merged state is
+  # definite only when EVERY arm agrees; a chain Live (absent) in one arm
+  # and Consumed in another joins to MaybeLive (the scope-exit rejection
+  # mirrors the root-level rule: the cleanup cannot be conditional).
+  mut root_union = Vec::new()
+  mut a2 = 0
+  while a2 < arms.len() do
+    let arm2 = arms[a2]
+    for (rid, _) in arm2.place_moves do
+      if !root_union.contains(&rid) then
+        root_union.push(rid)
+      end
+    end
+    a2 = a2 + 1
+  end
+  var ri = 0
+  while ri < root_union.len() do
+    let rid = root_union[ri]
+    var chain_union = Vec::new()
+    mut a3 = 0
+    while a3 < arms.len() do
+      match arms[a3].place_moves.get(rid)
+      when Option::Some(chains) then
+        for (ch, _) in chains do
+          if !chain_union.contains(&ch) then
+            chain_union.push(ch)
+          end
+        end
+      when Option::None then ()
+      end
+      a3 = a3 + 1
+    end
+    var merged_chains = Map::new()
+    var ci = 0
+    while ci < chain_union.len() do
+      let ch = chain_union[ci]
+      var seen_in: Vec[ResourceState] = Vec::new()
+      mut a4 = 0
+      while a4 < arms.len() do
+        match arms[a4].place_moves.get(rid)
+        when Option::Some(chains4) then
+          match chains4.get(ch)
+          when Option::Some(st4) then seen_in.push(st4)
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        a4 = a4 + 1
+      end
+      if seen_in.len() == arms.len() then
+        mut same4 = true
+        var s0_4 = seen_in[0]
+        var si4 = 1
+        while si4 < seen_in.len() do
+          if !(s0_4 == seen_in[si4]) then same4 = false end
+          si4 = si4 + 1
+        end
+        if same4 then
+          merged_chains.insert(ProjectionChain { keys: ch.keys.clone() }, s0_4)
+        else
+          merged_chains.insert(ProjectionChain { keys: ch.keys.clone() }, ResourceState::MaybeLive)
+        end
+      else
+        # Present in some arms, absent (Live) in others: the join is
+        # path-conditional — a chain Consumed on one path and live on
+        # another cannot be masked at the cleanup.
+        merged_chains.insert(ProjectionChain { keys: ch.keys.clone() }, ResourceState::MaybeLive)
+      end
+      ci = ci + 1
+    end
+    if merged_chains.len() > 0 then
+      out.place_moves.insert(rid, merged_chains)
+    end
+    ri = ri + 1
+  end
   out
 end
 
-def frame_caps_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Bool
+def frame_caps_any(arms: Vec[ResFrame], id: tg_compiler::ids::LocalId) -> Bool
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
@@ -6302,7 +7163,7 @@ def frame_caps_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Bool
   false
 end
 
-def frame_origin_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Option[ParamOrigin]
+def frame_origin_any(arms: Vec[ResFrame], id: tg_compiler::ids::LocalId) -> Option[ParamOrigin]
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
@@ -6315,7 +7176,7 @@ def frame_origin_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Op
   Option::None
 end
 
-def frame_span_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Span
+def frame_span_any(arms: Vec[ResFrame], id: tg_compiler::ids::LocalId) -> Span
   mut a = 0
   while a < arms.len() do
     let arm = arms[a]
@@ -6328,7 +7189,7 @@ def frame_span_any(arms: &Vec[ResFrame], id: &tg_compiler::ids::LocalId) -> Span
   Span { file: String::new(), start: 0, end_pos: 0 }
 end
 
-def bind_closure_params(env: &mut TypeEnv, typed: &TypedProgram, params: &Vec[ClosureParam], frame: &mut ResFrame) -> Vec[tg_compiler::ids::LocalId]
+def bind_closure_params(inout env: TypeEnv, typed: TypedProgram, params: Vec[ClosureParam], inout frame: ResFrame) -> Vec[tg_compiler::ids::LocalId]
   mut out = Vec::new()
   mut i = 0
   while i < params.len() do
@@ -6341,7 +7202,7 @@ def bind_closure_params(env: &mut TypeEnv, typed: &TypedProgram, params: &Vec[Cl
   out
 end
 
-def bind_closure_param(env: &mut TypeEnv, typed: &TypedProgram, cp: &ClosureParam, frame: &mut ResFrame) -> Option[tg_compiler::ids::LocalId]
+def bind_closure_param(inout env: TypeEnv, typed: TypedProgram, cp: ClosureParam, inout frame: ResFrame) -> Option[tg_compiler::ids::LocalId]
   match cp.pat.kind
   when PatternKind::Ident(_, _) then
     match typed.pattern_binding_resolutions.get(cp.pat.node_id)
@@ -6368,7 +7229,7 @@ def bind_closure_param(env: &mut TypeEnv, typed: &TypedProgram, cp: &ClosurePara
   end
 end
 
-def expr_root_id(typed: &TypedProgram, expr: &Expr) -> Option[Int]
+def expr_root_id(typed: TypedProgram, expr: Expr) -> Option[Int]
   match expr.kind
   when ExprKind::ExprIdent(_) then
     match typed.ident_resolutions.get(expr.node_id)
@@ -6384,7 +7245,7 @@ def expr_root_id(typed: &TypedProgram, expr: &Expr) -> Option[Int]
   end
 end
 
-def expr_is_plain(expr: &Expr) -> Bool
+def expr_is_plain(expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(_) then true
   when ExprKind::ExprAccess(inner) then expr_is_plain(&inner)
@@ -6393,7 +7254,7 @@ def expr_is_plain(expr: &Expr) -> Bool
   end
 end
 
-def expr_type_has_resource(env: &mut TypeEnv, typed: &TypedProgram, expr: &Expr) -> Bool
+def expr_type_has_resource(inout env: TypeEnv, typed: TypedProgram, expr: Expr) -> Bool
   # The MOVE/transfer detection uses the SAME canonical ownership predicate
   # as binding: UniquePtr[Int], Box[Int], Vec[Int], etc. are move-only even
   # though their nominal kinds are Value — `let q = p` for an owner MUST
@@ -6404,46 +7265,182 @@ def expr_type_has_resource(env: &mut TypeEnv, typed: &TypedProgram, expr: &Expr)
   end
 end
 
-def transfer_consume(env: &mut TypeEnv, typed: &TypedProgram, expr: &Expr, loop_outer: &Vec[Int], frame: &mut ResFrame, errors: &mut Vec[ResourceError], finalize_plan: &mut FunctionCleanupTable) -> Unit
+def transfer_consume(inout env: TypeEnv, typed: TypedProgram, expr: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable) -> Unit
   if expr_type_has_resource(env, typed, expr) then
     if !expr_is_plain(expr) then
-      # Moving out of a PROJECTED place (e.g. `let a = p.a`) cannot be
-      # represented: consuming the whole root leaks the sibling fields, and
-      # consuming just the field breaks structural cleanup. Reject until
-      # per-place partial-move state exists. A finalizer subject (DeinitSelf)
-      # gets the finalizer-specific rejection: the one destruction protocol
-      # forbids the hook from moving OWNED FIELDS out of the subject — the
-      # compiler's structural cleanup would finalize them a second time.
+      # (partial moves — the expression-level move-out): a projected move
+      # (e.g. `let a = p.a`) now tracks the FIELD chain in the frame's
+      # per-field lattice — the root stays Live, the chain becomes
+      # Consumed, and the drop glue's mask excludes it. A finalizer subject
+      # (DeinitSelf) keeps the finalizer-specific rejection: the one
+      # destruction protocol forbids the hook from moving OWNED FIELDS out
+      # of the subject — the compiler's structural cleanup would finalize
+      # them a second time (the field-level consume inside a finalizer is
+      # rejected by the same rule).
       match expr_root_id(typed, expr)
       when Option::Some(id) then
- # boundary: the frame is LocalId-keyed; expr_root_id yields the
+        # boundary: the frame is LocalId-keyed; expr_root_id yields the
         # raw Int semantic id (binding_name keeps the Int).
-        match res_frame_get_origin(frame, &tg_compiler::ids::LocalId { id: id })
-        when Option::Some(ParamOrigin::DeinitSelf) then
-          errors.push(ResourceError {
-            message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
-            span: expr.span
-          })
-          return
-        when _ then ()
+        let lid = tg_compiler::ids::LocalId { id: id }
+        if res_frame_has(frame, &lid) then
+          match res_frame_get_origin(frame, &lid)
+          when Option::Some(ParamOrigin::DeinitSelf) then
+            errors.push(ResourceError {
+              message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
+              span: expr.span
+            })
+            return
+          when _ then ()
+          end
+          var chain = Vec::new()
+          let field_chain = place_projection_keys(typed, &expr, &mut chain)
+          if field_chain then
+            apply_projected_consume(env, typed, id, &chain, expr.span, loop_outer, frame, errors)
+          else
+            # The whole-value boundary (index/deref projections): the
+            # per-index tracking is not feasible — the container's elements
+            # are treated as the aggregate (the existing container-element
+            # semantics: a "*" whole-value record at the type-check sites).
+            # The frame marks the ROOT's own state MaybeLive — the
+            # elements' state is indeterminate, so every whole use rejects
+            # ("may be consumed on one path") and the scope-exit cleanup
+            # cannot be conditional — the conservative boundary.
+            apply_whole_boundary_consume(env, typed, id, expr.span, loop_outer, frame, errors)
+          end
         end
       when Option::None then ()
       end
-      errors.push(ResourceError {
-        message: "cannot move out of a projected place: partial moves are not yet supported",
-        span: expr.span
-      })
       return
     end
     match expr_root_id(typed, expr)
     when Option::Some(id) then
- # boundary: same as above — LocalId for the frame lookup.
+      # boundary: same as above — LocalId for the frame lookup.
       if res_frame_has(frame, &tg_compiler::ids::LocalId { id: id }) then
         apply_consume(typed, id, expr.span, loop_outer, frame, errors)
       end
     when Option::None then ()
     end
   end
+end
+
+# (partial moves): consume a projected chain — the per-field state
+# tracking. The permission rules mirror apply_consume (DeinitSelf / Let /
+# Inout / repeatable-loop rejections), applied to the chain's effective
+# state (the prefix rule: a consumed prefix makes the rest dead); the
+# commit marks the chain Consumed in the frame's lattice.
+def apply_projected_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, chain: Vec[ProjectionKey], span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+  let lid = tg_compiler::ids::LocalId { id: id }
+  match res_frame_get_origin(frame, &lid)
+  when Option::Some(origin) then
+    if origin == ParamOrigin::DeinitSelf then
+      errors.push(ResourceError {
+        message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
+        span: span
+      })
+      return
+    end
+    if origin == ParamOrigin::Let then
+      errors.push(ResourceError {
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: let parameter is read-only",
+        span: span
+      })
+      return
+    end
+    if origin == ParamOrigin::Inout then
+      errors.push(ResourceError {
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: inout parameter may be modified but not consumed",
+        span: span
+      })
+      return
+    end
+  when Option::None then ()
+  end
+  if loop_outer.contains(&id) then
+    errors.push(ResourceError {
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` cannot be consumed inside a repeatable loop",
+      span: span
+    })
+  end
+  match res_frame_get(frame, &lid)
+  when Option::Some(ResourceState::Uninitialized) then
+    errors.push(ResourceError {
+      message: "use of uninitialized " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`",
+      span: span
+    })
+  when _ then ()
+  end
+  let eff = chain_effective_state(frame, lid, chain)
+  match eff
+  when ResourceState::Consumed then
+    errors.push(ResourceError {
+      message: "field `" + chain_display(typed, chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` consumed twice",
+      span: span
+    })
+  when ResourceState::MaybeLive then
+    errors.push(ResourceError {
+      message: "field `" + chain_display(typed, chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
+      span: span
+    })
+  when _ then ()
+  end
+  frame_place_mark(frame, lid, chain, ResourceState::Consumed)
+end
+
+# (partial moves — the whole-value boundary): a consume over a NON-field
+# projection (an indexed/deref place). The per-index tracking is not
+# feasible: the container's elements are treated as the aggregate (the
+# existing container-element semantics — the "*" whole-value registry
+# record). The frame marks the ROOT's own state MaybeLive — the elements'
+# state is indeterminate ("may be consumed on one path" on every whole
+# use; the scope-exit cleanup cannot be conditional) — the conservative
+# boundary. The permission rules mirror apply_consume.
+def apply_whole_boundary_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+  let lid = tg_compiler::ids::LocalId { id: id }
+  match res_frame_get_origin(frame, &lid)
+  when Option::Some(origin) then
+    if origin == ParamOrigin::DeinitSelf then
+      errors.push(ResourceError {
+        message: "cannot consume resource `" + binding_name(typed, id) + "`: a finalizer must not consume its own subject (compiler-owned structural cleanup)",
+        span: span
+      })
+      return
+    end
+    if origin == ParamOrigin::Let then
+      errors.push(ResourceError {
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: let parameter is read-only",
+        span: span
+      })
+      return
+    end
+    if origin == ParamOrigin::Inout then
+      errors.push(ResourceError {
+        message: "cannot consume " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: inout parameter may be modified but not consumed",
+        span: span
+      })
+      return
+    end
+  when Option::None then ()
+  end
+  if loop_outer.contains(&id) then
+    errors.push(ResourceError {
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` cannot be consumed inside a repeatable loop",
+      span: span
+    })
+  end
+  match res_frame_get(frame, &lid)
+  when Option::Some(ResourceState::Consumed) then
+    errors.push(ResourceError {
+      message: ownership_label(frame, id) + " `" + binding_name(typed, id) + "` consumed twice",
+      span: span
+    })
+  when Option::Some(ResourceState::Uninitialized) then
+    errors.push(ResourceError {
+      message: "use of uninitialized " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`",
+      span: span
+    })
+  when _ then ()
+  end
+  res_frame_set(frame, lid, ResourceState::MaybeLive)
 end
 
 def convention_effect(c: AccessConvention) -> AccessEffect

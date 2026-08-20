@@ -204,25 +204,25 @@ in_block_def() {
 }
 
 t G5.1a "Map::get is Copy-gated (impl[K: Hash + Eq, V: Copy])" \
-  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Copy] Map[K, V]" "def get(self: &Self, key: &K) -> Option[V]"'
+  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Copy] Map[K, V]" "def get(self: Self, key: K) -> Option[V]"'
 t G5.1b "Map::entries is Copy-gated (impl[K: Hash + Eq + Copy, V: Copy])" \
-  'in_block_def std/collections.tg "impl[K: Hash + Eq + Copy, V: Copy] Map[K, V]" "def entries(self: &Self) -> Vec[(K, V)]"'
+  'in_block_def std/collections.tg "impl[K: Hash + Eq + Copy, V: Copy] Map[K, V]" "def entries(self: Self) -> Vec[(K, V)]"'
 t G5.1c "Map::entries_cloned is the Clone variant (impl[K: Hash + Eq + Clone, V: Clone])" \
-  'in_block_def std/collections.tg "impl[K: Hash + Eq + Clone, V: Clone] Map[K, V]" "def entries_cloned(self: &Self) -> Vec[(K, V)]"'
+  'in_block_def std/collections.tg "impl[K: Hash + Eq + Clone, V: Clone] Map[K, V]" "def entries_cloned(self: Self) -> Vec[(K, V)]"'
 t G5.1d "Set::entries_copy is Copy-gated (impl[T: Hash + Eq + Copy])" \
-  'in_block_def std/collections.tg "impl[T: Hash + Eq + Copy] Set[T]" "def entries_copy(self: &Self) -> Vec[T]"'
+  'in_block_def std/collections.tg "impl[T: Hash + Eq + Copy] Set[T]" "def entries_copy(self: Self) -> Vec[T]"'
 t G5.1e "Set::entries_cloned is the Clone variant (impl[T: Hash + Eq + Clone])" \
-  'in_block_def std/collections.tg "impl[T: Hash + Eq + Clone] Set[T]" "def entries_cloned(self: &Self) -> Vec[T]"'
+  'in_block_def std/collections.tg "impl[T: Hash + Eq + Clone] Set[T]" "def entries_cloned(self: Self) -> Vec[T]"'
 t G5.1f "OrderedMap::get is Copy-gated (impl[K: Hash + Eq, V: Copy])" \
-  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Copy] OrderedMap[K, V]" "def get(self: &Self, key: &K) -> Option[V]"'
+  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Copy] OrderedMap[K, V]" "def get(self: Self, key: K) -> Option[V]"'
 t G5.1g "OrderedMap::get_cloned is the Clone variant (impl[K: Hash + Eq, V: Clone])" \
-  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Clone] OrderedMap[K, V]" "def get_cloned(self: &Self, key: &K) -> Option[V]"'
+  'in_block_def std/collections.tg "impl[K: Hash + Eq, V: Clone] OrderedMap[K, V]" "def get_cloned(self: Self, key: K) -> Option[V]"'
 t G5.1h "RingBuffer::peek_front is Copy-gated (impl[T: Copy])" \
-  'in_block_def std/collections.tg "impl[T: Copy] RingBuffer[T]" "def peek_front(self: &Self) -> Option[T]"'
+  'in_block_def std/collections.tg "impl[T: Copy] RingBuffer[T]" "def peek_front(self: Self) -> Option[T]"'
 t G5.1i "RingBuffer::peek_front_cloned is the Clone variant (impl[T: Clone])" \
-  'in_block_def std/collections.tg "impl[T: Clone] RingBuffer[T]" "def peek_front_cloned(self: &Self) -> Option[T]"'
+  'in_block_def std/collections.tg "impl[T: Clone] RingBuffer[T]" "def peek_front_cloned(self: Self) -> Option[T]"'
 t G5.1j "Array::get/slice are Copy-gated (impl[T: Copy])" \
-  'in_block_def std/collections.tg "impl[T: Copy] Array[T]" "def get(self: &Self, index: Int) -> T" && in_block_def std/collections.tg "impl[T: Copy] Array[T]" "def slice(self: &Self, start: Int, end_idx: Int) -> Array[T]"'
+  'in_block_def std/collections.tg "impl[T: Copy] Array[T]" "def get(self: Self, index: Int) -> T" && in_block_def std/collections.tg "impl[T: Copy] Array[T]" "def slice(self: Self, start: Int, end_idx: Int) -> Array[T]"'
 
 # block_with <file> <impl-header-substr> <needle>: the needle appears
 # inside the impl block. block_without: the needle does NOT.
@@ -294,9 +294,9 @@ t G9.1a "analyze_parsed/analyze_program/analyze_source return Vec[Diagnostic]" \
 t G9.1b "zero Result[AnalyzedProgram, String] signatures" \
   '! grep -rq "Result\[AnalyzedProgram, String\]" tg_compiler/*.tg'
 t G9.2a "join_diagnostics exists and is the String boundary" \
-  'grep -qE "^pub def join_diagnostics\(diags: &Vec\[Diagnostic\]\) -> String$" tg_compiler/compiler_core.tg'
-t G9.2b "no join_diagnostics inside the structured analysis surface (lines 834-953)" \
-  '! sed -n "834,953p" tg_compiler/compiler_core.tg | grep -q "join_diagnostics"'
+  'grep -qE "^pub def join_diagnostics\(diags: Vec\[Diagnostic\]\) -> String$" tg_compiler/compiler_core.tg'
+t G9.2b "no join_diagnostics inside the structured analysis surface (analyze_parsed..analyze_source)" \
+  'awk "/^pub def analyze_parsed/{f=1} f && /^pub def compile_file_core/{f=0} f && /join_diagnostics/{n++} END{exit n+0}" tg_compiler/compiler_core.tg'
 t G9.2c "join_diagnostics lives at the CLI boundary (driver.tg + compile_file_core)" \
   'test "$(grep -c "join_diagnostics" tg_compiler/driver.tg)" -ge 2 && test "$(awk "/^pub def compile_file_core/{f=1} f && /join_diagnostics/{n++} END{print n+0}" tg_compiler/compiler_core.tg)" -ge 2'
 
@@ -380,8 +380,8 @@ else
   report G11.2a "zero crate.modules.entries() scans in lookup modules (found in:$scan_bad)" FAIL
 fi
 
-t G11.2b "the only crate.modules.entries() in the compiler is the macro-filter rebuild (compiler_core.tg)" \
-  'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 1'
+t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter rebuild and the module-graph dump (compiler_core.tg)" \
+  'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 2'
 
 # ———————————————————————————————————————————————————————————————
 # G12 Summary report
