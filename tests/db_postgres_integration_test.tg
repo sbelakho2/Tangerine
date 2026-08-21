@@ -1,17 +1,26 @@
 # tests/db_postgres_integration_test.tg — the std::db Postgres driver
-# against the CI postgres service container.
+# against the CI postgres server.
 #
 # The non-SQLite DB lane: PostgresConfig::new() defaults (localhost:5432,
-# user postgres, dbname postgres) match the GitHub Actions postgres
-# service container; the password comes from the service env. The lane is
-# gated behind the service container (ci.yml db-integration-postgres job)
-# and preloads libpq into the tg-compiled test process — the same
+# user postgres, dbname postgres) match the CI lane's NATIVE Homebrew
+# postgresql@16 server (initdb + pg_ctl started in the job — GitHub
+# Actions forbids Docker service containers on macOS runners; the
+# password comes from the lane's --auth=trust initdb). The lane is gated
+# behind the started server (ci.yml db-integration-postgres job) and
+# preloads libpq into the tg-compiled test process — the same
 # DYLD_INSERT_LIBRARIES / DYLD_FORCE_FLAT_NAMESPACE mechanism as the TLS
 # shim lane, because the in-house Mach-O linker emits a single
 # LC_LOAD_DYLIB and records the PQ* externs as dyld imports.
 #
 # The assertions mirror the SQLite lane: open -> CREATE TABLE -> INSERT ->
-# SELECT through the shared Connection trait / Rows API.
+# SELECT through the shared Connection trait / Rows API. The INSERT uses
+# the JDBC-style `?` placeholder, which the driver TRANSLATES to
+# PostgreSQL's $1..$n positional parameters (postgres_translate_placeholders)
+# before PQexecParams; the binary-parameter case (a BYTEA blob, format=1,
+# its bytes owned by the PgParamBacking through the call) and the
+# server-side prepared statements (PQprepare at prepare() time,
+# PQexecPrepared at execute/query time, DEALLOCATE when the statement is
+# dropped) exercise the same machinery.
 
 use std::core::{Vec, String, Unit, Result, Option}
 use std::test::*
@@ -29,7 +38,8 @@ def test_postgres_service_create_insert_select() -> Unit
     let rc = c.execute("CREATE TABLE kv (id SERIAL PRIMARY KEY, value TEXT)", &[])
     assert_ok(rc)
 
-    # Insert
+    # Insert through the ? placeholder: the driver translates VALUES (?)
+    # to VALUES ($1) before PQexecParams.
     let ri = c.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("hello".to_string()) as Box[dyn ToSqlParam]])
     assert_ok(ri)
 
@@ -46,6 +56,48 @@ def test_postgres_service_create_insert_select() -> Unit
     when Option::None then
       assert_false(true)
     end
+
+    # Binary blob round trip: the BYTEA column receives a binary-format
+    # parameter whose bytes are owned by the PgParamBacking (never a
+    # dangling pointer into a temporary) and comes back as a byte-exact
+    # SqlValue::Blob.
+    let rc2 = c.execute("CREATE TABLE kv_blob (id SERIAL PRIMARY KEY, data BYTEA)", &[])
+    assert_ok(rc2)
+    let blob = Vec::from([0u8, 255u8, 0u8, 104u8, 105u8, 254u8, 39u8, 92u8])
+    let rb = c.execute("INSERT INTO kv_blob (data) VALUES (?)", &[Box::new(blob.clone()) as Box[dyn ToSqlParam]])
+    assert_ok(rb)
+    let rows2 = c.query("SELECT data FROM kv_blob", &[])
+    let r2 = assert_ok(rows2)
+    assert_eq(r2.row_count(), 1)
+    let row2 = r2.into_iter().next()
+    match row2
+    when Option::Some(row2) then
+      let b: Vec[u8] = row2.get(0).ok().unwrap_or(Vec::new())
+      assert_eq(b.len(), blob.len())
+      var k = 0
+      while k < blob.len() do
+        assert_eq(b[k], blob[k])
+        k = k + 1
+      end
+    when Option::None then
+      assert_false(true)
+    end
+
+    # Server-side prepared statement: PQprepare at prepare() time (the
+    # translated $1 form and the recorded parameter count), PQexecPrepared
+    # at execute/query time, DEALLOCATE when the statement drops.
+    var stmt = assert_ok(c.prepare("INSERT INTO kv (value) VALUES (?)"))
+    let pr = stmt.execute(&[Box::new("prepared-hello".to_string()) as Box[dyn ToSqlParam]])
+    assert_ok(pr)
+
+    let rows3 = c.query("SELECT value FROM kv WHERE value = ?", &[Box::new("prepared-hello".to_string()) as Box[dyn ToSqlParam]])
+    let r3 = assert_ok(rows3)
+    assert_eq(r3.row_count(), 1)
+
+    var qstmt = assert_ok(c.prepare("SELECT value FROM kv WHERE value = ?"))
+    let qrows = qstmt.query(&[Box::new("hello".to_string()) as Box[dyn ToSqlParam]])
+    let qr = assert_ok(qrows)
+    assert_eq(qr.row_count(), 1)
   when Result::Err(e) then
     assert_false(true)
   end

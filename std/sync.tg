@@ -288,32 +288,62 @@ end
 ##
 ## The notification state lives behind an Arc. Condvar::wait drops the
 ## MutexGuard (its Drop runs — the atomic store releases the lock and the
-## guard's Arc clone is released), polls the notification counter until a
+## guard's Arc clone is released), polls the notification state until a
 ## notify advances it, then re-acquires the lock through the Arc the guard
 ## kept alive — the mutex state can never dangle while the wait is in
-## flight. notify_one/notify_all advance the counter (a notify that races
-## the poll is never lost — the counter monotonicity makes the wait
-## re-check before blocking).
+## flight.
+##
+## THE TICKET DESIGN (notify_one vs notify_all): CondvarInner carries TWO
+## counters — `notified` (the generation, advanced on EVERY notify) and
+## `waiting` (the registered-waiter ticket counter). A waiter snapshots
+## the generation FIRST, then registers (waiting += 1 — its ticket is
+## fetch_add's old value): the snapshot predates the registration, so a
+## notify that consumes this waiter's membership (its generation advance
+## follows the consumed registration) is always visible to the waiter's
+## generation check. notify_one consumes ONE membership and advances the
+## generation exactly once: if the waiting count is > 0 it decrements the
+## waiting count and increments the generation — the ONE waiter whose
+## ticket matches the NEW waiting count (and whose generation snapshot is
+## stale) proceeds; every other waiter's snapshot is stale but its
+## membership is not revoked, so it stays blocked. notify_all advances the
+## generation and ZEROES the waiting count — every registered waiter's
+## membership is revoked at once, so all of them proceed. A waiter's poll
+## loop therefore checks BOTH the generation against its snapshot AND the
+## waiting-count membership (waiting <= ticket): notify_one wakes exactly
+## one waiter, notify_all wakes every remaining waiter. A notify that
+## races a registration is never lost (the snapshot precedes the
+## registration, so the notify's generation advance is visible) and the
+## counters' monotonicity makes the wait re-check before blocking.
 struct Condvar
   inner: Arc[CondvarInner]
 end
 
 struct CondvarInner
   notified: AtomicU32
+  waiting: AtomicU32
 end
 
 def Condvar::new() -> Condvar
-  Condvar { inner: Arc::new(CondvarInner { notified: AtomicU32::new(0) }) }
+  Condvar { inner: Arc::new(CondvarInner { notified: AtomicU32::new(0), waiting: AtomicU32::new(0) }) }
 end
 
 def Condvar::wait[T](self: Condvar, guard: MutexGuard[T]) -> MutexGuard[T]
-  let seen = self.inner.ptr.as_ref().notified.load()
-  let inner = guard.inner.clone()
+  # Snapshot the generation FIRST, then register: the snapshot predates
+  # the registration, so any notify that consumes THIS waiter's
+  # membership (the notify's generation advance follows the consumed
+  # registration) is visible to the generation check — the waiter never
+  # sleeps through its own wakeup. A notify that fires before the
+  # registration is either a no-op (no waiters) or consumed an earlier
+  # waiter — the membership check (waiting <= ticket) disambiguates.
+  let inner = self.inner.ptr.as_ref()
+  let seen = inner.notified.load()
+  let ticket = inner.waiting.fetch_add(1)
+  let inner_arc = guard.inner.clone()
   drop(guard)
-  while self.inner.ptr.as_ref().notified.load() == seen do
+  while inner.notified.load() == seen || inner.waiting.load() > ticket do
     std::thread::yield_now()
   end
-  let mutex = Mutex { inner: inner }
+  let mutex = Mutex { inner: inner_arc }
   let result = mutex.lock()
   drop(mutex)
   result
@@ -321,19 +351,33 @@ end
 
 def Condvar::wait_timeout[T](self: Condvar, guard: MutexGuard[T], timeout: Duration) -> MutexGuard[T]
   let start = Instant::now()
-  let seen = self.inner.ptr.as_ref().notified.load()
-  let inner = guard.inner.clone()
+  let inner = self.inner.ptr.as_ref()
+  let seen = inner.notified.load()
+  let ticket = inner.waiting.fetch_add(1)
+  let inner_arc = guard.inner.clone()
   drop(guard)
+  mut timed_out = false
   loop do
-    if self.inner.ptr.as_ref().notified.load() != seen then
+    if inner.notified.load() != seen && inner.waiting.load() <= ticket then
       break
     end
     if start.elapsed() >= timeout then
+      timed_out = true
       break
     end
     std::thread::yield_now()
   end
-  let mutex = Mutex { inner: inner }
+  if timed_out then
+    # The timeout exits without a notify: reclaim the registration IF it
+    # is still live (waiting > ticket — the membership was not consumed).
+    # A racing notify_one's decrement may land between the load and the
+    # fetch_sub; the count then drops one extra, which can only cause a
+    # spurious wakeup, never a lost one.
+    if inner.waiting.load() > ticket then
+      inner.waiting.fetch_sub(1)
+    end
+  end
+  let mutex = Mutex { inner: inner_arc }
   let result = mutex.lock()
   drop(mutex)
   result
@@ -344,11 +388,39 @@ def Condvar::wait_timeout_ms[T](self: Condvar, guard: MutexGuard[T], ms: Int) ->
 end
 
 def Condvar::notify_one(self: Condvar) -> Unit
-  self.inner.ptr.as_ref().notified.fetch_add(1)
+  let inner = self.inner.ptr.as_ref()
+  # Consume exactly ONE membership (the decrement FIRST, then the
+  # generation advance): the consumed waiter's snapshot predates its
+  # registration, which predates the decrement, so its generation check
+  # fires — no lost wakeup. A waiter registering between the two steps
+  # may wake spuriously (legal), never lost.
+  loop do
+    let w = inner.waiting.load()
+    if w == 0 then
+      break
+    end
+    if inner.waiting.compare_and_swap(w, w - 1) == w then
+      inner.notified.fetch_add(1)
+      break
+    end
+  end
 end
 
 def Condvar::notify_all(self: Condvar) -> Unit
-  self.inner.ptr.as_ref().notified.fetch_add(1)
+  let inner = self.inner.ptr.as_ref()
+  # Advance the generation (every registered waiter's snapshot goes
+  # stale) and ZERO the waiting count (every waiter's membership is
+  # revoked — the remaining waiters all proceed).
+  inner.notified.fetch_add(1)
+  loop do
+    let w = inner.waiting.load()
+    if w == 0 then
+      break
+    end
+    if inner.waiting.compare_and_swap(w, 0) == w then
+      break
+    end
+  end
 end
 
 # ═══════════════════════════════════════════════════════════════

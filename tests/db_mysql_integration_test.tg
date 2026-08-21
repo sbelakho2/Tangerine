@@ -1,20 +1,25 @@
 # tests/db_mysql_integration_test.tg — the std::db MySQL driver
-# against the CI mysql service container.
+# against the CI mysql server.
 #
 # The MySQL lane: mysql_config_new() defaults (port 3306, charset
-# utf8mb4) with the host/user/password/database supplied to match the
-# GitHub Actions mysql:8 service container (127.0.0.1:3306, root/root,
-# database test). The lane is gated behind the service container
-# (ci.yml db-integration-mysql job) and preloads libmysqlclient into the
-# tg-compiled test process — the same DYLD_INSERT_LIBRARIES /
-# DYLD_FORCE_FLAT_NAMESPACE mechanism as the TLS shim and Postgres
-# lanes, because the in-house Mach-O linker emits a single LC_LOAD_DYLIB
-# and records the mysql_* externs as dyld imports.
+# utf8mb4) with the host/user/password/database supplied to match the CI
+# lane's NATIVE Homebrew mysql server (127.0.0.1:3306, root/root,
+# database test — mysqld initialized in the job; GitHub Actions forbids
+# Docker service containers on macOS runners). The lane is gated behind
+# the started server (ci.yml db-integration-mysql job) and preloads
+# libmysqlclient into the tg-compiled test process — the same
+# DYLD_INSERT_LIBRARIES / DYLD_FORCE_FLAT_NAMESPACE mechanism as the TLS
+# shim and Postgres lanes, because the in-house Mach-O linker emits a
+# single LC_LOAD_DYLIB and records the mysql_* externs as dyld imports.
 #
 # The assertions mirror the SQLite/Postgres lanes: open -> CREATE TABLE
-# -> INSERT (the ? placeholder interpolated via mysql_interpolate ->
-# mysql_real_query) -> SELECT (mysql_store_result ->
-# mysql_result_to_rows) through the shared Connection trait / Rows API.
+# -> INSERT -> SELECT through the shared Connection trait / Rows API.
+# Every parameterized statement goes through the REAL MYSQL_BIND
+# parameter binding (mysql_stmt_bind_param with the MYSQL_BIND array +
+# mysql_stmt_execute) — never the manual interpolation — so the hostile
+# values (the ' \ \\ \0 ' OR 1=1 -- fragment with quotes, backslashes and
+# a NUL byte, the multibyte text, and the binary blobs) are shipped as
+# DATA and round-trip byte-exact.
 
 use std::core::{Vec, String, Unit, Result, Option}
 use std::test::*
@@ -36,19 +41,85 @@ def test_mysql_service_create_insert_select() -> Unit
     let ri = c.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("hello".to_string()) as Box[dyn ToSqlParam]])
     assert_ok(ri)
 
-    # Select
+    # The hostile value: ' \ \\ \0 ' OR 1=1 --  (a quote, spaces, two
+    # backslashes, a NUL byte, and an SQL injection fragment). A real
+    # MYSQL_BIND binding ships it as DATA; interpolation would mangle it
+    # or inject it.
+    var hostile = String::new()
+    hostile.push('\'')
+    hostile.push(' ')
+    hostile.push('\\')
+    hostile.push(' ')
+    hostile.push('\\')
+    hostile.push(' ')
+    hostile.push(0 as Char)
+    hostile.push(' ')
+    hostile.push('\'')
+    hostile.push(' ')
+    hostile.push_str("OR 1=1 --")
+    let rh = c.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new(hostile.clone()) as Box[dyn ToSqlParam]])
+    assert_ok(rh)
+
+    # The multibyte text case (utf8mb4).
+    let multi = "héllo wörld — 世界".to_string()
+    let rm = c.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new(multi.clone()) as Box[dyn ToSqlParam]])
+    assert_ok(rm)
+
+    # Select: every value must round-trip byte-exact (including the NUL).
     let rows = c.query("SELECT value FROM kv", &[])
     let r = assert_ok(rows)
-    assert_eq(r.row_count(), 1)
+    assert_eq(r.row_count(), 3)
 
-    let row = r.into_iter().next()
-    match row
-    when Option::Some(row) then
+    var seen_hostile = false
+    var seen_multi = false
+    for row in r.into_iter() do
       let v: String = row.get(0).ok().unwrap_or("".to_string())
-      assert_eq(v, "hello")
+      if v == hostile then
+        seen_hostile = true
+      end
+      if v == multi then
+        seen_multi = true
+      end
+    end
+    assert_true(seen_hostile)
+    assert_true(seen_multi)
+
+    # The binary blob case: a BLOB column receives raw bytes (NULs, 0xFF)
+    # through the MYSQL_BIND buffer and comes back byte-exact as a
+    # SqlValue::Blob.
+    let rc2 = c.execute("CREATE TABLE kv_bin (id INT AUTO_INCREMENT PRIMARY KEY, data BLOB)", &[])
+    assert_ok(rc2)
+    let blob = Vec::from([0u8, 255u8, 0u8, 104u8, 105u8, 254u8, 39u8, 92u8])
+    let rb = c.execute("INSERT INTO kv_bin (data) VALUES (?)", &[Box::new(blob.clone()) as Box[dyn ToSqlParam]])
+    assert_ok(rb)
+    let rows2 = c.query("SELECT data FROM kv_bin", &[])
+    let r2 = assert_ok(rows2)
+    assert_eq(r2.row_count(), 1)
+    let row2 = r2.into_iter().next()
+    match row2
+    when Option::Some(row2) then
+      let b: Vec[u8] = row2.get(0).ok().unwrap_or(Vec::new())
+      assert_eq(b.len(), blob.len())
+      var k = 0
+      while k < blob.len() do
+        assert_eq(b[k], blob[k])
+        k = k + 1
+      end
     when Option::None then
       assert_false(true)
     end
+
+    # The prepared-statement path: mysql_stmt_prepare at prepare() time,
+    # mysql_stmt_bind_param with the MYSQL_BIND array + mysql_stmt_execute
+    # at execute/query time, mysql_stmt_close when the statement drops.
+    var stmt = assert_ok(c.prepare("INSERT INTO kv (value) VALUES (?)"))
+    let pr = stmt.execute(&[Box::new("prepared".to_string()) as Box[dyn ToSqlParam]])
+    assert_ok(pr)
+
+    var qstmt = assert_ok(c.prepare("SELECT value FROM kv WHERE value = ?"))
+    let qrows = qstmt.query(&[Box::new("prepared".to_string()) as Box[dyn ToSqlParam]])
+    let qr = assert_ok(qrows)
+    assert_eq(qr.row_count(), 1)
   when Result::Err(e) then
     assert_false(true)
   end

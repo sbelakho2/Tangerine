@@ -1,0 +1,291 @@
+# tests/tls_handshake_test.tg — TLS handshake over loopback sockets.
+#
+# The full connection setup — the shim's SSL_accept/SSL_connect over
+# loopback TCP — driven through std::tls:
+#   (1) TRUSTED CA: the client's ca_certs trusts the server's self-signed
+#       certificate and the SNI hostname matches the certificate CN — the
+#       handshake succeeds and an echo round trip proves the session is
+#       live.
+#   (2) UNTRUSTED: the client verifies the peer WITHOUT any CA — the
+#       self-signed certificate fails the chain check — the handshake
+#       fails.
+#   (3) WRONG HOSTNAME: the client trusts the CA but connects under a
+#       hostname that does not match the certificate CN — the hostname
+#       verification fails the handshake.
+#   (4) ALPN: the client offers h2 and the server selects it — the
+#       negotiated protocol must be h2.
+#
+# The fixed self-signed RSA-2048 certificate (CN=tangerine-interop.test,
+# SAN DNS:tangerine-interop.test, valid 2026-08-21 .. 2046-08-21) and its
+# matching PKCS#8 key are embedded so the suite never depends on external
+# fixture files (same PEMs as
+# tls_interop_test.tg). Each @test runs as its own process (the `tg test`
+# per-test harness), so the fixed port is safe across the suite.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::tls::{Certificate, PrivateKey, TlsConfig, TlsConnection, TlsServer, TlsError}
+use std::net::{tcp_connect, socket_addr_v4, ipv4_localhost}
+use std::thread::{spawn, JoinHandle}
+
+const HANDSHAKE_PORT: u16 = 38770u16
+
+def server_host() -> String
+  "tangerine-interop.test"
+end
+
+def fixed_cert_pem() -> String
+"-----BEGIN CERTIFICATE-----
+" +
+"MIIDRjCCAi6gAwIBAgIUHu9EggaYCQEAXgvLXaOVYReVuN4wDQYJKoZIhvcNAQEL
+" +
+"BQAwITEfMB0GA1UEAwwWdGFuZ2VyaW5lLWludGVyb3AudGVzdDAeFw0yNjA4MjEw
+" +
+"MTUwMTVaFw00NjA4MjEwMTUwMTVaMCExHzAdBgNVBAMMFnRhbmdlcmluZS1pbnRl
+" +
+"cm9wLnRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDB/YTQTUD2
+" +
+"Eig4hdt3ZagRPv538zS+izmgKja6V3zBkQBsdLX5Jrkr3sw7rxHrzbH+onZ0i3op
+" +
+"sWuXn3ZGOMa6+Iu7VFNb1nSjAOPn40ZZY10G4FBi3P/t27kTzeh8uss4DLnNsaOx
+" +
+"D87YYNWe+WLnjHJu0nZOG9iyEKIKY5h93FT3pbkCXH36wqxa9YTUId2Wkp8xEPN7
+" +
+"fD6AKFqwwefj1q0vwtK2l5yWrdemE0tCamfkh/n4jY+otS0/LNZdlDRdsUdj2o+J
+" +
+"ktZzlCst0x/sbypGYc/EtVGGDxnB/FWZhs9s2rOC3uUE3I7fWfbY0rVh6RZuUNg2
+" +
+"QPG2s+S/Om+dAgMBAAGjdjB0MB0GA1UdDgQWBBQAx+CUOXqAuhUOvxPebksVrG0+
+" +
+"HDAfBgNVHSMEGDAWgBQAx+CUOXqAuhUOvxPebksVrG0+HDAPBgNVHRMBAf8EBTAD
+" +
+"AQH/MCEGA1UdEQQaMBiCFnRhbmdlcmluZS1pbnRlcm9wLnRlc3QwDQYJKoZIhvcN
+" +
+"AQELBQADggEBAIecyh84yQTzl1PAbnNdjgUK8L72kk9/VD/YM3iy0R3Gzee6xZ0D
+" +
+"lSNBW9/iX2OWRSu7IZ1UxcTokUjmBULTMFDyPtzDcGxWjNoj5YrEuR+lWzlXc/Zc
+" +
+"ltCpJkCcBRrqB4hOhT3MFqMXrcCT/YLNA+8LRiSNCK3gB1G21Xiy9YbUHvWC6yto
+" +
+"+9ulmOq7Z/7LXP2eTyFuDmvbLzER8rS57A0ag7Gvq4rF7PCND3N16gqvxvx7XjN+
+" +
+"TcVgSoa4FJo6eHTr9lAoiYqZZLRFl+EXJDphVU7BQvNhj2bpyWas6srdBVJHPb/F
+" +
+"/I6RyP8d2y9wqTs54h5YcMkSGFUriWAFeTo=
+" +
+"-----END CERTIFICATE-----
+"
+end
+
+def fixed_key_pem() -> String
+"-----BEGIN PRIVATE KEY-----
+" +
+"MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDB/YTQTUD2Eig4
+" +
+"hdt3ZagRPv538zS+izmgKja6V3zBkQBsdLX5Jrkr3sw7rxHrzbH+onZ0i3opsWuX
+" +
+"n3ZGOMa6+Iu7VFNb1nSjAOPn40ZZY10G4FBi3P/t27kTzeh8uss4DLnNsaOxD87Y
+" +
+"YNWe+WLnjHJu0nZOG9iyEKIKY5h93FT3pbkCXH36wqxa9YTUId2Wkp8xEPN7fD6A
+" +
+"KFqwwefj1q0vwtK2l5yWrdemE0tCamfkh/n4jY+otS0/LNZdlDRdsUdj2o+JktZz
+" +
+"lCst0x/sbypGYc/EtVGGDxnB/FWZhs9s2rOC3uUE3I7fWfbY0rVh6RZuUNg2QPG2
+" +
+"s+S/Om+dAgMBAAECggEAR4USTEHPK2myTnR7X1+pQQJ6ivqtfXqS+kvV9Yl/w1WU
+" +
+"VGgLFxqBtnzjyzVWZBtn/jsjdQBfP7PbuQDfeDBChHhR+/Sw7vD3+4i+faW7MAWE
+" +
+"LJ7SxEA6UxVo/LYzepjbh4SZlA5kDUmItxmsaHoFTtzm65jIaS+3Cp87Pp1NgUjv
+" +
+"7lg1zWkfi891e4TB96N6peLDFtgFRLMcmprJTD/FmoZmonsRam+jp5/26z+ldoSj
+" +
+"bUVrZhK/LP5zxr0mqYGYYiS5PfLSlBfFJhJ9JdZ6c3IVAoZHI2cAkl8u0vHnTSpI
+" +
+"6DHCwt/Qw5lVNjWCWraQ+Lq3LwZtHUtbXVusc+wR+QKBgQDhCjtBoh87oLnhD79M
+" +
+"YfedGRxtBf6ZcsqsA5aGXaoDyzLxx7Bmn1N6dvf+PQyxyn3dgsmziHKiqxxmCiOn
+" +
+"929lAbgUnv25y1QGo1MPPah0WEi2TPjupeHpVbSfSi6C/akSzKpOSX7/9DfjiCt1
+" +
+"d/llbY2sLoQ2XvWwhsm/JhgugwKBgQDcrbzPbPcA0kdVjNXqgPuhViOFtF+BH1eQ
+" +
+"Lgt74vFjyS0IbIZrRQwVgJNCzEZwNY4NuGGlL2NyaFCozsL78Bxw5UvIjlxJ+8HR
+" +
+"d89TU31UnVHo1RNsJ0IQIO3zQFddxoFjg/TcmoE7IAFTbUaHepBryOuYQY/xExEZ
+" +
+"+j/yycKPXwKBgE6uhx1hk84DWjpIiTgpoKu61eeAiw4Xxqjx8DU2lnURHNTQXuri
+" +
+"lgthgT/RFJktFWjXi7JL6NjbPuimbuURbE9ClJwRIuFNKCnR/P59LmLPY0zqCLdY
+" +
+"JG6y2p4/D5gZHH5INNt+cvsG5muVdqxxsC84aKpk8TEZbomz9uHwbdAFAoGAM8Vy
+" +
+"qTsIC6JJZ/GdceGGpwf9V23EhhdjRIj42ryYIu/cZ8CGHH5bYmQCqEYiNErsI53h
+" +
+"Eo62hu2gFqpDJjXjhjzU9Z0oW5b7lnfEJOlOWt55i+UJJHNlVUFUcZ/jnzVlv4IC
+" +
+"nQqGTOeqR/c396qyXQcK9nJTIZx2g6CpBf19boMCgYA6AE/8FbwWgAj6IDFultwQ
+" +
+"Xy4pgZdThRzO4qyKvFGVKz+hwYecsccXXeGi8bM+y70moUuj256rafun8u5Op60S
+" +
+"t3Tu5+5S6RRC3HX7xQq8PBxaWg89Q33rlsuT3AKgiJvAFnrnu7LSezGoKCPnWqeK
+" +
+"q741rz6aKfC47CsnNHFLZA==
+" +
+"-----END PRIVATE KEY-----
+"
+end
+
+# Runs the server side of one handshake: accept, then echo the client's
+# 5-byte message back. Returns 0 on the full success path; 1 when the
+# accept (handshake) fails — which the failure tests EXPECT; 2..4 on the
+# echo-path failures.
+def run_tls_echo_server(server: TlsServer) -> Int
+  let mut srv = server
+  let conn_res = srv.accept()
+  match conn_res
+  when Result::Err(_) then 1
+  when Result::Ok(c) then
+    let mut conn = c
+    let mut buf: Vec[u8] = Vec::from([0u8, 0u8, 0u8, 0u8, 0u8])
+    let read_res = conn.read(buf)
+    match read_res
+    when Result::Err(_) then 2
+    when Result::Ok(nr) then
+      if nr != 5 then
+        3
+      else
+        let echo: Vec[u8] = Vec::from([104u8, 101u8, 108u8, 108u8, 111u8])  # "hello"
+        let write_res = conn.write(echo)
+        match write_res
+        when Result::Err(_) then 4
+        when Result::Ok(_) then 0
+        end
+      end
+    end
+  end
+end
+
+# Binds the listener on the main thread (no bind/accept race), moves the
+# bound server into a worker thread, and returns the join handle.
+def start_tls_server(server_cfg: TlsConfig) -> JoinHandle[Int]
+  let mut server = TlsServer::new(server_cfg)
+  assert_ok(server.bind("127.0.0.1", HANDSHAKE_PORT))
+  spawn(move || run_tls_echo_server(server))
+end
+
+def client_cfg_with_ca(ca_cert: Certificate) -> TlsConfig
+  var certs: Vec[Certificate] = Vec::new()
+  certs.push(ca_cert)
+  TlsConfig::default_client().with_ca_certs(certs)
+end
+
+def connect_client(client_cfg: TlsConfig, hostname: String) -> Result[TlsConnection, TlsError]
+  let addr = socket_addr_v4(ipv4_localhost(), HANDSHAKE_PORT)
+  let stream = match tcp_connect(addr)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(TlsError::IoError(e.message()))
+  end
+  TlsConnection::connect(stream, client_cfg, Option::Some(hostname))
+end
+
+@test
+def test_tls_handshake_trusted_ca_succeeds() -> Unit
+  let cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let no_password: Option[String] = Option::None
+  let key = assert_ok(PrivateKey::from_pem(fixed_key_pem(), no_password))
+  let server_cfg = TlsConfig::default_server().with_certificate(cert, key)
+  let mut handle = start_tls_server(server_cfg)
+
+  let ca_cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let client_cfg = client_cfg_with_ca(ca_cert)
+  let mut conn = assert_ok(connect_client(client_cfg, server_host()))
+  assert_true(conn.is_connected())
+
+  # Echo round trip over the live TLS session.
+  let payload: Vec[u8] = Vec::from([104u8, 101u8, 108u8, 108u8, 111u8])  # "hello"
+  let nw = assert_ok(conn.write(payload))
+  assert_eq(nw, 5)
+  let mut buf: Vec[u8] = Vec::from([0u8, 0u8, 0u8, 0u8, 0u8])
+  let nr = assert_ok(conn.read(buf))
+  assert_eq(nr, 5)
+  assert_eq(buf[0], 104u8)
+  assert_eq(buf[1], 101u8)
+  assert_eq(buf[2], 108u8)
+  assert_eq(buf[3], 108u8)
+  assert_eq(buf[4], 111u8)
+
+  let server_rc = assert_ok(handle.join())
+  assert_eq(server_rc, 0)
+end
+
+@test
+def test_tls_handshake_untrusted_ca_fails() -> Unit
+  let cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let no_password: Option[String] = Option::None
+  let key = assert_ok(PrivateKey::from_pem(fixed_key_pem(), no_password))
+  let server_cfg = TlsConfig::default_server().with_certificate(cert, key)
+  let mut handle = start_tls_server(server_cfg)
+
+  # The client verifies the peer but holds NO CA: the self-signed server
+  # certificate fails the chain check and the handshake must fail.
+  let client_cfg = TlsConfig::default_client()
+  match connect_client(client_cfg, server_host())
+  when Result::Err(_) then assert_true(true)
+  when Result::Ok(_) then assert_false(true)
+  end
+
+  # The server side observes the aborted handshake (accept fails) — that
+  # is the expected outcome here.
+  let _ = assert_ok(handle.join())
+  assert_true(true)
+end
+
+@test
+def test_tls_handshake_wrong_hostname_fails() -> Unit
+  let cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let no_password: Option[String] = Option::None
+  let key = assert_ok(PrivateKey::from_pem(fixed_key_pem(), no_password))
+  let server_cfg = TlsConfig::default_server().with_certificate(cert, key)
+  let mut handle = start_tls_server(server_cfg)
+
+  # The client TRUSTS the CA but connects under a hostname that does not
+  # match the certificate CN: the hostname verification must fail.
+  let ca_cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let client_cfg = client_cfg_with_ca(ca_cert)
+  match connect_client(client_cfg, "wrong.example.com".to_string())
+  when Result::Err(_) then assert_true(true)
+  when Result::Ok(_) then assert_false(true)
+  end
+
+  let _ = assert_ok(handle.join())
+  assert_true(true)
+end
+
+@test
+def test_tls_handshake_alpn_h2_negotiated() -> Unit
+  let cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let no_password: Option[String] = Option::None
+  let key = assert_ok(PrivateKey::from_pem(fixed_key_pem(), no_password))
+
+  var protocols: Vec[String] = Vec::new()
+  protocols.push("h2".to_string())
+  let server_cfg = TlsConfig::default_server()
+    .with_certificate(cert, key)
+    .with_alpn(protocols.clone())
+  let mut handle = start_tls_server(server_cfg)
+
+  let ca_cert = assert_ok(Certificate::from_pem(fixed_cert_pem()))
+  let client_cfg = client_cfg_with_ca(ca_cert).with_alpn(protocols)
+  let conn = assert_ok(connect_client(client_cfg, server_host()))
+  assert_true(conn.is_connected())
+
+  # The negotiated protocol must be the h2 both sides offered.
+  match conn.negotiated_alpn()
+  when Option::Some(p) then assert_eq(p, "h2")
+  when Option::None then assert_false(true)
+  end
+
+  let _ = assert_ok(handle.join())
+  assert_true(true)
+end

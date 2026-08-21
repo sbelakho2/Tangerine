@@ -1,0 +1,248 @@
+# tests/io_read_adapters_test.tg — P1 I/O regression suite for the read
+# adapters in std::io.
+#
+# (1) read_to_end's spare-capacity view: the writable extent must be the
+#     buffer's SPARE CAPACITY. The old loop computed
+#     exposed = out.len() - start AFTER the commit, so a partial read
+#     (len < capacity) made the next iteration expose len - len = 0
+#     bytes — a zero-length view that terminated a large stream after
+#     its first partial chunk.
+# (2) read_line's over-consumption + CRLF: the generic free read_line
+#     cannot push back (its over-consumption is inherent and documented
+#     in std/io.tg) — the sound path is BufReader::read_line, which
+#     retains the unread suffix in its reader-side buffer; and the CRLF
+#     strip must drop the byte BEFORE the '\n' (the old free function
+#     checked the last committed byte, which was the '\n' itself).
+
+use std::core::{Int, String, Unit, Result, Option, Vec}
+use std::collections::{SliceMut}
+use std::io::{Read, IOError, read_to_end, read_line, buf_reader_new}
+use std::test::*
+
+# A fake Read that hands out exactly `chunk` bytes per call — the
+# partial-chunk driver for the >1-buffer behavior: every read returns a
+# short read and the accumulation must span many buffers until the EOF.
+struct ChunkReader
+  data: Vec[u8]
+  pos: Int
+  chunk: Int
+end
+
+def chunk_reader_new(data: Vec[u8], chunk: Int) -> ChunkReader
+  ChunkReader { data: data, pos: 0, chunk: chunk }
+end
+
+impl Read for ChunkReader
+  def read(inout self: Self, buf: SliceMut[u8]) -> Result[Int, IOError]
+    if self.pos >= self.data.len() then
+      return Result::Ok(0)
+    end
+    let want = if self.chunk < buf.len as Int then self.chunk else buf.len as Int end
+    var i = 0
+    while i < want do
+      unsafe "copy a chunk byte into the caller's view" do
+        buf.write(i, self.data[self.pos + i])
+      end
+      i = i + 1
+    end
+    self.pos = self.pos + want
+    Result::Ok(want)
+  end
+end
+
+def reader_of(s: String, chunk: Int) -> ChunkReader
+  chunk_reader_new(s.as_bytes(), chunk)
+end
+
+def captured(out: Vec[u8]) -> String
+  String::from_bytes(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# read_to_end — the spare-capacity view
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_read_to_end_partial_chunks_accumulates_until_eof() -> Unit
+  # 10_000 bytes delivered 100 at a time. The old loop exposed a
+  # zero-length view after the first partial commit and stopped at 100
+  # bytes; the spare-capacity view must accumulate every chunk through
+  # the true EOF (the mandatory >1-buffer behavior).
+  let mut big = ""
+  var i = 0
+  while i < 10000 do
+    big = big + "x"
+    i = i + 1
+  end
+  let mut r = reader_of(big.clone(), 100)
+  let mut out = Vec::with_capacity(8)
+  let total = assert_ok(read_to_end(&mut r, &mut out))
+  assert_eq(total, 10000)
+  assert_eq(captured(out), big)
+end
+
+@test
+def test_read_to_end_byte_at_a_time() -> Unit
+  let mut r = reader_of("0123456789", 1)
+  let mut out = Vec::new()
+  let total = assert_ok(read_to_end(&mut r, &mut out))
+  assert_eq(total, 10)
+  assert_eq(captured(out), "0123456789")
+end
+
+@test
+def test_read_to_end_exact_capacity_boundary() -> Unit
+  # A stream of exactly 4096 bytes: the first read fills the whole
+  # exposed buffer, the next iteration must grow and then hit EOF — not
+  # terminate early with a zero-length view.
+  let mut big = ""
+  var i = 0
+  while i < 4096 do
+    big = big + "y"
+    i = i + 1
+  end
+  let mut r = reader_of(big.clone(), 4096)
+  let mut out = Vec::new()
+  let total = assert_ok(read_to_end(&mut r, &mut out))
+  assert_eq(total, 4096)
+  assert_eq(captured(out), big)
+end
+
+@test
+def test_read_to_end_empty_stream() -> Unit
+  let mut r = reader_of("", 64)
+  let mut out = Vec::new()
+  let total = assert_ok(read_to_end(&mut r, &mut out))
+  assert_eq(total, 0)
+  assert_eq(captured(out), "")
+end
+
+# ———————————————————————————————————————————————————————————————
+# read_line (free) — spare-capacity view + CRLF
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_free_read_line_spanning_short_reads() -> Unit
+  # A line delivered 3 bytes at a time: the old loop exposed a
+  # zero-length view after the first partial commit and returned the
+  # truncated line; the spare-capacity view must keep reading until the
+  # newline arrives.
+  let mut r = reader_of("hello world\n", 3)
+  let line = assert_ok(read_line(&mut r))
+  assert_eq(line, "hello world")
+end
+
+@test
+def test_free_read_line_crlf() -> Unit
+  let mut r = reader_of("hello\r\n", 64)
+  let line = assert_ok(read_line(&mut r))
+  assert_eq(line, "hello")
+end
+
+@test
+def test_free_read_line_eof_without_newline() -> Unit
+  let mut r = reader_of("partial", 64)
+  let line = assert_ok(read_line(&mut r))
+  assert_eq(line, "partial")
+  match read_line(&mut r)
+  when Result::Err(IOError::EOF) then ()
+  when _ then assert_false(true)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# BufReader::read_line — buffered retention + CRLF
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_bufreader_read_line_newline_in_middle_of_chunk() -> Unit
+  # One underlying read delivers "hello\nnext": the first read_line must
+  # return "hello" and the retained suffix must be served by the second
+  # call — the reader-side buffer never loses the bytes after the
+  # newline.
+  let mut r = reader_of("hello\nnext", 8192)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "hello")
+  assert_eq(assert_ok(br.read_line()), "next")
+  match br.read_line()
+  when Result::Err(IOError::EOF) then ()
+  when _ then assert_false(true)
+  end
+end
+
+@test
+def test_bufreader_read_line_two_lines_one_read() -> Unit
+  let mut r = reader_of("first\nsecond\n", 8192)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "first")
+  assert_eq(assert_ok(br.read_line()), "second")
+  match br.read_line()
+  when Result::Err(IOError::EOF) then ()
+  when _ then assert_false(true)
+  end
+end
+
+@test
+def test_bufreader_read_line_crlf() -> Unit
+  let mut r = reader_of("hello\r\nworld\r\n", 8192)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "hello")
+  assert_eq(assert_ok(br.read_line()), "world")
+end
+
+@test
+def test_bufreader_read_line_eof_without_newline() -> Unit
+  let mut r = reader_of("no trailing newline", 8192)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "no trailing newline")
+  match br.read_line()
+  when Result::Err(IOError::EOF) then ()
+  when _ then assert_false(true)
+  end
+end
+
+@test
+def test_bufreader_read_line_very_long_line() -> Unit
+  # A line longer than the BufReader's 8192-byte internal buffer: the
+  # accumulation must span several refills and return the whole line.
+  let mut big = ""
+  var i = 0
+  while i < 20000 do
+    big = big + "a"
+    i = i + 1
+  end
+  let mut r = reader_of(big.clone() + "\n" + "tail", 3000)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), big)
+  assert_eq(assert_ok(br.read_line()), "tail")
+end
+
+@test
+def test_bufreader_read_line_byte_at_a_time() -> Unit
+  # Zero-byte/short-read behavior: every underlying read delivers one
+  # byte, the line scanner must still find the newline and retain the
+  # rest.
+  let mut r = reader_of("abc\ndef\n", 1)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "abc")
+  assert_eq(assert_ok(br.read_line()), "def")
+end
+
+@test
+def test_bufreader_read_line_empty_lines() -> Unit
+  # "\n" (empty line) and "\r\n" (CRLF-only empty line).
+  let mut r = reader_of("\n\r\n", 8192)
+  let mut br = buf_reader_new(r)
+  assert_eq(assert_ok(br.read_line()), "")
+  assert_eq(assert_ok(br.read_line()), "")
+end
+
+@test
+def test_bufreader_read_line_empty_stream_is_eof() -> Unit
+  let mut r = reader_of("", 8192)
+  let mut br = buf_reader_new(r)
+  match br.read_line()
+  when Result::Err(IOError::EOF) then ()
+  when _ then assert_false(true)
+  end
+end

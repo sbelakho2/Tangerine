@@ -5,14 +5,22 @@
 ## - TLS 1.3 handshake protocol
 ## - Certificate verification
 ## - Cipher suites (AES-GCM, ChaCha20-Poly1305)
-## - Session resumption
 ## - ALPN negotiation
+##
+## The transport is the native OpenSSL stack behind the tls_* shim family
+## (native/tls_shims.c — see the shim's header for the API contract).
+## The connection setup wires the TlsConfig fields to the shim: the
+## verify_peer flag enables the platform default trust roots plus the
+## configured ca_certs, alpn_protocols drives the ALPN offer/selection,
+## cipher_suites restricts the TLS 1.2 cipher list and the TLS 1.3
+## ciphersuites, and min/max_version bounds the negotiated protocol.
+## Session resumption is NOT implemented (no session cache exists).
 
 use std::collections::{Vec, Map, SliceMut}
 use std::ffi::{Ptr, CString}
 use std::core::{Option, Result}
 use std::io::{Read, Write}
-use std::net::{TcpStream, SocketAddr, TcpListener}
+use std::net::{TcpStream, SocketAddr, TcpListener, tcp_connect_host}
 use std::time::{Instant, Duration}
 
 # ———————————————————————————————————————————————————————————————
@@ -141,6 +149,22 @@ impl TlsConfig
   
   pub fn with_verify_peer(sink self: TlsConfig, verify: Bool) -> TlsConfig
     self.verify_peer = verify
+    self
+  end
+  
+  # The CA trust anchors: `sink certs` MOVES the certificates (each an
+  # owning wrapper over its native X509 handle) into the config; the
+  # connection setup adds them to the SSL_CTX trust store.
+  pub fn with_ca_certs(sink self: TlsConfig, sink certs: Vec[Certificate]) -> TlsConfig
+    self.ca_certs = certs
+    self
+  end
+  
+  # The cipher restriction: `sink suites` MOVES the suite list into the
+  # config; the connection setup maps each suite to its OpenSSL name and
+  # restricts the TLS 1.2 cipher list / the TLS 1.3 ciphersuites.
+  pub fn with_cipher_suites(sink self: TlsConfig, sink suites: Vec[CipherSuite]) -> TlsConfig
+    self.cipher_suites = suites
     self
   end
 end
@@ -310,6 +334,8 @@ end
 impl TlsConnection
   pub fn connect(stream: TcpStream, config: TlsConfig, hostname: Option[String]) -> Result[TlsConnection, TlsError]
     let mut handle: SslPtr = Ptr::null()
+    let mut alpn_len: i32 = 0
+    let mut alpn_buf: Vec[u8] = Vec::with_capacity(64)
     
     unsafe "tls connect" do
       handle = tls_ssl_new()
@@ -319,10 +345,50 @@ impl TlsConnection
       tls_ssl_set_max_version(handle, match config.max_version when TlsVersion::V1_2 then 0x0303 when TlsVersion::V1_3 then 0x0304 end)
       
       if config.use_sni then
-        match hostname
+        # The SNI name is taken from a CLONE so the hostname value stays
+        # whole for the server_name field below (the shim copies the name
+        # into the SSL).
+        match hostname.clone()
           when Option::Some(name) then tls_ssl_set_hostname(handle, name.as_ptr())
           when Option::None then
         end
+      end
+      
+      # Cipher restrictions: the configured suites -> the OpenSSL names,
+      # split into the TLS 1.3 ciphersuites and the TLS <= 1.2 cipher
+      # list (SSL_CTX_set_ciphersuites / SSL_CTX_set_cipher_list).
+      mut ciphers13: String = String::new()
+      mut ciphers12: String = String::new()
+      for suite in config.cipher_suites do
+        let name = cipher_suite_openssl_name(suite)
+        if name.starts_with("TLS_") then
+          if !ciphers13.is_empty() then ciphers13 = ciphers13 + ":" end
+          ciphers13 = ciphers13 + name
+        else
+          if !ciphers12.is_empty() then ciphers12 = ciphers12 + ":" end
+          ciphers12 = ciphers12 + name
+        end
+      end
+      if !ciphers13.is_empty() then
+        let _ = tls_ssl_set_cipher_suites(handle, ciphers13.as_ptr())
+      end
+      if !ciphers12.is_empty() then
+        let _ = tls_ssl_set_cipher_list(handle, ciphers12.as_ptr())
+      end
+      
+      # ALPN: the client offer is the wire-format (length-prefixed) list.
+      mut alpn_wire: Vec[u8] = Vec::new()
+      for proto in config.alpn_protocols do
+        alpn_wire.push(proto.len() as u8)
+        let proto_ptr = proto.as_ptr()
+        var bi = 0
+        while bi < proto.len() do
+          alpn_wire.push(proto_ptr.offset(bi).read())
+          bi = bi + 1
+        end
+      end
+      if !alpn_wire.is_empty() then
+        let _ = tls_ssl_set_alpn_protos(handle, alpn_wire.as_ptr(), alpn_wire.len() as usize)
       end
       
       match config.certificate
@@ -337,11 +403,34 @@ impl TlsConnection
       
       tls_ssl_set_verify(handle, config.verify_peer, config.verify_hostname)
       
-      let result = tls_ssl_connect(handle, stream.native_handle())
+      # Trust roots: verify_peer enables the platform default verify
+      # paths, and every configured CA certificate is added to the CTX
+      # trust store.
+      if config.verify_peer then
+        tls_ssl_set_default_verify_paths(handle)
+        for ca in config.ca_certs do
+          tls_ssl_add_ca_cert(handle, ca.handle)
+        end
+      end
+      
+      # The fd is read as a FIELD (not raw_fd(), which consumes the
+      # stream) — the stream is moved into the TlsConnection below.
+      let result = tls_ssl_connect(handle, stream.fd as i32)
       if result != 0 then
         tls_ssl_free(handle)
         return Result::Err(TlsError::HandshakeFailed)
       end
+      
+      alpn_len = tls_ssl_get_alpn(handle, alpn_buf.as_mut_ptr(), 64)
+      if alpn_len > 0 then
+        alpn_buf.set_len(alpn_len)
+      end
+    end
+    
+    let negotiated_alpn = if alpn_len > 0 then
+      Option::Some(String::from_utf8(alpn_buf).unwrap_or(String::new()))
+    else
+      Option::None
     end
     
     Result::Ok(TlsConnection {
@@ -351,16 +440,58 @@ impl TlsConnection
       negotiated_cipher: Option::None,
       negotiated_version: Option::None,
       server_name: hostname.map(|h| h.clone()),
-      alpn_protocol: Option::None
+      alpn_protocol: negotiated_alpn
     })
   end
   
   pub fn accept(stream: TcpStream, config: TlsConfig) -> Result[TlsConnection, TlsError]
     let mut handle: SslPtr = Ptr::null()
+    let mut alpn_len: i32 = 0
+    let mut alpn_buf: Vec[u8] = Vec::with_capacity(64)
     
     unsafe "tls accept" do
       handle = tls_ssl_new()
       if handle.is_null() then return Result::Err(TlsError::HandshakeFailed) end
+      
+      tls_ssl_set_min_version(handle, match config.min_version when TlsVersion::V1_2 then 0x0303 when TlsVersion::V1_3 then 0x0304 end)
+      tls_ssl_set_max_version(handle, match config.max_version when TlsVersion::V1_2 then 0x0303 when TlsVersion::V1_3 then 0x0304 end)
+      
+      # Cipher restrictions (same wiring as the client: the TLS 1.3
+      # ciphersuites and the TLS <= 1.2 cipher list).
+      mut ciphers13: String = String::new()
+      mut ciphers12: String = String::new()
+      for suite in config.cipher_suites do
+        let name = cipher_suite_openssl_name(suite)
+        if name.starts_with("TLS_") then
+          if !ciphers13.is_empty() then ciphers13 = ciphers13 + ":" end
+          ciphers13 = ciphers13 + name
+        else
+          if !ciphers12.is_empty() then ciphers12 = ciphers12 + ":" end
+          ciphers12 = ciphers12 + name
+        end
+      end
+      if !ciphers13.is_empty() then
+        let _ = tls_ssl_set_cipher_suites(handle, ciphers13.as_ptr())
+      end
+      if !ciphers12.is_empty() then
+        let _ = tls_ssl_set_cipher_list(handle, ciphers12.as_ptr())
+      end
+      
+      # ALPN: the server's protocol list drives the select callback
+      # (the shim copies it into the SSL_CTX).
+      mut alpn_wire: Vec[u8] = Vec::new()
+      for proto in config.alpn_protocols do
+        alpn_wire.push(proto.len() as u8)
+        let proto_ptr = proto.as_ptr()
+        var bi = 0
+        while bi < proto.len() do
+          alpn_wire.push(proto_ptr.offset(bi).read())
+          bi = bi + 1
+        end
+      end
+      if !alpn_wire.is_empty() then
+        let _ = tls_ssl_set_alpn_select(handle, alpn_wire.as_ptr(), alpn_wire.len() as usize)
+      end
       
       match config.certificate
         when Option::Some(cert) then tls_ssl_set_certificate(handle, cert.handle)
@@ -376,11 +507,31 @@ impl TlsConnection
           return Result::Err(TlsError::HandshakeFailed)
       end
       
-      let result = tls_ssl_accept(handle, stream.native_handle())
+      if config.verify_peer then
+        tls_ssl_set_default_verify_paths(handle)
+        for ca in config.ca_certs do
+          tls_ssl_add_ca_cert(handle, ca.handle)
+        end
+      end
+      
+      # The fd is read as a FIELD (not raw_fd(), which consumes the
+      # stream) — the stream is moved into the TlsConnection below.
+      let result = tls_ssl_accept(handle, stream.fd as i32)
       if result != 0 then
         tls_ssl_free(handle)
         return Result::Err(TlsError::HandshakeFailed)
       end
+      
+      alpn_len = tls_ssl_get_alpn(handle, alpn_buf.as_mut_ptr(), 64)
+      if alpn_len > 0 then
+        alpn_buf.set_len(alpn_len)
+      end
+    end
+    
+    let negotiated_alpn = if alpn_len > 0 then
+      Option::Some(String::from_utf8(alpn_buf).unwrap_or(String::new()))
+    else
+      Option::None
     end
     
     Result::Ok(TlsConnection {
@@ -390,7 +541,7 @@ impl TlsConnection
       negotiated_cipher: Option::None,
       negotiated_version: Option::None,
       server_name: Option::None,
-      alpn_protocol: Option::None
+      alpn_protocol: negotiated_alpn
     })
   end
   
@@ -398,6 +549,15 @@ impl TlsConnection
     match self.state
       when TlsState::Connected then true
       else false
+    end
+  end
+  
+  # The ALPN protocol negotiated during the handshake (None when neither
+  # side offered one or the negotiation failed).
+  pub fn negotiated_alpn(self: Self) -> Option[String]
+    match self.alpn_protocol
+      when Option::Some(p) then Option::Some(p.clone())
+      when Option::None then Option::None
     end
   end
 end
@@ -420,7 +580,7 @@ impl Write for TlsConnection
   pub def write(inout self: Self, buf: [u8]) -> Result[usize, TlsError]
     if !self.is_connected() then return Result::Err(TlsError::ConnectionClosed) end
     unsafe "tls write" do
-      let result = tls_ssl_write(self.handle, buf.as_ptr(), buf.len())
+      let result = tls_ssl_write(self.handle, buf.ptr, buf.len as usize)
       if result < 0 then return Result::Err(TlsError::ConnectionClosed) end
       Result::Ok(result as usize)
     end
@@ -475,10 +635,9 @@ impl TlsClient
   end
   
   pub def connect(inout self: Self, host: String, port: u16) -> Result[TlsConnection, TlsError]
-    let addr = format!("{}:{}", host, port)
-    let stream = match TcpStream::connect(&addr)
+    let stream = match tcp_connect_host(host.clone(), port)
       when Result::Ok(s) then s
-      when Result::Err(e) then return Result::Err(TlsError::IoError(e))
+      when Result::Err(e) then return Result::Err(TlsError::IoError(e.message()))
     end
     TlsConnection::connect(stream, &self.config, Option::Some(host))
   end
@@ -517,7 +676,7 @@ impl TlsServer
       when Option::Some(listener) then
         match listener.accept()
           when Result::Ok((stream, _addr)) then TlsConnection::accept(stream, &self.config)
-          when Result::Err(e) then Result::Err(TlsError::IoError(e))
+          when Result::Err(e) then Result::Err(TlsError::IoError(e.message()))
         end
       when Option::None then Result::Err(TlsError::IoError("Server not bound".to_string()))
     end
@@ -527,6 +686,19 @@ end
 # ———————————————————————————————————————————————————————————————
 # Native TLS FFI declarations
 # ———————————————————————————————————————————————————————————————
+# The CipherSuite -> OpenSSL name mapping: the TLS 1.3 suites use the
+# IANA names (SSL_CTX_set_ciphersuites), the TLS 1.2 suites use the
+# OpenSSL cipher names (SSL_CTX_set_cipher_list). The prefix split
+# ("TLS_" = 1.3, "ECDHE-" = 1.2) drives which setter each suite feeds.
+def cipher_suite_openssl_name(suite: CipherSuite) -> String
+  match suite
+  when CipherSuite::AES_128_GCM_SHA256 then "TLS_AES_128_GCM_SHA256"
+  when CipherSuite::AES_256_GCM_SHA384 then "TLS_AES_256_GCM_SHA384"
+  when CipherSuite::CHACHA20_POLY1305_SHA256 then "TLS_CHACHA20_POLY1305_SHA256"
+  when CipherSuite::ECDHE_RSA_WITH_AES_128_GCM_SHA256 then "ECDHE-RSA-AES128-GCM-SHA256"
+  when CipherSuite::ECDHE_RSA_WITH_AES_256_GCM_SHA384 then "ECDHE-RSA-AES256-GCM-SHA384"
+  end
+end
 
 extern "C" do
   def tls_ssl_new() -> SslPtr
@@ -542,6 +714,19 @@ extern "C" do
   def tls_ssl_read(ssl: SslPtr, buf: PtrMut[u8], len: usize) -> i32
   def tls_ssl_write(ssl: SslPtr, buf: Ptr[u8], len: usize) -> i32
   def tls_ssl_shutdown(ssl: SslPtr) -> i32
+  
+  # Trust roots / verification
+  def tls_ssl_set_default_verify_paths(ssl: SslPtr) -> Unit
+  def tls_ssl_add_ca_cert(ssl: SslPtr, cert: X509Ptr) -> Unit
+  
+  # ALPN
+  def tls_ssl_set_alpn_protos(ssl: SslPtr, protos: Ptr[u8], len: usize) -> i32
+  def tls_ssl_set_alpn_select(ssl: SslPtr, protos: Ptr[u8], len: usize) -> i32
+  def tls_ssl_get_alpn(ssl: SslPtr, buf: PtrMut[u8], max_len: usize) -> i32
+  
+  # Cipher restrictions
+  def tls_ssl_set_cipher_list(ssl: SslPtr, ciphers: Ptr[u8]) -> i32
+  def tls_ssl_set_cipher_suites(ssl: SslPtr, ciphers: Ptr[u8]) -> i32
   
   def tls_x509_from_pem(pem: Ptr[u8], len: usize) -> X509Ptr
   def tls_x509_free(cert: X509Ptr) -> Unit

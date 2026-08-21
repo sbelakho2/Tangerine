@@ -305,12 +305,18 @@ struct Statement
   sql: String
   handle: Ptr[Unit]
   driver: DriverKind
-end
-
-enum DriverKind
-  Sqlite
-  Postgres
-  Mysql
+  # The backend-specific prepared-statement state:
+  #   conn_handle — the owning connection's native handle (the Postgres
+  #                 PgConnection pointer; the statement keeps it alive for
+  #                 PQexecPrepared / DEALLOCATE and for the Drop cleanup)
+  #   param_count — the prepared statement's parameter metadata (the
+  #                 Postgres nParams; Sqlite/Mysql keep 0)
+  #   stmt_name   — the statement identity: the Postgres server-side
+  #                 prepared-statement name (Sqlite/Mysql keep the native
+  #                 statement pointer in `handle` and an empty name)
+  conn_handle: Ptr[Unit]
+  param_count: UInt
+  stmt_name: String
 end
 
 impl Statement
@@ -341,16 +347,21 @@ end
 
 impl Drop for Statement
   def drop(inout self: Statement) -> Unit
-    if !self.handle.is_null() then
-      match self.driver
-      when DriverKind::Sqlite then
+    match self.driver
+    when DriverKind::Sqlite then
+      if !self.handle.is_null() then
         let _ = unsafe "FFI boundary" do sqlite3_finalize(self.handle) end
-      when DriverKind::Postgres then
-        let _ = postgres_stmt_finalize(self)
-      when DriverKind::Mysql then
-        let _ = unsafe "FFI boundary" do mysql_stmt_close(self.handle) end
+        self.handle = null_ptr()
       end
-      self.handle = null_ptr()
+    when DriverKind::Postgres then
+      # The deterministic server-side cleanup: DEALLOCATE the named
+      # prepared statement and PQclear any result, then null the state.
+      let _ = postgres_stmt_finalize(self)
+    when DriverKind::Mysql then
+      if !self.handle.is_null() then
+        let _ = unsafe "FFI boundary" do mysql_stmt_close(self.handle) end
+        self.handle = null_ptr()
+      end
     end
   end
 end
@@ -556,7 +567,10 @@ impl Connection for Sqlite
     Result::Ok(Statement {
       sql: sql.to_string(),
       handle: stmt_handle,
-      driver: DriverKind::Sqlite
+      driver: DriverKind::Sqlite,
+      conn_handle: null_ptr(),
+      param_count: 0,
+      stmt_name: String::new()
     })
   end
   
@@ -1042,17 +1056,23 @@ impl Connection for Postgres
   end
   
   def prepare(inout self: Postgres, sql: str) -> Result[Statement, DbError]
+    # The statement SQL is normalized to PostgreSQL's $1..$n positional
+    # form at prepare time (the `?` placeholder translation, quoted-string
+    # aware), and the server-side statement is created with PQprepare; the
+    # Statement then carries the connection handle + the statement name +
+    # the parameter count so execute/query run PQexecPrepared.
+    let (translated, param_count) = postgres_translate_placeholders(sql)
     self.stmt_counter = self.stmt_counter + 1
     let stmt_name = "stmt_" + self.stmt_counter.to_string()
     let stmt_name_cstr = stmt_name.to_cstring()
-    let sql_cstr = sql.to_cstring()
+    let sql_cstr = translated.to_cstring()
     
     let result = unsafe "FFI boundary" do
-      PQprepare(self.handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), 0, null_ptr())
+      PQprepare(self.handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), param_count as i32, null_ptr())
     end
     
     if result.is_null() then
-      return Result::Err(DbError::QueryFailed("failed to prepare statement"))
+      return Result::Err(DbError::QueryFailed(postgres_errmsg(self.handle)))
     end
     
     let status = unsafe "FFI boundary" do PQresultStatus(result) end
@@ -1064,13 +1084,13 @@ impl Connection for Postgres
     
     unsafe "FFI boundary" do PQclear(result) end
     
-    # Store statement name in handle pointer (as string pointer for lookup)
-    let name_ptr = stmt_name.into_raw() as Ptr[Unit]
-    
     Result::Ok(Statement {
-      sql: sql.to_string(),
-      handle: name_ptr,
-      driver: DriverKind::Postgres
+      sql: translated,
+      handle: null_ptr(),
+      driver: DriverKind::Postgres,
+      conn_handle: self.handle,
+      param_count: param_count,
+      stmt_name: stmt_name
     })
   end
   
@@ -1108,6 +1128,147 @@ def postgres_result_errmsg(result: Ptr[Unit]) -> String
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# The ? -> $n placeholder translation
+# ———————————————————————————————————————————————————————————————
+# PostgreSQL expects $1..$n positional parameters, never the JDBC `?`
+# placeholder. The translation scans the statement's SQL with quoted-
+# string awareness — a `?` inside a single-quoted string literal or a
+# double-quoted identifier is DATA, never a parameter — and rewrites the
+# parameter occurrences to $1..$n in parameter order. The scan is a
+# single pass over the characters; a doubled quote ('' or "") toggles the
+# quote state like any other quote and is handled by the toggle itself.
+# Returns the translated SQL and the number of parameters found.
+def postgres_translate_placeholders(sql: str) -> (String, UInt)
+  var out = String::new()
+  var param_count = 0
+  var in_single_quote = false
+  var in_double_quote = false
+  for ch in sql.chars() do
+    if ch == '\'' && !in_double_quote then
+      in_single_quote = !in_single_quote
+      out.push(ch)
+    elsif ch == '"' && !in_single_quote then
+      in_double_quote = !in_double_quote
+      out.push(ch)
+    elsif ch == '?' && !in_single_quote && !in_double_quote then
+      param_count = param_count + 1
+      let dollar = "$" + param_count.to_string()
+      out.push_str(dollar.as_str())
+    else
+      out.push(ch)
+    end
+  end
+  (out, param_count as UInt)
+end
+
+# ———————————————————————————————————————————————————————————————
+# PgParamBacking — the explicit parameter backing for PQexecParams /
+# PQexecPrepared
+# ———————————————————————————————————————————————————————————————
+# Every parameter's PAYLOAD is owned by the backing for the duration of
+# the FFI call:
+#   owned_buffers — the owned byte buffers: the blob's raw bytes and the
+#                   text/numeric NUL-terminated C-string bytes. The blob
+#                   bytes are COPIED into an owned buffer here (never a
+#                   pointer into a temporary SqlValue payload that dies at
+#                   the end of its loop iteration), and each C-string is
+#                   likewise an owned buffer — every ptrs[] entry stays
+#                   valid until the backing is dropped, i.e. through the
+#                   PQexecParams/PQexecPrepared call.
+#   ptrs          — the paramValues array: a Ptr[u8] per parameter (null
+#                   for SQL NULL).
+#   lengths       — the paramLengths entries (Int; converted to the C
+#                   i32 ABI at the FFI boundary).
+#   formats       — the paramFormats entries (0 = text, 1 = binary).
+struct PgParamBacking
+  owned_buffers: Vec[Vec[u8]]
+  ptrs: Vec[Ptr[u8]]
+  lengths: Vec[Int]
+  formats: Vec[Int]
+end
+
+impl PgParamBacking
+  def new() -> PgParamBacking
+    PgParamBacking {
+      owned_buffers: Vec::new(),
+      ptrs: Vec::new(),
+      lengths: Vec::new(),
+      formats: Vec::new()
+    }
+  end
+  
+  def push_null(inout self: PgParamBacking) -> Unit
+    self.ptrs.push(null_ptr())
+    self.lengths.push(0)
+    self.formats.push(0)
+  end
+  
+  # A text-format parameter: the NUL-terminated byte buffer is pushed
+  # into owned_buffers BEFORE the backing is used, so the ptrs[] entry
+  # points into a buffer that lives through the FFI call.
+  def push_text_bytes(inout self: PgParamBacking, sink bytes: Vec[u8]) -> Unit
+    self.ptrs.push(bytes.as_ptr())
+    self.lengths.push(bytes.len())
+    self.formats.push(0)
+    self.owned_buffers.push(bytes)
+  end
+  
+  # A binary-format parameter: the blob's bytes are copied into an owned
+  # buffer (owned_buffers push) — the pointer cannot dangle before
+  # PQexecParams/PQexecPrepared.
+  def push_blob(inout self: PgParamBacking, blob: Vec[u8]) -> Unit
+    self.ptrs.push(blob.as_ptr())
+    self.lengths.push(blob.len())
+    self.formats.push(1)
+    self.owned_buffers.push(blob)
+  end
+end
+
+# Build the parameter backing for a parameter slice.
+def postgres_build_backing(params: [Box[dyn ToSqlParam]]) -> PgParamBacking
+  var backing = PgParamBacking::new()
+  for param in params do
+    let value = param.to_sql_param()
+    match value
+    when SqlValue::Null then
+      backing.push_null()
+    when SqlValue::Integer(i) then
+      backing.push_text_bytes(i.to_string().to_cstring_bytes())
+    when SqlValue::Float(f) then
+      backing.push_text_bytes(f.to_string().to_cstring_bytes())
+    when SqlValue::Text(t) then
+      backing.push_text_bytes(t.to_cstring_bytes())
+    when SqlValue::Bool(b) then
+      backing.push_text_bytes((if b then "t" else "f" end).to_cstring_bytes())
+    when SqlValue::Blob(blob) then
+      backing.push_blob(blob)
+    when SqlValue::Timestamp(t) then
+      backing.push_text_bytes(t.to_string().to_cstring_bytes())
+    end
+  end
+  backing
+end
+
+# Translate the C int32 length/format arrays at the FFI boundary: the
+# backing stores the Tangerine-native Int entries; PQexecParams /
+# PQexecPrepared read i32 arrays.
+def postgres_i32_lengths(backing: PgParamBacking) -> Vec[i32]
+  var out = Vec::new()
+  for l in backing.lengths do
+    out.push(l as i32)
+  end
+  out
+end
+
+def postgres_i32_formats(backing: PgParamBacking) -> Vec[i32]
+  var out = Vec::new()
+  for f in backing.formats do
+    out.push(f as i32)
+  end
+  out
+end
+
 def postgres_execute_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
   if params.is_empty() then
     let sql_cstr = sql.to_cstring()
@@ -1131,66 +1292,28 @@ def postgres_execute_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlPara
     return Result::Ok(affected)
   end
   
-  # Convert parameters to C strings
-  var param_values: Vec[Vec[u8]] = Vec::new()
-  var param_ptrs: Vec[Ptr[u8]] = Vec::new()
-  var param_lengths: Vec[i32] = Vec::new()
-  var param_formats: Vec[i32] = Vec::new()
-  
-  for param in params do
-    let value = param.to_sql_param()
-    match value
-    when SqlValue::Null then
-      param_ptrs.push(null_ptr())
-      param_lengths.push(0)
-      param_formats.push(0)
-    when SqlValue::Integer(i) then
-      let s = i.to_string().to_cstring_bytes()
-      param_ptrs.push(s.as_ptr())
-      param_lengths.push(s.len() as i32)
-      param_formats.push(0)
-      param_values.push(s)
-    when SqlValue::Float(f) then
-      let s = f.to_string().to_cstring_bytes()
-      param_ptrs.push(s.as_ptr())
-      param_lengths.push(s.len() as i32)
-      param_formats.push(0)
-      param_values.push(s)
-    when SqlValue::Text(t) then
-      let s = t.to_cstring_bytes()
-      param_ptrs.push(s.as_ptr())
-      param_lengths.push(s.len() as i32)
-      param_formats.push(0)
-      param_values.push(s)
-    when SqlValue::Bool(b) then
-      let s = (if b then "t" else "f" end).to_cstring_bytes()
-      param_ptrs.push(s.as_ptr())
-      param_lengths.push(s.len() as i32)
-      param_formats.push(0)
-      param_values.push(s)
-    when SqlValue::Blob(blob) then
-      param_ptrs.push(blob.as_ptr())
-      param_lengths.push(blob.len() as i32)
-      param_formats.push(1)  # binary format
-    when SqlValue::Timestamp(t) then
-      let s = t.to_string().to_cstring_bytes()
-      param_ptrs.push(s.as_ptr())
-      param_lengths.push(s.len() as i32)
-      param_formats.push(0)
-      param_values.push(s)
-    end
+  # Parameterized execution: translate the `?` placeholders to the $1..$n
+  # positional form PostgreSQL expects, back every parameter payload with
+  # the owned PgParamBacking (blob bytes copied into owned buffers — no
+  # dangling pointers), and send through PQexecParams.
+  let (translated, param_count) = postgres_translate_placeholders(sql)
+  if param_count != params.len() as UInt then
+    return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
   end
   
-  let sql_cstr = sql.to_cstring()
+  let backing = postgres_build_backing(params)
+  let sql_cstr = translated.to_cstring()
+  let c_lengths = postgres_i32_lengths(backing)
+  let c_formats = postgres_i32_formats(backing)
   let result = unsafe "FFI boundary" do
     PQexecParams(
       handle,
       sql_cstr.as_ptr(),
       params.len() as i32,
       null_ptr(),
-      param_ptrs.as_ptr(),
-      param_lengths.as_ptr(),
-      param_formats.as_ptr(),
+      backing.ptrs.as_ptr(),
+      c_lengths.as_ptr(),
+      c_formats.as_ptr(),
       0
     )
   end
@@ -1218,66 +1341,27 @@ def postgres_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]
     let sql_cstr = sql.to_cstring()
     unsafe "FFI boundary" do PQexec(handle, sql_cstr.as_ptr()) end
   else
-    # Convert parameters
-    var param_values: Vec[Vec[u8]] = Vec::new()
-    var param_ptrs: Vec[Ptr[u8]] = Vec::new()
-    var param_lengths: Vec[i32] = Vec::new()
-    var param_formats: Vec[i32] = Vec::new()
-    
-    for param in params do
-      let value = param.to_sql_param()
-      match value
-      when SqlValue::Null then
-        param_ptrs.push(null_ptr())
-        param_lengths.push(0)
-        param_formats.push(0)
-      when SqlValue::Integer(i) then
-        let s = i.to_string().to_cstring_bytes()
-        param_ptrs.push(s.as_ptr())
-        param_lengths.push(s.len() as i32)
-        param_formats.push(0)
-        param_values.push(s)
-      when SqlValue::Float(f) then
-        let s = f.to_string().to_cstring_bytes()
-        param_ptrs.push(s.as_ptr())
-        param_lengths.push(s.len() as i32)
-        param_formats.push(0)
-        param_values.push(s)
-      when SqlValue::Text(t) then
-        let s = t.to_cstring_bytes()
-        param_ptrs.push(s.as_ptr())
-        param_lengths.push(s.len() as i32)
-        param_formats.push(0)
-        param_values.push(s)
-      when SqlValue::Bool(b) then
-        let s = (if b then "t" else "f" end).to_cstring_bytes()
-        param_ptrs.push(s.as_ptr())
-        param_lengths.push(s.len() as i32)
-        param_formats.push(0)
-        param_values.push(s)
-      when SqlValue::Blob(blob) then
-        param_ptrs.push(blob.as_ptr())
-        param_lengths.push(blob.len() as i32)
-        param_formats.push(1)
-      when SqlValue::Timestamp(t) then
-        let s = t.to_string().to_cstring_bytes()
-        param_ptrs.push(s.as_ptr())
-        param_lengths.push(s.len() as i32)
-        param_formats.push(0)
-        param_values.push(s)
-      end
+    # Parameterized query: translate the `?` placeholders to the $1..$n
+    # positional form and back every parameter with the owned
+    # PgParamBacking (blob bytes copied into owned buffers — no dangling
+    # pointers) before PQexecParams.
+    let (translated, param_count) = postgres_translate_placeholders(sql)
+    if param_count != params.len() as UInt then
+      return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
     end
-    
-    let sql_cstr = sql.to_cstring()
+    let backing = postgres_build_backing(params)
+    let sql_cstr = translated.to_cstring()
+    let c_lengths = postgres_i32_lengths(backing)
+    let c_formats = postgres_i32_formats(backing)
     unsafe "FFI boundary" do
       PQexecParams(
         handle,
         sql_cstr.as_ptr(),
         params.len() as i32,
         null_ptr(),
-        param_ptrs.as_ptr(),
-        param_lengths.as_ptr(),
-        param_formats.as_ptr(),
+        backing.ptrs.as_ptr(),
+        c_lengths.as_ptr(),
+        c_formats.as_ptr(),
         0
       )
     end
@@ -1294,6 +1378,14 @@ def postgres_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]
     return Result::Err(DbError::QueryFailed(err_msg))
   end
   
+  let rows = postgres_result_to_rows(result)
+  unsafe "FFI boundary" do PQclear(result) end
+  Result::Ok(rows)
+end
+
+# Read a PGRES_TUPLES_OK result into Rows (shared by the raw query path
+# and the prepared-statement query path).
+def postgres_result_to_rows(result: Ptr[Unit]) -> Rows
   # Get column info
   let num_fields = unsafe "FFI boundary" do PQnfields(result)  end as UInt
   var columns = Vec::new()
@@ -1345,8 +1437,7 @@ def postgres_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]
     data.push(row_values)
   end
   
-  unsafe "FFI boundary" do PQclear(result) end
-  Result::Ok(Rows::new(columns, data))
+  Rows::new(columns, data)
 end
 
 # Decode PostgreSQL bytea hex format
@@ -1461,20 +1552,108 @@ def parse_pg_timestamp(s: str) -> i64
 end
 
 def postgres_stmt_execute(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-  # Would need to store connection handle with statement
-  Result::Err(DbError::Internal("prepared statement execution requires connection context"))
+  if stmt.conn_handle.is_null() then
+    return Result::Err(DbError::Internal("prepared statement execution requires connection context".to_string()))
+  end
+  if stmt.stmt_name.is_empty() then
+    return Result::Err(DbError::Internal("prepared statement has no server-side identity".to_string()))
+  end
+  
+  # The statement was PQprepare'd at prepare() time with the translated
+  # $1..$n SQL and the recorded parameter count; execution goes through
+  # PQexecPrepared with the same owned PgParamBacking as the raw path.
+  let backing = postgres_build_backing(params)
+  let name_cstr = stmt.stmt_name.to_cstring()
+  let c_lengths = postgres_i32_lengths(backing)
+  let c_formats = postgres_i32_formats(backing)
+  let result = unsafe "FFI boundary" do
+    PQexecPrepared(
+      stmt.conn_handle,
+      name_cstr.as_ptr(),
+      stmt.param_count as i32,
+      backing.ptrs.as_ptr(),
+      c_lengths.as_ptr(),
+      c_formats.as_ptr(),
+      0
+    )
+  end
+  
+  if result.is_null() then
+    return Result::Err(DbError::QueryFailed(postgres_errmsg(stmt.conn_handle)))
+  end
+  
+  let status = unsafe "FFI boundary" do PQresultStatus(result) end
+  if status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK then
+    let err_msg = postgres_result_errmsg(result)
+    unsafe "FFI boundary" do PQclear(result) end
+    return Result::Err(DbError::QueryFailed(err_msg))
+  end
+  
+  let cmd_ptr = unsafe "FFI boundary" do PQcmdTuples(result) end
+  let affected_str = if cmd_ptr.is_null() then "0" else unsafe "FFI boundary" do String::from_cstr(cmd_ptr) end end
+  let affected = affected_str.parse_uint().unwrap_or(0)
+  unsafe "FFI boundary" do PQclear(result) end
+  Result::Ok(affected)
 end
 
 def postgres_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-  Result::Err(DbError::Internal("prepared statement query requires connection context"))
+  if stmt.conn_handle.is_null() then
+    return Result::Err(DbError::Internal("prepared statement query requires connection context".to_string()))
+  end
+  if stmt.stmt_name.is_empty() then
+    return Result::Err(DbError::Internal("prepared statement has no server-side identity".to_string()))
+  end
+  
+  let backing = postgres_build_backing(params)
+  let name_cstr = stmt.stmt_name.to_cstring()
+  let c_lengths = postgres_i32_lengths(backing)
+  let c_formats = postgres_i32_formats(backing)
+  let result = unsafe "FFI boundary" do
+    PQexecPrepared(
+      stmt.conn_handle,
+      name_cstr.as_ptr(),
+      stmt.param_count as i32,
+      backing.ptrs.as_ptr(),
+      c_lengths.as_ptr(),
+      c_formats.as_ptr(),
+      0
+    )
+  end
+  
+  if result.is_null() then
+    return Result::Err(DbError::QueryFailed(postgres_errmsg(stmt.conn_handle)))
+  end
+  
+  let status = unsafe "FFI boundary" do PQresultStatus(result) end
+  if status != PGRES_TUPLES_OK then
+    let err_msg = postgres_result_errmsg(result)
+    unsafe "FFI boundary" do PQclear(result) end
+    return Result::Err(DbError::QueryFailed(err_msg))
+  end
+  
+  let rows = postgres_result_to_rows(result)
+  unsafe "FFI boundary" do PQclear(result) end
+  Result::Ok(rows)
 end
 
 def postgres_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
-  # Free statement name string
-  if !stmt.handle.is_null() then
-    let _ = unsafe "FFI boundary" do String::from_raw(stmt.handle as Ptr[u8]) end
-    stmt.handle = null_ptr()
+  # The deterministic server-side cleanup: DEALLOCATE the named prepared
+  # statement on the stored connection (the server frees its plan), and
+  # PQclear any result the DEALLOCATE returned. A closed/finished
+  # connection simply leaves the session state to the server — the
+  # Tangerine-side state is nulled either way.
+  if !stmt.conn_handle.is_null() && !stmt.stmt_name.is_empty() then
+    let dealloc_sql = "DEALLOCATE " + stmt.stmt_name
+    let sql_cstr = dealloc_sql.to_cstring()
+    let result = unsafe "FFI boundary" do PQexec(stmt.conn_handle, sql_cstr.as_ptr()) end
+    if !result.is_null() then
+      unsafe "FFI boundary" do PQclear(result) end
+    end
   end
+  stmt.handle = null_ptr()
+  stmt.conn_handle = null_ptr()
+  stmt.param_count = 0
+  stmt.stmt_name = String::new()
   Result::Ok(())
 end
 
@@ -1843,7 +2022,12 @@ extern "C"
   def mysql_rollback(mysql: Ptr[Unit]) -> u8
   def mysql_stmt_init(mysql: Ptr[Unit]) -> Ptr[Unit]
   def mysql_stmt_prepare(stmt: Ptr[Unit], query: Ptr[u8], length: UInt) -> i32
+  def mysql_stmt_bind_param(stmt: Ptr[Unit], bind: Ptr[MysqlBind]) -> i32
+  def mysql_stmt_bind_result(stmt: Ptr[Unit], bind: Ptr[MysqlBind]) -> i32
   def mysql_stmt_execute(stmt: Ptr[Unit]) -> i32
+  def mysql_stmt_store_result(stmt: Ptr[Unit]) -> i32
+  def mysql_stmt_fetch(stmt: Ptr[Unit]) -> i32
+  def mysql_stmt_result_metadata(stmt: Ptr[Unit]) -> Ptr[Unit]
   def mysql_stmt_close(stmt: Ptr[Unit]) -> u8
   def mysql_stmt_affected_rows(stmt: Ptr[Unit]) -> u64
   def mysql_stmt_error(stmt: Ptr[Unit]) -> Ptr[u8]
@@ -1872,6 +2056,91 @@ struct MysqlField
   charsetnr: u32
   type_: u32   ## MYSQL_TYPE_*
 end
+
+# MYSQL_BIND — the mysql.h st_mysql_bind layout (LP64), the parameter /
+# result cell descriptor used by mysql_stmt_bind_param / bind_result.
+# The parameter-relevant fields (buffer_type @96, buffer @16,
+# buffer_length @64, length @0, is_null @8, is_unsigned @101) sit in the
+# ABI-stable prefix shared by the MySQL and MariaDB client headers; the
+# tail (read_row_data / is_unsigned_p / own_data) is copied by the
+# client, never interpreted for parameter binding. buffer_type is the
+# enum_field_types value (MYSQL_TYPE_* constants below).
+@repr(C)
+struct MysqlBind
+  length: Ptr[UInt]        ## unsigned long *length
+  is_null: Ptr[u8]         ## my_bool *is_null
+  buffer: Ptr[u8]          ## void *buffer
+  error: Ptr[u8]           ## my_bool *error
+  row_ptr: Ptr[u8]         ## unsigned char *row_ptr
+  store_param_func: Ptr[u8]  ## void (*)(NET *, unsigned char *)
+  fetch_result: Ptr[u8]    ## void (*)(MYSQL_BIND *, MYSQL_FIELD *, unsigned char **)
+  skip_result: Ptr[u8]     ## void (*)(MYSQL_BIND *, MYSQL_FIELD *, unsigned char **)
+  buffer_length: UInt      ## unsigned long buffer_length
+  offset: UInt             ## unsigned long offset
+  length_value: UInt       ## unsigned long length_value
+  param_number: u32        ## unsigned int param_number
+  pack_length: u32         ## unsigned int pack_length
+  buffer_type: u32         ## enum enum_field_types buffer_type
+  error_value: u8          ## my_bool error_value
+  is_unsigned: u8          ## my_bool is_unsigned
+  long_data_used: u8       ## my_bool long_data_used
+  skip_value: u8           ## my_bool skip_value
+  read_row_data: Ptr[u8]   ## unsigned char *read_row_data
+  is_unsigned_p: Ptr[u8]   ## my_bool *is_unsigned_p
+  own_data: u8             ## my_bool own_data
+end
+
+impl MysqlBind
+  # Build a parameter bind cell: the per-parameter buffer_type / length /
+  # is_null / buffer pointers the client reads at mysql_stmt_bind_param
+  # time (and, for result binding, writes at fetch time).
+  def new(length_ptr: Ptr[UInt], is_null_ptr: Ptr[u8], buffer: Ptr[u8],
+          buffer_len: UInt, ty: u32, is_unsigned: u8) -> MysqlBind
+    MysqlBind {
+      length: length_ptr,
+      is_null: is_null_ptr,
+      buffer: buffer,
+      error: null_ptr(),
+      row_ptr: null_ptr(),
+      store_param_func: null_ptr(),
+      fetch_result: null_ptr(),
+      skip_result: null_ptr(),
+      buffer_length: buffer_len,
+      offset: 0,
+      length_value: 0,
+      param_number: 0,
+      pack_length: 0,
+      buffer_type: ty,
+      error_value: 0,
+      is_unsigned: is_unsigned,
+      long_data_used: 0,
+      skip_value: 0,
+      read_row_data: null_ptr(),
+      is_unsigned_p: null_ptr(),
+      own_data: 0
+    }
+  end
+end
+
+## enum_field_types values (mysql.h), used as MysqlBind.buffer_type and
+## MysqlField.type_.
+const MYSQL_TYPE_TINY: u32 = 1
+const MYSQL_TYPE_LONGLONG: u32 = 8
+const MYSQL_TYPE_DOUBLE: u32 = 5
+const MYSQL_TYPE_NULL: u32 = 6
+const MYSQL_TYPE_TINY_BLOB: u32 = 249
+const MYSQL_TYPE_MEDIUM_BLOB: u32 = 250
+const MYSQL_TYPE_LONG_BLOB: u32 = 251
+const MYSQL_TYPE_BLOB: u32 = 252
+const MYSQL_TYPE_STRING: u32 = 254
+
+## mysql_stmt_fetch() result codes (mysql.h)
+const MYSQL_NO_DATA: i32 = 100
+const MYSQL_DATA_TRUNCATED: i32 = 101
+
+## The per-column output buffer size for the prepared-statement result
+## fetch (a column value longer than this is reported as truncated).
+const MYSQL_FETCH_BUFFER_SIZE: UInt = 65536
 
 struct MysqlConfig
   host: String
@@ -1930,34 +2199,44 @@ end
 
 impl Connection for Mysql
   def execute(inout self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-    let query_str = mysql_interpolate_params(self, sql, params)?
-    let ret = unsafe "FFI boundary" do
-      mysql_real_query(self.handle, query_str.to_cstring().as_ptr(), query_str.len())
+    if params.is_empty() then
+      let ret = unsafe "FFI boundary" do mysql_query(self.handle, sql.to_cstring().as_ptr()) end
+      if ret != 0 then
+        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+        return Result::Err(DbError::QueryFailed(err))
+      end
+      let affected = unsafe "FFI boundary" do mysql_affected_rows(self.handle) end
+      Result::Ok(affected as UInt)
+    else
+      # Parameterized execution goes through the REAL prepared-statement
+      # path (mysql_stmt_prepare + mysql_stmt_bind_param with the
+      # MYSQL_BIND array + mysql_stmt_execute) — never the manual
+      # interpolation.
+      mysql_prepared_execute(self.handle, sql, params)
     end
-    if ret != 0 then
-      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
-      return Result::Err(DbError::QueryFailed(err))
-    end
-    let affected = unsafe "FFI boundary" do mysql_affected_rows(self.handle) end
-    Result::Ok(affected as UInt)
   end
 
   def query(self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-    let query_str = mysql_interpolate_params_ref(self, sql, params)?
-    let ret = unsafe "FFI boundary" do
-      mysql_real_query(self.handle, query_str.to_cstring().as_ptr(), query_str.len())
+    if params.is_empty() then
+      let ret = unsafe "FFI boundary" do
+        mysql_real_query(self.handle, sql.to_cstring().as_ptr(), sql.len() as UInt)
+      end
+      if ret != 0 then
+        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+        return Result::Err(DbError::QueryFailed(err))
+      end
+      let result = unsafe "FFI boundary" do mysql_store_result(self.handle) end
+      if result.is_null() then
+        return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+      end
+      let rows = mysql_result_to_rows(result)
+      unsafe "FFI boundary" do mysql_free_result(result) end
+      Result::Ok(rows)
+    else
+      # Parameterized query through the prepared-statement path with the
+      # real MYSQL_BIND parameter binding.
+      mysql_prepared_query(self.handle, sql, params)
     end
-    if ret != 0 then
-      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
-      return Result::Err(DbError::QueryFailed(err))
-    end
-    let result = unsafe "FFI boundary" do mysql_store_result(self.handle) end
-    if result.is_null() then
-      return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
-    end
-    let rows = mysql_result_to_rows(result)
-    unsafe "FFI boundary" do mysql_free_result(result) end
-    Result::Ok(rows)
   end
 
   def begin_transaction(inout self: Mysql) -> Result[Transaction, DbError]
@@ -1989,7 +2268,10 @@ impl Connection for Mysql
     Result::Ok(Statement {
       handle: stmt,
       sql: sql.to_string(),
-      driver: DriverKind::Mysql
+      driver: DriverKind::Mysql,
+      conn_handle: null_ptr(),
+      param_count: 0,
+      stmt_name: String::new()
     })
   end
 
@@ -2009,42 +2291,38 @@ impl Drop for Mysql
 end
 
 def mysql_execute_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-  let query_str = if params.is_empty() then
-    sql.to_string()
+  if params.is_empty() then
+    let ret = unsafe "FFI boundary" do mysql_query(handle, sql.to_cstring().as_ptr()) end
+    if ret != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    let affected = unsafe "FFI boundary" do mysql_affected_rows(handle) end
+    Result::Ok(affected as UInt)
   else
-    mysql_interpolate(sql, params)?
+    mysql_prepared_execute(handle, sql, params)
   end
-  let ret = if params.is_empty() then
-    unsafe "FFI boundary" do mysql_query(handle, query_str.to_cstring().as_ptr()) end
-  else
-    unsafe "FFI boundary" do mysql_real_query(handle, query_str.to_cstring().as_ptr(), query_str.len()) end
-  end
-  if ret != 0 then
-    let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
-    return Result::Err(DbError::QueryFailed(err))
-  end
-  let affected = unsafe "FFI boundary" do mysql_affected_rows(handle) end
-  Result::Ok(affected as UInt)
 end
 
 def mysql_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-  let query_str = if params.is_empty() then
-    sql.to_string()
+  if params.is_empty() then
+    let ret = unsafe "FFI boundary" do
+      mysql_real_query(handle, sql.to_cstring().as_ptr(), sql.len() as UInt)
+    end
+    if ret != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    let result = unsafe "FFI boundary" do mysql_store_result(handle) end
+    if result.is_null() then
+      return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+    end
+    let rows = mysql_result_to_rows(result)
+    unsafe "FFI boundary" do mysql_free_result(result) end
+    Result::Ok(rows)
   else
-    mysql_interpolate(sql, params)?
+    mysql_prepared_query(handle, sql, params)
   end
-  let ret = unsafe "FFI boundary" do mysql_real_query(handle, query_str.to_cstring().as_ptr(), query_str.len()) end
-  if ret != 0 then
-    let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(handle)) end
-    return Result::Err(DbError::QueryFailed(err))
-  end
-  let result = unsafe "FFI boundary" do mysql_store_result(handle) end
-  if result.is_null() then
-    return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
-  end
-  let rows = mysql_result_to_rows(result)
-  unsafe "FFI boundary" do mysql_free_result(result) end
-  Result::Ok(rows)
 end
 
 def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
@@ -2052,11 +2330,13 @@ def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
   let num_rows = unsafe "FFI boundary" do mysql_num_rows(result) end as UInt
 
   var columns = Vec::new()
+  var col_types = Vec::new()
   for i in 0..num_fields do
     let field = unsafe "FFI boundary" do mysql_fetch_field(result) end
     if !field.is_null() then
       let name = unsafe "FFI boundary" do cstring_to_string(field.name) end
       columns.push(name)
+      col_types.push(field.type_)
     end
   end
 
@@ -2072,8 +2352,16 @@ def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
         row_values.push(SqlValue::Null)
       else
         let len = unsafe "FFI boundary" do *lengths.offset(j as isize) end
-        let s = unsafe "FFI boundary" do string_from_ptr(field_ptr, len) end
-        row_values.push(SqlValue::Text(s))
+        if mysql_type_is_blob(col_types[j]) then
+          var bytes = Vec::with_capacity(len)
+          for k in 0..len do
+            bytes.push(unsafe "FFI boundary" do *(field_ptr.offset(k as isize)) end)
+          end
+          row_values.push(SqlValue::Blob(bytes))
+        else
+          let s = unsafe "FFI boundary" do string_from_ptr(field_ptr, len) end
+          row_values.push(SqlValue::Text(s))
+        end
       end
     end
     data.push(row_values)
@@ -2082,14 +2370,265 @@ def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
   Rows { columns: columns, data: data, pos: 0 }
 end
 
+# ———————————————————————————————————————————————————————————————
+# The real MYSQL_BIND parameter binding
+# ———————————————————————————————————————————————————————————————
+# The prepared path binds parameters through mysql_stmt_bind_param with a
+# MYSQL_BIND array (the mysql.h st_mysql_bind layout above) and executes
+# with mysql_stmt_execute — the values are sent as DATA, so the hostile
+# values (' \ \\ \0 ' OR 1=1 --, multibyte text, binary blobs) can never
+# be reinterpreted as SQL. The manual interpolation is gone from every
+# execution path.
+#
+# MysqlParamBacking owns every payload through the execute/fetch calls:
+#   binds        — the MYSQL_BIND array (one cell per parameter)
+#   buffers      — the owned byte payloads (text/numeric strings, blob
+#                  bytes) — buffer pointers stay valid through the call
+#   length_cells — the unsigned long length cells, one per parameter
+#   null_cells   — the my_bool null cells, one per parameter
+# The cell vectors are pre-sized to the parameter count (with_capacity),
+# so their storage never reallocates while the per-parameter
+# length/is_null pointers are being recorded.
+struct MysqlParamBacking
+  binds: Vec[MysqlBind]
+  buffers: Vec[Vec[u8]]
+  length_cells: Vec[UInt]
+  null_cells: Vec[u8]
+end
+
+impl MysqlParamBacking
+  def push_text_param(inout self: MysqlParamBacking, sink s: String) -> Unit
+    let idx = self.length_cells.len()
+    self.length_cells.push(0)
+    self.null_cells.push(0)
+    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
+    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
+    let bytes = s.as_bytes()
+    let len = bytes.len() as UInt
+    self.length_cells[idx] = len
+    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, bytes.as_ptr(), len, MYSQL_TYPE_STRING, 0))
+    self.buffers.push(bytes)
+  end
+  
+  def push_blob_param(inout self: MysqlParamBacking, sink blob: Vec[u8]) -> Unit
+    let idx = self.length_cells.len()
+    self.length_cells.push(0)
+    self.null_cells.push(0)
+    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
+    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
+    let len = blob.len() as UInt
+    self.length_cells[idx] = len
+    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, blob.as_ptr(), len, MYSQL_TYPE_BLOB, 0))
+    self.buffers.push(blob)
+  end
+  
+  def push_null_param(inout self: MysqlParamBacking) -> Unit
+    let idx = self.length_cells.len()
+    self.length_cells.push(0)
+    self.null_cells.push(0)
+    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
+    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
+    self.null_cells[idx] = 1
+    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, null_ptr(), 0, MYSQL_TYPE_NULL, 0))
+  end
+end
+
+def mysql_build_binds(params: [Box[dyn ToSqlParam]]) -> MysqlParamBacking
+  let n = params.len()
+  var backing = MysqlParamBacking {
+    binds: Vec::with_capacity(n),
+    buffers: Vec::with_capacity(n),
+    length_cells: Vec::with_capacity(n),
+    null_cells: Vec::with_capacity(n)
+  }
+  for param in params do
+    let value = param.to_sql_param()
+    match value
+    when SqlValue::Null then
+      backing.push_null_param()
+    when SqlValue::Integer(i) then
+      backing.push_text_param(i.to_string())
+    when SqlValue::Float(f) then
+      backing.push_text_param(f.to_string())
+    when SqlValue::Text(t) then
+      backing.push_text_param(t)
+    when SqlValue::Bool(b) then
+      backing.push_text_param((if b then "1" else "0" end).to_string())
+    when SqlValue::Blob(blob) then
+      backing.push_blob_param(blob)
+    when SqlValue::Timestamp(t) then
+      backing.push_text_param(t.to_string())
+    end
+  end
+  backing
+end
+
+# Bind the MYSQL_BIND array on the statement and execute it; the backing
+# is local, so every payload buffer lives exactly through the
+# bind_param + execute calls.
+def mysql_stmt_bind_and_execute(stmt: Ptr[Unit], params: [Box[dyn ToSqlParam]]) -> Result[Unit, DbError]
+  if params.is_empty() then
+    let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt) end
+    if ret != 0 then
+      return Result::Err(DbError::QueryFailed(unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
+    end
+    return Result::Ok(())
+  end
+  let backing = mysql_build_binds(params)
+  let bind_rc = unsafe "FFI boundary" do mysql_stmt_bind_param(stmt, backing.binds.as_ptr()) end
+  if bind_rc != 0 then
+    return Result::Err(DbError::BindError(0, unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
+  end
+  let exec_rc = unsafe "FFI boundary" do mysql_stmt_execute(stmt) end
+  if exec_rc != 0 then
+    return Result::Err(DbError::QueryFailed(unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
+  end
+  Result::Ok(())
+end
+
+def mysql_type_is_blob(t: u32) -> Bool
+  t == MYSQL_TYPE_TINY_BLOB || t == MYSQL_TYPE_MEDIUM_BLOB || t == MYSQL_TYPE_LONG_BLOB || t == MYSQL_TYPE_BLOB
+end
+
+# Fetch the result set of an executed prepared statement: store the
+# result, read the metadata (names + types), bind STRING/BLOB-typed
+# output cells, and fetch every row.
+def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
+  let store_rc = unsafe "FFI boundary" do mysql_stmt_store_result(stmt) end
+  if store_rc != 0 then
+    return Result::Err(DbError::QueryFailed(unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
+  end
+  let metadata = unsafe "FFI boundary" do mysql_stmt_result_metadata(stmt) end
+  if metadata.is_null() then
+    return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+  end
+  let num_fields = unsafe "FFI boundary" do mysql_num_fields(metadata) end as UInt
+  var columns = Vec::new()
+  var col_types = Vec::new()
+  for i in 0..num_fields do
+    let field = unsafe "FFI boundary" do mysql_fetch_field(metadata) end
+    if !field.is_null() then
+      columns.push(unsafe "FFI boundary" do cstring_to_string(field.name) end)
+      col_types.push(field.type_)
+    else
+      columns.push("column_" + i.to_string())
+      col_types.push(MYSQL_TYPE_STRING)
+    end
+  end
+  let n = num_fields as Int
+  var out_binds = Vec::with_capacity(n)
+  var out_buffers = Vec::with_capacity(n)
+  var out_buffer_ptrs = Vec::with_capacity(n)
+  var out_lengths = Vec::with_capacity(n)
+  var out_nulls = Vec::with_capacity(n)
+  for i in 0..num_fields do
+    out_lengths.push(0)
+    out_nulls.push(0)
+    let length_ptr = out_lengths.as_ptr().offset(i as Int) as Ptr[UInt]
+    let is_null_ptr = out_nulls.as_ptr().offset(i as Int) as Ptr[u8]
+    var buf = Vec::with_capacity(MYSQL_FETCH_BUFFER_SIZE as Int)
+    let is_blob = mysql_type_is_blob(col_types[i])
+    let ty = if is_blob then MYSQL_TYPE_BLOB else MYSQL_TYPE_STRING end
+    out_buffer_ptrs.push(buf.as_ptr())
+    out_binds.push(MysqlBind::new(length_ptr, is_null_ptr, buf.as_ptr(), MYSQL_FETCH_BUFFER_SIZE, ty, 0))
+    out_buffers.push(buf)
+  end
+  let bind_rc = unsafe "FFI boundary" do mysql_stmt_bind_result(stmt, out_binds.as_ptr()) end
+  if bind_rc != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+    unsafe "FFI boundary" do mysql_free_result(metadata) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  var data = Vec::new()
+  loop
+    let fetch_rc = unsafe "FFI boundary" do mysql_stmt_fetch(stmt) end
+    if fetch_rc == MYSQL_NO_DATA then
+      break
+    end
+    if fetch_rc != 0 then
+      let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+      unsafe "FFI boundary" do mysql_free_result(metadata) end
+      return Result::Err(DbError::QueryFailed(err))
+    end
+    var row_values = Vec::new()
+    for j in 0..num_fields do
+      if out_nulls[j] != 0 then
+        row_values.push(SqlValue::Null)
+      else
+        let len = out_lengths[j]
+        let buf_ptr = out_buffer_ptrs[j]
+        if mysql_type_is_blob(col_types[j]) then
+          var bytes = Vec::with_capacity(len)
+          for k in 0..len do
+            bytes.push(unsafe "FFI boundary" do *(buf_ptr.offset(k as Int)) end)
+          end
+          row_values.push(SqlValue::Blob(bytes))
+        else
+          let s = unsafe "FFI boundary" do string_from_ptr(buf_ptr, len) end
+          row_values.push(SqlValue::Text(s))
+        end
+      end
+    end
+    data.push(row_values)
+  end
+  unsafe "FFI boundary" do mysql_free_result(metadata) end
+  Result::Ok(Rows::new(columns, data))
+end
+
+# The parameterized connection-level execute: a fresh prepared statement,
+# the real MYSQL_BIND binding, execute, and the deterministic close.
+def mysql_prepared_execute(conn: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  let stmt = unsafe "FFI boundary" do mysql_stmt_init(conn) end
+  if stmt.is_null() then
+    return Result::Err(DbError::Internal("mysql_stmt_init failed".to_string()))
+  end
+  let prep_rc = unsafe "FFI boundary" do mysql_stmt_prepare(stmt, sql.to_cstring().as_ptr(), sql.len() as UInt) end
+  if prep_rc != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+    unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  let res = mysql_stmt_bind_and_execute(stmt, params)
+  if let Result::Err(e) = res then
+    unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+    return Result::Err(e)
+  end
+  let affected = unsafe "FFI boundary" do mysql_stmt_affected_rows(stmt) end
+  unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+  Result::Ok(affected as UInt)
+end
+
+# The parameterized connection-level query: a fresh prepared statement,
+# the real MYSQL_BIND binding, execute, fetch, and the deterministic
+# close.
+def mysql_prepared_query(conn: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  let stmt = unsafe "FFI boundary" do mysql_stmt_init(conn) end
+  if stmt.is_null() then
+    return Result::Err(DbError::Internal("mysql_stmt_init failed".to_string()))
+  end
+  let prep_rc = unsafe "FFI boundary" do mysql_stmt_prepare(stmt, sql.to_cstring().as_ptr(), sql.len() as UInt) end
+  if prep_rc != 0 then
+    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+    unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+    return Result::Err(DbError::QueryFailed(err))
+  end
+  let res = mysql_stmt_bind_and_execute(stmt, params)
+  if let Result::Err(e) = res then
+    unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+    return Result::Err(e)
+  end
+  let rows = mysql_prepared_fetch_rows(stmt)
+  unsafe "FFI boundary" do mysql_stmt_close(stmt) end
+  rows
+end
+
 def mysql_stmt_run(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
-  let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt.handle) end
-  if ret != 0 then
-    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt.handle)) end
-    return Result::Err(DbError::QueryFailed(err))
+  let res = mysql_stmt_bind_and_execute(stmt.handle, params)
+  if let Result::Err(e) = res then
+    return Result::Err(e)
   end
   let affected = unsafe "FFI boundary" do mysql_stmt_affected_rows(stmt.handle) end
   Result::Ok(affected as UInt)
@@ -2099,12 +2638,11 @@ def mysql_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[R
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
-  let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt.handle) end
-  if ret != 0 then
-    let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt.handle)) end
-    return Result::Err(DbError::QueryFailed(err))
+  let res = mysql_stmt_bind_and_execute(stmt.handle, params)
+  if let Result::Err(e) = res then
+    return Result::Err(e)
   end
-  Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
+  mysql_prepared_fetch_rows(stmt.handle)
 end
 
 def mysql_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
@@ -2113,44 +2651,6 @@ def mysql_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
     stmt.handle = null_ptr()
   end
   Result::Ok(())
-end
-
-def mysql_interpolate(sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
-  var result = String::new()
-  var param_idx = 0
-  for ch in sql.chars() do
-    if ch == '?' then
-      if param_idx >= params.len() then
-        return Result::Err(DbError::BindError(param_idx as UInt, "too few parameters".to_string()))
-      end
-      let val = params[param_idx].to_sql_param()
-      result.push_str(&sql_value_to_mysql_literal(&val))
-      param_idx = param_idx + 1
-    else
-      result.push(ch)
-    end
-  end
-  Result::Ok(result)
-end
-
-def mysql_interpolate_params(inout conn: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
-  mysql_interpolate(sql, params)
-end
-
-def mysql_interpolate_params_ref(conn: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[String, DbError]
-  mysql_interpolate(sql, params)
-end
-
-def sql_value_to_mysql_literal(val: SqlValue) -> String
-  match val
-  when SqlValue::Null then "NULL".to_string()
-  when SqlValue::Integer(i) then i.to_string()
-  when SqlValue::Float(f) then f.to_string()
-  when SqlValue::Text(s) then "'" + s.replace("'", "\\'") + "'"
-  when SqlValue::Bool(b) then if b then "1" else "0" end.to_string()
-  when SqlValue::Blob(_) then "X''".to_string()  ## Simplified
-  when SqlValue::Timestamp(t) then t.to_string()
-  end
 end
 
 def cstring_to_string(ptr: Ptr[u8]) -> String

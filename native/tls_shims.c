@@ -7,6 +7,25 @@
  * tls_load_file; this file implements every one of them as a small,
  * deterministic wrapper over the system OpenSSL (libssl + libcrypto).
  *
+ * The ssl-side family covers the full connection setup: the TLS version
+ * selection (SSL_set_min/max_proto_version), the trust roots
+ * (SSL_CTX_set_default_verify_paths + per-cert X509_STORE_add_cert — the
+ * in-memory equivalent of SSL_CTX_load_verify_locations for the config's
+ * ca_certs), the client ALPN offer (SSL_set_alpn_protos), the server
+ * ALPN selection (SSL_select_next_proto in the select callback — the
+ * selection is copied into the handle's stable buffer because the
+ * negotiated pointer from SSL_select_next_proto points into the client's
+ * message memory), the negotiated-protocol readout
+ * (SSL_get0_alpn_selected), and the cipher restrictions
+ * (SSL_set_cipher_list for TLS <= 1.2 and SSL_set_ciphersuites for
+ * TLS 1.3). The version/cipher/ALPN-offer calls are the SSL-LEVEL forms
+ * on purpose: the handle creates the SSL inside tls_ssl_new, and the
+ * CTX-level equivalents are copied into the SSL at SSL_new, so a
+ * CTX-level change after creation would not reach the handshake. The
+ * trust-store calls stay CTX-level (the SSL's verification reads the
+ * CTX's store live). Session resumption is NOT implemented (the module
+ * header no longer claims it).
+ *
  * Ownership contract (mirrors std/tls.tg):
  *   - tls_x509_from_pem / tls_pkey_from_pem return a FRESH native handle
  *     (refcount 1) owned by the Tangerine Certificate / PrivateKey wrapper;
@@ -49,6 +68,9 @@
 typedef struct tg_ssl_handle {
   SSL_CTX *ctx;
   SSL     *ssl;
+  unsigned char *alpn_protos;  /* server-side ALPN list (owned copy, wire format) */
+  size_t  alpn_len;
+  unsigned char alpn_selected[64];  /* stable copy of the negotiated protocol (length-prefixed) */
 } tg_ssl_handle;
 
 /* tls_ssl_new() -> SslPtr */
@@ -68,21 +90,146 @@ void tls_ssl_free(void *ssl_handle) {
   tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
   if (hs->ssl != NULL) SSL_free(hs->ssl);
   if (hs->ctx != NULL) SSL_CTX_free(hs->ctx);
+  if (hs->alpn_protos != NULL) free(hs->alpn_protos);
   free(hs);
 }
 
-/* tls_ssl_set_min_version(ssl: SslPtr, version: u16) -> Unit */
+/* tls_ssl_set_min_version(ssl: SslPtr, version: u16) -> Unit
+ * The version floor. The SSL-LEVEL call (NOT SSL_CTX_set_min_proto_
+ * version): the handle creates the SSL inside tls_ssl_new, and the CTX
+ * limits are copied into the SSL at SSL_new — setting them on the CTX
+ * afterwards would be too late for the handshake. */
 void tls_ssl_set_min_version(void *ssl_handle, uint16_t version) {
   tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
   if (hs == NULL || hs->ssl == NULL) return;
   SSL_set_min_proto_version(hs->ssl, (int)version);
 }
 
-/* tls_ssl_set_max_version(ssl: SslPtr, version: u16) -> Unit */
+/* tls_ssl_set_max_version(ssl: SslPtr, version: u16) -> Unit
+ * The version ceiling — same SSL-level rationale as set_min_version. */
 void tls_ssl_set_max_version(void *ssl_handle, uint16_t version) {
   tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
   if (hs == NULL || hs->ssl == NULL) return;
   SSL_set_max_proto_version(hs->ssl, (int)version);
+}
+
+/* tls_ssl_set_default_verify_paths(ssl: SslPtr) -> Unit
+ * The trust-root loading: SSL_CTX_set_default_verify_paths installs the
+ * platform default CA store (/etc/ssl/cert.pem & co.), so verify_peer
+ * works against the public trust roots the shim previously ignored. */
+void tls_ssl_set_default_verify_paths(void *ssl_handle) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ctx == NULL) return;
+  SSL_CTX_set_default_verify_paths(hs->ctx);
+}
+
+/* tls_ssl_add_ca_cert(ssl: SslPtr, cert: X509Ptr) -> Unit
+ * The config's CA certificates: adds the parsed X509 to the CTX trust
+ * store — the in-memory equivalent of SSL_CTX_load_verify_locations
+ * (which requires a FILE PATH; the Tangerine side already holds the
+ * parsed handles). X509_STORE_add_cert takes its own duplicate, so the
+ * Tangerine Certificate wrapper's later free is safe. */
+void tls_ssl_add_ca_cert(void *ssl_handle, void *cert) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ctx == NULL || cert == NULL) return;
+  X509_STORE_add_cert(SSL_CTX_get_cert_store(hs->ctx), (X509 *)cert);
+}
+
+/* tls_ssl_set_alpn_protos(ssl: SslPtr, protos: Ptr[u8], len: usize) -> i32
+ * Client-side ALPN offer in wire format (length-prefixed protocols).
+ * The SSL-level call (NOT SSL_CTX_set_alpn_protos): the handle creates
+ * the SSL inside tls_ssl_new, and the CTX-level list is copied into the
+ * SSL at SSL_new — setting it on the CTX afterwards would be too late
+ * for the ClientHello. SSL_set_alpn_protos copies the list.
+ * 0 on success, -1 on error. */
+int tls_ssl_set_alpn_protos(void *ssl_handle, const unsigned char *protos, size_t len) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ssl == NULL) return -1;
+  if (len > INT_MAX) return -1;
+  return SSL_set_alpn_protos(hs->ssl, protos, (unsigned int)len);
+}
+
+/* Server-side ALPN selection: SSL_select_next_proto picks the first
+ * server protocol the client also offered. SSL_select_next_proto's *out
+ * points INTO THE CLIENT'S MESSAGE buffer, which OpenSSL frees before
+ * the ServerHello is written — the selection is copied into the
+ * handle's stable buffer, and *out is redirected to that copy. */
+static int tg_alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                             const unsigned char *in, unsigned int inlen, void *arg) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)arg;
+  (void)ssl;
+  if (hs == NULL || hs->alpn_protos == NULL || hs->alpn_len == 0) {
+    return SSL_TLSEXT_ERR_NOACK;
+  }
+  if (SSL_select_next_proto((unsigned char **)out, outlen, hs->alpn_protos,
+                            (unsigned int)hs->alpn_len, in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+    if (*outlen > sizeof(hs->alpn_selected) - 1) {
+      return SSL_TLSEXT_ERR_NOACK;
+    }
+    hs->alpn_selected[0] = *outlen;
+    memcpy(hs->alpn_selected + 1, *out, *outlen);
+    *out = hs->alpn_selected + 1;
+    return SSL_TLSEXT_ERR_OK;
+  }
+  return SSL_TLSEXT_ERR_NOACK;
+}
+
+/* tls_ssl_set_alpn_select(ssl: SslPtr, protos: Ptr[u8], len: usize) -> i32
+ * Server-side ALPN: registers the select callback over an OWNED COPY of
+ * the server's protocol list (the caller's buffer must not outlive the
+ * call). 0 on success, -1 on error. */
+int tls_ssl_set_alpn_select(void *ssl_handle, const unsigned char *protos, size_t len) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ctx == NULL) return -1;
+  unsigned char *copy = NULL;
+  if (len > 0) {
+    copy = (unsigned char *)malloc(len);
+    if (copy == NULL) return -1;
+    memcpy(copy, protos, len);
+  }
+  if (hs->alpn_protos != NULL) free(hs->alpn_protos);
+  hs->alpn_protos = copy;
+  hs->alpn_len = len;
+  SSL_CTX_set_alpn_select_cb(hs->ctx, tg_alpn_select_cb, hs);
+  return 0;
+}
+
+/* tls_ssl_get_alpn(ssl: SslPtr, buf: PtrMut[u8], max_len: usize) -> i32
+ * The NEGOTIATED ALPN protocol (raw bytes, no length prefix) into the
+ * caller's buffer; returns the byte count, 0 when no protocol was
+ * negotiated, -1 when the result does not fit. */
+int tls_ssl_get_alpn(void *ssl_handle, unsigned char *buf, size_t max_len) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ssl == NULL || buf == NULL) return 0;
+  const unsigned char *proto = NULL;
+  unsigned int len = 0;
+  SSL_get0_alpn_selected(hs->ssl, &proto, &len);
+  if (proto == NULL || len == 0) return 0;
+  if ((size_t)len > max_len) return -1;
+  memcpy(buf, proto, (size_t)len);
+  return (int)len;
+}
+
+/* tls_ssl_set_cipher_list(ssl: SslPtr, ciphers: Ptr[u8]) -> i32
+ * TLS 1.2 (and below) cipher restriction with the OpenSSL cipher names
+ * (colon-separated). The SSL-LEVEL call (NOT SSL_CTX_set_cipher_list):
+ * the SSL inherits the CTX's cipher list at SSL_new, so a CTX-level
+ * change after the handle was created is not applied to the handshake.
+ * 1 on success (the OpenSSL convention), 0 on failure. */
+int tls_ssl_set_cipher_list(void *ssl_handle, const unsigned char *ciphers) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ssl == NULL || ciphers == NULL) return 0;
+  return SSL_set_cipher_list(hs->ssl, (const char *)ciphers);
+}
+
+/* tls_ssl_set_cipher_suites(ssl: SslPtr, ciphers: Ptr[u8]) -> i32
+ * TLS 1.3 cipher restriction with the IANA suite names (colon-separated)
+ * — SSL-level for the same reason as set_cipher_list. 1 on success, 0 on
+ * failure. */
+int tls_ssl_set_cipher_suites(void *ssl_handle, const unsigned char *ciphers) {
+  tg_ssl_handle *hs = (tg_ssl_handle *)ssl_handle;
+  if (hs == NULL || hs->ssl == NULL || ciphers == NULL) return 0;
+  return SSL_set_ciphersuites(hs->ssl, (const char *)ciphers);
 }
 
 /* tls_ssl_set_hostname(ssl: SslPtr, hostname: Ptr[u8]) -> Unit */

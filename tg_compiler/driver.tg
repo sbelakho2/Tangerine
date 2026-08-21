@@ -754,16 +754,19 @@ end
 
 def cmd_test(argv: Vec[String]) -> Int
   # Discover test sources: from project or CLI args. Explicitly named FILES
-  # are verified strictly; project discovery and directory scans are implicit
-  # (skip-tolerant).
+  # are verified strictly; project discovery and directory scans select only
+  # RECOGNIZED test sources (the files carrying the @test test-attribute
+  # marker) and run them under the same strict discipline — a recognized
+  # test source's read/parse/compile failure fails the invocation; non-test
+  # sources are never selected.
   var explicit_files: Vec[String] = Vec::new()
   var implicit_files: Vec[String] = Vec::new()
 
   match parse_args(argv)
   when Result::Ok(o) then
     if o.input_files.is_empty() then
-      # Implicit discovery (project sources or directory scan): broken files
-      # are skipped and testless files contribute nothing.
+      # Implicit discovery (project sources or directory scan): narrowed to
+      # RECOGNIZED test sources below; non-test sources are never selected.
       match load_project(".")
       when Result::Ok(project) then
         let srcs = clone_vec_strings(&project.sources)
@@ -801,10 +804,17 @@ def cmd_test(argv: Vec[String]) -> Int
     end
   end
 
+  # Implicit discovery selects only RECOGNIZED test sources: the files
+  # carrying the @test test-attribute marker (the recognized set). Non-test
+  # sources are never selected; a selected source is a recognized test
+  # source and its read/parse/compile failure fails the invocation (no
+  # silent vanish).
+  implicit_files = select_test_sources(implicit_files)
+
   let opts = default_options()
 
   var summary = run_test_files(&opts, explicit_files, true)
-  let scan_summary = run_test_files(&opts, implicit_files, false)
+  let scan_summary = run_test_files(&opts, implicit_files, true)
   summary.total = summary.total + scan_summary.total
   summary.passed = summary.passed + scan_summary.passed
   summary.failed = summary.failed + scan_summary.failed
@@ -848,9 +858,12 @@ end
 #              skipped); a file with zero @test functions FAILS it with the
 #              "no tests found in <file>" diagnostic. Only a file whose tests
 #              all pass succeeds.
-#   implicit — discovered suites (directory scans, project sources): broken
-#              files are skipped and testless files contribute nothing
-#              (the historical skip-tolerant behavior).
+#   implicit — discovered suites (directory scans, project sources): the
+#              batch has already been narrowed to RECOGNIZED test sources
+#              (select_test_sources — the files carrying the @test marker),
+#              so the strict discipline applies: a recognized test source's
+#              read/parse/compile failure fails the invocation; non-test
+#              sources are never selected.
 def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> TestRunSummary
   var total = 0
   var passed = 0
@@ -1332,66 +1345,98 @@ use std::bench::{BenchSuite, bench_suite_new, run_benchmarks, parse_bench_args}
 
 def cmd_bench(argv: Vec[String]) -> Int
   # Discover benchmark sources: from CLI args or project.
-  let bench_files = if argv.len() > 1 && !argv[1].starts_with("-") then
-    var files = Vec::new()
+  var bench_files: Vec[String] = Vec::new()
+  if argv.len() > 1 && !argv[1].starts_with("-") then
     var i: UInt = 1
     while i < argv.len() do
       if !argv[i].starts_with("-") then
-        files.push(argv[i].clone())
+        bench_files.push(argv[i].clone())
       end
       i = i + 1
     end
-    files
   else
     match load_project(".")
-    when Result::Ok(project) then clone_vec_strings(&project.sources)
-    when Result::Err(_) then find_bench_files(".")
+    when Result::Ok(project) then
+      let srcs = clone_vec_strings(&project.sources)
+      for s in srcs do bench_files.push(s) end
+    when Result::Err(_) then
+      let found = find_bench_files(".")
+      for f in found do bench_files.push(f) end
     end
   end
 
   if bench_files.is_empty() then
     println("No benchmark files found.")
-    return 0
+    eprintln("error: no benchmarks found")
+    return 1
   end
 
   let opts = default_options()
   var total = 0
   var ok_count = 0
+  var failed = 0
 
   for file in bench_files do
     let source = match read_file(file.clone())
     when Result::Ok(content) then content
-    when Result::Err(_) then next
+    when Result::Err(_) then
+      eprintln("error: failed to read benchmark file: " + file)
+      println("  FAIL  " + file + ": failed to read file")
+      failed = failed + 1
+      next
     end
     let lex_result = tokenize(source, file.clone())
     let parse_out = parse(lex_result)
     let ast = parse_out.program
     let parse_diags = parse_out.diagnostics
-    if diag_has_errors(&parse_diags) then next end
+    if diag_has_errors(&parse_diags) then
+      # Emit the parse diagnostics and count the file as failed: a benchmark
+      # source that cannot be parsed is never skipped.
+      for d in parse_diags do
+        let dmsg = d.message
+        match d.code
+        when Option::Some(c) then eprintln(file + ": error[" + c + "]: " + dmsg)
+        when Option::None then eprintln(file + ": error: " + dmsg)
+        end
+      end
+      println("  FAIL  " + file + ": parse errors (see diagnostics)")
+      failed = failed + 1
+      next
+    end
 
     let cases = extract_bench_functions(&ast, file.clone())
+    if cases.is_empty() then
+      println("  FAIL  " + file + ": no @bench functions found (verify with `tg check` instead)")
+      eprintln("error: no benchmarks found in " + file)
+      failed = failed + 1
+      next
+    end
+
     for bench in cases do
       total = total + 1
       # Compile the file to get a runnable binary, then invoke the bench by name.
       match compile_file(&opts, file.clone())
-      when Result::Ok(output_path) then
-        let cmd = output_path + " --run-bench " + bench.name.clone()
+      when Result::Ok(_) then
+        let exe_path = get_output_path(&opts, file.clone(), "")
+        let cmd = exe_path + " --run-bench " + bench.name.clone()
         let exit_code = bootstrap_call_system(cmd)
         if exit_code == 0 then
           ok_count = ok_count + 1
           println("  bench " + bench.name + " ... ok")
         else
           println("  bench " + bench.name + " ... FAILED (exit " + exit_code.to_string() + ")")
+          failed = failed + 1
         end
       when Result::Err(e) then
         println("  bench " + bench.name + " ... COMPILE ERROR: " + e)
+        failed = failed + 1
       end
     end
   end
 
   println("")
   println("bench result: " + ok_count.to_string() + "/" + total.to_string() + " ok")
-  if ok_count < total then 1 else 0 end
+  if failed > 0 then 1 else 0 end
 end
 
 def find_bench_files(dir: String) -> Vec[String]
@@ -1410,7 +1455,7 @@ def find_bench_files(dir: String) -> Vec[String]
     elsif entry.name.ends_with(".tg") then
       match read_file(entry.path.clone())
       when Result::Ok(content) then
-        if content.contains("#[bench]") then
+        if is_bench_source(content) then
           files.push(entry.path.clone())
         end
       when Result::Err(_) then ()
@@ -1736,6 +1781,56 @@ def find_tg_files(dir: String) -> Vec[String]
   end
   
   files
+end
+
+# Implicit-discovery selection: only RECOGNIZED test sources are selected —
+# the files carrying the @test test-attribute marker (the recognized set).
+# Non-test sources are never selected; a selected source is a recognized
+# test source and runs under the strict discipline, so its read/parse/
+# compile failure fails the invocation (no silent vanish).
+def select_test_sources(files: Vec[String]) -> Vec[String]
+  var selected = Vec::new()
+  for file in files do
+    match read_file(file.clone())
+    when Result::Ok(content) then
+      if is_test_source(content) then
+        selected.push(file.clone())
+      end
+    when Result::Err(_) then ()
+    end
+  end
+  selected
+end
+
+# A RECOGNIZED test source carries the @test test-attribute marker in the
+# attribute position: at the start of a line (after indentation). The marker
+# is never matched inside comments or string literals, so the compiler's own
+# sources (whose code and docs mention `@test`) cannot self-select.
+def is_test_source(content: String) -> Bool
+  if content.starts_with("@test") then
+    return true
+  end
+  for line in content.lines() do
+    if line.trim().starts_with("@test") then
+      return true
+    end
+  end
+  false
+end
+
+# The bench counterpart of is_test_source: a recognized benchmark source
+# carries the @bench attribute marker in the attribute position (line
+# start). Discovered-only: files named *_bench.tg / bench_* need no marker.
+def is_bench_source(content: String) -> Bool
+  if content.starts_with("@bench") then
+    return true
+  end
+  for line in content.lines() do
+    if line.trim().starts_with("@bench") then
+      return true
+    end
+  end
+  false
 end
 
 

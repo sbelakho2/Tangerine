@@ -124,21 +124,28 @@ enum Type
   FixedArray(Type, Int)
   
  # (FnPtr/Closure split): a FUNCTION POINTER — the signature (the
-  # parameter list with access conventions, the return type) and NO
-  # environment. Layout: a single code pointer (fn_ptr_size). Bit-copyable,
-  # Transferable/Shareable per the decided pointer policy.
-  FnPtr(Vec[ParamType], Type)
+  # parameter list with access conventions, the return type), the
+  # EFFECT SET (Vec[EffectId]) and NO environment. Layout: a single code
+  # pointer (fn_ptr_size). Bit-copyable, Transferable/Shareable per the
+  # decided pointer policy. The effect set is the callable's declared/
+  # computed effects — the checker's indirect-call recording reads it from
+  # the callee's TYPE (a closure value, a function-pointer field, a
+  # computed callee) so an indirect call is never effect-unknown/effect-
+  # free; the direct-call seeds flow into the fn-item values at pass 3.
+  FnPtr(Vec[ParamType], Type, Vec[EffectId])
 
  # (FnPtr/Closure split): a CLOSURE VALUE — the closure's identity
-  # (ClosureId), its signature (params + return), and the CAPTURE TUPLE
-  # type (Type::Tuple of the captured locals' types, in local-id order).
-  # The closure object's layout/ABI derives from the captures (the
-  # aggregate of the capture tuple plus the code pointer); the closure's
+  # (ClosureId), its signature (params + return), the CAPTURE TUPLE
+  # type (Type::Tuple of the captured locals' types, in local-id order)
+  # and the EFFECT SET (Vec[EffectId] — the closure body's effectful
+  # calls, accumulated at the closure's type-construction site). The
+  # closure object's layout/ABI derives from the captures (the aggregate
+  # of the capture tuple plus the code pointer); the closure's
   # TypeProperties (owns_state / requires_drop_glue / linearity) derive
   # from the capture tuple — a closure capturing an owning value owns it.
   # The closure dispatch through the MIR closure aggregate keys on this
   # form (the checker types closure EXPRESSIONS as this variant).
-  Closure(ClosureId, Vec[ParamType], Type, Type)
+  Closure(ClosureId, Vec[ParamType], Type, Type, Vec[EffectId])
   
   # Internal reference (MIR-only: parameter re-wrap and MirRef typing)
   RefInternal(Type, Bool)
@@ -382,22 +389,53 @@ def fn_effect_def_key(env: TypeEnv, did: DefId) -> String
   fn_owner_key("def::" + did.module.id.to_string(), did.index, kind)
 end
 
+# The MODULE-QUALIFIED identity of a declaration ("std::io::println",
+# "std::fs::open", "std::core::panic" — the module path joined with the
+# name; a root-module declaration is the bare name). This is the SEED
+# identity the std effectful-function table keys on — the semantic
+# identity (the module path + the name the resolver would resolve), never
+# the bare name: a user function named `print` in a user module is never
+# seeded, and two same-named std functions in different std modules
+# (std::io::read vs std::fs::read) seed differently.
+def module_qualified_effect_name(module_path: Vec[String], name: String) -> String
+  if module_path.len() > 0 then
+    module_path.join("::") + "::" + name
+  else
+    name
+  end
+end
+
 # The declared-effect seeding table for the KNOWN effectful standard
 # functions — the std's declared effects, the seeds the transitive
-# checking propagates. The std library's effectful operations (the
-# io/print/read/write/panic/await-effectful families) declare their
-# effects HERE — the source-text analyzer in std::effects is tooling; the
-# semantic seeds live in the checker (the fixed-id builtin band from
-# ids.tg: Io / File / Async). Gated to the std module by the caller
-# (declared_effects_of — a user function named `print` is never seeded).
-def std_effectful_fn_seed(reg: EffectRegistry, name: String) -> Vec[EffectId]
+# checking propagates. The std library's effectful operations declare
+# their effects HERE — the source-text analyzer in std::effects is
+# tooling; the semantic seeds live in the checker (the fixed-id builtin
+# band from ids.tg: Io / File / Async). The key is the MODULE-QUALIFIED
+# identity (module_qualified_effect_name — the module path + the name),
+# not the bare name, so the seed fires only for the exact std identity:
+#   Io   (EFFECT_IO):   std::io::print / println / eprint / eprintln /
+#                       read_line / read; std::core::panic
+#   File (EFFECT_FILE): std::fs::open / read / write / write_all
+#   Async(EFFECT_ASYNC):std::async::spawn / sleep; std::exec::spawn / sleep
+# The panic category: the current effect universe (the builtin band
+# Io/Network/File/Async/Timer) has NO Exception effect, so the pragmatic
+# choice keeps panic under Io (a program that can panic is not pure) —
+# the semantic IDENTITY fix (the qualified key) is the core of this
+# change; the category follows the language's declared effect universe.
+# Gated to the std module by the caller (declared_effects_of — a user
+# function named `print` is never seeded).
+def std_effectful_fn_seed(reg: EffectRegistry, qualified_name: String) -> Vec[EffectId]
   var out = Vec::new()
-  if name == "print" || name == "println" || name == "eprint" || name == "eprintln" ||
-     name == "read_line" || name == "read" || name == "panic" then
+  if qualified_name == "std::io::print" || qualified_name == "std::io::println" ||
+     qualified_name == "std::io::eprint" || qualified_name == "std::io::eprintln" ||
+     qualified_name == "std::io::read_line" || qualified_name == "std::io::read" ||
+     qualified_name == "std::core::panic" then
     out.push(EffectId { id: EFFECT_IO })
-  elsif name == "write" || name == "write_all" || name == "open" then
+  elsif qualified_name == "std::fs::write" || qualified_name == "std::fs::write_all" ||
+        qualified_name == "std::fs::open" || qualified_name == "std::fs::read" then
     out.push(EffectId { id: EFFECT_FILE })
-  elsif name == "spawn" || name == "sleep" || name == "await" then
+  elsif qualified_name == "std::async::spawn" || qualified_name == "std::async::sleep" ||
+        qualified_name == "std::exec::spawn" || qualified_name == "std::exec::sleep" then
     out.push(EffectId { id: EFFECT_ASYNC })
   end
   out
@@ -409,9 +447,12 @@ end
 # distinct EffectIds), falling back to the std effectful-function seeds
 # when the declaration carries no annotation (the io/print/read/write/
 # panic/await-effectful std functions — the transitive checking's seeds).
+# The seed fallback keys on the declaration's MODULE-QUALIFIED identity
+# (the module path + the name — the semantic DefId-adjacent identity the
+# resolver's qualified names render), never the bare name.
 # inout: the interning persists into the caller's registry (the interned
 # id is the canonical identity).
-def declared_effects_of(inout env: TypeEnv, f_effects: Vec[String], f_name: String) -> Vec[EffectId]
+def declared_effects_of(inout env: TypeEnv, f_effects: Vec[String], qualified_name: String) -> Vec[EffectId]
   var out = Vec::new()
   if f_effects.len() > 0 then
     for e_name in f_effects do
@@ -420,7 +461,7 @@ def declared_effects_of(inout env: TypeEnv, f_effects: Vec[String], f_name: Stri
   else
     let in_std = env.current_module_path.len() > 0 && env.current_module_path[0] == "std"
     if in_std then
-      out = std_effectful_fn_seed(&env.effects, &f_name)
+      out = std_effectful_fn_seed(&env.effects, &qualified_name)
     end
   end
   out
@@ -1539,6 +1580,21 @@ struct TypeEnv
   # the call-recording sites accumulate into its computed set. "" outside
   # any function body (const/static initializers record no edges).
   current_fn_key: String = ""
+ # the closure node whose body is being checked — the call-recording
+  # sites ALSO accumulate into the closure's own computed effect set
+  # (closure_computed_effects), the effect set the closure TYPE carries
+  # (Type::Closure's 5th payload): an indirect call through a closure
+  # value records the closure body's effects at the call site. 0 outside
+  # a closure body; nested closures save/restore it (the innermost
+  # closure's body records into its own set).
+  current_closure_node: Int = 0
+ # closure expression node id -> the closure body's computed effect set
+  # (the union of the effectful direct calls its body performs — the
+  # same callee-declared effects record_effect_call accumulates into the
+  # enclosing function, recorded per closure at the same site). Read at
+  # the closure's type-construction site (the ExprClosure arm) to seed
+  # the Type::Closure effect payload.
+  closure_computed_effects: Map[Int, Vec[EffectId]] = Map::new()
  # module-qualified key ("path::name" — module_qualified_key) -> the
   # checker's resolved declared type of a static / const / extern-static
   # declaration. Recorded in pass 3 (the same registration pass that binds
@@ -2721,7 +2777,7 @@ def closure_call_shape(env: TypeEnv, callee: Expr, args: Vec[Expr], receiver_nod
   match env.typed_expr_types.get(callee.node_id)
   when Option::Some(callee_ty) then
     match callee_ty
-    when Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then typed_closure_call_for(env, args, receiver_node)
+    when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then typed_closure_call_for(env, args, receiver_node)
     when _ then Option::None
     end
   when Option::None then Option::None
@@ -4085,9 +4141,9 @@ pub def type_kinds_contain_resource(kinds: Map[Int, TypeKind], ty: Type) -> Bool
   when Type::Tuple(fields) then
     type_fields_contain_resource(kinds, &fields)
   when Type::FixedArray(elem, _) then type_kinds_contain_resource(kinds, &elem)
-  when Type::FnPtr(_, _) then false
+  when Type::FnPtr(_, _, _) then false
  # a closure's kind containment derives from its capture tuple.
-  when Type::Closure(_, _, _, captures) then type_kinds_contain_resource(kinds, &captures)
+  when Type::Closure(_, _, _, captures, _) then type_kinds_contain_resource(kinds, &captures)
   when Type::RefInternal(inner, _) then type_kinds_contain_resource(kinds, &inner)
   when _ then false
   end
@@ -5042,7 +5098,7 @@ pub def subst_type_args(ty: Type, generic_params: Vec[GenericParamId], type_args
     end
     Type::Tuple(new_fields)
   when Type::FixedArray(elem, n) then Type::FixedArray(subst_type_args(&elem, generic_params, type_args), n)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -5050,8 +5106,8 @@ pub def subst_type_args(ty: Type, generic_params: Vec[GenericParamId], type_args
       new_params.push(ParamType { ty: subst_type_args(&pt.ty, generic_params, type_args), convention: pt.convention })
       i = i + 1
     end
-    Type::FnPtr(new_params, subst_type_args(ret, generic_params, type_args))
-  when Type::Closure(cid, params, ret, captures) then
+    Type::FnPtr(new_params, subst_type_args(ret, generic_params, type_args), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -5059,7 +5115,7 @@ pub def subst_type_args(ty: Type, generic_params: Vec[GenericParamId], type_args
       new_params.push(ParamType { ty: subst_type_args(&pt.ty, generic_params, type_args), convention: pt.convention })
       i = i + 1
     end
-    Type::Closure(cid.clone(), new_params, subst_type_args(ret, generic_params, type_args), subst_type_args(&captures, generic_params, type_args))
+    Type::Closure(cid.clone(), new_params, subst_type_args(ret, generic_params, type_args), subst_type_args(&captures, generic_params, type_args), effects.clone())
   when Type::Effect(effects, inner) then
  # (defect fix): the substitution PRESERVES the effect set — the
     # effects pass through unchanged (a substituted effect[Io] Wrapper[T]
@@ -5089,7 +5145,7 @@ def resolve_type_var(env: TypeEnv, ty: Type) -> Type
       resolved_fields.push(resolve_type_var(env, f))
     end
     Type::Tuple(resolved_fields)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -5097,8 +5153,8 @@ def resolve_type_var(env: TypeEnv, ty: Type) -> Type
       new_params.push(ParamType { ty: resolve_type_var(env, pt.ty), convention: pt.convention })
       i = i + 1
     end
-    Type::FnPtr(new_params, resolve_type_var(env, ret))
-  when Type::Closure(cid, params, ret, captures) then
+    Type::FnPtr(new_params, resolve_type_var(env, ret), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -5106,7 +5162,7 @@ def resolve_type_var(env: TypeEnv, ty: Type) -> Type
       new_params.push(ParamType { ty: resolve_type_var(env, pt.ty), convention: pt.convention })
       i = i + 1
     end
-    Type::Closure(cid.clone(), new_params, resolve_type_var(env, ret), resolve_type_var(env, captures))
+    Type::Closure(cid.clone(), new_params, resolve_type_var(env, ret), resolve_type_var(env, captures), effects.clone())
   when Type::Adt(tid, args) then
  # the by-value array iterator is Copy-only and explicitly unsafe;
     # the projected for-loop is the primary collection iteration. Resolve
@@ -5182,8 +5238,8 @@ def type_tag(env: TypeEnv, t: Type) -> String
     else "Named#" + id.id.to_string()
     end
   when Type::FixedArray(elem, n) then "FixedArray[" + type_tag(env, &elem) + ";" + n.to_string() + "]"
-  when Type::FnPtr(_, _) then "FnPtr"
-  when Type::Closure(_, _, _, _) then "Closure"
+  when Type::FnPtr(_, _, _) then "FnPtr"
+  when Type::Closure(_, _, _, _, _) then "Closure"
   when Type::RefInternal(_, _) then "RefInternal"
   when Type::Ptr(_) then "Ptr"
   when Type::PtrMut(_) then "PtrMut"
@@ -5376,11 +5432,11 @@ def unify_named_fn_callable(inout env: TypeEnv, id1: TypeId, args1: Vec[Type], p
         end
       end
     else
-      type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()))), span)
+      type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())), span)
       false
     end
   when Option::None then
-    type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()))), span)
+    type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())), span)
     false
   end
 end
@@ -5738,20 +5794,20 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
           end
         # Handle Named(tid, args) unified with a callable type.
-        when Type::FnPtr(params2, ret2) then
+        when Type::FnPtr(params2, ret2, _) then
           unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
-        when Type::Closure(_, params2, ret2, _) then
+        when Type::Closure(_, params2, ret2, _, _) then
           unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
         when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
         end
-      when Type::FnPtr(params1, ret1) then
+      when Type::FnPtr(params1, ret1, _) then
  # (FnPtr/Closure split): a function POINTER unifies with the
         # callable signatures (a fn pointer, a closure value, or the
         # Function form) through the shared signature comparison.
         match b
-        when Type::FnPtr(params2, ret2) then
+        when Type::FnPtr(params2, ret2, _) then
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
-        when Type::Closure(_, params2, ret2, _) then
+        when Type::Closure(_, params2, ret2, _, _) then
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
         when Type::Error then true
         when Type::Param(_) then
@@ -5759,14 +5815,14 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           false
         when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
         end
-      when Type::Closure(_, params1, ret1, _) then
+      when Type::Closure(_, params1, ret1, _, _) then
  # a closure VALUE unifies with the callable signatures through
         # the shared signature comparison (the closure's capture type does
         # not participate in signature unification).
         match b
-        when Type::FnPtr(params2, ret2) then
+        when Type::FnPtr(params2, ret2, _) then
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
-        when Type::Closure(_, params2, ret2, _) then
+        when Type::Closure(_, params2, ret2, _, _) then
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
         when Type::Error then true
         when Type::Param(_) then
@@ -5961,7 +6017,7 @@ def occurs_check_with_depth(inout env: TypeEnv, id: TypeVarId, ty: Type, depth: 
       end
     end
     found
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var found = false
     for p in params do
       if occurs_check_with_depth(env, id, p.ty, depth + 1, span.clone()) then
@@ -5973,7 +6029,7 @@ def occurs_check_with_depth(inout env: TypeEnv, id: TypeVarId, ty: Type, depth: 
       found = occurs_check_with_depth(env, id, ret, depth + 1, span)
     end
     found
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     var found = false
     for p in params do
       if occurs_check_with_depth(env, id, p.ty, depth + 1, span.clone()) then
@@ -6176,8 +6232,14 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
       end
       pop_scope(env)
  # (FnPtr/Closure split): a declared function VALUE is a function
-      # POINTER (no environment) — the FnPtr form.
-      let fn_ty = Type::FnPtr(param_types, ret_ty)
+      # POINTER (no environment) — the FnPtr form. The callable type
+      # carries the function's DECLARED EFFECT SET (the parsed effect
+      # names, or the std effectful-function seeds by the MODULE-QUALIFIED
+      # identity — "std::io::println", never the bare name): a fn-item
+      # value's type is the source of the INDIRECT-call recording (a
+      # computed callee / fn-pointer field is effectful iff its type says
+      # so).
+      let fn_ty = Type::FnPtr(param_types, ret_ty, declared_effects_of(env, &f.effects, module_qualified_effect_name(&owner_path, &f.name)))
       bind_var(env, f.name.clone(), fn_ty.clone())
       record_module_callable(env, f.name.clone(), fn_ty, &owner_path, DefKind::Function)
     when ItemKind::ItemExternBlock(ext) then
@@ -6227,7 +6289,7 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
           # pass-4 checked), so this pass-3 record is their only entry.
           env.typed_fn_signatures.insert(module_qualified_fn_key(&owner_path, ef.name.clone()),
             FnSignature { params: param_types.clone(), ret_type: ret_ty.clone() })
-          let ext_fn_ty = Type::FnPtr(param_types, ret_ty)
+          let ext_fn_ty = Type::FnPtr(param_types, ret_ty, Vec::new())
           bind_var(env, ef.name.clone(), ext_fn_ty.clone())
           record_module_callable(env, ef.name.clone(), ext_fn_ty, &owner_path, DefKind::Function)
         when ExternItem::Static(es) then
@@ -7335,7 +7397,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # the registry, or the std effectful-function seeds) and the DECLARED
   # BUDGET (the @budget annotation's typed record) — the effect discipline
   # and the MIR's carry both read them from here.
-  let declared_effects = declared_effects_of(env, &f.effects, &f.name)
+  let declared_effects = declared_effects_of(env, &f.effects, module_qualified_effect_name(&env.current_module_path, &f.name))
   let decl_key = fn_effect_def_key(env, &f_owner)
   env.fn_declared_effects.insert(decl_key.clone(), declared_effects.clone())
   env.fn_declared_effect_names.insert(decl_key.clone(), f.name.clone())
@@ -7509,7 +7571,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     # every method body (this impl's and later impls') resolves the
     # declared set at its call sites) and the DECLARED BUDGET (the
     # @budget annotation's typed record).
-    let m_declared_effects = declared_effects_of(env, &m.effects, &m.name)
+    let m_declared_effects = declared_effects_of(env, &m.effects, module_qualified_effect_name(&env.current_module_path, &m.name))
     let m_decl_key = fn_effect_def_key(env, &m_owner)
     env.fn_declared_effects.insert(m_decl_key.clone(), m_declared_effects.clone())
     env.fn_declared_effect_names.insert(m_decl_key.clone(), m.name.clone())
@@ -8409,7 +8471,7 @@ def check_match(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool) -> FlowResult
     when Type::F64 then ()
     when Type::Ptr(_) then ()
     when Type::PtrMut(_) then ()
-    when Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then ()
+    when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then ()
     when Type::Dyn(_) then ()
     when Type::Effect(_, _) then ()
     when Type::Tuple(_) then ()
@@ -9967,8 +10029,8 @@ def is_trivially_copyable_walk(env: TypeEnv, ty: Type, inout visited: Set[String
   # a plain code pointer, bit-copyable; a CLOSURE's copy legality derives
   # from its CAPTURE TUPLE (a closure capturing a non-copyable value is not
   # bit-copyable).
-  when Type::FnPtr(_, _) then true
-  when Type::Closure(_, _, _, captures) then is_trivially_copyable_walk(env, &captures, visited)
+  when Type::FnPtr(_, _, _) then true
+  when Type::Closure(_, _, _, captures, _) then is_trivially_copyable_walk(env, &captures, visited)
   when Type::Dyn(_) then false
   when Type::Effect(_, _) then false
   when Type::RefInternal(_, _) then false
@@ -10182,14 +10244,14 @@ def collect_param_names_from_type(env: TypeEnv, ty: Type, inout out: Vec[Generic
       collect_param_names_from_type(env, &fields[i], out)
       i = i + 1
     end
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var i = 0
     while i < params.len() do
       collect_param_names_from_type(env, &params[i].ty, out)
       i = i + 1
     end
     collect_param_names_from_type(env, ret, out)
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     var i = 0
     while i < params.len() do
       collect_param_names_from_type(env, &params[i].ty, out)
@@ -10541,13 +10603,13 @@ pub def type_canon_render(ctx: TypeCanonCtx, ty: Type) -> Result[String, String]
     when TypeCanonFrame::CanonInternal then Result::Ok("tuple(" + parts.join(",") + ")")
     when TypeCanonFrame::CanonExternal then Result::Ok("(" + parts.join(",") + ")")
     end
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     match ctx.frame
     when TypeCanonFrame::CanonSemantic then canon_render_callable(ctx, "FnPtr", params, ret)
     when TypeCanonFrame::CanonInternal then canon_render_callable(ctx, "fnptr", params, ret)
     when TypeCanonFrame::CanonExternal then canon_render_callable(ctx, "F", params, ret)
     end
-  when Type::Closure(cid, params, ret, _) then
+  when Type::Closure(cid, params, ret, _, _) then
     match ctx.frame
     when TypeCanonFrame::CanonSemantic then
       match canon_render_callable(ctx, "Closure#" + cid.id.to_string(), params, ret)
@@ -11262,8 +11324,8 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
   # a CLOSURE's properties derive from its CAPTURE TUPLE (a closure
   # capturing an owning value owns it; the capture tuple's
   # requires_drop_glue / linearity / capability containment propagate).
-  when Type::FnPtr(_, _) then ()
-  when Type::Closure(_, _, _, captures) then
+  when Type::FnPtr(_, _, _) then ()
+  when Type::Closure(_, _, _, captures, _) then
     let cp = type_props_walk(env, &captures, visiting, via_heap)
     if cp.owns_state then props.owns_state = true end
     if cp.requires_drop_glue then props.requires_drop_glue = true end
@@ -11750,12 +11812,17 @@ end
 # Bridge the resolver's callee-node keying into the typed call-target map's
 # CALL-node keying: read the resolver's DefId under the callee's recorded
 # node (typed_callee_target_node) and record it under the CALL node's id —
-# the key typed_call_for and the MIR's call_def_ids consume. A callee with
-# no resolver entry (a closure value, a function-pointer field access)
-# records nothing — the missing-metadata rule: the construction never
-# silently defaults the callee. The DIRECT-CALL effect recording rides the
-# same site: when the callee has DECLARED effects, the enclosing function's
-# computed effect set accumulates them (record_effect_call).
+# the key typed_call_for and the MIR's call_def_ids consume. The DIRECT-CALL
+# effect recording rides the same site: when the callee has DECLARED
+# effects, the enclosing function's computed effect set accumulates them
+# (record_effect_call). An UNRESOLVED callee (a closure value, a
+# function-pointer field access, a computed callee) records no DefId — the
+# missing-metadata rule: the construction never silently defaults the
+# callee — but its EFFECTS are still recorded through the callee's TYPE
+# (record_indirect_call_effects): the callable types carry the effect set
+# (Type::FnPtr/Type::Closure's effect payload), so an indirect call is
+# NEVER effect-unknown/effect-free — effect-unknown at the call site is
+# unsound, and the callable type is the site's only sound source.
 def record_typed_call_target(inout env: TypeEnv, callee: Expr, node_id: Int) -> Unit
   let target_node = typed_callee_target_node(callee)
   if target_node < 0 then return end
@@ -11774,7 +11841,48 @@ def record_typed_call_target(inout env: TypeEnv, callee: Expr, node_id: Int) -> 
   when Option::Some(did) then
     env.typed_call_targets.insert(node_id, did.clone())
     record_effect_call(env, Option::Some(did))
+  when Option::None then
+    # Indirect call: no resolver target — record the callee TYPE's effect
+    # set into the enclosing function's computed set (the FnPtr/Closure
+    # effect payload; a non-callable or effectless callee records
+    # nothing).
+    record_indirect_call_effects(env, &callee)
+  end
+end
+
+# The INDIRECT-CALL effect recording — the checker's call sites with a
+# non-resolved callee (a closure value, a function-pointer field access, a
+# computed callee): the callee's recorded TYPE (the FnPtr/Closure effect
+# payload — the declared effects of the fn-item value, or the closure
+# body's computed effects) accumulates into the enclosing function's
+# computed effect set, exactly like a direct call's declared effects. This
+# closes the unsoundness where effect-unknown was effect-free: an indirect
+# call through a callable whose type carries effects is effectful at the
+# call site. A callee with no recorded type (or a non-callable type)
+# records nothing — the typed type map is the authority, never a guess.
+def record_indirect_call_effects(inout env: TypeEnv, callee: Expr) -> Unit
+  if env.current_fn_key == "" then return end
+  let target_node = typed_callee_target_node(callee)
+  if target_node < 0 then return end
+  var callee_effs = Vec::new()
+  match env.typed_expr_types.get(target_node)
+  when Option::Some(cty) then
+    match cty
+    when Type::FnPtr(_, _, effects) then callee_effs = effects.clone()
+    when Type::Closure(_, _, _, _, effects) then callee_effs = effects.clone()
+    when _ then ()
+    end
   when Option::None then ()
+  end
+  if callee_effs.len() > 0 then
+    match env.fn_computed_effects.get(env.current_fn_key.clone())
+    when Option::Some(comp) then
+      var new_comp = comp.clone()
+      let _ = effect_set_append(&mut new_comp, callee_effs)
+      env.fn_computed_effects.insert(env.current_fn_key.clone(), new_comp)
+    when Option::None then
+      env.fn_computed_effects.insert(env.current_fn_key.clone(), callee_effs)
+    end
   end
 end
 
@@ -11785,10 +11893,13 @@ end
 # closed transitively over the recorded call graph by check_effect_sets at
 # the end of the program check). The call-graph edge is recorded for every
 # resolved direct call, whether or not the callee carries effects (the
-# transitive closure reads the graph). An unresolved callee (a closure
-# value, a computed callee) records nothing — effect-unknown is
-# effect-free at the call site (the closure's own body calls recorded
-# under the enclosing function's key carry its transitive effects).
+# transitive closure reads the graph). The same callee-declared effects
+# accumulate into the CURRENT CLOSURE's computed set when the call sits
+# inside a closure body (current_closure_node != 0) — the closure type's
+# effect payload (Type::Closure's 5th field) is the indirect-call source
+# for that closure value. Unresolved callees record through
+# record_indirect_call_effects (the callable type's effect set) — an
+# indirect call is never effect-unknown/effect-free.
 def record_effect_call(inout env: TypeEnv, callee: Option[DefId]) -> Unit
   if env.current_fn_key == "" then return end
   match callee
@@ -11803,10 +11914,23 @@ def record_effect_call(inout env: TypeEnv, callee: Option[DefId]) -> Unit
       match env.fn_computed_effects.get(env.current_fn_key.clone())
       when Option::Some(comp) then
         var new_comp = comp.clone()
-        let _ = effect_set_append(&mut new_comp, callee_effs)
+        let _ = effect_set_append(&mut new_comp, callee_effs.clone())
         env.fn_computed_effects.insert(env.current_fn_key.clone(), new_comp)
       when Option::None then
-        env.fn_computed_effects.insert(env.current_fn_key.clone(), callee_effs)
+        env.fn_computed_effects.insert(env.current_fn_key.clone(), callee_effs.clone())
+      end
+      # The closure-body accumulation: the same effectful call inside a
+      # closure body lands in the closure's own computed set (the effect
+      # set its TYPE carries for indirect-call recording).
+      if env.current_closure_node != 0 then
+        match env.closure_computed_effects.get(env.current_closure_node)
+        when Option::Some(ceffs) then
+          var new_ceffs = ceffs.clone()
+          let _ = effect_set_append(&mut new_ceffs, callee_effs.clone())
+          env.closure_computed_effects.insert(env.current_closure_node, new_ceffs)
+        when Option::None then
+          env.closure_computed_effects.insert(env.current_closure_node, callee_effs.clone())
+        end
       end
     end
     match env.fn_call_graph.get(env.current_fn_key.clone())
@@ -12330,7 +12454,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
               fn_params.push(ParamType { ty: field_types[fi2], convention: AccessConvention::Let })
               fi2 = fi2 + 1
             end
-            Type::FnPtr(fn_params, enum_type)
+            Type::FnPtr(fn_params, enum_type, Vec::new())
           end
         when Option::None then
           # Unknown identifier: a name that survives type-name, enum-variant
@@ -12360,8 +12484,8 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # function pointer and a closure value; the conflation
     # form is are not part of the model.
     match func_type
-    when Type::FnPtr(ps, rt) then ()
-    when Type::Closure(_, ps, rt, _) then func_type = Type::FnPtr(ps, rt)
+    when Type::FnPtr(ps, rt, _) then ()
+    when Type::Closure(_, ps, rt, _, effs) then func_type = Type::FnPtr(ps, rt, effs)
     when _ then ()
     end
     env.access_marker_depth = env.access_marker_depth + 1
@@ -12385,7 +12509,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     let ret_type = fresh_type_var(env)
     var call_was_generic = false
     match func_type
-    when Type::FnPtr(params, ret) then
+    when Type::FnPtr(params, ret, _) then
  # FIX 1: explicit generic instantiation. Each generic parameter
       # of the callee is instantiated ONCE for the whole call to a fresh
       # inference variable (shared between parameters and return type), the
@@ -13103,12 +13227,21 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     when Option::None then fresh_type_var(env)
     end
     env.expected_return = Option::Some(closure_ret.clone())
+    # The closure body's DIRECT effectful calls accumulate into the
+    # closure's OWN computed set (current_closure_node routes
+    # record_effect_call's closure accumulation): the effect set the
+    # closure TYPE carries (the Type::Closure effect payload) — an
+    # indirect call through this closure value records these effects at
+    # the call site. Nested closures save/restore the innermost node.
+    let saved_closure_node = env.current_closure_node
+    env.current_closure_node = expr.node_id
  # (channel a): a closure annotated with (or returning) a Slice
     # view would let the view escape with the closure value — rejected.
     check_no_escaping_slice(env, &closure_ret, body.span, "returned from a closure")
     let body_type = check_expr(env, &body)
     unify(env, body_type, closure_ret.clone(), body.span)
     env.expected_return = saved_expected_return
+    env.current_closure_node = saved_closure_node
     # The capture scan runs AFTER the body check, so the body's recorded
     # call-argument effects (typed_access_effects) feed the Consume/Modify
     # capture records (scan_operand). uses = captured local id -> effect
@@ -13182,7 +13315,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     for (_, ct) in cap_list do
       cap_tys.push(ct)
     end
-    Type::Closure(ClosureId { id: expr.node_id }, param_types, closure_ret, Type::Tuple(cap_tys))
+    # The closure's EFFECT SET: the body's direct effectful calls (the
+    # closure_computed_effects accumulation from the body check above) —
+    # the Type::Closure effect payload the indirect-call recording reads
+    # when this closure value is invoked. A body with no effectful call
+    # carries an empty set (effect-free), never a guessed one.
+    var closure_effects = Vec::new()
+    match env.closure_computed_effects.get(expr.node_id)
+    when Option::Some(ceffs) then closure_effects = ceffs.clone()
+    when Option::None then ()
+    end
+    Type::Closure(ClosureId { id: expr.node_id }, param_types, closure_ret, Type::Tuple(cap_tys), closure_effects)
   when ExprKind::ExprIf(if_stmt) then
  # an if used as a value contributes its flow's normal type (with
     # the Unit false-path rule for a missing else enforced inside).
@@ -13722,7 +13865,7 @@ def resolve_field_type(inout env: TypeEnv, recv_type: Type, field: String, span:
       Type::Error
     end
   when Type::Var(_) then fresh_type_var(env)
-  when Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then fresh_type_var(env)
+  when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then fresh_type_var(env)
   when Type::Bool then Type::Bool
   when Type::Int then Type::Int
   when Type::U8 then Type::U8
@@ -14120,7 +14263,7 @@ def instantiate_generic_type(inout env: TypeEnv, ty: Type, inout var_map: Map[In
       i = i + 1
     end
     Type::Tuple(new_fields)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -14128,8 +14271,8 @@ def instantiate_generic_type(inout env: TypeEnv, ty: Type, inout var_map: Map[In
       new_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, var_map), convention: pt.convention })
       i = i + 1
     end
-    Type::FnPtr(new_params, instantiate_generic_type(env, ret, var_map))
-  when Type::Closure(cid, params, ret, captures) then
+    Type::FnPtr(new_params, instantiate_generic_type(env, ret, var_map), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
     var new_params = Vec::new()
     var i = 0
     while i < params.len() do
@@ -14137,7 +14280,7 @@ def instantiate_generic_type(inout env: TypeEnv, ty: Type, inout var_map: Map[In
       new_params.push(ParamType { ty: instantiate_generic_type(env, &pt.ty, var_map), convention: pt.convention })
       i = i + 1
     end
-    Type::Closure(cid.clone(), new_params, instantiate_generic_type(env, ret, var_map), instantiate_generic_type(env, &captures, var_map))
+    Type::Closure(cid.clone(), new_params, instantiate_generic_type(env, ret, var_map), instantiate_generic_type(env, &captures, var_map), effects.clone())
   when Type::Effect(effects, inner) then
  # (defect fix): the instantiation PRESERVES the effect set — the
     # effects pass through unchanged (instantiation never drops the
@@ -14341,7 +14484,7 @@ def solve_builtin_method_u(inout env: TypeEnv, recv_args: Vec[Type], arg_types: 
   if fn_idx < arg_types.len() then
     let arg_ty = resolve_type_var(env, arg_types[fn_idx].clone())
     match arg_ty
-    when Type::FnPtr(_, ret) | Type::Closure(_, _, ret, _) then
+    when Type::FnPtr(_, _, ret) | Type::Closure(_, _, ret, _, _) then
       if mode == "opt" then
         match builtin_option_inner(env, &ret)
         when Option::Some(inner) then unify(env, u.clone(), inner, span)
@@ -15092,7 +15235,7 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
         param_types.push(ParamType { ty: resolve_type_expr(env, &args[i]), convention: AccessConvention::Let })
         i = i + 1
       end
-      Type::FnPtr(param_types, Type::Unit)
+      Type::FnPtr(param_types, Type::Unit, Vec::new())
     elsif name == "Array" then
       # Handle Array[T] named syntax — the heap vector. The result is the
       # Adt form of the registered Array builtin (LangItems id); the fixed
@@ -15261,7 +15404,7 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
     let ret_type = resolve_type_expr(env, &ret)
  # (FnPtr/Closure split): the fn(Args) -> Ret TYPE EXPRESSION denotes
     # a function POINTER (no environment) — the FnPtr form.
-    Type::FnPtr(param_types, ret_type)
+    Type::FnPtr(param_types, ret_type, Vec::new())
   when TypeExprKind::Infer then
     fresh_type_var(env)
   when TypeExprKind::Ref(inner, mutable) then
@@ -15503,18 +15646,18 @@ def default_int_literal_type(env: TypeEnv, ty: Type) -> Type
   when Type::Ptr(inner) then Type::Ptr(default_int_literal_type(env, &inner))
   when Type::PtrMut(inner) then Type::PtrMut(default_int_literal_type(env, &inner))
   when Type::Effect(effects, inner) then Type::Effect(effects.clone(), default_int_literal_type(env, &inner))
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     for p in params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    Type::FnPtr(new_params, default_int_literal_type(env, &ret))
-  when Type::Closure(cid, params, ret, captures) then
+    Type::FnPtr(new_params, default_int_literal_type(env, &ret), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
     var new_params = Vec::new()
     for p in params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    Type::Closure(cid.clone(), new_params, default_int_literal_type(env, &ret), default_int_literal_type(env, &captures))
+    Type::Closure(cid.clone(), new_params, default_int_literal_type(env, &ret), default_int_literal_type(env, &captures), effects.clone())
   when _ then chased
   end
 end
@@ -15622,14 +15765,14 @@ def scan_codegen_type(env: TypeEnv, ty: Type, inout has_error: Bool, inout has_v
       scan_codegen_type(env, &args[i], has_error, has_var)
       i = i + 1
     end
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var i = 0
     while i < params.len() do
       scan_codegen_type(env, &params[i].ty, has_error, has_var)
       i = i + 1
     end
     scan_codegen_type(env, &ret, has_error, has_var)
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     var i = 0
     while i < params.len() do
       scan_codegen_type(env, &params[i].ty, has_error, has_var)
@@ -16219,9 +16362,9 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
       if !derive_transferable(env, &e, visited) then return false end
     end
     true
-  when Type::FnPtr(_, _) then true  #: function pointers are Transferable
+  when Type::FnPtr(_, _, _) then true  #: function pointers are Transferable
  # a closure's transferability derives from its capture tuple.
-  when Type::Closure(_, _, _, captures) then derive_transferable(env, &captures, visited)
+  when Type::Closure(_, _, _, captures, _) then derive_transferable(env, &captures, visited)
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
   when Type::Dyn(_) then false  # Trait objects: conservative !Transferable
@@ -16344,9 +16487,9 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
       if !derive_syncable(env, &e, visited) then return false end
     end
     true
-  when Type::FnPtr(_, _) then true
+  when Type::FnPtr(_, _, _) then true
  # a closure's shareability derives from its capture tuple.
-  when Type::Closure(_, _, _, captures) then derive_syncable(env, &captures, visited)
+  when Type::Closure(_, _, _, captures, _) then derive_syncable(env, &captures, visited)
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
   when Type::Dyn(_) then false  # Trait objects: conservative !Shareable
@@ -16494,7 +16637,7 @@ def type_display(env: TypeEnv, ty: Type) -> String
       end
     end
     "Effect[" + eff_names.join(", ") + "] " + type_display(env, inner)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var s = "fn("
     var first = true
     for p in params do
@@ -16504,7 +16647,7 @@ def type_display(env: TypeEnv, ty: Type) -> String
     end
     s = s + ") -> " + type_display(env, ret)
     s
-  when Type::Closure(cid, params, ret, captures) then
+  when Type::Closure(cid, params, ret, captures, _) then
     var s = "closure#" + cid.id.to_string() + "("
     var first = true
     for p in params do

@@ -568,8 +568,11 @@ jobs:
   # Minimal end-to-end suites for the network, database, TLS, and sync
   # modules: the TCP loopback (listener + client echo), the SQLite
   # in-memory open/create/insert/select, the TLS certificate parse
-  # round-trip + config-ownership suites (fixed embedded PEMs), and the
-  # mutex-guard contention churn across threads.
+  # round-trip + config-ownership suites (fixed embedded PEMs) plus the
+  # TLS handshake suite (the shim's SSL_accept/SSL_connect over loopback
+  # sockets: trusted-CA success, untrusted and wrong-hostname rejections,
+  # ALPN h2 negotiation), and the mutex-guard contention churn across
+  # threads (incl. the condvar notify_one/notify_all ticket semantics).
   #
   # TLS lane self-containment: std::tls declares the custom extern shim
   # family (tls_x509_* / tls_ssl_* / tls_pkey_* / tls_load_file); this job
@@ -613,20 +616,23 @@ jobs:
             tls_ssl_set_hostname tls_ssl_set_certificate tls_ssl_set_private_key \
             tls_ssl_set_verify tls_ssl_connect tls_ssl_accept tls_ssl_read \
             tls_ssl_write tls_ssl_shutdown \
+            tls_ssl_set_default_verify_paths tls_ssl_add_ca_cert \
+            tls_ssl_set_alpn_protos tls_ssl_set_alpn_select tls_ssl_get_alpn \
+            tls_ssl_set_cipher_list tls_ssl_set_cipher_suites \
             tls_x509_from_pem tls_x509_free tls_x509_to_der \
             tls_x509_get_subject_cn tls_x509_is_expired \
             tls_pkey_from_pem tls_pkey_free tls_pkey_to_der tls_load_file; do
             nm -gU build/libtg_tls_shims.dylib | grep -q " _$sym$" \
               || { echo "::error::TLS shim missing export: $sym"; exit 1; }
           done
-          echo "✓ libtg_tls_shims.dylib built with all 22 std::tls extern exports"
+          echo "✓ libtg_tls_shims.dylib built with all 29 std::tls extern exports"
 
       - name: Run net loopback / negative-return ABI / db / sync integration suites
         run: |
           ./build/tg test tests/net_loopback_test.tg tests/net_negative_abi_test.tg tests/db_integration_test.tg tests/sync_contention_test.tg
           echo "✓ Net loopback / negative-return ABI / db / sync integration suites passed"
 
-      - name: Run TLS interop suite (shim preloaded into the test processes)
+      - name: Run TLS interop + handshake suites (shim preloaded into the test processes)
         run: |
           set -euo pipefail
           # The tg toolchain's link step is the in-house Mach-O linker
@@ -643,39 +649,31 @@ jobs:
           # loaded image including the inserted shim.
           DYLD_INSERT_LIBRARIES="$PWD/build/libtg_tls_shims.dylib" \
           DYLD_FORCE_FLAT_NAMESPACE=1 \
-            ./build/tg test tests/tls_interop_test.tg
-          echo "✓ TLS interop suite passed"
+            ./build/tg test tests/tls_interop_test.tg tests/tls_handshake_test.tg
+          echo "✓ TLS interop + handshake suites passed"
 
   # ———————————————————————————————————————
   # DB Postgres lane (REQUIRED)
   # The std::db non-SQLite lane: the Postgres driver (libpq externs
-  # PQconnectdb/PQexec/PQexecParams/PQgetvalue/...) against the GitHub
-  # Actions postgres service container (localhost:5432). The tg
-  # toolchain's in-house Mach-O linker emits exactly one LC_LOAD_DYLIB
-  # and records the PQ* calls as dyld imports, so — exactly like the TLS
-  # shim lane — the lane preloads libpq (and its brew OpenSSL deps) into
-  # the test process (DYLD_INSERT_LIBRARIES + DYLD_FORCE_FLAT_NAMESPACE).
-  # The lane is gated behind the service container: the test only runs
-  # where the server exists.
+  # PQconnectdb/PQexec/PQexecParams/PQprepare/PQexecPrepared/PQgetvalue/
+  # ...) against a NATIVE Homebrew postgresql@16 server (localhost:5432,
+  # initdb + pg_ctl started in the job). GitHub Actions forbids Docker
+  # service containers on macOS runners, so the lane runs the server as a
+  # native process instead. The tg toolchain's in-house Mach-O linker
+  # emits exactly one LC_LOAD_DYLIB and records the PQ* calls as dyld
+  # imports, so — exactly like the TLS shim lane — the lane preloads
+  # libpq (and its brew OpenSSL deps) into the test process
+  # (DYLD_INSERT_LIBRARIES + DYLD_FORCE_FLAT_NAMESPACE). The lane is
+  # gated behind the started server: the test only runs where the server
+  # exists. The driver translates the JDBC `?` placeholder to PostgreSQL's
+  # $1..$n positional parameters, owns every parameter payload in the
+  # PgParamBacking, and runs prepared statements server-side
+  # (PQprepare/PQexecPrepared with a DEALLOCATE on drop).
   # ———————————————————————————————————————
   db-integration-postgres:
-    name: DB Postgres Lane (service container)
+    name: DB Postgres Lane (native Homebrew postgresql@16)
     needs: bootstrap
     runs-on: macos-14
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - name: Download stage3 artifact
@@ -687,52 +685,60 @@ jobs:
         run: |
           cp build/tg_stage3 build/tg
           chmod +x build/tg
-      - name: Install libpq (runtime provider for the std::db Postgres driver)
+      - name: Install libpq + PostgreSQL 16 (native server)
         run: |
           set -euo pipefail
-          brew install libpq openssl@3
+          brew install libpq postgresql@16 openssl@3
           echo "libpq: $(brew --prefix libpq)/lib/libpq.dylib"
           echo "openssl: $(brew --prefix openssl@3)"
-      - name: Run the Postgres driver lane (libpq preloaded, service container)
+      - name: Initialize and start the PostgreSQL server (native process)
+        run: |
+          set -euo pipefail
+          PGBIN="$(brew --prefix postgresql@16)/bin"
+          PGDATA="$RUNNER_TEMP/pgdata"
+          rm -rf "$PGDATA"
+          "$PGBIN/initdb" -D "$PGDATA" -U postgres --auth=trust >/dev/null
+          "$PGBIN/pg_ctl" -D "$PGDATA" -l "$RUNNER_TEMP/postgres.log" -o "-p 5432" start
+          for _ in $(seq 1 30); do
+            if "$PGBIN/pg_isready" -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          "$PGBIN/pg_isready" -h 127.0.0.1 -p 5432 -U postgres
+      - name: Run the Postgres driver lane (libpq preloaded, native server)
         run: |
           set -euo pipefail
           DYLD_INSERT_LIBRARIES="$(brew --prefix libpq)/lib/libpq.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
           DYLD_FORCE_FLAT_NAMESPACE=1 \
             ./build/tg test tests/db_postgres_integration_test.tg
-          echo "✓ DB Postgres lane passed (service container)"
+          echo "✓ DB Postgres lane passed (native Homebrew server)"
 
   # ———————————————————————————————————————
   # DB MySQL lane (REQUIRED)
   # The std::db MySQL driver (libmysqlclient externs
   # mysql_init/mysql_real_connect/mysql_query/mysql_real_query/
-  # mysql_store_result/mysql_fetch_row/... against the GitHub Actions
-  # mysql:8 service container (localhost:3306, root/root, database
-  # test). The tg toolchain's in-house Mach-O linker emits exactly one
-  # LC_LOAD_DYLIB and records the mysql_* calls as dyld imports, so —
-  # exactly like the TLS shim and Postgres lanes — the lane preloads
-  # libmysqlclient (and its brew OpenSSL deps) into the test process
-  # (DYLD_INSERT_LIBRARIES + DYLD_FORCE_FLAT_NAMESPACE). The lane is
-  # gated behind the service container: the test only runs where the
-  # server exists.
+  # mysql_stmt_init/mysql_stmt_prepare/mysql_stmt_bind_param/
+  # mysql_stmt_execute/mysql_store_result/mysql_fetch_row/...) against a
+  # NATIVE Homebrew mysql server (127.0.0.1:3306, root/root, database
+  # test — mysqld initialized and started in the job). GitHub Actions
+  # forbids Docker service containers on macOS runners, so the lane runs
+  # the server as a native process instead. The tg toolchain's in-house
+  # Mach-O linker emits exactly one LC_LOAD_DYLIB and records the
+  # mysql_* calls as dyld imports, so — exactly like the TLS shim and
+  # Postgres lanes — the lane preloads libmysqlclient (and its brew
+  # OpenSSL deps) into the test process (DYLD_INSERT_LIBRARIES +
+  # DYLD_FORCE_FLAT_NAMESPACE). The lane is gated behind the started
+  # server: the test only runs where the server exists. Every
+  # parameterized statement uses the REAL MYSQL_BIND parameter binding
+  # (mysql_stmt_bind_param with the MYSQL_BIND array + mysql_stmt_execute)
+  # — the hostile-value / multibyte / binary-blob cases are shipped as
+  # data, never interpolated.
   # ———————————————————————————————————————
   db-integration-mysql:
-    name: DB MySQL Lane (service container)
+    name: DB MySQL Lane (native Homebrew mysql)
     needs: bootstrap
     runs-on: macos-14
-    services:
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: test
-          MYSQL_ROOT_HOST: "%"
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - name: Download stage3 artifact
@@ -744,19 +750,37 @@ jobs:
         run: |
           cp build/tg_stage3 build/tg
           chmod +x build/tg
-      - name: Install libmysqlclient (runtime provider for the std::db MySQL driver)
+      - name: Install MySQL (native server + client libraries)
         run: |
           set -euo pipefail
-          brew install mysql-client
-          echo "mysqlclient: $(brew --prefix mysql-client)/lib/libmysqlclient.dylib"
+          brew install mysql openssl@3
+          echo "mysqlclient: $(brew --prefix mysql)/lib/libmysqlclient.dylib"
           echo "openssl: $(brew --prefix openssl@3)"
-      - name: Run the MySQL driver lane (libmysqlclient preloaded, service container)
+      - name: Initialize and start the MySQL server (native process)
         run: |
           set -euo pipefail
-          DYLD_INSERT_LIBRARIES="$(brew --prefix mysql-client)/lib/libmysqlclient.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
+          MYSQL_BIN="$(brew --prefix mysql)/bin"
+          MYSQL_DATADIR="$RUNNER_TEMP/mysql-data"
+          rm -rf "$MYSQL_DATADIR"
+          mkdir -p "$MYSQL_DATADIR"
+          "$MYSQL_BIN/mysqld" --initialize-insecure --datadir="$MYSQL_DATADIR" --log-error="$RUNNER_TEMP/mysql-init.log"
+          "$MYSQL_BIN/mysqld" --datadir="$MYSQL_DATADIR" --port=3306 \
+            --socket="$RUNNER_TEMP/mysql.sock" --log-error="$RUNNER_TEMP/mysql.log" &
+          for _ in $(seq 1 30); do
+            if "$MYSQL_BIN/mysqladmin" ping -h 127.0.0.1 -uroot >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          "$MYSQL_BIN/mysqladmin" ping -h 127.0.0.1 -uroot
+          "$MYSQL_BIN/mysql" -h 127.0.0.1 -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; CREATE DATABASE IF NOT EXISTS test;"
+      - name: Run the MySQL driver lane (libmysqlclient preloaded, native server)
+        run: |
+          set -euo pipefail
+          DYLD_INSERT_LIBRARIES="$(brew --prefix mysql)/lib/libmysqlclient.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
           DYLD_FORCE_FLAT_NAMESPACE=1 \
             ./build/tg test tests/db_mysql_integration_test.tg
-          echo "✓ DB MySQL lane passed (service container)"
+          echo "✓ DB MySQL lane passed (native Homebrew server)"
 
   # ———————————————————————————————————————
   # New stdlib module tests
@@ -777,9 +801,12 @@ jobs:
         run: |
           cp build/tg_stage3 build/tg
           chmod +x build/tg
-      - name: Test-runner integrity gate (pass / fail / zero-test / parse-error / implicit-skip)
+      - name: Test-runner integrity gate (pass / fail / zero-test / parse-error / implicit-recognized-selection)
         run: |
           bash tests/run_test_runner_integrity.sh ./build/tg
+      - name: Bench-runner integrity gate (pass / fail / parse-error / zero-@bench / compile-error / discovery / zero-discovery)
+        run: |
+          bash tests/run_bench_runner_integrity.sh ./build/tg
       - name: Verify stdlib modules without @test suites (simd embedded mmap gpu)
         run: |
           set -euo pipefail

@@ -78,7 +78,7 @@ end
 ## Handle to a spawned task for joining or cancellation
 struct JoinHandle[T]
   task_id: u64
-  executor: Arc[Executor]
+  executor: Arc[ExecutorInner]
   result: Arc[Mutex[Option[T]]]
   completed: Arc[Condvar]
 end
@@ -102,7 +102,7 @@ def WorkStealingQueue::new(capacity: Int) -> WorkStealingQueue
   }
 end
 
-def WorkStealingQueue::push(self: WorkStealingQueue, sink task: Task) -> Bool
+def WorkStealingQueue::push(inout self: WorkStealingQueue, sink task: Task) -> Bool
   var guard = self.buffer.lock()
   let result = guard.push_back(task)
   if result.is_some() then
@@ -114,7 +114,7 @@ def WorkStealingQueue::push(self: WorkStealingQueue, sink task: Task) -> Bool
   end
 end
 
-def WorkStealingQueue::pop(self: WorkStealingQueue) -> Option[Task]
+def WorkStealingQueue::pop(inout self: WorkStealingQueue) -> Option[Task]
   var guard = self.buffer.lock()
   match guard.pop_front()
   when Option::Some(task) then
@@ -124,7 +124,7 @@ def WorkStealingQueue::pop(self: WorkStealingQueue) -> Option[Task]
   end
 end
 
-def WorkStealingQueue::steal(self: WorkStealingQueue, count: Int) -> Vec[Task]
+def WorkStealingQueue::steal(inout self: WorkStealingQueue, count: Int) -> Vec[Task]
   var stolen: Vec[Task] = Vec::new()
   
   var guard = self.buffer.lock()
@@ -176,8 +176,17 @@ end
 # Executor Core
 # ═══════════════════════════════════════════════════════════════
 
-## The main executor struct managing the thread pool
-struct Executor
+## The executor's shared state (the worker slots, the queues, the
+## counters, the shutdown coordination) lives in a heap allocation owned
+## by an Arc — std::sync's Arc, the same heap-stable shape the sync
+## module's Mutex/Channel use. The worker threads each receive their OWN
+## Arc clone at start: the state stays alive even if the Executor is
+## dropped or moved while a worker thread lives. The old start_workers
+## hand-off passed `address_of(&mut self.workers)` into the threads — a
+## raw address of the caller's stack slot that dangled the moment the
+## Executor moved — and the Executor itself was shared by value through
+## the (nonexistent) `Arc::from(self)`.
+struct ExecutorInner
   # Worker threads and their state
   workers: Vec[WorkerState]
   threads: Vec[Thread]
@@ -200,8 +209,15 @@ struct Executor
   next_task_id: AtomicU32
 end
 
+## The Executor is a thin Arc wrapper over the inner — the same
+## { inner: Arc[ExecutorInner] } shape std::async's cooperative Executor
+## uses. The wrapper can be copied/moved freely; the state never moves.
+struct Executor
+  inner: Arc[ExecutorInner]
+end
+
 ## Global executor instance
-var GLOBAL_EXECUTOR: Option[Arc[Executor]] = Option::None
+var GLOBAL_EXECUTOR: Option[Arc[ExecutorInner]] = Option::None
 
 def Executor::new(thread_count: Int) -> Result[Executor, String]
   if thread_count < 1 then
@@ -220,18 +236,21 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
   end
   
   var executor = Executor {
-    workers: workers,
-    threads: Vec::new(),
-    global_queue: global_queue,
-    shutdown: shutdown,
-    shutdown_complete: Arc::new(Condvar::new()),
-    task_available: task_available,
-    total_tasks_submitted: AtomicU32::new(0),
-    total_tasks_completed: AtomicU32::new(0),
-    next_task_id: AtomicU32::new(1)
+    inner: Arc::new(ExecutorInner {
+      workers: workers,
+      threads: Vec::new(),
+      global_queue: global_queue,
+      shutdown: shutdown,
+      shutdown_complete: Arc::new(Condvar::new()),
+      task_available: task_available,
+      total_tasks_submitted: AtomicU32::new(0),
+      total_tasks_completed: AtomicU32::new(0),
+      next_task_id: AtomicU32::new(1)
+    })
   }
   
-  # Start worker threads
+  # Start worker threads — each thread receives its own Arc clone of the
+  # inner (the state stays alive for as long as ANY clone references it).
   executor.start_workers()
   
   Result::Ok(executor)
@@ -245,127 +264,119 @@ def Executor::new_default() -> Result[Executor, String]
 end
 
 def Executor::start_workers(inout self: Executor) -> Unit
-  let worker_count = self.workers.len()
+  let inner = self.inner.clone()
+  let worker_count = inner.ptr.as_ref().workers.len()
   var i = 0
   
   while i < worker_count do
     let worker_id = i
-    let workers_ref = address_of(&mut self.workers)
-    let global_queue_ref = self.global_queue.clone()
-    let shutdown_ref = self.shutdown.clone()
-    let task_available_ref = self.task_available.clone()
-    let total_completed_ref = self.total_completed.clone()
+    let thread_inner = inner.clone()
     
     let thread = spawn_thread(move || {
-      worker_loop(
-        worker_id,
-        &*workers_ref,
-        global_queue_ref,
-        shutdown_ref,
-        task_available_ref,
-        total_completed_ref
-      )
+      worker_loop(thread_inner, worker_id)
     })
     
-    self.threads.push(thread)
+    unsafe "executor inner access — the Arc clone keeps the inner alive" do
+      let inner_mut = inner.ptr.as_mut()
+      inner_mut.threads.push(thread)
+    end
     i = i + 1
   end
 end
 
-## Worker thread main loop
-def worker_loop(
-  worker_id: Int,
-  workers: Vec[WorkerState],
-  global_queue: Arc[Mutex[Queue[Task]]],
-  shutdown: Arc[AtomicBool],
-  task_available: Arc[Condvar],
-  total_completed: Arc[AtomicU32]
-) -> Unit
-  let worker = workers[worker_id]
-  worker.is_active.store(true)
-  
-  var consecutive_empty = 0
-  
-  while !shutdown.load() do
-    # Try to get a task
-    let task = find_task(worker, workers, global_queue)
+## Worker thread main loop — the worker holds its OWN Arc clone of the
+## executor inner: every read (the queues, the shutdown flag) and every
+## write (its own worker slot, the shared counters) goes through that
+## clone, so the state can never dangle behind a moved Executor.
+def worker_loop(executor: Arc[ExecutorInner], worker_id: Int) -> Unit
+  unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
+    let inner = executor.ptr.as_mut()
+    inner.workers[worker_id].is_active.store(true)
     
-    match task
-    when Option::Some(t) then
-      consecutive_empty = 0
-      execute_task(t, worker, total_completed)
-    when Option::None then
-      consecutive_empty = consecutive_empty + 1
+    var consecutive_empty = 0
+    
+    while !inner.shutdown.load() do
+      # Try to get a task
+      let task = find_task(executor, worker_id)
       
-      if consecutive_empty > SPIN_COUNT_BEFORE_YIELD() then
-        # Wait for task notification with timeout
-        var guard = global_queue.lock()
-        let _ = task_available.wait_timeout_ms(guard, IDLE_TIMEOUT_MS())
+      match task
+      when Option::Some(t) then
         consecutive_empty = 0
-      else
-        # Brief spin then yield
-        std::thread::yield_now()
+        execute_task(t, executor, worker_id)
+      when Option::None then
+        consecutive_empty = consecutive_empty + 1
+        
+        if consecutive_empty > SPIN_COUNT_BEFORE_YIELD() then
+          # Wait for task notification with timeout
+          var guard = inner.global_queue.lock()
+          let _ = inner.task_available.wait_timeout_ms(guard, IDLE_TIMEOUT_MS())
+          consecutive_empty = 0
+        else
+          # Brief spin then yield
+          std::thread::yield_now()
+        end
       end
     end
+    
+    inner.workers[worker_id].is_active.store(false)
   end
-  
-  worker.is_active.store(false)
 end
 
 ## Find a task to execute using work stealing
 def find_task(
-  worker: WorkerState,
-  workers: Vec[WorkerState],
-  global_queue: Arc[Mutex[Queue[Task]]]
+  executor: Arc[ExecutorInner],
+  worker_id: Int
 ) -> Option[Task]
-  # First, try local queue
-  match worker.local_queue.pop()
-  when Option::Some(task) then return Option::Some(task)
-  when Option::None then ()
-  end
-  
-  # Then, try global queue
-  var guard = global_queue.lock()
-  match guard.dequeue()
-  when Option::Some(task) then return Option::Some(task)
-  when Option::None then ()
-  end
-  
-  # Finally, try to steal from other workers
-  var steal_attempts = 0
-  while steal_attempts < STEAL_ATTEMPTS() do
-    var victim_idx = std::rand::random_range(0, workers.len() as Int - 1)
-    
-    if victim_idx != worker.id then
-      let victim = workers[victim_idx]
-      let stolen = victim.local_queue.steal(2)
-      
-      if stolen.len() > 0 then
-        worker.tasks_stolen.fetch_add(stolen.len() as u32)
-        
-        # Return first stolen task, put rest in local queue
-        var iter = stolen.iter()
-        let first = iter.next()
-        
-        for task in iter do
-          let _ = worker.local_queue.push(task)
-        end
-        
-        return first
-      end
+  unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
+    let inner = executor.ptr.as_mut()
+    # First, try local queue
+    match inner.workers[worker_id].local_queue.pop()
+    when Option::Some(task) then return Option::Some(task)
+    when Option::None then ()
     end
     
-    steal_attempts = steal_attempts + 1
+    # Then, try global queue
+    var guard = inner.global_queue.lock()
+    match guard.dequeue()
+    when Option::Some(task) then return Option::Some(task)
+    when Option::None then ()
+    end
+    
+    # Finally, try to steal from other workers
+    var steal_attempts = 0
+    while steal_attempts < STEAL_ATTEMPTS() do
+      var victim_idx = std::rand::random_range(0, inner.workers.len() as Int - 1)
+      
+      if victim_idx != worker_id then
+        let stolen = inner.workers[victim_idx].local_queue.steal(2)
+        
+        if stolen.len() > 0 then
+          inner.workers[worker_id].tasks_stolen.fetch_add(stolen.len() as u32)
+          
+          # Return first stolen task, put rest in local queue
+          var iter = stolen.iter()
+          let first = iter.next()
+          
+          for task in iter do
+            let _ = inner.workers[worker_id].local_queue.push(task)
+          end
+          
+          return first
+        end
+      end
+      
+      steal_attempts = steal_attempts + 1
+    end
+    
+    Option::None
   end
-  
-  Option::None
 end
 
 ## Execute a single task
 def execute_task(
   task: Task,
-  worker: WorkerState,
-  total_completed: Arc[AtomicU32]
+  executor: Arc[ExecutorInner],
+  worker_id: Int
 ) -> Unit
   # Set task state to running
   task.state.store(1)  # TaskState::Running
@@ -374,9 +385,13 @@ def execute_task(
   # Note: In a real implementation, we'd catch panics here
   task.func.call()
   
-  # Update statistics
-  worker.tasks_completed.fetch_add(1)
-  total_completed.fetch_add(1)
+  # Update statistics — through the worker's Arc clone (the inner's
+  # total_tasks_completed field is the single authority for the count)
+  unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
+    let inner = executor.ptr.as_mut()
+    inner.workers[worker_id].tasks_completed.fetch_add(1)
+    inner.total_tasks_completed.fetch_add(1)
+  end
   
   # Set task state to completed
   task.state.store(2)  # TaskState::Completed
@@ -388,54 +403,60 @@ end
 
 ## Submit a task to the executor
 def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPriority) -> u64
-  let task_id = self.next_task_id.fetch_add(1) as u64
-  
-  let task = Task {
-    id: task_id,
-    priority: priority,
-    state: AtomicU32::new(0),  # TaskState::Pending
-    func: func,
-    waker: Option::None,
-    created_at: Instant::now()
-  }
-  
-  self.total_tasks_submitted.fetch_add(1)
-  
-  # Try to push to current thread's local queue first
-  let current = current_thread()
-  var pushed = false
-  
-  # Check if we're a worker thread
-  var i = 0
-  while i < self.workers.len() do
-    if self.threads[i].id() == current.id() then
-      pushed = self.workers[i].local_queue.push(task)
-      break
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    let task_id = inner.next_task_id.fetch_add(1) as u64
+    
+    let task = Task {
+      id: task_id,
+      priority: priority,
+      state: AtomicU32::new(0),  # TaskState::Pending
+      func: func,
+      waker: Option::None,
+      created_at: Instant::now()
+    }
+    
+    inner.total_tasks_submitted.fetch_add(1)
+    
+    # Try to push to current thread's local queue first
+    let current = current_thread()
+    var pushed = false
+    
+    # Check if we're a worker thread
+    var i = 0
+    while i < inner.workers.len() do
+      if inner.threads[i].id() == current.id() then
+        pushed = inner.workers[i].local_queue.push(task)
+        break
+      end
+      i = i + 1
     end
-    i = i + 1
-  end
-  
-  # If not a worker or local queue full, use global queue
-  if !pushed then
-    var guard = self.global_queue.lock()
-    # Priority ordering: higher priority first
-    match priority
-    when TaskPriority::Realtime then guard.push_front(task)
-    when TaskPriority::High then guard.push_high_priority(task)
-    when TaskPriority::Normal then guard.enqueue(task)
-    when TaskPriority::Low then guard.enqueue_low_priority(task)
+    
+    # If not a worker or local queue full, use global queue
+    if !pushed then
+      var guard = inner.global_queue.lock()
+      # Priority ordering: higher priority first
+      match priority
+      when TaskPriority::Realtime then guard.push_front(task)
+      when TaskPriority::High then guard.push_high_priority(task)
+      when TaskPriority::Normal then guard.enqueue(task)
+      when TaskPriority::Low then guard.enqueue_low_priority(task)
+      end
     end
+    
+    # Notify waiting workers
+    inner.task_available.notify_one()
+    
+    task_id
   end
-  
-  # Notify waiting workers
-  self.task_available.notify_one()
-  
-  task_id
 end
 
 ## Submit a task that returns a value
 def Executor::submit_with_result[T: Send](self: Executor, func: fn() -> T, priority: TaskPriority) -> JoinHandle[T]
-  let task_id = self.next_task_id.fetch_add(1) as u64
+  let task_id = unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.next_task_id.fetch_add(1) as u64
+  end
   let result = Arc::new(Mutex::new(Option::None[T]))
   let completed = Arc::new(Condvar::new())
   
@@ -458,17 +479,23 @@ def Executor::submit_with_result[T: Send](self: Executor, func: fn() -> T, prior
     created_at: Instant::now()
   }
   
-  self.total_tasks_submitted.fetch_add(1)
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.total_tasks_submitted.fetch_add(1)
+    
+    # Add to global queue
+    var guard = inner.global_queue.lock()
+    guard.enqueue(task)
+    
+    inner.task_available.notify_one()
+  end
   
-  # Add to global queue
-  var guard = self.global_queue.lock()
-  guard.enqueue(task)
-  
-  self.task_available.notify_one()
-  
+  # The handle keeps the executor alive through its OWN Arc clone — the
+  # real Arc construction (the old `Arc::from(self)` did not exist in the
+  # Arc API).
   JoinHandle {
     task_id: task_id,
-    executor: Arc::from(self),
+    executor: self.inner.clone(),
     result: result,
     completed: completed
   }
@@ -516,45 +543,51 @@ end
 
 ## Shutdown the executor gracefully
 def Executor::shutdown(inout self: Executor) -> Unit
-  self.shutdown.store(true)
-  
-  # Wake all workers
-  self.task_available.notify_all()
-  
-  # Wait for all threads to complete
-  for thread in self.threads do
-    thread.join()
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.shutdown.store(true)
+    
+    # Wake all workers
+    inner.task_available.notify_all()
+    
+    # Wait for all threads to complete
+    for thread in inner.threads do
+      thread.join()
+    end
+    
+    inner.threads.clear()
   end
-  
-  self.threads.clear()
 end
 
 ## Shutdown immediately (may leave tasks incomplete)
 def Executor::shutdown_now(inout self: Executor) -> Unit
-  self.shutdown.store(true)
-  
-  # Wake all workers
-  self.task_available.notify_all()
-  
-  # Give threads a short time to finish current tasks
-  let timeout = Duration::from_millis(100)
-  let start = Instant::now()
-  
-  while start.elapsed() < timeout do
-    let all_inactive = true
-    for worker in self.workers do
-      if worker.is_active.load() then
-        all_inactive = false
-        break
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.shutdown.store(true)
+    
+    # Wake all workers
+    inner.task_available.notify_all()
+    
+    # Give threads a short time to finish current tasks
+    let timeout = Duration::from_millis(100)
+    let start = Instant::now()
+    
+    while start.elapsed() < timeout do
+      let all_inactive = true
+      for worker in inner.workers do
+        if worker.is_active.load() then
+          all_inactive = false
+          break
+        end
       end
+      
+      if all_inactive then break end
+      std::thread::sleep_ms(10)
     end
     
-    if all_inactive then break end
-    std::thread::sleep_ms(10)
+    # Force terminate any remaining threads
+    # (In a real implementation, we'd have cancellation support)
   end
-  
-  # Force terminate any remaining threads
-  # (In a real implementation, we'd have cancellation support)
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -571,11 +604,12 @@ struct ExecutorStats
 end
 
 def Executor::stats(self: Executor) -> ExecutorStats
+  let inner = self.inner.ptr.as_ref()
   var tasks_per_worker: Vec[u32] = Vec::new()
   var steals_per_worker: Vec[u32] = Vec::new()
   var active = 0
   
-  for worker in self.workers do
+  for worker in inner.workers do
     tasks_per_worker.push(worker.tasks_completed.load())
     steals_per_worker.push(worker.tasks_stolen.load())
     if worker.is_active.load() then
@@ -583,12 +617,12 @@ def Executor::stats(self: Executor) -> ExecutorStats
     end
   end
   
-  let guard = self.global_queue.lock()
+  let guard = inner.global_queue.lock()
   let pending = guard.len() as u32
   
   ExecutorStats {
-    total_submitted: self.total_tasks_submitted.load(),
-    total_completed: self.total_tasks_completed.load(),
+    total_submitted: inner.total_tasks_submitted.load(),
+    total_completed: inner.total_tasks_completed.load(),
     pending: pending,
     active_workers: active,
     tasks_per_worker: tasks_per_worker,
@@ -616,16 +650,25 @@ end
 
 struct Waker
   task_id: u64
-  executor: Arc[Executor]
+  # The waker holds its OWN Arc clone of the executor inner — the future
+  # keeps the executor alive even after the spawning Executor is dropped
+  # or moved.
+  executor: Arc[ExecutorInner]
 end
 
 impl Waker
   def wake(self: Waker) -> Unit
-    self.executor.task_available.notify_one()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let inner = self.executor.ptr.as_mut()
+      inner.task_available.notify_one()
+    end
   end
   
   def wake_by_ref(self: Waker) -> Unit
-    self.executor.task_available.notify_one()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let inner = self.executor.ptr.as_mut()
+      inner.task_available.notify_one()
+    end
   end
 end
 
@@ -680,9 +723,10 @@ end
 
 ## Spawn a future onto the executor
 def spawn_future[T: Send](future: impl Future[T] + Send) -> JoinHandle[T]
-  match GLOBAL_EXECUTOR
+  match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec) then
-    exec.submit_with_result(|| {
+    let executor = Executor { inner: exec }
+    executor.submit_with_result(|| {
       # This would need a proper async runtime to work
       # For now, this is a placeholder
       future.await
@@ -692,7 +736,7 @@ def spawn_future[T: Send](future: impl Future[T] + Send) -> JoinHandle[T]
     let exec = Executor::new_default()
     match exec
     when Result::Ok(e) then
-      GLOBAL_EXECUTOR = Option::Some(Arc::new(e))
+      GLOBAL_EXECUTOR = Option::Some(e.inner.clone())
       spawn_future(future)
     when Result::Err(_) then
       panic("Failed to create executor")
@@ -725,7 +769,7 @@ end
 def init_global_executor(thread_count: Int) -> Result[Unit, String]
   match Executor::new(thread_count)
   when Result::Ok(exec) then
-    GLOBAL_EXECUTOR = Option::Some(Arc::new(exec))
+    GLOBAL_EXECUTOR = Option::Some(exec.inner.clone())
     Result::Ok(())
   when Result::Err(e) then
     Result::Err(e)
@@ -733,7 +777,7 @@ def init_global_executor(thread_count: Int) -> Result[Unit, String]
 end
 
 ## Get or create the global executor
-def global_executor() -> Arc[Executor]
+def global_executor() -> Arc[ExecutorInner]
   match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec) then exec
   when Option::None then
@@ -744,25 +788,25 @@ end
 
 ## Spawn a closure on the global executor
 def spawn(func: fn() -> Unit) -> u64
-  let exec = global_executor()
-  exec.submit(Box::new(func), TaskPriority::Normal)
+  let executor = Executor { inner: global_executor() }
+  executor.submit(Box::new(func), TaskPriority::Normal)
 end
 
 ## Spawn with priority
 def spawn_with_priority(func: fn() -> Unit, priority: TaskPriority) -> u64
-  let exec = global_executor()
-  exec.submit(Box::new(func), priority)
+  let executor = Executor { inner: global_executor() }
+  executor.submit(Box::new(func), priority)
 end
 
 ## Spawn a closure that returns a value
 def spawn_with_result[T: Send](func: fn() -> T) -> JoinHandle[T]
-  let exec = global_executor()
-  exec.submit_with_result(func, TaskPriority::Normal)
+  let executor = Executor { inner: global_executor() }
+  executor.submit_with_result(func, TaskPriority::Normal)
 end
 
 ## Parallel for-each
 def par_for_each[T](items: [T], func: fn(T) -> Unit) -> Unit
-  let exec = global_executor()
+  let executor = Executor { inner: global_executor() }
   let count = items.len()
   
   if count == 0 then return end
@@ -774,7 +818,7 @@ def par_for_each[T](items: [T], func: fn(T) -> Unit) -> Unit
     let completed_clone = completed.clone()
     let all_done_clone = all_done.clone()
     
-    exec.submit(Box::new(move || {
+    executor.submit(Box::new(move || {
       func(item)
       let remaining = completed_clone.fetch_add(1) + 1
       if remaining == count as u32 then
@@ -792,7 +836,7 @@ end
 
 ## Parallel map
 def par_map[T: Send, U: Send](items: [T], func: fn(T) -> U) -> Vec[U]
-  let exec = global_executor()
+  let executor = Executor { inner: global_executor() }
   let count = items.len()
   
   if count == 0 then
@@ -813,7 +857,7 @@ def par_map[T: Send, U: Send](items: [T], func: fn(T) -> U) -> Vec[U]
     let completed_clone = completed.clone()
     let all_done_clone = all_done.clone()
     
-    exec.submit(Box::new(move || {
+    executor.submit(Box::new(move || {
       let value = func(item)
       var guard = results_clone.lock()
       guard[idx] = Option::Some(value)
@@ -854,6 +898,7 @@ def par_fold[T: Send, U: Send + Clone](
   merge: fn(U, U) -> U
 ) -> U
   let exec = global_executor()
+  let executor = Executor { inner: exec.clone() }
   let count = items.len()
   
   if count == 0 then
@@ -861,7 +906,8 @@ def par_fold[T: Send, U: Send + Clone](
   end
   
   # Split into chunks
-  let chunk_size = (count + exec.workers.len() - 1) / exec.workers.len()
+  let worker_count = exec.ptr.as_ref().workers.len()
+  let chunk_size = (count + worker_count - 1) / worker_count
   let num_chunks = (count + chunk_size - 1) / chunk_size
   
   let partial_results: Arc[Mutex[Vec[Option[U]]]] = Arc::new(Mutex::new(Vec::new()))
@@ -884,7 +930,7 @@ def par_fold[T: Send, U: Send + Clone](
     let all_done_clone = all_done.clone()
     let identity_clone = identity.clone()
     
-    exec.submit(Box::new(move || {
+    executor.submit(Box::new(move || {
       var acc = identity_clone
       var i = start
       while i < end_idx do
@@ -930,8 +976,8 @@ end
 
 ## Schedule a CPU-intensive task with proper CPU affinity
 def spawn_cpu_intensive[T: Send](func: fn() -> T) -> JoinHandle[T]
-  let exec = global_executor()
-  exec.submit_with_result(func, TaskPriority::High)
+  let executor = Executor { inner: global_executor() }
+  executor.submit_with_result(func, TaskPriority::High)
 end
 
 ## Yield the current task to allow other tasks to run
@@ -944,7 +990,8 @@ def is_executor_thread() -> Bool
   let current = current_thread()
   match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec) then
-    for thread in exec.threads do
+    let inner = exec.ptr.as_ref()
+    for thread in inner.threads do
       if thread.id() == current.id() then
         return true
       end
@@ -960,8 +1007,18 @@ end
 
 impl Drop for Executor
   def drop(inout self: Executor) -> Unit
-    if !self.shutdown.load() then
-      self.shutdown()
+    # The wrapper's Drop shuts the executor down ONLY when this is the
+    # LAST wrapper-visible owner (strong_count == 1): the worker threads
+    # hold their own Arc clones (count >= 2 while they run), and the
+    # convenience functions build transient wrappers around
+    # global_executor() — neither may tear the shared executor down. The
+    # worker threads exit when the shutdown flag is set; the inner
+    # allocation releases when the last Arc clone drops.
+    if self.inner.strong_count() == 1 then
+      let inner = self.inner.ptr.as_ref()
+      if !inner.shutdown.load() then
+        self.shutdown()
+      end
     end
   end
 end

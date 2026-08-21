@@ -101,12 +101,22 @@ def SYS_OPEN() -> Int = 2
 # capacity (resize exposes len onto the spare — the zero-fill is
 # written over by the read), read through the sub-view onto the exposed
 # region, and commit with a truncating resize (a pure len store — the
-# bytes read are never re-touched). A view is never constructed with a
-# zero writable extent after a clear.
+# bytes read are never re-touched). The writable extent is the SPARE
+# CAPACITY (capacity - len), so after a partial read the next iteration
+# exposes the remaining spare — a view is never constructed with a zero
+# writable extent after a clear or a partial commit.
 
 # Read until EOF into `out`, appending. On Err the Vec's length is
 # restored to its pre-call length; on Ok the appended bytes are
 # committed. Returns the total bytes appended.
+#
+# The writable extent is the buffer's SPARE CAPACITY: the logical length
+# is exposed over the whole capacity (the zero-fill is written over by
+# the read) and the view onto [start, capacity) is filled. After a
+# partial read (len < capacity) the next iteration exposes the remaining
+# capacity - len spare bytes, so the view is NEVER zero-length — a large
+# stream that delivers short reads is accumulated until the true EOF
+# instead of terminating after its first partial chunk.
 def read_to_end[R: Read](inout r: R, inout out: Vec[u8]) -> Result[Int, IOError]
   var total = 0
   loop
@@ -114,7 +124,8 @@ def read_to_end[R: Read](inout r: R, inout out: Vec[u8]) -> Result[Int, IOError]
     if start == out.capacity() then
       out.resize(start + 4096, 0)
     end
-    let exposed = out.len() - start
+    out.resize(out.capacity(), 0)
+    let exposed = out.capacity() - start
     var view = out.as_mut_slice().sub(start, exposed as UInt)
     match r.read(view)
     when Result::Ok(n) then
@@ -133,7 +144,18 @@ end
 
 # Read one line (up to and including '\n'; a trailing '\r' is dropped)
 # into an owned String. The line growth uses the same expose-read-commit
-# pattern as read_to_end.
+# pattern as read_to_end: the writable extent is the SPARE CAPACITY, so
+# a line spanning many short reads is never truncated by a zero-length
+# view after a partial chunk.
+#
+# OVER-CONSUMPTION CONTRACT: a generic Read has no reader-side buffer,
+# so this free function CANNOT push back — when the newline falls in the
+# middle of a chunk, the bytes after it have already been consumed from
+# `r` and are LOST (unavailable to the next call). That is inherent to
+# the free-function shape. For lossless line iteration (e.g. two
+# consecutive lines delivered by one underlying read), use
+# BufReader::read_line — the buffered variant retains the unread suffix
+# in its internal buffer and is the sound path.
 def read_line[R: Read](inout r: R) -> Result[String, IOError]
   var bytes = Vec[u8]::new()
   loop
@@ -141,7 +163,8 @@ def read_line[R: Read](inout r: R) -> Result[String, IOError]
     if start == bytes.capacity() then
       bytes.resize(start + 256, 0)
     end
-    let exposed = bytes.len() - start
+    bytes.resize(bytes.capacity(), 0)
+    let exposed = bytes.capacity() - start
     var view = bytes.as_mut_slice().sub(start, exposed as UInt)
     let n = r.read(view)?
     if n <= 0 then
@@ -156,7 +179,12 @@ def read_line[R: Read](inout r: R) -> Result[String, IOError]
     while i < n do
       let byte = bytes[start + i]
       if byte == 10u8 then # '\n'
-        if bytes[bytes.len() - 1] == 13u8 then # drop trailing '\r'
+        # The line is bytes[0 .. start+i): truncate the committed chunk
+        # at the newline, then strip the '\r' that PRECEDES it — the byte
+        # before the newline, not the last committed byte (which was the
+        # '\n' itself).
+        bytes.resize(start + i, 0)
+        if !bytes.is_empty() && bytes[bytes.len() - 1] == 13u8 then
           let _ = bytes.pop()
         end
         return Result::Ok(String::from_bytes(bytes))
@@ -348,6 +376,11 @@ impl[R: Read] BufReader[R]
     Result::Ok(self.buf.clone())
   end
 
+  # The buffered, lossless read_line — the sound path for line
+  # iteration: the unread suffix AFTER the '\n' stays in the internal
+  # buffer (pos..cap) and is served by the NEXT call, so two consecutive
+  # lines from one underlying read are never lost. A trailing '\r'
+  # before the '\n' is stripped from the returned line.
   def read_line(inout self: Self) -> Result[String, IOError]
     var line = Vec[u8]::new()
     loop
@@ -362,6 +395,11 @@ impl[R: Read] BufReader[R]
         let byte = self.buf[self.pos]
         self.pos = self.pos + 1
         if byte == 10u8 then # '\n'
+          # The '\n' is never pushed into `line`, so line's last byte IS
+          # the byte before the newline — drop a trailing '\r' there.
+          if !line.is_empty() && line[line.len() - 1] == 13u8 then
+            let _ = line.pop()
+          end
           return Result::Ok(String::from_bytes(line))
         end
         line.push(byte)

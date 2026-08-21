@@ -103,6 +103,28 @@ struct FrameInfo
   spill_offset: i32         # current spill position
   saved_regs: Vec[PhysReg]  # callee-saved regs used
   sret_offset: i32          # FP offset where x8 is saved (0 = no sret)
+  # The per-invocation BUDGET slots (FP-relative offsets; 0 = the function
+  # carries no statements for that metric). The budget counters moved from
+  # the global .data table into the generated function's STACK FRAME, so
+  # every invocation of a budgeted function gets its own counter/stamp:
+  #   * budget_alloc_offset — the ALLOCATION metric's consumed-units
+  #     counter ([FP + offset]); the prologue zeroes it at entry (each
+  #     invocation counts from zero — two calls of the same budgeted
+  #     function never share a counter, nested/recursive invocations use
+  #     their own frame slots, and per-thread stacks make concurrent calls
+  #     race-free).
+  #   * budget_time_offset — the TIME metric's entry-timestamp slot
+  #     ([FP + offset]); the __tg_budget_time_start MirEffectRecord stamps
+  #     it with __tg_clock_ns at function entry and the exit
+  #     MirBudgetConsume("time", _) reads it back — nesting works because
+  #     the inner invocation's frame is separate.
+  # Both offsets are reserved FIRST in allocate_locals (spill_off starts
+  # at -8), so they sit at the top of the spill area, never collide with
+  # other spills (those continue below) or the callee-saved saves (the
+  # bottom of the frame), and stay within the a64 LDUR/STUR -256..255
+  # range for every function.
+  budget_alloc_offset: i32 = 0
+  budget_time_offset: i32 = 0
 end
 
 struct FnCodegenCtx
@@ -392,7 +414,7 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
           panic("ICE: concrete instance '" + ckey + "' has no registered MIR type definition")
         end
       end
-    when Type::Closure(_, _, _, _) then
+    when Type::Closure(_, _, _, _, _) then
  # (the closure {code, env} ABI): the closure OBJECT's layout —
       # { code: fn ptr @ 0, env: capture-tuple } — registered by the
       # ClosureId-keyed concrete identity (closure_object_record computes
@@ -449,12 +471,12 @@ def collect_concrete_adt_types(ty: Type, inout out: Vec[Type]) -> Unit
     end
   when Type::FixedArray(elem, _) then
     collect_concrete_adt_types(elem, out)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     for p in params do
       collect_concrete_adt_types(&p.ty, out)
     end
     collect_concrete_adt_types(ret, out)
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     out.push(ty.clone())
     for p in params do
       collect_concrete_adt_types(&p.ty, out)
@@ -724,12 +746,56 @@ def saved_reg_bytes(saved: Vec[PhysReg]) -> Int
   count * 8
 end
 
+# Which budget frame slots a function's MIR needs: scan the lowered body
+# for the budget statements the lowering emits (the allocation consumes —
+# MirBudgetConsume("alloc", _) after each intrinsic allocation — and the
+# time entry/exit pair — the __tg_budget_time_start MirEffectRecord plus
+# the MirBudgetConsume("time", _) exit checks). The scan is the slot-
+# reservation authority: a function that carries no such statement never
+# reserves frame space, and a function that does always finds its slots
+# reserved when the codegen arms address them.
+def func_budget_slot_usage(func: MirFunction) -> (Bool, Bool)
+  var needs_alloc = false
+  var needs_time = false
+  for block in func.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirBudgetConsume(resource, _) then
+        if resource == "alloc" then needs_alloc = true
+        elsif resource == "time" then needs_time = true
+        end
+      when MirStatementKind::MirEffectRecord(name, _) then
+        if name == "__tg_budget_time_start" then needs_time = true end
+      when _ then ()
+      end
+    end
+  end
+  (needs_alloc, needs_time)
+end
+
 def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -> (Map[Int, VarLoc], FrameInfo)
   var ra = reg_alloc_new(arch)
   var local_offsets: Map[Int, Int] = Map::new()
   var var_locs: Map[Int, VarLoc] = Map::new()
   var spill_off: i32 = 0  # next spill starts at [fp - 8]
   var address_taken_locals: Set[Int] = Set::new()
+
+  # The per-invocation budget slots: reserved FIRST (before the sret slot
+  # and every spill), so their FP offsets are fixed at -8/-16 and every
+  # MirBudgetConsume / __tg_budget_time_start arm in the function's body
+  # addresses them through fctx.frame. A function that carries no budget
+  # statements never reserves (its frame stays unchanged).
+  var budget_alloc_offset: i32 = 0
+  var budget_time_offset: i32 = 0
+  let (fn_needs_alloc, fn_needs_time) = func_budget_slot_usage(func)
+  if fn_needs_alloc then
+    spill_off = spill_off - 8
+    budget_alloc_offset = spill_off
+  end
+  if fn_needs_time then
+    spill_off = spill_off - 8
+    budget_time_offset = spill_off
+  end
 
   # sret ABI: if the return type (local 0) has a sret-eligible value
   # category (ScalarPair/ByAddress — see category_uses_sret, the single
@@ -886,7 +952,9 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
     local_offsets: local_offsets,
     spill_offset: codegen_spill_start,
     saved_regs: saved,
-    sret_offset: sret_offset
+    sret_offset: sret_offset,
+    budget_alloc_offset: budget_alloc_offset,
+    budget_time_offset: budget_time_offset
   }
 
   (var_locs, frame)
@@ -5986,62 +6054,82 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
     def_label(&mut ctx.text, ok_label)
 
   when MirStatementKind::MirBudgetConsume(resource, amount) then
-    # REAL budget enforcement (the fail-closed placeholder arm became the
-    # check): the __tg_budget_<resource> counter (the .data slot the
-    # runtime's data section defines — emit_budget_runtime_data) counts
-    # CONSUMED UNITS from zero; this statement consumes ONE unit (the
-    # allocation metric — the annotated function's intrinsic allocations)
-    # or measures the ELAPSED clock against the entry stamp (the time
-    # metric's exit check). The amount payload is the function's DECLARED
-    # LIMIT for the resource (the typed budget's bound); the limit
-    # exceeded -> the runtime traps (budget exhausted).
+    # REAL budget enforcement: the budget state lives in THIS invocation's
+    # STACK FRAME (the slots allocate_locals reserved — FrameInfo's
+    # budget_alloc_offset / budget_time_offset), never in global .data, so
+    # two calls of the same budgeted function never share a counter, nested
+    # and recursive budgeted calls each get their own frame slots, and
+    # concurrent calls on per-thread stacks cannot race. The amount payload
+    # is the function's DECLARED LIMIT for the resource (the typed budget's
+    # bound); the limit exceeded -> the runtime traps (budget exhausted).
+    let fp = fp_reg(ctx.target.arch)
     let scratch = scratch_reg(ctx.target.arch)
     let scratch2 = scratch2_reg(ctx.target.arch)
     if resource == "time" then
-      # The time metric's exit check: elapsed = now - entry stamp
-      # (__tg_budget_time, set by the __tg_budget_time_start record at
-      # function entry); trap when elapsed exceeds the declared limit.
-      emit_call_direct(ctx, "__tg_clock_ns".to_string())
-      emit_lea_global(ctx, "__tg_budget_time".to_string(), scratch)
-      emit_load_indirect(ctx, scratch, 0, scratch2)
-      emit_sub_rrr(ctx, rr, rr, scratch2)
-      emit_mov_ri(ctx, scratch, amount as i64)
-      emit_cmp_rr(ctx, rr, scratch)
-      let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
-      ctx.fn_counter = ctx.fn_counter + 1
-      emit_jcc(ctx, CondKind::Le, ok_label.clone())
-      emit_trap(ctx)
-      def_label(&mut ctx.text, ok_label)
+      # The time metric's exit check: elapsed = now - entry stamp (the
+      # frame slot the __tg_budget_time_start record stamped at entry);
+      # trap when elapsed exceeds the declared limit.
+      if fctx.frame.budget_time_offset == 0 then
+        # Fail-closed: a time consume in a function whose frame carries no
+        # time slot is a lowering defect, never a silent [FP+0] write.
+        emit_trap(ctx)
+      else
+        emit_call_direct(ctx, "__tg_clock_ns".to_string())
+        emit_load_mem(ctx, scratch2, fp, fctx.frame.budget_time_offset)
+        emit_sub_rrr(ctx, rr, rr, scratch2)
+        emit_mov_ri(ctx, scratch, amount as i64)
+        emit_cmp_rr(ctx, rr, scratch)
+        let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+        ctx.fn_counter = ctx.fn_counter + 1
+        emit_jcc(ctx, CondKind::Le, ok_label.clone())
+        emit_trap(ctx)
+        def_label(&mut ctx.text, ok_label)
+      end
+    elsif resource == "alloc" then
+      # The allocation metric's consume: increment this invocation's
+      # frame-slot counter by one; trap when it exceeds the limit.
+      if fctx.frame.budget_alloc_offset == 0 then
+        # Fail-closed: an alloc consume without a reserved frame slot is a
+        # lowering defect (the slot scan is the authority), never a
+        # silent [FP+0] write.
+        emit_trap(ctx)
+      else
+        emit_load_mem(ctx, scratch2, fp, fctx.frame.budget_alloc_offset)
+        emit_add_ri(ctx, scratch2, 1)
+        emit_store_mem(ctx, fp, fctx.frame.budget_alloc_offset, scratch2)
+        emit_mov_ri(ctx, rr, amount as i64)
+        emit_cmp_rr(ctx, scratch2, rr)
+        let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+        ctx.fn_counter = ctx.fn_counter + 1
+        emit_jcc(ctx, CondKind::Le, ok_label.clone())
+        emit_trap(ctx)
+        def_label(&mut ctx.text, ok_label)
+      end
     else
-      # The allocation metric's consume: increment the resource's
-      # consumed-units counter by one; trap when it exceeds the limit.
-      let budget_sym = "__tg_budget_" + resource.clone()
-      emit_lea_global(ctx, budget_sym.clone(), scratch)
-      emit_load_indirect(ctx, scratch, 0, scratch2)
-      emit_add_ri(ctx, scratch2, 1)
-      emit_store_indirect(ctx, scratch2, scratch, 0)
-      emit_mov_ri(ctx, rr, amount as i64)
-      emit_cmp_rr(ctx, scratch2, rr)
-      let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
-      ctx.fn_counter = ctx.fn_counter + 1
-      emit_jcc(ctx, CondKind::Le, ok_label.clone())
+      # Any other resource the lowering never emits (the budget discipline
+      # only constructs "alloc"/"time" consumes — budget_metric_enforced)
+      # is a lowering defect: fail closed with a trap.
       emit_trap(ctx)
-      def_label(&mut ctx.text, ok_label)
     end
 
   when MirStatementKind::MirEffectRecord(name, operand) then
     if name == "__tg_budget_time_start" then
-      # REAL time-budget ENTRY: stamp the __tg_budget_time data slot with
-      # the monotonic clock (__tg_clock_ns — the clock_gettime runtime
-      # helper) — the exit MirBudgetConsume("time", _) compares the
-      # elapsed clock against the declared limit. (The fail-closed
-      # placeholder arm became the real check; the __tg_effect_record
-      # effect LOG itself remains a trap stub — no source lowering
-      # constructs effect records.)
-      let scratch = scratch_reg(ctx.target.arch)
-      emit_call_direct(ctx, "__tg_clock_ns".to_string())
-      emit_lea_global(ctx, "__tg_budget_time".to_string(), scratch)
-      emit_store_indirect(ctx, rr, scratch, 0)
+      # REAL time-budget ENTRY: stamp THIS invocation's time slot (the
+      # frame slot allocate_locals reserved) with the monotonic clock
+      # (__tg_clock_ns — the clock_gettime runtime helper) — the exit
+      # MirBudgetConsume("time", _) compares the elapsed clock against the
+      # declared limit. Per-invocation semantics: the slot belongs to this
+      # frame, so nested/recursive budgeted calls stamp their own slots.
+      # (The fail-closed placeholder arm became the real check; the
+      # __tg_effect_record effect LOG itself remains a trap stub — no
+      # source lowering constructs effect records.)
+      if fctx.frame.budget_time_offset == 0 then
+        emit_trap(ctx)
+      else
+        let fp = fp_reg(ctx.target.arch)
+        emit_call_direct(ctx, "__tg_clock_ns".to_string())
+        emit_store_mem(ctx, fp, fctx.frame.budget_time_offset, rr)
+      end
     else
       # Record an effect by pushing it to the effect log
       # Call __tg_effect_record(name_ptr, value)
@@ -6449,7 +6537,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
   match callee.kind
   when MirOperandKind::MirCopy(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -6460,7 +6548,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirMovePlace(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -6471,7 +6559,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirRead(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -6482,7 +6570,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirConsume(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -10164,62 +10252,82 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
     def_label(&mut ctx.text, ok_label)
 
   when MirStatementKind::MirBudgetConsume(resource, amount) then
-    # REAL budget enforcement (the fail-closed placeholder arm became the
-    # check): the __tg_budget_<resource> counter (the .data slot the
-    # runtime's data section defines — emit_budget_runtime_data) counts
-    # CONSUMED UNITS from zero; this statement consumes ONE unit (the
-    # allocation metric — the annotated function's intrinsic allocations)
-    # or measures the ELAPSED clock against the entry stamp (the time
-    # metric's exit check). The amount payload is the function's DECLARED
-    # LIMIT for the resource (the typed budget's bound); the limit
-    # exceeded -> the runtime traps (budget exhausted).
+    # REAL budget enforcement: the budget state lives in THIS invocation's
+    # STACK FRAME (the slots allocate_locals reserved — FrameInfo's
+    # budget_alloc_offset / budget_time_offset), never in global .data, so
+    # two calls of the same budgeted function never share a counter, nested
+    # and recursive budgeted calls each get their own frame slots, and
+    # concurrent calls on per-thread stacks cannot race. The amount payload
+    # is the function's DECLARED LIMIT for the resource (the typed budget's
+    # bound); the limit exceeded -> the runtime traps (budget exhausted).
+    let fp = fp_reg(ctx.target.arch)
     let scratch = scratch_reg(ctx.target.arch)
     let scratch2 = scratch2_reg(ctx.target.arch)
     if resource == "time" then
-      # The time metric's exit check: elapsed = now - entry stamp
-      # (__tg_budget_time, set by the __tg_budget_time_start record at
-      # function entry); trap when elapsed exceeds the declared limit.
-      emit_call_direct(ctx, "__tg_clock_ns".to_string())
-      emit_lea_global(ctx, "__tg_budget_time".to_string(), scratch)
-      emit_load_indirect(ctx, scratch, 0, scratch2)
-      emit_sub_rrr(ctx, rr, rr, scratch2)
-      emit_mov_ri(ctx, scratch, amount as i64)
-      emit_cmp_rr(ctx, rr, scratch)
-      let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
-      ctx.fn_counter = ctx.fn_counter + 1
-      emit_jcc(ctx, CondKind::Le, ok_label.clone())
-      emit_trap(ctx)
-      def_label(&mut ctx.text, ok_label)
+      # The time metric's exit check: elapsed = now - entry stamp (the
+      # frame slot the __tg_budget_time_start record stamped at entry);
+      # trap when elapsed exceeds the declared limit.
+      if fctx.frame.budget_time_offset == 0 then
+        # Fail-closed: a time consume in a function whose frame carries no
+        # time slot is a lowering defect, never a silent [FP+0] write.
+        emit_trap(ctx)
+      else
+        emit_call_direct(ctx, "__tg_clock_ns".to_string())
+        emit_load_mem(ctx, scratch2, fp, fctx.frame.budget_time_offset)
+        emit_sub_rrr(ctx, rr, rr, scratch2)
+        emit_mov_ri(ctx, scratch, amount as i64)
+        emit_cmp_rr(ctx, rr, scratch)
+        let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+        ctx.fn_counter = ctx.fn_counter + 1
+        emit_jcc(ctx, CondKind::Le, ok_label.clone())
+        emit_trap(ctx)
+        def_label(&mut ctx.text, ok_label)
+      end
+    elsif resource == "alloc" then
+      # The allocation metric's consume: increment this invocation's
+      # frame-slot counter by one; trap when it exceeds the limit.
+      if fctx.frame.budget_alloc_offset == 0 then
+        # Fail-closed: an alloc consume without a reserved frame slot is a
+        # lowering defect (the slot scan is the authority), never a
+        # silent [FP+0] write.
+        emit_trap(ctx)
+      else
+        emit_load_mem(ctx, scratch2, fp, fctx.frame.budget_alloc_offset)
+        emit_add_ri(ctx, scratch2, 1)
+        emit_store_mem(ctx, fp, fctx.frame.budget_alloc_offset, scratch2)
+        emit_mov_ri(ctx, rr, amount as i64)
+        emit_cmp_rr(ctx, scratch2, rr)
+        let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+        ctx.fn_counter = ctx.fn_counter + 1
+        emit_jcc(ctx, CondKind::Le, ok_label.clone())
+        emit_trap(ctx)
+        def_label(&mut ctx.text, ok_label)
+      end
     else
-      # The allocation metric's consume: increment the resource's
-      # consumed-units counter by one; trap when it exceeds the limit.
-      let budget_sym = "__tg_budget_" + resource.clone()
-      emit_lea_global(ctx, budget_sym.clone(), scratch)
-      emit_load_indirect(ctx, scratch, 0, scratch2)
-      emit_add_ri(ctx, scratch2, 1)
-      emit_store_indirect(ctx, scratch2, scratch, 0)
-      emit_mov_ri(ctx, rr, amount as i64)
-      emit_cmp_rr(ctx, scratch2, rr)
-      let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
-      ctx.fn_counter = ctx.fn_counter + 1
-      emit_jcc(ctx, CondKind::Le, ok_label.clone())
+      # Any other resource the lowering never emits (the budget discipline
+      # only constructs "alloc"/"time" consumes — budget_metric_enforced)
+      # is a lowering defect: fail closed with a trap.
       emit_trap(ctx)
-      def_label(&mut ctx.text, ok_label)
     end
 
   when MirStatementKind::MirEffectRecord(name, operand) then
     if name == "__tg_budget_time_start" then
-      # REAL time-budget ENTRY: stamp the __tg_budget_time data slot with
-      # the monotonic clock (__tg_clock_ns — the clock_gettime runtime
-      # helper) — the exit MirBudgetConsume("time", _) compares the
-      # elapsed clock against the declared limit. (The fail-closed
-      # placeholder arm became the real check; the __tg_effect_record
-      # effect LOG itself remains a trap stub — no source lowering
-      # constructs effect records.)
-      let scratch = scratch_reg(ctx.target.arch)
-      emit_call_direct(ctx, "__tg_clock_ns".to_string())
-      emit_lea_global(ctx, "__tg_budget_time".to_string(), scratch)
-      emit_store_indirect(ctx, rr, scratch, 0)
+      # REAL time-budget ENTRY: stamp THIS invocation's time slot (the
+      # frame slot allocate_locals reserved) with the monotonic clock
+      # (__tg_clock_ns — the clock_gettime runtime helper) — the exit
+      # MirBudgetConsume("time", _) compares the elapsed clock against the
+      # declared limit. Per-invocation semantics: the slot belongs to this
+      # frame, so nested/recursive budgeted calls stamp their own slots.
+      # (The fail-closed placeholder arm became the real check; the
+      # __tg_effect_record effect LOG itself remains a trap stub — no
+      # source lowering constructs effect records.)
+      if fctx.frame.budget_time_offset == 0 then
+        emit_trap(ctx)
+      else
+        let fp = fp_reg(ctx.target.arch)
+        emit_call_direct(ctx, "__tg_clock_ns".to_string())
+        emit_store_mem(ctx, fp, fctx.frame.budget_time_offset, rr)
+      end
     else
       # Record an effect by pushing it to the effect log
       # Call __tg_effect_record(name_ptr, value)
@@ -10627,7 +10735,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
   match callee.kind
   when MirOperandKind::MirCopy(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -10638,7 +10746,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirMovePlace(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -10649,7 +10757,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirRead(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -10660,7 +10768,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   when MirOperandKind::MirConsume(place) then
     match operand_type(ctx, fctx, callee)
-    when Type::Closure(_, _, _, captures) then
+    when Type::Closure(_, _, _, captures, _) then
       closure_shift = capture_tuple_len(&captures)
       match captures
       when Type::Tuple(t) then closure_cap_tys = t.clone()
@@ -10896,7 +11004,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
       end
     when MirConstantKind::MirZeroSized then
       match cst.ty
-      when Type::FnPtr(_, _) | Type::Closure(_, _, _, _) then
+      when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then
         emit_trap(ctx)
       when _ then
         emit_trap(ctx)
@@ -12795,6 +12903,18 @@ def codegen_prologue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
       end
       si = si + 1
     end
+  end
+
+  # The per-invocation ALLOCATION counter: zero the function's budget slot
+  # at entry, so every invocation of a budgeted function counts its own
+  # consumed units from zero (the counter never leaks across calls,
+  # nested/recursive invocations, or concurrent per-thread stacks). The
+  # TIME slot needs no prologue action — the __tg_budget_time_start
+  # MirEffectRecord (the entry block's first statement) stamps it.
+  if fctx.frame.budget_alloc_offset != 0 then
+    let zr = scratch_reg(arch)
+    emit_zero_reg(ctx, zr)
+    emit_store_mem(ctx, fp, fctx.frame.budget_alloc_offset, zr)
   end
 
   # Move register-assigned params from ABI regs to their assigned regs.
@@ -17491,51 +17611,19 @@ end
 # ———————————————————————————————————————————————————————————————
 # Budget Enforcement Data Section Storage
 # ———————————————————————————————————————————————————————————————
-# The budget counter table the MirBudgetConsume / MirEffectRecord
-# enforcement arms operate on (codegen_statement): one 8-byte slot per
-# enforced resource —
-#   * __tg_budget_alloc — the ALLOCATION metric's CONSUMED-UNITS counter:
-#     each intrinsic allocation in an @budget-annotated function
-#     increments it (the lowering emits the MirBudgetConsume); the
-#     statement's amount payload is the function's declared limit, and
-#     the codegen traps when the counter exceeds it. Zero-initialized —
-#     the counters count UP from 0 (the limits ride the MIR statements,
-#     so the slots are per-resource, never per-function).
-#   * __tg_budget_time — the TIME metric's ENTRY-TIMESTAMP slot: stamped
-#     by the __tg_budget_time_start record at function entry (the
-#     __tg_clock_ns runtime helper); the exit MirBudgetConsume("time", _)
-#     compares the elapsed clock against the declared limit.
-# Previously undefined (fail-closed at link when emitted); the definitions
-# are the budget counters the reviewer's "runtime enforcement where
-# required" demands.
-def emit_budget_runtime_data(inout ctx: CodegenCtx) -> Unit
-  while (buf_pos(&ctx.data) % 8) != 0 do
-    emit8(&mut ctx.data, 0)
-  end
-  let alloc_budget_off = buf_pos(&ctx.data)
-  add_symbol(&mut ctx.data, AsmSymbol {
-    name: "__tg_budget_alloc".to_string(),
-    section: Section::Data,
-    offset: alloc_budget_off,
-    size: 8,
-    binding: SymBinding::Global,
-    kind: SymKind::Data
-  })
-  def_label(&mut ctx.data, "__tg_budget_alloc".to_string())
-  emit64_le(&mut ctx.data, 0)
-
-  let time_budget_off = buf_pos(&ctx.data)
-  add_symbol(&mut ctx.data, AsmSymbol {
-    name: "__tg_budget_time".to_string(),
-    section: Section::Data,
-    offset: time_budget_off,
-    size: 8,
-    binding: SymBinding::Global,
-    kind: SymKind::Data
-  })
-  def_label(&mut ctx.data, "__tg_budget_time".to_string())
-  emit64_le(&mut ctx.data, 0)
-end
+# The budget counters NO LONGER live in .data — the global counter table
+# (the former __tg_budget_alloc / __tg_budget_time slots) was removed with
+# the semantics fix: the counters moved into the generated function's STACK
+# FRAME (FrameInfo.budget_alloc_offset / budget_time_offset — reserved by
+# allocate_locals and zeroed/stamped by the prologue and the
+# __tg_budget_time_start record arm). Global counters broke the budget
+# semantics three ways — two calls of the same budgeted function shared one
+# counter, nested budgeted calls overwrote the single global time stamp,
+# and concurrent calls raced the shared slots. The frame slots are
+# per-invocation (each invocation's frame), per-nesting (inner frames are
+# separate), and per-thread (per-thread stacks) by construction.
+# The runtime emits no budget data symbols; the __tg_clock_ns helper
+# (runtime.tg) remains the time metric's clock.
 
 # ———————————————————————————————————————————————————————————————
 # Allocator Runtime Data Section Storage
@@ -17753,8 +17841,10 @@ def generate_native(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], S
   emit_argc_argv_data(&mut ctx)
   # Free-list allocator state (heads, outstanding counter, fail flag).
   emit_allocator_runtime_data(&mut ctx)
-  # Budget enforcement counters (__tg_budget_alloc / __tg_budget_time).
-  emit_budget_runtime_data(&mut ctx)
+  # No budget data symbols: the budget counters live in each budgeted
+  # function's STACK FRAME (FrameInfo.budget_alloc_offset /
+  # budget_time_offset), not in .data — per-invocation, nesting-safe,
+  # race-free.
 
   # Combine text symbols with data, rodata, and BSS symbols so the
   # linker can resolve all cross-section relocations.
@@ -17855,8 +17945,10 @@ def generate_executable(program: MirProgram, target: AsmTarget, output_path: Str
   emit_argc_argv_data(&mut ctx)
   # Free-list allocator state (heads, outstanding counter, fail flag).
   emit_allocator_runtime_data(&mut ctx)
-  # Budget enforcement counters (__tg_budget_alloc / __tg_budget_time).
-  emit_budget_runtime_data(&mut ctx)
+  # No budget data symbols: the budget counters live in each budgeted
+  # function's STACK FRAME (FrameInfo.budget_alloc_offset /
+  # budget_time_offset), not in .data — per-invocation, nesting-safe,
+  # race-free.
 
   # Combine symbols from all sections + convert labels to symbols for cross-section refs
   var all_symbols = ctx.text.symbols.clone()

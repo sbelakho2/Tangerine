@@ -411,12 +411,70 @@ fact "budget time entry marker (__tg_budget_time_start)" \
   '__tg_budget_time_start' "$ROOT/tg_compiler/codegen.tg"
 fact "budget clock runtime (__tg_clock_ns)" \
   'def emit_tg_clock_ns' "$ROOT/tg_compiler/runtime.tg"
-fact "budget static-exceed rejection (check_budget_static_exceed)" \
-  'check_budget_static_exceed' "$ROOT/tg_compiler/mir.tg"
+fact "budget runtime enforcement only (the static allocation-site rejection removed)" \
+  'budget_alloc_offset' "$ROOT/tg_compiler/codegen.tg"
 fact "budget positive canary (within the limit)" \
   'canary_pos_budget_alloc_within' "$ROOT/tests/canary/MANIFEST"
-fact "budget negative canary (exceeded -> budget exceeded)" \
-  'canary_neg_budget_alloc_exceeded' "$ROOT/tests/canary_neg/MANIFEST"
+fact "budget runtime-trap enforcement script (run_budget_enforcement_tests)" \
+  'run_budget_enforcement_tests' "$ROOT/tests/run_budget_enforcement_tests.sh"
+
+# ── round-14 facts: the std::db driver hardening ─────────────────────
+# Postgres: the JDBC `?` placeholder of a parameterized statement is
+# TRANSLATED to PostgreSQL's $1..$n positional parameters before
+# PQexecParams/PQprepare (a quoted-string-aware scan — a `?` inside a
+# single-quoted literal or double-quoted identifier is data); every
+# parameter payload lives in the explicit PgParamBacking (blob bytes
+# copied into owned buffers that live through the FFI call — no dangling
+# pointers); the Statement carries the backend state (the connection
+# handle + the server-side statement name + the parameter count) so
+# execute/query run the PQprepare'd statement through PQexecPrepared with
+# a deterministic DEALLOCATE cleanup on drop.
+fact 'Postgres ? -> $n translation (postgres_translate_placeholders)' \
+  'postgres_translate_placeholders' "$ROOT/std/db.tg"
+fact "Postgres translation is quoted-string aware" \
+  'in_single_quote' "$ROOT/std/db.tg"
+fact "PgParamBacking owns the parameter payloads" \
+  'struct PgParamBacking' "$ROOT/std/db.tg"
+fact "PgParamBacking owns the blob bytes (owned_buffers push)" \
+  'owned_buffers' "$ROOT/std/db.tg"
+fact "Postgres prepared execution via PQexecPrepared" \
+  'PQexecPrepared' "$ROOT/std/db.tg"
+fact "Postgres statement cleanup DEALLOCATEs the server-side statement" \
+  'DEALLOCATE' "$ROOT/std/db.tg"
+fact "Statement carries the backend connection + identity + param metadata" \
+  'conn_handle' "$ROOT/std/db.tg"
+# MySQL: the prepared path uses the REAL MYSQL_BIND parameter binding —
+# the mysql.h st_mysql_bind layout (MysqlBind), mysql_stmt_bind_param
+# with the per-parameter buffer_type/length/is_null/buffer cells, and
+# mysql_stmt_execute with the bindings — the manual interpolation is gone
+# from every execution path; the integration test covers the hostile
+# values (' \ \\ \0 ' OR 1=1 --, multibyte text, binary blobs) as data.
+fact "MYSQL_BIND struct declared (mysql.h layout)" \
+  'struct MysqlBind' "$ROOT/std/db.tg"
+fact "mysql_stmt_bind_param bound (real MYSQL_BIND binding)" \
+  'mysql_stmt_bind_param' "$ROOT/std/db.tg"
+fact "MySQL per-parameter cells (length/is_null/buffer)" \
+  'length_cells' "$ROOT/std/db.tg"
+# The manual interpolation is REMOVED — every parameterized MySQL
+# statement goes through the real MYSQL_BIND binding.
+if grep -q 'mysql_interpolate' "$ROOT/std/db.tg"; then
+  printf '  [MISSING] std/db.tg still carries the manual mysql_interpolate path\n' >&2
+  fail=1
+else
+  printf '  [ok] manual MySQL interpolation is gone from the execution paths\n'
+fi
+fact "MySQL integration test hostile-value case" \
+  'OR 1=1 --' "$ROOT/tests/db_mysql_integration_test.tg"
+fact "MySQL integration test multibyte case" \
+  'héllo wörld' "$ROOT/tests/db_mysql_integration_test.tg"
+fact "MySQL integration test binary blob case" \
+  'kv_bin' "$ROOT/tests/db_mysql_integration_test.tg"
+fact "Postgres integration test exercises the ? placeholder translation" \
+  'VALUES \(\?\)' "$ROOT/tests/db_postgres_integration_test.tg"
+fact "Postgres integration test exercises the blob backing" \
+  'kv_blob' "$ROOT/tests/db_postgres_integration_test.tg"
+fact "Postgres integration test exercises prepared statements" \
+  'prepare' "$ROOT/tests/db_postgres_integration_test.tg"
 
 # ── working-tree file list ─────────────────────────────────────────────────
 WT="$(git -C "$ROOT" status --porcelain)"
@@ -634,6 +692,32 @@ CURRENT STATE (structural, verified against the tested tree):
   (canary_pos_budget_alloc_within, canary_neg_budget_alloc_exceeded).
   Enforced metrics: alloc (count-based) + time (elapsed); memory /
   iterations / calls / custom metric names parse but emit no checks.
+  No ladder/CI run has occurred on this tree.
+- Round-14 state (working tree at $SHA + the uncommitted round-14 work
+  in the WORKING TREE list above; HEAD is bccea59): the std::db driver
+  hardening — PostgreSQL: the JDBC \`?\` placeholder of every
+  parameterized statement is TRANSLATED to the \$1..\$n positional form
+  (postgres_translate_placeholders — the scan is quoted-string aware,
+  so a \`?\` inside a string literal or quoted identifier is data) before
+  PQexecParams, every parameter payload is owned by the explicit
+  PgParamBacking (the blob's bytes copied into owned_buffers that live
+  through the FFI call — the dangling-blob-pointer path is gone), and
+  the Statement gained the backend-specific state (the connection
+  handle, the server-side prepared-statement name, and the parameter
+  count) so the prepared statements run REAL server-side execution
+  (PQprepare at prepare() time, PQexecPrepared at execute/query time,
+  DEALLOCATE on drop/finalize — the "requires connection context" stub
+  is gone). MySQL: the prepared path uses the REAL MYSQL_BIND parameter
+  binding — the mysql.h st_mysql_bind layout (MysqlBind), the
+  mysql_stmt_bind_param call with the per-parameter
+  buffer_type/length/is_null/buffer cells (MysqlParamBacking), and the
+  mysql_stmt_execute with the bindings — and the manual interpolation is
+  REMOVED from every execution path (hostile values, multibyte text and
+  binary blobs are shipped as data; the BLOB columns read back as
+  SqlValue::Blob). The DB integration tests cover the translation, the
+  blob backing, the prepared statements, and the hostile values. The
+  db-integration-postgres / db-integration-mysql CI lanes run the native
+  Homebrew servers (service containers are forbidden on macOS runners).
   No ladder/CI run has occurred on this tree.
 - Status vocabulary (docs/current/feature_registry.md — the CI-artifact
   evidence model): a COMMITTED test artifact (manifest-registered canary,

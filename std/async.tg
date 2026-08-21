@@ -4,7 +4,15 @@
 # executor, task spawning, channels, timers, and join handles.
 #
 # Architecture:
-# - Executor: runs tasks in a cooperative event loop
+# - Executor: a thin Arc wrapper — { inner: Arc[ExecutorInner] }. The whole
+#   scheduler state (tasks, ready queue, task states, task results, join
+#   waiters, the timer heap, the I/O reactor, the deterministic-mode state)
+#   lives in the inner's heap allocation. Wakers and JoinHandles hold
+#   their OWN Arc clone of the inner, so a task can outlive the
+#   stack-local Executor that spawned it — the same heap-stable shape the
+#   channel's Arc[ChannelInner], the AsyncMutex's Arc, and the
+#   AsyncSemaphore's Arc use. The old `self as PtrMut[Executor]` handles
+#   (which dangled the moment the stack/local executor moved) are gone.
 # - Task: a future that can be polled to completion
 # - Waker: notifies the executor that a task is ready
 # - Channel: async MPSC message passing
@@ -346,15 +354,19 @@ end
 
 struct Waker
   task_id: UInt
-  executor: PtrMut[Executor]
+  # The waker holds its OWN Arc clone of the executor inner — a task's
+  # waker keeps the executor (and the task's state) alive even after the
+  # stack-local Executor that spawned the task is dropped or moved. The
+  # old PtrMut[Executor] handle died with the stack frame.
+  executor: Arc[ExecutorInner]
 end
 
 impl Waker
   def wake(self) -> Unit
     # Mark the task as ready in the executor
     guard !self.executor.is_null() else return end
-    unsafe "dereference executor pointer — lifetime guaranteed by Executor::run" do
-      let exec = self.executor.as_mut()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let exec = self.executor.ptr.as_mut()
       exec.wake_task(self.task_id)
     end
   end
@@ -362,8 +374,8 @@ impl Waker
   def clone(self) -> Waker
     Waker {
       task_id: self.task_id,
-      executor: self.executor
-    end
+      executor: self.executor.clone()
+    }
   end
 end
 
@@ -388,17 +400,18 @@ end
 struct JoinHandle[T]
   task_id: UInt
   result: Option[T]
-  executor: PtrMut[Executor]
+  # The handle holds its OWN Arc clone of the executor inner — the handle
+  # keeps the executor (and the task's results and join waiters) alive
+  # even after the spawning Executor is dropped or moved.
+  executor: Arc[ExecutorInner]
 end
 
 impl JoinHandle[T]
   def is_finished(self) -> Bool
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let exec = self.executor.as_ref()
-      match exec.task_states.get(&self.task_id)
-      when Option::Some(TaskState::Completed) then true
-      when _ then false
-      end
+    let exec = self.executor.ptr.as_ref()
+    match exec.task_states.get(&self.task_id)
+    when Option::Some(TaskState::Completed) then true
+    when _ then false
     end
   end
 end
@@ -408,8 +421,8 @@ impl Future for JoinHandle[T]
   type Output = Result[T, String]
   
   def poll(inout self, inout cx: Context) -> Poll[Result[T, String]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let exec = self.executor.as_mut()
+    unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
+      let exec = self.executor.ptr.as_mut()
       match exec.task_results.remove(&self.task_id)
       when Option::Some(result) then
         Poll::Ready(Result::Ok(result))
@@ -426,7 +439,12 @@ end
 # Executor
 # ———————————————————————————————————————————————————————————————
 
-struct Executor
+# The scheduler state lives in a heap allocation owned by an Arc (the
+# same std::sync Arc the channel/AsyncMutex/AsyncSemaphore use). Wakers
+# and JoinHandles hold their own inner clones, so a task keeps the
+# executor alive even after the stack-local Executor that spawned it is
+# dropped or moved.
+struct ExecutorInner
   tasks: Map[UInt, Task]
   ready_queue: VecDeque[UInt]
   next_task_id: UInt
@@ -442,6 +460,16 @@ struct Executor
   seed: u64
   virtual_time: Instant
   rand_state: u64
+end
+
+# The Executor is a thin Arc wrapper over the inner — the public API
+# (new/spawn/spawn_named/run/poll_task/set_deterministic/task_count/
+# cancel_task/register_timer) stays on the wrapper; the stateful
+# scheduler methods live on ExecutorInner and are reached through the Arc
+# the wakers/handles hold. `self as PtrMut[Executor]` is gone: no handle
+# ever addresses a caller-owned stack slot.
+struct Executor
+  inner: Arc[ExecutorInner]
 end
 
 struct TimerEntry
@@ -520,63 +548,238 @@ def executor_new() -> Executor
   end
   
   Executor {
-    tasks: Map::new(),
-    ready_queue: VecDeque::new(),
-    next_task_id: 1,
-    task_states: Map::new(),
-    task_results: Map::new(),
-    join_waiters: Map::new(),
-    timer_heap: Vec::new(),
-    io_reactor: reactor,
-    running: false
+    inner: Arc::new(ExecutorInner {
+      tasks: Map::new(),
+      ready_queue: VecDeque::new(),
+      next_task_id: 1,
+      task_states: Map::new(),
+      task_results: Map::new(),
+      join_waiters: Map::new(),
+      timer_heap: Vec::new(),
+      io_reactor: reactor,
+      running: false,
+      deterministic: false,
+      seed: 0,
+      virtual_time: Instant::now(),
+      rand_state: 0
+    })
   }
 end
 
 impl Executor
+  def new() -> Result[Executor, String]
+    Result::Ok(executor_new())
+  end
+
   def spawn(inout self, future: impl Future[Output = ()]) -> JoinHandle[()]
-    let id = self.next_task_id
-    self.next_task_id = self.next_task_id + 1
-    
-    let task = Task {
-      id: id,
-      state: TaskState::Ready,
-      future: Box::new(future),
-      name: Option::None
-    }
-    
-    self.tasks.insert(id, task)
-    self.task_states.insert(id, TaskState::Ready)
-    self.ready_queue.push_back(id)
+    # The handle takes an Arc clone of the inner — the task (and its
+    # result slot) stays alive even if this Executor is dropped or moved.
+    let id = unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      let id = inner.next_task_id
+      inner.next_task_id = inner.next_task_id + 1
+      
+      let task = Task {
+        id: id,
+        state: TaskState::Ready,
+        future: Box::new(future),
+        name: Option::None
+      }
+      
+      inner.tasks.insert(id, task)
+      inner.task_states.insert(id, TaskState::Ready)
+      inner.ready_queue.push_back(id)
+      id
+    end
     
     JoinHandle {
       task_id: id,
       result: Option::None,
-      executor: self as PtrMut[Executor]
+      executor: self.inner.clone()
     }
   end
   
   def spawn_named(inout self, name: String, future: impl Future[Output = ()]) -> JoinHandle[()]
-    let id = self.next_task_id
-    self.next_task_id = self.next_task_id + 1
-    
-    let task = Task {
-      id: id,
-      state: TaskState::Ready,
-      future: Box::new(future),
-      name: Option::Some(name),
-    }
-    
-    self.tasks.insert(id, task)
-    self.task_states.insert(id, TaskState::Ready)
-    self.ready_queue.push_back(id)
+    let id = unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      let id = inner.next_task_id
+      inner.next_task_id = inner.next_task_id + 1
+      
+      let task = Task {
+        id: id,
+        state: TaskState::Ready,
+        future: Box::new(future),
+        name: Option::Some(name)
+      }
+      
+      inner.tasks.insert(id, task)
+      inner.task_states.insert(id, TaskState::Ready)
+      inner.ready_queue.push_back(id)
+      id
+    end
     
     JoinHandle {
       task_id: id,
       result: Option::None,
-      executor: self as PtrMut[Executor]
+      executor: self.inner.clone()
     }
   end
   
+  def run(inout self) -> Unit
+    unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      inner.running = true
+
+      while inner.running do
+        # Check timers
+        if inner.deterministic then
+          inner.check_timers_deterministic()
+        else
+          inner.check_timers()
+        end
+
+        # Poll I/O reactor for ready file descriptors
+        if !inner.deterministic then
+          match inner.io_reactor
+          when Option::Some(mut reactor) then
+            # Poll with 0 timeout for non-blocking check
+            let io_ready = reactor.poll(0)
+            for task_id in io_ready do
+              if !inner.ready_queue.contains(&task_id) then
+                inner.ready_queue.push_back(task_id)
+              end
+            end
+          when Option::None then ()
+          end
+        end
+
+        # Poll ready tasks
+        match inner.ready_queue.pop_front()
+        when Option::Some(task_id) then
+          self.poll_task(task_id)
+        when Option::None then
+          # No ready tasks — check if all done
+          if inner.tasks.is_empty() then
+            inner.running = false
+            break
+          end
+
+          # Advance virtual time or block on I/O/timers
+          if inner.deterministic then
+            if !inner.timer_heap.is_empty() then
+              # Advance to next timer
+              let min_entry = inner.timer_heap[0]
+              inner.virtual_time = min_entry.deadline
+              inner.check_timers_deterministic()
+            else
+              # No ready tasks and no timers in deterministic mode == deadlock or finished
+              inner.running = false
+            end
+          else
+            # Block on I/O and timers
+            let timeout_ms = match inner.next_timer_deadline()
+            when Option::Some(deadline) then
+              let now = instant_now()
+              let remaining = deadline.duration_since(now)
+              duration_millis(remaining).max(0).min(100)
+            when Option::None then 100  # Default 100ms timeout
+            end
+
+            match inner.io_reactor
+            when Option::Some(mut reactor) then
+              # Block on I/O with timeout
+              let io_ready = reactor.poll(timeout_ms as Int)
+              for task_id in io_ready do
+                inner.ready_queue.push_back(task_id)
+              end
+            when Option::None then
+              # No I/O reactor — just sleep
+              if timeout_ms > 0 then
+                sleep_ms(timeout_ms)
+              else
+                sleep_ms(1)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def poll_task(inout self, task_id: UInt) -> Unit
+    # The per-task waker holds an Arc clone of the inner: the task (and
+    # its waker) keeps the executor alive even if the stack-local
+    # Executor is dropped while the task is in flight.
+    let waker = Waker {
+      task_id: task_id,
+      executor: self.inner.clone()
+    }
+
+    mut cx = Context { waker: waker }
+
+    unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      match inner.tasks.get_mut(&task_id)
+      when Option::None then return
+      when Option::Some(task) then
+        # CAP-44: Integrate with diagnostics for task polling
+        _log_async_event(LogLevel::Trace, "Polling task " + task_id.to_string())
+
+        match task.future.poll(&mut cx)
+        when Poll::Ready(()) then
+          # Task completed
+          inner.tasks.remove(&task_id)
+          inner.task_states.insert(task_id, TaskState::Completed)
+
+          # Wake any JoinHandle waiters
+          match inner.join_waiters.remove(&task_id)
+          when Option::Some(waiter) then waiter.wake()
+          when Option::None then ()
+          end
+        when Poll::Pending then
+          inner.task_states.insert(task_id, TaskState::Waiting)
+          
+          # Integration with ctxpacks: capture context if task is stuck or interesting
+          let mut seeds = Vec::new()
+          seeds.push("async::task_pending".to_string())
+          seeds.push("task_id::" + task_id.to_string())
+          match std::ctx::build_pack(seeds, 1000)
+          when Ok(pack) then std::ctx::register_pack(pack)
+          when Err(_) then {}
+          end
+        end
+      end
+    end
+  end
+  
+  def set_deterministic(inout self, seed: u64) -> Unit
+    unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      inner.set_deterministic(seed)
+    end
+  end
+
+  def task_count(self) -> UInt
+    let inner = self.inner.ptr.as_ref()
+    inner.task_count()
+  end
+  
+  def cancel_task(inout self, task_id: UInt) -> Bool
+    unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      inner.cancel_task(task_id)
+    end
+  end
+  
+  def register_timer(inout self, deadline: Instant, task_id: UInt) -> Unit
+    unsafe "executor inner access — the Arc clone keeps the executor alive" do
+      let inner = self.inner.ptr.as_mut()
+      inner.register_timer(deadline, task_id)
+    end
+  end
+end
+
+impl ExecutorInner
   def wake_task(inout self, task_id: UInt) -> Unit
     match self.task_states.get(&task_id)
     when Option::Some(TaskState::Waiting) then
@@ -604,84 +807,6 @@ impl Executor
     when Option::None then ()
     end
   end
-  
-  def run(inout self) -> Unit
-    self.running = true
-
-    while self.running do
-      # Check timers
-      if self.deterministic then
-        self.check_timers_deterministic()
-      else
-        self.check_timers()
-      end
-
-      # Poll I/O reactor for ready file descriptors
-      if !self.deterministic then
-        match self.io_reactor
-        when Option::Some(mut reactor) then
-          # Poll with 0 timeout for non-blocking check
-          let io_ready = reactor.poll(0)
-          for task_id in io_ready do
-            if !self.ready_queue.contains(&task_id) then
-              self.ready_queue.push_back(task_id)
-            end
-          end
-        when Option::None then ()
-        end
-      end
-
-      # Poll ready tasks
-      match self.ready_queue.pop_front()
-      when Option::Some(task_id) then
-        self.poll_task(task_id)
-      when Option::None then
-        # No ready tasks — check if all done
-        if self.tasks.is_empty() then
-          self.running = false
-          break
-        end
-
-        # Advance virtual time or block on I/O/timers
-        if self.deterministic then
-          if !self.timer_heap.is_empty() then
-            # Advance to next timer
-            let min_entry = self.timer_heap[0]
-            self.virtual_time = min_entry.deadline
-            self.check_timers_deterministic()
-          else
-            # No ready tasks and no timers in deterministic mode == deadlock or finished
-            self.running = false
-          end
-        else
-          # Block on I/O and timers
-          let timeout_ms = match self.next_timer_deadline()
-          when Option::Some(deadline) then
-            let now = instant_now()
-            let remaining = deadline.duration_since(now)
-            duration_millis(remaining).max(0).min(100)
-          when Option::None then 100  # Default 100ms timeout
-          end
-
-          match self.io_reactor
-          when Option::Some(mut reactor) then
-            # Block on I/O with timeout
-            let io_ready = reactor.poll(timeout_ms as Int)
-            for task_id in io_ready do
-              self.ready_queue.push_back(task_id)
-            end
-          when Option::None then
-            # No I/O reactor — just sleep
-            if timeout_ms > 0 then
-              sleep_ms(timeout_ms)
-            else
-              sleep_ms(1)
-            end
-          end
-        end
-      end
-    end
-  end
 
   def check_timers_deterministic(inout self) -> Unit
     # Process all expired timers from min-heap root based on virtual time
@@ -695,46 +820,6 @@ impl Executor
           break
         end
       when Option::None then break
-      end
-    end
-  end
-  
-  def poll_task(inout self, task_id: UInt) -> Unit
-    match self.tasks.get_mut(&task_id)
-    when Option::None then return
-    when Option::Some(task) then
-      let waker = Waker {
-        task_id: task_id,
-        executor: self as PtrMut[Executor]
-      }
-
-      mut cx = Context { waker: waker }
-
-      # CAP-44: Integrate with diagnostics for task polling
-      _log_async_event(LogLevel::Trace, "Polling task " + task_id.to_string())
-
-      match task.future.poll(&mut cx)
-      when Poll::Ready(()) then
-        # Task completed
-        self.tasks.remove(&task_id)
-        self.task_states.insert(task_id, TaskState::Completed)
-
-        # Wake any JoinHandle waiters
-        match self.join_waiters.remove(&task_id)
-        when Option::Some(waiter) then waiter.wake()
-        when Option::None then ()
-        end
-      when Poll::Pending then
-        self.task_states.insert(task_id, TaskState::Waiting)
-        
-        # Integration with ctxpacks: capture context if task is stuck or interesting
-        let mut seeds = Vec::new()
-        seeds.push("async::task_pending".to_string())
-        seeds.push("task_id::" + task_id.to_string())
-        match std::ctx::build_pack(seeds, 1000)
-        when Ok(pack) then std::ctx::register_pack(pack)
-        when Err(_) then {}
-        end
       end
     end
   end
@@ -820,8 +905,8 @@ impl Future for SleepFuture
     else
       if !self.registered then
         # Register timer with executor
-        unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-          let exec = cx.waker.executor.as_mut()
+        unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
           exec.register_timer(self.deadline, cx.waker.task_id)
         end
         self.registered = true
@@ -875,8 +960,8 @@ impl Future for TimeoutFuture[F]
         Poll::Ready(timeout_result)
     else
       if !self.timer_registered then
-        unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-          let exec = cx.waker.executor.as_mut()
+        unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
           exec.register_timer(self.deadline, cx.waker.task_id)
         end
         self.timer_registered = true
@@ -1185,8 +1270,13 @@ impl ReactorFd for TcpStream
   end
 end
 
+# The I/O futures OWN their I/O value (and buffer): wait_readable takes
+# the sink T — the value moves into the future, and the poll reads the
+# owned value's fd. The old PtrMut fields pointed into the caller's
+# inout-arg storage — the raw pointers escaped the caller's scope and
+# dangled the moment the args moved.
 struct WaitReadableFuture[T: ReactorFd]
-  io: PtrMut[T]
+  io: T
   registered: Bool
 end
 
@@ -1194,9 +1284,9 @@ impl Future for WaitReadableFuture[T]
   type Output = Result[Unit, String]
 
   def poll(inout self, inout cx: Context) -> Poll[Result[Unit, String]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let exec = cx.waker.executor.as_mut()
-      let fd = (*self.io).reactor_fd()
+    let fd = self.io.reactor_fd()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let exec = cx.waker.executor.ptr.as_mut()
 
       if !self.registered then
         match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
@@ -1217,7 +1307,7 @@ impl Future for WaitReadableFuture[T]
 end
 
 struct WaitWritableFuture[T: ReactorFd]
-  io: PtrMut[T]
+  io: T
   registered: Bool
 end
 
@@ -1225,9 +1315,9 @@ impl Future for WaitWritableFuture[T]
   type Output = Result[Unit, String]
 
   def poll(inout self, inout cx: Context) -> Poll[Result[Unit, String]]
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-      let exec = cx.waker.executor.as_mut()
-      let fd = (*self.io).reactor_fd()
+    let fd = self.io.reactor_fd()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let exec = cx.waker.executor.ptr.as_mut()
 
       if !self.registered then
         match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
@@ -1247,81 +1337,95 @@ impl Future for WaitWritableFuture[T]
   end
 end
 
-pub def wait_readable[T: ReactorFd](inout io: T) -> WaitReadableFuture[T]
+pub def wait_readable[T: ReactorFd](sink io: T) -> WaitReadableFuture[T]
   WaitReadableFuture {
-    io: io as PtrMut[T],
+    io: io,
     registered: false
   }
 end
 
-pub def wait_writable[T: ReactorFd](inout io: T) -> WaitWritableFuture[T]
+pub def wait_writable[T: ReactorFd](sink io: T) -> WaitWritableFuture[T]
   WaitWritableFuture {
-    io: io as PtrMut[T],
+    io: io,
     registered: false
   }
 end
 
+# AsyncReadFuture owns the io value AND the buffer: read_async takes both
+# by sink — the poll reads into the owned buffer through the owned value.
+# (The registration logic of WaitReadableFuture is inlined so the io is
+# owned ONCE — a nested wait future would need a second copy of the io.)
 struct AsyncReadFuture[T: Read + ReactorFd]
-  io: PtrMut[T]
-  buf: PtrMut[Vec[u8]]
-  wait: WaitReadableFuture[T]
+  io: T
+  buf: Vec[u8]
+  registered: Bool
 end
 
 impl Future for AsyncReadFuture[T]
   type Output = Result[Int, IOError]
 
   def poll(inout self, inout cx: Context) -> Poll[Result[Int, IOError]]
-    match self.wait.poll(cx)
-    when Poll::Pending then Poll::Pending
-    when Poll::Ready(Result::Err(err)) then
-      Poll::Ready(Result::Err(IOError::Other(err)))
-    when Poll::Ready(Result::Ok(())) then
-      unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-        let io = self.io.as_mut()
-        let buf = self.buf.as_mut()
-        Poll::Ready(io.read(buf))
+    let fd = self.io.reactor_fd()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let exec = cx.waker.executor.ptr.as_mut()
+      if !self.registered then
+        match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
+        when Result::Ok(()) then
+          self.registered = true
+          Poll::Pending
+        when Result::Err(err) then
+          Poll::Ready(Result::Err(IOError::Other(err)))
+        end
+      else
+        exec.deregister_io(fd)
+        Poll::Ready(self.io.read(self.buf.as_mut_slice()))
       end
     end
   end
 end
 
 struct AsyncWriteFuture[T: Write + ReactorFd]
-  io: PtrMut[T]
-  buf: Ptr[Vec[u8]]
-  wait: WaitWritableFuture[T]
+  io: T
+  buf: Vec[u8]
+  registered: Bool
 end
 
 impl Future for AsyncWriteFuture[T]
   type Output = Result[Int, IOError]
 
   def poll(inout self, inout cx: Context) -> Poll[Result[Int, IOError]]
-    match self.wait.poll(cx)
-    when Poll::Pending then Poll::Pending
-    when Poll::Ready(Result::Err(err)) then
-      Poll::Ready(Result::Err(IOError::Other(err)))
-    when Poll::Ready(Result::Ok(())) then
-      unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
-        let io = self.io.as_mut()
-        let buf = self.buf.as_ref()
-        Poll::Ready(io.write(buf))
+    let fd = self.io.reactor_fd()
+    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+      let exec = cx.waker.executor.ptr.as_mut()
+      if !self.registered then
+        match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
+        when Result::Ok(()) then
+          self.registered = true
+          Poll::Pending
+        when Result::Err(err) then
+          Poll::Ready(Result::Err(IOError::Other(err)))
+        end
+      else
+        exec.deregister_io(fd)
+        Poll::Ready(self.io.write(self.buf))
       end
     end
   end
 end
 
-pub def read_async[T: Read + ReactorFd](inout io: T, inout buf: Vec[u8]) -> AsyncReadFuture[T]
+pub def read_async[T: Read + ReactorFd](sink io: T, sink buf: Vec[u8]) -> AsyncReadFuture[T]
   AsyncReadFuture {
-    io: io as PtrMut[T],
-    buf: buf as PtrMut[Vec[u8]],
-    wait: wait_readable(io)
+    io: io,
+    buf: buf,
+    registered: false
   }
 end
 
-pub def write_async[T: Write + ReactorFd](inout io: T, buf: Vec[u8]) -> AsyncWriteFuture[T]
+pub def write_async[T: Write + ReactorFd](sink io: T, buf: Vec[u8]) -> AsyncWriteFuture[T]
   AsyncWriteFuture {
-    io: io as PtrMut[T],
-    buf: buf as Ptr[Vec[u8]],
-    wait: wait_writable(io)
+    io: io,
+    buf: buf,
+    registered: false
   }
 end
 
@@ -1329,21 +1433,23 @@ end
 # Public Entrypoints
 # ———————————————————————————————————————————————————————————————
 
-# Global executor (thread-local in multi-threaded contexts)
+# Global executor (thread-local in multi-threaded contexts). The Arc
+# keeps the inner alive for the whole block_on run; the entry is reset at
+# the end so the last clone releases the executor.
 @thread_local
-static mut GLOBAL_EXECUTOR: Option[PtrMut[Executor]] = Option::None
+static mut GLOBAL_EXECUTOR: Option[Arc[ExecutorInner]] = Option::None
 
 pub def block_on[F: Future](future: F) -> F::Output
   mut exec = executor_new()
 
-  GLOBAL_EXECUTOR = Option::Some(address_of_mut(&mut exec) as PtrMut[Executor])
+  GLOBAL_EXECUTOR = Option::Some(exec.inner.clone())
 
   mut result: Option[F::Output] = Option::None
   let result_ptr = address_of_mut(&mut result) as PtrMut[Option[F::Output]]
 
   exec.spawn(async {
     let val = future.await
-    unsafe "pointer dereference — lifetime guaranteed by enclosing scope" do
+    unsafe "block_on result slot — the block_on frame outlives the run loop" do
       *result_ptr = Option::Some(val)
     end
   })
@@ -1359,12 +1465,10 @@ pub def block_on[F: Future](future: F) -> F::Output
 end
 
 pub def spawn(future: impl Future[Output = ()]) -> JoinHandle[()]
-  match GLOBAL_EXECUTOR
-  when Option::Some(exec_ptr) then
-    unsafe "global executor pointer dereference" do
-      let exec = exec_ptr.as_mut()
-      exec.spawn(future)
-    end
+  match GLOBAL_EXECUTOR.clone()
+  when Option::Some(exec_inner) then
+    let exec = Executor { inner: exec_inner }
+    exec.spawn(future)
   when Option::None then
     panic("spawn called outside of async runtime — use block_on() first")
   end
@@ -1568,10 +1672,10 @@ impl TaskScope
   ## the error list reflects the cancelled tasks.
   def join_all(inout self: TaskScope) -> Result[Unit, Vec[String]]
     let mut errors = Vec::new()
-    match GLOBAL_EXECUTOR
-    when Option::Some(exec_ptr) then
-      unsafe "global executor pointer dereference" do
-        let exec = exec_ptr.as_mut()
+    match GLOBAL_EXECUTOR.clone()
+    when Option::Some(exec_inner) then
+      unsafe "executor inner access — the Arc clone keeps the executor alive" do
+        let exec = exec_inner.ptr.as_mut()
         var done = false
         while !done do
           done = true

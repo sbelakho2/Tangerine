@@ -20,10 +20,14 @@ trait Allocator
   # ALIGNMENT CONTRACT: the runtime allocator guarantees a 16-byte-
   # aligned payload (the 16-byte block header precedes the payload, and
   # the block base is 16-byte aligned, so payload = base + 16 is
-  # 16-aligned). Implementations must accept any power-of-two align
-  # <= 16; requests for align > 16 are OUT OF CONTRACT (the concrete
-  # allocators either reject them explicitly or satisfy them only by
-  # luck of the underlying buffer).
+  # 16-aligned). EVERY implementation validates the align argument with
+  # the SAME policy: any power-of-two align <= 16 is accepted; align 0,
+  # a non-power-of-two, or an align > 16 is an EXPLICIT error (panic) —
+  # SystemAllocator, ArenaAllocator and PoolAllocator reject
+  # out-of-contract requests identically, because none of them can
+  # honor an over-aligned request (the runtime payload is 16-aligned,
+  # the arena's backing buffer is 16-aligned, the pool's stride is a
+  # multiple of 16).
   def allocate(inout self: Self, size: UInt, align: UInt) -> Ptr[u8]
   
   # Deallocate memory previously allocated by this allocator.
@@ -272,15 +276,19 @@ end
 
 impl Allocator for ArenaAllocator
   def allocate(inout self: ArenaAllocator, size: UInt, align: UInt) -> Ptr[u8]
-    # ALIGNMENT CONTRACT (against the SystemAllocator guarantee): the
+    # ALIGNMENT CONTRACT (the SAME policy as SystemAllocator): the
     # backing buffer comes from SystemAllocator and is 16-byte-aligned
     # (payload = base + 16), so any power-of-two align <= 16 is
-    # satisfied by the aligned-offset math below. An align > 16 is NOT
-    # guaranteed: the buffer's base alignment is only 16, so a
-    # 32/64-byte request is honored only when the current offset
-    # happens to fall on such a boundary — the aligned-offset path
-    # still rounds up (never returns a misaligned pointer), but the
-    # caller must not rely on over-alignment.
+    # satisfied by the aligned-offset math below. An align 0, a
+    # non-power-of-two, or an align > 16 is an EXPLICIT error — the
+    # arena cannot honor a request above its backing alignment, and a
+    # misaligned buffer would silently break the caller.
+    if align == 0 || (align & (align - 1)) != 0 then
+      panic("ArenaAllocator::allocate: align must be a power of two")
+    end
+    if align > 16 then
+      panic("ArenaAllocator::allocate: align " + align.to_string() + " > 16 not supported — the backing buffer is 16-byte-aligned")
+    end
     if size == 0 then
       return Ptr::null()
     end
@@ -289,16 +297,8 @@ impl Allocator for ArenaAllocator
       return Ptr::null()
     end
 
-    if align == 0 then
-      return Ptr::null()
-    end
-    let align_mask = align - 1
-    let align_remainder = align & align_mask
-    if align_remainder != 0 then
-      return Ptr::null()
-    end
-
     # Align the current offset
+    let align_mask = align - 1
     let aligned_offset = (self.offset + align_mask) & ~align_mask
 
     if aligned_offset < self.offset then
@@ -370,11 +370,17 @@ impl ArenaBuf
   end
 
   def alloc(inout self: Self, size: UInt, align: UInt) -> Ptr[u8]
-    # ALIGNMENT CONTRACT (same as ArenaAllocator::allocate): the
-    # backing buffer is 16-aligned (SystemAllocator guarantee), so
+    # ALIGNMENT CONTRACT (the SAME policy as ArenaAllocator::allocate):
+    # the backing buffer is 16-aligned (SystemAllocator guarantee), so
     # power-of-two aligns <= 16 are satisfied by the aligned-offset
-    # math; over-aligned requests succeed only when the offset happens
-    # to land on the boundary — never guaranteed.
+    # math; an align 0, a non-power-of-two, or an align > 16 is an
+    # EXPLICIT error — over-alignment is never honored by luck.
+    if align == 0 || (align & (align - 1)) != 0 then
+      panic("ArenaBuf::alloc: align must be a power of two")
+    end
+    if align > 16 then
+      panic("ArenaBuf::alloc: align " + align.to_string() + " > 16 not supported — the backing buffer is 16-byte-aligned")
+    end
     if size == 0 then
       return Ptr::null()
     end
@@ -383,15 +389,7 @@ impl ArenaBuf
       return Ptr::null()
     end
 
-    if align == 0 then
-      return Ptr::null()
-    end
     let align_mask = align - 1
-    let align_remainder = align & align_mask
-    if align_remainder != 0 then
-      return Ptr::null()
-    end
-
     let aligned_offset = (self.offset + align_mask) & ~align_mask
 
     if aligned_offset < self.offset then
@@ -429,28 +427,46 @@ end
 # ———————————————————————————————————————————————————————————————
 # Pool Allocator (Fixed-Size Blocks)
 # ———————————————————————————————————————————————————————————————
+# The pool's FIXED ALIGNMENT is 16: the backing buffer comes from
+# SystemAllocator (a 16-aligned payload) and the buffer is divided into
+# fixed strides of round_up(max(block_size, pointer_size), 16) bytes —
+# the stride is the block size rounded UP to the pool's alignment, so
+# EVERY block sits on a 16-byte boundary (the old stride was
+# max(block_size, 8), so an 8-byte pool divided the buffer into 8-byte
+# strides and block 1 was only 8-aligned). The free-list link (one
+# pointer, 8 bytes) always fits inside a block because the stride is at
+# least the pointer size.
 
 struct PoolAllocator
   buffer: Ptr[u8]
-  block_size: UInt
+  block_size: UInt      # the minimum block payload (at least pointer size)
+  stride: UInt          # round_up(max(block_size, 8), 16) — the block pitch
   block_count: UInt
   free_list: Ptr[Ptr[u8]]  # Linked list of free blocks
   backing: SystemAllocator
+  alignment: UInt       # the pool's fixed alignment — 16 (the backing buffer's)
 end
 
 def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
+  # The pool's fixed alignment is 16 — the backing buffer's alignment.
+  # The stride is the block size rounded up to that alignment, so every
+  # returned block is 16-aligned.
+  let pool_alignment: UInt = 16
   # Ensure block size is at least pointer size
-  let actual_block_size = if block_size < 8 then 8 else block_size end
+  let min_block = if block_size < 8 then 8 else block_size end
+  let stride = (min_block + (pool_alignment - 1)) & ~(pool_alignment - 1)
   if block_count == 0 then
     return PoolAllocator {
       buffer: Ptr::null(),
-      block_size: actual_block_size,
+      block_size: min_block,
+      stride: stride,
       block_count: 0,
       free_list: Ptr::null(),
-      backing: system_allocator()
+      backing: system_allocator(),
+      alignment: pool_alignment
     }
   end
-  let total_size = actual_block_size * block_count
+  let total_size = stride * block_count
   
   let backing = system_allocator()
   let buffer = backing.allocate(total_size, 16)
@@ -462,7 +478,7 @@ def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
   mut current = buffer
   mut i: UInt = 0
   while i < block_count - 1 do
-    let next = current.offset(actual_block_size as Int)
+    let next = current.offset(stride as Int)
     current.cast[Ptr[u8]]().write(next)
     current = next
     i = i + 1
@@ -472,10 +488,12 @@ def pool_new(block_size: UInt, block_count: UInt) -> PoolAllocator
   
   PoolAllocator {
     buffer: buffer,
-    block_size: actual_block_size,
+    block_size: min_block,
+    stride: stride,
     block_count: block_count,
     free_list: buffer.cast[Ptr[u8]](),
-    backing: backing
+    backing: backing,
+    alignment: pool_alignment
   }
 end
 
@@ -484,7 +502,7 @@ impl Drop for PoolAllocator
     # Release the backing buffer so a bit-copied pool cannot double-own
     # (and double-free) the mmap region.
     if !self.buffer.is_null() && self.block_count != 0 then
-      self.backing.deallocate(self.buffer, self.block_size * self.block_count, 16)
+      self.backing.deallocate(self.buffer, self.stride * self.block_count, 16)
     end
     self.buffer = Ptr::null()
     self.free_list = Ptr::null()
@@ -494,6 +512,18 @@ end
 
 impl Allocator for PoolAllocator
   def allocate(inout self: PoolAllocator, size: UInt, align: UInt) -> Ptr[u8]
+    # ALIGNMENT CONTRACT (the SAME policy as SystemAllocator): the
+    # pool's fixed alignment is 16 — every returned block is
+    # 16-aligned, so any power-of-two align <= 16 is satisfied. An
+    # align 0, a non-power-of-two, or an align above the pool's
+    # configured alignment is an EXPLICIT error — the pool cannot
+    # honor an over-aligned request.
+    if align == 0 || (align & (align - 1)) != 0 then
+      panic("PoolAllocator::allocate: align must be a power of two")
+    end
+    if align > self.alignment then
+      panic("PoolAllocator::allocate: align " + align.to_string() + " > " + self.alignment.to_string() + " not supported — the pool's fixed alignment is " + self.alignment.to_string())
+    end
     if size > self.block_size then
       return Ptr::null()  # Too large for pool
     end

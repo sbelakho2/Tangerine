@@ -311,9 +311,12 @@ enum MirStatementKind
   # metric's canonical key — "alloc" for the allocation metric, "time" for
   # the elapsed metric). The Int payload is the annotated function's
   # DECLARED LIMIT for the resource (the typed record's bound): codegen
-  # increments the __tg_budget_<resource> counter by one (the allocation
-  # metric) or measures the elapsed clock against the entry stamp (the
-  # time metric) and TRAPS when the limit is exceeded.
+  # increments THIS INVOCATION's frame-slot counter by one (the allocation
+  # metric — the per-frame slot FrameInfo.budget_alloc_offset reserves and
+  # the prologue zeroes) or measures the elapsed clock against the frame
+  # slot's entry stamp (the time metric) and TRAPS when the limit is
+  # exceeded. The counters live in the generated function's STACK FRAME,
+  # never in global .data — per-invocation, nesting-safe, race-free.
   MirBudgetConsume(String, Int)              # Consume budget resources
   MirEffectRecord(String, MirOperand)        # Record an effect
 end
@@ -2063,7 +2066,7 @@ def mir_type_identity_key(ty: Type) -> String
       i = i + 1
     end
     s + ")"
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var s2 = "FnPtr("
     var i2 = 0
     while i2 < params.len() do
@@ -2072,7 +2075,7 @@ def mir_type_identity_key(ty: Type) -> String
       i2 = i2 + 1
     end
     s2 + ")->" + mir_type_identity_key(ret)
-  when Type::Closure(cid, params, ret, captures) then
+  when Type::Closure(cid, params, ret, captures, _) then
     var s3 = "Closure(" + cid.id.to_string() + ":"
     var i3 = 0
     while i3 < params.len() do
@@ -2131,7 +2134,7 @@ def mir_collect_plan_for_type(inout b: MirBuilder, ty: Type) -> Unit
     # the drop-glue label map are complete before MirProgram construction.
     var vis2 = Set::new()
     let _ = deinit_plan_for_type(b, ty, &mut vis2)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var pi = 0
     while pi < params.len() do
       mir_collect_plan_for_type(b, &params[pi].ty)
@@ -2167,7 +2170,7 @@ def mir_type_has_deferred(ty: Type) -> Bool
     end
     false
   when Type::FixedArray(elem, _) then mir_type_has_deferred(elem)
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var pi = 0
     while pi < params.len() do
       if mir_type_has_deferred(&params[pi].ty) then return true end
@@ -5295,9 +5298,10 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
  # the TIME metric's ENTRY stamp — the first statement of the entry
   # block (block 0, current at this point — before the contracts and the
   # body lower): MirEffectRecord("__tg_budget_time_start") — codegen
-  # stamps the __tg_budget_time data slot with the monotonic clock; the
-  # exit checks (emit_budget_time_exit_checks) compare the elapsed clock
-  # against the declared limit at every MirReturn.
+  # stamps THIS INVOCATION's frame time slot (FrameInfo's
+  # budget_time_offset — the per-frame entry stamp) with the monotonic
+  # clock; the exit checks (emit_budget_time_exit_checks) compare the
+  # elapsed clock against the declared limit at every MirReturn.
   if mir_budget_has_resource(b, "time") then
     let unit_op = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
@@ -5416,13 +5420,15 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
   end
   
  # the @budget enforcement tail: the TIME metric's EXIT checks (every
-  # MirReturn block gains the elapsed-vs-limit MirBudgetConsume) and the
-  # ALLOCATION metric's fail-closed STATIC-EXCEED rejection (a body whose
-  # STATIC allocation-site count already exceeds the declared limit is a
-  # compile error — the runtime trap it would hit on entry is
-  # deterministic, so the check-time rejection is the canary_neg surface).
+  # MirReturn block gains the elapsed-vs-limit MirBudgetConsume). The
+  # ALLOCATION metric's enforcement is PURELY RUNTIME — the per-invocation
+  # frame-slot counter (codegen's budget arms) traps when a path's
+  # consumed units exceed the declared limit. There is NO static
+  # allocation-site rejection: a body with two allocation sites and a
+  # limit of one is legal when every path allocates at most once (an `if`
+  # with one allocation per branch — the runtime counter decides, never
+  # the site count).
   emit_budget_time_exit_checks(b, f.span)
-  check_budget_static_exceed(b)
   
   finish_function(b)
 end
@@ -5473,30 +5479,16 @@ def emit_budget_time_exit_checks(inout b: MirBuilder, span: Span) -> Unit
   end
 end
 
-# The ALLOCATION metric's fail-closed static-exceed check: a body whose
-# STATIC allocation-site count (the MirBudgetConsume("alloc", _)
-# statements the lowering emitted) already exceeds the declared limit is
-# a compile error — the runtime trap it would hit on entry is
-# deterministic. Runtime exceed (a loop over a within-limit site count)
-# still traps at execution.
-def check_budget_static_exceed(inout b: MirBuilder) -> Unit
-  if mir_budget_has_resource(b, "alloc") then
-    let limit = mir_budget_limit_of(b, "alloc")
-    var count = 0
-    for blk in b.blocks do
-      for stmt in blk.statements do
-        match stmt.kind
-        when MirStatementKind::MirBudgetConsume(resource, _) then
-          if resource == "alloc" then count = count + 1 end
-        when _ then ()
-        end
-      end
-    end
-    if count > limit then
-      b.errors.push("budget exceeded: alloc limit " + limit.to_string() + " with " + count.to_string() + " allocation site(s) — the annotated function's allocations exceed the declared budget")
-    end
-  end
-end
+# The ALLOCATION metric's runtime enforcement is the ONLY enforcement: the
+# per-invocation frame-slot counter (codegen's MirBudgetConsume arm — the
+# slot allocate_locals reserved and the prologue zeroed) counts the units a
+# PATH consumes and traps when the path exceeds the declared limit. The
+# former STATIC allocation-site rejection is REMOVED — it was
+# path-insensitive and invalid: an `if` with one allocation per branch has
+# two sites while every path allocates once, and a within-limit loop over a
+# single site allocates many times. Both cases are dynamic behavior the
+# runtime counter decides; the compile-time surface is only the annotated
+# function's enforcement statements.
 
 def lower_final_stmt_to_return_place(inout b: MirBuilder, stmt: Stmt, span: Span) -> Unit
   let last_kind = stmt_kind_name(&stmt.kind)
@@ -6232,13 +6224,13 @@ def call_arg_effect(inout b: MirBuilder, callee: Option[Expr], arg_idx: Int, arg
         match b.expr_types.get(c.node_id)
         when Option::Some(t) then
           match t
-          when Type::FnPtr(params, _) then
+          when Type::FnPtr(params, _, _) then
             if arg_idx < params.len() then
               convention_access_effect(params[arg_idx].convention)
             else
               AccessEffect::Read
             end
-          when Type::Closure(_, params, _, _) then
+          when Type::Closure(_, params, _, _, _) then
             if arg_idx < params.len() then
               convention_access_effect(params[arg_idx].convention)
             else
@@ -6267,7 +6259,7 @@ def lower_string_literal_to_owned(inout b: MirBuilder, arg_expr: Expr, span: Spa
   let callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("string_from_static".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::String)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::String), Vec::new()),
       instance: Option::None
     })
   }
@@ -6385,7 +6377,7 @@ def mir_fn_operand_with_instance(b: MirBuilder, fn_name: String, instance: Optio
   MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(emission_name),
-      ty: Type::FnPtr(Vec::new(), Box::new(ret_type)),
+      ty: Type::FnPtr(Vec::new(), Box::new(ret_type), Vec::new()),
       instance: instance
     })
   }
@@ -8358,8 +8350,8 @@ def callee_is_closure_value(b: MirBuilder, callee_expr: Expr) -> Bool
       match b.expr_types.get(callee_expr.node_id)
       when Option::Some(t) then
         match t
-        when Type::FnPtr(_, _) then true
-        when Type::Closure(_, _, _, _) then true
+        when Type::FnPtr(_, _, _) then true
+        when Type::Closure(_, _, _, _, _) then true
         when _ then false
         end
       when Option::None then false
@@ -8643,8 +8635,8 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
     when ExprKind::ExprIdent(name) then
       let local_ty = lookup_local_type_by_name(b, name.clone())
       match local_ty
-      when Type::FnPtr(_, f_ret) then ret_type = f_ret
-      when Type::Closure(_, _, f_ret, _) then ret_type = f_ret
+      when Type::FnPtr(_, _, f_ret) then ret_type = f_ret
+      when Type::Closure(_, _, f_ret, _, _) then ret_type = f_ret
       when _ then ret_type = mir_lookup_fn_ret_type(b, name.clone())
       end
     when ExprKind::ExprFieldAccess(recv, field_name) then
@@ -8690,9 +8682,10 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
   b.current_block = Option::Some(success_blk)
 
  # the @budget ALLOCATION metric's consume: an intrinsic allocation in
-  # the annotated function consumes ONE unit (the counter
-  # __tg_budget_alloc increments; codegen traps when it exceeds the
-  # declared limit carried as the statement's amount).
+  # the annotated function consumes ONE unit (THIS invocation's frame-slot
+  # counter — FrameInfo.budget_alloc_offset, zeroed by the prologue —
+  # increments; codegen traps when it exceeds the declared limit carried
+  # as the statement's amount).
   if mir_budget_has_resource(b, "alloc") then
     match mir_call_intrinsic_of(b, call_node_id)
     when Option::Some(iid) then
@@ -8748,7 +8741,7 @@ def lr_static_path_call(inout b: MirBuilder, path: AstPath, args: Vec[Expr], spa
   var callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(fn_name.clone()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9063,7 +9056,7 @@ def mir_emit_map_remove_owned(
   let rm_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_remove_key".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9103,7 +9096,7 @@ def mir_emit_map_remove_owned(
   let wrap_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_option_wrap".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9143,7 +9136,7 @@ def mir_emit_set_remove_owned(
   let rm_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_remove_key".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9218,7 +9211,7 @@ def mir_emit_map_insert_owned(
   let ins_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_insert".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9284,7 +9277,7 @@ def mir_emit_set_insert_owned(
   let ins_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_insert".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9393,7 +9386,7 @@ def mir_emit_array_clear_owned(
   let cl_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_array_clear".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9434,7 +9427,7 @@ def mir_emit_map_clear_owned(
   let dr_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_drain_one".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -9520,7 +9513,7 @@ def mir_emit_set_clear_owned(
   let sd_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_drain_one".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit)),
+      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
       instance: Option::None
     })
   }
@@ -10376,7 +10369,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # as the Closure form — ClosureId + signature + the capture tuple. The
       # signature split feeds the pending closure record (the conflation
       # form is are not part of the model).
-      when Type::Closure(_, sig_params, sig_ret, _) then
+      when Type::Closure(_, sig_params, sig_ret, _, _) then
         for sp in sig_params do
           param_types.push(sp.ty.clone())
         end
@@ -10404,7 +10397,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       let fn_op = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirFnItem(closure_name.clone()),
-          ty: Type::FnPtr(fn_param_types_of(&param_types), Box::new(ret_type.clone())),
+          ty: Type::FnPtr(fn_param_types_of(&param_types), Box::new(ret_type.clone()), Vec::new()),
           instance: Option::None
         })
       }
@@ -14433,7 +14426,7 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
     out + ")"
   when Type::FixedArray(elem, n) then
     "[" + format_mir_type(names, param_names, &elem) + "; " + n.to_string() + "]"
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var out2 = "fnptr("
     var first2 = true
     for p2 in params do
@@ -14442,7 +14435,7 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
       first2 = false
     end
     out2 + ") -> " + format_mir_type(names, param_names, ret)
-  when Type::Closure(cid, params, ret, captures) then
+  when Type::Closure(cid, params, ret, captures, _) then
     "closure<" + cid.id.to_string() + ">(" + format_mir_type(names, param_names, captures) + ") -> " + format_mir_type(names, param_names, ret)
   when Type::Adt(id, args) then
     let nname = match names.get(id.id)
@@ -18468,8 +18461,8 @@ def verifier_type_key(type_index: Map[Int, MirTypeDef], ty: Type) -> String
     end
   when Type::FixedArray(elem, n) then
     "fixedarray(" + verifier_type_key(type_index, &elem) + ":" + n.to_string() + ")"
-  when Type::FnPtr(_, _) then "fnptr"
-  when Type::Closure(cid, _, _, _) then "closure<" + cid.id.to_string() + ">"
+  when Type::FnPtr(_, _, _) then "fnptr"
+  when Type::Closure(cid, _, _, _, _) then "closure<" + cid.id.to_string() + ">"
   when Type::RefInternal(inner, mutable) then
     if mutable then "&mut " + verifier_type_key(type_index, &inner) else "&" + verifier_type_key(type_index, &inner) end
   when Type::Ptr(inner) then "*" + verifier_type_key(type_index, &inner)
@@ -19258,14 +19251,14 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
       verifier_check_type_concreteness(plans, type_index, param_names, what, &args[ai], allow_param, errors)
       ai = ai + 1
     end
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var pi2 = 0
     while pi2 < params.len() do
       verifier_check_type_concreteness(plans, type_index, param_names, what, &params[pi2].ty, allow_param, errors)
       pi2 = pi2 + 1
     end
     verifier_check_type_concreteness(plans, type_index, param_names, what, &ret, allow_param, errors)
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     var pi3 = 0
     while pi3 < params.len() do
       verifier_check_type_concreteness(plans, type_index, param_names, what, &params[pi3].ty, allow_param, errors)
@@ -19941,11 +19934,11 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   match callee_ty
   when Option::Some(cty) then
     match cty
-    when Type::FnPtr(param_tys, _) then
+    when Type::FnPtr(param_tys, _, _) then
       if param_tys.len() != args.len() then
         errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
       end
-    when Type::Closure(_, param_tys, _, _) then
+    when Type::Closure(_, param_tys, _, _, _) then
       if param_tys.len() != args.len() then
         errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
       end
@@ -20891,14 +20884,14 @@ def verifier_type_has_param(ty: Type) -> Bool
       ai = ai + 1
     end
     false
-  when Type::FnPtr(params, ret) then
+  when Type::FnPtr(params, ret, _) then
     var pi2 = 0
     while pi2 < params.len() do
       if verifier_type_has_param(&params[pi2].ty) then return true end
       pi2 = pi2 + 1
     end
     verifier_type_has_param(&ret)
-  when Type::Closure(_, params, ret, captures) then
+  when Type::Closure(_, params, ret, captures, _) then
     var pi3 = 0
     while pi3 < params.len() do
       if verifier_type_has_param(&params[pi3].ty) then return true end

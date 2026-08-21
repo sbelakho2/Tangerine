@@ -5,11 +5,17 @@
 # THREADS * PER_THREAD: any lost update (a race on the guarded counter)
 # would leave the total short. The guard is re-acquired per iteration
 # (churn), so lock handoff between the worker threads is exercised.
+#
+# The condvar suite pins the notify_one/notify_all TICKET semantics: with
+# 8 registered waiters a single notify_one must let EXACTLY ONE waiter
+# proceed (the one whose ticket matches the consumed membership), and a
+# subsequent notify_all must let the remaining 7 proceed. The old
+# generation-counter design woke every waiter on notify_one.
 
 use std::core::{Vec, String, Unit, Result, Option}
 use std::test::*
-use std::sync::{Arc, Mutex}
-use std::thread::{spawn}
+use std::sync::{Arc, Mutex, Condvar}
+use std::thread::{spawn, JoinHandle}
 
 const THREADS: Int = 4
 const PER_THREAD: Int = 2000
@@ -56,4 +62,87 @@ def test_mutex_guard_read_write_round_trip() -> Unit
   assert_eq(rc, 0)
   let final_val = *counter.lock()
   assert_eq(final_val, 42)
+end
+
+# A waiter: signals READY (all 8 registered), blocks in condvar.wait, then
+# counts itself among the PROCEEDED waiters once the wait returns.
+def cond_waiter(cond: Arc[Condvar], mutex: Arc[Mutex[Int]], ready: Arc[Mutex[Int]], proceeded: Arc[Mutex[Int]]) -> Int
+  let mut guard = mutex.lock()
+  let mut rg = ready.lock()
+  *rg = *rg + 1
+  drop(rg)
+  guard = cond.wait(guard)
+  let mut pg = proceeded.lock()
+  *pg = *pg + 1
+  drop(pg)
+  0
+end
+
+# Bounded spin on the proceeded counter: returns false (never a hang) when
+# the target is not reached, so a broken notify design FAILS the test
+# instead of blocking CI forever.
+def spin_until_proceeded(proceeded: Arc[Mutex[Int]], target: Int) -> Bool
+  var spins = 0
+  while spins < 1000000 do
+    let g = proceeded.lock()
+    let n = *g
+    drop(g)
+    if n >= target then
+      return true
+    end
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  false
+end
+
+@test
+def test_condvar_notify_one_wakes_exactly_one_then_all() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(Mutex::new(0))
+  let proceeded = Arc::new(Mutex::new(0))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 8 do
+    let h = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+    handles.push(h)
+    i = i + 1
+  end
+
+  # All 8 waiters must be registered (ready == 8) before the single
+  # notify_one — the ticket design wakes exactly ONE of them.
+  var spins = 0
+  while spins < 1000000 do
+    let rg = ready.lock()
+    let n = *rg
+    drop(rg)
+    if n >= 8 then
+      break
+    end
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+
+  cond.notify_one()
+  assert_true(spin_until_proceeded(proceeded.clone(), 1))
+  let g = proceeded.lock()
+  assert_eq(*g, 1)
+  drop(g)
+
+  # The remaining 7 waiters proceed only after the notify_all.
+  cond.notify_all()
+  assert_true(spin_until_proceeded(proceeded.clone(), 8))
+  let g2 = proceeded.lock()
+  assert_eq(*g2, 8)
+  drop(g2)
+
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
 end

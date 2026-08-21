@@ -10,8 +10,10 @@
 #      with `tg check` instead);
 #   4. an explicitly named file that fails to parse exits nonzero AND emits
 #      the parse diagnostics (never skipped);
-#   5. implicit discovery (a directory scan containing a broken file next to
-#      a passing file) stays skip-tolerant and exits 0.
+#   5. implicit discovery selects only RECOGNIZED test sources: a directory
+#      scan containing a broken NON-test source next to a passing file exits
+#      0 (the broken file is never selected); a recognized TEST source that
+#      fails to compile exits nonzero (no silent vanish).
 #
 # Usage: tests/run_test_runner_integrity.sh [compiler]
 #   compiler defaults to build/tg (the CI-materialized stage3 artifact).
@@ -105,13 +107,24 @@ if ! grep -qi "error" "$WORK/out_parse.txt"; then
   fail "parse-error diagnostics missing from output"
 fi
 
-# 5. Implicit discovery stays skip-tolerant: a directory scan containing a
-#    broken file next to a passing file must not fail the suite.
+# 5. Implicit discovery selects only RECOGNIZED test sources. A directory
+#    scan containing a broken NON-test source next to a passing file stays
+#    clean: the broken file carries no @test marker and is never selected.
 mkdir -p "$WORK/implicit"
 cp "$WORK/pass.tg" "$WORK/implicit/good.tg"
-cp "$WORK/parse_error.tg" "$WORK/implicit/bad.tg"
-if ! "$COMPILER" test "$WORK/implicit" >"$WORK/out_implicit.txt" 2>&1; then
-  fail "implicit directory scan with a broken file exited nonzero"
+cp "$WORK/parse_error.tg" "$WORK/implicit/bad_non_test.tg"
+if ! "$COMPILER" test "$WORK/implicit" >"$WORK/out_implicit_non_test.txt" 2>&1; then
+  fail "implicit directory scan with a broken NON-test source exited nonzero"
 fi
 
-echo "✓ test-runner integrity: pass / fail / zero-test / parse-error / implicit-skip all behave"
+# 5b. A RECOGNIZED test source (a file carrying the @test marker) that fails
+#     to compile must fail the invocation — no silent vanish.
+cat > "$WORK/implicit/bad_test_source.tg" <<'EOF'
+@test
+def broken_test( -> Unit
+EOF
+if "$COMPILER" test "$WORK/implicit" >"$WORK/out_implicit_bad_test.txt" 2>&1; then
+  fail "implicit directory scan with a broken TEST source exited zero"
+fi
+
+echo "✓ test-runner integrity: pass / fail / zero-test / parse-error / implicit-recognized-selection all behave"
