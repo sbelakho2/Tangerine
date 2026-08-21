@@ -33,12 +33,19 @@
 #         waiter inserted at the frozen transition does not (it belongs
 #         to the next cohort) and needs its own notify.
 #   (c) test_timeout_racing_notify_one_detached_state_stays_alive
-#       — the timeout races a frozen notify_one: the notify detaches
-#         the waiter's entry and parks before the store; the waiter
-#         times out, and the notifier's later store lands on the
-#         still-alive Arc[WaiterState] (no crash, no use-after-free).
+#       — the timeout races a frozen notify_one under the DETACH-WINS
+#         contract: the notify detaches the waiter's entry and parks
+#         before the notified store; the waiter's deadline expires
+#         AFTER the detach — the cancel cannot find the id (the
+#         notifier won the ownership handoff) — and the waiter reports
+#         the NOTIFICATION, never the timeout; the notifier's later
+#         store lands on the still-alive Arc[WaiterState] (no crash, no
+#         use-after-free).
 #   (d) test_timeout_racing_notify_all_both_cohort_entries_detached
-#       — the same race against notify_all with two timed waiters.
+#       — the same race against notify_all with two timed waiters: both
+#         deadlines expire after the detach — both report the
+#         NOTIFICATION (the detach is the arbitration, the delayed flag
+#         store is merely the publication).
 #   (e) test_one_waiter_many_notifications_single_wake
 #       — 1 waiter / N notifications: the N-1 notify_ones with no
 #         registered waiter are no-ops (no ghost wake), the first with
@@ -61,7 +68,7 @@
 use std::core::{Int, Bool, Unit, Option, Result, Vec}
 use std::test::*
 use std::sync::{Arc, Mutex, Condvar, AtomicU32}
-use std::thread::{spawn, JoinHandle, yield_now}
+use std::thread::{spawn, JoinHandle, yield_now, thread_sleep_ms}
 use std::time::{Duration}
 
 const MAX_SPINS: Int = 2000000
@@ -244,21 +251,27 @@ def test_timeout_racing_notify_one_detached_state_stays_alive() -> Unit
   assert_eq(queue_len(cond.clone()), 1)
 
   # The notify_one detaches W1's entry and parks BEFORE storing the
-  # notified flag: the timeout sees a detached registration whose
-  # notify has not completed.
+  # notified flag. THE DETACH-WINS CONTRACT: the detach is the ownership
+  # handoff — W1's deadline expires AFTER the detach, the cancel cannot
+  # find the id (the notifier won), and W1 reports the NOTIFICATION, not
+  # the timeout. The delayed flag store is merely the publication, never
+  # the arbitration — the final recheck waits for it, so the barrier is
+  # released BEFORE the outcome is asserted.
   freeze_condvar(cond.clone())
   let mut hn = spawn(move || { cond.notify_one(); 0 })
   assert_true(spin_until_len(cond.clone(), 0))
-  # W1's deadline expires while the notify is in flight: it times out.
-  assert_true(spin_until_at_least(timed_out.clone(), 1))
-  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
-  # Release the frozen notify: its store lands on the detached
-  # (still-alive, via the notifier's Arc) WaiterState — harmless.
+  # Hold the notify parked PAST W1's 40ms deadline: the waiter's cancel
+  # runs while the publication is still pending — the detach already
+  # decided the outcome (woken).
+  thread_sleep_ms(60)
   release_frozen_condvar(cond.clone())
   assert_ok(hn.join())
+  # The waiter whose deadline expired after the detach reports the
+  # NOTIFICATION — never the timeout.
+  assert_true(spin_until_at_least(woken.clone(), 1))
+  assert_eq(woken.ptr.as_ref().load(), 1 as u32)
+  assert_eq(timed_out.ptr.as_ref().load(), 0 as u32)
   assert_ok(h1.join())
-  assert_eq(timed_out.ptr.as_ref().load(), 1 as u32)
-  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
 
   # The condvar still works: a fresh waiter is woken normally.
   let mut h2 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), woken.clone()))
@@ -286,14 +299,18 @@ def test_timeout_racing_notify_all_both_cohort_entries_detached() -> Unit
   freeze_condvar(cond.clone())
   let mut hn = spawn(move || { cond.notify_all(); 0 })
   assert_true(spin_until_len(cond.clone(), 0))
-  assert_true(spin_until_at_least(timed_out.clone(), 2))
-  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
+  # Hold the notify parked PAST both waiters' deadlines: both cancels
+  # run while the publications are pending — the detach-wins contract
+  # (the cancel cannot find the ids — the notifier won) makes both
+  # report the NOTIFICATION, never the timeout.
+  thread_sleep_ms(60)
   release_frozen_condvar(cond.clone())
   assert_ok(hn.join())
+  assert_true(spin_until_at_least(woken.clone(), 2))
+  assert_eq(woken.ptr.as_ref().load(), 2 as u32)
+  assert_eq(timed_out.ptr.as_ref().load(), 0 as u32)
   assert_ok(h1.join())
   assert_ok(h2.join())
-  assert_eq(timed_out.ptr.as_ref().load(), 2 as u32)
-  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
 
   # The condvar still works: a fresh waiter is woken normally.
   let mut h3 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), woken.clone()))

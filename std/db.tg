@@ -10,9 +10,10 @@
 use std::core::{Option, Result, Vec, String, Bool, Int, StrView}
 use std::collections::{Map, VecDeque}
 # The blocking pool (blocking-pool design): the N bounded worker threads from
-# std::thread, the blocking job queue, the async-channel result delivery.
+# std::thread, the blocking job queue, the BlockingFuture result delivery
+# (the synchronized result cell + the executor's external-wake bridge).
 use std::thread::{ThreadBuilder, JoinHandle, AtomicBool, Ordering, Once, once_new, atomic_bool_new, atomic_int_new}
-use std::async::{channel}
+use std::async::{ExecutorInner, Future, Poll, Context, global_executor_inner}
 
 # ═══════════════════════════════════════════════════════════════
 # PART 1: DATABASE ABSTRACTIONS
@@ -1210,6 +1211,79 @@ impl Postgres
     
     Result::Ok(Postgres { inner: Arc::new(PostgresInner { handle: handle, stmt_counter: 0, life: conn_lifetime_new() }) })
   end
+  
+  # ———————————————————————————————————————————————
+  # THE PORTABLE `?` API (the EXPLICIT translation mode): the native
+  # query/execute/prepare accept the AUTHORITATIVE $1..$n form and never
+  # rewrite the SQL; these methods are the opt-in convenience for the
+  # JDBC-style `?` placeholders — each one runs the lexer's ? -> $n
+  # translation (quoted-string aware) and then executes/prepares the
+  # translated statement through the SAME native raw paths.
+  # ———————————————————————————————————————————————
+  
+  ## Portable execute: `?` placeholders are translated to $1..$n
+  ## (quoted-string aware) before the native execution.
+  def execute_portable(inout self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
+    let (translated, param_count) = postgres_translate_placeholders(sql)
+    if param_count != params.len() as UInt then
+      return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
+    end
+    postgres_execute_raw(self.inner.ptr.as_ref().handle, translated, params)
+  end
+  
+  ## Portable query: `?` placeholders are translated to $1..$n
+  ## (quoted-string aware) before the native query.
+  def query_portable(self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
+    let (translated, param_count) = postgres_translate_placeholders(sql)
+    if param_count != params.len() as UInt then
+      return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
+    end
+    postgres_query_raw(self.inner.ptr.as_ref().handle, translated, params)
+  end
+  
+  ## Portable prepare: the `?` placeholders are translated to $1..$n at
+  ## prepare time (the explicit translation mode — the native prepare
+  ## never rewrites) and the server-side statement is created with the
+  ## translated SQL.
+  def prepare_portable(inout self: Postgres, sql: str) -> Result[Statement, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
+    let (translated, param_count) = postgres_translate_placeholders(sql)
+    self.inner.ptr.as_ref().stmt_counter = self.inner.ptr.as_ref().stmt_counter + 1
+    let stmt_name = "stmt_" + self.inner.ptr.as_ref().stmt_counter.to_string()
+    let stmt_name_cstr = stmt_name.to_cstring()
+    let sql_cstr = translated.to_cstring()
+    
+    let result = unsafe "FFI boundary" do
+      PQprepare(self.inner.ptr.as_ref().handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), param_count as i32, null_ptr())
+    end
+    
+    if result.is_null() then
+      return Result::Err(DbError::QueryFailed(postgres_errmsg(self.inner.ptr.as_ref().handle)))
+    end
+    
+    let status = unsafe "FFI boundary" do PQresultStatus(result) end
+    if status != PGRES_COMMAND_OK then
+      let err_msg = postgres_result_errmsg(result)
+      unsafe "FFI boundary" do PQclear(result) end
+      return Result::Err(DbError::QueryFailed(err_msg))
+    end
+    
+    unsafe "FFI boundary" do PQclear(result) end
+    
+    conn_lifetime_register_child(life)
+    Result::Ok(Statement {
+      sql: translated,
+      handle: null_ptr(),
+      driver: DriverKind::Postgres,
+      conn_handle: self.inner.ptr.as_ref().handle,
+      param_count: param_count,
+      stmt_name: stmt_name,
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life }
+    })
+  end
 end
 
 impl Connection for Postgres
@@ -1239,16 +1313,19 @@ impl Connection for Postgres
   def prepare(inout self: Postgres, sql: str) -> Result[Statement, DbError]
     let life = self.inner.ptr.as_ref().life.clone()
     conn_lifetime_check(life)?
-    # The statement SQL is normalized to PostgreSQL's $1..$n positional
-    # form at prepare time (the `?` placeholder translation, quoted-string
-    # aware), and the server-side statement is created with PQprepare; the
-    # Statement then carries the connection handle + the statement name +
-    # the parameter count so execute/query run PQexecPrepared.
-    let (translated, param_count) = postgres_translate_placeholders(sql)
+    # THE NATIVE PREPARED STATEMENT (the AUTHORITATIVE $1..$n form): the
+    # SQL is sent BYTE-IDENTICAL to PQprepare — the driver never silently
+    # rewrites a `?` (the jsonb ?| / ?& operators pass through untouched
+    # in the native mode). The server-side statement is created with
+    # PQprepare; the nParams is the lexer-aware count of the $n markers
+    # (the only scan in the native path — it counts, it never rewrites).
+    # The portable `?` form goes through Postgres::prepare_portable (the
+    # explicit translation mode).
+    let param_count = postgres_count_native_params(sql)
     self.inner.ptr.as_ref().stmt_counter = self.inner.ptr.as_ref().stmt_counter + 1
     let stmt_name = "stmt_" + self.inner.ptr.as_ref().stmt_counter.to_string()
     let stmt_name_cstr = stmt_name.to_cstring()
-    let sql_cstr = translated.to_cstring()
+    let sql_cstr = sql.to_cstring()
     
     let result = unsafe "FFI boundary" do
       PQprepare(self.inner.ptr.as_ref().handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), param_count as i32, null_ptr())
@@ -1269,7 +1346,7 @@ impl Connection for Postgres
     
     conn_lifetime_register_child(life)
     Result::Ok(Statement {
-      sql: translated,
+      sql: sql.to_string(),
       handle: null_ptr(),
       driver: DriverKind::Postgres,
       conn_handle: self.inner.ptr.as_ref().handle,
@@ -1329,20 +1406,29 @@ end
 # ———————————————————————————————————————————————————————————————
 # The ? -> $n placeholder translation — the real driver lexer
 # ———————————————————————————————————————————————————————————————
-# PostgreSQL expects $1..$n positional parameters, never the JDBC `?`
-# placeholder. The translation scans the statement's SQL with a STATE
-# MACHINE over the enumerated PgLexState states (blocking-pool design) — the
-# single-quoted strings (with the '' doubling), the double-quoted
-# identifiers (with the "" doubling), the E'...' escape strings (where a
-# backslash escapes the following byte AND '' still doubles), the
-# dollar-quoted bodies ($tag$ ... $tag$ — the tag is remembered and the
-# body is opaque until the exact closing delimiter; a $ followed by a
-# digit is a positional parameter, never a dollar-quote opener), the --
-# line comments, and the /* */ block comments (which NEST in PostgreSQL —
-# the depth counter). A `?` inside ANY of those regions is DATA, never a
-# parameter; outside them a `?` followed by | or & is the jsonb ?| / ?&
-# operator (also not a parameter); a lone `?` is rewritten to $1..$n in
-# parameter order.
+# THE PORTABLE MODE (the EXPLICIT opt-in): PostgreSQL expects $1..$n
+# positional parameters, never the JDBC `?` placeholder. The portable
+# wrappers (Postgres::execute_portable / query_portable /
+# prepare_portable) run the ? -> $n translation with a STATE MACHINE over
+# the enumerated PgLexState states — the single-quoted strings (with the
+# '' doubling), the double-quoted identifiers (with the "" doubling), the
+# E'...' escape strings (where a backslash escapes the following byte AND
+# '' still doubles), the dollar-quoted bodies ($tag$ ... $tag$ — the tag
+# is remembered and the body is opaque until the exact closing
+# delimiter; a $ followed by a digit is a positional parameter, never a
+# dollar-quote opener), the -- line comments, and the /* */ block
+# comments (which NEST in PostgreSQL — the depth counter). A `?` inside
+# ANY of those regions is DATA, never a parameter; outside them a `?`
+# followed by | or & is the jsonb ?| / ?& operator (also not a
+# parameter); a lone `?` is rewritten to $1..$n in parameter order.
+#
+# THE NATIVE MODE (the AUTHORITATIVE $1..$n form): the driver's
+# query/execute/prepare accept the $n parameters NATIVELY — the SQL
+# passes through BYTE-IDENTICAL (the translation NEVER runs in the
+# native path, and the `?` jsonb operator passes through untouched). The
+# same state machine is used ONLY to COUNT the $n markers
+# (postgres_count_native_params — the highest index) because PQprepare
+# requires the exact parameter count; the count scan never rewrites.
 #
 # The lexer works on the SQL's raw bytes (every state character is ASCII;
 # multi-byte UTF-8 content inside strings passes through byte-exact) and
@@ -1365,6 +1451,7 @@ struct PgPlaceholderLexer
   block_depth: UInt
   out: Vec[u8]
   param_count: UInt
+  count_native: Bool   # true: count $n markers only (never rewrite)
 end
 
 def pg_lex_ident_start(b: u8) -> Bool
@@ -1375,7 +1462,7 @@ def pg_lex_ident_char(b: u8) -> Bool
   pg_lex_ident_start(b) || (b >= '0' as u8 && b <= '9' as u8)
 end
 
-def postgres_translate_placeholders(sql: str) -> (String, UInt)
+def postgres_scan_sql(sql: str, count_native: Bool) -> (String, UInt)
   let bytes = sql.as_bytes()
   let n = bytes.len()
   mut lexer = PgPlaceholderLexer {
@@ -1383,7 +1470,8 @@ def postgres_translate_placeholders(sql: str) -> (String, UInt)
     dollar_tag: Vec::new(),
     block_depth: 0,
     out: Vec::new(),
-    param_count: 0
+    param_count: 0,
+    count_native: count_native
   }
   mut i = 0
   while i < n do
@@ -1443,12 +1531,31 @@ def postgres_translate_placeholders(sql: str) -> (String, UInt)
           else
             lexer.out.push(b)
           end
+        elsif lexer.count_native && tag_start < n && bytes[tag_start] >= '0' as u8 && bytes[tag_start] <= '9' as u8 then
+          # THE NATIVE COUNT MODE: a $n positional marker — the HIGHEST
+          # index is the PQprepare parameter count. The scan counts
+          # without ever rewriting: the SQL passes through untouched.
+          mut val = 0
+          var d = tag_start
+          while d < n && bytes[d] >= '0' as u8 && bytes[d] <= '9' as u8 do
+            val = val * 10 + (bytes[d] as Int - '0' as Int)
+            d = d + 1
+          end
+          if (val as UInt) > lexer.param_count then
+            lexer.param_count = val as UInt
+          end
+          lexer.out.push(b)
         else
           lexer.out.push(b)
         end
       elsif b == '?' as u8 then
         if i + 1 < n && (bytes[i + 1] == '|' as u8 || bytes[i + 1] == '&' as u8) then
           # The ?| / ?& jsonb operators — data, never a parameter.
+          lexer.out.push(b)
+        elsif lexer.count_native then
+          # THE NATIVE MODE: a lone `?` is DATA — the native driver never
+          # silently rewrites it (the jsonb ? operator passes through
+          # untouched; the portable translation is the explicit opt-in).
           lexer.out.push(b)
         else
           lexer.param_count = lexer.param_count + 1
@@ -1561,8 +1668,26 @@ def postgres_translate_placeholders(sql: str) -> (String, UInt)
     end
     i = i + 1
   end
-  let translated = String::from_utf8(lexer.out).unwrap_or(String::new())
-  (translated, lexer.param_count)
+  let out = String::from_utf8(lexer.out).unwrap_or(String::new())
+  (out, lexer.param_count)
+end
+
+## The PORTABLE translation: the `?` placeholders are rewritten to $1..$n
+## (the portable API's explicit translation mode — used ONLY by the
+## *Portable wrappers, never by the native driver paths).
+def postgres_translate_placeholders(sql: str) -> (String, UInt)
+  postgres_scan_sql(sql, false)
+end
+
+## The NATIVE $n count (the PQprepare parameter count): the highest $n
+## index in the statement — lexer-aware (the $n markers inside strings,
+## dollar-quoted bodies, and comments are data) and NEVER a rewrite: the
+## native paths pass the SQL through byte-identical; the scan only
+## counts. The `?` operator is data in the native mode — it contributes
+## nothing to the count and is never translated.
+def postgres_count_native_params(sql: str) -> UInt
+  let (_, count) = postgres_scan_sql(sql, true)
+  count
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1695,17 +1820,16 @@ def postgres_execute_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlPara
     return Result::Ok(affected)
   end
   
-  # Parameterized execution: translate the `?` placeholders to the $1..$n
-  # positional form PostgreSQL expects, back every parameter payload with
-  # the owned PgParamBacking (blob bytes copied into owned buffers — no
-  # dangling pointers), and send through PQexecParams.
-  let (translated, param_count) = postgres_translate_placeholders(sql)
-  if param_count != params.len() as UInt then
-    return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
-  end
-  
+  # THE NATIVE PARAMETER FORM (the AUTHORITATIVE $1..$n): the SQL is sent
+  # BYTE-IDENTICAL — the driver NEVER silently rewrites it (no `?` -> $n
+  # translation in the native path; a `?` that is the jsonb ?| / ?&
+  # operator passes through untouched). The parameter count comes from
+  # the caller's params array; PostgreSQL validates the $n references
+  # itself at the server. The portable `?` form goes through the
+  # translate-then-execute wrappers (Postgres::execute_portable /
+  # query_portable / prepare_portable).
   let backing = postgres_build_backing(params)
-  let sql_cstr = translated.to_cstring()
+  let sql_cstr = sql.to_cstring()
   let c_lengths = postgres_i32_lengths(backing)
   let c_formats = postgres_i32_formats(backing)
   let result = unsafe "FFI boundary" do
@@ -1744,16 +1868,11 @@ def postgres_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]
     let sql_cstr = sql.to_cstring()
     unsafe "FFI boundary" do PQexec(handle, sql_cstr.as_ptr()) end
   else
-    # Parameterized query: translate the `?` placeholders to the $1..$n
-    # positional form and back every parameter with the owned
-    # PgParamBacking (blob bytes copied into owned buffers — no dangling
-    # pointers) before PQexecParams.
-    let (translated, param_count) = postgres_translate_placeholders(sql)
-    if param_count != params.len() as UInt then
-      return Result::Err(DbError::BindError(param_count, "placeholder count does not match parameter count".to_string()))
-    end
+    # THE NATIVE PARAMETER FORM: the SQL passes through byte-identical
+    # (never a silent `?` rewrite); the parameter count is the caller's
+    # params array length.
     let backing = postgres_build_backing(params)
-    let sql_cstr = translated.to_cstring()
+    let sql_cstr = sql.to_cstring()
     let c_lengths = postgres_i32_lengths(backing)
     let c_formats = postgres_i32_formats(backing)
     unsafe "FFI boundary" do
@@ -3128,13 +3247,30 @@ end
 # REAL bounded pool of N worker threads (BLOCKING_POOL_SIZE, created
 # exactly once via the Once guard — the bounded thread creation). The
 # workers block on the job queue (Mutex[VecDeque] + Condvar); the RESULT
-# is delivered through an ASYNC CHANNEL — the worker pushes the value
-# into the channel's buffer and wakes the awaiting task, and the async
-# side awaits the RecvFuture (the pool + the channel result). The pool is
+# is delivered through the BlockingFuture (the cell + the wake bridge) —
+# the worker ONLY publishes the value into the synchronized result cell
+# (Arc[Mutex[BlockingCell[T]]]) and enqueues the task's id into the
+# executor's thread-safe external-wake inbox (external_wake_queue); the
+# executor thread drains the inbox in its run loop and wakes the task via
+# the INTERNAL wake_task. The worker NEVER touches the executor's
+# ready_queue/task_states/join_waiters/reactor or any cooperative waiter
+# list — the single-owner executor design is preserved. The pool is
 # process-global (the static holds the inner Arc + the join handles); the
 # workers hold their OWN Arc clones, so the inner (and the job queue)
 # stays alive regardless of the statics.
+#
+# THE BOUNDED QUEUE (the backpressure policy — CHOSEN over reject): the
+# job queue never grows past BLOCKING_POOL_QUEUE_LIMIT. A submitter whose
+# push would exceed the limit BLOCKS on the condvar until a worker frees
+# a slot (the worker notifies after every pop) — or the shutdown flag is
+# set (the drain guarantees the queued jobs still run). No job is ever
+# rejected or silently dropped: the queue is bounded by THROTTLING the
+# producers, not by losing work. REJECT (an Err on a full queue) was the
+# alternative and is NOT used: it cannot be surfaced through
+# spawn_blocking's T-returning future, and the graceful-drain contract
+# (queued work always runs) prefers a bounded block over a lost job.
 const BLOCKING_POOL_SIZE: UInt = 4
+const BLOCKING_POOL_QUEUE_LIMIT: UInt = 64
 
 struct BlockingPoolInner
   job_queue: Mutex[VecDeque[Box[dyn FnOnce()]]]
@@ -3144,70 +3280,137 @@ end
 
 struct BlockingPool
   inner: Arc[BlockingPoolInner]
-  workers: Vec[Option[JoinHandle[Unit]]]
+  workers: Vec[JoinHandle[Unit]]
 end
 
 static mut BLOCKING_POOL: Option[Arc[BlockingPoolInner]] = Option::None
-static mut BLOCKING_POOL_WORKERS: Option[Vec[Option[JoinHandle[Unit]]]] = Option::None
+static mut BLOCKING_POOL_WORKERS: Option[Vec[JoinHandle[Unit]]] = Option::None
+static mut BLOCKING_POOL_INIT_ERROR: Option[String] = Option::None
 static BLOCKING_POOL_ONCE: Once = once_new()
 
-def blocking_pool_init() -> Unit
+## The pool initialization — THE RESULT (the minimum-worker-count
+## contract): the creation FAILS when any worker cannot start (the
+## Result::Err — never a swallowed Err(_) => a None worker slot). The
+## already-started workers are joined down before the failure returns
+## (no thread leaks behind a failed pool), and the pool is never
+## installed in a partial state.
+def blocking_pool_init() -> Result[Unit, String]
   let inner = Arc::new(BlockingPoolInner {
     job_queue: Mutex::new(VecDeque::new()),
     condvar: Condvar::new(),
     shutdown: atomic_bool_new(false)
   })
-  var workers = Vec::new()
+  var workers: Vec[JoinHandle[Unit]] = Vec::new()
   var i: UInt = 0
   while i < BLOCKING_POOL_SIZE do
     let worker_inner = inner.clone()
-    let handle = ThreadBuilder::new().spawn(|| blocking_worker_loop(worker_inner))
-    match handle
-    when Result::Ok(h) then workers.push(Option::Some(h))
-    when Result::Err(_) then workers.push(Option::None)
+    match ThreadBuilder::new().spawn(|| blocking_worker_loop(worker_inner))
+    when Result::Ok(h) then
+      workers.push(h)
+    when Result::Err(e) then
+      # THE MINIMUM-WORKER-COUNT CONTRACT: a pool with fewer than
+      # BLOCKING_POOL_SIZE workers is never installed. The started
+      # workers are stopped through the flag + the drain (the empty
+      # queue exits them) and joined — no thread is leaked behind the
+      # failed creation.
+      let ch = inner.ptr.as_ref()
+      ch.shutdown.store(true, Ordering::Release)
+      ch.condvar.notify_all()
+      loop do
+        match workers.pop()
+        when Option::Some(mut handle) then
+          let _ = handle.join()
+        when Option::None then
+          break
+        end
+      end
+      return Result::Err("blocking pool: worker spawn failed: " + e)
     end
     i = i + 1
   end
   BLOCKING_POOL = Option::Some(inner)
   BLOCKING_POOL_WORKERS = Option::Some(workers)
+  Result::Ok(())
 end
 
-def blocking_pool_get() -> Arc[BlockingPoolInner]
-  BLOCKING_POOL_ONCE.call_once(|| blocking_pool_init())
-  match BLOCKING_POOL.clone()
-  when Option::Some(inner) then inner
-  when Option::None then panic("blocking pool: not initialized")
+## The pool getter — the Result: the pool is created exactly once (the
+## Once guard — a concurrent first caller never double-creates). A
+## FAILED creation is surfaced through the init-error static and fails
+## every subsequent get: the pool is never observed in a partial state.
+def blocking_pool_get() -> Result[Arc[BlockingPoolInner], String]
+  BLOCKING_POOL_ONCE.call_once(|| {
+    match blocking_pool_init()
+    when Result::Ok(()) then ()
+    when Result::Err(e) then BLOCKING_POOL_INIT_ERROR = Option::Some(e)
+    end
+  })
+  match BLOCKING_POOL_INIT_ERROR.clone()
+  when Option::Some(e) then
+    Result::Err(e)
+  when Option::None then
+    match BLOCKING_POOL.clone()
+    when Option::Some(inner) then Result::Ok(inner)
+    when Option::None then Result::Err("blocking pool: not initialized".to_string())
+    end
   end
 end
 
-# The worker loop: block on the job queue (the condvar) until a job
-# arrives or the shutdown flag is set, then run the job.
+## The worker loop: block on the job queue (the condvar) until a job
+## arrives or the shutdown flag is set, then run the job.
+##
+## THE DRAIN ORDER (the graceful drain): the loop's ONLY shutdown check
+## runs AFTER the drain — a worker that finds jobs under the shutdown
+## flag still runs them. The old top-of-loop flag check abandoned queued
+## work (the stop-flag-abandon): the worker exited with jobs still in
+## the queue. Here the worker exits only when the queue is EMPTY and the
+## flag is set.
 def blocking_worker_loop(inner: Arc[BlockingPoolInner]) -> Unit
   loop do
     let ch = inner.ptr.as_ref()
-    if ch.shutdown.load(Ordering::Acquire) then
-      break
-    end
     let mut guard = ch.job_queue.lock()
+    # Wait while the queue is empty and the pool is not shutting down —
+    # every wakeup re-checks the predicate (no lost wakeup, no spurious
+    # exit).
     while guard.is_empty() && !ch.shutdown.load(Ordering::Acquire) do
       guard = ch.condvar.wait(guard)
     end
-    if ch.shutdown.load(Ordering::Acquire) && guard.is_empty() then
-      break
-    end
-    let job = guard.pop_front()
-    drop(guard)
-
-    match job
-    when Option::Some(f) then f()
-    when Option::None then ()
+    if guard.is_empty() then
+      # THE SHUTDOWN CHECK AFTER THE DRAIN: the queue is empty — either
+      # the shutdown flag is set (the drain is complete — the worker
+      # exits) or a spurious wakeup left the queue empty (re-wait).
+      drop(guard)
+      if ch.shutdown.load(Ordering::Acquire) then
+        break
+      end
+    else
+      let job = guard.pop_front()
+      drop(guard)
+      # The freed slot wakes a backpressured producer (or a sibling
+      # worker; the predicate re-checks make every wakeup safe).
+      ch.condvar.notify_one()
+      match job
+      when Option::Some(f) then f()
+      when Option::None then ()
+      end
     end
   end
 end
 
 impl BlockingPoolInner
-  def execute(self: BlockingPoolInner, f: FnOnce() -> Unit) -> Unit
+  # The job must carry the cross-thread property: the closure (with its
+  # captures) crosses the pool boundary and runs on a worker thread — the
+  # Transferable bound is checked at the submit site.
+  #
+  # THE BOUNDED QUEUE (backpressure): the push BLOCKS while the queue is
+  # at the limit — the worker's post-pop notify wakes the blocked
+  # producer (the predicate re-checks make the wakeup safe). The
+  # shutdown flag unblocks a producer whose pool is draining: the drain
+  # runs the pushed job before the workers exit.
+  def execute[F: FnOnce() -> Unit + Transferable](self: BlockingPoolInner, f: F) -> Unit
     let mut guard = self.job_queue.lock()
+    while (guard.len() as UInt) >= BLOCKING_POOL_QUEUE_LIMIT && !self.shutdown.load(Ordering::Acquire) do
+      guard = self.condvar.wait(guard)
+    end
     guard.push_back(Box::new(f))
     drop(guard)
     self.condvar.notify_one()
@@ -3215,7 +3418,9 @@ impl BlockingPoolInner
 end
 
 # The graceful shutdown: set the flag, wake every worker, join them (the
-# bounded thread creation is released).
+# bounded thread creation is released). The workers' drain-first loop
+# runs every queued job before the flag check exits them — the shutdown
+# never abandons queued work.
 def blocking_pool_shutdown() -> Unit
   let workers = match BLOCKING_POOL_WORKERS.take()
   when Option::Some(w) then w
@@ -3228,9 +3433,12 @@ def blocking_pool_shutdown() -> Unit
   let ch = inner.ptr.as_ref()
   ch.shutdown.store(true, Ordering::Release)
   ch.condvar.notify_all()
-  for worker in workers do
-    if let Option::Some(mut handle) = worker then
+  loop do
+    match workers.pop()
+    when Option::Some(mut handle) then
       let _ = handle.join()
+    when Option::None then
+      break
     end
   end
 end
@@ -3427,24 +3635,99 @@ impl[C: Connection + Transferable] AsyncConnection for AsyncPooledConnection[C]
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# BlockingFuture — the async side of the blocking pool
+# ———————————————————————————————————————————————————————————————
+# THE SYNCHRONIZED RESULT CELL (the cell + the wake bridge): the value
+# crosses the pool boundary through ONE synchronized handoff —
+# BlockingCell[T] { result, task_id } under a single Mutex. The future's
+# FIRST poll registers the task id (from the waker) into the same cell
+# (the waiter registered ONCE — later polls never re-register); the
+# worker publishes the value and reads the registered id under the SAME
+# lock, so the publish/read and the check/register are atomic with
+# respect to each other: a worker that sees no registered id knows the
+# task's guaranteed first poll will observe the cell, and a worker that
+# sees the id wakes the task through the external-wake bridge. The
+# worker path is exactly TWO synchronized executor interactions — the
+# cell (Arc[Mutex[BlockingCell[T]]]) and the external-wake queue enqueue
+# (executor.external_wake) — it never mutates the executor's
+# ready_queue/task_states/join_waiters/reactor or any cooperative waiter
+# list (the single-owner executor design).
+struct BlockingCell[T]
+  result: Option[T]
+  task_id: Option[UInt]
+end
+
+struct BlockingFuture[T]
+  cell: Arc[Mutex[BlockingCell[T]]]
+  executor: Arc[ExecutorInner]
+  registered: Bool   # the waiter is registered ONCE (the first poll)
+end
+
+impl[T] Future for BlockingFuture[T]
+  type Output = T
+
+  def poll(inout self, inout cx: Context) -> Poll[T]
+    # The cell check and the registration happen under the SAME lock as
+    # the worker's publish + id read: no lost wakeup, no missed result.
+    let mut guard = self.cell.lock()
+    match guard.get_mut().result.take()
+    when Option::Some(value) then
+      Poll::Ready(value)
+    when Option::None then
+      if !self.registered then
+        self.registered = true
+        guard.get_mut().task_id = Option::Some(cx.waker.task_id)
+      end
+      Poll::Pending
+    end
+  end
+end
+
 ## Helper: run a blocking closure on the REAL blocking pool and return a
 ## future. The closure is submitted to the pool (never executed inline);
-## the worker computes f() and pushes the result into the async channel,
-## waking the awaiting task.
+## the worker computes f() and publishes the value into the synchronized
+## result cell, then wakes the awaiting task through the external-wake
+## bridge — the worker never touches the cooperative channel or the
+## executor's scheduler state (the executor thread drains the wake inbox
+## and wakes the task itself).
 async def spawn_blocking[T: Transferable, F: FnOnce() -> T + Transferable](f: F) -> T
-  let (sender, receiver) = channel[T](1)
-  let pool = blocking_pool_get()
+  let pool = match blocking_pool_get()
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("spawn_blocking: the blocking pool failed to initialize: " + e)
+  end
+  let executor = match global_executor_inner()
+  when Option::Some(exec) then exec
+  when Option::None then panic("spawn_blocking: no async executor in scope — call inside block_on")
+  end
+  # THE ONE synchronized handoff: the value + the registered task id live
+  # in the same cell under the same Mutex.
+  let cell = Arc::new(Mutex::new(BlockingCell[T] {
+    result: Option::None,
+    task_id: Option::None
+  }))
   pool.execute(|| {
     let value = f()
-    let ch = sender.inner.ptr.as_ref()
-    ch.buffer.push_back(value)
-    if !ch.recv_waiters.is_empty() then
-      ch.recv_waiters.pop().unwrap().wake()
+    # The worker's ONLY executor interactions: the cell set + the
+    # external-wake enqueue — everything else stays on the executor
+    # thread.
+    let mut guard = cell.lock()
+    guard.get_mut().result = Option::Some(value)
+    let task_id = guard.get_mut().task_id
+    drop(guard)
+    match task_id
+    when Option::Some(tid) then
+      unsafe "executor inner access — the worker only enqueues the external wake" do
+        let exec = executor.ptr.as_mut()
+        exec.external_wake(tid)
+      end
+    when Option::None then ()
     end
   })
-  let received = receiver.recv().await
-  match received
-  when Option::Some(value) then value
-  when Option::None then panic("spawn_blocking: the result channel closed before the value arrived")
-  end
+  let future = BlockingFuture[T] {
+    cell: cell,
+    executor: executor,
+    registered: false
+  }
+  future.await
 end

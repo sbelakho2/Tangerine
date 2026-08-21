@@ -17,7 +17,7 @@
 
 use std::core::{Vec}
 use std::test::*
-use std::exec::{Executor, TaskPriority}
+use std::exec::{Executor, TaskPriority, JoinHandle}
 use std::collections::{Set}
 use std::sync::{Arc, Mutex}
 
@@ -297,4 +297,98 @@ def test_duplicate_task_id_is_fatal_internal_error() -> Unit
     ex.debug_inject_duplicate_submit(999999 as u64)
   })
   assert_contains(msg, "duplicate TaskId")
+end
+
+# (f) THE GRACEFUL SHUTDOWN DRAIN (reviewer item 11): hundreds of queued
+# jobs + shutdown BEFORE the work completes — the Running -> Draining ->
+# Stopped state machine keeps the workers PROCESSING (the worker loop
+# exits only when the queues are empty AND the active count is 0), so
+# EVERY queued task executes. The old stop-flag-then-join abandoned the
+# queued work — the fix is the drain-first loop + the drain quiescence
+# probe.
+@test
+def test_graceful_shutdown_drains_all_queued_jobs() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  let counter = Arc::new(Mutex::new(0))
+  let total = 500
+  
+  var i = 0
+  while i < total do
+    let c = counter.clone()
+    let _ = exec.submit(Box::new(move || { bump(c) }), TaskPriority::Normal)
+    i = i + 1
+  end
+  
+  # The shutdown runs with most jobs still QUEUED (2 workers, 500 jobs):
+  # the graceful drain must run every one of them.
+  exec.shutdown()
+  
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
+  # The ledger at the quiescence: every id Completed, nothing queued or
+  # running — the conservation invariant holds.
+  assert_eq(exec.debug_task_count(3), total)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(2), 0)
+  assert_eq(exec.debug_task_count(4), 0)
+  assert_true(exec.conservation_ok())
+end
+
+# (g) THE IMMEDIATE SHUTDOWN (reviewer item 11): the Running -> Cancelling
+# -> Stopped state machine — the queued tasks are removed + marked
+# Cancelled in the ledger, the in-flight tasks complete, and EVERY
+# JoinHandle reaches the terminal state under the shutdown (the join
+# resolves a cancelled task to None — the ledger probe; the completed
+# tasks to Some). The ledger is conserved at the quiescence:
+# completed + cancelled == submitted.
+@test
+def test_shutdown_now_cancels_queued_joins_terminal_ledger_conserved() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  let counter = Arc::new(Mutex::new(0))
+  let total = 300
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  
+  var i = 0
+  while i < total do
+    let c = counter.clone()
+    let h = exec.submit_with_result(move || { bump(c); 1 }, TaskPriority::Normal)
+    handles.push(h)
+    i = i + 1
+  end
+  
+  # The shutdown_now with most tasks still queued: the queued tasks are
+  # cancelled, the in-flight tasks run to completion.
+  exec.shutdown_now()
+  
+  # Every join is TERMINAL: Some (completed) or None (cancelled) — none
+  # hang (the 5ms ledger-recheck bound).
+  var some_count = 0
+  var none_count = 0
+  loop do
+    match handles.pop()
+    when Option::Some(h) then
+      match h.join()
+      when Option::Some(_) then some_count = some_count + 1
+      when Option::None then none_count = none_count + 1
+      end
+    when Option::None then
+      break
+    end
+  end
+  assert_eq(some_count + none_count, total)
+  
+  # The ledger at the quiescence: every id terminal — Completed (the
+  # in-flight tasks) + Cancelled (the drained queue) == submitted, and
+  # the conservation invariant holds.
+  assert_eq(exec.debug_task_count(3), some_count)
+  assert_eq(exec.debug_task_count(4), none_count)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(2), 0)
+  assert_true(exec.conservation_ok())
+  # The completed tasks really ran (the counter matches the Some joins).
+  let g = counter.lock()
+  assert_eq(*g, some_count)
+  drop(g)
 end

@@ -47,6 +47,16 @@ mut __tg_spawn_fail_create: Bool = false
 # to false, and a normal build never touches it.
 mut __tg_join_fail: Bool = false
 
+# Fault-injection hooks for the TLS failure-path tests: when true,
+# pthread_key_create / pthread_setspecific report EAGAIN (11) without
+# invoking the libc function, so (a) the ThreadLocal creation failure
+# (no uninitialized key is ever used) and (b) the set-failure cleanup
+# (the drop thunk runs + the storage is freed immediately — no leak)
+# are exercised deterministically on every platform. Test-only; default
+# to false, and a normal build never touches them.
+mut __tg_tls_key_create_fail: Bool = false
+mut __tg_tls_set_fail: Bool = false
+
 type Condvar = std::sync::Condvar
 
 # ———————————————————————————————————————————————————————————————
@@ -1184,7 +1194,17 @@ def thread_local_new[T](init: fn() -> T) -> ThreadLocal[T]
   # type-erased TlsAllocation indirection above). The old registration of
   # a no-op destructor leaked every per-thread value and never ran its
   # destructor.
-  pthread_key_create(&key as PtrMut[PthreadKeyT], tls_destroy_allocation)
+  #
+  # THE KEY-CREATE CHECK: pthread_key_create's return is CHECKED — a
+  # failure (EAGAIN — the PTHREAD_KEYS_MAX exhaustion) makes the
+  # ThreadLocal creation FAIL (the panic): an uninitialized key (key ==
+  # 0) is never returned to the caller, never stored under, never
+  # deleted (the old unchecked call silently produced a broken ThreadLocal
+  # whose get()/drop would touch the invalid key 0).
+  let key_rc = if __tg_tls_key_create_fail then 11 else pthread_key_create(&key as PtrMut[PthreadKeyT], tls_destroy_allocation) end
+  if key_rc != 0 then
+    panic("ThreadLocal: pthread_key_create failed (code " + (key_rc as Int).to_string() + ")")
+  end
   ThreadLocal { key: key, init: init }
 end
 
@@ -1209,7 +1229,17 @@ impl[T] ThreadLocal[T]
         raw: payload as Ptr[Unit],
         drop_fn: tls_drop_thunk
       })
-      pthread_setspecific(self.key, header as Ptr[u8])
+      # THE SET-SPECIFIC CHECK: pthread_setspecific's return is CHECKED.
+      # A failure after the payload + header allocations means the
+      # per-thread value can never be reached through the key — the drop
+      # thunk is invoked NOW (T's drop glue + the payload free) and the
+      # header is freed immediately: NO leak, no orphaned value. The
+      # ThreadLocal creation (the get) fails with the panic.
+      let set_rc = if __tg_tls_set_fail then 11 else pthread_setspecific(self.key, header as Ptr[u8]) end
+      if set_rc != 0 then
+        tls_destroy_allocation(header as Ptr[u8])
+        panic("ThreadLocal: pthread_setspecific failed (code " + (set_rc as Int).to_string() + ")")
+      end
       payload
     else
       # Already initialized for this thread: the stored value is the

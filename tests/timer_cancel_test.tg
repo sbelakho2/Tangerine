@@ -1,0 +1,170 @@
+# tests/timer_cancel_test.tg — the TimerId lifecycle (reviewer item
+# 10): the timer heap's entries carry { id, task, deadline, cancelled };
+# the SleepFuture/TimeoutFuture hold their TimerId and the Drop cancels
+# it; the task cancellation cancels all of the task's registrations;
+# the expired-cancelled entries are skipped lazily when popped; the
+# deterministic timer expiration invokes the SAME wake_task() as the
+# real timers. A cancelled timer can never fire a stale wake.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::async::{Future, Waker, Context, Poll, Either}
+use std::time::Duration
+
+# (e1) A cancelled future's timer never fires: the dropped SleepFuture's
+# Drop cancels its registration (the entry stays in the heap marked
+# cancelled) and the expired-cancelled entry is skipped when popped —
+# no wake, no ready-queue entry.
+@test
+def test_timer_dropped_sleep_future_cancels_timer() -> Unit
+  mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+  let waker = Waker { task_id: 601, executor: exec.inner.clone() }
+  let mut cx = Context { waker: waker }
+
+  let mut fut = std::async::sleep_millis(10)
+  match fut.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 1)
+
+  # the future's Drop cancels the timer (the entry stays, marked)
+  drop(fut)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap[0].cancelled, true)
+
+  # advancing the clock past the deadline pops the cancelled entry and
+  # skips it — the timer never fires
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(20))
+    exec_inner.check_timers_deterministic()
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.is_empty(), true)
+  assert_eq(exec.inner.ptr.as_ref().ready_queue.is_empty(), true)
+end
+
+# (e1-task) The task cancellation cancels ALL of the task's timer
+# registrations: the cancelled task's timer is skipped when popped — it
+# can never wake the (cancelled, possibly id-reused) task.
+@test
+def test_timer_task_cancel_cancels_registration() -> Unit
+  mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+  let h = exec.spawn(async {
+    std::async::sleep_millis(10).await
+  })
+  # poll the task once: the sleep registers its timer
+  exec.poll_task(h.task_id)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 1)
+  # cancelling the task cancels its registrations
+  let cancelled = exec.cancel_task(h.task_id)
+  assert_eq(cancelled, true)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap[0].cancelled, true)
+  # the cancelled timer never fires: advancing past the deadline pops
+  # and skips it
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(20))
+    exec_inner.check_timers_deterministic()
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.is_empty(), true)
+  assert_eq(exec.inner.ptr.as_ref().ready_queue.is_empty(), true)
+end
+
+# (e2) The timeout whose inner wins: the inner sleep completes at 1ms —
+# the timeout cancels its 100ms timer (no stale wake); the cancelled
+# entry is skipped when popped.
+@test
+def test_timer_timeout_inner_wins_cancels_timer() -> Unit
+  mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+  let waker = Waker { task_id: 602, executor: exec.inner.clone() }
+  let mut cx = Context { waker: waker }
+
+  let mut fut = std::async::timeout(Duration::from_millis(100), std::async::sleep_millis(1))
+  match fut.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  # both timers registered: the inner sleep (1ms) and the timeout (100ms)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 2)
+
+  # advance the clock past the inner deadline: the sleep timer fires,
+  # then the re-poll completes the inner — the timeout cancels its
+  # 100ms timer
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(2))
+    exec_inner.check_timers_deterministic()
+  end
+  match fut.poll(&mut cx)
+  when Poll::Ready(res) then
+    match res
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+  # exactly the timeout's entry remains, CANCELLED
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 1)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap[0].cancelled, true)
+
+  # advancing past the deadline pops the cancelled entry and skips it:
+  # the stale timer never fires
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(200))
+    exec_inner.check_timers_deterministic()
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.is_empty(), true)
+end
+
+# (e3) The select loser's timer cancelled: the 1ms sleep wins; the
+# select completes and drops the 100ms loser — its Drop cancels the
+# timer; the cancelled entry is skipped when popped.
+@test
+def test_timer_select_loser_cancelled() -> Unit
+  mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+  let waker = Waker { task_id: 603, executor: exec.inner.clone() }
+  let mut cx = Context { waker: waker }
+
+  let mut fut = std::async::select(std::async::sleep_millis(100), std::async::sleep_millis(1))
+  match fut.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  # both sleeps registered their timers
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 2)
+
+  # advance the clock past the winner's deadline: the 1ms timer fires
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(2))
+    exec_inner.check_timers_deterministic()
+  end
+  match fut.poll(&mut cx)
+  when Poll::Ready(res) then
+    match res
+    when Either::Right(_) then ()
+    when Either::Left(_) then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+
+  # dropping the select drops the LOSER — its Drop cancels the 100ms
+  # timer (the winner's entry was already popped by the fire)
+  drop(fut)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.len(), 1)
+  assert_eq(exec.inner.ptr.as_ref().timer_heap[0].cancelled, true)
+
+  # advancing past the deadline pops the cancelled entry and skips it:
+  # the stale timer never fires
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(200))
+    exec_inner.check_timers_deterministic()
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.is_empty(), true)
+end

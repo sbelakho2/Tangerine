@@ -18,12 +18,12 @@
 # - Channel: async MPSC message passing
 # - Timer: async sleep and timeout support
 
-use std::core::{Option, Result, Vec, String, Bool, UInt, Int, Eq, Hash}
+use std::core::{Option, Result, Vec, String, Bool, UInt, Int}
 use std::collections::{Map, VecDeque}
 use std::atomic::{AtomicInt, Ordering}
-use std::sync::{Arc, AtomicBool, Mutex}
+use std::sync::{Arc, AtomicBool, Mutex, Condvar}
 use std::io::{Read, Write, IOError}
-use std::net::{TcpStream, close}
+use std::net::{TcpStream, close, tcp_bind, tcp_connect, socket_addr_v4, ipv4_localhost}
 use std::time::{Instant, Duration, instant_now, duration_millis, duration_nanos}
 
 # [METADATA]
@@ -181,8 +181,9 @@ end
 # converts to/from the kernel's PACKED 12-byte epoll_event at the C
 # boundary (a Tangerine { u32, u64 } struct would pad to 16 bytes with
 # the data at offset 8 — mismatched with the kernel ABI). `data` carries
-# the packed RegistrationId (pack_registration) — the readiness token the
-# event handler decodes to identify the registration.
+# the OPAQUE registration token — the exact map key of the registration
+# the event belongs to (the event handler looks it up; a stale token
+# misses the map and the event is discarded).
 struct EpollEvent
   events: u32
   _pad: u32
@@ -195,7 +196,7 @@ struct Kevent
   flags: u16       # action flags
   fflags: u32      # filter-specific flags
   data: Int        # filter-specific data
-  udata: PtrMut[Unit]   # user data (task_id as pointer)
+  udata: PtrMut[Unit]   # user data (the opaque registration token)
 end
 
 struct Timespec
@@ -210,30 +211,34 @@ enum Interest
   Both
 end
 
-# The readiness token: the identity of ONE registration. The futures store
-# the id their registration returned; the event handler recovers the id
-# from the kernel event's data word; the reactor's registration map is
-# keyed by it. The GENERATION component is the fd-number-reuse guard: a
-# stale registration (its fd was closed and the number was reused by a new
-# registration) never receives the new fd's events — the handler looks the
-# decoded id up in the registration map and ignores ids that no longer
-# exist. The same fd may carry TWO registrations — one Readable, one
-# Writable — as distinct ids.
-struct RegistrationId
+# The opaque readiness TOKEN: the identity of ONE registration. The
+# futures store the u64 token their register returned; the kernel event's
+# data word (epoll) / udata (kqueue) carries the token; the reactor's
+# registration map is keyed by it. The token NEVER encodes the
+# registration — it is an opaque handle into the map, and the map entry
+# (Registration) carries the full identity (task/fd/interest/generation)
+# with NO truncation: the old bit-packing forced task and fd into 16-bit
+# fields, so ids > 65535 collided. A stale token (deregistered, replaced,
+# cancelled) simply misses the map and its event is DISCARDED — the token
+# is never decoded into an fd and re-resolved against the fd's CURRENT
+# registration.
+struct Registration
   task: UInt
   fd: Int
   interest: Interest
   generation: UInt
+  ready: Bool
 end
 
-# The per-registration readiness state: the event handler marks it ready;
-# the futures' polls inspect it (not-ready -> Pending; ready -> consume
-# the event — deregister/modify — then perform the operation). The old
-# "second poll == I/O ready" assumption is gone: a poll for an UNRELATED
-# reason (a timer wake, another task's event) observes not-ready and stays
-# Pending.
-struct IoRegistration
-  ready: Bool
+# The per-fd interest slots: the CURRENT opaque tokens for the fd's two
+# interests — one entry per fd (the readable and the writable slot
+# tokens) replaces the old per-interest slot maps. The kernel is
+# (re)programmed through ADD vs MOD on the fd's interest union; DEL
+# when the last interest of an fd deregisters. The slots also drive the
+# event handler: an event's bits mark the slot tokens' registrations.
+struct FdState
+  readable: Option[UInt]
+  writable: Option[UInt]
 end
 
 # The three-way status a future's poll inspects for its stored id.
@@ -243,97 +248,45 @@ enum RegistrationStatus
   Ready
 end
 
-def interest_eq(a: Interest, b: Interest) -> Bool
+# Option[UInt] equality (the divergence probe between the naive and the
+# true post-displacement fd slots).
+def opt_eq(a: Option[UInt], b: Option[UInt]) -> Bool
   match a
-  when Interest::Readable then
+  when Option::Some(x) then
     match b
-    when Interest::Readable then true
-    when _ then false
+    when Option::Some(y) then x == y
+    when Option::None then false
     end
-  when Interest::Writable then
+  when Option::None then
     match b
-    when Interest::Writable then true
-    when _ then false
-    end
-  when Interest::Both then
-    match b
-    when Interest::Both then true
-    when _ then false
+    when Option::None then true
+    when Option::Some(_) then false
     end
   end
 end
 
-def interest_code(i: Interest) -> Int
-  match i
-  when Interest::Readable then 1
-  when Interest::Writable then 2
-  when Interest::Both then 3
-  end
-end
-
-impl Eq for RegistrationId
-  def eq(self: RegistrationId, other: RegistrationId) -> Bool
-    if self.task != other.task then return false end
-    if self.fd != other.fd then return false end
-    if self.generation != other.generation then return false end
-    interest_eq(self.interest, other.interest)
-  end
-end
-
-impl Hash for RegistrationId
-  def hash(self: RegistrationId) -> Int
-    ((((self.task as Int) * 31 + self.fd) * 31) + (self.generation as Int)) * 31 + interest_code(self.interest)
-  end
-end
-
-# The RegistrationId is packed into the kernel event's data word (epoll's
-# data / kqueue's udata pointer slot — both 64-bit) so the event handler
-# can recover the registration identity. The generation component (bits
-# 34..64) strictly increases per register, so a stale id can never collide
-# with a live one.
-def pack_registration(rid: RegistrationId) -> UInt
-  let interest_bits: UInt = match rid.interest
-  when Interest::Readable then 0
-  when Interest::Writable then 1
-  when Interest::Both then 2
-  end
-  ((rid.generation << 34) | (((rid.fd as UInt) & 0xFFFF) << 18) | (interest_bits << 16) | (rid.task & 0xFFFF))
-end
-
-def decode_registration(packed: UInt) -> RegistrationId
-  RegistrationId {
-    task: packed & 0xFFFF,
-    fd: ((packed >> 18) & 0xFFFF) as Int,
-    interest: match (packed >> 16) & 0x3
-    when 0 then Interest::Readable
-    when 1 then Interest::Writable
-    when _ then Interest::Both
-    end,
-    generation: packed >> 34
-  }
-end
-
-# Platform-independent I/O reactor with REAL readiness tokens.
+# Platform-independent I/O reactor with REAL opaque readiness tokens.
 #
-# - registrations: Map[RegistrationId, IoRegistration] — the readiness
-#   state per registration (the event handler marks ready; the futures'
-#   polls inspect).
-# - read_rids / write_rids: the CURRENT registration per (fd, interest)
-#   slot — the two interests of the same fd are independent registrations.
-#   The kernel is (re)programmed through ADD vs MOD on the fd's interest
-#   union; DEL when the last interest of an fd deregisters. The slots also
-#   drive the event handler: an event for fd marks the slot registrations
-#   whose interest matches the event's bits (EPOLLIN/EPOLLOUT/errors).
+# - registrations: Map[UInt, Registration] — the opaque token -> the
+#   full registration (the readiness state + the identity the future and
+#   the event handler share). The event handler marks the EXACT
+#   registration whose token the kernel event carries; a stale token
+#   (deregistered, replaced, cancelled) misses the map and the event is
+#   discarded.
+# - fd_states: Map[Int, FdState] — the CURRENT token per (fd, interest)
+#   slot; the two interests of the same fd are independent registrations
+#   (a Both registration allocates TWO exact tokens — the primary
+#   readable + the secondary writable — each with its own map entry and
+#   its own slot).
 # - displaced: tasks whose registration was replaced (the fd-number reuse
 #   case) — the executor drains it and wakes them so their futures poll,
 #   observe the lost registration, and terminate instead of hanging.
 # - shut_down: after close(), register fails closed.
 struct IoReactor
   poll_fd: Int
-  next_generation: UInt
-  registrations: Map[RegistrationId, IoRegistration]
-  read_rids: Map[Int, RegistrationId]
-  write_rids: Map[Int, RegistrationId]
+  next_token: UInt
+  registrations: Map[UInt, Registration]
+  fd_states: Map[Int, FdState]
   displaced: VecDeque[UInt]
   shut_down: Bool
 end
@@ -346,10 +299,9 @@ def io_reactor_new() -> Result[IoReactor, String]
     end
     Result::Ok(IoReactor {
       poll_fd: kq,
-      next_generation: 0,
+      next_token: 0,
       registrations: Map::new(),
-      read_rids: Map::new(),
-      write_rids: Map::new(),
+      fd_states: Map::new(),
       displaced: VecDeque::new(),
       shut_down: false
     })
@@ -360,10 +312,9 @@ def io_reactor_new() -> Result[IoReactor, String]
     end
     Result::Ok(IoReactor {
       poll_fd: epfd,
-      next_generation: 0,
+      next_token: 0,
       registrations: Map::new(),
-      read_rids: Map::new(),
-      write_rids: Map::new(),
+      fd_states: Map::new(),
       displaced: VecDeque::new(),
       shut_down: false
     })
@@ -373,73 +324,125 @@ def io_reactor_new() -> Result[IoReactor, String]
 end
 
 impl IoReactor
-  # Register a fresh readiness token for (fd, interest). Every register
-  # allocates a new generation: a registration that replaces a stale slot
-  # entry (the fd was closed and its number reused) removes the old
-  # registration — the old id can never receive the new fd's events — and
-  # records the displaced task for the executor to wake. The kernel call
-  # is ADD when the fd has no live interest yet, MOD otherwise (the fd's
-  # interest union changes — the second interest of the same fd does not
-  # ADD again: EEXIST would reject it).
-  def register(inout self, fd: Int, task_id: UInt, interest: Interest) -> Result[RegistrationId, String]
+  # Register a fresh readiness TOKEN for (fd, interest). The token is the
+  # monotonic next_token counter — the map key, the kernel event's data
+  # word, and the future's stored identity (never reused, never decoded).
+  # A registration that replaces a stale slot entry (the fd was closed and
+  # its number reused) removes the old registration AND its Both-sibling
+  # (the same task/fd with the other interest) — the old tokens can never
+  # receive the new fd's events — and records the displaced task for the
+  # executor to wake. A Both interest allocates TWO exact tokens: the
+  # primary (readable — returned) and the secondary (writable), each with
+  # its own map entry and its own fd slot. The kernel call is ADD when the
+  # fd has no live interest yet, MOD otherwise.
+  def register(inout self, fd: Int, task_id: UInt, interest: Interest) -> Result[UInt, String]
     if self.shut_down then
       return Result::Err("I/O reactor is shut down".to_string())
     end
 
-    let rid = RegistrationId {
-      task: task_id,
-      fd: fd,
-      interest: interest,
-      generation: self.next_generation
-    }
-    self.next_generation = self.next_generation + 1
+    let primary = self.next_token
+    let secondary = match interest
+    when Interest::Both then Option::Some(self.next_token + 1)
+    when _ then Option::None
+    end
+    self.next_token = match interest
+    when Interest::Both then self.next_token + 2
+    when _ then self.next_token + 1
+    end
+
+    # the tokens per interest slot (a Both owns one token per slot)
+    let read_token = match interest
+    when Interest::Readable then Option::Some(primary)
+    when Interest::Writable then Option::None
+    when Interest::Both then Option::Some(primary)
+    end
+    let write_token = match interest
+    when Interest::Readable then Option::None
+    when Interest::Writable then Option::Some(primary)
+    when Interest::Both then secondary
+    end
+
+    # the fd's pre-registration slot state
+    let prev_readable = match self.fd_states.get(&fd)
+    when Option::Some(state) then state.readable
+    when Option::None then Option::None
+    end
+    let prev_writable = match self.fd_states.get(&fd)
+    when Option::Some(state) then state.writable
+    when Option::None then Option::None
+    end
+    let has_read = prev_readable.is_some()
+    let has_write = prev_writable.is_some()
+
+    # the would-be post-registration slots (the naive union — a displaced
+    # registration's Both-sibling death is corrected by sync_fd below)
+    let post_readable = match read_token
+    when Option::Some(_) then read_token
+    when Option::None then prev_readable
+    end
+    let post_writable = match write_token
+    when Option::Some(_) then write_token
+    when Option::None then prev_writable
+    end
 
     if USE_KQUEUE then
-      let filter = match interest
-      when Interest::Readable then evfilt_read()
-      when Interest::Writable then evfilt_write()
-      when Interest::Both then evfilt_read()  # For kqueue, add both separately
-      end
-
-      mut ev = Kevent {
-        ident: fd as UInt,
-        filter: filter,
-        flags: EV_ADD | EV_ENABLE,
-        fflags: 0,
-        data: 0,
-        udata: pack_registration(rid) as PtrMut[Unit]
-      }
-
-      if kevent(self.poll_fd, &ev as Ptr[Kevent], 1, null_mut() as PtrMut[Kevent], 0, null() as Ptr[Timespec]) < 0 then
-        return Result::Err("Failed to register fd with kqueue".to_string())
-      end
-
-      # For Both interest, register write as well
-      match interest
-      when Interest::Both then
-        ev.filter = evfilt_write()
+      # each filter carries the EXACT token of its registration — the
+      # read filter the readable token, the write filter the writable —
+      # so the kernel event's udata identifies the registration directly
+      # (EV_ADD also modifies an existing filter's udata).
+      match read_token
+      when Option::Some(t) then
+        mut ev = Kevent {
+          ident: fd as UInt,
+          filter: evfilt_read(),
+          flags: EV_ADD | EV_ENABLE,
+          fflags: 0,
+          data: 0,
+          udata: t as PtrMut[Unit]
+        }
         if kevent(self.poll_fd, &ev as Ptr[Kevent], 1, null_mut() as PtrMut[Kevent], 0, null() as Ptr[Timespec]) < 0 then
-          return Result::Err("Failed to register write with kqueue".to_string())
+          return Result::Err("Failed to register fd with kqueue".to_string())
         end
-      when _ then ()
+      when Option::None then ()
+      end
+      match write_token
+      when Option::Some(t) then
+        mut ev = Kevent {
+          ident: fd as UInt,
+          filter: evfilt_write(),
+          flags: EV_ADD | EV_ENABLE,
+          fflags: 0,
+          data: 0,
+          udata: t as PtrMut[Unit]
+        }
+        if kevent(self.poll_fd, &ev as Ptr[Kevent], 1, null_mut() as PtrMut[Kevent], 0, null() as Ptr[Timespec]) < 0 then
+          return Result::Err("Failed to register fd with kqueue".to_string())
+        end
+      when Option::None then ()
       end
     elsif USE_EPOLL then
-      let has_read = self.read_rids.contains_key(&fd)
-      let has_write = self.write_rids.contains_key(&fd)
       let mut old_mask: u32 = 0
       if has_read then old_mask = old_mask | EPOLLIN end
       if has_write then old_mask = old_mask | EPOLLOUT end
       let op = if old_mask == 0 then EPOLL_CTL_ADD else EPOLL_CTL_MOD end
-      let new_mask = match interest
-      when Interest::Readable then EPOLLIN
-      when Interest::Writable then EPOLLOUT
-      when Interest::Both then EPOLLIN | EPOLLOUT
+      let mut mask: u32 = 0
+      match post_readable
+      when Option::Some(_) then mask = mask | EPOLLIN
+      when Option::None then ()
+      end
+      match post_writable
+      when Option::Some(_) then mask = mask | EPOLLOUT
+      when Option::None then ()
+      end
+      let data = match post_readable
+      when Option::Some(t) then t
+      when Option::None then post_writable.unwrap()
       end
 
       mut ev = EpollEvent {
-        events: old_mask | new_mask,
+        events: mask,
         _pad: 0,
-        data: pack_registration(rid)
+        data: data
       }
 
       if epoll_ctl(self.poll_fd, op, fd, &mut ev as Ptr[EpollEvent]) < 0 then
@@ -456,123 +459,210 @@ impl IoReactor
       end
     end
 
-    # Replace a stale registration for the same (fd, interest) — the fd
-    # number was reused: the old id must never receive the new fd's
-    # events. The displaced task is queued for the executor to wake.
-    match interest
-    when Interest::Readable then
-      match self.read_rids.get(&fd)
-      when Option::Some(old_rid) then
-        if old_rid != rid then
-          let _ = self.registrations.remove(old_rid)
-          self.displaced.push_back(old_rid.task)
+    # Replace a stale registration in a newly-occupied slot — the fd
+    # number was reused: the old token must never receive the new fd's
+    # events. The displaced task is queued for the executor to wake, and
+    # the displaced registration's Both-sibling (the same task/fd with
+    # the other interest) is removed with it — no dangling half.
+    match read_token
+    when Option::Some(t) then
+      match prev_readable
+      when Option::Some(old) then
+        if old != t then
+          self.displace_registration(old)
         end
       when Option::None then ()
       end
-    when Interest::Writable then
-      match self.write_rids.get(&fd)
-      when Option::Some(old_rid) then
-        if old_rid != rid then
-          let _ = self.registrations.remove(old_rid)
-          self.displaced.push_back(old_rid.task)
+    when Option::None then ()
+    end
+    match write_token
+    when Option::Some(t) then
+      match prev_writable
+      when Option::Some(old) then
+        if old != t then
+          self.displace_registration(old)
         end
       when Option::None then ()
       end
-    when Interest::Both then
-      match self.read_rids.get(&fd)
-      when Option::Some(old_rid) then
-        if old_rid != rid then
-          let _ = self.registrations.remove(old_rid)
-          self.displaced.push_back(old_rid.task)
-        end
-      when Option::None then ()
-      end
-      match self.write_rids.get(&fd)
-      when Option::Some(old_rid) then
-        if old_rid != rid then
-          let _ = self.registrations.remove(old_rid)
-          self.displaced.push_back(old_rid.task)
-        end
-      when Option::None then ()
-      end
+    when Option::None then ()
     end
 
-    match interest
-    when Interest::Readable then let _ = self.read_rids.insert(fd, rid)
-    when Interest::Writable then let _ = self.write_rids.insert(fd, rid)
-    when Interest::Both then
-      let _ = self.read_rids.insert(fd, rid)
-      let _ = self.write_rids.insert(fd, rid)
+    # the new registrations (a Both: the primary readable + the secondary
+    # writable — the generation is the registration's own token)
+    self.registrations.insert(primary, Registration {
+      task: task_id,
+      fd: fd,
+      interest: match interest
+      when Interest::Both then Interest::Readable
+      when _ then interest
+      end,
+      generation: primary,
+      ready: false
+    })
+    match secondary
+    when Option::Some(t) then
+      self.registrations.insert(t, Registration {
+        task: task_id,
+        fd: fd,
+        interest: Interest::Writable,
+        generation: t,
+        ready: false
+      })
+    when Option::None then ()
     end
-    self.registrations.insert(rid, IoRegistration { ready: false })
-    Result::Ok(rid)
+
+    # the true post-displacement slots: the new tokens overlay the
+    # surviving slots (a displaced registration's Both-sibling slot was
+    # already cleared)
+    let true_readable = match read_token
+    when Option::Some(t) then Option::Some(t)
+    when Option::None then
+      match self.fd_states.get(&fd)
+      when Option::Some(state) then state.readable
+      when Option::None then Option::None
+      end
+    end
+    let true_writable = match write_token
+    when Option::Some(t) then Option::Some(t)
+    when Option::None then
+      match self.fd_states.get(&fd)
+      when Option::Some(state) then state.writable
+      when Option::None then Option::None
+      end
+    end
+    let _ = self.fd_states.insert(fd, FdState { readable: true_readable, writable: true_writable })
+
+    # the correction: when a displaced registration's Both-sibling died,
+    # the kernel was programmed with the naive (pre-displacement) interest
+    # union — sync_fd reprograms it exactly from the true slots (the
+    # epoll mask/data; the kqueue per-filter deletion of the dead half)
+    if !opt_eq(post_readable, true_readable) || !opt_eq(post_writable, true_writable) then
+      self.sync_fd(fd)
+    end
+
+    Result::Ok(primary)
   end
 
-  # Consume the readiness: remove the registration and reprogram the
-  # kernel for the fd's remaining interests (MOD) or delete the fd's
-  # kernel entry when no interest remains (DEL). A DEL failure (the fd was
-  # closed — the kernel already dropped the entry) is ignored: the
-  # Tangerine-side state is the authority.
-  def deregister(inout self, rid: RegistrationId) -> Result[Unit, String]
-    match self.registrations.remove(rid)
-    when Option::Some(_) then
-      self.clear_slot(rid)
-      self.sync_fd(rid.fd)
+  # Consume the readiness: remove the registration — its map entry, its
+  # fd slot, and its Both-sibling (the same task/fd with the other
+  # interest, found via the fd's other slot) — then reprogram the kernel
+  # for the fd's remaining interests (MOD) or delete the fd's kernel
+  # entries when no interest remains (DEL; on kqueue exactly the filters
+  # of the disappeared registrations). A DEL failure (the fd was closed —
+  # the kernel already dropped the entry) is ignored: the Tangerine-side
+  # state is the authority.
+  def deregister(inout self, token: UInt) -> Result[Unit, String]
+    match self.registrations.remove(&token)
+    when Option::Some(reg) then
+      self.clear_slot(reg.fd, token)
+      self.remove_both_sibling(reg.fd, reg.task, reg.interest)
+      self.sync_fd(reg.fd)
       Result::Ok(())
     when Option::None then
       Result::Ok(())
     end
   end
 
-  # Clear the (fd, interest) slot when it still points at THIS rid (a
-  # newer registration may own the slot after an fd-number reuse).
-  def clear_slot(inout self, rid: RegistrationId) -> Unit
-    match rid.interest
-    when Interest::Readable then
-      match self.read_rids.get(&rid.fd)
-      when Option::Some(slot) then
-        if slot == rid then
-          let _ = self.read_rids.remove(&rid.fd)
+  # Clear the fd slot that still points at THIS token (a newer
+  # registration may own the slot after an fd-number reuse).
+  def clear_slot(inout self, fd: Int, token: UInt) -> Unit
+    match self.fd_states.get(&fd)
+    when Option::Some(state) then
+      let readable = match state.readable
+      when Option::Some(t) then
+        if t == token then Option::None else state.readable end
+      when Option::None then state.readable
+      end
+      let writable = match state.writable
+      when Option::Some(t) then
+        if t == token then Option::None else state.writable end
+      when Option::None then state.writable
+      end
+      let _ = self.fd_states.insert(fd, FdState { readable: readable, writable: writable })
+    when Option::None then ()
+    end
+  end
+
+  # Remove a displaced registration (the fd number was reused): its map
+  # entry, the displaced task queue push, and its Both-sibling — the old
+  # tokens must never receive the new fd's events.
+  def displace_registration(inout self, token: UInt) -> Unit
+    match self.registrations.remove(&token)
+    when Option::Some(reg) then
+      self.displaced.push_back(reg.task)
+      self.remove_both_sibling(reg.fd, reg.task, reg.interest)
+    when Option::None then ()
+    end
+  end
+
+  # Remove the Both-sibling of a just-removed registration: the OTHER
+  # interest slot of the same fd, when it holds a registration of the
+  # SAME task and fd (a Both register's two exact tokens — the primary
+  # readable + the secondary writable). The sibling's map entry and slot
+  # are removed — a Both half never dangles alone.
+  def remove_both_sibling(inout self, fd: Int, task: UInt, interest: Interest) -> Unit
+    let sibling_token = match self.fd_states.get(&fd)
+    when Option::Some(state) then
+      match interest
+      when Interest::Readable then state.writable
+      when Interest::Writable then state.readable
+      when Interest::Both then Option::None
+      end
+    when Option::None then Option::None
+    end
+    match sibling_token
+    when Option::Some(t) then
+      match self.registrations.get(&t)
+      when Option::Some(sib) then
+        if sib.task == task && sib.fd == fd then
+          let _ = self.registrations.remove(&t)
+          self.clear_slot(fd, t)
         end
       when Option::None then ()
       end
-    when Interest::Writable then
-      match self.write_rids.get(&rid.fd)
-      when Option::Some(slot) then
-        if slot == rid then
-          let _ = self.write_rids.remove(&rid.fd)
-        end
-      when Option::None then ()
-      end
-    when Interest::Both then
-      match self.read_rids.get(&rid.fd)
-      when Option::Some(slot) then
-        if slot == rid then
-          let _ = self.read_rids.remove(&rid.fd)
-        end
-      when Option::None then ()
-      end
-      match self.write_rids.get(&rid.fd)
-      when Option::Some(slot) then
-        if slot == rid then
-          let _ = self.write_rids.remove(&rid.fd)
-        end
-      when Option::None then ()
-      end
+    when Option::None then ()
     end
   end
 
   # Recompute the kernel registration for an fd from its live slots:
-  # DEL when nothing remains, MOD with the combined mask otherwise (the
-  # data carries a live slot's rid so events decode to a live
-  # registration).
+  # epoll — DEL when nothing remains, MOD with the combined mask
+  # otherwise (the data carries a live slot's token so events resolve to
+  # a live registration); kqueue — the per-filter deletion is exact: DEL
+  # exactly the filter(s) of the disappeared registrations (a missing
+  # filter's DEL is ENOENT-ignored).
   def sync_fd(inout self, fd: Int) -> Unit
-    let has_read = self.read_rids.contains_key(&fd)
-    let has_write = self.write_rids.contains_key(&fd)
-    if !has_read && !has_write then
-      if USE_EPOLL then
+    let mut has_read = false
+    let mut has_write = false
+    let mut read_slot: Option[UInt] = Option::None
+    let mut write_slot: Option[UInt] = Option::None
+    match self.fd_states.get(&fd)
+    when Option::Some(state) then
+      has_read = state.readable.is_some()
+      has_write = state.writable.is_some()
+      read_slot = state.readable
+      write_slot = state.writable
+    when Option::None then ()
+    end
+    if USE_EPOLL then
+      if !has_read && !has_write then
         let _ = epoll_ctl(self.poll_fd, EPOLL_CTL_DEL, fd, null_mut() as Ptr[EpollEvent])
-      elsif USE_KQUEUE then
+      else
+        let mut mask: u32 = 0
+        if has_read then mask = mask | EPOLLIN end
+        if has_write then mask = mask | EPOLLOUT end
+        let data = match read_slot
+        when Option::Some(t) then t
+        when Option::None then write_slot.unwrap()
+        end
+        mut ev = EpollEvent {
+          events: mask,
+          _pad: 0,
+          data: data
+        }
+        let _ = epoll_ctl(self.poll_fd, EPOLL_CTL_MOD, fd, &mut ev as Ptr[EpollEvent])
+      end
+    elsif USE_KQUEUE then
+      if !has_read then
         mut ev = Kevent {
           ident: fd as UInt,
           filter: evfilt_read(),
@@ -582,50 +672,53 @@ impl IoReactor
           udata: null_mut()
         }
         let _ = kevent(self.poll_fd, &ev as Ptr[Kevent], 1, null_mut() as PtrMut[Kevent], 0, null() as Ptr[Timespec])
-        ev.filter = evfilt_write()
+      end
+      if !has_write then
+        mut ev = Kevent {
+          ident: fd as UInt,
+          filter: evfilt_write(),
+          flags: EV_DELETE,
+          fflags: 0,
+          data: 0,
+          udata: null_mut()
+        }
         let _ = kevent(self.poll_fd, &ev as Ptr[Kevent], 1, null_mut() as PtrMut[Kevent], 0, null() as Ptr[Timespec])
       end
-    elsif USE_EPOLL then
-      let mut mask: u32 = 0
-      if has_read then mask = mask | EPOLLIN end
-      if has_write then mask = mask | EPOLLOUT end
-      let data = match self.read_rids.get(&fd)
-      when Option::Some(slot) then pack_registration(slot)
-      when Option::None then
-        match self.write_rids.get(&fd)
-        when Option::Some(slot) then pack_registration(slot)
-        when Option::None then 0
-        end
-      end
-      mut ev = EpollEvent {
-        events: mask,
-        _pad: 0,
-        data: data
-      }
-      let _ = epoll_ctl(self.poll_fd, EPOLL_CTL_MOD, fd, &mut ev as Ptr[EpollEvent])
     end
   end
 
-  # Mark a registration ready and queue its task. Stale ids (deregistered,
-  # replaced, cancelled) are ignored — the event belonged to a past
-  # registration lifecycle.
-  def mark_ready(inout self, rid: RegistrationId, inout ready_tasks: Vec[UInt]) -> Unit
-    match self.registrations.get(rid)
-    when Option::Some(_) then
-      self.registrations.insert(rid, IoRegistration { ready: true })
-      if !ready_tasks.contains(&rid.task) then
-        ready_tasks.push(rid.task)
+  # Mark a registration ready and queue its task. Stale tokens
+  # (deregistered, replaced, cancelled) miss the map and are ignored —
+  # the event belonged to a past registration lifecycle.
+  def mark_ready(inout self, token: UInt, inout ready_tasks: Vec[UInt]) -> Unit
+    match self.registrations.get(&token)
+    when Option::Some(reg) then
+      self.registrations.insert(token, Registration {
+        task: reg.task,
+        fd: reg.fd,
+        interest: reg.interest,
+        generation: reg.generation,
+        ready: true
+      })
+      if !ready_tasks.contains(&reg.task) then
+        ready_tasks.push(reg.task)
       end
     when Option::None then ()
     end
   end
 
-  # The event handler: wait for kernel events, decode each event's data
-  # into the registration identity, and mark the fd's CURRENT slot
-  # registrations ready per the event's interest bits. EPOLLIN marks the
-  # read slot; EPOLLOUT the write slot; EPOLLERR/EPOLLHUP mark both (an
-  # error unblocks every waiter of the fd). The marked readiness is the
-  # consumed-token state the futures' polls inspect.
+  # The event handler: wait for kernel events and mark the EXACT
+  # registration whose token the event carries. The kernel event's data
+  # word (epoll) / udata (kqueue) IS the opaque token: `registrations`
+  # hit -> mark the registration ready; MISS -> STALE — the event
+  # belonged to a deregistered/replaced/cancelled registration — DISCARD
+  # (never token -> fd -> the fd's CURRENT registration: the fd may have
+  # been closed and its number reused by an unrelated registration). The
+  # per-filter marking is preserved: an EPOLLIN marks the readable-slot
+  # token's registration; EPOLLOUT the writable; EPOLLERR/EPOLLHUP both
+  # (an error unblocks every waiter of the fd); a kqueue event marks the
+  # filter's own udata registration (the read filter carries the readable
+  # token, the write filter the writable).
   def poll(inout self, timeout_ms: Int) -> Vec[UInt]
     mut ready_tasks = Vec::new()
     if self.shut_down then
@@ -644,29 +737,10 @@ impl IoReactor
       let n = kevent(self.poll_fd, null() as Ptr[Kevent], 0, events.as_mut_ptr(), 64, &ts as Ptr[Timespec])
       let mut i = 0
       while i < n do
-        let rid = decode_registration(events[i].udata as UInt)
-        let fd = rid.fd
-        match rid.interest
-        when Interest::Readable then
-          match self.read_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
-          end
-        when Interest::Writable then
-          match self.write_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
-          end
-        when Interest::Both then
-          match self.read_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
-          end
-          match self.write_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
-          end
-        end
+        # the udata is the EXACT token of the filter's registration — mark
+        # it directly (a stale token misses the map and is discarded)
+        let token = events[i].udata as UInt
+        self.mark_ready(token, &mut ready_tasks)
         i = i + 1
       end
     elsif USE_EPOLL then
@@ -677,30 +751,48 @@ impl IoReactor
       let n = epoll_wait(self.poll_fd, events.as_mut_ptr(), 64, timeout_ms)
       let mut i = 0
       while i < n do
-        let rid = decode_registration(events[i].data)
-        let fd = rid.fd
+        let token = events[i].data
         let ev_events = events[i].events
-        if (ev_events & EPOLLIN) != 0 then
-          match self.read_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
+        # the gate: the event's token must be a LIVE registration — a
+        # stale token is discarded WITHOUT consulting the fd's slots
+        match self.registrations.get(&token)
+        when Option::Some(reg) then
+          let fd = reg.fd
+          if (ev_events & EPOLLIN) != 0 then
+            match self.fd_states.get(&fd)
+            when Option::Some(state) then
+              match state.readable
+              when Option::Some(slot_token) then self.mark_ready(slot_token, &mut ready_tasks)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
           end
-        end
-        if (ev_events & EPOLLOUT) != 0 then
-          match self.write_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
+          if (ev_events & EPOLLOUT) != 0 then
+            match self.fd_states.get(&fd)
+            when Option::Some(state) then
+              match state.writable
+              when Option::Some(slot_token) then self.mark_ready(slot_token, &mut ready_tasks)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
           end
-        end
-        if (ev_events & (EPOLLERR | EPOLLHUP)) != 0 then
-          match self.read_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
+          if (ev_events & (EPOLLERR | EPOLLHUP)) != 0 then
+            match self.fd_states.get(&fd)
+            when Option::Some(state) then
+              match state.readable
+              when Option::Some(slot_token) then self.mark_ready(slot_token, &mut ready_tasks)
+              when Option::None then ()
+              end
+              match state.writable
+              when Option::Some(slot_token) then self.mark_ready(slot_token, &mut ready_tasks)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
           end
-          match self.write_rids.get(&fd)
-          when Option::Some(slot) then self.mark_ready(slot, &mut ready_tasks)
-          when Option::None then ()
-          end
+        when Option::None then ()
         end
         i = i + 1
       end
@@ -710,18 +802,18 @@ impl IoReactor
   end
 
   # The readiness probe (the futures' polls): a registration that exists
-  # and is ready reports true. The id is the consumed-token authority — a
-  # replaced/cancelled id simply no longer exists.
-  def is_ready(self: IoReactor, rid: RegistrationId) -> Bool
-    match self.registrations.get(rid)
+  # and is ready reports true. The token is the consumed-token authority —
+  # a replaced/cancelled token simply no longer exists.
+  def is_ready(self: IoReactor, token: UInt) -> Bool
+    match self.registrations.get(&token)
     when Option::Some(reg) then reg.ready
     when Option::None then false
     end
   end
 
   # The three-way status the futures' polls inspect.
-  def status(self: IoReactor, rid: RegistrationId) -> RegistrationStatus
-    match self.registrations.get(rid)
+  def status(self: IoReactor, token: UInt) -> RegistrationStatus
+    match self.registrations.get(&token)
     when Option::Some(reg) then
       if reg.ready then
         RegistrationStatus::Ready
@@ -732,27 +824,32 @@ impl IoReactor
     end
   end
 
-  # Task cancellation: drop every registration of the task and reprogram
-  # the affected fds.
+  # Task cancellation: drop every registration of the task (each removed
+  # registration takes its Both-sibling with it) and reprogram the
+  # affected fds.
   def remove_task(inout self, task_id: UInt) -> Unit
-    let mut removed: Vec[RegistrationId] = Vec::new()
-    let mut kept: Map[RegistrationId, IoRegistration] = Map::new()
+    let mut removed: Map[UInt, Registration] = Map::new()
+    let mut kept: Map[UInt, Registration] = Map::new()
     loop do
       match self.registrations.drain_one()
-      when Option::Some((rid, reg)) then
-        if rid.task == task_id then
-          removed.push(rid)
+      when Option::Some((token, reg)) then
+        if reg.task == task_id then
+          removed.insert(token, reg)
         else
-          kept.insert(rid, reg)
+          kept.insert(token, reg)
         end
       when Option::None then break
       end
     end
     self.registrations = kept
-    while removed.len() > 0 do
-      let rid = removed.remove(0)
-      self.clear_slot(rid)
-      self.sync_fd(rid.fd)
+    loop do
+      match removed.drain_one()
+      when Option::Some((token, reg)) then
+        self.clear_slot(reg.fd, token)
+        self.remove_both_sibling(reg.fd, reg.task, reg.interest)
+        self.sync_fd(reg.fd)
+      when Option::None then break
+      end
     end
   end
 
@@ -853,16 +950,36 @@ struct Task
   name: Option[String]
 end
 
-struct JoinHandle[T]
+# One registered join waiter: the unique WaiterId plus the waker. The
+# join_waiters map holds a VEC of waiters per task, so the LAST poller
+# never overwrites an EARLIER poller's registration — the old
+# Map[UInt, Waker] last-poller-wins shape could leave a second handle to
+# the same child asleep (its waiter was silently replaced by the other
+# handle's poll).
+struct JoinWaiter
+  id: UInt
+  waker: Waker
+end
+
+# The honest Unit-only JoinHandle. The executor's spawn accepts only the
+# Future[Output = ()] (the task_results: Map[UInt, Unit] key the
+# completion by the task id), so the handle carries NO result member — the
+# `result: Option[T]` of the old generic form was never the actual
+# completion storage (the poll reads the executor's task_results). The
+# typed TaskResultCell[T] — the worker writes the typed Output into a
+# per-task cell, the joiner reads it back — is the DOCUMENTED FUTURE
+# GENERIC-SPAWN DESIGN: when spawn grows the typed Output, the handle
+# gains the cell (and the generic parameter); today the handle is the
+# Unit-only form that matches the executor it polls.
+struct JoinHandle
   task_id: UInt
-  result: Option[T]
   # The handle holds its OWN Arc clone of the executor inner — the handle
   # keeps the executor (and the task's results and join waiters) alive
   # even after the spawning Executor is dropped or moved.
   executor: Arc[ExecutorInner]
 end
 
-impl JoinHandle[T]
+impl JoinHandle
   def is_finished(self) -> Bool
     let exec = self.executor.ptr.as_ref()
     match exec.task_states.get(&self.task_id)
@@ -874,13 +991,15 @@ impl JoinHandle[T]
   end
 end
 
-# JoinHandle itself is a future. The result is the Result[(), String]
-# form ("task cancelled" / "task failed") — the typed JoinError enum is
-# the documented future work.
-impl Future for JoinHandle[T]
-  type Output = Result[T, String]
+# JoinHandle itself is a future. The result is the Result[Unit, String]
+# form ("task cancelled" / "task failed") — the executor's tasks are all
+# ()-output, so the handle's Output is the ()-result class (the typed
+# JoinError enum, and the typed TaskResultCell[T] for the future
+# generic-spawn, are the documented future work).
+impl Future for JoinHandle
+  type Output = Result[Unit, String]
   
-  def poll(inout self, inout cx: Context) -> Poll[Result[T, String]]
+  def poll(inout self, inout cx: Context) -> Poll[Result[Unit, String]]
     unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
       let exec = self.executor.ptr.as_mut()
       match exec.task_results.remove(&self.task_id)
@@ -893,14 +1012,17 @@ impl Future for JoinHandle[T]
         # and observes the terminal state here).
         match exec.task_states.get(&self.task_id)
         when Option::Some(TaskState::Cancelled) then
-          let cancel_result: Result[T, String] = Result::Err("task cancelled".to_string())
+          let cancel_result: Result[Unit, String] = Result::Err("task cancelled".to_string())
           Poll::Ready(cancel_result)
         when Option::Some(TaskState::Failed) then
-          let fail_result: Result[T, String] = Result::Err("task failed".to_string())
+          let fail_result: Result[Unit, String] = Result::Err("task failed".to_string())
           Poll::Ready(fail_result)
         when _ then
-          # Register interest
-          exec.join_waiters.insert(self.task_id, cx.waker.clone())
+          # Register interest: APPEND this handle's waiter to the task's
+          # waiter vector (the completion detaches the whole vector and
+          # wakes every member — a second handle to the same task never
+          # overwrites this registration).
+          exec.register_join_waiter(self.task_id, cx.waker.clone())
           Poll::Pending
         end
       end
@@ -958,7 +1080,7 @@ impl Future for ScopedTaskHandle
         let fail_result: Result[Unit, String] = Result::Err("task failed".to_string())
         Poll::Ready(fail_result)
       when _ then
-        exec.join_waiters.insert(self.task_id, cx.waker.clone())
+        exec.register_join_waiter(self.task_id, cx.waker.clone())
         Poll::Pending
       end
     end
@@ -980,7 +1102,9 @@ struct ExecutorInner
   next_task_id: UInt
   task_states: Map[UInt, TaskState]
   task_results: Map[UInt, Unit]   # the executor's tasks are all ()-output
-  join_waiters: Map[UInt, Waker]     # task_id -> waker of JoinHandle
+  join_waiters: Map[UInt, Vec[JoinWaiter]]   # task_id -> the registered join waiters (multi-waiter — never overwrite)
+  next_waiter_id: UInt                       # the strictly-increasing WaiterId allocator
+  next_timer_id: UInt                        # the strictly-increasing TimerId allocator
   timer_heap: Vec[TimerEntry]
   # I/O reactor for async I/O
   io_reactor: Option[IoReactor]
@@ -990,6 +1114,16 @@ struct ExecutorInner
   seed: u64
   virtual_time: Instant
   rand_state: u64
+  # THE EXTERNAL WAKE INBOX (the cross-thread wake bridge): the ONLY
+  # thread-safe inbound wake path. An external producer (a blocking-pool
+  # worker thread) enqueues the task id under the mutex and notifies the
+  # condvar; ONLY the executor thread drains the queue (in run) and wakes
+  # the tasks through the internal wake_task. The cooperative in-thread
+  # wakers keep the direct internal path. The executor thread is the ONLY
+  # code that mutates ready_queue/tasks/task_states/join_waiters/the
+  # reactor/the cooperative waiter lists — a worker never touches those.
+  external_wake_queue: Mutex[Vec[UInt]]
+  external_wake_cond: Condvar
 end
 
 # The Executor is a thin Arc wrapper over the inner — the public API
@@ -1002,9 +1136,19 @@ struct Executor
   inner: Arc[ExecutorInner]
 end
 
+# One heap-allocated timer registration: the unique TimerId (from the
+# executor's next_timer_id allocator — the id the owning SleepFuture/
+# TimeoutFuture holds and the Drop cancels with), the task the timer
+# wakes (a snapshot — the wake routes through the entry's OWN task, so
+# a stale timer can never wake a task id reused for a fresh task), the
+# deadline, and the CANCELLED flag. Cancellation marks the flag in place
+# (no mid-heap removal): the expired-cancelled entries are skipped
+# lazily when popped.
 struct TimerEntry
+  id: UInt
+  task: UInt
   deadline: Instant
-  task_id: UInt
+  cancelled: Bool
 end
 
 def timer_heap_push(inout heap: Vec[TimerEntry], entry: TimerEntry) -> Unit
@@ -1085,13 +1229,17 @@ def executor_new() -> Executor
       task_states: Map::new(),
       task_results: Map::new(),
       join_waiters: Map::new(),
+      next_waiter_id: 1,
+      next_timer_id: 1,
       timer_heap: Vec::new(),
       io_reactor: reactor,
       running: false,
       deterministic: false,
       seed: 0,
       virtual_time: Instant::now(),
-      rand_state: 0
+      rand_state: 0,
+      external_wake_queue: Mutex::new(Vec::new()),
+      external_wake_cond: Condvar::new()
     })
   }
 end
@@ -1101,7 +1249,7 @@ impl Executor
     Result::Ok(executor_new())
   end
 
-  def spawn(inout self, future: impl Future[Output = ()]) -> JoinHandle[()]
+  def spawn(inout self, future: impl Future[Output = ()]) -> JoinHandle
     # The handle takes an Arc clone of the inner — the task (and its
     # result slot) stays alive even if this Executor is dropped or moved.
     let id = unsafe "executor inner access — the Arc clone keeps the executor alive" do
@@ -1124,12 +1272,11 @@ impl Executor
     
     JoinHandle {
       task_id: id,
-      result: Option::None,
       executor: self.inner.clone()
     }
   end
   
-  def spawn_named(inout self, name: String, future: impl Future[Output = ()]) -> JoinHandle[()]
+  def spawn_named(inout self, name: String, future: impl Future[Output = ()]) -> JoinHandle
     let id = unsafe "executor inner access — the Arc clone keeps the executor alive" do
       let inner = self.inner.ptr.as_mut()
       let id = inner.next_task_id
@@ -1150,7 +1297,6 @@ impl Executor
     
     JoinHandle {
       task_id: id,
-      result: Option::None,
       executor: self.inner.clone()
     }
   end
@@ -1161,6 +1307,15 @@ impl Executor
       inner.running = true
 
       while inner.running do
+        # The external-wake drain: the ONLY consumer of the thread-safe
+        # inbound inbox. A blocking-pool worker enqueues a task id (it
+        # never touches the scheduler state itself) and notifies the
+        # condvar; the executor thread — the single owner of
+        # ready_queue/tasks/task_states/join_waiters/the reactor/the
+        # cooperative waiter lists — wakes each task through the internal
+        # wake_task here, between the polls.
+        inner.drain_external_wakes()
+
         # Check timers
         if inner.deterministic then
           inner.check_timers_deterministic()
@@ -1206,8 +1361,14 @@ impl Executor
               inner.virtual_time = min_entry.deadline
               inner.check_timers_deterministic()
             else
+              # Drain the external inbox before the deadlock verdict: the
+              # blocking pool completes in REAL time, so a worker's wake
+              # may be in flight even though the ready queue was empty.
+              inner.drain_external_wakes()
               # No ready tasks and no timers in deterministic mode == deadlock or finished
-              inner.running = false
+              if inner.ready_queue.is_empty() then
+                inner.running = false
+              end
             end
           else
             # Block on I/O and timers
@@ -1227,9 +1388,13 @@ impl Executor
                 inner.ready_queue.push_back(task_id)
               end
             when Option::None then
-              # No I/O reactor — just sleep
+              # No I/O reactor — block on the external-wake condvar for
+              # the timeout (a worker's enqueue notifies it; the loop top
+              # drains the inbox and wakes the task). The timed wait
+              # keeps the timers serviced.
               if timeout_ms > 0 then
-                sleep_ms(timeout_ms)
+                let mut guard = inner.external_wake_queue.lock()
+                let _ = inner.external_wake_cond.wait_timeout_ms(guard, timeout_ms)
               else
                 sleep_ms(1)
               end
@@ -1300,7 +1465,7 @@ impl Executor
     end
   end
   
-  def register_timer(inout self, deadline: Instant, task_id: UInt) -> Unit
+  def register_timer(inout self, deadline: Instant, task_id: UInt) -> UInt
     unsafe "executor inner access — the Arc clone keeps the executor alive" do
       let inner = self.inner.ptr.as_mut()
       inner.register_timer(deadline, task_id)
@@ -1318,9 +1483,39 @@ impl ExecutorInner
     end
   end
 
-  # Register a file descriptor for async I/O — returns the readiness
-  # token (the RegistrationId) the future stores and re-polls against.
-  def register_io(inout self, fd: Int, task_id: UInt, interest: Interest) -> Result[RegistrationId, String]
+  # THE EXTERNAL WAKE BRIDGE (the cross-thread wake path): the ONLY
+  # thread-safe way an external producer (a blocking-pool worker thread)
+  # wakes a task. The producer locks the synchronized inbox, pushes the
+  # task id, and notifies the condvar; ONLY the executor thread drains
+  # the inbox (in run) and wakes the task through the INTERNAL wake_task
+  # — a worker never mutates ready_queue/task_states/join_waiters/the
+  # reactor or the cooperative waiter lists. The cooperative in-thread
+  # wakers keep the direct internal wake path.
+  def external_wake(inout self, task_id: UInt) -> Unit
+    let mut guard = self.external_wake_queue.lock()
+    guard.push(task_id)
+    drop(guard)
+    self.external_wake_cond.notify_one()
+  end
+
+  # The executor-thread drain of the external-wake inbox: move every
+  # enqueued id into the ready queue through the internal wake_task.
+  # Called ONLY from the executor's run loop — no worker ever runs this.
+  def drain_external_wakes(inout self) -> Unit
+    let mut guard = self.external_wake_queue.lock()
+    let mut pending = Vec::new()
+    while !guard.is_empty() do
+      pending.push(guard.remove(0))
+    end
+    drop(guard)
+    for task_id in pending do
+      self.wake_task(task_id)
+    end
+  end
+
+  # Register a file descriptor for async I/O — returns the opaque
+  # readiness TOKEN (the u64) the future stores and re-polls against.
+  def register_io(inout self, fd: Int, task_id: UInt, interest: Interest) -> Result[UInt, String]
     match self.io_reactor
     when Option::Some(mut reactor) then
       reactor.register(fd, task_id, interest)
@@ -1331,10 +1526,10 @@ impl ExecutorInner
 
   # Consume the readiness of a registration (deregister/modify the kernel
   # registration).
-  def deregister_io(inout self, rid: RegistrationId) -> Unit
+  def deregister_io(inout self, token: UInt) -> Unit
     match self.io_reactor
     when Option::Some(mut reactor) then
-      let _ = reactor.deregister(rid)
+      let _ = reactor.deregister(token)
     when Option::None then ()
     end
   end
@@ -1343,23 +1538,34 @@ impl ExecutorInner
   # stored token: not-ready stays Pending; ready is consumed by the
   # deregister+operation; a vanished registration (replaced or cancelled)
   # is NotRegistered.
-  def io_status(self: ExecutorInner, rid: RegistrationId) -> RegistrationStatus
+  def io_status(self: ExecutorInner, token: UInt) -> RegistrationStatus
     match self.io_reactor
     when Option::Some(reactor) then
-      reactor.status(rid)
+      reactor.status(token)
     when Option::None then
       RegistrationStatus::NotRegistered
     end
   end
 
   def check_timers_deterministic(inout self) -> Unit
-    # Process all expired timers from min-heap root based on virtual time
+    # Process all expired timers from min-heap root based on virtual
+    # time. The expiration invokes the SAME wake_task() the real-timer
+    # path uses (no separate ready-queue push): the state check
+    # (Waiting -> Ready) keeps a timer from double-queueing an already
+    # ready task or re-polling a finished one. A CANCELLED entry (the
+    # owning future was dropped, or the task was cancelled) is skipped
+    # lazily — it can never wake its task.
     loop do
       match timer_heap_peek_deadline(&self.timer_heap)
       when Option::Some(deadline) then
         if deadline <= self.virtual_time then
-          let entry = timer_heap_pop_min(&mut self.timer_heap).unwrap()
-          self.ready_queue.push_back(entry.task_id)
+          match timer_heap_pop_min(&mut self.timer_heap)
+          when Option::Some(entry) then
+            if !entry.cancelled then
+              self.wake_task(entry.task)
+            end
+          when Option::None then break
+          end
         else
           break
         end
@@ -1377,7 +1583,10 @@ impl ExecutorInner
       when Option::Some(deadline) then
         if deadline <= now then
           match timer_heap_pop_min(&mut self.timer_heap)
-          when Option::Some(entry) then self.wake_task(entry.task_id)
+          when Option::Some(entry) then
+            if !entry.cancelled then
+              self.wake_task(entry.task)
+            end
           when Option::None then break
           end
         else
@@ -1409,19 +1618,96 @@ impl ExecutorInner
     rot as u64
   end
   
-  def register_timer(inout self, deadline: Instant, task_id: UInt) -> Unit
+  # Register a timer: allocates a unique TimerId from the executor's
+  # next_timer_id allocator and returns it — the owning future stores
+  # the id and the Drop cancels with it.
+  def register_timer(inout self, deadline: Instant, task_id: UInt) -> UInt
+    let id = self.next_timer_id
+    self.next_timer_id = self.next_timer_id + 1
     timer_heap_push(&mut self.timer_heap, TimerEntry {
+      id: id,
+      task: task_id,
       deadline: deadline,
-      task_id: task_id
+      cancelled: false
     })
+    id
+  end
+
+  # Cancel a timer registration: the entry stays in the heap (no
+  # mid-heap removal) marked cancelled — the expired-cancelled entries
+  # are skipped lazily when popped. The cancelled flag is the stale-wake
+  # guard: a cancelled timer can never wake its task, even a task id
+  # that has since been reused for a fresh task.
+  def cancel_timer(inout self, timer_id: UInt) -> Unit
+    mut i = 0
+    let n = self.timer_heap.len()
+    while i < n do
+      if self.timer_heap[i].id == timer_id then
+        self.timer_heap[i].cancelled = true
+        return
+      end
+      i = i + 1
+    end
   end
   
+  # THE waiter-id allocator: every cooperative waiter registration (the
+  # join waiters, the channel's send/recv waiters, the semaphore's
+  # waiters) takes a unique id from the executor's strictly-increasing
+  # counter. The id makes the Drop-time unregistration exact — a task
+  # may hold several futures of the same kind on the same channel or
+  # queue, so the task id alone cannot disambiguate the entry.
+  def alloc_waiter_id(inout self) -> UInt
+    let id = self.next_waiter_id
+    self.next_waiter_id = self.next_waiter_id + 1
+    id
+  end
+
+  # Register a join waiter for a task: APPEND (never overwrite — the
+  # old single-slot Map[UInt, Waker] last-poller-wins insert could leave
+  # an EARLIER handle to the same task asleep: its registration was
+  # silently replaced by a later poller's). Every registration allocates
+  # a unique WaiterId, so each member of the vector is distinguishable
+  # and the terminal paths wake every member of the vector exactly once.
+  def register_join_waiter(inout self, task_id: UInt, waker: Waker) -> Unit
+    let waiter = JoinWaiter {
+      id: self.next_waiter_id,
+      waker: waker
+    }
+    self.next_waiter_id = self.next_waiter_id + 1
+    match self.join_waiters.get_mut(&task_id)
+    when Option::Some(waiters) then waiters.push(waiter)
+    when Option::None then
+      let mut fresh = Vec::new()
+      fresh.push(waiter)
+      let _ = self.join_waiters.insert(task_id, fresh)
+    end
+  end
+
+  # THE atomic detach-and-wake: removes the task's ENTIRE waiter vector
+  # from the map (the removal IS the atomic detach — no waiter can join
+  # the vector after the remove) and wakes every member exactly once.
+  # The normal completion AND the cancellation/failure both route
+  # through finish_task, which calls this.
+  def detach_join_waiters(inout self, task_id: UInt) -> Unit
+    match self.join_waiters.remove(&task_id)
+    when Option::Some(waiters) then
+      while waiters.len() > 0 do
+        let waiter = waiters.remove(0)
+        waiter.waker.wake()
+      end
+    when Option::None then ()
+    end
+  end
+
   # THE single terminal-outcome path: removes the task, records the
   # terminal state (Completed also stores the ()-result slot), and wakes
-  # the task's join waiter exactly once. The normal completion (poll_task
-  # observing Ready) AND the cancellation (cancel_task) both route
-  # through here — a cancelled/failed task's pending join is woken and
-  # completes with the error on its next poll.
+  # the task's join waiters exactly once — the ENTIRE waiter vector is
+  # detached atomically and every member is woken (the multi-join-waiter
+  # form: the TaskScope's tracked handle and the caller's returned
+  # handle to the same child BOTH wake). The normal completion
+  # (poll_task observing Ready) AND the cancellation (cancel_task) both
+  # route through here — a cancelled/failed task's pending joins are
+  # woken and complete with the error on their next poll.
   def finish_task(inout self, task_id: UInt, outcome: TaskOutcome) -> Unit
     let _ = self.tasks.remove(&task_id)
     match outcome
@@ -1433,16 +1719,16 @@ impl ExecutorInner
     when TaskOutcome::Failed then
       self.task_states.insert(task_id, TaskState::Failed)
     end
-    match self.join_waiters.remove(&task_id)
-    when Option::Some(waiter) then waiter.wake()
-    when Option::None then ()
-    end
+    self.detach_join_waiters(task_id)
   end
 
   # Cancel a task: it reaches the terminal state Cancelled through the
   # shared finish_task path (the join waiter is woken there — a pending
-  # join completes with "task cancelled" on its next poll), and its I/O
-  # registrations are removed from the reactor.
+  # join completes with "task cancelled" on its next poll), its I/O
+  # registrations are removed from the reactor, and ALL of its timer
+  # registrations are cancelled (the entries stay in the heap marked
+  # cancelled — the expired-cancelled entries are skipped when popped,
+  # so a cancelled task's timers can never fire a stale wake).
   def cancel_task(inout self, task_id: UInt) -> Bool
     if !self.tasks.contains_key(&task_id) then
       return false
@@ -1450,6 +1736,14 @@ impl ExecutorInner
     match self.io_reactor
     when Option::Some(mut reactor) then reactor.remove_task(task_id)
     when Option::None then ()
+    end
+    mut i = 0
+    let n = self.timer_heap.len()
+    while i < n do
+      if self.timer_heap[i].task == task_id then
+        self.timer_heap[i].cancelled = true
+      end
+      i = i + 1
     end
     self.finish_task(task_id, TaskOutcome::Cancelled)
     true
@@ -1490,7 +1784,8 @@ end
 struct SleepFuture
   duration: Duration
   deadline: Option[Instant]   # fixed at the FIRST poll from the clock
-  registered: Bool
+  timer_id: Option[UInt]      # the executor's TimerId — set at the first registration
+  executor: Option[Arc[ExecutorInner]]   # the future's OWN Arc clone — the Drop's cancel handle
 end
 
 impl Future for SleepFuture
@@ -1512,17 +1807,51 @@ impl Future for SleepFuture
       d
     end
     if now >= deadline then
-      Poll::Ready(())
-    else
-      if !self.registered then
-        # Register timer with executor
+      # The sleep completed: cancel the (possibly still-heaped) timer —
+      # a stale entry can never wake a reused task id.
+      match self.timer_id
+      when Option::Some(id) then
         unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
           let exec = cx.waker.executor.ptr.as_mut()
-          exec.register_timer(deadline, cx.waker.task_id)
+          exec.cancel_timer(id)
         end
-        self.registered = true
+      when Option::None then ()
+      end
+      Poll::Ready(())
+    else
+      # Register the timer ONCE (the timer_id guard — a re-poll while
+      # still pending never registers a duplicate timer entry).
+      match self.timer_id
+      when Option::None then
+        unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
+          let id = exec.register_timer(deadline, cx.waker.task_id)
+          self.timer_id = Option::Some(id)
+        end
+        self.executor = Option::Some(cx.waker.executor.clone())
+      when Option::Some(_) then ()
       end
       Poll::Pending
+    end
+  end
+end
+
+impl Drop for SleepFuture
+  def drop(inout self) -> Unit
+    # The future left the executor without completing (dropped early, or
+    # the owning task was cancelled): cancel its timer registration —
+    # the entry stays in the heap marked cancelled and is skipped when
+    # popped.
+    match self.timer_id
+    when Option::Some(id) then
+      match self.executor
+      when Option::Some(exec) then
+        unsafe "executor inner access — the future's Arc clone keeps the executor alive" do
+          exec.ptr.as_mut().cancel_timer(id)
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
     end
   end
 end
@@ -1531,7 +1860,8 @@ pub def sleep(duration: Duration) -> SleepFuture
   SleepFuture {
     duration: duration,
     deadline: Option::None,
-    registered: false
+    timer_id: Option::None,
+    executor: Option::None
   }
 end
 
@@ -1547,7 +1877,8 @@ struct TimeoutFuture[F: Future]
   inner: F
   duration: Duration
   deadline: Option[Instant]   # fixed at the FIRST poll from the clock
-  timer_registered: Bool
+  timer_id: Option[UInt]      # the executor's TimerId — set at the first registration
+  executor: Option[Arc[ExecutorInner]]   # the future's OWN Arc clone — the Drop's cancel handle
 end
 
 enum TimeoutError
@@ -1561,8 +1892,19 @@ impl Future for TimeoutFuture[F]
     # Check the inner future first
     match self.inner.poll(cx)
     when Poll::Ready(val) then
-        let ready_result: Result[F::Output, TimeoutError] = Result::Ok(val)
-        return Poll::Ready(ready_result)
+      # The inner won: cancel the timeout's timer registration — a stale
+      # timer must never fire a wake (the "no stale wake" discipline:
+      # the cancelled entry is skipped when popped).
+      match self.timer_id
+      when Option::Some(id) then
+        unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
+          exec.cancel_timer(id)
+        end
+      when Option::None then ()
+      end
+      let ready_result: Result[F::Output, TimeoutError] = Result::Ok(val)
+      return Poll::Ready(ready_result)
     when Poll::Pending then ()
     end
     
@@ -1579,17 +1921,52 @@ impl Future for TimeoutFuture[F]
       d
     end
     if now >= deadline then
-        let timeout_result: Result[F::Output, TimeoutError] = Result::Err(TimeoutError::TimedOut)
-        Poll::Ready(timeout_result)
-    else
-      if !self.timer_registered then
+      # Timed out: cancel the (possibly still-heaped) timer — the stale
+      # entry can never wake the task.
+      match self.timer_id
+      when Option::Some(id) then
         unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
           let exec = cx.waker.executor.ptr.as_mut()
-          exec.register_timer(deadline, cx.waker.task_id)
+          exec.cancel_timer(id)
         end
-        self.timer_registered = true
+      when Option::None then ()
+      end
+      let timeout_result: Result[F::Output, TimeoutError] = Result::Err(TimeoutError::TimedOut)
+      Poll::Ready(timeout_result)
+    else
+      # Register the timer ONCE (the timer_id guard — a re-poll while
+      # still pending never registers a duplicate timer entry).
+      match self.timer_id
+      when Option::None then
+        unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
+          let id = exec.register_timer(deadline, cx.waker.task_id)
+          self.timer_id = Option::Some(id)
+        end
+        self.executor = Option::Some(cx.waker.executor.clone())
+      when Option::Some(_) then ()
       end
       Poll::Pending
+    end
+  end
+end
+
+impl Drop for TimeoutFuture[F]
+  def drop(inout self) -> Unit
+    # The future left the executor without completing (dropped early, or
+    # the owning task was cancelled): cancel its timer registration —
+    # the entry stays in the heap marked cancelled and is skipped when
+    # popped.
+    match self.timer_id
+    when Option::Some(id) then
+      match self.executor
+      when Option::Some(exec) then
+        unsafe "executor inner access — the future's Arc clone keeps the executor alive" do
+          exec.ptr.as_mut().cancel_timer(id)
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
     end
   end
 end
@@ -1599,7 +1976,8 @@ pub def timeout[F: Future](duration: Duration, future: F) -> TimeoutFuture[F]
     inner: future,
     duration: duration,
     deadline: Option::None,
-    timer_registered: false
+    timer_id: Option::None,
+    executor: Option::None
   }
 end
 
@@ -1634,12 +2012,61 @@ end
 # Async Channel (MPSC)
 # ———————————————————————————————————————————————————————————————
 
+# One registered cooperative waiter: the unique waiter id (from the
+# executor's next_waiter_id allocator — the SendWaiterId/RecvWaiterId
+# the SendFuture/RecvFuture hold) plus the waker. The id makes the
+# Drop-time unregistration exact: a task may hold several futures of
+# the same kind on the same channel (two blocked send futures), so the
+# task id alone cannot disambiguate the entry.
+struct WaiterEntry
+  id: UInt
+  waker: Waker
+end
+
+# THE ATOMIC CHANNEL CLOSURE: the closed swap is the single point of
+# truth — once it succeeds the send side can never reopen. The
+# detach-and-wake of BOTH waiter sets happens in one pass: every
+# blocked receiver is detached and woken (its re-poll drains the
+# buffer, then observes the closed state) and every blocked sender is
+# detached and woken (a SendFuture blocked full wakes on the close and
+# fails the send on its re-poll).
+def channel_inner_close[T](inner: Arc[ChannelInner[T]]) -> Unit
+  let ch = inner.ptr.as_ref()
+  if ch.closed.swap(true) then
+    return
+  end
+  while !ch.send_waiters.is_empty() do
+    ch.send_waiters.remove(0).waker.wake()
+  end
+  while !ch.recv_waiters.is_empty() do
+    ch.recv_waiters.remove(0).waker.wake()
+  end
+end
+
+# THE RECEIVER-SIDE GONE MARK: the Receiver endpoint's Drop marks the
+# receive side gone (every send fails from then on) and detaches+wakes
+# BOTH waiter sets — a blocked sender re-polls and fails the send; a
+# blocked receiver re-polls and observes the gone side (Ready(None)).
+def channel_inner_receiver_gone[T](inner: Arc[ChannelInner[T]]) -> Unit
+  let ch = inner.ptr.as_ref()
+  ch.recv_side_gone = true
+  while !ch.send_waiters.is_empty() do
+    ch.send_waiters.remove(0).waker.wake()
+  end
+  while !ch.recv_waiters.is_empty() do
+    ch.recv_waiters.remove(0).waker.wake()
+  end
+end
+
 struct ChannelInner[T]
   buffer: VecDeque[T]
   capacity: UInt
   closed: AtomicBool
-  send_waiters: Vec[Waker]
-  recv_waiters: Vec[Waker]
+  sender_count: UInt          # live Sender values (clones included)
+  recv_side_gone: Bool        # the explicit receiver-alive state (the
+                              # Receiver endpoint was dropped)
+  send_waiters: Vec[WaiterEntry]
+  recv_waiters: Vec[WaiterEntry]
 end
 
 # The channel's shared state lives in a heap allocation owned by an Arc
@@ -1663,8 +2090,10 @@ pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
     buffer: VecDeque[T]::new(),
     capacity: capacity,
     closed: AtomicBool::new(false),
-    send_waiters: Vec[Waker]::new(),
-    recv_waiters: Vec[Waker]::new()
+    sender_count: 1,
+    recv_side_gone: false,
+    send_waiters: Vec[WaiterEntry]::new(),
+    recv_waiters: Vec[WaiterEntry]::new()
   })
 
   (Sender[T] { inner: inner.clone() }, Receiver[T] { inner: inner })
@@ -1674,40 +2103,60 @@ impl Sender[T]
   def send(self, value: T) -> SendFuture[T]
     SendFuture[T] {
       inner: self.inner.clone(),
-      value: Option::Some(value)
+      value: Option::Some(value),
+      waiter_id: Option::None
     }
   end
 
   def close(self) -> Unit
-    if self.inner.ptr.as_ref().closed.load() then
-      return
-    end
-    self.inner.ptr.as_ref().closed.store(true)
-    loop do
-      match self.inner.ptr.as_ref().recv_waiters.pop()
-      when Option::Some(waker) then waker.wake()
-      when Option::None then break
-      end
-    end
+    # The explicit close: the atomic closure marks the channel closed
+    # and wakes BOTH waiter sets — a SendFuture blocked full wakes on
+    # the close and fails the send on its re-poll.
+    channel_inner_close(self.inner.clone())
   end
+end
 
-  def clone(self) -> Sender[T]
-    Sender[T] { inner: self.inner.clone() }
+impl[T] Clone for Sender[T]
+  def clone(self: Sender[T]) -> Sender[T]
+    # The clone registers in the shared sender count: the LAST Sender
+    # value to drop — of any generation — closes the send side.
+    let inner = self.inner.clone()
+    inner.ptr.as_ref().sender_count = inner.ptr.as_ref().sender_count + 1
+    Sender[T] { inner: inner }
+  end
+end
+
+impl[T] Drop for Sender[T]
+  def drop(inout self: Sender[T]) -> Unit
+    let ch = self.inner.ptr.as_ref()
+    if ch.sender_count > 0 then
+      ch.sender_count = ch.sender_count - 1
+    end
+    if ch.sender_count == 0 then
+      # The last sender: the send side closes — the atomic closure marks
+      # the channel closed and wakes every blocked receiver (the drain,
+      # then the closed state) and every blocked sender (the failed
+      # send).
+      channel_inner_close(self.inner.clone())
+    end
   end
 end
 
 impl Receiver[T]
   def recv(self) -> RecvFuture[T]
-    RecvFuture[T] { inner: self.inner.clone() }
+    RecvFuture[T] {
+      inner: self.inner.clone(),
+      waiter_id: Option::None
+    }
   end
 
   def try_recv(self) -> Option[T]
     let ch = self.inner.ptr.as_ref()
     match ch.buffer.pop_front()
     when Option::Some(val) then
-      # Wake a sender — the buffer just made room
+      # Wake the OLDEST blocked sender — the buffer just made room
       if !ch.send_waiters.is_empty() then
-        ch.send_waiters.pop().unwrap().wake()
+        ch.send_waiters.remove(0).waker.wake()
       end
       Option::Some(val)
     when Option::None then
@@ -1720,9 +2169,19 @@ impl Receiver[T]
   end
 end
 
+impl[T] Drop for Receiver[T]
+  def drop(inout self: Receiver[T]) -> Unit
+    # The receiver is gone: mark the receive side gone and wake every
+    # blocked sender (its re-poll fails the send) and every blocked
+    # receiver (its re-poll observes the gone side).
+    channel_inner_receiver_gone(self.inner.clone())
+  end
+end
+
 struct SendFuture[T]
   inner: Arc[ChannelInner[T]]
   value: Option[T]
+  waiter_id: Option[UInt]   # the SendWaiterId — set at the first registration
 end
 
 impl Future for SendFuture[T]
@@ -1730,6 +2189,14 @@ impl Future for SendFuture[T]
 
   def poll(inout self, inout cx: Context) -> Poll[Result[(), String]]
     let ch = self.inner.ptr.as_ref()
+
+    # The endpoint lifecycle: the receive side is gone (the Receiver was
+    # dropped) — every send fails; a blocked-full sender woken by the
+    # receiver's drop observes the gone side here.
+    if ch.recv_side_gone then
+      let gone_result: Result[(), String] = Result::Err("receiver dropped".to_string())
+      return Poll::Ready(gone_result)
+    end
 
     if ch.closed.load() then
       let closed_result: Result[(), String] = Result::Err("channel closed".to_string())
@@ -1741,9 +2208,10 @@ impl Future for SendFuture[T]
       match self.value.take()
       when Option::Some(val) then
         ch.buffer.push_back(val)
-        # Wake a receiver
+        # Wake the OLDEST blocked receiver — the buffer just made a
+        # value available (the FIFO remove(0) keeps the queue fair).
         if !ch.recv_waiters.is_empty() then
-          ch.recv_waiters.pop().unwrap().wake()
+          ch.recv_waiters.remove(0).waker.wake()
         end
         let sent_result: Result[(), String] = Result::Ok(())
         Poll::Ready(sent_result)
@@ -1752,15 +2220,49 @@ impl Future for SendFuture[T]
         Poll::Ready(missing_result)
       end
     else
-      # Buffer full, wait
-      ch.send_waiters.push(cx.waker.clone())
+      # Buffer full: register the waiter ONCE — the waiter_id guard; a
+      # re-poll while still full never appends a duplicate. The id comes
+      # from the executor's next_waiter_id allocator and is how the
+      # future's Drop unregisters the exact entry.
+      if self.waiter_id.is_none() then
+        let waker = cx.waker.clone()
+        let id = unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+          let exec = cx.waker.executor.ptr.as_mut()
+          exec.alloc_waiter_id()
+        end
+        ch.send_waiters.push(WaiterEntry { id: id, waker: waker })
+        self.waiter_id = Option::Some(id)
+      end
       Poll::Pending
+    end
+  end
+end
+
+impl Drop for SendFuture[T]
+  def drop(inout self) -> Unit
+    # The waiter left the channel without sending (dropped or already
+    # completed): remove its exact entry by the waiter id, so the
+    # channel's wake paths always pop the OLDEST live waiter.
+    match self.waiter_id
+    when Option::Some(id) then
+      let ch = self.inner.ptr.as_ref()
+      mut i = 0
+      let n = ch.send_waiters.len()
+      while i < n do
+        if ch.send_waiters[i].id == id then
+          let _ = ch.send_waiters.remove(i)
+          break
+        end
+        i = i + 1
+      end
+    when Option::None then ()
     end
   end
 end
 
 struct RecvFuture[T]
   inner: Arc[ChannelInner[T]]
+  waiter_id: Option[UInt]   # the RecvWaiterId — set at the first registration
 end
 
 impl Future for RecvFuture[T]
@@ -1771,18 +2273,55 @@ impl Future for RecvFuture[T]
 
     match ch.buffer.pop_front()
     when Option::Some(val) then
-      # Wake a sender
+      # Wake the OLDEST blocked sender — the buffer just made room.
       if !ch.send_waiters.is_empty() then
-        ch.send_waiters.pop().unwrap().wake()
+        ch.send_waiters.remove(0).waker.wake()
       end
       Poll::Ready(Option::Some(val))
     when Option::None then
-      if ch.closed.load() then
+      # The send side closed (the last sender dropped or the explicit
+      # close) or the receive side is gone (the Receiver was dropped):
+      # the receiver drains the buffer first, then observes the terminal
+      # state.
+      if ch.closed.load() || ch.recv_side_gone then
         Poll::Ready(Option::None)
       else
-        ch.recv_waiters.push(cx.waker.clone())
+        # Register the waiter ONCE — the waiter_id guard; a re-poll
+        # while still empty never appends a duplicate. The id comes from
+        # the executor's next_waiter_id allocator and is how the
+        # future's Drop unregisters the exact entry.
+        if self.waiter_id.is_none() then
+          let waker = cx.waker.clone()
+          let id = unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+            let exec = cx.waker.executor.ptr.as_mut()
+            exec.alloc_waiter_id()
+          end
+          ch.recv_waiters.push(WaiterEntry { id: id, waker: waker })
+          self.waiter_id = Option::Some(id)
+        end
         Poll::Pending
       end
+    end
+  end
+end
+
+impl Drop for RecvFuture[T]
+  def drop(inout self) -> Unit
+    # The waiter left the channel without receiving (dropped or already
+    # completed): remove its exact entry by the waiter id.
+    match self.waiter_id
+    when Option::Some(id) then
+      let ch = self.inner.ptr.as_ref()
+      mut i = 0
+      let n = ch.recv_waiters.len()
+      while i < n do
+        if ch.recv_waiters[i].id == id then
+          let _ = ch.recv_waiters.remove(i)
+          break
+        end
+        i = i + 1
+      end
+    when Option::None then ()
     end
   end
 end
@@ -1915,7 +2454,7 @@ mut __tg_async_force_eagain: Bool = false
 # closed fd fails the kernel ADD with the error propagated).
 struct WaitReadableFuture[T: ReactorFd]
   io: T
-  registration: Option[RegistrationId]
+  registration: Option[UInt]
 end
 
 impl Future for WaitReadableFuture[T]
@@ -1928,15 +2467,15 @@ impl Future for WaitReadableFuture[T]
       match self.registration
       when Option::None then
         match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
-        when Result::Ok(rid) then
-          self.registration = Option::Some(rid)
+        when Result::Ok(token) then
+          self.registration = Option::Some(token)
           Poll::Pending
         when Result::Err(err) then
           let reg_error: Result[Unit, String] = Result::Err(err)
           Poll::Ready(reg_error)
         end
-      when Option::Some(rid) then
-        match exec.io_status(rid)
+      when Option::Some(token) then
+        match exec.io_status(token)
         when RegistrationStatus::NotRegistered then
           self.registration = Option::None
           let lost_error: Result[Unit, String] = Result::Err("I/O registration lost — the file descriptor was closed or replaced".to_string())
@@ -1946,7 +2485,7 @@ impl Future for WaitReadableFuture[T]
         when RegistrationStatus::Ready then
           # consume the readiness: deregister, then the operation (the
           # readability is confirmed — nothing to read here)
-          exec.deregister_io(rid)
+          exec.deregister_io(token)
           self.registration = Option::None
           let read_ready: Result[Unit, String] = Result::Ok(())
           Poll::Ready(read_ready)
@@ -1958,7 +2497,7 @@ end
 
 struct WaitWritableFuture[T: ReactorFd]
   io: T
-  registration: Option[RegistrationId]
+  registration: Option[UInt]
 end
 
 impl Future for WaitWritableFuture[T]
@@ -1971,15 +2510,15 @@ impl Future for WaitWritableFuture[T]
       match self.registration
       when Option::None then
         match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
-        when Result::Ok(rid) then
-          self.registration = Option::Some(rid)
+        when Result::Ok(token) then
+          self.registration = Option::Some(token)
           Poll::Pending
         when Result::Err(err) then
           let reg_error: Result[Unit, String] = Result::Err(err)
           Poll::Ready(reg_error)
         end
-      when Option::Some(rid) then
-        match exec.io_status(rid)
+      when Option::Some(token) then
+        match exec.io_status(token)
         when RegistrationStatus::NotRegistered then
           self.registration = Option::None
           let lost_error: Result[Unit, String] = Result::Err("I/O registration lost — the file descriptor was closed or replaced".to_string())
@@ -1987,7 +2526,7 @@ impl Future for WaitWritableFuture[T]
         when RegistrationStatus::Pending then
           Poll::Pending
         when RegistrationStatus::Ready then
-          exec.deregister_io(rid)
+          exec.deregister_io(token)
           self.registration = Option::None
           let write_ready: Result[Unit, String] = Result::Ok(())
           Poll::Ready(write_ready)
@@ -2004,7 +2543,7 @@ end
 struct AsyncReadFuture[T: Read + ReactorFd]
   io: T
   buf: Vec[u8]
-  registration: Option[RegistrationId]
+  registration: Option[UInt]
 end
 
 impl Future for AsyncReadFuture[T]
@@ -2017,14 +2556,14 @@ impl Future for AsyncReadFuture[T]
       match self.registration
       when Option::None then
         match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
-        when Result::Ok(rid) then
-          self.registration = Option::Some(rid)
+        when Result::Ok(token) then
+          self.registration = Option::Some(token)
           Poll::Pending
         when Result::Err(err) then
           Poll::Ready(Result::Err(IOError::Other(err)))
         end
-      when Option::Some(rid) then
-        match exec.io_status(rid)
+      when Option::Some(token) then
+        match exec.io_status(token)
         when RegistrationStatus::NotRegistered then
           self.registration = Option::None
           let lost: Result[Int, IOError] = Result::Err(IOError::Other("I/O registration lost — the file descriptor was closed or replaced".to_string()))
@@ -2033,7 +2572,7 @@ impl Future for AsyncReadFuture[T]
           Poll::Pending
         when RegistrationStatus::Ready then
           # consume the readiness: deregister, then the operation
-          exec.deregister_io(rid)
+          exec.deregister_io(token)
           self.registration = Option::None
           let mut injected = false
           if __tg_async_force_eagain then
@@ -2056,8 +2595,8 @@ impl Future for AsyncReadFuture[T]
           end
           if injected then
             match exec.register_io(fd, cx.waker.task_id, Interest::Readable)
-            when Result::Ok(rid2) then
-              self.registration = Option::Some(rid2)
+            when Result::Ok(token2) then
+              self.registration = Option::Some(token2)
               Poll::Pending
             when Result::Err(e2) then
               Poll::Ready(Result::Err(IOError::Other(e2)))
@@ -2077,7 +2616,7 @@ end
 struct AsyncWriteFuture[T: Write + ReactorFd]
   io: T
   buf: Vec[u8]
-  registration: Option[RegistrationId]
+  registration: Option[UInt]
 end
 
 impl Future for AsyncWriteFuture[T]
@@ -2090,14 +2629,14 @@ impl Future for AsyncWriteFuture[T]
       match self.registration
       when Option::None then
         match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
-        when Result::Ok(rid) then
-          self.registration = Option::Some(rid)
+        when Result::Ok(token) then
+          self.registration = Option::Some(token)
           Poll::Pending
         when Result::Err(err) then
           Poll::Ready(Result::Err(IOError::Other(err)))
         end
-      when Option::Some(rid) then
-        match exec.io_status(rid)
+      when Option::Some(token) then
+        match exec.io_status(token)
         when RegistrationStatus::NotRegistered then
           self.registration = Option::None
           let lost: Result[Int, IOError] = Result::Err(IOError::Other("I/O registration lost — the file descriptor was closed or replaced".to_string()))
@@ -2105,7 +2644,7 @@ impl Future for AsyncWriteFuture[T]
         when RegistrationStatus::Pending then
           Poll::Pending
         when RegistrationStatus::Ready then
-          exec.deregister_io(rid)
+          exec.deregister_io(token)
           self.registration = Option::None
           let mut injected = false
           if __tg_async_force_eagain then
@@ -2125,8 +2664,8 @@ impl Future for AsyncWriteFuture[T]
           end
           if injected then
             match exec.register_io(fd, cx.waker.task_id, Interest::Writable)
-            when Result::Ok(rid2) then
-              self.registration = Option::Some(rid2)
+            when Result::Ok(token2) then
+              self.registration = Option::Some(token2)
               Poll::Pending
             when Result::Err(e2) then
               Poll::Ready(Result::Err(IOError::Other(e2)))
@@ -2205,7 +2744,14 @@ pub def block_on[F: Future](future: F) -> F::Output
   end
 end
 
-pub def spawn(future: impl Future[Output = ()]) -> JoinHandle[()]
+# The current executor's inner — the handle the external producers (the
+# blocking-pool workers) hold to enqueue wakes through the thread-safe
+# external-wake inbox (they never touch the scheduler state directly).
+pub def global_executor_inner() -> Option[Arc[ExecutorInner]]
+  GLOBAL_EXECUTOR.clone()
+end
+
+pub def spawn(future: impl Future[Output = ()]) -> JoinHandle
   match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec_inner) then
     let exec = Executor { inner: exec_inner }
@@ -2268,7 +2814,8 @@ end
 struct AsyncMutexInner[T]
   locked: AtomicBool
   value: T
-  waiters: Vec[Waker]
+  waiters: Vec[WaiterEntry]
+  waiter_id_source: AtomicUInt
 end
 
 pub def async_mutex_new[T](value: T) -> AsyncMutex[T]
@@ -2276,7 +2823,8 @@ pub def async_mutex_new[T](value: T) -> AsyncMutex[T]
     inner: Arc::new(AsyncMutexInner {
       locked: AtomicBool::new(false),
       value: value,
-      waiters: Vec::new()
+      waiters: Vec::new(),
+      waiter_id_source: AtomicUInt::new(1)
     })
   }
 end
@@ -2294,7 +2842,7 @@ end
 # waiter leaves the queue without acquiring.
 struct LockFuture[T]
   inner: Arc[AsyncMutexInner[T]]
-  waker: Option[Waker]
+  waiter_id: Option[UInt]
 end
 
 impl Future for LockFuture[T]
@@ -2306,14 +2854,17 @@ impl Future for LockFuture[T]
       # repeated poll re-tries the swap without appending a duplicate)
       # and return Pending: the guard's Drop wakes the OLDEST waiter
       # when the lock frees.
-      if self.waker.is_none() then
-        let waiter = cx.waker.clone()
-        self.inner.ptr.as_ref().waiters.push(waiter.clone())
-        self.waker = Option::Some(waiter)
+      if self.waiter_id.is_none() then
+        # The waiter registers ONCE with its own unique WaiterId — one
+        # task can own several LockFutures (join/select/nested state
+        # machines), so the id, never the task id, is the identity.
+        let id = self.inner.ptr.as_ref().waiter_id_source.fetch_add(1)
+        self.inner.ptr.as_ref().waiters.push(WaiterEntry { id: id, waker: cx.waker.clone() })
+        self.waiter_id = Option::Some(id)
       end
       Poll::Pending
     else
-      self.waker = Option::None
+      self.waiter_id = Option::None
       Poll::Ready(AsyncMutexGuard { inner: self.inner.clone() })
     end
   end
@@ -2321,16 +2872,16 @@ end
 
 impl Drop for LockFuture[T]
   def drop(inout self) -> Unit
-    # The waiter left the queue without acquiring: remove its own entry
-    # (the task_id match — one waiter per task) so the guard's Drop
-    # wakes the NEXT waiter (the queue stays FIFO).
-    match self.waker
-    when Option::Some(waiter) then
+    # The waiter left the queue without acquiring: remove its OWN entry
+    # by its unique WaiterId (never by the task id — a task may own
+    # several concurrent LockFutures) so the guard's Drop wakes the NEXT
+    # waiter (the queue stays FIFO).
+    match self.waiter_id
+    when Option::Some(id) then
       let inner = self.inner.ptr.as_ref()
-      let mut i = 0
-      let n = inner.waiters.len()
-      while i < n do
-        if inner.waiters[i].task_id == waiter.task_id then
+      var i = 0
+      while i < inner.waiters.len() do
+        if inner.waiters[i].id == id then
           let _ = inner.waiters.remove(i)
           break
         end
@@ -2387,7 +2938,7 @@ impl Drop for AsyncMutexGuard[T]
     inner.locked.store(false)
     if !inner.waiters.is_empty() then
       let waiter = inner.waiters.remove(0)
-      waiter.wake()
+      waiter.waker.wake()
     end
   end
 end
@@ -2543,7 +3094,13 @@ impl TaskScope
       task_id: handle.task_id,
       executor: handle.executor.clone()
     }
-    self.tasks.push(scoped_handle)
+    # The intentional clone — the deliberate ownership split: the scope
+    # tracks ITS copy (the join_all drains the scope's vector), the
+    # caller owns the returned handle (its await registers its own join
+    # waiter). Pushing the handle and then returning it would SINK the
+    # handle into the Vec — the final line would use the consumed value
+    # (the ScopedTaskHandle owns an Arc — not a harmless copy).
+    self.tasks.push(scoped_handle.clone())
     scoped_handle
   end
 
@@ -2719,17 +3276,40 @@ end
 ## Channel-backed async stream
 struct ChannelStream[T]
   receiver: Receiver[T]
+  recv_future: Option[RecvFuture[T]]   # the in-flight recv — the Pending registration
+end
+
+pub def channel_stream[T](receiver: Receiver[T]) -> ChannelStream[T]
+  ChannelStream[T] {
+    receiver: receiver,
+    recv_future: Option::None
+  }
 end
 
 impl[T] AsyncIterator for ChannelStream[T]
   type Item = T
   def poll_next(inout self: ChannelStream[T], inout cx: Context) -> Poll[Option[T]]
-    match self.receiver.try_recv()
-    when Option::Some(item) then Poll::Ready(Option::Some(item))
+    # THE WAKE REGISTRATION: every Pending goes through the stored
+    # RecvFuture — its poll registers the waker in the channel's
+    # receiver-waiter list exactly once (the waiter_id guard inside the
+    # future). A poll_next NEVER returns Pending without a live
+    # registration.
+    match self.recv_future
+    when Option::Some(mut fut) then
+      match fut.poll(&mut cx)
+      when Poll::Ready(item) then
+        self.recv_future = Option::None
+        Poll::Ready(item)
+      when Poll::Pending then
+        Poll::Pending
+      end
     when Option::None then
-      if self.receiver.is_closed() then
-        Poll::Ready(Option::None)
-      else
+      let mut fut = self.receiver.recv()
+      match fut.poll(&mut cx)
+      when Poll::Ready(item) then
+        Poll::Ready(item)
+      when Poll::Pending then
+        self.recv_future = Option::Some(fut)
         Poll::Pending
       end
     end
@@ -2900,7 +3480,7 @@ end
 struct AsyncSemaphoreInner
   counter: AtomicInt
   max_permits: UInt
-  waiters: VecDeque[Waker]
+  waiters: Vec[WaiterEntry]
 end
 
 def async_semaphore_new(permits: UInt) -> AsyncSemaphore
@@ -2908,7 +3488,7 @@ def async_semaphore_new(permits: UInt) -> AsyncSemaphore
     inner: Arc::new(AsyncSemaphoreInner {
       counter: AtomicInt::new(permits as Int),
       max_permits: permits,
-      waiters: VecDeque::new()
+      waiters: Vec::new()
     })
   }
 end
@@ -2919,6 +3499,31 @@ end
 
 struct AcquireFuture
   inner: Arc[AsyncSemaphoreInner]
+  waiter_id: Option[UInt]   # the waiter id — set at the first registration
+end
+
+impl AcquireFuture
+  # Remove the future's OWN waiter entry (matched by the waiter id) and
+  # clear the id — the acquire-time consume and the Drop-time
+  # unregistration share the same removal, so the release always wakes
+  # the OLDEST LIVE waiter.
+  def unregister_waiter(inout self: AcquireFuture) -> Unit
+    match self.waiter_id
+    when Option::Some(id) then
+      let inner = self.inner.ptr.as_ref()
+      mut i = 0
+      let n = inner.waiters.len()
+      while i < n do
+        if inner.waiters[i].id == id then
+          let _ = inner.waiters.remove(i)
+          break
+        end
+        i = i + 1
+      end
+      self.waiter_id = Option::None
+    when Option::None then ()
+    end
+  end
 end
 
 impl Future for AcquireFuture
@@ -2929,17 +3534,39 @@ impl Future for AcquireFuture
       if current > 0 then
         mut expected = current
         if self.inner.ptr.as_ref().counter.compare_exchange(&mut expected, current - 1, Ordering::AcqRel, Ordering::Acquire) then
+          # ACQUIRED: consume the registration — the entry is removed
+          # and the id cleared (the release's wake usually popped the
+          # entry already; the consume makes the Drop a no-op on every
+          # path).
+          self.unregister_waiter()
           return Poll::Ready(SemaphorePermit { inner: self.inner.clone() })
         end
       else
-        # No permit — queue this task's waker (the executor re-polls us
-        # once a permit release wakes the queue; a re-poll while still
-        # starved enqueues again, and the id-based wakeups make stale
-        # entries no-ops in the executor).
-        self.inner.ptr.as_ref().waiters.push_back(cx.waker.clone())
+        # No permit — register the waker ONCE (the waiter_id guard; a
+        # re-poll while still starved never appends a duplicate). The id
+        # comes from the executor's next_waiter_id allocator and is how
+        # the future's Drop removes the exact entry.
+        if self.waiter_id.is_none() then
+          let waker = cx.waker.clone()
+          let id = unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
+            let exec = cx.waker.executor.ptr.as_mut()
+            exec.alloc_waiter_id()
+          end
+          self.inner.ptr.as_ref().waiters.push(WaiterEntry { id: id, waker: waker })
+          self.waiter_id = Option::Some(id)
+        end
         return Poll::Pending
       end
     end
+  end
+end
+
+impl Drop for AcquireFuture
+  def drop(inout self) -> Unit
+    # The waiter left the queue without acquiring (dropped, or the
+    # owning task was cancelled): remove its own entry, so the release
+    # always wakes the OLDEST live waiter.
+    self.unregister_waiter()
   end
 end
 
@@ -2949,21 +3576,23 @@ end
 
 impl Drop for SemaphorePermit
   def drop(inout self) -> Unit
-    # Release the permit (the atomic increment) and wake the oldest waiter.
+    # Release the permit (the atomic increment) and wake the OLDEST live
+    # waiter (the FIFO remove(0) — a dropped waiter's entry was removed
+    # by its future's Drop, so the front is always live).
     self.inner.ptr.as_ref().counter.fetch_add(1, Ordering::Release)
-    match self.inner.ptr.as_ref().waiters.pop_front()
-    when Option::Some(waker) then waker.wake()
-    when Option::None then ()
+    let inner = self.inner.ptr.as_ref()
+    if !inner.waiters.is_empty() then
+      inner.waiters.remove(0).waker.wake()
     end
   end
 end
 
 impl AsyncSemaphore
-  def acquire(inout self) -> AcquireFuture
-    AcquireFuture { inner: self.inner.clone() }
+  def acquire(self) -> AcquireFuture
+    AcquireFuture { inner: self.inner.clone(), waiter_id: Option::None }
   end
 
-  def try_acquire(inout self) -> Option[SemaphorePermit]
+  def try_acquire(self) -> Option[SemaphorePermit]
     let current = self.inner.ptr.as_ref().counter.load(Ordering::Acquire)
     if current > 0 then
       mut expected = current
@@ -2984,4 +3613,223 @@ end
 # SemaphorePermit are all Arc-wrapped (the recognized synchronized
 # representation), so the derivation answers Transferable + Shareable
 # through the Arc layer.
+
+# ———————————————————————————————————————————————————————————————
+# Tests
+# ———————————————————————————————————————————————————————————————
+# The opaque-token guarantees the old bit-packed token could not
+# give: (a) the registration identity survives the round trip with ids
+# > 65535 — the map entry carries the full-width task AND fd (the old
+# packing forced both into 16-bit fields); (b) a stale token (its
+# registration was removed) is DISCARDED by the event path — the fd's
+# CURRENT registration is never consulted; (c) a Both registration
+# replaced by a read-only clears the write slot — no dangling half.
+
+@test
+def test_reactor_opaque_token_large_ids_round_trip() -> Unit
+  let addr = socket_addr_v4(ipv4_localhost(), 38930)
+  let listener = match tcp_bind(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: bind failed")
+  end
+  let _client = match tcp_connect(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: connect failed")
+  end
+  let server = match listener.accept()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: accept failed")
+  end
+
+  let mut reactor = match io_reactor_new()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: io_reactor_new failed")
+  end
+
+  # a task id > 65535 through the REAL register: the map entry preserves
+  # it exactly (the old pack truncated it to 16 bits)
+  let big_task: UInt = 70000
+  let token = match reactor.register(server.raw_fd(), big_task, Interest::Readable)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: register failed")
+  end
+  match reactor.registrations.get(&token)
+  when Option::Some(reg) then
+    assert reg.task == big_task
+    assert reg.fd == server.raw_fd()
+    match reg.interest
+    when Interest::Readable then ()
+    when _ then assert false
+    end
+    assert !reg.ready
+  when Option::None then assert false
+  end
+
+  # an fd > 65535: no real descriptor that high exists (the kernel would
+  # reject the register), so the fd half is pinned against the map entry
+  # + the event path directly — the entry is the authority and carries
+  # the full-width fd
+  let big_fd: Int = 70000
+  let huge_token: UInt = 90000
+  reactor.registrations.insert(huge_token, Registration {
+    task: big_task,
+    fd: big_fd,
+    interest: Interest::Writable,
+    generation: huge_token,
+    ready: false
+  })
+  match reactor.registrations.get(&huge_token)
+  when Option::Some(reg) then
+    assert reg.task == big_task
+    assert reg.fd == big_fd
+    match reg.interest
+    when Interest::Writable then ()
+    when _ then assert false
+    end
+  when Option::None then assert false
+  end
+  mut tasks: Vec[UInt] = Vec::new()
+  reactor.mark_ready(huge_token, &mut tasks)
+  assert reactor.is_ready(huge_token)
+  assert tasks.contains(&big_task)
+  let _ = reactor.deregister(huge_token)
+  assert !reactor.is_ready(huge_token)
+
+  reactor.close()
+end
+
+@test
+def test_reactor_stale_token_event_discarded() -> Unit
+  let addr = socket_addr_v4(ipv4_localhost(), 38932)
+  let listener = match tcp_bind(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: bind failed")
+  end
+  let _client = match tcp_connect(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: connect failed")
+  end
+  let server = match listener.accept()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: accept failed")
+  end
+
+  let mut reactor = match io_reactor_new()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: io_reactor_new failed")
+  end
+
+  let t1 = match reactor.register(server.raw_fd(), 21, Interest::Readable)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: register failed")
+  end
+  let _ = reactor.deregister(t1)
+  let t2 = match reactor.register(server.raw_fd(), 22, Interest::Readable)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: register failed")
+  end
+
+  # a stale event (t1 — its registration was removed) is DISCARDED: the
+  # same fd's CURRENT registration (t2) is never consulted — if the
+  # handler fell back to token -> fd -> current registration, t2 would
+  # wrongly be marked
+  mut tasks: Vec[UInt] = Vec::new()
+  reactor.mark_ready(t1, &mut tasks)
+  assert tasks.is_empty()
+  assert !reactor.is_ready(t2)
+  match reactor.status(t2)
+  when RegistrationStatus::Pending then ()
+  when _ then assert false
+  end
+
+  # the live token's event marks the exact registration
+  reactor.mark_ready(t2, &mut tasks)
+  assert reactor.is_ready(t2)
+  assert tasks.contains(&22)
+
+  reactor.close()
+end
+
+@test
+def test_reactor_both_replacement_clears_write_slot() -> Unit
+  let addr = socket_addr_v4(ipv4_localhost(), 38934)
+  let listener = match tcp_bind(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: bind failed")
+  end
+  let _client = match tcp_connect(addr)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: connect failed")
+  end
+  let server = match listener.accept()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: accept failed")
+  end
+
+  let mut reactor = match io_reactor_new()
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: io_reactor_new failed")
+  end
+
+  # a Both registration owns TWO exact tokens: the primary (readable —
+  # returned) and the secondary (writable — the write slot)
+  let primary = match reactor.register(server.raw_fd(), 31, Interest::Both)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: Both register failed")
+  end
+  let secondary = match reactor.fd_states.get(&server.raw_fd())
+  when Option::Some(state) then
+    match state.writable
+    when Option::Some(t) then t
+    when Option::None then panic("reactor test: Both write slot missing")
+    end
+  when Option::None then panic("reactor test: fd_states entry missing")
+  end
+  match reactor.registrations.get(&primary)
+  when Option::Some(reg) then
+    match reg.interest
+    when Interest::Readable then ()
+    when _ then assert false
+    end
+  when Option::None then assert false
+  end
+
+  # the Both replaced by a read-only: the displaced primary AND its
+  # Both-sibling die — the write slot is cleared, no dangling half
+  let replacement = match reactor.register(server.raw_fd(), 31, Interest::Readable)
+  when Result::Ok(v) then v
+  when Result::Err(_) then panic("reactor test: replacement register failed")
+  end
+  assert !reactor.is_ready(primary)
+  assert !reactor.is_ready(secondary)
+  match reactor.registrations.get(&replacement)
+  when Option::Some(reg) then
+    assert reg.task == 31
+    match reg.interest
+    when Interest::Readable then ()
+    when _ then assert false
+    end
+  when Option::None then assert false
+  end
+  match reactor.fd_states.get(&server.raw_fd())
+  when Option::Some(state) then
+    match state.readable
+    when Option::Some(t) then assert t == replacement
+    when Option::None then assert false
+    end
+    match state.writable
+    when Option::None then ()
+    when Option::Some(_) then assert false
+    end
+  when Option::None then assert false
+  end
+
+  # the displaced task is queued for the executor to wake
+  match reactor.displaced.pop_front()
+  when Option::Some(t) then assert t == 31
+  when Option::None then assert false
+  end
+
+  reactor.close()
+end
 

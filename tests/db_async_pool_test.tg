@@ -1,20 +1,25 @@
 # tests/db_async_pool_test.tg — the REAL blocking pool behind
 # std::db::spawn_blocking (reviewer P0-17): the N bounded worker threads
 # (the thread module's ThreadBuilder), the blocking job queue
-# (Mutex[VecDeque] + Condvar), and the result delivered through the async
-# channel. The closure runs on a WORKER THREAD — never inline on the
-# async executor — and the async side receives the value through the
-# channel wake. The AsyncWrapper round trip (SQLite in-memory through the
-# pool) exercises the synchronized Arc[Mutex[C]] connection state and the
-# AsyncTransaction.
+# (Mutex[VecDeque] + Condvar), and the result delivered through the
+# BlockingFuture (the cell + the wake bridge): the worker publishes the
+# value into the synchronized result cell and enqueues the task's id into
+# the executor's thread-safe external-wake inbox — it never touches the
+# cooperative channel or the executor's scheduler state; the executor
+# thread drains the inbox and wakes the task itself (the single-owner
+# executor design). The AsyncWrapper round trip (SQLite in-memory through
+# the pool) exercises the synchronized Arc[Mutex[C]] connection state and
+# the AsyncTransaction.
 
 use std::core::{Vec, String, Unit, Result, Option}
 use std::test::*
-use std::thread::{Thread}
-use std::db::{spawn_blocking, async_wrap, Sqlite, AsyncConnection, ToSqlParam}
+use std::thread::{Thread, thread_sleep_ms}
+use std::sync::{Arc, Mutex}
+use std::async::{Future, Waker, Context, Poll, TaskState}
+use std::db::{spawn_blocking, async_wrap, Sqlite, AsyncConnection, ToSqlParam, BlockingCell, BlockingFuture, blocking_pool_get, blocking_pool_shutdown}
 
 # The pool executes the closure and the value comes back through the
-# channel.
+# BlockingFuture (the cell + the wake bridge).
 @test
 def test_spawn_blocking_returns_result() -> Unit
   let result = std::async::block_on(async {
@@ -22,6 +27,144 @@ def test_spawn_blocking_returns_result() -> Unit
     v
   })
   assert_eq(result, 42)
+end
+
+# THE CROSS-THREAD DELIVERY (the wake bridge): the task registers its id
+# on the first poll; the worker sleeps PAST that registration and then
+# publishes the value + enqueues the wake — the completion lands as a
+# genuine cross-thread notification: the executor thread drains the
+# external-wake inbox and re-polls the task (a wake the first poll could
+# not have observed). The worker's path touches ONLY the synchronized
+# result cell and the external-wake queue — never the executor's ready
+# queue / task states / cooperative waiters.
+@test
+def test_spawn_blocking_wakes_through_bridge() -> Unit
+  let result = std::async::block_on(async {
+    let v = spawn_blocking(|| {
+      # The sleep guarantees the awaiting task's first poll (the
+      # registration) happened BEFORE the worker completes — the wake
+      # must travel through the external inbox, not the first poll.
+      thread_sleep_ms(25)
+      7
+    }).await
+    v
+  })
+  assert_eq(result, 7)
+end
+
+# THE STRUCTURAL ASSERTION (the worker path = the cell + the wake
+# queue): the pieces are driven directly, WITHOUT the pool — the
+# future's first poll registers the waiter (the task id) into the cell
+# exactly once (later polls never re-register); the worker-side
+# completion is replayed EXACTLY as the pool worker performs it (the
+# value publish + the id read under the cell's lock, then the
+# executor.external_wake enqueue — nothing else); the assertions prove
+# the confinement: the wake sits in the external inbox while the
+# executor's ready queue is untouched, and the task reaches the ready
+# queue ONLY through the executor-thread drain (drain_external_wakes ->
+# the internal wake_task), after which the re-poll takes the published
+# value.
+@test
+def test_blocking_future_worker_path_confined() -> Unit
+  mut exec = std::async::executor_new()
+  let inner = exec.inner.clone()
+  let target_id: UInt = 77
+
+  # The task's scheduler state: Waiting (mid-await) — the state the
+  # internal wake_task consults when the executor-thread drain wakes it.
+  unsafe "register the task into the executor state as spawn does" do
+    let exec_inner = inner.ptr.as_mut()
+    exec_inner.task_states.insert(target_id, TaskState::Waiting)
+  end
+
+  let cell = Arc::new(Mutex::new(BlockingCell[Int] {
+    result: Option::None,
+    task_id: Option::None
+  }))
+  mut future = BlockingFuture[Int] {
+    cell: cell.clone(),
+    executor: inner.clone(),
+    registered: false
+  }
+  let waker = Waker { task_id: target_id, executor: inner.clone() }
+  mut cx = Context { waker: waker }
+
+  # The FIRST poll: the waiter is registered into the cell once and the
+  # future stays Pending.
+  let p1 = future.poll(&mut cx)
+  match p1
+  when Poll::Pending then ()
+  when Poll::Ready(_) then assert_false(true)
+  end
+  assert_true(future.registered)
+  let mut g = cell.lock()
+  match g.get_mut().task_id
+  when Option::Some(t) then assert_eq(t, target_id)
+  when Option::None then assert_false(true)
+  end
+  drop(g)
+
+  # A second poll (an unrelated re-poll) never re-registers the waiter.
+  let p2 = future.poll(&mut cx)
+  match p2
+  when Poll::Pending then ()
+  when Poll::Ready(_) then assert_false(true)
+  end
+
+  # THE WORKER PATH — the ONLY two executor interactions, replayed
+  # exactly as the pool worker runs them: the value publish + the id
+  # read under the cell's lock, then the external-wake enqueue.
+  let mut guard = cell.lock()
+  guard.get_mut().result = Option::Some(9)
+  let task_id = guard.get_mut().task_id
+  drop(guard)
+  match task_id
+  when Option::Some(t) then
+    unsafe "worker confinement — the external inbox only" do
+      let exec_inner = inner.ptr.as_mut()
+      exec_inner.external_wake(t)
+    end
+  when Option::None then assert_false(true)
+  end
+
+  # THE CONFINEMENT ASSERTION: the wake is in the external inbox, and
+  # the worker has NOT touched the scheduler state — the task is not in
+  # the ready queue.
+  let inbox_len = unsafe "read-only check of the external inbox" do
+    let exec_inner = inner.ptr.as_ref()
+    exec_inner.external_wake_queue.lock().len()
+  end
+  assert_eq(inbox_len, 1)
+  let in_queue = unsafe "read-only check of the executor state" do
+    let exec_inner = inner.ptr.as_ref()
+    exec_inner.ready_queue.contains(&target_id)
+  end
+  assert_false(in_queue)
+
+  # THE EXECUTOR-THREAD PATH: the run loop drains the external inbox and
+  # wakes the task through the INTERNAL wake_task — the single owner of
+  # the scheduler state.
+  unsafe "executor-thread drain — the single owner of the scheduler state" do
+    let exec_inner = inner.ptr.as_mut()
+    exec_inner.drain_external_wakes()
+  end
+  let inbox_len_after = unsafe "read-only check of the external inbox" do
+    let exec_inner = inner.ptr.as_ref()
+    exec_inner.external_wake_queue.lock().len()
+  end
+  assert_eq(inbox_len_after, 0)
+  let in_queue_after = unsafe "read-only check of the executor state" do
+    let exec_inner = inner.ptr.as_ref()
+    exec_inner.ready_queue.contains(&target_id)
+  end
+  assert_true(in_queue_after)
+
+  # The woken task re-polls: the cell yields the published value.
+  let p3 = future.poll(&mut cx)
+  match p3
+  when Poll::Ready(v) then assert_eq(v, 9)
+  when Poll::Pending then assert_false(true)
+  end
 end
 
 # The closure runs on a DIFFERENT thread than the caller — the pool
@@ -82,4 +225,38 @@ def test_async_wrapper_sqlite_roundtrip() -> Unit
   when Option::None then
     assert_false(true)
   end
+end
+
+# THE GRACEFUL POOL DRAIN (reviewer item 12): the pool shuts down with
+# most jobs still QUEUED (4 workers, 100 jobs, the bounded queue limit
+# 64) — the worker loop's shutdown check runs AFTER the queue drain, so
+# EVERY queued job executes before the workers exit (the old top-of-loop
+# flag check abandoned the queued work). The joins in
+# blocking_pool_shutdown return only after the drain. THIS TEST MUST RUN
+# LAST IN THE FILE: the pool is shut down here and never re-created
+# (the Once guard).
+@test
+def test_blocking_pool_shutdown_drains_queued_jobs() -> Unit
+  let counter = Arc::new(Mutex::new(0))
+  let pool = assert_ok(blocking_pool_get())
+  let total = 100
+  
+  var i = 0
+  while i < total do
+    let c = counter.clone()
+    pool.execute(move || {
+      let mut g = c.lock()
+      *g = *g + 1
+      drop(g)
+    })
+    i = i + 1
+  end
+  
+  # The shutdown with ~96 jobs still queued: the drain-first worker loop
+  # runs every queued job before the flag exits the workers.
+  blocking_pool_shutdown()
+  
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
 end

@@ -45,6 +45,18 @@ def STEAL_ATTEMPTS() -> Int = 3
 def IDLE_TIMEOUT_MS() -> Int = 100
 def WORKER_LOCAL_QUEUE_CAPACITY() -> Int = 256
 
+# The executor lifecycle state codes (the inner.state field — the single
+# shutdown authority). Running -> Draining -> Stopped is the graceful
+# shutdown (the workers KEEP processing until the queues are empty AND
+# the active count is 0); Running -> Cancelling -> Stopped is
+# shutdown_now (the queued tasks are removed + cancelled, the running
+# tasks complete). The old stop-flag-then-join abandoned queued work;
+# the state machine is the fix.
+def _exec_state_running() -> u32 = 0
+def _exec_state_draining() -> u32 = 1
+def _exec_state_cancelling() -> u32 = 2
+def _exec_state_stopped() -> u32 = 3
+
 # ═══════════════════════════════════════════════════════════════
 # Task Types
 # ═══════════════════════════════════════════════════════════════
@@ -198,9 +210,21 @@ struct ExecutorInner
   # Global queue for tasks without affinity
   global_queue: Arc[Mutex[Queue[Task]]]
   
-  # Shutdown coordination
-  shutdown: Arc[AtomicBool]
-  shutdown_complete: Arc[Condvar]
+  # THE LIFECYCLE STATE MACHINE (the single shutdown authority — the old
+  # stop-flag-then-join abandoned queued work): Running -> Draining ->
+  # Stopped (the graceful shutdown — the workers keep processing until
+  # the queues are empty AND the active count is 0), or Running ->
+  # Cancelling -> Stopped (shutdown_now — the queued tasks are drained
+  # and marked Cancelled). The submit gate panics on every submission
+  # after the Running state.
+  state: Arc[AtomicU32]
+  
+  # The drain quiescence probe: the count of tasks CURRENTLY EXECUTING.
+  # A worker loop (under Draining/Cancelling) exits only when its
+  # find_task scan found no task AND this count is 0 — a running task
+  # may still enqueue work, so an idle worker keeps re-scanning until
+  # the quiescence.
+  active_tasks: AtomicU32
   
   # Task notification
   task_available: Arc[Condvar]
@@ -238,10 +262,9 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
     return Result::Err("Thread count must be at least 1".to_string())
   end
   
-  let shutdown = Arc::new(AtomicBool::new(false))
+  let state = Arc::new(AtomicU32::new(_exec_state_running()))
   let task_available = Arc::new(Condvar::new())
   let global_queue = Arc::new(Mutex::new(Queue::new()))
-  
   var workers: Vec[WorkerState] = Vec::with_capacity(thread_count)
   var i = 0
   while i < thread_count do
@@ -254,8 +277,8 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
       workers: workers,
       threads: Vec::new(),
       global_queue: global_queue,
-      shutdown: shutdown,
-      shutdown_complete: Arc::new(Condvar::new()),
+      state: state,
+      active_tasks: AtomicU32::new(0),
       task_available: task_available,
       total_tasks_submitted: AtomicU32::new(0),
       total_tasks_completed: AtomicU32::new(0),
@@ -300,9 +323,20 @@ def Executor::start_workers(inout self: Executor) -> Unit
 end
 
 ## Worker thread main loop — the worker holds its OWN Arc clone of the
-## executor inner: every read (the queues, the shutdown flag) and every
-## write (its own worker slot, the shared counters) goes through that
-## clone, so the state can never dangle behind a moved Executor.
+## executor inner: every read (the queues, the lifecycle state, the
+## active count) and every write (its own worker slot, the shared
+## counters) goes through that clone, so the state can never dangle
+## behind a moved Executor.
+##
+## THE DRAIN-ORIENTED LOOP: the loop exits ONLY when the lifecycle left
+## Running AND the find_task scan found no task AND the active count is
+## 0. The graceful shutdown (Draining) therefore NEVER abandons queued
+## work: the workers KEEP PROCESSING until the queues are empty and no
+## task is running, then exit (the shutdown's join returns). Under the
+## Cancelling state a task the scan still finds is CANCELLED inline (the
+## shutdown_now drain is the primary remover; the scan is the defense
+## for a task enqueued concurrently with the drain) — it is never
+## executed.
 def worker_loop(executor: Arc[ExecutorInner], worker_id: Int) -> Unit
   unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
     let inner = executor.ptr.as_mut()
@@ -310,16 +344,36 @@ def worker_loop(executor: Arc[ExecutorInner], worker_id: Int) -> Unit
     
     var consecutive_empty = 0
     
-    while !inner.shutdown.load() do
+    while true do
       # Try to get a task
       let task = find_task(executor, worker_id)
       
       match task
       when Option::Some(t) then
         consecutive_empty = 0
-        execute_task(t, executor, worker_id)
+        let st = inner.state.load()
+        if st == _exec_state_cancelling() then
+          # Under Cancelling: a task still found in the queues is
+          # CANCELLED — the terminal ledger transition + the TaskState
+          # signal — never executed (the closure drops with the Task).
+          _cancel_queued_task(inner, t)
+        else
+          execute_task(t, executor, worker_id)
+        end
       when Option::None then
         consecutive_empty = consecutive_empty + 1
+        
+        # THE DRAIN EXIT: the find_task scan found no task anywhere.
+        # The worker exits only when the lifecycle left Running AND no
+        # task is currently executing (a running task may still enqueue
+        # work, so the idle worker keeps re-scanning until the
+        # quiescence). The graceful drain never abandons a queued task:
+        # the workers stop ONLY at the empty-queues + zero-active
+        # quiescent point.
+        let st = inner.state.load()
+        if st != _exec_state_running() && inner.active_tasks.load() == 0 then
+          break
+        end
         
         if consecutive_empty > SPIN_COUNT_BEFORE_YIELD() then
           # Wait for task notification with timeout
@@ -402,9 +456,13 @@ def execute_task(
 ) -> Unit
   # The ledger first — the duplicate-scheduling detection: a task that
   # was already Running, or already left the runnable states
-  # (completed/cancelled/failed), is the internal fatal error.
+  # (completed/cancelled/failed), is the internal fatal error. The
+  # active count is incremented BEFORE the ledger mark so the drain
+  # quiescence probe (the worker exit condition) never sees zero while
+  # this task runs.
   unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
     let inner = executor.ptr.as_mut()
+    inner.active_tasks.fetch_add(1)
     _debug_ledger_running(inner, task.id)
   end
   
@@ -416,7 +474,10 @@ def execute_task(
   task.func.call()
   
   # Update statistics — through the worker's Arc clone (the inner's
-  # total_tasks_completed field is the single authority for the count)
+  # total_tasks_completed field is the single authority for the count).
+  # The active count is decremented AFTER the ledger completion mark so
+  # the quiescence probe never sees zero while the completion bookkeeping
+  # is in flight.
   unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
     let inner = executor.ptr.as_mut()
     inner.workers[worker_id].tasks_completed.fetch_add(1)
@@ -425,6 +486,7 @@ def execute_task(
     # sees the ledger already settled).
     _debug_ledger_completed(inner, task.id)
     inner.total_tasks_completed.fetch_add(1)
+    inner.active_tasks.fetch_sub(1)
   end
   
   # Set task state to completed
@@ -561,6 +623,25 @@ def _debug_ledger_failed(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
   end
 end
 
+## The ledger's live state code for one TaskId (-1 when the id was never
+## registered) — the JoinHandle terminal-resolution probe.
+def _debug_ledger_state_of(inner: PtrMut[ExecutorInner], task_id: u64) -> Int
+  let guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::Some(state) then state
+  when Option::None then -1
+  end
+end
+
+## Cancel a single queued task inline: the terminal ledger transition
+## (Queued -> Cancelled) + the TaskState cancellation signal
+## (TaskState::Cancelled = 4). The task never executes; the closure
+## drops with the Task (the Task parameter is consumed by value).
+def _cancel_queued_task(inner: PtrMut[ExecutorInner], task: Task) -> Unit
+  _debug_ledger_cancelled(inner, task.id)
+  task.state.store(4)  # TaskState::Cancelled
+end
+
 ## The TaskId conservation invariant — every submitted id exists in the
 ## ledger exactly once, sits in exactly one state, and
 ##   submitted == completed + cancelled + failed + still_queued/running
@@ -615,6 +696,15 @@ end
 def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPriority) -> u64
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
+    # THE LIFECYCLE GATE: a submission that arrives after the Running
+    # state is REJECTED (the panic) — the Draining/Cancelling states
+    # accept no new work (the graceful drain runs only the work queued
+    # before the transition; the Cancelling drain removes the rest). The
+    # rejection happens BEFORE any TaskId is allocated or the ledger is
+    # touched.
+    if inner.state.load() != _exec_state_running() then
+      panic("executor is shutting down: submit rejected")
+    end
     let task_id = inner.next_task_id.fetch_add(1) as u64
     
     let task = Task {
@@ -675,6 +765,14 @@ end
 
 ## Submit a task that returns a value
 def Executor::submit_with_result[T: Transferable](self: Executor, func: fn() -> T, priority: TaskPriority) -> JoinHandle[T]
+  # THE LIFECYCLE GATE — the same rejection contract as submit: no new
+  # work after the Running state.
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    if inner.state.load() != _exec_state_running() then
+      panic("executor is shutting down: submit rejected")
+    end
+  end
   let task_id = unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
     inner.next_task_id.fetch_add(1) as u64
@@ -733,10 +831,29 @@ end
 
 impl[T] JoinHandle[T]
   ## Wait for the task to complete and return the result
+  ##
+  ## THE TERMINAL RESOLUTION: under shutdown_now a queued task is
+  ## cancelled BEFORE it can run — the result cell is never published,
+  ## so the join polls the ledger: a task whose ledger state is
+  ## Cancelled (or Failed) resolves to None. The same terminal
+  ## resolution applies when the executor reached the Stopped state
+  ## without the task completing (a task stranded by a submission that
+  ## raced the drain). The wait is bounded (the 5ms ledger recheck) —
+  ## every JoinHandle reaches the terminal state under either shutdown.
   def join(self: JoinHandle[T]) -> Option[T]
     var guard = self.result.lock()
     while guard.is_none() do
-      guard = self.completed.wait(guard)
+      unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
+        let inner = self.executor.ptr.as_mut()
+        let st = _debug_ledger_state_of(inner, self.task_id)
+        if st == _debug_state_cancelled() then
+          return Option::None
+        end
+        if inner.state.load() == _exec_state_stopped() && st != _debug_state_completed() && st != _debug_state_running() then
+          return Option::None
+        end
+      end
+      guard = self.completed.wait_timeout(guard, Duration::from_millis(5))
     end
     guard.take()
   end
@@ -767,13 +884,25 @@ end
 # Shutdown
 # ═══════════════════════════════════════════════════════════════
 
-## Shutdown the executor gracefully
+## Shutdown the executor gracefully — the Running -> Draining -> Stopped
+## state machine. The transition is a SINGLE compare-and-swap: a
+## concurrent second shutdown (or shutdown_now) loses the transition and
+## returns immediately (the winner joins the threads). Under Draining the
+## workers KEEP PROCESSING — the worker loop exits only when the queues
+## are empty AND the active count is 0 (every queued task runs — the
+## graceful drain, never a stop-flag abandon) — then the workers are
+## joined, the state reaches Stopped, and the TaskId conservation
+## invariant is checked at the quiescence (a violation is the internal
+## fatal error).
 def Executor::shutdown(inout self: Executor) -> Unit
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
-    inner.shutdown.store(true)
+    let old = inner.state.compare_and_swap(_exec_state_running(), _exec_state_draining())
+    if old != _exec_state_running() then
+      return
+    end
     
-    # Wake all workers
+    # Wake all workers — they drain the queues to the quiescent point.
     inner.task_available.notify_all()
     
     # Wait for all threads to complete (the join is on the JoinHandle,
@@ -783,6 +912,7 @@ def Executor::shutdown(inout self: Executor) -> Unit
     end
     
     inner.threads.clear()
+    inner.state.store(_exec_state_stopped())
     
     # The quiescent point: every worker has joined and no queue is being
     # drained — the TaskId conservation invariant must hold. A violation
@@ -793,34 +923,70 @@ def Executor::shutdown(inout self: Executor) -> Unit
   end
 end
 
-## Shutdown immediately (may leave tasks incomplete)
+## Shutdown the executor immediately — the Running -> Cancelling ->
+## Stopped state machine. The single CAS transition (a concurrent second
+## shutdown loses and returns). The Cancelling state: the submit gate
+## rejects every new submission; ALL queued tasks are removed from every
+## queue (the global queue + each worker's local queue) and marked
+## Cancelled in the ledger (the terminal transition — the closures drop
+## with the Tasks); the running tasks — non-cooperative closures that
+## cannot observe a mid-run cancellation signal — run to completion, and
+## every JoinHandle reaches the terminal state under either shutdown
+## (the join resolves a Cancelled task to None — see JoinHandle::join).
+## The old stub comment ("we'd have cancellation support") is gone: the
+## cancellation IS the ledger mark + the TaskState signal + the join's
+## terminal resolution.
 def Executor::shutdown_now(inout self: Executor) -> Unit
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
-    inner.shutdown.store(true)
-    
-    # Wake all workers
-    inner.task_available.notify_all()
-    
-    # Give threads a short time to finish current tasks
-    let timeout = Duration::from_millis(100)
-    let start = Instant::now()
-    
-    while start.elapsed() < timeout do
-      let all_inactive = true
-      for worker in inner.workers do
-        if worker.is_active.load() then
-          all_inactive = false
-          break
-        end
-      end
-      
-      if all_inactive then break end
-      std::thread::sleep_ms(10)
+    let old = inner.state.compare_and_swap(_exec_state_running(), _exec_state_cancelling())
+    if old != _exec_state_running() then
+      return
     end
     
-    # Force terminate any remaining threads
-    # (In a real implementation, we'd have cancellation support)
+    # REMOVE ALL QUEUED TASKS + MARK THEM CANCELLED (the ledger): the
+    # global queue first, then every worker's local queue. The tasks in
+    # a worker's hand (popped before the transition) are not queued —
+    # they run to completion.
+    var gguard = inner.global_queue.lock()
+    loop do
+      match gguard.dequeue()
+      when Option::Some(t) then _cancel_queued_task(inner, t)
+      when Option::None then break
+      end
+    end
+    drop(gguard)
+    
+    var w = 0
+    while w < inner.workers.len() do
+      loop do
+        match inner.workers[w].local_queue.pop()
+        when Option::Some(t) then _cancel_queued_task(inner, t)
+        when Option::None then break
+        end
+      end
+      w = w + 1
+    end
+    
+    # Wake all workers: they exit at the quiescent point (the queues
+    # empty + the active count 0 — the running tasks complete first); a
+    # task still found in the queues under Cancelling is cancelled
+    # inline by the worker (the drain's concurrent-submit defense).
+    inner.task_available.notify_all()
+    
+    for handle in inner.threads do
+      let _ = handle.join()
+    end
+    
+    inner.threads.clear()
+    inner.state.store(_exec_state_stopped())
+    
+    # The quiescent point: every task is terminal — Completed (the
+    # running tasks) or Cancelled (the drained queue) — the conservation
+    # invariant holds.
+    if !_debug_check_task_conservation(inner) then
+      panic("exec conservation violation: submitted != completed + cancelled + failed + still_queued/running")
+    end
   end
 end
 
@@ -1298,11 +1464,11 @@ impl Drop for Executor
     # hold their own Arc clones (count >= 2 while they run), and the
     # convenience functions build transient wrappers around
     # global_executor() — neither may tear the shared executor down. The
-    # worker threads exit when the shutdown flag is set; the inner
-    # allocation releases when the last Arc clone drops.
+    # worker threads exit when the lifecycle leaves the Running state;
+    # the inner allocation releases when the last Arc clone drops.
     if self.inner.strong_count() == 1 then
       let inner = self.inner.ptr.as_ref()
-      if !inner.shutdown.load() then
+      if inner.state.load() == _exec_state_running() then
         self.shutdown()
       end
     end

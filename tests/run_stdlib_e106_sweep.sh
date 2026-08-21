@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # tests/run_stdlib_e106_sweep.sh
 #
-# E106 migration sweep — the stdlib parse-clean gate behind
-# docs/current/stdlib_reference.md "Completeness Status".
+# E106 migration sweep — the whole-semantic std sweep, the REQUIRED gate
+# (reviewer item 16) behind docs/current/stdlib_reference.md "Completeness
+# Status".
 #
 # Every shipped std module (std/*.tg, currently 133 files) must:
-#   1. PASS `tg check` — zero parse/type diagnostics (an E106/E100/E1100
-#      diagnostic or any syntax error fails the module). This is the
-#      compiler's own gate: `&T` in a general type position, legacy
-#      parameter spellings, and malformed tokens are hard errors.
+#   1. PASS `tg check` — the driver's check command (driver.tg cmd_check,
+#      stop_after = StopAfter::Mir) runs the FULL semantic pipeline per
+#      module: lex/parse, the imported-dependency merge, the @cfg target
+#      elimination, macro expansion (E105/E107 hard stops), name
+#      resolution, the strict type check, the access check, the resource
+#      check, MIR lowering, and the post-lower MIR verification (the
+#      unconditional verify_mir after lowering) — stopping before
+#      monomorphization and codegen. No extra flags are needed for the
+#      full pipeline: the MIR verification `tg check` reaches is the
+#      unconditional post-lower one, and the mode-gated post-mono /
+#      post-opt verifies are unreachable (check never monomorphizes).
+#      Zero diagnostics (an E106/E100/E1100 diagnostic or any syntax
+#      error) fails the module. This is the compiler's own gate: `&T` in
+#      a general type position, legacy parameter spellings, and malformed
+#      tokens are hard errors.
 #   2. PASS the grep backstop — the check can tolerate a syntax through a
 #      gap (a counterexample class that happens to lex/parse as junk, e.g.
 #      angle-bracket `Option<&T>` generic forms or `+ 'static` lifetime
@@ -56,9 +68,13 @@ fi
 
 mkdir -p "$SCRATCH"
 
-# Every shipped std module. std/*.tg is the complete enumeration — there is
-# no separate kernel list: the kernel closure (bootstrap/compiler_kernel.
-# manifest) is a subset of this set, and the sweep covers all 133 files.
+# Every shipped std module. The std/*.tg glob is the complete enumeration
+# — there is no separate kernel list: the kernel closure (the `std:`
+# entries of bootstrap/compiler_kernel.manifest — currently 14 modules) is
+# a strict subset of the swept set, so kernel-closure and non-kernel
+# modules alike are swept by the same list. The enumeration is kept
+# manifest-derived below: every manifest `std:` entry must resolve to a
+# swept std/*.tg module, so the closure cannot drift out of the sweep.
 ALL_MODULES=""
 for file in "$ROOT"/std/*.tg; do
   [ -f "$file" ] || continue
@@ -68,6 +84,39 @@ done
 
 failures=0
 checked=0
+
+# Manifest-derived enumeration cross-check: every `std:` entry of the
+# kernel manifest must exist in std/ and be inside the swept set. The
+# kernel closure is covered because it is a subset of std/*.tg; a
+# manifest module the glob cannot see fails the sweep up front.
+KERNEL_MANIFEST="$ROOT/bootstrap/compiler_kernel.manifest"
+kernel_count=0
+if [ -f "$KERNEL_MANIFEST" ]; then
+  kernel_std="$(awk '$1 == "std:" { print $2 }' "$KERNEL_MANIFEST")"
+  for rel in $kernel_std; do
+    kernel_count=$((kernel_count + 1))
+    if [ ! -f "$ROOT/std/$rel" ]; then
+      bh_err "e106 sweep: kernel-closure std module file missing: std/$rel (manifest $KERNEL_MANIFEST)"
+      failures=$((failures + 1))
+      continue
+    fi
+    mod="${rel%.tg}"
+    case " $ALL_MODULES " in
+      *" $mod "*)
+        ;;
+      *)
+        bh_err "e106 sweep: kernel-closure std module outside the swept std/*.tg set: std/$rel"
+        failures=$((failures + 1))
+        ;;
+    esac
+  done
+  if [ "$failures" -eq 0 ]; then
+    bh_log "e106 sweep: kernel-closure cross-check OK: $kernel_count manifest std module(s) all swept"
+  fi
+else
+  bh_err "e106 sweep: kernel manifest missing: $KERNEL_MANIFEST"
+  failures=$((failures + 1))
+fi
 
 # Strip string literals and comments from a module so the backstop greps
 # only real code: char literals (including `'"'` and `'\''`), double-quoted
@@ -157,8 +206,11 @@ for mod in $ALL_MODULES; do
     continue
   fi
 
-  # 1. The compiler gate: parse/check must succeed with zero diagnostics
-  #    (E106/E100/E1100 and any other error fail the compile).
+  # 1. The compiler gate: the FULL semantic pipeline (`tg check` —
+  #    parse + resolve + typecheck + access/resource + MIR verify) must
+  #    succeed with zero diagnostics (E106/E100/E1100 and any other error
+  #    fail the compile).
+  bh_log "e106 sweep: checking std/$mod.tg"
   if ! "$COMPILER" check "$file" >"$SCRATCH/$mod.out" 2>&1; then
     bh_err "e106 sweep FAILED: std/$mod.tg did not check clean:"
     bh_err "  $(head -n3 "$SCRATCH/$mod.out" | tr '\n' ' ')"
@@ -238,8 +290,8 @@ for mod in $ALL_MODULES; do
 done
 
 if [ "$failures" -ne 0 ]; then
-  bh_err "stdlib E106 sweep FAILED: $failures problem(s), $checked modules verified clean"
+  bh_err "stdlib E106 sweep FAILED: $failures problem(s), $checked modules passed the full semantic pipeline"
   exit 1
 fi
-bh_log "stdlib E106 sweep OK: all $checked shipped std modules parse clean and pass the forbidden-syntax grep backstop"
+bh_log "stdlib E106 sweep OK: all $checked shipped std modules pass the full semantic pipeline (tg check) and the forbidden-syntax grep backstop"
 exit 0

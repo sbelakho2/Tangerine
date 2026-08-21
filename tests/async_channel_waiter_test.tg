@@ -1,0 +1,230 @@
+# tests/async_channel_waiter_test.tg — the async channel's waiter
+# lifecycle and endpoint lifecycle (reviewer items 7-8):
+#
+# THE WAITER LIFECYCLE: the SendFuture/RecvFuture register ONCE — the
+# waiter_id comes from the executor's next_waiter_id allocator (the
+# SendWaiterId/RecvWaiterId) and the repeated polls never append
+# duplicates (the waiter_id guard); the future's Drop unregisters its
+# exact entry by the id. The channel CLOSURE (the explicit Sender::close
+# or the last sender's Drop) is atomic: it marks the channel closed and
+# detaches+wakes BOTH waiter sets — a SendFuture blocked full wakes on
+# the close and fails the send on its re-poll.
+#
+# THE ENDPOINT LIFECYCLE: the sender count lives in the inner (the
+# Sender's Clone registers, each Drop decrements); the LAST sender
+# closes the send side — the receiver drains the buffer, then observes
+# the closed state. The Receiver's Drop marks the receive side gone —
+# future sends fail and blocked senders wake.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::async::{Future, Waker, Context, Poll}
+
+# (a) The duplicate-poll no-op: two polls of the SAME full-send future
+# register ONE waiter (the second poll never appends a duplicate); the
+# registered entry carries the future's waiter id; the future's Drop
+# unregisters the exact entry.
+@test
+def test_channel_send_future_duplicate_poll_registers_once() -> Unit
+  mut exec = std::async::executor_new()
+  let (tx, rx) = std::async::channel(1)
+  let waker = Waker { task_id: 101, executor: exec.inner.clone() }
+  let mut cx = Context { waker: waker }
+
+  # fill the buffer
+  let mut first = tx.send(1)
+  match first.poll(&mut cx)
+  when Poll::Ready(r) then
+    match r
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+
+  # the buffer is full: the second future polls Pending twice — the
+  # registration happens ONCE, the second poll appends nothing
+  let mut full = tx.send(2)
+  match full.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 1)
+  match full.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 1)
+
+  # the registered entry carries the future's waiter id (from the
+  # executor's next_waiter_id allocator)
+  match full.waiter_id
+  when Option::Some(id) then
+    assert_eq(id, tx.inner.ptr.as_ref().send_waiters[0].id)
+  when Option::None then assert_false(true)
+  end
+
+  # the future's Drop unregisters: the exact entry is removed by the id
+  drop(full)
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 0)
+end
+
+# (a-drain) The drain wakes the OLDEST blocked sender (the FIFO
+# remove(0)); the younger sender stays registered and its own Drop
+# removes its entry.
+@test
+def test_channel_drain_wakes_oldest_blocked_sender() -> Unit
+  mut exec = std::async::executor_new()
+  let (tx, rx) = std::async::channel(1)
+  let waker = Waker { task_id: 102, executor: exec.inner.clone() }
+  let mut cx = Context { waker: waker }
+
+  let mut first = tx.send(1)
+  match first.poll(&mut cx)
+  when Poll::Ready(r) then
+    match r
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+
+  let mut fut1 = tx.send(2)
+  let mut fut2 = tx.send(3)
+  match fut1.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  match fut2.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 2)
+
+  # the drain pops the item and wakes the OLDEST blocked sender
+  let mut recv_fut = rx.recv()
+  match recv_fut.poll(&mut cx)
+  when Poll::Ready(opt) then
+    match opt
+    when Option::Some(v) then assert_eq(v, 1)
+    when Option::None then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 1)
+
+  # the woken sender re-polls: the buffer has room — the send completes
+  match fut1.poll(&mut cx)
+  when Poll::Ready(r) then
+    match r
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+  when Poll::Pending then assert_false(true)
+  end
+  # the SECOND sender stays registered (its entry was not popped)
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 1)
+  match fut2.poll(&mut cx)
+  when Poll::Pending then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 1)
+  # fut2's Drop removes its own entry
+  drop(fut2)
+  assert_eq(tx.inner.ptr.as_ref().send_waiters.len(), 0)
+end
+
+# (b) The close wakes the blocked senders: the sender registers on the
+# full buffer, the closer (after a sleep that guarantees the
+# registration) closes the channel — the blocked sender wakes, re-polls
+# and fails the send with "channel closed".
+@test
+def test_channel_close_wakes_blocked_senders() -> Unit
+  let mut results = Vec::new()
+  std::async::block_on(async {
+    let (tx, rx) = std::async::channel(1)
+    let _ = tx.send(1).await
+    let tx2 = tx.clone()
+    let h = std::async::spawn(async {
+      match tx2.send(2).await
+      when Result::Err(e) then results.push(e)
+      when Result::Ok(_) then results.push("sent".to_string())
+      end
+    })
+    let closer = std::async::spawn(async {
+      std::async::sleep_millis(1).await
+      tx.close()
+    })
+    let _ = h.await
+    let _ = closer.await
+  })
+  assert_eq(results.len(), 1)
+  let got = results.remove(0)
+  assert_eq(got, "channel closed")
+end
+
+# (b-endpoint) The last sender's Drop closes the send side: the
+# receiver drains the buffered item, then observes the closed state.
+@test
+def test_channel_last_sender_drop_closes_send_side() -> Unit
+  let mut received = Vec::new()
+  std::async::block_on(async {
+    let (tx, rx) = std::async::channel(1)
+    let _ = tx.send(7).await
+    drop(tx)
+    loop do
+      match rx.recv().await
+      when Option::Some(v) then received.push(v)
+      when Option::None then break
+      end
+    end
+  })
+  assert_eq(received.len(), 1)
+  assert_eq(received[0], 7)
+end
+
+# (b-receiver-gone) The Receiver's Drop marks the receive side gone: a
+# send — even with buffer room — fails.
+@test
+def test_channel_receiver_dropped_sends_fail() -> Unit
+  let mut results = Vec::new()
+  std::async::block_on(async {
+    let (tx, rx) = std::async::channel(1)
+    let _ = tx.send(1).await
+    drop(rx)
+    match tx.send(2).await
+    when Result::Err(e) then results.push(e)
+    when Result::Ok(_) then results.push("sent".to_string())
+    end
+  })
+  assert_eq(results.len(), 1)
+  let got = results.remove(0)
+  assert_eq(got, "receiver dropped")
+end
+
+# (b-receiver-wake) The Receiver's Drop wakes the blocked full senders:
+# the parked sender wakes, re-polls and fails the send.
+@test
+def test_channel_receiver_dropped_wakes_blocked_senders() -> Unit
+  let mut results = Vec::new()
+  std::async::block_on(async {
+    let (tx, rx) = std::async::channel(1)
+    let _ = tx.send(1).await
+    let tx2 = tx.clone()
+    let h = std::async::spawn(async {
+      match tx2.send(2).await
+      when Result::Err(e) then results.push(e)
+      when Result::Ok(_) then results.push("sent".to_string())
+      end
+    })
+    let dropper = std::async::spawn(async {
+      std::async::sleep_millis(1).await
+      drop(rx)
+    })
+    let _ = h.await
+    let _ = dropper.await
+  })
+  assert_eq(results.len(), 1)
+  let got = results.remove(0)
+  assert_eq(got, "receiver dropped")
+end

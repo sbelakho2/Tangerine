@@ -317,13 +317,19 @@ end
 ## it can never be woken by this call (the notifier stores only on the
 ## detached set it already holds, never re-scans the queue).
 ##
-## TIMEOUT: wait_timeout_ex cancels its registration at the deadline by
-## removing its own entry (matched by id) under the queue lock; if the
-## entry is already gone, a notify detached it and the final notified
-## recheck decides woken vs timed-out. A notifier that detached a
-## timed-out waiter's entry still holds the Arc: its notified store
-## lands on the still-alive state and is a harmless no-op for the
-## returned waiter.
+## TIMEOUT — THE DETACH-WINS CONTRACT: wait_timeout_ex cancels its
+## registration at the deadline by removing its own entry (matched by id)
+## under the queue lock. THE CANCEL'S SUCCESS IS THE ARBITRATION: a cancel
+## that finds its own entry still registered removes it and the timeout
+## result stands (the timeout linearized before the notifier's detach); a
+## cancel that cannot find the id was BEATEN by the notifier — the notify
+## detached this waiter (the ownership handoff) and the NOTIFIER WON: the
+## timeout result is overruled, and the final recheck waits for the
+## notified publication (the delayed flag store is merely the
+## PUBLICATION, never the arbitration — the notifier's store lands on the
+## still-alive Arc the notifier holds, and the waiter's recheck sees it
+## because the notifier won). A waiter whose deadline expires AFTER the
+## detach therefore reports the NOTIFICATION, not the timeout.
 ##
 ## THE TEST-INJECTION BARRIER (the deterministic race tests): CondvarInner
 ## carries the test-barrier fields (test_frozen + test_barrier). Both
@@ -378,9 +384,12 @@ def condvar_register(inner: Ptr[CondvarInner]) -> Arc[WaiterState]
 end
 
 ## Cancel a timed-out waiter's registration: remove its OWN entry (the
-## id match) under the queue lock. Returns true when the entry was still
-## registered (the timeout result stands); false when a notify already
-## detached it (the notified recheck decides the outcome).
+## id match) under the queue lock. THE DETACH-WINS ARBITRATION: returns
+## true when the entry was still registered (the cancel removed it — the
+## timeout linearized first, the timeout result stands); returns false
+## when a notify already detached it (the notifier won the ownership
+## handoff — the waiter's final recheck waits for the notified
+## publication, and the outcome is woken, never the timeout).
 def condvar_cancel(inner: Ptr[CondvarInner], waiter: Arc[WaiterState]) -> Bool
   let my_id = waiter.ptr.as_ref().id
   let mut guard = inner.queue.lock()
@@ -433,6 +442,15 @@ end
 ## The timed wait with the explicit outcome: (guard, true) when the
 ## deadline expired first (the registration was cancelled), (guard,
 ## false) when the notify won.
+##
+## THE CANCEL-THEN-FINAL-RECHECK (aligned with the detach-wins
+## contract): the outcome is decided by the CANCEL'S SUCCESS — the
+## cancel removed its own entry (the timeout won) OR the cancel could
+## not find the id (the notifier's detach won — the ownership handoff).
+## After a FAILED cancel the final recheck waits for the notified
+## publication (the notifier's store — delayed behind the test barrier or
+## not): the contract guarantees the recheck SEES the publication when
+## the notifier won, and the waiter reports woken — never the timeout.
 def Condvar::wait_timeout_ex[T](self: Condvar, guard: MutexGuard[T], timeout: Duration) -> (MutexGuard[T], Bool)
   let start = Instant::now()
   let inner = self.inner.ptr.as_ref()
@@ -452,12 +470,21 @@ def Condvar::wait_timeout_ex[T](self: Condvar, guard: MutexGuard[T], timeout: Du
   end
   if timed_out then
     # Cancel the registration on the timeout (the own entry matched by
-    # id). Already detached = a notify took it: the final recheck of the
-    # own flag decides woken vs timed-out (the notifier's store may
-    # still be pending behind the test barrier — the Arc keeps the
-    # state alive).
-    if !condvar_cancel(inner, waiter) && waiter.ptr.as_ref().notified.load() then
+    # id). THE DETACH-WINS ARBITRATION: a cancel that removed its own
+    # entry keeps the timeout result (the timeout linearized before the
+    # notifier's detach); a cancel that cannot find the id means the
+    # notifier ALREADY detached this waiter — the notifier won — and the
+    # timeout result is overruled REGARDLESS of whether the notified
+    # store has landed yet (the delayed store is merely the publication,
+    # never the arbitration). The final recheck then waits for the
+    # publication before the woken return (the notifier's store is
+    # guaranteed to land — the detach happened, the store follows; the
+    # test barrier is always released by the test).
+    if !condvar_cancel(inner, waiter) then
       timed_out = false
+      while !waiter.ptr.as_ref().notified.load() do
+        std::thread::yield_now()
+      end
     end
   end
   let mutex = Mutex { inner: inner_arc }
