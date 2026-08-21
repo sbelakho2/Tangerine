@@ -15,7 +15,7 @@
 
 use std::ctx
 use std::gfx_errors::{Error, ErrorCode, SyncError}
-use std::core::{Option, Result, panic}
+use std::core::{Option, Result, panic, AffineHandle}
 use std::collections::{Vec}
 use std::alloc::{alloc, dealloc, Box}
 use std::time::{TimeSpec}
@@ -39,36 +39,35 @@ use std::sync::{Mutex, RwLock, Arc}
 # never touches it.
 mut __tg_spawn_fail_create: Bool = false
 
+# Fault-injection hook for the join-failure (detach-path) tests: when
+# true, pthread_join reports EINVAL (22) without invoking the libc
+# function, so the failure path — the detach, the worker's continued
+# ownership of the shared result cell — is exercised deterministically on
+# every platform (no racing with a real join error). Test-only; defaults
+# to false, and a normal build never touches it.
+mut __tg_join_fail: Bool = false
+
 type Condvar = std::sync::Condvar
 
 # ———————————————————————————————————————————————————————————————
-# Thread Safety Markers
+# Thread Safety Markers — REMOVED (concurrency properties)
 # ———————————————————————————————————————————————————————————————
-
-# Marker trait: type can be safely sent between threads
-trait Send {}
-
-# Marker trait: type can be safely shared between threads (via &T)
-trait Sync {}
-
-# All primitive types implement Send + Sync
-impl Send for Int {}
-impl Send for UInt {}
-impl Send for Bool {}
-impl Send for Float {}
-impl Send for Char {}
-impl Send for u8 {}
-impl Send for i64 {}
-impl Send for u64 {}
-
-impl Sync for Int {}
-impl Sync for UInt {}
-impl Sync for Bool {}
-impl Sync for Float {}
-impl Sync for Char {}
-impl Sync for u8 {}
-impl Sync for i64 {}
-impl Sync for u64 {}
+# The old `trait Send {}` / `trait Sync {}` markers and their impls are
+# DELETED: Transferable / Shareable are COMPILER-DERIVED properties (the
+# transferable walk / the shareable walk in tg_compiler/types.tg — the
+# single authority). The derived rules apply here as follows:
+#   - Thread / JoinHandle / ThreadLocal hold the EXECUTION-CONTEXT-AFFINE
+#     native handle (PthreadT / PthreadKeyT carry the AffineHandle mark) —
+#     NOT Transferable/Shareable (no explicit opt-in; the conservative
+#     default). A thread handle must not move into another execution
+#     context.
+#   - Barrier / AtomicInt / AtomicBool / Once / the channel endpoints are
+#     structurally Transferable (the scalar/atomic layers) and Shareable
+#     (the synchronized representations — atomics, the Arc of the channel
+#     inner).
+# The pthread synchronization objects (mutex/condvar/barrier) are NOT
+# marked affine: they are the shared representations — designed for
+# cross-thread use.
 
 # ———————————————————————————————————————————————————————————————
 # POSIX Threads API (extern)
@@ -138,11 +137,13 @@ impl Sync for u64 {}
 # Barrier, the channel) all live here.
 @cfg(target_os = "linux")
 struct PthreadT
+  affine: AffineHandle   # the execution-context-affine native handle mark
   opaque: [u8; 8]
 end
 
 @cfg(target_os = "macos")
 struct PthreadT
+  affine: AffineHandle   # the execution-context-affine native handle mark
   opaque: [u8; 8]
 end
 
@@ -193,11 +194,13 @@ end
 # unsigned long on macOS (64-bit).
 @cfg(target_os = "linux")
 struct PthreadKeyT
+  affine: AffineHandle   # the execution-context-affine native handle mark
   key: u32
 end
 
 @cfg(target_os = "macos")
 struct PthreadKeyT
+  affine: AffineHandle   # the execution-context-affine native handle mark
   key: UInt
 end
 
@@ -246,8 +249,65 @@ end
 
 struct JoinHandle[T]
   thread: Thread
-  result_ptr: Ptr[T]
+  # THE SHARED RESULT CELL (result-cell design): the handle's OWN Arc clone
+  # of the one heap-stable storage the worker writes into. There is NO
+  # naked separately allocated T* here — the last owner's Arc release
+  # disposes the storage and the result value.
+  cell: ThreadResultCell[T]
   joined: Bool
+end
+
+# ———————————————————————————————————————————————————————————————
+# The ThreadResultCell — the shared thread-result storage
+# ———————————————————————————————————————————————————————————————
+#
+# THE TWO-SIDED SHARED CELL (result-cell design): the thread's result lives
+# in ONE heap-stable storage — ThreadResultCell[T] { inner:
+# Arc[ThreadResultInner[T]] } — the same heap-stable Arc shape the
+# channel's Arc[ChannelInner] uses. The WORKER's run frame and the
+# JoinHandle each hold their own Arc clone of the cell:
+#
+#   - the worker WRITES the result into the cell's take-once slot (the
+#     Mutex[Option[T]]) and its clone is released when its run frame
+#     ends — the worker remains an owner of the storage UNTIL ITS
+#     TERMINATION. On the pthread_join-FAILURE (detach) path the handle
+#     never touches the cell: the worker's clone keeps it alive, and the
+#     LAST owner's release (the worker's clone at its exit, or the
+#     handle's clone at its drop) disposes the storage AND runs the
+#     result value's destructor through the Arc's last-releaser
+#     drop_in_place glue — the result can never be orphaned;
+#   - the handle TAKES the result out exactly once: the Option slot is
+#     emptied by the take (the transfer is exactly-once; a second take
+#     yields None).
+#
+# THE STATE ENUM (the future support): the minimal statuses NOW are
+# Pending (the worker has not yet published) and Ready (the worker
+# published into the slot). The RESERVED extensions — documented, not
+# yet produced by any path — are Panicked (a future unwind-capable
+# worker's panic status; with the current process-abort panic policy a
+# panicking closure aborts the process before it could publish),
+# Cancelled (a future handle-side pthread_cancel landing), TimedOut (a
+# future join_timeout that left the worker running), and Taken (the
+# exactly-once transfer consumed the slot — the Option's take is the
+# CURRENT implementation of that transfer; the status can surface it to
+# join's diagnostics).
+enum ThreadResultStatus
+  Pending
+  Ready
+  Panicked
+  Cancelled
+  TimedOut
+  Taken
+end
+
+struct ThreadResultCell[T]
+  inner: Arc[ThreadResultInner[T]]
+end
+
+struct ThreadResultInner[T]
+  value: Mutex[Option[T]]   # the take-once slot — the Option IS the
+                            # exactly-once transfer
+  status: AtomicInt         # the current ThreadResultStatus
 end
 
 struct ThreadBuilder
@@ -274,38 +334,56 @@ impl ThreadBuilder
   end
   
   def spawn[F, T](self: ThreadBuilder, f: F) -> Result[JoinHandle[T], String]
-    where F: FnOnce() -> T + Send, T: Send
+    where F: FnOnce() -> T + Transferable, T: Transferable
   
-    # Allocate closure and result on heap
+    # Allocate closure on heap
     let closure_ptr = alloc[F]()
     if closure_ptr.is_null() then
       return Result::Err("spawn: failed to allocate closure")
     end
     closure_ptr.write(f)
     
-    let result_ptr = alloc[T]()
-    if result_ptr.is_null() then
+    # THE SHARED RESULT CELL: ONE heap-stable storage, TWO Arc clones —
+    # the worker's (placed below, moved into its run frame) and the
+    # handle's (returned below). The old naked separately allocated T*
+    # (result_ptr) is GONE: no path can orphan the result allocation —
+    # the worker's clone keeps the cell alive until the worker
+    # terminates, and the LAST owner's release disposes the storage.
+    let cell = ThreadResultCell[T]::new()
+    
+    # The worker's clone — PLACED in its own allocation (the context
+    # carries a type-erased pointer to it, the same shape as the closure
+    # allocation): the worker reads it out at startup, so the context
+    # itself never owns a cell value and frees raw.
+    let cell_ptr = alloc[ThreadResultCell[T]]()
+    if cell_ptr.is_null() then
       # The closure F is already PLACED in closure_ptr: run its drop glue
       # (the captured destructors fire exactly once — the same
       # drop_in_place machinery the Arc uses) BEFORE releasing the
-      # storage; a bare dealloc would leak the captured resources.
+      # storage; a bare dealloc would leak the captured resources. The
+      # local `cell` is the ONLY owner: its scope-end drop releases the
+      # shared storage.
       closure_ptr.drop_in_place()
       dealloc(closure_ptr)
-      return Result::Err("spawn: failed to allocate result")
+      return Result::Err("spawn: failed to allocate result cell")
     end
+    cell_ptr.write(cell.clone())
     
     # Create thread-safe wrapper context
     let ctx = ThreadContext {
       closure: closure_ptr as Ptr[u8],
-      result: result_ptr as Ptr[u8],
+      cell: cell_ptr as Ptr[u8],
       run: thread_run_wrapper
     }
     let ctx_ptr = alloc[ThreadContext]()
     if ctx_ptr.is_null() then
       closure_ptr.drop_in_place()
       dealloc(closure_ptr)
-      # T was never written into result_ptr: raw dealloc, no drop glue.
-      dealloc(result_ptr)
+      # The PLACED worker clone is a real owner: run its Arc release glue
+      # BEFORE freeing its storage; the local `cell` keeps the shared
+      # storage alive either way.
+      (cell_ptr as Ptr[ThreadResultCell[T]]).drop_in_place()
+      dealloc(cell_ptr)
       return Result::Err("spawn: failed to allocate thread context")
     end
     ctx_ptr.write(ctx)
@@ -321,7 +399,7 @@ impl ThreadBuilder
     end
     
     # Create thread
-    mut handle = PthreadT { opaque: [0; 8] }
+    mut handle = PthreadT { affine: AffineHandle {}, opaque: [0; 8] }
     mut ret: i32 = 0
     if __tg_spawn_fail_create then
       # The deterministic injected failure (EAGAIN) — see the flag's
@@ -339,19 +417,21 @@ impl ThreadBuilder
     if ret != 0 then
       # The closure is still OWNED by the block: run its drop glue before
       # freeing the storage (the captured destructors fire exactly once) —
-      # a bare dealloc would bypass them. result_ptr holds no T (never
-      # written) and ThreadContext is the {Ptr, Ptr, fn} trio (no owned
-      # values), so those free raw.
+      # a bare dealloc would bypass them. The PLACED worker clone is a
+      # real owner: run its Arc release glue the same way (the local
+      # `cell` keeps the shared storage alive). ThreadContext is the
+      # {Ptr, Ptr, fn} trio (no owned values), so it frees raw.
       closure_ptr.drop_in_place()
       dealloc(closure_ptr)
-      dealloc(result_ptr)
+      (cell_ptr as Ptr[ThreadResultCell[T]]).drop_in_place()
+      dealloc(cell_ptr)
       dealloc(ctx_ptr)
       return Result::Err("Failed to create thread".to_string())
     end
     
     Result::Ok(JoinHandle {
       thread: Thread { handle: handle, name: self.name.clone() },
-      result_ptr: result_ptr,
+      cell: cell,
       joined: false
     })
   end
@@ -359,7 +439,7 @@ end
 
 struct ThreadContext
   closure: Ptr[u8]
-  result: Ptr[u8]
+  cell: Ptr[u8]
   run: fn(Ptr[u8], Ptr[u8]) -> Unit
 end
 
@@ -368,24 +448,86 @@ def thread_entry_point(arg: Ptr[u8]) -> Ptr[u8]
     return Ptr::null() as Ptr[u8]
   end
   let ctx = (arg as Ptr[ThreadContext]).read()
-  (ctx.run)(ctx.closure, ctx.result)
+  (ctx.run)(ctx.closure, ctx.cell)
   dealloc(arg as Ptr[ThreadContext])
   Ptr::null() as Ptr[u8]
 end
 
-def thread_run_wrapper[F, T](closure_ptr: Ptr[u8], result_ptr: Ptr[u8]) -> Unit
+def thread_run_wrapper[F, T](closure_ptr: Ptr[u8], cell_ptr: Ptr[u8]) -> Unit
   where F: FnOnce() -> T
   
   let closure = (closure_ptr as Ptr[F]).read()
   let result = closure()
-  (result_ptr as Ptr[T]).write(result)
   dealloc(closure_ptr as Ptr[F])
+  # The worker's clone: read out of its placement allocation (the move),
+  # then free the placement raw. write_result publishes INTO the shared
+  # cell; the clone — the worker's ownership — is released when this run
+  # frame ends (the worker's termination), so the detach path can never
+  # orphan the result.
+  let cell = (cell_ptr as Ptr[ThreadResultCell[T]]).read()
+  dealloc(cell_ptr as Ptr[ThreadResultCell[T]])
+  cell.write_result(result)
 end
 
 def spawn[F, T](f: F) -> JoinHandle[T]
-  where F: FnOnce() -> T + Send, T: Send
+  where F: FnOnce() -> T + Transferable, T: Transferable
   
   thread_builder().spawn(f).unwrap()
+end
+
+# ———————————————————————————————————————————————————————————————
+# The result cell — construction, the write side, the take-once
+# ———————————————————————————————————————————————————————————————
+
+def ThreadResultCell::new[T]() -> ThreadResultCell[T]
+  ThreadResultCell[T] {
+    inner: Arc::new(ThreadResultInner[T] {
+      value: Mutex::new(Option::None),
+      status: atomic_int_new(thread_result_status_to_int(ThreadResultStatus::Pending))
+    })
+  }
+end
+
+def ThreadResultCell::clone[T](self: ThreadResultCell[T]) -> ThreadResultCell[T]
+  ThreadResultCell[T] { inner: self.inner.clone() }
+end
+
+impl[T] ThreadResultCell[T]
+  # The WORKER side: publish the result into the take-once slot. Called
+  # from the worker's run frame with the worker's own clone; the clone
+  # (the worker's ownership) is released when the run frame ends, so the
+  # detach path keeps the storage alive to the worker's termination.
+  def write_result(self: ThreadResultCell[T], value: T) -> Unit
+    let ch = self.inner.ptr.as_ref()
+    let mut guard = ch.value.lock()
+    let slot = guard.get_mut()
+    *slot = Option::Some(value)
+    drop(guard)
+    ch.status.store(thread_result_status_to_int(ThreadResultStatus::Ready), Ordering::Release)
+  end
+  
+  # The HANDLE side: the take-once transfer — the slot is emptied exactly
+  # once; a second take yields None (the transferred result is never
+  # double-owned).
+  def take_result(self: ThreadResultCell[T]) -> Option[T]
+    let ch = self.inner.ptr.as_ref()
+    let mut guard = ch.value.lock()
+    let taken = guard.take()
+    drop(guard)
+    taken
+  end
+end
+
+
+def thread_result_status_to_int(status: ThreadResultStatus) -> Int
+  match status
+  when ThreadResultStatus::Pending then 0
+  when ThreadResultStatus::Ready then 1
+  when ThreadResultStatus::Panicked then 2
+  when ThreadResultStatus::Cancelled then 3
+  when ThreadResultStatus::TimedOut then 4
+  when ThreadResultStatus::Taken then 5
+  end
 end
 
 impl[T] JoinHandle[T]
@@ -398,17 +540,27 @@ impl[T] JoinHandle[T]
     let ret = pthread_join(self.thread.handle, &retval as PtrMut[Ptr[u8]])
     
     if ret != 0 then
+      # THE JOIN-FAILURE (DETACH) PATH: the worker may still be running
+      # (or is already detached). Detach, and NEVER touch the result cell
+      # from here: the worker's OWN Arc clone keeps the cell — and with
+      # it the result the worker writes — alive until the worker
+      # terminates; the LAST owner's release (the worker's clone at its
+      # exit, or this handle's clone at its drop) disposes the storage.
+      # The result can never be orphaned: there is no naked allocation
+      # owned from one side only.
+      let _ = pthread_detach(self.thread.handle)
+      self.joined = true
       return Result::Err("Failed to join thread".to_string())
     end
     
-    if self.result_ptr.is_null() then
-      return Result::Err("Thread result already consumed")
-    end
-    let result = self.result_ptr.read()
-    dealloc(self.result_ptr)
-    self.result_ptr = Ptr::null() as Ptr[T]
     self.joined = true
-    Result::Ok(result)
+    # The worker terminated (its clone released): take the result out of
+    # the shared cell — the exactly-once transfer (the slot is emptied by
+    # the take; a second take yields None).
+    match self.cell.take_result()
+    when Option::Some(result) then Result::Ok(result)
+    when Option::None then Result::Err("Thread result already consumed")
+    end
   end
   
   def thread(inout self: JoinHandle[T]) -> Ptr[Thread]
@@ -418,21 +570,27 @@ end
 
 impl[T] Drop for JoinHandle[T]
   def drop(inout self: JoinHandle[T]) -> Unit
-    if self.joined || self.result_ptr.is_null() then
+    if self.joined then
       return
     end
 
     mut retval: Ptr[u8] = Ptr::null() as Ptr[u8]
     let ret = pthread_join(self.thread.handle, &retval as PtrMut[Ptr[u8]])
 
-    if ret == 0 then
-      drop(&mut self.result_ptr.read())
-      dealloc(self.result_ptr)
-      self.result_ptr = Ptr::null() as Ptr[T]
-      self.joined = true
-    else
-      pthread_detach(self.thread.handle)
+    if ret != 0 then
+      # The join failed: the worker may still be running. Detach — the
+      # worker's own cell clone keeps the shared storage alive to its
+      # termination; the last owner's release (this handle's clone after
+      # this body, or the worker's clone at its exit) disposes the
+      # storage AND the result value through the Arc's drop_in_place
+      # glue. The old manual read/drop/dealloc of a naked result_ptr is
+      # gone — the cell owns the destruction now.
+      let _ = pthread_detach(self.thread.handle)
     end
+    # ret == 0: the worker terminated and its clone is already released;
+    # this handle's cell clone (dropped by the deinit plan after this
+    # body) is the LAST owner — its release destroys the stored result
+    # value exactly once.
   end
 end
 
@@ -525,8 +683,6 @@ impl Drop for Barrier
   end
 end
 
-impl Send for Barrier {}
-impl Sync for Barrier {}
 
 # ———————————————————————————————————————————————————————————————
 # Atomic Types
@@ -603,8 +759,6 @@ impl AtomicInt
   end
 end
 
-impl Send for AtomicInt {}
-impl Sync for AtomicInt {}
 
 struct AtomicBool
   value: u8
@@ -628,8 +782,6 @@ impl AtomicBool
   end
 end
 
-impl Send for AtomicBool {}
-impl Sync for AtomicBool {}
 
 def ordering_to_int(order: Ordering) -> Int
   match order
@@ -648,194 +800,331 @@ end
 # ———————————————————————————————————————————————————————————————
 # Channel (MPSC)
 # ———————————————————————————————————————————————————————————————
+# THE TWO-SIDED OWNERSHIP DESIGN (channel ownership design): the channel's
+# shared state — the queue, the pthread mutex/condvar, the sender
+# count, the receiver-alive state, the closed flag — lives in ONE heap
+# allocation owned by std::sync's Arc, the same heap-stable shape the
+# async channel's Arc[ChannelInner] uses. Sender and Receiver hold
+# their own Arc clone, so either endpoint can outlive the other:
+# dropping the LAST sender closes the receive side and broadcasts
+# (every blocked recv wakes with Err); dropping the last receiver
+# flips the explicit receiver-alive state (receiver_count > 0) and
+# broadcasts (every blocked bounded send wakes, and every future send
+# fails with the value in Err). The native mutex and condvar are
+# destroyed EXACTLY ONCE — in ChannelInner's Drop, which the Arc's
+# last-releaser drop_in_place glue runs when the inner's refcount
+# reaches zero. The old manual alloc + raw-pointer endpoints (no
+# ownership protocol, no resource destruction) are gone.
+#
+# THE BLOCKING-CALL CLONE RULE: send/recv/try_recv take the endpoint
+# by read access, so a call that can block (the bounded send's
+# full-queue wait, the recv's empty-queue wait) takes its OWN Arc
+# clone for the call's duration — the inner (and its native mutex and
+# condvar) can never die mid-wait, even if every endpoint object is
+# dropped while the call is parked. The same rule gives ChannelIter
+# its own owned Receiver built on a clone of the inner Arc — the
+# iterator never holds a pointer into the caller's receiver object, so
+# the receiver can be moved or dropped while the iteration continues
+# (the iterator's receiver registers in the receiver count: the
+# receive side stays alive for the iteration).
+#
+# channel[T]() is the UNBOUNDED MPSC (capacity 0 — send never waits);
+# channel_bounded[T](capacity) is the bounded variant whose send
+# blocks on the full queue until the receiver drains a slot or the
+# channel dies. Both share the one ChannelInner protocol.
+
+# Test-only inner-destruction counter: incremented in ChannelInner's
+# Drop; the ownership tests assert the inner (and with it the native
+# mutex/condvar) is destroyed exactly once per channel. Defaults 0; a
+# normal build never reads it.
+mut __tg_channel_inner_drop_count: AtomicInt = AtomicInt { value: 0 }
 
 struct Sender[T]
-  inner: Ptr[ChannelInner[T]]
+  inner: Arc[ChannelInner[T]]
 end
 
 struct Receiver[T]
-  inner: Ptr[ChannelInner[T]]
+  inner: Arc[ChannelInner[T]]
 end
 
 struct ChannelInner[T]
   queue: Vec[T]
+  capacity: UInt                # 0 = unbounded (send never waits)
   mutex: PthreadMutexT
   not_empty: PthreadCondT
-  closed: Bool
-  sender_count: AtomicInt
+  closed: Bool                  # the last sender dropped (receive side closed)
+  sender_count: AtomicInt       # live Sender values (clones included)
+  receiver_count: AtomicInt     # live Receiver values — the explicit
+                                # receiver-alive state (alive while > 0)
 end
 
 def channel[T]() -> (Sender[T], Receiver[T])
-  let inner = alloc[ChannelInner[T]]()
-  if inner.is_null() then
-    panic("channel: allocation failed")
+  channel_bounded[T](0)
+end
+
+def channel_bounded[T](capacity: UInt) -> (Sender[T], Receiver[T])
+  mut mutex = pthread_mutex_zero()
+  let mutex_ret = pthread_mutex_init(&mutex as PtrMut[PthreadMutexT], Ptr::null())
+  if mutex_ret != 0 then
+    panic("channel: mutex init failed")
   end
   
-  mut mutex = pthread_mutex_zero()
-  pthread_mutex_init(&mutex as PtrMut[PthreadMutexT], Ptr::null())
-  
   mut cond = pthread_cond_zero()
-  pthread_cond_init(&cond as PtrMut[PthreadCondT], Ptr::null())
+  let cond_ret = pthread_cond_init(&cond as PtrMut[PthreadCondT], Ptr::null())
+  if cond_ret != 0 then
+    panic("channel: condvar init failed")
+  end
   
-  inner.write(ChannelInner {
+  let inner = Arc::new(ChannelInner[T] {
     queue: Vec::new(),
+    capacity: capacity,
     mutex: mutex,
     not_empty: cond,
     closed: false,
-    sender_count: atomic_int_new(1)
+    sender_count: atomic_int_new(1),
+    receiver_count: atomic_int_new(1)
   })
   
-  let sender = Sender { inner: inner }
-  let receiver = Receiver { inner: inner }
-  
-  (sender, receiver)
+  (Sender[T] { inner: inner.clone() }, Receiver[T] { inner: inner })
 end
 
 impl[T] Sender[T]
   def send(self: Sender[T], sink value: T) -> Result[Unit, T]
-    unsafe "pointer dereference — channel send" do
-      let ch = self.inner.as_mut()
-      pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
-      
-      if ch.closed then
+    # The in-flight clone keeps the inner alive for the whole call: a
+    # bounded send parked on the full queue can be woken by the last
+    # receiver's drop (or the last sender's close) after every endpoint
+    # object is already gone — the parked call still owns the channel.
+    let keep = self.inner.clone()
+    let ch = keep.ptr.as_mut()
+    pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
+    
+    if ch.closed || ch.receiver_count.load(Ordering::Relaxed) == 0 then
+      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+      return Result::Err(value)
+    end
+    
+    if ch.capacity != 0 then
+      # Bounded: wait for room while the channel is open and the
+      # receive side is alive. The predicates are re-checked under the
+      # mutex after EVERY wake — a broadcast that landed before the
+      # wait (the close or the receiver-drop) is never lost.
+      while ch.queue.len() >= ch.capacity && !ch.closed && ch.receiver_count.load(Ordering::Relaxed) > 0 do
+        pthread_cond_wait(&ch.not_empty as PtrMut[PthreadCondT], &ch.mutex as PtrMut[PthreadMutexT])
+      end
+      if ch.closed || ch.receiver_count.load(Ordering::Relaxed) == 0 then
         pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
         return Result::Err(value)
       end
-      
-      ch.queue.push(value)
-      pthread_cond_signal(&ch.not_empty as PtrMut[PthreadCondT])
-      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-      
-      Result::Ok(())
     end
+    
+    ch.queue.push(value)
+    # Wake ONE receiver: the queue just went non-empty.
+    pthread_cond_signal(&ch.not_empty as PtrMut[PthreadCondT])
+    pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+    
+    Result::Ok(())
   end
 end
 
 impl[T] Clone for Sender[T]
   def clone(self: Sender[T]) -> Sender[T]
-    unsafe "pointer dereference — channel clone" do
-      let ch = self.inner.as_mut()
-      ch.sender_count.fetch_add(1, Ordering::Relaxed)
-    end
-    Sender { inner: self.inner }
+    let inner = self.inner.clone()
+    # The clone registers in the shared sender count: the LAST Sender
+    # value to drop — of any generation — closes the receive side.
+    inner.ptr.as_ref().sender_count.fetch_add(1, Ordering::Relaxed)
+    Sender[T] { inner: inner }
   end
 end
 
 impl[T] Drop for Sender[T]
   def drop(inout self: Sender[T]) -> Unit
-    unsafe "pointer dereference — channel sender drop" do
-      let ch = self.inner.as_mut()
-      let prev = ch.sender_count.fetch_sub(1, Ordering::AcqRel)
-      if prev == 1 then
-        # Last sender - close channel
-        pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
-        ch.closed = true
-        pthread_cond_broadcast(&ch.not_empty as PtrMut[PthreadCondT])
-        pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-      end
+    let ch = self.inner.ptr.as_mut()
+    let prev = ch.sender_count.fetch_sub(1, Ordering::AcqRel)
+    if prev == 1 then
+      # The last Sender value: close the receive side and wake every
+      # blocked recv (and every blocked bounded send — its re-check
+      # fails on the closed flag).
+      pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
+      ch.closed = true
+      pthread_cond_broadcast(&ch.not_empty as PtrMut[PthreadCondT])
+      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
     end
   end
 end
 
 impl[T] Receiver[T]
   def recv(self: Receiver[T]) -> Result[T, Unit]
-    unsafe "pointer dereference — channel recv" do
-      let ch = self.inner.as_mut()
-      pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
-      
-      while ch.queue.is_empty() && !ch.closed do
-        pthread_cond_wait(&ch.not_empty as PtrMut[PthreadCondT], &ch.mutex as PtrMut[PthreadMutexT])
-      end
-      
-      if ch.queue.is_empty() then
-        pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-        return Result::Err(())
-      end
-      
-      let value = ch.queue.remove(0)
-      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-      
-      Result::Ok(value)
+    # The in-flight clone: a recv parked on the empty queue keeps the
+    # inner alive even if every endpoint object is dropped mid-wait.
+    let keep = self.inner.clone()
+    let ch = keep.ptr.as_mut()
+    pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
+    
+    while ch.queue.is_empty() && !ch.closed && ch.receiver_count.load(Ordering::Relaxed) > 0 do
+      pthread_cond_wait(&ch.not_empty as PtrMut[PthreadCondT], &ch.mutex as PtrMut[PthreadMutexT])
     end
+    
+    if ch.queue.is_empty() then
+      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+      return Result::Err(())
+    end
+    
+    let value = ch.queue.remove(0)
+    # Room was made: wake ONE blocked bounded sender.
+    pthread_cond_signal(&ch.not_empty as PtrMut[PthreadCondT])
+    pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+    
+    Result::Ok(value)
   end
   
   def try_recv(self: Receiver[T]) -> Option[T]
-    unsafe "pointer dereference — channel try_recv" do
-      let ch = self.inner.as_mut()
-      if pthread_mutex_trylock(&ch.mutex as PtrMut[PthreadMutexT]) != 0 then
-        return Option::None
-      end
-      
-      if ch.queue.is_empty() then
-        pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-        return Option::None
-      end
-      
-      let value = ch.queue.remove(0)
-      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
-      
-      Option::Some(value)
+    let keep = self.inner.clone()
+    let ch = keep.ptr.as_mut()
+    if pthread_mutex_trylock(&ch.mutex as PtrMut[PthreadMutexT]) != 0 then
+      return Option::None
     end
+    
+    if ch.queue.is_empty() then
+      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+      return Option::None
+    end
+    
+    let value = ch.queue.remove(0)
+    pthread_cond_signal(&ch.not_empty as PtrMut[PthreadCondT])
+    pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+    
+    Option::Some(value)
   end
   
   def iter(self: Receiver[T]) -> ChannelIter[T]
-    ChannelIter { receiver: self as Ptr[Receiver[T]] }
+    # The iterator owns its OWN Receiver built on a CLONE of the inner
+    # Arc — never a pointer into the caller's receiver object. The
+    # receiver can be moved or dropped after iter() and the iteration
+    # continues: the iterator's receiver registers in the receiver
+    # count, so the receive side stays alive for the iteration's
+    # lifetime.
+    let inner = self.inner.clone()
+    inner.ptr.as_ref().receiver_count.fetch_add(1, Ordering::Relaxed)
+    ChannelIter { receiver: Receiver[T] { inner: inner } }
+  end
+end
+
+impl[T] Drop for Receiver[T]
+  def drop(inout self: Receiver[T]) -> Unit
+    let ch = self.inner.ptr.as_mut()
+    let prev = ch.receiver_count.fetch_sub(1, Ordering::AcqRel)
+    if prev == 1 then
+      # The last Receiver value: the explicit receiver-alive state
+      # (receiver_count > 0) just went false — wake every blocked
+      # bounded sender: its re-check fails and the send returns the
+      # value in Err; every future send fails the same way.
+      pthread_mutex_lock(&ch.mutex as PtrMut[PthreadMutexT])
+      pthread_cond_broadcast(&ch.not_empty as PtrMut[PthreadCondT])
+      pthread_mutex_unlock(&ch.mutex as PtrMut[PthreadMutexT])
+    end
+  end
+end
+
+impl[T] Drop for ChannelInner[T]
+  def drop(inout self: ChannelInner[T]) -> Unit
+    # The inner's Drop is the EXACTLY-ONCE destruction point: the Arc
+    # runs it (via its last-releaser drop_in_place glue) when the last
+    # clone is released, and only then — no endpoint can touch the
+    # native resources afterwards (every blocking call holds its own
+    # clone, so the refcount cannot be zero while the mutex/condvar
+    # are in use).
+    let _ = pthread_mutex_destroy(&self.mutex as PtrMut[PthreadMutexT])
+    let _ = pthread_cond_destroy(&self.not_empty as PtrMut[PthreadCondT])
+    let _ = __tg_channel_inner_drop_count.fetch_add(1, Ordering::Relaxed)
   end
 end
 
 struct ChannelIter[T]
-  receiver: Ptr[Receiver[T]]
+  receiver: Receiver[T]
 end
 
 impl[T] Iterator for ChannelIter[T]
   type Item = T
   
   def next(inout self: ChannelIter[T]) -> Option[T]
-    match self.receiver.as_ref().recv()
+    match self.receiver.recv()
     when Result::Ok(val) then Option::Some(val)
     when Result::Err(_) then Option::None
     end
   end
 end
 
-impl[T: Send] Send for Sender[T] {}
-impl[T: Send] Sync for Sender[T] {}
-impl[T: Send] Send for Receiver[T] {}
 
 # ———————————————————————————————————————————————————————————————
 # Once (one-time initialization)
 # ———————————————————————————————————————————————————————————————
+#
+# THE CAS STATE MACHINE: UNINITIALIZED 0 -> RUNNING 1 -> COMPLETE 2.
+# Only the compare-and-swap 0->1 winner runs the initializer; every
+# other caller sees RUNNING (1) and spins until the state leaves
+# RUNNING (the same spin/yield class as the sync waits), or COMPLETE
+# (2) and no-ops. The old load-then-store (read 0, then store 1) let
+# two threads both read 0 and both run the initializer — the single
+# atomic 0->1 transition is the fix.
+#
+# FAILURE SEMANTICS (chosen): the panic policy is PROCESS-ABORT
+# (std::core.tg — panic terminates the process immediately; unwind is
+# not the default and is unsafe with live owned resources). A panicking
+# initializer aborts the process before any thread can observe a stuck
+# RUNNING state, so POISONING IS SKIPPED: state 3 is reserved for a
+# future unwind-enabled panic mode and is NOT used.
+#
+# REINITIALIZATION SEMANTICS: call_once on a COMPLETE Once is a no-op —
+# the initializer never runs again, regardless of which closure is
+# passed; a Once is single-shot.
 
 struct Once
-  state: AtomicInt    # 0 = incomplete, 1 = running, 2 = complete
+  state: AtomicInt    # 0 = UNINITIALIZED, 1 = RUNNING, 2 = COMPLETE
 end
 
+def ONCE_UNINITIALIZED() -> Int = 0
+def ONCE_RUNNING() -> Int = 1
+def ONCE_COMPLETE() -> Int = 2
+
 def once_new() -> Once
-  Once { state: atomic_int_new(0) }
+  Once { state: atomic_int_new(ONCE_UNINITIALIZED()) }
 end
 
 impl Once
   def call_once[F](self: Once, f: F) -> Unit
     where F: FnOnce() -> Unit
-    let current_state = self.state.load(Ordering::Acquire)
-    if current_state == 0 then
-      self.state.store(1, Ordering::Release)
+    # The single atomic 0->1 transition: exactly one caller wins the
+    # CAS and runs f; the others see RUNNING (spin until the state
+    # changes) or COMPLETE (no-op). The load-then-store alternative
+    # (read 0, then store 1) let two threads both read 0 and both run
+    # f — the CAS is the fix.
+    let current = self.state.compare_exchange(ONCE_UNINITIALIZED(), ONCE_RUNNING(), Ordering::AcqRel, Ordering::Acquire)
+    match current
+    when Result::Ok(_) then
+      # The CAS winner: run f and publish COMPLETE.
       f()
-      self.state.store(2, Ordering::Release)
-    else
-      while self.state.load(Ordering::Acquire) == 1 do
-        thread_yield()
+      self.state.store(ONCE_COMPLETE(), Ordering::Release)
+    when Result::Err(state) then
+      if state == ONCE_COMPLETE() then
+        # Already initialized — the reinitialization is a no-op.
+        ()
+      else
+        # RUNNING: another thread is initializing — spin until the
+        # state leaves RUNNING (the winner stores COMPLETE; a
+        # panicking f aborts the process, so the wait always
+        # terminates).
+        while self.state.load(Ordering::Acquire) == ONCE_RUNNING() do
+          thread_yield()
+        end
       end
     end
   end
   
   def is_completed(self: Once) -> Bool
-    self.state.load(Ordering::Acquire) == 2
+    self.state.load(Ordering::Acquire) == ONCE_COMPLETE()
   end
 end
 
-impl Send for Once {}
-impl Sync for Once {}
 
 # ———————————————————————————————————————————————————————————————
 # Thread-Local Storage
@@ -846,23 +1135,56 @@ struct ThreadLocal[T]
   init: fn() -> T
 end
 
-# Thread-local destructor (called when thread exits)
-def tls_destructor[T](value: Ptr[u8]) -> Unit
+# THE TYPE-ERASED TLS CELL: the per-thread value stored under the pthread
+# key is a POINTER TO A TlsAllocation header — never the raw T. The
+# header carries the payload pointer and the per-T drop thunk (drop_fn),
+# so the C-compatible key destructor — a NON-GENERIC fn(Ptr[u8]) -> Unit,
+# the only function shape pthread_key_create can register — can run T's
+# drop glue and free the payload without knowing T. WITHOUT this
+# indirection a generic destructor cannot be registered (the key's
+# destructor parameter is non-generic), and the old registration of a
+# no-op destructor leaked every per-thread value and skipped every
+# destructor (the comment claimed the opposite).
+struct TlsAllocation
+  raw: Ptr[Unit]
+  drop_fn: fn(Ptr[Unit]) -> Unit
+end
+
+# The per-T drop thunk, monomorphized once per ThreadLocal[T]: drops the
+# payload IN PLACE (T's Drop impl / deinit plan runs — the same typed
+# drop_in_place machinery the Arc uses) and frees the payload allocation.
+# The thunk is referenced as a function-pointer VALUE from the
+# TlsAllocation header (the same generic-fn-in-value-position form as
+# ThreadContext.run), so it is instantiated with the enclosing
+# ThreadLocal's T.
+def tls_drop_thunk[T](raw: Ptr[Unit]) -> Unit
+  let typed = raw as PtrMut[T]
+  typed.drop_in_place()
+  dealloc(raw as Ptr[T])
+end
+
+# The C-compatible (non-generic) key destructor — the ONLY function shape
+# pthread_key_create accepts — called by the pthreads runtime when a
+# thread exits: reads the TlsAllocation header stored under the key,
+# invokes the header's drop thunk (T's drop glue + the payload free), and
+# frees the header itself.
+def tls_destroy_allocation(value: Ptr[u8]) -> Unit
   if !value.is_null() then
-    let ptr = value as Ptr[T]
-    ptr.drop_in_place()
-    dealloc(value, size_of[T](), align_of[T]())
+    let header = value as Ptr[TlsAllocation]
+    let alloc = header.read()
+    (alloc.drop_fn)(alloc.raw)
+    dealloc(header)
   end
 end
 
-def tls_destructor_raw(_value: Ptr[u8]) -> Unit
-  ()
-end
-
 def thread_local_new[T](init: fn() -> T) -> ThreadLocal[T]
-  mut key = PthreadKeyT { key: 0 }
-  # Register destructor to prevent memory leak
-  pthread_key_create(&key as PtrMut[PthreadKeyT], tls_destructor_raw)
+  mut key = PthreadKeyT { affine: AffineHandle {}, key: 0 }
+  # Register the REAL destructor: the non-generic C-compatible one that
+  # runs the per-thread value's drop glue and frees the storage (the
+  # type-erased TlsAllocation indirection above). The old registration of
+  # a no-op destructor leaked every per-thread value and never ran its
+  # destructor.
+  pthread_key_create(&key as PtrMut[PthreadKeyT], tls_destroy_allocation)
   ThreadLocal { key: key, init: init }
 end
 
@@ -870,24 +1192,45 @@ impl[T] ThreadLocal[T]
   def get(self: ThreadLocal[T]) -> Ptr[T]
     let ptr = pthread_getspecific(self.key)
     if ptr.is_null() then
-      # Initialize for this thread
-      let raw = alloc(size_of[T](), align_of[T]())
-      if raw.is_null() then
+      # First touch on this thread: allocate the payload, run init, and
+      # publish a type-erased TlsAllocation header under the key — the
+      # thread's exit runs tls_destroy_allocation on that header.
+      let payload = alloc[T]()
+      if payload.is_null() then
         panic("ThreadLocal: allocation failed")
       end
-      let typed_ptr = raw as Ptr[T]
-      typed_ptr.write((self.init)())
-      pthread_setspecific(self.key, raw)
-      # Destructor registered at key creation will free this
-      typed_ptr
+      let header = alloc[TlsAllocation]()
+      if header.is_null() then
+        dealloc(payload)
+        panic("ThreadLocal: allocation failed")
+      end
+      payload.write((self.init)())
+      header.write(TlsAllocation {
+        raw: payload as Ptr[Unit],
+        drop_fn: tls_drop_thunk
+      })
+      pthread_setspecific(self.key, header as Ptr[u8])
+      payload
     else
-      ptr as Ptr[T]
+      # Already initialized for this thread: the stored value is the
+      # allocation header; the payload pointer is its raw field.
+      (ptr as Ptr[TlsAllocation]).read().raw as Ptr[T]
     end
   end
 end
 
 impl[T] Drop for ThreadLocal[T]
   def drop(inout self: ThreadLocal[T]) -> Unit
+    # pthread_key_delete removes the KEY, nothing more: it does NOT run
+    # the destructors of per-thread values still stored under that key in
+    # OTHER threads. Deleting a key while threads hold values under it is
+    # undefined behavior per POSIX — the destructor is never guaranteed
+    # to run for those threads. THE LIFETIME CONTRACT: the ThreadLocal
+    # must OUTLIVE every thread that called get() on it (or the caller
+    # must join those threads before the ThreadLocal drops), so each
+    # thread's EXIT runs the key destructor — the drop glue + the free —
+    # on its own value. Deleting the key is NOT a substitute for
+    # destructing the values in the arbitrary other threads.
     let _ = pthread_key_delete(self.key)
   end
 end
@@ -897,12 +1240,25 @@ end
 # ———————————————————————————————————————————————————————————————
 
 ## A fixed-size thread pool that distributes work across worker threads.
-struct ThreadPool
-  workers: Vec[Worker]
+## THE ARC-SHARED INNER (concurrency properties): the pool's shared state — the
+## job queue, the condvar, the shutdown flag, the active-jobs counter —
+## lives in a heap allocation owned by an Arc (the same heap-stable shape
+## the sync module's Mutex/Channel use). Each worker receives its OWN Arc
+## clone at spawn, so the state stays alive even if the pool is dropped
+## or moved. The old `spawn(|| worker_loop(&*worker_pool))` handed a raw
+## address of the caller's stack slot into the threads — the raw
+## stack-pointer escape the capture rules reject — and dangled the moment
+## the pool moved.
+struct ThreadPoolInner
   job_queue: Mutex[VecDeque[Box[dyn FnOnce()]]]
   condvar: Condvar
   shutdown: AtomicBool
   active_jobs: AtomicInt
+end
+
+struct ThreadPool
+  inner: Arc[ThreadPoolInner]
+  workers: Vec[Worker]
 end
 
 struct Worker
@@ -911,34 +1267,37 @@ struct Worker
 end
 
 def thread_pool_new(num_threads: UInt) -> ThreadPool
-  let pool = ThreadPool {
-    workers: Vec::new(),
+  let inner = Arc::new(ThreadPoolInner {
     job_queue: Mutex::new(VecDeque::new()),
     condvar: Condvar::new(),
     shutdown: atomic_bool_new(false),
     active_jobs: atomic_int_new(0),
+  })
+  let pool = ThreadPool {
+    inner: inner,
+    workers: Vec::new()
   }
 
   for i in 0..num_threads do
-    let worker_pool = address_of(&mut pool)
+    let thread_inner = pool.inner.clone()
     let handle = ThreadBuilder::new()
       .name("pool-worker-".to_string() + i.to_string())
-      .spawn(|| worker_loop(&*worker_pool))
+      .spawn(|| worker_loop(thread_inner, i))
     pool.workers.push(Worker { thread: Option::Some(handle), id: i })
   end
   pool
 end
 
-def worker_loop(pool: ThreadPool) -> Unit
+def worker_loop(inner: Arc[ThreadPoolInner], worker_id: UInt) -> Unit
   loop do
-    if pool.shutdown.load(Ordering::Acquire) then
+    if inner.ptr.as_ref().shutdown.load(Ordering::Acquire) then
       break
     end
-    let mut guard = pool.job_queue.lock()
-    while guard.is_empty() && !pool.shutdown.load(Ordering::Acquire) do
-      guard = pool.condvar.wait(guard)
+    let mut guard = inner.ptr.as_ref().job_queue.lock()
+    while guard.is_empty() && !inner.ptr.as_ref().shutdown.load(Ordering::Acquire) do
+      guard = inner.ptr.as_ref().condvar.wait(guard)
     end
-    if pool.shutdown.load(Ordering::Acquire) && guard.is_empty() then
+    if inner.ptr.as_ref().shutdown.load(Ordering::Acquire) && guard.is_empty() then
       break
     end
     let job = guard.pop_front()
@@ -946,9 +1305,9 @@ def worker_loop(pool: ThreadPool) -> Unit
 
     match job
     when Option::Some(f) then
-      pool.active_jobs.fetch_add(1, Ordering::Relaxed)
+      inner.ptr.as_ref().active_jobs.fetch_add(1, Ordering::Relaxed)
       f()
-      pool.active_jobs.fetch_sub(1, Ordering::Relaxed)
+      inner.ptr.as_ref().active_jobs.fetch_sub(1, Ordering::Relaxed)
     when Option::None then ()
     end
   end
@@ -957,10 +1316,10 @@ end
 impl ThreadPool
   ## Submit a job to the pool.
   def execute(self: ThreadPool, f: FnOnce() -> Unit) -> Unit
-    let mut guard = self.job_queue.lock()
+    let mut guard = self.inner.ptr.as_ref().job_queue.lock()
     guard.push_back(Box::new(f))
     drop(guard)
-    self.condvar.notify_one()
+    self.inner.ptr.as_ref().condvar.notify_one()
   end
 
   ## Submit a job and get a handle to its result.
@@ -991,19 +1350,19 @@ impl ThreadPool
 
   ## Number of queued jobs waiting for execution.
   def queued_jobs(self: ThreadPool) -> UInt
-    let guard = self.job_queue.lock()
+    let guard = self.inner.ptr.as_ref().job_queue.lock()
     guard.len()
   end
 
   ## Number of currently active (executing) jobs.
   def active_jobs(self: ThreadPool) -> Int
-    self.active_jobs.load(Ordering::Relaxed)
+    self.inner.ptr.as_ref().active_jobs.load(Ordering::Relaxed)
   end
 
   ## Gracefully shutdown the pool, waiting for all jobs to finish.
   def shutdown(inout self: ThreadPool) -> Unit
-    self.shutdown.store(true, Ordering::Release)
-    self.condvar.notify_all()
+    self.inner.ptr.as_ref().shutdown.store(true, Ordering::Release)
+    self.inner.ptr.as_ref().condvar.notify_all()
     for worker in self.workers do
       if let Option::Some(handle) = worker.thread.take() then
         handle.join()
@@ -1014,7 +1373,7 @@ end
 
 impl Drop for ThreadPool
   def drop(inout self: ThreadPool) -> Unit
-    if !self.shutdown.load(Ordering::Acquire) then
+    if !self.inner.ptr.as_ref().shutdown.load(Ordering::Acquire) then
       self.shutdown()
     end
   end
@@ -1201,22 +1560,10 @@ def thread_set_unpark(t: Thread) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
-# Transferable / Shareable marker impls (access + resource model)
+# Transferable / Shareable — NO marker impls (concurrency properties)
 # ———————————————————————————————————————————————————————————————
-
-impl Transferable for Barrier {}
-impl Shareable for Barrier {}
-
-impl Transferable for AtomicInt {}
-impl Shareable for AtomicInt {}
-
-impl Transferable for AtomicBool {}
-impl Shareable for AtomicBool {}
-
-impl Transferable for Once {}
-impl Shareable for Once {}
-
-impl[T: Send] Transferable for Sender[T] {}
-impl[T: Send] Shareable for Sender[T] {}
-
-impl[T: Send] Transferable for Receiver[T] {}
+# The manual Transferable/Shareable impls are DELETED: the compiler
+# derives the properties structurally (see the "Thread Safety Markers"
+# header above). Barrier/AtomicInt/AtomicBool/Once are derived through
+# their scalar/atomic layers; the channel endpoints through their Arc;
+# Thread/JoinHandle/ThreadLocal are rejected by the affine-handle mark.

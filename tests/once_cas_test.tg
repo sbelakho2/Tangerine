@@ -1,0 +1,192 @@
+# tests/once_cas_test.tg — the Once CAS state machine race suite.
+#
+# P0-3: the thread-module Once claimed the initializer with a
+# LOAD-THEN-STORE (read the state, then store RUNNING) — two threads
+# could both read 0 and both run f. The fix is the single atomic
+# compare-and-swap transition UNINITIALIZED 0 -> RUNNING 1 -> COMPLETE
+# 2: only the CAS 0->1 winner runs f; every other caller sees RUNNING
+# (1) and spins until the state leaves RUNNING (the same spin/yield
+# class as the sync waits), or COMPLETE (2) and no-ops.
+#
+# FAILURE SEMANTICS (documented, chosen): the panic policy is
+# PROCESS-ABORT (std::core.tg — panic terminates the process
+# immediately; unwind is not the default and is unsafe with live owned
+# resources). A panicking initializer aborts the process before any
+# thread can observe a stuck RUNNING state, so POISONING IS SKIPPED:
+# state 3 is reserved for a future unwind-enabled panic mode and is
+# unused — there is no recoverable failure to encode.
+#
+# REINITIALIZATION SEMANTICS: call_once on a COMPLETE Once is a no-op —
+# the initializer never runs again, regardless of which closure is
+# passed; a Once is single-shot.
+#
+# THE TESTS
+#   (1) test_once_cas_exactly_one_initializer_across_threads
+#       — the synchronized start barrier + 32 competing threads; the
+#         atomic execution counter must end at EXACTLY 1.
+#   (2) test_once_waiters_spin_until_initializer_completes
+#       — the initializer runs slowly; 8 waiters must observe RUNNING
+#         and block until the state changes, none running f.
+#   (3) test_once_reinitialization_is_noop
+#       — the reinitialization semantics: a second call_once with a
+#         different closure never runs the initializer again.
+#   (4) test_sync_once_cas_exactly_one_initializer
+#       — the same exactly-one race over std::sync::Once (16 threads).
+
+use std::core::{Int, UInt, Bool, Unit, Option, Result, Vec}
+use std::test::*
+use std::sync::{Arc, Mutex, AtomicU32, Once as SyncOnce}
+use std::thread::{spawn, JoinHandle, Once, barrier_new, yield_now}
+
+const MAX_SPINS: Int = 2000000
+
+def spin_until_at_least(count: Arc[AtomicU32], target: u32) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if count.ptr.as_ref().load() >= target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+# (1) The synchronized start barrier + 32 competing threads: the
+# barrier releases every racer at once into the CAS; the execution
+# counter must end at exactly 1 (any double-run — the old load-then-
+# store — lands at 2+ and fails the assert).
+@test
+def test_once_cas_exactly_one_initializer_across_threads() -> Unit
+  let once = Arc::new(Once::new())
+  let count = Arc::new(AtomicU32::new(0))
+  let start = Arc::new(barrier_new(33 as UInt))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 32 do
+    let h = spawn(move || {
+      let _ = start.wait()
+      once.call_once(|| { count.ptr.as_ref().fetch_add(1) })
+      0
+    })
+    handles.push(h)
+    i = i + 1
+  end
+  # The synchronized start: all 32 racers are parked on the barrier —
+  # the release fires them at once into the 0->1 CAS.
+  let _ = start.wait()
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+  assert_eq(count.ptr.as_ref().load(), 1 as u32)
+  assert_true(once.is_completed())
+end
+
+# (2) The waiters: the initializer runs SLOWLY (it spins on the release
+# flag), so the 8 late callers deterministically observe RUNNING and
+# block until the state changes — none may run f (the counter stays 0
+# until the release).
+@test
+def test_once_waiters_spin_until_initializer_completes() -> Unit
+  let once = Arc::new(Once::new())
+  let count = Arc::new(AtomicU32::new(0))
+  let started = Arc::new(AtomicU32::new(0))
+  let release = Arc::new(AtomicU32::new(0))
+
+  let mut hin = spawn(move || {
+    once.call_once(|| {
+      started.ptr.as_ref().fetch_add(1)
+      while release.ptr.as_ref().load() == 0 do
+        yield_now()
+      end
+      count.ptr.as_ref().fetch_add(1)
+    })
+    0
+  })
+  assert_true(spin_until_at_least(started.clone(), 1))
+
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 8 do
+    let h = spawn(move || {
+      once.call_once(|| { count.ptr.as_ref().fetch_add(1) })
+      0
+    })
+    handles.push(h)
+    i = i + 1
+  end
+  # The waiters are racing the RUNNING initializer — none may run f.
+  var spins = 0
+  while spins < 200000 do
+    assert_eq(count.ptr.as_ref().load(), 0 as u32)
+    spins = spins + 1
+    yield_now()
+  end
+  release.ptr.as_ref().store(1)
+  assert_ok(hin.join())
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+  assert_eq(count.ptr.as_ref().load(), 1 as u32)
+  assert_true(once.is_completed())
+end
+
+# (3) The once-reinitialization semantics: after COMPLETE, call_once is
+# a no-op — the initializer never runs again, regardless of the closure.
+@test
+def test_once_reinitialization_is_noop() -> Unit
+  let once = Arc::new(Once::new())
+  let count = Arc::new(AtomicU32::new(0))
+  let second = Arc::new(AtomicU32::new(0))
+  once.call_once(|| { count.ptr.as_ref().fetch_add(1) })
+  assert_eq(count.ptr.as_ref().load(), 1 as u32)
+  assert_true(once.is_completed())
+  # A second call_once with a DIFFERENT closure: the state machine is at
+  # COMPLETE and stays there — the initializer must NOT run again.
+  once.call_once(|| { second.ptr.as_ref().fetch_add(1) })
+  once.call_once(|| { second.ptr.as_ref().fetch_add(1) })
+  assert_eq(count.ptr.as_ref().load(), 1 as u32)
+  assert_eq(second.ptr.as_ref().load(), 0 as u32)
+  assert_true(once.is_completed())
+end
+
+# (4) The same exactly-one race over std::sync::Once (16 threads, the
+# same synchronized start barrier).
+@test
+def test_sync_once_cas_exactly_one_initializer() -> Unit
+  let once = Arc::new(SyncOnce::new())
+  let count = Arc::new(AtomicU32::new(0))
+  let start = Arc::new(barrier_new(17 as UInt))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 16 do
+    let h = spawn(move || {
+      let _ = start.wait()
+      once.call_once(|| { count.ptr.as_ref().fetch_add(1) })
+      0
+    })
+    handles.push(h)
+    i = i + 1
+  end
+  let _ = start.wait()
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+  assert_eq(count.ptr.as_ref().load(), 1 as u32)
+  assert_true(once.is_completed())
+end

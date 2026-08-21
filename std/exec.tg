@@ -28,7 +28,7 @@
 #     a + b
 #   })
 
-use std::core::{Option, Result, String, Bool, Int, UInt, Unit}
+use std::core::{Option, Result, String, Bool, Int, UInt, Unit, panic}
 use std::collections::{Vec, Map, Queue, RingBuffer}
 use std::sync::{Mutex, Condvar, AtomicU32, AtomicBool, Arc}
 use std::thread::{Thread, spawn}
@@ -43,6 +43,7 @@ def MAX_QUEUE_SIZE() -> Int = 4096
 def SPIN_COUNT_BEFORE_YIELD() -> Int = 100
 def STEAL_ATTEMPTS() -> Int = 3
 def IDLE_TIMEOUT_MS() -> Int = 100
+def WORKER_LOCAL_QUEUE_CAPACITY() -> Int = 256
 
 # ═══════════════════════════════════════════════════════════════
 # Task Types
@@ -168,7 +169,7 @@ end
 def WorkerState::new(id: Int) -> WorkerState
   WorkerState {
     id: id,
-    local_queue: WorkStealingQueue::new(256),
+    local_queue: WorkStealingQueue::new(WORKER_LOCAL_QUEUE_CAPACITY()),
     tasks_completed: AtomicU32::new(0),
     tasks_stolen: AtomicU32::new(0),
     is_active: AtomicBool::new(false)
@@ -210,6 +211,16 @@ struct ExecutorInner
   
   # Next task ID
   next_task_id: AtomicU32
+  
+  # Task-conservation ledger (ALWAYS-ON debug instrumentation — the
+  # dialect has no debug cfg key, so the ledger is unconditionally
+  # active): task id -> state code (0 = Submitted, 1 = Queued,
+  # 2 = Running, 3 = Completed, 4 = Cancelled, 5 = Failed). The ledger
+  # is the single authority for the invariant
+  #   submitted == completed + cancelled + failed + still_queued/running
+  # checked at every quiescent point; a duplicate TaskId — a re-submit,
+  # a second schedule, a second completion — is the internal fatal error.
+  debug_task_states: Arc[Mutex[Map[u64, Int]]]
 end
 
 ## The Executor is a thin Arc wrapper over the inner — the same
@@ -248,7 +259,8 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
       task_available: task_available,
       total_tasks_submitted: AtomicU32::new(0),
       total_tasks_completed: AtomicU32::new(0),
-      next_task_id: AtomicU32::new(1)
+      next_task_id: AtomicU32::new(1),
+      debug_task_states: Arc::new(Mutex::new(Map::new()))
     })
   }
   
@@ -364,9 +376,9 @@ def find_task(
             match inner.workers[worker_id].local_queue.push(task)
             when Option::Some(evicted) then
               # The local queue filled while refilling from a steal — the
-              # evicted task returns to the global queue.
-              var refill_guard = inner.global_queue.lock()
-              refill_guard.enqueue(evicted)
+              # evicted task returns to the global queue through the
+              # central insertion (the evicted's own priority).
+              enqueue_global_by_priority(inner, evicted)
             when Option::None then ()
             end
           end
@@ -388,6 +400,14 @@ def execute_task(
   executor: Arc[ExecutorInner],
   worker_id: Int
 ) -> Unit
+  # The ledger first — the duplicate-scheduling detection: a task that
+  # was already Running, or already left the runnable states
+  # (completed/cancelled/failed), is the internal fatal error.
+  unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
+    let inner = executor.ptr.as_mut()
+    _debug_ledger_running(inner, task.id)
+  end
+  
   # Set task state to running
   task.state.store(1)  # TaskState::Running
   
@@ -400,11 +420,191 @@ def execute_task(
   unsafe "executor inner access — the worker's Arc clone keeps the inner alive" do
     let inner = executor.ptr.as_mut()
     inner.workers[worker_id].tasks_completed.fetch_add(1)
+    # The ledger completion — the duplicate-completion detection — BEFORE
+    # the observable completion counter (a test spinning on the counter
+    # sees the ledger already settled).
+    _debug_ledger_completed(inner, task.id)
     inner.total_tasks_completed.fetch_add(1)
   end
   
   # Set task state to completed
   task.state.store(2)  # TaskState::Completed
+end
+
+# ═══════════════════════════════════════════════════════════════
+# TaskId Conservation Ledger (always-on debug instrumentation)
+# ═══════════════════════════════════════════════════════════════
+#
+# The ledger (inner.debug_task_states) tracks every TaskId through its
+# lifecycle — Submitted -> Queued -> Running -> Completed (or the
+# Cancelled/Failed terminal states) — and enforces the conservation
+# invariant
+#   submitted == completed + cancelled + failed + still_queued/running
+# at every quiescent point. Every transition is checked under the
+# ledger's mutex; a duplicate TaskId — a re-submit of a live id, a
+# second schedule of a task that already left the runnable states, a
+# second completion — is the internal fatal error (panic). The
+# instrumentation is ALWAYS-ON: the dialect has no debug cfg key
+# (cfg_simple_holds supports only target_os/target_arch), and the
+# conservation tests must observe the ledger unconditionally.
+
+## The ledger state codes (the Int values stored per TaskId).
+def _debug_state_submitted() -> Int = 0
+def _debug_state_queued() -> Int = 1
+def _debug_state_running() -> Int = 2
+def _debug_state_completed() -> Int = 3
+def _debug_state_cancelled() -> Int = 4
+def _debug_state_failed() -> Int = 5
+
+## Register a freshly allocated TaskId as Submitted. An id that already
+## exists in the ledger is the internal fatal error — the submit must
+## never re-use a live id.
+def _debug_ledger_submit(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::Some(_) then
+    panic("exec conservation violation: duplicate TaskId submitted: " + task_id.to_string())
+  when Option::None then
+    let _ = guard.insert(task_id, _debug_state_submitted())
+  end
+end
+
+## Mark a TaskId as Queued — the task was placed into a queue (local or
+## global). The re-route of an evicted task keeps the already-Queued
+## state; a task that was never submitted, or already left the runnable
+## states, is the internal fatal error.
+def _debug_ledger_queued(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::None then
+    panic("exec conservation violation: task scheduled without submit: " + task_id.to_string())
+  when Option::Some(state) then
+    if state == _debug_state_queued() then
+      ()
+    elsif state == _debug_state_submitted() then
+      let _ = guard.insert(task_id, _debug_state_queued())
+    else
+      panic("exec conservation violation: duplicate scheduling of TaskId " + task_id.to_string())
+    end
+  end
+end
+
+## Mark a TaskId as Running — the duplicate-scheduling detection: a task
+## that was already Running, or already left the runnable states
+## (completed/cancelled/failed), is the internal fatal error.
+def _debug_ledger_running(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::None then
+    panic("exec conservation violation: executed task never submitted: " + task_id.to_string())
+  when Option::Some(state) then
+    if state == _debug_state_running() then
+      panic("exec conservation violation: duplicate scheduling of TaskId " + task_id.to_string())
+    elsif state == _debug_state_submitted() || state == _debug_state_queued() then
+      let _ = guard.insert(task_id, _debug_state_running())
+    else
+      panic("exec conservation violation: duplicate execution of TaskId " + task_id.to_string())
+    end
+  end
+end
+
+## Mark a TaskId as Completed — the duplicate-completion detection: a
+## second completion of the same id is the internal fatal error.
+def _debug_ledger_completed(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::None then
+    panic("exec conservation violation: completed task never submitted: " + task_id.to_string())
+  when Option::Some(state) then
+    if state == _debug_state_completed() then
+      panic("exec conservation violation: duplicate completion of TaskId " + task_id.to_string())
+    elsif state == _debug_state_running() then
+      let _ = guard.insert(task_id, _debug_state_completed())
+    else
+      panic("exec conservation violation: TaskId " + task_id.to_string() + " completed from state " + state.to_string())
+    end
+  end
+end
+
+## Mark a TaskId as Cancelled — the terminal transition for a queued task
+## cancelled before execution (the hook the cancellation paths use; no
+## live cancellation exists today, the state is part of the invariant).
+def _debug_ledger_cancelled(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::None then
+    panic("exec conservation violation: cancelled task never submitted: " + task_id.to_string())
+  when Option::Some(state) then
+    if state == _debug_state_queued() then
+      let _ = guard.insert(task_id, _debug_state_cancelled())
+    else
+      panic("exec conservation violation: TaskId " + task_id.to_string() + " cancelled from state " + state.to_string())
+    end
+  end
+end
+
+## Mark a TaskId as Failed — the terminal transition for a task that
+## panicked during execution (the hook for a catch-panic execution path;
+## the executor does not catch panics today, the state is part of the
+## invariant).
+def _debug_ledger_failed(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
+  var guard = inner.debug_task_states.lock()
+  match guard.get(task_id)
+  when Option::None then
+    panic("exec conservation violation: failed task never submitted: " + task_id.to_string())
+  when Option::Some(state) then
+    if state == _debug_state_running() then
+      let _ = guard.insert(task_id, _debug_state_failed())
+    else
+      panic("exec conservation violation: TaskId " + task_id.to_string() + " failed from state " + state.to_string())
+    end
+  end
+end
+
+## The TaskId conservation invariant — every submitted id exists in the
+## ledger exactly once, sits in exactly one state, and
+##   submitted == completed + cancelled + failed + still_queued/running
+## (the accounted ledger entries must match the submit counter, and the
+## completed entries must match the completion counter). Invoked at the
+## quiescent points (the graceful shutdown, the test queries).
+def _debug_check_task_conservation(inner: PtrMut[ExecutorInner]) -> Bool
+  let guard = inner.debug_task_states.lock()
+  var submitted = 0
+  var queued = 0
+  var running = 0
+  var completed = 0
+  var cancelled = 0
+  var failed = 0
+  for (_, state) in guard.entries() do
+    if state == _debug_state_submitted() then submitted = submitted + 1
+    elsif state == _debug_state_queued() then queued = queued + 1
+    elsif state == _debug_state_running() then running = running + 1
+    elsif state == _debug_state_completed() then completed = completed + 1
+    elsif state == _debug_state_cancelled() then cancelled = cancelled + 1
+    elsif state == _debug_state_failed() then failed = failed + 1
+    else return false
+    end
+  end
+  let accounted = submitted + queued + running + completed + cancelled + failed
+  accounted == inner.total_tasks_submitted.load() as Int
+    && completed == inner.total_tasks_completed.load() as Int
+end
+
+## The single central global insertion: route a task into the global
+## queue by ITS OWN priority (the priority match + the enqueue). The sink
+## consumes the task exactly once — the eviction path passes the EVICTED
+## task (with the evicted's priority, never the incoming task's), the
+## non-worker submit path passes the incoming task; neither is ever
+## scheduled twice.
+def enqueue_global_by_priority(inner: PtrMut[ExecutorInner], sink task: Task) -> Unit
+  let prio = task.priority
+  var guard = inner.global_queue.lock()
+  match prio
+  when TaskPriority::Realtime then guard.push_front(task)
+  when TaskPriority::High then guard.push_high_priority(task)
+  when TaskPriority::Normal then guard.enqueue(task)
+  when TaskPriority::Low then guard.enqueue_low_priority(task)
+  end
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -426,6 +626,10 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
       created_at: Instant::now()
     }
     
+    # The ledger FIRST: a task id that already exists is the internal
+    # fatal error — checked before the task can reach any queue.
+    _debug_ledger_submit(inner, task_id)
+    
     inner.total_tasks_submitted.fetch_add(1)
     
     # Try to push to current thread's local queue first
@@ -436,35 +640,30 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
     var i = 0
     while i < inner.workers.len() do
       if inner.threads[i].thread.id() == current.id() then
+        # The push ACCEPTS the incoming task on BOTH outcomes: the
+        # eviction of an older task does not undo the acceptance. Only
+        # the EVICTED task is re-routed — with the EVICTED's own priority
+        # (the central insertion) — and the incoming task is never
+        # scheduled a second time (no fallthrough to the global path).
+        _debug_ledger_queued(inner, task_id)
         match inner.workers[i].local_queue.push(task)
         when Option::Some(evicted) then
-          # The local queue was full — the evicted task goes to the global
-          # queue (the task was consumed by the push; only the evicted
-          # item is re-routed — never a reuse of the moved task).
-          var evict_guard = inner.global_queue.lock()
-          match priority
-          when TaskPriority::Realtime then evict_guard.push_front(evicted)
-          when TaskPriority::High then evict_guard.push_high_priority(evicted)
-          when TaskPriority::Normal then evict_guard.enqueue(evicted)
-          when TaskPriority::Low then evict_guard.enqueue_low_priority(evicted)
-          end
-        when Option::None then pushed = true
+          pushed = true
+          enqueue_global_by_priority(inner, evicted)
+        when Option::None then
+          pushed = true
         end
         break
       end
       i = i + 1
     end
     
-    # If not a worker, use global queue
+    # Not a worker thread (no worker slot matched): the incoming task
+    # goes to the global queue through the same central priority-routed
+    # insertion the eviction path uses.
     if !pushed then
-      var guard = inner.global_queue.lock()
-      # Priority ordering: higher priority first
-      match priority
-      when TaskPriority::Realtime then guard.push_front(task)
-      when TaskPriority::High then guard.push_high_priority(task)
-      when TaskPriority::Normal then guard.enqueue(task)
-      when TaskPriority::Low then guard.enqueue_low_priority(task)
-      end
+      _debug_ledger_queued(inner, task_id)
+      enqueue_global_by_priority(inner, task)
     end
     
     # Notify waiting workers
@@ -475,7 +674,7 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
 end
 
 ## Submit a task that returns a value
-def Executor::submit_with_result[T: Send](self: Executor, func: fn() -> T, priority: TaskPriority) -> JoinHandle[T]
+def Executor::submit_with_result[T: Transferable](self: Executor, func: fn() -> T, priority: TaskPriority) -> JoinHandle[T]
   let task_id = unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
     inner.next_task_id.fetch_add(1) as u64
@@ -504,9 +703,13 @@ def Executor::submit_with_result[T: Send](self: Executor, func: fn() -> T, prior
   
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
+    # The ledger first — the duplicate-TaskId fatal before the task can
+    # reach the queue.
+    _debug_ledger_submit(inner, task_id)
     inner.total_tasks_submitted.fetch_add(1)
     
     # Add to global queue
+    _debug_ledger_queued(inner, task_id)
     var guard = inner.global_queue.lock()
     guard.enqueue(task)
     
@@ -580,6 +783,13 @@ def Executor::shutdown(inout self: Executor) -> Unit
     end
     
     inner.threads.clear()
+    
+    # The quiescent point: every worker has joined and no queue is being
+    # drained — the TaskId conservation invariant must hold. A violation
+    # is the internal fatal error.
+    if !_debug_check_task_conservation(inner) then
+      panic("exec conservation violation: submitted != completed + cancelled + failed + still_queued/running")
+    end
   end
 end
 
@@ -652,6 +862,58 @@ def Executor::stats(self: Executor) -> ExecutorStats
     tasks_per_worker: tasks_per_worker,
     steals_per_worker: steals_per_worker
   }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# Task Conservation Queries (always-on debug instrumentation)
+# ═══════════════════════════════════════════════════════════════
+
+## The conservation invariant at the caller's quiescent point — the same
+## check the executor runs at graceful shutdown.
+def Executor::conservation_ok(self: Executor) -> Bool
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    _debug_check_task_conservation(inner)
+  end
+end
+
+## The observable completion counter — the O(1) quiescence probe, updated
+## AFTER every ledger completion mark (a spin on this counter sees the
+## ledger already settled).
+def Executor::debug_completed_count(self: Executor) -> Int
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.total_tasks_completed.load() as Int
+  end
+end
+
+## The ledger's live count for one state code (0 = Submitted, 1 = Queued,
+## 2 = Running, 3 = Completed, 4 = Cancelled, 5 = Failed).
+def Executor::debug_task_count(self: Executor, state: Int) -> Int
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    let guard = inner.debug_task_states.lock()
+    var count = 0
+    for (_, s) in guard.entries() do
+      if s == state then
+        count = count + 1
+      end
+    end
+    count
+  end
+end
+
+## The negative-test hook: register a synthetic TaskId TWICE so the
+## duplicate-TaskId internal fatal error can be exercised (production code
+## never produces a duplicate — the ids come from the atomic counter and
+## the eviction fix routes only the evicted task). The second
+## registration panics with the fatal error.
+def Executor::debug_inject_duplicate_submit(self: Executor, task_id: u64) -> Unit
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    _debug_ledger_submit(inner, task_id)
+    _debug_ledger_submit(inner, task_id)
+  end
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -746,7 +1008,7 @@ def sleep(duration: Duration) -> Sleep
 end
 
 ## Spawn a future onto the executor
-def spawn_future[T: Send](future: impl Future[T] + Send) -> JoinHandle[T]
+def spawn_future[T: Transferable](future: impl Future[T] + Transferable) -> JoinHandle[T]
   match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec) then
     let executor = Executor { inner: exec }
@@ -823,7 +1085,7 @@ def spawn_with_priority(func: fn() -> Unit, priority: TaskPriority) -> u64
 end
 
 ## Spawn a closure that returns a value
-def spawn_with_result[T: Send](func: fn() -> T) -> JoinHandle[T]
+def spawn_with_result[T: Transferable](func: fn() -> T) -> JoinHandle[T]
   let executor = Executor { inner: global_executor() }
   executor.submit_with_result(func, TaskPriority::Normal)
 end
@@ -859,7 +1121,7 @@ def par_for_each[T](items: [T], func: fn(T) -> Unit) -> Unit
 end
 
 ## Parallel map
-def par_map[T: Send, U: Send](items: [T], func: fn(T) -> U) -> Vec[U]
+def par_map[T: Transferable, U: Transferable](items: [T], func: fn(T) -> U) -> Vec[U]
   let executor = Executor { inner: global_executor() }
   let count = items.len()
   
@@ -915,7 +1177,7 @@ def par_map[T: Send, U: Send](items: [T], func: fn(T) -> U) -> Vec[U]
 end
 
 ## Parallel fold
-def par_fold[T: Send, U: Send + Clone](
+def par_fold[T: Transferable, U: Transferable + Clone](
   items: Vec[T],
   identity: U,
   combine: fn(U, T) -> U,
@@ -999,7 +1261,7 @@ end
 # ═══════════════════════════════════════════════════════════════
 
 ## Schedule a CPU-intensive task with proper CPU affinity
-def spawn_cpu_intensive[T: Send](func: fn() -> T) -> JoinHandle[T]
+def spawn_cpu_intensive[T: Transferable](func: fn() -> T) -> JoinHandle[T]
   let executor = Executor { inner: global_executor() }
   executor.submit_with_result(func, TaskPriority::High)
 end

@@ -1,0 +1,300 @@
+# tests/exec_conservation_test.tg — std::exec TaskId conservation tests
+#
+# The submit eviction fix (reviewer item 3): a local-queue push ACCEPTS
+# the incoming task on both outcomes — the Some(evicted) case sets
+# pushed = true and routes ONLY the evicted task to the global queue,
+# with the EVICTED task's own priority (the central
+# enqueue_global_by_priority insertion). The incoming task is never
+# scheduled a second time: no moved-task duplication, no double
+# scheduling.
+#
+# The always-on conservation ledger enforces
+#   submitted == completed + cancelled + failed + still_queued/running
+# at every quiescent point, and a duplicate TaskId is the internal fatal
+# error. Every test is bounded: completion is awaited through a bounded
+# spin on the ledger's O(1) completion counter (never an unbounded wait
+# — a broken executor FAILS the test instead of hanging CI).
+
+use std::core::{Vec}
+use std::test::*
+use std::exec::{Executor, TaskPriority}
+use std::collections::{Set}
+use std::sync::{Arc, Mutex}
+
+# The single worker's local queue capacity — must match
+# WorkerState::new(WORKER_LOCAL_QUEUE_CAPACITY()) in std/exec.tg (256).
+const LOCAL_QUEUE_CAPACITY: Int = 256
+
+const STEAL_ROUNDS: Int = 2
+const PRODUCERS: Int = 4
+const FILLS_PER_PRODUCER: Int = 128
+
+# Exactly-once execution counter: every task bumps the shared counter
+# exactly once; a duplicated schedule would bump it twice.
+def bump(counter: Arc[Mutex[Int]]) -> Unit
+  let mut g = counter.lock()
+  *g = *g + 1
+  drop(g)
+end
+
+# Bounded quiescence probe: the O(1) observable completion counter (the
+# ledger's completed count, updated after each completion mark). Returns
+# false (never a hang) when the target is not reached.
+def spin_until_completed(exec: Executor, target: Int) -> Bool
+  var spins = 0
+  while spins < 500000 do
+    if exec.debug_completed_count() >= target then
+      return true
+    end
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  false
+end
+
+# (a) Fill the local queue to capacity, submit one extra unique task:
+# every TaskId executes exactly once, none disappears, and the evicted
+# task retains its own priority. Deterministic with one worker (no
+# stealing).
+@test
+def test_submit_eviction_conservation_single_worker() -> Unit
+  let exec = assert_ok(Executor::new(1))
+  let counter = Arc::new(Mutex::new(0))
+  let order = Arc::new(Mutex::new(Vec::new()))
+  
+  let inner_exec = exec.inner.clone()
+  let c0 = counter.clone()
+  let o0 = order.clone()
+  
+  # Task A (id 1, Normal) runs on the single worker. It fills the
+  # worker's local queue to capacity (256 Normal tasks, ids 2..257),
+  # then submits two High tasks (ids 258, 259): each push EVICTS the
+  # oldest local task (ids 2 and 3 — fill indices 0 and 1). Only the
+  # EVICTED tasks are re-routed to the global queue, with the EVICTED's
+  # own Normal priority (enqueue): the global segment is [id2, id3] and
+  # runs after the local queue drains. The old routing (the incoming
+  # High priority: push_front) would have flipped the segment to
+  # [id3, id2], and the old fallthrough would have scheduled ids 258 and
+  # 259 a second time.
+  let a_id = exec.submit(Box::new(move || {
+    let e = Executor { inner: inner_exec.clone() }
+    let og = o0.lock()
+    og.push(2000)
+    drop(og)
+    var i = 0
+    while i < LOCAL_QUEUE_CAPACITY do
+      let c = c0.clone()
+      let o = o0.clone()
+      let idx = i
+      e.submit(Box::new(move || {
+        let og = o.lock()
+        og.push(idx)
+        drop(og)
+        let mut g = c.lock()
+        *g = *g + 1
+        drop(g)
+      }), TaskPriority::Normal)
+      i = i + 1
+    end
+    let c1 = c0.clone()
+    let o1 = o0.clone()
+    e.submit(Box::new(move || {
+      let og = o1.lock()
+      og.push(1000)
+      drop(og)
+      let mut g = c1.lock()
+      *g = *g + 1
+      drop(g)
+    }), TaskPriority::High)
+    let c2 = c0.clone()
+    let o2 = o0.clone()
+    e.submit(Box::new(move || {
+      let og = o2.lock()
+      og.push(1001)
+      drop(og)
+      let mut g = c2.lock()
+      *g = *g + 1
+      drop(g)
+    }), TaskPriority::High)
+    let og = o0.lock()
+    og.push(2001)
+    drop(og)
+    let mut g = c0.lock()
+    *g = *g + 1
+    drop(g)
+  }), TaskPriority::Normal)
+  
+  assert_eq(a_id, 1 as u64)
+  let total = 1 + LOCAL_QUEUE_CAPACITY + 2  # A + 256 fills + 2 eviction triggers
+  
+  assert_true(spin_until_completed(exec, total))
+  
+  # The exactly-once counter: 259 submissions -> exactly 259 executions.
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
+  
+  # The exact execution order — the evicted fill tasks (indices 0 and 1)
+  # ran LAST, in their original enqueue order: the evicted task keeps its
+  # own Normal priority. The old routing (the incoming High priority)
+  # would have pushed the second eviction in front and flipped them.
+  let og = order.lock()
+  assert_eq(og.len(), 260)
+  assert_eq(og[0], 2000)
+  assert_eq(og[1], 2001)
+  var p = 2
+  var k = 2
+  while k < LOCAL_QUEUE_CAPACITY do
+    assert_eq(og[p], k)
+    p = p + 1
+    k = k + 1
+  end
+  assert_eq(og[p], 1000)
+  p = p + 1
+  assert_eq(og[p], 1001)
+  p = p + 1
+  assert_eq(og[p], 0)
+  p = p + 1
+  assert_eq(og[p], 1)
+  drop(og)
+  
+  # The ledger: every id completed, nothing still queued/running/
+  # submitted — none disappeared.
+  assert_eq(exec.debug_task_count(3), total)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(2), 0)
+  assert_true(exec.conservation_ok())
+  exec.shutdown()
+end
+
+# (b) The same conservation invariants under concurrent stealing: the
+# producers fill their local queues while the other workers steal from
+# them; every TaskId still executes exactly once.
+@test
+def test_conservation_under_concurrent_stealing() -> Unit
+  let exec = assert_ok(Executor::new(4))
+  let counter = Arc::new(Mutex::new(0))
+  var seen: Set[u64] = Set::new()
+  var total = 0
+  
+  var round = 0
+  while round < STEAL_ROUNDS do
+    var p = 0
+    while p < PRODUCERS do
+      let inner_exec = exec.inner.clone()
+      let c = counter.clone()
+      let pid = exec.submit(Box::new(move || {
+        let e = Executor { inner: inner_exec.clone() }
+        var k = 0
+        while k < FILLS_PER_PRODUCER do
+          let c1 = c.clone()
+          e.submit(Box::new(move || { bump(c1) }), TaskPriority::Normal)
+          k = k + 1
+        end
+        # The producer itself executes exactly once too.
+        let mut g = c.lock()
+        *g = *g + 1
+        drop(g)
+      }), TaskPriority::Normal)
+      assert_false(seen.insert(pid))
+      total = total + 1
+      p = p + 1
+    end
+    round = round + 1
+  end
+  total = total + STEAL_ROUNDS * PRODUCERS * FILLS_PER_PRODUCER
+  
+  assert_true(spin_until_completed(exec, total))
+  assert_eq(seen.len(), STEAL_ROUNDS * PRODUCERS)
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
+  assert_eq(exec.debug_task_count(3), total)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(2), 0)
+  assert_true(exec.conservation_ok())
+  exec.shutdown()
+end
+
+# (c) Hundreds of submissions repeated, the TaskIds accumulated into a
+# set — the task conservation check: every returned id is unique, every
+# submitted id is executed exactly once, none disappears.
+@test
+def test_repeated_submit_conservation_set() -> Unit
+  let exec = assert_ok(Executor::new(4))
+  let counter = Arc::new(Mutex::new(0))
+  var seen: Set[u64] = Set::new()
+  var total = 0
+  
+  var round = 0
+  while round < 50 do
+    var j = 0
+    while j < 40 do
+      let c = counter.clone()
+      let id = exec.submit(Box::new(move || { bump(c) }), TaskPriority::Normal)
+      # insert returns true when the id ALREADY existed — a duplicate
+      # returned id fails the test right here.
+      assert_false(seen.insert(id))
+      total = total + 1
+      j = j + 1
+    end
+    round = round + 1
+  end
+  # 50 rounds x 40 tasks = 2000 unique TaskIds.
+  assert_eq(total, 2000)
+  
+  assert_true(spin_until_completed(exec, total))
+  assert_eq(seen.len(), total)
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
+  assert_eq(exec.debug_task_count(3), total)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(2), 0)
+  assert_true(exec.conservation_ok())
+  exec.shutdown()
+end
+
+# (d) The exactly-once execution counter: every submission executes
+# exactly once, so the shared execution counter equals the submitted
+# count at the quiescent point.
+@test
+def test_exactly_once_execution_counter() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  let counter = Arc::new(Mutex::new(0))
+  var total = 0
+  var i = 0
+  while i < 200 do
+    let c = counter.clone()
+    let _ = exec.submit(Box::new(move || { bump(c) }), TaskPriority::Normal)
+    total = total + 1
+    i = i + 1
+  end
+  
+  assert_true(spin_until_completed(exec, total))
+  let g = counter.lock()
+  assert_eq(*g, total)
+  drop(g)
+  assert_eq(exec.debug_task_count(3), total)
+  assert_true(exec.conservation_ok())
+  exec.shutdown()
+end
+
+# (e) The negative: a duplicate TaskId is the internal fatal error.
+@test
+def test_duplicate_task_id_is_fatal_internal_error() -> Unit
+  # The ledger registers a synthetic id a second time and the internal
+  # fatal error (a panic carrying the "duplicate TaskId" marker) is
+  # raised. The executor is never shut down here: the panic unwinds
+  # through the ledger guard, whose lock is left held (the unwind path
+  # skips finalizers), so no further ledger access may follow — the test
+  # process ends right after.
+  let msg = assert_panics(|| {
+    let ex = assert_ok(Executor::new(1))
+    ex.debug_inject_duplicate_submit(999999 as u64)
+  })
+  assert_contains(msg, "duplicate TaskId")
+end

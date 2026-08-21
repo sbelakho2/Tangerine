@@ -1,0 +1,137 @@
+# tests/thread_local_drop_test.tg — ThreadLocal per-thread values run
+# their drop glue and free their storage at thread exit.
+#
+# P0-13: std::thread's ThreadLocal allocated a per-thread payload in
+# get() and registered a NO-OP as the pthread key destructor, so at
+# thread exit the payload's Drop glue never ran and its allocation
+# leaked (the source comment claimed the opposite). The fix registers
+# the type-erased destructor: every per-thread value is a
+# TlsAllocation { raw payload, drop_fn: thunk[T] } header; the
+# C-compatible key destructor (tls_destroy_allocation) runs the thunk —
+# T's drop glue + the payload free — and frees the header.
+#
+# THE TESTS
+#   (1) test_tls_drop_glue_runs_exactly_n_times — N threads each touch
+#       the ThreadLocal and exit; the process-visible atomic deinit
+#       counter must end at EXACTLY N (the old no-op destructor left it
+#       at 0).
+#   (2) test_tls_storage_freed_at_thread_exit — the allocator's
+#       outstanding-bytes counter (tg_allocator_outstanding_bytes)
+#       returns to its baseline after the threads exit: the destructor
+#       freed both the payload and the TlsAllocation header (the leak
+#       would leave N payloads + N headers outstanding).
+#   (3) test_tls_one_destruction_per_thread_many_touches — repeated
+#       get() on one thread reuses the SAME per-thread value: exactly
+#       ONE destruction per thread regardless of the touch count.
+
+use std::core::{Int, Unit, Option, Result, Vec}
+use std::test::*
+use std::thread::{spawn, JoinHandle, ThreadLocal, thread_local_new, AtomicInt, atomic_int_new, Ordering}
+use std::ffi::{address_of}
+
+extern def tg_allocator_outstanding_bytes() -> Int
+
+# The process-visible deinit counter: TrackedPayload's Drop increments it
+# when the destructor runs. The threads exit CONCURRENTLY, so the
+# increment is the atomic fetch_add — never a plain global store.
+static DROP_COUNT: AtomicInt = atomic_int_new(0)
+
+struct TrackedPayload
+  id: Int
+end
+
+impl Drop for TrackedPayload
+  def drop(inout self: TrackedPayload) -> Unit
+    address_of(&mut DROP_COUNT).as_ref().fetch_add(1, Ordering::Relaxed)
+  end
+end
+
+def init_payload() -> TrackedPayload
+  TrackedPayload { id: 1 }
+end
+
+static TLS_PAYLOAD: ThreadLocal[TrackedPayload] = thread_local_new(init_payload)
+
+const TLS_THREADS: Int = 8
+
+def drops_since(base: Int) -> Int
+  address_of(&mut DROP_COUNT).as_ref().load(Ordering::Acquire) - base
+end
+
+# (1) N threads each touch the ThreadLocal once and exit: each thread's
+# exit runs the registered key destructor exactly once, so the deinit
+# counter ends at EXACTLY N.
+@test
+def test_tls_drop_glue_runs_exactly_n_times() -> Unit
+  let base = address_of(&mut DROP_COUNT).as_ref().load(Ordering::Acquire)
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < TLS_THREADS do
+    let h = spawn(|| {
+      TLS_PAYLOAD.get()
+      0
+    })
+    handles.push(h)
+    i = i + 1
+  end
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+  # Every thread has exited (the key destructor ran before join
+  # returned): exactly one drop per thread.
+  assert_eq(drops_since(base), TLS_THREADS)
+end
+
+# (2) The allocator's outstanding-bytes counter returns to its baseline
+# after the threads exit: the key destructor freed the per-thread
+# payload AND the TlsAllocation header (the pre-fix leak left N payloads
+# + N headers outstanding).
+@test
+def test_tls_storage_freed_at_thread_exit() -> Unit
+  let before = tg_allocator_outstanding_bytes()
+  {
+    var handles: Vec[JoinHandle[Int]] = Vec::new()
+    var i = 0
+    while i < TLS_THREADS do
+      let h = spawn(|| {
+        TLS_PAYLOAD.get()
+        0
+      })
+      handles.push(h)
+      i = i + 1
+    end
+    loop do
+      match handles.pop()
+      when Option::Some(mut h) then
+        assert_ok(h.join())
+      when Option::None then
+        break
+      end
+    end
+  }
+  let after = tg_allocator_outstanding_bytes()
+  assert_eq(after, before)
+end
+
+# (3) Repeated get() on one thread reuses the SAME per-thread value
+# (pthread_getspecific returns the existing header): 64 touches still
+# produce exactly ONE destruction when the thread exits.
+@test
+def test_tls_one_destruction_per_thread_many_touches() -> Unit
+  let base = address_of(&mut DROP_COUNT).as_ref().load(Ordering::Acquire)
+  let mut h = spawn(|| {
+    var t = 0
+    while t < 64 do
+      TLS_PAYLOAD.get()
+      t = t + 1
+    end
+    0
+  })
+  assert_ok(h.join())
+  assert_eq(drops_since(base), 1)
+end

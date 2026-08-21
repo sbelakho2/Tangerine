@@ -1,22 +1,41 @@
 #!/usr/bin/env bash
 #
-# scripts/check_doctests.sh — the documentation doctest gate.
+# scripts/check_doctests.sh — the documentation doctest gate ("docs
+# compiler").
 #
-# Every fenced Tangerine example in the six doctested documents either
-# compiles under the current grammar or is annotated `compile_fail: <the
-# expected diagnostic substring>`. This script extracts the fenced blocks
-# and machine-checks that contract:
+# Every fenced Tangerine example in the docs/current tree either compiles
+# under the current grammar or is annotated `compile_fail: <the expected
+# diagnostic substring>`. This script extracts the fenced blocks and
+# machine-checks that contract.
 #
-#   Documents (docs/current/):
-#     language.md, grammar.md, memory_model.md, stabilized_subset.md,
-#     feature_matrix.md, feature_registry.md
+#   Coverage (docs/current/**, the history excluded):
+#     - The document set is ENUMERATED from docs/current/*.md at runtime —
+#       every document is accounted for, nothing can be added silently.
+#     - DOCTESTED_DOCS: the canonical current-grammar documents. Every
+#       fenced Tangerine/unlabeled block is checked AND compiled (when a
+#       probe-validated compiler binary exists); a violation fails the
+#       gate.
+#         language.md, grammar.md, memory_model.md, stabilized_subset.md,
+#         feature_matrix.md, feature_registry.md, concurrency.md
+#       (concurrency.md joined the set in the 2026-08 rewrite — the
+#       March-2026 edition taught the removed borrow syntax and was never
+#       covered; the rewritten guide is current-grammar by construction.)
+#     - EXCLUDED_DOCS: the non-canonical documents, each with a recorded
+#       reason (API-only/declared-surface guides — their fenced examples
+#       document module surfaces the compiler does not implement and that
+#       the feature registry marks API-only — and non-grammar material).
+#       Their fenced blocks are STILL SCANNED and reported (coverage
+#       notices, so every example in docs/current is checked), but the
+#       findings do not gate.
+#     - COVERAGE GATE: a docs/current/*.md that is in neither set fails —
+#       a new or unclassified document cannot merge.
+#     - docs/history/** is NEVER scanned (non-normative history; the
+#       glob below is docs/current/*.md and the history directory is
+#       asserted out of scope).
 #
 #   Block classification:
 #     - a fence labeled ```tangerine OR unlabeled (bare ```) is a doctest;
-#     - any other label (ebnf, text, bash, c, ...) is NOT a doctest (the
-#       round-10 sweep relabeled every non-code fence — ASCII diagrams,
-#       keyword lists, quoted diagnostic output — so no unlabeled fence is
-#       left that is not Tangerine source);
+#     - any other label (ebnf, text, bash, c, ...) is NOT a doctest;
 #     - a doctest whose FIRST line is `# compile_fail: <substring>` is a
 #       rejection example: it must be rejected and the rejection must
 #       contain <substring> in the diagnostic text;
@@ -36,7 +55,12 @@
 #       - the convention-AFTER-colon spelling `x: sink T` /
 #         `x: inout T` / `x: set T` (the canonical form is the prefix
 #         `sink x: T`; the suffix spelling is not parseable)
-#     Any hit in an unannotated block is a doctest failure.
+#       - the `Send` / `Sync` marker names (the removed dialect's
+#         thread-safety markers — the current model teaches
+#         `Transferable` / `Shareable`; a bare word-boundary `Send` /
+#         `Sync` in code is a hit)
+#     Any hit in an unannotated block of a DOCTESTED document is a
+#     doctest failure.
 #     For a compile_fail block the scan must find at least one forbidden
 #     form AND the expected substring must match one of the known
 #     parse-stage diagnostic phrases below — so the annotation is verified
@@ -44,25 +68,84 @@
 #
 #   Compiler mode (when a probe-validated binary exists — it must check a
 #   good probe AND reject a legacy-spelling probe, so a stale pre-E100
-#   binary never false-passes): each unannotated block is compiled with
-#   `check`. Blocks with no top-level-only item keyword (extern, cap,
-#   effect, macro, module, mod, edition, rationale, trait, pub, private,
-#   const, static, resource, @) are wrapped in a probe function so
-#   statement-level fragments parse; a parse-stage diagnostic (E100-E108)
-#   is a hard failure, while a semantic-only failure of an illustrative
-#   fragment (unresolved names in API-only examples) is a warning. Each
-#   compile_fail block must be rejected with the expected substring in
-#   the diagnostics.
+#   binary never false-passes): each unannotated block of the doctested
+#   documents is compiled with `check`. Blocks with no top-level-only item
+#   keyword (extern, cap, effect, macro, module, mod, edition, rationale,
+#   trait, pub, private, const, static, resource, @) are wrapped in a
+#   probe function so statement-level fragments parse; a parse-stage
+#   diagnostic (E100-E108) is a hard failure, while a semantic-only
+#   failure of an illustrative fragment (unresolved names in API-only
+#   examples) is a warning. Each compile_fail block must be rejected with
+#   the expected substring in the diagnostics.
 #
 # Usage: scripts/check_doctests.sh [compiler]
 #   compiler defaults to the first probe-validated build/tg_stage{1,2,3}
 #   binary (checked in that order).
-# Exit status: 0 when every doctest passes; non-zero otherwise.
+# Exit status: 0 when every doctest passes and the coverage gate holds;
+# non-zero otherwise.
 
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DOCS=(language.md grammar.md memory_model.md stabilized_subset.md feature_matrix.md feature_registry.md)
+DOCS_ROOT="$ROOT/docs/current"
+HISTORY_ROOT="$ROOT/docs/history"
+
+# ── the canonical doctested set ────────────────────────────────────────────
+# Every fenced Tangerine example in these documents is compiled (when a
+# probe-validated binary exists) or structurally scanned; a violation is
+# a hard failure.
+DOCTESTED_DOCS=(
+  language.md
+  grammar.md
+  memory_model.md
+  stabilized_subset.md
+  feature_matrix.md
+  feature_registry.md
+  concurrency.md
+)
+
+# ── the documented exclusions (coverage: scanned + reported, not gating) ──
+# doc<TAB>reason. The coverage gate fails when a docs/current/*.md is in
+# neither DOCTESTED_DOCS nor this map — a new document must be classified
+# before it can merge. docs/history/** is excluded by construction (the
+# history root is never globbed) and by the assertion below.
+EXCLUDED_DOCS=(
+  "web_guide.md	API-only declared surface (std/web, std/http ... are not implemented; the fenced examples cannot compile by definition — registry status API-only)"
+  "graphics_guide.md	API-only declared surface (std/gpu, std/gfx_* ... — registry status API-only)"
+  "embedded_guide.md	API-only declared surface (std/embedded — registry status API-only)"
+  "error_handling.md	API-only declared surface (examples document the removed reference-era error API — registry status API-only)"
+  "cross_compilation_guide.md	API-only declared surface (targets beyond aarch64-apple-darwin/x86_64 are not implemented)"
+  "ffi_cheatsheet.md	API-only declared surface (examples document the removed reference-era FFI spellings)"
+  "stdlib_reference.md	API-only declared surface (module surfaces outside the kernel closure — registry status API-only)"
+  "style_guide.md	API-only declared surface (examples document the removed reference-era spellings)"
+  "versioning.md	API-only declared surface (reference-era example spellings)"
+  "interop.md	API-only declared surface (reference-era example spellings)"
+  "deployment_targets.md	API-only declared surface (targets beyond the two implemented arches)"
+  "packaging.md	API-only declared surface (reference-era example spellings)"
+  "unicode_policy.md	non-grammar material (policy text, not current-grammar examples)"
+  "canonical_ir_spec.md	non-grammar material (IR/structural diagrams, not current-grammar examples)"
+  "consistency_reporting.md	non-grammar material (reporting prose, not current-grammar examples)"
+  "release_engineering.md	non-grammar material (process prose, not current-grammar examples)"
+  "rfc_process.md	non-grammar material (process prose, not current-grammar examples)"
+  "workspace_structure.md	non-grammar material (layout prose, not current-grammar examples)"
+  "architecture_decisions.md	no fenced Tangerine examples"
+  "artifact_policy.md	no fenced Tangerine examples"
+  "backend_strategy.md	no fenced Tangerine examples"
+  "build_system.md	no fenced Tangerine examples"
+  "developer_guide.md	no fenced Tangerine examples"
+  "gfx_ui_conformance.md	no fenced Tangerine examples"
+  "gfx_ui_cross_cutting.md	no fenced Tangerine examples"
+  "gfx_ui_invariants.md	no fenced Tangerine examples"
+  "governance.md	no fenced Tangerine examples"
+  "invariants.md	no fenced Tangerine examples"
+  "knowledge_transfer.md	no fenced Tangerine examples"
+  "migration.md	no fenced Tangerine examples"
+  "performance_budgets.md	no fenced Tangerine examples"
+  "pipeline_manifest.md	no fenced Tangerine examples"
+  "registry_policy.md	no fenced Tangerine examples"
+  "security.md	no fenced Tangerine examples"
+  "supply_chain.md	no fenced Tangerine examples"
+)
 
 # ── known parse-stage diagnostic phrases (the compiler's texts) ────────────
 # Structural-mode verification of `compile_fail:` annotations: the expected
@@ -80,7 +163,7 @@ KNOWN_PHRASES=(
 # The awk sanitizer strips `#` line comments, "..." strings and '...' char
 # literals so prose-in-code and string payloads cannot trip the scan. The
 # patterns are the grammar gate's set plus the convention-after-colon
-# spelling and the `ref` binder.
+# spelling, the `ref` binder, and the removed Send/Sync marker names.
 SCAN_AWK='
   function sanitize(s,    i, n, out, c, in_str) {
     n = length(s)
@@ -120,6 +203,7 @@ SCAN_AWK='
     else if (L ~ /([(,])[ \t]*&(mut[ \t]+)?self([ \t]*[,):])/) { print "legacy receiver (`&self` / `&mut self`)" }
     else if (L ~ /(^|[^A-Za-z0-9_])ref[ \t]+[a-z_][A-Za-z0-9_]*/) { print "legacy ref pattern binder (`ref x`)" }
     else if (L ~ /:[ \t]*(sink|inout|set)[ \t]+[a-z_][A-Za-z0-9_]*/) { print "convention after the colon (`x: sink T` — write `sink x: T`)" }
+    else if (L ~ /(^|[^A-Za-z0-9_])(Send|Sync)([^A-Za-z0-9_]|$)/) { print "removed Send/Sync marker (the model teaches Transferable/Shareable)" }
   }
 '
 
@@ -128,8 +212,22 @@ n_blocks=0
 n_annotated=0
 n_failed=0
 n_warned=0
+n_doctested_docs=0
+n_excluded_docs=0
+n_coverage=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tg_doctests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+
+# ── history exclusion assertion ────────────────────────────────────────────
+# docs/history/** is NON-NORMATIVE history and is NEVER scanned: the
+# enumeration below globs docs/current/*.md only. Assert the boundary so a
+# future glob change cannot silently drag the history into the gate.
+if [ -d "$HISTORY_ROOT" ] && ls "$HISTORY_ROOT"/*.md >/dev/null 2>&1; then
+  n_hist="$(ls "$HISTORY_ROOT"/*.md | wc -l | tr -d ' ')"
+  echo "doctests: history excluded (docs/history/**: $n_hist non-normative document(s) never scanned)"
+else
+  echo "doctests: history excluded (docs/history/ absent — nothing to exclude)"
+fi
 
 # ── extract the fenced blocks of one document ──────────────────────────────
 extract_blocks() { # extract_blocks <doc-path> <outdir>
@@ -242,22 +340,9 @@ compile_block() { # compile_block <compiler> <block-file> ; echoes status line
   return 2
 }
 
-# ── main ───────────────────────────────────────────────────────────────────
-COMPILER="$(find_compiler "${1:-}" || true)"
-MODE="structural"
-if [ -n "$COMPILER" ]; then
-  MODE="compiler ($COMPILER)"
-fi
-echo "doctests: mode = $MODE"
-echo "doctests: documents = ${DOCS[*]}"
-
-for doc in "${DOCS[@]}"; do
-  path="$ROOT/docs/current/$doc"
-  [ -f "$path" ] || { echo "[FAIL] missing document: $path" >&2; fail=1; continue; }
-  outdir="$WORK/$(basename "$doc" .md)"
-  mkdir -p "$outdir"
-  extract_blocks "$path" "$outdir"
-
+# ── check one document's blocks (the doctest gate for a canonical doc) ─────
+check_doc_blocks() { # check_doc_blocks <doc-name> <outdir>
+  local doc="$1" outdir="$2" label n block expected hits known ph status
   for label_file in "$outdir"/*.label; do
     [ -f "$label_file" ] || continue
     label="$(cat "$label_file")"
@@ -336,10 +421,109 @@ for doc in "${DOCS[@]}"; do
       n_failed=$((n_failed + 1))
     fi
   done
+}
+
+# ── coverage: scan one excluded document's blocks, report, never gate ──────
+coverage_doc_blocks() { # coverage_doc_blocks <doc-name> <outdir> <reason>
+  local doc="$1" outdir="$2" reason="$3"
+  local label n block hits blocks_in_doc=0 hit_lines=0
+  for label_file in "$outdir"/*.label; do
+    [ -f "$label_file" ] || continue
+    label="$(cat "$label_file")"
+    n="$outdir/$(basename "$label_file" .label)"
+    block="$n.block"
+    [ -f "$block" ] || continue
+    if [ -n "$label" ] && [ "$label" != "tangerine" ]; then
+      continue
+    fi
+    blocks_in_doc=$((blocks_in_doc + 1))
+    n_blocks=$((n_blocks + 1))
+    if hits="$(scan_block "$block")"; then
+      :
+    else
+      hit_lines=$((hit_lines + 1))
+      printf '%s\n' "$hits" | while IFS= read -r h; do
+        echo "[coverage] $doc:block $n — $h"
+      done
+    fi
+  done
+  if [ "$hit_lines" -ne 0 ]; then
+    echo "[coverage] $doc: $blocks_in_doc block(s), $hit_lines with legacy-form hit(s) — excluded from the gate: $reason"
+  else
+    echo "[coverage] $doc: $blocks_in_doc block(s) — structural scan clean; excluded from the gate: $reason"
+  fi
+}
+
+# ── excluded-doc lookup (portable: macOS ships bash 3.2 — no associative
+# ── arrays) ───────────────────────────────────────────────────────────────
+excluded_reason() { # excluded_reason <doc> ; echoes the reason, exit 0 when excluded
+  local doc="$1" entry d r
+  for entry in "${EXCLUDED_DOCS[@]}"; do
+    d="${entry%%$'\t'*}"
+    r="${entry#*$'\t'}"
+    if [ "$d" = "$doc" ]; then
+      printf '%s' "$r"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+COMPILER="$(find_compiler "${1:-}" || true)"
+MODE="structural"
+if [ -n "$COMPILER" ]; then
+  MODE="compiler ($COMPILER)"
+fi
+echo "doctests: mode = $MODE"
+echo "doctests: coverage = docs/current/** (history excluded)"
+
+# Coverage gate: every docs/current/*.md is doctested or excluded.
+for doc_path in "$DOCS_ROOT"/*.md; do
+  [ -f "$doc_path" ] || continue
+  doc="$(basename "$doc_path")"
+  doctested=0
+  for d in "${DOCTESTED_DOCS[@]}"; do
+    [ "$d" = "$doc" ] && doctested=1
+  done
+  if [ "$doctested" -eq 0 ] && ! excluded_reason "$doc" >/dev/null; then
+    echo "[FAIL] coverage: $doc is not a doctested document and has no documented exclusion — classify it (DOCTESTED_DOCS or EXCLUDED_DOCS) or remove it" >&2
+    fail=1
+    n_coverage=$((n_coverage + 1))
+  fi
 done
 
-echo "doctests: $n_blocks block(s), $n_annotated compile_fail, $n_failed failed, $n_warned fragment warning(s)"
-if [ "$n_failed" -ne 0 ]; then
+for doc in "${DOCTESTED_DOCS[@]}"; do
+  path="$DOCS_ROOT/$doc"
+  if [ ! -f "$path" ]; then
+    echo "[FAIL] missing doctested document: $path" >&2
+    fail=1
+    continue
+  fi
+  n_doctested_docs=$((n_doctested_docs + 1))
+  outdir="$WORK/$(basename "$doc" .md)"
+  mkdir -p "$outdir"
+  extract_blocks "$path" "$outdir"
+  check_doc_blocks "$doc" "$outdir"
+done
+
+# Coverage scan of the excluded documents (checked + reported, not gating).
+for entry in "${EXCLUDED_DOCS[@]}"; do
+  doc="${entry%%$'\t'*}"
+  reason="${entry#*$'\t'}"
+  path="$DOCS_ROOT/$doc"
+  if [ ! -f "$path" ]; then
+    continue  # absent docs are not errors here (the coverage gate above names them)
+  fi
+  n_excluded_docs=$((n_excluded_docs + 1))
+  outdir="$WORK/coverage_$(basename "$doc" .md)"
+  mkdir -p "$outdir"
+  extract_blocks "$path" "$outdir"
+  coverage_doc_blocks "$doc" "$outdir" "$reason"
+done
+
+echo "doctests: $n_doctested_docs doctested document(s), $n_excluded_docs excluded document(s) coverage-scanned, $n_blocks block(s), $n_annotated compile_fail, $n_failed failed, $n_warned fragment warning(s)"
+if [ "$n_failed" -ne 0 ] || [ "$n_coverage" -ne 0 ]; then
   exit 1
 fi
 exit 0

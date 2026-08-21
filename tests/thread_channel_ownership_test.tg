@@ -1,0 +1,280 @@
+# tests/thread_channel_ownership_test.tg — the thread channel's
+# two-sided ownership protocol (reviewer P0-12).
+#
+# THE FIX: std::thread::channel() allocated ChannelInner[T] manually
+# and both endpoints retained raw pointers to it (no ownership
+# protocol, and the native mutex/condvar were never destroyed);
+# ChannelIter stored a raw pointer to the caller's Receiver — dangling
+# the moment the receiver moved or dropped. The redesign mirrors the
+# async channel's heap-stable shape: Sender and Receiver hold
+# Arc[ChannelInner[T]]; the sender count and the explicit
+# receiver-alive state (receiver_count > 0) live in the shared inner;
+# dropping the LAST sender closes the receive side and broadcasts;
+# dropping the last receiver wakes every blocked bounded sender and
+# makes future sends fail; the inner's Drop destroys the native
+# mutex/condvar exactly once (the Arc's last-releaser drop_in_place
+# glue — the __tg_channel_inner_drop_count resource probe); and
+# ChannelIter owns its own Receiver built on a clone of the inner Arc
+# (it registers in the receiver count, so the receive side stays alive
+# for the iteration's lifetime).
+#
+# THE TESTS
+#   (a) test_channel_sender_dropped_receiver_sees_closed
+#       — drop the sender: the queued values drain first, then recv
+#         reports the closed channel; a recv already blocked on the
+#         empty queue wakes with Err (the close broadcast).
+#   (b) test_channel_receiver_dropped_sends_fail
+#       — drop the receiver: every send fails and the value comes back
+#         in the Err (nothing lost, nothing double-owned) — for the
+#         original sender and cloned senders alike.
+#   (c) test_channel_iter_outlives_receiver_move
+#       — the iterator owns its clone: the receiver is MOVED into a
+#         spawned thread (and dropped there); the iteration continues
+#         and the channel still delivers through the iterator's owned
+#         Receiver.
+#   (d) test_channel_dropped_while_senders_blocked_wake
+#       — bounded channel (capacity 2) with three sender threads: two
+#         sends complete, the third is parked on the full queue. The
+#         channel (both endpoints) is dropped; the receiver-alive
+#         broadcast wakes the parked sender and its send fails — the
+#         outcome is exactly 2 Ok + 1 Err, and the inner (with the
+#         native resources) dies exactly once afterwards.
+#   (e) test_channel_inner_destroyed_exactly_once
+#       — the resource counter: the inner — and with it the native
+#         mutex/condvar — is destroyed exactly once per channel, on
+#         the LAST clone release, including when the iterator's owned
+#         clone is the last owner.
+
+use std::core::{Int, UInt, Bool, Unit, Option, Result, Vec}
+use std::test::*
+use std::sync::{Arc, AtomicU32}
+use std::thread::{channel, channel_bounded, ChannelIter, Ordering, spawn, JoinHandle, yield_now, __tg_channel_inner_drop_count}
+
+const MAX_SPINS: Int = 2000000
+
+def spin_until_at_least(count: Arc[AtomicU32], target: u32) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if count.ptr.as_ref().load() >= target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+def expect_next(inout it: ChannelIter[Int], expected: Int) -> Unit
+  match it.next()
+  when Option::Some(v) then assert_eq(v, expected)
+  when Option::None then assert_true(false)
+  end
+end
+
+# (a) The sender-side close: the queued values drain first, then recv
+# reports the closed channel — the closed signal is repeated, and
+# try_recv sees the empty closed channel as None.
+@test
+def test_channel_sender_dropped_receiver_sees_closed() -> Unit
+  let (tx, rx) = channel[Int]()
+  let _ = tx.send(7)
+  let _ = tx.send(8)
+  drop(tx)
+
+  # The queued values are delivered before the closed signal.
+  match rx.recv()
+  when Result::Ok(v) then assert_eq(v, 7)
+  when Result::Err(_) then assert_true(false)
+  end
+  match rx.recv()
+  when Result::Ok(v) then assert_eq(v, 8)
+  when Result::Err(_) then assert_true(false)
+  end
+  # Empty and closed: the closed signal, repeatedly.
+  match rx.recv()
+  when Result::Ok(_) then assert_true(false)
+  when Result::Err(_) then assert_true(true)
+  end
+  match rx.try_recv()
+  when Option::Some(_) then assert_true(false)
+  when Option::None then assert_true(true)
+  end
+end
+
+# (a-blocked) A recv already parked on the empty queue wakes when the
+# last sender drops. The close is checked under the mutex, so the
+# outcome is Err whether the recv was parked or still acquiring the
+# mutex — no lost wakeup.
+@test
+def test_channel_blocked_recv_wakes_when_last_sender_drops() -> Unit
+  let (tx, rx) = channel[Int]()
+  let ready = Arc::new(AtomicU32::new(0))
+  let woke = Arc::new(AtomicU32::new(0))
+  let mut h = spawn(move || {
+    ready.ptr.as_ref().fetch_add(1)
+    match rx.recv()
+    when Result::Ok(_) then ()
+    when Result::Err(_) then woke.ptr.as_ref().fetch_add(1)
+    end
+    0
+  })
+  assert_true(spin_until_at_least(ready.clone(), 1))
+  drop(tx)
+  assert_true(spin_until_at_least(woke.clone(), 1))
+  assert_ok(h.join())
+  assert_eq(woke.ptr.as_ref().load(), 1 as u32)
+end
+
+# (b) The receiver-side close: drop the receiver — every send fails
+# and the value comes back in the Err — for the original sender and
+# for cloned senders alike.
+@test
+def test_channel_receiver_dropped_sends_fail() -> Unit
+  let (tx, rx) = channel[Int]()
+  drop(rx)
+  match tx.send(1)
+  when Result::Ok(_) then assert_true(false)
+  when Result::Err(v) then assert_eq(v, 1)
+  end
+  match tx.send(2)
+  when Result::Ok(_) then assert_true(false)
+  when Result::Err(v) then assert_eq(v, 2)
+  end
+  # A cloned sender fails the same way.
+  let tx2 = tx.clone()
+  match tx2.send(3)
+  when Result::Ok(_) then assert_true(false)
+  when Result::Err(v) then assert_eq(v, 3)
+  end
+end
+
+# (c) The iterator owns its clone: the receiver is MOVED into a
+# spawned thread (which drops it there); the iteration continues — the
+# iterator's owned Receiver keeps the receive side alive — and the
+# channel still delivers new values into the iteration.
+@test
+def test_channel_iter_outlives_receiver_move() -> Unit
+  let (tx, rx) = channel[Int]()
+  let _ = tx.send(1)
+  let _ = tx.send(2)
+  let _ = tx.send(3)
+  let mut it = rx.iter()
+
+  # Move the receiver across the thread boundary and drop it there.
+  let mut h = spawn(move || {
+    drop(rx)
+    0
+  })
+  assert_ok(h.join())
+
+  # The iterator's own clone: the iteration continues.
+  expect_next(it, 1)
+  expect_next(it, 2)
+  expect_next(it, 3)
+  # The receive side is still alive through the iterator's owned
+  # Receiver: a fresh send lands in the iteration.
+  let _ = tx.send(4)
+  expect_next(it, 4)
+
+  # Drop the sender: the iterator drains to the closed signal.
+  drop(tx)
+  match it.next()
+  when Option::Some(_) then assert_true(false)
+  when Option::None then assert_true(true)
+  end
+end
+
+# (d) The channel dropped while senders are blocked: a bounded channel
+# (capacity 2) with three sender threads — two sends complete, the
+# third is parked on the full queue. Dropping BOTH endpoints flips the
+# receiver-alive state and broadcasts: the parked sender wakes and its
+# send fails with the value. Exactly two Ok and one Err, and the inner
+# (with the native resources) is destroyed exactly once afterwards.
+@test
+def test_channel_dropped_while_senders_blocked_wake() -> Unit
+  let before = __tg_channel_inner_drop_count.load(Ordering::Relaxed)
+  let (tx, rx) = channel_bounded[Int](2 as UInt)
+  let started = Arc::new(AtomicU32::new(0))
+  let done = Arc::new(AtomicU32::new(0))
+  let ok_count = Arc::new(AtomicU32::new(0))
+  let err_count = Arc::new(AtomicU32::new(0))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 3 do
+    let idx = i
+    let t = tx.clone()
+    let h = spawn(move || {
+      started.ptr.as_ref().fetch_add(1)
+      match t.send(idx)
+      when Result::Ok(_) then ok_count.ptr.as_ref().fetch_add(1)
+      when Result::Err(_) then err_count.ptr.as_ref().fetch_add(1)
+      end
+      done.ptr.as_ref().fetch_add(1)
+      0
+    })
+    handles.push(h)
+    i = i + 1
+  end
+
+  # All three senders reached send; exactly two completed (capacity 2,
+  # no recv in flight) — the third is deterministically parked on the
+  # full queue (either in the condvar wait or holding the mutex on the
+  # way in; both fail the same way after the drops).
+  assert_true(spin_until_at_least(started.clone(), 3))
+  assert_true(spin_until_at_least(done.clone(), 2))
+  assert_eq(done.ptr.as_ref().load(), 2 as u32)
+
+  # Drop the channel (both endpoints) while the third send is parked.
+  drop(rx)
+  drop(tx)
+
+  # The receiver-alive broadcast wakes the parked sender: it fails.
+  assert_true(spin_until_at_least(done.clone(), 3))
+  assert_eq(ok_count.ptr.as_ref().load(), 2 as u32)
+  assert_eq(err_count.ptr.as_ref().load(), 1 as u32)
+
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+
+  # The inner — and with it the native mutex/condvar — died exactly
+  # once, on the last clone release (the joins are the barrier: the
+  # last release happened on the last sender thread before it exited).
+  assert_eq(__tg_channel_inner_drop_count.load(Ordering::Relaxed), before + 1)
+end
+
+# (e) The exactly-once destruction: the resource counter. The inner —
+# with the native mutex/condvar — dies exactly once per channel, on
+# the LAST clone release: sender + cloned sender + receiver, and the
+# iterator's owned clone when it is the last owner.
+@test
+def test_channel_inner_destroyed_exactly_once() -> Unit
+  let before = __tg_channel_inner_drop_count.load(Ordering::Relaxed)
+
+  # One channel, three owning values (sender, cloned sender, receiver):
+  # the inner dies exactly once — on the LAST drop.
+  let (tx, rx) = channel[Int]()
+  let tx2 = tx.clone()
+  let _ = tx.send(1)
+  drop(tx)
+  drop(tx2)
+  drop(rx)
+  assert_eq(__tg_channel_inner_drop_count.load(Ordering::Relaxed), before + 1)
+
+  # The iterator's owned clone keeps the inner alive past the
+  # receiver's drop; the inner dies when the iterator dies — exactly
+  # once.
+  let (tx, rx) = channel[Int]()
+  let _ = tx.send(5)
+  let mut it = rx.iter()
+  drop(tx)
+  drop(rx)
+  expect_next(it, 5)
+  drop(it)
+  assert_eq(__tg_channel_inner_drop_count.load(Ordering::Relaxed), before + 2)
+end

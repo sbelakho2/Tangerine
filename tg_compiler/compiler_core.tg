@@ -23,7 +23,7 @@ use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_e
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, ResourceError, AnalyzedProgram, analysis_context_new}
-use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
+use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, optimize_mir_verified, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
 use tg_compiler::mono::{monomorphize_program, mono_cache_new}
@@ -118,6 +118,17 @@ pub struct CompilerOptions
   # Mode system
   mode: Mode                  # Dev/Strict/Production/Hardened
   mode_config: ModeConfig     # Derived from mode
+
+  # MIR verifier policy (MIR-verifier policy): when true, the MIR verifier
+  # (verify_mir / optimize_mir_verified) runs after MIR construction, after
+  # monomorphization, AFTER EVERY transformative optimizer pass, and after
+  # optimization — the debug/CI firewall. When false, the pipeline runs the
+  # construction + final verifications only (the release verify-once
+  # policy). The mode system derives the default (Dev/Strict = debug =
+  # verify-everything; Production/Hardened = release = verify-once); this
+  # flag forces verify-everything explicitly (the CI stress job sets it via
+  # the pipeline entry points).
+  verify_everything: Bool
 end
 
 pub enum EmitMode
@@ -191,8 +202,29 @@ pub def default_options() -> CompilerOptions
     pgo_gen: Option::None,
     pgo_use: Option::None,
     mode: Mode::Dev,
-    mode_config: config_for_mode(Mode::Dev)
+    mode_config: config_for_mode(Mode::Dev),
+    verify_everything: false
   }
+end
+
+# The MIR verifier policy gate (MIR-verifier policy): the DEBUG/CI builds
+# (Mode::Dev / Mode::Strict — the driver's default mode, and the mode every
+# CI invocation uses) verify EVERYTHING — after MIR construction, after
+# monomorphization, after EVERY transformative optimizer pass (the
+# per-pass checkpoints inside optimize_mir_verified), and after
+# optimization. The RELEASE builds (Mode::Production / Mode::Hardened —
+# `tg compile --mode production`) verify ONCE — the construction and final
+# verifications only, no per-pass checkpoints. The explicit
+# opts.verify_everything flag forces the debug policy (the CI verifier-stress
+# job uses it so the stress lane is self-documenting).
+def mir_verify_everything(opts: CompilerOptions) -> Bool
+  if opts.verify_everything then return true end
+  match opts.mode
+  when Mode::Dev then true
+  when Mode::Strict then true
+  when Mode::Production then false
+  when Mode::Hardened then false
+  end
 end
 
 pub def is_compiler_driver_path(path: String) -> Bool
@@ -1495,13 +1527,20 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   if opts.verbose then
   end
 
-  # Verify MIR invariants after monomorphization.
-  let post_mono_errs = verify_mir(&mir)
-  if !post_mono_errs.is_empty() then
-    for e in post_mono_errs do
-      eprintln("MIR verifier (post-mono): " + e)
+  # Verify MIR invariants after monomorphization. The post-mono verification
+  # is a TRANSFORMATIVE-PASS boundary (monomorphization rewrites the
+  # program): under the verify-everything policy (the debug/CI builds —
+  # mir_verify_everything) it runs; the release policy verifies only the
+  # construction and the final IR (the post-opt check below).
+  let verify_everything = mir_verify_everything(opts)
+  if verify_everything then
+    let post_mono_errs = verify_mir(&mir)
+    if !post_mono_errs.is_empty() then
+      for e in post_mono_errs do
+        eprintln("MIR verifier (post-mono): " + e)
+      end
+      return Result::Err("MIR verification failed after monomorphization")
     end
-    return Result::Err("MIR verification failed after monomorphization")
   end
 
   match opts.dump_phase
@@ -1520,6 +1559,17 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   match opts.pgo_gen
   when Option::Some(_) then
     instrument_for_pgo(&mut mir)
+    # The instrumentation pass rewrites the program — verify it under the
+    # verify-everything policy.
+    if verify_everything then
+      let post_pgo_instr_errs = verify_mir(&mir)
+      if !post_pgo_instr_errs.is_empty() then
+        for e in post_pgo_instr_errs do
+          eprintln("MIR verifier (post-PGO-instrument): " + e)
+        end
+        return Result::Err("MIR verification failed after PGO instrumentation")
+      end
+    end
   when Option::None then ()
   end
   
@@ -1531,6 +1581,17 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     match read_pgo_profile(&profile_path)
     when Result::Ok(profile) then
       apply_pgo_profile(&mut mir, &profile)
+      # The profile application pass rewrites the program — verify it under
+      # the verify-everything policy.
+      if verify_everything then
+        let post_pgo_apply_errs = verify_mir(&mir)
+        if !post_pgo_apply_errs.is_empty() then
+          for e in post_pgo_apply_errs do
+            eprintln("MIR verifier (post-PGO-apply): " + e)
+          end
+          return Result::Err("MIR verification failed after PGO profile application")
+        end
+      end
     when Result::Err(e) then
       return Result::Err("failed to read requested PGO profile '" + profile_path + "': " + e)
     end
@@ -1540,7 +1601,11 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   if opts.emit_mir then
   end
 
-  optimize_mir(&mut mir, opts.opt_level)
+  # The optimizer runs with the verify-everything policy: per-pass verifier
+  # checkpoints (verify_mir after EVERY transformative pass) panic on any
+  # violation. Release builds pass verify_everything = false and rely on the
+  # single post-opt verification below.
+  optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
 
   if opts.verbose then
   end
@@ -1863,13 +1928,16 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   when Result::Ok(_) then ()
   end
 
-  let post_mono_errs = verify_mir(&mir)
-  if !post_mono_errs.is_empty() then
-    for e in post_mono_errs do
-      eprintln("MIR verifier (post-mono): " + e)
+  let verify_everything = mir_verify_everything(opts)
+  if verify_everything then
+    let post_mono_errs = verify_mir(&mir)
+    if !post_mono_errs.is_empty() then
+      for e in post_mono_errs do
+        eprintln("MIR verifier (post-mono): " + e)
+      end
+      println("MIR verification failed after monomorphization")
+      return 1
     end
-    println("MIR verification failed after monomorphization")
-    return 1
   end
 
   # Driver phase hook (--dump-mir-mono): the kernel compile entry writes the
@@ -1887,6 +1955,16 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   match opts.pgo_gen
   when Option::Some(_) then
     instrument_for_pgo(&mut mir)
+    if verify_everything then
+      let post_pgo_instr_errs = verify_mir(&mir)
+      if !post_pgo_instr_errs.is_empty() then
+        for e in post_pgo_instr_errs do
+          eprintln("MIR verifier (post-PGO-instrument): " + e)
+        end
+        println("MIR verification failed after PGO instrumentation")
+        return 1
+      end
+    end
   when Option::None then ()
   end
 
@@ -1895,6 +1973,16 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
     match read_pgo_profile(&profile_path)
     when Result::Ok(profile) then
       apply_pgo_profile(&mut mir, &profile)
+      if verify_everything then
+        let post_pgo_apply_errs = verify_mir(&mir)
+        if !post_pgo_apply_errs.is_empty() then
+          for e in post_pgo_apply_errs do
+            eprintln("MIR verifier (post-PGO-apply): " + e)
+          end
+          println("MIR verification failed after PGO profile application")
+          return 1
+        end
+      end
     when Result::Err(e) then
       println("failed to read requested PGO profile '" + profile_path + "': " + e)
       return 1
@@ -1902,7 +1990,7 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   when Option::None then ()
   end
 
-  optimize_mir(&mut mir, opts.opt_level)
+  optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
 
   let post_opt_errs = verify_mir(&mir)
   if !post_opt_errs.is_empty() then
@@ -4381,13 +4469,16 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   when Result::Ok(_) then ()
   end
 
-  let post_mono_errs = verify_mir(&mir)
-  if !post_mono_errs.is_empty() then
-    for e in post_mono_errs do
-      eprintln("MIR verifier (post-mono): " + e)
+  let verify_everything = mir_verify_everything(opts)
+  if verify_everything then
+    let post_mono_errs = verify_mir(&mir)
+    if !post_mono_errs.is_empty() then
+      for e in post_mono_errs do
+        eprintln("MIR verifier (post-mono): " + e)
+      end
+      println("MIR verification failed after monomorphization")
+      return 1
     end
-    println("MIR verification failed after monomorphization")
-    return 1
   end
 
   if opts.verbose then
@@ -4396,6 +4487,16 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   match opts.pgo_gen
   when Option::Some(_) then
     instrument_for_pgo(&mut mir)
+    if verify_everything then
+      let post_pgo_instr_errs = verify_mir(&mir)
+      if !post_pgo_instr_errs.is_empty() then
+        for e in post_pgo_instr_errs do
+          eprintln("MIR verifier (post-PGO-instrument): " + e)
+        end
+        println("MIR verification failed after PGO instrumentation")
+        return 1
+      end
+    end
   when Option::None then ()
   end
   match opts.pgo_use
@@ -4403,11 +4504,21 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
     match read_pgo_profile(&profile_path)
     when Result::Ok(profile) then
       apply_pgo_profile(&mut mir, &profile)
+      if verify_everything then
+        let post_pgo_apply_errs = verify_mir(&mir)
+        if !post_pgo_apply_errs.is_empty() then
+          for e in post_pgo_apply_errs do
+            eprintln("MIR verifier (post-PGO-apply): " + e)
+          end
+          println("MIR verification failed after PGO profile application")
+          return 1
+        end
+      end
     when Result::Err(e) then ()
     end
   when Option::None then ()
   end
-  optimize_mir(&mut mir, opts.opt_level)
+  optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
 
   let post_opt_errs = verify_mir(&mir)
   if !post_opt_errs.is_empty() then

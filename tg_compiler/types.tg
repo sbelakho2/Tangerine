@@ -1206,6 +1206,39 @@ end
 # is_trivially_copyable — raw bit-copy is valid, no retain/clone (—
 #                         THE copy authority; the MIR Copy verifier
 #                         queries THIS axis, never the DeinitPlan).
+# is_transferable      — (concurrency properties) the compiler-derived
+#                         Transferable property: a value may move into
+#                         another execution context. Derived by the
+#                         transferable walk (derive_transferable — the
+#                         single authority; see the concurrency section):
+#                         FALSE when the value contains an
+#                         execution-context-affine native handle (the
+#                         std-marked AffineHandle — the pthread thread
+#                         handle / TLS key — unless the containing type
+#                         explicitly opts in via UnsafeTransferable), the
+#                         active lexical inout state (a closure with an
+#                         inout capture), or a non-transferable captured
+#                         state. TRUE for the scalars, the owned
+#                         containers/strings (ownership moves), and the
+#                         Arc/Box/UniquePtr pointer layer (the pointee
+#                         walk); Rc and the raw pointers (gated) are
+#                         FALSE. A deferred type carries NO concrete
+#                         answer (false + is_deferred).
+# is_shareable          — (concurrency properties) the compiler-derived
+#                         Shareable property: safe simultaneous access
+#                         through a shared representation. Derived by
+#                         the shareable walk (derive_syncable): TRUE for
+#                         the trivially-copyable value types AND the
+#                         recognized synchronized representations (the
+#                         Arc/WeakArc — the shared heap boundary; the
+#                         atomics/Mutex/RwLock/channels reach it
+#                         structurally through their Arc/scalar
+#                         layers). The plain OWNED types (String/Vec/
+#                         owned aggregates) are Transferable but NOT
+#                         Shareable — shared mutable state must go
+#                         through Arc/Mutex/RwLock/atomics/channels.
+#                         Cell/RefCell/UnsafeCell (interior mutability
+#                         without synchronization) and Rc are FALSE.
 #   is_deferred         — the type graph contains an unsubstituted generic
 #                         parameter (Type::Param) or an unresolved inference
 #                         variable (Type::Var): the six semantic fields are
@@ -1215,7 +1248,8 @@ end
 #                         consumer must check is_deferred FIRST: while
 #                         deferred, a false owns_state/requires_drop_glue/
 #                         is_linear/is_capability/contains_capability/
-#                         is_trivially_copyable means "not proven true",
+#                         is_trivially_copyable/is_transferable/
+#                         is_shareable means "not proven true",
 #                         NOT "definitely false". The concrete answers
 #                         appear only after substitution (the MIR/mono
 #                         consumer wave substitutes the Param and re-queries
@@ -1233,6 +1267,8 @@ struct TypeProperties
   is_capability: Bool
   contains_capability: Bool
   is_trivially_copyable: Bool
+  is_transferable: Bool
+  is_shareable: Bool
   is_deferred: Bool
 end
 
@@ -1249,8 +1285,9 @@ end
 # after the builtin registrations (build_lang_items — the ids from the
 # type_name_index / trait_registry lookups) and REBUILT after pass 2
 # (type_check_program_env) so the std-declared names (StrView, UniquePtr,
-# ArcStrong, WeakRc, WeakArc — registered by the std's pass-2 type
-# collection) resolve their ids too; a rebuild never changes a builtin id
+# ArcStrong, WeakRc, WeakArc, AffineHandle — registered by the std's
+# pass-2 type collection) resolve their ids too; a
+# rebuild never changes a builtin id
 # (the std re-declarations keep the builtin TypeIds). -1 marks a name with
 # NO registration at init: Transferable/Shareable are std-declared traits
 # whose TraitIds arrive when the std's trait declarations register, and the
@@ -1280,6 +1317,18 @@ struct LangItems
   arc_strong: Int
   weak_rc: Int
   weak_arc: Int
+ # (concurrency properties — the execution-context-affine native handle): the
+  # std-declared AFFINE-HANDLE MARK type ("AffineHandle" — an empty
+  # marker struct in std::core that the std's native-handle types
+  # (PthreadT / PthreadKeyT — the pthread thread handle and the TLS key)
+  # carry as a zero-size field). The concurrency derivation (the
+  # transferable/shareable walk) recognizes the mark by THIS id: a value
+  # containing the mark holds an execution-context-affine native handle
+  # and is NOT Transferable/Shareable unless the containing type
+  # explicitly opts in (impl UnsafeTransferable / UnsafeShareable — the
+  # documented gate). Resolved at the post-pass-2 rebuild like the other
+  # std-declared names; -1 at init (no registration yet — no exclusions).
+  affine_handle: Int
  # the raw-pointer type names (Ptr/PtrMut — registered builtins; the
   # property engine's pointer arms select by id, never by name).
   ptr: Int
@@ -1386,6 +1435,17 @@ struct TypeEnv
   # Trait implementations
   impls: Vec[ImplInfo]
   method_lookup: Map[Int, Map[String, Vec[Int]]]  # receiver TypeId -> method name -> impl indices
+ # (impl conformance — validate-first-register-second): TraitId -> the
+  # trait's declared CONTRACT (the resolved method signatures, the
+  # trait-level generic parameter ids, the associated type names).
+  # Populated at the trait registration sites — register_builtin_trait
+  # (the builtin shapes) and collect_type_def's ItemTrait arm (the source
+  # declarations, which overwrite the builtin entry when the re-declared
+  # trait keeps the builtin id) — and consumed by check_impl's
+  # validate_impl_conformance BEFORE an impl enters env.impls: an impl
+  # that does not satisfy the declared method set is never admitted to
+  # the solver's candidate set, even transiently.
+  trait_contracts: Map[Int, TraitContract]
 
  # (module-semantic trait identity): the bare-name trait registry —
   # trait name -> TraitId — NO LONGER the semantic authority. The TraitId
@@ -1758,6 +1818,54 @@ struct MethodInfo
   # ["U"] for cast[U] — the ids, not the names; the param-name table holds
   # the display names).
   generic_params: Vec[GenericParamId]
+end
+
+# ———————————————————————————————————————————————————————————————
+# Impl conformance — the trait CONTRACT (validate-first-register-second)
+# ———————————————————————————————————————————————————————————————
+#
+# The declared contract of ONE trait method: the resolved signature, the
+# method-level generic parameter names and their bound trait names in
+# declaration order, the default-body flag, and the DECLARED EFFECT SET
+# (the std effectful-function seeds by the trait's module-qualified
+# identity — the impl must not require effects beyond what the trait
+# declares). `has_receiver` says the trait method takes `self`;
+# `receiver_in_params` says the recorded `params` include that receiver
+# position (TRUE for source declarations — the resolved `self: Self`
+# parameter is recorded; FALSE for the builtin registration stubs, whose
+# receiver-less MethodSig payloads get a synthetic wildcard receiver at
+# validation).
+struct TraitMethodContract
+  name: String
+  params: Vec[ParamType]
+  ret_type: Type
+  has_receiver: Bool
+  receiver_in_params: Bool
+  has_default: Bool
+  generic_param_names: Vec[String]
+  generic_param_bounds: Vec[Vec[String]]
+  declared_effects: Vec[EffectId]
+end
+
+# The full declared contract of ONE trait — the trait-level generic
+# parameter ids in declaration order (substituted positionally against the
+# impl's declared trait arguments — the FULL TraitRef, never the head),
+# the associated type names, and the method contracts. The BUILTIN
+# contracts additionally record the implicit receiver parameter ids
+# (named "Self" — substituted with the impl's self type) and the
+# associated-type parameter ids (named "Item" — substituted with the
+# impl's associated types); source contracts carry neither (their "Self"
+# references resolve to inference variables and their associated-type
+# references are the auto-registered "Self::<Assoc>" opaque Adts).
+# Keyed in env.trait_contracts by the TraitId (the declaration identity —
+# the SAME id trait_id_for resolves for the impl side, so two same-named
+# traits in different modules validate against their own declarations).
+struct TraitContract
+  generic_params: Vec[GenericParamId]
+  self_param_ids: Vec[GenericParamId]
+  assoc_types: Vec[String]
+  assoc_param_ids: Vec[GenericParamId]
+  methods: Vec[TraitMethodContract]
 end
 
 struct TypeError
@@ -3632,6 +3740,7 @@ def type_env_new() -> TypeEnv
     pattern_variant_resolutions: Map::new(),
     impls: Vec::new(),
     method_lookup: Map::new(),
+    trait_contracts: Map::new(),
     trait_registry: Map::new(),
  # placeholder — rebuilt from the registered builtins at the end
     # of this function (build_lang_items must run AFTER every builtin
@@ -3652,6 +3761,7 @@ def type_env_new() -> TypeEnv
       arc_strong: -1,
       weak_rc: -1,
       weak_arc: -1,
+      affine_handle: -1,
       ptr: -1,
       ptr_mut: -1,
       drop_trait: -1,
@@ -3914,6 +4024,17 @@ end
 # synthetic owner (begin_builtin_generic), so no two traits' implicit
 # parameters ever collide. The MethodSig payloads carry the ids.
 def register_builtin_trait(inout env: TypeEnv, sink name: String, sink methods: Vec[MethodSig]) -> Unit
+ # (impl conformance — validate-first-register-second): record the
+  # builtin trait's CONTRACT under its TraitId — the MethodSig payloads as
+  # registered (receiver-less signature stubs: has_receiver from is_method,
+  # receiver_in_params FALSE — the impl's receiver position is a synthetic
+  # wildcard at validation), with the implicit generic parameters
+  # classified (Self = the implicit receiver, Item = an associated type,
+  # everything else = a trait-level generic argument). A std source
+  # re-declaration of the trait re-records the contract at pass-2
+  # collection under the SAME TraitId when store_type_def's
+  # identical-acceptance keeps the builtin id.
+  let bt_contract = builtin_trait_contract(&env, &methods)
   let id_num = env.type_id_counter
   let id = TypeId { id: id_num }
   env.type_id_counter = env.type_id_counter + 1
@@ -3928,6 +4049,7 @@ def register_builtin_trait(inout env: TypeEnv, sink name: String, sink methods: 
   env.type_name_index.insert(name.clone(), env.type_list.len())
   env.type_id_index.insert(id_num, env.type_list.len())
   env.type_list.push(td)
+  env.trait_contracts.insert(id_num, bt_contract)
  # the builtin trait declarations register their TraitId (reusing
   # the TypeId value — the declaration is the identity) in the bare-name
   # registry. Builtins have NO resolver declaration (they are prelude
@@ -3937,6 +4059,142 @@ def register_builtin_trait(inout env: TypeEnv, sink name: String, sink methods: 
   # builtin trait re-registers the SAME builtin id (store_type_def's
   # identical-acceptance) under the std module's qualified key.
   env.trait_registry.insert(name, id_num)
+end
+
+# Build the CONTRACT of a builtin trait registration (register_builtin_trait).
+# The MethodSig payloads are receiver-less signature stubs: has_receiver is
+# derived from is_method and receiver_in_params is FALSE, so validation
+# compares the impl's receiver position against a synthetic wildcard (any
+# type, any convention — the builtin stub does not declare one). The
+# implicit generic parameter ids referenced by the payloads are collected
+# and classified by name: "Self" -> the implicit receiver (substituted
+# with the impl's self type), "Item" -> an associated type (substituted
+# with the impl's associated type), anything else -> a trait-level generic
+# argument (substituted positionally against the impl's declared trait
+# arguments).
+def builtin_trait_contract(env: TypeEnv, methods: Vec[MethodSig]) -> TraitContract
+  var seen = Vec::new()
+  var mi = 0
+  while mi < methods.len() do
+    let ms = methods[mi]
+    var pi = 0
+    while pi < ms.params.len() do
+      collect_builtin_param_ids(&ms.params[pi].ty, &mut seen)
+      pi = pi + 1
+    end
+    collect_builtin_param_ids(&ms.ret_type, &mut seen)
+    mi = mi + 1
+  end
+  var generic_params = Vec::new()
+  var self_param_ids = Vec::new()
+  var assoc_types = Vec::new()
+  var assoc_param_ids = Vec::new()
+  var max_idx = 0
+  var di = 0
+  while di < seen.len() do
+    if (seen[di].index as Int) > max_idx then max_idx = seen[di].index as Int end
+    di = di + 1
+  end
+  var oi = 0
+  while oi <= max_idx do
+    var found = Option::None
+    var fi = 0
+    while fi < seen.len() do
+      if (seen[fi].index as Int) == oi then
+        found = Option::Some(seen[fi])
+      end
+      fi = fi + 1
+    end
+    match found
+    when Option::Some(gpid) then
+      let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+      if pname == "Self" then
+        self_param_ids.push(gpid)
+      elsif pname == "Item" then
+        assoc_param_ids.push(gpid)
+        assoc_types.push(pname)
+      else
+        generic_params.push(gpid)
+      end
+    when Option::None then ()
+    end
+    oi = oi + 1
+  end
+  var tmethods = Vec::new()
+  mi = 0
+  while mi < methods.len() do
+    let ms = methods[mi]
+    var gnames = Vec::new()
+    var gbounds = Vec::new()
+    tmethods.push(TraitMethodContract {
+      name: ms.name.clone(),
+      params: ms.params.clone(),
+      ret_type: ms.ret_type.clone(),
+      has_receiver: ms.is_method,
+      receiver_in_params: false,
+      has_default: false,
+      generic_param_names: gnames,
+      generic_param_bounds: gbounds,
+      declared_effects: Vec::new()
+    })
+    mi = mi + 1
+  end
+  TraitContract {
+    generic_params: generic_params,
+    self_param_ids: self_param_ids,
+    assoc_types: assoc_types,
+    assoc_param_ids: assoc_param_ids,
+    methods: tmethods
+  }
+end
+
+# Collect the GenericParamId references of one builtin method payload type
+# into `seen` (deduplicated by id — the declaration order is recovered by
+# index afterwards).
+def collect_builtin_param_ids(ty: Type, inout seen: Vec[GenericParamId]) -> Unit
+  match ty
+  when Type::Param(gpid) then
+    var i = 0
+    var dup = false
+    while i < seen.len() do
+      if generic_param_id_eq(&seen[i], &gpid) then dup = true end
+      i = i + 1
+    end
+    if !dup then seen.push(gpid) end
+  when Type::Adt(_, args) then
+    var i = 0
+    while i < args.len() do
+      collect_builtin_param_ids(&args[i], seen)
+      i = i + 1
+    end
+  when Type::Tuple(fields) then
+    var i = 0
+    while i < fields.len() do
+      collect_builtin_param_ids(&fields[i], seen)
+      i = i + 1
+    end
+  when Type::FixedArray(elem, _) then collect_builtin_param_ids(elem, seen)
+  when Type::FnPtr(params, ret, _) then
+    var i = 0
+    while i < params.len() do
+      collect_builtin_param_ids(&params[i].ty, seen)
+      i = i + 1
+    end
+    collect_builtin_param_ids(ret, seen)
+  when Type::Closure(_, params, ret, captures, _) then
+    var i = 0
+    while i < params.len() do
+      collect_builtin_param_ids(&params[i].ty, seen)
+      i = i + 1
+    end
+    collect_builtin_param_ids(ret, seen)
+    collect_builtin_param_ids(captures, seen)
+  when Type::RefInternal(inner, _) then collect_builtin_param_ids(inner, seen)
+  when Type::Ptr(inner) then collect_builtin_param_ids(inner, seen)
+  when Type::PtrMut(inner) then collect_builtin_param_ids(inner, seen)
+  when Type::Effect(_, inner) then collect_builtin_param_ids(inner, seen)
+  when _ then ()
+  end
 end
 
 # the LangItems build helpers. TypeId by name for
@@ -3996,6 +4254,7 @@ def build_lang_items(env: TypeEnv) -> LangItems
     arc_strong: lang_item_type_id(env, "ArcStrong"),
     weak_rc: lang_item_type_id(env, "WeakRc"),
     weak_arc: lang_item_type_id(env, "WeakArc"),
+    affine_handle: lang_item_type_id(env, "AffineHandle"),
     ptr: lang_item_type_id(env, "Ptr"),
     ptr_mut: lang_item_type_id(env, "PtrMut"),
     drop_trait: lang_item_trait_id(env, "Drop"),
@@ -4027,6 +4286,7 @@ def build_lang_items(env: TypeEnv) -> LangItems
   if items.arc_strong != -1 then lang_items_check_unique(&mut seen, items.arc_strong, "arc_strong") end
   if items.weak_rc != -1 then lang_items_check_unique(&mut seen, items.weak_rc, "weak_rc") end
   if items.weak_arc != -1 then lang_items_check_unique(&mut seen, items.weak_arc, "weak_arc") end
+  if items.affine_handle != -1 then lang_items_check_unique(&mut seen, items.affine_handle, "affine_handle") end
   lang_items_check_unique(&mut seen, items.drop_trait, "drop_trait")
   lang_items_check_unique(&mut seen, items.clone_trait, "clone_trait")
   lang_items_check_unique(&mut seen, items.copy_trait, "copy_trait")
@@ -6106,6 +6366,19 @@ end
 #   E0218 — Condition must be Bool
 #   E0219 — Loop condition must be Bool
 #   E0277 — Trait bound not satisfied (Send/Sync)
+# (impl conformance — validate-first-register-second):
+#   E0220 — Impl missing a required trait method
+#   E0221 — Duplicate method in an impl
+#   E0222 — Unknown member (method / associated type) in a trait impl
+#   E0223 — Trait method parameter count mismatch
+#   E0224 — Trait method parameter type mismatch
+#   E0225 — Trait method access-convention mismatch (let/inout/sink/set)
+#   E0226 — Trait method return type mismatch
+#   E0227 — Trait method generic parameter count mismatch
+#   E0228 — Trait method generic bound mismatch
+#   E0229 — Trait argument count mismatch (the full TraitRef, not the head)
+#   E0230 — Impl method obligations/effects beyond the trait contract
+#   E0231 — Impl missing an associated type the trait declares
 
 # ———————————————————————————————————————————————————————————————
 # Type Checking
@@ -6658,6 +6931,67 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       i = i + 1
     end
 
+    # (impl conformance — validate-first-register-second): build the
+    # trait's CONTRACT alongside the MethodSig set — the resolved method
+    # signatures (in the trait's generic scope), the method-level generic
+    # parameter names and their bound trait names in declaration order,
+    # the default-body flag (a missing impl method is allowed ONLY for a
+    # defaulted contract method), and the declared effect set (the std
+    # effectful-function seeds by the trait's module-qualified identity —
+    # an impl method must not require effects beyond the trait's set).
+    var contract_methods = Vec::new()
+    var ci = 0
+    while ci < t.methods.len() do
+      var cparams = Vec::new()
+      var cj = 0
+      while cj < t.methods[ci].sig.params.len() do
+        let p = t.methods[ci].sig.params[cj]
+        let resolved_ty = match p.ty
+        when Option::Some(ty_expr) then
+          resolve_type_expr(env, &ty_expr)
+        when Option::None then
+          fresh_type_var(env)
+        end
+        cparams.push(ParamType { ty: resolved_ty, convention: p.convention })
+        cj = cj + 1
+      end
+      let cret_ty = match t.methods[ci].sig.ret_type
+      when Option::Some(ret_expr) then resolve_type_expr(env, &ret_expr)
+      when Option::None then Type::Unit
+      end
+      var mg_names = Vec::new()
+      var mg_bounds = Vec::new()
+      var mgi = 0
+      while mgi < t.methods[ci].sig.generic_params.len() do
+        let mgp = t.methods[ci].sig.generic_params[mgi]
+        mg_names.push(mgp.name.clone())
+        var bnames = Vec::new()
+        for b in mgp.bounds do
+          bnames.push(type_expr_name_of(&b))
+        end
+        mg_bounds.push(bnames)
+        mgi = mgi + 1
+      end
+      let c_is_default = match t.methods[ci].default_body
+      when FnBody::FnNone then false
+      when _ then true
+      end
+      let c_effects = declared_effects_of(env, &Vec::new(), module_qualified_effect_name(&module_path, &t.methods[ci].sig.name))
+      let c_has_receiver = t.methods[ci].sig.params.len() > 0 && t.methods[ci].sig.params[0].name == "self"
+      contract_methods.push(TraitMethodContract {
+        name: t.methods[ci].sig.name,
+        params: cparams,
+        ret_type: cret_ty,
+        has_receiver: c_has_receiver,
+        receiver_in_params: c_has_receiver,
+        has_default: c_is_default,
+        generic_param_names: mg_names,
+        generic_param_bounds: mg_bounds,
+        declared_effects: c_effects
+      })
+      ci = ci + 1
+    end
+
     pop_scope(env)
 
     var gen_params = Vec::new()
@@ -6671,7 +7005,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       id: id,
       name: t.name.clone(),
       def_kind: TypeDefKind::Trait(methods),
-      generic_params: gen_params,
+      generic_params: gen_params.clone(),
       kind: TypeKind::Value
       def: Option::None
     }
@@ -6694,6 +7028,27 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     if !env.trait_registry.contains_key(&t.name) then
       env.trait_registry.insert(t.name.clone(), decl_tid.id)
     end
+    # (impl conformance — validate-first-register-second): record the
+    # trait's CONTRACT under its FINAL declaration identity (decl_tid —
+    # the same TraitId the impl side resolves via trait_id_for, so two
+    # same-named traits in different modules validate against their own
+    # declarations and a std re-declaration of a builtin trait re-records
+    # the builtin id's contract with the source shapes). The contract
+    # carries the trait-level generic parameter ids in declaration order
+    # (the substitution authority for the impl's declared trait
+    # arguments), the associated type names, and the resolved method
+    # contracts.
+    var assoc_names = Vec::new()
+    for at in t.assoc_types do
+      assoc_names.push(at.name.clone())
+    end
+    env.trait_contracts.insert(decl_tid.id, TraitContract {
+      generic_params: gen_params,
+      self_param_ids: Vec::new(),
+      assoc_types: assoc_names,
+      assoc_param_ids: Vec::new(),
+      methods: contract_methods
+    })
   when ItemKind::ItemTypeAlias(ta) then
     # Register type alias generic params in scope so resolve_type_expr
     # can find them (e.g., T in a generic alias like type Box2[T] = Box[T]).
@@ -7438,6 +7793,408 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   pop_scope(env)
 end
 
+# ———————————————————————————————————————————————————————————————
+# Impl conformance validation (validate-first-register-second)
+# ———————————————————————————————————————————————————————————————
+#
+# check_impl registers an ImplInfo into env.impls — the solver's candidate
+# set — AFTER this validation: an impl that does not satisfy its trait's
+# declared CONTRACT never enters the candidate set, even transiently. The
+# contract is the TraitContract recorded at the trait registration sites
+# (register_builtin_trait / collect_type_def's ItemTrait arm) under the
+# same TraitId the impl resolves (trait_id_for — the module-semantic
+# declaration identity, so two same-named traits in different modules
+# validate against their own declarations).
+#
+# The rules:
+#   (a) every NON-DEFAULT contract method must be present in the impl;
+#   (b) duplicate impl methods are rejected;
+#   (c) an impl member that is not a contract method is rejected as an
+#       unknown member — the language permits inherent-extension methods
+#       ONLY in inherent impls (trait_name == ""); a trait impl's extra
+#       members are typos/leaks and are rejected;
+#   (d) the parameter count must be EXACT after the receiver-position
+#       normalization (the source contract's `self` is a recorded
+#       parameter; the builtin stub's synthetic receiver is a wildcard);
+#   (e) the parameter TYPES must unify after the Self / trait-argument /
+#       associated-type substitution;
+#   (f) the access conventions must match EXACTLY (let/inout/sink/set —
+#       a trait `inout x` against an impl `let x` is rejected, and the
+#       inverse), except the builtin stub's synthetic receiver;
+#   (g) the return type must unify after the same substitution;
+#   (h) the method generic arity must be exact;
+#   (i) the method generic bounds must satisfy the trait contract;
+#   (j) the trait generic arguments must match the contract's trait-level
+#       parameters — the FULL TraitRef, never a head-only approximation;
+#   (k) the impl method must not require effects beyond the trait's
+#       declared set (the std seeds by the trait's module-qualified
+#       identity);
+#   (l) the impl method must not add obligations the trait contract does
+#       not declare (@budget annotations, required capabilities,
+#       pre/post/invariant contracts);
+#   (m) every contract associated type must be provided by the impl (and
+#       an impl associated type the trait does not declare is rejected);
+#   (n) a missing method is allowed ONLY when the contract method has a
+#       default body.
+# Coherence — E0214 — and the TraitId module identity ((o), (q)) are the
+# existing machinery. The orphan rule ((p)) is the selected Tangerine
+# rule: NO orphan restriction — impls of foreign traits for foreign types
+# are permitted in any module (the std itself implements std-local
+# traits for std types in arbitrary modules), so conformance is decided
+# entirely by the declared-set validation above.
+
+# Whether two declared effect sets are equal (id-based, order-insensitive).
+def effect_ids_equal(a: Vec[EffectId], b: Vec[EffectId]) -> Bool
+  if a.len() != b.len() then return false end
+  var i = 0
+  while i < a.len() do
+    var found = false
+    var j = 0
+    while j < b.len() do
+      if b[j].id == a[i].id then found = true end
+      j = j + 1
+    end
+    if !found then return false end
+    i = i + 1
+  end
+  true
+end
+
+# Substitute the CONTRACT side of one signature comparison: the trait-level
+# generic parameters (positionally against the impl's declared trait
+# arguments), the builtin contracts' implicit receiver parameters (the
+# impl's self type) and the associated-type references (the impl's
+# resolved associated types — the builtin contracts' `Item` parameter ids
+# and the source contracts' auto-registered "Self::<Assoc>" opaque
+# references).
+def contract_ty_subst(env: TypeEnv, contract: TraitContract, trait_args: Vec[Type], self_type: Type, assoc_types: Vec[Type], ty: Type) -> Type
+  match ty
+  when Type::Param(gpid) then
+    var i = 0
+    while i < contract.generic_params.len() do
+      if generic_param_id_eq(&contract.generic_params[i], &gpid) then
+        return trait_args[i].clone()
+      end
+      i = i + 1
+    end
+    var si = 0
+    while si < contract.self_param_ids.len() do
+      if generic_param_id_eq(&contract.self_param_ids[si], &gpid) then
+        return self_type.clone()
+      end
+      si = si + 1
+    end
+    var ai = 0
+    while ai < contract.assoc_param_ids.len() do
+      if generic_param_id_eq(&contract.assoc_param_ids[ai], &gpid) then
+        if ai < assoc_types.len() then return assoc_types[ai].clone() end
+      end
+      ai = ai + 1
+    end
+    ty.clone()
+  when Type::Adt(tid, args) then
+    if args.len() == 0 then
+      match get_type_by_id_ref(env, &tid)
+      when Option::Some(td) then
+        if td.name.starts_with("Self::") then
+          let aname = td.name.slice(6, td.name.len())
+          var ai = 0
+          while ai < contract.assoc_types.len() do
+            if contract.assoc_types[ai] == aname then
+              if ai < assoc_types.len() then return assoc_types[ai].clone() end
+            end
+            ai = ai + 1
+          end
+        end
+      when Option::None then ()
+      end
+    end
+    var new_args = Vec::new()
+    var i = 0
+    while i < args.len() do
+      new_args.push(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &args[i]))
+      i = i + 1
+    end
+    Type::Adt(tid, new_args)
+  when Type::FixedArray(elem, n) then Type::FixedArray(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &elem), n)
+  when Type::FnPtr(params, ret, effects) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &pt.ty), convention: pt.convention })
+      i = i + 1
+    end
+    Type::FnPtr(new_params, contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &ret), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &pt.ty), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Closure(cid.clone(), new_params, contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &ret), contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &captures), effects.clone())
+  when Type::Tuple(fields) then
+    var new_fields = Vec::new()
+    var i = 0
+    while i < fields.len() do
+      new_fields.push(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &fields[i]))
+      i = i + 1
+    end
+    Type::Tuple(new_fields)
+  when Type::RefInternal(inner, mutable) then Type::RefInternal(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &inner), mutable)
+  when Type::Ptr(inner) then Type::Ptr(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &inner))
+  when Type::PtrMut(inner) then Type::PtrMut(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &inner))
+  when Type::Effect(effects, inner) then Type::Effect(effects.clone(), contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &inner))
+  when _ then ty.clone()
+  end
+end
+
+# One transactional type comparison: the probe runs from a snapshot and
+# restores it unconditionally — no substitution residue and no diagnostic
+# residue survive a compare, whether it succeeds or fails.
+def contract_unify_probe(inout env: TypeEnv, a: Type, b: Type) -> Bool
+  let snap = subst_snapshot(env)
+  let errs_before = env.errors.len()
+  let ok = try_head_unify(env, a, b)
+  subst_restore(env, &snap)
+  errors_truncate(env, errs_before)
+  ok
+end
+
+# (impl conformance): the per-method signature comparison — parameter
+# count (d), parameter types (e), access conventions (f), return type (g),
+# method generic arity (h), method generic bounds (i), effects (k) and
+# declared obligations (l).
+def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, cm: TraitMethodContract, trait_name: String, self_type: Type, trait_args: Vec[Type], assoc_types: Vec[Type], im: MethodInfo, im_sig: FnSignature, m: FunctionDecl) -> Bool
+  var valid = true
+
+  # (h) method generic arity is exact.
+  if im.generic_params.len() != cm.generic_param_names.len() then
+    add_error_with_code(env, "generic parameter count mismatch: method `" + cm.name + "` of trait `" + trait_name + "` declares " + im.generic_params.len().to_string() + " generic parameter(s), the trait declares " + cm.generic_param_names.len().to_string(), m.span, "E0227")
+    valid = false
+  end
+
+  # (i) the impl's method generic parameters must declare the contract's
+  # bound trait names.
+  var bpi = 0
+  while bpi < cm.generic_param_bounds.len() do
+    let cbounds = cm.generic_param_bounds[bpi]
+    var impl_bounds = Vec::new()
+    if bpi < m.generic_params.len() then
+      for b in m.generic_params[bpi].bounds do
+        impl_bounds.push(type_expr_name_of(&b))
+      end
+    end
+    var bj = 0
+    while bj < cbounds.len() do
+      let cbname = cbounds[bj]
+      var has_bound = false
+      var kbi = 0
+      while kbi < impl_bounds.len() do
+        if impl_bounds[kbi] == cbname then has_bound = true end
+        kbi = kbi + 1
+      end
+      if !has_bound then
+        add_error_with_code(env, "generic bound mismatch: generic parameter " + bpi.to_string() + " of method `" + cm.name + "` of trait `" + trait_name + "` is missing bound `" + cbname + "`", m.span, "E0228")
+        valid = false
+      end
+      bj = bj + 1
+    end
+    bpi = bpi + 1
+  end
+
+  # (d) parameter count is EXACT after the receiver-position
+  # normalization: a source contract records its `self` parameter
+  # (receiver_in_params); a builtin stub's receiver is synthetic (a
+  # wildcard position the impl must still occupy).
+  let impl_has_self = m.params.len() > 0 && m.params[0].name == "self"
+  var contract_expected = cm.params.len()
+  if cm.has_receiver && !cm.receiver_in_params then
+    contract_expected = contract_expected + 1
+  end
+  if im.params.len() != contract_expected then
+    add_error_with_code(env, "parameter count mismatch: method `" + cm.name + "` of trait `" + trait_name + "` declares " + im.params.len().to_string() + " parameter(s), the trait declares " + contract_expected.to_string(), m.span, "E0223")
+    return false
+  end
+  if cm.has_receiver != impl_has_self then
+    if cm.has_receiver then
+      add_error_with_code(env, "parameter count mismatch: method `" + cm.name + "` of trait `" + trait_name + "` must take `self` as its first parameter", m.span, "E0223")
+    else
+      add_error_with_code(env, "parameter count mismatch: method `" + cm.name + "` of trait `" + trait_name + "` must not take a `self` parameter", m.span, "E0223")
+    end
+    return false
+  end
+
+  # (e) / (f) the non-receiver parameters: exact conventions, unifying
+  # types. The builtin stub's synthetic receiver position is skipped.
+  var impl_offset = 0
+  if cm.has_receiver && !cm.receiver_in_params then
+    impl_offset = 1
+  end
+  var pi = 0
+  while pi < cm.params.len() do
+    let cpt = cm.params[pi]
+    let ipt = im.params[pi + impl_offset]
+    if !(cpt.convention == ipt.convention) then
+      add_error_with_code(env, "access convention mismatch: parameter " + pi.to_string() + " of method `" + cm.name + "` of trait `" + trait_name + "` has convention `" + convention_identity_tag(&ipt.convention) + "`, the trait declares `" + convention_identity_tag(&cpt.convention) + "`", m.span, "E0225")
+      valid = false
+    end
+    let contract_ty = contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &cpt.ty)
+    if !contract_unify_probe(env, ipt.ty.clone(), contract_ty) then
+      add_error_with_code(env, "parameter type mismatch: parameter " + pi.to_string() + " of method `" + cm.name + "` of trait `" + trait_name + "` has type `" + type_tag(env, &ipt.ty) + "`, the trait declares `" + type_tag(env, &cpt.ty) + "`", m.span, "E0224")
+      valid = false
+    end
+    pi = pi + 1
+  end
+
+  # (g) the return type unifies after the same substitution.
+  let contract_ret = contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &cm.ret_type)
+  if !contract_unify_probe(env, im.ret_type.clone(), contract_ret) then
+    add_error_with_code(env, "return type mismatch: method `" + cm.name + "` of trait `" + trait_name + "` returns `" + type_tag(env, &im.ret_type) + "`, the trait declares `" + type_tag(env, &cm.ret_type) + "`", m.span, "E0226")
+    valid = false
+  end
+
+  # (k) the impl method must not require effects beyond the trait's set.
+  if !effect_ids_equal(&im_sig.declared_effects, &cm.declared_effects) then
+    add_error_with_code(env, "effect mismatch: method `" + cm.name + "` of trait `" + trait_name + "` requires effects beyond the trait contract", m.span, "E0230")
+    valid = false
+  end
+
+  # (l) the impl method must not add obligations the trait contract does
+  # not declare.
+  match im_sig.declared_budget
+  when Option::Some(_) then
+    add_error_with_code(env, "budget annotation beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    valid = false
+  when Option::None then ()
+  end
+  if m.required_caps.len() > 0 then
+    add_error_with_code(env, "required capabilities beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    valid = false
+  end
+  if m.contracts.len() > 0 then
+    add_error_with_code(env, "contract clauses beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    valid = false
+  end
+
+  valid
+end
+
+# (impl conformance): validate one trait impl's method set and signatures
+# against the trait's CONTRACT — (a)/(b)/(c)/(j)/(m)/(n) at the impl
+# level, (d)-(l) per matched method. Returns false when any check fails
+# (every failure records its specific diagnostic). MUST run before the
+# ImplInfo enters env.impls.
+def validate_impl_conformance(inout env: TypeEnv, contract: TraitContract, trait_name: String, self_type: Type, trait_args: Vec[Type], impl_methods: Vec[MethodInfo], impl_sig_records: Vec[FnSignature], imp: ImplDecl) -> Bool
+  var valid = true
+
+  # (j) the FULL TraitRef: the trait-level generic arity is exact.
+  if contract.generic_params.len() != trait_args.len() then
+    add_error_with_code(env, "trait argument count mismatch: trait `" + trait_name + "` takes " + contract.generic_params.len().to_string() + " type argument(s), this impl provides " + trait_args.len().to_string(), imp.span, "E0229")
+    return false
+  end
+
+  # (m) associated types: every contract assoc type must be provided; an
+  # impl assoc type the trait does not declare is an unknown member.
+  var impl_assoc_types = Vec::new()
+  for at in imp.assoc_types do
+    impl_assoc_types.push((at.name.clone(), resolve_type_expr(env, &at.ty)))
+  end
+  var contract_assoc_resolved = Vec::new()
+  var ai = 0
+  while ai < contract.assoc_types.len() do
+    let aname = contract.assoc_types[ai]
+    var found_ty = Option::None
+    var fi = 0
+    while fi < impl_assoc_types.len() do
+      if impl_assoc_types[fi].0 == aname then
+        found_ty = Option::Some(impl_assoc_types[fi].1)
+      end
+      fi = fi + 1
+    end
+    match found_ty
+    when Option::Some(ty) then contract_assoc_resolved.push(ty)
+    when Option::None then
+      add_error_with_code(env, "missing associated type `" + aname + "` in impl of trait `" + trait_name + "`", imp.span, "E0231")
+      valid = false
+    end
+    ai = ai + 1
+  end
+  for at in impl_assoc_types do
+    var known = false
+    var ci = 0
+    while ci < contract.assoc_types.len() do
+      if contract.assoc_types[ci] == at.0 then known = true end
+      ci = ci + 1
+    end
+    if !known then
+      add_error_with_code(env, "associated type `" + at.0 + "` is not a member of trait `" + trait_name + "`", imp.span, "E0222")
+      valid = false
+    end
+  end
+
+  # (b) duplicate impl methods are rejected.
+  var mi = 0
+  while mi < impl_methods.len() do
+    var prev = 0
+    while prev < mi do
+      if impl_methods[prev].name == impl_methods[mi].name then
+        add_error_with_code(env, "duplicate method `" + impl_methods[mi].name + "` in impl of trait `" + trait_name + "`", imp.span, "E0221")
+        valid = false
+      end
+      prev = prev + 1
+    end
+    mi = mi + 1
+  end
+
+  # (a) / (n) every non-default contract method must be present; a missing
+  # defaulted method is allowed. (c) an impl member that is not a contract
+  # method is an unknown member (inherent-extension methods are permitted
+  # ONLY in inherent impls).
+  var ci = 0
+  while ci < contract.methods.len() do
+    let cm = contract.methods[ci]
+    var impl_idx = -1
+    var ii = 0
+    while ii < impl_methods.len() do
+      if impl_methods[ii].name == cm.name then impl_idx = ii end
+      ii = ii + 1
+    end
+    if impl_idx == -1 then
+      if !cm.has_default then
+        add_error_with_code(env, "missing required method `" + cm.name + "` of trait `" + trait_name + "`", imp.span, "E0220")
+        valid = false
+      end
+    else
+      if impl_idx < impl_sig_records.len() && impl_idx < imp.methods.len() then
+        if !check_impl_method_conformance(env, contract, &cm, trait_name, self_type, trait_args, contract_assoc_resolved, impl_methods[impl_idx], impl_sig_records[impl_idx], imp.methods[impl_idx]) then
+          valid = false
+        end
+      end
+    end
+    ci = ci + 1
+  end
+  var ii2 = 0
+  while ii2 < impl_methods.len() do
+    let im = impl_methods[ii2]
+    var known = false
+    var ci2 = 0
+    while ci2 < contract.methods.len() do
+      if contract.methods[ci2].name == im.name then known = true end
+      ci2 = ci2 + 1
+    end
+    if !known then
+      add_error_with_code(env, "method `" + im.name + "` is not a member of trait `" + trait_name + "`", imp.span, "E0222")
+      valid = false
+    end
+    ii2 = ii2 + 1
+  end
+
+  valid
+end
+
 def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Unit
   # Register impl-level generic type parameters FIRST so they are in scope
   # when resolving i.for_type (e.g., Vec[T] needs T in scope).
@@ -7695,6 +8452,27 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
       end
       ci = ci + 1
     end
+  end
+
+  # (validate-first-register-second — impl conformance): BEFORE the impl
+  # enters env.impls (the solver's candidate set), validate the impl's
+  # method set and signatures against the trait's declared CONTRACT
+  # (TraitContract — recorded at the trait registration sites under the
+  # same TraitId; inherent impls have no contract and are always valid).
+  # An invalid impl is rejected here and NEVER becomes a candidate, even
+  # transiently; its method bodies are not checked (the unregistered
+  # impl's methods cannot resolve).
+  var impl_valid = true
+  if trait_id.id != -1 then
+    match env.trait_contracts.get(trait_id.id)
+    when Option::Some(tcontract) then
+      impl_valid = validate_impl_conformance(env, &tcontract, &trait_name, &self_type, &imp_trait_args, &impl_methods, &impl_sig_records, i)
+    when Option::None then ()
+    end
+  end
+  if !impl_valid then
+    pop_scope(env)
+    return
   end
 
   # Register the impl in env.impls so resolve_method_type can find methods
@@ -10873,6 +11651,22 @@ def solve_obligation_depth(inout env: TypeEnv, obligation: Obligation, inout vis
     end
   when _ then ()
   end
+ # (concurrency properties — the auto-trait hook): Transferable/Shareable
+  # obligations solve by the STRUCTURAL DERIVATION — the compiler-derived
+  # authority. The user-implementable marker impls are removed from the
+  # std and the candidate loop below is NEVER consulted for these traits:
+  # even a leftover user impl is ignored, so the derivation is the
+  # authority by construction. The hook sits after the param-bounds
+  # registry (a `[T: Transferable]`-bounded parameter proves the
+  # obligation from its declared bounds — the checker's bound
+  # resolution) and before the candidate loop; the derivation's own
+  # visited set terminates its recursion (no cycle through the solver).
+  if obligation.trait_ref.trait_id.id == env.lang_items.transferable_trait then
+    return derive_transferable(env, &self_resolved)
+  end
+  if obligation.trait_ref.trait_id.id == env.lang_items.shareable_trait then
+    return derive_syncable(env, &self_resolved)
+  end
   let key = obligation.trait_ref.trait_id.id.to_string() + "::" + type_identity_key(env, &self_resolved) + "::" + args_key
   if visited.contains(&key) then
     # Cycle: this (trait, type) obligation is already being solved on the
@@ -11225,7 +12019,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
         # container's own arm claimed owns_state/requires_drop_glue; the
         # element's linearity/capability containment was decided by the
         # boundary-crossing arm's first visit).
-        return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
+        return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
       end
       # Recursion through INLINE storage: infinitely sized recursive type.
       # The layout engine panics on such types; the property engine reports
@@ -11239,12 +12033,12 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
         span: Span { file: "", start: 0, end_pos: 0 },
         code: Option::None
       })
-      return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
+      return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
     end
   when Option::None then ()
   end
   visiting.insert(key.clone(), TypePropVisitState::Visiting)
-  var props = TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
+  var props = TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
   match ty
   # Plain data: no drop, not linear, not a capability, bit-copyable.
   when Type::Unit then ()
@@ -11358,8 +12152,15 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
  # is_trivially_copyable comes from FIX 1: the decided bit-copy set.
   # A deferred type carries NO concrete answer here — the field stays false
   # (non-authoritative; the is_deferred flag is set) until substitution.
+  # (concurrency properties): the concurrency properties are the derived
+  # queries — the transferable walk and the shareable walk (the single
+  # authority; the engine answers through the SAME derivation the solver
+  # uses, so the two paths cannot disagree by construction). Deferred
+  # types carry no concrete answer (false + is_deferred).
   if !props.is_deferred then
     props.is_trivially_copyable = is_trivially_copyable(env, ty)
+    props.is_transferable = is_send(env, ty)
+    props.is_shareable = is_sync(env, ty)
   end
   visiting.insert(key.clone(), TypePropVisitState::Resolved)
   env.type_prop_cache.insert(key, props.clone())
@@ -12368,6 +13169,105 @@ def closure_has_inout_capture(env: TypeEnv, node_id: Int) -> Bool
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# The closure-capture enforcement (closure-capture enforcement): the async/thread
+# closure capture classification and the rejections
+# ———————————————————————————————————————————————————————————————
+# The capture CLASSIFICATION (the existing capture machinery — the
+# closure_captures record): a captured local is
+#   - read-only, non-escaping            -> let (AccessEffect::Read)
+#   - mutated in a non-escaping closure  -> the lexical inout (Modify)
+#   - escaping ownership                 -> sink (Consume)
+# For an async/thread closure (a closure argument to a spawn/schedule/
+# poll/async-marked call — the escaping context), the capture must be a
+# SINK (the ownership moves into the task) or a SHAREABLE state (the
+# synchronized representation — Arc/Mutex/RwLock/atomics/channels).
+# The REJECTIONS (each with its diagnostic):
+#   - the escaping inout capture   — a Modify capture: the lexical inout
+#     state cannot leave its defining execution context
+#   - the inout across await       — the same, at the await boundary
+#   - the raw stack-pointer escape — a captured local whose type is a raw
+#     Ptr/PtrMut: a stack address must not escape into a task/thread
+#   - the thread closure capturing a non-Transferable value — the
+#     captured type fails the transferable walk (the affine native
+#     handles, the inout state, the gated raw pointers)
+#   - the concurrent closure using a plain shared mutable value — a Read
+#     capture of a NON-SHAREABLE USER-DEFINED aggregate (the plain
+#     mutable struct shape): the state is not synchronized — share it
+#     through Arc/Mutex/RwLock/atomics/channels. The builtin owned
+#     values (String, the containers, the smart pointers) are the
+#     language's sink-movable shapes and are NOT rejected here (the
+#     Transferable walk governs them); a user aggregate with an explicit
+#     opt-in (impl UnsafeTransferable) is exempt the same way.
+def check_async_closure_captures(inout env: TypeEnv, node_id: Int, span: Span) -> Unit
+  match env.closure_captures.get(node_id)
+  when Option::Some(caps) then
+    let entries = caps.entries()
+    var i = 0
+    while i < entries.len() do
+      let cap_id = entries[i].0
+      let cap_effect = entries[i].1
+      let cap_ty = match env.typed_local_bindings.get(cap_id)
+      when Option::Some(lb) then lb.ty.clone()
+      when Option::None then Type::Unit
+      end
+      match cap_effect
+      when AccessEffect::Modify then
+        type_add_error(env, "escaping inout capture: inout capture cannot cross await (the lexical inout state cannot leave its defining execution context)", span)
+      when AccessEffect::Consume then
+        if !is_send(env, &cap_ty) then
+          type_add_error(env, "thread closure capturing a non-Transferable value: type `" + type_display(env, &cap_ty) + "` cannot be transferred into another execution context", span)
+        end
+      when AccessEffect::Read then
+        if type_is_raw_pointer(&cap_ty) then
+          type_add_error(env, "raw stack-pointer escaping into a task/thread: a raw pointer capture may dangle in another execution context", span)
+        end
+        if !is_send(env, &cap_ty) then
+          type_add_error(env, "thread closure capturing a non-Transferable value: type `" + type_display(env, &cap_ty) + "` cannot be transferred into another execution context", span)
+        end
+        if !is_sync(env, &cap_ty) && !pointer_gate_holds(env, &cap_ty, "UnsafeTransferable") && named_type_is_user_aggregate(env, &cap_ty) then
+          type_add_error(env, "concurrent closure using a plain shared mutable value: type `" + type_display(env, &cap_ty) + "` is not Shareable — share the state through Arc/Mutex/RwLock/atomics/channels", span)
+        end
+      when _ then ()
+      end
+      i = i + 1
+    end
+  when Option::None then ()
+  end
+end
+
+# The "plain mutable struct" shape of the concurrent-closure rejection:
+# a USER-DEFINED aggregate (an Adt whose TypeId is none of the builtin/
+# std-recognized LangItems forms — the scalars, String, the containers,
+# the smart pointers, the raw pointers). The builtin owned values are
+# the language's sink-movable shapes; the plain user struct must be
+# synchronized (Arc/Mutex/RwLock/atomics/channels) to be shared.
+def named_type_is_user_aggregate(env: TypeEnv, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then
+    let id = tid.id
+    !(id == env.lang_items.option || id == env.lang_items.result ||
+      id == env.lang_items.vec || id == env.lang_items.map ||
+      id == env.lang_items.set || id == env.lang_items.box_ ||
+      id == env.lang_items.rc || id == env.lang_items.array ||
+      id == env.lang_items.slice || id == env.lang_items.unique_ptr ||
+      id == env.lang_items.arc_strong || id == env.lang_items.weak_rc ||
+      id == env.lang_items.weak_arc || id == env.lang_items.affine_handle ||
+      id == env.lang_items.ptr || id == env.lang_items.ptr_mut)
+  when _ then false
+  end
+end
+
+# A captured local whose type is a raw pointer — the stack-pointer escape
+# rejection shape.
+def type_is_raw_pointer(ty: Type) -> Bool
+  match ty
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when _ then false
+  end
+end
+
 def callee_ident_name(expr: Expr) -> Option[String]
   match expr.kind
   when ExprKind::ExprIdent(n) then Option::Some(n.clone())
@@ -12754,9 +13654,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       if is_async_marker(&cname) then
         var ai = 0
         while ai < args.len() do
-          if closure_has_inout_capture(env, args[ai].node_id) then
-            type_add_error(env, "inout capture cannot cross await", args[ai].span)
-          end
+          check_async_closure_captures(env, args[ai].node_id, args[ai].span)
           ai = ai + 1
         end
       end
@@ -12863,14 +13761,10 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       end
     end
     if is_async_marker(&method) then
-      if closure_has_inout_capture(env, recv.node_id) then
-        type_add_error(env, "inout capture cannot cross await", recv.span)
-      end
+      check_async_closure_captures(env, recv.node_id, recv.span)
       var mai = 0
       while mai < args.len() do
-        if closure_has_inout_capture(env, args[mai].node_id) then
-          type_add_error(env, "inout capture cannot cross await", args[mai].span)
-        end
+        check_async_closure_captures(env, args[mai].node_id, args[mai].span)
         mai = mai + 1
       end
     end
@@ -16279,58 +17173,79 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
 end
 
 # ———————————————————————————————————————————————————————————————
-# Transferable (Send) / Shareable (Sync) classification 
+# Transferable / Shareable classification — the compiler-derived
+# concurrency properties (concurrency properties)
 # ———————————————————————————————————————————————————————————————
 
 # SINGLE RULE (, DECIDED — auto traits, ONE authority): Transferable and
 # Shareable are AUTO TRAITS whose STRUCTURAL DERIVATION IS the canonical
-# solver rule. `T: Transferable` holds iff the structural derivation below
-# proves it — T's fields/variants/contents are all Transferable — and the
-# obligation-solver query inside the derivation is the impl-registry
-# materialization of the SAME rule (the std's bounded impls encode exactly
-# the structural derivation: primitives, containers, the GATED raw-pointer
-# impls), NOT an independent authority. There is no "solver failed → second
-# unrelated algorithm" fallback: the structural walk is the derivation
-# itself, so the registry path and the direct path cannot disagree by
-# construction. The old string-name exclusion sets (non_send_types /
-# non_sync_types) are NO LONGER READ in the decision path — they remain as
-# a documentation mirror only. Rc has no Transferable/Shareable impl (the
-# std agent excluded it), so both materializations reject it; the interior
-# mutability types have no Shareable impl. A type is rejected only when it
-# is provably non-transferable; undecidable leaves fail OPEN (true).
+# solver rule — the derivations below are THE authority. The
+# user-implementable marker IMPLS ARE REMOVED FROM THE STD (the Send/Sync
+# traits are deleted; the Transferable/Shareable marker impls are
+# deleted): the obligation solver solves `T: Transferable` / `T:
+# Shareable` obligations by the SAME structural derivation (see
+# solve_obligation_depth's auto-trait hook), and a leftover user impl is
+# never consulted — the derivation is the authority by construction.
+#
+# THE TRANSFERABLE WALK (a value is NOT Transferable when it contains):
+#   1. the EXECUTION-CONTEXT-AFFINE NATIVE HANDLE (the std-marked
+#      AffineHandle — the pthread thread handle PthreadT / the TLS key
+#      PthreadKeyT carry the zero-size mark field) unless the CONTAINING
+#      type explicitly opts in (`impl UnsafeTransferable for T` — the
+#      documented gate). The raw Ptr/PtrMut of the affine types are
+#      covered by the pointer gate (never inferred).
+#   2. the ACTIVE LEXICAL INOUT STATE: a closure with an inout (Modify)
+#      capture carries the lexical inout state — such a closure is not
+#      Transferable/Shareable (the mutation is lexical to its defining
+#      context; moving it would move the mutation).
+#   3. the NON-TRANSFERABLE CAPTURED STATE: a closure's transferability
+#      derives from its capture tuple (the walk recurses into it).
+#   The plain owned types (String/Vec/Map/owned aggregates) ARE
+#   Transferable (ownership moves); the smart-pointer layer (Box/
+#   UniquePtr/Arc/WeakArc) transfers when its pointee does (heap-stable
+#   ownership); Rc/WeakRc and the gated raw pointers are NOT.
+#
+# THE SHAREABLE WALK (safe simultaneous access through a shared
+# representation): a type is Shareable iff
+#   1. it is a TRIVIALLY-COPYABLE VALUE TYPE (the scalars and the
+#      all-scalar aggregates — the atomics are exactly this shape), or
+#   2. it is a RECOGNIZED SYNCHRONIZED REPRESENTATION — the Arc/WeakArc
+#      (the shared heap boundary; the interior is reached through the
+#      Arc's protocol, so the walk stops there — sharing an Arc shares
+#      the synchronized representation), or
+#   3. every field/variant/arg is itself Shareable (a Mutex/RwLock/
+#      Condvar/channel — the std::sync types — reach the Arc layer
+#      structurally).
+#   The plain OWNED types (String/Vec/Map/owned aggregates) are
+#   Transferable but NOT Shareable: shared mutable state must go through
+#   Arc/Mutex/RwLock/atomics/channels. A type is rejected only when it
+#   is provably non-transferable/non-shareable; undecidable leaves fail
+#   OPEN (true).
 #
 # Raw pointers (, DECIDED): Ptr[T] / PtrMut[T] are Transferable /
 # Shareable ONLY when the pointee T explicitly implements the opt-in gate
 # marker (std::core UnsafeTransferable / UnsafeShareable) — pointer
 # thread-safety is never inferred from T: Transferable (bit-copyability
 # says nothing about whether the address stays meaningful and race-safe on
-# another thread). The gate query below and the std's gated bounded impls
-# are the same rule.
+# another thread). The gate query is the ONLY user-implementable marker
+# surface left in the concurrency model — the explicit opt-in the
+# mandate names ("unless explicitly opted in").
+#
+# The old string-name exclusion sets (non_send_types / non_sync_types)
+# are NOT READ in the decision path — they remain as a documentation
+# mirror only. There is NO depth-based semantic shortcut: a deep-but-
+# finite chain is walked to its concrete leaves (a depth limit would be a
+# diagnostic, never a semantic answer).
 def is_send(inout env: TypeEnv, ty: Type) -> Bool
   var visited = Set::new()
   derive_transferable(env, ty, &mut visited)
 end
 
-# The single Transferable derivation (auto-trait rule): first the
-# obligation solver proves the trait from the impl registry (the
-# registry-backed materialization of the SAME structural rule — primitives,
-# containers, gated pointers); for types the registry cannot decide, the
-# derivation continues structurally over the type's shape. The visited set
-# makes recursion through legal indirections (Box/Rc/pointers) terminate; a
-# revisit cannot prove non-transferability, so it fails open. There is NO
-# depth-based semantic shortcut: a deep-but-finite chain is walked to its
-# concrete leaves (a depth limit would be a diagnostic, never a semantic
-# answer).
+# The single Transferable derivation — THE rule (see the section header).
+# The visited set makes recursion through legal indirections (Box/Arc/
+# pointers) terminate; a revisit cannot prove non-transferability, so it
+# fails open.
 def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bool
- # the Transferable trait identity is its TraitId (the std declares
-  # the trait; TraitId(-1) when it has not registered, which solves nothing
-  # and continues the structural derivation — same as a name match failing).
-  let transferable_name = "Transferable"
-  let ob = Obligation { trait_ref: TraitRef { trait_id: trait_id_for(env, &transferable_name), self_ty: ty.clone(), args: Vec::new() }, trait_name: transferable_name }
-  if solve_obligation(env, &ob) then
-    return true
-  end
-  # The structural derivation — THE rule (see the section header).
   match ty
   when Type::Unit then true
   when Type::Bool then true
@@ -16338,7 +17253,7 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
   when Type::UInt then true
   when Type::Float then true
   when Type::Char then true
-  when Type::String then true
+  when Type::String then true  # owned, movable: Transferable (NOT Shareable)
   when Type::I8 then true
   when Type::I16 then true
   when Type::I32 then true
@@ -16354,7 +17269,25 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
   when Type::F32 then true
   when Type::F64 then true
   when Type::Adt(tid, args) then
-    is_named_transferable(env, tid, args, visited)
+   # the EXPLICIT OPT-IN (the documented gate): a type whose safety
+    # contract is asserted with `impl UnsafeTransferable for T` is
+    # Transferable — the sanctioned escape for the std's own pinned
+    # native handles (e.g. std::db's Transaction — a raw conn_handle
+    # pinned by an Arc token for the value's whole lifetime). Without
+    # the opt-in, a value CONTAINING the std-marked AffineHandle (the
+    # execution-context-affine native handle) is NOT Transferable.
+    if pointer_gate_holds(env, &ty, "UnsafeTransferable") then
+      true
+    elsif type_contains_affine_handle(env, ty) then
+      false
+    elsif tid.id == env.lang_items.rc || tid.id == env.lang_items.weak_rc then
+      false  # the refcount is NOT synchronized
+    elsif tid.id == env.lang_items.arc_strong || tid.id == env.lang_items.weak_arc ||
+          tid.id == env.lang_items.box_ || tid.id == env.lang_items.unique_ptr then
+      transferable_args_all(env, &args, visited)  # heap-stable ownership: the pointee walk
+    else
+      is_named_transferable(env, tid, args, visited)
+    end
   when Type::RefInternal(inner, _) then
     derive_transferable(env, inner, visited)
   when Type::Tuple(elems) then
@@ -16362,12 +17295,20 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
       if !derive_transferable(env, &e, visited) then return false end
     end
     true
-  when Type::FnPtr(_, _, _) then true  #: function pointers are Transferable
- # a closure's transferability derives from its capture tuple.
-  when Type::Closure(_, _, _, captures, _) then derive_transferable(env, &captures, visited)
+  when Type::FnPtr(_, _, _) then true  # function pointers are Transferable
+  when Type::Closure(cid, _, _, captures, _) then
+    # (the active lexical inout state): a closure that mutates a
+    # captured local carries the lexical inout state — NOT Transferable.
+    if closure_has_inout_capture(env, cid.id) then
+      false
+    else
+      derive_transferable(env, &captures, visited)
+    end
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeTransferable")  # GATED: never inferred from T: Transferable
-  when Type::Dyn(_) then false  # Trait objects: conservative !Transferable
+  when Type::FixedArray(elem, _) then derive_transferable(env, &elem, visited)
+  when Type::StaticStrPtr then true  # the static string view: immutable static bytes
+  when Type::Dyn(_) then true  # an OWNED trait object (Box[dyn T]): the erasure is reached only through the owning pointer — moving the owner moves the object
   when Type::Effect(_, inner) then derive_transferable(env, &inner, visited)
   when Type::Param(_) then true  # Assume generic params are Transferable (checked at instantiation)
   when Type::Var(_) then true  # Type variables: assume Transferable
@@ -16379,27 +17320,98 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
   end
 end
 
+# All the generic args of a pointer-layer type are Transferable (the
+# Arc/Box/UniquePtr/WeakArc arm of the Adt walk).
+def transferable_args_all(inout env: TypeEnv, args: Vec[Type], inout visited: Set[Int]) -> Bool
+  var ok = true
+  for a in args do
+    if !derive_transferable(env, &a, visited) then ok = false end
+  end
+  ok
+end
+
 # (raw-pointer thread-safety gate): Ptr[T] / PtrMut[T] are
 # Transferable / Shareable only when the POINTEE explicitly implements the
 # opt-in marker trait (`impl UnsafeTransferable for T` /
 # `impl UnsafeShareable for T` in std::core). The gate is a solver query on
-# the marker trait — the same rule the std's gated bounded impls
-# materialize — and never consults T's own Transferable/Shareable
-# derivation.
+# the marker trait — the explicit opt-in of the concurrency model — and
+# never consults T's own Transferable/Shareable derivation.
 def pointer_gate_holds(inout env: TypeEnv, pointee: Type, gate_trait: String) -> Bool
   let ob = Obligation { trait_ref: TraitRef { trait_id: trait_id_for(env, &gate_trait), self_ty: pointee.clone(), args: Vec::new() }, trait_name: gate_trait.clone() }
   solve_obligation(env, &ob)
 end
 
+# THE AFFINE-HANDLE CONTAINMENT WALK: does the value contain the
+# std-marked execution-context-affine native handle (the LangItems
+# AffineHandle id — the mark the std's pthread handle types carry as a
+# zero-size field)? The walk covers the whole type graph: fields,
+# variants, generic args, the pointees of the raw-pointer layer (a
+# Ptr[Thread] is the raw pointer of an execution-context-affine type —
+# affine), the capture tuples of closures. The visited set terminates
+# recursion through legal indirections; a revisit cannot prove affine
+# containment, so it fails open (false).
+def type_contains_affine_handle(inout env: TypeEnv, ty: Type) -> Bool
+  var visited = Set::new()
+  type_contains_affine_handle_walk(env, ty, &mut visited)
+end
+
+def type_contains_affine_handle_walk(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bool
+  match ty
+  when Type::Adt(tid, args) then
+    if env.lang_items.affine_handle != -1 && tid.id == env.lang_items.affine_handle then
+      return true
+    end
+    if visited.contains(&tid.id) then
+      return false
+    end
+    visited.insert(tid.id)
+    var ok = false
+    match get_type_by_id_ref(env, tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        for field in fields do
+          let f_ty = subst_type_args(&field.ty, &td.generic_params, args)
+          if type_contains_affine_handle_walk(env, &f_ty, visited) then ok = true end
+        end
+      when TypeDefKind::Enum(variants) then
+        for variant in variants do
+          for f in variant.fields do
+            let v_ty = subst_type_args(&f, &td.generic_params, args)
+            if type_contains_affine_handle_walk(env, &v_ty, visited) then ok = true end
+          end
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+    for a in args do
+      if type_contains_affine_handle_walk(env, &a, visited) then ok = true end
+    end
+    visited.remove(&tid.id)
+    ok
+  when Type::RefInternal(inner, _) then type_contains_affine_handle_walk(env, &inner, visited)
+  when Type::Tuple(elems) then
+    for e in elems do
+      if type_contains_affine_handle_walk(env, &e, visited) then return true end
+    end
+    false
+  when Type::FixedArray(elem, _) then type_contains_affine_handle_walk(env, &elem, visited)
+  when Type::Closure(_, _, _, captures, _) then type_contains_affine_handle_walk(env, &captures, visited)
+  when Type::Ptr(inner) then type_contains_affine_handle_walk(env, &inner, visited)
+  when Type::PtrMut(inner) then type_contains_affine_handle_walk(env, &inner, visited)
+  when Type::Effect(_, inner) then type_contains_affine_handle_walk(env, &inner, visited)
+  when _ then false
+  end
+end
+
 # Named-type structural derivation (Transferable): walk fields/variants with
 # the concrete generic args substituted (the same walk the type-properties
-# engine performs for owns_state/linearity) plus the concrete args. Rc is
-# the only provable inherent exclusion (mirror of the non_send_types
-# documentation set).
+# engine performs for owns_state/linearity) plus the concrete args. The Rc
+# exclusion is the LangItems TypeId — never the name.
 def is_named_transferable(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout visited: Set[Int]) -> Bool
   match get_type_by_id_ref(env, tid)
   when Option::Some(td) then
- # the Rc exclusion is the LangItems TypeId — never the name.
     if tid.id == env.lang_items.rc then
       return false
     end
@@ -16432,31 +17444,23 @@ def is_named_transferable(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inou
   end
 end
 
-# A type is Shareable (Sync — safe to share references across threads) iff
-# the SINGLE auto-trait rule (see the section header above) derives it: the
-# obligation solver proves `Shareable for T` from the impl registry (the
-# registry-backed materialization of the same structural rule; interior
-# mutability types Cell/RefCell/UnsafeCell and Rc are deliberately granted
-# NO impl by the std agent, so both materializations reject them), and the
-# structural derivation continues for types the registry cannot decide.
+# A type is Shareable (safe simultaneous access through a shared
+# representation) iff the SINGLE auto-trait rule (see the section header)
+# derives it: the recognized synchronized representations (Arc/WeakArc),
+# the trivially-copyable value types, and the aggregates whose fields/
+# variants/args are all Shareable. The plain OWNED types (String/Vec/
+# owned aggregates) are Transferable but NOT Shareable — shared mutable
+# state must go through Arc/Mutex/RwLock/atomics/channels.
 def is_sync(inout env: TypeEnv, ty: Type) -> Bool
   var visited = Set::new()
   derive_syncable(env, ty, &mut visited)
 end
 
-# The single Shareable derivation (auto-trait rule) — see derive_transferable
-# for the rule structure. The visited set terminates legal-indirection
-# recursion; there is NO depth-based semantic shortcut (a depth limit would
-# be a diagnostic, never a semantic answer).
+# The single Shareable derivation — see derive_transferable for the rule
+# structure. The visited set terminates legal-indirection recursion; there
+# is NO depth-based semantic shortcut (a depth limit would be a diagnostic,
+# never a semantic answer).
 def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bool
- # the Shareable trait identity is its TraitId (std-declared; see
-  # derive_transferable for the TraitId(-1) fall-through semantics).
-  let shareable_name = "Shareable"
-  let ob = Obligation { trait_ref: TraitRef { trait_id: trait_id_for(env, &shareable_name), self_ty: ty.clone(), args: Vec::new() }, trait_name: shareable_name }
-  if solve_obligation(env, &ob) then
-    return true
-  end
-  # The structural derivation — THE rule (see the section header).
   match ty
   when Type::Unit then true
   when Type::Bool then true
@@ -16464,7 +17468,7 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
   when Type::UInt then true
   when Type::Float then true
   when Type::Char then true
-  when Type::String then true
+  when Type::String then false  # owned: Transferable but NOT Shareable
   when Type::I8 then true
   when Type::I16 then true
   when Type::I32 then true
@@ -16480,7 +17484,27 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
   when Type::F32 then true
   when Type::F64 then true
   when Type::Adt(tid, args) then
-    is_named_syncable(env, tid, args, visited)
+   # the EXPLICIT OPT-IN (the documented gate) — see derive_transferable.
+    # Without the opt-in, a value containing the std-marked AffineHandle
+    # (the execution-context-affine native handle) is NOT Shareable —
+    # sharing an affine handle is sharing the execution context's
+    # identity.
+    if pointer_gate_holds(env, &ty, "UnsafeShareable") then
+      true
+    elsif type_contains_affine_handle(env, ty) then
+      false
+    elsif tid.id == env.lang_items.arc_strong || tid.id == env.lang_items.weak_arc then
+      true  # the RECOGNIZED SYNCHRONIZED REPRESENTATION: the Arc is the sharing boundary (the walk stops — the interior is reached through the Arc's protocol)
+    elsif tid.id == env.lang_items.rc || tid.id == env.lang_items.weak_rc then
+      false  # the refcount is NOT synchronized
+    elsif tid.id == env.lang_items.vec || tid.id == env.lang_items.map ||
+          tid.id == env.lang_items.set || tid.id == env.lang_items.array then
+      false  # the owned containers: Transferable but NOT Shareable (shared mutable state goes through Arc/Mutex/RwLock/atomics/channels)
+    elsif tid.id == env.lang_items.box_ || tid.id == env.lang_items.unique_ptr then
+      shareable_args_all(env, &args, visited)  # owned heap: shareable iff the pointee is
+    else
+      is_named_syncable(env, tid, args, visited)
+    end
   when Type::RefInternal(inner, _) then derive_syncable(env, inner, visited)
   when Type::Tuple(elems) then
     for e in elems do
@@ -16488,10 +17512,18 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
     end
     true
   when Type::FnPtr(_, _, _) then true
- # a closure's shareability derives from its capture tuple.
-  when Type::Closure(_, _, _, captures, _) then derive_syncable(env, &captures, visited)
+  when Type::Closure(cid, _, _, captures, _) then
+    # (the active lexical inout state): a closure with an inout capture
+    # mutates lexical state — sharing it is a race — NOT Shareable.
+    if closure_has_inout_capture(env, cid.id) then
+      false
+    else
+      derive_syncable(env, &captures, visited)
+    end
   when Type::Ptr(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
   when Type::PtrMut(inner) then pointer_gate_holds(env, &inner, "UnsafeShareable")  # GATED: never automatic
+  when Type::FixedArray(elem, _) then derive_syncable(env, &elem, visited)
+  when Type::StaticStrPtr then true  # the static string view: immutable static bytes
   when Type::Dyn(_) then false  # Trait objects: conservative !Shareable
   when Type::Effect(_, inner) then derive_syncable(env, &inner, visited)
   when Type::Param(_) then true
@@ -16504,15 +17536,25 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
   end
 end
 
+# All the generic args of an owned-heap type are Shareable (the
+# Box/UniquePtr arm of the Adt walk).
+def shareable_args_all(inout env: TypeEnv, args: Vec[Type], inout visited: Set[Int]) -> Bool
+  var ok = true
+  for a in args do
+    if !derive_syncable(env, &a, visited) then ok = false end
+  end
+  ok
+end
+
 # Named-type structural derivation (Shareable): fields/variants/args walk
-# (as above). Provable inherent exclusions — Rc (LangItems TypeId) and the
-# interior mutability types (Cell/RefCell/UnsafeCell, name-selected — no
-# LangItems entries) — mirror the non_sync_types documentation set; the
-# std grants none of them a Shareable impl.
+# (as above). The Rc exclusion is the LangItems TypeId — never the name;
+# the std declares no Cell/RefCell/UnsafeCell (interior mutability without
+# synchronization has no representation in this std — a future one must
+# be recognized by LangItems id, never by name).
 def is_named_syncable(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout visited: Set[Int]) -> Bool
   match get_type_by_id_ref(env, tid)
   when Option::Some(td) then
-    if tid.id == env.lang_items.rc || td.name == "Cell" || td.name == "RefCell" || td.name == "UnsafeCell" then
+    if tid.id == env.lang_items.rc || tid.id == env.lang_items.weak_rc then
       return false
     end
     if visited.contains(&tid.id) then
@@ -16544,24 +17586,28 @@ def is_named_syncable(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vi
   end
 end
 
-# Check that a type satisfies Send bound at a usage site (e.g., thread::spawn)
-def check_send_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
+# The checker's bound-resolution helpers (the `[T: Transferable]`-class
+# bounds): check that a type satisfies the Transferable bound at a usage
+# site (e.g., thread::spawn) — the compiler-derived property, never a
+# marker impl.
+def check_transferable_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
   if !is_send(env, ty) then
     env.errors.push(TypeError {
-      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Send` bound — " +
-               "cannot be safely transferred across thread boundaries",
+      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Transferable` bound — " +
+               "cannot be transferred into another execution context",
       span: span,
       code: Option::Some("E0277")
     })
   end
 end
 
-# Check that a type satisfies Sync bound (e.g., shared references across threads)
-def check_sync_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
+# Check that a type satisfies the Shareable bound (safe simultaneous
+# access through a shared representation).
+def check_shareable_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
   if !is_sync(env, ty) then
     env.errors.push(TypeError {
-      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Sync` bound — " +
-               "cannot be safely shared across thread boundaries",
+      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Shareable` bound — " +
+               "cannot be safely shared across execution contexts (use Arc/Mutex/RwLock/atomics/channels)",
       span: span,
       code: Option::Some("E0277")
     })

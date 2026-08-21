@@ -1,0 +1,502 @@
+# tests/condvar_waiter_queue_test.tg — the Condvar waiter-queue suite.
+#
+# The waiter-queue redesign (reviewer P0-2) replaces the two-counter
+# ticket protocol (the generation counter + the waiting-count ticket
+# counter), whose notify_all had the lost-wakeup race: a waiter
+# registering between the generation advance and the waiting-zeroing
+# could wait forever. The redesign gives CondvarInner ONE synchronized
+# waiter queue (a Vec[Arc[WaiterState]] behind the module's own Mutex)
+# plus the monotonically increasing waiter id; each waiter polls ONLY
+# its own WaiterState.notified. notify_one atomically detaches ONE
+# registered waiter (the oldest); notify_all atomically detaches the
+# WHOLE current set; waiters registering after a detach belong to the
+# NEXT cohort.
+#
+# The race-injection barrier (the CondvarInner test-barrier fields —
+# test_frozen + test_barrier): a notify whose frozen flag is set parks
+# INSIDE its critical section — after the detach, before the notified
+# stores — so a test can insert a waiter at exactly that transition and
+# release the notify afterwards. The interleavings are DETERMINISTIC
+# (the queue length under the queue lock is the handshake); no test
+# relies on "ran N times and did not hang" — every expectation is a
+# bounded spin ending in an exact counter/queue-length assertion.
+#
+# THE TEST TABLE
+#   (a) test_inject_waiter_during_notify_one_exactly_one_per_notify
+#       — the injection barrier freezes notify_one between its detach
+#         and its notified store; a waiter inserted at that point must
+#         NOT be woken by this notify (next cohort); each notify_one
+#         wakes EXACTLY one waiter, in registration (FIFO) order.
+#   (b) test_inject_waiter_during_notify_all_next_cohort
+#       — the injection barrier freezes notify_all between its detach
+#         and its notified stores; the pre-detach cohort wakes, the
+#         waiter inserted at the frozen transition does not (it belongs
+#         to the next cohort) and needs its own notify.
+#   (c) test_timeout_racing_notify_one_detached_state_stays_alive
+#       — the timeout races a frozen notify_one: the notify detaches
+#         the waiter's entry and parks before the store; the waiter
+#         times out, and the notifier's later store lands on the
+#         still-alive Arc[WaiterState] (no crash, no use-after-free).
+#   (d) test_timeout_racing_notify_all_both_cohort_entries_detached
+#       — the same race against notify_all with two timed waiters.
+#   (e) test_one_waiter_many_notifications_single_wake
+#       — 1 waiter / N notifications: the N-1 notify_ones with no
+#         registered waiter are no-ops (no ghost wake), the first with
+#         a waiter wakes it exactly once.
+#   (f) test_eight_waiters_single_notify_one_then_all
+#       — N waiters / 1 notification: one notify_one wakes EXACTLY one
+#         (the oldest), the notify_all wakes the remaining N-1.
+#   (g) test_eight_waiters_notify_all_wakes_everyone
+#       — N waiters / notify-all: one notify_all wakes all N.
+#   (h) test_spurious_timeout_rechecks_predicate
+#       — the spurious rechecks: a timed wait keeps expiring while the
+#         predicate stays false; the waiter re-checks the predicate
+#         after every return and only exits when the predicate changes.
+#   (i) test_repeated_predicate_loops_ping_pong
+#       — the repeated predicate loops: two threads ping-pong through
+#         the condvar; every wake re-checks the predicate under the
+#         mutex; any lost wakeup would strand a thread forever (the
+#         joins are the completion proof).
+
+use std::core::{Int, Bool, Unit, Option, Result, Vec}
+use std::test::*
+use std::sync::{Arc, Mutex, Condvar, AtomicU32}
+use std::thread::{spawn, JoinHandle, yield_now}
+use std::time::{Duration}
+
+const MAX_SPINS: Int = 2000000
+
+# The waiter-queue depth under the queue lock — the deterministic
+# handshake for the injection barriers (the queue reaches a length only
+# at the well-defined points the tests synchronize on).
+def queue_len(c: Arc[Condvar]) -> Int
+  let g = c.inner.ptr.as_ref().queue.lock()
+  let n = g.len()
+  drop(g)
+  n
+end
+
+# The injection barrier controls: set frozen (the next notify parks
+# between its detach and its notified stores), release it, clear it.
+def freeze_condvar(c: Arc[Condvar]) -> Unit
+  c.inner.ptr.as_ref().test_frozen.store(true)
+  c.inner.ptr.as_ref().test_barrier.store(false)
+end
+
+def release_frozen_condvar(c: Arc[Condvar]) -> Unit
+  c.inner.ptr.as_ref().test_barrier.store(true)
+end
+
+def unfreeze_condvar(c: Arc[Condvar]) -> Unit
+  c.inner.ptr.as_ref().test_frozen.store(false)
+end
+
+# A bounded spin on an atomic counter: true when the target is reached.
+# Never hangs — a broken design FAILS the test instead of blocking CI.
+def spin_until_at_least(count: Arc[AtomicU32], target: u32) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if count.ptr.as_ref().load() >= target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+def spin_until_len(c: Arc[Condvar], target: Int) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if queue_len(c.clone()) == target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+# A plain waiter: registers (ready++ happens while holding the user
+# mutex, BEFORE the registration), waits for the notify, then counts
+# itself among the proceeded waiters.
+def cond_waiter(cond: Arc[Condvar], mutex: Arc[Mutex[Int]], ready: Arc[AtomicU32], proceeded: Arc[AtomicU32]) -> Int
+  let mut guard = mutex.lock()
+  ready.ptr.as_ref().fetch_add(1)
+  guard = cond.wait(guard)
+  proceeded.ptr.as_ref().fetch_add(1)
+  0
+end
+
+# A timed waiter: registers, waits up to the timeout, then records the
+# outcome (timed_out vs woken).
+def cond_timed_waiter(cond: Arc[Condvar], mutex: Arc[Mutex[Int]], ready: Arc[AtomicU32], timed_out: Arc[AtomicU32], woken: Arc[AtomicU32], timeout: Duration) -> Int
+  let mut guard = mutex.lock()
+  ready.ptr.as_ref().fetch_add(1)
+  let (g, to) = cond.wait_timeout_ex(guard, timeout)
+  drop(g)
+  if to then
+    timed_out.ptr.as_ref().fetch_add(1)
+  else
+    woken.ptr.as_ref().fetch_add(1)
+  end
+  0
+end
+
+# (a) register during notify_one — the injection barrier.
+@test
+def test_inject_waiter_during_notify_one_exactly_one_per_notify() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let proceeded = Arc::new(AtomicU32::new(0))
+
+  let mut h1 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  let mut h2 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  assert_true(spin_until_at_least(ready.clone(), 2))
+  assert_eq(queue_len(cond.clone()), 2)
+
+  # Freeze the next notify_one after its detach and insert a third
+  # waiter at exactly that point: the mid-flight registration must NOT
+  # be woken by this notify — it belongs to the next cohort.
+  freeze_condvar(cond.clone())
+  let mut hn = spawn(move || { cond.notify_one(); 0 })
+  # The notifier detached exactly ONE waiter (W1) and parked.
+  assert_true(spin_until_len(cond.clone(), 1))
+  let mut h3 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  assert_true(spin_until_len(cond.clone(), 2))
+  assert_eq(proceeded.ptr.as_ref().load(), 0 as u32)
+  release_frozen_condvar(cond.clone())
+  assert_ok(hn.join())
+  # EXACTLY ONE waiter woke — the detached W1, not the mid-flight W3.
+  assert_true(spin_until_at_least(proceeded.clone(), 1))
+  assert_eq(proceeded.ptr.as_ref().load(), 1 as u32)
+
+  # W2 (the next oldest) wakes from the second notify_one; W3 (the
+  # mid-flight insertion) only from the third — FIFO by registration.
+  cond.notify_one()
+  assert_true(spin_until_at_least(proceeded.clone(), 2))
+  assert_eq(proceeded.ptr.as_ref().load(), 2 as u32)
+  cond.notify_one()
+  assert_true(spin_until_at_least(proceeded.clone(), 3))
+  assert_eq(proceeded.ptr.as_ref().load(), 3 as u32)
+  assert_ok(h1.join())
+  assert_ok(h2.join())
+  assert_ok(h3.join())
+  unfreeze_condvar(cond)
+end
+
+# (b) register during notify_all — the injection barrier.
+@test
+def test_inject_waiter_during_notify_all_next_cohort() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let proceeded = Arc::new(AtomicU32::new(0))
+
+  let mut h1 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  let mut h2 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  assert_true(spin_until_at_least(ready.clone(), 2))
+  assert_eq(queue_len(cond.clone()), 2)
+
+  # Freeze the next notify_all at the critical transition (after its
+  # detach of the whole current set, before its notified stores) and
+  # insert a third waiter at exactly that point.
+  freeze_condvar(cond.clone())
+  let mut hn = spawn(move || { cond.notify_all(); 0 })
+  # The notifier detached the whole set {W1, W2} and parked.
+  assert_true(spin_until_len(cond.clone(), 0))
+  # W3's registration lands while the notify is in flight — it MUST
+  # belong to the next cohort.
+  let mut h3 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  assert_true(spin_until_len(cond.clone(), 1))
+  # W3 registered behind the frozen notify — nothing has been woken.
+  assert_eq(proceeded.ptr.as_ref().load(), 0 as u32)
+  release_frozen_condvar(cond.clone())
+  assert_ok(hn.join())
+  # The notify woke the PRE-DETACH cohort only.
+  assert_true(spin_until_at_least(proceeded.clone(), 2))
+  assert_eq(proceeded.ptr.as_ref().load(), 2 as u32)
+  # W3 is still waiting — it belongs to the next cohort.
+  assert_eq(queue_len(cond.clone()), 1)
+  assert_eq(proceeded.ptr.as_ref().load(), 2 as u32)
+  # A second notify-all wakes the next cohort.
+  cond.notify_all()
+  assert_true(spin_until_at_least(proceeded.clone(), 3))
+  assert_eq(proceeded.ptr.as_ref().load(), 3 as u32)
+  assert_ok(h1.join())
+  assert_ok(h2.join())
+  assert_ok(h3.join())
+  unfreeze_condvar(cond)
+end
+
+# (c) timeout racing notify_one — the detached state stays alive.
+@test
+def test_timeout_racing_notify_one_detached_state_stays_alive() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let timed_out = Arc::new(AtomicU32::new(0))
+  let woken = Arc::new(AtomicU32::new(0))
+
+  let mut h1 = spawn(move || cond_timed_waiter(cond.clone(), mutex.clone(), ready.clone(), timed_out.clone(), woken.clone(), Duration::from_millis(40)))
+  assert_true(spin_until_at_least(ready.clone(), 1))
+  assert_eq(queue_len(cond.clone()), 1)
+
+  # The notify_one detaches W1's entry and parks BEFORE storing the
+  # notified flag: the timeout sees a detached registration whose
+  # notify has not completed.
+  freeze_condvar(cond.clone())
+  let mut hn = spawn(move || { cond.notify_one(); 0 })
+  assert_true(spin_until_len(cond.clone(), 0))
+  # W1's deadline expires while the notify is in flight: it times out.
+  assert_true(spin_until_at_least(timed_out.clone(), 1))
+  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
+  # Release the frozen notify: its store lands on the detached
+  # (still-alive, via the notifier's Arc) WaiterState — harmless.
+  release_frozen_condvar(cond.clone())
+  assert_ok(hn.join())
+  assert_ok(h1.join())
+  assert_eq(timed_out.ptr.as_ref().load(), 1 as u32)
+  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
+
+  # The condvar still works: a fresh waiter is woken normally.
+  let mut h2 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), woken.clone()))
+  assert_true(spin_until_at_least(ready.clone(), 2))
+  cond.notify_one()
+  assert_true(spin_until_at_least(woken.clone(), 1))
+  assert_ok(h2.join())
+  unfreeze_condvar(cond)
+end
+
+# (d) timeout racing notify_all — both cohort entries detached.
+@test
+def test_timeout_racing_notify_all_both_cohort_entries_detached() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let timed_out = Arc::new(AtomicU32::new(0))
+  let woken = Arc::new(AtomicU32::new(0))
+
+  let mut h1 = spawn(move || cond_timed_waiter(cond.clone(), mutex.clone(), ready.clone(), timed_out.clone(), woken.clone(), Duration::from_millis(40)))
+  let mut h2 = spawn(move || cond_timed_waiter(cond.clone(), mutex.clone(), ready.clone(), timed_out.clone(), woken.clone(), Duration::from_millis(40)))
+  assert_true(spin_until_at_least(ready.clone(), 2))
+  assert_eq(queue_len(cond.clone()), 2)
+
+  freeze_condvar(cond.clone())
+  let mut hn = spawn(move || { cond.notify_all(); 0 })
+  assert_true(spin_until_len(cond.clone(), 0))
+  assert_true(spin_until_at_least(timed_out.clone(), 2))
+  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
+  release_frozen_condvar(cond.clone())
+  assert_ok(hn.join())
+  assert_ok(h1.join())
+  assert_ok(h2.join())
+  assert_eq(timed_out.ptr.as_ref().load(), 2 as u32)
+  assert_eq(woken.ptr.as_ref().load(), 0 as u32)
+
+  # The condvar still works: a fresh waiter is woken normally.
+  let mut h3 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), woken.clone()))
+  assert_true(spin_until_at_least(ready.clone(), 3))
+  cond.notify_all()
+  assert_true(spin_until_at_least(woken.clone(), 1))
+  assert_ok(h3.join())
+  unfreeze_condvar(cond)
+end
+
+# (e) 1 waiter / N notifications.
+@test
+def test_one_waiter_many_notifications_single_wake() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let proceeded = Arc::new(AtomicU32::new(0))
+
+  # The notify_ones with NO registered waiter are no-ops: the
+  # notify-before-wait is lost (the wakeup test is the queue
+  # membership, never a counter that persists across registrations).
+  cond.notify_one()
+  cond.notify_one()
+  cond.notify_one()
+
+  let mut h1 = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+  assert_true(spin_until_at_least(ready.clone(), 1))
+  assert_eq(queue_len(cond.clone()), 1)
+  # The waiter is NOT woken by the pre-registration notifies — the
+  # bounded spin proves it is still blocked (never a hang).
+  var spins = 0
+  while spins < 200000 do
+    assert_eq(proceeded.ptr.as_ref().load(), 0 as u32)
+    spins = spins + 1
+    yield_now()
+  end
+  # N notifications with a registered waiter: the FIRST wakes it, the
+  # rest are no-ops on the now-empty queue.
+  cond.notify_one()
+  cond.notify_one()
+  cond.notify_one()
+  cond.notify_one()
+  assert_true(spin_until_at_least(proceeded.clone(), 1))
+  assert_eq(proceeded.ptr.as_ref().load(), 1 as u32)
+  assert_eq(queue_len(cond.clone()), 0)
+  assert_ok(h1.join())
+end
+
+# (f) N waiters / 1 notification.
+@test
+def test_eight_waiters_single_notify_one_then_all() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let proceeded = Arc::new(AtomicU32::new(0))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 8 do
+    let h = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+    handles.push(h)
+    i = i + 1
+  end
+  assert_true(spin_until_at_least(ready.clone(), 8))
+  assert_eq(queue_len(cond.clone()), 8)
+  # ONE notify_one wakes EXACTLY one waiter (the oldest registration).
+  cond.notify_one()
+  assert_true(spin_until_at_least(proceeded.clone(), 1))
+  assert_eq(proceeded.ptr.as_ref().load(), 1 as u32)
+  assert_eq(queue_len(cond.clone()), 7)
+  # The notify_all wakes the remaining 7.
+  cond.notify_all()
+  assert_true(spin_until_at_least(proceeded.clone(), 8))
+  assert_eq(proceeded.ptr.as_ref().load(), 8 as u32)
+  assert_eq(queue_len(cond.clone()), 0)
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+end
+
+# (g) N waiters / notify-all.
+@test
+def test_eight_waiters_notify_all_wakes_everyone() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let proceeded = Arc::new(AtomicU32::new(0))
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var i = 0
+  while i < 8 do
+    let h = spawn(move || cond_waiter(cond.clone(), mutex.clone(), ready.clone(), proceeded.clone()))
+    handles.push(h)
+    i = i + 1
+  end
+  assert_true(spin_until_at_least(ready.clone(), 8))
+  assert_eq(queue_len(cond.clone()), 8)
+  # ONE notify_all wakes ALL 8.
+  cond.notify_all()
+  assert_true(spin_until_at_least(proceeded.clone(), 8))
+  assert_eq(proceeded.ptr.as_ref().load(), 8 as u32)
+  assert_eq(queue_len(cond.clone()), 0)
+  loop do
+    match handles.pop()
+    when Option::Some(mut h) then
+      assert_ok(h.join())
+    when Option::None then
+      break
+    end
+  end
+end
+
+# (h) The spurious rechecks: a timed wait keeps expiring while the
+# predicate stays false; the waiter re-checks the predicate after every
+# return (spurious or notify) and only exits when the predicate
+# changes — the timed wakeups are legal, never lost-wakeup exits.
+@test
+def test_spurious_timeout_rechecks_predicate() -> Unit
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+  let rounds = Arc::new(AtomicU32::new(0))
+  let done = Arc::new(AtomicU32::new(0))
+
+  let mut h1 = spawn(move || {
+    let mut guard = mutex.lock()
+    ready.ptr.as_ref().fetch_add(1)
+    # The canonical predicate loop: recheck after EVERY wait return.
+    var waiting = true
+    while waiting do
+      if *guard != 0 then
+        waiting = false
+      else
+        let (g, to) = cond.wait_timeout_ex(guard, Duration::from_millis(2))
+        guard = g
+        if to then
+          rounds.ptr.as_ref().fetch_add(1)
+        end
+      end
+    end
+    done.ptr.as_ref().fetch_add(1)
+    0
+  })
+  assert_true(spin_until_at_least(ready.clone(), 1))
+  # Several full timeout rounds must occur while the predicate stays
+  # false — each is a spurious wakeup the loop must survive.
+  assert_true(spin_until_at_least(rounds.clone(), 3))
+  assert_eq(done.ptr.as_ref().load(), 0 as u32)
+  # Set the predicate under the mutex and notify: the waiter wakes,
+  # rechecks, and exits.
+  let mut g = mutex.lock()
+  *g = 1
+  drop(g)
+  cond.notify_all()
+  assert_true(spin_until_at_least(done.clone(), 1))
+  assert_ok(h1.join())
+end
+
+# (i) The repeated predicate loops: two threads ping-pong through the
+# condvar for ROUNDS rounds; every wake re-checks the predicate under
+# the mutex. Any lost wakeup would strand a thread forever (the joins
+# are the completion proof).
+@test
+def test_repeated_predicate_loops_ping_pong() -> Unit
+  const ROUNDS: Int = 200
+  let cond = Arc::new(Condvar::new())
+  let mutex = Arc::new(Mutex::new(0))
+  let ready = Arc::new(AtomicU32::new(0))
+
+  # A produces (data = 1) and waits for the consume-ack; B consumes and
+  # acks. Every wait is re-entered only after the predicate recheck.
+  let mut ha = spawn(move || {
+    var i = 0
+    while i < ROUNDS do
+      let mut guard = mutex.lock()
+      *guard = 1
+      cond.notify_all()
+      while *guard != 0 do
+        guard = cond.wait(guard)
+      end
+      i = i + 1
+    end
+    ready.ptr.as_ref().fetch_add(1)
+    0
+  })
+  let mut hb = spawn(move || {
+    var i = 0
+    while i < ROUNDS do
+      let mut guard = mutex.lock()
+      while *guard == 0 do
+        guard = cond.wait(guard)
+      end
+      *guard = 0
+      cond.notify_all()
+      i = i + 1
+    end
+    ready.ptr.as_ref().fetch_add(1)
+    0
+  })
+  assert_true(spin_until_at_least(ready.clone(), 2))
+  assert_ok(ha.join())
+  assert_ok(hb.join())
+end

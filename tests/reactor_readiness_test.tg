@@ -1,0 +1,142 @@
+# tests/reactor_readiness_test.tg — the I/O reactor's REAL readiness
+# tokens (RegistrationId { task, fd, interest, generation }). The old
+# "second poll == I/O ready" assumption is gone: the event handler marks
+# the registration ready; the futures' polls inspect the readiness
+# (not-ready -> Pending — a second poll for an UNRELATED reason never
+# completes the future; ready -> consume the event — deregister/modify —
+# then perform the operation). The suite pins: the second-poll-stays-
+# pending behavior, the ready-consume, the separate readable/writable
+# interests of the same fd, the shutdown fail-closed, and the EAGAIN
+# re-registration after a stale readiness.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::io::Write
+use std::net::{tcp_bind, tcp_connect, socket_addr_v4, ipv4_localhost}
+
+const REACTOR_READY_PORT: u16 = 38770u16
+const REACTOR_CONSUME_PORT: u16 = 38771u16
+const REACTOR_EAGAIN_PORT: u16 = 38772u16
+
+@test
+def test_reactor_second_poll_unrelated_stays_pending() -> Unit
+  let addr = socket_addr_v4(ipv4_localhost(), REACTOR_READY_PORT)
+  let listener = assert_ok(tcp_bind(addr))
+  let client = assert_ok(tcp_connect(addr))
+  let server = assert_ok(listener.accept())
+
+  let mut reactor = assert_ok(std::async::io_reactor_new())
+  let rid = assert_ok(reactor.register(server.raw_fd(), 7, std::async::Interest::Readable))
+
+  # nothing written: unrelated polls never fire the readiness — the
+  # registration stays Pending across the second poll (and any number of
+  # polls for unrelated reasons)
+  let _ = reactor.poll(0)
+  assert_false(reactor.is_ready(rid))
+  let _ = reactor.poll(0)
+  assert_false(reactor.is_ready(rid))
+
+  # the client writes: the event fires on the next poll — the readiness
+  # token is marked
+  let payload: Vec[u8] = Vec::from([1u8, 2u8, 3u8])
+  assert_ok(client.write(payload))
+  let _ = reactor.poll(0)
+  assert_true(reactor.is_ready(rid))
+
+  # consume: deregister removes the registration — the readiness is
+  # consumed and later polls do not re-fire it
+  assert_ok(reactor.deregister(rid))
+  let _ = reactor.poll(0)
+  assert_false(reactor.is_ready(rid))
+
+  # the separate WRITABLE interest of the same fd is an independent
+  # registration (a connected socket is writable — its event fires
+  # independently of the consumed read registration)
+  let wid = assert_ok(reactor.register(server.raw_fd(), 8, std::async::Interest::Writable))
+  let _ = reactor.poll(0)
+  assert_true(reactor.is_ready(wid))
+
+  # shutdown: registrations fail closed after close()
+  reactor.close()
+  let closed = reactor.register(server.raw_fd(), 9, std::async::Interest::Readable)
+  assert_false(closed.is_ok())
+end
+
+@test
+def test_reactor_ready_event_consumes() -> Unit
+  # the wait_readable FUTURE through the executor: the readiness fires
+  # (the data arrived before the run), the future's poll consumes the
+  # event (deregister) and completes — the completion proves the consume;
+  # a stale "second poll" would not have completed it.
+  let addr = socket_addr_v4(ipv4_localhost(), REACTOR_CONSUME_PORT)
+  let listener = assert_ok(tcp_bind(addr))
+  let client = assert_ok(tcp_connect(addr))
+  let server = assert_ok(listener.accept())
+
+  let payload: Vec[u8] = Vec::from([1u8, 2u8])
+  assert_ok(client.write(payload))
+
+  let mut exec = std::async::Executor::new().unwrap()
+  let mut completed: Option[Int] = Option::None
+  exec.spawn(async {
+    match std::async::wait_readable(server).await
+    when Result::Ok(()) then completed = Option::Some(1)
+    when Result::Err(_) then completed = Option::Some(-1)
+    end
+  })
+  exec.run()
+
+  match completed
+  when Option::Some(n) then assert_eq(n, 1)
+  when Option::None then assert_false(true)
+  end
+end
+
+@test
+def test_reactor_eagain_reregisters() -> Unit
+  # the EAGAIN-after-readiness path: the data sits in the socket before
+  # the future registers, so the first readiness fires immediately. The
+  # one-shot __tg_async_force_eagain fault flag (the deterministic
+  # stand-in for a racing consumer that drained the data between the
+  # event and the operation — the same fault-injection precedent as
+  # std::thread's __tg_spawn_fail_create) makes the first ready-branch
+  # run the EAGAIN re-registration path: the registration is consumed
+  # (deregistered) and a FRESH registration (a new generation) is made.
+  # The re-registration then picks up the still-pending data and the
+  # future completes.
+  let addr = socket_addr_v4(ipv4_localhost(), REACTOR_EAGAIN_PORT)
+  let listener = assert_ok(tcp_bind(addr))
+  let client = assert_ok(tcp_connect(addr))
+  let server = assert_ok(listener.accept())
+
+  let payload: Vec[u8] = Vec::from([1u8, 2u8])
+  assert_ok(client.write(payload))
+
+  let mut exec = std::async::Executor::new().unwrap()
+  let mut buf: Vec[u8] = Vec::from([0u8, 0u8])
+  let mut result: Option[Int] = Option::None
+  std::async::__tg_async_force_eagain = true
+  exec.spawn(async {
+    match std::async::read_async(server, buf).await
+    when Result::Ok(n) then result = Option::Some(n)
+    when Result::Err(_) then result = Option::Some(-1)
+    end
+  })
+  exec.run()
+  std::async::__tg_async_force_eagain = false
+
+  # the future completed ONLY after the re-registration picked up the
+  # data — the injected EAGAIN consumed the first registration
+  match result
+  when Option::Some(n) then assert_eq(n, 2)
+  when Option::None then assert_false(true)
+  end
+
+  # and the re-registration is observable: the reactor's generation
+  # counter advanced twice (the initial register + the EAGAIN
+  # re-register)
+  match exec.inner.ptr.as_ref().io_reactor
+  when Option::Some(reactor) then assert_eq(reactor.next_generation, 2)
+  when Option::None then assert_false(true)
+  end
+end

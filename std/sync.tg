@@ -288,59 +288,135 @@ end
 ##
 ## The notification state lives behind an Arc. Condvar::wait drops the
 ## MutexGuard (its Drop runs — the atomic store releases the lock and the
-## guard's Arc clone is released), polls the notification state until a
-## notify advances it, then re-acquires the lock through the Arc the guard
-## kept alive — the mutex state can never dangle while the wait is in
-## flight.
+## guard's Arc clone is released), polls its own waiter state until a
+## notify stores the notified flag, then re-acquires the lock through the
+## Arc the guard kept alive — the mutex state can never dangle while the
+## wait is in flight.
 ##
-## THE TICKET DESIGN (notify_one vs notify_all): CondvarInner carries TWO
-## counters — `notified` (the generation, advanced on EVERY notify) and
-## `waiting` (the registered-waiter ticket counter). A waiter snapshots
-## the generation FIRST, then registers (waiting += 1 — its ticket is
-## fetch_add's old value): the snapshot predates the registration, so a
-## notify that consumes this waiter's membership (its generation advance
-## follows the consumed registration) is always visible to the waiter's
-## generation check. notify_one consumes ONE membership and advances the
-## generation exactly once: if the waiting count is > 0 it decrements the
-## waiting count and increments the generation — the ONE waiter whose
-## ticket matches the NEW waiting count (and whose generation snapshot is
-## stale) proceeds; every other waiter's snapshot is stale but its
-## membership is not revoked, so it stays blocked. notify_all advances the
-## generation and ZEROES the waiting count — every registered waiter's
-## membership is revoked at once, so all of them proceed. A waiter's poll
-## loop therefore checks BOTH the generation against its snapshot AND the
-## waiting-count membership (waiting <= ticket): notify_one wakes exactly
-## one waiter, notify_all wakes every remaining waiter. A notify that
-## races a registration is never lost (the snapshot precedes the
-## registration, so the notify's generation advance is visible) and the
-## counters' monotonicity makes the wait re-check before blocking.
+## THE WAITER-QUEUE DESIGN (notify_one vs notify_all): CondvarInner
+## carries ONE synchronized waiter queue — a Vec[Arc[WaiterState]] behind
+## the module's own Mutex — plus the monotonically increasing waiter id
+## counter (next_id). A waiter REGISTERS by pushing its own
+## Arc[WaiterState] (notified: AtomicBool, id: UInt) onto the queue
+## BEFORE releasing the predicate mutex: the queue lock is taken and
+## released while the caller still holds the user mutex, so the
+## registration is LOGICALLY SYNCHRONIZED WITH THE PREDICATE-MUTEX
+## RELEASE — a notify that runs after the release is guaranteed to see
+## the registration (no lost-wakeup window). The waiter then polls ONLY
+## its own WaiterState.notified and owns the Arc, so the state stays
+## alive even if the Condvar itself is dropped mid-wait.
+##
+## notify_one ATOMICALLY DETACHES ONE registered waiter — the oldest
+## (the queue front, FIFO by registration) — under the queue lock and
+## stores notified on EXACTLY that waiter. notify_all ATOMICALLY DETACHES
+## THE WHOLE CURRENT WAITER SET under the queue lock and stores notified
+## on those waiters ONLY. THE LINEARIZATION POINT of both is the detach
+## (the queue-lock critical section that removes the set): a notify that
+## linearizes after a registration sees that waiter; a waiter whose
+## registration linearizes after the detach belongs to the NEXT COHORT —
+## it can never be woken by this call (the notifier stores only on the
+## detached set it already holds, never re-scans the queue).
+##
+## TIMEOUT: wait_timeout_ex cancels its registration at the deadline by
+## removing its own entry (matched by id) under the queue lock; if the
+## entry is already gone, a notify detached it and the final notified
+## recheck decides woken vs timed-out. A notifier that detached a
+## timed-out waiter's entry still holds the Arc: its notified store
+## lands on the still-alive state and is a harmless no-op for the
+## returned waiter.
+##
+## THE TEST-INJECTION BARRIER (the deterministic race tests): CondvarInner
+## carries the test-barrier fields (test_frozen + test_barrier). Both
+## notify paths check the frozen flag INSIDE the critical section —
+## after the detach, before the notified stores — and park on the
+## barrier when set. A test sets frozen, runs the notify (it detaches
+## its cohort and parks), inserts a waiter in the gap, then releases the
+## barrier: the notify completes with the pre-detach cohort only, and
+## the inserted waiter deterministically lands in the next cohort.
 struct Condvar
   inner: Arc[CondvarInner]
 end
 
+## The per-waiter registration state: owned by the waiting thread (its
+## Arc clone), cloned into the queue, and held by a notifier that
+## detached it — the state can never dangle under a racing detach,
+## timeout, or Condvar drop.
+struct WaiterState
+  notified: AtomicBool
+  id: UInt
+end
+
 struct CondvarInner
-  notified: AtomicU32
-  waiting: AtomicU32
+  queue: Mutex[Vec[Arc[WaiterState]]]
+  next_id: AtomicU32
+  test_frozen: AtomicBool
+  test_barrier: AtomicBool
 end
 
 def Condvar::new() -> Condvar
-  Condvar { inner: Arc::new(CondvarInner { notified: AtomicU32::new(0), waiting: AtomicU32::new(0) }) }
+  Condvar { inner: Arc::new(CondvarInner {
+    queue: Mutex::new(Vec::new()),
+    next_id: AtomicU32::new(0),
+    test_frozen: AtomicBool::new(false),
+    test_barrier: AtomicBool::new(false)
+  }) }
+end
+
+## Register this waiter on the queue: the waiter's own Arc (the polling
+## handle) plus a queue clone, with the id taken from the monotonically
+## increasing counter. The queue lock brackets the push — see the
+## header for the predicate-mutex synchronization argument.
+def condvar_register(inner: Ptr[CondvarInner]) -> Arc[WaiterState]
+  let waiter = Arc::new(WaiterState {
+    notified: AtomicBool::new(false),
+    id: inner.next_id.fetch_add(1) as UInt
+  })
+  let mut guard = inner.queue.lock()
+  guard.push(waiter.clone())
+  drop(guard)
+  waiter
+end
+
+## Cancel a timed-out waiter's registration: remove its OWN entry (the
+## id match) under the queue lock. Returns true when the entry was still
+## registered (the timeout result stands); false when a notify already
+## detached it (the notified recheck decides the outcome).
+def condvar_cancel(inner: Ptr[CondvarInner], waiter: Arc[WaiterState]) -> Bool
+  let my_id = waiter.ptr.as_ref().id
+  let mut guard = inner.queue.lock()
+  var i = 0
+  var found = false
+  while i < guard.len() do
+    let candidate = guard.remove(i)
+    if candidate.ptr.as_ref().id == my_id then
+      found = true
+      drop(candidate)
+      # The removal shifted the tail down; the inflated index ends the
+      # scan either way.
+      i = guard.len() + 1
+    else
+      guard.insert(i, candidate)
+      i = i + 1
+    end
+  end
+  drop(guard)
+  found
 end
 
 def Condvar::wait[T](self: Condvar, guard: MutexGuard[T]) -> MutexGuard[T]
-  # Snapshot the generation FIRST, then register: the snapshot predates
-  # the registration, so any notify that consumes THIS waiter's
-  # membership (the notify's generation advance follows the consumed
-  # registration) is visible to the generation check — the waiter never
-  # sleeps through its own wakeup. A notify that fires before the
-  # registration is either a no-op (no waiters) or consumed an earlier
-  # waiter — the membership check (waiting <= ticket) disambiguates.
+  # Register BEFORE releasing the user mutex: the registration (the
+  # queue push under the queue lock) is logically synchronized with the
+  # predicate-mutex release — a notify that runs after the release sees
+  # this waiter, so the classic register/release race cannot lose a
+  # wakeup.
   let inner = self.inner.ptr.as_ref()
-  let seen = inner.notified.load()
-  let ticket = inner.waiting.fetch_add(1)
+  let waiter = condvar_register(inner)
   let inner_arc = guard.inner.clone()
   drop(guard)
-  while inner.notified.load() == seen || inner.waiting.load() > ticket do
+  # Poll ONLY the own state. A notify that detached THIS waiter has
+  # stored notified on it; a notify that did not detach it cannot wake
+  # it. The own Arc keeps the state alive for the whole wait.
+  while !waiter.ptr.as_ref().notified.load() do
     std::thread::yield_now()
   end
   let mutex = Mutex { inner: inner_arc }
@@ -350,15 +426,22 @@ def Condvar::wait[T](self: Condvar, guard: MutexGuard[T]) -> MutexGuard[T]
 end
 
 def Condvar::wait_timeout[T](self: Condvar, guard: MutexGuard[T], timeout: Duration) -> MutexGuard[T]
+  let (result, _) = self.wait_timeout_ex(guard, timeout)
+  result
+end
+
+## The timed wait with the explicit outcome: (guard, true) when the
+## deadline expired first (the registration was cancelled), (guard,
+## false) when the notify won.
+def Condvar::wait_timeout_ex[T](self: Condvar, guard: MutexGuard[T], timeout: Duration) -> (MutexGuard[T], Bool)
   let start = Instant::now()
   let inner = self.inner.ptr.as_ref()
-  let seen = inner.notified.load()
-  let ticket = inner.waiting.fetch_add(1)
+  let waiter = condvar_register(inner)
   let inner_arc = guard.inner.clone()
   drop(guard)
   mut timed_out = false
   loop do
-    if inner.notified.load() != seen && inner.waiting.load() <= ticket then
+    if waiter.ptr.as_ref().notified.load() then
       break
     end
     if start.elapsed() >= timeout then
@@ -368,19 +451,19 @@ def Condvar::wait_timeout[T](self: Condvar, guard: MutexGuard[T], timeout: Durat
     std::thread::yield_now()
   end
   if timed_out then
-    # The timeout exits without a notify: reclaim the registration IF it
-    # is still live (waiting > ticket — the membership was not consumed).
-    # A racing notify_one's decrement may land between the load and the
-    # fetch_sub; the count then drops one extra, which can only cause a
-    # spurious wakeup, never a lost one.
-    if inner.waiting.load() > ticket then
-      inner.waiting.fetch_sub(1)
+    # Cancel the registration on the timeout (the own entry matched by
+    # id). Already detached = a notify took it: the final recheck of the
+    # own flag decides woken vs timed-out (the notifier's store may
+    # still be pending behind the test barrier — the Arc keeps the
+    # state alive).
+    if !condvar_cancel(inner, waiter) && waiter.ptr.as_ref().notified.load() then
+      timed_out = false
     end
   end
   let mutex = Mutex { inner: inner_arc }
   let result = mutex.lock()
   drop(mutex)
-  result
+  (result, timed_out)
 end
 
 def Condvar::wait_timeout_ms[T](self: Condvar, guard: MutexGuard[T], ms: Int) -> MutexGuard[T]
@@ -389,37 +472,48 @@ end
 
 def Condvar::notify_one(self: Condvar) -> Unit
   let inner = self.inner.ptr.as_ref()
-  # Consume exactly ONE membership (the decrement FIRST, then the
-  # generation advance): the consumed waiter's snapshot predates its
-  # registration, which predates the decrement, so its generation check
-  # fires — no lost wakeup. A waiter registering between the two steps
-  # may wake spuriously (legal), never lost.
-  loop do
-    let w = inner.waiting.load()
-    if w == 0 then
-      break
-    end
-    if inner.waiting.compare_and_swap(w, w - 1) == w then
-      inner.notified.fetch_add(1)
-      break
-    end
+  # Detach EXACTLY ONE registered waiter (the oldest — the queue front,
+  # FIFO by registration) under the queue lock. THE LINEARIZATION
+  # POINT: the detach. A waiter that registers after this critical
+  # section belongs to the next cohort.
+  let mut guard = inner.queue.lock()
+  let detached = if guard.len() == 0 then
+    Option::None
+  else
+    Option::Some(guard.remove(0))
+  end
+  drop(guard)
+  # The test-injection barrier: a frozen notify parks between the
+  # detach and the notified store (still inside the critical section)
+  # until the test releases the barrier.
+  while inner.test_frozen.load() && !inner.test_barrier.load() do
+    std::thread::yield_now()
+  end
+  match detached
+  when Option::Some(w) then w.ptr.as_ref().notified.store(true)
+  when Option::None then ()
   end
 end
 
 def Condvar::notify_all(self: Condvar) -> Unit
   let inner = self.inner.ptr.as_ref()
-  # Advance the generation (every registered waiter's snapshot goes
-  # stale) and ZERO the waiting count (every waiter's membership is
-  # revoked — the remaining waiters all proceed).
-  inner.notified.fetch_add(1)
-  loop do
-    let w = inner.waiting.load()
-    if w == 0 then
-      break
-    end
-    if inner.waiting.compare_and_swap(w, 0) == w then
-      break
-    end
+  # Detach the WHOLE current waiter set under the queue lock. THE
+  # LINEARIZATION POINT: the detach. The drained set is the cohort THIS
+  # call notifies; a waiter that registers after the detach belongs to
+  # the next cohort (its registration is a fresh entry the notifier
+  # never touches — the notifier holds the drained set only).
+  let mut guard = inner.queue.lock()
+  let mut cohort: Vec[Arc[WaiterState]] = Vec::new()
+  while guard.len() > 0 do
+    cohort.push(guard.remove(0))
+  end
+  drop(guard)
+  while inner.test_frozen.load() && !inner.test_barrier.load() do
+    std::thread::yield_now()
+  end
+  while cohort.len() > 0 do
+    let w = cohort.remove(0)
+    w.ptr.as_ref().notified.store(true)
   end
 end
 
@@ -815,44 +909,65 @@ end
 # ═══════════════════════════════════════════════════════════════
 
 ## A synchronization primitive for one-time initialization
+##
+## THE CAS STATE MACHINE: UNINITIALIZED 0 -> RUNNING 1 -> COMPLETE 2.
+## The 0->1 transition is a SINGLE compare-and-swap: only the CAS winner
+## runs f; every other caller either sees RUNNING (1 — spins until the
+## state leaves RUNNING; the same spin/yield class as the sync waits) or
+## COMPLETE (2 — no-op). The old load-then-store (read 0, then store 1)
+## let two threads both read 0 and both run the initializer — the single
+## atomic 0->1 transition is the fix.
+##
+## FAILURE SEMANTICS (chosen): the panic policy is PROCESS-ABORT
+## (std::core.tg — panic terminates the process immediately; unwind is
+## not the default and is unsafe with live owned resources). A panicking
+## initializer therefore aborts the process before any thread can observe
+## a stuck RUNNING state, so POISONING IS SKIPPED: state 3 is reserved
+## for a future unwind-enabled panic mode and is NOT used.
+##
+## REINITIALIZATION SEMANTICS: call_once on a COMPLETE Once is a no-op —
+## f is never invoked again, regardless of which closure is passed; a
+## Once is single-shot.
 struct Once
   state: AtomicU32
 end
 
-def ONCE_NOT_DONE() -> u32 = 0
-def ONCE_IN_PROGRESS() -> u32 = 1
-def ONCE_DONE() -> u32 = 2
+def ONCE_UNINITIALIZED() -> u32 = 0
+def ONCE_RUNNING() -> u32 = 1
+def ONCE_COMPLETE() -> u32 = 2
 
 def Once::new() -> Once
-  Once { state: AtomicU32::new(ONCE_NOT_DONE()) }
+  Once { state: AtomicU32::new(ONCE_UNINITIALIZED()) }
 end
 
 def Once::call_once(self: Once, f: fn() -> Unit) -> Unit
-  # Try to transition from NOT_DONE to IN_PROGRESS
-  let old = self.state.compare_and_swap(ONCE_NOT_DONE(), ONCE_IN_PROGRESS())
+  # The single atomic 0->1 transition: exactly one caller wins the CAS
+  # and runs f. The load-then-store alternative (read 0, then store 1)
+  # let two threads both read 0 and both run f — the CAS is the fix.
+  let old = self.state.compare_and_swap(ONCE_UNINITIALIZED(), ONCE_RUNNING())
   
-  if old == ONCE_DONE() then
-    # Already done, nothing to do
+  if old == ONCE_COMPLETE() then
+    # Already initialized — the reinitialization is a no-op.
     return
   end
   
-  if old == ONCE_IN_PROGRESS() then
-    # Another thread is doing it, spin wait
-    while self.state.load() != ONCE_DONE() do
+  if old == ONCE_RUNNING() then
+    # Another thread won the CAS and is running f: spin until the state
+    # leaves RUNNING (the winner stores COMPLETE; a panicking f aborts
+    # the process, so the wait always terminates).
+    while self.state.load() == ONCE_RUNNING() do
       std::thread::yield_now()
     end
     return
   end
   
-  # We got the lock, execute the function
+  # The CAS winner: run f and publish COMPLETE.
   f()
-  
-  # Mark as done
-  self.state.store(ONCE_DONE())
+  self.state.store(ONCE_COMPLETE())
 end
 
 def Once::is_completed(self: Once) -> Bool
-  self.state.load() == ONCE_DONE()
+  self.state.load() == ONCE_COMPLETE()
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -958,38 +1073,11 @@ def defer(cleanup: fn() -> Unit) -> ScopeGuard[fn() -> Unit]
   ScopeGuard::new(cleanup)
 end
 # ═══════════════════════════════════════════════════════════════
-# Transferable / Shareable marker impls (access + resource model)
+# Transferable / Shareable — NO marker impls (concurrency properties)
 # ═══════════════════════════════════════════════════════════════
-
-impl[T] Transferable for Mutex[T] {}
-impl[T] Shareable for Mutex[T] {}
-
-impl[T] Transferable for RwLock[T] {}
-impl[T] Shareable for RwLock[T] {}
-
-impl Transferable for Condvar {}
-impl Shareable for Condvar {}
-
-impl[T] Transferable for Sender[T] {}
-impl[T] Shareable for Sender[T] {}
-
-impl[T] Transferable for Receiver[T] {}
-impl[T] Shareable for Receiver[T] {}
-
-impl[T] Transferable for Arc[T] {}
-impl[T] Shareable for Arc[T] {}
-
-impl Transferable for AtomicBool {}
-impl Shareable for AtomicBool {}
-
-impl Transferable for AtomicU32 {}
-impl Shareable for AtomicU32 {}
-
-impl Transferable for AtomicU64 {}
-impl Shareable for AtomicU64 {}
-
-impl[T] Transferable for AtomicPtr[T] {}
-impl[T] Shareable for AtomicPtr[T] {}
-
-impl Transferable for Once {}
-impl Shareable for Once {}
+# The manual Transferable/Shareable impls are DELETED: the compiler
+# derives the properties structurally (tg_compiler/types.tg — the single
+# authority). Mutex/RwLock/Condvar/Sender/Receiver are Arc-wrapped (the
+# recognized synchronized representation) and the atomics are scalar
+# structs — the derivation answers Transferable + Shareable
+# structurally.

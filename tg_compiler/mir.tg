@@ -1532,6 +1532,7 @@ def builder_new() -> MirBuilder
       arc_strong: -1,
       weak_rc: -1,
       weak_arc: -1,
+      affine_handle: -1,
       ptr: -1,
       ptr_mut: -1,
       drop_trait: -1,
@@ -14483,29 +14484,87 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def optimize_mir(inout program: MirProgram, opt_level: Int) -> Unit
+  optimize_mir_verified(program, opt_level, false)
+end
+
+# The verify-everything optimizer entry — the reviewer's item 46 firewall.
+# `verify_everything` gates the PER-PASS verification checkpoints (the
+# debug/CI build mode): after EVERY transformative pass the whole-program
+# MIR verifier (verify_mir) runs and a violation panics with the full
+# diagnostic list — a pass that corrupts the IR can never reach codegen in
+# the debug/CI builds. Release builds call optimize_mir (verify_everything =
+# false) and rely on the pipeline's single post-opt verification.
+#
+# The per-function sub-pass sequence is EXACTLY optimize_function's (DCE ->
+# copy propagation -> constant folding -> [GVN -> LICM -> bounds-check
+# elimination] -> move simplification -> final DCE), executed as program-wide
+# BATCHES: the passes are per-function (no cross-function data), so batching
+# preserves the per-function result byte-for-byte while allowing a verifier
+# checkpoint BETWEEN every transformative pass.
+def optimize_mir_verified(inout program: MirProgram, opt_level: Int, verify_everything: Bool) -> Unit
   # At opt_level 0, skip all optimizations (debug builds)
   if opt_level == 0 then return end
 
   # First pass: inlining (requires full program) — opt_level >= 2
   if opt_level >= 2 then
     inline_functions(program)
+    if verify_everything then verifier_program_checkpoint(program, "inline") end
   end
 
-  # Second pass: per-function optimizations
-  for f in program.functions do
-    optimize_function(f, opt_level)
+  # Second pass: per-function optimizations (program-wide batches).
+  for f in program.functions do eliminate_dead_code(f) end
+  if verify_everything then verifier_program_checkpoint(program, "dead code elimination") end
+
+  for f in program.functions do propagate_copies(f) end
+  if verify_everything then verifier_program_checkpoint(program, "copy propagation") end
+
+  for f in program.functions do fold_constants(f) end
+  if verify_everything then verifier_program_checkpoint(program, "constant folding") end
+
+  if opt_level >= 2 then
+    for f in program.functions do global_value_numbering(f) end
+    if verify_everything then verifier_program_checkpoint(program, "global value numbering") end
+
+    for f in program.functions do loop_invariant_code_motion(f) end
+    if verify_everything then verifier_program_checkpoint(program, "loop-invariant code motion") end
+
+    for f in program.functions do eliminate_bounds_checks(f) end
+    if verify_everything then verifier_program_checkpoint(program, "bounds-check elimination") end
   end
+
+  for f in program.functions do simplify_moves(f) end
+  if verify_everything then verifier_program_checkpoint(program, "move simplification") end
+
+  for f in program.functions do eliminate_dead_code(f) end
+  if verify_everything then verifier_program_checkpoint(program, "final dead code elimination") end
 
   # Third pass: escape analysis and heap-to-stack promotion — opt_level >= 2
   if opt_level >= 2 then
     for f in program.functions do
       escape_analysis(f)
     end
+    if verify_everything then verifier_program_checkpoint(program, "escape analysis") end
   end
 
   # Fourth pass: PGO-guided optimization — opt_level >= 3
   if opt_level >= 3 then
     apply_pgo_optimizations(program)
+    if verify_everything then verifier_program_checkpoint(program, "PGO-guided optimization") end
+  end
+end
+
+# Run the whole-program verifier after one transformative pass; a violation
+# is a compiler-internal failure — panic with every diagnostic (the
+# debug/CI firewall surfaces the full violation set, never a truncated
+# first error).
+def verifier_program_checkpoint(program: MirProgram, pass_name: String) -> Unit
+  let errs = verify_mir(program)
+  if !errs.is_empty() then
+    var msg = "MIR verifier failed after pass '" + pass_name.clone() + "':"
+    for e in errs do
+      msg = msg + "\n  " + e
+    end
+    panic(msg)
   end
 end
 
@@ -18514,6 +18573,17 @@ def verifier_local_exists(func: MirFunction, lid: Int) -> Bool
   false
 end
 
+# Whether a local id is a function PARAMETER (not a body local). The item-j
+# rule exempts param-typed destination roots (the checker's assign-drop
+# contract covers concrete parameter reassignment; the hand-built verifier
+# tests reassign owning params to exercise the copy-safety backstop).
+def verifier_local_is_param(func: MirFunction, lid: Int) -> Bool
+  for p in func.params do
+    if p.id.id == lid then return true end
+  end
+  false
+end
+
 def verifier_block_exists(func: MirFunction, bid: Int) -> Bool
   for b in func.blocks do
     if b.id.id == bid then return true end
@@ -19125,6 +19195,19 @@ def verifier_type_trivially_copyable(inout engine_env: TypeEnv, ty: Type) -> Boo
   if props.is_deferred then false else props.is_trivially_copyable end
 end
 
+# (item j — the owning-destination test): whether an assignment destination
+# type REQUIRES an explicit old-value drop — the type is NOT trivially
+# copyable (bitwise overwrite would orphan owning state) AND its identity is
+# DECIDED (is_deferred false). A deferred destination (an unsubstituted
+# Param position in a generic template) is skipped: the checker deliberately
+# delays Param-position drops (the deferred contract — "never fabricates a
+# drop for a deferred position"), and the POST-MONO verifier re-evaluates
+# the substituted concrete instance, where the decisive answer lives.
+def verifier_type_requires_old_drop(inout engine_env: TypeEnv, ty: Type) -> Bool
+  let props = type_properties_of(engine_env, ty)
+  !props.is_deferred && !props.is_trivially_copyable
+end
+
 # MirCopy of a non-trivially-copyable type in a VALUE position is a
 # verifier error. Value positions are where a bitwise copy would alias
 # owning state WITHOUT transferring ownership: binary/unary/cast/repeat
@@ -19637,6 +19720,19 @@ def verifier_rvalue_type(inout engine_env: TypeEnv, type_index: Map[Int, MirType
     # copy-legality check applies: a move of a non-trivially-copyable
     # value (String, Vec[..],...) is exactly the sanctioned transfer.
     verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
+    # Ref-ABI invariant (#7): MOVING a ref-typed value is forbidden — the
+    # whitelist of legal ref uses is (a) a MirRef assigned to a plain
+    # temp, (b) the temp READ as a direct call argument, (c) value reads
+    # through deref projections. A MirMove of the ref temp would flow the
+    # reference into arbitrary storage (aggregate slots, the return
+    # place) and break the write-back model.
+    match operand.kind
+    when MirOperandKind::MirCopy(pl) then verifier_check_ref_operand(func, &pl, "move operand", ctx, errors)
+    when MirOperandKind::MirMovePlace(pl) then verifier_check_ref_operand(func, &pl, "move operand", ctx, errors)
+    when MirOperandKind::MirRead(pl) then verifier_check_ref_operand(func, &pl, "move operand", ctx, errors)
+    when MirOperandKind::MirConsume(pl) then verifier_check_ref_operand(func, &pl, "move operand", ctx, errors)
+    when _ then ()
+    end
   when MirRvalueKind::MirRef(place) then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
     Option::None
@@ -19723,6 +19819,19 @@ def verifier_rvalue_type(inout engine_env: TypeEnv, type_index: Map[Int, MirType
       if !verifier_local_exists(func, lid) then
         errors.push(ctx.clone() + ": phi references undefined local _" + lid.to_string())
       else
+        # Ref-ABI invariant (#7): a phi of ref-typed incoming values would
+        # merge internal ABI references — the write-back model requires
+        # refs to stay in their plain temp until the direct call argument,
+        # never to flow through a join.
+        match verifier_local_type(func, lid)
+        when Option::Some(lty) then
+          match lty
+          when Type::RefInternal(_, _) then
+            errors.push(ctx.clone() + ": phi incoming value is a ref-typed local _" + lid.to_string() + " (refs are internal ABI temporaries and must not flow through joins)")
+          when _ then ()
+          end
+        when Option::None then ()
+        end
         # All incoming values must have the same type; the destination type is
         # checked by the surrounding MirAssign via the returned phi type.
         match verifier_local_type(func, lid)
@@ -19898,9 +20007,62 @@ end
 # Call invariants
 # ———————————————————————————————————————————————————————————————
 
+# (item e — the call argument/convention mismatch): the shared
+# parameter-type + destination-type validation for a typed callee (FnPtr and
+# Closure). The param list's declared types must match the argument operand
+# types positionally (a Place argument passes the pointee value at the ABI
+# boundary — the expected ref/inout parameter type is stripped for the
+# comparison), and the call destination's type must match the callee's
+# return type. The Closure arm previously carried this logic; the FnPtr arm
+# checked only the arity — a concrete callee whose argument types mismatched
+# the declaration sailed through to codegen. Both callee kinds now share the
+# full check.
+def verifier_check_call_params_and_dest(type_index: Map[Int, MirTypeDef], func: MirFunction, args: Vec[MirCallArg], arg_types: Vec[Type], param_tys: Vec[ParamType], ret_ty: Type, dest: Place, ctx: String, inout errors: Vec[String]) -> Unit
+  if param_tys.len() != args.len() then
+    errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
+  end
+  var i = 0
+  while i < args.len() && i < param_tys.len() do
+    if i < arg_types.len() then
+      var expected_ty = param_tys[i].ty.clone()
+      match args[i].value
+      when MirCallValue::Place(_) then
+        match verifier_strip_pointee(type_index, &expected_ty)
+        when Option::Some(stripped) then expected_ty = stripped
+        when Option::None then ()
+        end
+      when MirCallValue::Value(_) then ()
+      end
+      if !verifier_types_compatible(type_index, &expected_ty, &arg_types[i]) then
+        errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(type_index, &expected_ty) + " got " + verifier_type_key(type_index, &arg_types[i]))
+      end
+    end
+    i = i + 1
+  end
+  match verifier_place_result_type_opt(type_index, func, dest)
+  when Option::Some(dty) then
+    if !verifier_types_compatible(type_index, &ret_ty, &dty) then
+      errors.push(ctx.clone() + ": call dest type mismatch: expected " + verifier_type_key(type_index, &ret_ty) + " got " + verifier_type_key(type_index, &dty))
+    end
+  when Option::None then ()
+  end
+end
+
 def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, dest: Place, callee: MirOperand, args: Vec[MirCallArg], running: Set[Int], inout moved: Map[Int, Set[String]], ctx: String, inout errors: Vec[String]) -> Unit
   let callee_ty = verifier_check_operand(type_index, func, callee, running, &mut moved, ctx, errors)
   verifier_check_place(type_index, func, dest, running, ctx, errors)
+  # Ref-ABI invariant (#7): a call whose DESTINATION is a ref-typed local
+  # would let a callee write a reference value through the return slot —
+  # refs are internal ABI temporaries whose only legal producer is MirRef.
+  match verifier_place_result_type_opt(type_index, func, dest)
+  when Option::Some(dty2) then
+    match dty2
+    when Type::RefInternal(_, _) then
+      errors.push(ctx.clone() + ": call destination is a ref-typed local (refs are internal ABI and must not be produced by calls)")
+    when _ then ()
+    end
+  when Option::None then ()
+  end
  # the effect/operand-form agreement is checked on the RAW call args
   # (mir_call_arg_operand collapses Place to a copy operand and would hide
   # the distinction the invariant is about).
@@ -19934,39 +20096,10 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   match callee_ty
   when Option::Some(cty) then
     match cty
-    when Type::FnPtr(param_tys, _, _) then
-      if param_tys.len() != args.len() then
-        errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
-      end
-    when Type::Closure(_, param_tys, _, _, _) then
-      if param_tys.len() != args.len() then
-        errors.push(ctx.clone() + ": call arg count mismatch: expected " + param_tys.len().to_string() + " got " + args.len().to_string())
-      end
-      var i = 0
-      while i < args.len() && i < param_tys.len() do
-        if i < arg_types.len() then
-          var expected_ty = param_tys[i].ty.clone()
-          match args[i].value
-          when MirCallValue::Place(_) then
-            match verifier_strip_pointee(type_index, &expected_ty)
-            when Option::Some(stripped) then expected_ty = stripped
-            when Option::None then ()
-            end
-          when MirCallValue::Value(_) then ()
-          end
-          if !verifier_types_compatible(type_index, &expected_ty, &arg_types[i]) then
-            errors.push(ctx.clone() + ": call arg " + i.to_string() + " type mismatch: expected " + verifier_type_key(type_index, &expected_ty) + " got " + verifier_type_key(type_index, &arg_types[i]))
-          end
-        end
-        i = i + 1
-      end
-      match verifier_place_result_type_opt(type_index, func, dest)
-      when Option::Some(dty) then
-        if !verifier_types_compatible(type_index, &ret_ty, &dty) then
-          errors.push(ctx.clone() + ": call dest type mismatch: expected " + verifier_type_key(type_index, &ret_ty) + " got " + verifier_type_key(type_index, &dty))
-        end
-      when Option::None then ()
-      end
+    when Type::FnPtr(param_tys, ret_ty, _) then
+      verifier_check_call_params_and_dest(type_index, func, &args, &arg_types, &param_tys, &ret_ty, dest, ctx, errors)
+    when Type::Closure(_, param_tys, ret_ty, _, _) then
+      verifier_check_call_params_and_dest(type_index, func, &args, &arg_types, &param_tys, &ret_ty, dest, ctx, errors)
     when Type::Unit then ()
     when _ then
       # A concrete, resolved callee that is neither a function nor unit is a
@@ -19977,13 +20110,41 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   end
 end
 
-def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, term: MirTerminator, running: Set[Int], inout moved: Map[Int, Set[String]], inout destroyed: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     if !verifier_block_exists(func, target.id) then
       errors.push(ctx.clone() + ": goto references invalid block bb" + target.id.to_string())
     end
-  when MirTerminatorKind::MirReturn then ()
+  when MirTerminatorKind::MirReturn then
+    # (item n — the invalid function return): the return place is the
+    # "_ret" local (the start_function convention: locals[0], created with
+    # the function's declared return type). The STRUCTURAL return check:
+    # the return place's declared type must still be the function's
+    # declared return type — a pass corrupting the return slot is caught
+    # here, before codegen emits a garbage return. (A definite-initialized
+    # check on the return value is NOT sound without call-divergence
+    # modeling: std's `Option::unwrap` — `match self when Some(v) then v
+    # when None then panic(...)` — flows the panic CALL's success edge into
+    # the return join, so the join is structurally reached on a path where
+    # `_ret` is never assigned — a false positive.)
+    if func.ret_type != Type::Unit && func.ret_type != Type::Never then
+      var ret_id = -1
+      var li3 = 0
+      while li3 < func.locals.len() do
+        if func.locals[li3].name == "_ret" then ret_id = func.locals[li3].id.id end
+        li3 = li3 + 1
+      end
+      if ret_id != -1 then
+        match verifier_local_type(func, ret_id)
+        when Option::Some(ret_lty) then
+          if !verifier_types_compatible(type_index, &func.ret_type, &ret_lty) then
+            errors.push(ctx.clone() + ": return place type mismatch: declared " + verifier_type_key(type_index, &func.ret_type) + " but local _" + ret_id.to_string() + " is " + verifier_type_key(type_index, &ret_lty))
+          end
+        when Option::None then ()
+        end
+      end
+    end
   when MirTerminatorKind::MirUnreachable then ()
   when MirTerminatorKind::MirAbort then ()
   when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
@@ -20051,6 +20212,28 @@ def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, Mi
     end
   when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
     verifier_check_place(type_index, func, &place, running, ctx, errors)
+    # (items h/i — the deinit of dead storage and the duplicate deinit):
+    #   - the moved lattice: a deinit of a place whose value was already
+    #     moved/consumed out (a predecessor move, a same-block move, or a
+    #     shadowing chain) destroys a value that is no longer there — a
+    #     double-drop (the checker's definitely_consumed tracking never
+    #     schedules it);
+    #   - the destroyed lattice (verifier_destroyed_key_conflict): a
+    #     second MirDeinit of the same place (exact or extension conflict)
+    #     is the duplicate deinit. The finalizer-then-fields order keeps a
+    #     whole-root destroyed entry from shadowing field keys, and the
+    #     dynamic-index "*" boundary (drop-glue loops) is excluded.
+    # The deinit then records the place key in the destroyed lattice so a
+    # later deinit (in this block's successors, through the destroyed
+    # dataflow) conflicts.
+    let dkey = verifier_place_key(type_index, &place)
+    if verifier_key_moved(moved, place.local.id, &dkey) then
+      errors.push(ctx.clone() + ": deinit of previously moved/consumed local _" + place.local.id.to_string() + verifier_moved_key_desc(&dkey))
+    end
+    if verifier_destroyed_key_conflict(destroyed, place.local.id, &dkey) then
+      errors.push(ctx.clone() + ": duplicate deinit of local _" + place.local.id.to_string() + verifier_moved_key_desc(&dkey))
+    end
+    verifier_key_insert(&mut destroyed, place.local.id, &dkey)
     if !verifier_block_exists(func, target.id) then
       errors.push(ctx.clone() + ": deinit target references invalid block bb" + target.id.to_string())
     end
@@ -20237,6 +20420,84 @@ end
 def verifier_root_has_moves(moved: Map[Int, Set[String]], root: Int) -> Bool
   match moved.get(root)
   when Option::Some(set) then set.len() > 0
+  when Option::None then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (the destroyed lattice — items h/i/j: deinit-of-dead storage, the
+# duplicate deinit, the Initialize into already-Live storage)
+# ———————————————————————————————————————————————————————————————
+# The DESTROYED lattice (root local -> destroyed place keys) tracks what the
+# MIR EXPLICITLY destroyed through MirDeinit terminators. It is the
+# complement of the moved lattice: a move TRANSFERS the value out (the
+# storage is dead), a deinit DESTROYS the value in place (the storage is
+# dead too — a later deinit is a double-drop). The two lattices feed
+# different rules:
+#   - the deinit-vs-deinit conflict (item i): destroying a place that is
+#     already destroyed — with the finalizer carve-outs. The user-finalizer
+#     walk (emit_plan_deinit's UserFinalizer arm) LEGITIMATELY destroys the
+#     whole root FIRST (the finalizer call — DeinitPlan::Call with the
+#     registered finalizer identity) and the field deinits SECOND, so a
+#     whole-root destroyed entry does NOT shadow field keys (the prefix
+#     rule skips the "" entry). The dynamic-index whole-value boundary
+#     ("*" — the heap-array element destroys in the drop glue, and the
+#     set/map drain loops) is loop-carried and not statically comparable —
+#     "*" entries never conflict.
+#   - the assign-vs-destroyed coverage (item j): an assignment into a place
+#     that holds a LIVE value of an owning (non-trivially-copyable) type is
+#     legal only when the old value was explicitly destroyed or already
+#     moved out (the moved lattice). The destroyed coverage is BROADER than
+#     the deinit conflict: the checker's assignment-drop chains
+#     (lower_assign_drop_chain) emit the exact-target deinit (key == the
+#     dest key), a PREFIX deinit (a destroyed parent covers the dest
+#     extension — the parent drop destroyed it with it), or a PARTIAL drop
+#     (mir_emit_partial_drop_chain — the checker's consumed-extensions plan
+#     drops exactly the dest's LIVE subfields, so a destroyed EXTENSION of
+#     the dest key also covers the dest — the dead moved-out parts need no
+#     drop). Well-formed MIR therefore always passes and a missing old-drop
+#     is caught before codegen.
+# The dataflow (verifier_compute_destroyed_dataflow) propagates the
+# destroyed state forward; a MirAssign re-lives the assigned place (the
+# store clears the key — the same verifier_key_clear the moved lattice
+# uses), so loop-carried old-value drops (the backedge deinit of a
+# loop-carried local) never conflict with the next iteration's deinit.
+def verifier_destroyed_key_conflict(destroyed: Map[Int, Set[String]], root: Int, key: String) -> Bool
+  match destroyed.get(root)
+  when Option::Some(set) then
+    if set.len() == 0 then return false end
+    for m in set do
+      # The dynamic-index whole-value boundary is loop-carried in the drop
+      # glue (heap-array elements, set/map drain slots) — not comparable.
+      if m == "*" then next end
+      if m == key then return true end
+      # A destroyed strict prefix covers the extension (destroying x.a
+      # destroys x.a.b with it — a later destroy of x.a.b double-drops).
+      # The whole-root "" entry does NOT cover field keys (the
+      # finalizer-then-fields order).
+      if m != "" && key.starts_with(m + ".") then return true end
+    end
+    false
+  when Option::None then false
+  end
+end
+
+# (item j — the assign coverage test): whether the destroyed lattice
+# records an explicit drop that covers the assignment destination key — the
+# exact key, a destroyed PREFIX (a parent drop destroyed the dest with it),
+# or a destroyed EXTENSION (the checker's partial-drop chain dropped the
+# dest's live subfields — the dead moved-out parts need no drop).
+def verifier_destroyed_covers_assign(destroyed: Map[Int, Set[String]], root: Int, key: String) -> Bool
+  match destroyed.get(root)
+  when Option::Some(set) then
+    if set.len() == 0 then return false end
+    for m in set do
+      if m == "*" then next end
+      if m == key then return true end
+      if m != "" && key.starts_with(m + ".") then return true end
+      if m.starts_with(key + ".") then return true end
+    end
+    false
   when Option::None then false
   end
 end
@@ -20456,6 +20717,10 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
   # Cross-block moved-state dataflow (may-moved per block IN set — the
   # projection-aware Map[Int, Set[String]] place-key lattice).
   let moved_in_map = verifier_compute_moved_dataflow(&type_index, func, &block_map, &preds, entry_id)
+  # Cross-block DESTROYED-state dataflow (items h/i/j — the MirDeinit
+  # destroyed place keys, propagated forward; the assign-vs-destroyed and
+  # deinit-vs-destroyed rules consume it).
+  let destroyed_in_map = verifier_compute_destroyed_dataflow(&type_index, func, &block_map, &preds, entry_id)
 
   # Phi edge validation: each Phi must have exactly one incoming value per CFG
   # predecessor (no duplicate/foreign predecessor ids), and the incoming local
@@ -20528,7 +20793,11 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
     when Option::Some(s) then s.clone()
     when Option::None then Map::new()
     end
-    verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &fn_effects, &bb_ctx, errors)
+    let bdestroyed = match destroyed_in_map.get(bid)
+    when Option::Some(s) then s.clone()
+    when Option::None then Map::new()
+    end
+    verifier_check_block_stmts(engine_env, type_index, func, b, &bin, &bmoved, &bdestroyed, &fn_effects, &bb_ctx, errors)
     bi = bi + 1
   end
 end
@@ -20576,6 +20845,150 @@ def verifier_rvalue_moved_targets(type_index: Map[Int, MirTypeDef], rvalue: MirR
   when MirRvalueKind::MirRepeat(operand, _) then verifier_operand_moved_target(type_index, &operand, out)
   when _ then ()
   end
+end
+
+# (item f/g — cross-block consume tracking): the moved targets of a
+# TERMINATOR. MirCall arguments are the one place ownership TRANSFERS into a
+# call: a Consume-effect argument (the sink ABI — Vec__push(element),
+# closure Consume captures at call sites) or a MirMovePlace/MirConsume value
+# operand transfers the value out of the source place, and every later use
+# (in this block's successors) of that place is the cross-block
+# use-after-move the reviewer's items f/g name. The moved-dataflow
+# propagates these like statement moves — a successor that reinitializes the
+# place clears the key (verifier_key_clear in the statement walk).
+def verifier_terminator_moved_targets(type_index: Map[Int, MirTypeDef], term: MirTerminator, inout out: Map[Int, Set[String]]) -> Unit
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind, intrinsic } then
+    for arg in args do
+      match arg.value
+      when MirCallValue::Value(op) then
+        verifier_operand_moved_target(type_index, &op, out)
+      when MirCallValue::Place(pl) then
+        # A Place-form argument with a Consume effect is the sink ABI's
+        # by-place transfer — the source place transitions out of
+        # initialized into consumed.
+        if arg.effect == AccessEffect::Consume then
+          let key = verifier_place_key(type_index, &pl)
+          var set = match out.get(pl.local.id)
+          when Option::Some(s) then s.clone()
+          when Option::None then Set::new()
+          end
+          set.insert(key)
+          out.insert(pl.local.id, set)
+        end
+      end
+    end
+  when _ then ()
+  end
+end
+
+# The destroyed-state dataflow (items h/i/j): the forward union of the
+# MirDeinit-destroyed place keys. The transfer function processes the block's
+# statements (a MirAssign re-lives the assigned place — verifier_key_clear —
+# and StorageLive/StorageDead reset the root) AND the terminator (a
+# MirDeinit destroys its place). MirDeinit is a terminator, so the destroyed
+# state only propagates through this dedicated dataflow — the moved lattice
+# never carries deinit effects (the array-glue element loop would alias the
+# loop-carried destroy with a same-path duplicate).
+def verifier_compute_destroyed_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[String]]
+  var destroyed_in: Map[Int, Set[String]] = Map::new()
+  var destroyed_out: Map[Int, Set[String]] = Map::new()
+  var entry_set: Set[String] = Set::new()
+  destroyed_in.insert(entry_id, entry_set.clone())
+
+  var worklist = Vec::new()
+  worklist.push(entry_id)
+  var in_worklist: Set[Int] = Set::new()
+  in_worklist.insert(entry_id)
+
+  while !worklist.is_empty() do
+    let bid = match worklist.pop()
+    when Option::Some(v) then v
+    when Option::None then break
+    end
+    in_worklist.remove(&bid)
+
+    var new_in: Map[Int, Set[String]] = Map::new()
+    if bid != entry_id then
+      let pred_list = match preds.get(bid)
+      when Option::Some(l) then l.clone()
+      when Option::None then Vec::new()
+      end
+      var pi = 0
+      while pi < pred_list.len() do
+        match destroyed_out.get(pred_list[pi])
+        when Option::Some(pm) then
+          for (pid, pset) in pm do
+            var set = match new_in.get(pid)
+            when Option::Some(s) then s.clone()
+            when Option::None then Set::new()
+            end
+            for k in pset do
+              set.insert(k.clone())
+            end
+            new_in.insert(pid, set)
+          end
+        when Option::None then ()
+        end
+        pi = pi + 1
+      end
+    end
+
+    let block = match block_map.get(bid)
+    when Option::Some(b) then b.clone()
+    when Option::None then break
+    end
+
+    var out: Map[Int, Set[String]] = Map::new()
+    for (pid, pset) in new_in do
+      var set2 = Set::new()
+      for k in pset do
+        set2.insert(k.clone())
+      end
+      out.insert(pid, set2)
+    end
+    for st in block.statements do
+      match st.kind
+      when MirStatementKind::MirAssign(place, _) then
+        # The store re-lives the place and its extensions.
+        verifier_key_clear(&mut out, place.local.id, verifier_place_key(type_index, &place))
+      when MirStatementKind::MirStorageLive(local) then out.remove(&local.id)
+      when MirStatementKind::MirStorageDead(local) then out.remove(&local.id)
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      verifier_key_insert(&mut out, place.local.id, verifier_place_key(type_index, &place))
+    when _ then ()
+    end
+
+    let had = match destroyed_in.get(bid)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    let old_in = match destroyed_in.get(bid)
+    when Option::Some(s) then s.clone()
+    when Option::None then Map::new()
+    end
+    let changed = !had || !verifier_moved_state_equal(&old_in, &new_in)
+    destroyed_in.insert(bid, new_in.clone())
+    destroyed_out.insert(bid, out)
+
+    if changed then
+      let succs2 = terminator_successor_ids(&block.terminator)
+      var s2 = 0
+      while s2 < succs2.len() do
+        let sid = succs2[s2]
+        if !in_worklist.contains(&sid) then
+          in_worklist.insert(sid)
+          worklist.push(sid)
+        end
+        s2 = s2 + 1
+      end
+    end
+  end
+  destroyed_in
 end
 
 # Forward may-moved dataflow: a place key is "moved-in" to a block if ANY
@@ -20649,6 +21062,10 @@ def verifier_compute_moved_dataflow(type_index: Map[Int, MirTypeDef], func: MirF
       when _ then ()
       end
     end
+    # (items f/g — cross-block consume tracking): the terminator's own
+    # ownership transfers (Consume-effect / MirMovePlace / MirConsume call
+    # arguments) propagate like statement moves.
+    verifier_terminator_moved_targets(type_index, &block.terminator, &mut out)
 
     let had = match moved_in.get(bid)
     when Option::Some(_) then true
@@ -20691,7 +21108,7 @@ def verifier_moved_state_equal(a: Map[Int, Set[String]], b: Map[Int, Set[String]
   true
 end
 
-def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, block: MirBlock, block_in: Set[Int], moved_in: Map[Int, Set[String]], destroyed_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (StorageLive'd or parameters). These are
   # deliberately separate: storage existing does NOT imply a valid value.
@@ -20712,6 +21129,16 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
       set.insert(k.clone())
     end
     moved.insert(root, set)
+  end
+  # `destroyed` = the destroyed-state lattice (items h/i/j — the
+  # MirDeinit-destroyed place keys; see verifier_destroyed_key_conflict).
+  var destroyed: Map[Int, Set[String]] = Map::new()
+  for (root, dset) in destroyed_in do
+    var set = Set::new()
+    for k in dset do
+      set.insert(k.clone())
+    end
+    destroyed.insert(root, set)
   end
 
   for st in block.statements do
@@ -20745,6 +21172,28 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
         if !live.contains(&pid) then
           errors.push(ctx.clone() + ": assign to local _" + pid.to_string() + " whose storage is not live")
         end
+        # (item j — the Initialize into already-Live storage): an
+        # assignment into a place that currently holds a LIVE value of a
+        # type that REQUIRES destruction (the engine's
+        # is_trivially_copyable authority — never the DeinitPlan) is legal
+        # only when the old value was explicitly destroyed (the destroyed
+        # lattice — the checker's assignment-drop chains
+        # (lower_assign_drop_chain) emit exactly the MirDeinit terminators
+        # that cover the key) or already moved/consumed out (the moved
+        # lattice). An overwrite of live owning storage without the
+        # explicit old drop would leak or double-own at runtime — the
+        # corruption class codegen would otherwise emit silently.
+        # A PARAM-typed destination root is exempt: the checker's
+        # assign-drop contract (is_owning_typed on the concrete parameter
+        # type) covers parameter reassignment in real MIR, and the
+        # hand-built verifier tests reassign owning params deliberately to
+        # exercise the copy-safety backstop.
+        let jkey = verifier_place_key(type_index, &place)
+        if jkey != "*" && running.contains(&pid) && !verifier_local_is_param(func, pid) && !verifier_key_moved(moved, pid, &jkey) && !verifier_destroyed_covers_assign(destroyed, pid, &jkey) then
+          if verifier_type_requires_old_drop(engine_env, &dst_ty) then
+            errors.push(ctx.clone() + ": assignment into already-initialized storage of the owning type " + verifier_type_key(type_index, &dst_ty) + " on local _" + pid.to_string() + " without an explicit drop of the old value (the old storage must be destroyed or moved out first)")
+          end
+        end
         running.insert(pid)
         # (partial moves — the place-result check): the store into the
         # place re-lives the place's chain and every extension of it; a
@@ -20758,6 +21207,9 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
           errors.push(ctx.clone() + ": assign into a field of consumed local _" + pid.to_string() + " (the whole root was moved out)")
         end
         verifier_key_clear(&mut moved, pid, &akey)
+        # The store re-lives the destroyed state too: the freshly assigned
+        # value is live and the old destroyed record is stale.
+        verifier_key_clear(&mut destroyed, pid, &jkey)
       when Option::None then
         errors.push(ctx.clone() + ": assignment to undefined local _" + pid.to_string())
       end
@@ -20770,6 +21222,7 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
       live.insert(lid)
       running.remove(&lid)
       moved.remove(&lid)
+      destroyed.remove(&lid)
     when MirStatementKind::MirStorageDead(local) then
       let lid = local.id
       if !verifier_local_exists(func, lid) then
@@ -20778,11 +21231,12 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
       live.remove(&lid)
       running.remove(&lid)
       moved.remove(&lid)
+      destroyed.remove(&lid)
     when _ then ()
     end
   end
 
-  verifier_check_terminator(engine_env, type_index, func, &block.terminator, &running, &mut moved, &fn_effects, ctx, errors)
+  verifier_check_terminator(engine_env, type_index, func, &block.terminator, &running, &mut moved, &mut destroyed, &fn_effects, ctx, errors)
 end
 
 # Top-level per-function verification driver.
@@ -20828,6 +21282,32 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
 
   if !verifier_block_exists(func, func.entry_block.id) then
     errors.push(fn_ctx.clone() + ": entry block bb" + func.entry_block.id.to_string() + " does not exist")
+  end
+
+  # (item b — the missing terminator): a block whose terminator is still
+  # the MirUnreachable PLACEHOLDER — create_block's "not yet terminated"
+  # sentinel (block_is_terminated treats it as unterminated; the entry
+  # block starts with it; clone_defer_block rewrites it) — is a block the
+  # lowering or a transformative pass never terminated. Unreachable
+  # leftovers are tolerated (DCE removes them); a REACHABLE block ending
+  # in the placeholder would make an executing path fall into an
+  # unreachable trap — the exact corruption class the reviewer's firewall
+  # exists for. The DUMMY span (span_dummy — file "", 0..0) distinguishes
+  # the never-replaced sentinel from a deliberately unreachable block.
+  let reachable_b = verifier_reachable_blocks(func)
+  var bi3 = 0
+  while bi3 < func.blocks.len() do
+    let blk3 = func.blocks[bi3]
+    if reachable_b.contains(&blk3.id.id) then
+      match blk3.terminator.kind
+      when MirTerminatorKind::MirUnreachable then
+        if blk3.terminator.span.file == "" && blk3.terminator.span.start == 0 && blk3.terminator.span.end_pos == 0 then
+          errors.push(fn_ctx.clone() + ": reachable block bb" + blk3.id.id.to_string() + " has no terminator (the MirUnreachable placeholder was never replaced)")
+        end
+      when _ then ()
+      end
+    end
+    bi3 = bi3 + 1
   end
 
  # no Type::Param / Type::Var in concrete MIR, and every Named type

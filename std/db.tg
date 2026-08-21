@@ -8,7 +8,11 @@
 #   let rows = db.query("SELECT * FROM users WHERE age > ?", &[&42])?
 
 use std::core::{Option, Result, Vec, String, Bool, Int, StrView}
-use std::collections::{Map}
+use std::collections::{Map, VecDeque}
+# The blocking pool (blocking-pool design): the N bounded worker threads from
+# std::thread, the blocking job queue, the async-channel result delivery.
+use std::thread::{ThreadBuilder, JoinHandle, AtomicBool, Ordering, Once, once_new, atomic_bool_new, atomic_int_new}
+use std::async::{channel}
 
 # ═══════════════════════════════════════════════════════════════
 # PART 1: DATABASE ABSTRACTIONS
@@ -54,6 +58,7 @@ enum DbError
   ConstraintViolation(String)
   Timeout
   Closed
+  Busy(String)
   Internal(String)
 end
 
@@ -68,6 +73,7 @@ def db_error_message(e: DbError) -> String
   when DbError::ConstraintViolation(s) then "constraint violation: " + s.clone()
   when DbError::Timeout then "connection timeout"
   when DbError::Closed then "connection closed"
+  when DbError::Busy(s) then "connection busy: " + s.clone()
   when DbError::Internal(s) then "internal error: " + s.clone()
   end
 end
@@ -298,6 +304,90 @@ impl Row
 end
 
 # ———————————————————————————————————————————————————————————————
+# The ConnectionInner lifecycle (connection-lifetime design)
+# ———————————————————————————————————————————————————————————————
+# Every driver's inner (SqliteInner / PostgresInner / MysqlInner) gains
+# the `life` field: the SAME Arc[ConnLifetime] cell the connection value
+# AND every live child (the Statement / Transaction lifetime tokens) hold.
+# The cell carries:
+#   state    — the Open/Closing/Closed lifecycle state (an atomic int
+#              code of the ConnState enum; the connection operations read
+#              it before touching the native handle, and every
+#              Statement/Transaction operation reads it through its
+#              token);
+#   children — the count of live statements/transactions holding the
+#              connection: incremented at prepare/begin_transaction,
+#              decremented at the child's drop. close() reads it for the
+#              BUSY POLICY — live children make close() fail with
+#              DbError::Busy and the native handle stays owned; the
+#              native close only runs when the count is zero (or at the
+#              inner's Drop, which the children's pins keep from running
+#              while any child lives).
+enum ConnState
+  Open
+  Closing
+  Closed
+end
+
+def conn_state_to_int(state: ConnState) -> Int
+  match state
+  when ConnState::Open then 0
+  when ConnState::Closing then 1
+  when ConnState::Closed then 2
+  end
+end
+
+struct ConnLifetime
+  state: AtomicInt
+  children: AtomicInt
+end
+
+def conn_lifetime_new() -> Arc[ConnLifetime]
+  Arc::new(ConnLifetime {
+    state: atomic_int_new(conn_state_to_int(ConnState::Open)),
+    children: atomic_int_new(0)
+  })
+end
+
+def conn_lifetime_open(life: Arc[ConnLifetime]) -> Bool
+  life.ptr.as_ref().state.load(Ordering::Acquire) == conn_state_to_int(ConnState::Open)
+end
+
+# The state check every connection-level operation runs before touching
+# the native handle: a Closing/Closed connection rejects the operation
+# with DbError::Closed.
+def conn_lifetime_check(life: Arc[ConnLifetime]) -> Result[Unit, DbError]
+  if conn_lifetime_open(life) then
+    Result::Ok(())
+  else
+    Result::Err(DbError::Closed)
+  end
+end
+
+# The child registration: prepare/begin_transaction increment the count;
+# the child's drop decrements it (the drop reaches the shared cell
+# through the token's own Arc clone of the cell).
+def conn_lifetime_register_child(life: Arc[ConnLifetime]) -> Unit
+  let _ = life.ptr.as_ref().children.fetch_add(1, Ordering::Relaxed)
+end
+
+# THE CONNECTION-LIFETIME TOKEN (connection-lifetime design): carried by every
+# Statement/Transaction value. `pin` — the type-erased Arc clone of the
+# connection inner (the heap block — and with it the native handle —
+# stays alive while the child lives, even after the connection value
+# drops); `life` — the SAME Arc[ConnLifetime] cell the connection inner
+# holds, so the child's operations can check the connection state and the
+# child's drop can release its registration.
+struct ConnToken
+  pin: Arc[Box[Any]]
+  life: Arc[ConnLifetime]
+end
+
+def conn_token_new(pin: Arc[Box[Any]], life: Arc[ConnLifetime]) -> ConnToken
+  ConnToken { pin: pin, life: life }
+end
+
+# ———————————————————————————————————————————————————————————————
 # Prepared Statement
 # ———————————————————————————————————————————————————————————————
 
@@ -317,17 +407,18 @@ struct Statement
   conn_handle: Ptr[Unit]
   param_count: UInt
   stmt_name: String
-  # The connection-lifetime token: the connection's inner Arc clone, boxed
-  # (Arc[Box[Any]]). While the statement lives, the token pins the inner's
-  # heap block, so the conn_handle raw pointer (and the native statement
-  # in `handle`, which the connection owns) stays valid even after the
-  # connection value itself drops. The token is released by the
-  # statement's drop — the field's default field drop.
-  conn_token: Arc[Box[Any]]
+  # The connection-lifetime token (connection-lifetime design): the pin keeps the
+  # connection inner (and the native handle) alive while the statement
+  # lives; the life cell is the shared Open/Closing/Closed state + the
+  # child count — the statement registered at prepare() and releases its
+  # registration at its drop. Every statement operation checks the state
+  # through the token before touching the native statement.
+  conn_token: ConnToken
 end
 
 impl Statement
   def execute(inout self: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    conn_lifetime_check(self.conn_token.life)?
     match self.driver
     when DriverKind::Sqlite then sqlite_stmt_execute(self, params)
     when DriverKind::Postgres then postgres_stmt_execute(self, params)
@@ -336,6 +427,7 @@ impl Statement
   end
   
   def query(self: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    conn_lifetime_check(self.conn_token.life)?
     match self.driver
     when DriverKind::Sqlite then sqlite_stmt_query(self, params)
     when DriverKind::Postgres then postgres_stmt_query(self, params)
@@ -370,6 +462,11 @@ impl Drop for Statement
         self.handle = null_ptr()
       end
     end
+    # The child-count release (connection-lifetime design): the statement's
+    # registration in the shared ConnLifetime cell is released at the
+    # drop — the count the connection's close() reads for the Busy
+    # policy.
+    let _ = self.conn_token.life.ptr.as_ref().children.fetch_sub(1, Ordering::Relaxed)
   end
 end
 
@@ -379,12 +476,13 @@ end
 
 struct Transaction
   conn_handle: Ptr[Unit]
-  # The connection-lifetime token: the connection's inner Arc clone, boxed
-  # (Arc[Box[Any]]). While the transaction lives, the token pins the
-  # connection's handle storage, so conn_handle stays valid even after
-  # the connection value itself drops; released by the transaction's drop
-  # (the field's default field drop).
-  conn_token: Arc[Box[Any]]
+  # The connection-lifetime token (connection-lifetime design): the pin keeps the
+  # connection inner (and the native handle) alive while the transaction
+  # lives; the life cell is the shared Open/Closing/Closed state + the
+  # child count — the transaction registered at begin_transaction() and
+  # releases its registration at its drop. Every transaction operation
+  # checks the state through the token before touching the native handle.
+  conn_token: ConnToken
   driver: DriverKind
   
   finished: Bool
@@ -395,6 +493,7 @@ impl Transaction
     if self.finished then
       return Result::Err(DbError::TransactionError("transaction already finished"))
     end
+    conn_lifetime_check(self.conn_token.life)?
     
     match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, sql, params)
@@ -407,6 +506,7 @@ impl Transaction
     if self.finished then
       return Result::Err(DbError::TransactionError("transaction already finished"))
     end
+    conn_lifetime_check(self.conn_token.life)?
     
     match self.driver
     when DriverKind::Sqlite then sqlite_query_raw(self.conn_handle, sql, params)
@@ -419,6 +519,7 @@ impl Transaction
     if self.finished then
       return Result::Err(DbError::TransactionError("transaction already finished"))
     end
+    conn_lifetime_check(self.conn_token.life)?
     
     let result = match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, "COMMIT", &[])
@@ -438,6 +539,7 @@ impl Transaction
     if self.finished then
       return Result::Err(DbError::TransactionError("transaction already finished"))
     end
+    conn_lifetime_check(self.conn_token.life)?
     
     let result = match self.driver
     when DriverKind::Sqlite then sqlite_execute_raw(self.conn_handle, "ROLLBACK", &[])
@@ -460,6 +562,10 @@ impl Drop for Transaction
       # Auto-rollback on drop
       let _ = self.rollback()
     end
+    # The child-count release (connection-lifetime design): the transaction's
+    # registration in the shared ConnLifetime cell is released at the
+    # drop.
+    let _ = self.conn_token.life.ptr.as_ref().children.fetch_sub(1, Ordering::Relaxed)
   end
 end
 
@@ -513,12 +619,14 @@ def sqlite_transient_destructor() -> Ptr[Unit]
   Ptr { address: (-1 as Int) as UInt }
 end
 
-# The heap-stable Sqlite connection: the native handle lives in the
-# Arc-owned inner (the inner's Drop runs sqlite3_close at the Arc's
-# last-release), and statements/transactions hold a boxed clone of the
-# inner Arc as their lifetime token.
+# The heap-stable Sqlite connection: the native handle and the shared
+# ConnLifetime cell (the Open/Closing/Closed state + the child count)
+# live in the Arc-owned inner (the inner's Drop runs sqlite3_close at the
+# Arc's last-release), and statements/transactions hold a boxed clone of
+# the inner Arc as their lifetime pin plus a clone of the life cell.
 struct SqliteInner
   handle: Ptr[Unit]
+  life: Arc[ConnLifetime]
 end
 
 struct Sqlite
@@ -541,7 +649,7 @@ impl Sqlite
       return Result::Err(DbError::ConnectionFailed(err_msg))
     end
     
-    Result::Ok(Sqlite { inner: Arc::new(SqliteInner { handle: handle }) })
+    Result::Ok(Sqlite { inner: Arc::new(SqliteInner { handle: handle, life: conn_lifetime_new() }) })
   end
   
   def open_memory() -> Result[Sqlite, DbError]
@@ -551,24 +659,31 @@ end
 
 impl Connection for Sqlite
   def execute(inout self: Sqlite, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     sqlite_execute_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def query(self: Sqlite, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     sqlite_query_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def begin_transaction(inout self: Sqlite) -> Result[Transaction, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     sqlite_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN TRANSACTION", &[])?
+    conn_lifetime_register_child(life)
     Result::Ok(Transaction {
       conn_handle: self.inner.ptr.as_ref().handle,
-      conn_token: Arc::new(Box::new(self.inner.clone())),
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life },
       driver: DriverKind::Sqlite,
       finished: false
     })
   end
   
   def prepare(inout self: Sqlite, sql: str) -> Result[Statement, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     var stmt_handle: Ptr[Unit] = null_ptr()
     let sql_cstr = sql.to_cstring()
     
@@ -586,6 +701,7 @@ impl Connection for Sqlite
       return Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(self.inner.ptr.as_ref().handle)))
     end
     
+    conn_lifetime_register_child(life)
     Result::Ok(Statement {
       sql: sql.to_string(),
       handle: stmt_handle,
@@ -593,22 +709,39 @@ impl Connection for Sqlite
       conn_handle: null_ptr(),
       param_count: 0,
       stmt_name: String::new(),
-      conn_token: Arc::new(Box::new(self.inner.clone()))
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life }
     })
   end
   
   def close(inout self: Sqlite) -> Result[Unit, DbError]
-    if self.inner.ptr.as_ref().handle.is_null() then
+    # THE BUSY POLICY (connection-lifetime design): live statements/transactions (the
+    # child count in the shared ConnLifetime cell) block the close — the
+    # native handle stays owned, the connection stays Open, and the
+    # children keep working. The native close only runs when the count is
+    # zero.
+    let inner = self.inner.ptr.as_ref()
+    let life = inner.life.clone()
+    if life.ptr.as_ref().children.load(Ordering::Acquire) > 0 then
+      return Result::Err(DbError::Busy("connection has live statements or transactions".to_string()))
+    end
+    if inner.handle.is_null() then
+      life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
       return Result::Ok(())
     end
-    let handle = self.inner.ptr.as_ref().handle
-    let rc = unsafe "FFI boundary" do sqlite3_close(self.inner.ptr.as_ref().handle) end
-    self.inner.ptr.as_ref().handle = null_ptr()
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closing), Ordering::Release)
+    let handle = inner.handle
+    let rc = unsafe "FFI boundary" do sqlite3_close(handle) end
     if rc != SQLITE_OK then
-      Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(handle)))
-    else
-      Result::Ok(())
+      # THE FAILED CLOSE KEEPS THE OWNERSHIP (connection-lifetime design): the handle
+      # is cleared ONLY on SQLITE_OK — a failed close leaves the handle in
+      # the inner (no leak; the inner's Drop retries sqlite3_close at the
+      # Arc's last release) and the connection returns to Open.
+      life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Open), Ordering::Release)
+      return Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(handle)))
     end
+    inner.handle = null_ptr()
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
+    Result::Ok(())
   end
 end
 
@@ -786,6 +919,7 @@ def sqlite_query_raw(handle: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]])
 end
 
 def sqlite_stmt_execute(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
@@ -825,6 +959,7 @@ def sqlite_stmt_execute(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) ->
 end
 
 def sqlite_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
@@ -908,9 +1043,15 @@ def sqlite_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[
 end
 
 def sqlite_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
-  let rc = unsafe "FFI boundary" do sqlite3_finalize(stmt.handle) end
-  if rc != SQLITE_OK then
-    return Result::Err(sqlite_error_from_code(rc, "statement finalize failed".to_string()))
+  # The state check: on a closed connection the native finalize is
+  # skipped (a closed connection's statement can only be a stale handle —
+  # the explicit close is blocked by the Busy policy while the statement
+  # lives); the handle is nulled either way so the drop is a no-op.
+  if !stmt.handle.is_null() && conn_lifetime_open(stmt.conn_token.life) then
+    let rc = unsafe "FFI boundary" do sqlite3_finalize(stmt.handle) end
+    if rc != SQLITE_OK then
+      return Result::Err(sqlite_error_from_code(rc, "statement finalize failed".to_string()))
+    end
   end
   stmt.handle = null_ptr()
   Result::Ok(())
@@ -966,14 +1107,16 @@ const PG_BYTEA_OID: u32 = 17
 const PG_TIMESTAMP_OID: u32 = 1114
 const PG_TIMESTAMPTZ_OID: u32 = 1184
 
-# The heap-stable Postgres connection: the native PgConnection pointer and
-# the prepared-statement counter live in the Arc-owned inner (the inner's
-# Drop runs PQfinish at the Arc's last-release), and
+# The heap-stable Postgres connection: the native PgConnection pointer,
+# the prepared-statement counter, and the shared ConnLifetime cell (the
+# Open/Closing/Closed state + the child count) live in the Arc-owned
+# inner (the inner's Drop runs PQfinish at the Arc's last-release), and
 # statements/transactions hold a boxed clone of the inner Arc as their
-# lifetime token.
+# lifetime pin plus a clone of the life cell.
 struct PostgresInner
   handle: Ptr[Unit]
   stmt_counter: UInt
+  life: Arc[ConnLifetime]
 end
 
 struct Postgres
@@ -1065,30 +1208,37 @@ impl Postgres
       return Result::Err(DbError::ConnectionFailed(err_msg))
     end
     
-    Result::Ok(Postgres { inner: Arc::new(PostgresInner { handle: handle, stmt_counter: 0 }) })
+    Result::Ok(Postgres { inner: Arc::new(PostgresInner { handle: handle, stmt_counter: 0, life: conn_lifetime_new() }) })
   end
 end
 
 impl Connection for Postgres
   def execute(inout self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     postgres_execute_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def query(self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     postgres_query_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def begin_transaction(inout self: Postgres) -> Result[Transaction, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     postgres_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN", &[])?
+    conn_lifetime_register_child(life)
     Result::Ok(Transaction {
       conn_handle: self.inner.ptr.as_ref().handle,
-      conn_token: Arc::new(Box::new(self.inner.clone())),
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life },
       driver: DriverKind::Postgres,
       finished: false
     })
   end
   
   def prepare(inout self: Postgres, sql: str) -> Result[Statement, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     # The statement SQL is normalized to PostgreSQL's $1..$n positional
     # form at prepare time (the `?` placeholder translation, quoted-string
     # aware), and the server-side statement is created with PQprepare; the
@@ -1117,6 +1267,7 @@ impl Connection for Postgres
     
     unsafe "FFI boundary" do PQclear(result) end
     
+    conn_lifetime_register_child(life)
     Result::Ok(Statement {
       sql: translated,
       handle: null_ptr(),
@@ -1124,13 +1275,26 @@ impl Connection for Postgres
       conn_handle: self.inner.ptr.as_ref().handle,
       param_count: param_count,
       stmt_name: stmt_name,
-      conn_token: Arc::new(Box::new(self.inner.clone()))
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life }
     })
   end
   
   def close(inout self: Postgres) -> Result[Unit, DbError]
-    unsafe "FFI boundary" do PQfinish(self.inner.ptr.as_ref().handle) end
-    self.inner.ptr.as_ref().handle = null_ptr()
+    # THE BUSY POLICY (connection-lifetime design): live statements/transactions
+    # block the close.
+    let inner = self.inner.ptr.as_ref()
+    let life = inner.life.clone()
+    if life.ptr.as_ref().children.load(Ordering::Acquire) > 0 then
+      return Result::Err(DbError::Busy("connection has live statements or transactions".to_string()))
+    end
+    if inner.handle.is_null() then
+      life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
+      return Result::Ok(())
+    end
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closing), Ordering::Release)
+    unsafe "FFI boundary" do PQfinish(inner.handle) end
+    inner.handle = null_ptr()
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
     Result::Ok(())
   end
 end
@@ -1163,37 +1327,242 @@ def postgres_result_errmsg(result: Ptr[Unit]) -> String
 end
 
 # ———————————————————————————————————————————————————————————————
-# The ? -> $n placeholder translation
+# The ? -> $n placeholder translation — the real driver lexer
 # ———————————————————————————————————————————————————————————————
 # PostgreSQL expects $1..$n positional parameters, never the JDBC `?`
-# placeholder. The translation scans the statement's SQL with quoted-
-# string awareness — a `?` inside a single-quoted string literal or a
-# double-quoted identifier is DATA, never a parameter — and rewrites the
-# parameter occurrences to $1..$n in parameter order. The scan is a
-# single pass over the characters; a doubled quote ('' or "") toggles the
-# quote state like any other quote and is handled by the toggle itself.
-# Returns the translated SQL and the number of parameters found.
+# placeholder. The translation scans the statement's SQL with a STATE
+# MACHINE over the enumerated PgLexState states (blocking-pool design) — the
+# single-quoted strings (with the '' doubling), the double-quoted
+# identifiers (with the "" doubling), the E'...' escape strings (where a
+# backslash escapes the following byte AND '' still doubles), the
+# dollar-quoted bodies ($tag$ ... $tag$ — the tag is remembered and the
+# body is opaque until the exact closing delimiter; a $ followed by a
+# digit is a positional parameter, never a dollar-quote opener), the --
+# line comments, and the /* */ block comments (which NEST in PostgreSQL —
+# the depth counter). A `?` inside ANY of those regions is DATA, never a
+# parameter; outside them a `?` followed by | or & is the jsonb ?| / ?&
+# operator (also not a parameter); a lone `?` is rewritten to $1..$n in
+# parameter order.
+#
+# The lexer works on the SQL's raw bytes (every state character is ASCII;
+# multi-byte UTF-8 content inside strings passes through byte-exact) and
+# rebuilds the output as bytes; the doubled-quote rules copy the doubled
+# delimiter verbatim and stay inside the string, exactly like the real
+# PostgreSQL scanner.
+enum PgLexState
+  PgNormal
+  PgSingleQuote
+  PgDoubleQuote
+  PgEscapeString
+  PgDollarQuote
+  PgLineComment
+  PgBlockComment
+end
+
+struct PgPlaceholderLexer
+  state: PgLexState
+  dollar_tag: Vec[u8]
+  block_depth: UInt
+  out: Vec[u8]
+  param_count: UInt
+end
+
+def pg_lex_ident_start(b: u8) -> Bool
+  (b >= 'a' as u8 && b <= 'z' as u8) || (b >= 'A' as u8 && b <= 'Z' as u8) || b == '_' as u8
+end
+
+def pg_lex_ident_char(b: u8) -> Bool
+  pg_lex_ident_start(b) || (b >= '0' as u8 && b <= '9' as u8)
+end
+
 def postgres_translate_placeholders(sql: str) -> (String, UInt)
-  var out = String::new()
-  var param_count = 0
-  var in_single_quote = false
-  var in_double_quote = false
-  for ch in sql.chars() do
-    if ch == '\'' && !in_double_quote then
-      in_single_quote = !in_single_quote
-      out.push(ch)
-    elsif ch == '"' && !in_single_quote then
-      in_double_quote = !in_double_quote
-      out.push(ch)
-    elsif ch == '?' && !in_single_quote && !in_double_quote then
-      param_count = param_count + 1
-      let dollar = "$" + param_count.to_string()
-      out.push_str(dollar.as_str())
-    else
-      out.push(ch)
+  let bytes = sql.as_bytes()
+  let n = bytes.len()
+  mut lexer = PgPlaceholderLexer {
+    state: PgLexState::PgNormal,
+    dollar_tag: Vec::new(),
+    block_depth: 0,
+    out: Vec::new(),
+    param_count: 0
+  }
+  mut i = 0
+  while i < n do
+    let b = bytes[i]
+    match lexer.state
+    when PgLexState::PgNormal then
+      if b == '\'' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgSingleQuote
+      elsif b == '"' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgDoubleQuote
+      elsif (b == 'E' as u8 || b == 'e' as u8) && i + 1 < n && bytes[i + 1] == '\'' as u8 then
+        # The E'...' escape string: the E prefix and the opening quote are
+        # emitted, the string body is scanned in PgEscapeString.
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+        lexer.state = PgLexState::PgEscapeString
+      elsif b == '-' as u8 && i + 1 < n && bytes[i + 1] == '-' as u8 then
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+        lexer.state = PgLexState::PgLineComment
+      elsif b == '/' as u8 && i + 1 < n && bytes[i + 1] == '*' as u8 then
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+        lexer.block_depth = 1
+        lexer.state = PgLexState::PgBlockComment
+      elsif b == '$' as u8 then
+        # The dollar-quote check: $tag$ opens a dollar-quoted body when
+        # the tag is empty ($$...$$) or starts with a letter/underscore;
+        # a $ followed by a digit (or a bare $) is a positional parameter
+        # marker / data.
+        let tag_start = i + 1
+        if tag_start < n && (bytes[tag_start] == '$' as u8 || pg_lex_ident_start(bytes[tag_start])) then
+          mut tag_end = tag_start
+          while tag_end < n && pg_lex_ident_char(bytes[tag_end]) do
+            tag_end = tag_end + 1
+          end
+          if tag_end < n && bytes[tag_end] == '$' as u8 then
+            lexer.dollar_tag = Vec::new()
+            var t = tag_start
+            while t < tag_end do
+              lexer.dollar_tag.push(bytes[t])
+              t = t + 1
+            end
+            lexer.out.push(b)
+            var t2 = tag_start
+            while t2 <= tag_end do
+              lexer.out.push(bytes[t2])
+              t2 = t2 + 1
+            end
+            i = tag_end
+            lexer.state = PgLexState::PgDollarQuote
+          else
+            lexer.out.push(b)
+          end
+        else
+          lexer.out.push(b)
+        end
+      elsif b == '?' as u8 then
+        if i + 1 < n && (bytes[i + 1] == '|' as u8 || bytes[i + 1] == '&' as u8) then
+          # The ?| / ?& jsonb operators — data, never a parameter.
+          lexer.out.push(b)
+        else
+          lexer.param_count = lexer.param_count + 1
+          let dollar = "$" + lexer.param_count.to_string()
+          for db in dollar.as_bytes() do
+            lexer.out.push(db)
+          end
+        end
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgSingleQuote then
+      if b == '\'' as u8 && i + 1 < n && bytes[i + 1] == '\'' as u8 then
+        # The '' doubling: emit both delimiters and stay inside.
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+      elsif b == '\'' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgNormal
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgDoubleQuote then
+      if b == '"' as u8 && i + 1 < n && bytes[i + 1] == '"' as u8 then
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+      elsif b == '"' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgNormal
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgEscapeString then
+      if b == '\\' as u8 && i + 1 < n then
+        # The backslash escape: the escaped byte is emitted verbatim —
+        # an escaped quote can never close the string.
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+      elsif b == '\'' as u8 && i + 1 < n && bytes[i + 1] == '\'' as u8 then
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+      elsif b == '\'' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgNormal
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgDollarQuote then
+      if b == '$' as u8 then
+        # The closing $tag$ must match the remembered tag EXACTLY; a $tag
+        # that only shares a prefix stays body data.
+        let tag_len = lexer.dollar_tag.len()
+        mut matches = true
+        if i + 1 + tag_len < n then
+          var t = 0
+          while t < tag_len && matches do
+            if bytes[i + 1 + t] != lexer.dollar_tag[t] then
+              matches = false
+            end
+            t = t + 1
+          end
+          if matches && bytes[i + 1 + tag_len] == '$' as u8 then
+            lexer.out.push(b)
+            var u = 0
+            while u <= tag_len do
+              lexer.out.push(bytes[i + 1 + u])
+              u = u + 1
+            end
+            i = i + 1 + tag_len
+            lexer.state = PgLexState::PgNormal
+            lexer.dollar_tag = Vec::new()
+          else
+            lexer.out.push(b)
+          end
+        else
+          lexer.out.push(b)
+        end
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgLineComment then
+      if b == '\n' as u8 then
+        lexer.out.push(b)
+        lexer.state = PgLexState::PgNormal
+      else
+        lexer.out.push(b)
+      end
+    when PgLexState::PgBlockComment then
+      if b == '*' as u8 && i + 1 < n && bytes[i + 1] == '/' as u8 then
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+        lexer.block_depth = lexer.block_depth - 1
+        if lexer.block_depth == 0 then
+          lexer.state = PgLexState::PgNormal
+        end
+      elsif b == '/' as u8 && i + 1 < n && bytes[i + 1] == '*' as u8 then
+        # The PostgreSQL block comments NEST — the depth counter.
+        lexer.out.push(b)
+        i = i + 1
+        lexer.out.push(bytes[i])
+        lexer.block_depth = lexer.block_depth + 1
+      else
+        lexer.out.push(b)
+      end
     end
+    i = i + 1
   end
-  (out, param_count as UInt)
+  let translated = String::from_utf8(lexer.out).unwrap_or(String::new())
+  (translated, lexer.param_count)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1586,6 +1955,7 @@ def parse_pg_timestamp(s: str) -> i64
 end
 
 def postgres_stmt_execute(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.conn_handle.is_null() then
     return Result::Err(DbError::Internal("prepared statement execution requires connection context".to_string()))
   end
@@ -1631,6 +2001,7 @@ def postgres_stmt_execute(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) 
 end
 
 def postgres_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.conn_handle.is_null() then
     return Result::Err(DbError::Internal("prepared statement query requires connection context".to_string()))
   end
@@ -1673,10 +2044,12 @@ end
 def postgres_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
   # The deterministic server-side cleanup: DEALLOCATE the named prepared
   # statement on the stored connection (the server frees its plan), and
-  # PQclear any result the DEALLOCATE returned. A closed/finished
+  # PQclear any result the DEALLOCATE returned. The state check (the
+  # connection must be Open — the Busy policy keeps a live statement from
+  # outliving its connection) guards the DEALLOCATE; a closed/finished
   # connection simply leaves the session state to the server — the
   # Tangerine-side state is nulled either way.
-  if !stmt.conn_handle.is_null() && !stmt.stmt_name.is_empty() then
+  if conn_lifetime_open(stmt.conn_token.life) && !stmt.conn_handle.is_null() && !stmt.stmt_name.is_empty() then
     let dealloc_sql = "DEALLOCATE " + stmt.stmt_name
     let sql_cstr = dealloc_sql.to_cstring()
     let result = unsafe "FFI boundary" do PQexec(stmt.conn_handle, sql_cstr.as_ptr()) end
@@ -2056,8 +2429,6 @@ extern "C"
   def mysql_rollback(mysql: Ptr[Unit]) -> u8
   def mysql_stmt_init(mysql: Ptr[Unit]) -> Ptr[Unit]
   def mysql_stmt_prepare(stmt: Ptr[Unit], query: Ptr[u8], length: UInt) -> i32
-  def mysql_stmt_bind_param(stmt: Ptr[Unit], bind: Ptr[MysqlBind]) -> i32
-  def mysql_stmt_bind_result(stmt: Ptr[Unit], bind: Ptr[MysqlBind]) -> i32
   def mysql_stmt_execute(stmt: Ptr[Unit]) -> i32
   def mysql_stmt_store_result(stmt: Ptr[Unit]) -> i32
   def mysql_stmt_fetch(stmt: Ptr[Unit]) -> i32
@@ -2065,6 +2436,15 @@ extern "C"
   def mysql_stmt_close(stmt: Ptr[Unit]) -> u8
   def mysql_stmt_affected_rows(stmt: Ptr[Unit]) -> u64
   def mysql_stmt_error(stmt: Ptr[Unit]) -> Ptr[u8]
+  # The MySQL native shim (blocking-pool design): every call that must touch a
+  # real MYSQL_BIND goes through the Tangerine-facing shim
+  # (native/mysql_shims.c), which builds the MYSQL_BIND arrays internally
+  # from the stable Tangerine descriptors (MysqlParam / MysqlResultCell).
+  # The handwritten st_mysql_bind layout is gone from the module.
+  def tg_mysql_stmt_bind_and_execute(stmt: Ptr[Unit], params: Ptr[MysqlParam], count: UInt) -> i32
+  def tg_mysql_stmt_bind_result(stmt: Ptr[Unit], cells: Ptr[MysqlResultCell], count: UInt) -> i32
+  def tg_mysql_stmt_fetch_column(stmt: Ptr[Unit], cell: Ptr[MysqlResultCell], column: UInt, offset: UInt) -> i32
+  def tg_mysql_layout_probe(out: PtrMut[i64], out_len: UInt) -> i32
 end
 
 @repr(C)
@@ -2091,73 +2471,44 @@ struct MysqlField
   type_: u32   ## MYSQL_TYPE_*
 end
 
-# MYSQL_BIND — the mysql.h st_mysql_bind layout (LP64), the parameter /
-# result cell descriptor used by mysql_stmt_bind_param / bind_result.
-# The parameter-relevant fields (buffer_type @96, buffer @16,
-# buffer_length @64, length @0, is_null @8, is_unsigned @101) sit in the
-# ABI-stable prefix shared by the MySQL and MariaDB client headers; the
-# tail (read_row_data / is_unsigned_p / own_data) is copied by the
-# client, never interpreted for parameter binding. buffer_type is the
-# enum_field_types value (MYSQL_TYPE_* constants below).
+# THE SHIM DESCRIPTORS (blocking-pool design): the stable Tangerine-facing
+# layouts the native shim (native/mysql_shims.c) builds the REAL
+# MYSQL_BIND arrays from. The hand-written st_mysql_bind layout is gone —
+# the Tangerine module never declares it. The C side prints and returns
+# the sizeof/_Alignof/offsetof facts of both descriptors (and of
+# MYSQL_BIND / MYSQL_FIELD) through tg_mysql_layout_probe; the layout
+# probe test asserts the Tangerine @repr(C) layouts against those facts.
+
+# One parameter: type 0 = SQL NULL, 1 = text (MYSQL_TYPE_STRING), 2 =
+# blob (MYSQL_TYPE_BLOB); data/len point into the Tangerine-owned
+# payload buffer (the MysqlParamBacking owns every payload through the
+# call).
 @repr(C)
-struct MysqlBind
-  length: Ptr[UInt]        ## unsigned long *length
-  is_null: Ptr[u8]         ## my_bool *is_null
-  buffer: Ptr[u8]          ## void *buffer
-  error: Ptr[u8]           ## my_bool *error
-  row_ptr: Ptr[u8]         ## unsigned char *row_ptr
-  store_param_func: Ptr[u8]  ## void (*)(NET *, unsigned char *)
-  fetch_result: Ptr[u8]    ## void (*)(MYSQL_BIND *, MYSQL_FIELD *, unsigned char **)
-  skip_result: Ptr[u8]     ## void (*)(MYSQL_BIND *, MYSQL_FIELD *, unsigned char **)
-  buffer_length: UInt      ## unsigned long buffer_length
-  offset: UInt             ## unsigned long offset
-  length_value: UInt       ## unsigned long length_value
-  param_number: u32        ## unsigned int param_number
-  pack_length: u32         ## unsigned int pack_length
-  buffer_type: u32         ## enum enum_field_types buffer_type
-  error_value: u8          ## my_bool error_value
-  is_unsigned: u8          ## my_bool is_unsigned
-  long_data_used: u8       ## my_bool long_data_used
-  skip_value: u8           ## my_bool skip_value
-  read_row_data: Ptr[u8]   ## unsigned char *read_row_data
-  is_unsigned_p: Ptr[u8]   ## my_bool *is_unsigned_p
-  own_data: u8             ## my_bool own_data
+struct MysqlParam
+  type_: i32
+  data: Ptr[u8]
+  len: UInt
 end
 
-impl MysqlBind
-  # Build a parameter bind cell: the per-parameter buffer_type / length /
-  # is_null / buffer pointers the client reads at mysql_stmt_bind_param
-  # time (and, for result binding, writes at fetch time).
-  def new(length_ptr: Ptr[UInt], is_null_ptr: Ptr[u8], buffer: Ptr[u8],
-          buffer_len: UInt, ty: u32, is_unsigned: u8) -> MysqlBind
-    MysqlBind {
-      length: length_ptr,
-      is_null: is_null_ptr,
-      buffer: buffer,
-      error: null_ptr(),
-      row_ptr: null_ptr(),
-      store_param_func: null_ptr(),
-      fetch_result: null_ptr(),
-      skip_result: null_ptr(),
-      buffer_length: buffer_len,
-      offset: 0,
-      length_value: 0,
-      param_number: 0,
-      pack_length: 0,
-      buffer_type: ty,
-      error_value: 0,
-      is_unsigned: is_unsigned,
-      long_data_used: 0,
-      skip_value: 0,
-      read_row_data: null_ptr(),
-      is_unsigned_p: null_ptr(),
-      own_data: 0
-    }
-  end
+# One result column: the output buffer (the INITIAL fixed-size buffer —
+# a truncated column is refetched through tg_mysql_stmt_fetch_column
+# with a RESIZED buffer in a fresh descriptor), its capacity, the
+# length/is_null out cells, and the MYSQL_TYPE_* value.
+@repr(C)
+struct MysqlResultCell
+  buffer: Ptr[u8]
+  capacity: UInt
+  length: Ptr[UInt]
+  is_null: Ptr[u8]
+  type_: i32
 end
 
-## enum_field_types values (mysql.h), used as MysqlBind.buffer_type and
-## MysqlField.type_.
+const MYSQL_PARAM_NULL: i32 = 0
+const MYSQL_PARAM_TEXT: i32 = 1
+const MYSQL_PARAM_BLOB: i32 = 2
+
+## enum_field_types values (mysql.h), used as the MysqlResultCell.type_
+## (and MysqlField.type_) values.
 const MYSQL_TYPE_TINY: u32 = 1
 const MYSQL_TYPE_LONGLONG: u32 = 8
 const MYSQL_TYPE_DOUBLE: u32 = 5
@@ -2196,13 +2547,16 @@ def mysql_config_new(host: str, user: str, password: str, database: str) -> Mysq
   }
 end
 
-# The heap-stable Mysql connection: the native MYSQL* handle and the
-# connected flag live in the Arc-owned inner (the inner's Drop runs
-# mysql_close at the Arc's last-release), and statements/transactions
-# hold a boxed clone of the inner Arc as their lifetime token.
+# The heap-stable Mysql connection: the native MYSQL* handle, the
+# connected flag, and the shared ConnLifetime cell (the Open/Closing/
+# Closed state + the child count) live in the Arc-owned inner (the
+# inner's Drop runs mysql_close at the Arc's last-release), and
+# statements/transactions hold a boxed clone of the inner Arc as their
+# lifetime pin plus a clone of the life cell.
 struct MysqlInner
   handle: Ptr[Unit]
   connected: Bool
+  life: Arc[ConnLifetime]
 end
 
 struct Mysql
@@ -2236,11 +2590,12 @@ def mysql_open(config: MysqlConfig) -> Result[Mysql, DbError]
     return Result::Err(DbError::ConnectionFailed(err_msg))
   end
 
-  Result::Ok(Mysql { inner: Arc::new(MysqlInner { handle: handle, connected: true }) })
+  Result::Ok(Mysql { inner: Arc::new(MysqlInner { handle: handle, connected: true, life: conn_lifetime_new() }) })
 end
 
 impl Connection for Mysql
   def execute(inout self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     if params.is_empty() then
       let ret = unsafe "FFI boundary" do mysql_query(self.inner.ptr.as_ref().handle, sql.to_cstring().as_ptr()) end
       if ret != 0 then
@@ -2251,14 +2606,15 @@ impl Connection for Mysql
       Result::Ok(affected as UInt)
     else
       # Parameterized execution goes through the REAL prepared-statement
-      # path (mysql_stmt_prepare + mysql_stmt_bind_param with the
-      # MYSQL_BIND array + mysql_stmt_execute) — never the manual
+      # path (the shim's tg_mysql_stmt_bind_and_execute — the MYSQL_BIND
+      # array is built inside the C shim) — never the manual
       # interpolation.
       mysql_prepared_execute(self.inner.ptr.as_ref().handle, sql, params)
     end
   end
 
   def query(self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    conn_lifetime_check(self.inner.ptr.as_ref().life)?
     if params.is_empty() then
       let ret = unsafe "FFI boundary" do
         mysql_real_query(self.inner.ptr.as_ref().handle, sql.to_cstring().as_ptr(), sql.len() as UInt)
@@ -2276,26 +2632,31 @@ impl Connection for Mysql
       Result::Ok(rows)
     else
       # Parameterized query through the prepared-statement path with the
-      # real MYSQL_BIND parameter binding.
+      # shim-built MYSQL_BIND parameter binding.
       mysql_prepared_query(self.inner.ptr.as_ref().handle, sql, params)
     end
   end
 
   def begin_transaction(inout self: Mysql) -> Result[Transaction, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     let ret = unsafe "FFI boundary" do mysql_autocommit(self.inner.ptr.as_ref().handle, 0) end
     if ret != 0 then
       return Result::Err(DbError::TransactionError("failed to disable autocommit".to_string()))
     end
     mysql_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN", &[])?
+    conn_lifetime_register_child(life)
     Result::Ok(Transaction {
       conn_handle: self.inner.ptr.as_ref().handle,
-      conn_token: Arc::new(Box::new(self.inner.clone())),
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life },
       driver: DriverKind::Mysql,
       finished: false
     })
   end
 
   def prepare(inout self: Mysql, sql: str) -> Result[Statement, DbError]
+    let life = self.inner.ptr.as_ref().life.clone()
+    conn_lifetime_check(life)?
     let stmt = unsafe "FFI boundary" do mysql_stmt_init(self.inner.ptr.as_ref().handle) end
     if stmt.is_null() then
       return Result::Err(DbError::Internal("mysql_stmt_init failed".to_string()))
@@ -2308,6 +2669,7 @@ impl Connection for Mysql
       unsafe "FFI boundary" do mysql_stmt_close(stmt) end
       return Result::Err(DbError::QueryFailed(err))
     end
+    conn_lifetime_register_child(life)
     Result::Ok(Statement {
       handle: stmt,
       sql: sql.to_string(),
@@ -2315,15 +2677,26 @@ impl Connection for Mysql
       conn_handle: null_ptr(),
       param_count: 0,
       stmt_name: String::new(),
-      conn_token: Arc::new(Box::new(self.inner.clone()))
+      conn_token: ConnToken { pin: Arc::new(Box::new(self.inner.clone())), life: life }
     })
   end
 
   def close(inout self: Mysql) -> Result[Unit, DbError]
-    if self.inner.ptr.as_ref().connected then
-      unsafe "FFI boundary" do mysql_close(self.inner.ptr.as_ref().handle) end
-      self.inner.ptr.as_ref().connected = false
+    # THE BUSY POLICY (connection-lifetime design): live statements/transactions
+    # block the close.
+    let inner = self.inner.ptr.as_ref()
+    let life = inner.life.clone()
+    if life.ptr.as_ref().children.load(Ordering::Acquire) > 0 then
+      return Result::Err(DbError::Busy("connection has live statements or transactions".to_string()))
     end
+    if !inner.connected then
+      life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
+      return Result::Ok(())
+    end
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closing), Ordering::Release)
+    unsafe "FFI boundary" do mysql_close(inner.handle) end
+    inner.connected = false
+    life.ptr.as_ref().state.store(conn_state_to_int(ConnState::Closed), Ordering::Release)
     Result::Ok(())
   end
 end
@@ -2418,76 +2791,56 @@ def mysql_result_to_rows(result: Ptr[Unit]) -> Rows
 end
 
 # ———————————————————————————————————————————————————————————————
-# The real MYSQL_BIND parameter binding
+# The shim-backed parameter binding
 # ———————————————————————————————————————————————————————————————
-# The prepared path binds parameters through mysql_stmt_bind_param with a
-# MYSQL_BIND array (the mysql.h st_mysql_bind layout above) and executes
-# with mysql_stmt_execute — the values are sent as DATA, so the hostile
-# values (' \ \\ \0 ' OR 1=1 --, multibyte text, binary blobs) can never
-# be reinterpreted as SQL. The manual interpolation is gone from every
-# execution path.
+# The prepared path binds parameters through the native shim
+# (tg_mysql_stmt_bind_and_execute): the Tangerine side builds the stable
+# MysqlParam descriptor array (the values are sent as DATA, so the
+# hostile values (' \ \\ \0 ' OR 1=1 --, multibyte text, binary blobs)
+# can never be reinterpreted as SQL), and the C shim builds the real
+# MYSQL_BIND array internally and runs bind_param + execute.
 #
-# MysqlParamBacking owns every payload through the execute/fetch calls:
-#   binds        — the MYSQL_BIND array (one cell per parameter)
-#   buffers      — the owned byte payloads (text/numeric strings, blob
-#                  bytes) — buffer pointers stay valid through the call
-#   length_cells — the unsigned long length cells, one per parameter
-#   null_cells   — the my_bool null cells, one per parameter
-# The cell vectors are pre-sized to the parameter count (with_capacity),
-# so their storage never reallocates while the per-parameter
-# length/is_null pointers are being recorded.
+# MysqlParamBacking owns every payload through the call:
+#   params   — the MysqlParam descriptor array (one per parameter)
+#   buffers  — the owned byte payloads (text/numeric strings, blob
+#              bytes) — the descriptor data pointers stay valid through
+#              the call
+# The descriptor vectors are pre-sized to the parameter count
+# (with_capacity), so their storage never reallocates while the
+# per-parameter data pointers are being recorded.
 struct MysqlParamBacking
-  binds: Vec[MysqlBind]
+  params: Vec[MysqlParam]
   buffers: Vec[Vec[u8]]
-  length_cells: Vec[UInt]
-  null_cells: Vec[u8]
 end
 
 impl MysqlParamBacking
+  def new(n: UInt) -> MysqlParamBacking
+    MysqlParamBacking {
+      params: Vec::with_capacity(n),
+      buffers: Vec::with_capacity(n)
+    }
+  end
+  
   def push_text_param(inout self: MysqlParamBacking, sink s: String) -> Unit
-    let idx = self.length_cells.len()
-    self.length_cells.push(0)
-    self.null_cells.push(0)
-    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
-    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
     let bytes = s.as_bytes()
     let len = bytes.len() as UInt
-    self.length_cells[idx] = len
-    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, bytes.as_ptr(), len, MYSQL_TYPE_STRING, 0))
+    self.params.push(MysqlParam { type_: MYSQL_PARAM_TEXT, data: bytes.as_ptr(), len: len })
     self.buffers.push(bytes)
   end
   
   def push_blob_param(inout self: MysqlParamBacking, sink blob: Vec[u8]) -> Unit
-    let idx = self.length_cells.len()
-    self.length_cells.push(0)
-    self.null_cells.push(0)
-    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
-    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
     let len = blob.len() as UInt
-    self.length_cells[idx] = len
-    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, blob.as_ptr(), len, MYSQL_TYPE_BLOB, 0))
+    self.params.push(MysqlParam { type_: MYSQL_PARAM_BLOB, data: blob.as_ptr(), len: len })
     self.buffers.push(blob)
   end
   
   def push_null_param(inout self: MysqlParamBacking) -> Unit
-    let idx = self.length_cells.len()
-    self.length_cells.push(0)
-    self.null_cells.push(0)
-    let length_ptr = self.length_cells.as_ptr().offset(idx) as Ptr[UInt]
-    let is_null_ptr = self.null_cells.as_ptr().offset(idx) as Ptr[u8]
-    self.null_cells[idx] = 1
-    self.binds.push(MysqlBind::new(length_ptr, is_null_ptr, null_ptr(), 0, MYSQL_TYPE_NULL, 0))
+    self.params.push(MysqlParam { type_: MYSQL_PARAM_NULL, data: null_ptr(), len: 0 })
   end
 end
 
 def mysql_build_binds(params: [Box[dyn ToSqlParam]]) -> MysqlParamBacking
-  let n = params.len()
-  var backing = MysqlParamBacking {
-    binds: Vec::with_capacity(n),
-    buffers: Vec::with_capacity(n),
-    length_cells: Vec::with_capacity(n),
-    null_cells: Vec::with_capacity(n)
-  }
+  var backing = MysqlParamBacking::new(params.len())
   for param in params do
     let value = param.to_sql_param()
     match value
@@ -2510,9 +2863,9 @@ def mysql_build_binds(params: [Box[dyn ToSqlParam]]) -> MysqlParamBacking
   backing
 end
 
-# Bind the MYSQL_BIND array on the statement and execute it; the backing
-# is local, so every payload buffer lives exactly through the
-# bind_param + execute calls.
+# Bind the descriptor array on the statement and execute it through the
+# shim; the backing is local, so every payload buffer lives exactly
+# through the bind + execute calls.
 def mysql_stmt_bind_and_execute(stmt: Ptr[Unit], params: [Box[dyn ToSqlParam]]) -> Result[Unit, DbError]
   if params.is_empty() then
     let ret = unsafe "FFI boundary" do mysql_stmt_execute(stmt) end
@@ -2522,13 +2875,9 @@ def mysql_stmt_bind_and_execute(stmt: Ptr[Unit], params: [Box[dyn ToSqlParam]]) 
     return Result::Ok(())
   end
   let backing = mysql_build_binds(params)
-  let bind_rc = unsafe "FFI boundary" do mysql_stmt_bind_param(stmt, backing.binds.as_ptr()) end
+  let bind_rc = unsafe "FFI boundary" do tg_mysql_stmt_bind_and_execute(stmt, backing.params.as_ptr(), backing.params.len() as UInt) end
   if bind_rc != 0 then
     return Result::Err(DbError::BindError(0, unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
-  end
-  let exec_rc = unsafe "FFI boundary" do mysql_stmt_execute(stmt) end
-  if exec_rc != 0 then
-    return Result::Err(DbError::QueryFailed(unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end))
   end
   Result::Ok(())
 end
@@ -2539,7 +2888,8 @@ end
 
 # Fetch the result set of an executed prepared statement: store the
 # result, read the metadata (names + types), bind STRING/BLOB-typed
-# output cells, and fetch every row.
+# output cells through the shim (the real MYSQL_BIND array is built
+# inside the C shim), and fetch every row.
 def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
   let store_rc = unsafe "FFI boundary" do mysql_stmt_store_result(stmt) end
   if store_rc != 0 then
@@ -2563,9 +2913,13 @@ def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
     end
   end
   let n = num_fields as Int
-  var out_binds = Vec::with_capacity(n)
+  # THE OUTPUT CELLS (blocking-pool design): one MysqlResultCell per column —
+  # the INITIAL fixed-size buffer (MYSQL_FETCH_BUFFER_SIZE), the
+  # length/is_null out cells — bound through the shim
+  # (tg_mysql_stmt_bind_result builds the real MYSQL_BIND array). The
+  # out vectors are pre-sized so the length/is_null pointers stay valid.
+  var out_cells = Vec::with_capacity(n)
   var out_buffers = Vec::with_capacity(n)
-  var out_buffer_ptrs = Vec::with_capacity(n)
   var out_lengths = Vec::with_capacity(n)
   var out_nulls = Vec::with_capacity(n)
   for i in 0..num_fields do
@@ -2576,11 +2930,16 @@ def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
     var buf = Vec::with_capacity(MYSQL_FETCH_BUFFER_SIZE as Int)
     let is_blob = mysql_type_is_blob(col_types[i])
     let ty = if is_blob then MYSQL_TYPE_BLOB else MYSQL_TYPE_STRING end
-    out_buffer_ptrs.push(buf.as_ptr())
-    out_binds.push(MysqlBind::new(length_ptr, is_null_ptr, buf.as_ptr(), MYSQL_FETCH_BUFFER_SIZE, ty, 0))
+    out_cells.push(MysqlResultCell {
+      buffer: buf.as_ptr(),
+      capacity: MYSQL_FETCH_BUFFER_SIZE,
+      length: length_ptr,
+      is_null: is_null_ptr,
+      type_: ty as i32
+    })
     out_buffers.push(buf)
   end
-  let bind_rc = unsafe "FFI boundary" do mysql_stmt_bind_result(stmt, out_binds.as_ptr()) end
+  let bind_rc = unsafe "FFI boundary" do tg_mysql_stmt_bind_result(stmt, out_cells.as_ptr(), num_fields as UInt) end
   if bind_rc != 0 then
     let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
     unsafe "FFI boundary" do mysql_free_result(metadata) end
@@ -2592,10 +2951,44 @@ def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
     if fetch_rc == MYSQL_NO_DATA then
       break
     end
-    if fetch_rc != 0 then
+    if fetch_rc != 0 && fetch_rc != MYSQL_DATA_TRUNCATED then
       let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
       unsafe "FFI boundary" do mysql_free_result(metadata) end
       return Result::Err(DbError::QueryFailed(err))
+    end
+    # THE LARGE-VALUE REFETCH (blocking-pool design): a MYSQL_DATA_TRUNCATED
+    # fetch leaves the FULL value length in the column's length cell —
+    # observe it, grow the column's buffer to the full length, and
+    # refetch the FULL value through tg_mysql_stmt_fetch_column (the
+    # shim builds the one-off MYSQL_BIND from the resized descriptor).
+    # The ORIGINAL bound cells are left untouched: the next row's fetch
+    # writes into the original buffers again (no rebind needed, no
+    # dangling buffer).
+    var full_buffers = Vec::new()
+    for j in 0..num_fields do
+      full_buffers.push(Vec::new())
+    end
+    if fetch_rc == MYSQL_DATA_TRUNCATED then
+      for j in 0..num_fields do
+        let full_len = out_lengths[j]
+        if full_len > MYSQL_FETCH_BUFFER_SIZE then
+          var full_buf = Vec::with_capacity(full_len as Int)
+          let cell = MysqlResultCell {
+            buffer: full_buf.as_ptr(),
+            capacity: full_len,
+            length: out_lengths.as_ptr().offset(j as Int) as Ptr[UInt],
+            is_null: out_nulls.as_ptr().offset(j as Int) as Ptr[u8],
+            type_: out_cells[j].type_
+          }
+          let rc2 = unsafe "FFI boundary" do tg_mysql_stmt_fetch_column(stmt, cell, j as UInt, 0) end
+          if rc2 != 0 then
+            let err = unsafe "FFI boundary" do cstring_to_string(mysql_stmt_error(stmt)) end
+            unsafe "FFI boundary" do mysql_free_result(metadata) end
+            return Result::Err(DbError::QueryFailed(err))
+          end
+          full_buffers[j] = full_buf
+        end
+      end
     end
     var row_values = Vec::new()
     for j in 0..num_fields do
@@ -2603,7 +2996,11 @@ def mysql_prepared_fetch_rows(stmt: Ptr[Unit]) -> Result[Rows, DbError]
         row_values.push(SqlValue::Null)
       else
         let len = out_lengths[j]
-        let buf_ptr = out_buffer_ptrs[j]
+        let buf_ptr = if full_buffers[j].is_empty() then
+          out_cells[j].buffer
+        else
+          full_buffers[j].as_ptr()
+        end
         if mysql_type_is_blob(col_types[j]) then
           var bytes = Vec::with_capacity(len)
           for k in 0..len do
@@ -2670,6 +3067,7 @@ def mysql_prepared_query(conn: Ptr[Unit], sql: str, params: [Box[dyn ToSqlParam]
 end
 
 def mysql_stmt_run(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
@@ -2682,6 +3080,7 @@ def mysql_stmt_run(inout stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Resu
 end
 
 def mysql_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+  conn_lifetime_check(stmt.conn_token.life)?
   if stmt.handle.is_null() then
     return Result::Err(DbError::QueryFailed("statement already finalized"))
   end
@@ -2693,7 +3092,10 @@ def mysql_stmt_query(stmt: Statement, params: [Box[dyn ToSqlParam]]) -> Result[R
 end
 
 def mysql_stmt_finalize(inout stmt: Statement) -> Result[Unit, DbError]
-  if !stmt.handle.is_null() then
+  # The state check: on a closed connection the native close is skipped
+  # (the explicit close is blocked by the Busy policy while the statement
+  # lives); the handle is nulled either way so the drop is a no-op.
+  if !stmt.handle.is_null() && conn_lifetime_open(stmt.conn_token.life) then
     unsafe "FFI boundary" do mysql_stmt_close(stmt.handle) end
     stmt.handle = null_ptr()
   end
@@ -2721,6 +3123,128 @@ end
 # PART 6: ASYNC DATABASE OPERATIONS
 # ═══════════════════════════════════════════════════════════════
 
+# THE REAL BLOCKING POOL (blocking-pool design): spawn_blocking NO LONGER
+# executes f() inline on the async executor — it submits the closure to a
+# REAL bounded pool of N worker threads (BLOCKING_POOL_SIZE, created
+# exactly once via the Once guard — the bounded thread creation). The
+# workers block on the job queue (Mutex[VecDeque] + Condvar); the RESULT
+# is delivered through an ASYNC CHANNEL — the worker pushes the value
+# into the channel's buffer and wakes the awaiting task, and the async
+# side awaits the RecvFuture (the pool + the channel result). The pool is
+# process-global (the static holds the inner Arc + the join handles); the
+# workers hold their OWN Arc clones, so the inner (and the job queue)
+# stays alive regardless of the statics.
+const BLOCKING_POOL_SIZE: UInt = 4
+
+struct BlockingPoolInner
+  job_queue: Mutex[VecDeque[Box[dyn FnOnce()]]]
+  condvar: Condvar
+  shutdown: AtomicBool
+end
+
+struct BlockingPool
+  inner: Arc[BlockingPoolInner]
+  workers: Vec[Option[JoinHandle[Unit]]]
+end
+
+static mut BLOCKING_POOL: Option[Arc[BlockingPoolInner]] = Option::None
+static mut BLOCKING_POOL_WORKERS: Option[Vec[Option[JoinHandle[Unit]]]] = Option::None
+static BLOCKING_POOL_ONCE: Once = once_new()
+
+def blocking_pool_init() -> Unit
+  let inner = Arc::new(BlockingPoolInner {
+    job_queue: Mutex::new(VecDeque::new()),
+    condvar: Condvar::new(),
+    shutdown: atomic_bool_new(false)
+  })
+  var workers = Vec::new()
+  var i: UInt = 0
+  while i < BLOCKING_POOL_SIZE do
+    let worker_inner = inner.clone()
+    let handle = ThreadBuilder::new().spawn(|| blocking_worker_loop(worker_inner))
+    match handle
+    when Result::Ok(h) then workers.push(Option::Some(h))
+    when Result::Err(_) then workers.push(Option::None)
+    end
+    i = i + 1
+  end
+  BLOCKING_POOL = Option::Some(inner)
+  BLOCKING_POOL_WORKERS = Option::Some(workers)
+end
+
+def blocking_pool_get() -> Arc[BlockingPoolInner]
+  BLOCKING_POOL_ONCE.call_once(|| blocking_pool_init())
+  match BLOCKING_POOL.clone()
+  when Option::Some(inner) then inner
+  when Option::None then panic("blocking pool: not initialized")
+  end
+end
+
+# The worker loop: block on the job queue (the condvar) until a job
+# arrives or the shutdown flag is set, then run the job.
+def blocking_worker_loop(inner: Arc[BlockingPoolInner]) -> Unit
+  loop do
+    let ch = inner.ptr.as_ref()
+    if ch.shutdown.load(Ordering::Acquire) then
+      break
+    end
+    let mut guard = ch.job_queue.lock()
+    while guard.is_empty() && !ch.shutdown.load(Ordering::Acquire) do
+      guard = ch.condvar.wait(guard)
+    end
+    if ch.shutdown.load(Ordering::Acquire) && guard.is_empty() then
+      break
+    end
+    let job = guard.pop_front()
+    drop(guard)
+
+    match job
+    when Option::Some(f) then f()
+    when Option::None then ()
+    end
+  end
+end
+
+impl BlockingPoolInner
+  def execute(self: BlockingPoolInner, f: FnOnce() -> Unit) -> Unit
+    let mut guard = self.job_queue.lock()
+    guard.push_back(Box::new(f))
+    drop(guard)
+    self.condvar.notify_one()
+  end
+end
+
+# The graceful shutdown: set the flag, wake every worker, join them (the
+# bounded thread creation is released).
+def blocking_pool_shutdown() -> Unit
+  let workers = match BLOCKING_POOL_WORKERS.take()
+  when Option::Some(w) then w
+  when Option::None then return
+  end
+  let inner = match BLOCKING_POOL.clone()
+  when Option::Some(i) then i
+  when Option::None then return
+  end
+  let ch = inner.ptr.as_ref()
+  ch.shutdown.store(true, Ordering::Release)
+  ch.condvar.notify_all()
+  for worker in workers do
+    if let Option::Some(mut handle) = worker then
+      let _ = handle.join()
+    end
+  end
+end
+
+# The Transaction (a raw conn_handle + the Arc pin/life token) crosses
+# the pool boundary ONLY as the value returned from begin_transaction:
+# the conn_handle's pointee is pinned by the token's Arc for the value's
+# whole lifetime, so the raw pointer stays valid on the receiving side.
+# The structural solver cannot prove this (Ptr[Unit] is not
+# auto-Transferable), so the impl is the explicit, documented opt-in
+# through the UnsafeTransferable gate (concurrency properties — the ONLY
+# user-implementable marker surface of the concurrency model).
+impl UnsafeTransferable for Transaction {}
+
 ## Trait for async database connections. Mirrors Connection but returns futures.
 trait AsyncConnection
   async def execute(inout self: Self, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
@@ -2729,77 +3253,169 @@ trait AsyncConnection
   async def close(inout self: Self) -> Result[Unit, DbError]
 end
 
+## The async transaction: owns the underlying Transaction (taken into the
+## pool closure for every operation and put back through the channel).
 struct AsyncTransaction
-  active: Bool
+  tx: Option[Transaction]
+end
+
+impl AsyncTransaction
+  async def execute(inout self: AsyncTransaction, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
+    match self.tx
+    when Option::Some(_) then ()
+    when Option::None then
+      return Result::Err(DbError::TransactionError("transaction already finished"))
+    end
+    let sql_owned = sql.to_string()
+    let mut tx = self.tx.take().unwrap()
+    let result = spawn_blocking(|| {
+      let r = tx.execute(&sql_owned, params)
+      (r, tx)
+    }).await
+    let (r, tx_back) = result
+    self.tx = Option::Some(tx_back)
+    r
+  end
+
+  async def query(inout self: AsyncTransaction, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    match self.tx
+    when Option::Some(_) then ()
+    when Option::None then
+      return Result::Err(DbError::TransactionError("transaction already finished"))
+    end
+    let sql_owned = sql.to_string()
+    let mut tx = self.tx.take().unwrap()
+    let result = spawn_blocking(|| {
+      let r = tx.query(&sql_owned, params)
+      (r, tx)
+    }).await
+    let (r, tx_back) = result
+    self.tx = Option::Some(tx_back)
+    r
+  end
+
+  async def commit(inout self: AsyncTransaction) -> Result[Unit, DbError]
+    match self.tx
+    when Option::Some(_) then ()
+    when Option::None then
+      return Result::Err(DbError::TransactionError("transaction already finished"))
+    end
+    let mut tx = self.tx.take().unwrap()
+    let result = spawn_blocking(|| tx.commit()).await
+    self.tx = Option::Some(tx)
+    result
+  end
+
+  async def rollback(inout self: AsyncTransaction) -> Result[Unit, DbError]
+    match self.tx
+    when Option::Some(_) then ()
+    when Option::None then
+      return Result::Err(DbError::TransactionError("transaction already finished"))
+    end
+    let mut tx = self.tx.take().unwrap()
+    let result = spawn_blocking(|| tx.rollback()).await
+    self.tx = Option::Some(tx)
+    result
+  end
 end
 
 ## Async wrapper around a synchronous Connection.
-## Executes DB operations on a background thread pool to avoid blocking the async executor.
-struct AsyncWrapper[C: Connection + Send]
-  inner: C
+## Executes DB operations on the REAL blocking pool to avoid blocking the
+## async executor.
+## THE SYNCHRONIZED CONNECTION STATE (blocking-pool design): the wrapper owns
+## the connection in an Arc[Mutex[C]] — the shared state. Every async
+## method clones the Arc BEFORE the await and the blocking closure locks
+## the mutex and runs the operation on the pool; no method ever captures
+## the inout receiver into the closure (no inout-across-await).
+struct AsyncWrapper[C: Connection + Transferable]
+  inner: Arc[Mutex[C]]
 end
 
-def async_wrap[C: Connection + Send](conn: C) -> AsyncWrapper[C]
-  AsyncWrapper { inner: conn }
+def async_wrap[C: Connection + Transferable](conn: C) -> AsyncWrapper[C]
+  AsyncWrapper { inner: Arc::new(Mutex::new(conn)) }
 end
 
-impl[C: Connection + Send] AsyncConnection for AsyncWrapper[C]
+impl[C: Connection + Transferable] AsyncConnection for AsyncWrapper[C]
   async def execute(inout self: AsyncWrapper[C], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-    ## Offload to thread pool
+    let conn = self.inner.clone()
     let sql_owned = sql.to_string()
     spawn_blocking(|| {
-      self.inner.execute(&sql_owned, params)
+      let mut guard = conn.lock()
+      guard.get_mut().execute(&sql_owned, params)
     }).await
   end
 
   async def query(self: AsyncWrapper[C], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
+    let conn = self.inner.clone()
     let sql_owned = sql.to_string()
     spawn_blocking(|| {
-      self.inner.query(&sql_owned, params)
+      let mut guard = conn.lock()
+      guard.get_mut().query(&sql_owned, params)
     }).await
   end
 
   async def begin_transaction(inout self: AsyncWrapper[C]) -> Result[AsyncTransaction, DbError]
-    spawn_blocking(|| {
-      self.inner.begin_transaction()
-    }).await.map(|t| AsyncTransaction { active: t.active })
+    let conn = self.inner.clone()
+    let result = spawn_blocking(|| {
+      let mut guard = conn.lock()
+      guard.get_mut().begin_transaction()
+    }).await
+    match result
+    when Result::Ok(t) then Result::Ok(AsyncTransaction { tx: Option::Some(t) })
+    when Result::Err(e) then Result::Err(e)
+    end
   end
 
   async def close(inout self: AsyncWrapper[C]) -> Result[Unit, DbError]
+    let conn = self.inner.clone()
     spawn_blocking(|| {
-      self.inner.close()
+      let mut guard = conn.lock()
+      guard.get_mut().close()
     }).await
   end
 end
 
 ## Async connection pool
-struct AsyncPool[C: Connection + Send]
-  pool: Pool[C]
+struct AsyncPool[C: Connection + Transferable]
+  pool: Arc[Mutex[Pool[C]]]
 end
 
-def async_pool_new[C: Connection + Send](max_size: UInt) -> AsyncPool[C]
-  AsyncPool { pool: pool_new(max_size) }
+def async_pool_new[C: Connection + Transferable](max_size: UInt, create_fn: fn() -> Result[C, DbError]) -> Result[AsyncPool[C], DbError]
+  let pool = Pool::new(max_size, create_fn)?
+  Result::Ok(AsyncPool { pool: Arc::new(Mutex::new(pool)) })
 end
 
-impl[C: Connection + Send] AsyncPool[C]
+impl[C: Connection + Transferable] AsyncPool[C]
   async def get(self: AsyncPool[C]) -> Result[AsyncPooledConnection[C], DbError]
+    let pool = self.pool.clone()
     spawn_blocking(|| {
-      self.pool.acquire()
-    }).await.map(|pc| AsyncPooledConnection { inner: pc })
+      let mut guard = pool.lock()
+      guard.get_mut().get()
+    }).await.map(|pc| AsyncPooledConnection { inner: Arc::new(Mutex::new(pc)) })
   end
 end
 
 struct AsyncPooledConnection[C: Connection]
-  inner: PooledConnection[C]
+  inner: Arc[Mutex[PooledConnection[C]]]
 end
 
-impl[C: Connection + Send] AsyncConnection for AsyncPooledConnection[C]
+impl[C: Connection + Transferable] AsyncConnection for AsyncPooledConnection[C]
   async def execute(inout self: AsyncPooledConnection[C], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-    spawn_blocking(|| self.inner.execute(sql, params)).await
+    let pc = self.inner.clone()
+    let sql_owned = sql.to_string()
+    spawn_blocking(|| {
+      let mut guard = pc.lock()
+      guard.get_mut().execute(&sql_owned, params)
+    }).await
   end
 
   async def query(self: AsyncPooledConnection[C], sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-    spawn_blocking(|| self.inner.query(sql, params)).await
+    let pc = self.inner.clone()
+    let sql_owned = sql.to_string()
+    spawn_blocking(|| {
+      let mut guard = pc.lock()
+      guard.get_mut().query(&sql_owned, params)
+    }).await
   end
 
   async def begin_transaction(inout self: AsyncPooledConnection[C]) -> Result[AsyncTransaction, DbError]
@@ -2811,9 +3427,24 @@ impl[C: Connection + Send] AsyncConnection for AsyncPooledConnection[C]
   end
 end
 
-## Helper: run a blocking closure on a thread pool and return a future.
-async def spawn_blocking[T: Send, F: FnOnce() -> T + Send](f: F) -> T
-  ## In a real implementation, this dispatches to a blocking thread pool
-  ## and returns a future that resolves when the work completes.
-  f()
+## Helper: run a blocking closure on the REAL blocking pool and return a
+## future. The closure is submitted to the pool (never executed inline);
+## the worker computes f() and pushes the result into the async channel,
+## waking the awaiting task.
+async def spawn_blocking[T: Transferable, F: FnOnce() -> T + Transferable](f: F) -> T
+  let (sender, receiver) = channel[T](1)
+  let pool = blocking_pool_get()
+  pool.execute(|| {
+    let value = f()
+    let ch = sender.inner.ptr.as_ref()
+    ch.buffer.push_back(value)
+    if !ch.recv_waiters.is_empty() then
+      ch.recv_waiters.pop().unwrap().wake()
+    end
+  })
+  let received = receiver.recv().await
+  match received
+  when Option::Some(value) then value
+  when Option::None then panic("spawn_blocking: the result channel closed before the value arrived")
+  end
 end

@@ -1,0 +1,158 @@
+# tests/thread_result_cell_test.tg — the JoinHandle shared result cell
+# (reviewer P0-14).
+#
+# THE FIX: JoinHandle allocated the result SEPARATELY (a naked T* owned
+# by the handle only) and handed the raw pointer to the worker. On the
+# pthread_join-FAILURE path the handle detached and lost the
+# deterministic ownership of that allocation: the detached worker could
+# still populate it (or was still running) with no owner left to dispose
+# it — the result was ORPHANED. The redesign: the result lives in ONE
+# heap-stable shared cell — ThreadResultCell[T] { inner:
+# Arc[ThreadResultInner[T]] } — the worker's run frame and the
+# JoinHandle hold Arc CLONES; the worker writes into the cell, the
+# handle takes out of it (the take-once Option slot); the LAST owner's
+# Arc release (the drop_in_place glue — the same machinery the channel's
+# Arc[ChannelInner] uses) disposes the storage and the result value. On
+# the detach path the worker's OWN clone keeps the cell alive until the
+# worker terminates — the result is never orphaned.
+#
+# THE TESTS
+#   (a) test_join_result_transferred_exactly_once
+#       — the normal join: the value comes out exactly once (the second
+#         join fails on the joined flag), and the cell's take-once yields
+#         None on the second take.
+#   (b) test_join_failure_detach_no_orphaned_result
+#       — the injected pthread_join failure (__tg_join_fail — the
+#         module's fault-injection flag pattern): join returns Err and
+#         DETACHES; the worker runs to termination with its own clone;
+#         after the worker's release and the handle's drop the
+#         allocator's outstanding-bytes counter returns to its baseline —
+#         the cell's storage is freed, the result is not orphaned.
+#   (c) test_result_destroyed_exactly_once
+#       — the result type carries a deinit counter: the destructor runs
+#         exactly once when the transferred value drops, and exactly once
+#         on the never-joined handle path (the last owner's Arc release
+#         destroys the cell's stored value).
+
+use std::core::{Int, Unit, Option, Result}
+use std::test::*
+use std::thread::{spawn, ThreadResultCell, ThreadResultStatus, thread_result_status_to_int, __tg_join_fail, Ordering, yield_now}
+
+extern def tg_allocator_outstanding_bytes() -> Int
+
+const MAX_SPINS: Int = 2000000
+
+# The process-visible deinit counter: TrackedResult's Drop increments it
+# when the destructor runs (the committed arc_lifecycle_test shape).
+mut RESULT_DROP_COUNT = 0
+
+struct TrackedResult
+  id: Int
+end
+
+impl Drop for TrackedResult
+  def drop(inout self: TrackedResult) -> Unit
+    RESULT_DROP_COUNT = RESULT_DROP_COUNT + 1
+  end
+end
+
+def drops_since(base: Int) -> Int
+  RESULT_DROP_COUNT - base
+end
+
+# (a) The normal join: the result is transferred exactly once. The
+# second join fails on the joined flag, and the cell's take-once yields
+# None on the second take.
+@test
+def test_join_result_transferred_exactly_once() -> Unit
+  let mut h = spawn(|| 42)
+  match h.join()
+  when Result::Ok(v) then assert_eq(v, 42)
+  when Result::Err(_) then assert_false(true)
+  end
+  match h.join()
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(_) then assert_true(true)
+  end
+
+  # The cell-level take-once: the slot is emptied by the first take —
+  # the second take yields None (the transfer is exactly-once).
+  let cell = ThreadResultCell[Int]::new()
+  cell.clone().write_result(7)
+  assert_eq(cell.inner.ptr.as_ref().status.load(Ordering::Relaxed),
+            thread_result_status_to_int(ThreadResultStatus::Ready))
+  match cell.take_result()
+  when Option::Some(v) then assert_eq(v, 7)
+  when Option::None then assert_false(true)
+  end
+  match cell.take_result()
+  when Option::Some(_) then assert_false(true)
+  when Option::None then assert_true(true)
+  end
+end
+
+# (b) The detach path: the injected join failure detaches, the worker's
+# own clone keeps the cell alive until the worker terminates, and the
+# last owner's release frees the storage — the result is never orphaned
+# (the allocator's outstanding counter returns to its baseline).
+@test
+def test_join_failure_detach_no_orphaned_result() -> Unit
+  let before = tg_allocator_outstanding_bytes()
+  {
+    let mut h = spawn(|| 42)
+
+    # The injected join failure: join returns Err AND detaches — the
+    # failure path keeps the worker's ownership of the shared cell.
+    __tg_join_fail = true
+    match h.join()
+    when Result::Err(_) then assert_true(true)
+    when Result::Ok(_) then assert_false(true)
+    end
+    __tg_join_fail = false
+
+    # The detach path: the worker's OWN Arc clone keeps the cell alive
+    # until the worker terminates. Wait for the cell's strong count to
+    # drop to 1 (only the handle's clone remains): the storage survived
+    # the failed join, and the worker's publish + release both completed.
+    mut spins = 0
+    while spins < MAX_SPINS && h.cell.inner.ptr.as_ref().ref_count.load() != 1 as u32 do
+      spins = spins + 1
+      yield_now()
+    end
+    assert_eq(h.cell.inner.ptr.as_ref().ref_count.load(), 1 as u32)
+
+    # The handle's drop releases the LAST clone: the cell's storage (and
+    # with it the written result) is disposed — nothing orphaned by the
+    # detach.
+    drop(h)
+  }
+  # The allocator's outstanding-bytes counter is back at its baseline.
+  assert_eq(tg_allocator_outstanding_bytes(), before)
+end
+
+# (c) The exactly-once destruction: the result type carries a deinit
+# counter. The transferred value drops exactly once (the cell's slot was
+# emptied by the take — nothing left in the storage to destroy), and the
+# never-joined handle's last owner release destroys the stored result
+# exactly once.
+@test
+def test_result_destroyed_exactly_once() -> Unit
+  let base = RESULT_DROP_COUNT
+  {
+    let mut h = spawn(|| TrackedResult { id: 7 })
+    match h.join()
+    when Result::Ok(v) then assert_eq(v.id, 7)
+    when Result::Err(_) then assert_false(true)
+    end
+  }
+  assert_eq(drops_since(base), 1)
+
+  {
+    let h = spawn(|| TrackedResult { id: 9 })
+    # No join: the handle's Drop joins; the handle's cell clone is the
+    # LAST owner — its release runs the stored result's destructor
+    # exactly once (the Arc's last-releaser drop_in_place glue).
+    drop(h)
+  }
+  assert_eq(drops_since(base), 2)
+end

@@ -1,0 +1,142 @@
+# tests/db_lifecycle_test.tg — the std::db connection lifecycle
+# (reviewer P0-16): the Open/Closing/Closed state in the shared
+# ConnLifetime cell, the child registry (the live statements/transactions
+# counted in the cell — incremented at prepare/begin_transaction,
+# decremented at the child's drop), and the BUSY POLICY — close() with a
+# live child returns DbError::Busy and the native handle stays owned (the
+# connection keeps working); once every child is gone the close succeeds,
+# and every subsequent connection/statement/transaction operation is
+# rejected with DbError::Closed. SQLite in-memory.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::db::{Sqlite, Connection, ToSqlParam, DbError}
+
+# The Busy policy with a live STATEMENT: the close fails with
+# DbError::Busy, the statement keeps working (the connection is still
+# Open), and after the statement drops the close succeeds.
+@test
+def test_lifecycle_busy_close_with_live_statement() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+
+  let rc = c.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[])
+  assert_ok(rc)
+
+  var stmt = assert_ok(c.prepare("INSERT INTO kv (value) VALUES (?)"))
+
+  # The Busy policy: a live statement blocks the close.
+  let close_rc = c.close()
+  match close_rc
+  when Result::Err(DbError::Busy(_)) then ()
+  when _ then assert_false(true)
+  end
+
+  # The connection is still Open — the statement keeps working.
+  let ri = stmt.execute(&[Box::new("hello".to_string()) as Box[dyn ToSqlParam]])
+  assert_ok(ri)
+  let qr = c.query("SELECT value FROM kv", &[])
+  let rows = assert_ok(qr)
+  assert_eq(rows.row_count(), 1)
+
+  # The child drop releases the registration: with no live children the
+  # close succeeds.
+  drop(stmt)
+  let close_rc2 = c.close()
+  assert_ok(close_rc2)
+
+  # The closed connection rejects every operation with DbError::Closed.
+  match c.query("SELECT * FROM kv", &[])
+  when Result::Err(DbError::Closed) then ()
+  when _ then assert_false(true)
+  end
+  match c.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("x".to_string()) as Box[dyn ToSqlParam]])
+  when Result::Err(DbError::Closed) then ()
+  when _ then assert_false(true)
+  end
+  match c.prepare("SELECT * FROM kv")
+  when Result::Err(DbError::Closed) then ()
+  when _ then assert_false(true)
+  end
+  match c.begin_transaction()
+  when Result::Err(DbError::Closed) then ()
+  when _ then assert_false(true)
+  end
+end
+
+# The Busy policy with a live TRANSACTION: the close fails, the
+# transaction keeps working (the commit lands), and after the commit the
+# close succeeds.
+@test
+def test_lifecycle_busy_close_with_live_transaction() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+
+  let rc = c.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[])
+  assert_ok(rc)
+
+  let mut tx = assert_ok(c.begin_transaction())
+
+  let close_rc = c.close()
+  match close_rc
+  when Result::Err(DbError::Busy(_)) then ()
+  when _ then assert_false(true)
+  end
+
+  let ri = tx.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("x".to_string()) as Box[dyn ToSqlParam]])
+  assert_ok(ri)
+  let cr = tx.commit()
+  assert_ok(cr)
+
+  assert_ok(c.close())
+end
+
+# A dropped transaction (no commit) auto-rolls-back AND releases its
+# child registration — the close succeeds afterwards, and the rolled-back
+# transaction left no row.
+@test
+def test_lifecycle_transaction_drop_releases_child() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+
+  let rc = c.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[])
+  assert_ok(rc)
+
+  do
+    let mut tx = assert_ok(c.begin_transaction())
+    let ri = tx.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("x".to_string()) as Box[dyn ToSqlParam]])
+    assert_ok(ri)
+    # Dropped without commit: the auto-rollback + the child release.
+  end
+
+  let rows = c.query("SELECT * FROM kv", &[])
+  let r = assert_ok(rows)
+  assert_eq(r.row_count(), 0)
+
+  assert_ok(c.close())
+end
+
+# The close is idempotent: a second close on the closed connection
+# succeeds (the already-Closed state is a no-op).
+@test
+def test_lifecycle_close_twice_ok() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+  assert_ok(c.close())
+  assert_ok(c.close())
+end
+
+# A finalized statement releases its registration like a dropped one.
+@test
+def test_lifecycle_finalized_statement_releases_child() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+
+  let rc = c.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[])
+  assert_ok(rc)
+
+  var stmt = assert_ok(c.prepare("INSERT INTO kv (value) VALUES (?)"))
+  assert_ok(stmt.finalize())
+
+  assert_ok(c.close())
+end

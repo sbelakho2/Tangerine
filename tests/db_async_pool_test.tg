@@ -1,0 +1,85 @@
+# tests/db_async_pool_test.tg — the REAL blocking pool behind
+# std::db::spawn_blocking (reviewer P0-17): the N bounded worker threads
+# (the thread module's ThreadBuilder), the blocking job queue
+# (Mutex[VecDeque] + Condvar), and the result delivered through the async
+# channel. The closure runs on a WORKER THREAD — never inline on the
+# async executor — and the async side receives the value through the
+# channel wake. The AsyncWrapper round trip (SQLite in-memory through the
+# pool) exercises the synchronized Arc[Mutex[C]] connection state and the
+# AsyncTransaction.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::thread::{Thread}
+use std::db::{spawn_blocking, async_wrap, Sqlite, AsyncConnection, ToSqlParam}
+
+# The pool executes the closure and the value comes back through the
+# channel.
+@test
+def test_spawn_blocking_returns_result() -> Unit
+  let result = std::async::block_on(async {
+    let v = spawn_blocking(|| 42).await
+    v
+  })
+  assert_eq(result, 42)
+end
+
+# The closure runs on a DIFFERENT thread than the caller — the pool
+# executes it (zero inline execution).
+@test
+def test_spawn_blocking_runs_on_pool_thread() -> Unit
+  let caller_tid = Thread::current().id()
+  let result = std::async::block_on(async {
+    let tid = spawn_blocking(|| Thread::current().id()).await
+    tid
+  })
+  assert_false(result == caller_tid)
+end
+
+# Many jobs through the same bounded pool all complete correctly.
+@test
+def test_spawn_blocking_many_jobs() -> Unit
+  let result = std::async::block_on(async {
+    var sum = 0
+    var i = 0
+    while i < 16 do
+      let v = spawn_blocking(|| 1).await
+      sum = sum + v
+      i = i + 1
+    end
+    sum
+  })
+  assert_eq(result, 16)
+end
+
+# The AsyncWrapper: the synchronized connection state (Arc[Mutex[C]]) is
+# owned by the wrapper — the async methods clone the Arc BEFORE the await
+# and the blocking closure locks and runs the operation on the pool; the
+# transaction goes through the pool and commits.
+@test
+def test_async_wrapper_sqlite_roundtrip() -> Unit
+  let db = Sqlite::open_memory()
+  let conn = assert_ok(db)
+  let wrapper = async_wrap(conn)
+  let result = std::async::block_on(async {
+    let rc = wrapper.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[]).await
+    assert_ok(rc)
+
+    let mut tx = assert_ok(wrapper.begin_transaction().await)
+    let ri = tx.execute("INSERT INTO kv (value) VALUES (?)", &[Box::new("hello".to_string()) as Box[dyn ToSqlParam]]).await
+    assert_ok(ri)
+    assert_ok(tx.commit().await)
+
+    let rows = assert_ok(wrapper.query("SELECT value FROM kv", &[]).await)
+    rows
+  })
+  assert_eq(result.row_count(), 1)
+  let row = result.into_iter().next()
+  match row
+  when Option::Some(row) then
+    let v: String = row.get(0).ok().unwrap_or("".to_string())
+    assert_eq(v, "hello")
+  when Option::None then
+    assert_false(true)
+  end
+end
