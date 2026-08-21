@@ -102,15 +102,18 @@ def WorkStealingQueue::new(capacity: Int) -> WorkStealingQueue
   }
 end
 
-def WorkStealingQueue::push(inout self: WorkStealingQueue, sink task: Task) -> Bool
+def WorkStealingQueue::push(inout self: WorkStealingQueue, sink task: Task) -> Option[Task]
+  # The sink consumes the task; when the queue is full the ring evicts the
+  # oldest item — the EVICTED task is returned so the caller can retry it
+  # elsewhere (never silently dropped, never reused after the move).
   var guard = self.buffer.lock()
   let result = guard.push_back(task)
-  if result.is_some() then
-    # Queue was full, item was evicted
-    false
-  else
+  match result
+  when Option::Some(evicted) then
+    Option::Some(evicted)
+  when Option::None then
     self.size.fetch_add(1)
-    true
+    Option::None
   end
 end
 
@@ -358,7 +361,14 @@ def find_task(
           let first = iter.next()
           
           for task in iter do
-            let _ = inner.workers[worker_id].local_queue.push(task)
+            match inner.workers[worker_id].local_queue.push(task)
+            when Option::Some(evicted) then
+              # The local queue filled while refilling from a steal — the
+              # evicted task returns to the global queue.
+              var refill_guard = inner.global_queue.lock()
+              refill_guard.enqueue(evicted)
+            when Option::None then ()
+            end
           end
           
           return first
@@ -426,13 +436,26 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
     var i = 0
     while i < inner.workers.len() do
       if inner.threads[i].id() == current.id() then
-        pushed = inner.workers[i].local_queue.push(task)
+        match inner.workers[i].local_queue.push(task)
+        when Option::Some(evicted) then
+          # The local queue was full — the evicted task goes to the global
+          # queue (the task was consumed by the push; only the evicted
+          # item is re-routed — never a reuse of the moved task).
+          var evict_guard = inner.global_queue.lock()
+          match priority
+          when TaskPriority::Realtime then evict_guard.push_front(evicted)
+          when TaskPriority::High then evict_guard.push_high_priority(evicted)
+          when TaskPriority::Normal then evict_guard.enqueue(evicted)
+          when TaskPriority::Low then evict_guard.enqueue_low_priority(evicted)
+          end
+        when Option::None then pushed = true
+        end
         break
       end
       i = i + 1
     end
     
-    # If not a worker or local queue full, use global queue
+    # If not a worker, use global queue
     if !pushed then
       var guard = inner.global_queue.lock()
       # Priority ordering: higher priority first

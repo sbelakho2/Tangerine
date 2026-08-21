@@ -317,6 +317,13 @@ struct Statement
   conn_handle: Ptr[Unit]
   param_count: UInt
   stmt_name: String
+  # The connection-lifetime token: the connection's inner Arc clone, boxed
+  # (Arc[Box[Any]]). While the statement lives, the token pins the inner's
+  # heap block, so the conn_handle raw pointer (and the native statement
+  # in `handle`, which the connection owns) stays valid even after the
+  # connection value itself drops. The token is released by the
+  # statement's drop — the field's default field drop.
+  conn_token: Arc[Box[Any]]
 end
 
 impl Statement
@@ -372,6 +379,12 @@ end
 
 struct Transaction
   conn_handle: Ptr[Unit]
+  # The connection-lifetime token: the connection's inner Arc clone, boxed
+  # (Arc[Box[Any]]). While the transaction lives, the token pins the
+  # connection's handle storage, so conn_handle stays valid even after
+  # the connection value itself drops; released by the transaction's drop
+  # (the field's default field drop).
+  conn_token: Arc[Box[Any]]
   driver: DriverKind
   
   finished: Bool
@@ -500,8 +513,16 @@ def sqlite_transient_destructor() -> Ptr[Unit]
   Ptr { address: (-1 as Int) as UInt }
 end
 
-struct Sqlite
+# The heap-stable Sqlite connection: the native handle lives in the
+# Arc-owned inner (the inner's Drop runs sqlite3_close at the Arc's
+# last-release), and statements/transactions hold a boxed clone of the
+# inner Arc as their lifetime token.
+struct SqliteInner
   handle: Ptr[Unit]
+end
+
+struct Sqlite
+  inner: Arc[SqliteInner]
 end
 
 impl Sqlite
@@ -520,7 +541,7 @@ impl Sqlite
       return Result::Err(DbError::ConnectionFailed(err_msg))
     end
     
-    Result::Ok(Sqlite { handle: handle })
+    Result::Ok(Sqlite { inner: Arc::new(SqliteInner { handle: handle }) })
   end
   
   def open_memory() -> Result[Sqlite, DbError]
@@ -530,17 +551,18 @@ end
 
 impl Connection for Sqlite
   def execute(inout self: Sqlite, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-    sqlite_execute_raw(self.handle, sql, params)
+    sqlite_execute_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def query(self: Sqlite, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-    sqlite_query_raw(self.handle, sql, params)
+    sqlite_query_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def begin_transaction(inout self: Sqlite) -> Result[Transaction, DbError]
-    sqlite_execute_raw(self.handle, "BEGIN TRANSACTION", &[])?
+    sqlite_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN TRANSACTION", &[])?
     Result::Ok(Transaction {
-      conn_handle: self.handle,
+      conn_handle: self.inner.ptr.as_ref().handle,
+      conn_token: Arc::new(Box::new(self.inner.clone())),
       driver: DriverKind::Sqlite,
       finished: false
     })
@@ -552,7 +574,7 @@ impl Connection for Sqlite
     
     let rc = unsafe "FFI boundary" do
       sqlite3_prepare_v2(
-        self.handle,
+        self.inner.ptr.as_ref().handle,
         sql_cstr.as_ptr(),
         -1,
         &mut stmt_handle as PtrMut[Ptr[Unit]],
@@ -561,7 +583,7 @@ impl Connection for Sqlite
     end
     
     if rc != SQLITE_OK then
-      return Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(self.handle)))
+      return Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(self.inner.ptr.as_ref().handle)))
     end
     
     Result::Ok(Statement {
@@ -570,17 +592,18 @@ impl Connection for Sqlite
       driver: DriverKind::Sqlite,
       conn_handle: null_ptr(),
       param_count: 0,
-      stmt_name: String::new()
+      stmt_name: String::new(),
+      conn_token: Arc::new(Box::new(self.inner.clone()))
     })
   end
   
   def close(inout self: Sqlite) -> Result[Unit, DbError]
-    if self.handle.is_null() then
+    if self.inner.ptr.as_ref().handle.is_null() then
       return Result::Ok(())
     end
-    let handle = self.handle
-    let rc = unsafe "FFI boundary" do sqlite3_close(self.handle) end
-    self.handle = null_ptr()
+    let handle = self.inner.ptr.as_ref().handle
+    let rc = unsafe "FFI boundary" do sqlite3_close(self.inner.ptr.as_ref().handle) end
+    self.inner.ptr.as_ref().handle = null_ptr()
     if rc != SQLITE_OK then
       Result::Err(sqlite_error_from_code(rc, sqlite_errmsg(handle)))
     else
@@ -589,8 +612,8 @@ impl Connection for Sqlite
   end
 end
 
-impl Drop for Sqlite
-  def drop(inout self: Sqlite) -> Unit
+impl Drop for SqliteInner
+  def drop(inout self: SqliteInner) -> Unit
     if !self.handle.is_null() then
       unsafe "FFI boundary" do sqlite3_close(self.handle) end
       self.handle = null_ptr()
@@ -943,9 +966,18 @@ const PG_BYTEA_OID: u32 = 17
 const PG_TIMESTAMP_OID: u32 = 1114
 const PG_TIMESTAMPTZ_OID: u32 = 1184
 
-struct Postgres
+# The heap-stable Postgres connection: the native PgConnection pointer and
+# the prepared-statement counter live in the Arc-owned inner (the inner's
+# Drop runs PQfinish at the Arc's last-release), and
+# statements/transactions hold a boxed clone of the inner Arc as their
+# lifetime token.
+struct PostgresInner
   handle: Ptr[Unit]
   stmt_counter: UInt
+end
+
+struct Postgres
+  inner: Arc[PostgresInner]
 end
 
 struct PostgresConfig
@@ -1033,23 +1065,24 @@ impl Postgres
       return Result::Err(DbError::ConnectionFailed(err_msg))
     end
     
-    Result::Ok(Postgres { handle: handle, stmt_counter: 0 })
+    Result::Ok(Postgres { inner: Arc::new(PostgresInner { handle: handle, stmt_counter: 0 }) })
   end
 end
 
 impl Connection for Postgres
   def execute(inout self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
-    postgres_execute_raw(self.handle, sql, params)
+    postgres_execute_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def query(self: Postgres, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
-    postgres_query_raw(self.handle, sql, params)
+    postgres_query_raw(self.inner.ptr.as_ref().handle, sql, params)
   end
   
   def begin_transaction(inout self: Postgres) -> Result[Transaction, DbError]
-    postgres_execute_raw(self.handle, "BEGIN", &[])?
+    postgres_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN", &[])?
     Result::Ok(Transaction {
-      conn_handle: self.handle,
+      conn_handle: self.inner.ptr.as_ref().handle,
+      conn_token: Arc::new(Box::new(self.inner.clone())),
       driver: DriverKind::Postgres,
       finished: false
     })
@@ -1062,17 +1095,17 @@ impl Connection for Postgres
     # Statement then carries the connection handle + the statement name +
     # the parameter count so execute/query run PQexecPrepared.
     let (translated, param_count) = postgres_translate_placeholders(sql)
-    self.stmt_counter = self.stmt_counter + 1
-    let stmt_name = "stmt_" + self.stmt_counter.to_string()
+    self.inner.ptr.as_ref().stmt_counter = self.inner.ptr.as_ref().stmt_counter + 1
+    let stmt_name = "stmt_" + self.inner.ptr.as_ref().stmt_counter.to_string()
     let stmt_name_cstr = stmt_name.to_cstring()
     let sql_cstr = translated.to_cstring()
     
     let result = unsafe "FFI boundary" do
-      PQprepare(self.handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), param_count as i32, null_ptr())
+      PQprepare(self.inner.ptr.as_ref().handle, stmt_name_cstr.as_ptr(), sql_cstr.as_ptr(), param_count as i32, null_ptr())
     end
     
     if result.is_null() then
-      return Result::Err(DbError::QueryFailed(postgres_errmsg(self.handle)))
+      return Result::Err(DbError::QueryFailed(postgres_errmsg(self.inner.ptr.as_ref().handle)))
     end
     
     let status = unsafe "FFI boundary" do PQresultStatus(result) end
@@ -1088,21 +1121,22 @@ impl Connection for Postgres
       sql: translated,
       handle: null_ptr(),
       driver: DriverKind::Postgres,
-      conn_handle: self.handle,
+      conn_handle: self.inner.ptr.as_ref().handle,
       param_count: param_count,
-      stmt_name: stmt_name
+      stmt_name: stmt_name,
+      conn_token: Arc::new(Box::new(self.inner.clone()))
     })
   end
   
   def close(inout self: Postgres) -> Result[Unit, DbError]
-    unsafe "FFI boundary" do PQfinish(self.handle) end
-    self.handle = null_ptr()
+    unsafe "FFI boundary" do PQfinish(self.inner.ptr.as_ref().handle) end
+    self.inner.ptr.as_ref().handle = null_ptr()
     Result::Ok(())
   end
 end
 
-impl Drop for Postgres
-  def drop(inout self: Postgres) -> Unit
+impl Drop for PostgresInner
+  def drop(inout self: PostgresInner) -> Unit
     if !self.handle.is_null() then
       unsafe "FFI boundary" do PQfinish(self.handle) end
     end
@@ -1907,7 +1941,7 @@ end
 # PART 6: CONNECTION POOL
 # ═══════════════════════════════════════════════════════════════
 
-use std::sync::{Mutex, Condvar}
+use std::sync::{Arc, Mutex, Condvar}
 
 struct Pool[C]
   connections: Mutex[Vec[C]]
@@ -2162,9 +2196,17 @@ def mysql_config_new(host: str, user: str, password: str, database: str) -> Mysq
   }
 end
 
-struct Mysql
+# The heap-stable Mysql connection: the native MYSQL* handle and the
+# connected flag live in the Arc-owned inner (the inner's Drop runs
+# mysql_close at the Arc's last-release), and statements/transactions
+# hold a boxed clone of the inner Arc as their lifetime token.
+struct MysqlInner
   handle: Ptr[Unit]
   connected: Bool
+end
+
+struct Mysql
+  inner: Arc[MysqlInner]
 end
 
 def mysql_open(config: MysqlConfig) -> Result[Mysql, DbError]
@@ -2194,38 +2236,38 @@ def mysql_open(config: MysqlConfig) -> Result[Mysql, DbError]
     return Result::Err(DbError::ConnectionFailed(err_msg))
   end
 
-  Result::Ok(Mysql { handle: handle, connected: true })
+  Result::Ok(Mysql { inner: Arc::new(MysqlInner { handle: handle, connected: true }) })
 end
 
 impl Connection for Mysql
   def execute(inout self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[UInt, DbError]
     if params.is_empty() then
-      let ret = unsafe "FFI boundary" do mysql_query(self.handle, sql.to_cstring().as_ptr()) end
+      let ret = unsafe "FFI boundary" do mysql_query(self.inner.ptr.as_ref().handle, sql.to_cstring().as_ptr()) end
       if ret != 0 then
-        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.inner.ptr.as_ref().handle)) end
         return Result::Err(DbError::QueryFailed(err))
       end
-      let affected = unsafe "FFI boundary" do mysql_affected_rows(self.handle) end
+      let affected = unsafe "FFI boundary" do mysql_affected_rows(self.inner.ptr.as_ref().handle) end
       Result::Ok(affected as UInt)
     else
       # Parameterized execution goes through the REAL prepared-statement
       # path (mysql_stmt_prepare + mysql_stmt_bind_param with the
       # MYSQL_BIND array + mysql_stmt_execute) — never the manual
       # interpolation.
-      mysql_prepared_execute(self.handle, sql, params)
+      mysql_prepared_execute(self.inner.ptr.as_ref().handle, sql, params)
     end
   end
 
   def query(self: Mysql, sql: str, params: [Box[dyn ToSqlParam]]) -> Result[Rows, DbError]
     if params.is_empty() then
       let ret = unsafe "FFI boundary" do
-        mysql_real_query(self.handle, sql.to_cstring().as_ptr(), sql.len() as UInt)
+        mysql_real_query(self.inner.ptr.as_ref().handle, sql.to_cstring().as_ptr(), sql.len() as UInt)
       end
       if ret != 0 then
-        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.handle)) end
+        let err = unsafe "FFI boundary" do cstring_to_string(mysql_error(self.inner.ptr.as_ref().handle)) end
         return Result::Err(DbError::QueryFailed(err))
       end
-      let result = unsafe "FFI boundary" do mysql_store_result(self.handle) end
+      let result = unsafe "FFI boundary" do mysql_store_result(self.inner.ptr.as_ref().handle) end
       if result.is_null() then
         return Result::Ok(Rows { columns: Vec::new(), data: Vec::new(), pos: 0 })
       end
@@ -2235,25 +2277,26 @@ impl Connection for Mysql
     else
       # Parameterized query through the prepared-statement path with the
       # real MYSQL_BIND parameter binding.
-      mysql_prepared_query(self.handle, sql, params)
+      mysql_prepared_query(self.inner.ptr.as_ref().handle, sql, params)
     end
   end
 
   def begin_transaction(inout self: Mysql) -> Result[Transaction, DbError]
-    let ret = unsafe "FFI boundary" do mysql_autocommit(self.handle, 0) end
+    let ret = unsafe "FFI boundary" do mysql_autocommit(self.inner.ptr.as_ref().handle, 0) end
     if ret != 0 then
       return Result::Err(DbError::TransactionError("failed to disable autocommit".to_string()))
     end
-    mysql_execute_raw(self.handle, "BEGIN", &[])?
+    mysql_execute_raw(self.inner.ptr.as_ref().handle, "BEGIN", &[])?
     Result::Ok(Transaction {
-      conn_handle: self.handle,
+      conn_handle: self.inner.ptr.as_ref().handle,
+      conn_token: Arc::new(Box::new(self.inner.clone())),
       driver: DriverKind::Mysql,
       finished: false
     })
   end
 
   def prepare(inout self: Mysql, sql: str) -> Result[Statement, DbError]
-    let stmt = unsafe "FFI boundary" do mysql_stmt_init(self.handle) end
+    let stmt = unsafe "FFI boundary" do mysql_stmt_init(self.inner.ptr.as_ref().handle) end
     if stmt.is_null() then
       return Result::Err(DbError::Internal("mysql_stmt_init failed".to_string()))
     end
@@ -2271,22 +2314,26 @@ impl Connection for Mysql
       driver: DriverKind::Mysql,
       conn_handle: null_ptr(),
       param_count: 0,
-      stmt_name: String::new()
+      stmt_name: String::new(),
+      conn_token: Arc::new(Box::new(self.inner.clone()))
     })
   end
 
   def close(inout self: Mysql) -> Result[Unit, DbError]
-    if self.connected then
-      unsafe "FFI boundary" do mysql_close(self.handle) end
-      self.connected = false
+    if self.inner.ptr.as_ref().connected then
+      unsafe "FFI boundary" do mysql_close(self.inner.ptr.as_ref().handle) end
+      self.inner.ptr.as_ref().connected = false
     end
     Result::Ok(())
   end
 end
 
-impl Drop for Mysql
-  def drop(inout self: Mysql) -> Unit
-    let _ = self.close()
+impl Drop for MysqlInner
+  def drop(inout self: MysqlInner) -> Unit
+    if self.connected then
+      unsafe "FFI boundary" do mysql_close(self.handle) end
+      self.connected = false
+    end
   end
 end
 
